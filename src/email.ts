@@ -37,8 +37,8 @@ import { logger } from './logger.js';
 
 export const EMAIL_PRINCIPAL_GROUP = {
   jid: 'email:principal',
-  name: 'Email',
-  folder: 'email',
+  name: 'Email (Principal)',
+  folder: 'email-principal',
   trigger: `@${ASSISTANT_NAME}`,
   requiresTrigger: false,
   allowedTools: [
@@ -104,8 +104,8 @@ export const EMAIL_PRINCIPAL_GROUP = {
 
 export const EMAIL_EXTERNAL_GROUP = {
   jid: 'email:external',
-  name: 'External Contact',
-  folder: 'external-contact',
+  name: 'Email (External)',
+  folder: 'email-external',
   trigger: `@${ASSISTANT_NAME}`,
   requiresTrigger: false,
   allowedTools: [
@@ -278,10 +278,10 @@ export function startEmailLoop(
 
 /**
  * Determine which group folder an email should route to based on sender.
- * Returns 'email' for principal, 'external-contact' for everyone else.
+ * Returns 'email-principal' for principal, 'email-external' for everyone else.
  */
 export function getEmailRouteGroup(email: IncomingEmail): string {
-  return isPrincipalEmail(email.from) ? 'email' : 'external-contact';
+  return isPrincipalEmail(email.from) ? 'email-principal' : 'email-external';
 }
 
 /**
@@ -308,7 +308,7 @@ export function buildEmailPrompt(
     allRecipients.length > 0 ? `\n- cc: "${allRecipients.join(', ')}"` : '';
 
   const externalNote = isExternal
-    ? `\n\n[EXTERNAL SENDER — this person is not ${PRINCIPAL_NAME}. Handle per external-contact procedures.]`
+    ? `\n\n[EXTERNAL SENDER — this person is not ${PRINCIPAL_NAME}. Handle per email-external procedures.]`
     : '';
 
   return `[EMAIL RECEIVED]
@@ -330,7 +330,7 @@ ${ccParam}
 - in_reply_to: "${email.messageId}"
 - references: <use get_gmail_thread_content to build the Message-ID chain>
 - user_google_email: "${ASSISTANT_EMAIL}"
-- from_name: <read persona.md for your full name>
+- from_name: "${ASSISTANT_NAME}"
 - from_email: "${ASSISTANT_EMAIL}"
 - body_format: "html"${externalNote}`;
 }

@@ -125,8 +125,7 @@ function errorIndicators(chatJid: string): void {
     if (ind.chatJid !== chatJid) continue;
     activeIndicators.delete(msgId);
     if (msgId === lastMsgId) {
-      ind.channel
-        .sendReaction!(chatJid, ind.key, '', { skipStore: true })
+      ind.channel.sendReaction!(chatJid, ind.key, '', { skipStore: true })
         .catch(() => {})
         .then(() =>
           ind.channel.sendReaction!(chatJid, ind.key, '❌', {
@@ -616,7 +615,7 @@ const HEARTBEAT_GROUP = {
 };
 
 /**
- * Ensure synthetic groups exist for email/external-contact/heartbeat routing.
+ * Ensure synthetic groups exist for email-principal/email-external/heartbeat routing.
  * Tool lists are synced from code on every restart so changes propagate.
  * Idempotent.
  */
@@ -722,18 +721,9 @@ async function main(): Promise<void> {
             requiresTrigger: false,
             isMain: true,
           });
-        } else {
-          registerGroup(chatJid, {
-            name: msg.sender_name || 'Google Chat DM',
-            folder: EMAIL_EXTERNAL_GROUP.folder,
-            trigger: `@${ASSISTANT_NAME}`,
-            added_at: new Date().toISOString(),
-            containerConfig: {
-              allowedTools: EMAIL_EXTERNAL_GROUP.allowedTools,
-            },
-            requiresTrigger: false,
-          });
         }
+        // Non-principal GChat DMs are not auto-registered.
+        // Register them manually if needed.
       }
     },
     onChatMetadata: (
@@ -874,12 +864,12 @@ async function main(): Promise<void> {
     }
     // Hijacking detection: third-party sender on principal-initiated thread.
     const senderIsPrincipal = isPrincipalEmail(email.from);
-    if (targetFolder === 'email' && !senderIsPrincipal) {
+    if (targetFolder === 'email-principal' && !senderIsPrincipal) {
       logger.warn(
         { from: email.from, subject: email.subject },
-        'Third-party sender on principal-initiated thread — downgrading to external-contact',
+        'Third-party sender on principal-initiated thread — downgrading to email-external',
       );
-      targetFolder = 'external-contact';
+      targetFolder = 'email-external';
       // Alert principal on main channel
       const mainChannel = findChannel(channels, mainJid);
       if (mainChannel) {
@@ -895,7 +885,7 @@ async function main(): Promise<void> {
 
     // Map folder → JID
     const targetJid =
-      targetFolder === 'external-contact'
+      targetFolder === 'email-external'
         ? EMAIL_EXTERNAL_GROUP.jid
         : EMAIL_PRINCIPAL_GROUP.jid;
 
@@ -911,7 +901,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    const isExternal = targetFolder === 'external-contact';
+    const isExternal = targetFolder === 'email-external';
     const prompt = buildEmailPrompt(email, isExternal);
     const mainChannel = findChannel(channels, mainJid);
 

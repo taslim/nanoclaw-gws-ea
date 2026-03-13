@@ -9,14 +9,35 @@ store/
 data/
 logs/
 
-# Groups - only track base structure and specific CLAUDE.md files
+# Groups - track EA structure, ignore runtime data
 groups/*
 !groups/main/
 !groups/global/
+!groups/email-principal/
+!groups/email-external/
+!groups/heartbeat/
+
+# Within tracked groups: track docs, ignore runtime
 groups/main/*
-groups/global/*
 !groups/main/CLAUDE.md
+!groups/main/procedures/
+groups/global/*
 !groups/global/CLAUDE.md
+!groups/global/profile.md
+!groups/global/procedures/
+groups/email-principal/*
+!groups/email-principal/CLAUDE.md
+groups/email-external/*
+!groups/email-external/CLAUDE.md
+groups/heartbeat/*
+!groups/heartbeat/CLAUDE.md
+
+# Runtime data (never tracked, even in whitelisted groups)
+groups/*/conversations/
+groups/*/memory/
+groups/*/MEMORY.md
+groups/*/heartbeat-logs.md
+groups/*/auth/
 
 # Secrets
 *.keys.json
