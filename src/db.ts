@@ -12,6 +12,23 @@ import {
   TaskRunLog,
 } from './types.js';
 
+export interface Reaction {
+  message_id: string;
+  message_chat_jid: string;
+  reactor_jid: string;
+  reactor_name?: string;
+  emoji: string;
+  timestamp: string;
+}
+
+export interface EmailThread {
+  thread_id: string;
+  group_folder: string;
+  status: string;
+  reason: string | null;
+  updated_at: string;
+}
+
 let db: Database.Database;
 
 function createSchema(database: Database.Database): void {
@@ -82,6 +99,35 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+    CREATE TABLE IF NOT EXISTS processed_emails (
+      message_id TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL,
+      sender TEXT NOT NULL,
+      subject TEXT,
+      processed_at TEXT NOT NULL,
+      response_sent INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_processed_emails_thread ON processed_emails(thread_id);
+
+    CREATE TABLE IF NOT EXISTS reactions (
+      message_id TEXT NOT NULL,
+      message_chat_jid TEXT NOT NULL,
+      reactor_jid TEXT NOT NULL,
+      reactor_name TEXT,
+      emoji TEXT NOT NULL,
+      timestamp TEXT NOT NULL,
+      PRIMARY KEY (message_id, message_chat_jid, reactor_jid)
+    );
+    CREATE INDEX IF NOT EXISTS idx_reactions_message ON reactions(message_id, message_chat_jid);
+
+    CREATE TABLE IF NOT EXISTS email_threads (
+      thread_id TEXT PRIMARY KEY,
+      group_folder TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      reason TEXT,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_threads_status ON email_threads(status);
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -114,6 +160,15 @@ function createSchema(database: Database.Database): void {
     // Backfill: existing rows with folder = 'main' are the main group
     database.exec(
       `UPDATE registered_groups SET is_main = 1 WHERE folder = 'main'`,
+    );
+  } catch {
+    /* column already exists */
+  }
+
+  // Add response_sent column to processed_emails if missing (migration for existing DBs)
+  try {
+    database.exec(
+      'ALTER TABLE processed_emails ADD COLUMN response_sent INTEGER DEFAULT 0',
     );
   } catch {
     /* column already exists */
@@ -632,6 +687,155 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- Processed emails ---
+
+export function isEmailProcessed(messageId: string): boolean {
+  const row = db
+    .prepare('SELECT 1 FROM processed_emails WHERE message_id = ?')
+    .get(messageId);
+  return !!row;
+}
+
+export function markEmailProcessed(
+  messageId: string,
+  threadId: string,
+  sender: string,
+  subject: string,
+): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO processed_emails (message_id, thread_id, sender, subject, processed_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run(messageId, threadId, sender, subject, new Date().toISOString());
+}
+
+export function markEmailResponded(messageId: string): void {
+  db.prepare(
+    'UPDATE processed_emails SET response_sent = 1 WHERE message_id = ?',
+  ).run(messageId);
+}
+
+// --- Email threads ---
+
+export function getEmailThreadRoute(threadId: string): string | undefined {
+  const row = db
+    .prepare('SELECT group_folder FROM email_threads WHERE thread_id = ?')
+    .get(threadId) as { group_folder: string } | undefined;
+  return row?.group_folder;
+}
+
+/**
+ * Create or update an email thread record.
+ * New threads start as 'pending'. Existing threads are auto-unresolve:
+ * any new message resets status to 'pending' so nothing falls through.
+ */
+export function upsertEmailThread(threadId: string, groupFolder: string): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO email_threads (thread_id, group_folder, status, updated_at)
+     VALUES (?, ?, 'pending', ?)
+     ON CONFLICT(thread_id) DO UPDATE SET
+       status = 'pending',
+       reason = NULL,
+       updated_at = excluded.updated_at`,
+  ).run(threadId, groupFolder, now);
+}
+
+export function updateEmailThreadStatus(
+  threadId: string,
+  status: string,
+  reason?: string,
+): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    'UPDATE email_threads SET status = ?, reason = ?, updated_at = ? WHERE thread_id = ?',
+  ).run(status, reason || null, now, threadId);
+}
+
+export function getEmailThread(threadId: string): EmailThread | undefined {
+  return db
+    .prepare('SELECT * FROM email_threads WHERE thread_id = ?')
+    .get(threadId) as EmailThread | undefined;
+}
+
+export function getPendingEmailThreads(): EmailThread[] {
+  return db
+    .prepare(
+      `SELECT * FROM email_threads WHERE status IN ('pending', 'escalated', 'waiting') ORDER BY updated_at DESC`,
+    )
+    .all() as EmailThread[];
+}
+
+export function getAllEmailThreads(): EmailThread[] {
+  return db
+    .prepare('SELECT * FROM email_threads ORDER BY updated_at DESC')
+    .all() as EmailThread[];
+}
+
+// --- Reactions ---
+
+/**
+ * Look up whether a specific message was sent by us
+ */
+export function getMessageFromMe(messageId: string, chatJid: string): boolean {
+  const row = db
+    .prepare(
+      `SELECT is_from_me FROM messages WHERE id = ? AND chat_jid = ? LIMIT 1`,
+    )
+    .get(messageId, chatJid) as { is_from_me: number | null } | undefined;
+  return row?.is_from_me === 1;
+}
+
+/**
+ * Look up a message by its resource ID (e.g. spaces/XXX/messages/YYY).
+ * Returns sender name and content, or undefined if not found.
+ */
+export function getMessageById(
+  id: string,
+): { sender_name: string; content: string } | undefined {
+  return db
+    .prepare(`SELECT sender_name, content FROM messages WHERE id = ? LIMIT 1`)
+    .get(id) as { sender_name: string; content: string } | undefined;
+}
+
+/**
+ * Get the most recent message for a chat (with fromMe flag)
+ */
+export function getLatestMessage(
+  chatJid: string,
+): { id: string; fromMe: boolean } | undefined {
+  const row = db
+    .prepare(
+      `SELECT id, is_from_me FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT 1`,
+    )
+    .get(chatJid) as { id: string; is_from_me: number | null } | undefined;
+  if (!row) return undefined;
+  return { id: row.id, fromMe: row.is_from_me === 1 };
+}
+
+/**
+ * Store or update a reaction. Empty emoji removes the reaction.
+ */
+export function storeReaction(reaction: Reaction): void {
+  if (!reaction.emoji) {
+    db.prepare(
+      `DELETE FROM reactions WHERE message_id = ? AND message_chat_jid = ? AND reactor_jid = ?`,
+    ).run(reaction.message_id, reaction.message_chat_jid, reaction.reactor_jid);
+    return;
+  }
+
+  db.prepare(
+    `INSERT OR REPLACE INTO reactions (message_id, message_chat_jid, reactor_jid, reactor_name, emoji, timestamp)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(
+    reaction.message_id,
+    reaction.message_chat_jid,
+    reaction.reactor_jid,
+    reaction.reactor_name || null,
+    reaction.emoji,
+    reaction.timestamp,
+  );
 }
 
 // --- JSON migration ---

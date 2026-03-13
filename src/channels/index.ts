@@ -3,6 +3,9 @@
 
 // discord
 
+// gchat
+import './gchat.js';
+
 // gmail
 
 // slack

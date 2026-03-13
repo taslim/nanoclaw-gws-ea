@@ -6,7 +6,16 @@ import { readEnvFile } from './env.js';
 // Read config values from .env (falls back to process.env).
 // Secrets (API keys, tokens) are NOT read here — they are loaded only
 // by the credential proxy (credential-proxy.ts), never exposed to containers.
-const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER']);
+const envConfig = readEnvFile([
+  'ASSISTANT_NAME',
+  'ASSISTANT_HAS_OWN_NUMBER',
+  'EMAIL_POLL_INTERVAL',
+  'GCHAT_POLL_INTERVAL',
+  'PRINCIPAL_NAME',
+  'PRINCIPAL_EMAILS',
+  'ASSISTANT_EMAIL',
+  'HEARTBEAT_SPACE_ID',
+]);
 
 export const ASSISTANT_NAME =
   process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
@@ -15,6 +24,51 @@ export const ASSISTANT_HAS_OWN_NUMBER =
     envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
+
+// --- GWS-EA config (all from .env) ---
+export const EMAIL_POLL_INTERVAL = parseInt(
+  process.env.EMAIL_POLL_INTERVAL ||
+    envConfig.EMAIL_POLL_INTERVAL ||
+    '60000',
+  10,
+);
+export const GCHAT_POLL_INTERVAL = parseInt(
+  process.env.GCHAT_POLL_INTERVAL ||
+    envConfig.GCHAT_POLL_INTERVAL ||
+    '30000',
+  10,
+);
+export const PRINCIPAL_NAME =
+  process.env.PRINCIPAL_NAME || envConfig.PRINCIPAL_NAME || '';
+export const ASSISTANT_EMAIL =
+  process.env.ASSISTANT_EMAIL || envConfig.ASSISTANT_EMAIL || '';
+export const HEARTBEAT_SPACE_ID =
+  process.env.HEARTBEAT_SPACE_ID || envConfig.HEARTBEAT_SPACE_ID || '';
+
+const rawEmails = (
+  process.env.PRINCIPAL_EMAILS ||
+  envConfig.PRINCIPAL_EMAILS ||
+  ''
+)
+  .split(',')
+  .map((e) => e.trim())
+  .filter(Boolean);
+export const PRINCIPAL_EMAILS = new Set(rawEmails.map((e) => e.toLowerCase()));
+
+export function isPrincipalEmail(email: string): boolean {
+  return PRINCIPAL_EMAILS.has(email.toLowerCase());
+}
+
+export function validateEaConfig(): void {
+  const errors: string[] = [];
+  if (PRINCIPAL_EMAILS.size === 0) errors.push('PRINCIPAL_EMAILS is empty');
+  if (!ASSISTANT_EMAIL) errors.push('ASSISTANT_EMAIL is not set');
+  if (!PRINCIPAL_NAME) errors.push('PRINCIPAL_NAME is not set');
+  if (errors.length > 0)
+    throw new Error(
+      `GWS-EA config error:\n${errors.map((e) => `  - ${e}`).join('\n')}`,
+    );
+}
 
 // Absolute paths needed for container mounts
 const PROJECT_ROOT = process.cwd();
