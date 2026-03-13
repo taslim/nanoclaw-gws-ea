@@ -5,13 +5,26 @@ import { CronExpressionParser } from 'cron-parser';
 
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { AvailableGroup } from './container-runner.js';
-import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import {
+  createTask,
+  deleteTask,
+  getEmailThread,
+  getTaskById,
+  updateEmailThreadStatus,
+  upsertEmailThread,
+  updateTask,
+} from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
+  sendReaction: (
+    jid: string,
+    emoji: string,
+    messageId?: string,
+  ) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -46,7 +59,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
       });
     } catch (err) {
       logger.error({ err }, 'Error reading IPC base directory');
-      setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
+      setTimeout(() => void processIpcFiles(), IPC_POLL_INTERVAL);
       return;
     }
 
@@ -89,6 +102,43 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC message attempt blocked',
+                  );
+                }
+              } else if (
+                data.type === 'reaction' &&
+                data.chatJid &&
+                typeof data.emoji === 'string'
+              ) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  try {
+                    await deps.sendReaction(
+                      data.chatJid,
+                      data.emoji,
+                      data.messageId,
+                    );
+                    logger.info(
+                      { chatJid: data.chatJid, emoji: data.emoji, sourceGroup },
+                      'IPC reaction sent',
+                    );
+                  } catch (err) {
+                    logger.error(
+                      {
+                        chatJid: data.chatJid,
+                        emoji: data.emoji,
+                        sourceGroup,
+                        err,
+                      },
+                      'IPC reaction failed',
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC reaction attempt blocked',
                   );
                 }
               }
@@ -146,10 +196,10 @@ export function startIpcWatcher(deps: IpcDeps): void {
       }
     }
 
-    setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
+    setTimeout(() => void processIpcFiles(), IPC_POLL_INTERVAL);
   };
 
-  processIpcFiles();
+  void processIpcFiles();
   logger.info('IPC watcher started (per-group namespaces)');
 }
 
@@ -171,6 +221,10 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For update_email_thread
+    threadId?: string;
+    status?: string;
+    reason?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -445,6 +499,42 @@ export async function processTaskIpc(
         logger.warn(
           { data },
           'Invalid register_group request - missing required fields',
+        );
+      }
+      break;
+
+    case 'update_email_thread':
+      if (data.threadId && data.status) {
+        let thread = getEmailThread(data.threadId);
+        if (!thread) {
+          // Create the thread (outbound-only emails won't exist yet)
+          upsertEmailThread(data.threadId, sourceGroup);
+          thread = getEmailThread(data.threadId)!;
+          logger.info(
+            { threadId: data.threadId, sourceGroup },
+            'Created email thread via upsert',
+          );
+        }
+        if (
+          !isMain &&
+          sourceGroup !== 'heartbeat' &&
+          thread.group_folder !== sourceGroup
+        ) {
+          logger.warn(
+            { threadId: data.threadId, sourceGroup },
+            'Unauthorized email thread update attempt',
+          );
+          break;
+        }
+        updateEmailThreadStatus(data.threadId, data.status, data.reason);
+        logger.info(
+          {
+            threadId: data.threadId,
+            status: data.status,
+            reason: data.reason,
+            sourceGroup,
+          },
+          'Email thread status updated via IPC',
         );
       }
       break;

@@ -27,15 +27,11 @@ export const SCHEDULER_POLL_INTERVAL = 60000;
 
 // --- GWS-EA config (all from .env) ---
 export const EMAIL_POLL_INTERVAL = parseInt(
-  process.env.EMAIL_POLL_INTERVAL ||
-    envConfig.EMAIL_POLL_INTERVAL ||
-    '60000',
+  process.env.EMAIL_POLL_INTERVAL || envConfig.EMAIL_POLL_INTERVAL || '60000',
   10,
 );
 export const GCHAT_POLL_INTERVAL = parseInt(
-  process.env.GCHAT_POLL_INTERVAL ||
-    envConfig.GCHAT_POLL_INTERVAL ||
-    '30000',
+  process.env.GCHAT_POLL_INTERVAL || envConfig.GCHAT_POLL_INTERVAL || '30000',
   10,
 );
 export const PRINCIPAL_NAME =

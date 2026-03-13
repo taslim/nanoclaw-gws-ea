@@ -4,6 +4,7 @@
  */
 import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -40,6 +41,7 @@ export interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  allowedTools?: string[];
   assistantName?: string;
 }
 
@@ -56,11 +58,22 @@ interface VolumeMount {
   readonly: boolean;
 }
 
+/**
+ * Check if a group's effective tool list includes any tools with the given prefix.
+ * When allowedTools is unset, all tools are available (returns true).
+ */
+function groupHasToolPrefix(group: RegisteredGroup, prefix: string): boolean {
+  const tools = group.containerConfig?.allowedTools;
+  if (!tools) return true; // No restrictions = all tools available
+  return tools.some((t) => t === `${prefix}*` || t.startsWith(prefix));
+}
+
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
+  const homeDir = os.homedir();
   const projectRoot = process.cwd();
   const groupDir = resolveGroupFolderPath(group.folder);
 
@@ -113,6 +126,30 @@ function buildVolumeMounts(
     }
   }
 
+  // Google Calendar credentials directory (only mount if group has calendar tools)
+  if (groupHasToolPrefix(group, 'mcp__calendar__')) {
+    const calendarDir = path.join(homeDir, '.calendar-mcp');
+    if (fs.existsSync(calendarDir)) {
+      mounts.push({
+        hostPath: calendarDir,
+        containerPath: '/home/node/.calendar-mcp',
+        readonly: false, // MCP may need to refresh tokens
+      });
+    }
+  }
+
+  // Google Workspace MCP credentials directory (only mount if group has workspace tools)
+  if (groupHasToolPrefix(group, 'mcp__workspace__')) {
+    const workspaceDir = path.join(homeDir, '.workspace-mcp');
+    if (fs.existsSync(workspaceDir)) {
+      mounts.push({
+        hostPath: workspaceDir,
+        containerPath: '/home/node/.workspace-mcp',
+        readonly: false, // MCP may need to refresh tokens
+      });
+    }
+  }
+
   // Per-group Claude sessions directory (isolated from other groups)
   // Each group gets their own .claude/ to prevent cross-group session access
   const groupSessionsDir = path.join(
@@ -154,7 +191,12 @@ function buildVolumeMounts(
       const srcDir = path.join(skillsSrc, skillDir);
       if (!fs.statSync(srcDir).isDirectory()) continue;
       const dstDir = path.join(skillsDst, skillDir);
-      fs.cpSync(srcDir, dstDir, { recursive: true });
+      fs.mkdirSync(dstDir, { recursive: true });
+      for (const file of fs.readdirSync(srcDir)) {
+        const srcFile = path.join(srcDir, file);
+        const dstFile = path.join(dstDir, file);
+        fs.copyFileSync(srcFile, dstFile);
+      }
     }
   }
   mounts.push({
@@ -460,7 +502,7 @@ export async function runContainerAgent(
             { group: group.name, containerName, duration, code },
             'Container timed out after output (idle cleanup)',
           );
-          outputChain.then(() => {
+          void outputChain.then(() => {
             resolve({
               status: 'success',
               result: null,
@@ -564,7 +606,7 @@ export async function runContainerAgent(
 
       // Streaming mode: wait for output chain to settle, return completion marker
       if (onOutput) {
-        outputChain.then(() => {
+        void outputChain.then(() => {
           logger.info(
             { group: group.name, duration, newSessionId },
             'Container completed (streaming mode)',
@@ -668,6 +710,30 @@ export function writeTasksSnapshot(
   fs.writeFileSync(tasksFile, JSON.stringify(filteredTasks, null, 2));
 }
 
+export function writeEmailThreadsSnapshot(
+  groupFolder: string,
+  isMain: boolean,
+  threads: Array<{
+    thread_id: string;
+    group_folder: string;
+    status: string;
+    reason: string | null;
+    updated_at: string;
+  }>,
+): void {
+  const groupIpcDir = resolveGroupIpcPath(groupFolder);
+  fs.mkdirSync(groupIpcDir, { recursive: true });
+
+  // Main and heartbeat see all threads, others only see their own
+  const filtered =
+    isMain || groupFolder === 'heartbeat'
+      ? threads
+      : threads.filter((t) => t.group_folder === groupFolder);
+
+  const threadsFile = path.join(groupIpcDir, 'pending_threads.json');
+  fs.writeFileSync(threadsFile, JSON.stringify(filtered, null, 2));
+}
+
 export interface AvailableGroup {
   jid: string;
   name: string;
@@ -684,7 +750,7 @@ export function writeGroupsSnapshot(
   groupFolder: string,
   isMain: boolean,
   groups: AvailableGroup[],
-  registeredJids: Set<string>,
+  _registeredJids: Set<string>,
 ): void {
   const groupIpcDir = resolveGroupIpcPath(groupFolder);
   fs.mkdirSync(groupIpcDir, { recursive: true });

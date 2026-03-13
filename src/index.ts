@@ -6,8 +6,11 @@ import {
   CREDENTIAL_PROXY_PORT,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
+  PRINCIPAL_NAME,
   TIMEZONE,
   TRIGGER_PATTERN,
+  isPrincipalEmail,
+  validateEaConfig,
 } from './config.js';
 import { startCredentialProxy } from './credential-proxy.js';
 import './channels/index.js';
@@ -16,8 +19,16 @@ import {
   getRegisteredChannelNames,
 } from './channels/registry.js';
 import {
+  EMAIL_PRINCIPAL_GROUP,
+  EMAIL_EXTERNAL_GROUP,
+  startEmailLoop,
+  buildEmailPrompt,
+  getEmailRouteGroup,
+} from './email.js';
+import {
   ContainerOutput,
   runContainerAgent,
+  writeEmailThreadsSnapshot,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
@@ -29,13 +40,16 @@ import {
 import {
   getAllChats,
   getAllRegisteredGroups,
+  getAllEmailThreads,
   getAllSessions,
   getAllTasks,
+  getEmailThreadRoute,
+  getMessageFromMe,
   getMessagesSince,
   getNewMessages,
-  getRegisteredGroup,
   getRouterState,
   initDatabase,
+  upsertEmailThread,
   setRegisteredGroup,
   setRouterState,
   setSession,
@@ -58,6 +72,79 @@ import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
+
+const MAIN_GROUP_FOLDER = 'main';
+
+// --- Status indicators ---
+// Lightweight per-message feedback: 👀 when acknowledged, clear on response, ❌ on unrecoverable error.
+// Keyed by message ID. Both the new-container and piping paths use this same Map.
+interface ActiveIndicator {
+  chatJid: string;
+  key: { id: string; remoteJid: string; fromMe: boolean };
+  channel: Channel;
+}
+const activeIndicators = new Map<string, ActiveIndicator>();
+
+/** Mark a message as acknowledged. */
+function setIndicator(
+  channel: Channel,
+  msg: NewMessage,
+  chatJid: string,
+): void {
+  if (!channel.sendReaction) return;
+  const key = {
+    id: msg.id,
+    remoteJid: chatJid,
+    fromMe: msg.is_from_me ?? false,
+  };
+  activeIndicators.set(msg.id, { chatJid, key, channel });
+  channel
+    .sendReaction(chatJid, key, '👀', { skipStore: true })
+    .catch((err) => logger.debug({ chatJid, err }, 'Indicator set failed'));
+}
+
+/** Clear all pending indicators for a group (response arrived). */
+function clearIndicators(chatJid: string): void {
+  for (const [msgId, ind] of activeIndicators) {
+    if (ind.chatJid !== chatJid) continue;
+    activeIndicators.delete(msgId);
+    ind.channel.sendReaction!(chatJid, ind.key, '', { skipStore: true }).catch(
+      (err) => logger.debug({ chatJid, err }, 'Indicator clear failed'),
+    );
+  }
+}
+
+/** Mark error on the most recent pending indicator, clear the rest. */
+function errorIndicators(chatJid: string): void {
+  let lastMsgId: string | null = null;
+  for (const [msgId, ind] of activeIndicators) {
+    if (ind.chatJid === chatJid) lastMsgId = msgId;
+  }
+
+  for (const [msgId, ind] of activeIndicators) {
+    if (ind.chatJid !== chatJid) continue;
+    activeIndicators.delete(msgId);
+    if (msgId === lastMsgId) {
+      ind.channel
+        .sendReaction!(chatJid, ind.key, '', { skipStore: true })
+        .catch(() => {})
+        .then(() =>
+          ind.channel.sendReaction!(chatJid, ind.key, '❌', {
+            skipStore: true,
+          }),
+        )
+        .catch((err) =>
+          logger.debug({ chatJid, err }, 'Error indicator failed'),
+        );
+    } else {
+      ind.channel.sendReaction!(chatJid, ind.key, '', {
+        skipStore: true,
+      }).catch((err) =>
+        logger.debug({ chatJid, err }, 'Indicator clear failed'),
+      );
+    }
+  }
+}
 
 let lastTimestamp = '';
 let sessions: Record<string, string> = {};
@@ -175,6 +262,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
+  // --- Status indicators: 👀 on each message, clear on response, ❌ on error ---
+  for (const msg of missedMessages) {
+    setIndicator(channel, msg, chatJid);
+  }
+
   const prompt = formatMessages(missedMessages, TIMEZONE);
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
@@ -203,61 +295,67 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
-  await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
-    if (result.result) {
-      const raw =
-        typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
-      if (text) {
-        await channel.sendMessage(chatJid, text);
-        outputSentToUser = true;
+  try {
+    const output = await runAgent(group, prompt, chatJid, async (result) => {
+      if (result.result) {
+        const raw =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        logger.info(
+          { group: group.name },
+          `Agent output: ${raw.slice(0, 200)}`,
+        );
+        if (text) {
+          await channel.sendMessage(chatJid, text);
+          clearIndicators(chatJid);
+          outputSentToUser = true;
+        }
+        // Only reset idle timer on actual results, not session-update markers (result: null)
+        resetIdleTimer();
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
-    }
 
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
-    }
+      if (result.status === 'success') {
+        queue.notifyIdle(chatJid);
+      }
 
-    if (result.status === 'error') {
-      hadError = true;
-    }
-  });
+      if (result.status === 'error') {
+        hadError = true;
+      }
+    });
 
-  await channel.setTyping?.(chatJid, false);
-  if (idleTimer) clearTimeout(idleTimer);
+    if (idleTimer) clearTimeout(idleTimer);
 
-  if (output === 'error' || hadError) {
-    // If we already sent output to the user, don't roll back the cursor —
-    // the user got their response and re-processing would send duplicates.
-    if (outputSentToUser) {
+    if (output === 'error' || hadError) {
+      if (outputSentToUser) {
+        errorIndicators(chatJid);
+        logger.warn(
+          { group: group.name },
+          'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
+        );
+        return true;
+      }
+      // Will retry — clear indicators (new 👀s will appear on retry)
+      clearIndicators(chatJid);
+      lastAgentTimestamp[chatJid] = previousCursor;
+      saveState();
       logger.warn(
         { group: group.name },
-        'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
+        'Agent error, rolled back message cursor for retry',
       );
-      return true;
+      return false;
     }
-    // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
-    saveState();
-    logger.warn(
-      { group: group.name },
-      'Agent error, rolled back message cursor for retry',
-    );
-    return false;
-  }
 
-  return true;
+    return true;
+  } finally {
+    // Catch-all for unexpected throws (OOM, crash, etc.)
+    clearIndicators(chatJid);
+  }
 }
 
 async function runAgent(
@@ -284,6 +382,9 @@ async function runAgent(
       next_run: t.next_run,
     })),
   );
+
+  // Update pending email threads snapshot for container to read
+  writeEmailThreadsSnapshot(group.folder, isMain, getAllEmailThreads());
 
   // Update available groups snapshot (main group only can see all groups)
   const availableGroups = getAvailableGroups();
@@ -314,6 +415,7 @@ async function runAgent(
         groupFolder: group.folder,
         chatJid,
         isMain,
+        allowedTools: group.containerConfig?.allowedTools,
         assistantName: ASSISTANT_NAME,
       },
       (proc, containerName) =>
@@ -423,12 +525,10 @@ async function startMessageLoop(): Promise<void> {
             lastAgentTimestamp[chatJid] =
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
-            // Show typing indicator while the container processes the piped message
-            channel
-              .setTyping?.(chatJid, true)
-              ?.catch((err) =>
-                logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
-              );
+            // 👀 each piped message (cleared when IPC response arrives)
+            for (const msg of messagesToSend) {
+              setIndicator(channel, msg, chatJid);
+            }
           } else {
             // No active container — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
@@ -465,11 +565,102 @@ function ensureContainerSystemRunning(): void {
   cleanupOrphans();
 }
 
+// --- Heartbeat/sweep synthetic group ---
+
+const HEARTBEAT_GROUP = {
+  jid: 'heartbeat:sweep',
+  name: 'Proactive Sweep',
+  folder: 'heartbeat',
+  trigger: `@${ASSISTANT_NAME}`,
+  requiresTrigger: false,
+  allowedTools: [
+    // Standard tools
+    'Bash',
+    'Read',
+    'Write',
+    'Edit',
+    'Glob',
+    'Grep',
+    'WebSearch',
+    'WebFetch',
+    'Task',
+    'TaskOutput',
+    'TaskStop',
+    'ToolSearch',
+    // NanoClaw IPC — send_message routes to main
+    'mcp__nanoclaw__send_message',
+    'mcp__nanoclaw__schedule_task',
+    'mcp__nanoclaw__list_tasks',
+    'mcp__nanoclaw__update_email_thread',
+    'mcp__nanoclaw__list_email_threads',
+    // Full calendar access
+    'mcp__calendar__*',
+    // Time MCP
+    'mcp__time__*',
+    // Gmail (search + read, send for follow-ups)
+    'mcp__workspace__send_gmail_message',
+    'mcp__workspace__draft_gmail_message',
+    'mcp__workspace__search_gmail_messages',
+    'mcp__workspace__get_gmail_message_content',
+    'mcp__workspace__get_gmail_messages_content_batch',
+    'mcp__workspace__get_gmail_thread_content',
+    'mcp__workspace__get_gmail_attachment_content',
+    'mcp__workspace__list_gmail_labels',
+    // Contacts (for tier lookups)
+    'mcp__workspace__contacts_search',
+    'mcp__workspace__contacts_get',
+    // Workspace Chat (heartbeat logging)
+    'mcp__workspace__chat_send_message',
+    'mcp__workspace__chat_get_messages',
+  ],
+};
+
+/**
+ * Ensure synthetic groups exist for email/external-contact/heartbeat routing.
+ * Tool lists are synced from code on every restart so changes propagate.
+ * Idempotent.
+ */
+function ensureSyntheticGroups(): void {
+  for (const cfg of [
+    EMAIL_PRINCIPAL_GROUP,
+    EMAIL_EXTERNAL_GROUP,
+    HEARTBEAT_GROUP,
+  ]) {
+    const existing = registeredGroups[cfg.jid];
+    if (existing) {
+      // Sync allowedTools from code so tool list changes propagate on restart
+      existing.containerConfig = { allowedTools: cfg.allowedTools };
+      setRegisteredGroup(cfg.jid, existing);
+    } else {
+      registerGroup(cfg.jid, {
+        name: cfg.name,
+        folder: cfg.folder,
+        trigger: cfg.trigger,
+        added_at: new Date().toISOString(),
+        containerConfig: { allowedTools: cfg.allowedTools },
+        requiresTrigger: cfg.requiresTrigger,
+      });
+      logger.info(
+        { jid: cfg.jid, folder: cfg.folder },
+        'Auto-registered synthetic group',
+      );
+    }
+    // Ensure chats row exists (storeMessage has FK on chat_jid → chats.jid)
+    const source = cfg.jid.startsWith('email:') ? 'email' : 'synthetic';
+    storeChatMetadata(cfg.jid, new Date().toISOString(), cfg.name, source);
+  }
+}
+
 async function main(): Promise<void> {
   ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
   loadState();
+
+  // Validate EA config (fail fast if required env vars are missing)
+  validateEaConfig();
+
+  ensureSyntheticGroups();
 
   // Start credential proxy (containers route API calls through this)
   const proxyServer = await startCredentialProxy(
@@ -485,8 +676,11 @@ async function main(): Promise<void> {
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
   };
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+
+  // Track GChat group spaces so onMessage can skip auto-registration for them
+  const gchatGroupSpaces = new Set<string>();
 
   // Channel callbacks (shared by all channels)
   const channelOpts = {
@@ -508,6 +702,39 @@ async function main(): Promise<void> {
         }
       }
       storeMessage(msg);
+
+      // Auto-register unregistered GChat DM spaces based on sender identity
+      // Groups require manual registration (like WhatsApp)
+      if (
+        chatJid.startsWith('gchat:') &&
+        !registeredGroups[chatJid] &&
+        !gchatGroupSpaces.has(chatJid)
+      ) {
+        const isPrincipal = isPrincipalEmail(msg.sender);
+        if (isPrincipal) {
+          registerGroup(chatJid, {
+            name:
+              msg.sender_name?.replace(` [${PRINCIPAL_NAME}]`, '') ||
+              'Google Chat DM',
+            folder: MAIN_GROUP_FOLDER,
+            trigger: `@${ASSISTANT_NAME}`,
+            added_at: new Date().toISOString(),
+            requiresTrigger: false,
+            isMain: true,
+          });
+        } else {
+          registerGroup(chatJid, {
+            name: msg.sender_name || 'Google Chat DM',
+            folder: EMAIL_EXTERNAL_GROUP.folder,
+            trigger: `@${ASSISTANT_NAME}`,
+            added_at: new Date().toISOString(),
+            containerConfig: {
+              allowedTools: EMAIL_EXTERNAL_GROUP.allowedTools,
+            },
+            requiresTrigger: false,
+          });
+        }
+      }
     },
     onChatMetadata: (
       chatJid: string,
@@ -515,7 +742,11 @@ async function main(): Promise<void> {
       name?: string,
       channel?: string,
       isGroup?: boolean,
-    ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
+    ) => {
+      storeChatMetadata(chatJid, timestamp, name, channel, isGroup);
+      if (isGroup && chatJid.startsWith('gchat:'))
+        gchatGroupSpaces.add(chatJid);
+    },
     registeredGroups: () => registeredGroups,
   };
 
@@ -548,20 +779,67 @@ async function main(): Promise<void> {
     onProcess: (groupJid, proc, containerName, groupFolder) =>
       queue.registerProcess(groupJid, proc, containerName, groupFolder),
     sendMessage: async (jid, rawText) => {
-      const channel = findChannel(channels, jid);
+      const isSynthetic =
+        jid.startsWith('email:') || jid.startsWith('heartbeat:');
+      let targetJid = jid;
+      if (isSynthetic) {
+        const mainEntry = Object.entries(registeredGroups).find(
+          ([, g]) => g.folder === MAIN_GROUP_FOLDER,
+        );
+        if (mainEntry) targetJid = mainEntry[0];
+      }
+      const channel = findChannel(channels, targetJid);
       if (!channel) {
         logger.warn({ jid }, 'No channel owns JID, cannot send message');
         return;
       }
       const text = formatOutbound(rawText);
-      if (text) await channel.sendMessage(jid, text);
+      if (text) await channel.sendMessage(targetJid, text);
     },
   });
   startIpcWatcher({
-    sendMessage: (jid, text) => {
+    sendMessage: async (jid, text) => {
+      // Synthetic JIDs (email:*, heartbeat:*) have no channel —
+      // route to main channel instead.
+      const isSynthetic =
+        jid.startsWith('email:') || jid.startsWith('heartbeat:');
+
+      let channel: Channel | undefined;
+      let targetJid = jid;
+
+      if (isSynthetic) {
+        const mainEntry = Object.entries(registeredGroups).find(
+          ([, g]) => g.folder === MAIN_GROUP_FOLDER,
+        );
+        if (mainEntry) {
+          targetJid = mainEntry[0];
+          channel = findChannel(channels, targetJid);
+        }
+      } else {
+        channel = findChannel(channels, jid);
+      }
+
+      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      await channel.sendMessage(targetJid, text);
+      clearIndicators(targetJid);
+    },
+    sendReaction: async (jid, emoji, messageId) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      return channel.sendMessage(jid, text);
+      if (messageId) {
+        if (!channel.sendReaction)
+          throw new Error('Channel does not support sendReaction');
+        const messageKey = {
+          id: messageId,
+          remoteJid: jid,
+          fromMe: getMessageFromMe(messageId, jid),
+        };
+        await channel.sendReaction(jid, messageKey, emoji);
+      } else {
+        if (!channel.reactToLatestMessage)
+          throw new Error('Channel does not support reactions');
+        await channel.reactToLatestMessage(jid, emoji);
+      }
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
@@ -578,10 +856,93 @@ async function main(): Promise<void> {
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
-  startMessageLoop().catch((err) => {
-    logger.fatal({ err }, 'Message loop crashed unexpectedly');
-    process.exit(1);
+
+  // Email event source — direct agent invocation, output forwarded to main channel
+  startEmailLoop(async (email) => {
+    const mainJid = Object.entries(registeredGroups).find(
+      ([, g]) => g.folder === MAIN_GROUP_FOLDER,
+    )?.[0];
+    if (!mainJid) {
+      logger.warn('No main group registered, cannot process email');
+      return;
+    }
+
+    // Thread routing: check table first, then classify by sender
+    let targetFolder = getEmailThreadRoute(email.threadId);
+    if (!targetFolder) {
+      targetFolder = getEmailRouteGroup(email);
+    }
+    // Hijacking detection: third-party sender on principal-initiated thread.
+    const senderIsPrincipal = isPrincipalEmail(email.from);
+    if (targetFolder === 'email' && !senderIsPrincipal) {
+      logger.warn(
+        { from: email.from, subject: email.subject },
+        'Third-party sender on principal-initiated thread — downgrading to external-contact',
+      );
+      targetFolder = 'external-contact';
+      // Alert principal on main channel
+      const mainChannel = findChannel(channels, mainJid);
+      if (mainChannel) {
+        await mainChannel.sendMessage(
+          mainJid,
+          `Heads up: ${email.from} replied to "${email.subject}" and you're no longer on the thread.`,
+        );
+      }
+    }
+
+    // Upsert thread after hijacking detection so group_folder is correct
+    upsertEmailThread(email.threadId, targetFolder);
+
+    // Map folder → JID
+    const targetJid =
+      targetFolder === 'external-contact'
+        ? EMAIL_EXTERNAL_GROUP.jid
+        : EMAIL_PRINCIPAL_GROUP.jid;
+
+    const group = registeredGroups[targetJid];
+    if (!group) {
+      logger.warn(
+        { targetFolder, targetJid },
+        'Target group not registered, falling back to main',
+      );
+      const mainGroup = registeredGroups[mainJid];
+      const prompt = buildEmailPrompt(email);
+      await runAgent(mainGroup, prompt, mainJid);
+      return;
+    }
+
+    const isExternal = targetFolder === 'external-contact';
+    const prompt = buildEmailPrompt(email, isExternal);
+    const mainChannel = findChannel(channels, mainJid);
+
+    logger.info(
+      { from: email.from, subject: email.subject, route: targetFolder },
+      `Processing email via ${targetFolder} group agent`,
+    );
+
+    // Direct agent invocation with output forwarding to main
+    const output = await runAgent(group, prompt, targetJid, async (result) => {
+      if (result.result) {
+        const raw =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        if (text && mainChannel) {
+          await mainChannel.sendMessage(mainJid, text);
+        }
+      }
+    });
+
+    if (output === 'error') {
+      logger.error(
+        { from: email.from, subject: email.subject, route: targetFolder },
+        'Email agent processing failed',
+      );
+    }
   });
+
+  void startMessageLoop();
 }
 
 // Guard: only run when executed directly, not when imported by tests

@@ -14,7 +14,11 @@ import path from 'path';
 
 import { google, chat_v1 } from 'googleapis';
 
-import { GCHAT_POLL_INTERVAL, PRINCIPAL_NAME, isPrincipalEmail } from '../config.js';
+import {
+  GCHAT_POLL_INTERVAL,
+  PRINCIPAL_NAME,
+  isPrincipalEmail,
+} from '../config.js';
 import { getLatestMessage, getMessageById, storeReaction } from '../db.js';
 import { logger } from '../logger.js';
 import { Channel } from '../types.js';
