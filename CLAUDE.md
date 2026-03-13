@@ -25,10 +25,12 @@ Single Node.js process with skill-based channel system. Channels (WhatsApp, Tele
 
 | Skill | When to Use |
 |-------|-------------|
-| `/setup` | First-time installation, authentication, service configuration |
+| `/setup-ea` | First-time GWS-EA setup (runs full setup + Workspace OAuth + EA identity) |
+| `/setup` | Base NanoClaw setup (upstream — prefer `/setup-ea`) |
 | `/customize` | Adding channels, integrations, changing behavior |
 | `/debug` | Container issues, logs, troubleshooting |
-| `/update-nanoclaw` | Bring upstream NanoClaw updates into a customized install |
+| `/update-ea` | Pull nanoclaw-gws-ea updates into your fork |
+| `/update-nanoclaw` | Pull upstream qwibitai/nanoclaw into gws-ea (maintainer only) |
 | `/qodo-pr-resolver` | Fetch and fix Qodo PR review issues interactively or in batch |
 | `/get-qodo-rules` | Load org- and repo-level coding rules from Qodo before code tasks |
 
@@ -58,6 +60,19 @@ systemctl --user restart nanoclaw
 ## Troubleshooting
 
 **WhatsApp not connecting after upgrade:** WhatsApp is now a separate channel fork, not bundled in core. Run `/add-whatsapp` (or `git remote add whatsapp https://github.com/qwibitai/nanoclaw-whatsapp.git && git fetch whatsapp main && (git merge whatsapp/main || { git checkout --theirs package-lock.json && git add package-lock.json && git merge --continue; }) && npm run build`) to install it. Existing auth credentials and groups are preserved.
+
+## GWS-EA Additions
+
+| File | Purpose |
+|------|---------|
+| `src/channels/gchat.ts` | Google Chat channel (polling, thread tracking, reactions) |
+| `src/email.ts` | Gmail event source: polls inbox, routes by sender identity |
+| `src/workspace-auth.ts` | One-time OAuth setup for Workspace scopes |
+| `groups/global/profile.md` | EA identity, calendars, integrations (single source of truth) |
+
+Groups: `main/` (GChat DM), `email-principal/`, `email-external/`, `heartbeat/`, `global/` (shared procedures).
+
+Fork sync: `/update-nanoclaw` pulls from `qwibitai/nanoclaw` → gws-ea. Users run `/update-ea` to pull from gws-ea → their fork. Core files modified by this fork (`config.ts`, `types.ts`, `db.ts`, `index.ts`, `ipc.ts`, `container-runner.ts`) are the likely conflict points.
 
 ## Container Build Cache
 
