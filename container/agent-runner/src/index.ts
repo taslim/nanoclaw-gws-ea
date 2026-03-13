@@ -26,6 +26,7 @@ interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  allowedTools?: string[];
   assistantName?: string;
 }
 
@@ -53,6 +54,21 @@ interface SDKUserMessage {
   parent_tool_use_id: null;
   session_id: string;
 }
+
+// Default tool list when no per-group restrictions are set
+const DEFAULT_ALLOWED_TOOLS = [
+  'Bash',
+  'Read', 'Write', 'Edit', 'Glob', 'Grep',
+  'WebSearch', 'WebFetch',
+  'Task', 'TaskOutput', 'TaskStop',
+  'TeamCreate', 'TeamDelete', 'SendMessage',
+  'TodoWrite', 'ToolSearch', 'Skill',
+  'NotebookEdit',
+  'mcp__nanoclaw__*',
+  'mcp__time__*',
+  'mcp__calendar__*',
+  'mcp__workspace__*',
+];
 
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
@@ -389,6 +405,64 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  const effectiveTools = containerInput.allowedTools || DEFAULT_ALLOWED_TOOLS;
+
+  // Only start MCP servers whose tools are in the effective allowed list
+  const hasCalendarTools = effectiveTools.some(t => t === 'mcp__calendar__*' || t.startsWith('mcp__calendar__'));
+
+  const mcpServers: Record<string, { command: string; args: string[]; env?: Record<string, string> }> = {
+    nanoclaw: {
+      command: 'node',
+      args: [mcpServerPath],
+      env: {
+        NANOCLAW_CHAT_JID: containerInput.chatJid,
+        NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
+        NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+      },
+    },
+  };
+
+  const hasTimeTools = effectiveTools.some(t => t === 'mcp__time__*' || t.startsWith('mcp__time__'));
+  if (hasTimeTools) {
+    mcpServers.time = {
+      command: 'node',
+      args: [path.join(path.dirname(mcpServerPath), 'time-mcp.js')],
+      env: { NANOCLAW_PRIMARY_TIMEZONE: process.env.TZ || 'UTC' },
+    };
+  }
+
+  if (hasCalendarTools) {
+    mcpServers.calendar = {
+      command: 'google-calendar-mcp',
+      args: [],
+      env: {
+        GOOGLE_OAUTH_CREDENTIALS: '/home/node/.calendar-mcp/gcp-oauth.keys.json',
+        GOOGLE_CALENDAR_MCP_TOKEN_PATH: '/home/node/.calendar-mcp/tokens.json',
+      },
+    };
+  }
+
+  const hasWorkspaceTools = effectiveTools.some(
+    t => t === 'mcp__workspace__*' || t.startsWith('mcp__workspace__'),
+  );
+
+  if (hasWorkspaceTools) {
+    mcpServers.workspace = {
+      command: '/opt/google_workspace_mcp/.venv/bin/python',
+      args: [
+        '/opt/google_workspace_mcp/main.py',
+        '--single-user',
+        '--tools', 'chat', 'drive', 'docs', 'sheets', 'tasks', 'contacts', 'gmail',
+      ],
+      env: {
+        GOOGLE_OAUTH_CLIENT_ID: (sdkEnv.GOOGLE_OAUTH_CLIENT_ID as string) || '',
+        GOOGLE_OAUTH_CLIENT_SECRET: (sdkEnv.GOOGLE_OAUTH_CLIENT_SECRET as string) || '',
+        WORKSPACE_MCP_CREDENTIALS_DIR: '/home/node/.workspace-mcp/credentials',
+        OAUTHLIB_INSECURE_TRANSPORT: '1',
+      },
+    };
+  }
+
   for await (const message of query({
     prompt: stream,
     options: {
@@ -399,31 +473,12 @@ async function runQuery(
       systemPrompt: globalClaudeMd
         ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
         : undefined,
-      allowedTools: [
-        'Bash',
-        'Read', 'Write', 'Edit', 'Glob', 'Grep',
-        'WebSearch', 'WebFetch',
-        'Task', 'TaskOutput', 'TaskStop',
-        'TeamCreate', 'TeamDelete', 'SendMessage',
-        'TodoWrite', 'ToolSearch', 'Skill',
-        'NotebookEdit',
-        'mcp__nanoclaw__*'
-      ],
+      allowedTools: effectiveTools,
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
-      mcpServers: {
-        nanoclaw: {
-          command: 'node',
-          args: [mcpServerPath],
-          env: {
-            NANOCLAW_CHAT_JID: containerInput.chatJid,
-            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
-            NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
-          },
-        },
-      },
+      mcpServers,
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
       },

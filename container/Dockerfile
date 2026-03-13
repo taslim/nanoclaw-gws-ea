@@ -3,7 +3,7 @@
 
 FROM node:22-slim
 
-# Install system dependencies for Chromium
+# Install system dependencies for Chromium + Python for google_workspace_mcp
 RUN apt-get update && apt-get install -y \
     chromium \
     fonts-liberation \
@@ -24,14 +24,22 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     curl \
     git \
+    python3 python3-pip python3-venv \
     && rm -rf /var/lib/apt/lists/*
+
+# Install uv (Python package manager) and google_workspace_mcp
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+RUN git clone --depth 1 https://github.com/taylorwilsdon/google_workspace_mcp.git /opt/google_workspace_mcp \
+    && cd /opt/google_workspace_mcp && uv sync
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
-# Install agent-browser and claude-code globally
-RUN npm install -g agent-browser @anthropic-ai/claude-code
+# Install agent-browser, claude-code, and MCP servers globally
+RUN npm install -g agent-browser @anthropic-ai/claude-code \
+    @cocal/google-calendar-mcp
 
 # Create app directory
 WORKDIR /app
