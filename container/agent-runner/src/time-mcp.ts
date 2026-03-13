@@ -345,7 +345,11 @@ server.tool(
           let slotTime = cursor.set({ hour: startH, minute: startM, second: 0 });
           const endTime = cursor.set({ hour: endH, minute: endM, second: 0 });
 
-          while (slotTime < endTime) {
+          // Clip to the requested [from, to] window on first/last days
+          if (slotTime < fromDt) slotTime = fromDt;
+          const clippedEnd = endTime > toDt ? toDt : endTime;
+
+          while (slotTime < clippedEnd) {
             slots.push({
               date: slotTime.toFormat('EEE, MMM d'),
               day: slotTime.toFormat('EEEE'),

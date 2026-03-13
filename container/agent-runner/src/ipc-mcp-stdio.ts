@@ -379,9 +379,16 @@ server.tool(
         threads = threads.filter((t) => t.status !== 'resolved');
       }
 
-      // Filter by time
+      // Filter by time (compare as epoch ms to handle timezone/format variations)
       if (args.since) {
-        threads = threads.filter((t) => t.updated_at >= args.since!);
+        const sinceMs = Date.parse(args.since);
+        if (Number.isNaN(sinceMs)) {
+          return {
+            content: [{ type: 'text' as const, text: `Invalid since datetime: "${args.since}". Use an ISO datetime.` }],
+            isError: true,
+          };
+        }
+        threads = threads.filter((t) => Date.parse(t.updated_at) >= sinceMs);
       }
 
       if (threads.length === 0) {
