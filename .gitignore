@@ -53,6 +53,12 @@ groups/*/auth/
 .idea/
 .vscode/
 
+# Claude Code agent memory
+.claude/agent-memory/
+
+# Maintainer-only skills (not for gws-ea)
+.claude/skills/sync-gws-ea/
+
 # Skills system (local per-installation state)
 .nanoclaw/
 

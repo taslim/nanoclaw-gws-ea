@@ -655,6 +655,7 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
   loadState();
+  ensureSyntheticGroups();
 
   // Validate EA config (fail fast if required env vars are missing)
   validateEaConfig();

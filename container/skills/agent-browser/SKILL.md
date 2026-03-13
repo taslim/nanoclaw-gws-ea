@@ -104,7 +104,7 @@ agent-browser find placeholder "Search" type "query"
 ### Authentication with saved state
 
 ```bash
-# Login once
+# Login once, then save state
 agent-browser open https://app.example.com/login
 agent-browser snapshot -i
 agent-browser fill @e1 "username"
@@ -113,9 +113,8 @@ agent-browser click @e3
 agent-browser wait --url "**/dashboard"
 agent-browser state save auth.json
 
-# Later: load saved state
-agent-browser state load auth.json
-agent-browser open https://app.example.com/dashboard
+# Later: launch browser with saved state (use --state flag on open)
+agent-browser --state auth.json open https://app.example.com/dashboard
 ```
 
 ### Cookies & Storage
