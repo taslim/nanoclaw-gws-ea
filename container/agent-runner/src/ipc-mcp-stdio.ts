@@ -63,6 +63,29 @@ server.tool(
 );
 
 server.tool(
+  'react_to_message',
+  'React to a message with an emoji. Omit message_id to react to the most recent message in the chat.',
+  {
+    emoji: z.string().describe('The emoji to react with (e.g. "👍", "❤️", "🔥")'),
+    message_id: z.string().optional().describe('The message ID to react to. If omitted, reacts to the latest message in the chat.'),
+  },
+  async (args) => {
+    const data: Record<string, string | undefined> = {
+      type: 'reaction',
+      chatJid,
+      emoji: args.emoji,
+      messageId: args.message_id || undefined,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: `Reaction ${args.emoji} sent.` }] };
+  },
+);
+
+server.tool(
   'schedule_task',
   `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools. Returns the task ID for future reference. To modify an existing task, use update_task instead.
 
@@ -329,6 +352,94 @@ Use available_groups.json to find the JID for a group. The folder name must be c
 
     return {
       content: [{ type: 'text' as const, text: `Group "${args.name}" registered. It will start receiving messages immediately.` }],
+    };
+  },
+);
+
+server.tool(
+  'list_email_threads',
+  "List email threads. By default shows threads needing attention (pending, escalated, waiting). Use include_resolved to also see resolved threads. Use since to filter by update time (ISO datetime).",
+  {
+    include_resolved: z.boolean().optional().describe('Include resolved threads (default: false)'),
+    since: z.string().optional().describe('Only return threads updated after this ISO datetime'),
+  },
+  async (args: { include_resolved?: boolean; since?: string }) => {
+    const threadsFile = path.join(IPC_DIR, 'pending_threads.json');
+
+    try {
+      if (!fs.existsSync(threadsFile)) {
+        return { content: [{ type: 'text' as const, text: 'No email threads.' }] };
+      }
+
+      let threads: Array<{ thread_id: string; group_folder: string; status: string; reason: string | null; updated_at: string }> =
+        JSON.parse(fs.readFileSync(threadsFile, 'utf-8'));
+
+      // Filter by status (default: exclude resolved)
+      if (!args.include_resolved) {
+        threads = threads.filter((t) => t.status !== 'resolved');
+      }
+
+      // Filter by time (compare as epoch ms to handle timezone/format variations)
+      if (args.since) {
+        const sinceMs = Date.parse(args.since);
+        if (Number.isNaN(sinceMs)) {
+          return {
+            content: [{ type: 'text' as const, text: `Invalid since datetime: "${args.since}". Use an ISO datetime.` }],
+            isError: true,
+          };
+        }
+        threads = threads.filter((t) => Date.parse(t.updated_at) >= sinceMs);
+      }
+
+      if (threads.length === 0) {
+        return { content: [{ type: 'text' as const, text: 'No email threads matching filters.' }] };
+      }
+
+      const formatted = threads
+        .map(
+          (t) =>
+            `- [${t.thread_id}] ${t.status}${t.reason ? ` (${t.reason})` : ''} — ${t.group_folder}, updated ${t.updated_at}`,
+        )
+        .join('\n');
+
+      const label = args.include_resolved ? 'Email threads' : 'Pending email threads';
+      return { content: [{ type: 'text' as const, text: `${label}:\n${formatted}` }] };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error reading threads: ${err instanceof Error ? err.message : String(err)}` }],
+      };
+    }
+  },
+);
+
+server.tool(
+  'update_email_thread',
+  `Update the triage status of an email thread. Creates the thread if it doesn't exist yet — use this to track outbound-only emails at send time (e.g., set "waiting" right after sending an email that expects a reply).
+
+Statuses:
+• "resolved" — thread handled (reason: "responded", "no_action_needed", "forwarded", etc.)
+• "waiting" — waiting on someone (reason: "waiting_for:Sandra", "waiting_for:vendor_reply", etc.). Always set this when you send an email that expects a response.
+• "escalated" — escalated to Tas for decision
+• "pending" — reopen a thread (rarely needed; new inbound messages auto-reset to pending)`,
+  {
+    thread_id: z.string().describe('The Gmail thread ID'),
+    status: z.enum(['pending', 'resolved', 'waiting', 'escalated']).describe('New triage status'),
+    reason: z.string().optional().describe('Why this status was set (e.g., "responded", "waiting_for:Sandra")'),
+  },
+  async (args) => {
+    const data = {
+      type: 'update_email_thread',
+      threadId: args.thread_id,
+      status: args.status,
+      reason: args.reason || undefined,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{ type: 'text' as const, text: `Thread ${args.thread_id} marked as ${args.status}${args.reason ? ` (${args.reason})` : ''}.` }],
     };
   },
 );

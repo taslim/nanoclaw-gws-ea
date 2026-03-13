@@ -270,10 +270,10 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
       logger.error({ err }, 'Error in scheduler loop');
     }
 
-    setTimeout(loop, SCHEDULER_POLL_INTERVAL);
+    setTimeout(() => void loop(), SCHEDULER_POLL_INTERVAL);
   };
 
-  loop();
+  void loop();
 }
 
 /** @internal - for tests only. */

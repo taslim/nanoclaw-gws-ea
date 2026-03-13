@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  NanoClaw —— 您的专属 Claude 助手，在容器中安全运行。它轻巧易懂，并能根据您的个人需求灵活定制。
+  我的个人 Claude 助手，安全地运行在容器中。它轻巧、易于理解，并可根据你自己的需求进行定制。
 </p>
 
 <p align="center">
@@ -22,10 +22,10 @@
 
 NanoClaw 用一个您能快速理解的代码库，为您提供了同样的核心功能。只有一个进程，少数几个文件。智能体（Agent）运行在具有文件系统隔离的真实 Linux 容器中，而不是依赖于权限检查。
 
-## 快速开始
+## 快速上手
 
 ```bash
-git clone https://github.com/qwibitai/nanoclaw.git
+git clone https://github.com/gavrielc/nanoclaw.git
 cd nanoclaw
 claude
 ```
@@ -36,9 +36,9 @@ claude
 
 ## 设计哲学
 
-**小巧易懂：** 单一进程，少量源文件。无微服务、无消息队列、无复杂抽象层。让 Claude Code 引导您轻松上手。
+**小到可以理解:** 一个进程，几个源文件。没有微服务，没有消息队列，没有抽象层。让 Claude Code 带你过一遍代码。
 
-**通过隔离保障安全:** 智能体运行在 Linux 容器（在 macOS 上是 Apple Container，或 Docker）中。它们只能看到被明确挂载的内容。即便通过 Bash 访问也十分安全，因为所有命令都在容器内执行，不会直接操作您的宿主机。
+**通过隔离保障安全:** 智能体运行在 Linux 容器（在 macOS 上是 Apple Container，或 Docker）中。它们只能看到被明确挂载的内容。即使是 Bash 访问也是安全的，因为命令是在容器内部执行，而不是在你的主机上。
 
 **为单一用户打造:** 这不是一个框架，是一个完全符合您个人需求的、可工作的软件。您可以 Fork 本项目，然后让 Claude Code 根据您的精确需求进行修改和适配。
 
@@ -46,7 +46,7 @@ claude
 
 **AI 原生:** 无安装向导（由 Claude Code 指导安装）。无需监控仪表盘，直接询问 Claude 即可了解系统状况。无调试工具（描述问题，Claude 会修复它）。
 
-**技能（Skills）优于功能（Features）:** 贡献者不应该向代码库添加新功能（例如支持 Telegram）。相反，他们应该贡献像 `/add-telegram` 这样的 [Claude Code 技能](https://code.claude.com/docs/en/skills)，这些技能可以改造您的 fork。最终，您得到的是只做您需要事情的整洁代码。
+**技能（Skills）优于功能（Features）:** 贡献者不应该向代码库添加新功能（例如支持 Telegram）。相反，他们应该贡献像 `/add-telegram` 这样的 [Claude Code 技能](https://code.claude.com/docs/en/skills)，这些技能可以改造你的 fork。最终，你得到的是只做你需要事情的整洁代码。
 
 **最好的工具套件，最好的模型:** 本项目运行在 Claude Agent SDK 之上，这意味着您直接运行的就是 Claude Code。Claude Code 高度强大，其编码和问题解决能力使其能够修改和扩展 NanoClaw，为每个用户量身定制。
 
@@ -63,7 +63,7 @@ claude
 
 ## 使用方法
 
-使用触发词（默认为 `@Andy`）与您的助手对话：
+使用触发词（默认为 `@Andy`）与你的助手对话：
 
 ```
 @Andy 每周一到周五早上9点，给我发一份销售渠道的概览（需要访问我的 Obsidian vault 文件夹）
@@ -71,7 +71,7 @@ claude
 @Andy 每周一早上8点，从 Hacker News 和 TechCrunch 收集关于 AI 发展的资讯，然后发给我一份简报
 ```
 
-在主频道（您的self-chat）中，可以管理群组和任务：
+在主频道（你的self-chat）中，可以管理群组和任务：
 ```
 @Andy 列出所有群组的计划任务
 @Andy 暂停周一简报任务
@@ -80,7 +80,7 @@ claude
 
 ## 定制
 
-没有需要学习的配置文件。直接告诉 Claude Code 您想要什么：
+没有需要学习的配置文件。直接告诉 Claude Code 你想要什么：
 
 - "把触发词改成 @Bob"
 - "记住以后回答要更简短直接"
@@ -95,9 +95,9 @@ claude
 
 **不要添加功能，而是添加技能。**
 
-如果您想添加 Telegram 支持，不要创建一个 PR 同时添加 Telegram 和 WhatsApp。而是贡献一个技能文件 (`.claude/skills/add-telegram/SKILL.md`)，教 Claude Code 如何改造一个 NanoClaw 安装以使用 Telegram。
+如果你想添加 Telegram 支持，不要创建一个 PR 同时添加 Telegram 和 WhatsApp。而是贡献一个技能文件 (`.claude/skills/add-telegram/SKILL.md`)，教 Claude Code 如何改造一个 NanoClaw 安装以使用 Telegram。
 
-然后用户在自己的 fork 上运行 `/add-telegram`，就能得到只做他们需要事情的整洁代码，而不是一个试图支持所有用例的臃肿系统。
+然后用户在自己的 fork 上运行 `/add-telegram`，就能得到只做他们需要的事情的整洁代码，而不是一个试图支持所有用例的臃肿系统。
 
 ### RFS (技能征集)
 
@@ -141,19 +141,19 @@ claude
 
 **为什么是 Docker？**
 
-Docker 提供跨平台支持（macOS 和 Linux）和成熟的生态系统。在 macOS 上，您可以选择通过运行 `/convert-to-apple-container` 切换到 Apple Container，以获得更轻量级的原生运行时体验。
+Docker 提供跨平台支持（macOS 和 Linux）和成熟的生态系统。在 macOS 上，你可以选择通过 `/convert-to-apple-container` 切换到 Apple Container 以获得更轻量的原生运行时。
 
 **我可以在 Linux 上运行吗？**
 
 可以。Docker 是默认的容器运行时，在 macOS 和 Linux 上都可以使用。只需运行 `/setup`。
 
-**这个项目安全吗？**
+**这个安全吗？**
 
-智能体在容器中运行，而不是在应用级别的权限检查之后。它们只能访问被明确挂载的目录。您仍然应该审查您运行的代码，但这个代码库小到您真的可以做到。完整的安全模型请见 [docs/SECURITY.md](docs/SECURITY.md)。
+智能体在容器中运行，而不是在应用级别的权限检查之后。它们只能访问被明确挂载的目录。你仍然应该审查你运行的代码，但这个代码库小到你真的可以做到。完整的安全模型请见 [docs/SECURITY.md](docs/SECURITY.md)。
 
 **为什么没有配置文件？**
 
-我们不希望配置泛滥。每个用户都应该定制它，让代码完全符合他们的需求，而不是去配置一个通用的系统。如果您喜欢用配置文件，告诉 Claude 让它加上。
+我们不希望配置泛滥。每个用户都应该定制它，让代码完全符合他们的需求，而不是去配置一个通用的系统。如果你喜欢用配置文件，告诉 Claude 让它加上。
 
 **我可以使用第三方或开源模型吗？**
 

@@ -55,21 +55,6 @@ interface SDKUserMessage {
   session_id: string;
 }
 
-// Default tool list when no per-group restrictions are set
-const DEFAULT_ALLOWED_TOOLS = [
-  'Bash',
-  'Read', 'Write', 'Edit', 'Glob', 'Grep',
-  'WebSearch', 'WebFetch',
-  'Task', 'TaskOutput', 'TaskStop',
-  'TeamCreate', 'TeamDelete', 'SendMessage',
-  'TodoWrite', 'ToolSearch', 'Skill',
-  'NotebookEdit',
-  'mcp__nanoclaw__*',
-  'mcp__time__*',
-  'mcp__calendar__*',
-  'mcp__workspace__*',
-];
-
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
@@ -405,11 +390,8 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
-  const effectiveTools = containerInput.allowedTools || DEFAULT_ALLOWED_TOOLS;
-
-  // Only start MCP servers whose tools are in the effective allowed list
-  const hasCalendarTools = effectiveTools.some(t => t === 'mcp__calendar__*' || t.startsWith('mcp__calendar__'));
-
+  // MCP servers: nanoclaw always runs; others start only if credentials are mounted.
+  // The SDK's allowedTools handles authorization — we only check availability here.
   const mcpServers: Record<string, { command: string; args: string[]; env?: Record<string, string> }> = {
     nanoclaw: {
       command: 'node',
@@ -422,16 +404,16 @@ async function runQuery(
     },
   };
 
-  const hasTimeTools = effectiveTools.some(t => t === 'mcp__time__*' || t.startsWith('mcp__time__'));
-  if (hasTimeTools) {
+  const timeMcpPath = path.join(path.dirname(mcpServerPath), 'time-mcp.js');
+  if (fs.existsSync(timeMcpPath)) {
     mcpServers.time = {
       command: 'node',
-      args: [path.join(path.dirname(mcpServerPath), 'time-mcp.js')],
+      args: [timeMcpPath],
       env: { NANOCLAW_PRIMARY_TIMEZONE: process.env.TZ || 'UTC' },
     };
   }
 
-  if (hasCalendarTools) {
+  if (fs.existsSync('/home/node/.calendar-mcp')) {
     mcpServers.calendar = {
       command: 'google-calendar-mcp',
       args: [],
@@ -442,11 +424,7 @@ async function runQuery(
     };
   }
 
-  const hasWorkspaceTools = effectiveTools.some(
-    t => t === 'mcp__workspace__*' || t.startsWith('mcp__workspace__'),
-  );
-
-  if (hasWorkspaceTools) {
+  if (fs.existsSync('/home/node/.workspace-mcp/credentials')) {
     mcpServers.workspace = {
       command: '/opt/google_workspace_mcp/.venv/bin/python',
       args: [
@@ -473,7 +451,17 @@ async function runQuery(
       systemPrompt: globalClaudeMd
         ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
         : undefined,
-      allowedTools: effectiveTools,
+      allowedTools: containerInput.allowedTools || [
+        'Bash',
+        'Read', 'Write', 'Edit', 'Glob', 'Grep',
+        'WebSearch', 'WebFetch',
+        'Task', 'TaskOutput', 'TaskStop',
+        'TeamCreate', 'TeamDelete', 'SendMessage',
+        'TodoWrite', 'ToolSearch', 'Skill',
+        'NotebookEdit',
+        'mcp__nanoclaw__*',
+        ...Object.keys(mcpServers).filter(k => k !== 'nanoclaw').map(k => `mcp__${k}__*`),
+      ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
