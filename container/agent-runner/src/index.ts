@@ -430,7 +430,7 @@ async function runQuery(
       args: [
         '/opt/google_workspace_mcp/main.py',
         '--single-user',
-        '--tools', 'chat', 'drive', 'docs', 'sheets', 'tasks', 'contacts', 'gmail',
+        '--tools', 'chat', 'drive', 'docs', 'sheets', 'contacts', 'gmail',
       ],
       env: {
         GOOGLE_OAUTH_CLIENT_ID: (sdkEnv.GOOGLE_OAUTH_CLIENT_ID as string) || '',

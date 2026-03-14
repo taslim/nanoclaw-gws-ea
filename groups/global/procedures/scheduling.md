@@ -3,7 +3,7 @@
 Read this before any calendar operation. Read `profile.md` for the calendar table (IDs, modes, notes).
 
 ## Week Template
-     
+
 Availability hours are the hard boundary for Tier 2-4 scheduling. Tier 1 (family, inner circle) gets flexibility beyond these windows — use the notes and judgment to find something that works.
 
 <!-- Customize this template for your principal's typical week. -->
@@ -36,7 +36,7 @@ Availability hours are the hard boundary for Tier 2-4 scheduling. Tier 1 (family
 
 ## Calendar Access
 
-Persona.md defines each calendar with an ID, mode, and notes. Respect the mode:
+Profile.md defines each calendar with an ID, mode, and notes. Respect the mode:
 
 - **freebusy** — you can see when your principal is blocked but not why. Treat as immovable terrain. Schedule around it.
 - **readonly** — you can read event details but not modify. Use for context only.
@@ -55,14 +55,14 @@ The question is never "should I confirm this?" It's **how hard is this to undo i
 
 ### Who's asking matters
 
-Match scheduling effort and slot quality to how important the person is:
+→ See `procedures/relationships.md` for tier definitions, assessment, and Google Contacts lookup.
 
-- **Tier 1 (inner circle):** Prime time slots, maximum flexibility. Accommodate quickly, move other things if needed. A vague "let's catch up" is enough — book it.
-- **Tier 2 (active professional contacts):** Good slots within 48 hours. Standard scheduling flow. Brief your principal before the meeting if context would help.
-- **Tier 3 (redirectable requests):** Margins and off-peak slots. If the ask is vague or the purpose unclear, ask what it's about before offering time. If it doesn't need your principal specifically, redirect.
-- **Tier 4 (cold outreach, low-priority):** Default to declining politely. If there's a reason to engage, offer the most constrained availability. Never displace anything for a Tier 4 request.
+Match scheduling effort and slot quality to tier:
 
-Tiers are stored as Google Contacts labels (Tier 1, Tier 2, Tier 3). A contact with no tier label defaults to Tier 3. Someone not in Google Contacts at all is Tier 4. Check Google Contacts (`mcp__workspace__contacts_search`) before deciding.
+- **Tier 1:** Prime time slots, maximum flexibility. Accommodate quickly, move other things if needed. A vague "let's catch up" is enough — book it.
+- **Tier 2:** Good slots within 48 hours. Standard scheduling flow. Brief your principal before the meeting if context would help.
+- **Tier 3:** Margins and off-peak slots. If the ask is vague or the purpose unclear, ask what it's about before offering time. If it doesn't need your principal specifically, redirect.
+- **Tier 4:** Default to declining politely. If there's a reason to engage, offer the most constrained availability. Never displace anything for a Tier 4 request.
 
 ### Bias for action
 

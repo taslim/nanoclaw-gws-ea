@@ -81,9 +81,10 @@ export const EMAIL_PRINCIPAL_GROUP = {
     'mcp__calendar__*',
     // Time MCP — date math, timezone conversions
     'mcp__time__*',
-    // Google Workspace — contacts, docs, sheets, drive (no Chat admin)
+    // Google Workspace — contacts (read + write), docs, sheets, drive (no Chat admin)
     'mcp__workspace__contacts_search',
     'mcp__workspace__contacts_get',
+    'mcp__workspace__manage_contact',
     'mcp__workspace__drive_search_files',
     'mcp__workspace__drive_read_file',
     'mcp__workspace__drive_create_file',
@@ -95,10 +96,6 @@ export const EMAIL_PRINCIPAL_GROUP = {
     'mcp__workspace__sheets_create_spreadsheet',
     'mcp__workspace__sheets_read_spreadsheet',
     'mcp__workspace__sheets_update_spreadsheet',
-    'mcp__workspace__tasks_list',
-    'mcp__workspace__tasks_create',
-    'mcp__workspace__tasks_update',
-    'mcp__workspace__tasks_delete',
   ],
 };
 

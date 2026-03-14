@@ -67,6 +67,20 @@ After handling any thread, update its status: `mcp__nanoclaw__update_email_threa
 
 **Done when:** All tracked threads are actioned.
 
+### Relationships
+
+Follow `/workspace/global/procedures/relationships.md` for tier definitions and contact management rules.
+
+**Check for:**
+- People your principal interacted with (email or calendar) who aren't in Contacts → apply the relationships procedure threshold. If they belong, create with name, email, org, and tier. Default to Tier 3 unless signals indicate higher
+- Contacts with no tier label and no recent interaction (30 days) → assess interaction history, assign a tier or remove
+- Tier 1 contacts with no email or calendar interaction in 4+ weeks → note in heartbeat
+- Tier 2 contacts with no interaction in 12+ weeks → same
+
+Don't initiate outreach for stale relationships — your principal may have context outside the system. Surface the gap, act when they say to.
+
+**Done when:** Untracked contacts are created, untiered contacts are classified or removed, and stale relationships are surfaced.
+
 ### Logistics
 
 **Scope:** Events in the next 7 days.
@@ -105,6 +119,7 @@ Only report what's *new or changed* since the last sweep. Before posting, verify
 <users/all> [Sweep {time}]
 *Calendar*: {what you found and did}
 *Email*: {what you found and did}
+*Relationships*: {what you found and did}
 *Logistics*: {what you found and did}
 *Needs decision*: {items queued for morning briefing, if any}
 ```

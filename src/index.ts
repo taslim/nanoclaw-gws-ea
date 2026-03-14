@@ -605,9 +605,12 @@ const HEARTBEAT_GROUP = {
     'mcp__workspace__get_gmail_thread_content',
     'mcp__workspace__get_gmail_attachment_content',
     'mcp__workspace__list_gmail_labels',
-    // Contacts (for tier lookups)
+    // Contacts (tier lookups + relationship management)
     'mcp__workspace__contacts_search',
     'mcp__workspace__contacts_get',
+    'mcp__workspace__manage_contact',
+    'mcp__workspace__list_contact_groups',
+    'mcp__workspace__manage_contact_group',
     // Workspace Chat (heartbeat logging)
     'mcp__workspace__chat_send_message',
     'mcp__workspace__chat_get_messages',
