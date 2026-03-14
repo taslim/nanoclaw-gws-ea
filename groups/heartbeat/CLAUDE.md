@@ -80,7 +80,6 @@ Skip routine recurring 1:1s or meetings where all attendees are well-known Tier 
 
 **Done when:** All meetings in the 2–3 hour window have briefs or were correctly skipped.
 
-
 ### Relationships
 
 Follow `/workspace/global/procedures/relationships.md` for tier definitions and contact management rules.
