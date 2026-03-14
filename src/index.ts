@@ -4,6 +4,7 @@ import path from 'path';
 import {
   ASSISTANT_NAME,
   CREDENTIAL_PROXY_PORT,
+  HEARTBEAT_SPACE_ID,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
   PRINCIPAL_NAME,
@@ -12,6 +13,7 @@ import {
   isPrincipalEmail,
   validateEaConfig,
 } from './config.js';
+import { HEARTBEAT_GROUP } from './heartbeat.js';
 import { startCredentialProxy } from './credential-proxy.js';
 import './channels/index.js';
 import {
@@ -564,92 +566,80 @@ function ensureContainerSystemRunning(): void {
   cleanupOrphans();
 }
 
-// --- Heartbeat/sweep synthetic group ---
+/**
+ * Resolve a JID to a channel. If no channel owns the JID,
+ * falls back to the main group's channel.
+ */
+function resolveChannel(jid: string): {
+  channel: Channel | undefined;
+  targetJid: string;
+} {
+  const channel = findChannel(channels, jid);
+  if (channel) return { channel, targetJid: jid };
 
-const HEARTBEAT_GROUP = {
-  jid: 'heartbeat:sweep',
-  name: 'Proactive Sweep',
-  folder: 'heartbeat',
-  trigger: `@${ASSISTANT_NAME}`,
-  requiresTrigger: false,
-  allowedTools: [
-    // Standard tools
-    'Bash',
-    'Read',
-    'Write',
-    'Edit',
-    'Glob',
-    'Grep',
-    'WebSearch',
-    'WebFetch',
-    'Task',
-    'TaskOutput',
-    'TaskStop',
-    'ToolSearch',
-    // NanoClaw IPC — send_message routes to main
-    'mcp__nanoclaw__send_message',
-    'mcp__nanoclaw__schedule_task',
-    'mcp__nanoclaw__list_tasks',
-    'mcp__nanoclaw__update_email_thread',
-    'mcp__nanoclaw__list_email_threads',
-    // Full calendar access
-    'mcp__calendar__*',
-    // Time MCP
-    'mcp__time__*',
-    // Gmail (search + read, send for follow-ups)
-    'mcp__workspace__send_gmail_message',
-    'mcp__workspace__draft_gmail_message',
-    'mcp__workspace__search_gmail_messages',
-    'mcp__workspace__get_gmail_message_content',
-    'mcp__workspace__get_gmail_messages_content_batch',
-    'mcp__workspace__get_gmail_thread_content',
-    'mcp__workspace__get_gmail_attachment_content',
-    'mcp__workspace__list_gmail_labels',
-    // Contacts (tier lookups + relationship management)
-    'mcp__workspace__contacts_search',
-    'mcp__workspace__contacts_get',
-    'mcp__workspace__manage_contact',
-    'mcp__workspace__list_contact_groups',
-    'mcp__workspace__manage_contact_group',
-    // Workspace Chat (heartbeat logging)
-    'mcp__workspace__chat_send_message',
-    'mcp__workspace__chat_get_messages',
-  ],
-};
+  // No channel owns this JID — route to main
+  const mainEntry = Object.entries(registeredGroups).find(
+    ([, g]) => g.folder === MAIN_GROUP_FOLDER,
+  );
+  if (!mainEntry) return { channel: undefined, targetJid: jid };
+  return {
+    channel: findChannel(channels, mainEntry[0]),
+    targetJid: mainEntry[0],
+  };
+}
 
 /**
- * Ensure synthetic groups exist for email-principal/email-external/heartbeat routing.
- * Tool lists are synced from code on every restart so changes propagate.
- * Idempotent.
+ * Register or sync a system group — one that must exist on every startup
+ * with its tool allowlist kept in sync with code. Works for any channel type.
  */
-function ensureSyntheticGroups(): void {
-  for (const cfg of [
-    EMAIL_PRINCIPAL_GROUP,
-    EMAIL_EXTERNAL_GROUP,
-    HEARTBEAT_GROUP,
-  ]) {
-    const existing = registeredGroups[cfg.jid];
-    if (existing) {
-      // Sync allowedTools from code so tool list changes propagate on restart
-      existing.containerConfig = { allowedTools: cfg.allowedTools };
-      setRegisteredGroup(cfg.jid, existing);
-    } else {
-      registerGroup(cfg.jid, {
-        name: cfg.name,
-        folder: cfg.folder,
-        trigger: cfg.trigger,
-        added_at: new Date().toISOString(),
-        containerConfig: { allowedTools: cfg.allowedTools },
-        requiresTrigger: cfg.requiresTrigger,
-      });
-      logger.info(
-        { jid: cfg.jid, folder: cfg.folder },
-        'Auto-registered synthetic group',
-      );
-    }
-    // Ensure chats row exists (storeMessage has FK on chat_jid → chats.jid)
-    const source = cfg.jid.startsWith('email:') ? 'email' : 'synthetic';
-    storeChatMetadata(cfg.jid, new Date().toISOString(), cfg.name, source);
+function ensureSystemGroup(cfg: {
+  jid: string;
+  name: string;
+  folder: string;
+  trigger: string;
+  requiresTrigger: boolean;
+  allowedTools: string[];
+}): void {
+  const existing = registeredGroups[cfg.jid];
+  if (existing) {
+    existing.containerConfig = { allowedTools: cfg.allowedTools };
+    setRegisteredGroup(cfg.jid, existing);
+  } else {
+    registerGroup(cfg.jid, {
+      name: cfg.name,
+      folder: cfg.folder,
+      trigger: cfg.trigger,
+      added_at: new Date().toISOString(),
+      containerConfig: { allowedTools: cfg.allowedTools },
+      requiresTrigger: cfg.requiresTrigger,
+    });
+    logger.info(
+      { jid: cfg.jid, folder: cfg.folder },
+      'Auto-registered system group',
+    );
+  }
+  // Derive channel label from JID prefix
+  const source = cfg.jid.startsWith('email:')
+    ? 'email'
+    : cfg.jid.startsWith('gchat:')
+      ? 'gchat'
+      : 'synthetic';
+  storeChatMetadata(cfg.jid, new Date().toISOString(), cfg.name, source);
+}
+
+/**
+ * Ensure all system groups exist. Email groups are synthetic (no channel owns
+ * their JIDs). The heartbeat group is a regular GChat group that also runs
+ * scheduled sweeps.
+ */
+function ensureSystemGroups(): void {
+  // Synthetic email groups (no channel, IPC routes to main)
+  ensureSystemGroup(EMAIL_PRINCIPAL_GROUP);
+  ensureSystemGroup(EMAIL_EXTERNAL_GROUP);
+
+  // Heartbeat: regular GChat group with scheduled sweeps + conversations
+  if (HEARTBEAT_SPACE_ID) {
+    ensureSystemGroup(HEARTBEAT_GROUP);
   }
 }
 
@@ -658,12 +648,11 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
   loadState();
-  ensureSyntheticGroups();
 
   // Validate EA config (fail fast if required env vars are missing)
   validateEaConfig();
 
-  ensureSyntheticGroups();
+  ensureSystemGroups();
 
   // Start credential proxy (containers route API calls through this)
   const proxyServer = await startCredentialProxy(
@@ -773,16 +762,7 @@ async function main(): Promise<void> {
     onProcess: (groupJid, proc, containerName, groupFolder) =>
       queue.registerProcess(groupJid, proc, containerName, groupFolder),
     sendMessage: async (jid, rawText) => {
-      const isSynthetic =
-        jid.startsWith('email:') || jid.startsWith('heartbeat:');
-      let targetJid = jid;
-      if (isSynthetic) {
-        const mainEntry = Object.entries(registeredGroups).find(
-          ([, g]) => g.folder === MAIN_GROUP_FOLDER,
-        );
-        if (mainEntry) targetJid = mainEntry[0];
-      }
-      const channel = findChannel(channels, targetJid);
+      const { channel, targetJid } = resolveChannel(jid);
       if (!channel) {
         logger.warn({ jid }, 'No channel owns JID, cannot send message');
         return;
@@ -793,26 +773,7 @@ async function main(): Promise<void> {
   });
   startIpcWatcher({
     sendMessage: async (jid, text) => {
-      // Synthetic JIDs (email:*, heartbeat:*) have no channel —
-      // route to main channel instead.
-      const isSynthetic =
-        jid.startsWith('email:') || jid.startsWith('heartbeat:');
-
-      let channel: Channel | undefined;
-      let targetJid = jid;
-
-      if (isSynthetic) {
-        const mainEntry = Object.entries(registeredGroups).find(
-          ([, g]) => g.folder === MAIN_GROUP_FOLDER,
-        );
-        if (mainEntry) {
-          targetJid = mainEntry[0];
-          channel = findChannel(channels, targetJid);
-        }
-      } else {
-        channel = findChannel(channels, jid);
-      }
-
+      const { channel, targetJid } = resolveChannel(jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       await channel.sendMessage(targetJid, text);
       clearIndicators(targetJid);

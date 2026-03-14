@@ -56,10 +56,6 @@ groups/*/auth/
 # Claude Code agent memory
 .claude/agent-memory/
 
-# Maintainer-only (not for gws-ea)
-.claude/skills/sync-gws-ea/
-.claude/agents/
-
 # Skills system (local per-installation state)
 .nanoclaw/
 
