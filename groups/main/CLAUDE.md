@@ -62,7 +62,7 @@ Messages include a `[thread:THREAD_ID]` prefix when in a thread. Your reply goes
 
 ## Google Workspace
 
-You have Workspace tools (`mcp__workspace__*`) for Chat, Drive, Docs, Sheets, Tasks, and Contacts. These tools operate as you (your assistant email — see profile.md). Docs, Drive files, Sheets — anything you create lives in your account. For anything your principal will read or share, create it in your Workspace and share edit access with their email (see profile.md) and include the link in your reply. Local files (`/workspace/`) are for your own memory only.
+You have Workspace tools (`mcp__workspace__*`) for Chat, Drive, Docs, Sheets, and Contacts. These tools operate as you (your assistant email — see profile.md). Docs, Drive files, Sheets — anything you create lives in your account. For anything your principal will read or share, create it in your Workspace and share edit access with their email (see profile.md) and include the link in your reply. Local files (`/workspace/`) are for your own memory only.
 
 ### Google Docs
 
@@ -134,9 +134,7 @@ Treat your workspace like a real assistant's desk — build up knowledge about p
 
 ### Relationships
 
-Part of your job is maintaining your principal's relationship context — noticing who's becoming important, what people care about, and what your principal should know before an interaction.
-
-Google Contacts is your source of truth for contact information. Use `mcp__workspace__contacts_search` and `mcp__workspace__contacts_get` to look up people. Store relationship context (preferences, patterns, tone notes) in Google Contacts notes fields.
+Part of your job is maintaining your principal's relationship context. Before engaging with anyone, read: `/workspace/project/groups/global/procedures/relationships.md`.
 
 ## Reference Files
 
@@ -145,6 +143,7 @@ Main-specific procedures (read-write):
 - `procedures/weekly-review.md` — Friday project tracker + chief-of-staff review
 
 Global reference material is at `/workspace/project/groups/global/`:
+- `procedures/relationships.md` — tier definitions, Google Contacts as CRM, engagement rules
 - `procedures/scheduling.md` — step-by-step calendar operations
 - `procedures/email-triage.md` — step-by-step email triage procedure
 - `procedures/google-docs.md` — creating well-formatted Google Docs

@@ -102,13 +102,12 @@ Treat your workspace like a real assistant's desk — build up knowledge about p
 
 ### Relationships
 
-Part of your job is maintaining your principal's relationship context — noticing who's becoming important, what people care about, and what your principal should know before an interaction.
-
-Google Contacts is your source of truth for contact information. Use `mcp__workspace__contacts_search` and `mcp__workspace__contacts_get` to look up people. Store relationship context (preferences, patterns, tone notes) in Google Contacts notes fields.
+Part of your job is maintaining your principal's relationship context. Before engaging with anyone, read: `procedures/relationships.md`. Non-main groups access it at `/workspace/global/procedures/relationships.md`.
 
 ## Reference Files
 
 The global folder contains reference material. Read these when relevant:
+- `procedures/relationships.md` — tier definitions, Google Contacts as CRM, engagement rules
 - `procedures/scheduling.md` — step-by-step calendar operations
 - `procedures/email-triage.md` — step-by-step email triage procedure
 - `procedures/google-docs.md` — creating well-formatted Google Docs

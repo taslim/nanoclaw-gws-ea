@@ -10,6 +10,7 @@ This context handles emails from your principal — kept separate from the real-
 
 ## Procedures
 
+Before engaging with anyone, read: `/workspace/global/procedures/relationships.md`
 Before replying to any email, read: `/workspace/global/procedures/email-triage.md`
 Before any scheduling operation, read: `/workspace/global/procedures/scheduling.md`
 
