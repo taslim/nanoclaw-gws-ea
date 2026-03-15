@@ -374,6 +374,8 @@ async function runQuery(
   let profileMd: string | undefined;
   if (profileMdPath) {
     profileMd = fs.readFileSync(profileMdPath, 'utf-8');
+  } else {
+    log('profile.md not found; proceeding without identity grounding');
   }
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
