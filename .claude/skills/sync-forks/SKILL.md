@@ -211,20 +211,13 @@ Create a staging branch with a descriptive name based on the changes from Step 4
 This branch is disposable. All work happens here. Your private fork's main is never modified.
 
 # Step 6: Merge upstream (individual commits, preserves attribution)
-Check if upstream has changes worth merging. Squash merges break commit ancestry, so `git log` may show "new" commits whose content is already present. Diff only the files those commits touched:
-```
-UPSTREAM_FILES=$(git log --name-only --pretty=format: <fork>/$FORK_BRANCH..upstream/main | sort -u | grep -v '^$')
-git diff <fork>/$FORK_BRANCH upstream/main -- $UPSTREAM_FILES
-```
-- If UPSTREAM_FILES is empty (no new commits): skip this step.
-- If the diff is empty (content already present via prior sync): skip this step. Log "upstream content already present via prior sync."
-- If the diff is formatting-only (e.g., prettier whitespace): skip, note it.
-- If there are real diffs: proceed with the merge.
+If upstream has no new commits (`git log --oneline <fork>/$FORK_BRANCH..upstream/main` is empty):
+- Skip this step.
 
-Dry-run merge to preview conflicts. Run as a single chained command so the abort always executes:
-```
-git merge --no-commit --no-ff upstream/main; git diff --name-only --diff-filter=U; git merge --abort
-```
+- Dry-run merge to preview conflicts. Run as a single chained command so the abort always executes:
+  ```
+  git merge --no-commit --no-ff upstream/main; git diff --name-only --diff-filter=U; git merge --abort
+  ```
 - If conflicts were listed: show them and ask user if they want to proceed.
 - If no conflicts: tell user it is clean and proceed.
 
@@ -232,22 +225,20 @@ Run:
 - `git merge upstream/main --no-edit`
 
 If conflicts occur:
-- Run `git rerere forget` on any file where rerere auto-resolved — rerere can replay bad resolutions from prior merges.
 - Run `git status` and identify conflicted files.
 - For each conflicted file:
   - Open the file.
   - Resolve only conflict markers.
   - Preserve the public fork's content where appropriate (this is the public fork's repo).
+  - Do not refactor surrounding code.
   - `git add <file>`
 - `git commit --no-edit`
 
-After committing, verify no duplicate definitions were introduced in conflicted files (a sign of bad merge resolution). If duplicates found: fix them before proceeding.
-
 # Step 7: Squash merge private fork (one commit, no private history)
-Dry-run merge to preview conflicts:
-```
-git merge --no-commit --no-ff main; git diff --name-only --diff-filter=U; git merge --abort
-```
+- Dry-run merge to preview conflicts. Run as a single chained command so the abort always executes:
+  ```
+  git merge --no-commit --no-ff main; git diff --name-only --diff-filter=U; git merge --abort
+  ```
 - If conflicts were listed: show them. Note that conflicts in private files don't matter — they'll be overwritten in Step 8. Just pick either side for those.
 - If no conflicts: proceed silently.
 
@@ -384,10 +375,10 @@ Show what the public fork has that your private fork doesn't:
 If the public fork has no new commits:
 - Tell the user there's nothing to pull. Stop.
 
-Dry-run merge to show what would actually change in your tree. Run as a single chained command so the abort always executes:
-```
-git merge --no-commit --no-ff <fork>/$FORK_BRANCH; git diff --stat HEAD; git merge --abort
-```
+- Dry-run merge to show what would actually change in your tree. Run as a single chained command so the abort always executes:
+  ```
+  git merge --no-commit --no-ff <fork>/$FORK_BRANCH; git diff --stat HEAD; git merge --abort
+  ```
 
 If the dry-run shows zero or near-zero file changes:
 - Tell the user: "These commits contain changes already in your fork from a previous push — no real file changes to pull."
