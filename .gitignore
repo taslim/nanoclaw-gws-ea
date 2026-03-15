@@ -53,8 +53,9 @@ groups/*/auth/
 .idea/
 .vscode/
 
-# Claude Code agent memory
+# Claude Code
 .claude/agent-memory/
+.claude/settings.local.json
 
 # Skills system (local per-installation state)
 .nanoclaw/
