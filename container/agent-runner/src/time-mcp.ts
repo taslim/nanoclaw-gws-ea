@@ -10,7 +10,7 @@ import { z } from 'zod';
 import { DateTime, Duration, IANAZone } from 'luxon';
 import * as chrono from 'chrono-node';
 
-const PRIMARY_TZ = process.env.NANOCLAW_PRIMARY_TIMEZONE || 'America/Los_Angeles';
+const PRIMARY_TZ = process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
 
 const TIMEZONE_LABELS: Record<string, string> = {
   'America/Los_Angeles': 'PT',

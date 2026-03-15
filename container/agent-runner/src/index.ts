@@ -367,6 +367,17 @@ async function runQuery(
   let messageCount = 0;
   let resultCount = 0;
 
+  // Load profile.md for identity grounding (injected into system prompt so it
+  // survives context compaction — the agent always knows who it is)
+  const profileMdPaths = ['/workspace/global/profile.md', '/workspace/project/groups/global/profile.md'];
+  const profileMdPath = profileMdPaths.find(p => fs.existsSync(p));
+  let profileMd: string | undefined;
+  if (profileMdPath) {
+    profileMd = fs.readFileSync(profileMdPath, 'utf-8');
+  } else {
+    log('profile.md not found; proceeding without identity grounding');
+  }
+
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
   let globalClaudeMd: string | undefined;
@@ -409,7 +420,6 @@ async function runQuery(
     mcpServers.time = {
       command: 'node',
       args: [timeMcpPath],
-      env: { NANOCLAW_PRIMARY_TIMEZONE: process.env.TZ || 'UTC' },
     };
   }
 
@@ -448,9 +458,11 @@ async function runQuery(
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
-        ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
-        : undefined,
+      systemPrompt: (() => {
+        const parts = [profileMd, globalClaudeMd].filter(Boolean);
+        if (parts.length === 0) return undefined;
+        return { type: 'preset' as const, preset: 'claude_code' as const, append: parts.join('\n\n---\n\n') };
+      })(),
       allowedTools: containerInput.allowedTools || [
         'Bash',
         'Read', 'Write', 'Edit', 'Glob', 'Grep',

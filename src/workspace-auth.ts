@@ -176,6 +176,29 @@ async function main(): Promise<void> {
     // Fall back to 'default' if People API isn't enabled yet
   }
 
+  // Warn if the authenticated account doesn't match ASSISTANT_EMAIL from .env
+  const envPath = path.join(process.cwd(), '.env');
+  if (fs.existsSync(envPath)) {
+    const envContent = fs.readFileSync(envPath, 'utf-8');
+    const match = envContent.match(/^ASSISTANT_EMAIL=["']?([^"'\n]+)["']?/m);
+    if (
+      match &&
+      match[1] &&
+      accountEmail !== 'default' &&
+      match[1].toLowerCase() !== accountEmail.toLowerCase()
+    ) {
+      console.warn(
+        `\n⚠️  WARNING: Authenticated as ${accountEmail}, but ASSISTANT_EMAIL in .env is ${match[1]}.`,
+      );
+      console.warn(
+        `   Make sure you're signing in with the EA's Google account, not the principal's.`,
+      );
+      console.warn(
+        `   If this was intentional, you can ignore this warning.\n`,
+      );
+    }
+  }
+
   const mcpCredsPath = path.join(MCP_CREDS_DIR, `${accountEmail}.json`);
   fs.writeFileSync(mcpCredsPath, JSON.stringify(mcpCreds, null, 2));
   console.log(`MCP credentials saved to: ${mcpCredsPath}`);
