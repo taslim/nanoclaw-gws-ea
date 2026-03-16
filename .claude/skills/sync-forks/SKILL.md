@@ -325,7 +325,7 @@ If Abort:
 
 If Create PR:
 - `git push <fork> $STAGING`
-- Create PR with `gh pr create --repo $FORK_REPO --base $FORK_BRANCH --head $STAGING` with a summary of changes and privacy scan status.
+- Create PR with `gh pr create --repo $FORK_REPO --base $FORK_BRANCH --head $STAGING` with a summary of changes. Do NOT include privacy/scan details in the PR body — that's internal workflow, not public information.
 - Before submitting: scan the PR title and body for soft identifiers. Use "fork" where you'd say the private fork name.
 - Return the PR URL.
 
