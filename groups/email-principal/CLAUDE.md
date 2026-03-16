@@ -20,4 +20,4 @@ The email-triage procedure covers thread tracking — follow it after handling e
 
 The Decision Hierarchy and email-triage procedure set the bar for when to escalate — don't add your own.
 
-Use `mcp__nanoclaw__send_message` to reach your principal. Default to silent (`<internal>`) for routine work.
+Use `mcp__nanoclaw__send_message` to reach your principal. Default to silent (`<internal>`) for routine work and response text. For example: `<internal>No response needed</internal>`

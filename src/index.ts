@@ -633,16 +633,13 @@ function ensureSystemGroup(cfg: {
 }
 
 /**
- * Ensure all system groups exist. Email groups are synthetic (no channel owns
- * their JIDs). The heartbeat group is a regular GChat group that also runs
- * scheduled sweeps.
+ * Register system groups (email routing, heartbeat sweep).
+ * Tool allowlists are synced from code on every restart.
  */
 function ensureSystemGroups(): void {
-  // Synthetic email groups (no channel, IPC routes to main)
   ensureSystemGroup(EMAIL_PRINCIPAL_GROUP);
   ensureSystemGroup(EMAIL_EXTERNAL_GROUP);
 
-  // Heartbeat: regular GChat group with scheduled sweeps + conversations
   if (HEARTBEAT_SPACE_ID) {
     ensureSystemGroup(HEARTBEAT_GROUP);
   }

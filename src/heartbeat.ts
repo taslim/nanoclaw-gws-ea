@@ -1,14 +1,12 @@
 /**
  * Heartbeat group configuration for NanoClaw GWS-EA
  *
- * The heartbeat is a GChat space where Soji posts proactive sweep results
- * and the principal can reply to discuss findings or give quick decisions.
- * Scheduled tasks run sweeps; inbound messages trigger conversations.
+ * One-way group for scheduled sweeps. Posts to GChat via workspace MCP.
  */
-import { ASSISTANT_NAME, HEARTBEAT_SPACE_ID } from './config.js';
+import { ASSISTANT_NAME } from './config.js';
 
 export const HEARTBEAT_GROUP = {
-  jid: `gchat:${HEARTBEAT_SPACE_ID}`,
+  jid: 'heartbeat:sweep',
   name: 'Proactive Sweep',
   folder: 'heartbeat',
   trigger: `@${ASSISTANT_NAME}`,
