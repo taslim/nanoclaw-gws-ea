@@ -371,7 +371,7 @@ server.tool(
         return { content: [{ type: 'text' as const, text: 'No email threads.' }] };
       }
 
-      let threads: Array<{ thread_id: string; group_folder: string; status: string; reason: string | null; updated_at: string }> =
+      let threads: Array<{ thread_id: string; group_folder: string; status: string; reason: string | null; subject: string | null; participants: string | null; updated_at: string }> =
         JSON.parse(fs.readFileSync(threadsFile, 'utf-8'));
 
       // Filter by status (default: exclude resolved)
@@ -398,7 +398,7 @@ server.tool(
       const formatted = threads
         .map(
           (t) =>
-            `- [${t.thread_id}] ${t.status}${t.reason ? ` (${t.reason})` : ''} — ${t.group_folder}, updated ${t.updated_at}`,
+            `- [${t.thread_id}] ${t.status}${t.reason ? ` (${t.reason})` : ''} — ${t.subject || 'No subject'} | ${t.participants || 'unknown'} | ${t.group_folder}, updated ${t.updated_at}`,
         )
         .join('\n');
 

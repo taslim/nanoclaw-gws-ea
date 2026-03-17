@@ -713,6 +713,8 @@ export function writeEmailThreadsSnapshot(
     group_folder: string;
     status: string;
     reason: string | null;
+    subject: string | null;
+    participants: string | null;
     updated_at: string;
   }>,
 ): void {
@@ -727,6 +729,65 @@ export function writeEmailThreadsSnapshot(
 
   const threadsFile = path.join(groupIpcDir, 'pending_threads.json');
   fs.writeFileSync(threadsFile, JSON.stringify(filtered, null, 2));
+}
+
+/**
+ * Delete SDK session files older than maxAgeDays from the given group folders.
+ * Only touches .claude/projects/ — preserves settings.json and skills/.
+ */
+export function pruneOldSessions(
+  groupFolders: string[],
+  maxAgeDays: number = 7,
+): void {
+  const maxAgeMs = maxAgeDays * 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  let pruned = 0;
+
+  for (const folder of groupFolders) {
+    const projectsDir = path.join(
+      DATA_DIR,
+      'sessions',
+      folder,
+      '.claude',
+      'projects',
+    );
+    if (!fs.existsSync(projectsDir)) continue;
+
+    for (const subdir of fs.readdirSync(projectsDir)) {
+      const subdirPath = path.join(projectsDir, subdir);
+      try {
+        if (!fs.statSync(subdirPath).isDirectory()) continue;
+      } catch {
+        continue;
+      }
+
+      for (const file of fs.readdirSync(subdirPath)) {
+        const filePath = path.join(subdirPath, file);
+        try {
+          const stat = fs.statSync(filePath);
+          if (stat.isFile() && now - stat.mtimeMs > maxAgeMs) {
+            fs.unlinkSync(filePath);
+            pruned++;
+          }
+        } catch {
+          // File may have been removed between readdir and stat
+        }
+      }
+
+      // Clean up empty subdirectories
+      try {
+        if (fs.readdirSync(subdirPath).length === 0) {
+          fs.rmdirSync(subdirPath);
+        }
+      } catch {
+        // Race or permission issue — not critical
+      }
+    }
+  }
+
+  if (pruned > 0) {
+    logger.info({ pruned, folders: groupFolders }, 'Pruned old session files');
+  }
 }
 
 export interface AvailableGroup {

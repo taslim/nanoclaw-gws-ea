@@ -515,11 +515,7 @@ export async function processTaskIpc(
             'Created email thread via upsert',
           );
         }
-        if (
-          !isMain &&
-          sourceGroup !== 'heartbeat' &&
-          thread.group_folder !== sourceGroup
-        ) {
+        if (!isMain && thread.group_folder !== sourceGroup) {
           logger.warn(
             { threadId: data.threadId, sourceGroup },
             'Unauthorized email thread update attempt',

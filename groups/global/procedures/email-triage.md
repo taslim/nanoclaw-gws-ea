@@ -14,6 +14,8 @@ Email is permanent. Anything you write may be forwarded, screenshot, or re-read 
 
 Every email requires a triage decision before you compose anything. Default to action — your principal should only hear about emails that genuinely need their brain.
 
+Start by scanning `list_email_threads` for threads with near-identical subjects or overlapping participants. Treat duplicates as continuations — reply on the original thread, resolve the duplicate with `reason: "duplicate of {thread_id}"`. For related threads, read them for context to ensure consistency.
+
 **Handle without asking:**
 - Scheduling (use the scheduling procedure — it has its own judgment for when to involve your principal)
 - Confirmations, acknowledgments, follow-ups on existing threads
@@ -34,13 +36,17 @@ Adding them to the thread keeps them on future replies. Forwarding gives them th
 
 ## Threading
 
-Reply params are included in the prompt: `thread_id`, `in_reply_to`, suggested `to`/`cc`.
+Reply params are included in the prompt: `thread_id`, `in_reply_to`, `to`, `cc`.
 
 **NEVER omit `thread_id` or `in_reply_to`.** This breaks threading and is never acceptable. Use the provided values verbatim.
 
-Always include `references`. Use `mcp__workspace__get_gmail_thread_content` to fetch the thread's Message-IDs and build the chain.
+Always include `references`. When thread history is available, the references chain is pre-computed in the reply params. Otherwise, use `mcp__workspace__get_gmail_thread_content` to fetch the thread's Message-IDs and build the chain.
 
-If you change `to` or `cc`, note it in italics at the top of the reply: *minus xyz*, *plus abc*, *just us*, etc.
+Thread history is included in the prompt when available. Only fetch thread content separately if you need the full untruncated body of a specific message.
+
+Use the provided `to` and `cc` verbatim. If you change them, note it in italics at the top of the reply: *minus xyz*, *plus abc*, *just us*, etc. **Never guess an email address** — if you don't have it, look it up in Contacts or ask.
+
+Before composing a new outbound email, search Gmail (`search_gmail_messages`) for existing threads on the same topic. Reply on an existing thread rather than starting a new one when the conversation is clearly related.
 
 ## Style
 
@@ -96,6 +102,8 @@ After handling any email, update its status via `mcp__nanoclaw__update_email_thr
 
 The tool creates the thread entry if it doesn't exist — use it for outbound-only threads too. For time-bound follow-ups, pair with a `schedule_task`. Use `mcp__nanoclaw__list_email_threads` to see all pending threads.
 
+If a pending thread carries a reason from a prior escalation, it means new information arrived while the thread was escalated. Re-triage with full context — decide whether to handle it yourself or escalate again.
+
 ## Verification
 
 After composing, silently verify (do not send these checks to your principal):
@@ -103,7 +111,7 @@ After composing, silently verify (do not send these checks to your principal):
 - [ ] `user_google_email` is set to your assistant email (see profile.md)
 - [ ] `from_name` and `from_email` match profile.md
 - [ ] `body_format` is `"html"`
-- [ ] `to` and `cc` are correct (changes noted at top of reply)
+- [ ] `to` and `cc` are correct — no guessed addresses, changes noted at top of reply
 - [ ] Tone matches the recipient and stakes
 - [ ] Any specifics mentioned (times, durations, dates) were computed via `mcp__time__*` tools and match the corresponding calendar event
 - [ ] Nothing reveals calendar details, financial info, or private context that shouldn't be shared
