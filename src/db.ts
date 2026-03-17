@@ -26,6 +26,8 @@ export interface EmailThread {
   group_folder: string;
   status: string;
   reason: string | null;
+  subject: string | null;
+  participants: string | null;
   updated_at: string;
 }
 
@@ -125,6 +127,8 @@ function createSchema(database: Database.Database): void {
       group_folder TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'pending',
       reason TEXT,
+      subject TEXT,
+      participants TEXT,
       updated_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_email_threads_status ON email_threads(status);
@@ -193,6 +197,18 @@ function createSchema(database: Database.Database): void {
     );
   } catch {
     /* columns already exist */
+  }
+
+  // Add subject, participants columns to email_threads if missing (migration for existing DBs)
+  try {
+    database.exec('ALTER TABLE email_threads ADD COLUMN subject TEXT');
+  } catch {
+    /* column already exists */
+  }
+  try {
+    database.exec('ALTER TABLE email_threads ADD COLUMN participants TEXT');
+  } catch {
+    /* column already exists */
   }
 }
 
@@ -710,12 +726,6 @@ export function markEmailProcessed(
   ).run(messageId, threadId, sender, subject, new Date().toISOString());
 }
 
-export function markEmailResponded(messageId: string): void {
-  db.prepare(
-    'UPDATE processed_emails SET response_sent = 1 WHERE message_id = ?',
-  ).run(messageId);
-}
-
 // --- Email threads ---
 
 export function getEmailThreadRoute(threadId: string): string | undefined {
@@ -727,19 +737,36 @@ export function getEmailThreadRoute(threadId: string): string | undefined {
 
 /**
  * Create or update an email thread record.
- * New threads start as 'pending'. Existing threads are auto-unresolve:
- * any new message resets status to 'pending' so nothing falls through.
+ * New threads start as 'pending'. Existing threads auto-unresolve on new inbound.
+ *
+ * Ratchet: group_folder only moves toward 'email-external', never back.
+ * Escalation: reason is preserved when resetting from 'escalated' so the
+ * agent knows why the thread was escalated and can re-triage.
  */
-export function upsertEmailThread(threadId: string, groupFolder: string): void {
+export function upsertEmailThread(
+  threadId: string,
+  groupFolder: string,
+  subject?: string,
+  participants?: string,
+): void {
   const now = new Date().toISOString();
   db.prepare(
-    `INSERT INTO email_threads (thread_id, group_folder, status, updated_at)
-     VALUES (?, ?, 'pending', ?)
+    `INSERT INTO email_threads (thread_id, group_folder, status, subject, participants, updated_at)
+     VALUES (?, ?, 'pending', ?, ?, ?)
      ON CONFLICT(thread_id) DO UPDATE SET
+       group_folder = CASE
+         WHEN excluded.group_folder = 'email-external' THEN 'email-external'
+         ELSE email_threads.group_folder
+       END,
        status = 'pending',
-       reason = NULL,
+       reason = CASE
+         WHEN email_threads.status = 'escalated' THEN email_threads.reason
+         ELSE NULL
+       END,
+       subject = COALESCE(excluded.subject, email_threads.subject),
+       participants = COALESCE(excluded.participants, email_threads.participants),
        updated_at = excluded.updated_at`,
-  ).run(threadId, groupFolder, now);
+  ).run(threadId, groupFolder, subject || null, participants || null, now);
 }
 
 export function updateEmailThreadStatus(

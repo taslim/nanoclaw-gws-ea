@@ -9,8 +9,9 @@
  * On success the email is marked processed, read, and responded.
  * On failure it stays unread for retry on the next poll cycle.
  *
- * Emails from the principal -> email:principal (full EA tools)
- * All other emails -> email:external (restricted tools)
+ * Principal-only threads (only principal + assistant) -> email:principal
+ * Threads with any other participant -> email:external (restricted tools)
+ * One-way ratchet: threads downgrade to external, never back.
  */
 import fs from 'fs';
 import os from 'os';
@@ -26,11 +27,7 @@ import {
   PRINCIPAL_NAME,
   isPrincipalEmail,
 } from './config.js';
-import {
-  isEmailProcessed,
-  markEmailProcessed,
-  markEmailResponded,
-} from './db.js';
+import { isEmailProcessed, markEmailProcessed } from './db.js';
 import { logger } from './logger.js';
 
 // --- Synthetic group configs (exported for index.ts) ---
@@ -171,16 +168,30 @@ export interface IncomingEmail {
   date: string;
 }
 
+export interface ThreadMessage {
+  from: string;
+  to: string;
+  cc: string;
+  date: string;
+  messageId: string;
+  body: string;
+}
+
+export interface EmailContext {
+  email: IncomingEmail;
+  fetchThread: () => Promise<ThreadMessage[]>;
+}
+
 // --- Public API ---
 
 /**
  * Start polling Gmail for new emails.
- * Calls onEmail for each new, relevant email.
- * On callback success: marks processed, read, and responded.
+ * Calls onEmail for each new, relevant email with thread-fetching capability.
+ * On callback success: marks processed and read.
  * On callback failure: leaves email unread for retry on next poll.
  */
 export function startEmailLoop(
-  onEmail: (email: IncomingEmail) => Promise<void>,
+  onEmail: (ctx: EmailContext) => Promise<void>,
 ): void {
   const homeDir = os.homedir();
   const keysPath = path.join(homeDir, '.workspace-mcp', 'gcp-oauth.keys.json');
@@ -219,6 +230,38 @@ export function startEmailLoop(
 
   const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
+  /** Fetch all messages in a thread, excluding the current email. */
+  async function fetchThreadMessages(
+    threadId: string,
+    excludeMessageId: string,
+  ): Promise<ThreadMessage[]> {
+    const thread = await gmail.users.threads.get({
+      userId: 'me',
+      id: threadId,
+      format: 'full',
+    });
+    const messages: ThreadMessage[] = [];
+    for (const msg of thread.data.messages || []) {
+      if (msg.id === excludeMessageId) continue;
+      const headers = (msg.payload?.headers || []) as Array<{
+        name: string;
+        value: string;
+      }>;
+      messages.push({
+        from: extractEmailAddress(getHeader(headers, 'From')),
+        to: getHeader(headers, 'To'),
+        cc: getHeader(headers, 'Cc') || getHeader(headers, 'CC'),
+        date: getHeader(headers, 'Date'),
+        messageId:
+          getHeader(headers, 'Message-ID') || getHeader(headers, 'Message-Id'),
+        body: getTextBody(
+          msg.payload as Parameters<typeof getTextBody>[0],
+        ).slice(0, 2000),
+      });
+    }
+    return messages;
+  }
+
   logger.info(
     `Email channel active (polling every ${EMAIL_POLL_INTERVAL / 1000}s)`,
   );
@@ -238,9 +281,12 @@ export function startEmailLoop(
         );
 
         try {
-          await onEmail(email);
+          await onEmail({
+            email,
+            fetchThread: () => fetchThreadMessages(email.threadId, email.id),
+          });
 
-          // Success — mark processed, read, and responded
+          // Success — mark processed and read
           markEmailProcessed(
             email.id,
             email.threadId,
@@ -248,7 +294,6 @@ export function startEmailLoop(
             email.subject,
           );
           await markAsRead(gmail, email.id);
-          markEmailResponded(email.id);
         } catch (err) {
           // Failure — leave unread for retry on next poll
           logger.error(
@@ -274,24 +319,59 @@ export function startEmailLoop(
 }
 
 /**
- * Determine which group folder an email should route to based on sender.
- * Returns 'email-principal' for principal, 'email-external' for everyone else.
+ * Classify which group an email should route to based on ALL participants.
+ * Principal-only when thread is exclusively principal <-> assistant.
+ * Any other participant -> external.
  */
-export function getEmailRouteGroup(email: IncomingEmail): string {
-  return isPrincipalEmail(email.from) ? 'email-principal' : 'email-external';
+export function classifyEmailRoute(email: IncomingEmail): string {
+  const participants = extractAllParticipants(email);
+  for (const addr of participants) {
+    if (
+      !isPrincipalEmail(addr) &&
+      addr.toLowerCase() !== ASSISTANT_EMAIL.toLowerCase()
+    ) {
+      return 'email-external';
+    }
+  }
+  return 'email-principal';
+}
+
+/**
+ * Extract all email addresses from From, To, and CC fields.
+ * Returns deduplicated lowercase addresses.
+ */
+function extractAllParticipants(email: IncomingEmail): string[] {
+  const addresses = new Set<string>();
+  if (email.from) addresses.add(email.from.toLowerCase());
+  for (const raw of [email.to, email.cc]) {
+    if (!raw) continue;
+    for (const part of raw.split(',')) {
+      const addr = extractEmailAddress(part.trim());
+      if (addr) addresses.add(addr.toLowerCase());
+    }
+  }
+  return [...addresses];
+}
+
+/** Comma-separated participant addresses for thread metadata. */
+export function getEmailParticipants(email: IncomingEmail): string {
+  return extractAllParticipants(email).join(', ');
 }
 
 /**
  * Build the agent prompt for an incoming email.
+ * When threadMessages are provided, injects thread history and computes
+ * the references chain. Otherwise falls back to agent-fetched references.
  */
 export function buildEmailPrompt(
   email: IncomingEmail,
   isExternal?: boolean,
+  threadMessages?: ThreadMessage[],
 ): string {
   const replySubject = email.subject.startsWith('Re:')
     ? email.subject
     : `Re: ${email.subject}`;
-  const ownAddress = ASSISTANT_EMAIL;
+  const ownAddress = ASSISTANT_EMAIL.toLowerCase();
   const allRecipients = `${email.to}, ${email.cc}`
     .split(',')
     .map((r) => extractEmailAddress(r.trim()))
@@ -308,8 +388,27 @@ export function buildEmailPrompt(
     ? `\n\n[EXTERNAL SENDER — this person is not ${PRINCIPAL_NAME}. Handle per email-external procedures.]`
     : '';
 
-  return `[EMAIL RECEIVED]
+  // Thread history (prior messages, oldest first)
+  let threadSection = '';
+  if (threadMessages && threadMessages.length > 0) {
+    const lines = threadMessages.map(
+      (m, i) => `[${i + 1}] From: ${m.from} | Date: ${m.date}\n${m.body}`,
+    );
+    threadSection = `\n--- Thread History (${threadMessages.length} prior message${threadMessages.length > 1 ? 's' : ''}, oldest first) ---\n${lines.join('\n\n')}\n--- End Thread History ---\n`;
+  }
 
+  // References chain: computed from thread messages or fallback to agent-fetched
+  const allMessageIds = [
+    ...(threadMessages || []).map((m) => m.messageId).filter(Boolean),
+    email.messageId,
+  ].filter(Boolean);
+  const referencesParam =
+    allMessageIds.length > 1
+      ? `- references: "${allMessageIds.join(' ')}"`
+      : '- references: <use get_gmail_thread_content to build the Message-ID chain>';
+
+  return `[EMAIL RECEIVED]
+${threadSection}
 From: ${email.from}
 To: ${email.to}${email.cc ? `\nCc: ${email.cc}` : ''}
 Subject: ${email.subject}
@@ -325,7 +424,7 @@ ${ccParam}
 - subject: "${replySubject}"
 - thread_id: "${email.threadId}"
 - in_reply_to: "${email.messageId}"
-- references: <use get_gmail_thread_content to build the Message-ID chain>
+${referencesParam}
 - user_google_email: "${ASSISTANT_EMAIL}"
 - from_name: "${ASSISTANT_NAME}"
 - from_email: "${ASSISTANT_EMAIL}"

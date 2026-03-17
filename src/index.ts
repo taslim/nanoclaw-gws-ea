@@ -25,10 +25,13 @@ import {
   EMAIL_EXTERNAL_GROUP,
   startEmailLoop,
   buildEmailPrompt,
-  getEmailRouteGroup,
+  classifyEmailRoute,
+  getEmailParticipants,
 } from './email.js';
+import type { ThreadMessage } from './email.js';
 import {
   ContainerOutput,
+  pruneOldSessions,
   runContainerAgent,
   writeEmailThreadsSnapshot,
   writeGroupsSnapshot,
@@ -369,9 +372,10 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  options?: { freshSession?: boolean },
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
-  const sessionId = sessions[group.folder];
+  const sessionId = options?.freshSession ? undefined : sessions[group.folder];
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -401,10 +405,10 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
-  // Wrap onOutput to track session ID from streamed results
+  // Wrap onOutput to track session ID from streamed results (skip for fresh sessions)
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
-        if (output.newSessionId) {
+        if (output.newSessionId && !options?.freshSession) {
           sessions[group.folder] = output.newSessionId;
           setSession(group.folder, output.newSessionId);
         }
@@ -429,7 +433,7 @@ async function runAgent(
       wrappedOnOutput,
     );
 
-    if (output.newSessionId) {
+    if (output.newSessionId && !options?.freshSession) {
       sessions[group.folder] = output.newSessionId;
       setSession(group.folder, output.newSessionId);
     }
@@ -657,6 +661,9 @@ async function main(): Promise<void> {
 
   ensureSystemGroups();
 
+  // Prune orphaned session files from fresh-session groups (email)
+  pruneOldSessions([EMAIL_PRINCIPAL_GROUP.folder, EMAIL_EXTERNAL_GROUP.folder]);
+
   // Start credential proxy (containers route API calls through this)
   const proxyServer = await startCredentialProxy(
     CREDENTIAL_PROXY_PORT,
@@ -867,7 +874,8 @@ async function main(): Promise<void> {
   recoverPendingMessages();
 
   // Email event source — direct agent invocation, output forwarded to main channel
-  startEmailLoop(async (email) => {
+  startEmailLoop(async (ctx) => {
+    const { email } = ctx;
     const mainJid = Object.entries(registeredGroups).find(
       ([, g]) => g.folder === MAIN_GROUP_FOLDER,
     )?.[0];
@@ -876,31 +884,22 @@ async function main(): Promise<void> {
       return;
     }
 
-    // Thread routing: check table first, then classify by sender
-    let targetFolder = getEmailThreadRoute(email.threadId);
-    if (!targetFolder) {
-      targetFolder = getEmailRouteGroup(email);
-    }
-    // Hijacking detection: third-party sender on principal-initiated thread.
-    const senderIsPrincipal = isPrincipalEmail(email.from);
-    if (targetFolder === 'email-principal' && !senderIsPrincipal) {
-      logger.warn(
-        { from: email.from, subject: email.subject },
-        'Third-party sender on principal-initiated thread — downgrading to email-external',
-      );
+    // Thread routing: one-way ratchet (external stays external, otherwise evaluate participants)
+    const existingRoute = getEmailThreadRoute(email.threadId);
+    let targetFolder: string;
+    if (existingRoute === 'email-external') {
       targetFolder = 'email-external';
-      // Alert principal on main channel
-      const mainChannel = findChannel(channels, mainJid);
-      if (mainChannel) {
-        await mainChannel.sendMessage(
-          mainJid,
-          `Heads up: ${email.from} replied to "${email.subject}" and you're no longer on the thread.`,
-        );
-      }
+    } else {
+      targetFolder = classifyEmailRoute(email);
     }
 
-    // Upsert thread after hijacking detection so group_folder is correct
-    upsertEmailThread(email.threadId, targetFolder);
+    // Upsert with metadata (ratchet + escalation preservation handled in SQL)
+    upsertEmailThread(
+      email.threadId,
+      targetFolder,
+      email.subject,
+      getEmailParticipants(email),
+    );
 
     // Map folder → JID
     const targetJid =
@@ -920,8 +919,19 @@ async function main(): Promise<void> {
       return;
     }
 
+    // Fetch thread content (graceful degradation on failure)
+    let threadMessages: ThreadMessage[] = [];
+    try {
+      threadMessages = await ctx.fetchThread();
+    } catch (err) {
+      logger.warn(
+        { threadId: email.threadId, err },
+        'Failed to fetch thread content, proceeding without',
+      );
+    }
+
     const isExternal = targetFolder === 'email-external';
-    const prompt = buildEmailPrompt(email, isExternal);
+    const prompt = buildEmailPrompt(email, isExternal, threadMessages);
     const mainChannel = findChannel(channels, mainJid);
 
     logger.info(
@@ -929,19 +939,27 @@ async function main(): Promise<void> {
       `Processing email via ${targetFolder} group agent`,
     );
 
-    // Direct agent invocation with output forwarding to main
-    const output = await runAgent(group, prompt, targetJid, async (result) => {
-      if (result.result) {
-        const raw =
-          typeof result.result === 'string'
-            ? result.result
-            : JSON.stringify(result.result);
-        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-        if (text && mainChannel) {
-          await mainChannel.sendMessage(mainJid, text);
+    // Fresh session per email — no cross-thread context leakage
+    const output = await runAgent(
+      group,
+      prompt,
+      targetJid,
+      async (result) => {
+        if (result.result) {
+          const raw =
+            typeof result.result === 'string'
+              ? result.result
+              : JSON.stringify(result.result);
+          const text = raw
+            .replace(/<internal>[\s\S]*?<\/internal>/g, '')
+            .trim();
+          if (text && mainChannel) {
+            await mainChannel.sendMessage(mainJid, text);
+          }
         }
-      }
-    });
+      },
+      { freshSession: true },
+    );
 
     if (output === 'error') {
       logger.error(

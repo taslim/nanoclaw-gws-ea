@@ -70,7 +70,7 @@ After handling any thread, update its status: `mcp__nanoclaw__update_email_threa
 
 **Scope:** Meetings in the next 2–3 hours with external attendees or first-time contacts.
 
-For each qualifying meeting, research attendees (contacts, web, conversation history) and post a concise brief to this space with `<users/all>`: who they are, relationship to your principal, likely ask, anything useful walking in.
+For each qualifying meeting, research attendees (contacts, web, conversation history) and post a concise brief to the heartbeat space: who they are, relationship to your principal, likely ask, anything useful walking in.
 
 Skip routine recurring 1:1s or meetings where all attendees are well-known Tier 1 contacts with recent interaction.
 

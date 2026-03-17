@@ -515,9 +515,16 @@ export async function processTaskIpc(
             'Created email thread via upsert',
           );
         }
+        // Auth: either email group can update any email thread (ratchet may move threads between groups)
+        const isEmailGroup =
+          sourceGroup === 'email-principal' || sourceGroup === 'email-external';
+        const isEmailThread =
+          thread.group_folder === 'email-principal' ||
+          thread.group_folder === 'email-external';
         if (
           !isMain &&
           sourceGroup !== 'heartbeat' &&
+          !(isEmailGroup && isEmailThread) &&
           thread.group_folder !== sourceGroup
         ) {
           logger.warn(
