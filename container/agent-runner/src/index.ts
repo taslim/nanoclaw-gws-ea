@@ -435,20 +435,52 @@ async function runQuery(
   }
 
   if (fs.existsSync('/home/node/.workspace-mcp/credentials')) {
-    mcpServers.workspace = {
-      command: '/opt/google_workspace_mcp/.venv/bin/python',
-      args: [
-        '/opt/google_workspace_mcp/main.py',
-        '--single-user',
-        '--tools', 'chat', 'drive', 'docs', 'sheets', 'contacts', 'gmail',
-      ],
-      env: {
-        GOOGLE_OAUTH_CLIENT_ID: (sdkEnv.GOOGLE_OAUTH_CLIENT_ID as string) || '',
-        GOOGLE_OAUTH_CLIENT_SECRET: (sdkEnv.GOOGLE_OAUTH_CLIENT_SECRET as string) || '',
-        WORKSPACE_MCP_CREDENTIALS_DIR: '/home/node/.workspace-mcp/credentials',
-        OAUTHLIB_INSECURE_TRANSPORT: '1',
-      },
-    };
+    // Derive which workspace MCP modules to load from allowedTools.
+    // When allowedTools is unset (main group), load all modules.
+    const allModules = ['chat', 'drive', 'docs', 'sheets', 'contacts', 'gmail'];
+    let modules: string[];
+    if (!containerInput.allowedTools) {
+      // No tool restrictions — load all modules
+      modules = allModules;
+    } else {
+      // Map allowed workspace tool names to MCP modules via keyword matching
+      const moduleKeywords: Record<string, string[]> = {
+        chat: ['chat_'],
+        drive: ['drive_'],
+        docs: ['docs_'],
+        sheets: ['sheets_'],
+        contacts: ['contact'],  // matches contacts_search, manage_contact, list_contact_groups
+        gmail: ['gmail'],       // matches send_gmail_message, search_gmail_messages, etc.
+      };
+      const matched = new Set<string>();
+      for (const tool of containerInput.allowedTools) {
+        if (!tool.startsWith('mcp__workspace__')) continue;
+        const suffix = tool.replace('mcp__workspace__', '');
+        for (const [mod, keywords] of Object.entries(moduleKeywords)) {
+          if (keywords.some((kw) => suffix.includes(kw))) {
+            matched.add(mod);
+          }
+        }
+      }
+      modules = [...matched];
+    }
+
+    if (modules.length > 0) {
+      mcpServers.workspace = {
+        command: '/opt/google_workspace_mcp/.venv/bin/python',
+        args: [
+          '/opt/google_workspace_mcp/main.py',
+          '--single-user',
+          '--tools', ...modules,
+        ],
+        env: {
+          GOOGLE_OAUTH_CLIENT_ID: (sdkEnv.GOOGLE_OAUTH_CLIENT_ID as string) || '',
+          GOOGLE_OAUTH_CLIENT_SECRET: (sdkEnv.GOOGLE_OAUTH_CLIENT_SECRET as string) || '',
+          WORKSPACE_MCP_CREDENTIALS_DIR: '/home/node/.workspace-mcp/credentials',
+          OAUTHLIB_INSECURE_TRANSPORT: '1',
+        },
+      };
+    }
   }
 
   for await (const message of query({
