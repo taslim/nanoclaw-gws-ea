@@ -314,12 +314,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           typeof result.result === 'string'
             ? result.result
             : JSON.stringify(result.result);
-        // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
         logger.info(
           { group: group.name },
           `Agent output: ${raw.slice(0, 200)}`,
         );
+        const text = formatOutbound(raw);
         if (text) {
           await channel.sendMessage(chatJid, text);
           clearIndicators(chatJid);
@@ -576,8 +575,8 @@ function ensureContainerSystemRunning(): void {
 }
 
 /**
- * Resolve a JID to a channel. If no channel owns the JID,
- * falls back to the main group's channel.
+ * Resolve a JID to a channel. System groups with synthetic JIDs (email:*, heartbeat:*)
+ * have no owning channel — their output routes to main for visibility.
  */
 function resolveChannel(jid: string): {
   channel: Channel | undefined;
@@ -586,7 +585,7 @@ function resolveChannel(jid: string): {
   const channel = findChannel(channels, jid);
   if (channel) return { channel, targetJid: jid };
 
-  // No channel owns this JID — route to main
+  // No channel owns this JID — route to main (system groups, synthetic events)
   const mainEntry = Object.entries(registeredGroups).find(
     ([, g]) => g.folder === MAIN_GROUP_FOLDER,
   );
@@ -891,13 +890,6 @@ async function main(): Promise<void> {
   // Email event source — direct agent invocation, output forwarded to main channel
   startEmailLoop(async (ctx) => {
     const { email } = ctx;
-    const mainJid = Object.entries(registeredGroups).find(
-      ([, g]) => g.folder === MAIN_GROUP_FOLDER,
-    )?.[0];
-    if (!mainJid) {
-      logger.warn('No main group registered, cannot process email');
-      return;
-    }
 
     // Thread routing: one-way ratchet (external stays external, otherwise evaluate participants)
     const existingRoute = getEmailThreadRoute(email.threadId);
@@ -926,11 +918,8 @@ async function main(): Promise<void> {
     if (!group) {
       logger.warn(
         { targetFolder, targetJid },
-        'Target group not registered, falling back to main',
+        'Target group not registered, skipping email',
       );
-      const mainGroup = registeredGroups[mainJid];
-      const prompt = buildEmailPrompt(email);
-      await runAgent(mainGroup, prompt, mainJid);
       return;
     }
 
@@ -947,7 +936,10 @@ async function main(): Promise<void> {
 
     const isExternal = targetFolder === 'email-external';
     const prompt = buildEmailPrompt(email, isExternal, threadMessages);
-    const mainChannel = findChannel(channels, mainJid);
+
+    // Resolve output channel (synthetic JIDs fall through to main via resolveChannel)
+    const { channel: outputChannel, targetJid: outputJid } =
+      resolveChannel(targetJid);
 
     logger.info(
       { from: email.from, subject: email.subject, route: targetFolder },
@@ -965,11 +957,9 @@ async function main(): Promise<void> {
             typeof result.result === 'string'
               ? result.result
               : JSON.stringify(result.result);
-          const text = raw
-            .replace(/<internal>[\s\S]*?<\/internal>/g, '')
-            .trim();
-          if (text && mainChannel) {
-            await mainChannel.sendMessage(mainJid, text);
+          const text = formatOutbound(raw);
+          if (text && outputChannel) {
+            await outputChannel.sendMessage(outputJid, text);
           }
         }
       },

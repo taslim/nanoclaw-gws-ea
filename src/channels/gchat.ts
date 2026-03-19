@@ -79,11 +79,13 @@ export class GChatChannel implements Channel {
 
     this.chat = google.chat({ version: 'v1', auth: this.oauth2Client });
 
-    // Resolve self user ID via token introspection
+    // Resolve self user ID via token introspection.
+    // Force a token refresh first — getTokenInfo validates the raw string
+    // and fails on expired tokens without triggering the refresh flow.
     try {
-      const accessToken = this.oauth2Client.credentials.access_token;
-      if (accessToken) {
-        const tokenInfo = await this.oauth2Client.getTokenInfo(accessToken);
+      const { token } = await this.oauth2Client.getAccessToken();
+      if (token) {
+        const tokenInfo = await this.oauth2Client.getTokenInfo(token);
         if (tokenInfo.sub) {
           this.selfUserId = `users/${tokenInfo.sub}`;
           logger.info(
