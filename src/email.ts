@@ -68,12 +68,15 @@ export const EMAIL_PRINCIPAL_GROUP = {
     'mcp__workspace__get_gmail_attachment_content',
     'mcp__workspace__modify_gmail_message_labels',
     'mcp__workspace__list_gmail_labels',
-    // NanoClaw IPC — messaging and task management, no admin operations
+    // NanoClaw IPC — messaging, task management, and matter tracking
     'mcp__nanoclaw__send_message',
     'mcp__nanoclaw__schedule_task',
     'mcp__nanoclaw__list_tasks',
-    'mcp__nanoclaw__update_email_thread',
-    'mcp__nanoclaw__list_email_threads',
+    'mcp__nanoclaw__create_matter',
+    'mcp__nanoclaw__update_matter',
+    'mcp__nanoclaw__list_matters',
+    'mcp__nanoclaw__get_matter',
+    'mcp__nanoclaw__find_matter',
     // Full calendar access (principal's emails often involve scheduling decisions)
     'mcp__calendar__*',
     // Time MCP — date math, timezone conversions
@@ -138,8 +141,11 @@ export const EMAIL_EXTERNAL_GROUP = {
     // NanoClaw IPC — no send_message (escalation handled by output forwarding)
     'mcp__nanoclaw__schedule_task',
     'mcp__nanoclaw__list_tasks',
-    'mcp__nanoclaw__update_email_thread',
-    'mcp__nanoclaw__list_email_threads',
+    'mcp__nanoclaw__create_matter',
+    'mcp__nanoclaw__update_matter',
+    'mcp__nanoclaw__list_matters',
+    'mcp__nanoclaw__get_matter',
+    'mcp__nanoclaw__find_matter',
     // Calendar: free/busy, event management, and calendar discovery
     // Excludes: list-events, get-event, search-events (prevents reading event details)
     'mcp__calendar__list-calendars',

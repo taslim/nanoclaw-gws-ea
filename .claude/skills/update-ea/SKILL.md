@@ -23,9 +23,9 @@ Run `/update-ea` in Claude Code.
 |------|---------------------|
 | `src/config.ts` | EA config vars, `validateEaConfig()`, `isPrincipalEmail()` |
 | `src/types.ts` | `allowedTools` on ContainerConfig, `sendReaction` on Channel |
-| `src/db.ts` | `processed_emails`, `email_threads`, `reactions` tables |
+| `src/db.ts` | `processed_emails`, `email_routes`, `matters`, `reactions` tables |
 | `src/index.ts` | Synthetic groups, email routing, GChat DM registration, status indicators |
-| `src/ipc.ts` | `sendReaction` handler, `update_email_thread` IPC |
+| `src/ipc.ts` | `sendReaction` handler, `create_matter`/`update_matter` IPC |
 | `src/container-runner.ts` | Conditional Workspace/Calendar mounts, `allowedTools` passthrough |
 
 **Update paths** (you pick one):

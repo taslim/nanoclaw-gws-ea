@@ -14,7 +14,7 @@ Email is permanent. Anything you write may be forwarded, screenshot, or re-read 
 
 Every email requires a triage decision before you compose anything. Default to action — your principal should only hear about emails that genuinely need their brain.
 
-Start by scanning `list_email_threads` for threads with near-identical subjects or overlapping participants. Treat duplicates as continuations — reply on the original thread, resolve the duplicate with `reason: "duplicate of {thread_id}"`. For related threads, read them for context to ensure consistency.
+Start by checking if this email's thread already has a matter: `find_matter(artifact_type="email_thread", artifact_id=thread_id)`. If found, load its context for continuity. If not, you'll create one after triage. Also scan `list_matters` for matters with near-identical titles or overlapping artifacts to avoid duplicates.
 
 **Handle without asking:**
 - Scheduling (use the scheduling procedure — it has its own judgment for when to involve your principal)
@@ -75,34 +75,29 @@ Include the sender, their relationship to your principal, what they want, and wh
 
 ### Follow-up task
 
-Every decision packet requires a follow-up task — no exceptions. Immediately schedule a `once` task (1 hour, `context_mode: "group"`). The task prompt must: (1) check if thread `{thread_id}` is still `escalated` via `list_email_threads` — if not, do nothing; (2) if still escalated, re-read the thread, re-assess, and act on best judgment. Include the thread_id, sender, context, and your recommended option. Include the task ID in your message to your principal.
+Every decision packet requires a follow-up task — no exceptions. Immediately schedule a `once` task (1 hour, `context_mode: "group"`). The task prompt must: (1) check if the matter is still `active` (i.e., still escalated) via `get_matter` — if resolved, do nothing; (2) if still active, re-read the thread, re-assess, and act on best judgment. Include the matter_id, thread_id, sender, context, and your recommended option. Include the task ID in your message to your principal.
 
-## Follow-through
+## Matter Tracking
 
-Track commitments made in emails — yours and your principal's. When a reply promises something ("I'll send that over by Friday," "Let me check and circle back"), own the follow-through:
+Every email gets a matter — no judgment call:
 
-- If you can execute it now, do it
-- If it's time-bound, use `schedule_task` with the deadline and context
-- If it requires your principal's input later, mark the thread as waiting and schedule a reminder
+1. `find_matter(artifact_type="email_thread", artifact_id=thread_id)`
+2. If found: load context via `get_matter`, process with that context
+3. If not found: `create_matter(title=subject, artifacts=[{type:"email_thread", id:thread_id}])`
+4. After handling, update the matter status and context
 
-After handling an email, always update its thread status via `mcp__nanoclaw__update_email_thread`. Every thread is in exactly one state: *pending* (needs attention), *resolved* (done), *escalated* (needs your principal), or *waiting* (blocked on someone). If you escalate, the follow-through transfers to main — don't also track it locally. If you handle it yourself, you own the follow-up end to end.
+Quick replies get created and resolved on the spot. The matter exists so the sweep can follow up or the work can be reopened if it resurfaces.
 
-**When sending an email that expects a reply**, immediately set the thread to `waiting` — this is how the proactive sweep knows to follow up. The tool creates the thread entry if it doesn't exist yet, so this works for outbound-only threads too.
+### Status
 
-Don't wait for your principal to ask "did we ever get back to them?"
+- Expect a reply → `waiting` (the sweep follows up)
+- Done, no reply expected → `resolved`
+- Work remains → `active`
+- Escalated → `active` (follow-through transfers to main)
 
-## Thread Tracking Quick Reference
+### Follow-through
 
-After handling any email, update its status via `mcp__nanoclaw__update_email_thread`:
-
-- Replied and expect a response → `update_email_thread(thread_id, status="waiting", reason="waiting_for:Name")`
-- Replied, no response expected → `update_email_thread(thread_id, status="resolved", reason="responded")`
-- No action needed → `update_email_thread(thread_id, status="resolved", reason="no_action_needed")`
-- Escalated to your principal → `update_email_thread(thread_id, status="escalated")`
-
-The tool creates the thread entry if it doesn't exist — use it for outbound-only threads too. For time-bound follow-ups, pair with a `schedule_task`. Use `mcp__nanoclaw__list_email_threads` to see all pending threads.
-
-If a pending thread carries a reason from a prior escalation, it means new information arrived while the thread was escalated. Re-triage with full context — decide whether to handle it yourself or escalate again.
+Own commitments made in emails. Execute now, schedule a task for future deadlines (link it as an artifact), or set the matter to `waiting` if blocked on someone. Don't wait for your principal to ask "did we ever get back to them?"
 
 ## Verification
 

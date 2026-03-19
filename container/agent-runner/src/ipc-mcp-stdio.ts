@@ -356,82 +356,46 @@ Use available_groups.json to find the JID for a group. The folder name must be c
   },
 );
 
-server.tool(
-  'list_email_threads',
-  "List email threads. By default shows threads needing attention (pending, escalated, waiting). Use include_resolved to also see resolved threads. Use since to filter by update time (ISO datetime).",
-  {
-    include_resolved: z.boolean().optional().describe('Include resolved threads (default: false)'),
-    since: z.string().optional().describe('Only return threads updated after this ISO datetime'),
-  },
-  async (args: { include_resolved?: boolean; since?: string }) => {
-    const threadsFile = path.join(IPC_DIR, 'pending_threads.json');
+// --- Matters ---
 
-    try {
-      if (!fs.existsSync(threadsFile)) {
-        return { content: [{ type: 'text' as const, text: 'No email threads.' }] };
-      }
+const ARTIFACT_TYPES = ['email_thread', 'calendar_event', 'task', 'doc'] as const;
 
-      let threads: Array<{ thread_id: string; group_folder: string; status: string; reason: string | null; subject: string | null; participants: string | null; updated_at: string }> =
-        JSON.parse(fs.readFileSync(threadsFile, 'utf-8'));
+type MatterEntry = {
+  id: number; title: string; status: string; artifacts?: string;
+  context?: string; tracking_file?: string; updated_at: string;
+};
 
-      // Filter by status (default: exclude resolved)
-      if (!args.include_resolved) {
-        threads = threads.filter((t) => t.status !== 'resolved');
-      }
-
-      // Filter by time (compare as epoch ms to handle timezone/format variations)
-      if (args.since) {
-        const sinceMs = Date.parse(args.since);
-        if (Number.isNaN(sinceMs)) {
-          return {
-            content: [{ type: 'text' as const, text: `Invalid since datetime: "${args.since}". Use an ISO datetime.` }],
-            isError: true,
-          };
-        }
-        threads = threads.filter((t) => Date.parse(t.updated_at) >= sinceMs);
-      }
-
-      if (threads.length === 0) {
-        return { content: [{ type: 'text' as const, text: 'No email threads matching filters.' }] };
-      }
-
-      const formatted = threads
-        .map(
-          (t) =>
-            `- [${t.thread_id}] ${t.status}${t.reason ? ` (${t.reason})` : ''} — ${t.subject || 'No subject'} | ${t.participants || 'unknown'} | ${t.group_folder}, updated ${t.updated_at}`,
-        )
-        .join('\n');
-
-      const label = args.include_resolved ? 'Email threads' : 'Pending email threads';
-      return { content: [{ type: 'text' as const, text: `${label}:\n${formatted}` }] };
-    } catch (err) {
-      return {
-        content: [{ type: 'text' as const, text: `Error reading threads: ${err instanceof Error ? err.message : String(err)}` }],
-      };
-    }
-  },
-);
+/** Read and parse the matters snapshot. Returns [] if the file doesn't exist. */
+function readMattersSnapshot(): MatterEntry[] {
+  const mattersFile = path.join(IPC_DIR, 'current_matters.json');
+  try {
+    return JSON.parse(fs.readFileSync(mattersFile, 'utf-8'));
+  } catch {
+    return [];
+  }
+}
 
 server.tool(
-  'update_email_thread',
-  `Update the triage status of an email thread. Creates the thread if it doesn't exist yet — use this to track outbound-only emails at send time (e.g., set "waiting" right after sending an email that expects a reply).
+  'create_matter',
+  `Create a new matter to track a workstream. Every piece of tracked work — an email exchange, a project, a calendar event requiring prep — is a matter. Matters scale from quick email replies (created and resolved on the spot) to complex multi-month projects.
 
-Statuses:
-• "resolved" — thread handled (reason: "responded", "no_action_needed", "forwarded", etc.)
-• "waiting" — waiting on someone (reason: "waiting_for:Sandra", "waiting_for:vendor_reply", etc.). Always set this when you send an email that expects a response.
-• "escalated" — escalated to Tas for decision
-• "pending" — reopen a thread (rarely needed; new inbound messages auto-reset to pending)`,
+Artifact types: email_thread (Gmail thread ID), calendar_event (Google Calendar event ID), task (scheduled_tasks task ID), doc (Google Drive/Docs file ID).`,
   {
-    thread_id: z.string().describe('The Gmail thread ID'),
-    status: z.enum(['pending', 'resolved', 'waiting', 'escalated']).describe('New triage status'),
-    reason: z.string().optional().describe('Why this status was set (e.g., "responded", "waiting_for:Sandra")'),
+    title: z.string().describe('Short descriptive title for the matter'),
+    context: z.string().optional().describe('Living summary of current state — rewritten (not appended) on meaningful updates'),
+    artifacts: z.array(z.object({
+      type: z.enum(ARTIFACT_TYPES),
+      id: z.string(),
+    })).optional().describe('Linked artifacts (email threads, calendar events, tasks, docs)'),
+    tracking_file: z.string().regex(/^[^/\\]+$/, 'tracking_file must be a plain filename').optional().describe('Filename in group memory/ for detailed dossier'),
   },
   async (args) => {
     const data = {
-      type: 'update_email_thread',
-      threadId: args.thread_id,
-      status: args.status,
-      reason: args.reason || undefined,
+      type: 'create_matter',
+      title: args.title,
+      context: args.context || undefined,
+      artifacts: args.artifacts ? JSON.stringify(args.artifacts) : undefined,
+      tracking_file: args.tracking_file || undefined,
       groupFolder,
       timestamp: new Date().toISOString(),
     };
@@ -439,8 +403,144 @@ Statuses:
     writeIpcFile(TASKS_DIR, data);
 
     return {
-      content: [{ type: 'text' as const, text: `Thread ${args.thread_id} marked as ${args.status}${args.reason ? ` (${args.reason})` : ''}.` }],
+      content: [{ type: 'text' as const, text: `Matter created: "${args.title}"` }],
     };
+  },
+);
+
+server.tool(
+  'update_matter',
+  `Update an existing matter. Only provided fields are changed; omitted fields stay the same. Use this to update status, context, add artifacts, or link a tracking file.
+
+Statuses: active (work remains), waiting (blocked on someone/something), paused (intentionally on hold), resolved (done).`,
+  {
+    matter_id: z.number().describe('The matter ID'),
+    title: z.string().optional().describe('New title'),
+    status: z.enum(['active', 'waiting', 'paused', 'resolved']).optional().describe('New status'),
+    context: z.string().optional().describe('Updated living summary — rewrite the whole context, not append'),
+    artifacts: z.array(z.object({
+      type: z.enum(ARTIFACT_TYPES),
+      id: z.string(),
+    })).optional().describe('Full replacement artifact list'),
+    tracking_file: z.string().regex(/^[^/\\]+$/, 'tracking_file must be a plain filename').optional().describe('Filename in group memory/'),
+  },
+  async (args) => {
+    const data: Record<string, unknown> = {
+      type: 'update_matter',
+      matterId: args.matter_id,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+    if (args.title !== undefined) data.title = args.title;
+    if (args.status !== undefined) data.status = args.status;
+    if (args.context !== undefined) data.context = args.context;
+    if (args.artifacts !== undefined) data.artifacts = JSON.stringify(args.artifacts);
+    if (args.tracking_file !== undefined) data.tracking_file = args.tracking_file;
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{ type: 'text' as const, text: `Matter ${args.matter_id} update requested.` }],
+    };
+  },
+);
+
+server.tool(
+  'list_matters',
+  'List tracked matters. By default shows active and waiting matters. Use status to filter.',
+  {
+    status: z.enum(['active', 'waiting', 'paused', 'resolved']).optional().describe('Filter by status (default: active + waiting)'),
+  },
+  async (args) => {
+    const all = readMattersSnapshot();
+    const matters = args.status
+      ? all.filter((m) => m.status === args.status)
+      : all.filter((m) => m.status === 'active' || m.status === 'waiting');
+
+    if (matters.length === 0) {
+      return { content: [{ type: 'text' as const, text: 'No matters matching filters.' }] };
+    }
+
+    const formatted = matters
+      .map((m) => `- [${m.id}] ${m.title} (${m.status}) — updated ${m.updated_at}`)
+      .join('\n');
+
+    return { content: [{ type: 'text' as const, text: `Matters:\n${formatted}` }] };
+  },
+);
+
+server.tool(
+  'get_matter',
+  'Get full details of a specific matter, including context and artifacts. From main group: also includes tracking file contents if set.',
+  {
+    matter_id: z.number().describe('The matter ID'),
+  },
+  async (args) => {
+    const matter = readMattersSnapshot().find((m) => m.id === args.matter_id);
+    if (!matter) {
+      return { content: [{ type: 'text' as const, text: `Matter ${args.matter_id} not found.` }] };
+    }
+
+    let result = `Matter #${matter.id}: ${matter.title}\nStatus: ${matter.status}\nUpdated: ${matter.updated_at}`;
+    if (matter.artifacts) result += `\nArtifacts: ${matter.artifacts}`;
+    if (matter.context) result += `\nContext: ${matter.context}`;
+    if (matter.tracking_file) result += `\nTracking file: ${matter.tracking_file}`;
+
+    // If main and tracking_file is set, read its contents
+    if (isMain && matter.tracking_file) {
+      try {
+        const memoryBase = path.resolve('/workspace/group/memory');
+        const trackingPath = path.resolve(memoryBase, matter.tracking_file);
+        if (!trackingPath.startsWith(memoryBase + path.sep) && trackingPath !== memoryBase) {
+          result += `\n\nTracking file path "${matter.tracking_file}" escapes memory directory — skipped.`;
+        } else {
+          const contents = fs.readFileSync(trackingPath, 'utf-8');
+          result += `\n\n--- Tracking File Contents ---\n${contents}`;
+        }
+      } catch {
+        // File may not exist yet — that's fine
+      }
+    }
+
+    return { content: [{ type: 'text' as const, text: result }] };
+  },
+);
+
+server.tool(
+  'find_matter',
+  'Find matters by linked artifact. Use this to check if an email thread, calendar event, task, or doc already has a matter.',
+  {
+    artifact_type: z.enum(ARTIFACT_TYPES).optional().describe('Filter by artifact type'),
+    artifact_id: z.string().optional().describe('Filter by artifact ID (e.g., Gmail thread ID)'),
+  },
+  async (args) => {
+    const matches = readMattersSnapshot().filter((m) => {
+      if (!m.artifacts) return false;
+      try {
+        const artifacts: Array<{ type: string; id: string }> = JSON.parse(m.artifacts);
+        return artifacts.some(
+          (a) =>
+            (!args.artifact_type || a.type === args.artifact_type) &&
+            (!args.artifact_id || a.id === args.artifact_id),
+        );
+      } catch {
+        return false;
+      }
+    });
+
+    if (matches.length === 0) {
+      return { content: [{ type: 'text' as const, text: 'No matters found with matching artifacts.' }] };
+    }
+
+    const formatted = matches
+      .map((m) => {
+        let line = `- [${m.id}] ${m.title} (${m.status}) — updated ${m.updated_at}`;
+        if (m.context) line += `\n  Context: ${m.context}`;
+        return line;
+      })
+      .join('\n');
+
+    return { content: [{ type: 'text' as const, text: `Matching matters:\n${formatted}` }] };
   },
 );
 

@@ -84,13 +84,11 @@ Both groups escalate here when they need your principal's input. Stay quiet abou
 
 ### Executing Email Decisions
 
-When an email escalation arrives with response options and a thread ID (a "decision packet"):
-- When your principal picks an option (or gives modified instructions), use `mcp__workspace__get_gmail_thread_content` with the thread_id to fetch full context and reply headers, read the email-triage procedure, compose and send via `mcp__workspace__send_gmail_message`
-- Before composing: look up the recipient in Contacts, assess their tier, and scope your reply to what that tier warrants. Your principal's instruction sets the *what* — the tier sets the *how much*
-- Run through the verification checklist in the email-triage procedure before sending
-- After sending, update thread status: use `waiting` if a response is expected, `resolved` if not: `mcp__nanoclaw__update_email_thread(thread_id, status, reason)`
+Email escalations arrive as decision packets (matter ID + options + thread ID). Load the matter for context, fetch the thread for reply headers, and follow the email-triage procedure to compose, verify, and send. Scope the reply to the recipient's tier — your principal's instruction sets the *what*, the tier sets the *how much*. After sending, update the matter and schedule follow-up tasks as artifacts if time-bound.
 
-Time-bound follow-ups get a `schedule_task` so nothing slips.
+### Matters
+
+When your principal asks about a workstream, check matters first via `list_matters` or `find_matter`. When your principal assigns new work, create a matter if one doesn't exist. When scheduling or creating calendar events, link them to the relevant matter via artifacts. When creating follow-up tasks, mention the matter ID in the task prompt so the task agent can load context.
 
 ## What You Can Do
 
@@ -131,11 +129,11 @@ When working as a sub-agent or teammate, only use `send_message` if instructed t
 The `conversations/` folder contains searchable history of past conversations. Use this to recall context from previous sessions.
 
 When you learn something important:
-- Create files in `memory/` for structured data (e.g., `memory/preferences.md`)
+- Create files in `memory/` for reference data (e.g., `memory/preferences.md`)
 - Split files larger than 500 lines into folders
 - Keep an index in your memory for the files you create
 
-Treat your workspace like a real assistant's desk — build up knowledge about people, preferences, and patterns as you encounter them.
+Work tracking (follow-ups, pending items, project status) lives in matters — don't duplicate it in local files. Files are for reference data: people, preferences, patterns, research.
 
 ### Relationships
 
