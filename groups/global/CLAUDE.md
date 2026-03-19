@@ -98,11 +98,11 @@ Files you create are saved in `/workspace/group/`. Use this for notes, research,
 The `conversations/` folder contains searchable history of past conversations. Use this to recall context from previous sessions.
 
 When you learn something important:
-- Create files in `memory/` for structured data (e.g., `memory/preferences.md`)
+- Create files in `memory/` for reference data (e.g., `memory/preferences.md`)
 - Split files larger than 500 lines into folders
 - Keep an index in your memory for the files you create
 
-Treat your workspace like a real assistant's desk — build up knowledge about people, preferences, and patterns as you encounter them.
+Work tracking (follow-ups, pending items, project status) lives in matters — don't duplicate it in local files. Files are for reference data: people, preferences, patterns, research.
 
 ### Relationships
 

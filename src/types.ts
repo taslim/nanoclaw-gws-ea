@@ -78,6 +78,33 @@ export interface TaskRunLog {
   error: string | null;
 }
 
+export interface Reaction {
+  message_id: string;
+  message_chat_jid: string;
+  reactor_jid: string;
+  reactor_name?: string;
+  emoji: string;
+  timestamp: string;
+}
+
+export const MATTER_STATUSES = [
+  'active',
+  'waiting',
+  'paused',
+  'resolved',
+] as const;
+export type MatterStatus = (typeof MATTER_STATUSES)[number];
+
+export interface Matter {
+  id: number;
+  title: string;
+  status: MatterStatus;
+  artifacts: string | null;
+  context: string | null;
+  tracking_file: string | null;
+  updated_at: string;
+}
+
 // --- Channel abstraction ---
 
 export interface Channel {

@@ -6,30 +6,13 @@ import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import {
+  Matter,
   NewMessage,
+  Reaction,
   RegisteredGroup,
   ScheduledTask,
   TaskRunLog,
 } from './types.js';
-
-export interface Reaction {
-  message_id: string;
-  message_chat_jid: string;
-  reactor_jid: string;
-  reactor_name?: string;
-  emoji: string;
-  timestamp: string;
-}
-
-export interface EmailThread {
-  thread_id: string;
-  group_folder: string;
-  status: string;
-  reason: string | null;
-  subject: string | null;
-  participants: string | null;
-  updated_at: string;
-}
 
 let db: Database.Database;
 
@@ -122,16 +105,22 @@ function createSchema(database: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_reactions_message ON reactions(message_id, message_chat_jid);
 
-    CREATE TABLE IF NOT EXISTS email_threads (
+    CREATE TABLE IF NOT EXISTS email_routes (
       thread_id TEXT PRIMARY KEY,
       group_folder TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending',
-      reason TEXT,
-      subject TEXT,
-      participants TEXT,
       updated_at TEXT NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS idx_email_threads_status ON email_threads(status);
+
+    CREATE TABLE IF NOT EXISTS matters (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      artifacts TEXT,
+      context TEXT,
+      tracking_file TEXT,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_matters_status ON matters(status);
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -199,16 +188,61 @@ function createSchema(database: Database.Database): void {
     /* columns already exist */
   }
 
-  // Add subject, participants columns to email_threads if missing (migration for existing DBs)
+  // Migrate email_threads → email_routes + matters (preserves routing data, moves status tracking to matters)
   try {
-    database.exec('ALTER TABLE email_threads ADD COLUMN subject TEXT');
-  } catch {
-    /* column already exists */
-  }
-  try {
-    database.exec('ALTER TABLE email_threads ADD COLUMN participants TEXT');
-  } catch {
-    /* column already exists */
+    const hasEmailThreads = database
+      .prepare(
+        `SELECT 1 FROM sqlite_master WHERE type='table' AND name='email_threads'`,
+      )
+      .get();
+    if (hasEmailThreads) {
+      // Copy routing data
+      database.exec(`
+        INSERT OR IGNORE INTO email_routes (thread_id, group_folder, updated_at)
+        SELECT thread_id, group_folder, updated_at FROM email_threads
+      `);
+
+      // Migrate active email threads (pending/waiting/escalated) into matters
+      const activeThreads = database
+        .prepare(
+          `SELECT thread_id, subject, status, updated_at FROM email_threads WHERE status IN ('pending', 'waiting', 'escalated')`,
+        )
+        .all() as Array<{
+        thread_id: string;
+        subject: string | null;
+        status: string;
+        updated_at: string;
+      }>;
+      for (const t of activeThreads) {
+        const matterStatus =
+          t.status === 'escalated'
+            ? 'active'
+            : t.status === 'pending'
+              ? 'active'
+              : 'waiting';
+        database
+          .prepare(
+            `INSERT INTO matters (title, status, artifacts, updated_at) VALUES (?, ?, ?, ?)`,
+          )
+          .run(
+            t.subject || `Email thread ${t.thread_id}`,
+            matterStatus,
+            JSON.stringify([{ type: 'email_thread', id: t.thread_id }]),
+            t.updated_at,
+          );
+      }
+      if (activeThreads.length > 0) {
+        logger.info(
+          { count: activeThreads.length },
+          'Migrated active email threads → matters',
+        );
+      }
+
+      database.exec(`DROP TABLE email_threads`);
+      logger.info('Migrated email_threads → email_routes');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'email_threads migration skipped or already done');
   }
 }
 
@@ -726,78 +760,146 @@ export function markEmailProcessed(
   ).run(messageId, threadId, sender, subject, new Date().toISOString());
 }
 
-// --- Email threads ---
+// --- Email routes ---
 
-export function getEmailThreadRoute(threadId: string): string | undefined {
+export function getEmailRoute(threadId: string): string | undefined {
   const row = db
-    .prepare('SELECT group_folder FROM email_threads WHERE thread_id = ?')
+    .prepare('SELECT group_folder FROM email_routes WHERE thread_id = ?')
     .get(threadId) as { group_folder: string } | undefined;
   return row?.group_folder;
 }
 
 /**
- * Create or update an email thread record.
- * New threads start as 'pending'. Existing threads auto-unresolve on new inbound.
- *
+ * Create or update an email route record.
  * Ratchet: group_folder only moves toward 'email-external', never back.
- * Escalation: reason is preserved when resetting from 'escalated' so the
- * agent knows why the thread was escalated and can re-triage.
  */
-export function upsertEmailThread(
-  threadId: string,
-  groupFolder: string,
-  subject?: string,
-  participants?: string,
-): void {
+export function upsertEmailRoute(threadId: string, groupFolder: string): void {
   const now = new Date().toISOString();
   db.prepare(
-    `INSERT INTO email_threads (thread_id, group_folder, status, subject, participants, updated_at)
-     VALUES (?, ?, 'pending', ?, ?, ?)
+    `INSERT INTO email_routes (thread_id, group_folder, updated_at)
+     VALUES (?, ?, ?)
      ON CONFLICT(thread_id) DO UPDATE SET
        group_folder = CASE
          WHEN excluded.group_folder = 'email-external' THEN 'email-external'
-         ELSE email_threads.group_folder
+         ELSE email_routes.group_folder
        END,
-       status = 'pending',
-       reason = CASE
-         WHEN email_threads.status = 'escalated' THEN email_threads.reason
-         ELSE NULL
-       END,
-       subject = COALESCE(excluded.subject, email_threads.subject),
-       participants = COALESCE(excluded.participants, email_threads.participants),
        updated_at = excluded.updated_at`,
-  ).run(threadId, groupFolder, subject || null, participants || null, now);
+  ).run(threadId, groupFolder, now);
 }
 
-export function updateEmailThreadStatus(
-  threadId: string,
-  status: string,
-  reason?: string,
-): void {
+// --- Matters ---
+
+export function createMatter(
+  title: string,
+  context?: string,
+  artifacts?: string,
+  trackingFile?: string,
+): number {
   const now = new Date().toISOString();
-  db.prepare(
-    'UPDATE email_threads SET status = ?, reason = ?, updated_at = ? WHERE thread_id = ?',
-  ).run(status, reason || null, now, threadId);
+  const result = db
+    .prepare(
+      `INSERT INTO matters (title, status, artifacts, context, tracking_file, updated_at)
+       VALUES (?, 'active', ?, ?, ?, ?)`,
+    )
+    .run(title, artifacts || null, context || null, trackingFile || null, now);
+  return Number(result.lastInsertRowid);
 }
 
-export function getEmailThread(threadId: string): EmailThread | undefined {
-  return db
-    .prepare('SELECT * FROM email_threads WHERE thread_id = ?')
-    .get(threadId) as EmailThread | undefined;
+export function getMatter(id: number): Matter | undefined {
+  return db.prepare('SELECT * FROM matters WHERE id = ?').get(id) as
+    | Matter
+    | undefined;
 }
 
-export function getPendingEmailThreads(): EmailThread[] {
+export function listMatters(
+  status?: string,
+): Array<Pick<Matter, 'id' | 'title' | 'status' | 'updated_at'>> {
+  if (status) {
+    return db
+      .prepare(
+        'SELECT id, title, status, updated_at FROM matters WHERE status = ? ORDER BY updated_at DESC',
+      )
+      .all(status) as Array<
+      Pick<Matter, 'id' | 'title' | 'status' | 'updated_at'>
+    >;
+  }
   return db
     .prepare(
-      `SELECT * FROM email_threads WHERE status IN ('pending', 'escalated', 'waiting') ORDER BY updated_at DESC`,
+      `SELECT id, title, status, updated_at FROM matters WHERE status IN ('active', 'waiting') ORDER BY updated_at DESC`,
     )
-    .all() as EmailThread[];
+    .all() as Array<Pick<Matter, 'id' | 'title' | 'status' | 'updated_at'>>;
 }
 
-export function getAllEmailThreads(): EmailThread[] {
+export function updateMatter(
+  id: number,
+  fields: Partial<
+    Pick<Matter, 'title' | 'status' | 'artifacts' | 'context' | 'tracking_file'>
+  >,
+): void {
+  const sets: string[] = [];
+  const values: unknown[] = [];
+
+  if (fields.title !== undefined) {
+    sets.push('title = ?');
+    values.push(fields.title);
+  }
+  if (fields.status !== undefined) {
+    sets.push('status = ?');
+    values.push(fields.status);
+  }
+  if (fields.artifacts !== undefined) {
+    sets.push('artifacts = ?');
+    values.push(fields.artifacts);
+  }
+  if (fields.context !== undefined) {
+    sets.push('context = ?');
+    values.push(fields.context);
+  }
+  if (fields.tracking_file !== undefined) {
+    sets.push('tracking_file = ?');
+    values.push(fields.tracking_file);
+  }
+
+  if (sets.length === 0) return;
+
+  sets.push('updated_at = ?');
+  values.push(new Date().toISOString());
+  values.push(id);
+
+  db.prepare(`UPDATE matters SET ${sets.join(', ')} WHERE id = ?`).run(
+    ...values,
+  );
+}
+
+export function findMatter(opts: {
+  artifactType?: string;
+  artifactId?: string;
+}): Matter[] {
+  const all = db
+    .prepare('SELECT * FROM matters ORDER BY updated_at DESC')
+    .all() as Matter[];
+  return all.filter((m) => {
+    if (!m.artifacts) return false;
+    try {
+      const artifacts = JSON.parse(m.artifacts) as Array<{
+        type: string;
+        id: string;
+      }>;
+      return artifacts.some(
+        (a) =>
+          (!opts.artifactType || a.type === opts.artifactType) &&
+          (!opts.artifactId || a.id === opts.artifactId),
+      );
+    } catch {
+      return false;
+    }
+  });
+}
+
+export function getAllMatters(): Matter[] {
   return db
-    .prepare('SELECT * FROM email_threads ORDER BY updated_at DESC')
-    .all() as EmailThread[];
+    .prepare('SELECT * FROM matters ORDER BY updated_at DESC')
+    .all() as Matter[];
 }
 
 // --- Reactions ---

@@ -6,17 +6,16 @@ import { CronExpressionParser } from 'cron-parser';
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import {
+  createMatter,
   createTask,
   deleteTask,
-  getEmailThread,
   getTaskById,
-  updateEmailThreadStatus,
-  upsertEmailThread,
+  updateMatter,
   updateTask,
 } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
-import { RegisteredGroup } from './types.js';
+import { MATTER_STATUSES, RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
@@ -222,10 +221,13 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
-    // For update_email_thread
-    threadId?: string;
+    // For matters
+    matterId?: number;
+    title?: string;
+    context?: string;
+    artifacts?: string;
+    tracking_file?: string;
     status?: string;
-    reason?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -509,34 +511,49 @@ export async function processTaskIpc(
       }
       break;
 
-    case 'update_email_thread':
-      if (data.threadId && data.status) {
-        let thread = getEmailThread(data.threadId);
-        if (!thread) {
-          // Create the thread (outbound-only emails won't exist yet)
-          upsertEmailThread(data.threadId, sourceGroup);
-          thread = getEmailThread(data.threadId)!;
-          logger.info(
-            { threadId: data.threadId, sourceGroup },
-            'Created email thread via upsert',
-          );
-        }
-        if (!isMain && thread.group_folder !== sourceGroup) {
+    case 'create_matter':
+      // No authorization — matters are shared state, any group can create
+      if (data.title) {
+        const id = createMatter(
+          data.title,
+          data.context,
+          data.artifacts,
+          data.tracking_file,
+        );
+        logger.info(
+          { matterId: id, title: data.title, sourceGroup },
+          'Matter created via IPC',
+        );
+      }
+      break;
+
+    case 'update_matter':
+      // No authorization — matters are shared state, any group can update
+      if (data.matterId) {
+        if (
+          data.status !== undefined &&
+          !MATTER_STATUSES.includes(
+            data.status as (typeof MATTER_STATUSES)[number],
+          )
+        ) {
           logger.warn(
-            { threadId: data.threadId, sourceGroup },
-            'Unauthorized email thread update attempt',
+            { matterId: data.matterId, status: data.status, sourceGroup },
+            'Invalid matter status, rejecting update',
           );
           break;
         }
-        updateEmailThreadStatus(data.threadId, data.status, data.reason);
+        const fields: Parameters<typeof updateMatter>[1] = {};
+        if (data.title !== undefined) fields.title = data.title;
+        if (data.status !== undefined)
+          fields.status = data.status as (typeof MATTER_STATUSES)[number];
+        if (data.context !== undefined) fields.context = data.context;
+        if (data.artifacts !== undefined) fields.artifacts = data.artifacts;
+        if (data.tracking_file !== undefined)
+          fields.tracking_file = data.tracking_file;
+        updateMatter(data.matterId, fields);
         logger.info(
-          {
-            threadId: data.threadId,
-            status: data.status,
-            reason: data.reason,
-            sourceGroup,
-          },
-          'Email thread status updated via IPC',
+          { matterId: data.matterId, sourceGroup },
+          'Matter updated via IPC',
         );
       }
       break;

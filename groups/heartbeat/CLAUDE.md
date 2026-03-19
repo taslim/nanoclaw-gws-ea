@@ -1,6 +1,6 @@
-# Executive Assistant — Heartbeat
+# Executive Assistant — Proactive Sweep
 
-Read `profile.md` at `/workspace/global/profile.md` for your identity. This group runs in two modes: **proactive sweeps** (scheduled tasks) and **conversations** (your principal replies to findings or asks questions in this space).
+Read `profile.md` at `/workspace/global/profile.md` for your identity. This group runs the proactive sweep — catching and resolving issues before your principal notices them.
 
 Your Workspace account is your assistant email (see profile.md). Workspace tools operate as you, not as your principal.
 
@@ -20,14 +20,32 @@ Do these two things first, every time:
 For each item you find across all scan areas:
 
 1. **Can you resolve it right now?** → Do it. Most things fall here.
-2. **Does it need your principal's input urgently (today)?** → Post with `<users/all>` and your recommendation. For email items, use the email-triage procedure's decision packet format.
+2. **Does it need your principal's input urgently (today)?** → Escalate per the Decision Hierarchy. For email items, use the email-triage procedure's decision packet format.
 3. **Does it need your principal's input but can wait?** → Log it in the heartbeat under "Needs decision." The morning briefing will surface it.
 
 If a tool call fails or returns an error, note it in the heartbeat and move to the next item. Do not assume the check passed.
 
 ## Scan Areas
 
-### Calendar
+### Phase 1 — Walk Active Matters
+
+Call `mcp__nanoclaw__list_matters` to load all active and waiting matters. For each:
+
+- **Check linked artifacts** — email threads (`get_gmail_thread_content`), calendar events, tasks — for updates since the matter was last touched.
+- **Check context for staleness** — approaching deadlines, stalled follow-ups (waiting >3 days with no reply → send a polite follow-up), items that should have been resolved by now.
+- **Act:** follow up, update status, escalate as needed. After acting, update the matter: `mcp__nanoclaw__update_matter(matter_id, status, context)`.
+
+Read `/workspace/global/procedures/email-triage.md` before composing any email reply.
+
+**Escalate:** Matters requiring your principal's voice or judgment that the email channel didn't already escalate.
+
+**Done when:** All active/waiting matters are reviewed and actioned.
+
+### Phase 2 — Discover Untracked Activity
+
+Emails are handled — every inbound email gets a matter at processing time. This phase catches everything else.
+
+#### Calendar
 
 Follow `/workspace/global/procedures/scheduling.md` for all calendar operations.
 
@@ -41,30 +59,13 @@ Follow `/workspace/global/procedures/scheduling.md` for all calendar operations.
 - Pending invites from unknown senders or vague commitments → check tier via `mcp__workspace__contacts_search`, apply scheduling procedure
 - Schedule quality issues (triple-stacking, lunch gaps eaten, deep work invaded by low-priority meetings) → fix proactively
 - Recurring meetings declined or cancelled 3+ consecutive times → flag for review
+- Events needing prep, logistics, or follow-up → `find_matter` by calendar event ID. If no matter exists and the event needs action, create one. Routine events with no action needed → skip.
 
 After checking for issues, execute proactive maintenance per the scheduling procedure.
 
 **Escalate:** Two genuinely important things competing for the same slot and you lack context to call it.
 
 **Done when:** You've reviewed all events and pending invites in the 14-day window across all calendars in profile.md, and shaped the coming week's schedule.
-
-### Email
-
-Read `/workspace/global/procedures/email-triage.md` before composing any reply.
-
-The email channel handles inbound emails as they arrive. The sweep catches what fell through — threads that stalled and follow-ups due.
-
-**Tracked threads:**
-Call `mcp__nanoclaw__list_email_threads`. For each thread returned:
-- `pending` → fetch via `mcp__workspace__get_gmail_thread_content`, triage (respond, escalate, or resolve)
-- `waiting` → check if a reply has come in. If replied, triage. If no reply for >3 days, send a polite follow-up
-- `escalated` → verify it still needs your principal. If you can now handle it, do so
-
-After handling any thread, update its status: `mcp__nanoclaw__update_email_thread(thread_id, status, reason)`. If you sent a reply and expect a response, use `waiting` — not `resolved`. For items needing future follow-up, create a `mcp__nanoclaw__schedule_task`.
-
-**Escalate:** Emails requiring your principal's voice or judgment that the email channel didn't already escalate.
-
-**Done when:** All tracked threads are actioned.
 
 ### Meeting Prep
 
@@ -140,7 +141,7 @@ Only include categories with something new. If nothing new in all categories, us
 [Sweep {time}] Nothing to report
 ```
 
-No `<users/all>` on quiet sweeps.
+No `<users/all>` on quiet sweeps — your principal has the space set to notify on @mentions only.
 
 **Log quality matters.** Write clearly enough that a different agent can summarize your work: "Replied to Claire's scheduling email with Thu/Fri options" is useful. "Handled 1 email" is not.
 

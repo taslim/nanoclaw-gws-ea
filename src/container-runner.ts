@@ -705,30 +705,41 @@ export function writeTasksSnapshot(
   fs.writeFileSync(tasksFile, JSON.stringify(filteredTasks, null, 2));
 }
 
-export function writeEmailThreadsSnapshot(
+export function writeMattersSnapshot(
   groupFolder: string,
   isMain: boolean,
-  threads: Array<{
-    thread_id: string;
-    group_folder: string;
+  matters: Array<{
+    id: number;
+    title: string;
     status: string;
-    reason: string | null;
-    subject: string | null;
-    participants: string | null;
+    artifacts: string | null;
+    context: string | null;
+    tracking_file: string | null;
     updated_at: string;
   }>,
 ): void {
   const groupIpcDir = resolveGroupIpcPath(groupFolder);
   fs.mkdirSync(groupIpcDir, { recursive: true });
 
-  // Main and heartbeat see all threads, others only see their own
-  const filtered =
-    isMain || groupFolder === 'heartbeat'
-      ? threads
-      : threads.filter((t) => t.group_folder === groupFolder);
+  // All groups get base fields. Main and heartbeat also get context/tracking_file.
+  const includeContext = isMain || groupFolder === 'heartbeat';
+  const snapshot = matters.map((m) => {
+    const entry: Record<string, unknown> = {
+      id: m.id,
+      title: m.title,
+      status: m.status,
+      artifacts: m.artifacts,
+      updated_at: m.updated_at,
+    };
+    if (includeContext) {
+      entry.context = m.context;
+      if (isMain) entry.tracking_file = m.tracking_file;
+    }
+    return entry;
+  });
 
-  const threadsFile = path.join(groupIpcDir, 'pending_threads.json');
-  fs.writeFileSync(threadsFile, JSON.stringify(filtered, null, 2));
+  const mattersFile = path.join(groupIpcDir, 'current_matters.json');
+  fs.writeFileSync(mattersFile, JSON.stringify(snapshot, null, 2));
 }
 
 /**

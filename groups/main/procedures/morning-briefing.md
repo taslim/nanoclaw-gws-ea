@@ -2,71 +2,47 @@
 
 Daily chief-of-staff brief. Your principal should be able to read this in 90 seconds, make 2-3 decisions, and know their day is handled.
 
-Use `mcp__time__*` tools for ALL date/time computation. Never calculate dates yourself.
+**Brevity is the point.** Skip sections with nothing to report. Never mention a matter in more than one section. Err on the side of leaving things out — if it doesn't need your principal's brain this morning, it doesn't belong here.
 
 ## Execution
 
-Work through each section below in order. Gather all the data first — all calendars in profile.md, `mcp__nanoclaw__list_email_threads` for pending/escalated threads — then compose one message. Send via `mcp__nanoclaw__send_message`, even on light days.
+Use `mcp__time__*` tools for all date/time computation. Gather all the data first — all calendars in profile.md, `list_matters` for active/waiting matters, `get_matter` for key projects (those with a `tracking_file`). Then compose one message and send via `mcp__nanoclaw__send_message`.
 
 ## Sections
 
-### 1. Decisions Needed
+### 1. Decisions
 
-This is the most important section. Surface anything awaiting your principal's input — from email escalations, scheduling conflicts, open questions from yesterday, or anything the overnight sweeps flagged but couldn't resolve.
+Active matters awaiting your principal's input.
 
-Format as a numbered list. Each item gets:
-- What the decision is (one sentence)
-- Your recommendation (bold)
-- The deadline, if any
+Format as a numbered list. Each item: what the decision is (one sentence), your recommendation (bold), and the deadline if any. Your principal replies "1 yes, 2 no, 3 go with your call" — design for that interaction.
 
-Your principal replies "1 yes, 2 no, 3 go with your call" — design for that interaction. If there are no decisions, say so explicitly: "Nothing pending."
+For each decision, schedule a `once` fallback task (1 hour, `context_mode: "group"`) that gate-checks whether your principal already responded before acting. Include the task ID: "Acting on this in 1 hour unless you say otherwise (task: {id})."
 
-For each decision, immediately schedule a `once` task (1 hour, `context_mode: "group"`) to act on it if your principal doesn't respond. The task prompt must gate-check whether your principal already responded before acting. Tell your principal in the briefing: "Acting on this in 1 hour unless you say otherwise (task: {id})."
+### 2. Today
 
-### 2. Overnight
+**Calendar** — what's wrong with today's schedule:
+- Conflicts to resolve
+- Meetings where your principal needs context walking in (first-time contacts, high-stakes)
+- Missing logistics (no location, no link)
 
-Use `mcp__time__now` to get the current time, then `mcp__time__resolve` to compute 11pm yesterday. Call `mcp__nanoclaw__list_email_threads(include_resolved=true, since=<11pm_iso>)` to see all threads that changed overnight. For threads with notable resolutions, read the thread via Gmail to understand what was handled.
+Skip anything routine or fully handled.
 
-Summarize what ran autonomously. Skip routine status changes and threads your principal already saw. Only surface items that change what your principal knows or needs to do: "Declined the Johnson meeting request — conflicted with board prep" or "Replied to Sarah's email offering Thursday slots." The examples show the right grain — what was done and why, not counts.
+**Projects** — key project matters (those with a `tracking_file`). Only mention if something needs attention today.
 
-If nothing happened, say "Quiet night."
+### 3. Horizon
 
-### 3. Today
+**Overnight** — what ran autonomously since ~11pm that changes what your principal knows or needs to do. Skip routine resolutions.
 
-Frame the day. Only include exceptions and items needing action/awareness:
+**This week** — matters at risk beyond today:
+- Stalled follow-ups or waiting matters past due
+- Upcoming events missing logistics (travel, reservations, venue)
+- Deadlines approaching without clear progress
 
-**Calendar:**
-- Double-books or conflicts to resolve
-- Events needing prep you haven't done yet
-- First/important meetings with people where context matters
-- Logistics gaps (no location, no link when you need one)
-
-Skip: routine recurring events, general busy/free shape unless extreme, events that are fully handled.
-
-**Projects:**
-Only mention when:
-- Your principal needs to decide or act today
-- Something became unblocked overnight
-- A deadline is approaching (within 48 hours)
-- Something is at risk of slipping
-
-Otherwise, projects stay in tracking files. Your principal asks when they want to check in.
-
-Check all calendars in profile.md. Follow `/workspace/project/groups/global/procedures/scheduling.md` for calendar operations.
-
-### 4. This Week
-
-Exceptions only — no calendar dumps. Include:
-- Follow-ups at risk of slipping (commitments from your principal or you)
-- Logistics gaps for upcoming events (travel without bookings, date nights without reservations)
-- Prep needed for meetings/events that gate other work
-- Time-sensitive items beyond today
-
-If everything is handled, skip this section entirely.
+Skip the entire section if everything is handled.
 
 ## Tone
 
-Write like a chief of staff, not a newsletter. Terse, direct, judgment-forward. Lead every section with the most important thing. No filler, no "hope you slept well," no emoji.
+Write like a chief of staff, not a newsletter. Terse, judgment-forward. Lead with the most important thing. No filler, no pleasantries, no emoji. A quiet morning that produces a two-line briefing is perfect.
 
 ## Output
 

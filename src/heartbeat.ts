@@ -29,8 +29,11 @@ export const HEARTBEAT_GROUP = {
     'mcp__nanoclaw__send_message',
     'mcp__nanoclaw__schedule_task',
     'mcp__nanoclaw__list_tasks',
-    'mcp__nanoclaw__update_email_thread',
-    'mcp__nanoclaw__list_email_threads',
+    'mcp__nanoclaw__create_matter',
+    'mcp__nanoclaw__update_matter',
+    'mcp__nanoclaw__list_matters',
+    'mcp__nanoclaw__get_matter',
+    'mcp__nanoclaw__find_matter',
     // Full calendar access
     'mcp__calendar__*',
     // Time MCP

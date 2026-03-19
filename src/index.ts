@@ -26,14 +26,13 @@ import {
   startEmailLoop,
   buildEmailPrompt,
   classifyEmailRoute,
-  getEmailParticipants,
 } from './email.js';
 import type { ThreadMessage } from './email.js';
 import {
   ContainerOutput,
   pruneOldSessions,
   runContainerAgent,
-  writeEmailThreadsSnapshot,
+  writeMattersSnapshot,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
@@ -45,16 +44,16 @@ import {
 import {
   getAllChats,
   getAllRegisteredGroups,
-  getAllEmailThreads,
+  getAllMatters,
   getAllSessions,
   getAllTasks,
-  getEmailThreadRoute,
+  getEmailRoute,
   getMessageFromMe,
   getMessagesSince,
   getNewMessages,
   getRouterState,
   initDatabase,
-  upsertEmailThread,
+  upsertEmailRoute,
   setRegisteredGroup,
   setRouterState,
   setSession,
@@ -392,8 +391,8 @@ async function runAgent(
     })),
   );
 
-  // Update pending email threads snapshot for container to read
-  writeEmailThreadsSnapshot(group.folder, isMain, getAllEmailThreads());
+  // Update matters snapshot for container to read
+  writeMattersSnapshot(group.folder, isMain, getAllMatters());
 
   // Update available groups snapshot (main group only can see all groups)
   const availableGroups = getAvailableGroups();
@@ -892,7 +891,7 @@ async function main(): Promise<void> {
     const { email } = ctx;
 
     // Thread routing: one-way ratchet (external stays external, otherwise evaluate participants)
-    const existingRoute = getEmailThreadRoute(email.threadId);
+    const existingRoute = getEmailRoute(email.threadId);
     let targetFolder: string;
     if (existingRoute === 'email-external') {
       targetFolder = 'email-external';
@@ -900,13 +899,8 @@ async function main(): Promise<void> {
       targetFolder = classifyEmailRoute(email);
     }
 
-    // Upsert with metadata (ratchet + escalation preservation handled in SQL)
-    upsertEmailThread(
-      email.threadId,
-      targetFolder,
-      email.subject,
-      getEmailParticipants(email),
-    );
+    // Upsert routing record (ratchet handled in SQL)
+    upsertEmailRoute(email.threadId, targetFolder);
 
     // Map folder → JID
     const targetJid =
