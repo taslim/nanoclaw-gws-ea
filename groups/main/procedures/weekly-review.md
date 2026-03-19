@@ -10,7 +10,7 @@ Use `mcp__time__*` tools for ALL date/time computation. Never calculate dates yo
 
 1. Load all matters via `list_matters` — filter to those with a `tracking_file` (use `get_matter` to check)
 2. For each, read the tracking file for detailed context, then check linked artifacts (email threads, calendar events, tasks) for recent activity
-3. Update the matter's context and tracking file with current status and blockers
+3. Update the tracking file contents with current status and blockers, and refresh the matter's context summary
 4. Compose one message with what your principal needs to see. Send via `mcp__nanoclaw__send_message`, even if everything is green
 
 ## What to Surface

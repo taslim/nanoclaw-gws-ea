@@ -196,50 +196,57 @@ function createSchema(database: Database.Database): void {
       )
       .get();
     if (hasEmailThreads) {
-      // Copy routing data
-      database.exec(`
-        INSERT OR IGNORE INTO email_routes (thread_id, group_folder, updated_at)
-        SELECT thread_id, group_folder, updated_at FROM email_threads
-      `);
+      database.exec('BEGIN');
+      try {
+        // Copy routing data
+        database.exec(`
+          INSERT OR IGNORE INTO email_routes (thread_id, group_folder, updated_at)
+          SELECT thread_id, group_folder, updated_at FROM email_threads
+        `);
 
-      // Migrate active email threads (pending/waiting/escalated) into matters
-      const activeThreads = database
-        .prepare(
-          `SELECT thread_id, subject, status, updated_at FROM email_threads WHERE status IN ('pending', 'waiting', 'escalated')`,
-        )
-        .all() as Array<{
-        thread_id: string;
-        subject: string | null;
-        status: string;
-        updated_at: string;
-      }>;
-      for (const t of activeThreads) {
-        const matterStatus =
-          t.status === 'escalated'
-            ? 'active'
-            : t.status === 'pending'
-              ? 'active'
-              : 'waiting';
-        database
+        // Migrate active email threads (pending/waiting/escalated) into matters
+        const activeThreads = database
           .prepare(
-            `INSERT INTO matters (title, status, artifacts, updated_at) VALUES (?, ?, ?, ?)`,
+            `SELECT thread_id, subject, status, updated_at FROM email_threads WHERE status IN ('pending', 'waiting', 'escalated')`,
           )
-          .run(
-            t.subject || `Email thread ${t.thread_id}`,
-            matterStatus,
-            JSON.stringify([{ type: 'email_thread', id: t.thread_id }]),
-            t.updated_at,
+          .all() as Array<{
+          thread_id: string;
+          subject: string | null;
+          status: string;
+          updated_at: string;
+        }>;
+        for (const t of activeThreads) {
+          const matterStatus =
+            t.status === 'escalated'
+              ? 'active'
+              : t.status === 'pending'
+                ? 'active'
+                : 'waiting';
+          database
+            .prepare(
+              `INSERT INTO matters (title, status, artifacts, updated_at) VALUES (?, ?, ?, ?)`,
+            )
+            .run(
+              t.subject || `Email thread ${t.thread_id}`,
+              matterStatus,
+              JSON.stringify([{ type: 'email_thread', id: t.thread_id }]),
+              t.updated_at,
+            );
+        }
+        if (activeThreads.length > 0) {
+          logger.info(
+            { count: activeThreads.length },
+            'Migrated active email threads → matters',
           );
-      }
-      if (activeThreads.length > 0) {
-        logger.info(
-          { count: activeThreads.length },
-          'Migrated active email threads → matters',
-        );
-      }
+        }
 
-      database.exec(`DROP TABLE email_threads`);
-      logger.info('Migrated email_threads → email_routes');
+        database.exec(`DROP TABLE email_threads`);
+        database.exec('COMMIT');
+        logger.info('Migrated email_threads → email_routes');
+      } catch (migrationErr) {
+        database.exec('ROLLBACK');
+        throw migrationErr;
+      }
     }
   } catch (err) {
     logger.warn({ err }, 'email_threads migration skipped or already done');
@@ -869,31 +876,6 @@ export function updateMatter(
   db.prepare(`UPDATE matters SET ${sets.join(', ')} WHERE id = ?`).run(
     ...values,
   );
-}
-
-export function findMatter(opts: {
-  artifactType?: string;
-  artifactId?: string;
-}): Matter[] {
-  const all = db
-    .prepare('SELECT * FROM matters ORDER BY updated_at DESC')
-    .all() as Matter[];
-  return all.filter((m) => {
-    if (!m.artifacts) return false;
-    try {
-      const artifacts = JSON.parse(m.artifacts) as Array<{
-        type: string;
-        id: string;
-      }>;
-      return artifacts.some(
-        (a) =>
-          (!opts.artifactType || a.type === opts.artifactType) &&
-          (!opts.artifactId || a.id === opts.artifactId),
-      );
-    } catch {
-      return false;
-    }
-  });
 }
 
 export function getAllMatters(): Matter[] {

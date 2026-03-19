@@ -387,7 +387,7 @@ Artifact types: email_thread (Gmail thread ID), calendar_event (Google Calendar 
       type: z.enum(ARTIFACT_TYPES),
       id: z.string(),
     })).optional().describe('Linked artifacts (email threads, calendar events, tasks, docs)'),
-    tracking_file: z.string().optional().describe('Filename in group memory/ for detailed dossier'),
+    tracking_file: z.string().regex(/^[^/\\]+$/, 'tracking_file must be a plain filename').optional().describe('Filename in group memory/ for detailed dossier'),
   },
   async (args) => {
     const data = {
@@ -422,7 +422,7 @@ Statuses: active (work remains), waiting (blocked on someone/something), paused 
       type: z.enum(ARTIFACT_TYPES),
       id: z.string(),
     })).optional().describe('Full replacement artifact list'),
-    tracking_file: z.string().optional().describe('Filename in group memory/'),
+    tracking_file: z.string().regex(/^[^/\\]+$/, 'tracking_file must be a plain filename').optional().describe('Filename in group memory/'),
   },
   async (args) => {
     const data: Record<string, unknown> = {
@@ -489,9 +489,14 @@ server.tool(
     // If main and tracking_file is set, read its contents
     if (isMain && matter.tracking_file) {
       try {
-        const trackingPath = path.join('/workspace/group/memory', matter.tracking_file);
-        const contents = fs.readFileSync(trackingPath, 'utf-8');
-        result += `\n\n--- Tracking File Contents ---\n${contents}`;
+        const memoryBase = path.resolve('/workspace/group/memory');
+        const trackingPath = path.resolve(memoryBase, matter.tracking_file);
+        if (!trackingPath.startsWith(memoryBase + path.sep) && trackingPath !== memoryBase) {
+          result += `\n\nTracking file path "${matter.tracking_file}" escapes memory directory — skipped.`;
+        } else {
+          const contents = fs.readFileSync(trackingPath, 'utf-8');
+          result += `\n\n--- Tracking File Contents ---\n${contents}`;
+        }
       } catch {
         // File may not exist yet — that's fine
       }
