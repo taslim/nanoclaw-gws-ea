@@ -6,8 +6,9 @@
  * to the main channel, not the email reply.
  *
  * Polls Gmail for new emails and invokes a callback per email.
- * On success the email is marked processed, read, and responded.
- * On failure it stays unread for retry on the next poll cycle.
+ * Queueing: Gmail is:unread → insert as 'queued' → markAsRead. Intake complete.
+ * Processing: agent run → updateEmailStatus. DB is source of truth.
+ * Retry: DB-driven — poll for 'failed' → re-fetch → re-process with backoff.
  *
  * Principal-only threads (only principal + assistant) -> email:principal
  * Threads with any other participant -> email:external (restricted tools)
@@ -27,7 +28,12 @@ import {
   PRINCIPAL_NAME,
   isPrincipalEmail,
 } from './config.js';
-import { isEmailProcessed, markEmailProcessed } from './db.js';
+import {
+  getFailedEmailIds,
+  insertEmailMessage,
+  isEmailSeen,
+  updateEmailStatus,
+} from './db.js';
 import { logger } from './logger.js';
 
 // --- Synthetic group configs (exported for index.ts) ---
@@ -192,9 +198,9 @@ export interface EmailContext {
 
 /**
  * Start polling Gmail for new emails.
- * Calls onEmail for each new, relevant email with thread-fetching capability.
- * On callback success: marks processed and read.
- * On callback failure: leaves email unread for retry on next poll.
+ * Queueing: intake from Gmail (is:unread → insert 'queued' → markAsRead).
+ * Processing: onEmail callback runs agent → updates status via updateEmailStatus.
+ * Retry: polls DB for 'failed' emails → re-fetches → re-processes with backoff.
  */
 export function startEmailLoop(
   onEmail: (ctx: EmailContext) => Promise<void>,
@@ -272,12 +278,66 @@ export function startEmailLoop(
     `Email channel active (polling every ${EMAIL_POLL_INTERVAL / 1000}s)`,
   );
 
+  // In-memory retry tracking (mirrors group-queue.ts pattern)
+  const MAX_RETRIES = 5;
+  const BASE_RETRY_MS = 5000;
+  const retryState = new Map<string, number>(); // messageId → retryCount
+  const pendingRetries = new Set<string>(); // messageIds with scheduled setTimeout
+
   let polling = false;
 
   const poll = async () => {
     if (polling) return;
     polling = true;
     try {
+      // Phase 1: Retry failed emails (DB-driven, in-memory backoff)
+      const failedIds = getFailedEmailIds();
+      for (const id of failedIds) {
+        if (pendingRetries.has(id)) continue;
+
+        const retryCount = (retryState.get(id) || 0) + 1;
+        if (retryCount > MAX_RETRIES) {
+          logger.error(
+            { messageId: id, retryCount },
+            'Max retries exceeded, giving up',
+          );
+          // Keep retryState entry so future polls skip this email (resets on restart)
+          continue;
+        }
+
+        retryState.set(id, retryCount);
+        pendingRetries.add(id);
+        const delayMs = BASE_RETRY_MS * Math.pow(2, retryCount - 1);
+        logger.info(
+          { messageId: id, retryCount, delayMs },
+          'Scheduling email retry',
+        );
+
+        setTimeout(() => {
+          pendingRetries.delete(id);
+          fetchEmailById(gmail, id)
+            .then(async (email) => {
+              if (!email) {
+                updateEmailStatus(id, 'skipped');
+                retryState.delete(id);
+                return;
+              }
+              updateEmailStatus(id, 'queued');
+              await onEmail({
+                email,
+                fetchThread: () =>
+                  fetchThreadMessages(email.threadId, email.id),
+              });
+              retryState.delete(id);
+            })
+            .catch((err) => {
+              updateEmailStatus(id, 'failed');
+              logger.error({ messageId: id, err }, 'Email retry failed');
+            });
+        }, delayMs);
+      }
+
+      // Phase 2: Intake new emails (Gmail-driven)
       const emails = await fetchNewEmails(gmail);
 
       for (const email of emails) {
@@ -286,22 +346,16 @@ export function startEmailLoop(
           'New email received',
         );
 
+        // Queue + mark read (intake complete)
+        insertEmailMessage(email.id, email.threadId, email.from);
+        await markAsRead(gmail, email.id);
+
         try {
           await onEmail({
             email,
             fetchThread: () => fetchThreadMessages(email.threadId, email.id),
           });
-
-          // Success — mark processed and read
-          markEmailProcessed(
-            email.id,
-            email.threadId,
-            email.from,
-            email.subject,
-          );
-          await markAsRead(gmail, email.id);
         } catch (err) {
-          // Failure — leave unread for retry on next poll
           logger.error(
             { from: email.from, subject: email.subject, err },
             'Email processing failed, will retry',
@@ -565,6 +619,58 @@ function isRelevantEmail(email: IncomingEmail): boolean {
   return true;
 }
 
+/** Parse a Gmail API message response into an IncomingEmail. */
+function parseGmailMessage(
+  id: string,
+  threadId: string,
+  payload: Parameters<typeof getTextBody>[0] & {
+    headers?: Array<{ name: string; value: string }>;
+  },
+): IncomingEmail {
+  const headers = (payload?.headers || []) as Array<{
+    name: string;
+    value: string;
+  }>;
+  const from = getHeader(headers, 'From');
+  const rfcMessageId =
+    getHeader(headers, 'Message-ID') || getHeader(headers, 'Message-Id');
+
+  return {
+    id,
+    threadId,
+    messageId: rfcMessageId,
+    from: extractEmailAddress(from),
+    to: getHeader(headers, 'To'),
+    cc: getHeader(headers, 'Cc') || getHeader(headers, 'CC'),
+    subject: getHeader(headers, 'Subject'),
+    body: getTextBody(payload).slice(0, 10000),
+    date: getHeader(headers, 'Date'),
+  };
+}
+
+/** Re-fetch a single email by message ID (for retry). Returns null if deleted. */
+async function fetchEmailById(
+  gmail: ReturnType<typeof google.gmail>,
+  messageId: string,
+): Promise<IncomingEmail | null> {
+  try {
+    const msg = await gmail.users.messages.get({
+      userId: 'me',
+      id: messageId,
+      format: 'full',
+    });
+    if (!msg.data.id || !msg.data.threadId) return null;
+    return parseGmailMessage(
+      msg.data.id,
+      msg.data.threadId,
+      msg.data.payload as Parameters<typeof parseGmailMessage>[2],
+    );
+  } catch (err) {
+    logger.warn({ messageId, err }, 'Failed to re-fetch email for retry');
+    return null;
+  }
+}
+
 async function fetchNewEmails(
   gmail: ReturnType<typeof google.gmail>,
 ): Promise<IncomingEmail[]> {
@@ -587,8 +693,8 @@ async function fetchNewEmails(
     for (const ref of messageRefs) {
       if (!ref.id || !ref.threadId) continue;
 
-      // Skip already-processed messages
-      if (isEmailProcessed(ref.id)) continue;
+      // Skip already-seen messages (any status)
+      if (isEmailSeen(ref.id)) continue;
 
       try {
         const msg = await gmail.users.messages.get({
@@ -597,44 +703,21 @@ async function fetchNewEmails(
           format: 'full',
         });
 
-        const headers = msg.data.payload?.headers || [];
-        const typedHeaders = headers as Array<{
-          name: string;
-          value: string;
-        }>;
-        const from = getHeader(typedHeaders, 'From');
-        const to = getHeader(typedHeaders, 'To');
-        const cc =
-          getHeader(typedHeaders, 'Cc') || getHeader(typedHeaders, 'CC');
-        const subject = getHeader(typedHeaders, 'Subject');
-        const date = getHeader(typedHeaders, 'Date');
-        const rfcMessageId =
-          getHeader(typedHeaders, 'Message-ID') ||
-          getHeader(typedHeaders, 'Message-Id');
-        const body = getTextBody(
-          msg.data.payload as Parameters<typeof getTextBody>[0],
+        const email = parseGmailMessage(
+          ref.id,
+          ref.threadId,
+          msg.data.payload as Parameters<typeof parseGmailMessage>[2],
         );
-
-        const email: IncomingEmail = {
-          id: ref.id,
-          threadId: ref.threadId,
-          messageId: rfcMessageId,
-          from: extractEmailAddress(from),
-          to,
-          cc,
-          subject,
-          body: body.slice(0, 10000),
-          date,
-        };
 
         if (isRelevantEmail(email)) {
           emails.push(email);
         } else {
-          // Not relevant — mark processed so we don't check again, and mark read
-          markEmailProcessed(ref.id, ref.threadId, email.from, subject);
+          // Not relevant — mark skipped so we don't check again, and mark read
+          insertEmailMessage(ref.id, ref.threadId, email.from);
+          updateEmailStatus(ref.id, 'skipped');
           await markAsRead(gmail, ref.id);
           logger.debug(
-            { from: email.from, subject },
+            { from: email.from, subject: email.subject },
             'Email filtered out (not relevant to principal)',
           );
         }

@@ -4,6 +4,7 @@ import path from 'path';
 import {
   ASSISTANT_NAME,
   CREDENTIAL_PROXY_PORT,
+  EMAIL_EXTERNAL_DELAY,
   HEARTBEAT_SPACE_ID,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
@@ -59,6 +60,7 @@ import {
   setSession,
   storeChatMetadata,
   storeMessage,
+  updateEmailStatus,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
@@ -914,6 +916,7 @@ async function main(): Promise<void> {
         { targetFolder, targetJid },
         'Target group not registered, skipping email',
       );
+      updateEmailStatus(email.id, 'failed');
       return;
     }
 
@@ -931,40 +934,72 @@ async function main(): Promise<void> {
     const isExternal = targetFolder === 'email-external';
     const prompt = buildEmailPrompt(email, isExternal, threadMessages);
 
-    // Resolve output channel (synthetic JIDs fall through to main via resolveChannel)
-    const { channel: outputChannel, targetJid: outputJid } =
-      resolveChannel(targetJid);
+    // Process email via agent, returns status
+    const processEmail = async (): Promise<'processed' | 'failed'> => {
+      const { channel: outputChannel, targetJid: outputJid } =
+        resolveChannel(targetJid);
 
-    logger.info(
-      { from: email.from, subject: email.subject, route: targetFolder },
-      `Processing email via ${targetFolder} group agent`,
-    );
-
-    // Fresh session per email — no cross-thread context leakage
-    const output = await runAgent(
-      group,
-      prompt,
-      targetJid,
-      async (result) => {
-        if (result.result) {
-          const raw =
-            typeof result.result === 'string'
-              ? result.result
-              : JSON.stringify(result.result);
-          const text = formatOutbound(raw);
-          if (text && outputChannel) {
-            await outputChannel.sendMessage(outputJid, text);
-          }
-        }
-      },
-      { freshSession: true },
-    );
-
-    if (output === 'error') {
-      logger.error(
+      logger.info(
         { from: email.from, subject: email.subject, route: targetFolder },
-        'Email agent processing failed',
+        `Processing email via ${targetFolder} group agent`,
       );
+
+      // Fresh session per email — no cross-thread context leakage
+      const output = await runAgent(
+        group,
+        prompt,
+        targetJid,
+        async (result) => {
+          if (result.result) {
+            const raw =
+              typeof result.result === 'string'
+                ? result.result
+                : JSON.stringify(result.result);
+            const text = formatOutbound(raw);
+            if (text && outputChannel) {
+              await outputChannel.sendMessage(outputJid, text);
+            }
+          }
+        },
+        { freshSession: true },
+      );
+
+      if (output === 'error') {
+        logger.error(
+          { from: email.from, subject: email.subject, route: targetFolder },
+          'Email agent processing failed',
+        );
+        return 'failed';
+      }
+      return 'processed';
+    };
+
+    // Delay external emails to avoid instant AI-giveaway replies.
+    // Fire-and-forget so the poll loop continues processing other emails.
+    if (isExternal && EMAIL_EXTERNAL_DELAY > 0) {
+      logger.info(
+        { from: email.from, delayMs: EMAIL_EXTERNAL_DELAY },
+        'Delaying external email processing',
+      );
+      setTimeout(() => {
+        processEmail()
+          .then((status) => updateEmailStatus(email.id, status))
+          .catch((err) => {
+            updateEmailStatus(email.id, 'failed');
+            logger.error(
+              { from: email.from, subject: email.subject, err },
+              'Delayed external email processing failed',
+            );
+          });
+      }, EMAIL_EXTERNAL_DELAY);
+      return;
+    }
+
+    // Non-deferred: process and update status
+    const status = await processEmail();
+    updateEmailStatus(email.id, status);
+    if (status === 'failed') {
+      throw new Error('Email agent processing failed');
     }
   });
 

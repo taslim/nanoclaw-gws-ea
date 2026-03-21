@@ -84,15 +84,16 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
-    CREATE TABLE IF NOT EXISTS processed_emails (
+    CREATE TABLE IF NOT EXISTS email_messages (
       message_id TEXT PRIMARY KEY,
       thread_id TEXT NOT NULL,
       sender TEXT NOT NULL,
-      subject TEXT,
-      processed_at TEXT NOT NULL,
-      response_sent INTEGER DEFAULT 0
+      status TEXT NOT NULL DEFAULT 'queued',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS idx_processed_emails_thread ON processed_emails(thread_id);
+    CREATE INDEX IF NOT EXISTS idx_email_messages_thread ON email_messages(thread_id);
+    CREATE INDEX IF NOT EXISTS idx_email_messages_status ON email_messages(status);
 
     CREATE TABLE IF NOT EXISTS reactions (
       message_id TEXT NOT NULL,
@@ -158,13 +159,23 @@ function createSchema(database: Database.Database): void {
     /* column already exists */
   }
 
-  // Add response_sent column to processed_emails if missing (migration for existing DBs)
+  // Migrate processed_emails → email_messages (one-time, for existing DBs)
   try {
-    database.exec(
-      'ALTER TABLE processed_emails ADD COLUMN response_sent INTEGER DEFAULT 0',
-    );
+    const oldTable = database
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='processed_emails'",
+      )
+      .get();
+    if (oldTable) {
+      database.exec(`
+        INSERT OR IGNORE INTO email_messages (message_id, thread_id, sender, status, created_at, updated_at)
+          SELECT message_id, thread_id, sender, 'processed', processed_at, processed_at
+          FROM processed_emails;
+        DROP TABLE processed_emails;
+      `);
+    }
   } catch {
-    /* column already exists */
+    /* already migrated */
   }
 
   // Add channel and is_group columns if they don't exist (migration for existing DBs)
@@ -746,25 +757,48 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
   return result;
 }
 
-// --- Processed emails ---
+// --- Email messages ---
 
-export function isEmailProcessed(messageId: string): boolean {
+export type EmailMessageStatus = 'queued' | 'processed' | 'failed' | 'skipped';
+
+/** Check if an email has been seen (any status — guards intake, not processing). */
+export function isEmailSeen(messageId: string): boolean {
   const row = db
-    .prepare('SELECT 1 FROM processed_emails WHERE message_id = ?')
+    .prepare('SELECT 1 FROM email_messages WHERE message_id = ?')
     .get(messageId);
   return !!row;
 }
 
-export function markEmailProcessed(
+/** Record a new email as 'queued'. No-op if already exists (idempotent). */
+export function insertEmailMessage(
   messageId: string,
   threadId: string,
   sender: string,
-  subject: string,
 ): void {
+  const now = new Date().toISOString();
   db.prepare(
-    `INSERT OR IGNORE INTO processed_emails (message_id, thread_id, sender, subject, processed_at)
-     VALUES (?, ?, ?, ?, ?)`,
-  ).run(messageId, threadId, sender, subject, new Date().toISOString());
+    `INSERT OR IGNORE INTO email_messages (message_id, thread_id, sender, status, created_at, updated_at)
+     VALUES (?, ?, ?, 'queued', ?, ?)`,
+  ).run(messageId, threadId, sender, now, now);
+}
+
+/** Update email status. */
+export function updateEmailStatus(
+  messageId: string,
+  status: EmailMessageStatus,
+): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    'UPDATE email_messages SET status = ?, updated_at = ? WHERE message_id = ?',
+  ).run(status, now, messageId);
+}
+
+/** Get message IDs of failed emails (for retry). */
+export function getFailedEmailIds(): string[] {
+  const rows = db
+    .prepare("SELECT message_id FROM email_messages WHERE status = 'failed'")
+    .all() as { message_id: string }[];
+  return rows.map((r) => r.message_id);
 }
 
 // --- Email routes ---

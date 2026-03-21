@@ -6,12 +6,16 @@ import {
   deleteTask,
   getAllChats,
   getAllRegisteredGroups,
+  getFailedEmailIds,
   getMessagesSince,
   getNewMessages,
   getTaskById,
+  insertEmailMessage,
+  isEmailSeen,
   setRegisteredGroup,
   storeChatMetadata,
   storeMessage,
+  updateEmailStatus,
   updateTask,
 } from './db.js';
 
@@ -480,5 +484,66 @@ describe('registered group isMain', () => {
     const group = groups['group@g.us'];
     expect(group).toBeDefined();
     expect(group.isMain).toBeUndefined();
+  });
+});
+
+// --- Email message tracking ---
+
+describe('email messages', () => {
+  it('isEmailSeen returns false for unknown message', () => {
+    expect(isEmailSeen('unknown-id')).toBe(false);
+  });
+
+  it('insertEmailMessage creates a queued record', () => {
+    insertEmailMessage('msg-1', 'thread-1', 'alice@example.com');
+    expect(isEmailSeen('msg-1')).toBe(true);
+  });
+
+  it('isEmailSeen returns true for all statuses', () => {
+    for (const status of [
+      'queued',
+      'processed',
+      'failed',
+      'skipped',
+    ] as const) {
+      const id = `msg-${status}`;
+      insertEmailMessage(id, 'thread-1', 'alice@example.com');
+      updateEmailStatus(id, status);
+      expect(isEmailSeen(id)).toBe(true);
+    }
+  });
+
+  it('insertEmailMessage is idempotent (no-op on conflict)', () => {
+    insertEmailMessage('msg-1', 'thread-1', 'alice@example.com');
+    updateEmailStatus('msg-1', 'processed');
+
+    // Second insert should not overwrite status
+    insertEmailMessage('msg-1', 'thread-1', 'alice@example.com');
+    // Still seen (status unchanged)
+    expect(isEmailSeen('msg-1')).toBe(true);
+  });
+
+  it('getFailedEmailIds returns only failed messages', () => {
+    insertEmailMessage('msg-ok', 'thread-1', 'alice@example.com');
+    updateEmailStatus('msg-ok', 'processed');
+
+    insertEmailMessage('msg-fail', 'thread-2', 'bob@example.com');
+    updateEmailStatus('msg-fail', 'failed');
+
+    insertEmailMessage('msg-queued', 'thread-3', 'carol@example.com');
+
+    const failed = getFailedEmailIds();
+    expect(failed).toEqual(['msg-fail']);
+  });
+
+  it('updateEmailStatus changes status', () => {
+    insertEmailMessage('msg-1', 'thread-1', 'alice@example.com');
+    updateEmailStatus('msg-1', 'processed');
+
+    // Verify by checking it's not in failed list
+    expect(getFailedEmailIds()).not.toContain('msg-1');
+
+    updateEmailStatus('msg-1', 'failed');
+    expect(getFailedEmailIds()).toContain('msg-1');
   });
 });

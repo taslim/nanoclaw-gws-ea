@@ -6,14 +6,14 @@ import noCatchAll from 'eslint-plugin-no-catch-all';
 
 export default tseslint.config(
   {
-    ignores: ['dist/', 'node_modules/', 'container/', 'groups/', '**/*.js', '**/*.mjs'],
+    ignores: ['dist/', 'node_modules/', 'container/', 'groups/'],
   },
   { languageOptions: { globals: globals.node } },
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
   prettier,
   {
-    files: ['src/**/*.{ts}'],
+    files: ['src/**/*.{js,ts}'],
     languageOptions: {
       parserOptions: {
         projectService: true,
