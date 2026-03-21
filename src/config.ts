@@ -9,6 +9,7 @@ import { readEnvFile } from './env.js';
 const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
+  'EMAIL_EXTERNAL_DELAY',
   'EMAIL_POLL_INTERVAL',
   'GCHAT_POLL_INTERVAL',
   'PRINCIPAL_NAME',
@@ -21,6 +22,12 @@ export const ASSISTANT_NAME =
   process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
+export const EMAIL_EXTERNAL_DELAY = parseInt(
+  process.env.EMAIL_EXTERNAL_DELAY ||
+    envConfig.EMAIL_EXTERNAL_DELAY ||
+    '240000', // 4min — avoid instant replies that look like AI
+  10,
+);
 
 // --- GWS-EA config (all from .env) ---
 export const EMAIL_POLL_INTERVAL = parseInt(
