@@ -120,6 +120,10 @@ Non-main groups access these at `/workspace/global/`.
 
 ## Message Formatting
 
+Format messages based on the channel you're responding to. Check your group folder name:
+
+### GChat channels (folder starts with `gchat_` or is `main`)
+
 NEVER use markdown. Only use GChat/messaging formatting:
 - *single asterisks* for bold (NEVER **double asterisks**)
 - _underscores_ for italic
@@ -127,4 +131,26 @@ NEVER use markdown. Only use GChat/messaging formatting:
 - ```triple backticks``` for code
 No ## headings. No [links](url). No **double stars**.
 
-Keep messages clean and readable for GChat.
+### Slack channels (folder starts with `slack_`)
+
+Use Slack mrkdwn syntax. Run `/slack-formatting` for the full reference. Key rules:
+- `*bold*` (single asterisks)
+- `_italic_` (underscores)
+- `<https://url|link text>` for links (NOT `[text](url)`)
+- `•` bullets (no numbered lists)
+- `:emoji:` shortcodes
+- `>` for block quotes
+- No `##` headings — use `*Bold text*` instead
+
+### WhatsApp/Telegram channels (folder starts with `whatsapp_` or `telegram_`)
+
+- `*bold*` (single asterisks, NEVER **double**)
+- `_italic_` (underscores)
+- `•` bullet points
+- ` ``` ` code blocks
+
+No `##` headings. No `[links](url)`. No `**double stars**`.
+
+### Discord channels (folder starts with `discord_`)
+
+Standard Markdown works: `**bold**`, `*italic*`, `[links](url)`, `# headings`.

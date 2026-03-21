@@ -1,26 +1,39 @@
+import globals from 'globals';
 import eslint from '@eslint/js';
 import tseslint from 'typescript-eslint';
 import prettier from 'eslint-config-prettier';
+import noCatchAll from 'eslint-plugin-no-catch-all';
 
 export default tseslint.config(
   {
-    ignores: ['dist/', 'node_modules/', 'container/', '**/*.js', '**/*.mjs'],
+    ignores: ['dist/', 'node_modules/', 'container/', 'groups/', '**/*.js', '**/*.mjs'],
   },
+  { languageOptions: { globals: globals.node } },
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
   prettier,
   {
+    files: ['src/**/*.{ts}'],
     languageOptions: {
       parserOptions: {
         projectService: true,
         tsconfigRootDir: import.meta.dirname,
       },
     },
+    plugins: { 'no-catch-all': noCatchAll },
     rules: {
       // Allow unused vars prefixed with _ (common pattern)
       '@typescript-eslint/no-unused-vars': [
         'error',
-        { argsIgnorePattern: '^_', varsIgnorePattern: '^_' },
+        {
+          args: 'all',
+          argsIgnorePattern: '^_',
+          caughtErrors: 'all',
+          caughtErrorsIgnorePattern: '^_',
+          destructuredArrayIgnorePattern: '^_',
+          varsIgnorePattern: '^_',
+          ignoreRestSiblings: true,
+        },
       ],
       // Allow explicit any where needed (pragmatic for this codebase)
       '@typescript-eslint/no-explicit-any': 'off',
@@ -34,6 +47,8 @@ export default tseslint.config(
       '@typescript-eslint/require-await': 'off',
       // Allow empty catch blocks with a comment
       'no-empty': ['error', { allowEmptyCatch: true }],
+      // Catch-all detection
+      'no-catch-all/no-catch-all': 'warn',
     },
   }
 );
