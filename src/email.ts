@@ -665,9 +665,13 @@ async function fetchEmailById(
       msg.data.threadId,
       msg.data.payload as Parameters<typeof parseGmailMessage>[2],
     );
-  } catch (err) {
-    logger.warn({ messageId, err }, 'Failed to re-fetch email for retry');
-    return null;
+  } catch (err: unknown) {
+    const status = (err as { code?: number }).code;
+    if (status === 404) {
+      logger.warn({ messageId }, 'Email deleted, skipping retry');
+      return null;
+    }
+    throw err;
   }
 }
 

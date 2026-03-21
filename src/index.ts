@@ -940,7 +940,7 @@ async function main(): Promise<void> {
         resolveChannel(targetJid);
 
       logger.info(
-        { from: email.from, subject: email.subject, route: targetFolder },
+        { emailId: email.id, threadId: email.threadId, route: targetFolder },
         `Processing email via ${targetFolder} group agent`,
       );
 
@@ -966,7 +966,7 @@ async function main(): Promise<void> {
 
       if (output === 'error') {
         logger.error(
-          { from: email.from, subject: email.subject, route: targetFolder },
+          { emailId: email.id, threadId: email.threadId, route: targetFolder },
           'Email agent processing failed',
         );
         return 'failed';
@@ -978,7 +978,11 @@ async function main(): Promise<void> {
     // Fire-and-forget so the poll loop continues processing other emails.
     if (isExternal && EMAIL_EXTERNAL_DELAY > 0) {
       logger.info(
-        { from: email.from, delayMs: EMAIL_EXTERNAL_DELAY },
+        {
+          emailId: email.id,
+          threadId: email.threadId,
+          delayMs: EMAIL_EXTERNAL_DELAY,
+        },
         'Delaying external email processing',
       );
       setTimeout(() => {
@@ -987,7 +991,7 @@ async function main(): Promise<void> {
           .catch((err) => {
             updateEmailStatus(email.id, 'failed');
             logger.error(
-              { from: email.from, subject: email.subject, err },
+              { emailId: email.id, threadId: email.threadId, err },
               'Delayed external email processing failed',
             );
           });

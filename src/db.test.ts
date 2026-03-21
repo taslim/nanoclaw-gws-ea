@@ -515,12 +515,11 @@ describe('email messages', () => {
 
   it('insertEmailMessage is idempotent (no-op on conflict)', () => {
     insertEmailMessage('msg-1', 'thread-1', 'alice@example.com');
-    updateEmailStatus('msg-1', 'processed');
+    updateEmailStatus('msg-1', 'failed');
 
     // Second insert should not overwrite status
     insertEmailMessage('msg-1', 'thread-1', 'alice@example.com');
-    // Still seen (status unchanged)
-    expect(isEmailSeen('msg-1')).toBe(true);
+    expect(getFailedEmailIds()).toContain('msg-1');
   });
 
   it('getFailedEmailIds returns only failed messages', () => {
