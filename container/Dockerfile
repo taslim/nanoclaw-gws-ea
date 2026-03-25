@@ -37,9 +37,8 @@ RUN git clone --depth 1 https://github.com/taylorwilsdon/google_workspace_mcp.gi
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
-# Install agent-browser, claude-code, and MCP servers globally
-RUN npm install -g agent-browser @anthropic-ai/claude-code \
-    @cocal/google-calendar-mcp
+# Install agent-browser and claude-code globally
+RUN npm install -g agent-browser @anthropic-ai/claude-code
 
 # Create app directory
 WORKDIR /app

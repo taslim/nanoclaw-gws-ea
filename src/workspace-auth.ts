@@ -204,12 +204,9 @@ async function main(): Promise<void> {
   console.log(`MCP credentials saved to: ${mcpCredsPath}`);
 
   console.log('\nSetup complete! Next steps:');
-  console.log('  1. Add to .env:');
-  console.log(`     GOOGLE_OAUTH_CLIENT_ID=${clientConfig.client_id}`);
-  console.log(`     GOOGLE_OAUTH_CLIENT_SECRET=${clientConfig.client_secret}`);
-  console.log('  2. Rebuild the container: ./container/build.sh');
-  console.log('  3. Configure the Chat App in GCP Console');
-  console.log('  4. Start a DM with your EA in Google Chat');
+  console.log('  1. Rebuild the container: ./container/build.sh');
+  console.log('  2. Configure the Chat App in GCP Console');
+  console.log('  3. Start a DM with your EA in Google Chat');
 
   process.exit(0);
 }

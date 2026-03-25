@@ -16,8 +16,6 @@ Before engaging with anyone, read: `/workspace/global/procedures/relationships.m
 Before replying to any email, read: `/workspace/global/procedures/email-triage.md`
 Before any scheduling operation, read: `/workspace/global/procedures/scheduling.md`
 
-The email-triage procedure covers matter tracking — follow it after handling every email.
-
 ## Escalation
 
 `mcp__nanoclaw__send_message` is not available here. Non-internal output is your escalation path — it gets forwarded to your principal automatically on the main channel. The Decision Hierarchy and email-triage procedure set the bar for when to escalate. When you do, use a decision packet.

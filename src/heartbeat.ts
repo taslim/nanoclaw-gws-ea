@@ -31,11 +31,14 @@ export const HEARTBEAT_GROUP = {
     'mcp__nanoclaw__list_tasks',
     'mcp__nanoclaw__create_matter',
     'mcp__nanoclaw__update_matter',
+    'mcp__nanoclaw__delete_matter',
     'mcp__nanoclaw__list_matters',
     'mcp__nanoclaw__get_matter',
     'mcp__nanoclaw__find_matter',
-    // Full calendar access
-    'mcp__calendar__*',
+    // Calendar: availability, event listing, RSVP (gcal MCP) + CRUD (workspace MCP)
+    'mcp__gcal__*',
+    'mcp__workspace__manage_event',
+    'mcp__workspace__list_calendars',
     // Time MCP
     'mcp__time__*',
     // Gmail (search + read, send for follow-ups)
@@ -56,5 +59,7 @@ export const HEARTBEAT_GROUP = {
     // Workspace Chat (heartbeat logging)
     'mcp__workspace__chat_send_message',
     'mcp__workspace__chat_get_messages',
+    // 1Password (credential retrieval for authenticated tasks)
+    'mcp__1password__*',
   ],
 };

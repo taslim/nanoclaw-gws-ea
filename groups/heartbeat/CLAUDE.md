@@ -31,9 +31,10 @@ If a tool call fails or returns an error, note it in the heartbeat and move to t
 
 Call `mcp__nanoclaw__list_matters` to load all active and waiting matters. For each:
 
-- **Check linked artifacts** — email threads (`get_gmail_thread_content`), calendar events, tasks — for updates since the matter was last touched.
-- **Check context for staleness** — approaching deadlines, stalled follow-ups (waiting >3 days with no reply → send a polite follow-up), items that should have been resolved by now.
-- **Act:** follow up, update status, escalate as needed. After acting, update the matter: `mcp__nanoclaw__update_matter(matter_id, status, context)`.
+- **Load and check linked artifacts** — email threads, calendar events, tasks — for updates since the matter was last touched.
+- **Check context for staleness** — read the tracking file if one exists, check for approaching deadlines, stalled follow-ups (waiting >3 days with no reply → send a polite follow-up), items that should have been resolved by now.
+- **Consolidate** — if multiple matters cover the same workstream, move artifacts to the primary matter and delete the duplicates.
+- **Act:** follow up, escalate as needed. After acting, update the matter status and context.
 
 Read `/workspace/global/procedures/email-triage.md` before composing any email reply.
 
@@ -41,9 +42,17 @@ Read `/workspace/global/procedures/email-triage.md` before composing any email r
 
 **Done when:** All active/waiting matters are reviewed and actioned.
 
-### Phase 2 — Discover Untracked Activity
+### Phase 2 — Triage New Email Activity
 
-Emails are handled — every inbound email gets a matter at processing time. This phase catches everything else.
+Read `/workspace/ipc/recent_emails.json` for email threads processed since the last sweep. For each thread:
+
+- **Already tracked** — `find_matter` by thread ID hits → check if the matter's context needs updating.
+- **Belongs to existing workstream** — thread isn't linked but the topic matches an active matter → add the thread as an artifact.
+- **New work** — genuinely new workstream that needs tracking → create a matter. Quick exchanges that were fully handled don't need one.
+
+**Done when:** Every recent thread is linked to a matter or correctly skipped.
+
+### Phase 3 — Discover Other Untracked Activity
 
 #### Calendar
 
