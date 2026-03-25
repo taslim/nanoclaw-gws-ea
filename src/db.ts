@@ -88,6 +88,7 @@ function createSchema(database: Database.Database): void {
       message_id TEXT PRIMARY KEY,
       thread_id TEXT NOT NULL,
       sender TEXT NOT NULL,
+      subject TEXT,
       status TEXT NOT NULL DEFAULT 'queued',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -199,68 +200,11 @@ function createSchema(database: Database.Database): void {
     /* columns already exist */
   }
 
-  // Migrate email_threads → email_routes + matters (preserves routing data, moves status tracking to matters)
+  // Add subject column to email_messages if missing (migration for existing DBs)
   try {
-    const hasEmailThreads = database
-      .prepare(
-        `SELECT 1 FROM sqlite_master WHERE type='table' AND name='email_threads'`,
-      )
-      .get();
-    if (hasEmailThreads) {
-      database.exec('BEGIN');
-      try {
-        // Copy routing data
-        database.exec(`
-          INSERT OR IGNORE INTO email_routes (thread_id, group_folder, updated_at)
-          SELECT thread_id, group_folder, updated_at FROM email_threads
-        `);
-
-        // Migrate active email threads (pending/waiting/escalated) into matters
-        const activeThreads = database
-          .prepare(
-            `SELECT thread_id, subject, status, updated_at FROM email_threads WHERE status IN ('pending', 'waiting', 'escalated')`,
-          )
-          .all() as Array<{
-          thread_id: string;
-          subject: string | null;
-          status: string;
-          updated_at: string;
-        }>;
-        for (const t of activeThreads) {
-          const matterStatus =
-            t.status === 'escalated'
-              ? 'active'
-              : t.status === 'pending'
-                ? 'active'
-                : 'waiting';
-          database
-            .prepare(
-              `INSERT INTO matters (title, status, artifacts, updated_at) VALUES (?, ?, ?, ?)`,
-            )
-            .run(
-              t.subject || `Email thread ${t.thread_id}`,
-              matterStatus,
-              JSON.stringify([{ type: 'email_thread', id: t.thread_id }]),
-              t.updated_at,
-            );
-        }
-        if (activeThreads.length > 0) {
-          logger.info(
-            { count: activeThreads.length },
-            'Migrated active email threads → matters',
-          );
-        }
-
-        database.exec(`DROP TABLE email_threads`);
-        database.exec('COMMIT');
-        logger.info('Migrated email_threads → email_routes');
-      } catch (migrationErr) {
-        database.exec('ROLLBACK');
-        throw migrationErr;
-      }
-    }
-  } catch (err) {
-    logger.warn({ err }, 'email_threads migration skipped or already done');
+    database.exec('ALTER TABLE email_messages ADD COLUMN subject TEXT');
+  } catch {
+    /* column already exists */
   }
 }
 
@@ -774,12 +718,13 @@ export function insertEmailMessage(
   messageId: string,
   threadId: string,
   sender: string,
+  subject?: string,
 ): void {
   const now = new Date().toISOString();
   db.prepare(
-    `INSERT OR IGNORE INTO email_messages (message_id, thread_id, sender, status, created_at, updated_at)
-     VALUES (?, ?, ?, 'queued', ?, ?)`,
-  ).run(messageId, threadId, sender, now, now);
+    `INSERT OR IGNORE INTO email_messages (message_id, thread_id, sender, subject, status, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'queued', ?, ?)`,
+  ).run(messageId, threadId, sender, subject ?? null, now, now);
 }
 
 /** Update email status. */
@@ -791,6 +736,31 @@ export function updateEmailStatus(
   db.prepare(
     'UPDATE email_messages SET status = ?, updated_at = ? WHERE message_id = ?',
   ).run(status, now, messageId);
+}
+
+/** Get recent email threads (one row per thread, most recent message wins). */
+export function getRecentEmailThreads(since: string): Array<{
+  thread_id: string;
+  sender: string;
+  subject: string | null;
+  updated_at: string;
+}> {
+  return db
+    .prepare(
+      `SELECT thread_id, sender, subject, updated_at FROM (
+         SELECT thread_id, sender, subject, updated_at,
+           ROW_NUMBER() OVER (PARTITION BY thread_id ORDER BY updated_at DESC) AS rn
+         FROM email_messages
+         WHERE updated_at > ? AND status IN ('processed', 'queued')
+       ) WHERE rn = 1
+       ORDER BY updated_at DESC`,
+    )
+    .all(since) as Array<{
+    thread_id: string;
+    sender: string;
+    subject: string | null;
+    updated_at: string;
+  }>;
 }
 
 /** Get message IDs of failed emails (for retry). */
@@ -918,6 +888,11 @@ export function getAllMatters(): Matter[] {
     .all() as Matter[];
 }
 
+export function deleteMatter(id: number): boolean {
+  const result = db.prepare('DELETE FROM matters WHERE id = ?').run(id);
+  return result.changes > 0;
+}
+
 // --- Reactions ---
 
 /**
@@ -930,18 +905,6 @@ export function getMessageFromMe(messageId: string, chatJid: string): boolean {
     )
     .get(messageId, chatJid) as { is_from_me: number | null } | undefined;
   return row?.is_from_me === 1;
-}
-
-/**
- * Look up a message by its resource ID (e.g. spaces/XXX/messages/YYY).
- * Returns sender name and content, or undefined if not found.
- */
-export function getMessageById(
-  id: string,
-): { sender_name: string; content: string } | undefined {
-  return db
-    .prepare(`SELECT sender_name, content FROM messages WHERE id = ? LIMIT 1`)
-    .get(id) as { sender_name: string; content: string } | undefined;
 }
 
 /**

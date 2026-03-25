@@ -19,7 +19,7 @@ import {
   PRINCIPAL_NAME,
   isPrincipalEmail,
 } from '../config.js';
-import { getLatestMessage, getMessageById, storeReaction } from '../db.js';
+import { getLatestMessage, storeReaction } from '../db.js';
 import { logger } from '../logger.js';
 import { Channel } from '../types.js';
 import { registerChannel, ChannelOpts } from './registry.js';
@@ -357,20 +357,16 @@ export class GChatChannel implements Channel {
 
             // Check for quote reply context
             let quotePrefix = '';
-            const quotedName = (
+            const quotedMeta = (
               msg as chat_v1.Schema$Message & {
-                quotedMessageMetadata?: { name?: string };
+                quotedMessageMetadata?: {
+                  quotedMessageSnapshot?: { sender?: string; text?: string };
+                };
               }
-            ).quotedMessageMetadata?.name;
-            if (quotedName) {
-              const quoted = getMessageById(quotedName);
-              if (quoted) {
-                // Strip metadata prefixes ([thread:...], [Reply to ...]) from stored content
-                const cleanContent = quoted.content
-                  .replace(/^\[thread:\S+\]\s*/, '')
-                  .replace(/^\[Reply to [^\]]+\]\s*/, '');
-                quotePrefix = `[Reply to ${quoted.sender_name}: "${cleanContent}"] `;
-              }
+            ).quotedMessageMetadata?.quotedMessageSnapshot;
+            if (quotedMeta?.text) {
+              const sender = quotedMeta.sender || 'someone';
+              quotePrefix = `[Reply to ${sender}: "${quotedMeta.text}"] `;
             }
 
             const content = [

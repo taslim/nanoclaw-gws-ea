@@ -8,6 +8,7 @@ import { AvailableGroup } from './container-runner.js';
 import {
   createMatter,
   createTask,
+  deleteMatter,
   deleteTask,
   getTaskById,
   updateMatter,
@@ -554,6 +555,17 @@ export async function processTaskIpc(
         logger.info(
           { matterId: data.matterId, sourceGroup },
           'Matter updated via IPC',
+        );
+      }
+      break;
+
+    // No authorization — matters are shared state, any group can delete
+    case 'delete_matter':
+      if (data.matterId) {
+        const deleted = deleteMatter(data.matterId);
+        logger.info(
+          { matterId: data.matterId, deleted, sourceGroup },
+          'Matter deleted via IPC',
         );
       }
       break;

@@ -14,8 +14,6 @@ Before engaging with anyone, read: `/workspace/global/procedures/relationships.m
 Before replying to any email, read: `/workspace/global/procedures/email-triage.md`
 Before any scheduling operation, read: `/workspace/global/procedures/scheduling.md`
 
-The email-triage procedure covers matter tracking — follow it after handling every email.
-
 ## Escalation
 
 The Decision Hierarchy and email-triage procedure set the bar for when to escalate — don't add your own.

@@ -127,13 +127,13 @@ function buildVolumeMounts(
     }
   }
 
-  // Google Calendar credentials directory (only mount if group has calendar tools)
-  if (groupHasToolPrefix(group, 'mcp__calendar__')) {
-    const calendarDir = path.join(homeDir, '.calendar-mcp');
-    if (fs.existsSync(calendarDir)) {
+  // Google Calendar credentials directory (only mount if group has gcal tools)
+  if (groupHasToolPrefix(group, 'mcp__gcal__')) {
+    const gcalDir = path.join(homeDir, '.gcal-mcp');
+    if (fs.existsSync(gcalDir)) {
       mounts.push({
-        hostPath: calendarDir,
-        containerPath: '/home/node/.calendar-mcp',
+        hostPath: gcalDir,
+        containerPath: '/home/node/.gcal-mcp',
         readonly: false, // MCP may need to refresh tokens
       });
     }
@@ -147,6 +147,18 @@ function buildVolumeMounts(
         hostPath: workspaceDir,
         containerPath: '/home/node/.workspace-mcp',
         readonly: false, // MCP may need to refresh tokens
+      });
+    }
+  }
+
+  // 1Password MCP token (only mount if group has 1password tools)
+  if (groupHasToolPrefix(group, 'mcp__1password__')) {
+    const opDir = path.join(homeDir, '.1password-mcp');
+    if (fs.existsSync(opDir)) {
+      mounts.push({
+        hostPath: opDir,
+        containerPath: '/home/node/.1password-mcp',
+        readonly: true,
       });
     }
   }
@@ -758,6 +770,21 @@ export function writeMattersSnapshot(
 
   const mattersFile = path.join(groupIpcDir, 'current_matters.json');
   fs.writeFileSync(mattersFile, JSON.stringify(snapshot, null, 2));
+}
+
+export function writeRecentEmailsSnapshot(
+  groupFolder: string,
+  threads: Array<{
+    thread_id: string;
+    sender: string;
+    subject: string | null;
+    updated_at: string;
+  }>,
+): void {
+  const groupIpcDir = resolveGroupIpcPath(groupFolder);
+  fs.mkdirSync(groupIpcDir, { recursive: true });
+  const emailsFile = path.join(groupIpcDir, 'recent_emails.json');
+  fs.writeFileSync(emailsFile, JSON.stringify(threads, null, 2));
 }
 
 /**

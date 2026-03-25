@@ -99,13 +99,13 @@ The goal is that your principal's calendar reflects their priorities, not just t
 
 Use `mcp__time__*` tools for ALL date/time computation — resolving "next Tuesday", computing availability windows, converting timezones, calculating gaps between dates. Never do date math in your head.
 
-1. Run `get-freebusy` on **all calendars** listed in profile.md
-2. `freebusy` blocks: schedule around them silently
-3. Conflicts on writable calendars: resolve per judgment above — move what you control, propose new times for what you don't
-4. When offering times externally, offer 2–3 specific slots. Use `get-freebusy`, not `list-events`
-5. Offering ≠ booking. Once a time is confirmed — or if the choice is low-stakes — create ONE event. Never create multiple events as "options"
-6. Create the event in the **primary** calendar (see profile.md)
-7. Organizer: **your principal's email** (see profile.md)
+1. Run `mcp__gcal__get_availability` with the target time window — returns unified busy/free data
+2. Conflicts on writable calendars: resolve per judgment above — move what you control, propose new times for what you don't
+3. When offering times externally, pick 2–3 slots total from the `free` array, within the Week Template availability windows — spread across different days/times for flexibility. Use each slot's `label` field verbatim for the day and date (e.g., "Friday, March 27")
+4. Offering ≠ booking. Once a time is confirmed — or if the choice is low-stakes — create ONE event. Never create multiple events as "options"
+5. Create the event in the **primary** calendar (see profile.md)
+6. Organizer: **your principal's email** (see profile.md)
+7. Set your principal's `responseStatus` to `"accepted"` in the attendees list
 8. Timezone: use your principal's primary timezone
 
 ## Verification

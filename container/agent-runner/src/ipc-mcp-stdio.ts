@@ -544,6 +544,28 @@ server.tool(
   },
 );
 
+server.tool(
+  'delete_matter',
+  'Permanently delete a matter. Use for duplicates or matters created in error — not for completed work (use update_matter with status="resolved" instead).',
+  {
+    matter_id: z.number().describe('The matter ID to delete'),
+  },
+  async (args) => {
+    const data = {
+      type: 'delete_matter',
+      matterId: args.matter_id,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{ type: 'text' as const, text: `Delete requested for matter ${args.matter_id}.` }],
+    };
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

@@ -423,13 +423,29 @@ async function runQuery(
     };
   }
 
-  if (fs.existsSync('/home/node/.calendar-mcp')) {
-    mcpServers.calendar = {
-      command: 'google-calendar-mcp',
-      args: [],
+  const gcalMcpPath = path.join(path.dirname(mcpServerPath), 'gcal-mcp.js');
+  if (fs.existsSync('/home/node/.gcal-mcp')) {
+    const configFile = '/home/node/.gcal-mcp/calendars.json';
+    mcpServers.gcal = {
+      command: 'node',
+      args: [gcalMcpPath],
       env: {
-        GOOGLE_OAUTH_CREDENTIALS: '/home/node/.calendar-mcp/gcp-oauth.keys.json',
-        GOOGLE_CALENDAR_MCP_TOKEN_PATH: '/home/node/.calendar-mcp/tokens.json',
+        GOOGLE_OAUTH_CREDENTIALS: '/home/node/.gcal-mcp/gcp-oauth.keys.json',
+        GOOGLE_CALENDAR_MCP_TOKEN_PATH: '/home/node/.gcal-mcp/tokens.json',
+        ...(fs.existsSync(configFile) && { CALENDAR_CONFIG_PATH: configFile }),
+      },
+    };
+  }
+
+  // 1Password MCP — conditional on mounted token file
+  const opTokenPath = '/home/node/.1password-mcp/token';
+  const opMcpPath = path.join(path.dirname(mcpServerPath), '1password-mcp.js');
+  if (fs.existsSync(opTokenPath) && fs.existsSync(opMcpPath)) {
+    mcpServers['1password'] = {
+      command: 'node',
+      args: [opMcpPath],
+      env: {
+        OP_TOKEN_PATH: opTokenPath,
       },
     };
   }
@@ -437,7 +453,7 @@ async function runQuery(
   if (fs.existsSync('/home/node/.workspace-mcp/credentials')) {
     // Derive which workspace MCP modules to load from allowedTools.
     // When allowedTools is unset (main group), load all modules.
-    const allModules = ['chat', 'drive', 'docs', 'sheets', 'contacts', 'gmail'];
+    const allModules = ['chat', 'drive', 'docs', 'sheets', 'contacts', 'gmail', 'calendar'];
     let modules: string[];
     if (!containerInput.allowedTools) {
       // No tool restrictions — load all modules
@@ -449,8 +465,9 @@ async function runQuery(
         drive: ['drive_'],
         docs: ['docs_'],
         sheets: ['sheets_'],
-        contacts: ['contact'],  // matches contacts_search, manage_contact, list_contact_groups
-        gmail: ['gmail'],       // matches send_gmail_message, search_gmail_messages, etc.
+        contacts: ['contact'],
+        gmail: ['gmail'],
+        calendar: ['calendar', 'event', 'freebusy'],
       };
       const matched = new Set<string>();
       for (const tool of containerInput.allowedTools) {
@@ -474,8 +491,7 @@ async function runQuery(
           '--tools', ...modules,
         ],
         env: {
-          GOOGLE_OAUTH_CLIENT_ID: (sdkEnv.GOOGLE_OAUTH_CLIENT_ID as string) || '',
-          GOOGLE_OAUTH_CLIENT_SECRET: (sdkEnv.GOOGLE_OAUTH_CLIENT_SECRET as string) || '',
+          GOOGLE_CLIENT_SECRET_PATH: '/home/node/.workspace-mcp/gcp-oauth.keys.json',
           WORKSPACE_MCP_CREDENTIALS_DIR: '/home/node/.workspace-mcp/credentials',
           OAUTHLIB_INSECURE_TRANSPORT: '1',
         },

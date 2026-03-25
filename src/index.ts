@@ -5,7 +5,6 @@ import { OneCLI } from '@onecli-sh/sdk';
 
 import {
   ASSISTANT_NAME,
-  CREDENTIAL_PROXY_PORT,
   EMAIL_EXTERNAL_DELAY,
   HEARTBEAT_SPACE_ID,
   IDLE_TIMEOUT,
@@ -18,7 +17,6 @@ import {
   validateEaConfig,
 } from './config.js';
 import { HEARTBEAT_GROUP } from './heartbeat.js';
-import { startCredentialProxy } from './credential-proxy.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -37,6 +35,7 @@ import {
   pruneOldSessions,
   runContainerAgent,
   writeMattersSnapshot,
+  writeRecentEmailsSnapshot,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
@@ -51,6 +50,7 @@ import {
   getAllSessions,
   getAllTasks,
   getEmailRoute,
+  getRecentEmailThreads,
   getMessageFromMe,
   getMessagesSince,
   getNewMessages,
@@ -422,6 +422,12 @@ async function runAgent(
   // Update matters snapshot for container to read
   writeMattersSnapshot(group.folder, isMain, getAllMatters());
 
+  // Update recent emails snapshot for heartbeat to triage into matters
+  if (group.folder === HEARTBEAT_GROUP.folder) {
+    const since = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); // last 2 hours
+    writeRecentEmailsSnapshot(group.folder, getRecentEmailThreads(since));
+  }
+
   // Update available groups snapshot (main group only can see all groups)
   const availableGroups = getAvailableGroups();
   writeGroupsSnapshot(
@@ -688,12 +694,6 @@ async function main(): Promise<void> {
 
   // Prune orphaned session files from fresh-session groups (email)
   pruneOldSessions([EMAIL_PRINCIPAL_GROUP.folder, EMAIL_EXTERNAL_GROUP.folder]);
-
-  // Start credential proxy (containers route API calls through this)
-  const proxyServer = await startCredentialProxy(
-    CREDENTIAL_PROXY_PORT,
-    PROXY_BIND_HOST,
-  );
 
   // Ensure OneCLI agents exist for all registered groups.
   // Recovers from missed creates (e.g. OneCLI was down at registration time).

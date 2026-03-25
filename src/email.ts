@@ -74,17 +74,17 @@ export const EMAIL_PRINCIPAL_GROUP = {
     'mcp__workspace__get_gmail_attachment_content',
     'mcp__workspace__modify_gmail_message_labels',
     'mcp__workspace__list_gmail_labels',
-    // NanoClaw IPC — messaging, task management, and matter tracking
+    // NanoClaw IPC — messaging, task management, matter context (read-only)
     'mcp__nanoclaw__send_message',
     'mcp__nanoclaw__schedule_task',
     'mcp__nanoclaw__list_tasks',
-    'mcp__nanoclaw__create_matter',
-    'mcp__nanoclaw__update_matter',
     'mcp__nanoclaw__list_matters',
     'mcp__nanoclaw__get_matter',
     'mcp__nanoclaw__find_matter',
-    // Full calendar access (principal's emails often involve scheduling decisions)
-    'mcp__calendar__*',
+    // Calendar: availability, event listing, RSVP (gcal MCP) + CRUD (workspace MCP)
+    'mcp__gcal__*',
+    'mcp__workspace__manage_event',
+    'mcp__workspace__list_calendars',
     // Time MCP — date math, timezone conversions
     'mcp__time__*',
     // Google Workspace — contacts (read + write), docs, sheets, drive (no Chat admin)
@@ -144,23 +144,18 @@ export const EMAIL_EXTERNAL_GROUP = {
     // Contacts (for tier-based gatekeeping)
     'mcp__workspace__contacts_search',
     'mcp__workspace__contacts_get',
-    // NanoClaw IPC — no send_message (escalation handled by output forwarding)
+    // NanoClaw IPC — no send_message (escalation handled by output forwarding), matter context (read-only)
     'mcp__nanoclaw__schedule_task',
     'mcp__nanoclaw__list_tasks',
-    'mcp__nanoclaw__create_matter',
-    'mcp__nanoclaw__update_matter',
     'mcp__nanoclaw__list_matters',
     'mcp__nanoclaw__get_matter',
     'mcp__nanoclaw__find_matter',
-    // Calendar: free/busy, event management, and calendar discovery
-    // Excludes: list-events, get-event, search-events (prevents reading event details)
-    'mcp__calendar__list-calendars',
-    'mcp__calendar__get-freebusy',
-    'mcp__calendar__create-event',
-    'mcp__calendar__update-event',
-    'mcp__calendar__delete-event',
-    'mcp__calendar__respond-to-event',
-    'mcp__calendar__get-current-time',
+    // Calendar: availability + RSVP (gcal MCP), CRUD + discovery (workspace MCP)
+    // Intentionally no list_events/get_events (prevents reading event details)
+    'mcp__gcal__get_availability',
+    'mcp__gcal__respond_to_event',
+    'mcp__workspace__manage_event',
+    'mcp__workspace__list_calendars',
     // Time MCP — date math, timezone conversions
     'mcp__time__*',
   ],
@@ -347,7 +342,7 @@ export function startEmailLoop(
         );
 
         // Queue + mark read (intake complete)
-        insertEmailMessage(email.id, email.threadId, email.from);
+        insertEmailMessage(email.id, email.threadId, email.from, email.subject);
         await markAsRead(gmail, email.id);
 
         try {
@@ -717,7 +712,7 @@ async function fetchNewEmails(
           emails.push(email);
         } else {
           // Not relevant — mark skipped so we don't check again, and mark read
-          insertEmailMessage(ref.id, ref.threadId, email.from);
+          insertEmailMessage(ref.id, ref.threadId, email.from, email.subject);
           updateEmailStatus(ref.id, 'skipped');
           await markAsRead(gmail, ref.id);
           logger.debug(

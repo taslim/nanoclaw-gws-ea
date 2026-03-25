@@ -26,7 +26,7 @@ export const SCHEDULER_POLL_INTERVAL = 60000;
 export const EMAIL_EXTERNAL_DELAY = parseInt(
   process.env.EMAIL_EXTERNAL_DELAY ||
     envConfig.EMAIL_EXTERNAL_DELAY ||
-    '240000', // 4min — avoid instant replies that look like AI
+    '360000', // 6min — avoid instant replies that look like AI
   10,
 );
 
