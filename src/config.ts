@@ -16,6 +16,7 @@ const envConfig = readEnvFile([
   'ASSISTANT_EMAIL',
   'HEARTBEAT_SPACE_ID',
   'ONECLI_URL',
+  'HOST_BROWSER_PORT',
   'TZ',
 ]);
 
@@ -91,6 +92,11 @@ export const SENDER_ALLOWLIST_PATH = path.join(
 export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
 export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
+
+export const HOST_BROWSER_PORT = parseInt(
+  process.env.HOST_BROWSER_PORT || envConfig.HOST_BROWSER_PORT || '9222',
+  10,
+);
 
 export const CONTAINER_IMAGE =
   process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
