@@ -424,14 +424,14 @@ async function runQuery(
   }
 
   const gcalMcpPath = path.join(path.dirname(mcpServerPath), 'gcal-mcp.js');
-  if (fs.existsSync('/home/node/.gcal-mcp')) {
-    const configFile = '/home/node/.gcal-mcp/calendars.json';
+  if (fs.existsSync('/home/node/.workspace-mcp/credentials.json')) {
+    const configFile = '/home/node/.workspace-mcp/calendars.json';
     mcpServers.gcal = {
       command: 'node',
       args: [gcalMcpPath],
       env: {
-        GOOGLE_OAUTH_CREDENTIALS: '/home/node/.gcal-mcp/gcp-oauth.keys.json',
-        GOOGLE_CALENDAR_MCP_TOKEN_PATH: '/home/node/.gcal-mcp/tokens.json',
+        GOOGLE_OAUTH_CREDENTIALS: '/home/node/.workspace-mcp/gcp-oauth.keys.json',
+        GOOGLE_CALENDAR_MCP_TOKEN_PATH: '/home/node/.workspace-mcp/credentials.json',
         ...(fs.existsSync(configFile) && { CALENDAR_CONFIG_PATH: configFile }),
       },
     };

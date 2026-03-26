@@ -127,20 +127,11 @@ function buildVolumeMounts(
     }
   }
 
-  // Google Calendar credentials directory (only mount if group has gcal tools)
-  if (groupHasToolPrefix(group, 'mcp__gcal__')) {
-    const gcalDir = path.join(homeDir, '.gcal-mcp');
-    if (fs.existsSync(gcalDir)) {
-      mounts.push({
-        hostPath: gcalDir,
-        containerPath: '/home/node/.gcal-mcp',
-        readonly: false, // MCP may need to refresh tokens
-      });
-    }
-  }
-
-  // Google Workspace MCP credentials directory (only mount if group has workspace tools)
-  if (groupHasToolPrefix(group, 'mcp__workspace__')) {
+  // Google Workspace credentials directory (workspace MCP + gcal-mcp both read from here)
+  if (
+    groupHasToolPrefix(group, 'mcp__workspace__') ||
+    groupHasToolPrefix(group, 'mcp__gcal__')
+  ) {
     const workspaceDir = path.join(homeDir, '.workspace-mcp');
     if (fs.existsSync(workspaceDir)) {
       mounts.push({
