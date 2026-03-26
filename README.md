@@ -40,7 +40,7 @@ Then run `/setup-ea`. Claude Code handles everything: dependencies, container ru
 
 Before running `/setup-ea`, you'll need:
 
-- macOS or Linux
+- macOS, Linux, or Windows (via WSL2)
 - Node.js 20+
 - [Claude Code](https://claude.ai/download)
 - [Apple Container](https://github.com/apple/container) (macOS) or [Docker](https://docker.com/products/docker-desktop) (macOS/Linux)
@@ -70,6 +70,8 @@ Gmail messages route to synthetic groups by sender identity:
 - **email-external** — third-party emails, restricted tools (no messaging, calendar free/busy only)
 - **heartbeat** — proactive sweeps, logs to a dedicated Chat space
 
+For the full architecture details, see the [documentation site](https://docs.nanoclaw.dev/concepts/architecture).
+
 ### Key Files (GWS-EA additions)
 
 | File | Purpose |
@@ -90,13 +92,13 @@ Run `/update-ea` in Claude Code to pull the latest from nanoclaw-gws-ea into you
 
 Docker provides cross-platform support (macOS, Linux and even Windows via WSL2) and a mature ecosystem. On macOS, you can optionally switch to Apple Container via `/convert-to-apple-container` for a lighter-weight native runtime. For additional isolation, [Docker Sandboxes](docs/docker-sandboxes.md) run each container inside a micro VM.
 
-**Can I run this on Linux?**
+**Can I run this on Linux or Windows?**
 
-Yes. Docker is the default runtime and works on both macOS and Linux. Just run `/setup`.
+Yes. Docker is the default runtime and works on macOS, Linux, and Windows (via WSL2). Just run `/setup`.
 
 **Is this secure?**
 
-Agents run in containers, not behind application-level permission checks. They can only access explicitly mounted directories. You should still review what you're running, but the codebase is small enough that you actually can. See [docs/SECURITY.md](docs/SECURITY.md) for the full security model.
+Agents run in containers, not behind application-level permission checks. They can only access explicitly mounted directories. You should still review what you're running, but the codebase is small enough that you actually can. See the [security documentation](https://docs.nanoclaw.dev/concepts/security) for the full security model.
 
 **Why no configuration files?**
 
@@ -140,7 +142,7 @@ Questions? Ideas? [Join the Discord](https://discord.gg/VDdww8qS42).
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for breaking changes and migration notes.
+See [CHANGELOG.md](CHANGELOG.md) for breaking changes, or the [full release history](https://docs.nanoclaw.dev/changelog) on the documentation site.
 
 ## License
 
