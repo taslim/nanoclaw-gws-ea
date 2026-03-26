@@ -1,12 +1,14 @@
 import fs from 'fs';
 import path from 'path';
 
+import { OneCLI } from '@onecli-sh/sdk';
+
 import {
   ASSISTANT_NAME,
-  CREDENTIAL_PROXY_PORT,
   EMAIL_EXTERNAL_DELAY,
   HEARTBEAT_SPACE_ID,
   IDLE_TIMEOUT,
+  ONECLI_URL,
   POLL_INTERVAL,
   PRINCIPAL_NAME,
   TIMEZONE,
@@ -15,7 +17,6 @@ import {
   validateEaConfig,
 } from './config.js';
 import { HEARTBEAT_GROUP } from './heartbeat.js';
-import { startCredentialProxy } from './credential-proxy.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -34,13 +35,13 @@ import {
   pruneOldSessions,
   runContainerAgent,
   writeMattersSnapshot,
+  writeRecentEmailsSnapshot,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
 import {
   cleanupOrphans,
   ensureContainerRuntimeRunning,
-  PROXY_BIND_HOST,
 } from './container-runtime.js';
 import {
   getAllChats,
@@ -49,6 +50,7 @@ import {
   getAllSessions,
   getAllTasks,
   getEmailRoute,
+  getRecentEmailThreads,
   getMessageFromMe,
   getMessagesSince,
   getNewMessages,
@@ -165,6 +167,27 @@ let messageLoopRunning = false;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 
+const onecli = new OneCLI({ url: ONECLI_URL });
+
+function ensureOneCLIAgent(jid: string, group: RegisteredGroup): void {
+  if (group.isMain) return;
+  const identifier = group.folder.toLowerCase().replace(/_/g, '-');
+  onecli.ensureAgent({ name: group.name, identifier }).then(
+    (res) => {
+      logger.info(
+        { jid, identifier, created: res.created },
+        'OneCLI agent ensured',
+      );
+    },
+    (err) => {
+      logger.debug(
+        { jid, identifier, err: String(err) },
+        'OneCLI agent ensure skipped',
+      );
+    },
+  );
+}
+
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
   const agentTs = getRouterState('last_agent_timestamp');
@@ -204,6 +227,9 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
 
   // Create group folder
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
+
+  // Ensure a corresponding OneCLI agent exists (best-effort, non-blocking)
+  ensureOneCLIAgent(jid, group);
 
   logger.info(
     { jid, name: group.name, folder: group.folder },
@@ -395,6 +421,12 @@ async function runAgent(
 
   // Update matters snapshot for container to read
   writeMattersSnapshot(group.folder, isMain, getAllMatters());
+
+  // Update recent emails snapshot for heartbeat to triage into matters
+  if (group.folder === HEARTBEAT_GROUP.folder) {
+    const since = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); // last 2 hours
+    writeRecentEmailsSnapshot(group.folder, getRecentEmailThreads(since));
+  }
 
   // Update available groups snapshot (main group only can see all groups)
   const availableGroups = getAvailableGroups();
@@ -654,7 +686,6 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
   loadState();
-  restoreRemoteControl();
 
   // Validate EA config (fail fast if required env vars are missing)
   validateEaConfig();
@@ -664,16 +695,17 @@ async function main(): Promise<void> {
   // Prune orphaned session files from fresh-session groups (email)
   pruneOldSessions([EMAIL_PRINCIPAL_GROUP.folder, EMAIL_EXTERNAL_GROUP.folder]);
 
-  // Start credential proxy (containers route API calls through this)
-  const proxyServer = await startCredentialProxy(
-    CREDENTIAL_PROXY_PORT,
-    PROXY_BIND_HOST,
-  );
+  // Ensure OneCLI agents exist for all registered groups.
+  // Recovers from missed creates (e.g. OneCLI was down at registration time).
+  for (const [jid, group] of Object.entries(registeredGroups)) {
+    ensureOneCLIAgent(jid, group);
+  }
+
+  restoreRemoteControl();
 
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
-    proxyServer.close();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);

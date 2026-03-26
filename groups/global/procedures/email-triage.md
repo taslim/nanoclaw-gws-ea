@@ -14,7 +14,9 @@ Email is permanent. Anything you write may be forwarded, screenshot, or re-read 
 
 Every email requires a triage decision before you compose anything. Default to action — your principal should only hear about emails that genuinely need their brain.
 
-Start by checking if this email's thread already has a matter: `find_matter(artifact_type="email_thread", artifact_id=thread_id)`. If found, load its context for continuity. If not, you'll create one after triage. Also scan `list_matters` for matters with near-identical titles or overlapping artifacts to avoid duplicates.
+Check if this email's thread is linked to a matter: `find_matter(artifact_type="email_thread", artifact_id=thread_id)`. If found, load its context via `get_matter` -— use it to inform your triage and reply.
+
+**Principal is already in the conversation → stay out.** If your principal has replied directly on the thread, they're handling it. Don't layer on top of their voice. The only reason to step in is if you're addressed directly, asked to take over, or have concrete logistics to add that your principal didn't include. Your principal choosing to reply directly is a signal, not a gap for you to fill.
 
 **Handle without asking:**
 - Scheduling (use the scheduling procedure — it has its own judgment for when to involve your principal)
@@ -33,6 +35,8 @@ When the Decision Hierarchy says to escalate, use a decision packet (see below).
 - Never CC the original sender on forwards to your principal
 
 Adding them to the thread keeps them on future replies. Forwarding gives them the full context.
+
+**Sent something wrong?** Re-read the source procedure before correcting — the error is usually in your interpretation, not just the output. If the mistake is cosmetic, course-correct in your next natural reply rather than sending a standalone correction.
 
 ## Threading
 
@@ -75,29 +79,11 @@ Include the sender, their relationship to your principal, what they want, and wh
 
 ### Follow-up task
 
-Every decision packet requires a follow-up task — no exceptions. Immediately schedule a `once` task (1 hour, `context_mode: "group"`). The task prompt must: (1) check if the matter is still `active` (i.e., still escalated) via `get_matter` — if resolved, do nothing; (2) if still active, re-read the thread, re-assess, and act on best judgment. Include the matter_id, thread_id, sender, context, and your recommended option. Include the task ID in your message to your principal.
+Every decision packet requires a follow-up task — no exceptions. Immediately schedule a `once` task (1 hour, `context_mode: "group"`). The task prompt must: (1) re-read the thread and check if your principal already responded; (2) if not, re-assess and act on best judgment. Include the thread_id, matter_id if linked, sender, context, and your recommended option. Include the task ID in your message to your principal.
 
-## Matter Tracking
+## Follow-through
 
-Every email gets a matter — no judgment call:
-
-1. `find_matter(artifact_type="email_thread", artifact_id=thread_id)`
-2. If found: load context via `get_matter`, process with that context
-3. If not found: `create_matter(title=subject, artifacts=[{type:"email_thread", id:thread_id}])`
-4. After handling, update the matter status and context
-
-Quick replies get created and resolved on the spot. The matter exists so the sweep can follow up or the work can be reopened if it resurfaces.
-
-### Status
-
-- Expect a reply → `waiting` (the sweep follows up)
-- Done, no reply expected → `resolved`
-- Work remains → `active`
-- Escalated → `active` (follow-through transfers to main)
-
-### Follow-through
-
-Own commitments made in emails. Execute now, schedule a task for future deadlines (link it as an artifact), or set the matter to `waiting` if blocked on someone. Don't wait for your principal to ask "did we ever get back to them?"
+Own commitments made in emails. Execute now, or schedule a task for future deadlines. Don't wait for your principal to ask "did we ever get back to them?"
 
 ## Verification
 

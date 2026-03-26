@@ -2,13 +2,13 @@
  * Google Workspace OAuth Setup Script
  *
  * One-time setup to authorize the EA's Google Workspace account.
- * Generates tokens for both:
+ * Generates tokens for:
  *   - Host-side googleapis (Google Chat polling)
- *   - Container-side google_workspace_mcp (Workspace tools)
+ *   - Container-side MCP servers (Workspace tools, Calendar)
  *
  * Prerequisites:
  *   1. Create OAuth Desktop App in GCP Console
- *   2. Enable APIs: Chat, Drive, Docs, Sheets, Tasks, People, Gmail
+ *   2. Enable APIs: Chat, Drive, Docs, Sheets, Tasks, People, Gmail, Calendar
  *   3. Save client credentials to ~/.workspace-mcp/gcp-oauth.keys.json
  *      Format: { "installed": { "client_id": "...", "client_secret": "...", "redirect_uris": ["http://localhost"] } }
  *
@@ -58,6 +58,8 @@ const SCOPES = [
   'https://www.googleapis.com/auth/contacts',
   // Directory (resolve workspace member emails for principal detection)
   'https://www.googleapis.com/auth/directory.readonly',
+  // Calendar (gcal-mcp + Workspace MCP calendar module)
+  'https://www.googleapis.com/auth/calendar',
   // Gmail (host-side polling + container-side Workspace MCP)
   'https://www.googleapis.com/auth/gmail.readonly',
   'https://www.googleapis.com/auth/gmail.send',
@@ -91,6 +93,7 @@ async function main(): Promise<void> {
     console.error('     - Google Tasks API');
     console.error('     - People API (Contacts)');
     console.error('     - Gmail API');
+    console.error('     - Google Calendar API');
     process.exit(1);
   }
 
@@ -203,13 +206,17 @@ async function main(): Promise<void> {
   fs.writeFileSync(mcpCredsPath, JSON.stringify(mcpCreds, null, 2));
   console.log(`MCP credentials saved to: ${mcpCredsPath}`);
 
+  if (!fs.existsSync(path.join(WORKSPACE_DIR, 'calendars.json'))) {
+    console.log(
+      `\nNote: No calendars.json found in ${WORKSPACE_DIR}/. ` +
+        'Create one with {"calendars":["primary"]} to configure which calendars the agent can access.',
+    );
+  }
+
   console.log('\nSetup complete! Next steps:');
-  console.log('  1. Add to .env:');
-  console.log(`     GOOGLE_OAUTH_CLIENT_ID=${clientConfig.client_id}`);
-  console.log(`     GOOGLE_OAUTH_CLIENT_SECRET=${clientConfig.client_secret}`);
-  console.log('  2. Rebuild the container: ./container/build.sh');
-  console.log('  3. Configure the Chat App in GCP Console');
-  console.log('  4. Start a DM with your EA in Google Chat');
+  console.log('  1. Rebuild the container: ./container/build.sh');
+  console.log('  2. Configure the Chat App in GCP Console');
+  console.log('  3. Start a DM with your EA in Google Chat');
 
   process.exit(0);
 }
