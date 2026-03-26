@@ -242,6 +242,9 @@ server.tool(
           );
           if (existing) {
             existing.value = value;
+            if (concealed !== undefined) {
+              existing.fieldType = concealed ? ItemFieldType.Concealed : ItemFieldType.Text;
+            }
           } else {
             item.fields.push({
               id: label.toLowerCase().replace(/\s+/g, '_'),

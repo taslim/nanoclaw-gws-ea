@@ -556,7 +556,11 @@ server.tool(
         eventId = eventId.substring(0, idx);
       }
     } else if (args.original_start_time && !eventId.includes('_')) {
-      const ts = args.original_start_time.replace(/[-:]/g, '').replace(/\.\d+/, '');
+      const dt = DateTime.fromISO(args.original_start_time, { zone: 'utc' });
+      if (!dt.isValid) {
+        return errorResult(`Invalid original_start_time: ${args.original_start_time}`);
+      }
+      const ts = dt.toFormat("yyyyMMdd'T'HHmmss'Z'");
       eventId = `${eventId}_${ts}`;
     }
 
