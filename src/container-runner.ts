@@ -13,10 +13,12 @@ import {
   CONTAINER_TIMEOUT,
   DATA_DIR,
   GROUPS_DIR,
+  HOST_BROWSER_PORT,
   IDLE_TIMEOUT,
   ONECLI_URL,
   TIMEZONE,
 } from './config.js';
+import { acquireHostBrowser, releaseHostBrowser } from './host-browser.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
@@ -44,6 +46,7 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   allowedTools?: string[];
   assistantName?: string;
+  script?: string;
 }
 
 export interface ContainerOutput {
@@ -231,8 +234,17 @@ function buildVolumeMounts(
     group.folder,
     'agent-runner-src',
   );
-  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
-    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+  if (fs.existsSync(agentRunnerSrc)) {
+    const srcIndex = path.join(agentRunnerSrc, 'index.ts');
+    const cachedIndex = path.join(groupAgentRunnerDir, 'index.ts');
+    const needsCopy =
+      !fs.existsSync(groupAgentRunnerDir) ||
+      !fs.existsSync(cachedIndex) ||
+      (fs.existsSync(srcIndex) &&
+        fs.statSync(srcIndex).mtimeMs > fs.statSync(cachedIndex).mtimeMs);
+    if (needsCopy) {
+      fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+    }
   }
   mounts.push({
     hostPath: groupAgentRunnerDir,
@@ -322,11 +334,36 @@ export async function runContainerAgent(
   const agentIdentifier = input.isMain
     ? undefined
     : group.folder.toLowerCase().replace(/_/g, '-');
-  const containerArgs = await buildContainerArgs(
-    mounts,
-    containerName,
-    agentIdentifier,
-  );
+
+  // Acquire host browser for eligible groups (starts Chrome if needed)
+  const needsHostBrowser = group.isMain || group.folder === 'heartbeat';
+  let hostBrowserAcquired = false;
+  if (needsHostBrowser) {
+    hostBrowserAcquired = await acquireHostBrowser();
+  }
+
+  let containerArgs: string[];
+  try {
+    containerArgs = await buildContainerArgs(
+      mounts,
+      containerName,
+      agentIdentifier,
+    );
+
+    // Inject host browser CDP port only when Chrome is confirmed running
+    if (hostBrowserAcquired) {
+      const imageIdx = containerArgs.indexOf(CONTAINER_IMAGE);
+      containerArgs.splice(
+        imageIdx,
+        0,
+        '-e',
+        `HOST_BROWSER=${HOST_BROWSER_PORT}`,
+      );
+    }
+  } catch (err) {
+    if (hostBrowserAcquired) releaseHostBrowser();
+    throw err;
+  }
 
   logger.debug(
     {
@@ -482,6 +519,7 @@ export async function runContainerAgent(
 
     container.on('close', (code) => {
       clearTimeout(timeout);
+      if (hostBrowserAcquired) releaseHostBrowser();
       const duration = Date.now() - startTime;
 
       if (timedOut) {
@@ -687,6 +725,7 @@ export async function runContainerAgent(
 
     container.on('error', (err) => {
       clearTimeout(timeout);
+      if (hostBrowserAcquired) releaseHostBrowser();
       logger.error(
         { group: group.name, containerName, error: err },
         'Container spawn error',
@@ -707,6 +746,7 @@ export function writeTasksSnapshot(
     id: string;
     groupFolder: string;
     prompt: string;
+    script?: string | null;
     schedule_type: string;
     schedule_value: string;
     status: string;
