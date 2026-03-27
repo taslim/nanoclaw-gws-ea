@@ -90,14 +90,24 @@ async function launchChrome(binary: string): Promise<void> {
     '--disable-renderer-backgrounding',
   ];
 
-  chromeProcess = spawn(binary, args, { stdio: 'ignore' });
+  const proc = spawn(binary, args, { stdio: 'ignore' });
+  chromeProcess = proc;
 
-  chromeProcess.on('exit', (code) => {
+  proc.on('exit', (code) => {
     logger.info({ code }, 'Host Chrome exited');
-    chromeProcess = null;
+    if (chromeProcess === proc) chromeProcess = null;
   });
 
-  await waitForCdp();
+  try {
+    await waitForCdp();
+  } catch (err) {
+    // CDP never came up — kill the zombie and clear state
+    if (chromeProcess === proc) {
+      proc.kill('SIGTERM');
+      chromeProcess = null;
+    }
+    throw err;
+  }
   logger.info({ port: HOST_BROWSER_PORT }, 'Host Chrome ready');
 }
 
@@ -105,13 +115,15 @@ async function launchChrome(binary: string): Promise<void> {
  * Ensure Chrome is running (launch or adopt). Serialized via coalescing promise
  * so concurrent callers don't double-launch.
  */
-async function ensureChrome(binary: string): Promise<boolean> {
+async function ensureChrome(binary: string | null): Promise<boolean> {
   if (chromeProcess && !chromeProcess.killed) return true;
 
   if (await isCdpReachable()) {
     logger.info({ port: HOST_BROWSER_PORT }, 'Adopting existing Chrome CDP');
     return true;
   }
+
+  if (!binary) return false;
 
   try {
     await launchChrome(binary);
@@ -124,11 +136,10 @@ async function ensureChrome(binary: string): Promise<boolean> {
 
 /**
  * Acquire the host browser. Starts Chrome if not running, increments refcount.
- * Returns true if Chrome is available, false if binary not found.
+ * Returns true if Chrome is available, false if no binary and no existing CDP.
  */
 export async function acquireHostBrowser(): Promise<boolean> {
   const binary = detectChromeBinary();
-  if (!binary) return false;
 
   // Coalesce concurrent launches — all callers await the same promise
   if (!launchPromise) {

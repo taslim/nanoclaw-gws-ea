@@ -342,21 +342,27 @@ export async function runContainerAgent(
     hostBrowserAcquired = await acquireHostBrowser();
   }
 
-  const containerArgs = await buildContainerArgs(
-    mounts,
-    containerName,
-    agentIdentifier,
-  );
-
-  // Inject host browser CDP port only when Chrome is confirmed running
-  if (hostBrowserAcquired) {
-    const imageIdx = containerArgs.indexOf(CONTAINER_IMAGE);
-    containerArgs.splice(
-      imageIdx,
-      0,
-      '-e',
-      `HOST_BROWSER=${HOST_BROWSER_PORT}`,
+  let containerArgs: string[];
+  try {
+    containerArgs = await buildContainerArgs(
+      mounts,
+      containerName,
+      agentIdentifier,
     );
+
+    // Inject host browser CDP port only when Chrome is confirmed running
+    if (hostBrowserAcquired) {
+      const imageIdx = containerArgs.indexOf(CONTAINER_IMAGE);
+      containerArgs.splice(
+        imageIdx,
+        0,
+        '-e',
+        `HOST_BROWSER=${HOST_BROWSER_PORT}`,
+      );
+    }
+  } catch (err) {
+    if (hostBrowserAcquired) releaseHostBrowser();
+    throw err;
   }
 
   logger.debug(
