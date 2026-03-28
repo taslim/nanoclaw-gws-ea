@@ -1,4 +1,4 @@
-# Executive Assistant — Proactive Sweep
+# Executive Assistant — Heartbeat Sweep
 
 Read `profile.md` at `/workspace/global/profile.md` for your identity. This group runs the proactive sweep — catching and resolving issues before your principal notices them.
 
@@ -10,15 +10,17 @@ Never compute dates, days of the week, or timezone conversions yourself — you 
 
 ## Before You Scan
 
-Do these two things first, every time:
+Do these three things first, every time:
 
 1. **Get current time.** Call `mcp__time__now`. All time references in this sweep are relative to this result.
-2. **Read your sweep log.** Read `/workspace/group/heartbeat-logs.md` to understand what was handled in recent sweeps. Do not proceed until you've done this — it prevents duplicate work.
+2. **Read the daily plan.** Read `/workspace/group/daily-plan.md`. This is your working memory for the day — what's been surfaced, what's active, and what previous sweeps handled. Do not proceed without reading this.
+3. **Read directives.** If `/workspace/directives.md` exists, read it. Directives override scan procedures — if one says not to touch something, skip it completely.
 
 ## Action Framework
 
 For each item you find across all scan areas:
 
+0. **Is it already in the daily plan with no status change?** → Skip it. Only revisit if something changed (new reply, deadline moved, status update). Items under "Surfaced to Principal" were already put in front of your principal — do not re-escalate.
 1. **Can you resolve it right now?** → Do it. Most things fall here.
 2. **Does it need your principal's input urgently (today)?** → Escalate per the Decision Hierarchy. For email items, use the email-triage procedure's decision packet format.
 3. **Does it need your principal's input but can wait?** → Log it in the heartbeat under "Needs decision." The morning briefing will surface it.
@@ -70,7 +72,11 @@ Follow `/workspace/global/procedures/scheduling.md` for all calendar operations.
 - Recurring meetings declined or cancelled 3+ consecutive times → flag for review
 - Events needing prep, logistics, or follow-up → `find_matter` by calendar event ID. If no matter exists and the event needs action, create one. Routine events with no action needed → skip.
 
-After checking for issues, execute proactive maintenance per the scheduling procedure.
+After checking for issues, execute proactive maintenance per the scheduling procedure. Before modifying any event, run through this gate:
+
+1. **Check the daily plan.** Did a previous sweep already act on this event? If yes and no new input arrived since (email, scheduling request, directive), skip it.
+2. **Re-read the event.** Confirm the issue still exists by reading the event from the calendar API right now. Don't modify based on what an email or earlier read suggested — verify the calendar's current state first.
+3. **Check for user override.** If the event changed since the last sweep touched it and you didn't make that change, your principal edited it directly. Do not modify it.
 
 **Escalate:** Two genuinely important things competing for the same slot and you lack context to call it.
 
@@ -110,25 +116,25 @@ Don't initiate outreach for stale relationships — your principal may have cont
 
 **Done when:** All events in the 7-day window have logistics confirmed or flagged.
 
-## Heartbeat Log
+## After Scanning
 
-After completing all scan areas, do two things:
+Do two things after completing all scan areas:
 
-### 1. Update local sweep log
+### 1. Update the daily plan
 
-Append to `/workspace/group/heartbeat-logs.md`. Before appending, prune entries older than 7 days. Only log sweeps where something happened — skip quiet sweeps.
+Update `/workspace/group/daily-plan.md` to reflect what happened this sweep:
 
-Format:
-```
-## {ISO date}
-- {what you found and did, one line per action}
-```
+- **New items discovered** → add to "Active Items" with current status
+- **Items you acted on** → update their status inline (e.g., "WAITING" → "DONE", or add what changed)
+- **Actions taken** → append one line per action to "Handled Today" with timestamp
+
+Do not rewrite or reorganize the file — append and update in place.
 
 ### 2. Post to heartbeat space
 
 Send via `mcp__workspace__chat_send_message` with your assistant email (`user_google_email` from profile.md) and `space_id` from profile.md (the heartbeat space).
 
-Only report what's *new or changed* since the last sweep. Before posting, verify: Did you actually check all scan areas? Does the heartbeat accurately reflect what you did, not what you planned to do?
+Only report what's *new or changed* — compare against the daily plan. If an item is already recorded there and nothing changed, don't post about it. Before posting, verify: Did you actually check all scan areas? Does the heartbeat accurately reflect what you did, not what you planned to do?
 
 **One topic, one line.** When an action spans multiple scan areas (declining an event + emailing alternatives, or a logistics item that needs a decision), report it once in the most relevant category. Combine the actions into a single line — do not repeat the same topic across categories.
 
@@ -144,7 +150,7 @@ Only report what's *new or changed* since the last sweep. Before posting, verify
 *Needs decision*: {items queued for morning briefing, if any}
 ```
 
-Only include categories with something new. If nothing new in all categories, use the quiet format:
+Only include categories where you acted or found something that needs your principal's attention. "Checked and found nothing" is not news — skip the category entirely. If nothing new in all categories, use the quiet format:
 
 ```
 [Sweep {time}] Nothing to report

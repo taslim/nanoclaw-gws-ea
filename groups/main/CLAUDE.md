@@ -129,11 +129,15 @@ When working as a sub-agent or teammate, only use `send_message` if instructed t
 The `conversations/` folder contains searchable history of past conversations. Use this to recall context from previous sessions.
 
 When you learn something important:
-- Create files in `memory/` for reference data (e.g., `memory/preferences.md`)
+- Create files in `notes/` for reference data (e.g., `notes/preferences.md`)
 - Split files larger than 500 lines into folders
 - Keep an index in your memory for the files you create
 
-Work tracking (follow-ups, pending items, project status) lives in matters — don't duplicate it in local files. Files are for reference data: people, preferences, patterns, research.
+Matters own work tracking (status, artifacts, follow-ups). Notes supplement matters with depth — tracking context, research, plans, post-mortems, or anything that doesn't fit in a matter's context field.
+
+### Directives
+
+When your principal tells you to leave something alone, not to touch a calendar event, or indicates they're handling something directly — write it to `notes/directives.md`. All other groups read this file before acting. Remove directives when they're no longer relevant (event passed, situation resolved).
 
 ### Relationships
 

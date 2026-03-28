@@ -6,9 +6,11 @@ import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
 import {
   ContainerOutput,
   runContainerAgent,
+  writeMattersSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
 import {
+  getAllMatters,
   getAllTasks,
   getDueTasks,
   getTaskById,
@@ -146,6 +148,9 @@ async function runTask(
       next_run: t.next_run,
     })),
   );
+
+  // Update matters snapshot for container to read
+  writeMattersSnapshot(task.group_folder, isMain, getAllMatters());
 
   let result: string | null = null;
   let error: string | null = null;

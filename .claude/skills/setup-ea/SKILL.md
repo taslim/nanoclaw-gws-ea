@@ -266,6 +266,11 @@ Update the calendar table in profile.md. At least one calendar must be set to `p
 
 **Heartbeat:** If `HEARTBEAT_SPACE_ID` was set in 5a, update the Heartbeat section in profile.md. If not, AskUserQuestion: "Do you want a heartbeat space for proactive sweep logs? If yes, create a Google Chat space and provide the space ID." This is optional — skip if the user declines.
 
+If heartbeat is enabled, create the daily plan file so the morning briefing can populate it on first run:
+```bash
+mkdir -p groups/heartbeat && touch groups/heartbeat/daily-plan.md
+```
+
 ## 6. Additional Channels (Optional)
 
 Google Chat is the primary channel and is already configured. The user may want additional channels for convenience.

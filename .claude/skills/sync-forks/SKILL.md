@@ -15,9 +15,9 @@ Run `/sync-forks` in Claude Code.
 
 **Fork discovery**: any git remote that isn't `origin` (private fork) or `upstream` (community upstream) is a public fork candidate. One fork skips selection; multiple forks prompts a choice.
 
-**Push flow**: creates a staging branch from the public fork. Merges upstream individually (preserves community attribution), squashes private fork commits (no private history leaks), runs a privacy scan (hard gate), validates the build, then opens a PR or pushes directly.
+**Push flow**: creates a staging branch from the public fork. Merges upstream individually (preserves community attribution), squashes private fork commits (no private history leaks), runs a privacy scan (hard gate), validates the build, surfaces any upstream breaking changes in the PR description, then opens a PR or pushes directly.
 
-**Pull flow**: merges the public fork's latest into your private fork. No privacy scanning needed — public → private is safe. Useful when someone else contributes to your public fork.
+**Pull flow**: merges the public fork's latest into your private fork. No privacy scanning needed — public → private is safe. Prompts for container rebuild if container files changed. Useful when someone else contributes to your public fork.
 
 **Privacy**: private files are restored to public fork templates before committing. A grep scan runs as a safety net for anything the manifest doesn't cover. Both happen before the commit, so personal data never enters the public fork's history.
 
@@ -183,8 +183,9 @@ If A: offer to run the appropriate update skill (e.g., `/update-nanoclaw`), or d
 Show upstream commits not yet in the public fork:
 - `git log --oneline <fork>/$FORK_BRANCH..upstream/main`
 
-Show changed files vs the public fork:
+Show changed files vs the public fork (commit divergence ≠ content divergence — always check the actual diff):
 - `git diff --name-only <fork>/$FORK_BRANCH HEAD`
+- `git diff --stat <fork>/$FORK_BRANCH HEAD` (shows magnitude of changes per file)
 
 Categorize each changed file using the Private Files lists from the Privacy Manifest:
 - **Private (auto-handled):** files in the manifest — will be restored, section-restored, or unstaged
@@ -324,6 +325,9 @@ If Abort:
 - Stop.
 
 If Create PR:
+- Check if upstream changes being pushed include breaking changes:
+  `git diff <fork>/$FORK_BRANCH..upstream/main -- CHANGELOG.md | grep -i '^\+.*\[BREAKING\]'`
+  If any found, include them in the PR body under a **Breaking Changes** section so end users know what they're getting.
 - `git push <fork> $STAGING`
 - Create PR with `gh pr create --repo $FORK_REPO --base $FORK_BRANCH --head $STAGING` with a summary of changes. Do NOT include privacy/scan details in the PR body — that's internal workflow, not public information.
 - Before submitting: scan the PR title and body for soft identifiers. Use "fork" where you'd say the private fork name.
@@ -339,8 +343,8 @@ Switch back to main:
 If pushed directly (not PR), delete staging branch:
 - `git branch -d $STAGING`
 
-If PR was created, keep the staging branch alive until merged. Tell the user they can delete it after merging:
-- `git branch -d $STAGING`
+If PR was created, keep the staging branch alive. Tell the user to delete it after the PR is merged:
+- `git branch -d $STAGING` (run after PR is merged)
 
 Update local tracking:
 - `git fetch <fork> --prune`
@@ -414,17 +418,28 @@ If build fails:
 - Do not refactor unrelated code.
 - If unclear, ask the user before making changes.
 
-# Step P5: Summary + rollback instructions
+# Step P5: Container rebuild check
+Check if container files changed in the pulled commits:
+- `git diff --name-only <backup-tag-from-step-P1>..HEAD -- container/`
+
+If changes found:
+- Ask using AskUserQuestion: "Container files changed. Rebuild the container now?"
+- If yes: `./container/build.sh`
+
+# Step P6: Summary + rollback instructions
 Show:
 - Backup tag: the tag name created in Step P1
 - Commits pulled: count + summary
 - Conflicts resolved (list files, if any)
+- Container rebuild status (rebuilt or skipped)
 - Build: PASSED
 
 Tell the user:
 - To rollback: `git reset --hard <backup-tag-from-step-P1>`
 - Backup branch also exists: `backup/pre-pull-<HASH>-<TIMESTAMP>`
-- Restart the service to apply changes.
+- Restart the service to apply changes:
+  - If using launchd: `launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist && launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist`
+  - If running manually: restart `npm run dev`
 
 If user selected "all" forks in Step 1 (multi-fork pull):
 - Loop back to Step P1 for the next fork.

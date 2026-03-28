@@ -144,7 +144,8 @@ export const EMAIL_EXTERNAL_GROUP = {
     // Contacts (for tier-based gatekeeping)
     'mcp__workspace__contacts_search',
     'mcp__workspace__contacts_get',
-    // NanoClaw IPC — no send_message (escalation handled by output forwarding), matter context (read-only)
+    // NanoClaw IPC — matter context (read-only)
+    'mcp__nanoclaw__send_message',
     'mcp__nanoclaw__schedule_task',
     'mcp__nanoclaw__list_tasks',
     'mcp__nanoclaw__list_matters',

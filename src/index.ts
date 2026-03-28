@@ -745,8 +745,12 @@ async function main(): Promise<void> {
 
   ensureSystemGroups();
 
-  // Prune orphaned session files from fresh-session groups (email)
-  pruneOldSessions([EMAIL_PRINCIPAL_GROUP.folder, EMAIL_EXTERNAL_GROUP.folder]);
+  // Prune orphaned session files from fresh-session groups (email, heartbeat)
+  pruneOldSessions([
+    EMAIL_PRINCIPAL_GROUP.folder,
+    EMAIL_EXTERNAL_GROUP.folder,
+    HEARTBEAT_GROUP.folder,
+  ]);
 
   // Ensure OneCLI agents exist for all registered groups.
   // Recovers from missed creates (e.g. OneCLI was down at registration time).
@@ -1020,8 +1024,7 @@ async function main(): Promise<void> {
     const isExternal = targetFolder === 'email-external';
     const prompt = buildEmailPrompt(email, isExternal, threadMessages);
 
-    // Process email via agent, returns status
-    const processEmail = async (): Promise<'processed' | 'failed'> => {
+    const emailTask = async (): Promise<void> => {
       const { channel: outputChannel, targetJid: outputJid } =
         resolveChannel(targetJid);
 
@@ -1055,13 +1058,13 @@ async function main(): Promise<void> {
           { emailId: email.id, threadId: email.threadId, route: targetFolder },
           'Email agent processing failed',
         );
-        return 'failed';
+        updateEmailStatus(email.id, 'failed');
+        return;
       }
-      return 'processed';
+      updateEmailStatus(email.id, 'processed');
     };
 
     // Delay external emails to avoid instant AI-giveaway replies.
-    // Fire-and-forget so the poll loop continues processing other emails.
     if (isExternal && EMAIL_EXTERNAL_DELAY > 0) {
       logger.info(
         {
@@ -1072,25 +1075,12 @@ async function main(): Promise<void> {
         'Delaying external email processing',
       );
       setTimeout(() => {
-        processEmail()
-          .then((status) => updateEmailStatus(email.id, status))
-          .catch((err) => {
-            updateEmailStatus(email.id, 'failed');
-            logger.error(
-              { emailId: email.id, threadId: email.threadId, err },
-              'Delayed external email processing failed',
-            );
-          });
+        queue.enqueueTask(targetJid, email.id, emailTask);
       }, EMAIL_EXTERNAL_DELAY);
       return;
     }
 
-    // Non-deferred: process and update status
-    const status = await processEmail();
-    updateEmailStatus(email.id, status);
-    if (status === 'failed') {
-      throw new Error('Email agent processing failed');
-    }
+    queue.enqueueTask(targetJid, email.id, emailTask);
   });
 
   void startMessageLoop();
