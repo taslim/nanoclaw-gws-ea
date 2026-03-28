@@ -53,18 +53,17 @@ Clear the file completely, then write:
 ```
 # Daily Plan — {today's date}
 
-## Surfaced to Principal
+## Surfaced via Morning Briefing
 {numbered list matching the Decisions section — what you asked your principal to decide on}
 
-## Active Items
-{one line per active/waiting matter: title | STATUS | key detail}
-{include items from Horizon that need tracking today}
+## Today's Focus
+{title | STATUS | key detail — items with a deadline, expected reply, or event today}
 
 ## Handled Today
-(sweep appends here)
+(leave empty. sweep appends here)
 ```
 
-Keep it terse — this is a working checklist, not a narrative. The sweep adds items during the day as new work arrives.
+Keep it terse — this is a daily attention budget, not a matter status dump. The sweep adds and prunes items during the day as work arrives and resolves.
 
 ## Output
 
