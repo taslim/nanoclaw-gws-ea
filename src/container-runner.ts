@@ -94,11 +94,16 @@ function buildVolumeMounts(
     });
 
     // Heartbeat's daily plan (read-write) so the morning briefing can populate it.
-    const dailyPlanFile = path.join(GROUPS_DIR, 'heartbeat', 'daily-plan.md');
-    if (fs.existsSync(dailyPlanFile)) {
+    // Only mount if the heartbeat group is set up (directory exists).
+    const heartbeatDir = path.join(GROUPS_DIR, 'heartbeat');
+    if (fs.existsSync(heartbeatDir)) {
+      const dailyPlanFile = path.join(heartbeatDir, 'daily-plan.md');
+      if (!fs.existsSync(dailyPlanFile)) {
+        fs.writeFileSync(dailyPlanFile, '');
+      }
       mounts.push({
         hostPath: dailyPlanFile,
-        containerPath: '/workspace/daily-plan.md',
+        containerPath: '/workspace/heartbeat/daily-plan.md',
         readonly: false,
       });
     }

@@ -46,7 +46,7 @@ Write like a chief of staff, not a newsletter. Terse, judgment-forward. Lead wit
 
 ## Daily Plan
 
-After sending the briefing, clear and rewrite `/workspace/daily-plan.md`. This file is shared with the proactive sweep — it references it hourly to skip known items and track progress.
+After sending the briefing, clear and rewrite `/workspace/heartbeat/daily-plan.md`. This is a cross-group mount — write to this exact path, not to `/workspace/group/`.
 
 Clear the file completely, then write:
 
@@ -57,13 +57,11 @@ Clear the file completely, then write:
 {numbered list matching the Decisions section — what you asked your principal to decide on}
 
 ## Today's Focus
-{title | STATUS | key detail — items with a deadline, expected reply, or event today}
+{title | STATUS | key detail — only items with something happening today: a deadline, expected reply, scheduled event, or new development. Keep it terse. This is a daily attention budget, not a mirror of list_matters. Empty on a quiet day is correct.}
 
 ## Handled Today
 (leave empty. sweep appends here)
 ```
-
-Keep it terse — this is a daily attention budget, not a matter status dump. The sweep adds and prunes items during the day as work arrives and resolves.
 
 ## Output
 
