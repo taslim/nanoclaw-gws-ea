@@ -34,9 +34,7 @@ groups/heartbeat/*
 
 # Runtime data (never tracked, even in whitelisted groups)
 groups/*/conversations/
-groups/*/memory/
-groups/*/MEMORY.md
-groups/*/heartbeat-logs.md
+groups/*/notes/
 groups/*/auth/
 
 # Secrets

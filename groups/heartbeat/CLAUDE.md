@@ -13,14 +13,14 @@ Never compute dates, days of the week, or timezone conversions yourself — you 
 Do these three things first, every time:
 
 1. **Get current time.** Call `mcp__time__now`. All time references in this sweep are relative to this result.
-2. **Read the daily plan.** Read `/workspace/group/daily-plan.md`. This is your working memory for the day — what's been surfaced, what's active, and what previous sweeps handled. Do not proceed without reading this.
+2. **Read the daily plan.** Read `/workspace/group/daily-plan.md`. This is your working memory for the day — what was briefed this morning, what needs attention today, and what's been handled. Do not proceed without reading this.
 3. **Read directives.** If `/workspace/directives.md` exists, read it. Directives override scan procedures — if one says not to touch something, skip it completely.
 
 ## Action Framework
 
 For each item you find across all scan areas:
 
-0. **Is it already in the daily plan with no status change?** → Skip it. Only revisit if something changed (new reply, deadline moved, status update). Items under "Surfaced to Principal" were already put in front of your principal — do not re-escalate.
+0. **Already handled today?** Check "Handled Today" in the daily plan — if the item was fully resolved there, skip it. Items under "Surfaced via Morning Briefing" were already put in front of your principal — do not re-escalate.
 1. **Can you resolve it right now?** → Do it. Most things fall here.
 2. **Does it need your principal's input urgently (today)?** → Escalate per the Decision Hierarchy. For email items, use the email-triage procedure's decision packet format.
 3. **Does it need your principal's input but can wait?** → Log it in the heartbeat under "Needs decision." The morning briefing will surface it.
@@ -124,11 +124,11 @@ Do two things after completing all scan areas:
 
 Update `/workspace/group/daily-plan.md` to reflect what happened this sweep:
 
-- **New items discovered** → add to "Active Items" with current status
-- **Items you acted on** → update their status inline (e.g., "WAITING" → "DONE", or add what changed)
-- **Actions taken** → append one line per action to "Handled Today" with timestamp
+- **Today's Focus** — add only items with something happening today: a deadline, expected reply, scheduled event, or new development. Not a mirror of `list_matters`.
+- **Prune as you go** — fully handled items move from "Today's focus" to "Handled Today." Items with nothing left today get removed (the matter still tracks them).
+- **Handled Today** — append one line per action: `- HH:MM: what you did and the outcome`.
 
-Do not rewrite or reorganize the file — append and update in place.
+Do not rewrite or reorganize the file — update in place.
 
 ### 2. Post to heartbeat space
 
