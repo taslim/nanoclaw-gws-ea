@@ -11,6 +11,7 @@ import {
   GROUPS_DIR,
   HEARTBEAT_SPACE_ID,
   IDLE_TIMEOUT,
+  MAX_MESSAGES_PER_PROMPT,
   ONECLI_URL,
   POLL_INTERVAL,
   PRINCIPAL_NAME,
@@ -54,6 +55,7 @@ import {
   getEmailRoute,
   getRecentEmailThreads,
   getMessageFromMe,
+  getLastBotMessageTimestamp,
   getMessagesSince,
   getNewMessages,
   getRouterState,
@@ -207,6 +209,27 @@ function loadState(): void {
   );
 }
 
+/**
+ * Return the message cursor for a group, recovering from the last bot reply
+ * if lastAgentTimestamp is missing (new group, corrupted state, restart).
+ */
+function getOrRecoverCursor(chatJid: string): string {
+  const existing = lastAgentTimestamp[chatJid];
+  if (existing) return existing;
+
+  const botTs = getLastBotMessageTimestamp(chatJid, ASSISTANT_NAME);
+  if (botTs) {
+    logger.info(
+      { chatJid, recoveredFrom: botTs },
+      'Recovered message cursor from last bot reply',
+    );
+    lastAgentTimestamp[chatJid] = botTs;
+    saveState();
+    return botTs;
+  }
+  return '';
+}
+
 function saveState(): void {
   setRouterState('last_timestamp', lastTimestamp);
   setRouterState('last_agent_timestamp', JSON.stringify(lastAgentTimestamp));
@@ -300,11 +323,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const isMainGroup = group.isMain === true;
 
-  const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
   const missedMessages = getMessagesSince(
     chatJid,
-    sinceTimestamp,
+    getOrRecoverCursor(chatJid),
     ASSISTANT_NAME,
+    MAX_MESSAGES_PER_PROMPT,
   );
 
   if (missedMessages.length === 0) return true;
@@ -435,6 +458,7 @@ async function runAgent(
       id: t.id,
       groupFolder: t.group_folder,
       prompt: t.prompt,
+      script: t.script || undefined,
       schedule_type: t.schedule_type,
       schedule_value: t.schedule_value,
       status: t.status,
@@ -576,8 +600,9 @@ async function startMessageLoop(): Promise<void> {
           // context that accumulated between triggers is included.
           const allPending = getMessagesSince(
             chatJid,
-            lastAgentTimestamp[chatJid] || '',
+            getOrRecoverCursor(chatJid),
             ASSISTANT_NAME,
+            MAX_MESSAGES_PER_PROMPT,
           );
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
@@ -614,8 +639,12 @@ async function startMessageLoop(): Promise<void> {
  */
 function recoverPendingMessages(): void {
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
-    const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-    const pending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
+    const pending = getMessagesSince(
+      chatJid,
+      getOrRecoverCursor(chatJid),
+      ASSISTANT_NAME,
+      MAX_MESSAGES_PER_PROMPT,
+    );
     if (pending.length > 0) {
       logger.info(
         { group: group.name, pendingCount: pending.length },
@@ -716,8 +745,12 @@ async function main(): Promise<void> {
 
   ensureSystemGroups();
 
-  // Prune orphaned session files from fresh-session groups (email)
-  pruneOldSessions([EMAIL_PRINCIPAL_GROUP.folder, EMAIL_EXTERNAL_GROUP.folder]);
+  // Prune orphaned session files from fresh-session groups (email, heartbeat)
+  pruneOldSessions([
+    EMAIL_PRINCIPAL_GROUP.folder,
+    EMAIL_EXTERNAL_GROUP.folder,
+    HEARTBEAT_GROUP.folder,
+  ]);
 
   // Ensure OneCLI agents exist for all registered groups.
   // Recovers from missed creates (e.g. OneCLI was down at registration time).
@@ -931,6 +964,7 @@ async function main(): Promise<void> {
         id: t.id,
         groupFolder: t.group_folder,
         prompt: t.prompt,
+        script: t.script || undefined,
         schedule_type: t.schedule_type,
         schedule_value: t.schedule_value,
         status: t.status,
@@ -990,8 +1024,7 @@ async function main(): Promise<void> {
     const isExternal = targetFolder === 'email-external';
     const prompt = buildEmailPrompt(email, isExternal, threadMessages);
 
-    // Process email via agent, returns status
-    const processEmail = async (): Promise<'processed' | 'failed'> => {
+    const emailTask = async (): Promise<void> => {
       const { channel: outputChannel, targetJid: outputJid } =
         resolveChannel(targetJid);
 
@@ -1025,13 +1058,13 @@ async function main(): Promise<void> {
           { emailId: email.id, threadId: email.threadId, route: targetFolder },
           'Email agent processing failed',
         );
-        return 'failed';
+        updateEmailStatus(email.id, 'failed');
+        return;
       }
-      return 'processed';
+      updateEmailStatus(email.id, 'processed');
     };
 
     // Delay external emails to avoid instant AI-giveaway replies.
-    // Fire-and-forget so the poll loop continues processing other emails.
     if (isExternal && EMAIL_EXTERNAL_DELAY > 0) {
       logger.info(
         {
@@ -1042,25 +1075,12 @@ async function main(): Promise<void> {
         'Delaying external email processing',
       );
       setTimeout(() => {
-        processEmail()
-          .then((status) => updateEmailStatus(email.id, status))
-          .catch((err) => {
-            updateEmailStatus(email.id, 'failed');
-            logger.error(
-              { emailId: email.id, threadId: email.threadId, err },
-              'Delayed external email processing failed',
-            );
-          });
+        queue.enqueueTask(targetJid, email.id, emailTask);
       }, EMAIL_EXTERNAL_DELAY);
       return;
     }
 
-    // Non-deferred: process and update status
-    const status = await processEmail();
-    updateEmailStatus(email.id, status);
-    if (status === 'failed') {
-      throw new Error('Email agent processing failed');
-    }
+    queue.enqueueTask(targetJid, email.id, emailTask);
   });
 
   void startMessageLoop();

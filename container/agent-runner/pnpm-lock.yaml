@@ -12,8 +12,8 @@ importers:
         specifier: ^0.4.0
         version: 0.4.0
       '@anthropic-ai/claude-agent-sdk':
-        specifier: ^0.2.76
-        version: 0.2.81(zod@4.3.6)
+        specifier: ^0.2.85
+        version: 0.2.85(zod@4.3.6)
       '@modelcontextprotocol/sdk':
         specifier: ^1.12.1
         version: 1.27.1(zod@4.3.6)
@@ -54,8 +54,8 @@ packages:
   '@1password/sdk@0.4.0':
     resolution: {integrity: sha512-RIypujc9R/UeUaobjyClTYokqRFpcaIkHq+EO/X9XoHId98Vg+SbjwGV+yygRC4MyHwYNo1KP1iEbZcqJ4ZTdw==}
 
-  '@anthropic-ai/claude-agent-sdk@0.2.81':
-    resolution: {integrity: sha512-CBeebgibBEN/DWOQGZN67vhuTG55RbI1hlsFSSoZ4uA/Io3lw04eHTE2ISCmdbqyJaefYTt6GKZei1nP0TQMNw==}
+  '@anthropic-ai/claude-agent-sdk@0.2.85':
+    resolution: {integrity: sha512-/ohKLtP1zy6aWXLW/9KTYBveJPEtAfdO96qiP1Cl5S7LgVq/qRDUl7AUw5YGrBaK6YWHEE/rfMQZGwP/i5zIvQ==}
     engines: {node: '>=18.0.0'}
     peerDependencies:
       zod: ^4.0.0
@@ -646,7 +646,7 @@ snapshots:
     dependencies:
       '@1password/sdk-core': 0.4.0
 
-  '@anthropic-ai/claude-agent-sdk@0.2.81(zod@4.3.6)':
+  '@anthropic-ai/claude-agent-sdk@0.2.85(zod@4.3.6)':
     dependencies:
       zod: 4.3.6
     optionalDependencies:

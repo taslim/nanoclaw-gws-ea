@@ -2,7 +2,7 @@
  * Container Runner for NanoClaw
  * Spawns agent execution in containers and handles IPC
  */
-import { ChildProcess, exec, spawn } from 'child_process';
+import { ChildProcess, spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -93,6 +93,16 @@ function buildVolumeMounts(
       readonly: true,
     });
 
+    // Heartbeat's daily plan (read-write) so the morning briefing can populate it.
+    const dailyPlanFile = path.join(GROUPS_DIR, 'heartbeat', 'daily-plan.md');
+    if (fs.existsSync(dailyPlanFile)) {
+      mounts.push({
+        hostPath: dailyPlanFile,
+        containerPath: '/workspace/daily-plan.md',
+        readonly: false,
+      });
+    }
+
     // Shadow .env so the agent cannot read secrets from the mounted project root.
     // Credentials are injected by the OneCLI gateway, never exposed to containers.
     const envFile = path.join(projectRoot, '.env');
@@ -125,6 +135,22 @@ function buildVolumeMounts(
       mounts.push({
         hostPath: globalDir,
         containerPath: '/workspace/global',
+        readonly: true,
+      });
+    }
+
+    // Non-main groups get main's directives file so cross-group
+    // overrides are visible to autonomous agents.
+    const directivesFile = path.join(
+      GROUPS_DIR,
+      'main',
+      'notes',
+      'directives.md',
+    );
+    if (fs.existsSync(directivesFile)) {
+      mounts.push({
+        hostPath: directivesFile,
+        containerPath: '/workspace/directives.md',
         readonly: true,
       });
     }
@@ -183,6 +209,8 @@ function buildVolumeMounts(
             // https://code.claude.com/docs/en/memory#manage-auto-memory
             CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
           },
+          autoMemoryEnabled: true,
+          autoDreamEnabled: true,
         },
         null,
         2,
@@ -498,15 +526,15 @@ export async function runContainerAgent(
         { group: group.name, containerName },
         'Container timeout, stopping gracefully',
       );
-      exec(stopContainer(containerName), { timeout: 15000 }, (err) => {
-        if (err) {
-          logger.warn(
-            { group: group.name, containerName, err },
-            'Graceful stop failed, force killing',
-          );
-          container.kill('SIGKILL');
-        }
-      });
+      try {
+        stopContainer(containerName);
+      } catch (err) {
+        logger.warn(
+          { group: group.name, containerName, err },
+          'Graceful stop failed, force killing',
+        );
+        container.kill('SIGKILL');
+      }
     };
 
     let timeout = setTimeout(killOnTimeout, timeoutMs);

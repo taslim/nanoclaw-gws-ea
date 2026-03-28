@@ -129,11 +129,15 @@ When working as a sub-agent or teammate, only use `send_message` if instructed t
 The `conversations/` folder contains searchable history of past conversations. Use this to recall context from previous sessions.
 
 When you learn something important:
-- Create files in `memory/` for reference data (e.g., `memory/preferences.md`)
+- Create files in `notes/` for reference data (e.g., `notes/preferences.md`)
 - Split files larger than 500 lines into folders
 - Keep an index in your memory for the files you create
 
-Work tracking (follow-ups, pending items, project status) lives in matters — don't duplicate it in local files. Files are for reference data: people, preferences, patterns, research.
+Matters own work tracking (status, artifacts, follow-ups). Notes supplement matters with depth — tracking context, research, plans, post-mortems, or anything that doesn't fit in a matter's context field.
+
+### Directives
+
+When your principal tells you to leave something alone, not to touch a calendar event, or indicates they're handling something directly — write it to `notes/directives.md`. All other groups read this file before acting. Remove directives when they're no longer relevant (event passed, situation resolved).
 
 ### Relationships
 
@@ -193,6 +197,10 @@ Standard Markdown: `**bold**`, `*italic*`, `[links](url)`, `# headings`.
 ## Admin Context
 
 This is the **main channel**, which has elevated privileges.
+
+## Authentication
+
+Anthropic credentials must be either an API key from console.anthropic.com (`ANTHROPIC_API_KEY`) or a long-lived OAuth token from `claude setup-token` (`CLAUDE_CODE_OAUTH_TOKEN`). Short-lived tokens from the system keychain or `~/.claude/.credentials.json` expire within hours and can cause recurring container 401s. The `/setup` skill walks through this. OneCLI manages credentials (including Anthropic auth) — run `onecli --help`.
 
 ## Container Mounts
 
@@ -349,7 +357,7 @@ The task will run in that group's context with access to their files and memory.
 
 ## Task Scripts
 
-When scheduling tasks that check a condition before acting (new PRs, website changes, API status), use the `script` parameter. The script runs first — if there's nothing to do, you don't wake up.
+For any recurring task, use `schedule_task`. Frequent agent invocations — especially multiple times a day — consume API credits and can risk account restrictions. If a simple check can determine whether action is needed, add a `script` — it runs first, and the agent is only called when the check passes. This keeps invocations to a minimum.
 
 ### How it works
 
