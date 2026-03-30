@@ -53,15 +53,16 @@ Clear the file completely, then write:
 ```
 # Daily Plan — {today's date}
 
-## Surfaced via Morning Briefing
-{numbered list matching the Decisions section — what you asked your principal to decide on}
-
 ## Today's Focus
-{title | STATUS | key detail — only items with something happening today: a deadline, expected reply, scheduled event, or new development. Keep it terse. This is a daily attention budget, not a mirror of list_matters. Empty on a quiet day is correct.}
+{title | STATUS | key detail}
 
 ## Handled Today
-(leave empty. sweep appends here)
+{- HH:MM: what you did and the outcome}
 ```
+
+**Today's Focus** — add only items with something happening today: a deadline, expected reply, scheduled event, or new development. Keep it terse — this is a daily attention budget, not a mirror of `list_matters`. Empty on a quiet day is correct.
+
+**Handled Today** — add one line per decision surfaced in the briefing. Sweeps append here throughout the day.
 
 ## Output
 

@@ -58,7 +58,7 @@ const SCOPES = [
   'https://www.googleapis.com/auth/contacts',
   // Directory (resolve workspace member emails for principal detection)
   'https://www.googleapis.com/auth/directory.readonly',
-  // Calendar (gcal-mcp + Workspace MCP calendar module)
+  // Calendar (google-calendar-mcp + Workspace MCP calendar module)
   'https://www.googleapis.com/auth/calendar',
   // Gmail (host-side polling + container-side Workspace MCP)
   'https://www.googleapis.com/auth/gmail.readonly',

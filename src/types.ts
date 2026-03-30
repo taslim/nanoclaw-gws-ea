@@ -30,7 +30,17 @@ export interface AllowedRoot {
 export interface ContainerConfig {
   additionalMounts?: AdditionalMount[];
   timeout?: number; // Default: 300000 (5 minutes)
-  allowedTools?: string[];
+  /** SDK `tools` field — restricts which built-in tools are available. Undefined = all. */
+  builtins?: string[];
+  /**
+   * Per-MCP-server tool configuration.
+   * - string[] = ENABLED_TOOLS (only these tools registered)
+   * - true = all tools on that server
+   * - absent = server not started
+   * Keys: 'calendar', 'workspace', '1password', 'spiral', 'blog'
+   * 'nanoclaw' and 'time' always start regardless.
+   */
+  mcpConfig?: Record<string, string[] | true>;
 }
 
 export interface RegisteredGroup {

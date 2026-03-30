@@ -44,65 +44,32 @@ export const EMAIL_PRINCIPAL_GROUP = {
   folder: 'email-principal',
   trigger: `@${ASSISTANT_NAME}`,
   requiresTrigger: false,
-  allowedTools: [
-    // Standard tools
-    'Bash',
-    'Read',
-    'Write',
-    'Edit',
-    'Glob',
-    'Grep',
-    'WebSearch',
-    'WebFetch',
-    'Task',
-    'TaskOutput',
-    'TaskStop',
-    'TeamCreate',
-    'TeamDelete',
-    'SendMessage',
-    'TodoWrite',
-    'ToolSearch',
-    'Skill',
-    'NotebookEdit',
-    // Gmail (via Workspace MCP)
-    'mcp__workspace__send_gmail_message',
-    'mcp__workspace__draft_gmail_message',
-    'mcp__workspace__search_gmail_messages',
-    'mcp__workspace__get_gmail_message_content',
-    'mcp__workspace__get_gmail_messages_content_batch',
-    'mcp__workspace__get_gmail_thread_content',
-    'mcp__workspace__get_gmail_attachment_content',
-    'mcp__workspace__modify_gmail_message_labels',
-    'mcp__workspace__list_gmail_labels',
-    // NanoClaw IPC — messaging, task management, matter context (read-only)
-    'mcp__nanoclaw__send_message',
-    'mcp__nanoclaw__schedule_task',
-    'mcp__nanoclaw__list_tasks',
-    'mcp__nanoclaw__list_matters',
-    'mcp__nanoclaw__get_matter',
-    'mcp__nanoclaw__find_matter',
-    // Calendar: availability, event listing, RSVP (gcal MCP) + CRUD (workspace MCP)
-    'mcp__gcal__*',
-    'mcp__workspace__manage_event',
-    'mcp__workspace__list_calendars',
-    // Time MCP — date math, timezone conversions
-    'mcp__time__*',
-    // Google Workspace — contacts (read + write), docs, sheets, drive (no Chat admin)
-    'mcp__workspace__contacts_search',
-    'mcp__workspace__contacts_get',
-    'mcp__workspace__manage_contact',
-    'mcp__workspace__drive_search_files',
-    'mcp__workspace__drive_read_file',
-    'mcp__workspace__drive_create_file',
-    'mcp__workspace__drive_update_file',
-    'mcp__workspace__drive_share_file',
-    'mcp__workspace__docs_create_document',
-    'mcp__workspace__docs_read_document',
-    'mcp__workspace__docs_update_document',
-    'mcp__workspace__sheets_create_spreadsheet',
-    'mcp__workspace__sheets_read_spreadsheet',
-    'mcp__workspace__sheets_update_spreadsheet',
-  ],
+  containerConfig: {
+    builtins: [
+      'Bash',
+      'Read',
+      'Write',
+      'Edit',
+      'Glob',
+      'Grep',
+      'WebSearch',
+      'WebFetch',
+      'Task',
+      'TaskOutput',
+      'TaskStop',
+      'ToolSearch',
+      'TeamCreate',
+      'TeamDelete',
+      'SendMessage',
+      'TodoWrite',
+      'Skill',
+      'NotebookEdit',
+    ],
+    mcpConfig: {
+      calendar: true as const,
+      workspace: ['gmail', 'contacts', 'drive', 'docs', 'sheets'],
+    },
+  },
 };
 
 export const EMAIL_EXTERNAL_GROUP = {
@@ -111,55 +78,27 @@ export const EMAIL_EXTERNAL_GROUP = {
   folder: 'email-external',
   trigger: `@${ASSISTANT_NAME}`,
   requiresTrigger: false,
-  allowedTools: [
-    // Standard tools
-    'Bash',
-    'Read',
-    'Write',
-    'Edit',
-    'Glob',
-    'Grep',
-    'WebSearch',
-    'WebFetch',
-    'Task',
-    'TaskOutput',
-    'TaskStop',
-    'TeamCreate',
-    'TeamDelete',
-    'SendMessage',
-    'TodoWrite',
-    'ToolSearch',
-    'Skill',
-    'NotebookEdit',
-    // Gmail (via Workspace MCP)
-    'mcp__workspace__send_gmail_message',
-    'mcp__workspace__draft_gmail_message',
-    'mcp__workspace__search_gmail_messages',
-    'mcp__workspace__get_gmail_message_content',
-    'mcp__workspace__get_gmail_messages_content_batch',
-    'mcp__workspace__get_gmail_thread_content',
-    'mcp__workspace__get_gmail_attachment_content',
-    'mcp__workspace__modify_gmail_message_labels',
-    'mcp__workspace__list_gmail_labels',
-    // Contacts (for tier-based gatekeeping)
-    'mcp__workspace__contacts_search',
-    'mcp__workspace__contacts_get',
-    // NanoClaw IPC — matter context (read-only)
-    'mcp__nanoclaw__send_message',
-    'mcp__nanoclaw__schedule_task',
-    'mcp__nanoclaw__list_tasks',
-    'mcp__nanoclaw__list_matters',
-    'mcp__nanoclaw__get_matter',
-    'mcp__nanoclaw__find_matter',
-    // Calendar: availability + RSVP (gcal MCP), CRUD + discovery (workspace MCP)
-    // Intentionally no list_events/get_events (prevents reading event details)
-    'mcp__gcal__get_availability',
-    'mcp__gcal__respond_to_event',
-    'mcp__workspace__manage_event',
-    'mcp__workspace__list_calendars',
-    // Time MCP — date math, timezone conversions
-    'mcp__time__*',
-  ],
+  containerConfig: {
+    builtins: [
+      'Bash',
+      'Read',
+      'Write',
+      'Edit',
+      'Glob',
+      'Grep',
+      'WebSearch',
+      'WebFetch',
+      'Task',
+      'TaskOutput',
+      'TaskStop',
+      'ToolSearch',
+    ],
+    mcpConfig: {
+      // Only availability + RSVP (no event details, no CRUD)
+      calendar: ['get-availability', 'respond-to-event'],
+      workspace: ['gmail', 'contacts'],
+    },
+  },
 };
 
 // --- Email types ---
@@ -211,7 +150,9 @@ export function startEmailLoop(
   }
 
   const keys = JSON.parse(fs.readFileSync(keysPath, 'utf-8'));
-  const creds = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
+  const credsFile = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
+  // google-calendar-mcp auto-migrates flat tokens to {normal: {...}} format
+  const creds = credsFile.normal || credsFile;
 
   const clientConfig = keys.installed || keys.web;
   const oauth2Client = new google.auth.OAuth2(
@@ -229,9 +170,10 @@ export function startEmailLoop(
   // Persist refreshed tokens back to disk
   oauth2Client.on('tokens', (tokens) => {
     const existing = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
-    if (tokens.access_token) existing.access_token = tokens.access_token;
-    if (tokens.refresh_token) existing.refresh_token = tokens.refresh_token;
-    if (tokens.expiry_date) existing.expiry_date = tokens.expiry_date;
+    const target = existing.normal || existing;
+    if (tokens.access_token) target.access_token = tokens.access_token;
+    if (tokens.refresh_token) target.refresh_token = tokens.refresh_token;
+    if (tokens.expiry_date) target.expiry_date = tokens.expiry_date;
     fs.writeFileSync(credsPath, JSON.stringify(existing, null, 2));
     logger.debug('Gmail OAuth tokens refreshed and saved');
   });

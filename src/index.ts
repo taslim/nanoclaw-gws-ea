@@ -84,7 +84,12 @@ import {
   shouldDropMessage,
 } from './sender-allowlist.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { Channel, NewMessage, RegisteredGroup } from './types.js';
+import {
+  Channel,
+  ContainerConfig,
+  NewMessage,
+  RegisteredGroup,
+} from './types.js';
 import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
@@ -504,7 +509,8 @@ async function runAgent(
         groupFolder: group.folder,
         chatJid,
         isMain,
-        allowedTools: group.containerConfig?.allowedTools,
+        builtinTools: group.containerConfig?.builtins,
+        mcpConfig: group.containerConfig?.mcpConfig,
         assistantName: ASSISTANT_NAME,
       },
       (proc, containerName) =>
@@ -684,7 +690,7 @@ function resolveChannel(jid: string): {
 
 /**
  * Register or sync a system group — one that must exist on every startup
- * with its tool allowlist kept in sync with code. Works for any channel type.
+ * with its container config kept in sync with code. Works for any channel type.
  */
 function ensureSystemGroup(cfg: {
   jid: string;
@@ -692,11 +698,11 @@ function ensureSystemGroup(cfg: {
   folder: string;
   trigger: string;
   requiresTrigger: boolean;
-  allowedTools: string[];
+  containerConfig?: ContainerConfig;
 }): void {
   const existing = registeredGroups[cfg.jid];
   if (existing) {
-    existing.containerConfig = { allowedTools: cfg.allowedTools };
+    existing.containerConfig = cfg.containerConfig;
     setRegisteredGroup(cfg.jid, existing);
   } else {
     registerGroup(cfg.jid, {
@@ -704,7 +710,7 @@ function ensureSystemGroup(cfg: {
       folder: cfg.folder,
       trigger: cfg.trigger,
       added_at: new Date().toISOString(),
-      containerConfig: { allowedTools: cfg.allowedTools },
+      containerConfig: cfg.containerConfig,
       requiresTrigger: cfg.requiresTrigger,
     });
     logger.info(
@@ -723,7 +729,7 @@ function ensureSystemGroup(cfg: {
 
 /**
  * Register system groups (email routing, heartbeat sweep).
- * Tool allowlists are synced from code on every restart.
+ * Container configs are synced from code on every restart.
  */
 function ensureSystemGroups(): void {
   ensureSystemGroup(EMAIL_PRINCIPAL_GROUP);

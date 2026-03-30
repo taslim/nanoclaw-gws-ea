@@ -20,7 +20,7 @@ Do these three things first, every time:
 
 For each item you find across all scan areas:
 
-0. **Already handled today?** Check "Handled Today" in the daily plan — if the item was fully resolved there, skip it. Items under "Surfaced via Morning Briefing" were already put in front of your principal — do not re-escalate.
+0. **Already handled today?** Check "Handled Today" in the daily plan — if the item was fully resolved there, skip it.
 1. **Can you resolve it right now?** → Do it. Most things fall here.
 2. **Does it need your principal's input urgently (today)?** → Escalate per the Decision Hierarchy. For email items, use the email-triage procedure's decision packet format.
 3. **Does it need your principal's input but can wait?** → Log it in the heartbeat under "Needs decision." The morning briefing will surface it.
@@ -126,7 +126,7 @@ Update `/workspace/group/daily-plan.md` to reflect what happened this sweep:
 
 - **Today's Focus** — add only items with something happening today: a deadline, expected reply, scheduled event, or new development. Not a mirror of `list_matters`.
 - **Prune as you go** — fully handled items move from "Today's focus" to "Handled Today." Items with nothing left today get removed (the matter still tracks them).
-- **Handled Today** — append one line per action: `- HH:MM: what you did and the outcome`.
+- **Handled Today** — append one line per item actioned: `- HH:MM: what you did and the outcome`. One entry per matter, email, or calendar action — not one summary per sweep.
 
 Do not rewrite or reorganize the file — update in place.
 
@@ -134,7 +134,7 @@ Do not rewrite or reorganize the file — update in place.
 
 Send via `mcp__workspace__chat_send_message` with your assistant email (`user_google_email` from profile.md) and `space_id` from profile.md (the heartbeat space).
 
-Only report what's *new or changed* — compare against the daily plan. If an item is already recorded there and nothing changed, don't post about it. Before posting, verify: Did you actually check all scan areas? Does the heartbeat accurately reflect what you did, not what you planned to do?
+Only report what's *new or changed* — for every item in every category, check "Handled Today" in the daily plan. If the item already appears there and no new input arrived since (a reply, a calendar update, a directive, or an action you took this sweep), omit it — the absence of a reply is not new input. Before posting, verify: Did you actually check all scan areas? Does the heartbeat accurately reflect what you did, not what you planned to do?
 
 **One topic, one line.** When an action spans multiple scan areas (declining an event + emailing alternatives, or a logistics item that needs a decision), report it once in the most relevant category. Combine the actions into a single line — do not repeat the same topic across categories.
 
@@ -170,4 +170,4 @@ For the last sweep of the day (after 9pm), additionally preview tomorrow: early 
 
 The Decision Hierarchy and Action Framework set the bar for when to escalate — don't add your own. Use `mcp__nanoclaw__send_message` to reach your principal when escalating.
 
-All communication happens exclusively through MCP tools. Wrap any response text in `<internal>` tags so it is never forwarded. For example: `<internal>No response needed</internal>`
+Your final response text must be completely empty — output nothing. All communication happens exclusively through MCP tools.

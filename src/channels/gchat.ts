@@ -52,7 +52,9 @@ export class GChatChannel implements Channel {
     const credsPath = path.join(homeDir, '.workspace-mcp', 'credentials.json');
 
     const keys = JSON.parse(fs.readFileSync(keysPath, 'utf-8'));
-    const creds = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
+    const credsFile = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
+    // google-calendar-mcp auto-migrates flat tokens to {normal: {...}} format
+    const creds = credsFile.normal || credsFile;
 
     const clientConfig = keys.installed || keys.web;
     this.oauth2Client = new google.auth.OAuth2(
@@ -70,9 +72,10 @@ export class GChatChannel implements Channel {
     // Persist refreshed tokens back to disk
     this.oauth2Client.on('tokens', (tokens) => {
       const existing = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
-      if (tokens.access_token) existing.access_token = tokens.access_token;
-      if (tokens.refresh_token) existing.refresh_token = tokens.refresh_token;
-      if (tokens.expiry_date) existing.expiry_date = tokens.expiry_date;
+      const target = existing.normal || existing;
+      if (tokens.access_token) target.access_token = tokens.access_token;
+      if (tokens.refresh_token) target.refresh_token = tokens.refresh_token;
+      if (tokens.expiry_date) target.expiry_date = tokens.expiry_date;
       fs.writeFileSync(credsPath, JSON.stringify(existing, null, 2));
       logger.debug('Workspace OAuth tokens refreshed and saved');
     });
