@@ -27,7 +27,8 @@ interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
-  allowedTools?: string[];
+  builtinTools?: string[];
+  mcpConfig?: Record<string, string[] | true>;
   assistantName?: string;
   script?: string;
 }
@@ -403,8 +404,7 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
-  // MCP servers: nanoclaw always runs; others start only if credentials are mounted.
-  // The SDK's allowedTools handles authorization — we only check availability here.
+  // MCP servers: nanoclaw + time always run. Others start based on mcpConfig + credentials.
   const mcpServers: Record<string, { command: string; args: string[]; env?: Record<string, string> }> = {
     nanoclaw: {
       command: 'node',
@@ -425,24 +425,31 @@ async function runQuery(
     };
   }
 
-  const gcalMcpPath = path.join(path.dirname(mcpServerPath), 'gcal-mcp.js');
-  if (fs.existsSync('/home/node/.workspace-mcp/credentials.json')) {
+  // MCP server gating: when mcpConfig is undefined (main group), all servers are available.
+  // When defined, only servers listed in mcpConfig start.
+  const mcp = containerInput.mcpConfig;
+  const unrestricted = !mcp;
+
+  // Calendar MCP (google-calendar-mcp fork)
+  const calendarConfig = unrestricted ? true : mcp?.calendar;
+  if (calendarConfig && fs.existsSync('/home/node/.workspace-mcp/credentials.json')) {
     const configFile = '/home/node/.workspace-mcp/calendars.json';
-    mcpServers.gcal = {
+    mcpServers.calendar = {
       command: 'node',
-      args: [gcalMcpPath],
+      args: ['/opt/google-calendar-mcp/build/index.js'],
       env: {
         GOOGLE_OAUTH_CREDENTIALS: '/home/node/.workspace-mcp/gcp-oauth.keys.json',
         GOOGLE_CALENDAR_MCP_TOKEN_PATH: '/home/node/.workspace-mcp/credentials.json',
-        ...(fs.existsSync(configFile) && { CALENDAR_CONFIG_PATH: configFile }),
+        ...(Array.isArray(calendarConfig) && { ENABLED_TOOLS: calendarConfig.join(',') }),
+        ...(fs.existsSync(configFile) && { EVENT_FILTER_CONFIG: configFile }),
       },
     };
   }
 
-  // 1Password MCP — conditional on mounted token file
+  // 1Password MCP — conditional on mcpConfig + mounted token file
   const opTokenPath = '/home/node/.1password-mcp/token';
   const opMcpPath = path.join(path.dirname(mcpServerPath), '1password-mcp.js');
-  if (fs.existsSync(opTokenPath) && fs.existsSync(opMcpPath)) {
+  if ((unrestricted || mcp?.['1password']) && fs.existsSync(opTokenPath) && fs.existsSync(opMcpPath)) {
     mcpServers['1password'] = {
       command: 'node',
       args: [opMcpPath],
@@ -452,37 +459,12 @@ async function runQuery(
     };
   }
 
-  if (fs.existsSync('/home/node/.workspace-mcp/credentials')) {
-    // Derive which workspace MCP modules to load from allowedTools.
-    // When allowedTools is unset (main group), load all modules.
-    const allModules = ['chat', 'drive', 'docs', 'sheets', 'contacts', 'gmail', 'calendar'];
-    let modules: string[];
-    if (!containerInput.allowedTools) {
-      // No tool restrictions — load all modules
-      modules = allModules;
-    } else {
-      // Map allowed workspace tool names to MCP modules via keyword matching
-      const moduleKeywords: Record<string, string[]> = {
-        chat: ['chat_'],
-        drive: ['drive_'],
-        docs: ['docs_'],
-        sheets: ['sheets_'],
-        contacts: ['contact'],
-        gmail: ['gmail'],
-        calendar: ['calendar', 'event', 'freebusy'],
-      };
-      const matched = new Set<string>();
-      for (const tool of containerInput.allowedTools) {
-        if (!tool.startsWith('mcp__workspace__')) continue;
-        const suffix = tool.replace('mcp__workspace__', '');
-        for (const [mod, keywords] of Object.entries(moduleKeywords)) {
-          if (keywords.some((kw) => suffix.includes(kw))) {
-            matched.add(mod);
-          }
-        }
-      }
-      modules = [...matched];
-    }
+  // Workspace MCP — modules come directly from mcpConfig (no keyword matching)
+  const workspaceModules = unrestricted ? true : mcp?.workspace;
+  if (workspaceModules && fs.existsSync('/home/node/.workspace-mcp/credentials')) {
+    const modules = workspaceModules === true
+      ? ['chat', 'drive', 'docs', 'sheets', 'contacts', 'gmail', 'calendar']
+      : workspaceModules;
 
     if (modules.length > 0) {
       mcpServers.workspace = {
@@ -513,17 +495,7 @@ async function runQuery(
         if (parts.length === 0) return undefined;
         return { type: 'preset' as const, preset: 'claude_code' as const, append: parts.join('\n\n---\n\n') };
       })(),
-      allowedTools: containerInput.allowedTools || [
-        'Bash',
-        'Read', 'Write', 'Edit', 'Glob', 'Grep',
-        'WebSearch', 'WebFetch',
-        'Task', 'TaskOutput', 'TaskStop',
-        'TeamCreate', 'TeamDelete', 'SendMessage',
-        'TodoWrite', 'ToolSearch', 'Skill',
-        'NotebookEdit',
-        'mcp__nanoclaw__*',
-        ...Object.keys(mcpServers).filter(k => k !== 'nanoclaw').map(k => `mcp__${k}__*`),
-      ],
+      tools: containerInput.builtinTools || { type: 'preset' as const, preset: 'claude_code' as const },
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,

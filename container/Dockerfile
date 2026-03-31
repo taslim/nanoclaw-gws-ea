@@ -34,6 +34,10 @@ ENV PATH="/root/.local/bin:$PATH"
 RUN git clone --depth 1 https://github.com/taylorwilsdon/google_workspace_mcp.git /opt/google_workspace_mcp \
     && cd /opt/google_workspace_mcp && uv sync
 
+# Install google-calendar-mcp fork (event filters + ENABLED_TOOLS gating)
+RUN git clone --depth 1 https://github.com/taslim/google-calendar-mcp.git /opt/google-calendar-mcp \
+    && cd /opt/google-calendar-mcp && npm install && npm run build
+
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium

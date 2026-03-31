@@ -44,7 +44,8 @@ export interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
-  allowedTools?: string[];
+  builtinTools?: string[];
+  mcpConfig?: Record<string, string[] | true>;
   assistantName?: string;
   script?: string;
 }
@@ -63,13 +64,13 @@ interface VolumeMount {
 }
 
 /**
- * Check if a group's effective tool list includes any tools with the given prefix.
- * When allowedTools is unset, all tools are available (returns true).
+ * Check if a group's mcpConfig includes a given MCP server.
+ * When mcpConfig is unset, all servers are available (returns true).
  */
-function groupHasToolPrefix(group: RegisteredGroup, prefix: string): boolean {
-  const tools = group.containerConfig?.allowedTools;
-  if (!tools) return true; // No restrictions = all tools available
-  return tools.some((t) => t === `${prefix}*` || t.startsWith(prefix));
+function groupHasMcpServer(group: RegisteredGroup, server: string): boolean {
+  const mcp = group.containerConfig?.mcpConfig;
+  if (!mcp) return true; // No restrictions = all servers available
+  return server in mcp;
 }
 
 function buildVolumeMounts(
@@ -161,10 +162,10 @@ function buildVolumeMounts(
     }
   }
 
-  // Google Workspace credentials directory (workspace MCP + gcal-mcp both read from here)
+  // Google Workspace credentials directory (workspace MCP + calendar MCP both read from here)
   if (
-    groupHasToolPrefix(group, 'mcp__workspace__') ||
-    groupHasToolPrefix(group, 'mcp__gcal__')
+    groupHasMcpServer(group, 'workspace') ||
+    groupHasMcpServer(group, 'calendar')
   ) {
     const workspaceDir = path.join(homeDir, '.workspace-mcp');
     if (fs.existsSync(workspaceDir)) {
@@ -177,7 +178,7 @@ function buildVolumeMounts(
   }
 
   // 1Password MCP token (only mount if group has 1password tools)
-  if (groupHasToolPrefix(group, 'mcp__1password__')) {
+  if (groupHasMcpServer(group, '1password')) {
     const opDir = path.join(homeDir, '.1password-mcp');
     if (fs.existsSync(opDir)) {
       mounts.push({
