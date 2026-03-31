@@ -48,6 +48,11 @@ export interface ContainerInput {
   mcpConfig?: Record<string, string[] | true>;
   assistantName?: string;
   script?: string;
+  attachments?: Array<{
+    path: string; // Container-relative: attachments/{uuid}-{filename}
+    mimeType: string;
+    mode: 'inline' | 'file';
+  }>;
 }
 
 export interface ContainerOutput {
@@ -858,7 +863,7 @@ export function writeRecentEmailsSnapshot(
  */
 export function pruneOldSessions(
   groupFolders: string[],
-  maxAgeDays: number = 7,
+  maxAgeDays: number,
 ): void {
   const maxAgeMs = maxAgeDays * 24 * 60 * 60 * 1000;
   const now = Date.now();

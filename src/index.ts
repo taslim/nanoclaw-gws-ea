@@ -5,7 +5,10 @@ import { OneCLI } from '@onecli-sh/sdk';
 
 import {
   ASSISTANT_NAME,
+  ATTACHMENT_MAX_PER_MESSAGE,
+  ATTACHMENT_PRUNE_DAYS,
   DEFAULT_TRIGGER,
+  SESSION_PRUNE_DAYS,
   EMAIL_EXTERNAL_DELAY,
   getTriggerPattern,
   GROUPS_DIR,
@@ -51,6 +54,7 @@ import {
   getAllRegisteredGroups,
   getAllMatters,
   getAllSessions,
+  deleteSession,
   getAllTasks,
   getEmailRoute,
   getRecentEmailThreads,
@@ -85,12 +89,21 @@ import {
 } from './sender-allowlist.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import {
+  Attachment,
   Channel,
   ContainerConfig,
   NewMessage,
   RegisteredGroup,
 } from './types.js';
+import {
+  DownloadResult,
+  downloadAndSave,
+  isFailedAttachment,
+  pruneAttachments,
+  SavedAttachment,
+} from './attachments.js';
 import { logger } from './logger.js';
+import { transcribe } from './transcription.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -354,6 +367,72 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     setIndicator(channel, msg, chatJid);
   }
 
+  // --- Process attachments ---
+  const savedAttachments: SavedAttachment[] = [];
+
+  if (group.allowAttachments) {
+    const authHeaders = (await channel.getAuthHeaders?.()) ?? {};
+
+    // Download all attachments in parallel (across all messages)
+    const downloadJobs: Array<{
+      msg: NewMessage;
+      att: Attachment;
+      resultPromise: Promise<DownloadResult>;
+    }> = [];
+
+    for (const msg of missedMessages) {
+      if (!msg.attachments?.length) continue;
+      for (const att of msg.attachments.slice(0, ATTACHMENT_MAX_PER_MESSAGE)) {
+        downloadJobs.push({
+          msg,
+          att,
+          resultPromise: downloadAndSave(att, group.folder, authHeaders),
+        });
+      }
+    }
+
+    const results = await Promise.all(downloadJobs.map((j) => j.resultPromise));
+
+    for (let i = 0; i < downloadJobs.length; i++) {
+      const { msg, att } = downloadJobs[i];
+      const result = results[i];
+
+      if (isFailedAttachment(result)) {
+        msg.content += `\n[Attachment failed: ${att.filename} — ${result.error}]`;
+      } else if (result.mimeType.startsWith('audio/')) {
+        const diskPath = path.join(
+          resolveGroupFolderPath(group.folder),
+          result.path,
+        );
+        const transcript = await transcribe(diskPath);
+        if (transcript) {
+          msg.content += `\n[Audio transcript: ${transcript}]`;
+        } else {
+          msg.content += `\n[Audio transcription unavailable: ${att.filename}]`;
+        }
+      } else {
+        savedAttachments.push(result);
+        if (result.mode === 'inline') {
+          msg.content += `\n[Attached: ${att.filename}]`;
+        } else {
+          msg.content += `\n[File: ${att.filename} at /workspace/group/${result.path}]`;
+        }
+      }
+
+      // Strip image URL from text if it was extracted from text
+      if (att.extractedFromText) {
+        msg.content = msg.content.replace(att.extractedFromText, '').trim();
+      }
+    }
+  } else {
+    // If attachments disabled but message is attachment-only, note it
+    for (const msg of missedMessages) {
+      if (msg.attachments?.length && !msg.content.trim()) {
+        msg.content = '[Attachment(s) sent but not enabled for this group]';
+      }
+    }
+  }
+
   const prompt = formatMessages(missedMessages, TIMEZONE);
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
@@ -386,34 +465,40 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let outputSentToUser = false;
 
   try {
-    const output = await runAgent(group, prompt, chatJid, async (result) => {
-      if (result.result) {
-        const raw =
-          typeof result.result === 'string'
-            ? result.result
-            : JSON.stringify(result.result);
-        logger.info(
-          { group: group.name },
-          `Agent output: ${raw.slice(0, 200)}`,
-        );
-        const text = formatOutbound(raw);
-        if (text) {
-          await channel.sendMessage(chatJid, text);
-          clearIndicators(chatJid);
-          outputSentToUser = true;
+    const output = await runAgent(
+      group,
+      prompt,
+      chatJid,
+      async (result) => {
+        if (result.result) {
+          const raw =
+            typeof result.result === 'string'
+              ? result.result
+              : JSON.stringify(result.result);
+          logger.info(
+            { group: group.name },
+            `Agent output: ${raw.slice(0, 200)}`,
+          );
+          const text = formatOutbound(raw);
+          if (text) {
+            await channel.sendMessage(chatJid, text);
+            clearIndicators(chatJid);
+            outputSentToUser = true;
+          }
+          // Only reset idle timer on actual results, not session-update markers (result: null)
+          resetIdleTimer();
         }
-        // Only reset idle timer on actual results, not session-update markers (result: null)
-        resetIdleTimer();
-      }
 
-      if (result.status === 'success') {
-        queue.notifyIdle(chatJid);
-      }
+        if (result.status === 'success') {
+          queue.notifyIdle(chatJid);
+        }
 
-      if (result.status === 'error') {
-        hadError = true;
-      }
-    });
+        if (result.status === 'error') {
+          hadError = true;
+        }
+      },
+      { attachments: savedAttachments },
+    );
 
     if (idleTimer) clearTimeout(idleTimer);
 
@@ -449,7 +534,7 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
-  options?: { freshSession?: boolean },
+  options?: { freshSession?: boolean; attachments?: SavedAttachment[] },
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
   const sessionId = options?.freshSession ? undefined : sessions[group.folder];
@@ -512,6 +597,9 @@ async function runAgent(
         builtinTools: group.containerConfig?.builtins,
         mcpConfig: group.containerConfig?.mcpConfig,
         assistantName: ASSISTANT_NAME,
+        ...(options?.attachments?.length && {
+          attachments: options.attachments,
+        }),
       },
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
@@ -524,6 +612,26 @@ async function runAgent(
     }
 
     if (output.status === 'error') {
+      // Detect stale/corrupt session — clear it so the next retry starts fresh.
+      // The session .jsonl can go missing after a crash mid-write, manual
+      // deletion, or disk-full. The existing backoff in group-queue.ts
+      // handles the retry; we just need to remove the broken session ID.
+      const isStaleSession =
+        sessionId &&
+        output.error &&
+        /no conversation found|ENOENT.*\.jsonl|session.*not found/i.test(
+          output.error,
+        );
+
+      if (isStaleSession) {
+        logger.warn(
+          { group: group.name, staleSessionId: sessionId, error: output.error },
+          'Stale session detected — clearing for next retry',
+        );
+        delete sessions[group.folder];
+        deleteSession(group.folder);
+      }
+
       logger.error(
         { group: group.name, error: output.error },
         'Container agent error',
@@ -612,6 +720,48 @@ async function startMessageLoop(): Promise<void> {
           );
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
+
+          // Process attachments for piped messages (saves to disk + annotates content)
+          if (group.allowAttachments) {
+            const authHeaders = (await channel.getAuthHeaders?.()) ?? {};
+            for (const msg of messagesToSend) {
+              if (!msg.attachments?.length) continue;
+              for (const att of msg.attachments.slice(
+                0,
+                ATTACHMENT_MAX_PER_MESSAGE,
+              )) {
+                const result = await downloadAndSave(
+                  att,
+                  group.folder,
+                  authHeaders,
+                );
+                if (isFailedAttachment(result)) {
+                  msg.content += `\n[Attachment failed: ${att.filename} — ${result.error}]`;
+                } else if (result.mimeType.startsWith('audio/')) {
+                  const diskPath = path.join(
+                    resolveGroupFolderPath(group.folder),
+                    result.path,
+                  );
+                  const transcript = await transcribe(diskPath);
+                  if (transcript) {
+                    msg.content += `\n[Audio transcript: ${transcript}]`;
+                  } else {
+                    msg.content += `\n[Audio transcription unavailable: ${att.filename}]`;
+                  }
+                } else if (result.mode === 'inline') {
+                  msg.content += `\n[Attached: ${att.filename} at /workspace/group/${result.path}]`;
+                } else {
+                  msg.content += `\n[File: ${att.filename} at /workspace/group/${result.path}]`;
+                }
+                if (att.extractedFromText) {
+                  msg.content = msg.content
+                    .replace(att.extractedFromText, '')
+                    .trim();
+                }
+              }
+            }
+          }
+
           const formatted = formatMessages(messagesToSend, TIMEZONE);
 
           if (queue.sendMessage(chatJid, formatted)) {
@@ -752,11 +902,23 @@ async function main(): Promise<void> {
   ensureSystemGroups();
 
   // Prune orphaned session files from fresh-session groups (email, heartbeat)
-  pruneOldSessions([
-    EMAIL_PRINCIPAL_GROUP.folder,
-    EMAIL_EXTERNAL_GROUP.folder,
-    HEARTBEAT_GROUP.folder,
-  ]);
+  pruneOldSessions(
+    [
+      EMAIL_PRINCIPAL_GROUP.folder,
+      EMAIL_EXTERNAL_GROUP.folder,
+      HEARTBEAT_GROUP.folder,
+    ],
+    SESSION_PRUNE_DAYS,
+  );
+
+  // Prune old attachments (14-day retention) on startup and daily
+  const allGroupFolders = () =>
+    Object.values(registeredGroups).map((g) => g.folder);
+  pruneAttachments(allGroupFolders(), ATTACHMENT_PRUNE_DAYS);
+  setInterval(
+    () => pruneAttachments(allGroupFolders(), ATTACHMENT_PRUNE_DAYS),
+    24 * 60 * 60 * 1000,
+  );
 
   // Ensure OneCLI agents exist for all registered groups.
   // Recovers from missed creates (e.g. OneCLI was down at registration time).
