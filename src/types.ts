@@ -27,6 +27,13 @@ export interface AllowedRoot {
   description?: string;
 }
 
+export interface Attachment {
+  url: string; // Download URL (channel-specific)
+  filename: string; // Original filename or fallback
+  mimeType: string; // Channel-reported (validated later via magic bytes)
+  extractedFromText?: string; // If extracted from image URL in text, the URL to strip
+}
+
 export interface ContainerConfig {
   additionalMounts?: AdditionalMount[];
   timeout?: number; // Default: 300000 (5 minutes)
@@ -51,6 +58,7 @@ export interface RegisteredGroup {
   containerConfig?: ContainerConfig;
   requiresTrigger?: boolean; // Default: true for groups, false for solo chats
   isMain?: boolean; // True for the main control group (no trigger, elevated privileges)
+  allowAttachments?: boolean; // Default: false. Enable to download and process file attachments.
 }
 
 export interface NewMessage {
@@ -62,6 +70,7 @@ export interface NewMessage {
   timestamp: string;
   is_from_me?: boolean;
   is_bot_message?: boolean;
+  attachments?: Attachment[];
 }
 
 export interface ScheduledTask {
@@ -143,6 +152,8 @@ export interface Channel {
   ): Promise<void>;
   // Optional: react to the latest message in a chat.
   reactToLatestMessage?(chatJid: string, emoji: string): Promise<void>;
+  // Optional: auth headers for downloading attachments from this channel's CDN.
+  getAuthHeaders?(): Promise<Record<string, string>>;
 }
 
 // Callback type that channels use to deliver inbound messages

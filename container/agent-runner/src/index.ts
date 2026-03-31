@@ -31,6 +31,11 @@ interface ContainerInput {
   mcpConfig?: Record<string, string[] | true>;
   assistantName?: string;
   script?: string;
+  attachments?: Array<{
+    path: string; // Container-relative: attachments/{uuid}-{filename}
+    mimeType: string;
+    mode: 'inline' | 'file';
+  }>;
 }
 
 interface ContainerOutput {
@@ -51,9 +56,14 @@ interface SessionsIndex {
   entries: SessionEntry[];
 }
 
+type ContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
+  | { type: 'document'; source: { type: 'base64'; media_type: string; data: string }; title?: string };
+
 interface SDKUserMessage {
   type: 'user';
-  message: { role: 'user'; content: string };
+  message: { role: 'user'; content: string | ContentBlock[] };
   parent_tool_use_id: null;
   session_id: string;
 }
@@ -75,6 +85,16 @@ class MessageStream {
     this.queue.push({
       type: 'user',
       message: { role: 'user', content: text },
+      parent_tool_use_id: null,
+      session_id: '',
+    });
+    this.waiting?.();
+  }
+
+  pushMultimodal(content: ContentBlock[]): void {
+    this.queue.push({
+      type: 'user',
+      message: { role: 'user', content },
       parent_tool_use_id: null,
       session_id: '',
     });
@@ -342,7 +362,43 @@ async function runQuery(
   resumeAt?: string,
 ): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
   const stream = new MessageStream();
-  stream.push(prompt);
+
+  // Build initial message: multimodal if Tier 1 attachments exist, text-only otherwise
+  const inlineAttachments = containerInput.attachments?.filter((a) => a.mode === 'inline') ?? [];
+  if (inlineAttachments.length === 0) {
+    stream.push(prompt);
+  } else {
+    const blocks: ContentBlock[] = [{ type: 'text', text: prompt }];
+    for (const att of inlineAttachments) {
+      try {
+        const data = fs
+          .readFileSync(`/workspace/group/${att.path}`)
+          .toString('base64');
+        const isImage = att.mimeType.startsWith('image/');
+        if (isImage) {
+          blocks.push({
+            type: 'image',
+            source: { type: 'base64', media_type: att.mimeType, data },
+          });
+        } else {
+          blocks.push({
+            type: 'document',
+            source: { type: 'base64', media_type: att.mimeType, data },
+            title: att.path.split('/').pop(),
+          });
+        }
+      } catch (err) {
+        log(
+          `Failed to read attachment ${att.path}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        blocks.push({
+          type: 'text',
+          text: `[Failed to read attachment: ${att.path}]`,
+        });
+      }
+    }
+    stream.pushMultimodal(blocks);
+  }
 
   // Poll IPC for follow-up messages and _close sentinel during the query
   let ipcPolling = true;

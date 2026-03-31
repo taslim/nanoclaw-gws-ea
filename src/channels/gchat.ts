@@ -21,7 +21,7 @@ import {
 } from '../config.js';
 import { getLatestMessage, storeReaction } from '../db.js';
 import { logger } from '../logger.js';
-import { Channel } from '../types.js';
+import { Attachment, Channel } from '../types.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 
 export class GChatChannel implements Channel {
@@ -163,6 +163,12 @@ export class GChatChannel implements Channel {
     }
     this.chat = null;
     logger.info('Google Chat channel stopped');
+  }
+
+  async getAuthHeaders(): Promise<Record<string, string>> {
+    if (!this.oauth2Client) return {};
+    const { token } = await this.oauth2Client.getAccessToken();
+    return token ? { Authorization: `Bearer ${token}` } : {};
   }
 
   async setTyping(_jid: string, _isTyping: boolean): Promise<void> {
@@ -318,7 +324,17 @@ export class GChatChannel implements Channel {
           const memberEmails = await this.resolveSpaceMemberEmails(space.name);
 
           for (const msg of messages) {
-            if (!msg.name || !msg.text) continue;
+            if (!msg.name) continue;
+            const msgAttachments = (
+              msg as chat_v1.Schema$Message & {
+                attachment?: Array<
+                  chat_v1.Schema$Attachment & {
+                    attachmentDataRef?: { resourceName?: string };
+                  }
+                >;
+              }
+            ).attachment;
+            if (!msg.text && !msgAttachments?.length) continue;
 
             const senderUserId = msg.sender?.name || '';
             const senderDisplayName = msg.sender?.displayName || 'Unknown';
@@ -372,10 +388,40 @@ export class GChatChannel implements Channel {
               quotePrefix = `[Reply to ${sender}: "${quotedMeta.text}"] `;
             }
 
+            // --- Extract attachments ---
+            const attachments: Attachment[] = [];
+
+            // From Google Chat API attachment objects
+            for (const att of (msgAttachments || []).slice(0, 5)) {
+              const resourceName = att.attachmentDataRef?.resourceName;
+              if (resourceName) {
+                attachments.push({
+                  url: `https://chat.googleapis.com/v1/media/${resourceName}?alt=media`,
+                  filename: att.contentName || 'attachment',
+                  mimeType: att.contentType || 'application/octet-stream',
+                });
+              }
+            }
+
+            // From image URLs embedded in text (Google CDN)
+            const text = msg.text || '';
+            if (text.includes('googleusercontent.com')) {
+              const imageUrlPattern =
+                /https:\/\/lh[0-9]*\.googleusercontent\.com\/[^\s)]+/g;
+              for (const match of text.matchAll(imageUrlPattern)) {
+                attachments.push({
+                  url: match[0],
+                  filename: 'image.jpg',
+                  mimeType: 'image/jpeg',
+                  extractedFromText: match[0],
+                });
+              }
+            }
+
             const content = [
               isThreadReply ? `[thread:${threadKey}]` : '',
               quotePrefix,
-              msg.text,
+              msg.text || '',
             ]
               .filter(Boolean)
               .join(' ');
@@ -395,6 +441,7 @@ export class GChatChannel implements Channel {
               content,
               timestamp,
               is_from_me: false,
+              ...(attachments.length > 0 && { attachments }),
             });
 
             logger.info(
