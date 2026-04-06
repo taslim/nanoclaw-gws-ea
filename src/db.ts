@@ -5,6 +5,7 @@ import path from 'path';
 import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
+import type { PeerEAStatus } from './peer-ea.js';
 import {
   Attachment,
   Matter,
@@ -113,6 +114,17 @@ function createSchema(database: Database.Database): void {
       group_folder TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS peer_eas (
+      email TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      principal TEXT NOT NULL,
+      relationship TEXT,
+      space_id TEXT,
+      status TEXT NOT NULL DEFAULT 'outbound-pending',
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_peer_eas_status ON peer_eas(status);
 
     CREATE TABLE IF NOT EXISTS matters (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -232,6 +244,17 @@ function createSchema(database: Database.Database): void {
     );
   } catch {
     /* column already exists */
+  }
+
+  // Add reply context columns if they don't exist (migration for existing DBs)
+  try {
+    database.exec(`ALTER TABLE messages ADD COLUMN reply_to_message_id TEXT`);
+    database.exec(
+      `ALTER TABLE messages ADD COLUMN reply_to_message_content TEXT`,
+    );
+    database.exec(`ALTER TABLE messages ADD COLUMN reply_to_sender_name TEXT`);
+  } catch {
+    /* columns already exist */
   }
 }
 
@@ -361,7 +384,7 @@ export function setLastGroupSync(): void {
  */
 export function storeMessage(msg: NewMessage): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, attachments) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, attachments, reply_to_message_id, reply_to_message_content, reply_to_sender_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -372,6 +395,9 @@ export function storeMessage(msg: NewMessage): void {
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
     msg.attachments ? JSON.stringify(msg.attachments) : null,
+    msg.reply_to_message_id ?? null,
+    msg.reply_to_message_content ?? null,
+    msg.reply_to_sender_name ?? null,
   );
 }
 
@@ -427,7 +453,8 @@ export function getNewMessages(
   // Subquery takes the N most recent, outer query re-sorts chronologically.
   const sql = `
     SELECT * FROM (
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, attachments
+      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, attachments,
+             reply_to_message_id, reply_to_message_content, reply_to_sender_name
       FROM messages
       WHERE timestamp > ? AND chat_jid IN (${placeholders})
         AND is_bot_message = 0 AND content NOT LIKE ?
@@ -461,7 +488,8 @@ export function getMessagesSince(
   // Subquery takes the N most recent, outer query re-sorts chronologically.
   const sql = `
     SELECT * FROM (
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, attachments
+      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, attachments,
+             reply_to_message_id, reply_to_message_content, reply_to_sender_name
       FROM messages
       WHERE chat_jid = ? AND timestamp > ?
         AND is_bot_message = 0 AND content NOT LIKE ?
@@ -741,6 +769,10 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   );
 }
 
+export function deleteRegisteredGroup(jid: string): void {
+  db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
+}
+
 export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
   const rows = db.prepare('SELECT * FROM registered_groups').all() as Array<{
     jid: string;
@@ -814,31 +846,6 @@ export function updateEmailStatus(
   db.prepare(
     'UPDATE email_messages SET status = ?, updated_at = ? WHERE message_id = ?',
   ).run(status, now, messageId);
-}
-
-/** Get recent email threads (one row per thread, most recent message wins). */
-export function getRecentEmailThreads(since: string): Array<{
-  thread_id: string;
-  sender: string;
-  subject: string | null;
-  updated_at: string;
-}> {
-  return db
-    .prepare(
-      `SELECT thread_id, sender, subject, updated_at FROM (
-         SELECT thread_id, sender, subject, updated_at,
-           ROW_NUMBER() OVER (PARTITION BY thread_id ORDER BY updated_at DESC) AS rn
-         FROM email_messages
-         WHERE updated_at > ? AND status IN ('processed', 'queued')
-       ) WHERE rn = 1
-       ORDER BY updated_at DESC`,
-    )
-    .all(since) as Array<{
-    thread_id: string;
-    sender: string;
-    subject: string | null;
-    updated_at: string;
-  }>;
 }
 
 /** Get message IDs of failed emails (for retry). */
@@ -969,6 +976,84 @@ export function getAllMatters(): Matter[] {
 export function deleteMatter(id: number): boolean {
   const result = db.prepare('DELETE FROM matters WHERE id = ?').run(id);
   return result.changes > 0;
+}
+
+// --- Peer EAs ---
+
+export interface PeerEA {
+  email: string;
+  name: string;
+  principal: string;
+  relationship: string | null;
+  space_id: string | null;
+  status: PeerEAStatus;
+  created_at: string;
+}
+
+export function insertPeerEA(peer: {
+  email: string;
+  name: string;
+  principal: string;
+  relationship?: string;
+  spaceId?: string;
+  status: PeerEAStatus;
+}): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO peer_eas (email, name, principal, relationship, space_id, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    peer.email.toLowerCase(),
+    peer.name,
+    peer.principal,
+    peer.relationship || null,
+    peer.spaceId || null,
+    peer.status,
+    new Date().toISOString(),
+  );
+}
+
+export function updatePeerEAStatus(
+  email: string,
+  status: PeerEAStatus,
+  spaceId?: string,
+): void {
+  if (spaceId) {
+    db.prepare(
+      'UPDATE peer_eas SET status = ?, space_id = ? WHERE email = ?',
+    ).run(status, spaceId, email.toLowerCase());
+  } else {
+    db.prepare('UPDATE peer_eas SET status = ? WHERE email = ?').run(
+      status,
+      email.toLowerCase(),
+    );
+  }
+}
+
+export function getPeerEA(email: string): PeerEA | undefined {
+  return db
+    .prepare('SELECT * FROM peer_eas WHERE email = ?')
+    .get(email.toLowerCase()) as PeerEA | undefined;
+}
+
+export function getPendingPeerRequests(): PeerEA[] {
+  return db
+    .prepare(
+      "SELECT * FROM peer_eas WHERE status IN ('inbound-pending', 'outbound-pending') ORDER BY created_at DESC",
+    )
+    .all() as PeerEA[];
+}
+
+export function getApprovedPeers(): PeerEA[] {
+  return db
+    .prepare("SELECT * FROM peer_eas WHERE status = 'approved' ORDER BY name")
+    .all() as PeerEA[];
+}
+
+export function isBlockedPeer(email: string): boolean {
+  const row = db
+    .prepare('SELECT status FROM peer_eas WHERE email = ?')
+    .get(email.toLowerCase()) as { status: string } | undefined;
+  return row?.status === 'blocked';
 }
 
 // --- Reactions ---

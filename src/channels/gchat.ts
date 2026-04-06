@@ -15,6 +15,8 @@ import path from 'path';
 import { google, chat_v1 } from 'googleapis';
 
 import {
+  ASSISTANT_NAME,
+  DEFAULT_TRIGGER,
   GCHAT_POLL_INTERVAL,
   PRINCIPAL_NAME,
   isPrincipalEmail,
@@ -23,6 +25,8 @@ import { getLatestMessage, storeReaction } from '../db.js';
 import { logger } from '../logger.js';
 import { Attachment, Channel } from '../types.js';
 import { registerChannel, ChannelOpts } from './registry.js';
+
+const assistantNameLower = ASSISTANT_NAME.toLowerCase();
 
 export class GChatChannel implements Channel {
   name = 'gchat';
@@ -146,6 +150,54 @@ export class GChatChannel implements Channel {
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Google Chat message');
     }
+  }
+
+  /**
+   * Create a DM space with a user via spaces.setup() and optionally send
+   * the first message. Returns the space ID. If a DM already exists,
+   * returns the existing one.
+   * Same-org only — spaces.setup() cannot add external users.
+   */
+  async createDM(email: string, firstMessage?: string): Promise<string> {
+    if (!this.chat) {
+      throw new Error('Google Chat not connected');
+    }
+
+    const response = await this.chat.spaces.setup({
+      requestBody: {
+        space: {
+          spaceType: 'DIRECT_MESSAGE',
+          singleUserBotDm: false,
+        },
+        memberships: [
+          {
+            member: {
+              name: `users/${email}`,
+              type: 'HUMAN',
+            },
+          },
+        ],
+      },
+    });
+
+    const spaceName = response.data.name;
+    if (!spaceName) {
+      throw new Error('spaces.setup() returned no space name');
+    }
+
+    const spaceId = spaceName.replace('spaces/', '');
+    logger.info({ email, spaceId }, 'Created/found DM space');
+
+    // Send the first message immediately using the same auth context
+    if (firstMessage) {
+      await this.chat.spaces.messages.create({
+        parent: `spaces/${spaceId}`,
+        requestBody: { text: firstMessage },
+      });
+      logger.info({ spaceId }, 'First message sent in DM space');
+    }
+
+    return spaceId;
   }
 
   isConnected(): boolean {
@@ -388,6 +440,29 @@ export class GChatChannel implements Channel {
               quotePrefix = `[Reply to ${sender}: "${quotedMeta.text}"] `;
             }
 
+            // Implicit trigger: quote-replying to the EA or @mentioning it
+            // bypasses requiresTrigger so users don't need the trigger word.
+            // Skip if the message already contains the explicit trigger.
+            let implicitTrigger = false;
+            const msgText = msg.text || '';
+            if (!msgText.toLowerCase().includes(assistantNameLower)) {
+              if (quotedMeta?.sender) {
+                const senderFirst = quotedMeta.sender.trim().split(/\s/)[0];
+                implicitTrigger =
+                  senderFirst.toLowerCase() === assistantNameLower ||
+                  quotedMeta.sender.trim().toLowerCase() === assistantNameLower;
+              }
+              if (
+                !implicitTrigger &&
+                this.selfUserId &&
+                msg.annotations?.some(
+                  (a) => a.userMention?.user?.name === this.selfUserId,
+                )
+              ) {
+                implicitTrigger = true;
+              }
+            }
+
             // --- Extract attachments ---
             const attachments: Attachment[] = [];
 
@@ -420,6 +495,7 @@ export class GChatChannel implements Channel {
 
             const content = [
               isThreadReply ? `[thread:${threadKey}]` : '',
+              implicitTrigger ? DEFAULT_TRIGGER : '',
               quotePrefix,
               msg.text || '',
             ]
@@ -503,6 +579,7 @@ export class GChatChannel implements Channel {
             sources: [
               'READ_SOURCE_TYPE_PROFILE',
               'READ_SOURCE_TYPE_DOMAIN_CONTACT',
+              'READ_SOURCE_TYPE_CONTACT',
             ],
           });
           const email = person.data.emailAddresses?.find(

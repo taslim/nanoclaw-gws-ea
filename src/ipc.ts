@@ -11,9 +11,18 @@ import {
   deleteMatter,
   deleteTask,
   getTaskById,
+  getPeerEA,
+  insertPeerEA,
+  isBlockedPeer,
   updateMatter,
+  updatePeerEAStatus,
   updateTask,
 } from './db.js';
+import {
+  buildPeerProtocolMessage,
+  peerFolderFromEmail,
+  pipeToAgent,
+} from './peer-ea.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { MATTER_STATUSES, RegisteredGroup } from './types.js';
@@ -36,6 +45,16 @@ export interface IpcDeps {
     registeredJids: Set<string>,
   ) => void;
   onTasksChanged: () => void;
+  // Peer EA operations
+  createDM?: (email: string, firstMessage?: string) => Promise<string>;
+  registerPeerGroup?: (
+    jid: string,
+    folder: string,
+    name: string,
+    principal: string,
+    relationship: string | undefined,
+  ) => void;
+  unregisterGroup?: (jid: string) => void;
 }
 
 let ipcWatcherRunning = false;
@@ -87,21 +106,54 @@ export function startIpcWatcher(deps: IpcDeps): void {
             const filePath = path.join(messagesDir, file);
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              if (data.type === 'message' && data.chatJid && data.text) {
+              if (data.type === 'message' && data.text) {
+                // Resolve relay_to_main: peer groups can relay to main
+                let targetJid = data.chatJid;
+                if (data.relayToMain && sourceGroup.startsWith('peer-')) {
+                  const mainEntry = Object.entries(registeredGroups).find(
+                    ([, g]) => g.isMain,
+                  );
+                  if (mainEntry) {
+                    targetJid = mainEntry[0];
+                  } else {
+                    logger.warn(
+                      { sourceGroup },
+                      'relay_to_main: no main group found',
+                    );
+                    fs.unlinkSync(filePath);
+                    continue;
+                  }
+                }
+
+                if (!targetJid) {
+                  fs.unlinkSync(filePath);
+                  continue;
+                }
+
                 // Authorization: verify this group can send to this chatJid
-                const targetGroup = registeredGroups[data.chatJid];
+                // - Main can send anywhere
+                // - Non-main can send to own JID
+                // - Peer groups (peer-*) can relay to main via relayToMain
+                const targetGroup = registeredGroups[targetJid];
                 if (
                   isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
+                  (targetGroup && targetGroup.folder === sourceGroup) ||
+                  (data.relayToMain &&
+                    sourceGroup.startsWith('peer-') &&
+                    targetGroup?.isMain)
                 ) {
-                  await deps.sendMessage(data.chatJid, data.text);
+                  await deps.sendMessage(targetJid, data.text);
                   logger.info(
-                    { chatJid: data.chatJid, sourceGroup },
+                    {
+                      chatJid: targetJid,
+                      sourceGroup,
+                      relayed: !!data.relayToMain,
+                    },
                     'IPC message sent',
                   );
                 } else {
                   logger.warn(
-                    { chatJid: data.chatJid, sourceGroup },
+                    { chatJid: targetJid, sourceGroup },
                     'Unauthorized IPC message attempt blocked',
                   );
                 }
@@ -111,9 +163,11 @@ export function startIpcWatcher(deps: IpcDeps): void {
                 typeof data.emoji === 'string'
               ) {
                 const targetGroup = registeredGroups[data.chatJid];
+                const isPeerFolder = sourceGroup.startsWith('peer-');
                 if (
                   isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
+                  (targetGroup && targetGroup.folder === sourceGroup) ||
+                  (isPeerFolder && targetGroup?.isMain)
                 ) {
                   try {
                     await deps.sendReaction(
@@ -230,6 +284,16 @@ export async function processTaskIpc(
     artifacts?: string;
     tracking_file?: string;
     status?: string;
+    // For peer EA operations
+    peerEmail?: string;
+    peerName?: string;
+    peerPrincipal?: string;
+    peerRelationship?: string;
+    selfEmail?: string;
+    selfName?: string;
+    selfPrincipal?: string;
+    selfRelationship?: string;
+    block?: boolean;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -574,6 +638,193 @@ export async function processTaskIpc(
           { matterId: data.matterId, deleted, sourceGroup },
           'Matter deleted via IPC',
         );
+      }
+      break;
+
+    // --- Peer EA operations (main-only) ---
+
+    case 'send_peer_request':
+      if (!isMain) {
+        logger.warn({ sourceGroup }, 'Unauthorized send_peer_request blocked');
+        break;
+      }
+      if (
+        data.peerEmail &&
+        data.peerName &&
+        data.peerPrincipal &&
+        deps.createDM
+      ) {
+        try {
+          // Build the protocol message
+          const requestMsg = buildPeerProtocolMessage('REQUEST', {
+            EA: data.selfName || '',
+            Email: data.selfEmail || '',
+            Principal: data.selfPrincipal || '',
+            ...(data.selfRelationship
+              ? { Relationship: data.selfRelationship }
+              : {}),
+          });
+
+          // Create/find the DM space and send the request in one call
+          const spaceId = await deps.createDM(data.peerEmail, requestMsg);
+
+          insertPeerEA({
+            email: data.peerEmail,
+            name: data.peerName,
+            principal: data.peerPrincipal,
+            relationship: data.peerRelationship,
+            spaceId,
+            status: 'outbound-pending',
+          });
+
+          logger.info(
+            { peerEmail: data.peerEmail, spaceId },
+            'Peer request sent',
+          );
+          pipeToAgent(
+            sourceGroup,
+            `[PEER_RESULT] Connection request sent to ${data.peerName} (${data.peerEmail}). Status: outbound-pending.`,
+          );
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          logger.error(
+            { peerEmail: data.peerEmail, err },
+            'Failed to send peer request',
+          );
+          pipeToAgent(
+            sourceGroup,
+            `[PEER_RESULT] Failed to send connection request to ${data.peerEmail}: ${errMsg}`,
+          );
+        }
+      }
+      break;
+
+    case 'approve_peer_request':
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized approve_peer_request blocked',
+        );
+        break;
+      }
+      if (data.peerEmail) {
+        const peer = getPeerEA(data.peerEmail);
+        if (!peer || peer.status !== 'inbound-pending') {
+          logger.warn(
+            { peerEmail: data.peerEmail },
+            'Cannot approve: no inbound-pending request',
+          );
+          break;
+        }
+
+        // Register peer group
+        if (deps.registerPeerGroup && peer.space_id) {
+          deps.registerPeerGroup(
+            `gchat:${peer.space_id}`,
+            peerFolderFromEmail(peer.email),
+            peer.name,
+            peer.principal,
+            peer.relationship || undefined,
+          );
+        }
+
+        // Send acceptance in the DM
+        if (peer.space_id) {
+          const acceptMsg = buildPeerProtocolMessage('ACCEPT', {
+            EA: data.selfName || '',
+            Email: data.selfEmail || '',
+            Principal: data.selfPrincipal || '',
+            ...(data.selfRelationship
+              ? { Relationship: data.selfRelationship }
+              : {}),
+          });
+
+          await deps.sendMessage(`gchat:${peer.space_id}`, acceptMsg);
+        }
+
+        // Persist status only after side effects succeed
+        updatePeerEAStatus(data.peerEmail, 'approved');
+        logger.info({ peerEmail: data.peerEmail }, 'Peer request approved');
+        pipeToAgent(
+          sourceGroup,
+          `[PEER_RESULT] Approved peer connection with ${peer.name} (${data.peerEmail}). Group: ${peerFolderFromEmail(peer.email)}.`,
+        );
+      }
+      break;
+
+    case 'reject_peer_request':
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized reject_peer_request blocked',
+        );
+        break;
+      }
+      if (data.peerEmail) {
+        const peer = getPeerEA(data.peerEmail);
+        if (peer) {
+          if (peer.space_id) {
+            const rejectMsg = buildPeerProtocolMessage('REJECT', {});
+            await deps.sendMessage(`gchat:${peer.space_id}`, rejectMsg);
+          }
+          updatePeerEAStatus(data.peerEmail, 'rejected');
+          logger.info({ peerEmail: data.peerEmail }, 'Peer request rejected');
+          pipeToAgent(
+            sourceGroup,
+            `[PEER_RESULT] Rejected peer connection with ${data.peerEmail}.`,
+          );
+        }
+      }
+      break;
+
+    case 'disconnect_peer':
+      if (!isMain) {
+        logger.warn({ sourceGroup }, 'Unauthorized disconnect_peer blocked');
+        break;
+      }
+      if (data.peerEmail) {
+        const peer = getPeerEA(data.peerEmail);
+        if (peer && peer.space_id) {
+          const newStatus = data.block ? 'blocked' : 'disconnected';
+
+          // Send disconnect notification
+          const disconnectMsg = buildPeerProtocolMessage('DISCONNECT', {});
+          await deps.sendMessage(`gchat:${peer.space_id}`, disconnectMsg);
+
+          // Unregister the group
+          const peerJid = `gchat:${peer.space_id}`;
+          if (deps.unregisterGroup) {
+            deps.unregisterGroup(peerJid);
+          }
+
+          // Persist status only after side effects succeed
+          updatePeerEAStatus(data.peerEmail, newStatus);
+          logger.info(
+            { peerEmail: data.peerEmail, status: newStatus },
+            'Peer disconnected',
+          );
+          pipeToAgent(
+            sourceGroup,
+            `[PEER_RESULT] Disconnected from ${peer.name} (${data.peerEmail}).${data.block ? ' Blocked.' : ''}`,
+          );
+        }
+      }
+      break;
+
+    case 'unblock_peer':
+      if (!isMain) {
+        logger.warn({ sourceGroup }, 'Unauthorized unblock_peer blocked');
+        break;
+      }
+      if (data.peerEmail) {
+        if (isBlockedPeer(data.peerEmail)) {
+          updatePeerEAStatus(data.peerEmail, 'disconnected');
+          logger.info({ peerEmail: data.peerEmail }, 'Peer unblocked');
+          pipeToAgent(
+            sourceGroup,
+            `[PEER_RESULT] Unblocked ${data.peerEmail}. Reconnection is now possible.`,
+          );
+        }
       }
       break;
 

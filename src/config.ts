@@ -16,6 +16,8 @@ const envConfig = readEnvFile([
   'ASSISTANT_EMAIL',
   'HEARTBEAT_SPACE_ID',
   'ONECLI_URL',
+  'WHISPER_BIN',
+  'WHISPER_MODEL',
   'HOST_BROWSER_PORT',
   'TZ',
 ]);
@@ -108,8 +110,13 @@ export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(
   process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760',
   10,
 ); // 10MB default
-export const ONECLI_URL =
-  process.env.ONECLI_URL || envConfig.ONECLI_URL || 'http://127.0.0.1:10254';
+export const ONECLI_URL = process.env.ONECLI_URL || envConfig.ONECLI_URL;
+export const WHISPER_BIN =
+  process.env.WHISPER_BIN || envConfig.WHISPER_BIN || 'whisper-cli';
+export const WHISPER_MODEL =
+  process.env.WHISPER_MODEL ||
+  envConfig.WHISPER_MODEL ||
+  'data/models/ggml-base.bin';
 export const MAX_MESSAGES_PER_PROMPT = Math.max(
   1,
   parseInt(process.env.MAX_MESSAGES_PER_PROMPT || '10', 10) || 10,
@@ -117,8 +124,8 @@ export const MAX_MESSAGES_PER_PROMPT = Math.max(
 export const ATTACHMENT_MAX_SIZE = 15 * 1024 * 1024; // 15MB
 export const ATTACHMENT_MAX_PER_MESSAGE = 5;
 export const ATTACHMENT_PRUNE_DAYS = 14;
-export const SESSION_PRUNE_DAYS = 7;
 export const IPC_POLL_INTERVAL = 1000;
+export const HEARTBEAT_RECENCY_MS = 60 * 60 * 1000; // 1 hour — matters older than this are hidden from heartbeat
 export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min default — how long to keep container alive after last result
 export const MAX_CONCURRENT_CONTAINERS = Math.max(
   1,

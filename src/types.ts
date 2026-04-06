@@ -71,6 +71,10 @@ export interface NewMessage {
   is_from_me?: boolean;
   is_bot_message?: boolean;
   attachments?: Attachment[];
+  thread_id?: string;
+  reply_to_message_id?: string;
+  reply_to_message_content?: string;
+  reply_to_sender_name?: string;
 }
 
 export interface ScheduledTask {
@@ -110,6 +114,7 @@ export interface Reaction {
 export const MATTER_STATUSES = [
   'active',
   'waiting',
+  'escalated',
   'paused',
   'resolved',
 ] as const;

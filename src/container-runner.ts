@@ -13,11 +13,13 @@ import {
   CONTAINER_TIMEOUT,
   DATA_DIR,
   GROUPS_DIR,
+  HEARTBEAT_RECENCY_MS,
   HOST_BROWSER_PORT,
   IDLE_TIMEOUT,
   ONECLI_URL,
   TIMEZONE,
 } from './config.js';
+import { HEARTBEAT_GROUP } from './heartbeat.js';
 import { acquireHostBrowser, releaseHostBrowser } from './host-browser.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
@@ -89,7 +91,7 @@ function buildVolumeMounts(
 
   if (isMain) {
     // Main gets the project root read-only. Writable paths the agent needs
-    // (group folder, IPC, .claude/) are mounted separately below.
+    // (store, group folder, IPC, .claude/) are mounted separately below.
     // Read-only prevents the agent from modifying host application code
     // (src/, dist/, package.json, etc.) which would bypass the sandbox
     // entirely on next restart.
@@ -98,21 +100,6 @@ function buildVolumeMounts(
       containerPath: '/workspace/project',
       readonly: true,
     });
-
-    // Heartbeat's daily plan (read-write) so the morning briefing can populate it.
-    // Only mount if the heartbeat group is set up (directory exists).
-    const heartbeatDir = path.join(GROUPS_DIR, 'heartbeat');
-    if (fs.existsSync(heartbeatDir)) {
-      const dailyPlanFile = path.join(heartbeatDir, 'daily-plan.md');
-      if (!fs.existsSync(dailyPlanFile)) {
-        fs.writeFileSync(dailyPlanFile, '');
-      }
-      mounts.push({
-        hostPath: dailyPlanFile,
-        containerPath: '/workspace/heartbeat/daily-plan.md',
-        readonly: false,
-      });
-    }
 
     // Shadow .env so the agent cannot read secrets from the mounted project root.
     // Credentials are injected by the OneCLI gateway, never exposed to containers.
@@ -125,12 +112,31 @@ function buildVolumeMounts(
       });
     }
 
+    // Main gets writable access to the store (SQLite DB) so it can
+    // query and write to the database directly.
+    const storeDir = path.join(projectRoot, 'store');
+    mounts.push({
+      hostPath: storeDir,
+      containerPath: '/workspace/project/store',
+      readonly: false,
+    });
+
     // Main also gets its group folder as the working directory
     mounts.push({
       hostPath: groupDir,
       containerPath: '/workspace/group',
       readonly: false,
     });
+
+    // Global memory directory — writable for main so it can update shared context
+    const globalDir = path.join(GROUPS_DIR, 'global');
+    if (fs.existsSync(globalDir)) {
+      mounts.push({
+        hostPath: globalDir,
+        containerPath: '/workspace/global',
+        readonly: false,
+      });
+    }
   } else {
     // Other groups only get their own folder
     mounts.push({
@@ -138,17 +144,6 @@ function buildVolumeMounts(
       containerPath: '/workspace/group',
       readonly: false,
     });
-
-    // Global memory directory (read-only for non-main)
-    // Only directory mounts are supported, not file mounts
-    const globalDir = path.join(GROUPS_DIR, 'global');
-    if (fs.existsSync(globalDir)) {
-      mounts.push({
-        hostPath: globalDir,
-        containerPath: '/workspace/global',
-        readonly: true,
-      });
-    }
 
     // Non-main groups get main's directives file so cross-group
     // overrides are visible to autonomous agents.
@@ -375,7 +370,8 @@ export async function runContainerAgent(
     : group.folder.toLowerCase().replace(/_/g, '-');
 
   // Acquire host browser for eligible groups (starts Chrome if needed)
-  const needsHostBrowser = group.isMain || group.folder === 'heartbeat';
+  const needsHostBrowser =
+    group.isMain || group.folder === HEARTBEAT_GROUP.folder;
   let hostBrowserAcquired = false;
   if (needsHostBrowser) {
     hostBrowserAcquired = await acquireHostBrowser();
@@ -821,9 +817,17 @@ export function writeMattersSnapshot(
   const groupIpcDir = resolveGroupIpcPath(groupFolder);
   fs.mkdirSync(groupIpcDir, { recursive: true });
 
+  // Heartbeat only sees matters updated in the last hour — it processes
+  // changes, not the full world. Other groups see all matters.
+  const isHeartbeat = groupFolder === HEARTBEAT_GROUP.folder;
+  const oneHourAgo = new Date(Date.now() - HEARTBEAT_RECENCY_MS).toISOString();
+  const filtered = isHeartbeat
+    ? matters.filter((m) => m.updated_at > oneHourAgo)
+    : matters;
+
   // All groups get base fields. Main and heartbeat also get context/tracking_file.
-  const includeContext = isMain || groupFolder === 'heartbeat';
-  const snapshot = matters.map((m) => {
+  const includeContext = isMain || isHeartbeat;
+  const snapshot = filtered.map((m) => {
     const entry: Record<string, unknown> = {
       id: m.id,
       title: m.title,
@@ -840,80 +844,6 @@ export function writeMattersSnapshot(
 
   const mattersFile = path.join(groupIpcDir, 'current_matters.json');
   fs.writeFileSync(mattersFile, JSON.stringify(snapshot, null, 2));
-}
-
-export function writeRecentEmailsSnapshot(
-  groupFolder: string,
-  threads: Array<{
-    thread_id: string;
-    sender: string;
-    subject: string | null;
-    updated_at: string;
-  }>,
-): void {
-  const groupIpcDir = resolveGroupIpcPath(groupFolder);
-  fs.mkdirSync(groupIpcDir, { recursive: true });
-  const emailsFile = path.join(groupIpcDir, 'recent_emails.json');
-  fs.writeFileSync(emailsFile, JSON.stringify(threads, null, 2));
-}
-
-/**
- * Delete SDK session files older than maxAgeDays from the given group folders.
- * Only touches .claude/projects/ — preserves settings.json and skills/.
- */
-export function pruneOldSessions(
-  groupFolders: string[],
-  maxAgeDays: number,
-): void {
-  const maxAgeMs = maxAgeDays * 24 * 60 * 60 * 1000;
-  const now = Date.now();
-  let pruned = 0;
-
-  for (const folder of groupFolders) {
-    const projectsDir = path.join(
-      DATA_DIR,
-      'sessions',
-      folder,
-      '.claude',
-      'projects',
-    );
-    if (!fs.existsSync(projectsDir)) continue;
-
-    for (const subdir of fs.readdirSync(projectsDir)) {
-      const subdirPath = path.join(projectsDir, subdir);
-      try {
-        if (!fs.statSync(subdirPath).isDirectory()) continue;
-      } catch {
-        continue;
-      }
-
-      for (const file of fs.readdirSync(subdirPath)) {
-        const filePath = path.join(subdirPath, file);
-        try {
-          const stat = fs.statSync(filePath);
-          if (stat.isFile() && now - stat.mtimeMs > maxAgeMs) {
-            fs.unlinkSync(filePath);
-            pruned++;
-          }
-        } catch {
-          // File may have been removed between readdir and stat
-        }
-      }
-
-      // Clean up empty subdirectories
-      try {
-        if (fs.readdirSync(subdirPath).length === 0) {
-          fs.rmdirSync(subdirPath);
-        }
-      } catch {
-        // Race or permission issue — not critical
-      }
-    }
-  }
-
-  if (pruned > 0) {
-    logger.info({ pruned, folders: groupFolders }, 'Pruned old session files');
-  }
 }
 
 export interface AvailableGroup {
