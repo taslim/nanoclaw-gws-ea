@@ -60,10 +60,13 @@ interface SessionsIndex {
   entries: SessionEntry[];
 }
 
+type ImageMediaType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+type DocumentMediaType = 'application/pdf';
+
 type ContentBlock =
   | { type: 'text'; text: string }
-  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
-  | { type: 'document'; source: { type: 'base64'; media_type: string; data: string }; title?: string };
+  | { type: 'image'; source: { type: 'base64'; media_type: ImageMediaType; data: string } }
+  | { type: 'document'; source: { type: 'base64'; media_type: DocumentMediaType; data: string }; title?: string };
 
 interface SDKUserMessage {
   type: 'user';
@@ -415,19 +418,25 @@ async function runQuery(
     const blocks: ContentBlock[] = [{ type: 'text', text: prompt }];
     for (const att of inlineAttachments) {
       try {
-        const data = fs
-          .readFileSync(`/workspace/group/${att.path}`)
-          .toString('base64');
+        const filePath = `/workspace/group/${att.path}`;
         const isImage = att.mimeType.startsWith('image/');
-        if (isImage) {
+        const isText = att.mimeType.startsWith('text/');
+        // Host validates MIME types before sending to container
+        if (isText) {
+          const text = fs.readFileSync(filePath, 'utf-8');
+          const filename = att.path.split('/').pop();
+          blocks.push({ type: 'text', text: `[File: ${filename}]\n${text}` });
+        } else if (isImage) {
+          const data = fs.readFileSync(filePath).toString('base64');
           blocks.push({
             type: 'image',
-            source: { type: 'base64', media_type: att.mimeType, data },
+            source: { type: 'base64', media_type: att.mimeType as ImageMediaType, data },
           });
         } else {
+          const data = fs.readFileSync(filePath).toString('base64');
           blocks.push({
             type: 'document',
-            source: { type: 'base64', media_type: att.mimeType, data },
+            source: { type: 'base64', media_type: att.mimeType as DocumentMediaType, data },
             title: att.path.split('/').pop(),
           });
         }

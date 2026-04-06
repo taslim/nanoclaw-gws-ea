@@ -23,6 +23,15 @@ import {
   validateEaConfig,
 } from './config.js';
 import { HEARTBEAT_GROUP } from './heartbeat.js';
+import {
+  PEER_EA_DEFAULTS,
+  PEER_PROTOCOL,
+  isPeerProtocolMessage,
+  parsePeerProtocolFields,
+  buildPeerProtocolMessage,
+  peerFolderFromEmail,
+} from './peer-ea.js';
+import { GChatChannel } from './channels/gchat.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -41,7 +50,6 @@ import {
   pruneOldSessions,
   runContainerAgent,
   writeMattersSnapshot,
-  writeRecentEmailsSnapshot,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
@@ -57,7 +65,6 @@ import {
   deleteSession,
   getAllTasks,
   getEmailRoute,
-  getRecentEmailThreads,
   getMessageFromMe,
   getLastBotMessageTimestamp,
   getMessagesSince,
@@ -71,6 +78,12 @@ import {
   storeChatMetadata,
   storeMessage,
   updateEmailStatus,
+  deleteRegisteredGroup,
+  insertPeerEA,
+  updatePeerEAStatus,
+  getPeerEA,
+  getApprovedPeers,
+  isBlockedPeer,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
@@ -254,7 +267,14 @@ function saveState(): void {
   setRouterState('last_agent_timestamp', JSON.stringify(lastAgentTimestamp));
 }
 
-function registerGroup(jid: string, group: RegisteredGroup): void {
+function registerGroup(
+  jid: string,
+  group: RegisteredGroup,
+  templateOpts?: {
+    templatePath: string;
+    substitutions: Record<string, string>;
+  },
+): void {
   let groupDir: string;
   try {
     groupDir = resolveGroupFolderPath(group.folder);
@@ -276,19 +296,41 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   // identity and instructions from the first run.  (Fixes #1391)
   const groupMdFile = path.join(groupDir, 'CLAUDE.md');
   if (!fs.existsSync(groupMdFile)) {
-    const templateFile = path.join(
-      GROUPS_DIR,
-      group.isMain ? 'main' : 'global',
-      'CLAUDE.md',
-    );
-    if (fs.existsSync(templateFile)) {
-      let content = fs.readFileSync(templateFile, 'utf-8');
-      if (ASSISTANT_NAME !== 'Andy') {
-        content = content.replace(/^# Andy$/m, `# ${ASSISTANT_NAME}`);
-        content = content.replace(/You are Andy/g, `You are ${ASSISTANT_NAME}`);
+    if (
+      templateOpts?.templatePath &&
+      fs.existsSync(templateOpts.templatePath)
+    ) {
+      // Custom template with substitutions (e.g., peer EA groups)
+      let content = fs.readFileSync(templateOpts.templatePath, 'utf-8');
+      for (const [key, value] of Object.entries(templateOpts.substitutions)) {
+        content = content.replaceAll(`{{${key}}}`, value);
       }
       fs.writeFileSync(groupMdFile, content);
-      logger.info({ folder: group.folder }, 'Created CLAUDE.md from template');
+      logger.info(
+        { folder: group.folder, template: templateOpts.templatePath },
+        'Created CLAUDE.md from custom template',
+      );
+    } else {
+      const templateFile = path.join(
+        GROUPS_DIR,
+        group.isMain ? 'main' : 'global',
+        'CLAUDE.md',
+      );
+      if (fs.existsSync(templateFile)) {
+        let content = fs.readFileSync(templateFile, 'utf-8');
+        if (ASSISTANT_NAME !== 'Andy') {
+          content = content.replace(/^# Andy$/m, `# ${ASSISTANT_NAME}`);
+          content = content.replace(
+            /You are Andy/g,
+            `You are ${ASSISTANT_NAME}`,
+          );
+        }
+        fs.writeFileSync(groupMdFile, content);
+        logger.info(
+          { folder: group.folder },
+          'Created CLAUDE.md from template',
+        );
+      }
     }
   }
 
@@ -317,6 +359,58 @@ export function getAvailableGroups(): import('./container-runner.js').AvailableG
       lastActivity: c.last_message_time,
       isRegistered: registeredJids.has(c.jid),
     }));
+}
+
+/** Find the JID of the main group (for peer→main relay) */
+function findMainJid(): string | undefined {
+  for (const [jid, group] of Object.entries(registeredGroups)) {
+    if (group.isMain) return jid;
+  }
+  return undefined;
+}
+
+/** Register a peer EA group with template-driven CLAUDE.md */
+function registerPeerGroup(
+  jid: string,
+  folder: string,
+  peerName: string,
+  peerPrincipal: string,
+  relationship: string | undefined,
+): void {
+  const templatePath = path.resolve(process.cwd(), 'templates', 'peer-ea.md');
+  registerGroup(
+    jid,
+    {
+      name: `${peerName} (Peer EA)`,
+      folder,
+      trigger: PEER_EA_DEFAULTS.trigger,
+      added_at: new Date().toISOString(),
+      containerConfig: PEER_EA_DEFAULTS.containerConfig,
+      requiresTrigger: PEER_EA_DEFAULTS.requiresTrigger,
+    },
+    {
+      templatePath,
+      substitutions: {
+        ASSISTANT_NAME,
+        PRINCIPAL_NAME,
+        PEER_NAME: peerName,
+        PEER_PRINCIPAL: peerPrincipal,
+        RELATIONSHIP: relationship || `${peerPrincipal}'s principal`,
+      },
+    },
+  );
+}
+
+/** Unregister a peer group, cleaning up sessions and state */
+function unregisterPeerGroup(jid: string): void {
+  const group = registeredGroups[jid];
+  if (group) {
+    delete sessions[group.folder];
+    deleteSession(group.folder);
+  }
+  delete registeredGroups[jid];
+  delete lastAgentTimestamp[jid];
+  deleteRegisteredGroup(jid);
 }
 
 /** @internal - exported for testing */
@@ -559,12 +653,6 @@ async function runAgent(
 
   // Update matters snapshot for container to read
   writeMattersSnapshot(group.folder, isMain, getAllMatters());
-
-  // Update recent emails snapshot for heartbeat to triage into matters
-  if (group.folder === HEARTBEAT_GROUP.folder) {
-    const since = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); // last 2 hours
-    writeRecentEmailsSnapshot(group.folder, getRecentEmailThreads(since));
-  }
 
   // Update available groups snapshot (main group only can see all groups)
   const availableGroups = getAvailableGroups();
@@ -889,6 +977,18 @@ function ensureSystemGroups(): void {
   if (HEARTBEAT_SPACE_ID) {
     ensureSystemGroup(HEARTBEAT_GROUP);
   }
+
+  // Sync peer group container configs from code (skip if unchanged)
+  for (const [jid, group] of Object.entries(registeredGroups)) {
+    if (group.folder.startsWith('peer-')) {
+      const current = JSON.stringify(group.containerConfig);
+      const target = JSON.stringify(PEER_EA_DEFAULTS.containerConfig);
+      if (current !== target) {
+        group.containerConfig = PEER_EA_DEFAULTS.containerConfig;
+        setRegisteredGroup(jid, group);
+      }
+    }
+  }
 }
 
 async function main(): Promise<void> {
@@ -984,6 +1084,151 @@ async function main(): Promise<void> {
     }
   }
 
+  // Handle peer EA protocol messages (connection request/accept/reject/disconnect)
+  async function handlePeerProtocol(
+    chatJid: string,
+    msg: NewMessage,
+  ): Promise<void> {
+    const content = msg.content.trim();
+    const fields = parsePeerProtocolFields(content);
+    const mainJid = findMainJid();
+    const mainChannel = mainJid ? findChannel(channels, mainJid) : undefined;
+
+    if (content.startsWith(PEER_PROTOCOL.REQUEST)) {
+      const email = fields.email;
+      const name = fields.ea;
+      const principal = fields.principal;
+      const relationship = fields.relationship;
+      if (!email || !name || !principal) {
+        logger.warn(
+          { chatJid, fields },
+          'Malformed peer request — missing fields',
+        );
+        return;
+      }
+
+      // Auto-reject if blocked
+      if (isBlockedPeer(email)) {
+        const channel = findChannel(channels, chatJid);
+        if (channel) {
+          await channel.sendMessage(
+            chatJid,
+            buildPeerProtocolMessage('REJECT', {}),
+          );
+        }
+        logger.info({ email }, 'Auto-rejected peer request from blocked EA');
+        return;
+      }
+
+      const spaceId = chatJid.replace(/^gchat:/, '');
+      insertPeerEA({
+        email,
+        name,
+        principal,
+        relationship,
+        spaceId,
+        status: 'inbound-pending',
+      });
+
+      // Notify principal via main channel
+      if (mainChannel && mainJid) {
+        const relText = relationship ? ` ${principal} is ${relationship}.` : '';
+        await mainChannel.sendMessage(
+          mainJid,
+          `${name} (${principal}'s EA) wants to connect.${relText} Reply "approve ${email}" to accept or "reject ${email}" to decline.`,
+        );
+      }
+      logger.info(
+        { email, name, principal, chatJid },
+        'Inbound peer request received',
+      );
+    } else if (content.startsWith(PEER_PROTOCOL.ACCEPT)) {
+      const email = fields.email;
+      if (!email) return;
+
+      const peer = getPeerEA(email);
+      if (!peer || peer.status !== 'outbound-pending') {
+        logger.warn(
+          { email },
+          'Received peer accept for unknown/non-pending request',
+        );
+        return;
+      }
+
+      // Merge verified info from acceptance message with stored data
+      const peerName = fields.ea || peer.name;
+      const peerPrincipal = fields.principal || peer.principal;
+      const peerRelationship =
+        fields.relationship || peer.relationship || undefined;
+
+      insertPeerEA({
+        email,
+        name: peerName,
+        principal: peerPrincipal,
+        relationship: peerRelationship,
+        spaceId: peer.space_id || undefined,
+        status: 'approved',
+      });
+
+      // Register the peer group
+      registerPeerGroup(
+        chatJid,
+        peerFolderFromEmail(email),
+        peerName,
+        peerPrincipal,
+        peerRelationship,
+      );
+
+      if (mainChannel && mainJid) {
+        await mainChannel.sendMessage(
+          mainJid,
+          `${peerName} accepted the peer connection. You can now coordinate with ${peerPrincipal} through ${peerName}.`,
+        );
+      }
+      logger.info(
+        { email, folder: peerFolderFromEmail(email) },
+        'Peer connection accepted and group registered',
+      );
+    } else if (content.startsWith(PEER_PROTOCOL.REJECT)) {
+      const peer = fields.email ? getPeerEA(fields.email) : undefined;
+
+      if (peer) {
+        updatePeerEAStatus(peer.email, 'rejected');
+        if (mainChannel && mainJid) {
+          await mainChannel.sendMessage(
+            mainJid,
+            `${peer.name} declined the peer connection request.`,
+          );
+        }
+        logger.info({ email: peer.email }, 'Peer connection rejected');
+      }
+    } else if (content.startsWith(PEER_PROTOCOL.DISCONNECT)) {
+      const group = registeredGroups[chatJid];
+      if (group && group.folder.startsWith('peer-')) {
+        const spaceId = chatJid.replace(/^gchat:/, '');
+        const peers = getApprovedPeers();
+        const peer = peers.find((p) => p.space_id === spaceId);
+
+        if (peer) {
+          updatePeerEAStatus(peer.email, 'disconnected');
+        }
+
+        unregisterPeerGroup(chatJid);
+
+        if (mainChannel && mainJid) {
+          await mainChannel.sendMessage(
+            mainJid,
+            `${peer?.name || 'Peer EA'} has disconnected the peer connection.`,
+          );
+        }
+        logger.info(
+          { chatJid, folder: group.folder },
+          'Peer disconnected (remote)',
+        );
+      }
+    }
+  }
+
   // Channel callbacks (shared by all channels)
   const channelOpts = {
     onMessage: (chatJid: string, msg: NewMessage) => {
@@ -992,6 +1237,14 @@ async function main(): Promise<void> {
       if (trimmed === '/remote-control' || trimmed === '/remote-control-end') {
         handleRemoteControl(trimmed, chatJid, msg).catch((err) =>
           logger.error({ err, chatJid }, 'Remote control command error'),
+        );
+        return;
+      }
+
+      // Peer EA protocol messages — intercept before storage
+      if (isPeerProtocolMessage(trimmed)) {
+        handlePeerProtocol(chatJid, msg).catch((err) =>
+          logger.error({ err, chatJid }, 'Peer protocol handling error'),
         );
         return;
       }
@@ -1143,6 +1396,16 @@ async function main(): Promise<void> {
         writeTasksSnapshot(group.folder, group.isMain === true, taskRows);
       }
     },
+    // Peer EA operations
+    createDM: async (email: string, firstMessage?: string) => {
+      const gchat = channels.find(
+        (ch): ch is GChatChannel => ch.name === 'gchat',
+      );
+      if (!gchat) throw new Error('GChat channel not available');
+      return gchat.createDM(email, firstMessage);
+    },
+    registerPeerGroup,
+    unregisterGroup: unregisterPeerGroup,
   });
   startSessionCleanup();
   queue.setProcessMessagesFn(processGroupMessages);

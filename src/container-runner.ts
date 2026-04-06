@@ -13,11 +13,13 @@ import {
   CONTAINER_TIMEOUT,
   DATA_DIR,
   GROUPS_DIR,
+  HEARTBEAT_RECENCY_MS,
   HOST_BROWSER_PORT,
   IDLE_TIMEOUT,
   ONECLI_URL,
   TIMEZONE,
 } from './config.js';
+import { HEARTBEAT_GROUP } from './heartbeat.js';
 import { acquireHostBrowser, releaseHostBrowser } from './host-browser.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
@@ -98,21 +100,6 @@ function buildVolumeMounts(
       containerPath: '/workspace/project',
       readonly: true,
     });
-
-    // Heartbeat's daily plan (read-write) so the morning briefing can populate it.
-    // Only mount if the heartbeat group is set up (directory exists).
-    const heartbeatDir = path.join(GROUPS_DIR, 'heartbeat');
-    if (fs.existsSync(heartbeatDir)) {
-      const dailyPlanFile = path.join(heartbeatDir, 'daily-plan.md');
-      if (!fs.existsSync(dailyPlanFile)) {
-        fs.writeFileSync(dailyPlanFile, '');
-      }
-      mounts.push({
-        hostPath: dailyPlanFile,
-        containerPath: '/workspace/heartbeat/daily-plan.md',
-        readonly: false,
-      });
-    }
 
     // Shadow .env so the agent cannot read secrets from the mounted project root.
     // Credentials are injected by the OneCLI gateway, never exposed to containers.
@@ -394,7 +381,8 @@ export async function runContainerAgent(
     : group.folder.toLowerCase().replace(/_/g, '-');
 
   // Acquire host browser for eligible groups (starts Chrome if needed)
-  const needsHostBrowser = group.isMain || group.folder === 'heartbeat';
+  const needsHostBrowser =
+    group.isMain || group.folder === HEARTBEAT_GROUP.folder;
   let hostBrowserAcquired = false;
   if (needsHostBrowser) {
     hostBrowserAcquired = await acquireHostBrowser();
@@ -840,9 +828,17 @@ export function writeMattersSnapshot(
   const groupIpcDir = resolveGroupIpcPath(groupFolder);
   fs.mkdirSync(groupIpcDir, { recursive: true });
 
+  // Heartbeat only sees matters updated in the last hour — it processes
+  // changes, not the full world. Other groups see all matters.
+  const isHeartbeat = groupFolder === HEARTBEAT_GROUP.folder;
+  const oneHourAgo = new Date(Date.now() - HEARTBEAT_RECENCY_MS).toISOString();
+  const filtered = isHeartbeat
+    ? matters.filter((m) => m.updated_at > oneHourAgo)
+    : matters;
+
   // All groups get base fields. Main and heartbeat also get context/tracking_file.
-  const includeContext = isMain || groupFolder === 'heartbeat';
-  const snapshot = matters.map((m) => {
+  const includeContext = isMain || isHeartbeat;
+  const snapshot = filtered.map((m) => {
     const entry: Record<string, unknown> = {
       id: m.id,
       title: m.title,
@@ -859,21 +855,6 @@ export function writeMattersSnapshot(
 
   const mattersFile = path.join(groupIpcDir, 'current_matters.json');
   fs.writeFileSync(mattersFile, JSON.stringify(snapshot, null, 2));
-}
-
-export function writeRecentEmailsSnapshot(
-  groupFolder: string,
-  threads: Array<{
-    thread_id: string;
-    sender: string;
-    subject: string | null;
-    updated_at: string;
-  }>,
-): void {
-  const groupIpcDir = resolveGroupIpcPath(groupFolder);
-  fs.mkdirSync(groupIpcDir, { recursive: true });
-  const emailsFile = path.join(groupIpcDir, 'recent_emails.json');
-  fs.writeFileSync(emailsFile, JSON.stringify(threads, null, 2));
 }
 
 /**

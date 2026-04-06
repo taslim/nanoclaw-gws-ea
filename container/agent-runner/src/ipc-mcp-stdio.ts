@@ -44,15 +44,11 @@ server.tool(
   "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times.",
   {
     text: z.string().describe('The message text to send'),
-    sender: z
-      .string()
-      .optional()
-      .describe(
-        'Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.',
-      ),
+    sender: z.string().optional().describe('Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.'),
+    relay_to_main: z.boolean().optional().describe('Set to true to relay this message to the main channel (your principal). Only works from peer EA groups.'),
   },
   async (args) => {
-    const data: Record<string, string | undefined> = {
+    const data: Record<string, string | boolean | undefined> = {
       type: 'message',
       chatJid,
       text: args.text,
@@ -60,10 +56,13 @@ server.tool(
       groupFolder,
       timestamp: new Date().toISOString(),
     };
+    if (args.relay_to_main) {
+      data.relayToMain = true;
+    }
 
     writeIpcFile(MESSAGES_DIR, data);
 
-    return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
+    return { content: [{ type: 'text' as const, text: args.relay_to_main ? 'Message relayed to main.' : 'Message sent.' }] };
   },
 );
 
@@ -523,6 +522,127 @@ Use available_groups.json to find the JID for a group. The folder name must be c
         },
       ],
     };
+  },
+);
+
+// --- Peer EA operations ---
+
+server.tool(
+  'send_peer_request',
+  'Send a connection request to another EA. Main group only. Requires both EAs to be in the same Google Workspace organization.',
+  {
+    peer_email: z.string().describe('Email address of the peer EA'),
+    peer_name: z.string().describe('Name of the peer EA'),
+    peer_principal: z.string().describe('Name of the peer EA\'s principal'),
+    peer_relationship: z.string().optional().describe('Relationship of the peer\'s principal to your principal (e.g. "wife", "business partner")'),
+    self_email: z.string().describe('Your EA email address'),
+    self_name: z.string().describe('Your EA name'),
+    self_principal: z.string().describe('Your principal\'s name'),
+    self_relationship: z.string().optional().describe('Your principal\'s relationship to the peer\'s principal'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return { content: [{ type: 'text' as const, text: 'Only the main group can send peer requests.' }], isError: true };
+    }
+    writeIpcFile(TASKS_DIR, {
+      type: 'send_peer_request',
+      peerEmail: args.peer_email,
+      peerName: args.peer_name,
+      peerPrincipal: args.peer_principal,
+      peerRelationship: args.peer_relationship || undefined,
+      selfEmail: args.self_email,
+      selfName: args.self_name,
+      selfPrincipal: args.self_principal,
+      selfRelationship: args.self_relationship || undefined,
+      timestamp: new Date().toISOString(),
+    });
+    return { content: [{ type: 'text' as const, text: `Peer connection request queued for ${args.peer_name} (${args.peer_email}). Wait for a [PEER_RESULT] message confirming success or failure before reporting to your principal.` }] };
+  },
+);
+
+server.tool(
+  'approve_peer_request',
+  'Approve an inbound peer EA connection request. Main group only.',
+  {
+    peer_email: z.string().describe('Email of the peer EA to approve'),
+    self_email: z.string().describe('Your EA email address'),
+    self_name: z.string().describe('Your EA name'),
+    self_principal: z.string().describe('Your principal\'s name'),
+    self_relationship: z.string().optional().describe('Your principal\'s relationship to the peer\'s principal'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return { content: [{ type: 'text' as const, text: 'Only the main group can approve peer requests.' }], isError: true };
+    }
+    writeIpcFile(TASKS_DIR, {
+      type: 'approve_peer_request',
+      peerEmail: args.peer_email,
+      selfEmail: args.self_email,
+      selfName: args.self_name,
+      selfPrincipal: args.self_principal,
+      selfRelationship: args.self_relationship || undefined,
+      timestamp: new Date().toISOString(),
+    });
+    return { content: [{ type: 'text' as const, text: `Approval queued for ${args.peer_email}. Wait for a [PEER_RESULT] message confirming success.` }] };
+  },
+);
+
+server.tool(
+  'reject_peer_request',
+  'Reject an inbound peer EA connection request. Main group only.',
+  {
+    peer_email: z.string().describe('Email of the peer EA to reject'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return { content: [{ type: 'text' as const, text: 'Only the main group can reject peer requests.' }], isError: true };
+    }
+    writeIpcFile(TASKS_DIR, {
+      type: 'reject_peer_request',
+      peerEmail: args.peer_email,
+      timestamp: new Date().toISOString(),
+    });
+    return { content: [{ type: 'text' as const, text: `Rejection queued for ${args.peer_email}. Wait for a [PEER_RESULT] message confirming success.` }] };
+  },
+);
+
+server.tool(
+  'disconnect_peer',
+  'Disconnect from a connected peer EA. Optionally block to prevent reconnection. Main group only.',
+  {
+    peer_email: z.string().describe('Email of the peer EA to disconnect'),
+    block: z.boolean().optional().describe('Set to true to also block future connection requests from this EA'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return { content: [{ type: 'text' as const, text: 'Only the main group can disconnect peers.' }], isError: true };
+    }
+    writeIpcFile(TASKS_DIR, {
+      type: 'disconnect_peer',
+      peerEmail: args.peer_email,
+      block: args.block || false,
+      timestamp: new Date().toISOString(),
+    });
+    return { content: [{ type: 'text' as const, text: `Disconnect queued for ${args.peer_email}. Wait for a [PEER_RESULT] message confirming success.` }] };
+  },
+);
+
+server.tool(
+  'unblock_peer',
+  'Unblock a previously blocked peer EA, allowing reconnection. Main group only.',
+  {
+    peer_email: z.string().describe('Email of the peer EA to unblock'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return { content: [{ type: 'text' as const, text: 'Only the main group can unblock peers.' }], isError: true };
+    }
+    writeIpcFile(TASKS_DIR, {
+      type: 'unblock_peer',
+      peerEmail: args.peer_email,
+      timestamp: new Date().toISOString(),
+    });
+    return { content: [{ type: 'text' as const, text: `Unblock queued for ${args.peer_email}. Wait for a [PEER_RESULT] message confirming success.` }] };
   },
 );
 

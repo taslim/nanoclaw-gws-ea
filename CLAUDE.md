@@ -37,6 +37,7 @@ Four types of skills exist in NanoClaw. See [CONTRIBUTING.md](CONTRIBUTING.md) f
 | Skill | When to Use |
 |-------|-------------|
 | `/setup-ea` | First-time GWS-EA setup (runs full setup + Workspace OAuth + EA identity) |
+| `/setup-same-mac` | Add another EA instance on the same Mac (fake HOME, OneCLI agent, separate LaunchAgent) |
 | `/setup` | Base NanoClaw setup (upstream — prefer `/setup-ea`) |
 | `/customize` | Adding channels, integrations, changing behavior |
 | `/debug` | Container issues, logs, troubleshooting |

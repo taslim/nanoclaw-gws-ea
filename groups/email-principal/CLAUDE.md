@@ -18,8 +18,12 @@ Before engaging with anyone, read: `/workspace/global/procedures/relationships.m
 Before replying to any email, read: `/workspace/global/procedures/email-triage.md`
 Before any scheduling operation, read: `/workspace/global/procedures/scheduling.md`
 
+## Matters
+
+After processing any email, follow the "After Processing" section in the email-triage procedure — link the thread to a matter and update its context. This is how the rest of the system knows what happened. If you skip this, the workstream falls through the cracks.
+
 ## Escalation
 
-The Decision Hierarchy and email-triage procedure set the bar for when to escalate — don't add your own. Use `mcp__nanoclaw__send_message` to reach your principal when escalating. When you do, use a decision packet.
+The Decision Hierarchy and email-triage procedure set the bar for when to escalate — don't add your own. Use `mcp__nanoclaw__send_message` to reach your principal when escalating. When you do, use a decision packet. Set the matter's status to `escalated`.
 
 Your final response text must be completely empty — output nothing. All communication happens exclusively through MCP tools.

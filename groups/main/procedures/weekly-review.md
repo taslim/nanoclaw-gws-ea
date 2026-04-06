@@ -9,7 +9,7 @@ Use `mcp__time__*` tools for ALL date/time computation. Never calculate dates yo
 ## Execution
 
 1. Load all matters via `list_matters` — filter to those with a `tracking_file` (use `get_matter` to check)
-2. For each, read the tracking file for detailed context, then check linked artifacts (email threads, calendar events, tasks) for recent activity
+2. For each, read the tracking file for detailed context, then fetch fresh source data — pull linked email threads and read linked calendar events from the API to verify the matter context is current
 3. Update the tracking file contents with current status and blockers, and refresh the matter's context summary
 4. Compose one message with what your principal needs to see. Send via `mcp__nanoclaw__send_message`, even if everything is green
 
@@ -23,7 +23,7 @@ In the message to your principal:
 
 ## Decisions Needed
 
-If any matter is blocked on your principal's input, surface it here — numbered, with your recommendation and deadline.
+Matters with status `escalated` that are still unresolved, plus any that should be escalated but weren't. Numbered, with your recommendation and deadline.
 
 If nothing needs a decision, skip this section entirely.
 

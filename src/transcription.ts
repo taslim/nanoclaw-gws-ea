@@ -4,12 +4,10 @@ import os from 'os';
 import path from 'path';
 import { promisify } from 'util';
 
+import { WHISPER_BIN, WHISPER_MODEL } from './config.js';
 import { logger } from './logger.js';
 
 const execFileAsync = promisify(execFile);
-
-const WHISPER_BIN = process.env.WHISPER_BIN || 'whisper-cli';
-const WHISPER_MODEL = process.env.WHISPER_MODEL || 'data/models/ggml-base.bin';
 
 /**
  * Transcribe an audio file using local whisper.cpp.

@@ -88,6 +88,7 @@ async function launchChrome(binary: string): Promise<void> {
     '--disable-background-timer-throttling',
     '--disable-backgrounding-occluded-windows',
     '--disable-renderer-backgrounding',
+    '--use-mock-keychain',
   ];
 
   const proc = spawn(binary, args, { stdio: 'ignore' });

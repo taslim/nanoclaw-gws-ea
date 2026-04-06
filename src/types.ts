@@ -114,6 +114,7 @@ export interface Reaction {
 export const MATTER_STATUSES = [
   'active',
   'waiting',
+  'escalated',
   'paused',
   'resolved',
 ] as const;

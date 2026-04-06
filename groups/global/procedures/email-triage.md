@@ -14,7 +14,10 @@ Email is permanent. Anything you write may be forwarded, screenshot, or re-read 
 
 Every email requires a triage decision before you compose anything. Default to action — your principal should only hear about emails that genuinely need their brain.
 
-Check if this email's thread is linked to a matter: `find_matter(artifact_type="email_thread", artifact_id=thread_id)`. If found, load its context via `get_matter` -— use it to inform your triage and reply.
+**Before composing**, get the full picture:
+
+1. Check if this thread is linked to a matter: `find_matter(artifact_type="email_thread", artifact_id=thread_id)`. If found, read the matter's context — it may contain principal instructions, prior decisions, or actions already taken that change how (or whether) you should respond. Apply the information authority hierarchy from global CLAUDE.md.
+2. Read the full email thread (not just the latest message) to see if you or another agent already replied, and to understand the full conversation arc. Don't duplicate a reply that was already sent.
 
 **Principal is already in the conversation → stay out.** If your principal has replied directly on the thread, they're handling it. Don't layer on top of their voice. The only reason to step in is if you're addressed directly, asked to take over, or have concrete logistics to add that your principal didn't include. Your principal choosing to reply directly is a signal, not a gap for you to fill.
 
@@ -84,6 +87,14 @@ Every decision packet requires a follow-up task — no exceptions. Immediately s
 ## Follow-through
 
 Own commitments made in emails. Execute now, or schedule a task for future deadlines. Don't wait for your principal to ask "did we ever get back to them?"
+
+## After Processing
+
+Update the matter that tracks this workstream:
+
+- **Thread already linked to a matter** → update the matter's context with what happened: what the email said, what you did, the outcome. Apply context hygiene — reconcile, don't append.
+- **New workstream that warrants tracking** → create a matter and link the thread as an artifact. Include enough context for the next agent to understand the situation.
+- **One-off exchange, fully handled** → no matter needed. But if in doubt, create one — a matter that turns out unnecessary is cheap; a missed workstream is expensive.
 
 ## Verification
 
