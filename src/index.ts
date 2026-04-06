@@ -1101,7 +1101,7 @@ async function main(): Promise<void> {
         if (channel) {
           await channel.sendMessage(
             chatJid,
-            buildPeerProtocolMessage('REJECT', {}),
+            buildPeerProtocolMessage('REJECT', { Email: email }),
           );
         }
         logger.info({ email }, 'Auto-rejected peer request from blocked EA');
@@ -1229,8 +1229,13 @@ async function main(): Promise<void> {
         return;
       }
 
-      // Peer EA protocol messages — intercept before storage
-      if (isPeerProtocolMessage(trimmed)) {
+      // Peer EA protocol messages — only process on inbound GChat DMs
+      if (
+        isPeerProtocolMessage(trimmed) &&
+        chatJid.startsWith('gchat:') &&
+        !msg.is_from_me &&
+        !msg.is_bot_message
+      ) {
         handlePeerProtocol(chatJid, msg).catch((err) =>
           logger.error({ err, chatJid }, 'Peer protocol handling error'),
         );

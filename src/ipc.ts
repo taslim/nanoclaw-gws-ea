@@ -19,7 +19,6 @@ import {
   updateTask,
 } from './db.js';
 import {
-  PEER_EA_DEFAULTS,
   buildPeerProtocolMessage,
   peerFolderFromEmail,
   pipeToAgent,
@@ -718,8 +717,6 @@ export async function processTaskIpc(
           break;
         }
 
-        updatePeerEAStatus(data.peerEmail, 'approved');
-
         // Register peer group
         if (deps.registerPeerGroup && peer.space_id) {
           deps.registerPeerGroup(
@@ -745,6 +742,8 @@ export async function processTaskIpc(
           await deps.sendMessage(`gchat:${peer.space_id}`, acceptMsg);
         }
 
+        // Persist status only after side effects succeed
+        updatePeerEAStatus(data.peerEmail, 'approved');
         logger.info({ peerEmail: data.peerEmail }, 'Peer request approved');
         pipeToAgent(
           sourceGroup,
@@ -764,11 +763,11 @@ export async function processTaskIpc(
       if (data.peerEmail) {
         const peer = getPeerEA(data.peerEmail);
         if (peer) {
-          updatePeerEAStatus(data.peerEmail, 'rejected');
           if (peer.space_id) {
             const rejectMsg = buildPeerProtocolMessage('REJECT', {});
             await deps.sendMessage(`gchat:${peer.space_id}`, rejectMsg);
           }
+          updatePeerEAStatus(data.peerEmail, 'rejected');
           logger.info({ peerEmail: data.peerEmail }, 'Peer request rejected');
           pipeToAgent(
             sourceGroup,
@@ -787,7 +786,6 @@ export async function processTaskIpc(
         const peer = getPeerEA(data.peerEmail);
         if (peer && peer.space_id) {
           const newStatus = data.block ? 'blocked' : 'disconnected';
-          updatePeerEAStatus(data.peerEmail, newStatus);
 
           // Send disconnect notification
           const disconnectMsg = buildPeerProtocolMessage('DISCONNECT', {});
@@ -799,6 +797,8 @@ export async function processTaskIpc(
             deps.unregisterGroup(peerJid);
           }
 
+          // Persist status only after side effects succeed
+          updatePeerEAStatus(data.peerEmail, newStatus);
           logger.info(
             { peerEmail: data.peerEmail, status: newStatus },
             'Peer disconnected',

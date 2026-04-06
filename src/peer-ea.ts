@@ -4,6 +4,7 @@
  * Defines container defaults for peer EA groups — privileged 1:1 channels
  * between two NanoClaw instances for cross-principal coordination.
  */
+import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -117,11 +118,15 @@ export function pipeToAgent(sourceGroup: string, text: string): void {
   }
 }
 
-/** Derive peer group folder name from email */
+/** Derive peer group folder name from email (collision-resistant) */
 export function peerFolderFromEmail(email: string): string {
   const localPart = email
     .split('@')[0]
     .toLowerCase()
     .replace(/[^a-z0-9-]/g, '-');
-  return `peer-${localPart}`;
+  const fingerprint = createHash('sha1')
+    .update(email.toLowerCase())
+    .digest('hex')
+    .slice(0, 8);
+  return `peer-${localPart}-${fingerprint}`;
 }
