@@ -8,7 +8,6 @@ import {
   ATTACHMENT_MAX_PER_MESSAGE,
   ATTACHMENT_PRUNE_DAYS,
   DEFAULT_TRIGGER,
-  SESSION_PRUNE_DAYS,
   EMAIL_EXTERNAL_DELAY,
   getTriggerPattern,
   GROUPS_DIR,
@@ -47,7 +46,6 @@ import {
 import type { ThreadMessage } from './email.js';
 import {
   ContainerOutput,
-  pruneOldSessions,
   runContainerAgent,
   writeMattersSnapshot,
   writeGroupsSnapshot,
@@ -1001,16 +999,6 @@ async function main(): Promise<void> {
   validateEaConfig();
 
   ensureSystemGroups();
-
-  // Prune orphaned session files from fresh-session groups (email, heartbeat)
-  pruneOldSessions(
-    [
-      EMAIL_PRINCIPAL_GROUP.folder,
-      EMAIL_EXTERNAL_GROUP.folder,
-      HEARTBEAT_GROUP.folder,
-    ],
-    SESSION_PRUNE_DAYS,
-  );
 
   // Prune old attachments (14-day retention) on startup and daily
   const allGroupFolders = () =>

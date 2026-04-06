@@ -145,17 +145,6 @@ function buildVolumeMounts(
       readonly: false,
     });
 
-    // Global memory directory (read-only for non-main)
-    // Only directory mounts are supported, not file mounts
-    const globalDir = path.join(GROUPS_DIR, 'global');
-    if (fs.existsSync(globalDir)) {
-      mounts.push({
-        hostPath: globalDir,
-        containerPath: '/workspace/global',
-        readonly: true,
-      });
-    }
-
     // Non-main groups get main's directives file so cross-group
     // overrides are visible to autonomous agents.
     const directivesFile = path.join(
@@ -855,65 +844,6 @@ export function writeMattersSnapshot(
 
   const mattersFile = path.join(groupIpcDir, 'current_matters.json');
   fs.writeFileSync(mattersFile, JSON.stringify(snapshot, null, 2));
-}
-
-/**
- * Delete SDK session files older than maxAgeDays from the given group folders.
- * Only touches .claude/projects/ — preserves settings.json and skills/.
- */
-export function pruneOldSessions(
-  groupFolders: string[],
-  maxAgeDays: number,
-): void {
-  const maxAgeMs = maxAgeDays * 24 * 60 * 60 * 1000;
-  const now = Date.now();
-  let pruned = 0;
-
-  for (const folder of groupFolders) {
-    const projectsDir = path.join(
-      DATA_DIR,
-      'sessions',
-      folder,
-      '.claude',
-      'projects',
-    );
-    if (!fs.existsSync(projectsDir)) continue;
-
-    for (const subdir of fs.readdirSync(projectsDir)) {
-      const subdirPath = path.join(projectsDir, subdir);
-      try {
-        if (!fs.statSync(subdirPath).isDirectory()) continue;
-      } catch {
-        continue;
-      }
-
-      for (const file of fs.readdirSync(subdirPath)) {
-        const filePath = path.join(subdirPath, file);
-        try {
-          const stat = fs.statSync(filePath);
-          if (stat.isFile() && now - stat.mtimeMs > maxAgeMs) {
-            fs.unlinkSync(filePath);
-            pruned++;
-          }
-        } catch {
-          // File may have been removed between readdir and stat
-        }
-      }
-
-      // Clean up empty subdirectories
-      try {
-        if (fs.readdirSync(subdirPath).length === 0) {
-          fs.rmdirSync(subdirPath);
-        }
-      } catch {
-        // Race or permission issue — not critical
-      }
-    }
-  }
-
-  if (pruned > 0) {
-    logger.info({ pruned, folders: groupFolders }, 'Pruned old session files');
-  }
 }
 
 export interface AvailableGroup {

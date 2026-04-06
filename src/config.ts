@@ -124,7 +124,6 @@ export const MAX_MESSAGES_PER_PROMPT = Math.max(
 export const ATTACHMENT_MAX_SIZE = 15 * 1024 * 1024; // 15MB
 export const ATTACHMENT_MAX_PER_MESSAGE = 5;
 export const ATTACHMENT_PRUNE_DAYS = 14;
-export const SESSION_PRUNE_DAYS = 7;
 export const IPC_POLL_INTERVAL = 1000;
 export const HEARTBEAT_RECENCY_MS = 60 * 60 * 1000; // 1 hour — matters older than this are hidden from heartbeat
 export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min default — how long to keep container alive after last result
