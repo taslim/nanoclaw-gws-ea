@@ -1327,19 +1327,20 @@ async function main(): Promise<void> {
     onProcess: (groupJid, proc, containerName, groupFolder) =>
       queue.registerProcess(groupJid, proc, containerName, groupFolder),
     sendMessage: async (jid, rawText) => {
-      const { channel, targetJid } = resolveChannel(jid);
-      if (!channel) {
-        logger.warn({ jid }, 'No channel owns JID, cannot send message');
-        return;
-      }
+      // Only deliver response text to groups with a real channel.
+      // Synthetic groups communicate via send_message IPC instead.
+      const channel = findChannel(channels, jid);
+      if (!channel) return;
       const text = formatOutbound(rawText);
-      if (text) await channel.sendMessage(targetJid, text);
+      if (text) await channel.sendMessage(jid, text);
     },
   });
   startIpcWatcher({
-    sendMessage: async (jid, text) => {
+    sendMessage: async (jid, rawText) => {
       const { channel, targetJid } = resolveChannel(jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      const text = formatOutbound(rawText);
+      if (!text) return;
       await channel.sendMessage(targetJid, text);
       clearIndicators(targetJid);
     },
@@ -1451,8 +1452,9 @@ async function main(): Promise<void> {
     const prompt = buildEmailPrompt(email, isExternal, threadMessages);
 
     const emailTask = async (): Promise<void> => {
-      const { channel: outputChannel, targetJid: outputJid } =
-        resolveChannel(targetJid);
+      // Response text only delivered if group has a real channel.
+      // Synthetic groups (email, heartbeat) communicate via send_message IPC.
+      const outputChannel = findChannel(channels, targetJid);
 
       logger.info(
         { emailId: email.id, threadId: email.threadId, route: targetFolder },
@@ -1472,7 +1474,7 @@ async function main(): Promise<void> {
                 : JSON.stringify(result.result);
             const text = formatOutbound(raw);
             if (text && outputChannel) {
-              await outputChannel.sendMessage(outputJid, text);
+              await outputChannel.sendMessage(targetJid, text);
             }
           }
         },

@@ -183,6 +183,14 @@ When your principal tells you to leave something alone, not to touch a calendar 
 
 **Directive-matter linking.** If the directive relates to an active matter, also update the matter's context to reflect the directive as authoritative truth. The directive file is the broadcast; the matter is the source of truth. They must agree. Apply context hygiene — replace the superseded information, don't append the directive alongside contradictory facts.
 
+### Corrections
+
+When your principal corrects your approach, overrides your judgment, or redirects you — append a one-line entry to `notes/corrections.md` before moving on:
+
+- `YYYY-MM-DD | what you did | what the correction was | which procedure applies`
+
+This log is input for the weekly review, not a permanent record. Record when a procedure led you to the wrong conclusion or when your judgment call was off.
+
 ### Relationships
 
 Part of your job is maintaining your principal's relationship context. Before engaging with anyone, read: `/workspace/project/groups/global/procedures/relationships.md`.
@@ -191,7 +199,7 @@ Part of your job is maintaining your principal's relationship context. Before en
 
 Main-specific procedures (read-write):
 - `procedures/morning-briefing.md` — daily chief-of-staff briefing
-- `procedures/weekly-review.md` — Friday project tracker + chief-of-staff review
+- `procedures/weekly-review.md` — Friday system review + procedure refinement
 
 Global reference material is at `/workspace/project/groups/global/`:
 - `procedures/relationships.md` — tier definitions, Google Contacts as CRM, engagement rules

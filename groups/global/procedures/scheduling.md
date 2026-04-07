@@ -108,6 +108,10 @@ Use `mcp__time__*` tools for ALL date/time computation — resolving "next Tuesd
 7. Set your principal's `responseStatus` to `"accepted"` in the attendees list
 8. Timezone: use your principal's primary timezone
 
+## After Scheduling
+
+If this scheduling interaction is tracked by a matter, link the new calendar event as an artifact (`artifact_type: "calendar_event"`, `artifact_id: event_id`) and update the matter's context with the confirmed time, attendees, and any logistics. This is how other groups and future sweeps connect the event back to the workstream.
+
 ## Verification
 
 After creating any event, silently verify (do not send these checks to your principal):

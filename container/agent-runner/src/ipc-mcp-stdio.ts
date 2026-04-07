@@ -692,8 +692,18 @@ Artifact types: email_thread (Gmail thread ID), calendar_event (Google Calendar 
 
     writeIpcFile(TASKS_DIR, data);
 
+    // Surface existing active/waiting matters so the agent can spot duplicates
+    const existing = readMattersSnapshot()
+      .filter((m) => m.status === 'active' || m.status === 'waiting' || m.status === 'escalated')
+      .map((m) => `- [${m.id}] ${m.title}`);
+
+    let text = `Matter created: "${args.title}"`;
+    if (existing.length > 0) {
+      text += `\n\nExisting open matters — if this overlaps one, delete this matter and use update_matter instead:\n${existing.join('\n')}`;
+    }
+
     return {
-      content: [{ type: 'text' as const, text: `Matter created: "${args.title}"` }],
+      content: [{ type: 'text' as const, text }],
     };
   },
 );
@@ -737,15 +747,17 @@ Statuses: active (work remains), waiting (blocked on someone/something), paused 
 
 server.tool(
   'list_matters',
-  'List tracked matters. By default shows active and waiting matters. Use status to filter.',
+  'List tracked matters. By default shows active, waiting, and escalated matters. Use status to filter, or "all" to include paused and resolved.',
   {
-    status: z.enum(['active', 'waiting', 'paused', 'resolved']).optional().describe('Filter by status (default: active + waiting)'),
+    status: z.enum(['active', 'waiting', 'escalated', 'paused', 'resolved', 'all']).optional().describe('Filter by status (default: active + waiting + escalated)'),
   },
   async (args) => {
     const all = readMattersSnapshot();
-    const matters = args.status
-      ? all.filter((m) => m.status === args.status)
-      : all.filter((m) => m.status === 'active' || m.status === 'waiting');
+    const matters = args.status === 'all'
+      ? all
+      : args.status
+        ? all.filter((m) => m.status === args.status)
+        : all.filter((m) => m.status === 'active' || m.status === 'waiting' || m.status === 'escalated');
 
     if (matters.length === 0) {
       return { content: [{ type: 'text' as const, text: 'No matters matching filters.' }] };

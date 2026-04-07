@@ -17,11 +17,13 @@ Every email requires a triage decision before you compose anything. Default to a
 **Before composing**, get the full picture:
 
 1. Check if this thread is linked to a matter: `find_matter(artifact_type="email_thread", artifact_id=thread_id)`. If found, read the matter's context — it may contain principal instructions, prior decisions, or actions already taken that change how (or whether) you should respond. Apply the information authority hierarchy from global CLAUDE.md.
-2. Read the full email thread (not just the latest message) to see if you or another agent already replied, and to understand the full conversation arc. Don't duplicate a reply that was already sent.
+2. Read the full email thread (not just the latest message) to understand the conversation arc and check who sent the last message.
+3. If the most recent message on the thread was sent from your assistant email and no new inbound has arrived since — stop. Do not reply, correct, improve, or follow up on your own message. Exceptions: (a) your principal explicitly instructs you to send again, or (b) a follow-up on a stale thread (>72 hours with no reply from the other party). Outside these two cases, the thread is waiting on the other party — leave it alone.
+4. Before composing a *new* outbound email (not a reply), search Gmail (`search_gmail_messages`) for recent sent messages to the same recipient on the same topic. Reply on an existing thread rather than starting a new one when the conversation is clearly related.
 
 **Principal is already in the conversation → stay out.** If your principal has replied directly on the thread, they're handling it. Don't layer on top of their voice. The only reason to step in is if you're addressed directly, asked to take over, or have concrete logistics to add that your principal didn't include. Your principal choosing to reply directly is a signal, not a gap for you to fill.
 
-**Handle without asking:**
+**Handle without asking** (subject to step 3 above — this list governs *whether to involve your principal*, not whether to send):
 - Scheduling (use the scheduling procedure — it has its own judgment for when to involve your principal)
 - Confirmations, acknowledgments, follow-ups on existing threads
 - Information requests you can answer from context, research, or calendar
@@ -39,7 +41,7 @@ When the Decision Hierarchy says to escalate, use a decision packet (see below).
 
 Adding them to the thread keeps them on future replies. Forwarding gives them the full context.
 
-**Sent something wrong?** Re-read the source procedure before correcting — the error is usually in your interpretation, not just the output. If the mistake is cosmetic, course-correct in your next natural reply rather than sending a standalone correction.
+**Sent something wrong?** Re-read the source procedure before correcting — the error is usually in your interpretation, not just the output. If the mistake is cosmetic, wait for the next inbound message on the thread and course-correct in that reply. Do not send a standalone correction — the recipient doesn't need to see you arguing with yourself.
 
 ## Threading
 
@@ -52,8 +54,6 @@ Always include `references`. When thread history is available, the references ch
 Thread history is included in the prompt when available. Only fetch thread content separately if you need the full untruncated body of a specific message.
 
 Use the provided `to` and `cc` verbatim. If you change them, note it in italics at the top of the reply: *minus xyz*, *plus abc*, *just us*, etc. **Never guess an email address** — if you don't have it, look it up in Contacts or ask.
-
-Before composing a new outbound email, search Gmail (`search_gmail_messages`) for existing threads on the same topic. Reply on an existing thread rather than starting a new one when the conversation is clearly related.
 
 ## Style
 
@@ -93,8 +93,9 @@ Own commitments made in emails. Execute now, or schedule a task for future deadl
 Update the matter that tracks this workstream:
 
 - **Thread already linked to a matter** → update the matter's context with what happened: what the email said, what you did, the outcome. Apply context hygiene — reconcile, don't append.
-- **New workstream that warrants tracking** → create a matter and link the thread as an artifact. Include enough context for the next agent to understand the situation.
-- **One-off exchange, fully handled** → no matter needed. But if in doubt, create one — a matter that turns out unnecessary is cheap; a missed workstream is expensive.
+- **Outbound email about a tracked workstream** → link the sent thread as an artifact on the existing matter (`artifact_type: "email_thread"`, `artifact_id: thread_id`). If the email was triggered by a calendar event, also link the event (`artifact_type: "calendar_event"`, `artifact_id: event_id`). This is how the next agent finds your email.
+- **New workstream** → create a matter, link the thread as an artifact, include enough context for the next agent. Default to creating — a matter that turns out unnecessary is cheap; a missed workstream is expensive.
+- **One-off exchange, fully handled, no future action** → no matter needed. But "fully handled" means nothing downstream depends on it. If in doubt, create one.
 
 ## Verification
 
