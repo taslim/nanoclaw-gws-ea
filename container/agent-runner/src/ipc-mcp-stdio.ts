@@ -712,11 +712,11 @@ server.tool(
   'update_matter',
   `Update an existing matter. Only provided fields are changed; omitted fields stay the same. Use this to update status, context, add artifacts, or link a tracking file.
 
-Statuses: active (work remains), waiting (blocked on someone/something), paused (intentionally on hold), resolved (done).`,
+Statuses: active (work remains), waiting (blocked on someone/something), escalated (waiting on the principal), paused (intentionally on hold), resolved (done).`,
   {
     matter_id: z.number().describe('The matter ID'),
     title: z.string().optional().describe('New title'),
-    status: z.enum(['active', 'waiting', 'paused', 'resolved']).optional().describe('New status'),
+    status: z.enum(['active', 'waiting', 'escalated', 'paused', 'resolved']).optional().describe('New status'),
     context: z.string().optional().describe('Updated living summary — rewrite the whole context, not append'),
     artifacts: z.array(z.object({
       type: z.enum(ARTIFACT_TYPES),

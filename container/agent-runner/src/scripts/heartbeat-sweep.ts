@@ -107,8 +107,8 @@ interface SweepBrief {
 
 interface SweepState {
   last_sweep_at: string;
-  matters: Record<string, { updated_at: string; reported_at: string }>;
-  calendar: Record<string, { updated: string; reported_at: string }>;
+  matters: Record<string, { updated_at: string; reported_at: string; fingerprint?: string }>;
+  calendar: Record<string, { updated: string; reported_at: string; fingerprint?: string }>;
 }
 
 interface EventFilter {
@@ -435,6 +435,9 @@ function tagMatters(
   const now = Date.now();
 
   for (const matter of matters) {
+    const isOpen = matter.status === 'active' || matter.status === 'waiting' || matter.status === 'escalated';
+    if (!isOpen) continue;
+
     if (matter.status === 'escalated' && !matter.tags.includes('skip_escalated')) {
       matter.tags.push('skip_escalated');
     }
@@ -814,31 +817,33 @@ async function main(): Promise<void> {
     calendar: {},
   };
 
-  // Dedup matters
+  // Dedup matters — fingerprint includes tags so state transitions (e.g. stalled_followup) wake the agent
   const survivingMatters: MatterBrief[] = [];
   for (const m of matterBriefs) {
     const key = String(m.id);
     const prev = prevState.matters[key];
+    const fingerprint = `${m.updated_at}|${m.tags.sort().join(',')}`;
 
-    if (prev && prev.updated_at === m.updated_at) {
+    if (prev && prev.fingerprint === fingerprint) {
       newState.matters[key] = prev;
     } else {
       survivingMatters.push(m);
-      newState.matters[key] = { updated_at: m.updated_at, reported_at: nowIso };
+      newState.matters[key] = { updated_at: m.updated_at, reported_at: nowIso, fingerprint };
     }
   }
 
-  // Dedup calendar findings
+  // Dedup calendar findings — fingerprint includes tags + conflicts
   const survivingCalendar: CalendarBrief[] = [];
   for (const finding of calendarFindings) {
     const key = `${finding.meta.calendar_id}:${finding.meta.event_id}`;
     const prev = prevState.calendar[key];
+    const fingerprint = `${finding.meta.updated}|${finding.tags.sort().join(',')}|${finding.conflictWith ?? ''}`;
 
-    if (prev && prev.updated === finding.meta.updated) {
+    if (prev && prev.fingerprint === fingerprint) {
       newState.calendar[key] = prev;
     } else {
       survivingCalendar.push(toCalendarBrief(finding.meta, finding.tags, finding.conflictWith));
-      newState.calendar[key] = { updated: finding.meta.updated, reported_at: nowIso };
+      newState.calendar[key] = { updated: finding.meta.updated, reported_at: nowIso, fingerprint };
     }
   }
 
