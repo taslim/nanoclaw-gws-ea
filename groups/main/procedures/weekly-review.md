@@ -1,35 +1,52 @@
 # Weekly Review
 
-Friday review of key projects — matters with a `tracking_file`. These are the long-running, high-stakes workstreams that warrant a detailed weekly check-in. Routine email matters and one-off tasks are not in scope — the sweep handles those.
+Friday system review. You review how the system performed this week and propose targeted edits to procedures and instructions. Your principal decides what ships.
 
-Your principal scans this over the weekend to plan the week ahead.
+This is not a retrospective or a report. It's a procedure edit session.
 
-Use `mcp__time__*` tools for ALL date/time computation. Never calculate dates yourself.
+## Gather
 
-## Execution
+Use `mcp__time__*` tools for ALL date/time computation.
 
-1. Load all matters via `list_matters` — filter to those with a `tracking_file` (use `get_matter` to check)
-2. For each, read the tracking file for detailed context, then fetch fresh source data — pull linked email threads and read linked calendar events from the API to verify the matter context is current
-3. Update the tracking file contents with current status and blockers, and refresh the matter's context summary
-4. Compose one message with what your principal needs to see. Send via `mcp__nanoclaw__send_message`, even if everything is green
+1. **Corrections** — read `notes/corrections.md`. These are recorded instances where your principal corrected your approach during the week.
+2. **Heartbeat activity** — read heartbeat messages from the heartbeat space (profile.md) for the past 7 days via `mcp__workspace__chat_list_messages`.
+3. **Matters** — `list_matters(status: "all")`, filter to those with `updated_at` in the last 7 days. For each, `get_matter` and check the context for how it was handled — escalation patterns, resolution path, corrections recorded.
+4. **Directives** — read `notes/directives.md`. Note any that were added this week — they often signal a procedure gap (the system did something the principal had to override).
 
-## What to Surface
+## Identify
 
-In the message to your principal:
-- Stalled or blocked matters get a one-line status each — what's wrong and what you recommend
-- Healthy matters get skipped. If everything is healthy, say so
-- If a matter has been waiting or active for multiple weeks with no progress, escalate the framing — it's drifting, not just "needs attention"
-- Matters that should be resolved but aren't — surface the question
+Look for patterns, not incidents. A single correction is noise. The same type of correction twice, or multiple escalations with the same shape, is a signal.
 
-## Decisions Needed
+- Did a procedure lead to the wrong conclusion more than once?
+- Were escalations predictable from existing rules? If yes, the auto-resolve scope could be wider.
+- Were auto-resolutions overridden? If yes, the scope is too wide.
+- Did the same type of issue recur (scheduling conflicts, email tone, missing context)?
+- Were new directives added because the system acted on something it shouldn't have?
 
-Matters with status `escalated` that are still unresolved, plus any that should be escalated but weren't. Numbered, with your recommendation and deadline.
+## Propose
 
-If nothing needs a decision, skip this section entirely.
+For each pattern found, draft a specific edit:
 
-## Tone
+1. **Read the full target file** before proposing any change.
+2. **Read all related markdown files** — a change to one procedure or CLAUDE.md may conflict with another. Check cross-references.
+3. **Draft the edit**: which file, which section, what it currently says, what it should say instead.
+4. **Explain why**: what happened this week that this edit would have changed.
+5. **Verify consistency**: ensure the edit doesn't contradict instructions elsewhere. If it does, draft edits to both files.
 
-Write like a weekly staff memo, not a dashboard dump. Judgment-forward — don't just list what's overdue, say what matters and what you recommend. Terse, direct, scannable in 2 minutes.
+Edits should match the target file's existing voice and structure. No new sections unless the change genuinely warrants it. No bloat, no repetition. If the change fits as a clause in an existing rule, put it there.
+
+## Present
+
+Send via `mcp__nanoclaw__send_message`:
+
+- If patterns were found: one item per proposed change — the file, the edit, and why. Keep it scannable. Your principal replies with what to apply, what to skip, and any adjustments.
+- If nothing surfaced: exit quietly. A quiet week means the system is working. Don't manufacture observations.
+
+## After
+
+When your principal approves changes, make the edits. After editing, re-read the modified file to verify it reads coherently — the edit should look like it was always there.
+
+Once the conversation is done and all approved edits are applied, clear `notes/corrections.md`.
 
 ## Output
 
