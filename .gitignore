@@ -1,6 +1,8 @@
 # Dependencies
 node_modules/
 .npm-cache/
+# pnpm content-addressable store (created when running in sandbox mode)
+.pnpm-store/
 # Build output
 dist/
 
@@ -9,37 +11,19 @@ store/
 data/
 logs/
 
-# Groups - track EA structure, ignore runtime data
+# Groups - per-installation state, not tracked
 groups/*
-!groups/main/
-!groups/global/
-!groups/email-principal/
-!groups/email-external/
-!groups/heartbeat/
 
-# Within tracked groups: track docs, ignore runtime
-groups/main/*
-!groups/main/CLAUDE.md
-!groups/main/procedures/
-groups/global/*
-!groups/global/CLAUDE.md
-!groups/global/profile.md
-!groups/global/procedures/
-groups/email-principal/*
-!groups/email-principal/CLAUDE.md
-groups/email-external/*
-!groups/email-external/CLAUDE.md
-groups/heartbeat/*
-!groups/heartbeat/CLAUDE.md
-
-# Runtime data (never tracked, even in whitelisted groups)
-groups/*/conversations/
-groups/*/notes/
-groups/*/auth/
+# Composer-managed CLAUDE.md artifacts (regenerated every spawn) and
+# per-group memory (CLAUDE.local.md) must never be committed.
+**/CLAUDE.local.md
+**/.claude-shared.md
+**/.claude-fragments/
 
 # Secrets
 *.keys.json
 .env
+.env*
 
 # Temp files
 .tmp-*
@@ -50,10 +34,6 @@ groups/*/auth/
 # IDE
 .idea/
 .vscode/
-
-# Claude Code
-.claude/agent-memory/
-.claude/settings.local.json
 
 # Skills system (local per-installation state)
 .nanoclaw/
