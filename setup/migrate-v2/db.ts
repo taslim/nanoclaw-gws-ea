@@ -29,10 +29,13 @@ import {
 import { runMigrations } from '../../src/db/migrations/index.js';
 import { readEnvFile } from '../../src/env.js';
 import { buildDiscordResolver, type DiscordResolver } from './discord-resolver.js';
+import { buildGchatResolver, type GchatResolver } from './gchat-resolver.js';
+import { getSaKeyPath } from '../../src/gws-paths.js';
 import {
   generateId,
   inferIsGroup,
   parseJid,
+  SELF_MANAGED_FOLDERS,
   triggerToEngage,
   v2PlatformId,
 } from './shared.js';
@@ -108,7 +111,32 @@ async function main(): Promise<void> {
     }
   }
 
+  // GChat JIDs are opaque — classify via spaces.get; falls back to inferIsGroup on failure.
+  let gchatResolver: GchatResolver | null = null;
+  const gchatSpaceIds = v1Groups
+    .map((g) => parseJid(g.jid))
+    .filter((p): p is NonNullable<typeof p> => p?.channel_type === 'gchat')
+    .map((p) => p.id);
+  if (gchatSpaceIds.length > 0) {
+    const env = readEnvFile(['ASSISTANT_EMAIL']);
+    gchatResolver = await buildGchatResolver(getSaKeyPath(), env.ASSISTANT_EMAIL ?? null, gchatSpaceIds);
+    const stats = gchatResolver.stats();
+    if (stats.reason) {
+      console.log(`WARN:gchat resolver disabled: ${stats.reason}`);
+    } else {
+      console.log(`INFO:gchat resolver: ${stats.dms} DM(s), ${stats.groups} group(s)`);
+    }
+  }
+
   for (const g of v1Groups) {
+    if (SELF_MANAGED_FOLDERS.has(g.folder)) {
+      skipped++;
+      console.log(
+        `INFO:skipping self-managed folder '${g.folder}' — init-email/init-heartbeat will create the v2 form`,
+      );
+      continue;
+    }
+
     const parsed = parseJid(g.jid);
     if (!parsed) {
       skipped++;
@@ -160,12 +188,17 @@ async function main(): Promise<void> {
       // policy via the skill — leave it alone.
       let mg = getMessagingGroupByPlatform(channelType, platformId);
       if (!mg) {
+        // For GChat, prefer the API-derived classification when available;
+        // the JID alone can't distinguish DM from group/space.
+        const resolvedIsGroup =
+          channelType === 'gchat' && gchatResolver ? gchatResolver.resolveIsGroup(parsed.id) : null;
+        const isGroup = resolvedIsGroup ?? inferIsGroup(channelType, platformId);
         createMessagingGroup({
           id: generateId('mg'),
           channel_type: channelType,
           platform_id: platformId,
           name: g.name || null,
-          is_group: inferIsGroup(channelType, platformId),
+          is_group: isGroup,
           unknown_sender_policy: 'public',
           created_at: createdAt,
         });

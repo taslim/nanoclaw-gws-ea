@@ -70,6 +70,21 @@ function insertOutbound(agentGroupId: string, sessionId: string, msgId: string):
   db.close();
 }
 
+function insertOutboundWithPriority(
+  agentGroupId: string,
+  sessionId: string,
+  msgId: string,
+  priority: string,
+  text: string,
+): void {
+  const db = new Database(outboundDbPath(agentGroupId, sessionId));
+  db.prepare(
+    `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content, priority)
+     VALUES (?, datetime('now'), 'chat', 'telegram:123', 'telegram', ?, ?)`,
+  ).run(msgId, JSON.stringify({ text }), priority);
+  db.close();
+}
+
 beforeEach(() => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
@@ -217,6 +232,62 @@ describe('deliverSessionMessages — retry and permanent failure', () => {
     // Attempt 3 — not called, message already delivered
     await deliverSessionMessages(session);
     expect(callCount).toBe(2);
+  });
+});
+
+describe('deliverSessionMessages — priority loudness', () => {
+  it('injects <users/all> into the body for attention', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutboundWithPriority('ag-1', session.id, 'out-attn', 'attention', 'meeting prep brief');
+
+    const calls: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, _tid, _kind, content) {
+        calls.push(content);
+        return 'plat-msg';
+      },
+    });
+
+    await deliverSessionMessages(session);
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(calls[0]).text).toBe('<users/all> meeting prep brief');
+  });
+
+  it('leaves the body untouched for awareness', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutboundWithPriority('ag-1', session.id, 'out-aware', 'awareness', 'declined a low-priority ask');
+
+    const calls: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, _tid, _kind, content) {
+        calls.push(content);
+        return 'plat-msg';
+      },
+    });
+
+    await deliverSessionMessages(session);
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(calls[0]).text).toBe('declined a low-priority ask');
+  });
+
+  it('leaves the body untouched for urgent (a DM is already a ping)', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutboundWithPriority('ag-1', session.id, 'out-urgent', 'urgent', 'board prep cancelled');
+
+    const calls: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, _tid, _kind, content) {
+        calls.push(content);
+        return 'plat-msg';
+      },
+    });
+
+    await deliverSessionMessages(session);
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(calls[0]).text).toBe('board prep cancelled');
   });
 });
 

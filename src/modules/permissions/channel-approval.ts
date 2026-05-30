@@ -55,6 +55,7 @@ import type { InboundEvent } from '../../channels/adapter.js';
 import type { AgentGroup } from '../../types.js';
 import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
 import { createPendingChannelApproval, hasInFlightChannelApproval } from './db/pending-channel-approvals.js';
+import { parseHandshake } from './peer-ea.js';
 import { hasAdminPrivilege } from './db/user-roles.js';
 
 // ── Value constants (response handler in index.ts parses these) ──
@@ -63,6 +64,7 @@ export const CONNECT_PREFIX = 'connect:';
 export const NEW_AGENT_VALUE = 'new_agent';
 export const CHOOSE_EXISTING_VALUE = 'choose_existing';
 export const REJECT_VALUE = 'reject';
+export const PEER_EA_VALUE = 'peer_ea';
 
 // ── Utilities ──
 
@@ -77,6 +79,22 @@ function toFolder(name: string): string {
 
 // ── Card builders ──
 
+const NEW_AGENT_OPTION: RawOption = {
+  label: 'Connect new agent',
+  selectedLabel: '🆕 Connecting new agent…',
+  value: NEW_AGENT_VALUE,
+};
+const PEER_EA_OPTION: RawOption = {
+  label: 'Connect new peer-EA agent',
+  selectedLabel: '🤝 Connecting new peer-EA agent…',
+  value: PEER_EA_VALUE,
+};
+const REJECT_OPTION: RawOption = {
+  label: 'Reject',
+  selectedLabel: '🙅 Rejected',
+  value: REJECT_VALUE,
+};
+
 function visibleAgentGroupsForApprover(
   agentGroups: AgentGroup[],
   approverUserId: string | null | undefined,
@@ -85,7 +103,11 @@ function visibleAgentGroupsForApprover(
   return agentGroups.filter((agentGroup) => hasAdminPrivilege(approverUserId, agentGroup.id));
 }
 
-function buildApprovalOptions(agentGroups: AgentGroup[], approverUserId?: string | null): RawOption[] {
+function buildApprovalOptions(
+  agentGroups: AgentGroup[],
+  peerEaSignal: boolean,
+  approverUserId?: string | null,
+): RawOption[] {
   const visibleAgentGroups = visibleAgentGroupsForApprover(agentGroups, approverUserId);
   const options: RawOption[] = [];
   if (visibleAgentGroups.length === 1) {
@@ -101,16 +123,15 @@ function buildApprovalOptions(agentGroups: AgentGroup[], approverUserId?: string
       value: CHOOSE_EXISTING_VALUE,
     });
   }
-  options.push({
-    label: 'Connect new agent',
-    selectedLabel: '🆕 Connecting new agent…',
-    value: NEW_AGENT_VALUE,
-  });
-  options.push({
-    label: 'Reject',
-    selectedLabel: '🙅 Rejected',
-    value: REJECT_VALUE,
-  });
+  // Signal can be forged; only changes the suggested default, not what's
+  // available. Picking peer-EA is strictly less privilege than new-agent,
+  // so a forged signal nudges the recipient toward less access, not more.
+  if (peerEaSignal) {
+    options.push(PEER_EA_OPTION, NEW_AGENT_OPTION);
+  } else {
+    options.push(NEW_AGENT_OPTION, PEER_EA_OPTION);
+  }
+  options.push(REJECT_OPTION);
   return options;
 }
 
@@ -119,8 +140,9 @@ function buildQuestionText(
   senderName: string | undefined,
   channelName: string | null,
   channelType: string,
+  peerPrincipal: string | null,
 ): string {
-  const who = senderName ?? 'Someone';
+  const who = peerPrincipal && senderName ? `${senderName} from ${peerPrincipal}` : (senderName ?? 'Someone');
   if (isGroup) {
     const where = channelName ? `${channelName} on ${channelType}` : `a ${channelType} channel`;
     return `${who} mentioned your bot in ${where}. How would you like to handle this channel?`;
@@ -194,17 +216,21 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   const isGroup = event.message?.isGroup ?? originMg?.is_group === 1;
 
   let senderName: string | undefined;
+  let messageBody: string | undefined;
   try {
     const parsed = JSON.parse(event.message.content) as Record<string, unknown>;
     senderName = (parsed.senderName ?? parsed.sender) as string | undefined;
+    messageBody = typeof parsed.text === 'string' ? parsed.text : undefined;
   } catch {
     // non-critical
   }
 
+  const handshake = messageBody ? parseHandshake(messageBody) : null;
+
   const channelName = originMg?.name ?? null;
   const title = isGroup ? '📣 Bot mentioned in new channel' : '💬 New direct message';
-  const question = buildQuestionText(isGroup, senderName, channelName, originChannelType);
-  const options = normalizeOptions(buildApprovalOptions(agentGroups, delivery.userId));
+  const question = buildQuestionText(isGroup, senderName, channelName, originChannelType, handshake?.principal ?? null);
+  const options = normalizeOptions(buildApprovalOptions(agentGroups, handshake !== null, delivery.userId));
 
   createPendingChannelApproval({
     messaging_group_id: messagingGroupId,
@@ -270,16 +296,29 @@ export function buildAgentSelectionOptions(
 }
 
 /**
- * Create a new agent group and initialize its filesystem. Handles
- * folder-name collisions with numeric suffixes.
+ * Create a new agent group and initialize its filesystem.
+ *
+ * Folder defaults to `toFolder(name)` with numeric suffixes (`-2`, `-3`,
+ * …) on collision — the upstream behavior. Callers with their own naming
+ * convention (e.g. peer-EA's random-suffixed slug) pass `folder` directly
+ * and own collision handling themselves.
+ *
+ * `instructions`, when provided, is seeded into CLAUDE.local.md by
+ * initGroupFilesystem on first creation. Without it, the file is created
+ * empty and the agent populates it organically.
  */
-export function createNewAgentGroup(name: string): AgentGroup {
-  let folder = toFolder(name);
-  const baseFolder = folder;
-  let suffix = 2;
-  while (getAgentGroupByFolder(folder)) {
-    folder = `${baseFolder}-${suffix}`;
-    suffix++;
+export function createNewAgentGroup(name: string, opts?: { folder?: string; instructions?: string }): AgentGroup {
+  let folder: string;
+  if (opts?.folder) {
+    folder = opts.folder;
+  } else {
+    folder = toFolder(name);
+    const baseFolder = folder;
+    let suffix = 2;
+    while (getAgentGroupByFolder(folder)) {
+      folder = `${baseFolder}-${suffix}`;
+      suffix++;
+    }
   }
 
   const agId = `ag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -292,6 +331,6 @@ export function createNewAgentGroup(name: string): AgentGroup {
   });
 
   const ag = getAgentGroup(agId)!;
-  initGroupFilesystem(ag);
+  initGroupFilesystem(ag, opts?.instructions ? { instructions: opts.instructions } : undefined);
   return ag;
 }

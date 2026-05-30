@@ -148,7 +148,7 @@ async function main(): Promise<void> {
       agent_group_id: ag.id,
       engage_mode: 'pattern',
       engage_pattern: '.',
-      sender_scope: 'all',
+      sender_scope: 'known',
       ignored_message_policy: 'drop',
       session_mode: 'shared',
       priority: 0,

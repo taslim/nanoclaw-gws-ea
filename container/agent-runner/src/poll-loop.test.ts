@@ -4,7 +4,7 @@ import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
-import { isCorruptionError } from './poll-loop.js';
+import { dispatchResultText, isCorruptionError } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 
 beforeEach(() => {
@@ -376,6 +376,140 @@ describe('end-to-end with mock provider', () => {
     expect(outMessages).toHaveLength(1);
     expect(JSON.parse(outMessages[0].content).text).toBe('The answer is 4');
     expect(outMessages[0].in_reply_to).toBe('m1');
+  });
+});
+
+describe('dispatchResultText — multi-block + unknown-destination behavior', () => {
+  // Predicate-level dedup behavior (verbatim match, whitespace normalization,
+  // case sensitivity, empty edges) is covered by `isVerbatimDuplicate` unit
+  // tests in integration.test.ts. These two tests cover dispatch-loop
+  // concerns that the pure predicate can't: per-block filtering across a
+  // multi-block result, and the unknownDestinations return field used by
+  // the result handler's nudge.
+  const ROUTING = { channelType: 'chat', platformId: 'p', threadId: null, inReplyTo: null };
+
+  beforeEach(() => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('peer', 'Peer', 'channel', 'chat', 'p', NULL)`,
+      )
+      .run();
+  });
+
+  it('drops only the duplicate block in a mixed-block response', () => {
+    const { sent } = dispatchResultText(
+      '<message to="peer">on it</message><message to="peer">here is the result</message>',
+      ROUTING,
+      ['on it'],
+    );
+    expect(sent).toBe(1);
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe('here is the result');
+  });
+
+  it('reports unknown destinations (so the agent can be nudged)', () => {
+    const { sent, unknownDestinations } = dispatchResultText(
+      '<message to="parent">should be principal</message><message to="peer">this lands</message>',
+      ROUTING,
+    );
+    expect(sent).toBe(1);
+    expect(unknownDestinations).toEqual(['parent']);
+  });
+});
+
+describe('dispatchResultText — priority routing', () => {
+  const ROUTING = { channelType: 'chat', platformId: 'p', threadId: null, inReplyTo: null };
+
+  beforeEach(() => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES
+           ('principal', 'Principal', 'channel', 'chat', 'pid-principal', NULL),
+           ('heartbeat', 'Heartbeat', 'channel', 'chat', 'pid-heartbeat', NULL),
+           ('peer', 'Peer', 'channel', 'chat', 'pid-peer', NULL)`,
+      )
+      .run();
+  });
+
+  it('urgent resolves to the principal surface and records priority', () => {
+    const { sent } = dispatchResultText('<message priority="urgent">cancel the board prep</message>', ROUTING);
+    expect(sent).toBe(1);
+    const [out] = getUndeliveredMessages();
+    expect(out.platform_id).toBe('pid-principal');
+    expect(out.priority).toBe('urgent');
+    expect(JSON.parse(out.content).text).toBe('cancel the board prep');
+  });
+
+  it('attention resolves to the heartbeat surface', () => {
+    const { sent } = dispatchResultText('<message priority="attention">meeting prep brief</message>', ROUTING);
+    expect(sent).toBe(1);
+    const [out] = getUndeliveredMessages();
+    expect(out.platform_id).toBe('pid-heartbeat');
+    expect(out.priority).toBe('attention');
+  });
+
+  it('awareness resolves to the heartbeat surface silently', () => {
+    const { sent } = dispatchResultText('<message priority="awareness">declined a low-priority ask</message>', ROUTING);
+    expect(sent).toBe(1);
+    const [out] = getUndeliveredMessages();
+    expect(out.platform_id).toBe('pid-heartbeat');
+    expect(out.priority).toBe('awareness');
+  });
+
+  it('rejects a block carrying both to= and priority= (mutual exclusion)', () => {
+    const { sent } = dispatchResultText('<message to="principal" priority="urgent">x</message>', ROUTING);
+    expect(sent).toBe(0);
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('drops a block with an unknown priority value', () => {
+    const { sent } = dispatchResultText('<message priority="loud">x</message>', ROUTING);
+    expect(sent).toBe(0);
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('strips a literal <users/all> the agent wrote into the body', () => {
+    const { sent } = dispatchResultText('<message priority="awareness"><users/all> heads up</message>', ROUTING);
+    expect(sent).toBe(1);
+    const [out] = getUndeliveredMessages();
+    expect(JSON.parse(out.content).text).toBe('heads up');
+    expect(JSON.parse(out.content).text).not.toContain('<users/all>');
+  });
+
+  it('legacy to="principal" is shimmed to priority="urgent"', () => {
+    const { sent } = dispatchResultText('<message to="principal">old-style ping</message>', ROUTING);
+    expect(sent).toBe(1);
+    const [out] = getUndeliveredMessages();
+    expect(out.platform_id).toBe('pid-principal');
+    expect(out.priority).toBe('urgent');
+  });
+
+  it('legacy to="heartbeat" with <users/all> is shimmed to attention', () => {
+    const { sent } = dispatchResultText('<message to="heartbeat"><users/all> [Sweep] log</message>', ROUTING);
+    expect(sent).toBe(1);
+    const [out] = getUndeliveredMessages();
+    expect(out.platform_id).toBe('pid-heartbeat');
+    expect(out.priority).toBe('attention');
+    expect(JSON.parse(out.content).text).not.toContain('<users/all>');
+  });
+
+  it('legacy to="heartbeat" without <users/all> is shimmed to awareness', () => {
+    const { sent } = dispatchResultText('<message to="heartbeat">[Sweep] quiet log</message>', ROUTING);
+    expect(sent).toBe(1);
+    const [out] = getUndeliveredMessages();
+    expect(out.platform_id).toBe('pid-heartbeat');
+    expect(out.priority).toBe('awareness');
+  });
+
+  it('a non-principal destination still routes without priority', () => {
+    const { sent } = dispatchResultText('<message to="peer">coordinate</message>', ROUTING);
+    expect(sent).toBe(1);
+    const [out] = getUndeliveredMessages();
+    expect(out.platform_id).toBe('pid-peer');
+    expect(out.priority).toBeNull();
   });
 });
 

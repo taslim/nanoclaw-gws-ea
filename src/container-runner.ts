@@ -10,6 +10,8 @@ import path from 'path';
 import { OneCLI } from '@onecli-sh/sdk';
 
 import {
+  ASSISTANT_EMAIL,
+  ASSISTANT_NAME,
   CONTAINER_IMAGE,
   CONTAINER_IMAGE_BASE,
   CONTAINER_INSTALL_LABEL,
@@ -17,6 +19,7 @@ import {
   GROUPS_DIR,
   ONECLI_API_KEY,
   ONECLI_URL,
+  PRINCIPAL_EMAILS,
   TIMEZONE,
 } from './config.js';
 import { materializeContainerJson } from './container-config.js';
@@ -27,9 +30,11 @@ import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { initGroupFilesystem } from './group-init.js';
+import { CONTAINER_CALENDARS_PATH, CONTAINER_SA_PATH, getCalendarsHostPath, getSaKeyPath } from './gws-paths.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
+import { assignNamespacedSecrets } from './onecli-namespace.js';
 // Provider host-side config barrel — each provider that needs host-side
 // container setup self-registers on import.
 import './providers/index.js';
@@ -45,7 +50,7 @@ import {
   sessionDir,
   writeSessionRouting,
 } from './session-manager.js';
-import type { AgentGroup, Session } from './types.js';
+import type { AgentGroup, SenderScope, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
@@ -112,12 +117,18 @@ async function spawnContainer(session: Session): Promise<void> {
     return;
   }
 
+  const trust = computeAgentGroupTrust(agentGroup.id);
+
   // Refresh the destination map and default reply routing so any admin
   // changes take effect on wake. Destinations come from the agent-to-agent
   // module — skip when the module isn't installed (table absent).
   if (hasTable(getDb(), 'agent_destinations')) {
     const { writeDestinations } = await import('./modules/agent-to-agent/write-destinations.js');
     writeDestinations(agentGroup.id, session.id);
+  }
+  if (hasTable(getDb(), 'matters')) {
+    const { writeMatters } = await import('./modules/matters/write-matters.js');
+    writeMatters(agentGroup.id, session.id);
   }
   writeSessionRouting(agentGroup.id, session.id);
 
@@ -144,6 +155,7 @@ async function spawnContainer(session: Session): Promise<void> {
     provider,
     contribution,
     agentIdentifier,
+    trust,
   );
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
@@ -159,10 +171,15 @@ async function spawnContainer(session: Session): Promise<void> {
   activeContainers.set(session.id, { process: container, containerName });
   markContainerRunning(session.id);
 
-  // Log stderr
+  // Log stderr at debug, but buffer recent lines so we can surface them on
+  // unexpected exits (non-zero, non-SIGTERM/SIGKILL).
+  const stderrTail: string[] = [];
   container.stderr?.on('data', (data) => {
     for (const line of data.toString().trim().split('\n')) {
-      if (line) log.debug(line, { container: agentGroup.folder });
+      if (!line) continue;
+      log.debug(line, { container: agentGroup.folder });
+      stderrTail.push(line);
+      if (stderrTail.length > 50) stderrTail.shift();
     }
   });
 
@@ -174,10 +191,22 @@ async function spawnContainer(session: Session): Promise<void> {
   // (see src/host-sweep.ts). This avoids killing long-running legitimate work
   // on a wall-clock timer.
 
+  // Process exit codes for signal-induced exits. Used to suppress the stderr
+  // dump for sweep-driven kills (which are expected, not failures).
+  const EXIT_SIGKILL = 137;
+  const EXIT_SIGTERM = 143;
   container.on('close', (code) => {
     activeContainers.delete(session.id);
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
+    if (code !== 0 && code !== EXIT_SIGKILL && code !== EXIT_SIGTERM && stderrTail.length > 0) {
+      log.warn('Container exited unexpectedly — stderr tail', {
+        sessionId: session.id,
+        code,
+        containerName,
+        stderr: stderrTail.join('\n'),
+      });
+    }
     log.info('Container exited', { sessionId: session.id, code, containerName });
   });
 
@@ -220,6 +249,22 @@ export function resolveProviderName(
   containerConfigProvider: string | null | undefined,
 ): string {
   return (sessionProvider || containerConfigProvider || 'claude').toLowerCase();
+}
+
+// Most-restrictive `sender_scope` across the agent_group's wirings; empty defaults to 'all'.
+//
+// Invariant: `sender_scope` ↔ `NANOCLAW_TRUST` are 1:1. A wiring's
+// `sender_scope='all'` taints the whole agent group's MCP scope to 'all'
+// (readonly external-tool subset). Setup scripts default to 'known' for
+// principal-bootstrap wirings (init-first-agent, init-cli-agent) so the
+// agent gets the full PRINCIPAL_WORKSPACE_TOOLS subset. Owner grants come
+// from PRINCIPAL_EMAILS via `syncInstallState` (src/install-state.ts).
+function computeAgentGroupTrust(agentGroupId: string): SenderScope {
+  const rows = getDb()
+    .prepare('SELECT sender_scope FROM messaging_group_agents WHERE agent_group_id = ?')
+    .all(agentGroupId) as Array<{ sender_scope: SenderScope }>;
+  if (rows.length === 0) return 'all';
+  return rows.some((r) => r.sender_scope === 'all') ? 'all' : 'known';
 }
 
 function resolveProviderContribution(
@@ -320,6 +365,17 @@ function buildMounts(
     mounts.push({ hostPath: skillsSrc, containerPath: '/app/skills', readonly: true });
   }
 
+  // Fork (GWS-EA): top-level mount path (not under /workspace/) — virtiofs on
+  // Docker for Mac rejects nested file binds. Groups without GWS skip.
+  const gwsSaPath = getSaKeyPath();
+  if (fs.existsSync(gwsSaPath)) {
+    mounts.push({ hostPath: gwsSaPath, containerPath: CONTAINER_SA_PATH, readonly: true });
+  }
+  const gwsCalendarsPath = getCalendarsHostPath();
+  if (fs.existsSync(gwsCalendarsPath)) {
+    mounts.push({ hostPath: gwsCalendarsPath, containerPath: CONTAINER_CALENDARS_PATH, readonly: true });
+  }
+
   // Additional mounts from container config
   if (containerConfig.additionalMounts && containerConfig.additionalMounts.length > 0) {
     const validated = validateAdditionalMounts(containerConfig.additionalMounts, agentGroup.name);
@@ -403,13 +459,24 @@ async function buildContainerArgs(
   containerConfig: import('./container-config.js').ContainerConfig,
   provider: string,
   providerContribution: ProviderContainerContribution,
-  agentIdentifier?: string,
+  agentIdentifier: string | undefined,
+  trust: SenderScope,
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
 
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  args.push('-e', `NANOCLAW_TRUST=${trust}`);
+
+  if (ASSISTANT_EMAIL) {
+    args.push('-e', `ASSISTANT_EMAIL=${ASSISTANT_EMAIL}`);
+  }
+
+  if (PRINCIPAL_EMAILS) {
+    args.push('-e', `PRINCIPAL_EMAILS=${PRINCIPAL_EMAILS}`);
+  }
 
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
@@ -424,7 +491,11 @@ async function buildContainerArgs(
   // The caller (router or host-sweep) catches the throw, leaves the inbound
   // message pending, and the next sweep tick retries.
   if (agentIdentifier) {
-    await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
+    await onecli.ensureAgent({
+      name: `${ASSISTANT_NAME.toLowerCase()}-${agentGroup.folder}`,
+      identifier: agentIdentifier,
+    });
+    await assignNamespacedSecrets(agentIdentifier);
   }
   const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
   if (!onecliApplied) {

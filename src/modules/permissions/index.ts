@@ -17,7 +17,12 @@
  */
 import { recordDroppedMessage } from '../../db/dropped-messages.js';
 import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
-import { createMessagingGroupAgent, setMessagingGroupDeniedAt } from '../../db/messaging-groups.js';
+import { registerDeliveryAction } from '../../delivery.js';
+import {
+  createMessagingGroupAgent,
+  setMessagingGroupDeniedAt,
+  updateMessagingGroup,
+} from '../../db/messaging-groups.js';
 import {
   routeInbound,
   setAccessGate,
@@ -31,7 +36,7 @@ import type { InboundEvent } from '../../channels/adapter.js';
 import { registerResponseHandler, type ResponsePayload } from '../../response-registry.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
-import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';
+import type { AgentGroup, MessagingGroup, MessagingGroupAgent, SenderScope } from '../../types.js';
 import { canAccessAgentGroup } from './access.js';
 import {
   buildAgentSelectionOptions,
@@ -39,6 +44,7 @@ import {
   CONNECT_PREFIX,
   createNewAgentGroup,
   NEW_AGENT_VALUE,
+  PEER_EA_VALUE,
   REJECT_VALUE,
   requestChannelApproval,
 } from './channel-approval.js';
@@ -51,18 +57,61 @@ import {
 import { deletePendingSenderApproval, getPendingSenderApproval } from './db/pending-sender-approvals.js';
 import { hasAdminPrivilege } from './db/user-roles.js';
 import { getUser, upsertUser } from './db/users.js';
+import {
+  applySetupPeerEa,
+  createPeerEaAgentGroup,
+  parseHandshake,
+  peerEaPromptCopy,
+  wirePeerEaDestinations,
+} from './peer-ea.js';
 import { requestSenderApproval } from './sender-approval.js';
 import { ensureUserDm } from './user-dm.js';
 
-// ── Free-text name input state ──
-// Tracks approvers waiting for a text reply with the agent name. Keyed by
-// namespaced userId (e.g. "slack:U0ABC"). Cleared on receipt or restart.
+// Tracks approvers waiting for a text reply with the agent name. Keyed
+// by namespaced userId. Cleared on receipt or restart. The peer-EA path
+// pre-extracts what the handshake + sender pinned so the interceptor
+// doesn't have to re-parse the original event; the prompt collapses to
+// 1, 2, or 3 fields based on how many slots remain.
 interface PendingNameInput {
   channelMgId: string;
   dmChannelType: string;
   dmPlatformId: string;
+  mode?: 'peer-ea';
+  peerNameFromSender?: string | null;
+  peerPrincipalFromSignature?: string | null;
 }
 const awaitingNameInput = new Map<string, PendingNameInput>();
+
+function extractSenderName(event: InboundEvent): string | null {
+  try {
+    const parsed = JSON.parse(event.message.content) as Record<string, unknown>;
+    const direct =
+      typeof parsed.senderName === 'string'
+        ? parsed.senderName
+        : typeof parsed.sender === 'string'
+          ? parsed.sender
+          : undefined;
+    if (direct && direct.trim()) return direct.trim();
+    const author =
+      typeof parsed.author === 'object' && parsed.author !== null
+        ? (parsed.author as Record<string, unknown>)
+        : undefined;
+    const fromAuthor =
+      (typeof author?.fullName === 'string' ? (author.fullName as string) : undefined) ??
+      (typeof author?.userName === 'string' ? (author.userName as string) : undefined);
+    return fromAuthor && fromAuthor.trim() ? fromAuthor.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function splitFields(text: string): string[] {
+  const sep = text.includes('|') ? '|' : ',';
+  return text
+    .split(sep)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
 
 function extractAndUpsertUser(event: InboundEvent): string | null {
   let content: Record<string, unknown>;
@@ -293,6 +342,10 @@ setChannelRequestGate(async (mg, event) => {
   await requestChannelApproval({ messagingGroupId: mg.id, event });
 });
 
+registerDeliveryAction('setup_peer_ea', async (content, session) => {
+  await applySetupPeerEa(content, session);
+});
+
 /**
  * Response handler for the unknown-channel registration card.
  *
@@ -424,6 +477,65 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     return true;
   }
 
+  if (payload.value === PEER_EA_VALUE) {
+    const approverDm = await ensureUserDm(row.approver_user_id);
+    if (!approverDm) {
+      log.error('Channel registration: no DM channel for approver', {
+        messagingGroupId: row.messaging_group_id,
+        approverUserId: row.approver_user_id,
+      });
+      return true;
+    }
+
+    const adapter = getDeliveryAdapter();
+    if (!adapter) {
+      log.error('Channel registration: no delivery adapter for peer-EA prompt', {
+        messagingGroupId: row.messaging_group_id,
+      });
+      return true;
+    }
+
+    let originalEvent: InboundEvent | null = null;
+    let bodyText: string | null = null;
+    try {
+      originalEvent = JSON.parse(row.original_message) as InboundEvent;
+      const parsed = JSON.parse(originalEvent.message.content) as Record<string, unknown>;
+      if (typeof parsed.text === 'string') bodyText = parsed.text;
+    } catch {
+      /* fall through — extracted fields stay null */
+    }
+    const peerNameFromSender = originalEvent ? extractSenderName(originalEvent) : null;
+    const peerPrincipalFromSignature = bodyText ? (parseHandshake(bodyText)?.principal ?? null) : null;
+
+    awaitingNameInput.set(row.approver_user_id, {
+      channelMgId: row.messaging_group_id,
+      dmChannelType: approverDm.channel_type,
+      dmPlatformId: approverDm.platform_id,
+      mode: 'peer-ea',
+      peerNameFromSender,
+      peerPrincipalFromSignature,
+    });
+
+    const { initial: promptText } = peerEaPromptCopy({ peerNameFromSender, peerPrincipalFromSignature });
+
+    try {
+      await adapter.deliver(
+        approverDm.channel_type,
+        approverDm.platform_id,
+        null,
+        'chat-sdk',
+        JSON.stringify({ text: promptText }),
+      );
+    } catch (err) {
+      log.error('Channel registration: peer-EA prompt delivery failed', {
+        messagingGroupId: row.messaging_group_id,
+        err,
+      });
+      awaitingNameInput.delete(row.approver_user_id);
+    }
+    return true;
+  }
+
   // ── Resolve target agent group (connect to existing or create new) ──
   let targetAgentGroupId: string;
 
@@ -547,14 +659,6 @@ setMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
   const row = getPendingChannelApproval(pending.channelMgId);
   if (!row) return true;
 
-  const ag = createNewAgentGroup(text);
-  log.info('Channel registration: new agent group created', {
-    messagingGroupId: row.messaging_group_id,
-    agentGroupId: ag.id,
-    agentName: ag.name,
-    folder: ag.folder,
-  });
-
   let originalEvent: InboundEvent;
   try {
     originalEvent = JSON.parse(row.original_message) as InboundEvent;
@@ -565,6 +669,77 @@ setMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
     });
     deletePendingChannelApproval(row.messaging_group_id);
     return true;
+  }
+
+  let ag: AgentGroup;
+  let senderScope: SenderScope;
+  let isPeerEa = false;
+
+  if (pending.mode === 'peer-ea') {
+    isPeerEa = true;
+    const fields = splitFields(text);
+    const peerNameFromSender = pending.peerNameFromSender;
+    const peerPrincipalFromSignature = pending.peerPrincipalFromSignature;
+
+    let peerName: string;
+    let peerPrincipal: string;
+    let relationship: string;
+
+    if (peerNameFromSender && peerPrincipalFromSignature && fields.length === 1) {
+      peerName = peerNameFromSender;
+      peerPrincipal = peerPrincipalFromSignature;
+      relationship = fields[0];
+    } else if (peerNameFromSender && fields.length === 2) {
+      peerName = peerNameFromSender;
+      peerPrincipal = fields[0];
+      relationship = fields[1];
+    } else if (fields.length === 3) {
+      peerName = fields[0];
+      peerPrincipal = fields[1];
+      relationship = fields[2];
+    } else {
+      // Re-prompt; pending row stays so the next reply hits this interceptor.
+      const adapter = getDeliveryAdapter();
+      const { expectedFormat: expected } = peerEaPromptCopy({ peerNameFromSender, peerPrincipalFromSignature });
+      if (adapter) {
+        adapter
+          .deliver(
+            pending.dmChannelType,
+            pending.dmPlatformId,
+            null,
+            'chat-sdk',
+            JSON.stringify({ text: `Couldn't parse — try again with: ${expected}` }),
+          )
+          .catch(() => {});
+      }
+      awaitingNameInput.set(userId, pending);
+      return true;
+    }
+
+    ag = createPeerEaAgentGroup({ peerName, peerPrincipal, relationship });
+    log.info('Channel registration: peer-EA agent group created', {
+      messagingGroupId: row.messaging_group_id,
+      agentGroupId: ag.id,
+      agentName: ag.name,
+      folder: ag.folder,
+      peerName,
+      peerPrincipal,
+      relationship,
+    });
+    senderScope = 'all';
+
+    // 'strict' so a third party in the peer space drops silently rather
+    // than triggering an unknown-sender approval cascade.
+    updateMessagingGroup(row.messaging_group_id, { unknown_sender_policy: 'strict' });
+  } else {
+    ag = createNewAgentGroup(text);
+    log.info('Channel registration: new agent group created', {
+      messagingGroupId: row.messaging_group_id,
+      agentGroupId: ag.id,
+      agentName: ag.name,
+      folder: ag.folder,
+    });
+    senderScope = 'known';
   }
 
   const isGroup = originalEvent.threadId !== null;
@@ -578,7 +753,7 @@ setMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
     agent_group_id: ag.id,
     engage_mode: engageMode,
     engage_pattern: engagePattern,
-    sender_scope: 'known',
+    sender_scope: senderScope,
     ignored_message_policy: 'accumulate',
     session_mode: 'shared',
     priority: 0,
@@ -589,6 +764,8 @@ setMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
     agentGroupId: ag.id,
     mgaId,
     engageMode,
+    senderScope,
+    isPeerEa,
     approverId: userId,
   });
 
@@ -604,6 +781,24 @@ setMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
 
   deletePendingChannelApproval(row.messaging_group_id);
 
+  // Best-effort — destination wiring failure doesn't roll back the
+  // agent group; it's recoverable later via `ncl destinations add`.
+  if (isPeerEa) {
+    const approverDm = await ensureUserDm(row.approver_user_id);
+    if (approverDm) {
+      try {
+        wirePeerEaDestinations(ag, approverDm);
+      } catch (err) {
+        log.error('Peer-EA: destination wiring failed', { agentGroupId: ag.id, err });
+      }
+    } else {
+      log.warn('Peer-EA: approver DM unresolvable, destinations not registered', {
+        agentGroupId: ag.id,
+        approverUserId: row.approver_user_id,
+      });
+    }
+  }
+
   try {
     await routeInbound(originalEvent);
   } catch (err) {
@@ -617,14 +812,11 @@ setMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
   if (adapter) {
     const dm = await ensureUserDm(row.approver_user_id);
     if (dm) {
+      const confirmText = isPeerEa
+        ? `✅ Peer-EA agent "${ag.name}" connected. main can now \`send_message(to="${ag.folder}")\`.`
+        : `✅ Agent "${ag.name}" created and connected.`;
       adapter
-        .deliver(
-          dm.channel_type,
-          dm.platform_id,
-          null,
-          'chat-sdk',
-          JSON.stringify({ text: `✅ Agent "${ag.name}" created and connected.` }),
-        )
+        .deliver(dm.channel_type, dm.platform_id, null, 'chat-sdk', JSON.stringify({ text: confirmText }))
         .catch(() => {});
     }
   }

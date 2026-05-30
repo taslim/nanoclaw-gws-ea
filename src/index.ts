@@ -12,6 +12,7 @@ import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
+import { syncInstallState } from './install-state.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
@@ -81,6 +82,12 @@ async function main(): Promise<void> {
 
   // 1c. One-time filesystem cutover — idempotent, no-op after first run.
   migrateGroupsToClaudeLocal();
+
+  // 1c. Sync env-driven identity state (CLAUDE.md text, owner role grants
+  // for PRINCIPAL_EMAILS). Runs every boot; only fires handlers when env
+  // and stored values diverge. First boot self-seeds: stored=null →
+  // PRINCIPAL_EMAILS handler grants owner to every current principal email.
+  syncInstallState();
 
   // 2. Container runtime
   ensureContainerRuntimeRunning();
@@ -161,6 +168,33 @@ async function main(): Promise<void> {
     async setTyping(channelType: string, platformId: string, threadId: string | null): Promise<void> {
       const adapter = getChannelAdapter(channelType);
       await adapter?.setTyping?.(platformId, threadId);
+    },
+    async markReceived(
+      channelType: string,
+      platformId: string,
+      threadId: string | null,
+      messageId: string,
+    ): Promise<void> {
+      const adapter = getChannelAdapter(channelType);
+      await adapter?.markReceived?.(platformId, threadId, messageId);
+    },
+    async clearReceived(
+      channelType: string,
+      platformId: string,
+      threadId: string | null,
+      messageId: string,
+    ): Promise<void> {
+      const adapter = getChannelAdapter(channelType);
+      await adapter?.clearReceived?.(platformId, threadId, messageId);
+    },
+    async markError(
+      channelType: string,
+      platformId: string,
+      threadId: string | null,
+      messageId: string,
+    ): Promise<void> {
+      const adapter = getChannelAdapter(channelType);
+      await adapter?.markError?.(platformId, threadId, messageId);
     },
   };
   setDeliveryAdapter(deliveryAdapter);

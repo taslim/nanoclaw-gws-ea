@@ -40,3 +40,17 @@ export function readEnvFile(keys: string[]): Record<string, string> {
 
   return result;
 }
+
+/**
+ * Parse a comma-separated env value into a normalized Set of lowercased
+ * non-empty entries. Used for PRINCIPAL_EMAILS-style lists.
+ */
+export function parseCsvSet(raw: string | null | undefined): Set<string> {
+  if (!raw) return new Set();
+  return new Set(
+    raw
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}

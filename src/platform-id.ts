@@ -17,6 +17,13 @@
  * later emits.
  */
 export function namespacedPlatformId(channel: string, raw: string): string {
+  // GChat is special — the impersonated SDK emits and decodes the full Chat
+  // API resource name `gchat:spaces/<id>`. Normalize all inputs (bare space
+  // id, `gchat:<id>`, or already-correct `gchat:spaces/<id>`) to that form.
+  if (channel === 'gchat') {
+    const id = raw.startsWith('gchat:') ? raw.slice('gchat:'.length) : raw;
+    return id.startsWith('spaces/') ? `gchat:${id}` : `gchat:spaces/${id}`;
+  }
   if (raw.startsWith(`${channel}:`)) return raw;
   if (raw.includes('@')) return raw;
   if (raw.startsWith('+') || raw.startsWith('group:')) return raw;

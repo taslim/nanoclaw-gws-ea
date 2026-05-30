@@ -38,4 +38,28 @@ groups/*
 # Skills system (local per-installation state)
 .nanoclaw/
 
+# Per-subagent memory (local, not tracked)
+.claude/agent-memory/
+
 agents-sdk-docs
+
+# Fork-specific tracked files — per-group persona deltas and heartbeat sweep procedure.
+# These override the broad `groups/*` and `**/CLAUDE.local.md` rules above.
+
+# main group
+!groups/main/
+groups/main/*
+!groups/main/heartbeats/
+!groups/main/CLAUDE.local.md
+
+# email-external group
+!groups/email-external/
+groups/email-external/*
+!groups/email-external/CLAUDE.local.md
+
+# Templated persona files — sources live in templates/, rendered at setup
+# time with values from .env. Never commit the rendered output to the public
+# fork; users' rendered content is local-only.
+container/CLAUDE.md
+container/skills/email-triage/SKILL.md
+container/skills/scheduling/SKILL.md

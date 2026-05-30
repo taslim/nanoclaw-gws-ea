@@ -43,6 +43,7 @@ import {
   type ContainerState,
 } from './db/session-db.js';
 import { log } from './log.js';
+import { markIndicatorErrorForSession } from './modules/indicators/index.js';
 import { openInboundDb, openOutboundDb, openOutboundDbRw, inboundDbPath, heartbeatPath } from './session-manager.js';
 import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
 import type { Session } from './types.js';
@@ -290,6 +291,10 @@ function resetStuckProcessingRows(
 
     if (msg.tries >= MAX_TRIES) {
       markMessageFailed(inDb, msg.id);
+      // Without this, the indicator stays as 👀 forever — silent-turn
+      // resolution in delivery only fires on terminal processing_ack rows,
+      // which never appear for a message the host gave up on.
+      markIndicatorErrorForSession(session.id);
       log.warn('Message marked as failed after max retries', {
         messageId: msg.id,
         sessionId: session.id,

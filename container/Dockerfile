@@ -49,6 +49,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         ca-certificates \
         curl \
         git \
+        python3 \
+        python3-venv \
         tini \
         unzip \
     && if [ "$INSTALL_CJK_FONTS" = "true" ]; then \
@@ -69,6 +71,18 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" && \
     install -m 0755 /root/.bun/bin/bun /usr/local/bin/bun && \
     rm -rf /root/.bun
+
+# ---- Google Workspace MCP servers -------------------------------------------
+# Wired by agent-runner's gws-capability when SA + ASSISTANT_EMAIL are present.
+# uv installs to /usr/local/bin so the non-root `node` user can invoke the venv.
+ENV UV_INSTALL_DIR=/usr/local/bin
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh
+
+RUN git clone --depth 1 https://github.com/taylorwilsdon/google_workspace_mcp.git /opt/google_workspace_mcp \
+    && cd /opt/google_workspace_mcp && uv sync && chmod -R a+rX /opt/google_workspace_mcp
+
+RUN git clone --depth 1 https://github.com/taslim/google-calendar-mcp.git /opt/google-calendar-mcp \
+    && cd /opt/google-calendar-mcp && npm install && npm run build && chmod -R a+rX /opt/google-calendar-mcp
 
 # ---- agent-runner deps -------------------------------------------------------
 # Deps are cached independently of CLI versions. Source is NOT baked in —

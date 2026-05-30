@@ -32,6 +32,7 @@ import {
   writeSessionRouting,
   outboundDbPath,
 } from '../../src/session-manager.js';
+import { SELF_MANAGED_FOLDERS } from './shared.js';
 
 const SKIP_NAMES = new Set(['.DS_Store']);
 
@@ -96,6 +97,11 @@ function main(): void {
   for (const entry of fs.readdirSync(v1SessionsDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
     const folder = entry.name;
+
+    if (SELF_MANAGED_FOLDERS.has(folder)) {
+      sessionsSkipped++;
+      continue;
+    }
 
     const ag = folderToAg.get(folder);
     if (!ag) {

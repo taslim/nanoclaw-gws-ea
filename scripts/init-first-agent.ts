@@ -62,6 +62,7 @@ interface Args {
   agentName: string;
   welcome: string;
   role: Role;
+  folder: string | null;
 }
 
 const DEFAULT_WELCOME =
@@ -111,6 +112,10 @@ function parseArgs(argv: string[]): Args {
         i++;
         break;
       }
+      case '--folder':
+        out.folder = val;
+        i++;
+        break;
     }
   }
 
@@ -132,6 +137,7 @@ function parseArgs(argv: string[]): Args {
     agentName: out.agentName?.trim() || out.displayName!,
     welcome: out.welcome?.trim() || DEFAULT_WELCOME,
     role: out.role ?? DEFAULT_ROLE,
+    folder: out.folder?.trim() || null,
   };
 }
 
@@ -158,7 +164,11 @@ function wireIfMissing(mg: MessagingGroup, ag: AgentGroup, now: string, label: s
     // via /manage-channels once the agent is in use.
     engage_mode: mg.is_group === 0 ? 'pattern' : 'mention',
     engage_pattern: mg.is_group === 0 ? '.' : null,
-    sender_scope: 'all',
+    // 'known' so MCP scope (NANOCLAW_TRUST) lands at 'known' too.
+    // computeAgentGroupTrust() in container-runner derives trust from the
+    // most-permissive sender_scope across an agent group's wirings; 'all'
+    // would silently downgrade the agent to readonly external-tool scope.
+    sender_scope: 'known',
     ignored_message_policy: 'drop',
     session_mode: 'shared',
     priority: 0,
@@ -188,7 +198,7 @@ async function main(): Promise<void> {
   // an admin grant is scoped to that group. See step 2b.
 
   // 2. Agent group + filesystem.
-  const folder = `dm-with-${normalizeName(args.displayName)}`;
+  const folder = args.folder ?? `dm-with-${normalizeName(args.displayName)}`;
   let ag: AgentGroup | undefined = getAgentGroupByFolder(folder);
   if (!ag) {
     const agId = generateId('ag');

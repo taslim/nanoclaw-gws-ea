@@ -11,7 +11,9 @@ import path from 'path';
 
 import { getCurrentInReplyTo } from '../current-batch.js';
 import { findByName, getAllDestinations } from '../destinations.js';
+import { isPrincipalSurface, PRINCIPAL_SURFACE, type Priority } from '../principal-surfaces.js';
 import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
+import { recordTurnSentPayload } from '../db/session-state.js';
 import { getSessionRouting } from '../db/session-routing.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
@@ -20,15 +22,15 @@ function log(msg: string): void {
   console.error(`[mcp-tools] ${msg}`);
 }
 
-function generateId(): string {
+export function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function ok(text: string) {
+export function ok(text: string) {
   return { content: [{ type: 'text' as const, text }] };
 }
 
-function err(text: string) {
+export function err(text: string) {
   return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true };
 }
 
@@ -49,7 +51,7 @@ function destinationList(): string {
  * preserved so replies land in the correct thread. Otherwise thread_id
  * is null (a cross-destination send starts a new conversation).
  */
-function resolveRouting(
+export function resolveRouting(
   to: string | undefined,
 ): { channel_type: string; platform_id: string; thread_id: string | null; resolvedName: string } | { error: string } {
   if (!to) {
@@ -92,30 +94,103 @@ function resolveRouting(
   return { channel_type: 'agent', platform_id: dest.agentGroupId!, thread_id: null, resolvedName: to };
 }
 
+export function asStringArray(value: unknown): string[] | undefined {
+  if (value == null) return undefined;
+  if (Array.isArray(value)) {
+    const out = value.filter((v): v is string => typeof v === 'string' && v.trim().length > 0);
+    return out.length > 0 ? out : undefined;
+  }
+  if (typeof value === 'string' && value.trim().length > 0) return [value];
+  return undefined;
+}
+
+export function stageOutboxFile(
+  messageId: string,
+  srcPath: string,
+  displayName?: string,
+): { filename: string } | { error: string } {
+  const resolved = path.isAbsolute(srcPath) ? srcPath : path.resolve('/workspace/agent', srcPath);
+  const filename = displayName ?? path.basename(resolved);
+  const outboxDir = path.join('/workspace/outbox', messageId);
+  fs.mkdirSync(outboxDir, { recursive: true });
+  try {
+    fs.copyFileSync(resolved, path.join(outboxDir, filename));
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { error: `File not found: ${srcPath}` };
+    }
+    throw e;
+  }
+  return { filename };
+}
+
 export const sendMessage: McpToolDefinition = {
   tool: {
     name: 'send_message',
-    description: 'Send a message to a named destination. If you have only one destination, you can omit `to`.',
+    description:
+      'Send a message to a named chat destination. If you have only one destination, you can omit `to`. The body goes in `text` and is treated as markdown — formatted per platform. Mid-turn use only (a quick ack before a slow tool call, or a heads-up while you keep working). For email, use a `<message to="…">` block (plain reply) or the `send_email` tool (compose / overrides); `send_message` does not deliver to email destinations.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         to: {
           type: 'string',
-          description: 'Destination name (e.g., "family", "worker-1"). Optional if you have only one destination.',
+          description: 'Destination name (e.g., "principal", "email-external"). Optional if you have only one destination.',
         },
-        text: { type: 'string', description: 'Message content' },
+        text: {
+          type: 'string',
+          description: 'Message body. Markdown is supported.',
+        },
+        files: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'File paths (relative to /workspace/agent/ or absolute) to attach.',
+        },
       },
-      required: ['text'],
     },
   },
   async handler(args) {
-    const text = args.text as string;
+    const text = typeof args.text === 'string' ? args.text : undefined;
     if (!text) return err('text is required');
 
     const routing = resolveRouting(args.to as string | undefined);
     if ('error' in routing) return err(routing.error);
 
+    if (routing.channel_type === 'email') {
+      return err(
+        'send_message does not deliver to email destinations. Use a `<message to="…">` block for plain replies on the inbound thread, or `send_email` for compose/overrides.',
+      );
+    }
+
+    // Cross-channel principal notifications flow through `<message priority>`
+    // blocks (where the host classifies loudness), not this mid-turn tool.
+    // Guard only fires on an explicit principal target; implicit replies and
+    // non-principal destinations pass through. Shim until prompts are rewritten,
+    // then flip to a hard reject.
+    const explicitTo = typeof args.to === 'string' ? args.to : undefined;
+    let shimPriority: Priority | null = null;
+    if (explicitTo && isPrincipalSurface(explicitTo)) {
+      shimPriority = explicitTo === PRINCIPAL_SURFACE ? 'urgent' : 'awareness';
+      log(
+        `send_message(to="${explicitTo}") targets a principal surface — shimming to priority="${shimPriority}". Prefer <message priority="...">.`,
+      );
+    }
+
+    const filePaths = asStringArray(args.files);
     const id = generateId();
+
+    let stagedFilenames: string[] | undefined;
+    if (filePaths) {
+      stagedFilenames = [];
+      for (const p of filePaths) {
+        const staged = stageOutboxFile(id, p);
+        if ('error' in staged) return err(staged.error);
+        stagedFilenames.push(staged.filename);
+      }
+    }
+
+    const content: Record<string, unknown> = { text };
+    if (stagedFilenames) content.files = stagedFilenames;
+
     const seq = writeMessageOut({
       id,
       in_reply_to: getCurrentInReplyTo(),
@@ -123,9 +198,11 @@ export const sendMessage: McpToolDefinition = {
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
       thread_id: routing.thread_id,
-      content: JSON.stringify({ text }),
+      content: JSON.stringify(content),
+      priority: shimPriority,
     });
 
+    recordTurnSentPayload(text);
     log(`send_message: #${seq} → ${routing.resolvedName}`);
     return ok(`Message sent to ${routing.resolvedName} (id: ${seq})`);
   },
@@ -153,15 +230,9 @@ export const sendFile: McpToolDefinition = {
     const routing = resolveRouting(args.to as string | undefined);
     if ('error' in routing) return err(routing.error);
 
-    const resolvedPath = path.isAbsolute(filePath) ? filePath : path.resolve('/workspace/agent', filePath);
-    if (!fs.existsSync(resolvedPath)) return err(`File not found: ${filePath}`);
-
     const id = generateId();
-    const filename = (args.filename as string) || path.basename(resolvedPath);
-
-    const outboxDir = path.join('/workspace/outbox', id);
-    fs.mkdirSync(outboxDir, { recursive: true });
-    fs.copyFileSync(resolvedPath, path.join(outboxDir, filename));
+    const staged = stageOutboxFile(id, filePath, args.filename as string | undefined);
+    if ('error' in staged) return err(staged.error);
 
     writeMessageOut({
       id,
@@ -170,11 +241,15 @@ export const sendFile: McpToolDefinition = {
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
       thread_id: routing.thread_id,
-      content: JSON.stringify({ text: (args.text as string) || '', files: [filename] }),
+      content: JSON.stringify({ text: (args.text as string) || '', files: [staged.filename] }),
     });
 
-    log(`send_file: ${id} → ${routing.resolvedName} (${filename})`);
-    return ok(`File sent to ${routing.resolvedName} (id: ${id}, filename: ${filename})`);
+    // send_file's text is optional and often just a caption; record only when present.
+    // The duplicate we're trying to suppress is the text-blob mirror, not the file itself.
+    const fileText = (args.text as string) || '';
+    if (fileText) recordTurnSentPayload(fileText);
+    log(`send_file: ${id} → ${routing.resolvedName} (${staged.filename})`);
+    return ok(`File sent to ${routing.resolvedName} (id: ${id}, filename: ${staged.filename})`);
   },
 };
 

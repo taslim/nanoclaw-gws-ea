@@ -6,9 +6,22 @@ import { getContainerImageBase, getDefaultContainerImage, getInstallSlug } from 
 import { isValidTimezone } from './timezone.js';
 
 // Read config values from .env (falls back to process.env).
-const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER', 'ONECLI_URL', 'ONECLI_API_KEY', 'TZ']);
+const envConfig = readEnvFile([
+  'ASSISTANT_NAME',
+  'ASSISTANT_LAST_NAME',
+  'ASSISTANT_EMAIL',
+  'ASSISTANT_HAS_OWN_NUMBER',
+  'PRINCIPAL_EMAILS',
+  'ONECLI_URL',
+  'ONECLI_API_KEY',
+  'TZ',
+]);
 
 export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
+export const ASSISTANT_LAST_NAME = process.env.ASSISTANT_LAST_NAME || envConfig.ASSISTANT_LAST_NAME || '';
+export const ASSISTANT_FULL_NAME = [ASSISTANT_NAME, ASSISTANT_LAST_NAME].filter(Boolean).join(' ');
+export const ASSISTANT_EMAIL = process.env.ASSISTANT_EMAIL || envConfig.ASSISTANT_EMAIL || '';
+export const PRINCIPAL_EMAILS = process.env.PRINCIPAL_EMAILS || envConfig.PRINCIPAL_EMAILS || '';
 export const ASSISTANT_HAS_OWN_NUMBER =
   (process.env.ASSISTANT_HAS_OWN_NUMBER || envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
 
@@ -39,7 +52,7 @@ export const MAX_MESSAGES_PER_PROMPT = Math.max(1, parseInt(process.env.MAX_MESS
 export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min default — how long to keep container alive after last result
 export const MAX_CONCURRENT_CONTAINERS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5);
 
-function escapeRegex(str: string): string {
+export function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 

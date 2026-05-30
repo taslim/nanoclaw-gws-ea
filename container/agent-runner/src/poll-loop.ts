@@ -1,9 +1,17 @@
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
+import {
+  isPriority,
+  isPrincipalSurface,
+  surfaceForPriority,
+  PRINCIPAL_SURFACE,
+  type Priority,
+} from './principal-surfaces.js';
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
-import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
+import { clearContinuation, clearTurnSentPayloads, getTurnSentPayloads, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
 import { clearCurrentInReplyTo, setCurrentInReplyTo } from './current-batch.js';
+import { gatherInlineAttachments } from './attachments.js';
 import {
   formatMessages,
   extractRouting,
@@ -14,6 +22,8 @@ import {
   type RoutingContext,
 } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
+
+const WORKSPACE_ROOT = '/workspace';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -102,6 +112,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // Clear leftover 'processing' acks from a previous crashed container.
   // This lets the new container re-process those messages.
   clearStaleProcessingAcks();
+
+  // Clear turn_sent_payloads from any prior container that died mid-turn
+  // (SIGKILL between send_message firing and the outer try/finally clear).
+  // Stale payloads here would suppress legitimate result blocks of this
+  // container's first turn whose body happens to match. Safe to clear
+  // unconditionally — within-turn state has no cross-container value.
+  clearTurnSentPayloads();
 
   let pollCount = 0;
   let isFirstPoll = true;
@@ -198,14 +215,26 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       continue;
     }
 
-    // Format messages: passthrough commands get raw text (only if the
-    // provider natively handles slash commands), others get XML.
-    const prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
+    const { blocks: inlineAttachments, inlinedPaths } = await gatherInlineAttachments(
+      keep,
+      config.provider.nativeAttachmentTypes,
+      WORKSPACE_ROOT,
+    );
 
-    log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
+    const prompt = formatMessagesWithCommands(
+      keep,
+      config.provider.supportsNativeSlashCommands,
+      inlinedPaths,
+    );
+
+    log(
+      `Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}` +
+        (inlineAttachments.length > 0 ? `, inline attachments: ${inlineAttachments.length}` : ''),
+    );
 
     const query = config.provider.query({
       prompt,
+      inlineAttachments: inlineAttachments.length > 0 ? inlineAttachments : undefined,
       continuation,
       cwd: config.cwd,
       systemContext: config.systemContext,
@@ -234,6 +263,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         log(`Stale session detected (${continuation}) — clearing for next retry`);
         continuation = undefined;
         clearContinuation(config.providerName);
+        clearTurnSentPayloads();
       }
 
       // Write error response so the user knows something went wrong
@@ -247,6 +277,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       });
     } finally {
       clearCurrentInReplyTo();
+      clearTurnSentPayloads();
     }
 
     // Ensure completed even if processQuery ended without a result event
@@ -262,7 +293,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
  * passthrough commands are sent raw (no XML wrapping) so the SDK can
  * dispatch them. Otherwise they fall through to standard XML formatting.
  */
-function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommands: boolean): string {
+function formatMessagesWithCommands(
+  messages: MessageInRow[],
+  nativeSlashCommands: boolean,
+  inlinedPaths?: ReadonlySet<string>,
+): string {
   const parts: string[] = [];
   const normalBatch: MessageInRow[] = [];
 
@@ -272,7 +307,7 @@ function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommand
       if (cmdInfo.category === 'passthrough' || cmdInfo.category === 'admin') {
         // Flush normal batch first
         if (normalBatch.length > 0) {
-          parts.push(formatMessages(normalBatch));
+          parts.push(formatMessages(normalBatch, inlinedPaths));
           normalBatch.length = 0;
         }
         // Pass raw command text (no XML wrapping) — SDK handles it natively
@@ -284,7 +319,7 @@ function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommand
   }
 
   if (normalBatch.length > 0) {
-    parts.push(formatMessages(normalBatch));
+    parts.push(formatMessages(normalBatch, inlinedPaths));
   }
 
   return parts.join('\n\n');
@@ -303,6 +338,7 @@ async function processQuery(
   let queryContinuation: string | undefined;
   let done = false;
   let unwrappedNudged = false;
+  let unknownDestNudged = false;
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open avoids
@@ -378,7 +414,13 @@ async function processQuery(
         const prompt = formatMessages(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
+        unknownDestNudged = false;
         query.push(prompt);
+        // Refresh routing so the next `result` event dispatches to where the
+        // user just spoke, not where the warm query was originally opened.
+        // Without this, every reply across the lifetime of a warm query lands
+        // in the first batch's thread/channel.
+        Object.assign(routing, extractRouting(keep));
         markCompleted(keptIds);
       } catch (err) {
         // Without this catch the rejection escapes the void IIFE and Node
@@ -441,19 +483,43 @@ async function processQuery(
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
         if (event.text) {
-          const { hasUnwrapped } = dispatchResultText(event.text, routing);
+          // Pass the turn's already-sent payloads so dispatchResultText can
+          // skip any <message> block whose body is a verbatim duplicate of
+          // something send_message / send_file already shipped. Distinct
+          // result content (e.g. send_message("looking it up") + result with
+          // the actual answer) flows through normally — only the literal
+          // duplicates are filtered.
+          const sentPayloads = getTurnSentPayloads();
+          const { hasUnwrapped, unknownDestinations } = dispatchResultText(event.text, routing, sentPayloads);
+          const needsNudge = (hasUnwrapped && !unwrappedNudged) || (unknownDestinations.length > 0 && !unknownDestNudged);
+          const validNames = needsNudge
+            ? getAllDestinations()
+                .map((d) => d.name)
+                .join(', ')
+            : '';
           if (hasUnwrapped && !unwrappedNudged) {
             unwrappedNudged = true;
-            const destinations = getAllDestinations();
-            const names = destinations.map((d) => d.name).join(', ');
             query.push(
               `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
                 `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
-                `Your destinations: ${names}. ` +
+                `Your destinations: ${validNames}. ` +
                 `Please re-send your response with the correct wrapping.</system>`,
             );
           }
+          if (unknownDestinations.length > 0 && !unknownDestNudged) {
+            unknownDestNudged = true;
+            const plural = unknownDestinations.length > 1;
+            const bad = unknownDestinations.map((d) => `"${d}"`).join(', ');
+            query.push(
+              `<system>You used unknown destination${plural ? 's' : ''}: ${bad}. ` +
+                `Those block${plural ? 's were' : ' was'} dropped — nothing was sent to ${bad}. ` +
+                `Valid destinations: ${validNames}. Re-send to a valid destination.</system>`,
+            );
+          }
         }
+        // Reset per-result so follow-up turns pushed into the same open query
+        // stream don't inherit suppression from a prior turn's send_message.
+        clearTurnSentPayloads();
       }
     }
   } finally {
@@ -484,36 +550,139 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
 }
 
 /**
- * Parse the agent's final text for <message to="name">...</message> blocks
- * and dispatch each one to its resolved destination. Text outside of blocks
- * (including <internal>...</internal>) is scratchpad — logged but not sent.
- *
- * The agent must always wrap output in <message to="name">...</message>
- * blocks, even with a single destination. Bare text is scratchpad only.
+ * Parse <message to="name">...</message> blocks and dispatch each to its
+ * destination. Text outside blocks (including <internal>) is scratchpad only.
+ * Blocks whose body is a verbatim duplicate of a mid-turn send are dropped.
  */
-function dispatchResultText(text: string, routing: RoutingContext): { sent: number; hasUnwrapped: boolean } {
-  const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
+/**
+ * Whitespace-normalized verbatim duplicate check: is the parsed result
+ * block body the same content that send_message / send_file already shipped
+ * earlier this turn? Exported for direct testing.
+ *
+ * Normalization collapses any run of whitespace to a single space and trims
+ * leading/trailing whitespace so the SDK reformatting between the tool input
+ * (e.g. "hello world") and the result text (e.g. "hello\nworld") doesn't
+ * slip a real duplicate through.
+ */
+export function isVerbatimDuplicate(body: string, sentPayloads: string[]): boolean {
+  if (sentPayloads.length === 0) return false;
+  const normalize = (s: string): string => s.trim().replace(/\s+/g, ' ');
+  const normalizedBody = normalize(body);
+  return sentPayloads.some((p) => normalize(p) === normalizedBody);
+}
+
+function parseMessageAttrs(openTag: string): Record<string, string> {
+  const ATTR_RE = /(\w+)="([^"]*)"/g;
+  const attrs: Record<string, string> = {};
+  let m: RegExpExecArray | null;
+  while ((m = ATTR_RE.exec(openTag)) !== null) {
+    attrs[m[1]] = m[2];
+  }
+  return attrs;
+}
+
+const USERS_ALL_TOKEN = '<users/all>';
+const USERS_ALL_RE = /<users\/all>/g;
+
+function stripUsersAll(body: string): { body: string; stripped: boolean } {
+  if (!body.includes(USERS_ALL_TOKEN)) return { body, stripped: false };
+  return { body: body.replace(USERS_ALL_RE, '').replace(/\s+/g, ' ').trim(), stripped: true };
+}
+
+export function dispatchResultText(
+  text: string,
+  routing: RoutingContext,
+  sentPayloads: string[] = [],
+): { sent: number; hasUnwrapped: boolean; unknownDestinations: string[] } {
+  const MESSAGE_RE = /<message\s+([^>]*?)>([\s\S]*?)<\/message>/g;
 
   let match: RegExpExecArray | null;
   let sent = 0;
   let lastIndex = 0;
   const scratchpadParts: string[] = [];
+  const unknownDestinations = new Set<string>();
 
   while ((match = MESSAGE_RE.exec(text)) !== null) {
     if (match.index > lastIndex) {
       scratchpadParts.push(text.slice(lastIndex, match.index));
     }
-    const toName = match[1];
-    const body = match[2].trim();
+    const attrs = parseMessageAttrs(match[1]);
+    const rawBody = match[2].trim();
     lastIndex = MESSAGE_RE.lastIndex;
 
-    const dest = findByName(toName);
+    let toName: string | undefined = attrs.to;
+    let priority: string | undefined = attrs.priority;
+
+    // `to=` (external destination) and `priority=` (principal-facing
+    // notification) are mutually exclusive — a single block is one or the other.
+    if (toName && priority) {
+      log(`<message> block has both to="${toName}" and priority="${priority}" — rejecting (mutually exclusive)`);
+      scratchpadParts.push(`[dropped: to= and priority= are mutually exclusive] ${rawBody}`);
+      continue;
+    }
+
+    if (priority && !isPriority(priority)) {
+      log(`Unknown priority="${priority}" in <message>, dropping block`);
+      scratchpadParts.push(`[dropped: unknown priority "${priority}"] ${rawBody}`);
+      continue;
+    }
+
+    // Legacy shim: rewrite explicit principal-surface targets to the equivalent
+    // priority so pre-priority prompts keep working until they're rewritten.
+    if (toName && isPrincipalSurface(toName)) {
+      if (toName === PRINCIPAL_SURFACE) {
+        priority = 'urgent';
+      } else {
+        priority = rawBody.includes(USERS_ALL_TOKEN) ? 'attention' : 'awareness';
+      }
+      log(`Legacy to="${toName}" shimmed to priority="${priority}"`);
+      toName = undefined;
+    }
+
+    // Under-notifying is recoverable; over-notifying isn't. Default unspecified
+    // to awareness rather than rejecting.
+    if (!toName && !priority) {
+      priority = 'awareness';
+    }
+
+    // Host injects `<users/all>` for attention; strip any literal one the
+    // agent wrote so it's never double-prepended.
+    const { body, stripped } = stripUsersAll(rawBody);
+    if (stripped) {
+      log(`Stripped literal <users/all> from <message> body (host injects it for attention)`);
+    }
+
+    if (isVerbatimDuplicate(body, sentPayloads)) {
+      // Verbatim duplicate of something send_message / send_file already
+      // shipped this turn — skip silently rather than double-deliver.
+      log(`Suppressing duplicate <message> block (verbatim of an already-sent payload)`);
+      scratchpadParts.push(`[duplicate of sent payload, suppressed] ${body}`);
+      continue;
+    }
+
+    if (priority) {
+      const surfaceName = surfaceForPriority(priority as Priority);
+      const dest = findByName(surfaceName);
+      if (!dest) {
+        log(`No "${surfaceName}" destination for priority="${priority}", dropping block`);
+        scratchpadParts.push(`[dropped: no "${surfaceName}" destination] ${body}`);
+        unknownDestinations.add(surfaceName);
+        continue;
+      }
+      sendToDestination(dest, body, routing, priority as Priority);
+      sent++;
+      continue;
+    }
+
+    const dest = findByName(toName!);
     if (!dest) {
       log(`Unknown destination in <message to="${toName}">, dropping block`);
       scratchpadParts.push(`[dropped: unknown destination "${toName}"] ${body}`);
+      unknownDestinations.add(toName!);
       continue;
     }
-    sendToDestination(dest, body, routing);
+
+    sendToDestination(dest, body, routing, null);
     sent++;
   }
   if (lastIndex < text.length) {
@@ -530,10 +699,15 @@ function dispatchResultText(text: string, routing: RoutingContext): { sent: numb
   if (hasUnwrapped) {
     log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
   }
-  return { sent, hasUnwrapped };
+  return { sent, hasUnwrapped, unknownDestinations: Array.from(unknownDestinations) };
 }
 
-function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): void {
+function sendToDestination(
+  dest: DestinationEntry,
+  body: string,
+  routing: RoutingContext,
+  priority: Priority | null,
+): void {
   const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
   const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
   // Resolve thread_id per-destination from the most recent inbound message
@@ -549,6 +723,7 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
     channel_type: channelType,
     thread_id: destRouting?.threadId ?? null,
     content: JSON.stringify({ text: body }),
+    priority,
   });
 }
 

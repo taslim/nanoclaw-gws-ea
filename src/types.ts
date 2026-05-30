@@ -207,3 +207,34 @@ export interface AgentDestination {
   target_id: string;
   created_at: string;
 }
+
+// ── Matters (central DB) ──
+
+export const MATTER_STATUSES = ['active', 'waiting', 'escalated', 'paused', 'resolved', 'archived'] as const;
+export type MatterStatus = (typeof MATTER_STATUSES)[number];
+
+/**
+ * Workstream tracking entity. The DB row is a slim header — title, stable
+ * scope `description` (used by `search_matters` for findability), and
+ * `status`. Live working memory lives in the optional context file at
+ * `groups/main/matters/<id>.md`. Files are canonical and may be purged
+ * for resolved/archived matters without losing the row or its artifact links.
+ */
+export interface Matter {
+  id: number;
+  title: string;
+  description: string | null;
+  status: MatterStatus;
+  updated_at: string;
+}
+
+/**
+ * Foreign-system pointers attached to a matter. (artifact_type, artifact_id)
+ * is unique across the whole table — an artifact belongs to at most one matter.
+ */
+export interface MatterArtifact {
+  matter_id: number;
+  artifact_type: string; // 'gmail_thread_id' | 'gcal_id' | 'gdrive_id' | 'gdocs_id' | 'gslides_id' | 'gsheets_id'
+  artifact_id: string;
+  linked_at: string;
+}

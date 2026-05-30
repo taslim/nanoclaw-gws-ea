@@ -16,6 +16,7 @@ import { getMessagingGroupByPlatform } from './db/messaging-groups.js';
 import {
   getDueOutboundMessages,
   getDeliveredIds,
+  getTerminalProcessingAcks,
   markDelivered,
   markDeliveryFailed,
   migrateDeliveredTable,
@@ -23,7 +24,14 @@ import {
 import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
+import {
+  clearIndicatorsForSession,
+  markIndicatorErrorForSession,
+  pendingIndicatorMessageIdsForSession,
+  setIndicatorAdapter,
+} from './modules/indicators/index.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
+import { applyPriorityLoudness } from './modules/notifications/loudness.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { Session } from './types.js';
 
@@ -59,6 +67,9 @@ export interface ChannelDeliveryAdapter {
     files?: OutboundFile[],
   ): Promise<string | undefined>;
   setTyping?(channelType: string, platformId: string, threadId: string | null): Promise<void>;
+  markReceived?(channelType: string, platformId: string, threadId: string | null, messageId: string): Promise<void>;
+  clearReceived?(channelType: string, platformId: string, threadId: string | null, messageId: string): Promise<void>;
+  markError?(channelType: string, platformId: string, threadId: string | null, messageId: string): Promise<void>;
 }
 
 let deliveryAdapter: ChannelDeliveryAdapter | null = null;
@@ -97,6 +108,7 @@ export function setDeliveryAdapter(adapter: ChannelDeliveryAdapter): void {
   // Forward to the typing module so it can fire setTyping on its own
   // interval. Direct call, not a registry — typing is a default module.
   setTypingAdapter(adapter);
+  setIndicatorAdapter(adapter);
   for (const cb of adapterReadyCallbacks) {
     void Promise.resolve()
       .then(() => cb(adapter))
@@ -161,6 +173,37 @@ export async function deliverSessionMessages(session: Session): Promise<void> {
   }
 }
 
+/** Internal traffic — system actions and agent-to-agent routing — that the
+ *  user doesn't see and should not move user-visible signals (typing dots,
+ *  status indicators). */
+function isUserFacing(msg: { kind: string; channel_type: string | null }): boolean {
+  return msg.kind !== 'system' && msg.channel_type !== 'agent';
+}
+
+/** Reactions and edits are auxiliary ops that ride alongside text replies.
+ *  They have their own delivery rows and can fail independently (Google's
+ *  reactions endpoint flakes with 500s). They must not move the session's
+ *  indicator/typing state — a reaction failing should not paint the user's
+ *  reply red, and a reaction succeeding should not clear indicators while
+ *  the actual text reply is still queued. */
+function isAuxiliaryOp(content: unknown): boolean {
+  if (typeof content !== 'object' || content === null) return false;
+  const op = (content as { operation?: unknown }).operation;
+  return op === 'reaction' || op === 'edit';
+}
+
+function movesIndicators(msg: { kind: string; channel_type: string | null }, parsedContent: unknown): boolean {
+  return isUserFacing(msg) && !isAuxiliaryOp(parsedContent);
+}
+
+function parseContent(json: string): unknown {
+  try {
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
 async function drainSession(session: Session): Promise<void> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) return;
@@ -177,30 +220,33 @@ async function drainSession(session: Session): Promise<void> {
   try {
     // Read all due messages from outbound.db (read-only)
     const allDue = getDueOutboundMessages(outDb);
-    if (allDue.length === 0) return;
 
     // Filter out already-delivered messages using inbound.db's delivered table
     const delivered = getDeliveredIds(inDb);
     const undelivered = allDue.filter((m) => !delivered.has(m.id));
-    if (undelivered.length === 0) return;
+
+    // Built over allDue, not undelivered — silent-turn resolution scans the
+    // full set looking for queued user-facing replies, and we want one parse
+    // per row across both passes.
+    const parsedById = new Map(allDue.map((m) => [m.id, parseContent(m.content)]));
 
     // Ensure platform_message_id column exists (migration for existing sessions)
-    migrateDeliveredTable(inDb);
+    if (undelivered.length > 0) migrateDeliveredTable(inDb);
 
     for (const msg of undelivered) {
+      const moves = movesIndicators(msg, parsedById.get(msg.id));
       try {
         const platformMsgId = await deliverMessage(msg, session, inDb);
         markDelivered(inDb, msg.id, platformMsgId ?? null);
         deliveryAttempts.delete(msg.id);
 
-        // Pause the typing indicator after a real user-facing message
-        // lands on the user's screen, so the client has time to visually
-        // clear the indicator before the next heartbeat tick brings it
-        // back. Skip the pause for internal traffic (system actions,
-        // agent-to-agent routing) — the user doesn't see those and
-        // shouldn't get a gap in their typing indicator for them.
-        if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
+        // Move user-visible signals only on user-facing traffic — pause the
+        // typing indicator so the client can clear before the next heartbeat
+        // tick brings it back, and clear the per-message status indicators
+        // the router placed on the engaging inbounds.
+        if (moves) {
           pauseTypingRefreshAfterDelivery(session.id);
+          clearIndicatorsForSession(session.id);
         }
       } catch (err) {
         const attempts = (deliveryAttempts.get(msg.id) ?? 0) + 1;
@@ -214,6 +260,9 @@ async function drainSession(session: Session): Promise<void> {
           });
           markDeliveryFailed(inDb, msg.id);
           deliveryAttempts.delete(msg.id);
+          if (moves) {
+            markIndicatorErrorForSession(session.id);
+          }
         } else {
           log.warn('Message delivery failed, will retry', {
             messageId: msg.id,
@@ -225,10 +274,36 @@ async function drainSession(session: Session): Promise<void> {
         }
       }
     }
+
+    resolveSilentTurnIndicators(session.id, outDb, allDue, delivered, parsedById);
   } finally {
     outDb.close();
     inDb.close();
   }
+}
+
+/** Catches the cases per-message delivery doesn't: empty turns,
+ *  auxiliary-only turns (just a reaction or edit), and crashed turns. Defers
+ *  while the agent is still processing or a user-facing reply is queued. */
+function resolveSilentTurnIndicators(
+  sessionId: string,
+  outDb: Database.Database,
+  allDue: ReturnType<typeof getDueOutboundMessages>,
+  delivered: Set<string>,
+  parsedById: Map<string, unknown>,
+): void {
+  const pendingIds = pendingIndicatorMessageIdsForSession(sessionId);
+  if (pendingIds.length === 0) return;
+
+  const userFacingReplyQueued = allDue.some((m) => !delivered.has(m.id) && movesIndicators(m, parsedById.get(m.id)));
+  if (userFacingReplyQueued) return;
+
+  const terminal = getTerminalProcessingAcks(outDb, pendingIds);
+  if (!pendingIds.every((id) => terminal.has(id))) return;
+
+  const anyFailed = pendingIds.some((id) => terminal.get(id) === 'failed');
+  if (anyFailed) markIndicatorErrorForSession(sessionId);
+  else clearIndicatorsForSession(sessionId);
 }
 
 async function deliverMessage(
@@ -240,6 +315,7 @@ async function deliverMessage(
     thread_id: string | null;
     content: string;
     in_reply_to: string | null;
+    priority: string | null;
   },
   session: Session,
   inDb: Database.Database,
@@ -353,12 +429,17 @@ async function deliverMessage(
       ? readOutboxFiles(session.agent_group_id, session.id, msg.id, content.files as string[])
       : undefined;
 
+  let deliverContent = msg.content;
+  if (msg.priority === 'attention' && typeof content.text === 'string') {
+    deliverContent = JSON.stringify({ ...content, text: applyPriorityLoudness(msg.priority, content.text) });
+  }
+
   const platformMsgId = await deliveryAdapter.deliver(
     msg.channel_type,
     msg.platform_id,
     msg.thread_id,
     msg.kind,
-    msg.content,
+    deliverContent,
     files,
   );
   log.info('Message delivered', {

@@ -7,3 +7,5 @@
 // self-registration import below.
 
 import './cli.js';
+import './gchat.js';
+import './email.js';

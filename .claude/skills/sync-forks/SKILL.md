@@ -297,8 +297,8 @@ If matches: `git reset --soft <fork>/$FORK_BRANCH` and recommit with a clean mes
 
 # Step 9: Validation
 Run:
-- `npm run build`
-- `npm test` (do not fail the flow if tests are not configured)
+- `pnpm run build`
+- `pnpm test` (do not fail the flow if tests are not configured)
 
 If build fails:
 - Show the error.
@@ -410,8 +410,8 @@ If Cherry-pick:
 
 # Step P4: Validation
 Run:
-- `npm run build`
-- `npm test` (do not fail the flow if tests are not configured)
+- `pnpm run build`
+- `pnpm test` (do not fail the flow if tests are not configured)
 
 If build fails:
 - Show the error and fix issues caused by the merge.
@@ -437,9 +437,10 @@ Show:
 Tell the user:
 - To rollback: `git reset --hard <backup-tag-from-step-P1>`
 - Backup branch also exists: `backup/pre-pull-<HASH>-<TIMESTAMP>`
-- Restart the service to apply changes:
-  - If using launchd: `launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist && launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist`
-  - If running manually: restart `npm run dev`
+- Restart the service to apply changes (service names are per-install — derive the canonical label, don't hardcode):
+  - macOS (launchd): `launchctl kickstart -k "gui/$(id -u)/$(source setup/lib/install-slug.sh && launchd_label)"`
+  - Linux (systemd): `systemctl --user restart "$(source setup/lib/install-slug.sh && systemd_unit)"`
+  - If running manually: restart `pnpm run dev`
 
 If user selected "all" forks in Step 1 (multi-fork pull):
 - Loop back to Step P1 for the next fork.

@@ -12,10 +12,16 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
-import type { McpToolDefinition } from './types.js';
+import type { McpToolDefinition, TrustLevel } from './types.js';
 
 function log(msg: string): void {
   console.error(`[mcp-tools] ${msg}`);
+}
+
+const TRUST: TrustLevel = process.env.NANOCLAW_TRUST === 'known' ? 'known' : 'all';
+
+export function getTrustLevel(): TrustLevel {
+  return TRUST;
 }
 
 const allTools: McpToolDefinition[] = [];
@@ -23,6 +29,7 @@ const toolMap = new Map<string, McpToolDefinition>();
 
 export function registerTools(tools: McpToolDefinition[]): void {
   for (const t of tools) {
+    if (t.availableToTrust && !t.availableToTrust.includes(TRUST)) continue;
     if (toolMap.has(t.tool.name)) {
       log(`Warning: tool "${t.tool.name}" already registered, skipping duplicate`);
       continue;

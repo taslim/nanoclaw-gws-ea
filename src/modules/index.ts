@@ -22,3 +22,5 @@ import './scheduling/index.js';
 import './permissions/index.js';
 import './agent-to-agent/index.js';
 import './self-mod/index.js';
+import './matters/index.js';
+import './email/index.js';

@@ -138,6 +138,20 @@ export interface ChannelAdapter {
   resolveChannelName?(platformId: string): Promise<string | null>;
 
   /**
+   * Per-message status indicators (mirrors v1's sendReaction lifecycle).
+   * Channels translate these into reactions, status emoji, etc., or omit
+   * them when the platform has no equivalent. Host orchestration lives in
+   * `src/modules/indicators/`.
+   *
+   *   markReceived  — message engaged a session; show acknowledgment
+   *   clearReceived — agent responded; remove acknowledgment
+   *   markError     — delivery/session permanently failed; show error
+   */
+  markReceived?(platformId: string, threadId: string | null, messageId: string): Promise<void>;
+  clearReceived?(platformId: string, threadId: string | null, messageId: string): Promise<void>;
+  markError?(platformId: string, threadId: string | null, messageId: string): Promise<void>;
+
+  /**
    * Subscribe the bot to a thread so follow-up messages route via the
    * platform's "subscribed message" path (onSubscribedMessage in Chat SDK).
    * Called by the router when a mention-sticky wiring first engages in a

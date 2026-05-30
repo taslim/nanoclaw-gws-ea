@@ -7,6 +7,7 @@ import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryIn
  */
 export class MockProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
+  readonly nativeAttachmentTypes: ReadonlySet<string> = new Set();
 
   private responseFactory: (prompt: string) => string;
 

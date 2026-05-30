@@ -102,15 +102,20 @@ export interface RoutingContext {
 
 /**
  * Extract routing context from a batch of messages.
- * Uses the first message's routing fields.
+ *
+ * Uses the **most recent** message's routing fields so the response follows
+ * where the user is now. For per-thread sessions the batch shares one
+ * thread, so this is a no-op; for shared sessions (DMs, agent-shared) it
+ * matters — e.g. a DM where the user's first message was top-level and
+ * their next was a thread reply should have the agent reply in the thread.
  */
 export function extractRouting(messages: MessageInRow[]): RoutingContext {
-  const first = messages[0];
+  const last = messages[messages.length - 1];
   return {
-    platformId: first?.platform_id ?? null,
-    channelType: first?.channel_type ?? null,
-    threadId: first?.thread_id ?? null,
-    inReplyTo: first?.id ?? null,
+    platformId: last?.platform_id ?? null,
+    channelType: last?.channel_type ?? null,
+    threadId: last?.thread_id ?? null,
+    inReplyTo: last?.id ?? null,
   };
 }
 
@@ -126,7 +131,10 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
  *
  * Strips routing fields — the agent never sees platform_id, channel_type, thread_id.
  */
-export function formatMessages(messages: MessageInRow[]): string {
+export function formatMessages(
+  messages: MessageInRow[],
+  inlinedPaths?: ReadonlySet<string>,
+): string {
   const header = `<context timezone="${escapeXml(TIMEZONE)}" />\n`;
   if (messages.length === 0) return header;
 
@@ -139,7 +147,7 @@ export function formatMessages(messages: MessageInRow[]): string {
   const parts: string[] = [];
 
   if (chatMessages.length > 0) {
-    parts.push(formatChatMessages(chatMessages));
+    parts.push(formatChatMessages(chatMessages, inlinedPaths));
   }
   if (taskMessages.length > 0) {
     parts.push(...taskMessages.map(formatTaskMessage));
@@ -154,7 +162,7 @@ export function formatMessages(messages: MessageInRow[]): string {
   return header + parts.join('\n\n');
 }
 
-function formatChatMessages(messages: MessageInRow[]): string {
+function formatChatMessages(messages: MessageInRow[], inlinedPaths?: ReadonlySet<string>): string {
   // Each `<message id="..." from="...">...</message>` block is self-contained;
   // concatenating them reads to the agent as a sequence of distinct messages.
   // Earlier revisions wrapped multi-message batches in an outer `<messages>`
@@ -163,10 +171,10 @@ function formatChatMessages(messages: MessageInRow[]): string {
   // requested."`) instead of calling the API — see #2555 for the full trace.
   // The fix is simply to drop the wrapper; the single-message path (which
   // already worked) is now just the N=1 case of the same code.
-  return messages.map(formatSingleChat).join('\n');
+  return messages.map((m) => formatSingleChat(m, inlinedPaths)).join('\n');
 }
 
-function formatSingleChat(msg: MessageInRow): string {
+function formatSingleChat(msg: MessageInRow, inlinedPaths?: ReadonlySet<string>): string {
   const content = parseContent(msg.content);
   const sender = content.sender || content.author?.fullName || content.author?.userName || 'Unknown';
   const time = formatLocalTime(msg.timestamp, TIMEZONE);
@@ -174,7 +182,7 @@ function formatSingleChat(msg: MessageInRow): string {
   const idAttr = msg.seq != null ? ` id="${msg.seq}"` : '';
   const replyAttr = content.replyTo?.id ? ` reply_to="${escapeXml(String(content.replyTo.id))}"` : '';
   const replyPrefix = formatReplyContext(content.replyTo);
-  const attachmentsSuffix = formatAttachments(content.attachments);
+  const attachmentsSuffix = formatAttachments(content.attachments, inlinedPaths);
 
   const fromAttr = originAttr(msg);
 
@@ -240,18 +248,35 @@ function formatReplyContext(replyTo: any): string {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function formatAttachments(attachments: any[] | undefined): string {
+function formatAttachments(attachments: any[] | undefined, inlinedPaths?: ReadonlySet<string>): string {
   if (!Array.isArray(attachments) || attachments.length === 0) return '';
-  const parts = attachments.map((a) => {
-    const name = a.name || a.filename || 'attachment';
+  const parts: string[] = [];
+  for (const a of attachments) {
+    // Suppress annotations for attachments already delivered as native blocks.
+    if (inlinedPaths && typeof a.localPath === 'string' && inlinedPaths.has(a.localPath)) continue;
     const type = a.type || 'file';
+    if (type === 'audio-transcript') {
+      const nameAttr = typeof a.name === 'string' && a.name ? ` filename="${escapeXml(a.name)}"` : '';
+      if (a.status === 'unavailable') {
+        parts.push(`<audio_transcript${nameAttr} status="unavailable" />`);
+      } else {
+        const text = typeof a.text === 'string' ? a.text : '';
+        parts.push(`<audio_transcript${nameAttr}>${escapeXml(text)}</audio_transcript>`);
+      }
+      continue;
+    }
+    const name = a.name || a.filename || 'attachment';
     const localPath = a.localPath ? `/workspace/${a.localPath}` : '';
     const url = a.url || '';
     if (localPath) {
-      return `[${type}: ${escapeXml(name)} — saved to ${escapeXml(localPath)}]`;
+      parts.push(`[${type}: ${escapeXml(name)} — saved to ${escapeXml(localPath)}]`);
+    } else if (url) {
+      parts.push(`[${type}: ${escapeXml(name)} (${escapeXml(url)})]`);
+    } else {
+      parts.push(`[${type}: ${escapeXml(name)}]`);
     }
-    return url ? `[${type}: ${escapeXml(name)} (${escapeXml(url)})]` : `[${type}: ${escapeXml(name)}]`;
-  });
+  }
+  if (parts.length === 0) return '';
   return '\n' + parts.join('\n');
 }
 

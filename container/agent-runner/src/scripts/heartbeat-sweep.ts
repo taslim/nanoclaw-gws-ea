@@ -1,42 +1,67 @@
 /**
- * Heartbeat pre-sweep script
+ * Heartbeat pre-sweep script.
  *
- * Runs inside the container via the task `script` field BEFORE the agent wakes.
- * Gathers data from Google APIs, applies deterministic rules, deduplicates
- * against prior sweeps, and decides whether to wake the agent.
+ * Invoked by the agent-runner pre-task hook. Gathers calendar/contacts data,
+ * applies deterministic tagging, dedupes against prior sweeps, and decides
+ * whether to wake the agent. Output (last stdout line): { wakeAgent, data? }.
  *
- * Output (stdout, last line): { "wakeAgent": boolean, "data"?: SweepBrief }
+ * Mounts read inside the container:
+ *   - /home/node/.gws/service-account.json  (SA key, RO)
+ *   - /home/node/.gws/calendars.json        (optional eventFilters, bot-wide; shared with calendar MCP)
+ *   - /workspace/agent/heartbeat.json       (per-group config: assistantEmail)
+ *   - /workspace/agent/sweep_state.json     (RW, dedup memory)
+ *   - /workspace/inbound.db                 (matters projection, RO)
  */
 import fs from 'fs';
 import path from 'path';
 
 import { google } from 'googleapis';
 import type { calendar_v3 } from 'googleapis';
-import type { OAuth2Client } from 'google-auth-library';
 
-// ── Paths ──────────────────────────────────────────────────────────────────
+import {
+  getArtifactsForMatters,
+  getLinkedArtifactIds,
+  listOpenMattersUpdatedSince,
+  type MatterStatus,
+} from '../db/matters.js';
 
-const WORKSPACE_MCP_DIR = '/home/node/.workspace-mcp';
-const KEYS_PATH = path.join(WORKSPACE_MCP_DIR, 'gcp-oauth.keys.json');
-const CREDS_PATH = path.join(WORKSPACE_MCP_DIR, 'credentials.json');
-const CALENDARS_CONFIG_PATH = path.join(WORKSPACE_MCP_DIR, 'calendars.json');
-const MATTERS_PATH = '/workspace/ipc/current_matters.json';
-const SWEEP_STATE_PATH = '/workspace/group/sweep_state.json';
+const SA_KEY_PATH = '/home/node/.gws/service-account.json';
+const HEARTBEAT_CONFIG_PATH = '/workspace/agent/heartbeat.json';
+const CALENDARS_CONFIG_PATH = '/home/node/.gws/calendars.json';
+const SWEEP_STATE_PATH = '/workspace/agent/sweep_state.json';
 
-// ── Types ──────────────────────────────────────────────────────────────────
+const HOUR_MS = 60 * 60 * 1000;
 
-interface MatterSnapshot {
-  id: number;
-  title: string;
-  status: string;
-  artifacts: string | null;
-  context: string | null;
-  updated_at: string;
-}
+// Heartbeat reports changes, not standing state. Matters older than this fall
+// outside the window and don't surface — pull-on-demand via `find_matter` if
+// the agent needs them. Window = sweep cadence so each sweep covers the gap.
+const HEARTBEAT_RECENCY_MS = HOUR_MS;
+
+// Cap on lookback after a missed sweep — past this, orphan threads are stale.
+const MAX_LOOKBACK_MS = 24 * HOUR_MS;
+
+// Inline scopes — heartbeat needs calendar RW (decline/accept), gmail read
+// (thread metadata), contacts read (tier-1 detection). DWD grant superset
+// in the admin console must include these.
+const HEARTBEAT_SCOPES = [
+  'https://www.googleapis.com/auth/calendar',
+  'https://www.googleapis.com/auth/gmail.readonly',
+  'https://www.googleapis.com/auth/contacts.readonly',
+];
 
 interface ParsedArtifact {
   type: string;
   id: string;
+}
+
+interface MatterSnapshot {
+  id: number;
+  title: string;
+  description: string | null;
+  status: MatterStatus;
+  artifacts: ParsedArtifact[];
+  context: string | null;
+  updated_at: string;
 }
 
 interface ThreadMeta {
@@ -44,7 +69,10 @@ interface ThreadMeta {
   subject: string;
   last_message_from: string;
   last_message_date: string;
+  // Gmail internalDate of the first message — drives one-shot orphan triage.
+  first_message_at: number | null;
   message_count: number;
+  snippet?: string;
 }
 
 interface EventMeta {
@@ -65,8 +93,8 @@ interface EventMeta {
 interface MatterBrief {
   id: number;
   title: string;
-  status: string;
-  context: string | null;
+  description: string | null;
+  status: MatterStatus;
   artifacts: ParsedArtifact[];
   updated_at: string;
   tags: string[];
@@ -101,6 +129,7 @@ interface SweepBrief {
   is_evening_preview: boolean;
   matters: MatterBrief[];
   calendar: CalendarBrief[];
+  threads: ThreadMeta[];
   tomorrow?: CalendarBrief[];
   failures: Failure[];
 }
@@ -119,10 +148,21 @@ interface EventFilter {
   calendarIds?: string[];
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+interface HeartbeatConfig {
+  assistantEmail: string;
+}
 
 function log(msg: string): void {
   process.stderr.write(`[heartbeat-sweep] ${msg}\n`);
+}
+
+function loadHeartbeatConfig(): HeartbeatConfig {
+  const raw = fs.readFileSync(HEARTBEAT_CONFIG_PATH, 'utf-8');
+  const parsed = JSON.parse(raw) as HeartbeatConfig;
+  if (!parsed.assistantEmail) {
+    throw new Error(`heartbeat.json missing assistantEmail at ${HEARTBEAT_CONFIG_PATH}`);
+  }
+  return parsed;
 }
 
 function getNestedValue(obj: Record<string, unknown>, dotPath: string): unknown {
@@ -132,23 +172,6 @@ function getNestedValue(obj: Record<string, unknown>, dotPath: string): unknown 
     current = (current as Record<string, unknown>)[key];
   }
   return current;
-}
-
-function parseArtifacts(raw: string | null): ParsedArtifact[] {
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(
-      (a: unknown): a is ParsedArtifact =>
-        typeof a === 'object' &&
-        a !== null &&
-        typeof (a as ParsedArtifact).type === 'string' &&
-        typeof (a as ParsedArtifact).id === 'string',
-    );
-  } catch {
-    return [];
-  }
 }
 
 function getEventTime(event: calendar_v3.Schema$Event, field: 'start' | 'end'): string {
@@ -224,50 +247,17 @@ function toCalendarBrief(meta: EventMeta, tags: string[], conflictWith?: string)
   };
 }
 
-// ── OAuth2 Client ──────────────────────────────────────────────────────────
-
-function createOAuth2Client(): OAuth2Client {
-  const keys = JSON.parse(fs.readFileSync(KEYS_PATH, 'utf-8'));
-  const credsFile = JSON.parse(fs.readFileSync(CREDS_PATH, 'utf-8'));
-  const creds = credsFile.normal || credsFile;
-
-  const clientConfig = keys.installed || keys.web;
-  const oauth2Client = new google.auth.OAuth2(
-    clientConfig.client_id,
-    clientConfig.client_secret,
-    clientConfig.redirect_uris?.[0],
-  );
-
-  oauth2Client.setCredentials({
-    access_token: creds.access_token,
-    refresh_token: creds.refresh_token,
-    expiry_date: creds.expiry_date,
+function createAuthClient(assistantEmail: string): InstanceType<typeof google.auth.JWT> {
+  const saKey = JSON.parse(fs.readFileSync(SA_KEY_PATH, 'utf-8'));
+  return new google.auth.JWT({
+    email: saKey.client_email,
+    key: saKey.private_key,
+    scopes: HEARTBEAT_SCOPES,
+    subject: assistantEmail,
   });
-
-  // Persist refreshed tokens back to disk
-  oauth2Client.on('tokens', (tokens) => {
-    const existing = JSON.parse(fs.readFileSync(CREDS_PATH, 'utf-8'));
-    const target = existing.normal || existing;
-    if (tokens.access_token) target.access_token = tokens.access_token;
-    if (tokens.refresh_token) target.refresh_token = tokens.refresh_token;
-    if (tokens.expiry_date) target.expiry_date = tokens.expiry_date;
-    fs.writeFileSync(CREDS_PATH, JSON.stringify(existing, null, 2));
-  });
-
-  return oauth2Client;
 }
-
-async function getAssistantEmail(oauth2Client: OAuth2Client): Promise<string> {
-  const { token } = await oauth2Client.getAccessToken();
-  if (!token) throw new Error('No access token available');
-  const tokenInfo = await oauth2Client.getTokenInfo(token);
-  return tokenInfo.email || '';
-}
-
-// ── Event Filters ──────────────────────────────────────────────────────────
 
 function loadEventFilters(): EventFilter[] {
-  if (!fs.existsSync(CALENDARS_CONFIG_PATH)) return [];
   try {
     const config = JSON.parse(fs.readFileSync(CALENDARS_CONFIG_PATH, 'utf-8'));
     return config.eventFilters || [];
@@ -286,8 +276,6 @@ function applyEventFilters(
     if (filter.action !== 'exclude') continue;
 
     if (filter.inValuesOf) {
-      // Cross-event filter: collect all values at inValuesOf path, exclude events whose
-      // 'where' field matches any of them
       const valueSet = new Set<string>();
       for (const { event } of result) {
         const val = getNestedValue(event as unknown as Record<string, unknown>, filter.inValuesOf);
@@ -309,12 +297,7 @@ function applyEventFilters(
   return result;
 }
 
-// ── Sweep State ────────────────────────────────────────────────────────────
-
 function loadSweepState(): SweepState {
-  if (!fs.existsSync(SWEEP_STATE_PATH)) {
-    return { last_sweep_at: '', matters: {}, calendar: {} };
-  }
   try {
     return JSON.parse(fs.readFileSync(SWEEP_STATE_PATH, 'utf-8'));
   } catch {
@@ -323,10 +306,9 @@ function loadSweepState(): SweepState {
 }
 
 function saveSweepState(state: SweepState): void {
+  fs.mkdirSync(path.dirname(SWEEP_STATE_PATH), { recursive: true });
   fs.writeFileSync(SWEEP_STATE_PATH, JSON.stringify(state, null, 2));
 }
-
-// ── Data Gathering ─────────────────────────────────────────────────────────
 
 interface CalendarInfo {
   id: string;
@@ -369,6 +351,12 @@ async function fetchCalendarEvents(
   return events;
 }
 
+function parseInternalDate(raw: string | null | undefined): number | null {
+  if (!raw) return null;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) ? n : null;
+}
+
 async function fetchThreadMeta(
   gmail: ReturnType<typeof google.gmail>,
   threadId: string,
@@ -397,8 +385,24 @@ async function fetchThreadMeta(
     subject,
     last_message_from: getHeader('From'),
     last_message_date: getHeader('Date'),
+    first_message_at: parseInternalDate(firstMsg?.internalDate),
     message_count: messages.length,
+    snippet: lastMsg?.snippet ?? undefined,
   };
+}
+
+async function listRecentInboxThreadIds(
+  gmail: ReturnType<typeof google.gmail>,
+  hours: number,
+): Promise<string[]> {
+  const res = await gmail.users.threads.list({
+    userId: 'me',
+    q: `newer_than:${Math.ceil(hours)}h in:inbox`,
+    maxResults: 100,
+  });
+  return (res.data.threads ?? [])
+    .map((t) => t.id)
+    .filter((id): id is string => typeof id === 'string');
 }
 
 async function fetchContacts(
@@ -425,32 +429,38 @@ async function fetchContacts(
   return emails;
 }
 
-// ── Deterministic Rules ────────────────────────────────────────────────────
+// String mirrored from src/modules/matters/context-file.ts — host/container
+// tsconfig split prevents sharing.
+const PENDING_SECTION_RE = /(^|\n)## Pending\b/;
 
 function tagMatters(
-  matters: MatterBrief[],
+  snapshots: MatterSnapshot[],
+  briefById: ReadonlyMap<number, MatterBrief>,
   assistantEmail: string,
 ): void {
-  const SEVENTY_TWO_HOURS = 72 * 60 * 60 * 1000;
+  const SEVENTY_TWO_HOURS = 72 * HOUR_MS;
   const now = Date.now();
 
-  for (const matter of matters) {
-    const isOpen = matter.status === 'active' || matter.status === 'waiting' || matter.status === 'escalated';
-    if (!isOpen) continue;
+  for (const snap of snapshots) {
+    const brief = briefById.get(snap.id);
+    if (!brief) continue;
 
-    if (matter.status === 'escalated' && !matter.tags.includes('skip_escalated')) {
-      matter.tags.push('skip_escalated');
+    if (snap.status === 'escalated' && !brief.tags.includes('skip_escalated')) {
+      brief.tags.push('skip_escalated');
     }
 
-    // Check for stalled follow-ups: last thread message from assistant, >72h ago
-    for (const thread of matter.threads) {
+    if (snap.context && PENDING_SECTION_RE.test(snap.context)) {
+      brief.tags.push('has_pending');
+    }
+
+    for (const thread of brief.threads) {
       const fromAssistant = thread.last_message_from
         .toLowerCase()
         .includes(assistantEmail.toLowerCase());
       if (fromAssistant && thread.last_message_date) {
         const msgTime = new Date(thread.last_message_date).getTime();
         if (now - msgTime > SEVENTY_TWO_HOURS) {
-          matter.tags.push('stalled_followup');
+          brief.tags.push('stalled_followup');
         }
       }
     }
@@ -469,16 +479,12 @@ function tagCalendarEvents(
     const tags: string[] = [];
     const isFreeBusy = freeBusyCalendarIds.has(meta.calendar_id);
 
-    // FreeBusyReader events only participate in conflict detection (below),
-    // they don't get individual tags since we can't see their details.
     if (!meta.is_all_day && !isFreeBusy) {
-      // Late night: 10pm-7am
       const hour = getHour(meta.start);
       if (hour >= 22 || hour < 7) {
         tags.push('late_night');
       }
 
-      // Missing meeting link
       if (
         !meta.hangout_link &&
         !meta.location &&
@@ -488,7 +494,6 @@ function tagCalendarEvents(
         tags.push('maybe_missing_link');
       }
 
-      // Pending invites
       if (meta.status === 'tentative' || meta.attendees.some(
         (a) => a.email === assistantEmail && a.responseStatus === 'needsAction',
       )) {
@@ -500,9 +505,8 @@ function tagCalendarEvents(
         }
       }
 
-      // Meeting prep: next 2-3 hours with external attendees
       const startMs = new Date(meta.start).getTime();
-      const hoursOut = (startMs - Date.now()) / (60 * 60 * 1000);
+      const hoursOut = (startMs - Date.now()) / HOUR_MS;
       if (hoursOut > 0 && hoursOut <= 3 &&
           hasExternalAttendees(meta.attendees, meta.organizer, assistantEmail)) {
         tags.push('needs_prep');
@@ -512,9 +516,6 @@ function tagCalendarEvents(
     tagged.push({ meta, tags });
   }
 
-  // Conflicts: check all pairs across different calendars.
-  // FreeBusyReader events participate as time blocks but don't get tagged —
-  // only the full-access side gets the conflict tag.
   for (let i = 0; i < tagged.length; i++) {
     for (let j = i + 1; j < tagged.length; j++) {
       const a = tagged[i];
@@ -536,7 +537,6 @@ function tagCalendarEvents(
     }
   }
 
-  // Conflicts override safe_to_accept
   for (const t of tagged) {
     const safeIdx = t.tags.indexOf('safe_to_accept');
     if (safeIdx !== -1 && t.tags.includes('conflict')) {
@@ -544,8 +544,6 @@ function tagCalendarEvents(
     }
   }
 
-  // Triple-stacked: 3+ events in same 1-hour slot.
-  // FreeBusy events count toward the total but don't get tagged.
   const nonAllDay = tagged
     .filter((t) => !t.meta.is_all_day)
     .map((t) => ({ ...t, startMs: new Date(t.meta.start).getTime(), endMs: new Date(t.meta.end).getTime() }));
@@ -562,34 +560,60 @@ function tagCalendarEvents(
   return tagged;
 }
 
-// ── Main ───────────────────────────────────────────────────────────────────
+// Reads from the matters projection in `/workspace/inbound.db` (host writes
+// it on every container wake — see src/modules/matters/write-matters.ts).
+// Filters to open statuses and the recency window so the sweep reports
+// changes, not standing state. Context body is read for `has_pending`
+// tagging but not surfaced to the agent — agent pulls via `find_matter`.
+function loadMatters(): MatterSnapshot[] {
+  const sinceIso = new Date(Date.now() - HEARTBEAT_RECENCY_MS).toISOString();
+  const matters = listOpenMattersUpdatedSince(sinceIso);
+  if (matters.length === 0) return [];
+
+  const byMatter = new Map<number, ParsedArtifact[]>();
+  for (const a of getArtifactsForMatters(matters.map((m) => m.id))) {
+    const list = byMatter.get(a.matter_id) ?? [];
+    list.push({ type: a.artifact_type, id: a.artifact_id });
+    byMatter.set(a.matter_id, list);
+  }
+
+  log(`Loaded ${matters.length} open matter(s) updated since ${sinceIso}`);
+
+  return matters.map((m) => ({
+    id: m.id,
+    title: m.title,
+    description: m.description,
+    status: m.status,
+    artifacts: byMatter.get(m.id) ?? [],
+    context: m.context,
+    updated_at: m.updated_at,
+  }));
+}
 
 async function main(): Promise<void> {
   const now = new Date();
   const nowIso = now.toISOString();
   const failures: Failure[] = [];
 
-  // 1. Create OAuth2 client
-  const oauth2Client = createOAuth2Client();
-
-  // 2. Derive assistant email
-  const assistantEmail = await getAssistantEmail(oauth2Client);
+  const config = loadHeartbeatConfig();
+  const assistantEmail = config.assistantEmail;
   log(`Assistant email: ${assistantEmail}`);
 
-  // 3. Read matters snapshot
-  let mattersSnapshot: MatterSnapshot[] = [];
-  if (fs.existsSync(MATTERS_PATH)) {
-    try {
-      mattersSnapshot = JSON.parse(fs.readFileSync(MATTERS_PATH, 'utf-8'));
-    } catch {
-      log('Failed to parse matters snapshot');
-    }
-  }
+  const authClient = createAuthClient(assistantEmail);
 
-  // 4. Load sweep state
+  const mattersSnapshot = loadMatters();
   const prevState = loadSweepState();
 
-  // 5. Check evening preview (hour === 21 in local TZ)
+  const sinceLastSweepMs = prevState.last_sweep_at
+    ? now.getTime() - new Date(prevState.last_sweep_at).getTime()
+    : HEARTBEAT_RECENCY_MS;
+  const lookbackMs = Math.min(
+    MAX_LOOKBACK_MS,
+    Math.max(HEARTBEAT_RECENCY_MS, sinceLastSweepMs),
+  );
+  const recencyCutoffMs = now.getTime() - lookbackMs;
+  const queryHours = lookbackMs / HOUR_MS;
+
   const localHour = parseInt(
     new Intl.DateTimeFormat('en-US', {
       hour: 'numeric',
@@ -600,17 +624,9 @@ async function main(): Promise<void> {
   );
   const isEveningPreview = localHour === 21;
 
-  // ── Gather data in parallel ──────────────────────────────────────────
-
-  const calendarClient = google.calendar({ version: 'v3', auth: oauth2Client });
-  const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-  const people = google.people({ version: 'v1', auth: oauth2Client });
-
-  // ── Gather data in parallel ──────────────────────────────────────────
-  //
-  // Phase 1: calendar discovery + contacts (independent)
-  // Phase 2: bulk calendar events + matter thread fetches (need calendars)
-  // Matter-linked events are looked up from bulk results, no extra API calls.
+  const calendarClient = google.calendar({ version: 'v3', auth: authClient });
+  const gmail = google.gmail({ version: 'v1', auth: authClient });
+  const people = google.people({ version: 'v1', auth: authClient });
 
   const calendarDiscoveryPromise = discoverCalendars(calendarClient).catch((err) => {
     failures.push({
@@ -630,27 +646,33 @@ async function main(): Promise<void> {
     return new Set<string>();
   });
 
-  // Parse matter artifacts and build thread fetch list
+  const unlinkedScanPromise = listRecentInboxThreadIds(gmail, queryHours).catch((err) => {
+    failures.push({
+      source: 'gmail',
+      operation: 'threads.list',
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [] as string[];
+  });
+
   const matterBriefs: MatterBrief[] = [];
   const matterById = new Map<number, MatterBrief>();
   const threadFetches: Array<{ matterId: number; threadId: string }> = [];
   const matterEventIds: Array<{ matterId: number; eventId: string }> = [];
 
   for (const m of mattersSnapshot) {
-    const artifacts = parseArtifacts(m.artifacts);
     const brief: MatterBrief = {
       id: m.id,
       title: m.title,
+      description: m.description,
       status: m.status,
-      context: m.context,
-      artifacts,
+      artifacts: m.artifacts,
       updated_at: m.updated_at,
       tags: [],
       threads: [],
       events: [],
     };
 
-    // Check if this escalated matter is unchanged — skip fetching
     const stateKey = String(m.id);
     if (
       m.status === 'escalated' &&
@@ -662,21 +684,22 @@ async function main(): Promise<void> {
       continue;
     }
 
-    for (const a of artifacts) {
-      if (a.type === 'email_thread') threadFetches.push({ matterId: m.id, threadId: a.id });
-      if (a.type === 'calendar_event') matterEventIds.push({ matterId: m.id, eventId: a.id });
+    for (const a of m.artifacts) {
+      if (a.type === 'gmail_thread_id') threadFetches.push({ matterId: m.id, threadId: a.id });
+      if (a.type === 'gcal_id') matterEventIds.push({ matterId: m.id, eventId: a.id });
     }
 
     matterBriefs.push(brief);
     matterById.set(m.id, brief);
   }
 
-  // Fetch bulk calendar events and threads in parallel
   const calendars = await calendarDiscoveryPromise;
-  const sevenDaysFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+  const recentInboxThreadIds = await unlinkedScanPromise;
+  const linkedThreadIds = getLinkedArtifactIds('gmail_thread_id');
+  const unlinkedCandidateIds = recentInboxThreadIds.filter((id) => !linkedThreadIds.has(id));
+  const sevenDaysFromNow = new Date(now.getTime() + 7 * 24 * HOUR_MS);
 
-  const [calendarFetchResults, threadResults] = await Promise.all([
-    // Bulk calendar events across all calendars
+  const [calendarFetchResults, threadResults, unlinkedFetchResults] = await Promise.all([
     Promise.all(
       calendars.map(async (cal) => {
         try {
@@ -698,7 +721,6 @@ async function main(): Promise<void> {
         }
       }),
     ),
-    // Thread fetches for matters
     Promise.all(
       threadFetches.map(async ({ matterId, threadId }) => {
         try {
@@ -715,9 +737,23 @@ async function main(): Promise<void> {
         }
       }),
     ),
+    Promise.all(
+      unlinkedCandidateIds.map(async (id) => {
+        try {
+          return await fetchThreadMeta(gmail, id);
+        } catch (err) {
+          failures.push({
+            source: 'gmail',
+            operation: 'threads.get',
+            error: err instanceof Error ? err.message : String(err),
+            target_id: id,
+          });
+          return null;
+        }
+      }),
+    ),
   ]);
 
-  // Build event ID → EventMeta map from bulk results
   const allRawEvents: Array<{ event: calendar_v3.Schema$Event; calendarId: string }> = [];
   for (const batch of calendarFetchResults) {
     allRawEvents.push(...batch);
@@ -728,14 +764,12 @@ async function main(): Promise<void> {
     if (event.id) bulkEventMap.set(event.id, toEventMeta(event, calendarId));
   }
 
-  // Attach threads to matters
   for (const result of threadResults) {
     if (!result) continue;
     const brief = matterById.get(result.matterId);
     if (brief) brief.threads.push(result.meta);
   }
 
-  // Attach events to matters — look up from bulk results (no extra API calls)
   for (const { matterId, eventId } of matterEventIds) {
     const meta = bulkEventMap.get(eventId);
     if (meta) {
@@ -751,42 +785,34 @@ async function main(): Promise<void> {
     }
   }
 
-  // Tag matters
-  tagMatters(matterBriefs, assistantEmail);
+  tagMatters(mattersSnapshot, matterById, assistantEmail);
 
-  // Apply event filters from calendars.json
   const filters = loadEventFilters();
   const filteredEvents = applyEventFilters(allRawEvents, filters);
 
-  // Build set of event IDs linked to surviving (non-dropped) matters
   const matterLinkedEventIds = new Set<string>();
   for (const m of matterBriefs) {
     if (m.tags.includes('skip_escalated') && prevState.matters[String(m.id)]?.updated_at === m.updated_at) {
-      continue; // Dropped matter — don't exclude its events from calendar section
+      continue;
     }
     for (const a of m.artifacts) {
-      if (a.type === 'calendar_event') matterLinkedEventIds.add(a.id);
+      if (a.type === 'gcal_id') matterLinkedEventIds.add(a.id);
     }
   }
 
-  // Convert to EventMeta, exclude matter-linked events
   const calendarEvents: EventMeta[] = [];
   for (const { event, calendarId } of filteredEvents) {
     if (event.id && matterLinkedEventIds.has(event.id)) continue;
     calendarEvents.push(toEventMeta(event, calendarId));
   }
 
-  // Apply calendar rules
   const contactEmails = await contactsPromise;
   const freeBusyCalendarIds = new Set(
     calendars.filter((c) => c.accessRole === 'freeBusyReader').map((c) => c.id),
   );
   const taggedCalendar = tagCalendarEvents(calendarEvents, contactEmails, assistantEmail, freeBusyCalendarIds);
 
-  // Only keep events with at least one tag (the rest are "clean" — no issues)
   const calendarFindings = taggedCalendar.filter((t) => t.tags.length > 0);
-
-  // ── Evening preview: tomorrow's events ──────────────────────────────
 
   let tomorrowBriefs: CalendarBrief[] | undefined;
   if (isEveningPreview) {
@@ -796,7 +822,6 @@ async function main(): Promise<void> {
     const tomorrowEnd = new Date(tomorrowStart);
     tomorrowEnd.setDate(tomorrowEnd.getDate() + 1);
 
-    // Filter from already-fetched events (they're within the 7-day window)
     const tomorrowEvents = filteredEvents
       .filter(({ event }) => {
         const start = getEventTime(event, 'start');
@@ -809,15 +834,12 @@ async function main(): Promise<void> {
     tomorrowBriefs = tomorrowEvents.map((meta) => toCalendarBrief(meta, []));
   }
 
-  // ── Dedup against sweep state ───────────────────────────────────────
-
   const newState: SweepState = {
     last_sweep_at: nowIso,
     matters: {},
     calendar: {},
   };
 
-  // Dedup matters — fingerprint includes tags so state transitions (e.g. stalled_followup) wake the agent
   const survivingMatters: MatterBrief[] = [];
   for (const m of matterBriefs) {
     const key = String(m.id);
@@ -832,7 +854,6 @@ async function main(): Promise<void> {
     }
   }
 
-  // Dedup calendar findings — fingerprint includes tags + conflicts
   const survivingCalendar: CalendarBrief[] = [];
   for (const finding of calendarFindings) {
     const key = `${finding.meta.calendar_id}:${finding.meta.event_id}`;
@@ -847,11 +868,15 @@ async function main(): Promise<void> {
     }
   }
 
-  // ── Decide: wake agent or not ───────────────────────────────────────
+  const survivingThreads: ThreadMeta[] = unlinkedFetchResults.filter(
+    (meta): meta is ThreadMeta =>
+      meta?.first_message_at != null && meta.first_message_at >= recencyCutoffMs,
+  );
 
   const isQuiet =
     survivingMatters.length === 0 &&
     survivingCalendar.length === 0 &&
+    survivingThreads.length === 0 &&
     failures.length === 0 &&
     !isEveningPreview;
 
@@ -868,18 +893,18 @@ async function main(): Promise<void> {
     is_evening_preview: isEveningPreview,
     matters: survivingMatters,
     calendar: survivingCalendar,
+    threads: survivingThreads,
     ...(tomorrowBriefs && { tomorrow: tomorrowBriefs }),
     failures,
   };
 
   log(
-    `Waking agent: ${survivingMatters.length} matters, ${survivingCalendar.length} calendar findings, ${failures.length} failures`,
+    `Waking agent: ${survivingMatters.length} matters, ${survivingCalendar.length} calendar findings, ${survivingThreads.length} unlinked threads, ${failures.length} failures`,
   );
   console.log(JSON.stringify({ wakeAgent: true, data: brief }));
 }
 
 main().catch((err) => {
   log(`Fatal error: ${err instanceof Error ? err.message : String(err)}`);
-  // Let the script crash — agent-runner will wake agent with full sweep as fallback
   process.exit(1);
 });

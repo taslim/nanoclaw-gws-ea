@@ -250,3 +250,18 @@ export function getMessagingGroupsByAgentGroup(agentGroupId: string): MessagingG
     )
     .all(agentGroupId) as MessagingGroup[];
 }
+
+// Throws on ambiguity (>1 match) — config error the caller should
+// surface, not silently absorb.
+export function findUniqueDmOnAgentGroup(agentGroupId: string, channelType: string): MessagingGroup | null {
+  const candidates = getMessagingGroupsByAgentGroup(agentGroupId).filter(
+    (mg) => mg.channel_type === channelType && mg.is_group === 0,
+  );
+  if (candidates.length === 0) return null;
+  if (candidates.length > 1) {
+    throw new Error(
+      `findUniqueDmOnAgentGroup: expected one ${channelType} DM wired to ${agentGroupId}, found ${candidates.length}: ${candidates.map((c) => c.id).join(', ')}`,
+    );
+  }
+  return candidates[0];
+}

@@ -153,7 +153,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             const buffer = await att.fetchData();
             entry.data = buffer.toString('base64');
           } catch (err) {
-            log.warn('Failed to download attachment', { type: att.type, err });
+            const e = err as { response?: { data?: unknown }; status?: number; code?: number };
+            log.warn('Failed to download attachment', {
+              type: att.type,
+              mimeType: att.mimeType,
+              status: e.status ?? e.code,
+              responseData: e.response?.data,
+              err,
+            });
           }
         }
         enriched.push(entry);

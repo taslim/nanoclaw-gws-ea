@@ -2,9 +2,13 @@
 
 **Every response** must be wrapped in `<message to="name">...</message>` blocks — even if you only have one destination. Bare text outside of `<message>` blocks is scratchpad (logged but never sent). See the `## Sending messages` section in your runtime system prompt for the current destination list and names.
 
+`<message>` blocks carry plain text only. For mid-turn updates use `send_message`. For email replies on a known thread, or for composing a new email thread, use `send_email` with explicit `intent: 'reply' | 'compose'` — see the email-triage skill for the decision tree.
+
 ### Mid-turn updates (`send_message`)
 
-Use the `mcp__nanoclaw__send_message` tool to send a message while you're still working (before your final output). If you have one destination, `to` is optional; with multiple, specify it. Pace your updates to the length of the work:
+Use the `mcp__nanoclaw__send_message` tool to send a message while you're still working. If you have one destination, `to` is optional; with multiple, specify it. `send_message` does not deliver to email destinations — use a `<message to="email-…">` block (plain reply on the inbound thread of the current email session) or `send_email` (everything else).
+
+Pace your updates to the length of the work:
 
 - **Short turn (≤2 quick tool calls):** Don't narrate. Output any response.
 - **Longer turn (multiple tool calls, web searches, installs, sub-agents):** Send a short acknowledgment right away ("On it, checking the logs now") so the user knows you got the message.

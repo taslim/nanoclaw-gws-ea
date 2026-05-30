@@ -19,6 +19,7 @@
     "prepare": "husky",
     "setup": "tsx setup/index.ts",
     "setup:auto": "tsx setup/auto.ts",
+    "setup:gws-ea": "tsx setup/gws-ea.ts",
     "ncl": "tsx src/cli/client.ts",
     "chat": "tsx scripts/chat.ts",
     "auth": "tsx src/whatsapp-auth.ts",
@@ -28,13 +29,17 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@chat-adapter/gchat": "4.26.0",
     "@clack/core": "^1.2.0",
     "@clack/prompts": "^1.2.0",
+    "@google-cloud/pubsub": "^4.11.0",
     "@onecli-sh/sdk": "^0.5.0",
     "better-sqlite3": "11.10.0",
     "chat": "^4.24.0",
     "cron-parser": "5.5.0",
-    "kleur": "^4.1.5"
+    "googleapis": "^171.4.0",
+    "kleur": "^4.1.5",
+    "marked": "^18.0.3"
   },
   "devDependencies": {
     "@eslint/js": "^9.35.0",

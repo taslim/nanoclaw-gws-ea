@@ -1,3 +1,5 @@
+import type { InlineAttachmentBlock } from '../attachments.js';
+
 export interface AgentProvider {
   /**
    * True if the provider's underlying SDK handles slash commands natively and
@@ -5,6 +7,13 @@ export interface AgentProvider {
    * slash commands like any other chat message.
    */
   readonly supportsNativeSlashCommands: boolean;
+
+  /**
+   * Mime types this provider ingests as native content blocks on the first
+   * turn. Empty → poll-loop falls back to text annotations referencing
+   * `/workspace/inbox/...` and the agent reaches them via the Read tool.
+   */
+  readonly nativeAttachmentTypes: ReadonlySet<string>;
 
   /** Start a new query. Returns a handle for streaming input and output. */
   query(input: QueryInput): AgentQuery;
@@ -55,6 +64,9 @@ export interface ProviderOptions {
 export interface QueryInput {
   /** Initial prompt (already formatted by agent-runner). */
   prompt: string;
+
+  /** Native attachment blocks for the first turn. Pre-filtered against `nativeAttachmentTypes`. */
+  inlineAttachments?: InlineAttachmentBlock[];
 
   /**
    * Opaque continuation token from a previous query. The provider decides

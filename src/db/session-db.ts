@@ -54,6 +54,8 @@ export function upsertSessionRouting(
   ).run(routing);
 }
 
+export type DestinationKind = 'chat' | 'email';
+
 export interface DestinationRow {
   name: string;
   display_name: string | null;
@@ -61,18 +63,69 @@ export interface DestinationRow {
   channel_type: string | null;
   platform_id: string | null;
   agent_group_id: string | null;
+  kind: DestinationKind;
 }
 
 export function replaceDestinations(db: Database.Database, entries: DestinationRow[]): void {
+  // Forward-compat: session DBs created before the `kind` column exists need
+  // it added before INSERT can succeed. The column is repopulated on every
+  // wake (DELETE + INSERT below), so no backfill is required.
+  const cols = new Set(
+    (db.prepare("PRAGMA table_info('destinations')").all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  if (!cols.has('kind')) {
+    db.exec(`ALTER TABLE destinations ADD COLUMN kind TEXT NOT NULL DEFAULT 'chat'`);
+  }
+
   const tx = db.transaction((rows: DestinationRow[]) => {
     db.prepare('DELETE FROM destinations').run();
     const stmt = db.prepare(
-      `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
-       VALUES (@name, @display_name, @type, @channel_type, @platform_id, @agent_group_id)`,
+      `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id, kind)
+       VALUES (@name, @display_name, @type, @channel_type, @platform_id, @agent_group_id, @kind)`,
     );
     for (const row of rows) stmt.run(row);
   });
   tx(entries);
+}
+
+export interface MatterRow {
+  id: number;
+  title: string;
+  description: string | null;
+  status: string;
+  context: string | null;
+  updated_at: string;
+}
+
+export interface MatterArtifactRow {
+  matter_id: number;
+  artifact_type: string;
+  artifact_id: string;
+  linked_at: string;
+}
+
+/**
+ * Replace the matters projection in a single transaction. Mirrors
+ * `replaceDestinations` — full rewrite per call. Host calls this from
+ * `src/modules/matters/write-matters.ts` on every container wake
+ * and after each matters-mutating system action.
+ */
+export function replaceMatters(db: Database.Database, matters: MatterRow[], artifacts: MatterArtifactRow[]): void {
+  const tx = db.transaction(() => {
+    db.prepare('DELETE FROM matter_artifacts').run();
+    db.prepare('DELETE FROM matters').run();
+    const insertMatter = db.prepare(
+      `INSERT INTO matters (id, title, description, status, context, updated_at)
+       VALUES (@id, @title, @description, @status, @context, @updated_at)`,
+    );
+    for (const m of matters) insertMatter.run(m);
+    const insertArtifact = db.prepare(
+      `INSERT INTO matter_artifacts (matter_id, artifact_type, artifact_id, linked_at)
+       VALUES (@matter_id, @artifact_type, @artifact_id, @linked_at)`,
+    );
+    for (const a of artifacts) insertArtifact.run(a);
+  });
+  tx();
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +234,25 @@ export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Data
   })();
 }
 
+export type TerminalProcessingAckStatus = 'completed' | 'failed';
+
+/** Look up processing_ack status for the given message ids, restricted to
+ *  terminal states. */
+export function getTerminalProcessingAcks(
+  outDb: Database.Database,
+  messageIds: string[],
+): Map<string, TerminalProcessingAckStatus> {
+  if (messageIds.length === 0) return new Map();
+  const placeholders = messageIds.map(() => '?').join(',');
+  const rows = outDb
+    .prepare(
+      `SELECT message_id, status FROM processing_ack
+       WHERE status IN ('completed', 'failed') AND message_id IN (${placeholders})`,
+    )
+    .all(...messageIds) as Array<{ message_id: string; status: TerminalProcessingAckStatus }>;
+  return new Map(rows.map((r) => [r.message_id, r.status]));
+}
+
 export function getStuckProcessingIds(outDb: Database.Database): string[] {
   return (
     outDb.prepare("SELECT message_id FROM processing_ack WHERE status = 'processing'").all() as Array<{
@@ -253,6 +325,7 @@ export interface OutboundMessage {
   thread_id: string | null;
   content: string;
   in_reply_to: string | null;
+  priority: string | null;
 }
 
 export function getDueOutboundMessages(db: Database.Database): OutboundMessage[] {

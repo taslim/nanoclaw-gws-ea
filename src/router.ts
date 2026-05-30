@@ -17,6 +17,7 @@
  * drops (no agent wired, no trigger match); the access gate writes rows
  * for policy refusals.
  */
+import { transcribeInboundAudio } from './audio-transcription.js';
 import { getChannelAdapter } from './channels/channel-registry.js';
 import { gateCommand } from './command-gate.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -27,6 +28,7 @@ import {
   getMessagingGroupWithAgentCount,
 } from './db/messaging-groups.js';
 import { findSessionForAgent } from './db/sessions.js';
+import { clearIndicatorsForSession, indicateReceived } from './modules/indicators/index.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
@@ -159,6 +161,13 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   // Pre-route interceptor — lets modules consume messages before any routing
   // (e.g. free-text replies during multi-step approval flows).
   if (messageInterceptor && (await messageInterceptor(event))) return;
+
+  // Audio transcription runs before any per-agent fan-out so a single
+  // whisper invocation feeds every wired agent group. Transcripts get
+  // appended to the message text and the audio attachments are dropped —
+  // the agent reads the transcript as the user's message, never sees a
+  // raw audio file path it can't process.
+  await transcribeInboundAudio(event);
 
   // 0. Apply the adapter's thread policy. Non-threaded adapters (Telegram,
   //    WhatsApp, iMessage, email) collapse threads to the channel.
@@ -470,16 +479,20 @@ async function deliverToAgent(
   });
 
   if (wake) {
-    // Typing indicator + wake are only for the engaged branch; accumulated
-    // messages sit silently until a real trigger fires.
+    // Typing indicator + status indicator + wake are only for the engaged
+    // branch; accumulated messages sit silently until a real trigger fires.
     startTypingRefresh(session.id, session.agent_group_id, event.channelType, event.platformId, event.threadId);
+    indicateReceived(session.id, event.channelType, event.platformId, event.threadId, event.message.id);
     const freshSession = getSession(session.id);
     if (freshSession) {
       const woke = await wakeContainer(freshSession);
       // wakeContainer never throws — it returns false on transient spawn
-      // failure (host-sweep retries). Stop the typing indicator we just
-      // started so it doesn't leak; the inbound row stays pending.
-      if (!woke) stopTypingRefresh(freshSession.id);
+      // failure (host-sweep retries). Roll back both indicators we just
+      // started so they don't leak; the inbound row stays pending.
+      if (!woke) {
+        stopTypingRefresh(freshSession.id);
+        clearIndicatorsForSession(freshSession.id);
+      }
     }
   }
 }

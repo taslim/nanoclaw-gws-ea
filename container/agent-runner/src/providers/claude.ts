@@ -4,9 +4,12 @@ import path from 'path';
 
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
+import { IMAGE_MIME_TYPES, PDF_MIME_TYPE, type InlineAttachmentBlock } from '../attachments.js';
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
+
+const CLAUDE_NATIVE_ATTACHMENT_TYPES: ReadonlySet<string> = new Set<string>([...IMAGE_MIME_TYPES, PDF_MIME_TYPE]);
 
 function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
@@ -61,6 +64,10 @@ const TOOL_ALLOWLIST = [
   'NotebookEdit',
 ];
 
+type UserMessageContent =
+  | string
+  | Array<{ type: 'text'; text: string } | InlineAttachmentBlock>;
+
 // MCP server names are sanitized by the SDK when forming tool prefixes:
 // any character outside [A-Za-z0-9_-] becomes '_'. Mirror that here so our
 // allowlist patterns match what the SDK actually exposes.
@@ -70,27 +77,38 @@ function mcpAllowPattern(serverName: string): string {
 
 interface SDKUserMessage {
   type: 'user';
-  message: { role: 'user'; content: string };
+  message: { role: 'user'; content: UserMessageContent };
   parent_tool_use_id: null;
   session_id: string;
 }
 
-/**
- * Push-based async iterable for streaming user messages to the Claude SDK.
- */
+/** Push-based async iterable feeding user messages into the Claude SDK. */
 class MessageStream {
   private queue: SDKUserMessage[] = [];
   private waiting: (() => void) | null = null;
   private done = false;
 
-  push(text: string): void {
+  private enqueue(content: UserMessageContent): void {
     this.queue.push({
       type: 'user',
-      message: { role: 'user', content: text },
+      message: { role: 'user', content },
       parent_tool_use_id: null,
       session_id: '',
     });
     this.waiting?.();
+  }
+
+  push(text: string): void {
+    this.enqueue(text);
+  }
+
+  pushMultipart(text: string, attachments: InlineAttachmentBlock[]): void {
+    if (attachments.length === 0) {
+      this.enqueue(text);
+      return;
+    }
+    // Image/document blocks before text so the model sees them as context for the prompt.
+    this.enqueue([...attachments, { type: 'text', text }]);
   }
 
   end(): void {
@@ -330,6 +348,7 @@ const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not fou
 
 export class ClaudeProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = true;
+  readonly nativeAttachmentTypes = CLAUDE_NATIVE_ATTACHMENT_TYPES;
 
   private assistantName?: string;
   private mcpServers: Record<string, McpServerConfig>;
@@ -392,7 +411,11 @@ export class ClaudeProvider implements AgentProvider {
 
   query(input: QueryInput): AgentQuery {
     const stream = new MessageStream();
-    stream.push(input.prompt);
+    if (input.inlineAttachments && input.inlineAttachments.length > 0) {
+      stream.pushMultipart(input.prompt, input.inlineAttachments);
+    } else {
+      stream.push(input.prompt);
+    }
 
     const instructions = input.systemContext?.instructions;
 

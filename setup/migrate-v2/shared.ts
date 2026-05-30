@@ -62,6 +62,10 @@ export function parseJid(raw: string): ParsedJid | null {
  * Build a v2 platform_id from a v1 JID, in the format the runtime adapter
  * for that channel emits. WhatsApp uses the raw Baileys JID (`<id>@<host>`,
  * no prefix). Other channels use `<channel_type>:<id>`.
+ *
+ * GChat: v1 stored bare space IDs (`gchat:AAAA1234567`). The current
+ * `@chat-adapter/gchat` emits and decodes the full Chat API resource
+ * name (`gchat:spaces/<id>`), so prepend `spaces/` if missing.
  */
 export function v2PlatformId(channelType: string, jid: string): string {
   if (channelType === 'whatsapp') {
@@ -71,6 +75,11 @@ export function v2PlatformId(channelType: string, jid: string): string {
   }
   const parsed = parseJid(jid);
   const id = parsed?.id ?? jid;
+  if (channelType === 'gchat') {
+    const spaceId = id.startsWith('gchat:') ? id.slice('gchat:'.length) : id;
+    const withPrefix = spaceId.startsWith('spaces/') ? spaceId : `spaces/${spaceId}`;
+    return `gchat:${withPrefix}`;
+  }
   return id.startsWith(`${channelType}:`) ? id : `${channelType}:${id}`;
 }
 
@@ -130,6 +139,27 @@ export function triggerToEngage(input: {
 export function generateId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
+
+// ── Self-managed folders ────────────────────────────────────────────────
+
+/**
+ * Folders that the gws-ea init scripts (init-email, init-heartbeat) create
+ * fresh from the canonical v2 wiring. The v1→v2 migration must NOT seed
+ * agent_groups / messaging_groups / wirings / sessions / tasks for these —
+ * doing so leaves stale rows around (v1 names, v1-shape JIDs, broken
+ * platform_ids on recurring tasks) that the init scripts then can't fix
+ * because they short-circuit on `getAgentGroupByFolder` finding the row.
+ *
+ * Includes both v1 and v2 folder names so a re-run after a partial
+ * migration still skips correctly.
+ */
+export const SELF_MANAGED_FOLDERS = new Set<string>([
+  'email',             // v1 principal email folder
+  'email-principal',   // v2 form (some installs renamed during migration)
+  'external-contact',  // v1 external email folder
+  'email-external',    // v2 form
+  'heartbeat',         // proactive sweep / morning briefing / weekly review
+]);
 
 // ── Channel auth registry ───────────────────────────────────────────────
 

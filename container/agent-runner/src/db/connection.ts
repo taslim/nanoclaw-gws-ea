@@ -108,6 +108,13 @@ export function getOutboundDb(): Database {
         updated_at               TEXT NOT NULL
       );
     `);
+    // Retrofit `priority` onto outbound.db files created before the column existed.
+    const outCols = new Set(
+      (_outbound.prepare("PRAGMA table_info('messages_out')").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    if (!outCols.has('priority')) {
+      _outbound.exec(`ALTER TABLE messages_out ADD COLUMN priority TEXT`);
+    }
   }
   return _outbound;
 }
@@ -211,7 +218,29 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       type            TEXT NOT NULL,
       channel_type    TEXT,
       platform_id     TEXT,
-      agent_group_id  TEXT
+      agent_group_id  TEXT,
+      kind            TEXT NOT NULL DEFAULT 'chat'
+    );
+    CREATE TABLE matters (
+      id          INTEGER PRIMARY KEY,
+      title       TEXT NOT NULL,
+      description TEXT,
+      status      TEXT NOT NULL,
+      context     TEXT,
+      updated_at  TEXT NOT NULL
+    );
+    CREATE TABLE matter_artifacts (
+      matter_id     INTEGER NOT NULL,
+      artifact_type TEXT NOT NULL,
+      artifact_id   TEXT NOT NULL,
+      linked_at     TEXT NOT NULL,
+      PRIMARY KEY (artifact_type, artifact_id)
+    );
+    CREATE TABLE session_routing (
+      id           INTEGER PRIMARY KEY CHECK (id = 1),
+      channel_type TEXT,
+      platform_id  TEXT,
+      thread_id    TEXT
     );
   `);
 
@@ -229,7 +258,8 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       platform_id    TEXT,
       channel_type   TEXT,
       thread_id      TEXT,
-      content        TEXT NOT NULL
+      content        TEXT NOT NULL,
+      priority       TEXT
     );
     CREATE TABLE processing_ack (
       message_id     TEXT PRIMARY KEY,

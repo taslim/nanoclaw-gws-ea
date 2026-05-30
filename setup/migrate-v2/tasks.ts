@@ -24,7 +24,7 @@ import { insertTask } from '../../src/modules/scheduling/db.js';
 import { openInboundDb, resolveSession } from '../../src/session-manager.js';
 import { readEnvFile } from '../../src/env.js';
 import { buildDiscordResolver, type DiscordResolver } from './discord-resolver.js';
-import { parseJid, v2PlatformId } from './shared.js';
+import { parseJid, SELF_MANAGED_FOLDERS, v2PlatformId } from './shared.js';
 
 interface V1Task {
   id: string;
@@ -87,7 +87,17 @@ async function main(): Promise<void> {
   const allTasks = v1Db.prepare('SELECT * FROM scheduled_tasks').all() as V1Task[];
   v1Db.close();
 
-  const activeTasks = allTasks.filter((t) => t.status === 'active');
+  // Filter: active + (recurring OR not-yet-fired one-shot). v1 leaves
+  // status='active' on completed one-shots, so we'd otherwise import a
+  // pile of long-past tasks as stale `pending` rows that never run.
+  const now = Date.now();
+  const activeTasks = allTasks.filter((t) => {
+    if (t.status !== 'active') return false;
+    const isRecurring = t.schedule_type === 'cron' || t.schedule_type === 'interval';
+    if (isRecurring) return true;
+    if (!t.next_run) return false;
+    return new Date(t.next_run).getTime() > now;
+  });
   if (activeTasks.length === 0) {
     console.log('SKIPPED:no active tasks');
     process.exit(0);
@@ -116,6 +126,8 @@ async function main(): Promise<void> {
 
   for (const t of activeTasks) {
     try {
+      if (SELF_MANAGED_FOLDERS.has(t.group_folder)) { skipped++; continue; }
+
       const ag = getAgentGroupByFolder(t.group_folder);
       if (!ag) { skipped++; continue; }
 

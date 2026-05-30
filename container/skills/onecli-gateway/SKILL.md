@@ -27,6 +27,13 @@ through the gateway. Just make the request directly; the gateway injects
 credentials if the app is connected. If not, it returns an error with a
 connect URL you can present to the user.
 
+If the container loads the `gworkspace` and `calendar` MCP servers (Google
+Docs/Drive/Gmail/Calendar/Contacts), prefer those tools over raw HTTP for
+Google Workspace — they auth via a mounted service-account key with
+domain-wide delegation, not through this gateway. A 401 from a gworkspace
+MCP tool is a scope or admin-config issue; there is no `connect_url` and
+the failure handling below does not apply.
+
 ## Making Requests
 
 Call the real API URL. The gateway intercepts the request and injects

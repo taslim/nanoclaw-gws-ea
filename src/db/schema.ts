@@ -202,7 +202,8 @@ CREATE TABLE IF NOT EXISTS destinations (
   type            TEXT NOT NULL,   -- 'channel' | 'agent'
   channel_type    TEXT,            -- for type='channel'
   platform_id     TEXT,            -- for type='channel'
-  agent_group_id  TEXT             -- for type='agent'
+  agent_group_id  TEXT,            -- for type='agent'
+  kind            TEXT NOT NULL DEFAULT 'chat'  -- 'chat' | 'email'
 );
 
 -- Default reply routing for this session. Single-row table (id=1).
@@ -216,6 +217,30 @@ CREATE TABLE IF NOT EXISTS session_routing (
   platform_id  TEXT,
   thread_id    TEXT
 );
+
+-- Matters projection. Slim header rows (id, title, description, status,
+-- updated_at) plus the context-file body. Host re-projects on every container
+-- wake AND after each matters-mutating system action so the calling agent
+-- sees its own writes immediately. Mid-session updates from other sessions
+-- propagate at next wake. Container reads via mcp-tools/matters.ts.
+CREATE TABLE IF NOT EXISTS matters (
+  id          INTEGER PRIMARY KEY,
+  title       TEXT NOT NULL,
+  description TEXT,
+  status      TEXT NOT NULL,
+  context     TEXT,
+  updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_matters_status ON matters(status);
+
+CREATE TABLE IF NOT EXISTS matter_artifacts (
+  matter_id     INTEGER NOT NULL,
+  artifact_type TEXT NOT NULL,
+  artifact_id   TEXT NOT NULL,
+  linked_at     TEXT NOT NULL,
+  PRIMARY KEY (artifact_type, artifact_id)
+);
+CREATE INDEX IF NOT EXISTS idx_matter_artifacts_matter ON matter_artifacts(matter_id);
 `;
 
 /** Container-owned: outbound messages + processing acknowledgments. */
@@ -231,7 +256,8 @@ CREATE TABLE IF NOT EXISTS messages_out (
   platform_id    TEXT,
   channel_type   TEXT,
   thread_id      TEXT,
-  content        TEXT NOT NULL
+  content        TEXT NOT NULL,
+  priority       TEXT
 );
 
 -- Container tracks processing status here instead of updating messages_in.

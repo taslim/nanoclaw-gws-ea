@@ -27,6 +27,7 @@ import { fileURLToPath } from 'url';
 
 import { loadConfig } from './config.js';
 import { buildSystemPromptAddendum } from './destinations.js';
+import { getGwsMcpServers } from './gws-capability.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
@@ -80,6 +81,11 @@ async function main(): Promise<void> {
       env: {},
     },
   };
+
+  for (const [name, serverConfig] of Object.entries(getGwsMcpServers())) {
+    mcpServers[name] = serverConfig;
+    log(`Capability MCP server: ${name}`);
+  }
 
   for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
     mcpServers[name] = serverConfig;

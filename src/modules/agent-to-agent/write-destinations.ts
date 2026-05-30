@@ -34,6 +34,7 @@ export function writeDestinations(agentGroupId: string, sessionId: string): void
         channel_type: mg.channel_type,
         platform_id: mg.platform_id,
         agent_group_id: null,
+        kind: mg.channel_type === 'email' ? 'email' : 'chat',
       });
     } else if (row.target_type === 'agent') {
       const ag = getAgentGroup(row.target_id);
@@ -45,6 +46,7 @@ export function writeDestinations(agentGroupId: string, sessionId: string): void
         channel_type: null,
         platform_id: null,
         agent_group_id: ag.id,
+        kind: 'chat',
       });
     }
   }

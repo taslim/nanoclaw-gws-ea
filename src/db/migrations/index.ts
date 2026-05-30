@@ -12,8 +12,12 @@ import { migration012 } from './012-channel-registration.js';
 import { migration013 } from './013-approval-render-metadata.js';
 import { migration014 } from './014-container-configs.js';
 import { migration015 } from './015-cli-scope.js';
+import { migration016 } from './016-install-state.js';
 import { moduleApprovalsPendingApprovals } from './module-approvals-pending-approvals.js';
 import { moduleApprovalsTitleOptions } from './module-approvals-title-options.js';
+import { moduleEmail } from './module-email.js';
+import { moduleGchatEvents } from './module-gchat-events.js';
+import { moduleMatters } from './module-matters.js';
 
 export interface Migration {
   version: number;
@@ -35,6 +39,10 @@ const migrations: Migration[] = [
   migration013,
   migration014,
   migration015,
+  migration016,
+  moduleMatters,
+  moduleEmail,
+  moduleGchatEvents,
 ];
 
 export function runMigrations(db: Database.Database): void {
