@@ -1,0 +1,148 @@
+diff --git a/dist/index.js b/dist/index.js
+index 3f397a6d030c62c0288bcddde42597667fbc5c35..73328d31ae77447d858a5c2126bcae04af1f2f21 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -488,7 +488,7 @@ async function listSpaceSubscriptions(spaceName, auth2) {
+     auth: authClient
+   });
+   const response = await workspaceEvents.subscriptions.list({
+-    filter: `target_resource="//chat.googleapis.com/${spaceName}"`
++    filter: `target_resource="//chat.googleapis.com/${spaceName}" AND event_types:"google.workspace.chat.message.v1.created"`
+   });
+   return (response.data.subscriptions || []).map((sub) => ({
+     name: sub.name || "",
+@@ -638,6 +638,8 @@ var GoogleChatAdapter = class {
+           scopes: [
+             "https://www.googleapis.com/auth/chat.spaces",
+             "https://www.googleapis.com/auth/chat.spaces.create",
++            "https://www.googleapis.com/auth/chat.messages",
++            "https://www.googleapis.com/auth/chat.messages.create",
+             "https://www.googleapis.com/auth/chat.messages.readonly"
+           ],
+           subject: this.impersonateUser
+@@ -651,6 +653,8 @@ var GoogleChatAdapter = class {
+           scopes: [
+             "https://www.googleapis.com/auth/chat.spaces",
+             "https://www.googleapis.com/auth/chat.spaces.create",
++            "https://www.googleapis.com/auth/chat.messages",
++            "https://www.googleapis.com/auth/chat.messages.create",
+             "https://www.googleapis.com/auth/chat.messages.readonly"
+           ],
+           clientOptions: {
+@@ -1084,7 +1088,7 @@ var GoogleChatAdapter = class {
+       let threadId;
+       if (messageName) {
+         try {
+-          const messageResponse = await this.chatApi.spaces.messages.get({
++          const messageResponse = await (this.impersonatedChatApi || this.chatApi).spaces.messages.get({
+             name: messageName
+           });
+           const threadName = messageResponse.data.thread?.name;
+@@ -1337,7 +1341,7 @@ var GoogleChatAdapter = class {
+           threadName,
+           googleCard: JSON.stringify(googleCard)
+         });
+-        const response2 = await this.chatApi.spaces.messages.create({
++        const response2 = await (this.impersonatedChatApi || this.chatApi).spaces.messages.create({
+           parent: spaceName,
+           messageReplyOption: threadName ? "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD" : void 0,
+           requestBody: {
+@@ -1364,7 +1368,7 @@ var GoogleChatAdapter = class {
+         threadName,
+         textLength: text.length
+       });
+-      const response = await this.chatApi.spaces.messages.create({
++      const response = await (this.impersonatedChatApi || this.chatApi).spaces.messages.create({
+         parent: spaceName,
+         // Required to reply in an existing thread
+         messageReplyOption: threadName ? "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD" : void 0,
+@@ -1421,7 +1425,7 @@ var GoogleChatAdapter = class {
+           textLength: requestBody.text.length
+         });
+       }
+-      const response = await this.chatApi.spaces.messages.create({
++      const response = await (this.impersonatedChatApi || this.chatApi).spaces.messages.create({
+         parent: spaceName,
+         messageReplyOption: threadName ? "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD" : void 0,
+         requestBody
+@@ -1514,7 +1518,7 @@ var GoogleChatAdapter = class {
+           messageId,
+           cardId
+         });
+-        const response2 = await this.chatApi.spaces.messages.update({
++        const response2 = await (this.impersonatedChatApi || this.chatApi).spaces.messages.update({
+           name: messageId,
+           updateMask: "cardsV2",
+           requestBody: {
+@@ -1539,7 +1543,7 @@ var GoogleChatAdapter = class {
+         messageId,
+         textLength: text.length
+       });
+-      const response = await this.chatApi.spaces.messages.update({
++      const response = await (this.impersonatedChatApi || this.chatApi).spaces.messages.update({
+         name: messageId,
+         updateMask: "text",
+         requestBody: {
+@@ -1561,7 +1565,7 @@ var GoogleChatAdapter = class {
+   async deleteMessage(_threadId, messageId) {
+     try {
+       this.logger.debug("GChat API: spaces.messages.delete", { messageId });
+-      await this.chatApi.spaces.messages.delete({
++      await (this.impersonatedChatApi || this.chatApi).spaces.messages.delete({
+         name: messageId
+       });
+       this.logger.debug("GChat API: spaces.messages.delete response", {
+@@ -1578,7 +1582,7 @@ var GoogleChatAdapter = class {
+         messageId,
+         emoji: gchatEmoji
+       });
+-      await this.chatApi.spaces.messages.reactions.create({
++      await (this.impersonatedChatApi || this.chatApi).spaces.messages.reactions.create({
+         parent: messageId,
+         requestBody: {
+           emoji: { unicode: gchatEmoji }
+@@ -1600,7 +1604,7 @@ var GoogleChatAdapter = class {
+       this.logger.debug("GChat API: spaces.messages.reactions.list", {
+         messageId
+       });
+-      const response = await this.chatApi.spaces.messages.reactions.list({
++      const response = await (this.impersonatedChatApi || this.chatApi).spaces.messages.reactions.list({
+         parent: messageId
+       });
+       this.logger.debug("GChat API: spaces.messages.reactions.list response", {
+@@ -1619,7 +1623,7 @@ var GoogleChatAdapter = class {
+       this.logger.debug("GChat API: spaces.messages.reactions.delete", {
+         reactionName: reaction.name
+       });
+-      await this.chatApi.spaces.messages.reactions.delete({
++      await (this.impersonatedChatApi || this.chatApi).spaces.messages.reactions.delete({
+         name: reaction.name
+       });
+       this.logger.debug(
+@@ -1646,7 +1650,7 @@ var GoogleChatAdapter = class {
+   async openDM(userId) {
+     try {
+       this.logger.debug("GChat API: spaces.findDirectMessage", { userId });
+-      const findResponse = await this.chatApi.spaces.findDirectMessage({
++      const findResponse = await (this.impersonatedChatApi || this.chatApi).spaces.findDirectMessage({
+         name: userId
+       });
+       if (findResponse.data.name) {
+@@ -2197,7 +2201,7 @@ var GoogleChatAdapter = class {
+         this.logger.debug("GChat API: spaces.messages.create (channel, card)", {
+           spaceName
+         });
+-        const response2 = await this.chatApi.spaces.messages.create({
++        const response2 = await (this.impersonatedChatApi || this.chatApi).spaces.messages.create({
+           parent: spaceName,
+           requestBody: {
+             cardsV2: [googleCard]
+@@ -2218,7 +2222,7 @@ var GoogleChatAdapter = class {
+         spaceName,
+         textLength: text.length
+       });
+-      const response = await this.chatApi.spaces.messages.create({
++      const response = await (this.impersonatedChatApi || this.chatApi).spaces.messages.create({
+         parent: spaceName,
+         requestBody: {
+           text

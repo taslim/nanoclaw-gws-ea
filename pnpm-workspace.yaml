@@ -1,0 +1,10 @@
+onlyBuiltDependencies:
+  - better-sqlite3
+  - esbuild
+  - protobufjs
+  - sharp
+patchedDependencies:
+  '@chat-adapter/gchat@4.26.0': patches/@chat-adapter__gchat@4.26.0.patch
+
+pnpm:
+  minimumReleaseAge: 4320

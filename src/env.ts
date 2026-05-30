@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { logger } from './logger.js';
+import { log } from './log.js';
 
 /**
  * Parse the .env file and return values for the requested keys.
@@ -14,7 +14,7 @@ export function readEnvFile(keys: string[]): Record<string, string> {
   try {
     content = fs.readFileSync(envFile, 'utf-8');
   } catch (err) {
-    logger.debug({ err }, '.env file not found, using defaults');
+    log.debug('.env file not found, using defaults', { err });
     return {};
   }
 
@@ -31,8 +31,7 @@ export function readEnvFile(keys: string[]): Record<string, string> {
     let value = trimmed.slice(eqIdx + 1).trim();
     if (
       value.length >= 2 &&
-      ((value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'")))
+      ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
     ) {
       value = value.slice(1, -1);
     }
@@ -40,4 +39,18 @@ export function readEnvFile(keys: string[]): Record<string, string> {
   }
 
   return result;
+}
+
+/**
+ * Parse a comma-separated env value into a normalized Set of lowercased
+ * non-empty entries. Used for PRINCIPAL_EMAILS-style lists.
+ */
+export function parseCsvSet(raw: string | null | undefined): Set<string> {
+  if (!raw) return new Set();
+  return new Set(
+    raw
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  );
 }

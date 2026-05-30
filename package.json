@@ -1,51 +1,61 @@
 {
   "name": "nanoclaw",
-  "version": "1.2.52",
+  "version": "2.0.71",
   "description": "Personal Claude assistant. Lightweight, secure, customizable.",
   "type": "module",
+  "packageManager": "pnpm@10.33.0",
   "main": "dist/index.js",
+  "bin": {
+    "ncl": "bin/ncl"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
-    "check": "eslint src/ && tsc --noEmit && prettier --check \"src/**/*.ts\"",
-    "lint": "eslint src/",
-    "lint:fix": "eslint src/ --fix",
     "format": "prettier --write \"src/**/*.ts\"",
     "format:fix": "prettier --write \"src/**/*.ts\"",
     "format:check": "prettier --check \"src/**/*.ts\"",
     "prepare": "husky",
     "setup": "tsx setup/index.ts",
+    "setup:auto": "tsx setup/auto.ts",
+    "setup:gws-ea": "tsx setup/gws-ea.ts",
+    "ncl": "tsx src/cli/client.ts",
+    "chat": "tsx scripts/chat.ts",
     "auth": "tsx src/whatsapp-auth.ts",
-    "auth:workspace": "tsx src/workspace-auth.ts",
-    "auth:browser": "tsx src/workspace-auth.ts --browser",
+    "lint": "eslint src/",
+    "lint:fix": "eslint src/ --fix",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@onecli-sh/sdk": "^0.2.0",
+    "@chat-adapter/gchat": "4.26.0",
+    "@clack/core": "^1.2.0",
+    "@clack/prompts": "^1.2.0",
+    "@google-cloud/pubsub": "^4.11.0",
+    "@onecli-sh/sdk": "^0.5.0",
     "better-sqlite3": "11.10.0",
+    "chat": "^4.24.0",
     "cron-parser": "5.5.0",
-    "googleapis": "^171.4.0"
+    "googleapis": "^171.4.0",
+    "kleur": "^4.1.5",
+    "marked": "^18.0.3"
   },
   "devDependencies": {
-    "@eslint/js": "^10.0.1",
+    "@eslint/js": "^9.35.0",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.10.0",
-    "eslint": "^10.0.3",
-    "eslint-config-prettier": "^10.1.8",
+    "eslint": "^9.35.0",
     "eslint-plugin-no-catch-all": "^1.1.0",
     "globals": "^15.12.0",
     "husky": "^9.1.7",
-    "playwright": "^1.58.2",
     "prettier": "^3.8.1",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
-    "typescript-eslint": "^8.57.0",
+    "typescript-eslint": "^8.35.0",
     "vitest": "^4.0.18"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=20"
   }
 }
