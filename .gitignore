@@ -54,5 +54,6 @@ AGENTS.md
 # Internal working docs, never committed
 docs/maintainer-guide.md
 docs/drafts/
+docs/rebuild/
 forks.md
 .worktrees/
