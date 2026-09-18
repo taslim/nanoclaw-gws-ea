@@ -2,11 +2,12 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
-  # A post-merge run on main, so main itself carries a verdict and not only the
-  # pull requests that fed it. Nothing below reads the pull_request payload.
+    branches: [main, rebuild-v2]
+  # Post-merge runs keep both the public line and the temporary rebuild
+  # integration line independently verified. Nothing below reads the
+  # pull_request payload.
   push:
-    branches: [main]
+    branches: [main, rebuild-v2]
 
 jobs:
   test:

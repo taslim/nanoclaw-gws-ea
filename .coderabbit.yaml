@@ -1,0 +1,9 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+# The rebuild uses `rebuild-v2` as an integration branch while public `main`
+# remains frozen. CodeRabbit skips non-default PR bases unless they are listed.
+reviews:
+  auto_review:
+    base_branches:
+      - "main"
+      - "rebuild-v2"

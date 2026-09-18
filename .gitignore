@@ -47,6 +47,9 @@ nanoclaw.pid
 # Skills system (local per-installation state)
 .nanoclaw/
 
+# Compound Engineering scratch space
+.context/compound-engineering/
+
 agents-sdk-docs
 .agents
 AGENTS.md
