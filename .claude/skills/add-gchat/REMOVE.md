@@ -2,7 +2,7 @@
 
 Every step is idempotent — safe to re-run.
 
-## 1. Remove the adapter
+## 1. Remove the registration
 
 Delete the self-registration import from `src/channels/index.ts` (skip if already gone):
 
@@ -10,15 +10,15 @@ Delete the self-registration import from `src/channels/index.ts` (skip if alread
 import './gchat.js';
 ```
 
-Then delete the copied adapter and its registration test:
+Then delete the copied registration test:
 
 ```bash
-rm -f src/channels/gchat.ts src/channels/gchat-registration.test.ts
+rm -f src/channels/gchat-registration.test.ts
 ```
 
 ## 2. Remove credentials
 
-Remove `GCHAT_CREDENTIALS` from `.env`.
+Remove `GCHAT_CREDENTIALS` and `GCHAT_ENDPOINT_URL` from `.env`.
 
 ## 3. Remove the package
 

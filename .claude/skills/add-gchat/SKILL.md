@@ -5,9 +5,10 @@ description: Add Google Chat channel integration via Chat SDK.
 
 # Add Google Chat Channel
 
-Adds Google Chat support via the Chat SDK bridge. NanoClaw doesn't ship channels
-in trunk — this skill copies the Google Chat adapter in from the `channels`
-branch.
+Configures the Google Chat support composed into this integration branch. The
+secure adapter wrapper is tracked here and consumes the exact public callback
+URL. Apply refreshes the registration test from the `channels` branch while
+preserving that wrapper.
 
 The mechanical steps under **Apply** carry `nc:` directive fences: an agent
 reads the prose and applies them, and a parser can apply them deterministically
@@ -16,13 +17,12 @@ safe to re-run; anything a parser can't apply falls back to the prose beside it.
 
 ## Apply
 
-### 1. Copy the adapter and its registration test
+### 1. Copy the registration test
 
-Fetch the `channels` branch and copy the Google Chat adapter and its
-registration test into `src/channels/` (overwrite — the branch is canonical):
+Fetch the `channels` branch and copy its registration test into
+`src/channels/`.
 
 ```nc:copy from-branch:channels
-src/channels/gchat.ts
 src/channels/gchat-registration.test.ts
 ```
 
@@ -40,7 +40,7 @@ import './gchat.js';
 Pinned to an exact version — the supply-chain policy rejects ranges and `latest`:
 
 ```nc:dep
-@chat-adapter/gchat@4.29.0
+@chat-adapter/gchat@4.40.0
 ```
 
 ### 4. Build and validate
@@ -91,8 +91,12 @@ in is never overwritten) as a single-line string:
 ```nc:prompt gchat_credentials secret
 Paste the service account JSON as a single line — the key file you downloaded, e.g. `{"type":"service_account","project_id":"...","private_key":"...","client_email":"..."}`.
 ```
+```nc:prompt gchat_endpoint_url normalize:trim validate:^https://[^\s]+/webhook/gchat$
+Paste the exact public HTTPS callback URL configured in Google Cloud, ending in `/webhook/gchat`.
+```
 ```nc:env-set
 GCHAT_CREDENTIALS={{gchat_credentials}}
+GCHAT_ENDPOINT_URL={{gchat_endpoint_url}}
 ```
 ### Webhook server
 

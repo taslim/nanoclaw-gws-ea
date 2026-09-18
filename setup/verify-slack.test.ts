@@ -205,3 +205,33 @@ await runSlackJob(${JSON.stringify(host.root)}, {
     }
   }, 10_000);
 });
+
+describe('Google Chat configuration diagnostics', () => {
+  it('reports Google Chat configured only when credentials and endpoint URL are both present', async () => {
+    host.groups = 1;
+    host.channels = {
+      GCHAT_CREDENTIALS: 'fixture-only',
+      GCHAT_ENDPOINT_URL: 'https://chat.example.test/webhook/gchat',
+    };
+
+    await expect(run([])).resolves.toBeUndefined();
+    expect(fields()).toMatchObject({
+      CONFIGURED_CHANNELS: 'gchat',
+      CHANNEL_AUTH: JSON.stringify({ gchat: 'configured' }),
+    });
+  });
+
+  it.each([
+    [{ GCHAT_CREDENTIALS: 'fixture-only' }, 'credentials only'],
+    [{ GCHAT_ENDPOINT_URL: 'https://chat.example.test/webhook/gchat' }, 'endpoint URL only'],
+  ])('reports an incomplete Google Chat pair with %s', async (channels) => {
+    host.groups = 1;
+    host.channels = channels;
+
+    await expect(run([])).resolves.toBeUndefined();
+    expect(fields()).toMatchObject({
+      CONFIGURED_CHANNELS: '',
+      CHANNEL_AUTH: JSON.stringify({ gchat: 'incomplete' }),
+    });
+  });
+});

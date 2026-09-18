@@ -4,7 +4,8 @@
     {
       "name": "service-account",
       "inputs": {
-        "gchat_credentials": "fake-service-account-json-blob"
+        "gchat_credentials": "fake-service-account-json-blob",
+        "gchat_endpoint_url": "https://assistant.example.test/webhook/gchat"
       }
     }
   ]
