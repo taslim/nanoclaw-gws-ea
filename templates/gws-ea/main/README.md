@@ -2,7 +2,7 @@
 
 This Agent Plugins 1.0 template creates the canonical `main` executive-assistant agent group.
 
-Its always-loaded instructions establish the generic assistant/principal relationship and point to the detailed operating doctrine in `ai.nanoco.nanoclaw/context/additional_context/operating-doctrine.md`. Names and other instance identity come from runtime context; they are intentionally absent here.
+Its always-loaded instructions establish the generic assistant/principal relationship and point to the concise operating procedure in `ai.nanoco.nanoclaw/context/additional_context/operating-procedure.md`. Names and other instance identity come from runtime context; they are intentionally absent here.
 
 Stamp the template through NanoClaw's existing local template path:
 
