@@ -185,6 +185,43 @@ Approval-gating credentialed actions is a **two-sided** flow:
 
 If approvals are configured server-side but the host callback isn't running (or throws), every credentialed call hangs until the gateway times out. Conversely, if the gateway has no rule asking for approval, the host callback never fires regardless of how it's wired.
 
+## Rebuild Workflow (Temporary)
+
+`rebuild-v2` is the integration branch for the in-progress GWS-EA rebuild. Public
+`main` remains untouched until the user explicitly authorizes a promotion. The
+accepted product, architecture, slice, and acceptance decisions live in the
+local, gitignored `docs/rebuild/` tree; Compound Engineering uses that same tree
+as its artifact root.
+
+`docs/rebuild/solutions/` is the local store of documented solutions to past
+problems (bugs, best practices, and workflow patterns), organized by category
+with YAML frontmatter such as `module`, `tags`, and `problem_type`; it is relevant
+when implementing or debugging in an area it covers. Because `docs/rebuild/` is
+gitignored during the rebuild, these learnings remain local unless the user later
+chooses a tracked knowledge location.
+
+- For substantive work, use Compound Engineering. Use `$ce-brainstorm` only when
+  product behavior is genuinely unsettled, `$ce-plan` to turn an accepted rebuild
+  slice into an implementation-ready plan, and `$ce-work` to implement and verify
+  that plan. `$lfg` may orchestrate those stages when the user asks for autonomous
+  end-to-end delivery.
+- Before implementation, create a short-lived descriptive branch from the latest
+  `origin/rebuild-v2`. Do not implement directly on `rebuild-v2` or `main`.
+- Deliver the checkpoints in `docs/rebuild/06-slice-1-talkable-assistant.md` as
+  focused end-to-end changes with their stated acceptance evidence. A later
+  checkpoint must not silently widen an earlier checkpoint's accepted scope.
+- During the rebuild, the project-defined shipping process replaces Compound
+  Engineering's default PR handoff: finish the CE simplify, review, and validation
+  gates; commit only work-owned files; push the current feature branch; create the
+  PR with explicit base `rebuild-v2`; then hand the resulting URL to
+  `$ce-babysit-pr`. Never rely on GitHub's default PR base and never use a full
+  `$ce-commit-push-pr` invocation that would target `main`.
+- An explicit `$lfg` invocation or explicit request to open a rebuild PR authorizes
+  that PR to target `rebuild-v2`; otherwise show the rebuild PR-hygiene evidence
+  below and wait for approval before publishing.
+- Merge into `rebuild-v2` only with explicit user approval. Opening, retargeting,
+  or merging a PR to `main` requires a separate explicit promotion request.
+
 ## Skills
 
 Four types of skills. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full taxonomy.
@@ -211,14 +248,25 @@ Before creating a PR, adding a skill, or preparing any contribution, you MUST re
 
 ## PR Hygiene
 
-Before creating a PR, run these checks:
+Before creating a rebuild PR, update and compare against its actual integration
+base:
+
+```bash
+git fetch origin rebuild-v2
+git diff origin/rebuild-v2...HEAD --stat
+git log origin/rebuild-v2..HEAD --oneline
+```
+
+For any other PR, run the upstream comparison:
 
 ```bash
 git diff upstream/main --stat HEAD
 git log upstream/main..HEAD --oneline
 ```
 
-Show the output and wait for approval. Installation-specific files (group files, .claude/settings.json, local configs) should not be included.
+Show the applicable output and wait for approval unless the user already explicitly
+authorized the PR in the current request. Installation-specific files (group files,
+`.claude/settings.json`, local configs) should not be included.
 
 ## Development
 
