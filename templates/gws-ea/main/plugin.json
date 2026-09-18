@@ -1,0 +1,11 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "gws-ea-main",
+  "version": "1.0.0",
+  "description": "Executive-assistant operating posture for the canonical GWS-EA main agent.",
+  "extensions": {
+    "ai.nanoco.nanoclaw": {
+      "agentName": "main"
+    }
+  }
+}
