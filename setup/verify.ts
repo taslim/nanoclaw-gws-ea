@@ -143,6 +143,8 @@ export async function run(_args: string[]): Promise<void> {
     'GITHUB_TOKEN',
     'LINEAR_API_KEY',
     'GCHAT_CREDENTIALS',
+    'GCHAT_ENDPOINT_URL',
+    'GCHAT_BOT_USER_ID',
     'TEAMS_APP_ID',
     'TEAMS_APP_PASSWORD',
     'WEBEX_BOT_TOKEN',
@@ -169,7 +171,8 @@ export async function run(_args: string[]): Promise<void> {
   if (has('SLACK_BOT_TOKEN') && has('SLACK_APP_TOKEN')) channelAuth.slack = 'configured';
   if (has('GITHUB_TOKEN')) channelAuth.github = 'configured';
   if (has('LINEAR_API_KEY')) channelAuth.linear = 'configured';
-  if (has('GCHAT_CREDENTIALS')) channelAuth.gchat = 'configured';
+  const gchatAuth = googleChatAuthStatus(has('GCHAT_CREDENTIALS'), has('GCHAT_ENDPOINT_URL'), has('GCHAT_BOT_USER_ID'));
+  if (gchatAuth !== 'missing') channelAuth.gchat = gchatAuth;
   if (has('TEAMS_APP_ID') && has('TEAMS_APP_PASSWORD')) channelAuth.teams = 'configured';
   if (has('WEBEX_BOT_TOKEN')) channelAuth.webex = 'configured';
   if (has('MATRIX_ACCESS_TOKEN')) channelAuth.matrix = 'configured';
@@ -181,7 +184,9 @@ export async function run(_args: string[]): Promise<void> {
     channelAuth.imessage = 'configured';
   }
 
-  const configuredChannels = Object.keys(channelAuth);
+  const configuredChannels = Object.entries(channelAuth)
+    .filter(([, authStatus]) => authStatus === 'configured' || authStatus === 'authenticated')
+    .map(([channel]) => channel);
 
   // 5. Check registered groups in v2 central DB (agent_groups + messaging_group_agents),
   //    plus how many agent groups pin an image of their own (reported in step 7).
@@ -285,6 +290,16 @@ export async function run(_args: string[]): Promise<void> {
  * leaves the channel configured but unwired).
  */
 export const DEFER_WIRE_CHANNELS = new Set(['teams']);
+
+function googleChatAuthStatus(
+  hasCredentials: boolean,
+  hasEndpointUrl: boolean,
+  hasBotUserId: boolean,
+): 'configured' | 'incomplete' | 'missing' {
+  if (hasCredentials && hasEndpointUrl && hasBotUserId) return 'configured';
+  if (hasCredentials || hasEndpointUrl || hasBotUserId) return 'incomplete';
+  return 'missing';
+}
 
 function canDeferSlackWiring(slackInstall: SlackJob['status'] | undefined, configuredChannels: string[]): boolean {
   return (
