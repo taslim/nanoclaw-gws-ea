@@ -18,13 +18,15 @@ rm -f src/channels/gchat-registration.test.ts
 
 ## 2. Remove credentials
 
-Remove `GCHAT_CREDENTIALS` and `GCHAT_ENDPOINT_URL` from `.env`.
+Remove `GCHAT_CREDENTIALS`, `GCHAT_ENDPOINT_URL`, and `GCHAT_BOT_USER_ID` from `.env`.
 
-## 3. Remove the package
+## 3. Keep the base-owned composition
 
-```bash
-pnpm uninstall @chat-adapter/gchat
-```
+Keep `@chat-adapter/gchat`, `src/channels/gchat.ts`,
+`src/channels/gchat.test.ts`, and `src/channels/gchat-auth.test.ts`. They are
+owned by the base checkout and remain part of its compiled channel composition;
+removal disables Google Chat by deleting its registration and runtime
+configuration only.
 
 ## 4. Rebuild and restart
 

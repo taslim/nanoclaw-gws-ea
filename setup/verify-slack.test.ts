@@ -212,6 +212,7 @@ describe('Google Chat configuration diagnostics', () => {
     host.channels = {
       GCHAT_CREDENTIALS: 'fixture-only',
       GCHAT_ENDPOINT_URL: 'https://chat.example.test/webhook/gchat',
+      GCHAT_BOT_USER_ID: 'users/123456789',
     };
 
     await expect(run([])).resolves.toBeUndefined();
@@ -224,7 +225,29 @@ describe('Google Chat configuration diagnostics', () => {
   it.each([
     [{ GCHAT_CREDENTIALS: 'fixture-only' }, 'credentials only'],
     [{ GCHAT_ENDPOINT_URL: 'https://chat.example.test/webhook/gchat' }, 'endpoint URL only'],
-  ])('reports an incomplete Google Chat pair with %s', async (channels) => {
+    [{ GCHAT_BOT_USER_ID: 'users/123456789' }, 'bot user ID only'],
+    [
+      {
+        GCHAT_CREDENTIALS: 'fixture-only',
+        GCHAT_ENDPOINT_URL: 'https://chat.example.test/webhook/gchat',
+      },
+      'credentials and endpoint URL only',
+    ],
+    [
+      {
+        GCHAT_CREDENTIALS: 'fixture-only',
+        GCHAT_BOT_USER_ID: 'users/123456789',
+      },
+      'credentials and bot user ID only',
+    ],
+    [
+      {
+        GCHAT_ENDPOINT_URL: 'https://chat.example.test/webhook/gchat',
+        GCHAT_BOT_USER_ID: 'users/123456789',
+      },
+      'endpoint URL and bot user ID only',
+    ],
+  ])('reports incomplete Google Chat configuration with %s', async (channels) => {
     host.groups = 1;
     host.channels = channels;
 

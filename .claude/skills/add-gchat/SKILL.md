@@ -79,6 +79,9 @@ until they're done.
 >    - Go to **IAM & Admin** > **Service Accounts** > **Create Service Account**
 >    - Grant the Chat Bot role
 >    - Create a JSON key and download it
+> 6. Record the Chat app's canonical user resource name (`users/<id>`). Use
+>    `sender.name` from a verified message authored by the app; a service-account
+>    email or project number is not interchangeable.
 
 ### Store the credentials
 
@@ -91,13 +94,21 @@ in is never overwritten) as a single-line string:
 ```nc:prompt gchat_credentials secret
 Paste the service account JSON as a single line — the key file you downloaded, e.g. `{"type":"service_account","project_id":"...","private_key":"...","client_email":"..."}`.
 ```
+
 ```nc:prompt gchat_endpoint_url normalize:trim validate:^https://[^\s]+/webhook/gchat$
 Paste the exact public HTTPS callback URL configured in Google Cloud, ending in `/webhook/gchat`.
 ```
+
+```nc:prompt gchat_bot_user_id normalize:trim validate:^users/[^/\s]+$
+Paste the Google Chat app's canonical user resource name, for example `users/123456789`.
+```
+
 ```nc:env-set
 GCHAT_CREDENTIALS={{gchat_credentials}}
 GCHAT_ENDPOINT_URL={{gchat_endpoint_url}}
+GCHAT_BOT_USER_ID={{gchat_bot_user_id}}
 ```
+
 ### Webhook server
 
 The Chat SDK bridge automatically starts a shared webhook server on port 3000
@@ -123,6 +134,8 @@ If you're in the middle of `/setup`, return to the setup flow now. Otherwise run
 ## Troubleshooting
 
 **The adapter starts, then errors about credentials.** `GCHAT_CREDENTIALS` must be the *entire* service account JSON collapsed to one line — inspect `.env` and confirm it still contains `"type":"service_account"`, `"private_key"`, and `"client_email"`. A truncated paste (shells often mangle the multi-line private key) is the usual cause; download a fresh JSON key under **IAM & Admin → Service Accounts → Keys** and re-paste it as a single line.
+
+**Group mentions never reach the agent.** Confirm `GCHAT_BOT_USER_ID` is the canonical `users/<id>` identity for this Chat app. It must match the `sender.name` on a verified message authored by the app; a service-account email or project number is not interchangeable.
 
 **Messages sent in the space never reach the agent.** Google Chat delivers only to the HTTP endpoint URL set under **Google Chat API → Configuration**, and that URL must be publicly reachable at `/webhook/gchat` (shared webhook server, port 3000). Tunnel hostnames (ngrok free tier) change on restart — make sure the Configuration URL matches the tunnel that's actually up.
 

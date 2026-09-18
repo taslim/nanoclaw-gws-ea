@@ -9,7 +9,8 @@ import type { ChannelDefaults } from './adapter.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
 
-const GCHAT_ENV_KEYS = ['GCHAT_CREDENTIALS', 'GCHAT_ENDPOINT_URL'] as const;
+const GCHAT_ENV_KEYS = ['GCHAT_CREDENTIALS', 'GCHAT_ENDPOINT_URL', 'GCHAT_BOT_USER_ID'] as const;
+const GCHAT_BOT_USER_ID_RE = /^users\/[^/\s]+$/;
 const ALTERNATE_VERIFIER_ENV_KEYS = [
   'GOOGLE_CHAT_PROJECT_NUMBER',
   'GOOGLE_CHAT_PUBSUB_AUDIENCE',
@@ -72,6 +73,12 @@ function validateEndpointUrl(endpointUrl: string): void {
   }
 }
 
+function validateBotUserId(botUserId: string): void {
+  if (!GCHAT_BOT_USER_ID_RE.test(botUserId)) {
+    throw new Error('GCHAT_BOT_USER_ID must be a canonical Google Chat user resource name (users/<id>)');
+  }
+}
+
 function rejectAlternateVerifierConfiguration(): void {
   const configuredKeys = ALTERNATE_VERIFIER_ENV_KEYS.filter((key) => process.env[key]?.trim());
   if (configuredKeys.length === 0) return;
@@ -96,20 +103,25 @@ registerChannelAdapter('gchat', {
     const fileEnv = readEnvFile([...GCHAT_ENV_KEYS]);
     const credentialsRaw = configuredValue(process.env.GCHAT_CREDENTIALS, fileEnv.GCHAT_CREDENTIALS);
     const endpointUrl = configuredValue(process.env.GCHAT_ENDPOINT_URL, fileEnv.GCHAT_ENDPOINT_URL);
+    const botUserId = configuredValue(process.env.GCHAT_BOT_USER_ID, fileEnv.GCHAT_BOT_USER_ID);
 
-    if (!credentialsRaw && !endpointUrl) return null;
+    if (!credentialsRaw && !endpointUrl && !botUserId) return null;
     if (!credentialsRaw) {
-      throw new Error('Google Chat configuration requires GCHAT_CREDENTIALS when GCHAT_ENDPOINT_URL is set');
+      throw new Error('Google Chat configuration requires GCHAT_CREDENTIALS');
     }
     if (!endpointUrl) {
-      throw new Error('Google Chat configuration requires GCHAT_ENDPOINT_URL when GCHAT_CREDENTIALS is set');
+      throw new Error('Google Chat configuration requires GCHAT_ENDPOINT_URL');
+    }
+    if (!botUserId) {
+      throw new Error('Google Chat configuration requires GCHAT_BOT_USER_ID');
     }
 
     const credentials = parseCredentials(credentialsRaw);
     validateEndpointUrl(endpointUrl);
+    validateBotUserId(botUserId);
     rejectAlternateVerifierConfiguration();
 
-    const gchatAdapter = createGoogleChatAdapter({ credentials, endpointUrl });
+    const gchatAdapter = createGoogleChatAdapter({ credentials, endpointUrl, botUserId });
     return createChatSdkBridge({
       adapter: gchatAdapter,
       concurrency: 'concurrent',

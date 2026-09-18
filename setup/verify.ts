@@ -144,6 +144,7 @@ export async function run(_args: string[]): Promise<void> {
     'LINEAR_API_KEY',
     'GCHAT_CREDENTIALS',
     'GCHAT_ENDPOINT_URL',
+    'GCHAT_BOT_USER_ID',
     'TEAMS_APP_ID',
     'TEAMS_APP_PASSWORD',
     'WEBEX_BOT_TOKEN',
@@ -170,7 +171,7 @@ export async function run(_args: string[]): Promise<void> {
   if (has('SLACK_BOT_TOKEN') && has('SLACK_APP_TOKEN')) channelAuth.slack = 'configured';
   if (has('GITHUB_TOKEN')) channelAuth.github = 'configured';
   if (has('LINEAR_API_KEY')) channelAuth.linear = 'configured';
-  const gchatAuth = googleChatAuthStatus(has('GCHAT_CREDENTIALS'), has('GCHAT_ENDPOINT_URL'));
+  const gchatAuth = googleChatAuthStatus(has('GCHAT_CREDENTIALS'), has('GCHAT_ENDPOINT_URL'), has('GCHAT_BOT_USER_ID'));
   if (gchatAuth !== 'missing') channelAuth.gchat = gchatAuth;
   if (has('TEAMS_APP_ID') && has('TEAMS_APP_PASSWORD')) channelAuth.teams = 'configured';
   if (has('WEBEX_BOT_TOKEN')) channelAuth.webex = 'configured';
@@ -293,9 +294,10 @@ export const DEFER_WIRE_CHANNELS = new Set(['teams']);
 function googleChatAuthStatus(
   hasCredentials: boolean,
   hasEndpointUrl: boolean,
+  hasBotUserId: boolean,
 ): 'configured' | 'incomplete' | 'missing' {
-  if (hasCredentials && hasEndpointUrl) return 'configured';
-  if (hasCredentials || hasEndpointUrl) return 'incomplete';
+  if (hasCredentials && hasEndpointUrl && hasBotUserId) return 'configured';
+  if (hasCredentials || hasEndpointUrl || hasBotUserId) return 'incomplete';
   return 'missing';
 }
 

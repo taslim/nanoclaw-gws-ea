@@ -2,6 +2,7 @@ import { createGoogleChatAdapter, type GoogleChatAdapter } from '@chat-adapter/g
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const endpointUrl = 'https://assistant.example.com/webhook/gchat';
+const botUserId = 'users/123456789';
 
 interface VerifyIdTokenOptions {
   audience: string | string[];
@@ -57,6 +58,7 @@ describe('Google Chat request authentication', () => {
     adapter = createGoogleChatAdapter({
       credentials: { client_email: 'bot@example.test', private_key: 'not-used-by-this-test' },
       endpointUrl,
+      botUserId,
     });
     observable = adapter as unknown as ObservableGoogleChatAdapter;
     verifyIdToken = vi
@@ -115,4 +117,36 @@ describe('Google Chat request authentication', () => {
       expect(handleMessageEvent).not.toHaveBeenCalled();
     },
   );
+
+  it('normalizes an exact app mention in a real group message', () => {
+    const raw = {
+      chat: {
+        messagePayload: {
+          message: {
+            annotations: [
+              {
+                length: 13,
+                startIndex: 0,
+                type: 'USER_MENTION',
+                userMention: {
+                  type: 'MENTION',
+                  user: { displayName: 'NanoClaw Bot', name: botUserId, type: 'BOT' },
+                },
+              },
+            ],
+            createTime: '2026-09-17T12:00:00.000Z',
+            name: 'spaces/space/messages/message',
+            sender: { displayName: 'Principal', name: 'users/principal', type: 'HUMAN' },
+            text: '@NanoClaw Bot help',
+            thread: { name: 'spaces/space/threads/thread' },
+          },
+          space: { name: 'spaces/space', type: 'ROOM' },
+        },
+      },
+    };
+
+    const message = adapter.parseMessage(raw);
+
+    expect(message.text).toBe('@bot help');
+  });
 });
