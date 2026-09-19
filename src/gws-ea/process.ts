@@ -1,4 +1,7 @@
 import { spawn } from 'node:child_process';
+import { constants as fsConstants } from 'node:fs';
+import { access, realpath, stat } from 'node:fs/promises';
+import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { GwsEaError } from './types.js';
@@ -15,6 +18,7 @@ const SAFE_AMBIENT_KEYS = [
 ] as const;
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_OUTPUT_LIMIT_BYTES = 1024 * 1024;
+const DEFAULT_EXECUTABLE_PATH = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
 
 export interface SanitizedCommand {
   readonly command: string;
@@ -38,6 +42,102 @@ export interface SanitizedCommandOutcome extends SanitizedCommandResult {
 
 export type SanitizedCommandOutcomeRunner = (command: SanitizedCommand) => Promise<SanitizedCommandOutcome>;
 
+function currentUid(): number | undefined {
+  return typeof process.getuid === 'function' ? process.getuid() : undefined;
+}
+
+function isAllowedOwner(uid: number): boolean {
+  const owner = currentUid();
+  return uid === 0 || (owner !== undefined && uid === owner);
+}
+
+function isFilesystemError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && 'code' in error && typeof error.code === 'string';
+}
+
+async function assertTrustedPathComponent(component: string, expectFile: boolean): Promise<void> {
+  const info = await stat(component);
+  if (expectFile ? !info.isFile() : !info.isDirectory()) {
+    throw new GwsEaError('untrusted_executable', 'A required executable has an invalid filesystem type');
+  }
+  if (!isAllowedOwner(info.uid) || (info.mode & 0o002) !== 0) {
+    throw new GwsEaError('untrusted_executable', 'A required executable is stored in an unsafe location');
+  }
+  // Homebrew and /Applications commonly have group-writable, root/current-user
+  // owned directories. Executable files themselves must not be group writable.
+  if ((info.mode & 0o020) !== 0 && expectFile) {
+    throw new GwsEaError('untrusted_executable', 'A required executable is stored in an unsafe location');
+  }
+}
+
+async function assertTrustedCanonicalPath(canonicalPath: string, expectFile: boolean): Promise<void> {
+  await assertTrustedPathComponent(canonicalPath, expectFile);
+  let directory = expectFile ? path.dirname(canonicalPath) : canonicalPath;
+  while (true) {
+    await assertTrustedPathComponent(directory, false);
+    const parent = path.dirname(directory);
+    if (parent === directory) return;
+    directory = parent;
+  }
+}
+
+async function trustedDirectory(directory: string): Promise<string | undefined> {
+  if (!path.isAbsolute(directory) || directory.includes('\0')) return undefined;
+  try {
+    const canonical = await realpath(directory);
+    await assertTrustedCanonicalPath(canonical, false);
+    return canonical;
+  } catch (error) {
+    if (!(error instanceof GwsEaError) && !isFilesystemError(error)) throw error;
+    return undefined;
+  }
+}
+
+async function trustedSearchPath(searchPath: string | undefined): Promise<readonly string[]> {
+  const requested = searchPath?.split(path.delimiter) ?? [];
+  const candidates = [...requested, ...DEFAULT_EXECUTABLE_PATH];
+  const trusted = await Promise.all(candidates.map(trustedDirectory));
+  return [...new Set(trusted.filter((entry): entry is string => entry !== undefined))];
+}
+
+async function resolveFromTrustedDirectories(command: string, directories: readonly string[]): Promise<string> {
+  if (!command || command.includes('\0')) {
+    throw new GwsEaError('untrusted_executable', 'A required executable name is invalid');
+  }
+  const candidates = path.isAbsolute(command)
+    ? [command]
+    : command === path.basename(command)
+      ? directories.map((directory) => path.join(directory, command))
+      : [];
+  for (const candidate of candidates) {
+    try {
+      await access(candidate, fsConstants.X_OK);
+      const canonical = await realpath(candidate);
+      await assertTrustedCanonicalPath(canonical, true);
+      return canonical;
+    } catch (error) {
+      if (!(error instanceof GwsEaError) && !isFilesystemError(error)) throw error;
+      // A hostile PATH entry must not shadow a later trusted installation.
+    }
+  }
+  throw new GwsEaError('untrusted_executable', `No trusted ${path.basename(command)} executable is available`);
+}
+
+/** Resolve a child-process executable to a canonical, non-publicly-writable path. */
+export async function resolveTrustedExecutable(command: string, searchPath?: string): Promise<string> {
+  return resolveFromTrustedDirectories(command, await trustedSearchPath(searchPath));
+}
+
+async function prepareTrustedCommand(command: SanitizedCommand): Promise<SanitizedCommand> {
+  const directories = await trustedSearchPath(command.env?.PATH);
+  const executable = await resolveFromTrustedDirectories(command.command, directories);
+  return {
+    ...command,
+    command: executable,
+    env: { ...command.env, PATH: directories.join(path.delimiter) },
+  };
+}
+
 export function buildAllowlistedEnvironment(
   ambient: NodeJS.ProcessEnv = process.env,
   overrides: Readonly<Record<string, string>> = {},
@@ -56,15 +156,19 @@ export function buildAllowlistedEnvironment(
   return environment;
 }
 
-export const runSanitizedCommandOutcome: SanitizedCommandOutcomeRunner = async (command) =>
-  new Promise<SanitizedCommandOutcome>((resolve, reject) => {
-    const child = spawn(command.command, [...command.args], {
-      cwd: command.cwd,
-      env: command.env ?? buildAllowlistedEnvironment(),
+export const runSanitizedCommandOutcome: SanitizedCommandOutcomeRunner = async (command) => {
+  const trusted = await prepareTrustedCommand({
+    ...command,
+    env: command.env ?? buildAllowlistedEnvironment(),
+  });
+  return new Promise<SanitizedCommandOutcome>((resolve, reject) => {
+    const child = spawn(trusted.command, [...trusted.args], {
+      cwd: trusted.cwd,
+      env: trusted.env,
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    const limit = command.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES;
+    const limit = trusted.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES;
     let stdout = '';
     let stderr = '';
     let outputBytes = 0;
@@ -101,11 +205,12 @@ export const runSanitizedCommandOutcome: SanitizedCommandOutcomeRunner = async (
 
     const timeout = setTimeout(
       () => fail(new GwsEaError('command_timeout', 'A required child process timed out')),
-      command.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      trusted.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     );
     timeout.unref();
     child.once('close', () => clearTimeout(timeout));
   });
+};
 
 export const runSanitizedCommand: SanitizedCommandRunner = async (command) => {
   const result = await runSanitizedCommandOutcome(command);

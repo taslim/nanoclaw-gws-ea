@@ -19,6 +19,7 @@ import {
 } from './registry.js';
 import { removePrivateFile } from './secrets.js';
 import { loadInstanceRuntimeConfig } from './service.js';
+import { createInstanceServiceCoordinates, type InstanceServicePlatform } from './service-coordinates.js';
 import { GwsEaError, type InstanceReservation } from './types.js';
 import { isRecord } from './validation.js';
 
@@ -154,7 +155,8 @@ async function uninstallNanoclaw(reservation: InstanceReservation): Promise<void
   } catch (error) {
     if (!isErrno(error, 'ENOENT')) throw error;
   }
-  const serviceIdentity = process.platform === 'darwin' ? `com.nanoclaw-v2-${installId}` : `nanoclaw-v2-${installId}`;
+  const coordinates = (platform: InstanceServicePlatform, runningAsRoot: boolean) =>
+    createInstanceServiceCoordinates({ installId, homeDirectory, platform, runningAsRoot });
   const environment = buildAllowlistedEnvironment(
     {},
     { HOME: homeDirectory, PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin' },
@@ -176,40 +178,45 @@ async function uninstallNanoclaw(reservation: InstanceReservation): Promise<void
   };
 
   if (process.platform === 'darwin') {
-    const unit = path.join(homeDirectory, 'Library', 'LaunchAgents', `${serviceIdentity}.plist`);
-    await run('launchctl', ['unload', unit], true);
+    const service = coordinates('macos', false);
+    await run('launchctl', ['unload', service.serviceDefinitionPath], true);
     const uid = process.getuid?.();
     if (uid === undefined) throw new GwsEaError('unsupported_platform', 'launchd requires a user ID');
-    const serviceDomain = `gui/${uid}/${serviceIdentity}`;
+    const serviceDomain = `gui/${uid}/${service.serviceIdentity}`;
     await run('launchctl', ['bootout', serviceDomain], true);
     if ((await outcome('launchctl', ['print', serviceDomain])).exitCode === 0) {
       throw new GwsEaError('nanoclaw_removal_incomplete', 'NanoClaw launchd service is still loaded');
     }
-    await rm(unit, { force: true });
+    await rm(service.serviceDefinitionPath, { force: true });
   } else if (process.platform === 'linux') {
-    const userUnit = path.join(homeDirectory, '.config', 'systemd', 'user', `${serviceIdentity}.service`);
+    const userService = coordinates('linux', false);
     try {
-      await access(userUnit);
-      await run('systemctl', ['--user', 'disable', '--now', `${serviceIdentity}.service`], true);
-      if ((await outcome('systemctl', ['--user', 'is-active', `${serviceIdentity}.service`])).exitCode === 0) {
+      await access(userService.serviceDefinitionPath);
+      await run('systemctl', ['--user', 'disable', '--now', `${userService.serviceIdentity}.service`], true);
+      if (
+        (await outcome('systemctl', ['--user', 'is-active', `${userService.serviceIdentity}.service`])).exitCode === 0
+      ) {
         throw new GwsEaError('nanoclaw_removal_incomplete', 'NanoClaw user service is still active');
       }
-      await rm(userUnit, { force: true });
+      await rm(userService.serviceDefinitionPath, { force: true });
       await run('systemctl', ['--user', 'daemon-reload']);
     } catch (error) {
       if (!isErrno(error, 'ENOENT')) throw error;
     }
-    const systemUnit = path.join('/etc/systemd/system', `${serviceIdentity}.service`);
+    const systemService = coordinates('linux', true);
     try {
-      await access(systemUnit);
+      await access(systemService.serviceDefinitionPath);
       if (process.getuid?.() !== 0) {
-        throw new GwsEaError('root_required', `Re-run removal with root privileges to remove ${systemUnit}`);
+        throw new GwsEaError(
+          'root_required',
+          `Re-run removal with root privileges to remove ${systemService.serviceDefinitionPath}`,
+        );
       }
-      await run('systemctl', ['disable', '--now', `${serviceIdentity}.service`], true);
-      if ((await outcome('systemctl', ['is-active', `${serviceIdentity}.service`])).exitCode === 0) {
+      await run('systemctl', ['disable', '--now', `${systemService.serviceIdentity}.service`], true);
+      if ((await outcome('systemctl', ['is-active', `${systemService.serviceIdentity}.service`])).exitCode === 0) {
         throw new GwsEaError('nanoclaw_removal_incomplete', 'NanoClaw system service is still active');
       }
-      await rm(systemUnit, { force: true });
+      await rm(systemService.serviceDefinitionPath, { force: true });
       await run('systemctl', ['daemon-reload']);
     } catch (error) {
       if (!isErrno(error, 'ENOENT')) throw error;
@@ -231,20 +238,19 @@ async function uninstallNanoclaw(reservation: InstanceReservation): Promise<void
     throw new GwsEaError('nanoclaw_removal_incomplete', 'Could not verify the NanoClaw host process stopped');
   }
 
-  const label = `nanoclaw-install=${installId}`;
-  const ids = (await run('docker', ['ps', '-aq', '--filter', `label=${label}`]))
+  const resources = coordinates(process.platform === 'darwin' ? 'macos' : 'linux', process.getuid?.() === 0);
+  const ids = (await run('docker', ['ps', '-aq', '--filter', `label=${resources.installLabel}`]))
     .split(/\r?\n/u)
     .map((id) => id.trim())
     .filter(Boolean);
   if (ids.length > 0) await run('docker', ['rm', '--force', ...ids]);
-  if ((await run('docker', ['ps', '-aq', '--filter', `label=${label}`])).trim()) {
+  if ((await run('docker', ['ps', '-aq', '--filter', `label=${resources.installLabel}`])).trim()) {
     throw new GwsEaError('nanoclaw_removal_incomplete', 'NanoClaw containers remain after removal');
   }
-  const image = `nanoclaw-agent-v2-${installId}:latest`;
-  if ((await run('docker', ['image', 'ls', '--quiet', '--no-trunc', image])).trim()) {
-    await run('docker', ['image', 'rm', image]);
+  if ((await run('docker', ['image', 'ls', '--quiet', '--no-trunc', resources.imageTag])).trim()) {
+    await run('docker', ['image', 'rm', resources.imageTag]);
   }
-  if ((await run('docker', ['image', 'ls', '--quiet', '--no-trunc', image])).trim()) {
+  if ((await run('docker', ['image', 'ls', '--quiet', '--no-trunc', resources.imageTag])).trim()) {
     throw new GwsEaError('nanoclaw_removal_incomplete', 'NanoClaw image remains after removal');
   }
 }

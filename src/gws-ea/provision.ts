@@ -27,12 +27,17 @@ import {
   persistOnecliApiKeyFiles,
   reconcileOnecliRuntime,
   validateObservedOnecliRuntime,
+  onecliSecretMatchesCredentialMetadata,
   type OnecliCompatibilityReceipt,
   type OnecliRuntimeDependencies,
-  type ProviderCredentialInput,
 } from './onecli.js';
 import type { OnecliRuntimeLayout } from './onecli-compose.js';
-import { createOnecliRuntimeLayout } from './onecli-compose.js';
+import {
+  createOnecliRuntimeLayout,
+  ONECLI_CLI_VERSION,
+  ONECLI_GATEWAY_VERSION,
+  ONECLI_SDK_VERSION,
+} from './onecli-compose.js';
 import {
   reconcileInstanceRuntime,
   runInstanceOnecliAdminCommand,
@@ -57,15 +62,22 @@ import {
 import { readOwnerOnlyFile, removePrivateFile, writePrivateTextFile } from './secrets.js';
 import { assertInstanceId, getInstanceReservation } from './registry.js';
 import { preparePrivateLocalDirectory, type ControlPlanePaths } from './paths.js';
+import { holdReservedLoopbackPorts, type AllocatedPortName, type LoopbackPortLease } from './ports.js';
 import {
   GwsEaError,
   PROVISION_PHASES,
-  type AllocatedPorts,
   type InstanceReservation,
   type ProvisionJournal,
   type ProvisionPhase,
 } from './types.js';
 import { hasControlCharacters, isRecord } from './validation.js';
+import {
+  credentialMatchesMetadata,
+  sameCredentialMetadata,
+  type ProviderCredential,
+  type ProviderCredentialMetadata,
+} from '../provider-credential.js';
+import { assertProviderProvisioningCapabilityDigest } from '../provider-provisioning-capability.js';
 import { googleChatConfigurationUrl, isChatConfigurationConfirmed } from './chat-configuration.js';
 import {
   parseGchatServiceAccountCredential,
@@ -90,9 +102,7 @@ export type ProvisionResult =
   | { readonly status: 'ready' }
   | { readonly status: 'paused'; readonly pause: ProvisionHumanPause };
 
-export interface ProvisionPortLease {
-  release(names?: readonly (keyof AllocatedPorts)[]): Promise<void>;
-}
+export type ProvisionPortLease = LoopbackPortLease;
 
 /** Test/process harness signal used to model an abrupt stop at a journal boundary. */
 export class ProvisionBoundaryInterruption extends Error {
@@ -111,8 +121,9 @@ export interface ProductionProvisionInput {
   readonly onecli: OnecliRuntimeLayout;
   readonly runtime: InstanceRuntimeConfig;
   readonly gcp: GcpProjectInput;
-  readonly providerCredentialMetadata?: Omit<ProviderCredentialInput, 'value'>;
-  readonly providerCredential?: ProviderCredentialInput;
+  readonly providerCredentialMetadata?: ProviderCredentialMetadata;
+  readonly providerCredential?: ProviderCredential;
+  readonly requestProviderCredential?: () => Promise<ProviderCredential>;
   readonly identity: Omit<MainIdentityInput, 'providerSecretId'>;
   readonly adapterInstance: string;
   readonly provisioningStartedAt: string;
@@ -160,6 +171,7 @@ export interface ProductionProvisionDependencies {
   readonly verifyPrincipalBinding: (input: PrincipalBindingVerificationInput) => PrincipalBindingVerificationResult;
   readonly reconcilePrincipal: typeof reconcilePrincipalDm;
   readonly verifyConversation: (input: ConversationVerificationInput) => ConversationVerificationResult;
+  readonly holdReservedLoopbackPorts: typeof holdReservedLoopbackPorts;
 }
 
 function unwrapData(value: unknown): unknown {
@@ -199,8 +211,42 @@ interface ReleasePreflightReceipt extends ReleasePreflightResult {
   readonly deployed_commit: string;
 }
 
-function validateReleasePreflightReceipt(value: unknown, context: ProductionProvisionContext): void {
-  if (!isRecord(value) || !isRecord(value.onecli)) {
+interface ReleasePreflightExpectation {
+  readonly instanceId: string;
+  readonly deployedCommit: string;
+  readonly provider: string;
+  readonly providerCapabilityDigest?: string;
+  readonly providerCredential?: ProviderCredentialMetadata;
+}
+
+function credentialMetadataRecord(value: Record<string, unknown>): ProviderCredentialMetadata {
+  const required = ['name', 'type', 'hostPattern'] as const;
+  const optional = ['pathPattern', 'headerName', 'valueFormat', 'paramName', 'paramFormat'] as const;
+  const keys = Object.keys(value);
+  if (
+    required.some((key) => typeof value[key] !== 'string' || value[key].length === 0) ||
+    optional.some((key) => value[key] !== undefined && typeof value[key] !== 'string') ||
+    keys.some((key) => ![...required, ...optional].includes(key as (typeof required)[number]))
+  ) {
+    throw new GwsEaError('invalid_release_preflight', 'Release provider credential metadata is invalid');
+  }
+  return {
+    name: value.name as string,
+    type: value.type as string,
+    hostPattern: value.hostPattern as string,
+    ...(typeof value.pathPattern === 'string' ? { pathPattern: value.pathPattern } : {}),
+    ...(typeof value.headerName === 'string' ? { headerName: value.headerName } : {}),
+    ...(typeof value.valueFormat === 'string' ? { valueFormat: value.valueFormat } : {}),
+    ...(typeof value.paramName === 'string' ? { paramName: value.paramName } : {}),
+    ...(typeof value.paramFormat === 'string' ? { paramFormat: value.paramFormat } : {}),
+  };
+}
+
+function validateReleasePreflightReceipt(
+  value: unknown,
+  expectation: ReleasePreflightExpectation,
+): ReleasePreflightReceipt {
+  if (!isRecord(value) || !isRecord(value.onecli) || !isRecord(value.providerCredential)) {
     throw new GwsEaError('invalid_release_preflight', 'Release preflight receipt is invalid');
   }
   const expectedKeys = [
@@ -208,42 +254,67 @@ function validateReleasePreflightReceipt(value: unknown, context: ProductionProv
     'instance_id',
     'deployed_commit',
     'provider',
+    'providerCapabilityDigest',
+    'providerCredential',
     'packageManager',
     'onecli',
   ].sort();
   const actualKeys = Object.keys(value).sort();
   const onecliKeys = Object.keys(value.onecli).sort();
+  const providerCredential = credentialMetadataRecord(value.providerCredential);
+  let providerCapabilityDigest: string;
+  try {
+    providerCapabilityDigest = assertProviderProvisioningCapabilityDigest(value.providerCapabilityDigest);
+  } catch {
+    throw new GwsEaError('invalid_release_preflight', 'Release provider capability digest is invalid');
+  }
   if (
     actualKeys.length !== expectedKeys.length ||
     actualKeys.some((key, index) => key !== expectedKeys[index]) ||
     onecliKeys.length !== 3 ||
     onecliKeys.some((key, index) => key !== ['cli', 'gateway', 'sdk'][index]) ||
     value.schema_version !== 1 ||
-    value.instance_id !== context.operation.instanceId ||
-    value.deployed_commit !== context.input.release.commit ||
-    value.provider !== context.input.releasePreflight.provider ||
+    value.instance_id !== expectation.instanceId ||
+    value.deployed_commit !== expectation.deployedCommit ||
+    value.provider !== expectation.provider ||
+    (expectation.providerCapabilityDigest !== undefined &&
+      providerCapabilityDigest !== expectation.providerCapabilityDigest) ||
     typeof value.packageManager !== 'string' ||
-    typeof value.onecli.gateway !== 'string' ||
-    typeof value.onecli.cli !== 'string' ||
-    typeof value.onecli.sdk !== 'string'
+    value.onecli.gateway !== ONECLI_GATEWAY_VERSION ||
+    value.onecli.cli !== ONECLI_CLI_VERSION ||
+    value.onecli.sdk !== ONECLI_SDK_VERSION ||
+    (expectation.providerCredential !== undefined &&
+      !sameCredentialMetadata(providerCredential, expectation.providerCredential))
   ) {
     throw new GwsEaError('release_preflight_mismatch', 'Release preflight receipt does not match this instance');
   }
+  return value as unknown as ReleasePreflightReceipt;
 }
 
-async function assertReleasePreflightReceipt(context: ProductionProvisionContext): Promise<void> {
+async function loadReleasePreflightReceipt(
+  file: string,
+  expectation: ReleasePreflightExpectation,
+): Promise<ReleasePreflightReceipt> {
   let value: unknown;
   try {
-    value = JSON.parse(
-      await readOwnerOnlyFile(context.operation.paths.releasePreflightFile(context.operation.instanceId)),
-    ) as unknown;
+    value = JSON.parse(await readOwnerOnlyFile(file)) as unknown;
   } catch (error) {
     if (error instanceof SyntaxError) {
       throw new GwsEaError('invalid_release_preflight', 'Release preflight receipt is invalid JSON');
     }
     throw error;
   }
-  validateReleasePreflightReceipt(value, context);
+  return validateReleasePreflightReceipt(value, expectation);
+}
+
+async function assertReleasePreflightReceipt(context: ProductionProvisionContext): Promise<void> {
+  await loadReleasePreflightReceipt(context.operation.paths.releasePreflightFile(context.operation.instanceId), {
+    instanceId: context.operation.instanceId,
+    deployedCommit: context.input.release.commit,
+    provider: context.input.releasePreflight.provider,
+    providerCapabilityDigest: context.input.releasePreflight.providerCapabilityDigest,
+    providerCredential: context.input.releasePreflight.providerCredential,
+  });
 }
 
 async function persistReleasePreflightReceipt(
@@ -297,24 +368,6 @@ async function defaultProbeOnecli(context: ProductionProvisionContext): Promise<
   }
 }
 
-function credentialMetadataMatches(
-  row: Record<string, unknown>,
-  input: Omit<ProviderCredentialInput, 'value'>,
-): boolean {
-  const optional = (key: string, expected: string | undefined): boolean =>
-    expected === undefined ? row[key] === undefined || row[key] === null || row[key] === '' : row[key] === expected;
-  return (
-    row.name === input.name &&
-    row.type === input.type &&
-    row.hostPattern === input.hostPattern &&
-    optional('pathPattern', input.pathPattern) &&
-    optional('headerName', input.headerName) &&
-    optional('valueFormat', input.valueFormat) &&
-    optional('paramName', input.paramName) &&
-    optional('paramFormat', input.paramFormat)
-  );
-}
-
 async function defaultProbeProvider(context: ProductionProvisionContext): Promise<PhaseProbeResult> {
   const credential = context.input.providerCredentialMetadata;
   try {
@@ -325,14 +378,18 @@ async function defaultProbeProvider(context: ProductionProvisionContext): Promis
     }
     if (context.state.providerSecretId) {
       const match = value.find((candidate) => candidate.id === context.state.providerSecretId);
-      return match ? { status: 'matched' } : { status: 'absent' };
+      if (!match) return { status: 'absent' };
+      if (!credential || !onecliSecretMatchesCredentialMetadata(match, credential)) {
+        throw new GwsEaError('onecli_secret_conflict', 'Provider credential metadata does not match');
+      }
+      return { status: 'matched' };
     }
     if (!credential) return { status: 'absent' };
     const matches = value.filter((candidate) => candidate.name === credential.name);
     if (matches.length > 1) throw new GwsEaError('ambiguous_onecli_secret', 'Provider credential is ambiguous');
     const match = matches[0];
     if (!match) return { status: 'absent' };
-    if (!credentialMetadataMatches(match, credential)) {
+    if (!onecliSecretMatchesCredentialMetadata(match, credential)) {
       throw new GwsEaError('onecli_secret_conflict', 'Provider credential metadata does not match');
     }
     const id = stringField(match, 'id');
@@ -361,12 +418,10 @@ async function defaultProbeNanoclaw(context: ProductionProvisionContext): Promis
     ) {
       return { status: 'absent' };
     }
-    const groupValue = unwrapData(
-      await runInstanceNclJson(context.input.runtime, ['groups', 'get', '--id', mainAgentGroupId]),
-    );
-    const configValue = unwrapData(
-      await runInstanceNclJson(context.input.runtime, ['groups', 'config', 'get', '--id', mainAgentGroupId]),
-    );
+    const [groupValue, configValue] = await Promise.all([
+      runInstanceNclJson(context.input.runtime, ['groups', 'get', '--id', mainAgentGroupId]).then(unwrapData),
+      runInstanceNclJson(context.input.runtime, ['groups', 'config', 'get', '--id', mainAgentGroupId]).then(unwrapData),
+    ]);
     if (
       !isRecord(groupValue) ||
       groupValue.name !== 'main' ||
@@ -446,7 +501,55 @@ const defaultProductionDependencies: ProductionProvisionDependencies = {
   verifyPrincipalBinding,
   reconcilePrincipal: reconcilePrincipalDm,
   verifyConversation: verifyTalkableConversation,
+  holdReservedLoopbackPorts,
 };
+
+async function withRuntimePortLease<T>(
+  context: ProductionProvisionContext,
+  names: readonly AllocatedPortName[],
+  claim: typeof holdReservedLoopbackPorts,
+  effect: (beforeBind: () => Promise<void>) => Promise<T>,
+): Promise<T> {
+  const lease =
+    context.input.portLease ??
+    (await claim(context.operation.instanceId, context.input.runtime.allocated_ports, names));
+  let releasePromise: Promise<void> | undefined;
+  const releaseBeforeBind = (): Promise<void> => {
+    releasePromise ??= lease.release(names);
+    return releasePromise;
+  };
+  try {
+    return await effect(releaseBeforeBind);
+  } finally {
+    await releaseBeforeBind().catch(() => undefined);
+  }
+}
+
+function beforeOnecliBind(
+  dependencies: OnecliRuntimeDependencies | undefined,
+  releaseLease: () => Promise<void>,
+): OnecliRuntimeDependencies {
+  return {
+    ...dependencies,
+    beforeBind: async () => {
+      await dependencies?.beforeBind?.();
+      await releaseLease();
+    },
+  };
+}
+
+function beforeNanoclawBind(
+  dependencies: InstanceServiceDependencies,
+  releaseLease: () => Promise<void>,
+): InstanceServiceDependencies {
+  return {
+    ...dependencies,
+    beforeBind: async () => {
+      await dependencies.beforeBind?.();
+      await releaseLease();
+    },
+  };
+}
 
 function humanPause(phase: ProvisionPhase, code: string, message: string): PhaseEffectResult {
   return { status: 'paused', pause: { kind: 'human-action', phase, code, message } };
@@ -536,7 +639,7 @@ function conversationInput(context: ProductionProvisionContext): ConversationVer
 }
 
 /**
- * Production phase composition over the U2-U6 primitives. Dependencies are
+ * Production phase composition over the validated provisioning primitives. Dependencies are
  * injectable for boundary tests; omitted functions are the real checkout,
  * OneCLI, runtime, identity, principal, endpoint, and mailbox implementations.
  */
@@ -561,7 +664,7 @@ export function createProductionProvisionRegistry(
   if (input.adapterInstance !== 'gchat') {
     throw new GwsEaError(
       'adapter_instance_mismatch',
-      'Checkpoint 2 requires the registered Google Chat instance gchat',
+      'Provisioning requires the registered Google Chat instance gchat',
     );
   }
 
@@ -605,8 +708,16 @@ export function createProductionProvisionRegistry(
         key('onecli', JSON.stringify([input.onecli.project, input.onecli.appPort, input.onecli.gatewayPort])),
       probe: dependencies.probeOnecli,
       apply: async (value) => {
-        await value.input.portLease?.release(['onecli_app', 'onecli_gateway']);
-        const receipt = await dependencies.reconcileOnecliRuntime(value.input.onecli, value.input.onecliDependencies);
+        const receipt = await withRuntimePortLease(
+          value,
+          ['onecli_app', 'onecli_gateway'],
+          dependencies.holdReservedLoopbackPorts,
+          (releaseLease) =>
+            dependencies.reconcileOnecliRuntime(
+              value.input.onecli,
+              beforeOnecliBind(value.input.onecliDependencies, releaseLease),
+            ),
+        );
         value.state.onecliReceipt = receipt;
         await dependencies.persistOnecliApiKeyFiles(receipt, {
           runtime: value.input.runtime.secret_files.onecli_runtime_api_key,
@@ -628,11 +739,19 @@ export function createProductionProvisionRegistry(
         ),
       probe: dependencies.probeProvider,
       apply: async (value) => {
-        if (!value.input.providerCredential) {
+        const credential = value.input.providerCredential ?? (await value.input.requestProviderCredential?.());
+        if (!credential) {
           return humanPause(
             'configure_provider',
             'provider_credential_required',
-            'Supply the selected provider credential through the private setup input, then resume.',
+            'Authenticate the selected provider, then resume.',
+          );
+        }
+        const expected = value.input.providerCredentialMetadata;
+        if (expected && !credentialMatchesMetadata(credential, expected)) {
+          throw new GwsEaError(
+            'provider_credential_mismatch',
+            'The selected provider returned credential metadata that does not match its definition',
           );
         }
         const receipt =
@@ -645,7 +764,7 @@ export function createProductionProvisionRegistry(
         });
         const imported = await dependencies.importProviderCredential(
           receipt,
-          value.input.providerCredential,
+          credential,
           value.input.onecliDependencies,
         );
         value.state.providerSecretId = imported.id;
@@ -667,9 +786,17 @@ export function createProductionProvisionRegistry(
         if (!value.state.providerSecretId) {
           throw new GwsEaError('provider_not_ready', 'Provider credential must be reconciled before NanoClaw');
         }
-        await value.input.portLease?.release(['nanoclaw_webhook']);
         await ensureGchatCredential(value);
-        await dependencies.reconcileInstanceRuntime(value.input.runtime, value.input.serviceDependencies);
+        await withRuntimePortLease(
+          value,
+          ['nanoclaw_webhook'],
+          dependencies.holdReservedLoopbackPorts,
+          (releaseLease) =>
+            dependencies.reconcileInstanceRuntime(
+              value.input.runtime,
+              beforeNanoclawBind(value.input.serviceDependencies, releaseLease),
+            ),
+        );
         const main = await dependencies.reconcileMainIdentity(
           value.input.runtime,
           { ...value.input.identity, providerSecretId: value.state.providerSecretId },
@@ -899,13 +1026,17 @@ export interface ProductionBootstrapManifest {
   readonly home_directory: string;
   readonly platform: 'macos' | 'linux';
   readonly running_as_root: boolean;
+  readonly provider_capability_digest: string;
   readonly provider: {
     readonly id: string;
     readonly name: string;
     readonly type: string;
     readonly host_pattern: string;
-    readonly credential_file: string;
     readonly header_name: string | null;
+    readonly value_format: string | null;
+    readonly path_pattern: string | null;
+    readonly param_name: string | null;
+    readonly param_format: string | null;
   };
   readonly identity: {
     readonly assistant_display_name: string;
@@ -938,7 +1069,7 @@ function bootstrapPath(value: unknown, label: string): string {
   return result;
 }
 
-function validateBootstrapManifest(value: unknown): ProductionBootstrapManifest {
+export function validateProductionBootstrapManifest(value: unknown): ProductionBootstrapManifest {
   if (!isRecord(value)) throw new GwsEaError('invalid_bootstrap_manifest', 'Bootstrap manifest must be an object');
   exactKeys(
     value,
@@ -949,6 +1080,7 @@ function validateBootstrapManifest(value: unknown): ProductionBootstrapManifest 
       'home_directory',
       'platform',
       'running_as_root',
+      'provider_capability_digest',
       'provider',
       'identity',
       'selected_messaging_group_id',
@@ -967,16 +1099,23 @@ function validateBootstrapManifest(value: unknown): ProductionBootstrapManifest 
   if (!isRecord(value.provider) || !isRecord(value.identity)) {
     throw new GwsEaError('invalid_bootstrap_manifest', 'Bootstrap nested input is invalid');
   }
-  exactKeys(value.provider, ['id', 'name', 'type', 'host_pattern', 'credential_file', 'header_name'], 'provider');
-  exactKeys(value.identity, ['assistant_display_name', 'principal_display_name', 'principal_timezone'], 'identity');
+  const provider = value.provider;
+  const identity = value.identity;
+  exactKeys(
+    provider,
+    ['id', 'name', 'type', 'host_pattern', 'header_name', 'value_format', 'path_pattern', 'param_name', 'param_format'],
+    'provider',
+  );
+  exactKeys(identity, ['assistant_display_name', 'principal_display_name', 'principal_timezone'], 'identity');
   const selected = value.selected_messaging_group_id;
   if (selected !== null && typeof selected !== 'string') {
     throw new GwsEaError('invalid_bootstrap_manifest', 'selected_messaging_group_id is invalid');
   }
-  const header = value.provider.header_name;
-  if (header !== null && typeof header !== 'string') {
-    throw new GwsEaError('invalid_bootstrap_manifest', 'provider header_name is invalid');
-  }
+  const optionalProviderString = (key: string): string | null => {
+    const candidate = provider[key];
+    if (candidate === null) return null;
+    return bootstrapString(candidate, `provider ${key}`, 512);
+  };
   return {
     schema_version: BOOTSTRAP_SCHEMA_VERSION,
     onecli_cli_path: bootstrapPath(value.onecli_cli_path, 'onecli_cli_path'),
@@ -984,18 +1123,28 @@ function validateBootstrapManifest(value: unknown): ProductionBootstrapManifest 
     home_directory: bootstrapPath(value.home_directory, 'home_directory'),
     platform: value.platform,
     running_as_root: value.running_as_root,
+    provider_capability_digest: (() => {
+      try {
+        return assertProviderProvisioningCapabilityDigest(value.provider_capability_digest);
+      } catch {
+        throw new GwsEaError('invalid_bootstrap_manifest', 'provider_capability_digest is invalid');
+      }
+    })(),
     provider: {
-      id: bootstrapString(value.provider.id, 'provider id', 64),
-      name: bootstrapString(value.provider.name, 'provider name', 256),
-      type: bootstrapString(value.provider.type, 'provider type', 64),
-      host_pattern: bootstrapString(value.provider.host_pattern, 'provider host_pattern', 512),
-      credential_file: bootstrapPath(value.provider.credential_file, 'provider credential_file'),
-      header_name: header === null ? null : bootstrapString(header, 'provider header_name', 128),
+      id: bootstrapString(provider.id, 'provider id', 64),
+      name: bootstrapString(provider.name, 'provider name', 256),
+      type: bootstrapString(provider.type, 'provider type', 64),
+      host_pattern: bootstrapString(provider.host_pattern, 'provider host_pattern', 512),
+      header_name: optionalProviderString('header_name'),
+      value_format: optionalProviderString('value_format'),
+      path_pattern: optionalProviderString('path_pattern'),
+      param_name: optionalProviderString('param_name'),
+      param_format: optionalProviderString('param_format'),
     },
     identity: {
-      assistant_display_name: bootstrapString(value.identity.assistant_display_name, 'assistant display name', 120),
-      principal_display_name: bootstrapString(value.identity.principal_display_name, 'principal display name', 120),
-      principal_timezone: bootstrapString(value.identity.principal_timezone, 'principal timezone', 128),
+      assistant_display_name: bootstrapString(identity.assistant_display_name, 'assistant display name', 120),
+      principal_display_name: bootstrapString(identity.principal_display_name, 'principal display name', 120),
+      principal_timezone: bootstrapString(identity.principal_timezone, 'principal timezone', 128),
     },
     selected_messaging_group_id:
       selected === null ? null : bootstrapString(selected, 'selected messaging group ID', 512),
@@ -1012,7 +1161,20 @@ export async function loadProductionBootstrapManifest(file: string): Promise<Pro
     }
     throw error;
   }
-  return validateBootstrapManifest(value);
+  return validateProductionBootstrapManifest(value);
+}
+
+function bootstrapProviderCredential(manifest: ProductionBootstrapManifest): ProviderCredentialMetadata {
+  return {
+    name: manifest.provider.name,
+    type: manifest.provider.type,
+    hostPattern: manifest.provider.host_pattern,
+    ...(manifest.provider.header_name ? { headerName: manifest.provider.header_name } : {}),
+    ...(manifest.provider.value_format ? { valueFormat: manifest.provider.value_format } : {}),
+    ...(manifest.provider.path_pattern ? { pathPattern: manifest.provider.path_pattern } : {}),
+    ...(manifest.provider.param_name ? { paramName: manifest.provider.param_name } : {}),
+    ...(manifest.provider.param_format ? { paramFormat: manifest.provider.param_format } : {}),
+  };
 }
 
 /** Copy validated, non-secret bootstrap metadata into instance-private state. */
@@ -1022,7 +1184,7 @@ export async function installProductionBootstrapManifest(
   input: ProductionBootstrapManifest,
 ): Promise<void> {
   assertInstanceId(instanceId);
-  const manifest = validateBootstrapManifest(input);
+  const manifest = validateProductionBootstrapManifest(input);
   await preparePrivateLocalDirectory(paths.instancesRoot);
   try {
     await mkdir(paths.instanceRoot(instanceId), { mode: 0o700 });
@@ -1127,11 +1289,12 @@ async function ensureTrustedProvisioningStart(
   return (await beginPhase(operation, 'materialize_checkout', resourceKey)).attempt.intended_at;
 }
 
-/** Build the real U7 context from temporary bootstrap input or authoritative instance state. */
+/** Build the production context from temporary bootstrap input or authoritative instance state. */
 export async function runProductionProvision(
   operation: InstanceOperation,
   selectedMessagingGroupId?: string,
   portLease?: ProvisionPortLease,
+  authenticateProvider?: (provider: string) => Promise<ProviderCredential>,
 ): Promise<ProvisionResult> {
   const reservation = await getInstanceReservation(operation.paths, operation.instanceId);
   const provisioningStartedAt = await ensureTrustedProvisioningStart(operation, reservation);
@@ -1182,6 +1345,19 @@ export async function runProductionProvision(
     gatewayPort: reservation.allocated_ports.onecli_gateway,
     cliExecutable: runtime.onecli_cli_path,
   });
+  const persistedPreflight = manifest
+    ? undefined
+    : await loadReleasePreflightReceipt(operation.paths.releasePreflightFile(operation.instanceId), {
+        instanceId: operation.instanceId,
+        deployedCommit: reservation.deployed_commit,
+        provider: runtime.selected_provider,
+      });
+  const providerCredentialMetadata = manifest
+    ? bootstrapProviderCredential(manifest)
+    : persistedPreflight!.providerCredential;
+  const providerCapabilityDigest = manifest
+    ? manifest.provider_capability_digest
+    : persistedPreflight!.providerCapabilityDigest;
   const profile = readPersistedProfile(runtime);
   if (!manifest && !profile) {
     throw new GwsEaError('bootstrap_required', 'The temporary bootstrap manifest is required until main is published');
@@ -1199,20 +1375,6 @@ export async function runProductionProvision(
         principalDisplayName: profile!.principal_display_name,
         principalTimezone: profile!.principal_timezone,
       };
-  let providerCredential: ProviderCredentialInput | undefined;
-  if (manifest) {
-    try {
-      providerCredential = {
-        name: manifest.provider.name,
-        type: manifest.provider.type,
-        value: await readOwnerOnlyFile(manifest.provider.credential_file),
-        hostPattern: manifest.provider.host_pattern,
-        ...(manifest.provider.header_name ? { headerName: manifest.provider.header_name } : {}),
-      };
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-  }
   const state = await hydrateMainState(runtime, profile);
   const context: ProductionProvisionContext = {
     operation,
@@ -1223,7 +1385,13 @@ export async function runProductionProvision(
         releaseRef: reservation.release_track,
         commit: reservation.deployed_commit,
       },
-      releasePreflight: { checkoutRoot: reservation.checkout_realpath, provider: runtime.selected_provider },
+      releasePreflight: {
+        checkoutRoot: reservation.checkout_realpath,
+        provider: runtime.selected_provider,
+        providerCapabilityDigest,
+        providerCredential: providerCredentialMetadata,
+        onecliCliPath: runtime.onecli_cli_path,
+      },
       onecli,
       runtime,
       gcp: {
@@ -1234,17 +1402,10 @@ export async function runProductionProvision(
         credentialFile: runtime.secret_files.gchat_credentials,
         cwd: reservation.checkout_realpath,
       },
-      ...(manifest
-        ? {
-            providerCredentialMetadata: {
-              name: manifest.provider.name,
-              type: manifest.provider.type,
-              hostPattern: manifest.provider.host_pattern,
-              ...(manifest.provider.header_name ? { headerName: manifest.provider.header_name } : {}),
-            },
-          }
+      providerCredentialMetadata,
+      ...(manifest && authenticateProvider
+        ? { requestProviderCredential: () => authenticateProvider(manifest.provider.id) }
         : {}),
-      ...(providerCredential ? { providerCredential } : {}),
       identity,
       adapterInstance: 'gchat',
       provisioningStartedAt,

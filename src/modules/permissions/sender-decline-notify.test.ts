@@ -80,6 +80,7 @@ beforeEach(async () => {
     id: 'mg-dm-stranger',
     channel_type: 'telegram',
     platform_id: 'dm-stranger',
+    instance: 'telegram-primary',
     name: null,
     is_group: 0,
     unknown_sender_policy: 'decline_notify',
@@ -136,6 +137,7 @@ afterEach(async () => {
 function strangerDm(text: string) {
   return {
     channelType: 'telegram',
+    instance: 'telegram-primary',
     platformId: 'dm-stranger',
     threadId: null,
     message: {
@@ -222,12 +224,11 @@ describe('unknown-sender decline_notify flow', () => {
     // Drop recorded. (The gate writes reason 'unknown_sender_decline_notify';
     // core's structural no_agent_engaged record then upserts the same row —
     // pre-existing behavior shared with every refusal path.)
-    const drop = await getDb().get<{ user_id: string }>(
-      'SELECT user_id FROM unregistered_senders WHERE platform_id = ?',
+    const drops = await getDb().all<{ user_id: string; instance: string; message_count: number }>(
+      'SELECT user_id, instance, message_count FROM unregistered_senders WHERE platform_id = ?',
       'dm-stranger',
     );
-    expect(drop).toBeDefined();
-    expect(drop!.user_id).toBe('tg:stranger');
+    expect(drops).toEqual([{ user_id: 'tg:stranger', instance: 'telegram-primary', message_count: 2 }]);
 
     // No card rows anywhere — only the decline stamp.
     const rows = await getDb().all<{ id: string }>('SELECT id FROM pending_sender_approvals');
@@ -311,6 +312,7 @@ describe('unknown-sender decline_notify flow', () => {
       id: 'mg-team',
       channel_type: 'telegram',
       platform_id: 'group-team',
+      instance: 'telegram-primary',
       name: 'Team',
       is_group: 1,
       unknown_sender_policy: 'decline_notify',

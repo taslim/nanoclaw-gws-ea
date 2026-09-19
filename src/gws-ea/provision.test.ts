@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { createServer, type Server } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -20,15 +21,18 @@ import { defineProvisionPhaseRegistry, type ProvisionPhaseDefinition } from './p
 import { reserveInstance } from './registry.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import type { OnecliCompatibilityReceipt } from './onecli.js';
+import { holdLoopbackPorts } from './ports.js';
 import { createInstanceRuntimeConfig } from './service.js';
 import {
   PROVISION_PHASES,
+  type AllocatedPorts,
   type InstanceReservation,
   type InstanceReservationInput,
   type ProvisionPhase,
 } from './types.js';
 
 const roots: string[] = [];
+const providerCapabilityDigest = 'c'.repeat(64);
 
 async function testPaths(): Promise<ControlPlanePaths> {
   const root = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-provision-'));
@@ -36,7 +40,10 @@ async function testPaths(): Promise<ControlPlanePaths> {
   return resolveControlPlanePaths({ configRoot: path.join(root, 'config'), stateRoot: path.join(root, 'state') });
 }
 
-function reservation(paths: ControlPlanePaths): InstanceReservationInput {
+function reservation(
+  paths: ControlPlanePaths,
+  allocatedPorts: AllocatedPorts = { nanoclaw_webhook: 3101, onecli_app: 3201, onecli_gateway: 3301 },
+): InstanceReservationInput {
   const instanceId = '11111111-1111-4111-8111-111111111111';
   return {
     instance_id: instanceId,
@@ -44,7 +51,7 @@ function reservation(paths: ControlPlanePaths): InstanceReservationInput {
     release_track: 'dogfood',
     source_remote: 'https://example.com/nanoclaw.git',
     deployed_commit: 'a'.repeat(40),
-    allocated_ports: { nanoclaw_webhook: 3101, onecli_app: 3201, onecli_gateway: 3301 },
+    allocated_ports: allocatedPorts,
     exclusive_resource_claims: {
       endpoint_url: 'https://assistant.example.com/webhook/gchat',
       gcp_project_id: 'gws-ea-dogfood',
@@ -54,6 +61,31 @@ function reservation(paths: ControlPlanePaths): InstanceReservationInput {
       onecli_project: 'gws_ea_1',
     },
   };
+}
+
+async function listen(server: Server, port: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', resolve);
+  });
+}
+
+async function close(server: Server): Promise<void> {
+  if (!server.listening) return;
+  await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+}
+
+async function canClaim(port: number): Promise<boolean> {
+  const server = createServer();
+  try {
+    await listen(server, port);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') return false;
+    throw error;
+  } finally {
+    await close(server);
+  }
 }
 
 function serviceAccount(overrides: Readonly<Record<string, string>> = {}): string {
@@ -75,7 +107,6 @@ function serviceAccount(overrides: Readonly<Record<string, string>> = {}): strin
 }
 
 function bootstrapManifest(paths: ControlPlanePaths): ProductionBootstrapManifest {
-  const inputRoot = path.join(path.dirname(paths.configRoot), 'bootstrap-input');
   return {
     schema_version: 1,
     onecli_cli_path: '/usr/local/bin/onecli',
@@ -83,13 +114,17 @@ function bootstrapManifest(paths: ControlPlanePaths): ProductionBootstrapManifes
     home_directory: path.dirname(paths.stateRoot),
     platform: process.platform === 'darwin' ? 'macos' : 'linux',
     running_as_root: false,
+    provider_capability_digest: providerCapabilityDigest,
     provider: {
       id: 'claude',
       name: 'Claude provider',
       type: 'api_key',
       host_pattern: 'api.anthropic.com',
-      credential_file: path.join(inputRoot, 'provider-key'),
       header_name: 'x-api-key',
+      value_format: null,
+      path_pattern: null,
+      param_name: null,
+      param_format: null,
     },
     identity: {
       assistant_display_name: 'Aya',
@@ -310,7 +345,18 @@ function productionContext(
         releaseRef: reserved.release_track,
         commit: reserved.deployed_commit,
       },
-      releasePreflight: { checkoutRoot: reserved.checkout_realpath, provider: 'claude' },
+      releasePreflight: {
+        checkoutRoot: reserved.checkout_realpath,
+        provider: 'claude',
+        providerCapabilityDigest,
+        providerCredential: {
+          name: 'Claude provider',
+          type: 'api_key',
+          hostPattern: 'api.anthropic.com',
+          headerName: 'x-api-key',
+        },
+        onecliCliPath: '/usr/local/bin/onecli',
+      },
       onecli,
       runtime,
       gcp: {
@@ -352,6 +398,143 @@ function productionContext(
 }
 
 describe('production provision phase composition', () => {
+  it('reclaims the exact reserved OneCLI ports on a normal resume and holds them until bind', async () => {
+    const paths = await testPaths();
+    const originalLease = await holdLoopbackPorts();
+    const ports = originalLease.ports;
+    await originalLease.release();
+    const reserved = await reserveInstance(paths, reservation(paths, ports));
+    const receipt = Object.freeze({}) as OnecliCompatibilityReceipt;
+    const bindObservations: boolean[] = [];
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const context = productionContext(operation, reserved);
+      const reconcileOnecliRuntime = vi.fn(async (_layout, dependencies) => {
+        bindObservations.push(await canClaim(ports.onecli_app));
+        await dependencies.beforeBind?.();
+        bindObservations.push(await canClaim(ports.onecli_app));
+        return receipt;
+      });
+      const phase = createProductionProvisionRegistry(context, {
+        reconcileOnecliRuntime,
+        persistOnecliApiKeyFiles: vi.fn(async () => undefined),
+      }).start_onecli;
+
+      await expect(phase.apply(context)).resolves.toEqual({ status: 'completed' });
+      expect(reconcileOnecliRuntime).toHaveBeenCalledOnce();
+    });
+
+    expect(bindObservations).toEqual([false, true]);
+    await expect(canClaim(ports.onecli_app)).resolves.toBe(true);
+    await expect(canClaim(ports.onecli_gateway)).resolves.toBe(true);
+  });
+
+  it('fails resume when a foreign listener takes an exact released reserved port', async () => {
+    const paths = await testPaths();
+    const originalLease = await holdLoopbackPorts();
+    const ports = originalLease.ports;
+    await originalLease.release();
+    const foreignListener = createServer();
+    await listen(foreignListener, ports.onecli_app);
+    const reserved = await reserveInstance(paths, reservation(paths, ports));
+    const reconcileOnecliRuntime = vi.fn();
+
+    try {
+      await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+        const context = productionContext(operation, reserved);
+        const phase = createProductionProvisionRegistry(context, { reconcileOnecliRuntime }).start_onecli;
+
+        await expect(phase.apply(context)).rejects.toMatchObject({
+          code: 'port_claim_lost',
+          message:
+            `Reserved onecli_app coordinate 127.0.0.1:${ports.onecli_app} is unavailable. ` +
+            `Stop the process using it, then resume with: gws-ea resume --id ${reserved.instance_id}`,
+        });
+      });
+    } finally {
+      await close(foreignListener);
+    }
+
+    expect(reconcileOnecliRuntime).not.toHaveBeenCalled();
+  });
+
+  it('collects a missing credential only after the isolated OneCLI runtime is ready', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation(paths));
+    const order: string[] = [];
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const base = productionContext(operation, reserved);
+      const context: ProductionProvisionContext = {
+        ...base,
+        input: {
+          ...base.input,
+          providerCredential: undefined,
+          requestProviderCredential: async () => {
+            order.push('collect');
+            return {
+              name: 'Claude provider',
+              type: 'api_key',
+              value: 'prompted-secret',
+              hostPattern: 'api.anthropic.com',
+              headerName: 'x-api-key',
+            };
+          },
+        },
+      };
+      const dependencies: Partial<ProductionProvisionDependencies> = {
+        reconcileOnecliRuntime: vi.fn(async () => {
+          order.push('onecli');
+          return {} as OnecliCompatibilityReceipt;
+        }),
+        persistOnecliApiKeyFiles: vi.fn(async () => undefined),
+        importProviderCredential: vi.fn(async (_receipt, credential) => {
+          order.push(`import:${credential.value}`);
+          return { id: 'secret-provider', created: true };
+        }),
+      };
+
+      const registry = createProductionProvisionRegistry(context, dependencies);
+      await registry.start_onecli.apply(context);
+      await registry.configure_provider.apply(context);
+    });
+
+    expect(order).toEqual(['onecli', 'collect', 'import:prompted-secret']);
+  });
+
+  it('rejects a credential that does not match the selected provider definition', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation(paths));
+    const importProviderCredential = vi.fn();
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const base = productionContext(operation, reserved);
+      const context: ProductionProvisionContext = {
+        ...base,
+        input: {
+          ...base.input,
+          providerCredential: undefined,
+          requestProviderCredential: async () => ({
+            name: 'Different provider',
+            type: 'api_key',
+            value: 'prompted-secret',
+            hostPattern: 'api.anthropic.com',
+            headerName: 'x-api-key',
+          }),
+        },
+      };
+      const registry = createProductionProvisionRegistry(context, {
+        importProviderCredential,
+      });
+
+      await expect(registry.configure_provider.apply(context)).rejects.toMatchObject({
+        code: 'provider_credential_mismatch',
+      });
+    });
+
+    expect(importProviderCredential).not.toHaveBeenCalled();
+  });
+
   it('pauses with the exact project-scoped Chat configuration handoff', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
@@ -413,7 +596,7 @@ describe('production provision phase composition', () => {
     expect(startRuntime).not.toHaveBeenCalled();
   });
 
-  it('composes U2-U6 in order, pauses for the principal, and resumes without duplicate effects', async () => {
+  it('composes provisioning phases in order, pauses for the principal, and resumes without duplicate effects', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
     const effects: string[] = [];
@@ -434,6 +617,13 @@ describe('production provision phase composition', () => {
         effects.push('runReleasePreflight');
         return {
           provider: 'claude',
+          providerCapabilityDigest,
+          providerCredential: {
+            name: 'Claude provider',
+            type: 'api_key',
+            hostPattern: 'api.anthropic.com',
+            headerName: 'x-api-key',
+          },
           packageManager: 'pnpm@10.0.0',
           onecli: { gateway: '1.42.0', cli: '2.2.5', sdk: '2.2.1' },
         };
@@ -641,6 +831,9 @@ describe('production provision phase composition', () => {
       return reconcileProvisioning(operation, resumed, createProductionProvisionRegistry(resumed, overrides));
     });
     expect(completed).toEqual({ status: 'ready' });
+    await expect(readFile(paths.releasePreflightFile(reserved.instance_id), 'utf8')).resolves.toContain(
+      '"providerCredential"',
+    );
     const after = await readProvisionJournal(paths, reserved.instance_id);
     for (const phase of PROVISION_PHASES) {
       expect(after.phases[phase].attempts.at(-1)?.resource_key).toBe(

@@ -70,7 +70,7 @@ function makeAdapter(): ChannelAdapter {
 }
 
 async function activate(): Promise<void> {
-  registerChannelAdapter('testchat', { factory: () => makeAdapter(), defaults: channelDefaults });
+  registerChannelAdapter('testchat-primary', { factory: () => makeAdapter(), defaults: channelDefaults });
   await initChannelAdapters(() => ({
     onInbound: () => {},
     onInboundEvent: () => {},
@@ -94,7 +94,7 @@ async function seedUnknownEngageModeWiring(): Promise<void> {
     id: 'mg-1',
     channel_type: 'testchat',
     platform_id: 'testchat:C1',
-    instance: 'testchat',
+    instance: 'testchat-primary',
     name: 'Test Chat',
     is_group: 0,
     unknown_sender_policy: 'public',
@@ -118,6 +118,7 @@ async function seedUnknownEngageModeWiring(): Promise<void> {
 async function inbound(id: string, text: string): Promise<void> {
   await routeInbound({
     channelType: 'testchat',
+    instance: 'testchat-primary',
     platformId: 'testchat:C1',
     threadId: null,
     message: {
@@ -154,6 +155,7 @@ describe('evaluateEngage with an unrecognized engage_mode', () => {
     const dropped = await getUnregisteredSenders();
     expect(dropped).toHaveLength(1);
     expect(dropped[0].reason).toBe('no_agent_engaged');
+    expect(dropped[0].instance).toBe('testchat-primary');
 
     expect(log.warn).toHaveBeenCalledWith(
       expect.stringContaining('Unknown engage_mode'),

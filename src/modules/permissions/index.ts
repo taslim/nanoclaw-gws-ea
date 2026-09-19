@@ -146,6 +146,7 @@ async function handleUnknownSender(
   const dropRecord = {
     channel_type: event.channelType,
     platform_id: event.platformId,
+    instance: mg.instance ?? event.channelType,
     user_id: userId,
     sender_name: senderName,
     reason: `unknown_sender_${mg.unknown_sender_policy}`,

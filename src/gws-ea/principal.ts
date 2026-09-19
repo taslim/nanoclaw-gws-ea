@@ -171,9 +171,10 @@ export function principalWelcomeEventId(
 }
 
 /**
- * Select and bind an authenticated first Google Chat DM. Discovery is
- * intentionally read-only until the operator supplies one exact eligible
- * messaging-group ID. Authentication alone never authorizes an owner grant.
+ * Select and bind an authenticated first Google Chat DM. A sole eligible
+ * candidate is unambiguous and binds automatically; multiple candidates stay
+ * read-only until the operator supplies one exact messaging-group ID.
+ * Authentication alone never authorizes an owner grant.
  */
 export async function reconcilePrincipalDm(
   configInput: InstanceRuntimeConfig,
@@ -192,8 +193,8 @@ export async function reconcilePrincipalDm(
     ((runtimeConfig: InstanceRuntimeConfig, args: readonly string[]) =>
       defaultRunBootstrap(runtimeConfig, args, dependencies.runCommand));
 
-  // A non-null pointer is published only after U5 verifies the selective
-  // OneCLI grant, so it is the hard prerequisite for any principal wiring.
+  // A non-null pointer is published only after the selective OneCLI grant is
+  // verified, so it is the hard prerequisite for any principal wiring.
   const profile = parseProfile(await runNcl(config, ['gws-ea-profile', 'get']));
   let selected = input.selectedCandidate;
   if (selected && input.messagingGroupId !== undefined && selected.messagingGroupId !== input.messagingGroupId) {
@@ -217,10 +218,13 @@ export async function reconcilePrincipalDm(
       provisioningStartedAt,
     );
     if (input.messagingGroupId === undefined) {
-      return candidates.length === 0 ? { status: 'waiting' } : { status: 'selection-required', candidates };
+      if (candidates.length === 0) return { status: 'waiting' };
+      if (candidates.length > 1) return { status: 'selection-required', candidates };
+      [selected] = candidates;
+    } else {
+      selected = candidates.find((candidate) => candidate.messagingGroupId === input.messagingGroupId);
+      if (!selected) throw new GwsEaError('principal_selection_mismatch', 'Selected principal DM is not eligible');
     }
-    selected = candidates.find((candidate) => candidate.messagingGroupId === input.messagingGroupId);
-    if (!selected) throw new GwsEaError('principal_selection_mismatch', 'Selected principal DM is not eligible');
     selected = await (dependencies.persistSelection?.(selected) ?? Promise.resolve(selected));
   }
 

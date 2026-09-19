@@ -5,8 +5,9 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { runArgumentCommand } from './checkout.js';
+import { runArgumentCommand, type CommandRunner } from './checkout.js';
 import { runReleasePreflight, type SetupCommand } from './release-preflight.js';
+import { providerProvisioningCapabilityDigest } from '../provider-provisioning-capability.js';
 
 const roots: string[] = [];
 
@@ -96,7 +97,15 @@ async function releaseFixture(): Promise<string> {
     ) + '\n',
   );
   await write(root, 'bin/ncl', '#!/usr/bin/env bash\nexit 0\n');
+  await write(root, 'bin/gws-ea', '#!/usr/bin/env bash\nexit 0\n');
   await chmod(path.join(root, 'bin/ncl'), 0o755);
+  await chmod(path.join(root, 'bin/gws-ea'), 0o755);
+  await write(root, 'setup/gws-ea.ts', 'export {};\n');
+  await write(root, 'setup/gws-ea-input.ts', 'export {};\n');
+  await write(root, 'setup/lib/bright-select.ts', 'export {};\n');
+  await write(root, 'setup/lib/inherit-script.ts', 'export {};\n');
+  await write(root, 'setup/register-claude-token.sh', '#!/bin/sh\n');
+  await write(root, 'src/provider-credential.ts', 'export {};\n');
   await write(root, 'src/channels/gchat.ts', "export const gchat = 'registered';\n");
   await write(root, 'src/channels/index.ts', "import './cli.js';\nimport './gchat.js';\n");
   await write(root, 'src/gws-ea/process.ts', 'export {};\n');
@@ -108,6 +117,7 @@ async function releaseFixture(): Promise<string> {
   await write(root, 'src/provider-contracts/index.ts', "import './claude.js';\n");
   await write(root, 'setup/providers/claude.ts', "export const provider = 'claude';\n");
   await write(root, 'setup/providers/index.ts', "import './claude.js';\n");
+  await write(root, 'setup/providers/registry.ts', 'export {};\n');
   await write(root, 'container/agent-runner/src/providers/claude.ts', "export const provider = 'claude';\n");
   await write(root, 'container/agent-runner/src/providers/index.ts', "import './claude.js';\n");
   await write(root, 'container/agent-runner/src/provider-contracts/claude.ts', "export const provider = 'claude';\n");
@@ -117,6 +127,21 @@ async function releaseFixture(): Promise<string> {
   git(root, 'checkout', '--detach');
   return realpath(root);
 }
+
+async function preflightInput(root: string) {
+  return {
+    checkoutRoot: root,
+    provider: 'claude',
+    providerCapabilityDigest: await providerProvisioningCapabilityDigest(root),
+    providerCredential: { name: 'Anthropic', type: 'anthropic', hostPattern: 'api.anthropic.com' },
+    onecliCliPath: '/fixture/bin/onecli',
+  } as const;
+}
+
+const fixtureCommandRunner: CommandRunner = async (spec) =>
+  spec.command === '/fixture/bin/onecli'
+    ? { stdout: JSON.stringify({ version: '2.2.5', server_version: 'unknown' }), stderr: '' }
+    : runArgumentCommand(spec);
 
 function recorder(commands: SetupCommand[]): (command: SetupCommand) => Promise<void> {
   return async (command) => {
@@ -140,13 +165,15 @@ describe('release preflight', () => {
     const root = await releaseFixture();
     const commands: SetupCommand[] = [];
 
-    const result = await runReleasePreflight(
-      { checkoutRoot: root, provider: 'claude' },
-      { runSetupCommand: recorder(commands) },
-    );
+    const result = await runReleasePreflight(await preflightInput(root), {
+      runCommand: fixtureCommandRunner,
+      runSetupCommand: recorder(commands),
+    });
 
     expect(result).toEqual({
       provider: 'claude',
+      providerCapabilityDigest: await providerProvisioningCapabilityDigest(root),
+      providerCredential: { name: 'Anthropic', type: 'anthropic', hostPattern: 'api.anthropic.com' },
       packageManager: 'pnpm@10.34.5',
       onecli: { gateway: '1.42.0', cli: '2.2.5', sdk: '2.2.1' },
     });
@@ -167,18 +194,20 @@ describe('release preflight', () => {
     vi.stubEnv('ANTHROPIC_API_KEY', 'must-not-propagate');
     vi.stubEnv('GOOGLE_APPLICATION_CREDENTIALS', '/tmp/hostile-google-key');
     const gitEnvironments: Array<Readonly<Record<string, string>>> = [];
+    let onecliEnvironment: Readonly<Record<string, string>> | undefined;
     const setupCommands: SetupCommand[] = [];
 
-    await runReleasePreflight(
-      { checkoutRoot: root, provider: 'claude' },
-      {
-        runCommand: async (spec) => {
-          gitEnvironments.push(spec.env);
-          return runArgumentCommand(spec);
-        },
-        runSetupCommand: recorder(setupCommands),
+    await runReleasePreflight(await preflightInput(root), {
+      runCommand: async (spec) => {
+        if (spec.command === '/fixture/bin/onecli') {
+          onecliEnvironment = spec.env;
+          return { stdout: JSON.stringify({ version: '2.2.5', server_version: 'unknown' }), stderr: '' };
+        }
+        gitEnvironments.push(spec.env);
+        return runArgumentCommand(spec);
       },
-    );
+      runSetupCommand: recorder(setupCommands),
+    });
 
     expect(gitEnvironments.length).toBeGreaterThan(0);
     for (const environment of gitEnvironments) {
@@ -191,12 +220,14 @@ describe('release preflight', () => {
         );
       }
     }
+    expectCommonEnvironment(onecliEnvironment!, root);
     for (const command of setupCommands) expectCommonEnvironment(command.env, root);
   });
 
   it.each([
     ['template', 'templates/gws-ea/main/plugin.json', 'incomplete_release'],
     ['Google Chat adapter', 'src/channels/gchat.ts', 'incomplete_release'],
+    ['GWS-EA interactive launcher', 'setup/gws-ea-input.ts', 'incomplete_release'],
     ['GWS-EA service launcher', 'src/gws-ea/process.ts', 'incomplete_release'],
     ['GWS-EA profile migration', 'src/modules/gws-ea-profile/migration.ts', 'incomplete_release'],
     ['provider host contract', 'src/provider-contracts/claude.ts', 'provider_not_composed'],
@@ -208,7 +239,7 @@ describe('release preflight', () => {
     const commands: SetupCommand[] = [];
 
     await expect(
-      runReleasePreflight({ checkoutRoot: root, provider: 'claude' }, { runSetupCommand: recorder(commands) }),
+      runReleasePreflight(await preflightInput(root), { runSetupCommand: recorder(commands) }),
     ).rejects.toMatchObject({ code });
     expect(commands).toEqual([]);
   });
@@ -218,14 +249,12 @@ describe('release preflight', () => {
     const commands: SetupCommand[] = [];
 
     await expect(
-      runReleasePreflight(
-        { checkoutRoot: root, provider: 'claude' },
-        {
-          runSetupCommand: async (command) => {
-            commands.push(command);
-          },
+      runReleasePreflight(await preflightInput(root), {
+        runCommand: fixtureCommandRunner,
+        runSetupCommand: async (command) => {
+          commands.push(command);
         },
-      ),
+      }),
     ).rejects.toThrow(/dist\/gws-ea\/process\.js/u);
     expect(commands).toHaveLength(2);
   });
@@ -235,8 +264,56 @@ describe('release preflight', () => {
     const commands: SetupCommand[] = [];
 
     await expect(
-      runReleasePreflight({ checkoutRoot: root, provider: 'opencode' }, { runSetupCommand: recorder(commands) }),
+      runReleasePreflight(
+        { ...(await preflightInput(root)), provider: 'opencode' },
+        { runSetupCommand: recorder(commands) },
+      ),
     ).rejects.toMatchObject({ code: 'provider_not_composed' });
+    expect(commands).toEqual([]);
+  });
+
+  it('rejects a launcher/target provider setup mismatch before setup commands', async () => {
+    const root = await releaseFixture();
+    const commands: SetupCommand[] = [];
+
+    await expect(
+      runReleasePreflight(
+        { ...(await preflightInput(root)), providerCapabilityDigest: 'f'.repeat(64) },
+        { runSetupCommand: recorder(commands) },
+      ),
+    ).rejects.toMatchObject({ code: 'provider_capability_mismatch' });
+    expect(commands).toEqual([]);
+  });
+
+  it('rejects target OneCLI pins that the launcher cannot execute before setup commands', async () => {
+    const root = await releaseFixture();
+    await write(
+      root,
+      'versions.json',
+      JSON.stringify({ 'onecli-gateway': '1.43.0', 'onecli-cli': '2.2.5' }, null, 2) + '\n',
+    );
+    commit(root, 'new OneCLI gateway cohort');
+    const commands: SetupCommand[] = [];
+
+    await expect(
+      runReleasePreflight(await preflightInput(root), { runSetupCommand: recorder(commands) }),
+    ).rejects.toMatchObject({ code: 'onecli_release_mismatch' });
+    expect(commands).toEqual([]);
+  });
+
+  it('rejects an installed OneCLI CLI outside the selected cohort before setup commands', async () => {
+    const root = await releaseFixture();
+    const commands: SetupCommand[] = [];
+
+    await expect(
+      runReleasePreflight(await preflightInput(root), {
+        runCommand: async (spec) =>
+          spec.command === '/fixture/bin/onecli'
+            ? { stdout: JSON.stringify({ version: '2.2.4', server_version: 'unknown' }), stderr: '' }
+            : runArgumentCommand(spec),
+        runSetupCommand: recorder(commands),
+      }),
+    ).rejects.toMatchObject({ code: 'incompatible_onecli' });
     expect(commands).toEqual([]);
   });
 
@@ -264,7 +341,7 @@ describe('release preflight', () => {
     const commands: SetupCommand[] = [];
 
     await expect(
-      runReleasePreflight({ checkoutRoot: root, provider: 'claude' }, { runSetupCommand: recorder(commands) }),
+      runReleasePreflight(await preflightInput(root), { runSetupCommand: recorder(commands) }),
     ).rejects.toMatchObject({ code: 'inconsistent_lockfile' });
     expect(commands).toEqual([]);
   });
@@ -288,7 +365,7 @@ describe('release preflight', () => {
     const commands: SetupCommand[] = [];
 
     await expect(
-      runReleasePreflight({ checkoutRoot: root, provider: 'claude' }, { runSetupCommand: recorder(commands) }),
+      runReleasePreflight(await preflightInput(root), { runSetupCommand: recorder(commands) }),
     ).rejects.toMatchObject({ code: 'invalid_release_pin' });
     expect(commands).toEqual([]);
   });
@@ -298,15 +375,13 @@ describe('release preflight', () => {
     const commands: SetupCommand[] = [];
 
     await expect(
-      runReleasePreflight(
-        { checkoutRoot: root, provider: 'claude' },
-        {
-          runSetupCommand: async (command) => {
-            commands.push(command);
-            if (command.args[0] === 'install') await write(root, 'package.json', '{"drift":true}\n');
-          },
+      runReleasePreflight(await preflightInput(root), {
+        runCommand: fixtureCommandRunner,
+        runSetupCommand: async (command) => {
+          commands.push(command);
+          if (command.args[0] === 'install') await write(root, 'package.json', '{"drift":true}\n');
         },
-      ),
+      }),
     ).rejects.toThrow(/package\.json/);
     expect(commands).toHaveLength(1);
     expect(commands[0]).toMatchObject({ command: 'pnpm', args: ['install', '--frozen-lockfile'], cwd: root });
@@ -317,17 +392,15 @@ describe('release preflight', () => {
     const commands: SetupCommand[] = [];
 
     await expect(
-      runReleasePreflight(
-        { checkoutRoot: root, provider: 'claude' },
-        {
-          runSetupCommand: async (command) => {
-            commands.push(command);
-            if (command.args[0] === 'run') {
-              await write(root, 'src/channels/gchat.ts', "export const gchat = 'drifted';\n");
-            }
-          },
+      runReleasePreflight(await preflightInput(root), {
+        runCommand: fixtureCommandRunner,
+        runSetupCommand: async (command) => {
+          commands.push(command);
+          if (command.args[0] === 'run') {
+            await write(root, 'src/channels/gchat.ts', "export const gchat = 'drifted';\n");
+          }
         },
-      ),
+      }),
     ).rejects.toThrow(/src\/channels\/gchat\.ts/);
     expect(commands).toHaveLength(2);
   });

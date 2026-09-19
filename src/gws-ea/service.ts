@@ -15,6 +15,8 @@ import {
   type SanitizedCommandRunner,
 } from './process.js';
 import { readOwnerOnlyFile, writePrivateTextFile } from './secrets.js';
+import { createInstanceServiceCoordinates, type InstanceServicePlatform } from './service-coordinates.js';
+import { validateExistingGchatEndpoint } from './endpoint.js';
 import { assertInstanceId } from './registry.js';
 import { GwsEaError, type AllocatedPorts, type InstanceReservation } from './types.js';
 import { hasControlCharacters } from './validation.js';
@@ -56,7 +58,7 @@ export interface InstanceRuntimeInput {
   readonly selectedProvider: string;
 }
 
-export type InstanceServicePlatform = 'macos' | 'linux';
+export type { InstanceServicePlatform } from './service-coordinates.js';
 
 export interface InstanceServiceLayout {
   readonly manager: 'launchd' | 'systemd-system' | 'systemd-user';
@@ -83,6 +85,7 @@ export interface ServiceLayoutOptions {
 export interface InstanceServiceDependencies extends ServiceLayoutOptions {
   readonly runCommand?: SanitizedCommandRunner;
   readonly uid?: number;
+  readonly beforeBind?: () => Promise<void>;
 }
 
 function assertControlFree(value: string, label: string): string {
@@ -221,20 +224,10 @@ export function validateRuntimeConfig(value: unknown): InstanceRuntimeConfig {
     throw new GwsEaError('invalid_runtime_config', 'onecli_project is invalid');
   const provider = stringField(raw, 'selected_provider');
   if (!PROVIDER_PATTERN.test(provider)) throw new GwsEaError('invalid_runtime_config', 'selected_provider is invalid');
-  let endpoint: URL;
+  let endpointUrl: string;
   try {
-    endpoint = new URL(stringField(raw, 'endpoint_url'));
+    endpointUrl = validateExistingGchatEndpoint(stringField(raw, 'endpoint_url'));
   } catch {
-    throw new GwsEaError('invalid_runtime_config', 'endpoint_url is invalid');
-  }
-  if (
-    endpoint.protocol !== 'https:' ||
-    endpoint.username ||
-    endpoint.password ||
-    endpoint.search ||
-    endpoint.hash ||
-    endpoint.pathname !== '/webhook/gchat'
-  ) {
     throw new GwsEaError('invalid_runtime_config', 'endpoint_url is invalid');
   }
   const secretRaw = record(raw.secret_files, 'secret_files');
@@ -289,7 +282,7 @@ export function validateRuntimeConfig(value: unknown): InstanceRuntimeConfig {
     onecli_gateway_container: `${project}-gateway-1`,
     onecli_cli_path: onecliCliPath,
     selected_provider: provider,
-    endpoint_url: endpoint.href,
+    endpoint_url: endpointUrl,
     secret_files: secretFiles,
   };
 }
@@ -298,8 +291,8 @@ function runtimeConfigFile(config: InstanceRuntimeConfig): string {
   return path.join(config.checkout_realpath, 'data', 'gws-ea', 'runtime.json');
 }
 
-function environmentFileContents(config: InstanceRuntimeConfig): string {
-  const values: Readonly<Record<string, string>> = {
+function instanceHostConfiguration(config: InstanceRuntimeConfig): Readonly<Record<string, string>> {
+  return {
     NANOCLAW_INSTALL_ID: config.install_id,
     DEFAULT_AGENT_PROVIDER: config.selected_provider,
     NANOCLAW_GATEWAY_PROVIDER: 'onecli',
@@ -310,7 +303,10 @@ function environmentFileContents(config: InstanceRuntimeConfig): string {
     ONECLI_URL: config.onecli_app_url,
     GCHAT_ENDPOINT_URL: config.endpoint_url,
   };
-  return `${Object.entries(values)
+}
+
+function environmentFileContents(config: InstanceRuntimeConfig): string {
+  return `${Object.entries(instanceHostConfiguration(config))
     .map(([key, value]) => `${key}=${assertControlFree(value, key)}`)
     .join('\n')}\n`;
 }
@@ -364,20 +360,14 @@ export function createInstanceServiceLayout(
   if (path.resolve(options.homeDirectory) !== config.home_directory) {
     throw new GwsEaError('runtime_mismatch', 'Service home does not match the persisted runtime');
   }
-  const isRoot = options.runningAsRoot ?? process.getuid?.() === 0;
-  const serviceIdentity =
-    options.platform === 'macos' ? `com.nanoclaw-v2-${config.install_id}` : `nanoclaw-v2-${config.install_id}`;
-  const manager = options.platform === 'macos' ? 'launchd' : isRoot ? 'systemd-system' : 'systemd-user';
-  const serviceDefinitionPath =
-    manager === 'launchd'
-      ? path.join(config.home_directory, 'Library', 'LaunchAgents', `${serviceIdentity}.plist`)
-      : manager === 'systemd-system'
-        ? path.join('/etc/systemd/system', `${serviceIdentity}.service`)
-        : path.join(config.home_directory, '.config', 'systemd', 'user', `${serviceIdentity}.service`);
+  const coordinates = createInstanceServiceCoordinates({
+    installId: config.install_id,
+    homeDirectory: config.home_directory,
+    platform: options.platform,
+    runningAsRoot: options.runningAsRoot ?? process.getuid?.() === 0,
+  });
   return {
-    manager,
-    serviceIdentity,
-    serviceDefinitionPath,
+    ...coordinates,
     runtimeConfigFile: runtimeConfigFile(config),
     environmentFile: path.join(config.checkout_realpath, '.env'),
     launcherEntrypoint: path.join(config.checkout_realpath, 'dist', 'gws-ea', 'process.js'),
@@ -386,8 +376,6 @@ export function createInstanceServiceLayout(
     cliSocket: path.join(config.checkout_realpath, 'data', 'ncl.sock'),
     standardOutputPath: path.join(config.checkout_realpath, 'logs', 'nanoclaw.log'),
     standardErrorPath: path.join(config.checkout_realpath, 'logs', 'nanoclaw.error.log'),
-    imageTag: `nanoclaw-agent-v2-${config.install_id}:latest`,
-    installLabel: `nanoclaw-install=${config.install_id}`,
   };
 }
 
@@ -446,6 +434,7 @@ export async function reconcileInstanceService(
   };
   if (layout.manager === 'launchd') {
     await command('launchctl', ['unload', layout.serviceDefinitionPath]).catch(() => undefined);
+    await dependencies.beforeBind?.();
     await command('launchctl', ['load', layout.serviceDefinitionPath]);
     const uid = dependencies.uid ?? process.getuid?.();
     if (uid === undefined) throw new GwsEaError('unsupported_platform', 'launchd requires a user ID');
@@ -456,6 +445,7 @@ export async function reconcileInstanceService(
     const prefix = layout.manager === 'systemd-user' ? ['--user'] : [];
     await command('systemctl', [...prefix, 'daemon-reload']);
     await command('systemctl', [...prefix, 'enable', layout.serviceIdentity]);
+    await dependencies.beforeBind?.();
     await command('systemctl', [...prefix, 'restart', layout.serviceIdentity]);
     await command('systemctl', [...prefix, 'is-active', layout.serviceIdentity]);
   }
@@ -498,17 +488,9 @@ export async function buildInstanceHostEnvironment(
   }
   return buildAllowlistedEnvironment(ambient, {
     HOME: config.home_directory,
-    NANOCLAW_INSTALL_ID: config.install_id,
-    DEFAULT_AGENT_PROVIDER: config.selected_provider,
-    NANOCLAW_GATEWAY_PROVIDER: 'onecli',
-    WEBHOOK_PORT: String(config.allocated_ports.nanoclaw_webhook),
-    NANOCLAW_EGRESS_LOCKDOWN: 'true',
-    NANOCLAW_EGRESS_NETWORK: config.agent_egress_network,
-    ONECLI_GATEWAY_CONTAINER: config.onecli_gateway_container,
-    ONECLI_URL: config.onecli_app_url,
+    ...instanceHostConfiguration(config),
     ONECLI_API_KEY: onecliRuntimeApiKey.trim(),
     GCHAT_CREDENTIALS: gchatCredentials,
-    GCHAT_ENDPOINT_URL: config.endpoint_url,
   });
 }
 

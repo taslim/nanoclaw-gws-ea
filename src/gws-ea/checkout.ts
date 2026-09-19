@@ -1,4 +1,3 @@
-import { spawn } from 'node:child_process';
 import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,11 +12,11 @@ import {
   type ControlPlanePaths,
 } from './paths.js';
 import { assertRegistryMarkerAgreement, getInstanceReservation } from './registry.js';
+import { runSanitizedCommand, type SanitizedCommandResult, type SanitizedCommandRunner } from './process.js';
 import { GwsEaError, INSTANCE_MARKER_SCHEMA_VERSION, type InstanceMarker, type InstanceReservation } from './types.js';
 import { isRecord } from './validation.js';
 
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
-const MAX_COMMAND_OUTPUT_BYTES = 2 * 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
 
 export interface CommandSpec {
@@ -28,10 +27,7 @@ export interface CommandSpec {
   timeoutMs?: number;
 }
 
-export interface CommandResult {
-  stdout: string;
-  stderr: string;
-}
+export type CommandResult = SanitizedCommandResult;
 
 export type CommandRunner = (spec: CommandSpec) => Promise<CommandResult>;
 
@@ -84,68 +80,14 @@ function fetchEnvironment(
   return result;
 }
 
-function appendOutput(current: string, chunk: Buffer, childCommand: string): string {
-  if (Buffer.byteLength(current) + chunk.byteLength > MAX_COMMAND_OUTPUT_BYTES) {
-    throw new GwsEaError('command_output_limit', `${childCommand} produced too much output`);
-  }
-  return current + chunk.toString('utf8');
-}
-
 /** Execute one binary directly. Arguments are never interpreted by a shell. */
-export function runArgumentCommand(spec: CommandSpec): Promise<CommandResult> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(spec.command, [...spec.args], {
-      cwd: spec.cwd,
-      env: spec.env,
-      shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let stdout = '';
-    let stderr = '';
-    let settled = false;
-
-    const fail = (error: unknown): void => {
-      if (settled) return;
-      settled = true;
-      child.kill('SIGKILL');
-      reject(error);
-    };
-
-    child.stdout.on('data', (chunk: Buffer) => {
-      try {
-        stdout = appendOutput(stdout, chunk, spec.command);
-      } catch (error) {
-        if (!(error instanceof GwsEaError)) throw error;
-        fail(error);
-      }
-    });
-    child.stderr.on('data', (chunk: Buffer) => {
-      try {
-        stderr = appendOutput(stderr, chunk, spec.command);
-      } catch (error) {
-        if (!(error instanceof GwsEaError)) throw error;
-        fail(error);
-      }
-    });
-    child.once('error', (error) => {
-      fail(new GwsEaError('command_failed', `Could not execute ${spec.command}: ${error.message}`));
-    });
-    child.once('close', (code, signal) => {
-      if (settled) return;
-      settled = true;
-      if (code === 0) {
-        resolve({ stdout, stderr });
-        return;
-      }
-      const outcome = signal ? `signal ${signal}` : `exit code ${String(code)}`;
-      reject(new GwsEaError('command_failed', `${spec.command} failed with ${outcome}`));
-    });
-
-    const timeout = setTimeout(() => {
-      fail(new GwsEaError('command_timeout', `${spec.command} exceeded its execution timeout`));
-    }, spec.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS);
-    timeout.unref();
-    child.once('close', () => clearTimeout(timeout));
+export async function runArgumentCommand(spec: CommandSpec): Promise<CommandResult> {
+  const run: SanitizedCommandRunner = runSanitizedCommand;
+  return run({
+    ...spec,
+    cwd: spec.cwd ?? process.cwd(),
+    timeoutMs: spec.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS,
+    outputLimitBytes: 2 * 1024 * 1024,
   });
 }
 

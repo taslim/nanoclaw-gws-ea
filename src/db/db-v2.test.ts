@@ -3,6 +3,7 @@ import { sqliteRaw } from './drivers/sqlite.js';
 
 import {
   initSqliteTestDb,
+  getDb,
   closeDb,
   runMigrations,
   createAgentGroup,
@@ -271,6 +272,20 @@ describe('messaging group agents', () => {
     expect(dest).toBeDefined();
     expect(dest!.local_name).toBe('gen'); // normalized from mg.name='Gen'
     expect(await getDestinations('ag-1')).toHaveLength(1);
+  });
+
+  it('rolls back the wiring when its companion destination cannot be created', async () => {
+    const db = getDb();
+    await db.exec(`
+      CREATE TRIGGER fail_test_destination
+      BEFORE INSERT ON agent_destinations
+      BEGIN
+        SELECT RAISE(ABORT, 'destination unavailable');
+      END
+    `);
+
+    await expect(createMessagingGroupAgent({ ...mga(), threads: 1 })).rejects.toThrow(/destination unavailable/);
+    expect(await getMessagingGroupAgent('mga-1')).toBeUndefined();
   });
 
   it('does not duplicate destination row on re-wiring', async () => {

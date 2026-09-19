@@ -50,6 +50,7 @@ import { initDb } from '../src/db/connection.js';
 import {
   createMessagingGroup,
   createMessagingGroupAgent,
+  ensureAgentDestinationForWiring,
   getMessagingGroupAgentByPair,
   getMessagingGroupByPlatform,
 } from '../src/db/messaging-groups.js';
@@ -307,10 +308,11 @@ async function wireIfMissing(
   const existing = await getMessagingGroupAgentByPair(mg.id, ag.id);
   if (existing) {
     // Preserve the vanilla script's historical idempotence: ordinary reruns
-    // never reinterpret or repair an existing wiring. Exact fail-closed
-    // comparison is reserved for callers opting into the new explicit
-    // principal-session semantics.
+    // never reinterpret an existing wiring. Reconcile only its derived
+    // destination; exact fail-closed comparison is reserved for callers
+    // opting into the new explicit principal-session semantics.
     if (senderScope === undefined && sessionMode === undefined) {
+      await ensureAgentDestinationForWiring(existing);
       console.log(`Wiring already exists: ${existing.id} (${label})`);
       return;
     }
@@ -327,6 +329,7 @@ async function wireIfMissing(
     if (mismatched.length > 0) {
       throw new Error(`Existing wiring ${existing.id} does not match requested bootstrap: ${mismatched.join(', ')}`);
     }
+    await ensureAgentDestinationForWiring(existing);
     console.log(`Wiring already exists: ${existing.id} (${label})`);
     return;
   }

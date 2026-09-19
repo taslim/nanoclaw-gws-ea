@@ -161,6 +161,23 @@ describe('scripts/init-first-agent.ts --instance', () => {
     }
   }
 
+  function destinationCount(agentGroupId: string): number {
+    const db = new Database(path.join(cwd, 'data', 'v2.db'), { readonly: true });
+    try {
+      return (
+        db
+          .prepare(
+            `SELECT count(*) AS count
+               FROM agent_destinations
+              WHERE agent_group_id = ? AND target_type = 'channel'`,
+          )
+          .get(agentGroupId) as { count: number }
+      ).count;
+    } finally {
+      db.close();
+    }
+  }
+
   it('creates the DM row for the named instance and addresses the welcome to it', async () => {
     const w = welcome();
     const r = await run(['--instance', 'telegram-mega']);
@@ -215,7 +232,7 @@ describe('scripts/init-first-agent.ts --instance', () => {
     expect(fs.existsSync(path.join(cwd, 'data', 'v2.db'))).toBe(false);
   }, 60_000);
 
-  it('persists the verified DM before one exact known agent-shared wiring and safely repeats it', async () => {
+  it('persists the verified DM and repairs its destination when resuming an interrupted wiring', async () => {
     const seedWelcome = welcome();
     const seeded = await run(['--instance', 'telegram-mega']);
     expect(seeded.status, seeded.stderr).toBe(0);
@@ -247,10 +264,18 @@ describe('scripts/init-first-agent.ts --instance', () => {
     expect(first.status, first.stderr).toBe(0);
     expect((await firstWelcome).id).toBe('gws-ea-welcome:stable');
 
+    const interrupted = new Database(path.join(cwd, 'data', 'v2.db'));
+    interrupted
+      .prepare("DELETE FROM agent_destinations WHERE agent_group_id = ? AND target_type = 'channel'")
+      .run(targetGroupId);
+    interrupted.close();
+    expect(destinationCount(targetGroupId)).toBe(0);
+
     const secondWelcome = welcome();
     const second = await run(flags);
     expect(second.status, second.stderr).toBe(0);
     expect((await secondWelcome).id).toBe('gws-ea-welcome:stable');
+    expect(destinationCount(targetGroupId)).toBe(1);
     expect(bootstrapRows()).toEqual({
       userDms: 1,
       roles: 1,

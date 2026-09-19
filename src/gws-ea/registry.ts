@@ -5,6 +5,7 @@ import { readJson, writePrivate } from '../community-portal/private-file.js';
 import { processLock } from '../community-portal/process-lock.js';
 import { isErrno } from '../community-portal/errors.js';
 import { deriveGchatServiceAccountEmail, GCP_PROJECT_PATTERN } from './gcp-identity.js';
+import { validateExistingGchatEndpoint } from './endpoint.js';
 import {
   assertLocalOwnedDestination,
   assertOwnedLocalDirectory,
@@ -78,26 +79,14 @@ function validatePorts(value: unknown): AllocatedPorts {
 
 function validateEndpoint(value: unknown): string {
   const raw = requireString(value, 'endpoint_url');
-  let endpoint: URL;
   try {
-    endpoint = new URL(raw);
+    return validateExistingGchatEndpoint(raw);
   } catch {
-    throw new GwsEaError('invalid_claim', 'Endpoint URL is invalid');
-  }
-  if (
-    endpoint.protocol !== 'https:' ||
-    endpoint.username ||
-    endpoint.password ||
-    endpoint.search ||
-    endpoint.hash ||
-    endpoint.pathname !== '/webhook/gchat'
-  ) {
     throw new GwsEaError(
       'invalid_claim',
       'Endpoint must be an HTTPS URL with the exact /webhook/gchat path and no credentials, query, or fragment',
     );
   }
-  return endpoint.href;
 }
 
 function validateSourceRemote(value: unknown): string {

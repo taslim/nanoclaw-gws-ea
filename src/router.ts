@@ -454,6 +454,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     await recordDroppedMessage({
       channel_type: event.channelType,
       platform_id: event.platformId,
+      instance: mg.instance ?? event.channelType,
       user_id: userId,
       sender_name: parsed.sender ?? null,
       reason: 'no_agent_engaged',
