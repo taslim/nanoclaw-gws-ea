@@ -20,6 +20,7 @@ export interface ControlPlanePaths {
   journalFile(instanceId: string): string;
   instanceLock(instanceId: string): string;
   markerFile(instanceId: string): string;
+  bootstrapFile(instanceId: string): string;
 }
 
 const REMOTE_FILESYSTEM_TYPES = new Set([
@@ -77,6 +78,7 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
     journalFile: (instanceId) => path.join(instanceRoot(instanceId), 'provision.json'),
     instanceLock: (instanceId) => path.join(instanceRoot(instanceId), 'operation.lock'),
     markerFile: (instanceId) => path.join(checkoutRoot(instanceId), 'data', 'gws-ea', 'instance.json'),
+    bootstrapFile: (instanceId) => path.join(instanceRoot(instanceId), 'bootstrap.json'),
   };
 }
 

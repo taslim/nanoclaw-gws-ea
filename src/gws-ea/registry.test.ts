@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { runCli } from './cli.js';
+import type { InstanceOperation } from './journal.js';
 import {
   allocateInstanceId,
   assertRegistryMarkerAgreement,
@@ -12,7 +13,7 @@ import {
   writeInstanceMarker,
 } from './registry.js';
 import { isLocalFilesystemType, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
-import type { InstanceReservationInput } from './types.js';
+import { GwsEaError, type InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
 
@@ -79,6 +80,14 @@ function createArgs(): string[] {
     '--workspace-email',
     'assistant@example.test',
   ];
+}
+
+function withoutOptions(args: readonly string[], names: ReadonlySet<string>): string[] {
+  const result: string[] = args.slice(0, 2);
+  for (let index = 2; index < args.length; index += 2) {
+    if (!names.has(args[index]!)) result.push(args[index]!, args[index + 1]!);
+  }
+  return result;
 }
 
 function waitForExit(child: ChildProcess): Promise<number | null> {
@@ -266,6 +275,111 @@ describe('machine registry', () => {
 });
 
 describe('create recovery contract', () => {
+  it('connects the owner-only setup surface to create and fresh-process resume', async () => {
+    const paths = await testPaths();
+    const inputRoot = path.join(path.dirname(paths.configRoot), 'bootstrap-input');
+    await mkdir(inputRoot, { recursive: true, mode: 0o700 });
+    const providerFile = path.join(inputRoot, 'provider-key');
+    const gchatFile = path.join(inputRoot, 'gchat-key.json');
+    const setupFile = path.join(inputRoot, 'setup.json');
+    await writeFile(providerFile, 'provider-secret', { mode: 0o600 });
+    await writeFile(gchatFile, '{"private_key":"gchat-secret"}', { mode: 0o600 });
+    await writeFile(
+      setupFile,
+      JSON.stringify({
+        schema_version: 1,
+        onecli_cli_path: '/usr/local/bin/onecli',
+        node_path: process.execPath,
+        home_directory: path.dirname(paths.stateRoot),
+        platform: process.platform === 'darwin' ? 'macos' : 'linux',
+        running_as_root: false,
+        provider: {
+          id: 'claude',
+          name: 'Claude provider',
+          type: 'api_key',
+          host_pattern: 'api.anthropic.com',
+          credential_file: providerFile,
+          header_name: 'x-api-key',
+        },
+        identity: {
+          assistant_display_name: 'Aya',
+          principal_display_name: 'Principal',
+          principal_timezone: 'America/Los_Angeles',
+        },
+        gchat: { bot_user_id: 'users/assistant-bot', credential_file: gchatFile },
+        provisioning_started_at: '2026-09-18T18:00:00.000Z',
+        selected_messaging_group_id: null,
+      }),
+      { mode: 0o600 },
+    );
+    const advanced: string[] = [];
+    const advanceProvision = async (operation: InstanceOperation) => {
+      advanced.push(operation.instanceId);
+      return {
+        status: 'paused' as const,
+        pause: {
+          kind: 'human-action' as const,
+          phase: 'bind_principal' as const,
+          code: 'principal_dm_required',
+          message: 'Send the direct message.',
+        },
+      };
+    };
+    const output: string[] = [];
+    const productionPorts = { nanoclaw_webhook: 34_101, onecli_app: 34_102, onecli_gateway: 34_103 };
+    const resolvedCommit = 'b'.repeat(40);
+    const resolveCalls: Array<[string, string]> = [];
+    let portsReleased = false;
+    expect(
+      await runCli(
+        [
+          ...withoutOptions(
+            createArgs(),
+            new Set(['--deployed-commit', '--webhook-port', '--onecli-app-port', '--onecli-gateway-port']),
+          ),
+          '--setup-file',
+          setupFile,
+        ],
+        {
+          paths,
+          stdout: (line) => output.push(line),
+          stderr: () => undefined,
+          advanceProvision,
+          resolveRelease: async (sourceRemote, releaseRef) => {
+            resolveCalls.push([sourceRemote, releaseRef]);
+            return { sourceRemote, releaseRef, commit: resolvedCommit };
+          },
+          holdLoopbackPorts: async () => ({
+            ports: productionPorts,
+            release: async () => {
+              portsReleased = true;
+            },
+          }),
+        },
+      ),
+    ).toBe(0);
+    const instanceId = output[0]!.slice('instance_id: '.length);
+    expect(resolveCalls).toEqual([['https://example.test/nanoclaw.git', 'refs/heads/dogfood']]);
+    expect(portsReleased).toBe(true);
+    expect((await readRegistry(paths)).instances[instanceId]).toMatchObject({
+      deployed_commit: resolvedCommit,
+      allocated_ports: productionPorts,
+    });
+    const persistedBootstrap = await readFile(paths.bootstrapFile(instanceId), 'utf8');
+    expect(persistedBootstrap).not.toContain('provider-secret');
+    expect(persistedBootstrap).not.toContain('gchat-secret');
+
+    expect(
+      await runCli(['assistants', 'resume', '--id', instanceId], {
+        paths,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        advanceProvision,
+      }),
+    ).toBe(0);
+    expect(advanced).toEqual([instanceId, instanceId]);
+  });
+
   it('creates durable state and resumes the first incomplete phase without changing claims', async () => {
     const paths = await testPaths();
     const createOutput: string[] = [];
@@ -304,6 +418,59 @@ describe('create recovery contract', () => {
     expect(exitCode).toBe(1);
     expect(stdout).toEqual([]);
     expect(stderr.join('\n')).toContain('gws-ea assistants create --track dogfood');
+    expect((await readRegistry(paths)).instances).toEqual({});
+  });
+
+  it('leaves no registry state when production track resolution fails before reservation', async () => {
+    const paths = await testPaths();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const args = withoutOptions(
+      createArgs(),
+      new Set(['--deployed-commit', '--webhook-port', '--onecli-app-port', '--onecli-gateway-port']),
+    );
+    const exitCode = await runCli([...args, '--setup-file', '/private/tmp/not-read-before-resolution.json'], {
+      paths,
+      stdout: (line) => stdout.push(line),
+      stderr: (line) => stderr.push(line),
+      resolveRelease: async () => {
+        throw new GwsEaError('release_resolution_failed', 'Release track could not be resolved');
+      },
+      holdLoopbackPorts: async () => {
+        throw new Error('ports must not be allocated after failed release resolution');
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(stdout[0]).toMatch(/^instance_id: [0-9a-f-]{36}$/u);
+    expect(stderr.join('\n')).toContain('gws-ea assistants create --track dogfood');
+    expect((await readRegistry(paths)).instances).toEqual({});
+  });
+
+  it('leaves no registry state when production setup input is invalid', async () => {
+    const paths = await testPaths();
+    const setupFile = path.join(path.dirname(paths.configRoot), 'invalid-setup.json');
+    await writeFile(setupFile, '{invalid-json', { mode: 0o600 });
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const args = withoutOptions(
+      createArgs(),
+      new Set(['--deployed-commit', '--webhook-port', '--onecli-app-port', '--onecli-gateway-port']),
+    );
+
+    const exitCode = await runCli([...args, '--setup-file', setupFile], {
+      paths,
+      stdout: (line) => stdout.push(line),
+      stderr: (line) => stderr.push(line),
+      resolveRelease: async (sourceRemote, releaseRef) => ({ sourceRemote, releaseRef, commit: 'b'.repeat(40) }),
+      holdLoopbackPorts: async () => {
+        throw new Error('ports must not be allocated for invalid setup input');
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(stdout[0]).toMatch(/^instance_id: [0-9a-f-]{36}$/u);
+    expect(stderr.join('\n')).toContain('Bootstrap manifest is not valid JSON');
     expect((await readRegistry(paths)).instances).toEqual({});
   });
 

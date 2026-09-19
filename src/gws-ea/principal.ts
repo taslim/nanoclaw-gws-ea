@@ -175,7 +175,11 @@ async function defaultRunBootstrap(
   });
 }
 
-function eventId(config: InstanceRuntimeConfig, mainAgentGroupId: string, candidate: PrincipalCandidate): string {
+export function principalWelcomeEventId(
+  config: Pick<InstanceRuntimeConfig, 'instance_id'>,
+  mainAgentGroupId: string,
+  candidate: PrincipalCandidate,
+): string {
   const digest = createHash('sha256')
     .update(
       [config.instance_id, mainAgentGroupId, candidate.messagingGroupId, candidate.authenticatedMessageId].join('\0'),
@@ -238,7 +242,7 @@ export async function reconcilePrincipalDm(
     [selected] = candidates;
   }
 
-  const stableEventId = eventId(config, profile.mainAgentGroupId, selected);
+  const stableEventId = principalWelcomeEventId(config, profile.mainAgentGroupId, selected);
   const binding = unwrapData(
     await runNcl(config, [
       'gws-ea-profile',
