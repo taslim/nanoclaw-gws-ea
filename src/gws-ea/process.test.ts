@@ -1,11 +1,25 @@
-import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { buildAllowlistedEnvironment, resolveTrustedExecutable, runSanitizedCommand } from './process.js';
 
 describe('GWS-EA process boundary', () => {
+  let trustedNodeRoot: string;
+  let trustedNode: string;
+
+  beforeAll(async () => {
+    trustedNodeRoot = await mkdtemp(path.join(process.cwd(), '.gws-ea-test-node-'));
+    trustedNode = path.join(trustedNodeRoot, 'node');
+    await copyFile(process.execPath, trustedNode);
+    await chmod(trustedNode, 0o755);
+  });
+
+  afterAll(async () => {
+    await rm(trustedNodeRoot, { recursive: true, force: true });
+  });
+
   it('copies only inert operating-system values and explicit overrides', () => {
     const environment = buildAllowlistedEnvironment(
       {
@@ -30,7 +44,7 @@ describe('GWS-EA process boundary', () => {
 
   it('executes an argument array without a shell or ambient environment', async () => {
     const result = await runSanitizedCommand({
-      command: process.execPath,
+      command: trustedNode,
       args: [
         '--input-type=module',
         '--eval',
@@ -52,7 +66,7 @@ describe('GWS-EA process boundary', () => {
     process.env[canaryKey] = 'must-not-cross';
     try {
       const result = await runSanitizedCommand({
-        command: process.execPath,
+        command: trustedNode,
         args: ['--eval', `process.stdout.write(String(process.env.${canaryKey}))`],
         cwd: process.cwd(),
       });
@@ -65,23 +79,23 @@ describe('GWS-EA process boundary', () => {
   it('ignores an executable planted in a publicly writable PATH ancestor', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-hostile-path-'));
     const directory = path.join(root, 'public-bin');
-    const executableName = path.basename(process.execPath);
+    const executableName = path.basename(trustedNode);
     try {
       await mkdir(directory, { mode: 0o777 });
       await chmod(directory, 0o777);
       await writeFile(path.join(directory, executableName), '#!/bin/sh\nexit 99\n', { mode: 0o755 });
       const resolved = await resolveTrustedExecutable(
         executableName,
-        `${directory}${path.delimiter}${path.dirname(process.execPath)}`,
+        `${directory}${path.delimiter}${path.dirname(trustedNode)}`,
       );
       const child = await runSanitizedCommand({
         command: executableName,
         args: ['--eval', 'process.stdout.write(process.env.PATH ?? "")'],
         cwd: process.cwd(),
-        env: { PATH: `${directory}${path.delimiter}${path.dirname(process.execPath)}` },
+        env: { PATH: `${directory}${path.delimiter}${path.dirname(trustedNode)}` },
       });
 
-      expect(resolved).toBe(await realpath(process.execPath));
+      expect(resolved).toBe(await realpath(trustedNode));
       expect(child.stdout.split(path.delimiter)).not.toContain(await realpath(directory));
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -106,7 +120,7 @@ describe('GWS-EA process boundary', () => {
 
   it('accepts executables owned by root or the current user', async () => {
     await expect(resolveTrustedExecutable('/bin/sh')).resolves.toMatch(/^\//u);
-    await expect(resolveTrustedExecutable(process.execPath)).resolves.toMatch(/^\//u);
+    await expect(resolveTrustedExecutable(trustedNode)).resolves.toMatch(/^\//u);
   });
 
   it('trusts only the running Node executable through managed installation ancestors', async () => {
