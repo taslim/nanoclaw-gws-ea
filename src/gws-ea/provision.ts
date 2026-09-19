@@ -124,7 +124,7 @@ export interface ProductionProvisionInput {
   readonly providerCredentialMetadata?: ProviderCredentialMetadata;
   readonly providerCredential?: ProviderCredential;
   readonly requestProviderCredential?: () => Promise<ProviderCredential>;
-  readonly identity: Omit<MainIdentityInput, 'providerSecretId'>;
+  readonly identity: MainIdentityInput;
   readonly adapterInstance: string;
   readonly provisioningStartedAt: string;
   readonly selectedMessagingGroupId?: string;
@@ -404,9 +404,28 @@ async function defaultProbeProvider(context: ProductionProvisionContext): Promis
   }
 }
 
-async function defaultProbeNanoclaw(context: ProductionProvisionContext): Promise<PhaseProbeResult> {
+type MainAccessExpectation =
+  | { readonly mode: 'all' }
+  | { readonly mode: 'legacy-selective'; readonly providerSecretId: string };
+
+async function runNanoclawProbeNcl(context: ProductionProvisionContext, args: readonly string[]): Promise<unknown> {
+  const run = context.input.identityDependencies?.runNcl ?? runInstanceNclJson;
+  return run(context.input.runtime, args);
+}
+
+async function runNanoclawProbeOnecli(context: ProductionProvisionContext, args: readonly string[]): Promise<unknown> {
+  const run = context.input.identityDependencies?.runOnecliAdmin;
+  if (run) return run(context.input.runtime, args);
+  const result = await runInstanceOnecliAdminCommand(context.input.runtime, args);
+  return parseJson(result.stdout, 'OneCLI');
+}
+
+async function probeNanoclawAccess(
+  context: ProductionProvisionContext,
+  expectation: MainAccessExpectation,
+): Promise<PhaseProbeResult> {
   try {
-    const profileValue = unwrapData(await runInstanceNclJson(context.input.runtime, ['gws-ea-profile', 'get']));
+    const profileValue = unwrapData(await runNanoclawProbeNcl(context, ['gws-ea-profile', 'get']));
     if (!isRecord(profileValue)) return { status: 'absent' };
     const mainAgentGroupId = stringField(profileValue, 'main_agent_group_id');
     if (
@@ -419,8 +438,8 @@ async function defaultProbeNanoclaw(context: ProductionProvisionContext): Promis
       return { status: 'absent' };
     }
     const [groupValue, configValue] = await Promise.all([
-      runInstanceNclJson(context.input.runtime, ['groups', 'get', '--id', mainAgentGroupId]).then(unwrapData),
-      runInstanceNclJson(context.input.runtime, ['groups', 'config', 'get', '--id', mainAgentGroupId]).then(unwrapData),
+      runNanoclawProbeNcl(context, ['groups', 'get', '--id', mainAgentGroupId]).then(unwrapData),
+      runNanoclawProbeNcl(context, ['groups', 'config', 'get', '--id', mainAgentGroupId]).then(unwrapData),
     ]);
     if (
       !isRecord(groupValue) ||
@@ -430,24 +449,22 @@ async function defaultProbeNanoclaw(context: ProductionProvisionContext): Promis
     ) {
       return { status: 'absent' };
     }
-    const providerSecretId = context.state.providerSecretId;
-    if (!providerSecretId) return { status: 'absent' };
-    const agentsResult = await runInstanceOnecliAdminCommand(context.input.runtime, ['agents', 'list', '--max', '0']);
-    const agents = unwrapData(parseJson(agentsResult.stdout, 'OneCLI'));
+    const agents = unwrapData(await runNanoclawProbeOnecli(context, ['agents', 'list', '--max', '0']));
     if (!Array.isArray(agents) || !agents.every(isRecord)) return { status: 'absent' };
     const matching = agents.filter((agent) => agent.identifier === mainAgentGroupId);
-    if (matching.length !== 1 || matching[0]!.secretMode !== 'selective') return { status: 'absent' };
-    const agentId = stringField(matching[0]!, 'id');
-    if (!agentId) return { status: 'absent' };
-    const secretResult = await runInstanceOnecliAdminCommand(context.input.runtime, [
-      'agents',
-      'secrets',
-      '--id',
-      agentId,
-    ]);
-    const secrets = unwrapData(parseJson(secretResult.stdout, 'OneCLI'));
-    if (!Array.isArray(secrets) || secrets.length !== 1 || secrets[0] !== providerSecretId) {
+    const agent = matching[0];
+    const agentId = agent ? stringField(agent, 'id') : undefined;
+    if (matching.length !== 1 || !agentId || agent!.name !== 'main') {
       return { status: 'absent' };
+    }
+    if (expectation.mode === 'all') {
+      if (agent!.secretMode !== 'all') return { status: 'absent' };
+    } else {
+      if (agent!.secretMode !== 'selective') return { status: 'absent' };
+      const secrets = unwrapData(await runNanoclawProbeOnecli(context, ['agents', 'secrets', '--id', agentId]));
+      if (!Array.isArray(secrets) || secrets.length !== 1 || secrets[0] !== expectation.providerSecretId) {
+        return { status: 'absent' };
+      }
     }
     context.state.mainAgentGroupId = mainAgentGroupId;
     return { status: 'matched' };
@@ -457,6 +474,10 @@ async function defaultProbeNanoclaw(context: ProductionProvisionContext): Promis
     }
     throw error;
   }
+}
+
+async function defaultProbeNanoclaw(context: ProductionProvisionContext): Promise<PhaseProbeResult> {
+  return probeNanoclawAccess(context, { mode: 'all' });
 }
 
 async function bootstrapManifestRemoved(file: string | undefined): Promise<boolean> {
@@ -799,7 +820,7 @@ export function createProductionProvisionRegistry(
         );
         const main = await dependencies.reconcileMainIdentity(
           value.input.runtime,
-          { ...value.input.identity, providerSecretId: value.state.providerSecretId },
+          value.input.identity,
           value.input.identityDependencies,
         );
         value.state.mainAgentGroupId = main.agentGroupId;
@@ -807,6 +828,21 @@ export function createProductionProvisionRegistry(
           await removePrivateFile(value.input.bootstrapManifestFile);
         }
         return { status: 'completed' };
+      },
+      reconcileCompletedPostcondition: async (value) => {
+        const providerSecretId = value.state.providerSecretId;
+        const legacyState = providerSecretId
+          ? await probeNanoclawAccess(value, { mode: 'legacy-selective', providerSecretId })
+          : { status: 'absent' as const };
+        if (legacyState.status !== 'matched' || !(await bootstrapManifestRemoved(value.input.bootstrapManifestFile))) {
+          throw new GwsEaError('postcondition_drift', 'Completed phase postcondition drifted: start_nanoclaw');
+        }
+        const main = await dependencies.reconcileMainIdentity(
+          value.input.runtime,
+          value.input.identity,
+          value.input.identityDependencies,
+        );
+        value.state.mainAgentGroupId = main.agentGroupId;
       },
     },
     establish_transport: {
@@ -926,10 +962,14 @@ async function assertCompletedPostcondition<Context>(
   definition: ProvisionPhaseRegistry<Context>[ProvisionPhase],
   context: Context,
 ): Promise<void> {
-  const observation = await definition.probe(context);
-  if (observation.status !== 'matched') {
-    throw new GwsEaError('postcondition_drift', `Completed phase postcondition drifted: ${phase}`);
+  let observation = await definition.probe(context);
+  if (observation.status === 'matched') return;
+  if (observation.status === 'absent' && definition.reconcileCompletedPostcondition) {
+    await definition.reconcileCompletedPostcondition(context);
+    observation = await definition.probe(context);
+    if (observation.status === 'matched') return;
   }
+  throw new GwsEaError('postcondition_drift', `Completed phase postcondition drifted: ${phase}`);
 }
 
 /**
@@ -1246,26 +1286,9 @@ function readPersistedProfile(runtime: InstanceRuntimeConfig): PersistedProfileI
   }
 }
 
-async function hydrateMainState(
-  runtime: InstanceRuntimeConfig,
-  profile: PersistedProfileIdentity | undefined,
-): Promise<ProductionProvisionState> {
+function hydrateMainState(profile: PersistedProfileIdentity | undefined): ProductionProvisionState {
   if (!profile) return {};
-  const agents = unwrapData(
-    parseJson((await runInstanceOnecliAdminCommand(runtime, ['agents', 'list', '--max', '0'])).stdout, 'OneCLI'),
-  );
-  if (!Array.isArray(agents) || !agents.every(isRecord)) return {};
-  const agent = agents.find((candidate) => candidate.identifier === profile.main_agent_group_id);
-  const agentId = agent ? stringField(agent, 'id') : undefined;
-  if (!agentId) return {};
-  const secrets = unwrapData(
-    parseJson((await runInstanceOnecliAdminCommand(runtime, ['agents', 'secrets', '--id', agentId])).stdout, 'OneCLI'),
-  );
-  if (!Array.isArray(secrets) || secrets.length !== 1 || typeof secrets[0] !== 'string') return {};
-  return {
-    providerSecretId: secrets[0],
-    mainAgentGroupId: profile.main_agent_group_id,
-  };
+  return { mainAgentGroupId: profile.main_agent_group_id };
 }
 
 function firstProvisionIntent(journal: ProvisionJournal): string | undefined {
@@ -1375,7 +1398,7 @@ export async function runProductionProvision(
         principalDisplayName: profile!.principal_display_name,
         principalTimezone: profile!.principal_timezone,
       };
-  const state = await hydrateMainState(runtime, profile);
+  const state = hydrateMainState(profile);
   const context: ProductionProvisionContext = {
     operation,
     state,

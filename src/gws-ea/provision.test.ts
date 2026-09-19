@@ -18,6 +18,7 @@ import {
   type ProductionProvisionDependencies,
 } from './provision.js';
 import { defineProvisionPhaseRegistry, type ProvisionPhaseDefinition } from './phases.js';
+import type { MainIdentityDependencies } from './identity.js';
 import { reserveInstance } from './registry.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import type { OnecliCompatibilityReceipt } from './onecli.js';
@@ -397,7 +398,135 @@ function productionContext(
   };
 }
 
+interface ProbeIdentityState {
+  agents: Array<{ id: string; identifier: string; name: string; secretMode: 'all' | 'selective' }>;
+  readonly onecliCalls: string[][];
+  readonly providerSecretIds: string[];
+}
+
+function probeIdentityDependencies(
+  context: ProductionProvisionContext,
+  state: ProbeIdentityState,
+): MainIdentityDependencies {
+  return {
+    runNcl: async (_runtime, args) => {
+      if (args[0] === 'gws-ea-profile' && args[1] === 'get') {
+        return {
+          assistant_display_name: context.input.identity.assistantDisplayName,
+          assistant_workspace_email: context.input.identity.assistantWorkspaceEmail,
+          principal_display_name: context.input.identity.principalDisplayName,
+          principal_timezone: context.input.identity.principalTimezone,
+          main_agent_group_id: 'ag-main',
+        };
+      }
+      if (args[0] === 'groups' && args[1] === 'get') return { id: 'ag-main', name: 'main' };
+      if (args[0] === 'groups' && args[1] === 'config' && args[2] === 'get') {
+        return { provider: context.input.runtime.selected_provider };
+      }
+      throw new Error(`Unexpected ncl probe call: ${args.join(' ')}`);
+    },
+    runOnecliAdmin: async (_runtime, args) => {
+      state.onecliCalls.push([...args]);
+      if (args[0] === 'agents' && args[1] === 'list') return state.agents;
+      if (args[0] === 'agents' && args[1] === 'secrets') return state.providerSecretIds;
+      throw new Error(`Unexpected OneCLI probe call: ${args.join(' ')}`);
+    },
+  };
+}
+
 describe('production provision phase composition', () => {
+  it('accepts only an all-mode canonical main without enumerating its grants', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation(paths));
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const base = productionContext(operation, reserved);
+      const state: ProbeIdentityState = {
+        agents: [{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'all' }],
+        onecliCalls: [],
+        providerSecretIds: ['secret-provider'],
+      };
+      const context: ProductionProvisionContext = {
+        ...base,
+        input: { ...base.input, identityDependencies: probeIdentityDependencies(base, state) },
+      };
+      const phase = createProductionProvisionRegistry(context).start_nanoclaw;
+
+      await expect(phase.probe(context)).resolves.toEqual({ status: 'matched' });
+      expect(state.onecliCalls).toEqual([['agents', 'list', '--max', '0']]);
+
+      state.agents = [{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'selective' }];
+      state.onecliCalls.length = 0;
+      await expect(phase.probe(context)).resolves.toEqual({ status: 'absent' });
+      expect(state.onecliCalls).toEqual([['agents', 'list', '--max', '0']]);
+    });
+  });
+
+  it('upgrades only canonical main when a completed selective installation resumes', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation(paths));
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const initial = productionContext(operation, reserved);
+      const completedDefinition = (phase: ProvisionPhase): ProvisionPhaseDefinition<ProductionProvisionContext> => ({
+        resourceKey: () => `legacy:${'a'.repeat(64)}`,
+        probe: async (value) => {
+          if (phase === 'configure_provider') value.state.providerSecretId = 'secret-provider';
+          return { status: 'matched' };
+        },
+        apply: async () => ({ status: 'completed' }),
+      });
+      const completedRegistry = defineProvisionPhaseRegistry(
+        Object.fromEntries(
+          PROVISION_PHASES.map((phase) => [phase, completedDefinition(phase)]),
+        ) as unknown as Parameters<typeof defineProvisionPhaseRegistry<ProductionProvisionContext>>[0],
+      );
+      await expect(reconcileProvisioning(operation, initial, completedRegistry)).resolves.toEqual({ status: 'ready' });
+
+      const identityState: ProbeIdentityState = {
+        agents: [
+          { id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'selective' },
+          { id: 'oc-other', identifier: 'ag-other', name: 'other', secretMode: 'selective' },
+        ],
+        onecliCalls: [],
+        providerSecretIds: ['secret-provider'],
+      };
+      const resumedBase: ProductionProvisionContext = { ...productionContext(operation, reserved), state: {} };
+      const resumed: ProductionProvisionContext = {
+        ...resumedBase,
+        input: {
+          ...resumedBase.input,
+          identityDependencies: probeIdentityDependencies(resumedBase, identityState),
+        },
+      };
+      const reconcileMainIdentity = vi.fn(async () => {
+        identityState.agents = identityState.agents.map((agent) =>
+          agent.id === 'oc-main' ? { ...agent, secretMode: 'all' as const } : agent,
+        );
+        return { agentGroupId: 'ag-main', onecliAgentId: 'oc-main' };
+      });
+      const production = createProductionProvisionRegistry(resumed, { reconcileMainIdentity });
+      const resumedRegistry = defineProvisionPhaseRegistry(
+        Object.fromEntries(
+          PROVISION_PHASES.map((phase) => [
+            phase,
+            phase === 'start_nanoclaw' ? production.start_nanoclaw : completedDefinition(phase),
+          ]),
+        ) as unknown as Parameters<typeof defineProvisionPhaseRegistry<ProductionProvisionContext>>[0],
+      );
+
+      await expect(reconcileProvisioning(operation, resumed, resumedRegistry)).resolves.toEqual({ status: 'ready' });
+      expect(reconcileMainIdentity).toHaveBeenCalledOnce();
+      expect(identityState.agents).toEqual([
+        { id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'all' },
+        { id: 'oc-other', identifier: 'ag-other', name: 'other', secretMode: 'selective' },
+      ]);
+      expect(identityState.onecliCalls.filter((args) => args[1] === 'secrets')).toEqual([
+        ['agents', 'secrets', '--id', 'oc-main'],
+      ]);
+    });
+  });
+
   it('reclaims the exact reserved OneCLI ports on a normal resume and holds them until bind', async () => {
     const paths = await testPaths();
     const originalLease = await holdLoopbackPorts();
@@ -681,7 +810,6 @@ describe('production provision phase composition', () => {
         return {
           agentGroupId: 'ag-main',
           onecliAgentId: 'onecli-main',
-          providerSecretId: 'secret-provider',
         };
       },
       verifyRoute: async ({ endpointUrl }) => {

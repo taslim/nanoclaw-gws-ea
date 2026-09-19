@@ -75,7 +75,7 @@ function parseProfile(value: unknown): MainProfile {
   const mainAgentGroupId = safeIdentifier(profile.main_agent_group_id);
   const principalDisplayName = safeDisplayName(profile.principal_display_name);
   if (!mainAgentGroupId) {
-    throw new GwsEaError('main_not_ready', 'Canonical main is not published with a verified selective grant');
+    throw new GwsEaError('main_not_ready', 'Canonical main is not published with verified OneCLI access');
   }
   if (!principalDisplayName) throw new GwsEaError('profile_mismatch', 'The principal profile is incomplete');
   return { mainAgentGroupId, principalDisplayName };
@@ -193,7 +193,7 @@ export async function reconcilePrincipalDm(
     ((runtimeConfig: InstanceRuntimeConfig, args: readonly string[]) =>
       defaultRunBootstrap(runtimeConfig, args, dependencies.runCommand));
 
-  // A non-null pointer is published only after the selective OneCLI grant is
+  // A non-null pointer is published only after main's OneCLI access is
   // verified, so it is the hard prerequisite for any principal wiring.
   const profile = parseProfile(await runNcl(config, ['gws-ea-profile', 'get']));
   let selected = input.selectedCandidate;
