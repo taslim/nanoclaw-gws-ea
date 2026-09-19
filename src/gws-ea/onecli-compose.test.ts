@@ -21,6 +21,7 @@ describe('instance-owned OneCLI Compose specification', () => {
       project: 'gws-ea-12345678123441238123123456789abc',
       appPort: 31_002,
       gatewayPort: 31_003,
+      cliExecutable: '/opt/onecli/bin/onecli',
     });
 
     const source = renderOnecliCompose(layout);
@@ -62,6 +63,7 @@ describe('instance-owned OneCLI Compose specification', () => {
       project: 'gws-ea-12345678123441238123123456789abc',
       appPort: 31_002,
       gatewayPort: 31_003,
+      cliExecutable: '/opt/onecli/bin/onecli',
     });
     const source = renderOnecliCompose(layout);
     const compose = record(parseYaml(source));

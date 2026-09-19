@@ -57,6 +57,7 @@ export interface OnecliRuntimeLayout {
   readonly gatewayPort: number;
   readonly appUrl: string;
   readonly gatewayUrl: string;
+  readonly cliExecutable: string;
 }
 
 export interface OnecliRuntimeLayoutInput {
@@ -65,6 +66,7 @@ export interface OnecliRuntimeLayoutInput {
   readonly project: string;
   readonly appPort: number;
   readonly gatewayPort: number;
+  readonly cliExecutable: string;
 }
 
 export function createOnecliRuntimeLayout(input: OnecliRuntimeLayoutInput): OnecliRuntimeLayout {
@@ -77,6 +79,9 @@ export function createOnecliRuntimeLayout(input: OnecliRuntimeLayoutInput): Onec
 
   if (!/^[a-z0-9][a-z0-9_-]{0,62}$/.test(input.project)) {
     throw new Error('OneCLI Compose project is invalid');
+  }
+  if (!path.isAbsolute(input.cliExecutable) || path.resolve(input.cliExecutable) !== input.cliExecutable) {
+    throw new Error('OneCLI CLI path must be absolute and normalized');
   }
   const rootDirectory = path.resolve(input.instanceRoot, 'onecli');
   const project = input.project;
@@ -102,6 +107,7 @@ export function createOnecliRuntimeLayout(input: OnecliRuntimeLayoutInput): Onec
     gatewayPort: input.gatewayPort,
     appUrl: `http://127.0.0.1:${input.appPort}`,
     gatewayUrl: `http://127.0.0.1:${input.gatewayPort}`,
+    cliExecutable: input.cliExecutable,
   };
 }
 

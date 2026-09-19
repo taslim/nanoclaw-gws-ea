@@ -10,6 +10,7 @@ import {
   buildOnecliCliEnvironment,
   cleanupOnecliDockerOrphans,
   importProviderCredential,
+  persistOnecliApiKeyFiles,
   prepareOnecliRuntime,
   runOnecliCompatibilityCanary,
   runSanitizedCommand,
@@ -20,6 +21,7 @@ import {
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 
 const INSTANCE_ID = '12345678-1234-4123-8123-123456789abc';
+const ONECLI_API_KEY = `oc_${'a'.repeat(64)}`;
 const roots: string[] = [];
 
 afterEach(async () => {
@@ -36,6 +38,7 @@ async function layoutFixture() {
     project: 'gws-ea-12345678123441238123123456789abc',
     appPort: 31_002,
     gatewayPort: 31_003,
+    cliExecutable: '/opt/onecli/bin/onecli',
   });
 }
 
@@ -275,6 +278,11 @@ describe('OneCLI compatibility and provider import', () => {
     const runner: OnecliCommandRunner = async (command) => {
       calls.push([command.command, ...command.args]);
       const args = command.args;
+      if (args[0] === 'auth' && args[1] === 'api-key') {
+        expect(command.env).not.toHaveProperty('ONECLI_API_KEY');
+        return { stdout: JSON.stringify({ apiKey: ONECLI_API_KEY }), stderr: '' };
+      }
+      expect(command.env?.ONECLI_API_KEY).toBe(ONECLI_API_KEY);
       if (args[0] === 'version') {
         return { stdout: JSON.stringify({ version: '2.2.5', server_version: '1.42.0' }), stderr: '' };
       }
@@ -341,6 +349,9 @@ describe('OneCLI compatibility and provider import', () => {
     });
     expect(Object.isFrozen(receipt)).toBe(true);
     expect(Object.keys(receipt)).toEqual([]);
+    const runtimeKeyFile = path.join(layout.secretsDirectory, 'runtime-api-key');
+    const adminKeyFile = path.join(layout.secretsDirectory, 'admin-api-key');
+    await persistOnecliApiKeyFiles(receipt, { runtime: runtimeKeyFile, admin: adminKeyFile });
     const imported = await importProviderCredential(
       receipt,
       {
@@ -353,6 +364,11 @@ describe('OneCLI compatibility and provider import', () => {
     );
 
     expect(imported).toEqual({ id: 'secret-provider', created: true });
+    expect(await readFile(runtimeKeyFile, 'utf8')).toBe(ONECLI_API_KEY);
+    expect(await readFile(adminKeyFile, 'utf8')).toBe(ONECLI_API_KEY);
+    expect((await stat(runtimeKeyFile)).mode & 0o777).toBe(0o600);
+    expect((await stat(adminKeyFile)).mode & 0o777).toBe(0o600);
+    expect(calls.every((call) => call[0] === layout.cliExecutable)).toBe(true);
     const providerCreate = calls.find(
       (call) => call[1] === 'secrets' && call[2] === 'create' && call.includes('Anthropic'),
     );
@@ -370,6 +386,9 @@ describe('OneCLI compatibility and provider import', () => {
     await writeFile(layout.providerStagingFile, 'orphaned-provider-secret', { mode: 0o600 });
     const observations: boolean[] = [];
     const runner: OnecliCommandRunner = async (command) => {
+      if (command.args[0] === 'auth' && command.args[1] === 'api-key') {
+        return { stdout: JSON.stringify({ apiKey: ONECLI_API_KEY }), stderr: '' };
+      }
       if (command.args[0] === 'version') {
         return { stdout: JSON.stringify({ version: '2.2.5', server_version: '1.42.0' }), stderr: '' };
       }

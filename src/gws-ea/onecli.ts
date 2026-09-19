@@ -1,14 +1,26 @@
 import { randomBytes } from 'node:crypto';
-import { constants as fsConstants } from 'node:fs';
-import { chmod, lstat, open, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 
 import { OneCLI } from '@onecli-sh/sdk';
 
 import { isErrno } from '../community-portal/errors.js';
-import { preparePrivateLocalDirectory, assertPrivateStateFile } from './paths.js';
+import { preparePrivateLocalDirectory } from './paths.js';
+import {
+  buildAllowlistedEnvironment,
+  runSanitizedCommand as runSharedSanitizedCommand,
+  type SanitizedCommand,
+  type SanitizedCommandResult,
+  type SanitizedCommandRunner,
+} from './process.js';
+import {
+  ensureRandomOwnerOnlyFile,
+  readOwnerOnlyFile,
+  removePrivateFile,
+  writeOwnerOnlyFileExclusive,
+  writePrivateTextFile,
+} from './secrets.js';
 import {
   ONECLI_CLI_VERSION,
   ONECLI_GATEWAY_VERSION,
@@ -20,33 +32,11 @@ import {
 } from './onecli-compose.js';
 import { GwsEaError } from './types.js';
 
-const SAFE_ENVIRONMENT_KEYS = [
-  'PATH',
-  'LANG',
-  'LC_ALL',
-  'LC_CTYPE',
-  'TERM',
-  'TMPDIR',
-  'SSL_CERT_FILE',
-  'SSL_CERT_DIR',
-] as const;
 const EXPECTED_SERVICES = ['app', 'gateway', 'postgres'] as const;
-const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 
-export interface OnecliCommand {
-  readonly command: string;
-  readonly args: readonly string[];
-  readonly cwd: string;
-  readonly env?: Readonly<Record<string, string>>;
-  readonly timeoutMs?: number;
-}
-
-export interface OnecliCommandResult {
-  readonly stdout: string;
-  readonly stderr: string;
-}
-
-export type OnecliCommandRunner = (command: OnecliCommand) => Promise<OnecliCommandResult>;
+export type OnecliCommand = SanitizedCommand;
+export type OnecliCommandResult = SanitizedCommandResult;
+export type OnecliCommandRunner = SanitizedCommandRunner;
 
 export type OnecliSdkClient = Pick<OneCLI, 'ensureAgent' | 'getContainerConfig'>;
 
@@ -100,7 +90,7 @@ export interface ImportedCredential {
 
 export interface OnecliCompatibilityDependencies {
   readonly runCommand?: OnecliCommandRunner;
-  readonly createSdkClient?: (layout: OnecliRuntimeLayout) => OnecliSdkClient;
+  readonly createSdkClient?: (layout: OnecliRuntimeLayout, apiKey: string) => OnecliSdkClient;
   readonly fetch?: typeof globalThis.fetch;
   readonly ambientEnv?: NodeJS.ProcessEnv;
 }
@@ -114,7 +104,17 @@ export interface OnecliCompatibilityReceipt {
   readonly [compatibilityReceiptBrand]: true;
 }
 
-const issuedCompatibilityReceipts = new WeakMap<object, OnecliRuntimeLayout>();
+interface VerifiedOnecliRuntime {
+  readonly layout: OnecliRuntimeLayout;
+  readonly apiKey: string;
+}
+
+export interface OnecliApiKeyFiles {
+  readonly runtime: string;
+  readonly admin: string;
+}
+
+const issuedCompatibilityReceipts = new WeakMap<object, VerifiedOnecliRuntime>();
 
 export function buildComposeInvocation(layout: OnecliRuntimeLayout, args: readonly string[]): OnecliCommand {
   return {
@@ -140,7 +140,7 @@ export function buildOnecliCliEnvironment(
   ambient: NodeJS.ProcessEnv = process.env,
   apiKey?: string,
 ): Readonly<Record<string, string>> {
-  const environment = copySafeEnvironment(ambient);
+  const environment = buildAllowlistedEnvironment(ambient);
   environment.HOME = layout.cliHome;
   environment.ONECLI_API_HOST = layout.appUrl;
   if (apiKey !== undefined) environment.ONECLI_API_KEY = apiKey;
@@ -148,7 +148,7 @@ export function buildOnecliCliEnvironment(
 }
 
 export function buildComposeEnvironment(ambient: NodeJS.ProcessEnv = process.env): Readonly<Record<string, string>> {
-  const environment = copySafeEnvironment(ambient);
+  const environment = buildAllowlistedEnvironment(ambient);
   if (ambient.HOME !== undefined) environment.HOME = ambient.HOME;
   return environment;
 }
@@ -159,12 +159,12 @@ export async function prepareOnecliRuntime(layout: OnecliRuntimeLayout): Promise
   await preparePrivateLocalDirectory(layout.secretsDirectory);
 
   await Promise.all([
-    ensurePrivateRandomFile(layout.postgresPasswordFile, 'base64url'),
-    ensurePrivateRandomFile(layout.encryptionKeyFile, 'base64'),
-    ensurePrivateRandomFile(layout.gatewayInternalSecretFile, 'base64url'),
+    ensureRandomOwnerOnlyFile(layout.postgresPasswordFile, 'base64url'),
+    ensureRandomOwnerOnlyFile(layout.encryptionKeyFile, 'base64'),
+    ensureRandomOwnerOnlyFile(layout.gatewayInternalSecretFile, 'base64url'),
   ]);
-  await ensurePrivateTextFile(layout.composeFile, renderOnecliCompose(layout));
-  await ensurePrivateTextFile(layout.envFile, '# Intentionally empty: runtime coordinates are passed explicitly.\n');
+  await writePrivateTextFile(layout.composeFile, renderOnecliCompose(layout));
+  await writePrivateTextFile(layout.envFile, '# Intentionally empty: runtime coordinates are passed explicitly.\n');
 }
 
 export function validateObservedOnecliRuntime(layout: OnecliRuntimeLayout, observed: ObservedOnecliRuntime): void {
@@ -252,7 +252,16 @@ async function runCompatibilityCanary(
     if (result.status === 'rejected') throw result.reason;
   }
 
-  const environment = buildOnecliCliEnvironment(layout, dependencies.ambientEnv);
+  const bootstrapEnvironment = buildOnecliCliEnvironment(layout, dependencies.ambientEnv);
+  const apiKeyResponse = parseRecord(
+    (await runOnecliCommand(layout, bootstrapEnvironment, ['auth', 'api-key'], runCommand)).stdout,
+    'OneCLI API key',
+  );
+  const apiKey = requireRecordString(apiKeyResponse, 'apiKey', 'OneCLI API key');
+  if (!/^oc_[A-Za-z0-9_-]{20,}$/u.test(apiKey)) {
+    throw new GwsEaError('incompatible_onecli', 'OneCLI returned an invalid local API key');
+  }
+  const environment = buildOnecliCliEnvironment(layout, dependencies.ambientEnv, apiKey);
   const version = parseRecord(
     (await runOnecliCommand(layout, environment, ['version'], runCommand)).stdout,
     'OneCLI version',
@@ -314,10 +323,10 @@ async function runCompatibilityCanary(
       );
     }
 
-    const sdk = dependencies.createSdkClient?.(layout) ?? createDefaultSdkClient(layout);
+    const sdk = dependencies.createSdkClient?.(layout, apiKey) ?? createDefaultSdkClient(layout, apiKey);
     await sdk.ensureAgent({ name: canaryAgentName, identifier: canaryAgentName });
 
-    await writeExclusiveSecret(layout.canaryStagingFile, `canary-${randomBytes(24).toString('hex')}`);
+    await writeOwnerOnlyFileExclusive(layout.canaryStagingFile, `canary-${randomBytes(24).toString('hex')}`);
     const createdSecret = parseRecord(
       (
         await runOnecliCommand(
@@ -399,7 +408,7 @@ async function runCompatibilityCanary(
   await cleanupCompatibilityCanary(layout, environment, runCommand, agentId, secretId, true);
 
   const receipt = Object.freeze({}) as OnecliCompatibilityReceipt;
-  issuedCompatibilityReceipts.set(receipt, Object.freeze({ ...layout }));
+  issuedCompatibilityReceipts.set(receipt, Object.freeze({ layout: Object.freeze({ ...layout }), apiKey }));
   return receipt;
 }
 
@@ -411,7 +420,7 @@ async function cleanupCompatibilityCanary(
   secretId: string | undefined,
   failClosed: boolean,
 ): Promise<void> {
-  await removeFileAndSyncParent(layout.canaryStagingFile);
+  await removePrivateFile(layout.canaryStagingFile);
   const results = await Promise.allSettled([
     agentId === undefined
       ? Promise.resolve()
@@ -430,13 +439,14 @@ export async function importProviderCredential(
   input: ProviderCredentialInput,
   dependencies: Pick<OnecliCompatibilityDependencies, 'runCommand' | 'ambientEnv'> = {},
 ): Promise<ImportedCredential> {
-  const layout = issuedCompatibilityReceipts.get(receipt);
-  if (layout === undefined) {
+  const verified = issuedCompatibilityReceipts.get(receipt);
+  if (verified === undefined) {
     throw new GwsEaError('onecli_canary_required', 'A successful OneCLI compatibility canary is required');
   }
+  const { layout, apiKey } = verified;
   assertCredentialMetadata(input);
   const runCommand = dependencies.runCommand ?? runSanitizedCommand;
-  const environment = buildOnecliCliEnvironment(layout, dependencies.ambientEnv);
+  const environment = buildOnecliCliEnvironment(layout, dependencies.ambientEnv, apiKey);
   await removePlaintextStagingFiles(layout);
   const secrets = parseArray(
     (await runOnecliCommand(layout, environment, ['secrets', 'list', '--max', '0'], runCommand)).stdout,
@@ -455,7 +465,7 @@ export async function importProviderCredential(
   }
 
   try {
-    await writeExclusiveSecret(layout.providerStagingFile, input.value);
+    await writeOwnerOnlyFileExclusive(layout.providerStagingFile, input.value);
     const args = [
       'secrets',
       'create',
@@ -479,7 +489,35 @@ export async function importProviderCredential(
     );
     return { id: requireRecordString(created, 'id', 'OneCLI secret'), created: true };
   } finally {
-    await removeFileAndSyncParent(layout.providerStagingFile);
+    await removePrivateFile(layout.providerStagingFile);
+  }
+}
+
+export async function persistOnecliApiKeyFiles(
+  receipt: OnecliCompatibilityReceipt,
+  files: OnecliApiKeyFiles,
+): Promise<void> {
+  const verified = issuedCompatibilityReceipts.get(receipt);
+  if (verified === undefined) {
+    throw new GwsEaError('onecli_canary_required', 'A successful OneCLI compatibility canary is required');
+  }
+  if (files.runtime === files.admin) {
+    throw new GwsEaError('unsafe_secret', 'OneCLI runtime and administrative credentials require separate files');
+  }
+  await Promise.all([
+    writeOrVerifyOwnerOnlySecret(files.runtime, verified.apiKey),
+    writeOrVerifyOwnerOnlySecret(files.admin, verified.apiKey),
+  ]);
+}
+
+async function writeOrVerifyOwnerOnlySecret(file: string, value: string): Promise<void> {
+  try {
+    if ((await readOwnerOnlyFile(file)).trim() !== value) {
+      throw new GwsEaError('runtime_conflict', 'An existing OneCLI credential file does not match this runtime');
+    }
+  } catch (error) {
+    if (!isErrno(error, 'ENOENT')) throw error;
+    await writeOwnerOnlyFileExclusive(file, value);
   }
 }
 
@@ -730,8 +768,8 @@ function requireNestedRecord(value: Record<string, unknown>, key: string, label:
   return nested;
 }
 
-function createDefaultSdkClient(layout: OnecliRuntimeLayout): OnecliSdkClient {
-  return new OneCLI({ url: layout.appUrl });
+function createDefaultSdkClient(layout: OnecliRuntimeLayout, apiKey: string): OnecliSdkClient {
+  return new OneCLI({ url: layout.appUrl, apiKey });
 }
 
 async function runOnecliCommand(
@@ -740,140 +778,20 @@ async function runOnecliCommand(
   args: readonly string[],
   runner: OnecliCommandRunner,
 ): Promise<OnecliCommandResult> {
-  return runner({ command: 'onecli', args, cwd: layout.rootDirectory, env: environment, timeoutMs: 30_000 });
-}
-
-export const runSanitizedCommand: OnecliCommandRunner = async (command) =>
-  new Promise<OnecliCommandResult>((resolve, reject) => {
-    const child = spawn(command.command, [...command.args], {
-      cwd: command.cwd,
-      env: command.env ?? copySafeEnvironment(process.env),
-      shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let stdout = '';
-    let stderr = '';
-    let outputBytes = 0;
-    let settled = false;
-    const timer = setTimeout(() => child.kill('SIGKILL'), command.timeoutMs ?? 30_000);
-    child.stdout.setEncoding('utf8');
-    child.stderr.setEncoding('utf8');
-    const capture = (chunk: string, destination: 'stdout' | 'stderr'): void => {
-      outputBytes += Buffer.byteLength(chunk);
-      if (outputBytes > MAX_COMMAND_OUTPUT_BYTES) {
-        child.kill('SIGKILL');
-        return;
-      }
-      if (destination === 'stdout') stdout += chunk;
-      else stderr += chunk;
-    };
-    child.stdout.on('data', (chunk: string) => capture(chunk, 'stdout'));
-    child.stderr.on('data', (chunk: string) => capture(chunk, 'stderr'));
-    child.once('error', () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(new GwsEaError('onecli_command_failed', 'A required OneCLI runtime command could not be started'));
-    });
-    child.once('close', (code, signal) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (outputBytes > MAX_COMMAND_OUTPUT_BYTES) {
-        reject(new GwsEaError('onecli_command_failed', 'A required OneCLI runtime command exceeded its output limit'));
-      } else if (code !== 0) {
-        reject(
-          new GwsEaError(
-            'onecli_command_failed',
-            signal === 'SIGKILL'
-              ? 'A required OneCLI runtime command timed out'
-              : 'A required OneCLI runtime command failed',
-          ),
-        );
-      } else {
-        resolve({ stdout, stderr });
-      }
-    });
+  return runner({
+    command: layout.cliExecutable,
+    args,
+    cwd: layout.rootDirectory,
+    env: environment,
+    timeoutMs: 30_000,
   });
-
-function copySafeEnvironment(ambient: NodeJS.ProcessEnv): Record<string, string> {
-  const environment: Record<string, string> = {};
-  for (const key of SAFE_ENVIRONMENT_KEYS) {
-    const value = ambient[key];
-    if (value !== undefined) environment[key] = value;
-  }
-  return environment;
 }
 
-async function ensurePrivateRandomFile(file: string, encoding: 'base64' | 'base64url'): Promise<void> {
-  try {
-    await assertPrivateStateFile(file);
-  } catch (error) {
-    if (!isErrno(error, 'ENOENT')) throw error;
-    await writeExclusiveSecret(file, randomBytes(32).toString(encoding));
-  }
-}
-
-async function ensurePrivateTextFile(file: string, contents: string): Promise<void> {
-  const temporary = `${file}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
-  try {
-    await writeFile(temporary, contents, { mode: 0o600, flag: 'wx' });
-    const handle = await open(temporary, fsConstants.O_RDONLY);
-    try {
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    await rename(temporary, file);
-    await chmod(file, 0o600);
-    await syncDirectory(path.dirname(file));
-    await assertPrivateStateFile(file);
-  } finally {
-    await unlink(temporary).catch((error: unknown) => {
-      if (!isErrno(error, 'ENOENT')) throw error;
-    });
-  }
-}
-
-async function writeExclusiveSecret(file: string, secret: string): Promise<void> {
-  const handle = await open(file, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY, 0o600);
-  try {
-    await handle.writeFile(secret, 'utf8');
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  await assertPrivateStateFile(file);
-  await syncDirectory(path.dirname(file));
-}
+export const runSanitizedCommand: OnecliCommandRunner = runSharedSanitizedCommand;
 
 async function removePlaintextStagingFiles(layout: OnecliRuntimeLayout): Promise<void> {
-  await removeFileAndSyncParent(layout.providerStagingFile);
-  await removeFileAndSyncParent(layout.canaryStagingFile);
-}
-
-async function removeFileAndSyncParent(file: string): Promise<void> {
-  let removed = false;
-  try {
-    const info = await lstat(file);
-    if (info.isSymbolicLink() || !info.isFile()) {
-      throw new GwsEaError('unsafe_onecli_staging', 'OneCLI staging path is not a regular file');
-    }
-    await unlink(file);
-    removed = true;
-  } catch (error) {
-    if (!isErrno(error, 'ENOENT')) throw error;
-  }
-  if (removed) await syncDirectory(path.dirname(file));
-}
-
-async function syncDirectory(directory: string): Promise<void> {
-  const handle = await open(directory, fsConstants.O_RDONLY);
-  try {
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
+  await removePrivateFile(layout.providerStagingFile);
+  await removePrivateFile(layout.canaryStagingFile);
 }
 
 async function assertHealthyEndpoint(
