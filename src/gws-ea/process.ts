@@ -68,7 +68,7 @@ async function assertTrustedPathComponent(
     throw new GwsEaError('untrusted_executable', 'A required executable is stored in an unsafe location');
   }
   const allowedOwner = isAllowedOwner(info.uid);
-  if (!allowedOwner && (!allowUnownedComponent || (info.mode & 0o020) !== 0)) {
+  if (!allowedOwner && !allowUnownedComponent) {
     throw new GwsEaError('untrusted_executable', 'A required executable is stored in an unsafe location');
   }
   // Homebrew and /Applications commonly have group-writable, root/current-user

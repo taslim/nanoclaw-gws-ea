@@ -118,6 +118,7 @@ describe('GWS-EA process boundary', () => {
     const uid = process.getuid();
     const getuid = vi.spyOn(process, 'getuid').mockReturnValue(uid + 1);
     try {
+      await chmod(root, 0o770);
       await writeFile(runningNode, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
       await writeFile(otherExecutable, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
       process.execPath = runningNode;
