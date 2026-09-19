@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { runCli } from './cli.js';
+import type { InstanceOperation } from './journal.js';
 import {
   allocateInstanceId,
   assertRegistryMarkerAgreement,
@@ -12,7 +13,7 @@ import {
   writeInstanceMarker,
 } from './registry.js';
 import { isLocalFilesystemType, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
-import type { InstanceReservationInput } from './types.js';
+import { GwsEaError, type InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
 
@@ -44,41 +45,78 @@ function reservation(paths: ControlPlanePaths, instanceId = allocateInstanceId()
     exclusive_resource_claims: {
       endpoint_url: 'https://assistant.example.test/webhook/gchat',
       gcp_project_id: 'assistant-project',
-      chat_app_id: 'assistant-chat-app',
-      chat_credential_id: 'assistant-chat-key',
+      gcp_account: 'operator@example.test',
+      gchat_service_account: 'gws-ea-chat@assistant-project.iam.gserviceaccount.com',
       workspace_email: 'assistant@example.test',
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },
   };
 }
 
-function createArgs(): string[] {
-  return [
-    'assistants',
+function createArgs(setupFile?: string): string[] {
+  const args = [
     'create',
     '--track',
     'dogfood',
     '--source-remote',
     'https://example.test/nanoclaw.git',
-    '--deployed-commit',
-    'a'.repeat(40),
-    '--webhook-port',
-    '31001',
-    '--onecli-app-port',
-    '31002',
-    '--onecli-gateway-port',
-    '31003',
     '--endpoint',
     'https://assistant.example.test/webhook/gchat',
-    '--gcp-project',
-    'assistant-project',
-    '--chat-app',
-    'assistant-chat-app',
-    '--chat-credential-id',
-    'assistant-chat-key',
     '--workspace-email',
     'assistant@example.test',
   ];
+  if (setupFile) args.push('--setup-file', setupFile);
+  return args;
+}
+
+async function createSetupFile(paths: ControlPlanePaths): Promise<string> {
+  const inputRoot = path.join(path.dirname(paths.configRoot), 'bootstrap-input');
+  await mkdir(inputRoot, { recursive: true, mode: 0o700 });
+  const providerFile = path.join(inputRoot, 'provider-key');
+  const setupFile = path.join(inputRoot, 'setup.json');
+  await writeFile(providerFile, 'provider-secret', { mode: 0o600 });
+  await writeFile(
+    setupFile,
+    JSON.stringify({
+      schema_version: 1,
+      onecli_cli_path: '/usr/local/bin/onecli',
+      node_path: process.execPath,
+      home_directory: path.dirname(paths.stateRoot),
+      platform: process.platform === 'darwin' ? 'macos' : 'linux',
+      running_as_root: false,
+      provider: {
+        id: 'claude',
+        name: 'Claude provider',
+        type: 'api_key',
+        host_pattern: 'api.anthropic.com',
+        credential_file: providerFile,
+        header_name: 'x-api-key',
+      },
+      identity: {
+        assistant_display_name: 'Aya',
+        principal_display_name: 'Principal',
+        principal_timezone: 'America/Los_Angeles',
+      },
+      selected_messaging_group_id: null,
+    }),
+    { mode: 0o600 },
+  );
+  return setupFile;
+}
+
+function productionRuntime() {
+  return {
+    preflightGcloud: async () => ({ account: 'operator@example.test' }),
+    resolveRelease: async (sourceRemote: string, releaseRef: string) => ({
+      sourceRemote,
+      releaseRef,
+      commit: 'b'.repeat(40),
+    }),
+    holdLoopbackPorts: async () => ({
+      ports: { nanoclaw_webhook: 34_101, onecli_app: 34_102, onecli_gateway: 34_103 },
+      release: async () => undefined,
+    }),
+  };
 }
 
 function waitForExit(child: ChildProcess): Promise<number | null> {
@@ -266,66 +304,317 @@ describe('machine registry', () => {
 });
 
 describe('create recovery contract', () => {
-  it('creates durable state and resumes the first incomplete phase without changing claims', async () => {
+  it('checks gcloud before allocating or printing an instance ID', async () => {
     const paths = await testPaths();
-    const createOutput: string[] = [];
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+
+    const exitCode = await runCli(['create', '--track', 'dogfood'], {
+      paths,
+      stdout: (line) => stdout.push(line),
+      stderr: (line) => stderr.push(line),
+      preflightGcloud: async () => {
+        throw new GwsEaError('gcloud_required', 'Install gcloud, then retry.');
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(stdout).toEqual([]);
+    expect(stderr.join('\n')).toContain('Install gcloud, then retry.');
+    expect((await readRegistry(paths)).instances).toEqual({});
+  });
+
+  it('connects the owner-only setup surface to create and fresh-process resume', async () => {
+    const paths = await testPaths();
+    const setupFile = await createSetupFile(paths);
+    const advanced: string[] = [];
+    let portsReleased = false;
+    const advanceProvision = async (operation: InstanceOperation, _selection?: string, heldPorts?: unknown) => {
+      if (advanced.length === 0) {
+        expect(heldPorts).toBeDefined();
+        expect(portsReleased).toBe(false);
+      }
+      advanced.push(operation.instanceId);
+      return {
+        status: 'paused' as const,
+        pause: {
+          kind: 'human-action' as const,
+          phase: 'bind_principal' as const,
+          code: 'principal_dm_required',
+          message: 'Send the direct message.',
+        },
+      };
+    };
+    const output: string[] = [];
+    const resolveCalls: Array<[string, string]> = [];
     expect(
-      await runCli(createArgs(), {
+      await runCli(createArgs(setupFile), {
         paths,
-        stdout: (line) => createOutput.push(line),
+        stdout: (line) => output.push(line),
         stderr: () => undefined,
+        preflightGcloud: async () => ({ account: 'operator@example.test' }),
+        advanceProvision,
+        resolveRelease: async (sourceRemote, releaseRef) => {
+          resolveCalls.push([sourceRemote, releaseRef]);
+          return { sourceRemote, releaseRef, commit: 'b'.repeat(40) };
+        },
+        holdLoopbackPorts: async () => ({
+          ports: { nanoclaw_webhook: 34_101, onecli_app: 34_102, onecli_gateway: 34_103 },
+          release: async () => {
+            portsReleased = true;
+          },
+        }),
       }),
     ).toBe(0);
-    const instanceId = createOutput[0]!.slice('instance_id: '.length);
-    const beforeResume = (await readRegistry(paths)).instances[instanceId];
+    const instanceId = output[0]!.slice('instance_id: '.length);
+    expect(resolveCalls).toEqual([['https://example.test/nanoclaw.git', 'refs/heads/dogfood']]);
+    expect(portsReleased).toBe(true);
+    expect((await readRegistry(paths)).instances[instanceId]).toMatchObject({
+      deployed_commit: 'b'.repeat(40),
+      allocated_ports: { nanoclaw_webhook: 34_101, onecli_app: 34_102, onecli_gateway: 34_103 },
+    });
+    const persistedBootstrap = await readFile(paths.bootstrapFile(instanceId), 'utf8');
+    expect(persistedBootstrap).not.toContain('provider-secret');
+    expect(persistedBootstrap).not.toContain('gchat-secret');
+
+    expect(
+      await runCli(['resume', '--id', instanceId], {
+        paths,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        advanceProvision,
+      }),
+    ).toBe(0);
+    expect(advanced).toEqual([instanceId, instanceId]);
+  });
+
+  it('provisions from the documented create command and prints exact principal-selection commands', async () => {
+    const paths = await testPaths();
+    const setupFile = await createSetupFile(paths);
+    const output: string[] = [];
+    let idWasPrintedBeforeCollection = false;
+    const pause = {
+      status: 'paused' as const,
+      pause: {
+        kind: 'human-action' as const,
+        phase: 'bind_principal' as const,
+        code: 'principal_selection_required',
+        message: 'Choose the verified principal conversation.',
+        choices: [
+          { id: 'gchat:spaces/AAA', label: 'Primary DM' },
+          { id: "gchat:spaces/O'Brien", label: 'Second DM' },
+        ],
+      },
+    };
+    const collectCreateInputs = async () => {
+      idWasPrintedBeforeCollection = /^instance_id: [0-9a-f-]{36}$/u.test(output[0] ?? '');
+      return {
+        'source-remote': 'https://example.test/nanoclaw.git',
+        endpoint: 'https://assistant.example.test/webhook/gchat',
+        'workspace-email': 'assistant@example.test',
+        'setup-file': setupFile,
+      };
+    };
+
+    expect(
+      await runCli(['create', '--track', 'dogfood'], {
+        paths,
+        stdout: (line) => output.push(line),
+        stderr: () => undefined,
+        collectCreateInputs,
+        advanceProvision: async () => pause,
+        ...productionRuntime(),
+      }),
+    ).toBe(0);
+    expect(idWasPrintedBeforeCollection).toBe(true);
+    const instanceId = output[0]!.slice('instance_id: '.length);
+    expect(output).toContain(
+      `  "Primary DM": gws-ea resume --id ${instanceId} --messaging-group-id 'gchat:spaces/AAA'`,
+    );
+    expect(output).toContain(
+      `  "Second DM": gws-ea resume --id ${instanceId} --messaging-group-id 'gchat:spaces/O'\\''Brien'`,
+    );
 
     const resumeOutput: string[] = [];
     expect(
-      await runCli(['assistants', 'resume', '--id', instanceId], {
+      await runCli(['resume', '--id', instanceId], {
         paths,
         stdout: (line) => resumeOutput.push(line),
         stderr: () => undefined,
+        advanceProvision: async () => pause,
       }),
     ).toBe(0);
-    expect(resumeOutput).toEqual([`Resuming instance ${instanceId} at phase materialize_checkout.`]);
-    expect((await readRegistry(paths)).instances[instanceId]).toEqual(beforeResume);
+    expect(resumeOutput).toContain(
+      `  "Primary DM": gws-ea resume --id ${instanceId} --messaging-group-id 'gchat:spaces/AAA'`,
+    );
   });
 
   it('leaves no instance state and gives a rerun command when validation fails before reservation', async () => {
     const paths = await testPaths();
     const stdout: string[] = [];
     const stderr: string[] = [];
-    const exitCode = await runCli(['assistants', 'create', '--track', 'dogfood'], {
+    const exitCode = await runCli(['create', '--track', 'dogfood'], {
       paths,
       stdout: (line) => stdout.push(line),
       stderr: (line) => stderr.push(line),
+      collectCreateInputs: async () => {
+        throw new GwsEaError('cancelled', 'Assistant creation was cancelled');
+      },
+      preflightGcloud: async () => ({ account: 'operator@example.test' }),
     });
 
     expect(exitCode).toBe(1);
-    expect(stdout).toEqual([]);
-    expect(stderr.join('\n')).toContain('gws-ea assistants create --track dogfood');
+    expect(stdout[0]).toMatch(/^instance_id: [0-9a-f-]{36}$/u);
+    expect(stderr.join('\n')).toContain('gws-ea create --track dogfood');
+    expect((await readRegistry(paths)).instances).toEqual({});
+  });
+
+  it('leaves no registry state when production track resolution fails before reservation', async () => {
+    const paths = await testPaths();
+    const setupFile = await createSetupFile(paths);
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const exitCode = await runCli(createArgs(setupFile), {
+      paths,
+      stdout: (line) => stdout.push(line),
+      stderr: (line) => stderr.push(line),
+      preflightGcloud: async () => ({ account: 'operator@example.test' }),
+      resolveRelease: async () => {
+        throw new GwsEaError('release_resolution_failed', 'Release track could not be resolved');
+      },
+      holdLoopbackPorts: async () => {
+        throw new Error('ports must not be allocated after failed release resolution');
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(stdout[0]).toMatch(/^instance_id: [0-9a-f-]{36}$/u);
+    expect(stderr.join('\n')).toContain('gws-ea create --track dogfood');
+    expect((await readRegistry(paths)).instances).toEqual({});
+  });
+
+  it('leaves no registry state when production setup input is invalid', async () => {
+    const paths = await testPaths();
+    const setupFile = path.join(path.dirname(paths.configRoot), 'invalid-setup.json');
+    await writeFile(setupFile, '{invalid-json', { mode: 0o600 });
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+
+    const exitCode = await runCli(createArgs(setupFile), {
+      paths,
+      stdout: (line) => stdout.push(line),
+      stderr: (line) => stderr.push(line),
+      preflightGcloud: async () => ({ account: 'operator@example.test' }),
+      resolveRelease: async (sourceRemote, releaseRef) => ({ sourceRemote, releaseRef, commit: 'b'.repeat(40) }),
+      holdLoopbackPorts: async () => {
+        throw new Error('ports must not be allocated for invalid setup input');
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(stdout[0]).toMatch(/^instance_id: [0-9a-f-]{36}$/u);
+    expect(stderr.join('\n')).toContain('Bootstrap manifest is not valid JSON');
+    expect((await readRegistry(paths)).instances).toEqual({});
+  });
+
+  it('stages bootstrap input before reservation and removes it when reservation fails', async () => {
+    const paths = await testPaths();
+    const setupFile = await createSetupFile(paths);
+    const stdout: string[] = [];
+    let stagedBeforeReservation = false;
+
+    expect(
+      await runCli(createArgs(setupFile), {
+        paths,
+        stdout: (line) => stdout.push(line),
+        stderr: () => undefined,
+        reserveInstance: async (_paths, input) => {
+          stagedBeforeReservation = (await readFile(paths.bootstrapFile(input.instance_id), 'utf8')).includes(
+            '"schema_version": 1',
+          );
+          throw new GwsEaError('claim_conflict', 'An exclusive operational resource is already claimed');
+        },
+        ...productionRuntime(),
+      }),
+    ).toBe(1);
+
+    const instanceId = stdout[0]!.slice('instance_id: '.length);
+    expect(stagedBeforeReservation).toBe(true);
+    await expect(stat(paths.bootstrapFile(instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(paths.instanceRoot(instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
     expect((await readRegistry(paths)).instances).toEqual({});
   });
 
   it('prints the id before reservation and only the exact safe resume command after a post-reservation failure', async () => {
     const paths = await testPaths();
+    const setupFile = await createSetupFile(paths);
     const stdout: string[] = [];
     const stderr: string[] = [];
     const secretCanary = 'secret-canary-must-not-print';
-    const exitCode = await runCli(createArgs(), {
+    const exitCode = await runCli(createArgs(setupFile), {
       paths,
       stdout: (line) => stdout.push(line),
       stderr: (line) => stderr.push(line),
       initializeJournal: async () => {
         throw new Error(secretCanary);
       },
+      ...productionRuntime(),
     });
 
     expect(exitCode).toBe(1);
     expect(stdout[0]).toMatch(/^instance_id: [0-9a-f-]{36}$/);
     const instanceId = stdout[0]!.slice('instance_id: '.length);
     expect(Object.keys((await readRegistry(paths)).instances)).toEqual([instanceId]);
-    expect(stderr.join('\n')).toContain(`gws-ea assistants resume --id ${instanceId}`);
+    await expect(readFile(paths.bootstrapFile(instanceId), 'utf8')).resolves.toContain('"schema_version": 1');
+    expect(stderr.join('\n')).toContain(`gws-ea resume --id ${instanceId}`);
     expect(`${stdout.join('\n')}\n${stderr.join('\n')}`).not.toContain(secretCanary);
+
+    const resumed: string[] = [];
+    expect(
+      await runCli(['resume', '--id', instanceId], {
+        paths,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        advanceProvision: async (operation) => {
+          resumed.push(operation.instanceId);
+          return {
+            status: 'paused',
+            pause: {
+              kind: 'human-action',
+              phase: 'bind_principal',
+              code: 'principal_dm_required',
+              message: 'Send the direct message.',
+            },
+          };
+        },
+      }),
+    ).toBe(0);
+    expect(resumed).toEqual([instanceId]);
+  });
+
+  it('preserves resumable state when reservation publishes before reporting failure', async () => {
+    const paths = await testPaths();
+    const setupFile = await createSetupFile(paths);
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+
+    expect(
+      await runCli(createArgs(setupFile), {
+        paths,
+        stdout: (line) => stdout.push(line),
+        stderr: (line) => stderr.push(line),
+        reserveInstance: async (reservationPaths, input) => {
+          await reserveInstance(reservationPaths, input);
+          throw new Error('simulated lock-release failure');
+        },
+        ...productionRuntime(),
+      }),
+    ).toBe(1);
+
+    const instanceId = stdout[0]!.slice('instance_id: '.length);
+    expect(Object.keys((await readRegistry(paths)).instances)).toEqual([instanceId]);
+    await expect(readFile(paths.bootstrapFile(instanceId), 'utf8')).resolves.toContain('"schema_version": 1');
+    expect(stderr.join('\n')).toContain(`gws-ea resume --id ${instanceId}`);
+    expect(stderr.join('\n')).not.toContain('gws-ea create --track');
   });
 });

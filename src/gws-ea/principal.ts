@@ -2,9 +2,11 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 
 import { INSTANCE_KEY_RE } from '../channels/channel-registry.js';
+import { runInstanceNclJson } from './ncl.js';
 import { buildInstanceCliCommand, validateRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
 import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { GwsEaError } from './types.js';
+import { hasControlCharacters, isRecord } from './validation.js';
 
 const CHANNEL_TYPE = 'gchat';
 
@@ -21,6 +23,7 @@ export interface PrincipalDiscoveryInput {
   readonly adapterInstance: string;
   readonly provisioningStartedAt: string;
   readonly messagingGroupId?: string;
+  readonly selectedCandidate?: PrincipalCandidate;
 }
 
 export type PrincipalDiscoveryResult =
@@ -37,15 +40,12 @@ export interface PrincipalDiscoveryDependencies {
   readonly runNcl?: (config: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
   readonly runBootstrap?: (config: InstanceRuntimeConfig, args: readonly string[]) => Promise<void>;
   readonly runCommand?: SanitizedCommandRunner;
+  readonly persistSelection?: (candidate: PrincipalCandidate) => Promise<PrincipalCandidate>;
 }
 
 interface MainProfile {
   readonly mainAgentGroupId: string;
   readonly principalDisplayName: string;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function unwrapData(value: unknown): unknown {
@@ -60,12 +60,7 @@ function canonicalTimestamp(value: unknown): string | undefined {
 
 function safeIdentifier(value: unknown): string | undefined {
   if (typeof value !== 'string' || value.length === 0 || value.length > 256) return undefined;
-  return [...value].some((character) => {
-    const code = character.codePointAt(0);
-    return code !== undefined && (code <= 0x1f || code === 0x7f);
-  })
-    ? undefined
-    : value;
+  return hasControlCharacters(value) ? undefined : value;
 }
 
 function safeDisplayName(value: unknown): string | undefined {
@@ -127,7 +122,7 @@ function parseCandidates(value: unknown, adapterInstance: string, provisioningSt
   const rows = unwrapData(value);
   if (!Array.isArray(rows))
     throw new GwsEaError('invalid_child_output', 'ncl returned an invalid dropped-message list');
-  return rows
+  const candidates = rows
     .map((row) => parseCandidate(row, adapterInstance, provisioningStartedAt))
     .filter((candidate): candidate is PrincipalCandidate => candidate !== undefined)
     .sort(
@@ -135,24 +130,13 @@ function parseCandidates(value: unknown, adapterInstance: string, provisioningSt
         left.authenticatedMessageAt.localeCompare(right.authenticatedMessageAt) ||
         left.messagingGroupId.localeCompare(right.messagingGroupId),
     );
-}
-
-function parseJson(source: string): unknown {
-  try {
-    return JSON.parse(source) as unknown;
-  } catch {
-    throw new GwsEaError('invalid_child_output', 'ncl returned invalid JSON');
-  }
-}
-
-async function defaultRunNcl(config: InstanceRuntimeConfig, args: readonly string[]): Promise<unknown> {
-  const command = buildInstanceCliCommand(config, [...args, '--json']);
-  const result = await runSanitizedCommand({ ...command, timeoutMs: 30_000 });
-  const frame = parseJson(result.stdout);
-  if (!isRecord(frame) || frame.ok !== true || !('data' in frame)) {
-    throw new GwsEaError('ncl_failed', 'The selected NanoClaw command did not succeed');
-  }
-  return frame.data;
+  const latestByConversation = new Map<string, PrincipalCandidate>();
+  for (const candidate of candidates) latestByConversation.set(candidate.messagingGroupId, candidate);
+  return [...latestByConversation.values()].sort(
+    (left, right) =>
+      left.authenticatedMessageAt.localeCompare(right.authenticatedMessageAt) ||
+      left.messagingGroupId.localeCompare(right.messagingGroupId),
+  );
 }
 
 async function defaultRunBootstrap(
@@ -175,19 +159,21 @@ async function defaultRunBootstrap(
   });
 }
 
-function eventId(config: InstanceRuntimeConfig, mainAgentGroupId: string, candidate: PrincipalCandidate): string {
+export function principalWelcomeEventId(
+  config: Pick<InstanceRuntimeConfig, 'instance_id'>,
+  mainAgentGroupId: string,
+  candidate: PrincipalCandidate,
+): string {
   const digest = createHash('sha256')
-    .update(
-      [config.instance_id, mainAgentGroupId, candidate.messagingGroupId, candidate.authenticatedMessageId].join('\0'),
-    )
+    .update([config.instance_id, mainAgentGroupId, candidate.messagingGroupId].join('\0'))
     .digest('hex');
   return `gws-ea-welcome:${digest}`;
 }
 
 /**
  * Select and bind an authenticated first Google Chat DM. Discovery is
- * intentionally read-only until one exact candidate is unambiguous (or the
- * operator supplies its exact messaging-group ID).
+ * intentionally read-only until the operator supplies one exact eligible
+ * messaging-group ID. Authentication alone never authorizes an owner grant.
  */
 export async function reconcilePrincipalDm(
   configInput: InstanceRuntimeConfig,
@@ -200,7 +186,7 @@ export async function reconcilePrincipalDm(
   if (!INSTANCE_KEY_RE.test(input.adapterInstance)) {
     throw new GwsEaError('invalid_arguments', 'Google Chat adapter instance is invalid');
   }
-  const runNcl = dependencies.runNcl ?? defaultRunNcl;
+  const runNcl = dependencies.runNcl ?? runInstanceNclJson;
   const runBootstrap =
     dependencies.runBootstrap ??
     ((runtimeConfig: InstanceRuntimeConfig, args: readonly string[]) =>
@@ -209,36 +195,36 @@ export async function reconcilePrincipalDm(
   // A non-null pointer is published only after U5 verifies the selective
   // OneCLI grant, so it is the hard prerequisite for any principal wiring.
   const profile = parseProfile(await runNcl(config, ['gws-ea-profile', 'get']));
-  const candidates = parseCandidates(
-    await runNcl(config, [
-      'dropped-messages',
-      'list',
-      '--channel-type',
-      CHANNEL_TYPE,
-      '--instance',
+  let selected = input.selectedCandidate;
+  if (selected && input.messagingGroupId !== undefined && selected.messagingGroupId !== input.messagingGroupId) {
+    throw new GwsEaError('principal_selection_mismatch', 'The principal selection is already fixed for this instance');
+  }
+  if (!selected) {
+    const candidates = parseCandidates(
+      await runNcl(config, [
+        'dropped-messages',
+        'list',
+        '--channel-type',
+        CHANNEL_TYPE,
+        '--instance',
+        input.adapterInstance,
+        '--reason',
+        'no_agent_wired',
+        '--limit',
+        '200',
+      ]),
       input.adapterInstance,
-      '--reason',
-      'no_agent_wired',
-      '--limit',
-      '200',
-    ]),
-    input.adapterInstance,
-    provisioningStartedAt,
-  );
-
-  let selected: PrincipalCandidate | undefined;
-  if (input.messagingGroupId !== undefined) {
+      provisioningStartedAt,
+    );
+    if (input.messagingGroupId === undefined) {
+      return candidates.length === 0 ? { status: 'waiting' } : { status: 'selection-required', candidates };
+    }
     selected = candidates.find((candidate) => candidate.messagingGroupId === input.messagingGroupId);
     if (!selected) throw new GwsEaError('principal_selection_mismatch', 'Selected principal DM is not eligible');
-  } else if (candidates.length === 0) {
-    return { status: 'waiting' };
-  } else if (candidates.length > 1) {
-    return { status: 'selection-required', candidates };
-  } else {
-    [selected] = candidates;
+    selected = await (dependencies.persistSelection?.(selected) ?? Promise.resolve(selected));
   }
 
-  const stableEventId = eventId(config, profile.mainAgentGroupId, selected);
+  const stableEventId = principalWelcomeEventId(config, profile.mainAgentGroupId, selected);
   const binding = unwrapData(
     await runNcl(config, [
       'gws-ea-profile',

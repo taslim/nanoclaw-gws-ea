@@ -1,4 +1,5 @@
 import { getDb } from '../../db/connection.js';
+import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { isValidTimezone } from '../../timezone.js';
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/u;
@@ -38,13 +39,6 @@ function identifier(value: string, label: string): string {
     throw new Error(`${label} is invalid`);
   }
   return value;
-}
-
-function hasControlCharacters(value: string): boolean {
-  return [...value].some((character) => {
-    const code = character.codePointAt(0);
-    return code !== undefined && (code <= 0x1f || code === 0x7f);
-  });
 }
 
 export function validateGwsEaProfileInput(input: ReconcileGwsEaProfileInput): ReconcileGwsEaProfileInput {
@@ -115,7 +109,7 @@ export async function bindVerifiedPrincipalUser(userId: string, verifiedAt: stri
   await getDb().run(
     `INSERT INTO gws_ea_principal_users (user_id, verified_at)
      VALUES (?, ?)
-     ON CONFLICT(user_id) DO NOTHING`,
+     ON CONFLICT(user_id) DO UPDATE SET verified_at = excluded.verified_at`,
     userId,
     verifiedAt,
   );

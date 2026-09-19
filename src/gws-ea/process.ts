@@ -32,6 +32,12 @@ export interface SanitizedCommandResult {
 
 export type SanitizedCommandRunner = (command: SanitizedCommand) => Promise<SanitizedCommandResult>;
 
+export interface SanitizedCommandOutcome extends SanitizedCommandResult {
+  readonly exitCode: number;
+}
+
+export type SanitizedCommandOutcomeRunner = (command: SanitizedCommand) => Promise<SanitizedCommandOutcome>;
+
 export function buildAllowlistedEnvironment(
   ambient: NodeJS.ProcessEnv = process.env,
   overrides: Readonly<Record<string, string>> = {},
@@ -50,8 +56,8 @@ export function buildAllowlistedEnvironment(
   return environment;
 }
 
-export const runSanitizedCommand: SanitizedCommandRunner = async (command) =>
-  new Promise<SanitizedCommandResult>((resolve, reject) => {
+export const runSanitizedCommandOutcome: SanitizedCommandOutcomeRunner = async (command) =>
+  new Promise<SanitizedCommandOutcome>((resolve, reject) => {
     const child = spawn(command.command, [...command.args], {
       cwd: command.cwd,
       env: command.env ?? buildAllowlistedEnvironment(),
@@ -86,16 +92,11 @@ export const runSanitizedCommand: SanitizedCommandRunner = async (command) =>
     child.once('close', (code, signal) => {
       if (settled) return;
       settled = true;
-      if (code === 0) {
-        resolve({ stdout, stderr });
+      if (signal === 'SIGKILL') {
+        reject(new GwsEaError('command_timeout', 'A required child process timed out'));
         return;
       }
-      reject(
-        new GwsEaError(
-          'command_failed',
-          signal === 'SIGKILL' ? 'A required child process timed out' : 'A required child process failed',
-        ),
-      );
+      resolve({ stdout, stderr, exitCode: code ?? 1 });
     });
 
     const timeout = setTimeout(
@@ -105,6 +106,14 @@ export const runSanitizedCommand: SanitizedCommandRunner = async (command) =>
     timeout.unref();
     child.once('close', () => clearTimeout(timeout));
   });
+
+export const runSanitizedCommand: SanitizedCommandRunner = async (command) => {
+  const result = await runSanitizedCommandOutcome(command);
+  if (result.exitCode !== 0) {
+    throw new GwsEaError('command_failed', 'A required child process failed');
+  }
+  return { stdout: result.stdout, stderr: result.stderr };
+};
 
 export function replaceProcess(
   executable: string,

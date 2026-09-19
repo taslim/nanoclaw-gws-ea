@@ -1,15 +1,17 @@
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { runArgumentCommand } from './checkout.js';
 import { runReleasePreflight, type SetupCommand } from './release-preflight.js';
 
 const roots: string[] = [];
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
@@ -33,8 +35,10 @@ function commit(root: string, message: string): void {
 }
 
 async function releaseFixture(): Promise<string> {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-preflight-'));
-  roots.push(root);
+  const instanceRoot = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-preflight-'));
+  roots.push(instanceRoot);
+  const root = path.join(instanceRoot, 'nanoclaw');
+  await mkdir(root);
   git(root, 'init', '-b', 'main');
   await write(root, '.gitignore', 'node_modules/\ndist/\ndata/\n');
   await write(
@@ -91,8 +95,15 @@ async function releaseFixture(): Promise<string> {
       2,
     ) + '\n',
   );
+  await write(root, 'bin/ncl', '#!/usr/bin/env bash\nexit 0\n');
+  await chmod(path.join(root, 'bin/ncl'), 0o755);
   await write(root, 'src/channels/gchat.ts', "export const gchat = 'registered';\n");
   await write(root, 'src/channels/index.ts', "import './cli.js';\nimport './gchat.js';\n");
+  await write(root, 'src/gws-ea/process.ts', 'export {};\n');
+  await write(root, 'scripts/init-first-agent.ts', 'export {};\n');
+  await write(root, 'src/modules/gws-ea-profile/index.ts', 'export {};\n');
+  await write(root, 'src/modules/gws-ea-profile/migration.ts', 'export {};\n');
+  await write(root, 'src/modules/index.ts', "import './gws-ea-profile/index.js';\n");
   await write(root, 'src/provider-contracts/claude.ts', "export const provider = 'claude';\n");
   await write(root, 'src/provider-contracts/index.ts', "import './claude.js';\n");
   await write(root, 'setup/providers/claude.ts', "export const provider = 'claude';\n");
@@ -110,7 +121,18 @@ async function releaseFixture(): Promise<string> {
 function recorder(commands: SetupCommand[]): (command: SetupCommand) => Promise<void> {
   return async (command) => {
     commands.push(command);
+    if (command.args[0] === 'run' && command.args[1] === 'build') {
+      await write(command.cwd, 'dist/gws-ea/process.js', 'export {};\n');
+      await write(command.cwd, 'dist/index.js', 'export {};\n');
+    }
   };
+}
+
+function expectCommonEnvironment(environment: Readonly<Record<string, string>>, checkoutRoot: string): void {
+  expect(environment.HOME).toBe(path.join(path.dirname(checkoutRoot), '.release-home'));
+  for (const key of Object.keys(environment)) {
+    expect(['HOME', 'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE']).toContain(key);
+  }
 }
 
 describe('release preflight', () => {
@@ -128,16 +150,55 @@ describe('release preflight', () => {
       packageManager: 'pnpm@10.34.5',
       onecli: { gateway: '1.42.0', cli: '2.2.5', sdk: '2.2.1' },
     });
-    expect(commands).toEqual([
-      { command: 'pnpm', args: ['install', '--frozen-lockfile'], cwd: root },
-      { command: 'pnpm', args: ['run', 'build'], cwd: root },
-    ]);
+    expect(commands).toHaveLength(2);
+    expect(commands[0]).toMatchObject({ command: 'pnpm', args: ['install', '--frozen-lockfile'], cwd: root });
+    expect(commands[1]).toMatchObject({ command: 'pnpm', args: ['run', 'build'], cwd: root });
+    for (const command of commands) expectCommonEnvironment(command.env, root);
     expect(git(root, 'status', '--porcelain')).toBe('');
+  });
+
+  it('runs every Git and pnpm child with an instance-owned allowlisted environment', async () => {
+    const root = await releaseFixture();
+    vi.stubEnv('GIT_CONFIG_GLOBAL', '/tmp/hostile-gitconfig');
+    vi.stubEnv('GIT_WORK_TREE', '/tmp/hostile-work-tree');
+    vi.stubEnv('NPM_CONFIG_USERCONFIG', '/tmp/hostile-npmrc');
+    vi.stubEnv('PNPM_HOME', '/tmp/hostile-pnpm');
+    vi.stubEnv('ONECLI_HOME', '/tmp/hostile-onecli');
+    vi.stubEnv('ANTHROPIC_API_KEY', 'must-not-propagate');
+    vi.stubEnv('GOOGLE_APPLICATION_CREDENTIALS', '/tmp/hostile-google-key');
+    const gitEnvironments: Array<Readonly<Record<string, string>>> = [];
+    const setupCommands: SetupCommand[] = [];
+
+    await runReleasePreflight(
+      { checkoutRoot: root, provider: 'claude' },
+      {
+        runCommand: async (spec) => {
+          gitEnvironments.push(spec.env);
+          return runArgumentCommand(spec);
+        },
+        runSetupCommand: recorder(setupCommands),
+      },
+    );
+
+    expect(gitEnvironments.length).toBeGreaterThan(0);
+    for (const environment of gitEnvironments) {
+      expect(environment.HOME).toBe(path.join(path.dirname(root), '.release-home'));
+      expect(environment.GIT_CONFIG_NOSYSTEM).toBe('1');
+      expect(environment.GIT_TERMINAL_PROMPT).toBe('0');
+      for (const key of Object.keys(environment)) {
+        expect(['HOME', 'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT']).toContain(
+          key,
+        );
+      }
+    }
+    for (const command of setupCommands) expectCommonEnvironment(command.env, root);
   });
 
   it.each([
     ['template', 'templates/gws-ea/main/plugin.json', 'incomplete_release'],
     ['Google Chat adapter', 'src/channels/gchat.ts', 'incomplete_release'],
+    ['GWS-EA service launcher', 'src/gws-ea/process.ts', 'incomplete_release'],
+    ['GWS-EA profile migration', 'src/modules/gws-ea-profile/migration.ts', 'incomplete_release'],
     ['provider host contract', 'src/provider-contracts/claude.ts', 'provider_not_composed'],
     ['provider runtime', 'container/agent-runner/src/providers/claude.ts', 'provider_not_composed'],
   ])('rejects a release missing its committed %s before setup commands', async (_label, missingPath, code) => {
@@ -150,6 +211,23 @@ describe('release preflight', () => {
       runReleasePreflight({ checkoutRoot: root, provider: 'claude' }, { runSetupCommand: recorder(commands) }),
     ).rejects.toMatchObject({ code });
     expect(commands).toEqual([]);
+  });
+
+  it('rejects a build that does not emit the service runtime artifacts', async () => {
+    const root = await releaseFixture();
+    const commands: SetupCommand[] = [];
+
+    await expect(
+      runReleasePreflight(
+        { checkoutRoot: root, provider: 'claude' },
+        {
+          runSetupCommand: async (command) => {
+            commands.push(command);
+          },
+        },
+      ),
+    ).rejects.toThrow(/dist\/gws-ea\/process\.js/u);
+    expect(commands).toHaveLength(2);
   });
 
   it('rejects a selected provider that is not composed into the release', async () => {
@@ -230,7 +308,8 @@ describe('release preflight', () => {
         },
       ),
     ).rejects.toThrow(/package\.json/);
-    expect(commands).toEqual([{ command: 'pnpm', args: ['install', '--frozen-lockfile'], cwd: root }]);
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toMatchObject({ command: 'pnpm', args: ['install', '--frozen-lockfile'], cwd: root });
   });
 
   it('fails with the tracked diff when the build changes source', async () => {

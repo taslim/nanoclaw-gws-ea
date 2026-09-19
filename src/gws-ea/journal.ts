@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import path from 'node:path';
 import { readJson, writePrivate } from '../community-portal/private-file.js';
 import { processLock } from '../community-portal/process-lock.js';
 import { isErrno } from '../community-portal/errors.js';
@@ -20,6 +21,7 @@ import {
   type ProvisionJournal,
   type ProvisionPhase,
 } from './types.js';
+import { hasControlCharacters, isRecord } from './validation.js';
 
 const ATTEMPT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const RESOURCE_KEY_PATTERN = /^[a-z][a-z0-9-]{0,31}:[0-9a-f]{64}$/;
@@ -27,13 +29,6 @@ const FAILURE_CODE_PATTERN = /^[a-z][a-z0-9_.-]{0,63}$/;
 const RESOURCE_KIND_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
 const operationBrand: unique symbol = Symbol('gws-ea-instance-operation');
 const activeOperations = new WeakSet<object>();
-
-function hasControlCharacters(value: string): boolean {
-  return [...value].some((character) => {
-    const code = character.codePointAt(0);
-    return code !== undefined && (code <= 0x1f || code === 0x7f);
-  });
-}
 
 export interface InstanceOperation {
   readonly instanceId: string;
@@ -49,10 +44,6 @@ export interface BeginPhaseResult {
 }
 
 export type PhaseObservationInput = { matched: false; resource_key?: never } | { matched: true; resource_key: string };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 function assertExactKeys(value: Record<string, unknown>, expected: readonly string[], label: string): void {
   const actual = Object.keys(value).sort();
@@ -204,10 +195,22 @@ export async function acquireInstanceOperation(
   instanceId: string,
 ): Promise<InstanceOperation | null> {
   assertInstanceId(instanceId);
-  await getInstanceReservation(paths, instanceId);
-  await preparePrivateLocalDirectory(paths.instanceRoot(instanceId));
+  await preparePrivateLocalDirectory(path.dirname(paths.instanceLock(instanceId)));
   const unlock = await processLock(paths.instanceLock(instanceId));
   if (!unlock) return null;
+  try {
+    try {
+      await assertPrivateStateFile(paths.removalFile(instanceId));
+      throw new GwsEaError('removal_in_progress', 'Assistant removal is in progress; provisioning cannot resume');
+    } catch (error) {
+      if (!isErrno(error, 'ENOENT')) throw error;
+    }
+    await getInstanceReservation(paths, instanceId);
+    await preparePrivateLocalDirectory(paths.instanceRoot(instanceId));
+  } catch (error) {
+    unlock();
+    throw error;
+  }
   let active = true;
   const operation: InstanceOperation = {
     instanceId,

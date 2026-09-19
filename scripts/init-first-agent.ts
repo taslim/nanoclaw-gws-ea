@@ -251,15 +251,20 @@ function generateId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+interface WireOptions {
+  readonly engagePattern?: string;
+  readonly senderScope?: 'all' | 'known';
+  readonly sessionMode?: 'shared' | 'per-thread' | 'agent-shared';
+}
+
 async function wireIfMissing(
   mg: MessagingGroup,
   ag: AgentGroup,
   now: string,
   label: string,
-  engagePattern?: string,
-  senderScope?: 'all' | 'known',
-  sessionMode?: 'shared' | 'per-thread' | 'agent-shared',
+  options: WireOptions = {},
 ): Promise<void> {
+  const { engagePattern, senderScope, sessionMode } = options;
   // Wiring defaults come from the channel's declaration when it has one
   // (resolveWiringDefaults: engage fields + session_mode + the threads stamp
   // derived from it — a context whose conversations are thread-rooted
@@ -472,7 +477,11 @@ async function main(): Promise<void> {
   // wiring. This is both the cold-DM cache and the proof the main policy uses.
   if (args.verifiedPrincipal) await rememberAuthenticatedUserDm(userId, dmMg, now);
 
-  await wireIfMissing(dmMg, ag, now, 'dm', args.engagePattern, args.senderScope, args.sessionMode);
+  await wireIfMissing(dmMg, ag, now, 'dm', {
+    engagePattern: args.engagePattern,
+    senderScope: args.senderScope,
+    sessionMode: args.sessionMode,
+  });
 
   // 5. Welcome delivery over the CLI socket. Router picks up the line,
   // writes the message into the DM session's inbound.db, and wakes the

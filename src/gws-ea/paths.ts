@@ -14,12 +14,18 @@ export interface ControlPlanePaths {
   stateRoot: string;
   registryFile: string;
   registryLock: string;
+  removalRoot: string;
   instancesRoot: string;
   instanceRoot(instanceId: string): string;
   checkoutRoot(instanceId: string): string;
   journalFile(instanceId: string): string;
   instanceLock(instanceId: string): string;
   markerFile(instanceId: string): string;
+  bootstrapFile(instanceId: string): string;
+  releasePreflightFile(instanceId: string): string;
+  principalSelectionFile(instanceId: string): string;
+  chatConfigurationFile(instanceId: string): string;
+  removalFile(instanceId: string): string;
 }
 
 const REMOTE_FILESYSTEM_TYPES = new Set([
@@ -63,6 +69,7 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
     overrides.stateRoot ?? process.env.GWS_EA_STATE_ROOT ?? path.join(defaultStateBase, 'gws-ea'),
   );
   const instancesRoot = path.join(stateRoot, 'instances');
+  const removalRoot = path.join(configRoot, 'removals');
   const instanceRoot = (instanceId: string): string => path.join(instancesRoot, instanceId);
   const checkoutRoot = (instanceId: string): string => path.join(instanceRoot(instanceId), 'nanoclaw');
 
@@ -71,12 +78,18 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
     stateRoot,
     registryFile: path.join(configRoot, 'instances.json'),
     registryLock: path.join(configRoot, 'instances.lock'),
+    removalRoot,
     instancesRoot,
     instanceRoot,
     checkoutRoot,
     journalFile: (instanceId) => path.join(instanceRoot(instanceId), 'provision.json'),
-    instanceLock: (instanceId) => path.join(instanceRoot(instanceId), 'operation.lock'),
+    instanceLock: (instanceId) => path.join(configRoot, 'locks', `${instanceId}.lock`),
     markerFile: (instanceId) => path.join(checkoutRoot(instanceId), 'data', 'gws-ea', 'instance.json'),
+    bootstrapFile: (instanceId) => path.join(instanceRoot(instanceId), 'bootstrap.json'),
+    releasePreflightFile: (instanceId) => path.join(instanceRoot(instanceId), 'release-preflight.json'),
+    principalSelectionFile: (instanceId) => path.join(instanceRoot(instanceId), 'principal-selection.json'),
+    chatConfigurationFile: (instanceId) => path.join(instanceRoot(instanceId), 'chat-configured.json'),
+    removalFile: (instanceId) => path.join(removalRoot, `${instanceId}.json`),
   };
 }
 

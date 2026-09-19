@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { access, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 
@@ -31,6 +31,7 @@ import {
   type OnecliRuntimeLayout,
 } from './onecli-compose.js';
 import { GwsEaError } from './types.js';
+import { hasControlCharacters, isRecord } from './validation.js';
 
 const EXPECTED_SERVICES = ['app', 'gateway', 'postgres'] as const;
 
@@ -546,6 +547,124 @@ export async function reconcileOnecliRuntime(
   );
 }
 
+export async function removeOnecliRuntime(
+  layout: OnecliRuntimeLayout,
+  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'runCommand' | 'ambientEnv'> = {},
+): Promise<void> {
+  const runner = dependencies.dockerCommandRunner ?? dependencies.runCommand ?? runSanitizedCommand;
+  const environment = buildComposeEnvironment(dependencies.ambientEnv);
+  const containers = await inspectProjectContainers(layout, runner, environment);
+  for (const container of containers) {
+    if (container.instanceId !== layout.instanceId || container.project !== layout.project) {
+      throw new GwsEaError('unsafe_onecli_owner', 'OneCLI removal found a Docker resource owned by another instance');
+    }
+  }
+  const namedResources = await assertOwnedOnecliNamedResources(layout, runner, environment);
+  if (containers.length === 0 && namedResources.length === 0) {
+    try {
+      await access(layout.composeFile);
+    } catch (error) {
+      if (isErrno(error, 'ENOENT')) return;
+      throw error;
+    }
+  }
+  await runner({
+    ...buildComposeInvocation(layout, ['down', '--volumes', '--remove-orphans']),
+    env: environment,
+    timeoutMs: 120_000,
+  });
+  if ((await inspectProjectContainers(layout, runner, environment)).length > 0) {
+    throw new GwsEaError('onecli_removal_incomplete', 'OneCLI containers remain after removal');
+  }
+  if ((await presentOnecliNamedResources(layout, runner, environment)).length > 0) {
+    throw new GwsEaError('onecli_removal_incomplete', 'OneCLI networks or volumes remain after removal');
+  }
+}
+
+interface NamedDockerResource {
+  readonly kind: 'network' | 'volume';
+  readonly name: string;
+  readonly role: string;
+}
+
+function onecliNamedResources(layout: OnecliRuntimeLayout): readonly NamedDockerResource[] {
+  return [
+    { kind: 'network', name: layout.backendNetwork, role: 'backend' },
+    { kind: 'network', name: layout.agentEgressNetwork, role: 'agent-egress' },
+    { kind: 'volume', name: layout.postgresVolume, role: 'postgres-data' },
+    { kind: 'volume', name: layout.appVolume, role: 'app-data' },
+  ];
+}
+
+async function listNamedDockerResource(
+  resource: NamedDockerResource,
+  runner: OnecliCommandRunner,
+  layout: OnecliRuntimeLayout,
+  environment: Readonly<Record<string, string>>,
+  labels: readonly string[] = [],
+): Promise<boolean> {
+  const result = await runner({
+    command: 'docker',
+    args: [
+      resource.kind,
+      'ls',
+      '--filter',
+      `name=^${resource.name}$`,
+      ...labels.flatMap((label) => ['--filter', `label=${label}`]),
+      '--format',
+      '{{.Name}}',
+    ],
+    cwd: path.dirname(layout.rootDirectory),
+    env: environment,
+    timeoutMs: 30_000,
+  });
+  return result.stdout
+    .split(/\r?\n/u)
+    .map((name) => name.trim())
+    .includes(resource.name);
+}
+
+async function presentOnecliNamedResources(
+  layout: OnecliRuntimeLayout,
+  runner: OnecliCommandRunner,
+  environment: Readonly<Record<string, string>>,
+): Promise<readonly NamedDockerResource[]> {
+  const resources = onecliNamedResources(layout);
+  const present = await Promise.all(
+    resources.map(async (resource) => ({
+      resource,
+      present: await listNamedDockerResource(resource, runner, layout, environment),
+    })),
+  );
+  return present.filter((entry) => entry.present).map((entry) => entry.resource);
+}
+
+async function assertOwnedOnecliNamedResources(
+  layout: OnecliRuntimeLayout,
+  runner: OnecliCommandRunner,
+  environment: Readonly<Record<string, string>>,
+): Promise<readonly NamedDockerResource[]> {
+  const resources = await presentOnecliNamedResources(layout, runner, environment);
+  const ownership = await Promise.all(
+    resources.map(async (resource) => ({
+      resource,
+      owned: await listNamedDockerResource(resource, runner, layout, environment, [
+        `${ONECLI_INSTANCE_LABEL}=${layout.instanceId}`,
+        `${ONECLI_RESOURCE_ROLE_LABEL}=${resource.role}`,
+      ]),
+    })),
+  );
+  for (const { resource, owned } of ownership) {
+    if (!owned) {
+      throw new GwsEaError(
+        'unsafe_onecli_owner',
+        `OneCLI ${resource.kind} ${resource.name} is not owned by this instance`,
+      );
+    }
+  }
+  return resources;
+}
+
 export async function cleanupOnecliDockerOrphans(
   layout: OnecliRuntimeLayout,
   runner: OnecliCommandRunner = runSanitizedCommand,
@@ -570,7 +689,7 @@ export async function cleanupOnecliDockerOrphans(
       await runner({
         command: 'docker',
         args: ['container', 'rm', '--force', container.id],
-        cwd: layout.rootDirectory,
+        cwd: path.dirname(layout.rootDirectory),
         env: environment,
         timeoutMs: 30_000,
       });
@@ -588,14 +707,14 @@ export async function inspectOnecliRuntime(
     runner({
       command: 'docker',
       args: ['network', 'inspect', layout.backendNetwork, layout.agentEgressNetwork],
-      cwd: layout.rootDirectory,
+      cwd: path.dirname(layout.rootDirectory),
       env: environment,
       timeoutMs: 30_000,
     }),
     runner({
       command: 'docker',
       args: ['volume', 'inspect', layout.postgresVolume, layout.appVolume],
-      cwd: layout.rootDirectory,
+      cwd: path.dirname(layout.rootDirectory),
       env: environment,
       timeoutMs: 30_000,
     }),
@@ -627,7 +746,7 @@ async function inspectProjectContainers(
       '--format',
       '{{.ID}}',
     ],
-    cwd: layout.rootDirectory,
+    cwd: path.dirname(layout.rootDirectory),
     env: environment,
     timeoutMs: 30_000,
   });
@@ -639,7 +758,7 @@ async function inspectProjectContainers(
   const inspection = await runner({
     command: 'docker',
     args: ['container', 'inspect', ...ids],
-    cwd: layout.rootDirectory,
+    cwd: path.dirname(layout.rootDirectory),
     env: environment,
     timeoutMs: 30_000,
   });
@@ -895,10 +1014,6 @@ function unwrapData(value: unknown): unknown {
   return value;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
 function recordString(value: Record<string, unknown>, key: string): string | undefined {
   return typeof value[key] === 'string' ? value[key] : undefined;
 }
@@ -948,13 +1063,6 @@ function isExpectedGatewayProxy(value: string): boolean {
   if (!URL.canParse(value)) return false;
   const url = new URL(value);
   return url.protocol === 'http:' && url.hostname === 'host.docker.internal' && url.port === '10255';
-}
-
-function hasControlCharacters(value: string): boolean {
-  return [...value].some((character) => {
-    const code = character.codePointAt(0);
-    return code !== undefined && (code <= 0x1f || code === 0x7f);
-  });
 }
 
 async function assertInstalledSdkVersion(): Promise<void> {

@@ -4,6 +4,7 @@ import path from 'node:path';
 import { readJson, writePrivate } from '../community-portal/private-file.js';
 import { processLock } from '../community-portal/process-lock.js';
 import { isErrno } from '../community-portal/errors.js';
+import { deriveGchatServiceAccountEmail, GCP_PROJECT_PATTERN } from './gcp-identity.js';
 import {
   assertLocalOwnedDestination,
   assertOwnedLocalDirectory,
@@ -23,24 +24,13 @@ import {
   type InstanceReservation,
   type InstanceReservationInput,
 } from './types.js';
+import { hasControlCharacters, isRecord } from './validation.js';
 
 const INSTANCE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const RELEASE_TRACK_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
-const GCP_PROJECT_PATTERN = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
 const ONECLI_PROJECT_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-function hasControlCharacters(value: string): boolean {
-  return [...value].some((character) => {
-    const code = character.codePointAt(0);
-    return code !== undefined && (code <= 0x1f || code === 0x7f);
-  });
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 function assertExactKeys(value: Record<string, unknown>, expected: readonly string[], label: string): void {
   const actual = Object.keys(value).sort();
@@ -128,11 +118,17 @@ function validateClaims(value: unknown): ExclusiveResourceClaims {
   if (!isRecord(value)) throw new GwsEaError('invalid_claim', 'exclusive_resource_claims is invalid');
   assertExactKeys(
     value,
-    ['endpoint_url', 'gcp_project_id', 'chat_app_id', 'chat_credential_id', 'workspace_email', 'onecli_project'],
+    ['endpoint_url', 'gcp_project_id', 'gcp_account', 'gchat_service_account', 'workspace_email', 'onecli_project'],
     'exclusive_resource_claims',
   );
   const gcpProject = requireString(value.gcp_project_id, 'gcp_project_id', 30).toLowerCase();
   if (!GCP_PROJECT_PATTERN.test(gcpProject)) throw new GwsEaError('invalid_claim', 'GCP project ID is invalid');
+  const gcpAccount = requireString(value.gcp_account, 'gcp_account', 320).toLowerCase();
+  if (!EMAIL_PATTERN.test(gcpAccount)) throw new GwsEaError('invalid_claim', 'GCP account is invalid');
+  const serviceAccount = requireString(value.gchat_service_account, 'gchat_service_account', 320).toLowerCase();
+  if (serviceAccount !== deriveGchatServiceAccountEmail(gcpProject)) {
+    throw new GwsEaError('invalid_claim', 'Google Chat service-account identity is invalid');
+  }
   const workspaceEmail = requireString(value.workspace_email, 'workspace_email', 320).toLowerCase();
   if (!EMAIL_PATTERN.test(workspaceEmail)) throw new GwsEaError('invalid_claim', 'Workspace email is invalid');
   const onecliProject = requireString(value.onecli_project, 'onecli_project', 63).toLowerCase();
@@ -142,8 +138,8 @@ function validateClaims(value: unknown): ExclusiveResourceClaims {
   return {
     endpoint_url: validateEndpoint(value.endpoint_url),
     gcp_project_id: gcpProject,
-    chat_app_id: requireString(value.chat_app_id, 'chat_app_id', 256),
-    chat_credential_id: requireString(value.chat_credential_id, 'chat_credential_id', 256),
+    gcp_account: gcpAccount,
+    gchat_service_account: serviceAccount,
     workspace_email: workspaceEmail,
     onecli_project: onecliProject,
   };
@@ -237,8 +233,7 @@ function claimKeys(instance: InstanceReservation): string[] {
     ...Object.values(instance.allocated_ports).map((port) => `port:${port}`),
     `endpoint:${claims.endpoint_url}`,
     `gcp-project:${claims.gcp_project_id}`,
-    `chat-app:${claims.chat_app_id}`,
-    `chat-credential:${claims.chat_credential_id}`,
+    `gchat-service-account:${claims.gchat_service_account}`,
     `workspace-email:${claims.workspace_email}`,
     `onecli-project:${claims.onecli_project}`,
   ];
@@ -301,6 +296,27 @@ export async function getInstanceReservation(
   const instance = registry.instances[instanceId];
   if (!instance) throw new GwsEaError('unknown_instance', 'Unknown instance ID');
   return instance;
+}
+
+export async function releaseInstanceReservation(
+  paths: ControlPlanePaths,
+  expected: InstanceReservation,
+): Promise<void> {
+  const validated = validateReservation(expected, paths);
+  const release = await acquireMachineLock(paths);
+  try {
+    const registry = await readRegistryFile(paths);
+    const stored = registry.instances[validated.instance_id];
+    if (!stored) return;
+    if (JSON.stringify(stored) !== JSON.stringify(validated)) {
+      throw new GwsEaError('reservation_mismatch', 'Instance reservation changed during removal; refusing release');
+    }
+    const instances = { ...registry.instances };
+    delete instances[validated.instance_id];
+    await writePrivate(paths.registryFile, { schema_version: REGISTRY_SCHEMA_VERSION, instances });
+  } finally {
+    release();
+  }
 }
 
 function validateMarker(value: unknown): InstanceMarker {

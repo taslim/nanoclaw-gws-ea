@@ -1,11 +1,7 @@
-import {
-  buildInstanceCliCommand,
-  runInstanceOnecliAdminCommand,
-  validateRuntimeConfig,
-  type InstanceRuntimeConfig,
-} from './service.js';
-import { runSanitizedCommand } from './process.js';
+import { runInstanceOnecliAdminCommand, validateRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
+import { runInstanceNclJson } from './ncl.js';
 import { GwsEaError } from './types.js';
+import { hasControlCharacters, isRecord } from './validation.js';
 import { isValidTimezone } from '../timezone.js';
 
 const MAIN_TEMPLATE = 'gws-ea/main';
@@ -39,10 +35,6 @@ interface OnecliAgent {
   readonly secretMode: string;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
 function unwrapData(value: unknown): unknown {
   return isRecord(value) && 'data' in value ? value.data : value;
 }
@@ -60,13 +52,6 @@ function safeString(value: unknown, label: string, maxLength = 256): string {
     throw new GwsEaError('invalid_identity', `${label} is invalid`);
   }
   return value;
-}
-
-function hasControlCharacters(value: string): boolean {
-  return [...value].some((character) => {
-    const code = character.codePointAt(0);
-    return code !== undefined && (code <= 0x1f || code === 0x7f);
-  });
 }
 
 function parseGroupResult(value: unknown): { id: string; name: string } {
@@ -120,16 +105,6 @@ function exactAgent(agents: readonly OnecliAgent[], agentGroupId: string): Onecl
     throw new GwsEaError('onecli_agent_collision', 'The OneCLI main name has an agent identity collision');
   }
   return match;
-}
-
-async function defaultRunNcl(config: InstanceRuntimeConfig, args: readonly string[]): Promise<unknown> {
-  const command = buildInstanceCliCommand(config, [...args, '--json']);
-  const result = await runSanitizedCommand({ ...command, timeoutMs: 30_000 });
-  const frame = parseJson(result.stdout, 'ncl');
-  if (!isRecord(frame) || frame.ok !== true || !('data' in frame)) {
-    throw new GwsEaError('ncl_failed', 'The selected NanoClaw command did not succeed');
-  }
-  return frame.data;
 }
 
 async function defaultRunOnecliAdmin(config: InstanceRuntimeConfig, args: readonly string[]): Promise<unknown> {
@@ -208,7 +183,7 @@ export async function reconcileMainIdentity(
 ): Promise<MainIdentityResult> {
   const config = validateRuntimeConfig(configInput);
   const input = validateInput(inputValue);
-  const runNcl = dependencies.runNcl ?? defaultRunNcl;
+  const runNcl = dependencies.runNcl ?? runInstanceNclJson;
   const runOnecliAdmin = dependencies.runOnecliAdmin ?? defaultRunOnecliAdmin;
 
   const group = parseGroupResult(

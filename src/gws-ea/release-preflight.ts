@@ -3,8 +3,14 @@ import path from 'node:path';
 
 import { parse as parseYaml } from 'yaml';
 
-import { runArgumentCommand } from './checkout.js';
+import {
+  prepareReleaseCommandEnvironments,
+  runArgumentCommand,
+  type CommandRunner,
+  type ReleaseCommandEnvironments,
+} from './checkout.js';
 import { GwsEaError } from './types.js';
+import { isRecord } from './validation.js';
 
 const PROVIDER_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const EXACT_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
@@ -13,6 +19,7 @@ export interface SetupCommand {
   command: 'pnpm';
   args: readonly string[];
   cwd: string;
+  env: Readonly<Record<string, string>>;
 }
 
 export interface ReleasePreflightInput {
@@ -21,6 +28,7 @@ export interface ReleasePreflightInput {
 }
 
 export interface ReleasePreflightRuntime {
+  runCommand?: CommandRunner;
   runSetupCommand?: (command: SetupCommand) => Promise<void>;
 }
 
@@ -34,13 +42,7 @@ export interface ReleasePreflightResult {
   };
 }
 
-interface JsonRecord {
-  [key: string]: unknown;
-}
-
-function isRecord(value: unknown): value is JsonRecord {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
+type JsonRecord = Record<string, unknown>;
 
 function requireRecord(value: unknown, label: string, code = 'incomplete_release'): JsonRecord {
   if (!isRecord(value)) throw new GwsEaError(code, `${label} must be an object`);
@@ -70,33 +72,67 @@ async function assertPhysicalCheckout(checkoutRoot: string): Promise<string> {
   return resolved;
 }
 
-async function git(checkoutRoot: string, args: readonly string[]): Promise<string> {
-  return (await runArgumentCommand({ command: 'git', args, cwd: checkoutRoot })).stdout.trim();
+async function git(
+  checkoutRoot: string,
+  args: readonly string[],
+  run: CommandRunner,
+  environments: ReleaseCommandEnvironments,
+): Promise<string> {
+  return (await run({ command: 'git', args, cwd: checkoutRoot, env: environments.git })).stdout.trim();
 }
 
-async function assertClean(checkoutRoot: string, phase: string): Promise<void> {
-  const status = await git(checkoutRoot, ['status', '--porcelain=v1', '--untracked-files=all']);
+async function assertClean(
+  checkoutRoot: string,
+  phase: string,
+  run: CommandRunner,
+  environments: ReleaseCommandEnvironments,
+): Promise<void> {
+  const status = await git(checkoutRoot, ['status', '--porcelain=v1', '--untracked-files=all'], run, environments);
   if (status) throw new GwsEaError('checkout_drift', `Release checkout changed during ${phase}:\n${status}`);
 }
 
-async function assertDetachedCommit(checkoutRoot: string): Promise<void> {
-  const head = await git(checkoutRoot, ['rev-parse', '--verify', 'HEAD^{commit}']);
+async function assertDetachedCommit(
+  checkoutRoot: string,
+  run: CommandRunner,
+  environments: ReleaseCommandEnvironments,
+): Promise<void> {
+  const head = await git(checkoutRoot, ['rev-parse', '--verify', 'HEAD^{commit}'], run, environments);
   if (!/^[0-9a-f]{40}$/.test(head)) {
     throw new GwsEaError('incomplete_release', 'Release checkout HEAD is not a full commit');
   }
-  if ((await git(checkoutRoot, ['rev-parse', '--abbrev-ref', 'HEAD'])) !== 'HEAD') {
+  if ((await git(checkoutRoot, ['rev-parse', '--abbrev-ref', 'HEAD'], run, environments)) !== 'HEAD') {
     throw new GwsEaError('checkout_not_detached', 'Release checkout HEAD must be detached');
   }
 }
 
-async function assertCommittedRegularFiles(checkoutRoot: string, relativePaths: readonly string[]): Promise<void> {
-  for (const relativePath of relativePaths) {
-    const absolutePath = path.join(checkoutRoot, relativePath);
-    let info;
-    try {
-      info = await lstat(absolutePath);
-      await git(checkoutRoot, ['ls-files', '--error-unmatch', '--', relativePath]);
-    } catch {
+async function assertCommittedRegularFiles(
+  checkoutRoot: string,
+  relativePaths: readonly string[],
+  run: CommandRunner,
+  environments: ReleaseCommandEnvironments,
+): Promise<void> {
+  const [trackedResult, fileInfo] = await Promise.all([
+    run({
+      command: 'git',
+      args: ['ls-files', '-z', '--', ...relativePaths],
+      cwd: checkoutRoot,
+      env: environments.git,
+    }),
+    Promise.all(
+      relativePaths.map(async (relativePath) => {
+        try {
+          return await lstat(path.join(checkoutRoot, relativePath));
+          /* eslint-disable-next-line no-catch-all/no-catch-all -- Every lstat failure means the required release file is unusable. */
+        } catch {
+          return undefined;
+        }
+      }),
+    ),
+  ]);
+  const tracked = new Set(trackedResult.stdout.split('\0').filter(Boolean));
+  for (const [index, relativePath] of relativePaths.entries()) {
+    const info = fileInfo[index];
+    if (!info || !tracked.has(relativePath)) {
       throw new GwsEaError('incomplete_release', `Required committed release file is missing: ${relativePath}`);
     }
     if (info.isSymbolicLink() || !info.isFile()) {
@@ -105,20 +141,49 @@ async function assertCommittedRegularFiles(checkoutRoot: string, relativePaths: 
   }
 }
 
+async function assertRuntimeArtifacts(checkoutRoot: string): Promise<void> {
+  for (const relativePath of ['dist/gws-ea/process.js', 'dist/index.js']) {
+    let info;
+    try {
+      info = await lstat(path.join(checkoutRoot, relativePath));
+    } catch {
+      throw new GwsEaError('incomplete_release', `Required build artifact is missing: ${relativePath}`);
+    }
+    if (info.isSymbolicLink() || !info.isFile()) {
+      throw new GwsEaError('incomplete_release', `Required build artifact must be a regular file: ${relativePath}`);
+    }
+  }
+  const launcher = await lstat(path.join(checkoutRoot, 'bin', 'ncl'));
+  if ((launcher.mode & 0o111) === 0) {
+    throw new GwsEaError('incomplete_release', 'Required ncl launcher is not executable');
+  }
+}
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-async function assertBarrelImport(
+interface BarrelImportExpectation {
+  readonly barrel: string;
+  readonly moduleName: string;
+  readonly code: string;
+}
+
+async function assertBarrelImports(
   checkoutRoot: string,
-  barrel: string,
-  moduleName: string,
-  code: string,
+  expectations: readonly BarrelImportExpectation[],
 ): Promise<void> {
-  const source = await readFile(path.join(checkoutRoot, barrel), 'utf8');
-  const importPattern = new RegExp(`^\\s*import\\s+['"]\\./${escapeRegExp(moduleName)}\\.js['"]\\s*;?\\s*$`, 'm');
-  if (!importPattern.test(source)) {
-    throw new GwsEaError(code, `${moduleName} is not composed in ${barrel}`);
+  const sources = await Promise.all(
+    expectations.map(({ barrel }) => readFile(path.join(checkoutRoot, barrel), 'utf8')),
+  );
+  for (const [index, expectation] of expectations.entries()) {
+    const importPattern = new RegExp(
+      `^\\s*import\\s+['"]\\./${escapeRegExp(expectation.moduleName)}\\.js['"]\\s*;?\\s*$`,
+      'm',
+    );
+    if (!importPattern.test(sources[index]!)) {
+      throw new GwsEaError(expectation.code, `${expectation.moduleName} is not composed in ${expectation.barrel}`);
+    }
   }
 }
 
@@ -198,7 +263,12 @@ async function validatePackageAndPins(
   return { packageManager, gateway, cli, sdk };
 }
 
-async function validateComposition(checkoutRoot: string, provider: string): Promise<void> {
+async function validateComposition(
+  checkoutRoot: string,
+  provider: string,
+  run: CommandRunner,
+  environments: ReleaseCommandEnvironments,
+): Promise<void> {
   if (!PROVIDER_PATTERN.test(provider)) {
     throw new GwsEaError('provider_not_composed', 'Selected provider name is invalid');
   }
@@ -206,9 +276,15 @@ async function validateComposition(checkoutRoot: string, provider: string): Prom
     'package.json',
     'pnpm-lock.yaml',
     'versions.json',
+    'bin/ncl',
     'templates/gws-ea/main/plugin.json',
     'src/channels/gchat.ts',
     'src/channels/index.ts',
+    'src/gws-ea/process.ts',
+    'scripts/init-first-agent.ts',
+    'src/modules/gws-ea-profile/index.ts',
+    'src/modules/gws-ea-profile/migration.ts',
+    'src/modules/index.ts',
   ];
   const providerFiles = [
     `src/provider-contracts/${provider}.ts`,
@@ -222,16 +298,17 @@ async function validateComposition(checkoutRoot: string, provider: string): Prom
     `container/agent-runner/src/providers/${provider}.conformance.test.ts`,
   ];
   try {
-    await assertCommittedRegularFiles(checkoutRoot, [...commonFiles, ...providerFiles]);
-    await assertBarrelImport(checkoutRoot, 'src/channels/index.ts', 'gchat', 'incomplete_release');
-    for (const barrel of [
-      'src/provider-contracts/index.ts',
-      'setup/providers/index.ts',
-      'container/agent-runner/src/providers/index.ts',
-      'container/agent-runner/src/provider-contracts/index.ts',
-    ]) {
-      await assertBarrelImport(checkoutRoot, barrel, provider, 'provider_not_composed');
-    }
+    await assertCommittedRegularFiles(checkoutRoot, [...commonFiles, ...providerFiles], run, environments);
+    await assertBarrelImports(checkoutRoot, [
+      { barrel: 'src/channels/index.ts', moduleName: 'gchat', code: 'incomplete_release' },
+      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-profile/index', code: 'incomplete_release' },
+      ...[
+        'src/provider-contracts/index.ts',
+        'setup/providers/index.ts',
+        'container/agent-runner/src/providers/index.ts',
+        'container/agent-runner/src/provider-contracts/index.ts',
+      ].map((barrel) => ({ barrel, moduleName: provider, code: 'provider_not_composed' })),
+    ]);
   } catch (error) {
     if (
       error instanceof GwsEaError &&
@@ -264,16 +341,24 @@ export async function runReleasePreflight(
   runtime: ReleasePreflightRuntime = {},
 ): Promise<ReleasePreflightResult> {
   const checkoutRoot = await assertPhysicalCheckout(input.checkoutRoot);
-  await assertDetachedCommit(checkoutRoot);
-  await assertClean(checkoutRoot, 'initial preflight');
-  await validateComposition(checkoutRoot, input.provider);
+  const environments = await prepareReleaseCommandEnvironments(path.dirname(checkoutRoot));
+  const runCommand = runtime.runCommand ?? runArgumentCommand;
+  await assertDetachedCommit(checkoutRoot, runCommand, environments);
+  await assertClean(checkoutRoot, 'initial preflight', runCommand, environments);
+  await validateComposition(checkoutRoot, input.provider, runCommand, environments);
   const pins = await validatePackageAndPins(checkoutRoot);
   const runSetupCommand = runtime.runSetupCommand ?? defaultSetupCommand;
 
-  await runSetupCommand({ command: 'pnpm', args: ['install', '--frozen-lockfile'], cwd: checkoutRoot });
-  await assertClean(checkoutRoot, 'frozen dependency installation');
-  await runSetupCommand({ command: 'pnpm', args: ['run', 'build'], cwd: checkoutRoot });
-  await assertClean(checkoutRoot, 'release build');
+  await runSetupCommand({
+    command: 'pnpm',
+    args: ['install', '--frozen-lockfile'],
+    cwd: checkoutRoot,
+    env: environments.common,
+  });
+  await assertClean(checkoutRoot, 'frozen dependency installation', runCommand, environments);
+  await runSetupCommand({ command: 'pnpm', args: ['run', 'build'], cwd: checkoutRoot, env: environments.common });
+  await assertClean(checkoutRoot, 'release build', runCommand, environments);
+  await assertRuntimeArtifacts(checkoutRoot);
 
   return {
     provider: input.provider,
