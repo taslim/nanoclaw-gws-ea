@@ -1273,6 +1273,10 @@ function readPersistedProfile(runtime: InstanceRuntimeConfig): PersistedProfileI
     throw error;
   }
   try {
+    const profileTable = database
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gws_ea_profile'")
+      .get();
+    if (!profileTable) return undefined;
     return database
       .prepare(
         `SELECT assistant_display_name, assistant_workspace_email,

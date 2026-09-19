@@ -55,12 +55,20 @@ function isFilesystemError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && 'code' in error && typeof error.code === 'string';
 }
 
-async function assertTrustedPathComponent(component: string, expectFile: boolean): Promise<void> {
+async function assertTrustedPathComponent(
+  component: string,
+  expectFile: boolean,
+  allowUnownedComponent = false,
+): Promise<void> {
   const info = await stat(component);
   if (expectFile ? !info.isFile() : !info.isDirectory()) {
     throw new GwsEaError('untrusted_executable', 'A required executable has an invalid filesystem type');
   }
-  if (!isAllowedOwner(info.uid) || (info.mode & 0o002) !== 0) {
+  if ((info.mode & 0o002) !== 0) {
+    throw new GwsEaError('untrusted_executable', 'A required executable is stored in an unsafe location');
+  }
+  const allowedOwner = isAllowedOwner(info.uid);
+  if (!allowedOwner && (!allowUnownedComponent || (info.mode & 0o020) !== 0)) {
     throw new GwsEaError('untrusted_executable', 'A required executable is stored in an unsafe location');
   }
   // Homebrew and /Applications commonly have group-writable, root/current-user
@@ -70,11 +78,15 @@ async function assertTrustedPathComponent(component: string, expectFile: boolean
   }
 }
 
-async function assertTrustedCanonicalPath(canonicalPath: string, expectFile: boolean): Promise<void> {
-  await assertTrustedPathComponent(canonicalPath, expectFile);
+async function assertTrustedCanonicalPath(
+  canonicalPath: string,
+  expectFile: boolean,
+  allowUnownedComponents = false,
+): Promise<void> {
+  await assertTrustedPathComponent(canonicalPath, expectFile, allowUnownedComponents);
   let directory = expectFile ? path.dirname(canonicalPath) : canonicalPath;
   while (true) {
-    await assertTrustedPathComponent(directory, false);
+    await assertTrustedPathComponent(directory, false, allowUnownedComponents);
     const parent = path.dirname(directory);
     if (parent === directory) return;
     directory = parent;
@@ -109,15 +121,25 @@ async function resolveFromTrustedDirectories(command: string, directories: reado
     : command === path.basename(command)
       ? directories.map((directory) => path.join(directory, command))
       : [];
+  const runningNode = await realpath(process.execPath);
   for (const candidate of candidates) {
     try {
       await access(candidate, fsConstants.X_OK);
       const canonical = await realpath(candidate);
-      await assertTrustedCanonicalPath(canonical, true);
+      await assertTrustedCanonicalPath(canonical, true, canonical === runningNode);
       return canonical;
     } catch (error) {
       if (!(error instanceof GwsEaError) && !isFilesystemError(error)) throw error;
       // A hostile PATH entry must not shadow a later trusted installation.
+    }
+  }
+  if (!path.isAbsolute(command) && command === path.basename(process.execPath)) {
+    try {
+      await access(runningNode, fsConstants.X_OK);
+      await assertTrustedCanonicalPath(runningNode, true, true);
+      return runningNode;
+    } catch (error) {
+      if (!(error instanceof GwsEaError) && !isFilesystemError(error)) throw error;
     }
   }
   throw new GwsEaError('untrusted_executable', `No trusted ${path.basename(command)} executable is available`);

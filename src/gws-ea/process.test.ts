@@ -1,7 +1,7 @@
 import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { buildAllowlistedEnvironment, resolveTrustedExecutable, runSanitizedCommand } from './process.js';
 
@@ -107,5 +107,29 @@ describe('GWS-EA process boundary', () => {
   it('accepts executables owned by root or the current user', async () => {
     await expect(resolveTrustedExecutable('/bin/sh')).resolves.toMatch(/^\//u);
     await expect(resolveTrustedExecutable(process.execPath)).resolves.toMatch(/^\//u);
+  });
+
+  it('falls back only to the running Node executable through a non-owner path', async () => {
+    if (typeof process.getuid !== 'function') return;
+    const root = await mkdtemp(path.join(process.cwd(), '.gws-ea-managed-node-'));
+    const runningNode = path.join(root, 'managed-node');
+    const otherExecutable = path.join(root, 'other-tool');
+    const originalExecPath = process.execPath;
+    const uid = process.getuid();
+    const getuid = vi.spyOn(process, 'getuid').mockReturnValue(uid + 1);
+    try {
+      await writeFile(runningNode, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      await writeFile(otherExecutable, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      process.execPath = runningNode;
+
+      await expect(resolveTrustedExecutable(path.basename(runningNode), root)).resolves.toBe(
+        await realpath(runningNode),
+      );
+      await expect(resolveTrustedExecutable(otherExecutable)).rejects.toMatchObject({ code: 'untrusted_executable' });
+    } finally {
+      process.execPath = originalExecPath;
+      getuid.mockRestore();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

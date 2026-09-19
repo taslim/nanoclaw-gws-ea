@@ -1,7 +1,8 @@
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { readProvisionJournal, withInstanceOperation } from './journal.js';
@@ -12,6 +13,7 @@ import {
   loadProductionBootstrapManifest,
   reconcileProvisioning,
   removeProductionBootstrapManifest,
+  runProductionProvision,
   ProvisionBoundaryInterruption,
   type ProductionBootstrapManifest,
   type ProductionProvisionContext,
@@ -20,10 +22,15 @@ import {
 import { defineProvisionPhaseRegistry, type ProvisionPhaseDefinition } from './phases.js';
 import type { MainIdentityDependencies } from './identity.js';
 import { reserveInstance } from './registry.js';
-import { createOnecliRuntimeLayout } from './onecli-compose.js';
+import {
+  createOnecliRuntimeLayout,
+  ONECLI_CLI_VERSION,
+  ONECLI_GATEWAY_VERSION,
+  ONECLI_SDK_VERSION,
+} from './onecli-compose.js';
 import type { OnecliCompatibilityReceipt } from './onecli.js';
 import { holdLoopbackPorts } from './ports.js';
-import { createInstanceRuntimeConfig } from './service.js';
+import { createInstanceRuntimeConfig, persistInstanceRuntime } from './service.js';
 import {
   PROVISION_PHASES,
   type AllocatedPorts,
@@ -181,8 +188,8 @@ function registry(context: FixtureContext) {
   });
 }
 
-afterEach(() => {
-  roots.length = 0;
+afterEach(async () => {
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
 describe('resumable provision phase runner', () => {
@@ -317,6 +324,54 @@ describe('production bootstrap trust boundary', () => {
     await removeProductionBootstrapManifest(paths, input.instance_id);
     await expect(readFile(paths.bootstrapFile(input.instance_id), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(readFile(paths.instanceRoot(input.instance_id), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('treats a database created before the profile migration as unpublished', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation(paths));
+    const onecli = createOnecliRuntimeLayout({
+      instanceId: reserved.instance_id,
+      instanceRoot: paths.instanceRoot(reserved.instance_id),
+      project: reserved.exclusive_resource_claims.onecli_project,
+      appPort: reserved.allocated_ports.onecli_app,
+      gatewayPort: reserved.allocated_ports.onecli_gateway,
+      cliExecutable: '/usr/local/bin/onecli',
+    });
+    const runtime = createInstanceRuntimeConfig(reserved, onecli, {
+      nodePath: process.execPath,
+      homeDirectory: path.dirname(paths.stateRoot),
+      selectedProvider: 'claude',
+    });
+    await persistInstanceRuntime(runtime);
+    await writeFile(
+      paths.releasePreflightFile(reserved.instance_id),
+      `${JSON.stringify({
+        schema_version: 1,
+        instance_id: reserved.instance_id,
+        deployed_commit: reserved.deployed_commit,
+        provider: 'claude',
+        providerCapabilityDigest,
+        providerCredential: {
+          name: 'Claude provider',
+          type: 'api_key',
+          hostPattern: 'api.anthropic.com',
+          headerName: 'x-api-key',
+        },
+        packageManager: 'pnpm@10.0.0',
+        onecli: {
+          gateway: ONECLI_GATEWAY_VERSION,
+          cli: ONECLI_CLI_VERSION,
+          sdk: ONECLI_SDK_VERSION,
+        },
+      })}\n`,
+      { mode: 0o600 },
+    );
+    await mkdir(path.join(reserved.checkout_realpath, 'data'), { recursive: true });
+    new Database(path.join(reserved.checkout_realpath, 'data', 'v2.db')).close();
+
+    await expect(
+      withInstanceOperation(paths, reserved.instance_id, (operation) => runProductionProvision(operation)),
+    ).rejects.toMatchObject({ code: 'bootstrap_required' });
   });
 });
 
