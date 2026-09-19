@@ -123,7 +123,7 @@ describe('GWS-EA process boundary', () => {
     await expect(resolveTrustedExecutable(trustedNode)).resolves.toMatch(/^\//u);
   });
 
-  it('trusts only the running Node executable through managed installation ancestors', async () => {
+  it('does not waive ownership for the running Node executable', async () => {
     if (typeof process.getuid !== 'function') return;
     const root = await mkdtemp(path.join(process.cwd(), '.gws-ea-managed-node-'));
     const runningNode = path.join(root, 'managed-node');
@@ -132,17 +132,14 @@ describe('GWS-EA process boundary', () => {
     const uid = process.getuid();
     const getuid = vi.spyOn(process, 'getuid').mockReturnValue(uid + 1);
     try {
-      await chmod(root, 0o777);
       await writeFile(runningNode, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
       await writeFile(otherExecutable, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
       process.execPath = runningNode;
 
-      await chmod(runningNode, 0o775);
       await expect(resolveTrustedExecutable(runningNode)).rejects.toMatchObject({ code: 'untrusted_executable' });
-      await chmod(runningNode, 0o755);
-      await expect(resolveTrustedExecutable(path.basename(runningNode), root)).resolves.toBe(
-        await realpath(runningNode),
-      );
+      await expect(resolveTrustedExecutable(path.basename(runningNode), root)).rejects.toMatchObject({
+        code: 'untrusted_executable',
+      });
       await expect(resolveTrustedExecutable(otherExecutable)).rejects.toMatchObject({ code: 'untrusted_executable' });
     } finally {
       process.execPath = originalExecPath;

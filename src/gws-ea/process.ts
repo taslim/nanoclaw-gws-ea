@@ -55,11 +55,7 @@ function isFilesystemError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && 'code' in error && typeof error.code === 'string';
 }
 
-async function assertTrustedPathComponent(
-  component: string,
-  expectFile: boolean,
-  allowUnownedComponent = false,
-): Promise<void> {
+async function assertTrustedPathComponent(component: string, expectFile: boolean): Promise<void> {
   const info = await stat(component);
   if (expectFile ? !info.isFile() : !info.isDirectory()) {
     throw new GwsEaError('untrusted_executable', 'A required executable has an invalid filesystem type');
@@ -68,7 +64,7 @@ async function assertTrustedPathComponent(
     throw new GwsEaError('untrusted_executable', 'A required executable is stored in an unsafe location');
   }
   const allowedOwner = isAllowedOwner(info.uid);
-  if (!allowedOwner && !allowUnownedComponent) {
+  if (!allowedOwner) {
     throw new GwsEaError('untrusted_executable', 'A required executable is stored in an unsafe location');
   }
   // Homebrew and /Applications commonly have group-writable, root/current-user
@@ -122,13 +118,7 @@ async function resolveFromTrustedDirectories(command: string, directories: reado
     try {
       await access(candidate, fsConstants.X_OK);
       const canonical = await realpath(candidate);
-      if (canonical === runningNode) {
-        // The runtime chose this exact binary before GWS-EA started. Keep the
-        // file write checks, but do not reject managed installation ancestors.
-        await assertTrustedPathComponent(canonical, true, true);
-      } else {
-        await assertTrustedCanonicalPath(canonical, true);
-      }
+      await assertTrustedCanonicalPath(canonical, true);
       return canonical;
     } catch (error) {
       if (!(error instanceof GwsEaError) && !isFilesystemError(error)) throw error;
@@ -138,7 +128,7 @@ async function resolveFromTrustedDirectories(command: string, directories: reado
   if (!path.isAbsolute(command) && command === path.basename(process.execPath)) {
     try {
       await access(runningNode, fsConstants.X_OK);
-      await assertTrustedPathComponent(runningNode, true, true);
+      await assertTrustedCanonicalPath(runningNode, true);
       return runningNode;
     } catch (error) {
       if (!(error instanceof GwsEaError) && !isFilesystemError(error)) throw error;
