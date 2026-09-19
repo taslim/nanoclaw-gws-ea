@@ -55,7 +55,6 @@ function reservation(paths: ControlPlanePaths, instanceId = allocateInstanceId()
 
 function createArgs(setupFile?: string): string[] {
   const args = [
-    'assistants',
     'create',
     '--track',
     'dogfood',
@@ -378,7 +377,7 @@ describe('create recovery contract', () => {
     expect(persistedBootstrap).not.toContain('gchat-secret');
 
     expect(
-      await runCli(['assistants', 'resume', '--id', instanceId], {
+      await runCli(['resume', '--id', instanceId], {
         paths,
         stdout: () => undefined,
         stderr: () => undefined,
@@ -420,7 +419,7 @@ describe('create recovery contract', () => {
     };
 
     expect(
-      await runCli(['assistants', 'create', '--track', 'dogfood'], {
+      await runCli(['create', '--track', 'dogfood'], {
         paths,
         stdout: (line) => output.push(line),
         stderr: () => undefined,
@@ -432,15 +431,15 @@ describe('create recovery contract', () => {
     expect(idWasPrintedBeforeCollection).toBe(true);
     const instanceId = output[0]!.slice('instance_id: '.length);
     expect(output).toContain(
-      `  "Primary DM": gws-ea assistants resume --id ${instanceId} --messaging-group-id 'gchat:spaces/AAA'`,
+      `  "Primary DM": gws-ea resume --id ${instanceId} --messaging-group-id 'gchat:spaces/AAA'`,
     );
     expect(output).toContain(
-      `  "Second DM": gws-ea assistants resume --id ${instanceId} --messaging-group-id 'gchat:spaces/O'\\''Brien'`,
+      `  "Second DM": gws-ea resume --id ${instanceId} --messaging-group-id 'gchat:spaces/O'\\''Brien'`,
     );
 
     const resumeOutput: string[] = [];
     expect(
-      await runCli(['assistants', 'resume', '--id', instanceId], {
+      await runCli(['resume', '--id', instanceId], {
         paths,
         stdout: (line) => resumeOutput.push(line),
         stderr: () => undefined,
@@ -448,7 +447,7 @@ describe('create recovery contract', () => {
       }),
     ).toBe(0);
     expect(resumeOutput).toContain(
-      `  "Primary DM": gws-ea assistants resume --id ${instanceId} --messaging-group-id 'gchat:spaces/AAA'`,
+      `  "Primary DM": gws-ea resume --id ${instanceId} --messaging-group-id 'gchat:spaces/AAA'`,
     );
   });
 
@@ -456,7 +455,7 @@ describe('create recovery contract', () => {
     const paths = await testPaths();
     const stdout: string[] = [];
     const stderr: string[] = [];
-    const exitCode = await runCli(['assistants', 'create', '--track', 'dogfood'], {
+    const exitCode = await runCli(['create', '--track', 'dogfood'], {
       paths,
       stdout: (line) => stdout.push(line),
       stderr: (line) => stderr.push(line),
@@ -467,7 +466,7 @@ describe('create recovery contract', () => {
 
     expect(exitCode).toBe(1);
     expect(stdout[0]).toMatch(/^instance_id: [0-9a-f-]{36}$/u);
-    expect(stderr.join('\n')).toContain('gws-ea assistants create --track dogfood');
+    expect(stderr.join('\n')).toContain('gws-ea create --track dogfood');
     expect((await readRegistry(paths)).instances).toEqual({});
   });
 
@@ -490,7 +489,7 @@ describe('create recovery contract', () => {
 
     expect(exitCode).toBe(1);
     expect(stdout[0]).toMatch(/^instance_id: [0-9a-f-]{36}$/u);
-    expect(stderr.join('\n')).toContain('gws-ea assistants create --track dogfood');
+    expect(stderr.join('\n')).toContain('gws-ea create --track dogfood');
     expect((await readRegistry(paths)).instances).toEqual({});
   });
 
@@ -566,12 +565,12 @@ describe('create recovery contract', () => {
     const instanceId = stdout[0]!.slice('instance_id: '.length);
     expect(Object.keys((await readRegistry(paths)).instances)).toEqual([instanceId]);
     await expect(readFile(paths.bootstrapFile(instanceId), 'utf8')).resolves.toContain('"schema_version": 1');
-    expect(stderr.join('\n')).toContain(`gws-ea assistants resume --id ${instanceId}`);
+    expect(stderr.join('\n')).toContain(`gws-ea resume --id ${instanceId}`);
     expect(`${stdout.join('\n')}\n${stderr.join('\n')}`).not.toContain(secretCanary);
 
     const resumed: string[] = [];
     expect(
-      await runCli(['assistants', 'resume', '--id', instanceId], {
+      await runCli(['resume', '--id', instanceId], {
         paths,
         stdout: () => undefined,
         stderr: () => undefined,
@@ -614,7 +613,7 @@ describe('create recovery contract', () => {
     const instanceId = stdout[0]!.slice('instance_id: '.length);
     expect(Object.keys((await readRegistry(paths)).instances)).toEqual([instanceId]);
     await expect(readFile(paths.bootstrapFile(instanceId), 'utf8')).resolves.toContain('"schema_version": 1');
-    expect(stderr.join('\n')).toContain(`gws-ea assistants resume --id ${instanceId}`);
-    expect(stderr.join('\n')).not.toContain('gws-ea assistants create --track');
+    expect(stderr.join('\n')).toContain(`gws-ea resume --id ${instanceId}`);
+    expect(stderr.join('\n')).not.toContain('gws-ea create --track');
   });
 });

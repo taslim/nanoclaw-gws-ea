@@ -141,7 +141,7 @@ function safeErrorMessage(error: unknown): string {
 
 function createRetryCommand(track: string | undefined): string {
   const safeTrack = track && /^[a-z0-9][a-z0-9._-]{0,63}$/.test(track) ? track : '<track>';
-  return `gws-ea assistants create --track ${safeTrack}`;
+  return `gws-ea create --track ${safeTrack}`;
 }
 
 function shellQuote(value: string): string {
@@ -158,12 +158,12 @@ function printPause(
     output('Eligible principal conversations:');
     for (const choice of result.pause.choices) {
       output(
-        `  ${JSON.stringify(choice.label)}: gws-ea assistants resume --id ${instanceId} --messaging-group-id ${shellQuote(choice.id)}`,
+        `  ${JSON.stringify(choice.label)}: gws-ea resume --id ${instanceId} --messaging-group-id ${shellQuote(choice.id)}`,
       );
     }
     return;
   }
-  output(`Continue with: gws-ea assistants resume --id ${instanceId}`);
+  output(`Continue with: gws-ea resume --id ${instanceId}`);
 }
 
 async function completeCreateOptions(
@@ -250,7 +250,7 @@ async function createAssistant(
   } catch (error) {
     errorOutput(safeErrorMessage(error));
     if (reserved && instanceId) {
-      errorOutput(`Resume with: gws-ea assistants resume --id ${instanceId}`);
+      errorOutput(`Resume with: gws-ea resume --id ${instanceId}`);
     } else {
       errorOutput(`Retry with: ${createRetryCommand(track)}`);
     }
@@ -294,14 +294,14 @@ async function resumeAssistant(
     }
   } catch (error) {
     errorOutput(safeErrorMessage(error));
-    if (instanceId) errorOutput(`Resume with: gws-ea assistants resume --id ${instanceId}`);
+    if (instanceId) errorOutput(`Resume with: gws-ea resume --id ${instanceId}`);
     return 1;
   }
   /* eslint-enable no-catch-all/no-catch-all */
 }
 
 function printHelp(output: LineWriter): void {
-  output('Usage: gws-ea assistants <create|resume> [options]');
+  output('Usage: gws-ea <create|resume> [options]');
   output('  create --track <track>');
   output('         [--source-remote <remote> --endpoint <https-url> --gcp-project <id>]');
   output('         [--chat-app <id> --chat-credential-id <private_key_id>]');
@@ -325,14 +325,9 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
     printHelp(output);
     return 0;
   }
-  if (args[0] !== 'assistants') {
-    errorOutput('Unknown command.');
-    printHelp(errorOutput);
-    return 1;
-  }
-  if (args[1] === 'create') {
+  if (args[0] === 'create') {
     return createAssistant(
-      args.slice(2),
+      args.slice(1),
       paths,
       output,
       errorOutput,
@@ -344,10 +339,10 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
       persistReservation,
     );
   }
-  if (args[1] === 'resume') {
-    return resumeAssistant(args.slice(2), paths, output, errorOutput, initializeJournal, advanceProvision);
+  if (args[0] === 'resume') {
+    return resumeAssistant(args.slice(1), paths, output, errorOutput, initializeJournal, advanceProvision);
   }
-  errorOutput('Unknown assistants command.');
+  errorOutput('Unknown command.');
   printHelp(errorOutput);
   return 1;
 }
