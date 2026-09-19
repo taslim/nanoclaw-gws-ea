@@ -15,6 +15,7 @@ import {
 } from '../modules/agent-to-agent/db/agent-destinations.js';
 import { getDb, hasTable } from './connection.js';
 import { isUniqueViolation } from './errors.js';
+import { assertWiringAdmitted } from './wiring-admission.js';
 
 // ── Messaging Groups ──
 
@@ -238,6 +239,7 @@ export async function isMessagingGroupDetached(id: string): Promise<boolean> {
  * mirrors the backfill logic in migration 004.
  */
 export async function createMessagingGroupAgent(mga: MessagingGroupAgent): Promise<void> {
+  await assertWiringAdmitted({ operation: 'create', proposed: mga });
   await getDb().run(
     `INSERT INTO messaging_group_agents (
          id, messaging_group_id, agent_group_id,
@@ -371,6 +373,11 @@ export async function updateMessagingGroupAgent(
     }
   }
   if (fields.length === 0) return;
+
+  const current = await getMessagingGroupAgent(id);
+  if (!current) return;
+  const proposed: MessagingGroupAgent = { ...current, ...updates };
+  await assertWiringAdmitted({ operation: 'update', current, proposed });
 
   await getDb().run(`UPDATE messaging_group_agents SET ${fields.join(', ')} WHERE id = @id`, values);
 }

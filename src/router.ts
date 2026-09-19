@@ -22,6 +22,7 @@ import { resolveThreadPolicy, resolveUnknownSenderPolicy } from './channels/chan
 import { gateCommand } from './command-gate.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
+import { isUniqueViolation } from './db/errors.js';
 import {
   createMessagingGroupIfAbsent,
   getMessagingGroupAgents,
@@ -307,11 +308,19 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     }
 
     const parsed = safeParseContent(event.message.content);
+    const authenticatedSender = event.message.authenticatedSender;
+    const userId = authenticatedSender && senderResolver ? await senderResolver(event) : null;
     await recordDroppedMessage({
       channel_type: event.channelType,
       platform_id: event.platformId,
-      user_id: null,
-      sender_name: parsed.sender ?? null,
+      instance: event.instance ?? event.channelType,
+      user_id: userId,
+      sender_name: authenticatedSender?.displayName ?? parsed.sender ?? null,
+      sender_authenticated: authenticatedSender !== undefined && userId !== null,
+      sender_kind: authenticatedSender?.kind ?? 'unknown',
+      is_group: event.message.isGroup ?? mg.is_group === 1,
+      message_id: event.message.id,
+      message_timestamp: event.message.timestamp,
       reason: 'no_agent_wired',
       messaging_group_id: mg.id,
       agent_group_id: null,
@@ -588,16 +597,21 @@ async function deliverToAgent(
   }
 
   const messageId = messageIdForAgent(event.message.id, agent.agent_group_id);
-  await writeSessionMessage(session.agent_group_id, session.id, {
-    id: messageId,
-    kind: event.message.kind,
-    timestamp: event.message.timestamp,
-    platformId: deliveryAddr.platformId,
-    channelType: deliveryAddr.channelType,
-    threadId: deliveryAddr.threadId,
-    content: event.message.content,
-    trigger: wake,
-  });
+  try {
+    await writeSessionMessage(session.agent_group_id, session.id, {
+      id: messageId,
+      kind: event.message.kind,
+      timestamp: event.message.timestamp,
+      platformId: deliveryAddr.platformId,
+      channelType: deliveryAddr.channelType,
+      threadId: deliveryAddr.threadId,
+      content: event.message.content,
+      trigger: wake,
+    });
+  } catch (error) {
+    if (!event.message.deduplicate || !isDuplicateInboundMessageIdViolation(error)) throw error;
+    log.info('Duplicate retry-safe inbound message already queued', { messageId, sessionId: session.id });
+  }
 
   if (wake && created) {
     // A brand-new engaged session: notify registered modules with the
@@ -666,6 +680,14 @@ async function deliverToAgent(
       timestamp: event.message.timestamp,
     });
   }
+}
+
+function isDuplicateInboundMessageIdViolation(error: unknown): boolean {
+  if (!isUniqueViolation(error) || !(error instanceof Error)) return false;
+  // messages_in.seq is independently unique. Only the exact id constraint
+  // proves this is the same routed event; a concurrent seq collision must be
+  // retried by the normal failure path, never mistaken for deduplication.
+  return /(?:UNIQUE|PRIMARY KEY) constraint failed:\s*messages_in\.id\b/iu.test(error.message);
 }
 
 /**
