@@ -51,6 +51,7 @@ export interface InstanceRegistry {
 export interface InstanceMarker {
   schema_version: typeof INSTANCE_MARKER_SCHEMA_VERSION;
   instance_id: string;
+  deployed_commit: string;
 }
 
 export interface JournalObservation {

@@ -305,13 +305,17 @@ export async function getInstanceReservation(
 
 function validateMarker(value: unknown): InstanceMarker {
   if (!isRecord(value)) throw new GwsEaError('invalid_marker', 'Instance marker is invalid');
-  assertExactKeys(value, ['schema_version', 'instance_id'], 'Instance marker');
+  assertExactKeys(value, ['schema_version', 'instance_id', 'deployed_commit'], 'Instance marker');
   if (value.schema_version !== INSTANCE_MARKER_SCHEMA_VERSION) {
     throw new GwsEaError('unsupported_marker', 'Instance marker schema version is unsupported');
   }
   const instanceId = requireString(value.instance_id, 'marker instance_id', 36);
   assertInstanceId(instanceId);
-  return { schema_version: INSTANCE_MARKER_SCHEMA_VERSION, instance_id: instanceId };
+  const deployedCommit = requireString(value.deployed_commit, 'marker deployed_commit', 40).toLowerCase();
+  if (!COMMIT_PATTERN.test(deployedCommit)) {
+    throw new GwsEaError('invalid_marker', 'Instance marker deployed commit is invalid');
+  }
+  return { schema_version: INSTANCE_MARKER_SCHEMA_VERSION, instance_id: instanceId, deployed_commit: deployedCommit };
 }
 
 async function readMarker(paths: ControlPlanePaths, instanceId: string): Promise<InstanceMarker> {
@@ -333,7 +337,7 @@ export async function assertRegistryMarkerAgreement(
   const reservation = await getInstanceReservation(paths, instanceId);
   await assertOwnedLocalDirectory(reservation.checkout_realpath);
   const marker = await readMarker(paths, instanceId);
-  if (marker.instance_id !== instanceId) {
+  if (marker.instance_id !== instanceId || marker.deployed_commit !== reservation.deployed_commit) {
     throw new GwsEaError('marker_mismatch', 'Instance marker mismatch; refusing mutation');
   }
   return reservation;
@@ -355,5 +359,6 @@ export async function writeInstanceMarker(paths: ControlPlanePaths, instanceId: 
   await writePrivate(paths.markerFile(instanceId), {
     schema_version: INSTANCE_MARKER_SCHEMA_VERSION,
     instance_id: instanceId,
+    deployed_commit: reservation.deployed_commit,
   } satisfies InstanceMarker);
 }

@@ -223,7 +223,7 @@ describe('machine registry', () => {
     await mkdir(path.dirname(paths.markerFile(input.instance_id)), { recursive: true, mode: 0o700 });
     await writeFile(
       paths.markerFile(input.instance_id),
-      JSON.stringify({ schema_version: 1, instance_id: allocateInstanceId() }),
+      JSON.stringify({ schema_version: 1, instance_id: allocateInstanceId(), deployed_commit: input.deployed_commit }),
       { mode: 0o600 },
     );
 
@@ -234,15 +234,34 @@ describe('machine registry', () => {
     const paths = await testPaths();
     const input = reservation(paths);
     await reserveInstance(paths, input);
-    await mkdir(paths.checkoutRoot(input.instance_id), { recursive: true, mode: 0o700 });
+    await mkdir(path.dirname(paths.markerFile(input.instance_id)), { recursive: true, mode: 0o700 });
     await writeInstanceMarker(paths, input.instance_id);
 
     await expect(assertRegistryMarkerAgreement(paths, input.instance_id)).resolves.toEqual(input);
     expect(JSON.parse(await readFile(paths.markerFile(input.instance_id), 'utf8'))).toEqual({
       schema_version: 1,
       instance_id: input.instance_id,
+      deployed_commit: input.deployed_commit,
     });
     expect((await stat(paths.markerFile(input.instance_id))).mode & 0o777).toBe(0o600);
+  });
+
+  it('fails closed when the marker commit disagrees with the registry', async () => {
+    const paths = await testPaths();
+    const input = reservation(paths);
+    await reserveInstance(paths, input);
+    await mkdir(path.dirname(paths.markerFile(input.instance_id)), { recursive: true, mode: 0o700 });
+    await writeFile(
+      paths.markerFile(input.instance_id),
+      JSON.stringify({
+        schema_version: 1,
+        instance_id: input.instance_id,
+        deployed_commit: 'b'.repeat(40),
+      }),
+      { mode: 0o600 },
+    );
+
+    await expect(assertRegistryMarkerAgreement(paths, input.instance_id)).rejects.toThrow(/marker.*mismatch/i);
   });
 });
 
