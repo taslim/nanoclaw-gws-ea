@@ -40,10 +40,10 @@ interface FakeState {
   provider: string | null;
   profileWrites: number;
   agents: Array<{ id: string; identifier: string; name: string; secretMode: 'all' | 'selective' }>;
-  grants: Map<string, string[]>;
+  secretModeWrites: number;
 }
 
-function harness(options: { failAfterGrantOnce?: boolean; neverApplyGrant?: boolean } = {}): {
+function harness(options: { failAfterSecretModeOnce?: boolean; neverApplySecretMode?: boolean } = {}): {
   state: FakeState;
   dependencies: MainIdentityDependencies;
 } {
@@ -52,7 +52,7 @@ function harness(options: { failAfterGrantOnce?: boolean; neverApplyGrant?: bool
     provider: null,
     profileWrites: 0,
     agents: [],
-    grants: new Map(),
+    secretModeWrites: 0,
   };
   let failed = false;
   const runNcl = vi.fn(async (_config: InstanceRuntimeConfig, args: readonly string[]) => {
@@ -81,20 +81,22 @@ function harness(options: { failAfterGrantOnce?: boolean; neverApplyGrant?: bool
       state.agents.push(agent);
       return { id: agent.id };
     }
-    if (args[0] === 'agents' && args[1] === 'set-secrets') {
-      if (!options.neverApplyGrant) {
-        state.agents = state.agents.map((agent) =>
-          agent.id === 'oc-main' ? { ...agent, secretMode: 'selective' as const } : agent,
-        );
-        state.grants.set('oc-main', [args[args.indexOf('--secret-ids') + 1]!]);
+    if (args[0] === 'agents' && args[1] === 'set-secret-mode') {
+      if (args[args.indexOf('--id') + 1] !== 'oc-main' || args[args.indexOf('--mode') + 1] !== 'all') {
+        throw new Error(`Unexpected OneCLI secret-mode update: ${args.join(' ')}`);
       }
-      if (options.failAfterGrantOnce && !failed) {
+      state.secretModeWrites += 1;
+      if (!options.neverApplySecretMode) {
+        state.agents = state.agents.map((agent) =>
+          agent.id === 'oc-main' ? { ...agent, secretMode: 'all' as const } : agent,
+        );
+      }
+      if (options.failAfterSecretModeOnce && !failed) {
         failed = true;
-        throw new Error('simulated crash after grant side effect');
+        throw new Error('simulated crash after secret-mode side effect');
       }
       return { status: 'updated' };
     }
-    if (args[0] === 'agents' && args[1] === 'secrets') return state.grants.get('oc-main') ?? [];
     throw new Error(`Unexpected OneCLI call: ${args.join(' ')}`);
   });
   return { state, dependencies: { runNcl, runOnecliAdmin } };
@@ -105,7 +107,6 @@ const input = {
   assistantWorkspaceEmail: 'aya@example.test',
   principalDisplayName: 'Taslim',
   principalTimezone: 'America/Los_Angeles',
-  providerSecretId: 'sec-claude',
 };
 
 describe('main identity reconciliation', () => {
@@ -123,39 +124,51 @@ describe('main identity reconciliation', () => {
     expect(state).toMatchObject({ groupCreated: 0, provider: null, profileWrites: 0, agents: [] });
   });
 
-  it('stamps one main group, selects its provider, verifies one selective grant, then publishes the profile', async () => {
+  it('stamps one main group, selects its provider, verifies all secret mode, then publishes the profile', async () => {
     const { state, dependencies } = harness();
 
     const result = await reconcileMainIdentity(runtimeConfig(), input, dependencies);
     await reconcileMainIdentity(runtimeConfig(), { ...input, assistantDisplayName: 'Aya Renamed' }, dependencies);
 
-    expect(result).toEqual({ agentGroupId: GROUP_ID, onecliAgentId: 'oc-main', providerSecretId: 'sec-claude' });
+    expect(result).toEqual({ agentGroupId: GROUP_ID, onecliAgentId: 'oc-main' });
     expect(state.groupCreated).toBe(1);
     expect(state.agents).toHaveLength(1);
     expect(state.provider).toBe('claude');
-    expect(state.grants.get('oc-main')).toEqual(['sec-claude']);
+    expect(state.secretModeWrites).toBe(0);
     expect(state.profileWrites).toBe(2);
   });
 
-  it('resumes after an ambiguous grant side effect without duplicating main or its OneCLI agent', async () => {
-    const { state, dependencies } = harness({ failAfterGrantOnce: true });
+  it('resumes after an ambiguous all-mode side effect without duplicating main or its OneCLI agent', async () => {
+    const { state, dependencies } = harness({ failAfterSecretModeOnce: true });
+    state.agents.push({ id: 'oc-main', identifier: GROUP_ID, name: 'main', secretMode: 'selective' });
+    state.agents.push({ id: 'oc-other', identifier: 'ag-other', name: 'other', secretMode: 'selective' });
 
-    await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).rejects.toThrow(/simulated crash/i);
+    await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).rejects.toThrow(
+      /secret-mode side effect/i,
+    );
     await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).resolves.toMatchObject({
       agentGroupId: GROUP_ID,
       onecliAgentId: 'oc-main',
     });
 
     expect(state.groupCreated).toBe(1);
-    expect(state.agents).toHaveLength(1);
+    expect(state.agents).toHaveLength(2);
     expect(state.profileWrites).toBe(1);
-    expect(state.grants.get('oc-main')).toEqual(['sec-claude']);
+    expect(state.agents).toContainEqual({ id: 'oc-main', identifier: GROUP_ID, name: 'main', secretMode: 'all' });
+    expect(state.agents).toContainEqual({
+      id: 'oc-other',
+      identifier: 'ag-other',
+      name: 'other',
+      secretMode: 'selective',
+    });
+    expect(state.secretModeWrites).toBe(1);
   });
 
-  it('fails closed before publishing canonical main when the selective grant cannot be verified', async () => {
-    const { state, dependencies } = harness({ neverApplyGrant: true });
+  it('fails closed before publishing canonical main when all secret mode cannot be verified', async () => {
+    const { state, dependencies } = harness({ neverApplySecretMode: true });
+    state.agents.push({ id: 'oc-main', identifier: GROUP_ID, name: 'main', secretMode: 'selective' });
 
-    await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).rejects.toThrow(/selective grant/i);
+    await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).rejects.toThrow(/all secret mode/i);
     expect(state.profileWrites).toBe(0);
   });
 

@@ -101,7 +101,7 @@ describe('verified principal first-DM reconciliation', () => {
     expect(h.runBootstrap).not.toHaveBeenCalled();
   });
 
-  it('waits with zero candidates and requires exact selection with multiple candidates', async () => {
+  it('waits with zero candidates, persists and binds one, and requires exact selection with multiple', async () => {
     const empty = harness([]);
     await expect(
       reconcilePrincipalDm(
@@ -112,14 +112,21 @@ describe('verified principal first-DM reconciliation', () => {
     ).resolves.toEqual({ status: 'waiting' });
 
     const sole = harness([row()]);
+    const persistSelection = vi.fn(
+      async (candidate: Parameters<NonNullable<PrincipalDiscoveryDependencies['persistSelection']>>[0]) => {
+        sole.order.push('persist');
+        return candidate;
+      },
+    );
     await expect(
       reconcilePrincipalDm(
         runtimeConfig(),
         { adapterInstance: 'gchat-assistant', provisioningStartedAt: STARTED_AT },
-        sole.dependencies,
+        { ...sole.dependencies, persistSelection },
       ),
-    ).resolves.toMatchObject({ status: 'selection-required', candidates: [{ userId: 'gchat:users/1' }] });
-    expect(sole.order).toEqual([]);
+    ).resolves.toMatchObject({ status: 'bound', candidate: { userId: 'gchat:users/1' } });
+    expect(persistSelection).toHaveBeenCalledWith(expect.objectContaining({ messagingGroupId: 'mg-1' }));
+    expect(sole.order).toEqual(['persist', 'bind', 'bootstrap']);
 
     const multiple = harness([
       row(),

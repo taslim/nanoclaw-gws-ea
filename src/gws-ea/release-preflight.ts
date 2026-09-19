@@ -11,6 +11,10 @@ import {
 } from './checkout.js';
 import { GwsEaError } from './types.js';
 import { isRecord } from './validation.js';
+import type { ProviderCredentialMetadata } from '../provider-credential.js';
+import { providerProvisioningCapabilityDigest } from '../provider-provisioning-capability.js';
+import { ONECLI_CLI_VERSION, ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './onecli-compose.js';
+import { assertInstalledOnecliSdkVersion } from './onecli.js';
 
 const PROVIDER_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const EXACT_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
@@ -25,6 +29,9 @@ export interface SetupCommand {
 export interface ReleasePreflightInput {
   checkoutRoot: string;
   provider: string;
+  providerCapabilityDigest: string;
+  providerCredential: ProviderCredentialMetadata;
+  onecliCliPath: string;
 }
 
 export interface ReleasePreflightRuntime {
@@ -34,6 +41,8 @@ export interface ReleasePreflightRuntime {
 
 export interface ReleasePreflightResult {
   provider: string;
+  providerCapabilityDigest: string;
+  providerCredential: ProviderCredentialMetadata;
   packageManager: string;
   onecli: {
     gateway: string;
@@ -276,7 +285,11 @@ async function validateComposition(
     'package.json',
     'pnpm-lock.yaml',
     'versions.json',
+    'bin/gws-ea',
     'bin/ncl',
+    'setup/gws-ea.ts',
+    'setup/gws-ea-input.ts',
+    'src/provider-credential.ts',
     'templates/gws-ea/main/plugin.json',
     'src/channels/gchat.ts',
     'src/channels/index.ts',
@@ -328,6 +341,38 @@ async function validateComposition(
   }
 }
 
+function assertLauncherOnecliCohort(pins: { gateway: string; cli: string; sdk: string }): void {
+  if (pins.gateway !== ONECLI_GATEWAY_VERSION || pins.cli !== ONECLI_CLI_VERSION || pins.sdk !== ONECLI_SDK_VERSION) {
+    throw new GwsEaError(
+      'onecli_release_mismatch',
+      'The selected release requires a different OneCLI cohort; update the GWS-EA launcher before provisioning it',
+    );
+  }
+}
+
+async function assertInstalledOnecliCli(
+  executable: string,
+  expectedVersion: string,
+  checkoutRoot: string,
+  environment: Readonly<Record<string, string>>,
+  run: CommandRunner,
+): Promise<void> {
+  if (!path.isAbsolute(executable) || path.resolve(executable) !== executable) {
+    throw new GwsEaError('incompatible_onecli', 'OneCLI CLI path must be absolute and normalized');
+  }
+  const result = await run({ command: executable, args: ['version'], cwd: checkoutRoot, env: environment });
+  let version: unknown;
+  try {
+    const parsed: unknown = JSON.parse(result.stdout);
+    version = isRecord(parsed) ? parsed.version : undefined;
+  } catch {
+    throw new GwsEaError('incompatible_onecli', 'Installed OneCLI CLI returned invalid version information');
+  }
+  if (version !== expectedVersion) {
+    throw new GwsEaError('incompatible_onecli', 'Installed OneCLI CLI does not match the selected release');
+  }
+}
+
 async function defaultSetupCommand(command: SetupCommand): Promise<void> {
   await runArgumentCommand({ ...command, timeoutMs: 20 * 60 * 1000 });
 }
@@ -345,8 +390,20 @@ export async function runReleasePreflight(
   const runCommand = runtime.runCommand ?? runArgumentCommand;
   await assertDetachedCommit(checkoutRoot, runCommand, environments);
   await assertClean(checkoutRoot, 'initial preflight', runCommand, environments);
+  const providerCapabilityDigest = await providerProvisioningCapabilityDigest(checkoutRoot);
+  if (providerCapabilityDigest !== input.providerCapabilityDigest) {
+    throw new GwsEaError(
+      'provider_capability_mismatch',
+      'The selected release has a different provider setup capability; update the GWS-EA launcher before provisioning it',
+    );
+  }
   await validateComposition(checkoutRoot, input.provider, runCommand, environments);
   const pins = await validatePackageAndPins(checkoutRoot);
+  assertLauncherOnecliCohort(pins);
+  await Promise.all([
+    assertInstalledOnecliCli(input.onecliCliPath, pins.cli, checkoutRoot, environments.common, runCommand),
+    assertInstalledOnecliSdkVersion(pins.sdk),
+  ]);
   const runSetupCommand = runtime.runSetupCommand ?? defaultSetupCommand;
 
   await runSetupCommand({
@@ -362,6 +419,8 @@ export async function runReleasePreflight(
 
   return {
     provider: input.provider,
+    providerCapabilityDigest,
+    providerCredential: input.providerCredential,
     packageManager: pins.packageManager,
     onecli: { gateway: pins.gateway, cli: pins.cli, sdk: pins.sdk },
   };

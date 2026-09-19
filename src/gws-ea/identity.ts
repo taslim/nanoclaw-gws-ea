@@ -14,13 +14,11 @@ export interface MainIdentityInput {
   readonly assistantWorkspaceEmail: string;
   readonly principalDisplayName: string;
   readonly principalTimezone: string;
-  readonly providerSecretId: string;
 }
 
 export interface MainIdentityResult {
   readonly agentGroupId: string;
   readonly onecliAgentId: string;
-  readonly providerSecretId: string;
 }
 
 export interface MainIdentityDependencies {
@@ -86,14 +84,6 @@ function parseOnecliAgents(value: unknown): OnecliAgent[] {
   }));
 }
 
-function parseSecretIds(value: unknown): string[] {
-  const data = unwrapData(value);
-  if (!Array.isArray(data) || !data.every((candidate) => typeof candidate === 'string')) {
-    throw new GwsEaError('invalid_child_output', 'OneCLI returned an invalid agent grant');
-  }
-  return data.map((id) => safeString(id, 'OneCLI secret ID'));
-}
-
 function exactAgent(agents: readonly OnecliAgent[], agentGroupId: string): OnecliAgent | undefined {
   const matches = agents.filter((agent) => agent.identifier === agentGroupId);
   if (matches.length > 1) throw new GwsEaError('onecli_agent_collision', 'Multiple OneCLI agents claim canonical main');
@@ -119,29 +109,23 @@ function validateInput(input: MainIdentityInput): MainIdentityInput {
     254,
   );
   const principalTimezone = safeString(input.principalTimezone, 'Principal timezone', 120);
-  const providerSecretId = safeString(input.providerSecretId, 'Provider secret ID');
   if (!EMAIL_PATTERN.test(assistantWorkspaceEmail)) {
     throw new GwsEaError('invalid_identity', 'Assistant Workspace email is invalid');
   }
   if (!isValidTimezone(principalTimezone)) {
     throw new GwsEaError('invalid_identity', 'Principal timezone is invalid');
   }
-  if (/\s/u.test(providerSecretId)) {
-    throw new GwsEaError('invalid_identity', 'Provider secret ID is invalid');
-  }
   return {
     assistantDisplayName: safeString(input.assistantDisplayName.trim(), 'Assistant display name', 120),
     assistantWorkspaceEmail,
     principalDisplayName: safeString(input.principalDisplayName.trim(), 'Principal display name', 120),
     principalTimezone,
-    providerSecretId,
   };
 }
 
-async function reconcileSelectiveGrant(
+async function reconcileAllSecretMode(
   config: InstanceRuntimeConfig,
   agentGroupId: string,
-  providerSecretId: string,
   run: NonNullable<MainIdentityDependencies['runOnecliAdmin']>,
 ): Promise<string> {
   let agents = parseOnecliAgents(await run(config, ['agents', 'list', '--max', '0']));
@@ -153,20 +137,14 @@ async function reconcileSelectiveGrant(
     if (!agent) throw new GwsEaError('onecli_agent_missing', 'OneCLI did not create canonical main');
   }
 
-  const currentSecrets =
-    agent.secretMode === 'selective' ? parseSecretIds(await run(config, ['agents', 'secrets', '--id', agent.id])) : [];
-  if (agent.secretMode !== 'selective' || currentSecrets.length !== 1 || currentSecrets[0] !== providerSecretId) {
-    await run(config, ['agents', 'set-secrets', '--id', agent.id, '--secret-ids', providerSecretId]);
+  if (agent.secretMode !== 'all') {
+    await run(config, ['agents', 'set-secret-mode', '--id', agent.id, '--mode', 'all']);
   }
 
   agents = parseOnecliAgents(await run(config, ['agents', 'list', '--max', '0']));
   const verified = exactAgent(agents, agentGroupId);
-  if (!verified || verified.id !== agent.id || verified.secretMode !== 'selective') {
-    throw new GwsEaError('onecli_grant_mismatch', 'Canonical main does not have a verified selective grant');
-  }
-  const verifiedSecrets = parseSecretIds(await run(config, ['agents', 'secrets', '--id', verified.id]));
-  if (verifiedSecrets.length !== 1 || verifiedSecrets[0] !== providerSecretId) {
-    throw new GwsEaError('onecli_grant_mismatch', 'Canonical main does not have the selected provider-only grant');
+  if (!verified || verified.id !== agent.id || verified.secretMode !== 'all') {
+    throw new GwsEaError('onecli_secret_mode_mismatch', 'Canonical main does not have verified all secret mode');
   }
   return verified.id;
 }
@@ -174,7 +152,7 @@ async function reconcileSelectiveGrant(
 /**
  * Reconcile the canonical main group and its credential boundary. The profile
  * pointer is published last, so principal binding cannot observe a canonical
- * main until its provider and exact selective OneCLI grant have been verified.
+ * main until its provider and instance-vault-wide OneCLI access have been verified.
  */
 export async function reconcileMainIdentity(
   configInput: InstanceRuntimeConfig,
@@ -200,7 +178,7 @@ export async function reconcileMainIdentity(
     throw new GwsEaError('main_group_mismatch', 'Canonical main provider reconciliation did not persist');
   }
 
-  const onecliAgentId = await reconcileSelectiveGrant(config, group.id, input.providerSecretId, runOnecliAdmin);
+  const onecliAgentId = await reconcileAllSecretMode(config, group.id, runOnecliAdmin);
   const profile = unwrapData(
     await runNcl(config, [
       'gws-ea-profile',
@@ -221,5 +199,5 @@ export async function reconcileMainIdentity(
     throw new GwsEaError('profile_mismatch', 'GWS-EA profile did not retain canonical main');
   }
 
-  return { agentGroupId: group.id, onecliAgentId, providerSecretId: input.providerSecretId };
+  return { agentGroupId: group.id, onecliAgentId };
 }

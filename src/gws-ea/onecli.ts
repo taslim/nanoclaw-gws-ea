@@ -9,7 +9,7 @@ import { isErrno } from '../community-portal/errors.js';
 import { preparePrivateLocalDirectory } from './paths.js';
 import {
   buildAllowlistedEnvironment,
-  runSanitizedCommand as runSharedSanitizedCommand,
+  runSanitizedCommand,
   type SanitizedCommand,
   type SanitizedCommandResult,
   type SanitizedCommandRunner,
@@ -32,6 +32,7 @@ import {
 } from './onecli-compose.js';
 import { GwsEaError } from './types.js';
 import { hasControlCharacters, isRecord } from './validation.js';
+import type { ProviderCredential, ProviderCredentialMetadata } from '../provider-credential.js';
 
 const EXPECTED_SERVICES = ['app', 'gateway', 'postgres'] as const;
 
@@ -72,18 +73,6 @@ export interface ObservedOnecliRuntime {
   readonly volumes: readonly ObservedOnecliVolume[];
 }
 
-export interface ProviderCredentialInput {
-  readonly name: string;
-  readonly type: string;
-  readonly value: string;
-  readonly hostPattern: string;
-  readonly pathPattern?: string;
-  readonly headerName?: string;
-  readonly valueFormat?: string;
-  readonly paramName?: string;
-  readonly paramFormat?: string;
-}
-
 export interface ImportedCredential {
   readonly id: string;
   readonly created: boolean;
@@ -98,6 +87,7 @@ export interface OnecliCompatibilityDependencies {
 
 export interface OnecliRuntimeDependencies extends OnecliCompatibilityDependencies {
   readonly dockerCommandRunner?: OnecliCommandRunner;
+  readonly beforeBind?: () => Promise<void>;
 }
 
 declare const compatibilityReceiptBrand: unique symbol;
@@ -156,8 +146,10 @@ export function buildComposeEnvironment(ambient: NodeJS.ProcessEnv = process.env
 
 export async function prepareOnecliRuntime(layout: OnecliRuntimeLayout): Promise<void> {
   await preparePrivateLocalDirectory(layout.rootDirectory);
-  await preparePrivateLocalDirectory(layout.cliHome);
-  await preparePrivateLocalDirectory(layout.secretsDirectory);
+  await Promise.all([
+    preparePrivateLocalDirectory(layout.cliHome),
+    preparePrivateLocalDirectory(layout.secretsDirectory),
+  ]);
 
   await Promise.all([
     ensureRandomOwnerOnlyFile(layout.postgresPasswordFile, 'base64url'),
@@ -276,7 +268,7 @@ async function runCompatibilityCanary(
   ) {
     throw new GwsEaError('incompatible_onecli', 'Running OneCLI gateway does not match the sanctioned version');
   }
-  await assertInstalledSdkVersion();
+  await assertInstalledOnecliSdkVersion();
 
   const canarySecretName = 'GWS-EA compatibility canary';
   const canaryAgentName = `gws-ea-compat-${layout.instanceId}`;
@@ -437,7 +429,7 @@ async function cleanupCompatibilityCanary(
 
 export async function importProviderCredential(
   receipt: OnecliCompatibilityReceipt,
-  input: ProviderCredentialInput,
+  input: ProviderCredential,
   dependencies: Pick<OnecliCompatibilityDependencies, 'runCommand' | 'ambientEnv'> = {},
 ): Promise<ImportedCredential> {
   const verified = issuedCompatibilityReceipts.get(receipt);
@@ -459,7 +451,7 @@ export async function importProviderCredential(
   }
   if (matching.length === 1) {
     const existing = matching[0];
-    if (!credentialMetadataMatches(existing, input)) {
+    if (!onecliSecretMatchesCredentialMetadata(existing, input)) {
       throw new GwsEaError('onecli_secret_conflict', 'An existing OneCLI secret has incompatible metadata');
     }
     return { id: requireRecordString(existing, 'id', 'OneCLI secret'), created: false };
@@ -533,6 +525,7 @@ export async function reconcileOnecliRuntime(
   await cleanupOnecliDockerOrphans(layout, dockerRunner, composeEnvironment);
 
   const up = buildComposeInvocation(layout, ['up', '--detach', '--wait', '--remove-orphans']);
+  await dependencies.beforeBind?.();
   await dockerRunner({ ...up, env: composeEnvironment, timeoutMs: 120_000 });
   const observed = await inspectOnecliRuntime(layout, dockerRunner, composeEnvironment);
   validateObservedOnecliRuntime(layout, observed);
@@ -906,8 +899,6 @@ async function runOnecliCommand(
   });
 }
 
-export const runSanitizedCommand: OnecliCommandRunner = runSharedSanitizedCommand;
-
 async function removePlaintextStagingFiles(layout: OnecliRuntimeLayout): Promise<void> {
   await removePrivateFile(layout.providerStagingFile);
   await removePrivateFile(layout.canaryStagingFile);
@@ -1026,7 +1017,7 @@ function requireRecordString(value: Record<string, unknown>, key: string, label:
   return result;
 }
 
-function assertCredentialMetadata(input: ProviderCredentialInput): void {
+function assertCredentialMetadata(input: ProviderCredential): void {
   for (const [key, value] of Object.entries(input)) {
     if (typeof value !== 'string' || value.length === 0 || (key !== 'value' && hasControlCharacters(value))) {
       throw new GwsEaError('invalid_onecli_secret', `Provider credential ${key} is invalid`);
@@ -1040,7 +1031,10 @@ function assertCredentialMetadata(input: ProviderCredentialInput): void {
   }
 }
 
-function credentialMetadataMatches(existing: Record<string, unknown>, input: ProviderCredentialInput): boolean {
+export function onecliSecretMatchesCredentialMetadata(
+  existing: Record<string, unknown>,
+  input: ProviderCredentialMetadata,
+): boolean {
   const expectedInjection =
     input.headerName !== undefined
       ? { headerName: input.headerName, valueFormat: input.valueFormat ?? '' }
@@ -1048,6 +1042,7 @@ function credentialMetadataMatches(existing: Record<string, unknown>, input: Pro
         ? { paramName: input.paramName, paramFormat: input.paramFormat ?? '' }
         : null;
   return (
+    recordString(existing, 'name') === input.name &&
     recordString(existing, 'type') === input.type &&
     recordString(existing, 'hostPattern') === input.hostPattern &&
     nullableString(existing.pathPattern) === (input.pathPattern ?? null) &&
@@ -1065,14 +1060,14 @@ function isExpectedGatewayProxy(value: string): boolean {
   return url.protocol === 'http:' && url.hostname === 'host.docker.internal' && url.port === '10255';
 }
 
-async function assertInstalledSdkVersion(): Promise<void> {
+export async function assertInstalledOnecliSdkVersion(expectedVersion = ONECLI_SDK_VERSION): Promise<void> {
   const require = createRequire(import.meta.url);
   const entry = require.resolve('@onecli-sh/sdk');
   const manifest = parseRecord(
     await readFile(path.resolve(path.dirname(entry), '..', 'package.json'), 'utf8'),
     'OneCLI SDK manifest',
   );
-  if (manifest.version !== ONECLI_SDK_VERSION) {
+  if (manifest.version !== expectedVersion) {
     throw new GwsEaError('incompatible_onecli', 'Installed OneCLI SDK does not match the sanctioned version');
   }
 }

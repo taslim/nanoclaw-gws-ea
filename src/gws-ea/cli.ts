@@ -1,14 +1,6 @@
-import { createServer, type Server } from 'node:net';
-import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import * as prompts from '@clack/prompts';
 import { resolveReleaseCommit, type ResolvedRelease } from './checkout.js';
-import {
-  collectCreateSetup,
-  CREATE_SETUP_FIELDS,
-  type CreatePromptContext,
-  type CreateSetupAnswers,
-} from './create-input.js';
+import { CREATE_SETUP_FIELDS, type CreatePromptContext, type CreateSetupAnswers } from './create-input.js';
 import {
   acquireInstanceOperation,
   ensureProvisionJournal,
@@ -29,12 +21,14 @@ import { confirmChatConfiguration } from './chat-configuration.js';
 import { describeRemoval, removeAssistant, type RemovalPreview } from './remove.js';
 import {
   installProductionBootstrapManifest,
-  loadProductionBootstrapManifest,
   removeProductionBootstrapManifest,
   runProductionProvision,
+  validateProductionBootstrapManifest,
   type ProductionBootstrapManifest,
   type ProvisionResult,
 } from './provision.js';
+import { holdLoopbackPorts, type HeldLoopbackPorts } from './ports.js';
+import type { ProviderCredential } from '../provider-credential.js';
 
 type LineWriter = (line: string) => void;
 
@@ -51,17 +45,13 @@ export interface CliRuntime {
   resolveRelease?: (sourceRemote: string, releaseRef: string) => Promise<ResolvedRelease>;
   holdLoopbackPorts?: () => Promise<HeldLoopbackPorts>;
   collectCreateInputs?: (context: CreatePromptContext) => Promise<CreateSetupAnswers>;
+  authenticateProvider?: (provider: string) => Promise<ProviderCredential>;
   reserveInstance?: typeof reserveInstance;
   preflightGcloud?: () => Promise<{ readonly account: string }>;
   confirmChatConfiguration?: typeof confirmChatConfiguration;
   describeRemoval?: typeof describeRemoval;
   removeAssistant?: typeof removeAssistant;
   confirmRemoval?: (preview: RemovalPreview) => Promise<boolean>;
-}
-
-export interface HeldLoopbackPorts {
-  readonly ports: AllocatedPorts;
-  release(names?: readonly (keyof AllocatedPorts)[]): Promise<void>;
 }
 
 const CREATE_OPTIONS = ['track', ...CREATE_SETUP_FIELDS] as const;
@@ -103,7 +93,8 @@ function requireOption(options: Readonly<Record<string, string>>, name: string):
 
 function createReservation(
   paths: ControlPlanePaths,
-  options: Readonly<Record<string, string>>,
+  track: string,
+  setup: CreateSetupAnswers,
   production: {
     readonly instanceId: string;
     readonly commit: string;
@@ -116,64 +107,20 @@ function createReservation(
   const input: InstanceReservationInput = {
     instance_id: instanceId,
     checkout_realpath: paths.checkoutRoot(instanceId),
-    release_track: requireOption(options, 'track'),
-    source_remote: requireOption(options, 'source-remote'),
+    release_track: track,
+    source_remote: setup.sourceRemote,
     deployed_commit: production.commit,
     allocated_ports: production.ports,
     exclusive_resource_claims: {
-      endpoint_url: requireOption(options, 'endpoint'),
+      endpoint_url: setup.endpoint,
       gcp_project_id: gcpProjectId,
       gcp_account: production.gcpAccount,
       gchat_service_account: deriveGchatServiceAccountEmail(gcpProjectId),
-      workspace_email: requireOption(options, 'workspace-email'),
+      workspace_email: setup.assistantWorkspaceEmail,
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },
   };
   return validateReservation(input, paths);
-}
-
-async function listenLoopback(server: Server): Promise<number> {
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', resolve);
-  });
-  const address = server.address();
-  if (!address || typeof address === 'string') {
-    throw new GwsEaError('port_allocation_failed', 'Could not allocate a loopback port');
-  }
-  return address.port;
-}
-
-async function closeServer(server: Server): Promise<void> {
-  if (!server.listening) return;
-  await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
-}
-
-async function holdLoopbackPorts(): Promise<HeldLoopbackPorts> {
-  const servers: Record<keyof AllocatedPorts, Server> = {
-    nanoclaw_webhook: createServer(),
-    onecli_app: createServer(),
-    onecli_gateway: createServer(),
-  };
-  try {
-    const [nanoclawWebhook, onecliApp, onecliGateway] = await Promise.all([
-      listenLoopback(servers.nanoclaw_webhook),
-      listenLoopback(servers.onecli_app),
-      listenLoopback(servers.onecli_gateway),
-    ]);
-    return {
-      ports: {
-        nanoclaw_webhook: nanoclawWebhook,
-        onecli_app: onecliApp,
-        onecli_gateway: onecliGateway,
-      },
-      release: async (names = Object.keys(servers) as (keyof AllocatedPorts)[]) =>
-        void (await Promise.all(names.map((name) => closeServer(servers[name])))),
-    };
-  } catch (error) {
-    await Promise.all(Object.values(servers).map(closeServer));
-    throw error;
-  }
 }
 
 function safeErrorMessage(error: unknown): string {
@@ -211,17 +158,6 @@ function printPause(
   );
 }
 
-async function completeCreateOptions(
-  options: Readonly<Record<string, string>>,
-  instanceId: string,
-  track: string,
-  collectInputs: (context: CreatePromptContext) => Promise<CreateSetupAnswers>,
-): Promise<Record<string, string>> {
-  if (CREATE_SETUP_FIELDS.every((field) => options[field])) return { ...options };
-  const collected = await collectInputs({ instanceId, track, provided: options });
-  return { ...options, ...collected };
-}
-
 async function createAssistant(
   commandArgs: readonly string[],
   paths: ControlPlanePaths,
@@ -249,15 +185,12 @@ async function createAssistant(
     const gcloud = await checkGcloud();
     instanceId = allocateInstanceId();
     output(`instance_id: ${instanceId}`);
-    const options = await completeCreateOptions(parsed, instanceId, track, collectInputs);
-    const sourceRemote = requireOption(options, 'source-remote');
-    const resolved = await resolveRelease(sourceRemote, `refs/heads/${track}`);
-    const bootstrapManifest: ProductionBootstrapManifest = await loadProductionBootstrapManifest(
-      path.resolve(requireOption(options, 'setup-file')),
-    );
+    const setup = await collectInputs({ instanceId, track, provided: parsed });
+    const resolved = await resolveRelease(setup.sourceRemote, `refs/heads/${track}`);
+    const bootstrapManifest: ProductionBootstrapManifest = validateProductionBootstrapManifest(setup.bootstrapManifest);
     const held = await allocatePorts();
     try {
-      const input = createReservation(paths, options, {
+      const input = createReservation(paths, track, setup, {
         instanceId,
         commit: resolved.commit,
         ports: held.ports,
@@ -413,7 +346,7 @@ function printHelp(output: LineWriter): void {
   output('Usage: gws-ea <create|resume|remove> [options]');
   output('  create --track <track>');
   output('         [--source-remote <remote> --endpoint <https-url>]');
-  output('         [--workspace-email <email> --setup-file <owner-only-input.json>]');
+  output('         [--workspace-email <email>]');
   output('  resume --id <instance_id> [--chat-configured] [--messaging-group-id <exact-id>]');
   output('  remove --id <instance_id> [--yes]');
 }
@@ -424,10 +357,17 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
   const paths = runtime.paths ?? resolveControlPlanePaths();
   const initializeJournal =
     runtime.initializeJournal ?? (async (operation) => void (await ensureProvisionJournal(operation)));
-  const advanceProvision = runtime.advanceProvision ?? runProductionProvision;
+  const advanceProvision =
+    runtime.advanceProvision ??
+    ((operation, selectedMessagingGroupId, heldPorts) =>
+      runProductionProvision(operation, selectedMessagingGroupId, heldPorts, runtime.authenticateProvider));
   const resolveRelease = runtime.resolveRelease ?? resolveReleaseCommit;
   const allocatePorts = runtime.holdLoopbackPorts ?? holdLoopbackPorts;
-  const collectInputs = runtime.collectCreateInputs ?? collectCreateSetup;
+  const collectInputs =
+    runtime.collectCreateInputs ??
+    (async (): Promise<CreateSetupAnswers> => {
+      throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
+    });
   const persistReservation = runtime.reserveInstance ?? reserveInstance;
   const checkGcloud = runtime.preflightGcloud ?? (() => preflightGcloud({ cwd: process.cwd() }));
   const confirmConfigured = runtime.confirmChatConfiguration ?? confirmChatConfiguration;
@@ -472,6 +412,3 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
   printHelp(errorOutput);
   return 1;
 }
-
-const invokedPath = process.argv[1] ? pathToFileURL(process.argv[1]).href : undefined;
-if (invokedPath === import.meta.url) process.exitCode = await runCli(process.argv.slice(2));

@@ -240,29 +240,31 @@ export async function isMessagingGroupDetached(id: string): Promise<boolean> {
  */
 export async function createMessagingGroupAgent(mga: MessagingGroupAgent): Promise<void> {
   await assertWiringAdmitted({ operation: 'create', proposed: mga });
-  await getDb().run(
-    `INSERT INTO messaging_group_agents (
-         id, messaging_group_id, agent_group_id,
-         engage_mode, engage_pattern, sender_scope, ignored_message_policy,
-         session_mode, priority, created_at
-       )
-       VALUES (
-         @id, @messaging_group_id, @agent_group_id,
-         @engage_mode, @engage_pattern, @sender_scope, @ignored_message_policy,
-         @session_mode, @priority, @created_at
-       )`,
-    mga,
-  );
+  await getDb().transaction(async () => {
+    await getDb().run(
+      `INSERT INTO messaging_group_agents (
+           id, messaging_group_id, agent_group_id,
+           engage_mode, engage_pattern, sender_scope, ignored_message_policy,
+           session_mode, priority, created_at
+         )
+         VALUES (
+           @id, @messaging_group_id, @agent_group_id,
+           @engage_mode, @engage_pattern, @sender_scope, @ignored_message_policy,
+           @session_mode, @priority, @created_at
+         )`,
+      mga,
+    );
 
-  // `threads` (migration 019) is written separately so existing callers that
-  // omit it keep passing named-param sets that match the INSERT exactly
-  // (better-sqlite3 rejects missing named params). Omitted/NULL = column
-  // stays NULL = inherit the channel declaration at fanout time.
-  if (mga.threads !== undefined && mga.threads !== null) {
-    await getDb().run('UPDATE messaging_group_agents SET threads = ? WHERE id = ?', mga.threads, mga.id);
-  }
+    // `threads` (migration 019) is written separately so existing callers that
+    // omit it keep passing named-param sets that match the INSERT exactly
+    // (better-sqlite3 rejects missing named params). Omitted/NULL = column
+    // stays NULL = inherit the channel declaration at fanout time.
+    if (mga.threads !== undefined && mga.threads !== null) {
+      await getDb().run('UPDATE messaging_group_agents SET threads = ? WHERE id = ?', mga.threads, mga.id);
+    }
 
-  await ensureAgentDestinationForWiring(mga);
+    await ensureAgentDestinationForWiring(mga);
+  });
 }
 
 /**

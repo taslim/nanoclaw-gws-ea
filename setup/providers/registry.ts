@@ -3,14 +3,16 @@
  * step render from this map instead of hardcoding provider names in the setup
  * flow (same capability-not-name rule as the host provider-container registry).
  *
- * `claude` is the built-in default: it has no `runAuth` of its own, which the
- * setup flow reads as "run the standard auth step". Every provider adds
+ * `claude` is the built-in default: normal setup uses its standard auth step,
+ * while product provisioning calls the same credential collector through the
+ * `provisioning` capability. Every provider adds
  * itself by shipping a `setup/providers/<name>.ts` with a top-level
  * `registerSetupProvider(...)` call and appending one import line to the
  * `setup/providers/index.ts` barrel — the same shape as the host and container
  * provider registries, guarded the same way (a barrel-driven registration test).
  */
 import type { AssistContext } from '../lib/claude-assist.js'; // type-only — registry stays runtime-dependency-free
+import type { ProviderCredential, ProviderCredentialMetadata } from '../../src/provider-credential.js';
 
 /**
  * Outcome of a provider-owned failure-assist hook:
@@ -21,12 +23,31 @@ import type { AssistContext } from '../lib/claude-assist.js'; // type-only — r
  */
 export type FailureAssistResult = 'launched' | 'declined' | 'unavailable';
 
+export type SetupProviderCredential = ProviderCredential;
+
+export type SetupProviderCredentialMetadata = ProviderCredentialMetadata;
+
+export interface CollectedProviderCredential {
+  readonly credential: SetupProviderCredential;
+  readonly method: string;
+}
+
+export interface SetupProviderProvisioning {
+  credentialMetadata(options?: { readonly allowAmbientConfiguration?: boolean }): SetupProviderCredentialMetadata;
+  collectCredential(options: {
+    readonly allowSkip: boolean;
+    readonly allowAmbientConfiguration?: boolean;
+  }): Promise<CollectedProviderCredential | null>;
+}
+
 export interface SetupProviderEntry {
   value: string;
   label: string;
   hint: string;
   /** Provider-owned auth walk-through (vault-only). Absent → standard auth step. */
   runAuth?: () => Promise<void>;
+  /** Provider-owned credential flow reusable by an isolated product vault. */
+  provisioning?: SetupProviderProvisioning;
   /** Verifies the provider's payload is wired (files, barrels, Dockerfile pin). */
   runInstallCheck?: () => Promise<void>;
   /** Provider-owned interactive failure debugger. 'unavailable' → dispatcher

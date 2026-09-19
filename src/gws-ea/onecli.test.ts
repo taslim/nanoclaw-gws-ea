@@ -10,11 +10,11 @@ import {
   buildOnecliCliEnvironment,
   cleanupOnecliDockerOrphans,
   importProviderCredential,
+  onecliSecretMatchesCredentialMetadata,
   persistOnecliApiKeyFiles,
   prepareOnecliRuntime,
   removeOnecliRuntime,
   runOnecliCompatibilityCanary,
-  runSanitizedCommand,
   validateObservedOnecliRuntime,
   type OnecliCommandRunner,
   type OnecliSdkClient,
@@ -44,6 +44,29 @@ async function layoutFixture() {
 }
 
 describe('OneCLI child boundaries', () => {
+  it('compares the complete non-secret provider contract for an existing secret ID', () => {
+    const expected = {
+      name: 'Anthropic',
+      type: 'generic',
+      hostPattern: 'api.example.test',
+      headerName: 'Authorization',
+      valueFormat: 'Bearer {value}',
+    };
+    const observed = {
+      id: 'same-secret-id',
+      name: 'Anthropic',
+      type: 'generic',
+      hostPattern: 'api.example.test',
+      pathPattern: null,
+      injectionConfig: { headerName: 'Authorization', valueFormat: 'Bearer {value}' },
+    };
+
+    expect(onecliSecretMatchesCredentialMetadata(observed, expected)).toBe(true);
+    expect(onecliSecretMatchesCredentialMetadata({ ...observed, hostPattern: 'drifted.example.test' }, expected)).toBe(
+      false,
+    );
+  });
+
   it('uses explicit Compose coordinates and drops hostile ambient targeting variables', async () => {
     const layout = await layoutFixture();
     const env = buildOnecliCliEnvironment(
@@ -103,21 +126,6 @@ describe('OneCLI child boundaries', () => {
     expect(env).not.toHaveProperty('NANOCLAW_INSTALL_ID');
     expect(env).not.toHaveProperty('GCHAT_CREDENTIALS');
     expect(composeEnv).toEqual({ PATH: '/safe/bin', HOME: '/host/home' });
-  });
-
-  it('does not inherit unspecified parent variables when a caller omits env', async () => {
-    const canaryKey = 'GWS_EA_AMBIENT_SECRET_CANARY';
-    process.env[canaryKey] = 'must-not-cross';
-    try {
-      const result = await runSanitizedCommand({
-        command: process.execPath,
-        args: ['--eval', `process.stdout.write(String(process.env.${canaryKey}))`],
-        cwd: process.cwd(),
-      });
-      expect(result.stdout).toBe('undefined');
-    } finally {
-      delete process.env[canaryKey];
-    }
   });
 });
 

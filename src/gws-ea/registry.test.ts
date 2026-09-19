@@ -16,6 +16,7 @@ import { isLocalFilesystemType, resolveControlPlanePaths, type ControlPlanePaths
 import { GwsEaError, type InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
+const providerCapabilityDigest = 'd'.repeat(64);
 
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
@@ -53,8 +54,8 @@ function reservation(paths: ControlPlanePaths, instanceId = allocateInstanceId()
   };
 }
 
-function createArgs(setupFile?: string): string[] {
-  const args = [
+function createArgs(): string[] {
+  return [
     'create',
     '--track',
     'dogfood',
@@ -65,32 +66,31 @@ function createArgs(setupFile?: string): string[] {
     '--workspace-email',
     'assistant@example.test',
   ];
-  if (setupFile) args.push('--setup-file', setupFile);
-  return args;
 }
 
-async function createSetupFile(paths: ControlPlanePaths): Promise<string> {
-  const inputRoot = path.join(path.dirname(paths.configRoot), 'bootstrap-input');
-  await mkdir(inputRoot, { recursive: true, mode: 0o700 });
-  const providerFile = path.join(inputRoot, 'provider-key');
-  const setupFile = path.join(inputRoot, 'setup.json');
-  await writeFile(providerFile, 'provider-secret', { mode: 0o600 });
-  await writeFile(
-    setupFile,
-    JSON.stringify({
+function createSetupInput() {
+  return {
+    sourceRemote: 'https://example.test/nanoclaw.git',
+    endpoint: 'https://assistant.example.test/webhook/gchat',
+    assistantWorkspaceEmail: 'assistant@example.test',
+    bootstrapManifest: {
       schema_version: 1,
       onecli_cli_path: '/usr/local/bin/onecli',
       node_path: process.execPath,
-      home_directory: path.dirname(paths.stateRoot),
+      home_directory: '/Users/operator',
       platform: process.platform === 'darwin' ? 'macos' : 'linux',
       running_as_root: false,
+      provider_capability_digest: providerCapabilityDigest,
       provider: {
         id: 'claude',
         name: 'Claude provider',
         type: 'api_key',
         host_pattern: 'api.anthropic.com',
-        credential_file: providerFile,
         header_name: 'x-api-key',
+        value_format: null,
+        path_pattern: null,
+        param_name: null,
+        param_format: null,
       },
       identity: {
         assistant_display_name: 'Aya',
@@ -98,14 +98,13 @@ async function createSetupFile(paths: ControlPlanePaths): Promise<string> {
         principal_timezone: 'America/Los_Angeles',
       },
       selected_messaging_group_id: null,
-    }),
-    { mode: 0o600 },
-  );
-  return setupFile;
+    },
+  } as const;
 }
 
 function productionRuntime() {
   return {
+    collectCreateInputs: async () => createSetupInput(),
     preflightGcloud: async () => ({ account: 'operator@example.test' }),
     resolveRelease: async (sourceRemote: string, releaseRef: string) => ({
       sourceRemote,
@@ -326,7 +325,6 @@ describe('create recovery contract', () => {
 
   it('connects the owner-only setup surface to create and fresh-process resume', async () => {
     const paths = await testPaths();
-    const setupFile = await createSetupFile(paths);
     const advanced: string[] = [];
     let portsReleased = false;
     const advanceProvision = async (operation: InstanceOperation, _selection?: string, heldPorts?: unknown) => {
@@ -348,7 +346,7 @@ describe('create recovery contract', () => {
     const output: string[] = [];
     const resolveCalls: Array<[string, string]> = [];
     expect(
-      await runCli(createArgs(setupFile), {
+      await runCli(createArgs(), {
         paths,
         stdout: (line) => output.push(line),
         stderr: () => undefined,
@@ -364,6 +362,7 @@ describe('create recovery contract', () => {
             portsReleased = true;
           },
         }),
+        collectCreateInputs: async () => createSetupInput(),
       }),
     ).toBe(0);
     const instanceId = output[0]!.slice('instance_id: '.length);
@@ -390,7 +389,6 @@ describe('create recovery contract', () => {
 
   it('provisions from the documented create command and prints exact principal-selection commands', async () => {
     const paths = await testPaths();
-    const setupFile = await createSetupFile(paths);
     const output: string[] = [];
     let idWasPrintedBeforeCollection = false;
     const pause = {
@@ -408,12 +406,7 @@ describe('create recovery contract', () => {
     };
     const collectCreateInputs = async () => {
       idWasPrintedBeforeCollection = /^instance_id: [0-9a-f-]{36}$/u.test(output[0] ?? '');
-      return {
-        'source-remote': 'https://example.test/nanoclaw.git',
-        endpoint: 'https://assistant.example.test/webhook/gchat',
-        'workspace-email': 'assistant@example.test',
-        'setup-file': setupFile,
-      };
+      return createSetupInput();
     };
 
     expect(
@@ -421,9 +414,9 @@ describe('create recovery contract', () => {
         paths,
         stdout: (line) => output.push(line),
         stderr: () => undefined,
+        ...productionRuntime(),
         collectCreateInputs,
         advanceProvision: async () => pause,
-        ...productionRuntime(),
       }),
     ).toBe(0);
     expect(idWasPrintedBeforeCollection).toBe(true);
@@ -471,13 +464,13 @@ describe('create recovery contract', () => {
 
   it('leaves no registry state when production track resolution fails before reservation', async () => {
     const paths = await testPaths();
-    const setupFile = await createSetupFile(paths);
     const stdout: string[] = [];
     const stderr: string[] = [];
-    const exitCode = await runCli(createArgs(setupFile), {
+    const exitCode = await runCli(createArgs(), {
       paths,
       stdout: (line) => stdout.push(line),
       stderr: (line) => stderr.push(line),
+      collectCreateInputs: async () => createSetupInput(),
       preflightGcloud: async () => ({ account: 'operator@example.test' }),
       resolveRelease: async () => {
         throw new GwsEaError('release_resolution_failed', 'Release track could not be resolved');
@@ -493,17 +486,19 @@ describe('create recovery contract', () => {
     expect((await readRegistry(paths)).instances).toEqual({});
   });
 
-  it('leaves no registry state when production setup input is invalid', async () => {
+  it('leaves no registry state when generated bootstrap input is invalid', async () => {
     const paths = await testPaths();
-    const setupFile = path.join(path.dirname(paths.configRoot), 'invalid-setup.json');
-    await writeFile(setupFile, '{invalid-json', { mode: 0o600 });
     const stdout: string[] = [];
     const stderr: string[] = [];
 
-    const exitCode = await runCli(createArgs(setupFile), {
+    const exitCode = await runCli(createArgs(), {
       paths,
       stdout: (line) => stdout.push(line),
       stderr: (line) => stderr.push(line),
+      collectCreateInputs: async () => ({
+        ...createSetupInput(),
+        bootstrapManifest: { ...createSetupInput().bootstrapManifest, schema_version: 99 as 1 },
+      }),
       preflightGcloud: async () => ({ account: 'operator@example.test' }),
       resolveRelease: async (sourceRemote, releaseRef) => ({ sourceRemote, releaseRef, commit: 'b'.repeat(40) }),
       holdLoopbackPorts: async () => {
@@ -513,18 +508,17 @@ describe('create recovery contract', () => {
 
     expect(exitCode).toBe(1);
     expect(stdout[0]).toMatch(/^instance_id: [0-9a-f-]{36}$/u);
-    expect(stderr.join('\n')).toContain('Bootstrap manifest is not valid JSON');
+    expect(stderr.join('\n')).toContain('Bootstrap manifest schema is unsupported');
     expect((await readRegistry(paths)).instances).toEqual({});
   });
 
   it('stages bootstrap input before reservation and removes it when reservation fails', async () => {
     const paths = await testPaths();
-    const setupFile = await createSetupFile(paths);
     const stdout: string[] = [];
     let stagedBeforeReservation = false;
 
     expect(
-      await runCli(createArgs(setupFile), {
+      await runCli(createArgs(), {
         paths,
         stdout: (line) => stdout.push(line),
         stderr: () => undefined,
@@ -547,11 +541,10 @@ describe('create recovery contract', () => {
 
   it('prints the id before reservation and only the exact safe resume command after a post-reservation failure', async () => {
     const paths = await testPaths();
-    const setupFile = await createSetupFile(paths);
     const stdout: string[] = [];
     const stderr: string[] = [];
     const secretCanary = 'secret-canary-must-not-print';
-    const exitCode = await runCli(createArgs(setupFile), {
+    const exitCode = await runCli(createArgs(), {
       paths,
       stdout: (line) => stdout.push(line),
       stderr: (line) => stderr.push(line),
@@ -594,12 +587,11 @@ describe('create recovery contract', () => {
 
   it('preserves resumable state when reservation publishes before reporting failure', async () => {
     const paths = await testPaths();
-    const setupFile = await createSetupFile(paths);
     const stdout: string[] = [];
     const stderr: string[] = [];
 
     expect(
-      await runCli(createArgs(setupFile), {
+      await runCli(createArgs(), {
         paths,
         stdout: (line) => stdout.push(line),
         stderr: (line) => stderr.push(line),
