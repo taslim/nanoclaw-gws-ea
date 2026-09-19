@@ -12,6 +12,7 @@ import path from 'path';
 
 import { log } from '../src/log.js';
 import { getLaunchdLabel, getSystemdUnit } from '../src/install-slug.js';
+import { renderLaunchdService, renderSystemdService } from '../src/service-definition.js';
 import { writeUpgradeState } from '../src/upgrade-state.js';
 import { cleanupUnhealthyPeers } from './peer-cleanup.js';
 import { commandExists, getPlatform, getNodePath, getServiceManager, isRoot } from './platform.js';
@@ -131,36 +132,17 @@ function setupLaunchd(projectRoot: string, nodePath: string, homeDir: string): v
   const plistPath = path.join(homeDir, 'Library', 'LaunchAgents', `${label}.plist`);
   fs.mkdirSync(path.dirname(plistPath), { recursive: true });
 
-  const plist = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>${label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${nodePath}</string>
-        <string>${projectRoot}/dist/index.js</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>${projectRoot}</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin</string>
-        <key>HOME</key>
-        <string>${homeDir}</string>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>${projectRoot}/logs/nanoclaw.log</string>
-    <key>StandardErrorPath</key>
-    <string>${projectRoot}/logs/nanoclaw.error.log</string>
-</dict>
-</plist>`;
+  const plist = renderLaunchdService({
+    label,
+    programArguments: [nodePath, `${projectRoot}/dist/index.js`],
+    workingDirectory: projectRoot,
+    environment: {
+      PATH: `/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin`,
+      HOME: homeDir,
+    },
+    standardOutputPath: `${projectRoot}/logs/nanoclaw.log`,
+    standardErrorPath: `${projectRoot}/logs/nanoclaw.error.log`,
+  });
 
   fs.writeFileSync(plistPath, plist);
   log.info('Wrote launchd plist', { plistPath });
@@ -303,24 +285,17 @@ async function setupSystemd(projectRoot: string, nodePath: string, homeDir: stri
     systemctlPrefix = 'systemctl --user';
   }
 
-  const unit = `[Unit]
-Description=NanoClaw Personal Assistant
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=${nodePath} ${projectRoot}/dist/index.js
-WorkingDirectory=${projectRoot}
-Restart=always
-RestartSec=5
-KillMode=process
-Environment=HOME=${homeDir}
-Environment=PATH=/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin
-StandardOutput=append:${projectRoot}/logs/nanoclaw.log
-StandardError=append:${projectRoot}/logs/nanoclaw.error.log
-
-[Install]
-WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
+  const unit = renderSystemdService({
+    programArguments: [nodePath, `${projectRoot}/dist/index.js`],
+    workingDirectory: projectRoot,
+    environment: {
+      HOME: homeDir,
+      PATH: `/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin`,
+    },
+    standardOutputPath: `${projectRoot}/logs/nanoclaw.log`,
+    standardErrorPath: `${projectRoot}/logs/nanoclaw.error.log`,
+    wantedBy: runningAsRoot ? 'multi-user.target' : 'default.target',
+  });
 
   fs.writeFileSync(unitPath, unit);
   log.info('Wrote systemd unit', { unitPath });

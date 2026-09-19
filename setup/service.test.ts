@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 
 import { getLaunchdLabel } from '../src/install-slug.js';
+import { renderLaunchdService, renderSystemdService } from '../src/service-definition.js';
 
 /**
  * Tests for service configuration generation.
@@ -12,57 +13,31 @@ import { getLaunchdLabel } from '../src/install-slug.js';
 // Helper: generate a plist string the same way service.ts does
 function generatePlist(nodePath: string, projectRoot: string, homeDir: string): string {
   const label = getLaunchdLabel(projectRoot);
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>${label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${nodePath}</string>
-        <string>${projectRoot}/dist/index.js</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>${projectRoot}</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin</string>
-        <key>HOME</key>
-        <string>${homeDir}</string>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>${projectRoot}/logs/nanoclaw.log</string>
-    <key>StandardErrorPath</key>
-    <string>${projectRoot}/logs/nanoclaw.error.log</string>
-</dict>
-</plist>`;
+  return renderLaunchdService({
+    label,
+    programArguments: [nodePath, `${projectRoot}/dist/index.js`],
+    workingDirectory: projectRoot,
+    environment: {
+      PATH: `/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin`,
+      HOME: homeDir,
+    },
+    standardOutputPath: `${projectRoot}/logs/nanoclaw.log`,
+    standardErrorPath: `${projectRoot}/logs/nanoclaw.error.log`,
+  });
 }
 
 function generateSystemdUnit(nodePath: string, projectRoot: string, homeDir: string, isSystem: boolean): string {
-  return `[Unit]
-Description=NanoClaw Personal Assistant
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=${nodePath} ${projectRoot}/dist/index.js
-WorkingDirectory=${projectRoot}
-Restart=always
-RestartSec=5
-KillMode=process
-Environment=HOME=${homeDir}
-Environment=PATH=/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin
-StandardOutput=append:${projectRoot}/logs/nanoclaw.log
-StandardError=append:${projectRoot}/logs/nanoclaw.error.log
-
-[Install]
-WantedBy=${isSystem ? 'multi-user.target' : 'default.target'}`;
+  return renderSystemdService({
+    programArguments: [nodePath, `${projectRoot}/dist/index.js`],
+    workingDirectory: projectRoot,
+    environment: {
+      HOME: homeDir,
+      PATH: `/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin`,
+    },
+    standardOutputPath: `${projectRoot}/logs/nanoclaw.log`,
+    standardErrorPath: `${projectRoot}/logs/nanoclaw.error.log`,
+    wantedBy: isSystem ? 'multi-user.target' : 'default.target',
+  });
 }
 
 describe('plist generation', () => {
@@ -115,5 +90,37 @@ describe('systemd unit generation', () => {
   it('sets correct ExecStart', () => {
     const unit = generateSystemdUnit('/usr/bin/node', '/srv/nanoclaw', '/home/user', false);
     expect(unit).toContain('ExecStart=/usr/bin/node /srv/nanoclaw/dist/index.js');
+  });
+});
+
+describe('generic service rendering', () => {
+  it('escapes launchd XML without changing argument boundaries', () => {
+    const plist = renderLaunchdService({
+      label: 'com.example.a&b',
+      programArguments: ['/opt/Node & Tools/node', '/tmp/<launcher>.js'],
+      workingDirectory: '/tmp/a & b',
+      environment: { HOME: '/tmp/a & b' },
+      standardOutputPath: '/tmp/a & b/out.log',
+      standardErrorPath: '/tmp/a & b/err.log',
+    });
+
+    expect(plist).toContain('<string>com.example.a&amp;b</string>');
+    expect(plist).toContain('<string>/opt/Node &amp; Tools/node</string>');
+    expect(plist).toContain('<string>/tmp/&lt;launcher&gt;.js</string>');
+  });
+
+  it('quotes systemd arguments and values containing whitespace', () => {
+    const unit = renderSystemdService({
+      programArguments: ['/opt/Node Tools/node', '/tmp/host launcher.js'],
+      workingDirectory: '/tmp/a b',
+      environment: { HOME: '/tmp/a b' },
+      standardOutputPath: '/tmp/a b/out.log',
+      standardErrorPath: '/tmp/a b/err.log',
+      wantedBy: 'default.target',
+    });
+
+    expect(unit).toContain('ExecStart="/opt/Node Tools/node" "/tmp/host launcher.js"');
+    expect(unit).toContain('WorkingDirectory="/tmp/a b"');
+    expect(unit).toContain('Environment="HOME=/tmp/a b"');
   });
 });
