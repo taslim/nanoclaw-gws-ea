@@ -78,15 +78,11 @@ async function assertTrustedPathComponent(
   }
 }
 
-async function assertTrustedCanonicalPath(
-  canonicalPath: string,
-  expectFile: boolean,
-  allowUnownedComponents = false,
-): Promise<void> {
-  await assertTrustedPathComponent(canonicalPath, expectFile, allowUnownedComponents);
+async function assertTrustedCanonicalPath(canonicalPath: string, expectFile: boolean): Promise<void> {
+  await assertTrustedPathComponent(canonicalPath, expectFile);
   let directory = expectFile ? path.dirname(canonicalPath) : canonicalPath;
   while (true) {
-    await assertTrustedPathComponent(directory, false, allowUnownedComponents);
+    await assertTrustedPathComponent(directory, false);
     const parent = path.dirname(directory);
     if (parent === directory) return;
     directory = parent;
@@ -126,7 +122,13 @@ async function resolveFromTrustedDirectories(command: string, directories: reado
     try {
       await access(candidate, fsConstants.X_OK);
       const canonical = await realpath(candidate);
-      await assertTrustedCanonicalPath(canonical, true, canonical === runningNode);
+      if (canonical === runningNode) {
+        // The runtime chose this exact binary before GWS-EA started. Keep the
+        // file write checks, but do not reject managed installation ancestors.
+        await assertTrustedPathComponent(canonical, true, true);
+      } else {
+        await assertTrustedCanonicalPath(canonical, true);
+      }
       return canonical;
     } catch (error) {
       if (!(error instanceof GwsEaError) && !isFilesystemError(error)) throw error;
@@ -136,7 +138,7 @@ async function resolveFromTrustedDirectories(command: string, directories: reado
   if (!path.isAbsolute(command) && command === path.basename(process.execPath)) {
     try {
       await access(runningNode, fsConstants.X_OK);
-      await assertTrustedCanonicalPath(runningNode, true, true);
+      await assertTrustedPathComponent(runningNode, true, true);
       return runningNode;
     } catch (error) {
       if (!(error instanceof GwsEaError) && !isFilesystemError(error)) throw error;
