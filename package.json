@@ -6,6 +6,7 @@
   "packageManager": "pnpm@10.34.5",
   "main": "dist/index.js",
   "bin": {
+    "gws-ea": "bin/gws-ea",
     "ncl": "bin/ncl"
   },
   "scripts": {
