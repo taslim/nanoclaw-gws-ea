@@ -3,8 +3,9 @@ import { registerMigration } from '../../db/migrations/index.js';
 import { registerRequiredProjectDocSection } from '../../project-doc-sections.js';
 import { register } from '../../cli/registry.js';
 import type { AgentGroup } from '../../types.js';
-import { getGwsEaProfile, reconcileGwsEaProfile, validateGwsEaProfileInput } from './db.js';
+import { bindVerifiedPrincipalUser, getGwsEaProfile, reconcileGwsEaProfile, validateGwsEaProfileInput } from './db.js';
 import { gwsEaProfileMigration } from './migration.js';
+import './wiring-policy.js';
 
 registerMigration(gwsEaProfileMigration);
 
@@ -57,6 +58,39 @@ register({
     });
   },
   handler: async (input) => reconcileGwsEaProfile(input),
+});
+
+register({
+  name: 'gws-ea-profile-get',
+  description: 'Read the installation-owned GWS-EA identity profile.',
+  access: 'hidden',
+  hostOnly: true,
+  parseArgs(raw) {
+    const unknown = Object.keys(raw);
+    if (unknown.length > 0) throw new Error(`Unknown profile field: --${unknown[0]}`);
+    return undefined;
+  },
+  handler: async () => getGwsEaProfile(),
+});
+
+register({
+  name: 'gws-ea-profile-bind-principal',
+  description: 'Bind one adapter-authenticated platform user to the principal.',
+  access: 'hidden',
+  hostOnly: true,
+  parseArgs(raw) {
+    const unknown = Object.keys(raw).filter((key) => key !== 'user-id' && key !== 'verified-at');
+    if (unknown.length > 0) throw new Error(`Unknown profile field: --${unknown[0]}`);
+    const userId = raw['user-id'];
+    const verifiedAt = raw['verified-at'];
+    if (typeof userId !== 'string' || userId.length === 0) throw new Error('--user-id is required');
+    if (typeof verifiedAt !== 'string' || verifiedAt.length === 0) throw new Error('--verified-at is required');
+    return { userId, verifiedAt };
+  },
+  handler: async ({ userId, verifiedAt }) => {
+    await bindVerifiedPrincipalUser(userId, verifiedAt);
+    return { user_id: userId, verified_at: verifiedAt };
+  },
 });
 
 export {

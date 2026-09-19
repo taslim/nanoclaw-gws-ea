@@ -5,14 +5,20 @@ registerResource({
   plural: 'dropped-messages',
   table: 'unregistered_senders',
   description:
-    "Dropped message log — tracks messages that were dropped by the router or access gate. Aggregates by (channel_type, platform_id) with a running count. Reasons include: no_agent_wired (no wiring exists), no_agent_engaged (wiring exists but engage rules didn't fire), unknown_sender_strict (sender not recognized, strict policy), unknown_sender_request_approval (sender not recognized, approval requested).",
+    "Dropped message log — tracks messages that were dropped by the router or access gate. Aggregates by (channel_type, platform_id, instance) with a running count. Reasons include: no_agent_wired (no wiring exists), no_agent_engaged (wiring exists but engage rules didn't fire), unknown_sender_strict (sender not recognized, strict policy), unknown_sender_request_approval (sender not recognized, approval requested).",
   idColumn: 'channel_type',
-  listOrder: 'last_seen DESC, channel_type, platform_id',
+  listOrder: 'last_seen DESC, channel_type, instance, platform_id',
   columns: [
     { name: 'channel_type', type: 'string', description: 'Channel adapter type of the dropped message.' },
     { name: 'platform_id', type: 'string', description: 'Platform chat ID where the message was dropped.' },
+    { name: 'instance', type: 'string', description: 'Exact adapter instance that received the message.' },
     { name: 'user_id', type: 'string', description: 'Sender user ID if resolved, null otherwise.' },
     { name: 'sender_name', type: 'string', description: 'Sender display name if available.' },
+    { name: 'sender_authenticated', type: 'number', description: '1 when the adapter authenticated the sender.' },
+    { name: 'sender_kind', type: 'string', description: 'Authenticated sender kind: human, bot, or unknown.' },
+    { name: 'is_group', type: 'number', description: '1 for a group conversation, 0 for a direct conversation.' },
+    { name: 'authenticated_message_id', type: 'string', description: 'Adapter-authenticated source message ID.' },
+    { name: 'authenticated_message_at', type: 'string', description: 'Canonical timestamp of authenticated evidence.' },
     {
       name: 'reason',
       type: 'string',
