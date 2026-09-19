@@ -33,7 +33,6 @@ import {
 import type { OnecliRuntimeLayout } from './onecli-compose.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import {
-  buildInstanceCliCommand,
   reconcileInstanceRuntime,
   runInstanceOnecliAdminCommand,
   createInstanceRuntimeConfig,
@@ -41,12 +40,8 @@ import {
   type InstanceRuntimeConfig,
   type InstanceServiceDependencies,
 } from './service.js';
-import {
-  reconcileMainIdentity,
-  type MainIdentityDependencies,
-  type MainIdentityInput,
-  type MainIdentityResult,
-} from './identity.js';
+import { runInstanceNclJson } from './ncl.js';
+import { reconcileMainIdentity, type MainIdentityDependencies, type MainIdentityInput } from './identity.js';
 import { reconcilePrincipalDm, type PrincipalCandidate, type PrincipalDiscoveryDependencies } from './principal.js';
 import { verifyExistingGchatEndpoint, verifyExistingGchatRoute, validateExistingGchatEndpoint } from './endpoint.js';
 import {
@@ -58,10 +53,10 @@ import {
   type PrincipalBindingVerificationResult,
 } from './verify.js';
 import { readOwnerOnlyFile, removePrivateFile, writePrivateTextFile } from './secrets.js';
-import { runSanitizedCommand } from './process.js';
 import { getInstanceReservation } from './registry.js';
 import { preparePrivateLocalDirectory, type ControlPlanePaths } from './paths.js';
 import { GwsEaError, PROVISION_PHASES, type ProvisionJournal, type ProvisionPhase } from './types.js';
+import { isRecord } from './validation.js';
 
 export type ProvisionBoundary = 'intent' | 'effect' | 'verify';
 
@@ -112,7 +107,7 @@ export interface ProductionProvisionInput {
 export interface ProductionProvisionState {
   onecliReceipt?: OnecliCompatibilityReceipt;
   providerSecretId?: string;
-  main?: MainIdentityResult;
+  mainAgentGroupId?: string;
   principal?: PrincipalCandidate;
   welcomeEventId?: string;
 }
@@ -142,10 +137,6 @@ export interface ProductionProvisionDependencies {
   readonly verifyConversation: (input: ConversationVerificationInput) => ConversationVerificationResult;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
 function unwrapData(value: unknown): unknown {
   return isRecord(value) && 'data' in value ? value.data : value;
 }
@@ -156,16 +147,6 @@ function parseJson(source: string, label: string): unknown {
   } catch {
     throw new GwsEaError('invalid_child_output', `${label} returned invalid JSON`);
   }
-}
-
-async function runNclJson(config: InstanceRuntimeConfig, args: readonly string[]): Promise<unknown> {
-  const command = buildInstanceCliCommand(config, [...args, '--json']);
-  const result = await runSanitizedCommand({ ...command, timeoutMs: 30_000 });
-  const frame = parseJson(result.stdout, 'ncl');
-  if (!isRecord(frame) || frame.ok !== true || !('data' in frame)) {
-    throw new GwsEaError('ncl_failed', 'The selected NanoClaw command did not succeed');
-  }
-  return frame.data;
 }
 
 function stringField(value: Record<string, unknown>, key: string): string | undefined {
@@ -254,7 +235,7 @@ async function defaultProbeProvider(context: ProductionProvisionContext): Promis
 
 async function defaultProbeNanoclaw(context: ProductionProvisionContext): Promise<PhaseProbeResult> {
   try {
-    const profileValue = unwrapData(await runNclJson(context.input.runtime, ['gws-ea-profile', 'get']));
+    const profileValue = unwrapData(await runInstanceNclJson(context.input.runtime, ['gws-ea-profile', 'get']));
     if (!isRecord(profileValue)) return { status: 'absent' };
     const mainAgentGroupId = stringField(profileValue, 'main_agent_group_id');
     if (
@@ -266,9 +247,11 @@ async function defaultProbeNanoclaw(context: ProductionProvisionContext): Promis
     ) {
       return { status: 'absent' };
     }
-    const groupValue = unwrapData(await runNclJson(context.input.runtime, ['groups', 'get', '--id', mainAgentGroupId]));
+    const groupValue = unwrapData(
+      await runInstanceNclJson(context.input.runtime, ['groups', 'get', '--id', mainAgentGroupId]),
+    );
     const configValue = unwrapData(
-      await runNclJson(context.input.runtime, ['groups', 'config', 'get', '--id', mainAgentGroupId]),
+      await runInstanceNclJson(context.input.runtime, ['groups', 'config', 'get', '--id', mainAgentGroupId]),
     );
     if (
       !isRecord(groupValue) ||
@@ -297,7 +280,7 @@ async function defaultProbeNanoclaw(context: ProductionProvisionContext): Promis
     if (!Array.isArray(secrets) || secrets.length !== 1 || secrets[0] !== providerSecretId) {
       return { status: 'absent' };
     }
-    context.state.main = { agentGroupId: mainAgentGroupId, onecliAgentId: agentId, providerSecretId };
+    context.state.mainAgentGroupId = mainAgentGroupId;
     return { status: 'matched' };
   } catch (error) {
     if (error instanceof GwsEaError && ['command_failed', 'command_timeout', 'ncl_failed'].includes(error.code)) {
@@ -371,11 +354,7 @@ function principalResult(
       },
     };
   }
-  context.state.main = context.state.main ?? {
-    agentGroupId: result.agentGroupId,
-    onecliAgentId: '',
-    providerSecretId: context.state.providerSecretId ?? '',
-  };
+  context.state.mainAgentGroupId = result.agentGroupId;
   context.state.principal = result.candidate;
   context.state.welcomeEventId = result.eventId;
   return { status: 'matched' };
@@ -386,25 +365,20 @@ function bindingObservation(
   result: PrincipalBindingVerificationResult,
 ): PhaseProbeResult {
   if (result.status === 'absent') return { status: 'absent' };
-  const providerSecretId = context.state.providerSecretId;
-  context.state.main = context.state.main ?? {
-    agentGroupId: result.agentGroupId,
-    onecliAgentId: '',
-    providerSecretId: providerSecretId ?? '',
-  };
+  context.state.mainAgentGroupId = result.agentGroupId;
   context.state.principal = result.candidate;
   context.state.welcomeEventId = result.welcomeEventId;
   return { status: 'matched' };
 }
 
 function conversationInput(context: ProductionProvisionContext): ConversationVerificationInput | undefined {
-  const main = context.state.main;
+  const mainAgentGroupId = context.state.mainAgentGroupId;
   const principal = context.state.principal;
   const welcomeEventId = context.state.welcomeEventId;
-  if (!main || !principal || !welcomeEventId) return undefined;
+  if (!mainAgentGroupId || !principal || !welcomeEventId) return undefined;
   return {
     checkoutRoot: context.input.runtime.checkout_realpath,
-    mainAgentGroupId: main.agentGroupId,
+    mainAgentGroupId,
     messagingGroupId: principal.messagingGroupId,
     principalUserId: principal.userId,
     adapterInstance: context.input.adapterInstance,
@@ -569,11 +543,12 @@ export function createProductionProvisionRegistry(
           }
         }
         await dependencies.reconcileInstanceRuntime(value.input.runtime, value.input.serviceDependencies);
-        value.state.main = await dependencies.reconcileMainIdentity(
+        const main = await dependencies.reconcileMainIdentity(
           value.input.runtime,
           { ...value.input.identity, providerSecretId: value.state.providerSecretId },
           value.input.identityDependencies,
         );
+        value.state.mainAgentGroupId = main.agentGroupId;
         if (value.input.bootstrapManifestFile) {
           await removePrivateFile(value.input.bootstrapManifestFile);
         }
@@ -988,11 +963,7 @@ async function hydrateMainState(
   if (!Array.isArray(secrets) || secrets.length !== 1 || typeof secrets[0] !== 'string') return {};
   return {
     providerSecretId: secrets[0],
-    main: {
-      agentGroupId: profile.main_agent_group_id,
-      onecliAgentId: agentId,
-      providerSecretId: secrets[0],
-    },
+    mainAgentGroupId: profile.main_agent_group_id,
   };
 }
 

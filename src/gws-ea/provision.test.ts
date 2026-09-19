@@ -316,11 +316,7 @@ describe('production provision phase composition', () => {
       },
       probeNanoclaw: async (value) => {
         if (!resources.has('nanoclaw')) return { status: 'absent' };
-        value.state.main = {
-          agentGroupId: 'ag-main',
-          onecliAgentId: 'onecli-main',
-          providerSecretId: 'secret-provider',
-        };
+        value.state.mainAgentGroupId = 'ag-main';
         return { status: 'matched' };
       },
       reconcileInstanceRuntime: async () => {

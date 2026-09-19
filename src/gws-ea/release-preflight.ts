@@ -5,6 +5,7 @@ import { parse as parseYaml } from 'yaml';
 
 import { runArgumentCommand } from './checkout.js';
 import { GwsEaError } from './types.js';
+import { isRecord } from './validation.js';
 
 const PROVIDER_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const EXACT_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
@@ -34,13 +35,7 @@ export interface ReleasePreflightResult {
   };
 }
 
-interface JsonRecord {
-  [key: string]: unknown;
-}
-
-function isRecord(value: unknown): value is JsonRecord {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
+type JsonRecord = Record<string, unknown>;
 
 function requireRecord(value: unknown, label: string, code = 'incomplete_release'): JsonRecord {
   if (!isRecord(value)) throw new GwsEaError(code, `${label} must be an object`);
@@ -90,13 +85,23 @@ async function assertDetachedCommit(checkoutRoot: string): Promise<void> {
 }
 
 async function assertCommittedRegularFiles(checkoutRoot: string, relativePaths: readonly string[]): Promise<void> {
-  for (const relativePath of relativePaths) {
-    const absolutePath = path.join(checkoutRoot, relativePath);
-    let info;
-    try {
-      info = await lstat(absolutePath);
-      await git(checkoutRoot, ['ls-files', '--error-unmatch', '--', relativePath]);
-    } catch {
+  const [trackedResult, fileInfo] = await Promise.all([
+    runArgumentCommand({ command: 'git', args: ['ls-files', '-z', '--', ...relativePaths], cwd: checkoutRoot }),
+    Promise.all(
+      relativePaths.map(async (relativePath) => {
+        try {
+          return await lstat(path.join(checkoutRoot, relativePath));
+          /* eslint-disable-next-line no-catch-all/no-catch-all -- Every lstat failure means the required release file is unusable. */
+        } catch {
+          return undefined;
+        }
+      }),
+    ),
+  ]);
+  const tracked = new Set(trackedResult.stdout.split('\0').filter(Boolean));
+  for (const [index, relativePath] of relativePaths.entries()) {
+    const info = fileInfo[index];
+    if (!info || !tracked.has(relativePath)) {
       throw new GwsEaError('incomplete_release', `Required committed release file is missing: ${relativePath}`);
     }
     if (info.isSymbolicLink() || !info.isFile()) {
@@ -109,16 +114,27 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-async function assertBarrelImport(
+interface BarrelImportExpectation {
+  readonly barrel: string;
+  readonly moduleName: string;
+  readonly code: string;
+}
+
+async function assertBarrelImports(
   checkoutRoot: string,
-  barrel: string,
-  moduleName: string,
-  code: string,
+  expectations: readonly BarrelImportExpectation[],
 ): Promise<void> {
-  const source = await readFile(path.join(checkoutRoot, barrel), 'utf8');
-  const importPattern = new RegExp(`^\\s*import\\s+['"]\\./${escapeRegExp(moduleName)}\\.js['"]\\s*;?\\s*$`, 'm');
-  if (!importPattern.test(source)) {
-    throw new GwsEaError(code, `${moduleName} is not composed in ${barrel}`);
+  const sources = await Promise.all(
+    expectations.map(({ barrel }) => readFile(path.join(checkoutRoot, barrel), 'utf8')),
+  );
+  for (const [index, expectation] of expectations.entries()) {
+    const importPattern = new RegExp(
+      `^\\s*import\\s+['"]\\./${escapeRegExp(expectation.moduleName)}\\.js['"]\\s*;?\\s*$`,
+      'm',
+    );
+    if (!importPattern.test(sources[index]!)) {
+      throw new GwsEaError(expectation.code, `${expectation.moduleName} is not composed in ${expectation.barrel}`);
+    }
   }
 }
 
@@ -223,15 +239,15 @@ async function validateComposition(checkoutRoot: string, provider: string): Prom
   ];
   try {
     await assertCommittedRegularFiles(checkoutRoot, [...commonFiles, ...providerFiles]);
-    await assertBarrelImport(checkoutRoot, 'src/channels/index.ts', 'gchat', 'incomplete_release');
-    for (const barrel of [
-      'src/provider-contracts/index.ts',
-      'setup/providers/index.ts',
-      'container/agent-runner/src/providers/index.ts',
-      'container/agent-runner/src/provider-contracts/index.ts',
-    ]) {
-      await assertBarrelImport(checkoutRoot, barrel, provider, 'provider_not_composed');
-    }
+    await assertBarrelImports(checkoutRoot, [
+      { barrel: 'src/channels/index.ts', moduleName: 'gchat', code: 'incomplete_release' },
+      ...[
+        'src/provider-contracts/index.ts',
+        'setup/providers/index.ts',
+        'container/agent-runner/src/providers/index.ts',
+        'container/agent-runner/src/provider-contracts/index.ts',
+      ].map((barrel) => ({ barrel, moduleName: provider, code: 'provider_not_composed' })),
+    ]);
   } catch (error) {
     if (
       error instanceof GwsEaError &&

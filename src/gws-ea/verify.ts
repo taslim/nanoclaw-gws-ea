@@ -244,7 +244,7 @@ function exactDeliveredReply(
           AND kind NOT IN ('system', 'task_log')
         ORDER BY timestamp, id`,
     )
-    .all(inReplyTo, CHANNEL_TYPE, platformId) as OutboundRow[];
+    .iterate(inReplyTo, CHANNEL_TYPE, platformId) as IterableIterator<OutboundRow>;
   for (const output of outputs) {
     const delivery = inbound
       .prepare(
@@ -365,13 +365,16 @@ export function verifyTalkableConversation(input: ConversationVerificationInput)
             AND kind = 'chat-sdk' AND trigger = 1
           ORDER BY timestamp, id`,
       )
-      .all(welcome.id, welcomeReply.delivery.delivered_at, CHANNEL_TYPE, platformId) as InboundRow[];
-    const principalMessages = laterMessages.filter((message) =>
-      isAuthenticatedPrincipalChatSdkMessage(message.content, principalUserId),
-    );
-    if (principalMessages.length === 0) return { ready: false, reason: 'later_principal_message_missing' };
-
-    for (const later of principalMessages) {
+      .iterate(
+        welcome.id,
+        welcomeReply.delivery.delivered_at,
+        CHANNEL_TYPE,
+        platformId,
+      ) as IterableIterator<InboundRow>;
+    let foundPrincipalMessage = false;
+    for (const later of laterMessages) {
+      if (!isAuthenticatedPrincipalChatSdkMessage(later.content, principalUserId)) continue;
+      foundPrincipalMessage = true;
       const reply = exactDeliveredReply(inbound, outbound, later.id, platformId);
       if (!reply || reply.outbound.timestamp < later.timestamp) continue;
       return {
@@ -384,7 +387,10 @@ export function verifyTalkableConversation(input: ConversationVerificationInput)
         deliveredAt: reply.delivery.delivered_at,
       };
     }
-    return { ready: false, reason: 'reply_not_delivered' };
+    return {
+      ready: false,
+      reason: foundPrincipalMessage ? 'reply_not_delivered' : 'later_principal_message_missing',
+    };
   } finally {
     outbound?.close();
     inbound.close();

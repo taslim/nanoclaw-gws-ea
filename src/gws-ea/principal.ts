@@ -2,9 +2,11 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 
 import { INSTANCE_KEY_RE } from '../channels/channel-registry.js';
+import { runInstanceNclJson } from './ncl.js';
 import { buildInstanceCliCommand, validateRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
 import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { GwsEaError } from './types.js';
+import { isRecord } from './validation.js';
 
 const CHANNEL_TYPE = 'gchat';
 
@@ -42,10 +44,6 @@ export interface PrincipalDiscoveryDependencies {
 interface MainProfile {
   readonly mainAgentGroupId: string;
   readonly principalDisplayName: string;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function unwrapData(value: unknown): unknown {
@@ -137,24 +135,6 @@ function parseCandidates(value: unknown, adapterInstance: string, provisioningSt
     );
 }
 
-function parseJson(source: string): unknown {
-  try {
-    return JSON.parse(source) as unknown;
-  } catch {
-    throw new GwsEaError('invalid_child_output', 'ncl returned invalid JSON');
-  }
-}
-
-async function defaultRunNcl(config: InstanceRuntimeConfig, args: readonly string[]): Promise<unknown> {
-  const command = buildInstanceCliCommand(config, [...args, '--json']);
-  const result = await runSanitizedCommand({ ...command, timeoutMs: 30_000 });
-  const frame = parseJson(result.stdout);
-  if (!isRecord(frame) || frame.ok !== true || !('data' in frame)) {
-    throw new GwsEaError('ncl_failed', 'The selected NanoClaw command did not succeed');
-  }
-  return frame.data;
-}
-
 async function defaultRunBootstrap(
   config: InstanceRuntimeConfig,
   args: readonly string[],
@@ -204,7 +184,7 @@ export async function reconcilePrincipalDm(
   if (!INSTANCE_KEY_RE.test(input.adapterInstance)) {
     throw new GwsEaError('invalid_arguments', 'Google Chat adapter instance is invalid');
   }
-  const runNcl = dependencies.runNcl ?? defaultRunNcl;
+  const runNcl = dependencies.runNcl ?? runInstanceNclJson;
   const runBootstrap =
     dependencies.runBootstrap ??
     ((runtimeConfig: InstanceRuntimeConfig, args: readonly string[]) =>

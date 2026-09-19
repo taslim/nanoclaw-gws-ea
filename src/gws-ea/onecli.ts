@@ -31,6 +31,7 @@ import {
   type OnecliRuntimeLayout,
 } from './onecli-compose.js';
 import { GwsEaError } from './types.js';
+import { hasControlCharacters, isRecord } from './validation.js';
 
 const EXPECTED_SERVICES = ['app', 'gateway', 'postgres'] as const;
 
@@ -895,10 +896,6 @@ function unwrapData(value: unknown): unknown {
   return value;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
 function recordString(value: Record<string, unknown>, key: string): string | undefined {
   return typeof value[key] === 'string' ? value[key] : undefined;
 }
@@ -948,13 +945,6 @@ function isExpectedGatewayProxy(value: string): boolean {
   if (!URL.canParse(value)) return false;
   const url = new URL(value);
   return url.protocol === 'http:' && url.hostname === 'host.docker.internal' && url.port === '10255';
-}
-
-function hasControlCharacters(value: string): boolean {
-  return [...value].some((character) => {
-    const code = character.codePointAt(0);
-    return code !== undefined && (code <= 0x1f || code === 0x7f);
-  });
 }
 
 async function assertInstalledSdkVersion(): Promise<void> {

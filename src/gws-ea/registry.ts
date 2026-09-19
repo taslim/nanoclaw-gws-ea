@@ -23,6 +23,7 @@ import {
   type InstanceReservation,
   type InstanceReservationInput,
 } from './types.js';
+import { hasControlCharacters, isRecord } from './validation.js';
 
 const INSTANCE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const RELEASE_TRACK_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
@@ -30,17 +31,6 @@ const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 const GCP_PROJECT_PATTERN = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
 const ONECLI_PROJECT_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-function hasControlCharacters(value: string): boolean {
-  return [...value].some((character) => {
-    const code = character.codePointAt(0);
-    return code !== undefined && (code <= 0x1f || code === 0x7f);
-  });
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 function assertExactKeys(value: Record<string, unknown>, expected: readonly string[], label: string): void {
   const actual = Object.keys(value).sort();
