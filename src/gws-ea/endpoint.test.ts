@@ -41,7 +41,7 @@ describe('existing Google Chat endpoint verification', () => {
     ).rejects.toThrow(/endpoint/i);
   });
 
-  it('uses no-follow probes and requires both unsigned and wrong-audience traffic to return 401', async () => {
+  it('uses a no-follow probe and requires unsigned traffic to return 401', async () => {
     const requests: Array<{ url: string; init: RequestInit | undefined }> = [];
     const fetch = vi.fn<typeof globalThis.fetch>(async (url, init) => {
       requests.push({ url: String(url), init });
@@ -52,18 +52,12 @@ describe('existing Google Chat endpoint verification', () => {
       verifyExistingGchatEndpoint({ endpointUrl: ENDPOINT, audienceUrl: ENDPOINT }, { fetch }),
     ).resolves.toEqual({ endpointUrl: ENDPOINT, audienceUrl: ENDPOINT });
 
-    expect(requests).toHaveLength(2);
+    expect(requests).toHaveLength(1);
     for (const request of requests) {
       expect(request.url).toBe(ENDPOINT);
       expect(request.init).toMatchObject({ method: 'POST', redirect: 'manual' });
     }
     expect(new Headers(requests[0]!.init?.headers).has('authorization')).toBe(false);
-    const authorization = new Headers(requests[1]!.init?.headers).get('authorization');
-    expect(authorization).toMatch(/^Bearer /u);
-    const payload = authorization!.slice('Bearer '.length).split('.')[1]!;
-    expect(JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'))).toMatchObject({
-      aud: 'https://wrong-audience.invalid/webhook/gchat',
-    });
   });
 
   it.each([301, 302, 307, 308])('rejects redirects instead of following status %s', async (status) => {

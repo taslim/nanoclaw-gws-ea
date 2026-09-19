@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -95,8 +95,15 @@ async function releaseFixture(): Promise<string> {
       2,
     ) + '\n',
   );
+  await write(root, 'bin/ncl', '#!/usr/bin/env bash\nexit 0\n');
+  await chmod(path.join(root, 'bin/ncl'), 0o755);
   await write(root, 'src/channels/gchat.ts', "export const gchat = 'registered';\n");
   await write(root, 'src/channels/index.ts', "import './cli.js';\nimport './gchat.js';\n");
+  await write(root, 'src/gws-ea/process.ts', 'export {};\n');
+  await write(root, 'scripts/init-first-agent.ts', 'export {};\n');
+  await write(root, 'src/modules/gws-ea-profile/index.ts', 'export {};\n');
+  await write(root, 'src/modules/gws-ea-profile/migration.ts', 'export {};\n');
+  await write(root, 'src/modules/index.ts', "import './gws-ea-profile/index.js';\n");
   await write(root, 'src/provider-contracts/claude.ts', "export const provider = 'claude';\n");
   await write(root, 'src/provider-contracts/index.ts', "import './claude.js';\n");
   await write(root, 'setup/providers/claude.ts', "export const provider = 'claude';\n");
@@ -114,6 +121,10 @@ async function releaseFixture(): Promise<string> {
 function recorder(commands: SetupCommand[]): (command: SetupCommand) => Promise<void> {
   return async (command) => {
     commands.push(command);
+    if (command.args[0] === 'run' && command.args[1] === 'build') {
+      await write(command.cwd, 'dist/gws-ea/process.js', 'export {};\n');
+      await write(command.cwd, 'dist/index.js', 'export {};\n');
+    }
   };
 }
 
@@ -186,6 +197,8 @@ describe('release preflight', () => {
   it.each([
     ['template', 'templates/gws-ea/main/plugin.json', 'incomplete_release'],
     ['Google Chat adapter', 'src/channels/gchat.ts', 'incomplete_release'],
+    ['GWS-EA service launcher', 'src/gws-ea/process.ts', 'incomplete_release'],
+    ['GWS-EA profile migration', 'src/modules/gws-ea-profile/migration.ts', 'incomplete_release'],
     ['provider host contract', 'src/provider-contracts/claude.ts', 'provider_not_composed'],
     ['provider runtime', 'container/agent-runner/src/providers/claude.ts', 'provider_not_composed'],
   ])('rejects a release missing its committed %s before setup commands', async (_label, missingPath, code) => {
@@ -198,6 +211,23 @@ describe('release preflight', () => {
       runReleasePreflight({ checkoutRoot: root, provider: 'claude' }, { runSetupCommand: recorder(commands) }),
     ).rejects.toMatchObject({ code });
     expect(commands).toEqual([]);
+  });
+
+  it('rejects a build that does not emit the service runtime artifacts', async () => {
+    const root = await releaseFixture();
+    const commands: SetupCommand[] = [];
+
+    await expect(
+      runReleasePreflight(
+        { checkoutRoot: root, provider: 'claude' },
+        {
+          runSetupCommand: async (command) => {
+            commands.push(command);
+          },
+        },
+      ),
+    ).rejects.toThrow(/dist\/gws-ea\/process\.js/u);
+    expect(commands).toHaveLength(2);
   });
 
   it('rejects a selected provider that is not composed into the release', async () => {

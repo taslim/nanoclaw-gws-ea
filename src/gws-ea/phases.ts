@@ -5,6 +5,9 @@ export interface ProvisionHumanPause {
   readonly phase: ProvisionPhase;
   readonly code: string;
   readonly message: string;
+  readonly details?: readonly string[];
+  readonly actionUrl?: string;
+  readonly resumeFlag?: string;
   readonly choices?: readonly { readonly id: string; readonly label: string }[];
 }
 

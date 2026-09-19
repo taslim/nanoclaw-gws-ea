@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import path from 'node:path';
 import { readJson, writePrivate } from '../community-portal/private-file.js';
 import { processLock } from '../community-portal/process-lock.js';
 import { isErrno } from '../community-portal/errors.js';
@@ -194,10 +195,22 @@ export async function acquireInstanceOperation(
   instanceId: string,
 ): Promise<InstanceOperation | null> {
   assertInstanceId(instanceId);
-  await getInstanceReservation(paths, instanceId);
-  await preparePrivateLocalDirectory(paths.instanceRoot(instanceId));
+  await preparePrivateLocalDirectory(path.dirname(paths.instanceLock(instanceId)));
   const unlock = await processLock(paths.instanceLock(instanceId));
   if (!unlock) return null;
+  try {
+    try {
+      await assertPrivateStateFile(paths.removalFile(instanceId));
+      throw new GwsEaError('removal_in_progress', 'Assistant removal is in progress; provisioning cannot resume');
+    } catch (error) {
+      if (!isErrno(error, 'ENOENT')) throw error;
+    }
+    await getInstanceReservation(paths, instanceId);
+    await preparePrivateLocalDirectory(paths.instanceRoot(instanceId));
+  } catch (error) {
+    unlock();
+    throw error;
+  }
   let active = true;
   const operation: InstanceOperation = {
     instanceId,

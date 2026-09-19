@@ -26,7 +26,6 @@ function runtimeConfig(): InstanceRuntimeConfig {
     onecli_cli_path: '/opt/onecli',
     selected_provider: 'claude',
     endpoint_url: 'https://aya.example.test/webhook/gchat',
-    gchat_bot_user_id: 'users/123',
     secret_files: {
       gchat_credentials: `${checkout}/data/gws-ea/secrets/gchat-service-account.json`,
       onecli_runtime_api_key: `${checkout}/data/gws-ea/secrets/onecli-runtime-api-key`,

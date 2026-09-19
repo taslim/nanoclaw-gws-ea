@@ -17,10 +17,10 @@ import {
 import { readOwnerOnlyFile, writePrivateTextFile } from './secrets.js';
 import { assertInstanceId } from './registry.js';
 import { GwsEaError, type AllocatedPorts, type InstanceReservation } from './types.js';
+import { hasControlCharacters } from './validation.js';
 
 export const INSTANCE_RUNTIME_SCHEMA_VERSION = 1 as const;
 const PROVIDER_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
-const GCHAT_BOT_USER_ID_PATTERN = /^users\/[^/\s]+$/u;
 const ONECLI_PROJECT_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/u;
 const SERVICE_PATH = '/usr/local/bin:/usr/bin:/bin';
 
@@ -47,7 +47,6 @@ export interface InstanceRuntimeConfig {
   readonly onecli_cli_path: string;
   readonly selected_provider: string;
   readonly endpoint_url: string;
-  readonly gchat_bot_user_id: string;
   readonly secret_files: InstanceSecretFiles;
 }
 
@@ -55,7 +54,6 @@ export interface InstanceRuntimeInput {
   readonly nodePath: string;
   readonly homeDirectory: string;
   readonly selectedProvider: string;
-  readonly gchatBotUserId: string;
 }
 
 export type InstanceServicePlatform = 'macos' | 'linux';
@@ -88,13 +86,7 @@ export interface InstanceServiceDependencies extends ServiceLayoutOptions {
 }
 
 function assertControlFree(value: string, label: string): string {
-  if (
-    !value ||
-    [...value].some((character) => {
-      const code = character.codePointAt(0);
-      return code !== undefined && (code <= 0x1f || code === 0x7f);
-    })
-  ) {
+  if (!value || hasControlCharacters(value)) {
     throw new GwsEaError('invalid_runtime_config', `${label} is invalid`);
   }
   return value;
@@ -154,7 +146,6 @@ export function createInstanceRuntimeConfig(
     onecli_cli_path: onecli.cliExecutable,
     selected_provider: input.selectedProvider.toLowerCase(),
     endpoint_url: reservation.exclusive_resource_claims.endpoint_url,
-    gchat_bot_user_id: input.gchatBotUserId,
     secret_files: expectedSecretFiles(checkout),
   };
   validateRuntimeConfig(config);
@@ -202,7 +193,6 @@ export function validateRuntimeConfig(value: unknown): InstanceRuntimeConfig {
       'onecli_cli_path',
       'selected_provider',
       'endpoint_url',
-      'gchat_bot_user_id',
       'secret_files',
     ],
     'Runtime config',
@@ -231,10 +221,6 @@ export function validateRuntimeConfig(value: unknown): InstanceRuntimeConfig {
     throw new GwsEaError('invalid_runtime_config', 'onecli_project is invalid');
   const provider = stringField(raw, 'selected_provider');
   if (!PROVIDER_PATTERN.test(provider)) throw new GwsEaError('invalid_runtime_config', 'selected_provider is invalid');
-  const botUserId = stringField(raw, 'gchat_bot_user_id');
-  if (!GCHAT_BOT_USER_ID_PATTERN.test(botUserId)) {
-    throw new GwsEaError('invalid_runtime_config', 'gchat_bot_user_id is invalid');
-  }
   let endpoint: URL;
   try {
     endpoint = new URL(stringField(raw, 'endpoint_url'));
@@ -304,7 +290,6 @@ export function validateRuntimeConfig(value: unknown): InstanceRuntimeConfig {
     onecli_cli_path: onecliCliPath,
     selected_provider: provider,
     endpoint_url: endpoint.href,
-    gchat_bot_user_id: botUserId,
     secret_files: secretFiles,
   };
 }
@@ -324,7 +309,6 @@ function environmentFileContents(config: InstanceRuntimeConfig): string {
     ONECLI_GATEWAY_CONTAINER: config.onecli_gateway_container,
     ONECLI_URL: config.onecli_app_url,
     GCHAT_ENDPOINT_URL: config.endpoint_url,
-    GCHAT_BOT_USER_ID: config.gchat_bot_user_id,
   };
   return `${Object.entries(values)
     .map(([key, value]) => `${key}=${assertControlFree(value, key)}`)
@@ -525,7 +509,6 @@ export async function buildInstanceHostEnvironment(
     ONECLI_API_KEY: onecliRuntimeApiKey.trim(),
     GCHAT_CREDENTIALS: gchatCredentials,
     GCHAT_ENDPOINT_URL: config.endpoint_url,
-    GCHAT_BOT_USER_ID: config.gchat_bot_user_id,
   });
 }
 

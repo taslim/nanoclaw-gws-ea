@@ -88,8 +88,8 @@ function reservation(
     exclusive_resource_claims: {
       endpoint_url: 'https://checkout.example.test/webhook/gchat',
       gcp_project_id: 'checkout-project',
-      chat_app_id: 'checkout-chat-app',
-      chat_credential_id: 'checkout-chat-key',
+      gcp_account: 'operator@example.test',
+      gchat_service_account: 'gws-ea-chat@checkout-project.iam.gserviceaccount.com',
       workspace_email: 'checkout@example.test',
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },

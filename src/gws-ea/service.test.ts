@@ -55,8 +55,8 @@ async function fixture(): Promise<{ config: InstanceRuntimeConfig; home: string 
     exclusive_resource_claims: {
       endpoint_url: 'https://assistant.example.test/webhook/gchat',
       gcp_project_id: 'assistant-project',
-      chat_app_id: 'assistant-chat-app',
-      chat_credential_id: 'assistant-chat-key',
+      gcp_account: 'operator@example.test',
+      gchat_service_account: 'gws-ea-chat@assistant-project.iam.gserviceaccount.com',
       workspace_email: 'assistant@example.test',
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },
@@ -76,7 +76,6 @@ async function fixture(): Promise<{ config: InstanceRuntimeConfig; home: string 
       nodePath: process.execPath,
       homeDirectory: home,
       selectedProvider: 'claude',
-      gchatBotUserId: 'users/123456789',
     }),
     home,
   };

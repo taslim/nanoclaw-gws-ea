@@ -141,6 +141,24 @@ async function assertCommittedRegularFiles(
   }
 }
 
+async function assertRuntimeArtifacts(checkoutRoot: string): Promise<void> {
+  for (const relativePath of ['dist/gws-ea/process.js', 'dist/index.js']) {
+    let info;
+    try {
+      info = await lstat(path.join(checkoutRoot, relativePath));
+    } catch {
+      throw new GwsEaError('incomplete_release', `Required build artifact is missing: ${relativePath}`);
+    }
+    if (info.isSymbolicLink() || !info.isFile()) {
+      throw new GwsEaError('incomplete_release', `Required build artifact must be a regular file: ${relativePath}`);
+    }
+  }
+  const launcher = await lstat(path.join(checkoutRoot, 'bin', 'ncl'));
+  if ((launcher.mode & 0o111) === 0) {
+    throw new GwsEaError('incomplete_release', 'Required ncl launcher is not executable');
+  }
+}
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -258,9 +276,15 @@ async function validateComposition(
     'package.json',
     'pnpm-lock.yaml',
     'versions.json',
+    'bin/ncl',
     'templates/gws-ea/main/plugin.json',
     'src/channels/gchat.ts',
     'src/channels/index.ts',
+    'src/gws-ea/process.ts',
+    'scripts/init-first-agent.ts',
+    'src/modules/gws-ea-profile/index.ts',
+    'src/modules/gws-ea-profile/migration.ts',
+    'src/modules/index.ts',
   ];
   const providerFiles = [
     `src/provider-contracts/${provider}.ts`,
@@ -277,6 +301,7 @@ async function validateComposition(
     await assertCommittedRegularFiles(checkoutRoot, [...commonFiles, ...providerFiles], run, environments);
     await assertBarrelImports(checkoutRoot, [
       { barrel: 'src/channels/index.ts', moduleName: 'gchat', code: 'incomplete_release' },
+      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-profile/index', code: 'incomplete_release' },
       ...[
         'src/provider-contracts/index.ts',
         'setup/providers/index.ts',
@@ -333,6 +358,7 @@ export async function runReleasePreflight(
   await assertClean(checkoutRoot, 'frozen dependency installation', runCommand, environments);
   await runSetupCommand({ command: 'pnpm', args: ['run', 'build'], cwd: checkoutRoot, env: environments.common });
   await assertClean(checkoutRoot, 'release build', runCommand, environments);
+  await assertRuntimeArtifacts(checkoutRoot);
 
   return {
     provider: input.provider,

@@ -1,15 +1,7 @@
 import * as prompts from '@clack/prompts';
 import { GwsEaError } from './types.js';
 
-export const CREATE_SETUP_FIELDS = [
-  'source-remote',
-  'endpoint',
-  'gcp-project',
-  'chat-app',
-  'chat-credential-id',
-  'workspace-email',
-  'setup-file',
-] as const;
+export const CREATE_SETUP_FIELDS = ['source-remote', 'endpoint', 'workspace-email', 'setup-file'] as const;
 
 export type CreateSetupField = (typeof CREATE_SETUP_FIELDS)[number];
 export type CreateSetupAnswers = Record<CreateSetupField, string>;
@@ -23,9 +15,6 @@ export interface CreatePromptContext {
 const LABELS: Readonly<Record<CreateSetupField, string>> = {
   'source-remote': 'Source repository remote',
   endpoint: 'Existing HTTPS Google Chat endpoint',
-  'gcp-project': 'Dedicated GCP project ID',
-  'chat-app': 'Google Chat app ID',
-  'chat-credential-id': 'Service-account private_key_id',
   'workspace-email': 'Assistant Workspace email',
   'setup-file': 'Owner-only provisioning input file',
 };

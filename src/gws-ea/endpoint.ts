@@ -1,7 +1,6 @@
 import { GwsEaError } from './types.js';
 
 const CALLBACK_PATH = '/webhook/gchat';
-const WRONG_AUDIENCE = 'https://wrong-audience.invalid/webhook/gchat';
 
 export interface ExistingGchatEndpointInput {
   readonly endpointUrl: string;
@@ -45,11 +44,6 @@ export function validateExistingGchatEndpoint(value: string): string {
   return endpoint.href;
 }
 
-function wrongAudienceToken(): string {
-  const encode = (value: object): string => Buffer.from(JSON.stringify(value)).toString('base64url');
-  return `${encode({ alg: 'RS256', typ: 'JWT' })}.${encode({ aud: WRONG_AUDIENCE })}.invalid-signature`;
-}
-
 async function expectUnauthorized(
   fetchImplementation: typeof globalThis.fetch,
   endpointUrl: string,
@@ -82,9 +76,9 @@ async function expectUnauthorized(
 }
 
 /**
- * Verify the operator-owned route without following redirects. The second
- * request carries an intentionally invalid token naming another audience;
- * the live U8 receipt supplies the signed wrong-audience proof.
+ * Verify the operator-owned route without following redirects. A real signed
+ * Google Chat event is the authentication proof; a fabricated JWT cannot
+ * distinguish signature rejection from audience rejection.
  */
 export async function verifyExistingGchatEndpoint(
   input: ExistingGchatEndpointInput,
@@ -98,7 +92,6 @@ export async function verifyExistingGchatEndpoint(
   const fetchImplementation = dependencies.fetch ?? globalThis.fetch;
   const timeoutMs = dependencies.timeoutMs ?? 10_000;
   await expectUnauthorized(fetchImplementation, endpointUrl, undefined, timeoutMs);
-  await expectUnauthorized(fetchImplementation, endpointUrl, `Bearer ${wrongAudienceToken()}`, timeoutMs);
   return { endpointUrl, audienceUrl };
 }
 

@@ -48,8 +48,8 @@ function reservation(paths: ControlPlanePaths): InstanceReservationInput {
     exclusive_resource_claims: {
       endpoint_url: 'https://assistant.example.com/webhook/gchat',
       gcp_project_id: 'gws-ea-dogfood',
-      chat_app_id: 'assistant-bot',
-      chat_credential_id: 'chat-credential-1',
+      gcp_account: 'operator@example.com',
+      gchat_service_account: 'gws-ea-chat@gws-ea-dogfood.iam.gserviceaccount.com',
       workspace_email: 'assistant@example.com',
       onecli_project: 'gws_ea_1',
     },
@@ -63,7 +63,7 @@ function serviceAccount(overrides: Readonly<Record<string, string>> = {}): strin
     project_id: projectId,
     private_key_id: 'chat-credential-1',
     private_key: '-----BEGIN PRIVATE KEY-----\ntest-key-material\n-----END PRIVATE KEY-----\n',
-    client_email: `assistant@${projectId}.iam.gserviceaccount.com`,
+    client_email: `gws-ea-chat@${projectId}.iam.gserviceaccount.com`,
     client_id: '1234567890',
     auth_uri: 'https://accounts.google.com/o/oauth2/auth',
     token_uri: 'https://oauth2.googleapis.com/token',
@@ -95,10 +95,6 @@ function bootstrapManifest(paths: ControlPlanePaths): ProductionBootstrapManifes
       assistant_display_name: 'Aya',
       principal_display_name: 'Principal',
       principal_timezone: 'America/Los_Angeles',
-    },
-    gchat: {
-      bot_user_id: 'users/assistant-bot',
-      credential_file: path.join(inputRoot, 'gchat-key.json'),
     },
     selected_messaging_group_id: null,
   };
@@ -137,6 +133,7 @@ function registry(context: FixtureContext) {
   });
   return defineProvisionPhaseRegistry({
     materialize_checkout: entry('materialize_checkout'),
+    provision_gcp: entry('provision_gcp'),
     start_onecli: entry('start_onecli'),
     configure_provider: entry('configure_provider'),
     start_nanoclaw: entry('start_nanoclaw'),
@@ -303,7 +300,6 @@ function productionContext(
     nodePath: '/usr/local/bin/node',
     homeDirectory: path.dirname(operation.paths.stateRoot),
     selectedProvider: 'claude',
-    gchatBotUserId: 'users/assistant-bot',
   });
   return {
     operation,
@@ -317,6 +313,14 @@ function productionContext(
       releasePreflight: { checkoutRoot: reserved.checkout_realpath, provider: 'claude' },
       onecli,
       runtime,
+      gcp: {
+        instanceId: reserved.instance_id,
+        projectId: reserved.exclusive_resource_claims.gcp_project_id,
+        account: reserved.exclusive_resource_claims.gcp_account,
+        serviceAccountEmail: reserved.exclusive_resource_claims.gchat_service_account,
+        credentialFile: runtime.secret_files.gchat_credentials,
+        cwd: reserved.checkout_realpath,
+      },
       providerCredentialMetadata: {
         name: 'Claude provider',
         type: 'api_key',
@@ -348,41 +352,40 @@ function productionContext(
 }
 
 describe('production provision phase composition', () => {
-  it('rejects a configured Google Chat bot swap before starting NanoClaw', async () => {
+  it('pauses with the exact project-scoped Chat configuration handoff', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
-    const startRuntime = vi.fn(async (): Promise<never> => {
-      throw new Error('NanoClaw must not start');
-    });
+    const verifyEndpoint = vi.fn();
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
-      context.state.providerSecretId = 'secret-provider';
-      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), {
-        recursive: true,
-        mode: 0o700,
-      });
-      await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
-      const mismatched: ProductionProvisionContext = {
-        ...context,
-        input: {
-          ...context.input,
-          runtime: { ...context.input.runtime, gchat_bot_user_id: 'users/different-app' },
-        },
-      };
-      const definitions = createProductionProvisionRegistry(mismatched, { reconcileInstanceRuntime: startRuntime });
+      const phase = createProductionProvisionRegistry(context, {
+        isChatConfigurationConfirmed: async () => false,
+        verifyEndpoint,
+      }).configure_channel;
 
-      await expect(definitions.start_nanoclaw.apply(mismatched)).rejects.toMatchObject({
-        code: 'gchat_app_mismatch',
+      await expect(phase.probe(context)).resolves.toMatchObject({
+        status: 'paused',
+        pause: {
+          code: 'chat_configuration_required',
+          details: [
+            'App name: Aya',
+            expect.stringContaining('avatar'),
+            expect.stringContaining(reserved.exclusive_resource_claims.endpoint_url),
+            expect.stringContaining('visibility'),
+          ],
+          actionUrl: expect.stringContaining(`project=${reserved.exclusive_resource_claims.gcp_project_id}`),
+          resumeFlag: '--chat-configured',
+        },
       });
     });
 
-    expect(startRuntime).not.toHaveBeenCalled();
+    expect(verifyEndpoint).not.toHaveBeenCalled();
   });
 
   it.each([
     ['project', { project_id: 'different-project' }],
-    ['key', { private_key_id: 'different-key-id' }],
+    ['identity', { client_email: 'other@gws-ea-dogfood.iam.gserviceaccount.com' }],
   ] as const)('rejects a service-account %s swap before starting NanoClaw', async (_label, credentialOverride) => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
@@ -434,6 +437,11 @@ describe('production provision phase composition', () => {
           packageManager: 'pnpm@10.0.0',
           onecli: { gateway: '1.42.0', cli: '2.2.5', sdk: '2.2.1' },
         };
+      },
+      probeGcp: async () => (resources.has('gcp') ? { status: 'matched' } : { status: 'absent' }),
+      reconcileGcpProject: async () => {
+        effects.push('reconcileGcpProject');
+        resources.add('gcp');
       },
       probeOnecli: async () => (resources.has('onecli') ? { status: 'matched' } : { status: 'absent' }),
       reconcileOnecliRuntime: async () => {
@@ -494,6 +502,7 @@ describe('production provision phase composition', () => {
         effects.push('verifyExistingGchatEndpoint');
         return { endpointUrl: endpoint.endpointUrl, audienceUrl: endpoint.audienceUrl };
       },
+      isChatConfigurationConfirmed: async () => true,
       verifyPrincipalBinding: () =>
         principalBound
           ? {
@@ -578,6 +587,7 @@ describe('production provision phase composition', () => {
     expect(effects.filter((effect) => !effect.startsWith('verifyExisting'))).toEqual([
       'materializeReleaseCheckout',
       'runReleasePreflight',
+      'reconcileGcpProject',
       'reconcileOnecliRuntime',
       'persistOnecliApiKeyFiles',
       'persistOnecliApiKeyFiles',

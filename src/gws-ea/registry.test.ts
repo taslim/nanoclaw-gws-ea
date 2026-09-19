@@ -45,8 +45,8 @@ function reservation(paths: ControlPlanePaths, instanceId = allocateInstanceId()
     exclusive_resource_claims: {
       endpoint_url: 'https://assistant.example.test/webhook/gchat',
       gcp_project_id: 'assistant-project',
-      chat_app_id: 'assistant-chat-app',
-      chat_credential_id: 'assistant-chat-key',
+      gcp_account: 'operator@example.test',
+      gchat_service_account: 'gws-ea-chat@assistant-project.iam.gserviceaccount.com',
       workspace_email: 'assistant@example.test',
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },
@@ -62,12 +62,6 @@ function createArgs(setupFile?: string): string[] {
     'https://example.test/nanoclaw.git',
     '--endpoint',
     'https://assistant.example.test/webhook/gchat',
-    '--gcp-project',
-    'assistant-project',
-    '--chat-app',
-    'assistant-chat-app',
-    '--chat-credential-id',
-    'assistant-chat-key',
     '--workspace-email',
     'assistant@example.test',
   ];
@@ -79,26 +73,8 @@ async function createSetupFile(paths: ControlPlanePaths): Promise<string> {
   const inputRoot = path.join(path.dirname(paths.configRoot), 'bootstrap-input');
   await mkdir(inputRoot, { recursive: true, mode: 0o700 });
   const providerFile = path.join(inputRoot, 'provider-key');
-  const gchatFile = path.join(inputRoot, 'gchat-key.json');
   const setupFile = path.join(inputRoot, 'setup.json');
   await writeFile(providerFile, 'provider-secret', { mode: 0o600 });
-  await writeFile(
-    gchatFile,
-    JSON.stringify({
-      type: 'service_account',
-      project_id: 'assistant-project',
-      private_key_id: 'assistant-chat-key',
-      private_key: '-----BEGIN PRIVATE KEY-----\ntest-key-material\n-----END PRIVATE KEY-----\n',
-      client_email: 'assistant@assistant-project.iam.gserviceaccount.com',
-      client_id: '1234567890',
-      auth_uri: 'https://accounts.google.com/o/oauth2/auth',
-      token_uri: 'https://oauth2.googleapis.com/token',
-      auth_provider_x509_cert_url: 'https://www.googleapis.com/oauth2/v1/certs',
-      client_x509_cert_url: 'https://www.googleapis.com/robot/v1/metadata/x509/assistant',
-      universe_domain: 'googleapis.com',
-    }),
-    { mode: 0o600 },
-  );
   await writeFile(
     setupFile,
     JSON.stringify({
@@ -121,7 +97,6 @@ async function createSetupFile(paths: ControlPlanePaths): Promise<string> {
         principal_display_name: 'Principal',
         principal_timezone: 'America/Los_Angeles',
       },
-      gchat: { bot_user_id: 'users/assistant-bot', credential_file: gchatFile },
       selected_messaging_group_id: null,
     }),
     { mode: 0o600 },
@@ -131,6 +106,7 @@ async function createSetupFile(paths: ControlPlanePaths): Promise<string> {
 
 function productionRuntime() {
   return {
+    preflightGcloud: async () => ({ account: 'operator@example.test' }),
     resolveRelease: async (sourceRemote: string, releaseRef: string) => ({
       sourceRemote,
       releaseRef,
@@ -328,11 +304,36 @@ describe('machine registry', () => {
 });
 
 describe('create recovery contract', () => {
+  it('checks gcloud before allocating or printing an instance ID', async () => {
+    const paths = await testPaths();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+
+    const exitCode = await runCli(['create', '--track', 'dogfood'], {
+      paths,
+      stdout: (line) => stdout.push(line),
+      stderr: (line) => stderr.push(line),
+      preflightGcloud: async () => {
+        throw new GwsEaError('gcloud_required', 'Install gcloud, then retry.');
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(stdout).toEqual([]);
+    expect(stderr.join('\n')).toContain('Install gcloud, then retry.');
+    expect((await readRegistry(paths)).instances).toEqual({});
+  });
+
   it('connects the owner-only setup surface to create and fresh-process resume', async () => {
     const paths = await testPaths();
     const setupFile = await createSetupFile(paths);
     const advanced: string[] = [];
-    const advanceProvision = async (operation: InstanceOperation) => {
+    let portsReleased = false;
+    const advanceProvision = async (operation: InstanceOperation, _selection?: string, heldPorts?: unknown) => {
+      if (advanced.length === 0) {
+        expect(heldPorts).toBeDefined();
+        expect(portsReleased).toBe(false);
+      }
       advanced.push(operation.instanceId);
       return {
         status: 'paused' as const,
@@ -346,12 +347,12 @@ describe('create recovery contract', () => {
     };
     const output: string[] = [];
     const resolveCalls: Array<[string, string]> = [];
-    let portsReleased = false;
     expect(
       await runCli(createArgs(setupFile), {
         paths,
         stdout: (line) => output.push(line),
         stderr: () => undefined,
+        preflightGcloud: async () => ({ account: 'operator@example.test' }),
         advanceProvision,
         resolveRelease: async (sourceRemote, releaseRef) => {
           resolveCalls.push([sourceRemote, releaseRef]);
@@ -410,9 +411,6 @@ describe('create recovery contract', () => {
       return {
         'source-remote': 'https://example.test/nanoclaw.git',
         endpoint: 'https://assistant.example.test/webhook/gchat',
-        'gcp-project': 'assistant-project',
-        'chat-app': 'assistant-chat-app',
-        'chat-credential-id': 'assistant-chat-key',
         'workspace-email': 'assistant@example.test',
         'setup-file': setupFile,
       };
@@ -462,6 +460,7 @@ describe('create recovery contract', () => {
       collectCreateInputs: async () => {
         throw new GwsEaError('cancelled', 'Assistant creation was cancelled');
       },
+      preflightGcloud: async () => ({ account: 'operator@example.test' }),
     });
 
     expect(exitCode).toBe(1);
@@ -479,6 +478,7 @@ describe('create recovery contract', () => {
       paths,
       stdout: (line) => stdout.push(line),
       stderr: (line) => stderr.push(line),
+      preflightGcloud: async () => ({ account: 'operator@example.test' }),
       resolveRelease: async () => {
         throw new GwsEaError('release_resolution_failed', 'Release track could not be resolved');
       },
@@ -504,6 +504,7 @@ describe('create recovery contract', () => {
       paths,
       stdout: (line) => stdout.push(line),
       stderr: (line) => stderr.push(line),
+      preflightGcloud: async () => ({ account: 'operator@example.test' }),
       resolveRelease: async (sourceRemote, releaseRef) => ({ sourceRemote, releaseRef, commit: 'b'.repeat(40) }),
       holdLoopbackPorts: async () => {
         throw new Error('ports must not be allocated for invalid setup input');

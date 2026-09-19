@@ -12,6 +12,7 @@ import {
   importProviderCredential,
   persistOnecliApiKeyFiles,
   prepareOnecliRuntime,
+  removeOnecliRuntime,
   runOnecliCompatibilityCanary,
   runSanitizedCommand,
   validateObservedOnecliRuntime,
@@ -264,6 +265,74 @@ describe('OneCLI runtime verification', () => {
 
     await cleanupOnecliDockerOrphans(layout, runner, { PATH: '/safe/bin' });
     expect(calls).toContainEqual(['container', 'rm', '--force', 'orphan-id']);
+  });
+
+  it('removes and verifies only the exact owned OneCLI networks and volumes', async () => {
+    const layout = await layoutFixture();
+    let resourcesPresent = true;
+    let downCalls = 0;
+    const runner: OnecliCommandRunner = async (command) => {
+      if (command.args[0] === 'container' && command.args[1] === 'ls') {
+        return { stdout: '', stderr: '' };
+      }
+      if ((command.args[0] === 'network' || command.args[0] === 'volume') && command.args[1] === 'ls') {
+        if (!resourcesPresent) return { stdout: '', stderr: '' };
+        const filter = command.args[command.args.indexOf('--filter') + 1] ?? '';
+        const name = filter.replace(/^name=\^/u, '').replace(/\$$/u, '');
+        return { stdout: `${name}\n`, stderr: '' };
+      }
+      if (command.args[0] === 'compose' && command.args.includes('down')) {
+        downCalls += 1;
+        resourcesPresent = false;
+        return { stdout: '', stderr: '' };
+      }
+      throw new Error(`unexpected command: ${command.args.join(' ')}`);
+    };
+
+    await removeOnecliRuntime(layout, { dockerCommandRunner: runner, ambientEnv: { PATH: '/safe/bin' } });
+
+    expect(downCalls).toBe(1);
+  });
+
+  it('treats a not-yet-created OneCLI runtime as already removed', async () => {
+    const layout = await layoutFixture();
+    const calls: string[][] = [];
+    const runner: OnecliCommandRunner = async (command) => {
+      expect(command.cwd).toBe(path.dirname(layout.rootDirectory));
+      calls.push([...command.args]);
+      return { stdout: '', stderr: '' };
+    };
+
+    await removeOnecliRuntime(layout, { dockerCommandRunner: runner });
+
+    expect(calls.some((args) => args[0] === 'compose')).toBe(false);
+  });
+
+  it('refuses to remove an exact-name OneCLI resource without this instance ownership label', async () => {
+    const layout = await layoutFixture();
+    let downCalls = 0;
+    const runner: OnecliCommandRunner = async (command) => {
+      if (command.args[0] === 'container' && command.args[1] === 'ls') {
+        return { stdout: '', stderr: '' };
+      }
+      if ((command.args[0] === 'network' || command.args[0] === 'volume') && command.args[1] === 'ls') {
+        const filters = command.args.filter((value) => value.startsWith('label='));
+        if (filters.length > 0) return { stdout: '', stderr: '' };
+        const filter = command.args[command.args.indexOf('--filter') + 1] ?? '';
+        const name = filter.replace(/^name=\^/u, '').replace(/\$$/u, '');
+        return { stdout: `${name}\n`, stderr: '' };
+      }
+      if (command.args[0] === 'compose' && command.args.includes('down')) {
+        downCalls += 1;
+        return { stdout: '', stderr: '' };
+      }
+      throw new Error(`unexpected command: ${command.args.join(' ')}`);
+    };
+
+    await expect(removeOnecliRuntime(layout, { dockerCommandRunner: runner })).rejects.toMatchObject({
+      code: 'unsafe_onecli_owner',
+    });
+    expect(downCalls).toBe(0);
   });
 });
 

@@ -4,6 +4,7 @@ export const PROVISION_JOURNAL_SCHEMA_VERSION = 1 as const;
 
 export const PROVISION_PHASES = [
   'materialize_checkout',
+  'provision_gcp',
   'start_onecli',
   'configure_provider',
   'start_nanoclaw',
@@ -25,8 +26,8 @@ export interface AllocatedPorts {
 export interface ExclusiveResourceClaims {
   endpoint_url: string;
   gcp_project_id: string;
-  chat_app_id: string;
-  chat_credential_id: string;
+  gcp_account: string;
+  gchat_service_account: string;
   workspace_email: string;
   onecli_project: string;
 }

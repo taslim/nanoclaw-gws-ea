@@ -41,8 +41,8 @@ async function fixture(): Promise<{ paths: ControlPlanePaths; input: InstanceRes
     exclusive_resource_claims: {
       endpoint_url: 'https://journal.example.test/webhook/gchat',
       gcp_project_id: 'journal-project',
-      chat_app_id: 'journal-chat-app',
-      chat_credential_id: 'journal-chat-key',
+      gcp_account: 'operator@example.test',
+      gchat_service_account: 'gws-ea-chat@journal-project.iam.gserviceaccount.com',
       workspace_email: 'journal@example.test',
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },
@@ -187,13 +187,13 @@ describe('provision journal', () => {
         resource_key: key,
       });
       const committed = await commitPhaseSuccess(operation!, 'materialize_checkout', begun.attempt.attempt_id);
-      expect(firstIncompletePhase(committed)).toBe('start_onecli');
+      expect(firstIncompletePhase(committed)).toBe('provision_gcp');
     } finally {
       operation!.release();
     }
 
     const reopened = await readProvisionJournal(paths, input.instance_id);
-    expect(firstIncompletePhase(reopened)).toBe('start_onecli');
+    expect(firstIncompletePhase(reopened)).toBe('provision_gcp');
     expect((await stat(paths.journalFile(input.instance_id))).mode & 0o777).toBe(0o600);
     expect((await stat(paths.stateRoot)).mode & 0o777).toBe(0o700);
     expect((await stat(paths.instancesRoot)).mode & 0o777).toBe(0o700);

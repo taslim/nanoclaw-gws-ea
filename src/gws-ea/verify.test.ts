@@ -182,6 +182,7 @@ describe('talkable conversation verification', () => {
         runtime,
         adapterInstance: INSTANCE,
         provisioningStartedAt: BOUND_AT,
+        selectedCandidate: candidate,
       }),
     ).toEqual({ status: 'matched', agentGroupId: MAIN, candidate, welcomeEventId });
     expect(
@@ -189,6 +190,7 @@ describe('talkable conversation verification', () => {
         runtime,
         adapterInstance: INSTANCE,
         provisioningStartedAt: '2026-09-18T18:00:00.001Z',
+        selectedCandidate: candidate,
       }),
     ).toEqual({ status: 'absent' });
     expect(inbound.prepare('SELECT COUNT(*) AS count FROM messages_in').get()).toEqual({ count: 1 });

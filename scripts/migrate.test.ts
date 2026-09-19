@@ -23,8 +23,16 @@ describe('scripts/migrate.ts', () => {
       const dbPath = path.join(cwd, 'data', 'v2.db');
       const db = new Database(dbPath, { readonly: true });
       const row = db.prepare('SELECT COUNT(*) AS count FROM schema_version').get() as { count: number };
+      const profileMigration = db
+        .prepare("SELECT name FROM schema_version WHERE name = 'module:gws-ea-profile:create-profile'")
+        .get() as { name: string } | undefined;
+      const profileTable = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'gws_ea_profile'")
+        .get() as { name: string } | undefined;
       db.close();
       expect(row.count).toBeGreaterThan(0);
+      expect(profileMigration?.name).toBe('module:gws-ea-profile:create-profile');
+      expect(profileTable?.name).toBe('gws_ea_profile');
     } finally {
       fs.rmSync(cwd, { recursive: true, force: true });
     }

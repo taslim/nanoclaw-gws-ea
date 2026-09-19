@@ -20,7 +20,7 @@ import {
 } from './phases.js';
 import { journalResourceKey } from './journal.js';
 import { assertReleaseCheckoutAgreement, materializeReleaseCheckout, type ResolvedRelease } from './checkout.js';
-import { runReleasePreflight, type ReleasePreflightInput } from './release-preflight.js';
+import { runReleasePreflight, type ReleasePreflightInput, type ReleasePreflightResult } from './release-preflight.js';
 import {
   importProviderCredential,
   inspectOnecliRuntime,
@@ -44,6 +44,7 @@ import {
 import { runInstanceNclJson } from './ncl.js';
 import { reconcileMainIdentity, type MainIdentityDependencies, type MainIdentityInput } from './identity.js';
 import { reconcilePrincipalDm, type PrincipalCandidate, type PrincipalDiscoveryDependencies } from './principal.js';
+import { loadPrincipalSelection, persistPrincipalSelection } from './principal-selection.js';
 import { verifyExistingGchatEndpoint, verifyExistingGchatRoute, validateExistingGchatEndpoint } from './endpoint.js';
 import {
   verifyPrincipalBinding,
@@ -59,11 +60,19 @@ import { preparePrivateLocalDirectory, type ControlPlanePaths } from './paths.js
 import {
   GwsEaError,
   PROVISION_PHASES,
+  type AllocatedPorts,
   type InstanceReservation,
   type ProvisionJournal,
   type ProvisionPhase,
 } from './types.js';
-import { isRecord } from './validation.js';
+import { hasControlCharacters, isRecord } from './validation.js';
+import { googleChatConfigurationUrl, isChatConfigurationConfirmed } from './chat-configuration.js';
+import {
+  parseGchatServiceAccountCredential,
+  reconcileGcpProject,
+  verifyGcpProject,
+  type GcpProjectInput,
+} from './gcloud.js';
 
 export type ProvisionBoundary = 'intent' | 'effect' | 'verify';
 
@@ -81,6 +90,10 @@ export type ProvisionResult =
   | { readonly status: 'ready' }
   | { readonly status: 'paused'; readonly pause: ProvisionHumanPause };
 
+export interface ProvisionPortLease {
+  release(names?: readonly (keyof AllocatedPorts)[]): Promise<void>;
+}
+
 /** Test/process harness signal used to model an abrupt stop at a journal boundary. */
 export class ProvisionBoundaryInterruption extends Error {
   readonly event: ProvisionBoundaryEvent;
@@ -97,18 +110,20 @@ export interface ProductionProvisionInput {
   readonly releasePreflight: ReleasePreflightInput;
   readonly onecli: OnecliRuntimeLayout;
   readonly runtime: InstanceRuntimeConfig;
+  readonly gcp: GcpProjectInput;
   readonly providerCredentialMetadata?: Omit<ProviderCredentialInput, 'value'>;
   readonly providerCredential?: ProviderCredentialInput;
   readonly identity: Omit<MainIdentityInput, 'providerSecretId'>;
   readonly adapterInstance: string;
   readonly provisioningStartedAt: string;
   readonly selectedMessagingGroupId?: string;
-  readonly gchatCredentialSourceFile?: string;
+  readonly selectedPrincipal?: PrincipalCandidate;
   readonly bootstrapManifestFile?: string;
   readonly serviceDependencies: InstanceServiceDependencies;
   readonly onecliDependencies?: OnecliRuntimeDependencies;
   readonly identityDependencies?: MainIdentityDependencies;
   readonly principalDependencies?: PrincipalDiscoveryDependencies;
+  readonly portLease?: ProvisionPortLease;
 }
 
 export interface ProductionProvisionState {
@@ -129,6 +144,8 @@ export interface ProductionProvisionDependencies {
   readonly probeCheckout: (context: ProductionProvisionContext) => Promise<PhaseProbeResult>;
   readonly materializeReleaseCheckout: typeof materializeReleaseCheckout;
   readonly runReleasePreflight: typeof runReleasePreflight;
+  readonly probeGcp: (context: ProductionProvisionContext) => Promise<PhaseProbeResult>;
+  readonly reconcileGcpProject: typeof reconcileGcpProject;
   readonly probeOnecli: (context: ProductionProvisionContext) => Promise<PhaseProbeResult>;
   readonly reconcileOnecliRuntime: typeof reconcileOnecliRuntime;
   readonly persistOnecliApiKeyFiles: typeof persistOnecliApiKeyFiles;
@@ -139,6 +156,7 @@ export interface ProductionProvisionDependencies {
   readonly reconcileMainIdentity: typeof reconcileMainIdentity;
   readonly verifyRoute: typeof verifyExistingGchatRoute;
   readonly verifyEndpoint: typeof verifyExistingGchatEndpoint;
+  readonly isChatConfigurationConfirmed: typeof isChatConfigurationConfirmed;
   readonly verifyPrincipalBinding: (input: PrincipalBindingVerificationInput) => PrincipalBindingVerificationResult;
   readonly reconcilePrincipal: typeof reconcilePrincipalDm;
   readonly verifyConversation: (input: ConversationVerificationInput) => ConversationVerificationResult;
@@ -163,6 +181,7 @@ function stringField(value: Record<string, unknown>, key: string): string | unde
 async function defaultProbeCheckout(context: ProductionProvisionContext): Promise<PhaseProbeResult> {
   try {
     await assertReleaseCheckoutAgreement(context.operation.paths, context.operation.instanceId);
+    await assertReleasePreflightReceipt(context);
     return { status: 'matched' };
   } catch (error) {
     if (error instanceof GwsEaError && ['marker_missing', 'checkout_exists', 'unsafe_checkout'].includes(error.code)) {
@@ -172,6 +191,94 @@ async function defaultProbeCheckout(context: ProductionProvisionContext): Promis
     if (code === 'ENOENT') return { status: 'absent' };
     throw error;
   }
+}
+
+interface ReleasePreflightReceipt extends ReleasePreflightResult {
+  readonly schema_version: 1;
+  readonly instance_id: string;
+  readonly deployed_commit: string;
+}
+
+function validateReleasePreflightReceipt(value: unknown, context: ProductionProvisionContext): void {
+  if (!isRecord(value) || !isRecord(value.onecli)) {
+    throw new GwsEaError('invalid_release_preflight', 'Release preflight receipt is invalid');
+  }
+  const expectedKeys = [
+    'schema_version',
+    'instance_id',
+    'deployed_commit',
+    'provider',
+    'packageManager',
+    'onecli',
+  ].sort();
+  const actualKeys = Object.keys(value).sort();
+  const onecliKeys = Object.keys(value.onecli).sort();
+  if (
+    actualKeys.length !== expectedKeys.length ||
+    actualKeys.some((key, index) => key !== expectedKeys[index]) ||
+    onecliKeys.length !== 3 ||
+    onecliKeys.some((key, index) => key !== ['cli', 'gateway', 'sdk'][index]) ||
+    value.schema_version !== 1 ||
+    value.instance_id !== context.operation.instanceId ||
+    value.deployed_commit !== context.input.release.commit ||
+    value.provider !== context.input.releasePreflight.provider ||
+    typeof value.packageManager !== 'string' ||
+    typeof value.onecli.gateway !== 'string' ||
+    typeof value.onecli.cli !== 'string' ||
+    typeof value.onecli.sdk !== 'string'
+  ) {
+    throw new GwsEaError('release_preflight_mismatch', 'Release preflight receipt does not match this instance');
+  }
+}
+
+async function assertReleasePreflightReceipt(context: ProductionProvisionContext): Promise<void> {
+  let value: unknown;
+  try {
+    value = JSON.parse(
+      await readOwnerOnlyFile(context.operation.paths.releasePreflightFile(context.operation.instanceId)),
+    ) as unknown;
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new GwsEaError('invalid_release_preflight', 'Release preflight receipt is invalid JSON');
+    }
+    throw error;
+  }
+  validateReleasePreflightReceipt(value, context);
+}
+
+async function persistReleasePreflightReceipt(
+  context: ProductionProvisionContext,
+  result: ReleasePreflightResult,
+): Promise<void> {
+  const receipt: ReleasePreflightReceipt = {
+    schema_version: 1,
+    instance_id: context.operation.instanceId,
+    deployed_commit: context.input.release.commit,
+    ...result,
+  };
+  await writePrivateTextFile(
+    context.operation.paths.releasePreflightFile(context.operation.instanceId),
+    `${JSON.stringify(receipt, null, 2)}\n`,
+  );
+}
+
+async function ensureReleaseCheckout(
+  context: ProductionProvisionContext,
+  dependencies: ProductionProvisionDependencies,
+): Promise<void> {
+  try {
+    await assertReleaseCheckoutAgreement(context.operation.paths, context.operation.instanceId);
+  } catch (error) {
+    const code = error instanceof GwsEaError ? error.code : (error as NodeJS.ErrnoException).code;
+    if (!['ENOENT', 'marker_missing', 'checkout_exists', 'unsafe_checkout'].includes(code ?? '')) throw error;
+    await dependencies.materializeReleaseCheckout(
+      context.operation.paths,
+      context.operation.instanceId,
+      context.input.release,
+    );
+  }
+  const result = await dependencies.runReleasePreflight(context.input.releasePreflight);
+  await persistReleasePreflightReceipt(context, result);
 }
 
 async function defaultProbeOnecli(context: ProductionProvisionContext): Promise<PhaseProbeResult> {
@@ -308,127 +415,23 @@ async function bootstrapManifestRemoved(file: string | undefined): Promise<boole
   }
 }
 
-const SERVICE_ACCOUNT_KEYS = new Set([
-  'type',
-  'project_id',
-  'private_key_id',
-  'private_key',
-  'client_email',
-  'client_id',
-  'auth_uri',
-  'token_uri',
-  'auth_provider_x509_cert_url',
-  'client_x509_cert_url',
-  'universe_domain',
-]);
-
-function serviceAccountString(credential: Record<string, unknown>, field: string, maximumLength = 4_096): string {
-  const value = credential[field];
-  if (typeof value !== 'string' || value.length === 0 || value.length > maximumLength) {
-    throw new GwsEaError('invalid_gchat_credential', 'Google Chat credential schema is invalid');
-  }
-  return value;
-}
-
-function serviceAccountHttpsUrl(credential: Record<string, unknown>, field: string): void {
-  const value = serviceAccountString(credential, field);
-  let parsed: URL;
-  try {
-    parsed = new URL(value);
-  } catch {
-    throw new GwsEaError('invalid_gchat_credential', 'Google Chat credential schema is invalid');
-  }
-  if (parsed.protocol !== 'https:' || parsed.username || parsed.password) {
-    throw new GwsEaError('invalid_gchat_credential', 'Google Chat credential schema is invalid');
-  }
-}
-
-function validateGchatServiceAccountCredential(
-  contents: string,
-  expected: { readonly projectId: string; readonly privateKeyId: string },
-): void {
-  let value: unknown;
-  try {
-    value = JSON.parse(contents) as unknown;
-  } catch {
-    throw new GwsEaError('invalid_gchat_credential', 'Google Chat credential is not valid JSON');
-  }
-  if (!isRecord(value) || Object.keys(value).some((key) => !SERVICE_ACCOUNT_KEYS.has(key))) {
-    throw new GwsEaError('invalid_gchat_credential', 'Google Chat credential schema is invalid');
-  }
-  if (value.type !== 'service_account') {
-    throw new GwsEaError('invalid_gchat_credential', 'Google Chat credential must be a service-account key');
-  }
-  const projectId = serviceAccountString(value, 'project_id', 30);
-  const privateKeyId = serviceAccountString(value, 'private_key_id', 256);
-  const privateKey = serviceAccountString(value, 'private_key', 32_768);
-  const clientEmail = serviceAccountString(value, 'client_email', 320);
-  serviceAccountString(value, 'client_id', 256);
-  for (const field of ['auth_uri', 'token_uri', 'auth_provider_x509_cert_url', 'client_x509_cert_url']) {
-    serviceAccountHttpsUrl(value, field);
-  }
-  if (value.universe_domain !== undefined) serviceAccountString(value, 'universe_domain', 256);
-  if (
-    !privateKey.startsWith('-----BEGIN PRIVATE KEY-----\n') ||
-    !privateKey.trimEnd().endsWith('\n-----END PRIVATE KEY-----') ||
-    !clientEmail.endsWith(`@${projectId}.iam.gserviceaccount.com`)
-  ) {
-    throw new GwsEaError('invalid_gchat_credential', 'Google Chat credential schema is invalid');
-  }
-  if (projectId !== expected.projectId) {
-    throw new GwsEaError('gchat_credential_mismatch', 'Google Chat credential project does not match the reservation');
-  }
-  // The reservation's chat_credential_id is the Google service-account key ID.
-  if (privateKeyId !== expected.privateKeyId) {
-    throw new GwsEaError('gchat_credential_mismatch', 'Google Chat credential key does not match the reservation');
-  }
-}
-
-function canonicalGchatAppResourceName(appId: string): string {
-  return appId.startsWith('users/') ? appId : `users/${appId}`;
-}
-
-async function ensureGchatCredential(context: ProductionProvisionContext): Promise<PhaseEffectResult | undefined> {
+async function ensureGchatCredential(context: ProductionProvisionContext): Promise<void> {
   const target = context.input.runtime.secret_files.gchat_credentials;
-  let contents: string;
-  let install = false;
-  try {
-    contents = await readOwnerOnlyFile(target);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    const source = context.input.gchatCredentialSourceFile;
-    if (!source) {
-      return humanPause(
-        'start_nanoclaw',
-        'gchat_credential_required',
-        'Install the Google Chat service-account credential in the instance private file, then resume.',
-      );
-    }
-    contents = await readOwnerOnlyFile(source);
-    install = true;
-  }
+  const contents = await readOwnerOnlyFile(target);
   const reservation = await getInstanceReservation(context.operation.paths, context.operation.instanceId);
-  if (
-    context.input.runtime.gchat_bot_user_id !==
-    canonicalGchatAppResourceName(reservation.exclusive_resource_claims.chat_app_id)
-  ) {
-    throw new GwsEaError('gchat_app_mismatch', 'Google Chat bot identity does not match the reserved app');
-  }
-  validateGchatServiceAccountCredential(contents, {
+  parseGchatServiceAccountCredential(contents, {
     projectId: reservation.exclusive_resource_claims.gcp_project_id,
-    privateKeyId: reservation.exclusive_resource_claims.chat_credential_id,
+    serviceAccountEmail: reservation.exclusive_resource_claims.gchat_service_account,
   });
-  if (install) {
-    await preparePrivateLocalDirectory(path.dirname(target));
-    await writePrivateTextFile(target, contents);
-  }
-  return undefined;
 }
 
 const defaultProductionDependencies: ProductionProvisionDependencies = {
   probeCheckout: defaultProbeCheckout,
   materializeReleaseCheckout,
   runReleasePreflight,
+  probeGcp: async (context) =>
+    (await verifyGcpProject(context.input.gcp)) ? { status: 'matched' } : { status: 'absent' },
+  reconcileGcpProject,
   probeOnecli: defaultProbeOnecli,
   reconcileOnecliRuntime,
   persistOnecliApiKeyFiles,
@@ -439,6 +442,7 @@ const defaultProductionDependencies: ProductionProvisionDependencies = {
   reconcileMainIdentity,
   verifyRoute: verifyExistingGchatRoute,
   verifyEndpoint: verifyExistingGchatEndpoint,
+  isChatConfigurationConfirmed,
   verifyPrincipalBinding,
   reconcilePrincipal: reconcilePrincipalDm,
   verifyConversation: verifyTalkableConversation,
@@ -473,7 +477,7 @@ function principalResult(
         message: 'Select the principal direct-message conversation, then resume.',
         choices: result.candidates.map((candidate) => ({
           id: candidate.messagingGroupId,
-          label: candidate.senderName ?? candidate.userId,
+          label: candidate.senderName ? `${candidate.senderName} (${candidate.userId})` : candidate.userId,
         })),
       },
     };
@@ -482,6 +486,26 @@ function principalResult(
   context.state.principal = result.candidate;
   context.state.welcomeEventId = result.eventId;
   return { status: 'matched' };
+}
+
+function chatConfigurationPause(input: ProductionProvisionInput): Extract<PhaseProbeResult, { status: 'paused' }> {
+  return {
+    status: 'paused',
+    pause: {
+      kind: 'human-action',
+      phase: 'configure_channel',
+      code: 'chat_configuration_required',
+      message: "Finish this assistant's Google Chat app configuration, then confirm it.",
+      details: [
+        `App name: ${input.identity.assistantDisplayName}`,
+        'Add a public HTTPS avatar URL and a short description.',
+        `Enable interactive features and 1:1 messages, then use HTTP endpoint URL ${input.runtime.endpoint_url}`,
+        'Limit visibility to the intended principal or Workspace domain.',
+      ],
+      actionUrl: googleChatConfigurationUrl(input.gcp.projectId),
+      resumeFlag: '--chat-configured',
+    },
+  };
 }
 
 function bindingObservation(
@@ -550,6 +574,7 @@ export function createProductionProvisionRegistry(
         adapterInstance: value.input.adapterInstance,
         provisioningStartedAt: value.input.provisioningStartedAt,
         selectedMessagingGroupId: value.input.selectedMessagingGroupId,
+        selectedCandidate: value.state.principal ?? value.input.selectedPrincipal,
       }),
     );
   const conversationProbe = async (value: ProductionProvisionContext): Promise<PhaseProbeResult> => {
@@ -563,12 +588,15 @@ export function createProductionProvisionRegistry(
       resourceKey: () => key('checkout', JSON.stringify([input.release.sourceRemote, input.release.commit])),
       probe: dependencies.probeCheckout,
       apply: async (value) => {
-        await dependencies.materializeReleaseCheckout(
-          value.operation.paths,
-          value.operation.instanceId,
-          value.input.release,
-        );
-        await dependencies.runReleasePreflight(value.input.releasePreflight);
+        await ensureReleaseCheckout(value, dependencies);
+        return { status: 'completed' };
+      },
+    },
+    provision_gcp: {
+      resourceKey: () => key('gcp', input.gcp.projectId),
+      probe: dependencies.probeGcp,
+      apply: async (value) => {
+        await dependencies.reconcileGcpProject(value.input.gcp);
         return { status: 'completed' };
       },
     },
@@ -577,6 +605,7 @@ export function createProductionProvisionRegistry(
         key('onecli', JSON.stringify([input.onecli.project, input.onecli.appPort, input.onecli.gatewayPort])),
       probe: dependencies.probeOnecli,
       apply: async (value) => {
+        await value.input.portLease?.release(['onecli_app', 'onecli_gateway']);
         const receipt = await dependencies.reconcileOnecliRuntime(value.input.onecli, value.input.onecliDependencies);
         value.state.onecliReceipt = receipt;
         await dependencies.persistOnecliApiKeyFiles(receipt, {
@@ -638,8 +667,8 @@ export function createProductionProvisionRegistry(
         if (!value.state.providerSecretId) {
           throw new GwsEaError('provider_not_ready', 'Provider credential must be reconciled before NanoClaw');
         }
-        const credentialPause = await ensureGchatCredential(value);
-        if (credentialPause) return credentialPause;
+        await value.input.portLease?.release(['nanoclaw_webhook']);
+        await ensureGchatCredential(value);
         await dependencies.reconcileInstanceRuntime(value.input.runtime, value.input.serviceDependencies);
         const main = await dependencies.reconcileMainIdentity(
           value.input.runtime,
@@ -673,7 +702,10 @@ export function createProductionProvisionRegistry(
     },
     configure_channel: {
       resourceKey: () => key('gchat', JSON.stringify([input.adapterInstance, input.runtime.endpoint_url])),
-      probe: async () => {
+      probe: async (value) => {
+        if (!(await dependencies.isChatConfigurationConfirmed(value.operation.paths, value.operation.instanceId))) {
+          return chatConfigurationPause(input);
+        }
         try {
           await dependencies.verifyEndpoint({
             endpointUrl: input.runtime.endpoint_url,
@@ -685,7 +717,10 @@ export function createProductionProvisionRegistry(
           return { status: 'absent' };
         }
       },
-      apply: async () => {
+      apply: async (value) => {
+        if (!(await dependencies.isChatConfigurationConfirmed(value.operation.paths, value.operation.instanceId))) {
+          return chatConfigurationPause(input);
+        }
         await dependencies.verifyEndpoint({
           endpointUrl: input.runtime.endpoint_url,
           audienceUrl: input.runtime.endpoint_url,
@@ -705,6 +740,7 @@ export function createProductionProvisionRegistry(
               adapterInstance: value.input.adapterInstance,
               provisioningStartedAt: value.input.provisioningStartedAt,
               messagingGroupId: value.input.selectedMessagingGroupId,
+              selectedCandidate: value.input.selectedPrincipal,
             },
             value.input.principalDependencies,
           ),
@@ -876,10 +912,6 @@ export interface ProductionBootstrapManifest {
     readonly principal_display_name: string;
     readonly principal_timezone: string;
   };
-  readonly gchat: {
-    readonly bot_user_id: string;
-    readonly credential_file: string;
-  };
   readonly selected_messaging_group_id: string | null;
 }
 
@@ -892,15 +924,7 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[], labe
 }
 
 function bootstrapString(value: unknown, label: string, maximum = 2_048): string {
-  if (
-    typeof value !== 'string' ||
-    value.length === 0 ||
-    value.length > maximum ||
-    [...value].some((character) => {
-      const code = character.codePointAt(0);
-      return code !== undefined && (code <= 0x1f || code === 0x7f);
-    })
-  ) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > maximum || hasControlCharacters(value)) {
     throw new GwsEaError('invalid_bootstrap_manifest', `${label} is invalid`);
   }
   return value;
@@ -927,7 +951,6 @@ function validateBootstrapManifest(value: unknown): ProductionBootstrapManifest 
       'running_as_root',
       'provider',
       'identity',
-      'gchat',
       'selected_messaging_group_id',
     ],
     'Bootstrap manifest',
@@ -941,12 +964,11 @@ function validateBootstrapManifest(value: unknown): ProductionBootstrapManifest 
   if (typeof value.running_as_root !== 'boolean') {
     throw new GwsEaError('invalid_bootstrap_manifest', 'Bootstrap running_as_root is invalid');
   }
-  if (!isRecord(value.provider) || !isRecord(value.identity) || !isRecord(value.gchat)) {
+  if (!isRecord(value.provider) || !isRecord(value.identity)) {
     throw new GwsEaError('invalid_bootstrap_manifest', 'Bootstrap nested input is invalid');
   }
   exactKeys(value.provider, ['id', 'name', 'type', 'host_pattern', 'credential_file', 'header_name'], 'provider');
   exactKeys(value.identity, ['assistant_display_name', 'principal_display_name', 'principal_timezone'], 'identity');
-  exactKeys(value.gchat, ['bot_user_id', 'credential_file'], 'gchat');
   const selected = value.selected_messaging_group_id;
   if (selected !== null && typeof selected !== 'string') {
     throw new GwsEaError('invalid_bootstrap_manifest', 'selected_messaging_group_id is invalid');
@@ -974,10 +996,6 @@ function validateBootstrapManifest(value: unknown): ProductionBootstrapManifest 
       assistant_display_name: bootstrapString(value.identity.assistant_display_name, 'assistant display name', 120),
       principal_display_name: bootstrapString(value.identity.principal_display_name, 'principal display name', 120),
       principal_timezone: bootstrapString(value.identity.principal_timezone, 'principal timezone', 128),
-    },
-    gchat: {
-      bot_user_id: bootstrapString(value.gchat.bot_user_id, 'gchat bot user ID', 256),
-      credential_file: bootstrapPath(value.gchat.credential_file, 'gchat credential_file'),
     },
     selected_messaging_group_id:
       selected === null ? null : bootstrapString(selected, 'selected messaging group ID', 512),
@@ -1045,8 +1063,13 @@ interface PersistedProfileIdentity {
 
 function readPersistedProfile(runtime: InstanceRuntimeConfig): PersistedProfileIdentity | undefined {
   const file = path.join(runtime.checkout_realpath, 'data', 'v2.db');
-  if (!existsSync(file)) return undefined;
-  const database = new Database(file, { readonly: true, fileMustExist: true });
+  let database: Database.Database;
+  try {
+    database = new Database(file, { readonly: true, fileMustExist: true });
+  } catch (error) {
+    if (!existsSync(file)) return undefined;
+    throw error;
+  }
   try {
     return database
       .prepare(
@@ -1108,9 +1131,23 @@ async function ensureTrustedProvisioningStart(
 export async function runProductionProvision(
   operation: InstanceOperation,
   selectedMessagingGroupId?: string,
+  portLease?: ProvisionPortLease,
 ): Promise<ProvisionResult> {
   const reservation = await getInstanceReservation(operation.paths, operation.instanceId);
   const provisioningStartedAt = await ensureTrustedProvisioningStart(operation, reservation);
+  const principalSelection = await loadPrincipalSelection(
+    operation.paths,
+    operation.instanceId,
+    'gchat',
+    provisioningStartedAt,
+  );
+  if (
+    principalSelection &&
+    selectedMessagingGroupId !== undefined &&
+    principalSelection.candidate.messagingGroupId !== selectedMessagingGroupId
+  ) {
+    throw new GwsEaError('principal_selection_mismatch', 'The principal selection is already fixed for this instance');
+  }
   let manifest: ProductionBootstrapManifest | undefined;
   try {
     manifest = await loadProductionBootstrapManifest(operation.paths.bootstrapFile(operation.instanceId));
@@ -1135,7 +1172,6 @@ export async function runProductionProvision(
       nodePath: manifest.node_path,
       homeDirectory: manifest.home_directory,
       selectedProvider: manifest.provider.id,
-      gchatBotUserId: manifest.gchat.bot_user_id,
     });
   }
   const onecli = createOnecliRuntimeLayout({
@@ -1190,6 +1226,14 @@ export async function runProductionProvision(
       releasePreflight: { checkoutRoot: reservation.checkout_realpath, provider: runtime.selected_provider },
       onecli,
       runtime,
+      gcp: {
+        instanceId: reservation.instance_id,
+        projectId: reservation.exclusive_resource_claims.gcp_project_id,
+        account: reservation.exclusive_resource_claims.gcp_account,
+        serviceAccountEmail: reservation.exclusive_resource_claims.gchat_service_account,
+        credentialFile: runtime.secret_files.gchat_credentials,
+        cwd: reservation.checkout_realpath,
+      },
       ...(manifest
         ? {
             providerCredentialMetadata: {
@@ -1204,16 +1248,28 @@ export async function runProductionProvision(
       identity,
       adapterInstance: 'gchat',
       provisioningStartedAt,
-      ...((selectedMessagingGroupId ?? manifest?.selected_messaging_group_id)
-        ? { selectedMessagingGroupId: selectedMessagingGroupId ?? manifest!.selected_messaging_group_id! }
+      ...((principalSelection?.candidate.messagingGroupId ??
+      selectedMessagingGroupId ??
+      manifest?.selected_messaging_group_id)
+        ? {
+            selectedMessagingGroupId:
+              principalSelection?.candidate.messagingGroupId ??
+              selectedMessagingGroupId ??
+              manifest!.selected_messaging_group_id!,
+          }
         : {}),
-      ...(manifest ? { gchatCredentialSourceFile: manifest.gchat.credential_file } : {}),
+      ...(principalSelection ? { selectedPrincipal: principalSelection.candidate } : {}),
       bootstrapManifestFile: operation.paths.bootstrapFile(operation.instanceId),
       serviceDependencies: {
         platform: manifest?.platform ?? (process.platform === 'darwin' ? 'macos' : 'linux'),
         homeDirectory: runtime.home_directory,
         runningAsRoot: manifest?.running_as_root ?? process.getuid?.() === 0,
       },
+      principalDependencies: {
+        persistSelection: (candidate) =>
+          persistPrincipalSelection(operation.paths, operation.instanceId, 'gchat', provisioningStartedAt, candidate),
+      },
+      ...(portLease ? { portLease } : {}),
     },
   };
   return reconcileProvisioning(operation, context, createProductionProvisionRegistry(context));
