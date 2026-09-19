@@ -16,6 +16,7 @@ import {
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
 import { PERSONA_PREPEND_FILE } from './group-persona.js';
 import { log } from './log.js';
+import { registerRequiredProjectDocSection } from './project-doc-sections.js';
 import {
   BASE_INSTRUCTIONS_PATH,
   composeGroupProjectDoc,
@@ -395,6 +396,20 @@ describe('composeGroupProjectDoc size cap', () => {
     expect(doc).toContain('PERSONA_MARKER');
     expect(doc).toContain('# NanoClaw Runtime Contract');
     expect(log.error).toHaveBeenCalled();
+  });
+
+  it('never drops a registered required runtime section', async () => {
+    const ag = await seed('ag-required-section', 'required-section-group');
+    registerRequiredProjectDocSection('test:required-cap-section', (candidate) =>
+      candidate.id === ag.id ? { name: 'Required Runtime Identity', body: 'REQUIRED_IDENTITY_MARKER' } : undefined,
+    );
+    await updateContainerConfigJson(ag.id, 'mcp_servers', bigMcp(4));
+
+    const doc = await compose(ag, { ...CLAUDE_SPEC, maxBytes: 24 * 1024 });
+
+    expect(doc).toContain('# Required Runtime Identity');
+    expect(doc).toContain('REQUIRED_IDENTITY_MARKER');
+    expect(doc).toContain('# Omitted for size');
   });
 
   // Claude Code "loads a CLAUDE.md file of up to 4 MiB in full and skips a
