@@ -3,7 +3,12 @@ import path from 'node:path';
 
 import { parse as parseYaml } from 'yaml';
 
-import { runArgumentCommand } from './checkout.js';
+import {
+  prepareReleaseCommandEnvironments,
+  runArgumentCommand,
+  type CommandRunner,
+  type ReleaseCommandEnvironments,
+} from './checkout.js';
 import { GwsEaError } from './types.js';
 import { isRecord } from './validation.js';
 
@@ -14,6 +19,7 @@ export interface SetupCommand {
   command: 'pnpm';
   args: readonly string[];
   cwd: string;
+  env: Readonly<Record<string, string>>;
 }
 
 export interface ReleasePreflightInput {
@@ -22,6 +28,7 @@ export interface ReleasePreflightInput {
 }
 
 export interface ReleasePreflightRuntime {
+  runCommand?: CommandRunner;
   runSetupCommand?: (command: SetupCommand) => Promise<void>;
 }
 
@@ -65,28 +72,52 @@ async function assertPhysicalCheckout(checkoutRoot: string): Promise<string> {
   return resolved;
 }
 
-async function git(checkoutRoot: string, args: readonly string[]): Promise<string> {
-  return (await runArgumentCommand({ command: 'git', args, cwd: checkoutRoot })).stdout.trim();
+async function git(
+  checkoutRoot: string,
+  args: readonly string[],
+  run: CommandRunner,
+  environments: ReleaseCommandEnvironments,
+): Promise<string> {
+  return (await run({ command: 'git', args, cwd: checkoutRoot, env: environments.git })).stdout.trim();
 }
 
-async function assertClean(checkoutRoot: string, phase: string): Promise<void> {
-  const status = await git(checkoutRoot, ['status', '--porcelain=v1', '--untracked-files=all']);
+async function assertClean(
+  checkoutRoot: string,
+  phase: string,
+  run: CommandRunner,
+  environments: ReleaseCommandEnvironments,
+): Promise<void> {
+  const status = await git(checkoutRoot, ['status', '--porcelain=v1', '--untracked-files=all'], run, environments);
   if (status) throw new GwsEaError('checkout_drift', `Release checkout changed during ${phase}:\n${status}`);
 }
 
-async function assertDetachedCommit(checkoutRoot: string): Promise<void> {
-  const head = await git(checkoutRoot, ['rev-parse', '--verify', 'HEAD^{commit}']);
+async function assertDetachedCommit(
+  checkoutRoot: string,
+  run: CommandRunner,
+  environments: ReleaseCommandEnvironments,
+): Promise<void> {
+  const head = await git(checkoutRoot, ['rev-parse', '--verify', 'HEAD^{commit}'], run, environments);
   if (!/^[0-9a-f]{40}$/.test(head)) {
     throw new GwsEaError('incomplete_release', 'Release checkout HEAD is not a full commit');
   }
-  if ((await git(checkoutRoot, ['rev-parse', '--abbrev-ref', 'HEAD'])) !== 'HEAD') {
+  if ((await git(checkoutRoot, ['rev-parse', '--abbrev-ref', 'HEAD'], run, environments)) !== 'HEAD') {
     throw new GwsEaError('checkout_not_detached', 'Release checkout HEAD must be detached');
   }
 }
 
-async function assertCommittedRegularFiles(checkoutRoot: string, relativePaths: readonly string[]): Promise<void> {
+async function assertCommittedRegularFiles(
+  checkoutRoot: string,
+  relativePaths: readonly string[],
+  run: CommandRunner,
+  environments: ReleaseCommandEnvironments,
+): Promise<void> {
   const [trackedResult, fileInfo] = await Promise.all([
-    runArgumentCommand({ command: 'git', args: ['ls-files', '-z', '--', ...relativePaths], cwd: checkoutRoot }),
+    run({
+      command: 'git',
+      args: ['ls-files', '-z', '--', ...relativePaths],
+      cwd: checkoutRoot,
+      env: environments.git,
+    }),
     Promise.all(
       relativePaths.map(async (relativePath) => {
         try {
@@ -214,7 +245,12 @@ async function validatePackageAndPins(
   return { packageManager, gateway, cli, sdk };
 }
 
-async function validateComposition(checkoutRoot: string, provider: string): Promise<void> {
+async function validateComposition(
+  checkoutRoot: string,
+  provider: string,
+  run: CommandRunner,
+  environments: ReleaseCommandEnvironments,
+): Promise<void> {
   if (!PROVIDER_PATTERN.test(provider)) {
     throw new GwsEaError('provider_not_composed', 'Selected provider name is invalid');
   }
@@ -238,7 +274,7 @@ async function validateComposition(checkoutRoot: string, provider: string): Prom
     `container/agent-runner/src/providers/${provider}.conformance.test.ts`,
   ];
   try {
-    await assertCommittedRegularFiles(checkoutRoot, [...commonFiles, ...providerFiles]);
+    await assertCommittedRegularFiles(checkoutRoot, [...commonFiles, ...providerFiles], run, environments);
     await assertBarrelImports(checkoutRoot, [
       { barrel: 'src/channels/index.ts', moduleName: 'gchat', code: 'incomplete_release' },
       ...[
@@ -280,16 +316,23 @@ export async function runReleasePreflight(
   runtime: ReleasePreflightRuntime = {},
 ): Promise<ReleasePreflightResult> {
   const checkoutRoot = await assertPhysicalCheckout(input.checkoutRoot);
-  await assertDetachedCommit(checkoutRoot);
-  await assertClean(checkoutRoot, 'initial preflight');
-  await validateComposition(checkoutRoot, input.provider);
+  const environments = await prepareReleaseCommandEnvironments(path.dirname(checkoutRoot));
+  const runCommand = runtime.runCommand ?? runArgumentCommand;
+  await assertDetachedCommit(checkoutRoot, runCommand, environments);
+  await assertClean(checkoutRoot, 'initial preflight', runCommand, environments);
+  await validateComposition(checkoutRoot, input.provider, runCommand, environments);
   const pins = await validatePackageAndPins(checkoutRoot);
   const runSetupCommand = runtime.runSetupCommand ?? defaultSetupCommand;
 
-  await runSetupCommand({ command: 'pnpm', args: ['install', '--frozen-lockfile'], cwd: checkoutRoot });
-  await assertClean(checkoutRoot, 'frozen dependency installation');
-  await runSetupCommand({ command: 'pnpm', args: ['run', 'build'], cwd: checkoutRoot });
-  await assertClean(checkoutRoot, 'release build');
+  await runSetupCommand({
+    command: 'pnpm',
+    args: ['install', '--frozen-lockfile'],
+    cwd: checkoutRoot,
+    env: environments.common,
+  });
+  await assertClean(checkoutRoot, 'frozen dependency installation', runCommand, environments);
+  await runSetupCommand({ command: 'pnpm', args: ['run', 'build'], cwd: checkoutRoot, env: environments.common });
+  await assertClean(checkoutRoot, 'release build', runCommand, environments);
 
   return {
     provider: input.provider,

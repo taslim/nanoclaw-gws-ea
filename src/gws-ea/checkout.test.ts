@@ -1,9 +1,9 @@
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   assertReleaseCheckoutAgreement,
@@ -18,6 +18,7 @@ import type { InstanceReservationInput } from './types.js';
 const roots: string[] = [];
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
@@ -95,6 +96,33 @@ function reservation(
   };
 }
 
+function stagingRoot(paths: ControlPlanePaths, instanceId: string): string {
+  return `${paths.checkoutRoot(instanceId)}.staging`;
+}
+
+function expectSanitizedEnvironment(
+  environment: Readonly<Record<string, string>>,
+  expectedHome?: string,
+  additions: readonly string[] = [],
+): void {
+  if (expectedHome) expect(environment.HOME).toBe(expectedHome);
+  else expect(environment.HOME).toMatch(/\.release-home$/);
+  expect(environment.GIT_CONFIG_NOSYSTEM).toBe('1');
+  expect(environment.GIT_TERMINAL_PROMPT).toBe('0');
+  for (const key of Object.keys(environment)) {
+    expect([
+      'HOME',
+      'PATH',
+      'LANG',
+      'LC_ALL',
+      'LC_CTYPE',
+      'GIT_CONFIG_NOSYSTEM',
+      'GIT_TERMINAL_PROMPT',
+      ...additions,
+    ]).toContain(key);
+  }
+}
+
 describe('exact release checkout', () => {
   it('materializes the recorded commit even when the release branch moves after resolution', async () => {
     const source = await sourceFixture();
@@ -143,6 +171,40 @@ describe('exact release checkout', () => {
     await expect(resolveReleaseCommit(source.remote, 'refs/heads/../dogfood')).rejects.toMatchObject({
       code: 'invalid_release_ref',
     });
+  });
+
+  it('does not propagate hostile ambient configuration into release Git children', async () => {
+    const source = await sourceFixture();
+    vi.stubEnv('GIT_CONFIG_GLOBAL', '/tmp/hostile-gitconfig');
+    vi.stubEnv('GIT_DIR', '/tmp/hostile-git-dir');
+    vi.stubEnv('GIT_ASKPASS', '/tmp/hostile-askpass');
+    vi.stubEnv('SSH_AUTH_SOCK', '/tmp/hostile-agent.sock');
+    vi.stubEnv('NPM_CONFIG_USERCONFIG', '/tmp/hostile-npmrc');
+    vi.stubEnv('PNPM_HOME', '/tmp/hostile-pnpm');
+    vi.stubEnv('ONECLI_HOME', '/tmp/hostile-onecli');
+    vi.stubEnv('ANTHROPIC_API_KEY', 'must-not-propagate');
+    vi.stubEnv('GOOGLE_APPLICATION_CREDENTIALS', '/tmp/hostile-google-key');
+    const observed: Array<{ args: readonly string[]; env: Readonly<Record<string, string>> }> = [];
+
+    const resolved = await resolveReleaseCommit(source.remote, 'refs/heads/dogfood', {
+      fetchAuthentication: {
+        askPassProgram: '/owned/askpass',
+        sshAgentSocket: '/owned/agent.sock',
+      },
+      runCommand: async (spec) => {
+        observed.push({ args: spec.args, env: spec.env });
+        return runArgumentCommand(spec);
+      },
+    });
+
+    expect(resolved.commit).toBe(source.firstCommit);
+    expect(observed.length).toBeGreaterThan(0);
+    for (const command of observed) {
+      const isFetch = command.args[0] === 'fetch';
+      expectSanitizedEnvironment(command.env, undefined, isFetch ? ['GIT_ASKPASS', 'SSH_AUTH_SOCK'] : []);
+      expect(command.env.GIT_ASKPASS).toBe(isFetch ? '/owned/askpass' : undefined);
+      expect(command.env.SSH_AUTH_SOCK).toBe(isFetch ? '/owned/agent.sock' : undefined);
+    }
   });
 
   it('rejects an existing checkout instead of reusing or overwriting it', async () => {
@@ -198,7 +260,7 @@ describe('exact release checkout', () => {
     await expect(
       materializeReleaseCheckout(paths, instanceId, resolved, {
         runCommand: async (spec) => {
-          if (spec.cwd === paths.checkoutRoot(instanceId) && spec.args[0] === 'fetch') {
+          if (spec.cwd === stagingRoot(paths, instanceId) && spec.args[0] === 'fetch') {
             throw new Error('fixture fetch failure');
           }
           return runArgumentCommand(spec);
@@ -206,5 +268,110 @@ describe('exact release checkout', () => {
       }),
     ).rejects.toThrow(/fixture fetch failure/);
     await expect(stat(paths.checkoutRoot(instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(stagingRoot(paths, instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('publishes the checkout atomically only after staging verification', async () => {
+    const source = await sourceFixture();
+    const resolved = await resolveReleaseCommit(source.remote, 'refs/heads/dogfood');
+    const paths = await controlPlanePaths();
+    const instanceId = allocateInstanceId();
+    await reserveInstance(paths, reservation(paths, instanceId, source.remote, resolved.commit));
+    const expectedHome = path.join(paths.instanceRoot(instanceId), '.release-home');
+
+    await materializeReleaseCheckout(paths, instanceId, resolved, {
+      runCommand: async (spec) => {
+        expectSanitizedEnvironment(spec.env, expectedHome);
+        if (spec.cwd === stagingRoot(paths, instanceId)) {
+          await expect(stat(paths.checkoutRoot(instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
+        }
+        return runArgumentCommand(spec);
+      },
+    });
+
+    expect(git(paths.checkoutRoot(instanceId), 'rev-parse', 'HEAD')).toBe(resolved.commit);
+    await expect(stat(stagingRoot(paths, instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('publishes a complete owned staging checkout after an interrupted rename', async () => {
+    const source = await sourceFixture();
+    const resolved = await resolveReleaseCommit(source.remote, 'refs/heads/dogfood');
+    const paths = await controlPlanePaths();
+    const instanceId = allocateInstanceId();
+    await reserveInstance(paths, reservation(paths, instanceId, source.remote, resolved.commit));
+    await materializeReleaseCheckout(paths, instanceId, resolved);
+    await rename(paths.checkoutRoot(instanceId), stagingRoot(paths, instanceId));
+    const commands: string[] = [];
+
+    await materializeReleaseCheckout(paths, instanceId, resolved, {
+      runCommand: async (spec) => {
+        commands.push(spec.args[0] ?? '');
+        return runArgumentCommand(spec);
+      },
+    });
+
+    expect(commands).not.toContain('init');
+    expect(commands).not.toContain('fetch');
+    expect(commands).not.toContain('checkout');
+    expect(git(paths.checkoutRoot(instanceId), 'rev-parse', 'HEAD')).toBe(resolved.commit);
+  });
+
+  it('cleans an owned partial staging checkout before retrying materialization', async () => {
+    const source = await sourceFixture();
+    const resolved = await resolveReleaseCommit(source.remote, 'refs/heads/dogfood');
+    const paths = await controlPlanePaths();
+    const instanceId = allocateInstanceId();
+    await reserveInstance(paths, reservation(paths, instanceId, source.remote, resolved.commit));
+    await mkdir(paths.instanceRoot(instanceId), { recursive: true, mode: 0o700 });
+    await mkdir(stagingRoot(paths, instanceId), { mode: 0o700 });
+    await write(stagingRoot(paths, instanceId), 'partial.txt', 'interrupted\n');
+
+    await materializeReleaseCheckout(paths, instanceId, resolved);
+
+    await expect(stat(path.join(paths.checkoutRoot(instanceId), 'partial.txt'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    expect(git(paths.checkoutRoot(instanceId), 'rev-parse', 'HEAD')).toBe(resolved.commit);
+  });
+
+  it('does not clean a staging path that is a symlink', async () => {
+    const source = await sourceFixture();
+    const resolved = await resolveReleaseCommit(source.remote, 'refs/heads/dogfood');
+    const paths = await controlPlanePaths();
+    const instanceId = allocateInstanceId();
+    await reserveInstance(paths, reservation(paths, instanceId, source.remote, resolved.commit));
+    await mkdir(paths.instanceRoot(instanceId), { recursive: true, mode: 0o700 });
+    const foreign = path.join(path.dirname(paths.stateRoot), 'foreign-staging');
+    await mkdir(foreign);
+    await write(foreign, 'owner.txt', 'preserve me\n');
+    await symlink(foreign, stagingRoot(paths, instanceId));
+
+    await expect(materializeReleaseCheckout(paths, instanceId, resolved)).rejects.toMatchObject({
+      code: 'unsafe_checkout',
+    });
+    expect(await readFile(path.join(foreign, 'owner.txt'), 'utf8')).toBe('preserve me\n');
+  });
+
+  it('does not replace an unmarked final directory created while staging', async () => {
+    const source = await sourceFixture();
+    const resolved = await resolveReleaseCommit(source.remote, 'refs/heads/dogfood');
+    const paths = await controlPlanePaths();
+    const instanceId = allocateInstanceId();
+    await reserveInstance(paths, reservation(paths, instanceId, source.remote, resolved.commit));
+
+    await expect(
+      materializeReleaseCheckout(paths, instanceId, resolved, {
+        runCommand: async (spec) => {
+          const result = await runArgumentCommand(spec);
+          if (spec.cwd === stagingRoot(paths, instanceId) && spec.args[0] === 'status') {
+            await mkdir(paths.checkoutRoot(instanceId), { mode: 0o700 });
+            await write(paths.checkoutRoot(instanceId), 'owner.txt', 'preserve me\n');
+          }
+          return result;
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'checkout_exists' });
+    expect(await readFile(path.join(paths.checkoutRoot(instanceId), 'owner.txt'), 'utf8')).toBe('preserve me\n');
+    await expect(stat(stagingRoot(paths, instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });

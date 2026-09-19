@@ -31,6 +31,7 @@ const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 const GCP_PROJECT_PATTERN = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
 const ONECLI_PROJECT_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const GCHAT_APP_PATTERN = /^users\/[^/\s]+$/;
 
 function assertExactKeys(value: Record<string, unknown>, expected: readonly string[], label: string): void {
   const actual = Object.keys(value).sort();
@@ -100,6 +101,15 @@ function validateEndpoint(value: unknown): string {
   return endpoint.href;
 }
 
+function validateChatAppId(value: unknown): string {
+  const appId = requireString(value, 'chat_app_id', 256);
+  const resourceName = appId.startsWith('users/') ? appId : `users/${appId}`;
+  if (!GCHAT_APP_PATTERN.test(resourceName)) {
+    throw new GwsEaError('invalid_claim', 'Google Chat app ID must identify one bot user');
+  }
+  return appId;
+}
+
 function validateSourceRemote(value: unknown): string {
   const remote = requireString(value, 'source_remote');
   try {
@@ -132,7 +142,7 @@ function validateClaims(value: unknown): ExclusiveResourceClaims {
   return {
     endpoint_url: validateEndpoint(value.endpoint_url),
     gcp_project_id: gcpProject,
-    chat_app_id: requireString(value.chat_app_id, 'chat_app_id', 256),
+    chat_app_id: validateChatAppId(value.chat_app_id),
     chat_credential_id: requireString(value.chat_credential_id, 'chat_credential_id', 256),
     workspace_email: workspaceEmail,
     onecli_project: onecliProject,
@@ -227,7 +237,7 @@ function claimKeys(instance: InstanceReservation): string[] {
     ...Object.values(instance.allocated_ports).map((port) => `port:${port}`),
     `endpoint:${claims.endpoint_url}`,
     `gcp-project:${claims.gcp_project_id}`,
-    `chat-app:${claims.chat_app_id}`,
+    `chat-app:${claims.chat_app_id.startsWith('users/') ? claims.chat_app_id : `users/${claims.chat_app_id}`}`,
     `chat-credential:${claims.chat_credential_id}`,
     `workspace-email:${claims.workspace_email}`,
     `onecli-project:${claims.onecli_project}`,

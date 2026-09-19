@@ -182,6 +182,33 @@ describe('verified principal first-DM reconciliation', () => {
     );
   });
 
+  it('uses the latest authenticated event when a second DM arrives after a binding crash', async () => {
+    const first = row();
+    const second = row({
+      authenticated_message_id: 'spaces/dm-1/messages/2',
+      authenticated_message_at: '2026-09-18T18:02:00.000Z',
+    });
+    const h = harness([first, second]);
+
+    const result = await reconcilePrincipalDm(
+      runtimeConfig(),
+      { adapterInstance: 'gchat-assistant', provisioningStartedAt: STARTED_AT },
+      h.dependencies,
+    );
+
+    expect(result).toMatchObject({
+      status: 'bound',
+      candidate: {
+        messagingGroupId: 'mg-1',
+        authenticatedMessageId: 'spaces/dm-1/messages/2',
+        authenticatedMessageAt: '2026-09-18T18:02:00.000Z',
+      },
+    });
+    const bindArgs = h.runNcl.mock.calls.find((call) => call[1][1] === 'bind-principal')?.[1] as readonly string[];
+    expect(bindArgs[bindArgs.indexOf('--verified-at') + 1]).toBe('2026-09-18T18:02:00.000Z');
+    expect(h.runBootstrap).toHaveBeenCalledTimes(1);
+  });
+
   it('executes the checked-out bootstrap script with the allowlisted instance environment', async () => {
     const h = harness([row()]);
     const runCommand = vi.fn(async () => ({ stdout: '', stderr: '' }));

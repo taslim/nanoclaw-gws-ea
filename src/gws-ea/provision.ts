@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { existsSync } from 'node:fs';
+import { mkdir, rmdir } from 'node:fs/promises';
 import path from 'node:path';
 
 import {
@@ -53,9 +54,15 @@ import {
   type PrincipalBindingVerificationResult,
 } from './verify.js';
 import { readOwnerOnlyFile, removePrivateFile, writePrivateTextFile } from './secrets.js';
-import { getInstanceReservation } from './registry.js';
+import { assertInstanceId, getInstanceReservation } from './registry.js';
 import { preparePrivateLocalDirectory, type ControlPlanePaths } from './paths.js';
-import { GwsEaError, PROVISION_PHASES, type ProvisionJournal, type ProvisionPhase } from './types.js';
+import {
+  GwsEaError,
+  PROVISION_PHASES,
+  type InstanceReservation,
+  type ProvisionJournal,
+  type ProvisionPhase,
+} from './types.js';
 import { isRecord } from './validation.js';
 
 export type ProvisionBoundary = 'intent' | 'effect' | 'verify';
@@ -301,6 +308,123 @@ async function bootstrapManifestRemoved(file: string | undefined): Promise<boole
   }
 }
 
+const SERVICE_ACCOUNT_KEYS = new Set([
+  'type',
+  'project_id',
+  'private_key_id',
+  'private_key',
+  'client_email',
+  'client_id',
+  'auth_uri',
+  'token_uri',
+  'auth_provider_x509_cert_url',
+  'client_x509_cert_url',
+  'universe_domain',
+]);
+
+function serviceAccountString(credential: Record<string, unknown>, field: string, maximumLength = 4_096): string {
+  const value = credential[field];
+  if (typeof value !== 'string' || value.length === 0 || value.length > maximumLength) {
+    throw new GwsEaError('invalid_gchat_credential', 'Google Chat credential schema is invalid');
+  }
+  return value;
+}
+
+function serviceAccountHttpsUrl(credential: Record<string, unknown>, field: string): void {
+  const value = serviceAccountString(credential, field);
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new GwsEaError('invalid_gchat_credential', 'Google Chat credential schema is invalid');
+  }
+  if (parsed.protocol !== 'https:' || parsed.username || parsed.password) {
+    throw new GwsEaError('invalid_gchat_credential', 'Google Chat credential schema is invalid');
+  }
+}
+
+function validateGchatServiceAccountCredential(
+  contents: string,
+  expected: { readonly projectId: string; readonly privateKeyId: string },
+): void {
+  let value: unknown;
+  try {
+    value = JSON.parse(contents) as unknown;
+  } catch {
+    throw new GwsEaError('invalid_gchat_credential', 'Google Chat credential is not valid JSON');
+  }
+  if (!isRecord(value) || Object.keys(value).some((key) => !SERVICE_ACCOUNT_KEYS.has(key))) {
+    throw new GwsEaError('invalid_gchat_credential', 'Google Chat credential schema is invalid');
+  }
+  if (value.type !== 'service_account') {
+    throw new GwsEaError('invalid_gchat_credential', 'Google Chat credential must be a service-account key');
+  }
+  const projectId = serviceAccountString(value, 'project_id', 30);
+  const privateKeyId = serviceAccountString(value, 'private_key_id', 256);
+  const privateKey = serviceAccountString(value, 'private_key', 32_768);
+  const clientEmail = serviceAccountString(value, 'client_email', 320);
+  serviceAccountString(value, 'client_id', 256);
+  for (const field of ['auth_uri', 'token_uri', 'auth_provider_x509_cert_url', 'client_x509_cert_url']) {
+    serviceAccountHttpsUrl(value, field);
+  }
+  if (value.universe_domain !== undefined) serviceAccountString(value, 'universe_domain', 256);
+  if (
+    !privateKey.startsWith('-----BEGIN PRIVATE KEY-----\n') ||
+    !privateKey.trimEnd().endsWith('\n-----END PRIVATE KEY-----') ||
+    !clientEmail.endsWith(`@${projectId}.iam.gserviceaccount.com`)
+  ) {
+    throw new GwsEaError('invalid_gchat_credential', 'Google Chat credential schema is invalid');
+  }
+  if (projectId !== expected.projectId) {
+    throw new GwsEaError('gchat_credential_mismatch', 'Google Chat credential project does not match the reservation');
+  }
+  // The reservation's chat_credential_id is the Google service-account key ID.
+  if (privateKeyId !== expected.privateKeyId) {
+    throw new GwsEaError('gchat_credential_mismatch', 'Google Chat credential key does not match the reservation');
+  }
+}
+
+function canonicalGchatAppResourceName(appId: string): string {
+  return appId.startsWith('users/') ? appId : `users/${appId}`;
+}
+
+async function ensureGchatCredential(context: ProductionProvisionContext): Promise<PhaseEffectResult | undefined> {
+  const target = context.input.runtime.secret_files.gchat_credentials;
+  let contents: string;
+  let install = false;
+  try {
+    contents = await readOwnerOnlyFile(target);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    const source = context.input.gchatCredentialSourceFile;
+    if (!source) {
+      return humanPause(
+        'start_nanoclaw',
+        'gchat_credential_required',
+        'Install the Google Chat service-account credential in the instance private file, then resume.',
+      );
+    }
+    contents = await readOwnerOnlyFile(source);
+    install = true;
+  }
+  const reservation = await getInstanceReservation(context.operation.paths, context.operation.instanceId);
+  if (
+    context.input.runtime.gchat_bot_user_id !==
+    canonicalGchatAppResourceName(reservation.exclusive_resource_claims.chat_app_id)
+  ) {
+    throw new GwsEaError('gchat_app_mismatch', 'Google Chat bot identity does not match the reserved app');
+  }
+  validateGchatServiceAccountCredential(contents, {
+    projectId: reservation.exclusive_resource_claims.gcp_project_id,
+    privateKeyId: reservation.exclusive_resource_claims.chat_credential_id,
+  });
+  if (install) {
+    await preparePrivateLocalDirectory(path.dirname(target));
+    await writePrivateTextFile(target, contents);
+  }
+  return undefined;
+}
+
 const defaultProductionDependencies: ProductionProvisionDependencies = {
   probeCheckout: defaultProbeCheckout,
   materializeReleaseCheckout,
@@ -514,34 +638,8 @@ export function createProductionProvisionRegistry(
         if (!value.state.providerSecretId) {
           throw new GwsEaError('provider_not_ready', 'Provider credential must be reconciled before NanoClaw');
         }
-        try {
-          if (!(await readOwnerOnlyFile(value.input.runtime.secret_files.gchat_credentials)).trim()) {
-            return humanPause(
-              'start_nanoclaw',
-              'gchat_credential_required',
-              'Install the Google Chat service-account credential in the instance private file, then resume.',
-            );
-          }
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-            const source = value.input.gchatCredentialSourceFile;
-            if (!source) {
-              return humanPause(
-                'start_nanoclaw',
-                'gchat_credential_required',
-                'Install the Google Chat service-account credential in the instance private file, then resume.',
-              );
-            }
-            const contents = await readOwnerOnlyFile(source);
-            if (!contents.trim()) {
-              throw new GwsEaError('invalid_gchat_credential', 'Google Chat credential file is empty');
-            }
-            await preparePrivateLocalDirectory(path.dirname(value.input.runtime.secret_files.gchat_credentials));
-            await writePrivateTextFile(value.input.runtime.secret_files.gchat_credentials, contents);
-          } else {
-            throw error;
-          }
-        }
+        const credentialPause = await ensureGchatCredential(value);
+        if (credentialPause) return credentialPause;
         await dependencies.reconcileInstanceRuntime(value.input.runtime, value.input.serviceDependencies);
         const main = await dependencies.reconcileMainIdentity(
           value.input.runtime,
@@ -782,7 +880,6 @@ export interface ProductionBootstrapManifest {
     readonly bot_user_id: string;
     readonly credential_file: string;
   };
-  readonly provisioning_started_at: string;
   readonly selected_messaging_group_id: string | null;
 }
 
@@ -831,7 +928,6 @@ function validateBootstrapManifest(value: unknown): ProductionBootstrapManifest 
       'provider',
       'identity',
       'gchat',
-      'provisioning_started_at',
       'selected_messaging_group_id',
     ],
     'Bootstrap manifest',
@@ -851,10 +947,6 @@ function validateBootstrapManifest(value: unknown): ProductionBootstrapManifest 
   exactKeys(value.provider, ['id', 'name', 'type', 'host_pattern', 'credential_file', 'header_name'], 'provider');
   exactKeys(value.identity, ['assistant_display_name', 'principal_display_name', 'principal_timezone'], 'identity');
   exactKeys(value.gchat, ['bot_user_id', 'credential_file'], 'gchat');
-  const startedAt = bootstrapString(value.provisioning_started_at, 'provisioning_started_at');
-  if (new Date(startedAt).toISOString() !== startedAt) {
-    throw new GwsEaError('invalid_bootstrap_manifest', 'provisioning_started_at must be canonical UTC');
-  }
   const selected = value.selected_messaging_group_id;
   if (selected !== null && typeof selected !== 'string') {
     throw new GwsEaError('invalid_bootstrap_manifest', 'selected_messaging_group_id is invalid');
@@ -887,7 +979,6 @@ function validateBootstrapManifest(value: unknown): ProductionBootstrapManifest 
       bot_user_id: bootstrapString(value.gchat.bot_user_id, 'gchat bot user ID', 256),
       credential_file: bootstrapPath(value.gchat.credential_file, 'gchat credential_file'),
     },
-    provisioning_started_at: startedAt,
     selected_messaging_group_id:
       selected === null ? null : bootstrapString(selected, 'selected messaging group ID', 512),
   };
@@ -912,10 +1003,35 @@ export async function installProductionBootstrapManifest(
   instanceId: string,
   input: ProductionBootstrapManifest,
 ): Promise<void> {
-  await getInstanceReservation(paths, instanceId);
+  assertInstanceId(instanceId);
   const manifest = validateBootstrapManifest(input);
-  await preparePrivateLocalDirectory(paths.instanceRoot(instanceId));
-  await writePrivateTextFile(paths.bootstrapFile(instanceId), `${JSON.stringify(manifest, null, 2)}\n`);
+  await preparePrivateLocalDirectory(paths.instancesRoot);
+  try {
+    await mkdir(paths.instanceRoot(instanceId), { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      throw new GwsEaError('instance_state_exists', 'Instance state already exists; refusing to overwrite it');
+    }
+    throw error;
+  }
+  try {
+    await writePrivateTextFile(paths.bootstrapFile(instanceId), `${JSON.stringify(manifest, null, 2)}\n`);
+  } catch (error) {
+    await removeProductionBootstrapManifest(paths, instanceId);
+    throw error;
+  }
+}
+
+/** Remove only the staged bootstrap file after an unsuccessful reservation. */
+export async function removeProductionBootstrapManifest(paths: ControlPlanePaths, instanceId: string): Promise<void> {
+  assertInstanceId(instanceId);
+  await removePrivateFile(paths.bootstrapFile(instanceId));
+  try {
+    await rmdir(paths.instanceRoot(instanceId));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT' && code !== 'ENOTEMPTY') throw error;
+  }
 }
 
 interface PersistedProfileIdentity {
@@ -967,11 +1083,25 @@ async function hydrateMainState(
   };
 }
 
-function firstProvisionIntent(journal: ProvisionJournal): string {
+function firstProvisionIntent(journal: ProvisionJournal): string | undefined {
   const timestamps = PROVISION_PHASES.flatMap((phase) =>
     journal.phases[phase].attempts.map((attempt) => attempt.intended_at),
   ).sort();
-  return timestamps[0] ?? '1970-01-01T00:00:00.000Z';
+  return timestamps[0];
+}
+
+async function ensureTrustedProvisioningStart(
+  operation: InstanceOperation,
+  reservation: InstanceReservation,
+): Promise<string> {
+  const journal = await ensureProvisionJournal(operation);
+  const existing = firstProvisionIntent(journal);
+  if (existing) return existing;
+  const resourceKey = journalResourceKey(
+    'checkout',
+    JSON.stringify([reservation.source_remote, reservation.deployed_commit]),
+  );
+  return (await beginPhase(operation, 'materialize_checkout', resourceKey)).attempt.intended_at;
 }
 
 /** Build the real U7 context from temporary bootstrap input or authoritative instance state. */
@@ -980,6 +1110,7 @@ export async function runProductionProvision(
   selectedMessagingGroupId?: string,
 ): Promise<ProvisionResult> {
   const reservation = await getInstanceReservation(operation.paths, operation.instanceId);
+  const provisioningStartedAt = await ensureTrustedProvisioningStart(operation, reservation);
   let manifest: ProductionBootstrapManifest | undefined;
   try {
     manifest = await loadProductionBootstrapManifest(operation.paths.bootstrapFile(operation.instanceId));
@@ -1047,7 +1178,6 @@ export async function runProductionProvision(
     }
   }
   const state = await hydrateMainState(runtime, profile);
-  const journal = await ensureProvisionJournal(operation);
   const context: ProductionProvisionContext = {
     operation,
     state,
@@ -1073,7 +1203,7 @@ export async function runProductionProvision(
       ...(providerCredential ? { providerCredential } : {}),
       identity,
       adapterInstance: 'gchat',
-      provisioningStartedAt: manifest?.provisioning_started_at ?? profile?.updated_at ?? firstProvisionIntent(journal),
+      provisioningStartedAt,
       ...((selectedMessagingGroupId ?? manifest?.selected_messaging_group_id)
         ? { selectedMessagingGroupId: selectedMessagingGroupId ?? manifest!.selected_messaging_group_id! }
         : {}),

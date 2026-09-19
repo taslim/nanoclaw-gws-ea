@@ -1,14 +1,18 @@
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { readProvisionJournal, withInstanceOperation } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import {
   createProductionProvisionRegistry,
+  installProductionBootstrapManifest,
+  loadProductionBootstrapManifest,
   reconcileProvisioning,
+  removeProductionBootstrapManifest,
   ProvisionBoundaryInterruption,
+  type ProductionBootstrapManifest,
   type ProductionProvisionContext,
   type ProductionProvisionDependencies,
 } from './provision.js';
@@ -44,11 +48,59 @@ function reservation(paths: ControlPlanePaths): InstanceReservationInput {
     exclusive_resource_claims: {
       endpoint_url: 'https://assistant.example.com/webhook/gchat',
       gcp_project_id: 'gws-ea-dogfood',
-      chat_app_id: 'chat-app-1',
+      chat_app_id: 'assistant-bot',
       chat_credential_id: 'chat-credential-1',
       workspace_email: 'assistant@example.com',
       onecli_project: 'gws_ea_1',
     },
+  };
+}
+
+function serviceAccount(overrides: Readonly<Record<string, string>> = {}): string {
+  const projectId = overrides.project_id ?? 'gws-ea-dogfood';
+  return JSON.stringify({
+    type: 'service_account',
+    project_id: projectId,
+    private_key_id: 'chat-credential-1',
+    private_key: '-----BEGIN PRIVATE KEY-----\ntest-key-material\n-----END PRIVATE KEY-----\n',
+    client_email: `assistant@${projectId}.iam.gserviceaccount.com`,
+    client_id: '1234567890',
+    auth_uri: 'https://accounts.google.com/o/oauth2/auth',
+    token_uri: 'https://oauth2.googleapis.com/token',
+    auth_provider_x509_cert_url: 'https://www.googleapis.com/oauth2/v1/certs',
+    client_x509_cert_url: 'https://www.googleapis.com/robot/v1/metadata/x509/assistant',
+    universe_domain: 'googleapis.com',
+    ...overrides,
+  });
+}
+
+function bootstrapManifest(paths: ControlPlanePaths): ProductionBootstrapManifest {
+  const inputRoot = path.join(path.dirname(paths.configRoot), 'bootstrap-input');
+  return {
+    schema_version: 1,
+    onecli_cli_path: '/usr/local/bin/onecli',
+    node_path: process.execPath,
+    home_directory: path.dirname(paths.stateRoot),
+    platform: process.platform === 'darwin' ? 'macos' : 'linux',
+    running_as_root: false,
+    provider: {
+      id: 'claude',
+      name: 'Claude provider',
+      type: 'api_key',
+      host_pattern: 'api.anthropic.com',
+      credential_file: path.join(inputRoot, 'provider-key'),
+      header_name: 'x-api-key',
+    },
+    identity: {
+      assistant_display_name: 'Aya',
+      principal_display_name: 'Principal',
+      principal_timezone: 'America/Los_Angeles',
+    },
+    gchat: {
+      bot_user_id: 'users/assistant-bot',
+      credential_file: path.join(inputRoot, 'gchat-key.json'),
+    },
+    selected_messaging_group_id: null,
   };
 }
 
@@ -209,6 +261,32 @@ describe('resumable provision phase runner', () => {
   });
 });
 
+describe('production bootstrap trust boundary', () => {
+  it('rejects caller-authored principal eligibility timestamps', async () => {
+    const paths = await testPaths();
+    const file = path.join(path.dirname(paths.configRoot), 'setup.json');
+    await writeFile(
+      file,
+      JSON.stringify({ ...bootstrapManifest(paths), provisioning_started_at: '1970-01-01T00:00:00.000Z' }),
+      { mode: 0o600 },
+    );
+
+    await expect(loadProductionBootstrapManifest(file)).rejects.toThrow(/unknown or missing fields/i);
+  });
+
+  it('stages and removes only the validated bootstrap file before reservation publication', async () => {
+    const paths = await testPaths();
+    const input = reservation(paths);
+    const manifest = bootstrapManifest(paths);
+
+    await installProductionBootstrapManifest(paths, input.instance_id, manifest);
+    await expect(readFile(paths.bootstrapFile(input.instance_id), 'utf8')).resolves.toContain('"schema_version": 1');
+    await removeProductionBootstrapManifest(paths, input.instance_id);
+    await expect(readFile(paths.bootstrapFile(input.instance_id), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(readFile(paths.instanceRoot(input.instance_id), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+});
+
 function productionContext(
   operation: Parameters<typeof createProductionProvisionRegistry>[0]['operation'],
   reserved: InstanceReservation,
@@ -270,6 +348,68 @@ function productionContext(
 }
 
 describe('production provision phase composition', () => {
+  it('rejects a configured Google Chat bot swap before starting NanoClaw', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation(paths));
+    const startRuntime = vi.fn(async (): Promise<never> => {
+      throw new Error('NanoClaw must not start');
+    });
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const context = productionContext(operation, reserved);
+      context.state.providerSecretId = 'secret-provider';
+      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), {
+        recursive: true,
+        mode: 0o700,
+      });
+      await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
+      const mismatched: ProductionProvisionContext = {
+        ...context,
+        input: {
+          ...context.input,
+          runtime: { ...context.input.runtime, gchat_bot_user_id: 'users/different-app' },
+        },
+      };
+      const definitions = createProductionProvisionRegistry(mismatched, { reconcileInstanceRuntime: startRuntime });
+
+      await expect(definitions.start_nanoclaw.apply(mismatched)).rejects.toMatchObject({
+        code: 'gchat_app_mismatch',
+      });
+    });
+
+    expect(startRuntime).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['project', { project_id: 'different-project' }],
+    ['key', { private_key_id: 'different-key-id' }],
+  ] as const)('rejects a service-account %s swap before starting NanoClaw', async (_label, credentialOverride) => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation(paths));
+    const startRuntime = vi.fn(async (): Promise<never> => {
+      throw new Error('NanoClaw must not start');
+    });
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const context = productionContext(operation, reserved);
+      context.state.providerSecretId = 'secret-provider';
+      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), {
+        recursive: true,
+        mode: 0o700,
+      });
+      await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(credentialOverride), {
+        mode: 0o600,
+      });
+      const definitions = createProductionProvisionRegistry(context, { reconcileInstanceRuntime: startRuntime });
+
+      await expect(definitions.start_nanoclaw.apply(context)).rejects.toMatchObject({
+        code: 'gchat_credential_mismatch',
+      });
+    });
+
+    expect(startRuntime).not.toHaveBeenCalled();
+  });
+
   it('composes U2-U6 in order, pauses for the principal, and resumes without duplicate effects', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
@@ -429,7 +569,7 @@ describe('production provision phase composition', () => {
       await writeFile(bootstrapManifestFile, '{}', { mode: 0o600 });
       context = { ...initial, input: { ...initial.input, bootstrapManifestFile } };
       await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), { recursive: true, mode: 0o700 });
-      await writeFile(context.input.runtime.secret_files.gchat_credentials, '{}', { mode: 0o600 });
+      await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
       return reconcileProvisioning(operation, context, createProductionProvisionRegistry(context, overrides));
     });
     expect(effects).toContain('verifyExistingGchatRoute');

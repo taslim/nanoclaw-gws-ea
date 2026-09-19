@@ -115,7 +115,7 @@ export async function bindVerifiedPrincipalUser(userId: string, verifiedAt: stri
   await getDb().run(
     `INSERT INTO gws_ea_principal_users (user_id, verified_at)
      VALUES (?, ?)
-     ON CONFLICT(user_id) DO NOTHING`,
+     ON CONFLICT(user_id) DO UPDATE SET verified_at = excluded.verified_at`,
     userId,
     verifiedAt,
   );

@@ -125,7 +125,7 @@ function parseCandidates(value: unknown, adapterInstance: string, provisioningSt
   const rows = unwrapData(value);
   if (!Array.isArray(rows))
     throw new GwsEaError('invalid_child_output', 'ncl returned an invalid dropped-message list');
-  return rows
+  const candidates = rows
     .map((row) => parseCandidate(row, adapterInstance, provisioningStartedAt))
     .filter((candidate): candidate is PrincipalCandidate => candidate !== undefined)
     .sort(
@@ -133,6 +133,13 @@ function parseCandidates(value: unknown, adapterInstance: string, provisioningSt
         left.authenticatedMessageAt.localeCompare(right.authenticatedMessageAt) ||
         left.messagingGroupId.localeCompare(right.messagingGroupId),
     );
+  const latestByConversation = new Map<string, PrincipalCandidate>();
+  for (const candidate of candidates) latestByConversation.set(candidate.messagingGroupId, candidate);
+  return [...latestByConversation.values()].sort(
+    (left, right) =>
+      left.authenticatedMessageAt.localeCompare(right.authenticatedMessageAt) ||
+      left.messagingGroupId.localeCompare(right.messagingGroupId),
+  );
 }
 
 async function defaultRunBootstrap(

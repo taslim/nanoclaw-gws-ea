@@ -87,7 +87,7 @@ describe('GWS-EA profile module', () => {
       main_agent_group_id: main.id,
     });
     expect(await listVerifiedPrincipalUsers()).toEqual([
-      { user_id: 'gchat:users/one', verified_at: '2026-09-18T03:00:00.000Z' },
+      { user_id: 'gchat:users/one', verified_at: '2026-09-18T04:00:00.000Z' },
       { user_id: 'slack:U123', verified_at: '2026-09-18T05:00:00.000Z' },
     ]);
     expect(await getDb().get<{ count: number }>('SELECT COUNT(*) AS count FROM gws_ea_profile')).toEqual({ count: 1 });

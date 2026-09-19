@@ -3,13 +3,15 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { runArgumentCommand } from './checkout.js';
 import { runReleasePreflight, type SetupCommand } from './release-preflight.js';
 
 const roots: string[] = [];
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
@@ -33,8 +35,10 @@ function commit(root: string, message: string): void {
 }
 
 async function releaseFixture(): Promise<string> {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-preflight-'));
-  roots.push(root);
+  const instanceRoot = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-preflight-'));
+  roots.push(instanceRoot);
+  const root = path.join(instanceRoot, 'nanoclaw');
+  await mkdir(root);
   git(root, 'init', '-b', 'main');
   await write(root, '.gitignore', 'node_modules/\ndist/\ndata/\n');
   await write(
@@ -113,6 +117,13 @@ function recorder(commands: SetupCommand[]): (command: SetupCommand) => Promise<
   };
 }
 
+function expectCommonEnvironment(environment: Readonly<Record<string, string>>, checkoutRoot: string): void {
+  expect(environment.HOME).toBe(path.join(path.dirname(checkoutRoot), '.release-home'));
+  for (const key of Object.keys(environment)) {
+    expect(['HOME', 'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE']).toContain(key);
+  }
+}
+
 describe('release preflight', () => {
   it('validates a composed release, installs frozen dependencies, and builds without applying skills', async () => {
     const root = await releaseFixture();
@@ -128,11 +139,48 @@ describe('release preflight', () => {
       packageManager: 'pnpm@10.34.5',
       onecli: { gateway: '1.42.0', cli: '2.2.5', sdk: '2.2.1' },
     });
-    expect(commands).toEqual([
-      { command: 'pnpm', args: ['install', '--frozen-lockfile'], cwd: root },
-      { command: 'pnpm', args: ['run', 'build'], cwd: root },
-    ]);
+    expect(commands).toHaveLength(2);
+    expect(commands[0]).toMatchObject({ command: 'pnpm', args: ['install', '--frozen-lockfile'], cwd: root });
+    expect(commands[1]).toMatchObject({ command: 'pnpm', args: ['run', 'build'], cwd: root });
+    for (const command of commands) expectCommonEnvironment(command.env, root);
     expect(git(root, 'status', '--porcelain')).toBe('');
+  });
+
+  it('runs every Git and pnpm child with an instance-owned allowlisted environment', async () => {
+    const root = await releaseFixture();
+    vi.stubEnv('GIT_CONFIG_GLOBAL', '/tmp/hostile-gitconfig');
+    vi.stubEnv('GIT_WORK_TREE', '/tmp/hostile-work-tree');
+    vi.stubEnv('NPM_CONFIG_USERCONFIG', '/tmp/hostile-npmrc');
+    vi.stubEnv('PNPM_HOME', '/tmp/hostile-pnpm');
+    vi.stubEnv('ONECLI_HOME', '/tmp/hostile-onecli');
+    vi.stubEnv('ANTHROPIC_API_KEY', 'must-not-propagate');
+    vi.stubEnv('GOOGLE_APPLICATION_CREDENTIALS', '/tmp/hostile-google-key');
+    const gitEnvironments: Array<Readonly<Record<string, string>>> = [];
+    const setupCommands: SetupCommand[] = [];
+
+    await runReleasePreflight(
+      { checkoutRoot: root, provider: 'claude' },
+      {
+        runCommand: async (spec) => {
+          gitEnvironments.push(spec.env);
+          return runArgumentCommand(spec);
+        },
+        runSetupCommand: recorder(setupCommands),
+      },
+    );
+
+    expect(gitEnvironments.length).toBeGreaterThan(0);
+    for (const environment of gitEnvironments) {
+      expect(environment.HOME).toBe(path.join(path.dirname(root), '.release-home'));
+      expect(environment.GIT_CONFIG_NOSYSTEM).toBe('1');
+      expect(environment.GIT_TERMINAL_PROMPT).toBe('0');
+      for (const key of Object.keys(environment)) {
+        expect(['HOME', 'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT']).toContain(
+          key,
+        );
+      }
+    }
+    for (const command of setupCommands) expectCommonEnvironment(command.env, root);
   });
 
   it.each([
@@ -230,7 +278,8 @@ describe('release preflight', () => {
         },
       ),
     ).rejects.toThrow(/package\.json/);
-    expect(commands).toEqual([{ command: 'pnpm', args: ['install', '--frozen-lockfile'], cwd: root }]);
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toMatchObject({ command: 'pnpm', args: ['install', '--frozen-lockfile'], cwd: root });
   });
 
   it('fails with the tracked diff when the build changes source', async () => {

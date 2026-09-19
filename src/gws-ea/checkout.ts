@@ -1,12 +1,20 @@
 import { spawn } from 'node:child_process';
-import { lstat, mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
-import { assertLocalOwnedDestination, assertOwnedLocalDirectory, type ControlPlanePaths } from './paths.js';
-import { assertRegistryMarkerAgreement, getInstanceReservation, writeInstanceMarker } from './registry.js';
-import { GwsEaError, type InstanceReservation } from './types.js';
+import { writePrivate } from '../community-portal/private-file.js';
+import {
+  assertLocalOwnedDestination,
+  assertOwnedLocalDirectory,
+  assertPrivateStateFile,
+  preparePrivateLocalDirectory,
+  type ControlPlanePaths,
+} from './paths.js';
+import { assertRegistryMarkerAgreement, getInstanceReservation } from './registry.js';
+import { GwsEaError, INSTANCE_MARKER_SCHEMA_VERSION, type InstanceMarker, type InstanceReservation } from './types.js';
+import { isRecord } from './validation.js';
 
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 const MAX_COMMAND_OUTPUT_BYTES = 2 * 1024 * 1024;
@@ -15,6 +23,7 @@ const DEFAULT_COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
 export interface CommandSpec {
   command: string;
   args: readonly string[];
+  env: Readonly<Record<string, string>>;
   cwd?: string;
   timeoutMs?: number;
 }
@@ -34,6 +43,45 @@ export interface ResolvedRelease {
 
 export interface CheckoutRuntime {
   runCommand?: CommandRunner;
+  fetchAuthentication?: GitFetchAuthentication;
+}
+
+export interface GitFetchAuthentication {
+  askPassProgram?: string;
+  sshAgentSocket?: string;
+}
+
+export interface ReleaseCommandEnvironments {
+  common: Readonly<Record<string, string>>;
+  git: Readonly<Record<string, string>>;
+}
+
+function copyAmbientValue(target: Record<string, string>, key: string): void {
+  const value = process.env[key];
+  if (value !== undefined) target[key] = value;
+}
+
+/** Build a minimal child environment rooted in storage owned by this release operation. */
+export async function prepareReleaseCommandEnvironments(ownerRoot: string): Promise<ReleaseCommandEnvironments> {
+  const home = path.join(ownerRoot, '.release-home');
+  await preparePrivateLocalDirectory(home);
+  const common: Record<string, string> = { HOME: home };
+  for (const key of ['PATH', 'LANG', 'LC_ALL', 'LC_CTYPE'] as const) copyAmbientValue(common, key);
+  return {
+    common,
+    git: { ...common, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' },
+  };
+}
+
+function fetchEnvironment(
+  environment: Readonly<Record<string, string>>,
+  authentication: GitFetchAuthentication | undefined,
+): Readonly<Record<string, string>> {
+  if (!authentication) return environment;
+  const result = { ...environment };
+  if (authentication.askPassProgram) result.GIT_ASKPASS = authentication.askPassProgram;
+  if (authentication.sshAgentSocket) result.SSH_AUTH_SOCK = authentication.sshAgentSocket;
+  return result;
 }
 
 function appendOutput(current: string, chunk: Buffer, childCommand: string): string {
@@ -48,6 +96,7 @@ export function runArgumentCommand(spec: CommandSpec): Promise<CommandResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(spec.command, [...spec.args], {
       cwd: spec.cwd,
+      env: spec.env,
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -122,12 +171,22 @@ function validateCommit(commit: string): string {
   return normalized;
 }
 
-async function assertValidReleaseRef(repository: string, releaseRef: string, run: CommandRunner): Promise<void> {
+async function assertValidReleaseRef(
+  repository: string,
+  releaseRef: string,
+  run: CommandRunner,
+  environment: Readonly<Record<string, string>>,
+): Promise<void> {
   if (!releaseRef || releaseRef.startsWith('-') || releaseRef.length > 256) {
     throw new GwsEaError('invalid_release_ref', 'Release ref is invalid');
   }
   try {
-    await run({ command: 'git', args: ['check-ref-format', '--allow-onelevel', releaseRef], cwd: repository });
+    await run({
+      command: 'git',
+      args: ['check-ref-format', '--allow-onelevel', releaseRef],
+      cwd: repository,
+      env: environment,
+    });
   } catch {
     throw new GwsEaError('invalid_release_ref', 'Release ref is invalid');
   }
@@ -147,19 +206,26 @@ export async function resolveReleaseCommit(
   const scratchRoot = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-resolve-'));
   const repository = path.join(scratchRoot, 'objects.git');
   try {
-    await run({ command: 'git', args: ['init', '--bare', repository] });
-    await assertValidReleaseRef(repository, releaseRef, run);
+    const environment = await prepareReleaseCommandEnvironments(scratchRoot);
+    await run({ command: 'git', args: ['init', '--bare', repository], env: environment.git });
+    await assertValidReleaseRef(repository, releaseRef, run, environment.git);
     await run({
       command: 'git',
       args: ['fetch', '--no-tags', '--depth=1', '--end-of-options', sourceRemote, releaseRef],
       cwd: repository,
+      env: fetchEnvironment(environment.git, runtime.fetchAuthentication),
     });
 
     let commit: string;
     try {
       commit = validateCommit(
         (
-          await run({ command: 'git', args: ['rev-parse', '--verify', 'FETCH_HEAD^{commit}'], cwd: repository })
+          await run({
+            command: 'git',
+            args: ['rev-parse', '--verify', 'FETCH_HEAD^{commit}'],
+            cwd: repository,
+            env: environment.git,
+          })
         ).stdout.trim(),
       );
     } catch {
@@ -184,6 +250,52 @@ async function assertCheckoutTargetAbsent(checkoutRoot: string): Promise<void> {
   }
 }
 
+function stagingCheckoutRoot(checkoutRoot: string): string {
+  return `${checkoutRoot}.staging`;
+}
+
+function markerPath(checkoutRoot: string): string {
+  return path.join(checkoutRoot, 'data', 'gws-ea', 'instance.json');
+}
+
+async function writeStagingMarker(
+  checkoutRoot: string,
+  instanceId: string,
+  reservation: InstanceReservation,
+): Promise<void> {
+  const file = markerPath(checkoutRoot);
+  await preparePrivateLocalDirectory(path.dirname(file));
+  await writePrivate(file, {
+    schema_version: INSTANCE_MARKER_SCHEMA_VERSION,
+    instance_id: instanceId,
+    deployed_commit: reservation.deployed_commit,
+  } satisfies InstanceMarker);
+}
+
+async function assertStagingMarker(
+  checkoutRoot: string,
+  instanceId: string,
+  reservation: InstanceReservation,
+): Promise<void> {
+  const file = markerPath(checkoutRoot);
+  await assertPrivateStateFile(file);
+  let marker: unknown;
+  try {
+    marker = JSON.parse(await readFile(file, 'utf8')) as unknown;
+  } catch {
+    throw new GwsEaError('invalid_marker', 'Staging instance marker cannot be parsed safely');
+  }
+  if (
+    !isRecord(marker) ||
+    Object.keys(marker).sort().join(',') !== 'deployed_commit,instance_id,schema_version' ||
+    marker.schema_version !== INSTANCE_MARKER_SCHEMA_VERSION ||
+    marker.instance_id !== instanceId ||
+    marker.deployed_commit !== reservation.deployed_commit
+  ) {
+    throw new GwsEaError('marker_mismatch', 'Staging instance marker mismatch; refusing mutation');
+  }
+}
+
 function assertResolvedReleaseMatches(reservation: InstanceReservation, release: ResolvedRelease): void {
   if (reservation.source_remote !== release.sourceRemote || reservation.deployed_commit !== release.commit) {
     throw new GwsEaError('release_mismatch', 'Resolved release does not match the immutable instance reservation');
@@ -203,34 +315,102 @@ export async function materializeReleaseCheckout(
   await assertLocalOwnedDestination(reservation.checkout_realpath);
   await mkdir(paths.instanceRoot(instanceId), { recursive: true, mode: 0o700 });
   await assertOwnedLocalDirectory(paths.instanceRoot(instanceId), 0o700);
-  await mkdir(reservation.checkout_realpath, { mode: 0o700 });
-
+  const environments = await prepareReleaseCommandEnvironments(paths.instanceRoot(instanceId));
+  const stagingRoot = stagingCheckoutRoot(reservation.checkout_realpath);
   const run = runtime.runCommand ?? runArgumentCommand;
+  try {
+    const info = await lstat(stagingRoot);
+    if (info.isSymbolicLink() || !info.isDirectory() || (await realpath(stagingRoot)) !== stagingRoot) {
+      throw new GwsEaError('unsafe_checkout', 'Staging checkout must be a physical directory at its claimed path');
+    }
+    await assertOwnedLocalDirectory(stagingRoot, 0o700);
+    try {
+      await assertStagingMarker(stagingRoot, instanceId, reservation);
+      await assertCheckoutRoot(stagingRoot, reservation, run, environments.git);
+      await assertCheckoutTargetAbsent(reservation.checkout_realpath);
+      await rename(stagingRoot, reservation.checkout_realpath);
+      return assertReleaseCheckoutAgreement(paths, instanceId, runtime);
+    } catch (error) {
+      if (error instanceof GwsEaError && ['invalid_marker', 'marker_mismatch'].includes(error.code)) throw error;
+      await rm(stagingRoot, { recursive: true, force: true });
+    }
+  } catch (error) {
+    if (!isErrno(error, 'ENOENT')) throw error;
+  }
+  await preparePrivateLocalDirectory(stagingRoot);
+
   let completed = false;
   try {
-    await run({ command: 'git', args: ['init'], cwd: reservation.checkout_realpath });
+    await run({ command: 'git', args: ['init'], cwd: stagingRoot, env: environments.git });
     await run({
       command: 'git',
       args: ['remote', 'add', 'origin', reservation.source_remote],
-      cwd: reservation.checkout_realpath,
+      cwd: stagingRoot,
+      env: environments.git,
     });
     await run({
       command: 'git',
       args: ['fetch', '--no-tags', '--depth=1', '--end-of-options', 'origin', reservation.deployed_commit],
-      cwd: reservation.checkout_realpath,
+      cwd: stagingRoot,
+      env: fetchEnvironment(environments.git, runtime.fetchAuthentication),
     });
     await run({
       command: 'git',
       args: ['checkout', '--detach', reservation.deployed_commit],
-      cwd: reservation.checkout_realpath,
+      cwd: stagingRoot,
+      env: environments.git,
     });
-    await writeInstanceMarker(paths, instanceId);
+    await writeStagingMarker(stagingRoot, instanceId, reservation);
+    await assertStagingMarker(stagingRoot, instanceId, reservation);
+    await assertCheckoutRoot(stagingRoot, reservation, run, environments.git);
+    await assertCheckoutTargetAbsent(reservation.checkout_realpath);
+    await rename(stagingRoot, reservation.checkout_realpath);
     const result = await assertReleaseCheckoutAgreement(paths, instanceId, runtime);
     completed = true;
     return result;
   } finally {
-    if (!completed) await rm(reservation.checkout_realpath, { recursive: true, force: true });
+    if (!completed) await rm(stagingRoot, { recursive: true, force: true });
   }
+}
+
+async function assertCheckoutRoot(
+  checkoutRoot: string,
+  reservation: InstanceReservation,
+  run: CommandRunner,
+  environment: Readonly<Record<string, string>>,
+): Promise<void> {
+  const head = validateCommit(
+    (
+      await run({
+        command: 'git',
+        args: ['rev-parse', '--verify', 'HEAD^{commit}'],
+        cwd: checkoutRoot,
+        env: environment,
+      })
+    ).stdout.trim(),
+  );
+  if (head !== reservation.deployed_commit) {
+    throw new GwsEaError('release_mismatch', 'Checkout HEAD does not match the immutable instance reservation');
+  }
+  const branch = (
+    await run({
+      command: 'git',
+      args: ['rev-parse', '--abbrev-ref', 'HEAD'],
+      cwd: checkoutRoot,
+      env: environment,
+    })
+  ).stdout.trim();
+  if (branch !== 'HEAD') throw new GwsEaError('checkout_not_detached', 'Release checkout HEAD must be detached');
+
+  const status = (
+    await run({
+      command: 'git',
+      args: ['status', '--porcelain=v1', '--untracked-files=all'],
+      cwd: checkoutRoot,
+      env: environment,
+    })
+  ).stdout.trim();
+  if (status) throw new GwsEaError('checkout_drift', `Release checkout is not clean:\n${status}`);
 }
 
 /** Verify registry, physical checkout, detached HEAD, marker, commit, and clean tree agree. */
@@ -249,32 +429,7 @@ export async function assertReleaseCheckoutAgreement(
   }
 
   const run = runtime.runCommand ?? runArgumentCommand;
-  const head = validateCommit(
-    (
-      await run({
-        command: 'git',
-        args: ['rev-parse', '--verify', 'HEAD^{commit}'],
-        cwd: reservation.checkout_realpath,
-      })
-    ).stdout.trim(),
-  );
-  if (head !== reservation.deployed_commit) {
-    throw new GwsEaError('release_mismatch', 'Checkout HEAD does not match the immutable instance reservation');
-  }
-  const branch = (
-    await run({ command: 'git', args: ['rev-parse', '--abbrev-ref', 'HEAD'], cwd: reservation.checkout_realpath })
-  ).stdout.trim();
-  if (branch !== 'HEAD') throw new GwsEaError('checkout_not_detached', 'Release checkout HEAD must be detached');
-
-  const status = (
-    await run({
-      command: 'git',
-      args: ['status', '--porcelain=v1', '--untracked-files=all'],
-      cwd: reservation.checkout_realpath,
-    })
-  ).stdout.trim();
-  if (status) {
-    throw new GwsEaError('checkout_drift', `Release checkout is not clean:\n${status}`);
-  }
+  const environments = await prepareReleaseCommandEnvironments(paths.instanceRoot(instanceId));
+  await assertCheckoutRoot(reservation.checkout_realpath, reservation, run, environments.git);
   return reservation;
 }
