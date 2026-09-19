@@ -8,6 +8,7 @@ const STARTED_AT = '2026-09-18T18:00:00.000Z';
 function runtimeConfig(): InstanceRuntimeConfig {
   const instanceId = '11111111-1111-4111-8111-111111111111';
   const checkout = '/opt/gws-ea/instances/one/nanoclaw';
+  const secrets = '/opt/gws-ea/instances/one/secrets';
   const project = `gws-ea-${instanceId.replaceAll('-', '')}`;
   return {
     schema_version: 1,
@@ -27,9 +28,9 @@ function runtimeConfig(): InstanceRuntimeConfig {
     selected_provider: 'claude',
     endpoint_url: 'https://aya.example.test/webhook/gchat',
     secret_files: {
-      gchat_credentials: `${checkout}/data/gws-ea/secrets/gchat-service-account.json`,
-      onecli_runtime_api_key: `${checkout}/data/gws-ea/secrets/onecli-runtime-api-key`,
-      onecli_admin_api_key: `${checkout}/data/gws-ea/secrets/onecli-admin-api-key`,
+      gchat_credentials: `${secrets}/gchat-service-account.json`,
+      onecli_runtime_api_key: `${secrets}/onecli-runtime-api-key`,
+      onecli_admin_api_key: `${secrets}/onecli-admin-api-key`,
     },
   };
 }

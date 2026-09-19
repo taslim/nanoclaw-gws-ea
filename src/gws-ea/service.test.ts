@@ -95,6 +95,13 @@ describe('GWS-EA instance runtime', () => {
     expect(layout.installLabel).toBe(`nanoclaw-install=${config.install_id}`);
     expect(layout.cliSocket).toBe(path.join(config.checkout_realpath, 'data', 'ncl.sock'));
     expect(layout.standardOutputPath).toBe(path.join(config.checkout_realpath, 'logs', 'nanoclaw.log'));
+    const secretsDirectory = path.join(path.dirname(config.checkout_realpath), 'secrets');
+    expect(config.secret_files).toEqual({
+      gchat_credentials: path.join(secretsDirectory, 'gchat-service-account.json'),
+      onecli_runtime_api_key: path.join(secretsDirectory, 'onecli-runtime-api-key'),
+      onecli_admin_api_key: path.join(secretsDirectory, 'onecli-admin-api-key'),
+    });
+    expect(secretsDirectory.startsWith(`${config.checkout_realpath}${path.sep}`)).toBe(false);
     expect(environmentFile).toContain(`WEBHOOK_PORT=${config.allocated_ports.nanoclaw_webhook}`);
     expect(environmentFile).toContain(`NANOCLAW_EGRESS_NETWORK=${config.agent_egress_network}`);
     expect(environmentFile).not.toContain('runtime-secret-canary');

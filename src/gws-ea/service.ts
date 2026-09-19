@@ -100,7 +100,7 @@ function assertPort(value: unknown, label: string): number {
 }
 
 function expectedSecretFiles(checkout: string): InstanceSecretFiles {
-  const root = path.join(checkout, 'data', 'gws-ea', 'secrets');
+  const root = path.join(path.dirname(checkout), 'secrets');
   return {
     gchat_credentials: path.join(root, 'gchat-service-account.json'),
     onecli_runtime_api_key: path.join(root, 'onecli-runtime-api-key'),
