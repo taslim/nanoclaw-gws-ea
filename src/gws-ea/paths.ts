@@ -15,6 +15,8 @@ export interface ControlPlanePaths {
   registryFile: string;
   registryLock: string;
   removalRoot: string;
+  ingressRoot: string;
+  cloudflareRoot: string;
   instancesRoot: string;
   instanceRoot(instanceId: string): string;
   checkoutRoot(instanceId: string): string;
@@ -70,6 +72,8 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
   );
   const instancesRoot = path.join(stateRoot, 'instances');
   const removalRoot = path.join(configRoot, 'removals');
+  const ingressRoot = path.join(stateRoot, 'ingress');
+  const cloudflareRoot = path.join(ingressRoot, 'cloudflare');
   const instanceRoot = (instanceId: string): string => path.join(instancesRoot, instanceId);
   const checkoutRoot = (instanceId: string): string => path.join(instanceRoot(instanceId), 'nanoclaw');
 
@@ -79,6 +83,8 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
     registryFile: path.join(configRoot, 'instances.json'),
     registryLock: path.join(configRoot, 'instances.lock'),
     removalRoot,
+    ingressRoot,
+    cloudflareRoot,
     instancesRoot,
     instanceRoot,
     checkoutRoot,

@@ -3,7 +3,7 @@ import { isErrno } from '../community-portal/errors.js';
 import { assertPrivateStateFile } from './paths.js';
 import type { ControlPlanePaths } from './paths.js';
 import { assertRegistryMarkerAgreement, getInstanceReservation } from './registry.js';
-import { GwsEaError } from './types.js';
+import { GwsEaError, ingressEndpointUrl } from './types.js';
 import { isRecord } from './validation.js';
 
 const CHAT_CONFIGURATION_SCHEMA_VERSION = 1 as const;
@@ -59,7 +59,7 @@ export async function confirmChatConfiguration(paths: ControlPlanePaths, instanc
   const expected = {
     instanceId,
     projectId: reservation.exclusive_resource_claims.gcp_project_id,
-    endpointUrl: reservation.exclusive_resource_claims.endpoint_url,
+    endpointUrl: ingressEndpointUrl(reservation.exclusive_resource_claims.ingress),
   };
   try {
     await assertPrivateStateFile(paths.chatConfigurationFile(instanceId));
@@ -84,7 +84,7 @@ export async function isChatConfigurationConfirmed(paths: ControlPlanePaths, ins
     validateReceipt(await readJson<unknown>(paths.chatConfigurationFile(instanceId)), {
       instanceId,
       projectId: reservation.exclusive_resource_claims.gcp_project_id,
-      endpointUrl: reservation.exclusive_resource_claims.endpoint_url,
+      endpointUrl: ingressEndpointUrl(reservation.exclusive_resource_claims.ingress),
     });
     return true;
   } catch (error) {

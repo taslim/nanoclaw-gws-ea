@@ -39,7 +39,7 @@ async function fixture(): Promise<{ paths: ControlPlanePaths; input: InstanceRes
     deployed_commit: 'a'.repeat(40),
     allocated_ports: { nanoclaw_webhook: 32_001, onecli_app: 32_002, onecli_gateway: 32_003 },
     exclusive_resource_claims: {
-      endpoint_url: 'https://journal.example.test/webhook/gchat',
+      ingress: { mode: 'existing', endpoint_url: 'https://journal.example.test/webhook/gchat' },
       gcp_project_id: 'journal-project',
       gcp_account: 'operator@example.test',
       gchat_service_account: 'gws-ea-chat@journal-project.iam.gserviceaccount.com',

@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runCli } from './cli.js';
 import type { InstanceOperation } from './journal.js';
 import {
@@ -44,12 +44,34 @@ function reservation(paths: ControlPlanePaths, instanceId = allocateInstanceId()
       onecli_gateway: 31_003,
     },
     exclusive_resource_claims: {
-      endpoint_url: 'https://assistant.example.test/webhook/gchat',
+      ingress: {
+        mode: 'existing',
+        endpoint_url: 'https://assistant.example.test/webhook/gchat',
+      },
       gcp_project_id: 'assistant-project',
       gcp_account: 'operator@example.test',
       gchat_service_account: 'gws-ea-chat@assistant-project.iam.gserviceaccount.com',
       workspace_email: 'assistant@example.test',
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
+    },
+  };
+}
+
+function managedReservation(paths: ControlPlanePaths, instanceId = allocateInstanceId()): InstanceReservationInput {
+  const input = reservation(paths, instanceId);
+  return {
+    ...input,
+    exclusive_resource_claims: {
+      ...input.exclusive_resource_claims,
+      ingress: {
+        mode: 'managed-cloudflare',
+        account_id: 'a'.repeat(32),
+        zone_id: 'b'.repeat(32),
+        zone_name: 'example.com',
+        hostname: 'assistant.example.com',
+        callback_url: 'https://assistant.example.com/webhook/gchat',
+        dns_record_id: null,
+      },
     },
   };
 }
@@ -71,7 +93,7 @@ function createArgs(): string[] {
 function createSetupInput() {
   return {
     sourceRemote: 'https://example.test/nanoclaw.git',
-    endpoint: 'https://assistant.example.test/webhook/gchat',
+    ingress: { mode: 'existing', endpointUrl: 'https://assistant.example.test/webhook/gchat' },
     assistantWorkspaceEmail: 'assistant@example.test',
     bootstrapManifest: {
       schema_version: 1,
@@ -211,10 +233,114 @@ describe('machine registry', () => {
     expect((await readRegistry(paths)).instances[input.instance_id]).toEqual(input);
   });
 
+  it('records one non-secret shared Cloudflare owner for managed reservations', async () => {
+    const paths = await testPaths();
+    const tokenCanary = 'cloudflare-account-token-canary';
+    const input = managedReservation(paths);
+    await reserveInstance(paths, input);
+
+    const registry = await readRegistry(paths);
+    expect(registry.instances[input.instance_id]).toEqual(input);
+    expect(registry.shared_infrastructure_metadata.cloudflare).toMatchObject({
+      account_id: 'a'.repeat(32),
+      tunnel_id: null,
+    });
+    expect(registry.shared_infrastructure_metadata.cloudflare?.ownership_id).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(await readFile(paths.registryFile, 'utf8')).not.toContain(tokenCanary);
+  });
+
+  it('rejects a second managed account and duplicate managed identity before publishing it', async () => {
+    const paths = await testPaths();
+    const first = managedReservation(paths);
+    await reserveInstance(paths, first);
+
+    const duplicate = managedReservation(paths);
+    duplicate.allocated_ports.nanoclaw_webhook += 100;
+    duplicate.allocated_ports.onecli_app += 100;
+    duplicate.allocated_ports.onecli_gateway += 100;
+    duplicate.exclusive_resource_claims.gcp_project_id = 'second-project';
+    duplicate.exclusive_resource_claims.gchat_service_account = 'gws-ea-chat@second-project.iam.gserviceaccount.com';
+    duplicate.exclusive_resource_claims.workspace_email = 'second@example.test';
+    await expect(reserveInstance(paths, duplicate)).rejects.toMatchObject({ code: 'claim_conflict' });
+
+    const crossAccount = managedReservation(paths);
+    crossAccount.allocated_ports.nanoclaw_webhook += 200;
+    crossAccount.allocated_ports.onecli_app += 200;
+    crossAccount.allocated_ports.onecli_gateway += 200;
+    crossAccount.exclusive_resource_claims.gcp_project_id = 'third-project';
+    crossAccount.exclusive_resource_claims.gchat_service_account = 'gws-ea-chat@third-project.iam.gserviceaccount.com';
+    crossAccount.exclusive_resource_claims.workspace_email = 'third@example.test';
+    if (crossAccount.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare') {
+      throw new Error('managed reservation fixture is invalid');
+    }
+    crossAccount.exclusive_resource_claims.ingress = {
+      ...crossAccount.exclusive_resource_claims.ingress,
+      account_id: 'c'.repeat(32),
+      zone_id: 'd'.repeat(32),
+      zone_name: 'example.net',
+      hostname: 'third.example.net',
+      callback_url: 'https://third.example.net/webhook/gchat',
+    };
+    await expect(reserveInstance(paths, crossAccount)).rejects.toMatchObject({ code: 'cloudflare_account_conflict' });
+    expect(Object.keys((await readRegistry(paths)).instances)).toEqual([first.instance_id]);
+  });
+
+  it('rejects inconsistent managed callbacks and secret-shaped shared metadata', async () => {
+    const paths = await testPaths();
+    const invalid = managedReservation(paths);
+    if (invalid.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare') {
+      throw new Error('managed reservation fixture is invalid');
+    }
+    invalid.exclusive_resource_claims.ingress = {
+      ...invalid.exclusive_resource_claims.ingress,
+      callback_url: 'https://other.example.com/webhook/gchat',
+    };
+    await expect(reserveInstance(paths, invalid)).rejects.toMatchObject({ code: 'invalid_claim' });
+
+    const nestedHostname = managedReservation(paths);
+    if (nestedHostname.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare') {
+      throw new Error('managed reservation fixture is invalid');
+    }
+    nestedHostname.exclusive_resource_claims.ingress = {
+      ...nestedHostname.exclusive_resource_claims.ingress,
+      hostname: 'nested.assistant.example.com',
+      callback_url: 'https://nested.assistant.example.com/webhook/gchat',
+    };
+    await expect(reserveInstance(paths, nestedHostname)).rejects.toMatchObject({ code: 'invalid_claim' });
+
+    await mkdir(paths.configRoot, { recursive: true, mode: 0o700 });
+    await writeFile(
+      paths.registryFile,
+      JSON.stringify({
+        schema_version: 2,
+        instances: {},
+        shared_infrastructure_metadata: {
+          cloudflare: {
+            ownership_id: allocateInstanceId(),
+            account_id: 'a'.repeat(32),
+            tunnel_name: 'gws-ea-owner',
+            tunnel_id: null,
+            token: 'must-not-be-accepted',
+          },
+        },
+      }),
+      { mode: 0o600 },
+    );
+    await expect(readRegistry(paths)).rejects.toThrow(/unknown or missing fields/i);
+  });
+
   it.each([
     ['corrupt JSON', '{not-json'],
     ['an unknown schema', JSON.stringify({ schema_version: 99, instances: {} })],
-    ['an unvalidated field', JSON.stringify({ schema_version: 1, instances: {}, surprise: true })],
+    [
+      'an unvalidated field',
+      JSON.stringify({
+        schema_version: 2,
+        instances: {},
+        shared_infrastructure_metadata: { cloudflare: null },
+        surprise: true,
+      }),
+    ],
   ])('stops mutation for %s', async (_label, contents) => {
     const paths = await testPaths();
     await mkdir(paths.configRoot, { recursive: true, mode: 0o700 });
@@ -303,6 +429,37 @@ describe('machine registry', () => {
 });
 
 describe('create recovery contract', () => {
+  it('clears run-scoped Cloudflare authority when create exits', async () => {
+    const paths = await testPaths();
+    const clearAccountToken = vi.fn();
+    const discoverZones = vi.fn();
+
+    expect(
+      await runCli(createArgs(), {
+        paths,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        ...productionRuntime(),
+        advanceProvision: async () => ({
+          status: 'paused',
+          pause: {
+            kind: 'human-action',
+            phase: 'configure_channel',
+            code: 'chat_configuration_required',
+            message: 'Configure Google Chat.',
+          },
+        }),
+        managedIngressSetup: {
+          discoverZones,
+          retainAccountToken: vi.fn(),
+          clearAccountToken,
+        },
+      }),
+    ).toBe(0);
+    expect(discoverZones).not.toHaveBeenCalled();
+    expect(clearAccountToken).toHaveBeenCalledOnce();
+  });
+
   it('checks gcloud before allocating or printing an instance ID', async () => {
     const paths = await testPaths();
     const stdout: string[] = [];

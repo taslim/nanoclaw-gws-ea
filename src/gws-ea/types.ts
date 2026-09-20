@@ -1,4 +1,4 @@
-export const REGISTRY_SCHEMA_VERSION = 1 as const;
+export const REGISTRY_SCHEMA_VERSION = 2 as const;
 export const INSTANCE_MARKER_SCHEMA_VERSION = 1 as const;
 export const PROVISION_JOURNAL_SCHEMA_VERSION = 1 as const;
 
@@ -23,8 +23,36 @@ export interface AllocatedPorts {
   onecli_gateway: number;
 }
 
-export interface ExclusiveResourceClaims {
+export interface ExistingIngressClaim {
+  mode: 'existing';
   endpoint_url: string;
+}
+
+export interface ManagedCloudflareIngressClaim {
+  mode: 'managed-cloudflare';
+  account_id: string;
+  zone_id: string;
+  zone_name: string;
+  hostname: string;
+  callback_url: string;
+  dns_record_id: string | null;
+}
+
+export type IngressClaim = ExistingIngressClaim | ManagedCloudflareIngressClaim;
+
+export interface SharedCloudflareMetadata {
+  ownership_id: string;
+  account_id: string;
+  tunnel_name: string;
+  tunnel_id: string | null;
+}
+
+export interface SharedInfrastructureMetadata {
+  cloudflare: SharedCloudflareMetadata | null;
+}
+
+export interface ExclusiveResourceClaims {
+  ingress: IngressClaim;
   gcp_project_id: string;
   gcp_account: string;
   gchat_service_account: string;
@@ -47,6 +75,11 @@ export type InstanceReservation = Readonly<InstanceReservationInput>;
 export interface InstanceRegistry {
   schema_version: typeof REGISTRY_SCHEMA_VERSION;
   instances: Record<string, InstanceReservation>;
+  shared_infrastructure_metadata: SharedInfrastructureMetadata;
+}
+
+export function ingressEndpointUrl(claim: IngressClaim): string {
+  return claim.mode === 'existing' ? claim.endpoint_url : claim.callback_url;
 }
 
 export interface InstanceMarker {

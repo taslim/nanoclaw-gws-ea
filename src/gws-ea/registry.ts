@@ -20,10 +20,13 @@ import {
   REGISTRY_SCHEMA_VERSION,
   type AllocatedPorts,
   type ExclusiveResourceClaims,
+  type IngressClaim,
   type InstanceMarker,
   type InstanceRegistry,
   type InstanceReservation,
   type InstanceReservationInput,
+  type SharedCloudflareMetadata,
+  type SharedInfrastructureMetadata,
 } from './types.js';
 import { hasControlCharacters, isRecord } from './validation.js';
 
@@ -32,6 +35,10 @@ const RELEASE_TRACK_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 const ONECLI_PROJECT_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const CLOUDFLARE_ID_PATTERN = /^[0-9a-f]{32}$/;
+const DNS_LABEL = '[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?';
+const DNS_NAME_PATTERN = new RegExp(`^(?:${DNS_LABEL}\\.)+${DNS_LABEL}$`);
+const TUNNEL_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 function assertExactKeys(value: Record<string, unknown>, expected: readonly string[], label: string): void {
   const actual = Object.keys(value).sort();
@@ -89,6 +96,59 @@ function validateEndpoint(value: unknown): string {
   }
 }
 
+function requireCloudflareId(value: unknown, label: string): string {
+  const id = requireString(value, label, 32).toLowerCase();
+  if (!CLOUDFLARE_ID_PATTERN.test(id)) throw new GwsEaError('invalid_claim', `${label} is invalid`);
+  return id;
+}
+
+function validateIngress(value: unknown): IngressClaim {
+  if (!isRecord(value)) throw new GwsEaError('invalid_claim', 'ingress is invalid');
+  if (value.mode === 'existing') {
+    assertExactKeys(value, ['mode', 'endpoint_url'], 'existing ingress');
+    return { mode: 'existing', endpoint_url: validateEndpoint(value.endpoint_url) };
+  }
+  if (value.mode !== 'managed-cloudflare') {
+    throw new GwsEaError('invalid_claim', 'Ingress mode is invalid');
+  }
+  assertExactKeys(
+    value,
+    ['mode', 'account_id', 'zone_id', 'zone_name', 'hostname', 'callback_url', 'dns_record_id'],
+    'managed Cloudflare ingress',
+  );
+  const accountId = requireCloudflareId(value.account_id, 'Cloudflare account ID');
+  const zoneId = requireCloudflareId(value.zone_id, 'Cloudflare zone ID');
+  const zoneName = requireString(value.zone_name, 'Cloudflare zone name', 253);
+  const hostname = requireString(value.hostname, 'Cloudflare hostname', 253);
+  if (
+    zoneName !== zoneName.toLowerCase() ||
+    hostname !== hostname.toLowerCase() ||
+    !DNS_NAME_PATTERN.test(zoneName) ||
+    !DNS_NAME_PATTERN.test(hostname) ||
+    !hostname.endsWith(`.${zoneName}`) ||
+    hostname.slice(0, -(zoneName.length + 1)).includes('.')
+  ) {
+    throw new GwsEaError('invalid_claim', 'Managed hostname must be one first-level label in the selected zone');
+  }
+  const callbackUrl = validateEndpoint(value.callback_url);
+  if (callbackUrl !== `https://${hostname}/webhook/gchat`) {
+    throw new GwsEaError('invalid_claim', 'Managed callback does not match its claimed hostname');
+  }
+  let dnsRecordId: string | null = null;
+  if (value.dns_record_id !== null) {
+    dnsRecordId = requireCloudflareId(value.dns_record_id, 'Cloudflare DNS record ID');
+  }
+  return {
+    mode: 'managed-cloudflare',
+    account_id: accountId,
+    zone_id: zoneId,
+    zone_name: zoneName,
+    hostname,
+    callback_url: callbackUrl,
+    dns_record_id: dnsRecordId,
+  };
+}
+
 function validateSourceRemote(value: unknown): string {
   const remote = requireString(value, 'source_remote');
   try {
@@ -107,7 +167,7 @@ function validateClaims(value: unknown): ExclusiveResourceClaims {
   if (!isRecord(value)) throw new GwsEaError('invalid_claim', 'exclusive_resource_claims is invalid');
   assertExactKeys(
     value,
-    ['endpoint_url', 'gcp_project_id', 'gcp_account', 'gchat_service_account', 'workspace_email', 'onecli_project'],
+    ['ingress', 'gcp_project_id', 'gcp_account', 'gchat_service_account', 'workspace_email', 'onecli_project'],
     'exclusive_resource_claims',
   );
   const gcpProject = requireString(value.gcp_project_id, 'gcp_project_id', 30).toLowerCase();
@@ -125,13 +185,45 @@ function validateClaims(value: unknown): ExclusiveResourceClaims {
     throw new GwsEaError('invalid_claim', 'OneCLI project identity is invalid');
   }
   return {
-    endpoint_url: validateEndpoint(value.endpoint_url),
+    ingress: validateIngress(value.ingress),
     gcp_project_id: gcpProject,
     gcp_account: gcpAccount,
     gchat_service_account: serviceAccount,
     workspace_email: workspaceEmail,
     onecli_project: onecliProject,
   };
+}
+
+function validateSharedCloudflare(value: unknown): SharedCloudflareMetadata | null {
+  if (value === null) return null;
+  if (!isRecord(value)) throw new GwsEaError('invalid_registry', 'Shared Cloudflare metadata is invalid');
+  assertExactKeys(value, ['ownership_id', 'account_id', 'tunnel_name', 'tunnel_id'], 'Shared Cloudflare metadata');
+  const ownershipId = requireString(value.ownership_id, 'Cloudflare ownership ID', 36);
+  assertInstanceId(ownershipId);
+  const accountId = requireCloudflareId(value.account_id, 'Cloudflare account ID');
+  const tunnelName = requireString(value.tunnel_name, 'Cloudflare tunnel name', 63);
+  if (tunnelName !== `gws-ea-${ownershipId.replaceAll('-', '')}`) {
+    throw new GwsEaError('invalid_registry', 'Shared Cloudflare tunnel name does not match its ownership ID');
+  }
+  let tunnelId: string | null = null;
+  if (value.tunnel_id !== null) {
+    tunnelId = requireString(value.tunnel_id, 'Cloudflare tunnel ID', 36).toLowerCase();
+    if (!TUNNEL_ID_PATTERN.test(tunnelId)) {
+      throw new GwsEaError('invalid_registry', 'Cloudflare tunnel ID is invalid');
+    }
+  }
+  return {
+    ownership_id: ownershipId,
+    account_id: accountId,
+    tunnel_name: tunnelName,
+    tunnel_id: tunnelId,
+  };
+}
+
+function validateSharedInfrastructure(value: unknown): SharedInfrastructureMetadata {
+  if (!isRecord(value)) throw new GwsEaError('invalid_registry', 'Shared infrastructure metadata is invalid');
+  assertExactKeys(value, ['cloudflare'], 'Shared infrastructure metadata');
+  return { cloudflare: validateSharedCloudflare(value.cloudflare) };
 }
 
 export function validateReservation(value: unknown, paths: ControlPlanePaths): InstanceReservation {
@@ -173,7 +265,7 @@ export function validateReservation(value: unknown, paths: ControlPlanePaths): I
 
 function validateRegistry(value: unknown, paths: ControlPlanePaths): InstanceRegistry {
   if (!isRecord(value)) throw new GwsEaError('invalid_registry', 'Machine registry is invalid');
-  assertExactKeys(value, ['schema_version', 'instances'], 'Machine registry');
+  assertExactKeys(value, ['schema_version', 'instances', 'shared_infrastructure_metadata'], 'Machine registry');
   if (value.schema_version !== REGISTRY_SCHEMA_VERSION) {
     throw new GwsEaError('unsupported_registry', 'Machine registry schema version is unsupported');
   }
@@ -186,11 +278,32 @@ function validateRegistry(value: unknown, paths: ControlPlanePaths): InstanceReg
     instances[key] = parsed;
   }
   assertNoClaimCollisions(Object.values(instances));
-  return { schema_version: REGISTRY_SCHEMA_VERSION, instances };
+  const sharedInfrastructure = validateSharedInfrastructure(value.shared_infrastructure_metadata);
+  const managedAccounts = new Set(
+    Object.values(instances)
+      .map((instance) => instance.exclusive_resource_claims.ingress)
+      .filter((ingress) => ingress.mode === 'managed-cloudflare')
+      .map((ingress) => ingress.account_id),
+  );
+  if (managedAccounts.size > 1) {
+    throw new GwsEaError('invalid_registry', 'Managed Cloudflare claims span more than one account');
+  }
+  if (managedAccounts.size === 1 && sharedInfrastructure.cloudflare?.account_id !== [...managedAccounts][0]) {
+    throw new GwsEaError('invalid_registry', 'Managed Cloudflare claims disagree with shared infrastructure');
+  }
+  return {
+    schema_version: REGISTRY_SCHEMA_VERSION,
+    instances,
+    shared_infrastructure_metadata: sharedInfrastructure,
+  };
 }
 
 function emptyRegistry(): InstanceRegistry {
-  return { schema_version: REGISTRY_SCHEMA_VERSION, instances: {} };
+  return {
+    schema_version: REGISTRY_SCHEMA_VERSION,
+    instances: {},
+    shared_infrastructure_metadata: { cloudflare: null },
+  };
 }
 
 async function readRegistryFile(paths: ControlPlanePaths): Promise<InstanceRegistry> {
@@ -217,15 +330,50 @@ export async function readRegistry(paths: ControlPlanePaths): Promise<InstanceRe
 
 function claimKeys(instance: InstanceReservation): string[] {
   const claims = instance.exclusive_resource_claims;
-  return [
+  const keys = [
     `checkout:${instance.checkout_realpath}`,
     ...Object.values(instance.allocated_ports).map((port) => `port:${port}`),
-    `endpoint:${claims.endpoint_url}`,
+    `endpoint:${claims.ingress.mode === 'existing' ? claims.ingress.endpoint_url : claims.ingress.callback_url}`,
     `gcp-project:${claims.gcp_project_id}`,
     `gchat-service-account:${claims.gchat_service_account}`,
     `workspace-email:${claims.workspace_email}`,
     `onecli-project:${claims.onecli_project}`,
   ];
+  if (claims.ingress.mode === 'managed-cloudflare') {
+    keys.push(
+      `hostname:${claims.ingress.hostname}`,
+      `dns:${claims.ingress.zone_id}:${claims.ingress.hostname}`,
+      `route:${claims.ingress.hostname}:/webhook/gchat`,
+    );
+    if (claims.ingress.dns_record_id) keys.push(`dns-record-id:${claims.ingress.dns_record_id}`);
+  }
+  return keys;
+}
+
+function sharedInfrastructureForReservation(
+  current: SharedInfrastructureMetadata,
+  reservation: InstanceReservation,
+): SharedInfrastructureMetadata {
+  const ingress = reservation.exclusive_resource_claims.ingress;
+  if (ingress.mode === 'existing') return current;
+  if (current.cloudflare) {
+    if (current.cloudflare.account_id !== ingress.account_id) {
+      throw new GwsEaError(
+        'cloudflare_account_conflict',
+        'Managed Cloudflare ingress on this machine already belongs to another account',
+      );
+    }
+    return current;
+  }
+  const ownershipId = randomUUID();
+  return {
+    cloudflare: {
+      ownership_id: ownershipId,
+      account_id: ingress.account_id,
+      tunnel_name: `gws-ea-${ownershipId.replaceAll('-', '')}`,
+      tunnel_id: null,
+    },
+  };
 }
 
 function assertNoClaimCollisions(instances: readonly InstanceReservation[]): void {
@@ -265,9 +413,11 @@ export async function reserveInstance(
       throw new GwsEaError('instance_exists', 'Instance ID already exists');
     }
     assertNoClaimCollisions([...Object.values(registry.instances), validated]);
+    const sharedInfrastructure = sharedInfrastructureForReservation(registry.shared_infrastructure_metadata, validated);
     const next: InstanceRegistry = {
       schema_version: REGISTRY_SCHEMA_VERSION,
       instances: { ...registry.instances, [validated.instance_id]: validated },
+      shared_infrastructure_metadata: sharedInfrastructure,
     };
     await writePrivate(paths.registryFile, next);
     return validated;
@@ -302,7 +452,11 @@ export async function releaseInstanceReservation(
     }
     const instances = { ...registry.instances };
     delete instances[validated.instance_id];
-    await writePrivate(paths.registryFile, { schema_version: REGISTRY_SCHEMA_VERSION, instances });
+    await writePrivate(paths.registryFile, {
+      schema_version: REGISTRY_SCHEMA_VERSION,
+      instances,
+      shared_infrastructure_metadata: registry.shared_infrastructure_metadata,
+    });
   } finally {
     release();
   }

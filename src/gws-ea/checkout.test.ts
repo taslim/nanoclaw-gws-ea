@@ -86,7 +86,7 @@ function reservation(
     deployed_commit: deployedCommit,
     allocated_ports: { nanoclaw_webhook: 33_001, onecli_app: 33_002, onecli_gateway: 33_003 },
     exclusive_resource_claims: {
-      endpoint_url: 'https://checkout.example.test/webhook/gchat',
+      ingress: { mode: 'existing', endpoint_url: 'https://checkout.example.test/webhook/gchat' },
       gcp_project_id: 'checkout-project',
       gcp_account: 'operator@example.test',
       gchat_service_account: 'gws-ea-chat@checkout-project.iam.gserviceaccount.com',

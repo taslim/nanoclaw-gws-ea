@@ -18,7 +18,7 @@ import { readOwnerOnlyFile, writePrivateTextFile } from './secrets.js';
 import { createInstanceServiceCoordinates, type InstanceServicePlatform } from './service-coordinates.js';
 import { validateExistingGchatEndpoint } from './endpoint.js';
 import { assertInstanceId } from './registry.js';
-import { GwsEaError, type AllocatedPorts, type InstanceReservation } from './types.js';
+import { GwsEaError, ingressEndpointUrl, type AllocatedPorts, type InstanceReservation } from './types.js';
 import { hasControlCharacters } from './validation.js';
 
 export const INSTANCE_RUNTIME_SCHEMA_VERSION = 1 as const;
@@ -148,7 +148,7 @@ export function createInstanceRuntimeConfig(
     onecli_gateway_container: `${onecli.project}-gateway-1`,
     onecli_cli_path: onecli.cliExecutable,
     selected_provider: input.selectedProvider.toLowerCase(),
-    endpoint_url: reservation.exclusive_resource_claims.endpoint_url,
+    endpoint_url: ingressEndpointUrl(reservation.exclusive_resource_claims.ingress),
     secret_files: expectedSecretFiles(checkout),
   };
   validateRuntimeConfig(config);

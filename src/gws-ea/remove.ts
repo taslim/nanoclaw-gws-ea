@@ -20,7 +20,7 @@ import {
 import { removePrivateFile } from './secrets.js';
 import { loadInstanceRuntimeConfig } from './service.js';
 import { createInstanceServiceCoordinates, type InstanceServicePlatform } from './service-coordinates.js';
-import { GwsEaError, type InstanceReservation } from './types.js';
+import { GwsEaError, ingressEndpointUrl, type InstanceReservation } from './types.js';
 import { isRecord } from './validation.js';
 
 const REMOVAL_SCHEMA_VERSION = 1 as const;
@@ -290,7 +290,7 @@ export async function describeRemoval(paths: ControlPlanePaths, instanceId: stri
     gcpProject: claims.gcp_project_id,
     gcpAccount: claims.gcp_account,
     onecliProject: claims.onecli_project,
-    endpoint: claims.endpoint_url,
+    endpoint: ingressEndpointUrl(claims.ingress),
   };
 }
 

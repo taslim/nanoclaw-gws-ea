@@ -61,7 +61,7 @@ function reservation(
     deployed_commit: 'a'.repeat(40),
     allocated_ports: allocatedPorts,
     exclusive_resource_claims: {
-      endpoint_url: 'https://assistant.example.com/webhook/gchat',
+      ingress: { mode: 'existing', endpoint_url: 'https://assistant.example.com/webhook/gchat' },
       gcp_project_id: 'gws-ea-dogfood',
       gcp_account: 'operator@example.com',
       gchat_service_account: 'gws-ea-chat@gws-ea-dogfood.iam.gserviceaccount.com',
@@ -738,7 +738,7 @@ describe('production provision phase composition', () => {
           details: [
             'App name: Aya',
             expect.stringContaining('avatar'),
-            expect.stringContaining(reserved.exclusive_resource_claims.endpoint_url),
+            expect.stringContaining('https://assistant.example.com/webhook/gchat'),
             expect.stringContaining('visibility'),
           ],
           actionUrl: expect.stringContaining(`project=${reserved.exclusive_resource_claims.gcp_project_id}`),

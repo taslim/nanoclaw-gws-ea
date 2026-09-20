@@ -32,7 +32,7 @@ describe('Google Chat configuration confirmation', () => {
       deployed_commit: 'a'.repeat(40),
       allocated_ports: { nanoclaw_webhook: 43_001, onecli_app: 43_002, onecli_gateway: 43_003 },
       exclusive_resource_claims: {
-        endpoint_url: 'https://assistant.example.test/webhook/gchat',
+        ingress: { mode: 'existing', endpoint_url: 'https://assistant.example.test/webhook/gchat' },
         gcp_project_id: projectId,
         gcp_account: 'operator@example.test',
         gchat_service_account: `gws-ea-chat@${projectId}.iam.gserviceaccount.com`,

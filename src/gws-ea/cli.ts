@@ -1,6 +1,11 @@
 import * as prompts from '@clack/prompts';
 import { resolveReleaseCommit, type ResolvedRelease } from './checkout.js';
-import { CREATE_SETUP_FIELDS, type CreatePromptContext, type CreateSetupAnswers } from './create-input.js';
+import {
+  CREATE_SETUP_FIELDS,
+  type CreatePromptContext,
+  type CreateSetupAnswers,
+  type ManagedIngressSetupSession,
+} from './create-input.js';
 import {
   acquireInstanceOperation,
   ensureProvisionJournal,
@@ -52,6 +57,7 @@ export interface CliRuntime {
   describeRemoval?: typeof describeRemoval;
   removeAssistant?: typeof removeAssistant;
   confirmRemoval?: (preview: RemovalPreview) => Promise<boolean>;
+  managedIngressSetup?: ManagedIngressSetupSession;
 }
 
 const CREATE_OPTIONS = ['track', ...CREATE_SETUP_FIELDS] as const;
@@ -112,7 +118,18 @@ function createReservation(
     deployed_commit: production.commit,
     allocated_ports: production.ports,
     exclusive_resource_claims: {
-      endpoint_url: setup.endpoint,
+      ingress:
+        setup.ingress.mode === 'existing'
+          ? { mode: 'existing', endpoint_url: setup.ingress.endpointUrl }
+          : {
+              mode: 'managed-cloudflare',
+              account_id: setup.ingress.accountId,
+              zone_id: setup.ingress.zoneId,
+              zone_name: setup.ingress.zoneName,
+              hostname: setup.ingress.hostname,
+              callback_url: setup.ingress.callbackUrl,
+              dns_record_id: null,
+            },
       gcp_project_id: gcpProjectId,
       gcp_account: production.gcpAccount,
       gchat_service_account: deriveGchatServiceAccountEmail(gcpProjectId),
@@ -174,6 +191,7 @@ async function createAssistant(
   collectInputs: (context: CreatePromptContext) => Promise<CreateSetupAnswers>,
   persistReservation: typeof reserveInstance,
   checkGcloud: () => Promise<{ readonly account: string }>,
+  managedIngressSetup?: ManagedIngressSetupSession,
 ): Promise<number> {
   let track: string | undefined;
   let instanceId: string | undefined;
@@ -185,7 +203,7 @@ async function createAssistant(
     const gcloud = await checkGcloud();
     instanceId = allocateInstanceId();
     output(`instance_id: ${instanceId}`);
-    const setup = await collectInputs({ instanceId, track, provided: parsed });
+    const setup = await collectInputs({ instanceId, track, provided: parsed, managedIngressSetup });
     const resolved = await resolveRelease(setup.sourceRemote, `refs/heads/${track}`);
     const bootstrapManifest: ProductionBootstrapManifest = validateProductionBootstrapManifest(setup.bootstrapManifest);
     const held = await allocatePorts();
@@ -380,19 +398,24 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
     return 0;
   }
   if (args[0] === 'create') {
-    return createAssistant(
-      args.slice(1),
-      paths,
-      output,
-      errorOutput,
-      initializeJournal,
-      advanceProvision,
-      resolveRelease,
-      allocatePorts,
-      collectInputs,
-      persistReservation,
-      checkGcloud,
-    );
+    try {
+      return await createAssistant(
+        args.slice(1),
+        paths,
+        output,
+        errorOutput,
+        initializeJournal,
+        advanceProvision,
+        resolveRelease,
+        allocatePorts,
+        collectInputs,
+        persistReservation,
+        checkGcloud,
+        runtime.managedIngressSetup,
+      );
+    } finally {
+      runtime.managedIngressSetup?.clearAccountToken();
+    }
   }
   if (args[0] === 'resume') {
     return resumeAssistant(

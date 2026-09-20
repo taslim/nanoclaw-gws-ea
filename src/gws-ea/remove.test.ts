@@ -35,7 +35,7 @@ async function fixture(): Promise<{ paths: ControlPlanePaths; input: InstanceRes
     deployed_commit: 'a'.repeat(40),
     allocated_ports: { nanoclaw_webhook: 32_001, onecli_app: 32_002, onecli_gateway: 32_003 },
     exclusive_resource_claims: {
-      endpoint_url: 'https://assistant.example.test/webhook/gchat',
+      ingress: { mode: 'existing', endpoint_url: 'https://assistant.example.test/webhook/gchat' },
       gcp_project_id: projectId,
       gcp_account: 'operator@example.test',
       gchat_service_account: `gws-ea-chat@${projectId}.iam.gserviceaccount.com`,
@@ -130,13 +130,13 @@ describe('assistant removal', () => {
   it('leaves a peer reservation untouched', async () => {
     const { paths, input } = await fixture();
     const peer = (await fixture()).input;
-    const peerForSameRegistry = {
+    const peerForSameRegistry: InstanceReservationInput = {
       ...peer,
       checkout_realpath: paths.checkoutRoot(peer.instance_id),
       allocated_ports: { nanoclaw_webhook: 42_001, onecli_app: 42_002, onecli_gateway: 42_003 },
       exclusive_resource_claims: {
         ...peer.exclusive_resource_claims,
-        endpoint_url: 'https://peer.example.test/webhook/gchat',
+        ingress: { mode: 'existing', endpoint_url: 'https://peer.example.test/webhook/gchat' },
         workspace_email: 'peer@example.test',
       },
     };
