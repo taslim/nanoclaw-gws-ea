@@ -148,7 +148,7 @@ describe('Cloudflare REST boundary', () => {
     await expect(api.createTunnel(ACCOUNT_ID, TOKEN)).rejects.not.toThrow(TOKEN);
   });
 
-  it('uses exact current mutation bodies and PATCH semantics', async () => {
+  it('uses exact current mutation bodies', async () => {
     const requests: Array<{ path: string; method: string; body: unknown }> = [];
     const record = {
       type: 'CNAME' as const,
@@ -163,7 +163,7 @@ describe('Cloudflare REST boundary', () => {
       if (path.endsWith('/cfd_tunnel')) {
         return envelope({ id: TUNNEL_ID, name: 'gws-ea-owned', config_src: 'cloudflare', status: 'inactive' });
       }
-      if (path.endsWith('/dns_records') || path.endsWith(`/dns_records/${'c'.repeat(32)}`)) {
+      if (path.endsWith('/dns_records')) {
         return envelope({ id: 'c'.repeat(32), ...record });
       }
       return envelope({ id: TUNNEL_ID });
@@ -172,7 +172,6 @@ describe('Cloudflare REST boundary', () => {
 
     await api.createTunnel(ACCOUNT_ID, 'gws-ea-owned');
     await api.createDnsRecord(ZONE_ID, record);
-    await api.updateDnsRecord(ZONE_ID, 'c'.repeat(32), record);
 
     expect(requests).toEqual([
       {
@@ -181,7 +180,6 @@ describe('Cloudflare REST boundary', () => {
         body: { name: 'gws-ea-owned', config_src: 'cloudflare' },
       },
       { path: `/client/v4/zones/${ZONE_ID}/dns_records`, method: 'POST', body: record },
-      { path: `/client/v4/zones/${ZONE_ID}/dns_records/${'c'.repeat(32)}`, method: 'PATCH', body: record },
     ]);
   });
 

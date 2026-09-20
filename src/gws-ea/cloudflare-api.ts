@@ -86,7 +86,6 @@ export interface CloudflareApi {
   listTunnelConnections(accountId: string, tunnelId: string): Promise<readonly CloudflareTunnelConnection[]>;
   listDnsRecords(zoneId: string, name: string): Promise<readonly CloudflareDnsRecord[]>;
   createDnsRecord(zoneId: string, record: CloudflareDnsRecordWrite): Promise<CloudflareDnsRecord>;
-  updateDnsRecord(zoneId: string, recordId: string, record: CloudflareDnsRecordWrite): Promise<CloudflareDnsRecord>;
   deleteDnsRecord(zoneId: string, recordId: string): Promise<void>;
   deleteTunnel(accountId: string, tunnelId: string): Promise<void>;
 }
@@ -536,19 +535,6 @@ class CloudflareApiClient implements CloudflareApi {
   async createDnsRecord(zoneId: string, record: CloudflareDnsRecordWrite): Promise<CloudflareDnsRecord> {
     const zone = requireAccountOrZoneId(zoneId, 'Cloudflare zone ID');
     const { result } = await this.#request('create the owned DNS record', 'POST', `/zones/${zone}/dns_records`, {
-      body: record,
-    });
-    return parseDnsRecord(result);
-  }
-
-  async updateDnsRecord(
-    zoneId: string,
-    recordId: string,
-    record: CloudflareDnsRecordWrite,
-  ): Promise<CloudflareDnsRecord> {
-    const zone = requireAccountOrZoneId(zoneId, 'Cloudflare zone ID');
-    const id = requireAccountOrZoneId(recordId, 'Cloudflare DNS record ID');
-    const { result } = await this.#request('update the owned DNS record', 'PATCH', `/zones/${zone}/dns_records/${id}`, {
       body: record,
     });
     return parseDnsRecord(result);

@@ -18,6 +18,7 @@ import {
   GwsEaError,
   INSTANCE_MARKER_SCHEMA_VERSION,
   REGISTRY_SCHEMA_VERSION,
+  ingressEndpointUrl,
   type AllocatedPorts,
   type ExclusiveResourceClaims,
   type IngressClaim,
@@ -357,7 +358,7 @@ function claimKeys(instance: InstanceReservation): string[] {
   const keys = [
     `checkout:${instance.checkout_realpath}`,
     ...Object.values(instance.allocated_ports).map((port) => `port:${port}`),
-    `endpoint:${claims.ingress.mode === 'existing' ? claims.ingress.endpoint_url : claims.ingress.callback_url}`,
+    `endpoint:${ingressEndpointUrl(claims.ingress)}`,
     `gcp-project:${claims.gcp_project_id}`,
     `gchat-service-account:${claims.gchat_service_account}`,
     `workspace-email:${claims.workspace_email}`,

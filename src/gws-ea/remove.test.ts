@@ -154,7 +154,6 @@ function cloudflareApi(overrides: Partial<CloudflareApi> = {}): CloudflareApi {
     listTunnelConnections: vi.fn(async () => []),
     listDnsRecords: vi.fn(),
     createDnsRecord: vi.fn(),
-    updateDnsRecord: vi.fn(),
     deleteDnsRecord: vi.fn(async () => undefined),
     deleteTunnel: vi.fn(async () => undefined),
     ...overrides,
