@@ -17,7 +17,7 @@ import { assertInstanceId } from './registry.js';
 import { GwsEaError } from './types.js';
 import { isRecord } from './validation.js';
 
-const INSTALL_URL = 'https://cloud.google.com/sdk/docs/install';
+export const GCLOUD_INSTALL_URL = 'https://cloud.google.com/sdk/docs/install';
 const PROJECT_LABEL_INSTANCE = 'gws-ea-instance';
 const PROJECT_LABEL_MANAGED = 'gws-ea-managed';
 const REQUIRED_APIS = ['chat.googleapis.com', 'iam.googleapis.com'] as const;
@@ -160,13 +160,13 @@ export async function preflightGcloud(input: GcloudPreflightInput): Promise<{ re
   } catch {
     throw new GwsEaError(
       'gcloud_required',
-      `Google Cloud CLI is required. Install it from ${INSTALL_URL}, then retry.`,
+      `Google Cloud CLI is required. Install it from ${GCLOUD_INSTALL_URL}, then retry.`,
     );
   }
   if (version.exitCode !== 0) {
     throw new GwsEaError(
       'gcloud_required',
-      `Google Cloud CLI is required. Install it from ${INSTALL_URL}, then retry.`,
+      `Google Cloud CLI is required. Install it from ${GCLOUD_INSTALL_URL}, then retry.`,
     );
   }
   const accounts = await run(input.cwd, ['auth', 'list', '--filter=status:ACTIVE', '--format=value(account)'], runner);

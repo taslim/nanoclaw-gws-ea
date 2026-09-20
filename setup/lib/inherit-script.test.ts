@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildInteractiveEnvironment } from './inherit-script.js';
+import { buildInteractiveEnvironment, runInheritScript } from './inherit-script.js';
 
 describe('interactive child environment', () => {
   it('preserves terminal and browser integration without inheriting ambient credentials', () => {
@@ -24,5 +24,9 @@ describe('interactive child environment', () => {
       DISPLAY: ':0',
       BROWSER: 'open',
     });
+  });
+
+  it('returns a nonzero result when an interactive child cannot start', async () => {
+    await expect(runInheritScript('/gws-ea-command-that-does-not-exist', [])).resolves.toBe(1);
   });
 });

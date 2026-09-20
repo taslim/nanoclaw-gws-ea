@@ -68,6 +68,16 @@ const defaultPrompts: PromptAdapter = {
 const CLOUDFLARE_ID_PATTERN = /^[0-9a-f]{32}$/u;
 const DNS_LABEL_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 const DNS_NAME_PATTERN = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
+const CLOUDFLARE_API_TOKEN_URL = 'https://dash.cloudflare.com/profile/api-tokens';
+export const CLOUDFLARE_API_TOKEN_GUIDANCE = [
+  'Create a scoped API token for the intended account and zone:',
+  'Account · Cloudflare Tunnel: Edit',
+  'Zone · Zone: Read',
+  'Zone · DNS: Edit',
+  CLOUDFLARE_API_TOKEN_URL,
+  '',
+  'The token is used only for this setup run and is not stored.',
+].join('\n');
 
 function cancelled(): never {
   throw new GwsEaError('cancelled', 'Assistant creation was cancelled');
@@ -256,6 +266,7 @@ async function collectIngress(
   if (!session) {
     throw new GwsEaError('managed_ingress_unavailable', 'Managed Cloudflare setup is unavailable in this release');
   }
+  prompts.note(CLOUDFLARE_API_TOKEN_GUIDANCE, 'Cloudflare access');
   const token = await askPassword(prompts, 'Cloudflare API token');
   const zones = validateDiscoveredZones(await session.discoverZones(token));
   const zone = await chooseZone(zones, prompts);

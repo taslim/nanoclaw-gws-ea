@@ -230,6 +230,7 @@ describe('GWS-EA interactive create input', () => {
     const password = vi.fn(async () => 'cloudflare-token-canary');
     const confirm = vi.fn(async () => true);
 
+    const note = vi.fn();
     const result = await collectGwsEaCreateInput(
       {
         instanceId: '11111111-1111-4111-8111-111111111111',
@@ -250,7 +251,7 @@ describe('GWS-EA interactive create input', () => {
         detectedTimezone: 'UTC',
         providerCapabilityDigest,
         prompts: {
-          note: vi.fn(),
+          note,
           text,
           password,
           confirm,
@@ -262,6 +263,12 @@ describe('GWS-EA interactive create input', () => {
     );
 
     expect(discoverZones).toHaveBeenCalledOnce();
+    const cloudflareGuidance = note.mock.calls.find((call) => call[1] === 'Cloudflare access')?.[0];
+    expect(cloudflareGuidance).toContain('https://dash.cloudflare.com/profile/api-tokens');
+    expect(cloudflareGuidance).toContain('Cloudflare Tunnel: Edit');
+    expect(cloudflareGuidance).toContain('Zone: Read');
+    expect(cloudflareGuidance).toContain('DNS: Edit');
+    expect(note.mock.invocationCallOrder[1]).toBeLessThan(password.mock.invocationCallOrder[0]!);
     expect(select).toHaveBeenCalledWith(
       expect.objectContaining({
         message: 'How should Google Chat reach this assistant?',

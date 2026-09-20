@@ -3,7 +3,8 @@ import * as prompts from '@clack/prompts';
 import { runCli } from '../src/gws-ea/cli.js';
 import { createManagedIngressSetupSession } from '../src/gws-ea/cloudflare-api.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
-import { authenticateGwsEaProvider, collectGwsEaCreateInput } from './gws-ea-input.js';
+import { authenticateGwsEaProvider, CLOUDFLARE_API_TOKEN_GUIDANCE, collectGwsEaCreateInput } from './gws-ea-input.js';
+import { ensureGcloudReady } from './gws-ea-prerequisites.js';
 import { listSetupProviders } from './providers/registry.js';
 import './providers/index.js';
 
@@ -12,6 +13,7 @@ const managedIngressSetup = createManagedIngressSetupSession();
 
 async function requestCloudflareAccountToken(accountId: string, observation: string): Promise<string> {
   prompts.log.warn(observation);
+  prompts.note(CLOUDFLARE_API_TOKEN_GUIDANCE, 'Cloudflare access');
   const answer = await prompts.password({
     message: 'Cloudflare API token for managed ingress',
     validate: (value) => (value?.trim() ? undefined : 'Required'),
@@ -34,6 +36,7 @@ async function requestCloudflareAccountToken(accountId: string, observation: str
 process.exitCode = await runCli(process.argv.slice(2), {
   collectCreateInputs: (context) => collectGwsEaCreateInput(context, { providers }),
   authenticateProvider: (provider) => authenticateGwsEaProvider(provider, providers),
+  preflightGcloud: () => ensureGcloudReady(process.cwd()),
   managedIngressSetup,
   requestCloudflareAccountToken,
 });
