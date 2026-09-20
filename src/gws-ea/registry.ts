@@ -400,6 +400,92 @@ async function acquireMachineLock(paths: ControlPlanePaths): Promise<() => void>
   throw new GwsEaError('registry_busy', 'The machine registry is busy; retry the command');
 }
 
+export interface CloudflareCoordinateUpdate {
+  readonly tunnelId?: string;
+  readonly dnsRecordIds?: Readonly<Record<string, string>>;
+}
+
+export interface LockedCloudflareRegistry {
+  readonly registry: InstanceRegistry;
+  updateCoordinates(update: CloudflareCoordinateUpdate): Promise<InstanceRegistry>;
+}
+
+/**
+ * Hold the machine registry lock across one shared Cloudflare reconciliation.
+ * The callback can persist only remote coordinates; it cannot rewrite claims.
+ */
+export async function withLockedCloudflareRegistry<T>(
+  paths: ControlPlanePaths,
+  callback: (locked: LockedCloudflareRegistry) => Promise<T>,
+): Promise<T> {
+  const release = await acquireMachineLock(paths);
+  try {
+    let current = await readRegistryFile(paths);
+    const locked: LockedCloudflareRegistry = {
+      get registry() {
+        return current;
+      },
+      async updateCoordinates(update) {
+        const cloudflare = current.shared_infrastructure_metadata.cloudflare;
+        if (!cloudflare) {
+          throw new GwsEaError('cloudflare_state_missing', 'Shared Cloudflare ownership is not reserved');
+        }
+        if (
+          update.tunnelId !== undefined &&
+          cloudflare.tunnel_id !== null &&
+          update.tunnelId !== cloudflare.tunnel_id
+        ) {
+          throw new GwsEaError('reservation_mismatch', 'Cloudflare tunnel coordinate changed; refusing replacement');
+        }
+        const tunnelId = update.tunnelId ?? cloudflare.tunnel_id;
+        if (tunnelId === null || !TUNNEL_ID_PATTERN.test(tunnelId)) {
+          throw new GwsEaError('invalid_claim', 'Cloudflare tunnel ID is invalid');
+        }
+        const instances = { ...current.instances };
+        for (const [instanceId, dnsRecordId] of Object.entries(update.dnsRecordIds ?? {})) {
+          assertInstanceId(instanceId);
+          if (!CLOUDFLARE_ID_PATTERN.test(dnsRecordId)) {
+            throw new GwsEaError('invalid_claim', 'Cloudflare DNS record ID is invalid');
+          }
+          const instance = instances[instanceId];
+          if (!instance || instance.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare') {
+            throw new GwsEaError('invalid_claim', 'Cloudflare DNS coordinate has no managed reservation');
+          }
+          if (
+            instance.exclusive_resource_claims.ingress.dns_record_id !== null &&
+            instance.exclusive_resource_claims.ingress.dns_record_id !== dnsRecordId
+          ) {
+            throw new GwsEaError('reservation_mismatch', 'Cloudflare DNS coordinate changed; refusing replacement');
+          }
+          instances[instanceId] = {
+            ...instance,
+            exclusive_resource_claims: {
+              ...instance.exclusive_resource_claims,
+              ingress: { ...instance.exclusive_resource_claims.ingress, dns_record_id: dnsRecordId },
+            },
+          };
+        }
+        const next = validateRegistry(
+          {
+            schema_version: REGISTRY_SCHEMA_VERSION,
+            instances,
+            shared_infrastructure_metadata: {
+              cloudflare: { ...cloudflare, tunnel_id: tunnelId },
+            },
+          },
+          paths,
+        );
+        await writePrivate(paths.registryFile, next);
+        current = next;
+        return current;
+      },
+    };
+    return await callback(locked);
+  } finally {
+    release();
+  }
+}
+
 export async function reserveInstance(
   paths: ControlPlanePaths,
   input: InstanceReservationInput,
