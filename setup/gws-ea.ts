@@ -13,7 +13,7 @@ const managedIngressSetup = createManagedIngressSetupSession();
 async function requestCloudflareAccountToken(accountId: string, observation: string): Promise<string> {
   prompts.log.warn(observation);
   const answer = await prompts.password({
-    message: 'Cloudflare API token for managed ingress repair',
+    message: 'Cloudflare API token for managed ingress',
     validate: (value) => (value?.trim() ? undefined : 'Required'),
   });
   if (prompts.isCancel(answer) || typeof answer !== 'string' || !answer.trim()) {

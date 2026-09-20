@@ -32,6 +32,7 @@ import { holdLoopbackPorts, type HeldLoopbackPorts } from './ports.js';
 import type { ProviderCredential } from '../provider-credential.js';
 
 type LineWriter = (line: string) => void;
+type RemoveAssistantRunner = (paths: ControlPlanePaths, instanceId: string) => Promise<void>;
 
 export interface CliRuntime {
   paths?: ControlPlanePaths;
@@ -51,7 +52,7 @@ export interface CliRuntime {
   preflightGcloud?: () => Promise<{ readonly account: string }>;
   confirmChatConfiguration?: typeof confirmChatConfiguration;
   describeRemoval?: typeof describeRemoval;
-  removeAssistant?: typeof removeAssistant;
+  removeAssistant?: RemoveAssistantRunner;
   confirmRemoval?: (preview: RemovalPreview) => Promise<boolean>;
   managedIngressSetup?: RetainedManagedIngressSetupSession;
   requestCloudflareAccountToken?: (accountId: string, observation: string) => Promise<string>;
@@ -327,7 +328,7 @@ async function removeAssistantCommand(
   output: LineWriter,
   errorOutput: LineWriter,
   inspect: typeof describeRemoval,
-  remove: typeof removeAssistant,
+  remove: RemoveAssistantRunner,
   confirm: (preview: RemovalPreview) => Promise<boolean>,
 ): Promise<number> {
   let instanceId: string | undefined;
@@ -341,7 +342,19 @@ async function removeAssistantCommand(
     output(`NanoClaw: ${preview.checkout}`);
     output(`OneCLI: ${preview.onecliProject}`);
     output(`Google Cloud project: ${preview.gcpProject} (${preview.gcpAccount})`);
-    output(`External endpoint: ${preview.endpoint} (operator-managed; disconnect separately)`);
+    if (preview.ingress.mode === 'existing') {
+      output(`External endpoint: ${preview.ingress.endpoint} (operator-managed; disconnect separately)`);
+    } else {
+      output(`Managed hostname: ${preview.ingress.hostname}`);
+      output(`Managed callback: ${preview.ingress.callback}`);
+      output(`Owned DNS record: ${preview.ingress.dnsRecordId ?? 'not created'}`);
+      output(`Owned tunnel route: ${preview.ingress.route}`);
+      output(
+        preview.ingress.sharedIngress === 'retained-for-peers'
+          ? 'Shared Cloudflare ingress: retained for other assistants'
+          : 'Shared Cloudflare ingress: retired after this final managed callback',
+      );
+    }
     if (!options.yes && !(await confirm(preview))) {
       output('Removal cancelled. Nothing was changed.');
       return 0;
@@ -392,7 +405,14 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
   const checkGcloud = runtime.preflightGcloud ?? (() => preflightGcloud({ cwd: process.cwd() }));
   const confirmConfigured = runtime.confirmChatConfiguration ?? confirmChatConfiguration;
   const inspectRemoval = runtime.describeRemoval ?? describeRemoval;
-  const remove = runtime.removeAssistant ?? removeAssistant;
+  const remove: RemoveAssistantRunner =
+    runtime.removeAssistant ??
+    ((targetPaths, instanceId) =>
+      removeAssistant(targetPaths, instanceId, {
+        ...(runtime.requestCloudflareAccountToken
+          ? { requestCloudflareAccountToken: runtime.requestCloudflareAccountToken }
+          : {}),
+      }));
   const confirm = runtime.confirmRemoval ?? defaultConfirmRemoval;
 
   if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
@@ -435,7 +455,11 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
     }
   }
   if (args[0] === 'remove') {
-    return removeAssistantCommand(args.slice(1), paths, output, errorOutput, inspectRemoval, remove, confirm);
+    try {
+      return await removeAssistantCommand(args.slice(1), paths, output, errorOutput, inspectRemoval, remove, confirm);
+    } finally {
+      runtime.managedIngressSetup?.clearAccountToken();
+    }
   }
   errorOutput('Unknown command.');
   printHelp(errorOutput);

@@ -257,7 +257,7 @@ async function createOrObserveTunnel(
   }
 }
 
-async function replaceAndReadBackConfiguration(
+export async function replaceManagedCloudflareConfiguration(
   api: CloudflareApi,
   accountId: string,
   tunnelId: string,
@@ -410,7 +410,7 @@ export async function reconcileManagedCloudflareIngress(
     const configurationVersion =
       stable(normalizedCurrent) === stable(desired)
         ? currentConfiguration.version
-        : await replaceAndReadBackConfiguration(api, metadata.account_id, tunnel.id, desired);
+        : await replaceManagedCloudflareConfiguration(api, metadata.account_id, tunnel.id, desired);
 
     const dnsRecordIds: Record<string, string> = {};
     for (const instance of managedReservations(registry)) {

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { readJson, writePrivate } from '../community-portal/private-file.js';
 import { processLock } from '../community-portal/process-lock.js';
@@ -318,6 +318,30 @@ async function readRegistryFile(paths: ControlPlanePaths): Promise<InstanceRegis
   }
 }
 
+export async function activeRemovalInstanceIds(
+  paths: ControlPlanePaths,
+  registry: InstanceRegistry,
+): Promise<readonly string[]> {
+  try {
+    await assertPrivateLocalDirectory(paths.removalRoot);
+    const entries = await readdir(paths.removalRoot, { withFileTypes: true });
+    const active: string[] = [];
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.json')) {
+        throw new GwsEaError('invalid_removal', 'Removal state contains an unexpected entry');
+      }
+      const instanceId = entry.name.slice(0, -'.json'.length);
+      assertInstanceId(instanceId);
+      await assertPrivateStateFile(path.join(paths.removalRoot, entry.name));
+      if (registry.instances[instanceId]) active.push(instanceId);
+    }
+    return active.sort();
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) return [];
+    throw error;
+  }
+}
+
 export async function readRegistry(paths: ControlPlanePaths): Promise<InstanceRegistry> {
   try {
     await assertPrivateLocalDirectory(paths.configRoot);
@@ -495,6 +519,12 @@ export async function reserveInstance(
   const release = await acquireMachineLock(paths);
   try {
     const registry = await readRegistryFile(paths);
+    if ((await activeRemovalInstanceIds(paths, registry)).length > 0) {
+      throw new GwsEaError(
+        'removal_in_progress',
+        'An assistant removal is in progress; retry create after it completes',
+      );
+    }
     if (registry.instances[validated.instance_id]) {
       throw new GwsEaError('instance_exists', 'Instance ID already exists');
     }
@@ -538,10 +568,15 @@ export async function releaseInstanceReservation(
     }
     const instances = { ...registry.instances };
     delete instances[validated.instance_id];
+    const hasManagedIngress = Object.values(instances).some(
+      (instance) => instance.exclusive_resource_claims.ingress.mode === 'managed-cloudflare',
+    );
     await writePrivate(paths.registryFile, {
       schema_version: REGISTRY_SCHEMA_VERSION,
       instances,
-      shared_infrastructure_metadata: registry.shared_infrastructure_metadata,
+      shared_infrastructure_metadata: hasManagedIngress
+        ? registry.shared_infrastructure_metadata
+        : { cloudflare: null },
     });
   } finally {
     release();
