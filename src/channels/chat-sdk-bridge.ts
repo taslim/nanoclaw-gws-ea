@@ -548,6 +548,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       timestamp: message.metadata.dateSent.toISOString(),
       isMention,
       isGroup,
+      authenticatedSender:
+        typeof message.author.userId === 'string' && message.author.userId.length > 0
+          ? {
+              userId: message.author.userId,
+              displayName: message.author.fullName || message.author.userName || undefined,
+              kind: message.author.isBot === false ? 'human' : message.author.isBot === true ? 'bot' : 'unknown',
+            }
+          : undefined,
     };
   }
 

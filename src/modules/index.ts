@@ -25,3 +25,4 @@ import './permissions/index.js';
 import './agent-to-agent/index.js';
 import './self-mod/index.js';
 import './community-portal/index.js';
+import './gws-ea-profile/index.js';

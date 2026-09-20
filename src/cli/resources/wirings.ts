@@ -18,6 +18,7 @@ import { log } from '../../log.js';
 import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';
 import { registerResource } from '../crud.js';
 import { projectDestinationsToSessions } from './destinations.js';
+import { assertWiringAdmitted } from '../../db/wiring-admission.js';
 
 /**
  * Pass-1 parity with the generic create: enum validation for explicit flags
@@ -162,6 +163,11 @@ registerResource({
     if (merged.engage_mode !== (updates.engage_mode ?? current.engage_mode)) {
       updates.engage_mode = merged.engage_mode;
     }
+    await assertWiringAdmitted({
+      operation: 'update',
+      current: current as unknown as MessagingGroupAgent,
+      proposed: { ...current, ...updates } as unknown as MessagingGroupAgent,
+    });
   },
   customOperations: {
     create: {
@@ -199,7 +205,10 @@ registerResource({
         // Idempotent: a wiring for this pair already exists → return it
         // (defaults/validation/side-effects are skipped — nothing new is written).
         const existing = await getMessagingGroupAgentByPair(mgId, agId);
-        if (existing) return existing;
+        if (existing) {
+          await assertWiringAdmitted({ operation: 'create', proposed: existing });
+          return existing;
+        }
 
         // Pass-1 parity: only defined keys enter `values` (an unset
         // engage_pattern stays absent → column NULL), enums validated.
@@ -256,6 +265,8 @@ registerResource({
         if (values.ignored_message_policy === undefined) values.ignored_message_policy = 'drop';
         if (values.session_mode === undefined) values.session_mode = 'shared';
         if (values.priority === undefined) values.priority = 0;
+
+        await assertWiringAdmitted({ operation: 'create', proposed: values as unknown as MessagingGroupAgent });
 
         // postCreate parity, in one transaction with the INSERT (a throw rolls
         // back the parent row). Dynamic INSERT — not createMessagingGroupAgent,

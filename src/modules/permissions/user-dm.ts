@@ -40,6 +40,34 @@ import { getUser } from './db/users.js';
 import { getUserDm, upsertUserDm } from './db/user-dms.js';
 
 /**
+ * Persist an already-authenticated direct conversation as the DM mapping for
+ * a known user. Unlike ensureUserDm(), this never calls an adapter or invents
+ * a conversation: callers must supply the exact row proven by an inbound DM.
+ */
+export async function rememberAuthenticatedUserDm(
+  userId: string,
+  messagingGroup: MessagingGroup,
+  resolvedAt: string,
+): Promise<void> {
+  const user = await getUser(userId);
+  if (!user) throw new Error(`User not found: ${userId}`);
+  if (messagingGroup.is_group !== 0) throw new Error('Authenticated user DM mapping requires a direct conversation');
+  if (user.kind !== messagingGroup.channel_type) {
+    throw new Error('Authenticated user and messaging group channel types do not match');
+  }
+  const parsed = new Date(resolvedAt);
+  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString() !== resolvedAt) {
+    throw new Error('Authenticated user DM timestamp is invalid');
+  }
+  await upsertUserDm({
+    user_id: userId,
+    channel_type: messagingGroup.channel_type,
+    messaging_group_id: messagingGroup.id,
+    resolved_at: resolvedAt,
+  });
+}
+
+/**
  * Return a messaging_group usable to DM this user, creating it lazily if
  * needed. Returns null when:
  *   - the user id isn't namespaced (no `kind:handle` prefix)

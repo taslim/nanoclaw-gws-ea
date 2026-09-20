@@ -137,10 +137,6 @@ describe('Google Chat channel configuration', () => {
       configured: { GCHAT_CREDENTIALS: credentialEnv, GCHAT_BOT_USER_ID: botUserId },
       missingKey: 'GCHAT_ENDPOINT_URL',
     },
-    {
-      configured: { GCHAT_CREDENTIALS: credentialEnv, GCHAT_ENDPOINT_URL: endpointUrl },
-      missingKey: 'GCHAT_BOT_USER_ID',
-    },
   ] as const)('rejects partial configuration missing $missingKey', async ({ configured, missingKey }) => {
     Object.assign(process.env, configured);
     const factory = await registeredFactory();
@@ -207,14 +203,18 @@ describe('Google Chat channel configuration', () => {
     },
   );
 
-  it('does not accept the package ambient bot identity in place of project configuration', async () => {
+  it('starts without an explicit bot user ID and ignores the package ambient identity', async () => {
     process.env.GCHAT_CREDENTIALS = credentialEnv;
     process.env.GCHAT_ENDPOINT_URL = endpointUrl;
     process.env.GOOGLE_CHAT_BOT_USER_ID = botUserId;
     const factory = await registeredFactory();
 
-    expect(() => factory()).toThrow('Google Chat configuration requires GCHAT_BOT_USER_ID');
-    expect(mocks.createGoogleChatAdapter).not.toHaveBeenCalled();
+    await factory();
+
+    expect(mocks.createGoogleChatAdapter).toHaveBeenCalledWith({
+      credentials: { client_email: 'bot@example.test', private_key: 'secret' },
+      endpointUrl,
+    });
   });
 
   it.each(alternateVerifierEnvKeys)('rejects ambient alternate verifier setting %s', async (key) => {

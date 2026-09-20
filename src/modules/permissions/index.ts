@@ -78,6 +78,24 @@ async function extractAndUpsertUser(event: InboundEvent): Promise<string | null>
     return null;
   }
 
+  // Transport-authenticated identity wins over compatibility content fields.
+  // The latter remain for legacy/native adapters but are never sufficient for
+  // principal-candidate eligibility.
+  const authenticated = event.message.authenticatedSender;
+  if (authenticated) {
+    const rawHandle = authenticated.userId;
+    const userId = rawHandle.includes(':') ? rawHandle : `${event.channelType}:${rawHandle}`;
+    if (!(await getUser(userId))) {
+      await upsertUser({
+        id: userId,
+        kind: event.channelType,
+        display_name: authenticated.displayName ?? null,
+        created_at: new Date().toISOString(),
+      });
+    }
+    return userId;
+  }
+
   // chat-sdk-bridge serializes author info as a nested `author.userId` and
   // does NOT populate top-level `senderId`. Older adapters (v1, native) put
   // `senderId` or `sender` directly at the top level. Check all three.
@@ -128,6 +146,7 @@ async function handleUnknownSender(
   const dropRecord = {
     channel_type: event.channelType,
     platform_id: event.platformId,
+    instance: mg.instance ?? event.channelType,
     user_id: userId,
     sender_name: senderName,
     reason: `unknown_sender_${mg.unknown_sender_policy}`,

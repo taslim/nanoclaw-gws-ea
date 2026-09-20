@@ -48,6 +48,7 @@ import { runInheritScript } from './lib/inherit-script.js';
 import { offerPortalReminder, portalEnabled, runImagePortal } from './portal.js';
 import { pingCliAgent, PING_AGENT_FOLDER, type PingResult } from './lib/agent-ping.js';
 import { getSetupProvider, listSetupProviders } from './providers/registry.js';
+import { collectClaudeCredential } from './providers/claude-auth.js';
 import { applyProviderSkill } from './providers/install.js';
 import {
   getInstallableProviderDescriptor,
@@ -1562,37 +1563,8 @@ async function runAuthStep(): Promise<void> {
     return;
   }
 
-  const method = ensureAnswer(
-    await brightSelect({
-      message: 'How would you like to connect to Claude?',
-      options: [
-        {
-          value: 'subscription',
-          label: 'Sign in with my Claude subscription',
-          hint: 'recommended if you have Pro or Max',
-        },
-        {
-          value: 'oauth',
-          label: 'Paste an OAuth token I already have',
-          hint: 'sk-ant-oat…',
-        },
-        {
-          value: 'api',
-          label: 'Paste an Anthropic API key',
-          hint: 'pay-per-use via console.anthropic.com',
-        },
-        {
-          value: 'skip',
-          label: "Skip — I'll connect later",
-          hint: 'not recommended — Claude helps debug setup issues',
-        },
-      ],
-    }),
-  ) as 'subscription' | 'oauth' | 'api' | 'skip';
-  setupLog.userInput('auth_method', method);
-  phEmit('auth_method_chosen', { method });
-
-  if (method === 'skip') {
+  const collected = await collectClaudeCredential({ allowSkip: true, allowAmbientConfiguration: true });
+  if (!collected) {
     const confirmed = ensureAnswer(
       await p.confirm({
         message:
@@ -1601,72 +1573,15 @@ async function runAuthStep(): Promise<void> {
       }),
     );
     if (!confirmed) {
-      // Loop back to the auth picker so they can choose a real method.
       return runAuthStep();
     }
     setupLog.step('auth', 'skipped', 0, { REASON: 'user-skipped' });
     p.log.warn(brandBody('Claude sign-in skipped. Re-run setup or run `bash nanoclaw.sh` to finish later.'));
     return;
   }
-
-  if (method === 'subscription') {
-    await runSubscriptionAuth();
-  } else {
-    await runPasteAuth(method);
-  }
-}
-
-async function runSubscriptionAuth(): Promise<void> {
-  p.log.step(brandBody('Opening the Claude sign-in flow…'));
-  console.log(k.dim('   (a browser will open for sign-in; this part is interactive)'));
-  console.log();
-  const start = Date.now();
-  const code = await runInheritScript('bash', ['setup/register-claude-token.sh']);
-  const durationMs = Date.now() - start;
-  console.log();
-  if (code !== 0) {
-    setupLog.step('auth', 'failed', durationMs, {
-      EXIT_CODE: code,
-      METHOD: 'subscription',
-    });
-    await fail(
-      'auth',
-      "Couldn't complete the Claude sign-in.",
-      'Re-run setup and try again, or choose a paste option instead.',
-    );
-  }
-  setupLog.step('auth', 'interactive', durationMs, { METHOD: 'subscription' });
-  p.log.success(brandBody('Claude account connected.'));
-}
-
-async function runPasteAuth(method: 'oauth' | 'api'): Promise<void> {
-  const label = method === 'oauth' ? 'OAuth token' : 'API key';
-  const prefix = method === 'oauth' ? 'sk-ant-oat' : 'sk-ant-api';
-
-  const answer = ensureAnswer(
-    await p.password({
-      message: `Paste your ${label}`,
-      clearOnError: true,
-      validate: (v) => {
-        // Strip any internal whitespace so a line-wrapped paste that did
-        // survive into clack can still validate. The mid-token-newline
-        // case where clack only sees the first line is caught by the
-        // shape check below.
-        const cleaned = (v ?? '').replace(/\s+/g, '');
-        if (!cleaned) return 'Required';
-        if (!cleaned.startsWith(prefix)) {
-          return `Should start with ${prefix}…`;
-        }
-        if (method === 'oauth' && !/^sk-ant-oat[A-Za-z0-9_-]{80,500}AA$/.test(cleaned)) {
-          return cleaned.length < 90
-            ? 'Token looks truncated — line breaks in the paste can cut it off. Widen your terminal so the token fits on one line, then paste again.'
-            : "Token shape doesn't look right (expected sk-ant-oat…AA).";
-        }
-        return undefined;
-      },
-    }),
-  );
-  const token = (answer as string).replace(/\s+/g, '');
+  const { credential, method } = collected;
+  setupLog.userInput('auth_method', method);
+  phEmit('auth_method_chosen', { method });
 
   const res = await runQuietChild(
     'auth',
@@ -1675,16 +1590,21 @@ async function runPasteAuth(method: 'oauth' | 'api'): Promise<void> {
       'secrets',
       'create',
       '--name',
-      'Anthropic',
+      credential.name,
       '--type',
-      'anthropic',
+      credential.type,
       '--value',
-      token,
+      credential.value,
       '--host-pattern',
-      'api.anthropic.com',
+      credential.hostPattern,
+      ...(credential.pathPattern ? ['--path-pattern', credential.pathPattern] : []),
+      ...(credential.headerName ? ['--header-name', credential.headerName] : []),
+      ...(credential.valueFormat ? ['--value-format', credential.valueFormat] : []),
+      ...(credential.paramName ? ['--param-name', credential.paramName] : []),
+      ...(credential.paramFormat ? ['--param-format', credential.paramFormat] : []),
     ],
     {
-      running: `Saving your ${label} to your OneCLI vault…`,
+      running: 'Saving your Claude credential to your OneCLI vault…',
       done: 'Claude account connected.',
     },
     {
@@ -1694,7 +1614,7 @@ async function runPasteAuth(method: 'oauth' | 'api'): Promise<void> {
   if (!res.ok) {
     await fail(
       'auth',
-      `Couldn't save your ${label} to the vault.`,
+      "Couldn't save your Claude credential to the vault.",
       'Make sure OneCLI is running (`onecli version`), then retry.',
     );
   }

@@ -33,11 +33,11 @@ import { initChannelAdapters, teardownChannelAdapters } from './channel-registry
 let nextEvent: ((event: InboundEvent) => void) | null = null;
 
 /** Write one routed (`to`-bearing) line over the socket; resolve with the event the adapter handed the host. */
-function routed(to: Record<string, unknown>): Promise<InboundEvent> {
+function routed(to: Record<string, unknown>, extra: Record<string, unknown> = {}): Promise<InboundEvent> {
   return new Promise((resolve, reject) => {
     nextEvent = resolve;
     const socket = net.connect(path.join(TEST_DIR, 'cli.sock'), () => {
-      socket.end(JSON.stringify({ text: 'hello', to }) + '\n');
+      socket.end(JSON.stringify({ text: 'hello', to, ...extra }) + '\n');
     });
     socket.once('error', reject);
   });
@@ -82,5 +82,24 @@ describe('cli channel: routed message carries to.instance', () => {
     } finally {
       warn.mockRestore();
     }
+  });
+
+  it('accepts a deterministic ID only on the owner-only routed transport', async () => {
+    const event = await routed(to, { id: 'gws-ea-welcome:abc123' });
+    expect(event.message).toMatchObject({ id: 'gws-ea-welcome:abc123', deduplicate: true });
+  });
+
+  it('rejects malformed routed IDs and falls back to a fresh untrusted ID', async () => {
+    const event = await routed(to, { id: 'bad id/with spaces' });
+    expect(event.message.id).toMatch(/^cli-/u);
+    expect(event.message.deduplicate).toBe(false);
+  });
+
+  it('does not let a socket payload smuggle authenticated sender provenance', async () => {
+    const event = await routed(to, {
+      authenticatedSender: { userId: 'users/spoofed', displayName: 'Spoofed', kind: 'human' },
+      senderId: 'users/spoofed',
+    });
+    expect(event.message.authenticatedSender).toBeUndefined();
   });
 });

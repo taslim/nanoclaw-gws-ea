@@ -62,6 +62,14 @@ export interface InboundEvent {
     isMention?: boolean;
     /** True when the source is a group/channel thread, false for DMs. */
     isGroup?: boolean;
+    /**
+     * Sender identity asserted by the authenticated adapter transport, never
+     * parsed from message content. Admin-routed CLI events deliberately omit
+     * it even when their content carries sender fields.
+     */
+    authenticatedSender?: AuthenticatedSender;
+    /** Retry-safe only for owner-controlled routed admin messages. */
+    deduplicate?: boolean;
   };
   replyTo?: DeliveryAddress;
 }
@@ -90,6 +98,14 @@ export interface InboundMessage {
   isMention?: boolean;
   /** True when the source is a group/channel thread, false for DMs. */
   isGroup?: boolean;
+  /** Sender identity asserted by the authenticated adapter transport. */
+  authenticatedSender?: AuthenticatedSender;
+}
+
+export interface AuthenticatedSender {
+  userId: string;
+  displayName?: string;
+  kind: 'human' | 'bot' | 'unknown';
 }
 
 /** A file attachment to deliver alongside a message. */

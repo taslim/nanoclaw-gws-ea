@@ -104,13 +104,24 @@ async function main(): Promise<void> {
             timestamp: message.timestamp,
             isMention: message.isMention,
             isGroup: message.isGroup,
+            authenticatedSender: message.authenticatedSender,
           },
         }).catch((err) => {
           log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
         });
       },
       onInboundEvent(event) {
-        routeInbound(event).catch((err) => {
+        // Admin transports may target another channel and carry display
+        // identity for authorization-compatible routing, but they cannot
+        // assert platform authentication on that channel.
+        routeInbound({
+          ...event,
+          message: {
+            ...event.message,
+            authenticatedSender: undefined,
+            deduplicate: adapter.channelType === 'cli' ? event.message.deduplicate : undefined,
+          },
+        }).catch((err) => {
           log.error('Failed to route inbound event', {
             sourceAdapter: adapter.channelType,
             targetChannelType: event.channelType,

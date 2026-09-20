@@ -23,6 +23,12 @@ describe('setup provider registry', () => {
     const claude = getSetupProvider('claude');
     expect(claude).toBeDefined();
     expect(claude!.runAuth).toBeUndefined();
+    expect(claude!.provisioning).toBeDefined();
+    expect(claude!.provisioning!.credentialMetadata()).toEqual({
+      name: 'Anthropic',
+      type: 'anthropic',
+      hostPattern: 'api.anthropic.com',
+    });
     expect(listSetupProviders()[0]!.value).toBe('claude');
   });
 });

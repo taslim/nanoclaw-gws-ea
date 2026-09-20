@@ -23,6 +23,7 @@ import { parseSkillSelection, sanitizeStoredMcpServers } from './container-confi
 import { getContainerConfig } from './db/container-configs.js';
 import { readGroupPersona } from './group-persona.js';
 import { log } from './log.js';
+import { getRequiredProjectDocSections } from './project-doc-sections.js';
 import type { AgentGroup } from './types.js';
 
 /** One `# <name>` block of the composed document. */
@@ -185,6 +186,11 @@ export async function composeGroupProjectDoc(group: AgentGroup, groupDir: string
   // droppable: a group whose persona is evicted stops being that group.
   const persona = readGroupPersona(groupDir);
   if (persona) push('Persona', persona);
+
+  // Module-contributed runtime context follows the persona and cannot be
+  // evicted under a provider document cap. A module that is absent (or has no
+  // section for this installation) changes no bytes in the vanilla document.
+  for (const section of await getRequiredProjectDocSections(group)) push(section.name, section.body);
 
   const legacySpec = spec.baseDocPath !== undefined;
   const baseDoc = path.resolve(process.cwd(), spec.baseDocPath ?? BASE_INSTRUCTIONS_PATH);

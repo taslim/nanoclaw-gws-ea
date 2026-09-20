@@ -16,6 +16,29 @@ import { createHash } from 'crypto';
 
 const INSTALL_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 
+export interface InstallScopedNames {
+  readonly launchdLabel: string;
+  readonly systemdUnit: string;
+  readonly containerImageBase: string;
+  readonly defaultContainerImage: string;
+  readonly containerInstallLabel: string;
+}
+
+/** Names shared by every host and container resource owned by one install. */
+export function getInstallScopedNames(installSlug: string): InstallScopedNames {
+  if (!INSTALL_ID_PATTERN.test(installSlug)) {
+    throw new Error(`Install slug must be 1-32 chars of [a-z0-9_-] starting alphanumeric (got '${installSlug}')`);
+  }
+  const containerImageBase = `nanoclaw-agent-v2-${installSlug}`;
+  return {
+    launchdLabel: `com.nanoclaw-v2-${installSlug}`,
+    systemdUnit: `nanoclaw-v2-${installSlug}`,
+    containerImageBase,
+    defaultContainerImage: `${containerImageBase}:latest`,
+    containerInstallLabel: `nanoclaw-install=${installSlug}`,
+  };
+}
+
 export function getInstallSlug(projectRoot: string = process.cwd()): string {
   const override = process.env.NANOCLAW_INSTALL_ID;
   if (override) {
@@ -29,20 +52,20 @@ export function getInstallSlug(projectRoot: string = process.cwd()): string {
 
 /** launchd Label + plist basename. e.g. `com.nanoclaw-v2-ab12cd34`. */
 export function getLaunchdLabel(projectRoot?: string): string {
-  return `com.nanoclaw-v2-${getInstallSlug(projectRoot)}`;
+  return getInstallScopedNames(getInstallSlug(projectRoot)).launchdLabel;
 }
 
 /** systemd unit name (no .service suffix). e.g. `nanoclaw-v2-ab12cd34`. */
 export function getSystemdUnit(projectRoot?: string): string {
-  return `nanoclaw-v2-${getInstallSlug(projectRoot)}`;
+  return getInstallScopedNames(getInstallSlug(projectRoot)).systemdUnit;
 }
 
 /** Docker image base (no tag). e.g. `nanoclaw-agent-v2-ab12cd34`. */
 export function getContainerImageBase(projectRoot?: string): string {
-  return `nanoclaw-agent-v2-${getInstallSlug(projectRoot)}`;
+  return getInstallScopedNames(getInstallSlug(projectRoot)).containerImageBase;
 }
 
 /** Default full container image reference with `:latest` tag. */
 export function getDefaultContainerImage(projectRoot?: string): string {
-  return `${getContainerImageBase(projectRoot)}:latest`;
+  return getInstallScopedNames(getInstallSlug(projectRoot)).defaultContainerImage;
 }

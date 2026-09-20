@@ -50,6 +50,7 @@ import { initDb } from '../src/db/connection.js';
 import {
   createMessagingGroup,
   createMessagingGroupAgent,
+  ensureAgentDestinationForWiring,
   getMessagingGroupAgentByPair,
   getMessagingGroupByPlatform,
 } from '../src/db/messaging-groups.js';
@@ -59,6 +60,7 @@ import { normalizeName } from '../src/modules/agent-to-agent/db/agent-destinatio
 import { addMember } from '../src/modules/permissions/db/agent-group-members.js';
 import { getUserRoles, grantRole } from '../src/modules/permissions/db/user-roles.js';
 import { upsertUser } from '../src/modules/permissions/db/users.js';
+import { rememberAuthenticatedUserDm } from '../src/modules/permissions/user-dm.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from '../src/db/container-configs.js';
 import { namespacedPlatformId } from '../src/platform-id.js';
 import type { AgentGroup, MessagingGroup } from '../src/types.js';
@@ -78,6 +80,14 @@ interface Args {
   engagePattern?: string;
   /** Adapter instance registry key (e.g. telegram-mega); omitted = the channel's default instance. */
   instance?: string;
+  /** Explicit sender admission for the DM wiring; omitted preserves the vanilla 'all' default. */
+  senderScope?: 'all' | 'known';
+  /** Explicit session sharing mode; omitted preserves channel/legacy defaults. */
+  sessionMode?: 'shared' | 'per-thread' | 'agent-shared';
+  /** Stable routed-event ID for retry-safe bootstrap welcome delivery. */
+  eventId?: string;
+  /** Enables verified-principal DM persistence and its stricter argument contract. */
+  verifiedPrincipal?: boolean;
 }
 
 const DEFAULT_WELCOME = 'System instruction: run /welcome to introduce yourself to the user on this new channel.';
@@ -151,6 +161,35 @@ function parseArgs(argv: string[]): Args {
         out.instance = val;
         i++;
         break;
+      case '--sender-scope': {
+        if (val !== 'all' && val !== 'known') {
+          console.error(`Invalid --sender-scope: ${String(val)} (expected 'all' or 'known')`);
+          process.exit(2);
+        }
+        out.senderScope = val;
+        i++;
+        break;
+      }
+      case '--session-mode': {
+        if (val !== 'shared' && val !== 'per-thread' && val !== 'agent-shared') {
+          console.error(`Invalid --session-mode: ${String(val)} (expected 'shared', 'per-thread', or 'agent-shared')`);
+          process.exit(2);
+        }
+        out.sessionMode = val;
+        i++;
+        break;
+      }
+      case '--event-id':
+        if (!val || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(val)) {
+          console.error(`--event-id must be a safe non-empty identifier, got: ${JSON.stringify(val)}`);
+          process.exit(2);
+        }
+        out.eventId = val;
+        i++;
+        break;
+      case '--verified-principal':
+        out.verifiedPrincipal = true;
+        break;
       case '--role': {
         const raw = (val ?? '').toLowerCase();
         if (raw !== 'owner' && raw !== 'admin' && raw !== 'member') {
@@ -173,6 +212,19 @@ function parseArgs(argv: string[]): Args {
     console.error('See scripts/init-first-agent.ts header for usage.');
     process.exit(2);
   }
+  if (
+    out.verifiedPrincipal &&
+    (!out.agentGroupId ||
+      out.role !== 'owner' ||
+      out.senderScope !== 'known' ||
+      out.sessionMode !== 'agent-shared' ||
+      !out.eventId)
+  ) {
+    console.error(
+      '--verified-principal requires --agent-group-id, --role owner, --sender-scope known, --session-mode agent-shared, and --event-id',
+    );
+    process.exit(2);
+  }
 
   return {
     channel: out.channel!,
@@ -185,6 +237,10 @@ function parseArgs(argv: string[]): Args {
     role: out.role ?? DEFAULT_ROLE,
     engagePattern: out.engagePattern?.trim() || undefined,
     instance: out.instance,
+    senderScope: out.senderScope,
+    sessionMode: out.sessionMode,
+    eventId: out.eventId,
+    verifiedPrincipal: out.verifiedPrincipal,
   };
 }
 
@@ -196,18 +252,20 @@ function generateId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+interface WireOptions {
+  readonly engagePattern?: string;
+  readonly senderScope?: 'all' | 'known';
+  readonly sessionMode?: 'shared' | 'per-thread' | 'agent-shared';
+}
+
 async function wireIfMissing(
   mg: MessagingGroup,
   ag: AgentGroup,
   now: string,
   label: string,
-  engagePattern?: string,
+  options: WireOptions = {},
 ): Promise<void> {
-  const existing = await getMessagingGroupAgentByPair(mg.id, ag.id);
-  if (existing) {
-    console.log(`Wiring already exists: ${existing.id} (${label})`);
-    return;
-  }
+  const { engagePattern, senderScope, sessionMode } = options;
   // Wiring defaults come from the channel's declaration when it has one
   // (resolveWiringDefaults: engage fields + session_mode + the threads stamp
   // derived from it — a context whose conversations are thread-rooted
@@ -231,7 +289,7 @@ async function wireIfMissing(
       (isGroup
         ? { engage_mode: 'mention' as const, engage_pattern: null }
         : { engage_mode: 'pattern' as const, engage_pattern: '.' }));
-  await createMessagingGroupAgent({
+  const desired = {
     id: generateId('mga'),
     messaging_group_id: mg.id,
     agent_group_id: ag.id,
@@ -240,18 +298,54 @@ async function wireIfMissing(
     // Deliberate owner-bootstrap choices, not channel defaults: the operator
     // wires their own DM, so every sender is trusted ('all') and ignored
     // messages carry no value ('drop').
-    sender_scope: 'all',
+    sender_scope: senderScope ?? ('all' as const),
     ignored_message_policy: 'drop',
-    session_mode: resolved?.session_mode ?? 'shared',
+    session_mode: sessionMode ?? resolved?.session_mode ?? ('shared' as const),
     ...(resolved?.threads !== undefined && resolved?.threads !== null ? { threads: resolved.threads } : {}),
     priority: 0,
     created_at: now,
-  });
+  };
+  const existing = await getMessagingGroupAgentByPair(mg.id, ag.id);
+  if (existing) {
+    // Preserve the vanilla script's historical idempotence: ordinary reruns
+    // never reinterpret an existing wiring. Reconcile only its derived
+    // destination; exact fail-closed comparison is reserved for callers
+    // opting into the new explicit principal-session semantics.
+    if (senderScope === undefined && sessionMode === undefined) {
+      await ensureAgentDestinationForWiring(existing);
+      console.log(`Wiring already exists: ${existing.id} (${label})`);
+      return;
+    }
+    const keys = [
+      'engage_mode',
+      'engage_pattern',
+      'sender_scope',
+      'ignored_message_policy',
+      'session_mode',
+      'priority',
+      'threads',
+    ] as const;
+    const mismatched = keys.filter((key) => (existing[key] ?? null) !== (desired[key] ?? null));
+    if (mismatched.length > 0) {
+      throw new Error(`Existing wiring ${existing.id} does not match requested bootstrap: ${mismatched.join(', ')}`);
+    }
+    await ensureAgentDestinationForWiring(existing);
+    console.log(`Wiring already exists: ${existing.id} (${label})`);
+    return;
+  }
+  await createMessagingGroupAgent(desired);
   console.log(`Wired ${label}: ${mg.id} -> ${ag.id}`);
 }
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
+
+  // Keep the vanilla bootstrap byte-for-behavior at the module boundary:
+  // only the explicit verified-principal flow installs the product-owned
+  // profile migration and canonical-main admission policy. The import must
+  // happen before runMigrations() so a fresh provisioned checkout creates
+  // its profile tables before the policy is consulted.
+  if (args.verifiedPrincipal) await import('../src/modules/gws-ea-profile/index.js');
 
   const db = await initDb(CENTRAL_DB_PATH);
   await runMigrations(db); // idempotent
@@ -382,16 +476,29 @@ async function main(): Promise<void> {
   }
 
   // 4. Wire DM messaging group to the agent.
-  await wireIfMissing(dmMg, ag, now, 'dm', args.engagePattern);
+  // The canonical user-to-DM mapping exists before admission evaluates the
+  // wiring. This is both the cold-DM cache and the proof the main policy uses.
+  if (args.verifiedPrincipal) await rememberAuthenticatedUserDm(userId, dmMg, now);
+
+  await wireIfMissing(dmMg, ag, now, 'dm', {
+    engagePattern: args.engagePattern,
+    senderScope: args.senderScope,
+    sessionMode: args.sessionMode,
+  });
 
   // 5. Welcome delivery over the CLI socket. Router picks up the line,
   // writes the message into the DM session's inbound.db, and wakes the
   // container synchronously — no sweep wait. The paired user's identity is
   // passed so the sender resolver sees the real owner, not cli:local.
-  await sendWelcomeViaCliSocket(dmMg, args.welcome, {
-    senderId: userId,
-    sender: args.displayName,
-  });
+  await sendWelcomeViaCliSocket(
+    dmMg,
+    args.welcome,
+    {
+      senderId: userId,
+      sender: args.displayName,
+    },
+    args.eventId,
+  );
 
   const roleLabel =
     args.role === 'owner' ? 'owner (global)' : args.role === 'admin' ? `admin (scoped to ${ag.id})` : 'member';
@@ -419,6 +526,7 @@ async function sendWelcomeViaCliSocket(
   dmMg: MessagingGroup,
   welcome: string,
   identity: { senderId: string; sender: string },
+  eventId?: string,
 ): Promise<void> {
   const sockPath = path.join(DATA_DIR, 'cli.sock');
 
@@ -444,6 +552,7 @@ async function sendWelcomeViaCliSocket(
     socket.once('connect', () => {
       const payload =
         JSON.stringify({
+          ...(eventId ? { id: eventId } : {}),
           text: welcome,
           senderId: identity.senderId,
           sender: identity.sender,

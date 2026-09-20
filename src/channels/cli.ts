@@ -202,6 +202,7 @@ function createAdapter(): ChannelAdapter {
 
   async function handleLine(line: string, config: ChannelSetup, claimChatSlot: () => void): Promise<void> {
     let payload: {
+      id?: unknown;
       text?: unknown;
       to?: unknown;
       reply_to?: unknown;
@@ -223,13 +224,14 @@ function createAdapter(): ChannelAdapter {
       // Routed message — admin transport. Build a full InboundEvent targeting
       // `to`'s channel/platform, and let `reply_to` (if any) redirect replies.
       // Does NOT claim the chat slot, so an active terminal chat isn't evicted.
+      const suppliedId = parseAdminEventId(payload.id);
       const event: InboundEvent = {
         channelType: to.channelType,
         instance: to.instance,
         platformId: to.platformId,
         threadId: to.threadId,
         message: {
-          id: `cli-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          id: suppliedId ?? `cli-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           kind: 'chat',
           timestamp: new Date().toISOString(),
           content: JSON.stringify({
@@ -237,6 +239,10 @@ function createAdapter(): ChannelAdapter {
             sender: typeof payload.sender === 'string' ? payload.sender : 'cli',
             senderId: typeof payload.senderId === 'string' ? payload.senderId : `cli:${PLATFORM_ID}`,
           }),
+          // A caller-supplied ID is accepted only on this owner-only routed
+          // opcode. It makes installation bootstrap safely retryable without
+          // changing ordinary chat's random-ID semantics.
+          deduplicate: suppliedId !== undefined,
         },
         replyTo: replyTo ?? undefined,
       };
@@ -296,6 +302,11 @@ function createAdapter(): ChannelAdapter {
   }
 
   return adapter;
+}
+
+function parseAdminEventId(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(value)) return undefined;
+  return value;
 }
 
 function extractText(message: OutboundMessage): string | null {
