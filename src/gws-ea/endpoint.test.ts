@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { verifyExistingGchatEndpoint, verifyExistingGchatRoute } from './endpoint.js';
+import { verifyExistingGchatEndpoint, verifyExistingGchatRoute, verifyManagedGchatRoute } from './endpoint.js';
 
 const ENDPOINT = 'https://assistant.example.com/webhook/gchat';
 
@@ -76,5 +76,80 @@ describe('existing Google Chat endpoint verification', () => {
     await expect(
       verifyExistingGchatEndpoint({ endpointUrl: ENDPOINT, audienceUrl: ENDPOINT }, { fetch }),
     ).rejects.toThrow(/401/u);
+  });
+});
+
+describe('managed Google Chat route verification', () => {
+  const listenerId = '11111111-1111-4111-8111-111111111111';
+  const localEndpoint = 'http://127.0.0.1:31001/webhook/gchat';
+
+  it('correlates the public callback with the local listener and proves the catch-all', async () => {
+    const requests: string[] = [];
+    const fetch = vi.fn<typeof globalThis.fetch>(async (url) => {
+      const value = String(url);
+      requests.push(value);
+      if (value === 'https://assistant.example.com/__gws_ea_wrong_path__') {
+        return new Response(null, { status: 404 });
+      }
+      return new Response(null, {
+        status: 401,
+        headers: { 'x-nanoclaw-webhook-id': listenerId },
+      });
+    });
+
+    await expect(
+      verifyManagedGchatRoute({ endpointUrl: ENDPOINT, localEndpointUrl: localEndpoint }, { fetch }),
+    ).resolves.toEqual({ endpointUrl: ENDPOINT, listenerId });
+    expect(requests).toEqual([localEndpoint, ENDPOINT, 'https://assistant.example.com/__gws_ea_wrong_path__']);
+  });
+
+  it('rejects a healthy public callback routed to another NanoClaw listener', async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>(
+      async (url) =>
+        new Response(null, {
+          status: 401,
+          headers: {
+            'x-nanoclaw-webhook-id': String(url).startsWith('http://127.0.0.1')
+              ? listenerId
+              : '22222222-2222-4222-8222-222222222222',
+          },
+        }),
+    );
+
+    await expect(
+      verifyManagedGchatRoute({ endpointUrl: ENDPOINT, localEndpointUrl: localEndpoint }, { fetch }),
+    ).rejects.toMatchObject({ code: 'managed_listener_mismatch' });
+  });
+
+  it('requires the public wrong path to return an exact non-redirecting 404', async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>(async (url) => {
+      if (String(url).endsWith('__gws_ea_wrong_path__')) {
+        return new Response(null, { status: 200 });
+      }
+      return new Response(null, {
+        status: 401,
+        headers: { 'x-nanoclaw-webhook-id': listenerId },
+      });
+    });
+
+    await expect(
+      verifyManagedGchatRoute({ endpointUrl: ENDPOINT, localEndpointUrl: localEndpoint }, { fetch }),
+    ).rejects.toMatchObject({ code: 'managed_catch_all_mismatch' });
+  });
+
+  it('rejects a redirect from the public wrong path', async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>(async (url) => {
+      if (String(url).endsWith('__gws_ea_wrong_path__')) {
+        return new Response(null, { status: 302, headers: { location: 'https://elsewhere.invalid/' } });
+      }
+      return new Response(null, {
+        status: 401,
+        headers: { 'x-nanoclaw-webhook-id': listenerId },
+      });
+    });
+
+    await expect(
+      verifyManagedGchatRoute({ endpointUrl: ENDPOINT, localEndpointUrl: localEndpoint }, { fetch }),
+    ).rejects.toMatchObject({ code: 'endpoint_redirect' });
   });
 });

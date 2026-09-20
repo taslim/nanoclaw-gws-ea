@@ -452,11 +452,42 @@ describe('create recovery contract', () => {
         managedIngressSetup: {
           discoverZones,
           retainAccountToken: vi.fn(),
+          requireAccountToken: vi.fn(),
           clearAccountToken,
         },
       }),
     ).toBe(0);
     expect(discoverZones).not.toHaveBeenCalled();
+    expect(clearAccountToken).toHaveBeenCalledOnce();
+  });
+
+  it('clears run-scoped Cloudflare authority when resume exits', async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, managedReservation(paths));
+    const clearAccountToken = vi.fn();
+
+    expect(
+      await runCli(['resume', '--id', input.instance_id], {
+        paths,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        advanceProvision: async () => ({
+          status: 'paused',
+          pause: {
+            kind: 'human-action',
+            phase: 'configure_channel',
+            code: 'chat_configuration_required',
+            message: 'Configure Google Chat.',
+          },
+        }),
+        managedIngressSetup: {
+          discoverZones: vi.fn(),
+          retainAccountToken: vi.fn(),
+          requireAccountToken: vi.fn(),
+          clearAccountToken,
+        },
+      }),
+    ).toBe(0);
     expect(clearAccountToken).toHaveBeenCalledOnce();
   });
 

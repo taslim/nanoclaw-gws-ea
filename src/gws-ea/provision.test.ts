@@ -5,7 +5,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { readProvisionJournal, withInstanceOperation } from './journal.js';
+import { journalResourceKey, readProvisionJournal, withInstanceOperation } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import {
   createProductionProvisionRegistry,
@@ -31,7 +31,10 @@ import {
 import type { OnecliCompatibilityReceipt } from './onecli.js';
 import { holdLoopbackPorts } from './ports.js';
 import { createInstanceRuntimeConfig, persistInstanceRuntime } from './service.js';
+import type { CloudflareApi } from './cloudflare-api.js';
+import type { ObservedCloudflareConnector } from './cloudflare-connector.js';
 import {
+  GwsEaError,
   PROVISION_PHASES,
   type AllocatedPorts,
   type InstanceReservation,
@@ -67,6 +70,28 @@ function reservation(
       gchat_service_account: 'gws-ea-chat@gws-ea-dogfood.iam.gserviceaccount.com',
       workspace_email: 'assistant@example.com',
       onecli_project: 'gws_ea_1',
+    },
+  };
+}
+
+function managedReservation(
+  paths: ControlPlanePaths,
+  allocatedPorts: AllocatedPorts = { nanoclaw_webhook: 3101, onecli_app: 3201, onecli_gateway: 3301 },
+): InstanceReservationInput {
+  const input = reservation(paths, allocatedPorts);
+  return {
+    ...input,
+    exclusive_resource_claims: {
+      ...input.exclusive_resource_claims,
+      ingress: {
+        mode: 'managed-cloudflare',
+        account_id: 'a'.repeat(32),
+        zone_id: 'b'.repeat(32),
+        zone_name: 'example.com',
+        hostname: 'assistant.example.com',
+        callback_url: 'https://assistant.example.com/webhook/gchat',
+        dns_record_id: null,
+      },
     },
   };
 }
@@ -449,6 +474,7 @@ function productionContext(
         homeDirectory: path.dirname(operation.paths.stateRoot),
         runningAsRoot: false,
       },
+      ingress: reserved.exclusive_resource_claims.ingress,
     },
   };
 }
@@ -719,6 +745,260 @@ describe('production provision phase composition', () => {
     expect(importProviderCredential).not.toHaveBeenCalled();
   });
 
+  it('reconciles managed ingress, starts the shared connector, and waits for the applied configuration', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, managedReservation(paths));
+    const connectorToken = 'connector-token-canary';
+    const accountToken = 'account-token-canary';
+    const order: string[] = [];
+    let connectorReady = false;
+    let connectionReads = 0;
+    const api = {
+      getTunnelToken: vi.fn(async () => {
+        order.push('connector-token');
+        return connectorToken;
+      }),
+      listTunnelConnections: vi.fn(async () => {
+        connectionReads += 1;
+        order.push(`connections:${connectionReads}`);
+        return connectionReads === 1 ? [] : [{ id: 'connection-1', configVersion: 7 }];
+      }),
+    } as unknown as CloudflareApi;
+    const observedConnector = Object.freeze({}) as ObservedCloudflareConnector;
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const base = productionContext(operation, reserved);
+      const context: ProductionProvisionContext = {
+        ...base,
+        input: {
+          ...base.input,
+          managedIngressSetup: {
+            requireAccountToken: (accountId) => {
+              order.push(`account-token:${accountId}`);
+              return accountToken;
+            },
+          },
+        },
+      };
+      const dependencies: Partial<ProductionProvisionDependencies> = {
+        createCloudflareApi: vi.fn((options) => {
+          expect(options.accountToken).toBe(accountToken);
+          order.push('api');
+          return api;
+        }),
+        reconcileManagedCloudflareIngress: vi.fn(async (_paths, receivedApi, options) => {
+          expect(receivedApi).toBe(api);
+          expect(options).toEqual({ originHost: 'host.docker.internal' });
+          order.push('ingress');
+          return { tunnelId: '11111111-1111-4111-8111-111111111111', configurationVersion: 7, dnsRecordIds: {} };
+        }),
+        reconcileCloudflareConnector: vi.fn(async (layout, token) => {
+          expect(layout.rootDirectory).toBe(paths.cloudflareRoot);
+          expect(token).toBe(connectorToken);
+          order.push('connector');
+          connectorReady = true;
+          return observedConnector;
+        }),
+        inspectCloudflareConnector: vi.fn(async () => (connectorReady ? observedConnector : undefined)),
+        validateObservedCloudflareConnector: vi.fn(),
+        verifyManagedRoute: vi.fn(async ({ endpointUrl, localEndpointUrl }) => {
+          expect(connectorReady).toBe(true);
+          expect(endpointUrl).toBe('https://assistant.example.com/webhook/gchat');
+          expect(localEndpointUrl).toBe('http://127.0.0.1:3101/webhook/gchat');
+          order.push('public-probe');
+          return { endpointUrl, listenerId: '22222222-2222-4222-8222-222222222222' };
+        }),
+        managedConnectionDelay: vi.fn(async () => undefined),
+      };
+      const phase = createProductionProvisionRegistry(context, dependencies).establish_transport;
+
+      await expect(phase.probe(context)).resolves.toEqual({ status: 'absent' });
+      await expect(phase.apply(context)).resolves.toEqual({ status: 'completed' });
+      await expect(phase.probe(context)).resolves.toEqual({ status: 'matched' });
+    });
+
+    expect(order).toEqual([
+      `account-token:${'a'.repeat(32)}`,
+      'api',
+      'ingress',
+      'connector-token',
+      'connector',
+      'connections:1',
+      'connections:2',
+      'public-probe',
+    ]);
+  });
+
+  it('resumes a healthy managed transport without requesting Cloudflare account authority', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, managedReservation(paths));
+    const observedConnector = Object.freeze({}) as ObservedCloudflareConnector;
+    const requestCloudflareAccountToken = vi.fn();
+    const createCloudflareApi = vi.fn();
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const base = productionContext(operation, reserved);
+      const context: ProductionProvisionContext = {
+        ...base,
+        input: { ...base.input, requestCloudflareAccountToken },
+      };
+      const phase = createProductionProvisionRegistry(context, {
+        createCloudflareApi,
+        inspectCloudflareConnector: vi.fn(async () => observedConnector),
+        validateObservedCloudflareConnector: vi.fn(),
+        verifyManagedRoute: vi.fn(async ({ endpointUrl }) => ({
+          endpointUrl,
+          listenerId: '22222222-2222-4222-8222-222222222222',
+        })),
+      }).establish_transport;
+
+      await expect(phase.probe(context)).resolves.toEqual({ status: 'matched' });
+    });
+
+    expect(requestCloudflareAccountToken).not.toHaveBeenCalled();
+    expect(createCloudflareApi).not.toHaveBeenCalled();
+  });
+
+  it('refuses unsafe connector ownership before requesting account authority or mutating Cloudflare', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, managedReservation(paths));
+    const observedConnector = Object.freeze({}) as ObservedCloudflareConnector;
+    const requestCloudflareAccountToken = vi.fn();
+    const createCloudflareApi = vi.fn();
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const base = productionContext(operation, reserved);
+      const context: ProductionProvisionContext = {
+        ...base,
+        input: { ...base.input, requestCloudflareAccountToken },
+      };
+      const phase = createProductionProvisionRegistry(context, {
+        createCloudflareApi,
+        inspectCloudflareConnector: vi.fn(async () => observedConnector),
+        validateObservedCloudflareConnector: vi.fn(() => {
+          throw new GwsEaError('unsafe_connector_owner', 'Cloudflare connector ownership labels are invalid');
+        }),
+      }).establish_transport;
+
+      await expect(phase.probe(context)).rejects.toMatchObject({ code: 'unsafe_connector_owner' });
+    });
+
+    expect(requestCloudflareAccountToken).not.toHaveBeenCalled();
+    expect(createCloudflareApi).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when connector inspection cannot run Docker', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, managedReservation(paths));
+    const requestCloudflareAccountToken = vi.fn();
+    const createCloudflareApi = vi.fn();
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const base = productionContext(operation, reserved);
+      const context: ProductionProvisionContext = {
+        ...base,
+        input: { ...base.input, requestCloudflareAccountToken },
+      };
+      const phase = createProductionProvisionRegistry(context, {
+        createCloudflareApi,
+        inspectCloudflareConnector: vi.fn(async () => {
+          throw new GwsEaError('command_failed', 'Docker connector inspection failed');
+        }),
+      }).establish_transport;
+
+      await expect(phase.probe(context)).rejects.toMatchObject({ code: 'command_failed' });
+    });
+
+    expect(requestCloudflareAccountToken).not.toHaveBeenCalled();
+    expect(createCloudflareApi).not.toHaveBeenCalled();
+  });
+
+  it('reports the observed managed drift before requesting one fresh token', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, managedReservation(paths));
+    const observation = 'The public Google Chat callback is routed to a different NanoClaw listener';
+    const requested: string[] = [];
+    const api = {
+      getTunnelToken: vi.fn(async () => 'connector-token'),
+      listTunnelConnections: vi.fn(async () => [{ id: 'connection-1', configVersion: 4 }]),
+    } as unknown as CloudflareApi;
+    const observedConnector = Object.freeze({}) as ObservedCloudflareConnector;
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const base = productionContext(operation, reserved);
+      const context: ProductionProvisionContext = {
+        ...base,
+        input: {
+          ...base.input,
+          requestCloudflareAccountToken: async (accountId, observed) => {
+            requested.push(`${accountId}:${observed}`);
+            return 'fresh-account-token';
+          },
+        },
+      };
+      const verifyManagedRoute = vi
+        .fn()
+        .mockRejectedValueOnce(new GwsEaError('managed_listener_mismatch', observation))
+        .mockResolvedValue({
+          endpointUrl: 'https://assistant.example.com/webhook/gchat',
+          listenerId: '22222222-2222-4222-8222-222222222222',
+        });
+      const phase = createProductionProvisionRegistry(context, {
+        createCloudflareApi: vi.fn(() => api),
+        reconcileManagedCloudflareIngress: vi.fn(async () => ({
+          tunnelId: '11111111-1111-4111-8111-111111111111',
+          configurationVersion: 4,
+          dnsRecordIds: {},
+        })),
+        inspectCloudflareConnector: vi.fn(async () => observedConnector),
+        validateObservedCloudflareConnector: vi.fn(),
+        reconcileCloudflareConnector: vi.fn(async () => observedConnector),
+        verifyManagedRoute,
+        managedConnectionDelay: vi.fn(async () => undefined),
+      }).establish_transport;
+
+      await expect(phase.probe(context)).resolves.toEqual({ status: 'absent' });
+      await expect(phase.apply(context)).resolves.toEqual({ status: 'completed' });
+      await expect(phase.probe(context)).resolves.toEqual({ status: 'matched' });
+    });
+
+    expect(requested).toEqual([`${'a'.repeat(32)}:${observation}`]);
+  });
+
+  it('keeps existing transport behavior and invokes no Cloudflare dependency', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation(paths));
+    const createCloudflareApi = vi.fn();
+    const reconcileManagedCloudflareIngress = vi.fn();
+    const inspectCloudflareConnector = vi.fn();
+    const reconcileCloudflareConnector = vi.fn();
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const context = productionContext(operation, reserved);
+      const phase = createProductionProvisionRegistry(context, {
+        verifyRoute: async ({ endpointUrl }) => endpointUrl,
+        createCloudflareApi,
+        reconcileManagedCloudflareIngress,
+        inspectCloudflareConnector,
+        reconcileCloudflareConnector,
+      }).establish_transport;
+
+      await expect(phase.probe(context)).resolves.toEqual({ status: 'matched' });
+      await expect(phase.apply(context)).resolves.toMatchObject({
+        status: 'paused',
+        pause: { code: 'existing_endpoint_required' },
+      });
+      expect(phase.resourceKey(context)).toBe(
+        journalResourceKey('transport', 'https://assistant.example.com/webhook/gchat'),
+      );
+    });
+
+    expect(createCloudflareApi).not.toHaveBeenCalled();
+    expect(reconcileManagedCloudflareIngress).not.toHaveBeenCalled();
+    expect(inspectCloudflareConnector).not.toHaveBeenCalled();
+    expect(reconcileCloudflareConnector).not.toHaveBeenCalled();
+  });
+
   it('pauses with the exact project-scoped Chat configuration handoff', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
@@ -748,6 +1028,26 @@ describe('production provision phase composition', () => {
     });
 
     expect(verifyEndpoint).not.toHaveBeenCalled();
+  });
+
+  it('uses the reserved managed callback byte-for-byte in runtime and Chat configuration', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, managedReservation(paths));
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const context = productionContext(operation, reserved);
+      const phase = createProductionProvisionRegistry(context, {
+        isChatConfigurationConfirmed: async () => false,
+      }).configure_channel;
+
+      expect(context.input.runtime.endpoint_url).toBe('https://assistant.example.com/webhook/gchat');
+      await expect(phase.probe(context)).resolves.toMatchObject({
+        status: 'paused',
+        pause: {
+          details: expect.arrayContaining([expect.stringContaining('https://assistant.example.com/webhook/gchat')]),
+        },
+      });
+    });
   });
 
   it.each([

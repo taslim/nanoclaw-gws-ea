@@ -1,11 +1,7 @@
 import * as prompts from '@clack/prompts';
 import { resolveReleaseCommit, type ResolvedRelease } from './checkout.js';
-import {
-  CREATE_SETUP_FIELDS,
-  type CreatePromptContext,
-  type CreateSetupAnswers,
-  type ManagedIngressSetupSession,
-} from './create-input.js';
+import { CREATE_SETUP_FIELDS, type CreatePromptContext, type CreateSetupAnswers } from './create-input.js';
+import type { RetainedManagedIngressSetupSession } from './cloudflare-api.js';
 import {
   acquireInstanceOperation,
   ensureProvisionJournal,
@@ -57,7 +53,8 @@ export interface CliRuntime {
   describeRemoval?: typeof describeRemoval;
   removeAssistant?: typeof removeAssistant;
   confirmRemoval?: (preview: RemovalPreview) => Promise<boolean>;
-  managedIngressSetup?: ManagedIngressSetupSession;
+  managedIngressSetup?: RetainedManagedIngressSetupSession;
+  requestCloudflareAccountToken?: (accountId: string, observation: string) => Promise<string>;
 }
 
 const CREATE_OPTIONS = ['track', ...CREATE_SETUP_FIELDS] as const;
@@ -191,7 +188,7 @@ async function createAssistant(
   collectInputs: (context: CreatePromptContext) => Promise<CreateSetupAnswers>,
   persistReservation: typeof reserveInstance,
   checkGcloud: () => Promise<{ readonly account: string }>,
-  managedIngressSetup?: ManagedIngressSetupSession,
+  managedIngressSetup?: RetainedManagedIngressSetupSession,
 ): Promise<number> {
   let track: string | undefined;
   let instanceId: string | undefined;
@@ -378,7 +375,12 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
   const advanceProvision =
     runtime.advanceProvision ??
     ((operation, selectedMessagingGroupId, heldPorts) =>
-      runProductionProvision(operation, selectedMessagingGroupId, heldPorts, runtime.authenticateProvider));
+      runProductionProvision(operation, selectedMessagingGroupId, heldPorts, runtime.authenticateProvider, {
+        ...(runtime.managedIngressSetup ? { setupSession: runtime.managedIngressSetup } : {}),
+        ...(runtime.requestCloudflareAccountToken
+          ? { requestAccountToken: runtime.requestCloudflareAccountToken }
+          : {}),
+      }));
   const resolveRelease = runtime.resolveRelease ?? resolveReleaseCommit;
   const allocatePorts = runtime.holdLoopbackPorts ?? holdLoopbackPorts;
   const collectInputs =
@@ -418,15 +420,19 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
     }
   }
   if (args[0] === 'resume') {
-    return resumeAssistant(
-      args.slice(1),
-      paths,
-      output,
-      errorOutput,
-      initializeJournal,
-      advanceProvision,
-      confirmConfigured,
-    );
+    try {
+      return await resumeAssistant(
+        args.slice(1),
+        paths,
+        output,
+        errorOutput,
+        initializeJournal,
+        advanceProvision,
+        confirmConfigured,
+      );
+    } finally {
+      runtime.managedIngressSetup?.clearAccountToken();
+    }
   }
   if (args[0] === 'remove') {
     return removeAssistantCommand(args.slice(1), paths, output, errorOutput, inspectRemoval, remove, confirm);
