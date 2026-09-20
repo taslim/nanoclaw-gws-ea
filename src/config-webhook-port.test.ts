@@ -9,7 +9,7 @@ import { allocateFreePort } from './test-utils/free-port.js';
 
 // Use real .env files, as in #2977, and exercise the shared listener as well
 // as #3148's configuration lookup. Each test owns its cwd and environment.
-describe('WEBHOOK_PORT configuration (#2901)', () => {
+describe('webhook listener configuration', () => {
   const originalCwd = process.cwd();
   let directory: string;
   let stopWebhookServer: (() => Promise<void>) | undefined;
@@ -18,6 +18,7 @@ describe('WEBHOOK_PORT configuration (#2901)', () => {
     directory = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-webhook-port-'));
     process.chdir(directory);
     vi.stubEnv('WEBHOOK_PORT', undefined);
+    vi.stubEnv('WEBHOOK_HOST', undefined);
     vi.resetModules();
     stopWebhookServer = undefined;
   });
@@ -44,6 +45,23 @@ describe('WEBHOOK_PORT configuration (#2901)', () => {
     const { getWebhookPort } = await import('./config.js');
 
     expect(getWebhookPort()).toBe(3000);
+  });
+
+  it('keeps the vanilla host default public while honoring a configured loopback bind', async () => {
+    const { getWebhookHost } = await import('./config.js');
+    expect(getWebhookHost()).toBe('0.0.0.0');
+
+    vi.stubEnv('WEBHOOK_HOST', '127.0.0.1');
+    expect(getWebhookHost()).toBe('127.0.0.1');
+  });
+
+  it('reads WEBHOOK_HOST from .env and rejects malformed values', async () => {
+    fs.writeFileSync(path.join(directory, '.env'), 'WEBHOOK_HOST=localhost\n');
+    const { getWebhookHost } = await import('./config.js');
+    expect(getWebhookHost()).toBe('localhost');
+
+    vi.stubEnv('WEBHOOK_HOST', 'https://attacker.invalid');
+    expect(() => getWebhookHost()).toThrow(/Invalid WEBHOOK_HOST/u);
   });
 
   it('lets the process environment override .env', async () => {
@@ -149,5 +167,22 @@ describe('WEBHOOK_PORT configuration (#2901)', () => {
       },
       { timeout: 2000, interval: 25 },
     );
+  });
+
+  it('binds the shared listener to the configured host', async () => {
+    const port = await allocateFreePort();
+    fs.writeFileSync(path.join(directory, '.env'), `WEBHOOK_PORT=${port}\nWEBHOOK_HOST=127.0.0.1\n`);
+    const webhook = await import('./webhook-server.js');
+    stopWebhookServer = webhook.stopWebhookServer;
+    webhook.registerWebhookHandler('host-check', (req, res) => {
+      res.end(req.socket.localAddress);
+    });
+
+    await vi.waitFor(async () => {
+      const response = await fetch(`http://127.0.0.1:${port}/webhook/host-check`, {
+        signal: AbortSignal.timeout(500),
+      });
+      expect(await response.text()).toBe('127.0.0.1');
+    });
   });
 });

@@ -1,5 +1,6 @@
 {
   "onecli-gateway": "1.42.0",
   "onecli-cli": "2.2.5",
+  "cloudflared": "cloudflare/cloudflared:2026.9.1@sha256:b269e8abd07a5bf6f3f4be65d5050b2174eca89c56a0241a8ff32a16aec454e4",
   "agent-image": "797273591697.dkr.ecr.us-east-1.amazonaws.com/nanoclaw/agent@sha256:79ac5063af36c1a77560a8aff66bc5efec8295b004fef32855a1df93fec3ea1a"
 }

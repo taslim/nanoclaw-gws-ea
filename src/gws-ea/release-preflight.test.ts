@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -79,7 +79,16 @@ async function releaseFixture(): Promise<string> {
   await write(
     root,
     'versions.json',
-    JSON.stringify({ 'onecli-gateway': '1.42.0', 'onecli-cli': '2.2.5' }, null, 2) + '\n',
+    JSON.stringify(
+      {
+        'onecli-gateway': '1.42.0',
+        'onecli-cli': '2.2.5',
+        cloudflared:
+          'cloudflare/cloudflared:2026.9.1@sha256:b269e8abd07a5bf6f3f4be65d5050b2174eca89c56a0241a8ff32a16aec454e4',
+      },
+      null,
+      2,
+    ) + '\n',
   );
   await write(
     root,
@@ -109,6 +118,7 @@ async function releaseFixture(): Promise<string> {
   await write(root, 'src/channels/gchat.ts', "export const gchat = 'registered';\n");
   await write(root, 'src/channels/index.ts', "import './cli.js';\nimport './gchat.js';\n");
   await write(root, 'src/gws-ea/process.ts', 'export {};\n');
+  await write(root, 'src/gws-ea/cloudflare-connector.ts', 'export {};\n');
   await write(root, 'scripts/init-first-agent.ts', 'export {};\n');
   await write(root, 'src/modules/gws-ea-profile/index.ts', 'export {};\n');
   await write(root, 'src/modules/gws-ea-profile/migration.ts', 'export {};\n');
@@ -244,6 +254,18 @@ describe('release preflight', () => {
     expect(commands).toEqual([]);
   });
 
+  it('rejects an immutable cloudflared pin outside the launcher cohort', async () => {
+    const root = await releaseFixture();
+    const versions = JSON.parse(await readFile(path.join(root, 'versions.json'), 'utf8')) as Record<string, unknown>;
+    versions.cloudflared = `cloudflare/cloudflared:2026.9.2@sha256:${'a'.repeat(64)}`;
+    await write(root, 'versions.json', `${JSON.stringify(versions, null, 2)}\n`);
+    commit(root, 'different cloudflared cohort');
+
+    await expect(runReleasePreflight(await preflightInput(root))).rejects.toMatchObject({
+      code: 'cloudflared_release_mismatch',
+    });
+  });
+
   it('rejects a build that does not emit the service runtime artifacts', async () => {
     const root = await releaseFixture();
     const commands: SetupCommand[] = [];
@@ -290,7 +312,16 @@ describe('release preflight', () => {
     await write(
       root,
       'versions.json',
-      JSON.stringify({ 'onecli-gateway': '1.43.0', 'onecli-cli': '2.2.5' }, null, 2) + '\n',
+      JSON.stringify(
+        {
+          'onecli-gateway': '1.43.0',
+          'onecli-cli': '2.2.5',
+          cloudflared:
+            'cloudflare/cloudflared:2026.9.1@sha256:b269e8abd07a5bf6f3f4be65d5050b2174eca89c56a0241a8ff32a16aec454e4',
+        },
+        null,
+        2,
+      ) + '\n',
     );
     commit(root, 'new OneCLI gateway cohort');
     const commands: SetupCommand[] = [];
@@ -299,6 +330,22 @@ describe('release preflight', () => {
       runReleasePreflight(await preflightInput(root), { runSetupCommand: recorder(commands) }),
     ).rejects.toMatchObject({ code: 'onecli_release_mismatch' });
     expect(commands).toEqual([]);
+  });
+
+  it.each([
+    ['cloudflare/cloudflared:latest'],
+    ['cloudflare/cloudflared:2026.9.1'],
+    ['cloudflare/cloudflared@sha256:' + 'a'.repeat(64)],
+  ])('rejects a mutable or incomplete cloudflared pin: %s', async (image) => {
+    const root = await releaseFixture();
+    const versions = JSON.parse(await readFile(path.join(root, 'versions.json'), 'utf8')) as Record<string, unknown>;
+    versions.cloudflared = image;
+    await write(root, 'versions.json', `${JSON.stringify(versions, null, 2)}\n`);
+    commit(root, 'invalid cloudflared pin');
+
+    await expect(runReleasePreflight(await preflightInput(root))).rejects.toMatchObject({
+      code: 'invalid_release_pin',
+    });
   });
 
   it('rejects an installed OneCLI CLI outside the selected cohort before setup commands', async () => {

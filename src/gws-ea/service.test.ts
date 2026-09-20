@@ -103,6 +103,7 @@ describe('GWS-EA instance runtime', () => {
     });
     expect(secretsDirectory.startsWith(`${config.checkout_realpath}${path.sep}`)).toBe(false);
     expect(environmentFile).toContain(`WEBHOOK_PORT=${config.allocated_ports.nanoclaw_webhook}`);
+    expect(environmentFile).toContain('WEBHOOK_HOST=127.0.0.1');
     expect(environmentFile).toContain(`NANOCLAW_EGRESS_NETWORK=${config.agent_egress_network}`);
     expect(environmentFile).not.toContain('runtime-secret-canary');
     expect(manifest).toContain(config.secret_files.onecli_runtime_api_key);
@@ -123,6 +124,7 @@ describe('GWS-EA instance runtime', () => {
       PATH: '/safe/bin',
       NANOCLAW_INSTALL_ID: 'victim',
       WEBHOOK_PORT: '9',
+      WEBHOOK_HOST: '0.0.0.0',
       ONECLI_URL: 'https://attacker.invalid',
       ONECLI_API_KEY: 'ambient-secret',
       GCHAT_CREDENTIALS: 'ambient-chat-secret',
@@ -132,6 +134,7 @@ describe('GWS-EA instance runtime', () => {
     expect(environment).toMatchObject({
       NANOCLAW_INSTALL_ID: config.install_id,
       WEBHOOK_PORT: String(config.allocated_ports.nanoclaw_webhook),
+      WEBHOOK_HOST: '127.0.0.1',
       NANOCLAW_EGRESS_NETWORK: config.agent_egress_network,
       ONECLI_URL: config.onecli_app_url,
       ONECLI_API_KEY: 'runtime-secret-canary',

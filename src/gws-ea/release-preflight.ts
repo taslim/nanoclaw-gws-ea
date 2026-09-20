@@ -15,6 +15,7 @@ import type { ProviderCredentialMetadata } from '../provider-credential.js';
 import { providerProvisioningCapabilityDigest } from '../provider-provisioning-capability.js';
 import { ONECLI_CLI_VERSION, ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './onecli-compose.js';
 import { assertInstalledOnecliSdkVersion } from './onecli.js';
+import { CLOUDFLARED_IMAGE, validateCloudflaredImagePin } from './cloudflare-connector.js';
 
 const PROVIDER_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const EXACT_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
@@ -227,7 +228,7 @@ function lockSpecifier(section: unknown, dependency: string): string | undefined
 
 async function validatePackageAndPins(
   checkoutRoot: string,
-): Promise<{ packageManager: string; gateway: string; cli: string; sdk: string }> {
+): Promise<{ packageManager: string; gateway: string; cli: string; sdk: string; cloudflaredImage: string }> {
   const manifest = await readJson(path.join(checkoutRoot, 'package.json'), 'package.json');
   const packageManager = typeof manifest.packageManager === 'string' ? manifest.packageManager : '';
   const packageManagerMatch = /^pnpm@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/.exec(packageManager);
@@ -266,10 +267,11 @@ async function validatePackageAndPins(
   const versions = await readJson(path.join(checkoutRoot, 'versions.json'), 'versions.json');
   const gateway = exactVersion(versions['onecli-gateway'], 'OneCLI gateway');
   const cli = exactVersion(versions['onecli-cli'], 'OneCLI CLI');
+  const cloudflaredImage = validateCloudflaredImagePin(versions.cloudflared);
   if (lockSpecifier(rootImporter.dependencies, '@onecli-sh/sdk') !== sdk) {
     throw new GwsEaError('inconsistent_lockfile', 'pnpm lockfile does not match the pinned OneCLI SDK');
   }
-  return { packageManager, gateway, cli, sdk };
+  return { packageManager, gateway, cli, sdk, cloudflaredImage };
 }
 
 async function validateComposition(
@@ -294,6 +296,7 @@ async function validateComposition(
     'src/channels/gchat.ts',
     'src/channels/index.ts',
     'src/gws-ea/process.ts',
+    'src/gws-ea/cloudflare-connector.ts',
     'scripts/init-first-agent.ts',
     'src/modules/gws-ea-profile/index.ts',
     'src/modules/gws-ea-profile/migration.ts',
@@ -350,6 +353,15 @@ function assertLauncherOnecliCohort(pins: { gateway: string; cli: string; sdk: s
   }
 }
 
+function assertLauncherCloudflaredPin(image: string): void {
+  if (image !== CLOUDFLARED_IMAGE) {
+    throw new GwsEaError(
+      'cloudflared_release_mismatch',
+      'The selected release requires a different cloudflared image; update the GWS-EA launcher before provisioning it',
+    );
+  }
+}
+
 async function assertInstalledOnecliCli(
   executable: string,
   expectedVersion: string,
@@ -400,6 +412,7 @@ export async function runReleasePreflight(
   await validateComposition(checkoutRoot, input.provider, runCommand, environments);
   const pins = await validatePackageAndPins(checkoutRoot);
   assertLauncherOnecliCohort(pins);
+  assertLauncherCloudflaredPin(pins.cloudflaredImage);
   await Promise.all([
     assertInstalledOnecliCli(input.onecliCliPath, pins.cli, checkoutRoot, environments.common, runCommand),
     assertInstalledOnecliSdkVersion(pins.sdk),

@@ -297,6 +297,7 @@ function instanceHostConfiguration(config: InstanceRuntimeConfig): Readonly<Reco
     DEFAULT_AGENT_PROVIDER: config.selected_provider,
     NANOCLAW_GATEWAY_PROVIDER: 'onecli',
     WEBHOOK_PORT: String(config.allocated_ports.nanoclaw_webhook),
+    WEBHOOK_HOST: '127.0.0.1',
     NANOCLAW_EGRESS_LOCKDOWN: 'true',
     NANOCLAW_EGRESS_NETWORK: config.agent_egress_network,
     ONECLI_GATEWAY_CONTAINER: config.onecli_gateway_container,
