@@ -5,7 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { stringify } from 'yaml';
 
 import { isErrno } from '../community-portal/errors.js';
-import { preparePrivateLocalDirectory } from './paths.js';
+import { assertPrivateLocalDirectory, preparePrivateLocalDirectory } from './paths.js';
 import {
   buildAllowlistedEnvironment,
   runSanitizedCommand,
@@ -25,6 +25,7 @@ const CONNECTOR_PROJECT = 'gws-ea-cloudflare';
 const CONNECTOR_OWNER = 'shared-cloudflare-ingress';
 const CONNECTOR_ROLE = 'connector';
 const CONNECTOR_TMPFS = '/tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777';
+const CONNECTOR_ENV_FILE = '# Intentionally empty: the connector token is mounted from its owner-only file.\n';
 const EXPECTED_IMAGE_ENVIRONMENT = [
   'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
   'SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt',
@@ -228,10 +229,26 @@ export async function prepareCloudflareConnector(layout: CloudflareConnectorLayo
   await preparePrivateLocalDirectory(layout.secretsDirectory);
   await writeOrVerifyConnectorToken(layout.tokenFile, token);
   await writePrivateTextFile(layout.composeFile, renderCloudflareConnectorCompose(layout));
-  await writePrivateTextFile(
-    layout.envFile,
-    '# Intentionally empty: the connector token is mounted from its owner-only file.\n',
-  );
+  await writePrivateTextFile(layout.envFile, CONNECTOR_ENV_FILE);
+}
+
+export async function validateCloudflareConnectorState(layout: CloudflareConnectorLayout): Promise<void> {
+  try {
+    await assertPrivateLocalDirectory(layout.rootDirectory);
+    await assertPrivateLocalDirectory(layout.secretsDirectory);
+    assertConnectorToken(await readOwnerOnlyFile(layout.tokenFile));
+    if ((await readOwnerOnlyFile(layout.composeFile)) !== renderCloudflareConnectorCompose(layout)) {
+      throw new GwsEaError('cloudflare_connector_state_drift', 'Cloudflare connector Compose state has drifted');
+    }
+    if ((await readOwnerOnlyFile(layout.envFile)) !== CONNECTOR_ENV_FILE) {
+      throw new GwsEaError('cloudflare_connector_state_drift', 'Cloudflare connector environment state has drifted');
+    }
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) {
+      throw new GwsEaError('cloudflare_connector_state_missing', 'Cloudflare connector private state is missing');
+    }
+    throw error;
+  }
 }
 
 function sameArray(left: readonly string[], right: readonly string[]): boolean {
@@ -306,9 +323,10 @@ export async function reconcileCloudflareConnector(
 ): Promise<ObservedCloudflareConnector> {
   const runner = dependencies.runCommand ?? runSanitizedCommand;
   const environment = connectorEnvironment(dependencies.ambientEnv);
-  await prepareCloudflareConnector(layout, token);
+  await preparePrivateLocalDirectory(layout.rootDirectory);
   const before = await inspectCloudflareConnector(layout, runner, environment);
   if (before !== undefined) validateObservedCloudflareConnector(layout, before, { requireRunning: false });
+  await prepareCloudflareConnector(layout, token);
   await runner({
     ...buildCloudflareComposeInvocation(layout, ['up', '--detach', '--remove-orphans']),
     env: environment,

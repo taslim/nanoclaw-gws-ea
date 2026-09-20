@@ -42,14 +42,20 @@ describe('Cloudflare REST boundary', () => {
         );
       }
       if (url.pathname === `/client/v4/accounts/${ACCOUNT_ID}/cfd_tunnel`) {
-        return envelope([{ id: TUNNEL_ID, name: 'gws-ea-owned', config_src: 'cloudflare', status: 'healthy' }], {
-          page: 1,
-          per_page: 50,
-          count: 1,
-          total_count: 1,
-          total_pages: 1,
-        });
+        return envelope(
+          [
+            {
+              id: TUNNEL_ID,
+              name: 'gws-ea-owned',
+              config_src: 'cloudflare',
+              status: 'healthy',
+              connections: [],
+            },
+          ],
+          { page: 1, per_page: 50, count: 1, total_count: 1 },
+        );
       }
+      if (url.pathname === `/client/v4/accounts/${ACCOUNT_ID}/cfd_tunnel/${TUNNEL_ID}`) return envelope({});
       if (url.pathname.endsWith('/configurations')) {
         if (init.method === 'PUT') return envelope({ config: JSON.parse(String(init.body)).config, version: 8 });
         return envelope({ config: { ingress: [{ service: 'http_status:404' }] }, version: 7 });
@@ -61,6 +67,7 @@ describe('Cloudflare REST boundary', () => {
       if (url.pathname === `/client/v4/zones/${ZONE_ID}/dns_records`) {
         return envelope([], { page: 1, per_page: 50, count: 0, total_count: 0, total_pages: 1 });
       }
+      if (url.pathname === `/client/v4/zones/${ZONE_ID}/dns_records/${ZONE_ID}`) return envelope({});
       throw new Error(`unexpected path ${url.pathname}`);
     });
     const api = createCloudflareApi({ accountToken: TOKEN, fetch, baseUrl: 'https://api.test/client/v4' });
@@ -77,11 +84,25 @@ describe('Cloudflare REST boundary', () => {
     ]);
     await expect(api.getTunnelToken(ACCOUNT_ID, TUNNEL_ID)).resolves.toBe('connector-token');
     await expect(api.listDnsRecords(ZONE_ID, 'assistant.example.com')).resolves.toEqual([]);
+    await expect(api.deleteDnsRecord(ZONE_ID, ZONE_ID)).resolves.toBeUndefined();
+    await expect(api.deleteTunnel(ACCOUNT_ID, TUNNEL_ID)).resolves.toBeUndefined();
 
     expect(seen.every(({ init }) => new Headers(init.headers).get('authorization') === `Bearer ${TOKEN}`)).toBe(true);
     expect(seen.every(({ init }) => !new Headers(init.headers).has('x-auth-email'))).toBe(true);
     expect(seen.every(({ init }) => !new Headers(init.headers).has('x-auth-key'))).toBe(true);
     expect(seen.some(({ url }) => /\/cfd_tunnel\/.+\/connections$/u.test(url.pathname))).toBe(true);
+    expect(
+      seen.some(
+        ({ url, init }) =>
+          init.method === 'DELETE' && url.pathname === `/client/v4/zones/${ZONE_ID}/dns_records/${ZONE_ID}`,
+      ),
+    ).toBe(true);
+    expect(
+      seen.some(
+        ({ url, init }) =>
+          init.method === 'DELETE' && url.pathname === `/client/v4/accounts/${ACCOUNT_ID}/cfd_tunnel/${TUNNEL_ID}`,
+      ),
+    ).toBe(true);
     expect(seen.every(({ url }) => !url.pathname.includes('/tunnels/'))).toBe(true);
     expect(
       JSON.stringify(seen.map(({ url, init }) => ({ url: url.toString(), method: init.method, body: init.body }))),
@@ -204,7 +225,7 @@ describe('Cloudflare REST boundary', () => {
     expect(sleeps).toEqual([100, 200]);
   });
 
-  it('returns sanitized actionable capability failures and rejects deprecated embedded connection state', async () => {
+  it('returns sanitized capability failures and accepts the documented tunnel-list response shape', async () => {
     const denied = createCloudflareApi({
       accountToken: TOKEN,
       baseUrl: 'https://api.test/client/v4',
@@ -218,7 +239,7 @@ describe('Cloudflare REST boundary', () => {
     await expect(denied.listActiveZones()).rejects.toMatchObject({ code: 'cloudflare_capability_missing' });
     await expect(denied.listActiveZones()).rejects.not.toThrow(TOKEN);
 
-    const deprecated = createCloudflareApi({
+    const documented = createCloudflareApi({
       accountToken: TOKEN,
       baseUrl: 'https://api.test/client/v4',
       fetch: vi.fn<typeof globalThis.fetch>(async () =>
@@ -232,13 +253,13 @@ describe('Cloudflare REST boundary', () => {
               connections: [],
             },
           ],
-          { page: 1, per_page: 50, count: 1, total_count: 1, total_pages: 1 },
+          { page: 1, per_page: 50, count: 1, total_count: 1 },
         ),
       ),
     });
-    await expect(deprecated.listTunnels(ACCOUNT_ID, 'gws-ea-owned')).rejects.toMatchObject({
-      code: 'deprecated_cloudflare_surface',
-    });
+    await expect(documented.listTunnels(ACCOUNT_ID, 'gws-ea-owned')).resolves.toEqual([
+      { id: TUNNEL_ID, name: 'gws-ea-owned', configSource: 'cloudflare', status: 'healthy' },
+    ]);
   });
 
   it('accepts the documented uninitialized tunnel-configuration response without inventing routes', async () => {

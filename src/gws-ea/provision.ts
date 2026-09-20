@@ -99,6 +99,7 @@ import {
   createCloudflareConnectorLayout,
   inspectCloudflareConnector,
   reconcileCloudflareConnector,
+  validateCloudflareConnectorState,
   validateObservedCloudflareConnector,
 } from './cloudflare-connector.js';
 
@@ -197,6 +198,7 @@ export interface ProductionProvisionDependencies {
   readonly reconcileManagedCloudflareIngress: typeof reconcileManagedCloudflareIngress;
   readonly createCloudflareConnectorLayout: typeof createCloudflareConnectorLayout;
   readonly inspectCloudflareConnector: typeof inspectCloudflareConnector;
+  readonly validateCloudflareConnectorState: typeof validateCloudflareConnectorState;
   readonly validateObservedCloudflareConnector: typeof validateObservedCloudflareConnector;
   readonly reconcileCloudflareConnector: typeof reconcileCloudflareConnector;
   readonly managedConnectionDelay: (milliseconds: number) => Promise<void>;
@@ -556,6 +558,7 @@ const defaultProductionDependencies: ProductionProvisionDependencies = {
   reconcileManagedCloudflareIngress,
   createCloudflareConnectorLayout,
   inspectCloudflareConnector,
+  validateCloudflareConnectorState,
   validateObservedCloudflareConnector,
   reconcileCloudflareConnector,
   managedConnectionDelay: delay,
@@ -621,6 +624,8 @@ function managedLocalEndpoint(context: ProductionProvisionContext): string {
 
 const REPAIRABLE_MANAGED_TRANSPORT_CODES = new Set([
   'cloudflare_connector_missing',
+  'cloudflare_connector_state_missing',
+  'cloudflare_connector_state_drift',
   'unhealthy_connector',
   'endpoint_unreachable',
   'endpoint_redirect',
@@ -649,6 +654,7 @@ async function probeManagedTransport(
       throw new GwsEaError('cloudflare_connector_missing', 'The shared Cloudflare connector is not running');
     }
     dependencies.validateObservedCloudflareConnector(layout, connector);
+    await dependencies.validateCloudflareConnectorState(layout);
     await dependencies.verifyManagedRoute({
       endpointUrl: context.input.runtime.endpoint_url,
       localEndpointUrl: managedLocalEndpoint(context),

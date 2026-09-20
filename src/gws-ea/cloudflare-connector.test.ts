@@ -16,6 +16,7 @@ import {
   reconcileCloudflareConnector,
   renderCloudflareConnectorCompose,
   stopCloudflareConnector,
+  validateCloudflareConnectorState,
   validateObservedCloudflareConnector,
   type CloudflareConnectorLayout,
   type ObservedCloudflareConnector,
@@ -188,10 +189,15 @@ describe('shared Cloudflare connector', () => {
     expect(await readFile(connector.composeFile, 'utf8')).not.toContain(canary);
     expect(await readFile(connector.envFile, 'utf8')).not.toContain(canary);
     expect(connector.rootDirectory).not.toContain(`${path.sep}instances${path.sep}`);
+    await expect(validateCloudflareConnectorState(connector)).resolves.toBeUndefined();
 
     await prepareCloudflareConnector(connector, canary);
     await expect(prepareCloudflareConnector(connector, 'different-token')).rejects.toMatchObject({
       code: 'connector_token_conflict',
+    });
+    await rm(connector.tokenFile);
+    await expect(validateCloudflareConnectorState(connector)).rejects.toMatchObject({
+      code: 'cloudflare_connector_state_missing',
     });
   });
 
@@ -299,6 +305,7 @@ describe('shared Cloudflare connector', () => {
       code: 'unsafe_connector_image',
     });
     expect(calls.some((call) => call.args.includes('up'))).toBe(false);
+    await expect(readFile(connector.tokenFile, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
 
     calls.length = 0;
     inspection = inspectJson(connector);

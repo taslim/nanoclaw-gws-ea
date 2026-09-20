@@ -3,14 +3,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { CloudflareApi } from './cloudflare-api.js';
+import { writePrivate } from '../community-portal/private-file.js';
+import { CloudflareAmbiguousMutationError, type CloudflareApi } from './cloudflare-api.js';
 import {
   assertManagedCloudflareConfigurationOwnership,
   cloudflareDnsOwnershipComment,
   reconcileManagedCloudflareIngress,
+  replaceManagedCloudflareConfiguration,
   renderManagedCloudflareConfiguration,
 } from './cloudflare-ingress.js';
-import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+import { preparePrivateLocalDirectory, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { allocateInstanceId, readRegistry, reserveInstance, withLockedCloudflareRegistry } from './registry.js';
 import { GwsEaError } from './types.js';
 import type { InstanceReservationInput } from './types.js';
@@ -180,6 +182,32 @@ describe('managed Cloudflare desired state', () => {
     ).rejects.toMatchObject({ code: 'reservation_mismatch' });
   });
 
+  it('blocks every managed reconciliation while an assistant removal receipt is active', async () => {
+    const paths = await testPaths();
+    const removing = managedReservation(paths, 'removing.example.com', 31_100);
+    await reserveInstance(paths, removing);
+    await reserveInstance(paths, managedReservation(paths, 'peer.example.com', 31_200));
+    await preparePrivateLocalDirectory(paths.removalRoot);
+    await writePrivate(paths.removalFile(removing.instance_id), { active: true });
+    const api = {
+      verifyToken: vi.fn(),
+      listActiveZones: vi.fn(),
+      listTunnels: vi.fn(),
+      listDnsRecords: vi.fn(),
+      createTunnel: vi.fn(),
+      replaceTunnelConfiguration: vi.fn(),
+      createDnsRecord: vi.fn(),
+    } as unknown as CloudflareApi;
+
+    await expect(
+      reconcileManagedCloudflareIngress(paths, api, { originHost: 'host.docker.internal' }),
+    ).rejects.toMatchObject({ code: 'removal_in_progress' });
+    expect(api.verifyToken).not.toHaveBeenCalled();
+    expect(api.listTunnels).not.toHaveBeenCalled();
+    expect(api.replaceTunnelConfiguration).not.toHaveBeenCalled();
+    expect(api.createDnsRecord).not.toHaveBeenCalled();
+  });
+
   it.each(['foreign-config', 'foreign-dns'] as const)('refuses %s before overwriting it', async (kind) => {
     const paths = await testPaths();
     const input = managedReservation(paths, 'assistant.example.com', 31_100);
@@ -233,7 +261,7 @@ describe('managed Cloudflare desired state', () => {
     }
   });
 
-  it('observes deterministic tunnel and DNS identity after ambiguous creates before retrying', async () => {
+  it('polls deterministic tunnel and DNS identity after ambiguous creates without repeating either POST', async () => {
     const paths = await testPaths();
     const input = managedReservation(paths, 'assistant.example.com', 31_100);
     await reserveInstance(paths, input);
@@ -260,26 +288,71 @@ describe('managed Cloudflare desired state', () => {
       listActiveZones: vi.fn(async () => [
         { zoneId: ZONE_ID, name: 'example.com', status: 'active', accountId: ACCOUNT_ID, accountName: 'Example' },
       ]),
-      listTunnels: vi.fn(async () => (++tunnelReads === 1 ? [] : [tunnel])),
+      listTunnels: vi.fn(async () => (++tunnelReads <= 2 ? [] : [tunnel])),
       createTunnel: vi.fn(async () => {
-        throw new Error('ambiguous');
+        throw new CloudflareAmbiguousMutationError('create the managed tunnel');
       }),
       getTunnelConfiguration: vi.fn(async () => ({ config, version: 1 })),
       replaceTunnelConfiguration: vi.fn(async (_a: string, _t: string, desired: unknown) => {
         config = desired;
         return { config, version: 2 };
       }),
-      listDnsRecords: vi.fn(async () => (++dnsReads === 1 ? [] : [dns])),
+      listDnsRecords: vi.fn(async () => (++dnsReads <= 2 ? [] : [dns])),
       createDnsRecord: vi.fn(async () => {
-        throw new Error('ambiguous');
+        throw new CloudflareAmbiguousMutationError('create the owned DNS record');
       }),
     } as unknown as CloudflareApi;
+    const sleep = vi.fn(async () => undefined);
 
     await expect(
-      reconcileManagedCloudflareIngress(paths, api, { originHost: 'host.docker.internal' }),
+      reconcileManagedCloudflareIngress(paths, api, { originHost: 'host.docker.internal', sleep }),
     ).resolves.toMatchObject({ tunnelId: TUNNEL_ID });
     expect(api.createTunnel).toHaveBeenCalledOnce();
     expect(api.createDnsRecord).toHaveBeenCalledOnce();
+    expect(sleep).toHaveBeenCalledTimes(2);
+  });
+
+  it('observes or retries one ambiguous full-configuration write and always verifies readback', async () => {
+    const desired = {
+      ingress: [
+        {
+          hostname: 'assistant.example.com',
+          path: '^/webhook/gchat$' as const,
+          service: 'http://host.docker.internal:31100',
+        },
+        { service: 'http_status:404' as const },
+      ],
+    };
+    const old = { ingress: [{ service: 'http_status:404' }] };
+    const observedAfterAmbiguous = {
+      replaceTunnelConfiguration: vi.fn(async () => {
+        throw new CloudflareAmbiguousMutationError('replace the tunnel configuration');
+      }),
+      getTunnelConfiguration: vi.fn(async () => ({ config: desired, initialized: true, version: 2 })),
+    } as unknown as CloudflareApi;
+    await expect(
+      replaceManagedCloudflareConfiguration(observedAfterAmbiguous, ACCOUNT_ID, TUNNEL_ID, desired),
+    ).resolves.toBe(2);
+    expect(observedAfterAmbiguous.replaceTunnelConfiguration).toHaveBeenCalledOnce();
+
+    let writes = 0;
+    let reads = 0;
+    const retriedAfterOldReadback = {
+      replaceTunnelConfiguration: vi.fn(async () => {
+        writes += 1;
+        if (writes === 1) throw new CloudflareAmbiguousMutationError('replace the tunnel configuration');
+        return { config: desired, initialized: true, version: 3 };
+      }),
+      getTunnelConfiguration: vi.fn(async () => {
+        reads += 1;
+        return { config: reads === 1 ? old : desired, initialized: true, version: reads === 1 ? 1 : 3 };
+      }),
+    } as unknown as CloudflareApi;
+    await expect(
+      replaceManagedCloudflareConfiguration(retriedAfterOldReadback, ACCOUNT_ID, TUNNEL_ID, desired),
+    ).resolves.toBe(3);
+    expect(retriedAfterOldReadback.replaceTunnelConfiguration).toHaveBeenCalledTimes(2);
+    expect(retriedAfterOldReadback.getTunnelConfiguration).toHaveBeenCalledTimes(2);
   });
 
   it.each(['zones', 'tunnels', 'dns'] as const)(

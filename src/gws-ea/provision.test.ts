@@ -800,6 +800,7 @@ describe('production provision phase composition', () => {
           return observedConnector;
         }),
         inspectCloudflareConnector: vi.fn(async () => (connectorReady ? observedConnector : undefined)),
+        validateCloudflareConnectorState: vi.fn(async () => undefined),
         validateObservedCloudflareConnector: vi.fn(),
         verifyManagedRoute: vi.fn(async ({ endpointUrl, localEndpointUrl }) => {
           expect(connectorReady).toBe(true);
@@ -845,6 +846,7 @@ describe('production provision phase composition', () => {
       const phase = createProductionProvisionRegistry(context, {
         createCloudflareApi,
         inspectCloudflareConnector: vi.fn(async () => observedConnector),
+        validateCloudflareConnectorState: vi.fn(async () => undefined),
         validateObservedCloudflareConnector: vi.fn(),
         verifyManagedRoute: vi.fn(async ({ endpointUrl }) => ({
           endpointUrl,
@@ -857,6 +859,36 @@ describe('production provision phase composition', () => {
 
     expect(requestCloudflareAccountToken).not.toHaveBeenCalled();
     expect(createCloudflareApi).not.toHaveBeenCalled();
+  });
+
+  it('marks missing durable connector state for managed repair instead of accepting a live container', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, managedReservation(paths));
+    const observedConnector = Object.freeze({}) as ObservedCloudflareConnector;
+    const requestCloudflareAccountToken = vi.fn();
+    const verifyManagedRoute = vi.fn();
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const base = productionContext(operation, reserved);
+      const context: ProductionProvisionContext = {
+        ...base,
+        input: { ...base.input, requestCloudflareAccountToken },
+      };
+      const phase = createProductionProvisionRegistry(context, {
+        inspectCloudflareConnector: vi.fn(async () => observedConnector),
+        validateObservedCloudflareConnector: vi.fn(),
+        validateCloudflareConnectorState: vi.fn(async () => {
+          throw new GwsEaError('cloudflare_connector_state_missing', 'Cloudflare connector private state is missing');
+        }),
+        verifyManagedRoute,
+      }).establish_transport;
+
+      await expect(phase.probe(context)).resolves.toEqual({ status: 'absent' });
+      expect(context.state.managedTransportObservation).toBe('Cloudflare connector private state is missing');
+    });
+
+    expect(verifyManagedRoute).not.toHaveBeenCalled();
+    expect(requestCloudflareAccountToken).not.toHaveBeenCalled();
   });
 
   it('refuses unsafe connector ownership before requesting account authority or mutating Cloudflare', async () => {
@@ -951,6 +983,7 @@ describe('production provision phase composition', () => {
           dnsRecordIds: {},
         })),
         inspectCloudflareConnector: vi.fn(async () => observedConnector),
+        validateCloudflareConnectorState: vi.fn(async () => undefined),
         validateObservedCloudflareConnector: vi.fn(),
         reconcileCloudflareConnector: vi.fn(async () => observedConnector),
         verifyManagedRoute,

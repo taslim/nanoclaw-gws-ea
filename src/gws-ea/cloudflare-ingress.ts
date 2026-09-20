@@ -1,3 +1,5 @@
+import { setTimeout as delay } from 'node:timers/promises';
+
 import {
   CloudflareAmbiguousMutationError,
   type CloudflareApi,
@@ -5,13 +7,16 @@ import {
   type CloudflareDnsRecordWrite,
   type CloudflareTunnel,
 } from './cloudflare-api.js';
-import { withLockedCloudflareRegistry } from './registry.js';
+import { activeRemovalInstanceIds, withLockedCloudflareRegistry } from './registry.js';
 import { GwsEaError, type InstanceRegistry, type InstanceReservation } from './types.js';
 import { isRecord } from './validation.js';
 import type { ControlPlanePaths } from './paths.js';
 
 export const GCHAT_TUNNEL_PATH = '^/webhook/gchat$';
 const CATCH_ALL_SERVICE = 'http_status:404';
+const AMBIGUOUS_CREATE_OBSERVATION_DELAYS_MS = [100, 250] as const;
+
+type Sleep = (milliseconds: number) => Promise<void>;
 
 export type CloudflareOriginHost = '127.0.0.1' | 'host.docker.internal';
 
@@ -217,43 +222,42 @@ function chooseOwnedDnsRecord(
   return record;
 }
 
-async function observeAfterCreateFailure<T>(error: unknown, observe: () => Promise<T>): Promise<T> {
-  try {
-    return await observe();
-  } catch (observationError) {
-    if (!(error instanceof CloudflareAmbiguousMutationError) && error instanceof GwsEaError) throw error;
-    throw observationError;
+async function observeCreatedResource<T>(
+  error: GwsEaError,
+  observe: () => Promise<T | undefined>,
+  sleep: Sleep,
+): Promise<T> {
+  const attempts =
+    error instanceof CloudflareAmbiguousMutationError ? AMBIGUOUS_CREATE_OBSERVATION_DELAYS_MS.length + 1 : 1;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const observed = await observe();
+      if (observed !== undefined) return observed;
+    } catch (observationError) {
+      if (!(error instanceof CloudflareAmbiguousMutationError)) throw error;
+      throw observationError;
+    }
+    const wait = AMBIGUOUS_CREATE_OBSERVATION_DELAYS_MS[attempt];
+    if (wait !== undefined) await sleep(wait);
   }
+  throw error;
 }
 
 async function createOrObserveTunnel(
   api: CloudflareApi,
   accountId: string,
   tunnelName: string,
+  sleep: Sleep,
 ): Promise<CloudflareTunnel> {
   try {
     return assertTunnel(await api.createTunnel(accountId, tunnelName), tunnelName);
   } catch (error) {
-    const observed = await observeAfterCreateFailure(error, async () =>
-      chooseOwnedTunnel(await api.listTunnels(accountId, tunnelName), tunnelName),
+    if (!(error instanceof GwsEaError)) throw error;
+    return observeCreatedResource(
+      error,
+      async () => chooseOwnedTunnel(await api.listTunnels(accountId, tunnelName), tunnelName),
+      sleep,
     );
-    if (observed) return observed;
-    if (!(error instanceof CloudflareAmbiguousMutationError)) {
-      if (error instanceof GwsEaError) throw error;
-      throw new GwsEaError('cloudflare_tunnel_create_failed', 'Cloudflare did not create the reserved managed tunnel');
-    }
-    try {
-      return assertTunnel(await api.createTunnel(accountId, tunnelName), tunnelName);
-    } catch (retryError) {
-      const retried = await observeAfterCreateFailure(retryError, async () =>
-        chooseOwnedTunnel(await api.listTunnels(accountId, tunnelName), tunnelName),
-      );
-      if (retried) return retried;
-      if (!(retryError instanceof CloudflareAmbiguousMutationError) && retryError instanceof GwsEaError) {
-        throw retryError;
-      }
-      throw error;
-    }
   }
 }
 
@@ -288,6 +292,7 @@ async function createOrObserveDnsRecord(
   api: CloudflareApi,
   zoneId: string,
   desired: CloudflareDnsRecordWrite,
+  sleep: Sleep,
 ): Promise<CloudflareDnsRecord> {
   try {
     const created = await api.createDnsRecord(zoneId, desired);
@@ -296,38 +301,27 @@ async function createOrObserveDnsRecord(
     }
     return created;
   } catch (error) {
-    const observed = await observeAfterCreateFailure(error, async () =>
-      chooseOwnedDnsRecord(await api.listDnsRecords(zoneId, desired.name), desired, null),
+    if (!(error instanceof GwsEaError)) throw error;
+    return observeCreatedResource(
+      error,
+      async () => chooseOwnedDnsRecord(await api.listDnsRecords(zoneId, desired.name), desired, null),
+      sleep,
     );
-    if (observed) return observed;
-    if (!(error instanceof CloudflareAmbiguousMutationError)) {
-      if (error instanceof GwsEaError) throw error;
-      throw new GwsEaError('cloudflare_dns_create_failed', `Cloudflare did not create owned DNS name ${desired.name}`);
-    }
-    try {
-      const created = await api.createDnsRecord(zoneId, desired);
-      if (!dnsMatches(created, desired))
-        throw new GwsEaError('cloudflare_dns_drift', 'Cloudflare DNS readback drifted');
-      return created;
-    } catch (retryError) {
-      const retried = await observeAfterCreateFailure(retryError, async () =>
-        chooseOwnedDnsRecord(await api.listDnsRecords(zoneId, desired.name), desired, null),
-      );
-      if (retried) return retried;
-      if (!(retryError instanceof CloudflareAmbiguousMutationError) && retryError instanceof GwsEaError) {
-        throw retryError;
-      }
-      throw error;
-    }
   }
 }
 
 export async function reconcileManagedCloudflareIngress(
   paths: ControlPlanePaths,
   api: CloudflareApi,
-  options: { readonly originHost: CloudflareOriginHost },
+  options: { readonly originHost: CloudflareOriginHost; readonly sleep?: Sleep },
 ): Promise<ManagedCloudflareReconcileResult> {
   return withLockedCloudflareRegistry(paths, async (locked) => {
+    if ((await activeRemovalInstanceIds(paths, locked.registry)).length > 0) {
+      throw new GwsEaError(
+        'removal_in_progress',
+        'An assistant removal is in progress; retry managed ingress reconciliation after it completes',
+      );
+    }
     let registry = locked.registry;
     const metadata = registry.shared_infrastructure_metadata.cloudflare;
     const reservations = managedReservations(registry);
@@ -387,7 +381,8 @@ export async function reconcileManagedCloudflareIngress(
     }
 
     let tunnel = existingTunnel;
-    if (!tunnel) tunnel = await createOrObserveTunnel(api, metadata.account_id, metadata.tunnel_name);
+    const sleep = options.sleep ?? delay;
+    if (!tunnel) tunnel = await createOrObserveTunnel(api, metadata.account_id, metadata.tunnel_name, sleep);
 
     const desired = renderManagedCloudflareConfiguration(registry, options.originHost);
     const currentConfiguration = await api.getTunnelConfiguration(metadata.account_id, tunnel.id);
@@ -420,7 +415,7 @@ export async function reconcileManagedCloudflareIngress(
       if (claim.mode !== 'managed-cloudflare') {
         throw new GwsEaError('invalid_registry', 'Managed DNS claim changed during reconciliation');
       }
-      const record = state.record ?? (await createOrObserveDnsRecord(api, claim.zone_id, state.desired));
+      const record = state.record ?? (await createOrObserveDnsRecord(api, claim.zone_id, state.desired, sleep));
       dnsRecordIds[instance.instance_id] = record.id;
       if (claim.dns_record_id !== record.id) {
         registry = await locked.updateCoordinates({ dnsRecordIds: { [instance.instance_id]: record.id } });

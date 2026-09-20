@@ -150,16 +150,21 @@ function requireDnsName(value: string): string {
 
 function parseResultInfo(value: unknown): CloudflareResultInfo {
   if (!isRecord(value)) throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare pagination is missing');
-  const { page, total_pages: totalPages } = value;
-  if (
-    typeof page !== 'number' ||
-    !Number.isInteger(page) ||
-    page < 1 ||
-    typeof totalPages !== 'number' ||
-    !Number.isInteger(totalPages) ||
-    totalPages < page ||
-    totalPages > MAX_PAGES
-  ) {
+  const { page, per_page: perPage, total_count: totalCount, total_pages: reportedTotalPages } = value;
+  if (typeof page !== 'number' || !Number.isInteger(page) || page < 1) {
+    throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare pagination is invalid');
+  }
+  const totalPages =
+    reportedTotalPages === undefined &&
+    typeof perPage === 'number' &&
+    Number.isInteger(perPage) &&
+    perPage > 0 &&
+    typeof totalCount === 'number' &&
+    Number.isInteger(totalCount) &&
+    totalCount >= 0
+      ? Math.max(1, Math.ceil(totalCount / perPage))
+      : reportedTotalPages;
+  if (typeof totalPages !== 'number' || !Number.isInteger(totalPages) || totalPages < page || totalPages > MAX_PAGES) {
     throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare pagination is invalid');
   }
   return { page, totalPages };
@@ -233,12 +238,6 @@ function retryDelay(response: Response, attempt: number): number {
 
 function parseTunnel(value: unknown): CloudflareTunnel {
   if (!isRecord(value)) throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare returned an invalid tunnel');
-  if (Object.hasOwn(value, 'connections')) {
-    throw new GwsEaError(
-      'deprecated_cloudflare_surface',
-      'Cloudflare returned deprecated embedded tunnel connections; refusing the legacy response surface.',
-    );
-  }
   if (value.config_src !== 'cloudflare') {
     throw new GwsEaError('foreign_cloudflare_tunnel', 'Cloudflare tunnel is not remotely managed by Cloudflare');
   }
