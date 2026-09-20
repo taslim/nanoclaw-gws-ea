@@ -11,7 +11,8 @@ set -euo pipefail
 #      OAuth dance works and its token is captured into a tempfile.
 #   2. Parse the sk-ant-oat…AA token out of the capture via the shared
 #      PTY-capture parser (setup/lib/captured-token.ts).
-#   3. Register it with OneCLI.
+#   3. Register it with OneCLI, or write it to an explicitly requested
+#      owner-only handoff file for a caller that owns its own isolated vault.
 #
 # Env overrides:
 #   SECRET_NAME   OneCLI secret name   (default: Anthropic)
@@ -24,8 +25,22 @@ set -euo pipefail
 SECRET_NAME="${SECRET_NAME:-Anthropic}"
 HOST_PATTERN="${HOST_PATTERN:-api.anthropic.com}"
 
-command -v onecli >/dev/null \
-  || { echo "onecli not found. Install it first (see /setup §4)." >&2; exit 1; }
+output_file=""
+if [ "${1:-}" = "--output-file" ]; then
+  output_file="${2:-}"
+  if [ -z "$output_file" ] || [ "${output_file#/}" = "$output_file" ] || [ "$#" -ne 2 ]; then
+    echo "Usage: $0 [--output-file /absolute/owner-only/path]" >&2
+    exit 2
+  fi
+elif [ "$#" -ne 0 ]; then
+  echo "Usage: $0 [--output-file /absolute/owner-only/path]" >&2
+  exit 2
+fi
+
+if [ -z "$output_file" ]; then
+  command -v onecli >/dev/null \
+    || { echo "onecli not found. Install it first (see /setup §4)." >&2; exit 1; }
+fi
 
 if ! command -v claude >/dev/null 2>&1; then
   echo "Claude Code CLI not found — installing it now (needed for subscription sign-in)…"
@@ -114,10 +129,21 @@ if [ -z "$token" ]; then
   exit 1
 fi
 
+if [ -n "$output_file" ]; then
+  umask 077
+  if [ -e "$output_file" ] || [ -L "$output_file" ]; then
+    echo "Credential output path already exists; refusing to overwrite it." >&2
+    exit 1
+  fi
+  printf '%s' "$token" > "$output_file"
+  echo
+  echo "Claude sign-in complete."
+  exit 0
+fi
+
 echo
 echo "Got token: ${token:0:16}…${token: -4}"
 echo "Saving it to your OneCLI vault as '${SECRET_NAME}' (host: ${HOST_PATTERN})…"
-
 onecli secrets create \
   --name "$SECRET_NAME" \
   --type anthropic \

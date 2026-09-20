@@ -112,16 +112,16 @@ registerChannelAdapter('gchat', {
     if (!endpointUrl) {
       throw new Error('Google Chat configuration requires GCHAT_ENDPOINT_URL');
     }
-    if (!botUserId) {
-      throw new Error('Google Chat configuration requires GCHAT_BOT_USER_ID');
-    }
-
     const credentials = parseCredentials(credentialsRaw);
     validateEndpointUrl(endpointUrl);
-    validateBotUserId(botUserId);
+    if (botUserId) validateBotUserId(botUserId);
     rejectAlternateVerifierConfiguration();
 
-    const gchatAdapter = createGoogleChatAdapter({ credentials, endpointUrl, botUserId });
+    const gchatAdapter = createGoogleChatAdapter({
+      credentials,
+      endpointUrl,
+      ...(botUserId ? { botUserId } : {}),
+    });
     return createChatSdkBridge({
       adapter: gchatAdapter,
       concurrency: 'concurrent',

@@ -1,0 +1,101 @@
+#!/bin/bash
+
+set -euo pipefail
+
+stat_owner_mode() {
+  if /usr/bin/stat -f '%u %Lp' "$1" >/dev/null 2>&1; then
+    /usr/bin/stat -f '%u %Lp' "$1"
+  else
+    /usr/bin/stat -c '%u %a' "$1"
+  fi
+}
+
+trusted_directory() {
+  local directory="$1" owner mode parent
+  [ "${directory#/}" != "$directory" ] || return 1
+  directory="$(cd -P "$directory" 2>/dev/null && pwd)" || return 1
+  while true; do
+    IFS=' ' read -r owner mode <<EOF
+$(stat_owner_mode "$directory")
+EOF
+    [ "$owner" = '0' ] || [ "$owner" = "$UID" ] || return 1
+    # Publicly writable paths are never executable search roots. Root/current-
+    # user-owned group-writable directories keep Homebrew and /Applications usable.
+    (( (8#$mode & 2) == 0 )) || return 1
+    [ "$directory" = '/' ] && return 0
+    parent="${directory%/*}"
+    [ -n "$parent" ] || parent='/'
+    directory="$parent"
+  done
+}
+
+canonical_file() {
+  local candidate="$1" directory target
+  while [ -L "$candidate" ]; do
+    target="$(/usr/bin/readlink "$candidate")" || return 1
+    if [ "${target#/}" != "$target" ]; then
+      candidate="$target"
+    else
+      directory="${candidate%/*}"
+      [ -n "$directory" ] || directory='.'
+      candidate="$directory/$target"
+    fi
+  done
+  directory="${candidate%/*}"
+  [ -n "$directory" ] || directory='.'
+  directory="$(cd -P "$directory" 2>/dev/null && pwd)" || return 1
+  printf '%s/%s\n' "$directory" "${candidate##*/}"
+}
+
+trusted_executable() {
+  local candidate canonical owner mode directory
+  candidate="$1"
+  [ -f "$candidate" ] && [ -x "$candidate" ] || return 1
+  canonical="$(canonical_file "$candidate")" || return 1
+  [ -f "$canonical" ] && [ -x "$canonical" ] || return 1
+  IFS=' ' read -r owner mode <<EOF
+$(stat_owner_mode "$canonical")
+EOF
+  [ "$owner" = '0' ] || [ "$owner" = "$UID" ] || return 1
+  (( (8#$mode & 18) == 0 )) || return 1
+  directory="${canonical%/*}"
+  trusted_directory "$directory" || return 1
+  printf '%s\n' "$canonical"
+}
+
+# This is the minimal bootstrap boundary before the TypeScript control plane's
+# shared resolver takes over every subsequent child process.
+NODE=''
+SAFE_PATH=''
+IFS=':' read -r -a SEARCH_DIRECTORIES <<< "${PATH:-}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+for directory in "${SEARCH_DIRECTORIES[@]}"; do
+  [ -n "$directory" ] || continue
+  if trusted_directory "$directory"; then
+    canonical_directory="$(cd -P "$directory" && pwd)"
+    case ":$SAFE_PATH:" in
+      *":$canonical_directory:"*) ;;
+      *) SAFE_PATH="${SAFE_PATH:+$SAFE_PATH:}$canonical_directory" ;;
+    esac
+    if [ -z "$NODE" ] && [ -x "$canonical_directory/node" ]; then
+      NODE="$(trusted_executable "$canonical_directory/node" || true)"
+    fi
+  fi
+done
+[ -n "$NODE" ] || { printf '%s\n' 'No trusted Node.js executable is available.' >&2; exit 1; }
+export PATH="$SAFE_PATH"
+
+SCRIPT="${BASH_SOURCE[0]}"
+while [ -h "$SCRIPT" ]; do
+  SCRIPT_PARENT="${SCRIPT%/*}"
+  [ -n "$SCRIPT_PARENT" ] || SCRIPT_PARENT='.'
+  DIR="$(cd -P "$SCRIPT_PARENT" && pwd)"
+  SCRIPT="$(/usr/bin/readlink "$SCRIPT")"
+  [[ "$SCRIPT" != /* ]] && SCRIPT="$DIR/$SCRIPT"
+done
+SCRIPT_PARENT="${SCRIPT%/*}"
+[ -n "$SCRIPT_PARENT" ] || SCRIPT_PARENT='.'
+SCRIPT_DIR="$(cd -P "$SCRIPT_PARENT" && pwd)"
+PROJECT_ROOT="${SCRIPT_DIR%/*}"
+
+cd "$PROJECT_ROOT"
+exec "$NODE" --import tsx setup/gws-ea.ts "$@"

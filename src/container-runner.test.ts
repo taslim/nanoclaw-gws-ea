@@ -156,6 +156,20 @@ describe('composeSessionSpec', () => {
     expect(compose().containers[0].env.NANOCLAW_MAILBOX_BACKEND).toBe('sqlite');
   });
 
+  it('does not copy host-only runtime values into the agent environment', () => {
+    vi.stubEnv('GCHAT_CREDENTIALS', 'gchat-secret-canary');
+    vi.stubEnv('ONECLI_API_KEY', 'onecli-secret-canary');
+    try {
+      const agent = compose().containers[0];
+      for (const key of ['GCHAT_CREDENTIALS', 'ONECLI_API_KEY']) {
+        expect(agent.env).not.toHaveProperty(key);
+        expect(agent.contributedEnv).not.toHaveProperty(key);
+      }
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('the gateway contribution fills the contributed lane last and wins a collision', () => {
     const spec = compose({
       contribution: { env: { HTTPS_PROXY: 'http://provider:1' } },

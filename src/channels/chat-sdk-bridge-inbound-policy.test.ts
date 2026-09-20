@@ -140,6 +140,11 @@ describe('registerBridgeInboundPolicy', () => {
     const content = calls[0].message.content as Record<string, unknown>;
     expect(content.text).toBe('hello there');
     expect(content.policyTag).toBe('wrapped:slack');
+    expect(calls[0].message.authenticatedSender).toEqual({
+      userId: 'U123',
+      displayName: 'A Human',
+      kind: 'human',
+    });
 
     await bridge.teardown();
   });
