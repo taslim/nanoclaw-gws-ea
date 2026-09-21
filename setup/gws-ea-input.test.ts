@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { GWS_EA_RELEASE_REMOTE } from '../src/gws-ea/release-tracks.js';
 import type { SetupProviderEntry } from './providers/registry.js';
 import { authenticateGwsEaProvider, collectGwsEaCreateInput } from './gws-ea-input.js';
 
@@ -53,7 +54,6 @@ describe('GWS-EA interactive create input', () => {
         instanceId: '11111111-1111-4111-8111-111111111111',
         track: 'dogfood',
         provided: {
-          'source-remote': 'https://example.test/nanoclaw.git',
           endpoint: 'https://assistant.example.test/webhook/gchat',
           'workspace-email': 'ada@example.test',
         },
@@ -76,12 +76,13 @@ describe('GWS-EA interactive create input', () => {
     );
 
     expect(select).not.toHaveBeenCalled();
+    expect(text).toHaveBeenCalledTimes(5);
     expect(text).toHaveBeenNthCalledWith(
       5,
       expect.objectContaining({ message: 'Principal timezone', initialValue: 'America/Los_Angeles' }),
     );
     expect(result).toEqual({
-      sourceRemote: 'https://example.test/nanoclaw.git',
+      sourceRemote: GWS_EA_RELEASE_REMOTE,
       ingress: { mode: 'existing', endpointUrl: 'https://assistant.example.test/webhook/gchat' },
       assistantWorkspaceEmail: 'ada@example.test',
       bootstrapManifest: {

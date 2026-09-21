@@ -11,6 +11,7 @@ import type {
 } from '../src/gws-ea/create-input.js';
 import { validateExistingGchatEndpoint } from '../src/gws-ea/endpoint.js';
 import { resolveTrustedExecutable } from '../src/gws-ea/process.js';
+import { configuredReleaseSource } from '../src/gws-ea/release-tracks.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
 import type { ProviderCredential } from '../src/provider-credential.js';
 import { providerProvisioningCapabilityDigest } from '../src/provider-provisioning-capability.js';
@@ -119,7 +120,7 @@ async function askPassword(prompts: PromptAdapter, message: string): Promise<str
 async function suppliedOrAsk(
   context: CreatePromptContext,
   prompts: PromptAdapter,
-  field: 'source-remote' | 'endpoint' | 'workspace-email',
+  field: 'endpoint' | 'workspace-email',
   message: string,
   validate?: (value: string) => string | undefined,
 ): Promise<string> {
@@ -329,7 +330,7 @@ export async function collectGwsEaCreateInput(
     dependencies.providerCapabilityDigest ?? (await providerProvisioningCapabilityDigest(process.cwd()));
 
   prompts.note(`Instance ${context.instanceId}\nRelease track ${context.track}`, 'New assistant');
-  const sourceRemote = await suppliedOrAsk(context, prompts, 'source-remote', 'Source repository remote');
+  const sourceRemote = context.provided['source-remote']?.trim() || configuredReleaseSource(context.track);
   const assistantFirst = await askText(prompts, 'Assistant first name');
   const assistantLast = await askText(prompts, 'Assistant last name', { optional: true, placeholder: 'Optional' });
   const principalFirst = await askText(prompts, 'Principal first name');
