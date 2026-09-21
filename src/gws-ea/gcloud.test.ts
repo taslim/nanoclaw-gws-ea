@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -35,10 +35,11 @@ interface FakeGcpState {
   api: boolean;
   serviceAccount: boolean;
   keys: Set<string>;
+  blockedPolicies?: Set<string>;
   mutations: string[];
 }
 
-function fakeRunner(state: FakeGcpState, credentialFile: string): GcloudCommandRunner {
+function fakeRunner(state: FakeGcpState): GcloudCommandRunner {
   return async (command) => {
     const signature = command.args.join(' ');
     const ok = (stdout = '') => ({ stdout, stderr: '', exitCode: 0 });
@@ -91,6 +92,27 @@ function fakeRunner(state: FakeGcpState, credentialFile: string): GcloudCommandR
       state.mutations.push(signature);
       return ok('{}');
     }
+    if (signature.startsWith('resource-manager org-policies describe ')) {
+      const constraint = command.args[3]!;
+      return ok(
+        JSON.stringify({
+          booleanPolicy: state.blockedPolicies?.has(constraint) ? { enforced: true } : {},
+          constraint: `constraints/${constraint}`,
+        }),
+      );
+    }
+    if (signature.startsWith('resource-manager org-policies disable-enforce ')) {
+      const constraint = command.args[3]!;
+      state.blockedPolicies?.delete(constraint);
+      state.mutations.push(signature);
+      return ok('{}');
+    }
+    if (signature.startsWith('resource-manager org-policies enable-enforce ')) {
+      const constraint = command.args[3]!;
+      (state.blockedPolicies ??= new Set()).add(constraint);
+      state.mutations.push(signature);
+      return ok('{}');
+    }
     if (signature.startsWith('iam service-accounts keys list ')) {
       return ok(
         JSON.stringify(
@@ -102,26 +124,19 @@ function fakeRunner(state: FakeGcpState, credentialFile: string): GcloudCommandR
       );
     }
     if (signature.startsWith('iam service-accounts keys create ')) {
+      const outputFile = command.args[4]!;
+      await mkdir(path.dirname(outputFile), { recursive: true, mode: 0o700 });
+      if (state.blockedPolicies && state.blockedPolicies.size > 0) {
+        await writeFile(outputFile, '', { mode: 0o600 });
+        return {
+          stdout: '',
+          stderr: 'FAILED_PRECONDITION: Key creation is not allowed on this service account.',
+          exitCode: 1,
+        };
+      }
       const keyId = 'key-1';
       state.keys.add(keyId);
-      await mkdir(path.dirname(credentialFile), { recursive: true, mode: 0o700 });
-      await writeFile(
-        credentialFile,
-        JSON.stringify({
-          type: 'service_account',
-          project_id: deriveGcpProjectId(INSTANCE_ID),
-          private_key_id: keyId,
-          private_key: '-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----\n',
-          client_email: SERVICE_ACCOUNT,
-          client_id: '123',
-          auth_uri: 'https://accounts.google.com/o/oauth2/auth',
-          token_uri: 'https://oauth2.googleapis.com/token',
-          auth_provider_x509_cert_url: 'https://www.googleapis.com/oauth2/v1/certs',
-          client_x509_cert_url: 'https://www.googleapis.com/robot/v1/metadata/x509/gws-ea-chat',
-          universe_domain: 'googleapis.com',
-        }),
-        { mode: 0o600 },
-      );
+      await writeFile(outputFile, credentialContents(keyId), { mode: 0o600 });
       state.mutations.push(signature);
       return ok('{}');
     }
@@ -132,6 +147,46 @@ function fakeRunner(state: FakeGcpState, credentialFile: string): GcloudCommandR
 const INSTANCE_ID = '12345678-1234-4234-8234-123456789abc';
 const PROJECT_ID = deriveGcpProjectId(INSTANCE_ID);
 const SERVICE_ACCOUNT = `gws-ea-chat@${PROJECT_ID}.iam.gserviceaccount.com`;
+
+function credentialContents(keyId = 'key-1'): string {
+  return JSON.stringify({
+    type: 'service_account',
+    project_id: PROJECT_ID,
+    private_key_id: keyId,
+    private_key: '-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----\n',
+    client_email: SERVICE_ACCOUNT,
+    client_id: '123',
+    auth_uri: 'https://accounts.google.com/o/oauth2/auth',
+    token_uri: 'https://oauth2.googleapis.com/token',
+    auth_provider_x509_cert_url: 'https://www.googleapis.com/oauth2/v1/certs',
+    client_x509_cert_url: 'https://www.googleapis.com/robot/v1/metadata/x509/gws-ea-chat',
+    universe_domain: 'googleapis.com',
+  });
+}
+
+function readyState(overrides: Partial<FakeGcpState> = {}): FakeGcpState {
+  return {
+    project: true,
+    lifecycle: 'ACTIVE',
+    labels: { 'gws-ea-instance': INSTANCE_ID, 'gws-ea-managed': 'true' },
+    api: true,
+    serviceAccount: true,
+    keys: new Set(),
+    mutations: [],
+    ...overrides,
+  };
+}
+
+function projectInput(root: string, credentialFile = path.join(root, 'secrets', 'gchat.json')) {
+  return {
+    instanceId: INSTANCE_ID,
+    projectId: PROJECT_ID,
+    account: 'operator@example.com',
+    serviceAccountEmail: SERVICE_ACCOUNT,
+    credentialFile,
+    cwd: root,
+  };
+}
 
 describe('Google Cloud provisioning', () => {
   it('fails before local allocation with one actionable install message when gcloud is unavailable', async () => {
@@ -165,7 +220,7 @@ describe('Google Cloud provisioning', () => {
       keys: new Set(),
       mutations: [],
     };
-    const runCommand = fakeRunner(state, credentialFile);
+    const runCommand = fakeRunner(state);
     const input = {
       instanceId: INSTANCE_ID,
       projectId: PROJECT_ID,
@@ -181,11 +236,219 @@ describe('Google Cloud provisioning', () => {
     const firstMutations = [...state.mutations];
     await reconcileGcpProject(input, { runCommand });
     expect(state.mutations).toEqual(firstMutations);
-    expect(firstMutations).toHaveLength(4);
+    expect(firstMutations).toHaveLength(6);
     expect(firstMutations.every((args) => args.includes('--account=operator@example.com'))).toBe(true);
     expect(
       firstMutations.filter((args) => !args.startsWith('projects create ')).every((args) => args.includes(PROJECT_ID)),
     ).toBe(true);
+  });
+
+  it('overrides only enforced key-creation policies on the dedicated project', async () => {
+    const root = await tempRoot();
+    const input = projectInput(root);
+    const state = readyState({
+      blockedPolicies: new Set([
+        'iam.disableServiceAccountKeyCreation',
+        'iam.managed.disableServiceAccountKeyCreation',
+      ]),
+    });
+    const progress: string[] = [];
+
+    await reconcileGcpProject(input, {
+      runCommand: fakeRunner(state),
+      onProgress: (event) => void progress.push(event.resource),
+    });
+
+    expect(state.blockedPolicies).toEqual(
+      new Set(['iam.disableServiceAccountKeyCreation', 'iam.managed.disableServiceAccountKeyCreation']),
+    );
+    expect(
+      state.mutations.filter((entry) => entry.startsWith('resource-manager org-policies disable-enforce ')),
+    ).toEqual([
+      expect.stringContaining('iam.disableServiceAccountKeyCreation'),
+      expect.stringContaining('iam.managed.disableServiceAccountKeyCreation'),
+    ]);
+    expect(
+      state.mutations.filter((entry) => entry.startsWith('resource-manager org-policies enable-enforce ')),
+    ).toEqual([
+      expect.stringContaining('iam.disableServiceAccountKeyCreation'),
+      expect.stringContaining('iam.managed.disableServiceAccountKeyCreation'),
+    ]);
+    expect(progress).toContain('credential-policy');
+    expect(await verifyGcpProject(input, { runCommand: fakeRunner(state) })).toBe(true);
+  });
+
+  it('recovers a zero-byte credential left by a failed gcloud key request', async () => {
+    const root = await tempRoot();
+    const input = projectInput(root);
+    await mkdir(path.dirname(input.credentialFile), { recursive: true, mode: 0o700 });
+    await writeFile(input.credentialFile, '', { mode: 0o600 });
+    const state = readyState();
+
+    await reconcileGcpProject(input, { runCommand: fakeRunner(state) });
+
+    expect(await verifyGcpProject(input, { runCommand: fakeRunner(state) })).toBe(true);
+  });
+
+  it('cleans failed staged key output without publishing it as the credential', async () => {
+    const root = await tempRoot();
+    const input = projectInput(root);
+    const stagingFile = `${input.credentialFile}.staging`;
+    const state = readyState();
+    const fallback = fakeRunner(state);
+    const runCommand: GcloudCommandRunner = async (command) => {
+      if (command.args.slice(0, 4).join(' ') === 'iam service-accounts keys create') {
+        const outputFile = command.args[4]!;
+        await writeFile(outputFile, '', { mode: 0o600 });
+        return {
+          stdout: '',
+          stderr: 'FAILED_PRECONDITION: Key creation is not allowed on this service account.',
+          exitCode: 1,
+        };
+      }
+      return fallback(command);
+    };
+
+    await expect(reconcileGcpProject(input, { runCommand })).rejects.toMatchObject({ code: 'gcloud_failed' });
+
+    await expect(stat(input.credentialFile)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(stagingFile)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('publishes a valid staged credential after an interrupted successful key request', async () => {
+    const root = await tempRoot();
+    const input = projectInput(root);
+    await mkdir(path.dirname(input.credentialFile), { recursive: true, mode: 0o700 });
+    await writeFile(`${input.credentialFile}.staging`, credentialContents('staged-key'), { mode: 0o600 });
+    const state = readyState({ keys: new Set(['staged-key']) });
+
+    await reconcileGcpProject(input, { runCommand: fakeRunner(state) });
+
+    expect(await verifyGcpProject(input, { runCommand: fakeRunner(state) })).toBe(true);
+    await expect(stat(`${input.credentialFile}.staging`)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(state.mutations).toEqual([
+      expect.stringContaining('resource-manager org-policies enable-enforce iam.disableServiceAccountKeyCreation'),
+      expect.stringContaining(
+        'resource-manager org-policies enable-enforce iam.managed.disableServiceAccountKeyCreation',
+      ),
+    ]);
+  });
+
+  it('preserves a valid staged credential while its remote key remains hidden', async () => {
+    const root = await tempRoot();
+    const input = projectInput(root);
+    const stagingFile = `${input.credentialFile}.staging`;
+    await mkdir(path.dirname(input.credentialFile), { recursive: true, mode: 0o700 });
+    await writeFile(stagingFile, credentialContents('staged-key'), { mode: 0o600 });
+    const state = readyState();
+
+    await expect(
+      reconcileGcpProject(input, { runCommand: fakeRunner(state), sleep: async () => undefined }),
+    ).rejects.toMatchObject({ code: 'gcp_key_pending' });
+
+    await expect(stat(stagingFile)).resolves.toMatchObject({ mode: expect.any(Number) });
+    await expect(stat(input.credentialFile)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(state.mutations.some((entry) => entry.startsWith('iam service-accounts keys create '))).toBe(false);
+
+    state.keys.add('staged-key');
+    await reconcileGcpProject(input, { runCommand: fakeRunner(state) });
+    expect(await verifyGcpProject(input, { runCommand: fakeRunner(state) })).toBe(true);
+    await expect(stat(stagingFile)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('recovers a valid staged credential after an ambiguous key-create failure', async () => {
+    const root = await tempRoot();
+    const input = projectInput(root);
+    const stagingFile = `${input.credentialFile}.staging`;
+    const state = readyState();
+    const fallback = fakeRunner(state);
+    let creates = 0;
+    const runCommand: GcloudCommandRunner = async (command) => {
+      if (command.args.slice(0, 4).join(' ') === 'iam service-accounts keys create') {
+        creates += 1;
+        await mkdir(path.dirname(stagingFile), { recursive: true, mode: 0o700 });
+        await writeFile(stagingFile, credentialContents('ambiguous-key'), { mode: 0o600 });
+        state.keys.add('ambiguous-key');
+        return { stdout: '', stderr: 'connection closed after remote commit', exitCode: 1 };
+      }
+      return fallback(command);
+    };
+
+    await expect(reconcileGcpProject(input, { runCommand })).rejects.toMatchObject({ code: 'gcloud_failed' });
+    await reconcileGcpProject(input, { runCommand });
+
+    expect(creates).toBe(1);
+    expect(await verifyGcpProject(input, { runCommand })).toBe(true);
+    await expect(stat(stagingFile)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('distinguishes policy permission failures from other update failures', async () => {
+    const runCase = async (stderr: string, expectedCode: string) => {
+      const root = await tempRoot();
+      const input = projectInput(root);
+      const state = readyState({ blockedPolicies: new Set(['iam.disableServiceAccountKeyCreation']) });
+      const fallback = fakeRunner(state);
+      const runCommand: GcloudCommandRunner = async (command) =>
+        command.args.slice(0, 3).join(' ') === 'resource-manager org-policies disable-enforce'
+          ? { stdout: '', stderr, exitCode: 1 }
+          : fallback(command);
+
+      await expect(reconcileGcpProject(input, { runCommand })).rejects.toMatchObject({ code: expectedCode });
+      expect(state.mutations.some((entry) => entry.startsWith('iam service-accounts keys create '))).toBe(false);
+    };
+
+    await runCase('PERMISSION_DENIED: denied', 'gcp_policy_permission_required');
+    await runCase('UNAVAILABLE: service unavailable', 'gcloud_failed');
+  });
+
+  it('does not create a key before a policy change becomes effective', async () => {
+    const root = await tempRoot();
+    const input = projectInput(root);
+    const state = readyState({ blockedPolicies: new Set(['iam.disableServiceAccountKeyCreation']) });
+    const fallback = fakeRunner(state);
+    const runCommand: GcloudCommandRunner = async (command) => {
+      if (command.args.slice(0, 3).join(' ') === 'resource-manager org-policies disable-enforce') {
+        state.mutations.push(command.args.join(' '));
+        return { stdout: '{}', stderr: '', exitCode: 0 };
+      }
+      return fallback(command);
+    };
+
+    await expect(reconcileGcpProject(input, { runCommand, sleep: async () => undefined })).rejects.toMatchObject({
+      code: 'gcp_policy_pending',
+    });
+    expect(state.mutations.some((entry) => entry.startsWith('iam service-accounts keys create '))).toBe(false);
+  });
+
+  it('resumes policy restoration after the credential is published', async () => {
+    const root = await tempRoot();
+    const input = projectInput(root);
+    const stagingFile = `${input.credentialFile}.staging`;
+    await mkdir(path.dirname(input.credentialFile), { recursive: true, mode: 0o700 });
+    await writeFile(stagingFile, credentialContents('staged-key'), { mode: 0o600 });
+    const state = readyState({ keys: new Set(['staged-key']) });
+    const fallback = fakeRunner(state);
+    const stalePolicyRunner: GcloudCommandRunner = async (command) => {
+      if (command.args.slice(0, 3).join(' ') === 'resource-manager org-policies enable-enforce') {
+        state.mutations.push(command.args.join(' '));
+        return { stdout: '{}', stderr: '', exitCode: 0 };
+      }
+      return fallback(command);
+    };
+
+    await expect(
+      reconcileGcpProject(input, { runCommand: stalePolicyRunner, sleep: async () => undefined }),
+    ).rejects.toMatchObject({ code: 'gcp_policy_pending' });
+
+    await expect(stat(input.credentialFile)).resolves.toMatchObject({ mode: expect.any(Number) });
+    await expect(stat(stagingFile)).resolves.toMatchObject({ mode: expect.any(Number) });
+
+    await reconcileGcpProject(input, { runCommand: fakeRunner(state) });
+    expect(await verifyGcpProject(input, { runCommand: fakeRunner(state) })).toBe(true);
+    await expect(stat(stagingFile)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(state.blockedPolicies).toEqual(
+      new Set(['iam.disableServiceAccountKeyCreation', 'iam.managed.disableServiceAccountKeyCreation']),
+    );
   });
 
   it('waits for every created GCP resource to become readable without replaying mutations', async () => {
@@ -200,7 +463,7 @@ describe('Google Cloud provisioning', () => {
       keys: new Set(),
       mutations: [],
     };
-    const fallback = fakeRunner(state, credentialFile);
+    const fallback = fakeRunner(state);
     const sleeps: number[] = [];
     const progress: string[] = [];
     const staleReads = { project: 1, apis: 1, serviceAccount: 2, serviceAccountKeys: 1, createdKey: 1 };
@@ -263,8 +526,15 @@ describe('Google Cloud provisioning', () => {
     await reconcileGcpProject(input, dependencies);
 
     expect(sleeps).toEqual([1_000, 1_000, 1_000, 2_000, 1_000, 1_000]);
-    expect(progress).toEqual(['project', 'apis', 'service-account', 'service-account-keys', 'credential-key']);
-    expect(state.mutations).toHaveLength(4);
+    expect(progress).toEqual([
+      'project',
+      'apis',
+      'service-account',
+      'service-account-keys',
+      'credential-key',
+      'credential-policy',
+    ]);
+    expect(state.mutations).toHaveLength(6);
     expect(await verifyGcpProject(input, { runCommand })).toBe(true);
     const firstMutations = [...state.mutations];
     const firstSleeps = [...sleeps];
@@ -273,7 +543,7 @@ describe('Google Cloud provisioning', () => {
 
     expect(state.mutations).toEqual(firstMutations);
     expect(sleeps).toEqual(firstSleeps);
-    expect(progress).toHaveLength(5);
+    expect(progress).toHaveLength(6);
   });
 
   it('uses project creation to resolve an access-denied missing-project probe', async () => {
@@ -288,7 +558,7 @@ describe('Google Cloud provisioning', () => {
       keys: new Set(),
       mutations: [],
     };
-    const fallback = fakeRunner(state, credentialFile);
+    const fallback = fakeRunner(state);
     const runCommand: GcloudCommandRunner = async (command) => {
       if (command.args[0] === 'projects' && command.args[1] === 'describe' && !state.project) {
         return {
@@ -399,7 +669,7 @@ describe('Google Cloud provisioning', () => {
           credentialFile,
           cwd: root,
         },
-        { runCommand: fakeRunner(state, credentialFile) },
+        { runCommand: fakeRunner(state) },
       ),
     ).rejects.toMatchObject({ code: 'gcp_key_recovery_required' });
     expect(state.mutations).toEqual([]);
@@ -428,7 +698,7 @@ describe('Google Cloud provisioning', () => {
           credentialFile,
           cwd: root,
         },
-        { runCommand: fakeRunner(state, credentialFile) },
+        { runCommand: fakeRunner(state) },
       ),
     ).rejects.toMatchObject({ code: 'gcp_project_owner_mismatch' });
     expect(state.mutations).toEqual([]);
@@ -436,7 +706,6 @@ describe('Google Cloud provisioning', () => {
 
   it('requests deletion only after ownership verification and treats a repeated delete as complete', async () => {
     const root = await tempRoot();
-    const credentialFile = path.join(root, 'gchat.json');
     const state: FakeGcpState = {
       project: true,
       lifecycle: 'ACTIVE',
@@ -452,7 +721,7 @@ describe('Google Cloud provisioning', () => {
       account: 'operator@example.com',
       cwd: root,
     };
-    const runCommand = fakeRunner(state, credentialFile);
+    const runCommand = fakeRunner(state);
 
     await deleteOwnedGcpProject(input, { runCommand });
     await deleteOwnedGcpProject(input, { runCommand });
@@ -462,7 +731,6 @@ describe('Google Cloud provisioning', () => {
 
   it('refuses project deletion when the instance ownership label differs', async () => {
     const root = await tempRoot();
-    const credentialFile = path.join(root, 'gchat.json');
     const state: FakeGcpState = {
       project: true,
       lifecycle: 'ACTIVE',
@@ -476,7 +744,7 @@ describe('Google Cloud provisioning', () => {
     await expect(
       deleteOwnedGcpProject(
         { instanceId: INSTANCE_ID, projectId: PROJECT_ID, account: 'operator@example.com', cwd: root },
-        { runCommand: fakeRunner(state, credentialFile) },
+        { runCommand: fakeRunner(state) },
       ),
     ).rejects.toMatchObject({ code: 'gcp_project_owner_mismatch' });
     expect(state.mutations).toEqual([]);
@@ -484,7 +752,6 @@ describe('Google Cloud provisioning', () => {
 
   it('does not complete removal when Google Cloud leaves the project active after delete', async () => {
     const root = await tempRoot();
-    const credentialFile = path.join(root, 'gchat.json');
     const state: FakeGcpState = {
       project: true,
       lifecycle: 'ACTIVE',
@@ -494,7 +761,7 @@ describe('Google Cloud provisioning', () => {
       keys: new Set(),
       mutations: [],
     };
-    const fallback = fakeRunner(state, credentialFile);
+    const fallback = fakeRunner(state);
     const runCommand: GcloudCommandRunner = async (command) => {
       if (command.args[0] === 'projects' && command.args[1] === 'delete') {
         state.mutations.push(command.args.join(' '));

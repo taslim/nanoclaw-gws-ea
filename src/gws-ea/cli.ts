@@ -91,6 +91,7 @@ const GCP_PROGRESS: Readonly<Record<NonNullable<ProvisionProgressEvent['detail']
   project: 'Waiting for the Google Cloud project…',
   apis: 'Waiting for the Google Chat APIs…',
   'service-account': 'Waiting for the Google Chat service account…',
+  'credential-policy': 'Updating the dedicated project’s Google Chat credential policy…',
   'service-account-keys': 'Waiting for Google Cloud IAM…',
   'credential-key': 'Waiting for the Google Chat credential…',
 };
