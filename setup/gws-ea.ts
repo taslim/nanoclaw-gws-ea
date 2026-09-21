@@ -11,7 +11,11 @@ import './providers/index.js';
 const providers = listSetupProviders();
 const managedIngressSetup = createManagedIngressSetupSession();
 
-async function requestCloudflareAccountToken(accountId: string, observation: string): Promise<string> {
+async function requestCloudflareAccountToken(
+  accountId: string,
+  observation: string,
+  onPromptComplete?: () => void,
+): Promise<string> {
   prompts.log.warn(observation);
   prompts.note(CLOUDFLARE_API_TOKEN_GUIDANCE, 'Cloudflare access');
   const answer = await prompts.password({
@@ -22,6 +26,7 @@ async function requestCloudflareAccountToken(accountId: string, observation: str
     throw new GwsEaError('cancelled', 'Managed ingress repair was cancelled');
   }
   const token = answer.trim();
+  onPromptComplete?.();
   const zones = await managedIngressSetup.discoverZones(token);
   if (!zones.some((zone) => zone.accountId === accountId)) {
     throw new GwsEaError(

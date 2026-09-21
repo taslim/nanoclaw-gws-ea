@@ -16,7 +16,7 @@ import {
   reserveInstance,
   validateReservation,
 } from './registry.js';
-import { GwsEaError, type AllocatedPorts, type InstanceReservationInput } from './types.js';
+import { GwsEaError, type AllocatedPorts, type InstanceReservationInput, type ProvisionPhase } from './types.js';
 import { deriveGchatServiceAccountEmail, deriveGcpProjectId, preflightGcloud } from './gcloud.js';
 import { confirmChatConfiguration } from './chat-configuration.js';
 import { describeRemoval, removeAssistant, type RemovalPreview } from './remove.js';
@@ -26,24 +26,34 @@ import {
   runProductionProvision,
   validateProductionBootstrapManifest,
   type ProductionBootstrapManifest,
+  type ProvisionProgressEvent,
   type ProvisionResult,
+  type ProvisionRuntime,
 } from './provision.js';
 import { holdLoopbackPorts, type HeldLoopbackPorts } from './ports.js';
 import type { ProviderCredential } from '../provider-credential.js';
 
 type LineWriter = (line: string) => void;
+type TextWriter = (text: string) => void;
 type RemoveAssistantRunner = (paths: ControlPlanePaths, instanceId: string) => Promise<void>;
+type AdvanceProvision = (
+  operation: InstanceOperation,
+  selectedMessagingGroupId?: string,
+  heldPorts?: HeldLoopbackPorts,
+  runtime?: ProvisionRuntime,
+) => Promise<ProvisionResult>;
+
+interface ProvisionProgressDisplay {
+  show(message: string): void;
+  clear(): void;
+}
 
 export interface CliRuntime {
   paths?: ControlPlanePaths;
   stdout?: LineWriter;
   stderr?: LineWriter;
   initializeJournal?: (operation: InstanceOperation) => Promise<void>;
-  advanceProvision?: (
-    operation: InstanceOperation,
-    selectedMessagingGroupId?: string,
-    heldPorts?: HeldLoopbackPorts,
-  ) => Promise<ProvisionResult>;
+  advanceProvision?: AdvanceProvision;
   resolveRelease?: (sourceRemote: string, releaseRef: string) => Promise<ResolvedRelease>;
   holdLoopbackPorts?: () => Promise<HeldLoopbackPorts>;
   collectCreateInputs?: (context: CreatePromptContext) => Promise<CreateSetupAnswers>;
@@ -55,10 +65,68 @@ export interface CliRuntime {
   removeAssistant?: RemoveAssistantRunner;
   confirmRemoval?: (preview: RemovalPreview) => Promise<boolean>;
   managedIngressSetup?: RetainedManagedIngressSetupSession;
-  requestCloudflareAccountToken?: (accountId: string, observation: string) => Promise<string>;
+  requestCloudflareAccountToken?: (
+    accountId: string,
+    observation: string,
+    onPromptComplete?: () => void,
+  ) => Promise<string>;
 }
 
 const CREATE_OPTIONS = ['track', ...CREATE_SETUP_FIELDS] as const;
+
+const PHASE_PROGRESS: Readonly<Record<ProvisionPhase, string>> = {
+  materialize_checkout: 'Preparing assistant files…',
+  provision_gcp: 'Configuring Google Cloud…',
+  start_onecli: 'Starting the credential vault…',
+  configure_provider: 'Connecting the AI provider…',
+  start_nanoclaw: 'Starting the assistant…',
+  establish_transport: 'Publishing the secure callback…',
+  configure_channel: 'Checking Google Chat configuration…',
+  bind_principal: 'Connecting the principal conversation…',
+  verify_conversation: 'Verifying the conversation…',
+  ready: 'Finishing setup…',
+};
+
+const GCP_PROGRESS: Readonly<Record<NonNullable<ProvisionProgressEvent['detail']>, string>> = {
+  project: 'Waiting for the Google Cloud project…',
+  apis: 'Waiting for the Google Chat APIs…',
+  'service-account': 'Waiting for the Google Chat service account…',
+  'service-account-keys': 'Waiting for Google Cloud IAM…',
+  'credential-key': 'Waiting for the Google Chat credential…',
+};
+
+function progressMessage(event: ProvisionProgressEvent): string {
+  return event.detail ? GCP_PROGRESS[event.detail] : PHASE_PROGRESS[event.phase];
+}
+
+export function createProgressDisplay(
+  output: LineWriter,
+  interactive: boolean,
+  terminalOutput: TextWriter = (text) => {
+    process.stdout.write(text);
+  },
+): ProvisionProgressDisplay {
+  let active = false;
+  let lastMessage: string | undefined;
+  return {
+    show(message) {
+      if (message === lastMessage) return;
+      lastMessage = message;
+      if (!interactive) {
+        output(message);
+        return;
+      }
+      terminalOutput(`\r\u001B[2K${message}`);
+      active = true;
+    },
+    clear() {
+      if (!interactive) return;
+      if (active) terminalOutput('\r\u001B[2K');
+      active = false;
+      lastMessage = undefined;
+    },
+  };
+}
 
 function parseOptions(
   args: readonly string[],
@@ -179,16 +247,13 @@ async function createAssistant(
   output: LineWriter,
   errorOutput: LineWriter,
   initializeJournal: (operation: InstanceOperation) => Promise<void>,
-  advanceProvision: (
-    operation: InstanceOperation,
-    selectedMessagingGroupId?: string,
-    heldPorts?: HeldLoopbackPorts,
-  ) => Promise<ProvisionResult>,
+  advanceProvision: AdvanceProvision,
   resolveRelease: (sourceRemote: string, releaseRef: string) => Promise<ResolvedRelease>,
   allocatePorts: () => Promise<HeldLoopbackPorts>,
   collectInputs: (context: CreatePromptContext) => Promise<CreateSetupAnswers>,
   persistReservation: typeof reserveInstance,
   checkGcloud: () => Promise<{ readonly account: string }>,
+  progress: ProvisionProgressDisplay,
   managedIngressSetup?: RetainedManagedIngressSetupSession,
 ): Promise<number> {
   let track: string | undefined;
@@ -202,6 +267,7 @@ async function createAssistant(
     instanceId = allocateInstanceId();
     output(`instance_id: ${instanceId}`);
     const setup = await collectInputs({ instanceId, track, provided: parsed, managedIngressSetup });
+    progress.show('Preparing assistant…');
     const resolved = await resolveRelease(setup.sourceRemote, `refs/heads/${track}`);
     const bootstrapManifest: ProductionBootstrapManifest = validateProductionBootstrapManifest(setup.bootstrapManifest);
     const held = await allocatePorts();
@@ -248,11 +314,14 @@ async function createAssistant(
     }
     try {
       await initializeJournal(operation);
-      provisionResult = await advanceProvision(operation, undefined, held);
+      provisionResult = await advanceProvision(operation, undefined, held, {
+        onProgress: (event) => progress.show(progressMessage(event)),
+      });
     } finally {
       await held.release();
       operation.release();
     }
+    progress.clear();
     if (provisionResult.status === 'paused') {
       printPause(output, instanceId, provisionResult);
     } else {
@@ -260,6 +329,7 @@ async function createAssistant(
     }
     return 0;
   } catch (error) {
+    progress.clear();
     errorOutput(safeErrorMessage(error));
     if (reserved && instanceId) {
       errorOutput(`Resume with: gws-ea resume --id ${instanceId}`);
@@ -277,8 +347,9 @@ async function resumeAssistant(
   output: LineWriter,
   errorOutput: LineWriter,
   initializeJournal: (operation: InstanceOperation) => Promise<void>,
-  advanceProvision: (operation: InstanceOperation, selectedMessagingGroupId?: string) => Promise<ProvisionResult>,
+  advanceProvision: AdvanceProvision,
   confirmConfigured: typeof confirmChatConfiguration,
+  progress: ProvisionProgressDisplay,
 ): Promise<number> {
   let instanceId: string | undefined;
   /* eslint-disable no-catch-all/no-catch-all -- The CLI boundary redacts unexpected failures while preserving recovery instructions. */
@@ -292,9 +363,13 @@ async function resumeAssistant(
       return 2;
     }
     try {
+      progress.show('Resuming assistant…');
       if (options['chat-configured']) await confirmConfigured(paths, instanceId);
       await initializeJournal(operation);
-      const result = await advanceProvision(operation, options['messaging-group-id']);
+      const result = await advanceProvision(operation, options['messaging-group-id'], undefined, {
+        onProgress: (event) => progress.show(progressMessage(event)),
+      });
+      progress.clear();
       if (result.status === 'paused') {
         printPause(output, instanceId, result);
         return 0;
@@ -307,6 +382,7 @@ async function resumeAssistant(
       operation.release();
     }
   } catch (error) {
+    progress.clear();
     errorOutput(safeErrorMessage(error));
     if (instanceId) errorOutput(`Resume with: gws-ea resume --id ${instanceId}`);
     return 1;
@@ -382,17 +458,42 @@ function printHelp(output: LineWriter): void {
 export async function runCli(args: readonly string[], runtime: CliRuntime = {}): Promise<number> {
   const output = runtime.stdout ?? ((line) => process.stdout.write(`${line}\n`));
   const errorOutput = runtime.stderr ?? ((line) => process.stderr.write(`${line}\n`));
+  const progress = createProgressDisplay(output, runtime.stdout === undefined && process.stdout.isTTY === true);
+  const configuredAuthenticateProvider = runtime.authenticateProvider;
+  const authenticateProvider = configuredAuthenticateProvider
+    ? async (provider: string): Promise<ProviderCredential> => {
+        progress.clear();
+        const credential = await configuredAuthenticateProvider(provider);
+        progress.show(PHASE_PROGRESS.configure_provider);
+        return credential;
+      }
+    : undefined;
+  const configuredRequestCloudflareAccountToken = runtime.requestCloudflareAccountToken;
+  const requestCloudflareAccountToken = configuredRequestCloudflareAccountToken
+    ? async (accountId: string, observation: string): Promise<string> => {
+        progress.clear();
+        const token = await configuredRequestCloudflareAccountToken(accountId, observation, () =>
+          progress.show(PHASE_PROGRESS.establish_transport),
+        );
+        progress.show(PHASE_PROGRESS.establish_transport);
+        return token;
+      }
+    : undefined;
   const paths = runtime.paths ?? resolveControlPlanePaths();
   const initializeJournal =
     runtime.initializeJournal ?? (async (operation) => void (await ensureProvisionJournal(operation)));
   const advanceProvision =
     runtime.advanceProvision ??
-    ((operation, selectedMessagingGroupId, heldPorts) =>
-      runProductionProvision(operation, selectedMessagingGroupId, heldPorts, runtime.authenticateProvider, {
-        ...(runtime.managedIngressSetup ? { setupSession: runtime.managedIngressSetup } : {}),
-        ...(runtime.requestCloudflareAccountToken
-          ? { requestAccountToken: runtime.requestCloudflareAccountToken }
-          : {}),
+    ((operation, selectedMessagingGroupId, heldPorts, provisionRuntime) =>
+      runProductionProvision(operation, {
+        selectedMessagingGroupId,
+        portLease: heldPorts,
+        authenticateProvider,
+        managedIngress: {
+          ...(runtime.managedIngressSetup ? { setupSession: runtime.managedIngressSetup } : {}),
+          ...(requestCloudflareAccountToken ? { requestAccountToken: requestCloudflareAccountToken } : {}),
+        },
+        runtime: provisionRuntime,
       }));
   const resolveRelease = runtime.resolveRelease ?? resolveReleaseCommit;
   const allocatePorts = runtime.holdLoopbackPorts ?? holdLoopbackPorts;
@@ -433,6 +534,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
         collectInputs,
         persistReservation,
         checkGcloud,
+        progress,
         runtime.managedIngressSetup,
       );
     } finally {
@@ -449,6 +551,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
         initializeJournal,
         advanceProvision,
         confirmConfigured,
+        progress,
       );
     } finally {
       runtime.managedIngressSetup?.clearAccountToken();

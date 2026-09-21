@@ -91,6 +91,7 @@ import {
   parseGchatServiceAccountCredential,
   probeGcpProjectForCreate,
   reconcileGcpProject,
+  type GcloudReadbackResource,
   type GcpProjectInput,
 } from './gcloud.js';
 import { createCloudflareApi, type RetainedManagedIngressSetupSession } from './cloudflare-api.js';
@@ -111,8 +112,24 @@ export interface ProvisionBoundaryEvent {
   readonly attemptId: string;
 }
 
+export type ProvisionProgressEvent =
+  | { readonly phase: ProvisionPhase; readonly detail?: never }
+  | { readonly phase: 'provision_gcp'; readonly detail: GcloudReadbackResource };
+
 export interface ProvisionRuntime {
   readonly onBoundary?: (event: ProvisionBoundaryEvent) => void | Promise<void>;
+  readonly onProgress?: (event: ProvisionProgressEvent) => void | Promise<void>;
+}
+
+export interface ProductionProvisionOptions {
+  readonly selectedMessagingGroupId?: string;
+  readonly portLease?: ProvisionPortLease;
+  readonly authenticateProvider?: (provider: string) => Promise<ProviderCredential>;
+  readonly managedIngress?: {
+    readonly setupSession?: Pick<RetainedManagedIngressSetupSession, 'requireAccountToken'>;
+    readonly requestAccountToken?: (accountId: string, observation: string) => Promise<string>;
+  };
+  readonly runtime?: ProvisionRuntime;
 }
 
 export type ProvisionResult =
@@ -824,6 +841,7 @@ function conversationInput(context: ProductionProvisionContext): ConversationVer
 export function createProductionProvisionRegistry(
   context: ProductionProvisionContext,
   overrides: Partial<ProductionProvisionDependencies> = {},
+  runtime: ProvisionRuntime = {},
 ): ProvisionPhaseRegistry<ProductionProvisionContext> {
   const dependencies: ProductionProvisionDependencies = { ...defaultProductionDependencies, ...overrides };
   const { input } = context;
@@ -880,7 +898,9 @@ export function createProductionProvisionRegistry(
       resourceKey: () => key('gcp', input.gcp.projectId),
       probe: dependencies.probeGcp,
       apply: async (value) => {
-        await dependencies.reconcileGcpProject(value.input.gcp);
+        await dependencies.reconcileGcpProject(value.input.gcp, {
+          onProgress: ({ resource }) => runtime.onProgress?.({ phase: 'provision_gcp', detail: resource }),
+        });
         return { status: 'completed' };
       },
     },
@@ -1158,6 +1178,7 @@ export async function reconcileProvisioning<Context>(
   let journal = await ensureProvisionJournal(operation);
 
   for (const phase of PROVISION_PHASES) {
+    await runtime.onProgress?.({ phase });
     const definition = definitions[phase];
     if (succeeded(journal, phase)) {
       await assertCompletedPostcondition(phase, definition, context);
@@ -1490,14 +1511,10 @@ async function ensureTrustedProvisioningStart(
 /** Build the production context from temporary bootstrap input or authoritative instance state. */
 export async function runProductionProvision(
   operation: InstanceOperation,
-  selectedMessagingGroupId?: string,
-  portLease?: ProvisionPortLease,
-  authenticateProvider?: (provider: string) => Promise<ProviderCredential>,
-  managedIngress?: {
-    readonly setupSession?: Pick<RetainedManagedIngressSetupSession, 'requireAccountToken'>;
-    readonly requestAccountToken?: (accountId: string, observation: string) => Promise<string>;
-  },
+  options: ProductionProvisionOptions = {},
 ): Promise<ProvisionResult> {
+  const { authenticateProvider, managedIngress } = options;
+  const provisionRuntime = options.runtime ?? {};
   const reservation = await getInstanceReservation(operation.paths, operation.instanceId);
   const provisioningStartedAt = await ensureTrustedProvisioningStart(operation, reservation);
   const principalSelection = await loadPrincipalSelection(
@@ -1508,8 +1525,8 @@ export async function runProductionProvision(
   );
   if (
     principalSelection &&
-    selectedMessagingGroupId !== undefined &&
-    principalSelection.candidate.messagingGroupId !== selectedMessagingGroupId
+    options.selectedMessagingGroupId !== undefined &&
+    principalSelection.candidate.messagingGroupId !== options.selectedMessagingGroupId
   ) {
     throw new GwsEaError('principal_selection_mismatch', 'The principal selection is already fixed for this instance');
   }
@@ -1612,12 +1629,12 @@ export async function runProductionProvision(
       adapterInstance: 'gchat',
       provisioningStartedAt,
       ...((principalSelection?.candidate.messagingGroupId ??
-      selectedMessagingGroupId ??
+      options.selectedMessagingGroupId ??
       manifest?.selected_messaging_group_id)
         ? {
             selectedMessagingGroupId:
               principalSelection?.candidate.messagingGroupId ??
-              selectedMessagingGroupId ??
+              options.selectedMessagingGroupId ??
               manifest!.selected_messaging_group_id!,
           }
         : {}),
@@ -1632,7 +1649,7 @@ export async function runProductionProvision(
         persistSelection: (candidate) =>
           persistPrincipalSelection(operation.paths, operation.instanceId, 'gchat', provisioningStartedAt, candidate),
       },
-      ...(portLease ? { portLease } : {}),
+      ...(options.portLease ? { portLease: options.portLease } : {}),
       ingress: reservation.exclusive_resource_claims.ingress,
       ...(managedIngress?.setupSession ? { managedIngressSetup: managedIngress.setupSession } : {}),
       ...(managedIngress?.requestAccountToken
@@ -1640,5 +1657,10 @@ export async function runProductionProvision(
         : {}),
     },
   };
-  return reconcileProvisioning(operation, context, createProductionProvisionRegistry(context));
+  return reconcileProvisioning(
+    operation,
+    context,
+    createProductionProvisionRegistry(context, {}, provisionRuntime),
+    provisionRuntime,
+  );
 }

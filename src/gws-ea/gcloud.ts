@@ -41,9 +41,16 @@ const ACCOUNT_PATTERN = /^[^\s@]+@[^\s@]+$/u;
 
 export type GcloudCommandRunner = SanitizedCommandOutcomeRunner;
 
+export type GcloudReadbackResource = 'project' | 'apis' | 'service-account' | 'service-account-keys' | 'credential-key';
+
+export interface GcloudProgressEvent {
+  readonly resource: GcloudReadbackResource;
+}
+
 export interface GcloudDependencies {
   readonly runCommand?: GcloudCommandRunner;
   readonly sleep?: (delayMs: number) => Promise<void>;
+  readonly onProgress?: (event: GcloudProgressEvent) => void | Promise<void>;
 }
 
 export interface GcloudPreflightInput extends GcloudDependencies {
@@ -114,9 +121,11 @@ function commandFailure(message: string): GwsEaError {
 async function waitForReadback<Value>(
   observe: () => Promise<Value | undefined>,
   sleep: (delayMs: number) => Promise<void>,
+  onWait: () => void | Promise<void>,
 ): Promise<Value | undefined> {
   const immediate = await observe();
   if (immediate !== undefined) return immediate;
+  await onWait();
   for (const delayMs of READBACK_DELAYS_MS) {
     await sleep(delayMs);
     const observed = await observe();
@@ -264,6 +273,7 @@ async function ensureProject(
   input: GcpProjectInput,
   runner: GcloudCommandRunner,
   sleep: (delayMs: number) => Promise<void>,
+  onProgress: (event: GcloudProgressEvent) => void | Promise<void>,
 ): Promise<void> {
   // Resource Manager deliberately makes a missing project indistinguishable
   // from an inaccessible one. Creation is the safe discriminator: it either
@@ -293,15 +303,19 @@ async function ensureProject(
   if (result.exitCode !== 0) {
     throw commandFailure('Google Cloud could not create the dedicated assistant project.');
   }
-  const created = await waitForReadback(async () => {
-    const project = await describeProject(input, runner, 'creation-probe');
-    if (!project) return undefined;
-    assertOwnedProject(input, project);
-    if (project.lifecycleState !== 'ACTIVE') {
-      throw new GwsEaError('gcp_project_unavailable', 'The dedicated Google Cloud project is not active');
-    }
-    return project;
-  }, sleep);
+  const created = await waitForReadback(
+    async () => {
+      const project = await describeProject(input, runner, 'creation-probe');
+      if (!project) return undefined;
+      assertOwnedProject(input, project);
+      if (project.lifecycleState !== 'ACTIVE') {
+        throw new GwsEaError('gcp_project_unavailable', 'The dedicated Google Cloud project is not active');
+      }
+      return project;
+    },
+    sleep,
+    () => onProgress({ resource: 'project' }),
+  );
   if (!created) throw commandFailure('Google Cloud did not return the newly created assistant project.');
 }
 
@@ -332,6 +346,7 @@ async function ensureApis(
   input: GcpProjectInput,
   runner: GcloudCommandRunner,
   sleep: (delayMs: number) => Promise<void>,
+  onProgress: (event: GcloudProgressEvent) => void | Promise<void>,
 ): Promise<void> {
   const observed = await enabledApis(input, runner);
   const missing = REQUIRED_APIS.filter((api) => !observed.has(api));
@@ -342,10 +357,14 @@ async function ensureApis(
     runner,
   );
   if (result.exitCode !== 0) throw commandFailure('Google Cloud could not enable the Google Chat APIs.');
-  const enabled = await waitForReadback(async () => {
-    const apis = await enabledApis(input, runner);
-    return REQUIRED_APIS.every((api) => apis.has(api)) ? apis : undefined;
-  }, sleep);
+  const enabled = await waitForReadback(
+    async () => {
+      const apis = await enabledApis(input, runner);
+      return REQUIRED_APIS.every((api) => apis.has(api)) ? apis : undefined;
+    },
+    sleep,
+    () => onProgress({ resource: 'apis' }),
+  );
   if (!enabled) throw commandFailure('Google Cloud did not return the newly enabled Google Chat APIs.');
 }
 
@@ -402,6 +421,7 @@ async function ensureServiceAccount(
   input: GcpProjectInput,
   runner: GcloudCommandRunner,
   sleep: (delayMs: number) => Promise<void>,
+  onProgress: (event: GcloudProgressEvent) => void | Promise<void>,
 ): Promise<void> {
   const observed = await describeServiceAccount(input, runner);
   if (observed) {
@@ -425,12 +445,16 @@ async function ensureServiceAccount(
     runner,
   );
   if (result.exitCode !== 0) throw commandFailure('Google Cloud could not create the Chat service account.');
-  const created = await waitForReadback(async () => {
-    const account = await describeServiceAccount(input, runner);
-    if (!account) return undefined;
-    assertOwnedServiceAccount(input, account);
-    return account;
-  }, sleep);
+  const created = await waitForReadback(
+    async () => {
+      const account = await describeServiceAccount(input, runner);
+      if (!account) return undefined;
+      assertOwnedServiceAccount(input, account);
+      return account;
+    },
+    sleep,
+    () => onProgress({ resource: 'service-account' }),
+  );
   if (!created) throw commandFailure('Google Cloud did not return the newly created Chat service account.');
 }
 
@@ -529,9 +553,14 @@ async function ensureCredential(
   input: GcpProjectInput,
   runner: GcloudCommandRunner,
   sleep: (delayMs: number) => Promise<void>,
+  onProgress: (event: GcloudProgressEvent) => void | Promise<void>,
 ): Promise<void> {
   const local = await credentialFromFile(input);
-  const remote = await waitForReadback(() => readUserManagedKeys(input, runner), sleep);
+  const remote = await waitForReadback(
+    () => readUserManagedKeys(input, runner),
+    sleep,
+    () => onProgress({ resource: 'service-account-keys' }),
+  );
   if (!remote) throw commandFailure('Google Cloud could not inspect the Chat credential keys.');
   if (local) {
     if (!remote.includes(local.privateKeyId)) {
@@ -566,10 +595,14 @@ async function ensureCredential(
   await chmod(input.credentialFile, 0o600);
   const created = await credentialFromFile(input);
   if (!created) throw commandFailure('Google Cloud did not write the Chat credential key.');
-  const key = await waitForReadback(async () => {
-    const keys = await readUserManagedKeys(input, runner);
-    return keys?.includes(created.privateKeyId) ? created.privateKeyId : undefined;
-  }, sleep);
+  const key = await waitForReadback(
+    async () => {
+      const keys = await readUserManagedKeys(input, runner);
+      return keys?.includes(created.privateKeyId) ? created.privateKeyId : undefined;
+    },
+    sleep,
+    () => onProgress({ resource: 'credential-key' }),
+  );
   if (!key) {
     throw new GwsEaError('gcp_key_drift', 'The new Chat credential key was not visible in Google Cloud');
   }
@@ -618,14 +651,15 @@ export async function reconcileGcpProject(
 ): Promise<void> {
   const runner = dependencies.runCommand ?? runSanitizedCommandOutcome;
   const sleep = dependencies.sleep ?? delay;
+  const onProgress = dependencies.onProgress ?? (() => undefined);
   validateCoordinates(input);
   if (input.serviceAccountEmail !== deriveGchatServiceAccountEmail(input.projectId)) {
     throw new GwsEaError('invalid_claim', 'Chat service-account identity does not match the project');
   }
-  await ensureProject(input, runner, sleep);
-  await ensureApis(input, runner, sleep);
-  await ensureServiceAccount(input, runner, sleep);
-  await ensureCredential(input, runner, sleep);
+  await ensureProject(input, runner, sleep, onProgress);
+  await ensureApis(input, runner, sleep, onProgress);
+  await ensureServiceAccount(input, runner, sleep, onProgress);
+  await ensureCredential(input, runner, sleep, onProgress);
 }
 
 export async function deleteOwnedGcpProject(

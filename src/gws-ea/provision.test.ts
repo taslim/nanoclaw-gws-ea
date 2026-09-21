@@ -18,6 +18,7 @@ import {
   type ProductionBootstrapManifest,
   type ProductionProvisionContext,
   type ProductionProvisionDependencies,
+  type ProvisionProgressEvent,
 } from './provision.js';
 import { defineProvisionPhaseRegistry, type ProvisionPhaseDefinition } from './phases.js';
 import type { MainIdentityDependencies } from './identity.js';
@@ -218,6 +219,23 @@ afterEach(async () => {
 });
 
 describe('resumable provision phase runner', () => {
+  it('reports each phase as reconciliation advances', async () => {
+    const paths = await testPaths();
+    const input = reservation(paths);
+    await reserveInstance(paths, input);
+    const context: FixtureContext = { instanceId: input.instance_id, resources: new Set(), effects: new Map() };
+    const progress: ProvisionPhase[] = [];
+    const runtime = {
+      onProgress: (event: { readonly phase: ProvisionPhase }) => void progress.push(event.phase),
+    };
+
+    await withInstanceOperation(paths, input.instance_id, (operation) =>
+      reconcileProvisioning(operation, context, registry(context), runtime),
+    );
+
+    expect(progress).toEqual(PROVISION_PHASES);
+  });
+
   it.each(['intent', 'effect', 'verify'] as const)(
     'resumes after interruption at the %s boundary without duplicating a resource',
     async (boundary) => {
@@ -516,6 +534,31 @@ function probeIdentityDependencies(
 }
 
 describe('production provision phase composition', () => {
+  it('forwards delayed Google Cloud readback progress through the provision runtime', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation(paths));
+    const progress: ProvisionProgressEvent[] = [];
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const context = productionContext(operation, reserved);
+      const reconcileGcpProject: ProductionProvisionDependencies['reconcileGcpProject'] = async (
+        _input,
+        dependencies,
+      ) => {
+        await dependencies?.onProgress?.({ resource: 'service-account' });
+      };
+      const phase = createProductionProvisionRegistry(
+        context,
+        { reconcileGcpProject },
+        { onProgress: (event) => void progress.push(event) },
+      ).provision_gcp;
+
+      await expect(phase.apply(context)).resolves.toEqual({ status: 'completed' });
+    });
+
+    expect(progress).toEqual([{ phase: 'provision_gcp', detail: 'service-account' }]);
+  });
+
   it('accepts only an all-mode canonical main without enumerating its grants', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));

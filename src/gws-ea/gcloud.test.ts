@@ -12,6 +12,7 @@ import {
   reconcileGcpProject,
   verifyGcpProject,
   type GcloudCommandRunner,
+  type GcloudProgressEvent,
 } from './gcloud.js';
 import { allocateInstanceId } from './registry.js';
 
@@ -201,6 +202,7 @@ describe('Google Cloud provisioning', () => {
     };
     const fallback = fakeRunner(state, credentialFile);
     const sleeps: number[] = [];
+    const progress: string[] = [];
     const staleReads = { project: 1, apis: 1, serviceAccount: 2, serviceAccountKeys: 1, createdKey: 1 };
     let projectCreated = false;
     let apisEnabled = false;
@@ -252,11 +254,16 @@ describe('Google Cloud provisioning', () => {
       credentialFile,
       cwd: root,
     };
-    const dependencies = { runCommand, sleep: async (delayMs: number) => void sleeps.push(delayMs) };
+    const dependencies = {
+      runCommand,
+      sleep: async (delayMs: number) => void sleeps.push(delayMs),
+      onProgress: (event: GcloudProgressEvent) => void progress.push(event.resource),
+    };
 
     await reconcileGcpProject(input, dependencies);
 
     expect(sleeps).toEqual([1_000, 1_000, 1_000, 2_000, 1_000, 1_000]);
+    expect(progress).toEqual(['project', 'apis', 'service-account', 'service-account-keys', 'credential-key']);
     expect(state.mutations).toHaveLength(4);
     expect(await verifyGcpProject(input, { runCommand })).toBe(true);
     const firstMutations = [...state.mutations];
@@ -266,6 +273,7 @@ describe('Google Cloud provisioning', () => {
 
     expect(state.mutations).toEqual(firstMutations);
     expect(sleeps).toEqual(firstSleeps);
+    expect(progress).toHaveLength(5);
   });
 
   it('uses project creation to resolve an access-denied missing-project probe', async () => {

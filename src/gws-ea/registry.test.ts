@@ -3,8 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { runCli } from './cli.js';
-import type { InstanceOperation } from './journal.js';
+import { createProgressDisplay, runCli, type CliRuntime } from './cli.js';
 import {
   allocateInstanceId,
   assertRegistryMarkerAgreement,
@@ -515,11 +514,19 @@ describe('create recovery contract', () => {
     const paths = await testPaths();
     const advanced: string[] = [];
     let portsReleased = false;
-    const advanceProvision = async (operation: InstanceOperation, _selection?: string, heldPorts?: unknown) => {
+    const advanceProvision: NonNullable<CliRuntime['advanceProvision']> = async (
+      operation,
+      _selection,
+      heldPorts,
+      runtime,
+    ) => {
       if (advanced.length === 0) {
         expect(heldPorts).toBeDefined();
         expect(portsReleased).toBe(false);
       }
+      await runtime?.onProgress?.({ phase: 'provision_gcp' });
+      await runtime?.onProgress?.({ phase: 'provision_gcp', detail: 'service-account' });
+      await runtime?.onProgress?.({ phase: 'provision_gcp', detail: 'service-account' });
       advanced.push(operation.instanceId);
       return {
         status: 'paused' as const,
@@ -556,6 +563,12 @@ describe('create recovery contract', () => {
     const instanceId = output[0]!.slice('instance_id: '.length);
     expect(resolveCalls).toEqual([['https://example.test/nanoclaw.git', 'refs/heads/dogfood']]);
     expect(portsReleased).toBe(true);
+    expect(output.slice(1, 5)).toEqual([
+      'Preparing assistant…',
+      'Configuring Google Cloud…',
+      'Waiting for the Google Chat service account…',
+      'Provisioning paused: Send the direct message.',
+    ]);
     expect((await readRegistry(paths)).instances[instanceId]).toMatchObject({
       deployed_commit: 'b'.repeat(40),
       allocated_ports: { nanoclaw_webhook: 34_101, onecli_app: 34_102, onecli_gateway: 34_103 },
@@ -573,6 +586,76 @@ describe('create recovery contract', () => {
       }),
     ).toBe(0);
     expect(advanced).toEqual([instanceId, instanceId]);
+  });
+
+  it('prints durable, deduplicated progress while a non-interactive resume advances', async () => {
+    const paths = await testPaths();
+    const input = reservation(paths);
+    await reserveInstance(paths, input);
+    const output: string[] = [];
+    const advanceProvision: NonNullable<CliRuntime['advanceProvision']> = async (
+      _operation,
+      _selection,
+      _heldPorts,
+      runtime,
+    ) => {
+      await runtime?.onProgress?.({ phase: 'provision_gcp' });
+      await runtime?.onProgress?.({ phase: 'provision_gcp', detail: 'service-account' });
+      await runtime?.onProgress?.({ phase: 'provision_gcp', detail: 'service-account' });
+      return {
+        status: 'paused',
+        pause: {
+          kind: 'human-action',
+          phase: 'configure_channel',
+          code: 'chat_configuration_required',
+          message: 'Configure Google Chat.',
+        },
+      };
+    };
+
+    expect(
+      await runCli(['resume', '--id', input.instance_id], {
+        paths,
+        stdout: (line) => output.push(line),
+        stderr: () => undefined,
+        advanceProvision,
+      }),
+    ).toBe(0);
+
+    expect(output).toEqual([
+      'Resuming assistant…',
+      'Configuring Google Cloud…',
+      'Waiting for the Google Chat service account…',
+      'Provisioning paused: Configure Google Chat.',
+      `Continue with: gws-ea resume --id ${input.instance_id}`,
+    ]);
+  });
+
+  it('updates and clears one interactive status line without intercepting process signals', () => {
+    const terminalOutput: string[] = [];
+    const sigintListeners = process.listenerCount('SIGINT');
+    const sigtermListeners = process.listenerCount('SIGTERM');
+    const progress = createProgressDisplay(
+      () => {
+        throw new Error('interactive progress must not emit durable lines');
+      },
+      true,
+      (text) => terminalOutput.push(text),
+    );
+
+    progress.show('Configuring Google Cloud…');
+    progress.show('Configuring Google Cloud…');
+    progress.show('Waiting for the Google Chat service account…');
+    progress.clear();
+
+    expect(terminalOutput).toEqual([
+      '\r\u001B[2KConfiguring Google Cloud…',
+      '\r\u001B[2KWaiting for the Google Chat service account…',
+      '\r\u001B[2K',
+    ]);
+    expect(terminalOutput.join('')).not.toContain('\n');
+    expect(process.listenerCount('SIGINT')).toBe(sigintListeners);
+    expect(process.listenerCount('SIGTERM')).toBe(sigtermListeners);
   });
 
   it('provisions from the documented create command and prints exact principal-selection commands', async () => {
