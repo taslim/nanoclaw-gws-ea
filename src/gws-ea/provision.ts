@@ -89,8 +89,8 @@ import { assertProviderProvisioningCapabilityDigest } from '../provider-provisio
 import { googleChatConfigurationUrl, isChatConfigurationConfirmed } from './chat-configuration.js';
 import {
   parseGchatServiceAccountCredential,
+  probeGcpProjectForCreate,
   reconcileGcpProject,
-  verifyGcpProject,
   type GcpProjectInput,
 } from './gcloud.js';
 import { createCloudflareApi, type RetainedManagedIngressSetupSession } from './cloudflare-api.js';
@@ -536,7 +536,7 @@ const defaultProductionDependencies: ProductionProvisionDependencies = {
   materializeReleaseCheckout,
   runReleasePreflight,
   probeGcp: async (context) =>
-    (await verifyGcpProject(context.input.gcp)) ? { status: 'matched' } : { status: 'absent' },
+    (await probeGcpProjectForCreate(context.input.gcp)) ? { status: 'matched' } : { status: 'absent' },
   reconcileGcpProject,
   probeOnecli: defaultProbeOnecli,
   reconcileOnecliRuntime,

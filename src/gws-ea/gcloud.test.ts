@@ -8,6 +8,7 @@ import {
   deleteOwnedGcpProject,
   deriveGcpProjectId,
   preflightGcloud,
+  probeGcpProjectForCreate,
   reconcileGcpProject,
   verifyGcpProject,
   type GcloudCommandRunner,
@@ -173,6 +174,7 @@ describe('Google Cloud provisioning', () => {
       cwd: root,
     };
 
+    await expect(probeGcpProjectForCreate(input, { runCommand })).resolves.toBe(false);
     await reconcileGcpProject(input, { runCommand });
     expect(await verifyGcpProject(input, { runCommand })).toBe(true);
     const firstMutations = [...state.mutations];
@@ -225,12 +227,21 @@ describe('Google Cloud provisioning', () => {
 
   it('does not treat access denial as absence during project removal', async () => {
     const root = await tempRoot();
+    const input = {
+      instanceId: INSTANCE_ID,
+      projectId: PROJECT_ID,
+      account: 'operator@example.com',
+      serviceAccountEmail: SERVICE_ACCOUNT,
+      credentialFile: path.join(root, 'secrets', 'gchat.json'),
+      cwd: root,
+    };
     const runCommand: GcloudCommandRunner = async () => ({
       stdout: '',
       stderr: 'The caller does not have permission to access this project (or it may not exist).',
       exitCode: 1,
     });
 
+    await expect(verifyGcpProject(input, { runCommand })).rejects.toMatchObject({ code: 'gcloud_failed' });
     await expect(
       deleteOwnedGcpProject(
         { instanceId: INSTANCE_ID, projectId: PROJECT_ID, account: 'operator@example.com', cwd: root },

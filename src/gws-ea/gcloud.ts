@@ -510,16 +510,16 @@ async function ensureCredential(input: GcpProjectInput, runner: GcloudCommandRun
   }
 }
 
-export async function verifyGcpProject(
+async function inspectGcpProject(
   input: GcpProjectInput,
-  dependencies: GcloudDependencies = {},
+  runner: GcloudCommandRunner,
+  mode: ProjectLookupMode,
 ): Promise<boolean> {
-  const runner = dependencies.runCommand ?? runSanitizedCommandOutcome;
   validateCoordinates(input);
   if (input.serviceAccountEmail !== deriveGchatServiceAccountEmail(input.projectId)) {
     throw new GwsEaError('invalid_claim', 'Chat service-account identity does not match the project');
   }
-  const project = await describeProject(input, runner);
+  const project = await describeProject(input, runner, mode);
   if (!project) return false;
   assertOwnedProject(input, project);
   if (project.lifecycleState !== 'ACTIVE') return false;
@@ -531,6 +531,20 @@ export async function verifyGcpProject(
   const local = await credentialFromFile(input);
   if (!local) return false;
   return (await listUserManagedKeys(input, runner)).includes(local.privateKeyId);
+}
+
+export async function probeGcpProjectForCreate(
+  input: GcpProjectInput,
+  dependencies: GcloudDependencies = {},
+): Promise<boolean> {
+  return inspectGcpProject(input, dependencies.runCommand ?? runSanitizedCommandOutcome, 'creation-probe');
+}
+
+export async function verifyGcpProject(
+  input: GcpProjectInput,
+  dependencies: GcloudDependencies = {},
+): Promise<boolean> {
+  return inspectGcpProject(input, dependencies.runCommand ?? runSanitizedCommandOutcome, 'strict');
 }
 
 export async function reconcileGcpProject(
