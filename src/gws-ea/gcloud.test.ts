@@ -187,6 +187,87 @@ describe('Google Cloud provisioning', () => {
     ).toBe(true);
   });
 
+  it('waits for every created GCP resource to become readable without replaying mutations', async () => {
+    const root = await tempRoot();
+    const credentialFile = path.join(root, 'secrets', 'gchat.json');
+    const state: FakeGcpState = {
+      project: false,
+      lifecycle: 'ACTIVE',
+      labels: {},
+      api: false,
+      serviceAccount: false,
+      keys: new Set(),
+      mutations: [],
+    };
+    const fallback = fakeRunner(state, credentialFile);
+    const sleeps: number[] = [];
+    const staleReads = { project: 1, apis: 1, serviceAccount: 2, serviceAccountKeys: 1, createdKey: 1 };
+    let projectCreated = false;
+    let apisEnabled = false;
+    let serviceAccountCreated = false;
+    let keyCreated = false;
+    const runCommand: GcloudCommandRunner = async (command) => {
+      const signature = command.args.join(' ');
+      if (projectCreated && signature.startsWith('projects describe ') && staleReads.project > 0) {
+        staleReads.project -= 1;
+        return { stdout: '', stderr: 'NOT_FOUND: resource was not found', exitCode: 1 };
+      }
+      if (apisEnabled && signature.startsWith('services list ') && staleReads.apis > 0) {
+        staleReads.apis -= 1;
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }
+      if (
+        serviceAccountCreated &&
+        signature.startsWith('iam service-accounts describe ') &&
+        staleReads.serviceAccount > 0
+      ) {
+        staleReads.serviceAccount -= 1;
+        return { stdout: '', stderr: 'NOT_FOUND: resource was not found', exitCode: 1 };
+      }
+      if (
+        serviceAccountCreated &&
+        !keyCreated &&
+        signature.startsWith('iam service-accounts keys list ') &&
+        staleReads.serviceAccountKeys > 0
+      ) {
+        staleReads.serviceAccountKeys -= 1;
+        return { stdout: '', stderr: 'NOT_FOUND: resource was not found', exitCode: 1 };
+      }
+      if (keyCreated && signature.startsWith('iam service-accounts keys list ') && staleReads.createdKey > 0) {
+        staleReads.createdKey -= 1;
+        return { stdout: '[]', stderr: '', exitCode: 0 };
+      }
+      const result = await fallback(command);
+      if (signature.startsWith('projects create ')) projectCreated = true;
+      if (signature.startsWith('services enable ')) apisEnabled = true;
+      if (signature.startsWith('iam service-accounts create ')) serviceAccountCreated = true;
+      if (signature.startsWith('iam service-accounts keys create ')) keyCreated = true;
+      return result;
+    };
+    const input = {
+      instanceId: INSTANCE_ID,
+      projectId: PROJECT_ID,
+      account: 'operator@example.com',
+      serviceAccountEmail: SERVICE_ACCOUNT,
+      credentialFile,
+      cwd: root,
+    };
+    const dependencies = { runCommand, sleep: async (delayMs: number) => void sleeps.push(delayMs) };
+
+    await reconcileGcpProject(input, dependencies);
+
+    expect(sleeps).toEqual([1_000, 1_000, 1_000, 2_000, 1_000, 1_000]);
+    expect(state.mutations).toHaveLength(4);
+    expect(await verifyGcpProject(input, { runCommand })).toBe(true);
+    const firstMutations = [...state.mutations];
+    const firstSleeps = [...sleeps];
+
+    await reconcileGcpProject(input, dependencies);
+
+    expect(state.mutations).toEqual(firstMutations);
+    expect(sleeps).toEqual(firstSleeps);
+  });
+
   it('uses project creation to resolve an access-denied missing-project probe', async () => {
     const root = await tempRoot();
     const credentialFile = path.join(root, 'secrets', 'gchat.json');
