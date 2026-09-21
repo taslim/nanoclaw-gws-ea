@@ -69,6 +69,8 @@ interface ProjectDescription {
   readonly labels: Readonly<Record<string, string>>;
 }
 
+type ProjectLookupMode = 'strict' | 'creation-probe';
+
 interface ServiceAccountDescription {
   readonly email: string;
   readonly displayName: string;
@@ -124,6 +126,10 @@ function stringField(value: Record<string, unknown>, key: string, label: string)
 
 function isNotFound(outcome: SanitizedCommandOutcome): boolean {
   return /\bNOT_FOUND\b|\bnot found\b|does not exist/iu.test(outcome.stderr);
+}
+
+function isProjectVisibilityAmbiguous(outcome: SanitizedCommandOutcome): boolean {
+  return /\bPERMISSION_DENIED\b|\bdoes not have permission\b/iu.test(outcome.stderr);
 }
 
 function validateCoordinates(input: GcpDeletionInput): void {
@@ -194,6 +200,7 @@ export async function preflightGcloud(input: GcloudPreflightInput): Promise<{ re
 async function describeProject(
   input: GcpDeletionInput,
   runner: GcloudCommandRunner,
+  mode: ProjectLookupMode = 'strict',
 ): Promise<ProjectDescription | undefined> {
   validateCoordinates(input);
   const result = await run(
@@ -202,7 +209,7 @@ async function describeProject(
     runner,
   );
   if (result.exitCode !== 0) {
-    if (isNotFound(result)) return undefined;
+    if (isNotFound(result) || (mode === 'creation-probe' && isProjectVisibilityAmbiguous(result))) return undefined;
     throw commandFailure('Google Cloud could not verify the dedicated project; no action was taken.');
   }
   const value = parseJson(result.stdout, 'Google Cloud project');
@@ -237,7 +244,10 @@ function assertOwnedProject(input: GcpDeletionInput, project: ProjectDescription
 }
 
 async function ensureProject(input: GcpProjectInput, runner: GcloudCommandRunner): Promise<void> {
-  const observed = await describeProject(input, runner);
+  // Resource Manager deliberately makes a missing project indistinguishable
+  // from an inaccessible one. Creation is the safe discriminator: it either
+  // creates our random ID or fails without adopting an existing project.
+  const observed = await describeProject(input, runner, 'creation-probe');
   if (observed) {
     assertOwnedProject(input, observed);
     if (observed.lifecycleState !== 'ACTIVE') {

@@ -185,6 +185,97 @@ describe('Google Cloud provisioning', () => {
     ).toBe(true);
   });
 
+  it('uses project creation to resolve an access-denied missing-project probe', async () => {
+    const root = await tempRoot();
+    const credentialFile = path.join(root, 'secrets', 'gchat.json');
+    const state: FakeGcpState = {
+      project: false,
+      lifecycle: 'ACTIVE',
+      labels: {},
+      api: false,
+      serviceAccount: false,
+      keys: new Set(),
+      mutations: [],
+    };
+    const fallback = fakeRunner(state, credentialFile);
+    const runCommand: GcloudCommandRunner = async (command) => {
+      if (command.args[0] === 'projects' && command.args[1] === 'describe' && !state.project) {
+        return {
+          stdout: '',
+          stderr: 'The caller does not have permission to access this project (or it may not exist).',
+          exitCode: 1,
+        };
+      }
+      return fallback(command);
+    };
+    const input = {
+      instanceId: INSTANCE_ID,
+      projectId: PROJECT_ID,
+      account: 'operator@example.com',
+      serviceAccountEmail: SERVICE_ACCOUNT,
+      credentialFile,
+      cwd: root,
+    };
+
+    await reconcileGcpProject(input, { runCommand });
+
+    expect(await verifyGcpProject(input, { runCommand })).toBe(true);
+    expect(state.mutations.some((args) => args.startsWith('projects create '))).toBe(true);
+  });
+
+  it('does not treat access denial as absence during project removal', async () => {
+    const root = await tempRoot();
+    const runCommand: GcloudCommandRunner = async () => ({
+      stdout: '',
+      stderr: 'The caller does not have permission to access this project (or it may not exist).',
+      exitCode: 1,
+    });
+
+    await expect(
+      deleteOwnedGcpProject(
+        { instanceId: INSTANCE_ID, projectId: PROJECT_ID, account: 'operator@example.com', cwd: root },
+        { runCommand },
+      ),
+    ).rejects.toMatchObject({ code: 'gcloud_failed' });
+  });
+
+  it('fails closed when an access-denied project probe collides during creation', async () => {
+    const root = await tempRoot();
+    const commands: string[] = [];
+    const runCommand: GcloudCommandRunner = async (command) => {
+      const signature = command.args.join(' ');
+      commands.push(signature);
+      if (signature.startsWith('projects describe ')) {
+        return {
+          stdout: '',
+          stderr: 'The caller does not have permission to access this project (or it may not exist).',
+          exitCode: 1,
+        };
+      }
+      if (signature.startsWith('projects create ')) {
+        return { stdout: '', stderr: 'ALREADY_EXISTS: Requested entity already exists', exitCode: 1 };
+      }
+      throw new Error(`Unexpected gcloud command: ${signature}`);
+    };
+
+    await expect(
+      reconcileGcpProject(
+        {
+          instanceId: INSTANCE_ID,
+          projectId: PROJECT_ID,
+          account: 'operator@example.com',
+          serviceAccountEmail: SERVICE_ACCOUNT,
+          credentialFile: path.join(root, 'secrets', 'gchat.json'),
+          cwd: root,
+        },
+        { runCommand },
+      ),
+    ).rejects.toMatchObject({ code: 'gcloud_failed' });
+
+    expect(commands).toHaveLength(2);
+    expect(commands[1]).toMatch(/^projects create /u);
+  });
+
   it('stops instead of minting a second key when remote private material is unavailable locally', async () => {
     const root = await tempRoot();
     const credentialFile = path.join(root, 'secrets', 'gchat.json');
