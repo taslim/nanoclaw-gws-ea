@@ -651,6 +651,69 @@ describe('production provision phase composition', () => {
     });
   });
 
+  it('repairs a completed OneCLI runtime without accepting unsafe drift', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation(paths));
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const context = productionContext(operation, reserved);
+      const completedDefinition: ProvisionPhaseDefinition<ProductionProvisionContext> = {
+        resourceKey: () => `existing:${'a'.repeat(64)}`,
+        probe: async () => ({ status: 'matched' }),
+        apply: async () => ({ status: 'completed' }),
+      };
+      const completedRegistry = defineProvisionPhaseRegistry(
+        Object.fromEntries(PROVISION_PHASES.map((phase) => [phase, completedDefinition])) as unknown as Parameters<
+          typeof defineProvisionPhaseRegistry<ProductionProvisionContext>
+        >[0],
+      );
+      await expect(reconcileProvisioning(operation, context, completedRegistry)).resolves.toEqual({ status: 'ready' });
+
+      let recovered = false;
+      let unsafe = false;
+      const receipt = Object.freeze({}) as OnecliCompatibilityReceipt;
+      const reconcileOnecliRuntime = vi.fn(async () => {
+        recovered = true;
+        return receipt;
+      });
+      const persistOnecliApiKeyFiles = vi.fn(async () => undefined);
+      const probeOnecli = vi.fn(async () => {
+        if (unsafe) throw new GwsEaError('unsafe_onecli_owner', 'Foreign OneCLI resource');
+        return recovered ? { status: 'matched' as const } : { status: 'absent' as const };
+      });
+      const production = createProductionProvisionRegistry(context, {
+        probeOnecli,
+        reconcileOnecliRuntime,
+        persistOnecliApiKeyFiles,
+        holdReservedLoopbackPorts: async () => {
+          throw new Error('A completed runtime must not reclaim ports already bound by OneCLI');
+        },
+      });
+      const resumedRegistry = defineProvisionPhaseRegistry(
+        Object.fromEntries(
+          PROVISION_PHASES.map((phase) => [
+            phase,
+            phase === 'start_onecli' ? production.start_onecli : completedDefinition,
+          ]),
+        ) as unknown as Parameters<typeof defineProvisionPhaseRegistry<ProductionProvisionContext>>[0],
+      );
+
+      await expect(reconcileProvisioning(operation, context, resumedRegistry)).resolves.toEqual({ status: 'ready' });
+      expect(reconcileOnecliRuntime).toHaveBeenCalledOnce();
+      expect(persistOnecliApiKeyFiles).toHaveBeenCalledWith(receipt, {
+        runtime: context.input.runtime.secret_files.onecli_runtime_api_key,
+        admin: context.input.runtime.secret_files.onecli_admin_api_key,
+      });
+      expect(context.state.onecliReceipt).toBe(receipt);
+
+      unsafe = true;
+      await expect(reconcileProvisioning(operation, context, resumedRegistry)).rejects.toMatchObject({
+        code: 'unsafe_onecli_owner',
+      });
+      expect(reconcileOnecliRuntime).toHaveBeenCalledOnce();
+    });
+  });
+
   it('reclaims the exact reserved OneCLI ports on a normal resume and holds them until bind', async () => {
     const paths = await testPaths();
     const originalLease = await holdLoopbackPorts();

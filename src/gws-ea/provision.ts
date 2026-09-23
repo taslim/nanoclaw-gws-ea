@@ -868,6 +868,16 @@ export function createProductionProvisionRegistry(
   }
 
   const key = (kind: string, value: string): string => journalResourceKey(kind, value);
+  const retainOnecliReceipt = async (
+    value: ProductionProvisionContext,
+    receipt: OnecliCompatibilityReceipt,
+  ): Promise<void> => {
+    value.state.onecliReceipt = receipt;
+    await dependencies.persistOnecliApiKeyFiles(receipt, {
+      runtime: value.input.runtime.secret_files.onecli_runtime_api_key,
+      admin: value.input.runtime.secret_files.onecli_admin_api_key,
+    });
+  };
   const principalProbe = async (value: ProductionProvisionContext): Promise<PhaseProbeResult> =>
     bindingObservation(
       value,
@@ -919,12 +929,12 @@ export function createProductionProvisionRegistry(
               beforeOnecliBind(value.input.onecliDependencies, releaseLease),
             ),
         );
-        value.state.onecliReceipt = receipt;
-        await dependencies.persistOnecliApiKeyFiles(receipt, {
-          runtime: value.input.runtime.secret_files.onecli_runtime_api_key,
-          admin: value.input.runtime.secret_files.onecli_admin_api_key,
-        });
+        await retainOnecliReceipt(value, receipt);
         return { status: 'completed' };
+      },
+      reconcileCompletedPostcondition: async (value) => {
+        const receipt = await dependencies.reconcileOnecliRuntime(value.input.onecli, value.input.onecliDependencies);
+        await retainOnecliReceipt(value, receipt);
       },
     },
     configure_provider: {
@@ -958,11 +968,7 @@ export function createProductionProvisionRegistry(
         const receipt =
           value.state.onecliReceipt ??
           (await dependencies.reconcileOnecliRuntime(value.input.onecli, value.input.onecliDependencies));
-        value.state.onecliReceipt = receipt;
-        await dependencies.persistOnecliApiKeyFiles(receipt, {
-          runtime: value.input.runtime.secret_files.onecli_runtime_api_key,
-          admin: value.input.runtime.secret_files.onecli_admin_api_key,
-        });
+        await retainOnecliReceipt(value, receipt);
         const imported = await dependencies.importProviderCredential(
           receipt,
           credential,

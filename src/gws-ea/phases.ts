@@ -30,9 +30,8 @@ export interface ProvisionPhaseDefinition<Context> {
   readonly probe: (context: Context) => Promise<PhaseProbeResult>;
   readonly apply: (context: Context) => Promise<PhaseEffectResult>;
   /**
-   * Optional, narrowly scoped migration for a completed phase whose accepted
-   * postcondition changed. The callback must reject unrelated drift; the
-   * runner always re-probes before accepting the repaired postcondition.
+   * Optional repair for a completed phase with a recoverable postcondition.
+   * The callback must reject unrelated drift; the runner re-probes afterward.
    */
   readonly reconcileCompletedPostcondition?: (context: Context) => Promise<void>;
 }
