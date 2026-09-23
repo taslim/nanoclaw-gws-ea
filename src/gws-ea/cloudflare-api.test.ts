@@ -262,7 +262,12 @@ describe('Cloudflare REST boundary', () => {
     ]);
   });
 
-  it('accepts the documented uninitialized tunnel-configuration response without inventing routes', async () => {
+  it.each([
+    { label: 'missing config and version', fields: {} },
+    { label: 'version zero without config', fields: { version: 0 } },
+    { label: 'null config at version zero', fields: { config: null, version: 0 } },
+    { label: 'empty config without version', fields: { config: {} } },
+  ])('accepts $label as an uninitialized tunnel without inventing routes', async ({ fields }) => {
     const api = createCloudflareApi({
       accountToken: TOKEN,
       baseUrl: 'https://api.test/client/v4',
@@ -271,6 +276,7 @@ describe('Cloudflare REST boundary', () => {
           account_id: ACCOUNT_ID,
           tunnel_id: TUNNEL_ID,
           source: 'cloudflare',
+          ...fields,
         }),
       ),
     });
@@ -279,6 +285,45 @@ describe('Cloudflare REST boundary', () => {
       config: {},
       initialized: false,
       version: 0,
+    });
+  });
+
+  it.each([
+    { label: 'null result', result: null, shape: 'result=null' },
+    { label: 'nonzero version without config', result: { version: 1 }, shape: 'config=missing, version=number' },
+    {
+      label: 'configured route without version',
+      result: { config: { ingress: [{ service: 'http_status:404' }] } },
+      shape: 'config=object, version=missing',
+    },
+    {
+      label: 'non-object config',
+      result: { config: 'private-canary', version: 0 },
+      shape: 'config=string, version=number',
+    },
+  ])('rejects $label with value-free shape diagnostics', async ({ result, shape }) => {
+    const api = createCloudflareApi({
+      accountToken: TOKEN,
+      baseUrl: 'https://api.test/client/v4',
+      fetch: vi.fn<typeof globalThis.fetch>(async () => envelope(result)),
+    });
+
+    await expect(api.getTunnelConfiguration(ACCOUNT_ID, TUNNEL_ID)).rejects.toMatchObject({
+      code: 'invalid_cloudflare_response',
+      message: `Cloudflare returned an invalid tunnel configuration (${shape})`,
+    });
+  });
+
+  it('rejects an incomplete configuration write instead of treating it as uninitialized', async () => {
+    const api = createCloudflareApi({
+      accountToken: TOKEN,
+      baseUrl: 'https://api.test/client/v4',
+      fetch: vi.fn<typeof globalThis.fetch>(async () => envelope({ version: 0 })),
+    });
+
+    await expect(api.replaceTunnelConfiguration(ACCOUNT_ID, TUNNEL_ID, {})).rejects.toMatchObject({
+      code: 'invalid_cloudflare_response',
+      message: 'Cloudflare returned an invalid tunnel configuration (config=missing, version=number)',
     });
   });
 

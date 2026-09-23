@@ -249,15 +249,29 @@ function parseTunnel(value: unknown): CloudflareTunnel {
   };
 }
 
+function invalidConfiguration(value: unknown): GwsEaError {
+  const shape = (entry: unknown): string => {
+    if (entry === undefined) return 'missing';
+    if (entry === null) return 'null';
+    if (Array.isArray(entry)) return 'array';
+    return typeof entry;
+  };
+  const summary = isRecord(value)
+    ? `config=${shape(value.config)}, version=${shape(value.version)}`
+    : `result=${shape(value)}`;
+  return new GwsEaError(
+    'invalid_cloudflare_response',
+    `Cloudflare returned an invalid tunnel configuration (${summary})`,
+  );
+}
+
 function parseConfiguration(value: unknown, allowUninitialized: boolean): CloudflareTunnelConfiguration {
   // The current GET schema makes result, config, and version optional before
   // the first configuration PUT. No error status is treated as initialization.
   if (allowUninitialized && value === undefined) {
     return { config: {}, initialized: false, version: 0 };
   }
-  if (!isRecord(value)) {
-    throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare returned an invalid tunnel configuration');
-  }
+  if (!isRecord(value)) throw invalidConfiguration(value);
   const documentedKeys = new Set(['account_id', 'config', 'created_at', 'source', 'tunnel_id', 'version']);
   if (Object.keys(value).some((key) => !documentedKeys.has(key))) {
     throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare tunnel configuration contains unknown fields');
@@ -268,15 +282,19 @@ function parseConfiguration(value: unknown, allowUninitialized: boolean): Cloudf
   if (value.source !== undefined && value.source !== 'cloudflare') {
     throw new GwsEaError('foreign_cloudflare_tunnel', 'Cloudflare tunnel configuration is not remotely managed');
   }
-  if (allowUninitialized && value.config === undefined && value.version === undefined) {
+  if (
+    allowUninitialized &&
+    (value.version === undefined || value.version === 0) &&
+    (value.config === undefined ||
+      value.config === null ||
+      (isRecord(value.config) && Object.keys(value.config).length === 0))
+  ) {
     return { config: {}, initialized: false, version: 0 };
   }
-  if (!isRecord(value.config)) {
-    throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare returned an invalid tunnel configuration');
-  }
+  if (!isRecord(value.config)) throw invalidConfiguration(value);
   const version = value.version;
   if (typeof version !== 'number' || !Number.isInteger(version) || version < 0) {
-    throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare returned an invalid configuration version');
+    throw invalidConfiguration(value);
   }
   return { config: value.config, initialized: true, version };
 }
