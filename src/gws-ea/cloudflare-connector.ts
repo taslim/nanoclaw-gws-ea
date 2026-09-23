@@ -366,6 +366,8 @@ export async function inspectCloudflareConnector(
   runner: SanitizedCommandRunner = runSanitizedCommand,
   environment: Readonly<Record<string, string>> = connectorEnvironment(),
 ): Promise<ObservedCloudflareConnector | undefined> {
+  // The first inspection runs before the connector's private directory exists.
+  const cwd = path.dirname(path.dirname(layout.rootDirectory));
   const list = await runner({
     command: 'docker',
     args: [
@@ -377,7 +379,7 @@ export async function inspectCloudflareConnector(
       '--format',
       '{{.ID}}',
     ],
-    cwd: layout.rootDirectory,
+    cwd,
     env: environment,
     timeoutMs: 30_000,
   });
@@ -391,7 +393,7 @@ export async function inspectCloudflareConnector(
   const result = await runner({
     command: 'docker',
     args: ['container', 'inspect', ids[0]!],
-    cwd: layout.rootDirectory,
+    cwd,
     env: environment,
     timeoutMs: 30_000,
   });

@@ -12,6 +12,7 @@ import {
   buildCloudflareComposeInvocation,
   cloudflareOriginUrl,
   createCloudflareConnectorLayout,
+  inspectCloudflareConnector,
   prepareCloudflareConnector,
   reconcileCloudflareConnector,
   renderCloudflareConnectorCompose,
@@ -199,6 +200,21 @@ describe('shared Cloudflare connector', () => {
     await expect(validateCloudflareConnectorState(connector)).rejects.toMatchObject({
       code: 'cloudflare_connector_state_missing',
     });
+  });
+
+  it.each([false, true])('inspects before its private directory exists (connector present: %s)', async (present) => {
+    const connector = await layout('macos');
+    const runner = vi.fn(async (command: SanitizedCommand) => {
+      expect((await stat(command.cwd)).isDirectory()).toBe(true);
+      if (command.args[1] === 'ls') return { stdout: present ? 'container-id\n' : '', stderr: '' };
+      return { stdout: inspectJson(connector), stderr: '' };
+    });
+
+    await expect(inspectCloudflareConnector(connector, runner)).resolves.toEqual(
+      present ? observed(connector) : undefined,
+    );
+    expect(runner).toHaveBeenCalledTimes(present ? 2 : 1);
+    await expect(stat(connector.rootDirectory)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('accepts only the exact owned connector specification', async () => {
