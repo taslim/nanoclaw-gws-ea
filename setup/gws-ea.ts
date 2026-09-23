@@ -41,7 +41,7 @@ async function requestCloudflareAccountToken(
 process.exitCode = await runCli(process.argv.slice(2), {
   collectCreateInputs: (context) => collectGwsEaCreateInput(context, { providers }),
   authenticateProvider: (provider) => authenticateGwsEaProvider(provider, providers),
-  preflightGcloud: () => ensureGcloudReady(process.cwd()),
+  preflightGcloud: (account) => ensureGcloudReady(process.cwd(), { ...(account ? { account } : {}) }),
   managedIngressSetup,
   requestCloudflareAccountToken,
 });

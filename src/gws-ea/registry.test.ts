@@ -5,6 +5,14 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createProgressDisplay, runCli, type CliRuntime } from './cli.js';
 import {
+  acquireInstanceOperation,
+  beginPhase,
+  commitPhaseSuccess,
+  ensureProvisionJournal,
+  journalResourceKey,
+  observePhase,
+} from './journal.js';
+import {
   allocateInstanceId,
   assertRegistryMarkerAgreement,
   readRegistry,
@@ -428,6 +436,89 @@ describe('machine registry', () => {
 });
 
 describe('create recovery contract', () => {
+  it('checks the reserved Google account before a GCP resume advances', async () => {
+    const paths = await testPaths();
+    const input = reservation(paths);
+    await reserveInstance(paths, input);
+    const preflight = vi.fn(async () => ({ account: input.exclusive_resource_claims.gcp_account }));
+    const advanceProvision = vi.fn(async () => ({
+      status: 'paused' as const,
+      pause: {
+        kind: 'human-action' as const,
+        phase: 'configure_channel' as const,
+        code: 'chat_configuration_required',
+        message: 'Configure Google Chat.',
+      },
+    }));
+
+    expect(
+      await runCli(['resume', '--id', input.instance_id], {
+        paths,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        preflightGcloud: preflight,
+        advanceProvision,
+      }),
+    ).toBe(0);
+    expect(preflight).toHaveBeenCalledExactlyOnceWith(input.exclusive_resource_claims.gcp_account);
+    expect(advanceProvision).toHaveBeenCalledOnce();
+  });
+
+  it('checks Google sign-in after GCP setup is complete because resume re-probes it', async () => {
+    const paths = await testPaths();
+    const input = reservation(paths);
+    await reserveInstance(paths, input);
+    const operation = await acquireInstanceOperation(paths, input.instance_id);
+    if (!operation) throw new Error('Test instance operation could not be acquired');
+    try {
+      await ensureProvisionJournal(operation);
+      for (const phase of ['materialize_checkout', 'provision_gcp'] as const) {
+        const key = journalResourceKey('phase', `${phase}:${input.instance_id}`);
+        const begun = await beginPhase(operation, phase, key);
+        await observePhase(operation, phase, begun.attempt.attempt_id, { matched: true, resource_key: key });
+        await commitPhaseSuccess(operation, phase, begun.attempt.attempt_id);
+      }
+    } finally {
+      operation.release();
+    }
+    const preflight = vi.fn(async () => ({ account: input.exclusive_resource_claims.gcp_account }));
+    const advanceProvision = vi.fn(async () => ({ status: 'ready' as const }));
+
+    expect(
+      await runCli(['resume', '--id', input.instance_id], {
+        paths,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        preflightGcloud: preflight,
+        advanceProvision,
+      }),
+    ).toBe(0);
+    expect(preflight).toHaveBeenCalledExactlyOnceWith(input.exclusive_resource_claims.gcp_account);
+    expect(advanceProvision).toHaveBeenCalledOnce();
+  });
+
+  it('does not advance a GCP resume when the reserved Google account needs sign-in', async () => {
+    const paths = await testPaths();
+    const input = reservation(paths);
+    await reserveInstance(paths, input);
+    const errors: string[] = [];
+    const advanceProvision = vi.fn();
+
+    expect(
+      await runCli(['resume', '--id', input.instance_id], {
+        paths,
+        stdout: () => undefined,
+        stderr: (line) => errors.push(line),
+        preflightGcloud: async () => {
+          throw new GwsEaError('gcloud_auth_required', 'Google Cloud sign-in is required');
+        },
+        advanceProvision,
+      }),
+    ).toBe(1);
+    expect(advanceProvision).not.toHaveBeenCalled();
+    expect(errors).toContain('Google Cloud sign-in is required');
+  });
+
   it('clears run-scoped Cloudflare authority when create exits', async () => {
     const paths = await testPaths();
     const clearAccountToken = vi.fn();
@@ -470,6 +561,7 @@ describe('create recovery contract', () => {
         paths,
         stdout: () => undefined,
         stderr: () => undefined,
+        preflightGcloud: async () => ({ account: 'operator@example.test' }),
         advanceProvision: async () => ({
           status: 'paused',
           pause: {
@@ -582,6 +674,7 @@ describe('create recovery contract', () => {
         paths,
         stdout: () => undefined,
         stderr: () => undefined,
+        preflightGcloud: async () => ({ account: 'operator@example.test' }),
         advanceProvision,
       }),
     ).toBe(0);
@@ -618,6 +711,7 @@ describe('create recovery contract', () => {
         paths,
         stdout: (line) => output.push(line),
         stderr: () => undefined,
+        preflightGcloud: async () => ({ account: 'operator@example.test' }),
         advanceProvision,
       }),
     ).toBe(0);
@@ -705,6 +799,7 @@ describe('create recovery contract', () => {
         paths,
         stdout: (line) => resumeOutput.push(line),
         stderr: () => undefined,
+        preflightGcloud: async () => ({ account: 'operator@example.test' }),
         advanceProvision: async () => pause,
       }),
     ).toBe(0);
@@ -839,6 +934,7 @@ describe('create recovery contract', () => {
         paths,
         stdout: () => undefined,
         stderr: () => undefined,
+        preflightGcloud: async () => ({ account: 'operator@example.test' }),
         advanceProvision: async (operation) => {
           resumed.push(operation.instanceId);
           return {

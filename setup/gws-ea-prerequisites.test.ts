@@ -17,6 +17,28 @@ function promptFixture(confirmAnswers: readonly boolean[] = [true]) {
 describe('GWS-EA Google Cloud prerequisite flow', () => {
   afterEach(() => vi.unstubAllEnvs());
 
+  it('signs back into the reserved account during resume', async () => {
+    const prompts = promptFixture([true]);
+    const check = vi
+      .fn<() => Promise<{ readonly account: string }>>()
+      .mockRejectedValueOnce(new GwsEaError('gcloud_auth_required', 'Google Cloud sign-in is required'))
+      .mockResolvedValueOnce({ account: 'reserved@example.com' });
+    const runLogin = vi.fn(async () => 0);
+
+    await expect(
+      ensureGcloudReady('/repo', {
+        account: 'reserved@example.com',
+        check,
+        resolveExecutable: async () => '/opt/homebrew/bin/gcloud',
+        runLogin,
+        prompts,
+      }),
+    ).resolves.toEqual({ account: 'reserved@example.com' });
+
+    expect(prompts.note).toHaveBeenCalledWith(expect.stringContaining('reserved@example.com'), 'Google Cloud');
+    expect(runLogin).toHaveBeenCalledWith('/opt/homebrew/bin/gcloud', ['auth', 'login', 'reserved@example.com']);
+  });
+
   it('continues one create flow through installation and interactive authentication', async () => {
     vi.stubEnv('PATH', '/custom/bin:/usr/bin');
     const check = vi

@@ -59,7 +59,7 @@ export interface CliRuntime {
   collectCreateInputs?: (context: CreatePromptContext) => Promise<CreateSetupAnswers>;
   authenticateProvider?: (provider: string) => Promise<ProviderCredential>;
   reserveInstance?: typeof reserveInstance;
-  preflightGcloud?: () => Promise<{ readonly account: string }>;
+  preflightGcloud?: (account?: string) => Promise<{ readonly account: string }>;
   confirmChatConfiguration?: typeof confirmChatConfiguration;
   describeRemoval?: typeof describeRemoval;
   removeAssistant?: RemoveAssistantRunner;
@@ -350,6 +350,7 @@ async function resumeAssistant(
   initializeJournal: (operation: InstanceOperation) => Promise<void>,
   advanceProvision: AdvanceProvision,
   confirmConfigured: typeof confirmChatConfiguration,
+  checkGcloud: (account?: string) => Promise<{ readonly account: string }>,
   progress: ProvisionProgressDisplay,
 ): Promise<number> {
   let instanceId: string | undefined;
@@ -367,6 +368,14 @@ async function resumeAssistant(
       progress.show('Resuming assistant…');
       if (options['chat-configured']) await confirmConfigured(paths, instanceId);
       await initializeJournal(operation);
+      const reservation = await getInstanceReservation(paths, instanceId);
+      const account = reservation.exclusive_resource_claims.gcp_account;
+      progress.clear();
+      const ready = await checkGcloud(account);
+      if (ready.account !== account) {
+        throw new GwsEaError('gcloud_account_mismatch', 'Google Cloud is signed in with the wrong account');
+      }
+      progress.show('Resuming assistant…');
       const result = await advanceProvision(operation, options['messaging-group-id'], undefined, {
         onProgress: (event) => progress.show(progressMessage(event)),
       });
@@ -504,7 +513,9 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
       throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
     });
   const persistReservation = runtime.reserveInstance ?? reserveInstance;
-  const checkGcloud = runtime.preflightGcloud ?? (() => preflightGcloud({ cwd: process.cwd() }));
+  const checkGcloud =
+    runtime.preflightGcloud ??
+    ((account?: string) => preflightGcloud({ cwd: process.cwd(), ...(account ? { account } : {}) }));
   const confirmConfigured = runtime.confirmChatConfiguration ?? confirmChatConfiguration;
   const inspectRemoval = runtime.describeRemoval ?? describeRemoval;
   const remove: RemoveAssistantRunner =
@@ -552,6 +563,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
         initializeJournal,
         advanceProvision,
         confirmConfigured,
+        checkGcloud,
         progress,
       );
     } finally {

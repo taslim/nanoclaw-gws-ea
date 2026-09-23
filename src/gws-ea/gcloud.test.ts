@@ -189,6 +189,42 @@ function projectInput(root: string, credentialFile = path.join(root, 'secrets', 
 }
 
 describe('Google Cloud provisioning', () => {
+  it('checks the reserved account on resume even when another account is active', async () => {
+    const commands: string[][] = [];
+    const account = 'reserved@example.com';
+    const result = await preflightGcloud({
+      cwd: process.cwd(),
+      account,
+      runCommand: async (command) => {
+        commands.push([...command.args]);
+        if (command.args[0] === 'version') return { stdout: '{}', stderr: '', exitCode: 0 };
+        if (command.args[0] === 'auth' && command.args[1] === 'print-access-token') {
+          return { stdout: 'discard-me', stderr: '', exitCode: 0 };
+        }
+        throw new Error(`Unexpected gcloud command: ${command.args.join(' ')}`);
+      },
+    });
+
+    expect(result).toEqual({ account });
+    expect(commands).toEqual([
+      ['version', '--format=json'],
+      ['auth', 'print-access-token', `--account=${account}`, '--quiet'],
+    ]);
+  });
+
+  it('requests sign-in when the reserved account cannot refresh its token', async () => {
+    await expect(
+      preflightGcloud({
+        cwd: process.cwd(),
+        account: 'reserved@example.com',
+        runCommand: async (command) =>
+          command.args[0] === 'version'
+            ? { stdout: '{}', stderr: '', exitCode: 0 }
+            : { stdout: '', stderr: 'Reauthentication failed', exitCode: 1 },
+      }),
+    ).rejects.toMatchObject({ code: 'gcloud_auth_required' });
+  });
+
   it('fails before local allocation with one actionable install message when gcloud is unavailable', async () => {
     await expect(
       preflightGcloud({

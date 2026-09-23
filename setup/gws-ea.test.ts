@@ -72,15 +72,19 @@ describe('GWS-EA launcher', () => {
         observation: string,
         onPromptComplete?: () => void,
       ): Promise<string>;
-      preflightGcloud(): Promise<{ readonly account: string }>;
+      preflightGcloud(account?: string): Promise<{ readonly account: string }>;
     };
     expect(args).toEqual(['create', '--track', 'prod']);
     await runtime.collectCreateInputs({ marker: 'context' });
     await runtime.authenticateProvider('claude');
     await expect(runtime.preflightGcloud()).resolves.toEqual({ account: 'operator@example.com' });
+    await runtime.preflightGcloud('reserved@example.com');
     expect(fixture.collect).toHaveBeenCalledWith({ marker: 'context' }, { providers: fixture.providers });
     expect(fixture.authenticate).toHaveBeenCalledWith('claude', fixture.providers);
-    expect(fixture.ensureGcloudReady).toHaveBeenCalledOnce();
+    expect(fixture.ensureGcloudReady).toHaveBeenNthCalledWith(1, process.cwd(), {});
+    expect(fixture.ensureGcloudReady).toHaveBeenNthCalledWith(2, process.cwd(), {
+      account: 'reserved@example.com',
+    });
     const onPromptComplete = vi.fn();
     await expect(
       runtime.requestCloudflareAccountToken(

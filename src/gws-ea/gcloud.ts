@@ -65,6 +65,7 @@ export interface GcloudDependencies {
 
 export interface GcloudPreflightInput extends GcloudDependencies {
   readonly cwd: string;
+  readonly account?: string;
 }
 
 export interface GcpProjectInput {
@@ -200,6 +201,9 @@ export function deriveGcpProjectId(instanceId: string): string {
 export { deriveGchatServiceAccountEmail } from './gcp-identity.js';
 
 export async function preflightGcloud(input: GcloudPreflightInput): Promise<{ readonly account: string }> {
+  if (input.account !== undefined && !ACCOUNT_PATTERN.test(input.account)) {
+    throw new GwsEaError('invalid_claim', 'GCP account is invalid');
+  }
   const runner = input.runCommand ?? runSanitizedCommandOutcome;
   let version: SanitizedCommandOutcome;
   try {
@@ -216,18 +220,25 @@ export async function preflightGcloud(input: GcloudPreflightInput): Promise<{ re
       `Google Cloud CLI is required. Install it from ${GCLOUD_INSTALL_URL}, then retry.`,
     );
   }
-  const accounts = await run(input.cwd, ['auth', 'list', '--filter=status:ACTIVE', '--format=value(account)'], runner);
-  const active = accounts.stdout
-    .split('\n')
-    .map((value) => value.trim())
-    .filter(Boolean);
-  if (accounts.exitCode !== 0 || active.length !== 1 || !ACCOUNT_PATTERN.test(active[0]!)) {
-    throw new GwsEaError(
-      'gcloud_auth_required',
-      'Google Cloud CLI is not signed in. Run gcloud auth login, then retry.',
+  let account = input.account;
+  if (account === undefined) {
+    const accounts = await run(
+      input.cwd,
+      ['auth', 'list', '--filter=status:ACTIVE', '--format=value(account)'],
+      runner,
     );
+    const active = accounts.stdout
+      .split('\n')
+      .map((value) => value.trim())
+      .filter(Boolean);
+    if (accounts.exitCode !== 0 || active.length !== 1 || !ACCOUNT_PATTERN.test(active[0]!)) {
+      throw new GwsEaError(
+        'gcloud_auth_required',
+        'Google Cloud CLI is not signed in. Run gcloud auth login, then retry.',
+      );
+    }
+    account = active[0]!;
   }
-  const account = active[0]!;
   const token = await run(input.cwd, ['auth', 'print-access-token', `--account=${account}`, '--quiet'], runner);
   if (token.exitCode !== 0 || !token.stdout.trim()) {
     throw new GwsEaError(

@@ -14,6 +14,7 @@ interface PromptAdapter {
 }
 
 export interface GcloudPrerequisiteDependencies {
+  readonly account?: string;
   readonly check?: () => Promise<{ readonly account: string }>;
   readonly resolveExecutable?: (searchPath: string) => Promise<string>;
   readonly runLogin?: (executable: string, args: readonly string[]) => Promise<number>;
@@ -27,7 +28,7 @@ const defaultPrompts: PromptAdapter = {
 };
 
 function cancelled(): never {
-  throw new GwsEaError('cancelled', 'Assistant creation was cancelled');
+  throw new GwsEaError('cancelled', 'Google Cloud setup was cancelled');
 }
 
 async function confirm(prompts: PromptAdapter, message: string): Promise<void> {
@@ -56,7 +57,9 @@ export async function ensureGcloudReady(
   dependencies: GcloudPrerequisiteDependencies = {},
 ): Promise<{ readonly account: string }> {
   const prompts = dependencies.prompts ?? defaultPrompts;
-  const check = dependencies.check ?? (() => preflightGcloud({ cwd }));
+  const check =
+    dependencies.check ??
+    (() => preflightGcloud({ cwd, ...(dependencies.account ? { account: dependencies.account } : {}) }));
   const resolveExecutable =
     dependencies.resolveExecutable ?? ((searchPath: string) => resolveTrustedExecutable('gcloud', searchPath));
   const runLogin =
@@ -108,16 +111,19 @@ export async function ensureGcloudReady(
           );
         }
         prompts.note(
-          'Sign in with the Google account that should own this assistant’s dedicated project. GWS-EA does not store the login credential.',
+          dependencies.account
+            ? `Sign back in as ${dependencies.account} to continue this assistant’s setup. GWS-EA does not store the login credential.`
+            : 'Sign in with the Google account that should own this assistant’s dedicated project. GWS-EA does not store the login credential.',
           'Google Cloud',
         );
         await confirm(prompts, 'Sign in to Google Cloud now?');
-        const exitCode = await runLogin(await resolveGcloud(), ['auth', 'login']);
+        const exitCode = await runLogin(await resolveGcloud(), [
+          'auth',
+          'login',
+          ...(dependencies.account ? [dependencies.account] : []),
+        ]);
         if (exitCode !== 0) {
-          throw new GwsEaError(
-            'gcloud_auth_failed',
-            'Google Cloud sign-in did not complete; no resources were created.',
-          );
+          throw new GwsEaError('gcloud_auth_failed', 'Google Cloud sign-in did not complete.');
         }
         loginAttempted = true;
         continue;
