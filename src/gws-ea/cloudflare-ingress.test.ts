@@ -323,7 +323,7 @@ describe('managed Cloudflare desired state', () => {
         { service: 'http_status:404' as const },
       ],
     };
-    const old = { ingress: [{ service: 'http_status:404' }] };
+    const old = { ingress: [{ service: 'http_status:404' as const }] };
     const observedAfterAmbiguous = {
       replaceTunnelConfiguration: vi.fn(async () => {
         throw new CloudflareAmbiguousMutationError('replace the tunnel configuration');
@@ -331,7 +331,7 @@ describe('managed Cloudflare desired state', () => {
       getTunnelConfiguration: vi.fn(async () => ({ config: desired, initialized: true, version: 2 })),
     } as unknown as CloudflareApi;
     await expect(
-      replaceManagedCloudflareConfiguration(observedAfterAmbiguous, ACCOUNT_ID, TUNNEL_ID, desired),
+      replaceManagedCloudflareConfiguration(observedAfterAmbiguous, ACCOUNT_ID, TUNNEL_ID, desired, old),
     ).resolves.toBe(2);
     expect(observedAfterAmbiguous.replaceTunnelConfiguration).toHaveBeenCalledOnce();
 
@@ -349,10 +349,47 @@ describe('managed Cloudflare desired state', () => {
       }),
     } as unknown as CloudflareApi;
     await expect(
-      replaceManagedCloudflareConfiguration(retriedAfterOldReadback, ACCOUNT_ID, TUNNEL_ID, desired),
+      replaceManagedCloudflareConfiguration(retriedAfterOldReadback, ACCOUNT_ID, TUNNEL_ID, desired, old),
     ).resolves.toBe(3);
     expect(retriedAfterOldReadback.replaceTunnelConfiguration).toHaveBeenCalledTimes(2);
     expect(retriedAfterOldReadback.getTunnelConfiguration).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry an ambiguous configuration write over a concurrent change', async () => {
+    const old = { ingress: [{ service: 'http_status:404' as const }] };
+    const desired = {
+      ingress: [
+        {
+          hostname: 'assistant.example.com',
+          path: '^/webhook/gchat$' as const,
+          service: 'http://host.docker.internal:31100',
+        },
+        { service: 'http_status:404' as const },
+      ],
+    };
+    const changed = {
+      ingress: [
+        {
+          hostname: 'other.example.com',
+          path: '^/webhook/gchat$' as const,
+          service: 'http://host.docker.internal:31200',
+        },
+        { service: 'http_status:404' as const },
+      ],
+    };
+    const api = {
+      replaceTunnelConfiguration: vi.fn(async () => {
+        throw new CloudflareAmbiguousMutationError('replace the tunnel configuration');
+      }),
+      getTunnelConfiguration: vi.fn(async () => ({ config: changed, initialized: true, version: 2 })),
+    } as unknown as CloudflareApi;
+
+    await expect(replaceManagedCloudflareConfiguration(api, ACCOUNT_ID, TUNNEL_ID, desired, old)).rejects.toMatchObject(
+      {
+        code: 'cloudflare_configuration_drift',
+      },
+    );
+    expect(api.replaceTunnelConfiguration).toHaveBeenCalledOnce();
   });
 
   it.each(['zones', 'tunnels', 'dns'] as const)(

@@ -44,6 +44,7 @@ import {
   reconcileInstanceRuntime,
   runInstanceOnecliAdminCommand,
   createInstanceRuntimeConfig,
+  googleChatProjectNumberFile,
   loadInstanceRuntimeConfig,
   type InstanceRuntimeConfig,
   type InstanceServiceDependencies,
@@ -80,6 +81,7 @@ import {
   type ProvisionPhase,
 } from './types.js';
 import { hasControlCharacters, isRecord } from './validation.js';
+import { parseGcpProjectNumber } from './gcp-identity.js';
 import {
   credentialMatchesMetadata,
   sameCredentialMetadata,
@@ -90,6 +92,7 @@ import { assertProviderProvisioningCapabilityDigest } from '../provider-provisio
 import { googleChatConfigurationUrl, isChatConfigurationConfirmed } from './chat-configuration.js';
 import {
   parseGchatServiceAccountCredential,
+  getOwnedGcpProjectNumber,
   probeGcpProjectForCreate,
   reconcileGcpProject,
   type GcloudReadbackResource,
@@ -196,6 +199,7 @@ export interface ProductionProvisionDependencies {
   readonly runReleasePreflight: typeof runReleasePreflight;
   readonly probeGcp: (context: ProductionProvisionContext) => Promise<PhaseProbeResult>;
   readonly reconcileGcpProject: typeof reconcileGcpProject;
+  readonly getOwnedGcpProjectNumber: typeof getOwnedGcpProjectNumber;
   readonly probeOnecli: (context: ProductionProvisionContext) => Promise<PhaseProbeResult>;
   readonly reconcileOnecliRuntime: typeof reconcileOnecliRuntime;
   readonly inspectOnecliRuntime: (layout: OnecliRuntimeLayout) => Promise<ObservedOnecliRuntime>;
@@ -596,6 +600,27 @@ async function ensureGchatCredential(context: ProductionProvisionContext): Promi
   });
 }
 
+async function ensureGchatProjectNumber(
+  context: ProductionProvisionContext,
+  dependencies: ProductionProvisionDependencies,
+): Promise<void> {
+  const file = googleChatProjectNumberFile(context.input.runtime);
+  try {
+    const current = (await readOwnerOnlyFile(file)).trim();
+    if (!parseGcpProjectNumber(current)) {
+      throw new GwsEaError('invalid_runtime_config', 'Google Chat project number is invalid');
+    }
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const number = await dependencies.getOwnedGcpProjectNumber(context.input.gcp);
+  if (!parseGcpProjectNumber(number)) {
+    throw new GwsEaError('invalid_child_output', 'Google Cloud returned an invalid project number');
+  }
+  await writePrivateTextFile(file, `${number}\n`);
+}
+
 const defaultProductionDependencies: ProductionProvisionDependencies = {
   probeCheckout: defaultProbeCheckout,
   materializeReleaseCheckout,
@@ -603,6 +628,7 @@ const defaultProductionDependencies: ProductionProvisionDependencies = {
   probeGcp: async (context) =>
     (await probeGcpProjectForCreate(context.input.gcp)) ? { status: 'matched' } : { status: 'absent' },
   reconcileGcpProject,
+  getOwnedGcpProjectNumber,
   probeOnecli: defaultProbeOnecli,
   reconcileOnecliRuntime,
   inspectOnecliRuntime,
@@ -866,6 +892,7 @@ function chatConfigurationPause(input: ProductionProvisionInput): Extract<PhaseP
       details: [
         `App name: ${input.identity.assistantDisplayName}`,
         'Add a public HTTPS avatar URL and a short description.',
+        'Keep “Build this Chat app as a Google Workspace add-on” enabled.',
         `Enable interactive features and 1:1 messages, then use HTTP endpoint URL ${input.runtime.endpoint_url}`,
         'Limit visibility to the intended principal or Workspace domain.',
       ],
@@ -1076,6 +1103,7 @@ export function createProductionProvisionRegistry(
           throw new GwsEaError('provider_not_ready', 'Provider credential must be reconciled before NanoClaw');
         }
         await ensureGchatCredential(value);
+        await ensureGchatProjectNumber(value, dependencies);
         await ensureInstanceHostStarted(value, dependencies);
         const main = await dependencies.reconcileMainIdentity(
           value.input.runtime,
@@ -1089,6 +1117,7 @@ export function createProductionProvisionRegistry(
         return { status: 'completed' };
       },
       reconcileCompletedPostcondition: async (value) => {
+        await ensureGchatProjectNumber(value, dependencies);
         if (!(await observeInstanceHost(value))) {
           await ensureGchatCredential(value);
           await ensureInstanceHostStarted(value, dependencies);

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -36,6 +36,7 @@ interface FakeGcpState {
   serviceAccount: boolean;
   keys: Set<string>;
   blockedPolicies?: Set<string>;
+  projectPolicies?: Map<string, boolean>;
   mutations: string[];
 }
 
@@ -70,7 +71,9 @@ function fakeRunner(state: FakeGcpState): GcloudCommandRunner {
       state.mutations.push(signature);
       return ok('{}');
     }
-    if (signature.startsWith('services list ')) return ok(state.api ? 'chat.googleapis.com\niam.googleapis.com\n' : '');
+    if (signature.startsWith('services list ')) {
+      return ok(state.api ? 'chat.googleapis.com\niam.googleapis.com\norgpolicy.googleapis.com\n' : '');
+    }
     if (signature.startsWith('services enable ')) {
       state.api = true;
       state.mutations.push(signature);
@@ -92,25 +95,33 @@ function fakeRunner(state: FakeGcpState): GcloudCommandRunner {
       state.mutations.push(signature);
       return ok('{}');
     }
-    if (signature.startsWith('resource-manager org-policies describe ')) {
-      const constraint = command.args[3]!;
+    if (signature.startsWith('org-policies describe ')) {
+      const constraint = command.args[2]!;
+      const effective = command.args.includes('--effective');
+      const enforced = effective ? state.blockedPolicies?.has(constraint) : state.projectPolicies?.get(constraint);
+      if (enforced === undefined) return missing();
       return ok(
         JSON.stringify({
-          booleanPolicy: state.blockedPolicies?.has(constraint) ? { enforced: true } : {},
-          constraint: `constraints/${constraint}`,
+          name: `projects/${PROJECT_ID}/policies/${constraint}`,
+          spec: {
+            ...(effective ? {} : { etag: 'test-etag' }),
+            rules: [{ enforce: enforced }],
+          },
         }),
       );
     }
-    if (signature.startsWith('resource-manager org-policies disable-enforce ')) {
-      const constraint = command.args[3]!;
-      state.blockedPolicies?.delete(constraint);
-      state.mutations.push(signature);
-      return ok('{}');
-    }
-    if (signature.startsWith('resource-manager org-policies enable-enforce ')) {
-      const constraint = command.args[3]!;
-      (state.blockedPolicies ??= new Set()).add(constraint);
-      state.mutations.push(signature);
+    if (signature.startsWith('org-policies set-policy ')) {
+      const policy = JSON.parse(await readFile(command.args[2]!, 'utf8')) as {
+        name: string;
+        spec: { etag?: string; rules: [{ enforce: boolean }] };
+      };
+      const constraint = policy.name.split('/').at(-1)!;
+      const expectedEtag = state.projectPolicies?.has(constraint) ? 'test-etag' : undefined;
+      if (policy.spec.etag !== expectedEtag) throw new Error('Incorrect V2 policy etag');
+      (state.projectPolicies ??= new Map()).set(constraint, policy.spec.rules[0].enforce);
+      if (policy.spec.rules[0].enforce) (state.blockedPolicies ??= new Set()).add(constraint);
+      else state.blockedPolicies?.delete(constraint);
+      state.mutations.push(`${signature} name=${policy.name} enforced=${policy.spec.rules[0].enforce}`);
       return ok('{}');
     }
     if (signature.startsWith('iam service-accounts keys list ')) {
@@ -273,6 +284,7 @@ describe('Google Cloud provisioning', () => {
     await reconcileGcpProject(input, { runCommand });
     expect(state.mutations).toEqual(firstMutations);
     expect(firstMutations).toHaveLength(6);
+    expect(firstMutations.find((entry) => entry.startsWith('services enable '))).toContain('orgpolicy.googleapis.com');
     expect(firstMutations.every((args) => args.includes('--account=operator@example.com'))).toBe(true);
     expect(
       firstMutations.filter((args) => !args.startsWith('projects create ')).every((args) => args.includes(PROJECT_ID)),
@@ -299,19 +311,113 @@ describe('Google Cloud provisioning', () => {
       new Set(['iam.disableServiceAccountKeyCreation', 'iam.managed.disableServiceAccountKeyCreation']),
     );
     expect(
-      state.mutations.filter((entry) => entry.startsWith('resource-manager org-policies disable-enforce ')),
+      state.mutations.filter(
+        (entry) => entry.startsWith('org-policies set-policy ') && entry.endsWith('enforced=false'),
+      ),
     ).toEqual([
       expect.stringContaining('iam.disableServiceAccountKeyCreation'),
       expect.stringContaining('iam.managed.disableServiceAccountKeyCreation'),
     ]);
     expect(
-      state.mutations.filter((entry) => entry.startsWith('resource-manager org-policies enable-enforce ')),
+      state.mutations.filter(
+        (entry) => entry.startsWith('org-policies set-policy ') && entry.endsWith('enforced=true'),
+      ),
     ).toEqual([
       expect.stringContaining('iam.disableServiceAccountKeyCreation'),
       expect.stringContaining('iam.managed.disableServiceAccountKeyCreation'),
     ]);
     expect(progress).toContain('credential-policy');
     expect(await verifyGcpProject(input, { runCommand: fakeRunner(state) })).toBe(true);
+  });
+
+  it('restores a managed key-creation policy through V2 after publishing the Chat credential', async () => {
+    const root = await tempRoot();
+    const input = projectInput(root);
+    await mkdir(path.dirname(input.credentialFile), { recursive: true, mode: 0o700 });
+    await writeFile(input.credentialFile, credentialContents('existing-key'), { mode: 0o600 });
+    const state = readyState({
+      keys: new Set(['existing-key']),
+      blockedPolicies: new Set(['iam.disableServiceAccountKeyCreation']),
+      projectPolicies: new Map([['iam.managed.disableServiceAccountKeyCreation', false]]),
+    });
+    await expect(probeGcpProjectForCreate(input, { runCommand: fakeRunner(state) })).resolves.toBe(false);
+    await reconcileGcpProject(input, { runCommand: fakeRunner(state) });
+
+    expect(state.blockedPolicies).toEqual(
+      new Set(['iam.disableServiceAccountKeyCreation', 'iam.managed.disableServiceAccountKeyCreation']),
+    );
+    expect(state.projectPolicies?.get('iam.managed.disableServiceAccountKeyCreation')).toBe(true);
+    expect(state.mutations).toEqual([
+      expect.stringContaining('policies/iam.managed.disableServiceAccountKeyCreation enforced=true'),
+    ]);
+    expect(state.mutations.some((entry) => entry.startsWith('iam service-accounts keys create '))).toBe(false);
+  });
+
+  it('restores key-creation restrictions after key creation fails', async () => {
+    const root = await tempRoot();
+    const input = projectInput(root);
+    const state = readyState({ blockedPolicies: new Set(['iam.disableServiceAccountKeyCreation']) });
+    const fallback = fakeRunner(state);
+    const failedKeyRunner: GcloudCommandRunner = async (command) => {
+      if (command.args.slice(0, 4).join(' ') === 'iam service-accounts keys create') {
+        return { stdout: '', stderr: 'PERMISSION_DENIED', exitCode: 1 };
+      }
+      return fallback(command);
+    };
+
+    await expect(reconcileGcpProject(input, { runCommand: failedKeyRunner })).rejects.toMatchObject({
+      code: 'gcloud_failed',
+    });
+    expect(state.blockedPolicies).toEqual(
+      new Set(['iam.disableServiceAccountKeyCreation', 'iam.managed.disableServiceAccountKeyCreation']),
+    );
+    expect(state.keys.size).toBe(0);
+  });
+
+  it('restores a restriction when disabling the next one fails', async () => {
+    const root = await tempRoot();
+    const input = projectInput(root);
+    const state = readyState({
+      blockedPolicies: new Set([
+        'iam.disableServiceAccountKeyCreation',
+        'iam.managed.disableServiceAccountKeyCreation',
+      ]),
+    });
+    const fallback = fakeRunner(state);
+    const partialFailureRunner: GcloudCommandRunner = async (command) => {
+      if (command.args.slice(0, 2).join(' ') === 'org-policies set-policy') {
+        const policy = JSON.parse(await readFile(command.args[2]!, 'utf8')) as {
+          name: string;
+          spec: { rules: [{ enforce: boolean }] };
+        };
+        if (policy.name.endsWith('/iam.managed.disableServiceAccountKeyCreation') && !policy.spec.rules[0].enforce) {
+          return { stdout: '', stderr: 'PERMISSION_DENIED', exitCode: 1 };
+        }
+      }
+      return fallback(command);
+    };
+
+    await expect(reconcileGcpProject(input, { runCommand: partialFailureRunner })).rejects.toMatchObject({
+      code: 'gcp_policy_permission_required',
+    });
+    expect(state.blockedPolicies).toEqual(
+      new Set(['iam.disableServiceAccountKeyCreation', 'iam.managed.disableServiceAccountKeyCreation']),
+    );
+    expect(state.keys.size).toBe(0);
+  });
+
+  it('restores restrictions before reporting a remote key without local private material', async () => {
+    const root = await tempRoot();
+    const input = projectInput(root);
+    const state = readyState({ keys: new Set(['orphan-key']), blockedPolicies: new Set() });
+
+    await expect(reconcileGcpProject(input, { runCommand: fakeRunner(state) })).rejects.toMatchObject({
+      code: 'gcp_key_recovery_required',
+    });
+    expect(state.blockedPolicies).toEqual(
+      new Set(['iam.disableServiceAccountKeyCreation', 'iam.managed.disableServiceAccountKeyCreation']),
+    );
+    expect(state.mutations.some((entry) => entry.startsWith('iam service-accounts keys create '))).toBe(false);
   });
 
   it('recovers a zero-byte credential left by a failed gcloud key request', async () => {
@@ -363,10 +469,8 @@ describe('Google Cloud provisioning', () => {
     expect(await verifyGcpProject(input, { runCommand: fakeRunner(state) })).toBe(true);
     await expect(stat(`${input.credentialFile}.staging`)).rejects.toMatchObject({ code: 'ENOENT' });
     expect(state.mutations).toEqual([
-      expect.stringContaining('resource-manager org-policies enable-enforce iam.disableServiceAccountKeyCreation'),
-      expect.stringContaining(
-        'resource-manager org-policies enable-enforce iam.managed.disableServiceAccountKeyCreation',
-      ),
+      expect.stringContaining('policies/iam.disableServiceAccountKeyCreation enforced=true'),
+      expect.stringContaining('policies/iam.managed.disableServiceAccountKeyCreation enforced=true'),
     ]);
   });
 
@@ -425,7 +529,7 @@ describe('Google Cloud provisioning', () => {
       const state = readyState({ blockedPolicies: new Set(['iam.disableServiceAccountKeyCreation']) });
       const fallback = fakeRunner(state);
       const runCommand: GcloudCommandRunner = async (command) =>
-        command.args.slice(0, 3).join(' ') === 'resource-manager org-policies disable-enforce'
+        command.args.slice(0, 2).join(' ') === 'org-policies set-policy'
           ? { stdout: '', stderr, exitCode: 1 }
           : fallback(command);
 
@@ -443,7 +547,7 @@ describe('Google Cloud provisioning', () => {
     const state = readyState({ blockedPolicies: new Set(['iam.disableServiceAccountKeyCreation']) });
     const fallback = fakeRunner(state);
     const runCommand: GcloudCommandRunner = async (command) => {
-      if (command.args.slice(0, 3).join(' ') === 'resource-manager org-policies disable-enforce') {
+      if (command.args.slice(0, 2).join(' ') === 'org-policies set-policy') {
         state.mutations.push(command.args.join(' '));
         return { stdout: '{}', stderr: '', exitCode: 0 };
       }
@@ -465,7 +569,7 @@ describe('Google Cloud provisioning', () => {
     const state = readyState({ keys: new Set(['staged-key']) });
     const fallback = fakeRunner(state);
     const stalePolicyRunner: GcloudCommandRunner = async (command) => {
-      if (command.args.slice(0, 3).join(' ') === 'resource-manager org-policies enable-enforce') {
+      if (command.args.slice(0, 2).join(' ') === 'org-policies set-policy') {
         state.mutations.push(command.args.join(' '));
         return { stdout: '{}', stderr: '', exitCode: 0 };
       }
@@ -708,7 +812,8 @@ describe('Google Cloud provisioning', () => {
         { runCommand: fakeRunner(state) },
       ),
     ).rejects.toMatchObject({ code: 'gcp_key_recovery_required' });
-    expect(state.mutations).toEqual([]);
+    expect(state.mutations.every((mutation) => mutation.includes('enforced=true'))).toBe(true);
+    expect(state.mutations.some((mutation) => mutation.startsWith('iam service-accounts keys create '))).toBe(false);
   });
 
   it('refuses to adopt a project whose GWS-EA ownership label differs', async () => {

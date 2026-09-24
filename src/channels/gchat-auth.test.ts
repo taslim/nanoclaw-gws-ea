@@ -48,6 +48,19 @@ function webhookRequest(token?: string): Request {
   });
 }
 
+function verifiedEmail(token: string): string {
+  switch (token) {
+    case 'exact-audience-untrusted-email':
+      return 'attacker@example.test';
+    case 'exact-audience-addon':
+      return 'service-441811502258@gcp-sa-gsuiteaddons.iam.gserviceaccount.com';
+    case 'exact-audience-foreign-addon':
+      return 'service-999999999999@gcp-sa-gsuiteaddons.iam.gserviceaccount.com';
+    default:
+      return 'chat@system.gserviceaccount.com';
+  }
+}
+
 describe('Google Chat request authentication', () => {
   let adapter: GoogleChatAdapter;
   let observable: ObservableGoogleChatAdapter;
@@ -59,6 +72,7 @@ describe('Google Chat request authentication', () => {
       credentials: { client_email: 'bot@example.test', private_key: 'not-used-by-this-test' },
       endpointUrl,
       botUserId,
+      workspaceAddOnServiceAccountEmail: 'service-441811502258@gcp-sa-gsuiteaddons.iam.gserviceaccount.com',
     });
     observable = adapter as unknown as ObservableGoogleChatAdapter;
     verifyIdToken = vi
@@ -71,10 +85,7 @@ describe('Google Chat request authentication', () => {
         return {
           getPayload: () => ({
             aud: tokenAudience,
-            email:
-              idToken === 'exact-audience-untrusted-email'
-                ? 'attacker@example.test'
-                : 'chat@system.gserviceaccount.com',
+            email: verifiedEmail(idToken),
             email_verified: idToken !== 'exact-audience-unverified-email',
             iss: 'https://accounts.google.com',
           }),
@@ -107,7 +118,14 @@ describe('Google Chat request authentication', () => {
     expect(handleMessageEvent).toHaveBeenCalledOnce();
   });
 
-  it.each(['exact-audience-untrusted-email', 'exact-audience-unverified-email'])(
+  it('accepts the dedicated project’s Workspace Add-on identity', async () => {
+    const response = await adapter.handleWebhook(webhookRequest('exact-audience-addon'));
+
+    expect(response.status).toBe(200);
+    expect(handleMessageEvent).toHaveBeenCalledOnce();
+  });
+
+  it.each(['exact-audience-untrusted-email', 'exact-audience-unverified-email', 'exact-audience-foreign-addon'])(
     'rejects exact-audience token with untrusted identity claims: %s',
     async (token) => {
       const response = await adapter.handleWebhook(webhookRequest(token));

@@ -12,6 +12,7 @@ import {
   buildInstanceHostEnvironment,
   createInstanceRuntimeConfig,
   createInstanceServiceLayout,
+  googleChatProjectNumberFile,
   launchInstanceHost,
   persistInstanceRuntime,
   reconcileInstanceRuntime,
@@ -118,6 +119,10 @@ describe('GWS-EA instance runtime', () => {
       '{"client_email":"bot@example.test","private_key":"chat-secret-canary"}',
     );
     await writeOwnerOnlyFileExclusive(config.secret_files.onecli_runtime_api_key, 'runtime-secret-canary');
+    await writeOwnerOnlyFileExclusive(
+      googleChatProjectNumberFile(config),
+      '441811502258\n',
+    );
     await writeOwnerOnlyFileExclusive(config.secret_files.onecli_admin_api_key, 'admin-secret-canary');
 
     const environment = await buildInstanceHostEnvironment(config, {
@@ -128,6 +133,8 @@ describe('GWS-EA instance runtime', () => {
       ONECLI_URL: 'https://attacker.invalid',
       ONECLI_API_KEY: 'ambient-secret',
       GCHAT_CREDENTIALS: 'ambient-chat-secret',
+      GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL:
+        'service-999999999999@gcp-sa-gsuiteaddons.iam.gserviceaccount.com',
       NODE_OPTIONS: '--import=/tmp/attacker.js',
     });
 
@@ -139,6 +146,8 @@ describe('GWS-EA instance runtime', () => {
       ONECLI_URL: config.onecli_app_url,
       ONECLI_API_KEY: 'runtime-secret-canary',
       GCHAT_CREDENTIALS: expect.stringContaining('chat-secret-canary'),
+      GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL:
+        'service-441811502258@gcp-sa-gsuiteaddons.iam.gserviceaccount.com',
     });
     expect(environment).not.toHaveProperty('NODE_OPTIONS');
     expect(Object.values(environment)).not.toContain('admin-secret-canary');
@@ -217,6 +226,16 @@ describe('GWS-EA instance runtime', () => {
     await expect(buildInstanceHostEnvironment(config)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it('rejects an invalid Google Chat project number before host start', async () => {
+    const { config } = await fixture();
+    await persistInstanceRuntime(config);
+    await writeOwnerOnlyFileExclusive(config.secret_files.gchat_credentials, 'chat-credential');
+    await writeOwnerOnlyFileExclusive(config.secret_files.onecli_runtime_api_key, 'runtime-key');
+    await writeOwnerOnlyFileExclusive(googleChatProjectNumberFile(config), '0\n');
+
+    await expect(buildInstanceHostEnvironment(config)).rejects.toMatchObject({ code: 'invalid_runtime_config' });
+  });
+
   it('replaces the launcher with the exact checkout host and constructed environment', async () => {
     const { config } = await fixture();
     await persistInstanceRuntime(config);
@@ -225,6 +244,10 @@ describe('GWS-EA instance runtime', () => {
       '{"client_email":"bot@example.test","private_key":"chat-secret-canary"}',
     );
     await writeOwnerOnlyFileExclusive(config.secret_files.onecli_runtime_api_key, 'runtime-secret-canary');
+    await writeOwnerOnlyFileExclusive(
+      googleChatProjectNumberFile(config),
+      '441811502258\n',
+    );
     const calls: Array<{ file: string; args: readonly string[]; env: NodeJS.ProcessEnv }> = [];
     const marker = new Error('execve called');
     const execve = ((file: string, args: readonly string[], env: NodeJS.ProcessEnv): never => {

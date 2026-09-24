@@ -89,7 +89,7 @@ const PHASE_PROGRESS: Readonly<Record<ProvisionPhase, string>> = {
 
 const GCP_PROGRESS: Readonly<Record<NonNullable<ProvisionProgressEvent['detail']>, string>> = {
   project: 'Waiting for the Google Cloud project…',
-  apis: 'Waiting for the Google Chat APIs…',
+  apis: 'Waiting for the required Google Cloud APIs…',
   'service-account': 'Waiting for the Google Chat service account…',
   'credential-policy': 'Updating the dedicated project’s Google Chat credential policy…',
   'service-account-keys': 'Waiting for Google Cloud IAM…',

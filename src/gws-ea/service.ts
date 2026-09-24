@@ -17,6 +17,7 @@ import {
 import { readOwnerOnlyFile, writePrivateTextFile } from './secrets.js';
 import { createInstanceServiceCoordinates, type InstanceServicePlatform } from './service-coordinates.js';
 import { validateExistingGchatEndpoint } from './endpoint.js';
+import { deriveWorkspaceAddOnIdentity, parseGcpProjectNumber } from './gcp-identity.js';
 import { assertInstanceId } from './registry.js';
 import { GwsEaError, ingressEndpointUrl, type AllocatedPorts, type InstanceReservation } from './types.js';
 import { hasControlCharacters } from './validation.js';
@@ -109,6 +110,10 @@ function expectedSecretFiles(checkout: string): InstanceSecretFiles {
     onecli_runtime_api_key: path.join(root, 'onecli-runtime-api-key'),
     onecli_admin_api_key: path.join(root, 'onecli-admin-api-key'),
   };
+}
+
+export function googleChatProjectNumberFile(config: Pick<InstanceRuntimeConfig, 'secret_files'>): string {
+  return path.join(path.dirname(config.secret_files.gchat_credentials), 'gchat-project-number');
 }
 
 function installId(instanceId: string): string {
@@ -480,18 +485,22 @@ export async function buildInstanceHostEnvironment(
 ): Promise<Record<string, string>> {
   const config = validateRuntimeConfig(configInput);
   await assertPrivateLocalDirectory(path.dirname(config.secret_files.gchat_credentials));
-  const [gchatCredentials, onecliRuntimeApiKey] = await Promise.all([
+  const [gchatCredentials, onecliRuntimeApiKey, projectNumberFile] = await Promise.all([
     readOwnerOnlyFile(config.secret_files.gchat_credentials),
     readOwnerOnlyFile(config.secret_files.onecli_runtime_api_key),
+    readOwnerOnlyFile(googleChatProjectNumberFile(config)),
   ]);
   if (!gchatCredentials.trim() || !onecliRuntimeApiKey.trim()) {
     throw new GwsEaError('invalid_secret', 'A required instance host credential is empty');
   }
+  const projectNumber = parseGcpProjectNumber(projectNumberFile.trim());
+  if (!projectNumber) throw new GwsEaError('invalid_runtime_config', 'Google Chat project number is invalid');
   return buildAllowlistedEnvironment(ambient, {
     HOME: config.home_directory,
     ...instanceHostConfiguration(config),
     ONECLI_API_KEY: onecliRuntimeApiKey.trim(),
     GCHAT_CREDENTIALS: gchatCredentials,
+    GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL: deriveWorkspaceAddOnIdentity(projectNumber),
   });
 }
 

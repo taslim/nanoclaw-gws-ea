@@ -137,6 +137,20 @@ describe('managed Google Chat route verification', () => {
     ).rejects.toMatchObject({ code: 'managed_catch_all_mismatch' });
   });
 
+  it('rejects a wrong-path 404 served by NanoClaw instead of Cloudflare', async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>(
+      async (url) =>
+        new Response(null, {
+          status: String(url).endsWith('__gws_ea_wrong_path__') ? 404 : 401,
+          headers: { 'x-nanoclaw-webhook-id': listenerId },
+        }),
+    );
+
+    await expect(
+      verifyManagedGchatRoute({ endpointUrl: ENDPOINT, localEndpointUrl: localEndpoint }, { fetch }),
+    ).rejects.toMatchObject({ code: 'managed_catch_all_mismatch' });
+  });
+
   it('rejects a redirect from the public wrong path', async () => {
     const fetch = vi.fn<typeof globalThis.fetch>(async (url) => {
       if (String(url).endsWith('__gws_ea_wrong_path__')) {

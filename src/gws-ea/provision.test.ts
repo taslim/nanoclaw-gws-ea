@@ -31,7 +31,7 @@ import {
 } from './onecli-compose.js';
 import type { ObservedOnecliRuntime, OnecliCompatibilityReceipt } from './onecli.js';
 import { holdLoopbackPorts } from './ports.js';
-import { createInstanceRuntimeConfig, persistInstanceRuntime } from './service.js';
+import { createInstanceRuntimeConfig, googleChatProjectNumberFile, persistInstanceRuntime } from './service.js';
 import type { CloudflareApi } from './cloudflare-api.js';
 import type { ObservedCloudflareConnector } from './cloudflare-connector.js';
 import {
@@ -630,13 +630,20 @@ describe('production provision phase composition', () => {
           identityDependencies: probeIdentityDependencies(resumedBase, identityState),
         },
       };
+      await mkdir(path.dirname(resumed.input.runtime.secret_files.gchat_credentials), {
+        recursive: true,
+        mode: 0o700,
+      });
       const reconcileMainIdentity = vi.fn(async () => {
         identityState.agents = identityState.agents.map((agent) =>
           agent.id === 'oc-main' ? { ...agent, secretMode: 'all' as const } : agent,
         );
         return { agentGroupId: 'ag-main', onecliAgentId: 'oc-main' };
       });
-      const production = createProductionProvisionRegistry(resumed, { reconcileMainIdentity });
+      const production = createProductionProvisionRegistry(resumed, {
+        reconcileMainIdentity,
+        getOwnedGcpProjectNumber: async () => '441811502258',
+      });
       const resumedRegistry = defineProvisionPhaseRegistry(
         Object.fromEntries(
           PROVISION_PHASES.map((phase) => [
@@ -1198,6 +1205,7 @@ describe('production provision phase composition', () => {
           details: [
             'App name: Aya',
             expect.stringContaining('avatar'),
+            expect.stringContaining('Google Workspace add-on'),
             expect.stringContaining('https://assistant.example.com/webhook/gchat'),
             expect.stringContaining('visibility'),
           ],
@@ -1287,6 +1295,7 @@ describe('production provision phase composition', () => {
       });
       const reconcileMainIdentity = vi.fn(async () => ({ agentGroupId: 'ag-main', onecliAgentId: 'onecli-main' }));
       const phase = createProductionProvisionRegistry(context, {
+        getOwnedGcpProjectNumber: async () => '441811502258',
         holdReservedLoopbackPorts,
         reconcileInstanceRuntime,
         reconcileMainIdentity,
@@ -1335,6 +1344,7 @@ describe('production provision phase composition', () => {
       const reconcileMainIdentity = vi.fn(async () => ({ agentGroupId: 'ag-main', onecliAgentId: 'onecli-main' }));
       const nanoclawStartupDelay = vi.fn(async () => undefined);
       const phase = createProductionProvisionRegistry(context, {
+        getOwnedGcpProjectNumber: async () => '441811502258',
         holdReservedLoopbackPorts,
         reconcileInstanceRuntime,
         reconcileMainIdentity,
@@ -1385,6 +1395,7 @@ describe('production provision phase composition', () => {
       });
       const reconcileMainIdentity = vi.fn();
       const phase = createProductionProvisionRegistry(context, {
+        getOwnedGcpProjectNumber: async () => '441811502258',
         holdReservedLoopbackPorts: async () => ({ release: async () => undefined }),
         reconcileInstanceRuntime,
         reconcileMainIdentity,
@@ -1435,6 +1446,8 @@ describe('production provision phase composition', () => {
         effects.push('reconcileGcpProject');
         resources.add('gcp');
       },
+      getOwnedGcpProjectNumber: async () => '441811502258',
+      holdReservedLoopbackPorts: async () => ({ release: async () => undefined }),
       probeOnecli: async () => (resources.has('onecli') ? { status: 'matched' } : { status: 'absent' }),
       reconcileOnecliRuntime: async () => {
         effects.push('reconcileOnecliRuntime');
@@ -1592,6 +1605,7 @@ describe('production provision phase composition', () => {
     });
     expect(effects).toContain('verifyExistingGchatRoute');
     expect(paused).toMatchObject({ status: 'paused', pause: { code: 'principal_dm_required' } });
+    expect(await readFile(googleChatProjectNumberFile(context!.input.runtime), 'utf8')).toBe('441811502258\n');
     await expect(readFile(paths.bootstrapFile(reserved.instance_id), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
     expect(effects.filter((effect) => !effect.startsWith('verifyExisting'))).toEqual([
       'materializeReleaseCheckout',

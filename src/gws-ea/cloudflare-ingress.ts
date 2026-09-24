@@ -182,7 +182,7 @@ function chooseOwnedTunnel(
   return tunnels[0] ? assertTunnel(tunnels[0], expectedName, expectedId) : undefined;
 }
 
-function desiredDnsRecord(instance: InstanceReservation, tunnelId: string): CloudflareDnsRecordWrite {
+export function desiredDnsRecord(instance: InstanceReservation, tunnelId: string): CloudflareDnsRecordWrite {
   const claim = instance.exclusive_resource_claims.ingress;
   if (claim.mode !== 'managed-cloudflare') {
     throw new GwsEaError('invalid_registry', 'DNS reconciliation requires a managed Cloudflare claim');
@@ -206,7 +206,7 @@ function dnsMatches(record: CloudflareDnsRecord, desired: CloudflareDnsRecordWri
   );
 }
 
-function chooseOwnedDnsRecord(
+export function chooseOwnedDnsRecord(
   records: readonly CloudflareDnsRecord[],
   desired: CloudflareDnsRecordWrite,
   expectedId: string | null,
@@ -266,14 +266,19 @@ export async function replaceManagedCloudflareConfiguration(
   accountId: string,
   tunnelId: string,
   desired: ManagedCloudflareConfiguration,
+  expectedBefore: ManagedCloudflareConfiguration,
 ): Promise<number> {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       await api.replaceTunnelConfiguration(accountId, tunnelId, desired);
     } catch (error) {
       const observed = await api.getTunnelConfiguration(accountId, tunnelId);
-      if (stable(parseOwnedConfiguration(observed.config)) === stable(desired)) return observed.version;
+      const actual = stable(parseOwnedConfiguration(observed.config));
+      if (actual === stable(desired)) return observed.version;
       if (!(error instanceof CloudflareAmbiguousMutationError) || attempt === 1) throw error;
+      if (actual !== stable(expectedBefore)) {
+        throw new GwsEaError('cloudflare_configuration_drift', 'Cloudflare tunnel configuration changed during retry');
+      }
       continue;
     }
     const readback = await api.getTunnelConfiguration(accountId, tunnelId);
@@ -405,7 +410,7 @@ export async function reconcileManagedCloudflareIngress(
     const configurationVersion =
       stable(normalizedCurrent) === stable(desired)
         ? currentConfiguration.version
-        : await replaceManagedCloudflareConfiguration(api, metadata.account_id, tunnel.id, desired);
+        : await replaceManagedCloudflareConfiguration(api, metadata.account_id, tunnel.id, desired, normalizedCurrent);
 
     const dnsRecordIds: Record<string, string> = {};
     for (const instance of managedReservations(registry)) {

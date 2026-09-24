@@ -9,8 +9,14 @@ import type { ChannelDefaults } from './adapter.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
 
-const GCHAT_ENV_KEYS = ['GCHAT_CREDENTIALS', 'GCHAT_ENDPOINT_URL', 'GCHAT_BOT_USER_ID'] as const;
+const GCHAT_ENV_KEYS = [
+  'GCHAT_CREDENTIALS',
+  'GCHAT_ENDPOINT_URL',
+  'GCHAT_BOT_USER_ID',
+  'GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL',
+] as const;
 const GCHAT_BOT_USER_ID_RE = /^users\/[^/\s]+$/;
+const GCHAT_ADDON_IDENTITY_RE = /^service-[1-9]\d*@gcp-sa-gsuiteaddons\.iam\.gserviceaccount\.com$/;
 const ALTERNATE_VERIFIER_ENV_KEYS = [
   'GOOGLE_CHAT_PROJECT_NUMBER',
   'GOOGLE_CHAT_PUBSUB_AUDIENCE',
@@ -104,8 +110,12 @@ registerChannelAdapter('gchat', {
     const credentialsRaw = configuredValue(process.env.GCHAT_CREDENTIALS, fileEnv.GCHAT_CREDENTIALS);
     const endpointUrl = configuredValue(process.env.GCHAT_ENDPOINT_URL, fileEnv.GCHAT_ENDPOINT_URL);
     const botUserId = configuredValue(process.env.GCHAT_BOT_USER_ID, fileEnv.GCHAT_BOT_USER_ID);
+    const addOnIdentity = configuredValue(
+      process.env.GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL,
+      fileEnv.GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL,
+    );
 
-    if (!credentialsRaw && !endpointUrl && !botUserId) return null;
+    if (!credentialsRaw && !endpointUrl && !botUserId && !addOnIdentity) return null;
     if (!credentialsRaw) {
       throw new Error('Google Chat configuration requires GCHAT_CREDENTIALS');
     }
@@ -115,12 +125,16 @@ registerChannelAdapter('gchat', {
     const credentials = parseCredentials(credentialsRaw);
     validateEndpointUrl(endpointUrl);
     if (botUserId) validateBotUserId(botUserId);
+    if (addOnIdentity && !GCHAT_ADDON_IDENTITY_RE.test(addOnIdentity)) {
+      throw new Error('GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL must be a Workspace Add-on service identity');
+    }
     rejectAlternateVerifierConfiguration();
 
     const gchatAdapter = createGoogleChatAdapter({
       credentials,
       endpointUrl,
       ...(botUserId ? { botUserId } : {}),
+      ...(addOnIdentity ? { workspaceAddOnServiceAccountEmail: addOnIdentity } : {}),
     });
     return createChatSdkBridge({
       adapter: gchatAdapter,

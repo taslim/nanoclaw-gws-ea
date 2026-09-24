@@ -71,7 +71,7 @@ const DNS_LABEL_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 const DNS_NAME_PATTERN = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 const CLOUDFLARE_API_TOKEN_URL = 'https://dash.cloudflare.com/profile/api-tokens';
 export const CLOUDFLARE_API_TOKEN_GUIDANCE = [
-  'Create a scoped API token for the intended account and zone:',
+  'Create a scoped API token for the intended account and every zone used by managed assistants on this machine:',
   'Account · Cloudflare Tunnel: Edit',
   'Zone · Zone: Read',
   'Zone · DNS: Edit',

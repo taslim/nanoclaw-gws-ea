@@ -7,7 +7,12 @@ import { readJson, writePrivate } from '../community-portal/private-file.js';
 import { processLock } from '../community-portal/process-lock.js';
 import { isErrno } from '../community-portal/errors.js';
 import { deleteOwnedGcpProject } from './gcloud.js';
-import { createCloudflareApi, type CloudflareApi, type CloudflareDnsRecord } from './cloudflare-api.js';
+import {
+  createCloudflareApi,
+  type CloudflareApi,
+  type CloudflareDnsRecord,
+  type CloudflareDnsRecordWrite,
+} from './cloudflare-api.js';
 import {
   createCloudflareConnectorLayout,
   inspectCloudflareConnector,
@@ -19,7 +24,8 @@ import {
 } from './cloudflare-connector.js';
 import {
   assertManagedCloudflareConfigurationOwnership,
-  cloudflareDnsOwnershipComment,
+  chooseOwnedDnsRecord,
+  desiredDnsRecord,
   GCHAT_TUNNEL_PATH,
   renderManagedCloudflareConfiguration,
   replaceManagedCloudflareConfiguration,
@@ -384,44 +390,16 @@ function registryWithoutInstance(registry: InstanceRegistry, instanceId: string)
   return { ...registry, instances };
 }
 
-function managedDnsRecord(
-  reservation: InstanceReservation,
-  claim: ManagedCloudflareIngressClaim,
-  tunnelId: string,
-): Omit<CloudflareDnsRecord, 'id'> {
-  return {
-    type: 'CNAME',
-    name: claim.hostname,
-    content: `${tunnelId}.cfargotunnel.com`,
-    proxied: true,
-    comment: cloudflareDnsOwnershipComment(reservation.instance_id),
-  };
-}
-
-function dnsRecordMatches(
-  record: CloudflareDnsRecord,
-  desired: Omit<CloudflareDnsRecord, 'id'>,
-  recordId: string,
-): boolean {
-  return (
-    record.id === recordId &&
-    record.type === desired.type &&
-    record.name === desired.name &&
-    record.content === desired.content &&
-    record.proxied === desired.proxied &&
-    record.comment === desired.comment
-  );
-}
-
 function exactOwnedDnsRecord(
   records: readonly CloudflareDnsRecord[],
-  desired: Omit<CloudflareDnsRecord, 'id'>,
+  desired: CloudflareDnsRecordWrite,
   recordId: string,
 ): CloudflareDnsRecord {
-  if (records.length !== 1 || !dnsRecordMatches(records[0]!, desired, recordId)) {
+  const record = chooseOwnedDnsRecord(records, desired, recordId);
+  if (!record) {
     throw new GwsEaError('foreign_cloudflare_dns', `Cloudflare DNS name ${desired.name} changed ownership`);
   }
-  return records[0]!;
+  return record;
 }
 
 function assertOwnedTunnel(
@@ -585,7 +563,7 @@ async function removeManagedCloudflareIngress(
       throw new GwsEaError('invalid_removal', 'Cloudflare tunnel disappeared before route teardown completed');
     }
 
-    const desiredDns = tunnelId === null ? undefined : managedDnsRecord(reservation, claim, tunnelId);
+    const desiredDns = tunnelId === null ? undefined : desiredDnsRecord(reservation, tunnelId);
     let dnsRecords = await api.listDnsRecords(claim.zone_id, claim.hostname);
     if (claim.dns_record_id === null) {
       if (dnsRecords.length !== 0) {
@@ -634,7 +612,7 @@ async function removeManagedCloudflareIngress(
         throw new GwsEaError('cloudflare_tunnel_missing', 'The owned Cloudflare tunnel is missing during teardown');
       }
       if (tunnelId !== null && currentConfiguration && stable(currentConfiguration) !== stable(desired)) {
-        await replaceManagedCloudflareConfiguration(api, claim.account_id, tunnelId, desired);
+        await replaceManagedCloudflareConfiguration(api, claim.account_id, tunnelId, desired, currentConfiguration);
       }
       receipt = await completeManagedIngressStep(paths, receipt, 'configuration');
     }

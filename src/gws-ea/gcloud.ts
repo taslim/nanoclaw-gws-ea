@@ -1,10 +1,15 @@
-import { chmod } from 'node:fs/promises';
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { isErrno } from '../community-portal/errors.js';
-import { deriveGchatServiceAccountEmail, GCHAT_SERVICE_ACCOUNT_ID, GCP_PROJECT_PATTERN } from './gcp-identity.js';
+import {
+  deriveGchatServiceAccountEmail,
+  GCHAT_SERVICE_ACCOUNT_ID,
+  GCP_PROJECT_PATTERN,
+  parseGcpProjectNumber,
+} from './gcp-identity.js';
 import { preparePrivateLocalDirectory } from './paths.js';
 import {
   buildAllowlistedEnvironment,
@@ -21,7 +26,7 @@ import { isRecord } from './validation.js';
 export const GCLOUD_INSTALL_URL = 'https://cloud.google.com/sdk/docs/install';
 const PROJECT_LABEL_INSTANCE = 'gws-ea-instance';
 const PROJECT_LABEL_MANAGED = 'gws-ea-managed';
-const REQUIRED_APIS = ['chat.googleapis.com', 'iam.googleapis.com'] as const;
+const REQUIRED_APIS = ['chat.googleapis.com', 'iam.googleapis.com', 'orgpolicy.googleapis.com'] as const;
 const SERVICE_ACCOUNT_KEY_POLICIES = [
   'iam.disableServiceAccountKeyCreation',
   'iam.managed.disableServiceAccountKeyCreation',
@@ -86,6 +91,7 @@ export interface GcpDeletionInput {
 
 interface ProjectDescription {
   readonly projectId: string;
+  readonly projectNumber: string | undefined;
   readonly lifecycleState: string;
   readonly labels: Readonly<Record<string, string>>;
 }
@@ -277,9 +283,26 @@ async function describeProject(
   }
   return {
     projectId: stringField(value, 'projectId', 'Google Cloud project'),
+    projectNumber: parseGcpProjectNumber(value.projectNumber),
     lifecycleState: stringField(value, 'lifecycleState', 'Google Cloud project'),
     labels,
   };
+}
+
+export async function getOwnedGcpProjectNumber(
+  input: GcpDeletionInput,
+  dependencies: GcloudDependencies = {},
+): Promise<string> {
+  const project = await describeProject(input, dependencies.runCommand ?? runSanitizedCommandOutcome);
+  if (!project) throw commandFailure('The dedicated Google Cloud project is unavailable.');
+  assertOwnedProject(input, project);
+  if (project.lifecycleState !== 'ACTIVE') {
+    throw new GwsEaError('gcp_project_unavailable', 'The dedicated Google Cloud project is not active');
+  }
+  if (!project.projectNumber) {
+    throw new GwsEaError('invalid_gcloud_output', 'Google Cloud returned an invalid project number');
+  }
+  return project.projectNumber;
 }
 
 function assertOwnedProject(input: GcpDeletionInput, project: ProjectDescription): void {
@@ -382,7 +405,7 @@ async function ensureApis(
     ['services', 'enable', ...missing, `--project=${input.projectId}`, `--account=${input.account}`, '--quiet'],
     runner,
   );
-  if (result.exitCode !== 0) throw commandFailure('Google Cloud could not enable the Google Chat APIs.');
+  if (result.exitCode !== 0) throw commandFailure('Google Cloud could not enable the assistant setup APIs.');
   const enabled = await waitForReadback(
     async () => {
       const apis = await enabledApis(input, runner);
@@ -391,7 +414,7 @@ async function ensureApis(
     sleep,
     () => onProgress({ resource: 'apis' }),
   );
-  if (!enabled) throw commandFailure('Google Cloud did not return the newly enabled Google Chat APIs.');
+  if (!enabled) throw commandFailure('Google Cloud did not return the newly enabled assistant setup APIs.');
 }
 
 async function keyCreationPolicyEnforced(
@@ -402,7 +425,6 @@ async function keyCreationPolicyEnforced(
   const result = await run(
     input.cwd,
     [
-      'resource-manager',
       'org-policies',
       'describe',
       constraint,
@@ -415,17 +437,86 @@ async function keyCreationPolicyEnforced(
     runner,
   );
   if (result.exitCode !== 0) {
+    if (isNotFound(result)) return false;
     throw commandFailure('Google Cloud could not inspect the Chat credential policy.');
   }
   const value = parseJson(result.stdout, 'Google Cloud credential policy');
-  if (!isRecord(value) || !isRecord(value.booleanPolicy)) {
+  if (!isRecord(value) || !isRecord(value.spec) || !Array.isArray(value.spec.rules)) {
     throw new GwsEaError('invalid_gcloud_output', 'Google Cloud returned an invalid credential policy');
   }
-  const enforced = value.booleanPolicy.enforced;
-  if (enforced !== undefined && typeof enforced !== 'boolean') {
+  const rules: unknown[] = value.spec.rules;
+  if (rules.length !== 1 || !isRecord(rules[0]) || typeof rules[0].enforce !== 'boolean' || rules[0].condition) {
     throw new GwsEaError('invalid_gcloud_output', 'Google Cloud returned an invalid credential policy');
   }
-  return enforced === true;
+  return rules[0].enforce;
+}
+
+async function setKeyCreationPolicy(
+  input: GcpProjectInput,
+  constraint: (typeof SERVICE_ACCOUNT_KEY_POLICIES)[number],
+  enforced: boolean,
+  runner: GcloudCommandRunner,
+): Promise<void> {
+  const current = await run(
+    input.cwd,
+    [
+      'org-policies',
+      'describe',
+      constraint,
+      `--project=${input.projectId}`,
+      `--account=${input.account}`,
+      '--format=json',
+      '--quiet',
+    ],
+    runner,
+  );
+  if (current.exitCode !== 0 && !isNotFound(current)) {
+    throw commandFailure('Google Cloud could not inspect the Chat credential policy.');
+  }
+  let etag: string | undefined;
+  if (current.exitCode === 0) {
+    const value = parseJson(current.stdout, 'Google Cloud credential policy');
+    if (!isRecord(value) || !isRecord(value.spec) || typeof value.spec.etag !== 'string' || !value.spec.etag) {
+      throw new GwsEaError('invalid_gcloud_output', 'Google Cloud returned an invalid credential policy');
+    }
+    etag = value.spec.etag;
+  }
+
+  const temporary = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-org-policy-'));
+  try {
+    const policyFile = path.join(temporary, 'policy.json');
+    await writeFile(
+      policyFile,
+      JSON.stringify({
+        name: `projects/${input.projectId}/policies/${constraint}`,
+        spec: { ...(etag === undefined ? {} : { etag }), rules: [{ enforce: enforced }] },
+      }),
+      { encoding: 'utf8', flag: 'wx', mode: 0o600 },
+    );
+    const result = await run(
+      input.cwd,
+      [
+        'org-policies',
+        'set-policy',
+        policyFile,
+        `--project=${input.projectId}`,
+        `--account=${input.account}`,
+        '--quiet',
+      ],
+      runner,
+    );
+    if (result.exitCode !== 0) {
+      if (isPermissionDenied(result)) {
+        throw new GwsEaError(
+          'gcp_policy_permission_required',
+          'Google Cloud could not update the Chat credential policy. Grant Organization Policy Administrator access, then resume.',
+        );
+      }
+      throw commandFailure('Google Cloud could not update the Chat credential policy.');
+    }
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
 }
 
 async function reconcileKeyCreationPolicies(
@@ -446,28 +537,7 @@ async function reconcileKeyCreationPolicies(
 
   await onProgress({ resource: 'credential-policy' });
   for (const constraint of pending) {
-    const result = await run(
-      input.cwd,
-      [
-        'resource-manager',
-        'org-policies',
-        enforced ? 'enable-enforce' : 'disable-enforce',
-        constraint,
-        `--project=${input.projectId}`,
-        `--account=${input.account}`,
-        '--quiet',
-      ],
-      runner,
-    );
-    if (result.exitCode !== 0) {
-      if (isPermissionDenied(result)) {
-        throw new GwsEaError(
-          'gcp_policy_permission_required',
-          'Google Cloud could not update the Chat credential policy. Grant Organization Policy Administrator access, then resume.',
-        );
-      }
-      throw commandFailure('Google Cloud could not update the Chat credential policy.');
-    }
+    await setKeyCreationPolicy(input, constraint, enforced, runner);
   }
 
   for (const constraint of pending) {
@@ -717,17 +787,24 @@ async function ensureCredential(
   onProgress: (event: GcloudProgressEvent) => void | Promise<void>,
 ): Promise<void> {
   const stagingFile = `${input.credentialFile}.staging`;
+  const failAfterPolicyRestore = async (error: GwsEaError): Promise<never> => {
+    await reconcileKeyCreationPolicies(input, true, runner, sleep, onProgress);
+    throw error;
+  };
   const local = await inspectCredentialArtifact(input, input.credentialFile);
-  if (local.status === 'invalid') throw local.error;
+  if (local.status === 'invalid') return failAfterPolicyRestore(local.error);
   const remote = await waitForReadback(
     () => readUserManagedKeys(input, runner),
     sleep,
     () => onProgress({ resource: 'service-account-keys' }),
   );
-  if (!remote) throw commandFailure('Google Cloud could not inspect the Chat credential keys.');
+  if (!remote)
+    return failAfterPolicyRestore(commandFailure('Google Cloud could not inspect the Chat credential keys.'));
   if (local.status === 'valid') {
     if (!remote.includes(local.credential.privateKeyId)) {
-      throw new GwsEaError('gcp_key_drift', 'The local Chat credential key is no longer active in Google Cloud');
+      return failAfterPolicyRestore(
+        new GwsEaError('gcp_key_drift', 'The local Chat credential key is no longer active in Google Cloud'),
+      );
     }
     await reconcileKeyCreationPolicies(input, true, runner, sleep, onProgress);
     await removePrivateFile(stagingFile);
@@ -745,53 +822,58 @@ async function ensureCredential(
       await removePrivateFile(stagingFile);
       return;
     }
-    if (remote.length > 0) throw unavailableLocalKey();
-    throw new GwsEaError(
-      'gcp_key_pending',
-      'Google Cloud has not returned the staged Chat credential key yet; resume to continue.',
+    if (remote.length > 0) return failAfterPolicyRestore(unavailableLocalKey());
+    return failAfterPolicyRestore(
+      new GwsEaError(
+        'gcp_key_pending',
+        'Google Cloud has not returned the staged Chat credential key yet; resume to continue.',
+      ),
     );
   } else if (staged.status !== 'missing') {
-    if (remote.length > 0) throw unavailableLocalKey();
+    if (remote.length > 0) return failAfterPolicyRestore(unavailableLocalKey());
     await removePrivateFile(stagingFile);
   }
-  if (remote.length > 0) throw unavailableLocalKey();
+  if (remote.length > 0) return failAfterPolicyRestore(unavailableLocalKey());
   if (local.status === 'empty') await removePrivateFile(input.credentialFile);
 
-  await reconcileKeyCreationPolicies(input, false, runner, sleep, onProgress);
-  await preparePrivateLocalDirectory(path.dirname(input.credentialFile));
-  const result = await run(
-    input.cwd,
-    [
-      'iam',
-      'service-accounts',
-      'keys',
-      'create',
-      stagingFile,
-      `--iam-account=${input.serviceAccountEmail}`,
-      '--key-file-type=json',
-      `--project=${input.projectId}`,
-      `--account=${input.account}`,
-      '--quiet',
-    ],
-    runner,
-  );
-  if (result.exitCode !== 0) {
-    const failed = await inspectCredentialArtifact(input, stagingFile);
-    if (failed.status === 'empty') await removePrivateFile(stagingFile);
-    throw commandFailure('Google Cloud could not create the Chat credential key.');
+  try {
+    await reconcileKeyCreationPolicies(input, false, runner, sleep, onProgress);
+    await preparePrivateLocalDirectory(path.dirname(input.credentialFile));
+    const result = await run(
+      input.cwd,
+      [
+        'iam',
+        'service-accounts',
+        'keys',
+        'create',
+        stagingFile,
+        `--iam-account=${input.serviceAccountEmail}`,
+        '--key-file-type=json',
+        `--project=${input.projectId}`,
+        `--account=${input.account}`,
+        '--quiet',
+      ],
+      runner,
+    );
+    if (result.exitCode !== 0) {
+      const failed = await inspectCredentialArtifact(input, stagingFile);
+      if (failed.status === 'empty') await removePrivateFile(stagingFile);
+      throw commandFailure('Google Cloud could not create the Chat credential key.');
+    }
+    await chmod(stagingFile, 0o600);
+    const created = await inspectCredentialArtifact(input, stagingFile);
+    if (created.status !== 'valid') {
+      if (created.status === 'empty') await removePrivateFile(stagingFile);
+      if (created.status === 'invalid') throw created.error;
+      throw commandFailure('Google Cloud did not write the Chat credential key.');
+    }
+    if (!(await credentialKeyVisible(input, created.credential.privateKeyId, runner, sleep, onProgress))) {
+      throw new GwsEaError('gcp_key_drift', 'The new Chat credential key was not visible in Google Cloud');
+    }
+    await writePrivateTextFile(input.credentialFile, created.contents);
+  } finally {
+    await reconcileKeyCreationPolicies(input, true, runner, sleep, onProgress);
   }
-  await chmod(stagingFile, 0o600);
-  const created = await inspectCredentialArtifact(input, stagingFile);
-  if (created.status !== 'valid') {
-    if (created.status === 'empty') await removePrivateFile(stagingFile);
-    if (created.status === 'invalid') throw created.error;
-    throw commandFailure('Google Cloud did not write the Chat credential key.');
-  }
-  if (!(await credentialKeyVisible(input, created.credential.privateKeyId, runner, sleep, onProgress))) {
-    throw new GwsEaError('gcp_key_drift', 'The new Chat credential key was not visible in Google Cloud');
-  }
-  await writePrivateTextFile(input.credentialFile, created.contents);
-  await reconcileKeyCreationPolicies(input, true, runner, sleep, onProgress);
   await removePrivateFile(stagingFile);
 }
 
@@ -815,7 +897,11 @@ async function inspectGcpProject(
   assertOwnedServiceAccount(input, account);
   const local = await credentialFromFile(input);
   if (!local) return false;
-  return (await listUserManagedKeys(input, runner)).includes(local.privateKeyId);
+  if (!(await listUserManagedKeys(input, runner)).includes(local.privateKeyId)) return false;
+  for (const constraint of SERVICE_ACCOUNT_KEY_POLICIES) {
+    if (!(await keyCreationPolicyEnforced(input, constraint, runner))) return false;
+  }
+  return true;
 }
 
 export async function probeGcpProjectForCreate(

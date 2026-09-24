@@ -147,8 +147,8 @@ async function expectManagedCatchAll(
   ) {
     throw new GwsEaError('endpoint_redirect', 'Managed Cloudflare catch-all must not redirect');
   }
-  if (response.status !== 404) {
-    throw new GwsEaError('managed_catch_all_mismatch', 'Managed Cloudflare catch-all must return 404');
+  if (response.status !== 404 || response.headers.has('x-nanoclaw-webhook-id')) {
+    throw new GwsEaError('managed_catch_all_mismatch', 'Managed Cloudflare catch-all must return its own 404');
   }
 }
 
