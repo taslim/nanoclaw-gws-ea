@@ -29,7 +29,7 @@ import {
   ONECLI_GATEWAY_VERSION,
   ONECLI_SDK_VERSION,
 } from './onecli-compose.js';
-import type { OnecliCompatibilityReceipt } from './onecli.js';
+import type { ObservedOnecliRuntime, OnecliCompatibilityReceipt } from './onecli.js';
 import { holdLoopbackPorts } from './ports.js';
 import { createInstanceRuntimeConfig, persistInstanceRuntime } from './service.js';
 import type { CloudflareApi } from './cloudflare-api.js';
@@ -509,6 +509,13 @@ function probeIdentityDependencies(
 ): MainIdentityDependencies {
   return {
     runNcl: async (_runtime, args) => {
+      if (args[0] === 'status') {
+        return {
+          project_root: context.input.runtime.checkout_realpath,
+          webhook: { port: context.input.runtime.allocated_ports.nanoclaw_webhook, paths: ['/webhook/gchat'] },
+          channels: [{ instance: 'gchat', type: 'gchat', connected: true }],
+        };
+      }
       if (args[0] === 'gws-ea-profile' && args[1] === 'get') {
         return {
           assistant_display_name: context.input.identity.assistantDisplayName,
@@ -774,6 +781,38 @@ describe('production provision phase composition', () => {
     expect(reconcileOnecliRuntime).not.toHaveBeenCalled();
   });
 
+  it('reattaches an owned OneCLI runtime after interruption before its API keys were persisted', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation(paths));
+    const receipt = Object.freeze({}) as OnecliCompatibilityReceipt;
+    const observed = { containers: [], networks: [], volumes: [] } as ObservedOnecliRuntime;
+    const portFailure = new GwsEaError('port_claim_lost', 'The owned OneCLI runtime already holds its ports');
+    const holdReservedLoopbackPorts = vi.fn(async (): Promise<never> => {
+      throw portFailure;
+    });
+    const inspectOnecliRuntime = vi.fn(async () => observed);
+    const validateObservedOnecliRuntime = vi.fn(() => undefined);
+    const reconcileOnecliRuntime = vi.fn(async () => receipt);
+    const persistOnecliApiKeyFiles = vi.fn(async () => undefined);
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const context = productionContext(operation, reserved);
+      const phase = createProductionProvisionRegistry(context, {
+        holdReservedLoopbackPorts,
+        inspectOnecliRuntime,
+        validateObservedOnecliRuntime,
+        reconcileOnecliRuntime,
+        persistOnecliApiKeyFiles,
+      }).start_onecli;
+
+      await expect(phase.apply(context)).resolves.toEqual({ status: 'completed' });
+      expect(inspectOnecliRuntime).toHaveBeenCalledWith(context.input.onecli);
+      expect(validateObservedOnecliRuntime).toHaveBeenCalledWith(context.input.onecli, observed);
+      expect(reconcileOnecliRuntime).toHaveBeenCalledWith(context.input.onecli, undefined);
+      expect(persistOnecliApiKeyFiles).toHaveBeenCalledOnce();
+    });
+  });
+
   it('collects a missing credential only after the isolated OneCLI runtime is ready', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
@@ -851,23 +890,21 @@ describe('production provision phase composition', () => {
     expect(importProviderCredential).not.toHaveBeenCalled();
   });
 
-  it('reconciles managed ingress, starts the shared connector, and waits for the applied configuration', async () => {
+  it('reconciles managed ingress and waits for the exact public callback without connection metadata', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, managedReservation(paths));
     const connectorToken = 'connector-token-canary';
     const accountToken = 'account-token-canary';
     const order: string[] = [];
     let connectorReady = false;
-    let connectionReads = 0;
+    let publicProbeReads = 0;
     const api = {
       getTunnelToken: vi.fn(async () => {
         order.push('connector-token');
         return connectorToken;
       }),
       listTunnelConnections: vi.fn(async () => {
-        connectionReads += 1;
-        order.push(`connections:${connectionReads}`);
-        return connectionReads === 1 ? [] : [{ id: 'connection-1', configVersion: 7 }];
+        throw new Error('Provisioning must not depend on optional connection metadata');
       }),
     } as unknown as CloudflareApi;
     const observedConnector = Object.freeze({}) as ObservedCloudflareConnector;
@@ -912,10 +949,14 @@ describe('production provision phase composition', () => {
           expect(connectorReady).toBe(true);
           expect(endpointUrl).toBe('https://assistant.example.com/webhook/gchat');
           expect(localEndpointUrl).toBe('http://127.0.0.1:3101/webhook/gchat');
-          order.push('public-probe');
+          publicProbeReads += 1;
+          order.push(`public-probe:${publicProbeReads}`);
+          if (publicProbeReads === 1) {
+            throw new GwsEaError('endpoint_unreachable', 'Cloudflare route is still propagating');
+          }
           return { endpointUrl, listenerId: '22222222-2222-4222-8222-222222222222' };
         }),
-        managedConnectionDelay: vi.fn(async () => undefined),
+        managedTransportDelay: vi.fn(async () => undefined),
       };
       const phase = createProductionProvisionRegistry(context, dependencies).establish_transport;
 
@@ -930,10 +971,11 @@ describe('production provision phase composition', () => {
       'ingress',
       'connector-token',
       'connector',
-      'connections:1',
-      'connections:2',
-      'public-probe',
+      'public-probe:1',
+      'public-probe:2',
+      'public-probe:3',
     ]);
+    expect(api.listTunnelConnections).not.toHaveBeenCalled();
   });
 
   it('resumes a healthy managed transport without requesting Cloudflare account authority', async () => {
@@ -1058,7 +1100,6 @@ describe('production provision phase composition', () => {
     const requested: string[] = [];
     const api = {
       getTunnelToken: vi.fn(async () => 'connector-token'),
-      listTunnelConnections: vi.fn(async () => [{ id: 'connection-1', configVersion: 4 }]),
     } as unknown as CloudflareApi;
     const observedConnector = Object.freeze({}) as ObservedCloudflareConnector;
 
@@ -1093,7 +1134,7 @@ describe('production provision phase composition', () => {
         validateObservedCloudflareConnector: vi.fn(),
         reconcileCloudflareConnector: vi.fn(async () => observedConnector),
         verifyManagedRoute,
-        managedConnectionDelay: vi.fn(async () => undefined),
+        managedTransportDelay: vi.fn(async () => undefined),
       }).establish_transport;
 
       await expect(phase.probe(context)).resolves.toEqual({ status: 'absent' });
@@ -1217,6 +1258,144 @@ describe('production provision phase composition', () => {
     });
 
     expect(startRuntime).not.toHaveBeenCalled();
+  });
+
+  it('continues main identity setup when the exact NanoClaw host already owns its webhook port', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation(paths));
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const base = productionContext(operation, reserved);
+      const runNcl = vi.fn(async () => ({
+        pid: 1234,
+        project_root: reserved.checkout_realpath,
+        webhook: { id: 'gchat', port: reserved.allocated_ports.nanoclaw_webhook, paths: ['/webhook/gchat'] },
+        channels: [{ instance: 'gchat', type: 'gchat', connected: true }],
+      }));
+      const context: ProductionProvisionContext = {
+        ...base,
+        state: { providerSecretId: 'secret-provider' },
+        input: { ...base.input, identityDependencies: { runNcl } },
+      };
+      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), { recursive: true, mode: 0o700 });
+      await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
+      const holdReservedLoopbackPorts = vi.fn(async (): Promise<never> => {
+        throw new Error('The owned host already holds the webhook port');
+      });
+      const reconcileInstanceRuntime = vi.fn(async (): Promise<never> => {
+        throw new Error('An already-running host must not be restarted');
+      });
+      const reconcileMainIdentity = vi.fn(async () => ({ agentGroupId: 'ag-main', onecliAgentId: 'onecli-main' }));
+      const phase = createProductionProvisionRegistry(context, {
+        holdReservedLoopbackPorts,
+        reconcileInstanceRuntime,
+        reconcileMainIdentity,
+      }).start_nanoclaw;
+
+      await expect(phase.apply(context)).resolves.toEqual({ status: 'completed' });
+      expect(runNcl).toHaveBeenCalledWith(context.input.runtime, ['status']);
+      expect(holdReservedLoopbackPorts).not.toHaveBeenCalled();
+      expect(reconcileInstanceRuntime).not.toHaveBeenCalled();
+      expect(reconcileMainIdentity).toHaveBeenCalledOnce();
+      expect(context.state.mainAgentGroupId).toBe('ag-main');
+    });
+  });
+
+  it('waits for an owned NanoClaw host to become ready after its webhook port is claimed', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation(paths));
+    let statusCalls = 0;
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const base = productionContext(operation, reserved);
+      const context: ProductionProvisionContext = {
+        ...base,
+        state: { providerSecretId: 'secret-provider' },
+        input: {
+          ...base.input,
+          identityDependencies: {
+            runNcl: async () => {
+              statusCalls++;
+              if (statusCalls < 3) throw new GwsEaError('command_failed', 'Host still starting');
+              return {
+                project_root: reserved.checkout_realpath,
+                webhook: { port: reserved.allocated_ports.nanoclaw_webhook, paths: ['/webhook/gchat'] },
+                channels: [{ instance: 'gchat', type: 'gchat', connected: true }],
+              };
+            },
+          },
+        },
+      };
+      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), { recursive: true, mode: 0o700 });
+      await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
+      const holdReservedLoopbackPorts = vi.fn(async (): Promise<never> => {
+        throw new GwsEaError('port_claim_lost', 'Owned host has the webhook port');
+      });
+      const reconcileInstanceRuntime = vi.fn();
+      const reconcileMainIdentity = vi.fn(async () => ({ agentGroupId: 'ag-main', onecliAgentId: 'onecli-main' }));
+      const nanoclawStartupDelay = vi.fn(async () => undefined);
+      const phase = createProductionProvisionRegistry(context, {
+        holdReservedLoopbackPorts,
+        reconcileInstanceRuntime,
+        reconcileMainIdentity,
+        nanoclawStartupDelay,
+      }).start_nanoclaw;
+
+      await expect(phase.apply(context)).resolves.toEqual({ status: 'completed' });
+      expect(statusCalls).toBeGreaterThanOrEqual(3);
+      expect(nanoclawStartupDelay).toHaveBeenCalled();
+      expect(reconcileInstanceRuntime).not.toHaveBeenCalled();
+      expect(reconcileMainIdentity).toHaveBeenCalledOnce();
+    });
+  });
+
+  it('restarts a stopped host for a completed phase without restamping its matching main identity', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation(paths));
+    let hostStarted = false;
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const base = productionContext(operation, reserved);
+      const identityState: ProbeIdentityState = {
+        agents: [{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'all' }],
+        onecliCalls: [],
+        providerSecretIds: [],
+      };
+      const identityDependencies = probeIdentityDependencies(base, identityState);
+      const context: ProductionProvisionContext = {
+        ...base,
+        input: {
+          ...base.input,
+          identityDependencies: {
+            ...identityDependencies,
+            runNcl: async (runtime, args) => {
+              if (args[0] === 'status' && !hostStarted) {
+                throw new GwsEaError('command_failed', 'Host is stopped');
+              }
+              return identityDependencies.runNcl!(runtime, args);
+            },
+          },
+        },
+      };
+      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), { recursive: true, mode: 0o700 });
+      await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
+      const reconcileInstanceRuntime = vi.fn(async () => {
+        hostStarted = true;
+        return {} as Awaited<ReturnType<ProductionProvisionDependencies['reconcileInstanceRuntime']>>;
+      });
+      const reconcileMainIdentity = vi.fn();
+      const phase = createProductionProvisionRegistry(context, {
+        holdReservedLoopbackPorts: async () => ({ release: async () => undefined }),
+        reconcileInstanceRuntime,
+        reconcileMainIdentity,
+      }).start_nanoclaw;
+      if (!phase.reconcileCompletedPostcondition) throw new Error('Missing completed-phase reconciliation');
+
+      await phase.reconcileCompletedPostcondition(context);
+      expect(reconcileInstanceRuntime).toHaveBeenCalledOnce();
+      expect(reconcileMainIdentity).not.toHaveBeenCalled();
+      expect(context.state.mainAgentGroupId).toBe('ag-main');
+    });
   });
 
   it('composes provisioning phases in order, pauses for the principal, and resumes without duplicate effects', async () => {
@@ -1388,7 +1567,25 @@ describe('production provision phase composition', () => {
       const initial = productionContext(operation, reserved);
       const bootstrapManifestFile = paths.bootstrapFile(reserved.instance_id);
       await writeFile(bootstrapManifestFile, '{}', { mode: 0o600 });
-      context = { ...initial, input: { ...initial.input, bootstrapManifestFile } };
+      context = {
+        ...initial,
+        input: {
+          ...initial.input,
+          bootstrapManifestFile,
+          identityDependencies: {
+            runNcl: async (_runtime, args) => {
+              if (args[0] === 'status' && effects.includes('reconcileInstanceRuntime')) {
+                return {
+                  project_root: reserved.checkout_realpath,
+                  webhook: { port: reserved.allocated_ports.nanoclaw_webhook, paths: ['/webhook/gchat'] },
+                  channels: [{ instance: 'gchat', type: 'gchat', connected: true }],
+                };
+              }
+              throw new GwsEaError('command_failed', 'NanoClaw has not started');
+            },
+          },
+        },
+      };
       await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), { recursive: true, mode: 0o700 });
       await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
       return reconcileProvisioning(operation, context, createProductionProvisionRegistry(context, overrides));

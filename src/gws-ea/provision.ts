@@ -31,6 +31,7 @@ import {
   onecliSecretMatchesCredentialMetadata,
   type OnecliCompatibilityReceipt,
   type OnecliRuntimeDependencies,
+  type ObservedOnecliRuntime,
 } from './onecli.js';
 import type { OnecliRuntimeLayout } from './onecli-compose.js';
 import {
@@ -197,6 +198,8 @@ export interface ProductionProvisionDependencies {
   readonly reconcileGcpProject: typeof reconcileGcpProject;
   readonly probeOnecli: (context: ProductionProvisionContext) => Promise<PhaseProbeResult>;
   readonly reconcileOnecliRuntime: typeof reconcileOnecliRuntime;
+  readonly inspectOnecliRuntime: (layout: OnecliRuntimeLayout) => Promise<ObservedOnecliRuntime>;
+  readonly validateObservedOnecliRuntime: typeof validateObservedOnecliRuntime;
   readonly persistOnecliApiKeyFiles: typeof persistOnecliApiKeyFiles;
   readonly probeProvider: (context: ProductionProvisionContext) => Promise<PhaseProbeResult>;
   readonly importProviderCredential: typeof importProviderCredential;
@@ -218,7 +221,8 @@ export interface ProductionProvisionDependencies {
   readonly validateCloudflareConnectorState: typeof validateCloudflareConnectorState;
   readonly validateObservedCloudflareConnector: typeof validateObservedCloudflareConnector;
   readonly reconcileCloudflareConnector: typeof reconcileCloudflareConnector;
-  readonly managedConnectionDelay: (milliseconds: number) => Promise<void>;
+  readonly managedTransportDelay: (milliseconds: number) => Promise<void>;
+  readonly nanoclawStartupDelay: (milliseconds: number) => Promise<void>;
 }
 
 function unwrapData(value: unknown): unknown {
@@ -460,6 +464,50 @@ async function runNanoclawProbeNcl(context: ProductionProvisionContext, args: re
   return run(context.input.runtime, args);
 }
 
+async function observeInstanceHost(context: ProductionProvisionContext): Promise<boolean> {
+  let status: unknown;
+  try {
+    status = unwrapData(await runNanoclawProbeNcl(context, ['status']));
+  } catch (error) {
+    if (error instanceof GwsEaError && ['command_failed', 'command_timeout', 'ncl_failed'].includes(error.code)) {
+      return false;
+    }
+    throw error;
+  }
+  if (!isRecord(status) || typeof status.project_root !== 'string') {
+    throw new GwsEaError('invalid_child_output', 'NanoClaw returned invalid host status');
+  }
+  if (status.project_root !== context.input.runtime.checkout_realpath) {
+    throw new GwsEaError('unsafe_runtime', 'NanoClaw status belongs to a different checkout');
+  }
+  if (status.webhook === null) return false;
+  if (!isRecord(status.webhook) || !Array.isArray(status.webhook.paths) || !Array.isArray(status.channels)) {
+    throw new GwsEaError('invalid_child_output', 'NanoClaw returned invalid webhook status');
+  }
+  if (status.webhook.port !== context.input.runtime.allocated_ports.nanoclaw_webhook) {
+    throw new GwsEaError('unsafe_runtime', 'NanoClaw is listening on an unexpected webhook port');
+  }
+  return (
+    status.webhook.paths.includes('/webhook/gchat') &&
+    status.channels.some(
+      (channel) =>
+        isRecord(channel) && channel.instance === 'gchat' && channel.type === 'gchat' && channel.connected === true,
+    )
+  );
+}
+
+async function waitForInstanceHost(
+  context: ProductionProvisionContext,
+  sleep: (milliseconds: number) => Promise<void>,
+  attempts: number,
+): Promise<boolean> {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (await observeInstanceHost(context)) return true;
+    if (attempt + 1 < attempts) await sleep(1_000);
+  }
+  return false;
+}
+
 async function runNanoclawProbeOnecli(context: ProductionProvisionContext, args: readonly string[]): Promise<unknown> {
   const run = context.input.identityDependencies?.runOnecliAdmin;
   if (run) return run(context.input.runtime, args);
@@ -557,6 +605,8 @@ const defaultProductionDependencies: ProductionProvisionDependencies = {
   reconcileGcpProject,
   probeOnecli: defaultProbeOnecli,
   reconcileOnecliRuntime,
+  inspectOnecliRuntime,
+  validateObservedOnecliRuntime,
   persistOnecliApiKeyFiles,
   probeProvider: defaultProbeProvider,
   importProviderCredential,
@@ -578,7 +628,8 @@ const defaultProductionDependencies: ProductionProvisionDependencies = {
   validateCloudflareConnectorState,
   validateObservedCloudflareConnector,
   reconcileCloudflareConnector,
-  managedConnectionDelay: delay,
+  managedTransportDelay: delay,
+  nanoclawStartupDelay: delay,
 };
 
 async function withRuntimePortLease<T>(
@@ -628,12 +679,38 @@ function beforeNanoclawBind(
   };
 }
 
+async function ensureInstanceHostStarted(
+  context: ProductionProvisionContext,
+  dependencies: ProductionProvisionDependencies,
+): Promise<void> {
+  if (await observeInstanceHost(context)) return;
+  try {
+    await withRuntimePortLease(context, ['nanoclaw_webhook'], dependencies.holdReservedLoopbackPorts, (releaseLease) =>
+      dependencies.reconcileInstanceRuntime(
+        context.input.runtime,
+        beforeNanoclawBind(context.input.serviceDependencies, releaseLease),
+      ),
+    );
+  } catch (error) {
+    if (
+      !(error instanceof GwsEaError) ||
+      !['port_claim_lost', 'command_failed', 'command_timeout'].includes(error.code) ||
+      !(await waitForInstanceHost(context, dependencies.nanoclawStartupDelay, 5))
+    ) {
+      throw error;
+    }
+  }
+  if (!(await waitForInstanceHost(context, dependencies.nanoclawStartupDelay, 20))) {
+    throw new GwsEaError('nanoclaw_not_ready', 'NanoClaw did not become ready; resume after checking its service log');
+  }
+}
+
 function humanPause(phase: ProvisionPhase, code: string, message: string): PhaseEffectResult {
   return { status: 'paused', pause: { kind: 'human-action', phase, code, message } };
 }
 
-const MANAGED_CONNECTION_ATTEMPTS = 30;
-const MANAGED_CONNECTION_DELAY_MS = 1_000;
+const MANAGED_TRANSPORT_ATTEMPTS = 30;
+const MANAGED_TRANSPORT_DELAY_MS = 1_000;
 
 function managedLocalEndpoint(context: ProductionProvisionContext): string {
   return `http://127.0.0.1:${context.input.runtime.allocated_ports.nanoclaw_webhook}/webhook/gchat`;
@@ -703,21 +780,19 @@ async function requireManagedAccountToken(context: ProductionProvisionContext, a
   return context.input.requestCloudflareAccountToken(accountId, observation);
 }
 
-async function waitForManagedConfiguration(
-  api: ReturnType<typeof createCloudflareApi>,
-  accountId: string,
-  tunnelId: string,
-  configurationVersion: number,
-  sleep: (milliseconds: number) => Promise<void>,
+async function waitForManagedTransport(
+  context: ProductionProvisionContext,
+  dependencies: ProductionProvisionDependencies,
 ): Promise<void> {
-  for (let attempt = 0; attempt < MANAGED_CONNECTION_ATTEMPTS; attempt += 1) {
-    const connections = await api.listTunnelConnections(accountId, tunnelId);
-    if (connections.some((connection) => connection.configVersion === configurationVersion)) return;
-    if (attempt + 1 < MANAGED_CONNECTION_ATTEMPTS) await sleep(MANAGED_CONNECTION_DELAY_MS);
+  for (let attempt = 0; attempt < MANAGED_TRANSPORT_ATTEMPTS; attempt += 1) {
+    if ((await probeManagedTransport(context, dependencies)).status === 'matched') return;
+    if (attempt + 1 < MANAGED_TRANSPORT_ATTEMPTS) {
+      await dependencies.managedTransportDelay(MANAGED_TRANSPORT_DELAY_MS);
+    }
   }
   throw new GwsEaError(
-    'cloudflare_configuration_not_active',
-    `Cloudflare connector did not activate tunnel configuration version ${configurationVersion}`,
+    'managed_transport_not_ready',
+    context.state.managedTransportObservation ?? 'Managed Cloudflare transport did not become ready',
   );
 }
 
@@ -741,13 +816,7 @@ async function reconcileManagedTransport(
     platform,
   });
   await dependencies.reconcileCloudflareConnector(layout, connectorToken);
-  await waitForManagedConfiguration(
-    api,
-    claim.account_id,
-    reconciled.tunnelId,
-    reconciled.configurationVersion,
-    dependencies.managedConnectionDelay,
-  );
+  await waitForManagedTransport(context, dependencies);
 }
 
 function principalResult(
@@ -919,16 +988,29 @@ export function createProductionProvisionRegistry(
         key('onecli', JSON.stringify([input.onecli.project, input.onecli.appPort, input.onecli.gatewayPort])),
       probe: dependencies.probeOnecli,
       apply: async (value) => {
-        const receipt = await withRuntimePortLease(
-          value,
-          ['onecli_app', 'onecli_gateway'],
-          dependencies.holdReservedLoopbackPorts,
-          (releaseLease) =>
-            dependencies.reconcileOnecliRuntime(
-              value.input.onecli,
-              beforeOnecliBind(value.input.onecliDependencies, releaseLease),
-            ),
-        );
+        let receipt: OnecliCompatibilityReceipt;
+        try {
+          receipt = await withRuntimePortLease(
+            value,
+            ['onecli_app', 'onecli_gateway'],
+            dependencies.holdReservedLoopbackPorts,
+            (releaseLease) =>
+              dependencies.reconcileOnecliRuntime(
+                value.input.onecli,
+                beforeOnecliBind(value.input.onecliDependencies, releaseLease),
+              ),
+          );
+        } catch (error) {
+          if (!(error instanceof GwsEaError) || error.code !== 'port_claim_lost') throw error;
+          let observed: ObservedOnecliRuntime;
+          try {
+            observed = await dependencies.inspectOnecliRuntime(value.input.onecli);
+          } catch {
+            throw error;
+          }
+          dependencies.validateObservedOnecliRuntime(value.input.onecli, observed);
+          receipt = await dependencies.reconcileOnecliRuntime(value.input.onecli, value.input.onecliDependencies);
+        }
         await retainOnecliReceipt(value, receipt);
         return { status: 'completed' };
       },
@@ -994,16 +1076,7 @@ export function createProductionProvisionRegistry(
           throw new GwsEaError('provider_not_ready', 'Provider credential must be reconciled before NanoClaw');
         }
         await ensureGchatCredential(value);
-        await withRuntimePortLease(
-          value,
-          ['nanoclaw_webhook'],
-          dependencies.holdReservedLoopbackPorts,
-          (releaseLease) =>
-            dependencies.reconcileInstanceRuntime(
-              value.input.runtime,
-              beforeNanoclawBind(value.input.serviceDependencies, releaseLease),
-            ),
-        );
+        await ensureInstanceHostStarted(value, dependencies);
         const main = await dependencies.reconcileMainIdentity(
           value.input.runtime,
           value.input.identity,
@@ -1016,6 +1089,16 @@ export function createProductionProvisionRegistry(
         return { status: 'completed' };
       },
       reconcileCompletedPostcondition: async (value) => {
+        if (!(await observeInstanceHost(value))) {
+          await ensureGchatCredential(value);
+          await ensureInstanceHostStarted(value, dependencies);
+        }
+        if (
+          (await probeNanoclawAccess(value, { mode: 'all' })).status === 'matched' &&
+          (await bootstrapManifestRemoved(value.input.bootstrapManifestFile))
+        ) {
+          return;
+        }
         const providerSecretId = value.state.providerSecretId;
         const legacyState = providerSecretId
           ? await probeNanoclawAccess(value, { mode: 'legacy-selective', providerSecretId })

@@ -109,6 +109,22 @@ describe('Cloudflare REST boundary', () => {
     ).not.toContain(TOKEN);
   });
 
+  it('accepts connections when Cloudflare omits optional connection metadata', async () => {
+    const api = createCloudflareApi({
+      accountToken: TOKEN,
+      baseUrl: 'https://api.test/client/v4',
+      fetch: vi.fn<typeof globalThis.fetch>(async () =>
+        envelope([{ id: 'connection-id' }, { config_version: 0 }, { id: null, config_version: null }]),
+      ),
+    });
+
+    await expect(api.listTunnelConnections(ACCOUNT_ID, TUNNEL_ID)).resolves.toEqual([
+      { id: 'connection-id' },
+      { configVersion: 0 },
+      {},
+    ]);
+  });
+
   it('paginates active zones and validates token state through the setup session without retaining rejected tokens', async () => {
     const pages: number[] = [];
     const fetch = vi.fn<typeof globalThis.fetch>(async (input) => {

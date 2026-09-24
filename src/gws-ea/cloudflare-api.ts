@@ -50,8 +50,8 @@ export interface CloudflareTunnelConfiguration {
 }
 
 export interface CloudflareTunnelConnection {
-  readonly id: string;
-  readonly configVersion: number;
+  readonly id?: string;
+  readonly configVersion?: number;
 }
 
 export interface CloudflareDnsRecord {
@@ -536,10 +536,23 @@ class CloudflareApiClient implements CloudflareApi {
       throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare returned invalid tunnel connections');
     }
     return result.map((value) => {
-      if (!isRecord(value) || typeof value.config_version !== 'number' || !Number.isInteger(value.config_version)) {
+      if (!isRecord(value)) {
         throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare returned an invalid tunnel connection');
       }
-      return { id: requireString(value.id, 'connection ID', 128), configVersion: value.config_version };
+      const id = value.id;
+      const configVersion = value.config_version;
+      if (
+        (configVersion !== undefined &&
+          configVersion !== null &&
+          (typeof configVersion !== 'number' || !Number.isInteger(configVersion))) ||
+        (id !== undefined && id !== null && typeof id !== 'string')
+      ) {
+        throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare returned an invalid tunnel connection');
+      }
+      return {
+        ...(id === undefined || id === null ? {} : { id: requireString(id, 'connection ID', 128) }),
+        ...(configVersion === undefined || configVersion === null ? {} : { configVersion }),
+      };
     });
   }
 
