@@ -287,7 +287,11 @@ describe('OneCLI runtime verification', () => {
       throw new Error(`unexpected command: ${command.args.join(' ')}`);
     };
 
-    await cleanupOnecliDockerOrphans(layout, runner, buildComposeEnvironment(layout, { PATH: '/safe/bin' }));
+    await cleanupOnecliDockerOrphans({
+      layout,
+      runner,
+      environment: buildComposeEnvironment(layout, { PATH: '/safe/bin' }),
+    });
     expect(calls).toContainEqual(['container', 'rm', '--force', 'orphan-id']);
   });
 

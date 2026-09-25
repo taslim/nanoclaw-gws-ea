@@ -1,5 +1,5 @@
 /**
- * Prerequisites (R6): what create and resume need from this machine and the
+ * Prerequisites: what create and resume need from this machine and the
  * operator's Google sign-in, checked before anything is reserved and again on
  * every resume. Local checks run first, so a stopped Docker is named before
  * anyone is asked to sign in.
@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { errorCode } from '../community-portal/errors.js';
-import { SignInRequired, type Interaction } from './events.js';
+import { SignInRequired, withGoogleSignIn, type Interaction } from './events.js';
 import {
   activeGcloudAccount,
   assertGcloudInstalled,
@@ -30,6 +30,7 @@ import {
   type SanitizedCommandOutcomeRunner,
 } from './process.js';
 import { assertInstalledOnecliCli } from './release-preflight.js';
+import { instanceServicePlatform } from './service-coordinates.js';
 import { GwsEaError, type GwsEaErrorDetails } from './types.js';
 import { isRecord, parseJson, unixSocketPath } from './validation.js';
 
@@ -90,9 +91,10 @@ function toolCommand(command: string, args: readonly string[]): SanitizedCommand
 }
 
 function supportedPlatform(platform: NodeJS.Platform): Prerequisites['platform'] {
-  if (platform === 'darwin') return 'macos';
-  if (platform === 'linux') return 'linux';
-  throw new GwsEaError('unsupported_platform', 'GWS-EA supports macOS and Linux hosts');
+  if (platform !== 'darwin' && platform !== 'linux') {
+    throw new GwsEaError('unsupported_platform', 'GWS-EA supports macOS and Linux hosts');
+  }
+  return instanceServicePlatform(platform);
 }
 
 /** The instance service replaces its launcher with the host process, which needs `process.execve`. */
@@ -176,7 +178,7 @@ function parseDockerContext(stdout: string): { readonly name: string; readonly e
 
 /**
  * Resolve the active Docker context, under the same environment every tool
- * gets, to its endpoint (KTD3). Only a local `unix://` socket answered by a
+ * gets, to its endpoint. Only a local `unix://` socket answered by a
  * running daemon is accepted.
  */
 export async function resolveDockerEndpoint(
@@ -286,13 +288,10 @@ async function googleAccount(
   }
   await assertGcloudInstalled(runner);
   const account = request.account ?? (await confirmedAccount(interaction, runner));
-  try {
-    await assertGcloudSignedIn(account, runner);
-  } catch (error) {
-    if (!(error instanceof SignInRequired)) throw error;
-    await interaction.signInToGoogleCloud(account);
-    await assertGcloudSignedIn(account, runner);
-  }
+  await withGoogleSignIn(
+    () => assertGcloudSignedIn(account, runner),
+    () => interaction.signInToGoogleCloud(account),
+  );
   return account;
 }
 

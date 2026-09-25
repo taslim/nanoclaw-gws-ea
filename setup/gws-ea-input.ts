@@ -12,6 +12,7 @@ import { validateExistingGchatEndpoint } from '../src/gws-ea/endpoint.js';
 import { isConsumerGoogleAccount } from '../src/gws-ea/gcloud.js';
 import { registerSecret } from '../src/gws-ea/redact.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
+import { EMAIL_PATTERN } from '../src/gws-ea/validation.js';
 import type { ProviderCredential } from '../src/provider-credential.js';
 import { providerProvisioningCapabilityDigest } from '../src/provider-provisioning-capability.js';
 import { isValidTimezone, resolveTimezone } from '../src/timezone.js';
@@ -165,7 +166,7 @@ async function askPassword(prompts: PromptAdapter, message: string): Promise<str
 }
 
 function workspaceEmailProblem(value: string): string | undefined {
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(value)) return 'Enter a valid email address';
+  if (!EMAIL_PATTERN.test(value)) return 'Enter a valid email address';
   if (isConsumerGoogleAccount(value)) return 'Enter a Google Workspace address, not a personal Google account';
   return undefined;
 }

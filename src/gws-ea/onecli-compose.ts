@@ -72,7 +72,7 @@ export interface OnecliRuntimeLayout {
   readonly appUrl: string;
   readonly gatewayUrl: string;
   readonly cliExecutable: string;
-  /** The local Docker endpoint recorded for this instance (KTD3), given to every Docker command. */
+  /** The local Docker endpoint recorded for this instance, given to every Docker command. */
   readonly dockerEndpoint: string;
 }
 

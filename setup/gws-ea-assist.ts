@@ -1,5 +1,5 @@
 /**
- * Claude-assisted diagnosis after an interactive gws-ea failure (KTD10).
+ * Claude-assisted diagnosis after an interactive gws-ea failure.
  *
  * The CLI calls this only after the failed attempt released its instance
  * lock. The bundle is staged, redacted, in a 0700 directory beside the run's
@@ -11,7 +11,7 @@
  * Upstream setup/lib/claude-assist.ts runs Claude with bypassed permissions in
  * the project root, so it is deliberately not reused here.
  */
-import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -19,7 +19,7 @@ import * as p from '@clack/prompts';
 
 import { isErrno } from '../src/community-portal/errors.js';
 import type { FailureReport } from '../src/gws-ea/cli.js';
-import { CONTROL_PLANE_ROOT } from '../src/gws-ea/paths.js';
+import { CONTROL_PLANE_ROOT, preparePrivateDirectory } from '../src/gws-ea/paths.js';
 import {
   buildToolEnvironment,
   isSecretEnvironmentKey,
@@ -28,6 +28,7 @@ import {
   type SanitizedCommandOutcomeRunner,
 } from '../src/gws-ea/process.js';
 import { redact } from '../src/gws-ea/redact.js';
+import { writePrivateTextFile } from '../src/gws-ea/secrets.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
 import { note } from './lib/theme.js';
 
@@ -129,10 +130,10 @@ async function readIfPresent(file: string): Promise<string | undefined> {
   }
 }
 
-async function writePrivate(directory: string, name: string, contents: string): Promise<void> {
+async function writeBundleFile(directory: string, name: string, contents: string): Promise<void> {
   const file = path.join(directory, name);
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-  await writeFile(file, contents, { mode: 0o600 });
+  await writePrivateTextFile(file, contents);
 }
 
 /** Stage the redacted bundle in a private directory beside the run's logs. */
@@ -141,8 +142,7 @@ async function stageBundle(
   sourceRoot: string,
 ): Promise<{ readonly directory: string; readonly files: readonly BundleFile[] }> {
   const directory = path.join(report.runDirectory, 'diagnosis');
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  await chmod(directory, 0o700);
+  await preparePrivateDirectory(directory);
   const files: BundleFile[] = [];
   const logs: Array<readonly [string, string | undefined]> = [
     ['progress.log', report.progressLog],
@@ -156,7 +156,7 @@ async function stageBundle(
     const contents = await readIfPresent(path.join(sourceRoot, source));
     if (contents !== undefined) files.push({ name: path.join('sources', source), contents: redact(contents) });
   }
-  await Promise.all(files.map((file) => writePrivate(directory, file.name, file.contents)));
+  await Promise.all(files.map((file) => writeBundleFile(directory, file.name, file.contents)));
   return { directory, files };
 }
 

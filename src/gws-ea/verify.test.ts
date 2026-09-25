@@ -1,6 +1,6 @@
 /**
  * Verification reads an instance's central DB and `main`'s mailbox exactly as
- * NanoClaw writes them (KTD11): core migrations build the schema, the host's
+ * NanoClaw writes them: core migrations build the schema, the host's
  * `ncl` dispatch and profile module make the principal binding, and
  * `resolveSession` creates `main`'s agent-shared session for the principal DM
  * as the router does. Only the container's own write — an assistant reply in

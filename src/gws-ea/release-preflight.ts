@@ -14,7 +14,7 @@ import { assertInstalledOnecliSdkVersion } from './onecli.js';
 
 const PROVIDER_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const INCOMPLETE = 'incomplete_release';
-/** gws-ea's pins inside a release checkout (KTD9). */
+/** gws-ea's pins inside a release checkout. */
 const RELEASE_PINS_FILE = 'src/gws-ea/versions.json';
 
 export interface SetupCommand {

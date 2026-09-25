@@ -1,5 +1,5 @@
 /**
- * gws-ea's version pins (KTD9): the OneCLI gateway and CLI, and the
+ * gws-ea's version pins: the OneCLI gateway and CLI, and the
  * cloudflared image. They live in `src/gws-ea/versions.json`, outside the
  * upstream-owned root `versions.json`. A release carries its own copy, which
  * release preflight compares with this launcher's at create only.

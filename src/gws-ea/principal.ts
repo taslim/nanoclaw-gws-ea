@@ -5,10 +5,8 @@ import { INSTANCE_KEY_RE } from '../channels/channel-registry.js';
 import { runInstanceNclJson } from './ncl.js';
 import { buildInstanceCliCommand, validateRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
 import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
-import { GwsEaError } from './types.js';
-import { hasControlCharacters, isRecord, unwrapData } from './validation.js';
-
-const CHANNEL_TYPE = 'gchat';
+import { GCHAT_CHANNEL_TYPE, GwsEaError } from './types.js';
+import { canonicalTimestamp, hasControlCharacters, isRecord, unwrapData } from './validation.js';
 
 export interface PrincipalCandidate {
   readonly messagingGroupId: string;
@@ -48,12 +46,6 @@ interface MainProfile {
   readonly principalDisplayName: string;
 }
 
-function canonicalTimestamp(value: unknown): string | undefined {
-  if (typeof value !== 'string') return undefined;
-  const parsed = new Date(value);
-  return Number.isFinite(parsed.getTime()) && parsed.toISOString() === value ? value : undefined;
-}
-
 function safeIdentifier(value: unknown): string | undefined {
   if (typeof value !== 'string' || value.length === 0 || value.length > 256) return undefined;
   return hasControlCharacters(value) ? undefined : value;
@@ -89,7 +81,7 @@ function parseCandidate(
   const platformId = safeIdentifier(value.platform_id);
   const userId = safeIdentifier(value.user_id);
   if (
-    value.channel_type !== CHANNEL_TYPE ||
+    value.channel_type !== GCHAT_CHANNEL_TYPE ||
     value.instance !== adapterInstance ||
     value.reason !== 'no_agent_wired' ||
     value.sender_authenticated !== 1 ||
@@ -100,7 +92,7 @@ function parseCandidate(
     !authenticatedMessageId ||
     !messagingGroupId ||
     !platformId ||
-    !userId?.startsWith(`${CHANNEL_TYPE}:`)
+    !userId?.startsWith(`${GCHAT_CHANNEL_TYPE}:`)
   ) {
     return undefined;
   }
@@ -172,7 +164,7 @@ export function principalWelcomeEventId(
  * read-only until the operator supplies one exact messaging-group ID.
  * Authentication alone never authorizes an owner grant.
  *
- * Binding order (KTD9): the principal and its authenticated DM are bound
+ * Binding order: the principal and its authenticated DM are bound
  * first; then the host creates the principal's user, owner role, membership,
  * and main's DM wiring, which its canonical-main admission accepts or
  * rejects; then `init-first-agent` reuses those records and delivers the
@@ -208,7 +200,7 @@ export async function reconcilePrincipalDm(
         'dropped-messages',
         'list',
         '--channel-type',
-        CHANNEL_TYPE,
+        GCHAT_CHANNEL_TYPE,
         '--instance',
         input.adapterInstance,
         '--reason',
@@ -242,7 +234,7 @@ export async function reconcilePrincipalDm(
     '--id',
     selected.userId,
     '--kind',
-    CHANNEL_TYPE,
+    GCHAT_CHANNEL_TYPE,
     '--display-name',
     displayName,
   ]);
@@ -293,7 +285,7 @@ export async function reconcilePrincipalDm(
   }
   await runBootstrap(config, [
     '--channel',
-    CHANNEL_TYPE,
+    GCHAT_CHANNEL_TYPE,
     '--user-id',
     selected.userId,
     '--platform-id',

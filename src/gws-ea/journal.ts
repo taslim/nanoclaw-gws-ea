@@ -1,5 +1,5 @@
 /**
- * The provision journal (KTD4): the minimal durable record of one instance's
+ * The provision journal: the minimal durable record of one instance's
  * provisioning. It is created together with the reservation, so a missing
  * journal means nothing started, and every later write replaces it atomically
  * under the instance operation lock.
@@ -14,14 +14,31 @@ import path from 'node:path';
 import { readJson, writePrivate } from '../community-portal/private-file.js';
 import { processLock } from '../community-portal/process-lock.js';
 import { isErrno } from '../community-portal/errors.js';
-import { assertPrivateStateFile, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
+import {
+  assertOwnedDestination,
+  assertPrivateStateFile,
+  preparePrivateDirectory,
+  type ControlPlanePaths,
+} from './paths.js';
 import type { PrincipalCandidate } from './principal.js';
 import { parsePrincipalCandidate } from './principal-selection.js';
-import { redact } from './redact.js';
-import { assertInstanceId, getInstanceReservation } from './registry.js';
+import { safeErrorCode, safeErrorMessage } from './redact.js';
+import {
+  assertInstanceId,
+  getInstanceReservation,
+  stageReservation,
+  validateReservation,
+  withMachineLock,
+} from './registry.js';
 import { removePrivateFile } from './secrets.js';
-import { GwsEaError, PROVISION_STEPS, type ProvisionStepId } from './types.js';
-import { hasControlCharacters, isRecord, requireString } from './validation.js';
+import {
+  GwsEaError,
+  PROVISION_STEPS,
+  type InstanceReservation,
+  type InstanceReservationInput,
+  type ProvisionStepId,
+} from './types.js';
+import { hasControlCharacters, isRecord, requireCanonicalTimestamp, requireString } from './validation.js';
 
 export const PROVISION_JOURNAL_SCHEMA_VERSION = 3 as const;
 
@@ -62,7 +79,7 @@ export interface ProvisionJournal {
   readonly started_at: string;
   readonly steps: Readonly<Partial<Record<ProvisionStepId, JournalStep>>>;
   readonly decisions: JournalDecisions;
-  /** `provision_gcp` lifted the project's key-creation policy, so removal restores it (KTD5). */
+  /** `provision_gcp` lifted the project's key-creation policy, so removal restores it. */
   readonly key_policy_lifted: boolean;
   readonly last_error?: JournalError;
 }
@@ -86,12 +103,7 @@ function invalid(message: string): GwsEaError {
 }
 
 function timestamp(value: unknown, label: string): string {
-  if (typeof value !== 'string') throw invalid(`Provision journal ${label} is invalid`);
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.valueOf()) || parsed.toISOString() !== value) {
-    throw invalid(`Provision journal ${label} is invalid`);
-  }
-  return value;
+  return requireCanonicalTimestamp(value, 'invalid_journal', `Provision journal ${label} is invalid`);
 }
 
 function text(value: unknown, label: string): string {
@@ -167,11 +179,8 @@ function parseJournal(value: unknown, instanceId: string): ProvisionJournal {
   };
 }
 
-/**
- * Write a new journal for a reservation about to be published; the registry
- * calls this under its machine lock, before the reservation becomes visible.
- */
-export async function createProvisionJournal(paths: ControlPlanePaths, instanceId: string): Promise<ProvisionJournal> {
+/** Write a new journal for a reservation about to be published, before it becomes visible. */
+async function createProvisionJournal(paths: ControlPlanePaths, instanceId: string): Promise<ProvisionJournal> {
   assertInstanceId(instanceId);
   await preparePrivateDirectory(paths.instanceRoot(instanceId));
   const file = paths.journalFile(instanceId);
@@ -197,9 +206,34 @@ export async function createProvisionJournal(paths: ControlPlanePaths, instanceI
 }
 
 /** Discard the journal of a reservation that was never published. */
-export async function discardProvisionJournal(paths: ControlPlanePaths, instanceId: string): Promise<void> {
+async function discardProvisionJournal(paths: ControlPlanePaths, instanceId: string): Promise<void> {
   assertInstanceId(instanceId);
   await removePrivateFile(paths.journalFile(instanceId));
+}
+
+/**
+ * Reserve an instance's claims and start its provision journal as one
+ * operation under the machine lock: the journal is written before the
+ * reservation is published, so a reserved instance always has one.
+ */
+export async function reserveInstance(
+  paths: ControlPlanePaths,
+  input: InstanceReservationInput,
+): Promise<InstanceReservation> {
+  const reservation = validateReservation(input, paths);
+  await assertOwnedDestination(reservation.checkout_realpath);
+  return withMachineLock(paths, async () => {
+    const staged = await stageReservation(paths, reservation);
+    await createProvisionJournal(paths, reservation.instance_id);
+    try {
+      await staged.publish();
+    } catch (error) {
+      // Keep the journal unless the reservation certainly did not publish.
+      if (!(await staged.published())) await discardProvisionJournal(paths, reservation.instance_id);
+      throw error;
+    }
+    return reservation;
+  });
 }
 
 export async function readProvisionJournal(paths: ControlPlanePaths, instanceId: string): Promise<ProvisionJournal> {
@@ -272,11 +306,10 @@ export function recordStepFailure(
   error: unknown,
   log: string | undefined,
 ): Promise<ProvisionJournal> {
-  const known = error instanceof GwsEaError;
   const failure: JournalError = {
     step,
-    code: singleLine(known ? error.code : 'unexpected'),
-    message: singleLine(known ? redact(error.message) : 'Unexpected control-plane failure.'),
+    code: singleLine(safeErrorCode(error)),
+    message: singleLine(safeErrorMessage(error)),
     at: new Date().toISOString(),
     ...(log ? { log: singleLine(log) } : {}),
   };

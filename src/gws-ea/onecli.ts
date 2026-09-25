@@ -132,8 +132,22 @@ function verifiedRuntime(receipt: OnecliRuntimeReceipt): VerifiedOnecliRuntime {
   return verified;
 }
 
-function dockerRunner(dependencies: OnecliRuntimeDependencies): OnecliCommandRunner {
-  return dependencies.dockerCommandRunner ?? dependencies.runCommand ?? runSanitizedCommand;
+/** What every Docker command against one instance shares: its layout, the runner, and Compose's environment. */
+interface OnecliDocker {
+  readonly layout: OnecliRuntimeLayout;
+  readonly runner: OnecliCommandRunner;
+  readonly environment: Readonly<Record<string, string>>;
+}
+
+function dockerContext(
+  layout: OnecliRuntimeLayout,
+  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'runCommand' | 'ambientEnv'>,
+): OnecliDocker {
+  return {
+    layout,
+    runner: dependencies.dockerCommandRunner ?? dependencies.runCommand ?? runSanitizedCommand,
+    environment: buildComposeEnvironment(layout, dependencies.ambientEnv),
+  };
 }
 
 export function buildComposeInvocation(layout: OnecliRuntimeLayout, args: readonly string[]): OnecliCommand {
@@ -269,13 +283,12 @@ export async function observeOnecliRuntime(
   pins: OnecliPins,
   dependencies: OnecliRuntimeDependencies = {},
 ): Promise<Observation> {
-  const runner = dockerRunner(dependencies);
-  const environment = buildComposeEnvironment(layout, dependencies.ambientEnv);
+  const docker = dockerContext(layout, dependencies);
   try {
-    const containers = await inspectProjectContainers(layout, runner, environment);
+    const containers = await inspectProjectContainers(docker);
     const seen = serviceObservation(layout, containers);
     if (seen.status !== 'present') return seen;
-    validateObservedOnecliRuntime(layout, pins, await inspectOnecliRuntime(layout, runner, environment, containers));
+    validateObservedOnecliRuntime(layout, pins, await inspectOnecliRuntime(docker, containers));
     return PRESENT;
   } catch (error) {
     if (!(error instanceof GwsEaError) || !['command_failed', 'command_timeout'].includes(error.code)) throw error;
@@ -321,27 +334,16 @@ export async function verifyOnecliRuntime(
   const runCommand = dependencies.runCommand ?? runSanitizedCommand;
   const fetchImplementation = dependencies.fetch ?? globalThis.fetch;
   await removePrivateFile(layout.providerStagingFile);
-  const runner = dockerRunner(dependencies);
-  validateObservedOnecliRuntime(
-    layout,
-    pins,
-    await inspectOnecliRuntime(layout, runner, buildComposeEnvironment(layout, dependencies.ambientEnv)),
-  );
+  validateObservedOnecliRuntime(layout, pins, await inspectOnecliRuntime(dockerContext(layout, dependencies)));
   await Promise.all([
     assertHealthyEndpoint(fetchImplementation, `${layout.appUrl}/api/health`, 'OneCLI app'),
     assertHealthyEndpoint(fetchImplementation, `${layout.appUrl}/v1/health`, 'OneCLI versioned API'),
     assertHealthyEndpoint(fetchImplementation, `${layout.gatewayUrl}/healthz`, 'OneCLI gateway'),
   ]);
 
+  const keylessEnvironment = buildOnecliCliEnvironment(layout, dependencies.ambientEnv);
   const apiKeyResponse = parseRecord(
-    (
-      await runOnecliCommand(
-        layout,
-        buildOnecliCliEnvironment(layout, dependencies.ambientEnv),
-        ['auth', 'api-key'],
-        runCommand,
-      )
-    ).stdout,
+    (await runOnecliCommand(layout, runCommand, keylessEnvironment, ['auth', 'api-key'])).stdout,
     'OneCLI API key',
   );
   const apiKey = stringField(apiKeyResponse, 'apiKey', 'OneCLI API key', INVALID_OUTPUT);
@@ -349,15 +351,9 @@ export async function verifyOnecliRuntime(
     throw new GwsEaError('incompatible_onecli', 'OneCLI returned an invalid local API key');
   }
   registerSecret(apiKey);
+  const keyedEnvironment = buildOnecliCliEnvironment(layout, dependencies.ambientEnv, apiKey);
   const version = parseRecord(
-    (
-      await runOnecliCommand(
-        layout,
-        buildOnecliCliEnvironment(layout, dependencies.ambientEnv, apiKey),
-        ['version'],
-        runCommand,
-      )
-    ).stdout,
+    (await runOnecliCommand(layout, runCommand, keyedEnvironment, ['version'])).stdout,
     'OneCLI version',
   );
   const cli = optionalString(version.version) ?? '(unknown)';
@@ -391,20 +387,14 @@ export async function importProviderCredential(
   const environment = buildOnecliCliEnvironment(layout, dependencies.ambientEnv, apiKey);
   await removePrivateFile(layout.providerStagingFile);
   const secrets = parseArray(
-    (await runOnecliCommand(layout, environment, ['secrets', 'list', '--max', '0'], runCommand)).stdout,
+    (await runOnecliCommand(layout, runCommand, environment, ['secrets', 'list', '--max', '0'])).stdout,
     'OneCLI secrets',
   );
-  const matching = secrets.filter((candidate) => optionalString(candidate.name) === input.name);
-  if (matching.length > 1) {
-    throw new GwsEaError('ambiguous_onecli_secret', 'More than one OneCLI secret has the requested name');
-  }
-  if (matching.length === 1) {
-    const existing = matching[0];
-    if (!onecliSecretMatchesCredentialMetadata(existing, input)) {
-      throw new GwsEaError('onecli_secret_conflict', 'An existing OneCLI secret has incompatible metadata');
-    }
-    return { id: stringField(existing, 'id', 'OneCLI secret', INVALID_OUTPUT), created: false };
-  }
+  const existing = findCredentialSecret(secrets, input, {
+    ambiguous: 'More than one OneCLI secret has the requested name',
+    conflict: 'An existing OneCLI secret has incompatible metadata',
+  });
+  if (existing) return { id: stringField(existing, 'id', 'OneCLI secret', INVALID_OUTPUT), created: false };
 
   try {
     await writeOwnerOnlyFileExclusive(layout.providerStagingFile, input.value);
@@ -426,7 +416,7 @@ export async function importProviderCredential(
     if (input.paramName !== undefined) args.push('--param-name', input.paramName);
     if (input.paramFormat !== undefined) args.push('--param-format', input.paramFormat);
     const created = parseRecord(
-      (await runOnecliCommand(layout, environment, args, runCommand)).stdout,
+      (await runOnecliCommand(layout, runCommand, environment, args)).stdout,
       'OneCLI secret',
     );
     return { id: stringField(created, 'id', 'OneCLI secret', INVALID_OUTPUT), created: true };
@@ -458,7 +448,7 @@ async function writeOrVerifyOwnerOnlySecret(file: string, value: string): Promis
 }
 
 /**
- * Start or repair the runtime (KTD7): pull missing images under their own
+ * Start or repair the runtime: pull missing images under their own
  * timeout, force-recreate only a service Docker reports unhealthy, then
  * start everything and wait for health within the budget the healthchecks
  * allow. A failed start names a foreign process on an allocated port.
@@ -468,11 +458,11 @@ export async function reconcileOnecliRuntime(
   pins: OnecliPins,
   dependencies: OnecliRuntimeDependencies = {},
 ): Promise<OnecliRuntimeReceipt> {
-  const runner = dockerRunner(dependencies);
-  const environment = buildComposeEnvironment(layout, dependencies.ambientEnv);
+  const docker = dockerContext(layout, dependencies);
+  const { runner, environment } = docker;
   await prepareOnecliRuntime(layout, pins);
   await removePrivateFile(layout.providerStagingFile);
-  const kept = await cleanupOnecliDockerOrphans(layout, runner, environment);
+  const kept = await cleanupOnecliDockerOrphans(docker);
   await runner({
     ...buildComposeInvocation(layout, ['pull', '--policy', 'missing']),
     env: environment,
@@ -502,10 +492,10 @@ export async function reconcileOnecliRuntime(
     }
     await up(['--remove-orphans']);
   } catch (error) {
-    throw (await foreignPortError(layout, runner, environment, dependencies, error)) ?? error;
+    throw (await foreignPortError(docker, dependencies, error)) ?? error;
   }
   const receipt = await verifyOnecliRuntime(layout, pins, dependencies);
-  await verifyAgentNetworkIsolation(layout, pins, runner, environment);
+  await verifyAgentNetworkIsolation(docker, pins);
   return receipt;
 }
 
@@ -515,15 +505,14 @@ export async function reconcileOnecliRuntime(
  * comes from the compose labels, never from trying to bind it.
  */
 async function foreignPortError(
-  layout: OnecliRuntimeLayout,
-  runner: OnecliCommandRunner,
-  environment: Readonly<Record<string, string>>,
+  docker: OnecliDocker,
   dependencies: OnecliRuntimeDependencies,
   cause: unknown,
 ): Promise<GwsEaError | undefined> {
   if (!(cause instanceof GwsEaError) || cause.code !== 'command_failed') return undefined;
+  const { layout, runner } = docker;
   const owned = new Set(
-    (await inspectProjectContainers(layout, runner, environment).catch(() => []))
+    (await inspectProjectContainers(docker).catch(() => []))
       .filter((container) => container.running)
       .flatMap((container) => Object.values(container.publishedPorts).flat())
       .map((binding) => binding.hostPort),
@@ -544,15 +533,15 @@ export async function removeOnecliRuntime(
   layout: OnecliRuntimeLayout,
   dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'runCommand' | 'ambientEnv'> = {},
 ): Promise<void> {
-  const runner = dockerRunner(dependencies);
-  const environment = buildComposeEnvironment(layout, dependencies.ambientEnv);
-  const containers = await inspectProjectContainers(layout, runner, environment);
+  const docker = dockerContext(layout, dependencies);
+  const { runner, environment } = docker;
+  const containers = await inspectProjectContainers(docker);
   for (const container of containers) {
     if (container.instanceId !== layout.instanceId || container.project !== layout.project) {
       throw new GwsEaError('unsafe_onecli_owner', 'OneCLI removal found a Docker resource owned by another instance');
     }
   }
-  const namedResources = await assertOwnedOnecliNamedResources(layout, runner, environment);
+  const namedResources = await assertOwnedOnecliNamedResources(docker);
   if (containers.length === 0 && namedResources.length === 0) {
     try {
       await access(layout.composeFile);
@@ -567,10 +556,10 @@ export async function removeOnecliRuntime(
     timeoutMs: 120_000,
     stream: true,
   });
-  if ((await inspectProjectContainers(layout, runner, environment)).length > 0) {
+  if ((await inspectProjectContainers(docker)).length > 0) {
     throw new GwsEaError('onecli_removal_incomplete', 'OneCLI containers remain after removal');
   }
-  if ((await presentOnecliNamedResources(layout, runner, environment)).length > 0) {
+  if ((await presentOnecliNamedResources(docker)).length > 0) {
     throw new GwsEaError('onecli_removal_incomplete', 'OneCLI networks or volumes remain after removal');
   }
 }
@@ -591,12 +580,11 @@ function onecliNamedResources(layout: OnecliRuntimeLayout): readonly NamedDocker
 }
 
 async function listNamedDockerResource(
+  docker: OnecliDocker,
   resource: NamedDockerResource,
-  runner: OnecliCommandRunner,
-  layout: OnecliRuntimeLayout,
-  environment: Readonly<Record<string, string>>,
   labels: readonly string[] = [],
 ): Promise<boolean> {
+  const { layout, runner, environment } = docker;
   const result = await runner({
     command: 'docker',
     args: [
@@ -618,32 +606,24 @@ async function listNamedDockerResource(
     .includes(resource.name);
 }
 
-async function presentOnecliNamedResources(
-  layout: OnecliRuntimeLayout,
-  runner: OnecliCommandRunner,
-  environment: Readonly<Record<string, string>>,
-): Promise<readonly NamedDockerResource[]> {
-  const resources = onecliNamedResources(layout);
+async function presentOnecliNamedResources(docker: OnecliDocker): Promise<readonly NamedDockerResource[]> {
+  const resources = onecliNamedResources(docker.layout);
   const present = await Promise.all(
     resources.map(async (resource) => ({
       resource,
-      present: await listNamedDockerResource(resource, runner, layout, environment),
+      present: await listNamedDockerResource(docker, resource),
     })),
   );
   return present.filter((entry) => entry.present).map((entry) => entry.resource);
 }
 
-async function assertOwnedOnecliNamedResources(
-  layout: OnecliRuntimeLayout,
-  runner: OnecliCommandRunner,
-  environment: Readonly<Record<string, string>>,
-): Promise<readonly NamedDockerResource[]> {
-  const resources = await presentOnecliNamedResources(layout, runner, environment);
+async function assertOwnedOnecliNamedResources(docker: OnecliDocker): Promise<readonly NamedDockerResource[]> {
+  const resources = await presentOnecliNamedResources(docker);
   const ownership = await Promise.all(
     resources.map(async (resource) => ({
       resource,
-      owned: await listNamedDockerResource(resource, runner, layout, environment, [
-        `${ONECLI_INSTANCE_LABEL}=${layout.instanceId}`,
+      owned: await listNamedDockerResource(docker, resource, [
+        `${ONECLI_INSTANCE_LABEL}=${docker.layout.instanceId}`,
         `${ONECLI_RESOURCE_ROLE_LABEL}=${resource.role}`,
       ]),
     })),
@@ -675,12 +655,9 @@ function assertOwnedContainers(layout: OnecliRuntimeLayout, containers: readonly
  * Remove owned containers outside the three services, or duplicates of one,
  * and return the containers that remain.
  */
-export async function cleanupOnecliDockerOrphans(
-  layout: OnecliRuntimeLayout,
-  runner: OnecliCommandRunner,
-  environment: Readonly<Record<string, string>>,
-): Promise<readonly InspectedOnecliContainer[]> {
-  const containers = await inspectProjectContainers(layout, runner, environment);
+export async function cleanupOnecliDockerOrphans(docker: OnecliDocker): Promise<readonly InspectedOnecliContainer[]> {
+  const { layout, runner, environment } = docker;
+  const containers = await inspectProjectContainers(docker);
   assertOwnedContainers(layout, containers);
   const kept: InspectedOnecliContainer[] = [];
   for (const container of containers) {
@@ -700,14 +677,13 @@ export async function cleanupOnecliDockerOrphans(
   return kept;
 }
 
-export async function inspectOnecliRuntime(
-  layout: OnecliRuntimeLayout,
-  runner: OnecliCommandRunner = runSanitizedCommand,
-  environment: Readonly<Record<string, string>> = buildComposeEnvironment(layout),
+async function inspectOnecliRuntime(
+  docker: OnecliDocker,
   inspected?: readonly InspectedOnecliContainer[],
 ): Promise<ObservedOnecliRuntime> {
+  const { layout, runner, environment } = docker;
   const [containers, networkResult, volumeResult] = await Promise.all([
-    inspected ?? inspectProjectContainers(layout, runner, environment),
+    inspected ?? inspectProjectContainers(docker),
     runner({
       command: 'docker',
       args: ['network', 'inspect', layout.backendNetwork, layout.agentEgressNetwork],
@@ -734,11 +710,8 @@ interface InspectedOnecliContainer extends ObservedOnecliContainer {
   readonly id: string;
 }
 
-async function inspectProjectContainers(
-  layout: OnecliRuntimeLayout,
-  runner: OnecliCommandRunner,
-  environment: Readonly<Record<string, string>>,
-): Promise<readonly InspectedOnecliContainer[]> {
+async function inspectProjectContainers(docker: OnecliDocker): Promise<readonly InspectedOnecliContainer[]> {
+  const { layout, runner, environment } = docker;
   const list = await runner({
     command: 'docker',
     args: [
@@ -769,12 +742,8 @@ async function inspectProjectContainers(
   return parseDockerContainers(inspection.stdout);
 }
 
-async function verifyAgentNetworkIsolation(
-  layout: OnecliRuntimeLayout,
-  pins: OnecliPins,
-  runner: OnecliCommandRunner,
-  environment: Readonly<Record<string, string>>,
-): Promise<void> {
+async function verifyAgentNetworkIsolation(docker: OnecliDocker, pins: OnecliPins): Promise<void> {
+  const { layout, runner, environment } = docker;
   const script = [
     '(async () => {',
     "const dns = require('node:dns').promises;",
@@ -888,9 +857,9 @@ function parseDockerArray(source: string, label: string): readonly Record<string
 
 async function runOnecliCommand(
   layout: OnecliRuntimeLayout,
+  runner: OnecliCommandRunner,
   environment: Readonly<Record<string, string>>,
   args: readonly string[],
-  runner: OnecliCommandRunner,
 ): Promise<OnecliCommandResult> {
   return runner({
     command: layout.cliExecutable,
@@ -1012,6 +981,31 @@ export function onecliSecretMatchesCredentialMetadata(
     nullableString(existing.pathPattern) === (input.pathPattern ?? null) &&
     JSON.stringify(existing.injectionConfig ?? null) === JSON.stringify(expectedInjection)
   );
+}
+
+/** What `findCredentialSecret`'s two refusals say. */
+export interface CredentialSecretRefusals {
+  readonly ambiguous: string;
+  readonly conflict: string;
+}
+
+/**
+ * The one OneCLI secret named like `credential`, or undefined when there is
+ * none. More than one raises `ambiguous_onecli_secret`; one whose metadata
+ * differs raises `onecli_secret_conflict`.
+ */
+export function findCredentialSecret(
+  secrets: readonly Record<string, unknown>[],
+  credential: ProviderCredentialMetadata,
+  refusals: CredentialSecretRefusals,
+): Record<string, unknown> | undefined {
+  const matching = secrets.filter((candidate) => candidate.name === credential.name);
+  if (matching.length > 1) throw new GwsEaError('ambiguous_onecli_secret', refusals.ambiguous);
+  const existing = matching[0];
+  if (existing && !onecliSecretMatchesCredentialMetadata(existing, credential)) {
+    throw new GwsEaError('onecli_secret_conflict', refusals.conflict);
+  }
+  return existing;
 }
 
 function nullableString(value: unknown): string | null {

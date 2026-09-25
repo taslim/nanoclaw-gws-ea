@@ -1,9 +1,11 @@
 /**
- * The Cloudflare REST seam (KTD6). Readers tolerate the documented optional
+ * The Cloudflare REST seam. Readers tolerate the documented optional
  * and extra fields; ownership is decided by callers on exact values. Every
  * request writes its method, path, and HTTP status to the step's raw log,
  * never a body; non-token reads go to the fixture capture sink when enabled.
  */
+import { setTimeout as delay } from 'node:timers/promises';
+
 import type { CloudflareZoneChoice, ManagedIngressSetupSession } from './create-input.js';
 import { redact, registerSecret } from './redact.js';
 import { activeStep } from './run-log.js';
@@ -96,7 +98,7 @@ export interface RetainedManagedIngressSetupSession extends ManagedIngressSetupS
 /**
  * A change Cloudflare did not confirm: no answer or a 5xx (it may have been
  * applied), or a 429 after its Retry-After (it was not). Either way the
- * caller re-reads before deciding whether to send it again (KTD6 item 5).
+ * caller re-reads before deciding whether to send it again.
  */
 export class CloudflareAmbiguousMutationError extends GwsEaError {
   readonly status: number | undefined;
@@ -334,7 +336,7 @@ class CloudflareApiClient implements CloudflareApi {
     this.#fetch = options.fetch ?? globalThis.fetch;
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.#maxReadAttempts = options.maxReadAttempts ?? DEFAULT_READ_ATTEMPTS;
-    this.#sleep = options.sleep ?? ((delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)));
+    this.#sleep = options.sleep ?? delay;
     if (!Number.isInteger(this.#timeoutMs) || this.#timeoutMs < 1) {
       throw new GwsEaError('invalid_cloudflare_api', 'Cloudflare request timeout is invalid');
     }

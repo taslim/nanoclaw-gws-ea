@@ -1,3 +1,4 @@
+import { errorCode } from '../community-portal/errors.js';
 import { GwsEaError } from './types.js';
 
 const CALLBACK_PATH = '/webhook/gchat';
@@ -167,8 +168,8 @@ function isRedirect(response: Response, url: string): boolean {
 
 function failureCode(error: unknown): string {
   const cause = error instanceof Error ? error.cause : undefined;
-  const code = cause instanceof Error ? (cause as NodeJS.ErrnoException).code : undefined;
-  if (typeof code === 'string' && code) return code;
+  const code = cause instanceof Error ? errorCode(cause, '') : '';
+  if (code) return code;
   return error instanceof Error && error.name === 'TimeoutError' ? 'timed out' : 'no answer';
 }
 

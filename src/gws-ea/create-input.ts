@@ -5,7 +5,7 @@ import { registerSecret } from './redact.js';
 import { readOperatorFile } from './secrets.js';
 import { GwsEaError } from './types.js';
 
-/** One flag per create prompt (KTD11), so `create` can run without a person. */
+/** One flag per create prompt, so `create` can run without a person. */
 export const CREATE_INPUT_FLAGS = [
   'assistant-first-name',
   'assistant-last-name',

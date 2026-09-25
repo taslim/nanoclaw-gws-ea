@@ -16,17 +16,12 @@ import {
   recordKeyPolicyLifted,
   recordStepCompleted,
   recordStepStarted,
+  reserveInstance,
   withInstanceOperation,
 } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { SanitizedCommand, SanitizedCommandOutcome } from './process.js';
-import {
-  allocateInstanceId,
-  readRegistry,
-  reserveInstance,
-  withLockedCloudflareRegistry,
-  writeInstanceMarker,
-} from './registry.js';
+import { allocateInstanceId, readRegistry, withLockedCloudflareRegistry, writeInstanceMarker } from './registry.js';
 import { removeAssistant, type RemovalDependencies, type RemovalInteraction } from './remove.js';
 import { GwsEaError, type InstanceReservationInput, type ProvisionStepId } from './types.js';
 

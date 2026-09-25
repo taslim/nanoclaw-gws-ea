@@ -222,10 +222,7 @@ export async function materializeReleaseCheckout(
     }
     await assertPrivateDirectory(stagingRoot);
     try {
-      await assertStagingMarker(stagingRoot, instanceId, reservation);
-      await assertCheckoutRoot(stagingRoot, reservation, run, environments.git);
-      await assertCheckoutTargetAbsent(reservation.checkout_realpath);
-      await rename(stagingRoot, reservation.checkout_realpath);
+      await promoteStagingCheckout(stagingRoot, instanceId, reservation, run, environments.git);
       return assertReleaseCheckoutAgreement(paths, instanceId, runtime);
     } catch (error) {
       if (error instanceof GwsEaError && ['invalid_marker', 'marker_mismatch'].includes(error.code)) throw error;
@@ -258,16 +255,30 @@ export async function materializeReleaseCheckout(
       env: environments.git,
     });
     await writeStagingMarker(stagingRoot, instanceId, reservation);
-    await assertStagingMarker(stagingRoot, instanceId, reservation);
-    await assertCheckoutRoot(stagingRoot, reservation, run, environments.git);
-    await assertCheckoutTargetAbsent(reservation.checkout_realpath);
-    await rename(stagingRoot, reservation.checkout_realpath);
+    await promoteStagingCheckout(stagingRoot, instanceId, reservation, run, environments.git);
     const result = await assertReleaseCheckoutAgreement(paths, instanceId, runtime);
     completed = true;
     return result;
   } finally {
     if (!completed) await rm(stagingRoot, { recursive: true, force: true });
   }
+}
+
+/**
+ * Move a staged checkout into place once it carries this instance's marker,
+ * sits at the reserved commit, and nothing occupies the checkout path.
+ */
+async function promoteStagingCheckout(
+  stagingRoot: string,
+  instanceId: string,
+  reservation: InstanceReservation,
+  run: SanitizedCommandRunner,
+  environment: Readonly<Record<string, string>>,
+): Promise<void> {
+  await assertStagingMarker(stagingRoot, instanceId, reservation);
+  await assertCheckoutRoot(stagingRoot, reservation, run, environment);
+  await assertCheckoutTargetAbsent(reservation.checkout_realpath);
+  await rename(stagingRoot, reservation.checkout_realpath);
 }
 
 async function assertCheckoutRoot(

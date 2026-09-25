@@ -1,5 +1,5 @@
 /**
- * The gws-ea driver (KTD8): terminal rendering, prompts, Google Cloud
+ * The gws-ea driver: terminal rendering, prompts, Google Cloud
  * guidance, and the interactive failure loop around the control-plane CLI.
  * Without a TTY it adds none of them, so every input comes from flags, the
  * environment, or the secrets file, and every stop is a durable line.

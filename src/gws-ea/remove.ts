@@ -1,6 +1,6 @@
 /**
- * Removal from any partial state (R11, R12). A resource is observed only when
- * the provisioning step that owns it ever started (KTD4): no journal means
+ * Removal from any partial state. A resource is observed only when
+ * the provisioning step that owns it ever started: no journal means
  * nothing started, and a journal this launcher cannot read means every
  * resource is observed. An absent resource is done; an owned one is deleted
  * and observed again; a foreign one is refused by name; one that cannot be
@@ -41,7 +41,7 @@ import {
 import {
   PauseRequired,
   runStep,
-  SignInRequired,
+  withGoogleSignIn,
   type CloudflareTokenRequest,
   type StepIdentity,
   type StepReporter,
@@ -61,6 +61,7 @@ import { CONTROL_PLANE_ROOT, preparePrivateDirectory, type ControlPlanePaths } f
 import { probeRecordedDockerEndpoint, resolveDockerEndpoint } from './prerequisites.js';
 import {
   buildToolEnvironment,
+  checkedRunner,
   commandExitError,
   resolveExecutable,
   runSanitizedCommandOutcome,
@@ -80,7 +81,11 @@ import {
 import { activeStep } from './run-log.js';
 import { readOwnerOnlyJson, removePrivateFile } from './secrets.js';
 import { serviceManagerEnvironment } from './service.js';
-import { createInstanceServiceCoordinates, type InstanceServicePlatform } from './service-coordinates.js';
+import {
+  createInstanceServiceCoordinates,
+  instanceServicePlatform,
+  type InstanceServicePlatform,
+} from './service-coordinates.js';
 import {
   GwsEaError,
   ingressEndpointUrl,
@@ -90,7 +95,7 @@ import {
   type ProvisionStepId,
   type SharedCloudflareMetadata,
 } from './types.js';
-import { isRecord, requireDockerEndpoint, requirePath } from './validation.js';
+import { canonicalTimestamp, isRecord, requireDockerEndpoint, requirePath } from './validation.js';
 
 /** Resources in teardown order; the registry entry is released after all of them. */
 export const REMOVAL_RESOURCES = ['managed-ingress', 'nanoclaw', 'gcp-project', 'onecli', 'instance-files'] as const;
@@ -221,15 +226,9 @@ export interface RemovalPreview {
   readonly ingress: ExistingRemovalPreview | ManagedRemovalPreview;
 }
 
-function timestamp(value: unknown): string | undefined {
-  if (typeof value !== 'string') return undefined;
-  const parsed = new Date(value);
-  return !Number.isNaN(parsed.valueOf()) && parsed.toISOString() === value ? value : undefined;
-}
-
 function evidenceOf(value: unknown): Evidence | undefined {
   if (!isRecord(value) || typeof value.evidence !== 'string') return undefined;
-  const at = timestamp(value.at);
+  const at = canonicalTimestamp(value.at);
   return at ? { at, evidence: value.evidence } : undefined;
 }
 
@@ -265,8 +264,8 @@ async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promis
       schema_version: RECEIPT_SCHEMA_VERSION,
       instance_id: instanceId,
       reservation,
-      started_at: timestamp(raw.started_at) ?? new Date().toISOString(),
-      completed: current ? entries(REMOVAL_RESOURCES, raw.completed, timestamp) : {},
+      started_at: canonicalTimestamp(raw.started_at) ?? new Date().toISOString(),
+      completed: current ? entries(REMOVAL_RESOURCES, raw.completed, canonicalTimestamp) : {},
       abandoned: current ? entries<RemovalResource, Evidence>(ABANDONABLE_RESOURCES, raw.abandoned, evidenceOf) : {},
       ...(unrestored ? { key_policy_unrestored: unrestored } : {}),
     };
@@ -312,7 +311,7 @@ async function readRecord(file: string): Promise<Record<string, unknown> | undef
  * The home directory, Docker endpoint, and OneCLI CLI the instance recorded:
  * `runtime.json` once the host started, else the bootstrap manifest create
  * wrote. Only these fields are read, so files an earlier launcher wrote still
- * remove cleanly (R14).
+ * remove cleanly.
  */
 async function readRecordedRuntime(
   paths: ControlPlanePaths,
@@ -434,7 +433,7 @@ async function cloudflareAuthority(
     reason: `Removing managed callback ${claim.callback_url} requires temporary Cloudflare authorization.`,
   });
   const api = createApi(token);
-  // Listing zones proves the token, account-owned tokens included (KTD6 item 4).
+  // Listing zones proves the token, account-owned tokens included.
   const zones = await api.listActiveZones();
   if (
     !zones.some(
@@ -540,15 +539,19 @@ async function uninstallNanoclaw(
   const installId = reservation.instance_id.replaceAll('-', '');
   const recorded = { home_directory: runtime.homeDirectory, docker_endpoint: runtime.dockerEndpoint };
   const incomplete = (message: string): GwsEaError => new GwsEaError('nanoclaw_removal_incomplete', message);
+  const commandFor = (
+    program: string,
+    args: readonly string[],
+    env: Readonly<Record<string, string>>,
+  ): SanitizedCommand => ({ command: program, args, cwd: CONTROL_PLANE_ROOT, env, timeoutMs: 120_000 });
+  /** Runs a command and returns its raw outcome, for callers that read the exit code themselves. */
   const execute = (program: string, args: readonly string[], env: Readonly<Record<string, string>>) => {
-    const command: SanitizedCommand = { command: program, args, cwd: CONTROL_PLANE_ROOT, env, timeoutMs: 120_000 };
+    const command = commandFor(program, args, env);
     return run(command).then((outcome) => ({ command, outcome }));
   };
-  const checked = async (program: string, args: readonly string[], env: Readonly<Record<string, string>>) => {
-    const { command, outcome } = await execute(program, args, env);
-    if (outcome.exitCode !== 0) throw commandExitError(command, outcome);
-    return outcome.stdout;
-  };
+  const runChecked = checkedRunner(run);
+  const checked = async (program: string, args: readonly string[], env: Readonly<Record<string, string>>) =>
+    (await runChecked(commandFor(program, args, env))).stdout;
   const coordinates = (runningAsRoot: boolean) =>
     createInstanceServiceCoordinates({ installId, homeDirectory: runtime.homeDirectory, platform, runningAsRoot });
 
@@ -694,7 +697,7 @@ async function removeLocked(
   const { interaction } = dependencies;
   const reporter = dependencies.reporter ?? {};
   const abandon = dependencies.abandon ?? new Set();
-  const platform = dependencies.platform ?? (process.platform === 'darwin' ? 'macos' : 'linux');
+  const platform = dependencies.platform ?? instanceServicePlatform();
   const runGcloud = dependencies.runGcloud ?? runSanitizedCommandOutcome;
   const registry = await readRegistry(paths);
   const existing = await readReceipt(paths, instanceId);
@@ -745,16 +748,12 @@ async function removeLocked(
     onecliCliPath: recorded.onecliCliPath,
   });
   const account = claims.gcp_account;
-  const withSignIn = async <T>(body: () => Promise<T>): Promise<T> => {
-    try {
-      return await body();
-    } catch (error) {
-      if (!(error instanceof SignInRequired)) throw error;
-      activeStep()?.write(`${error.message}; signing in, then trying again\n`);
-      await interaction.signInToGoogleCloud(account);
-      return body();
-    }
-  };
+  const withSignIn = <T>(body: () => Promise<T>): Promise<T> =>
+    withGoogleSignIn(
+      body,
+      () => interaction.signInToGoogleCloud(account),
+      (refusal) => activeStep()?.write(`${refusal.message}; signing in, then trying again\n`),
+    );
   const cloudflare = once(async () => {
     if (!claim) throw new GwsEaError('invalid_removal', 'Only managed ingress needs Cloudflare authorization');
     return cloudflareAuthority(

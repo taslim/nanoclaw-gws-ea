@@ -21,7 +21,7 @@ import { verifyPrincipalBinding } from './verify.js';
 vi.mock('../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
 
 const STARTED_AT = '2026-09-18T18:00:00.000Z';
-/** KTD9: bind, then the host's records and main's DM wiring, then the welcome. */
+/** Binding order: bind, then the host's records and main's DM wiring, then the welcome. */
 const BIND_ORDER = ['user', 'bind', 'role:owner', 'member', 'wiring', 'bootstrap'] as const;
 
 function runtimeConfig(overrides: Partial<InstanceRuntimeConfig> = {}): InstanceRuntimeConfig {
@@ -355,7 +355,7 @@ describe('verified principal first-DM reconciliation', () => {
 });
 
 /**
- * The binding on real NanoClaw code (KTD11): the principal's DM is routed by
+ * The binding on real NanoClaw code: the principal's DM is routed by
  * the router into a checkout's central DB built by core migrations, every
  * `ncl` call goes through the host's dispatch, and the checkout's own
  * `scripts/init-first-agent.ts` runs as a child process and hands its welcome

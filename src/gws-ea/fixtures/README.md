@@ -1,6 +1,6 @@
 # gws-ea boundary recordings
 
-Real outputs that boundary tests replay (R7, KTD11). `recordings.ts` loads them.
+Real outputs that boundary tests replay. `recordings.ts` loads them.
 
 ## Provenance
 

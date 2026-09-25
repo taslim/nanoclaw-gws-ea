@@ -9,7 +9,7 @@ import { runCli, type CliRuntime, type FailureReport } from './cli.js';
 import type { CreatePromptContext } from './create-input.js';
 import { runStep, withPendingAction, type Interaction } from './events.js';
 import { RECORDED_GCLOUD_REAUTHENTICATION_FAILED } from './fixtures/recordings.js';
-import { acquireInstanceOperation } from './journal.js';
+import { acquireInstanceOperation, reserveInstance } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { ONECLI_CLI_VERSION } from './pins.js';
 import type { ProvisionHumanPause } from './phases.js';
@@ -21,7 +21,7 @@ import {
 } from './prerequisites.js';
 import { runSanitizedCommand } from './process.js';
 import { installProductionBootstrapManifest } from './provision.js';
-import { allocateInstanceId, readRegistry, reserveInstance } from './registry.js';
+import { allocateInstanceId, readRegistry } from './registry.js';
 import { DOGFOOD_SOURCE_FILE, GWS_EA_RELEASE_REMOTE } from './release-tracks.js';
 import { activeStep } from './run-log.js';
 import { GwsEaError, type InstanceReservationInput } from './types.js';

@@ -1,6 +1,9 @@
 export const REGISTRY_SCHEMA_VERSION = 2 as const;
 export const INSTANCE_MARKER_SCHEMA_VERSION = 1 as const;
 
+/** NanoClaw's channel type for Google Chat: the prefix of its user IDs and the `channel_type` of its rows. */
+export const GCHAT_CHANNEL_TYPE = 'gchat';
+
 /** Provisioning steps in run order; a completed `verify_conversation` means the assistant is ready. */
 export const PROVISION_STEPS = [
   'materialize_checkout',

@@ -24,7 +24,7 @@ import {
   type GcpProjectInput,
   type GcpStepContext,
 } from './gcloud.js';
-import { readProvisionJournal, withInstanceOperation, type ProvisionJournal } from './journal.js';
+import { readProvisionJournal, reserveInstance, withInstanceOperation, type ProvisionJournal } from './journal.js';
 import { resolveControlPlanePaths } from './paths.js';
 import {
   OBSERVATION_WAITS_SECONDS,
@@ -35,7 +35,7 @@ import {
   type ProvisionSteps,
 } from './phases.js';
 import type { SanitizedCommandOutcome } from './process.js';
-import { allocateInstanceId, reserveInstance } from './registry.js';
+import { allocateInstanceId } from './registry.js';
 import { GwsEaError, PROVISION_STEPS } from './types.js';
 
 const roots: string[] = [];

@@ -8,7 +8,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { assertReleaseCheckoutAgreement, materializeReleaseCheckout, resolveReleaseCommit } from './checkout.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { TOOL_ENVIRONMENT_KEYS, runSanitizedCommand } from './process.js';
-import { allocateInstanceId, reserveInstance } from './registry.js';
+import { reserveInstance } from './journal.js';
+import { allocateInstanceId } from './registry.js';
 import type { InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];

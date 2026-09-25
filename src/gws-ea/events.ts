@@ -1,5 +1,5 @@
 /**
- * The engine-to-driver contract (KTD8). Steps report typed events; human input
+ * The engine-to-driver contract. Steps report typed events; human input
  * reaches the engine only through the `Interaction` port. The driver
  * (setup/gws-ea*.ts) renders the events and supplies the terminal prompts;
  * nothing here imports setup/.
@@ -103,6 +103,26 @@ export class SignInRequired extends GwsEaError {
   constructor(message: string, options?: GwsEaErrorOptions) {
     super('gcloud_auth_required', message, options);
     this.name = 'SignInRequired';
+  }
+}
+
+/**
+ * Run `work`; when it finds the Google sign-in expired, sign in once and run
+ * it again. Without `signIn` the refusal stands. `onSignIn` hears the refusal
+ * first, so the caller can log it.
+ */
+export async function withGoogleSignIn<T>(
+  work: () => Promise<T>,
+  signIn: (() => Promise<void>) | undefined,
+  onSignIn?: (refusal: SignInRequired) => void,
+): Promise<T> {
+  try {
+    return await work();
+  } catch (error) {
+    if (!(error instanceof SignInRequired) || !signIn) throw error;
+    onSignIn?.(error);
+    await signIn();
+    return work();
   }
 }
 

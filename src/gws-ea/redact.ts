@@ -93,6 +93,16 @@ export function redact(text: string): string {
   return result;
 }
 
+/** A failure's code as gws-ea reports it: a GWS-EA error's own code, `unexpected` for anything else. */
+export function safeErrorCode(error: unknown): string {
+  return error instanceof GwsEaError ? error.code : 'unexpected';
+}
+
+/** A failure's message as gws-ea reports it: only a GWS-EA error's own message, redacted, is ever shown. */
+export function safeErrorMessage(error: unknown): string {
+  return error instanceof GwsEaError ? redact(error.message) : 'Unexpected control-plane failure.';
+}
+
 export interface StreamRedactor {
   /** Accept a chunk and return the redacted text of every line it completes. */
   push(chunk: string): string;

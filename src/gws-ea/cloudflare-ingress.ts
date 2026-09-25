@@ -1,5 +1,5 @@
 /**
- * Managed Cloudflare ingress (KTD6): one remotely managed tunnel per machine,
+ * Managed Cloudflare ingress: one remotely managed tunnel per machine,
  * one route and DNS record per assistant, and one shared connector.
  *
  * Ownership stays exact: the tunnel by name and recorded ID, each DNS record
@@ -118,7 +118,7 @@ function foreign(message: string): GwsEaError {
 /**
  * Project a remote configuration onto what ownership compares: each rule's
  * (hostname, path, service), ending in one catch-all. Per-rule settings such
- * as `originRequest` and a null `ingress` are tolerated (KTD6 item 2); other
+ * as `originRequest` and a null `ingress` are tolerated; other
  * top-level settings are foreign.
  */
 function projectConfiguration(value: unknown): ManagedCloudflareConfiguration {
@@ -237,7 +237,7 @@ export function chooseOwnedDnsRecord(
 }
 
 /**
- * Send one change and confirm it (KTD6 item 5). After any failure the change
+ * Send one change and confirm it. After any failure the change
  * is re-read: if it shows, it is done. It is sent again only when the re-read
  * shows it absent and Cloudflare rate-limited it (so it was not applied), or
  * the change is idempotent; anything else stops with the original error.
@@ -342,7 +342,7 @@ export interface ManagedIngressReconcileOptions {
  * Converge the machine's tunnel, the full route set, and one assistant's DNS
  * record under the machine lock. Every read that decides ownership happens
  * before the first change. Assistants under removal leave the route set, so
- * a stuck removal never blocks another assistant (R12).
+ * a stuck removal never blocks another assistant.
  */
 export async function reconcileManagedCloudflareIngress(
   paths: ControlPlanePaths,
@@ -362,7 +362,7 @@ export async function reconcileManagedCloudflareIngress(
       throw new GwsEaError('removal_in_progress', 'This assistant is being removed; finish its removal instead');
     }
 
-    // Listing zones proves the token, account-owned tokens included (KTD6 item 4).
+    // Listing zones proves the token, account-owned tokens included.
     const zones = await api.listActiveZones();
     if (!zones.some((zone) => zone.zoneId === claim.zone_id && zone.accountId === claim.account_id)) {
       throw new GwsEaError(
@@ -410,7 +410,7 @@ export async function reconcileManagedCloudflareIngress(
 
 /**
  * Wait, on the observation schedule, until a connected connector reports this
- * configuration version or newer (KTD6 item 3). No connected connector means
+ * configuration version or newer. No connected connector means
  * none runs yet: it loads the latest configuration when it starts. A version
  * that never shows is not a failure; the public callback check decides.
  */
@@ -441,9 +441,9 @@ export interface ManagedTransport {
   readonly platform: CloudflareConnectorPlatform;
   /** The assistant's loopback webhook port, which its route targets. */
   readonly webhookPort: number;
-  /** The assistant's recorded Docker endpoint, where the connector runs (KTD3). */
+  /** The assistant's recorded Docker endpoint, where the connector runs. */
   readonly dockerEndpoint: string;
-  /** The account token, asked for only when a tunnel, route, or DNS change may be needed (R8). */
+  /** The account token, asked for only when a tunnel, route, or DNS change may be needed. */
   readonly accountToken: (reason: string) => Promise<string>;
 }
 
@@ -475,7 +475,7 @@ function sentence(clause: string): string {
  *
  * 1. The Cloudflare route (tunnel, route set, this assistant's DNS record),
  *    observed locally from the recorded coordinates and the stored connector
- *    token: completed cloud setup is not re-proven (R4).
+ *    token: completed cloud setup is not re-proven.
  * 2. The connector, a local runtime repaired from the stored connector token
  *    without the account token.
  * 3. The public callback, observed from outside. Edge 5xx/53x is waited on

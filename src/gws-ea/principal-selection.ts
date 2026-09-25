@@ -1,20 +1,12 @@
 import type { PrincipalCandidate } from './principal.js';
-import { GwsEaError } from './types.js';
-import { hasControlCharacters, isRecord } from './validation.js';
+import { GCHAT_CHANNEL_TYPE, GwsEaError } from './types.js';
+import { hasControlCharacters, isRecord, requireCanonicalTimestamp } from './validation.js';
 
 function identifier(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.length === 0 || value.length > 512 || hasControlCharacters(value)) {
     throw new GwsEaError('invalid_principal_selection', `${label} is invalid`);
   }
   return value;
-}
-
-function timestamp(value: unknown, label: string): string {
-  const parsed = typeof value === 'string' ? new Date(value) : undefined;
-  if (!parsed || !Number.isFinite(parsed.getTime()) || parsed.toISOString() !== value) {
-    throw new GwsEaError('invalid_principal_selection', `${label} is invalid`);
-  }
-  return value as string;
 }
 
 /**
@@ -31,7 +23,7 @@ export function parsePrincipalCandidate(value: unknown): PrincipalCandidate {
     throw new GwsEaError('invalid_principal_selection', 'Principal display name is invalid');
   }
   const userId = identifier(value.userId, 'User ID');
-  if (!userId.startsWith('gchat:')) {
+  if (!userId.startsWith(`${GCHAT_CHANNEL_TYPE}:`)) {
     throw new GwsEaError('invalid_principal_selection', 'Principal user ID is not a Google Chat identity');
   }
   return {
@@ -40,6 +32,10 @@ export function parsePrincipalCandidate(value: unknown): PrincipalCandidate {
     userId,
     senderName,
     authenticatedMessageId: identifier(value.authenticatedMessageId, 'Authenticated message ID'),
-    authenticatedMessageAt: timestamp(value.authenticatedMessageAt, 'Authenticated message time'),
+    authenticatedMessageAt: requireCanonicalTimestamp(
+      value.authenticatedMessageAt,
+      'invalid_principal_selection',
+      'Authenticated message time is invalid',
+    ),
   };
 }

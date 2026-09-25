@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { deriveGchatServiceAccountEmail, deriveGcpProjectId } from './gcloud.js';
 
 /**
- * The committed-fixture scan (KTD11): a recording may carry an identifying or
+ * The committed-fixture scan: a recording may carry an identifying or
  * secret value only from the reserved synthetic set.
  */
 const FIXTURES = path.join(import.meta.dirname, 'fixtures');

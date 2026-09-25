@@ -1,5 +1,5 @@
 /**
- * Guards for gws-ea's recorded differences from upstream NanoClaw (KTD9, R13).
+ * Guards for gws-ea's recorded differences from upstream NanoClaw.
  *
  * Each guard drives the real upstream-owned module through the behavior gws-ea
  * depends on, so a skill refresh or upstream update that drops a recorded

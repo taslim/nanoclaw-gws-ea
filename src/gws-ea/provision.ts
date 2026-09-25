@@ -22,6 +22,7 @@ import {
 import { assertReleaseCheckoutAgreement, materializeReleaseCheckout, type ResolvedRelease } from './checkout.js';
 import { runReleasePreflight, type ReleasePreflightInput, type ReleasePreflightResult } from './release-preflight.js';
 import {
+  findCredentialSecret,
   importProviderCredential,
   observeOnecliRuntime,
   persistOnecliApiKeyFiles,
@@ -44,6 +45,7 @@ import {
   type InstanceRuntimeDependencies,
   type UpsertEnvVars,
 } from './service.js';
+import { instanceServicePlatform } from './service-coordinates.js';
 import { runInstanceNclJson } from './ncl.js';
 import { reconcileMainIdentity, type MainIdentityDependencies, type MainIdentityInput } from './identity.js';
 import { reconcilePrincipalDm, type PrincipalCandidate, type PrincipalDiscoveryDependencies } from './principal.js';
@@ -159,7 +161,7 @@ export interface ProductionProvisionDependencies {
   readonly observeCheckout: Observe;
   readonly materializeReleaseCheckout: typeof materializeReleaseCheckout;
   readonly runReleasePreflight: typeof runReleasePreflight;
-  /** `provision_gcp`'s resources (KTD5). */
+  /** `provision_gcp`'s resources. */
   readonly googleCloudResources: typeof googleCloudResources;
   readonly getOwnedGcpProjectNumber: typeof getOwnedGcpProjectNumber;
   readonly observeOnecli: Observe;
@@ -181,7 +183,7 @@ export interface ProductionProvisionDependencies {
   readonly verifyPrincipalBinding: (input: PrincipalBindingVerificationInput) => PrincipalBindingVerificationResult;
   readonly reconcilePrincipal: typeof reconcilePrincipalDm;
   readonly verifyConversation: (input: ConversationVerificationInput) => ConversationVerificationResult;
-  /** `establish_transport`'s resources in managed mode (KTD6). */
+  /** `establish_transport`'s resources in managed mode. */
   readonly managedTransportResources: typeof managedTransportResources;
 }
 
@@ -231,8 +233,7 @@ function credentialMetadataRecord(value: unknown): ProviderCredentialMetadata {
  * The receipt records what create's release preflight established, including
  * the OneCLI cohort the release pinned. The instance's OneCLI runtime runs
  * that cohort; resume never compares it with this launcher's pins, so a
- * launcher upgrade neither blocks nor upgrades an instance it did not create
- * (Appendix B #11).
+ * launcher upgrade neither blocks nor upgrades an instance it did not create.
  */
 function validateReleasePreflightReceipt(
   value: unknown,
@@ -377,13 +378,11 @@ async function defaultObserveProvider(context: ProductionProvisionContext): Prom
       return PRESENT;
     }
     if (!credential) return ABSENT;
-    const matches = value.filter((candidate) => candidate.name === credential.name);
-    if (matches.length > 1) throw new GwsEaError('ambiguous_onecli_secret', 'Provider credential is ambiguous');
-    const match = matches[0];
+    const match = findCredentialSecret(value, credential, {
+      ambiguous: 'Provider credential is ambiguous',
+      conflict: 'Provider credential metadata does not match',
+    });
     if (!match) return ABSENT;
-    if (!onecliSecretMatchesCredentialMetadata(match, credential)) {
-      throw new GwsEaError('onecli_secret_conflict', 'Provider credential metadata does not match');
-    }
     const id = optionalString(match.id);
     if (!id) throw new GwsEaError('invalid_child_output', 'OneCLI provider secret has no ID');
     context.state.providerSecretId = id;
@@ -1063,7 +1062,7 @@ export interface ProductionBootstrapManifest {
   readonly home_directory: string;
   readonly platform: 'macos' | 'linux';
   readonly running_as_root: boolean;
-  /** The local Docker endpoint prerequisites resolved at create (KTD3). */
+  /** The local Docker endpoint prerequisites resolved at create. */
   readonly docker_endpoint: string;
   readonly provider_capability_digest: string;
   readonly provider: {
@@ -1264,7 +1263,7 @@ async function readInstanceState(paths: ControlPlanePaths, reservation: Instance
 /**
  * The Docker endpoint create recorded for this instance: the runtime's once
  * the host has started, the bootstrap manifest's before. Once recorded,
- * resume probes it rather than re-resolving the active context (KTD3).
+ * resume probes it rather than re-resolving the active context.
  */
 export async function recordedDockerEndpoint(
   paths: ControlPlanePaths,
@@ -1296,20 +1295,25 @@ export async function runProductionProvision(
   }
   const reservation = await getInstanceReservation(operation.paths, operation.instanceId);
   const { manifest, runtime: persistedRuntime } = await readInstanceState(operation.paths, reservation);
-  let runtime: InstanceRuntimeConfig;
-  if (persistedRuntime) {
-    runtime = persistedRuntime;
-  } else {
-    if (!manifest) throw new GwsEaError('bootstrap_required', 'The temporary bootstrap manifest is missing');
-    const onecli = createOnecliRuntimeLayout({
+  const onecliLayout = (cliExecutable: string, dockerEndpoint: string): OnecliRuntimeLayout =>
+    createOnecliRuntimeLayout({
       instanceId: reservation.instance_id,
       instanceRoot: operation.paths.instanceRoot(reservation.instance_id),
       project: reservation.exclusive_resource_claims.onecli_project,
       appPort: reservation.allocated_ports.onecli_app,
       gatewayPort: reservation.allocated_ports.onecli_gateway,
-      cliExecutable: manifest.onecli_cli_path,
-      dockerEndpoint: manifest.docker_endpoint,
+      cliExecutable,
+      dockerEndpoint,
     });
+  let runtime: InstanceRuntimeConfig;
+  let onecli: OnecliRuntimeLayout;
+  if (persistedRuntime) {
+    runtime = persistedRuntime;
+    onecli = onecliLayout(runtime.onecli_cli_path, runtime.docker_endpoint);
+  } else {
+    if (!manifest) throw new GwsEaError('bootstrap_required', 'The temporary bootstrap manifest is missing');
+    // The runtime records this layout's CLI path and Docker endpoint verbatim, so the layout matches it too.
+    onecli = onecliLayout(manifest.onecli_cli_path, manifest.docker_endpoint);
     runtime = createInstanceRuntimeConfig(reservation, onecli, {
       nodePath: manifest.node_path,
       homeDirectory: manifest.home_directory,
@@ -1317,15 +1321,6 @@ export async function runProductionProvision(
       dockerEndpoint: manifest.docker_endpoint,
     });
   }
-  const onecli = createOnecliRuntimeLayout({
-    instanceId: reservation.instance_id,
-    instanceRoot: operation.paths.instanceRoot(reservation.instance_id),
-    project: reservation.exclusive_resource_claims.onecli_project,
-    appPort: reservation.allocated_ports.onecli_app,
-    gatewayPort: reservation.allocated_ports.onecli_gateway,
-    cliExecutable: runtime.onecli_cli_path,
-    dockerEndpoint: runtime.docker_endpoint,
-  });
   const persistedPreflight = manifest
     ? undefined
     : await loadReleasePreflightReceipt(operation.paths.releasePreflightFile(operation.instanceId), {
@@ -1407,7 +1402,7 @@ export async function runProductionProvision(
       bootstrapManifestFile: operation.paths.bootstrapFile(operation.instanceId),
       serviceDependencies: {
         upsertEnvVars: options.upsertEnvVars,
-        platform: manifest?.platform ?? (process.platform === 'darwin' ? 'macos' : 'linux'),
+        platform: manifest?.platform ?? instanceServicePlatform(),
         homeDirectory: runtime.home_directory,
         runningAsRoot: manifest?.running_as_root ?? process.getuid?.() === 0,
       },

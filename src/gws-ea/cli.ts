@@ -22,7 +22,7 @@ import {
   type StepReporter,
 } from './events.js';
 import { deriveGchatServiceAccountEmail, deriveGcpProjectId } from './gcloud.js';
-import { acquireInstanceOperation, readProvisionJournal, type InstanceOperation } from './journal.js';
+import { acquireInstanceOperation, readProvisionJournal, reserveInstance, type InstanceOperation } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { ProvisionHumanPause, ProvisionResult, ProvisionRuntime } from './phases.js';
 import { holdLoopbackPorts, type HeldLoopbackPorts } from './ports.js';
@@ -34,14 +34,8 @@ import {
   runProductionProvision,
   validateProductionBootstrapManifest,
 } from './provision.js';
-import { redact } from './redact.js';
-import {
-  allocateInstanceId,
-  assertInstanceId,
-  getInstanceReservation,
-  reserveInstance,
-  validateReservation,
-} from './registry.js';
+import { redact, safeErrorCode, safeErrorMessage } from './redact.js';
+import { allocateInstanceId, assertInstanceId, getInstanceReservation, validateReservation } from './registry.js';
 import { resolveReleaseSource } from './release-tracks.js';
 import {
   ABANDONABLE_RESOURCES,
@@ -60,7 +54,7 @@ import { GwsEaError, type AllocatedPorts, type GwsEaErrorDetails, type InstanceR
 /** Unlabeled, so a scripted create's first line stays its `instance_id`. */
 const PREREQUISITES_STEP = { id: 'prerequisites' } as const;
 
-/** `0` ready, `10` paused for a person, `1` failed, `75` busy (KTD11). */
+/** `0` ready, `10` paused for a person, `1` failed, `75` busy. */
 export const EXIT_CODES = { ready: 0, paused: 10, failed: 1, busy: 75 } as const;
 
 type LineWriter = (line: string) => void;
@@ -208,10 +202,6 @@ function parseAbandon(value: string | undefined): ReadonlySet<AbandonableResourc
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
-}
-
-function safeMessage(error: unknown): string {
-  return error instanceof GwsEaError ? redact(error.message) : 'Unexpected control-plane failure.';
 }
 
 function isBusy(error: unknown): boolean {
@@ -660,7 +650,7 @@ class Cli {
         run?.pause(error.code);
         presenter.report({
           outcome: 'paused',
-          headline: `Paused at ${step}: ${safeMessage(error)}`,
+          headline: `Paused at ${step}: ${safeErrorMessage(error)}`,
           details: [
             ...error.instructions,
             `Continue with: ${continueWith()}`,
@@ -672,14 +662,14 @@ class Cli {
       }
       run?.abort(error);
       if (isBusy(error)) {
-        presenter.report({ outcome: 'busy', headline: safeMessage(error), details: log });
+        presenter.report({ outcome: 'busy', headline: safeErrorMessage(error), details: log });
         return { status: 'done', exitCode: EXIT_CODES.busy };
       }
       const nextAction = this.#nextAction(plan, state);
       if (!run || (error instanceof GwsEaError && error.code === 'cancelled')) {
         presenter.report({
           outcome: 'failed',
-          headline: `Stopped at ${step}: ${safeMessage(error)}`,
+          headline: `Stopped at ${step}: ${safeErrorMessage(error)}`,
           details: [nextAction, ...log],
         });
         return { status: 'done', exitCode: EXIT_CODES.failed };
@@ -709,8 +699,8 @@ function failureReport(
     command,
     step,
     ...(label ? { stepLabel: label } : {}),
-    code: error instanceof GwsEaError ? error.code : 'unexpected',
-    cause: safeMessage(error),
+    code: safeErrorCode(error),
+    cause: safeErrorMessage(error),
     nextAction,
     ...(pending ? { pendingAction: pending.message } : {}),
     progressLog: run.progressLog,

@@ -6,7 +6,7 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { PauseRequired, pendingActionOf, SignInRequired, type RunEvent } from './events.js';
-import { readProvisionJournal, withInstanceOperation, type InstanceOperation } from './journal.js';
+import { readProvisionJournal, reserveInstance, withInstanceOperation, type InstanceOperation } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import {
   ABSENT,
@@ -30,7 +30,6 @@ import {
   type ProductionProvisionDependencies,
 } from './provision.js';
 import type { MainIdentityDependencies } from './identity.js';
-import { reserveInstance } from './registry.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { ONECLI_CLI_VERSION, ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './pins.js';
 import type { OnecliRuntimeReceipt } from './onecli.js';
@@ -1475,7 +1474,7 @@ describe('production provision step composition', () => {
 
   it('waits with a reason, and raises no port error, while a host that holds its webhook port has not opened its socket', async () => {
     const paths = await testPaths();
-    // The assistant's own host has bound its webhook port; only its ncl socket is still closed (Appendix A #13).
+    // The assistant's own host has bound its webhook port; only its ncl socket is still closed.
     const webhook = createServer();
     await listen(webhook, 0);
     const port = (webhook.address() as { port: number }).port;

@@ -13,7 +13,7 @@ import { createStreamRedactor, redact, registerSecret } from './redact.js';
 import { activeStep, type StepLog } from './run-log.js';
 import { GwsEaError } from './types.js';
 
-/** Ambient variables the instance host process inherits. Unchanged by KTD3. */
+/** Ambient variables the instance host process inherits. */
 export const INSTANCE_HOST_ENVIRONMENT_KEYS = [
   'PATH',
   'LANG',
@@ -26,7 +26,7 @@ export const INSTANCE_HOST_ENVIRONMENT_KEYS = [
 ] as const;
 
 /**
- * Ambient variables every tool the control plane runs inherits (KTD3). Never
+ * Ambient variables every tool the control plane runs inherits. Never
  * SSH_AUTH_SOCK, GOOGLE_APPLICATION_CREDENTIALS, or any other CLOUDSDK_*,
  * CLOUDFLARE_*, ONECLI_*, ANTHROPIC_*, or GCHAT_* variable.
  */

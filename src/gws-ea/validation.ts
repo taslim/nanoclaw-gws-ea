@@ -1,13 +1,16 @@
 /**
  * The shared readers for gws-ea's state files and child-process output.
  * Readers validate the fields they need and ignore every other field, so a
- * newer or older writer's extra fields never wedge a run (R14). Ownership is
+ * newer or older writer's extra fields never wedge a run. Ownership is
  * still decided by the exact values a caller compares, never by which keys
  * happen to be present.
  */
 import path from 'node:path';
 
 import { GwsEaError } from './types.js';
+
+/** An email address: a local part, `@`, and a dotted domain, with no whitespace. */
+export const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/u;
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -56,6 +59,20 @@ export function optionalString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
 
+/** `value` when it is a timestamp exactly as `Date#toISOString` writes it (ISO-8601 UTC), else undefined. */
+export function canonicalTimestamp(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const parsed = new Date(value);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString() === value ? value : undefined;
+}
+
+/** A canonical timestamp (see `canonicalTimestamp`); anything else raises `code` with `message`. */
+export function requireCanonicalTimestamp(value: unknown, code: string, message: string): string {
+  const timestamp = canonicalTimestamp(value);
+  if (timestamp === undefined) throw new GwsEaError(code, message);
+  return timestamp;
+}
+
 /** An absolute, normalized path. */
 export function requirePath(value: unknown, label: string, code: string): string {
   const result = requireString(value, label, code);
@@ -71,7 +88,7 @@ export function unixSocketPath(endpoint: string): string | undefined {
   return socket && path.isAbsolute(socket) && !hasControlCharacters(socket) ? socket : undefined;
 }
 
-/** A recorded Docker endpoint: a local `unix://` socket (KTD3). */
+/** A recorded Docker endpoint: a local `unix://` socket. */
 export function requireDockerEndpoint(value: unknown, label: string, code: string): string {
   const endpoint = requireString(value, label, code);
   if (!unixSocketPath(endpoint)) throw new GwsEaError(code, `${label} must be a local unix:// socket`);

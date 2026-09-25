@@ -1,13 +1,12 @@
 import { runInstanceOnecliAdminCommand, validateRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
 import { runInstanceNclJson } from './ncl.js';
 import { GwsEaError } from './types.js';
-import { isRecord, parseJson, requireString, unwrapData } from './validation.js';
+import { EMAIL_PATTERN, isRecord, parseJson, requireString, unwrapData } from './validation.js';
 import { isValidTimezone } from '../timezone.js';
 
 const MAIN_TEMPLATE = 'gws-ea/main';
 const MAIN_GROUP_NAME = 'main';
 const MAIN_PLUGIN_NAME = 'gws-ea-main';
-const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/u;
 
 export interface MainIdentityInput {
   readonly assistantDisplayName: string;

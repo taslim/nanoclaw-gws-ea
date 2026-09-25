@@ -5,14 +5,14 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runCli, type CliRuntime } from './cli.js';
 import { runStep } from './events.js';
-import { acquireInstanceOperation, readProvisionJournal, recordStepCompleted, recordStepStarted } from './journal.js';
 import {
-  allocateInstanceId,
-  assertRegistryMarkerAgreement,
-  readRegistry,
+  acquireInstanceOperation,
+  readProvisionJournal,
+  recordStepCompleted,
+  recordStepStarted,
   reserveInstance,
-  writeInstanceMarker,
-} from './registry.js';
+} from './journal.js';
+import { allocateInstanceId, assertRegistryMarkerAgreement, readRegistry, writeInstanceMarker } from './registry.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { Prerequisites } from './prerequisites.js';
 import { GwsEaError, type InstanceReservationInput } from './types.js';
@@ -187,7 +187,7 @@ describe('machine registry', () => {
     const childScript = `
       import { writeFile, stat } from 'node:fs/promises';
       import { resolveControlPlanePaths } from './src/gws-ea/paths.ts';
-      import { reserveInstance } from './src/gws-ea/registry.ts';
+      import { reserveInstance } from './src/gws-ea/journal.ts';
       const input = JSON.parse(process.env.TEST_INPUT);
       const paths = resolveControlPlanePaths(JSON.parse(process.env.TEST_PATHS));
       await writeFile(process.env.TEST_READY, 'ready');

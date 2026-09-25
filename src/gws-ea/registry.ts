@@ -6,9 +6,7 @@ import { processLock } from '../community-portal/process-lock.js';
 import { isErrno } from '../community-portal/errors.js';
 import { deriveGchatServiceAccountEmail, GCP_PROJECT_PATTERN } from './gcp-identity.js';
 import { validateExistingGchatEndpoint } from './endpoint.js';
-import { createProvisionJournal, discardProvisionJournal } from './journal.js';
 import {
-  assertOwnedDestination,
   assertOwnedDirectory,
   assertPrivateDirectory,
   assertPrivateStateFile,
@@ -26,23 +24,21 @@ import {
   type InstanceMarker,
   type InstanceRegistry,
   type InstanceReservation,
-  type InstanceReservationInput,
   type SharedCloudflareMetadata,
   type SharedInfrastructureMetadata,
 } from './types.js';
-import { isRecord, parseJson, requireString as requireText } from './validation.js';
+import { EMAIL_PATTERN, isRecord, parseJson, requireString as requireText } from './validation.js';
 
 const INSTANCE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const RELEASE_TRACK_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 const ONECLI_PROJECT_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/;
-const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const CLOUDFLARE_ID_PATTERN = /^[0-9a-f]{32}$/;
 const DNS_LABEL = '[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?';
 const DNS_NAME_PATTERN = new RegExp(`^(?:${DNS_LABEL}\\.)+${DNS_LABEL}$`);
 const TUNNEL_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-/** Readers keep every ownership value exact and ignore fields they do not use (R14). */
+/** Readers keep every ownership value exact and ignore fields they do not use. */
 function requireString(value: unknown, label: string, maxLength?: number): string {
   return requireText(value, label, 'invalid_state', maxLength);
 }
@@ -387,9 +383,9 @@ async function acquireMachineLock(paths: ControlPlanePaths): Promise<() => void>
 }
 
 /**
- * Hold the machine lock for one machine-wide effect: the Cloudflare route-set
- * write, the last-assistant retirement decision, and connector repair
- * (KTD6 item 7). Everything else locks per instance.
+ * Hold the machine lock for one machine-wide effect: an instance reservation,
+ * the Cloudflare route-set write, the last-assistant retirement decision, and
+ * connector repair. Everything else locks per instance.
  */
 export async function withMachineLock<T>(paths: ControlPlanePaths, callback: () => Promise<T>): Promise<T> {
   const release = await acquireMachineLock(paths);
@@ -408,7 +404,7 @@ export interface CloudflareCoordinateUpdate {
 export interface LockedCloudflareRegistry {
   readonly registry: InstanceRegistry;
   updateCoordinates(update: CloudflareCoordinateUpdate): Promise<InstanceRegistry>;
-  /** Forget a tunnel the last managed assistant's removal retired, so the next one creates its own (R12). */
+  /** Forget a tunnel the last managed assistant's removal retired, so the next one creates its own. */
   forgetTunnel(): Promise<InstanceRegistry>;
 }
 
@@ -493,46 +489,43 @@ export async function withLockedCloudflareRegistry<T>(
   });
 }
 
+/** A validated reservation checked against the registry, ready to publish. */
+export interface StagedReservation {
+  /** Write the registry with the reservation added. */
+  publish(): Promise<void>;
+  /** Whether the registry holds the reservation; a registry that cannot be read counts as holding it. */
+  published(): Promise<boolean>;
+}
+
 /**
- * Reserve an instance's claims and start its provision journal as one
- * operation: the journal is written before the reservation is published, so a
- * reserved instance always has one.
+ * Check a validated reservation against the registry: an existing instance ID
+ * or a claim another instance holds is refused. Call it under
+ * `withMachineLock` and publish under the same lock, so nothing can claim the
+ * same resources in between.
  */
-export async function reserveInstance(
+export async function stageReservation(
   paths: ControlPlanePaths,
-  input: InstanceReservationInput,
-): Promise<InstanceReservation> {
-  const validated = validateReservation(input, paths);
-  await assertOwnedDestination(validated.checkout_realpath);
-  const release = await acquireMachineLock(paths);
-  try {
-    const registry = await readRegistryFile(paths);
-    if (registry.instances[validated.instance_id]) {
-      throw new GwsEaError('instance_exists', 'Instance ID already exists');
-    }
-    assertNoClaimCollisions([...Object.values(registry.instances), validated]);
-    const sharedInfrastructure = sharedInfrastructureForReservation(registry.shared_infrastructure_metadata, validated);
-    const next: InstanceRegistry = {
-      schema_version: REGISTRY_SCHEMA_VERSION,
-      instances: { ...registry.instances, [validated.instance_id]: validated },
-      shared_infrastructure_metadata: sharedInfrastructure,
-    };
-    await createProvisionJournal(paths, validated.instance_id);
-    try {
-      await writePrivate(paths.registryFile, next);
-    } catch (error) {
-      // Keep the journal unless the reservation certainly did not publish.
-      const published = await readRegistryFile(paths).then(
-        (current) => current.instances[validated.instance_id] !== undefined,
-        () => true,
-      );
-      if (!published) await discardProvisionJournal(paths, validated.instance_id);
-      throw error;
-    }
-    return validated;
-  } finally {
-    release();
+  reservation: InstanceReservation,
+): Promise<StagedReservation> {
+  const registry = await readRegistryFile(paths);
+  if (registry.instances[reservation.instance_id]) {
+    throw new GwsEaError('instance_exists', 'Instance ID already exists');
   }
+  assertNoClaimCollisions([...Object.values(registry.instances), reservation]);
+  const sharedInfrastructure = sharedInfrastructureForReservation(registry.shared_infrastructure_metadata, reservation);
+  const next: InstanceRegistry = {
+    schema_version: REGISTRY_SCHEMA_VERSION,
+    instances: { ...registry.instances, [reservation.instance_id]: reservation },
+    shared_infrastructure_metadata: sharedInfrastructure,
+  };
+  return {
+    publish: () => writePrivate(paths.registryFile, next),
+    published: () =>
+      readRegistryFile(paths).then(
+        (current) => current.instances[reservation.instance_id] !== undefined,
+        () => true,
+      ),
+  };
 }
 
 export async function getInstanceReservation(

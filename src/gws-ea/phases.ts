@@ -1,5 +1,5 @@
 /**
- * The step engine (KTD4). Each step owns resources it observes as present,
+ * The step engine. Each step owns resources it observes as present,
  * absent, or unknown, and the step is complete only when all are present.
  * A run checks completed runtime steps once, then advances the first
  * incomplete step onward; the journal records only when each step started and
@@ -7,7 +7,7 @@
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { PauseRequired, runStep, SignInRequired, withPendingAction, type StepReporter } from './events.js';
+import { PauseRequired, runStep, withGoogleSignIn, withPendingAction, type StepReporter } from './events.js';
 import {
   readProvisionJournal,
   recordStepCompleted,
@@ -172,16 +172,10 @@ export async function runProvisionSteps<Context>(
    * again from its observations: whatever it already changed now observes
    * present, so no change is made twice.
    */
-  const withSignIn = async (body: () => Promise<Pause>): Promise<Pause> => {
-    try {
-      return await body();
-    } catch (error) {
-      if (!(error instanceof SignInRequired) || !runtime.signIn) throw error;
-      activeStep()?.write(`${error.message}; signing in, then running the step again\n`);
-      await runtime.signIn();
-      return body();
-    }
-  };
+  const withSignIn = (body: () => Promise<Pause>): Promise<Pause> =>
+    withGoogleSignIn(body, runtime.signIn, (refusal) =>
+      activeStep()?.write(`${refusal.message}; signing in, then running the step again\n`),
+    );
 
   /** Run a step's body as a logged step, recording any failure in the journal. */
   const stepRun = (id: ProvisionStepId, label: string, body: () => Promise<Pause>): Promise<Pause> =>

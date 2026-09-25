@@ -18,7 +18,11 @@ import {
 } from './process.js';
 import { activeStep } from './run-log.js';
 import { readOwnerOnlyFile, readOwnerOnlyJson, writePrivateTextFile } from './secrets.js';
-import { createInstanceServiceCoordinates, type InstanceServicePlatform } from './service-coordinates.js';
+import {
+  createInstanceServiceCoordinates,
+  instanceServicePlatform,
+  type InstanceServicePlatform,
+} from './service-coordinates.js';
 import { validateExistingGchatEndpoint } from './endpoint.js';
 import { deriveWorkspaceAddOnIdentity, parseGcpProjectNumber } from './gcp-identity.js';
 import { assertInstanceId } from './registry.js';
@@ -39,7 +43,7 @@ export interface InstanceSecretFiles {
 
 /**
  * What `runtime.json` stores: the values nothing else determines, plus the
- * local Docker endpoint create resolved (KTD3). Everything derivable from
+ * local Docker endpoint create resolved. Everything derivable from
  * them is recomputed on every read, so it can never disagree with them.
  */
 export interface PersistedInstanceRuntime {
@@ -459,7 +463,7 @@ function notLoaded(error: unknown): boolean {
 }
 
 /**
- * Lingering keeps a user's services running after logout (R10). Enabling it
+ * Lingering keeps a user's services running after logout. Enabling it
  * for oneself needs no password where polkit allows it, so it is enabled
  * here, once; where it is refused, the operator gets the one command to run.
  */
@@ -487,7 +491,7 @@ async function ensureLingering(
  * Write the service definition and (re)start it. launchd reloads a changed
  * definition only through `bootout` then `bootstrap`; `kickstart` without
  * `-k` then demand-starts a job launchd left pended, without restarting a
- * running one. systemd user services need lingering to survive logout (R10).
+ * running one. systemd user services need lingering to survive logout.
  */
 export async function reconcileInstanceService(
   configInput: InstanceRuntimeConfig,
@@ -570,7 +574,7 @@ export function buildInstanceCliCommand(
 ): SanitizedCommand {
   const config = validateRuntimeConfig(configInput);
   const layout = createInstanceServiceLayout(config, {
-    platform: process.platform === 'darwin' ? 'macos' : 'linux',
+    platform: instanceServicePlatform(),
     homeDirectory: config.home_directory,
   });
   return {
@@ -643,7 +647,7 @@ export async function launchInstanceHost(
     throw new GwsEaError('unsafe_runtime', 'The instance checkout is not the persisted physical path');
   }
   const layout = createInstanceServiceLayout(config, {
-    platform: process.platform === 'darwin' ? 'macos' : 'linux',
+    platform: instanceServicePlatform(),
     homeDirectory: config.home_directory,
   });
   await Promise.all([assertExecutable(config.node_path), assertRegularFile(layout.hostEntrypoint)]);

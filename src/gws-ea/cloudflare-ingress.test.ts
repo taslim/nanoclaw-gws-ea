@@ -18,7 +18,7 @@ import {
   type ManagedTransport,
 } from './cloudflare-ingress.js';
 import type { RunEvent } from './events.js';
-import { withInstanceOperation } from './journal.js';
+import { reserveInstance, withInstanceOperation } from './journal.js';
 import { preparePrivateDirectory, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import {
   OBSERVATION_WAITS_SECONDS,
@@ -29,7 +29,7 @@ import {
 } from './phases.js';
 import { CLOUDFLARED_IMAGE } from './pins.js';
 import type { SanitizedCommand } from './process.js';
-import { allocateInstanceId, readRegistry, reserveInstance } from './registry.js';
+import { allocateInstanceId, readRegistry } from './registry.js';
 import { GwsEaError, PROVISION_STEPS, type InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];

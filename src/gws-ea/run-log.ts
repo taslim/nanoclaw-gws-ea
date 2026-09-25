@@ -24,7 +24,7 @@ import { performance } from 'node:perf_hooks';
 import { isErrno } from '../community-portal/errors.js';
 import { PauseRequired } from './events.js';
 import { CONTROL_PLANE_ROOT, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
-import { envKeyNames, redact, registerSecretDirectory } from './redact.js';
+import { envKeyNames, redact, registerSecretDirectory, safeErrorCode } from './redact.js';
 import { assertInstanceId } from './registry.js';
 import { GwsEaError } from './types.js';
 
@@ -124,10 +124,6 @@ function slug(value: string): string {
       .replace(/^-+|-+$/gu, '')
       .slice(0, 80) || 'step'
   );
-}
-
-function errorCode(error: unknown): string {
-  return error instanceof GwsEaError ? error.code : 'unexpected';
 }
 
 function errorMessage(error: unknown): string {
@@ -260,7 +256,9 @@ class Run implements RunLog {
       this.append([
         `=== [${startedAt}] ${name} [${formatDuration(performance.now() - started)}] → ${status} ===`,
         ...facts.map(([key, value]) => `  ${key}: ${value}`),
-        ...(status === 'failed' ? [`  error: ${errorCode(error)}`, `  message: ${field(errorMessage(error))}`] : []),
+        ...(status === 'failed'
+          ? [`  error: ${safeErrorCode(error)}`, `  message: ${field(errorMessage(error))}`]
+          : []),
         `  raw: ${relativeRawLog}`,
         '',
       ]);
@@ -315,7 +313,9 @@ class Run implements RunLog {
 
   abort(error: unknown): void {
     const step = typeof error === 'object' && error !== null ? this.#failures.get(error) : undefined;
-    this.append([`## ${this.#now().toISOString()} · aborted${step ? ` at ${step}` : ''} (err=${errorCode(error)})`]);
+    this.append([
+      `## ${this.#now().toISOString()} · aborted${step ? ` at ${step}` : ''} (err=${safeErrorCode(error)})`,
+    ]);
   }
 
   #stage(label: string, capture: Readonly<Record<string, unknown>>): void {

@@ -7,10 +7,8 @@ import { isErrno } from '../community-portal/errors.js';
 import { principalWelcomeEventId, type PrincipalCandidate } from './principal.js';
 import { redact } from './redact.js';
 import type { InstanceRuntimeConfig } from './service.js';
-import { GwsEaError } from './types.js';
-import { hasControlCharacters } from './validation.js';
-
-const CHANNEL_TYPE = 'gchat';
+import { GCHAT_CHANNEL_TYPE, GwsEaError } from './types.js';
+import { hasControlCharacters, requireCanonicalTimestamp } from './validation.js';
 
 /** How much of the error log's end is read, and how many of its lines are shown. */
 const ERROR_LOG_TAIL_BYTES = 64 * 1024;
@@ -101,12 +99,8 @@ export type PrincipalBindingVerificationResult =
       readonly welcomeEventId: string;
     };
 
-function canonicalTimestamp(value: string, label: string): string {
-  const parsed = new Date(value);
-  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString() !== value) {
-    throw new GwsEaError('invalid_verification_input', `${label} is not a canonical timestamp`);
-  }
-  return value;
+function timestamp(value: string, label: string): string {
+  return requireCanonicalTimestamp(value, 'invalid_verification_input', `${label} is not a canonical timestamp`);
 }
 
 function safeIdentifier(value: string, label: string): string {
@@ -149,7 +143,7 @@ function openReadonly(file: string): Database.Database {
  */
 export function verifyPrincipalBinding(input: PrincipalBindingVerificationInput): PrincipalBindingVerificationResult {
   const adapterInstance = safeIdentifier(input.adapterInstance, 'adapter instance');
-  const provisioningStartedAt = canonicalTimestamp(input.provisioningStartedAt, 'provisioning timestamp');
+  const provisioningStartedAt = timestamp(input.provisioningStartedAt, 'provisioning timestamp');
   const candidate = input.selectedCandidate;
   if (!candidate || candidate.authenticatedMessageAt < provisioningStartedAt) return { status: 'absent' };
   const selectedMessagingGroupId = input.selectedMessagingGroupId;
@@ -195,8 +189,8 @@ export function verifyPrincipalBinding(input: PrincipalBindingVerificationInput)
       )
       .all(
         candidate.userId,
-        CHANNEL_TYPE,
-        CHANNEL_TYPE,
+        GCHAT_CHANNEL_TYPE,
+        GCHAT_CHANNEL_TYPE,
         adapterInstance,
         candidate.messagingGroupId,
         candidate.platformId,
@@ -224,7 +218,7 @@ export function verifyPrincipalBinding(input: PrincipalBindingVerificationInput)
       .get(
         `${welcomeEventId}:${row.main_agent_group_id}`,
         candidate.authenticatedMessageAt,
-        CHANNEL_TYPE,
+        GCHAT_CHANNEL_TYPE,
         row.platform_id,
       );
     if (!welcome) return { status: 'absent' };
@@ -248,7 +242,7 @@ function exactDeliveredReply(
           AND kind NOT IN ('system', 'task_log')
         ORDER BY timestamp, id`,
     )
-    .iterate(inReplyTo, CHANNEL_TYPE, platformId) as IterableIterator<OutboundRow>;
+    .iterate(inReplyTo, GCHAT_CHANNEL_TYPE, platformId) as IterableIterator<OutboundRow>;
   for (const output of outputs) {
     const delivery = inbound
       .prepare(
@@ -272,8 +266,8 @@ function isAuthenticatedPrincipalChatSdkMessage(content: string, principalUserId
   }
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
   const message = value as Record<string, unknown>;
-  const rawPrincipalId = principalUserId.startsWith(`${CHANNEL_TYPE}:`)
-    ? principalUserId.slice(`${CHANNEL_TYPE}:`.length)
+  const rawPrincipalId = principalUserId.startsWith(`${GCHAT_CHANNEL_TYPE}:`)
+    ? principalUserId.slice(`${GCHAT_CHANNEL_TYPE}:`.length)
     : principalUserId;
   const author =
     message.author !== null && typeof message.author === 'object' && !Array.isArray(message.author)
@@ -293,7 +287,7 @@ export function verifyTalkableConversation(input: ConversationVerificationInput)
   const messagingGroupId = safeIdentifier(input.messagingGroupId, 'messaging group ID');
   const principalUserId = safeIdentifier(input.principalUserId, 'principal user ID');
   const adapterInstance = safeIdentifier(input.adapterInstance, 'adapter instance');
-  const boundAt = canonicalTimestamp(input.boundAt, 'binding timestamp');
+  const boundAt = timestamp(input.boundAt, 'binding timestamp');
   const welcomeEventId = safeIdentifier(input.welcomeEventId, 'welcome event ID');
   const central = openReadonly(path.join(checkoutRoot, 'data', 'v2.db'));
 
@@ -320,9 +314,14 @@ export function verifyTalkableConversation(input: ConversationVerificationInput)
             AND mga.sender_scope = 'known'
             AND mga.session_mode = 'agent-shared'`,
       )
-      .get(principalUserId, CHANNEL_TYPE, mainAgentGroupId, messagingGroupId, CHANNEL_TYPE, adapterInstance) as
-      | BindingRow
-      | undefined;
+      .get(
+        principalUserId,
+        GCHAT_CHANNEL_TYPE,
+        mainAgentGroupId,
+        messagingGroupId,
+        GCHAT_CHANNEL_TYPE,
+        adapterInstance,
+      ) as BindingRow | undefined;
     if (!binding || binding.verified_at > boundAt) return { ready: false, reason: 'binding_not_ready' };
     platformId = binding.platform_id;
 
@@ -346,7 +345,7 @@ export function verifyTalkableConversation(input: ConversationVerificationInput)
           WHERE id = ? AND timestamp >= ? AND channel_type = ? AND platform_id = ?
             AND kind IN ('chat', 'chat-sdk') AND trigger = 1`,
       )
-      .get(welcomeInboundId, boundAt, CHANNEL_TYPE, platformId) as InboundRow | undefined;
+      .get(welcomeInboundId, boundAt, GCHAT_CHANNEL_TYPE, platformId) as InboundRow | undefined;
     if (!welcome) return { ready: false, reason: 'welcome_not_delivered' };
     const welcomeReply = exactDeliveredReply(inbound, outbound, welcome.id, platformId);
     if (!welcomeReply) return { ready: false, reason: 'welcome_not_delivered' };
@@ -362,7 +361,7 @@ export function verifyTalkableConversation(input: ConversationVerificationInput)
       .iterate(
         welcome.id,
         welcomeReply.delivery.delivered_at,
-        CHANNEL_TYPE,
+        GCHAT_CHANNEL_TYPE,
         platformId,
       ) as IterableIterator<InboundRow>;
     let foundPrincipalMessage = false;
@@ -418,7 +417,7 @@ function printableLogLine(line: string): string {
  */
 export async function instanceErrorsSince(checkoutRoot: string, since: string): Promise<InstanceErrorLog> {
   const file = path.join(path.resolve(checkoutRoot), 'logs', 'nanoclaw.error.log');
-  const sinceMs = new Date(canonicalTimestamp(since, 'error log start')).getTime();
+  const sinceMs = new Date(timestamp(since, 'error log start')).getTime();
   let handle: Awaited<ReturnType<typeof open>>;
   try {
     handle = await open(file, 'r');

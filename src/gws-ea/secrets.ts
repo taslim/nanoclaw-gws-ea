@@ -10,17 +10,30 @@ import { parseJson } from './validation.js';
 
 const MAX_PRIVATE_FILE_BYTES = 1024 * 1024;
 
-function assertOwnerOnlyStat(info: Awaited<ReturnType<Awaited<ReturnType<typeof open>>['stat']>>, file: string): void {
-  if (!info.isFile()) throw new GwsEaError('unsafe_secret', `Owner-only state must be a regular file: ${file}`);
-  if (typeof process.getuid === 'function' && Number(info.uid) !== process.getuid()) {
-    throw new GwsEaError('unsafe_owner', `Owner-only state must be owned by the current user: ${file}`);
-  }
-  if (!isOwnerOnlyMode(Number(info.mode))) {
-    throw new GwsEaError('unsafe_mode', `Owner-only state must be readable only by its owner (0600): ${file}`);
-  }
-  if (Number(info.size) > MAX_PRIVATE_FILE_BYTES) {
-    throw new GwsEaError('unsafe_secret', `Owner-only state exceeds its size limit: ${file}`);
-  }
+/** Each owner-only rule's refusal: its code and what it says before the file's path. */
+type OwnerOnlyRefusals = Readonly<Record<'file' | 'owner' | 'mode' | 'size', readonly [code: string, message: string]>>;
+
+const OWNER_ONLY_STATE: OwnerOnlyRefusals = {
+  file: ['unsafe_secret', 'Owner-only state must be a regular file'],
+  owner: ['unsafe_owner', 'Owner-only state must be owned by the current user'],
+  mode: ['unsafe_mode', 'Owner-only state must be readable only by its owner (0600)'],
+  size: ['unsafe_secret', 'Owner-only state exceeds its size limit'],
+};
+
+/** A regular file, owned by the current user, with no group or other permission bits, within the size limit. */
+function assertOwnerOnlyStat(
+  info: Awaited<ReturnType<Awaited<ReturnType<typeof open>>['stat']>>,
+  file: string,
+  refusals: OwnerOnlyRefusals = OWNER_ONLY_STATE,
+): void {
+  const refuse = (rule: keyof OwnerOnlyRefusals): GwsEaError => {
+    const [code, message] = refusals[rule];
+    return new GwsEaError(code, `${message}: ${file}`);
+  };
+  if (!info.isFile()) throw refuse('file');
+  if (typeof process.getuid === 'function' && Number(info.uid) !== process.getuid()) throw refuse('owner');
+  if (!isOwnerOnlyMode(Number(info.mode))) throw refuse('mode');
+  if (Number(info.size) > MAX_PRIVATE_FILE_BYTES) throw refuse('size');
 }
 
 export async function readOwnerOnlyFile(file: string): Promise<string> {
@@ -73,15 +86,12 @@ export async function readOperatorFile(file: string, root: string, label: string
     throw error;
   }
   try {
-    const info = await handle.stat();
-    if (!info.isFile()) throw new GwsEaError(code, `${label} must be a regular file: ${absolute}`);
-    if (typeof process.getuid === 'function' && info.uid !== process.getuid()) {
-      throw new GwsEaError(code, `${label} must be owned by the current user: ${absolute}`);
-    }
-    if (!isOwnerOnlyMode(info.mode)) {
-      throw new GwsEaError(code, `${label} must be readable only by its owner (chmod 0600): ${absolute}`);
-    }
-    if (info.size > MAX_PRIVATE_FILE_BYTES) throw new GwsEaError(code, `${label} is too large: ${absolute}`);
+    assertOwnerOnlyStat(await handle.stat(), absolute, {
+      file: [code, `${label} must be a regular file`],
+      owner: [code, `${label} must be owned by the current user`],
+      mode: [code, `${label} must be readable only by its owner (chmod 0600)`],
+      size: [code, `${label} is too large`],
+    });
     return await handle.readFile('utf8');
   } finally {
     await handle.close();

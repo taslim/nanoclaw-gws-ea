@@ -1,5 +1,5 @@
 /**
- * The machine's one shared cloudflared connector (KTD6). Ownership is the
+ * The machine's one shared cloudflared connector. Ownership is the
  * Compose project plus the owner label, checked exactly. Any other difference
  * from the rendered service (image, environment, token, user, security,
  * network, mounts) is drift, repaired by force-recreating the connector from
@@ -99,7 +99,7 @@ export interface ObservedCloudflareConnector {
 export interface CloudflareConnectorDependencies {
   readonly runCommand?: SanitizedCommandRunner;
   readonly ambientEnv?: NodeJS.ProcessEnv;
-  /** The Docker endpoint the assistant recorded (KTD3); without one, Docker's active context. */
+  /** The Docker endpoint the assistant recorded; without one, Docker's active context. */
   readonly dockerEndpoint?: string;
 }
 

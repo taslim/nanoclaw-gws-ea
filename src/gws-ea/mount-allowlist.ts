@@ -1,5 +1,5 @@
 /**
- * The shared NanoClaw mount allowlist (KTD9). It is NanoClaw's documented
+ * The shared NanoClaw mount allowlist. It is NanoClaw's documented
  * configuration file, `~/.config/nanoclaw/mount-allowlist.json`: every
  * assistant's host reads it before mounting an extra directory into an agent.
  *

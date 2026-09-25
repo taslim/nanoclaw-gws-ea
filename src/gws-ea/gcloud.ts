@@ -1,5 +1,5 @@
 /**
- * Google Cloud through gcloud (KTD5). `provision_gcp` observes its resources
+ * Google Cloud through gcloud. `provision_gcp` observes its resources
  * with reads whose failures are classified, never guessed: an expired sign-in
  * signs in again, and anything a read cannot decide is unknown and changes
  * nothing, except creating the project under the instance's own random ID.
@@ -62,7 +62,7 @@ const ACCOUNT_PATTERN = /^[^\s@]+@[^\s@]+$/u;
 const CONSUMER_GOOGLE_DOMAINS = new Set(['gmail.com', 'googlemail.com']);
 
 /**
- * What a failed gcloud command means (KTD5). Only messages Google documents
+ * What a failed gcloud command means. Only messages Google documents
  * are recognized; anything unfamiliar is `anything-else`.
  * - `auth-required`: the operator must sign in again.
  * - `permission-or-missing`: Google will not say whether the resource exists.
@@ -237,7 +237,7 @@ function alreadyExists({ outcome }: Ran): boolean {
   return ALREADY_EXISTS.some((pattern) => pattern.test(outcome.stderr));
 }
 
-/** A command Google Cloud refused: the step stops with the failed command as evidence (R1). */
+/** A command Google Cloud refused: the step stops with the failed command as evidence. */
 function gcloudFailed(message: string, { command, outcome }: Ran): GwsEaError {
   const failure = commandExitError(command, outcome);
   return new GwsEaError('gcloud_failed', message, {
@@ -253,7 +253,7 @@ function evidence({ command, outcome }: Ran): string {
   return typeof tail === 'string' && tail ? `${failure.message}\n${tail}` : failure.message;
 }
 
-/** A read that did not decide (KTD5): unknown, with the failed command as evidence. */
+/** A read that did not decide: unknown, with the failed command as evidence. */
 function unknownRead(what: string, failed: Ran): Observation {
   return {
     status: 'unknown',
@@ -626,7 +626,7 @@ async function deleteUserManagedKeys(gcloud: Gcloud, gcp: GcpProjectInput): Prom
 }
 
 /**
- * Keys converge by replacement (KTD5). A key staged before an interruption is
+ * Keys converge by replacement. A key staged before an interruption is
  * published without creating another; otherwise this assistant's keys are
  * deleted and a new one is created to the staging file, validated, and
  * published atomically.
@@ -654,7 +654,7 @@ async function replaceKey(context: GcpStepContext, dependencies: GcloudDependenc
 }
 
 /**
- * `provision_gcp`'s resources, in order (KTD4, KTD5). A policy lift left by an
+ * `provision_gcp`'s resources, in order. A policy lift left by an
  * interrupted run is restored before anything else; the project is the one
  * resource created on an unknown observation, under the instance's own ID.
  */
@@ -771,7 +771,7 @@ export function googleCloudResources(dependencies: GcloudDependencies = {}): rea
 }
 
 /**
- * Removal's restore of a key-creation policy `provision_gcp` lifted (KTD5).
+ * Removal's restore of a key-creation policy `provision_gcp` lifted.
  * Returns what Google refused as evidence, for the receipt to record as an
  * unrestored lift, rather than pausing the way `provision_gcp` does.
  */
@@ -794,7 +794,7 @@ export type GcpProjectRemoval =
   | { readonly status: 'unknown'; readonly reason: string; readonly evidence: string };
 
 /**
- * Delete the owned project (KTD5). It is deleted only once it is described
+ * Delete the owned project. It is deleted only once it is described
  * with this assistant's labels, after any lifted key-creation policy is
  * restored; a restore Google refuses is reported, not a reason to keep the
  * project. A project Google will not describe is unknown, with evidence:

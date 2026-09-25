@@ -13,10 +13,11 @@ import {
   recordStepCompleted,
   recordStepFailure,
   recordStepStarted,
+  reserveInstance,
   withInstanceOperation,
 } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
-import { allocateInstanceId, reserveInstance } from './registry.js';
+import { allocateInstanceId } from './registry.js';
 import { GwsEaError, type InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
