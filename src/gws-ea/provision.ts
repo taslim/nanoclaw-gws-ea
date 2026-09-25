@@ -1241,6 +1241,63 @@ function hydrateMainState(profile: PersistedProfileIdentity | undefined): Produc
   return { mainAgentGroupId: profile.main_agent_group_id };
 }
 
+/**
+ * What provisioning reads from the bootstrap manifest until main is
+ * published, and from the release receipt and main's profile after.
+ */
+interface ProvisionSource {
+  readonly providerCredentialMetadata: ProviderCredentialMetadata;
+  readonly providerCapabilityDigest: string;
+  readonly identity: MainIdentityInput;
+  /** The messaging group create's bootstrap input selected, if any. */
+  readonly bootstrapMessagingGroupId: string | null;
+  /** Main's published profile, once there is one. */
+  readonly profile: PersistedProfileIdentity | undefined;
+}
+
+async function resolveProvisionSource(
+  operation: InstanceOperation,
+  reservation: InstanceReservation,
+  runtime: InstanceRuntimeConfig,
+  manifest: ProductionBootstrapManifest | undefined,
+): Promise<ProvisionSource> {
+  if (manifest) {
+    return {
+      providerCredentialMetadata: bootstrapProviderCredential(manifest),
+      providerCapabilityDigest: manifest.provider_capability_digest,
+      profile: readPersistedProfile(runtime),
+      identity: {
+        assistantDisplayName: manifest.identity.assistant_display_name,
+        assistantWorkspaceEmail: reservation.exclusive_resource_claims.workspace_email,
+        principalDisplayName: manifest.identity.principal_display_name,
+        principalTimezone: manifest.identity.principal_timezone,
+      },
+      bootstrapMessagingGroupId: manifest.selected_messaging_group_id,
+    };
+  }
+  const preflight = await loadReleasePreflightReceipt(operation.paths.releasePreflightFile(operation.instanceId), {
+    instanceId: operation.instanceId,
+    deployedCommit: reservation.deployed_commit,
+    provider: runtime.selected_provider,
+  });
+  const profile = readPersistedProfile(runtime);
+  if (!profile) {
+    throw new GwsEaError('bootstrap_required', 'The temporary bootstrap manifest is required until main is published');
+  }
+  return {
+    providerCredentialMetadata: preflight.providerCredential,
+    providerCapabilityDigest: preflight.providerCapabilityDigest,
+    profile,
+    identity: {
+      assistantDisplayName: profile.assistant_display_name,
+      assistantWorkspaceEmail: profile.assistant_workspace_email,
+      principalDisplayName: profile.principal_display_name,
+      principalTimezone: profile.principal_timezone,
+    },
+    bootstrapMessagingGroupId: null,
+  };
+}
+
 interface InstanceState {
   /** The temporary bootstrap input, until main is published. */
   readonly manifest?: ProductionBootstrapManifest;
@@ -1321,37 +1378,11 @@ export async function runProductionProvision(
       dockerEndpoint: manifest.docker_endpoint,
     });
   }
-  const persistedPreflight = manifest
-    ? undefined
-    : await loadReleasePreflightReceipt(operation.paths.releasePreflightFile(operation.instanceId), {
-        instanceId: operation.instanceId,
-        deployedCommit: reservation.deployed_commit,
-        provider: runtime.selected_provider,
-      });
-  const providerCredentialMetadata = manifest
-    ? bootstrapProviderCredential(manifest)
-    : persistedPreflight!.providerCredential;
-  const providerCapabilityDigest = manifest
-    ? manifest.provider_capability_digest
-    : persistedPreflight!.providerCapabilityDigest;
-  const profile = readPersistedProfile(runtime);
-  if (!manifest && !profile) {
-    throw new GwsEaError('bootstrap_required', 'The temporary bootstrap manifest is required until main is published');
-  }
-  const identity = manifest
-    ? {
-        assistantDisplayName: manifest.identity.assistant_display_name,
-        assistantWorkspaceEmail: reservation.exclusive_resource_claims.workspace_email,
-        principalDisplayName: manifest.identity.principal_display_name,
-        principalTimezone: manifest.identity.principal_timezone,
-      }
-    : {
-        assistantDisplayName: profile!.assistant_display_name,
-        assistantWorkspaceEmail: profile!.assistant_workspace_email,
-        principalDisplayName: profile!.principal_display_name,
-        principalTimezone: profile!.principal_timezone,
-      };
-  const state = hydrateMainState(profile);
+  const source = await resolveProvisionSource(operation, reservation, runtime, manifest);
+  const state = hydrateMainState(source.profile);
+  // The fixed principal's conversation wins, then this run's selection, then create's.
+  const messagingGroupId =
+    selectedPrincipal?.messagingGroupId ?? selectedMessagingGroupId ?? source.bootstrapMessagingGroupId;
   const context: ProductionProvisionContext = {
     operation,
     state,
@@ -1364,8 +1395,8 @@ export async function runProductionProvision(
       releasePreflight: {
         checkoutRoot: reservation.checkout_realpath,
         provider: runtime.selected_provider,
-        providerCapabilityDigest,
-        providerCredential: providerCredentialMetadata,
+        providerCapabilityDigest: source.providerCapabilityDigest,
+        providerCredential: source.providerCredentialMetadata,
         onecliCliPath: runtime.onecli_cli_path,
       },
       onecli,
@@ -1378,26 +1409,21 @@ export async function runProductionProvision(
         credentialFile: runtime.secret_files.gchat_credentials,
         cwd: reservation.checkout_realpath,
       },
-      providerCredentialMetadata,
+      providerCredentialMetadata: source.providerCredentialMetadata,
       ...(manifest && interaction
         ? {
             requestProviderCredential: () =>
               interaction.requestProviderCredential({
                 providerId: manifest.provider.id,
-                metadata: providerCredentialMetadata,
+                metadata: source.providerCredentialMetadata,
               }),
           }
         : {}),
-      identity,
+      identity: source.identity,
       adapterInstance: 'gchat',
       provisioningStartedAt,
       chatConfigured: journal.decisions.chat_configuration_confirmed_at !== undefined,
-      ...((selectedPrincipal?.messagingGroupId ?? selectedMessagingGroupId ?? manifest?.selected_messaging_group_id)
-        ? {
-            selectedMessagingGroupId:
-              selectedPrincipal?.messagingGroupId ?? selectedMessagingGroupId ?? manifest!.selected_messaging_group_id!,
-          }
-        : {}),
+      ...(messagingGroupId ? { selectedMessagingGroupId: messagingGroupId } : {}),
       ...(selectedPrincipal ? { selectedPrincipal } : {}),
       bootstrapManifestFile: operation.paths.bootstrapFile(operation.instanceId),
       serviceDependencies: {

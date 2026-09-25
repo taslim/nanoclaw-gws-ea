@@ -20,6 +20,7 @@ import {
   type CloudflareTunnel,
 } from './cloudflare-api.js';
 import {
+  connectorNetworking,
   createCloudflareConnectorLayout,
   hasConnectorToken,
   observeCloudflareConnector,
@@ -28,6 +29,7 @@ import {
   type CloudflareConnectorDependencies,
   type CloudflareConnectorLayout,
   type CloudflareConnectorPlatform,
+  type CloudflareOriginHost,
 } from './cloudflare-connector.js';
 import { observeManagedGchatRoute } from './endpoint.js';
 import type { ControlPlanePaths } from './paths.js';
@@ -48,8 +50,6 @@ const CATCH_ALL_SERVICE = 'http_status:404';
 const CHANGE_ATTEMPTS = 3;
 
 type Sleep = (milliseconds: number) => Promise<void>;
-
-export type CloudflareOriginHost = '127.0.0.1' | 'host.docker.internal';
 
 export interface ManagedCloudflareIngressRule {
   readonly hostname: string;
@@ -72,10 +72,6 @@ export interface ManagedCloudflareReconcileResult {
 
 export function cloudflareDnsOwnershipComment(instanceId: string): string {
   return `gws-ea managed ingress ${instanceId}`;
-}
-
-function originHostFor(platform: CloudflareConnectorPlatform): CloudflareOriginHost {
-  return platform === 'macos' ? 'host.docker.internal' : '127.0.0.1';
 }
 
 function managedClaim(instance: InstanceReservation): ManagedCloudflareIngressClaim {
@@ -505,7 +501,7 @@ export function managedTransportResources(
     );
     const result = await reconcileManagedCloudflareIngress(paths, api, {
       instanceId,
-      originHost: originHostFor(transport.platform),
+      originHost: connectorNetworking(layout.platform).originHost,
       connector: layout,
     });
     await awaitConnectorConfiguration(api, claim.account_id, result, sleep);

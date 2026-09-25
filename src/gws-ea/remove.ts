@@ -25,9 +25,11 @@ import {
   type CloudflareTunnel,
 } from './cloudflare-api.js';
 import {
+  connectorNetworking,
   createCloudflareConnectorLayout,
   stopCloudflareConnector,
   type CloudflareConnectorLayout,
+  type CloudflareOriginHost,
 } from './cloudflare-connector.js';
 import {
   assertManagedCloudflareConfigurationOwnership,
@@ -36,7 +38,6 @@ import {
   GCHAT_TUNNEL_PATH,
   renderManagedCloudflareConfiguration,
   replaceManagedCloudflareConfiguration,
-  type CloudflareOriginHost,
 } from './cloudflare-ingress.js';
 import {
   PauseRequired,
@@ -807,7 +808,7 @@ async function removeLocked(
         claim,
         api: await cloudflare(),
         ownTransport: provisioning.started('establish_transport'),
-        originHost: dependencies.originHost ?? (platform === 'macos' ? 'host.docker.internal' : '127.0.0.1'),
+        originHost: dependencies.originHost ?? connectorNetworking(connector.platform).originHost,
         connector,
         stopConnector: async () =>
           dependencies.stopCloudflareConnector

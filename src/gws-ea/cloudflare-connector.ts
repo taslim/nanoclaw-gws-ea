@@ -46,6 +46,32 @@ export const CLOUDFLARE_CONNECTOR_TOKEN_LABEL = 'dev.gws-ea.connector-token-sha2
 
 export type CloudflareConnectorPlatform = 'macos' | 'linux';
 
+/** The host each tunnel route targets: the machine's loopback, as the connector reaches it. */
+export type CloudflareOriginHost = '127.0.0.1' | 'host.docker.internal';
+
+export interface CloudflareConnectorNetworking {
+  readonly networkMode: 'host' | 'bridge';
+  readonly extraHosts: readonly string[];
+  readonly originHost: CloudflareOriginHost;
+}
+
+/**
+ * How the connector reaches the assistants' loopback webhooks. On Linux it
+ * shares the host's network, so loopback is the host's; on macOS Docker runs
+ * it on a bridge that reaches the host through the host-gateway alias. The
+ * rendered service, its drift check, and the tunnel's route origins all read
+ * this one decision.
+ */
+export function connectorNetworking(platform: CloudflareConnectorPlatform): CloudflareConnectorNetworking {
+  return platform === 'linux'
+    ? { networkMode: 'host', extraHosts: [], originHost: '127.0.0.1' }
+    : {
+        networkMode: 'bridge',
+        extraHosts: ['host.docker.internal:host-gateway'],
+        originHost: 'host.docker.internal',
+      };
+}
+
 export interface CloudflareConnectorLayout {
   readonly platform: CloudflareConnectorPlatform;
   readonly project: typeof CONNECTOR_PROJECT;
@@ -144,6 +170,7 @@ export function renderCloudflareConnectorCompose(
   layout: CloudflareConnectorLayout,
   connectorTokenDigest: string,
 ): string {
+  const networking = connectorNetworking(layout.platform);
   const service: Record<string, unknown> = {
     image: CLOUDFLARED_IMAGE,
     restart: 'unless-stopped',
@@ -155,7 +182,7 @@ export function renderCloudflareConnectorCompose(
     cap_drop: ['ALL'],
     security_opt: ['no-new-privileges:true'],
     tmpfs: [CONNECTOR_TMPFS],
-    network_mode: layout.platform === 'linux' ? 'host' : 'bridge',
+    network_mode: networking.networkMode,
     secrets: ['tunnel_token'],
     labels: {
       [CLOUDFLARE_CONNECTOR_OWNER_LABEL]: CONNECTOR_OWNER,
@@ -163,7 +190,7 @@ export function renderCloudflareConnectorCompose(
       [CLOUDFLARE_CONNECTOR_TOKEN_LABEL]: connectorTokenDigest,
     },
   };
-  if (layout.platform === 'macos') service.extra_hosts = ['host.docker.internal:host-gateway'];
+  if (networking.extraHosts.length > 0) service.extra_hosts = [...networking.extraHosts];
   return stringify(
     {
       services: { [CONNECTOR_SERVICE]: service },
@@ -307,9 +334,8 @@ function connectorDrift(
   ) {
     return 'security settings differ';
   }
-  const network = layout.platform === 'linux' ? 'host' : 'bridge';
-  const extraHosts = layout.platform === 'macos' ? ['host.docker.internal:host-gateway'] : [];
-  if (observed.networkMode !== network || !sameSet(observed.extraHosts, extraHosts)) {
+  const networking = connectorNetworking(layout.platform);
+  if (observed.networkMode !== networking.networkMode || !sameSet(observed.extraHosts, networking.extraHosts)) {
     return 'network settings differ';
   }
   const [mount] = observed.mounts;
