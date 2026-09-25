@@ -1,4 +1,5 @@
 import { isErrno } from '../community-portal/errors.js';
+import type { Prerequisites } from './prerequisites.js';
 import type { ProductionBootstrapManifest } from './provision.js';
 import { registerSecret } from './redact.js';
 import { readOperatorFile } from './secrets.js';
@@ -115,6 +116,8 @@ export interface CreatePromptContext {
   readonly track: string;
   /** The resolved release source; create never asks for a repository. */
   readonly sourceRemote: string;
+  /** The checked host and confirmed Google account this assistant is created on. */
+  readonly prerequisites: Prerequisites;
   readonly provided: Readonly<Partial<Record<CreateInputFlag, string>>>;
   readonly secrets: SecretSource;
   readonly managedIngressSetup?: ManagedIngressSetupSession;

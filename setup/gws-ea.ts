@@ -14,7 +14,7 @@ import type { InteractivePrompts } from '../src/gws-ea/events.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
 import { offerDiagnosis } from './gws-ea-assist.js';
 import { authenticateGwsEaProvider, CLOUDFLARE_API_TOKEN_GUIDANCE, collectGwsEaCreateInput } from './gws-ea-input.js';
-import { ensureGcloudReady, signInToGoogleCloud } from './gws-ea-prerequisites.js';
+import { confirmGoogleAccount, ensurePrerequisites, signInToGoogleCloud } from './gws-ea-prerequisites.js';
 import { dumpTranscriptOnFailure } from './lib/runner.js';
 import { fitToWidth, fmtDuration } from './lib/theme.js';
 import { listSetupProviders, type SetupProviderEntry } from './providers/registry.js';
@@ -139,6 +139,7 @@ function terminalPrompts(providers: readonly SetupProviderEntry[]): InteractiveP
       return answer.trim();
     },
     googleCloudSignIn: (account) => signInToGoogleCloud(account),
+    googleAccount: (account) => confirmGoogleAccount(account),
   };
 }
 
@@ -162,8 +163,7 @@ export async function main(argv: readonly string[], options: { readonly interact
     presenter: createTerminalPresenter(),
     prompts: terminalPrompts(providers),
     collectCreateInputs,
-    preflightGcloud: (account, interaction) =>
-      interaction.withTerminal(() => ensureGcloudReady(process.cwd(), account ? { account } : {})),
+    checkPrerequisites: (request, interaction) => ensurePrerequisites(request, interaction),
     confirmRemoval: async (preview) =>
       (await p.confirm({
         message: `Permanently remove assistant ${preview.instanceId} and request deletion of GCP project ${preview.gcpProject}?`,

@@ -2,167 +2,190 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import type { PrerequisiteRequest, Prerequisites } from '../src/gws-ea/prerequisites.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
-import { ensureGcloudReady, signInToGoogleCloud } from './gws-ea-prerequisites.js';
+import { confirmGoogleAccount, ensurePrerequisites, signInToGoogleCloud } from './gws-ea-prerequisites.js';
 
-function promptFixture(confirmAnswers: readonly boolean[] = [true]) {
+function promptFixture(confirmAnswers: readonly unknown[] = [true]) {
   const answers = [...confirmAnswers];
   return {
     note: vi.fn(),
     confirm: vi.fn(async () => answers.shift() ?? true),
-    isCancel: () => false,
+    isCancel: (value: unknown) => value === CANCEL,
   };
 }
 
-describe('GWS-EA Google Cloud prerequisite flow', () => {
-  afterEach(() => vi.unstubAllEnvs());
+const CANCEL = Symbol('cancel');
 
-  it('signs back into the reserved account during resume', async () => {
-    const prompts = promptFixture([true]);
-    const check = vi
-      .fn<() => Promise<{ readonly account: string }>>()
-      .mockRejectedValueOnce(new GwsEaError('gcloud_auth_required', 'Google Cloud sign-in is required'))
-      .mockResolvedValueOnce({ account: 'reserved@example.com' });
+const READY: Prerequisites = {
+  platform: 'macos',
+  homeDirectory: '/Users/operator',
+  runningAsRoot: false,
+  nodePath: '/opt/homebrew/bin/node',
+  onecliCliPath: '/Users/operator/.local/bin/onecli',
+  dockerEndpoint: 'unix:///Users/operator/.docker/run/docker.sock',
+  account: 'operator@example.com',
+};
+
+const REQUEST: PrerequisiteRequest = {
+  command: 'create',
+  instancesRoot: '/Users/operator/.local/state/gws-ea/instances',
+};
+
+function terminal() {
+  const order: string[] = [];
+  return {
+    order,
+    interaction: {
+      signInToGoogleCloud: vi.fn(async () => undefined),
+      confirmGoogleAccount: vi.fn(async () => true),
+      withTerminal: async <T>(work: () => Promise<T>): Promise<T> => {
+        order.push('suspend');
+        try {
+          return await work();
+        } finally {
+          order.push('resume');
+        }
+      },
+    },
+  };
+}
+
+describe('GWS-EA Google Cloud sign-in', () => {
+  it('always runs the browser flow with --force, for the reserved account or a new one', async () => {
     const runLogin = vi.fn(async () => 0);
-
-    await expect(
-      ensureGcloudReady('/repo', {
-        account: 'reserved@example.com',
-        check,
-        resolveExecutable: async () => '/opt/homebrew/bin/gcloud',
-        runLogin,
-        prompts,
-      }),
-    ).resolves.toEqual({ account: 'reserved@example.com' });
-
-    expect(prompts.note).toHaveBeenCalledWith(expect.stringContaining('reserved@example.com'), 'Google Cloud');
-    expect(runLogin).toHaveBeenCalledWith('/opt/homebrew/bin/gcloud', ['auth', 'login', 'reserved@example.com']);
-  });
-
-  it('continues one create flow through installation and interactive authentication', async () => {
-    vi.stubEnv('PATH', '/custom/bin:/usr/bin');
-    const check = vi
-      .fn<() => Promise<{ readonly account: string }>>()
-      .mockRejectedValueOnce(new GwsEaError('gcloud_required', 'Google Cloud CLI is required'))
-      .mockRejectedValueOnce(new GwsEaError('gcloud_auth_required', 'Google Cloud sign-in is required'))
-      .mockResolvedValueOnce({ account: 'operator@example.com' });
     const prompts = promptFixture([true, true]);
-    const runLogin = vi.fn(async () => 0);
-    const resolveExecutable = vi.fn(async () => '/Users/operator/google-cloud-sdk/bin/gcloud');
-
-    await expect(
-      ensureGcloudReady('/repo', {
-        check,
-        resolveExecutable,
-        runLogin,
-        prompts,
-      }),
-    ).resolves.toEqual({ account: 'operator@example.com' });
-
-    expect(check).toHaveBeenCalledTimes(3);
-    expect(prompts.note).toHaveBeenNthCalledWith(
-      1,
-      expect.stringContaining('https://cloud.google.com/sdk/docs/install'),
-      'Google Cloud CLI',
-    );
-    expect(prompts.note).toHaveBeenNthCalledWith(2, expect.stringMatching(/sign in/iu), 'Google Cloud');
-    expect(resolveExecutable).toHaveBeenCalledWith(
-      ['/custom/bin:/usr/bin', path.join(os.homedir(), 'google-cloud-sdk', 'bin')].join(path.delimiter),
-    );
-    expect(process.env.PATH?.split(path.delimiter)[0]).toBe('/Users/operator/google-cloud-sdk/bin');
-    expect(runLogin).toHaveBeenCalledWith('/Users/operator/google-cloud-sdk/bin/gcloud', ['auth', 'login']);
-  });
-
-  it('does not prompt or launch login when Google Cloud is already ready', async () => {
-    const prompts = promptFixture();
-    const runLogin = vi.fn(async () => 0);
-
-    await expect(
-      ensureGcloudReady('/repo', {
-        check: async () => ({ account: 'operator@example.com' }),
-        resolveExecutable: async () => '/opt/homebrew/bin/gcloud',
-        runLogin,
-        prompts,
-      }),
-    ).resolves.toEqual({ account: 'operator@example.com' });
-
-    expect(prompts.note).not.toHaveBeenCalled();
-    expect(prompts.confirm).not.toHaveBeenCalled();
-    expect(runLogin).not.toHaveBeenCalled();
-  });
-
-  it('fails without allocating resources when interactive login does not complete', async () => {
-    const prompts = promptFixture([true]);
-    const runLogin = vi.fn(async () => 1);
-
-    await expect(
-      ensureGcloudReady('/repo', {
-        check: async () => {
-          throw new GwsEaError('gcloud_auth_required', 'Google Cloud sign-in is required');
-        },
-        resolveExecutable: async () => '/opt/homebrew/bin/gcloud',
-        runLogin,
-        prompts,
-      }),
-    ).rejects.toMatchObject({ code: 'gcloud_auth_failed' });
-  });
-
-  it('does not repeat a successful login when credentials remain unavailable', async () => {
-    const prompts = promptFixture([true]);
-    const check = vi.fn(async () => {
-      throw new GwsEaError('gcloud_auth_required', 'Google Cloud sign-in is required');
-    });
-    const runLogin = vi.fn(async () => 0);
-
-    await expect(
-      ensureGcloudReady('/repo', {
-        check,
-        resolveExecutable: async () => '/opt/homebrew/bin/gcloud',
-        runLogin,
-        prompts,
-      }),
-    ).rejects.toMatchObject({ code: 'gcloud_auth_required' });
-
-    expect(prompts.confirm).toHaveBeenCalledOnce();
-    expect(runLogin).toHaveBeenCalledOnce();
-  });
-
-  it('does not launch login when the operator declines', async () => {
-    const prompts = promptFixture([false]);
-    const runLogin = vi.fn(async () => 0);
-
-    await expect(
-      ensureGcloudReady('/repo', {
-        check: async () => {
-          throw new GwsEaError('gcloud_auth_required', 'Google Cloud sign-in is required');
-        },
-        resolveExecutable: async () => '/opt/homebrew/bin/gcloud',
-        runLogin,
-        prompts,
-      }),
-    ).rejects.toMatchObject({ code: 'cancelled' });
-
-    expect(runLogin).not.toHaveBeenCalled();
-  });
-
-  it('signs in on its own for the Interaction port, handing gcloud the terminal', async () => {
-    const prompts = promptFixture([true]);
-    const runLogin = vi.fn(async () => 0);
 
     await signInToGoogleCloud('reserved@example.com', {
       resolveExecutable: async () => '/opt/homebrew/bin/gcloud',
       runLogin,
       prompts,
     });
+    await signInToGoogleCloud(undefined, {
+      resolveExecutable: async () => '/opt/homebrew/bin/gcloud',
+      runLogin,
+      prompts,
+    });
 
-    expect(prompts.note).toHaveBeenCalledWith(expect.stringContaining('reserved@example.com'), 'Google Cloud');
-    expect(runLogin).toHaveBeenCalledWith('/opt/homebrew/bin/gcloud', ['auth', 'login', 'reserved@example.com']);
+    expect(prompts.note).toHaveBeenNthCalledWith(1, expect.stringContaining('reserved@example.com'), 'Google Cloud');
+    expect(runLogin.mock.calls).toEqual([
+      ['/opt/homebrew/bin/gcloud', ['auth', 'login', 'reserved@example.com', '--force']],
+      ['/opt/homebrew/bin/gcloud', ['auth', 'login', '--force']],
+    ]);
+  });
+
+  it('fails when the login does not complete, and never launches it when declined', async () => {
     await expect(
-      signInToGoogleCloud(undefined, {
+      signInToGoogleCloud('reserved@example.com', {
         resolveExecutable: async () => '/opt/homebrew/bin/gcloud',
         runLogin: async () => 1,
         prompts: promptFixture([true]),
       }),
     ).rejects.toMatchObject({ code: 'gcloud_auth_failed' });
+
+    const runLogin = vi.fn(async () => 0);
+    await expect(
+      signInToGoogleCloud('reserved@example.com', {
+        resolveExecutable: async () => '/opt/homebrew/bin/gcloud',
+        runLogin,
+        prompts: promptFixture([false]),
+      }),
+    ).rejects.toMatchObject({ code: 'cancelled' });
+    expect(runLogin).not.toHaveBeenCalled();
+  });
+});
+
+describe('GWS-EA Google account confirmation', () => {
+  it('returns the operator’s answer and treats cancel as cancelling setup', async () => {
+    const prompts = promptFixture([true, false, CANCEL]);
+
+    await expect(confirmGoogleAccount('operator@example.com', { prompts })).resolves.toBe(true);
+    await expect(confirmGoogleAccount('operator@example.com', { prompts })).resolves.toBe(false);
+    await expect(confirmGoogleAccount('operator@example.com', { prompts })).rejects.toMatchObject({
+      code: 'cancelled',
+    });
+    expect(prompts.confirm).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining('operator@example.com') }),
+    );
+  });
+});
+
+describe('GWS-EA guided prerequisites', () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it('guides a Google Cloud CLI install, then continues the same run', async () => {
+    vi.stubEnv('PATH', '/custom/bin:/usr/bin');
+    const check = vi
+      .fn<(request: PrerequisiteRequest) => Promise<Prerequisites>>()
+      .mockRejectedValueOnce(new GwsEaError('gcloud_required', 'Google Cloud CLI is required'))
+      .mockResolvedValueOnce(READY);
+    const prompts = promptFixture([true]);
+    const resolveExecutable = vi.fn(async () => '/Users/operator/google-cloud-sdk/bin/gcloud');
+    const { order, interaction } = terminal();
+    prompts.note.mockImplementation(() => void order.push('guidance'));
+
+    await expect(ensurePrerequisites(REQUEST, interaction, { check, resolveExecutable, prompts })).resolves.toBe(READY);
+
+    expect(check).toHaveBeenCalledTimes(2);
+    expect(check).toHaveBeenNthCalledWith(2, REQUEST, interaction);
+    expect(prompts.note).toHaveBeenCalledWith(
+      expect.stringContaining('https://cloud.google.com/sdk/docs/install'),
+      'Google Cloud CLI',
+    );
+    expect(order).toEqual(['suspend', 'guidance', 'resume']);
+    expect(resolveExecutable).toHaveBeenCalledWith(
+      ['/custom/bin:/usr/bin', path.join(os.homedir(), 'google-cloud-sdk', 'bin')].join(path.delimiter),
+    );
+    expect(process.env.PATH?.split(path.delimiter)[0]).toBe('/Users/operator/google-cloud-sdk/bin');
+  });
+
+  it('stops with the install link when the CLI is still missing', async () => {
+    const check = vi.fn(async () => {
+      throw new GwsEaError('gcloud_required', 'Google Cloud CLI is required');
+    });
+
+    await expect(
+      ensurePrerequisites(REQUEST, terminal().interaction, {
+        check,
+        resolveExecutable: async () => {
+          throw new GwsEaError('executable_not_found', 'gcloud was not found on PATH');
+        },
+        prompts: promptFixture([true]),
+      }),
+    ).rejects.toMatchObject({
+      code: 'gcloud_required',
+      message: expect.stringContaining('https://cloud.google.com/sdk/docs/install'),
+    });
+    expect(check).toHaveBeenCalledOnce();
+  });
+
+  it('does not continue when the operator declines to install', async () => {
+    const check = vi.fn(async () => {
+      throw new GwsEaError('gcloud_required', 'Google Cloud CLI is required');
+    });
+
+    await expect(
+      ensurePrerequisites(REQUEST, terminal().interaction, {
+        check,
+        resolveExecutable: async () => '/opt/homebrew/bin/gcloud',
+        prompts: promptFixture([false]),
+      }),
+    ).rejects.toMatchObject({ code: 'cancelled' });
+    expect(check).toHaveBeenCalledOnce();
+  });
+
+  it('passes every other prerequisite failure through without guidance', async () => {
+    const stopped = new GwsEaError('docker_stopped', 'Docker is not running');
+    const prompts = promptFixture();
+
+    await expect(
+      ensurePrerequisites(REQUEST, terminal().interaction, {
+        check: async () => {
+          throw stopped;
+        },
+        prompts,
+      }),
+    ).rejects.toBe(stopped);
+    expect(prompts.note).not.toHaveBeenCalled();
   });
 });

@@ -52,7 +52,7 @@ const MAX_REPLY_CHARACTERS = 4000;
 const STEP_SOURCES: Readonly<Record<string, readonly string[]>> = {
   secrets: ['src/gws-ea/create-input.ts'],
   release_source: ['src/gws-ea/release-tracks.ts'],
-  prerequisites: ['setup/gws-ea-prerequisites.ts', 'src/gws-ea/gcloud.ts'],
+  prerequisites: ['src/gws-ea/prerequisites.ts', 'setup/gws-ea-prerequisites.ts', 'src/gws-ea/gcloud.ts'],
   inputs: ['setup/gws-ea-input.ts', 'src/gws-ea/create-input.ts'],
   resolve_release: ['src/gws-ea/checkout.ts'],
   reserve: ['src/gws-ea/cli.ts', 'src/gws-ea/registry.ts'],

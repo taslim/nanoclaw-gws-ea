@@ -482,11 +482,24 @@ export const runSanitizedCommandOutcome: SanitizedCommandOutcomeRunner = async (
   }
 };
 
-export const runSanitizedCommand: SanitizedCommandRunner = async (command) => {
-  const outcome = await runSanitizedCommandOutcome(command);
-  if (outcome.exitCode !== 0) throw commandExitError(command, outcome);
-  return { stdout: outcome.stdout, stderr: outcome.stderr };
-};
+/** A runner that raises `commandExitError` for any non-zero exit. */
+export function checkedRunner(runner: SanitizedCommandOutcomeRunner): SanitizedCommandRunner {
+  return async (command) => {
+    const outcome = await runner(command);
+    if (outcome.exitCode !== 0) throw commandExitError(command, outcome);
+    return { stdout: outcome.stdout, stderr: outcome.stderr };
+  };
+}
+
+export const runSanitizedCommand: SanitizedCommandRunner = checkedRunner(runSanitizedCommandOutcome);
+
+/** Re-raise a program that is not installed as `code`, keeping where the runner looked; rethrow anything else. */
+export function missingExecutable(error: unknown, code: string, message: string): never {
+  if (error instanceof GwsEaError && error.code === 'executable_not_found') {
+    throw new GwsEaError(code, message, { cause: error, ...(error.details ? { details: error.details } : {}) });
+  }
+  throw error;
+}
 
 export function replaceProcess(
   executable: string,

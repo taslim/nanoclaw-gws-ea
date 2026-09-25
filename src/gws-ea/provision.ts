@@ -1589,10 +1589,9 @@ export async function runProductionProvision(
         : {}),
     },
   };
-  return runProvisionSteps(
-    operation,
-    context,
-    createProductionProvisionSteps(context, {}, provisionRuntime),
-    provisionRuntime,
-  );
+  const gcpAccount = reservation.exclusive_resource_claims.gcp_account;
+  return runProvisionSteps(operation, context, createProductionProvisionSteps(context, {}, provisionRuntime), {
+    ...provisionRuntime,
+    ...(interaction ? { signIn: () => interaction.signInToGoogleCloud(gcpAccount) } : {}),
+  });
 }

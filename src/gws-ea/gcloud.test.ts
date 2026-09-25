@@ -4,17 +4,24 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { SignInRequired } from './events.js';
 import {
+  activeGcloudAccount,
+  assertGcloudInstalled,
+  assertGcloudSignedIn,
+  classifyGcloudFailure,
   deleteOwnedGcpProject,
   deriveGcpProjectId,
-  preflightGcloud,
+  isConsumerGoogleAccount,
   probeGcpProjectForCreate,
   reconcileGcpProject,
   verifyGcpProject,
   type GcloudCommandRunner,
+  type GcloudFailureClass,
   type GcloudProgressEvent,
 } from './gcloud.js';
 import { allocateInstanceId } from './registry.js';
+import { GwsEaError } from './types.js';
 
 const roots: string[] = [];
 
@@ -199,60 +206,186 @@ function projectInput(root: string, credentialFile = path.join(root, 'secrets', 
   };
 }
 
+// Recorded gcloud stderr, as Google Cloud SDK prints it.
+const REAUTHENTICATION_FAILED = [
+  'ERROR: (gcloud.auth.print-access-token) There was a problem refreshing your current auth tokens: Reauthentication failed. cannot prompt during non-interactive execution.',
+  'Please run:',
+  '',
+  '  $ gcloud auth login',
+  '',
+  'to obtain new credentials.',
+].join('\n');
+const TOKEN_REFRESH_FAILED = [
+  "ERROR: (gcloud.projects.describe) There was a problem refreshing auth tokens for account operator@example.com: ('invalid_grant: Bad Request', {'error': 'invalid_grant', 'error_description': 'Bad Request'})",
+  'Please run:',
+  '',
+  '  $ gcloud auth login',
+  '',
+  'to obtain new credentials.',
+].join('\n');
+const NO_ACTIVE_ACCOUNT = [
+  'ERROR: (gcloud.projects.list) You do not currently have an active account selected.',
+  'Please run:',
+  '',
+  '  $ gcloud auth login',
+  '',
+  'to obtain new credentials.',
+].join('\n');
+const CONNECTION_FAILED =
+  'ERROR: (gcloud.auth.print-access-token) There was a problem connecting: [Errno 8] nodename nor servname provided, or not known';
+
+describe('gcloud failure classification', () => {
+  it.each<[string, string, GcloudFailureClass]>([
+    ['a failed reauthentication', REAUTHENTICATION_FAILED, 'auth-required'],
+    ['a token that no longer refreshes', TOKEN_REFRESH_FAILED, 'auth-required'],
+    ['no active account', NO_ACTIVE_ACCOUNT, 'auth-required'],
+    [
+      'an account without credentials',
+      'ERROR: (gcloud.auth.print-access-token) Your current active account [operator@example.com] does not have any valid credentials',
+      'auth-required',
+    ],
+    ['a reauthentication demand', 'ERROR: (gcloud.projects.describe) Reauthentication required.', 'auth-required'],
+    [
+      'rejected credentials',
+      'ERROR: (gcloud.projects.describe) UNAUTHENTICATED: Request had invalid authentication credentials.',
+      'auth-required',
+    ],
+    [
+      'a project Google will not confirm exists',
+      'ERROR: (gcloud.projects.describe) [operator@example.com] does not have permission to access projects instance [gws-ea-12345678123442348234] (or it may not exist): The caller does not have permission. This command is authenticated as operator@example.com which is the active account specified by the [core/account] property.',
+      'permission-or-missing',
+    ],
+    [
+      'a denied permission on a resource that may not exist',
+      "ERROR: (gcloud.iam.service-accounts.describe) PERMISSION_DENIED: Permission 'iam.serviceAccounts.get' denied on resource (or it may not exist).",
+      'permission-or-missing',
+    ],
+    [
+      'a missing resource',
+      'ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account',
+      'permission-or-missing',
+    ],
+    [
+      'blocked key creation',
+      [
+        'ERROR: (gcloud.iam.service-accounts.keys.create) FAILED_PRECONDITION: Key creation is not allowed on this service account.',
+        "- '@type': type.googleapis.com/google.rpc.PreconditionFailure",
+        '  violations:',
+        '  - description: Key creation is not allowed on this service account.',
+        '    type: constraints/iam.disableServiceAccountKeyCreation',
+      ].join('\n'),
+      'precondition',
+    ],
+    ['a connection failure', CONNECTION_FAILED, 'anything-else'],
+    ['exhausted quota', 'ERROR: (gcloud.projects.create) RESOURCE_EXHAUSTED: Quota exceeded.', 'anything-else'],
+    ['a crash', 'ERROR: gcloud crashed (TypeError): unsupported operand', 'anything-else'],
+    ['silence', '', 'anything-else'],
+  ])('classifies %s', (_case, stderr, expected) => {
+    expect(classifyGcloudFailure({ stdout: '', stderr, exitCode: 1 })).toBe(expected);
+  });
+});
+
+describe('Google account kind', () => {
+  it.each([
+    ['operator@gmail.com', true],
+    ['Operator@GoogleMail.com', true],
+    ['operator@example.com', false],
+    ['gmail.com@example.com', false],
+  ])('%s is a consumer account: %s', (email, consumer) => {
+    expect(isConsumerGoogleAccount(email)).toBe(consumer);
+  });
+});
+
 describe('Google Cloud provisioning', () => {
   it('checks the reserved account on resume even when another account is active', async () => {
     const commands: string[][] = [];
     const account = 'reserved@example.com';
-    const result = await preflightGcloud({
-      cwd: process.cwd(),
-      account,
-      runCommand: async (command) => {
-        commands.push([...command.args]);
-        if (command.args[0] === 'version') return { stdout: '{}', stderr: '', exitCode: 0 };
-        if (command.args[0] === 'auth' && command.args[1] === 'print-access-token') {
-          return { stdout: 'discard-me', stderr: '', exitCode: 0 };
-        }
-        throw new Error(`Unexpected gcloud command: ${command.args.join(' ')}`);
-      },
+
+    await assertGcloudSignedIn(account, async (command) => {
+      commands.push([...command.args]);
+      return { stdout: 'discard-me', stderr: '', exitCode: 0 };
     });
 
-    expect(result).toEqual({ account });
-    expect(commands).toEqual([
-      ['version', '--format=json'],
-      ['auth', 'print-access-token', `--account=${account}`, '--quiet'],
-    ]);
+    expect(commands).toEqual([['auth', 'print-access-token', `--account=${account}`, '--quiet']]);
   });
 
-  it('requests sign-in when the reserved account cannot refresh its token', async () => {
-    await expect(
-      preflightGcloud({
-        cwd: process.cwd(),
-        account: 'reserved@example.com',
-        runCommand: async (command) =>
-          command.args[0] === 'version'
-            ? { stdout: '{}', stderr: '', exitCode: 0 }
-            : { stdout: '', stderr: 'Reauthentication failed', exitCode: 1 },
-      }),
-    ).rejects.toMatchObject({ code: 'gcloud_auth_required' });
+  it('asks for sign-in when the reserved account cannot refresh its token', async () => {
+    const failure = await assertGcloudSignedIn('reserved@example.com', async () => ({
+      stdout: '',
+      stderr: REAUTHENTICATION_FAILED,
+      exitCode: 1,
+    })).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(SignInRequired);
+    expect(failure).toMatchObject({
+      code: 'gcloud_auth_required',
+      message: expect.stringContaining('reserved@example.com'),
+      details: { exitCode: 1, stderrTail: expect.stringContaining('Reauthentication failed') },
+    });
   });
 
-  it('fails before local allocation with one actionable install message when gcloud is unavailable', async () => {
+  it('reports any other token failure as the failed command, not as a sign-in', async () => {
+    const failure = await assertGcloudSignedIn('reserved@example.com', async () => ({
+      stdout: '',
+      stderr: CONNECTION_FAILED,
+      exitCode: 1,
+    })).catch((error: unknown) => error);
+
+    expect(failure).not.toBeInstanceOf(SignInRequired);
+    expect(failure).toMatchObject({
+      code: 'command_failed',
+      message: expect.stringContaining('gcloud auth print-access-token --account=reserved@example.com'),
+      details: { exitCode: 1, stderrTail: expect.stringContaining('There was a problem connecting') },
+    });
+  });
+
+  it('names the signed-in account, or none', async () => {
+    const commands: string[][] = [];
+    const answer =
+      (stdout: string): GcloudCommandRunner =>
+      async (command) => {
+        commands.push([...command.args]);
+        return { stdout, stderr: '', exitCode: 0 };
+      };
+
+    await expect(activeGcloudAccount(answer('operator@example.com\n'))).resolves.toBe('operator@example.com');
+    await expect(activeGcloudAccount(answer(''))).resolves.toBeUndefined();
+    expect(commands[0]).toEqual(['auth', 'list', '--filter=status:ACTIVE', '--format=value(account)']);
+  });
+
+  it('fails with one actionable install message when gcloud is unavailable', async () => {
+    const missing = assertGcloudInstalled(async () => {
+      throw new GwsEaError('executable_not_found', 'gcloud was not found on PATH', {
+        details: { program: 'gcloud', searched: ['/usr/bin'] },
+      });
+    });
+
+    await expect(missing).rejects.toMatchObject({
+      code: 'gcloud_required',
+      message: expect.stringContaining('https://cloud.google.com/sdk/docs/install'),
+      details: { searched: ['/usr/bin'] },
+    });
     await expect(
-      preflightGcloud({
-        cwd: process.cwd(),
-        runCommand: async () => {
-          throw new Error('spawn ENOENT');
-        },
-      }),
-    ).rejects.toMatchObject({ code: 'gcloud_required' });
-    await expect(
-      preflightGcloud({
-        cwd: process.cwd(),
-        runCommand: async () => {
-          throw new Error('spawn ENOENT');
-        },
-      }),
-    ).rejects.toThrow(/cloud\.google\.com\/sdk\/docs\/install/u);
+      assertGcloudInstalled(async () => ({ stdout: '{}', stderr: '', exitCode: 0 })),
+    ).resolves.toBeUndefined();
+  });
+
+  it('asks for sign-in when a step finds the sign-in expired, instead of a generic project error', async () => {
+    const root = await tempRoot();
+    const state = readyState();
+    const fallback = fakeRunner(state);
+
+    const failure = await reconcileGcpProject(projectInput(root), {
+      runCommand: async (command) =>
+        command.args[0] === 'projects' && command.args[1] === 'describe'
+          ? { stdout: '', stderr: TOKEN_REFRESH_FAILED, exitCode: 1 }
+          : fallback(command),
+      sleep: async () => undefined,
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(SignInRequired);
+    expect(failure).toMatchObject({ message: expect.stringContaining('operator@example.com') });
+    expect(state.mutations).toEqual([]);
   });
 
   it('creates one labeled project, enables only required APIs, and reconciles one owner-only key', async () => {

@@ -10,7 +10,7 @@ import { describeSecretInput, SECRET_INPUTS, type SecretInput, type SecretSource
 import type { ProvisionHumanPause } from './phases.js';
 import { registerSecret } from './redact.js';
 import type { RunLog, StepLog } from './run-log.js';
-import { GwsEaError } from './types.js';
+import { GwsEaError, type GwsEaErrorOptions } from './types.js';
 
 export type RunEvent =
   /** Unlabeled steps are logged but not rendered as progress. */
@@ -94,6 +94,18 @@ export class PauseRequired extends GwsEaError {
   }
 }
 
+/**
+ * Google Cloud refused a command because the operator's sign-in expired. The
+ * step engine signs in through the `Interaction` port and runs the step again
+ * from its observations, so nothing it already changed is changed twice.
+ */
+export class SignInRequired extends GwsEaError {
+  constructor(message: string, options?: GwsEaErrorOptions) {
+    super('gcloud_auth_required', message, options);
+    this.name = 'SignInRequired';
+  }
+}
+
 /** Human decisions supplied on re-entry; the engine persists them. */
 export interface HumanDecisions {
   /** `--chat-configured`: the operator finished the Google Chat app configuration. */
@@ -118,7 +130,10 @@ export interface Interaction {
   readonly decisions: HumanDecisions;
   requestProviderCredential(request: ProviderCredentialRequest): Promise<ProviderCredential>;
   requestCloudflareAccountToken(request: CloudflareTokenRequest): Promise<string>;
+  /** Always the browser flow (`gcloud auth login --force`); without an account, the operator picks one. */
   signInToGoogleCloud(account?: string): Promise<void>;
+  /** Create: whether the signed-in `account` should own the new assistant's Google Cloud project. */
+  confirmGoogleAccount(account: string): Promise<boolean>;
   /** Hand the terminal to an interactive child, suspending progress rendering around it. */
   withTerminal<T>(work: () => Promise<T>): Promise<T>;
 }
@@ -128,6 +143,7 @@ export interface InteractivePrompts {
   providerCredential(providerId: string): Promise<ProviderCredential>;
   cloudflareAccountToken(request: CloudflareTokenRequest): Promise<string>;
   googleCloudSignIn(account?: string): Promise<void>;
+  googleAccount(account: string): Promise<boolean>;
 }
 
 export interface InteractionOptions {
@@ -207,10 +223,20 @@ export function createInteraction(options: InteractionOptions): Interaction {
         throw new PauseRequired(
           'gcloud_sign_in_required',
           `Google Cloud sign-in is required${account ? ` for ${account}` : ''}.`,
-          [`Sign in: gcloud auth login${account ? ` ${account}` : ''}`],
+          [`Sign in: gcloud auth login${account ? ` ${account}` : ''} --force`],
         );
       }
       await withTerminal(() => prompts.googleCloudSignIn(account));
+    },
+    async confirmGoogleAccount(account) {
+      if (!prompts) {
+        throw new GwsEaError(
+          'input_required',
+          `Confirm the Google account that owns this assistant's Google Cloud project: pass --google-account ${account}, or run gws-ea create in a terminal to be asked.`,
+          { details: { flag: '--google-account' } },
+        );
+      }
+      return withTerminal(() => prompts.googleAccount(account));
     },
   };
 }

@@ -7,15 +7,18 @@ import { describe, expect, it, vi } from 'vitest';
 import { runCli } from '../src/gws-ea/cli.js';
 import type { SecretSource } from '../src/gws-ea/create-input.js';
 import { resolveControlPlanePaths } from '../src/gws-ea/paths.js';
+import type { Prerequisites } from '../src/gws-ea/prerequisites.js';
 import type { SetupProviderEntry } from './providers/registry.js';
 import { authenticateGwsEaProvider, collectGwsEaCreateInput } from './gws-ea-input.js';
 
-const runtime = {
+const prerequisites: Prerequisites = {
   onecliCliPath: '/opt/homebrew/bin/onecli',
   nodePath: '/opt/homebrew/bin/node',
   homeDirectory: '/Users/principal',
-  platform: 'macos' as const,
+  platform: 'macos',
   runningAsRoot: false,
+  dockerEndpoint: 'unix:///Users/principal/.docker/run/docker.sock',
+  account: 'operator@example.test',
 };
 const providerCapabilityDigest = 'a'.repeat(64);
 const NO_SECRETS: SecretSource = { get: () => undefined };
@@ -59,6 +62,7 @@ describe('GWS-EA interactive create input', () => {
     const result = await collectGwsEaCreateInput(
       {
         instanceId: '11111111-1111-4111-8111-111111111111',
+        prerequisites,
         sourceRemote: 'https://example.test/nanoclaw.git',
         secrets: NO_SECRETS,
         track: 'dogfood',
@@ -69,7 +73,6 @@ describe('GWS-EA interactive create input', () => {
       },
       {
         providers: [claude],
-        detectedRuntime: runtime,
         detectedTimezone: 'America/Los_Angeles',
         providerCapabilityDigest,
         prompts: {
@@ -138,6 +141,7 @@ describe('GWS-EA interactive create input', () => {
     const result = await collectGwsEaCreateInput(
       {
         instanceId: '11111111-1111-4111-8111-111111111111',
+        prerequisites,
         sourceRemote: 'https://example.test/nanoclaw.git',
         secrets: NO_SECRETS,
         track: 'prod',
@@ -148,7 +152,6 @@ describe('GWS-EA interactive create input', () => {
       },
       {
         providers: [claude, codex],
-        detectedRuntime: runtime,
         detectedTimezone: 'UTC',
         providerCapabilityDigest,
         prompts: {
@@ -195,6 +198,7 @@ describe('GWS-EA interactive create input', () => {
     await collectGwsEaCreateInput(
       {
         instanceId: '11111111-1111-4111-8111-111111111111',
+        prerequisites,
         sourceRemote: 'https://example.test/nanoclaw.git',
         secrets: NO_SECRETS,
         track: 'prod',
@@ -202,7 +206,6 @@ describe('GWS-EA interactive create input', () => {
       },
       {
         providers: [provider('claude', 'Claude')],
-        detectedRuntime: runtime,
         detectedTimezone: 'UTC',
         providerCapabilityDigest,
         prompts,
@@ -246,6 +249,7 @@ describe('GWS-EA interactive create input', () => {
     const result = await collectGwsEaCreateInput(
       {
         instanceId: '11111111-1111-4111-8111-111111111111',
+        prerequisites,
         sourceRemote: 'https://example.test/nanoclaw.git',
         secrets: NO_SECRETS,
         track: 'prod',
@@ -260,7 +264,6 @@ describe('GWS-EA interactive create input', () => {
       },
       {
         providers: [provider('claude', 'Claude')],
-        detectedRuntime: runtime,
         detectedTimezone: 'UTC',
         providerCapabilityDigest,
         prompts: {
@@ -320,6 +323,7 @@ describe('GWS-EA interactive create input', () => {
     const result = await collectGwsEaCreateInput(
       {
         instanceId: '11111111-1111-4111-8111-111111111111',
+        prerequisites,
         sourceRemote: 'https://example.test/nanoclaw.git',
         secrets: NO_SECRETS,
         track: 'prod',
@@ -349,7 +353,6 @@ describe('GWS-EA interactive create input', () => {
       },
       {
         providers: [provider('claude', 'Claude')],
-        detectedRuntime: runtime,
         detectedTimezone: 'UTC',
         providerCapabilityDigest,
         prompts: {
@@ -386,6 +389,7 @@ describe('GWS-EA interactive create input', () => {
     const result = await collectGwsEaCreateInput(
       {
         instanceId: '11111111-1111-4111-8111-111111111111',
+        prerequisites,
         sourceRemote: 'https://example.test/nanoclaw.git',
         secrets: NO_SECRETS,
         track: 'prod',
@@ -401,7 +405,6 @@ describe('GWS-EA interactive create input', () => {
       },
       {
         providers: [provider('claude', 'Claude')],
-        detectedRuntime: runtime,
         detectedTimezone: 'UTC',
         providerCapabilityDigest,
         prompts: {
@@ -432,6 +435,7 @@ describe('GWS-EA interactive create input', () => {
       collectGwsEaCreateInput(
         {
           instanceId: '11111111-1111-4111-8111-111111111111',
+          prerequisites,
           sourceRemote: 'https://example.test/nanoclaw.git',
           secrets: NO_SECRETS,
           track: 'prod',
@@ -454,7 +458,6 @@ describe('GWS-EA interactive create input', () => {
         },
         {
           providers: [provider('claude', 'Claude')],
-          detectedRuntime: runtime,
           detectedTimezone: 'UTC',
           providerCapabilityDigest,
           prompts: {
@@ -509,6 +512,7 @@ describe('GWS-EA interactive create input', () => {
       collectGwsEaCreateInput(
         {
           instanceId: '11111111-1111-4111-8111-111111111111',
+          prerequisites,
           sourceRemote: 'https://example.test/nanoclaw.git',
           secrets: NO_SECRETS,
           track: 'prod',
@@ -523,7 +527,6 @@ describe('GWS-EA interactive create input', () => {
         },
         {
           providers: [provider('claude', 'Claude')],
-          detectedRuntime: runtime,
           detectedTimezone: 'UTC',
           providerCapabilityDigest,
           prompts: {
@@ -589,6 +592,7 @@ describe('GWS-EA unattended create input', () => {
     return collectGwsEaCreateInput(
       {
         instanceId: '11111111-1111-4111-8111-111111111111',
+        prerequisites,
         sourceRemote: 'https://example.test/nanoclaw.git',
         secrets,
         track: 'dogfood',
@@ -598,7 +602,6 @@ describe('GWS-EA unattended create input', () => {
       {
         interactive: false,
         providers: [provider('claude', 'Claude')],
-        detectedRuntime: runtime,
         detectedTimezone: 'UTC',
         providerCapabilityDigest,
         prompts: unattendedPrompts,
@@ -636,6 +639,10 @@ describe('GWS-EA unattended create input', () => {
     });
     await expect(unattended({ ...FLAGS, 'workspace-email': 'not-an-email' })).rejects.toMatchObject({
       message: expect.stringContaining('--workspace-email'),
+    });
+    await expect(unattended({ ...FLAGS, 'workspace-email': 'aya@gmail.com' })).rejects.toMatchObject({
+      code: 'invalid_arguments',
+      message: expect.stringMatching(/--workspace-email.*Google Workspace/su),
     });
   });
 
@@ -699,13 +706,13 @@ describe('GWS-EA unattended create input', () => {
     const dependencies = {
       interactive: false,
       providers,
-      detectedRuntime: runtime,
       detectedTimezone: 'UTC',
       providerCapabilityDigest,
       prompts: unattendedPrompts,
     };
     const base = {
       instanceId: '11111111-1111-4111-8111-111111111111',
+      prerequisites,
       sourceRemote: 'https://example.test/nanoclaw.git',
       secrets: NO_SECRETS,
       track: 'dogfood',
@@ -743,10 +750,9 @@ describe('GWS-EA unattended create input', () => {
             collectGwsEaCreateInput(context, {
               interactive: false,
               providers: [provider('claude', 'Claude')],
-              detectedRuntime: { ...runtime, nodePath: process.execPath },
               providerCapabilityDigest,
             }),
-          preflightGcloud: async () => ({ account: 'operator@example.test' }),
+          checkPrerequisites: async () => ({ ...prerequisites, nodePath: process.execPath }),
           resolveRelease: async (sourceRemote, releaseRef) => ({ sourceRemote, releaseRef, commit: 'b'.repeat(40) }),
           holdLoopbackPorts: async () => ({
             ports: { nanoclaw_webhook: 35_101, onecli_app: 35_102, onecli_gateway: 35_103 },

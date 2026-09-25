@@ -315,7 +315,12 @@ describe('assistant removal', () => {
         stdout: (line) => output.push(line),
         stderr: () => undefined,
         confirmRemoval: async () => false,
-        prompts: { providerCredential: vi.fn(), cloudflareAccountToken: requestToken, googleCloudSignIn: vi.fn() },
+        prompts: {
+          providerCredential: vi.fn(),
+          cloudflareAccountToken: requestToken,
+          googleCloudSignIn: vi.fn(),
+          googleAccount: vi.fn(),
+        },
       }),
     ).toBe(0);
 

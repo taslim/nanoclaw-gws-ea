@@ -7,7 +7,7 @@
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { PauseRequired, runStep, withPendingAction, type StepReporter } from './events.js';
+import { PauseRequired, runStep, SignInRequired, withPendingAction, type StepReporter } from './events.js';
 import {
   readProvisionJournal,
   recordStepCompleted,
@@ -74,6 +74,8 @@ export const OBSERVATION_WAITS_SECONDS = [1, 2, 4, 8, 16, 30] as const;
 export interface ProvisionRuntime extends StepReporter {
   /** Waits between observations. */
   readonly sleep?: (milliseconds: number) => Promise<void>;
+  /** Renews the reserved account's Google sign-in when a step finds it expired. */
+  readonly signIn?: () => Promise<void>;
 }
 
 export type ProvisionResult =
@@ -150,6 +152,22 @@ export async function runProvisionSteps<Context>(
     throw new GwsEaError('step_incomplete', `${resource.name} is still missing after it was set up`);
   };
 
+  /**
+   * A step that finds the Google sign-in expired signs in once, then runs
+   * again from its observations: whatever it already changed now observes
+   * present, so no change is made twice.
+   */
+  const withSignIn = async (body: () => Promise<Pause>): Promise<Pause> => {
+    try {
+      return await body();
+    } catch (error) {
+      if (!(error instanceof SignInRequired) || !runtime.signIn) throw error;
+      activeStep()?.write(`${error.message}; signing in, then running the step again\n`);
+      await runtime.signIn();
+      return body();
+    }
+  };
+
   /** Run a step's body as a logged step, recording any failure in the journal. */
   const stepRun = (id: ProvisionStepId, label: string, body: () => Promise<Pause>): Promise<Pause> =>
     runStep(
@@ -157,7 +175,7 @@ export async function runProvisionSteps<Context>(
       { id, label },
       async () => {
         try {
-          return await body();
+          return await withSignIn(body);
         } catch (error) {
           if (!(error instanceof PauseRequired)) {
             const log = activeStep()?.rawLog ?? runtime.run?.progressLog;

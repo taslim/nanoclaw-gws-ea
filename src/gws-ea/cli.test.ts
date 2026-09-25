@@ -1,14 +1,23 @@
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { createServer, type Server } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { runCli, type CliRuntime, type FailureReport } from './cli.js';
-import { runStep, withPendingAction } from './events.js';
+import type { CreatePromptContext } from './create-input.js';
+import { runStep, withPendingAction, type Interaction } from './events.js';
 import { acquireInstanceOperation } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+import { ONECLI_CLI_VERSION } from './onecli-compose.js';
 import type { ProvisionHumanPause } from './phases.js';
+import {
+  checkPrerequisites,
+  type PrerequisiteDependencies,
+  type PrerequisiteRequest,
+  type Prerequisites,
+} from './prerequisites.js';
 import { runSanitizedCommand } from './process.js';
 import { allocateInstanceId, readRegistry, reserveInstance } from './registry.js';
 import { DOGFOOD_SOURCE_FILE, GWS_EA_RELEASE_REMOTE } from './release-tracks.js';
@@ -16,9 +25,15 @@ import { activeStep } from './run-log.js';
 import { GwsEaError, type InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
+const servers: Server[] = [];
+
+function neverCalled(): never {
+  throw new Error('process.execve is only called by the service launcher');
+}
 const PRIVATE_REMOTE = 'git@github.com:example/nanoclaw-gws-ea-private.git';
 
 afterEach(async () => {
+  for (const server of servers.splice(0)) await new Promise((resolve) => server.close(resolve));
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
@@ -85,10 +100,20 @@ function setupAnswers() {
   } as const;
 }
 
+const PREREQUISITES: Prerequisites = {
+  platform: process.platform === 'darwin' ? 'macos' : 'linux',
+  homeDirectory: '/Users/operator',
+  runningAsRoot: false,
+  nodePath: process.execPath,
+  onecliCliPath: '/usr/local/bin/onecli',
+  dockerEndpoint: 'unix:///var/run/docker.sock',
+  account: 'operator@example.test',
+};
+
 function createRuntime(): Partial<CliRuntime> {
   return {
     collectCreateInputs: async () => setupAnswers(),
-    preflightGcloud: async () => ({ account: 'operator@example.test' }),
+    checkPrerequisites: async () => PREREQUISITES,
     resolveRelease: async (sourceRemote, releaseRef) => ({ sourceRemote, releaseRef, commit: 'b'.repeat(40) }),
     holdLoopbackPorts: async () => ({
       ports: { nanoclaw_webhook: 34_101, onecli_app: 34_102, onecli_gateway: 34_103 },
@@ -133,7 +158,7 @@ describe('gws-ea stop summaries and exit codes', () => {
     const exitCode = await runCli(['resume', '--id', input.instance_id], {
       paths,
       ...io.runtime,
-      preflightGcloud: async () => ({ account: 'operator@example.test' }),
+      checkPrerequisites: async () => PREREQUISITES,
       advanceProvision: async (_operation, { runtime }) =>
         runStep(runtime, { id: 'provision_gcp', label: 'Configuring Google Cloud…' }, () =>
           runSanitizedCommand({
@@ -170,7 +195,7 @@ describe('gws-ea stop summaries and exit codes', () => {
       await runCli(['resume', '--id', input.instance_id], {
         paths,
         ...io.runtime,
-        preflightGcloud: async () => ({ account: 'operator@example.test' }),
+        checkPrerequisites: async () => PREREQUISITES,
         advanceProvision: async () => ({ status: 'paused', pause: DM_PAUSE }),
       }),
     ).toBe(10);
@@ -190,7 +215,7 @@ describe('gws-ea stop summaries and exit codes', () => {
         await runCli(['resume', '--id', input.instance_id], {
           paths,
           ...io.runtime,
-          preflightGcloud: async () => ({ account: 'operator@example.test' }),
+          checkPrerequisites: async () => PREREQUISITES,
           advanceProvision,
         }),
       ).toBe(75);
@@ -210,7 +235,7 @@ describe('gws-ea stop summaries and exit codes', () => {
       await runCli(['resume', '--id', input.instance_id], {
         paths,
         ...io.runtime,
-        preflightGcloud: async () => ({ account: 'operator@example.test' }),
+        checkPrerequisites: async () => PREREQUISITES,
         advanceProvision: async () => {
           throw withPendingAction(new GwsEaError('nanoclaw_not_ready', 'NanoClaw did not become ready'), DM_PAUSE);
         },
@@ -230,7 +255,7 @@ describe('gws-ea stop summaries and exit codes', () => {
       await runCli(['resume', '--id', input.instance_id], {
         paths,
         ...io.runtime,
-        preflightGcloud: async () => ({ account: 'operator@example.test' }),
+        checkPrerequisites: async () => PREREQUISITES,
         advanceProvision: async () => {
           throw new Error('secret-canary-must-not-print');
         },
@@ -252,7 +277,7 @@ describe('gws-ea without a TTY', () => {
         paths,
         ...io.runtime,
         environment: {},
-        preflightGcloud: async () => ({ account: 'operator@example.test' }),
+        checkPrerequisites: async () => PREREQUISITES,
         advanceProvision: async (_operation, { interaction }) => {
           await interaction.requestProviderCredential({
             providerId: 'claude',
@@ -276,7 +301,7 @@ describe('gws-ea without a TTY', () => {
         paths,
         ...io.runtime,
         environment: {},
-        preflightGcloud: async () => ({ account: 'operator@example.test' }),
+        checkPrerequisites: async () => PREREQUISITES,
         advanceProvision: async (_operation, { interaction, runtime }) =>
           runStep(runtime, { id: 'configure_provider', label: 'Connecting the AI provider…' }, async () => {
             await interaction.requestProviderCredential({
@@ -303,7 +328,7 @@ describe('gws-ea without a TTY', () => {
       JSON.stringify({ schema_version: 1, instance_id: input.instance_id, phases: {} }),
       { mode: 0o600 },
     );
-    const preflight = vi.fn(async () => ({ account: 'operator@example.test' }));
+    const preflight = vi.fn(async () => PREREQUISITES);
     const advanceProvision = vi.fn();
     const io = lines();
 
@@ -311,7 +336,7 @@ describe('gws-ea without a TTY', () => {
       await runCli(['resume', '--id', input.instance_id], {
         paths,
         ...io.runtime,
-        preflightGcloud: preflight,
+        checkPrerequisites: preflight,
         advanceProvision,
       }),
     ).toBe(1);
@@ -330,7 +355,7 @@ describe('gws-ea without a TTY', () => {
         paths,
         ...io.runtime,
         environment: {},
-        preflightGcloud: async () => ({ account: 'operator@example.test' }),
+        checkPrerequisites: async () => PREREQUISITES,
         advanceProvision: async (_operation, { interaction }) => {
           await interaction.requestCloudflareAccountToken({ accountId: 'a'.repeat(32), reason: 'Listener drifted' });
           return { status: 'ready' };
@@ -361,7 +386,7 @@ describe('gws-ea without a TTY', () => {
     await runCli(['resume', '--id', input.instance_id], {
       paths,
       ...io.runtime,
-      preflightGcloud: async () => ({ account: 'operator@example.test' }),
+      checkPrerequisites: async () => PREREQUISITES,
       advanceProvision: async (_operation, { runtime }) =>
         runStep(runtime, { id: 'provision_gcp', label: 'Configuring Google Cloud…' }, async () => {
           runtime.emit?.({ type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for the service account…' });
@@ -553,11 +578,209 @@ describe('gws-ea release sources', () => {
   });
 });
 
+/**
+ * A stubbed host for the real prerequisite checks: Docker at `dockerHost`,
+ * gcloud signed in as `active`, and `expired` accounts that must sign in again.
+ */
+function hostDependencies(
+  dockerHost: string,
+  active = 'operator@example.test',
+  expired: ReadonlySet<string> = new Set(),
+): PrerequisiteDependencies {
+  return {
+    runCommand: async (command) => {
+      const signature = [path.basename(command.command), ...command.args].join(' ');
+      const ok = (stdout = '') => ({ stdout, stderr: '', exitCode: 0 });
+      if (signature === 'docker context inspect') {
+        return ok(JSON.stringify([{ Name: 'default', Endpoints: { docker: { Host: dockerHost } } }]));
+      }
+      if (signature === 'onecli version') return ok(JSON.stringify({ version: ONECLI_CLI_VERSION }));
+      if (signature.startsWith('gcloud auth list ')) return ok(`${active}\n`);
+      if (signature.startsWith('gcloud auth print-access-token ')) {
+        return [...expired].some((account) => signature.includes(`--account=${account} `))
+          ? { stdout: '', stderr: 'ERROR: (gcloud.auth.print-access-token) Reauthentication required.', exitCode: 1 }
+          : ok('ya29.discard-me');
+      }
+      return ok();
+    },
+    resolvePersisted: async (command) => (command === 'onecli' ? '/usr/local/bin/onecli' : process.execPath),
+    node: { version: 'v22.20.0', execPath: process.execPath, execve: neverCalled },
+    platform: 'linux',
+  };
+}
+
+async function runningDocker(): Promise<string> {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-docker-'));
+  roots.push(directory);
+  const socket = path.join(directory, 'docker.sock');
+  const server = createServer((_request, response) => response.writeHead(200).end('OK'));
+  await new Promise<void>((resolve) => server.listen(socket, resolve));
+  servers.push(server);
+  return `unix://${socket}`;
+}
+
+describe('gws-ea prerequisites', () => {
+  it.each([
+    ['Docker is stopped', 'unix:///nonexistent/gws-ea/docker.sock', 'docker_stopped', /not running.*Start Docker/su],
+    [
+      'the Docker context is remote',
+      'tcp://192.0.2.10:2376',
+      'docker_remote',
+      /tcp:\/\/192\.0\.2\.10:2376.*unix:\/\//su,
+    ],
+  ])('stops create before reservation when %s, with guidance', async (_case, dockerHost, code, guidance) => {
+    const paths = await testPaths();
+    const collectCreateInputs = vi.fn();
+    const io = lines();
+
+    const exitCode = await runCli(['create', '--track', 'dogfood', '--source-remote', PRIVATE_REMOTE], {
+      paths,
+      ...io.runtime,
+      ...createRuntime(),
+      checkPrerequisites: (request, interaction) =>
+        checkPrerequisites(request, interaction, hostDependencies(dockerHost)),
+      collectCreateInputs,
+    });
+
+    expect(exitCode).toBe(1);
+    const summary = io.err.join('\n');
+    expect(summary).toMatch(guidance);
+    expect(summary).toContain('Stopped at prerequisites:');
+    expect(summary).toContain('Retry with: gws-ea create --track dogfood');
+    expect(collectCreateInputs).not.toHaveBeenCalled();
+    expect(io.out.some((line) => line.startsWith('instance_id:'))).toBe(false);
+    expect(Object.keys((await readRegistry(paths)).instances)).toEqual([]);
+    const progressLog = /Log: (\S+)/u.exec(summary)?.[1];
+    expect(await readFile(progressLog!, 'utf8')).toContain(`aborted at prerequisites (err=${code})`);
+  });
+
+  it('refuses a consumer Google account before reservation', async () => {
+    const paths = await testPaths();
+    const io = lines();
+
+    const exitCode = await runCli(['create', '--track', 'dogfood', '--source-remote', PRIVATE_REMOTE], {
+      paths,
+      ...io.runtime,
+      ...createRuntime(),
+      checkPrerequisites: async (request, interaction) =>
+        checkPrerequisites(request, interaction, hostDependencies(await runningDocker(), 'operator@gmail.com')),
+    });
+
+    expect(exitCode).toBe(1);
+    expect(io.err.join('\n')).toMatch(/operator@gmail\.com.*Google Workspace/su);
+    expect(Object.keys((await readRegistry(paths)).instances)).toEqual([]);
+  });
+
+  it('names --google-account when no person can confirm the signed-in account', async () => {
+    const paths = await testPaths();
+    const io = lines();
+    const args = ['create', '--track', 'dogfood', '--source-remote', PRIVATE_REMOTE];
+    const dockerHost = await runningDocker();
+    const runtime = {
+      paths,
+      ...io.runtime,
+      ...createRuntime(),
+      checkPrerequisites: (request: PrerequisiteRequest, interaction: Interaction) =>
+        checkPrerequisites(request, interaction, hostDependencies(dockerHost)),
+      advanceProvision: async () => ({ status: 'paused' as const, pause: DM_PAUSE }),
+    };
+
+    expect(await runCli(args, runtime)).toBe(1);
+    expect(io.err.join('\n')).toContain('--google-account operator@example.test');
+    expect(Object.keys((await readRegistry(paths)).instances)).toEqual([]);
+
+    expect(await runCli([...args, '--google-account', 'operator@example.test'], runtime)).toBe(10);
+    const [reserved] = Object.values((await readRegistry(paths)).instances);
+    expect(reserved?.exclusive_resource_claims.gcp_account).toBe('operator@example.test');
+  });
+
+  it('hands create inputs the checked host and reserves the confirmed account', async () => {
+    const paths = await testPaths();
+    const requests: PrerequisiteRequest[] = [];
+    const contexts: CreatePromptContext[] = [];
+    const confirmed = { ...PREREQUISITES, account: 'owner@example.test' };
+
+    expect(
+      await runCli(
+        ['create', '--track', 'dogfood', '--source-remote', PRIVATE_REMOTE, '--google-account', 'owner@example.test'],
+        {
+          paths,
+          ...lines().runtime,
+          ...createRuntime(),
+          checkPrerequisites: async (request) => {
+            requests.push(request);
+            return confirmed;
+          },
+          collectCreateInputs: async (context) => {
+            contexts.push(context);
+            return setupAnswers();
+          },
+          advanceProvision: async () => ({ status: 'paused', pause: DM_PAUSE }),
+        },
+      ),
+    ).toBe(10);
+
+    expect(requests).toEqual([
+      { command: 'create', instancesRoot: paths.instancesRoot, account: 'owner@example.test' },
+    ]);
+    expect(contexts[0]?.prerequisites).toBe(confirmed);
+    const [reserved] = Object.values((await readRegistry(paths)).instances);
+    expect(reserved?.exclusive_resource_claims.gcp_account).toBe('owner@example.test');
+  });
+
+  it('renews an expired sign-in through the browser flow, then continues the same resume', async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation(paths));
+    const expired = new Set(['operator@example.test']);
+    const dockerHost = await runningDocker();
+    const googleCloudSignIn = vi.fn(async (account?: string) => void expired.delete(account ?? ''));
+    const advanceProvision = vi.fn(async () => ({ status: 'ready' as const }));
+
+    const exitCode = await runCli(['resume', '--id', input.instance_id], {
+      paths,
+      ...lines().runtime,
+      prompts: {
+        providerCredential: vi.fn(),
+        cloudflareAccountToken: vi.fn(),
+        googleCloudSignIn,
+        googleAccount: vi.fn(),
+      },
+      checkPrerequisites: (request, interaction) =>
+        checkPrerequisites(request, interaction, hostDependencies(dockerHost, 'someone@example.test', expired)),
+      advanceProvision,
+    });
+
+    expect(exitCode).toBe(0);
+    expect(googleCloudSignIn).toHaveBeenCalledExactlyOnceWith('operator@example.test');
+    expect(advanceProvision).toHaveBeenCalledOnce();
+  });
+
+  it('checks the reserved account on resume', async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation(paths));
+    const requests: PrerequisiteRequest[] = [];
+
+    await runCli(['resume', '--id', input.instance_id], {
+      paths,
+      ...lines().runtime,
+      checkPrerequisites: async (request) => {
+        requests.push(request);
+        return PREREQUISITES;
+      },
+      advanceProvision: async () => ({ status: 'paused', pause: DM_PAUSE }),
+    });
+
+    expect(requests).toEqual([
+      { command: 'resume', instancesRoot: paths.instancesRoot, account: 'operator@example.test' },
+    ]);
+  });
+});
+
 describe('gws-ea interactive failure loop', () => {
   it('releases the lock before the failure hook, then retries through prerequisites and resume', async () => {
     const paths = await testPaths();
     const input = await reserveInstance(paths, reservation(paths));
-    const preflight = vi.fn(async () => ({ account: 'operator@example.test' }));
+    const preflight = vi.fn(async () => PREREQUISITES);
     const reports: FailureReport[] = [];
     let lockFree = false;
     let attempts = 0;
@@ -566,7 +789,7 @@ describe('gws-ea interactive failure loop', () => {
     const exitCode = await runCli(['resume', '--id', input.instance_id], {
       paths,
       ...io.runtime,
-      preflightGcloud: preflight,
+      checkPrerequisites: preflight,
       advanceProvision: async (_operation, { runtime }) =>
         runStep(runtime, { id: 'start_onecli', label: 'Starting the credential vault…' }, async () => {
           attempts += 1;
@@ -608,7 +831,7 @@ describe('gws-ea interactive failure loop', () => {
       await runCli(['resume', '--id', input.instance_id], {
         paths,
         ...lines().runtime,
-        preflightGcloud: async () => ({ account: 'operator@example.test' }),
+        checkPrerequisites: async () => PREREQUISITES,
         advanceProvision,
         onFailure: async () => 'stop',
       }),

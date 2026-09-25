@@ -70,6 +70,9 @@ function prompts(overrides: Partial<InteractivePrompts> = {}): InteractivePrompt
       throw new Error('unexpected Cloudflare prompt');
     }),
     googleCloudSignIn: vi.fn(async () => undefined),
+    googleAccount: vi.fn(async () => {
+      throw new Error('unexpected Google account prompt');
+    }),
     ...overrides,
   };
 }
@@ -269,7 +272,34 @@ describe('Interaction port', () => {
 
     const signIn = await interaction.signInToGoogleCloud('operator@example.test').catch((error: unknown) => error);
     expect(signIn).toBeInstanceOf(PauseRequired);
-    expect((signIn as PauseRequired).instructions.join('\n')).toContain('gcloud auth login operator@example.test');
+    expect((signIn as PauseRequired).instructions.join('\n')).toContain(
+      'gcloud auth login operator@example.test --force',
+    );
+
+    await expect(interaction.confirmGoogleAccount('operator@example.test')).rejects.toMatchObject({
+      code: 'input_required',
+      message: expect.stringContaining('--google-account operator@example.test'),
+      details: { flag: '--google-account' },
+    });
+  });
+
+  it('asks a person to confirm the Google account, with progress suspended', async () => {
+    const order: string[] = [];
+    const interaction = createInteraction({
+      decisions: { chatConfigured: false },
+      secrets: NO_SECRETS,
+      prompts: prompts({
+        googleAccount: async (account) => {
+          order.push(`confirm ${account}`);
+          return false;
+        },
+      }),
+      terminal: { suspend: () => order.push('suspend'), resume: () => order.push('resume') },
+      managedIngressSetup: ingressSetup(),
+    });
+
+    await expect(interaction.confirmGoogleAccount('operator@example.test')).resolves.toBe(false);
+    expect(order).toEqual(['suspend', 'confirm operator@example.test', 'resume']);
   });
 
   it('hands the terminal to a sign-in child', async () => {

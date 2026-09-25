@@ -4,15 +4,18 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { isErrno } from '../community-portal/errors.js';
+import { SignInRequired } from './events.js';
 import {
   deriveGchatServiceAccountEmail,
   GCHAT_SERVICE_ACCOUNT_ID,
   GCP_PROJECT_PATTERN,
   parseGcpProjectNumber,
 } from './gcp-identity.js';
-import { preparePrivateLocalDirectory } from './paths.js';
+import { CONTROL_PLANE_ROOT, preparePrivateLocalDirectory } from './paths.js';
 import {
   buildToolEnvironment,
+  commandExitError,
+  missingExecutable,
   runSanitizedCommandOutcome,
   type SanitizedCommand,
   type SanitizedCommandOutcome,
@@ -48,6 +51,51 @@ const SERVICE_ACCOUNT_KEYS = new Set([
   'universe_domain',
 ]);
 const ACCOUNT_PATTERN = /^[^\s@]+@[^\s@]+$/u;
+const CONSUMER_GOOGLE_DOMAINS = new Set(['gmail.com', 'googlemail.com']);
+
+/**
+ * What a failed gcloud command means (KTD5). Only messages Google documents
+ * are recognized; anything unfamiliar is `anything-else`.
+ * - `auth-required`: the operator must sign in again.
+ * - `permission-or-missing`: Google will not say whether the resource exists.
+ * - `precondition`: the request was refused by policy, such as blocked key creation.
+ */
+export type GcloudFailureClass = 'auth-required' | 'permission-or-missing' | 'precondition' | 'anything-else';
+
+const GCLOUD_FAILURES: ReadonlyArray<readonly [GcloudFailureClass, readonly RegExp[]]> = [
+  [
+    'auth-required',
+    [
+      /There was a problem refreshing (?:your current auth tokens|auth tokens for account)/u,
+      /There was a problem reauthenticating/u,
+      /Reauthentication (?:required|failed|is needed)/u,
+      /You do not currently have an active account selected/u,
+      /does not have any valid credentials/u,
+      /to obtain new credentials/u,
+      /\bUNAUTHENTICATED\b/u,
+    ],
+  ],
+  ['precondition', [/\bFAILED_PRECONDITION\b/u]],
+  [
+    'permission-or-missing',
+    [/\bPERMISSION_DENIED\b/u, /\bNOT_FOUND\b/u, /\(or it may not exist\)/u, /does not have permission to access/u],
+  ],
+];
+
+/** Classify a failed gcloud command by its stderr. */
+export function classifyGcloudFailure(outcome: SanitizedCommandOutcome): GcloudFailureClass {
+  const match = GCLOUD_FAILURES.find(([, patterns]) => patterns.some((pattern) => pattern.test(outcome.stderr)));
+  return match?.[0] ?? 'anything-else';
+}
+
+/** A personal Google account, which cannot own a Google Chat app for a Workspace. */
+export function isConsumerGoogleAccount(email: string): boolean {
+  return CONSUMER_GOOGLE_DOMAINS.has(email.slice(email.lastIndexOf('@') + 1).toLowerCase());
+}
+
+export function isGoogleAccountAddress(value: string): boolean {
+  return ACCOUNT_PATTERN.test(value);
+}
 
 export type GcloudCommandRunner = SanitizedCommandOutcomeRunner;
 
@@ -67,11 +115,6 @@ export interface GcloudDependencies {
   readonly runCommand?: GcloudCommandRunner;
   readonly sleep?: (delayMs: number) => Promise<void>;
   readonly onProgress?: (event: GcloudProgressEvent) => void | Promise<void>;
-}
-
-export interface GcloudPreflightInput extends GcloudDependencies {
-  readonly cwd: string;
-  readonly account?: string;
 }
 
 export interface GcpProjectInput {
@@ -129,12 +172,34 @@ function gcloudCommand(cwd: string, args: readonly string[]): SanitizedCommand {
   };
 }
 
+/** Run gcloud. An expired sign-in throws `SignInRequired`; any other failure is the caller's to judge. */
 async function run(
   cwd: string,
   args: readonly string[],
   runner: GcloudCommandRunner,
 ): Promise<SanitizedCommandOutcome> {
-  return runner(gcloudCommand(cwd, args));
+  const command = gcloudCommand(cwd, args);
+  const outcome = await runner(command);
+  if (outcome.exitCode !== 0 && classifyGcloudFailure(outcome) === 'auth-required') {
+    const failure = commandExitError(command, outcome);
+    const account = args.find((arg) => arg.startsWith('--account='))?.slice('--account='.length);
+    throw new SignInRequired(`Google Cloud sign-in${account ? ` for ${account}` : ''} has expired`, {
+      cause: failure,
+      ...(failure.details ? { details: failure.details } : {}),
+    });
+  }
+  return outcome;
+}
+
+/** Run gcloud where any failure stops the caller, reported as the failed command. */
+async function runChecked(
+  cwd: string,
+  args: readonly string[],
+  runner: GcloudCommandRunner,
+): Promise<SanitizedCommandOutcome> {
+  const outcome = await run(cwd, args, runner);
+  if (outcome.exitCode !== 0) throw commandExitError(gcloudCommand(cwd, args), outcome);
+  return outcome;
 }
 
 function commandFailure(message: string): GwsEaError {
@@ -207,54 +272,50 @@ export function deriveGcpProjectId(instanceId: string): string {
 
 export { deriveGchatServiceAccountEmail } from './gcp-identity.js';
 
-export async function preflightGcloud(input: GcloudPreflightInput): Promise<{ readonly account: string }> {
-  if (input.account !== undefined && !ACCOUNT_PATTERN.test(input.account)) {
-    throw new GwsEaError('invalid_claim', 'GCP account is invalid');
-  }
-  const runner = input.runCommand ?? runSanitizedCommandOutcome;
-  let version: SanitizedCommandOutcome;
-  try {
-    version = await run(input.cwd, ['version', '--format=json'], runner);
-  } catch {
-    throw new GwsEaError(
+/** gcloud is on PATH and runs. */
+export async function assertGcloudInstalled(runner: GcloudCommandRunner = runSanitizedCommandOutcome): Promise<void> {
+  await runChecked(CONTROL_PLANE_ROOT, ['version', '--format=json'], runner).catch((error: unknown) =>
+    missingExecutable(
+      error,
       'gcloud_required',
       `Google Cloud CLI is required. Install it from ${GCLOUD_INSTALL_URL}, then retry.`,
-    );
+    ),
+  );
+}
+
+/** The account gcloud is signed in as, or undefined when nobody is. */
+export async function activeGcloudAccount(
+  runner: GcloudCommandRunner = runSanitizedCommandOutcome,
+): Promise<string | undefined> {
+  const { stdout } = await runChecked(
+    CONTROL_PLANE_ROOT,
+    ['auth', 'list', '--filter=status:ACTIVE', '--format=value(account)'],
+    runner,
+  );
+  const active = stdout
+    .split('\n')
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (active.length > 1 || (active.length === 1 && !ACCOUNT_PATTERN.test(active[0]!))) {
+    throw new GwsEaError('invalid_gcloud_output', 'gcloud reported an invalid active account');
   }
-  if (version.exitCode !== 0) {
-    throw new GwsEaError(
-      'gcloud_required',
-      `Google Cloud CLI is required. Install it from ${GCLOUD_INSTALL_URL}, then retry.`,
-    );
-  }
-  let account = input.account;
-  if (account === undefined) {
-    const accounts = await run(
-      input.cwd,
-      ['auth', 'list', '--filter=status:ACTIVE', '--format=value(account)'],
-      runner,
-    );
-    const active = accounts.stdout
-      .split('\n')
-      .map((value) => value.trim())
-      .filter(Boolean);
-    if (accounts.exitCode !== 0 || active.length !== 1 || !ACCOUNT_PATTERN.test(active[0]!)) {
-      throw new GwsEaError(
-        'gcloud_auth_required',
-        'Google Cloud CLI is not signed in. Run gcloud auth login, then retry.',
-      );
-    }
-    account = active[0]!;
-  }
-  const token = await run(input.cwd, ['auth', 'print-access-token', `--account=${account}`, '--quiet'], runner);
-  if (token.exitCode !== 0 || !token.stdout.trim()) {
-    throw new GwsEaError(
-      'gcloud_auth_required',
-      `Google Cloud credentials for ${account} are unavailable. Run gcloud auth login ${account}, then retry.`,
-    );
-  }
-  registerSecret(token.stdout.trim());
-  return { account };
+  return active[0];
+}
+
+/** `account` holds Google Cloud credentials that still refresh; `SignInRequired` when it must sign in again. */
+export async function assertGcloudSignedIn(
+  account: string,
+  runner: GcloudCommandRunner = runSanitizedCommandOutcome,
+): Promise<void> {
+  if (!ACCOUNT_PATTERN.test(account)) throw new GwsEaError('invalid_claim', 'GCP account is invalid');
+  const { stdout } = await runChecked(
+    CONTROL_PLANE_ROOT,
+    ['auth', 'print-access-token', `--account=${account}`, '--quiet'],
+    runner,
+  );
+  const token = stdout.trim();
+  if (!token) throw new SignInRequired(`Google Cloud returned no credentials for ${account}`);
+  registerSecret(token);
 }
 
 async function describeProject(

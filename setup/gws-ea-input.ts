@@ -1,6 +1,3 @@
-import os from 'node:os';
-import path from 'node:path';
-
 import * as p from '@clack/prompts';
 
 import {
@@ -12,8 +9,7 @@ import {
   type CreateSetupAnswers,
 } from '../src/gws-ea/create-input.js';
 import { validateExistingGchatEndpoint } from '../src/gws-ea/endpoint.js';
-import { resolveControlPlanePaths } from '../src/gws-ea/paths.js';
-import { resolvePersistedExecutable } from '../src/gws-ea/process.js';
+import { isConsumerGoogleAccount } from '../src/gws-ea/gcloud.js';
 import { registerSecret } from '../src/gws-ea/redact.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
 import type { ProviderCredential } from '../src/provider-credential.js';
@@ -21,14 +17,6 @@ import { providerProvisioningCapabilityDigest } from '../src/provider-provisioni
 import { isValidTimezone, resolveTimezone } from '../src/timezone.js';
 import { brightSelect } from './lib/bright-select.js';
 import { listSetupProviders, type SetupProviderEntry, type SetupProviderProvisioning } from './providers/registry.js';
-
-interface DetectedRuntime {
-  readonly onecliCliPath: string;
-  readonly nodePath: string;
-  readonly homeDirectory: string;
-  readonly platform: 'macos' | 'linux';
-  readonly runningAsRoot: boolean;
-}
 
 interface PromptAdapter {
   note(message: string, title?: string): void;
@@ -55,7 +43,6 @@ export interface GwsEaCreateInputDependencies {
   /** Whether a person can answer prompts. Without one, every input comes from its flag or secret source. */
   readonly interactive?: boolean;
   readonly providers?: readonly SetupProviderEntry[];
-  readonly detectedRuntime?: DetectedRuntime;
   readonly detectedTimezone?: string;
   readonly providerCapabilityDigest?: string;
   readonly prompts?: PromptAdapter;
@@ -177,28 +164,10 @@ async function askPassword(prompts: PromptAdapter, message: string): Promise<str
   return answer.trim();
 }
 
-async function detectRuntime(): Promise<DetectedRuntime> {
-  if (process.platform !== 'darwin' && process.platform !== 'linux') {
-    throw new GwsEaError('unsupported_platform', 'GWS-EA supports macOS and Linux hosts');
-  }
-  const onecliSearchPath = [path.join(os.homedir(), '.local', 'bin'), process.env.PATH ?? ''].join(path.delimiter);
-  const checkoutRoots = [resolveControlPlanePaths().instancesRoot];
-  const [onecliCliPath, nodePath] = await Promise.all([
-    resolvePersistedExecutable('onecli', { searchPath: onecliSearchPath, checkoutRoots }).catch((error: unknown) => {
-      if (!(error instanceof GwsEaError) || error.code !== 'executable_not_found') throw error;
-      throw new GwsEaError('onecli_required', 'OneCLI is not installed or is not executable; install it, then retry.', {
-        cause: error,
-      });
-    }),
-    resolvePersistedExecutable(process.execPath, { checkoutRoots }),
-  ]);
-  return {
-    onecliCliPath,
-    nodePath,
-    homeDirectory: os.homedir(),
-    platform: process.platform === 'darwin' ? 'macos' : 'linux',
-    runningAsRoot: process.getuid?.() === 0,
-  };
+function workspaceEmailProblem(value: string): string | undefined {
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(value)) return 'Enter a valid email address';
+  if (isConsumerGoogleAccount(value)) return 'Enter a Google Workspace address, not a personal Google account';
+  return undefined;
 }
 
 function systemTimezone(): string {
@@ -424,7 +393,7 @@ export async function collectGwsEaCreateInput(
   dependencies: GwsEaCreateInputDependencies = {},
 ): Promise<CreateSetupAnswers> {
   const prompts = dependencies.prompts ?? defaultPrompts;
-  const runtime = dependencies.detectedRuntime ?? (await detectRuntime());
+  const host = context.prerequisites;
   const detectedTimezone = dependencies.detectedTimezone ?? systemTimezone();
   const providers = dependencies.providers ?? listSetupProviders();
   const providerCapabilityDigest =
@@ -448,7 +417,7 @@ export async function collectGwsEaCreateInput(
     validate: (value) => (isValidTimezone(value) ? undefined : 'Enter a valid IANA timezone'),
   });
   const assistantWorkspaceEmail = await textInput(source, 'workspace-email', 'Assistant Google Workspace email', {
-    validate: (value) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(value) ? undefined : 'Enter a valid email address'),
+    validate: workspaceEmailProblem,
   });
   const ingress = await collectIngress(source, assistantFirst);
   const provider = await chooseProvider(providers, source);
@@ -459,11 +428,11 @@ export async function collectGwsEaCreateInput(
     assistantWorkspaceEmail,
     bootstrapManifest: {
       schema_version: 1,
-      onecli_cli_path: runtime.onecliCliPath,
-      node_path: runtime.nodePath,
-      home_directory: runtime.homeDirectory,
-      platform: runtime.platform,
-      running_as_root: runtime.runningAsRoot,
+      onecli_cli_path: host.onecliCliPath,
+      node_path: host.nodePath,
+      home_directory: host.homeDirectory,
+      platform: host.platform,
+      running_as_root: host.runningAsRoot,
       provider_capability_digest: providerCapabilityDigest,
       provider: {
         id: provider.value,

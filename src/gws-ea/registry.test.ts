@@ -14,6 +14,7 @@ import {
   writeInstanceMarker,
 } from './registry.js';
 import { isLocalFilesystemType, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+import type { Prerequisites } from './prerequisites.js';
 import { GwsEaError, type InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
@@ -125,10 +126,20 @@ function createSetupInput() {
   } as const;
 }
 
+const PREREQUISITES: Prerequisites = {
+  platform: process.platform === 'darwin' ? 'macos' : 'linux',
+  homeDirectory: '/Users/operator',
+  runningAsRoot: false,
+  nodePath: process.execPath,
+  onecliCliPath: '/usr/local/bin/onecli',
+  dockerEndpoint: 'unix:///var/run/docker.sock',
+  account: 'operator@example.test',
+};
+
 function productionRuntime() {
   return {
     collectCreateInputs: async () => createSetupInput(),
-    preflightGcloud: async () => ({ account: 'operator@example.test' }),
+    checkPrerequisites: async () => PREREQUISITES,
     resolveRelease: async (sourceRemote: string, releaseRef: string) => ({
       sourceRemote,
       releaseRef,
@@ -434,7 +445,7 @@ describe('create recovery contract', () => {
     const paths = await testPaths();
     const input = reservation(paths);
     await reserveInstance(paths, input);
-    const preflight = vi.fn(async () => ({ account: input.exclusive_resource_claims.gcp_account }));
+    const preflight = vi.fn(async () => ({ ...PREREQUISITES, account: input.exclusive_resource_claims.gcp_account }));
     const advanceProvision = vi.fn(async () => ({
       status: 'paused' as const,
       pause: {
@@ -450,11 +461,14 @@ describe('create recovery contract', () => {
         paths,
         stdout: () => undefined,
         stderr: () => undefined,
-        preflightGcloud: preflight,
+        checkPrerequisites: preflight,
         advanceProvision,
       }),
     ).toBe(10);
-    expect(preflight).toHaveBeenCalledExactlyOnceWith(input.exclusive_resource_claims.gcp_account, expect.anything());
+    expect(preflight).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ command: 'resume', account: input.exclusive_resource_claims.gcp_account }),
+      expect.anything(),
+    );
     expect(advanceProvision).toHaveBeenCalledOnce();
   });
 
@@ -472,7 +486,7 @@ describe('create recovery contract', () => {
     } finally {
       operation.release();
     }
-    const preflight = vi.fn(async () => ({ account: input.exclusive_resource_claims.gcp_account }));
+    const preflight = vi.fn(async () => ({ ...PREREQUISITES, account: input.exclusive_resource_claims.gcp_account }));
     const advanceProvision = vi.fn(async () => ({ status: 'ready' as const }));
 
     expect(
@@ -480,11 +494,14 @@ describe('create recovery contract', () => {
         paths,
         stdout: () => undefined,
         stderr: () => undefined,
-        preflightGcloud: preflight,
+        checkPrerequisites: preflight,
         advanceProvision,
       }),
     ).toBe(0);
-    expect(preflight).toHaveBeenCalledExactlyOnceWith(input.exclusive_resource_claims.gcp_account, expect.anything());
+    expect(preflight).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ command: 'resume', account: input.exclusive_resource_claims.gcp_account }),
+      expect.anything(),
+    );
     expect(advanceProvision).toHaveBeenCalledOnce();
   });
 
@@ -500,7 +517,7 @@ describe('create recovery contract', () => {
         paths,
         stdout: () => undefined,
         stderr: (line) => errors.push(line),
-        preflightGcloud: async () => {
+        checkPrerequisites: async () => {
           throw new GwsEaError('gcloud_auth_required', 'Google Cloud sign-in is required');
         },
         advanceProvision,
@@ -552,7 +569,7 @@ describe('create recovery contract', () => {
         paths,
         stdout: () => undefined,
         stderr: () => undefined,
-        preflightGcloud: async () => ({ account: 'operator@example.test' }),
+        checkPrerequisites: async () => PREREQUISITES,
         advanceProvision: async () => ({
           status: 'paused',
           pause: {
@@ -584,7 +601,7 @@ describe('create recovery contract', () => {
         paths,
         stdout: (line) => stdout.push(line),
         stderr: (line) => stderr.push(line),
-        preflightGcloud: async () => {
+        checkPrerequisites: async () => {
           throw new GwsEaError('gcloud_required', 'Install gcloud, then retry.');
         },
       },
@@ -627,7 +644,7 @@ describe('create recovery contract', () => {
         paths,
         stdout: (line) => output.push(line),
         stderr: () => undefined,
-        preflightGcloud: async () => ({ account: 'operator@example.test' }),
+        checkPrerequisites: async () => PREREQUISITES,
         advanceProvision,
         resolveRelease: async (sourceRemote, releaseRef) => {
           resolveCalls.push([sourceRemote, releaseRef]);
@@ -665,7 +682,7 @@ describe('create recovery contract', () => {
         paths,
         stdout: () => undefined,
         stderr: () => undefined,
-        preflightGcloud: async () => ({ account: 'operator@example.test' }),
+        checkPrerequisites: async () => PREREQUISITES,
         advanceProvision,
       }),
     ).toBe(10);
@@ -702,7 +719,7 @@ describe('create recovery contract', () => {
         paths,
         stdout: (line) => output.push(line),
         stderr: () => undefined,
-        preflightGcloud: async () => ({ account: 'operator@example.test' }),
+        checkPrerequisites: async () => PREREQUISITES,
         advanceProvision,
       }),
     ).toBe(10);
@@ -763,7 +780,7 @@ describe('create recovery contract', () => {
         paths,
         stdout: (line) => resumeOutput.push(line),
         stderr: () => undefined,
-        preflightGcloud: async () => ({ account: 'operator@example.test' }),
+        checkPrerequisites: async () => PREREQUISITES,
         advanceProvision: async () => pause,
       }),
     ).toBe(10);
@@ -785,7 +802,7 @@ describe('create recovery contract', () => {
         collectCreateInputs: async () => {
           throw new GwsEaError('cancelled', 'Assistant creation was cancelled');
         },
-        preflightGcloud: async () => ({ account: 'operator@example.test' }),
+        checkPrerequisites: async () => PREREQUISITES,
       },
     );
 
@@ -804,7 +821,7 @@ describe('create recovery contract', () => {
       stdout: (line) => stdout.push(line),
       stderr: (line) => stderr.push(line),
       collectCreateInputs: async () => createSetupInput(),
-      preflightGcloud: async () => ({ account: 'operator@example.test' }),
+      checkPrerequisites: async () => PREREQUISITES,
       resolveRelease: async () => {
         throw new GwsEaError('release_resolution_failed', 'Release track could not be resolved');
       },
@@ -832,7 +849,7 @@ describe('create recovery contract', () => {
         ...createSetupInput(),
         bootstrapManifest: { ...createSetupInput().bootstrapManifest, schema_version: 99 as 1 },
       }),
-      preflightGcloud: async () => ({ account: 'operator@example.test' }),
+      checkPrerequisites: async () => PREREQUISITES,
       resolveRelease: async (sourceRemote, releaseRef) => ({ sourceRemote, releaseRef, commit: 'b'.repeat(40) }),
       holdLoopbackPorts: async () => {
         throw new Error('ports must not be allocated for invalid setup input');
@@ -902,7 +919,7 @@ describe('create recovery contract', () => {
         paths,
         stdout: () => undefined,
         stderr: () => undefined,
-        preflightGcloud: async () => ({ account: 'operator@example.test' }),
+        checkPrerequisites: async () => PREREQUISITES,
         advanceProvision: async (operation) => {
           resumed.push(operation.instanceId);
           return {

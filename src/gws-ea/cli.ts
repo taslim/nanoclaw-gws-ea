@@ -21,11 +21,12 @@ import {
   type RunEvent,
   type StepReporter,
 } from './events.js';
-import { deriveGchatServiceAccountEmail, deriveGcpProjectId, preflightGcloud } from './gcloud.js';
+import { deriveGchatServiceAccountEmail, deriveGcpProjectId } from './gcloud.js';
 import { acquireInstanceOperation, readProvisionJournal, type InstanceOperation } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { ProvisionHumanPause, ProvisionResult, ProvisionRuntime } from './phases.js';
 import { holdLoopbackPorts, type HeldLoopbackPorts } from './ports.js';
+import { checkPrerequisites, type PrerequisiteRequest, type Prerequisites } from './prerequisites.js';
 import {
   installProductionBootstrapManifest,
   removeProductionBootstrapManifest,
@@ -44,6 +45,9 @@ import { resolveReleaseSource } from './release-tracks.js';
 import { describeRemoval, removeAssistant, type RemovalPreview } from './remove.js';
 import { FIXTURE_STAGING_DIRECTORY, startRunLog, type RunLog } from './run-log.js';
 import { GwsEaError, type AllocatedPorts, type GwsEaErrorDetails, type InstanceReservationInput } from './types.js';
+
+/** Unlabeled, so a scripted create's first line stays its `instance_id`. */
+const PREREQUISITES_STEP = { id: 'prerequisites' } as const;
 
 /** `0` ready, `10` paused for a person, `1` failed, `75` busy (KTD11). */
 export const EXIT_CODES = { ready: 0, paused: 10, failed: 1, busy: 75 } as const;
@@ -112,7 +116,8 @@ export interface CliRuntime {
   holdLoopbackPorts?: () => Promise<HeldLoopbackPorts>;
   collectCreateInputs?: (context: CreatePromptContext) => Promise<CreateSetupAnswers>;
   reserveInstance?: typeof reserveInstance;
-  preflightGcloud?: (account: string | undefined, interaction: Interaction) => Promise<{ readonly account: string }>;
+  /** Checks what create and resume need; the terminal driver adds guided installation. */
+  checkPrerequisites?: (request: PrerequisiteRequest, interaction: Interaction) => Promise<Prerequisites>;
   describeRemoval?: typeof describeRemoval;
   removeAssistant?: RemoveAssistantRunner;
   /** Absent means removal requires `--yes`. */
@@ -123,7 +128,10 @@ export interface CliRuntime {
 const COMMON_OPTIONS = ['secrets-file'] as const;
 const COMMON_SWITCHES = ['capture-fixtures'] as const;
 const COMMAND_OPTIONS: Readonly<Record<Command, { values: readonly string[]; switches: readonly string[] }>> = {
-  create: { values: ['track', 'source-remote', ...CREATE_INPUT_FLAGS, ...COMMON_OPTIONS], switches: COMMON_SWITCHES },
+  create: {
+    values: ['track', 'source-remote', 'google-account', ...CREATE_INPUT_FLAGS, ...COMMON_OPTIONS],
+    switches: COMMON_SWITCHES,
+  },
   resume: {
     values: ['id', 'messaging-group-id', ...COMMON_OPTIONS],
     switches: ['chat-configured', ...COMMON_SWITCHES],
@@ -356,15 +364,8 @@ class Cli {
     return () => this.prepare('resume', resumeArgs)();
   }
 
-  #checkGcloud(account: string | undefined, interaction: Interaction): Promise<{ readonly account: string }> {
-    if (this.#runtime.preflightGcloud) return this.#runtime.preflightGcloud(account, interaction);
-    const check = (): Promise<{ readonly account: string }> =>
-      preflightGcloud({ cwd: process.cwd(), ...(account ? { account } : {}) });
-    return check().catch(async (error: unknown) => {
-      if (!(error instanceof GwsEaError) || error.code !== 'gcloud_auth_required') throw error;
-      await interaction.signInToGoogleCloud(account);
-      return check();
-    });
+  #checkPrerequisites(request: PrerequisiteRequest, interaction: Interaction): Promise<Prerequisites> {
+    return (this.#runtime.checkPrerequisites ?? checkPrerequisites)(request, interaction);
   }
 
   #advance(operation: InstanceOperation, options: AdvanceOptions): Promise<ProvisionResult> {
@@ -388,7 +389,13 @@ class Cli {
       resolveReleaseSource({ track, sourceRemote: options['source-remote'], configRoot: paths.configRoot }),
     );
     run.userInput('release_source', sourceRemote);
-    const gcloud = await runStep(reporter, { id: 'prerequisites' }, () => this.#checkGcloud(undefined, interaction));
+    const googleAccount = options['google-account'];
+    const prerequisites = await runStep(reporter, PREREQUISITES_STEP, () =>
+      this.#checkPrerequisites(
+        { command: 'create', instancesRoot: paths.instancesRoot, ...(googleAccount ? { account: googleAccount } : {}) },
+        interaction,
+      ),
+    );
     const instanceId = allocateInstanceId();
     state.instanceId = instanceId;
     this.#presenter.line(`instance_id: ${instanceId}`);
@@ -401,7 +408,15 @@ class Cli {
         throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
       });
     const setup = await runStep(reporter, { id: 'inputs' }, () =>
-      collect({ instanceId, track, sourceRemote, provided, secrets, managedIngressSetup: this.#managedIngressSetup }),
+      collect({
+        instanceId,
+        track,
+        sourceRemote,
+        provided,
+        secrets,
+        prerequisites,
+        managedIngressSetup: this.#managedIngressSetup,
+      }),
     );
     run.userInput('ingress', setup.ingress.mode);
     run.userInput('provider', setup.bootstrapManifest.provider.id);
@@ -410,7 +425,7 @@ class Cli {
       (this.#runtime.resolveRelease ?? resolveReleaseCommit)(sourceRemote, `refs/heads/${track}`),
     );
     const held = await runStep(reporter, { id: 'reserve', label: 'Reserving the assistant…' }, async () => {
-      const lease = await this.#reserve(state, track, sourceRemote, setup, resolved.commit, gcloud.account);
+      const lease = await this.#reserve(state, track, sourceRemote, setup, resolved.commit, prerequisites.account);
       try {
         await run.assignInstance(instanceId);
       } catch (error) {
@@ -502,15 +517,15 @@ class Cli {
     const operation = await acquireInstanceOperation(this.#paths, instanceId);
     if (!operation) throw busy();
     try {
-      await runStep(reporter, { id: 'prerequisites' }, async () => {
+      await runStep(reporter, PREREQUISITES_STEP, async () => {
         // An instance this launcher cannot continue is refused before sign-in is asked for.
         await readProvisionJournal(this.#paths, instanceId);
         const reservation = await getInstanceReservation(this.#paths, instanceId);
         const account = reservation.exclusive_resource_claims.gcp_account;
-        const ready = await this.#checkGcloud(account, interaction);
-        if (ready.account !== account) {
-          throw new GwsEaError('gcloud_account_mismatch', 'Google Cloud is signed in with the wrong account');
-        }
+        await this.#checkPrerequisites(
+          { command: 'resume', instancesRoot: this.#paths.instancesRoot, account },
+          interaction,
+        );
       });
       return await this.#provision(reporter, operation, interaction);
     } finally {
@@ -764,7 +779,7 @@ function removalPreviewLines(preview: RemovalPreview): string[] {
 
 function printHelp(output: LineWriter): void {
   output('Usage: gws-ea <create|resume|remove> [options]');
-  output('  create --track <track> [--source-remote <remote>]');
+  output('  create --track <track> [--source-remote <remote>] [--google-account <email>]');
   output('         [--assistant-first-name <name> --assistant-last-name <name>]');
   output('         [--principal-first-name <name> --principal-last-name <name> --principal-timezone <iana>]');
   output('         [--workspace-email <email>] [--provider <id>]');

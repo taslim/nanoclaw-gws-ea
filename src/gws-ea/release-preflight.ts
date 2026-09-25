@@ -380,7 +380,8 @@ function assertLauncherCloudflaredPin(image: string): void {
   }
 }
 
-async function assertInstalledOnecliCli(
+/** The OneCLI CLI at `executable` reports exactly `expectedVersion`. */
+export async function assertInstalledOnecliCli(
   executable: string,
   expectedVersion: string,
   checkoutRoot: string,
@@ -399,7 +400,10 @@ async function assertInstalledOnecliCli(
     throw new GwsEaError('incompatible_onecli', 'Installed OneCLI CLI returned invalid version information');
   }
   if (version !== expectedVersion) {
-    throw new GwsEaError('incompatible_onecli', 'Installed OneCLI CLI does not match the selected release');
+    throw new GwsEaError(
+      'incompatible_onecli',
+      `Installed OneCLI CLI ${typeof version === 'string' ? version : '(unknown version)'} does not match the pinned ${expectedVersion}; install OneCLI CLI ${expectedVersion}, then retry`,
+    );
   }
 }
 

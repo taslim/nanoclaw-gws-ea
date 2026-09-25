@@ -1,11 +1,11 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { PauseRequired, pendingActionOf, type RunEvent } from './events.js';
+import { PauseRequired, pendingActionOf, SignInRequired, type RunEvent } from './events.js';
 import { readProvisionJournal, withInstanceOperation, type InstanceOperation } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import {
@@ -203,6 +203,8 @@ interface World {
   readonly failOnApply: Map<string, Error>;
   /** The resource whose next apply takes effect, then the process dies. */
   crashAfterApply?: string;
+  /** Resources whose next apply takes effect, then Google Cloud reports an expired sign-in. */
+  readonly signInExpiresAfterApply: Set<string>;
 }
 
 function worldResource(world: World, name: string, unknown?: 'create-by-unique-id'): StepResource<World> {
@@ -232,6 +234,9 @@ function worldResource(world: World, name: string, unknown?: 'create-by-unique-i
       const pause = world.pauseOnApply.get(name);
       if (pause) return pause;
       world.present.add(name);
+      if (world.signInExpiresAfterApply.delete(name)) {
+        throw new SignInRequired('Google Cloud sign-in for operator@example.test has expired');
+      }
       if (world.crashAfterApply === name) {
         world.crashAfterApply = undefined;
         throw new Error('The process died after the effect');
@@ -274,15 +279,22 @@ async function engineFixture(ingress: 'existing' | 'managed' = 'existing') {
     pauseOnObserve: new Map(),
     pauseOnApply: new Map(),
     failOnApply: new Map(),
+    signInExpiresAfterApply: new Set(),
   };
   const sleeps: number[] = [];
   const events: RunEvent[] = [];
+  const signIns: string[] = [];
   let steps = worldSteps(world, ingress);
+  let signIn: (() => Promise<void>) | undefined = async () => void signIns.push('signed in');
   return {
     paths,
     world,
     sleeps,
     events,
+    signIns,
+    set signIn(next: (() => Promise<void>) | undefined) {
+      signIn = next;
+    },
     get steps() {
       return steps;
     },
@@ -295,6 +307,7 @@ async function engineFixture(ingress: 'existing' | 'managed' = 'existing') {
         runProvisionSteps(operation, world, steps, {
           emit: (event) => void events.push(event),
           sleep: async (milliseconds) => void sleeps.push(milliseconds),
+          ...(signIn ? { signIn } : {}),
           ...(run ? { run } : {}),
         }),
       );
@@ -427,6 +440,75 @@ describe('step engine', () => {
     engine.world.pauseOnObserve.clear();
     await expect(engine.run()).resolves.toEqual({ status: 'ready' });
     expect(engine.world.applied.filter((name) => name === 'provision_gcp')).toHaveLength(1);
+  });
+
+  it('signs in when a step finds the sign-in expired, then retries it without repeating its mutation', async () => {
+    const engine = await engineFixture();
+    engine.world.signInExpiresAfterApply.add('provision_gcp');
+    const run = await startRunLog({ paths: engine.paths, command: 'resume', instanceId: engine.instanceId });
+
+    await expect(engine.run(run)).resolves.toEqual({ status: 'ready' });
+
+    expect(engine.signIns).toEqual(['signed in']);
+    expect(engine.world.applied.filter((name) => name === 'provision_gcp')).toHaveLength(1);
+    expect(engine.events.filter((event) => event.type === 'step-failed')).toEqual([]);
+    const journal = await engine.journal();
+    expect(journal.steps.provision_gcp?.completed_at).toBeDefined();
+    expect(journal.last_error).toBeUndefined();
+    const rawLog = (await readdir(run.directory, { recursive: true })).find((file) =>
+      file.endsWith('provision-gcp.log'),
+    );
+    expect(await readFile(path.join(run.directory, rawLog!), 'utf8')).toContain(
+      'sign-in for operator@example.test has expired',
+    );
+  });
+
+  it('pauses for sign-in when no person can sign in, and resumes without repeating the mutation', async () => {
+    const engine = await engineFixture();
+    engine.world.signInExpiresAfterApply.add('provision_gcp');
+    engine.signIn = async () => {
+      throw new PauseRequired('gcloud_sign_in_required', 'Google Cloud sign-in is required.', ['Sign in.']);
+    };
+
+    await expect(engine.run()).rejects.toBeInstanceOf(PauseRequired);
+    const paused = await engine.journal();
+    expect(paused.steps.provision_gcp?.completed_at).toBeUndefined();
+    expect(paused.last_error).toBeUndefined();
+
+    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+    expect(engine.world.applied.filter((name) => name === 'provision_gcp')).toHaveLength(1);
+  });
+
+  it('signs in once per step: an expiry that survives sign-in fails the step', async () => {
+    const engine = await engineFixture();
+    engine.steps = {
+      ...engine.steps,
+      provision_gcp: {
+        ...engine.steps.provision_gcp,
+        resources: [
+          {
+            name: 'provision_gcp',
+            observe: async () => {
+              throw new SignInRequired('Google Cloud sign-in for operator@example.test has expired');
+            },
+            apply: async () => undefined,
+          },
+        ],
+      },
+    };
+
+    await expect(engine.run()).rejects.toBeInstanceOf(SignInRequired);
+    expect(engine.signIns).toEqual(['signed in']);
+    expect((await engine.journal()).last_error).toMatchObject({ step: 'provision_gcp', code: 'gcloud_auth_required' });
+  });
+
+  it('fails an expired sign-in as-is when the run has no way to sign in', async () => {
+    const engine = await engineFixture();
+    engine.world.signInExpiresAfterApply.add('provision_gcp');
+    engine.signIn = undefined;
+
+    await expect(engine.run()).rejects.toBeInstanceOf(SignInRequired);
+    expect((await engine.journal()).last_error).toMatchObject({ step: 'provision_gcp', code: 'gcloud_auth_required' });
   });
 
   it('records an input pause as a pause, not a failure', async () => {

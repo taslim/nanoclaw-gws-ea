@@ -21,8 +21,9 @@ const fixture = vi.hoisted(() => {
     note: vi.fn(),
     password: vi.fn(async () => 'fresh-cloudflare-token'),
     confirm: vi.fn(async () => true),
-    ensureGcloudReady: vi.fn(async () => ({ account: 'operator@example.com' })),
+    ensurePrerequisites: vi.fn(async () => ({ account: 'operator@example.com' })),
     signIn: vi.fn(async () => undefined),
+    confirmAccount: vi.fn(async () => true),
     offerDiagnosis: vi.fn(async () => 'answered'),
     dump: vi.fn(),
   };
@@ -43,8 +44,9 @@ vi.mock('./gws-ea-input.js', () => ({
   CLOUDFLARE_API_TOKEN_GUIDANCE: 'cloudflare-token-guidance',
 }));
 vi.mock('./gws-ea-prerequisites.js', () => ({
-  ensureGcloudReady: fixture.ensureGcloudReady,
+  ensurePrerequisites: fixture.ensurePrerequisites,
   signInToGoogleCloud: fixture.signIn,
+  confirmGoogleAccount: fixture.confirmAccount,
 }));
 vi.mock('./gws-ea-assist.js', () => ({ offerDiagnosis: fixture.offerDiagnosis }));
 vi.mock('./lib/runner.js', () => ({ dumpTranscriptOnFailure: fixture.dump }));
@@ -84,7 +86,7 @@ describe('GWS-EA driver', () => {
     expect(runtime.presenter).toBeUndefined();
     expect(runtime.prompts).toBeUndefined();
     expect(runtime.onFailure).toBeUndefined();
-    expect(runtime.preflightGcloud).toBeUndefined();
+    expect(runtime.checkPrerequisites).toBeUndefined();
     expect(runtime.confirmRemoval).toBeUndefined();
     await runtime.collectCreateInputs!({ marker: 'context' } as never);
     expect(fixture.collect).toHaveBeenCalledWith(
@@ -117,25 +119,13 @@ describe('GWS-EA driver', () => {
 
     await runtime.prompts!.googleCloudSignIn('reserved@example.com');
     expect(fixture.signIn).toHaveBeenCalledWith('reserved@example.com');
+    await expect(runtime.prompts!.googleAccount('operator@example.com')).resolves.toBe(true);
+    expect(fixture.confirmAccount).toHaveBeenCalledWith('operator@example.com');
 
-    const order: string[] = [];
-    const interaction = {
-      withTerminal: async <T>(work: () => Promise<T>) => {
-        order.push('suspend');
-        const result = await work();
-        order.push('resume');
-        return result;
-      },
-    } as unknown as Interaction;
-    fixture.ensureGcloudReady.mockImplementationOnce(async () => {
-      order.push('gcloud');
-      return { account: 'reserved@example.com' };
-    });
-    await expect(runtime.preflightGcloud!('reserved@example.com', interaction)).resolves.toEqual({
-      account: 'reserved@example.com',
-    });
-    expect(order).toEqual(['suspend', 'gcloud', 'resume']);
-    expect(fixture.ensureGcloudReady).toHaveBeenCalledWith(process.cwd(), { account: 'reserved@example.com' });
+    const interaction = { marker: 'interaction' } as unknown as Interaction;
+    const request = { command: 'resume', instancesRoot: '/instances', account: 'reserved@example.com' } as const;
+    await runtime.checkPrerequisites!(request, interaction);
+    expect(fixture.ensurePrerequisites).toHaveBeenCalledWith(request, interaction);
   });
 
   it('offers diagnosis, then a retry, after an interactive failure', async () => {
