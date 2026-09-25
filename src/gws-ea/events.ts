@@ -17,7 +17,8 @@ export type RunEvent =
   | { readonly type: 'step-started'; readonly step: string; readonly label?: string }
   | { readonly type: 'step-waiting'; readonly step: string; readonly reason: string }
   | { readonly type: 'step-completed'; readonly step: string }
-  | { readonly type: 'step-paused'; readonly step: string; readonly pause: ProvisionHumanPause }
+  /** `pause` is absent when the step stopped for an input it could not ask for (`PauseRequired`). */
+  | { readonly type: 'step-paused'; readonly step: string; readonly pause?: ProvisionHumanPause }
   | { readonly type: 'step-failed'; readonly step: string; readonly error: unknown; readonly rawLog?: string };
 
 /** Where a step reports: the driver's event listener and the run log. Both optional. */
@@ -34,7 +35,7 @@ export interface StepIdentity {
 /**
  * Run one named step: its commands log to its own raw log, and the driver
  * hears it start, wait, and complete, pause, or fail. `pauseOf` recognizes a
- * result that stops for a person.
+ * result that stops for a person; a thrown `PauseRequired` pauses too.
  */
 export async function runStep<T>(
   reporter: StepReporter,
@@ -58,7 +59,11 @@ export async function runStep<T>(
     emit(pause ? { type: 'step-paused', step: step.id, pause } : { type: 'step-completed', step: step.id });
     return result;
   } catch (error) {
-    emit({ type: 'step-failed', step: step.id, error, ...(log ? { rawLog: log.rawLog } : {}) });
+    emit(
+      error instanceof PauseRequired
+        ? { type: 'step-paused', step: step.id }
+        : { type: 'step-failed', step: step.id, error, ...(log ? { rawLog: log.rawLog } : {}) },
+    );
     throw error;
   }
 }

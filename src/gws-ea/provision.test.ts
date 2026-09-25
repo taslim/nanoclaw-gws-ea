@@ -5,22 +5,30 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { journalResourceKey, readProvisionJournal, withInstanceOperation } from './journal.js';
+import { PauseRequired, pendingActionOf, type RunEvent } from './events.js';
+import { readProvisionJournal, withInstanceOperation, type InstanceOperation } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import {
-  createProductionProvisionRegistry,
+  ABSENT,
+  OBSERVATION_WAITS_SECONDS,
+  PRESENT,
+  runProvisionSteps,
+  type ProvisionHumanPause,
+  type ProvisionResult,
+  type ProvisionStep,
+  type ProvisionSteps,
+  type StepResource,
+} from './phases.js';
+import {
+  createProductionProvisionSteps,
   installProductionBootstrapManifest,
   loadProductionBootstrapManifest,
-  reconcileProvisioning,
   removeProductionBootstrapManifest,
   runProductionProvision,
-  ProvisionBoundaryInterruption,
   type ProductionBootstrapManifest,
   type ProductionProvisionContext,
   type ProductionProvisionDependencies,
 } from './provision.js';
-import type { RunEvent } from './events.js';
-import { defineProvisionPhaseRegistry, type ProvisionPhaseDefinition } from './phases.js';
 import type { MainIdentityDependencies } from './identity.js';
 import { reserveInstance } from './registry.js';
 import {
@@ -31,16 +39,17 @@ import {
 } from './onecli-compose.js';
 import type { ObservedOnecliRuntime, OnecliCompatibilityReceipt } from './onecli.js';
 import { holdLoopbackPorts } from './ports.js';
+import { startRunLog, type RunLog } from './run-log.js';
 import { createInstanceRuntimeConfig, googleChatProjectNumberFile, persistInstanceRuntime } from './service.js';
 import type { CloudflareApi } from './cloudflare-api.js';
 import type { ObservedCloudflareConnector } from './cloudflare-connector.js';
 import {
   GwsEaError,
-  PROVISION_PHASES,
+  PROVISION_STEPS,
   type AllocatedPorts,
   type InstanceReservation,
   type InstanceReservationInput,
-  type ProvisionPhase,
+  type ProvisionStepId,
 } from './types.js';
 
 const roots: string[] = [];
@@ -169,180 +178,373 @@ function bootstrapManifest(paths: ControlPlanePaths): ProductionBootstrapManifes
   };
 }
 
-interface FixtureContext {
-  readonly instanceId: string;
-  readonly resources: Set<ProvisionPhase>;
-  readonly effects: Map<ProvisionPhase, number>;
-  readonly pauseAt?: ProvisionPhase;
-}
-
-function registry(context: FixtureContext) {
-  const entry = (phase: ProvisionPhase): ProvisionPhaseDefinition<FixtureContext> => ({
-    resourceKey: () => `${phase.replaceAll('_', '-')}:${'a'.repeat(64)}`,
-    probe: async () =>
-      context.resources.has(phase)
-        ? { status: 'matched' as const }
-        : context.pauseAt === phase
-          ? {
-              status: 'paused' as const,
-              pause: { kind: 'human-action' as const, phase, code: 'operator_action', message: 'Continue later.' },
-            }
-          : { status: 'absent' as const },
-    apply: async () => {
-      if (context.pauseAt === phase) {
-        return {
-          status: 'paused' as const,
-          pause: { kind: 'human-action' as const, phase, code: 'operator_action', message: 'Continue later.' },
-        };
-      }
-      context.effects.set(phase, (context.effects.get(phase) ?? 0) + 1);
-      context.resources.add(phase);
-      return { status: 'completed' as const };
-    },
-  });
-  return defineProvisionPhaseRegistry({
-    materialize_checkout: entry('materialize_checkout'),
-    provision_gcp: entry('provision_gcp'),
-    start_onecli: entry('start_onecli'),
-    configure_provider: entry('configure_provider'),
-    start_nanoclaw: entry('start_nanoclaw'),
-    establish_transport: entry('establish_transport'),
-    configure_channel: entry('configure_channel'),
-    bind_principal: entry('bind_principal'),
-    verify_conversation: entry('verify_conversation'),
-    ready: entry('ready'),
-  });
-}
-
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-describe('resumable provision phase runner', () => {
-  it('reports each phase as reconciliation advances', async () => {
-    const paths = await testPaths();
-    const input = reservation(paths);
-    await reserveInstance(paths, input);
-    const context: FixtureContext = { instanceId: input.instance_id, resources: new Set(), effects: new Map() };
-    const progress: string[] = [];
-    const runtime = {
-      emit: (event: RunEvent) => {
-        if (event.type === 'step-started') progress.push(event.step);
+const DM_PAUSE: ProvisionHumanPause = {
+  kind: 'human-action',
+  phase: 'bind_principal',
+  code: 'principal_dm_required',
+  message: 'Ask the principal to send a direct message to the configured Google Chat app, then resume.',
+};
+
+/** An in-memory world of named resources for exercising the step engine. */
+interface World {
+  readonly present: Set<string>;
+  readonly observed: string[];
+  readonly applied: string[];
+  /** Observations left before a resource can be observed conclusively. */
+  readonly unknownFor: Map<string, number>;
+  /** Observations left while a runtime is still starting. */
+  readonly startingFor: Map<string, number>;
+  readonly pauseOnObserve: Map<string, ProvisionHumanPause>;
+  readonly pauseOnApply: Map<string, ProvisionHumanPause>;
+  readonly failOnApply: Map<string, Error>;
+  /** The resource whose next apply takes effect, then the process dies. */
+  crashAfterApply?: string;
+}
+
+function worldResource(world: World, name: string, unknown?: 'create-by-unique-id'): StepResource<World> {
+  return {
+    name,
+    ...(unknown ? { unknown } : {}),
+    observe: async () => {
+      world.observed.push(name);
+      const pause = world.pauseOnObserve.get(name);
+      if (pause) return { status: 'pause', pause };
+      const unknownLeft = world.unknownFor.get(name) ?? 0;
+      if (unknownLeft > 0) {
+        world.unknownFor.set(name, unknownLeft - 1);
+        return { status: 'unknown', reason: `Waiting for ${name} to answer…`, evidence: 'HTTP 503 from the API' };
+      }
+      const startingLeft = world.startingFor.get(name) ?? 0;
+      if (startingLeft > 0) {
+        world.startingFor.set(name, startingLeft - 1);
+        return ABSENT;
+      }
+      return world.present.has(name) ? PRESENT : ABSENT;
+    },
+    apply: async () => {
+      world.applied.push(name);
+      const failure = world.failOnApply.get(name);
+      if (failure) throw failure;
+      const pause = world.pauseOnApply.get(name);
+      if (pause) return pause;
+      world.present.add(name);
+      if (world.crashAfterApply === name) {
+        world.crashAfterApply = undefined;
+        throw new Error('The process died after the effect');
+      }
+      return undefined;
+    },
+  };
+}
+
+function worldSteps(world: World, ingress: 'existing' | 'managed' = 'existing'): ProvisionSteps<World> {
+  const step = (id: ProvisionStepId, extra: Partial<ProvisionStep<World>> = {}): ProvisionStep<World> => ({
+    label: `Running ${id}…`,
+    resources: [worldResource(world, id)],
+    ...extra,
+  });
+  const runtime = (id: ProvisionStepId): ProvisionStep<World> => step(id, { liveness: { label: `Checking ${id}…` } });
+  const principalPauseNeeds = ['start_nanoclaw', 'establish_transport'] as const;
+  return {
+    materialize_checkout: step('materialize_checkout'),
+    provision_gcp: step('provision_gcp'),
+    start_onecli: runtime('start_onecli'),
+    configure_provider: step('configure_provider'),
+    start_nanoclaw: runtime('start_nanoclaw'),
+    establish_transport: ingress === 'managed' ? runtime('establish_transport') : step('establish_transport'),
+    configure_channel: step('configure_channel'),
+    bind_principal: step('bind_principal', { pauseNeeds: principalPauseNeeds }),
+    verify_conversation: step('verify_conversation', { pauseNeeds: principalPauseNeeds }),
+  };
+}
+
+async function engineFixture(ingress: 'existing' | 'managed' = 'existing') {
+  const paths = await testPaths();
+  const reserved = await reserveInstance(paths, reservation(paths));
+  const world: World = {
+    present: new Set(),
+    observed: [],
+    applied: [],
+    unknownFor: new Map(),
+    startingFor: new Map(),
+    pauseOnObserve: new Map(),
+    pauseOnApply: new Map(),
+    failOnApply: new Map(),
+  };
+  const sleeps: number[] = [];
+  const events: RunEvent[] = [];
+  let steps = worldSteps(world, ingress);
+  return {
+    paths,
+    world,
+    sleeps,
+    events,
+    get steps() {
+      return steps;
+    },
+    set steps(next: ProvisionSteps<World>) {
+      steps = next;
+    },
+    journal: () => readProvisionJournal(paths, reserved.instance_id),
+    run: async (run?: RunLog): Promise<ProvisionResult> => {
+      const result = await withInstanceOperation(paths, reserved.instance_id, (operation) =>
+        runProvisionSteps(operation, world, steps, {
+          emit: (event) => void events.push(event),
+          sleep: async (milliseconds) => void sleeps.push(milliseconds),
+          ...(run ? { run } : {}),
+        }),
+      );
+      if (!result) throw new Error('The instance operation was busy');
+      return result;
+    },
+    instanceId: reserved.instance_id,
+  };
+}
+
+function startedSteps(events: readonly RunEvent[]): string[] {
+  return events.flatMap((event) => (event.type === 'step-started' ? [event.step] : []));
+}
+
+const FULL_WAIT = OBSERVATION_WAITS_SECONDS.map((seconds) => seconds * 1_000);
+
+describe('step engine', () => {
+  it('runs a fresh instance in order, recording when each step started and completed', async () => {
+    const engine = await engineFixture();
+
+    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+
+    expect(startedSteps(engine.events)).toEqual([...PROVISION_STEPS]);
+    expect(engine.world.applied).toEqual([...PROVISION_STEPS]);
+    const journal = await engine.journal();
+    let previous = journal.started_at;
+    for (const id of PROVISION_STEPS) {
+      const step = journal.steps[id];
+      expect(step?.completed_at, id).toBeDefined();
+      expect(step!.started_at >= previous, id).toBe(true);
+      expect(step!.completed_at! >= step!.started_at, id).toBe(true);
+      previous = step!.completed_at!;
+    }
+  });
+
+  it('resumes an interrupted step by observing its effect, without applying it again', async () => {
+    const engine = await engineFixture();
+    engine.world.crashAfterApply = 'start_onecli';
+
+    await expect(engine.run()).rejects.toThrow('The process died after the effect');
+    const interrupted = await engine.journal();
+    expect(interrupted.steps.provision_gcp?.completed_at).toBeDefined();
+    expect(interrupted.steps.start_onecli).toEqual({ started_at: expect.any(String) });
+    expect(interrupted.last_error).toMatchObject({ step: 'start_onecli', code: 'unexpected' });
+
+    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+    expect(engine.world.applied.filter((name) => name === 'start_onecli')).toHaveLength(1);
+    const resumed = await engine.journal();
+    expect(resumed.steps.start_onecli?.started_at).toBe(interrupted.steps.start_onecli?.started_at);
+    expect(resumed.last_error).toBeUndefined();
+  });
+
+  it('applies only the absent resource of a step with two', async () => {
+    const engine = await engineFixture();
+    engine.steps = {
+      ...engine.steps,
+      start_nanoclaw: {
+        ...engine.steps.start_nanoclaw,
+        resources: [worldResource(engine.world, 'host'), worldResource(engine.world, 'identity')],
+      },
+    };
+    engine.world.present.add('host');
+
+    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+    expect(engine.world.applied).toContain('identity');
+    expect(engine.world.applied).not.toContain('host');
+  });
+
+  it('waits out an unknown observation and completes without applying', async () => {
+    const engine = await engineFixture();
+    engine.world.present.add('provision_gcp');
+    engine.world.unknownFor.set('provision_gcp', 2);
+
+    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+    expect(engine.world.applied).not.toContain('provision_gcp');
+    expect(engine.sleeps).toEqual([1_000, 2_000]);
+    expect(engine.events.filter((event) => event.type === 'step-waiting')).toEqual([
+      { type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for provision_gcp to answer…' },
+      { type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for provision_gcp to answer…' },
+    ]);
+  });
+
+  it('stops with evidence and changes nothing when an observation stays unknown past the deadline', async () => {
+    const engine = await engineFixture();
+    engine.world.unknownFor.set('provision_gcp', 99);
+    const run = await startRunLog({ paths: engine.paths, command: 'resume', instanceId: engine.instanceId });
+
+    const failure = await engine.run(run).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ code: 'observation_unknown', details: { evidence: 'HTTP 503 from the API' } });
+    expect((failure as GwsEaError).message).toContain('Waiting for provision_gcp to answer…');
+    expect(engine.sleeps).toEqual(FULL_WAIT);
+    expect(engine.world.applied).toEqual(['materialize_checkout']);
+    const journal = await engine.journal();
+    expect(journal.steps.provision_gcp?.completed_at).toBeUndefined();
+    expect(journal.last_error).toMatchObject({ step: 'provision_gcp', code: 'observation_unknown' });
+    expect(await readFile(journal.last_error!.log!, 'utf8')).toContain('HTTP 503 from the API');
+  });
+
+  it('creates a resource under its own unique ID without waiting out an unknown observation', async () => {
+    const engine = await engineFixture();
+    engine.steps = {
+      ...engine.steps,
+      provision_gcp: {
+        ...engine.steps.provision_gcp,
+        resources: [worldResource(engine.world, 'provision_gcp', 'create-by-unique-id')],
+      },
+    };
+    engine.world.unknownFor.set('provision_gcp', 1);
+
+    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+    expect(engine.world.applied).toContain('provision_gcp');
+    expect(engine.sleeps).toEqual([]);
+  });
+
+  it('pauses when an observation needs sign-in, and continues after it', async () => {
+    const engine = await engineFixture();
+    const signIn: ProvisionHumanPause = {
+      kind: 'human-action',
+      phase: 'provision_gcp',
+      code: 'gcloud_sign_in_required',
+      message: 'Sign in to Google Cloud, then resume.',
+    };
+    engine.world.pauseOnObserve.set('provision_gcp', signIn);
+
+    await expect(engine.run()).resolves.toEqual({ status: 'paused', pause: signIn });
+    expect(engine.world.applied).toEqual(['materialize_checkout']);
+    expect((await engine.journal()).steps.provision_gcp?.completed_at).toBeUndefined();
+
+    engine.world.pauseOnObserve.clear();
+    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+    expect(engine.world.applied.filter((name) => name === 'provision_gcp')).toHaveLength(1);
+  });
+
+  it('records an input pause as a pause, not a failure', async () => {
+    const engine = await engineFixture();
+    engine.world.failOnApply.set(
+      'configure_provider',
+      new PauseRequired('input_required', 'The provider credential is required.', ['Set GWS_EA_PROVIDER_CREDENTIAL.']),
+    );
+    const run = await startRunLog({ paths: engine.paths, command: 'resume', instanceId: engine.instanceId });
+
+    await expect(engine.run(run)).rejects.toBeInstanceOf(PauseRequired);
+
+    const journal = await engine.journal();
+    expect(journal.last_error).toBeUndefined();
+    expect(journal.steps.configure_provider).toEqual({ started_at: expect.any(String) });
+    const progress = await readFile(run.progressLog, 'utf8');
+    expect(progress).toMatch(/configure_provider \[\S+\] → paused/u);
+    expect(progress).not.toContain('→ failed');
+  });
+
+  it('checks completed runtime steps once per run, waiting on one that is still starting', async () => {
+    const engine = await engineFixture();
+    const chat: ProvisionHumanPause = { ...DM_PAUSE, phase: 'configure_channel', code: 'chat_configuration_required' };
+    engine.world.pauseOnApply.set('configure_channel', chat);
+    await expect(engine.run()).resolves.toMatchObject({ status: 'paused' });
+
+    engine.world.pauseOnApply.clear();
+    engine.world.startingFor.set('start_onecli', 2);
+    engine.world.observed.length = 0;
+    engine.events.length = 0;
+    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+
+    expect(startedSteps(engine.events).slice(0, 2)).toEqual(['start_onecli', 'start_nanoclaw']);
+    expect(engine.events[0]).toEqual({ type: 'step-started', step: 'start_onecli', label: 'Checking start_onecli…' });
+    expect(engine.world.observed.filter((name) => name === 'start_onecli')).toHaveLength(3);
+    expect(engine.world.observed.filter((name) => name === 'start_nanoclaw')).toHaveLength(1);
+    expect(engine.world.observed).not.toContain('materialize_checkout');
+    expect(engine.world.observed).not.toContain('provision_gcp');
+    expect(engine.world.observed).not.toContain('configure_provider');
+    expect(engine.sleeps).toEqual([1_000, 2_000]);
+    expect(engine.world.applied.filter((name) => name === 'start_onecli')).toHaveLength(1);
+  });
+
+  it('repairs a stopped runtime locally only after the bounded wait', async () => {
+    const engine = await engineFixture();
+    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+
+    engine.world.present.delete('start_nanoclaw');
+    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+
+    expect(engine.sleeps).toEqual(FULL_WAIT);
+    expect(engine.world.applied.filter((name) => name === 'start_nanoclaw')).toHaveLength(2);
+    expect(engine.world.applied.filter((name) => name === 'configure_provider')).toHaveLength(1);
+  });
+
+  it.each([
+    ['existing', ['start_nanoclaw']],
+    ['managed', ['start_nanoclaw', 'establish_transport']],
+  ] as const)('before the DM pause re-checks only the host (and connector when %s)', async (ingress, rechecked) => {
+    const engine = await engineFixture(ingress);
+    engine.world.pauseOnApply.set('bind_principal', DM_PAUSE);
+    await expect(engine.run()).resolves.toEqual({ status: 'paused', pause: DM_PAUSE });
+
+    engine.world.observed.length = 0;
+    await expect(engine.run()).resolves.toEqual({ status: 'paused', pause: DM_PAUSE });
+
+    const afterPause = engine.world.observed.slice(engine.world.observed.lastIndexOf('bind_principal') + 1);
+    expect(afterPause).toEqual(rechecked);
+  });
+
+  it('still names the pending human action when a failed re-check blocks the pause', async () => {
+    const engine = await engineFixture();
+    const hostDown = new GwsEaError('nanoclaw_not_ready', 'NanoClaw did not become ready');
+    engine.steps = {
+      ...engine.steps,
+      bind_principal: {
+        ...engine.steps.bind_principal,
+        resources: [
+          {
+            name: 'bind_principal',
+            observe: async () => ABSENT,
+            apply: async () => {
+              engine.world.present.delete('start_nanoclaw');
+              engine.world.failOnApply.set('start_nanoclaw', hostDown);
+              return DM_PAUSE;
+            },
+          },
+        ],
       },
     };
 
-    await withInstanceOperation(paths, input.instance_id, (operation) =>
-      reconcileProvisioning(operation, context, registry(context), runtime),
-    );
+    const failure = await engine.run().catch((error: unknown) => error);
 
-    expect(progress).toEqual(PROVISION_PHASES);
+    expect(failure).toBe(hostDown);
+    expect(pendingActionOf(failure)).toBe(DM_PAUSE);
+    expect((await engine.journal()).last_error).toMatchObject({ step: 'start_nanoclaw', code: 'nanoclaw_not_ready' });
   });
 
-  it.each(['intent', 'effect', 'verify'] as const)(
-    'resumes after interruption at the %s boundary without duplicating a resource',
-    async (boundary) => {
-      const paths = await testPaths();
-      const input = reservation(paths);
-      await reserveInstance(paths, input);
-      const context: FixtureContext = { instanceId: input.instance_id, resources: new Set(), effects: new Map() };
-      let interrupted = false;
+  it('refuses a pre-v3 journal before running any step', async () => {
+    const engine = await engineFixture();
+    await writeFile(
+      engine.paths.journalFile(engine.instanceId),
+      JSON.stringify({ schema_version: 1, instance_id: engine.instanceId, phases: {} }),
+      { mode: 0o600 },
+    );
 
-      await expect(
-        withInstanceOperation(paths, input.instance_id, async (operation) => {
-          await reconcileProvisioning(operation, context, registry(context), {
-            onBoundary: (event) => {
-              if (!interrupted && event.phase === 'materialize_checkout' && event.boundary === boundary) {
-                interrupted = true;
-                throw new ProvisionBoundaryInterruption(event);
-              }
-            },
-          });
-        }),
-      ).rejects.toBeInstanceOf(ProvisionBoundaryInterruption);
-
-      await withInstanceOperation(paths, input.instance_id, async (operation) => {
-        expect(await reconcileProvisioning(operation, context, registry(context))).toEqual({ status: 'ready' });
-      });
-
-      expect(context.effects.get('materialize_checkout')).toBe(1);
-      expect([...context.resources]).toEqual(PROVISION_PHASES);
-      const journal = await readProvisionJournal(paths, input.instance_id);
-      expect(journal.phases.ready.attempts.at(-1)?.succeeded_at).toBeDefined();
-    },
-  );
+    await expect(engine.run()).rejects.toMatchObject({ code: 'unsupported_journal' });
+    expect(engine.world.observed).toEqual([]);
+  });
 
   it('releases the instance lock while paused for a human action', async () => {
-    const paths = await testPaths();
-    const input = reservation(paths);
-    await reserveInstance(paths, input);
-    const context: FixtureContext = {
-      instanceId: input.instance_id,
-      resources: new Set(PROVISION_PHASES.slice(0, 6)),
-      effects: new Map(),
-      pauseAt: 'bind_principal',
-    };
+    const engine = await engineFixture();
+    engine.world.pauseOnApply.set('bind_principal', DM_PAUSE);
 
-    const result = await withInstanceOperation(paths, input.instance_id, (operation) =>
-      reconcileProvisioning(operation, context, registry(context)),
+    await expect(engine.run()).resolves.toMatchObject({ status: 'paused' });
+    await expect(withInstanceOperation(engine.paths, engine.instanceId, async () => 'reacquired')).resolves.toBe(
+      'reacquired',
     );
-    expect(result).toMatchObject({ status: 'paused', pause: { phase: 'bind_principal' } });
-
-    await expect(withInstanceOperation(paths, input.instance_id, async () => 'lock-reacquired')).resolves.toBe(
-      'lock-reacquired',
-    );
-  });
-
-  it('re-probes every completed phase and performs no effects on a repeated complete run', async () => {
-    const paths = await testPaths();
-    const input = reservation(paths);
-    await reserveInstance(paths, input);
-    const context: FixtureContext = { instanceId: input.instance_id, resources: new Set(), effects: new Map() };
-
-    await withInstanceOperation(paths, input.instance_id, (operation) =>
-      reconcileProvisioning(operation, context, registry(context)),
-    );
-    const firstEffects = new Map(context.effects);
-    const probes: ProvisionPhase[] = [];
-    const definitions = registry(context);
-    const wrapped = defineProvisionPhaseRegistry(
-      Object.fromEntries(
-        PROVISION_PHASES.map((phase) => [
-          phase,
-          {
-            ...definitions[phase],
-            probe: async (value: FixtureContext) => {
-              probes.push(phase);
-              return definitions[phase].probe(value);
-            },
-          },
-        ]),
-      ) as unknown as Parameters<typeof defineProvisionPhaseRegistry<FixtureContext>>[0],
-    );
-
-    await withInstanceOperation(paths, input.instance_id, async (operation) => {
-      expect(await reconcileProvisioning(operation, context, wrapped)).toEqual({ status: 'ready' });
-    });
-    expect(probes).toEqual(PROVISION_PHASES);
-    expect(context.effects).toEqual(firstEffects);
-  });
-
-  it('fails closed when a completed phase postcondition has drifted', async () => {
-    const paths = await testPaths();
-    const input = reservation(paths);
-    await reserveInstance(paths, input);
-    const context: FixtureContext = { instanceId: input.instance_id, resources: new Set(), effects: new Map() };
-
-    await withInstanceOperation(paths, input.instance_id, (operation) =>
-      reconcileProvisioning(operation, context, registry(context)),
-    );
-    context.resources.delete('start_onecli');
-
-    await expect(
-      withInstanceOperation(paths, input.instance_id, (operation) =>
-        reconcileProvisioning(operation, context, registry(context)),
-      ),
-    ).rejects.toThrow(/postcondition.*start_onecli/i);
-    expect(context.effects.get('start_onecli')).toBe(1);
   });
 });
 
@@ -420,10 +622,7 @@ describe('production bootstrap trust boundary', () => {
   });
 });
 
-function productionContext(
-  operation: Parameters<typeof createProductionProvisionRegistry>[0]['operation'],
-  reserved: InstanceReservation,
-): ProductionProvisionContext {
+function productionContext(operation: InstanceOperation, reserved: InstanceReservation): ProductionProvisionContext {
   const onecli = createOnecliRuntimeLayout({
     instanceId: reserved.instance_id,
     instanceRoot: operation.paths.instanceRoot(reserved.instance_id),
@@ -489,6 +688,7 @@ function productionContext(
       },
       adapterInstance: 'gchat',
       provisioningStartedAt: '2026-09-18T18:00:00.000Z',
+      chatConfigured: false,
       serviceDependencies: {
         platform: 'macos',
         homeDirectory: path.dirname(operation.paths.stateRoot),
@@ -542,7 +742,39 @@ function probeIdentityDependencies(
   };
 }
 
-describe('production provision phase composition', () => {
+/** Run one production step through the engine; every other step is already satisfied. */
+function runAlone(
+  operation: InstanceOperation,
+  context: ProductionProvisionContext,
+  id: ProvisionStepId,
+  step: ProvisionStep<ProductionProvisionContext>,
+  runtime: Parameters<typeof runProvisionSteps>[3] = {},
+): Promise<ProvisionResult> {
+  const satisfied: ProvisionStep<ProductionProvisionContext> = {
+    label: 'Already satisfied…',
+    resources: [{ name: 'nothing', observe: async () => PRESENT, apply: async () => undefined }],
+  };
+  const steps = { ...Object.fromEntries(PROVISION_STEPS.map((other) => [other, satisfied])), [id]: step };
+  return runProvisionSteps(operation, context, steps as ProvisionSteps<ProductionProvisionContext>, runtime);
+}
+
+describe('production provision step composition', () => {
+  it.each([
+    ['existing', ['start_onecli', 'start_nanoclaw']],
+    ['managed', ['start_onecli', 'start_nanoclaw', 'establish_transport']],
+  ] as const)('re-checks only runtime steps once complete (%s ingress)', async (mode, runtime) => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, mode === 'managed' ? managedReservation(paths) : reservation(paths));
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const steps = createProductionProvisionSteps(productionContext(operation, reserved));
+      expect(PROVISION_STEPS.filter((id) => steps[id].liveness)).toEqual(runtime);
+      expect(steps.bind_principal.pauseNeeds).toEqual(['start_nanoclaw', 'establish_transport']);
+      expect(steps.verify_conversation.pauseNeeds).toEqual(['start_nanoclaw', 'establish_transport']);
+      expect(steps.configure_channel.pauseNeeds).toBeUndefined();
+    });
+  });
+
   it('forwards delayed Google Cloud readback progress through the provision runtime', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
@@ -556,13 +788,13 @@ describe('production provision phase composition', () => {
       ) => {
         await dependencies?.onProgress?.({ resource: 'service-account' });
       };
-      const phase = createProductionProvisionRegistry(
+      const phase = createProductionProvisionSteps(
         context,
         { reconcileGcpProject },
         { emit: (event) => void progress.push(event) },
-      ).provision_gcp;
+      ).provision_gcp.resources[0]!;
 
-      await expect(phase.apply(context)).resolves.toEqual({ status: 'completed' });
+      await expect(phase.apply(context)).resolves.toBeUndefined();
     });
 
     expect(progress).toEqual([
@@ -585,138 +817,50 @@ describe('production provision phase composition', () => {
         ...base,
         input: { ...base.input, identityDependencies: probeIdentityDependencies(base, state) },
       };
-      const phase = createProductionProvisionRegistry(context).start_nanoclaw;
+      const phase = createProductionProvisionSteps(context).start_nanoclaw.resources[1]!;
 
-      await expect(phase.probe(context)).resolves.toEqual({ status: 'matched' });
+      await expect(phase.observe(context)).resolves.toEqual(PRESENT);
       expect(state.onecliCalls).toEqual([['agents', 'list', '--max', '0']]);
 
       state.agents = [{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'selective' }];
       state.onecliCalls.length = 0;
-      await expect(phase.probe(context)).resolves.toEqual({ status: 'absent' });
+      await expect(phase.observe(context)).resolves.toEqual(ABSENT);
       expect(state.onecliCalls).toEqual([['agents', 'list', '--max', '0']]);
     });
   });
 
-  it('upgrades only canonical main when a completed selective installation resumes', async () => {
-    const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
-
-    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
-      const initial = productionContext(operation, reserved);
-      const completedDefinition = (phase: ProvisionPhase): ProvisionPhaseDefinition<ProductionProvisionContext> => ({
-        resourceKey: () => `legacy:${'a'.repeat(64)}`,
-        probe: async (value) => {
-          if (phase === 'configure_provider') value.state.providerSecretId = 'secret-provider';
-          return { status: 'matched' };
-        },
-        apply: async () => ({ status: 'completed' }),
-      });
-      const completedRegistry = defineProvisionPhaseRegistry(
-        Object.fromEntries(
-          PROVISION_PHASES.map((phase) => [phase, completedDefinition(phase)]),
-        ) as unknown as Parameters<typeof defineProvisionPhaseRegistry<ProductionProvisionContext>>[0],
-      );
-      await expect(reconcileProvisioning(operation, initial, completedRegistry)).resolves.toEqual({ status: 'ready' });
-
-      const identityState: ProbeIdentityState = {
-        agents: [
-          { id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'selective' },
-          { id: 'oc-other', identifier: 'ag-other', name: 'other', secretMode: 'selective' },
-        ],
-        onecliCalls: [],
-        providerSecretIds: ['secret-provider'],
-      };
-      const resumedBase: ProductionProvisionContext = { ...productionContext(operation, reserved), state: {} };
-      const resumed: ProductionProvisionContext = {
-        ...resumedBase,
-        input: {
-          ...resumedBase.input,
-          identityDependencies: probeIdentityDependencies(resumedBase, identityState),
-        },
-      };
-      await mkdir(path.dirname(resumed.input.runtime.secret_files.gchat_credentials), {
-        recursive: true,
-        mode: 0o700,
-      });
-      const reconcileMainIdentity = vi.fn(async () => {
-        identityState.agents = identityState.agents.map((agent) =>
-          agent.id === 'oc-main' ? { ...agent, secretMode: 'all' as const } : agent,
-        );
-        return { agentGroupId: 'ag-main', onecliAgentId: 'oc-main' };
-      });
-      const production = createProductionProvisionRegistry(resumed, {
-        reconcileMainIdentity,
-        getOwnedGcpProjectNumber: async () => '441811502258',
-      });
-      const resumedRegistry = defineProvisionPhaseRegistry(
-        Object.fromEntries(
-          PROVISION_PHASES.map((phase) => [
-            phase,
-            phase === 'start_nanoclaw' ? production.start_nanoclaw : completedDefinition(phase),
-          ]),
-        ) as unknown as Parameters<typeof defineProvisionPhaseRegistry<ProductionProvisionContext>>[0],
-      );
-
-      await expect(reconcileProvisioning(operation, resumed, resumedRegistry)).resolves.toEqual({ status: 'ready' });
-      expect(reconcileMainIdentity).toHaveBeenCalledOnce();
-      expect(identityState.agents).toEqual([
-        { id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'all' },
-        { id: 'oc-other', identifier: 'ag-other', name: 'other', secretMode: 'selective' },
-      ]);
-      expect(identityState.onecliCalls.filter((args) => args[1] === 'secrets')).toEqual([
-        ['agents', 'secrets', '--id', 'oc-main'],
-      ]);
-    });
-  });
-
-  it('repairs a completed OneCLI runtime without accepting unsafe drift', async () => {
+  it('repairs a stopped OneCLI runtime only after the liveness wait, and refuses unsafe drift', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
-      const completedDefinition: ProvisionPhaseDefinition<ProductionProvisionContext> = {
-        resourceKey: () => `existing:${'a'.repeat(64)}`,
-        probe: async () => ({ status: 'matched' }),
-        apply: async () => ({ status: 'completed' }),
-      };
-      const completedRegistry = defineProvisionPhaseRegistry(
-        Object.fromEntries(PROVISION_PHASES.map((phase) => [phase, completedDefinition])) as unknown as Parameters<
-          typeof defineProvisionPhaseRegistry<ProductionProvisionContext>
-        >[0],
-      );
-      await expect(reconcileProvisioning(operation, context, completedRegistry)).resolves.toEqual({ status: 'ready' });
-
-      let recovered = false;
+      let running = true;
       let unsafe = false;
       const receipt = Object.freeze({}) as OnecliCompatibilityReceipt;
       const reconcileOnecliRuntime = vi.fn(async () => {
-        recovered = true;
+        running = true;
         return receipt;
       });
       const persistOnecliApiKeyFiles = vi.fn(async () => undefined);
-      const probeOnecli = vi.fn(async () => {
+      const observeOnecli = vi.fn(async () => {
         if (unsafe) throw new GwsEaError('unsafe_onecli_owner', 'Foreign OneCLI resource');
-        return recovered ? { status: 'matched' as const } : { status: 'absent' as const };
+        return running ? PRESENT : ABSENT;
       });
-      const production = createProductionProvisionRegistry(context, {
-        probeOnecli,
+      const step = createProductionProvisionSteps(context, {
+        observeOnecli,
         reconcileOnecliRuntime,
         persistOnecliApiKeyFiles,
-        holdReservedLoopbackPorts: async () => {
-          throw new Error('A completed runtime must not reclaim ports already bound by OneCLI');
-        },
-      });
-      const resumedRegistry = defineProvisionPhaseRegistry(
-        Object.fromEntries(
-          PROVISION_PHASES.map((phase) => [
-            phase,
-            phase === 'start_onecli' ? production.start_onecli : completedDefinition,
-          ]),
-        ) as unknown as Parameters<typeof defineProvisionPhaseRegistry<ProductionProvisionContext>>[0],
-      );
+        holdReservedLoopbackPorts: async () => ({ release: async () => undefined }),
+      }).start_onecli;
+      const sleeps: number[] = [];
+      const runtime = { sleep: async (milliseconds: number) => void sleeps.push(milliseconds) };
+      await expect(runAlone(operation, context, 'start_onecli', step, runtime)).resolves.toEqual({ status: 'ready' });
+      expect(reconcileOnecliRuntime).not.toHaveBeenCalled();
 
-      await expect(reconcileProvisioning(operation, context, resumedRegistry)).resolves.toEqual({ status: 'ready' });
+      running = false;
+      await expect(runAlone(operation, context, 'start_onecli', step, runtime)).resolves.toEqual({ status: 'ready' });
+      expect(sleeps).toEqual(FULL_WAIT);
       expect(reconcileOnecliRuntime).toHaveBeenCalledOnce();
       expect(persistOnecliApiKeyFiles).toHaveBeenCalledWith(receipt, {
         runtime: context.input.runtime.secret_files.onecli_runtime_api_key,
@@ -725,7 +869,7 @@ describe('production provision phase composition', () => {
       expect(context.state.onecliReceipt).toBe(receipt);
 
       unsafe = true;
-      await expect(reconcileProvisioning(operation, context, resumedRegistry)).rejects.toMatchObject({
+      await expect(runAlone(operation, context, 'start_onecli', step, runtime)).rejects.toMatchObject({
         code: 'unsafe_onecli_owner',
       });
       expect(reconcileOnecliRuntime).toHaveBeenCalledOnce();
@@ -749,12 +893,12 @@ describe('production provision phase composition', () => {
         bindObservations.push(await canClaim(ports.onecli_app));
         return receipt;
       });
-      const phase = createProductionProvisionRegistry(context, {
+      const phase = createProductionProvisionSteps(context, {
         reconcileOnecliRuntime,
         persistOnecliApiKeyFiles: vi.fn(async () => undefined),
-      }).start_onecli;
+      }).start_onecli.resources[0]!;
 
-      await expect(phase.apply(context)).resolves.toEqual({ status: 'completed' });
+      await expect(phase.apply(context)).resolves.toBeUndefined();
       expect(reconcileOnecliRuntime).toHaveBeenCalledOnce();
     });
 
@@ -776,7 +920,7 @@ describe('production provision phase composition', () => {
     try {
       await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
         const context = productionContext(operation, reserved);
-        const phase = createProductionProvisionRegistry(context, { reconcileOnecliRuntime }).start_onecli;
+        const phase = createProductionProvisionSteps(context, { reconcileOnecliRuntime }).start_onecli.resources[0]!;
 
         await expect(phase.apply(context)).rejects.toMatchObject({
           code: 'port_claim_lost',
@@ -808,15 +952,15 @@ describe('production provision phase composition', () => {
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
-      const phase = createProductionProvisionRegistry(context, {
+      const phase = createProductionProvisionSteps(context, {
         holdReservedLoopbackPorts,
         inspectOnecliRuntime,
         validateObservedOnecliRuntime,
         reconcileOnecliRuntime,
         persistOnecliApiKeyFiles,
-      }).start_onecli;
+      }).start_onecli.resources[0]!;
 
-      await expect(phase.apply(context)).resolves.toEqual({ status: 'completed' });
+      await expect(phase.apply(context)).resolves.toBeUndefined();
       expect(inspectOnecliRuntime).toHaveBeenCalledWith(context.input.onecli);
       expect(validateObservedOnecliRuntime).toHaveBeenCalledWith(context.input.onecli, observed);
       expect(reconcileOnecliRuntime).toHaveBeenCalledWith(context.input.onecli, undefined);
@@ -860,9 +1004,9 @@ describe('production provision phase composition', () => {
         }),
       };
 
-      const registry = createProductionProvisionRegistry(context, dependencies);
-      await registry.start_onecli.apply(context);
-      await registry.configure_provider.apply(context);
+      const registry = createProductionProvisionSteps(context, dependencies);
+      await registry.start_onecli.resources[0]!.apply(context);
+      await registry.configure_provider.resources[0]!.apply(context);
     });
 
     expect(order).toEqual(['onecli', 'collect', 'import:prompted-secret']);
@@ -889,11 +1033,11 @@ describe('production provision phase composition', () => {
           }),
         },
       };
-      const registry = createProductionProvisionRegistry(context, {
+      const registry = createProductionProvisionSteps(context, {
         importProviderCredential,
       });
 
-      await expect(registry.configure_provider.apply(context)).rejects.toMatchObject({
+      await expect(registry.configure_provider.resources[0]!.apply(context)).rejects.toMatchObject({
         code: 'provider_credential_mismatch',
       });
     });
@@ -969,11 +1113,11 @@ describe('production provision phase composition', () => {
         }),
         managedTransportDelay: vi.fn(async () => undefined),
       };
-      const phase = createProductionProvisionRegistry(context, dependencies).establish_transport;
+      const phase = createProductionProvisionSteps(context, dependencies).establish_transport.resources[0]!;
 
-      await expect(phase.probe(context)).resolves.toEqual({ status: 'absent' });
-      await expect(phase.apply(context)).resolves.toEqual({ status: 'completed' });
-      await expect(phase.probe(context)).resolves.toEqual({ status: 'matched' });
+      await expect(phase.observe(context)).resolves.toEqual(ABSENT);
+      await expect(phase.apply(context)).resolves.toBeUndefined();
+      await expect(phase.observe(context)).resolves.toEqual(PRESENT);
     });
 
     expect(order).toEqual([
@@ -1002,7 +1146,7 @@ describe('production provision phase composition', () => {
         ...base,
         input: { ...base.input, requestCloudflareAccountToken },
       };
-      const phase = createProductionProvisionRegistry(context, {
+      const phase = createProductionProvisionSteps(context, {
         createCloudflareApi,
         inspectCloudflareConnector: vi.fn(async () => observedConnector),
         validateCloudflareConnectorState: vi.fn(async () => undefined),
@@ -1011,9 +1155,9 @@ describe('production provision phase composition', () => {
           endpointUrl,
           listenerId: '22222222-2222-4222-8222-222222222222',
         })),
-      }).establish_transport;
+      }).establish_transport.resources[0]!;
 
-      await expect(phase.probe(context)).resolves.toEqual({ status: 'matched' });
+      await expect(phase.observe(context)).resolves.toEqual(PRESENT);
     });
 
     expect(requestCloudflareAccountToken).not.toHaveBeenCalled();
@@ -1033,16 +1177,16 @@ describe('production provision phase composition', () => {
         ...base,
         input: { ...base.input, requestCloudflareAccountToken },
       };
-      const phase = createProductionProvisionRegistry(context, {
+      const phase = createProductionProvisionSteps(context, {
         inspectCloudflareConnector: vi.fn(async () => observedConnector),
         validateObservedCloudflareConnector: vi.fn(),
         validateCloudflareConnectorState: vi.fn(async () => {
           throw new GwsEaError('cloudflare_connector_state_missing', 'Cloudflare connector private state is missing');
         }),
         verifyManagedRoute,
-      }).establish_transport;
+      }).establish_transport.resources[0]!;
 
-      await expect(phase.probe(context)).resolves.toEqual({ status: 'absent' });
+      await expect(phase.observe(context)).resolves.toEqual(ABSENT);
       expect(context.state.managedTransportObservation).toBe('Cloudflare connector private state is missing');
     });
 
@@ -1063,15 +1207,15 @@ describe('production provision phase composition', () => {
         ...base,
         input: { ...base.input, requestCloudflareAccountToken },
       };
-      const phase = createProductionProvisionRegistry(context, {
+      const phase = createProductionProvisionSteps(context, {
         createCloudflareApi,
         inspectCloudflareConnector: vi.fn(async () => observedConnector),
         validateObservedCloudflareConnector: vi.fn(() => {
           throw new GwsEaError('unsafe_connector_owner', 'Cloudflare connector ownership labels are invalid');
         }),
-      }).establish_transport;
+      }).establish_transport.resources[0]!;
 
-      await expect(phase.probe(context)).rejects.toMatchObject({ code: 'unsafe_connector_owner' });
+      await expect(phase.observe(context)).rejects.toMatchObject({ code: 'unsafe_connector_owner' });
     });
 
     expect(requestCloudflareAccountToken).not.toHaveBeenCalled();
@@ -1090,14 +1234,14 @@ describe('production provision phase composition', () => {
         ...base,
         input: { ...base.input, requestCloudflareAccountToken },
       };
-      const phase = createProductionProvisionRegistry(context, {
+      const phase = createProductionProvisionSteps(context, {
         createCloudflareApi,
         inspectCloudflareConnector: vi.fn(async () => {
           throw new GwsEaError('command_failed', 'Docker connector inspection failed');
         }),
-      }).establish_transport;
+      }).establish_transport.resources[0]!;
 
-      await expect(phase.probe(context)).rejects.toMatchObject({ code: 'command_failed' });
+      await expect(phase.observe(context)).rejects.toMatchObject({ code: 'command_failed' });
     });
 
     expect(requestCloudflareAccountToken).not.toHaveBeenCalled();
@@ -1133,7 +1277,7 @@ describe('production provision phase composition', () => {
           endpointUrl: 'https://assistant.example.com/webhook/gchat',
           listenerId: '22222222-2222-4222-8222-222222222222',
         });
-      const phase = createProductionProvisionRegistry(context, {
+      const phase = createProductionProvisionSteps(context, {
         createCloudflareApi: vi.fn(() => api),
         reconcileManagedCloudflareIngress: vi.fn(async () => ({
           tunnelId: '11111111-1111-4111-8111-111111111111',
@@ -1146,11 +1290,11 @@ describe('production provision phase composition', () => {
         reconcileCloudflareConnector: vi.fn(async () => observedConnector),
         verifyManagedRoute,
         managedTransportDelay: vi.fn(async () => undefined),
-      }).establish_transport;
+      }).establish_transport.resources[0]!;
 
-      await expect(phase.probe(context)).resolves.toEqual({ status: 'absent' });
-      await expect(phase.apply(context)).resolves.toEqual({ status: 'completed' });
-      await expect(phase.probe(context)).resolves.toEqual({ status: 'matched' });
+      await expect(phase.observe(context)).resolves.toEqual(ABSENT);
+      await expect(phase.apply(context)).resolves.toBeUndefined();
+      await expect(phase.observe(context)).resolves.toEqual(PRESENT);
     });
 
     expect(requested).toEqual([`${'a'.repeat(32)}:${observation}`]);
@@ -1166,22 +1310,17 @@ describe('production provision phase composition', () => {
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
-      const phase = createProductionProvisionRegistry(context, {
+      const phase = createProductionProvisionSteps(context, {
         verifyRoute: async ({ endpointUrl }) => endpointUrl,
         createCloudflareApi,
         reconcileManagedCloudflareIngress,
         inspectCloudflareConnector,
         reconcileCloudflareConnector,
-      }).establish_transport;
+      }).establish_transport.resources[0]!;
 
-      await expect(phase.probe(context)).resolves.toEqual({ status: 'matched' });
-      await expect(phase.apply(context)).resolves.toMatchObject({
-        status: 'paused',
-        pause: { code: 'existing_endpoint_required' },
-      });
-      expect(phase.resourceKey(context)).toBe(
-        journalResourceKey('transport', 'https://assistant.example.com/webhook/gchat'),
-      );
+      await expect(phase.observe(context)).resolves.toEqual(PRESENT);
+      await expect(phase.apply(context)).resolves.toMatchObject({ code: 'existing_endpoint_required' });
+      expect(createProductionProvisionSteps(context).establish_transport.liveness).toBeUndefined();
     });
 
     expect(createCloudflareApi).not.toHaveBeenCalled();
@@ -1197,13 +1336,10 @@ describe('production provision phase composition', () => {
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
-      const phase = createProductionProvisionRegistry(context, {
-        isChatConfigurationConfirmed: async () => false,
-        verifyEndpoint,
-      }).configure_channel;
+      const phase = createProductionProvisionSteps(context, { verifyEndpoint }).configure_channel.resources[0]!;
 
-      await expect(phase.probe(context)).resolves.toMatchObject({
-        status: 'paused',
+      await expect(phase.observe(context)).resolves.toMatchObject({
+        status: 'pause',
         pause: {
           code: 'chat_configuration_required',
           details: [
@@ -1228,13 +1364,11 @@ describe('production provision phase composition', () => {
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
-      const phase = createProductionProvisionRegistry(context, {
-        isChatConfigurationConfirmed: async () => false,
-      }).configure_channel;
+      const phase = createProductionProvisionSteps(context).configure_channel.resources[0]!;
 
       expect(context.input.runtime.endpoint_url).toBe('https://assistant.example.com/webhook/gchat');
-      await expect(phase.probe(context)).resolves.toMatchObject({
-        status: 'paused',
+      await expect(phase.observe(context)).resolves.toMatchObject({
+        status: 'pause',
         pause: {
           details: expect.arrayContaining([expect.stringContaining('https://assistant.example.com/webhook/gchat')]),
         },
@@ -1254,7 +1388,6 @@ describe('production provision phase composition', () => {
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
-      context.state.providerSecretId = 'secret-provider';
       await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), {
         recursive: true,
         mode: 0o700,
@@ -1262,9 +1395,11 @@ describe('production provision phase composition', () => {
       await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(credentialOverride), {
         mode: 0o600,
       });
-      const definitions = createProductionProvisionRegistry(context, { reconcileInstanceRuntime: startRuntime });
+      const definitions = createProductionProvisionSteps(context, { reconcileInstanceRuntime: startRuntime });
 
-      await expect(definitions.start_nanoclaw.apply(context)).rejects.toMatchObject({
+      const host = definitions.start_nanoclaw.resources[0]!;
+      expect(host.name).toBe('the NanoClaw host');
+      await expect(host.apply(context)).rejects.toMatchObject({
         code: 'gchat_credential_mismatch',
       });
     });
@@ -1286,26 +1421,27 @@ describe('production provision phase composition', () => {
       }));
       const context: ProductionProvisionContext = {
         ...base,
-        state: { providerSecretId: 'secret-provider' },
         input: { ...base.input, identityDependencies: { runNcl } },
       };
-      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), { recursive: true, mode: 0o700 });
-      await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
       const holdReservedLoopbackPorts = vi.fn(async (): Promise<never> => {
         throw new Error('The owned host already holds the webhook port');
       });
       const reconcileInstanceRuntime = vi.fn(async (): Promise<never> => {
         throw new Error('An already-running host must not be restarted');
       });
-      const reconcileMainIdentity = vi.fn(async () => ({ agentGroupId: 'ag-main', onecliAgentId: 'onecli-main' }));
-      const phase = createProductionProvisionRegistry(context, {
-        getOwnedGcpProjectNumber: async () => '441811502258',
+      let identified = false;
+      const reconcileMainIdentity = vi.fn(async () => {
+        identified = true;
+        return { agentGroupId: 'ag-main', onecliAgentId: 'onecli-main' };
+      });
+      const step = createProductionProvisionSteps(context, {
         holdReservedLoopbackPorts,
         reconcileInstanceRuntime,
         reconcileMainIdentity,
+        observeMainIdentity: async () => (identified ? PRESENT : ABSENT),
       }).start_nanoclaw;
 
-      await expect(phase.apply(context)).resolves.toEqual({ status: 'completed' });
+      await expect(runAlone(operation, context, 'start_nanoclaw', step)).resolves.toEqual({ status: 'ready' });
       expect(runNcl).toHaveBeenCalledWith(context.input.runtime, ['status']);
       expect(holdReservedLoopbackPorts).not.toHaveBeenCalled();
       expect(reconcileInstanceRuntime).not.toHaveBeenCalled();
@@ -1323,13 +1459,12 @@ describe('production provision phase composition', () => {
       const base = productionContext(operation, reserved);
       const context: ProductionProvisionContext = {
         ...base,
-        state: { providerSecretId: 'secret-provider' },
         input: {
           ...base.input,
           identityDependencies: {
             runNcl: async () => {
               statusCalls++;
-              if (statusCalls < 3) throw new GwsEaError('command_failed', 'Host still starting');
+              if (statusCalls < 4) throw new GwsEaError('command_failed', 'Host still starting');
               return {
                 project_root: reserved.checkout_realpath,
                 webhook: { port: reserved.allocated_ports.nanoclaw_webhook, paths: ['/webhook/gchat'] },
@@ -1345,28 +1480,33 @@ describe('production provision phase composition', () => {
         throw new GwsEaError('port_claim_lost', 'Owned host has the webhook port');
       });
       const reconcileInstanceRuntime = vi.fn();
-      const reconcileMainIdentity = vi.fn(async () => ({ agentGroupId: 'ag-main', onecliAgentId: 'onecli-main' }));
+      let identified = false;
+      const reconcileMainIdentity = vi.fn(async () => {
+        identified = true;
+        return { agentGroupId: 'ag-main', onecliAgentId: 'onecli-main' };
+      });
       const nanoclawStartupDelay = vi.fn(async () => undefined);
-      const phase = createProductionProvisionRegistry(context, {
+      const step = createProductionProvisionSteps(context, {
         getOwnedGcpProjectNumber: async () => '441811502258',
         holdReservedLoopbackPorts,
         reconcileInstanceRuntime,
         reconcileMainIdentity,
+        observeMainIdentity: async () => (identified ? PRESENT : ABSENT),
         nanoclawStartupDelay,
       }).start_nanoclaw;
 
-      await expect(phase.apply(context)).resolves.toEqual({ status: 'completed' });
-      expect(statusCalls).toBeGreaterThanOrEqual(3);
+      await expect(runAlone(operation, context, 'start_nanoclaw', step)).resolves.toEqual({ status: 'ready' });
+      expect(statusCalls).toBeGreaterThanOrEqual(4);
       expect(nanoclawStartupDelay).toHaveBeenCalled();
       expect(reconcileInstanceRuntime).not.toHaveBeenCalled();
       expect(reconcileMainIdentity).toHaveBeenCalledOnce();
     });
   });
 
-  it('restarts a stopped host for a completed phase without restamping its matching main identity', async () => {
+  it('waits on a starting host, and restarts a stopped one without restamping its matching main identity', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
-    let hostStarted = false;
+    let hostStatus: 'running' | 'stopped' | number = 'running';
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
@@ -1383,7 +1523,11 @@ describe('production provision phase composition', () => {
           identityDependencies: {
             ...identityDependencies,
             runNcl: async (runtime, args) => {
-              if (args[0] === 'status' && !hostStarted) {
+              if (args[0] === 'status' && typeof hostStatus === 'number') {
+                hostStatus = hostStatus > 1 ? hostStatus - 1 : 'running';
+                throw new GwsEaError('command_failed', 'Host is starting');
+              }
+              if (args[0] === 'status' && hostStatus === 'stopped') {
                 throw new GwsEaError('command_failed', 'Host is stopped');
               }
               return identityDependencies.runNcl!(runtime, args);
@@ -1394,305 +1538,344 @@ describe('production provision phase composition', () => {
       await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), { recursive: true, mode: 0o700 });
       await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
       const reconcileInstanceRuntime = vi.fn(async () => {
-        hostStarted = true;
+        hostStatus = 'running';
         return {} as Awaited<ReturnType<ProductionProvisionDependencies['reconcileInstanceRuntime']>>;
       });
       const reconcileMainIdentity = vi.fn();
-      const phase = createProductionProvisionRegistry(context, {
+      const step = createProductionProvisionSteps(context, {
         getOwnedGcpProjectNumber: async () => '441811502258',
         holdReservedLoopbackPorts: async () => ({ release: async () => undefined }),
         reconcileInstanceRuntime,
         reconcileMainIdentity,
       }).start_nanoclaw;
-      if (!phase.reconcileCompletedPostcondition) throw new Error('Missing completed-phase reconciliation');
+      const sleeps: number[] = [];
+      const runtime = { sleep: async (milliseconds: number) => void sleeps.push(milliseconds) };
+      await expect(runAlone(operation, context, 'start_nanoclaw', step, runtime)).resolves.toEqual({ status: 'ready' });
 
-      await phase.reconcileCompletedPostcondition(context);
+      hostStatus = 2;
+      await expect(runAlone(operation, context, 'start_nanoclaw', step, runtime)).resolves.toEqual({ status: 'ready' });
+      expect(sleeps).toEqual([1_000, 2_000]);
+      expect(reconcileInstanceRuntime).not.toHaveBeenCalled();
+
+      sleeps.length = 0;
+      hostStatus = 'stopped';
+      await expect(runAlone(operation, context, 'start_nanoclaw', step, runtime)).resolves.toEqual({ status: 'ready' });
+      expect(sleeps).toEqual(FULL_WAIT);
       expect(reconcileInstanceRuntime).toHaveBeenCalledOnce();
       expect(reconcileMainIdentity).not.toHaveBeenCalled();
       expect(context.state.mainAgentGroupId).toBe('ag-main');
     });
   });
+});
 
-  it('composes provisioning phases in order, pauses for the principal, and resumes without duplicate effects', async () => {
-    const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
-    const effects: string[] = [];
-    const resources = new Set<string>();
-    let principalMode: 'waiting' | 'selection' | 'bound' = 'waiting';
-    let principalBound = false;
-    const receipt = Object.freeze({}) as OnecliCompatibilityReceipt;
-    let context: ProductionProvisionContext | undefined;
+/**
+ * A production composition whose external boundaries are in-memory: each
+ * toggle stands for one human or external condition a step can pause on.
+ */
+interface ProductionHarness {
+  readonly paths: ControlPlanePaths;
+  readonly instanceId: string;
+  readonly effects: string[];
+  readonly started: string[];
+  readonly sleeps: number[];
+  providerCredential: boolean;
+  routePublished: boolean;
+  chatConfigured: boolean;
+  principal: 'waiting' | 'selection' | 'bound';
+  selectedMessagingGroupId?: string;
+  conversationReady: boolean;
+  /** The process dies right after the principal is bound, before the step completes. */
+  crashAfterBinding: boolean;
+  lastContext?: ProductionProvisionContext;
+  run(): Promise<ProvisionResult>;
+}
 
-    const overrides: Partial<ProductionProvisionDependencies> = {
-      probeCheckout: async () => (resources.has('checkout') ? { status: 'matched' } : { status: 'absent' }),
-      materializeReleaseCheckout: async () => {
-        effects.push('materializeReleaseCheckout');
-        resources.add('checkout');
-        return reserved;
-      },
-      runReleasePreflight: async () => {
-        effects.push('runReleasePreflight');
-        return {
-          provider: 'claude',
-          providerCapabilityDigest,
-          providerCredential: {
-            name: 'Claude provider',
-            type: 'api_key',
-            hostPattern: 'api.anthropic.com',
-            headerName: 'x-api-key',
-          },
-          packageManager: 'pnpm@10.0.0',
-          onecli: { gateway: '1.42.0', cli: '2.2.5', sdk: '2.2.1' },
-        };
-      },
-      probeGcp: async () => (resources.has('gcp') ? { status: 'matched' } : { status: 'absent' }),
-      reconcileGcpProject: async () => {
-        effects.push('reconcileGcpProject');
-        resources.add('gcp');
-      },
-      getOwnedGcpProjectNumber: async () => '441811502258',
-      holdReservedLoopbackPorts: async () => ({ release: async () => undefined }),
-      probeOnecli: async () => (resources.has('onecli') ? { status: 'matched' } : { status: 'absent' }),
-      reconcileOnecliRuntime: async () => {
-        effects.push('reconcileOnecliRuntime');
-        resources.add('onecli');
-        return receipt;
-      },
-      persistOnecliApiKeyFiles: async () => {
-        effects.push('persistOnecliApiKeyFiles');
-      },
-      probeProvider: async (value) => {
-        if (!resources.has('provider')) return { status: 'absent' };
-        value.state.providerSecretId = 'secret-provider';
-        return { status: 'matched' };
-      },
-      importProviderCredential: async () => {
-        effects.push('importProviderCredential');
-        resources.add('provider');
-        return { id: 'secret-provider', created: true };
-      },
-      probeNanoclaw: async (value) => {
-        if (!resources.has('nanoclaw')) return { status: 'absent' };
-        value.state.mainAgentGroupId = 'ag-main';
-        return { status: 'matched' };
-      },
-      reconcileInstanceRuntime: async () => {
-        effects.push('reconcileInstanceRuntime');
-        return {
-          manager: 'launchd',
-          serviceIdentity: 'service',
-          serviceDefinitionPath: '/tmp/service',
-          runtimeConfigFile: '/tmp/runtime',
-          environmentFile: '/tmp/env',
-          launcherEntrypoint: '/tmp/launcher',
-          hostEntrypoint: '/tmp/host',
-          cliPath: '/tmp/ncl',
-          cliSocket: '/tmp/ncl.sock',
-          standardOutputPath: '/tmp/out',
-          standardErrorPath: '/tmp/err',
-          imageTag: 'image',
-          installLabel: 'install',
-        };
-      },
-      reconcileMainIdentity: async () => {
-        effects.push('reconcileMainIdentity');
-        resources.add('nanoclaw');
-        return {
-          agentGroupId: 'ag-main',
-          onecliAgentId: 'onecli-main',
-        };
-      },
-      verifyRoute: async ({ endpointUrl }) => {
-        effects.push('verifyExistingGchatRoute');
-        return endpointUrl;
-      },
-      verifyEndpoint: async (endpoint) => {
-        effects.push('verifyExistingGchatEndpoint');
-        return { endpointUrl: endpoint.endpointUrl, audienceUrl: endpoint.audienceUrl };
-      },
-      isChatConfigurationConfirmed: async () => true,
-      verifyPrincipalBinding: () =>
-        principalBound
-          ? {
-              status: 'matched',
-              agentGroupId: 'ag-main',
-              candidate: {
-                messagingGroupId: 'mg-principal',
-                platformId: 'gchat:spaces/principal',
-                userId: 'gchat:users/principal',
-                senderName: 'Principal',
-                authenticatedMessageId: 'signed-first-dm',
-                authenticatedMessageAt: '2026-09-18T18:00:01.000Z',
-              },
-              welcomeEventId: 'gws-ea-welcome:stable',
-            }
-          : { status: 'absent' },
-      reconcilePrincipal: async (_runtime, selection) => {
-        effects.push(`reconcilePrincipalDm:${principalMode}`);
-        if (principalMode === 'waiting') return { status: 'waiting' };
-        if (principalMode === 'selection' && !selection.messagingGroupId) {
-          return {
-            status: 'selection-required',
-            candidates: [
-              {
-                messagingGroupId: 'mg-principal',
-                platformId: 'gchat:spaces/principal',
-                userId: 'gchat:users/principal',
-                senderName: 'Principal',
-                authenticatedMessageId: 'signed-first-dm',
-                authenticatedMessageAt: '2026-09-18T18:00:01.000Z',
-              },
-              {
-                messagingGroupId: 'mg-other',
-                platformId: 'gchat:spaces/other',
-                userId: 'gchat:users/other',
-                senderName: 'Other',
-                authenticatedMessageId: 'signed-other-dm',
-                authenticatedMessageAt: '2026-09-18T18:00:02.000Z',
-              },
-            ],
-          };
-        }
-        expect(selection.messagingGroupId).toBe('mg-principal');
-        principalBound = true;
-        return {
-          status: 'bound',
-          candidate: {
-            messagingGroupId: 'mg-principal',
-            platformId: 'gchat:spaces/principal',
-            userId: 'gchat:users/principal',
-            senderName: 'Principal',
-            authenticatedMessageId: 'signed-first-dm',
-            authenticatedMessageAt: '2026-09-18T18:00:01.000Z',
-          },
-          agentGroupId: 'ag-main',
-          eventId: 'gws-ea-welcome:stable',
-        };
-      },
-      verifyConversation: () => ({
-        ready: true,
-        sessionId: 'session-main',
-        welcomeInboundId: 'welcome-in',
-        welcomeOutboundId: 'welcome-out',
-        laterInboundId: 'later-in',
-        laterOutboundId: 'later-out',
-        deliveredAt: '2026-09-18T18:01:00.000Z',
-      }),
-    };
+const PRINCIPAL = {
+  messagingGroupId: 'mg-principal',
+  platformId: 'gchat:spaces/principal',
+  userId: 'gchat:users/principal',
+  senderName: 'Principal',
+  authenticatedMessageId: 'signed-first-dm',
+  authenticatedMessageAt: '2026-09-18T18:00:01.000Z',
+} as const;
 
-    const paused = await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
-      const initial = productionContext(operation, reserved);
-      const bootstrapManifestFile = paths.bootstrapFile(reserved.instance_id);
-      await writeFile(bootstrapManifestFile, '{}', { mode: 0o600 });
-      context = {
-        ...initial,
-        input: {
-          ...initial.input,
-          bootstrapManifestFile,
-          identityDependencies: {
-            runNcl: async (_runtime, args) => {
-              if (args[0] === 'status' && effects.includes('reconcileInstanceRuntime')) {
-                return {
-                  project_root: reserved.checkout_realpath,
-                  webhook: { port: reserved.allocated_ports.nanoclaw_webhook, paths: ['/webhook/gchat'] },
-                  channels: [{ instance: 'gchat', type: 'gchat', connected: true }],
-                };
-              }
-              throw new GwsEaError('command_failed', 'NanoClaw has not started');
+async function productionHarness(): Promise<ProductionHarness> {
+  const paths = await testPaths();
+  const reserved = await reserveInstance(paths, reservation(paths));
+  await mkdir(paths.instanceRoot(reserved.instance_id), { recursive: true, mode: 0o700 });
+  await writeFile(paths.bootstrapFile(reserved.instance_id), '{}', { mode: 0o600 });
+  const resources = new Set<string>();
+  const receipt = Object.freeze({}) as OnecliCompatibilityReceipt;
+  let principalBound = false;
+
+  const harness: ProductionHarness = {
+    paths,
+    instanceId: reserved.instance_id,
+    effects: [],
+    started: [],
+    sleeps: [],
+    crashAfterBinding: false,
+    providerCredential: true,
+    routePublished: true,
+    chatConfigured: true,
+    principal: 'waiting',
+    conversationReady: true,
+    run: () =>
+      withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+        const base = productionContext(operation, reserved);
+        const context: ProductionProvisionContext = {
+          ...base,
+          state: {},
+          input: {
+            ...base.input,
+            ...(harness.providerCredential ? {} : { providerCredential: undefined }),
+            ...(harness.selectedMessagingGroupId ? { selectedMessagingGroupId: harness.selectedMessagingGroupId } : {}),
+            chatConfigured: harness.chatConfigured,
+            bootstrapManifestFile: paths.bootstrapFile(reserved.instance_id),
+            identityDependencies: {
+              runNcl: async (_runtime, args) => {
+                if (args[0] === 'status' && resources.has('host')) {
+                  return {
+                    project_root: reserved.checkout_realpath,
+                    webhook: { port: reserved.allocated_ports.nanoclaw_webhook, paths: ['/webhook/gchat'] },
+                    channels: [{ instance: 'gchat', type: 'gchat', connected: true }],
+                  };
+                }
+                throw new GwsEaError('command_failed', 'NanoClaw is not running');
+              },
             },
           },
-        },
-      };
-      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), { recursive: true, mode: 0o700 });
-      await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
-      return reconcileProvisioning(operation, context, createProductionProvisionRegistry(context, overrides));
+        };
+        await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), {
+          recursive: true,
+          mode: 0o700,
+        });
+        await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
+        harness.lastContext = context;
+        const effect = (name: string, resource: string): void => {
+          harness.effects.push(name);
+          resources.add(resource);
+        };
+        const overrides: Partial<ProductionProvisionDependencies> = {
+          observeCheckout: async () => (resources.has('checkout') ? PRESENT : ABSENT),
+          materializeReleaseCheckout: async () => {
+            effect('materializeReleaseCheckout', 'checkout');
+            return reserved;
+          },
+          runReleasePreflight: async () => ({
+            provider: 'claude',
+            providerCapabilityDigest,
+            providerCredential: {
+              name: 'Claude provider',
+              type: 'api_key',
+              hostPattern: 'api.anthropic.com',
+              headerName: 'x-api-key',
+            },
+            packageManager: 'pnpm@10.0.0',
+            onecli: { gateway: ONECLI_GATEWAY_VERSION, cli: ONECLI_CLI_VERSION, sdk: ONECLI_SDK_VERSION },
+          }),
+          observeGcp: async () => (resources.has('gcp') ? PRESENT : ABSENT),
+          reconcileGcpProject: async () => effect('reconcileGcpProject', 'gcp'),
+          getOwnedGcpProjectNumber: async () => '441811502258',
+          holdReservedLoopbackPorts: async () => ({ release: async () => undefined }),
+          observeOnecli: async () => (resources.has('onecli') ? PRESENT : ABSENT),
+          reconcileOnecliRuntime: async () => {
+            effect('reconcileOnecliRuntime', 'onecli');
+            return receipt;
+          },
+          persistOnecliApiKeyFiles: async () => undefined,
+          observeProvider: async (value) => {
+            if (!resources.has('provider')) return ABSENT;
+            value.state.providerSecretId = 'secret-provider';
+            return PRESENT;
+          },
+          importProviderCredential: async () => {
+            effect('importProviderCredential', 'provider');
+            return { id: 'secret-provider', created: true };
+          },
+          observeMainIdentity: async (value) => {
+            if (!resources.has('host') || !resources.has('main')) return ABSENT;
+            value.state.mainAgentGroupId = 'ag-main';
+            return PRESENT;
+          },
+          reconcileInstanceRuntime: async () => {
+            effect('reconcileInstanceRuntime', 'host');
+            return {} as Awaited<ReturnType<ProductionProvisionDependencies['reconcileInstanceRuntime']>>;
+          },
+          nanoclawStartupDelay: async () => undefined,
+          reconcileMainIdentity: async () => {
+            effect('reconcileMainIdentity', 'main');
+            return { agentGroupId: 'ag-main', onecliAgentId: 'onecli-main' };
+          },
+          verifyRoute: async ({ endpointUrl }) => {
+            if (!harness.routePublished) throw new GwsEaError('endpoint_unreachable', 'Route is not published');
+            return endpointUrl;
+          },
+          verifyEndpoint: async (endpoint) => ({
+            endpointUrl: endpoint.endpointUrl,
+            audienceUrl: endpoint.audienceUrl,
+          }),
+          verifyPrincipalBinding: () =>
+            principalBound
+              ? { status: 'matched', agentGroupId: 'ag-main', candidate: PRINCIPAL, welcomeEventId: 'welcome' }
+              : { status: 'absent' },
+          reconcilePrincipal: async (_runtime, selection) => {
+            harness.effects.push(`reconcilePrincipalDm:${harness.principal}`);
+            if (harness.principal === 'waiting') return { status: 'waiting' };
+            if (harness.principal === 'selection' && !selection.messagingGroupId) {
+              return {
+                status: 'selection-required',
+                candidates: [PRINCIPAL, { ...PRINCIPAL, messagingGroupId: 'mg-other', userId: 'gchat:users/other' }],
+              };
+            }
+            principalBound = true;
+            if (harness.crashAfterBinding) {
+              harness.crashAfterBinding = false;
+              throw new Error('The process died after binding the principal');
+            }
+            return { status: 'bound', candidate: PRINCIPAL, agentGroupId: 'ag-main', eventId: 'welcome' };
+          },
+          verifyConversation: () =>
+            harness.conversationReady
+              ? {
+                  ready: true,
+                  sessionId: 'session-main',
+                  welcomeInboundId: 'welcome-in',
+                  welcomeOutboundId: 'welcome-out',
+                  laterInboundId: 'later-in',
+                  laterOutboundId: 'later-out',
+                  deliveredAt: '2026-09-18T18:01:00.000Z',
+                }
+              : { ready: false, reason: 'later_principal_message_missing' },
+        };
+        const runtime = {
+          emit: (event: RunEvent) => {
+            if (event.type === 'step-started') harness.started.push(event.step);
+          },
+          sleep: async (milliseconds: number) => void harness.sleeps.push(milliseconds),
+        };
+        return runProvisionSteps(
+          operation,
+          context,
+          createProductionProvisionSteps(context, overrides, runtime),
+          runtime,
+        );
+      }).then((result) => {
+        if (!result) throw new Error('The instance operation was busy');
+        return result;
+      }),
+  };
+  return harness;
+}
+
+describe('production step order and pause outcomes', () => {
+  const ORDER = [
+    'materialize_checkout',
+    'provision_gcp',
+    'start_onecli',
+    'configure_provider',
+    'start_nanoclaw',
+    'establish_transport',
+    'configure_channel',
+    'bind_principal',
+  ];
+
+  it('runs the steps in order and pauses for the principal DM, then for a selection, then completes', async () => {
+    const harness = await productionHarness();
+
+    await expect(harness.run()).resolves.toMatchObject({
+      status: 'paused',
+      pause: { phase: 'bind_principal', code: 'principal_dm_required' },
     });
-    expect(effects).toContain('verifyExistingGchatRoute');
-    expect(paused).toMatchObject({ status: 'paused', pause: { code: 'principal_dm_required' } });
-    expect(await readFile(googleChatProjectNumberFile(context!.input.runtime), 'utf8')).toBe('441811502258\n');
-    await expect(readFile(paths.bootstrapFile(reserved.instance_id), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
-    expect(effects.filter((effect) => !effect.startsWith('verifyExisting'))).toEqual([
+    expect(harness.started.slice(0, ORDER.length)).toEqual(ORDER);
+    expect(harness.effects).toEqual([
       'materializeReleaseCheckout',
-      'runReleasePreflight',
       'reconcileGcpProject',
       'reconcileOnecliRuntime',
-      'persistOnecliApiKeyFiles',
-      'persistOnecliApiKeyFiles',
       'importProviderCredential',
       'reconcileInstanceRuntime',
       'reconcileMainIdentity',
       'reconcilePrincipalDm:waiting',
     ]);
-    const before = await readProvisionJournal(paths, reserved.instance_id);
-    const stableKeys = Object.fromEntries(
-      PROVISION_PHASES.map((phase) => [phase, before.phases[phase].attempts.at(-1)?.resource_key]),
-    );
 
-    principalMode = 'selection';
-    const needsSelection = await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
-      expect(context).toBeDefined();
-      const resumed = { ...context!, operation };
-      context = resumed;
-      return reconcileProvisioning(operation, resumed, createProductionProvisionRegistry(resumed, overrides));
-    });
-    expect(needsSelection).toMatchObject({
+    harness.principal = 'selection';
+    await expect(harness.run()).resolves.toMatchObject({
       status: 'paused',
-      pause: { code: 'principal_selection_required', choices: [{ id: 'mg-principal' }, { id: 'mg-other' }] },
+      pause: {
+        phase: 'bind_principal',
+        code: 'principal_selection_required',
+        choices: [{ id: 'mg-principal' }, { id: 'mg-other' }],
+      },
     });
 
-    principalMode = 'bound';
-    let interrupted = false;
-    await expect(
-      withInstanceOperation(paths, reserved.instance_id, async (operation) => {
-        expect(context).toBeDefined();
-        const resumed: ProductionProvisionContext = {
-          ...context!,
-          operation,
-          input: { ...context!.input, selectedMessagingGroupId: 'mg-principal' },
-        };
-        context = resumed;
-        return reconcileProvisioning(operation, resumed, createProductionProvisionRegistry(resumed, overrides), {
-          onBoundary: (event) => {
-            if (!interrupted && event.phase === 'bind_principal' && event.boundary === 'effect') {
-              interrupted = true;
-              throw new ProvisionBoundaryInterruption(event);
-            }
-          },
-        });
-      }),
-    ).rejects.toBeInstanceOf(ProvisionBoundaryInterruption);
-
-    const completed = await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
-      const resumed: ProductionProvisionContext = { ...productionContext(operation, reserved), state: {} };
-      context = resumed;
-      return reconcileProvisioning(operation, resumed, createProductionProvisionRegistry(resumed, overrides));
+    expect(await readFile(googleChatProjectNumberFile(harness.lastContext!.input.runtime), 'utf8')).toBe(
+      '441811502258\n',
+    );
+    await expect(readFile(harness.paths.bootstrapFile(harness.instanceId), 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
     });
-    expect(completed).toEqual({ status: 'ready' });
-    await expect(readFile(paths.releasePreflightFile(reserved.instance_id), 'utf8')).resolves.toContain(
+    await expect(readFile(harness.paths.releasePreflightFile(harness.instanceId), 'utf8')).resolves.toContain(
       '"providerCredential"',
     );
-    const after = await readProvisionJournal(paths, reserved.instance_id);
-    for (const phase of PROVISION_PHASES) {
-      expect(after.phases[phase].attempts.at(-1)?.resource_key).toBe(
-        stableKeys[phase] ?? after.phases[phase].attempts[0]?.resource_key,
-      );
-    }
-    expect(effects.filter((effect) => effect === 'materializeReleaseCheckout')).toHaveLength(1);
-    expect(effects.filter((effect) => effect === 'reconcileOnecliRuntime')).toHaveLength(1);
-    expect(effects.filter((effect) => effect === 'importProviderCredential')).toHaveLength(1);
-    expect(effects.filter((effect) => effect === 'reconcileInstanceRuntime')).toHaveLength(1);
-    expect(effects.filter((effect) => effect === 'reconcileMainIdentity')).toHaveLength(1);
-    expect(effects.filter((effect) => effect === 'reconcilePrincipalDm:bound')).toHaveLength(1);
 
-    const completedEffects = [...effects];
-    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
-      const restarted: ProductionProvisionContext = { ...productionContext(operation, reserved), state: {} };
-      expect(
-        await reconcileProvisioning(operation, restarted, createProductionProvisionRegistry(restarted, overrides)),
-      ).toEqual({ status: 'ready' });
+    harness.principal = 'bound';
+    harness.selectedMessagingGroupId = 'mg-principal';
+    await expect(harness.run()).resolves.toEqual({ status: 'ready' });
+    expect(harness.sleeps).toEqual([]);
+    expect(harness.effects.filter((effect) => !effect.startsWith('reconcilePrincipalDm'))).toEqual([
+      'materializeReleaseCheckout',
+      'reconcileGcpProject',
+      'reconcileOnecliRuntime',
+      'importProviderCredential',
+      'reconcileInstanceRuntime',
+      'reconcileMainIdentity',
+    ]);
+  });
+
+  const blockers: ReadonlyArray<readonly [ProvisionStepId, string, (harness: ProductionHarness) => void]> = [
+    ['configure_provider', 'provider_credential_required', (harness) => void (harness.providerCredential = false)],
+    ['establish_transport', 'existing_endpoint_required', (harness) => void (harness.routePublished = false)],
+    ['configure_channel', 'chat_configuration_required', (harness) => void (harness.chatConfigured = false)],
+  ];
+
+  it.each(blockers)('pauses at %s with %s and continues once the person acts', async (step, code, block) => {
+    const harness = await productionHarness();
+    block(harness);
+
+    await expect(harness.run()).resolves.toMatchObject({ status: 'paused', pause: { phase: step, code } });
+    expect(harness.started.slice(0, ORDER.indexOf(step) + 1)).toEqual(ORDER.slice(0, ORDER.indexOf(step) + 1));
+
+    harness.providerCredential = true;
+    harness.routePublished = true;
+    harness.chatConfigured = true;
+    await expect(harness.run()).resolves.toMatchObject({
+      status: 'paused',
+      pause: { phase: 'bind_principal', code: 'principal_dm_required' },
     });
-    expect(effects.filter((effect) => !effect.startsWith('verifyExisting'))).toEqual(
-      completedEffects.filter((effect) => !effect.startsWith('verifyExisting')),
-    );
+  });
+
+  it('resumes after the principal was bound but before the step completed, without binding again', async () => {
+    const harness = await productionHarness();
+    harness.principal = 'bound';
+    harness.crashAfterBinding = true;
+
+    await expect(harness.run()).rejects.toThrow('The process died after binding the principal');
+    await expect(harness.run()).resolves.toEqual({ status: 'ready' });
+    expect(harness.effects.filter((effect) => effect === 'reconcilePrincipalDm:bound')).toHaveLength(1);
+  });
+
+  it('pauses at verify_conversation until a later principal message is answered', async () => {
+    const harness = await productionHarness();
+    harness.principal = 'bound';
+    harness.conversationReady = false;
+
+    await expect(harness.run()).resolves.toMatchObject({
+      status: 'paused',
+      pause: { phase: 'verify_conversation', code: 'later_principal_message_missing' },
+    });
+
+    harness.conversationReady = true;
+    await expect(harness.run()).resolves.toEqual({ status: 'ready' });
+    expect(harness.effects.filter((effect) => effect === 'reconcilePrincipalDm:bound')).toHaveLength(1);
   });
 });

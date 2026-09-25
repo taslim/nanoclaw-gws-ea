@@ -1,8 +1,8 @@
 export const REGISTRY_SCHEMA_VERSION = 2 as const;
 export const INSTANCE_MARKER_SCHEMA_VERSION = 1 as const;
-export const PROVISION_JOURNAL_SCHEMA_VERSION = 1 as const;
 
-export const PROVISION_PHASES = [
+/** Provisioning steps in run order; a completed `verify_conversation` means the assistant is ready. */
+export const PROVISION_STEPS = [
   'materialize_checkout',
   'provision_gcp',
   'start_onecli',
@@ -12,10 +12,9 @@ export const PROVISION_PHASES = [
   'configure_channel',
   'bind_principal',
   'verify_conversation',
-  'ready',
 ] as const;
 
-export type ProvisionPhase = (typeof PROVISION_PHASES)[number];
+export type ProvisionStepId = (typeof PROVISION_STEPS)[number];
 
 export interface AllocatedPorts {
   nanoclaw_webhook: number;
@@ -86,36 +85,6 @@ export interface InstanceMarker {
   schema_version: typeof INSTANCE_MARKER_SCHEMA_VERSION;
   instance_id: string;
   deployed_commit: string;
-}
-
-export interface JournalObservation {
-  matched: boolean;
-  observed_at: string;
-  resource_key?: string;
-}
-
-export interface JournalFailure {
-  code: string;
-  failed_at: string;
-}
-
-export interface JournalAttempt {
-  attempt_id: string;
-  resource_key: string;
-  intended_at: string;
-  observation?: JournalObservation;
-  failure?: JournalFailure;
-  succeeded_at?: string;
-}
-
-export interface JournalPhase {
-  attempts: JournalAttempt[];
-}
-
-export interface ProvisionJournal {
-  schema_version: typeof PROVISION_JOURNAL_SCHEMA_VERSION;
-  instance_id: string;
-  phases: Record<ProvisionPhase, JournalPhase>;
 }
 
 /** Structured, non-secret facts about a failure, for rendering and diagnosis. */

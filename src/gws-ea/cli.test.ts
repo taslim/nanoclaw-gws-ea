@@ -266,6 +266,60 @@ describe('gws-ea without a TTY', () => {
     expect(io.out).toContain(`Continue with: gws-ea resume --id ${input.instance_id}`);
   });
 
+  it('names the step an input pause stopped at and logs it as paused, not failed', async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation(paths));
+    const io = lines();
+
+    expect(
+      await runCli(['resume', '--id', input.instance_id], {
+        paths,
+        ...io.runtime,
+        environment: {},
+        preflightGcloud: async () => ({ account: 'operator@example.test' }),
+        advanceProvision: async (_operation, { interaction, runtime }) =>
+          runStep(runtime, { id: 'configure_provider', label: 'Connecting the AI provider…' }, async () => {
+            await interaction.requestProviderCredential({
+              providerId: 'claude',
+              metadata: { name: 'Anthropic', type: 'anthropic', hostPattern: 'api.anthropic.com' },
+            });
+            return { status: 'ready' as const };
+          }),
+      }),
+    ).toBe(10);
+    expect(io.out.join('\n')).toContain('Paused at configure_provider:');
+    const progressLog = /Log: (\S+)/u.exec(io.out.join('\n'))?.[1];
+    const progress = await readFile(progressLog!, 'utf8');
+    expect(progress).toMatch(/configure_provider \[\S+\] → paused/u);
+    expect(progress).not.toContain('→ failed');
+    expect(progress).toContain('paused at configure_provider (input_required)');
+  });
+
+  it('refuses an instance from an earlier gws-ea before asking for sign-in', async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation(paths));
+    await writeFile(
+      paths.journalFile(input.instance_id),
+      JSON.stringify({ schema_version: 1, instance_id: input.instance_id, phases: {} }),
+      { mode: 0o600 },
+    );
+    const preflight = vi.fn(async () => ({ account: 'operator@example.test' }));
+    const advanceProvision = vi.fn();
+    const io = lines();
+
+    expect(
+      await runCli(['resume', '--id', input.instance_id], {
+        paths,
+        ...io.runtime,
+        preflightGcloud: preflight,
+        advanceProvision,
+      }),
+    ).toBe(1);
+    expect(io.err.join('\n')).toContain(`gws-ea remove --id ${input.instance_id}, then create it again`);
+    expect(preflight).not.toHaveBeenCalled();
+    expect(advanceProvision).not.toHaveBeenCalled();
+  });
+
   it('pauses with exit 10 naming the variable when a Cloudflare token is needed mid-run', async () => {
     const paths = await testPaths();
     const input = await reserveInstance(paths, reservation(paths));

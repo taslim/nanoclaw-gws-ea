@@ -128,6 +128,31 @@ describe('runStep', () => {
     expect(failed[0]).toMatchObject({ error: failure, rawLog: expect.stringMatching(/provision-gcp\.log$/u) });
   });
 
+  it('records an input pause raised inside nested steps as paused, not failed', async () => {
+    const log = await run();
+    const events: RunEvent[] = [];
+    const reporter = { emit: (event: RunEvent) => events.push(event), run: log };
+    const pause = new PauseRequired('input_required', 'A credential is required.', ['Supply it.']);
+
+    await expect(
+      runStep(reporter, { id: 'provision' }, () =>
+        runStep(reporter, { id: 'configure_provider' }, async () => {
+          throw pause;
+        }),
+      ),
+    ).rejects.toBe(pause);
+
+    expect(events.filter((event) => event.type === 'step-failed')).toEqual([]);
+    expect(events.filter((event) => event.type === 'step-paused').map((event) => event.step)).toEqual([
+      'configure_provider',
+      'provision',
+    ]);
+    const progress = await readFile(log.progressLog, 'utf8');
+    expect(progress).toMatch(/configure_provider \[\S+\] → paused/u);
+    expect(progress).toMatch(/provision \[\S+\] → paused/u);
+    expect(progress).not.toContain('→ failed');
+  });
+
   it('runs without a run log or listener', async () => {
     await expect(runStep({}, { id: 'bare' }, async () => 'ok')).resolves.toBe('ok');
   });

@@ -22,17 +22,15 @@ import {
   type StepReporter,
 } from './events.js';
 import { deriveGchatServiceAccountEmail, deriveGcpProjectId, preflightGcloud } from './gcloud.js';
-import { acquireInstanceOperation, ensureProvisionJournal, type InstanceOperation } from './journal.js';
+import { acquireInstanceOperation, readProvisionJournal, type InstanceOperation } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
-import type { ProvisionHumanPause } from './phases.js';
+import type { ProvisionHumanPause, ProvisionResult, ProvisionRuntime } from './phases.js';
 import { holdLoopbackPorts, type HeldLoopbackPorts } from './ports.js';
 import {
   installProductionBootstrapManifest,
   removeProductionBootstrapManifest,
   runProductionProvision,
   validateProductionBootstrapManifest,
-  type ProvisionResult,
-  type ProvisionRuntime,
 } from './provision.js';
 import { redact } from './redact.js';
 import {
@@ -109,7 +107,6 @@ export interface CliRuntime {
   prompts?: InteractivePrompts;
   /** Interactive failure loop: diagnosis, then whether to retry. */
   onFailure?: (report: FailureReport) => Promise<'retry' | 'stop'>;
-  initializeJournal?: (operation: InstanceOperation) => Promise<void>;
   advanceProvision?: AdvanceProvision;
   resolveRelease?: (sourceRemote: string, releaseRef: string) => Promise<ResolvedRelease>;
   holdLoopbackPorts?: () => Promise<HeldLoopbackPorts>;
@@ -380,11 +377,6 @@ class Cli {
     });
   }
 
-  async #initializeJournal(operation: InstanceOperation): Promise<void> {
-    if (this.#runtime.initializeJournal) await this.#runtime.initializeJournal(operation);
-    else await ensureProvisionJournal(operation);
-  }
-
   async #createWork(
     { reporter, interaction, secrets, state }: Session,
     options: Options,
@@ -498,10 +490,9 @@ class Cli {
     interaction: Interaction,
     portLease?: HeldLoopbackPorts,
   ): Promise<Outcome> {
-    const result = await runStep(reporter, { id: 'provision' }, async () => {
-      await this.#initializeJournal(operation);
-      return this.#advance(operation, { interaction, runtime: reporter, ...(portLease ? { portLease } : {}) });
-    });
+    const result = await runStep(reporter, { id: 'provision' }, () =>
+      this.#advance(operation, { interaction, runtime: reporter, ...(portLease ? { portLease } : {}) }),
+    );
     return result.status === 'paused'
       ? result
       : { status: 'ready', message: `Instance ${operation.instanceId} is ready.` };
@@ -512,7 +503,8 @@ class Cli {
     if (!operation) throw busy();
     try {
       await runStep(reporter, { id: 'prerequisites' }, async () => {
-        await this.#initializeJournal(operation);
+        // An instance this launcher cannot continue is refused before sign-in is asked for.
+        await readProvisionJournal(this.#paths, instanceId);
         const reservation = await getInstanceReservation(this.#paths, instanceId);
         const account = reservation.exclusive_resource_claims.gcp_account;
         const ready = await this.#checkGcloud(account, interaction);
@@ -570,6 +562,7 @@ class Cli {
     const paths = this.#paths;
     const presenter = this.#presenter;
     const failures: Array<Extract<RunEvent, { type: 'step-failed' }>> = [];
+    let pausedForInput: string | undefined;
     const labels = new Map<string, string>();
     const state: AttemptState = {
       ...(plan.instanceId ? { instanceId: plan.instanceId } : {}),
@@ -598,6 +591,7 @@ class Cli {
       const emit = (event: RunEvent): void => {
         if (event.type === 'step-started' && event.label) labels.set(event.step, event.label);
         if (event.type === 'step-failed') failures.push(event);
+        if (event.type === 'step-paused' && !event.pause) pausedForInput ??= event.step;
         presenter.event(event);
       };
       const reporter = { emit, run };
@@ -619,7 +613,7 @@ class Cli {
       presenter.report({ outcome: 'ready', headline: outcome.message, details: [] });
       return { status: 'done', exitCode: EXIT_CODES.ready };
     } catch (error) {
-      const step = failures[0]?.step ?? plan.command;
+      const step = (error instanceof PauseRequired ? pausedForInput : failures[0]?.step) ?? plan.command;
       const log = run ? [`Log: ${run.progressLog}`] : [];
       if (error instanceof PauseRequired) {
         run?.pause(error.code);

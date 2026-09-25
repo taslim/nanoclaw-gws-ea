@@ -5,14 +5,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runCli, type CliRuntime } from './cli.js';
 import { runStep } from './events.js';
-import {
-  acquireInstanceOperation,
-  beginPhase,
-  commitPhaseSuccess,
-  ensureProvisionJournal,
-  journalResourceKey,
-  observePhase,
-} from './journal.js';
+import { acquireInstanceOperation, readProvisionJournal, recordStepCompleted, recordStepStarted } from './journal.js';
 import {
   allocateInstanceId,
   assertRegistryMarkerAgreement,
@@ -465,19 +458,16 @@ describe('create recovery contract', () => {
     expect(advanceProvision).toHaveBeenCalledOnce();
   });
 
-  it('checks Google sign-in after GCP setup is complete because resume re-probes it', async () => {
+  it('checks Google sign-in on every resume, even after GCP setup is complete', async () => {
     const paths = await testPaths();
     const input = reservation(paths);
     await reserveInstance(paths, input);
     const operation = await acquireInstanceOperation(paths, input.instance_id);
     if (!operation) throw new Error('Test instance operation could not be acquired');
     try {
-      await ensureProvisionJournal(operation);
-      for (const phase of ['materialize_checkout', 'provision_gcp'] as const) {
-        const key = journalResourceKey('phase', `${phase}:${input.instance_id}`);
-        const begun = await beginPhase(operation, phase, key);
-        await observePhase(operation, phase, begun.attempt.attempt_id, { matched: true, resource_key: key });
-        await commitPhaseSuccess(operation, phase, begun.attempt.attempt_id);
+      for (const step of ['materialize_checkout', 'provision_gcp'] as const) {
+        await recordStepStarted(operation, step);
+        await recordStepCompleted(operation, step);
       }
     } finally {
       operation.release();
@@ -891,10 +881,10 @@ describe('create recovery contract', () => {
       paths,
       stdout: (line) => stdout.push(line),
       stderr: (line) => stderr.push(line),
-      initializeJournal: async () => {
+      ...productionRuntime(),
+      advanceProvision: async () => {
         throw new Error(secretCanary);
       },
-      ...productionRuntime(),
     });
 
     expect(exitCode).toBe(1);
@@ -904,6 +894,7 @@ describe('create recovery contract', () => {
     await expect(readFile(paths.bootstrapFile(instanceId), 'utf8')).resolves.toContain('"schema_version": 1');
     expect(stderr.join('\n')).toContain(`gws-ea resume --id ${instanceId}`);
     expect(`${stdout.join('\n')}\n${stderr.join('\n')}`).not.toContain(secretCanary);
+    expect((await readProvisionJournal(paths, instanceId)).steps).toEqual({});
 
     const resumed: string[] = [];
     expect(

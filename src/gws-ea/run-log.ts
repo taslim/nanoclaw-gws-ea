@@ -22,6 +22,7 @@ import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 
 import { isErrno } from '../community-portal/errors.js';
+import { PauseRequired } from './events.js';
 import { CONTROL_PLANE_ROOT, preparePrivateLocalDirectory, type ControlPlanePaths } from './paths.js';
 import { envKeyNames, redact, registerSecretDirectory } from './redact.js';
 import { assertInstanceId } from './registry.js';
@@ -269,6 +270,10 @@ class Run implements RunLog {
       entry(marked ?? 'success');
       return result;
     } catch (error) {
+      if (error instanceof PauseRequired) {
+        entry('paused');
+        throw error;
+      }
       // Attribute each failure to the innermost step that raised it.
       if (typeof error === 'object' && error !== null && !this.#failures.has(error)) this.#failures.set(error, name);
       entry('failed', error);

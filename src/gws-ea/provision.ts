@@ -5,21 +5,21 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import {
-  beginPhase,
-  commitPhaseSuccess,
-  ensureProvisionJournal,
-  observePhase,
-  recordPhaseFailure,
+  readProvisionJournal,
+  recordChatConfigurationConfirmed,
+  recordPrincipalSelection,
   type InstanceOperation,
 } from './journal.js';
 import {
-  defineProvisionPhaseRegistry,
-  type PhaseEffectResult,
-  type PhaseProbeResult,
+  ABSENT,
+  PRESENT,
+  runProvisionSteps,
+  type Observation,
   type ProvisionHumanPause,
-  type ProvisionPhaseRegistry,
+  type ProvisionResult,
+  type ProvisionRuntime,
+  type ProvisionSteps,
 } from './phases.js';
-import { journalResourceKey } from './journal.js';
 import { assertReleaseCheckoutAgreement, materializeReleaseCheckout, type ResolvedRelease } from './checkout.js';
 import { runReleasePreflight, type ReleasePreflightInput, type ReleasePreflightResult } from './release-preflight.js';
 import {
@@ -52,7 +52,6 @@ import {
 import { runInstanceNclJson } from './ncl.js';
 import { reconcileMainIdentity, type MainIdentityDependencies, type MainIdentityInput } from './identity.js';
 import { reconcilePrincipalDm, type PrincipalCandidate, type PrincipalDiscoveryDependencies } from './principal.js';
-import { loadPrincipalSelection, persistPrincipalSelection } from './principal-selection.js';
 import {
   verifyExistingGchatEndpoint,
   verifyExistingGchatRoute,
@@ -71,15 +70,7 @@ import { readOwnerOnlyFile, removePrivateFile, writePrivateTextFile } from './se
 import { assertInstanceId, getInstanceReservation } from './registry.js';
 import { preparePrivateLocalDirectory, type ControlPlanePaths } from './paths.js';
 import { holdReservedLoopbackPorts, type AllocatedPortName, type LoopbackPortLease } from './ports.js';
-import {
-  GwsEaError,
-  PROVISION_PHASES,
-  ingressEndpointUrl,
-  type IngressClaim,
-  type InstanceReservation,
-  type ProvisionJournal,
-  type ProvisionPhase,
-} from './types.js';
+import { GwsEaError, ingressEndpointUrl, type IngressClaim, type ProvisionStepId } from './types.js';
 import { hasControlCharacters, isRecord } from './validation.js';
 import { parseGcpProjectNumber } from './gcp-identity.js';
 import {
@@ -89,12 +80,8 @@ import {
   type ProviderCredentialMetadata,
 } from '../provider-credential.js';
 import { assertProviderProvisioningCapabilityDigest } from '../provider-provisioning-capability.js';
-import {
-  confirmChatConfiguration,
-  googleChatConfigurationUrl,
-  isChatConfigurationConfirmed,
-} from './chat-configuration.js';
-import { runStep, type Interaction, type StepReporter } from './events.js';
+import { googleChatConfigurationUrl } from './chat-configuration.js';
+import type { Interaction } from './events.js';
 import {
   parseGchatServiceAccountCredential,
   getOwnedGcpProjectNumber,
@@ -112,32 +99,6 @@ import {
   validateCloudflareConnectorState,
   validateObservedCloudflareConnector,
 } from './cloudflare-connector.js';
-
-export type ProvisionBoundary = 'intent' | 'effect' | 'verify';
-
-export interface ProvisionBoundaryEvent {
-  readonly phase: ProvisionPhase;
-  readonly boundary: ProvisionBoundary;
-  readonly attemptId: string;
-}
-
-/** Each phase runs as a logged step that reports typed events (events.ts). */
-export interface ProvisionRuntime extends StepReporter {
-  readonly onBoundary?: (event: ProvisionBoundaryEvent) => void | Promise<void>;
-}
-
-const PHASE_LABELS: Readonly<Record<ProvisionPhase, string>> = {
-  materialize_checkout: 'Preparing assistant files…',
-  provision_gcp: 'Configuring Google Cloud…',
-  start_onecli: 'Starting the credential vault…',
-  configure_provider: 'Connecting the AI provider…',
-  start_nanoclaw: 'Starting the assistant…',
-  establish_transport: 'Publishing the secure callback…',
-  configure_channel: 'Checking Google Chat configuration…',
-  bind_principal: 'Connecting the principal conversation…',
-  verify_conversation: 'Verifying the conversation…',
-  ready: 'Finishing setup…',
-};
 
 const GCP_WAIT_REASONS: Readonly<Record<GcloudReadbackResource, string>> = {
   project: 'Waiting for the Google Cloud project…',
@@ -158,22 +119,7 @@ export interface ProductionProvisionOptions {
   readonly runtime?: ProvisionRuntime;
 }
 
-export type ProvisionResult =
-  | { readonly status: 'ready' }
-  | { readonly status: 'paused'; readonly pause: ProvisionHumanPause };
-
 export type ProvisionPortLease = LoopbackPortLease;
-
-/** Test/process harness signal used to model an abrupt stop at a journal boundary. */
-export class ProvisionBoundaryInterruption extends Error {
-  readonly event: ProvisionBoundaryEvent;
-
-  constructor(event: ProvisionBoundaryEvent) {
-    super(`Provision interrupted after ${event.phase} ${event.boundary}`);
-    this.name = 'ProvisionBoundaryInterruption';
-    this.event = event;
-  }
-}
 
 export interface ProductionProvisionInput {
   readonly release: ResolvedRelease;
@@ -186,7 +132,10 @@ export interface ProductionProvisionInput {
   readonly requestProviderCredential?: () => Promise<ProviderCredential>;
   readonly identity: MainIdentityInput;
   readonly adapterInstance: string;
+  /** The journal's start: only principal messages after it count. */
   readonly provisioningStartedAt: string;
+  /** The operator confirmed the Google Chat app configuration (`--chat-configured`). */
+  readonly chatConfigured: boolean;
   readonly selectedMessagingGroupId?: string;
   readonly selectedPrincipal?: PrincipalCandidate;
   readonly bootstrapManifestFile?: string;
@@ -215,27 +164,29 @@ export interface ProductionProvisionContext {
   readonly state: ProductionProvisionState;
 }
 
+type Observe = (context: ProductionProvisionContext) => Promise<Observation>;
+
 export interface ProductionProvisionDependencies {
-  readonly probeCheckout: (context: ProductionProvisionContext) => Promise<PhaseProbeResult>;
+  readonly observeCheckout: Observe;
   readonly materializeReleaseCheckout: typeof materializeReleaseCheckout;
   readonly runReleasePreflight: typeof runReleasePreflight;
-  readonly probeGcp: (context: ProductionProvisionContext) => Promise<PhaseProbeResult>;
+  readonly observeGcp: Observe;
   readonly reconcileGcpProject: typeof reconcileGcpProject;
   readonly getOwnedGcpProjectNumber: typeof getOwnedGcpProjectNumber;
-  readonly probeOnecli: (context: ProductionProvisionContext) => Promise<PhaseProbeResult>;
+  readonly observeOnecli: Observe;
   readonly reconcileOnecliRuntime: typeof reconcileOnecliRuntime;
   readonly inspectOnecliRuntime: (layout: OnecliRuntimeLayout) => Promise<ObservedOnecliRuntime>;
   readonly validateObservedOnecliRuntime: typeof validateObservedOnecliRuntime;
   readonly persistOnecliApiKeyFiles: typeof persistOnecliApiKeyFiles;
-  readonly probeProvider: (context: ProductionProvisionContext) => Promise<PhaseProbeResult>;
+  readonly observeProvider: Observe;
   readonly importProviderCredential: typeof importProviderCredential;
-  readonly probeNanoclaw: (context: ProductionProvisionContext) => Promise<PhaseProbeResult>;
+  /** Main's published identity and access, observed through the running host. */
+  readonly observeMainIdentity: Observe;
   readonly reconcileInstanceRuntime: typeof reconcileInstanceRuntime;
   readonly reconcileMainIdentity: typeof reconcileMainIdentity;
   readonly verifyRoute: typeof verifyExistingGchatRoute;
   readonly verifyManagedRoute: typeof verifyManagedGchatRoute;
   readonly verifyEndpoint: typeof verifyExistingGchatEndpoint;
-  readonly isChatConfigurationConfirmed: typeof isChatConfigurationConfirmed;
   readonly verifyPrincipalBinding: (input: PrincipalBindingVerificationInput) => PrincipalBindingVerificationResult;
   readonly reconcilePrincipal: typeof reconcilePrincipalDm;
   readonly verifyConversation: (input: ConversationVerificationInput) => ConversationVerificationResult;
@@ -267,17 +218,17 @@ function stringField(value: Record<string, unknown>, key: string): string | unde
   return typeof value[key] === 'string' && value[key].length > 0 ? value[key] : undefined;
 }
 
-async function defaultProbeCheckout(context: ProductionProvisionContext): Promise<PhaseProbeResult> {
+async function defaultObserveCheckout(context: ProductionProvisionContext): Promise<Observation> {
   try {
     await assertReleaseCheckoutAgreement(context.operation.paths, context.operation.instanceId);
     await assertReleasePreflightReceipt(context);
-    return { status: 'matched' };
+    return PRESENT;
   } catch (error) {
     if (error instanceof GwsEaError && ['marker_missing', 'checkout_exists', 'unsafe_checkout'].includes(error.code)) {
-      return { status: 'absent' };
+      return ABSENT;
     }
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT') return { status: 'absent' };
+    if (code === 'ENOENT') return ABSENT;
     throw error;
   }
 }
@@ -429,7 +380,7 @@ async function ensureReleaseCheckout(
   await persistReleasePreflightReceipt(context, result);
 }
 
-async function defaultProbeOnecli(context: ProductionProvisionContext): Promise<PhaseProbeResult> {
+async function defaultObserveOnecli(context: ProductionProvisionContext): Promise<Observation> {
   try {
     const observed = await inspectOnecliRuntime(context.input.onecli);
     validateObservedOnecliRuntime(context.input.onecli, observed);
@@ -437,15 +388,15 @@ async function defaultProbeOnecli(context: ProductionProvisionContext): Promise<
       readOwnerOnlyFile(context.input.runtime.secret_files.onecli_runtime_api_key),
       readOwnerOnlyFile(context.input.runtime.secret_files.onecli_admin_api_key),
     ]);
-    if (!runtimeKey.trim() || runtimeKey.trim() !== adminKey.trim()) return { status: 'absent' };
-    return { status: 'matched' };
+    if (!runtimeKey.trim() || runtimeKey.trim() !== adminKey.trim()) return ABSENT;
+    return PRESENT;
   } catch (error) {
     if (error instanceof GwsEaError && error.code.startsWith('unsafe_')) throw error;
-    return { status: 'absent' };
+    return ABSENT;
   }
 }
 
-async function defaultProbeProvider(context: ProductionProvisionContext): Promise<PhaseProbeResult> {
+async function defaultObserveProvider(context: ProductionProvisionContext): Promise<Observation> {
   const credential = context.input.providerCredentialMetadata;
   try {
     const result = await runInstanceOnecliAdminCommand(context.input.runtime, ['secrets', 'list', '--max', '0']);
@@ -455,35 +406,31 @@ async function defaultProbeProvider(context: ProductionProvisionContext): Promis
     }
     if (context.state.providerSecretId) {
       const match = value.find((candidate) => candidate.id === context.state.providerSecretId);
-      if (!match) return { status: 'absent' };
+      if (!match) return ABSENT;
       if (!credential || !onecliSecretMatchesCredentialMetadata(match, credential)) {
         throw new GwsEaError('onecli_secret_conflict', 'Provider credential metadata does not match');
       }
-      return { status: 'matched' };
+      return PRESENT;
     }
-    if (!credential) return { status: 'absent' };
+    if (!credential) return ABSENT;
     const matches = value.filter((candidate) => candidate.name === credential.name);
     if (matches.length > 1) throw new GwsEaError('ambiguous_onecli_secret', 'Provider credential is ambiguous');
     const match = matches[0];
-    if (!match) return { status: 'absent' };
+    if (!match) return ABSENT;
     if (!onecliSecretMatchesCredentialMetadata(match, credential)) {
       throw new GwsEaError('onecli_secret_conflict', 'Provider credential metadata does not match');
     }
     const id = stringField(match, 'id');
     if (!id) throw new GwsEaError('invalid_child_output', 'OneCLI provider secret has no ID');
     context.state.providerSecretId = id;
-    return { status: 'matched' };
+    return PRESENT;
   } catch (error) {
     if (error instanceof GwsEaError && ['command_failed', 'command_timeout'].includes(error.code)) {
-      return { status: 'absent' };
+      return ABSENT;
     }
     throw error;
   }
 }
-
-type MainAccessExpectation =
-  | { readonly mode: 'all' }
-  | { readonly mode: 'legacy-selective'; readonly providerSecretId: string };
 
 async function runNanoclawProbeNcl(context: ProductionProvisionContext, args: readonly string[]): Promise<unknown> {
   const run = context.input.identityDependencies?.runNcl ?? runInstanceNclJson;
@@ -541,13 +488,11 @@ async function runNanoclawProbeOnecli(context: ProductionProvisionContext, args:
   return parseJson(result.stdout, 'OneCLI');
 }
 
-async function probeNanoclawAccess(
-  context: ProductionProvisionContext,
-  expectation: MainAccessExpectation,
-): Promise<PhaseProbeResult> {
+/** Main exists as published, and its OneCLI agent injects every matching secret (all mode). */
+async function defaultObserveMainIdentity(context: ProductionProvisionContext): Promise<Observation> {
   try {
     const profileValue = unwrapData(await runNanoclawProbeNcl(context, ['gws-ea-profile', 'get']));
-    if (!isRecord(profileValue)) return { status: 'absent' };
+    if (!isRecord(profileValue)) return ABSENT;
     const mainAgentGroupId = stringField(profileValue, 'main_agent_group_id');
     if (
       !mainAgentGroupId ||
@@ -556,7 +501,7 @@ async function probeNanoclawAccess(
       profileValue.principal_display_name !== context.input.identity.principalDisplayName ||
       profileValue.principal_timezone !== context.input.identity.principalTimezone
     ) {
-      return { status: 'absent' };
+      return ABSENT;
     }
     const [groupValue, configValue] = await Promise.all([
       runNanoclawProbeNcl(context, ['groups', 'get', '--id', mainAgentGroupId]).then(unwrapData),
@@ -568,37 +513,24 @@ async function probeNanoclawAccess(
       !isRecord(configValue) ||
       configValue.provider !== context.input.runtime.selected_provider
     ) {
-      return { status: 'absent' };
+      return ABSENT;
     }
     const agents = unwrapData(await runNanoclawProbeOnecli(context, ['agents', 'list', '--max', '0']));
-    if (!Array.isArray(agents) || !agents.every(isRecord)) return { status: 'absent' };
+    if (!Array.isArray(agents) || !agents.every(isRecord)) return ABSENT;
     const matching = agents.filter((agent) => agent.identifier === mainAgentGroupId);
     const agent = matching[0];
     const agentId = agent ? stringField(agent, 'id') : undefined;
-    if (matching.length !== 1 || !agentId || agent!.name !== 'main') {
-      return { status: 'absent' };
-    }
-    if (expectation.mode === 'all') {
-      if (agent!.secretMode !== 'all') return { status: 'absent' };
-    } else {
-      if (agent!.secretMode !== 'selective') return { status: 'absent' };
-      const secrets = unwrapData(await runNanoclawProbeOnecli(context, ['agents', 'secrets', '--id', agentId]));
-      if (!Array.isArray(secrets) || secrets.length !== 1 || secrets[0] !== expectation.providerSecretId) {
-        return { status: 'absent' };
-      }
+    if (matching.length !== 1 || !agentId || agent!.name !== 'main' || agent!.secretMode !== 'all') {
+      return ABSENT;
     }
     context.state.mainAgentGroupId = mainAgentGroupId;
-    return { status: 'matched' };
+    return PRESENT;
   } catch (error) {
     if (error instanceof GwsEaError && ['command_failed', 'command_timeout', 'ncl_failed'].includes(error.code)) {
-      return { status: 'absent' };
+      return ABSENT;
     }
     throw error;
   }
-}
-
-async function defaultProbeNanoclaw(context: ProductionProvisionContext): Promise<PhaseProbeResult> {
-  return probeNanoclawAccess(context, { mode: 'all' });
 }
 
 async function bootstrapManifestRemoved(file: string | undefined): Promise<boolean> {
@@ -644,27 +576,25 @@ async function ensureGchatProjectNumber(
 }
 
 const defaultProductionDependencies: ProductionProvisionDependencies = {
-  probeCheckout: defaultProbeCheckout,
+  observeCheckout: defaultObserveCheckout,
   materializeReleaseCheckout,
   runReleasePreflight,
-  probeGcp: async (context) =>
-    (await probeGcpProjectForCreate(context.input.gcp)) ? { status: 'matched' } : { status: 'absent' },
+  observeGcp: async (context) => ((await probeGcpProjectForCreate(context.input.gcp)) ? PRESENT : ABSENT),
   reconcileGcpProject,
   getOwnedGcpProjectNumber,
-  probeOnecli: defaultProbeOnecli,
+  observeOnecli: defaultObserveOnecli,
   reconcileOnecliRuntime,
   inspectOnecliRuntime,
   validateObservedOnecliRuntime,
   persistOnecliApiKeyFiles,
-  probeProvider: defaultProbeProvider,
+  observeProvider: defaultObserveProvider,
   importProviderCredential,
-  probeNanoclaw: defaultProbeNanoclaw,
+  observeMainIdentity: defaultObserveMainIdentity,
   reconcileInstanceRuntime,
   reconcileMainIdentity,
   verifyRoute: verifyExistingGchatRoute,
   verifyManagedRoute: verifyManagedGchatRoute,
   verifyEndpoint: verifyExistingGchatEndpoint,
-  isChatConfigurationConfirmed,
   verifyPrincipalBinding,
   reconcilePrincipal: reconcilePrincipalDm,
   verifyConversation: verifyTalkableConversation,
@@ -753,8 +683,8 @@ async function ensureInstanceHostStarted(
   }
 }
 
-function humanPause(phase: ProvisionPhase, code: string, message: string): PhaseEffectResult {
-  return { status: 'paused', pause: { kind: 'human-action', phase, code, message } };
+function humanPause(phase: ProvisionStepId, code: string, message: string): ProvisionHumanPause {
+  return { kind: 'human-action', phase, code, message };
 }
 
 const MANAGED_TRANSPORT_ATTEMPTS = 30;
@@ -782,10 +712,10 @@ function isRepairableManagedTransportObservation(error: unknown): error is GwsEa
   return error instanceof GwsEaError && REPAIRABLE_MANAGED_TRANSPORT_CODES.has(error.code);
 }
 
-async function probeManagedTransport(
+async function observeManagedTransport(
   context: ProductionProvisionContext,
   dependencies: ProductionProvisionDependencies,
-): Promise<PhaseProbeResult> {
+): Promise<Observation> {
   const layout = dependencies.createCloudflareConnectorLayout({
     cloudflareRoot: context.operation.paths.cloudflareRoot,
     platform: context.input.serviceDependencies.platform,
@@ -802,11 +732,11 @@ async function probeManagedTransport(
       localEndpointUrl: managedLocalEndpoint(context),
     });
     context.state.managedTransportObservation = undefined;
-    return { status: 'matched' };
+    return PRESENT;
   } catch (error) {
     if (!isRepairableManagedTransportObservation(error)) throw error;
     context.state.managedTransportObservation = error.message;
-    return { status: 'absent' };
+    return ABSENT;
   }
 }
 
@@ -833,7 +763,7 @@ async function waitForManagedTransport(
   dependencies: ProductionProvisionDependencies,
 ): Promise<void> {
   for (let attempt = 0; attempt < MANAGED_TRANSPORT_ATTEMPTS; attempt += 1) {
-    if ((await probeManagedTransport(context, dependencies)).status === 'matched') return;
+    if ((await observeManagedTransport(context, dependencies)).status === 'present') return;
     if (attempt + 1 < MANAGED_TRANSPORT_ATTEMPTS) {
       await dependencies.managedTransportDelay(MANAGED_TRANSPORT_DELAY_MS);
     }
@@ -867,72 +797,65 @@ async function reconcileManagedTransport(
   await waitForManagedTransport(context, dependencies);
 }
 
+/** A pause while the principal DM is awaited or chosen; otherwise the binding joins the run state. */
 function principalResult(
   context: ProductionProvisionContext,
   result: Awaited<ReturnType<typeof reconcilePrincipalDm>>,
-): PhaseProbeResult {
+): ProvisionHumanPause | undefined {
   if (result.status === 'waiting') {
-    return {
-      status: 'paused',
-      pause: {
-        kind: 'human-action',
-        phase: 'bind_principal',
-        code: 'principal_dm_required',
-        message: 'Ask the principal to send a direct message to the configured Google Chat app, then resume.',
-      },
-    };
+    return humanPause(
+      'bind_principal',
+      'principal_dm_required',
+      'Ask the principal to send a direct message to the configured Google Chat app, then resume.',
+    );
   }
   if (result.status === 'selection-required') {
     return {
-      status: 'paused',
-      pause: {
-        kind: 'human-action',
-        phase: 'bind_principal',
-        code: 'principal_selection_required',
-        message: 'Select the principal direct-message conversation, then resume.',
-        choices: result.candidates.map((candidate) => ({
-          id: candidate.messagingGroupId,
-          label: candidate.senderName ? `${candidate.senderName} (${candidate.userId})` : candidate.userId,
-        })),
-      },
+      ...humanPause(
+        'bind_principal',
+        'principal_selection_required',
+        'Select the principal direct-message conversation, then resume.',
+      ),
+      choices: result.candidates.map((candidate) => ({
+        id: candidate.messagingGroupId,
+        label: candidate.senderName ? `${candidate.senderName} (${candidate.userId})` : candidate.userId,
+      })),
     };
   }
   context.state.mainAgentGroupId = result.agentGroupId;
   context.state.principal = result.candidate;
   context.state.welcomeEventId = result.eventId;
-  return { status: 'matched' };
+  return undefined;
 }
 
-function chatConfigurationPause(input: ProductionProvisionInput): Extract<PhaseProbeResult, { status: 'paused' }> {
+function chatConfigurationPause(input: ProductionProvisionInput): ProvisionHumanPause {
   return {
-    status: 'paused',
-    pause: {
-      kind: 'human-action',
-      phase: 'configure_channel',
-      code: 'chat_configuration_required',
-      message: "Finish this assistant's Google Chat app configuration, then confirm it.",
-      details: [
-        `App name: ${input.identity.assistantDisplayName}`,
-        'Add a public HTTPS avatar URL and a short description.',
-        'Keep “Build this Chat app as a Google Workspace add-on” enabled.',
-        `Enable interactive features and 1:1 messages, then use HTTP endpoint URL ${input.runtime.endpoint_url}`,
-        'Limit visibility to the intended principal or Workspace domain.',
-      ],
-      actionUrl: googleChatConfigurationUrl(input.gcp.projectId),
-      resumeFlag: '--chat-configured',
-    },
+    ...humanPause(
+      'configure_channel',
+      'chat_configuration_required',
+      "Finish this assistant's Google Chat app configuration, then confirm it.",
+    ),
+    details: [
+      `App name: ${input.identity.assistantDisplayName}`,
+      'Add a public HTTPS avatar URL and a short description.',
+      'Keep “Build this Chat app as a Google Workspace add-on” enabled.',
+      `Enable interactive features and 1:1 messages, then use HTTP endpoint URL ${input.runtime.endpoint_url}`,
+      'Limit visibility to the intended principal or Workspace domain.',
+    ],
+    actionUrl: googleChatConfigurationUrl(input.gcp.projectId),
+    resumeFlag: '--chat-configured',
   };
 }
 
 function bindingObservation(
   context: ProductionProvisionContext,
   result: PrincipalBindingVerificationResult,
-): PhaseProbeResult {
-  if (result.status === 'absent') return { status: 'absent' };
+): Observation {
+  if (result.status === 'absent') return ABSENT;
   context.state.mainAgentGroupId = result.agentGroupId;
   context.state.principal = result.candidate;
   context.state.welcomeEventId = result.welcomeEventId;
-  return { status: 'matched' };
+  return PRESENT;
 }
 
 function conversationInput(context: ProductionProvisionContext): ConversationVerificationInput | undefined {
@@ -952,15 +875,16 @@ function conversationInput(context: ProductionProvisionContext): ConversationVer
 }
 
 /**
- * Production phase composition over the validated provisioning primitives. Dependencies are
+ * Production step composition over the validated provisioning primitives.
+ * Each existing probe is one resource's observation. Dependencies are
  * injectable for boundary tests; omitted functions are the real checkout,
  * OneCLI, runtime, identity, principal, endpoint, and mailbox implementations.
  */
-export function createProductionProvisionRegistry(
+export function createProductionProvisionSteps(
   context: ProductionProvisionContext,
   overrides: Partial<ProductionProvisionDependencies> = {},
   runtime: ProvisionRuntime = {},
-): ProvisionPhaseRegistry<ProductionProvisionContext> {
+): ProvisionSteps<ProductionProvisionContext> {
   const dependencies: ProductionProvisionDependencies = { ...defaultProductionDependencies, ...overrides };
   const { input } = context;
   if (input.runtime.instance_id !== context.operation.instanceId) {
@@ -985,7 +909,6 @@ export function createProductionProvisionRegistry(
     );
   }
 
-  const key = (kind: string, value: string): string => journalResourceKey(kind, value);
   const retainOnecliReceipt = async (
     value: ProductionProvisionContext,
     receipt: OnecliCompatibilityReceipt,
@@ -996,7 +919,7 @@ export function createProductionProvisionRegistry(
       admin: value.input.runtime.secret_files.onecli_admin_api_key,
     });
   };
-  const principalProbe = async (value: ProductionProvisionContext): Promise<PhaseProbeResult> =>
+  const observeBinding = async (value: ProductionProvisionContext): Promise<Observation> =>
     bindingObservation(
       value,
       dependencies.verifyPrincipalBinding({
@@ -1007,399 +930,269 @@ export function createProductionProvisionRegistry(
         selectedCandidate: value.state.principal ?? value.input.selectedPrincipal,
       }),
     );
-  const conversationProbe = async (value: ProductionProvisionContext): Promise<PhaseProbeResult> => {
+  /** The conversation check needs the binding, which an earlier run may have made. */
+  const verifyConversation = async (
+    value: ProductionProvisionContext,
+  ): Promise<ConversationVerificationResult | undefined> => {
+    if (!conversationInput(value)) await observeBinding(value);
     const verificationInput = conversationInput(value);
-    if (!verificationInput) return { status: 'absent' };
-    return dependencies.verifyConversation(verificationInput).ready ? { status: 'matched' } : { status: 'absent' };
+    return verificationInput ? dependencies.verifyConversation(verificationInput) : undefined;
   };
+  /** The principal's messages reach the assistant only through its host, and the connector when managed. */
+  const principalPauseNeeds = ['start_nanoclaw', 'establish_transport'] as const;
 
-  return defineProvisionPhaseRegistry({
+  return {
     materialize_checkout: {
-      resourceKey: () => key('checkout', JSON.stringify([input.release.sourceRemote, input.release.commit])),
-      probe: dependencies.probeCheckout,
-      apply: async (value) => {
-        await ensureReleaseCheckout(value, dependencies);
-        return { status: 'completed' };
-      },
+      label: 'Preparing assistant files…',
+      resources: [
+        {
+          name: 'the release checkout',
+          observe: dependencies.observeCheckout,
+          apply: async (value) => {
+            await ensureReleaseCheckout(value, dependencies);
+            return undefined;
+          },
+        },
+      ],
     },
     provision_gcp: {
-      resourceKey: () => key('gcp', input.gcp.projectId),
-      probe: dependencies.probeGcp,
-      apply: async (value) => {
-        await dependencies.reconcileGcpProject(value.input.gcp, {
-          onProgress: ({ resource }) =>
-            runtime.emit?.({ type: 'step-waiting', step: 'provision_gcp', reason: GCP_WAIT_REASONS[resource] }),
-        });
-        return { status: 'completed' };
-      },
+      label: 'Configuring Google Cloud…',
+      resources: [
+        {
+          name: 'the Google Cloud project',
+          observe: dependencies.observeGcp,
+          apply: async (value) => {
+            await dependencies.reconcileGcpProject(value.input.gcp, {
+              onProgress: ({ resource }) =>
+                runtime.emit?.({ type: 'step-waiting', step: 'provision_gcp', reason: GCP_WAIT_REASONS[resource] }),
+            });
+            return undefined;
+          },
+        },
+      ],
     },
     start_onecli: {
-      resourceKey: () =>
-        key('onecli', JSON.stringify([input.onecli.project, input.onecli.appPort, input.onecli.gatewayPort])),
-      probe: dependencies.probeOnecli,
-      apply: async (value) => {
-        let receipt: OnecliCompatibilityReceipt;
-        try {
-          receipt = await withRuntimePortLease(
-            value,
-            ['onecli_app', 'onecli_gateway'],
-            dependencies.holdReservedLoopbackPorts,
-            (releaseLease) =>
-              dependencies.reconcileOnecliRuntime(
-                value.input.onecli,
-                beforeOnecliBind(value.input.onecliDependencies, releaseLease),
-              ),
-          );
-        } catch (error) {
-          if (!(error instanceof GwsEaError) || error.code !== 'port_claim_lost') throw error;
-          let observed: ObservedOnecliRuntime;
-          try {
-            observed = await dependencies.inspectOnecliRuntime(value.input.onecli);
-          } catch {
-            throw error;
-          }
-          dependencies.validateObservedOnecliRuntime(value.input.onecli, observed);
-          receipt = await dependencies.reconcileOnecliRuntime(value.input.onecli, value.input.onecliDependencies);
-        }
-        await retainOnecliReceipt(value, receipt);
-        return { status: 'completed' };
-      },
-      reconcileCompletedPostcondition: async (value) => {
-        const receipt = await dependencies.reconcileOnecliRuntime(value.input.onecli, value.input.onecliDependencies);
-        await retainOnecliReceipt(value, receipt);
-      },
+      label: 'Starting the credential vault…',
+      liveness: { label: 'Checking the credential vault…' },
+      resources: [
+        {
+          name: 'the OneCLI runtime',
+          observe: dependencies.observeOnecli,
+          apply: async (value) => {
+            let receipt: OnecliCompatibilityReceipt;
+            try {
+              receipt = await withRuntimePortLease(
+                value,
+                ['onecli_app', 'onecli_gateway'],
+                dependencies.holdReservedLoopbackPorts,
+                (releaseLease) =>
+                  dependencies.reconcileOnecliRuntime(
+                    value.input.onecli,
+                    beforeOnecliBind(value.input.onecliDependencies, releaseLease),
+                  ),
+              );
+            } catch (error) {
+              if (!(error instanceof GwsEaError) || error.code !== 'port_claim_lost') throw error;
+              let observed: ObservedOnecliRuntime;
+              try {
+                observed = await dependencies.inspectOnecliRuntime(value.input.onecli);
+              } catch {
+                throw error;
+              }
+              dependencies.validateObservedOnecliRuntime(value.input.onecli, observed);
+              receipt = await dependencies.reconcileOnecliRuntime(value.input.onecli, value.input.onecliDependencies);
+            }
+            await retainOnecliReceipt(value, receipt);
+            return undefined;
+          },
+        },
+      ],
     },
     configure_provider: {
-      resourceKey: () =>
-        key(
-          'provider',
-          JSON.stringify([
-            input.runtime.selected_provider,
-            input.providerCredentialMetadata?.name ?? context.state.providerSecretId ?? 'unresolved',
-            input.providerCredentialMetadata?.type ?? '',
-            input.providerCredentialMetadata?.hostPattern ?? '',
-          ]),
-        ),
-      probe: dependencies.probeProvider,
-      apply: async (value) => {
-        const credential = value.input.providerCredential ?? (await value.input.requestProviderCredential?.());
-        if (!credential) {
-          return humanPause(
-            'configure_provider',
-            'provider_credential_required',
-            'Authenticate the selected provider, then resume.',
-          );
-        }
-        const expected = value.input.providerCredentialMetadata;
-        if (expected && !credentialMatchesMetadata(credential, expected)) {
-          throw new GwsEaError(
-            'provider_credential_mismatch',
-            'The selected provider returned credential metadata that does not match its definition',
-          );
-        }
-        const receipt =
-          value.state.onecliReceipt ??
-          (await dependencies.reconcileOnecliRuntime(value.input.onecli, value.input.onecliDependencies));
-        await retainOnecliReceipt(value, receipt);
-        const imported = await dependencies.importProviderCredential(
-          receipt,
-          credential,
-          value.input.onecliDependencies,
-        );
-        value.state.providerSecretId = imported.id;
-        return { status: 'completed' };
-      },
+      label: 'Connecting the AI provider…',
+      resources: [
+        {
+          name: 'the provider credential',
+          observe: dependencies.observeProvider,
+          apply: async (value) => {
+            const credential = value.input.providerCredential ?? (await value.input.requestProviderCredential?.());
+            if (!credential) {
+              return humanPause(
+                'configure_provider',
+                'provider_credential_required',
+                'Authenticate the selected provider, then resume.',
+              );
+            }
+            const expected = value.input.providerCredentialMetadata;
+            if (expected && !credentialMatchesMetadata(credential, expected)) {
+              throw new GwsEaError(
+                'provider_credential_mismatch',
+                'The selected provider returned credential metadata that does not match its definition',
+              );
+            }
+            const receipt =
+              value.state.onecliReceipt ??
+              (await dependencies.reconcileOnecliRuntime(value.input.onecli, value.input.onecliDependencies));
+            await retainOnecliReceipt(value, receipt);
+            const imported = await dependencies.importProviderCredential(
+              receipt,
+              credential,
+              value.input.onecliDependencies,
+            );
+            value.state.providerSecretId = imported.id;
+            return undefined;
+          },
+        },
+      ],
     },
     start_nanoclaw: {
-      resourceKey: () =>
-        key(
-          'nanoclaw',
-          JSON.stringify([input.runtime.instance_id, input.runtime.deployed_commit, input.runtime.selected_provider]),
-        ),
-      probe: async (value) => {
-        const observed = await dependencies.probeNanoclaw(value);
-        if (observed.status !== 'matched') return observed;
-        return (await bootstrapManifestRemoved(value.input.bootstrapManifestFile)) ? observed : { status: 'absent' };
-      },
-      apply: async (value) => {
-        if (!value.state.providerSecretId) {
-          throw new GwsEaError('provider_not_ready', 'Provider credential must be reconciled before NanoClaw');
-        }
-        await ensureGchatCredential(value);
-        await ensureGchatProjectNumber(value, dependencies);
-        await ensureInstanceHostStarted(value, dependencies);
-        const main = await dependencies.reconcileMainIdentity(
-          value.input.runtime,
-          value.input.identity,
-          value.input.identityDependencies,
-        );
-        value.state.mainAgentGroupId = main.agentGroupId;
-        if (value.input.bootstrapManifestFile) {
-          await removePrivateFile(value.input.bootstrapManifestFile);
-        }
-        return { status: 'completed' };
-      },
-      reconcileCompletedPostcondition: async (value) => {
-        await ensureGchatProjectNumber(value, dependencies);
-        if (!(await observeInstanceHost(value))) {
-          await ensureGchatCredential(value);
-          await ensureInstanceHostStarted(value, dependencies);
-        }
-        if (
-          (await probeNanoclawAccess(value, { mode: 'all' })).status === 'matched' &&
-          (await bootstrapManifestRemoved(value.input.bootstrapManifestFile))
-        ) {
-          return;
-        }
-        const providerSecretId = value.state.providerSecretId;
-        const legacyState = providerSecretId
-          ? await probeNanoclawAccess(value, { mode: 'legacy-selective', providerSecretId })
-          : { status: 'absent' as const };
-        if (legacyState.status !== 'matched' || !(await bootstrapManifestRemoved(value.input.bootstrapManifestFile))) {
-          throw new GwsEaError('postcondition_drift', 'Completed phase postcondition drifted: start_nanoclaw');
-        }
-        const main = await dependencies.reconcileMainIdentity(
-          value.input.runtime,
-          value.input.identity,
-          value.input.identityDependencies,
-        );
-        value.state.mainAgentGroupId = main.agentGroupId;
-      },
+      label: 'Starting the assistant…',
+      liveness: { label: 'Checking the assistant…' },
+      resources: [
+        {
+          name: 'the NanoClaw host',
+          observe: async (value) => ((await observeInstanceHost(value)) ? PRESENT : ABSENT),
+          apply: async (value) => {
+            await ensureGchatCredential(value);
+            await ensureGchatProjectNumber(value, dependencies);
+            await ensureInstanceHostStarted(value, dependencies);
+            return undefined;
+          },
+        },
+        {
+          name: "main's identity",
+          observe: async (value) => {
+            const observed = await dependencies.observeMainIdentity(value);
+            if (observed.status !== 'present') return observed;
+            return (await bootstrapManifestRemoved(value.input.bootstrapManifestFile)) ? observed : ABSENT;
+          },
+          apply: async (value) => {
+            const main = await dependencies.reconcileMainIdentity(
+              value.input.runtime,
+              value.input.identity,
+              value.input.identityDependencies,
+            );
+            value.state.mainAgentGroupId = main.agentGroupId;
+            if (value.input.bootstrapManifestFile) await removePrivateFile(value.input.bootstrapManifestFile);
+            return undefined;
+          },
+        },
+      ],
     },
     establish_transport:
       input.ingress.mode === 'existing'
         ? {
-            resourceKey: () => key('transport', input.runtime.endpoint_url),
-            probe: async () => {
-              try {
-                await dependencies.verifyRoute({ endpointUrl: input.runtime.endpoint_url });
-                return { status: 'matched' };
-                /* eslint-disable-next-line no-catch-all/no-catch-all -- Any route-probe failure means the external postcondition is absent. */
-              } catch {
-                return { status: 'absent' };
-              }
-            },
-            apply: async () =>
-              humanPause(
-                'establish_transport',
-                'existing_endpoint_required',
-                'Publish the claimed HTTPS /webhook/gchat route without redirects, then resume.',
-              ),
+            label: 'Publishing the secure callback…',
+            resources: [
+              {
+                name: 'the published callback route',
+                observe: async () => {
+                  try {
+                    await dependencies.verifyRoute({ endpointUrl: input.runtime.endpoint_url });
+                    return PRESENT;
+                    /* eslint-disable-next-line no-catch-all/no-catch-all -- Any route-probe failure means the external postcondition is absent. */
+                  } catch {
+                    return ABSENT;
+                  }
+                },
+                apply: async () =>
+                  humanPause(
+                    'establish_transport',
+                    'existing_endpoint_required',
+                    'Publish the claimed HTTPS /webhook/gchat route without redirects, then resume.',
+                  ),
+              },
+            ],
           }
         : {
-            resourceKey: () => key('transport', input.runtime.endpoint_url),
-            probe: (value) => probeManagedTransport(value, dependencies),
-            apply: async (value) => {
-              await reconcileManagedTransport(value, dependencies);
-              return { status: 'completed' };
-            },
-            reconcileCompletedPostcondition: (value) => reconcileManagedTransport(value, dependencies),
+            label: 'Publishing the secure callback…',
+            liveness: { label: 'Checking the secure callback…' },
+            resources: [
+              {
+                name: 'the managed Cloudflare transport',
+                observe: (value) => observeManagedTransport(value, dependencies),
+                apply: async (value) => {
+                  await reconcileManagedTransport(value, dependencies);
+                  return undefined;
+                },
+              },
+            ],
           },
     configure_channel: {
-      resourceKey: () => key('gchat', JSON.stringify([input.adapterInstance, input.runtime.endpoint_url])),
-      probe: async (value) => {
-        if (!(await dependencies.isChatConfigurationConfirmed(value.operation.paths, value.operation.instanceId))) {
-          return chatConfigurationPause(input);
-        }
-        try {
-          await dependencies.verifyEndpoint({
-            endpointUrl: input.runtime.endpoint_url,
-            audienceUrl: input.runtime.endpoint_url,
-          });
-          return { status: 'matched' };
-          /* eslint-disable-next-line no-catch-all/no-catch-all -- Any auth-probe failure means the external postcondition is absent. */
-        } catch {
-          return { status: 'absent' };
-        }
-      },
-      apply: async (value) => {
-        if (!(await dependencies.isChatConfigurationConfirmed(value.operation.paths, value.operation.instanceId))) {
-          return chatConfigurationPause(input);
-        }
-        await dependencies.verifyEndpoint({
-          endpointUrl: input.runtime.endpoint_url,
-          audienceUrl: input.runtime.endpoint_url,
-        });
-        return { status: 'completed' };
-      },
+      label: 'Checking Google Chat configuration…',
+      resources: [
+        {
+          name: 'the Google Chat app configuration',
+          observe: async (value) => {
+            if (!value.input.chatConfigured) return { status: 'pause', pause: chatConfigurationPause(value.input) };
+            try {
+              await dependencies.verifyEndpoint({
+                endpointUrl: input.runtime.endpoint_url,
+                audienceUrl: input.runtime.endpoint_url,
+              });
+              return PRESENT;
+              /* eslint-disable-next-line no-catch-all/no-catch-all -- Any auth-probe failure means the external postcondition is absent. */
+            } catch {
+              return ABSENT;
+            }
+          },
+          apply: async (value) => {
+            if (!value.input.chatConfigured) return chatConfigurationPause(value.input);
+            await dependencies.verifyEndpoint({
+              endpointUrl: input.runtime.endpoint_url,
+              audienceUrl: input.runtime.endpoint_url,
+            });
+            return undefined;
+          },
+        },
+      ],
     },
     bind_principal: {
-      resourceKey: () => key('principal', JSON.stringify([input.adapterInstance, input.provisioningStartedAt])),
-      probe: principalProbe,
-      apply: async (value) => {
-        const result = principalResult(
-          value,
-          await dependencies.reconcilePrincipal(
-            value.input.runtime,
-            {
-              adapterInstance: value.input.adapterInstance,
-              provisioningStartedAt: value.input.provisioningStartedAt,
-              messagingGroupId: value.input.selectedMessagingGroupId,
-              selectedCandidate: value.input.selectedPrincipal,
-            },
-            value.input.principalDependencies,
-          ),
-        );
-        return result.status === 'paused' ? result : { status: 'completed' };
-      },
+      label: 'Connecting the principal conversation…',
+      pauseNeeds: principalPauseNeeds,
+      resources: [
+        {
+          name: 'the principal binding',
+          observe: observeBinding,
+          apply: async (value) =>
+            principalResult(
+              value,
+              await dependencies.reconcilePrincipal(
+                value.input.runtime,
+                {
+                  adapterInstance: value.input.adapterInstance,
+                  provisioningStartedAt: value.input.provisioningStartedAt,
+                  messagingGroupId: value.input.selectedMessagingGroupId,
+                  selectedCandidate: value.input.selectedPrincipal,
+                },
+                value.input.principalDependencies,
+              ),
+            ),
+        },
+      ],
     },
     verify_conversation: {
-      resourceKey: () => key('conversation', input.runtime.instance_id),
-      probe: conversationProbe,
-      apply: async (value) => {
-        const verificationInput = conversationInput(value);
-        if (!verificationInput) throw new GwsEaError('principal_not_ready', 'Principal binding is not available');
-        const result = dependencies.verifyConversation(verificationInput);
-        return result.ready
-          ? { status: 'completed' }
-          : humanPause(
-              'verify_conversation',
-              result.reason,
-              'Wait for the delivered welcome, then ask the principal to send a later Google Chat message and resume.',
-            );
-      },
+      label: 'Verifying the conversation…',
+      pauseNeeds: principalPauseNeeds,
+      resources: [
+        {
+          name: 'the talkable conversation',
+          observe: async (value) => ((await verifyConversation(value))?.ready ? PRESENT : ABSENT),
+          apply: async (value) => {
+            const result = await verifyConversation(value);
+            if (!result) throw new GwsEaError('principal_not_ready', 'Principal binding is not available');
+            return result.ready
+              ? undefined
+              : humanPause(
+                  'verify_conversation',
+                  result.reason,
+                  'Wait for the delivered welcome, then ask the principal to send a later Google Chat message and resume.',
+                );
+          },
+        },
+      ],
     },
-    ready: {
-      resourceKey: () => key('ready', input.runtime.instance_id),
-      probe: conversationProbe,
-      apply: async (value) => {
-        const result = await conversationProbe(value);
-        return result.status === 'matched'
-          ? { status: 'completed' }
-          : humanPause('ready', 'conversation_not_ready', 'Conversation evidence is not ready; resume after delivery.');
-      },
-    },
-  });
-}
-
-function succeeded(journal: ProvisionJournal, phase: ProvisionPhase): boolean {
-  return journal.phases[phase].attempts.at(-1)?.succeeded_at !== undefined;
-}
-
-function failureCode(error: unknown): string {
-  return error instanceof GwsEaError ? error.code : 'phase_failed';
-}
-
-async function boundary(
-  runtime: ProvisionRuntime,
-  phase: ProvisionPhase,
-  kind: ProvisionBoundary,
-  attemptId: string,
-): Promise<void> {
-  await runtime.onBoundary?.({ phase, boundary: kind, attemptId });
-}
-
-async function assertCompletedPostcondition<Context>(
-  phase: ProvisionPhase,
-  definition: ProvisionPhaseRegistry<Context>[ProvisionPhase],
-  context: Context,
-): Promise<void> {
-  let observation = await definition.probe(context);
-  if (observation.status === 'matched') return;
-  if (observation.status === 'absent' && definition.reconcileCompletedPostcondition) {
-    await definition.reconcileCompletedPostcondition(context);
-    observation = await definition.probe(context);
-    if (observation.status === 'matched') return;
-  }
-  throw new GwsEaError('postcondition_drift', `Completed phase postcondition drifted: ${phase}`);
-}
-
-/**
- * Reconcile every completed phase and advance the first incomplete phase via
- * durable intent -> effect -> observed postcondition -> success. The caller
- * owns the instance-operation lifetime; returning `paused` lets it release
- * the lock before waiting on a person or an inbound message.
- */
-export async function reconcileProvisioning<Context>(
-  operation: InstanceOperation,
-  context: Context,
-  definitions: ProvisionPhaseRegistry<Context>,
-  runtime: ProvisionRuntime = {},
-): Promise<ProvisionResult> {
-  let journal = await ensureProvisionJournal(operation);
-
-  /** Advance one phase; `undefined` once its postcondition holds. */
-  const advancePhase = async (
-    phase: ProvisionPhase,
-  ): Promise<Extract<ProvisionResult, { status: 'paused' }> | undefined> => {
-    const definition = definitions[phase];
-    if (succeeded(journal, phase)) {
-      await assertCompletedPostcondition(phase, definition, context);
-      return undefined;
-    }
-
-    const resourceKey = definition.resourceKey(context);
-    let begun = await beginPhase(operation, phase, resourceKey);
-    let attempt = begun.attempt;
-    try {
-      if (begun.requires_reconciliation) {
-        const reconciled = await definition.probe(context);
-        if (reconciled.status === 'paused') return { status: 'paused', pause: reconciled.pause };
-        journal = await observePhase(
-          operation,
-          phase,
-          attempt.attempt_id,
-          reconciled.status === 'matched' ? { matched: true, resource_key: resourceKey } : { matched: false },
-        );
-        await boundary(runtime, phase, 'verify', attempt.attempt_id);
-        if (reconciled.status === 'matched') {
-          journal = await commitPhaseSuccess(operation, phase, attempt.attempt_id);
-          return undefined;
-        }
-        begun = await beginPhase(operation, phase, resourceKey);
-        attempt = begun.attempt;
-      }
-
-      await boundary(runtime, phase, 'intent', attempt.attempt_id);
-      const alreadySatisfied = await definition.probe(context);
-      if (alreadySatisfied.status === 'paused') {
-        return { status: 'paused', pause: alreadySatisfied.pause };
-      }
-      if (alreadySatisfied.status === 'matched') {
-        journal = await observePhase(operation, phase, attempt.attempt_id, {
-          matched: true,
-          resource_key: resourceKey,
-        });
-        await boundary(runtime, phase, 'verify', attempt.attempt_id);
-        journal = await commitPhaseSuccess(operation, phase, attempt.attempt_id);
-        return undefined;
-      }
-      const applied = await definition.apply(context);
-      if (applied.status === 'paused') return { status: 'paused', pause: applied.pause };
-      await boundary(runtime, phase, 'effect', attempt.attempt_id);
-
-      const verified = await definition.probe(context);
-      if (verified.status === 'paused') return { status: 'paused', pause: verified.pause };
-      journal = await observePhase(
-        operation,
-        phase,
-        attempt.attempt_id,
-        verified.status === 'matched' ? { matched: true, resource_key: resourceKey } : { matched: false },
-      );
-      await boundary(runtime, phase, 'verify', attempt.attempt_id);
-      if (verified.status !== 'matched') {
-        throw new GwsEaError('postcondition_missing', `Phase postcondition is not satisfied: ${phase}`);
-      }
-      journal = await commitPhaseSuccess(operation, phase, attempt.attempt_id);
-    } catch (error) {
-      if (!(error instanceof ProvisionBoundaryInterruption)) {
-        await recordPhaseFailure(operation, phase, attempt.attempt_id, failureCode(error));
-      }
-      throw error;
-    }
-    return undefined;
   };
-
-  for (const phase of PROVISION_PHASES) {
-    const paused = await runStep(
-      runtime,
-      { id: phase, label: PHASE_LABELS[phase] },
-      () => advancePhase(phase),
-      (result) => result?.pause,
-    );
-    if (paused) return paused;
-  }
-  return { status: 'ready' };
 }
 
 const BOOTSTRAP_SCHEMA_VERSION = 1 as const;
@@ -1640,27 +1433,6 @@ function hydrateMainState(profile: PersistedProfileIdentity | undefined): Produc
   return { mainAgentGroupId: profile.main_agent_group_id };
 }
 
-function firstProvisionIntent(journal: ProvisionJournal): string | undefined {
-  const timestamps = PROVISION_PHASES.flatMap((phase) =>
-    journal.phases[phase].attempts.map((attempt) => attempt.intended_at),
-  ).sort();
-  return timestamps[0];
-}
-
-async function ensureTrustedProvisioningStart(
-  operation: InstanceOperation,
-  reservation: InstanceReservation,
-): Promise<string> {
-  const journal = await ensureProvisionJournal(operation);
-  const existing = firstProvisionIntent(journal);
-  if (existing) return existing;
-  const resourceKey = journalResourceKey(
-    'checkout',
-    JSON.stringify([reservation.source_remote, reservation.deployed_commit]),
-  );
-  return (await beginPhase(operation, 'materialize_checkout', resourceKey)).attempt.intended_at;
-}
-
 /** Build the production context from temporary bootstrap input or authoritative instance state. */
 export async function runProductionProvision(
   operation: InstanceOperation,
@@ -1669,22 +1441,19 @@ export async function runProductionProvision(
   const { interaction, managedIngress } = options;
   const provisionRuntime = options.runtime ?? {};
   const selectedMessagingGroupId = interaction?.decisions.messagingGroupId;
-  if (interaction?.decisions.chatConfigured) await confirmChatConfiguration(operation.paths, operation.instanceId);
-  const reservation = await getInstanceReservation(operation.paths, operation.instanceId);
-  const provisioningStartedAt = await ensureTrustedProvisioningStart(operation, reservation);
-  const principalSelection = await loadPrincipalSelection(
-    operation.paths,
-    operation.instanceId,
-    'gchat',
-    provisioningStartedAt,
-  );
+  const journal = interaction?.decisions.chatConfigured
+    ? await recordChatConfigurationConfirmed(operation)
+    : await readProvisionJournal(operation.paths, operation.instanceId);
+  const provisioningStartedAt = journal.started_at;
+  const selectedPrincipal = journal.decisions.principal;
   if (
-    principalSelection &&
+    selectedPrincipal &&
     selectedMessagingGroupId !== undefined &&
-    principalSelection.candidate.messagingGroupId !== selectedMessagingGroupId
+    selectedPrincipal.messagingGroupId !== selectedMessagingGroupId
   ) {
     throw new GwsEaError('principal_selection_mismatch', 'The principal selection is already fixed for this instance');
   }
+  const reservation = await getInstanceReservation(operation.paths, operation.instanceId);
   let manifest: ProductionBootstrapManifest | undefined;
   try {
     manifest = await loadProductionBootstrapManifest(operation.paths.bootstrapFile(operation.instanceId));
@@ -1789,17 +1558,14 @@ export async function runProductionProvision(
       identity,
       adapterInstance: 'gchat',
       provisioningStartedAt,
-      ...((principalSelection?.candidate.messagingGroupId ??
-      selectedMessagingGroupId ??
-      manifest?.selected_messaging_group_id)
+      chatConfigured: journal.decisions.chat_configuration_confirmed_at !== undefined,
+      ...((selectedPrincipal?.messagingGroupId ?? selectedMessagingGroupId ?? manifest?.selected_messaging_group_id)
         ? {
             selectedMessagingGroupId:
-              principalSelection?.candidate.messagingGroupId ??
-              selectedMessagingGroupId ??
-              manifest!.selected_messaging_group_id!,
+              selectedPrincipal?.messagingGroupId ?? selectedMessagingGroupId ?? manifest!.selected_messaging_group_id!,
           }
         : {}),
-      ...(principalSelection ? { selectedPrincipal: principalSelection.candidate } : {}),
+      ...(selectedPrincipal ? { selectedPrincipal } : {}),
       bootstrapManifestFile: operation.paths.bootstrapFile(operation.instanceId),
       serviceDependencies: {
         platform: manifest?.platform ?? (process.platform === 'darwin' ? 'macos' : 'linux'),
@@ -1807,8 +1573,10 @@ export async function runProductionProvision(
         runningAsRoot: manifest?.running_as_root ?? process.getuid?.() === 0,
       },
       principalDependencies: {
-        persistSelection: (candidate) =>
-          persistPrincipalSelection(operation.paths, operation.instanceId, 'gchat', provisioningStartedAt, candidate),
+        persistSelection: async (candidate) => {
+          await recordPrincipalSelection(operation, candidate);
+          return candidate;
+        },
       },
       ...(options.portLease ? { portLease: options.portLease } : {}),
       ingress: reservation.exclusive_resource_claims.ingress,
@@ -1821,10 +1589,10 @@ export async function runProductionProvision(
         : {}),
     },
   };
-  return reconcileProvisioning(
+  return runProvisionSteps(
     operation,
     context,
-    createProductionProvisionRegistry(context, {}, provisionRuntime),
+    createProductionProvisionSteps(context, {}, provisionRuntime),
     provisionRuntime,
   );
 }

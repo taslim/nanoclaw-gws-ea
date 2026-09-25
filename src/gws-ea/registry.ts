@@ -6,6 +6,7 @@ import { processLock } from '../community-portal/process-lock.js';
 import { isErrno } from '../community-portal/errors.js';
 import { deriveGchatServiceAccountEmail, GCP_PROJECT_PATTERN } from './gcp-identity.js';
 import { validateExistingGchatEndpoint } from './endpoint.js';
+import { createProvisionJournal, discardProvisionJournal } from './journal.js';
 import {
   assertLocalOwnedDestination,
   assertOwnedLocalDirectory,
@@ -511,6 +512,11 @@ export async function withLockedCloudflareRegistry<T>(
   }
 }
 
+/**
+ * Reserve an instance's claims and start its provision journal as one
+ * operation: the journal is written before the reservation is published, so a
+ * reserved instance always has one.
+ */
 export async function reserveInstance(
   paths: ControlPlanePaths,
   input: InstanceReservationInput,
@@ -536,7 +542,18 @@ export async function reserveInstance(
       instances: { ...registry.instances, [validated.instance_id]: validated },
       shared_infrastructure_metadata: sharedInfrastructure,
     };
-    await writePrivate(paths.registryFile, next);
+    await createProvisionJournal(paths, validated.instance_id);
+    try {
+      await writePrivate(paths.registryFile, next);
+    } catch (error) {
+      // Keep the journal unless the reservation certainly did not publish.
+      const published = await readRegistryFile(paths).then(
+        (current) => current.instances[validated.instance_id] !== undefined,
+        () => true,
+      );
+      if (!published) await discardProvisionJournal(paths, validated.instance_id);
+      throw error;
+    }
     return validated;
   } finally {
     release();

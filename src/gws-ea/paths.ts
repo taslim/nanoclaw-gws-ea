@@ -33,8 +33,6 @@ export interface ControlPlanePaths {
   markerFile(instanceId: string): string;
   bootstrapFile(instanceId: string): string;
   releasePreflightFile(instanceId: string): string;
-  principalSelectionFile(instanceId: string): string;
-  chatConfigurationFile(instanceId: string): string;
   removalFile(instanceId: string): string;
 }
 
@@ -105,8 +103,6 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
     markerFile: (instanceId) => path.join(checkoutRoot(instanceId), 'data', 'gws-ea', 'instance.json'),
     bootstrapFile: (instanceId) => path.join(instanceRoot(instanceId), 'bootstrap.json'),
     releasePreflightFile: (instanceId) => path.join(instanceRoot(instanceId), 'release-preflight.json'),
-    principalSelectionFile: (instanceId) => path.join(instanceRoot(instanceId), 'principal-selection.json'),
-    chatConfigurationFile: (instanceId) => path.join(instanceRoot(instanceId), 'chat-configured.json'),
     removalFile: (instanceId) => path.join(removalRoot, `${instanceId}.json`),
   };
 }
