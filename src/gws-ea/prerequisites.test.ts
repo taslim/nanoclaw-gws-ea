@@ -6,6 +6,11 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { SignInRequired } from './events.js';
+import {
+  RECORDED_DOCKER_CONTEXT_INSPECT,
+  RECORDED_GCLOUD_REAUTHENTICATION_FAILED,
+  RECORDED_ONECLI_VERSION,
+} from './fixtures/recordings.js';
 import { ONECLI_CLI_VERSION } from './pins.js';
 import {
   checkPrerequisites,
@@ -15,6 +20,7 @@ import {
   type PrerequisiteRequest,
 } from './prerequisites.js';
 import type { SanitizedCommandOutcomeRunner } from './process.js';
+import { assertInstalledOnecliCli } from './release-preflight.js';
 import { GwsEaError } from './types.js';
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -69,14 +75,35 @@ function fakeHost(dockerHost: string): FakeHost {
   };
 }
 
-const REAUTHENTICATION_FAILED = [
-  'ERROR: (gcloud.auth.print-access-token) There was a problem refreshing your current auth tokens: Reauthentication failed. cannot prompt during non-interactive execution.',
-  'Please run:',
-  '',
-  '  $ gcloud auth login',
-  '',
-  'to obtain new credentials.',
-].join('\n');
+/** The recorded Docker Desktop context's name and endpoint (fixtures/README.md). */
+const RECORDED_CONTEXT = 'desktop-linux';
+const RECORDED_DOCKER_HOST = 'unix:///home/operator/.docker/run/docker.sock';
+const RECORDED_ONECLI_CLI = '2.2.5';
+
+/** A recording with one exact recorded fragment replaced, every other byte as recorded. */
+function substitute(recording: string, recorded: string, replacement: string): string {
+  if (!recording.includes(recorded)) throw new Error(`The recording no longer contains ${recorded}`);
+  return recording.replace(recorded, replacement);
+}
+
+/** The recorded `docker context inspect` answer for this host's context and endpoint. */
+function dockerContextInspect(host: FakeHost): string {
+  const named = substitute(
+    RECORDED_DOCKER_CONTEXT_INSPECT.stdout,
+    `"Name": "${RECORDED_CONTEXT}"`,
+    `"Name": ${JSON.stringify(host.dockerContext)}`,
+  );
+  return substitute(named, `"Host": "${RECORDED_DOCKER_HOST}"`, `"Host": ${JSON.stringify(host.dockerHost)}`);
+}
+
+/** The recorded `onecli version` answer for this host's OneCLI CLI version. */
+function onecliVersion(host: FakeHost): string {
+  return substitute(
+    RECORDED_ONECLI_VERSION.stdout,
+    `"version": "${RECORDED_ONECLI_CLI}"`,
+    `"version": ${JSON.stringify(host.onecliVersion)}`,
+  );
+}
 
 function notFound(program: string): GwsEaError {
   return new GwsEaError('executable_not_found', `${program} was not found on PATH`, {
@@ -93,29 +120,15 @@ function hostRunner(host: FakeHost): SanitizedCommandOutcomeRunner {
     const ok = (stdout = '') => ({ stdout, stderr: '', exitCode: 0 });
     if (signature === 'git --version') return ok('git version 2.50.1\n');
     if (signature === 'pnpm --version') return ok('10.18.0\n');
-    if (signature === 'onecli version') return ok(JSON.stringify({ version: host.onecliVersion }));
-    if (signature === 'docker context inspect') {
-      return ok(
-        JSON.stringify([
-          {
-            Name: host.dockerContext,
-            Metadata: { Description: 'Docker Desktop' },
-            Endpoints: { docker: { Host: host.dockerHost, SkipTLSVerify: false } },
-            TLSMaterial: {},
-            Storage: { MetadataPath: '/Users/operator/.docker/contexts/meta/x', TLSPath: '<IN MEMORY>' },
-          },
-        ]),
-      );
-    }
+    if (signature === 'onecli version') return ok(onecliVersion(host));
+    if (signature === 'docker context inspect') return ok(dockerContextInspect(host));
     if (signature === 'gcloud version --format=json') return ok('{"Google Cloud SDK":"540.0.0"}');
     if (signature === 'gcloud auth list --filter=status:ACTIVE --format=value(account)') {
       return ok(host.active ? `${host.active}\n` : '');
     }
     const token = /^gcloud auth print-access-token --account=(\S+) --quiet$/u.exec(signature);
     if (token) {
-      return host.expired.has(token[1]!)
-        ? { stdout: '', stderr: REAUTHENTICATION_FAILED, exitCode: 1 }
-        : ok('ya29.discard-me\n');
+      return host.expired.has(token[1]!) ? RECORDED_GCLOUD_REAUTHENTICATION_FAILED : ok('ya29.discard-me\n');
     }
     throw new Error(`Unexpected command: ${signature}`);
   };
@@ -418,6 +431,14 @@ describe('Docker endpoint', () => {
     await expect(resolveDockerEndpoint(hostRunner(host))).resolves.toBe(daemon.host);
   });
 
+  it('reads the recorded Docker Desktop context unchanged, then probes its socket', async () => {
+    await expect(resolveDockerEndpoint(async () => RECORDED_DOCKER_CONTEXT_INSPECT)).rejects.toMatchObject({
+      code: 'docker_stopped',
+      message: expect.stringContaining(`the active context ${RECORDED_CONTEXT}`),
+      details: { context: RECORDED_CONTEXT, endpoint: RECORDED_DOCKER_HOST },
+    });
+  });
+
   it('names a missing Docker CLI', async () => {
     const host = fakeHost('unix:///var/run/docker.sock');
     host.missing.add('docker');
@@ -485,6 +506,19 @@ describe('Docker endpoint', () => {
       code: 'command_failed',
       message: expect.stringContaining('docker context inspect'),
       details: { exitCode: 1, stderrTail: expect.stringContaining('context not found') },
+    });
+  });
+});
+
+describe('OneCLI CLI version', () => {
+  it('reads the recorded `onecli version` answer at create, extra fields and all', async () => {
+    const check = (pinned: string) =>
+      assertInstalledOnecliCli('/usr/local/bin/onecli', pinned, os.tmpdir(), {}, async () => RECORDED_ONECLI_VERSION);
+
+    await expect(check(RECORDED_ONECLI_CLI)).resolves.toBeUndefined();
+    await expect(check('2.2.6')).rejects.toMatchObject({
+      code: 'incompatible_onecli',
+      message: expect.stringContaining(`OneCLI CLI ${RECORDED_ONECLI_CLI} does not match the pinned 2.2.6`),
     });
   });
 });

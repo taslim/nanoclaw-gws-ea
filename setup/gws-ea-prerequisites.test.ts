@@ -98,6 +98,23 @@ describe('GWS-EA Google Cloud sign-in', () => {
     ).rejects.toMatchObject({ code: 'cancelled' });
     expect(runLogin).not.toHaveBeenCalled();
   });
+
+  // Recorded divergence: upstream's setup/lib/inherit-script.ts has no `error`
+  // listener, so a login that cannot start crashes the driver instead.
+  it('fails the sign-in when gcloud cannot start, through the real interactive runner', async () => {
+    // Locating gcloud puts its directory on PATH; restore it afterwards.
+    vi.stubEnv('PATH', process.env.PATH ?? '');
+    try {
+      await expect(
+        signInToGoogleCloud('reserved@example.com', {
+          resolveExecutable: async () => path.join(os.tmpdir(), 'gws-ea-missing-gcloud', 'gcloud'),
+          prompts: promptFixture([true]),
+        }),
+      ).rejects.toMatchObject({ code: 'gcloud_auth_failed' });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
 });
 
 describe('GWS-EA Google account confirmation', () => {

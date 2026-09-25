@@ -5,6 +5,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { SignInRequired, type RunEvent } from './events.js';
+import { RECORDED_GCLOUD_REAUTHENTICATION_FAILED } from './fixtures/recordings.js';
 import {
   activeGcloudAccount,
   assertGcloudInstalled,
@@ -53,15 +54,10 @@ const ACCOUNT = 'operator@example.com';
 const FULL_WAIT = OBSERVATION_WAITS_SECONDS.map((seconds) => seconds * 1_000);
 const KEY_CONSTRAINTS = ['iam.disableServiceAccountKeyCreation', 'iam.managed.disableServiceAccountKeyCreation'];
 
-// gcloud stderr as the Cloud SDK prints it.
-const REAUTHENTICATION_FAILED = [
-  'ERROR: (gcloud.auth.print-access-token) There was a problem refreshing your current auth tokens: Reauthentication failed. cannot prompt during non-interactive execution.',
-  'Please run:',
-  '',
-  '  $ gcloud auth login',
-  '',
-  'to obtain new credentials.',
-].join('\n');
+// Recorded live (fixtures/README.md): an expired sign-in, behind the Python warning that gcloud prints first.
+const REAUTHENTICATION_FAILED = RECORDED_GCLOUD_REAUTHENTICATION_FAILED.stderr;
+const PYTHON_WARNING = REAUTHENTICATION_FAILED.slice(0, REAUTHENTICATION_FAILED.indexOf('ERROR:'));
+// gcloud stderr in the Cloud SDK's wordings, not recorded live.
 const TOKEN_REFRESH_FAILED = [
   `ERROR: (gcloud.projects.describe) There was a problem refreshing auth tokens for account ${ACCOUNT}: ('invalid_grant: Bad Request', {'error': 'invalid_grant', 'error_description': 'Bad Request'})`,
   'Please run:',
@@ -479,8 +475,8 @@ async function publishedKeyId(gcp: GcpProjectInput): Promise<string> {
 }
 
 describe('gcloud failure classification', () => {
-  it.each<[string, string, GcloudFailureClass]>([
-    ['a failed reauthentication', REAUTHENTICATION_FAILED, 'auth-required'],
+  const cases: ReadonlyArray<readonly [string, string, GcloudFailureClass]> = [
+    ['a failed reauthentication, as recorded', REAUTHENTICATION_FAILED, 'auth-required'],
     ['a token that no longer refreshes', TOKEN_REFRESH_FAILED, 'auth-required'],
     ['no active account', NO_ACTIVE_ACCOUNT, 'auth-required'],
     [
@@ -518,8 +514,18 @@ describe('gcloud failure classification', () => {
     ['exhausted quota', 'ERROR: (gcloud.projects.create) RESOURCE_EXHAUSTED: Quota exceeded.', 'anything-else'],
     ['a crash', GCLOUD_CRASHED, 'anything-else'],
     ['silence', '', 'anything-else'],
-  ])('classifies %s', (_case, stderr, expected) => {
+  ];
+
+  it.each(cases)('classifies %s', (_case, stderr, expected) => {
     expect(classifyGcloudFailure({ stdout: '', stderr, exitCode: 1 })).toBe(expected);
+  });
+
+  it('keeps the recorded Python warning ahead of the error', () => {
+    expect(PYTHON_WARNING).toMatch(/^WARNING: {2}Python 3\.9\.x is no longer officially supported/u);
+  });
+
+  it.each(cases)('classifies %s behind the recorded Python warning', (_case, stderr, expected) => {
+    expect(classifyGcloudFailure({ stdout: '', stderr: `${PYTHON_WARNING}${stderr}`, exitCode: 1 })).toBe(expected);
   });
 });
 
@@ -548,8 +554,9 @@ describe('gcloud sign-in and installation', () => {
   });
 
   it('asks for sign-in when the reserved account cannot refresh its token', async () => {
-    const failure = await assertGcloudSignedIn('reserved@example.com', async () =>
-      failed(REAUTHENTICATION_FAILED),
+    const failure = await assertGcloudSignedIn(
+      'reserved@example.com',
+      async () => RECORDED_GCLOUD_REAUTHENTICATION_FAILED,
     ).catch((error: unknown) => error);
 
     expect(failure).toBeInstanceOf(SignInRequired);

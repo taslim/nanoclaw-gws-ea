@@ -28,6 +28,7 @@ import {
   type OnecliPins,
   type OnecliRuntimeLayout,
 } from './onecli-compose.js';
+import { RECORDED_ONECLI_VERSION } from './fixtures/recordings.js';
 import { GwsEaError } from './types.js';
 
 const INSTANCE_ID = '12345678-1234-4123-8123-123456789abc';
@@ -371,6 +372,8 @@ interface DockerWorld {
   failUp?: GwsEaError;
   serverVersion: string;
   cliVersion: string;
+  /** `onecli version` as printed, instead of an answer built from the versions above. */
+  versionOutput?: string;
 }
 
 function containerJson(layout: OnecliRuntimeLayout, service: ServiceName, state: { running: boolean; health: Health }) {
@@ -426,7 +429,11 @@ function dockerWorld(layout: OnecliRuntimeLayout, initial: Partial<Record<Servic
     const reply = (value: unknown) => ({ stdout: JSON.stringify(value), stderr: '' });
     if (command.command === layout.cliExecutable) {
       if (args[0] === 'auth') return reply({ apiKey: ONECLI_API_KEY });
-      if (args[0] === 'version') return reply({ version: world.cliVersion, server_version: world.serverVersion });
+      if (args[0] === 'version') {
+        return world.versionOutput === undefined
+          ? reply({ version: world.cliVersion, server_version: world.serverVersion })
+          : { stdout: world.versionOutput, stderr: '' };
+      }
       if (args[0] === 'secrets' && args[1] === 'list') return reply([]);
       if (args[0] === 'secrets' && args[1] === 'create') {
         return reply({ id: 'secret-provider', name: args[args.indexOf('--name') + 1] });
@@ -696,6 +703,19 @@ describe('OneCLI health and version check', () => {
     await expect(
       verifyOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, runCommand: runner, fetch: healthyFetch() }),
     ).rejects.toMatchObject({ code: 'incompatible_onecli', message: expect.stringMatching(message) });
+  });
+
+  it('reads the recorded `onecli version` answer, whose gateway reports no version', async () => {
+    const layout = await layoutFixture();
+    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
+    world.versionOutput = RECORDED_ONECLI_VERSION.stdout;
+    const dependencies = { dockerCommandRunner: runner, runCommand: runner, fetch: healthyFetch() };
+
+    await expect(verifyOnecliRuntime(layout, { ...PINS, cli: '2.2.5' }, dependencies)).resolves.toBeDefined();
+    await expect(verifyOnecliRuntime(layout, PINS, dependencies)).rejects.toMatchObject({
+      code: 'incompatible_onecli',
+      message: expect.stringMatching(/CLI 2\.2\.5.*2\.2\.4/u),
+    });
   });
 
   it('refuses an unhealthy endpoint before asking the CLI for a key', async () => {

@@ -846,7 +846,7 @@ function printHelp(output: LineWriter): void {
 export async function runCli(args: readonly string[], runtime: CliRuntime = {}): Promise<number> {
   const output = runtime.stdout ?? ((line) => process.stdout.write(`${line}\n`));
   const errorOutput = runtime.stderr ?? ((line) => process.stderr.write(`${line}\n`));
-  if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
+  if (args.length === 0 || args[0] === 'help' || args.includes('--help') || args.includes('-h')) {
     printHelp(output);
     return EXIT_CODES.ready;
   }

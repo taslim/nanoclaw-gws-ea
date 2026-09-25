@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runCli, type CliRuntime, type FailureReport } from './cli.js';
 import type { CreatePromptContext } from './create-input.js';
 import { runStep, withPendingAction, type Interaction } from './events.js';
+import { RECORDED_GCLOUD_REAUTHENTICATION_FAILED } from './fixtures/recordings.js';
 import { acquireInstanceOperation } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { ONECLI_CLI_VERSION } from './pins.js';
@@ -149,6 +150,24 @@ function lines(): { readonly out: string[]; readonly err: string[]; readonly run
   const err: string[] = [];
   return { out, err, runtime: { stdout: (line) => out.push(line), stderr: (line) => err.push(line) } };
 }
+
+describe('gws-ea usage', () => {
+  it.each(['help', '--help', '-h'])('prints the usage for gws-ea %s and exits 0', async (argument) => {
+    const io = lines();
+
+    expect(await runCli([argument], io.runtime)).toBe(0);
+    expect(io.out[0]).toBe('Usage: gws-ea <create|resume|remove> [options]');
+    expect(io.err).toEqual([]);
+  });
+
+  it('names an unknown command before the usage and exits 1', async () => {
+    const io = lines();
+
+    expect(await runCli(['helpme'], io.runtime)).toBe(1);
+    expect(io.err.slice(0, 2)).toEqual(['Unknown command.', 'Usage: gws-ea <create|resume|remove> [options]']);
+    expect(io.out).toEqual([]);
+  });
+});
 
 describe('gws-ea stop summaries and exit codes', () => {
   it('prints the failing step, cause, next action, log paths, and redacted tail, then exits 1', async () => {
@@ -600,7 +619,7 @@ function hostDependencies(
       if (signature.startsWith('gcloud auth list ')) return ok(`${active}\n`);
       if (signature.startsWith('gcloud auth print-access-token ')) {
         return [...expired].some((account) => signature.includes(`--account=${account} `))
-          ? { stdout: '', stderr: 'ERROR: (gcloud.auth.print-access-token) Reauthentication required.', exitCode: 1 }
+          ? RECORDED_GCLOUD_REAUTHENTICATION_FAILED
           : ok('ya29.discard-me');
       }
       return ok();
@@ -656,6 +675,37 @@ describe('gws-ea prerequisites', () => {
     expect(Object.keys((await readRegistry(paths)).instances)).toEqual([]);
     const progressLog = /Log: (\S+)/u.exec(summary)?.[1];
     expect(await readFile(progressLog!, 'utf8')).toContain(`aborted at prerequisites (err=${code})`);
+  });
+
+  it('pauses create without a TTY at an expired sign-in, as live Gate 1 did, with nothing reserved', async () => {
+    const paths = await testPaths();
+    const collectCreateInputs = vi.fn();
+    const io = lines();
+    const dockerHost = await runningDocker();
+    const account = 'operator@example.test';
+
+    const exitCode = await runCli(
+      ['create', '--track', 'dogfood', '--source-remote', PRIVATE_REMOTE, '--google-account', account],
+      {
+        paths,
+        ...io.runtime,
+        ...createRuntime(),
+        checkPrerequisites: (request, interaction) =>
+          checkPrerequisites(request, interaction, hostDependencies(dockerHost, account, new Set([account]))),
+        collectCreateInputs,
+      },
+    );
+
+    expect(exitCode).toBe(10);
+    const summary = io.out.join('\n');
+    expect(summary).toContain(`Paused at prerequisites: Google Cloud sign-in is required for ${account}.`);
+    expect(summary).toContain(`Sign in: gcloud auth login ${account} --force`);
+    expect(summary).toContain('Continue with: gws-ea create --track dogfood (with the same options)');
+    expect(io.err).toEqual([]);
+    expect(collectCreateInputs).not.toHaveBeenCalled();
+    expect(Object.keys((await readRegistry(paths)).instances)).toEqual([]);
+    const progressLog = /Log: (\S+)/u.exec(summary)?.[1];
+    expect(await readFile(progressLog!, 'utf8')).toMatch(/paused at prerequisites \(gcloud_sign_in_required\)/u);
   });
 
   it('refuses a consumer Google account before reservation', async () => {
