@@ -6,7 +6,7 @@ import { runInstanceNclJson } from './ncl.js';
 import { buildInstanceCliCommand, validateRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
 import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { GwsEaError } from './types.js';
-import { hasControlCharacters, isRecord } from './validation.js';
+import { hasControlCharacters, isRecord, unwrapData } from './validation.js';
 
 const CHANNEL_TYPE = 'gchat';
 
@@ -46,10 +46,6 @@ export interface PrincipalDiscoveryDependencies {
 interface MainProfile {
   readonly mainAgentGroupId: string;
   readonly principalDisplayName: string;
-}
-
-function unwrapData(value: unknown): unknown {
-  return isRecord(value) && 'data' in value ? value.data : value;
 }
 
 function canonicalTimestamp(value: unknown): string | undefined {

@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
-import { resolveControlPlanePaths } from './paths.js';
+import { CONTROL_PLANE_ROOT, resolveControlPlanePaths } from './paths.js';
 import type { SanitizedCommand } from './process.js';
 import { allocateInstanceId } from './registry.js';
 import {
@@ -14,14 +14,22 @@ import {
   createInstanceServiceLayout,
   googleChatProjectNumberFile,
   launchInstanceHost,
+  loadInstanceRuntimeConfig,
   persistInstanceRuntime,
+  readRecordedHomeDirectory,
   reconcileInstanceRuntime,
   reconcileInstanceService,
   runInstanceOnecliAdminCommand,
   type InstanceRuntimeConfig,
+  type UpsertEnvVars,
 } from './service.js';
 import { writeOwnerOnlyFileExclusive } from './secrets.js';
 import type { InstanceReservation } from './types.js';
+
+/** Upstream's `.env` writer, which the driver injects; loaded by path because `src/` cannot import `setup/`. */
+const { upsertEnvVars } = (await import(path.join(CONTROL_PLANE_ROOT, 'setup', 'set-env.ts'))) as {
+  readonly upsertEnvVars: UpsertEnvVars;
+};
 
 const roots: string[] = [];
 
@@ -77,15 +85,16 @@ async function fixture(): Promise<{ config: InstanceRuntimeConfig; home: string 
       nodePath: process.execPath,
       homeDirectory: home,
       selectedProvider: 'claude',
+      dockerEndpoint: 'unix:///var/run/docker.sock',
     }),
     home,
   };
 }
 
 describe('GWS-EA instance runtime', () => {
-  it('persists only non-secret exact coordinates and derives every instance target', async () => {
+  it('persists only independent values and the Docker endpoint, and derives every instance target', async () => {
     const { config, home } = await fixture();
-    await persistInstanceRuntime(config);
+    await persistInstanceRuntime(config, upsertEnvVars);
     const layout = createInstanceServiceLayout(config, { platform: 'macos', homeDirectory: home });
     const environmentFile = await readFile(layout.environmentFile, 'utf8');
     const manifest = await readFile(layout.runtimeConfigFile, 'utf8');
@@ -107,13 +116,80 @@ describe('GWS-EA instance runtime', () => {
     expect(environmentFile).toContain('WEBHOOK_HOST=127.0.0.1');
     expect(environmentFile).toContain(`NANOCLAW_EGRESS_NETWORK=${config.agent_egress_network}`);
     expect(environmentFile).not.toContain('runtime-secret-canary');
-    expect(manifest).toContain(config.secret_files.onecli_runtime_api_key);
+    expect(Object.keys(JSON.parse(manifest) as object).sort()).toEqual([
+      'allocated_ports',
+      'checkout_realpath',
+      'deployed_commit',
+      'docker_endpoint',
+      'endpoint_url',
+      'home_directory',
+      'instance_id',
+      'node_path',
+      'onecli_cli_path',
+      'onecli_project',
+      'schema_version',
+      'selected_provider',
+    ]);
+    expect(JSON.parse(manifest)).toMatchObject({ docker_endpoint: 'unix:///var/run/docker.sock' });
     expect((await stat(layout.environmentFile)).mode & 0o777).toBe(0o600);
+  });
+
+  it('loads a runtime file with unknown fields, recomputes derived values, and leaves the file as written', async () => {
+    const { config } = await fixture();
+    await persistInstanceRuntime(config, upsertEnvVars);
+    const file = path.join(config.checkout_realpath, 'data', 'gws-ea', 'runtime.json');
+    const written = JSON.parse(await readFile(file, 'utf8')) as Record<string, unknown>;
+    const extended = `${JSON.stringify({ ...written, added_by_a_newer_launcher: { any: 'shape' }, install_id: 'stale' }, null, 2)}\n`;
+    await writeFile(file, extended, { mode: 0o600 });
+
+    const loaded = await loadInstanceRuntimeConfig(file);
+    expect(loaded.install_id).toBe(config.instance_id.replaceAll('-', ''));
+    expect(loaded.onecli_gateway_container).toBe(config.onecli_gateway_container);
+    await persistInstanceRuntime(loaded, upsertEnvVars);
+    expect(await readFile(file, 'utf8')).toBe(extended);
+  });
+
+  it('reads the home directory removal needs from a runtime an earlier launcher wrote', async () => {
+    const { config } = await fixture();
+    await persistInstanceRuntime(config, upsertEnvVars);
+    const file = path.join(config.checkout_realpath, 'data', 'gws-ea', 'runtime.json');
+    const earlier = JSON.parse(await readFile(file, 'utf8')) as Record<string, unknown>;
+    delete earlier.docker_endpoint;
+    await writeFile(file, JSON.stringify({ ...earlier, install_id: config.install_id }), { mode: 0o600 });
+
+    await expect(loadInstanceRuntimeConfig(file)).rejects.toMatchObject({ code: 'invalid_runtime_config' });
+    await expect(readRecordedHomeDirectory(file)).resolves.toBe(config.home_directory);
+    await expect(readRecordedHomeDirectory(`${file}.missing`)).resolves.toBeUndefined();
+  });
+
+  it('refuses a runtime file whose persisted values disagree', async () => {
+    const { config } = await fixture();
+    await persistInstanceRuntime(config, upsertEnvVars);
+
+    await expect(
+      persistInstanceRuntime({ ...config, docker_endpoint: 'unix:///run/other/docker.sock' }, upsertEnvVars),
+    ).rejects.toMatchObject({ code: 'runtime_conflict' });
+  });
+
+  it('keeps a .env key another writer added when resume persists the runtime again', async () => {
+    const { config } = await fixture();
+    await persistInstanceRuntime(config, upsertEnvVars);
+    const environmentFile = path.join(config.checkout_realpath, '.env');
+    const stale = (await readFile(environmentFile, 'utf8')).replace('WEBHOOK_HOST=127.0.0.1', 'WEBHOOK_HOST=0.0.0.0');
+    await writeFile(environmentFile, `${stale}# added by /add-telegram\nTELEGRAM_BOT_TOKEN=skill-value\n`);
+
+    await persistInstanceRuntime(config, upsertEnvVars);
+
+    const lines = (await readFile(environmentFile, 'utf8')).split('\n');
+    expect(lines).toContain('TELEGRAM_BOT_TOKEN=skill-value');
+    expect(lines).toContain('# added by /add-telegram');
+    expect(lines.filter((line) => line.startsWith('WEBHOOK_HOST='))).toEqual(['WEBHOOK_HOST=127.0.0.1']);
+    expect(lines).toContain(`NANOCLAW_INSTALL_ID=${config.install_id}`);
   });
 
   it('loads only host credentials into a fresh environment and rejects ambient redirects', async () => {
     const { config } = await fixture();
-    await persistInstanceRuntime(config);
+    await persistInstanceRuntime(config, upsertEnvVars);
     await writeOwnerOnlyFileExclusive(
       config.secret_files.gchat_credentials,
       '{"client_email":"bot@example.test","private_key":"chat-secret-canary"}',
@@ -150,7 +226,7 @@ describe('GWS-EA instance runtime', () => {
 
   it('runs OneCLI administration through the pinned binary and admin-only credential file', async () => {
     const { config } = await fixture();
-    await persistInstanceRuntime(config);
+    await persistInstanceRuntime(config, upsertEnvVars);
     await writeOwnerOnlyFileExclusive(config.secret_files.onecli_admin_api_key, 'admin-secret-canary');
     const calls: SanitizedCommand[] = [];
     const runner = vi.fn(async (command: SanitizedCommand) => {
@@ -185,7 +261,7 @@ describe('GWS-EA instance runtime', () => {
 
   it('renders and restarts only the exact service without touching a global ncl target', async () => {
     const { config, home } = await fixture();
-    await persistInstanceRuntime(config);
+    await persistInstanceRuntime(config, upsertEnvVars);
     const calls: Array<{ command: string; args: readonly string[] }> = [];
     const runner = vi.fn(async (command: { command: string; args: readonly string[] }) => {
       calls.push(command);
@@ -217,13 +293,13 @@ describe('GWS-EA instance runtime', () => {
 
   it('fails before host start when a required secret is missing or unsafe', async () => {
     const { config } = await fixture();
-    await persistInstanceRuntime(config);
+    await persistInstanceRuntime(config, upsertEnvVars);
     await expect(buildInstanceHostEnvironment(config)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('rejects an invalid Google Chat project number before host start', async () => {
     const { config } = await fixture();
-    await persistInstanceRuntime(config);
+    await persistInstanceRuntime(config, upsertEnvVars);
     await writeOwnerOnlyFileExclusive(config.secret_files.gchat_credentials, 'chat-credential');
     await writeOwnerOnlyFileExclusive(config.secret_files.onecli_runtime_api_key, 'runtime-key');
     await writeOwnerOnlyFileExclusive(googleChatProjectNumberFile(config), '0\n');
@@ -233,7 +309,7 @@ describe('GWS-EA instance runtime', () => {
 
   it('replaces the launcher with the exact checkout host and constructed environment', async () => {
     const { config } = await fixture();
-    await persistInstanceRuntime(config);
+    await persistInstanceRuntime(config, upsertEnvVars);
     await writeOwnerOnlyFileExclusive(
       config.secret_files.gchat_credentials,
       '{"client_email":"bot@example.test","private_key":"chat-secret-canary"}',
@@ -280,6 +356,7 @@ describe('GWS-EA instance runtime', () => {
       return { stdout: '', stderr: '' };
     });
     await reconcileInstanceRuntime(config, {
+      upsertEnvVars,
       platform: 'macos',
       homeDirectory: home,
       runCommand: runner,

@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, rm } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -6,7 +6,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { SignInRequired } from './events.js';
-import { ONECLI_CLI_VERSION } from './onecli-compose.js';
+import { ONECLI_CLI_VERSION } from './pins.js';
 import {
   checkPrerequisites,
   resolveDockerEndpoint,
@@ -133,6 +133,8 @@ function dependencies(host: FakeHost, overrides: Partial<PrerequisiteDependencie
     },
     node: { version: 'v22.20.0', execPath: '/opt/homebrew/bin/node', execve: neverCalled },
     platform: 'darwin',
+    // No shared NanoClaw mount allowlist unless a test writes one.
+    mountAllowlistFile: path.join(os.tmpdir(), `gws-ea-prereq-no-allowlist-${process.pid}`, 'mount-allowlist.json'),
     ...overrides,
   };
 }
@@ -152,13 +154,29 @@ function operator(host: FakeHost, answers: { confirm?: boolean[]; browserAccount
   return interaction;
 }
 
-const INSTANCES_ROOT = '/Users/operator/.local/state/gws-ea/instances';
-const CREATE: PrerequisiteRequest = { command: 'create', instancesRoot: INSTANCES_ROOT };
-const RESUME: PrerequisiteRequest = {
-  command: 'resume',
-  instancesRoot: INSTANCES_ROOT,
-  account: 'reserved@example.com',
-};
+const PATHS = {
+  configRoot: '/Users/operator/.config/gws-ea',
+  stateRoot: '/Users/operator/.local/share/gws-ea',
+  logsRoot: '/Users/operator/.local/share/gws-ea/logs',
+  instancesRoot: '/Users/operator/.local/share/gws-ea/instances',
+} as const;
+const CREATE: PrerequisiteRequest = { command: 'create', paths: PATHS };
+
+/** gws-ea's roots under a home directory, as the XDG defaults place them. */
+function rootsUnder(home: string) {
+  const stateRoot = path.join(home, '.local', 'share', 'gws-ea');
+  return {
+    configRoot: path.join(home, '.config', 'gws-ea'),
+    stateRoot,
+    logsRoot: path.join(stateRoot, 'logs'),
+    instancesRoot: path.join(stateRoot, 'instances'),
+  };
+}
+
+/** Resume names the Docker endpoint create recorded. */
+function resume(dockerEndpoint: string): PrerequisiteRequest {
+  return { command: 'resume', paths: PATHS, account: 'reserved@example.com', dockerEndpoint };
+}
 
 describe('prerequisites', () => {
   it('reports the host facts create records, confirming the signed-in Workspace account', async () => {
@@ -235,17 +253,61 @@ describe('prerequisites', () => {
     });
 
     host.commands.length = 0;
-    await expect(checkPrerequisites(RESUME, operator(host), dependencies(host))).resolves.toMatchObject({
+    await expect(checkPrerequisites(resume(daemon.host), operator(host), dependencies(host))).resolves.toMatchObject({
       account: 'reserved@example.com',
     });
     expect(host.commands).not.toContain('onecli version');
 
     host.missing.add('onecli');
-    await expect(checkPrerequisites(RESUME, operator(host), dependencies(host))).rejects.toMatchObject({
+    await expect(checkPrerequisites(resume(daemon.host), operator(host), dependencies(host))).rejects.toMatchObject({
       code: 'onecli_required',
       message: expect.stringContaining(ONECLI_CLI_VERSION),
     });
   });
+
+  it('probes the Docker endpoint create recorded on resume, not the active context', async () => {
+    const daemon = await dockerDaemon();
+    const host = fakeHost('tcp://192.0.2.10:2376');
+    host.dockerContext = 'remote-builder';
+
+    await expect(checkPrerequisites(resume(daemon.host), operator(host), dependencies(host))).resolves.toMatchObject({
+      dockerEndpoint: daemon.host,
+    });
+    expect(host.commands).not.toContain('docker context inspect');
+
+    const stopped = `unix://${path.join(await tempDirectory(), 'docker.sock')}`;
+    await expect(checkPrerequisites(resume(stopped), operator(host), dependencies(host))).rejects.toMatchObject({
+      code: 'docker_stopped',
+      message: expect.stringContaining('the endpoint this assistant was created with'),
+      details: { endpoint: stopped, evidence: 'ENOENT' },
+    });
+  });
+
+  it.each(['create', 'resume'] as const)(
+    'stops %s before any other check when a mount allowlist root contains gws-ea state, naming the entry',
+    async (command) => {
+      const daemon = await dockerDaemon();
+      const host = fakeHost(daemon.host);
+      const allowlist = path.join(await tempDirectory(), 'mount-allowlist.json');
+      await writeFile(
+        allowlist,
+        JSON.stringify({ allowedRoots: [{ path: '~', allowReadWrite: false }], blockedPatterns: [] }),
+      );
+      const request = command === 'create' ? CREATE : resume(daemon.host);
+
+      await expect(
+        checkPrerequisites(
+          { ...request, paths: { ...PATHS, ...rootsUnder(os.homedir()) } },
+          operator(host),
+          dependencies(host, { mountAllowlistFile: allowlist }),
+        ),
+      ).rejects.toMatchObject({ code: 'mount_allowlist_exposes_gws_ea', details: { entry: '~' } });
+      expect(host.commands).toEqual([]);
+      expect(JSON.parse(await readFile(allowlist, 'utf8'))).toMatchObject({
+        blockedPatterns: Object.values(rootsUnder(os.homedir())).slice(0, 3),
+      });
+    },
+  );
 
   it('continues after an expired sign-in is renewed', async () => {
     const daemon = await dockerDaemon();
@@ -253,7 +315,7 @@ describe('prerequisites', () => {
     host.expired.add('reserved@example.com');
     const person = operator(host);
 
-    await expect(checkPrerequisites(RESUME, person, dependencies(host))).resolves.toMatchObject({
+    await expect(checkPrerequisites(resume(daemon.host), person, dependencies(host))).resolves.toMatchObject({
       account: 'reserved@example.com',
     });
     expect(person.signInToGoogleCloud).toHaveBeenCalledExactlyOnceWith('reserved@example.com');
@@ -268,7 +330,9 @@ describe('prerequisites', () => {
     const person = operator(host);
     person.signInToGoogleCloud.mockImplementation(async () => undefined);
 
-    await expect(checkPrerequisites(RESUME, person, dependencies(host))).rejects.toBeInstanceOf(SignInRequired);
+    await expect(checkPrerequisites(resume(daemon.host), person, dependencies(host))).rejects.toBeInstanceOf(
+      SignInRequired,
+    );
     expect(person.signInToGoogleCloud).toHaveBeenCalledOnce();
   });
 

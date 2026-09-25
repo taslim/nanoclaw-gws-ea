@@ -5,8 +5,8 @@ import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { CLOUDFLARED_IMAGE } from './pins.js';
 import {
-  CLOUDFLARED_IMAGE,
   CLOUDFLARE_CONNECTOR_OWNER_LABEL,
   CLOUDFLARE_CONNECTOR_ROLE_LABEL,
   buildCloudflareComposeInvocation,

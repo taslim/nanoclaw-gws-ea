@@ -6,7 +6,7 @@ import { createRequire } from 'node:module';
 import { OneCLI } from '@onecli-sh/sdk';
 
 import { isErrno } from '../community-portal/errors.js';
-import { preparePrivateLocalDirectory } from './paths.js';
+import { preparePrivateDirectory } from './paths.js';
 import {
   buildToolEnvironment,
   runSanitizedCommand,
@@ -23,16 +23,25 @@ import {
   writePrivateTextFile,
 } from './secrets.js';
 import {
-  ONECLI_CLI_VERSION,
-  ONECLI_GATEWAY_VERSION,
-  ONECLI_SDK_VERSION,
   ONECLI_INSTANCE_LABEL,
   ONECLI_RESOURCE_ROLE_LABEL,
   renderOnecliCompose,
   type OnecliRuntimeLayout,
 } from './onecli-compose.js';
+import { ONECLI_CLI_VERSION, ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './pins.js';
 import { GwsEaError } from './types.js';
-import { hasControlCharacters, isRecord } from './validation.js';
+import {
+  hasControlCharacters,
+  isRecord,
+  optionalString,
+  parseJson,
+  requireRecord,
+  stringField,
+  unwrapData,
+} from './validation.js';
+
+const INVALID_OUTPUT = 'invalid_onecli_output';
+const INVALID_RUNTIME = 'invalid_onecli_runtime';
 import type { ProviderCredential, ProviderCredentialMetadata } from '../provider-credential.js';
 
 const EXPECTED_SERVICES = ['app', 'gateway', 'postgres'] as const;
@@ -146,11 +155,8 @@ export function buildComposeEnvironment(ambient: NodeJS.ProcessEnv = process.env
 }
 
 export async function prepareOnecliRuntime(layout: OnecliRuntimeLayout): Promise<void> {
-  await preparePrivateLocalDirectory(layout.rootDirectory);
-  await Promise.all([
-    preparePrivateLocalDirectory(layout.cliHome),
-    preparePrivateLocalDirectory(layout.secretsDirectory),
-  ]);
+  await preparePrivateDirectory(layout.rootDirectory);
+  await Promise.all([preparePrivateDirectory(layout.cliHome), preparePrivateDirectory(layout.secretsDirectory)]);
 
   await Promise.all([
     ensureRandomOwnerOnlyFile(layout.postgresPasswordFile, 'base64url'),
@@ -176,7 +182,7 @@ export function validateObservedOnecliRuntime(layout: OnecliRuntimeLayout, obser
   );
   for (const service of EXPECTED_SERVICES) {
     const container = observed.containers.find((candidate) => candidate.service === service);
-    if (!container) throw new GwsEaError('invalid_onecli_runtime', `OneCLI ${service} container is missing`);
+    if (!container) throw new GwsEaError(INVALID_RUNTIME, `OneCLI ${service} container is missing`);
     if (container.instanceId !== layout.instanceId || container.project !== layout.project) {
       throw new GwsEaError('unsafe_onecli_owner', `OneCLI ${service} ownership labels are invalid`);
     }
@@ -251,7 +257,7 @@ async function runCompatibilityCanary(
     (await runOnecliCommand(layout, bootstrapEnvironment, ['auth', 'api-key'], runCommand)).stdout,
     'OneCLI API key',
   );
-  const apiKey = requireRecordString(apiKeyResponse, 'apiKey', 'OneCLI API key');
+  const apiKey = stringField(apiKeyResponse, 'apiKey', 'OneCLI API key', INVALID_OUTPUT);
   if (!/^oc_[A-Za-z0-9_-]{20,}$/u.test(apiKey)) {
     throw new GwsEaError('incompatible_onecli', 'OneCLI returned an invalid local API key');
   }
@@ -281,17 +287,14 @@ async function runCompatibilityCanary(
       (await runOnecliCommand(layout, environment, ['secrets', 'list', '--max', '0'], runCommand)).stdout,
       'OneCLI secrets',
     );
-    for (const candidate of existingSecrets.filter((value) => recordString(value, 'name') === canarySecretName)) {
-      if (
-        recordString(candidate, 'type') !== 'generic' ||
-        recordString(candidate, 'hostPattern') !== 'canary.invalid'
-      ) {
+    for (const candidate of existingSecrets.filter((value) => optionalString(value.name) === canarySecretName)) {
+      if (optionalString(candidate.type) !== 'generic' || optionalString(candidate.hostPattern) !== 'canary.invalid') {
         throw new GwsEaError('onecli_canary_collision', 'A conflicting OneCLI compatibility canary secret exists');
       }
       await runOnecliCommand(
         layout,
         environment,
-        ['secrets', 'delete', '--id', requireRecordString(candidate, 'id', 'OneCLI canary secret')],
+        ['secrets', 'delete', '--id', stringField(candidate, 'id', 'OneCLI canary secret', INVALID_OUTPUT)],
         runCommand,
       );
     }
@@ -300,20 +303,19 @@ async function runCompatibilityCanary(
       'OneCLI agents',
     ).filter(
       (candidate) =>
-        recordString(candidate, 'identifier') === canaryAgentName ||
-        recordString(candidate, 'name') === canaryAgentName,
+        optionalString(candidate.identifier) === canaryAgentName || optionalString(candidate.name) === canaryAgentName,
     );
     for (const candidate of staleAgents) {
       if (
-        recordString(candidate, 'identifier') !== canaryAgentName ||
-        recordString(candidate, 'name') !== canaryAgentName
+        optionalString(candidate.identifier) !== canaryAgentName ||
+        optionalString(candidate.name) !== canaryAgentName
       ) {
         throw new GwsEaError('onecli_canary_collision', 'A conflicting OneCLI compatibility canary agent exists');
       }
       await runOnecliCommand(
         layout,
         environment,
-        ['agents', 'delete', '--id', requireRecordString(candidate, 'id', 'OneCLI canary agent')],
+        ['agents', 'delete', '--id', stringField(candidate, 'id', 'OneCLI canary agent', INVALID_OUTPUT)],
         runCommand,
       );
     }
@@ -348,7 +350,7 @@ async function runCompatibilityCanary(
       ).stdout,
       'OneCLI canary secret',
     );
-    secretId = requireRecordString(createdSecret, 'id', 'OneCLI canary secret');
+    secretId = stringField(createdSecret, 'id', 'OneCLI canary secret', INVALID_OUTPUT);
 
     const agents = parseArray(
       (await runOnecliCommand(layout, environment, ['agents', 'list', '--max', '0'], runCommand)).stdout,
@@ -356,12 +358,11 @@ async function runCompatibilityCanary(
     );
     const agent = agents.find(
       (candidate) =>
-        recordString(candidate, 'identifier') === canaryAgentName ||
-        recordString(candidate, 'name') === canaryAgentName,
+        optionalString(candidate.identifier) === canaryAgentName || optionalString(candidate.name) === canaryAgentName,
     );
     if (!agent)
       throw new GwsEaError('incompatible_onecli', 'OneCLI SDK-created canary agent was not visible to the CLI');
-    agentId = requireRecordString(agent, 'id', 'OneCLI canary agent');
+    agentId = stringField(agent, 'id', 'OneCLI canary agent', INVALID_OUTPUT);
     await runOnecliCommand(
       layout,
       environment,
@@ -372,8 +373,8 @@ async function runCompatibilityCanary(
       (await runOnecliCommand(layout, environment, ['agents', 'list', '--max', '0'], runCommand)).stdout,
       'OneCLI agents',
     );
-    const verifiedAgent = verifiedAgents.find((candidate) => recordString(candidate, 'id') === agentId);
-    if (recordString(verifiedAgent ?? {}, 'secretMode') !== 'selective') {
+    const verifiedAgent = verifiedAgents.find((candidate) => optionalString(candidate.id) === agentId);
+    if (optionalString(verifiedAgent?.secretMode) !== 'selective') {
       throw new GwsEaError('incompatible_onecli', 'OneCLI canary agent did not enter selective secret mode');
     }
     const assignedSecretIds = parseStringArray(
@@ -392,7 +393,7 @@ async function runCompatibilityCanary(
     ) {
       throw new GwsEaError('incompatible_onecli', 'OneCLI SDK returned an invalid container configuration');
     }
-    const proxy = recordString(config.env, 'HTTPS_PROXY') ?? recordString(config.env, 'HTTP_PROXY');
+    const proxy = optionalString(config.env.HTTPS_PROXY) ?? optionalString(config.env.HTTP_PROXY);
     if (proxy === undefined || !isExpectedGatewayProxy(proxy)) {
       throw new GwsEaError('incompatible_onecli', 'OneCLI SDK returned an invalid gateway proxy');
     }
@@ -447,7 +448,7 @@ export async function importProviderCredential(
     (await runOnecliCommand(layout, environment, ['secrets', 'list', '--max', '0'], runCommand)).stdout,
     'OneCLI secrets',
   );
-  const matching = secrets.filter((candidate) => recordString(candidate, 'name') === input.name);
+  const matching = secrets.filter((candidate) => optionalString(candidate.name) === input.name);
   if (matching.length > 1) {
     throw new GwsEaError('ambiguous_onecli_secret', 'More than one OneCLI secret has the requested name');
   }
@@ -456,7 +457,7 @@ export async function importProviderCredential(
     if (!onecliSecretMatchesCredentialMetadata(existing, input)) {
       throw new GwsEaError('onecli_secret_conflict', 'An existing OneCLI secret has incompatible metadata');
     }
-    return { id: requireRecordString(existing, 'id', 'OneCLI secret'), created: false };
+    return { id: stringField(existing, 'id', 'OneCLI secret', INVALID_OUTPUT), created: false };
   }
 
   try {
@@ -482,7 +483,7 @@ export async function importProviderCredential(
       (await runOnecliCommand(layout, environment, args, runCommand)).stdout,
       'OneCLI secret',
     );
-    return { id: requireRecordString(created, 'id', 'OneCLI secret'), created: true };
+    return { id: stringField(created, 'id', 'OneCLI secret', INVALID_OUTPUT), created: true };
   } finally {
     await removePrivateFile(layout.providerStagingFile);
   }
@@ -800,22 +801,22 @@ async function verifyAgentNetworkIsolation(
 function parseDockerContainers(source: string): readonly InspectedOnecliContainer[] {
   const values = parseDockerArray(source, 'Docker container inspection');
   return values.map((value) => {
-    const config = requireNestedRecord(value, 'Config', 'Docker container inspection');
-    const labels = requireNestedRecord(config, 'Labels', 'Docker container labels');
-    const state = requireNestedRecord(value, 'State', 'Docker container state');
-    const networkSettings = requireNestedRecord(value, 'NetworkSettings', 'Docker network settings');
-    const networks = requireNestedRecord(networkSettings, 'Networks', 'Docker container networks');
+    const config = requireRecord(value.Config, 'Docker container inspection', INVALID_RUNTIME);
+    const labels = requireRecord(config.Labels, 'Docker container labels', INVALID_RUNTIME);
+    const state = requireRecord(value.State, 'Docker container state', INVALID_RUNTIME);
+    const networkSettings = requireRecord(value.NetworkSettings, 'Docker network settings', INVALID_RUNTIME);
+    const networks = requireRecord(networkSettings.Networks, 'Docker container networks', INVALID_RUNTIME);
     const mounts = value.Mounts;
     if (!Array.isArray(mounts) || !mounts.every(isRecord)) {
-      throw new GwsEaError('invalid_onecli_runtime', 'Docker container mounts are invalid');
+      throw new GwsEaError(INVALID_RUNTIME, 'Docker container mounts are invalid');
     }
     const health = isRecord(state.Health) ? state.Health : undefined;
     return {
-      id: requireRecordString(value, 'Id', 'Docker container'),
-      service: requireRecordString(labels, 'com.docker.compose.service', 'Docker container labels'),
-      image: requireRecordString(config, 'Image', 'Docker container config'),
-      instanceId: recordString(labels, ONECLI_INSTANCE_LABEL),
-      project: recordString(labels, 'com.docker.compose.project'),
+      id: stringField(value, 'Id', 'Docker container', INVALID_OUTPUT),
+      service: stringField(labels, 'com.docker.compose.service', 'Docker container labels', INVALID_OUTPUT),
+      image: stringField(config, 'Image', 'Docker container config', INVALID_OUTPUT),
+      instanceId: optionalString(labels[ONECLI_INSTANCE_LABEL]),
+      project: optionalString(labels['com.docker.compose.project']),
       running: state.Running === true,
       healthy: health?.Status === 'healthy',
       publishedPorts: parseDockerPorts(networkSettings.Ports),
@@ -823,24 +824,24 @@ function parseDockerContainers(source: string): readonly InspectedOnecliContaine
       volumes: mounts
         .filter((mount) => mount.Type === 'volume')
         .map((mount) => ({
-          name: requireRecordString(mount, 'Name', 'Docker container volume'),
-          destination: requireRecordString(mount, 'Destination', 'Docker container mount'),
+          name: stringField(mount, 'Name', 'Docker container volume', INVALID_OUTPUT),
+          destination: stringField(mount, 'Destination', 'Docker container mount', INVALID_OUTPUT),
         })),
     };
   });
 }
 
 function parseDockerPorts(value: unknown): ObservedOnecliContainer['publishedPorts'] {
-  if (!isRecord(value)) throw new GwsEaError('invalid_onecli_runtime', 'Docker published ports are invalid');
+  if (!isRecord(value)) throw new GwsEaError(INVALID_RUNTIME, 'Docker published ports are invalid');
   const result: Record<string, { hostIp: string; hostPort: string }[]> = {};
   for (const [containerPort, bindings] of Object.entries(value)) {
     if (bindings === null) continue;
     if (!Array.isArray(bindings) || !bindings.every(isRecord)) {
-      throw new GwsEaError('invalid_onecli_runtime', 'Docker published port binding is invalid');
+      throw new GwsEaError(INVALID_RUNTIME, 'Docker published port binding is invalid');
     }
     result[containerPort] = bindings.map((binding) => ({
-      hostIp: requireRecordString(binding, 'HostIp', 'Docker port binding'),
-      hostPort: requireRecordString(binding, 'HostPort', 'Docker port binding'),
+      hostIp: stringField(binding, 'HostIp', 'Docker port binding', INVALID_OUTPUT),
+      hostPort: stringField(binding, 'HostPort', 'Docker port binding', INVALID_OUTPUT),
     }));
   }
   return result;
@@ -848,11 +849,11 @@ function parseDockerPorts(value: unknown): ObservedOnecliContainer['publishedPor
 
 function parseDockerNetworks(source: string): readonly ObservedOnecliNetwork[] {
   return parseDockerArray(source, 'Docker network inspection').map((value) => {
-    const labels = requireNestedRecord(value, 'Labels', 'Docker network labels');
+    const labels = requireRecord(value.Labels, 'Docker network labels', INVALID_RUNTIME);
     return {
-      name: requireRecordString(value, 'Name', 'Docker network'),
-      instanceId: recordString(labels, ONECLI_INSTANCE_LABEL),
-      role: recordString(labels, ONECLI_RESOURCE_ROLE_LABEL),
+      name: stringField(value, 'Name', 'Docker network', INVALID_OUTPUT),
+      instanceId: optionalString(labels[ONECLI_INSTANCE_LABEL]),
+      role: optionalString(labels[ONECLI_RESOURCE_ROLE_LABEL]),
       internal: value.Internal === true,
     };
   });
@@ -860,27 +861,21 @@ function parseDockerNetworks(source: string): readonly ObservedOnecliNetwork[] {
 
 function parseDockerVolumes(source: string): readonly ObservedOnecliVolume[] {
   return parseDockerArray(source, 'Docker volume inspection').map((value) => {
-    const labels = requireNestedRecord(value, 'Labels', 'Docker volume labels');
+    const labels = requireRecord(value.Labels, 'Docker volume labels', INVALID_RUNTIME);
     return {
-      name: requireRecordString(value, 'Name', 'Docker volume'),
-      instanceId: recordString(labels, ONECLI_INSTANCE_LABEL),
-      role: recordString(labels, ONECLI_RESOURCE_ROLE_LABEL),
+      name: stringField(value, 'Name', 'Docker volume', INVALID_OUTPUT),
+      instanceId: optionalString(labels[ONECLI_INSTANCE_LABEL]),
+      role: optionalString(labels[ONECLI_RESOURCE_ROLE_LABEL]),
     };
   });
 }
 
 function parseDockerArray(source: string, label: string): readonly Record<string, unknown>[] {
-  const value = parseJson(source, label);
+  const value = parseJson(source, label, INVALID_RUNTIME);
   if (!Array.isArray(value) || !value.every(isRecord)) {
-    throw new GwsEaError('invalid_onecli_runtime', `${label} is invalid`);
+    throw new GwsEaError(INVALID_RUNTIME, `${label} is invalid`);
   }
   return value;
-}
-
-function requireNestedRecord(value: Record<string, unknown>, key: string, label: string): Record<string, unknown> {
-  const nested = value[key];
-  if (!isRecord(nested)) throw new GwsEaError('invalid_onecli_runtime', `${label} is invalid`);
-  return nested;
 }
 
 function createDefaultSdkClient(layout: OnecliRuntimeLayout, apiKey: string): OnecliSdkClient {
@@ -963,7 +958,7 @@ function validateContainerVolumes(layout: OnecliRuntimeLayout, container: Observ
 
 function assertExactNamedResources(actual: readonly string[], expected: readonly string[], label: string): void {
   if (!sameSet(actual, expected) || actual.length !== expected.length) {
-    throw new GwsEaError('invalid_onecli_runtime', `${label} do not match the expected runtime`);
+    throw new GwsEaError(INVALID_RUNTIME, `${label} do not match the expected runtime`);
   }
 }
 
@@ -974,50 +969,25 @@ function sameSet(left: readonly string[], right: readonly string[]): boolean {
 }
 
 function parseRecord(source: string, label: string): Record<string, unknown> {
-  const parsed = unwrapData(parseJson(source, label));
-  if (!isRecord(parsed)) throw new GwsEaError('invalid_onecli_output', `${label} response is invalid`);
+  const parsed = unwrapData(parseJson(source, label, INVALID_OUTPUT));
+  if (!isRecord(parsed)) throw new GwsEaError(INVALID_OUTPUT, `${label} response is invalid`);
   return parsed;
 }
 
 function parseArray(source: string, label: string): readonly Record<string, unknown>[] {
-  const parsed = unwrapData(parseJson(source, label));
+  const parsed = unwrapData(parseJson(source, label, INVALID_OUTPUT));
   if (!Array.isArray(parsed) || !parsed.every(isRecord)) {
-    throw new GwsEaError('invalid_onecli_output', `${label} response is invalid`);
+    throw new GwsEaError(INVALID_OUTPUT, `${label} response is invalid`);
   }
   return parsed;
 }
 
 function parseStringArray(source: string, label: string): readonly string[] {
-  const parsed = unwrapData(parseJson(source, label));
+  const parsed = unwrapData(parseJson(source, label, INVALID_OUTPUT));
   if (!Array.isArray(parsed) || !parsed.every((value) => typeof value === 'string')) {
-    throw new GwsEaError('invalid_onecli_output', `${label} response is invalid`);
+    throw new GwsEaError(INVALID_OUTPUT, `${label} response is invalid`);
   }
   return parsed;
-}
-
-function parseJson(source: string, label: string): unknown {
-  try {
-    return JSON.parse(source) as unknown;
-  } catch {
-    throw new GwsEaError('invalid_onecli_output', `${label} response is not valid JSON`);
-  }
-}
-
-function unwrapData(value: unknown): unknown {
-  if (isRecord(value) && 'data' in value) return value.data;
-  return value;
-}
-
-function recordString(value: Record<string, unknown>, key: string): string | undefined {
-  return typeof value[key] === 'string' ? value[key] : undefined;
-}
-
-function requireRecordString(value: Record<string, unknown>, key: string, label: string): string {
-  const result = recordString(value, key);
-  if (result === undefined || result.length === 0) {
-    throw new GwsEaError('invalid_onecli_output', `${label} response is missing ${key}`);
-  }
-  return result;
 }
 
 function assertCredentialMetadata(input: ProviderCredential): void {
@@ -1045,9 +1015,9 @@ export function onecliSecretMatchesCredentialMetadata(
         ? { paramName: input.paramName, paramFormat: input.paramFormat ?? '' }
         : null;
   return (
-    recordString(existing, 'name') === input.name &&
-    recordString(existing, 'type') === input.type &&
-    recordString(existing, 'hostPattern') === input.hostPattern &&
+    optionalString(existing.name) === input.name &&
+    optionalString(existing.type) === input.type &&
+    optionalString(existing.hostPattern) === input.hostPattern &&
     nullableString(existing.pathPattern) === (input.pathPattern ?? null) &&
     JSON.stringify(existing.injectionConfig ?? null) === JSON.stringify(expectedInjection)
   );

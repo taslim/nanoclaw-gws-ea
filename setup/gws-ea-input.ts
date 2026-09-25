@@ -433,6 +433,7 @@ export async function collectGwsEaCreateInput(
       home_directory: host.homeDirectory,
       platform: host.platform,
       running_as_root: host.runningAsRoot,
+      docker_endpoint: host.dockerEndpoint,
       provider_capability_digest: providerCapabilityDigest,
       provider: {
         id: provider.value,

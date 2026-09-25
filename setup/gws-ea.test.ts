@@ -54,6 +54,8 @@ vi.mock('./providers/registry.js', () => ({ listSetupProviders: () => fixture.pr
 vi.mock('./providers/index.js', () => ({}));
 
 const { createTerminalPresenter, main } = await import('./gws-ea.js');
+/** Upstream's `.env` writer: the driver injects it unchanged. */
+const { upsertEnvVars } = await import('./set-env.js');
 
 function runtimeOf(call = 0): CliRuntime {
   return fixture.runCli.mock.calls[call]![1] as CliRuntime;
@@ -88,6 +90,7 @@ describe('GWS-EA driver', () => {
     expect(runtime.onFailure).toBeUndefined();
     expect(runtime.checkPrerequisites).toBeUndefined();
     expect(runtime.confirmRemoval).toBeUndefined();
+    expect(runtime.upsertEnvVars).toBe(upsertEnvVars);
     await runtime.collectCreateInputs!({ marker: 'context' } as never);
     expect(fixture.collect).toHaveBeenCalledWith(
       { marker: 'context' },
@@ -100,6 +103,7 @@ describe('GWS-EA driver', () => {
     const runtime = runtimeOf();
 
     expect(runtime.presenter).toBeDefined();
+    expect(runtime.upsertEnvVars).toBe(upsertEnvVars);
     await runtime.collectCreateInputs!({ marker: 'context' } as never);
     expect(fixture.collect).toHaveBeenCalledWith(
       { marker: 'context' },
@@ -123,7 +127,12 @@ describe('GWS-EA driver', () => {
     expect(fixture.confirmAccount).toHaveBeenCalledWith('operator@example.com');
 
     const interaction = { marker: 'interaction' } as unknown as Interaction;
-    const request = { command: 'resume', instancesRoot: '/instances', account: 'reserved@example.com' } as const;
+    const request = {
+      command: 'resume',
+      paths: { configRoot: '/config', stateRoot: '/state', logsRoot: '/state/logs', instancesRoot: '/state/instances' },
+      account: 'reserved@example.com',
+      dockerEndpoint: 'unix:///var/run/docker.sock',
+    } as const;
     await runtime.checkPrerequisites!(request, interaction);
     expect(fixture.ensurePrerequisites).toHaveBeenCalledWith(request, interaction);
   });

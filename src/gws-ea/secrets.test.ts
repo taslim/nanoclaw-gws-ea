@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { preparePrivateLocalDirectory } from './paths.js';
+import { assertPrivateDirectory, assertPrivateStateFile, preparePrivateDirectory } from './paths.js';
 import { readOwnerOnlyFile, writeOwnerOnlyFileExclusive } from './secrets.js';
 
 const roots: string[] = [];
@@ -16,7 +16,7 @@ async function fixture(): Promise<string> {
   const root = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-secret-'));
   roots.push(root);
   const directory = path.join(root, 'secrets');
-  await preparePrivateLocalDirectory(directory);
+  await preparePrivateDirectory(directory);
   return directory;
 }
 
@@ -40,6 +40,38 @@ describe('GWS-EA owner-only files', () => {
 
     await chmod(target, 0o640);
     await expect(readOwnerOnlyFile(target)).rejects.toThrow(/0600/);
+  });
+
+  it.each([0o600, 0o400])('accepts an owner-only secret file at mode %o', async (mode) => {
+    const directory = await fixture();
+    const file = path.join(directory, 'credential');
+    await writeFile(file, 'secret', { mode: 0o600 });
+    await chmod(file, mode);
+
+    await expect(readOwnerOnlyFile(file)).resolves.toBe('secret');
+    await expect(assertPrivateStateFile(file)).resolves.toBeUndefined();
+  });
+
+  it.each([0o644, 0o604])('refuses a secret file others can read at mode %o', async (mode) => {
+    const directory = await fixture();
+    const file = path.join(directory, 'credential');
+    await writeFile(file, 'secret', { mode: 0o600 });
+    await chmod(file, mode);
+
+    await expect(readOwnerOnlyFile(file)).rejects.toMatchObject({
+      code: 'unsafe_mode',
+      message: expect.stringContaining('0600'),
+    });
+    await expect(assertPrivateStateFile(file)).rejects.toMatchObject({ code: 'unsafe_mode' });
+  });
+
+  it('accepts an owner-only directory stricter than 0700 and refuses a group-readable one', async () => {
+    const directory = await fixture();
+    await chmod(directory, 0o500);
+    await expect(assertPrivateDirectory(directory)).resolves.toBeUndefined();
+    await chmod(directory, 0o750);
+    await expect(assertPrivateDirectory(directory)).rejects.toMatchObject({ code: 'unsafe_mode' });
+    await chmod(directory, 0o700);
   });
 
   it('refuses to overwrite an existing secret', async () => {

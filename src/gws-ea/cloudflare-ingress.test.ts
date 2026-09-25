@@ -12,7 +12,7 @@ import {
   replaceManagedCloudflareConfiguration,
   renderManagedCloudflareConfiguration,
 } from './cloudflare-ingress.js';
-import { preparePrivateLocalDirectory, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+import { preparePrivateDirectory, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { allocateInstanceId, readRegistry, reserveInstance, withLockedCloudflareRegistry } from './registry.js';
 import { GwsEaError } from './types.js';
 import type { InstanceReservationInput } from './types.js';
@@ -187,7 +187,7 @@ describe('managed Cloudflare desired state', () => {
     const removing = managedReservation(paths, 'removing.example.com', 31_100);
     await reserveInstance(paths, removing);
     await reserveInstance(paths, managedReservation(paths, 'peer.example.com', 31_200));
-    await preparePrivateLocalDirectory(paths.removalRoot);
+    await preparePrivateDirectory(paths.removalRoot);
     await writePrivate(paths.removalFile(removing.instance_id), { active: true });
     const api = {
       verifyToken: vi.fn(),

@@ -17,8 +17,9 @@ import {
   isConsumerGoogleAccount,
   isGoogleAccountAddress,
 } from './gcloud.js';
-import { ONECLI_CLI_VERSION } from './onecli-compose.js';
-import { CONTROL_PLANE_ROOT } from './paths.js';
+import { ONECLI_CLI_VERSION } from './pins.js';
+import { protectFromAgentMounts } from './mount-allowlist.js';
+import { CONTROL_PLANE_ROOT, type ControlPlanePaths } from './paths.js';
 import {
   buildToolEnvironment,
   checkedRunner,
@@ -29,17 +30,28 @@ import {
   type SanitizedCommandOutcomeRunner,
 } from './process.js';
 import { assertInstalledOnecliCli } from './release-preflight.js';
-import { GwsEaError } from './types.js';
-import { isRecord } from './validation.js';
+import { GwsEaError, type GwsEaErrorDetails } from './types.js';
+import { isRecord, parseJson, unixSocketPath } from './validation.js';
 
 const DOCKER_PING_TIMEOUT_MS = 5_000;
 const TOOL_TIMEOUT_MS = 30_000;
 
+/** gws-ea's own roots: executables may not live in its instances, and agent mounts may not reach any of them. */
+export type PrerequisitePaths = Pick<ControlPlanePaths, 'configRoot' | 'stateRoot' | 'logsRoot' | 'instancesRoot'>;
+
 export type PrerequisiteRequest =
   /** `account` is `--google-account`; without it the operator confirms the signed-in account. */
-  | { readonly command: 'create'; readonly instancesRoot: string; readonly account?: string }
-  /** `account` is the reserved account, which must still be signed in. */
-  | { readonly command: 'resume'; readonly instancesRoot: string; readonly account: string };
+  | { readonly command: 'create'; readonly paths: PrerequisitePaths; readonly account?: string }
+  /**
+   * `account` is the reserved account, which must still be signed in;
+   * `dockerEndpoint`, once create recorded it, is probed instead of the active context.
+   */
+  | {
+      readonly command: 'resume';
+      readonly paths: PrerequisitePaths;
+      readonly account: string;
+      readonly dockerEndpoint?: string;
+    };
 
 /** What the prerequisites established about this host, as create records it. */
 export interface Prerequisites {
@@ -65,6 +77,8 @@ export interface PrerequisiteDependencies {
   readonly resolvePersisted?: typeof resolvePersistedExecutable;
   readonly node?: Pick<NodeJS.Process, 'version' | 'execPath' | 'execve'>;
   readonly platform?: NodeJS.Platform;
+  /** The shared NanoClaw mount allowlist; its documented location under the home directory by default. */
+  readonly mountAllowlistFile?: string;
 }
 
 function toolEnvironment(): Readonly<Record<string, string>> {
@@ -150,12 +164,7 @@ function pingDocker(socketPath: string): Promise<DockerDaemonState> {
 }
 
 function parseDockerContext(stdout: string): { readonly name: string; readonly endpoint: string } {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(stdout);
-  } catch {
-    throw new GwsEaError('invalid_docker_output', 'docker context inspect returned invalid JSON');
-  }
+  const parsed = parseJson(stdout, 'docker context inspect output', 'invalid_docker_output');
   const context: unknown = Array.isArray(parsed) && parsed.length === 1 ? parsed[0] : undefined;
   const endpoints = isRecord(context) && isRecord(context.Endpoints) ? context.Endpoints : undefined;
   const docker = endpoints && isRecord(endpoints.docker) ? endpoints.docker : undefined;
@@ -182,17 +191,45 @@ export async function resolveDockerEndpoint(
       ),
   );
   const { name, endpoint } = parseDockerContext(stdout);
-  const socket = endpoint.startsWith('unix://') ? endpoint.slice('unix://'.length) : undefined;
-  if (!socket || !path.isAbsolute(socket)) {
+  const socket = unixSocketPath(endpoint);
+  if (!socket) {
     throw new GwsEaError(
       'docker_remote',
       `The active Docker context ${name} points at ${endpoint}; GWS-EA needs a local Docker daemon on a unix:// socket. Switch to a local context (docker context use <name>), then retry.`,
       { details: { context: name, endpoint } },
     );
   }
+  await assertDockerRunning(endpoint, socket, {
+    where: `the endpoint of the active context ${name}`,
+    fix: 'Start Docker, or switch to a running local context (docker context use <name>), then retry.',
+    details: { context: name },
+  });
+  return endpoint;
+}
+
+/**
+ * Resume probes the endpoint create recorded rather than the active context,
+ * so switching contexts can neither move nor strand a running assistant.
+ */
+export async function probeRecordedDockerEndpoint(endpoint: string): Promise<string> {
+  const socket = unixSocketPath(endpoint);
+  if (!socket) throw new GwsEaError('docker_remote', `The recorded Docker endpoint ${endpoint} is not a local socket`);
+  await assertDockerRunning(endpoint, socket, {
+    where: 'the endpoint this assistant was created with',
+    fix: 'Start Docker there, then retry.',
+    details: {},
+  });
+  return endpoint;
+}
+
+async function assertDockerRunning(
+  endpoint: string,
+  socket: string,
+  context: { readonly where: string; readonly fix: string; readonly details: GwsEaErrorDetails },
+): Promise<void> {
   const daemon = await pingDocker(socket);
-  if (daemon.state === 'running') return endpoint;
-  const details = { context: name, endpoint, evidence: daemon.evidence };
+  if (daemon.state === 'running') return;
+  const details = { ...context.details, endpoint, evidence: daemon.evidence };
   if (daemon.state === 'no-permission') {
     throw new GwsEaError(
       'docker_permission_denied',
@@ -202,7 +239,7 @@ export async function resolveDockerEndpoint(
   }
   throw new GwsEaError(
     'docker_stopped',
-    `Docker is not running at ${endpoint}, the endpoint of the active context ${name} (${daemon.evidence}). Start Docker, or switch to a running local context (docker context use <name>), then retry.`,
+    `Docker is not running at ${endpoint}, ${context.where} (${daemon.evidence}). ${context.fix}`,
     { details },
   );
 }
@@ -268,10 +305,15 @@ export async function checkPrerequisites(
   const runner = dependencies.runCommand ?? runSanitizedCommandOutcome;
   const resolvePersisted = dependencies.resolvePersisted ?? resolvePersistedExecutable;
   const node = dependencies.node ?? process;
-  const checkoutRoots = [request.instancesRoot];
+  const checkoutRoots = [request.paths.instancesRoot];
+  const homeDirectory = os.homedir();
 
   const platform = supportedPlatform(dependencies.platform ?? process.platform);
   assertNodeExecve(node);
+  await protectFromAgentMounts(request.paths, {
+    homeDirectory,
+    ...(dependencies.mountAllowlistFile ? { file: dependencies.mountAllowlistFile } : {}),
+  });
   const nodePath = await resolvePersisted(node.execPath, { checkoutRoots });
   await assertTools(runner);
   const onecliCliPath = await locateOnecli(resolvePersisted, checkoutRoots);
@@ -285,11 +327,14 @@ export async function checkPrerequisites(
       checkedRunner(runner),
     );
   }
-  const dockerEndpoint = await resolveDockerEndpoint(runner);
+  const dockerEndpoint =
+    request.command === 'resume' && request.dockerEndpoint !== undefined
+      ? await probeRecordedDockerEndpoint(request.dockerEndpoint)
+      : await resolveDockerEndpoint(runner);
   const account = await googleAccount(request, interaction, runner);
   return {
     platform,
-    homeDirectory: os.homedir(),
+    homeDirectory,
     runningAsRoot: process.getuid?.() === 0,
     nodePath,
     onecliCliPath,

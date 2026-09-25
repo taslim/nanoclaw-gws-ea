@@ -1,20 +1,18 @@
-import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, realpath, rename, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
 import { writePrivate } from '../community-portal/private-file.js';
 import {
-  assertLocalOwnedDestination,
-  assertOwnedLocalDirectory,
-  assertPrivateStateFile,
-  preparePrivateLocalDirectory,
+  assertOwnedDestination,
+  assertPrivateDirectory,
+  preparePrivateDirectory,
   type ControlPlanePaths,
 } from './paths.js';
-import { assertRegistryMarkerAgreement, getInstanceReservation } from './registry.js';
+import { assertRegistryMarkerAgreement, getInstanceReservation, readInstanceMarkerFile } from './registry.js';
 import { buildToolEnvironment, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { GwsEaError, INSTANCE_MARKER_SCHEMA_VERSION, type InstanceMarker, type InstanceReservation } from './types.js';
-import { isRecord } from './validation.js';
 
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 
@@ -42,7 +40,7 @@ export interface ReleaseCommandEnvironments {
 /** Build the tool environment rooted in storage owned by this release operation. */
 export async function prepareReleaseCommandEnvironments(ownerRoot: string): Promise<ReleaseCommandEnvironments> {
   const home = path.join(ownerRoot, '.release-home');
-  await preparePrivateLocalDirectory(home);
+  await preparePrivateDirectory(home);
   const common = buildToolEnvironment(process.env, { HOME: home });
   return {
     common,
@@ -176,7 +174,7 @@ async function writeStagingMarker(
   reservation: InstanceReservation,
 ): Promise<void> {
   const file = markerPath(checkoutRoot);
-  await preparePrivateLocalDirectory(path.dirname(file));
+  await preparePrivateDirectory(path.dirname(file));
   await writePrivate(file, {
     schema_version: INSTANCE_MARKER_SCHEMA_VERSION,
     instance_id: instanceId,
@@ -189,21 +187,8 @@ async function assertStagingMarker(
   instanceId: string,
   reservation: InstanceReservation,
 ): Promise<void> {
-  const file = markerPath(checkoutRoot);
-  await assertPrivateStateFile(file);
-  let marker: unknown;
-  try {
-    marker = JSON.parse(await readFile(file, 'utf8')) as unknown;
-  } catch {
-    throw new GwsEaError('invalid_marker', 'Staging instance marker cannot be parsed safely');
-  }
-  if (
-    !isRecord(marker) ||
-    Object.keys(marker).sort().join(',') !== 'deployed_commit,instance_id,schema_version' ||
-    marker.schema_version !== INSTANCE_MARKER_SCHEMA_VERSION ||
-    marker.instance_id !== instanceId ||
-    marker.deployed_commit !== reservation.deployed_commit
-  ) {
+  const marker = await readInstanceMarkerFile(markerPath(checkoutRoot));
+  if (marker.instance_id !== instanceId || marker.deployed_commit !== reservation.deployed_commit) {
     throw new GwsEaError('marker_mismatch', 'Staging instance marker mismatch; refusing mutation');
   }
 }
@@ -224,9 +209,9 @@ export async function materializeReleaseCheckout(
   const reservation = await getInstanceReservation(paths, instanceId);
   assertResolvedReleaseMatches(reservation, release);
   await assertCheckoutTargetAbsent(reservation.checkout_realpath);
-  await assertLocalOwnedDestination(reservation.checkout_realpath);
+  await assertOwnedDestination(reservation.checkout_realpath);
   await mkdir(paths.instanceRoot(instanceId), { recursive: true, mode: 0o700 });
-  await assertOwnedLocalDirectory(paths.instanceRoot(instanceId), 0o700);
+  await assertPrivateDirectory(paths.instanceRoot(instanceId));
   const environments = await prepareReleaseCommandEnvironments(paths.instanceRoot(instanceId));
   const stagingRoot = stagingCheckoutRoot(reservation.checkout_realpath);
   const run = runtime.runCommand ?? runSanitizedCommand;
@@ -235,7 +220,7 @@ export async function materializeReleaseCheckout(
     if (info.isSymbolicLink() || !info.isDirectory() || (await realpath(stagingRoot)) !== stagingRoot) {
       throw new GwsEaError('unsafe_checkout', 'Staging checkout must be a physical directory at its claimed path');
     }
-    await assertOwnedLocalDirectory(stagingRoot, 0o700);
+    await assertPrivateDirectory(stagingRoot);
     try {
       await assertStagingMarker(stagingRoot, instanceId, reservation);
       await assertCheckoutRoot(stagingRoot, reservation, run, environments.git);
@@ -249,7 +234,7 @@ export async function materializeReleaseCheckout(
   } catch (error) {
     if (!isErrno(error, 'ENOENT')) throw error;
   }
-  await preparePrivateLocalDirectory(stagingRoot);
+  await preparePrivateDirectory(stagingRoot);
 
   let completed = false;
   try {

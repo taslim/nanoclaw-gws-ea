@@ -1,37 +1,9 @@
 import path from 'node:path';
-import { createRequire } from 'node:module';
 
 import { stringify } from 'yaml';
 
+import { ONECLI_GATEWAY_VERSION } from './pins.js';
 import { assertInstanceId } from './registry.js';
-
-const EXACT_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
-const require = createRequire(import.meta.url);
-
-function record(value: unknown, label: string): Record<string, unknown> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error(`${label} must be an object`);
-  }
-  return value as Record<string, unknown>;
-}
-
-function exactVersion(value: unknown, label: string): string {
-  if (typeof value !== 'string' || !EXACT_VERSION_PATTERN.test(value)) {
-    throw new Error(`${label} must be pinned to one exact version`);
-  }
-  return value;
-}
-
-const versionPins: unknown = require('../../versions.json');
-const packageManifest: unknown = require('../../package.json');
-const dependencies = record(record(packageManifest, 'package.json').dependencies, 'package.json dependencies');
-
-export const ONECLI_GATEWAY_VERSION = exactVersion(
-  record(versionPins, 'versions.json')['onecli-gateway'],
-  'OneCLI gateway',
-);
-export const ONECLI_CLI_VERSION = exactVersion(record(versionPins, 'versions.json')['onecli-cli'], 'OneCLI CLI');
-export const ONECLI_SDK_VERSION = exactVersion(dependencies['@onecli-sh/sdk'], 'OneCLI SDK');
 
 export const ONECLI_INSTANCE_LABEL = 'dev.gws-ea.instance-id' as const;
 export const ONECLI_RESOURCE_ROLE_LABEL = 'dev.gws-ea.onecli-role' as const;

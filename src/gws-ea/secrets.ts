@@ -4,8 +4,9 @@ import { chmod, open, realpath, rename, unlink } from 'node:fs/promises';
 import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
-import { isWithinDirectory } from './paths.js';
+import { isOwnerOnlyMode, isWithinDirectory } from './paths.js';
 import { GwsEaError } from './types.js';
+import { parseJson } from './validation.js';
 
 const MAX_PRIVATE_FILE_BYTES = 1024 * 1024;
 
@@ -14,8 +15,8 @@ function assertOwnerOnlyStat(info: Awaited<ReturnType<Awaited<ReturnType<typeof 
   if (typeof process.getuid === 'function' && Number(info.uid) !== process.getuid()) {
     throw new GwsEaError('unsafe_owner', `Owner-only state must be owned by the current user: ${file}`);
   }
-  if ((Number(info.mode) & 0o777) !== 0o600) {
-    throw new GwsEaError('unsafe_mode', `Owner-only state must have mode 0600: ${file}`);
+  if (!isOwnerOnlyMode(Number(info.mode))) {
+    throw new GwsEaError('unsafe_mode', `Owner-only state must be readable only by its owner (0600): ${file}`);
   }
   if (Number(info.size) > MAX_PRIVATE_FILE_BYTES) {
     throw new GwsEaError('unsafe_secret', `Owner-only state exceeds its size limit: ${file}`);
@@ -38,6 +39,11 @@ export async function readOwnerOnlyFile(file: string): Promise<string> {
   } finally {
     await handle.close();
   }
+}
+
+/** An owner-only JSON state file; malformed JSON raises `code`. */
+export async function readOwnerOnlyJson(file: string, label: string, code: string): Promise<unknown> {
+  return parseJson(await readOwnerOnlyFile(file), label, code);
 }
 
 /**
@@ -72,7 +78,7 @@ export async function readOperatorFile(file: string, root: string, label: string
     if (typeof process.getuid === 'function' && info.uid !== process.getuid()) {
       throw new GwsEaError(code, `${label} must be owned by the current user: ${absolute}`);
     }
-    if ((info.mode & 0o077) !== 0) {
+    if (!isOwnerOnlyMode(info.mode)) {
       throw new GwsEaError(code, `${label} must be readable only by its owner (chmod 0600): ${absolute}`);
     }
     if (info.size > MAX_PRIVATE_FILE_BYTES) throw new GwsEaError(code, `${label} is too large: ${absolute}`);

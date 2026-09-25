@@ -1,6 +1,6 @@
 import type { CloudflareZoneChoice, ManagedIngressSetupSession } from './create-input.js';
 import { GwsEaError } from './types.js';
-import { hasControlCharacters, isRecord } from './validation.js';
+import { hasControlCharacters, isRecord, requireString as requireText } from './validation.js';
 
 const DEFAULT_BASE_URL = 'https://api.cloudflare.com/client/v4';
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -104,11 +104,8 @@ export class CloudflareAmbiguousMutationError extends GwsEaError {
   }
 }
 
-function requireString(value: unknown, label: string, maxLength = 2048): string {
-  if (typeof value !== 'string' || value.length === 0 || value.length > maxLength || hasControlCharacters(value)) {
-    throw new GwsEaError('invalid_cloudflare_response', `Cloudflare returned an invalid ${label}`);
-  }
-  return value;
+function requireString(value: unknown, label: string, maxLength?: number): string {
+  return requireText(value, `Cloudflare ${label}`, 'invalid_cloudflare_response', maxLength);
 }
 
 function requireCloudflareHexId(value: unknown, label: string): string {

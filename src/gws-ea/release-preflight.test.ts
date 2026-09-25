@@ -5,9 +5,18 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { CONTROL_PLANE_ROOT } from './paths.js';
+import { CLOUDFLARED_IMAGE, ONECLI_CLI_VERSION, ONECLI_GATEWAY_VERSION } from './pins.js';
 import { TOOL_ENVIRONMENT_KEYS, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { runReleasePreflight, type SetupCommand } from './release-preflight.js';
 import { providerProvisioningCapabilityDigest } from '../provider-provisioning-capability.js';
+
+/** gws-ea's pins, which a release carries at the same path as this launcher. */
+const PINS_FILE = 'src/gws-ea/versions.json';
+const LAUNCHER_PIN_FILE = JSON.parse(await readFile(path.join(CONTROL_PLANE_ROOT, PINS_FILE), 'utf8')) as Record<
+  string,
+  string
+>;
 
 const roots: string[] = [];
 
@@ -33,6 +42,10 @@ async function write(root: string, relativePath: string, contents: string): Prom
 function commit(root: string, message: string): void {
   git(root, 'add', '.');
   git(root, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', message);
+}
+
+async function writePins(root: string, changes: Record<string, string>): Promise<void> {
+  await write(root, PINS_FILE, `${JSON.stringify({ ...LAUNCHER_PIN_FILE, ...changes }, null, 2)}\n`);
 }
 
 async function releaseFixture(): Promise<string> {
@@ -76,20 +89,9 @@ async function releaseFixture(): Promise<string> {
       '',
     ].join('\n'),
   );
-  await write(
-    root,
-    'versions.json',
-    JSON.stringify(
-      {
-        'onecli-gateway': '1.42.0',
-        'onecli-cli': '2.2.5',
-        cloudflared:
-          'cloudflare/cloudflared:2026.9.1@sha256:b269e8abd07a5bf6f3f4be65d5050b2174eca89c56a0241a8ff32a16aec454e4',
-      },
-      null,
-      2,
-    ) + '\n',
-  );
+  // Upstream's root pins file carries none of gws-ea's pins.
+  await write(root, 'versions.json', `${JSON.stringify({ 'agent-image': 'example@sha256:0' }, null, 2)}\n`);
+  await write(root, PINS_FILE, await readFile(path.join(CONTROL_PLANE_ROOT, PINS_FILE), 'utf8'));
   await write(
     root,
     'templates/gws-ea/main/plugin.json',
@@ -265,15 +267,16 @@ describe('release preflight', () => {
     expect(commands).toEqual([]);
   });
 
-  it('rejects an immutable cloudflared pin outside the launcher cohort', async () => {
+  it('rejects an immutable cloudflared pin outside the launcher cohort, naming the pin', async () => {
     const root = await releaseFixture();
-    const versions = JSON.parse(await readFile(path.join(root, 'versions.json'), 'utf8')) as Record<string, unknown>;
-    versions.cloudflared = `cloudflare/cloudflared:2026.9.2@sha256:${'a'.repeat(64)}`;
-    await write(root, 'versions.json', `${JSON.stringify(versions, null, 2)}\n`);
+    const image = `cloudflare/cloudflared:2026.9.2@sha256:${'a'.repeat(64)}`;
+    await writePins(root, { cloudflared: image });
     commit(root, 'different cloudflared cohort');
 
     await expect(runReleasePreflight(await preflightInput(root))).rejects.toMatchObject({
       code: 'cloudflared_release_mismatch',
+      message: expect.stringContaining(`cloudflared image ${image}`),
+      details: { pin: 'cloudflared image', release: image, launcher: CLOUDFLARED_IMAGE },
     });
   });
 
@@ -333,30 +336,27 @@ describe('release preflight', () => {
     expect(commands).toEqual([]);
   });
 
-  it('rejects target OneCLI pins that the launcher cannot execute before setup commands', async () => {
-    const root = await releaseFixture();
-    await write(
-      root,
-      'versions.json',
-      JSON.stringify(
-        {
-          'onecli-gateway': '1.43.0',
-          'onecli-cli': '2.2.5',
-          cloudflared:
-            'cloudflare/cloudflared:2026.9.1@sha256:b269e8abd07a5bf6f3f4be65d5050b2174eca89c56a0241a8ff32a16aec454e4',
-        },
-        null,
-        2,
-      ) + '\n',
-    );
-    commit(root, 'new OneCLI gateway cohort');
-    const commands: SetupCommand[] = [];
+  it.each([
+    ['onecli-gateway', 'OneCLI gateway', ONECLI_GATEWAY_VERSION],
+    ['onecli-cli', 'OneCLI CLI', ONECLI_CLI_VERSION],
+  ])(
+    'rejects a target %s pin the launcher cannot execute, naming it, before setup commands',
+    async (key, name, launcher) => {
+      const root = await releaseFixture();
+      await writePins(root, { [key]: '9.9.9' });
+      commit(root, 'new OneCLI cohort');
+      const commands: SetupCommand[] = [];
 
-    await expect(
-      runReleasePreflight(await preflightInput(root), { runSetupCommand: recorder(commands) }),
-    ).rejects.toMatchObject({ code: 'onecli_release_mismatch' });
-    expect(commands).toEqual([]);
-  });
+      await expect(
+        runReleasePreflight(await preflightInput(root), { runSetupCommand: recorder(commands) }),
+      ).rejects.toMatchObject({
+        code: 'onecli_release_mismatch',
+        message: expect.stringContaining(`pins ${name} 9.9.9, but this launcher pins ${launcher}`),
+        details: { pin: name, release: '9.9.9', launcher },
+      });
+      expect(commands).toEqual([]);
+    },
+  );
 
   it.each([
     ['cloudflare/cloudflared:latest'],
@@ -364,9 +364,7 @@ describe('release preflight', () => {
     ['cloudflare/cloudflared@sha256:' + 'a'.repeat(64)],
   ])('rejects a mutable or incomplete cloudflared pin: %s', async (image) => {
     const root = await releaseFixture();
-    const versions = JSON.parse(await readFile(path.join(root, 'versions.json'), 'utf8')) as Record<string, unknown>;
-    versions.cloudflared = image;
-    await write(root, 'versions.json', `${JSON.stringify(versions, null, 2)}\n`);
+    await writePins(root, { cloudflared: image });
     commit(root, 'invalid cloudflared pin');
 
     await expect(runReleasePreflight(await preflightInput(root))).rejects.toMatchObject({
@@ -420,7 +418,7 @@ describe('release preflight', () => {
   });
 
   it.each([
-    ['versions.json', JSON.stringify({ 'onecli-gateway': '^1.42.0', 'onecli-cli': '2.2.5' })],
+    [PINS_FILE, JSON.stringify({ ...LAUNCHER_PIN_FILE, 'onecli-gateway': '^1.42.0' })],
     [
       'package.json',
       JSON.stringify({

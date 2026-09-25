@@ -13,7 +13,7 @@ import {
   reserveInstance,
   writeInstanceMarker,
 } from './registry.js';
-import { isLocalFilesystemType, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { Prerequisites } from './prerequisites.js';
 import { GwsEaError, type InstanceReservationInput } from './types.js';
 
@@ -104,6 +104,7 @@ function createSetupInput() {
       home_directory: '/Users/operator',
       platform: process.platform === 'darwin' ? 'macos' : 'linux',
       running_as_root: false,
+      docker_endpoint: 'unix:///var/run/docker.sock',
       provider_capability_digest: providerCapabilityDigest,
       provider: {
         id: 'claude',
@@ -338,21 +339,59 @@ describe('machine registry', () => {
       }),
       { mode: 0o600 },
     );
-    await expect(readRegistry(paths)).rejects.toThrow(/unknown or missing fields/i);
+    await expect(readRegistry(paths)).rejects.toMatchObject({
+      code: 'invalid_registry',
+      message: expect.stringMatching(/tunnel name does not match its ownership ID/u),
+    });
+  });
+
+  it('loads a registry record with unknown fields and keeps its claims exact', async () => {
+    const paths = await testPaths();
+    const input = reservation(paths);
+    await reserveInstance(paths, input);
+    const stored = JSON.parse(await readFile(paths.registryFile, 'utf8')) as {
+      instances: Record<string, Record<string, unknown> & { exclusive_resource_claims: Record<string, unknown> }>;
+    } & Record<string, unknown>;
+    const instance = stored.instances[input.instance_id]!;
+    await writeFile(
+      paths.registryFile,
+      JSON.stringify({
+        ...stored,
+        written_by: 'a newer launcher',
+        instances: {
+          [input.instance_id]: {
+            ...instance,
+            added_later: { any: 'shape' },
+            exclusive_resource_claims: { ...instance.exclusive_resource_claims, note: 'extra' },
+          },
+        },
+      }),
+      { mode: 0o600 },
+    );
+
+    expect((await readRegistry(paths)).instances[input.instance_id]).toEqual(input);
+    await expect(
+      reserveInstance(paths, { ...reservation(paths), allocated_ports: input.allocated_ports }),
+    ).rejects.toMatchObject({
+      code: 'claim_conflict',
+    });
+  });
+
+  it('ignores entries in the removals directory that are not removal receipts', async () => {
+    const paths = await testPaths();
+    await mkdir(paths.removalRoot, { recursive: true, mode: 0o700 });
+    const leftover = `${allocateInstanceId()}.json.${process.pid}.0123456789abcdef.tmp`;
+    await writeFile(path.join(paths.removalRoot, '.DS_Store'), 'finder', { mode: 0o644 });
+    await writeFile(path.join(paths.removalRoot, leftover), '{', { mode: 0o600 });
+
+    const reserved = await reserveInstance(paths, reservation(paths));
+
+    expect(Object.keys((await readRegistry(paths)).instances)).toEqual([reserved.instance_id]);
   });
 
   it.each([
     ['corrupt JSON', '{not-json'],
     ['an unknown schema', JSON.stringify({ schema_version: 99, instances: {} })],
-    [
-      'an unvalidated field',
-      JSON.stringify({
-        schema_version: 2,
-        instances: {},
-        shared_infrastructure_metadata: { cloudflare: null },
-        surprise: true,
-      }),
-    ],
   ])('stops mutation for %s', async (_label, contents) => {
     const paths = await testPaths();
     await mkdir(paths.configRoot, { recursive: true, mode: 0o700 });
@@ -383,13 +422,6 @@ describe('machine registry', () => {
       await expect(readRegistry(paths)).rejects.toThrow(/owned/i);
     },
   );
-
-  it('classifies known remote filesystem types as unsafe', () => {
-    expect(isLocalFilesystemType(0x6969)).toBe(false); // NFS
-    expect(isLocalFilesystemType(0xff534d42)).toBe(false); // CIFS
-    expect(isLocalFilesystemType(0x65735546)).toBe(false); // FUSE (may be remote)
-    expect(isLocalFilesystemType(0xef53)).toBe(true); // ext family
-  });
 
   it('fails closed when an immutable marker disagrees with the registry', async () => {
     const paths = await testPaths();

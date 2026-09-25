@@ -14,14 +14,14 @@ import path from 'node:path';
 import { readJson, writePrivate } from '../community-portal/private-file.js';
 import { processLock } from '../community-portal/process-lock.js';
 import { isErrno } from '../community-portal/errors.js';
-import { assertPrivateStateFile, preparePrivateLocalDirectory, type ControlPlanePaths } from './paths.js';
+import { assertPrivateStateFile, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import type { PrincipalCandidate } from './principal.js';
 import { parsePrincipalCandidate } from './principal-selection.js';
 import { redact } from './redact.js';
 import { assertInstanceId, getInstanceReservation } from './registry.js';
 import { removePrivateFile } from './secrets.js';
 import { GwsEaError, PROVISION_STEPS, type ProvisionStepId } from './types.js';
-import { hasControlCharacters, isRecord } from './validation.js';
+import { hasControlCharacters, isRecord, requireString } from './validation.js';
 
 export const PROVISION_JOURNAL_SCHEMA_VERSION = 3 as const;
 
@@ -95,10 +95,7 @@ function timestamp(value: unknown, label: string): string {
 }
 
 function text(value: unknown, label: string): string {
-  if (typeof value !== 'string' || value.length === 0 || value.length > 4_096 || hasControlCharacters(value)) {
-    throw invalid(`Provision journal ${label} is invalid`);
-  }
-  return value;
+  return requireString(value, `Provision journal ${label}`, 'invalid_journal', 4_096);
 }
 
 function parseSteps(value: unknown): ProvisionJournal['steps'] {
@@ -176,7 +173,7 @@ function parseJournal(value: unknown, instanceId: string): ProvisionJournal {
  */
 export async function createProvisionJournal(paths: ControlPlanePaths, instanceId: string): Promise<ProvisionJournal> {
   assertInstanceId(instanceId);
-  await preparePrivateLocalDirectory(paths.instanceRoot(instanceId));
+  await preparePrivateDirectory(paths.instanceRoot(instanceId));
   const file = paths.journalFile(instanceId);
   const exists = await lstat(file).then(
     () => true,
@@ -324,7 +321,7 @@ export async function acquireInstanceOperation(
   instanceId: string,
 ): Promise<InstanceOperation | null> {
   assertInstanceId(instanceId);
-  await preparePrivateLocalDirectory(path.dirname(paths.instanceLock(instanceId)));
+  await preparePrivateDirectory(path.dirname(paths.instanceLock(instanceId)));
   const unlock = await processLock(paths.instanceLock(instanceId));
   if (!unlock) return null;
   try {
@@ -335,7 +332,7 @@ export async function acquireInstanceOperation(
       if (!isErrno(error, 'ENOENT')) throw error;
     }
     await getInstanceReservation(paths, instanceId);
-    await preparePrivateLocalDirectory(paths.instanceRoot(instanceId));
+    await preparePrivateDirectory(paths.instanceRoot(instanceId));
   } catch (error) {
     unlock();
     throw error;

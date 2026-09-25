@@ -35,9 +35,9 @@ import {
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { removeOnecliRuntime } from './onecli.js';
 import {
-  assertPrivateLocalDirectory,
+  assertPrivateDirectory,
   assertPrivateStateFile,
-  preparePrivateLocalDirectory,
+  preparePrivateDirectory,
   type ControlPlanePaths,
 } from './paths.js';
 import { buildToolEnvironment, runSanitizedCommand, runSanitizedCommandOutcome } from './process.js';
@@ -52,7 +52,7 @@ import {
   withLockedCloudflareRegistry,
 } from './registry.js';
 import { removePrivateFile } from './secrets.js';
-import { loadInstanceRuntimeConfig } from './service.js';
+import { readRecordedHomeDirectory } from './service.js';
 import { createInstanceServiceCoordinates, type InstanceServicePlatform } from './service-coordinates.js';
 import {
   GwsEaError,
@@ -132,14 +132,6 @@ export interface RemovalPreview {
   readonly ingress: ExistingRemovalPreview | ManagedRemovalPreview;
 }
 
-function exactKeys(value: Record<string, unknown>, expected: readonly string[], label: string): void {
-  const actual = Object.keys(value).sort();
-  const wanted = [...expected].sort();
-  if (actual.length !== wanted.length || actual.some((key, index) => key !== wanted[index])) {
-    throw new GwsEaError('invalid_removal', `${label} contains unknown or missing fields`);
-  }
-}
-
 function isoTimestamp(value: unknown, label: string): string {
   if (typeof value !== 'string') throw new GwsEaError('invalid_removal', `${label} is invalid`);
   const parsed = new Date(value);
@@ -156,17 +148,14 @@ function nullableTimestamp(value: unknown, label: string): string | null {
 function validateManagedIngressReceipt(value: unknown): ManagedIngressRemovalReceipt | null {
   if (value === null) return null;
   if (!isRecord(value)) throw new GwsEaError('invalid_removal', 'Managed ingress removal state is invalid');
-  exactKeys(value, ['final', 'steps'], 'Managed ingress removal state');
   if (value.final !== null && typeof value.final !== 'boolean') {
     throw new GwsEaError('invalid_removal', 'Managed ingress removal scope is invalid');
   }
   if (!isRecord(value.steps)) throw new GwsEaError('invalid_removal', 'Managed ingress removal steps are invalid');
-  exactKeys(value.steps, MANAGED_INGRESS_STEPS, 'Managed ingress removal steps');
   const steps = {} as Record<ManagedIngressStep, RemovalStepReceipt>;
   for (const step of MANAGED_INGRESS_STEPS) {
     const raw = value.steps[step];
     if (!isRecord(raw)) throw new GwsEaError('invalid_removal', `Managed ingress ${step} step is invalid`);
-    exactKeys(raw, ['intended_at', 'completed_at'], `Managed ingress ${step} step`);
     const intendedAt = nullableTimestamp(raw.intended_at, `${step} intent`);
     const completedAt = nullableTimestamp(raw.completed_at, `${step} completion`);
     if (completedAt !== null && intendedAt === null) {
@@ -210,16 +199,10 @@ function assertManagedIngressReceiptOrder(
 
 function validateReceipt(value: unknown, paths: ControlPlanePaths, instanceId: string): RemovalReceipt {
   if (!isRecord(value)) throw new GwsEaError('invalid_removal', 'Removal receipt is invalid');
-  exactKeys(
-    value,
-    ['schema_version', 'instance_id', 'reservation', 'started_at', 'managed_ingress', 'completed'],
-    'Removal receipt',
-  );
   if (value.schema_version !== REMOVAL_SCHEMA_VERSION || value.instance_id !== instanceId) {
     throw new GwsEaError('invalid_removal', 'Removal receipt does not match this instance');
   }
   if (!isRecord(value.completed)) throw new GwsEaError('invalid_removal', 'Removal phases are invalid');
-  exactKeys(value.completed, REMOVAL_PHASES, 'Removal phases');
   const completed = {} as Record<RemovalPhase, string | null>;
   for (const phase of REMOVAL_PHASES) {
     const stamp = value.completed[phase];
@@ -294,7 +277,7 @@ async function ensureReceipt(
     if (activeRemovals.some((activeInstanceId) => activeInstanceId !== instanceId)) {
       throw new GwsEaError('removal_in_progress', 'Another assistant removal is already in progress');
     }
-    await preparePrivateLocalDirectory(paths.removalRoot);
+    await preparePrivateDirectory(paths.removalRoot);
     await writePrivate(paths.removalFile(instanceId), receipt);
   });
   return receipt;
@@ -585,7 +568,7 @@ async function removeManagedCloudflareIngress(
     const layout = createCloudflareConnectorLayout({ cloudflareRoot: paths.cloudflareRoot, platform });
     let privateRootPresent = true;
     try {
-      await assertPrivateLocalDirectory(paths.cloudflareRoot);
+      await assertPrivateDirectory(paths.cloudflareRoot);
     } catch (error) {
       if (!isErrno(error, 'ENOENT')) throw error;
       privateRootPresent = false;
@@ -693,16 +676,10 @@ async function removeManagedCloudflareIngress(
 }
 
 async function uninstallNanoclaw(reservation: InstanceReservation): Promise<void> {
-  let installId = reservation.instance_id.replaceAll('-', '');
-  let homeDirectory = os.homedir();
-  const runtimeFile = path.join(reservation.checkout_realpath, 'data', 'gws-ea', 'runtime.json');
-  try {
-    const runtime = await loadInstanceRuntimeConfig(runtimeFile);
-    installId = runtime.install_id;
-    homeDirectory = runtime.home_directory;
-  } catch (error) {
-    if (!isErrno(error, 'ENOENT')) throw error;
-  }
+  const installId = reservation.instance_id.replaceAll('-', '');
+  const homeDirectory =
+    (await readRecordedHomeDirectory(path.join(reservation.checkout_realpath, 'data', 'gws-ea', 'runtime.json'))) ??
+    os.homedir();
   const coordinates = (platform: InstanceServicePlatform, runningAsRoot: boolean) =>
     createInstanceServiceCoordinates({ installId, homeDirectory, platform, runningAsRoot });
   const environment = buildToolEnvironment(
@@ -864,7 +841,7 @@ export async function removeAssistant(
   dependencies: RemovalDependencies = {},
 ): Promise<void> {
   assertInstanceId(instanceId);
-  await preparePrivateLocalDirectory(path.dirname(paths.instanceLock(instanceId)));
+  await preparePrivateDirectory(path.dirname(paths.instanceLock(instanceId)));
   const release = await processLock(paths.instanceLock(instanceId));
   if (!release) throw new GwsEaError('instance_busy', 'Instance operation is already in progress');
   try {

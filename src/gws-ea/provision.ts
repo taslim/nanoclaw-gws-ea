@@ -34,12 +34,7 @@ import {
   type ObservedOnecliRuntime,
 } from './onecli.js';
 import type { OnecliRuntimeLayout } from './onecli-compose.js';
-import {
-  createOnecliRuntimeLayout,
-  ONECLI_CLI_VERSION,
-  ONECLI_GATEWAY_VERSION,
-  ONECLI_SDK_VERSION,
-} from './onecli-compose.js';
+import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import {
   reconcileInstanceRuntime,
   runInstanceOnecliAdminCommand,
@@ -47,7 +42,8 @@ import {
   googleChatProjectNumberFile,
   loadInstanceRuntimeConfig,
   type InstanceRuntimeConfig,
-  type InstanceServiceDependencies,
+  type InstanceRuntimeDependencies,
+  type UpsertEnvVars,
 } from './service.js';
 import { runInstanceNclJson } from './ncl.js';
 import { reconcileMainIdentity, type MainIdentityDependencies, type MainIdentityInput } from './identity.js';
@@ -66,12 +62,28 @@ import {
   type PrincipalBindingVerificationInput,
   type PrincipalBindingVerificationResult,
 } from './verify.js';
-import { readOwnerOnlyFile, removePrivateFile, writePrivateTextFile } from './secrets.js';
+import { readOwnerOnlyFile, readOwnerOnlyJson, removePrivateFile, writePrivateTextFile } from './secrets.js';
 import { assertInstanceId, getInstanceReservation } from './registry.js';
-import { preparePrivateLocalDirectory, type ControlPlanePaths } from './paths.js';
+import { isErrno } from '../community-portal/errors.js';
+import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import { holdReservedLoopbackPorts, type AllocatedPortName, type LoopbackPortLease } from './ports.js';
-import { GwsEaError, ingressEndpointUrl, type IngressClaim, type ProvisionStepId } from './types.js';
-import { hasControlCharacters, isRecord } from './validation.js';
+import {
+  GwsEaError,
+  ingressEndpointUrl,
+  type IngressClaim,
+  type InstanceReservation,
+  type ProvisionStepId,
+} from './types.js';
+import {
+  isRecord,
+  optionalString,
+  parseJson,
+  requireDockerEndpoint,
+  requirePath,
+  requireRecord,
+  requireString,
+  unwrapData,
+} from './validation.js';
 import { parseGcpProjectNumber } from './gcp-identity.js';
 import {
   credentialMatchesMetadata,
@@ -110,6 +122,8 @@ const GCP_WAIT_REASONS: Readonly<Record<GcloudReadbackResource, string>> = {
 };
 
 export interface ProductionProvisionOptions {
+  /** Upstream's `.env` upsert, injected by the driver (`src/` cannot import `setup/`). */
+  readonly upsertEnvVars: UpsertEnvVars;
   readonly portLease?: ProvisionPortLease;
   /** Human input: credentials, sign-in, and decisions supplied on re-entry. */
   readonly interaction?: Interaction;
@@ -139,7 +153,7 @@ export interface ProductionProvisionInput {
   readonly selectedMessagingGroupId?: string;
   readonly selectedPrincipal?: PrincipalCandidate;
   readonly bootstrapManifestFile?: string;
-  readonly serviceDependencies: InstanceServiceDependencies;
+  readonly serviceDependencies: InstanceRuntimeDependencies;
   readonly onecliDependencies?: OnecliRuntimeDependencies;
   readonly identityDependencies?: MainIdentityDependencies;
   readonly principalDependencies?: PrincipalDiscoveryDependencies;
@@ -202,22 +216,6 @@ export interface ProductionProvisionDependencies {
   readonly nanoclawStartupDelay: (milliseconds: number) => Promise<void>;
 }
 
-function unwrapData(value: unknown): unknown {
-  return isRecord(value) && 'data' in value ? value.data : value;
-}
-
-function parseJson(source: string, label: string): unknown {
-  try {
-    return JSON.parse(source) as unknown;
-  } catch {
-    throw new GwsEaError('invalid_child_output', `${label} returned invalid JSON`);
-  }
-}
-
-function stringField(value: Record<string, unknown>, key: string): string | undefined {
-  return typeof value[key] === 'string' && value[key].length > 0 ? value[key] : undefined;
-}
-
 async function defaultObserveCheckout(context: ProductionProvisionContext): Promise<Observation> {
   try {
     await assertReleaseCheckoutAgreement(context.operation.paths, context.operation.instanceId);
@@ -247,92 +245,74 @@ interface ReleasePreflightExpectation {
   readonly providerCredential?: ProviderCredentialMetadata;
 }
 
-function credentialMetadataRecord(value: Record<string, unknown>): ProviderCredentialMetadata {
-  const required = ['name', 'type', 'hostPattern'] as const;
-  const optional = ['pathPattern', 'headerName', 'valueFormat', 'paramName', 'paramFormat'] as const;
-  const keys = Object.keys(value);
-  if (
-    required.some((key) => typeof value[key] !== 'string' || value[key].length === 0) ||
-    optional.some((key) => value[key] !== undefined && typeof value[key] !== 'string') ||
-    keys.some((key) => ![...required, ...optional].includes(key as (typeof required)[number]))
-  ) {
-    throw new GwsEaError('invalid_release_preflight', 'Release provider credential metadata is invalid');
-  }
-  return {
-    name: value.name as string,
-    type: value.type as string,
-    hostPattern: value.hostPattern as string,
-    ...(typeof value.pathPattern === 'string' ? { pathPattern: value.pathPattern } : {}),
-    ...(typeof value.headerName === 'string' ? { headerName: value.headerName } : {}),
-    ...(typeof value.valueFormat === 'string' ? { valueFormat: value.valueFormat } : {}),
-    ...(typeof value.paramName === 'string' ? { paramName: value.paramName } : {}),
-    ...(typeof value.paramFormat === 'string' ? { paramFormat: value.paramFormat } : {}),
-  };
+const INVALID_RECEIPT = 'invalid_release_preflight';
+
+const OPTIONAL_CREDENTIAL_FIELDS = ['pathPattern', 'headerName', 'valueFormat', 'paramName', 'paramFormat'] as const;
+
+function credentialMetadataRecord(value: unknown): ProviderCredentialMetadata {
+  const metadata = requireRecord(value, 'Release provider credential metadata', INVALID_RECEIPT);
+  const field = (key: string): string =>
+    requireString(metadata[key], `Release provider credential ${key}`, INVALID_RECEIPT);
+  const optional: { [Key in (typeof OPTIONAL_CREDENTIAL_FIELDS)[number]]?: string } = {};
+  for (const key of OPTIONAL_CREDENTIAL_FIELDS) if (metadata[key] !== undefined) optional[key] = field(key);
+  return { name: field('name'), type: field('type'), hostPattern: field('hostPattern'), ...optional };
 }
 
+/**
+ * The receipt records what create's release preflight established. It names
+ * the OneCLI cohort the release was checked against, but resume never
+ * compares it with this launcher's pins: a launcher upgrade must not block an
+ * instance it did not create (Appendix B #11).
+ */
 function validateReleasePreflightReceipt(
   value: unknown,
   expectation: ReleasePreflightExpectation,
 ): ReleasePreflightReceipt {
-  if (!isRecord(value) || !isRecord(value.onecli) || !isRecord(value.providerCredential)) {
-    throw new GwsEaError('invalid_release_preflight', 'Release preflight receipt is invalid');
-  }
-  const expectedKeys = [
-    'schema_version',
-    'instance_id',
-    'deployed_commit',
-    'provider',
-    'providerCapabilityDigest',
-    'providerCredential',
-    'packageManager',
-    'onecli',
-  ].sort();
-  const actualKeys = Object.keys(value).sort();
-  const onecliKeys = Object.keys(value.onecli).sort();
-  const providerCredential = credentialMetadataRecord(value.providerCredential);
+  const receipt = requireRecord(value, 'Release preflight receipt', INVALID_RECEIPT);
+  const onecli = requireRecord(receipt.onecli, 'Release preflight OneCLI cohort', INVALID_RECEIPT);
   let providerCapabilityDigest: string;
   try {
-    providerCapabilityDigest = assertProviderProvisioningCapabilityDigest(value.providerCapabilityDigest);
+    providerCapabilityDigest = assertProviderProvisioningCapabilityDigest(receipt.providerCapabilityDigest);
   } catch {
-    throw new GwsEaError('invalid_release_preflight', 'Release provider capability digest is invalid');
+    throw new GwsEaError(INVALID_RECEIPT, 'Release provider capability digest is invalid');
   }
+  const validated: ReleasePreflightReceipt = {
+    schema_version: 1,
+    instance_id: requireString(receipt.instance_id, 'Release preflight instance_id', INVALID_RECEIPT),
+    deployed_commit: requireString(receipt.deployed_commit, 'Release preflight deployed_commit', INVALID_RECEIPT),
+    provider: requireString(receipt.provider, 'Release preflight provider', INVALID_RECEIPT),
+    providerCapabilityDigest,
+    providerCredential: credentialMetadataRecord(receipt.providerCredential),
+    packageManager: requireString(receipt.packageManager, 'Release preflight packageManager', INVALID_RECEIPT),
+    onecli: {
+      gateway: requireString(onecli.gateway, 'Release preflight OneCLI gateway', INVALID_RECEIPT),
+      cli: requireString(onecli.cli, 'Release preflight OneCLI CLI', INVALID_RECEIPT),
+      sdk: requireString(onecli.sdk, 'Release preflight OneCLI SDK', INVALID_RECEIPT),
+    },
+  };
   if (
-    actualKeys.length !== expectedKeys.length ||
-    actualKeys.some((key, index) => key !== expectedKeys[index]) ||
-    onecliKeys.length !== 3 ||
-    onecliKeys.some((key, index) => key !== ['cli', 'gateway', 'sdk'][index]) ||
-    value.schema_version !== 1 ||
-    value.instance_id !== expectation.instanceId ||
-    value.deployed_commit !== expectation.deployedCommit ||
-    value.provider !== expectation.provider ||
+    receipt.schema_version !== 1 ||
+    validated.instance_id !== expectation.instanceId ||
+    validated.deployed_commit !== expectation.deployedCommit ||
+    validated.provider !== expectation.provider ||
     (expectation.providerCapabilityDigest !== undefined &&
       providerCapabilityDigest !== expectation.providerCapabilityDigest) ||
-    typeof value.packageManager !== 'string' ||
-    value.onecli.gateway !== ONECLI_GATEWAY_VERSION ||
-    value.onecli.cli !== ONECLI_CLI_VERSION ||
-    value.onecli.sdk !== ONECLI_SDK_VERSION ||
     (expectation.providerCredential !== undefined &&
-      !sameCredentialMetadata(providerCredential, expectation.providerCredential))
+      !sameCredentialMetadata(validated.providerCredential, expectation.providerCredential))
   ) {
     throw new GwsEaError('release_preflight_mismatch', 'Release preflight receipt does not match this instance');
   }
-  return value as unknown as ReleasePreflightReceipt;
+  return validated;
 }
 
 async function loadReleasePreflightReceipt(
   file: string,
   expectation: ReleasePreflightExpectation,
 ): Promise<ReleasePreflightReceipt> {
-  let value: unknown;
-  try {
-    value = JSON.parse(await readOwnerOnlyFile(file)) as unknown;
-  } catch (error) {
-    if (error instanceof SyntaxError) {
-      throw new GwsEaError('invalid_release_preflight', 'Release preflight receipt is invalid JSON');
-    }
-    throw error;
-  }
-  return validateReleasePreflightReceipt(value, expectation);
+  return validateReleasePreflightReceipt(
+    await readOwnerOnlyJson(file, 'Release preflight receipt', INVALID_RECEIPT),
+    expectation,
+  );
 }
 
 async function assertReleasePreflightReceipt(context: ProductionProvisionContext): Promise<void> {
@@ -400,7 +380,7 @@ async function defaultObserveProvider(context: ProductionProvisionContext): Prom
   const credential = context.input.providerCredentialMetadata;
   try {
     const result = await runInstanceOnecliAdminCommand(context.input.runtime, ['secrets', 'list', '--max', '0']);
-    const value = unwrapData(parseJson(result.stdout, 'OneCLI'));
+    const value = unwrapData(parseJson(result.stdout, 'OneCLI output', 'invalid_child_output'));
     if (!Array.isArray(value) || !value.every(isRecord)) {
       throw new GwsEaError('invalid_child_output', 'OneCLI returned an invalid secret list');
     }
@@ -420,7 +400,7 @@ async function defaultObserveProvider(context: ProductionProvisionContext): Prom
     if (!onecliSecretMatchesCredentialMetadata(match, credential)) {
       throw new GwsEaError('onecli_secret_conflict', 'Provider credential metadata does not match');
     }
-    const id = stringField(match, 'id');
+    const id = optionalString(match.id);
     if (!id) throw new GwsEaError('invalid_child_output', 'OneCLI provider secret has no ID');
     context.state.providerSecretId = id;
     return PRESENT;
@@ -485,7 +465,7 @@ async function runNanoclawProbeOnecli(context: ProductionProvisionContext, args:
   const run = context.input.identityDependencies?.runOnecliAdmin;
   if (run) return run(context.input.runtime, args);
   const result = await runInstanceOnecliAdminCommand(context.input.runtime, args);
-  return parseJson(result.stdout, 'OneCLI');
+  return parseJson(result.stdout, 'OneCLI output', 'invalid_child_output');
 }
 
 /** Main exists as published, and its OneCLI agent injects every matching secret (all mode). */
@@ -493,7 +473,7 @@ async function defaultObserveMainIdentity(context: ProductionProvisionContext): 
   try {
     const profileValue = unwrapData(await runNanoclawProbeNcl(context, ['gws-ea-profile', 'get']));
     if (!isRecord(profileValue)) return ABSENT;
-    const mainAgentGroupId = stringField(profileValue, 'main_agent_group_id');
+    const mainAgentGroupId = optionalString(profileValue.main_agent_group_id);
     if (
       !mainAgentGroupId ||
       profileValue.assistant_display_name !== context.input.identity.assistantDisplayName ||
@@ -519,7 +499,7 @@ async function defaultObserveMainIdentity(context: ProductionProvisionContext): 
     if (!Array.isArray(agents) || !agents.every(isRecord)) return ABSENT;
     const matching = agents.filter((agent) => agent.identifier === mainAgentGroupId);
     const agent = matching[0];
-    const agentId = agent ? stringField(agent, 'id') : undefined;
+    const agentId = optionalString(agent?.id);
     if (matching.length !== 1 || !agentId || agent!.name !== 'main' || agent!.secretMode !== 'all') {
       return ABSENT;
     }
@@ -645,9 +625,9 @@ function beforeOnecliBind(
 }
 
 function beforeNanoclawBind(
-  dependencies: InstanceServiceDependencies,
+  dependencies: InstanceRuntimeDependencies,
   releaseLease: () => Promise<void>,
-): InstanceServiceDependencies {
+): InstanceRuntimeDependencies {
   return {
     ...dependencies,
     beforeBind: async () => {
@@ -1204,6 +1184,8 @@ export interface ProductionBootstrapManifest {
   readonly home_directory: string;
   readonly platform: 'macos' | 'linux';
   readonly running_as_root: boolean;
+  /** The local Docker endpoint prerequisites resolved at create (KTD3). */
+  readonly docker_endpoint: string;
   readonly provider_capability_digest: string;
   readonly provider: {
     readonly id: string;
@@ -1224,90 +1206,45 @@ export interface ProductionBootstrapManifest {
   readonly selected_messaging_group_id: string | null;
 }
 
-function exactKeys(value: Record<string, unknown>, keys: readonly string[], label: string): void {
-  const actual = Object.keys(value).sort();
-  const expected = [...keys].sort();
-  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
-    throw new GwsEaError('invalid_bootstrap_manifest', `${label} contains unknown or missing fields`);
-  }
-}
+const INVALID_BOOTSTRAP = 'invalid_bootstrap_manifest';
 
-function bootstrapString(value: unknown, label: string, maximum = 2_048): string {
-  if (typeof value !== 'string' || value.length === 0 || value.length > maximum || hasControlCharacters(value)) {
-    throw new GwsEaError('invalid_bootstrap_manifest', `${label} is invalid`);
-  }
-  return value;
-}
-
-function bootstrapPath(value: unknown, label: string): string {
-  const result = bootstrapString(value, label);
-  if (!path.isAbsolute(result) || path.resolve(result) !== result) {
-    throw new GwsEaError('invalid_bootstrap_manifest', `${label} must be an absolute normalized path`);
-  }
-  return result;
+function bootstrapString(value: unknown, label: string, maximum?: number): string {
+  return requireString(value, label, INVALID_BOOTSTRAP, maximum);
 }
 
 export function validateProductionBootstrapManifest(value: unknown): ProductionBootstrapManifest {
-  if (!isRecord(value)) throw new GwsEaError('invalid_bootstrap_manifest', 'Bootstrap manifest must be an object');
-  exactKeys(
-    value,
-    [
-      'schema_version',
-      'onecli_cli_path',
-      'node_path',
-      'home_directory',
-      'platform',
-      'running_as_root',
-      'provider_capability_digest',
-      'provider',
-      'identity',
-      'selected_messaging_group_id',
-    ],
-    'Bootstrap manifest',
-  );
-  if (value.schema_version !== BOOTSTRAP_SCHEMA_VERSION) {
-    throw new GwsEaError('invalid_bootstrap_manifest', 'Bootstrap manifest schema is unsupported');
+  const manifest = requireRecord(value, 'Bootstrap manifest', INVALID_BOOTSTRAP);
+  if (manifest.schema_version !== BOOTSTRAP_SCHEMA_VERSION) {
+    throw new GwsEaError(INVALID_BOOTSTRAP, 'Bootstrap manifest schema is unsupported');
   }
-  if (value.platform !== 'macos' && value.platform !== 'linux') {
-    throw new GwsEaError('invalid_bootstrap_manifest', 'Bootstrap platform is invalid');
+  if (manifest.platform !== 'macos' && manifest.platform !== 'linux') {
+    throw new GwsEaError(INVALID_BOOTSTRAP, 'Bootstrap platform is invalid');
   }
-  if (typeof value.running_as_root !== 'boolean') {
-    throw new GwsEaError('invalid_bootstrap_manifest', 'Bootstrap running_as_root is invalid');
+  if (typeof manifest.running_as_root !== 'boolean') {
+    throw new GwsEaError(INVALID_BOOTSTRAP, 'Bootstrap running_as_root is invalid');
   }
-  if (!isRecord(value.provider) || !isRecord(value.identity)) {
-    throw new GwsEaError('invalid_bootstrap_manifest', 'Bootstrap nested input is invalid');
-  }
-  const provider = value.provider;
-  const identity = value.identity;
-  exactKeys(
-    provider,
-    ['id', 'name', 'type', 'host_pattern', 'header_name', 'value_format', 'path_pattern', 'param_name', 'param_format'],
-    'provider',
-  );
-  exactKeys(identity, ['assistant_display_name', 'principal_display_name', 'principal_timezone'], 'identity');
-  const selected = value.selected_messaging_group_id;
-  if (selected !== null && typeof selected !== 'string') {
-    throw new GwsEaError('invalid_bootstrap_manifest', 'selected_messaging_group_id is invalid');
-  }
+  const provider = requireRecord(manifest.provider, 'Bootstrap provider', INVALID_BOOTSTRAP);
+  const identity = requireRecord(manifest.identity, 'Bootstrap identity', INVALID_BOOTSTRAP);
   const optionalProviderString = (key: string): string | null => {
     const candidate = provider[key];
-    if (candidate === null) return null;
-    return bootstrapString(candidate, `provider ${key}`, 512);
+    return candidate === null || candidate === undefined ? null : bootstrapString(candidate, `provider ${key}`, 512);
   };
+  const selected = manifest.selected_messaging_group_id;
+  let providerCapabilityDigest: string;
+  try {
+    providerCapabilityDigest = assertProviderProvisioningCapabilityDigest(manifest.provider_capability_digest);
+  } catch {
+    throw new GwsEaError(INVALID_BOOTSTRAP, 'provider_capability_digest is invalid');
+  }
   return {
     schema_version: BOOTSTRAP_SCHEMA_VERSION,
-    onecli_cli_path: bootstrapPath(value.onecli_cli_path, 'onecli_cli_path'),
-    node_path: bootstrapPath(value.node_path, 'node_path'),
-    home_directory: bootstrapPath(value.home_directory, 'home_directory'),
-    platform: value.platform,
-    running_as_root: value.running_as_root,
-    provider_capability_digest: (() => {
-      try {
-        return assertProviderProvisioningCapabilityDigest(value.provider_capability_digest);
-      } catch {
-        throw new GwsEaError('invalid_bootstrap_manifest', 'provider_capability_digest is invalid');
-      }
-    })(),
+    onecli_cli_path: requirePath(manifest.onecli_cli_path, 'onecli_cli_path', INVALID_BOOTSTRAP),
+    node_path: requirePath(manifest.node_path, 'node_path', INVALID_BOOTSTRAP),
+    home_directory: requirePath(manifest.home_directory, 'home_directory', INVALID_BOOTSTRAP),
+    platform: manifest.platform,
+    running_as_root: manifest.running_as_root,
+    docker_endpoint: requireDockerEndpoint(manifest.docker_endpoint, 'docker_endpoint', INVALID_BOOTSTRAP),
+    provider_capability_digest: providerCapabilityDigest,
     provider: {
       id: bootstrapString(provider.id, 'provider id', 64),
       name: bootstrapString(provider.name, 'provider name', 256),
@@ -1325,21 +1262,14 @@ export function validateProductionBootstrapManifest(value: unknown): ProductionB
       principal_timezone: bootstrapString(identity.principal_timezone, 'principal timezone', 128),
     },
     selected_messaging_group_id:
-      selected === null ? null : bootstrapString(selected, 'selected messaging group ID', 512),
+      selected === null || selected === undefined
+        ? null
+        : bootstrapString(selected, 'selected messaging group ID', 512),
   };
 }
 
 export async function loadProductionBootstrapManifest(file: string): Promise<ProductionBootstrapManifest> {
-  let value: unknown;
-  try {
-    value = JSON.parse(await readOwnerOnlyFile(file)) as unknown;
-  } catch (error) {
-    if (error instanceof SyntaxError) {
-      throw new GwsEaError('invalid_bootstrap_manifest', 'Bootstrap manifest is not valid JSON');
-    }
-    throw error;
-  }
-  return validateProductionBootstrapManifest(value);
+  return validateProductionBootstrapManifest(await readOwnerOnlyJson(file, 'Bootstrap manifest', INVALID_BOOTSTRAP));
 }
 
 function bootstrapProviderCredential(manifest: ProductionBootstrapManifest): ProviderCredentialMetadata {
@@ -1363,7 +1293,7 @@ export async function installProductionBootstrapManifest(
 ): Promise<void> {
   assertInstanceId(instanceId);
   const manifest = validateProductionBootstrapManifest(input);
-  await preparePrivateLocalDirectory(paths.instancesRoot);
+  await preparePrivateDirectory(paths.instancesRoot);
   try {
     await mkdir(paths.instanceRoot(instanceId), { mode: 0o700 });
   } catch (error) {
@@ -1433,10 +1363,42 @@ function hydrateMainState(profile: PersistedProfileIdentity | undefined): Produc
   return { mainAgentGroupId: profile.main_agent_group_id };
 }
 
+interface InstanceState {
+  /** The temporary bootstrap input, until main is published. */
+  readonly manifest?: ProductionBootstrapManifest;
+  /** The persisted runtime, once the host was first started. */
+  readonly runtime?: InstanceRuntimeConfig;
+}
+
+async function readInstanceState(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<InstanceState> {
+  const absent = (error: unknown): undefined => {
+    if (isErrno(error, 'ENOENT')) return undefined;
+    throw error;
+  };
+  const [manifest, runtime] = await Promise.all([
+    loadProductionBootstrapManifest(paths.bootstrapFile(reservation.instance_id)).catch(absent),
+    loadInstanceRuntimeConfig(path.join(reservation.checkout_realpath, 'data', 'gws-ea', 'runtime.json')).catch(absent),
+  ]);
+  return { ...(manifest ? { manifest } : {}), ...(runtime ? { runtime } : {}) };
+}
+
+/**
+ * The Docker endpoint create recorded for this instance: the runtime's once
+ * the host has started, the bootstrap manifest's before. Once recorded,
+ * resume probes it rather than re-resolving the active context (KTD3).
+ */
+export async function recordedDockerEndpoint(
+  paths: ControlPlanePaths,
+  reservation: InstanceReservation,
+): Promise<string | undefined> {
+  const { manifest, runtime } = await readInstanceState(paths, reservation);
+  return runtime?.docker_endpoint ?? manifest?.docker_endpoint;
+}
+
 /** Build the production context from temporary bootstrap input or authoritative instance state. */
 export async function runProductionProvision(
   operation: InstanceOperation,
-  options: ProductionProvisionOptions = {},
+  options: ProductionProvisionOptions,
 ): Promise<ProvisionResult> {
   const { interaction, managedIngress } = options;
   const provisionRuntime = options.runtime ?? {};
@@ -1454,18 +1416,12 @@ export async function runProductionProvision(
     throw new GwsEaError('principal_selection_mismatch', 'The principal selection is already fixed for this instance');
   }
   const reservation = await getInstanceReservation(operation.paths, operation.instanceId);
-  let manifest: ProductionBootstrapManifest | undefined;
-  try {
-    manifest = await loadProductionBootstrapManifest(operation.paths.bootstrapFile(operation.instanceId));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-  }
-  const runtimeFile = path.join(reservation.checkout_realpath, 'data', 'gws-ea', 'runtime.json');
+  const { manifest, runtime: persistedRuntime } = await readInstanceState(operation.paths, reservation);
   let runtime: InstanceRuntimeConfig;
-  try {
-    runtime = await loadInstanceRuntimeConfig(runtimeFile);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || !manifest) throw error;
+  if (persistedRuntime) {
+    runtime = persistedRuntime;
+  } else {
+    if (!manifest) throw new GwsEaError('bootstrap_required', 'The temporary bootstrap manifest is missing');
     const onecli = createOnecliRuntimeLayout({
       instanceId: reservation.instance_id,
       instanceRoot: operation.paths.instanceRoot(reservation.instance_id),
@@ -1478,6 +1434,7 @@ export async function runProductionProvision(
       nodePath: manifest.node_path,
       homeDirectory: manifest.home_directory,
       selectedProvider: manifest.provider.id,
+      dockerEndpoint: manifest.docker_endpoint,
     });
   }
   const onecli = createOnecliRuntimeLayout({
@@ -1568,6 +1525,7 @@ export async function runProductionProvision(
       ...(selectedPrincipal ? { selectedPrincipal } : {}),
       bootstrapManifestFile: operation.paths.bootstrapFile(operation.instanceId),
       serviceDependencies: {
+        upsertEnvVars: options.upsertEnvVars,
         platform: manifest?.platform ?? (process.platform === 'darwin' ? 'macos' : 'linux'),
         homeDirectory: runtime.home_directory,
         runningAsRoot: manifest?.running_as_root ?? process.getuid?.() === 0,

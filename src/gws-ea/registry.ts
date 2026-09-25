@@ -8,11 +8,11 @@ import { deriveGchatServiceAccountEmail, GCP_PROJECT_PATTERN } from './gcp-ident
 import { validateExistingGchatEndpoint } from './endpoint.js';
 import { createProvisionJournal, discardProvisionJournal } from './journal.js';
 import {
-  assertLocalOwnedDestination,
-  assertOwnedLocalDirectory,
-  assertPrivateLocalDirectory,
+  assertOwnedDestination,
+  assertOwnedDirectory,
+  assertPrivateDirectory,
   assertPrivateStateFile,
-  preparePrivateLocalDirectory,
+  preparePrivateDirectory,
   type ControlPlanePaths,
 } from './paths.js';
 import {
@@ -30,7 +30,7 @@ import {
   type SharedCloudflareMetadata,
   type SharedInfrastructureMetadata,
 } from './types.js';
-import { hasControlCharacters, isRecord } from './validation.js';
+import { isRecord, parseJson, requireString as requireText } from './validation.js';
 
 const INSTANCE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const RELEASE_TRACK_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
@@ -42,19 +42,9 @@ const DNS_LABEL = '[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?';
 const DNS_NAME_PATTERN = new RegExp(`^(?:${DNS_LABEL}\\.)+${DNS_LABEL}$`);
 const TUNNEL_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-function assertExactKeys(value: Record<string, unknown>, expected: readonly string[], label: string): void {
-  const actual = Object.keys(value).sort();
-  const wanted = [...expected].sort();
-  if (actual.length !== wanted.length || actual.some((key, index) => key !== wanted[index])) {
-    throw new GwsEaError('invalid_state', `${label} contains unknown or missing fields`);
-  }
-}
-
-function requireString(value: unknown, label: string, maxLength = 2048): string {
-  if (typeof value !== 'string' || value.length === 0 || value.length > maxLength || hasControlCharacters(value)) {
-    throw new GwsEaError('invalid_state', `${label} is invalid`);
-  }
-  return value;
+/** Readers keep every ownership value exact and ignore fields they do not use (R14). */
+function requireString(value: unknown, label: string, maxLength?: number): string {
+  return requireText(value, label, 'invalid_state', maxLength);
 }
 
 export function assertInstanceId(value: string): void {
@@ -74,7 +64,6 @@ function validatePort(value: unknown, label: string): number {
 
 function validatePorts(value: unknown): AllocatedPorts {
   if (!isRecord(value)) throw new GwsEaError('invalid_claim', 'allocated_ports is invalid');
-  assertExactKeys(value, ['nanoclaw_webhook', 'onecli_app', 'onecli_gateway'], 'allocated_ports');
   const ports = {
     nanoclaw_webhook: validatePort(value.nanoclaw_webhook, 'nanoclaw_webhook'),
     onecli_app: validatePort(value.onecli_app, 'onecli_app'),
@@ -107,17 +96,11 @@ function requireCloudflareId(value: unknown, label: string): string {
 function validateIngress(value: unknown): IngressClaim {
   if (!isRecord(value)) throw new GwsEaError('invalid_claim', 'ingress is invalid');
   if (value.mode === 'existing') {
-    assertExactKeys(value, ['mode', 'endpoint_url'], 'existing ingress');
     return { mode: 'existing', endpoint_url: validateEndpoint(value.endpoint_url) };
   }
   if (value.mode !== 'managed-cloudflare') {
     throw new GwsEaError('invalid_claim', 'Ingress mode is invalid');
   }
-  assertExactKeys(
-    value,
-    ['mode', 'account_id', 'zone_id', 'zone_name', 'hostname', 'callback_url', 'dns_record_id'],
-    'managed Cloudflare ingress',
-  );
   const accountId = requireCloudflareId(value.account_id, 'Cloudflare account ID');
   const zoneId = requireCloudflareId(value.zone_id, 'Cloudflare zone ID');
   const zoneName = requireString(value.zone_name, 'Cloudflare zone name', 253);
@@ -167,11 +150,6 @@ function validateSourceRemote(value: unknown): string {
 
 function validateClaims(value: unknown): ExclusiveResourceClaims {
   if (!isRecord(value)) throw new GwsEaError('invalid_claim', 'exclusive_resource_claims is invalid');
-  assertExactKeys(
-    value,
-    ['ingress', 'gcp_project_id', 'gcp_account', 'gchat_service_account', 'workspace_email', 'onecli_project'],
-    'exclusive_resource_claims',
-  );
   const gcpProject = requireString(value.gcp_project_id, 'gcp_project_id', 30).toLowerCase();
   if (!GCP_PROJECT_PATTERN.test(gcpProject)) throw new GwsEaError('invalid_claim', 'GCP project ID is invalid');
   const gcpAccount = requireString(value.gcp_account, 'gcp_account', 320).toLowerCase();
@@ -199,7 +177,6 @@ function validateClaims(value: unknown): ExclusiveResourceClaims {
 function validateSharedCloudflare(value: unknown): SharedCloudflareMetadata | null {
   if (value === null) return null;
   if (!isRecord(value)) throw new GwsEaError('invalid_registry', 'Shared Cloudflare metadata is invalid');
-  assertExactKeys(value, ['ownership_id', 'account_id', 'tunnel_name', 'tunnel_id'], 'Shared Cloudflare metadata');
   const ownershipId = requireString(value.ownership_id, 'Cloudflare ownership ID', 36);
   assertInstanceId(ownershipId);
   const accountId = requireCloudflareId(value.account_id, 'Cloudflare account ID');
@@ -224,25 +201,11 @@ function validateSharedCloudflare(value: unknown): SharedCloudflareMetadata | nu
 
 function validateSharedInfrastructure(value: unknown): SharedInfrastructureMetadata {
   if (!isRecord(value)) throw new GwsEaError('invalid_registry', 'Shared infrastructure metadata is invalid');
-  assertExactKeys(value, ['cloudflare'], 'Shared infrastructure metadata');
   return { cloudflare: validateSharedCloudflare(value.cloudflare) };
 }
 
 export function validateReservation(value: unknown, paths: ControlPlanePaths): InstanceReservation {
   if (!isRecord(value)) throw new GwsEaError('invalid_state', 'Instance reservation is invalid');
-  assertExactKeys(
-    value,
-    [
-      'instance_id',
-      'checkout_realpath',
-      'release_track',
-      'source_remote',
-      'deployed_commit',
-      'allocated_ports',
-      'exclusive_resource_claims',
-    ],
-    'Instance reservation',
-  );
   const instanceId = requireString(value.instance_id, 'instance_id', 36);
   assertInstanceId(instanceId);
   const checkout = requireString(value.checkout_realpath, 'checkout_realpath');
@@ -267,7 +230,6 @@ export function validateReservation(value: unknown, paths: ControlPlanePaths): I
 
 function validateRegistry(value: unknown, paths: ControlPlanePaths): InstanceRegistry {
   if (!isRecord(value)) throw new GwsEaError('invalid_registry', 'Machine registry is invalid');
-  assertExactKeys(value, ['schema_version', 'instances', 'shared_infrastructure_metadata'], 'Machine registry');
   if (value.schema_version !== REGISTRY_SCHEMA_VERSION) {
     throw new GwsEaError('unsupported_registry', 'Machine registry schema version is unsupported');
   }
@@ -325,15 +287,13 @@ export async function activeRemovalInstanceIds(
   registry: InstanceRegistry,
 ): Promise<readonly string[]> {
   try {
-    await assertPrivateLocalDirectory(paths.removalRoot);
+    await assertPrivateDirectory(paths.removalRoot);
     const entries = await readdir(paths.removalRoot, { withFileTypes: true });
     const active: string[] = [];
     for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith('.json')) {
-        throw new GwsEaError('invalid_removal', 'Removal state contains an unexpected entry');
-      }
-      const instanceId = entry.name.slice(0, -'.json'.length);
-      assertInstanceId(instanceId);
+      // Only `<instance id>.json` is a receipt; `.DS_Store` or a leftover `.tmp` is not.
+      const instanceId = entry.name.endsWith('.json') ? entry.name.slice(0, -'.json'.length) : '';
+      if (!INSTANCE_ID_PATTERN.test(instanceId)) continue;
       await assertPrivateStateFile(path.join(paths.removalRoot, entry.name));
       if (registry.instances[instanceId]) active.push(instanceId);
     }
@@ -346,7 +306,7 @@ export async function activeRemovalInstanceIds(
 
 export async function readRegistry(paths: ControlPlanePaths): Promise<InstanceRegistry> {
   try {
-    await assertPrivateLocalDirectory(paths.configRoot);
+    await assertPrivateDirectory(paths.configRoot);
   } catch (error) {
     if (isErrno(error, 'ENOENT')) return emptyRegistry();
     throw error;
@@ -416,7 +376,7 @@ function assertNoClaimCollisions(instances: readonly InstanceReservation[]): voi
 }
 
 async function acquireMachineLock(paths: ControlPlanePaths): Promise<() => void> {
-  await preparePrivateLocalDirectory(paths.configRoot);
+  await preparePrivateDirectory(paths.configRoot);
   const deadline = Date.now() + 5_000;
   do {
     const release = await processLock(paths.registryLock);
@@ -522,7 +482,7 @@ export async function reserveInstance(
   input: InstanceReservationInput,
 ): Promise<InstanceReservation> {
   const validated = validateReservation(input, paths);
-  await assertLocalOwnedDestination(validated.checkout_realpath);
+  await assertOwnedDestination(validated.checkout_realpath);
   const release = await acquireMachineLock(paths);
   try {
     const registry = await readRegistryFile(paths);
@@ -603,7 +563,6 @@ export async function releaseInstanceReservation(
 
 function validateMarker(value: unknown): InstanceMarker {
   if (!isRecord(value)) throw new GwsEaError('invalid_marker', 'Instance marker is invalid');
-  assertExactKeys(value, ['schema_version', 'instance_id', 'deployed_commit'], 'Instance marker');
   if (value.schema_version !== INSTANCE_MARKER_SCHEMA_VERSION) {
     throw new GwsEaError('unsupported_marker', 'Instance marker schema version is unsupported');
   }
@@ -616,11 +575,11 @@ function validateMarker(value: unknown): InstanceMarker {
   return { schema_version: INSTANCE_MARKER_SCHEMA_VERSION, instance_id: instanceId, deployed_commit: deployedCommit };
 }
 
-async function readMarker(paths: ControlPlanePaths, instanceId: string): Promise<InstanceMarker> {
-  const file = paths.markerFile(instanceId);
+/** Read a checkout's instance marker; a missing file raises `marker_missing`. */
+export async function readInstanceMarkerFile(file: string): Promise<InstanceMarker> {
   try {
     await assertPrivateStateFile(file);
-    return validateMarker(JSON.parse(await readFile(file, 'utf8')) as unknown);
+    return validateMarker(parseJson(await readFile(file, 'utf8'), 'Instance marker', 'invalid_marker'));
   } catch (error) {
     if (isErrno(error, 'ENOENT')) throw new GwsEaError('marker_missing', 'Instance marker is missing');
     if (error instanceof GwsEaError) throw error;
@@ -633,8 +592,8 @@ export async function assertRegistryMarkerAgreement(
   instanceId: string,
 ): Promise<InstanceReservation> {
   const reservation = await getInstanceReservation(paths, instanceId);
-  await assertOwnedLocalDirectory(reservation.checkout_realpath);
-  const marker = await readMarker(paths, instanceId);
+  await assertOwnedDirectory(reservation.checkout_realpath);
+  const marker = await readInstanceMarkerFile(paths.markerFile(instanceId));
   if (marker.instance_id !== instanceId || marker.deployed_commit !== reservation.deployed_commit) {
     throw new GwsEaError('marker_mismatch', 'Instance marker mismatch; refusing mutation');
   }
@@ -643,9 +602,9 @@ export async function assertRegistryMarkerAgreement(
 
 export async function writeInstanceMarker(paths: ControlPlanePaths, instanceId: string): Promise<void> {
   const reservation = await getInstanceReservation(paths, instanceId);
-  await assertOwnedLocalDirectory(reservation.checkout_realpath);
+  await assertOwnedDirectory(reservation.checkout_realpath);
   try {
-    const existing = await readMarker(paths, instanceId);
+    const existing = await readInstanceMarkerFile(paths.markerFile(instanceId));
     if (existing.instance_id !== instanceId) {
       throw new GwsEaError('marker_mismatch', 'Instance marker mismatch; refusing mutation');
     }
@@ -653,7 +612,7 @@ export async function writeInstanceMarker(paths: ControlPlanePaths, instanceId: 
   } catch (error) {
     if (!(error instanceof GwsEaError) || error.code !== 'marker_missing') throw error;
   }
-  await preparePrivateLocalDirectory(path.dirname(paths.markerFile(instanceId)));
+  await preparePrivateDirectory(path.dirname(paths.markerFile(instanceId)));
   await writePrivate(paths.markerFile(instanceId), {
     schema_version: INSTANCE_MARKER_SCHEMA_VERSION,
     instance_id: instanceId,

@@ -39,6 +39,7 @@ async function instanceWithNcl(script: string): Promise<InstanceRuntimeConfig> {
     onecli_cli_path: '/opt/onecli',
     selected_provider: 'claude',
     endpoint_url: 'https://aya.example.test/webhook/gchat',
+    docker_endpoint: 'unix:///var/run/docker.sock',
     secret_files: {
       gchat_credentials: path.join(secrets, 'gchat-service-account.json'),
       onecli_runtime_api_key: path.join(secrets, 'onecli-runtime-api-key'),

@@ -10,7 +10,7 @@ import type { CreatePromptContext } from './create-input.js';
 import { runStep, withPendingAction, type Interaction } from './events.js';
 import { acquireInstanceOperation } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
-import { ONECLI_CLI_VERSION } from './onecli-compose.js';
+import { ONECLI_CLI_VERSION } from './pins.js';
 import type { ProvisionHumanPause } from './phases.js';
 import {
   checkPrerequisites,
@@ -19,6 +19,7 @@ import {
   type Prerequisites,
 } from './prerequisites.js';
 import { runSanitizedCommand } from './process.js';
+import { installProductionBootstrapManifest } from './provision.js';
 import { allocateInstanceId, readRegistry, reserveInstance } from './registry.js';
 import { DOGFOOD_SOURCE_FILE, GWS_EA_RELEASE_REMOTE } from './release-tracks.js';
 import { activeStep } from './run-log.js';
@@ -78,6 +79,7 @@ function setupAnswers() {
       home_directory: '/Users/operator',
       platform: process.platform === 'darwin' ? 'macos' : 'linux',
       running_as_root: false,
+      docker_endpoint: 'unix:///var/run/docker.sock',
       provider_capability_digest: 'd'.repeat(64),
       provider: {
         id: 'claude',
@@ -606,6 +608,8 @@ function hostDependencies(
     resolvePersisted: async (command) => (command === 'onecli' ? '/usr/local/bin/onecli' : process.execPath),
     node: { version: 'v22.20.0', execPath: process.execPath, execve: neverCalled },
     platform: 'linux',
+    // Never the operator's real NanoClaw mount allowlist.
+    mountAllowlistFile: path.join(os.tmpdir(), `gws-ea-cli-no-allowlist-${process.pid}`, 'mount-allowlist.json'),
   };
 }
 
@@ -720,9 +724,7 @@ describe('gws-ea prerequisites', () => {
       ),
     ).toBe(10);
 
-    expect(requests).toEqual([
-      { command: 'create', instancesRoot: paths.instancesRoot, account: 'owner@example.test' },
-    ]);
+    expect(requests).toEqual([{ command: 'create', paths, account: 'owner@example.test' }]);
     expect(contexts[0]?.prerequisites).toBe(confirmed);
     const [reserved] = Object.values((await readRegistry(paths)).instances);
     expect(reserved?.exclusive_resource_claims.gcp_account).toBe('owner@example.test');
@@ -770,8 +772,36 @@ describe('gws-ea prerequisites', () => {
       advanceProvision: async () => ({ status: 'paused', pause: DM_PAUSE }),
     });
 
+    expect(requests).toEqual([{ command: 'resume', paths, account: 'operator@example.test' }]);
+  });
+
+  it('probes the Docker endpoint create recorded when resume checks prerequisites', async () => {
+    const paths = await testPaths();
+    const input = reservation(paths);
+    await installProductionBootstrapManifest(paths, input.instance_id, {
+      ...setupAnswers().bootstrapManifest,
+      docker_endpoint: 'unix:///Users/operator/.docker/run/docker.sock',
+    });
+    await reserveInstance(paths, input);
+    const requests: PrerequisiteRequest[] = [];
+
+    await runCli(['resume', '--id', input.instance_id], {
+      paths,
+      ...lines().runtime,
+      checkPrerequisites: async (request) => {
+        requests.push(request);
+        return PREREQUISITES;
+      },
+      advanceProvision: async () => ({ status: 'paused', pause: DM_PAUSE }),
+    });
+
     expect(requests).toEqual([
-      { command: 'resume', instancesRoot: paths.instancesRoot, account: 'operator@example.test' },
+      {
+        command: 'resume',
+        paths,
+        account: 'operator@example.test',
+        dockerEndpoint: 'unix:///Users/operator/.docker/run/docker.sock',
+      },
     ]);
   });
 });

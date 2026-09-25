@@ -1,11 +1,10 @@
-import { createRequire } from 'node:module';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { stringify } from 'yaml';
 
 import { isErrno } from '../community-portal/errors.js';
-import { assertPrivateLocalDirectory, preparePrivateLocalDirectory } from './paths.js';
+import { assertPrivateDirectory, preparePrivateDirectory } from './paths.js';
 import {
   buildToolEnvironment,
   runSanitizedCommand,
@@ -14,11 +13,9 @@ import {
 } from './process.js';
 import { readOwnerOnlyFile, writeOwnerOnlyFileExclusive, writePrivateTextFile } from './secrets.js';
 import { GwsEaError } from './types.js';
-import { hasControlCharacters, isRecord } from './validation.js';
+import { CLOUDFLARED_IMAGE } from './pins.js';
+import { hasControlCharacters, isRecord, optionalString, parseJson, requireRecord, stringField } from './validation.js';
 
-const require = createRequire(import.meta.url);
-const versionPins: unknown = require('../../versions.json');
-const CLOUDFLARED_IMAGE_PATTERN = /^cloudflare\/cloudflared:(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)@sha256:[0-9a-f]{64}$/u;
 const CONNECTOR_COMMAND = ['tunnel', '--no-autoupdate', 'run', '--token-file', '/run/secrets/tunnel_token'] as const;
 const CONNECTOR_TOKEN_DESTINATION = '/run/secrets/tunnel_token';
 const CONNECTOR_PROJECT = 'gws-ea-cloudflare';
@@ -33,23 +30,6 @@ const EXPECTED_IMAGE_ENVIRONMENT = [
 
 export const CLOUDFLARE_CONNECTOR_OWNER_LABEL = 'dev.gws-ea.resource-owner' as const;
 export const CLOUDFLARE_CONNECTOR_ROLE_LABEL = 'dev.gws-ea.cloudflare-role' as const;
-
-function record(value: unknown, label: string): Record<string, unknown> {
-  if (!isRecord(value)) throw new GwsEaError('invalid_connector_pin', `${label} must be an object`);
-  return value;
-}
-
-export function validateCloudflaredImagePin(value: unknown): string {
-  if (typeof value !== 'string' || !CLOUDFLARED_IMAGE_PATTERN.test(value)) {
-    throw new GwsEaError(
-      'invalid_release_pin',
-      'cloudflared must be pinned to an exact version and immutable sha256 manifest digest',
-    );
-  }
-  return value;
-}
-
-export const CLOUDFLARED_IMAGE = validateCloudflaredImagePin(record(versionPins, 'versions.json').cloudflared);
 
 export type CloudflareConnectorPlatform = 'macos' | 'linux';
 
@@ -225,8 +205,8 @@ async function writeOrVerifyConnectorToken(file: string, token: string): Promise
 
 export async function prepareCloudflareConnector(layout: CloudflareConnectorLayout, tokenInput: string): Promise<void> {
   const token = assertConnectorToken(tokenInput);
-  await preparePrivateLocalDirectory(layout.rootDirectory);
-  await preparePrivateLocalDirectory(layout.secretsDirectory);
+  await preparePrivateDirectory(layout.rootDirectory);
+  await preparePrivateDirectory(layout.secretsDirectory);
   await writeOrVerifyConnectorToken(layout.tokenFile, token);
   await writePrivateTextFile(layout.composeFile, renderCloudflareConnectorCompose(layout));
   await writePrivateTextFile(layout.envFile, CONNECTOR_ENV_FILE);
@@ -234,8 +214,8 @@ export async function prepareCloudflareConnector(layout: CloudflareConnectorLayo
 
 export async function validateCloudflareConnectorState(layout: CloudflareConnectorLayout): Promise<void> {
   try {
-    await assertPrivateLocalDirectory(layout.rootDirectory);
-    await assertPrivateLocalDirectory(layout.secretsDirectory);
+    await assertPrivateDirectory(layout.rootDirectory);
+    await assertPrivateDirectory(layout.secretsDirectory);
     assertConnectorToken(await readOwnerOnlyFile(layout.tokenFile));
     if ((await readOwnerOnlyFile(layout.composeFile)) !== renderCloudflareConnectorCompose(layout)) {
       throw new GwsEaError('cloudflare_connector_state_drift', 'Cloudflare connector Compose state has drifted');
@@ -323,7 +303,7 @@ export async function reconcileCloudflareConnector(
 ): Promise<ObservedCloudflareConnector> {
   const runner = dependencies.runCommand ?? runSanitizedCommand;
   const environment = connectorEnvironment(dependencies.ambientEnv);
-  await preparePrivateLocalDirectory(layout.rootDirectory);
+  await preparePrivateDirectory(layout.rootDirectory);
   const before = await inspectCloudflareConnector(layout, runner, environment);
   if (before !== undefined) validateObservedCloudflareConnector(layout, before, { requireRunning: false });
   await prepareCloudflareConnector(layout, token);
@@ -402,23 +382,10 @@ export async function inspectCloudflareConnector(
   return parseObservedConnector(result.stdout);
 }
 
-function requireObject(value: unknown, key: string, label: string): Record<string, unknown> {
-  if (!isRecord(value)) throw new GwsEaError('invalid_connector_runtime', `${label} is invalid`);
-  const nested = value[key];
-  if (!isRecord(nested)) throw new GwsEaError('invalid_connector_runtime', `${label} is invalid`);
-  return nested;
-}
+const INVALID_CONNECTOR = 'invalid_connector_runtime';
 
-function requireString(value: Record<string, unknown>, key: string, label: string): string {
-  const result = value[key];
-  if (typeof result !== 'string' || !result) {
-    throw new GwsEaError('invalid_connector_runtime', `${label} is missing ${key}`);
-  }
-  return result;
-}
-
-function optionalString(value: Record<string, unknown>, key: string): string | undefined {
-  return typeof value[key] === 'string' ? value[key] : undefined;
+function field(value: Record<string, unknown>, key: string, label: string): string {
+  return stringField(value, key, label, INVALID_CONNECTOR);
 }
 
 function stringArray(value: unknown, label: string): readonly string[] {
@@ -430,21 +397,16 @@ function stringArray(value: unknown, label: string): readonly string[] {
 }
 
 function parseObservedConnector(source: string): ObservedCloudflareConnector {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(source) as unknown;
-  } catch {
-    throw new GwsEaError('invalid_connector_runtime', 'Docker connector inspection is not valid JSON');
-  }
+  const parsed = parseJson(source, 'Docker connector inspection', INVALID_CONNECTOR);
   if (!Array.isArray(parsed) || parsed.length !== 1 || !isRecord(parsed[0])) {
     throw new GwsEaError('invalid_connector_runtime', 'Docker connector inspection is invalid');
   }
   const value = parsed[0];
-  const config = requireObject(value, 'Config', 'Docker connector config');
-  const labels = requireObject(config, 'Labels', 'Docker connector labels');
-  const state = requireObject(value, 'State', 'Docker connector state');
-  const hostConfig = requireObject(value, 'HostConfig', 'Docker connector host config');
-  const restartPolicy = requireObject(hostConfig, 'RestartPolicy', 'Docker connector restart policy');
+  const config = requireRecord(value.Config, 'Docker connector config', INVALID_CONNECTOR);
+  const labels = requireRecord(config.Labels, 'Docker connector labels', INVALID_CONNECTOR);
+  const state = requireRecord(value.State, 'Docker connector state', INVALID_CONNECTOR);
+  const hostConfig = requireRecord(value.HostConfig, 'Docker connector host config', INVALID_CONNECTOR);
+  const restartPolicy = requireRecord(hostConfig.RestartPolicy, 'Docker connector restart policy', INVALID_CONNECTOR);
   const mountsRaw = value.Mounts;
   if (!Array.isArray(mountsRaw) || !mountsRaw.every(isRecord)) {
     throw new GwsEaError('invalid_connector_runtime', 'Docker connector mounts are invalid');
@@ -456,28 +418,28 @@ function parseObservedConnector(source: string): ObservedCloudflareConnector {
     throw new GwsEaError('invalid_connector_runtime', 'Docker connector port bindings are invalid');
   }
   return {
-    id: requireString(value, 'Id', 'Docker connector'),
-    service: requireString(labels, 'com.docker.compose.service', 'Docker connector labels'),
-    project: requireString(labels, 'com.docker.compose.project', 'Docker connector labels'),
-    owner: optionalString(labels, CLOUDFLARE_CONNECTOR_OWNER_LABEL),
-    role: optionalString(labels, CLOUDFLARE_CONNECTOR_ROLE_LABEL),
-    image: requireString(config, 'Image', 'Docker connector config'),
-    user: requireString(config, 'User', 'Docker connector config'),
+    id: field(value, 'Id', 'Docker connector'),
+    service: field(labels, 'com.docker.compose.service', 'Docker connector label'),
+    project: field(labels, 'com.docker.compose.project', 'Docker connector label'),
+    owner: optionalString(labels[CLOUDFLARE_CONNECTOR_OWNER_LABEL]),
+    role: optionalString(labels[CLOUDFLARE_CONNECTOR_ROLE_LABEL]),
+    image: field(config, 'Image', 'Docker connector config'),
+    user: field(config, 'User', 'Docker connector config'),
     command: stringArray(config.Cmd, 'Docker connector command'),
     environment: stringArray(config.Env, 'Docker connector environment'),
     running: state.Running === true,
     restarting: state.Restarting === true,
-    restartPolicy: requireString(restartPolicy, 'Name', 'Docker connector restart policy'),
+    restartPolicy: field(restartPolicy, 'Name', 'Docker connector restart policy'),
     readOnlyRootFilesystem: hostConfig.ReadonlyRootfs === true,
     privileged: hostConfig.Privileged === true,
     capabilitiesDropped: stringArray(hostConfig.CapDrop, 'Docker connector dropped capabilities'),
     securityOptions: stringArray(hostConfig.SecurityOpt, 'Docker connector security options'),
-    networkMode: requireString(hostConfig, 'NetworkMode', 'Docker connector network mode'),
+    networkMode: field(hostConfig, 'NetworkMode', 'Docker connector host config'),
     extraHosts: stringArray(hostConfig.ExtraHosts, 'Docker connector extra hosts'),
     mounts: mountsRaw.map((mount) => ({
-      type: requireString(mount, 'Type', 'Docker connector mount'),
-      source: requireString(mount, 'Source', 'Docker connector mount'),
-      destination: requireString(mount, 'Destination', 'Docker connector mount'),
+      type: field(mount, 'Type', 'Docker connector mount'),
+      source: field(mount, 'Source', 'Docker connector mount'),
+      destination: field(mount, 'Destination', 'Docker connector mount'),
       readOnly: mount.RW === false,
     })),
     tmpfs: Object.keys(tmpfs),

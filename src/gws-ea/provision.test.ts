@@ -31,16 +31,17 @@ import {
 } from './provision.js';
 import type { MainIdentityDependencies } from './identity.js';
 import { reserveInstance } from './registry.js';
-import {
-  createOnecliRuntimeLayout,
-  ONECLI_CLI_VERSION,
-  ONECLI_GATEWAY_VERSION,
-  ONECLI_SDK_VERSION,
-} from './onecli-compose.js';
+import { createOnecliRuntimeLayout } from './onecli-compose.js';
+import { ONECLI_CLI_VERSION, ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './pins.js';
 import type { ObservedOnecliRuntime, OnecliCompatibilityReceipt } from './onecli.js';
 import { holdLoopbackPorts } from './ports.js';
 import { startRunLog, type RunLog } from './run-log.js';
-import { createInstanceRuntimeConfig, googleChatProjectNumberFile, persistInstanceRuntime } from './service.js';
+import {
+  createInstanceRuntimeConfig,
+  googleChatProjectNumberFile,
+  persistInstanceRuntime,
+  type UpsertEnvVars,
+} from './service.js';
 import type { CloudflareApi } from './cloudflare-api.js';
 import type { ObservedCloudflareConnector } from './cloudflare-connector.js';
 import {
@@ -157,6 +158,7 @@ function bootstrapManifest(paths: ControlPlanePaths): ProductionBootstrapManifes
     home_directory: path.dirname(paths.stateRoot),
     platform: process.platform === 'darwin' ? 'macos' : 'linux',
     running_as_root: false,
+    docker_endpoint: 'unix:///var/run/docker.sock',
     provider_capability_digest: providerCapabilityDigest,
     provider: {
       id: 'claude',
@@ -630,8 +632,11 @@ describe('step engine', () => {
   });
 });
 
+/** The driver injects upstream's `.env` writer; these tests only need the owned keys it receives. */
+const recordEnv: UpsertEnvVars = () => undefined;
+
 describe('production bootstrap trust boundary', () => {
-  it('rejects caller-authored principal eligibility timestamps', async () => {
+  it('ignores caller-authored principal eligibility timestamps and other unknown fields', async () => {
     const paths = await testPaths();
     const file = path.join(path.dirname(paths.configRoot), 'setup.json');
     await writeFile(
@@ -640,7 +645,20 @@ describe('production bootstrap trust boundary', () => {
       { mode: 0o600 },
     );
 
-    await expect(loadProductionBootstrapManifest(file)).rejects.toThrow(/unknown or missing fields/i);
+    await expect(loadProductionBootstrapManifest(file)).resolves.toEqual(bootstrapManifest(paths));
+  });
+
+  it('refuses a bootstrap manifest without a local Docker endpoint', async () => {
+    const paths = await testPaths();
+    const file = path.join(path.dirname(paths.configRoot), 'setup.json');
+    await writeFile(file, JSON.stringify({ ...bootstrapManifest(paths), docker_endpoint: 'tcp://192.0.2.10:2376' }), {
+      mode: 0o600,
+    });
+
+    await expect(loadProductionBootstrapManifest(file)).rejects.toMatchObject({
+      code: 'invalid_bootstrap_manifest',
+      message: expect.stringContaining('docker_endpoint'),
+    });
   });
 
   it('stages and removes only the validated bootstrap file before reservation publication', async () => {
@@ -655,7 +673,8 @@ describe('production bootstrap trust boundary', () => {
     await expect(readFile(paths.instanceRoot(input.instance_id), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('treats a database created before the profile migration as unpublished', async () => {
+  /** A reserved instance whose host started once: runtime and receipt persisted, bootstrap manifest gone. */
+  async function startedInstance(receiptCohort: { gateway: string; cli: string; sdk: string }) {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
     const onecli = createOnecliRuntimeLayout({
@@ -670,8 +689,9 @@ describe('production bootstrap trust boundary', () => {
       nodePath: process.execPath,
       homeDirectory: path.dirname(paths.stateRoot),
       selectedProvider: 'claude',
+      dockerEndpoint: 'unix:///var/run/docker.sock',
     });
-    await persistInstanceRuntime(runtime);
+    await persistInstanceRuntime(runtime, recordEnv);
     await writeFile(
       paths.releasePreflightFile(reserved.instance_id),
       `${JSON.stringify({
@@ -687,19 +707,38 @@ describe('production bootstrap trust boundary', () => {
           headerName: 'x-api-key',
         },
         packageManager: 'pnpm@10.0.0',
-        onecli: {
-          gateway: ONECLI_GATEWAY_VERSION,
-          cli: ONECLI_CLI_VERSION,
-          sdk: ONECLI_SDK_VERSION,
-        },
+        onecli: receiptCohort,
+        recorded_by: 'a launcher with other fields',
       })}\n`,
       { mode: 0o600 },
     );
     await mkdir(path.join(reserved.checkout_realpath, 'data'), { recursive: true });
     new Database(path.join(reserved.checkout_realpath, 'data', 'v2.db')).close();
+    return { paths, reserved };
+  }
+
+  it('treats a database created before the profile migration as unpublished', async () => {
+    const { paths, reserved } = await startedInstance({
+      gateway: ONECLI_GATEWAY_VERSION,
+      cli: ONECLI_CLI_VERSION,
+      sdk: ONECLI_SDK_VERSION,
+    });
 
     await expect(
-      withInstanceOperation(paths, reserved.instance_id, (operation) => runProductionProvision(operation)),
+      withInstanceOperation(paths, reserved.instance_id, (operation) =>
+        runProductionProvision(operation, { upsertEnvVars: recordEnv }),
+      ),
+    ).rejects.toMatchObject({ code: 'bootstrap_required' });
+  });
+
+  it('resumes past a release receipt whose OneCLI cohort differs from this launcher’s pins', async () => {
+    const { paths, reserved } = await startedInstance({ gateway: '1.41.0', cli: '2.2.4', sdk: '2.2.0' });
+
+    // bootstrap_required is raised only after the receipt was accepted.
+    await expect(
+      withInstanceOperation(paths, reserved.instance_id, (operation) =>
+        runProductionProvision(operation, { upsertEnvVars: recordEnv }),
+      ),
     ).rejects.toMatchObject({ code: 'bootstrap_required' });
   });
 });
@@ -717,6 +756,7 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
     nodePath: '/usr/local/bin/node',
     homeDirectory: path.dirname(operation.paths.stateRoot),
     selectedProvider: 'claude',
+    dockerEndpoint: 'unix:///var/run/docker.sock',
   });
   return {
     operation,
@@ -772,6 +812,7 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
       provisioningStartedAt: '2026-09-18T18:00:00.000Z',
       chatConfigured: false,
       serviceDependencies: {
+        upsertEnvVars: recordEnv,
         platform: 'macos',
         homeDirectory: path.dirname(operation.paths.stateRoot),
         runningAsRoot: false,

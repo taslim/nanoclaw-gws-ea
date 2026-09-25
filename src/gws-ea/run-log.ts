@@ -23,7 +23,7 @@ import { performance } from 'node:perf_hooks';
 
 import { isErrno } from '../community-portal/errors.js';
 import { PauseRequired } from './events.js';
-import { CONTROL_PLANE_ROOT, preparePrivateLocalDirectory, type ControlPlanePaths } from './paths.js';
+import { CONTROL_PLANE_ROOT, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import { envKeyNames, redact, registerSecretDirectory } from './redact.js';
 import { assertInstanceId } from './registry.js';
 import { GwsEaError } from './types.js';
@@ -296,7 +296,7 @@ class Run implements RunLog {
     if (path.dirname(this.#directory) !== this.#paths.preReservationLogsRoot) {
       throw new GwsEaError('run_log_conflict', 'This run already belongs to another instance');
     }
-    await preparePrivateLocalDirectory(parent);
+    await preparePrivateDirectory(parent);
     await rename(this.#directory, target);
     this.#directory = target;
     this.append([`=== [${this.#now().toISOString()}] instance-reserved → ${instanceId} ===`, '']);
@@ -364,9 +364,9 @@ export async function startRunLog(options: StartRunOptions): Promise<RunLog> {
     options.instanceId === undefined
       ? options.paths.preReservationLogsRoot
       : options.paths.instanceLogsRoot(options.instanceId);
-  await preparePrivateLocalDirectory(options.paths.logsRoot);
-  await preparePrivateLocalDirectory(parent);
-  if (options.captureFixturesTo !== undefined) await preparePrivateLocalDirectory(options.captureFixturesTo);
+  await preparePrivateDirectory(options.paths.logsRoot);
+  await preparePrivateDirectory(parent);
+  if (options.captureFixturesTo !== undefined) await preparePrivateDirectory(options.captureFixturesTo);
   const { id, directory } = await createRunDirectory(parent, now());
   await mkdir(path.join(directory, STEPS_DIRECTORY), { mode: 0o700 });
   const run = new Run(id, directory, options.paths, now, options.captureFixturesTo);

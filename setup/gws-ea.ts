@@ -18,6 +18,7 @@ import { confirmGoogleAccount, ensurePrerequisites, signInToGoogleCloud } from '
 import { dumpTranscriptOnFailure } from './lib/runner.js';
 import { fitToWidth, fmtDuration } from './lib/theme.js';
 import { listSetupProviders, type SetupProviderEntry } from './providers/registry.js';
+import { upsertEnvVars } from './set-env.js';
 import './providers/index.js';
 
 interface RunningStep {
@@ -158,8 +159,9 @@ export async function main(argv: readonly string[], options: { readonly interact
   const providers = listSetupProviders();
   const collectCreateInputs: CliRuntime['collectCreateInputs'] = (context) =>
     collectGwsEaCreateInput(context, { providers, interactive });
-  if (!interactive) return runCli(argv, { collectCreateInputs });
+  if (!interactive) return runCli(argv, { collectCreateInputs, upsertEnvVars });
   return runCli(argv, {
+    upsertEnvVars,
     presenter: createTerminalPresenter(),
     prompts: terminalPrompts(providers),
     collectCreateInputs,

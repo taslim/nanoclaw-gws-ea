@@ -11,7 +11,7 @@ import {
   GCP_PROJECT_PATTERN,
   parseGcpProjectNumber,
 } from './gcp-identity.js';
-import { CONTROL_PLANE_ROOT, preparePrivateLocalDirectory } from './paths.js';
+import { CONTROL_PLANE_ROOT, preparePrivateDirectory } from './paths.js';
 import {
   buildToolEnvironment,
   commandExitError,
@@ -25,9 +25,10 @@ import { registerSecret } from './redact.js';
 import { readOwnerOnlyFile, removePrivateFile, writePrivateTextFile } from './secrets.js';
 import { assertInstanceId } from './registry.js';
 import { GwsEaError } from './types.js';
-import { isRecord } from './validation.js';
+import { isRecord, parseJson } from './validation.js';
 
 export const GCLOUD_INSTALL_URL = 'https://cloud.google.com/sdk/docs/install';
+const INVALID_OUTPUT = 'invalid_gcloud_output';
 const PROJECT_LABEL_INSTANCE = 'gws-ea-instance';
 const PROJECT_LABEL_MANAGED = 'gws-ea-managed';
 const REQUIRED_APIS = ['chat.googleapis.com', 'iam.googleapis.com', 'orgpolicy.googleapis.com'] as const;
@@ -222,14 +223,6 @@ async function waitForReadback<Value>(
   return undefined;
 }
 
-function parseJson(source: string, label: string): unknown {
-  try {
-    return JSON.parse(source) as unknown;
-  } catch {
-    throw new GwsEaError('invalid_gcloud_output', `${label} returned invalid JSON`);
-  }
-}
-
 function stringField(value: Record<string, unknown>, key: string, label: string): string {
   const field = value[key];
   if (typeof field !== 'string' || field.length === 0) {
@@ -333,7 +326,7 @@ async function describeProject(
     if (isNotFound(result) || (mode === 'creation-probe' && isPermissionDenied(result))) return undefined;
     throw commandFailure('Google Cloud could not verify the dedicated project; no action was taken.');
   }
-  const value = parseJson(result.stdout, 'Google Cloud project');
+  const value = parseJson(result.stdout, 'Google Cloud project', INVALID_OUTPUT);
   if (!isRecord(value) || !isRecord(value.labels)) {
     throw new GwsEaError('invalid_gcloud_output', 'Google Cloud returned an invalid project description');
   }
@@ -503,7 +496,7 @@ async function keyCreationPolicyEnforced(
     if (isNotFound(result)) return false;
     throw commandFailure('Google Cloud could not inspect the Chat credential policy.');
   }
-  const value = parseJson(result.stdout, 'Google Cloud credential policy');
+  const value = parseJson(result.stdout, 'Google Cloud credential policy', INVALID_OUTPUT);
   if (!isRecord(value) || !isRecord(value.spec) || !Array.isArray(value.spec.rules)) {
     throw new GwsEaError('invalid_gcloud_output', 'Google Cloud returned an invalid credential policy');
   }
@@ -538,7 +531,7 @@ async function setKeyCreationPolicy(
   }
   let etag: string | undefined;
   if (current.exitCode === 0) {
-    const value = parseJson(current.stdout, 'Google Cloud credential policy');
+    const value = parseJson(current.stdout, 'Google Cloud credential policy', INVALID_OUTPUT);
     if (!isRecord(value) || !isRecord(value.spec) || typeof value.spec.etag !== 'string' || !value.spec.etag) {
       throw new GwsEaError('invalid_gcloud_output', 'Google Cloud returned an invalid credential policy');
     }
@@ -640,7 +633,7 @@ async function describeServiceAccount(
     if (isNotFound(result)) return undefined;
     throw commandFailure('Google Cloud could not inspect the Chat service account.');
   }
-  const value = parseJson(result.stdout, 'Google Cloud service account');
+  const value = parseJson(result.stdout, 'Google Cloud service account', INVALID_OUTPUT);
   if (!isRecord(value))
     throw new GwsEaError('invalid_gcloud_output', 'Google Cloud returned an invalid service account');
   return {
@@ -712,7 +705,7 @@ export function parseGchatServiceAccountCredential(
   contents: string,
   expected: { readonly projectId: string; readonly serviceAccountEmail: string },
 ): ServiceAccountCredential {
-  const value = parseJson(contents, 'Google Chat credential');
+  const value = parseJson(contents, 'Google Chat credential', INVALID_OUTPUT);
   if (
     !isRecord(value) ||
     value.type !== 'service_account' ||
@@ -772,7 +765,7 @@ async function readUserManagedKeys(
     if (isNotFound(result)) return undefined;
     throw commandFailure('Google Cloud could not inspect the Chat credential keys.');
   }
-  const value = parseJson(result.stdout, 'Google Cloud service-account keys');
+  const value = parseJson(result.stdout, 'Google Cloud service-account keys', INVALID_OUTPUT);
   if (!Array.isArray(value) || !value.every(isRecord)) {
     throw new GwsEaError('invalid_gcloud_output', 'Google Cloud returned invalid service-account keys');
   }
@@ -901,7 +894,7 @@ async function ensureCredential(
 
   try {
     await reconcileKeyCreationPolicies(input, false, runner, sleep, onProgress);
-    await preparePrivateLocalDirectory(path.dirname(input.credentialFile));
+    await preparePrivateDirectory(path.dirname(input.credentialFile));
     const result = await run(
       input.cwd,
       [

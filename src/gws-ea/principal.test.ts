@@ -27,6 +27,7 @@ function runtimeConfig(): InstanceRuntimeConfig {
     onecli_cli_path: '/opt/onecli',
     selected_provider: 'claude',
     endpoint_url: 'https://aya.example.test/webhook/gchat',
+    docker_endpoint: 'unix:///var/run/docker.sock',
     secret_files: {
       gchat_credentials: `${secrets}/gchat-service-account.json`,
       onecli_runtime_api_key: `${secrets}/onecli-runtime-api-key`,

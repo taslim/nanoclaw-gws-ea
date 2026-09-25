@@ -103,6 +103,7 @@ describe('GWS-EA interactive create input', () => {
         home_directory: '/Users/principal',
         platform: 'macos',
         running_as_root: false,
+        docker_endpoint: 'unix:///Users/principal/.docker/run/docker.sock',
         provider_capability_digest: providerCapabilityDigest,
         provider: {
           id: 'claude',

@@ -2,7 +2,8 @@ import { parse as parseYaml } from 'yaml';
 
 import { describe, expect, it } from 'vitest';
 
-import { createOnecliRuntimeLayout, ONECLI_GATEWAY_VERSION, renderOnecliCompose } from './onecli-compose.js';
+import { createOnecliRuntimeLayout, renderOnecliCompose } from './onecli-compose.js';
+import { ONECLI_GATEWAY_VERSION } from './pins.js';
 
 const INSTANCE_ID = '12345678-1234-4123-8123-123456789abc';
 

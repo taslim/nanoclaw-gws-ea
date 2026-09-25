@@ -29,6 +29,7 @@ import { holdLoopbackPorts, type HeldLoopbackPorts } from './ports.js';
 import { checkPrerequisites, type PrerequisiteRequest, type Prerequisites } from './prerequisites.js';
 import {
   installProductionBootstrapManifest,
+  recordedDockerEndpoint,
   removeProductionBootstrapManifest,
   runProductionProvision,
   validateProductionBootstrapManifest,
@@ -44,6 +45,7 @@ import {
 import { resolveReleaseSource } from './release-tracks.js';
 import { describeRemoval, removeAssistant, type RemovalPreview } from './remove.js';
 import { FIXTURE_STAGING_DIRECTORY, startRunLog, type RunLog } from './run-log.js';
+import type { UpsertEnvVars } from './service.js';
 import { GwsEaError, type AllocatedPorts, type GwsEaErrorDetails, type InstanceReservationInput } from './types.js';
 
 /** Unlabeled, so a scripted create's first line stays its `instance_id`. */
@@ -123,6 +125,8 @@ export interface CliRuntime {
   /** Absent means removal requires `--yes`. */
   confirmRemoval?: (preview: RemovalPreview) => Promise<boolean>;
   managedIngressSetup?: RetainedManagedIngressSetupSession;
+  /** Upstream's `.env` upsert (`setup/set-env.ts`), which the driver supplies. */
+  upsertEnvVars?: UpsertEnvVars;
 }
 
 const COMMON_OPTIONS = ['secrets-file'] as const;
@@ -370,7 +374,12 @@ class Cli {
 
   #advance(operation: InstanceOperation, options: AdvanceOptions): Promise<ProvisionResult> {
     if (this.#runtime.advanceProvision) return this.#runtime.advanceProvision(operation, options);
+    const upsertEnvVars = this.#runtime.upsertEnvVars;
+    if (!upsertEnvVars) {
+      throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
+    }
     return runProductionProvision(operation, {
+      upsertEnvVars,
       interaction: options.interaction,
       runtime: options.runtime,
       ...(options.portLease ? { portLease: options.portLease } : {}),
@@ -392,7 +401,7 @@ class Cli {
     const googleAccount = options['google-account'];
     const prerequisites = await runStep(reporter, PREREQUISITES_STEP, () =>
       this.#checkPrerequisites(
-        { command: 'create', instancesRoot: paths.instancesRoot, ...(googleAccount ? { account: googleAccount } : {}) },
+        { command: 'create', paths, ...(googleAccount ? { account: googleAccount } : {}) },
         interaction,
       ),
     );
@@ -522,8 +531,9 @@ class Cli {
         await readProvisionJournal(this.#paths, instanceId);
         const reservation = await getInstanceReservation(this.#paths, instanceId);
         const account = reservation.exclusive_resource_claims.gcp_account;
+        const dockerEndpoint = await recordedDockerEndpoint(this.#paths, reservation);
         await this.#checkPrerequisites(
-          { command: 'resume', instancesRoot: this.#paths.instancesRoot, account },
+          { command: 'resume', paths: this.#paths, account, ...(dockerEndpoint ? { dockerEndpoint } : {}) },
           interaction,
         );
       });
