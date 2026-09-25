@@ -192,9 +192,15 @@ function prompt(report: FailureReport, files: readonly BundleFile[]): string {
   );
 }
 
-/** Strip terminal escape sequences and control characters from untrusted text. */
+/**
+ * Strip terminal escape sequences, control characters, and invisible format
+ * characters (bidi overrides and isolates, zero-width characters) from
+ * untrusted text, so a shown command reads as its bytes. Format characters go
+ * first, so one cannot split an escape sequence and leave its tail behind.
+ */
 function sanitize(text: string): string {
   return text
+    .replace(/\p{Cf}/gu, '')
     .replace(/\p{Cc}\[[0-?]*[ -/]*[@-~]/gu, '')
     .replace(/[^\P{Cc}\n\t]/gu, '')
     .trim()

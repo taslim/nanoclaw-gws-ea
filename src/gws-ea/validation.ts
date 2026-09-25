@@ -19,7 +19,8 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 export function hasControlCharacters(value: string): boolean {
   return [...value].some((character) => {
     const code = character.codePointAt(0);
-    return code !== undefined && (code <= 0x1f || code === 0x7f);
+    // C0 controls, DEL, and C1 controls (U+009B alone starts a terminal escape).
+    return code !== undefined && (code <= 0x1f || (code >= 0x7f && code <= 0x9f));
   });
 }
 

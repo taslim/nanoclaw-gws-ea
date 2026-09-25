@@ -181,6 +181,29 @@ describe('GWS-EA failure diagnosis', () => {
     expect(shown).toContain('gcloud projects list --filter=gws-ea');
   });
 
+  it('strips bidi and zero-width format characters, so a suggested command reads as its bytes', async () => {
+    const { report } = await failure();
+    const prompts = ui();
+
+    expect(
+      await offerDiagnosis(report, {
+        interactive: true,
+        ui: prompts,
+        locateClaude: async () => '/usr/local/bin/claude',
+        runClaude: async () => ({
+          exitCode: 0,
+          stderr: '',
+          stdout: 'The ‮project is missing.\nCOMMAND: gcloud projects list ⁦--filter=gws-ea⁩​\n',
+        }),
+      }),
+    ).toBe('answered');
+    const shown = prompts.notes.find(([, title]) => /untrusted/iu.test(title))?.[0] ?? '';
+    expect(shown).not.toMatch(/[‮⁦]/u);
+    expect(shown).not.toMatch(/\p{Cf}/u);
+    expect(shown).toContain('The project is missing.');
+    expect(shown).toMatch(/\n {2}gcloud projects list --filter=gws-ea$/u);
+  });
+
   it('reports a failed diagnosis without running anything else', async () => {
     const { report } = await failure();
     const prompts = ui();
