@@ -62,7 +62,7 @@ async function collectSubscriptionToken(): Promise<string> {
   try {
     const exitCode = await runInheritScript(
       '/bin/bash',
-      ['setup/register-claude-token.sh', '--output-file', outputFile],
+      ['.claude/skills/add-onecli/scripts/register-claude-token.sh', '--output-file', outputFile],
       { env: buildInteractiveEnvironment() },
     );
     if (exitCode !== 0) throw new Error("Couldn't complete the Claude sign-in");

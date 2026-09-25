@@ -29,8 +29,10 @@ async function fixture(): Promise<string> {
     write(root, 'setup/providers/install.ts', "export const install = 'v1';\n"),
     write(root, 'setup/providers/skill-descriptor.ts', "export const skill = 'v1';\n"),
     write(root, 'setup/lib/bright-select.ts', 'export {};\n'),
+    write(root, 'setup/lib/captured-token.ts', 'export {};\n'),
     write(root, 'setup/lib/inherit-script.ts', 'export {};\n'),
-    write(root, 'setup/register-claude-token.sh', '#!/bin/sh\n'),
+    write(root, '.claude/skills/add-onecli/scripts/install-claude.sh', '#!/bin/sh\n'),
+    write(root, '.claude/skills/add-onecli/scripts/register-claude-token.sh', '#!/bin/sh\n'),
     write(root, 'setup/unrelated.ts', "export const unrelated = 'v1';\n"),
     write(root, 'src/provider-credential.ts', 'export interface Credential {}\n'),
   ]);
@@ -48,6 +50,18 @@ describe('provider provisioning capability digest', () => {
     expect(await providerProvisioningCapabilityDigest(root)).toBe(original);
 
     await write(root, 'setup/providers/claude-auth.ts', "export const auth = 'v2';\n");
+    expect(await providerProvisioningCapabilityDigest(root)).not.toBe(original);
+  });
+
+  it('tracks the Claude sign-in script and its executable dependencies', async () => {
+    const root = await fixture();
+    const original = await providerProvisioningCapabilityDigest(root);
+
+    await write(root, '.claude/skills/add-onecli/scripts/install-claude.sh', '#!/bin/sh\nexit 1\n');
+    expect(await providerProvisioningCapabilityDigest(root)).not.toBe(original);
+
+    await write(root, '.claude/skills/add-onecli/scripts/install-claude.sh', '#!/bin/sh\n');
+    await write(root, 'setup/lib/captured-token.ts', "export const parser = 'changed';\n");
     expect(await providerProvisioningCapabilityDigest(root)).not.toBe(original);
   });
 });

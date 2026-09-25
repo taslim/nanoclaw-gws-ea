@@ -107,7 +107,7 @@ describe('shared Claude credential flow', () => {
     });
     expect(fixture.runInheritScript).toHaveBeenCalledWith(
       '/bin/bash',
-      ['setup/register-claude-token.sh', '--output-file', expect.any(String)],
+      ['.claude/skills/add-onecli/scripts/register-claude-token.sh', '--output-file', expect.any(String)],
       { env: { NANOCLAW_SETUP_WIZARD: '1', HOME: '/Users/operator' } },
     );
   });

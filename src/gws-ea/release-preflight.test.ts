@@ -112,11 +112,19 @@ async function releaseFixture(): Promise<string> {
   await write(root, 'setup/gws-ea.ts', 'export {};\n');
   await write(root, 'setup/gws-ea-input.ts', 'export {};\n');
   await write(root, 'setup/lib/bright-select.ts', 'export {};\n');
+  await write(root, 'setup/lib/captured-token.ts', 'export {};\n');
   await write(root, 'setup/lib/inherit-script.ts', 'export {};\n');
-  await write(root, 'setup/register-claude-token.sh', '#!/bin/sh\n');
+  await write(root, '.claude/skills/add-onecli/scripts/install-claude.sh', '#!/bin/sh\n');
+  await write(root, '.claude/skills/add-onecli/scripts/register-claude-token.sh', '#!/bin/sh\n');
   await write(root, 'src/provider-credential.ts', 'export {};\n');
   await write(root, 'src/channels/gchat.ts', "export const gchat = 'registered';\n");
   await write(root, 'src/channels/index.ts', "import './cli.js';\nimport './gchat.js';\n");
+  await write(root, 'src/gateway-providers/index.ts', "import './installed.js';\n");
+  await write(root, 'src/gateway-providers/installed.ts', "import './onecli.js';\n");
+  await write(root, 'src/gateway-providers/onecli.ts', 'export {};\n');
+  await write(root, 'src/gateway-providers/onecli-files.ts', 'export {};\n');
+  await write(root, 'container/skills/onecli-gateway/SKILL.md', '# OneCLI gateway\n');
+  await write(root, 'container/skills/onecli-gateway/instructions.md', '# OneCLI instructions\n');
   await write(root, 'src/gws-ea/process.ts', 'export {};\n');
   await write(root, 'src/gws-ea/cloudflare-connector.ts', 'export {};\n');
   await write(root, 'scripts/init-first-agent.ts', 'export {};\n');
@@ -240,6 +248,8 @@ describe('release preflight', () => {
     ['GWS-EA interactive launcher', 'setup/gws-ea-input.ts', 'incomplete_release'],
     ['GWS-EA service launcher', 'src/gws-ea/process.ts', 'incomplete_release'],
     ['GWS-EA profile migration', 'src/modules/gws-ea-profile/migration.ts', 'incomplete_release'],
+    ['OneCLI gateway adapter', 'src/gateway-providers/onecli.ts', 'gateway_not_composed'],
+    ['OneCLI agent instructions', 'container/skills/onecli-gateway/SKILL.md', 'gateway_not_composed'],
     ['provider host contract', 'src/provider-contracts/claude.ts', 'provider_not_composed'],
     ['provider runtime', 'container/agent-runner/src/providers/claude.ts', 'provider_not_composed'],
   ])('rejects a release missing its committed %s before setup commands', async (_label, missingPath, code) => {
@@ -249,7 +259,10 @@ describe('release preflight', () => {
     const commands: SetupCommand[] = [];
 
     await expect(
-      runReleasePreflight(await preflightInput(root), { runSetupCommand: recorder(commands) }),
+      runReleasePreflight(await preflightInput(root), {
+        runCommand: fixtureCommandRunner,
+        runSetupCommand: recorder(commands),
+      }),
     ).rejects.toMatchObject({ code });
     expect(commands).toEqual([]);
   });
@@ -264,6 +277,21 @@ describe('release preflight', () => {
     await expect(runReleasePreflight(await preflightInput(root))).rejects.toMatchObject({
       code: 'cloudflared_release_mismatch',
     });
+  });
+
+  it('rejects a committed release without OneCLI gateway registration', async () => {
+    const root = await releaseFixture();
+    await write(root, 'src/gateway-providers/installed.ts', 'export {};\n');
+    commit(root, 'remove OneCLI gateway registration');
+    const commands: SetupCommand[] = [];
+
+    await expect(
+      runReleasePreflight(await preflightInput(root), {
+        runCommand: fixtureCommandRunner,
+        runSetupCommand: recorder(commands),
+      }),
+    ).rejects.toMatchObject({ code: 'gateway_not_composed' });
+    expect(commands).toEqual([]);
   });
 
   it('rejects a build that does not emit the service runtime artifacts', async () => {

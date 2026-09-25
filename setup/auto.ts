@@ -15,7 +15,7 @@
  *   NANOCLAW_AGENT_PROVIDER preselect the setup provider and skip the picker
  *                          (for packaged flows). Example: claude.
  *   NANOCLAW_SKIP          comma-separated step names to skip
- *                          (environment|container|onecli|auth|mounts|
+ *                          (environment|container|gateway|auth|mounts|
  *                           service|cli-agent|timezone|channel|
  *                           verify|first-chat)
  *
@@ -48,8 +48,7 @@ import { runInheritScript } from './lib/inherit-script.js';
 import { offerPortalReminder, portalEnabled, runImagePortal } from './portal.js';
 import { pingCliAgent, PING_AGENT_FOLDER, type PingResult } from './lib/agent-ping.js';
 import { getSetupProvider, listSetupProviders } from './providers/registry.js';
-import { collectClaudeCredential } from './providers/claude-auth.js';
-import { applyProviderSkill } from './providers/install.js';
+import { applyProviderSkill, loadHostContractModules } from './providers/install.js';
 import {
   getInstallableProviderDescriptor,
   listInstallableProviderDescriptors,
@@ -79,7 +78,9 @@ import { runWindowedStep } from './lib/windowed-runner.js';
 import { runUninstallFlow } from './uninstall/flow.js';
 import { detectExistingInstall } from './uninstall/scan.js';
 import { detectRegisteredGroups, detectExistingDisplayName, readEnvKey } from './environment.js';
-import { pollHealth } from './onecli.js';
+import { installGateway, runGatewayAuth } from './gateways/install.js';
+import { loadGatewayCatalog } from './gateways/catalog.js';
+import { configuredGatewayKind, detectInstalledGateway } from './gateways/selection.js';
 import { getLaunchdLabel, getSystemdUnit } from '../src/install-slug.js';
 import type { AgentGroup } from '../src/types.js';
 import { claudeCliAvailable, resolveTimezoneViaClaude } from './lib/tz-from-claude.js';
@@ -126,10 +127,7 @@ const LOGIN_EXIT_SKIPPED = 2;
 
 async function main(): Promise<void> {
   // Make sure ~/.local/bin is on PATH for every child process we spawn.
-  // Installers we run mid-setup (OneCLI, claude) drop binaries there and
-  // append a PATH line to the user's shell rc, but rc updates don't reach
-  // an already-running Node process — so without this patch a freshly
-  // installed `onecli` is invisible to a subsequent `runInheritScript`.
+  // Installable gateways and agent providers may place binaries there.
   ensureLocalBinOnPath();
 
   // Parse CLI flags first — `--help` short-circuits before we render anything,
@@ -182,7 +180,16 @@ async function main(): Promise<void> {
     setupLog.userInput('start_choice', startChoice);
   }
   if (startChoice === 'advanced') {
-    configValues = await runAdvancedScreen(configValues);
+    const gatewayCatalog = loadGatewayCatalog();
+    configValues.gatewayProvider ??=
+      configuredGatewayKind(process.cwd()) || detectInstalledGateway(process.cwd()) || gatewayCatalog.default;
+    configValues = await runAdvancedScreen(configValues, {
+      gatewayProvider: gatewayCatalog.gateways.map(({ kind, label, description }) => ({
+        value: kind,
+        label,
+        hint: description,
+      })),
+    });
     applyToEnv(configValues);
   }
 
@@ -259,9 +266,9 @@ async function main(): Promise<void> {
       brandBody(dimWrap('Your assistant lives in its own sandbox. It can only see what you explicitly share.', 4)),
     );
     // Asked before the step runs, because the step is what acts on the answer.
-    // An explicit "build it here" is a decision; the perk reminder for this
-    // question is only for installs that fell back to a local build unasked.
-    if ((await chooseImageSource()) === 'local') skip.add('echo-reminder');
+    // The answer lives in `.env` (imageSourceDecided); the perk reminder below
+    // reads it from there, so it survives a resume and a plain re-run alike.
+    await chooseImageSource();
     p.log.message(
       brandBody(
         dimWrap(
@@ -318,103 +325,26 @@ async function main(): Promise<void> {
     maybeReexecUnderSg();
   }
 
-  if (!skip.has('onecli')) {
+  let gatewayKind = process.env.NANOCLAW_GATEWAY_PROVIDER?.trim().toLowerCase();
+  if (!skip.has('gateway')) {
     p.log.message(
       brandBody(
         dimWrap(
-          'Your assistant never gets your API keys directly. The vault adds them to approved requests as they leave the sandbox.',
+          'Your assistant never receives real credentials. The selected gateway adds them only at the network boundary.',
           4,
         ),
       ),
     );
-
-    const remoteHost = process.env.NANOCLAW_ONECLI_API_HOST?.trim();
-
-    if (remoteHost) {
-      // Advanced-settings override: user has already named a remote vault,
-      // so skip the local-vs-fresh prompt entirely. Health-check it here
-      // rather than letting the step fail silently — a typo in the URL is a
-      // common mistake and the answer is human-fixable.
-      const s = p.spinner();
-      s.start(`Checking remote OneCLI at ${remoteHost}…`);
-      const healthy = await pollHealth(remoteHost, 5000);
-      if (!healthy) {
-        s.stop(`Couldn't reach OneCLI at ${remoteHost}.`, 1);
-        await fail(
-          'onecli',
-          `Couldn't reach OneCLI at ${remoteHost}.`,
-          'Check the URL and that OneCLI is running on the remote machine, then retry.',
-        );
-      }
-      s.stop('Remote OneCLI is reachable.');
-
-      const res = await runQuietStep(
-        'onecli',
-        {
-          running: `Connecting to remote OneCLI at ${remoteHost}…`,
-          done: 'OneCLI vault ready.',
-        },
-        ['--remote-url', remoteHost],
+    try {
+      const gateway = await installGateway(gatewayKind);
+      gatewayKind = gateway.kind;
+      p.log.success(`${gateway.label} gateway ready.`);
+    } catch (error) {
+      await fail(
+        'gateway',
+        "Couldn't install the selected gateway.",
+        error instanceof Error ? error.message : String(error),
       );
-      if (!res.ok) {
-        const err = res.terminal?.fields.ERROR;
-        await fail(
-          'onecli',
-          `Couldn't connect to remote OneCLI (${err ?? 'unknown error'}).`,
-          'Check the URL and that OneCLI is running on the remote machine, then retry.',
-        );
-      }
-    } else {
-      // Respect an existing OneCLI install. Re-running the installer would
-      // rebind the listener and knock any other app using that gateway
-      // offline — confirm with the user before doing that.
-      const existing = detectExistingOnecli();
-      let reuse = false;
-      if (existing) {
-        const choice = ensureAnswer(
-          await brightSelect({
-            message: `Found an existing OneCLI at ${existing.apiHost}. What would you like to do?`,
-            options: [
-              {
-                value: 'reuse',
-                label: 'Use the existing instance',
-                hint: 'recommended — keeps other apps bound to this vault working',
-              },
-              {
-                value: 'fresh',
-                label: 'Install a fresh instance for NanoClaw',
-                hint: 'reinstalls onecli; other apps may need to reconnect',
-              },
-            ],
-          }),
-        ) as 'reuse' | 'fresh';
-        setupLog.userInput('onecli_choice', choice);
-        reuse = choice === 'reuse';
-      }
-
-      const res = await runQuietStep(
-        'onecli',
-        {
-          running: reuse ? 'Hooking up to your existing OneCLI…' : "Setting up OneCLI, your agent's vault…",
-          done: 'OneCLI vault ready.',
-        },
-        reuse ? ['--reuse'] : [],
-      );
-      if (!res.ok) {
-        const err = res.terminal?.fields.ERROR;
-        if (err === 'onecli_not_on_path_after_install') {
-          await fail(
-            'onecli',
-            'OneCLI was installed but your shell needs to refresh to see it.',
-            'Open a new shell or run `export PATH="$HOME/.local/bin:$PATH"`, then retry.',
-          );
-        }
-        await fail(
-          'onecli',
-          `Couldn't set up OneCLI (${err ?? 'unknown error'}).`,
-          'Make sure curl is installed and ~/.local/bin is writable, then retry.',
-        );
-      }
     }
   }
 
@@ -471,8 +401,9 @@ async function main(): Promise<void> {
       const s = p.spinner();
       s.start(`Installing ${agentProvider}…`);
       let blockers: string[];
+      let hostContractModules: string[];
       try {
-        ({ blockers } = await applyProviderSkill(skillDir, process.cwd()));
+        ({ blockers, hostContractModules } = await applyProviderSkill(skillDir, process.cwd()));
       } catch (err) {
         s.stop(`Couldn't install ${agentProvider}.`, 1);
         const message = err instanceof Error ? err.message : String(err);
@@ -496,6 +427,11 @@ async function main(): Promise<void> {
           rebuild.hint,
         );
       }
+      // This process imported src/provider-contracts/index.ts at startup, and
+      // ESM caches the barrel, so a line appended to it now never evaluates
+      // here; load the contract module directly before the auth step asks the
+      // gateway store for model endpoints.
+      await loadHostContractModules(hostContractModules);
       await import(`./providers/${agentProvider}.js`);
       providerEntry = getSetupProvider(agentProvider);
     }
@@ -511,7 +447,8 @@ async function main(): Promise<void> {
         );
       }
     } else {
-      await runAuthStep();
+      if (!gatewayKind) throw new Error('No gateway is selected for agent authentication');
+      runGatewayAuth(gatewayKind, agentProvider);
     }
     // Persist the pick as the instance-wide default so every future group
     // (channel-approved, ncl-created) is created on this provider. Read from
@@ -536,10 +473,16 @@ async function main(): Promise<void> {
     }
   }
 
+  // Only for a run that never reached the sandbox-image question. Any answer
+  // to it — a browser choice, a declined handoff, a skipped or failed sign-in
+  // — is written to `.env`, and that is the one store every kind of re-entry
+  // (fail()'s retry, the sg-docker re-exec, a plain re-run) still sees. An
+  // in-memory skip entry would not survive the first two, and the question is
+  // not asked again on any of them.
   if (
     portalEnabled() &&
     !skip.has('echo-reminder') &&
-    readImageSource() !== 'hardened' &&
+    !imageSourceDecided() &&
     readAgentImagePin() &&
     (process.env.NANOCLAW_AGENT_PROVIDER || readEnvKey('DEFAULT_AGENT_PROVIDER') || DEFAULT_AGENT_PROVIDER || 'claude')
       .trim()
@@ -560,7 +503,6 @@ async function main(): Promise<void> {
           },
         }),
       );
-      skip.add('echo-reminder');
     } catch (error) {
       await fail(
         'container',
@@ -1546,159 +1488,6 @@ async function askAgentProviderChoice(): Promise<string> {
   return choice;
 }
 
-async function runAuthStep(): Promise<void> {
-  if (anthropicSecretExists()) {
-    p.log.success(brandBody('Your Claude account is already connected.'));
-    setupLog.step('auth', 'skipped', 0, { REASON: 'secret-already-present' });
-    return;
-  }
-
-  // Custom Anthropic-compatible endpoint flow. Both URL and token must be set;
-  // OneCLI stores the token as a generic Bearer secret keyed to the URL host,
-  // so the container only ever sees ANTHROPIC_BASE_URL + a placeholder.
-  const customBaseUrl = process.env.NANOCLAW_ANTHROPIC_BASE_URL?.trim();
-  const customAuthToken = process.env.NANOCLAW_ANTHROPIC_AUTH_TOKEN?.trim();
-  if (customBaseUrl && customAuthToken) {
-    await runCustomEndpointAuth(customBaseUrl, customAuthToken);
-    return;
-  }
-
-  const collected = await collectClaudeCredential({ allowSkip: true, allowAmbientConfiguration: true });
-  if (!collected) {
-    const confirmed = ensureAnswer(
-      await p.confirm({
-        message:
-          "Skip Claude sign-in? The agent won't be able to run until you connect, and we won't be able to help debug setup errors.",
-        initialValue: false,
-      }),
-    );
-    if (!confirmed) {
-      return runAuthStep();
-    }
-    setupLog.step('auth', 'skipped', 0, { REASON: 'user-skipped' });
-    p.log.warn(brandBody('Claude sign-in skipped. Re-run setup or run `bash nanoclaw.sh` to finish later.'));
-    return;
-  }
-  const { credential, method } = collected;
-  setupLog.userInput('auth_method', method);
-  phEmit('auth_method_chosen', { method });
-
-  const res = await runQuietChild(
-    'auth',
-    'onecli',
-    [
-      'secrets',
-      'create',
-      '--name',
-      credential.name,
-      '--type',
-      credential.type,
-      '--value',
-      credential.value,
-      '--host-pattern',
-      credential.hostPattern,
-      ...(credential.pathPattern ? ['--path-pattern', credential.pathPattern] : []),
-      ...(credential.headerName ? ['--header-name', credential.headerName] : []),
-      ...(credential.valueFormat ? ['--value-format', credential.valueFormat] : []),
-      ...(credential.paramName ? ['--param-name', credential.paramName] : []),
-      ...(credential.paramFormat ? ['--param-format', credential.paramFormat] : []),
-    ],
-    {
-      running: 'Saving your Claude credential to your OneCLI vault…',
-      done: 'Claude account connected.',
-    },
-    {
-      extraFields: { METHOD: method },
-    },
-  );
-  if (!res.ok) {
-    await fail(
-      'auth',
-      "Couldn't save your Claude credential to the vault.",
-      'Make sure OneCLI is running (`onecli version`), then retry.',
-    );
-  }
-}
-
-/**
- * Set up Anthropic auth for a custom endpoint. The token is stored as a
- * OneCLI generic secret with header injection so the proxy rewrites the
- * Authorization header on the wire — the container only ever sees
- * ANTHROPIC_BASE_URL + a placeholder bearer.
- */
-async function runCustomEndpointAuth(baseUrl: string, token: string): Promise<void> {
-  let host: string;
-  try {
-    host = new URL(baseUrl).hostname;
-  } catch {
-    await fail('auth', `Invalid Anthropic base URL: ${baseUrl}`, 'Check --anthropic-base-url and retry.');
-    return;
-  }
-
-  const res = await runQuietChild(
-    'auth',
-    'onecli',
-    [
-      'secrets',
-      'create',
-      '--name',
-      'Anthropic',
-      '--type',
-      'generic',
-      '--value',
-      token,
-      '--host-pattern',
-      host,
-      '--header-name',
-      'Authorization',
-      '--value-format',
-      'Bearer {value}',
-    ],
-    {
-      running: `Saving your Anthropic auth token to your OneCLI vault…`,
-      done: 'Claude account connected.',
-    },
-    { extraFields: { METHOD: 'custom-endpoint', HOST: host } },
-  );
-  if (!res.ok) {
-    await fail(
-      'auth',
-      `Couldn't save your Anthropic auth token to the vault.`,
-      'Make sure OneCLI is running (`onecli version`), then retry.',
-    );
-  }
-
-  // ANTHROPIC_BASE_URL has to be in .env so the runtime provider config
-  // reads it when building container env. The token is *not* written —
-  // OneCLI holds it.
-  writeEnvLine('ANTHROPIC_BASE_URL', baseUrl);
-
-  // Register the claude provider so the runtime passes ANTHROPIC_BASE_URL
-  // and the placeholder bearer into the container. Only appended when the
-  // user has configured a custom endpoint; standard installs don't load
-  // the file at all.
-  appendProviderImport('./claude.js');
-}
-
-function writeEnvLine(key: string, value: string): void {
-  const envFile = path.join(process.cwd(), '.env');
-  const content = fs.existsSync(envFile) ? fs.readFileSync(envFile, 'utf-8') : '';
-  const re = new RegExp(`^${key}=.*$`, 'm');
-  const next = re.test(content)
-    ? content.replace(re, `${key}=${value}`)
-    : content.trimEnd() + (content ? '\n' : '') + `${key}=${value}\n`;
-  fs.writeFileSync(envFile, next);
-}
-
-function appendProviderImport(modulePath: string): void {
-  const file = path.join(process.cwd(), 'src', 'providers', 'index.ts');
-  const content = fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : '';
-  const line = `import '${modulePath}';`;
-  if (content.includes(line)) return;
-  const sep = content && !content.endsWith('\n') ? '\n' : '';
-  fs.writeFileSync(file, content + sep + line + '\n');
-}
-
 // ─── timezone step ─────────────────────────────────────────────────────
 
 /**
@@ -1901,66 +1690,6 @@ function ensureLocalBinOnPath(): void {
   process.env.PATH = current ? `${localBin}${path.delimiter}${current}` : localBin;
 }
 
-function anthropicSecretExists(): boolean {
-  try {
-    const res = spawnSync('onecli', ['secrets', 'list'], {
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    if (res.status !== 0) return false;
-    return /anthropic/i.test(res.stdout ?? '');
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Probe the host for a working OneCLI install so we can offer to reuse it
- * instead of re-running the installer (which rebinds the listener and breaks
- * any other app already using that gateway).
- */
-function detectExistingOnecli(): { version: string; apiHost: string } | null {
-  try {
-    const ver = spawnSync('onecli', ['version'], {
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    if (ver.status !== 0) return null;
-    const version = (ver.stdout ?? '').trim();
-    if (!version) return null;
-
-    const host = spawnSync('onecli', ['config', 'get', 'api-host'], {
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    if (host.status !== 0) return null;
-    const raw = (host.stdout ?? '').trim();
-    if (!raw) return null;
-
-    // onecli 1.3+ emits JSON by default. Older versions would print raw text.
-    try {
-      const parsed = JSON.parse(raw) as { data?: unknown; value?: unknown };
-      const val = parsed.data ?? parsed.value;
-      if (typeof val === 'string' && val.trim()) {
-        return { version, apiHost: val.trim() };
-      }
-    } catch {
-      // not JSON — try to extract a URL directly
-    }
-    const m = raw.match(/https?:\/\/[\w.-]+(?::\d+)?/);
-    return m ? { version, apiHost: m[0] } : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * After installing Docker, this process's supplementary groups are still
- * frozen from login — subsequent steps that talk to /var/run/docker.sock
- * (onecli install, service start, …) fail with EACCES even though the
- * daemon is up. Detect that and re-exec the whole driver under `sg docker`
- * so the rest of the run inherits the docker group without a re-login.
- */
 function maybeReexecUnderSg(): void {
   if (process.env.NANOCLAW_REEXEC_SG === '1') return;
   if (process.platform !== 'linux') return;
