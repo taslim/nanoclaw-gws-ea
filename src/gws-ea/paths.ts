@@ -2,7 +2,12 @@ import fs from 'node:fs';
 import { chmod, lstat, mkdir, statfs } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { GwsEaError } from './types.js';
+
+/** The checkout this control plane runs from (`src/gws-ea` and `dist/gws-ea` both sit two levels below it). */
+export const CONTROL_PLANE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 export interface ControlPlanePathOverrides {
   configRoot?: string;
@@ -18,6 +23,9 @@ export interface ControlPlanePaths {
   ingressRoot: string;
   cloudflareRoot: string;
   instancesRoot: string;
+  logsRoot: string;
+  preReservationLogsRoot: string;
+  instanceLogsRoot(instanceId: string): string;
   instanceRoot(instanceId: string): string;
   checkoutRoot(instanceId: string): string;
   journalFile(instanceId: string): string;
@@ -74,6 +82,7 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
   const removalRoot = path.join(configRoot, 'removals');
   const ingressRoot = path.join(stateRoot, 'ingress');
   const cloudflareRoot = path.join(ingressRoot, 'cloudflare');
+  const logsRoot = path.join(stateRoot, 'logs');
   const instanceRoot = (instanceId: string): string => path.join(instancesRoot, instanceId);
   const checkoutRoot = (instanceId: string): string => path.join(instanceRoot(instanceId), 'nanoclaw');
 
@@ -86,6 +95,9 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
     ingressRoot,
     cloudflareRoot,
     instancesRoot,
+    logsRoot,
+    preReservationLogsRoot: path.join(logsRoot, 'runs'),
+    instanceLogsRoot: (instanceId) => path.join(logsRoot, instanceId),
     instanceRoot,
     checkoutRoot,
     journalFile: (instanceId) => path.join(instanceRoot(instanceId), 'provision.json'),

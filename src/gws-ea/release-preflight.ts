@@ -3,12 +3,8 @@ import path from 'node:path';
 
 import { parse as parseYaml } from 'yaml';
 
-import {
-  prepareReleaseCommandEnvironments,
-  runArgumentCommand,
-  type CommandRunner,
-  type ReleaseCommandEnvironments,
-} from './checkout.js';
+import { prepareReleaseCommandEnvironments, type ReleaseCommandEnvironments } from './checkout.js';
+import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { GwsEaError } from './types.js';
 import { isRecord } from './validation.js';
 import type { ProviderCredentialMetadata } from '../provider-credential.js';
@@ -36,7 +32,7 @@ export interface ReleasePreflightInput {
 }
 
 export interface ReleasePreflightRuntime {
-  runCommand?: CommandRunner;
+  runCommand?: SanitizedCommandRunner;
   runSetupCommand?: (command: SetupCommand) => Promise<void>;
 }
 
@@ -85,7 +81,7 @@ async function assertPhysicalCheckout(checkoutRoot: string): Promise<string> {
 async function git(
   checkoutRoot: string,
   args: readonly string[],
-  run: CommandRunner,
+  run: SanitizedCommandRunner,
   environments: ReleaseCommandEnvironments,
 ): Promise<string> {
   return (await run({ command: 'git', args, cwd: checkoutRoot, env: environments.git })).stdout.trim();
@@ -94,7 +90,7 @@ async function git(
 async function assertClean(
   checkoutRoot: string,
   phase: string,
-  run: CommandRunner,
+  run: SanitizedCommandRunner,
   environments: ReleaseCommandEnvironments,
 ): Promise<void> {
   const status = await git(checkoutRoot, ['status', '--porcelain=v1', '--untracked-files=all'], run, environments);
@@ -103,7 +99,7 @@ async function assertClean(
 
 async function assertDetachedCommit(
   checkoutRoot: string,
-  run: CommandRunner,
+  run: SanitizedCommandRunner,
   environments: ReleaseCommandEnvironments,
 ): Promise<void> {
   const head = await git(checkoutRoot, ['rev-parse', '--verify', 'HEAD^{commit}'], run, environments);
@@ -118,7 +114,7 @@ async function assertDetachedCommit(
 async function assertCommittedRegularFiles(
   checkoutRoot: string,
   relativePaths: readonly string[],
-  run: CommandRunner,
+  run: SanitizedCommandRunner,
   environments: ReleaseCommandEnvironments,
 ): Promise<void> {
   const [trackedResult, fileInfo] = await Promise.all([
@@ -277,7 +273,7 @@ async function validatePackageAndPins(
 async function validateComposition(
   checkoutRoot: string,
   provider: string,
-  run: CommandRunner,
+  run: SanitizedCommandRunner,
   environments: ReleaseCommandEnvironments,
 ): Promise<void> {
   if (!PROVIDER_PATTERN.test(provider)) {
@@ -389,7 +385,7 @@ async function assertInstalledOnecliCli(
   expectedVersion: string,
   checkoutRoot: string,
   environment: Readonly<Record<string, string>>,
-  run: CommandRunner,
+  run: SanitizedCommandRunner,
 ): Promise<void> {
   if (!path.isAbsolute(executable) || path.resolve(executable) !== executable) {
     throw new GwsEaError('incompatible_onecli', 'OneCLI CLI path must be absolute and normalized');
@@ -408,7 +404,7 @@ async function assertInstalledOnecliCli(
 }
 
 async function defaultSetupCommand(command: SetupCommand): Promise<void> {
-  await runArgumentCommand({ ...command, timeoutMs: 20 * 60 * 1000 });
+  await runSanitizedCommand({ ...command, timeoutMs: 20 * 60 * 1000, stream: true });
 }
 
 /**
@@ -421,7 +417,7 @@ export async function runReleasePreflight(
 ): Promise<ReleasePreflightResult> {
   const checkoutRoot = await assertPhysicalCheckout(input.checkoutRoot);
   const environments = await prepareReleaseCommandEnvironments(path.dirname(checkoutRoot));
-  const runCommand = runtime.runCommand ?? runArgumentCommand;
+  const runCommand = runtime.runCommand ?? runSanitizedCommand;
   await assertDetachedCommit(checkoutRoot, runCommand, environments);
   await assertClean(checkoutRoot, 'initial preflight', runCommand, environments);
   const providerCapabilityDigest = await providerProvisioningCapabilityDigest(checkoutRoot);

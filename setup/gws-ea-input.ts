@@ -10,7 +10,8 @@ import type {
   CreateSetupAnswers,
 } from '../src/gws-ea/create-input.js';
 import { validateExistingGchatEndpoint } from '../src/gws-ea/endpoint.js';
-import { resolveTrustedExecutable } from '../src/gws-ea/process.js';
+import { resolveControlPlanePaths } from '../src/gws-ea/paths.js';
+import { resolvePersistedExecutable } from '../src/gws-ea/process.js';
 import { configuredReleaseSource } from '../src/gws-ea/release-tracks.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
 import type { ProviderCredential } from '../src/provider-credential.js';
@@ -133,11 +134,15 @@ async function detectRuntime(): Promise<DetectedRuntime> {
     throw new GwsEaError('unsupported_platform', 'GWS-EA supports macOS and Linux hosts');
   }
   const onecliSearchPath = [path.join(os.homedir(), '.local', 'bin'), process.env.PATH ?? ''].join(path.delimiter);
+  const checkoutRoots = [resolveControlPlanePaths().instancesRoot];
   const [onecliCliPath, nodePath] = await Promise.all([
-    resolveTrustedExecutable('onecli', onecliSearchPath).catch(() => {
-      throw new GwsEaError('onecli_required', 'OneCLI is not installed or is not executable; install it, then retry.');
+    resolvePersistedExecutable('onecli', { searchPath: onecliSearchPath, checkoutRoots }).catch((error: unknown) => {
+      if (!(error instanceof GwsEaError) || error.code !== 'executable_not_found') throw error;
+      throw new GwsEaError('onecli_required', 'OneCLI is not installed or is not executable; install it, then retry.', {
+        cause: error,
+      });
     }),
-    resolveTrustedExecutable(process.execPath),
+    resolvePersistedExecutable(process.execPath, { checkoutRoots }),
   ]);
   return {
     onecliCliPath,

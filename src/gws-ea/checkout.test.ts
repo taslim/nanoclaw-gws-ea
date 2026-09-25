@@ -5,13 +5,9 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import {
-  assertReleaseCheckoutAgreement,
-  materializeReleaseCheckout,
-  resolveReleaseCommit,
-  runArgumentCommand,
-} from './checkout.js';
+import { assertReleaseCheckoutAgreement, materializeReleaseCheckout, resolveReleaseCommit } from './checkout.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+import { TOOL_ENVIRONMENT_KEYS, runSanitizedCommand } from './process.js';
 import { allocateInstanceId, reserveInstance } from './registry.js';
 import type { InstanceReservationInput } from './types.js';
 
@@ -101,25 +97,18 @@ function stagingRoot(paths: ControlPlanePaths, instanceId: string): string {
 }
 
 function expectSanitizedEnvironment(
-  environment: Readonly<Record<string, string>>,
+  environment: Readonly<Record<string, string>> | undefined,
   expectedHome?: string,
   additions: readonly string[] = [],
 ): void {
-  if (expectedHome) expect(environment.HOME).toBe(expectedHome);
-  else expect(environment.HOME).toMatch(/\.release-home$/);
-  expect(environment.GIT_CONFIG_NOSYSTEM).toBe('1');
-  expect(environment.GIT_TERMINAL_PROMPT).toBe('0');
-  for (const key of Object.keys(environment)) {
-    expect([
-      'HOME',
-      'PATH',
-      'LANG',
-      'LC_ALL',
-      'LC_CTYPE',
-      'GIT_CONFIG_NOSYSTEM',
-      'GIT_TERMINAL_PROMPT',
-      ...additions,
-    ]).toContain(key);
+  if (expectedHome) expect(environment?.HOME).toBe(expectedHome);
+  else expect(environment?.HOME).toMatch(/\.release-home$/);
+  expect(environment?.GIT_CONFIG_NOSYSTEM).toBe('1');
+  expect(environment?.GIT_TERMINAL_PROMPT).toBe('0');
+  for (const key of Object.keys(environment ?? {})) {
+    expect([...TOOL_ENVIRONMENT_KEYS, 'HOME', 'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT', ...additions]).toContain(
+      key,
+    );
   }
 }
 
@@ -184,7 +173,7 @@ describe('exact release checkout', () => {
     vi.stubEnv('ONECLI_HOME', '/tmp/hostile-onecli');
     vi.stubEnv('ANTHROPIC_API_KEY', 'must-not-propagate');
     vi.stubEnv('GOOGLE_APPLICATION_CREDENTIALS', '/tmp/hostile-google-key');
-    const observed: Array<{ args: readonly string[]; env: Readonly<Record<string, string>> }> = [];
+    const observed: Array<{ args: readonly string[]; env: Readonly<Record<string, string>> | undefined }> = [];
 
     const resolved = await resolveReleaseCommit(source.remote, 'refs/heads/dogfood', {
       fetchAuthentication: {
@@ -193,7 +182,7 @@ describe('exact release checkout', () => {
       },
       runCommand: async (spec) => {
         observed.push({ args: spec.args, env: spec.env });
-        return runArgumentCommand(spec);
+        return runSanitizedCommand(spec);
       },
     });
 
@@ -202,8 +191,8 @@ describe('exact release checkout', () => {
     for (const command of observed) {
       const isFetch = command.args[0] === 'fetch';
       expectSanitizedEnvironment(command.env, undefined, isFetch ? ['GIT_ASKPASS', 'SSH_AUTH_SOCK'] : []);
-      expect(command.env.GIT_ASKPASS).toBe(isFetch ? '/owned/askpass' : undefined);
-      expect(command.env.SSH_AUTH_SOCK).toBe(isFetch ? '/owned/agent.sock' : undefined);
+      expect(command.env?.GIT_ASKPASS).toBe(isFetch ? '/owned/askpass' : undefined);
+      expect(command.env?.SSH_AUTH_SOCK).toBe(isFetch ? '/owned/agent.sock' : undefined);
     }
   });
 
@@ -263,7 +252,7 @@ describe('exact release checkout', () => {
           if (spec.cwd === stagingRoot(paths, instanceId) && spec.args[0] === 'fetch') {
             throw new Error('fixture fetch failure');
           }
-          return runArgumentCommand(spec);
+          return runSanitizedCommand(spec);
         },
       }),
     ).rejects.toThrow(/fixture fetch failure/);
@@ -285,7 +274,7 @@ describe('exact release checkout', () => {
         if (spec.cwd === stagingRoot(paths, instanceId)) {
           await expect(stat(paths.checkoutRoot(instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
         }
-        return runArgumentCommand(spec);
+        return runSanitizedCommand(spec);
       },
     });
 
@@ -306,7 +295,7 @@ describe('exact release checkout', () => {
     await materializeReleaseCheckout(paths, instanceId, resolved, {
       runCommand: async (spec) => {
         commands.push(spec.args[0] ?? '');
-        return runArgumentCommand(spec);
+        return runSanitizedCommand(spec);
       },
     });
 
@@ -362,7 +351,7 @@ describe('exact release checkout', () => {
     await expect(
       materializeReleaseCheckout(paths, instanceId, resolved, {
         runCommand: async (spec) => {
-          const result = await runArgumentCommand(spec);
+          const result = await runSanitizedCommand(spec);
           if (spec.cwd === stagingRoot(paths, instanceId) && spec.args[0] === 'status') {
             await mkdir(paths.checkoutRoot(instanceId), { mode: 0o700 });
             await write(paths.checkoutRoot(instanceId), 'owner.txt', 'preserve me\n');

@@ -12,24 +12,11 @@ import {
   type ControlPlanePaths,
 } from './paths.js';
 import { assertRegistryMarkerAgreement, getInstanceReservation } from './registry.js';
-import { runSanitizedCommand, type SanitizedCommandResult, type SanitizedCommandRunner } from './process.js';
+import { buildToolEnvironment, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { GwsEaError, INSTANCE_MARKER_SCHEMA_VERSION, type InstanceMarker, type InstanceReservation } from './types.js';
 import { isRecord } from './validation.js';
 
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
-const DEFAULT_COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
-
-export interface CommandSpec {
-  command: string;
-  args: readonly string[];
-  env: Readonly<Record<string, string>>;
-  cwd?: string;
-  timeoutMs?: number;
-}
-
-export type CommandResult = SanitizedCommandResult;
-
-export type CommandRunner = (spec: CommandSpec) => Promise<CommandResult>;
 
 export interface ResolvedRelease {
   sourceRemote: string;
@@ -38,7 +25,7 @@ export interface ResolvedRelease {
 }
 
 export interface CheckoutRuntime {
-  runCommand?: CommandRunner;
+  runCommand?: SanitizedCommandRunner;
   fetchAuthentication?: GitFetchAuthentication;
 }
 
@@ -52,17 +39,11 @@ export interface ReleaseCommandEnvironments {
   git: Readonly<Record<string, string>>;
 }
 
-function copyAmbientValue(target: Record<string, string>, key: string): void {
-  const value = process.env[key];
-  if (value !== undefined) target[key] = value;
-}
-
-/** Build a minimal child environment rooted in storage owned by this release operation. */
+/** Build the tool environment rooted in storage owned by this release operation. */
 export async function prepareReleaseCommandEnvironments(ownerRoot: string): Promise<ReleaseCommandEnvironments> {
   const home = path.join(ownerRoot, '.release-home');
   await preparePrivateLocalDirectory(home);
-  const common: Record<string, string> = { HOME: home };
-  for (const key of ['PATH', 'LANG', 'LC_ALL', 'LC_CTYPE'] as const) copyAmbientValue(common, key);
+  const common = buildToolEnvironment(process.env, { HOME: home });
   return {
     common,
     git: { ...common, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' },
@@ -78,17 +59,6 @@ function fetchEnvironment(
   if (authentication.askPassProgram) result.GIT_ASKPASS = authentication.askPassProgram;
   if (authentication.sshAgentSocket) result.SSH_AUTH_SOCK = authentication.sshAgentSocket;
   return result;
-}
-
-/** Execute one binary directly. Arguments are never interpreted by a shell. */
-export async function runArgumentCommand(spec: CommandSpec): Promise<CommandResult> {
-  const run: SanitizedCommandRunner = runSanitizedCommand;
-  return run({
-    ...spec,
-    cwd: spec.cwd ?? process.cwd(),
-    timeoutMs: spec.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS,
-    outputLimitBytes: 2 * 1024 * 1024,
-  });
 }
 
 function validateSourceRemote(sourceRemote: string): void {
@@ -116,7 +86,7 @@ function validateCommit(commit: string): string {
 async function assertValidReleaseRef(
   repository: string,
   releaseRef: string,
-  run: CommandRunner,
+  run: SanitizedCommandRunner,
   environment: Readonly<Record<string, string>>,
 ): Promise<void> {
   if (!releaseRef || releaseRef.startsWith('-') || releaseRef.length > 256) {
@@ -144,12 +114,12 @@ export async function resolveReleaseCommit(
   runtime: CheckoutRuntime = {},
 ): Promise<ResolvedRelease> {
   validateSourceRemote(sourceRemote);
-  const run = runtime.runCommand ?? runArgumentCommand;
+  const run = runtime.runCommand ?? runSanitizedCommand;
   const scratchRoot = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-resolve-'));
   const repository = path.join(scratchRoot, 'objects.git');
   try {
     const environment = await prepareReleaseCommandEnvironments(scratchRoot);
-    await run({ command: 'git', args: ['init', '--bare', repository], env: environment.git });
+    await run({ command: 'git', args: ['init', '--bare', repository], cwd: scratchRoot, env: environment.git });
     await assertValidReleaseRef(repository, releaseRef, run, environment.git);
     await run({
       command: 'git',
@@ -259,7 +229,7 @@ export async function materializeReleaseCheckout(
   await assertOwnedLocalDirectory(paths.instanceRoot(instanceId), 0o700);
   const environments = await prepareReleaseCommandEnvironments(paths.instanceRoot(instanceId));
   const stagingRoot = stagingCheckoutRoot(reservation.checkout_realpath);
-  const run = runtime.runCommand ?? runArgumentCommand;
+  const run = runtime.runCommand ?? runSanitizedCommand;
   try {
     const info = await lstat(stagingRoot);
     if (info.isSymbolicLink() || !info.isDirectory() || (await realpath(stagingRoot)) !== stagingRoot) {
@@ -318,7 +288,7 @@ export async function materializeReleaseCheckout(
 async function assertCheckoutRoot(
   checkoutRoot: string,
   reservation: InstanceReservation,
-  run: CommandRunner,
+  run: SanitizedCommandRunner,
   environment: Readonly<Record<string, string>>,
 ): Promise<void> {
   const head = validateCommit(
@@ -370,7 +340,7 @@ export async function assertReleaseCheckoutAgreement(
     throw new GwsEaError('unsafe_checkout', 'Checkout real path does not match the immutable reservation');
   }
 
-  const run = runtime.runCommand ?? runArgumentCommand;
+  const run = runtime.runCommand ?? runSanitizedCommand;
   const environments = await prepareReleaseCommandEnvironments(paths.instanceRoot(instanceId));
   await assertCheckoutRoot(reservation.checkout_realpath, reservation, run, environments.git);
   return reservation;

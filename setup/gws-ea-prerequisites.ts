@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { GCLOUD_INSTALL_URL, preflightGcloud } from '../src/gws-ea/gcloud.js';
-import { resolveTrustedExecutable } from '../src/gws-ea/process.js';
+import { resolveExecutable } from '../src/gws-ea/process.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
 import { buildInteractiveEnvironment, runInheritScript } from './lib/inherit-script.js';
 
@@ -60,8 +60,8 @@ export async function ensureGcloudReady(
   const check =
     dependencies.check ??
     (() => preflightGcloud({ cwd, ...(dependencies.account ? { account: dependencies.account } : {}) }));
-  const resolveExecutable =
-    dependencies.resolveExecutable ?? ((searchPath: string) => resolveTrustedExecutable('gcloud', searchPath));
+  const resolveGcloudExecutable =
+    dependencies.resolveExecutable ?? ((searchPath: string) => resolveExecutable('gcloud', searchPath));
   const runLogin =
     dependencies.runLogin ??
     ((executable: string, args: readonly string[]) =>
@@ -72,7 +72,7 @@ export async function ensureGcloudReady(
 
   const resolveGcloud = async (): Promise<string> => {
     try {
-      executable ??= await resolveExecutable(gcloudSearchPath());
+      executable ??= await resolveGcloudExecutable(gcloudSearchPath());
       activateExecutable(executable);
       return executable;
     } catch {

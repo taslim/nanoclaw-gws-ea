@@ -7,7 +7,7 @@ import { stringify } from 'yaml';
 import { isErrno } from '../community-portal/errors.js';
 import { assertPrivateLocalDirectory, preparePrivateLocalDirectory } from './paths.js';
 import {
-  buildAllowlistedEnvironment,
+  buildToolEnvironment,
   runSanitizedCommand,
   type SanitizedCommand,
   type SanitizedCommandRunner,
@@ -200,7 +200,7 @@ export function buildCloudflareComposeInvocation(
 }
 
 function connectorEnvironment(ambient: NodeJS.ProcessEnv = process.env): Readonly<Record<string, string>> {
-  const environment = buildAllowlistedEnvironment(ambient);
+  const environment = buildToolEnvironment(ambient);
   if (ambient.HOME !== undefined) environment.HOME = ambient.HOME;
   return environment;
 }
@@ -331,6 +331,7 @@ export async function reconcileCloudflareConnector(
     ...buildCloudflareComposeInvocation(layout, ['up', '--detach', '--remove-orphans']),
     env: environment,
     timeoutMs: 120_000,
+    stream: true,
   });
   const after = await inspectCloudflareConnector(layout, runner, environment);
   if (after === undefined) throw new GwsEaError('unhealthy_connector', 'Cloudflare connector did not start');
@@ -355,6 +356,7 @@ export async function stopCloudflareConnector(
     ...buildCloudflareComposeInvocation(layout, ['down', '--remove-orphans']),
     env: environment,
     timeoutMs: 120_000,
+    stream: true,
   });
   if ((await inspectCloudflareConnector(layout, runner, environment)) !== undefined) {
     throw new GwsEaError('connector_removal_incomplete', 'Cloudflare connector remains after shutdown');

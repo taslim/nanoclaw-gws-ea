@@ -118,12 +118,22 @@ export interface ProvisionJournal {
   phases: Record<ProvisionPhase, JournalPhase>;
 }
 
+/** Structured, non-secret facts about a failure, for rendering and diagnosis. */
+export type GwsEaErrorDetails = Readonly<Record<string, string | number | boolean | null | readonly string[]>>;
+
+export interface GwsEaErrorOptions {
+  readonly cause?: unknown;
+  readonly details?: GwsEaErrorDetails;
+}
+
 export class GwsEaError extends Error {
   readonly code: string;
+  readonly details: GwsEaErrorDetails | undefined;
 
-  constructor(code: string, message: string) {
-    super(message);
+  constructor(code: string, message: string, options: GwsEaErrorOptions = {}) {
+    super(message, 'cause' in options ? { cause: options.cause } : undefined);
     this.name = 'GwsEaError';
     this.code = code;
+    this.details = options.details;
   }
 }

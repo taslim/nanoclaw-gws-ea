@@ -5,7 +5,7 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { runArgumentCommand, type CommandRunner } from './checkout.js';
+import { TOOL_ENVIRONMENT_KEYS, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { runReleasePreflight, type SetupCommand } from './release-preflight.js';
 import { providerProvisioningCapabilityDigest } from '../provider-provisioning-capability.js';
 
@@ -156,10 +156,10 @@ async function preflightInput(root: string) {
   } as const;
 }
 
-const fixtureCommandRunner: CommandRunner = async (spec) =>
+const fixtureCommandRunner: SanitizedCommandRunner = async (spec) =>
   spec.command === '/fixture/bin/onecli'
     ? { stdout: JSON.stringify({ version: '2.2.5', server_version: 'unknown' }), stderr: '' }
-    : runArgumentCommand(spec);
+    : runSanitizedCommand(spec);
 
 function recorder(commands: SetupCommand[]): (command: SetupCommand) => Promise<void> {
   return async (command) => {
@@ -174,7 +174,7 @@ function recorder(commands: SetupCommand[]): (command: SetupCommand) => Promise<
 function expectCommonEnvironment(environment: Readonly<Record<string, string>>, checkoutRoot: string): void {
   expect(environment.HOME).toBe(path.join(path.dirname(checkoutRoot), '.release-home'));
   for (const key of Object.keys(environment)) {
-    expect(['HOME', 'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE']).toContain(key);
+    expect([...TOOL_ENVIRONMENT_KEYS, 'HOME']).toContain(key);
   }
 }
 
@@ -211,7 +211,7 @@ describe('release preflight', () => {
     vi.stubEnv('ONECLI_HOME', '/tmp/hostile-onecli');
     vi.stubEnv('ANTHROPIC_API_KEY', 'must-not-propagate');
     vi.stubEnv('GOOGLE_APPLICATION_CREDENTIALS', '/tmp/hostile-google-key');
-    const gitEnvironments: Array<Readonly<Record<string, string>>> = [];
+    const gitEnvironments: Array<Readonly<Record<string, string>> | undefined> = [];
     let onecliEnvironment: Readonly<Record<string, string>> | undefined;
     const setupCommands: SetupCommand[] = [];
 
@@ -222,20 +222,18 @@ describe('release preflight', () => {
           return { stdout: JSON.stringify({ version: '2.2.5', server_version: 'unknown' }), stderr: '' };
         }
         gitEnvironments.push(spec.env);
-        return runArgumentCommand(spec);
+        return runSanitizedCommand(spec);
       },
       runSetupCommand: recorder(setupCommands),
     });
 
     expect(gitEnvironments.length).toBeGreaterThan(0);
     for (const environment of gitEnvironments) {
-      expect(environment.HOME).toBe(path.join(path.dirname(root), '.release-home'));
-      expect(environment.GIT_CONFIG_NOSYSTEM).toBe('1');
-      expect(environment.GIT_TERMINAL_PROMPT).toBe('0');
-      for (const key of Object.keys(environment)) {
-        expect(['HOME', 'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT']).toContain(
-          key,
-        );
+      expect(environment?.HOME).toBe(path.join(path.dirname(root), '.release-home'));
+      expect(environment?.GIT_CONFIG_NOSYSTEM).toBe('1');
+      expect(environment?.GIT_TERMINAL_PROMPT).toBe('0');
+      for (const key of Object.keys(environment ?? {})) {
+        expect([...TOOL_ENVIRONMENT_KEYS, 'HOME', 'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT']).toContain(key);
       }
     }
     expectCommonEnvironment(onecliEnvironment!, root);
@@ -385,7 +383,7 @@ describe('release preflight', () => {
         runCommand: async (spec) =>
           spec.command === '/fixture/bin/onecli'
             ? { stdout: JSON.stringify({ version: '2.2.4', server_version: 'unknown' }), stderr: '' }
-            : runArgumentCommand(spec),
+            : runSanitizedCommand(spec),
         runSetupCommand: recorder(commands),
       }),
     ).rejects.toMatchObject({ code: 'incompatible_onecli' });

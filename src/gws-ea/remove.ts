@@ -40,7 +40,7 @@ import {
   preparePrivateLocalDirectory,
   type ControlPlanePaths,
 } from './paths.js';
-import { buildAllowlistedEnvironment, runSanitizedCommand, runSanitizedCommandOutcome } from './process.js';
+import { buildToolEnvironment, runSanitizedCommand, runSanitizedCommandOutcome } from './process.js';
 import {
   activeRemovalInstanceIds,
   assertInstanceId,
@@ -705,7 +705,7 @@ async function uninstallNanoclaw(reservation: InstanceReservation): Promise<void
   }
   const coordinates = (platform: InstanceServicePlatform, runningAsRoot: boolean) =>
     createInstanceServiceCoordinates({ installId, homeDirectory, platform, runningAsRoot });
-  const environment = buildAllowlistedEnvironment(
+  const environment = buildToolEnvironment(
     {},
     { HOME: homeDirectory, PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin' },
   );

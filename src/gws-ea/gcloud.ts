@@ -12,12 +12,13 @@ import {
 } from './gcp-identity.js';
 import { preparePrivateLocalDirectory } from './paths.js';
 import {
-  buildAllowlistedEnvironment,
+  buildToolEnvironment,
   runSanitizedCommandOutcome,
   type SanitizedCommand,
   type SanitizedCommandOutcome,
   type SanitizedCommandOutcomeRunner,
 } from './process.js';
+import { registerSecret } from './redact.js';
 import { readOwnerOnlyFile, removePrivateFile, writePrivateTextFile } from './secrets.js';
 import { assertInstanceId } from './registry.js';
 import { GwsEaError } from './types.js';
@@ -120,7 +121,7 @@ function gcloudCommand(cwd: string, args: readonly string[]): SanitizedCommand {
     command: 'gcloud',
     args,
     cwd: path.resolve(cwd),
-    env: buildAllowlistedEnvironment(process.env, {
+    env: buildToolEnvironment(process.env, {
       HOME: os.homedir(),
       CLOUDSDK_CORE_DISABLE_PROMPTS: '1',
     }),
@@ -252,6 +253,7 @@ export async function preflightGcloud(input: GcloudPreflightInput): Promise<{ re
       `Google Cloud credentials for ${account} are unavailable. Run gcloud auth login ${account}, then retry.`,
     );
   }
+  registerSecret(token.stdout.trim());
   return { account };
 }
 

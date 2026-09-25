@@ -8,12 +8,13 @@ import { OneCLI } from '@onecli-sh/sdk';
 import { isErrno } from '../community-portal/errors.js';
 import { preparePrivateLocalDirectory } from './paths.js';
 import {
-  buildAllowlistedEnvironment,
+  buildToolEnvironment,
   runSanitizedCommand,
   type SanitizedCommand,
   type SanitizedCommandResult,
   type SanitizedCommandRunner,
 } from './process.js';
+import { registerSecret } from './redact.js';
 import {
   ensureRandomOwnerOnlyFile,
   readOwnerOnlyFile,
@@ -131,7 +132,7 @@ export function buildOnecliCliEnvironment(
   ambient: NodeJS.ProcessEnv = process.env,
   apiKey?: string,
 ): Readonly<Record<string, string>> {
-  const environment = buildAllowlistedEnvironment(ambient);
+  const environment = buildToolEnvironment(ambient);
   environment.HOME = layout.cliHome;
   environment.ONECLI_API_HOST = layout.appUrl;
   if (apiKey !== undefined) environment.ONECLI_API_KEY = apiKey;
@@ -139,7 +140,7 @@ export function buildOnecliCliEnvironment(
 }
 
 export function buildComposeEnvironment(ambient: NodeJS.ProcessEnv = process.env): Readonly<Record<string, string>> {
-  const environment = buildAllowlistedEnvironment(ambient);
+  const environment = buildToolEnvironment(ambient);
   if (ambient.HOME !== undefined) environment.HOME = ambient.HOME;
   return environment;
 }
@@ -254,6 +255,7 @@ async function runCompatibilityCanary(
   if (!/^oc_[A-Za-z0-9_-]{20,}$/u.test(apiKey)) {
     throw new GwsEaError('incompatible_onecli', 'OneCLI returned an invalid local API key');
   }
+  registerSecret(apiKey);
   const environment = buildOnecliCliEnvironment(layout, dependencies.ambientEnv, apiKey);
   const version = parseRecord(
     (await runOnecliCommand(layout, environment, ['version'], runCommand)).stdout,
@@ -526,7 +528,7 @@ export async function reconcileOnecliRuntime(
 
   const up = buildComposeInvocation(layout, ['up', '--detach', '--wait', '--remove-orphans']);
   await dependencies.beforeBind?.();
-  await dockerRunner({ ...up, env: composeEnvironment, timeoutMs: 120_000 });
+  await dockerRunner({ ...up, env: composeEnvironment, timeoutMs: 120_000, stream: true });
   const observed = await inspectOnecliRuntime(layout, dockerRunner, composeEnvironment);
   validateObservedOnecliRuntime(layout, observed);
   await verifyAgentNetworkIsolation(layout, dockerRunner, composeEnvironment);
@@ -565,6 +567,7 @@ export async function removeOnecliRuntime(
     ...buildComposeInvocation(layout, ['down', '--volumes', '--remove-orphans']),
     env: environment,
     timeoutMs: 120_000,
+    stream: true,
   });
   if ((await inspectProjectContainers(layout, runner, environment)).length > 0) {
     throw new GwsEaError('onecli_removal_incomplete', 'OneCLI containers remain after removal');

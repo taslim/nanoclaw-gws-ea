@@ -7,13 +7,15 @@ import { renderLaunchdService, renderSystemdService } from '../service-definitio
 import type { OnecliRuntimeLayout } from './onecli-compose.js';
 import { preparePrivateLocalDirectory, assertPrivateLocalDirectory } from './paths.js';
 import {
-  buildAllowlistedEnvironment,
+  buildHostEnvironment,
+  buildToolEnvironment,
   replaceProcess,
   runSanitizedCommand,
   type SanitizedCommand,
   type SanitizedCommandResult,
   type SanitizedCommandRunner,
 } from './process.js';
+import { activeStep } from './run-log.js';
 import { readOwnerOnlyFile, writePrivateTextFile } from './secrets.js';
 import { createInstanceServiceCoordinates, type InstanceServicePlatform } from './service-coordinates.js';
 import { validateExistingGchatEndpoint } from './endpoint.js';
@@ -339,7 +341,10 @@ export async function persistInstanceRuntime(configInput: InstanceRuntimeConfig)
   await preparePrivateLocalDirectory(path.dirname(config.secret_files.gchat_credentials));
   await preparePrivateLocalDirectory(path.join(config.checkout_realpath, 'logs'));
   await writeOrVerify(runtimeConfigFile(config), `${JSON.stringify(config, null, 2)}\n`);
-  await writeOrVerify(path.join(config.checkout_realpath, '.env'), environmentFileContents(config));
+  const environmentFile = path.join(config.checkout_realpath, '.env');
+  const environmentContents = environmentFileContents(config);
+  await writeOrVerify(environmentFile, environmentContents);
+  activeStep()?.envFile(environmentFile, environmentContents);
 }
 
 export async function loadInstanceRuntimeConfig(file: string): Promise<InstanceRuntimeConfig> {
@@ -434,7 +439,7 @@ export async function reconcileInstanceService(
   await mkdir(path.dirname(layout.serviceDefinitionPath), { recursive: true, mode: 0o700 });
   await writePrivateTextFile(layout.serviceDefinitionPath, renderInstanceService(config, layout));
   const run = dependencies.runCommand ?? runSanitizedCommand;
-  const environment = buildAllowlistedEnvironment({}, serviceEnvironment(config));
+  const environment = buildToolEnvironment({}, serviceEnvironment(config));
   const command = async (program: string, args: readonly string[]): Promise<void> => {
     await run({ command: program, args, cwd: config.checkout_realpath, env: environment, timeoutMs: 30_000 });
   };
@@ -472,7 +477,7 @@ export function buildInstanceCliCommand(
     command: layout.cliPath,
     args,
     cwd: config.checkout_realpath,
-    env: buildAllowlistedEnvironment(ambient, {
+    env: buildToolEnvironment(ambient, {
       HOME: config.home_directory,
       NANOCLAW_INSTALL_ID: config.install_id,
     }),
@@ -495,7 +500,7 @@ export async function buildInstanceHostEnvironment(
   }
   const projectNumber = parseGcpProjectNumber(projectNumberFile.trim());
   if (!projectNumber) throw new GwsEaError('invalid_runtime_config', 'Google Chat project number is invalid');
-  return buildAllowlistedEnvironment(ambient, {
+  return buildHostEnvironment(ambient, {
     HOME: config.home_directory,
     ...instanceHostConfiguration(config),
     ONECLI_API_KEY: onecliRuntimeApiKey.trim(),
@@ -518,7 +523,7 @@ export async function runInstanceOnecliAdminCommand(
     command: config.onecli_cli_path,
     args,
     cwd: config.checkout_realpath,
-    env: buildAllowlistedEnvironment(dependencies.ambientEnv, {
+    env: buildToolEnvironment(dependencies.ambientEnv, {
       HOME: path.join(path.dirname(config.checkout_realpath), 'onecli', 'cli-home'),
       ONECLI_API_HOST: config.onecli_app_url,
       ONECLI_API_KEY: apiKey,
@@ -553,7 +558,7 @@ export async function reconcileInstanceRuntime(
   const config = validateRuntimeConfig(configInput);
   await persistInstanceRuntime(config);
   const run = dependencies.runCommand ?? runSanitizedCommand;
-  const environment = buildAllowlistedEnvironment(
+  const environment = buildToolEnvironment(
     {},
     {
       HOME: config.home_directory,
@@ -580,6 +585,7 @@ export async function reconcileInstanceRuntime(
     cwd: config.checkout_realpath,
     env: environment,
     timeoutMs: 15 * 60_000,
+    stream: true,
   });
   return reconcileInstanceService(config, dependencies);
 }
