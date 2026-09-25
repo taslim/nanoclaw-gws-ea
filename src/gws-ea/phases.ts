@@ -101,7 +101,8 @@ export async function runProvisionSteps<Context>(
 
   /**
    * Observe until conclusive. Unknown is re-observed on the wait schedule, and
-   * so is absent when `waitOnAbsent` (a runtime may still be starting).
+   * so is absent when `waitOnAbsent` (a runtime may still be starting, or a
+   * change may not be visible yet).
    */
   const observe = async (
     id: ProvisionStepId,
@@ -146,7 +147,8 @@ export async function runProvisionSteps<Context>(
     if (before.status === 'pause') return before.pause;
     const applied = await resource.apply(context);
     if (applied) return applied;
-    const after = await observe(id, resource, { waitOnAbsent: false, applyOnUnknown: false });
+    // A change can take a while to become visible, so absent is waited on here too.
+    const after = await observe(id, resource, { waitOnAbsent: true, applyOnUnknown: false });
     if (after.status === 'present') return undefined;
     if (after.status === 'pause') return after.pause;
     throw new GwsEaError('step_incomplete', `${resource.name} is still missing after it was set up`);

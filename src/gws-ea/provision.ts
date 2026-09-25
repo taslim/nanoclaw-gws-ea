@@ -95,11 +95,9 @@ import { assertProviderProvisioningCapabilityDigest } from '../provider-provisio
 import { googleChatConfigurationUrl } from './chat-configuration.js';
 import type { Interaction } from './events.js';
 import {
-  parseGchatServiceAccountCredential,
   getOwnedGcpProjectNumber,
-  probeGcpProjectForCreate,
-  reconcileGcpProject,
-  type GcloudReadbackResource,
+  googleCloudResources,
+  parseGchatServiceAccountCredential,
   type GcpProjectInput,
 } from './gcloud.js';
 import { createCloudflareApi, type RetainedManagedIngressSetupSession } from './cloudflare-api.js';
@@ -111,15 +109,6 @@ import {
   validateCloudflareConnectorState,
   validateObservedCloudflareConnector,
 } from './cloudflare-connector.js';
-
-const GCP_WAIT_REASONS: Readonly<Record<GcloudReadbackResource, string>> = {
-  project: 'Waiting for the Google Cloud project…',
-  apis: 'Waiting for the required Google Cloud APIs…',
-  'service-account': 'Waiting for the Google Chat service account…',
-  'credential-policy': 'Updating the dedicated project’s Google Chat credential policy…',
-  'service-account-keys': 'Waiting for Google Cloud IAM…',
-  'credential-key': 'Waiting for the Google Chat credential…',
-};
 
 export interface ProductionProvisionOptions {
   /** Upstream's `.env` upsert, injected by the driver (`src/` cannot import `setup/`). */
@@ -184,8 +173,8 @@ export interface ProductionProvisionDependencies {
   readonly observeCheckout: Observe;
   readonly materializeReleaseCheckout: typeof materializeReleaseCheckout;
   readonly runReleasePreflight: typeof runReleasePreflight;
-  readonly observeGcp: Observe;
-  readonly reconcileGcpProject: typeof reconcileGcpProject;
+  /** `provision_gcp`'s resources (KTD5). */
+  readonly googleCloudResources: typeof googleCloudResources;
   readonly getOwnedGcpProjectNumber: typeof getOwnedGcpProjectNumber;
   readonly observeOnecli: Observe;
   readonly reconcileOnecliRuntime: typeof reconcileOnecliRuntime;
@@ -559,8 +548,7 @@ const defaultProductionDependencies: ProductionProvisionDependencies = {
   observeCheckout: defaultObserveCheckout,
   materializeReleaseCheckout,
   runReleasePreflight,
-  observeGcp: async (context) => ((await probeGcpProjectForCreate(context.input.gcp)) ? PRESENT : ABSENT),
-  reconcileGcpProject,
+  googleCloudResources,
   getOwnedGcpProjectNumber,
   observeOnecli: defaultObserveOnecli,
   reconcileOnecliRuntime,
@@ -937,19 +925,9 @@ export function createProductionProvisionSteps(
     },
     provision_gcp: {
       label: 'Configuring Google Cloud…',
-      resources: [
-        {
-          name: 'the Google Cloud project',
-          observe: dependencies.observeGcp,
-          apply: async (value) => {
-            await dependencies.reconcileGcpProject(value.input.gcp, {
-              onProgress: ({ resource }) =>
-                runtime.emit?.({ type: 'step-waiting', step: 'provision_gcp', reason: GCP_WAIT_REASONS[resource] }),
-            });
-            return undefined;
-          },
-        },
-      ],
+      resources: dependencies.googleCloudResources({
+        onWait: (reason) => runtime.emit?.({ type: 'step-waiting', step: 'provision_gcp', reason }),
+      }),
     },
     start_onecli: {
       label: 'Starting the credential vault…',

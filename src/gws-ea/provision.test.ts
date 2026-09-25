@@ -425,6 +425,20 @@ describe('step engine', () => {
     expect(engine.sleeps).toEqual([]);
   });
 
+  it('waits for a resource it just created to become visible, then completes', async () => {
+    const engine = await engineFixture();
+    // Absent before the change, then absent twice more while the change propagates.
+    engine.world.startingFor.set('provision_gcp', 3);
+
+    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+    expect(engine.world.applied.filter((name) => name === 'provision_gcp')).toHaveLength(1);
+    expect(engine.sleeps).toEqual([1_000, 2_000]);
+    expect(engine.events.filter((event) => event.type === 'step-waiting')).toEqual([
+      { type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for provision_gcp…' },
+      { type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for provision_gcp…' },
+    ]);
+  });
+
   it('pauses when an observation needs sign-in, and continues after it', async () => {
     const engine = await engineFixture();
     const signIn: ProvisionHumanPause = {
@@ -898,31 +912,51 @@ describe('production provision step composition', () => {
     });
   });
 
-  it('forwards delayed Google Cloud readback progress through the provision runtime', async () => {
+  it('forwards Google Cloud waits through the provision runtime', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
     const progress: RunEvent[] = [];
+    const reason = 'Waiting for Google Cloud to allow Google Chat key creation…';
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
-      const reconcileGcpProject: ProductionProvisionDependencies['reconcileGcpProject'] = async (
-        _input,
-        dependencies,
-      ) => {
-        await dependencies?.onProgress?.({ resource: 'service-account' });
-      };
+      const googleCloudResources: ProductionProvisionDependencies['googleCloudResources'] = (dependencies) => [
+        {
+          name: 'the Google Chat credential',
+          observe: async () => ABSENT,
+          apply: async () => {
+            dependencies?.onWait?.(reason);
+            return undefined;
+          },
+        },
+      ];
       const phase = createProductionProvisionSteps(
         context,
-        { reconcileGcpProject },
+        { googleCloudResources },
         { emit: (event) => void progress.push(event) },
       ).provision_gcp.resources[0]!;
 
       await expect(phase.apply(context)).resolves.toBeUndefined();
     });
 
-    expect(progress).toEqual([
-      { type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for the Google Chat service account…' },
-    ]);
+    expect(progress).toEqual([{ type: 'step-waiting', step: 'provision_gcp', reason }]);
+  });
+
+  it('observes Google Cloud as its own resources, restoring a lifted key policy first', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation(paths));
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const resources = createProductionProvisionSteps(productionContext(operation, reserved)).provision_gcp.resources;
+
+      expect(resources.map((resource) => [resource.name, resource.unknown ?? 'wait'])).toEqual([
+        ['the Google Chat key-creation policy', 'wait'],
+        ['the Google Cloud project', 'create-by-unique-id'],
+        ['the Google Cloud APIs', 'wait'],
+        ['the Google Chat service account', 'wait'],
+        ['the Google Chat credential', 'wait'],
+      ]);
+    });
   });
 
   it('accepts only an all-mode canonical main without enumerating its grants', async () => {
@@ -1797,8 +1831,16 @@ async function productionHarness(): Promise<ProductionHarness> {
             packageManager: 'pnpm@10.0.0',
             onecli: { gateway: ONECLI_GATEWAY_VERSION, cli: ONECLI_CLI_VERSION, sdk: ONECLI_SDK_VERSION },
           }),
-          observeGcp: async () => (resources.has('gcp') ? PRESENT : ABSENT),
-          reconcileGcpProject: async () => effect('reconcileGcpProject', 'gcp'),
+          googleCloudResources: () => [
+            {
+              name: 'the Google Cloud project',
+              observe: async () => (resources.has('gcp') ? PRESENT : ABSENT),
+              apply: async () => {
+                effect('provisionGoogleCloud', 'gcp');
+                return undefined;
+              },
+            },
+          ],
           getOwnedGcpProjectNumber: async () => '441811502258',
           holdReservedLoopbackPorts: async () => ({ release: async () => undefined }),
           observeOnecli: async () => (resources.has('onecli') ? PRESENT : ABSENT),
@@ -1913,7 +1955,7 @@ describe('production step order and pause outcomes', () => {
     expect(harness.started.slice(0, ORDER.length)).toEqual(ORDER);
     expect(harness.effects).toEqual([
       'materializeReleaseCheckout',
-      'reconcileGcpProject',
+      'provisionGoogleCloud',
       'reconcileOnecliRuntime',
       'importProviderCredential',
       'reconcileInstanceRuntime',
@@ -1947,7 +1989,7 @@ describe('production step order and pause outcomes', () => {
     expect(harness.sleeps).toEqual([]);
     expect(harness.effects.filter((effect) => !effect.startsWith('reconcilePrincipalDm'))).toEqual([
       'materializeReleaseCheckout',
-      'reconcileGcpProject',
+      'provisionGoogleCloud',
       'reconcileOnecliRuntime',
       'importProviderCredential',
       'reconcileInstanceRuntime',
