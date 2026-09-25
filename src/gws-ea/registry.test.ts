@@ -3,7 +3,8 @@ import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createProgressDisplay, runCli, type CliRuntime } from './cli.js';
+import { runCli, type CliRuntime } from './cli.js';
+import { runStep } from './events.js';
 import {
   acquireInstanceOperation,
   beginPhase,
@@ -459,8 +460,8 @@ describe('create recovery contract', () => {
         preflightGcloud: preflight,
         advanceProvision,
       }),
-    ).toBe(0);
-    expect(preflight).toHaveBeenCalledExactlyOnceWith(input.exclusive_resource_claims.gcp_account);
+    ).toBe(10);
+    expect(preflight).toHaveBeenCalledExactlyOnceWith(input.exclusive_resource_claims.gcp_account, expect.anything());
     expect(advanceProvision).toHaveBeenCalledOnce();
   });
 
@@ -493,7 +494,7 @@ describe('create recovery contract', () => {
         advanceProvision,
       }),
     ).toBe(0);
-    expect(preflight).toHaveBeenCalledExactlyOnceWith(input.exclusive_resource_claims.gcp_account);
+    expect(preflight).toHaveBeenCalledExactlyOnceWith(input.exclusive_resource_claims.gcp_account, expect.anything());
     expect(advanceProvision).toHaveBeenCalledOnce();
   });
 
@@ -516,7 +517,7 @@ describe('create recovery contract', () => {
       }),
     ).toBe(1);
     expect(advanceProvision).not.toHaveBeenCalled();
-    expect(errors).toContain('Google Cloud sign-in is required');
+    expect(errors.join('\n')).toContain('Google Cloud sign-in is required');
   });
 
   it('clears run-scoped Cloudflare authority when create exits', async () => {
@@ -546,7 +547,7 @@ describe('create recovery contract', () => {
           clearAccountToken,
         },
       }),
-    ).toBe(0);
+    ).toBe(10);
     expect(discoverZones).not.toHaveBeenCalled();
     expect(clearAccountToken).toHaveBeenCalledOnce();
   });
@@ -578,7 +579,7 @@ describe('create recovery contract', () => {
           clearAccountToken,
         },
       }),
-    ).toBe(0);
+    ).toBe(10);
     expect(clearAccountToken).toHaveBeenCalledOnce();
   });
 
@@ -587,14 +588,17 @@ describe('create recovery contract', () => {
     const stdout: string[] = [];
     const stderr: string[] = [];
 
-    const exitCode = await runCli(['create', '--track', 'dogfood'], {
-      paths,
-      stdout: (line) => stdout.push(line),
-      stderr: (line) => stderr.push(line),
-      preflightGcloud: async () => {
-        throw new GwsEaError('gcloud_required', 'Install gcloud, then retry.');
+    const exitCode = await runCli(
+      ['create', '--track', 'dogfood', '--source-remote', 'https://example.test/nanoclaw.git'],
+      {
+        paths,
+        stdout: (line) => stdout.push(line),
+        stderr: (line) => stderr.push(line),
+        preflightGcloud: async () => {
+          throw new GwsEaError('gcloud_required', 'Install gcloud, then retry.');
+        },
       },
-    });
+    );
 
     expect(exitCode).toBe(1);
     expect(stdout).toEqual([]);
@@ -606,19 +610,15 @@ describe('create recovery contract', () => {
     const paths = await testPaths();
     const advanced: string[] = [];
     let portsReleased = false;
-    const advanceProvision: NonNullable<CliRuntime['advanceProvision']> = async (
-      operation,
-      _selection,
-      heldPorts,
-      runtime,
-    ) => {
+    const advanceProvision: NonNullable<CliRuntime['advanceProvision']> = async (operation, { portLease, runtime }) => {
       if (advanced.length === 0) {
-        expect(heldPorts).toBeDefined();
+        expect(portLease).toBeDefined();
         expect(portsReleased).toBe(false);
       }
-      await runtime?.onProgress?.({ phase: 'provision_gcp' });
-      await runtime?.onProgress?.({ phase: 'provision_gcp', detail: 'service-account' });
-      await runtime?.onProgress?.({ phase: 'provision_gcp', detail: 'service-account' });
+      await runStep(runtime, { id: 'provision_gcp', label: 'Configuring Google Cloud…' }, async () => {
+        runtime.emit?.({ type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for the service account…' });
+        runtime.emit?.({ type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for the service account…' });
+      });
       advanced.push(operation.instanceId);
       return {
         status: 'paused' as const,
@@ -651,15 +651,16 @@ describe('create recovery contract', () => {
         }),
         collectCreateInputs: async () => createSetupInput(),
       }),
-    ).toBe(0);
+    ).toBe(10);
     const instanceId = output[0]!.slice('instance_id: '.length);
     expect(resolveCalls).toEqual([['https://example.test/nanoclaw.git', 'refs/heads/dogfood']]);
     expect(portsReleased).toBe(true);
-    expect(output.slice(1, 5)).toEqual([
-      'Preparing assistant…',
+    expect(output.slice(1, 6)).toEqual([
+      'Resolving the release…',
+      'Reserving the assistant…',
       'Configuring Google Cloud…',
-      'Waiting for the Google Chat service account…',
-      'Provisioning paused: Send the direct message.',
+      'Waiting for the service account…',
+      'Paused at bind_principal: Send the direct message.',
     ]);
     expect((await readRegistry(paths)).instances[instanceId]).toMatchObject({
       deployed_commit: 'b'.repeat(40),
@@ -677,7 +678,7 @@ describe('create recovery contract', () => {
         preflightGcloud: async () => ({ account: 'operator@example.test' }),
         advanceProvision,
       }),
-    ).toBe(0);
+    ).toBe(10);
     expect(advanced).toEqual([instanceId, instanceId]);
   });
 
@@ -686,25 +687,25 @@ describe('create recovery contract', () => {
     const input = reservation(paths);
     await reserveInstance(paths, input);
     const output: string[] = [];
-    const advanceProvision: NonNullable<CliRuntime['advanceProvision']> = async (
-      _operation,
-      _selection,
-      _heldPorts,
-      runtime,
-    ) => {
-      await runtime?.onProgress?.({ phase: 'provision_gcp' });
-      await runtime?.onProgress?.({ phase: 'provision_gcp', detail: 'service-account' });
-      await runtime?.onProgress?.({ phase: 'provision_gcp', detail: 'service-account' });
-      return {
-        status: 'paused',
-        pause: {
-          kind: 'human-action',
-          phase: 'configure_channel',
-          code: 'chat_configuration_required',
-          message: 'Configure Google Chat.',
+    const advanceProvision: NonNullable<CliRuntime['advanceProvision']> = async (_operation, { runtime }) =>
+      runStep(
+        runtime,
+        { id: 'provision_gcp', label: 'Configuring Google Cloud…' },
+        async () => {
+          runtime.emit?.({ type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for the service account…' });
+          runtime.emit?.({ type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for the service account…' });
+          return {
+            status: 'paused' as const,
+            pause: {
+              kind: 'human-action' as const,
+              phase: 'configure_channel' as const,
+              code: 'chat_configuration_required',
+              message: 'Configure Google Chat.',
+            },
+          };
         },
-      };
-    };
+        (result) => result.pause,
+      );
 
     expect(
       await runCli(['resume', '--id', input.instance_id], {
@@ -714,42 +715,15 @@ describe('create recovery contract', () => {
         preflightGcloud: async () => ({ account: 'operator@example.test' }),
         advanceProvision,
       }),
-    ).toBe(0);
+    ).toBe(10);
 
     expect(output).toEqual([
-      'Resuming assistant…',
       'Configuring Google Cloud…',
-      'Waiting for the Google Chat service account…',
-      'Provisioning paused: Configure Google Chat.',
+      'Waiting for the service account…',
+      'Paused at configure_channel: Configure Google Chat.',
       `Continue with: gws-ea resume --id ${input.instance_id}`,
+      expect.stringMatching(/^Log: \S+progress\.log$/u),
     ]);
-  });
-
-  it('updates and clears one interactive status line without intercepting process signals', () => {
-    const terminalOutput: string[] = [];
-    const sigintListeners = process.listenerCount('SIGINT');
-    const sigtermListeners = process.listenerCount('SIGTERM');
-    const progress = createProgressDisplay(
-      () => {
-        throw new Error('interactive progress must not emit durable lines');
-      },
-      true,
-      (text) => terminalOutput.push(text),
-    );
-
-    progress.show('Configuring Google Cloud…');
-    progress.show('Configuring Google Cloud…');
-    progress.show('Waiting for the Google Chat service account…');
-    progress.clear();
-
-    expect(terminalOutput).toEqual([
-      '\r\u001B[2KConfiguring Google Cloud…',
-      '\r\u001B[2KWaiting for the Google Chat service account…',
-      '\r\u001B[2K',
-    ]);
-    expect(terminalOutput.join('')).not.toContain('\n');
-    expect(process.listenerCount('SIGINT')).toBe(sigintListeners);
-    expect(process.listenerCount('SIGTERM')).toBe(sigtermListeners);
   });
 
   it('provisions from the documented create command and prints exact principal-selection commands', async () => {
@@ -775,7 +749,7 @@ describe('create recovery contract', () => {
     };
 
     expect(
-      await runCli(['create', '--track', 'dogfood'], {
+      await runCli(['create', '--track', 'dogfood', '--source-remote', 'https://example.test/nanoclaw.git'], {
         paths,
         stdout: (line) => output.push(line),
         stderr: () => undefined,
@@ -783,7 +757,7 @@ describe('create recovery contract', () => {
         collectCreateInputs,
         advanceProvision: async () => pause,
       }),
-    ).toBe(0);
+    ).toBe(10);
     expect(idWasPrintedBeforeCollection).toBe(true);
     const instanceId = output[0]!.slice('instance_id: '.length);
     expect(output).toContain(
@@ -802,7 +776,7 @@ describe('create recovery contract', () => {
         preflightGcloud: async () => ({ account: 'operator@example.test' }),
         advanceProvision: async () => pause,
       }),
-    ).toBe(0);
+    ).toBe(10);
     expect(resumeOutput).toContain(
       `  "Primary DM": gws-ea resume --id ${instanceId} --messaging-group-id 'gchat:spaces/AAA'`,
     );
@@ -812,15 +786,18 @@ describe('create recovery contract', () => {
     const paths = await testPaths();
     const stdout: string[] = [];
     const stderr: string[] = [];
-    const exitCode = await runCli(['create', '--track', 'dogfood'], {
-      paths,
-      stdout: (line) => stdout.push(line),
-      stderr: (line) => stderr.push(line),
-      collectCreateInputs: async () => {
-        throw new GwsEaError('cancelled', 'Assistant creation was cancelled');
+    const exitCode = await runCli(
+      ['create', '--track', 'dogfood', '--source-remote', 'https://example.test/nanoclaw.git'],
+      {
+        paths,
+        stdout: (line) => stdout.push(line),
+        stderr: (line) => stderr.push(line),
+        collectCreateInputs: async () => {
+          throw new GwsEaError('cancelled', 'Assistant creation was cancelled');
+        },
+        preflightGcloud: async () => ({ account: 'operator@example.test' }),
       },
-      preflightGcloud: async () => ({ account: 'operator@example.test' }),
-    });
+    );
 
     expect(exitCode).toBe(1);
     expect(stdout[0]).toMatch(/^instance_id: [0-9a-f-]{36}$/u);
@@ -948,7 +925,7 @@ describe('create recovery contract', () => {
           };
         },
       }),
-    ).toBe(0);
+    ).toBe(10);
     expect(resumed).toEqual([instanceId]);
   });
 

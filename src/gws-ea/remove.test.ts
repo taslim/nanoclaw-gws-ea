@@ -301,7 +301,7 @@ describe('assistant removal', () => {
       }),
     ).toBe(0);
     expect(confirm).not.toHaveBeenCalled();
-    expect(remove).toHaveBeenCalledWith(paths, input.instance_id);
+    expect(remove).toHaveBeenCalledWith(paths, input.instance_id, expect.anything());
   });
 
   it('previews exact managed ownership and whether shared ingress is retained or retired', async () => {
@@ -315,7 +315,7 @@ describe('assistant removal', () => {
         stdout: (line) => output.push(line),
         stderr: () => undefined,
         confirmRemoval: async () => false,
-        requestCloudflareAccountToken: requestToken,
+        prompts: { providerCredential: vi.fn(), cloudflareAccountToken: requestToken, googleCloudSignIn: vi.fn() },
       }),
     ).toBe(0);
 

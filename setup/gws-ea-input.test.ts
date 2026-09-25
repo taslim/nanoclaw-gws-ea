@@ -1,6 +1,12 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
 import { describe, expect, it, vi } from 'vitest';
 
-import { GWS_EA_RELEASE_REMOTE } from '../src/gws-ea/release-tracks.js';
+import { runCli } from '../src/gws-ea/cli.js';
+import type { SecretSource } from '../src/gws-ea/create-input.js';
+import { resolveControlPlanePaths } from '../src/gws-ea/paths.js';
 import type { SetupProviderEntry } from './providers/registry.js';
 import { authenticateGwsEaProvider, collectGwsEaCreateInput } from './gws-ea-input.js';
 
@@ -12,6 +18,7 @@ const runtime = {
   runningAsRoot: false,
 };
 const providerCapabilityDigest = 'a'.repeat(64);
+const NO_SECRETS: SecretSource = { get: () => undefined };
 
 function provider(value: string, label: string): SetupProviderEntry {
   return {
@@ -52,6 +59,8 @@ describe('GWS-EA interactive create input', () => {
     const result = await collectGwsEaCreateInput(
       {
         instanceId: '11111111-1111-4111-8111-111111111111',
+        sourceRemote: 'https://example.test/nanoclaw.git',
+        secrets: NO_SECRETS,
         track: 'dogfood',
         provided: {
           endpoint: 'https://assistant.example.test/webhook/gchat',
@@ -82,7 +91,6 @@ describe('GWS-EA interactive create input', () => {
       expect.objectContaining({ message: 'Principal timezone', initialValue: 'America/Los_Angeles' }),
     );
     expect(result).toEqual({
-      sourceRemote: GWS_EA_RELEASE_REMOTE,
       ingress: { mode: 'existing', endpointUrl: 'https://assistant.example.test/webhook/gchat' },
       assistantWorkspaceEmail: 'ada@example.test',
       bootstrapManifest: {
@@ -130,9 +138,10 @@ describe('GWS-EA interactive create input', () => {
     const result = await collectGwsEaCreateInput(
       {
         instanceId: '11111111-1111-4111-8111-111111111111',
+        sourceRemote: 'https://example.test/nanoclaw.git',
+        secrets: NO_SECRETS,
         track: 'prod',
         provided: {
-          'source-remote': 'git@github.com:example/nanoclaw.git',
           endpoint: 'https://aya.example.test/webhook/gchat',
           'workspace-email': 'aya@example.test',
         },
@@ -186,8 +195,10 @@ describe('GWS-EA interactive create input', () => {
     await collectGwsEaCreateInput(
       {
         instanceId: '11111111-1111-4111-8111-111111111111',
+        sourceRemote: 'https://example.test/nanoclaw.git',
+        secrets: NO_SECRETS,
         track: 'prod',
-        provided: { 'source-remote': 'https://example.test/nanoclaw.git' },
+        provided: {},
       },
       {
         providers: [provider('claude', 'Claude')],
@@ -235,9 +246,10 @@ describe('GWS-EA interactive create input', () => {
     const result = await collectGwsEaCreateInput(
       {
         instanceId: '11111111-1111-4111-8111-111111111111',
+        sourceRemote: 'https://example.test/nanoclaw.git',
+        secrets: NO_SECRETS,
         track: 'prod',
         provided: {
-          'source-remote': 'https://example.test/nanoclaw.git',
           'workspace-email': 'aya@example.test',
         },
         managedIngressSetup: {
@@ -308,9 +320,10 @@ describe('GWS-EA interactive create input', () => {
     const result = await collectGwsEaCreateInput(
       {
         instanceId: '11111111-1111-4111-8111-111111111111',
+        sourceRemote: 'https://example.test/nanoclaw.git',
+        secrets: NO_SECRETS,
         track: 'prod',
         provided: {
-          'source-remote': 'https://example.test/nanoclaw.git',
           'workspace-email': 'aya@example.test',
         },
         managedIngressSetup: {
@@ -373,9 +386,10 @@ describe('GWS-EA interactive create input', () => {
     const result = await collectGwsEaCreateInput(
       {
         instanceId: '11111111-1111-4111-8111-111111111111',
+        sourceRemote: 'https://example.test/nanoclaw.git',
+        secrets: NO_SECRETS,
         track: 'prod',
         provided: {
-          'source-remote': 'https://example.test/nanoclaw.git',
           endpoint: 'https://aya.example.test/webhook/gchat',
           'workspace-email': 'aya@example.test',
         },
@@ -418,9 +432,10 @@ describe('GWS-EA interactive create input', () => {
       collectGwsEaCreateInput(
         {
           instanceId: '11111111-1111-4111-8111-111111111111',
+          sourceRemote: 'https://example.test/nanoclaw.git',
+          secrets: NO_SECRETS,
           track: 'prod',
           provided: {
-            'source-remote': 'https://example.test/nanoclaw.git',
             'workspace-email': 'aya@example.test',
           },
           managedIngressSetup: {
@@ -494,9 +509,10 @@ describe('GWS-EA interactive create input', () => {
       collectGwsEaCreateInput(
         {
           instanceId: '11111111-1111-4111-8111-111111111111',
+          sourceRemote: 'https://example.test/nanoclaw.git',
+          secrets: NO_SECRETS,
           track: 'prod',
           provided: {
-            'source-remote': 'https://example.test/nanoclaw.git',
             'workspace-email': 'aya@example.test',
           },
           managedIngressSetup: {
@@ -539,5 +555,221 @@ describe('GWS-EA provider authentication', () => {
       allowSkip: false,
       allowAmbientConfiguration: false,
     });
+  });
+});
+
+describe('GWS-EA unattended create input', () => {
+  const unattendedPrompts = {
+    note: vi.fn(),
+    text: vi.fn(async () => {
+      throw new Error('unattended input must not prompt');
+    }),
+    password: vi.fn(async () => {
+      throw new Error('unattended input must not prompt');
+    }),
+    confirm: vi.fn(async () => {
+      throw new Error('unattended input must not prompt');
+    }),
+    select: vi.fn(async () => {
+      throw new Error('unattended input must not prompt');
+    }),
+    isCancel: () => false,
+    logInfo: vi.fn(),
+  };
+  const FLAGS = {
+    'assistant-first-name': 'Aya',
+    'principal-first-name': 'Taslim',
+    'principal-last-name': 'Khan',
+    'principal-timezone': 'America/Los_Angeles',
+    'workspace-email': 'aya@example.test',
+    endpoint: 'https://aya.example.test/webhook/gchat',
+  } as const;
+
+  function unattended(provided: Record<string, string>, secrets: SecretSource = NO_SECRETS, extra = {}) {
+    return collectGwsEaCreateInput(
+      {
+        instanceId: '11111111-1111-4111-8111-111111111111',
+        sourceRemote: 'https://example.test/nanoclaw.git',
+        secrets,
+        track: 'dogfood',
+        provided,
+        ...extra,
+      },
+      {
+        interactive: false,
+        providers: [provider('claude', 'Claude')],
+        detectedRuntime: runtime,
+        detectedTimezone: 'UTC',
+        providerCapabilityDigest,
+        prompts: unattendedPrompts,
+      },
+    );
+  }
+
+  it('builds the full answer from flags alone', async () => {
+    const result = await unattended(FLAGS);
+
+    expect(result.ingress).toEqual({ mode: 'existing', endpointUrl: 'https://aya.example.test/webhook/gchat' });
+    expect(result.bootstrapManifest.identity).toEqual({
+      assistant_display_name: 'Aya',
+      principal_display_name: 'Taslim Khan',
+      principal_timezone: 'America/Los_Angeles',
+    });
+    expect(unattendedPrompts.text).not.toHaveBeenCalled();
+  });
+
+  it.each(['assistant-first-name', 'principal-first-name', 'principal-timezone', 'workspace-email'] as const)(
+    'names --%s when it is missing',
+    async (flag) => {
+      const { [flag]: _omitted, ...provided } = FLAGS;
+      await expect(unattended(provided)).rejects.toMatchObject({
+        code: 'input_required',
+        message: expect.stringContaining(`--${flag}`),
+      });
+    },
+  );
+
+  it('validates flag values like prompted ones, naming the flag', async () => {
+    await expect(unattended({ ...FLAGS, 'principal-timezone': 'Not/A_Zone' })).rejects.toMatchObject({
+      code: 'invalid_arguments',
+      message: expect.stringContaining('--principal-timezone'),
+    });
+    await expect(unattended({ ...FLAGS, 'workspace-email': 'not-an-email' })).rejects.toMatchObject({
+      message: expect.stringContaining('--workspace-email'),
+    });
+  });
+
+  it('collects managed Cloudflare ingress from flags and the supplied token', async () => {
+    const retained: string[] = [];
+    const { endpoint: _endpoint, ...base } = FLAGS;
+    const result = await unattended(
+      { ...base, ingress: 'managed-cloudflare', 'cloudflare-zone': 'example.net', 'hostname-label': 'aya' },
+      { get: (name) => (name === 'cloudflareAccountToken' ? 'supplied-cloudflare-token' : undefined) },
+      {
+        managedIngressSetup: {
+          discoverZones: async () => [
+            {
+              accountId: 'a'.repeat(32),
+              accountName: 'A',
+              zoneId: 'b'.repeat(32),
+              name: 'example.com',
+              status: 'active',
+            },
+            {
+              accountId: 'c'.repeat(32),
+              accountName: 'C',
+              zoneId: 'd'.repeat(32),
+              name: 'example.net',
+              status: 'active',
+            },
+          ],
+          retainAccountToken: (token: string) => retained.push(token),
+          clearAccountToken: vi.fn(),
+        },
+      },
+    );
+
+    expect(result.ingress).toEqual({
+      mode: 'managed-cloudflare',
+      accountId: 'c'.repeat(32),
+      zoneId: 'd'.repeat(32),
+      zoneName: 'example.net',
+      hostname: 'aya.example.net',
+      callbackUrl: 'https://aya.example.net/webhook/gchat',
+    });
+    expect(retained).toEqual(['supplied-cloudflare-token']);
+  });
+
+  it('names the Cloudflare token variable when managed ingress has no token', async () => {
+    const { endpoint: _endpoint, ...base } = FLAGS;
+    await expect(
+      unattended(
+        { ...base, ingress: 'managed-cloudflare', 'cloudflare-zone': 'example.com', 'hostname-label': 'aya' },
+        NO_SECRETS,
+        { managedIngressSetup: { discoverZones: vi.fn(), retainAccountToken: vi.fn(), clearAccountToken: vi.fn() } },
+      ),
+    ).rejects.toMatchObject({
+      code: 'input_required',
+      message: expect.stringContaining('GWS_EA_CLOUDFLARE_API_TOKEN'),
+    });
+  });
+
+  it('requires --provider only when more than one provider is composed', async () => {
+    const providers = [provider('claude', 'Claude'), provider('codex', 'Codex')];
+    const dependencies = {
+      interactive: false,
+      providers,
+      detectedRuntime: runtime,
+      detectedTimezone: 'UTC',
+      providerCapabilityDigest,
+      prompts: unattendedPrompts,
+    };
+    const base = {
+      instanceId: '11111111-1111-4111-8111-111111111111',
+      sourceRemote: 'https://example.test/nanoclaw.git',
+      secrets: NO_SECRETS,
+      track: 'dogfood',
+    };
+    await expect(collectGwsEaCreateInput({ ...base, provided: FLAGS }, dependencies)).rejects.toMatchObject({
+      message: expect.stringContaining('--provider'),
+    });
+    const chosen = await collectGwsEaCreateInput({ ...base, provided: { ...FLAGS, provider: 'codex' } }, dependencies);
+    expect(chosen.bootstrapManifest.provider.id).toBe('codex');
+  });
+
+  it('reaches the first pause of a scripted create without a person', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-unattended-'));
+    try {
+      const paths = resolveControlPlanePaths({
+        configRoot: path.join(root, 'config'),
+        stateRoot: path.join(root, 'state'),
+      });
+      const out: string[] = [];
+      const exitCode = await runCli(
+        [
+          'create',
+          '--track',
+          'dogfood',
+          '--source-remote',
+          '/srv/git/nanoclaw.git',
+          ...Object.entries(FLAGS).flatMap(([flag, value]) => [`--${flag}`, value]),
+        ],
+        {
+          paths,
+          stdout: (line) => out.push(line),
+          stderr: (line) => out.push(line),
+          environment: {},
+          collectCreateInputs: (context) =>
+            collectGwsEaCreateInput(context, {
+              interactive: false,
+              providers: [provider('claude', 'Claude')],
+              detectedRuntime: { ...runtime, nodePath: process.execPath },
+              providerCapabilityDigest,
+            }),
+          preflightGcloud: async () => ({ account: 'operator@example.test' }),
+          resolveRelease: async (sourceRemote, releaseRef) => ({ sourceRemote, releaseRef, commit: 'b'.repeat(40) }),
+          holdLoopbackPorts: async () => ({
+            ports: { nanoclaw_webhook: 35_101, onecli_app: 35_102, onecli_gateway: 35_103 },
+            release: async () => undefined,
+          }),
+          advanceProvision: async () => ({
+            status: 'paused',
+            pause: {
+              kind: 'human-action',
+              phase: 'configure_channel',
+              code: 'chat_configuration_required',
+              message: "Finish this assistant's Google Chat app configuration, then confirm it.",
+              resumeFlag: '--chat-configured',
+            },
+          }),
+        },
+      );
+
+      expect(exitCode).toBe(10);
+      const instanceId = out[0]!.slice('instance_id: '.length);
+      expect(out).toContain(`Continue with: gws-ea resume --id ${instanceId} --chat-configured`);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

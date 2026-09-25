@@ -3,7 +3,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { GwsEaError } from '../src/gws-ea/types.js';
-import { ensureGcloudReady } from './gws-ea-prerequisites.js';
+import { ensureGcloudReady, signInToGoogleCloud } from './gws-ea-prerequisites.js';
 
 function promptFixture(confirmAnswers: readonly boolean[] = [true]) {
   const answers = [...confirmAnswers];
@@ -143,5 +143,26 @@ describe('GWS-EA Google Cloud prerequisite flow', () => {
     ).rejects.toMatchObject({ code: 'cancelled' });
 
     expect(runLogin).not.toHaveBeenCalled();
+  });
+
+  it('signs in on its own for the Interaction port, handing gcloud the terminal', async () => {
+    const prompts = promptFixture([true]);
+    const runLogin = vi.fn(async () => 0);
+
+    await signInToGoogleCloud('reserved@example.com', {
+      resolveExecutable: async () => '/opt/homebrew/bin/gcloud',
+      runLogin,
+      prompts,
+    });
+
+    expect(prompts.note).toHaveBeenCalledWith(expect.stringContaining('reserved@example.com'), 'Google Cloud');
+    expect(runLogin).toHaveBeenCalledWith('/opt/homebrew/bin/gcloud', ['auth', 'login', 'reserved@example.com']);
+    await expect(
+      signInToGoogleCloud(undefined, {
+        resolveExecutable: async () => '/opt/homebrew/bin/gcloud',
+        runLogin: async () => 1,
+        prompts: promptFixture([true]),
+      }),
+    ).rejects.toMatchObject({ code: 'gcloud_auth_failed' });
   });
 });

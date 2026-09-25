@@ -13,12 +13,15 @@ interface PromptAdapter {
   isCancel(value: unknown): boolean;
 }
 
-export interface GcloudPrerequisiteDependencies {
-  readonly account?: string;
-  readonly check?: () => Promise<{ readonly account: string }>;
+export interface GoogleCloudSignInDependencies {
   readonly resolveExecutable?: (searchPath: string) => Promise<string>;
   readonly runLogin?: (executable: string, args: readonly string[]) => Promise<number>;
   readonly prompts?: PromptAdapter;
+}
+
+export interface GcloudPrerequisiteDependencies extends GoogleCloudSignInDependencies {
+  readonly account?: string;
+  readonly check?: () => Promise<{ readonly account: string }>;
 }
 
 const defaultPrompts: PromptAdapter = {
@@ -52,6 +55,62 @@ function activateExecutable(executable: string): void {
   if (!current.includes(directory)) process.env.PATH = [directory, ...current].join(path.delimiter);
 }
 
+function defaultResolveExecutable(searchPath: string): Promise<string> {
+  return resolveExecutable('gcloud', searchPath);
+}
+
+function defaultRunLogin(executable: string, args: readonly string[]): Promise<number> {
+  return runInheritScript(executable, [...args], { env: buildInteractiveEnvironment() });
+}
+
+/** Locate gcloud (including the installer's default directory) and put it on PATH for later children. */
+async function locateGcloud(resolve: (searchPath: string) => Promise<string>): Promise<string> {
+  let executable: string;
+  try {
+    executable = await resolve(gcloudSearchPath());
+  } catch {
+    throw new GwsEaError(
+      'gcloud_required',
+      `Google Cloud CLI is still unavailable. Finish installation from ${GCLOUD_INSTALL_URL}, then retry.`,
+    );
+  }
+  activateExecutable(executable);
+  return executable;
+}
+
+async function signIn(
+  account: string | undefined,
+  prompts: PromptAdapter,
+  locate: () => Promise<string>,
+  runLogin: (executable: string, args: readonly string[]) => Promise<number>,
+): Promise<void> {
+  prompts.note(
+    account
+      ? `Sign back in as ${account} to continue this assistant’s setup. GWS-EA does not store the login credential.`
+      : 'Sign in with the Google account that should own this assistant’s dedicated project. GWS-EA does not store the login credential.',
+    'Google Cloud',
+  );
+  await confirm(prompts, 'Sign in to Google Cloud now?');
+  const exitCode = await runLogin(await locate(), ['auth', 'login', ...(account ? [account] : [])]);
+  if (exitCode !== 0) {
+    throw new GwsEaError('gcloud_auth_failed', 'Google Cloud sign-in did not complete.');
+  }
+}
+
+/** Interactive `gcloud auth login`: the operator confirms, then gcloud owns the terminal and browser flow. */
+export async function signInToGoogleCloud(
+  account?: string,
+  dependencies: GoogleCloudSignInDependencies = {},
+): Promise<void> {
+  const resolve = dependencies.resolveExecutable ?? defaultResolveExecutable;
+  await signIn(
+    account,
+    dependencies.prompts ?? defaultPrompts,
+    () => locateGcloud(resolve),
+    dependencies.runLogin ?? defaultRunLogin,
+  );
+}
+
 export async function ensureGcloudReady(
   cwd: string,
   dependencies: GcloudPrerequisiteDependencies = {},
@@ -60,27 +119,16 @@ export async function ensureGcloudReady(
   const check =
     dependencies.check ??
     (() => preflightGcloud({ cwd, ...(dependencies.account ? { account: dependencies.account } : {}) }));
-  const resolveGcloudExecutable =
-    dependencies.resolveExecutable ?? ((searchPath: string) => resolveExecutable('gcloud', searchPath));
-  const runLogin =
-    dependencies.runLogin ??
-    ((executable: string, args: readonly string[]) =>
-      runInheritScript(executable, [...args], { env: buildInteractiveEnvironment() }));
+  const resolveGcloudExecutable = dependencies.resolveExecutable ?? defaultResolveExecutable;
+  const runLogin = dependencies.runLogin ?? defaultRunLogin;
   let installAttempted = false;
   let loginAttempted = false;
   let executable: string | undefined;
 
   const resolveGcloud = async (): Promise<string> => {
-    try {
-      executable ??= await resolveGcloudExecutable(gcloudSearchPath());
-      activateExecutable(executable);
-      return executable;
-    } catch {
-      throw new GwsEaError(
-        'gcloud_required',
-        `Google Cloud CLI is still unavailable. Finish installation from ${GCLOUD_INSTALL_URL}, then retry.`,
-      );
-    }
+    executable ??= await locateGcloud(resolveGcloudExecutable);
+    activateExecutable(executable);
+    return executable;
   };
 
   for (;;) {
@@ -110,21 +158,7 @@ export async function ensureGcloudReady(
             'Google Cloud sign-in did not become available. Complete gcloud authentication, then retry.',
           );
         }
-        prompts.note(
-          dependencies.account
-            ? `Sign back in as ${dependencies.account} to continue this assistant’s setup. GWS-EA does not store the login credential.`
-            : 'Sign in with the Google account that should own this assistant’s dedicated project. GWS-EA does not store the login credential.',
-          'Google Cloud',
-        );
-        await confirm(prompts, 'Sign in to Google Cloud now?');
-        const exitCode = await runLogin(await resolveGcloud(), [
-          'auth',
-          'login',
-          ...(dependencies.account ? [dependencies.account] : []),
-        ]);
-        if (exitCode !== 0) {
-          throw new GwsEaError('gcloud_auth_failed', 'Google Cloud sign-in did not complete.');
-        }
+        await signIn(dependencies.account, prompts, resolveGcloud, runLogin);
         loginAttempted = true;
         continue;
       }

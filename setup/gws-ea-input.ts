@@ -3,16 +3,18 @@ import path from 'node:path';
 
 import * as p from '@clack/prompts';
 
-import type {
-  CloudflareZoneChoice,
-  CreateIngressAnswer,
-  CreatePromptContext,
-  CreateSetupAnswers,
+import {
+  describeSecretInput,
+  type CloudflareZoneChoice,
+  type CreateIngressAnswer,
+  type CreateInputFlag,
+  type CreatePromptContext,
+  type CreateSetupAnswers,
 } from '../src/gws-ea/create-input.js';
 import { validateExistingGchatEndpoint } from '../src/gws-ea/endpoint.js';
 import { resolveControlPlanePaths } from '../src/gws-ea/paths.js';
 import { resolvePersistedExecutable } from '../src/gws-ea/process.js';
-import { configuredReleaseSource } from '../src/gws-ea/release-tracks.js';
+import { registerSecret } from '../src/gws-ea/redact.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
 import type { ProviderCredential } from '../src/provider-credential.js';
 import { providerProvisioningCapabilityDigest } from '../src/provider-provisioning-capability.js';
@@ -50,6 +52,8 @@ interface PromptAdapter {
 }
 
 export interface GwsEaCreateInputDependencies {
+  /** Whether a person can answer prompts. Without one, every input comes from its flag or secret source. */
+  readonly interactive?: boolean;
   readonly providers?: readonly SetupProviderEntry[];
   readonly detectedRuntime?: DetectedRuntime;
   readonly detectedTimezone?: string;
@@ -85,6 +89,61 @@ function cancelled(): never {
   throw new GwsEaError('cancelled', 'Assistant creation was cancelled');
 }
 
+/** Where create input comes from: its flag first, then a prompt when a person is present. */
+interface InputSource {
+  readonly context: CreatePromptContext;
+  readonly prompts: PromptAdapter;
+  readonly interactive: boolean;
+}
+
+function missingInput(flag: CreateInputFlag, hint = ''): GwsEaError {
+  return new GwsEaError(
+    'input_required',
+    `Missing --${flag}${hint}; pass it, or run gws-ea create in a terminal to be asked.`,
+    { details: { flag: `--${flag}` } },
+  );
+}
+
+function invalidFlag(flag: CreateInputFlag, problem: string): GwsEaError {
+  return new GwsEaError('invalid_arguments', `--${flag}: ${problem}`, { details: { flag: `--${flag}` } });
+}
+
+function supplied(source: InputSource, flag: CreateInputFlag): string | undefined {
+  return source.context.provided[flag]?.trim() || undefined;
+}
+
+async function textInput(
+  source: InputSource,
+  flag: CreateInputFlag,
+  message: string,
+  options: {
+    readonly initialValue?: string;
+    readonly placeholder?: string;
+    readonly optional?: boolean;
+    readonly validate?: (value: string) => string | undefined;
+  } = {},
+): Promise<string> {
+  const value = supplied(source, flag);
+  if (value !== undefined) {
+    const problem = options.validate?.(value);
+    if (problem) throw invalidFlag(flag, problem);
+    return value;
+  }
+  if (!source.interactive) {
+    if (options.optional) return '';
+    throw missingInput(flag);
+  }
+  return askText(source.prompts, message, options);
+}
+
+function note(source: InputSource, message: string, title: string): void {
+  if (source.interactive) source.prompts.note(message, title);
+}
+
+function logInfo(source: InputSource, message: string): void {
+  if (source.interactive) source.prompts.logInfo(message);
+}
+
 async function askText(
   prompts: PromptAdapter,
   message: string,
@@ -116,17 +175,6 @@ async function askPassword(prompts: PromptAdapter, message: string): Promise<str
   });
   if (prompts.isCancel(answer) || typeof answer !== 'string' || !answer.trim()) return cancelled();
   return answer.trim();
-}
-
-async function suppliedOrAsk(
-  context: CreatePromptContext,
-  prompts: PromptAdapter,
-  field: 'endpoint' | 'workspace-email',
-  message: string,
-  validate?: (value: string) => string | undefined,
-): Promise<string> {
-  const supplied = context.provided[field]?.trim();
-  return supplied || askText(prompts, message, { validate });
 }
 
 async function detectRuntime(): Promise<DetectedRuntime> {
@@ -206,15 +254,25 @@ function validateDiscoveredZones(zones: readonly CloudflareZoneChoice[]): readon
   return zones;
 }
 
-async function chooseZone(
-  zones: readonly CloudflareZoneChoice[],
-  prompts: PromptAdapter,
-): Promise<CloudflareZoneChoice> {
-  if (zones.length === 1) {
-    const zone = zones[0]!;
-    prompts.logInfo(`Using ${zone.name}, the active zone available to this token.`);
+async function chooseZone(zones: readonly CloudflareZoneChoice[], source: InputSource): Promise<CloudflareZoneChoice> {
+  const named = supplied(source, 'cloudflare-zone')?.toLowerCase();
+  if (named !== undefined) {
+    const zone = zones.find((candidate) => candidate.name === named);
+    if (!zone) {
+      throw invalidFlag(
+        'cloudflare-zone',
+        `${named} is not an active zone this token can use (${zones.map((candidate) => candidate.name).join(', ')})`,
+      );
+    }
     return zone;
   }
+  if (zones.length === 1) {
+    const zone = zones[0]!;
+    logInfo(source, `Using ${zone.name}, the active zone available to this token.`);
+    return zone;
+  }
+  if (!source.interactive) throw missingInput('cloudflare-zone');
+  const prompts = source.prompts;
   const selected = await prompts.select({
     message: 'Which Cloudflare zone should host the assistant?',
     options: zones.map((zone) => ({
@@ -229,16 +287,20 @@ async function chooseZone(
   return zone;
 }
 
-async function collectIngress(
-  context: CreatePromptContext,
-  prompts: PromptAdapter,
-  assistantFirstName: string,
-): Promise<CreateIngressAnswer> {
-  const suppliedEndpoint = context.provided.endpoint?.trim();
-  if (suppliedEndpoint) {
-    return { mode: 'existing', endpointUrl: validateExistingGchatEndpoint(suppliedEndpoint) };
+async function chooseIngressMode(source: InputSource): Promise<CreateIngressAnswer['mode']> {
+  const endpoint = supplied(source, 'endpoint');
+  const mode = supplied(source, 'ingress');
+  if (mode !== undefined && mode !== 'existing' && mode !== 'managed-cloudflare') {
+    throw invalidFlag('ingress', 'use existing or managed-cloudflare');
   }
-  const mode = await prompts.select({
+  if (endpoint !== undefined && mode === 'managed-cloudflare') {
+    throw invalidFlag('endpoint', 'applies only to --ingress existing');
+  }
+  if (endpoint !== undefined) return 'existing';
+  if (mode !== undefined) return mode;
+  if (!source.interactive) throw missingInput('ingress', ' (existing with --endpoint, or managed-cloudflare)');
+  const prompts = source.prompts;
+  const selected = await prompts.select({
     message: 'How should Google Chat reach this assistant?',
     options: [
       {
@@ -253,40 +315,64 @@ async function collectIngress(
       },
     ],
   });
-  if (prompts.isCancel(mode) || (mode !== 'existing' && mode !== 'managed-cloudflare')) return cancelled();
+  if (prompts.isCancel(selected) || (selected !== 'existing' && selected !== 'managed-cloudflare')) return cancelled();
+  return selected;
+}
+
+function endpointProblem(value: string): string | undefined {
+  try {
+    validateExistingGchatEndpoint(value);
+    return undefined;
+  } catch (error) {
+    return error instanceof Error ? error.message : 'Enter a valid Google Chat endpoint';
+  }
+}
+
+async function cloudflareToken(source: InputSource): Promise<string> {
+  const token = source.context.secrets.get('cloudflareAccountToken');
+  if (token) return token;
+  if (!source.interactive) {
+    throw new GwsEaError(
+      'input_required',
+      `Managed Cloudflare ingress needs an API token: ${describeSecretInput('cloudflareAccountToken')}.`,
+    );
+  }
+  note(source, CLOUDFLARE_API_TOKEN_GUIDANCE, 'Cloudflare access');
+  const prompted = await askPassword(source.prompts, 'Cloudflare API token');
+  registerSecret(prompted);
+  return prompted;
+}
+
+async function collectIngress(source: InputSource, assistantFirstName: string): Promise<CreateIngressAnswer> {
+  const mode = await chooseIngressMode(source);
   if (mode === 'existing') {
-    const endpointUrl = await askText(prompts, 'Existing Google Chat webhook endpoint', {
-      validate: (value) => {
-        try {
-          validateExistingGchatEndpoint(value);
-          return undefined;
-        } catch (error) {
-          return error instanceof Error ? error.message : 'Enter a valid Google Chat endpoint';
-        }
-      },
+    const endpointUrl = await textInput(source, 'endpoint', 'Existing Google Chat webhook endpoint', {
+      validate: endpointProblem,
     });
     return { mode, endpointUrl: validateExistingGchatEndpoint(endpointUrl) };
   }
 
-  const session = context.managedIngressSetup;
+  const session = source.context.managedIngressSetup;
   if (!session) {
     throw new GwsEaError('managed_ingress_unavailable', 'Managed Cloudflare setup is unavailable in this release');
   }
-  prompts.note(CLOUDFLARE_API_TOKEN_GUIDANCE, 'Cloudflare access');
-  const token = await askPassword(prompts, 'Cloudflare API token');
+  const token = await cloudflareToken(source);
   const zones = validateDiscoveredZones(await session.discoverZones(token));
-  const zone = await chooseZone(zones, prompts);
-  const label = await askText(prompts, 'Assistant hostname label', {
+  const zone = await chooseZone(zones, source);
+  const labelWasSupplied = supplied(source, 'hostname-label') !== undefined;
+  const label = await textInput(source, 'hostname-label', 'Assistant hostname label', {
     initialValue: defaultDnsLabel(assistantFirstName),
     validate: validateDnsLabel,
   });
   const hostname = `${label}.${zone.name}`;
   const callbackUrl = `https://${hostname}/webhook/gchat`;
-  const confirmed = await prompts.confirm({
-    message: `Reserve ${hostname} for this assistant?\nGoogle Chat callback: ${callbackUrl}`,
-    initialValue: true,
-  });
-  if (prompts.isCancel(confirmed) || confirmed !== true) return cancelled();
+  if (!labelWasSupplied) {
+    const confirmed = await source.prompts.confirm({
+      message: `Reserve ${hostname} for this assistant?\nGoogle Chat callback: ${callbackUrl}`,
+      initialValue: true,
+    });
+    if (source.prompts.isCancel(confirmed) || confirmed !== true) return cancelled();
+  }
   session.retainAccountToken(token);
   return {
     mode,
@@ -300,7 +386,7 @@ async function collectIngress(
 
 async function chooseProvider(
   providers: readonly SetupProviderEntry[],
-  prompts: PromptAdapter,
+  source: InputSource,
 ): Promise<SetupProviderEntry & { readonly provisioning: SetupProviderProvisioning }> {
   const eligible = providers.filter(
     (provider): provider is SetupProviderEntry & { readonly provisioning: SetupProviderProvisioning } =>
@@ -309,10 +395,20 @@ async function chooseProvider(
   if (eligible.length === 0) {
     throw new GwsEaError('provider_not_composed', 'This release has no provider with an isolated authentication flow');
   }
+  const named = supplied(source, 'provider');
+  if (named !== undefined) {
+    const provider = eligible.find((entry) => entry.value === named);
+    if (!provider) {
+      throw invalidFlag('provider', `use one of ${eligible.map((entry) => entry.value).join(', ')}`);
+    }
+    return provider;
+  }
   if (eligible.length === 1) {
-    prompts.logInfo(`Using ${eligible[0]!.label}, the provider composed into this release.`);
+    logInfo(source, `Using ${eligible[0]!.label}, the provider composed into this release.`);
     return eligible[0]!;
   }
+  if (!source.interactive) throw missingInput('provider');
+  const prompts = source.prompts;
   const selected = await prompts.select({
     message: 'Which agent runtime should power your assistant?',
     options: eligible.map(({ value, label, hint }) => ({ value, label, hint })),
@@ -334,29 +430,31 @@ export async function collectGwsEaCreateInput(
   const providerCapabilityDigest =
     dependencies.providerCapabilityDigest ?? (await providerProvisioningCapabilityDigest(process.cwd()));
 
-  prompts.note(`Instance ${context.instanceId}\nRelease track ${context.track}`, 'New assistant');
-  const sourceRemote = context.provided['source-remote']?.trim() || configuredReleaseSource(context.track);
-  const assistantFirst = await askText(prompts, 'Assistant first name');
-  const assistantLast = await askText(prompts, 'Assistant last name', { optional: true, placeholder: 'Optional' });
-  const principalFirst = await askText(prompts, 'Principal first name');
-  const principalLast = await askText(prompts, 'Principal last name', { optional: true, placeholder: 'Optional' });
-  const principalTimezone = await askText(prompts, 'Principal timezone', {
+  const source: InputSource = { context, prompts, interactive: dependencies.interactive ?? true };
+
+  note(source, `Instance ${context.instanceId}\nRelease track ${context.track}`, 'New assistant');
+  const assistantFirst = await textInput(source, 'assistant-first-name', 'Assistant first name');
+  const assistantLast = await textInput(source, 'assistant-last-name', 'Assistant last name', {
+    optional: true,
+    placeholder: 'Optional',
+  });
+  const principalFirst = await textInput(source, 'principal-first-name', 'Principal first name');
+  const principalLast = await textInput(source, 'principal-last-name', 'Principal last name', {
+    optional: true,
+    placeholder: 'Optional',
+  });
+  const principalTimezone = await textInput(source, 'principal-timezone', 'Principal timezone', {
     initialValue: detectedTimezone,
     validate: (value) => (isValidTimezone(value) ? undefined : 'Enter a valid IANA timezone'),
   });
-  const assistantWorkspaceEmail = await suppliedOrAsk(
-    context,
-    prompts,
-    'workspace-email',
-    'Assistant Google Workspace email',
-    (value) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(value) ? undefined : 'Enter a valid email address'),
-  );
-  const ingress = await collectIngress(context, prompts, assistantFirst);
-  const provider = await chooseProvider(providers, prompts);
+  const assistantWorkspaceEmail = await textInput(source, 'workspace-email', 'Assistant Google Workspace email', {
+    validate: (value) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(value) ? undefined : 'Enter a valid email address'),
+  });
+  const ingress = await collectIngress(source, assistantFirst);
+  const provider = await chooseProvider(providers, source);
   const metadata = provider.provisioning.credentialMetadata({ allowAmbientConfiguration: false });
 
   return {
-    sourceRemote,
     ingress,
     assistantWorkspaceEmail,
     bootstrapManifest: {

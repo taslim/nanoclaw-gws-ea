@@ -1,9 +1,10 @@
 import { randomBytes } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
-import { chmod, open, rename, unlink } from 'node:fs/promises';
+import { chmod, open, realpath, rename, unlink } from 'node:fs/promises';
 import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
+import { isWithinDirectory } from './paths.js';
 import { GwsEaError } from './types.js';
 
 const MAX_PRIVATE_FILE_BYTES = 1024 * 1024;
@@ -33,6 +34,48 @@ export async function readOwnerOnlyFile(file: string): Promise<string> {
   }
   try {
     assertOwnerOnlyStat(await handle.stat(), file);
+    return await handle.readFile('utf8');
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Read an operator-written file that must sit under `root`: a regular,
+ * non-symlink file owned by the current user with no group or other
+ * permission bits. Refusals raise `code` naming the file and the rule; a
+ * missing file raises the underlying ENOENT for the caller to interpret.
+ */
+export async function readOperatorFile(file: string, root: string, label: string, code: string): Promise<string> {
+  const absolute = path.resolve(file);
+  const outside = (): GwsEaError => new GwsEaError(code, `${label} must be inside ${root}: ${absolute}`);
+  let canonicalRoot: string;
+  try {
+    canonicalRoot = await realpath(root);
+  } catch (error) {
+    // Without its root the file cannot exist; report it missing unless it names another place.
+    if (isErrno(error, 'ENOENT') && !isWithinDirectory(absolute, path.resolve(root))) throw outside();
+    throw error;
+  }
+  const directory = await realpath(path.dirname(absolute));
+  if (!isWithinDirectory(path.join(directory, path.basename(absolute)), canonicalRoot)) throw outside();
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await open(absolute, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch (error) {
+    if (isErrno(error, 'ELOOP')) throw new GwsEaError(code, `${label} must not be a symlink: ${absolute}`);
+    throw error;
+  }
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) throw new GwsEaError(code, `${label} must be a regular file: ${absolute}`);
+    if (typeof process.getuid === 'function' && info.uid !== process.getuid()) {
+      throw new GwsEaError(code, `${label} must be owned by the current user: ${absolute}`);
+    }
+    if ((info.mode & 0o077) !== 0) {
+      throw new GwsEaError(code, `${label} must be readable only by its owner (chmod 0600): ${absolute}`);
+    }
+    if (info.size > MAX_PRIVATE_FILE_BYTES) throw new GwsEaError(code, `${label} is too large: ${absolute}`);
     return await handle.readFile('utf8');
   } finally {
     await handle.close();

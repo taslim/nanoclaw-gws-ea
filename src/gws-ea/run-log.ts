@@ -35,7 +35,7 @@ const STEPS_DIRECTORY = 'steps';
 const MAX_FIELD_CHARACTERS = 300;
 
 export type LogFieldValue = string | number | boolean;
-export type StepStatus = 'success' | 'skipped' | 'failed' | 'interactive';
+export type StepStatus = 'success' | 'skipped' | 'failed' | 'interactive' | 'paused';
 
 export interface CommandCapture {
   readonly program: string;
@@ -58,7 +58,7 @@ export interface StepLog {
   readonly rawLog: string;
   /** Record a short parsed fact on this step's progression entry. */
   fact(key: string, value: LogFieldValue): void;
-  mark(status: 'skipped' | 'interactive'): void;
+  mark(status: 'skipped' | 'interactive' | 'paused'): void;
   /** Append redacted text to this step's raw log. */
   write(text: string): void;
   /** Record a dotenv file by its key names only. */
@@ -234,7 +234,7 @@ class Run implements RunLog {
     const descriptor = fs.openSync(path.join(this.#directory, relativeRawLog), 'wx', 0o600);
     let open = true;
     const facts: Array<readonly [string, string]> = [];
-    let marked: 'skipped' | 'interactive' | undefined;
+    let marked: 'skipped' | 'interactive' | 'paused' | undefined;
     const write = (text: string): void => {
       if (open && text) fs.writeSync(descriptor, redact(text));
     };

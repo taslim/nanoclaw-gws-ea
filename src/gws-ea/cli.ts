@@ -1,14 +1,40 @@
-import * as prompts from '@clack/prompts';
+import path from 'node:path';
+
 import { resolveReleaseCommit, type ResolvedRelease } from './checkout.js';
-import { CREATE_SETUP_FIELDS, type CreatePromptContext, type CreateSetupAnswers } from './create-input.js';
-import type { RetainedManagedIngressSetupSession } from './cloudflare-api.js';
+import { createManagedIngressSetupSession, type RetainedManagedIngressSetupSession } from './cloudflare-api.js';
 import {
-  acquireInstanceOperation,
-  ensureProvisionJournal,
-  firstIncompletePhase,
-  type InstanceOperation,
-} from './journal.js';
+  CREATE_INPUT_FLAGS,
+  loadSecretSource,
+  type CreateInputFlag,
+  type CreatePromptContext,
+  type CreateSetupAnswers,
+  type SecretSource,
+} from './create-input.js';
+import {
+  createInteraction,
+  pendingActionOf,
+  PauseRequired,
+  runStep,
+  type HumanDecisions,
+  type Interaction,
+  type InteractivePrompts,
+  type RunEvent,
+  type StepReporter,
+} from './events.js';
+import { deriveGchatServiceAccountEmail, deriveGcpProjectId, preflightGcloud } from './gcloud.js';
+import { acquireInstanceOperation, ensureProvisionJournal, type InstanceOperation } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+import type { ProvisionHumanPause } from './phases.js';
+import { holdLoopbackPorts, type HeldLoopbackPorts } from './ports.js';
+import {
+  installProductionBootstrapManifest,
+  removeProductionBootstrapManifest,
+  runProductionProvision,
+  validateProductionBootstrapManifest,
+  type ProvisionResult,
+  type ProvisionRuntime,
+} from './provision.js';
+import { redact } from './redact.js';
 import {
   allocateInstanceId,
   assertInstanceId,
@@ -16,134 +42,112 @@ import {
   reserveInstance,
   validateReservation,
 } from './registry.js';
-import { GwsEaError, type AllocatedPorts, type InstanceReservationInput, type ProvisionPhase } from './types.js';
-import { deriveGchatServiceAccountEmail, deriveGcpProjectId, preflightGcloud } from './gcloud.js';
-import { confirmChatConfiguration } from './chat-configuration.js';
+import { resolveReleaseSource } from './release-tracks.js';
 import { describeRemoval, removeAssistant, type RemovalPreview } from './remove.js';
-import {
-  installProductionBootstrapManifest,
-  removeProductionBootstrapManifest,
-  runProductionProvision,
-  validateProductionBootstrapManifest,
-  type ProductionBootstrapManifest,
-  type ProvisionProgressEvent,
-  type ProvisionResult,
-  type ProvisionRuntime,
-} from './provision.js';
-import { holdLoopbackPorts, type HeldLoopbackPorts } from './ports.js';
-import type { ProviderCredential } from '../provider-credential.js';
+import { FIXTURE_STAGING_DIRECTORY, startRunLog, type RunLog } from './run-log.js';
+import { GwsEaError, type AllocatedPorts, type GwsEaErrorDetails, type InstanceReservationInput } from './types.js';
+
+/** `0` ready, `10` paused for a person, `1` failed, `75` busy (KTD11). */
+export const EXIT_CODES = { ready: 0, paused: 10, failed: 1, busy: 75 } as const;
 
 type LineWriter = (line: string) => void;
-type TextWriter = (text: string) => void;
-type RemoveAssistantRunner = (paths: ControlPlanePaths, instanceId: string) => Promise<void>;
-type AdvanceProvision = (
-  operation: InstanceOperation,
-  selectedMessagingGroupId?: string,
-  heldPorts?: HeldLoopbackPorts,
-  runtime?: ProvisionRuntime,
-) => Promise<ProvisionResult>;
+type Command = 'create' | 'resume' | 'remove';
 
-interface ProvisionProgressDisplay {
-  show(message: string): void;
-  clear(): void;
+/** A stop summary. The line presenter prints it; the terminal presenter draws it with clack. */
+export interface StopReport {
+  readonly outcome: 'ready' | 'paused' | 'failed' | 'busy';
+  readonly headline: string;
+  readonly details: readonly string[];
+  /** The failed command's redacted stderr tail. */
+  readonly tail?: string;
 }
+
+/** Level-1 output (docs/setup-flow.md): progress while steps run, then one stop summary. */
+export interface Presenter {
+  event(event: RunEvent): void;
+  /** Release the terminal to a prompt or interactive child; `resume` redraws running progress. */
+  suspend(): void;
+  resume(): void;
+  line(text: string): void;
+  report(report: StopReport): void;
+}
+
+/** Everything the failure summary names, and what diagnosis and retry need. */
+export interface FailureReport {
+  readonly command: Command;
+  readonly step: string;
+  readonly stepLabel?: string;
+  readonly code: string;
+  readonly cause: string;
+  readonly nextAction: string;
+  readonly pendingAction?: string;
+  readonly progressLog: string;
+  readonly rawLog?: string;
+  readonly runDirectory: string;
+  readonly tail?: string;
+  readonly instanceId?: string;
+}
+
+export interface AdvanceOptions {
+  readonly interaction: Interaction;
+  readonly runtime: ProvisionRuntime;
+  readonly portLease?: HeldLoopbackPorts;
+}
+
+export type AdvanceProvision = (operation: InstanceOperation, options: AdvanceOptions) => Promise<ProvisionResult>;
+type RemoveAssistantRunner = (paths: ControlPlanePaths, instanceId: string, interaction: Interaction) => Promise<void>;
 
 export interface CliRuntime {
   paths?: ControlPlanePaths;
   stdout?: LineWriter;
   stderr?: LineWriter;
+  /** Where secret environment variables are read. */
+  environment?: NodeJS.ProcessEnv;
+  /** Terminal rendering; durable lines on stdout and stderr when absent. */
+  presenter?: Presenter;
+  /** Terminal prompts. Absent means no person can be asked. */
+  prompts?: InteractivePrompts;
+  /** Interactive failure loop: diagnosis, then whether to retry. */
+  onFailure?: (report: FailureReport) => Promise<'retry' | 'stop'>;
   initializeJournal?: (operation: InstanceOperation) => Promise<void>;
   advanceProvision?: AdvanceProvision;
   resolveRelease?: (sourceRemote: string, releaseRef: string) => Promise<ResolvedRelease>;
   holdLoopbackPorts?: () => Promise<HeldLoopbackPorts>;
   collectCreateInputs?: (context: CreatePromptContext) => Promise<CreateSetupAnswers>;
-  authenticateProvider?: (provider: string) => Promise<ProviderCredential>;
   reserveInstance?: typeof reserveInstance;
-  preflightGcloud?: (account?: string) => Promise<{ readonly account: string }>;
-  confirmChatConfiguration?: typeof confirmChatConfiguration;
+  preflightGcloud?: (account: string | undefined, interaction: Interaction) => Promise<{ readonly account: string }>;
   describeRemoval?: typeof describeRemoval;
   removeAssistant?: RemoveAssistantRunner;
+  /** Absent means removal requires `--yes`. */
   confirmRemoval?: (preview: RemovalPreview) => Promise<boolean>;
   managedIngressSetup?: RetainedManagedIngressSetupSession;
-  requestCloudflareAccountToken?: (
-    accountId: string,
-    observation: string,
-    onPromptComplete?: () => void,
-  ) => Promise<string>;
 }
 
-const CREATE_OPTIONS = ['track', ...CREATE_SETUP_FIELDS] as const;
-
-const PHASE_PROGRESS: Readonly<Record<ProvisionPhase, string>> = {
-  materialize_checkout: 'Preparing assistant files…',
-  provision_gcp: 'Configuring Google Cloud…',
-  start_onecli: 'Starting the credential vault…',
-  configure_provider: 'Connecting the AI provider…',
-  start_nanoclaw: 'Starting the assistant…',
-  establish_transport: 'Publishing the secure callback…',
-  configure_channel: 'Checking Google Chat configuration…',
-  bind_principal: 'Connecting the principal conversation…',
-  verify_conversation: 'Verifying the conversation…',
-  ready: 'Finishing setup…',
-};
-
-const GCP_PROGRESS: Readonly<Record<NonNullable<ProvisionProgressEvent['detail']>, string>> = {
-  project: 'Waiting for the Google Cloud project…',
-  apis: 'Waiting for the required Google Cloud APIs…',
-  'service-account': 'Waiting for the Google Chat service account…',
-  'credential-policy': 'Updating the dedicated project’s Google Chat credential policy…',
-  'service-account-keys': 'Waiting for Google Cloud IAM…',
-  'credential-key': 'Waiting for the Google Chat credential…',
-};
-
-function progressMessage(event: ProvisionProgressEvent): string {
-  return event.detail ? GCP_PROGRESS[event.detail] : PHASE_PROGRESS[event.phase];
-}
-
-export function createProgressDisplay(
-  output: LineWriter,
-  interactive: boolean,
-  terminalOutput: TextWriter = (text) => {
-    process.stdout.write(text);
+const COMMON_OPTIONS = ['secrets-file'] as const;
+const COMMON_SWITCHES = ['capture-fixtures'] as const;
+const COMMAND_OPTIONS: Readonly<Record<Command, { values: readonly string[]; switches: readonly string[] }>> = {
+  create: { values: ['track', 'source-remote', ...CREATE_INPUT_FLAGS, ...COMMON_OPTIONS], switches: COMMON_SWITCHES },
+  resume: {
+    values: ['id', 'messaging-group-id', ...COMMON_OPTIONS],
+    switches: ['chat-configured', ...COMMON_SWITCHES],
   },
-): ProvisionProgressDisplay {
-  let active = false;
-  let lastMessage: string | undefined;
-  return {
-    show(message) {
-      if (message === lastMessage) return;
-      lastMessage = message;
-      if (!interactive) {
-        output(message);
-        return;
-      }
-      terminalOutput(`\r\u001B[2K${message}`);
-      active = true;
-    },
-    clear() {
-      if (!interactive) return;
-      if (active) terminalOutput('\r\u001B[2K');
-      active = false;
-      lastMessage = undefined;
-    },
-  };
-}
+  remove: { values: ['id', ...COMMON_OPTIONS], switches: ['yes', ...COMMON_SWITCHES] },
+};
 
-function parseOptions(
-  args: readonly string[],
-  allowed: readonly string[],
-  booleanOptions: readonly string[] = [],
-): Record<string, string> {
+type Options = Readonly<Record<string, string>>;
+
+function parseOptions(args: readonly string[], command: Command): Options {
+  const { values, switches } = COMMAND_OPTIONS[command];
   const options: Record<string, string> = {};
   for (let index = 0; index < args.length; ) {
     const flag = args[index];
     if (!flag?.startsWith('--')) throw new GwsEaError('invalid_arguments', 'Expected an option flag');
     const name = flag.slice(2);
-    if (!allowed.includes(name) && !booleanOptions.includes(name)) {
+    if (!values.includes(name) && !switches.includes(name)) {
       throw new GwsEaError('invalid_arguments', `Unknown option --${name}`);
     }
     if (options[name] !== undefined) throw new GwsEaError('invalid_arguments', `Option --${name} was provided twice`);
-    if (booleanOptions.includes(name)) {
+    if (switches.includes(name)) {
       options[name] = 'true';
       index += 1;
       continue;
@@ -158,15 +162,549 @@ function parseOptions(
   return options;
 }
 
-function requireOption(options: Readonly<Record<string, string>>, name: string): string {
+function requireOption(options: Options, name: string): string {
   const value = options[name];
   if (!value) throw new GwsEaError('invalid_arguments', `Missing required option --${name}`);
   return value;
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+function safeMessage(error: unknown): string {
+  return error instanceof GwsEaError ? redact(error.message) : 'Unexpected control-plane failure.';
+}
+
+function isBusy(error: unknown): boolean {
+  return error instanceof GwsEaError && error.code === 'instance_busy';
+}
+
+function busy(): GwsEaError {
+  return new GwsEaError('instance_busy', 'Instance operation is already in progress; no action was taken.');
+}
+
+function createLinePresenter(output: LineWriter, errorOutput: LineWriter): Presenter {
+  let last: string | undefined;
+  const progress = (text: string): void => {
+    if (text === last) return;
+    last = text;
+    output(text);
+  };
+  return {
+    event(event) {
+      if (event.type === 'step-started' && event.label) progress(event.label);
+      else if (event.type === 'step-waiting') progress(event.reason);
+    },
+    suspend: () => undefined,
+    resume: () => undefined,
+    line: output,
+    report(report) {
+      const write = report.outcome === 'ready' || report.outcome === 'paused' ? output : errorOutput;
+      write(report.headline);
+      for (const detail of report.details) write(detail);
+      for (const line of report.tail ? report.tail.split('\n') : []) write(`  ${line}`);
+    },
+  };
+}
+
+function exitFact(details: GwsEaErrorDetails | undefined): string | undefined {
+  if (typeof details?.timeoutMs === 'number') return `timed out after ${(details.timeoutMs / 1000).toFixed(1)}s`;
+  if (typeof details?.signal === 'string') return `signal ${details.signal}`;
+  if (typeof details?.exitCode === 'number') return `code ${details.exitCode}`;
+  if (typeof details?.errno === 'string') return `errno ${details.errno}`;
+  return undefined;
+}
+
+function pauseReport(pause: ProvisionHumanPause, resume: (extra?: string) => string, log: string): StopReport {
+  const headline = `Paused at ${pause.phase}: ${pause.message}`;
+  if (pause.choices?.length) {
+    return {
+      outcome: 'paused',
+      headline,
+      details: [
+        'Eligible principal conversations:',
+        ...pause.choices.map(
+          (choice) => `  ${JSON.stringify(choice.label)}: ${resume(`--messaging-group-id ${shellQuote(choice.id)}`)}`,
+        ),
+        `Log: ${log}`,
+      ],
+    };
+  }
+  return {
+    outcome: 'paused',
+    headline,
+    details: [
+      ...(pause.details ?? []).map((detail) => `  ${detail}`),
+      ...(pause.actionUrl ? [`Open: ${pause.actionUrl}`] : []),
+      `Continue with: ${resume(pause.resumeFlag)}`,
+      `Log: ${log}`,
+    ],
+  };
+}
+
+type Outcome =
+  | { readonly status: 'ready'; readonly message: string }
+  | { readonly status: 'paused'; readonly pause: ProvisionHumanPause };
+
+type Attempt =
+  | { readonly status: 'done'; readonly exitCode: number }
+  | { readonly status: 'failed'; readonly report: FailureReport; readonly retry: () => Promise<Attempt> };
+
+/** What one attempt knows about its instance as it runs. */
+interface AttemptState {
+  instanceId?: string;
+  reserved: boolean;
+}
+
+interface Session {
+  readonly reporter: StepReporter & { readonly run: RunLog };
+  readonly interaction: Interaction;
+  readonly secrets: SecretSource;
+  readonly state: AttemptState;
+}
+
+interface AttemptPlan {
+  readonly command: Command;
+  readonly args: readonly string[];
+  readonly options: Options;
+  readonly instanceId?: string;
+  readonly meta?: Readonly<Record<string, string>>;
+  readonly decisions?: HumanDecisions;
+  readonly work: (session: Session) => Promise<Outcome>;
+}
+
+class Cli {
+  readonly #paths: ControlPlanePaths;
+  readonly #presenter: Presenter;
+  readonly #runtime: CliRuntime;
+  readonly #managedIngressSetup: RetainedManagedIngressSetupSession;
+
+  constructor(runtime: CliRuntime, presenter: Presenter, managedIngressSetup: RetainedManagedIngressSetupSession) {
+    this.#paths = runtime.paths ?? resolveControlPlanePaths();
+    this.#presenter = presenter;
+    this.#runtime = runtime;
+    this.#managedIngressSetup = managedIngressSetup;
+  }
+
+  /** Validate arguments up front; the returned attempt reports every later failure itself. */
+  prepare(command: Command, args: readonly string[]): () => Promise<Attempt> {
+    const options = parseOptions(args, command);
+    if (command === 'create') {
+      const track = requireOption(options, 'track');
+      return () =>
+        this.#attempt({
+          command,
+          args,
+          options,
+          meta: { track },
+          work: (session) => this.#createWork(session, options, track),
+        });
+    }
+    const instanceId = requireOption(options, 'id');
+    assertInstanceId(instanceId);
+    if (command === 'remove') {
+      return () =>
+        this.#attempt({
+          command,
+          args,
+          options,
+          instanceId,
+          work: (session) => this.#removeWork(session, options, instanceId),
+        });
+    }
+    return () =>
+      this.#attempt({
+        command,
+        args,
+        options,
+        instanceId,
+        decisions: {
+          chatConfigured: options['chat-configured'] === 'true',
+          ...(options['messaging-group-id'] ? { messagingGroupId: options['messaging-group-id'] } : {}),
+        },
+        work: (session) => this.#resumeWork(session, instanceId),
+      });
+  }
+
+  /** The command that continues from where an attempt stopped; `extra` carries a pause's decision flag. */
+  #continueCommand(plan: AttemptPlan, state: AttemptState, extra?: string): string {
+    const secretsFile = plan.options['secrets-file'];
+    const common = secretsFile ? `--secrets-file ${shellQuote(secretsFile)}` : undefined;
+    const join = (...parts: Array<string | undefined>): string => parts.filter(Boolean).join(' ');
+    if (plan.command === 'remove') {
+      return join(`gws-ea remove --id ${state.instanceId}`, plan.options.yes ? '--yes' : undefined, common);
+    }
+    if (state.reserved && state.instanceId) return join(`gws-ea resume --id ${state.instanceId}`, extra, common);
+    const track = plan.options.track ?? '';
+    return `gws-ea create --track ${/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(track) ? track : '<track>'} (with the same options)`;
+  }
+
+  #nextAction(plan: AttemptPlan, state: AttemptState): string {
+    const verb = plan.command !== 'remove' && state.reserved ? 'Resume' : 'Retry';
+    return `${verb} with: ${this.#continueCommand(plan, state)}`;
+  }
+
+  /** Retrying a reserved create resumes it; every other attempt reruns as given. */
+  #retry(plan: AttemptPlan, state: AttemptState): () => Promise<Attempt> {
+    if (plan.command !== 'create' || !state.reserved || !state.instanceId) {
+      return () => this.prepare(plan.command, plan.args)();
+    }
+    const resumeArgs = [
+      '--id',
+      state.instanceId,
+      ...(plan.options['secrets-file'] ? ['--secrets-file', plan.options['secrets-file']] : []),
+      ...(plan.options['capture-fixtures'] ? ['--capture-fixtures'] : []),
+    ];
+    return () => this.prepare('resume', resumeArgs)();
+  }
+
+  #checkGcloud(account: string | undefined, interaction: Interaction): Promise<{ readonly account: string }> {
+    if (this.#runtime.preflightGcloud) return this.#runtime.preflightGcloud(account, interaction);
+    const check = (): Promise<{ readonly account: string }> =>
+      preflightGcloud({ cwd: process.cwd(), ...(account ? { account } : {}) });
+    return check().catch(async (error: unknown) => {
+      if (!(error instanceof GwsEaError) || error.code !== 'gcloud_auth_required') throw error;
+      await interaction.signInToGoogleCloud(account);
+      return check();
+    });
+  }
+
+  #advance(operation: InstanceOperation, options: AdvanceOptions): Promise<ProvisionResult> {
+    if (this.#runtime.advanceProvision) return this.#runtime.advanceProvision(operation, options);
+    return runProductionProvision(operation, {
+      interaction: options.interaction,
+      runtime: options.runtime,
+      ...(options.portLease ? { portLease: options.portLease } : {}),
+      managedIngress: { setupSession: this.#managedIngressSetup },
+    });
+  }
+
+  async #initializeJournal(operation: InstanceOperation): Promise<void> {
+    if (this.#runtime.initializeJournal) await this.#runtime.initializeJournal(operation);
+    else await ensureProvisionJournal(operation);
+  }
+
+  async #createWork(
+    { reporter, interaction, secrets, state }: Session,
+    options: Options,
+    track: string,
+  ): Promise<Outcome> {
+    const paths = this.#paths;
+    const run = reporter.run;
+    const sourceRemote = await runStep(reporter, { id: 'release_source' }, () =>
+      resolveReleaseSource({ track, sourceRemote: options['source-remote'], configRoot: paths.configRoot }),
+    );
+    run.userInput('release_source', sourceRemote);
+    const gcloud = await runStep(reporter, { id: 'prerequisites' }, () => this.#checkGcloud(undefined, interaction));
+    const instanceId = allocateInstanceId();
+    state.instanceId = instanceId;
+    this.#presenter.line(`instance_id: ${instanceId}`);
+
+    const provided: Partial<Record<CreateInputFlag, string>> = {};
+    for (const flag of CREATE_INPUT_FLAGS) if (options[flag] !== undefined) provided[flag] = options[flag];
+    const collect =
+      this.#runtime.collectCreateInputs ??
+      (async (): Promise<CreateSetupAnswers> => {
+        throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
+      });
+    const setup = await runStep(reporter, { id: 'inputs' }, () =>
+      collect({ instanceId, track, sourceRemote, provided, secrets, managedIngressSetup: this.#managedIngressSetup }),
+    );
+    run.userInput('ingress', setup.ingress.mode);
+    run.userInput('provider', setup.bootstrapManifest.provider.id);
+
+    const resolved = await runStep(reporter, { id: 'resolve_release', label: 'Resolving the release…' }, () =>
+      (this.#runtime.resolveRelease ?? resolveReleaseCommit)(sourceRemote, `refs/heads/${track}`),
+    );
+    const held = await runStep(reporter, { id: 'reserve', label: 'Reserving the assistant…' }, async () => {
+      const lease = await this.#reserve(state, track, sourceRemote, setup, resolved.commit, gcloud.account);
+      try {
+        await run.assignInstance(instanceId);
+      } catch (error) {
+        await lease.release();
+        throw error;
+      }
+      return lease;
+    });
+
+    let operation: InstanceOperation | null;
+    try {
+      operation = await acquireInstanceOperation(paths, instanceId);
+    } catch (error) {
+      await held.release();
+      throw error;
+    }
+    if (!operation) {
+      await held.release();
+      throw busy();
+    }
+    const active = operation;
+    try {
+      return await this.#provision(reporter, active, interaction, held);
+    } finally {
+      await held.release();
+      active.release();
+    }
+  }
+
+  async #reserve(
+    state: AttemptState,
+    track: string,
+    sourceRemote: string,
+    setup: CreateSetupAnswers,
+    commit: string,
+    gcpAccount: string,
+  ): Promise<HeldLoopbackPorts> {
+    const paths = this.#paths;
+    const instanceId = state.instanceId!;
+    const bootstrapManifest = validateProductionBootstrapManifest(setup.bootstrapManifest);
+    const held = await (this.#runtime.holdLoopbackPorts ?? holdLoopbackPorts)();
+    try {
+      const input = createReservation(paths, track, sourceRemote, setup, {
+        instanceId,
+        commit,
+        ports: held.ports,
+        gcpAccount,
+      });
+      await installProductionBootstrapManifest(paths, instanceId, bootstrapManifest);
+      try {
+        await (this.#runtime.reserveInstance ?? reserveInstance)(paths, input);
+        state.reserved = true;
+      } catch (error) {
+        try {
+          await getInstanceReservation(paths, instanceId);
+          state.reserved = true;
+          // eslint-disable-next-line no-catch-all/no-catch-all -- An unobservable reservation counts as reserved: resuming is safe, discarding it is not. The original error is rethrown below.
+        } catch (observationError) {
+          if (observationError instanceof GwsEaError && observationError.code === 'unknown_instance') {
+            await removeProductionBootstrapManifest(paths, instanceId);
+          } else {
+            state.reserved = true;
+          }
+        }
+        throw error;
+      }
+    } catch (error) {
+      await held.release();
+      throw error;
+    }
+    return held;
+  }
+
+  async #provision(
+    reporter: StepReporter,
+    operation: InstanceOperation,
+    interaction: Interaction,
+    portLease?: HeldLoopbackPorts,
+  ): Promise<Outcome> {
+    const result = await runStep(reporter, { id: 'provision' }, async () => {
+      await this.#initializeJournal(operation);
+      return this.#advance(operation, { interaction, runtime: reporter, ...(portLease ? { portLease } : {}) });
+    });
+    return result.status === 'paused'
+      ? result
+      : { status: 'ready', message: `Instance ${operation.instanceId} is ready.` };
+  }
+
+  async #resumeWork({ reporter, interaction }: Session, instanceId: string): Promise<Outcome> {
+    const operation = await acquireInstanceOperation(this.#paths, instanceId);
+    if (!operation) throw busy();
+    try {
+      await runStep(reporter, { id: 'prerequisites' }, async () => {
+        await this.#initializeJournal(operation);
+        const reservation = await getInstanceReservation(this.#paths, instanceId);
+        const account = reservation.exclusive_resource_claims.gcp_account;
+        const ready = await this.#checkGcloud(account, interaction);
+        if (ready.account !== account) {
+          throw new GwsEaError('gcloud_account_mismatch', 'Google Cloud is signed in with the wrong account');
+        }
+      });
+      return await this.#provision(reporter, operation, interaction);
+    } finally {
+      operation.release();
+    }
+  }
+
+  async #removeWork({ reporter, interaction }: Session, options: Options, instanceId: string): Promise<Outcome> {
+    const preview = await runStep(reporter, { id: 'inspect' }, () =>
+      (this.#runtime.describeRemoval ?? describeRemoval)(this.#paths, instanceId),
+    );
+    for (const line of removalPreviewLines(preview)) this.#presenter.line(line);
+    if (!options.yes) {
+      const confirm = this.#runtime.confirmRemoval;
+      if (!confirm) {
+        throw new GwsEaError(
+          'input_required',
+          'Removal needs confirmation: pass --yes, or run gws-ea remove in a terminal to be asked.',
+        );
+      }
+      if (!(await confirm(preview))) return { status: 'ready', message: 'Removal cancelled. Nothing was changed.' };
+    }
+    const remove: RemoveAssistantRunner =
+      this.#runtime.removeAssistant ??
+      ((paths, id, port) =>
+        removeAssistant(paths, id, {
+          requestCloudflareAccountToken: (accountId, reason) =>
+            port.requestCloudflareAccountToken({ accountId, reason }),
+        }));
+    await runStep(reporter, { id: 'remove', label: 'Removing the assistant…' }, () =>
+      remove(this.#paths, instanceId, interaction),
+    );
+    return {
+      status: 'ready',
+      message: `Assistant ${instanceId} was removed. Google Cloud project deletion was requested.`,
+    };
+  }
+
+  #secrets(options: Options): Promise<SecretSource> {
+    return loadSecretSource({
+      environment: this.#runtime.environment ?? process.env,
+      ...(options['secrets-file'] ? { file: options['secrets-file'] } : {}),
+      configRoot: this.#paths.configRoot,
+    });
+  }
+
+  /** Run one attempt with its own run log, and turn its end into a stop summary and exit code. */
+  async #attempt(plan: AttemptPlan): Promise<Attempt> {
+    const paths = this.#paths;
+    const presenter = this.#presenter;
+    const failures: Array<Extract<RunEvent, { type: 'step-failed' }>> = [];
+    const labels = new Map<string, string>();
+    const state: AttemptState = {
+      ...(plan.instanceId ? { instanceId: plan.instanceId } : {}),
+      reserved: plan.instanceId !== undefined,
+    };
+    const continueWith = (extra?: string): string => this.#continueCommand(plan, state, extra);
+    let run: RunLog | undefined;
+    /* eslint-disable no-catch-all/no-catch-all -- The CLI boundary turns every failure into a redacted summary and exit code. */
+    try {
+      run = await startRunLog({
+        paths,
+        command: plan.command,
+        ...(plan.instanceId ? { instanceId: plan.instanceId } : {}),
+        ...(plan.meta ? { meta: plan.meta } : {}),
+        secretDirectories: [
+          path.join(paths.cloudflareRoot, 'secrets'),
+          ...(plan.instanceId
+            ? [
+                path.join(paths.instanceRoot(plan.instanceId), 'secrets'),
+                path.join(paths.instanceRoot(plan.instanceId), 'onecli', 'secrets'),
+              ]
+            : []),
+        ],
+        ...(plan.options['capture-fixtures'] ? { captureFixturesTo: FIXTURE_STAGING_DIRECTORY } : {}),
+      });
+      const emit = (event: RunEvent): void => {
+        if (event.type === 'step-started' && event.label) labels.set(event.step, event.label);
+        if (event.type === 'step-failed') failures.push(event);
+        presenter.event(event);
+      };
+      const reporter = { emit, run };
+      const secrets = await runStep(reporter, { id: 'secrets' }, () => this.#secrets(plan.options));
+      const interaction = createInteraction({
+        decisions: plan.decisions ?? { chatConfigured: false },
+        secrets,
+        ...(this.#runtime.prompts ? { prompts: this.#runtime.prompts } : {}),
+        terminal: presenter,
+        managedIngressSetup: this.#managedIngressSetup,
+      });
+      const outcome = await plan.work({ reporter, interaction, secrets, state });
+      if (outcome.status === 'paused') {
+        run.pause(outcome.pause.code);
+        presenter.report(pauseReport(outcome.pause, continueWith, run.progressLog));
+        return { status: 'done', exitCode: EXIT_CODES.paused };
+      }
+      run.complete();
+      presenter.report({ outcome: 'ready', headline: outcome.message, details: [] });
+      return { status: 'done', exitCode: EXIT_CODES.ready };
+    } catch (error) {
+      const step = failures[0]?.step ?? plan.command;
+      const log = run ? [`Log: ${run.progressLog}`] : [];
+      if (error instanceof PauseRequired) {
+        run?.pause(error.code);
+        presenter.report({
+          outcome: 'paused',
+          headline: `Paused at ${step}: ${safeMessage(error)}`,
+          details: [...error.instructions, `Continue with: ${continueWith()}`, ...log],
+        });
+        return { status: 'done', exitCode: EXIT_CODES.paused };
+      }
+      run?.abort(error);
+      if (isBusy(error)) {
+        presenter.report({ outcome: 'busy', headline: safeMessage(error), details: log });
+        return { status: 'done', exitCode: EXIT_CODES.busy };
+      }
+      const nextAction = this.#nextAction(plan, state);
+      if (!run || (error instanceof GwsEaError && error.code === 'cancelled')) {
+        presenter.report({
+          outcome: 'failed',
+          headline: `Stopped at ${step}: ${safeMessage(error)}`,
+          details: [nextAction, ...log],
+        });
+        return { status: 'done', exitCode: EXIT_CODES.failed };
+      }
+      const report = failureReport(plan.command, nextAction, state, run, error, failures[0], labels);
+      presenter.report(failureStop(report, error));
+      return { status: 'failed', report, retry: this.#retry(plan, state) };
+    }
+    /* eslint-enable no-catch-all/no-catch-all */
+  }
+}
+
+function failureReport(
+  command: Command,
+  nextAction: string,
+  state: AttemptState,
+  run: RunLog,
+  error: unknown,
+  failed: Extract<RunEvent, { type: 'step-failed' }> | undefined,
+  labels: ReadonlyMap<string, string>,
+): FailureReport {
+  const step = failed?.step ?? command;
+  const label = labels.get(step);
+  const pending = pendingActionOf(error);
+  const tail = error instanceof GwsEaError ? error.details?.stderrTail : undefined;
+  return {
+    command,
+    step,
+    ...(label ? { stepLabel: label } : {}),
+    code: error instanceof GwsEaError ? error.code : 'unexpected',
+    cause: safeMessage(error),
+    nextAction,
+    ...(pending ? { pendingAction: pending.message } : {}),
+    progressLog: run.progressLog,
+    ...(failed?.rawLog ? { rawLog: failed.rawLog } : {}),
+    runDirectory: run.directory,
+    ...(typeof tail === 'string' && tail ? { tail: redact(tail) } : {}),
+    ...(state.instanceId ? { instanceId: state.instanceId } : {}),
+  };
+}
+
+function failureStop(report: FailureReport, error: unknown): StopReport {
+  const details = error instanceof GwsEaError ? error.details : undefined;
+  const exit = exitFact(details);
+  const searched = Array.isArray(details?.searched) ? details.searched.join(path.delimiter) : undefined;
+  const step = report.stepLabel ? `${report.stepLabel.replace(/…$/u, '')} (${report.step})` : report.step;
+  return {
+    outcome: 'failed',
+    headline: `Stopped at ${step}: ${report.cause}`,
+    details: [
+      ...(exit ? [`Exit: ${exit}`] : []),
+      ...(searched ? [`Searched: ${searched}`] : []),
+      ...(report.pendingAction ? [`Pending human action: ${report.pendingAction}`] : []),
+      report.nextAction,
+      `Log: ${report.progressLog}`,
+      ...(report.rawLog ? [`Step log: ${report.rawLog}`] : []),
+    ],
+    ...(report.tail ? { tail: report.tail } : {}),
+  };
+}
+
 function createReservation(
   paths: ControlPlanePaths,
   track: string,
+  sourceRemote: string,
   setup: CreateSetupAnswers,
   production: {
     readonly instanceId: string;
@@ -181,7 +719,7 @@ function createReservation(
     instance_id: instanceId,
     checkout_realpath: paths.checkoutRoot(instanceId),
     release_track: track,
-    source_remote: setup.sourceRemote,
+    source_remote: sourceRemote,
     deployed_commit: production.commit,
     allocated_ports: production.ports,
     exclusive_resource_claims: {
@@ -207,377 +745,77 @@ function createReservation(
   return validateReservation(input, paths);
 }
 
-function safeErrorMessage(error: unknown): string {
-  return error instanceof GwsEaError ? error.message : 'Unexpected control-plane failure.';
-}
-
-function createRetryCommand(track: string | undefined): string {
-  const safeTrack = track && /^[a-z0-9][a-z0-9._-]{0,63}$/.test(track) ? track : '<track>';
-  return `gws-ea create --track ${safeTrack}`;
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", `'\\''`)}'`;
-}
-
-function printPause(
-  output: LineWriter,
-  instanceId: string,
-  result: Extract<ProvisionResult, { status: 'paused' }>,
-): void {
-  output(`Provisioning paused: ${result.pause.message}`);
-  if (result.pause.choices?.length) {
-    output('Eligible principal conversations:');
-    for (const choice of result.pause.choices) {
-      output(
-        `  ${JSON.stringify(choice.label)}: gws-ea resume --id ${instanceId} --messaging-group-id ${shellQuote(choice.id)}`,
-      );
-    }
-    return;
+function removalPreviewLines(preview: RemovalPreview): string[] {
+  const lines = [
+    `Assistant: ${preview.instanceId}`,
+    `NanoClaw: ${preview.checkout}`,
+    `OneCLI: ${preview.onecliProject}`,
+    `Google Cloud project: ${preview.gcpProject} (${preview.gcpAccount})`,
+  ];
+  if (preview.ingress.mode === 'existing') {
+    lines.push(`External endpoint: ${preview.ingress.endpoint} (operator-managed; disconnect separately)`);
+    return lines;
   }
-  for (const detail of result.pause.details ?? []) output(`  ${detail}`);
-  if (result.pause.actionUrl) output(`Open: ${result.pause.actionUrl}`);
-  output(
-    `Continue with: gws-ea resume --id ${instanceId}${result.pause.resumeFlag ? ` ${result.pause.resumeFlag}` : ''}`,
+  lines.push(
+    `Managed hostname: ${preview.ingress.hostname}`,
+    `Managed callback: ${preview.ingress.callback}`,
+    `Owned DNS record: ${preview.ingress.dnsRecordId ?? 'not created'}`,
+    `Owned tunnel route: ${preview.ingress.route}`,
+    preview.ingress.sharedIngress === 'retained-for-peers'
+      ? 'Shared Cloudflare ingress: retained for other assistants'
+      : 'Shared Cloudflare ingress: retired after this final managed callback',
   );
-}
-
-async function createAssistant(
-  commandArgs: readonly string[],
-  paths: ControlPlanePaths,
-  output: LineWriter,
-  errorOutput: LineWriter,
-  initializeJournal: (operation: InstanceOperation) => Promise<void>,
-  advanceProvision: AdvanceProvision,
-  resolveRelease: (sourceRemote: string, releaseRef: string) => Promise<ResolvedRelease>,
-  allocatePorts: () => Promise<HeldLoopbackPorts>,
-  collectInputs: (context: CreatePromptContext) => Promise<CreateSetupAnswers>,
-  persistReservation: typeof reserveInstance,
-  checkGcloud: () => Promise<{ readonly account: string }>,
-  progress: ProvisionProgressDisplay,
-  managedIngressSetup?: RetainedManagedIngressSetupSession,
-): Promise<number> {
-  let track: string | undefined;
-  let instanceId: string | undefined;
-  let reserved = false;
-  /* eslint-disable no-catch-all/no-catch-all -- The CLI boundary redacts unexpected failures while preserving recovery instructions. */
-  try {
-    const parsed = parseOptions(commandArgs, CREATE_OPTIONS);
-    track = requireOption(parsed, 'track');
-    const gcloud = await checkGcloud();
-    instanceId = allocateInstanceId();
-    output(`instance_id: ${instanceId}`);
-    const setup = await collectInputs({ instanceId, track, provided: parsed, managedIngressSetup });
-    progress.show('Preparing assistant…');
-    const resolved = await resolveRelease(setup.sourceRemote, `refs/heads/${track}`);
-    const bootstrapManifest: ProductionBootstrapManifest = validateProductionBootstrapManifest(setup.bootstrapManifest);
-    const held = await allocatePorts();
-    try {
-      const input = createReservation(paths, track, setup, {
-        instanceId,
-        commit: resolved.commit,
-        ports: held.ports,
-        gcpAccount: gcloud.account,
-      });
-      await installProductionBootstrapManifest(paths, instanceId, bootstrapManifest);
-      try {
-        await persistReservation(paths, input);
-        reserved = true;
-      } catch (error) {
-        try {
-          await getInstanceReservation(paths, instanceId);
-          reserved = true;
-        } catch (observationError) {
-          if (observationError instanceof GwsEaError && observationError.code === 'unknown_instance') {
-            await removeProductionBootstrapManifest(paths, instanceId);
-          } else {
-            reserved = true;
-          }
-        }
-        throw error;
-      }
-    } catch (error) {
-      await held.release();
-      throw error;
-    }
-
-    let provisionResult: ProvisionResult | undefined;
-    let operation: InstanceOperation | null;
-    try {
-      operation = await acquireInstanceOperation(paths, instanceId);
-    } catch (error) {
-      await held.release();
-      throw error;
-    }
-    if (!operation) {
-      await held.release();
-      throw new GwsEaError('instance_busy', 'Instance operation is already in progress');
-    }
-    try {
-      await initializeJournal(operation);
-      provisionResult = await advanceProvision(operation, undefined, held, {
-        onProgress: (event) => progress.show(progressMessage(event)),
-      });
-    } finally {
-      await held.release();
-      operation.release();
-    }
-    progress.clear();
-    if (provisionResult.status === 'paused') {
-      printPause(output, instanceId, provisionResult);
-    } else {
-      output(`Instance ${instanceId} is ready.`);
-    }
-    return 0;
-  } catch (error) {
-    progress.clear();
-    errorOutput(safeErrorMessage(error));
-    if (reserved && instanceId) {
-      errorOutput(`Resume with: gws-ea resume --id ${instanceId}`);
-    } else {
-      errorOutput(`Retry with: ${createRetryCommand(track)}`);
-    }
-    return 1;
-  }
-  /* eslint-enable no-catch-all/no-catch-all */
-}
-
-async function resumeAssistant(
-  commandArgs: readonly string[],
-  paths: ControlPlanePaths,
-  output: LineWriter,
-  errorOutput: LineWriter,
-  initializeJournal: (operation: InstanceOperation) => Promise<void>,
-  advanceProvision: AdvanceProvision,
-  confirmConfigured: typeof confirmChatConfiguration,
-  checkGcloud: (account?: string) => Promise<{ readonly account: string }>,
-  progress: ProvisionProgressDisplay,
-): Promise<number> {
-  let instanceId: string | undefined;
-  /* eslint-disable no-catch-all/no-catch-all -- The CLI boundary redacts unexpected failures while preserving recovery instructions. */
-  try {
-    const options = parseOptions(commandArgs, ['id', 'messaging-group-id'], ['chat-configured']);
-    instanceId = requireOption(options, 'id');
-    assertInstanceId(instanceId);
-    const operation = await acquireInstanceOperation(paths, instanceId);
-    if (!operation) {
-      errorOutput('Instance operation is already in progress; no action was taken.');
-      return 2;
-    }
-    try {
-      progress.show('Resuming assistant…');
-      if (options['chat-configured']) await confirmConfigured(paths, instanceId);
-      await initializeJournal(operation);
-      const reservation = await getInstanceReservation(paths, instanceId);
-      const account = reservation.exclusive_resource_claims.gcp_account;
-      progress.clear();
-      const ready = await checkGcloud(account);
-      if (ready.account !== account) {
-        throw new GwsEaError('gcloud_account_mismatch', 'Google Cloud is signed in with the wrong account');
-      }
-      progress.show('Resuming assistant…');
-      const result = await advanceProvision(operation, options['messaging-group-id'], undefined, {
-        onProgress: (event) => progress.show(progressMessage(event)),
-      });
-      progress.clear();
-      if (result.status === 'paused') {
-        printPause(output, instanceId, result);
-        return 0;
-      }
-      const journal = await ensureProvisionJournal(operation);
-      const phase = firstIncompletePhase(journal);
-      output(phase ? `Resuming instance ${instanceId} at phase ${phase}.` : `Instance ${instanceId} is ready.`);
-      return 0;
-    } finally {
-      operation.release();
-    }
-  } catch (error) {
-    progress.clear();
-    errorOutput(safeErrorMessage(error));
-    if (instanceId) errorOutput(`Resume with: gws-ea resume --id ${instanceId}`);
-    return 1;
-  }
-  /* eslint-enable no-catch-all/no-catch-all */
-}
-
-async function defaultConfirmRemoval(preview: RemovalPreview): Promise<boolean> {
-  const answer = await prompts.confirm({
-    message: `Permanently remove assistant ${preview.instanceId} and request deletion of GCP project ${preview.gcpProject}?`,
-    initialValue: false,
-  });
-  return answer === true;
-}
-
-async function removeAssistantCommand(
-  commandArgs: readonly string[],
-  paths: ControlPlanePaths,
-  output: LineWriter,
-  errorOutput: LineWriter,
-  inspect: typeof describeRemoval,
-  remove: RemoveAssistantRunner,
-  confirm: (preview: RemovalPreview) => Promise<boolean>,
-): Promise<number> {
-  let instanceId: string | undefined;
-  /* eslint-disable no-catch-all/no-catch-all -- The CLI boundary redacts unexpected failures. */
-  try {
-    const options = parseOptions(commandArgs, ['id'], ['yes']);
-    instanceId = requireOption(options, 'id');
-    assertInstanceId(instanceId);
-    const preview = await inspect(paths, instanceId);
-    output(`Assistant: ${preview.instanceId}`);
-    output(`NanoClaw: ${preview.checkout}`);
-    output(`OneCLI: ${preview.onecliProject}`);
-    output(`Google Cloud project: ${preview.gcpProject} (${preview.gcpAccount})`);
-    if (preview.ingress.mode === 'existing') {
-      output(`External endpoint: ${preview.ingress.endpoint} (operator-managed; disconnect separately)`);
-    } else {
-      output(`Managed hostname: ${preview.ingress.hostname}`);
-      output(`Managed callback: ${preview.ingress.callback}`);
-      output(`Owned DNS record: ${preview.ingress.dnsRecordId ?? 'not created'}`);
-      output(`Owned tunnel route: ${preview.ingress.route}`);
-      output(
-        preview.ingress.sharedIngress === 'retained-for-peers'
-          ? 'Shared Cloudflare ingress: retained for other assistants'
-          : 'Shared Cloudflare ingress: retired after this final managed callback',
-      );
-    }
-    if (!options.yes && !(await confirm(preview))) {
-      output('Removal cancelled. Nothing was changed.');
-      return 0;
-    }
-    await remove(paths, instanceId);
-    output(`Assistant ${instanceId} was removed. Google Cloud project deletion was requested.`);
-    return 0;
-  } catch (error) {
-    errorOutput(safeErrorMessage(error));
-    if (instanceId) errorOutput(`Retry with: gws-ea remove --id ${instanceId}`);
-    return 1;
-  }
-  /* eslint-enable no-catch-all/no-catch-all */
+  return lines;
 }
 
 function printHelp(output: LineWriter): void {
   output('Usage: gws-ea <create|resume|remove> [options]');
-  output('  create --track <track>');
-  output('         [--source-remote <remote> --endpoint <https-url>]');
-  output('         [--workspace-email <email>]');
+  output('  create --track <track> [--source-remote <remote>]');
+  output('         [--assistant-first-name <name> --assistant-last-name <name>]');
+  output('         [--principal-first-name <name> --principal-last-name <name> --principal-timezone <iana>]');
+  output('         [--workspace-email <email>] [--provider <id>]');
+  output('         [--ingress existing --endpoint <https-url>]');
+  output('         [--ingress managed-cloudflare --cloudflare-zone <zone> --hostname-label <label>]');
   output('  resume --id <instance_id> [--chat-configured] [--messaging-group-id <exact-id>]');
   output('  remove --id <instance_id> [--yes]');
+  output('  Every command: [--secrets-file <owner-only file under the config root>] [--capture-fixtures]');
+  output('  Secrets: GWS_EA_PROVIDER_CREDENTIAL, GWS_EA_CLOUDFLARE_API_TOKEN (environment or --secrets-file).');
+  output('  Exit codes: 0 ready, 10 paused for a person, 1 failed, 75 busy.');
 }
 
 export async function runCli(args: readonly string[], runtime: CliRuntime = {}): Promise<number> {
   const output = runtime.stdout ?? ((line) => process.stdout.write(`${line}\n`));
   const errorOutput = runtime.stderr ?? ((line) => process.stderr.write(`${line}\n`));
-  const progress = createProgressDisplay(output, runtime.stdout === undefined && process.stdout.isTTY === true);
-  const configuredAuthenticateProvider = runtime.authenticateProvider;
-  const authenticateProvider = configuredAuthenticateProvider
-    ? async (provider: string): Promise<ProviderCredential> => {
-        progress.clear();
-        const credential = await configuredAuthenticateProvider(provider);
-        progress.show(PHASE_PROGRESS.configure_provider);
-        return credential;
-      }
-    : undefined;
-  const configuredRequestCloudflareAccountToken = runtime.requestCloudflareAccountToken;
-  const requestCloudflareAccountToken = configuredRequestCloudflareAccountToken
-    ? async (accountId: string, observation: string): Promise<string> => {
-        progress.clear();
-        const token = await configuredRequestCloudflareAccountToken(accountId, observation, () =>
-          progress.show(PHASE_PROGRESS.establish_transport),
-        );
-        progress.show(PHASE_PROGRESS.establish_transport);
-        return token;
-      }
-    : undefined;
-  const paths = runtime.paths ?? resolveControlPlanePaths();
-  const initializeJournal =
-    runtime.initializeJournal ?? (async (operation) => void (await ensureProvisionJournal(operation)));
-  const advanceProvision =
-    runtime.advanceProvision ??
-    ((operation, selectedMessagingGroupId, heldPorts, provisionRuntime) =>
-      runProductionProvision(operation, {
-        selectedMessagingGroupId,
-        portLease: heldPorts,
-        authenticateProvider,
-        managedIngress: {
-          ...(runtime.managedIngressSetup ? { setupSession: runtime.managedIngressSetup } : {}),
-          ...(requestCloudflareAccountToken ? { requestAccountToken: requestCloudflareAccountToken } : {}),
-        },
-        runtime: provisionRuntime,
-      }));
-  const resolveRelease = runtime.resolveRelease ?? resolveReleaseCommit;
-  const allocatePorts = runtime.holdLoopbackPorts ?? holdLoopbackPorts;
-  const collectInputs =
-    runtime.collectCreateInputs ??
-    (async (): Promise<CreateSetupAnswers> => {
-      throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
-    });
-  const persistReservation = runtime.reserveInstance ?? reserveInstance;
-  const checkGcloud =
-    runtime.preflightGcloud ??
-    ((account?: string) => preflightGcloud({ cwd: process.cwd(), ...(account ? { account } : {}) }));
-  const confirmConfigured = runtime.confirmChatConfiguration ?? confirmChatConfiguration;
-  const inspectRemoval = runtime.describeRemoval ?? describeRemoval;
-  const remove: RemoveAssistantRunner =
-    runtime.removeAssistant ??
-    ((targetPaths, instanceId) =>
-      removeAssistant(targetPaths, instanceId, {
-        ...(runtime.requestCloudflareAccountToken
-          ? { requestCloudflareAccountToken: runtime.requestCloudflareAccountToken }
-          : {}),
-      }));
-  const confirm = runtime.confirmRemoval ?? defaultConfirmRemoval;
-
   if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
     printHelp(output);
-    return 0;
+    return EXIT_CODES.ready;
   }
-  if (args[0] === 'create') {
+  const command = args[0];
+  if (command !== 'create' && command !== 'resume' && command !== 'remove') {
+    errorOutput('Unknown command.');
+    printHelp(errorOutput);
+    return EXIT_CODES.failed;
+  }
+  const presenter = runtime.presenter ?? createLinePresenter(output, errorOutput);
+  const managedIngressSetup = runtime.managedIngressSetup ?? createManagedIngressSetupSession();
+  const cli = new Cli(runtime, presenter, managedIngressSetup);
+  try {
+    let next: () => Promise<Attempt>;
     try {
-      return await createAssistant(
-        args.slice(1),
-        paths,
-        output,
-        errorOutput,
-        initializeJournal,
-        advanceProvision,
-        resolveRelease,
-        allocatePorts,
-        collectInputs,
-        persistReservation,
-        checkGcloud,
-        progress,
-        runtime.managedIngressSetup,
-      );
-    } finally {
-      runtime.managedIngressSetup?.clearAccountToken();
+      next = cli.prepare(command, args.slice(1));
+    } catch (error) {
+      if (!(error instanceof GwsEaError)) throw error;
+      presenter.report({ outcome: 'failed', headline: error.message, details: ['Run gws-ea --help for usage.'] });
+      return EXIT_CODES.failed;
     }
-  }
-  if (args[0] === 'resume') {
-    try {
-      return await resumeAssistant(
-        args.slice(1),
-        paths,
-        output,
-        errorOutput,
-        initializeJournal,
-        advanceProvision,
-        confirmConfigured,
-        checkGcloud,
-        progress,
-      );
-    } finally {
-      runtime.managedIngressSetup?.clearAccountToken();
+    for (;;) {
+      const attempt = await next();
+      if (attempt.status === 'done') return attempt.exitCode;
+      if (!runtime.onFailure) return EXIT_CODES.failed;
+      if ((await runtime.onFailure(attempt.report)) !== 'retry') return EXIT_CODES.failed;
+      next = attempt.retry;
     }
+  } finally {
+    managedIngressSetup.clearAccountToken();
   }
-  if (args[0] === 'remove') {
-    try {
-      return await removeAssistantCommand(args.slice(1), paths, output, errorOutput, inspectRemoval, remove, confirm);
-    } finally {
-      runtime.managedIngressSetup?.clearAccountToken();
-    }
-  }
-  errorOutput('Unknown command.');
-  printHelp(errorOutput);
-  return 1;
 }

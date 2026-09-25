@@ -89,7 +89,12 @@ import {
   type ProviderCredentialMetadata,
 } from '../provider-credential.js';
 import { assertProviderProvisioningCapabilityDigest } from '../provider-provisioning-capability.js';
-import { googleChatConfigurationUrl, isChatConfigurationConfirmed } from './chat-configuration.js';
+import {
+  confirmChatConfiguration,
+  googleChatConfigurationUrl,
+  isChatConfigurationConfirmed,
+} from './chat-configuration.js';
+import { runStep, type Interaction, type StepReporter } from './events.js';
 import {
   parseGchatServiceAccountCredential,
   getOwnedGcpProjectNumber,
@@ -116,22 +121,39 @@ export interface ProvisionBoundaryEvent {
   readonly attemptId: string;
 }
 
-export type ProvisionProgressEvent =
-  | { readonly phase: ProvisionPhase; readonly detail?: never }
-  | { readonly phase: 'provision_gcp'; readonly detail: GcloudReadbackResource };
-
-export interface ProvisionRuntime {
+/** Each phase runs as a logged step that reports typed events (events.ts). */
+export interface ProvisionRuntime extends StepReporter {
   readonly onBoundary?: (event: ProvisionBoundaryEvent) => void | Promise<void>;
-  readonly onProgress?: (event: ProvisionProgressEvent) => void | Promise<void>;
 }
 
+const PHASE_LABELS: Readonly<Record<ProvisionPhase, string>> = {
+  materialize_checkout: 'Preparing assistant files…',
+  provision_gcp: 'Configuring Google Cloud…',
+  start_onecli: 'Starting the credential vault…',
+  configure_provider: 'Connecting the AI provider…',
+  start_nanoclaw: 'Starting the assistant…',
+  establish_transport: 'Publishing the secure callback…',
+  configure_channel: 'Checking Google Chat configuration…',
+  bind_principal: 'Connecting the principal conversation…',
+  verify_conversation: 'Verifying the conversation…',
+  ready: 'Finishing setup…',
+};
+
+const GCP_WAIT_REASONS: Readonly<Record<GcloudReadbackResource, string>> = {
+  project: 'Waiting for the Google Cloud project…',
+  apis: 'Waiting for the required Google Cloud APIs…',
+  'service-account': 'Waiting for the Google Chat service account…',
+  'credential-policy': 'Updating the dedicated project’s Google Chat credential policy…',
+  'service-account-keys': 'Waiting for Google Cloud IAM…',
+  'credential-key': 'Waiting for the Google Chat credential…',
+};
+
 export interface ProductionProvisionOptions {
-  readonly selectedMessagingGroupId?: string;
   readonly portLease?: ProvisionPortLease;
-  readonly authenticateProvider?: (provider: string) => Promise<ProviderCredential>;
+  /** Human input: credentials, sign-in, and decisions supplied on re-entry. */
+  readonly interaction?: Interaction;
   readonly managedIngress?: {
     readonly setupSession?: Pick<RetainedManagedIngressSetupSession, 'requireAccountToken'>;
-    readonly requestAccountToken?: (accountId: string, observation: string) => Promise<string>;
   };
   readonly runtime?: ProvisionRuntime;
 }
@@ -1005,7 +1027,8 @@ export function createProductionProvisionRegistry(
       probe: dependencies.probeGcp,
       apply: async (value) => {
         await dependencies.reconcileGcpProject(value.input.gcp, {
-          onProgress: ({ resource }) => runtime.onProgress?.({ phase: 'provision_gcp', detail: resource }),
+          onProgress: ({ resource }) =>
+            runtime.emit?.({ type: 'step-waiting', step: 'provision_gcp', reason: GCP_WAIT_REASONS[resource] }),
         });
         return { status: 'completed' };
       },
@@ -1295,12 +1318,14 @@ export async function reconcileProvisioning<Context>(
 ): Promise<ProvisionResult> {
   let journal = await ensureProvisionJournal(operation);
 
-  for (const phase of PROVISION_PHASES) {
-    await runtime.onProgress?.({ phase });
+  /** Advance one phase; `undefined` once its postcondition holds. */
+  const advancePhase = async (
+    phase: ProvisionPhase,
+  ): Promise<Extract<ProvisionResult, { status: 'paused' }> | undefined> => {
     const definition = definitions[phase];
     if (succeeded(journal, phase)) {
       await assertCompletedPostcondition(phase, definition, context);
-      continue;
+      return undefined;
     }
 
     const resourceKey = definition.resourceKey(context);
@@ -1319,7 +1344,7 @@ export async function reconcileProvisioning<Context>(
         await boundary(runtime, phase, 'verify', attempt.attempt_id);
         if (reconciled.status === 'matched') {
           journal = await commitPhaseSuccess(operation, phase, attempt.attempt_id);
-          continue;
+          return undefined;
         }
         begun = await beginPhase(operation, phase, resourceKey);
         attempt = begun.attempt;
@@ -1337,7 +1362,7 @@ export async function reconcileProvisioning<Context>(
         });
         await boundary(runtime, phase, 'verify', attempt.attempt_id);
         journal = await commitPhaseSuccess(operation, phase, attempt.attempt_id);
-        continue;
+        return undefined;
       }
       const applied = await definition.apply(context);
       if (applied.status === 'paused') return { status: 'paused', pause: applied.pause };
@@ -1362,8 +1387,18 @@ export async function reconcileProvisioning<Context>(
       }
       throw error;
     }
-  }
+    return undefined;
+  };
 
+  for (const phase of PROVISION_PHASES) {
+    const paused = await runStep(
+      runtime,
+      { id: phase, label: PHASE_LABELS[phase] },
+      () => advancePhase(phase),
+      (result) => result?.pause,
+    );
+    if (paused) return paused;
+  }
   return { status: 'ready' };
 }
 
@@ -1631,8 +1666,10 @@ export async function runProductionProvision(
   operation: InstanceOperation,
   options: ProductionProvisionOptions = {},
 ): Promise<ProvisionResult> {
-  const { authenticateProvider, managedIngress } = options;
+  const { interaction, managedIngress } = options;
   const provisionRuntime = options.runtime ?? {};
+  const selectedMessagingGroupId = interaction?.decisions.messagingGroupId;
+  if (interaction?.decisions.chatConfigured) await confirmChatConfiguration(operation.paths, operation.instanceId);
   const reservation = await getInstanceReservation(operation.paths, operation.instanceId);
   const provisioningStartedAt = await ensureTrustedProvisioningStart(operation, reservation);
   const principalSelection = await loadPrincipalSelection(
@@ -1643,8 +1680,8 @@ export async function runProductionProvision(
   );
   if (
     principalSelection &&
-    options.selectedMessagingGroupId !== undefined &&
-    principalSelection.candidate.messagingGroupId !== options.selectedMessagingGroupId
+    selectedMessagingGroupId !== undefined &&
+    principalSelection.candidate.messagingGroupId !== selectedMessagingGroupId
   ) {
     throw new GwsEaError('principal_selection_mismatch', 'The principal selection is already fixed for this instance');
   }
@@ -1740,19 +1777,25 @@ export async function runProductionProvision(
         cwd: reservation.checkout_realpath,
       },
       providerCredentialMetadata,
-      ...(manifest && authenticateProvider
-        ? { requestProviderCredential: () => authenticateProvider(manifest.provider.id) }
+      ...(manifest && interaction
+        ? {
+            requestProviderCredential: () =>
+              interaction.requestProviderCredential({
+                providerId: manifest.provider.id,
+                metadata: providerCredentialMetadata,
+              }),
+          }
         : {}),
       identity,
       adapterInstance: 'gchat',
       provisioningStartedAt,
       ...((principalSelection?.candidate.messagingGroupId ??
-      options.selectedMessagingGroupId ??
+      selectedMessagingGroupId ??
       manifest?.selected_messaging_group_id)
         ? {
             selectedMessagingGroupId:
               principalSelection?.candidate.messagingGroupId ??
-              options.selectedMessagingGroupId ??
+              selectedMessagingGroupId ??
               manifest!.selected_messaging_group_id!,
           }
         : {}),
@@ -1770,8 +1813,11 @@ export async function runProductionProvision(
       ...(options.portLease ? { portLease: options.portLease } : {}),
       ingress: reservation.exclusive_resource_claims.ingress,
       ...(managedIngress?.setupSession ? { managedIngressSetup: managedIngress.setupSession } : {}),
-      ...(managedIngress?.requestAccountToken
-        ? { requestCloudflareAccountToken: managedIngress.requestAccountToken }
+      ...(interaction
+        ? {
+            requestCloudflareAccountToken: (accountId: string, reason: string) =>
+              interaction.requestCloudflareAccountToken({ accountId, reason }),
+          }
         : {}),
     },
   };

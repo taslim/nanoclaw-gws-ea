@@ -345,6 +345,30 @@ describe('GWS-EA command runner', () => {
     for (const leaked of [apiKey, accessToken, 'plain-password-value', 'c0ffee']) expect(raw).not.toContain(leaked);
   });
 
+  it('writes input to stdin without logging it, and survives a child that never reads it', async () => {
+    const run = await runLog();
+    const input = `diagnosis bundle ${randomBytes(12).toString('hex')}`;
+
+    const echoed = await run.step('diagnose', () =>
+      runSanitizedCommand({
+        command: NODE,
+        args: ['--eval', 'process.stdin.pipe(process.stdout)'],
+        cwd: process.cwd(),
+        input,
+      }),
+    );
+    const ignored = await runSanitizedCommandOutcome({
+      command: NODE,
+      args: ['--eval', 'process.exit(3)'],
+      cwd: process.cwd(),
+      input: 'x'.repeat(4 * 1024 * 1024),
+    });
+
+    expect(echoed.stdout).toBe(input);
+    expect(await rawLog(run, '01-diagnose.log')).not.toContain(input);
+    expect(ignored.exitCode).toBe(3);
+  });
+
   it('redacts secrets from stderr in the raw log and the error tail', async () => {
     const secretDirectory = await temporaryRoot('secret-dir');
     const fileSecret = `file-secret-${randomBytes(12).toString('hex')}`;

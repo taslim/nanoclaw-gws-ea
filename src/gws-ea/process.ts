@@ -1,13 +1,14 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import { constants as fsConstants } from 'node:fs';
 import { access, realpath, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
+import type { Readable, Writable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 
 import { errorCode, isErrno } from '../community-portal/errors.js';
-import { CONTROL_PLANE_ROOT } from './paths.js';
+import { CONTROL_PLANE_ROOT, isWithinDirectory } from './paths.js';
 import { createStreamRedactor, redact, registerSecret } from './redact.js';
 import { activeStep, type StepLog } from './run-log.js';
 import { GwsEaError } from './types.js';
@@ -72,6 +73,8 @@ export interface SanitizedCommand {
    * returning stdout. Only for output nobody parses: image builds and compose.
    */
   readonly stream?: boolean;
+  /** Text written to the child's stdin, then closed. Never logged. */
+  readonly input?: string;
 }
 
 export interface SanitizedCommandResult {
@@ -118,6 +121,11 @@ function buildEnvironment(
     environment[key] = value;
   }
   return environment;
+}
+
+/** Whether an environment variable's name marks its value as a secret. */
+export function isSecretEnvironmentKey(key: string): boolean {
+  return SECRET_ENVIRONMENT_KEY.test(key);
 }
 
 /** Environment for a tool the control plane runs: the tool allowlist plus explicit overrides. */
@@ -187,11 +195,6 @@ async function canonicalRoots(roots: readonly string[]): Promise<string[]> {
   );
 }
 
-function isWithin(target: string, root: string): boolean {
-  const relative = path.relative(root, target);
-  return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
-}
-
 /**
  * Resolve an executable persisted into runtime.json and the service unit
  * (`node`, `onecli`) to its real path. Refused in a group- or world-writable
@@ -211,10 +214,10 @@ export async function resolvePersistedExecutable(
   const [file, directory] = await Promise.all([stat(executable), stat(path.dirname(executable))]);
   if (((file.mode | directory.mode) & 0o022) !== 0) throw refuse('is in a group- or world-writable location');
   for (const root of await canonicalRoots([CONTROL_PLANE_ROOT, ...(options.checkoutRoots ?? [])])) {
-    if (isWithin(executable, root)) throw refuse(`is inside a checkout (${root})`);
+    if (isWithinDirectory(executable, root)) throw refuse(`is inside a checkout (${root})`);
   }
   for (const root of await canonicalRoots([os.tmpdir(), ...TEMPORARY_ROOTS])) {
-    if (isWithin(executable, root)) throw refuse(`is inside a temporary directory (${root})`);
+    if (isWithinDirectory(executable, root)) throw refuse(`is inside a temporary directory (${root})`);
   }
   return executable;
 }
@@ -344,13 +347,14 @@ function execute(
   const timeoutMs = command.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const outputLimit = command.outputLimitBytes ?? DEFAULT_PARSED_OUTPUT_LIMIT_BYTES;
   return new Promise((resolve, reject) => {
+    // stdin is a pipe only when there is input; stdout and stderr are always pipes.
     const child = spawn(executable, [...command.args], {
       cwd: command.cwd,
       env: environment,
       shell: false,
       detached: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+      stdio: [command.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+    }) as ChildProcessByStdio<Writable | null, Readable, Readable>;
     const pid = child.pid;
     if (pid !== undefined) trackGroup(pid);
     const tees = command.stream ? { stdout: createStreamRedactor(), stderr: createStreamRedactor() } : undefined;
@@ -390,6 +394,13 @@ function execute(
     child.once('error', (error) => {
       startError = error;
     });
+    if (command.input !== undefined && child.stdin) {
+      // A child that exits without reading its input closes the pipe; its exit status tells the story.
+      child.stdin.on('error', (error) => {
+        if (!isErrno(error, 'EPIPE')) startError ??= error;
+      });
+      child.stdin.end(command.input);
+    }
     const timer = setTimeout(() => terminate('timeout'), timeoutMs);
 
     child.once('close', (code, signal) => {
@@ -442,7 +453,7 @@ export const runSanitizedCommandOutcome: SanitizedCommandOutcomeRunner = async (
   const searched = executableSearchPath(environment.PATH);
   if (environment.PATH !== undefined) environment.PATH = searched.join(path.delimiter);
   for (const [key, value] of Object.entries(environment)) {
-    if (SECRET_ENVIRONMENT_KEY.test(key)) registerSecret(value);
+    if (isSecretEnvironmentKey(key)) registerSecret(value);
   }
   const step = activeStep();
   step?.write(

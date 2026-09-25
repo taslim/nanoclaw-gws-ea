@@ -18,8 +18,8 @@ import {
   type ProductionBootstrapManifest,
   type ProductionProvisionContext,
   type ProductionProvisionDependencies,
-  type ProvisionProgressEvent,
 } from './provision.js';
+import type { RunEvent } from './events.js';
 import { defineProvisionPhaseRegistry, type ProvisionPhaseDefinition } from './phases.js';
 import type { MainIdentityDependencies } from './identity.js';
 import { reserveInstance } from './registry.js';
@@ -224,9 +224,11 @@ describe('resumable provision phase runner', () => {
     const input = reservation(paths);
     await reserveInstance(paths, input);
     const context: FixtureContext = { instanceId: input.instance_id, resources: new Set(), effects: new Map() };
-    const progress: ProvisionPhase[] = [];
+    const progress: string[] = [];
     const runtime = {
-      onProgress: (event: { readonly phase: ProvisionPhase }) => void progress.push(event.phase),
+      emit: (event: RunEvent) => {
+        if (event.type === 'step-started') progress.push(event.step);
+      },
     };
 
     await withInstanceOperation(paths, input.instance_id, (operation) =>
@@ -544,7 +546,7 @@ describe('production provision phase composition', () => {
   it('forwards delayed Google Cloud readback progress through the provision runtime', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
-    const progress: ProvisionProgressEvent[] = [];
+    const progress: RunEvent[] = [];
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
@@ -557,13 +559,15 @@ describe('production provision phase composition', () => {
       const phase = createProductionProvisionRegistry(
         context,
         { reconcileGcpProject },
-        { onProgress: (event) => void progress.push(event) },
+        { emit: (event) => void progress.push(event) },
       ).provision_gcp;
 
       await expect(phase.apply(context)).resolves.toEqual({ status: 'completed' });
     });
 
-    expect(progress).toEqual([{ phase: 'provision_gcp', detail: 'service-account' }]);
+    expect(progress).toEqual([
+      { type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for the Google Chat service account…' },
+    ]);
   });
 
   it('accepts only an all-mode canonical main without enumerating its grants', async () => {

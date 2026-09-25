@@ -111,6 +111,12 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
   };
 }
 
+/** Whether `target` lies strictly inside `root` (both absolute, already canonical where it matters). */
+export function isWithinDirectory(target: string, root: string): boolean {
+  const relative = path.relative(root, target);
+  return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
 function unsignedFilesystemType(type: number | bigint): bigint {
   return BigInt.asUintN(64, BigInt(type));
 }
