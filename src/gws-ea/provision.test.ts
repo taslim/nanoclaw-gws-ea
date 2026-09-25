@@ -427,6 +427,38 @@ describe('step engine', () => {
     ]);
   });
 
+  it('fails the step when a resource it set up stays absent through every wait', async () => {
+    const engine = await engineFixture();
+    let applies = 0;
+    engine.steps = {
+      ...engine.steps,
+      provision_gcp: {
+        ...engine.steps.provision_gcp,
+        resources: [
+          {
+            name: 'the Google Cloud project',
+            observe: async () => ABSENT,
+            apply: async () => {
+              applies += 1;
+              return undefined;
+            },
+          },
+        ],
+      },
+    };
+
+    await expect(engine.run()).rejects.toMatchObject({
+      code: 'step_incomplete',
+      message: 'the Google Cloud project is still missing after it was set up',
+    });
+
+    expect(applies).toBe(1);
+    expect(engine.sleeps).toEqual(FULL_WAIT);
+    const journal = await engine.journal();
+    expect(journal.steps.provision_gcp?.completed_at).toBeUndefined();
+    expect(journal.last_error).toMatchObject({ step: 'provision_gcp', code: 'step_incomplete' });
+  });
+
   it('pauses when an observation needs sign-in, and continues after it', async () => {
     const engine = await engineFixture();
     const signIn: ProvisionHumanPause = {

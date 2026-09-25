@@ -11,6 +11,7 @@ import { activeStep, startRunLog } from './run-log.js';
 import { GwsEaError } from './types.js';
 
 const INSTANCE_ID = '0d8f6f7e-3c2b-4a1d-9e8f-7a6b5c4d3e2f';
+const OTHER_INSTANCE_ID = '11111111-1111-4111-8111-111111111111';
 const roots: string[] = [];
 
 afterEach(async () => {
@@ -121,6 +122,32 @@ describe('GWS-EA run log', () => {
     expect(progression).toContain('prerequisites');
     expect(progression).toContain(`instance-reserved → ${INSTANCE_ID}`);
     expect(await readFile(path.join(run.directory, 'steps', '02-reserve.log'), 'utf8')).toBe('reserved\n');
+  });
+
+  it('treats assigning the instance a run already belongs to as a no-op', async () => {
+    const paths = await controlPlanePaths();
+    const run = await startRunLog({ paths, command: 'create' });
+    await run.assignInstance(INSTANCE_ID);
+    const assigned = run.directory;
+    const progression = await readFile(run.progressLog, 'utf8');
+
+    await expect(run.assignInstance(INSTANCE_ID)).resolves.toBeUndefined();
+
+    expect(run.directory).toBe(assigned);
+    expect(await readdir(paths.instanceLogsRoot(INSTANCE_ID))).toEqual([run.id]);
+    expect(await readFile(run.progressLog, 'utf8')).toBe(progression);
+  });
+
+  it('refuses to move a run that already belongs to another instance', async () => {
+    const paths = await controlPlanePaths();
+    const run = await startRunLog({ paths, command: 'resume', instanceId: INSTANCE_ID });
+    const assigned = run.directory;
+
+    await expect(run.assignInstance(OTHER_INSTANCE_ID)).rejects.toMatchObject({ code: 'run_log_conflict' });
+
+    expect(run.directory).toBe(assigned);
+    expect((await stat(assigned)).isDirectory()).toBe(true);
+    await expect(stat(paths.instanceLogsRoot(OTHER_INSTANCE_ID))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('never lets concurrent runs share a directory or file', async () => {
