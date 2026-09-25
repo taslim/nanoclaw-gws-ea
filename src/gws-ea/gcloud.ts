@@ -485,15 +485,18 @@ function policyPermissionPause(coordinates: GcpProjectCoordinates): ProvisionHum
   };
 }
 
-/**
- * Set both key-creation constraints on the dedicated project only (org-policies
- * v2). A missing policy permission pauses; any other refusal stops.
- */
+/** A key-creation constraint Google refused to set, and the refused command. */
+interface PolicyRefusal {
+  readonly constraint: string;
+  readonly refused: Ran;
+}
+
+/** Set both key-creation constraints on the dedicated project only (org-policies v2). */
 async function setKeyCreationPolicy(
   coordinates: GcpProjectCoordinates,
   enforce: boolean,
   dependencies: GcloudDependencies,
-): Promise<Pause> {
+): Promise<PolicyRefusal | undefined> {
   const gcloud = gcloudFor(coordinates, dependencies);
   const { projectId } = coordinates;
   const directory = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-org-policy-'));
@@ -503,10 +506,7 @@ async function setKeyCreationPolicy(
       const policy = { name: `projects/${projectId}/policies/${constraint}`, spec: { rules: [{ enforce }] } };
       await writeFile(file, JSON.stringify(policy), { encoding: 'utf8', flag: 'wx', mode: 0o600 });
       const set = await gcloud(['org-policies', 'set-policy', file, `--project=${projectId}`]);
-      if (succeeded(set)) continue;
-      if (classifyGcloudFailure(set.outcome) === 'permission-or-missing') return policyPermissionPause(coordinates);
-      const change = enforce ? 'restore' : 'lift';
-      throw gcloudFailed(`Google Cloud could not ${change} ${constraint} on project ${projectId}`, set);
+      if (!succeeded(set)) return { constraint, refused: set };
     }
     return undefined;
   } finally {
@@ -514,9 +514,27 @@ async function setKeyCreationPolicy(
   }
 }
 
+/** For `provision_gcp`: a missing policy permission pauses for the operator; any other refusal stops. */
+async function changeKeyCreationPolicy(
+  coordinates: GcpProjectCoordinates,
+  enforce: boolean,
+  dependencies: GcloudDependencies,
+): Promise<Pause> {
+  const refusal = await setKeyCreationPolicy(coordinates, enforce, dependencies);
+  if (!refusal) return undefined;
+  if (classifyGcloudFailure(refusal.refused.outcome) === 'permission-or-missing') {
+    return policyPermissionPause(coordinates);
+  }
+  const change = enforce ? 'restore' : 'lift';
+  throw gcloudFailed(
+    `Google Cloud could not ${change} ${refusal.constraint} on project ${coordinates.projectId}`,
+    refusal.refused,
+  );
+}
+
 /** Restore the dedicated project's key-creation policy, then clear the journal's lift. */
 async function restoreKeyCreationPolicy(context: GcpStepContext, dependencies: GcloudDependencies): Promise<Pause> {
-  const pause = await setKeyCreationPolicy(context.input.gcp, true, dependencies);
+  const pause = await changeKeyCreationPolicy(context.input.gcp, true, dependencies);
   if (!pause) await recordKeyPolicyLifted(context.operation, false);
   return pause;
 }
@@ -551,7 +569,7 @@ async function createKey(context: GcpStepContext, dependencies: GcloudDependenci
   let created = await create();
   if (blocked(created)) {
     await recordKeyPolicyLifted(context.operation, true);
-    const denied = await setKeyCreationPolicy(gcp, false, dependencies);
+    const denied = await changeKeyCreationPolicy(gcp, false, dependencies);
     if (denied) return denied;
     const sleep = dependencies.sleep ?? delay;
     let restored: Pause;
@@ -753,29 +771,55 @@ export function googleCloudResources(dependencies: GcloudDependencies = {}): rea
 }
 
 /**
- * Delete the owned project. A project Google will not describe raises
- * `gcp_project_unobservable` with evidence: whether that may be skipped
- * depends on whether provisioning ever started it (KTD5).
+ * Removal's restore of a key-creation policy `provision_gcp` lifted (KTD5).
+ * Returns what Google refused as evidence, for the receipt to record as an
+ * unrestored lift, rather than pausing the way `provision_gcp` does.
+ */
+export async function restoreKeyCreationPolicyForRemoval(
+  coordinates: GcpProjectCoordinates,
+  dependencies: GcloudDependencies = {},
+): Promise<string | undefined> {
+  const refusal = await setKeyCreationPolicy(coordinates, true, dependencies);
+  return refusal && `${refusal.constraint}: ${evidence(refusal.refused)}`;
+}
+
+export interface GcpProjectRemovalOptions {
+  /** `provision_gcp` lifted the key-creation policy: restore it before deleting the project. */
+  readonly restoreKeyPolicy: boolean;
+}
+
+/** Removal's side of the reserved project: deleted (now or earlier), or unknown with evidence. */
+export type GcpProjectRemoval =
+  | { readonly status: 'deleted'; readonly keyPolicyUnrestored?: string }
+  | { readonly status: 'unknown'; readonly reason: string; readonly evidence: string };
+
+/**
+ * Delete the owned project (KTD5). It is deleted only once it is described
+ * with this assistant's labels, after any lifted key-creation policy is
+ * restored; a restore Google refuses is reported, not a reason to keep the
+ * project. A project Google will not describe is unknown, with evidence:
+ * whether that may be skipped or abandoned is removal's decision.
  */
 export async function deleteOwnedGcpProject(
   coordinates: GcpProjectCoordinates,
+  options: GcpProjectRemovalOptions,
   dependencies: GcloudDependencies = {},
-): Promise<void> {
+): Promise<GcpProjectRemoval> {
   const gcloud = gcloudFor(coordinates, dependencies);
   const read = await readProject(gcloud, coordinates.projectId);
   if ('failed' in read) {
-    if (classifyGcloudFailure(read.failed.outcome) !== 'permission-or-missing') {
-      throw gcloudFailed(`Google Cloud could not describe project ${coordinates.projectId}`, read.failed);
-    }
-    throw new GwsEaError(
-      'gcp_project_unobservable',
-      `Google Cloud will not say whether project ${coordinates.projectId} exists for ${coordinates.account}`,
-      { details: { evidence: evidence(read.failed) } },
-    );
+    return {
+      status: 'unknown',
+      reason: `Google Cloud will not show project ${coordinates.projectId} to ${coordinates.account}, so removal cannot tell whether it still exists`,
+      evidence: evidence(read.failed),
+    };
   }
   assertOwnedProject(coordinates, read.value);
-  if (read.value.lifecycleState === 'DELETE_REQUESTED') return;
+  if (read.value.lifecycleState === 'DELETE_REQUESTED') return { status: 'deleted' };
   assertActiveProject(coordinates, read.value);
+  const keyPolicyUnrestored = options.restoreKeyPolicy
+    ? await restoreKeyCreationPolicyForRemoval(coordinates, dependencies)
+    : undefined;
   const deleted = await gcloud(['projects', 'delete', coordinates.projectId]);
   if (!succeeded(deleted)) {
     throw gcloudFailed(`Google Cloud could not delete project ${coordinates.projectId}`, deleted);
@@ -787,4 +831,5 @@ export async function deleteOwnedGcpProject(
       `Google Cloud did not confirm deletion of project ${coordinates.projectId}`,
     );
   }
+  return keyPolicyUnrestored ? { status: 'deleted', keyPolicyUnrestored } : { status: 'deleted' };
 }

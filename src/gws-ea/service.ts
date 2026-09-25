@@ -347,23 +347,6 @@ export async function loadInstanceRuntimeConfig(file: string): Promise<InstanceR
   return config;
 }
 
-/**
- * The home directory a runtime file records, or undefined without one.
- * Removal needs nothing else from the file, so a runtime an earlier launcher
- * wrote without a later field still removes cleanly.
- */
-export async function readRecordedHomeDirectory(file: string): Promise<string | undefined> {
-  let runtime: unknown;
-  try {
-    runtime = await readOwnerOnlyJson(file, 'Runtime config', INVALID_RUNTIME);
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) return undefined;
-    throw error;
-  }
-  const { home_directory: home } = requireRecord(runtime, 'Runtime config', INVALID_RUNTIME);
-  return requirePath(home, 'home_directory', INVALID_RUNTIME);
-}
-
 export function createInstanceServiceLayout(
   configInput: InstanceRuntimeConfig,
   options: ServiceLayoutOptions,
@@ -391,8 +374,11 @@ export function createInstanceServiceLayout(
   };
 }
 
+/** The runtime values a service manager's environment derives from. */
+export type ServiceManagerRuntime = Pick<PersistedInstanceRuntime, 'home_directory' | 'docker_endpoint'>;
+
 /** What the service manager starts the launcher with, and what the image build runs under. */
-function serviceEnvironment(config: InstanceRuntimeConfig): Readonly<Record<string, string>> {
+function serviceEnvironment(config: ServiceManagerRuntime): Readonly<Record<string, string>> {
   return {
     HOME: config.home_directory,
     PATH: `${SERVICE_PATH}:${path.join(config.home_directory, '.local', 'bin')}`,
@@ -428,7 +414,7 @@ async function assertExecutable(file: string): Promise<void> {
   await access(file, fsConstants.X_OK);
 }
 
-function requireUid(dependencies: InstanceServiceDependencies): number {
+function requireUid(dependencies: Pick<InstanceServiceDependencies, 'uid'>): number {
   const uid = dependencies.uid ?? process.getuid?.();
   if (uid === undefined) throw new GwsEaError('unsupported_platform', 'The service manager requires a user ID');
   return uid;
@@ -440,12 +426,12 @@ function requireUid(dependencies: InstanceServiceDependencies): number {
  * `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS`, derived from the UID when
  * the caller has none (a non-login shell, sudo, cron).
  */
-function serviceManagerEnvironment(
-  config: InstanceRuntimeConfig,
-  layout: InstanceServiceLayout,
-  dependencies: InstanceServiceDependencies,
+export function serviceManagerEnvironment(
+  config: ServiceManagerRuntime,
+  manager: InstanceServiceLayout['manager'],
+  dependencies: Pick<InstanceServiceDependencies, 'uid' | 'ambientEnv'>,
 ): Readonly<Record<string, string>> {
-  if (layout.manager !== 'systemd-user') return buildToolEnvironment({}, serviceEnvironment(config));
+  if (manager !== 'systemd-user') return buildToolEnvironment({}, serviceEnvironment(config));
   const ambient = dependencies.ambientEnv ?? process.env;
   const runtimeDirectory = ambient.XDG_RUNTIME_DIR || `/run/user/${requireUid(dependencies)}`;
   return buildToolEnvironment(
@@ -517,7 +503,7 @@ export async function reconcileInstanceService(
   await mkdir(path.dirname(layout.serviceDefinitionPath), { recursive: true, mode: 0o700 });
   await writePrivateTextFile(layout.serviceDefinitionPath, renderInstanceService(config, layout));
   const run = dependencies.runCommand ?? runSanitizedCommand;
-  const environment = serviceManagerEnvironment(config, layout, dependencies);
+  const environment = serviceManagerEnvironment(config, layout.manager, dependencies);
   const command = async (program: string, args: readonly string[]): Promise<string> =>
     (await run({ command: program, args, cwd: config.checkout_realpath, env: environment, timeoutMs: 30_000 })).stdout;
   if (layout.manager === 'launchd') {
@@ -566,7 +552,7 @@ export async function instanceServicePid(
       command: layout.manager === 'launchd' ? 'launchctl' : 'systemctl',
       args,
       cwd: config.checkout_realpath,
-      env: serviceManagerEnvironment(config, layout, dependencies),
+      env: serviceManagerEnvironment(config, layout.manager, dependencies),
       timeoutMs: 30_000,
     }));
   } catch (error) {

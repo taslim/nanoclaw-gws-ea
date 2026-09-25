@@ -18,7 +18,6 @@ import {
   launchInstanceHost,
   loadInstanceRuntimeConfig,
   persistInstanceRuntime,
-  readRecordedHomeDirectory,
   reconcileInstanceRuntime,
   reconcileInstanceService,
   runInstanceOnecliAdminCommand,
@@ -152,19 +151,6 @@ describe('GWS-EA instance runtime', () => {
     expect(loaded.onecli_gateway_container).toBe(config.onecli_gateway_container);
     await persistInstanceRuntime(loaded, upsertEnvVars);
     expect(await readFile(file, 'utf8')).toBe(extended);
-  });
-
-  it('reads the home directory removal needs from a runtime an earlier launcher wrote', async () => {
-    const { config } = await fixture();
-    await persistInstanceRuntime(config, upsertEnvVars);
-    const file = path.join(config.checkout_realpath, 'data', 'gws-ea', 'runtime.json');
-    const earlier = JSON.parse(await readFile(file, 'utf8')) as Record<string, unknown>;
-    delete earlier.docker_endpoint;
-    await writeFile(file, JSON.stringify({ ...earlier, install_id: config.install_id }), { mode: 0o600 });
-
-    await expect(loadInstanceRuntimeConfig(file)).rejects.toMatchObject({ code: 'invalid_runtime_config' });
-    await expect(readRecordedHomeDirectory(file)).resolves.toBe(config.home_directory);
-    await expect(readRecordedHomeDirectory(`${file}.missing`)).resolves.toBeUndefined();
   });
 
   it('refuses a runtime file whose persisted values disagree', async () => {

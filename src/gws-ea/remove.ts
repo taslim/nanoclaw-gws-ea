@@ -1,26 +1,33 @@
+/**
+ * Removal from any partial state (R11, R12). A resource is observed only when
+ * the provisioning step that owns it ever started (KTD4): no journal means
+ * nothing started, and a journal this launcher cannot read means every
+ * resource is observed. An absent resource is done; an owned one is deleted
+ * and observed again; a foreign one is refused by name; one that cannot be
+ * observed pauses with evidence until the operator abandons it. Everything a
+ * resource needs — Docker, Google sign-in, the Cloudflare token — is checked
+ * before the first change, and removal locks only its own instance, so one
+ * stuck removal never blocks another assistant.
+ */
 import { access, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { readJson, writePrivate } from '../community-portal/private-file.js';
+import { writePrivate } from '../community-portal/private-file.js';
 import { processLock } from '../community-portal/process-lock.js';
 import { isErrno } from '../community-portal/errors.js';
-import { deleteOwnedGcpProject } from './gcloud.js';
 import {
+  CloudflareAmbiguousMutationError,
   createCloudflareApi,
   type CloudflareApi,
   type CloudflareDnsRecord,
-  type CloudflareDnsRecordWrite,
+  type CloudflareTunnel,
 } from './cloudflare-api.js';
 import {
   createCloudflareConnectorLayout,
-  inspectCloudflareConnector,
-  assertCloudflareConnectorOwnership,
   stopCloudflareConnector,
   type CloudflareConnectorLayout,
-  type CloudflareConnectorPlatform,
-  type ObservedCloudflareConnector,
 } from './cloudflare-connector.js';
 import {
   assertManagedCloudflareConfigurationOwnership,
@@ -30,31 +37,49 @@ import {
   renderManagedCloudflareConfiguration,
   replaceManagedCloudflareConfiguration,
   type CloudflareOriginHost,
-  type ManagedCloudflareConfiguration,
 } from './cloudflare-ingress.js';
+import {
+  PauseRequired,
+  runStep,
+  SignInRequired,
+  type CloudflareTokenRequest,
+  type StepIdentity,
+  type StepReporter,
+} from './events.js';
+import {
+  assertGcloudInstalled,
+  assertGcloudSignedIn,
+  deleteOwnedGcpProject,
+  restoreKeyCreationPolicyForRemoval,
+  type GcloudCommandRunner,
+  type GcpProjectCoordinates,
+} from './gcloud.js';
+import { readProvisionJournal } from './journal.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { removeOnecliRuntime } from './onecli.js';
+import { CONTROL_PLANE_ROOT, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
+import { probeRecordedDockerEndpoint, resolveDockerEndpoint } from './prerequisites.js';
 import {
-  assertPrivateDirectory,
-  assertPrivateStateFile,
-  preparePrivateDirectory,
-  type ControlPlanePaths,
-} from './paths.js';
-import { resolveDockerEndpoint } from './prerequisites.js';
-import { buildToolEnvironment, runSanitizedCommand, runSanitizedCommandOutcome } from './process.js';
-import { recordedDockerEndpoint } from './provision.js';
+  buildToolEnvironment,
+  commandExitError,
+  resolveExecutable,
+  runSanitizedCommandOutcome,
+  type SanitizedCommand,
+  type SanitizedCommandOutcomeRunner,
+} from './process.js';
 import {
   activeRemovalInstanceIds,
+  assertCheckoutConsistent,
   assertInstanceId,
-  assertRegistryMarkerAgreement,
   getInstanceReservation,
   readRegistry,
   releaseInstanceReservation,
   validateReservation,
   withLockedCloudflareRegistry,
 } from './registry.js';
-import { removePrivateFile } from './secrets.js';
-import { readRecordedHomeDirectory } from './service.js';
+import { activeStep } from './run-log.js';
+import { readOwnerOnlyJson, removePrivateFile } from './secrets.js';
+import { serviceManagerEnvironment } from './service.js';
 import { createInstanceServiceCoordinates, type InstanceServicePlatform } from './service-coordinates.js';
 import {
   GwsEaError,
@@ -62,53 +87,115 @@ import {
   type InstanceRegistry,
   type InstanceReservation,
   type ManagedCloudflareIngressClaim,
+  type ProvisionStepId,
+  type SharedCloudflareMetadata,
 } from './types.js';
-import { isRecord } from './validation.js';
+import { isRecord, requireDockerEndpoint, requirePath } from './validation.js';
 
-const REMOVAL_SCHEMA_VERSION = 2 as const;
-const REMOVAL_PHASES = ['ingress', 'nanoclaw', 'gcp_project', 'onecli', 'instance_files', 'registry'] as const;
-type RemovalPhase = (typeof REMOVAL_PHASES)[number];
-const MANAGED_INGRESS_STEPS = ['configuration', 'dns', 'connector', 'connections', 'tunnel', 'private_state'] as const;
-type ManagedIngressStep = (typeof MANAGED_INGRESS_STEPS)[number];
+/** Resources in teardown order; the registry entry is released after all of them. */
+export const REMOVAL_RESOURCES = ['managed-ingress', 'nanoclaw', 'gcp-project', 'onecli', 'instance-files'] as const;
+export type RemovalResource = (typeof REMOVAL_RESOURCES)[number];
 
-interface RemovalStepReceipt {
-  readonly intended_at: string | null;
-  readonly completed_at: string | null;
+/** Resources an operator may leave behind when removal cannot observe them (`--abandon`). */
+export const ABANDONABLE_RESOURCES = ['gcp-project'] as const;
+export type AbandonableResource = (typeof ABANDONABLE_RESOURCES)[number];
+
+const RECEIPT_SCHEMA_VERSION = 3 as const;
+const INVALID_RECORD = 'invalid_runtime_config';
+const CONNECTION_ATTEMPTS = 30;
+const CONNECTION_DELAY_MS = 1_000;
+const DELETE_ATTEMPTS = 3;
+
+const RESOURCE_STEPS: Readonly<Record<RemovalResource, StepIdentity>> = {
+  'managed-ingress': { id: 'remove_managed_ingress', label: 'Removing the Cloudflare route…' },
+  nanoclaw: { id: 'remove_nanoclaw', label: 'Stopping NanoClaw…' },
+  'gcp-project': { id: 'remove_gcp_project', label: 'Deleting the Google Cloud project…' },
+  onecli: { id: 'remove_onecli', label: 'Removing OneCLI…' },
+  'instance-files': { id: 'remove_instance_files', label: 'Removing local files…' },
+};
+
+interface Evidence {
+  readonly at: string;
+  readonly evidence: string;
 }
 
-interface ManagedIngressRemovalReceipt {
-  readonly final: boolean | null;
-  readonly steps: Record<ManagedIngressStep, RemovalStepReceipt>;
-}
-
+/** The durable record of a removal under way: its reservation snapshot and what each resource came to. */
 interface RemovalReceipt {
-  readonly schema_version: typeof REMOVAL_SCHEMA_VERSION;
+  readonly schema_version: typeof RECEIPT_SCHEMA_VERSION;
   readonly instance_id: string;
   readonly reservation: InstanceReservation;
   readonly started_at: string;
-  readonly managed_ingress: ManagedIngressRemovalReceipt | null;
-  readonly completed: Record<RemovalPhase, string | null>;
+  readonly completed: Readonly<Partial<Record<RemovalResource, string>>>;
+  readonly abandoned: Readonly<Partial<Record<RemovalResource, Evidence>>>;
+  /** A key-creation policy `provision_gcp` lifted that Google refused to restore. */
+  readonly key_policy_unrestored?: Evidence;
 }
 
-export interface RemovalDependencies {
-  readonly uninstallNanoclaw?: (reservation: InstanceReservation) => Promise<void>;
-  readonly deleteGcpProject?: (reservation: InstanceReservation) => Promise<void>;
-  readonly removeOnecli?: (reservation: InstanceReservation) => Promise<void>;
-  readonly removeInstanceFiles?: (reservation: InstanceReservation) => Promise<void>;
-  readonly requestCloudflareAccountToken?: (accountId: string, observation: string) => Promise<string>;
-  readonly createCloudflareApi?: (accountToken: string) => CloudflareApi;
-  readonly connectorPlatform?: CloudflareConnectorPlatform;
+/** What local teardown uses, as the instance recorded it. */
+export interface LocalRuntime {
+  readonly homeDirectory: string;
+  readonly dockerEndpoint: string;
+  readonly onecliCliPath: string | undefined;
+}
+
+/** The human input removal may need, through the driver's `Interaction` port. */
+export interface RemovalInteraction {
+  signInToGoogleCloud(account: string): Promise<void>;
+  requestCloudflareAccountToken(request: CloudflareTokenRequest): Promise<string>;
+}
+
+/** What the driver supplies to one removal. */
+export interface RemovalOptions {
+  readonly interaction: RemovalInteraction;
+  /** Resources the operator accepts leaving behind if removal cannot observe them. */
+  readonly abandon?: ReadonlySet<AbandonableResource>;
+  readonly reporter?: StepReporter;
+}
+
+/** Boundary seams; each defaults to the real one. */
+export interface RemovalDependencies extends RemovalOptions {
+  readonly platform?: InstanceServicePlatform;
   readonly originHost?: CloudflareOriginHost;
-  readonly inspectCloudflareConnector?: (
-    layout: CloudflareConnectorLayout,
-  ) => Promise<ObservedCloudflareConnector | undefined>;
-  readonly validateCloudflareConnector?: (
-    layout: CloudflareConnectorLayout,
-    observed: ObservedCloudflareConnector,
-  ) => void;
-  readonly stopCloudflareConnector?: (layout: CloudflareConnectorLayout) => Promise<void>;
-  readonly removeCloudflarePrivateState?: (layout: CloudflareConnectorLayout) => Promise<void>;
-  readonly connectionDelay?: (milliseconds: number) => Promise<void>;
+  readonly runCommand?: SanitizedCommandOutcomeRunner;
+  readonly runGcloud?: GcloudCommandRunner;
+  /** Probe the recorded Docker endpoint, else resolve the active local one. */
+  readonly resolveDocker?: (recorded: string | undefined) => Promise<string>;
+  readonly createCloudflareApi?: (accountToken: string) => CloudflareApi;
+  readonly uninstallNanoclaw?: (reservation: InstanceReservation, runtime: LocalRuntime) => Promise<void>;
+  readonly removeOnecli?: (reservation: InstanceReservation, runtime: LocalRuntime) => Promise<void>;
+  readonly stopCloudflareConnector?: (layout: CloudflareConnectorLayout, dockerEndpoint: string) => Promise<void>;
+  readonly sleep?: (milliseconds: number) => Promise<void>;
+}
+
+export interface AbandonedResource {
+  readonly resource: AbandonableResource;
+  readonly evidence: string;
+}
+
+export interface RemovalOutcome {
+  /** Resources removal observed and removed, or found already gone. */
+  readonly removed: readonly RemovalResource[];
+  readonly abandoned: readonly AbandonedResource[];
+  /** Why a lifted key-creation policy could not be restored. */
+  readonly keyPolicyUnrestored?: string;
+}
+
+/**
+ * Removal cannot observe a resource. It pauses with the evidence; the operator
+ * fixes access and retries, or leaves the resource behind with `--abandon`.
+ */
+export class RemovalPause extends PauseRequired {
+  readonly resource: AbandonableResource;
+
+  constructor(resource: AbandonableResource, reason: string, evidence: string) {
+    super(`${resource.replaceAll('-', '_')}_unobservable`, reason, [
+      'Evidence:',
+      ...evidence.split('\n').map((line) => `  ${line}`),
+      `Leave it behind only if it is already gone or is not this assistant's; removal records this evidence.`,
+    ]);
+    this.name = 'RemovalPause';
+    this.resource = resource;
+  }
 }
 
 export interface ExistingRemovalPreview {
@@ -134,271 +221,194 @@ export interface RemovalPreview {
   readonly ingress: ExistingRemovalPreview | ManagedRemovalPreview;
 }
 
-function isoTimestamp(value: unknown, label: string): string {
-  if (typeof value !== 'string') throw new GwsEaError('invalid_removal', `${label} is invalid`);
+function timestamp(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
   const parsed = new Date(value);
-  if (Number.isNaN(parsed.valueOf()) || parsed.toISOString() !== value) {
-    throw new GwsEaError('invalid_removal', `${label} is invalid`);
-  }
-  return value;
+  return !Number.isNaN(parsed.valueOf()) && parsed.toISOString() === value ? value : undefined;
 }
 
-function nullableTimestamp(value: unknown, label: string): string | null {
-  return value === null ? null : isoTimestamp(value, label);
+function evidenceOf(value: unknown): Evidence | undefined {
+  if (!isRecord(value) || typeof value.evidence !== 'string') return undefined;
+  const at = timestamp(value.at);
+  return at ? { at, evidence: value.evidence } : undefined;
 }
 
-function validateManagedIngressReceipt(value: unknown): ManagedIngressRemovalReceipt | null {
-  if (value === null) return null;
-  if (!isRecord(value)) throw new GwsEaError('invalid_removal', 'Managed ingress removal state is invalid');
-  if (value.final !== null && typeof value.final !== 'boolean') {
-    throw new GwsEaError('invalid_removal', 'Managed ingress removal scope is invalid');
+function entries<K extends string, V>(keys: readonly K[], value: unknown, parse: (entry: unknown) => V | undefined) {
+  const parsed: Partial<Record<K, V>> = {};
+  if (!isRecord(value)) return parsed;
+  for (const key of keys) {
+    const entry = parse(value[key]);
+    if (entry !== undefined) parsed[key] = entry;
   }
-  if (!isRecord(value.steps)) throw new GwsEaError('invalid_removal', 'Managed ingress removal steps are invalid');
-  const steps = {} as Record<ManagedIngressStep, RemovalStepReceipt>;
-  for (const step of MANAGED_INGRESS_STEPS) {
-    const raw = value.steps[step];
-    if (!isRecord(raw)) throw new GwsEaError('invalid_removal', `Managed ingress ${step} step is invalid`);
-    const intendedAt = nullableTimestamp(raw.intended_at, `${step} intent`);
-    const completedAt = nullableTimestamp(raw.completed_at, `${step} completion`);
-    if (completedAt !== null && intendedAt === null) {
-      throw new GwsEaError('invalid_removal', `Managed ingress ${step} completed without intent`);
-    }
-    steps[step] = { intended_at: intendedAt, completed_at: completedAt };
-  }
-  return { final: value.final, steps };
+  return parsed;
 }
 
-function assertManagedIngressReceiptOrder(
-  managed: ManagedIngressRemovalReceipt,
-  ingressCompletedAt: string | null,
-): void {
-  let priorCompleted = true;
-  for (const step of MANAGED_INGRESS_STEPS) {
-    const state = managed.steps[step];
-    if (!priorCompleted && state.intended_at !== null) {
-      throw new GwsEaError('invalid_removal', `Managed ingress ${step} started before its predecessor completed`);
-    }
-    priorCompleted = state.completed_at !== null;
-  }
-  if (managed.final === null && MANAGED_INGRESS_STEPS.some((step) => managed.steps[step].intended_at !== null)) {
-    throw new GwsEaError('invalid_removal', 'Managed ingress teardown began before its scope was recorded');
-  }
-  if (
-    managed.final === false &&
-    MANAGED_INGRESS_STEPS.slice(2).some((step) => managed.steps[step].intended_at !== null)
-  ) {
-    throw new GwsEaError('invalid_removal', 'Peer-preserving removal contains final-ingress teardown steps');
-  }
-  if (
-    ingressCompletedAt !== null &&
-    (!managed.steps.configuration.completed_at ||
-      !managed.steps.dns.completed_at ||
-      (managed.final === true && MANAGED_INGRESS_STEPS.some((step) => !managed.steps[step].completed_at)))
-  ) {
-    throw new GwsEaError('invalid_removal', 'Ingress removal completed before its managed teardown steps');
-  }
-}
-
-function validateReceipt(value: unknown, paths: ControlPlanePaths, instanceId: string): RemovalReceipt {
-  if (!isRecord(value)) throw new GwsEaError('invalid_removal', 'Removal receipt is invalid');
-  if (value.schema_version !== REMOVAL_SCHEMA_VERSION || value.instance_id !== instanceId) {
-    throw new GwsEaError('invalid_removal', 'Removal receipt does not match this instance');
-  }
-  if (!isRecord(value.completed)) throw new GwsEaError('invalid_removal', 'Removal phases are invalid');
-  const completed = {} as Record<RemovalPhase, string | null>;
-  for (const phase of REMOVAL_PHASES) {
-    const stamp = value.completed[phase];
-    completed[phase] = stamp === null ? null : isoTimestamp(stamp, `${phase} completion`);
-  }
-  const reservation = validateReservation(value.reservation, paths);
-  if (reservation.instance_id !== instanceId) {
-    throw new GwsEaError('invalid_removal', 'Removal reservation does not match this instance');
-  }
-  const managedIngress = validateManagedIngressReceipt(value.managed_ingress);
-  if ((reservation.exclusive_resource_claims.ingress.mode === 'managed-cloudflare') !== (managedIngress !== null)) {
-    throw new GwsEaError('invalid_removal', 'Removal ingress state does not match the reservation');
-  }
-  if (managedIngress) assertManagedIngressReceiptOrder(managedIngress, completed.ingress);
-  return {
-    schema_version: REMOVAL_SCHEMA_VERSION,
-    instance_id: instanceId,
-    reservation,
-    started_at: isoTimestamp(value.started_at, 'Removal start'),
-    managed_ingress: managedIngress,
-    completed,
-  };
-}
-
+/**
+ * The receipt of a removal already under way. Unknown fields are ignored; a
+ * receipt an earlier launcher wrote keeps only its reservation snapshot, so
+ * every resource is observed again. A receipt that cannot be read safely is
+ * set aside: everything it could say is re-observed.
+ */
 async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promise<RemovalReceipt | undefined> {
-  const file = paths.removalFile(instanceId);
   try {
-    await assertPrivateStateFile(file);
-    return validateReceipt(await readJson<unknown>(file), paths, instanceId);
+    const raw = await readOwnerOnlyJson(paths.removalFile(instanceId), 'Removal receipt', 'invalid_removal');
+    if (!isRecord(raw) || raw.instance_id !== instanceId) {
+      throw new GwsEaError('invalid_removal', 'Removal receipt does not match this instance');
+    }
+    const reservation = validateReservation(raw.reservation, paths);
+    if (reservation.instance_id !== instanceId) {
+      throw new GwsEaError('invalid_removal', 'Removal receipt reservation does not match this instance');
+    }
+    const current = raw.schema_version === RECEIPT_SCHEMA_VERSION;
+    const unrestored = current ? evidenceOf(raw.key_policy_unrestored) : undefined;
+    return {
+      schema_version: RECEIPT_SCHEMA_VERSION,
+      instance_id: instanceId,
+      reservation,
+      started_at: timestamp(raw.started_at) ?? new Date().toISOString(),
+      completed: current ? entries(REMOVAL_RESOURCES, raw.completed, timestamp) : {},
+      abandoned: current ? entries<RemovalResource, Evidence>(ABANDONABLE_RESOURCES, raw.abandoned, evidenceOf) : {},
+      ...(unrestored ? { key_policy_unrestored: unrestored } : {}),
+    };
   } catch (error) {
     if (isErrno(error, 'ENOENT')) return undefined;
-    if (error instanceof GwsEaError) throw error;
-    throw new GwsEaError('invalid_removal', 'Removal receipt cannot be read safely');
+    if (!(error instanceof GwsEaError)) throw error;
+    activeStep()?.write(`${error.message}; its resources are observed again\n`);
+    return undefined;
   }
 }
 
-function emptyManagedIngressReceipt(): ManagedIngressRemovalReceipt {
-  const steps = {} as Record<ManagedIngressStep, RemovalStepReceipt>;
-  for (const step of MANAGED_INGRESS_STEPS) steps[step] = { intended_at: null, completed_at: null };
-  return { final: null, steps };
+/** Which provisioning steps ever started, and whether `provision_gcp` left the key policy lifted. */
+interface ProvisioningRecord {
+  readonly started: (step: ProvisionStepId) => boolean;
+  readonly keyPolicyLifted: boolean;
 }
 
-async function ensureReceipt(
+async function readProvisioningRecord(paths: ControlPlanePaths, instanceId: string): Promise<ProvisioningRecord> {
+  try {
+    const journal = await readProvisionJournal(paths, instanceId);
+    return { started: (step) => journal.steps[step] !== undefined, keyPolicyLifted: journal.key_policy_lifted };
+  } catch (error) {
+    if (!(error instanceof GwsEaError)) throw error;
+    if (error.code === 'journal_missing') return { started: () => false, keyPolicyLifted: false };
+    activeStep()?.write(`${error.message}; every resource is observed\n`);
+    return { started: () => true, keyPolicyLifted: false };
+  }
+}
+
+async function readRecord(file: string): Promise<Record<string, unknown> | undefined> {
+  try {
+    const value = await readOwnerOnlyJson(file, 'Instance record', INVALID_RECORD);
+    return isRecord(value) ? value : undefined;
+  } catch (error) {
+    if (isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR')) return undefined;
+    if (!(error instanceof GwsEaError)) throw error;
+    activeStep()?.write(`${error.message}; not used for removal\n`);
+    return undefined;
+  }
+}
+
+/**
+ * The home directory, Docker endpoint, and OneCLI CLI the instance recorded:
+ * `runtime.json` once the host started, else the bootstrap manifest create
+ * wrote. Only these fields are read, so files an earlier launcher wrote still
+ * remove cleanly (R14).
+ */
+async function readRecordedRuntime(
   paths: ControlPlanePaths,
-  instanceId: string,
   reservation: InstanceReservation,
-): Promise<RemovalReceipt> {
-  const existing = await readReceipt(paths, instanceId);
-  if (existing) return existing;
-  const receipt: RemovalReceipt = {
-    schema_version: REMOVAL_SCHEMA_VERSION,
-    instance_id: instanceId,
-    reservation,
-    started_at: new Date().toISOString(),
-    managed_ingress:
-      reservation.exclusive_resource_claims.ingress.mode === 'managed-cloudflare' ? emptyManagedIngressReceipt() : null,
-    completed: {
-      ingress: null,
-      nanoclaw: null,
-      gcp_project: null,
-      onecli: null,
-      instance_files: null,
-      registry: null,
-    },
-  };
-  await withLockedCloudflareRegistry(paths, async (locked) => {
-    const stored = locked.registry.instances[instanceId];
-    if (!stored || JSON.stringify(stored) !== JSON.stringify(reservation)) {
-      throw new GwsEaError('reservation_mismatch', 'Instance reservation changed before removal began');
+): Promise<{ readonly homeDirectory?: string; readonly dockerEndpoint?: string; readonly onecliCliPath?: string }> {
+  const records = await Promise.all([
+    readRecord(path.join(reservation.checkout_realpath, 'data', 'gws-ea', 'runtime.json')),
+    readRecord(paths.bootstrapFile(reservation.instance_id)),
+  ]);
+  const field = (key: string, parse: (value: unknown, label: string, code: string) => string): string | undefined => {
+    for (const record of records) {
+      if (record?.[key] === undefined) continue;
+      try {
+        return parse(record[key], key, INVALID_RECORD);
+      } catch (error) {
+        if (!(error instanceof GwsEaError)) throw error;
+      }
     }
-    const activeRemovals = await activeRemovalInstanceIds(paths, locked.registry);
-    if (activeRemovals.some((activeInstanceId) => activeInstanceId !== instanceId)) {
-      throw new GwsEaError('removal_in_progress', 'Another assistant removal is already in progress');
-    }
-    await preparePrivateDirectory(paths.removalRoot);
-    await writePrivate(paths.removalFile(instanceId), receipt);
-  });
-  return receipt;
-}
-
-async function completePhase(
-  paths: ControlPlanePaths,
-  receipt: RemovalReceipt,
-  phase: RemovalPhase,
-  effect: () => Promise<void>,
-): Promise<RemovalReceipt> {
-  if (receipt.completed[phase] !== null) return receipt;
-  await effect();
-  const next: RemovalReceipt = {
-    ...receipt,
-    completed: { ...receipt.completed, [phase]: new Date().toISOString() },
+    return undefined;
   };
-  await writePrivate(paths.removalFile(receipt.instance_id), next);
-  return next;
+  const homeDirectory = field('home_directory', requirePath);
+  const dockerEndpoint = field('docker_endpoint', requireDockerEndpoint);
+  const onecliCliPath = field('onecli_cli_path', requirePath);
+  return {
+    ...(homeDirectory ? { homeDirectory } : {}),
+    ...(dockerEndpoint ? { dockerEndpoint } : {}),
+    ...(onecliCliPath ? { onecliCliPath } : {}),
+  };
 }
 
-async function writeReceipt(paths: ControlPlanePaths, receipt: RemovalReceipt): Promise<RemovalReceipt> {
-  await writePrivate(paths.removalFile(receipt.instance_id), receipt);
-  return receipt;
+function managedClaim(reservation: InstanceReservation): ManagedCloudflareIngressClaim | undefined {
+  const ingress = reservation.exclusive_resource_claims.ingress;
+  return ingress.mode === 'managed-cloudflare' ? ingress : undefined;
 }
 
-async function setManagedRemovalScope(
-  paths: ControlPlanePaths,
-  receipt: RemovalReceipt,
-  final: boolean,
-): Promise<RemovalReceipt> {
-  const managed = receipt.managed_ingress;
-  if (!managed) throw new GwsEaError('invalid_removal', 'Managed ingress removal state is missing');
-  if (managed.final !== null && managed.final !== final) {
-    throw new GwsEaError('reservation_mismatch', 'Managed ingress removal scope changed during teardown');
-  }
-  if (managed.final === final) return receipt;
-  return writeReceipt(paths, { ...receipt, managed_ingress: { ...managed, final } });
+function managedPeers(registry: InstanceRegistry, instanceId: string): number {
+  return Object.values(registry.instances).filter(
+    (instance) => instance.instance_id !== instanceId && managedClaim(instance) !== undefined,
+  ).length;
 }
 
-async function intendManagedIngressStep(
-  paths: ControlPlanePaths,
-  receipt: RemovalReceipt,
-  step: ManagedIngressStep,
-): Promise<RemovalReceipt> {
-  const managed = receipt.managed_ingress;
-  if (!managed) throw new GwsEaError('invalid_removal', 'Managed ingress removal state is missing');
-  const current = managed.steps[step];
-  if (current.intended_at !== null) return receipt;
-  return writeReceipt(paths, {
-    ...receipt,
-    managed_ingress: {
-      ...managed,
-      steps: {
-        ...managed.steps,
-        [step]: { intended_at: new Date().toISOString(), completed_at: null },
-      },
-    },
-  });
+/** Evaluate once, on first use. */
+function once<T>(evaluate: () => Promise<T>): () => Promise<T> {
+  let value: Promise<T> | undefined;
+  return () => (value ??= evaluate());
 }
 
-async function completeManagedIngressStep(
-  paths: ControlPlanePaths,
-  receipt: RemovalReceipt,
-  step: ManagedIngressStep,
-): Promise<RemovalReceipt> {
-  const managed = receipt.managed_ingress;
-  if (!managed) throw new GwsEaError('invalid_removal', 'Managed ingress removal state is missing');
-  const current = managed.steps[step];
-  if (current.completed_at !== null) return receipt;
-  if (current.intended_at === null) {
-    throw new GwsEaError('invalid_removal', `Managed ingress ${step} completed without intent`);
-  }
-  return writeReceipt(paths, {
-    ...receipt,
-    managed_ingress: {
-      ...managed,
-      steps: {
-        ...managed.steps,
-        [step]: { ...current, completed_at: new Date().toISOString() },
-      },
-    },
-  });
-}
-
-function stable(value: unknown): string {
-  return JSON.stringify(value);
-}
-
-function registryWithoutInstance(registry: InstanceRegistry, instanceId: string): InstanceRegistry {
-  const instances = { ...registry.instances };
-  delete instances[instanceId];
-  return { ...registry, instances };
-}
-
-function exactOwnedDnsRecord(
-  records: readonly CloudflareDnsRecord[],
-  desired: CloudflareDnsRecordWrite,
-  recordId: string,
-): CloudflareDnsRecord {
-  const record = chooseOwnedDnsRecord(records, desired, recordId);
-  if (!record) {
-    throw new GwsEaError('foreign_cloudflare_dns', `Cloudflare DNS name ${desired.name} changed ownership`);
-  }
-  return record;
-}
-
-function assertOwnedTunnel(
-  tunnels: Awaited<ReturnType<CloudflareApi['listTunnels']>>,
-  tunnelId: string,
-  tunnelName: string,
-): void {
-  if (tunnels.length !== 1 || tunnels[0]?.id !== tunnelId || tunnels[0].name !== tunnelName) {
-    throw new GwsEaError('foreign_cloudflare_tunnel', 'Cloudflare tunnel changed ownership during removal');
+/**
+ * Delete, then observe again: gone is done even when the delete failed (it
+ * was already deleted). Still there retries a delete Cloudflare did not
+ * confirm; otherwise removal stops with the delete's error.
+ */
+async function deleteAndConfirm(send: () => Promise<void>, gone: () => Promise<boolean>, what: string): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    let failure: unknown;
+    try {
+      await send();
+      // The observation below decides whether a failed delete matters.
+      // eslint-disable-next-line no-catch-all/no-catch-all
+    } catch (error) {
+      failure = error;
+    }
+    if (await gone()) return;
+    if (failure instanceof CloudflareAmbiguousMutationError && attempt < DELETE_ATTEMPTS) continue;
+    throw (
+      failure ?? new GwsEaError('cloudflare_removal_incomplete', `Cloudflare still shows ${what} after its deletion`)
+    );
   }
 }
 
-const CONNECTION_ATTEMPTS = 30;
-const CONNECTION_DELAY_MS = 1_000;
+/** This machine's tunnel, by the name only it uses; one with another ID than recorded is refused. */
+async function observeTunnel(
+  api: CloudflareApi,
+  metadata: SharedCloudflareMetadata,
+): Promise<CloudflareTunnel | undefined> {
+  const tunnels = await api.listTunnels(metadata.account_id, metadata.tunnel_name);
+  const [tunnel] = tunnels;
+  if (!tunnel) return undefined;
+  if (
+    tunnels.length > 1 ||
+    tunnel.name !== metadata.tunnel_name ||
+    (metadata.tunnel_id !== null && tunnel.id !== metadata.tunnel_id)
+  ) {
+    throw new GwsEaError(
+      'foreign_cloudflare_tunnel',
+      `Cloudflare tunnel ${metadata.tunnel_name} is not the one this machine recorded; refusing to change it`,
+    );
+  }
+  return tunnel;
+}
+
+function requireCloudflareMetadata(registry: InstanceRegistry): SharedCloudflareMetadata {
+  const metadata = registry.shared_infrastructure_metadata.cloudflare;
+  if (!metadata) throw new GwsEaError('cloudflare_state_missing', 'Shared Cloudflare ownership is not recorded');
+  return metadata;
+}
 
 async function waitForTunnelConnectionsToClear(
   api: CloudflareApi,
@@ -406,28 +416,24 @@ async function waitForTunnelConnectionsToClear(
   tunnelId: string,
   sleep: (milliseconds: number) => Promise<void>,
 ): Promise<void> {
-  for (let attempt = 0; attempt < CONNECTION_ATTEMPTS; attempt += 1) {
+  for (let attempt = 1; attempt <= CONNECTION_ATTEMPTS; attempt += 1) {
     if ((await api.listTunnelConnections(accountId, tunnelId)).length === 0) return;
-    if (attempt + 1 < CONNECTION_ATTEMPTS) await sleep(CONNECTION_DELAY_MS);
+    if (attempt < CONNECTION_ATTEMPTS) await sleep(CONNECTION_DELAY_MS);
   }
   throw new GwsEaError('cloudflare_connections_active', 'Cloudflare tunnel still has active connector sessions');
 }
 
-async function verifyManagedRemovalAuthority(
+/** The account token, proven against the exact reserved zone before anything changes. */
+async function cloudflareAuthority(
   claim: ManagedCloudflareIngressClaim,
-  dependencies: RemovalDependencies,
+  interaction: RemovalInteraction,
+  createApi: (accountToken: string) => CloudflareApi,
 ): Promise<CloudflareApi> {
-  if (!dependencies.requestCloudflareAccountToken) {
-    throw new GwsEaError(
-      'cloudflare_token_required',
-      'A fresh Cloudflare API token is required to remove managed ingress.',
-    );
-  }
-  const token = await dependencies.requestCloudflareAccountToken(
-    claim.account_id,
-    `Removing managed callback ${claim.callback_url} requires temporary Cloudflare authorization.`,
-  );
-  const api = (dependencies.createCloudflareApi ?? ((accountToken) => createCloudflareApi({ accountToken })))(token);
+  const token = await interaction.requestCloudflareAccountToken({
+    accountId: claim.account_id,
+    reason: `Removing managed callback ${claim.callback_url} requires temporary Cloudflare authorization.`,
+  });
+  const api = createApi(token);
   // Listing zones proves the token, account-owned tokens included (KTD6 item 4).
   const zones = await api.listActiveZones();
   if (
@@ -447,368 +453,202 @@ async function verifyManagedRemovalAuthority(
   return api;
 }
 
-async function inspectCloudflareConnectorForRemoval(
-  layout: CloudflareConnectorLayout,
-): Promise<ObservedCloudflareConnector | undefined> {
-  return inspectCloudflareConnector(layout, (command) =>
-    runSanitizedCommand({ ...command, cwd: path.dirname(path.dirname(layout.rootDirectory)) }),
-  );
+interface ManagedIngressRemoval {
+  readonly paths: ControlPlanePaths;
+  readonly reservation: InstanceReservation;
+  readonly claim: ManagedCloudflareIngressClaim;
+  readonly api: CloudflareApi;
+  /** The assistant's own `establish_transport` started, so its DNS record may exist. */
+  readonly ownTransport: boolean;
+  readonly originHost: CloudflareOriginHost;
+  readonly connector: CloudflareConnectorLayout;
+  readonly stopConnector: () => Promise<void>;
+  readonly sleep: (milliseconds: number) => Promise<void>;
 }
 
-function stepCompleted(receipt: RemovalReceipt, step: ManagedIngressStep): boolean {
-  return receipt.managed_ingress?.steps[step].completed_at !== null;
-}
+/**
+ * The assistant's route leaves the shared route set under the machine lock;
+ * peers write it there too, so it is observed whenever the machine has a
+ * tunnel. Its own DNS record follows. The last managed assistant then retires
+ * the connector and tunnel, still under the machine lock, and forgets the
+ * tunnel so the next managed assistant creates its own.
+ */
+async function removeManagedIngress(removal: ManagedIngressRemoval): Promise<void> {
+  const { paths, reservation, claim, api } = removal;
+  const tunnelId = await withLockedCloudflareRegistry(paths, async ({ registry }) => {
+    const metadata = requireCloudflareMetadata(registry);
+    const found = await observeTunnel(api, metadata);
+    if (!found) return metadata.tunnel_id;
+    const observed = await api.getTunnelConfiguration(claim.account_id, found.id);
+    const universe = renderManagedCloudflareConfiguration(registry, removal.originHost);
+    const current = assertManagedCloudflareConfigurationOwnership(observed.config, universe);
+    if (current.ingress.some((rule) => 'hostname' in rule && rule.hostname === claim.hostname)) {
+      const leaving = new Set([...(await activeRemovalInstanceIds(paths, registry)), reservation.instance_id]);
+      const desired = renderManagedCloudflareConfiguration(registry, removal.originHost, leaving);
+      await replaceManagedCloudflareConfiguration(api, claim.account_id, found.id, desired, current);
+    }
+    return found.id;
+  });
 
-function stepIntended(receipt: RemovalReceipt, step: ManagedIngressStep): boolean {
-  return receipt.managed_ingress?.steps[step].intended_at !== null;
-}
-
-async function removeManagedCloudflareIngress(
-  paths: ControlPlanePaths,
-  receiptInput: RemovalReceipt,
-  api: CloudflareApi,
-  dependencies: RemovalDependencies,
-): Promise<RemovalReceipt> {
-  return withLockedCloudflareRegistry(paths, async (locked) => {
-    let receipt = receiptInput;
-    const reservation = receipt.reservation;
-    const claim = reservation.exclusive_resource_claims.ingress;
-    if (claim.mode !== 'managed-cloudflare' || !receipt.managed_ingress) {
-      throw new GwsEaError('invalid_removal', 'Managed ingress removal requires a managed reservation');
-    }
-    const stored = locked.registry.instances[reservation.instance_id];
-    if (!stored || stable(stored) !== stable(reservation)) {
-      throw new GwsEaError('reservation_mismatch', 'Managed ingress reservation changed during removal');
-    }
-    const activeRemovals = await activeRemovalInstanceIds(paths, locked.registry);
-    if (activeRemovals.some((instanceId) => instanceId !== reservation.instance_id)) {
-      throw new GwsEaError('removal_in_progress', 'Another assistant removal is already in progress');
-    }
-    const metadata = locked.registry.shared_infrastructure_metadata.cloudflare;
-    if (!metadata || metadata.account_id !== claim.account_id) {
-      throw new GwsEaError('cloudflare_state_missing', 'Shared Cloudflare ownership is incomplete');
-    }
-    const tunnelId = metadata.tunnel_id;
-    const managedReservations = Object.values(locked.registry.instances).filter(
-      (instance) => instance.exclusive_resource_claims.ingress.mode === 'managed-cloudflare',
-    );
-    const final = managedReservations.length === 1;
-    receipt = await setManagedRemovalScope(paths, receipt, final);
-
-    const originHost =
-      dependencies.originHost ?? (process.platform === 'darwin' ? 'host.docker.internal' : '127.0.0.1');
-    const ownershipUniverse = renderManagedCloudflareConfiguration(locked.registry, originHost);
-    const desired = renderManagedCloudflareConfiguration(
-      registryWithoutInstance(locked.registry, reservation.instance_id),
-      originHost,
-    );
-    const tunnels = await api.listTunnels(claim.account_id, metadata.tunnel_name);
-    const tunnelMissing = tunnels.length === 0;
-    if (tunnelId === null) {
-      if (!tunnelMissing) {
+  if (removal.ownTransport) {
+    const observe = async (): Promise<CloudflareDnsRecord | undefined> => {
+      const records = await api.listDnsRecords(claim.zone_id, claim.hostname);
+      if (records.length === 0) return undefined;
+      if (tunnelId === null) {
         throw new GwsEaError(
-          'foreign_cloudflare_tunnel',
-          'A Cloudflare tunnel exists by name without a durably recorded owned ID',
+          'foreign_cloudflare_dns',
+          `Cloudflare DNS name ${claim.hostname} has records, but this machine has no tunnel they could point to`,
         );
       }
-      if (claim.dns_record_id !== null) {
-        throw new GwsEaError('invalid_removal', 'Managed DNS ownership exists without a recorded tunnel');
-      }
-    } else if (tunnelMissing) {
-      if (!final || !stepIntended(receipt, 'tunnel')) {
-        throw new GwsEaError('cloudflare_tunnel_missing', 'The owned Cloudflare tunnel is missing before teardown');
-      }
-    } else {
-      assertOwnedTunnel(tunnels, tunnelId, metadata.tunnel_name);
-    }
-
-    let currentConfiguration: ManagedCloudflareConfiguration | undefined;
-    if (tunnelId !== null && !tunnelMissing) {
-      const observed = await api.getTunnelConfiguration(claim.account_id, tunnelId);
-      currentConfiguration = assertManagedCloudflareConfigurationOwnership(observed.config, ownershipUniverse);
-      // A peer's reconciliation leaves an assistant under removal out of the
-      // route set (R12), so a route already gone before intent counts as done.
-      if (stepCompleted(receipt, 'configuration') && stable(currentConfiguration) !== stable(desired)) {
-        throw new GwsEaError(
-          'cloudflare_configuration_drift',
-          'Cloudflare tunnel configuration changed after route teardown',
-        );
-      }
-    } else if (tunnelId !== null && !stepCompleted(receipt, 'configuration')) {
-      throw new GwsEaError('invalid_removal', 'Cloudflare tunnel disappeared before route teardown completed');
-    }
-
-    const desiredDns = tunnelId === null ? undefined : desiredDnsRecord(reservation, tunnelId);
-    let dnsRecords = await api.listDnsRecords(claim.zone_id, claim.hostname);
-    if (claim.dns_record_id === null) {
-      if (dnsRecords.length !== 0) {
-        throw new GwsEaError('foreign_cloudflare_dns', `Cloudflare DNS name ${claim.hostname} is not owned`);
-      }
-    } else if (dnsRecords.length === 0) {
-      if (!stepIntended(receipt, 'dns')) {
-        throw new GwsEaError('cloudflare_dns_missing', 'The owned Cloudflare DNS record is missing before teardown');
-      }
-    } else {
-      if (!desiredDns) throw new GwsEaError('invalid_removal', 'Managed DNS ownership has no recorded tunnel');
-      exactOwnedDnsRecord(dnsRecords, desiredDns, claim.dns_record_id);
-      if (stepCompleted(receipt, 'dns')) {
-        throw new GwsEaError('cloudflare_dns_drift', 'The owned Cloudflare DNS record reappeared after deletion');
-      }
-    }
-
-    const platform = dependencies.connectorPlatform ?? (process.platform === 'darwin' ? 'macos' : 'linux');
-    const layout = createCloudflareConnectorLayout({ cloudflareRoot: paths.cloudflareRoot, platform });
-    let privateRootPresent = true;
-    try {
-      await assertPrivateDirectory(paths.cloudflareRoot);
-    } catch (error) {
-      if (!isErrno(error, 'ENOENT')) throw error;
-      privateRootPresent = false;
-    }
-    let observedConnector: ObservedCloudflareConnector | undefined;
-    if (final && !stepCompleted(receipt, 'connector')) {
-      observedConnector = await (dependencies.inspectCloudflareConnector ?? inspectCloudflareConnectorForRemoval)(
-        layout,
+      return chooseOwnedDnsRecord(records, desiredDnsRecord(reservation, tunnelId), claim.dns_record_id);
+    };
+    const record = await observe();
+    if (record) {
+      await deleteAndConfirm(
+        () => api.deleteDnsRecord(claim.zone_id, record.id),
+        async () => (await observe()) === undefined,
+        `the DNS record for ${claim.hostname}`,
       );
-      if (observedConnector) {
-        (dependencies.validateCloudflareConnector ?? assertCloudflareConnectorOwnership)(layout, observedConnector);
-        if (!privateRootPresent) {
-          throw new GwsEaError(
-            'unsafe_connector_owner',
-            'Cloudflare connector exists without its owned private runtime state',
-          );
-        }
-      }
     }
+  }
 
-    if (!stepCompleted(receipt, 'configuration')) {
-      receipt = await intendManagedIngressStep(paths, receipt, 'configuration');
-      if (tunnelId !== null && (!currentConfiguration || tunnelMissing)) {
-        throw new GwsEaError('cloudflare_tunnel_missing', 'The owned Cloudflare tunnel is missing during teardown');
-      }
-      if (tunnelId !== null && currentConfiguration && stable(currentConfiguration) !== stable(desired)) {
-        await replaceManagedCloudflareConfiguration(api, claim.account_id, tunnelId, desired, currentConfiguration);
-      }
-      receipt = await completeManagedIngressStep(paths, receipt, 'configuration');
+  await withLockedCloudflareRegistry(paths, async (locked) => {
+    if (managedPeers(locked.registry, reservation.instance_id) > 0) return;
+    const metadata = requireCloudflareMetadata(locked.registry);
+    const retiring = await observeTunnel(api, metadata);
+    await removal.stopConnector();
+    if (retiring) {
+      await waitForTunnelConnectionsToClear(api, metadata.account_id, retiring.id, removal.sleep);
+      await deleteAndConfirm(
+        () => api.deleteTunnel(metadata.account_id, retiring.id),
+        async () => (await observeTunnel(api, metadata)) === undefined,
+        `tunnel ${metadata.tunnel_name}`,
+      );
     }
-
-    if (!stepCompleted(receipt, 'dns')) {
-      const wasIntended = stepIntended(receipt, 'dns');
-      receipt = await intendManagedIngressStep(paths, receipt, 'dns');
-      if (claim.dns_record_id !== null && dnsRecords.length > 0) {
-        if (!desiredDns) throw new GwsEaError('invalid_removal', 'Managed DNS ownership has no recorded tunnel');
-        let deletionError: unknown;
-        try {
-          await api.deleteDnsRecord(claim.zone_id, claim.dns_record_id);
-          // The post-delete observation below resolves ambiguous failures safely.
-          // eslint-disable-next-line no-catch-all/no-catch-all
-        } catch (error) {
-          deletionError = error;
-        }
-        dnsRecords = await api.listDnsRecords(claim.zone_id, claim.hostname);
-        if (dnsRecords.length > 0) {
-          exactOwnedDnsRecord(dnsRecords, desiredDns, claim.dns_record_id);
-          if (deletionError) throw deletionError;
-          throw new GwsEaError('cloudflare_dns_removal_incomplete', 'The owned Cloudflare DNS record remains');
-        }
-      } else if (claim.dns_record_id !== null && !wasIntended) {
-        throw new GwsEaError('cloudflare_dns_missing', 'The owned Cloudflare DNS record disappeared before deletion');
-      }
-      receipt = await completeManagedIngressStep(paths, receipt, 'dns');
-    }
-
-    if (!final) return receipt;
-
-    if (!stepCompleted(receipt, 'connector')) {
-      receipt = await intendManagedIngressStep(paths, receipt, 'connector');
-      if (observedConnector) await (dependencies.stopCloudflareConnector ?? stopCloudflareConnector)(layout);
-      receipt = await completeManagedIngressStep(paths, receipt, 'connector');
-    }
-    if (!stepCompleted(receipt, 'connections')) {
-      receipt = await intendManagedIngressStep(paths, receipt, 'connections');
-      if (tunnelId !== null) {
-        await waitForTunnelConnectionsToClear(api, claim.account_id, tunnelId, dependencies.connectionDelay ?? delay);
-      }
-      receipt = await completeManagedIngressStep(paths, receipt, 'connections');
-    }
-    if (!stepCompleted(receipt, 'tunnel')) {
-      const wasIntended = stepIntended(receipt, 'tunnel');
-      receipt = await intendManagedIngressStep(paths, receipt, 'tunnel');
-      if (tunnelId !== null && !tunnelMissing) {
-        let deletionError: unknown;
-        try {
-          await api.deleteTunnel(claim.account_id, tunnelId);
-          // The post-delete observation below resolves ambiguous failures safely.
-          // eslint-disable-next-line no-catch-all/no-catch-all
-        } catch (error) {
-          deletionError = error;
-        }
-        const after = await api.listTunnels(claim.account_id, metadata.tunnel_name);
-        if (after.length > 0) {
-          assertOwnedTunnel(after, tunnelId, metadata.tunnel_name);
-          if (deletionError) throw deletionError;
-          throw new GwsEaError('cloudflare_tunnel_removal_incomplete', 'The owned Cloudflare tunnel remains');
-        }
-      } else if (tunnelId !== null && !wasIntended) {
-        throw new GwsEaError('cloudflare_tunnel_missing', 'The owned Cloudflare tunnel disappeared before deletion');
-      }
-      receipt = await completeManagedIngressStep(paths, receipt, 'tunnel');
-    }
-    if (!stepCompleted(receipt, 'private_state')) {
-      receipt = await intendManagedIngressStep(paths, receipt, 'private_state');
-      if (privateRootPresent) {
-        await (
-          dependencies.removeCloudflarePrivateState ?? (async () => rm(paths.cloudflareRoot, { recursive: true }))
-        )(layout);
-      }
-      receipt = await completeManagedIngressStep(paths, receipt, 'private_state');
-    }
-    return receipt;
+    await rm(removal.connector.rootDirectory, { recursive: true, force: true });
+    await locked.forgetTunnel();
   });
 }
 
-async function uninstallNanoclaw(reservation: InstanceReservation): Promise<void> {
+/** Stop the instance service through its manager, then its host process, containers, and image. */
+async function uninstallNanoclaw(
+  reservation: InstanceReservation,
+  runtime: LocalRuntime,
+  platform: InstanceServicePlatform,
+  run: SanitizedCommandOutcomeRunner,
+): Promise<void> {
   const installId = reservation.instance_id.replaceAll('-', '');
-  const homeDirectory =
-    (await readRecordedHomeDirectory(path.join(reservation.checkout_realpath, 'data', 'gws-ea', 'runtime.json'))) ??
-    os.homedir();
-  const coordinates = (platform: InstanceServicePlatform, runningAsRoot: boolean) =>
-    createInstanceServiceCoordinates({ installId, homeDirectory, platform, runningAsRoot });
-  const environment = buildToolEnvironment(
-    {},
-    { HOME: homeDirectory, PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin' },
-  );
-  const outcome = (command: string, args: readonly string[]) =>
-    runSanitizedCommandOutcome({
-      command,
-      args,
-      cwd: reservation.checkout_realpath,
-      env: environment,
-      timeoutMs: 120_000,
-    });
-  const run = async (command: string, args: readonly string[], acceptFailure = false): Promise<string> => {
-    const result = await outcome(command, args);
-    if (result.exitCode !== 0 && !acceptFailure) {
-      throw new GwsEaError('nanoclaw_removal_incomplete', `Could not remove the instance ${command} resource`);
-    }
-    return result.stdout;
+  const recorded = { home_directory: runtime.homeDirectory, docker_endpoint: runtime.dockerEndpoint };
+  const incomplete = (message: string): GwsEaError => new GwsEaError('nanoclaw_removal_incomplete', message);
+  const execute = (program: string, args: readonly string[], env: Readonly<Record<string, string>>) => {
+    const command: SanitizedCommand = { command: program, args, cwd: CONTROL_PLANE_ROOT, env, timeoutMs: 120_000 };
+    return run(command).then((outcome) => ({ command, outcome }));
   };
+  const checked = async (program: string, args: readonly string[], env: Readonly<Record<string, string>>) => {
+    const { command, outcome } = await execute(program, args, env);
+    if (outcome.exitCode !== 0) throw commandExitError(command, outcome);
+    return outcome.stdout;
+  };
+  const coordinates = (runningAsRoot: boolean) =>
+    createInstanceServiceCoordinates({ installId, homeDirectory: runtime.homeDirectory, platform, runningAsRoot });
 
-  if (process.platform === 'darwin') {
-    const service = coordinates('macos', false);
-    await run('launchctl', ['unload', service.serviceDefinitionPath], true);
+  if (platform === 'macos') {
+    const service = coordinates(false);
     const uid = process.getuid?.();
     if (uid === undefined) throw new GwsEaError('unsupported_platform', 'launchd requires a user ID');
-    const serviceDomain = `gui/${uid}/${service.serviceIdentity}`;
-    await run('launchctl', ['bootout', serviceDomain], true);
-    if ((await outcome('launchctl', ['print', serviceDomain])).exitCode === 0) {
-      throw new GwsEaError('nanoclaw_removal_incomplete', 'NanoClaw launchd service is still loaded');
+    const env = serviceManagerEnvironment(recorded, service.manager, {});
+    const domain = `gui/${uid}/${service.serviceIdentity}`;
+    // A job that is not loaded refuses bootout; `print` then decides.
+    await execute('launchctl', ['bootout', domain], env);
+    if ((await execute('launchctl', ['print', domain], env)).outcome.exitCode === 0) {
+      throw incomplete('The NanoClaw launchd service is still loaded');
     }
     await rm(service.serviceDefinitionPath, { force: true });
-  } else if (process.platform === 'linux') {
-    const userService = coordinates('linux', false);
-    try {
-      await access(userService.serviceDefinitionPath);
-      await run('systemctl', ['--user', 'disable', '--now', `${userService.serviceIdentity}.service`], true);
-      if (
-        (await outcome('systemctl', ['--user', 'is-active', `${userService.serviceIdentity}.service`])).exitCode === 0
-      ) {
-        throw new GwsEaError('nanoclaw_removal_incomplete', 'NanoClaw user service is still active');
-      }
-      await rm(userService.serviceDefinitionPath, { force: true });
-      await run('systemctl', ['--user', 'daemon-reload']);
-    } catch (error) {
-      if (!isErrno(error, 'ENOENT')) throw error;
-    }
-    const systemService = coordinates('linux', true);
-    try {
-      await access(systemService.serviceDefinitionPath);
-      if (process.getuid?.() !== 0) {
+  } else {
+    for (const runningAsRoot of [false, true]) {
+      const service = coordinates(runningAsRoot);
+      const defined = await access(service.serviceDefinitionPath).then(
+        () => true,
+        (error: unknown) => {
+          if (isErrno(error, 'ENOENT')) return false;
+          throw error;
+        },
+      );
+      if (!defined) continue;
+      if (runningAsRoot && process.getuid?.() !== 0) {
         throw new GwsEaError(
           'root_required',
-          `Re-run removal with root privileges to remove ${systemService.serviceDefinitionPath}`,
+          `Re-run removal with root privileges to remove ${service.serviceDefinitionPath}`,
         );
       }
-      await run('systemctl', ['disable', '--now', `${systemService.serviceIdentity}.service`], true);
-      if ((await outcome('systemctl', ['is-active', `${systemService.serviceIdentity}.service`])).exitCode === 0) {
-        throw new GwsEaError('nanoclaw_removal_incomplete', 'NanoClaw system service is still active');
+      const env = serviceManagerEnvironment(recorded, service.manager, {});
+      const scope = service.manager === 'systemd-user' ? ['--user'] : [];
+      const unit = `${service.serviceIdentity}.service`;
+      await execute('systemctl', [...scope, 'disable', '--now', unit], env);
+      if ((await execute('systemctl', [...scope, 'is-active', unit], env)).outcome.exitCode === 0) {
+        throw incomplete(`The NanoClaw service ${unit} is still active`);
       }
-      await rm(systemService.serviceDefinitionPath, { force: true });
-      await run('systemctl', ['daemon-reload']);
-    } catch (error) {
-      if (!isErrno(error, 'ENOENT')) throw error;
+      await rm(service.serviceDefinitionPath, { force: true });
+      await checked('systemctl', [...scope, 'daemon-reload'], env);
     }
   }
 
-  const hostPattern = path
-    .join(reservation.checkout_realpath, 'dist', 'index.js')
-    .replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
-  const killed = await outcome('pkill', ['-f', hostPattern]);
-  if (killed.exitCode !== 0 && killed.exitCode !== 1) {
-    throw new GwsEaError('nanoclaw_removal_incomplete', 'Could not stop the NanoClaw host process');
-  }
-  const remaining = await outcome('pgrep', ['-f', hostPattern]);
-  if (remaining.exitCode === 0) {
-    throw new GwsEaError('nanoclaw_removal_incomplete', 'NanoClaw host process is still running');
-  }
-  if (remaining.exitCode !== 1) {
-    throw new GwsEaError('nanoclaw_removal_incomplete', 'Could not verify the NanoClaw host process stopped');
-  }
+  const tools = buildToolEnvironment(process.env, { DOCKER_HOST: runtime.dockerEndpoint });
+  const host = path.join(reservation.checkout_realpath, 'dist', 'index.js').replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+  const killed = await execute('pkill', ['-f', host], tools);
+  if (killed.outcome.exitCode !== 0 && killed.outcome.exitCode !== 1)
+    throw commandExitError(killed.command, killed.outcome);
+  const remaining = await execute('pgrep', ['-f', host], tools);
+  if (remaining.outcome.exitCode === 0) throw incomplete('The NanoClaw host process is still running');
+  if (remaining.outcome.exitCode !== 1) throw commandExitError(remaining.command, remaining.outcome);
 
-  const resources = coordinates(process.platform === 'darwin' ? 'macos' : 'linux', process.getuid?.() === 0);
-  const ids = (await run('docker', ['ps', '-aq', '--filter', `label=${resources.installLabel}`]))
-    .split(/\r?\n/u)
-    .map((id) => id.trim())
-    .filter(Boolean);
-  if (ids.length > 0) await run('docker', ['rm', '--force', ...ids]);
-  if ((await run('docker', ['ps', '-aq', '--filter', `label=${resources.installLabel}`])).trim()) {
-    throw new GwsEaError('nanoclaw_removal_incomplete', 'NanoClaw containers remain after removal');
+  const { installLabel, imageTag } = coordinates(false);
+  const containers = async (): Promise<string[]> =>
+    (await checked('docker', ['ps', '-aq', '--filter', `label=${installLabel}`], tools))
+      .split(/\r?\n/u)
+      .map((id) => id.trim())
+      .filter(Boolean);
+  const ids = await containers();
+  if (ids.length > 0) {
+    await checked('docker', ['rm', '--force', ...ids], tools);
+    if ((await containers()).length > 0) throw incomplete('NanoClaw containers remain after removal');
   }
-  if ((await run('docker', ['image', 'ls', '--quiet', '--no-trunc', resources.imageTag])).trim()) {
-    await run('docker', ['image', 'rm', resources.imageTag]);
-  }
-  if ((await run('docker', ['image', 'ls', '--quiet', '--no-trunc', resources.imageTag])).trim()) {
-    throw new GwsEaError('nanoclaw_removal_incomplete', 'NanoClaw image remains after removal');
+  const image = async (): Promise<boolean> =>
+    (await checked('docker', ['image', 'ls', '--quiet', '--no-trunc', imageTag], tools)).trim() !== '';
+  if (await image()) {
+    await checked('docker', ['image', 'rm', imageTag], tools);
+    if (await image()) throw incomplete('The NanoClaw image remains after removal');
   }
 }
 
-async function deleteGcpProject(reservation: InstanceReservation): Promise<void> {
-  const claims = reservation.exclusive_resource_claims;
-  await deleteOwnedGcpProject({
-    instanceId: reservation.instance_id,
-    projectId: claims.gcp_project_id,
-    account: claims.gcp_account,
-    cwd: path.dirname(reservation.checkout_realpath),
-  });
-}
-
-/** OneCLI is removed through the Docker endpoint the instance recorded, else the active local one. */
-async function removeOnecli(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<void> {
-  const claims = reservation.exclusive_resource_claims;
+/** OneCLI's Compose project, through the recorded Docker endpoint; the CLI path is the one the instance stored. */
+async function removeOnecli(
+  paths: ControlPlanePaths,
+  reservation: InstanceReservation,
+  runtime: LocalRuntime,
+): Promise<void> {
   await removeOnecliRuntime(
     createOnecliRuntimeLayout({
       instanceId: reservation.instance_id,
-      instanceRoot: path.dirname(reservation.checkout_realpath),
-      project: claims.onecli_project,
+      instanceRoot: paths.instanceRoot(reservation.instance_id),
+      project: reservation.exclusive_resource_claims.onecli_project,
       appPort: reservation.allocated_ports.onecli_app,
       gatewayPort: reservation.allocated_ports.onecli_gateway,
-      cliExecutable: '/usr/local/bin/onecli',
-      dockerEndpoint: (await recordedDockerEndpoint(paths, reservation)) ?? (await resolveDockerEndpoint()),
+      cliExecutable: runtime.onecliCliPath ?? (await resolveExecutable('onecli')),
+      dockerEndpoint: runtime.dockerEndpoint,
     }),
   );
 }
 
 export async function describeRemoval(paths: ControlPlanePaths, instanceId: string): Promise<RemovalPreview> {
   assertInstanceId(instanceId);
-  const receipt = await readReceipt(paths, instanceId);
-  const reservation = receipt?.reservation ?? (await getInstanceReservation(paths, instanceId));
-  const claims = reservation.exclusive_resource_claims;
   const registry = await readRegistry(paths);
+  const reservation =
+    registry.instances[instanceId] ??
+    (await readReceipt(paths, instanceId))?.reservation ??
+    (await getInstanceReservation(paths, instanceId));
+  const claims = reservation.exclusive_resource_claims;
   const ingress = claims.ingress;
-  const managedPeerExists = Object.values(registry.instances).some(
-    (instance) =>
-      instance.instance_id !== instanceId && instance.exclusive_resource_claims.ingress.mode === 'managed-cloudflare',
-  );
   return {
     instanceId,
     checkout: reservation.checkout_realpath,
@@ -824,56 +664,210 @@ export async function describeRemoval(paths: ControlPlanePaths, instanceId: stri
             callback: ingress.callback_url,
             dnsRecordId: ingress.dns_record_id,
             route: `${ingress.hostname} ${GCHAT_TUNNEL_PATH}`,
-            sharedIngress: managedPeerExists ? 'retained-for-peers' : 'retired',
+            sharedIngress: managedPeers(registry, instanceId) > 0 ? 'retained-for-peers' : 'retired',
           },
   };
 }
 
+/** Remove one assistant from whatever state it is in, holding only its own lock. */
 export async function removeAssistant(
   paths: ControlPlanePaths,
   instanceId: string,
-  dependencies: RemovalDependencies = {},
-): Promise<void> {
+  dependencies: RemovalDependencies,
+): Promise<RemovalOutcome> {
   assertInstanceId(instanceId);
   await preparePrivateDirectory(path.dirname(paths.instanceLock(instanceId)));
   const release = await processLock(paths.instanceLock(instanceId));
   if (!release) throw new GwsEaError('instance_busy', 'Instance operation is already in progress');
   try {
-    const existingReceipt = await readReceipt(paths, instanceId);
-    const reservation = existingReceipt?.reservation ?? (await assertRegistryMarkerAgreement(paths, instanceId));
-    const ingress = reservation.exclusive_resource_claims.ingress;
-    const api =
-      ingress.mode === 'managed-cloudflare' &&
-      (existingReceipt === undefined || existingReceipt.completed.ingress === null)
-        ? await verifyManagedRemovalAuthority(ingress, dependencies)
-        : undefined;
-    let receipt = existingReceipt ?? (await ensureReceipt(paths, instanceId, reservation));
-    if (receipt.completed.ingress === null) {
-      if (ingress.mode === 'managed-cloudflare') {
-        if (!api) throw new GwsEaError('cloudflare_token_required', 'Cloudflare authorization is missing');
-        receipt = await removeManagedCloudflareIngress(paths, receipt, api, dependencies);
-      }
-      receipt = await completePhase(paths, receipt, 'ingress', async () => undefined);
-    }
-    receipt = await completePhase(paths, receipt, 'nanoclaw', () =>
-      (dependencies.uninstallNanoclaw ?? uninstallNanoclaw)(receipt.reservation),
-    );
-    receipt = await completePhase(paths, receipt, 'gcp_project', () =>
-      (dependencies.deleteGcpProject ?? deleteGcpProject)(receipt.reservation),
-    );
-    receipt = await completePhase(paths, receipt, 'onecli', () =>
-      (dependencies.removeOnecli ?? ((reservation) => removeOnecli(paths, reservation)))(receipt.reservation),
-    );
-    receipt = await completePhase(paths, receipt, 'instance_files', () =>
-      dependencies.removeInstanceFiles
-        ? dependencies.removeInstanceFiles(receipt.reservation)
-        : rm(paths.instanceRoot(instanceId), { recursive: true, force: true }),
-    );
-    receipt = await completePhase(paths, receipt, 'registry', () =>
-      releaseInstanceReservation(paths, receipt.reservation),
-    );
-    await removePrivateFile(paths.removalFile(instanceId));
+    return await removeLocked(paths, instanceId, dependencies);
   } finally {
     release();
   }
+}
+
+async function removeLocked(
+  paths: ControlPlanePaths,
+  instanceId: string,
+  dependencies: RemovalDependencies,
+): Promise<RemovalOutcome> {
+  const { interaction } = dependencies;
+  const reporter = dependencies.reporter ?? {};
+  const abandon = dependencies.abandon ?? new Set();
+  const platform = dependencies.platform ?? (process.platform === 'darwin' ? 'macos' : 'linux');
+  const runGcloud = dependencies.runGcloud ?? runSanitizedCommandOutcome;
+  const registry = await readRegistry(paths);
+  const existing = await readReceipt(paths, instanceId);
+  const reservation =
+    registry.instances[instanceId] ?? existing?.reservation ?? (await getInstanceReservation(paths, instanceId));
+  const claims = reservation.exclusive_resource_claims;
+  const claim = managedClaim(reservation);
+  let receipt: RemovalReceipt = existing ?? {
+    schema_version: RECEIPT_SCHEMA_VERSION,
+    instance_id: instanceId,
+    reservation,
+    started_at: new Date().toISOString(),
+    completed: {},
+    abandoned: {},
+  };
+
+  // Everything below reads; nothing changes until the receipt is written.
+  await assertCheckoutConsistent(paths, reservation);
+  const provisioning = await readProvisioningRecord(paths, instanceId);
+  const recorded = await readRecordedRuntime(paths, reservation);
+  // Released last, so a released reservation left only local files and the receipt behind.
+  const released = registry.instances[instanceId] === undefined;
+  const started = (step: ProvisionStepId): boolean => !released && provisioning.started(step);
+  const tunnelRecorded = registry.shared_infrastructure_metadata.cloudflare?.tunnel_id !== null;
+  const owned: Readonly<Record<RemovalResource, boolean>> = {
+    // Peers write every managed route into the shared set, so it is observed whenever the machine has a tunnel.
+    'managed-ingress': claim !== undefined && (started('establish_transport') || (!released && tunnelRecorded)),
+    nanoclaw: started('start_nanoclaw'),
+    'gcp-project': started('provision_gcp'),
+    onecli: started('start_onecli'),
+    'instance-files': true,
+  };
+  const pending = new Set(
+    REMOVAL_RESOURCES.filter(
+      (resource) => owned[resource] && !receipt.completed[resource] && !receipt.abandoned[resource],
+    ),
+  );
+
+  const docker = once(() =>
+    (
+      dependencies.resolveDocker ??
+      ((endpoint) => (endpoint ? probeRecordedDockerEndpoint(endpoint) : resolveDockerEndpoint()))
+    )(recorded.dockerEndpoint),
+  );
+  const localRuntime = async (): Promise<LocalRuntime> => ({
+    homeDirectory: recorded.homeDirectory ?? os.homedir(),
+    dockerEndpoint: await docker(),
+    onecliCliPath: recorded.onecliCliPath,
+  });
+  const account = claims.gcp_account;
+  const withSignIn = async <T>(body: () => Promise<T>): Promise<T> => {
+    try {
+      return await body();
+    } catch (error) {
+      if (!(error instanceof SignInRequired)) throw error;
+      activeStep()?.write(`${error.message}; signing in, then trying again\n`);
+      await interaction.signInToGoogleCloud(account);
+      return body();
+    }
+  };
+  const cloudflare = once(async () => {
+    if (!claim) throw new GwsEaError('invalid_removal', 'Only managed ingress needs Cloudflare authorization');
+    return cloudflareAuthority(
+      claim,
+      interaction,
+      dependencies.createCloudflareApi ?? ((accountToken) => createCloudflareApi({ accountToken })),
+    );
+  });
+
+  await runStep(reporter, { id: 'prerequisites' }, async () => {
+    const retiresConnector = pending.has('managed-ingress') && managedPeers(registry, instanceId) === 0;
+    if (pending.has('nanoclaw') || pending.has('onecli') || retiresConnector) await docker();
+    if (pending.has('gcp-project')) {
+      await withSignIn(async () => {
+        await assertGcloudInstalled(runGcloud);
+        await assertGcloudSignedIn(account, runGcloud);
+      });
+    }
+    if (pending.has('managed-ingress')) await cloudflare();
+  });
+
+  const file = paths.removalFile(instanceId);
+  const record = async (change: (current: RemovalReceipt) => RemovalReceipt): Promise<void> => {
+    receipt = change(receipt);
+    await writePrivate(file, receipt);
+  };
+  await preparePrivateDirectory(paths.removalRoot);
+  await record((current) => current);
+
+  const removals: Readonly<Record<RemovalResource, () => Promise<Evidence | undefined>>> = {
+    'managed-ingress': async () => {
+      if (!claim) return undefined;
+      const connector = createCloudflareConnectorLayout({ cloudflareRoot: paths.cloudflareRoot, platform });
+      await removeManagedIngress({
+        paths,
+        reservation,
+        claim,
+        api: await cloudflare(),
+        ownTransport: provisioning.started('establish_transport'),
+        originHost: dependencies.originHost ?? (platform === 'macos' ? 'host.docker.internal' : '127.0.0.1'),
+        connector,
+        stopConnector: async () =>
+          dependencies.stopCloudflareConnector
+            ? dependencies.stopCloudflareConnector(connector, await docker())
+            : stopCloudflareConnector(connector, { dockerEndpoint: await docker() }),
+        sleep: dependencies.sleep ?? delay,
+      });
+      return undefined;
+    },
+    nanoclaw: async () => {
+      const runtime = await localRuntime();
+      await (dependencies.uninstallNanoclaw
+        ? dependencies.uninstallNanoclaw(reservation, runtime)
+        : uninstallNanoclaw(reservation, runtime, platform, dependencies.runCommand ?? runSanitizedCommandOutcome));
+      return undefined;
+    },
+    'gcp-project': async () => {
+      const coordinates: GcpProjectCoordinates = {
+        instanceId,
+        projectId: claims.gcp_project_id,
+        account,
+        cwd: CONTROL_PLANE_ROOT,
+      };
+      const gcloud = { runCommand: runGcloud };
+      const unrestored = (evidence: string | undefined) =>
+        evidence
+          ? record((current) => ({ ...current, key_policy_unrestored: { at: new Date().toISOString(), evidence } }))
+          : undefined;
+      const seen = await withSignIn(() =>
+        deleteOwnedGcpProject(coordinates, { restoreKeyPolicy: provisioning.keyPolicyLifted }, gcloud),
+      );
+      if (seen.status === 'deleted') {
+        await unrestored(seen.keyPolicyUnrestored);
+        return undefined;
+      }
+      activeStep()?.write(`${seen.reason}\n${seen.evidence}\n`);
+      if (!abandon.has('gcp-project')) throw new RemovalPause('gcp-project', seen.reason, seen.evidence);
+      if (provisioning.keyPolicyLifted) {
+        await unrestored(await withSignIn(() => restoreKeyCreationPolicyForRemoval(coordinates, gcloud)));
+      }
+      return { at: new Date().toISOString(), evidence: seen.evidence };
+    },
+    onecli: async () => {
+      const runtime = await localRuntime();
+      await (dependencies.removeOnecli
+        ? dependencies.removeOnecli(reservation, runtime)
+        : removeOnecli(paths, reservation, runtime));
+      return undefined;
+    },
+    'instance-files': async () => {
+      await rm(paths.instanceRoot(instanceId), { recursive: true, force: true });
+      return undefined;
+    },
+  };
+
+  for (const resource of REMOVAL_RESOURCES) {
+    if (!pending.has(resource)) continue;
+    const abandoned = await runStep(reporter, RESOURCE_STEPS[resource], removals[resource]);
+    await record((current) =>
+      abandoned
+        ? { ...current, abandoned: { ...current.abandoned, [resource]: abandoned } }
+        : { ...current, completed: { ...current.completed, [resource]: new Date().toISOString() } },
+    );
+  }
+  await releaseInstanceReservation(paths, reservation);
+  await removePrivateFile(file);
+
+  return {
+    removed: REMOVAL_RESOURCES.filter((resource) => receipt.completed[resource] !== undefined),
+    abandoned: ABANDONABLE_RESOURCES.flatMap((resource) => {
+      const entry = receipt.abandoned[resource];
+      return entry ? [{ resource, evidence: entry.evidence }] : [];
+    }),
+    ...(receipt.key_policy_unrestored ? { keyPolicyUnrestored: receipt.key_policy_unrestored.evidence } : {}),
+  };
 }

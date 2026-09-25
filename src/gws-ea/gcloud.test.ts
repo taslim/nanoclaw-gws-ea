@@ -16,6 +16,7 @@ import {
   googleCloudResources,
   isConsumerGoogleAccount,
   parseGchatServiceAccountCredential,
+  restoreKeyCreationPolicyForRemoval,
   type GcloudCommandRunner,
   type GcloudFailureClass,
   type GcpProjectCoordinates,
@@ -979,29 +980,74 @@ describe('Google Cloud project removal', () => {
     const { cloud, coordinates } = await removal();
     cloud.ready();
 
-    await deleteOwnedGcpProject(coordinates, { runCommand: cloud.run });
-    await deleteOwnedGcpProject(coordinates, { runCommand: cloud.run });
+    const options = { restoreKeyPolicy: false };
+    await expect(deleteOwnedGcpProject(coordinates, options, { runCommand: cloud.run })).resolves.toEqual({
+      status: 'deleted',
+    });
+    await expect(deleteOwnedGcpProject(coordinates, options, { runCommand: cloud.run })).resolves.toEqual({
+      status: 'deleted',
+    });
 
     expect(cloud.project?.lifecycleState).toBe('DELETE_REQUESTED');
     expect(cloud.mutations).toEqual([`projects delete ${coordinates.projectId}`]);
   });
 
-  it('reports a project Google will not confirm as unobservable, with evidence', async () => {
+  it('reports a project Google will not show as unknown, with evidence, and changes nothing', async () => {
     const { cloud, coordinates } = await removal();
 
-    await expect(deleteOwnedGcpProject(coordinates, { runCommand: cloud.run })).rejects.toMatchObject({
-      code: 'gcp_project_unobservable',
-      message: expect.stringContaining(coordinates.projectId),
-      details: { evidence: expect.stringContaining('(or it may not exist)') },
+    await expect(
+      deleteOwnedGcpProject(coordinates, { restoreKeyPolicy: true }, { runCommand: cloud.run }),
+    ).resolves.toEqual({
+      status: 'unknown',
+      reason: expect.stringContaining(coordinates.projectId),
+      evidence: expect.stringContaining('(or it may not exist)'),
     });
     expect(cloud.mutations).toEqual([]);
+  });
+
+  it('restores a lifted key-creation policy before it requests deletion', async () => {
+    const { cloud, coordinates } = await removal();
+    cloud.ready();
+    for (const constraint of KEY_CONSTRAINTS) cloud.projectPolicies.set(constraint, false);
+
+    await expect(
+      deleteOwnedGcpProject(coordinates, { restoreKeyPolicy: true }, { runCommand: cloud.run }),
+    ).resolves.toEqual({ status: 'deleted' });
+
+    expect(cloud.mutations).toEqual([
+      ...KEY_CONSTRAINTS.map((constraint) => `set-policy ${constraint} enforce=true`),
+      `projects delete ${coordinates.projectId}`,
+    ]);
+  });
+
+  it('still deletes the project, reporting the lift unrestored, when Google refuses the restore', async () => {
+    const { cloud, coordinates } = await removal();
+    cloud.ready().canSetPolicy = false;
+
+    await expect(
+      deleteOwnedGcpProject(coordinates, { restoreKeyPolicy: true }, { runCommand: cloud.run }),
+    ).resolves.toEqual({ status: 'deleted', keyPolicyUnrestored: expect.stringContaining('PERMISSION_DENIED') });
+    expect(cloud.mutations).toEqual([`projects delete ${coordinates.projectId}`]);
+  });
+
+  it('reports a restore Google refuses as evidence rather than a pause', async () => {
+    const { cloud, coordinates } = await removal();
+
+    await expect(restoreKeyCreationPolicyForRemoval(coordinates, { runCommand: cloud.run })).resolves.toEqual(
+      expect.stringContaining('PERMISSION_DENIED'),
+    );
+    cloud.ready();
+    await expect(restoreKeyCreationPolicyForRemoval(coordinates, { runCommand: cloud.run })).resolves.toBeUndefined();
+    expect(cloud.mutations).toEqual(KEY_CONSTRAINTS.map((constraint) => `set-policy ${constraint} enforce=true`));
   });
 
   it('refuses project deletion when the instance ownership label differs', async () => {
     const { cloud, coordinates } = await removal();
     cloud.ready().project!.labels['gws-ea-instance'] = allocateInstanceId();
 
-    await expect(deleteOwnedGcpProject(coordinates, { runCommand: cloud.run })).rejects.toMatchObject({
+    await expect(
+      deleteOwnedGcpProject(coordinates, { restoreKeyPolicy: true }, { runCommand: cloud.run }),
+    ).rejects.toMatchObject({
       code: 'gcp_project_owner_mismatch',
       message: expect.stringContaining(coordinates.projectId),
     });
@@ -1014,9 +1060,11 @@ describe('Google Cloud project removal', () => {
     const runCommand: GcloudCommandRunner = async (command) =>
       command.args[1] === 'delete' ? ok() : cloud.run(command);
 
-    await expect(deleteOwnedGcpProject(coordinates, { runCommand })).rejects.toMatchObject({
-      code: 'gcp_delete_unconfirmed',
-    });
+    await expect(deleteOwnedGcpProject(coordinates, { restoreKeyPolicy: false }, { runCommand })).rejects.toMatchObject(
+      {
+        code: 'gcp_delete_unconfirmed',
+      },
+    );
     expect(cloud.project?.lifecycleState).toBe('ACTIVE');
   });
 });

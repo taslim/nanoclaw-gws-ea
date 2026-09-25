@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { readFile, readdir } from 'node:fs/promises';
+import { lstat, readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { readJson, writePrivate } from '../community-portal/private-file.js';
 import { processLock } from '../community-portal/process-lock.js';
@@ -408,13 +408,16 @@ export interface CloudflareCoordinateUpdate {
 export interface LockedCloudflareRegistry {
   readonly registry: InstanceRegistry;
   updateCoordinates(update: CloudflareCoordinateUpdate): Promise<InstanceRegistry>;
+  /** Forget a tunnel the last managed assistant's removal retired, so the next one creates its own (R12). */
+  forgetTunnel(): Promise<InstanceRegistry>;
 }
 
 /**
  * Hold the machine registry lock across one shared Cloudflare reconciliation.
  * The callback can persist only remote coordinates; it cannot rewrite claims.
- * The tunnel coordinate never changes once recorded; a DNS record that
- * vanished may be recreated, and its new ID replaces the old one.
+ * The tunnel coordinate never changes once recorded, except that retiring the
+ * tunnel forgets it; a DNS record that vanished may be recreated, and its new
+ * ID replaces the old one.
  */
 export async function withLockedCloudflareRegistry<T>(
   paths: ControlPlanePaths,
@@ -474,6 +477,17 @@ export async function withLockedCloudflareRegistry<T>(
         current = next;
         return current;
       },
+      async forgetTunnel() {
+        const cloudflare = current.shared_infrastructure_metadata.cloudflare;
+        if (!cloudflare || cloudflare.tunnel_id === null) return current;
+        const next = validateRegistry(
+          { ...current, shared_infrastructure_metadata: { cloudflare: { ...cloudflare, tunnel_id: null } } },
+          paths,
+        );
+        await writePrivate(paths.registryFile, next);
+        current = next;
+        return current;
+      },
     };
     return callback(locked);
   });
@@ -493,12 +507,6 @@ export async function reserveInstance(
   const release = await acquireMachineLock(paths);
   try {
     const registry = await readRegistryFile(paths);
-    if ((await activeRemovalInstanceIds(paths, registry)).length > 0) {
-      throw new GwsEaError(
-        'removal_in_progress',
-        'An assistant removal is in progress; retry create after it completes',
-      );
-    }
     if (registry.instances[validated.instance_id]) {
       throw new GwsEaError('instance_exists', 'Instance ID already exists');
     }
@@ -594,17 +602,39 @@ export async function readInstanceMarkerFile(file: string): Promise<InstanceMark
   }
 }
 
+async function assertMarkerAgreement(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<void> {
+  await assertOwnedDirectory(reservation.checkout_realpath);
+  const marker = await readInstanceMarkerFile(paths.markerFile(reservation.instance_id));
+  if (marker.instance_id !== reservation.instance_id || marker.deployed_commit !== reservation.deployed_commit) {
+    throw new GwsEaError('marker_mismatch', 'Instance marker mismatch; refusing mutation');
+  }
+}
+
 export async function assertRegistryMarkerAgreement(
   paths: ControlPlanePaths,
   instanceId: string,
 ): Promise<InstanceReservation> {
   const reservation = await getInstanceReservation(paths, instanceId);
-  await assertOwnedDirectory(reservation.checkout_realpath);
-  const marker = await readInstanceMarkerFile(paths.markerFile(instanceId));
-  if (marker.instance_id !== instanceId || marker.deployed_commit !== reservation.deployed_commit) {
-    throw new GwsEaError('marker_mismatch', 'Instance marker mismatch; refusing mutation');
-  }
+  await assertMarkerAgreement(paths, reservation);
   return reservation;
+}
+
+/**
+ * A missing checkout without its marker is consistent: it was never
+ * materialized, or is already removed. A present checkout must carry this
+ * reservation's marker before anything touches it.
+ */
+export async function assertCheckoutConsistent(
+  paths: ControlPlanePaths,
+  reservation: InstanceReservation,
+): Promise<void> {
+  try {
+    await lstat(reservation.checkout_realpath);
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) return;
+    throw error;
+  }
+  await assertMarkerAgreement(paths, reservation);
 }
 
 export async function writeInstanceMarker(paths: ControlPlanePaths, instanceId: string): Promise<void> {

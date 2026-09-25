@@ -43,7 +43,16 @@ import {
   validateReservation,
 } from './registry.js';
 import { resolveReleaseSource } from './release-tracks.js';
-import { describeRemoval, removeAssistant, type RemovalPreview } from './remove.js';
+import {
+  ABANDONABLE_RESOURCES,
+  describeRemoval,
+  removeAssistant,
+  RemovalPause,
+  type AbandonableResource,
+  type RemovalOptions,
+  type RemovalOutcome,
+  type RemovalPreview,
+} from './remove.js';
 import { FIXTURE_STAGING_DIRECTORY, startRunLog, type RunLog } from './run-log.js';
 import type { HostStatusHelpers, UpsertEnvVars } from './service.js';
 import { GwsEaError, type AllocatedPorts, type GwsEaErrorDetails, type InstanceReservationInput } from './types.js';
@@ -98,7 +107,11 @@ export interface AdvanceOptions {
 }
 
 export type AdvanceProvision = (operation: InstanceOperation, options: AdvanceOptions) => Promise<ProvisionResult>;
-type RemoveAssistantRunner = (paths: ControlPlanePaths, instanceId: string, interaction: Interaction) => Promise<void>;
+type RemoveAssistantRunner = (
+  paths: ControlPlanePaths,
+  instanceId: string,
+  options: RemovalOptions,
+) => Promise<RemovalOutcome | undefined>;
 
 export interface CliRuntime {
   paths?: ControlPlanePaths;
@@ -141,7 +154,7 @@ const COMMAND_OPTIONS: Readonly<Record<Command, { values: readonly string[]; swi
     values: ['id', 'messaging-group-id', ...COMMON_OPTIONS],
     switches: ['chat-configured', ...COMMON_SWITCHES],
   },
-  remove: { values: ['id', ...COMMON_OPTIONS], switches: ['yes', ...COMMON_SWITCHES] },
+  remove: { values: ['id', 'abandon', ...COMMON_OPTIONS], switches: ['yes', ...COMMON_SWITCHES] },
 };
 
 type Options = Readonly<Record<string, string>>;
@@ -176,6 +189,21 @@ function requireOption(options: Options, name: string): string {
   const value = options[name];
   if (!value) throw new GwsEaError('invalid_arguments', `Missing required option --${name}`);
   return value;
+}
+
+/** `--abandon a,b`: resources removal may leave behind when it cannot observe them. */
+function parseAbandon(value: string | undefined): ReadonlySet<AbandonableResource> {
+  const abandonable: readonly string[] = ABANDONABLE_RESOURCES;
+  const resources = value === undefined ? [] : value.split(',');
+  const unknown = resources.find((resource) => !abandonable.includes(resource));
+  if (unknown !== undefined) {
+    throw new GwsEaError(
+      'invalid_arguments',
+      `--abandon: ${JSON.stringify(unknown)} cannot be abandoned; choose from ${ABANDONABLE_RESOURCES.join(', ')}`,
+      { details: { flag: '--abandon' } },
+    );
+  }
+  return new Set(resources.filter((resource): resource is AbandonableResource => abandonable.includes(resource)));
 }
 
 function shellQuote(value: string): string {
@@ -254,7 +282,7 @@ function pauseReport(pause: ProvisionHumanPause, resume: (extra?: string) => str
 }
 
 type Outcome =
-  | { readonly status: 'ready'; readonly message: string }
+  | { readonly status: 'ready'; readonly message: string; readonly details?: readonly string[] }
   | { readonly status: 'paused'; readonly pause: ProvisionHumanPause };
 
 type Attempt =
@@ -314,13 +342,14 @@ class Cli {
     const instanceId = requireOption(options, 'id');
     assertInstanceId(instanceId);
     if (command === 'remove') {
+      const abandon = parseAbandon(options.abandon);
       return () =>
         this.#attempt({
           command,
           args,
           options,
           instanceId,
-          work: (session) => this.#removeWork(session, options, instanceId),
+          work: (session) => this.#removeWork(session, options, instanceId, abandon),
         });
     }
     return () =>
@@ -343,7 +372,13 @@ class Cli {
     const common = secretsFile ? `--secrets-file ${shellQuote(secretsFile)}` : undefined;
     const join = (...parts: Array<string | undefined>): string => parts.filter(Boolean).join(' ');
     if (plan.command === 'remove') {
-      return join(`gws-ea remove --id ${state.instanceId}`, plan.options.yes ? '--yes' : undefined, common);
+      const abandon = [...new Set([...(plan.options.abandon?.split(',') ?? []), ...(extra ? [extra] : [])])];
+      return join(
+        `gws-ea remove --id ${state.instanceId}`,
+        plan.options.yes ? '--yes' : undefined,
+        abandon.length > 0 ? `--abandon ${abandon.join(',')}` : undefined,
+        common,
+      );
     }
     if (state.reserved && state.instanceId) return join(`gws-ea resume --id ${state.instanceId}`, extra, common);
     const track = plan.options.track ?? '';
@@ -524,7 +559,12 @@ class Cli {
     }
   }
 
-  async #removeWork({ reporter, interaction }: Session, options: Options, instanceId: string): Promise<Outcome> {
+  async #removeWork(
+    { reporter, interaction }: Session,
+    options: Options,
+    instanceId: string,
+    abandon: ReadonlySet<AbandonableResource>,
+  ): Promise<Outcome> {
     const preview = await runStep(reporter, { id: 'inspect' }, () =>
       (this.#runtime.describeRemoval ?? describeRemoval)(this.#paths, instanceId),
     );
@@ -539,19 +579,14 @@ class Cli {
       }
       if (!(await confirm(preview))) return { status: 'ready', message: 'Removal cancelled. Nothing was changed.' };
     }
-    const remove: RemoveAssistantRunner =
-      this.#runtime.removeAssistant ??
-      ((paths, id, port) =>
-        removeAssistant(paths, id, {
-          requestCloudflareAccountToken: (accountId, reason) =>
-            port.requestCloudflareAccountToken({ accountId, reason }),
-        }));
-    await runStep(reporter, { id: 'remove', label: 'Removing the assistant…' }, () =>
-      remove(this.#paths, instanceId, interaction),
+    const remove: RemoveAssistantRunner = this.#runtime.removeAssistant ?? removeAssistant;
+    const removed = await runStep(reporter, { id: 'remove', label: 'Removing the assistant…' }, () =>
+      remove(this.#paths, instanceId, { interaction, abandon, reporter }),
     );
     return {
       status: 'ready',
-      message: `Assistant ${instanceId} was removed. Google Cloud project deletion was requested.`,
+      message: `Assistant ${instanceId} was removed.`,
+      details: removalSummary(preview, removed),
     };
   }
 
@@ -616,7 +651,7 @@ class Cli {
         return { status: 'done', exitCode: EXIT_CODES.paused };
       }
       run.complete();
-      presenter.report({ outcome: 'ready', headline: outcome.message, details: [] });
+      presenter.report({ outcome: 'ready', headline: outcome.message, details: outcome.details ?? [] });
       return { status: 'done', exitCode: EXIT_CODES.ready };
     } catch (error) {
       const step = (error instanceof PauseRequired ? pausedForInput : failures[0]?.step) ?? plan.command;
@@ -626,7 +661,12 @@ class Cli {
         presenter.report({
           outcome: 'paused',
           headline: `Paused at ${step}: ${safeMessage(error)}`,
-          details: [...error.instructions, `Continue with: ${continueWith()}`, ...log],
+          details: [
+            ...error.instructions,
+            `Continue with: ${continueWith()}`,
+            ...(error instanceof RemovalPause ? [`Or leave it behind: ${continueWith(error.resource)}`] : []),
+            ...log,
+          ],
         });
         return { status: 'done', exitCode: EXIT_CODES.paused };
       }
@@ -768,6 +808,26 @@ function removalPreviewLines(preview: RemovalPreview): string[] {
   return lines;
 }
 
+/** What the operator must know after removal: the project deletion, and anything left behind. */
+function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undefined): string[] {
+  const project = `Google Cloud project ${preview.gcpProject}`;
+  const names: Readonly<Record<AbandonableResource, string>> = { 'gcp-project': project };
+  return [
+    ...(outcome?.removed.includes('gcp-project')
+      ? [`${project}: deletion requested; it stays recoverable for 30 days, then Google Cloud deletes it.`]
+      : []),
+    ...(outcome?.abandoned.map(
+      ({ resource }) =>
+        `Left behind: ${names[resource]}, which removal could not observe; delete it yourself if it still exists.`,
+    ) ?? []),
+    ...(outcome?.keyPolicyUnrestored
+      ? [
+          `The Google Chat key-creation policy lifted on ${project} was not restored: ${outcome.keyPolicyUnrestored.split('\n')[0]}`,
+        ]
+      : []),
+  ];
+}
+
 function printHelp(output: LineWriter): void {
   output('Usage: gws-ea <create|resume|remove> [options]');
   output('  create --track <track> [--source-remote <remote>] [--google-account <email>]');
@@ -777,7 +837,7 @@ function printHelp(output: LineWriter): void {
   output('         [--ingress existing --endpoint <https-url>]');
   output('         [--ingress managed-cloudflare --cloudflare-zone <zone> --hostname-label <label>]');
   output('  resume --id <instance_id> [--chat-configured] [--messaging-group-id <exact-id>]');
-  output('  remove --id <instance_id> [--yes]');
+  output('  remove --id <instance_id> [--yes] [--abandon gcp-project]');
   output('  Every command: [--secrets-file <owner-only file under the config root>] [--capture-fixtures]');
   output('  Secrets: GWS_EA_PROVIDER_CREDENTIAL, GWS_EA_CLOUDFLARE_API_TOKEN (environment or --secrets-file).');
   output('  Exit codes: 0 ready, 10 paused for a person, 1 failed, 75 busy.');
