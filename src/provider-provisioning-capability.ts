@@ -5,8 +5,10 @@ import path from 'node:path';
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/u;
 const SHARED_CAPABILITY_FILES = [
   'setup/lib/bright-select.ts',
+  'setup/lib/captured-token.ts',
   'setup/lib/inherit-script.ts',
-  'setup/register-claude-token.sh',
+  '.claude/skills/add-onecli/scripts/install-claude.sh',
+  '.claude/skills/add-onecli/scripts/register-claude-token.sh',
   'src/provider-credential.ts',
 ] as const;
 const NON_PROVISIONING_PROVIDER_FILES = new Set(['install.ts', 'skill-descriptor.ts']);

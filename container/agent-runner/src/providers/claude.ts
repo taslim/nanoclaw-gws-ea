@@ -257,8 +257,13 @@ export class ClaudeProvider implements AgentProvider {
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
         pathToClaudeCodeExecutable: '/pnpm/claude',
+        // The append (agent name + destinations) is rebuilt at every container
+        // start. Left to the SDK default, Claude Code records the prompt on a
+        // session's first request and resends that record on every resume, so
+        // a resumed agent would keep its old name and destination list until
+        // compaction. snapshot: false renders it fresh each time.
         systemPrompt: instructions
-          ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions }
+          ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions, snapshot: false }
           : undefined,
         allowedTools: [...this.mcp.allowedTools],
         disallowedTools: [...this.executionPolicy.disallowedTools],
@@ -269,10 +274,11 @@ export class ClaudeProvider implements AgentProvider {
         permissionMode: this.executionPolicy.permissionMode,
         allowDangerouslySkipPermissions: this.executionPolicy.allowDangerouslySkipPermissions,
         settingSources: ['project', 'user', 'local'],
-        // Only sent when enabled, so an install that never turns it on passes
-        // exactly the options it always did. `fastMode` is a Settings member
-        // rather than a query option, which is why it rides `settings`.
-        ...(this.inference.settings ? { settings: this.inference.settings } : {}),
+        // Flag-level settings: `fastMode` only when the install turns it on,
+        // then the execution policy's fixed keys, spread last so per-group
+        // input can never override them. Both are Settings members rather
+        // than query options, which is why they ride `settings`.
+        settings: { ...this.inference.settings, ...this.executionPolicy.settings },
         mcpServers: this.mcp.mcpServers,
         hooks: {
           PreToolUse: [{ hooks: [preToolUseHook] }],

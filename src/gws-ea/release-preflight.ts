@@ -299,6 +299,14 @@ async function validateComposition(
     'src/modules/gws-ea-profile/migration.ts',
     'src/modules/index.ts',
   ];
+  const gatewayFiles = [
+    'src/gateway-providers/index.ts',
+    'src/gateway-providers/installed.ts',
+    'src/gateway-providers/onecli.ts',
+    'src/gateway-providers/onecli-files.ts',
+    'container/skills/onecli-gateway/SKILL.md',
+    'container/skills/onecli-gateway/instructions.md',
+  ];
   const providerFiles = [
     `src/provider-contracts/${provider}.ts`,
     'src/provider-contracts/index.ts',
@@ -311,10 +319,17 @@ async function validateComposition(
     `container/agent-runner/src/providers/${provider}.conformance.test.ts`,
   ];
   try {
-    await assertCommittedRegularFiles(checkoutRoot, [...commonFiles, ...providerFiles], run, environments);
+    await assertCommittedRegularFiles(
+      checkoutRoot,
+      [...commonFiles, ...gatewayFiles, ...providerFiles],
+      run,
+      environments,
+    );
     await assertBarrelImports(checkoutRoot, [
       { barrel: 'src/channels/index.ts', moduleName: 'gchat', code: 'incomplete_release' },
       { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-profile/index', code: 'incomplete_release' },
+      { barrel: 'src/gateway-providers/index.ts', moduleName: 'installed', code: 'gateway_not_composed' },
+      { barrel: 'src/gateway-providers/installed.ts', moduleName: 'onecli', code: 'gateway_not_composed' },
       ...[
         'src/provider-contracts/index.ts',
         'setup/providers/index.ts',
@@ -323,6 +338,13 @@ async function validateComposition(
       ].map((barrel) => ({ barrel, moduleName: provider, code: 'provider_not_composed' })),
     ]);
   } catch (error) {
+    if (
+      error instanceof GwsEaError &&
+      error.code === 'incomplete_release' &&
+      gatewayFiles.some((file) => error.message.includes(file))
+    ) {
+      throw new GwsEaError('gateway_not_composed', 'The selected release is missing its OneCLI gateway');
+    }
     if (
       error instanceof GwsEaError &&
       error.code === 'incomplete_release' &&
