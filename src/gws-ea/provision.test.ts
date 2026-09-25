@@ -33,14 +33,17 @@ import type { MainIdentityDependencies } from './identity.js';
 import { reserveInstance } from './registry.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { ONECLI_CLI_VERSION, ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './pins.js';
-import type { ObservedOnecliRuntime, OnecliCompatibilityReceipt } from './onecli.js';
-import { holdLoopbackPorts } from './ports.js';
+import type { OnecliRuntimeReceipt } from './onecli.js';
+import { findPortHolder } from './ports.js';
 import { startRunLog, type RunLog } from './run-log.js';
+import { writeOwnerOnlyFileExclusive } from './secrets.js';
 import {
   createInstanceRuntimeConfig,
   googleChatProjectNumberFile,
   persistInstanceRuntime,
+  type HostStatusHelpers,
   type UpsertEnvVars,
+  type WaitForHostOptions,
 } from './service.js';
 import type { ManagedTransport } from './cloudflare-ingress.js';
 import {
@@ -116,19 +119,6 @@ async function listen(server: Server, port: number): Promise<void> {
 async function close(server: Server): Promise<void> {
   if (!server.listening) return;
   await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
-}
-
-async function canClaim(port: number): Promise<boolean> {
-  const server = createServer();
-  try {
-    await listen(server, port);
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') return false;
-    throw error;
-  } finally {
-    await close(server);
-  }
 }
 
 function serviceAccount(overrides: Readonly<Record<string, string>> = {}): string {
@@ -697,6 +687,7 @@ describe('production bootstrap trust boundary', () => {
       appPort: reserved.allocated_ports.onecli_app,
       gatewayPort: reserved.allocated_ports.onecli_gateway,
       cliExecutable: '/usr/local/bin/onecli',
+      dockerEndpoint: 'unix:///var/run/docker.sock',
     });
     const runtime = createInstanceRuntimeConfig(reserved, onecli, {
       nodePath: process.execPath,
@@ -739,7 +730,7 @@ describe('production bootstrap trust boundary', () => {
 
     await expect(
       withInstanceOperation(paths, reserved.instance_id, (operation) =>
-        runProductionProvision(operation, { upsertEnvVars: recordEnv }),
+        runProductionProvision(operation, { upsertEnvVars: recordEnv, hostStatus: servingHost(reserved) }),
       ),
     ).rejects.toMatchObject({ code: 'bootstrap_required' });
   });
@@ -750,7 +741,7 @@ describe('production bootstrap trust boundary', () => {
     // bootstrap_required is raised only after the receipt was accepted.
     await expect(
       withInstanceOperation(paths, reserved.instance_id, (operation) =>
-        runProductionProvision(operation, { upsertEnvVars: recordEnv }),
+        runProductionProvision(operation, { upsertEnvVars: recordEnv, hostStatus: servingHost(reserved) }),
       ),
     ).rejects.toMatchObject({ code: 'bootstrap_required' });
   });
@@ -764,6 +755,7 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
     appPort: reserved.allocated_ports.onecli_app,
     gatewayPort: reserved.allocated_ports.onecli_gateway,
     cliExecutable: '/usr/local/bin/onecli',
+    dockerEndpoint: 'unix:///var/run/docker.sock',
   });
   const runtime = createInstanceRuntimeConfig(reserved, onecli, {
     nodePath: '/usr/local/bin/node',
@@ -831,8 +823,54 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
         runningAsRoot: false,
       },
       ingress: reserved.exclusive_resource_claims.ingress,
+      hostStatus: servingHost(reserved),
     },
   };
+}
+
+/** What upstream `queryHost` returns for this checkout's running host. */
+function hostStatusOf(reserved: InstanceReservation, overrides: Readonly<Record<string, unknown>> = {}) {
+  return {
+    pid: 4242,
+    started_at: '2026-09-25T12:00:00.000Z',
+    instance_id: 'host-instance-1',
+    project_root: reserved.checkout_realpath,
+    webhook: { id: 'listener-1', port: reserved.allocated_ports.nanoclaw_webhook, paths: ['/webhook/gchat'] },
+    channels: [{ instance: 'gchat', type: 'gchat', connected: true }],
+    ...overrides,
+  };
+}
+
+/** Upstream's host-status helpers for a host that is up and connected. */
+function servingHost(reserved: InstanceReservation): HostStatusHelpers {
+  return { queryHost: async () => hostStatusOf(reserved), waitForHost: async () => hostStatusOf(reserved) };
+}
+
+/** Write the release receipt create's preflight records, with the OneCLI cohort the release pinned. */
+async function writeReleaseReceipt(
+  paths: ControlPlanePaths,
+  reserved: InstanceReservation,
+  onecli: { gateway: string; cli: string; sdk: string },
+): Promise<void> {
+  await writeFile(
+    paths.releasePreflightFile(reserved.instance_id),
+    `${JSON.stringify({
+      schema_version: 1,
+      instance_id: reserved.instance_id,
+      deployed_commit: reserved.deployed_commit,
+      provider: 'claude',
+      providerCapabilityDigest,
+      providerCredential: {
+        name: 'Claude provider',
+        type: 'api_key',
+        hostPattern: 'api.anthropic.com',
+        headerName: 'x-api-key',
+      },
+      packageManager: 'pnpm@10.0.0',
+      onecli,
+    })}\n`,
+    { mode: 0o600 },
+  );
 }
 
 interface ProbeIdentityState {
@@ -847,13 +885,6 @@ function probeIdentityDependencies(
 ): MainIdentityDependencies {
   return {
     runNcl: async (_runtime, args) => {
-      if (args[0] === 'status') {
-        return {
-          project_root: context.input.runtime.checkout_realpath,
-          webhook: { port: context.input.runtime.allocated_ports.nanoclaw_webhook, paths: ['/webhook/gchat'] },
-          channels: [{ instance: 'gchat', type: 'gchat', connected: true }],
-        };
-      }
       if (args[0] === 'gws-ea-profile' && args[1] === 'get') {
         return {
           assistant_display_name: context.input.identity.assistantDisplayName,
@@ -892,6 +923,70 @@ function runAlone(
   };
   const steps = { ...Object.fromEntries(PROVISION_STEPS.map((other) => [other, satisfied])), [id]: step };
   return runProvisionSteps(operation, context, steps as ProvisionSteps<ProductionProvisionContext>, runtime);
+}
+
+/** A Docker CLI that reports this instance's three OneCLI services running healthy at the launcher's pins. */
+function healthyOnecliDocker(context: ProductionProvisionContext) {
+  const layout = context.input.onecli;
+  const labels = (role: string) => ({ 'dev.gws-ea.instance-id': layout.instanceId, 'dev.gws-ea.onecli-role': role });
+  return async (command: { readonly args: readonly string[] }) => {
+    const [kind, verb] = command.args;
+    const reply = (value: unknown) => ({ stdout: JSON.stringify(value), stderr: '' });
+    if (kind === 'container' && verb === 'ls') return { stdout: 'id-postgres\nid-app\nid-gateway\n', stderr: '' };
+    if (kind === 'container' && verb === 'inspect') {
+      return reply(
+        (['postgres', 'app', 'gateway'] as const).map((service) => ({
+          Id: `id-${service}`,
+          Config: {
+            Image: service === 'postgres' ? 'postgres:18-alpine' : `ghcr.io/onecli/onecli:${ONECLI_GATEWAY_VERSION}`,
+            Labels: {
+              'com.docker.compose.project': layout.project,
+              'com.docker.compose.service': service,
+              'dev.gws-ea.instance-id': layout.instanceId,
+            },
+          },
+          State: { Running: true, Health: { Status: 'healthy' } },
+          NetworkSettings: {
+            Ports:
+              service === 'postgres'
+                ? {}
+                : {
+                    [service === 'app' ? '10254/tcp' : '10255/tcp']: [
+                      {
+                        HostIp: '127.0.0.1',
+                        HostPort: String(service === 'app' ? layout.appPort : layout.gatewayPort),
+                      },
+                    ],
+                  },
+            Networks: Object.fromEntries(
+              (service === 'gateway'
+                ? [layout.backendNetwork, layout.agentEgressNetwork]
+                : [layout.backendNetwork]
+              ).map((network) => [network, {}]),
+            ),
+          },
+          Mounts: [
+            service === 'postgres'
+              ? { Type: 'volume', Name: layout.postgresVolume, Destination: '/var/lib/postgresql' }
+              : { Type: 'volume', Name: layout.appVolume, Destination: '/app/data' },
+          ],
+        })),
+      );
+    }
+    if (kind === 'network') {
+      return reply([
+        { Name: layout.backendNetwork, Internal: false, Labels: labels('backend') },
+        { Name: layout.agentEgressNetwork, Internal: true, Labels: labels('agent-egress') },
+      ]);
+    }
+    if (kind === 'volume') {
+      return reply([
+        { Name: layout.postgresVolume, Labels: labels('postgres-data') },
+        { Name: layout.appVolume, Labels: labels('app-data') },
+      ]);
+    }
+    throw new Error(`unexpected docker command: ${command.args.join(' ')}`);
+  };
 }
 
 describe('production provision step composition', () => {
@@ -985,38 +1080,43 @@ describe('production provision step composition', () => {
     });
   });
 
-  it('repairs a stopped OneCLI runtime only after the liveness wait, and refuses unsafe drift', async () => {
+  it('repairs a completed OneCLI runtime whose container stopped at once, and refuses unsafe drift', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
+    await writeReleaseReceipt(paths, reserved, {
+      gateway: ONECLI_GATEWAY_VERSION,
+      cli: ONECLI_CLI_VERSION,
+      sdk: '2.2.1',
+    });
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
-      let running = true;
+      let stopped = false;
       let unsafe = false;
-      const receipt = Object.freeze({}) as OnecliCompatibilityReceipt;
+      const receipt = Object.freeze({}) as OnecliRuntimeReceipt;
       const reconcileOnecliRuntime = vi.fn(async () => {
-        running = true;
+        stopped = false;
         return receipt;
       });
       const persistOnecliApiKeyFiles = vi.fn(async () => undefined);
       const observeOnecli = vi.fn(async () => {
         if (unsafe) throw new GwsEaError('unsafe_onecli_owner', 'Foreign OneCLI resource');
-        return running ? PRESENT : ABSENT;
+        return stopped ? { status: 'absent' as const, reason: 'its gateway container is stopped' } : PRESENT;
       });
       const step = createProductionProvisionSteps(context, {
         observeOnecli,
         reconcileOnecliRuntime,
         persistOnecliApiKeyFiles,
-        holdReservedLoopbackPorts: async () => ({ release: async () => undefined }),
       }).start_onecli;
       const sleeps: number[] = [];
       const runtime = { sleep: async (milliseconds: number) => void sleeps.push(milliseconds) };
       await expect(runAlone(operation, context, 'start_onecli', step, runtime)).resolves.toEqual({ status: 'ready' });
       expect(reconcileOnecliRuntime).not.toHaveBeenCalled();
 
-      running = false;
+      stopped = true;
       await expect(runAlone(operation, context, 'start_onecli', step, runtime)).resolves.toEqual({ status: 'ready' });
-      expect(sleeps).toEqual(FULL_WAIT);
+      expect(step.resources[0]!.absentMeansStopped).toBe(true);
+      expect(sleeps).toEqual([]);
       expect(reconcileOnecliRuntime).toHaveBeenCalledOnce();
       expect(persistOnecliApiKeyFiles).toHaveBeenCalledWith(receipt, {
         runtime: context.input.runtime.secret_files.onecli_runtime_api_key,
@@ -1032,101 +1132,80 @@ describe('production provision step composition', () => {
     });
   });
 
-  it('reclaims the exact reserved OneCLI ports on a normal resume and holds them until bind', async () => {
-    const paths = await testPaths();
-    const originalLease = await holdLoopbackPorts();
-    const ports = originalLease.ports;
-    await originalLease.release();
-    const reserved = await reserveInstance(paths, reservation(paths, ports));
-    const receipt = Object.freeze({}) as OnecliCompatibilityReceipt;
-    const bindObservations: boolean[] = [];
-
-    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
-      const context = productionContext(operation, reserved);
-      const reconcileOnecliRuntime = vi.fn(async (_layout, dependencies) => {
-        bindObservations.push(await canClaim(ports.onecli_app));
-        await dependencies.beforeBind?.();
-        bindObservations.push(await canClaim(ports.onecli_app));
-        return receipt;
-      });
-      const phase = createProductionProvisionSteps(context, {
-        reconcileOnecliRuntime,
-        persistOnecliApiKeyFiles: vi.fn(async () => undefined),
-      }).start_onecli.resources[0]!;
-
-      await expect(phase.apply(context)).resolves.toBeUndefined();
-      expect(reconcileOnecliRuntime).toHaveBeenCalledOnce();
-    });
-
-    expect(bindObservations).toEqual([false, true]);
-    await expect(canClaim(ports.onecli_app)).resolves.toBe(true);
-    await expect(canClaim(ports.onecli_gateway)).resolves.toBe(true);
-  });
-
-  it('fails resume when a foreign listener takes an exact released reserved port', async () => {
-    const paths = await testPaths();
-    const originalLease = await holdLoopbackPorts();
-    const ports = originalLease.ports;
-    await originalLease.release();
-    const foreignListener = createServer();
-    await listen(foreignListener, ports.onecli_app);
-    const reserved = await reserveInstance(paths, reservation(paths, ports));
-    const reconcileOnecliRuntime = vi.fn();
-
-    try {
-      await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
-        const context = productionContext(operation, reserved);
-        const phase = createProductionProvisionSteps(context, { reconcileOnecliRuntime }).start_onecli.resources[0]!;
-
-        await expect(phase.apply(context)).rejects.toMatchObject({
-          code: 'port_claim_lost',
-          message:
-            `Reserved onecli_app coordinate 127.0.0.1:${ports.onecli_app} is unavailable. ` +
-            `Stop the process using it, then resume with: gws-ea resume --id ${reserved.instance_id}`,
-        });
-      });
-    } finally {
-      await close(foreignListener);
-    }
-
-    expect(reconcileOnecliRuntime).not.toHaveBeenCalled();
-  });
-
-  it('reattaches an owned OneCLI runtime after interruption before its API keys were persisted', async () => {
+  it('runs and checks OneCLI at the pins its release recorded, not this launcher’s', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
-    const receipt = Object.freeze({}) as OnecliCompatibilityReceipt;
-    const observed = { containers: [], networks: [], volumes: [] } as ObservedOnecliRuntime;
-    const portFailure = new GwsEaError('port_claim_lost', 'The owned OneCLI runtime already holds its ports');
-    const holdReservedLoopbackPorts = vi.fn(async (): Promise<never> => {
-      throw portFailure;
-    });
-    const inspectOnecliRuntime = vi.fn(async () => observed);
-    const validateObservedOnecliRuntime = vi.fn(() => undefined);
-    const reconcileOnecliRuntime = vi.fn(async () => receipt);
-    const persistOnecliApiKeyFiles = vi.fn(async () => undefined);
+    const recorded = { gateway: '1.41.3', cli: '2.2.4', sdk: '2.2.0' };
+    await writeReleaseReceipt(paths, reserved, recorded);
+    const receipt = Object.freeze({}) as OnecliRuntimeReceipt;
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
-      const phase = createProductionProvisionSteps(context, {
-        holdReservedLoopbackPorts,
-        inspectOnecliRuntime,
-        validateObservedOnecliRuntime,
+      const reconcileOnecliRuntime = vi.fn(async () => receipt);
+      const verifyOnecliRuntime = vi.fn(async () => receipt);
+      const registry = createProductionProvisionSteps(context, {
         reconcileOnecliRuntime,
-        persistOnecliApiKeyFiles,
-      }).start_onecli.resources[0]!;
+        verifyOnecliRuntime,
+        persistOnecliApiKeyFiles: vi.fn(async () => undefined),
+        importProviderCredential: vi.fn(async () => ({ id: 'secret-provider', created: true })),
+      });
 
-      await expect(phase.apply(context)).resolves.toBeUndefined();
-      expect(inspectOnecliRuntime).toHaveBeenCalledWith(context.input.onecli);
-      expect(validateObservedOnecliRuntime).toHaveBeenCalledWith(context.input.onecli, observed);
-      expect(reconcileOnecliRuntime).toHaveBeenCalledWith(context.input.onecli, undefined);
-      expect(persistOnecliApiKeyFiles).toHaveBeenCalledOnce();
+      await registry.start_onecli.resources[0]!.apply(context);
+      context.state.onecliReceipt = undefined;
+      await registry.configure_provider.resources[0]!.apply(context);
+
+      const pins = { gateway: recorded.gateway, cli: recorded.cli };
+      expect(recorded.gateway).not.toBe(ONECLI_GATEWAY_VERSION);
+      expect(reconcileOnecliRuntime).toHaveBeenCalledWith(context.input.onecli, pins, undefined);
+      // A resumed provider step checks the running vault instead of starting it again.
+      expect(verifyOnecliRuntime).toHaveBeenCalledWith(context.input.onecli, pins, undefined);
+      expect(reconcileOnecliRuntime).toHaveBeenCalledOnce();
+    });
+  });
+
+  it('adopts a healthy OneCLI runtime interrupted before its API keys were persisted', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation(paths));
+    await writeReleaseReceipt(paths, reserved, {
+      gateway: ONECLI_GATEWAY_VERSION,
+      cli: ONECLI_CLI_VERSION,
+      sdk: '2.2.1',
+    });
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const base = productionContext(operation, reserved);
+      const context: ProductionProvisionContext = {
+        ...base,
+        input: { ...base.input, onecliDependencies: { dockerCommandRunner: healthyOnecliDocker(base) } },
+      };
+      const reconcileOnecliRuntime = vi.fn(async () => Object.freeze({}) as OnecliRuntimeReceipt);
+      const step = createProductionProvisionSteps(context, {
+        reconcileOnecliRuntime,
+        persistOnecliApiKeyFiles: vi.fn(async () => {
+          await mkdir(path.dirname(context.input.runtime.secret_files.onecli_admin_api_key), { recursive: true });
+          await writeOwnerOnlyFileExclusive(context.input.runtime.secret_files.onecli_runtime_api_key, 'oc_key');
+          await writeOwnerOnlyFileExclusive(context.input.runtime.secret_files.onecli_admin_api_key, 'oc_key');
+        }),
+      }).start_onecli;
+
+      await expect(step.resources[0]!.observe(context)).resolves.toMatchObject({
+        status: 'absent',
+        reason: expect.stringContaining('API key'),
+      });
+      await expect(runAlone(operation, context, 'start_onecli', step)).resolves.toEqual({ status: 'ready' });
+      expect(reconcileOnecliRuntime).toHaveBeenCalledOnce();
+      await expect(step.resources[0]!.observe(context)).resolves.toEqual(PRESENT);
     });
   });
 
   it('collects a missing credential only after the isolated OneCLI runtime is ready', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
+    await writeReleaseReceipt(paths, reserved, {
+      gateway: ONECLI_GATEWAY_VERSION,
+      cli: ONECLI_CLI_VERSION,
+      sdk: '2.2.1',
+    });
     const order: string[] = [];
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
@@ -1151,7 +1230,7 @@ describe('production provision step composition', () => {
       const dependencies: Partial<ProductionProvisionDependencies> = {
         reconcileOnecliRuntime: vi.fn(async () => {
           order.push('onecli');
-          return {} as OnecliCompatibilityReceipt;
+          return {} as OnecliRuntimeReceipt;
         }),
         persistOnecliApiKeyFiles: vi.fn(async () => undefined),
         importProviderCredential: vi.fn(async (_receipt, credential) => {
@@ -1247,6 +1326,7 @@ describe('production provision step composition', () => {
         claim,
         platform: 'macos',
         webhookPort: reserved.allocated_ports.nanoclaw_webhook,
+        dockerEndpoint: 'unix:///var/run/docker.sock',
       });
       await expect(transport!.accountToken('Cloudflare must route the callback')).resolves.toBe(
         'requested-account-token',
@@ -1358,25 +1438,18 @@ describe('production provision step composition', () => {
     expect(startRuntime).not.toHaveBeenCalled();
   });
 
-  it('continues main identity setup when the exact NanoClaw host already owns its webhook port', async () => {
+  it('continues main identity setup when this checkout’s host already serves, without restarting it', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
-      const runNcl = vi.fn(async () => ({
-        pid: 1234,
-        project_root: reserved.checkout_realpath,
-        webhook: { id: 'gchat', port: reserved.allocated_ports.nanoclaw_webhook, paths: ['/webhook/gchat'] },
-        channels: [{ instance: 'gchat', type: 'gchat', connected: true }],
-      }));
+      const queryHost = vi.fn(async () => hostStatusOf(reserved));
+      const waitForHost = vi.fn();
       const context: ProductionProvisionContext = {
         ...base,
-        input: { ...base.input, identityDependencies: { runNcl } },
+        input: { ...base.input, hostStatus: { queryHost, waitForHost } },
       };
-      const holdReservedLoopbackPorts = vi.fn(async (): Promise<never> => {
-        throw new Error('The owned host already holds the webhook port');
-      });
       const reconcileInstanceRuntime = vi.fn(async (): Promise<never> => {
         throw new Error('An already-running host must not be restarted');
       });
@@ -1386,25 +1459,142 @@ describe('production provision step composition', () => {
         return { agentGroupId: 'ag-main', onecliAgentId: 'onecli-main' };
       });
       const step = createProductionProvisionSteps(context, {
-        holdReservedLoopbackPorts,
         reconcileInstanceRuntime,
         reconcileMainIdentity,
         observeMainIdentity: async () => (identified ? PRESENT : ABSENT),
       }).start_nanoclaw;
 
       await expect(runAlone(operation, context, 'start_nanoclaw', step)).resolves.toEqual({ status: 'ready' });
-      expect(runNcl).toHaveBeenCalledWith(context.input.runtime, ['status']);
-      expect(holdReservedLoopbackPorts).not.toHaveBeenCalled();
+      expect(queryHost).toHaveBeenCalledWith(reserved.checkout_realpath);
+      expect(waitForHost).not.toHaveBeenCalled();
       expect(reconcileInstanceRuntime).not.toHaveBeenCalled();
       expect(reconcileMainIdentity).toHaveBeenCalledOnce();
       expect(context.state.mainAgentGroupId).toBe('ag-main');
     });
   });
 
-  it('waits for an owned NanoClaw host to become ready after its webhook port is claimed', async () => {
+  it('waits with a reason, and raises no port error, while a host that holds its webhook port has not opened its socket', async () => {
+    const paths = await testPaths();
+    // The assistant's own host has bound its webhook port; only its ncl socket is still closed (Appendix A #13).
+    const webhook = createServer();
+    await listen(webhook, 0);
+    const port = (webhook.address() as { port: number }).port;
+    const bound = await reserveInstance(
+      paths,
+      reservation(paths, { nanoclaw_webhook: port, onecli_app: 3201, onecli_gateway: 3301 }),
+    );
+    const events: RunEvent[] = [];
+    let socketOpen = false;
+
+    try {
+      await withInstanceOperation(paths, bound.instance_id, async (operation) => {
+        const base = productionContext(operation, bound);
+        const socketClosed = () => new Error(`connect ENOENT ${path.join(bound.checkout_realpath, 'data/ncl.sock')}`);
+        const waitForHost = vi.fn(async (_root: string, _options?: WaitForHostOptions) => {
+          socketOpen = true;
+          return hostStatusOf(bound);
+        });
+        const context: ProductionProvisionContext = {
+          ...base,
+          input: {
+            ...base.input,
+            hostStatus: {
+              queryHost: async () => {
+                if (!socketOpen) throw socketClosed();
+                return hostStatusOf(bound);
+              },
+              waitForHost,
+            },
+          },
+        };
+        await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), {
+          recursive: true,
+          mode: 0o700,
+        });
+        await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
+        const findPortHolder = vi.fn();
+        const reconcileInstanceRuntime = vi.fn(async () => ({ pid: 4242 }) as never);
+        const step = createProductionProvisionSteps(
+          context,
+          {
+            getOwnedGcpProjectNumber: async () => '441811502258',
+            reconcileInstanceRuntime,
+            instanceServicePid: async () => undefined,
+            findPortHolder,
+            reconcileMainIdentity: vi.fn(async () => ({ agentGroupId: 'ag-main', onecliAgentId: 'onecli-main' })),
+            observeMainIdentity: async () => (socketOpen ? PRESENT : ABSENT),
+          },
+          { emit: (event) => void events.push(event) },
+        ).start_nanoclaw;
+
+        await expect(
+          runAlone(operation, context, 'start_nanoclaw', step, { emit: (event) => void events.push(event) }),
+        ).resolves.toEqual({ status: 'ready' });
+        expect(reconcileInstanceRuntime).toHaveBeenCalledOnce();
+        expect(waitForHost).toHaveBeenCalledWith(bound.checkout_realpath, {
+          channel: 'gchat',
+          pid: 4242,
+          alive: expect.any(Function),
+          timeoutMs: expect.any(Number),
+        });
+        expect(events).toContainEqual({
+          type: 'step-waiting',
+          step: 'start_nanoclaw',
+          reason: 'Waiting for the assistant to connect Google Chat…',
+        });
+        expect(findPortHolder).not.toHaveBeenCalled();
+      });
+    } finally {
+      await close(webhook);
+    }
+  });
+
+  it('names a foreign process on the webhook port when the host does not become ready', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
-    let statusCalls = 0;
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const base = productionContext(operation, reserved);
+      const exited = new Error('NanoClaw exited before becoming ready. Check logs/nanoclaw.error.log.');
+      const context: ProductionProvisionContext = {
+        ...base,
+        input: {
+          ...base.input,
+          hostStatus: {
+            queryHost: async () => {
+              throw new Error('connect ECONNREFUSED data/ncl.sock');
+            },
+            waitForHost: async () => {
+              throw exited;
+            },
+          },
+        },
+      };
+      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), { recursive: true, mode: 0o700 });
+      await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
+      const findPortHolder = vi.fn(async () => ({ pid: 5150, command: 'python3' }));
+      const host = createProductionProvisionSteps(context, {
+        getOwnedGcpProjectNumber: async () => '441811502258',
+        reconcileInstanceRuntime: vi.fn(async () => ({ pid: 4242 }) as never),
+        instanceServicePid: async () => undefined,
+        findPortHolder,
+      }).start_nanoclaw.resources[0]!;
+
+      const failure = await host.apply(context).catch((error: unknown) => error);
+
+      expect(findPortHolder).toHaveBeenCalledWith(reserved.allocated_ports.nanoclaw_webhook);
+      expect(failure).toMatchObject({
+        code: 'port_in_use',
+        message: expect.stringContaining(`python3 (pid 5150)`),
+      });
+      expect((failure as Error).message).toContain(`127.0.0.1:${reserved.allocated_ports.nanoclaw_webhook}`);
+      expect((failure as Error).cause).toBe(exited);
+    });
+  });
+
+  it('stops with the host’s reason and its error log at the instance path when it does not become ready', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation(paths));
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
@@ -1412,52 +1602,34 @@ describe('production provision step composition', () => {
         ...base,
         input: {
           ...base.input,
-          identityDependencies: {
-            runNcl: async () => {
-              statusCalls++;
-              if (statusCalls < 4) throw new GwsEaError('command_failed', 'Host still starting');
-              return {
-                project_root: reserved.checkout_realpath,
-                webhook: { port: reserved.allocated_ports.nanoclaw_webhook, paths: ['/webhook/gchat'] },
-                channels: [{ instance: 'gchat', type: 'gchat', connected: true }],
-              };
+          hostStatus: {
+            queryHost: async () => hostStatusOf(reserved),
+            waitForHost: async () => {
+              throw new Error('Channel gchat is not connected in the running host. Check logs/nanoclaw.error.log.');
             },
           },
         },
       };
       await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), { recursive: true, mode: 0o700 });
       await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
-      const holdReservedLoopbackPorts = vi.fn(async (): Promise<never> => {
-        throw new GwsEaError('port_claim_lost', 'Owned host has the webhook port');
-      });
-      const reconcileInstanceRuntime = vi.fn();
-      let identified = false;
-      const reconcileMainIdentity = vi.fn(async () => {
-        identified = true;
-        return { agentGroupId: 'ag-main', onecliAgentId: 'onecli-main' };
-      });
-      const nanoclawStartupDelay = vi.fn(async () => undefined);
-      const step = createProductionProvisionSteps(context, {
+      const host = createProductionProvisionSteps(context, {
         getOwnedGcpProjectNumber: async () => '441811502258',
-        holdReservedLoopbackPorts,
-        reconcileInstanceRuntime,
-        reconcileMainIdentity,
-        observeMainIdentity: async () => (identified ? PRESENT : ABSENT),
-        nanoclawStartupDelay,
-      }).start_nanoclaw;
+        reconcileInstanceRuntime: vi.fn(async () => ({ pid: 4242 }) as never),
+        // The host's own process holds its port: that is not a conflict.
+        findPortHolder: async () => ({ pid: 4242, command: 'node' }),
+      }).start_nanoclaw.resources[0]!;
 
-      await expect(runAlone(operation, context, 'start_nanoclaw', step)).resolves.toEqual({ status: 'ready' });
-      expect(statusCalls).toBeGreaterThanOrEqual(4);
-      expect(nanoclawStartupDelay).toHaveBeenCalled();
-      expect(reconcileInstanceRuntime).not.toHaveBeenCalled();
-      expect(reconcileMainIdentity).toHaveBeenCalledOnce();
+      await expect(host.apply(context)).rejects.toMatchObject({
+        code: 'nanoclaw_not_ready',
+        message: `Channel gchat is not connected in the running host. Check ${path.join(reserved.checkout_realpath, 'logs', 'nanoclaw.error.log')}.`,
+      });
     });
   });
 
-  it('waits on a starting host, and restarts a stopped one without restamping its matching main identity', async () => {
+  it('waits on a starting host, and restarts a stopped one at once without restamping its matching main identity', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
-    let hostStatus: 'running' | 'stopped' | number = 'running';
+    let host: 'serving' | 'stopped' | number = 'serving';
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
@@ -1466,56 +1638,115 @@ describe('production provision step composition', () => {
         onecliCalls: [],
         providerSecretIds: [],
       };
-      const identityDependencies = probeIdentityDependencies(base, identityState);
       const context: ProductionProvisionContext = {
         ...base,
         input: {
           ...base.input,
-          identityDependencies: {
-            ...identityDependencies,
-            runNcl: async (runtime, args) => {
-              if (args[0] === 'status' && typeof hostStatus === 'number') {
-                hostStatus = hostStatus > 1 ? hostStatus - 1 : 'running';
-                throw new GwsEaError('command_failed', 'Host is starting');
-              }
-              if (args[0] === 'status' && hostStatus === 'stopped') {
-                throw new GwsEaError('command_failed', 'Host is stopped');
-              }
-              return identityDependencies.runNcl!(runtime, args);
+          identityDependencies: probeIdentityDependencies(base, identityState),
+          hostStatus: {
+            queryHost: async () => {
+              if (typeof host === 'number') throw new Error('connect ENOENT data/ncl.sock');
+              if (host === 'stopped') throw new Error('connect ECONNREFUSED data/ncl.sock');
+              return hostStatusOf(reserved);
             },
+            waitForHost: async () => hostStatusOf(reserved),
           },
         },
       };
       await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), { recursive: true, mode: 0o700 });
       await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
       const reconcileInstanceRuntime = vi.fn(async () => {
-        hostStatus = 'running';
-        return {} as Awaited<ReturnType<ProductionProvisionDependencies['reconcileInstanceRuntime']>>;
+        host = 'serving';
+        return { pid: 4242 } as never;
       });
       const reconcileMainIdentity = vi.fn();
+      const events: RunEvent[] = [];
       const step = createProductionProvisionSteps(context, {
         getOwnedGcpProjectNumber: async () => '441811502258',
-        holdReservedLoopbackPorts: async () => ({ release: async () => undefined }),
         reconcileInstanceRuntime,
         reconcileMainIdentity,
+        // The service runs a process while the host starts; its socket opens after `host` more looks.
+        instanceServicePid: async () => {
+          if (typeof host !== 'number') return undefined;
+          host = host > 1 ? host - 1 : 'serving';
+          return 4242;
+        },
       }).start_nanoclaw;
       const sleeps: number[] = [];
-      const runtime = { sleep: async (milliseconds: number) => void sleeps.push(milliseconds) };
+      const runtime = {
+        sleep: async (milliseconds: number) => void sleeps.push(milliseconds),
+        emit: (event: RunEvent) => void events.push(event),
+      };
       await expect(runAlone(operation, context, 'start_nanoclaw', step, runtime)).resolves.toEqual({ status: 'ready' });
 
-      hostStatus = 2;
+      host = 2;
       await expect(runAlone(operation, context, 'start_nanoclaw', step, runtime)).resolves.toEqual({ status: 'ready' });
       expect(sleeps).toEqual([1_000, 2_000]);
+      expect(events).toContainEqual({
+        type: 'step-waiting',
+        step: 'start_nanoclaw',
+        reason: 'The assistant is starting (pid 4242)',
+      });
       expect(reconcileInstanceRuntime).not.toHaveBeenCalled();
 
       sleeps.length = 0;
-      hostStatus = 'stopped';
+      host = 'stopped';
       await expect(runAlone(operation, context, 'start_nanoclaw', step, runtime)).resolves.toEqual({ status: 'ready' });
-      expect(sleeps).toEqual(FULL_WAIT);
+      expect(step.resources[0]!.absentMeansStopped).toBe(true);
+      expect(sleeps).toEqual([]);
       expect(reconcileInstanceRuntime).toHaveBeenCalledOnce();
       expect(reconcileMainIdentity).not.toHaveBeenCalled();
       expect(context.state.mainAgentGroupId).toBe('ag-main');
     });
+  });
+
+  it('waits on a host whose Google Chat channel has not connected yet', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation(paths));
+
+    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+      const base = productionContext(operation, reserved);
+      const context: ProductionProvisionContext = {
+        ...base,
+        input: {
+          ...base.input,
+          hostStatus: {
+            queryHost: async () =>
+              hostStatusOf(reserved, { channels: [{ instance: 'gchat', type: 'gchat', connected: false }] }),
+            waitForHost: vi.fn(),
+          },
+        },
+      };
+      const host = createProductionProvisionSteps(context).start_nanoclaw.resources[0]!;
+
+      await expect(host.observe(context)).resolves.toMatchObject({
+        status: 'unknown',
+        reason: 'Channel gchat is not connected in the running host',
+        evidence: expect.stringContaining(path.join(reserved.checkout_realpath, 'logs', 'nanoclaw.error.log')),
+      });
+    });
+  });
+});
+
+describe('port holders', () => {
+  it('names the process lsof reports, and nobody when lsof finds none or is missing', async () => {
+    const answers: Array<Error | string> = [
+      'p5150\ncpython3.12\n',
+      new GwsEaError('command_failed', 'Command failed (exit code 1): lsof'),
+      new GwsEaError('executable_not_found', 'lsof was not found on PATH'),
+    ];
+    const run = vi.fn(async () => {
+      const answer = answers.shift()!;
+      if (answer instanceof Error) throw answer;
+      return { stdout: answer, stderr: '' };
+    });
+
+    await expect(findPortHolder(52882, run)).resolves.toEqual({ pid: 5150, command: 'python3.12' });
+    await expect(findPortHolder(52882, run)).resolves.toBeUndefined();
+    await expect(findPortHolder(52882, run)).resolves.toBeUndefined();
+    expect(run).toHaveBeenCalledWith(
+      expect.objectContaining({ command: 'lsof', args: expect.arrayContaining(['-iTCP:52882', '-sTCP:LISTEN']) }),
+    );
   });
 });
 
@@ -1556,7 +1787,7 @@ async function productionHarness(): Promise<ProductionHarness> {
   await mkdir(paths.instanceRoot(reserved.instance_id), { recursive: true, mode: 0o700 });
   await writeFile(paths.bootstrapFile(reserved.instance_id), '{}', { mode: 0o600 });
   const resources = new Set<string>();
-  const receipt = Object.freeze({}) as OnecliCompatibilityReceipt;
+  const receipt = Object.freeze({}) as OnecliRuntimeReceipt;
   let principalBound = false;
 
   const harness: ProductionHarness = {
@@ -1583,17 +1814,12 @@ async function productionHarness(): Promise<ProductionHarness> {
             ...(harness.selectedMessagingGroupId ? { selectedMessagingGroupId: harness.selectedMessagingGroupId } : {}),
             chatConfigured: harness.chatConfigured,
             bootstrapManifestFile: paths.bootstrapFile(reserved.instance_id),
-            identityDependencies: {
-              runNcl: async (_runtime, args) => {
-                if (args[0] === 'status' && resources.has('host')) {
-                  return {
-                    project_root: reserved.checkout_realpath,
-                    webhook: { port: reserved.allocated_ports.nanoclaw_webhook, paths: ['/webhook/gchat'] },
-                    channels: [{ instance: 'gchat', type: 'gchat', connected: true }],
-                  };
-                }
-                throw new GwsEaError('command_failed', 'NanoClaw is not running');
+            hostStatus: {
+              queryHost: async () => {
+                if (resources.has('host')) return hostStatusOf(reserved);
+                throw new Error(`connect ENOENT ${path.join(reserved.checkout_realpath, 'data/ncl.sock')}`);
               },
+              waitForHost: async () => hostStatusOf(reserved),
             },
           },
         };
@@ -1636,12 +1862,12 @@ async function productionHarness(): Promise<ProductionHarness> {
             },
           ],
           getOwnedGcpProjectNumber: async () => '441811502258',
-          holdReservedLoopbackPorts: async () => ({ release: async () => undefined }),
           observeOnecli: async () => (resources.has('onecli') ? PRESENT : ABSENT),
           reconcileOnecliRuntime: async () => {
             effect('reconcileOnecliRuntime', 'onecli');
             return receipt;
           },
+          verifyOnecliRuntime: async () => receipt,
           persistOnecliApiKeyFiles: async () => undefined,
           observeProvider: async (value) => {
             if (!resources.has('provider')) return ABSENT;
@@ -1659,9 +1885,9 @@ async function productionHarness(): Promise<ProductionHarness> {
           },
           reconcileInstanceRuntime: async () => {
             effect('reconcileInstanceRuntime', 'host');
-            return {} as Awaited<ReturnType<ProductionProvisionDependencies['reconcileInstanceRuntime']>>;
+            return { pid: 4242 } as Awaited<ReturnType<ProductionProvisionDependencies['reconcileInstanceRuntime']>>;
           },
-          nanoclawStartupDelay: async () => undefined,
+          instanceServicePid: async () => undefined,
           reconcileMainIdentity: async () => {
             effect('reconcileMainIdentity', 'main');
             return { agentGroupId: 'ag-main', onecliAgentId: 'onecli-main' };

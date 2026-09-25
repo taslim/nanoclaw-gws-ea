@@ -649,11 +649,9 @@ describe('create recovery contract', () => {
     const paths = await testPaths();
     const advanced: string[] = [];
     let portsReleased = false;
-    const advanceProvision: NonNullable<CliRuntime['advanceProvision']> = async (operation, { portLease, runtime }) => {
-      if (advanced.length === 0) {
-        expect(portLease).toBeDefined();
-        expect(portsReleased).toBe(false);
-      }
+    const advanceProvision: NonNullable<CliRuntime['advanceProvision']> = async (operation, { runtime }) => {
+      // The reservation claims the ports; each runtime binds its own when it starts.
+      expect(portsReleased).toBe(true);
       await runStep(runtime, { id: 'provision_gcp', label: 'Configuring Google Cloud…' }, async () => {
         runtime.emit?.({ type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for the service account…' });
         runtime.emit?.({ type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for the service account…' });

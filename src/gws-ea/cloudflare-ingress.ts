@@ -441,6 +441,8 @@ export interface ManagedTransport {
   readonly platform: CloudflareConnectorPlatform;
   /** The assistant's loopback webhook port, which its route targets. */
   readonly webhookPort: number;
+  /** The assistant's recorded Docker endpoint, where the connector runs (KTD3). */
+  readonly dockerEndpoint: string;
   /** The account token, asked for only when a tunnel, route, or DNS change may be needed (R8). */
   readonly accountToken: (reason: string) => Promise<string>;
 }
@@ -490,6 +492,7 @@ export function managedTransportResources(
     cloudflareRoot: paths.cloudflareRoot,
     platform: transport.platform,
   });
+  const connector = { dockerEndpoint: transport.dockerEndpoint, ...dependencies.connector };
   const sleep = dependencies.sleep ?? ((milliseconds: number) => delay(milliseconds));
   const localEndpointUrl = `http://127.0.0.1:${transport.webhookPort}/webhook/gchat`;
   let misrouted: string | undefined;
@@ -519,9 +522,9 @@ export function managedTransportResources(
     {
       name: 'the Cloudflare connector',
       absentMeansStopped: true,
-      observe: () => observeCloudflareConnector(layout, dependencies.connector),
+      observe: () => observeCloudflareConnector(layout, connector),
       apply: async () => {
-        await repairCloudflareConnector(paths, layout, dependencies.connector);
+        await repairCloudflareConnector(paths, layout, connector);
         return undefined;
       },
     },

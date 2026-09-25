@@ -1,3 +1,7 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { CliRuntime, FailureReport } from '../src/gws-ea/cli.js';
@@ -56,6 +60,10 @@ vi.mock('./providers/index.js', () => ({}));
 const { createTerminalPresenter, main } = await import('./gws-ea.js');
 /** Upstream's `.env` writer: the driver injects it unchanged. */
 const { upsertEnvVars } = await import('./set-env.js');
+/** Upstream's host readiness helpers (untyped ESM, so loaded by URL): the driver injects them unchanged. */
+const hostStatus = (await import(new URL('./lib/host-status.mjs', import.meta.url).href)) as Readonly<
+  Record<'queryHost' | 'waitForHost', unknown>
+>;
 
 function runtimeOf(call = 0): CliRuntime {
   return fixture.runCli.mock.calls[call]![1] as CliRuntime;
@@ -91,11 +99,24 @@ describe('GWS-EA driver', () => {
     expect(runtime.checkPrerequisites).toBeUndefined();
     expect(runtime.confirmRemoval).toBeUndefined();
     expect(runtime.upsertEnvVars).toBe(upsertEnvVars);
+    expect(runtime.hostStatus?.queryHost).toBe(hostStatus.queryHost);
+    expect(runtime.hostStatus?.waitForHost).toBe(hostStatus.waitForHost);
     await runtime.collectCreateInputs!({ marker: 'context' } as never);
     expect(fixture.collect).toHaveBeenCalledWith(
       { marker: 'context' },
       { providers: fixture.providers, interactive: false },
     );
+  });
+
+  it('relies on upstream waitForHost naming the checkout-relative error log that gws-ea rewrites', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-host-status-'));
+    const waitForHost = hostStatus.waitForHost as (root: string, options: { timeoutMs: number }) => Promise<unknown>;
+    try {
+      // No host listens in an empty checkout: the helper gives up with its reason and the relative log path.
+      await expect(waitForHost(root, { timeoutMs: 50 })).rejects.toThrow(/\. Check logs\/nanoclaw\.error\.log\.$/u);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it('wires the spinner, prompts, gcloud guidance, and failure loop on a TTY', async () => {
@@ -104,6 +125,7 @@ describe('GWS-EA driver', () => {
 
     expect(runtime.presenter).toBeDefined();
     expect(runtime.upsertEnvVars).toBe(upsertEnvVars);
+    expect(runtime.hostStatus?.waitForHost).toBe(hostStatus.waitForHost);
     await runtime.collectCreateInputs!({ marker: 'context' } as never);
     expect(fixture.collect).toHaveBeenCalledWith(
       { marker: 'context' },

@@ -11,6 +11,7 @@ import k from 'kleur';
 
 import { runCli, type CliRuntime, type FailureReport, type Presenter } from '../src/gws-ea/cli.js';
 import type { InteractivePrompts } from '../src/gws-ea/events.js';
+import type { HostStatusHelpers } from '../src/gws-ea/service.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
 import { offerDiagnosis } from './gws-ea-assist.js';
 import { authenticateGwsEaProvider, CLOUDFLARE_API_TOKEN_GUIDANCE, collectGwsEaCreateInput } from './gws-ea-input.js';
@@ -144,6 +145,26 @@ function terminalPrompts(providers: readonly SetupProviderEntry[]): InteractiveP
   };
 }
 
+/**
+ * Upstream's host readiness helpers, unchanged. They ship as untyped ESM
+ * (`setup/lib/host-status.mjs`), so they are loaded by URL and checked here
+ * rather than given a declaration file inside upstream's tree.
+ */
+async function loadHostStatus(): Promise<HostStatusHelpers> {
+  const helpers = (await import(new URL('./lib/host-status.mjs', import.meta.url).href)) as Record<string, unknown>;
+  const { queryHost, waitForHost } = helpers;
+  if (typeof queryHost !== 'function' || typeof waitForHost !== 'function') {
+    throw new GwsEaError(
+      'launcher_incomplete',
+      'setup/lib/host-status.mjs no longer provides queryHost and waitForHost',
+    );
+  }
+  return {
+    queryHost: queryHost as HostStatusHelpers['queryHost'],
+    waitForHost: waitForHost as HostStatusHelpers['waitForHost'],
+  };
+}
+
 /** Diagnosis first, then the retry offer; a retry re-runs prerequisites and resumes. */
 async function handleFailure(report: FailureReport): Promise<'retry' | 'stop'> {
   await offerDiagnosis(report);
@@ -159,9 +180,11 @@ export async function main(argv: readonly string[], options: { readonly interact
   const providers = listSetupProviders();
   const collectCreateInputs: CliRuntime['collectCreateInputs'] = (context) =>
     collectGwsEaCreateInput(context, { providers, interactive });
-  if (!interactive) return runCli(argv, { collectCreateInputs, upsertEnvVars });
+  const hostStatus = await loadHostStatus();
+  if (!interactive) return runCli(argv, { collectCreateInputs, upsertEnvVars, hostStatus });
   return runCli(argv, {
     upsertEnvVars,
+    hostStatus,
     presenter: createTerminalPresenter(),
     prompts: terminalPrompts(providers),
     collectCreateInputs,

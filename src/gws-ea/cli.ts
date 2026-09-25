@@ -45,7 +45,7 @@ import {
 import { resolveReleaseSource } from './release-tracks.js';
 import { describeRemoval, removeAssistant, type RemovalPreview } from './remove.js';
 import { FIXTURE_STAGING_DIRECTORY, startRunLog, type RunLog } from './run-log.js';
-import type { UpsertEnvVars } from './service.js';
+import type { HostStatusHelpers, UpsertEnvVars } from './service.js';
 import { GwsEaError, type AllocatedPorts, type GwsEaErrorDetails, type InstanceReservationInput } from './types.js';
 
 /** Unlabeled, so a scripted create's first line stays its `instance_id`. */
@@ -95,7 +95,6 @@ export interface FailureReport {
 export interface AdvanceOptions {
   readonly interaction: Interaction;
   readonly runtime: ProvisionRuntime;
-  readonly portLease?: HeldLoopbackPorts;
 }
 
 export type AdvanceProvision = (operation: InstanceOperation, options: AdvanceOptions) => Promise<ProvisionResult>;
@@ -127,6 +126,8 @@ export interface CliRuntime {
   managedIngressSetup?: RetainedManagedIngressSetupSession;
   /** Upstream's `.env` upsert (`setup/set-env.ts`), which the driver supplies. */
   upsertEnvVars?: UpsertEnvVars;
+  /** Upstream's host readiness helpers (`setup/lib/host-status.mjs`), which the driver supplies. */
+  hostStatus?: HostStatusHelpers;
 }
 
 const COMMON_OPTIONS = ['secrets-file'] as const;
@@ -374,15 +375,15 @@ class Cli {
 
   #advance(operation: InstanceOperation, options: AdvanceOptions): Promise<ProvisionResult> {
     if (this.#runtime.advanceProvision) return this.#runtime.advanceProvision(operation, options);
-    const upsertEnvVars = this.#runtime.upsertEnvVars;
-    if (!upsertEnvVars) {
+    const { upsertEnvVars, hostStatus } = this.#runtime;
+    if (!upsertEnvVars || !hostStatus) {
       throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
     }
     return runProductionProvision(operation, {
       upsertEnvVars,
+      hostStatus,
       interaction: options.interaction,
       runtime: options.runtime,
-      ...(options.portLease ? { portLease: options.portLease } : {}),
       managedIngress: { setupSession: this.#managedIngressSetup },
     });
   }
@@ -433,37 +434,24 @@ class Cli {
     const resolved = await runStep(reporter, { id: 'resolve_release', label: 'Resolving the release…' }, () =>
       (this.#runtime.resolveRelease ?? resolveReleaseCommit)(sourceRemote, `refs/heads/${track}`),
     );
-    const held = await runStep(reporter, { id: 'reserve', label: 'Reserving the assistant…' }, async () => {
-      const lease = await this.#reserve(state, track, sourceRemote, setup, resolved.commit, prerequisites.account);
-      try {
-        await run.assignInstance(instanceId);
-      } catch (error) {
-        await lease.release();
-        throw error;
-      }
-      return lease;
+    await runStep(reporter, { id: 'reserve', label: 'Reserving the assistant…' }, async () => {
+      await this.#reserve(state, track, sourceRemote, setup, resolved.commit, prerequisites.account);
+      await run.assignInstance(instanceId);
     });
 
-    let operation: InstanceOperation | null;
+    const operation = await acquireInstanceOperation(paths, instanceId);
+    if (!operation) throw busy();
     try {
-      operation = await acquireInstanceOperation(paths, instanceId);
-    } catch (error) {
-      await held.release();
-      throw error;
-    }
-    if (!operation) {
-      await held.release();
-      throw busy();
-    }
-    const active = operation;
-    try {
-      return await this.#provision(reporter, active, interaction, held);
+      return await this.#provision(reporter, operation, interaction);
     } finally {
-      await held.release();
-      active.release();
+      operation.release();
     }
   }
 
+  /**
+   * Allocate the instance's ports and reserve it. The ports are held only
+   * until the reservation claims them; each runtime binds its own on start.
+   */
   async #reserve(
     state: AttemptState,
     track: string,
@@ -471,7 +459,7 @@ class Cli {
     setup: CreateSetupAnswers,
     commit: string,
     gcpAccount: string,
-  ): Promise<HeldLoopbackPorts> {
+  ): Promise<void> {
     const paths = this.#paths;
     const instanceId = state.instanceId!;
     const bootstrapManifest = validateProductionBootstrapManifest(setup.bootstrapManifest);
@@ -501,21 +489,14 @@ class Cli {
         }
         throw error;
       }
-    } catch (error) {
+    } finally {
       await held.release();
-      throw error;
     }
-    return held;
   }
 
-  async #provision(
-    reporter: StepReporter,
-    operation: InstanceOperation,
-    interaction: Interaction,
-    portLease?: HeldLoopbackPorts,
-  ): Promise<Outcome> {
+  async #provision(reporter: StepReporter, operation: InstanceOperation, interaction: Interaction): Promise<Outcome> {
     const result = await runStep(reporter, { id: 'provision' }, () =>
-      this.#advance(operation, { interaction, runtime: reporter, ...(portLease ? { portLease } : {}) }),
+      this.#advance(operation, { interaction, runtime: reporter }),
     );
     return result.status === 'paused'
       ? result

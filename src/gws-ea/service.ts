@@ -1,5 +1,6 @@
 import { constants as fsConstants } from 'node:fs';
 import { access, lstat, mkdir, readFile, realpath } from 'node:fs/promises';
+import { userInfo } from 'node:os';
 import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
@@ -79,6 +80,26 @@ export interface InstanceRuntimeInput {
  */
 export type UpsertEnvVars = (values: Record<string, string>, projectRoot: string) => unknown;
 
+/** The options upstream `waitForHost` takes that gws-ea uses. */
+export interface WaitForHostOptions {
+  readonly channel?: string;
+  readonly pid?: number;
+  readonly alive?: () => boolean;
+  readonly timeoutMs?: number;
+}
+
+/**
+ * Upstream `setup/lib/host-status.mjs`, injected by the driver because `src/`
+ * cannot import `setup/`. `queryHost` asks a checkout's running host for its
+ * status over `data/ncl.sock` and throws unless the host identifies that
+ * checkout; `waitForHost` polls it until the host (and a channel) is ready and
+ * throws the last reason, naming the checkout-relative `logs/nanoclaw.error.log`.
+ */
+export interface HostStatusHelpers {
+  readonly queryHost: (root: string, timeoutMs?: number) => Promise<unknown>;
+  readonly waitForHost: (root: string, options?: WaitForHostOptions) => Promise<unknown>;
+}
+
 export type { InstanceServicePlatform } from './service-coordinates.js';
 
 export interface InstanceServiceLayout {
@@ -106,7 +127,14 @@ export interface ServiceLayoutOptions {
 export interface InstanceServiceDependencies extends ServiceLayoutOptions {
   readonly runCommand?: SanitizedCommandRunner;
   readonly uid?: number;
-  readonly beforeBind?: () => Promise<void>;
+  /** Where the user-bus variables are read; absent ones are derived from the UID. */
+  readonly ambientEnv?: NodeJS.ProcessEnv;
+}
+
+/** A (re)started service, with the pid its manager reports when it has one. */
+export interface InstanceServiceStart {
+  readonly layout: InstanceServiceLayout;
+  readonly pid: number | undefined;
 }
 
 export interface InstanceRuntimeDependencies extends InstanceServiceDependencies {
@@ -363,10 +391,12 @@ export function createInstanceServiceLayout(
   };
 }
 
+/** What the service manager starts the launcher with, and what the image build runs under. */
 function serviceEnvironment(config: InstanceRuntimeConfig): Readonly<Record<string, string>> {
   return {
     HOME: config.home_directory,
     PATH: `${SERVICE_PATH}:${path.join(config.home_directory, '.local', 'bin')}`,
+    DOCKER_HOST: config.docker_endpoint,
   };
 }
 
@@ -398,10 +428,85 @@ async function assertExecutable(file: string): Promise<void> {
   await access(file, fsConstants.X_OK);
 }
 
+function requireUid(dependencies: InstanceServiceDependencies): number {
+  const uid = dependencies.uid ?? process.getuid?.();
+  if (uid === undefined) throw new GwsEaError('unsupported_platform', 'The service manager requires a user ID');
+  return uid;
+}
+
+/**
+ * The environment `launchctl`, `systemctl`, and `loginctl` run with. A user
+ * service manager is reached over the user bus, so `systemctl --user` gets
+ * `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS`, derived from the UID when
+ * the caller has none (a non-login shell, sudo, cron).
+ */
+function serviceManagerEnvironment(
+  config: InstanceRuntimeConfig,
+  layout: InstanceServiceLayout,
+  dependencies: InstanceServiceDependencies,
+): Readonly<Record<string, string>> {
+  if (layout.manager !== 'systemd-user') return buildToolEnvironment({}, serviceEnvironment(config));
+  const ambient = dependencies.ambientEnv ?? process.env;
+  const runtimeDirectory = ambient.XDG_RUNTIME_DIR || `/run/user/${requireUid(dependencies)}`;
+  return buildToolEnvironment(
+    {},
+    {
+      ...serviceEnvironment(config),
+      XDG_RUNTIME_DIR: runtimeDirectory,
+      DBUS_SESSION_BUS_ADDRESS: ambient.DBUS_SESSION_BUS_ADDRESS || `unix:path=${runtimeDirectory}/bus`,
+    },
+  );
+}
+
+function servicePid(value: string | undefined): number | undefined {
+  const pid = Number(value?.trim());
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+/** `launchctl bootout` of a job that is not loaded fails in launchd's own words; nothing needed stopping. */
+function notLoaded(error: unknown): boolean {
+  return (
+    error instanceof GwsEaError &&
+    error.code === 'command_failed' &&
+    /No such process|Could not find/iu.test(String(error.details?.stderrTail ?? ''))
+  );
+}
+
+/**
+ * Lingering keeps a user's services running after logout (R10). Enabling it
+ * for oneself needs no password where polkit allows it, so it is enabled
+ * here, once; where it is refused, the operator gets the one command to run.
+ */
+async function ensureLingering(
+  command: (program: string, args: readonly string[]) => Promise<string>,
+  dependencies: InstanceServiceDependencies,
+): Promise<void> {
+  const uid = String(requireUid(dependencies));
+  const lingering = await command('loginctl', ['show-user', uid, '--property', 'Linger', '--value']).then(
+    (value) => value.trim() === 'yes',
+    () => false,
+  );
+  if (lingering) return;
+  await command('loginctl', ['enable-linger']).catch((error: unknown) => {
+    const user = (dependencies.ambientEnv ?? process.env).USER || userInfo().username;
+    throw new GwsEaError(
+      'linger_required',
+      `Could not enable lingering, so this assistant would stop at logout. Run: sudo loginctl enable-linger ${user}, then resume.`,
+      { cause: error },
+    );
+  });
+}
+
+/**
+ * Write the service definition and (re)start it. launchd reloads a changed
+ * definition only through `bootout` then `bootstrap`; `kickstart` without
+ * `-k` then demand-starts a job launchd left pended, without restarting a
+ * running one. systemd user services need lingering to survive logout (R10).
+ */
 export async function reconcileInstanceService(
   configInput: InstanceRuntimeConfig,
   dependencies: InstanceServiceDependencies,
-): Promise<InstanceServiceLayout> {
+): Promise<InstanceServiceStart> {
   const config = validateRuntimeConfig(configInput);
   const layout = createInstanceServiceLayout(config, dependencies);
   await Promise.all([
@@ -412,28 +517,64 @@ export async function reconcileInstanceService(
   await mkdir(path.dirname(layout.serviceDefinitionPath), { recursive: true, mode: 0o700 });
   await writePrivateTextFile(layout.serviceDefinitionPath, renderInstanceService(config, layout));
   const run = dependencies.runCommand ?? runSanitizedCommand;
-  const environment = buildToolEnvironment({}, serviceEnvironment(config));
-  const command = async (program: string, args: readonly string[]): Promise<void> => {
-    await run({ command: program, args, cwd: config.checkout_realpath, env: environment, timeoutMs: 30_000 });
-  };
+  const environment = serviceManagerEnvironment(config, layout, dependencies);
+  const command = async (program: string, args: readonly string[]): Promise<string> =>
+    (await run({ command: program, args, cwd: config.checkout_realpath, env: environment, timeoutMs: 30_000 })).stdout;
   if (layout.manager === 'launchd') {
-    await command('launchctl', ['unload', layout.serviceDefinitionPath]).catch(() => undefined);
-    await dependencies.beforeBind?.();
-    await command('launchctl', ['load', layout.serviceDefinitionPath]);
-    const uid = dependencies.uid ?? process.getuid?.();
-    if (uid === undefined) throw new GwsEaError('unsupported_platform', 'launchd requires a user ID');
-    const domain = `gui/${uid}/${layout.serviceIdentity}`;
-    await command('launchctl', ['kickstart', '-k', domain]);
-    await command('launchctl', ['print', domain]);
+    const domain = `gui/${requireUid(dependencies)}`;
+    await command('launchctl', ['bootout', `${domain}/${layout.serviceIdentity}`]).catch((error: unknown) => {
+      if (!notLoaded(error)) throw error;
+    });
+    await command('launchctl', ['bootstrap', domain, layout.serviceDefinitionPath]);
+    await command('launchctl', ['kickstart', `${domain}/${layout.serviceIdentity}`]);
   } else {
     const prefix = layout.manager === 'systemd-user' ? ['--user'] : [];
+    if (layout.manager === 'systemd-user') await ensureLingering(command, dependencies);
     await command('systemctl', [...prefix, 'daemon-reload']);
     await command('systemctl', [...prefix, 'enable', layout.serviceIdentity]);
-    await dependencies.beforeBind?.();
     await command('systemctl', [...prefix, 'restart', layout.serviceIdentity]);
-    await command('systemctl', [...prefix, 'is-active', layout.serviceIdentity]);
   }
-  return layout;
+  return { layout, pid: await instanceServicePid(config, dependencies) };
+}
+
+/**
+ * The pid of the instance's service process, or undefined when its manager
+ * runs none (not loaded, stopped, or waiting to restart). Liveness uses it to
+ * tell a host that is starting from one that is stopped.
+ */
+export async function instanceServicePid(
+  configInput: InstanceRuntimeConfig,
+  dependencies: InstanceServiceDependencies,
+): Promise<number | undefined> {
+  const config = validateRuntimeConfig(configInput);
+  const layout = createInstanceServiceLayout(config, dependencies);
+  const run = dependencies.runCommand ?? runSanitizedCommand;
+  const args =
+    layout.manager === 'launchd'
+      ? ['print', `gui/${requireUid(dependencies)}/${layout.serviceIdentity}`]
+      : [
+          ...(layout.manager === 'systemd-user' ? ['--user'] : []),
+          'show',
+          layout.serviceIdentity,
+          '--property',
+          'MainPID',
+          '--value',
+        ];
+  let stdout: string;
+  try {
+    ({ stdout } = await run({
+      command: layout.manager === 'launchd' ? 'launchctl' : 'systemctl',
+      args,
+      cwd: config.checkout_realpath,
+      env: serviceManagerEnvironment(config, layout, dependencies),
+      timeoutMs: 30_000,
+    }));
+  } catch (error) {
+    // A manager that cannot report the service runs no process for it; starting it surfaces why.
+    if (error instanceof GwsEaError && error.code === 'command_failed') return undefined;
+    throw error;
+  }
+  return servicePid(layout.manager === 'launchd' ? /^\s*pid = (\d+)\s*$/mu.exec(stdout)?.[1] : stdout);
 }
 
 export function buildInstanceCliCommand(
@@ -475,6 +616,7 @@ export async function buildInstanceHostEnvironment(
   if (!projectNumber) throw new GwsEaError('invalid_runtime_config', 'Google Chat project number is invalid');
   return buildHostEnvironment(ambient, {
     HOME: config.home_directory,
+    DOCKER_HOST: config.docker_endpoint,
     ...instanceHostConfiguration(config),
     ONECLI_API_KEY: onecliRuntimeApiKey.trim(),
     GCHAT_CREDENTIALS: gchatCredentials,
@@ -527,17 +669,13 @@ export async function launchInstanceHost(
 export async function reconcileInstanceRuntime(
   configInput: InstanceRuntimeConfig,
   dependencies: InstanceRuntimeDependencies,
-): Promise<InstanceServiceLayout> {
+): Promise<InstanceServiceStart> {
   const config = validateRuntimeConfig(configInput);
   await persistInstanceRuntime(config, dependencies.upsertEnvVars);
   const run = dependencies.runCommand ?? runSanitizedCommand;
   const environment = buildToolEnvironment(
     {},
-    {
-      HOME: config.home_directory,
-      PATH: `${SERVICE_PATH}:${path.join(config.home_directory, '.local', 'bin')}`,
-      NANOCLAW_INSTALL_ID: config.install_id,
-    },
+    { ...serviceEnvironment(config), NANOCLAW_INSTALL_ID: config.install_id },
   );
   const packageManifest = requireRecord(
     parseJson(

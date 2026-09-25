@@ -34,6 +34,8 @@ import { GwsEaError, PROVISION_STEPS, type InstanceReservationInput } from './ty
 
 const roots: string[] = [];
 const TOKEN = 'cf-account-token-canary';
+/** The Docker endpoint the assistant recorded, which the connector runs against. */
+const DOCKER_ENDPOINT = 'unix:///run/user/1000/docker.sock';
 const ACCOUNT_ID = '699d98642c564d2e855e9661899b7252';
 const ZONE_ID = '023e105f4ecef8ad9ca31a8372d0c353';
 const TUNNEL_ID = 'f70ff985-a4ef-4643-bbbc-4a0ed4fc8415';
@@ -241,6 +243,8 @@ interface FakeContainer {
 /** Docker as the connector sees it: the container is built from the rendered Compose file. */
 class FakeDocker {
   readonly calls: string[][] = [];
+  /** The Docker endpoint each call targeted. */
+  readonly endpoints: Array<string | undefined> = [];
   readonly images = new Set<string>();
   container: FakeContainer | undefined;
   upUnderMachineLock: boolean[] = [];
@@ -253,6 +257,7 @@ class FakeDocker {
   readonly run = async (command: SanitizedCommand): Promise<{ stdout: string; stderr: string }> => {
     const args = [...command.args];
     this.calls.push(args);
+    this.endpoints.push(command.env?.DOCKER_HOST);
     const words = args.filter((arg) => !arg.startsWith('-'));
     if (args[0] === 'container' && args[1] === 'ls') return { stdout: this.container ? 'c0ffee\n' : '', stderr: '' };
     if (args[0] === 'container' && args[1] === 'inspect') {
@@ -410,6 +415,7 @@ async function transportFixture(
         claim,
         platform: 'linux',
         webhookPort: registry.instances[instanceId]!.allocated_ports.nanoclaw_webhook,
+        dockerEndpoint: DOCKER_ENDPOINT,
         accountToken: async (reason) => {
           tokenRequests.push(reason);
           return TOKEN;
@@ -807,6 +813,7 @@ describe('managed Cloudflare transport step', () => {
       expect.arrayContaining(['up', '--detach', '--force-recreate']),
     ]);
     expect(world.docker.upUnderMachineLock).toEqual([true]);
+    expect(new Set(world.docker.endpoints)).toEqual(new Set([DOCKER_ENDPOINT]));
     expect(JSON.stringify(world.docker.calls)).not.toContain(`tunnel-token-${TUNNEL_ID}`);
     expect(world.route.probes).toEqual([
       'POST http://127.0.0.1:31100/webhook/gchat',

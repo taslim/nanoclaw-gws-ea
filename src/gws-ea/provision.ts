@@ -2,7 +2,6 @@ import Database from 'better-sqlite3';
 import { existsSync } from 'node:fs';
 import { mkdir, rmdir } from 'node:fs/promises';
 import path from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
 
 import {
   readProvisionJournal,
@@ -24,23 +23,23 @@ import { assertReleaseCheckoutAgreement, materializeReleaseCheckout, type Resolv
 import { runReleasePreflight, type ReleasePreflightInput, type ReleasePreflightResult } from './release-preflight.js';
 import {
   importProviderCredential,
-  inspectOnecliRuntime,
+  observeOnecliRuntime,
   persistOnecliApiKeyFiles,
   reconcileOnecliRuntime,
-  validateObservedOnecliRuntime,
+  verifyOnecliRuntime,
   onecliSecretMatchesCredentialMetadata,
-  type OnecliCompatibilityReceipt,
+  type OnecliRuntimeReceipt,
   type OnecliRuntimeDependencies,
-  type ObservedOnecliRuntime,
 } from './onecli.js';
-import type { OnecliRuntimeLayout } from './onecli-compose.js';
-import { createOnecliRuntimeLayout } from './onecli-compose.js';
+import { createOnecliRuntimeLayout, type OnecliPins, type OnecliRuntimeLayout } from './onecli-compose.js';
 import {
   reconcileInstanceRuntime,
   runInstanceOnecliAdminCommand,
   createInstanceRuntimeConfig,
   googleChatProjectNumberFile,
+  instanceServicePid,
   loadInstanceRuntimeConfig,
+  type HostStatusHelpers,
   type InstanceRuntimeConfig,
   type InstanceRuntimeDependencies,
   type UpsertEnvVars,
@@ -61,7 +60,7 @@ import { readOwnerOnlyFile, readOwnerOnlyJson, removePrivateFile, writePrivateTe
 import { assertInstanceId, getInstanceReservation } from './registry.js';
 import { isErrno } from '../community-portal/errors.js';
 import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
-import { holdReservedLoopbackPorts, type AllocatedPortName, type LoopbackPortLease } from './ports.js';
+import { findPortHolder, portInUseError } from './ports.js';
 import {
   GwsEaError,
   ingressEndpointUrl,
@@ -101,7 +100,8 @@ import { managedTransportResources } from './cloudflare-ingress.js';
 export interface ProductionProvisionOptions {
   /** Upstream's `.env` upsert, injected by the driver (`src/` cannot import `setup/`). */
   readonly upsertEnvVars: UpsertEnvVars;
-  readonly portLease?: ProvisionPortLease;
+  /** Upstream's host readiness helpers, injected by the driver. */
+  readonly hostStatus: HostStatusHelpers;
   /** Human input: credentials, sign-in, and decisions supplied on re-entry. */
   readonly interaction?: Interaction;
   readonly managedIngress?: {
@@ -109,8 +109,6 @@ export interface ProductionProvisionOptions {
   };
   readonly runtime?: ProvisionRuntime;
 }
-
-export type ProvisionPortLease = LoopbackPortLease;
 
 export interface ProductionProvisionInput {
   readonly release: ResolvedRelease;
@@ -134,14 +132,14 @@ export interface ProductionProvisionInput {
   readonly onecliDependencies?: OnecliRuntimeDependencies;
   readonly identityDependencies?: MainIdentityDependencies;
   readonly principalDependencies?: PrincipalDiscoveryDependencies;
-  readonly portLease?: ProvisionPortLease;
+  readonly hostStatus: HostStatusHelpers;
   readonly ingress: IngressClaim;
   readonly managedIngressSetup?: Pick<RetainedManagedIngressSetupSession, 'requireAccountToken'>;
   readonly requestCloudflareAccountToken?: (accountId: string, observation: string) => Promise<string>;
 }
 
 export interface ProductionProvisionState {
-  onecliReceipt?: OnecliCompatibilityReceipt;
+  onecliReceipt?: OnecliRuntimeReceipt;
   providerSecretId?: string;
   mainAgentGroupId?: string;
   principal?: PrincipalCandidate;
@@ -165,30 +163,31 @@ export interface ProductionProvisionDependencies {
   readonly getOwnedGcpProjectNumber: typeof getOwnedGcpProjectNumber;
   readonly observeOnecli: Observe;
   readonly reconcileOnecliRuntime: typeof reconcileOnecliRuntime;
-  readonly inspectOnecliRuntime: (layout: OnecliRuntimeLayout) => Promise<ObservedOnecliRuntime>;
-  readonly validateObservedOnecliRuntime: typeof validateObservedOnecliRuntime;
+  readonly verifyOnecliRuntime: typeof verifyOnecliRuntime;
   readonly persistOnecliApiKeyFiles: typeof persistOnecliApiKeyFiles;
   readonly observeProvider: Observe;
   readonly importProviderCredential: typeof importProviderCredential;
   /** Main's published identity and access, observed through the running host. */
   readonly observeMainIdentity: Observe;
   readonly reconcileInstanceRuntime: typeof reconcileInstanceRuntime;
+  /** Tells a host that is starting (its service runs a process) from one that is stopped. */
+  readonly instanceServicePid: typeof instanceServicePid;
+  /** Names the process on a port when the host does not come up. */
+  readonly findPortHolder: typeof findPortHolder;
   readonly reconcileMainIdentity: typeof reconcileMainIdentity;
   readonly verifyRoute: typeof verifyExistingGchatRoute;
   readonly verifyEndpoint: typeof verifyExistingGchatEndpoint;
   readonly verifyPrincipalBinding: (input: PrincipalBindingVerificationInput) => PrincipalBindingVerificationResult;
   readonly reconcilePrincipal: typeof reconcilePrincipalDm;
   readonly verifyConversation: (input: ConversationVerificationInput) => ConversationVerificationResult;
-  readonly holdReservedLoopbackPorts: typeof holdReservedLoopbackPorts;
   /** `establish_transport`'s resources in managed mode (KTD6). */
   readonly managedTransportResources: typeof managedTransportResources;
-  readonly nanoclawStartupDelay: (milliseconds: number) => Promise<void>;
 }
 
 async function defaultObserveCheckout(context: ProductionProvisionContext): Promise<Observation> {
   try {
     await assertReleaseCheckoutAgreement(context.operation.paths, context.operation.instanceId);
-    await assertReleasePreflightReceipt(context);
+    await instanceReleaseReceipt(context);
     return PRESENT;
   } catch (error) {
     if (error instanceof GwsEaError && ['marker_missing', 'checkout_exists', 'unsafe_checkout'].includes(error.code)) {
@@ -228,10 +227,11 @@ function credentialMetadataRecord(value: unknown): ProviderCredentialMetadata {
 }
 
 /**
- * The receipt records what create's release preflight established. It names
- * the OneCLI cohort the release was checked against, but resume never
- * compares it with this launcher's pins: a launcher upgrade must not block an
- * instance it did not create (Appendix B #11).
+ * The receipt records what create's release preflight established, including
+ * the OneCLI cohort the release pinned. The instance's OneCLI runtime runs
+ * that cohort; resume never compares it with this launcher's pins, so a
+ * launcher upgrade neither blocks nor upgrades an instance it did not create
+ * (Appendix B #11).
  */
 function validateReleasePreflightReceipt(
   value: unknown,
@@ -284,14 +284,21 @@ async function loadReleasePreflightReceipt(
   );
 }
 
-async function assertReleasePreflightReceipt(context: ProductionProvisionContext): Promise<void> {
-  await loadReleasePreflightReceipt(context.operation.paths.releasePreflightFile(context.operation.instanceId), {
+/** The receipt create's release preflight wrote for this instance, checked against it. */
+function instanceReleaseReceipt(context: ProductionProvisionContext): Promise<ReleasePreflightReceipt> {
+  return loadReleasePreflightReceipt(context.operation.paths.releasePreflightFile(context.operation.instanceId), {
     instanceId: context.operation.instanceId,
     deployedCommit: context.input.release.commit,
     provider: context.input.releasePreflight.provider,
     providerCapabilityDigest: context.input.releasePreflight.providerCapabilityDigest,
     providerCredential: context.input.releasePreflight.providerCredential,
   });
+}
+
+/** The OneCLI versions this instance's release pinned: its runtime runs these, not the launcher's. */
+async function instanceOnecliPins(context: ProductionProvisionContext): Promise<OnecliPins> {
+  const { onecli } = await instanceReleaseReceipt(context);
+  return { gateway: onecli.gateway, cli: onecli.cli };
 }
 
 async function persistReleasePreflightReceipt(
@@ -329,20 +336,27 @@ async function ensureReleaseCheckout(
   await persistReleasePreflightReceipt(context, result);
 }
 
+/** The OneCLI runtime at the instance's pins, and the API key files the host and admin commands read. */
 async function defaultObserveOnecli(context: ProductionProvisionContext): Promise<Observation> {
-  try {
-    const observed = await inspectOnecliRuntime(context.input.onecli);
-    validateObservedOnecliRuntime(context.input.onecli, observed);
-    const [runtimeKey, adminKey] = await Promise.all([
-      readOwnerOnlyFile(context.input.runtime.secret_files.onecli_runtime_api_key),
-      readOwnerOnlyFile(context.input.runtime.secret_files.onecli_admin_api_key),
-    ]);
-    if (!runtimeKey.trim() || runtimeKey.trim() !== adminKey.trim()) return ABSENT;
-    return PRESENT;
-  } catch (error) {
-    if (error instanceof GwsEaError && error.code.startsWith('unsafe_')) throw error;
-    return ABSENT;
-  }
+  const seen = await observeOnecliRuntime(
+    context.input.onecli,
+    await instanceOnecliPins(context),
+    context.input.onecliDependencies,
+  );
+  if (seen.status !== 'present') return seen;
+  const read = (file: string): Promise<string> =>
+    readOwnerOnlyFile(file).then(
+      (value) => value.trim(),
+      (error: unknown) => {
+        if (isErrno(error, 'ENOENT')) return '';
+        throw error;
+      },
+    );
+  const { onecli_runtime_api_key: runtimeFile, onecli_admin_api_key: adminFile } = context.input.runtime.secret_files;
+  const [runtimeKey, adminKey] = await Promise.all([read(runtimeFile), read(adminFile)]);
+  return runtimeKey && runtimeKey === adminKey
+    ? PRESENT
+    : { status: 'absent', reason: 'its API key files are missing' };
 }
 
 async function defaultObserveProvider(context: ProductionProvisionContext): Promise<Observation> {
@@ -386,48 +400,102 @@ async function runNanoclawProbeNcl(context: ProductionProvisionContext, args: re
   return run(context.input.runtime, args);
 }
 
-async function observeInstanceHost(context: ProductionProvisionContext): Promise<boolean> {
-  let status: unknown;
-  try {
-    status = unwrapData(await runNanoclawProbeNcl(context, ['status']));
-  } catch (error) {
-    if (error instanceof GwsEaError && ['command_failed', 'command_timeout', 'ncl_failed'].includes(error.code)) {
-      return false;
-    }
-    throw error;
-  }
-  if (!isRecord(status) || typeof status.project_root !== 'string') {
-    throw new GwsEaError('invalid_child_output', 'NanoClaw returned invalid host status');
-  }
-  if (status.project_root !== context.input.runtime.checkout_realpath) {
-    throw new GwsEaError('unsafe_runtime', 'NanoClaw status belongs to a different checkout');
-  }
-  if (status.webhook === null) return false;
-  if (!isRecord(status.webhook) || !Array.isArray(status.webhook.paths) || !Array.isArray(status.channels)) {
-    throw new GwsEaError('invalid_child_output', 'NanoClaw returned invalid webhook status');
-  }
-  if (status.webhook.port !== context.input.runtime.allocated_ports.nanoclaw_webhook) {
-    throw new GwsEaError('unsafe_runtime', 'NanoClaw is listening on an unexpected webhook port');
-  }
-  return (
-    status.webhook.paths.includes('/webhook/gchat') &&
-    status.channels.some(
-      (channel) =>
-        isRecord(channel) && channel.instance === 'gchat' && channel.type === 'gchat' && channel.connected === true,
-    )
+/** How long a (re)started host may take to answer and connect Google Chat. */
+const HOST_READY_TIMEOUT_MS = 60_000;
+
+/** Upstream's messages name the checkout-relative error log; point at this instance's. */
+function hostReason(error: unknown, runtime: InstanceRuntimeConfig): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.replaceAll(
+    'logs/nanoclaw.error.log',
+    path.join(runtime.checkout_realpath, 'logs', 'nanoclaw.error.log'),
   );
 }
 
-async function waitForInstanceHost(
+/**
+ * The host as its own status reports it (upstream `queryHost`, which accepts
+ * only a host identifying this checkout). A host that does not answer is
+ * starting while its service runs a process, and stopped otherwise; one that
+ * answers is present once it serves the Google Chat webhook on its allocated
+ * port with the channel connected, and still starting until then.
+ */
+async function observeInstanceHost(
   context: ProductionProvisionContext,
-  sleep: (milliseconds: number) => Promise<void>,
-  attempts: number,
-): Promise<boolean> {
-  for (let attempt = 0; attempt < attempts; attempt++) {
-    if (await observeInstanceHost(context)) return true;
-    if (attempt + 1 < attempts) await sleep(1_000);
+  dependencies: ProductionProvisionDependencies,
+): Promise<Observation> {
+  const { runtime, hostStatus, serviceDependencies } = context.input;
+  const errorLog = path.join(runtime.checkout_realpath, 'logs', 'nanoclaw.error.log');
+  let status: unknown;
+  try {
+    status = await hostStatus.queryHost(runtime.checkout_realpath);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- Upstream queryHost reports every failure as a plain Error meaning the host is not answering; its service manager then tells starting from stopped.
+  } catch (error) {
+    const pid = await dependencies.instanceServicePid(runtime, serviceDependencies);
+    if (pid === undefined) return { status: 'absent', reason: 'its service is not running' };
+    return {
+      status: 'unknown',
+      reason: `The assistant is starting (pid ${pid})`,
+      evidence: `${hostReason(error, runtime)}; see ${errorLog}`,
+    };
   }
-  return false;
+  const webhook = isRecord(status) ? status.webhook : undefined;
+  const channels = isRecord(status) && Array.isArray(status.channels) ? status.channels : [];
+  const pid = isRecord(status) ? status.pid : undefined;
+  if (isRecord(webhook) && webhook.port !== runtime.allocated_ports.nanoclaw_webhook) {
+    throw new GwsEaError('unsafe_runtime', 'NanoClaw is listening on an unexpected webhook port');
+  }
+  const starting = (reason: string): Observation => ({
+    status: 'unknown',
+    reason,
+    evidence: `host pid ${String(pid)}; see ${errorLog}`,
+  });
+  if (!isRecord(webhook) || !Array.isArray(webhook.paths) || !webhook.paths.includes('/webhook/gchat')) {
+    return starting('The assistant has not opened its Google Chat webhook yet');
+  }
+  if (!channels.some((channel) => isRecord(channel) && channel.instance === 'gchat' && channel.connected === true)) {
+    return starting('Channel gchat is not connected in the running host');
+  }
+  return PRESENT;
+}
+
+/**
+ * Start the host and wait, with upstream `waitForHost`, until it answers and
+ * connects Google Chat. A host that does not become ready stops the run with
+ * its reason; when a process other than the host holds the webhook port, that
+ * process is named instead. The port is never bound here to test it: the
+ * host's own status says whose it is.
+ */
+async function startInstanceHost(
+  context: ProductionProvisionContext,
+  dependencies: ProductionProvisionDependencies,
+  emit: ProvisionRuntime['emit'],
+): Promise<void> {
+  const { runtime, hostStatus, serviceDependencies } = context.input;
+  const { pid } = await dependencies.reconcileInstanceRuntime(runtime, serviceDependencies);
+  emit?.({ type: 'step-waiting', step: 'start_nanoclaw', reason: 'Waiting for the assistant to connect Google Chat…' });
+  try {
+    await hostStatus.waitForHost(runtime.checkout_realpath, {
+      channel: 'gchat',
+      ...(pid === undefined ? {} : { pid, alive: () => processAlive(pid) }),
+      timeoutMs: HOST_READY_TIMEOUT_MS,
+    });
+  } catch (error) {
+    const port = runtime.allocated_ports.nanoclaw_webhook;
+    const holder = await dependencies.findPortHolder(port);
+    if (holder && holder.pid !== pid) throw portInUseError('webhook', port, holder, error);
+    throw new GwsEaError('nanoclaw_not_ready', hostReason(error, runtime), { cause: error });
+  }
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (isErrno(error, 'ESRCH')) return false;
+    if (isErrno(error, 'EPERM')) return true;
+    throw error;
+  }
 }
 
 async function runNanoclawProbeOnecli(context: ProductionProvisionContext, args: readonly string[]): Promise<unknown> {
@@ -532,96 +600,22 @@ const defaultProductionDependencies: ProductionProvisionDependencies = {
   getOwnedGcpProjectNumber,
   observeOnecli: defaultObserveOnecli,
   reconcileOnecliRuntime,
-  inspectOnecliRuntime,
-  validateObservedOnecliRuntime,
+  verifyOnecliRuntime,
   persistOnecliApiKeyFiles,
   observeProvider: defaultObserveProvider,
   importProviderCredential,
   observeMainIdentity: defaultObserveMainIdentity,
   reconcileInstanceRuntime,
+  instanceServicePid,
+  findPortHolder,
   reconcileMainIdentity,
   verifyRoute: verifyExistingGchatRoute,
   verifyEndpoint: verifyExistingGchatEndpoint,
   verifyPrincipalBinding,
   reconcilePrincipal: reconcilePrincipalDm,
   verifyConversation: verifyTalkableConversation,
-  holdReservedLoopbackPorts,
   managedTransportResources,
-  nanoclawStartupDelay: delay,
 };
-
-async function withRuntimePortLease<T>(
-  context: ProductionProvisionContext,
-  names: readonly AllocatedPortName[],
-  claim: typeof holdReservedLoopbackPorts,
-  effect: (beforeBind: () => Promise<void>) => Promise<T>,
-): Promise<T> {
-  const lease =
-    context.input.portLease ??
-    (await claim(context.operation.instanceId, context.input.runtime.allocated_ports, names));
-  let releasePromise: Promise<void> | undefined;
-  const releaseBeforeBind = (): Promise<void> => {
-    releasePromise ??= lease.release(names);
-    return releasePromise;
-  };
-  try {
-    return await effect(releaseBeforeBind);
-  } finally {
-    await releaseBeforeBind().catch(() => undefined);
-  }
-}
-
-function beforeOnecliBind(
-  dependencies: OnecliRuntimeDependencies | undefined,
-  releaseLease: () => Promise<void>,
-): OnecliRuntimeDependencies {
-  return {
-    ...dependencies,
-    beforeBind: async () => {
-      await dependencies?.beforeBind?.();
-      await releaseLease();
-    },
-  };
-}
-
-function beforeNanoclawBind(
-  dependencies: InstanceRuntimeDependencies,
-  releaseLease: () => Promise<void>,
-): InstanceRuntimeDependencies {
-  return {
-    ...dependencies,
-    beforeBind: async () => {
-      await dependencies.beforeBind?.();
-      await releaseLease();
-    },
-  };
-}
-
-async function ensureInstanceHostStarted(
-  context: ProductionProvisionContext,
-  dependencies: ProductionProvisionDependencies,
-): Promise<void> {
-  if (await observeInstanceHost(context)) return;
-  try {
-    await withRuntimePortLease(context, ['nanoclaw_webhook'], dependencies.holdReservedLoopbackPorts, (releaseLease) =>
-      dependencies.reconcileInstanceRuntime(
-        context.input.runtime,
-        beforeNanoclawBind(context.input.serviceDependencies, releaseLease),
-      ),
-    );
-  } catch (error) {
-    if (
-      !(error instanceof GwsEaError) ||
-      !['port_claim_lost', 'command_failed', 'command_timeout'].includes(error.code) ||
-      !(await waitForInstanceHost(context, dependencies.nanoclawStartupDelay, 5))
-    ) {
-      throw error;
-    }
-  }
-  if (!(await waitForInstanceHost(context, dependencies.nanoclawStartupDelay, 20))) {
-    throw new GwsEaError('nanoclaw_not_ready', 'NanoClaw did not become ready; resume after checking its service log');
-  }
-}
 
 function humanPause(phase: ProvisionStepId, code: string, message: string): ProvisionHumanPause {
   return { kind: 'human-action', phase, code, message };
@@ -763,7 +757,7 @@ export function createProductionProvisionSteps(
 
   const retainOnecliReceipt = async (
     value: ProductionProvisionContext,
-    receipt: OnecliCompatibilityReceipt,
+    receipt: OnecliRuntimeReceipt,
   ): Promise<void> => {
     value.state.onecliReceipt = receipt;
     await dependencies.persistOnecliApiKeyFiles(receipt, {
@@ -819,32 +813,17 @@ export function createProductionProvisionSteps(
       resources: [
         {
           name: 'the OneCLI runtime',
+          absentMeansStopped: true,
           observe: dependencies.observeOnecli,
           apply: async (value) => {
-            let receipt: OnecliCompatibilityReceipt;
-            try {
-              receipt = await withRuntimePortLease(
-                value,
-                ['onecli_app', 'onecli_gateway'],
-                dependencies.holdReservedLoopbackPorts,
-                (releaseLease) =>
-                  dependencies.reconcileOnecliRuntime(
-                    value.input.onecli,
-                    beforeOnecliBind(value.input.onecliDependencies, releaseLease),
-                  ),
-              );
-            } catch (error) {
-              if (!(error instanceof GwsEaError) || error.code !== 'port_claim_lost') throw error;
-              let observed: ObservedOnecliRuntime;
-              try {
-                observed = await dependencies.inspectOnecliRuntime(value.input.onecli);
-              } catch {
-                throw error;
-              }
-              dependencies.validateObservedOnecliRuntime(value.input.onecli, observed);
-              receipt = await dependencies.reconcileOnecliRuntime(value.input.onecli, value.input.onecliDependencies);
-            }
-            await retainOnecliReceipt(value, receipt);
+            await retainOnecliReceipt(
+              value,
+              await dependencies.reconcileOnecliRuntime(
+                value.input.onecli,
+                await instanceOnecliPins(value),
+                value.input.onecliDependencies,
+              ),
+            );
             return undefined;
           },
         },
@@ -874,7 +853,11 @@ export function createProductionProvisionSteps(
             }
             const receipt =
               value.state.onecliReceipt ??
-              (await dependencies.reconcileOnecliRuntime(value.input.onecli, value.input.onecliDependencies));
+              (await dependencies.verifyOnecliRuntime(
+                value.input.onecli,
+                await instanceOnecliPins(value),
+                value.input.onecliDependencies,
+              ));
             await retainOnecliReceipt(value, receipt);
             const imported = await dependencies.importProviderCredential(
               receipt,
@@ -893,11 +876,12 @@ export function createProductionProvisionSteps(
       resources: [
         {
           name: 'the NanoClaw host',
-          observe: async (value) => ((await observeInstanceHost(value)) ? PRESENT : ABSENT),
+          absentMeansStopped: true,
+          observe: (value) => observeInstanceHost(value, dependencies),
           apply: async (value) => {
             await ensureGchatCredential(value);
             await ensureGchatProjectNumber(value, dependencies);
-            await ensureInstanceHostStarted(value, dependencies);
+            await startInstanceHost(value, dependencies, runtime.emit);
             return undefined;
           },
         },
@@ -955,6 +939,7 @@ export function createProductionProvisionSteps(
               claim: ingress,
               platform: input.serviceDependencies.platform,
               webhookPort: input.runtime.allocated_ports.nanoclaw_webhook,
+              dockerEndpoint: input.runtime.docker_endpoint,
               accountToken: (reason) => requireManagedAccountToken(context, ingress.account_id, reason),
             }),
           },
@@ -1289,6 +1274,7 @@ export async function runProductionProvision(
       appPort: reservation.allocated_ports.onecli_app,
       gatewayPort: reservation.allocated_ports.onecli_gateway,
       cliExecutable: manifest.onecli_cli_path,
+      dockerEndpoint: manifest.docker_endpoint,
     });
     runtime = createInstanceRuntimeConfig(reservation, onecli, {
       nodePath: manifest.node_path,
@@ -1304,6 +1290,7 @@ export async function runProductionProvision(
     appPort: reservation.allocated_ports.onecli_app,
     gatewayPort: reservation.allocated_ports.onecli_gateway,
     cliExecutable: runtime.onecli_cli_path,
+    dockerEndpoint: runtime.docker_endpoint,
   });
   const persistedPreflight = manifest
     ? undefined
@@ -1396,7 +1383,7 @@ export async function runProductionProvision(
           return candidate;
         },
       },
-      ...(options.portLease ? { portLease: options.portLease } : {}),
+      hostStatus: options.hostStatus,
       ingress: reservation.exclusive_resource_claims.ingress,
       ...(managedIngress?.setupSession ? { managedIngressSetup: managedIngress.setupSession } : {}),
       ...(interaction

@@ -40,7 +40,9 @@ import {
   preparePrivateDirectory,
   type ControlPlanePaths,
 } from './paths.js';
+import { resolveDockerEndpoint } from './prerequisites.js';
 import { buildToolEnvironment, runSanitizedCommand, runSanitizedCommandOutcome } from './process.js';
+import { recordedDockerEndpoint } from './provision.js';
 import {
   activeRemovalInstanceIds,
   assertInstanceId,
@@ -780,7 +782,8 @@ async function deleteGcpProject(reservation: InstanceReservation): Promise<void>
   });
 }
 
-async function removeOnecli(reservation: InstanceReservation): Promise<void> {
+/** OneCLI is removed through the Docker endpoint the instance recorded, else the active local one. */
+async function removeOnecli(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<void> {
   const claims = reservation.exclusive_resource_claims;
   await removeOnecliRuntime(
     createOnecliRuntimeLayout({
@@ -790,6 +793,7 @@ async function removeOnecli(reservation: InstanceReservation): Promise<void> {
       appPort: reservation.allocated_ports.onecli_app,
       gatewayPort: reservation.allocated_ports.onecli_gateway,
       cliExecutable: '/usr/local/bin/onecli',
+      dockerEndpoint: (await recordedDockerEndpoint(paths, reservation)) ?? (await resolveDockerEndpoint()),
     }),
   );
 }
@@ -858,7 +862,7 @@ export async function removeAssistant(
       (dependencies.deleteGcpProject ?? deleteGcpProject)(receipt.reservation),
     );
     receipt = await completePhase(paths, receipt, 'onecli', () =>
-      (dependencies.removeOnecli ?? removeOnecli)(receipt.reservation),
+      (dependencies.removeOnecli ?? ((reservation) => removeOnecli(paths, reservation)))(receipt.reservation),
     );
     receipt = await completePhase(paths, receipt, 'instance_files', () =>
       dependencies.removeInstanceFiles

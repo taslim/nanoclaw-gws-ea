@@ -99,6 +99,8 @@ export interface ObservedCloudflareConnector {
 export interface CloudflareConnectorDependencies {
   readonly runCommand?: SanitizedCommandRunner;
   readonly ambientEnv?: NodeJS.ProcessEnv;
+  /** The Docker endpoint the assistant recorded (KTD3); without one, Docker's active context. */
+  readonly dockerEndpoint?: string;
 }
 
 export function createCloudflareConnectorLayout(input: CloudflareConnectorLayoutInput): CloudflareConnectorLayout {
@@ -193,8 +195,14 @@ export function buildCloudflareComposeInvocation(
   };
 }
 
-function connectorEnvironment(ambient: NodeJS.ProcessEnv = process.env): Readonly<Record<string, string>> {
-  const environment = buildToolEnvironment(ambient);
+function connectorEnvironment(
+  dependencies: Pick<CloudflareConnectorDependencies, 'ambientEnv' | 'dockerEndpoint'> = {},
+): Readonly<Record<string, string>> {
+  const ambient = dependencies.ambientEnv ?? process.env;
+  const environment = buildToolEnvironment(
+    ambient,
+    dependencies.dockerEndpoint === undefined ? {} : { DOCKER_HOST: dependencies.dockerEndpoint },
+  );
   if (ambient.HOME !== undefined) environment.HOME = ambient.HOME;
   return environment;
 }
@@ -345,7 +353,7 @@ export async function observeCloudflareConnector(
   dependencies: CloudflareConnectorDependencies = {},
 ): Promise<Observation> {
   const runner = dependencies.runCommand ?? runSanitizedCommand;
-  const environment = connectorEnvironment(dependencies.ambientEnv);
+  const environment = connectorEnvironment(dependencies);
   const observed = await inspectCloudflareConnector(layout, runner, environment);
   if (!observed) return { status: 'absent', reason: 'it has not been created' };
   assertCloudflareConnectorOwnership(layout, observed);
@@ -377,7 +385,7 @@ export async function repairCloudflareConnector(
   dependencies: CloudflareConnectorDependencies = {},
 ): Promise<void> {
   const runner = dependencies.runCommand ?? runSanitizedCommand;
-  const environment = connectorEnvironment(dependencies.ambientEnv);
+  const environment = connectorEnvironment(dependencies);
   const token = await requireStoredToken(layout);
   const before = await inspectCloudflareConnector(layout, runner, environment);
   if (before) assertCloudflareConnectorOwnership(layout, before);
@@ -411,7 +419,7 @@ export async function stopCloudflareConnector(
   dependencies: CloudflareConnectorDependencies = {},
 ): Promise<void> {
   const runner = dependencies.runCommand ?? runSanitizedCommand;
-  const environment = connectorEnvironment(dependencies.ambientEnv);
+  const environment = connectorEnvironment(dependencies);
   const existing = await inspectCloudflareConnector(layout, runner, environment);
   if (existing === undefined) return;
   assertCloudflareConnectorOwnership(layout, existing);
