@@ -268,7 +268,10 @@ describe('recorded divergence: a repeated welcome event ID is delivered once', (
   const tsxLoader = path.join(CONTROL_PLANE_ROOT, 'node_modules', 'tsx', 'dist', 'loader.mjs');
   const initFirstAgent = path.join(CONTROL_PLANE_ROOT, 'scripts', 'init-first-agent.ts');
 
-  function welcome(cwd: string): Promise<{ readonly status: number | null; readonly stderr: string }> {
+  function welcome(
+    cwd: string,
+    eventId: readonly string[] = ['--event-id', 'gws-ea-welcome:divergence-guard'],
+  ): Promise<{ readonly status: number | null; readonly stderr: string }> {
     return new Promise((resolve) => {
       const child = spawn(
         process.execPath,
@@ -284,8 +287,7 @@ describe('recorded divergence: a repeated welcome event ID is delivered once', (
           'gchat:spaces/principal-dm',
           '--display-name',
           'Principal',
-          '--event-id',
-          'gws-ea-welcome:divergence-guard',
+          ...eventId,
         ],
         { cwd, stdio: ['ignore', 'ignore', 'pipe'] },
       );
@@ -297,7 +299,8 @@ describe('recorded divergence: a repeated welcome event ID is delivered once', (
     });
   }
 
-  it('queues one welcome when init-first-agent retries with the same --event-id', async () => {
+  /** Run init-first-agent twice against a host's CLI transport; the ids of main's queued messages. */
+  async function welcomeTwice(eventId?: readonly string[]): Promise<{ agentGroupId: string; queued: unknown[] }> {
     const install = await freshInstall();
     const { CENTRAL_DB_PATH, DATA_DIR } = await import('../config.js');
     const { closeDb, getDb, initDb } = await import('../db/connection.js');
@@ -309,13 +312,20 @@ describe('recorded divergence: a repeated welcome event ID is delivered once', (
     let database: Promise<unknown> | undefined;
     const routed: Promise<void>[] = [];
     // The host's wiring for the CLI admin transport (src/index.ts).
-    await initChannelAdapters(() => ({
+    await initChannelAdapters((adapter) => ({
       onInbound() {},
       onInboundEvent(event: InboundEvent) {
         database ??= initDb(CENTRAL_DB_PATH);
         routed.push(
           database.then(() =>
-            routeInbound({ ...event, message: { ...event.message, authenticatedSender: undefined } }),
+            routeInbound({
+              ...event,
+              message: {
+                ...event.message,
+                authenticatedSender: undefined,
+                deduplicate: adapter.channelType === 'cli' ? event.message.deduplicate : undefined,
+              },
+            }),
           ),
         );
       },
@@ -328,7 +338,7 @@ describe('recorded divergence: a repeated welcome event ID is delivered once', (
     });
 
     for (const attempt of [1, 2]) {
-      const run = await welcome(install);
+      const run = await welcome(install, eventId);
       expect(run, `attempt ${attempt}: ${run.stderr}`).toMatchObject({ status: 0 });
       await vi.waitFor(() => expect(routed).toHaveLength(attempt));
       await Promise.all(routed);
@@ -343,12 +353,63 @@ describe('recorded divergence: a repeated welcome event ID is delivered once', (
       { readonly: true },
     );
     try {
-      expect(inbound.prepare('SELECT id FROM messages_in').all()).toEqual([
-        { id: `gws-ea-welcome:divergence-guard:${sessions[0]!.agent_group_id}` },
-      ]);
+      return {
+        agentGroupId: sessions[0]!.agent_group_id,
+        queued: inbound.prepare('SELECT id FROM messages_in ORDER BY seq').all(),
+      };
     } finally {
       inbound.close();
     }
+  }
+
+  it('queues one welcome when init-first-agent retries with the same --event-id', async () => {
+    const { agentGroupId, queued } = await welcomeTwice();
+    expect(queued).toEqual([{ id: `gws-ea-welcome:divergence-guard:${agentGroupId}` }]);
+  });
+
+  it("leaves upstream's welcome unchanged without --event-id: every run queues a fresh one", async () => {
+    const { queued } = await welcomeTwice([]);
+    expect(queued).toHaveLength(2);
+    expect(queued).not.toContainEqual({ id: expect.stringContaining('gws-ea-welcome') });
+  });
+});
+
+describe('recorded divergence: an authenticated direct message is remembered as the user DM', () => {
+  it('maps a known user to the exact direct conversation that authenticated them, and refuses a group', async () => {
+    await freshInstall();
+    const { closeDb, getDb, initTestDb } = await import('../db/connection.js');
+    const { runMigrations } = await import('../db/migrations/index.js');
+    const { createMessagingGroup, getMessagingGroup } = await import('../db/messaging-groups.js');
+    const { upsertUser } = await import('../modules/permissions/db/users.js');
+    const { rememberAuthenticatedUserDm } = await import('../modules/permissions/user-dm.js');
+    await runMigrations(await initTestDb());
+    cleanups.push(closeDb);
+    const at = '2026-09-18T18:00:00.000Z';
+    await upsertUser({ id: 'gchat:users/principal', kind: 'gchat', display_name: 'Principal', created_at: at });
+    for (const [id, isGroup] of [
+      ['mg-dm', 0],
+      ['mg-space', 1],
+    ] as const) {
+      await createMessagingGroup({
+        id,
+        channel_type: 'gchat',
+        platform_id: `gchat:spaces/${id}`,
+        instance: 'gchat',
+        name: null,
+        is_group: isGroup,
+        unknown_sender_policy: 'strict',
+        created_at: at,
+      });
+    }
+
+    await expect(
+      rememberAuthenticatedUserDm('gchat:users/principal', (await getMessagingGroup('mg-space'))!, at),
+    ).rejects.toThrow(/direct conversation/);
+    await rememberAuthenticatedUserDm('gchat:users/principal', (await getMessagingGroup('mg-dm'))!, at);
+
+    expect(await getDb().all('SELECT user_id, channel_type, messaging_group_id, resolved_at FROM user_dms')).toEqual([
+      { user_id: 'gchat:users/principal', channel_type: 'gchat', messaging_group_id: 'mg-dm', resolved_at: at },
+    ]);
   });
 });
 

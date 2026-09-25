@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -1763,7 +1763,8 @@ interface ProductionHarness {
   providerCredential: boolean;
   routePublished: boolean;
   chatConfigured: boolean;
-  principal: 'waiting' | 'selection' | 'bound';
+  /** `rejected`: the host's canonical-main admission refuses main's DM wiring. */
+  principal: 'waiting' | 'selection' | 'bound' | 'rejected';
   selectedMessagingGroupId?: string;
   conversationReady: boolean;
   /** The process dies right after the principal is bound, before the step completes. */
@@ -1907,6 +1908,12 @@ async function productionHarness(): Promise<ProductionHarness> {
           reconcilePrincipal: async (_runtime, selection) => {
             harness.effects.push(`reconcilePrincipalDm:${harness.principal}`);
             if (harness.principal === 'waiting') return { status: 'waiting' };
+            if (harness.principal === 'rejected') {
+              throw new GwsEaError(
+                'ncl_failed',
+                "ncl wirings create failed: Canonical main wiring rejected: sender_scope must be 'known'",
+              );
+            }
             if (harness.principal === 'selection' && !selection.messagingGroupId) {
               return {
                 status: 'selection-required',
@@ -2039,6 +2046,20 @@ describe('production step order and pause outcomes', () => {
     });
   });
 
+  it("fails bind_principal, recording why, when admission rejects main's DM wiring", async () => {
+    const harness = await productionHarness();
+    harness.principal = 'rejected';
+
+    await expect(harness.run()).rejects.toMatchObject({ code: 'ncl_failed' });
+    const journal = await readProvisionJournal(harness.paths, harness.instanceId);
+    expect(journal.steps.bind_principal?.completed_at).toBeUndefined();
+    expect(journal.last_error).toMatchObject({
+      step: 'bind_principal',
+      code: 'ncl_failed',
+      message: expect.stringContaining('Canonical main wiring rejected'),
+    });
+  });
+
   it('resumes after the principal was bound but before the step completed, without binding again', async () => {
     const harness = await productionHarness();
     harness.principal = 'bound';
@@ -2047,6 +2068,96 @@ describe('production step order and pause outcomes', () => {
     await expect(harness.run()).rejects.toThrow('The process died after binding the principal');
     await expect(harness.run()).resolves.toEqual({ status: 'ready' });
     expect(harness.effects.filter((effect) => effect === 'reconcilePrincipalDm:bound')).toHaveLength(1);
+  });
+
+  /** A NanoClaw log line as the host writes it: local time of day, colored level and message. */
+  function logLine(at: Date, level: string, message: string, data = ''): string {
+    const two = (value: number) => String(value).padStart(2, '0');
+    const stamp = `${two(at.getHours())}:${two(at.getMinutes())}:${two(at.getSeconds())}.${String(at.getMilliseconds()).padStart(3, '0')}`;
+    return `[${stamp}] \x1b[33m${level}\x1b[39m \x1b[36m${message}\x1b[39m${data}`;
+  }
+
+  async function writeErrorLog(harness: ProductionHarness, lines: readonly string[], writtenAt: Date): Promise<string> {
+    const errorLog = path.join(harness.lastContext!.input.runtime.checkout_realpath, 'logs', 'nanoclaw.error.log');
+    await mkdir(path.dirname(errorLog), { recursive: true });
+    await writeFile(errorLog, `${lines.join('\n')}\n`);
+    await utimes(errorLog, writtenAt, writtenAt);
+    return errorLog;
+  }
+
+  it('shows a DM pause the errors logged since it began, redacted, and none from before', async () => {
+    const harness = await productionHarness();
+    const first = await harness.run();
+    const began = (await readProvisionJournal(harness.paths, harness.instanceId)).steps.bind_principal!.started_at;
+    const errorLog = path.join(harness.lastContext!.input.runtime.checkout_realpath, 'logs', 'nanoclaw.error.log');
+    expect(first).toMatchObject({
+      status: 'paused',
+      pause: {
+        phase: 'bind_principal',
+        code: 'principal_dm_required',
+        details: ['Principal: Principal (not bound yet)', `No errors logged since ${began} in ${errorLog}`],
+      },
+    });
+
+    const start = new Date(began).getTime();
+    const after = new Date(start + 1_000);
+    await writeErrorLog(
+      harness,
+      [
+        logLine(new Date(start - 60_000), 'ERROR', 'Logged before the pause'),
+        logLine(after, 'WARN', 'Google Chat request rejected', ' authorization="Bearer abcdefghijklmnop"'),
+        '    at verifyRequest (gchat.js:1:1)',
+      ],
+      new Date(start + 2_000),
+    );
+
+    const details = (await harness.run()) as Extract<ProvisionResult, { status: 'paused' }>;
+    const stamp = logLine(after, 'WARN', '').slice(0, 14);
+    expect(details.pause.details).toEqual([
+      'Principal: Principal (not bound yet)',
+      `Errors logged since ${began} in ${errorLog}:`,
+      `  ${stamp} WARN Google Chat request rejected authorization="Bearer [REDACTED]"`,
+      '      at verifyRequest (gchat.js:1:1)',
+    ]);
+  });
+
+  it('shows nothing from an error log last written before the pause began', async () => {
+    const harness = await productionHarness();
+    await harness.run();
+    const began = (await readProvisionJournal(harness.paths, harness.instanceId)).steps.bind_principal!.started_at;
+    const start = new Date(began).getTime();
+    // Written a day earlier at a later time of day: the file's last write dates it.
+    const errorLog = await writeErrorLog(
+      harness,
+      [logLine(new Date(start + 1_000), 'ERROR', 'Logged the day before')],
+      new Date(start - 86_400_000 + 2_000),
+    );
+
+    await expect(harness.run()).resolves.toMatchObject({
+      pause: { details: ['Principal: Principal (not bound yet)', `No errors logged since ${began} in ${errorLog}`] },
+    });
+  });
+
+  it('names the bound principal and its errors when the conversation is not answered yet', async () => {
+    const harness = await productionHarness();
+    harness.principal = 'bound';
+    harness.conversationReady = false;
+    await harness.run();
+    const began = (await readProvisionJournal(harness.paths, harness.instanceId)).steps.verify_conversation!.started_at;
+    const start = new Date(began).getTime();
+    const errorLog = await writeErrorLog(
+      harness,
+      [logLine(new Date(start + 1_000), 'ERROR', 'Delivery failed')],
+      new Date(start + 2_000),
+    );
+
+    const paused = (await harness.run()) as Extract<ProvisionResult, { status: 'paused' }>;
+    expect(paused.pause).toMatchObject({ phase: 'verify_conversation', code: 'later_principal_message_missing' });
+    expect(paused.pause.details).toEqual([
+      'Bound principal: Principal (gchat:users/principal)',
+      `Errors logged since ${began} in ${errorLog}:`,
+      `  ${logLine(new Date(start + 1_000), 'ERROR', '').slice(0, 14)} ERROR Delivery failed`,
+    ]);
   });
 
   it('pauses at verify_conversation until a later principal message is answered', async () => {

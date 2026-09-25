@@ -1,8 +1,10 @@
 import { getDb } from '../../db/connection.js';
+import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { registerRequiredProjectDocSection } from '../../project-doc-sections.js';
 import { register } from '../../cli/registry.js';
 import type { AgentGroup } from '../../types.js';
+import { rememberAuthenticatedUserDm } from '../permissions/user-dm.js';
 import { bindVerifiedPrincipalUser, getGwsEaProfile, reconcileGwsEaProfile, validateGwsEaProfileInput } from './db.js';
 import { gwsEaProfileMigration } from './migration.js';
 import './wiring-policy.js';
@@ -73,23 +75,38 @@ register({
   handler: async () => getGwsEaProfile(),
 });
 
+const bindPrincipalKeys = new Set(['user-id', 'verified-at', 'messaging-group-id']);
+
 register({
   name: 'gws-ea-profile-bind-principal',
-  description: 'Bind one adapter-authenticated platform user to the principal.',
+  description:
+    'Bind one adapter-authenticated platform user to the principal, with the direct message that authenticated them.',
   access: 'hidden',
   hostOnly: true,
   parseArgs(raw) {
-    const unknown = Object.keys(raw).filter((key) => key !== 'user-id' && key !== 'verified-at');
+    const unknown = Object.keys(raw).filter((key) => !bindPrincipalKeys.has(key));
     if (unknown.length > 0) throw new Error(`Unknown profile field: --${unknown[0]}`);
-    const userId = raw['user-id'];
-    const verifiedAt = raw['verified-at'];
-    if (typeof userId !== 'string' || userId.length === 0) throw new Error('--user-id is required');
-    if (typeof verifiedAt !== 'string' || verifiedAt.length === 0) throw new Error('--verified-at is required');
-    return { userId, verifiedAt };
+    const required = (key: string): string => {
+      const value = raw[key];
+      if (typeof value !== 'string' || value.length === 0) throw new Error(`--${key} is required`);
+      return value;
+    };
+    return {
+      userId: required('user-id'),
+      verifiedAt: required('verified-at'),
+      messagingGroupId: required('messaging-group-id'),
+    };
   },
-  handler: async ({ userId, verifiedAt }) => {
-    await bindVerifiedPrincipalUser(userId, verifiedAt);
-    return { user_id: userId, verified_at: verifiedAt };
+  // The DM mapping is what canonical-main wiring admission proves the
+  // principal's conversation with, so it is recorded with the binding.
+  handler: async ({ userId, verifiedAt, messagingGroupId }) => {
+    const dm = await getMessagingGroup(messagingGroupId);
+    if (!dm) throw new Error(`Principal direct message not found: ${messagingGroupId}`);
+    await getDb().transaction(async () => {
+      await bindVerifiedPrincipalUser(userId, verifiedAt);
+      await rememberAuthenticatedUserDm(userId, dm, verifiedAt);
+    });
+    return { user_id: userId, verified_at: verifiedAt, messaging_group_id: dm.id };
   },
 });
 

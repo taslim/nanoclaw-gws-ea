@@ -171,6 +171,12 @@ export function principalWelcomeEventId(
  * candidate is unambiguous and binds automatically; multiple candidates stay
  * read-only until the operator supplies one exact messaging-group ID.
  * Authentication alone never authorizes an owner grant.
+ *
+ * Binding order (KTD9): the principal and its authenticated DM are bound
+ * first; then the host creates the principal's user, owner role, membership,
+ * and main's DM wiring, which its canonical-main admission accepts or
+ * rejects; then `init-first-agent` reuses those records and delivers the
+ * welcome once per stable event ID.
  */
 export async function reconcilePrincipalDm(
   configInput: InstanceRuntimeConfig,
@@ -224,7 +230,22 @@ export async function reconcilePrincipalDm(
     selected = await (dependencies.persistSelection?.(selected) ?? Promise.resolve(selected));
   }
 
-  const stableEventId = principalWelcomeEventId(config, profile.mainAgentGroupId, selected);
+  const mainAgentGroupId = profile.mainAgentGroupId;
+  const displayName = selected.senderName ?? profile.principalDisplayName;
+  const stableEventId = principalWelcomeEventId(config, mainAgentGroupId, selected);
+  // Every record is made through the host, so its wiring admission judges
+  // main's DM wiring when it is created; each command is idempotent, so a
+  // retry after a crash repeats the whole sequence safely.
+  await runNcl(config, [
+    'users',
+    'create',
+    '--id',
+    selected.userId,
+    '--kind',
+    CHANNEL_TYPE,
+    '--display-name',
+    displayName,
+  ]);
   const binding = unwrapData(
     await runNcl(config, [
       'gws-ea-profile',
@@ -233,14 +254,42 @@ export async function reconcilePrincipalDm(
       selected.userId,
       '--verified-at',
       selected.authenticatedMessageAt,
+      '--messaging-group-id',
+      selected.messagingGroupId,
     ]),
   );
   if (
     !isRecord(binding) ||
     binding.user_id !== selected.userId ||
-    binding.verified_at !== selected.authenticatedMessageAt
+    binding.verified_at !== selected.authenticatedMessageAt ||
+    binding.messaging_group_id !== selected.messagingGroupId
   ) {
     throw new GwsEaError('profile_mismatch', 'The principal user binding was not confirmed');
+  }
+  await runNcl(config, ['roles', 'grant', '--user', selected.userId, '--role', 'owner']);
+  await runNcl(config, ['members', 'add', '--user', selected.userId, '--group', mainAgentGroupId]);
+  const wiring = unwrapData(
+    await runNcl(config, [
+      'wirings',
+      'create',
+      '--messaging-group-id',
+      selected.messagingGroupId,
+      '--agent-group-id',
+      mainAgentGroupId,
+      '--sender-scope',
+      'known',
+      '--session-mode',
+      'agent-shared',
+    ]),
+  );
+  if (
+    !isRecord(wiring) ||
+    wiring.messaging_group_id !== selected.messagingGroupId ||
+    wiring.agent_group_id !== mainAgentGroupId ||
+    wiring.sender_scope !== 'known' ||
+    wiring.session_mode !== 'agent-shared'
+  ) {
+    throw new GwsEaError('profile_mismatch', "Main's principal DM wiring was not confirmed");
   }
   await runBootstrap(config, [
     '--channel',
@@ -250,20 +299,15 @@ export async function reconcilePrincipalDm(
     '--platform-id',
     selected.platformId,
     '--display-name',
-    selected.senderName ?? profile.principalDisplayName,
+    displayName,
     '--agent-group-id',
-    profile.mainAgentGroupId,
-    '--verified-principal',
+    mainAgentGroupId,
     '--role',
     'owner',
     '--instance',
     input.adapterInstance,
-    '--sender-scope',
-    'known',
-    '--session-mode',
-    'agent-shared',
     '--event-id',
     stableEventId,
   ]);
-  return { status: 'bound', candidate: selected, agentGroupId: profile.mainAgentGroupId, eventId: stableEventId };
+  return { status: 'bound', candidate: selected, agentGroupId: mainAgentGroupId, eventId: stableEventId };
 }

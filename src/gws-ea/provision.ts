@@ -49,6 +49,7 @@ import { reconcileMainIdentity, type MainIdentityDependencies, type MainIdentity
 import { reconcilePrincipalDm, type PrincipalCandidate, type PrincipalDiscoveryDependencies } from './principal.js';
 import { verifyExistingGchatEndpoint, verifyExistingGchatRoute, validateExistingGchatEndpoint } from './endpoint.js';
 import {
+  instanceErrorsSince,
   verifyPrincipalBinding,
   verifyTalkableConversation,
   type ConversationVerificationInput,
@@ -642,16 +643,44 @@ async function requireManagedAccountToken(
   return context.input.requestCloudflareAccountToken(accountId, reason);
 }
 
+/**
+ * A pause while the principal's conversation is awaited. It names the person
+ * and shows what the host logged as errors since the step began, which is
+ * usually why a message has not arrived or been answered.
+ */
+async function principalPause(
+  context: ProductionProvisionContext,
+  phase: 'bind_principal' | 'verify_conversation',
+  code: string,
+  message: string,
+  person: string,
+): Promise<ProvisionHumanPause> {
+  const journal = await readProvisionJournal(context.operation.paths, context.operation.instanceId);
+  const since = journal.steps[phase]?.started_at ?? new Date().toISOString();
+  const errors = await instanceErrorsSince(context.input.runtime.checkout_realpath, since);
+  return {
+    ...humanPause(phase, code, message),
+    details: [
+      person,
+      ...(errors.lines.length === 0
+        ? [`No errors logged since ${since} in ${errors.file}`]
+        : [`Errors logged since ${since} in ${errors.file}:`, ...errors.lines.map((line) => `  ${line}`)]),
+    ],
+  };
+}
+
 /** A pause while the principal DM is awaited or chosen; otherwise the binding joins the run state. */
-function principalResult(
+async function principalResult(
   context: ProductionProvisionContext,
   result: Awaited<ReturnType<typeof reconcilePrincipalDm>>,
-): ProvisionHumanPause | undefined {
+): Promise<ProvisionHumanPause | undefined> {
   if (result.status === 'waiting') {
-    return humanPause(
+    return principalPause(
+      context,
       'bind_principal',
       'principal_dm_required',
       'Ask the principal to send a direct message to the configured Google Chat app, then resume.',
+      `Principal: ${context.input.identity.principalDisplayName} (not bound yet)`,
     );
   }
   if (result.status === 'selection-required') {
@@ -1005,13 +1034,18 @@ export function createProductionProvisionSteps(
           observe: async (value) => ((await verifyConversation(value))?.ready ? PRESENT : ABSENT),
           apply: async (value) => {
             const result = await verifyConversation(value);
-            if (!result) throw new GwsEaError('principal_not_ready', 'Principal binding is not available');
+            const principal = value.state.principal;
+            if (!result || !principal) {
+              throw new GwsEaError('principal_not_ready', 'Principal binding is not available');
+            }
             return result.ready
               ? undefined
-              : humanPause(
+              : principalPause(
+                  value,
                   'verify_conversation',
                   result.reason,
                   'Wait for the delivered welcome, then ask the principal to send a later Google Chat message and resume.',
+                  `Bound principal: ${principal.senderName ?? value.input.identity.principalDisplayName} (${principal.userId})`,
                 );
           },
         },
