@@ -1,128 +1,146 @@
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
 import { parse as parseYaml } from 'yaml';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { CLOUDFLARED_IMAGE } from './pins.js';
+import { processLockOwner } from '../community-portal/process-lock.js';
 import {
   CLOUDFLARE_CONNECTOR_OWNER_LABEL,
   CLOUDFLARE_CONNECTOR_ROLE_LABEL,
+  CLOUDFLARE_CONNECTOR_TOKEN_LABEL,
   buildCloudflareComposeInvocation,
-  cloudflareOriginUrl,
   createCloudflareConnectorLayout,
+  hasConnectorToken,
   inspectCloudflareConnector,
-  prepareCloudflareConnector,
-  reconcileCloudflareConnector,
+  observeCloudflareConnector,
   renderCloudflareConnectorCompose,
+  repairCloudflareConnector,
   stopCloudflareConnector,
-  validateCloudflareConnectorState,
-  validateObservedCloudflareConnector,
+  storeConnectorToken,
   type CloudflareConnectorLayout,
-  type ObservedCloudflareConnector,
 } from './cloudflare-connector.js';
+import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+import { PRESENT } from './phases.js';
+import { CLOUDFLARED_IMAGE } from './pins.js';
 import type { SanitizedCommand } from './process.js';
+import { GwsEaError } from './types.js';
 
+const TOKEN = 'connector-token-canary';
+const DIGEST = createHash('sha256').update(TOKEN).digest('hex');
+const IMAGE_ENVIRONMENT = [
+  'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+  'SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt',
+];
 const roots: string[] = [];
 
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
-function record(value: unknown): Record<string, unknown> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('expected object');
-  return value as Record<string, unknown>;
-}
+type Json = Record<string, unknown>;
 
-async function layout(platform: 'macos' | 'linux'): Promise<CloudflareConnectorLayout> {
+async function fixture(platform: 'macos' | 'linux' = 'linux'): Promise<{
+  paths: ControlPlanePaths;
+  layout: CloudflareConnectorLayout;
+}> {
   const root = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-cloudflared-'));
   roots.push(root);
-  return createCloudflareConnectorLayout({
-    cloudflareRoot: path.join(root, 'ingress', 'cloudflare'),
-    platform,
-    ownerUid: 501,
-    ownerGid: 20,
+  const paths = resolveControlPlanePaths({
+    configRoot: path.join(root, 'config'),
+    stateRoot: path.join(root, 'state'),
   });
-}
-
-function observed(
-  layout: CloudflareConnectorLayout,
-  overrides: Partial<ObservedCloudflareConnector> = {},
-): ObservedCloudflareConnector {
   return {
-    id: 'container-id',
-    service: 'connector',
-    project: layout.project,
-    owner: 'shared-cloudflare-ingress',
-    role: 'connector',
-    image: CLOUDFLARED_IMAGE,
-    user: layout.runtimeUser,
-    command: ['tunnel', '--no-autoupdate', 'run', '--token-file', '/run/secrets/tunnel_token'],
-    environment: [
-      'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-      'SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt',
-    ],
-    running: true,
-    restarting: false,
-    restartPolicy: 'unless-stopped',
-    readOnlyRootFilesystem: true,
-    privileged: false,
-    capabilitiesDropped: ['ALL'],
-    securityOptions: ['no-new-privileges:true'],
-    networkMode: layout.platform === 'linux' ? 'host' : 'bridge',
-    extraHosts: layout.platform === 'macos' ? ['host.docker.internal:host-gateway'] : [],
-    mounts: [
-      {
-        type: 'bind',
-        source: layout.tokenFile,
-        destination: '/run/secrets/tunnel_token',
-        readOnly: true,
-      },
-    ],
-    tmpfs: ['/tmp'],
-    publishedPorts: {},
-    ...overrides,
+    paths,
+    layout: createCloudflareConnectorLayout({
+      cloudflareRoot: paths.cloudflareRoot,
+      platform,
+      ownerUid: 501,
+      ownerGid: 20,
+    }),
   };
 }
 
-function inspectJson(layout: CloudflareConnectorLayout): string {
-  const value = observed(layout);
-  return JSON.stringify([
-    {
-      Id: value.id,
-      Config: {
-        Image: value.image,
-        User: value.user,
-        Cmd: value.command,
-        Env: value.environment,
-        Labels: {
-          'com.docker.compose.project': value.project,
-          'com.docker.compose.service': value.service,
-          [CLOUDFLARE_CONNECTOR_OWNER_LABEL]: value.owner,
-          [CLOUDFLARE_CONNECTOR_ROLE_LABEL]: value.role,
-        },
+/** `docker container inspect` output for the connector Compose creates from the rendered file. */
+function inspection(layout: CloudflareConnectorLayout, change: (container: Json) => void = () => undefined): Json {
+  const container: Json = {
+    Id: 'c0ffee',
+    Name: '/gws-ea-cloudflare-connector-1',
+    RestartCount: 0,
+    Config: {
+      Image: CLOUDFLARED_IMAGE,
+      User: layout.runtimeUser,
+      Cmd: ['tunnel', '--no-autoupdate', 'run', '--token-file', '/run/secrets/tunnel_token'],
+      Env: [...IMAGE_ENVIRONMENT],
+      Labels: {
+        'com.docker.compose.project': layout.project,
+        'com.docker.compose.service': 'connector',
+        'com.docker.compose.version': '2.39.1',
+        [CLOUDFLARE_CONNECTOR_OWNER_LABEL]: 'shared-cloudflare-ingress',
+        [CLOUDFLARE_CONNECTOR_ROLE_LABEL]: 'connector',
+        [CLOUDFLARE_CONNECTOR_TOKEN_LABEL]: DIGEST,
       },
-      State: { Running: value.running, Restarting: value.restarting },
-      HostConfig: {
-        RestartPolicy: { Name: value.restartPolicy },
-        ReadonlyRootfs: value.readOnlyRootFilesystem,
-        Privileged: value.privileged,
-        CapDrop: value.capabilitiesDropped,
-        SecurityOpt: value.securityOptions,
-        NetworkMode: value.networkMode,
-        ExtraHosts: value.extraHosts,
-        Tmpfs: { '/tmp': 'rw,nosuid,nodev,noexec,size=16m,mode=1777' },
-        PortBindings: value.publishedPorts,
-      },
-      Mounts: value.mounts.map((mount) => ({
-        Type: mount.type,
-        Source: mount.source,
-        Destination: mount.destination,
-        RW: !mount.readOnly,
-      })),
     },
-  ]);
+    State: { Status: 'running', Running: true, Paused: false, Restarting: false, ExitCode: 0 },
+    HostConfig: {
+      RestartPolicy: { Name: 'unless-stopped', MaximumRetryCount: 0 },
+      ReadonlyRootfs: true,
+      Privileged: false,
+      CapAdd: null,
+      CapDrop: ['ALL'],
+      SecurityOpt: ['no-new-privileges:true'],
+      NetworkMode: layout.platform === 'linux' ? 'host' : 'bridge',
+      ExtraHosts: layout.platform === 'macos' ? ['host.docker.internal:host-gateway'] : null,
+      Tmpfs: { '/tmp': 'rw,nosuid,nodev,noexec,size=16m,mode=1777' },
+      PortBindings: {},
+    },
+    Mounts: [
+      {
+        Type: 'bind',
+        Source: layout.tokenFile,
+        Destination: '/run/secrets/tunnel_token',
+        Mode: '',
+        RW: false,
+        Propagation: 'rprivate',
+      },
+    ],
+  };
+  change(container);
+  return container;
+}
+
+/** A Docker CLI that answers from one container, or none. */
+function docker(initial: Json | undefined, paths?: ControlPlanePaths) {
+  let container = initial;
+  const calls: SanitizedCommand[] = [];
+  const lockedUps: boolean[] = [];
+  const run = vi.fn(async (command: SanitizedCommand) => {
+    calls.push(command);
+    const [first, second] = command.args;
+    if (first === 'container' && second === 'ls') return { stdout: container ? 'c0ffee\n' : '', stderr: '' };
+    if (first === 'container' && second === 'inspect') return { stdout: JSON.stringify([container]), stderr: '' };
+    if (first === 'image' && second === 'inspect') return { stdout: JSON.stringify(IMAGE_ENVIRONMENT), stderr: '' };
+    if (command.args.includes('up')) {
+      lockedUps.push(paths !== undefined && processLockOwner(paths.registryLock)?.pid === process.pid);
+      container = { ...(container ?? {}), ...upResult };
+    }
+    if (command.args.includes('down')) container = undefined;
+    return { stdout: '', stderr: '' };
+  });
+  let upResult: Json = {};
+  return {
+    run,
+    calls,
+    lockedUps,
+    set afterUp(value: Json) {
+      upResult = value;
+    },
+    get container() {
+      return container;
+    },
+  };
 }
 
 describe('shared Cloudflare connector', () => {
@@ -133,199 +151,256 @@ describe('shared Cloudflare connector', () => {
   });
 
   it.each(['macos', 'linux'] as const)(
-    'renders the exact hardened %s connector without secret material',
+    'renders the hardened %s connector with a token digest, not the token',
     async (platform) => {
-      const connector = await layout(platform);
-      const source = renderCloudflareConnectorCompose(connector);
-      const compose = record(parseYaml(source));
-      const service = record(record(compose.services).connector);
-      const secrets = record(compose.secrets);
-      const canary = 'connector-token-canary';
+      const { layout } = await fixture(platform);
+      const source = renderCloudflareConnectorCompose(layout, DIGEST);
+      const compose = parseYaml(source) as Json;
+      const service = (compose.services as Json).connector as Json;
 
-      expect(service.image).toBe(CLOUDFLARED_IMAGE);
-      expect(service.command).toEqual([
-        'tunnel',
-        '--no-autoupdate',
-        'run',
-        '--token-file',
-        '/run/secrets/tunnel_token',
-      ]);
-      expect(service.user).toBe('501:20');
       expect(service).toMatchObject({
+        image: CLOUDFLARED_IMAGE,
+        command: ['tunnel', '--no-autoupdate', 'run', '--token-file', '/run/secrets/tunnel_token'],
+        user: '501:20',
         restart: 'unless-stopped',
         read_only: true,
         cap_drop: ['ALL'],
         security_opt: ['no-new-privileges:true'],
         tmpfs: ['/tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777'],
+        network_mode: platform === 'linux' ? 'host' : 'bridge',
         labels: {
           [CLOUDFLARE_CONNECTOR_OWNER_LABEL]: 'shared-cloudflare-ingress',
           [CLOUDFLARE_CONNECTOR_ROLE_LABEL]: 'connector',
+          [CLOUDFLARE_CONNECTOR_TOKEN_LABEL]: DIGEST,
         },
       });
-      expect(record(secrets.tunnel_token).file).toBe(connector.tokenFile);
-      expect(service.network_mode).toBe(platform === 'linux' ? 'host' : 'bridge');
+      expect(((compose.secrets as Json).tunnel_token as Json).file).toBe(layout.tokenFile);
       expect(service.extra_hosts ?? []).toEqual(platform === 'macos' ? ['host.docker.internal:host-gateway'] : []);
-      expect(source).not.toContain(canary);
-      expect(source).not.toContain('/var/run/docker.sock');
-      expect(source).not.toContain('/nanoclaw');
       expect(service).not.toHaveProperty('ports');
       expect(service).not.toHaveProperty('environment');
+      expect(source).not.toContain(TOKEN);
+      expect(source).not.toContain('/var/run/docker.sock');
     },
   );
 
-  it('renders explicit platform origins without claiming Linux port isolation', () => {
-    expect(cloudflareOriginUrl('macos', 31_001)).toBe('http://host.docker.internal:31001');
-    expect(cloudflareOriginUrl('linux', 31_001)).toBe('http://127.0.0.1:31001');
-    expect(() => cloudflareOriginUrl('macos', 0)).toThrow(/port/u);
-  });
+  it('stores the connector token owner-only outside assistant checkouts, replacing a rotated one', async () => {
+    const { layout } = await fixture();
+    await expect(hasConnectorToken(layout)).resolves.toBe(false);
 
-  it('persists only the connector token as an owner-only file outside assistant checkouts', async () => {
-    const connector = await layout('macos');
-    const canary = 'connector-token-canary';
-    await prepareCloudflareConnector(connector, canary);
+    await storeConnectorToken(layout, TOKEN);
+    expect(await readFile(layout.tokenFile, 'utf8')).toBe(TOKEN);
+    expect((await stat(layout.tokenFile)).mode & 0o777).toBe(0o600);
+    expect((await stat(layout.rootDirectory)).mode & 0o777).toBe(0o700);
+    expect(layout.rootDirectory).not.toContain(`${path.sep}instances${path.sep}`);
+    await expect(hasConnectorToken(layout)).resolves.toBe(true);
 
-    expect(await readFile(connector.tokenFile, 'utf8')).toBe(canary);
-    expect((await stat(connector.tokenFile)).mode & 0o777).toBe(0o600);
-    expect((await stat(connector.rootDirectory)).mode & 0o777).toBe(0o700);
-    expect(await readFile(connector.composeFile, 'utf8')).not.toContain(canary);
-    expect(await readFile(connector.envFile, 'utf8')).not.toContain(canary);
-    expect(connector.rootDirectory).not.toContain(`${path.sep}instances${path.sep}`);
-    await expect(validateCloudflareConnectorState(connector)).resolves.toBeUndefined();
-
-    await prepareCloudflareConnector(connector, canary);
-    await expect(prepareCloudflareConnector(connector, 'different-token')).rejects.toMatchObject({
-      code: 'connector_token_conflict',
-    });
-    await rm(connector.tokenFile);
-    await expect(validateCloudflareConnectorState(connector)).rejects.toMatchObject({
-      code: 'cloudflare_connector_state_missing',
-    });
+    await storeConnectorToken(layout, 'rotated-connector-token');
+    expect(await readFile(layout.tokenFile, 'utf8')).toBe('rotated-connector-token');
+    await expect(storeConnectorToken(layout, ' padded ')).rejects.toMatchObject({ code: 'invalid_connector_token' });
   });
 
   it.each([false, true])('inspects before its private directory exists (connector present: %s)', async (present) => {
-    const connector = await layout('macos');
-    const runner = vi.fn(async (command: SanitizedCommand) => {
-      expect((await stat(command.cwd)).isDirectory()).toBe(true);
-      if (command.args[1] === 'ls') return { stdout: present ? 'container-id\n' : '', stderr: '' };
-      return { stdout: inspectJson(connector), stderr: '' };
-    });
+    const { layout } = await fixture();
+    const cli = docker(present ? inspection(layout) : undefined);
 
-    await expect(inspectCloudflareConnector(connector, runner)).resolves.toEqual(
-      present ? observed(connector) : undefined,
-    );
-    expect(runner).toHaveBeenCalledTimes(present ? 2 : 1);
-    await expect(stat(connector.rootDirectory)).rejects.toMatchObject({ code: 'ENOENT' });
+    const observed = await inspectCloudflareConnector(layout, cli.run);
+    expect(observed === undefined).toBe(!present);
+    expect(cli.run).toHaveBeenCalledTimes(present ? 2 : 1);
+    await expect(stat(layout.rootDirectory)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('accepts only the exact owned connector specification', async () => {
-    const connector = await layout('macos');
-    expect(() => validateObservedCloudflareConnector(connector, observed(connector))).not.toThrow();
-    for (const unsafe of [
-      observed(connector, { image: 'cloudflare/cloudflared:latest' }),
-      observed(connector, { command: ['tunnel', 'run', 'secret-on-argv'] }),
-      observed(connector, { environment: ['TUNNEL_TOKEN=connector-token-canary'] }),
-      observed(connector, {
-        mounts: [
-          ...observed(connector).mounts,
-          { type: 'bind', source: '/var/run/docker.sock', destination: '/var/run/docker.sock', readOnly: false },
-        ],
-      }),
-      observed(connector, { networkMode: 'host' }),
-      observed(connector, { owner: 'foreign' }),
-      observed(connector, { user: '65532:65532' }),
-      observed(connector, { readOnlyRootFilesystem: false }),
-      observed(connector, { privileged: true }),
-      observed(connector, { restarting: true }),
-    ]) {
-      expect(() => validateObservedCloudflareConnector(connector, unsafe)).toThrow();
+  describe('observation', () => {
+    async function observe(change?: (container: Json) => void, present = true) {
+      const { layout } = await fixture();
+      await storeConnectorToken(layout, TOKEN);
+      const cli = docker(present ? inspection(layout, change) : undefined);
+      return observeCloudflareConnector(layout, { runCommand: cli.run });
     }
+
+    it('finds the exact running connector present', async () => {
+      await expect(observe()).resolves.toEqual(PRESENT);
+    });
+
+    it('finds a missing or stopped connector absent, so it is repaired', async () => {
+      await expect(observe(undefined, false)).resolves.toEqual({
+        status: 'absent',
+        reason: 'it has not been created',
+      });
+      await expect(
+        observe((container) => {
+          container.State = { Status: 'exited', Running: false, Restarting: false, ExitCode: 0 };
+        }),
+      ).resolves.toEqual({ status: 'absent', reason: 'it is exited' });
+    });
+
+    it('cannot tell yet while the connector is restarting', async () => {
+      await expect(
+        observe((container) => {
+          container.State = { Status: 'restarting', Running: true, Restarting: true, ExitCode: 1 };
+          container.RestartCount = 4;
+        }),
+      ).resolves.toEqual({
+        status: 'unknown',
+        reason: 'The Cloudflare connector is restarting',
+        evidence: 'state restarting, exit code 1, 4 restarts',
+      });
+    });
+
+    it.each([
+      {
+        label: 'a cloudflared pin bump',
+        change: (container: Json) => {
+          (container.Config as Json).Image = `cloudflare/cloudflared:2026.8.0@sha256:${'1'.repeat(64)}`;
+        },
+        reason: /runs cloudflare\/cloudflared:2026\.8\.0.*not the pinned cloudflare\/cloudflared:2026\.9\.1/u,
+      },
+      {
+        label: 'environment drift',
+        change: (container: Json) => {
+          (container.Config as Json).Env = [...IMAGE_ENVIRONMENT, `TUNNEL_TOKEN=${TOKEN}`];
+        },
+        reason: /environment its image does not set: TUNNEL_TOKEN$/u,
+      },
+      {
+        label: 'a rotated connector token',
+        change: (container: Json) => {
+          ((container.Config as Json).Labels as Json)[CLOUDFLARE_CONNECTOR_TOKEN_LABEL] = 'f'.repeat(64);
+        },
+        reason: /was started with a different connector token/u,
+      },
+      {
+        label: 'token-file mount drift',
+        change: (container: Json) => {
+          (container.Mounts as Json[])[0]!.Source = '/tmp/elsewhere';
+        },
+        reason: /does not mount exactly its token file/u,
+      },
+      {
+        label: 'security drift',
+        change: (container: Json) => {
+          (container.HostConfig as Json).Privileged = true;
+        },
+        reason: /security settings differ/u,
+      },
+    ])('finds $label absent, so the owned connector is recreated', async ({ change, reason }) => {
+      const observed = await observe(change);
+      expect(observed).toMatchObject({ status: 'absent', reason: expect.stringMatching(reason) });
+      expect(JSON.stringify(observed)).not.toContain(TOKEN);
+    });
+
+    it.each([
+      {
+        label: 'a foreign owner label',
+        change: (container: Json) => {
+          ((container.Config as Json).Labels as Json)[CLOUDFLARE_CONNECTOR_OWNER_LABEL] = 'someone-else';
+        },
+      },
+      {
+        label: 'another Compose service',
+        change: (container: Json) => {
+          ((container.Config as Json).Labels as Json)['com.docker.compose.service'] = 'sidecar';
+        },
+      },
+    ])('refuses a connector with $label instead of recreating it', async ({ change }) => {
+      await expect(observe(change)).rejects.toMatchObject({ code: 'unsafe_connector_owner' });
+    });
   });
 
-  it('adopts and restarts only an exact connector without exposing its token to Docker argv or environment', async () => {
-    const connector = await layout('linux');
-    const canary = 'connector-token-canary';
-    const calls: SanitizedCommand[] = [];
-    const runner = vi.fn(async (command: SanitizedCommand) => {
-      calls.push(command);
-      if (command.args[0] === 'container' && command.args[1] === 'ls') return { stdout: 'container-id\n', stderr: '' };
-      if (command.args[0] === 'container' && command.args[1] === 'inspect') {
-        return { stdout: inspectJson(connector), stderr: '' };
-      }
-      return { stdout: '', stderr: '' };
+  describe('repair', () => {
+    it('pulls a missing image outside the lock, then recreates the connector under the machine lock', async () => {
+      const { paths, layout } = await fixture();
+      await storeConnectorToken(layout, TOKEN);
+      const cli = docker(undefined, paths);
+      cli.afterUp = inspection(layout);
+
+      await repairCloudflareConnector(paths, layout, { runCommand: cli.run, ambientEnv: { PATH: '/usr/bin' } });
+
+      const commands = cli.calls.map((call) => call.args.filter((arg) => !arg.startsWith('/')));
+      expect(commands.filter((args) => args[0] === 'pull')).toEqual([['pull', CLOUDFLARED_IMAGE]]);
+      expect(commands.find((args) => args.includes('up'))).toEqual(
+        expect.arrayContaining(['up', '--detach', '--force-recreate', '--remove-orphans']),
+      );
+      expect(cli.lockedUps).toEqual([true]);
+      expect(await readFile(layout.composeFile, 'utf8')).toBe(renderCloudflareConnectorCompose(layout, DIGEST));
+      expect(JSON.stringify(cli.calls)).not.toContain(TOKEN);
+      expect(buildCloudflareComposeInvocation(layout, ['up']).args).not.toContain(TOKEN);
     });
 
-    const stabilityDelay = vi.fn(async () => undefined);
-    await reconcileCloudflareConnector(connector, canary, {
-      runCommand: runner,
-      ambientEnv: { PATH: '/safe/bin' },
-      stabilityDelay,
-    });
-    await reconcileCloudflareConnector(connector, canary, {
-      runCommand: runner,
-      ambientEnv: { PATH: '/safe/bin' },
-      stabilityDelay,
+    it('recreates a stopped connector without pulling', async () => {
+      const { paths, layout } = await fixture();
+      await storeConnectorToken(layout, TOKEN);
+      const cli = docker(
+        inspection(layout, (container) => {
+          container.State = { Status: 'exited', Running: false, Restarting: false, ExitCode: 137 };
+        }),
+        paths,
+      );
+      cli.afterUp = inspection(layout);
+
+      await repairCloudflareConnector(paths, layout, { runCommand: cli.run });
+
+      expect(cli.calls.some((call) => call.args[0] === 'pull')).toBe(false);
+      expect(cli.lockedUps).toEqual([true]);
     });
 
-    const upCalls = calls.filter((call) => call.args.includes('up'));
-    expect(upCalls).toHaveLength(2);
-    expect(stabilityDelay).toHaveBeenCalledTimes(2);
-    expect(calls.map((call) => JSON.stringify(call))).not.toContainEqual(expect.stringContaining(canary));
-    expect(await readFile(connector.tokenFile, 'utf8')).toBe(canary);
-    expect(buildCloudflareComposeInvocation(connector, ['up']).args).not.toContain(canary);
+    it('leaves a connector another run already repaired', async () => {
+      const { paths, layout } = await fixture();
+      await storeConnectorToken(layout, TOKEN);
+      const cli = docker(inspection(layout), paths);
+
+      await repairCloudflareConnector(paths, layout, { runCommand: cli.run });
+
+      expect(cli.calls.some((call) => call.args.includes('up'))).toBe(false);
+    });
+
+    it('needs the stored connector token and never asks for another', async () => {
+      const { paths, layout } = await fixture();
+      const cli = docker(undefined, paths);
+
+      await expect(repairCloudflareConnector(paths, layout, { runCommand: cli.run })).rejects.toMatchObject({
+        code: 'cloudflare_connector_token_missing',
+      });
+      expect(cli.calls).toEqual([]);
+    });
+
+    it('refuses to recreate a connector it does not own', async () => {
+      const { paths, layout } = await fixture();
+      await storeConnectorToken(layout, TOKEN);
+      const cli = docker(
+        inspection(layout, (container) => {
+          ((container.Config as Json).Labels as Json)[CLOUDFLARE_CONNECTOR_OWNER_LABEL] = 'someone-else';
+        }),
+        paths,
+      );
+
+      await expect(repairCloudflareConnector(paths, layout, { runCommand: cli.run })).rejects.toBeInstanceOf(
+        GwsEaError,
+      );
+      expect(cli.calls.some((call) => call.args.includes('up'))).toBe(false);
+    });
   });
 
-  it('rejects a connector that enters a restart loop immediately after startup', async () => {
-    const connector = await layout('macos');
-    let lists = 0;
-    let inspections = 0;
-    const runner = vi.fn(async (command: SanitizedCommand) => {
-      if (command.args[0] === 'container' && command.args[1] === 'ls') {
-        lists += 1;
-        return { stdout: lists === 1 ? '' : 'container-id\n', stderr: '' };
-      }
-      if (command.args[0] === 'container' && command.args[1] === 'inspect') {
-        inspections += 1;
-        const runtime = JSON.parse(inspectJson(connector)) as Array<Record<string, unknown>>;
-        if (inspections === 2) record(runtime[0]?.State).Restarting = true;
-        return { stdout: JSON.stringify(runtime), stderr: '' };
-      }
-      return { stdout: '', stderr: '' };
-    });
-
-    await expect(
-      reconcileCloudflareConnector(connector, 'connector-token', {
-        runCommand: runner,
-        stabilityDelay: async () => undefined,
+  it('stops an owned connector even when it has drifted, and never a foreign one', async () => {
+    const { layout } = await fixture();
+    await storeConnectorToken(layout, TOKEN);
+    await writeFile(layout.composeFile, renderCloudflareConnectorCompose(layout, DIGEST), { mode: 0o600 });
+    const drifted = docker(
+      inspection(layout, (container) => {
+        (container.Config as Json).Image = 'cloudflare/cloudflared:latest';
       }),
-    ).rejects.toMatchObject({ code: 'unhealthy_connector' });
-  });
+    );
 
-  it('refuses a wrong existing spec before compose can replace it and stops only an owned connector', async () => {
-    const connector = await layout('macos');
-    const wrong = JSON.parse(inspectJson(connector)) as Array<Record<string, unknown>>;
-    record(wrong[0]?.Config).Image = 'cloudflare/cloudflared:latest';
-    let inspection = JSON.stringify(wrong);
-    let stopped = false;
-    const calls: SanitizedCommand[] = [];
-    const runner = vi.fn(async (command: SanitizedCommand) => {
-      calls.push(command);
-      if (command.args[0] === 'container' && command.args[1] === 'ls') {
-        return { stdout: stopped ? '' : 'container-id\n', stderr: '' };
-      }
-      if (command.args[0] === 'container' && command.args[1] === 'inspect') return { stdout: inspection, stderr: '' };
-      if (command.args.includes('down')) stopped = true;
-      return { stdout: '', stderr: '' };
+    await stopCloudflareConnector(layout, { runCommand: drifted.run });
+    expect(drifted.calls.some((call) => call.args.includes('down'))).toBe(true);
+
+    const foreign = docker(
+      inspection(layout, (container) => {
+        ((container.Config as Json).Labels as Json)[CLOUDFLARE_CONNECTOR_OWNER_LABEL] = 'someone-else';
+      }),
+    );
+    await expect(stopCloudflareConnector(layout, { runCommand: foreign.run })).rejects.toMatchObject({
+      code: 'unsafe_connector_owner',
     });
-
-    await expect(reconcileCloudflareConnector(connector, 'token', { runCommand: runner })).rejects.toMatchObject({
-      code: 'unsafe_connector_image',
-    });
-    expect(calls.some((call) => call.args.includes('up'))).toBe(false);
-    await expect(readFile(connector.tokenFile, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
-
-    calls.length = 0;
-    inspection = inspectJson(connector);
-    await stopCloudflareConnector(connector, { runCommand: runner });
-    expect(calls.some((call) => call.args.includes('down'))).toBe(true);
+    expect(foreign.calls.some((call) => call.args.includes('down'))).toBe(false);
   });
 });

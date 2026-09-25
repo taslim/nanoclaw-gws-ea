@@ -142,7 +142,6 @@ function dnsRecord(input: InstanceReservationInput): CloudflareDnsRecord {
 
 function cloudflareApi(overrides: Partial<CloudflareApi> = {}): CloudflareApi {
   return {
-    verifyToken: vi.fn(async () => undefined),
     listActiveZones: vi.fn<CloudflareApi['listActiveZones']>(async () => [
       { zoneId: ZONE_ID, name: 'example.test', accountId: ACCOUNT_ID, accountName: 'Test', status: 'active' },
     ]),
@@ -387,17 +386,14 @@ describe('assistant removal', () => {
     const order: string[] = [];
     let dnsPresent = true;
     const api = cloudflareApi({
-      listTunnels: vi.fn<CloudflareApi['listTunnels']>(async () => [
-        { id: TUNNEL_ID, name: metadata.tunnel_name, configSource: 'cloudflare', status: 'healthy' },
-      ]),
+      listTunnels: vi.fn<CloudflareApi['listTunnels']>(async () => [{ id: TUNNEL_ID, name: metadata.tunnel_name }]),
       getTunnelConfiguration: vi
         .fn<CloudflareApi['getTunnelConfiguration']>()
-        .mockResolvedValueOnce({ config: fullConfig, initialized: true, version: 1 })
-        .mockResolvedValueOnce({ config: peerConfig, initialized: true, version: 2 }),
+        .mockResolvedValueOnce({ config: fullConfig, version: 1 })
+        .mockResolvedValueOnce({ config: peerConfig, version: 2 }),
       replaceTunnelConfiguration: vi.fn(async (_accountId, _tunnelId, config) => {
         order.push('configuration');
         expect(config).toEqual(peerConfig);
-        return { config, initialized: true, version: 2 };
       }),
       listDnsRecords: vi.fn(async () => (dnsPresent ? [dnsRecord(target)] : [])),
       deleteDnsRecord: vi.fn(async () => {
@@ -420,7 +416,7 @@ describe('assistant removal', () => {
     });
 
     expect(order).toEqual(['configuration', 'dns', 'nanoclaw', 'gcp', 'onecli', 'files']);
-    expect(api.verifyToken).toHaveBeenCalledOnce();
+    expect(api.listActiveZones).toHaveBeenCalledOnce();
     expect(api.deleteTunnel).not.toHaveBeenCalled();
     expect(api.listTunnelConnections).not.toHaveBeenCalled();
     const after = await readRegistry(paths);
@@ -445,17 +441,14 @@ describe('assistant removal', () => {
     let tunnelPresent = true;
     const api = cloudflareApi({
       listTunnels: vi.fn<CloudflareApi['listTunnels']>(async () =>
-        tunnelPresent
-          ? [{ id: TUNNEL_ID, name: metadata.tunnel_name, configSource: 'cloudflare', status: 'healthy' }]
-          : [],
+        tunnelPresent ? [{ id: TUNNEL_ID, name: metadata.tunnel_name }] : [],
       ),
       getTunnelConfiguration: vi
         .fn<CloudflareApi['getTunnelConfiguration']>()
-        .mockResolvedValueOnce({ config: fullConfig, initialized: true, version: 1 })
-        .mockResolvedValueOnce({ config: catchAll, initialized: true, version: 2 }),
-      replaceTunnelConfiguration: vi.fn(async (_accountId, _tunnelId, config) => {
+        .mockResolvedValueOnce({ config: fullConfig, version: 1 })
+        .mockResolvedValueOnce({ config: catchAll, version: 2 }),
+      replaceTunnelConfiguration: vi.fn(async () => {
         order.push('configuration');
-        return { config, initialized: true, version: 2 };
       }),
       listDnsRecords: vi.fn(async () => (dnsPresent ? [dnsRecord(target)] : [])),
       deleteDnsRecord: vi.fn(async () => {
@@ -552,9 +545,7 @@ describe('assistant removal', () => {
     const metadata = (await readRegistry(paths)).shared_infrastructure_metadata.cloudflare;
     if (!metadata) throw new Error('Cloudflare metadata missing');
     const api = cloudflareApi({
-      listTunnels: vi.fn<CloudflareApi['listTunnels']>(async () => [
-        { id: TUNNEL_ID, name: metadata.tunnel_name, configSource: 'cloudflare', status: 'healthy' },
-      ]),
+      listTunnels: vi.fn<CloudflareApi['listTunnels']>(async () => [{ id: TUNNEL_ID, name: metadata.tunnel_name }]),
     });
 
     await expect(
@@ -582,17 +573,14 @@ describe('assistant removal', () => {
     let tunnelPresent = true;
     const api = cloudflareApi({
       listTunnels: vi.fn<CloudflareApi['listTunnels']>(async () =>
-        tunnelPresent
-          ? [{ id: TUNNEL_ID, name: metadata.tunnel_name, configSource: 'cloudflare', status: 'healthy' }]
-          : [],
+        tunnelPresent ? [{ id: TUNNEL_ID, name: metadata.tunnel_name }] : [],
       ),
       getTunnelConfiguration: vi
         .fn<CloudflareApi['getTunnelConfiguration']>()
-        .mockResolvedValueOnce({ config: fullConfig, initialized: true, version: 1 })
-        .mockResolvedValueOnce({ config: catchAll, initialized: true, version: 2 }),
-      replaceTunnelConfiguration: vi.fn(async (_accountId, _tunnelId, config) => {
+        .mockResolvedValueOnce({ config: fullConfig, version: 1 })
+        .mockResolvedValueOnce({ config: catchAll, version: 2 }),
+      replaceTunnelConfiguration: vi.fn(async () => {
         order.push('configuration');
-        return { config, initialized: true, version: 2 };
       }),
       listDnsRecords: vi.fn(async () => (dnsPresent ? [dnsRecord(target)] : [])),
       deleteDnsRecord: vi.fn(async () => {
@@ -650,7 +638,6 @@ describe('assistant removal', () => {
     let dnsPresent = true;
     const replace = vi.fn(async (_accountId: string, _tunnelId: string, config: unknown) => {
       currentConfig = config as typeof fullConfig;
-      return { config, initialized: true, version: 2 };
     });
     const deleteDns = vi
       .fn<CloudflareApi['deleteDnsRecord']>()
@@ -659,10 +646,8 @@ describe('assistant removal', () => {
         dnsPresent = false;
       });
     const api = cloudflareApi({
-      listTunnels: vi.fn<CloudflareApi['listTunnels']>(async () => [
-        { id: TUNNEL_ID, name: metadata.tunnel_name, configSource: 'cloudflare', status: 'healthy' },
-      ]),
-      getTunnelConfiguration: vi.fn(async () => ({ config: currentConfig, initialized: true, version: 2 })),
+      listTunnels: vi.fn<CloudflareApi['listTunnels']>(async () => [{ id: TUNNEL_ID, name: metadata.tunnel_name }]),
+      getTunnelConfiguration: vi.fn(async () => ({ config: currentConfig, version: 2 })),
       replaceTunnelConfiguration: replace,
       listDnsRecords: vi.fn(async () => (dnsPresent ? [dnsRecord(target)] : [])),
       deleteDnsRecord: deleteDns,
@@ -695,9 +680,7 @@ describe('assistant removal', () => {
     const replace = vi.fn<CloudflareApi['replaceTunnelConfiguration']>();
     const deleteDns = vi.fn<CloudflareApi['deleteDnsRecord']>();
     const api = cloudflareApi({
-      listTunnels: vi.fn<CloudflareApi['listTunnels']>(async () => [
-        { id: TUNNEL_ID, name: metadata.tunnel_name, configSource: 'cloudflare', status: 'healthy' },
-      ]),
+      listTunnels: vi.fn<CloudflareApi['listTunnels']>(async () => [{ id: TUNNEL_ID, name: metadata.tunnel_name }]),
       getTunnelConfiguration: vi.fn(async () => ({
         config: {
           ingress: [

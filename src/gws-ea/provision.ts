@@ -48,12 +48,7 @@ import {
 import { runInstanceNclJson } from './ncl.js';
 import { reconcileMainIdentity, type MainIdentityDependencies, type MainIdentityInput } from './identity.js';
 import { reconcilePrincipalDm, type PrincipalCandidate, type PrincipalDiscoveryDependencies } from './principal.js';
-import {
-  verifyExistingGchatEndpoint,
-  verifyExistingGchatRoute,
-  verifyManagedGchatRoute,
-  validateExistingGchatEndpoint,
-} from './endpoint.js';
+import { verifyExistingGchatEndpoint, verifyExistingGchatRoute, validateExistingGchatEndpoint } from './endpoint.js';
 import {
   verifyPrincipalBinding,
   verifyTalkableConversation,
@@ -100,15 +95,8 @@ import {
   parseGchatServiceAccountCredential,
   type GcpProjectInput,
 } from './gcloud.js';
-import { createCloudflareApi, type RetainedManagedIngressSetupSession } from './cloudflare-api.js';
-import { reconcileManagedCloudflareIngress } from './cloudflare-ingress.js';
-import {
-  createCloudflareConnectorLayout,
-  inspectCloudflareConnector,
-  reconcileCloudflareConnector,
-  validateCloudflareConnectorState,
-  validateObservedCloudflareConnector,
-} from './cloudflare-connector.js';
+import type { RetainedManagedIngressSetupSession } from './cloudflare-api.js';
+import { managedTransportResources } from './cloudflare-ingress.js';
 
 export interface ProductionProvisionOptions {
   /** Upstream's `.env` upsert, injected by the driver (`src/` cannot import `setup/`). */
@@ -158,7 +146,6 @@ export interface ProductionProvisionState {
   mainAgentGroupId?: string;
   principal?: PrincipalCandidate;
   welcomeEventId?: string;
-  managedTransportObservation?: string;
 }
 
 export interface ProductionProvisionContext {
@@ -188,20 +175,13 @@ export interface ProductionProvisionDependencies {
   readonly reconcileInstanceRuntime: typeof reconcileInstanceRuntime;
   readonly reconcileMainIdentity: typeof reconcileMainIdentity;
   readonly verifyRoute: typeof verifyExistingGchatRoute;
-  readonly verifyManagedRoute: typeof verifyManagedGchatRoute;
   readonly verifyEndpoint: typeof verifyExistingGchatEndpoint;
   readonly verifyPrincipalBinding: (input: PrincipalBindingVerificationInput) => PrincipalBindingVerificationResult;
   readonly reconcilePrincipal: typeof reconcilePrincipalDm;
   readonly verifyConversation: (input: ConversationVerificationInput) => ConversationVerificationResult;
   readonly holdReservedLoopbackPorts: typeof holdReservedLoopbackPorts;
-  readonly createCloudflareApi: typeof createCloudflareApi;
-  readonly reconcileManagedCloudflareIngress: typeof reconcileManagedCloudflareIngress;
-  readonly createCloudflareConnectorLayout: typeof createCloudflareConnectorLayout;
-  readonly inspectCloudflareConnector: typeof inspectCloudflareConnector;
-  readonly validateCloudflareConnectorState: typeof validateCloudflareConnectorState;
-  readonly validateObservedCloudflareConnector: typeof validateObservedCloudflareConnector;
-  readonly reconcileCloudflareConnector: typeof reconcileCloudflareConnector;
-  readonly managedTransportDelay: (milliseconds: number) => Promise<void>;
+  /** `establish_transport`'s resources in managed mode (KTD6). */
+  readonly managedTransportResources: typeof managedTransportResources;
   readonly nanoclawStartupDelay: (milliseconds: number) => Promise<void>;
 }
 
@@ -561,20 +541,12 @@ const defaultProductionDependencies: ProductionProvisionDependencies = {
   reconcileInstanceRuntime,
   reconcileMainIdentity,
   verifyRoute: verifyExistingGchatRoute,
-  verifyManagedRoute: verifyManagedGchatRoute,
   verifyEndpoint: verifyExistingGchatEndpoint,
   verifyPrincipalBinding,
   reconcilePrincipal: reconcilePrincipalDm,
   verifyConversation: verifyTalkableConversation,
   holdReservedLoopbackPorts,
-  createCloudflareApi,
-  reconcileManagedCloudflareIngress,
-  createCloudflareConnectorLayout,
-  inspectCloudflareConnector,
-  validateCloudflareConnectorState,
-  validateObservedCloudflareConnector,
-  reconcileCloudflareConnector,
-  managedTransportDelay: delay,
+  managedTransportResources,
   nanoclawStartupDelay: delay,
 };
 
@@ -655,114 +627,25 @@ function humanPause(phase: ProvisionStepId, code: string, message: string): Prov
   return { kind: 'human-action', phase, code, message };
 }
 
-const MANAGED_TRANSPORT_ATTEMPTS = 30;
-const MANAGED_TRANSPORT_DELAY_MS = 1_000;
-
-function managedLocalEndpoint(context: ProductionProvisionContext): string {
-  return `http://127.0.0.1:${context.input.runtime.allocated_ports.nanoclaw_webhook}/webhook/gchat`;
-}
-
-const REPAIRABLE_MANAGED_TRANSPORT_CODES = new Set([
-  'cloudflare_connector_missing',
-  'cloudflare_connector_state_missing',
-  'cloudflare_connector_state_drift',
-  'unhealthy_connector',
-  'endpoint_unreachable',
-  'endpoint_redirect',
-  'endpoint_auth_bypass',
-  'managed_catch_all_unreachable',
-  'managed_catch_all_mismatch',
-  'managed_listener_id_missing',
-  'managed_listener_mismatch',
-]);
-
-function isRepairableManagedTransportObservation(error: unknown): error is GwsEaError {
-  return error instanceof GwsEaError && REPAIRABLE_MANAGED_TRANSPORT_CODES.has(error.code);
-}
-
-async function observeManagedTransport(
+/**
+ * The Cloudflare account token for one managed-ingress change: the one this
+ * run already holds for the account, else one asked for with `reason`.
+ */
+async function requireManagedAccountToken(
   context: ProductionProvisionContext,
-  dependencies: ProductionProvisionDependencies,
-): Promise<Observation> {
-  const layout = dependencies.createCloudflareConnectorLayout({
-    cloudflareRoot: context.operation.paths.cloudflareRoot,
-    platform: context.input.serviceDependencies.platform,
-  });
-  try {
-    const connector = await dependencies.inspectCloudflareConnector(layout);
-    if (!connector) {
-      throw new GwsEaError('cloudflare_connector_missing', 'The shared Cloudflare connector is not running');
-    }
-    dependencies.validateObservedCloudflareConnector(layout, connector);
-    await dependencies.validateCloudflareConnectorState(layout);
-    await dependencies.verifyManagedRoute({
-      endpointUrl: context.input.runtime.endpoint_url,
-      localEndpointUrl: managedLocalEndpoint(context),
-    });
-    context.state.managedTransportObservation = undefined;
-    return PRESENT;
-  } catch (error) {
-    if (!isRepairableManagedTransportObservation(error)) throw error;
-    context.state.managedTransportObservation = error.message;
-    return ABSENT;
-  }
-}
-
-async function requireManagedAccountToken(context: ProductionProvisionContext, accountId: string): Promise<string> {
+  accountId: string,
+  reason: string,
+): Promise<string> {
   try {
     const retained = context.input.managedIngressSetup?.requireAccountToken(accountId);
     if (retained !== undefined) return retained;
   } catch (error) {
     if (!(error instanceof GwsEaError) || error.code !== 'cloudflare_token_required') throw error;
   }
-  const observation =
-    context.state.managedTransportObservation ?? 'Managed Cloudflare transport requires reconciliation';
   if (!context.input.requestCloudflareAccountToken) {
-    throw new GwsEaError(
-      'cloudflare_token_required',
-      `${observation}. A fresh Cloudflare API token is required to repair managed ingress.`,
-    );
+    throw new GwsEaError('cloudflare_token_required', `${reason}. A fresh Cloudflare API token is required.`);
   }
-  return context.input.requestCloudflareAccountToken(accountId, observation);
-}
-
-async function waitForManagedTransport(
-  context: ProductionProvisionContext,
-  dependencies: ProductionProvisionDependencies,
-): Promise<void> {
-  for (let attempt = 0; attempt < MANAGED_TRANSPORT_ATTEMPTS; attempt += 1) {
-    if ((await observeManagedTransport(context, dependencies)).status === 'present') return;
-    if (attempt + 1 < MANAGED_TRANSPORT_ATTEMPTS) {
-      await dependencies.managedTransportDelay(MANAGED_TRANSPORT_DELAY_MS);
-    }
-  }
-  throw new GwsEaError(
-    'managed_transport_not_ready',
-    context.state.managedTransportObservation ?? 'Managed Cloudflare transport did not become ready',
-  );
-}
-
-async function reconcileManagedTransport(
-  context: ProductionProvisionContext,
-  dependencies: ProductionProvisionDependencies,
-): Promise<void> {
-  const claim = context.input.ingress;
-  if (claim.mode !== 'managed-cloudflare') {
-    throw new GwsEaError('invalid_registry', 'Managed transport requires a managed Cloudflare claim');
-  }
-  const accountToken = await requireManagedAccountToken(context, claim.account_id);
-  const api = dependencies.createCloudflareApi({ accountToken });
-  const platform = context.input.serviceDependencies.platform;
-  const reconciled = await dependencies.reconcileManagedCloudflareIngress(context.operation.paths, api, {
-    originHost: platform === 'macos' ? 'host.docker.internal' : '127.0.0.1',
-  });
-  const connectorToken = await api.getTunnelToken(claim.account_id, reconciled.tunnelId);
-  const layout = dependencies.createCloudflareConnectorLayout({
-    cloudflareRoot: context.operation.paths.cloudflareRoot,
-    platform,
-  });
-  await dependencies.reconcileCloudflareConnector(layout, connectorToken);
-  await waitForManagedTransport(context, dependencies);
+  return context.input.requestCloudflareAccountToken(accountId, reason);
 }
 
 /** A pause while the principal DM is awaited or chosen; otherwise the binding joins the run state. */
@@ -855,6 +738,7 @@ export function createProductionProvisionSteps(
 ): ProvisionSteps<ProductionProvisionContext> {
   const dependencies: ProductionProvisionDependencies = { ...defaultProductionDependencies, ...overrides };
   const { input } = context;
+  const { ingress } = input;
   if (input.runtime.instance_id !== context.operation.instanceId) {
     throw new GwsEaError('runtime_mismatch', 'Provision runtime targets a different instance');
   }
@@ -1038,7 +922,7 @@ export function createProductionProvisionSteps(
       ],
     },
     establish_transport:
-      input.ingress.mode === 'existing'
+      ingress.mode === 'existing'
         ? {
             label: 'Publishing the secure callback…',
             resources: [
@@ -1065,16 +949,14 @@ export function createProductionProvisionSteps(
         : {
             label: 'Publishing the secure callback…',
             liveness: { label: 'Checking the secure callback…' },
-            resources: [
-              {
-                name: 'the managed Cloudflare transport',
-                observe: (value) => observeManagedTransport(value, dependencies),
-                apply: async (value) => {
-                  await reconcileManagedTransport(value, dependencies);
-                  return undefined;
-                },
-              },
-            ],
+            resources: dependencies.managedTransportResources({
+              paths: context.operation.paths,
+              instanceId: context.operation.instanceId,
+              claim: ingress,
+              platform: input.serviceDependencies.platform,
+              webhookPort: input.runtime.allocated_ports.nanoclaw_webhook,
+              accountToken: (reason) => requireManagedAccountToken(context, ingress.account_id, reason),
+            }),
           },
     configure_channel: {
       label: 'Checking Google Chat configuration…',

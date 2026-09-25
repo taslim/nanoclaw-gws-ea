@@ -16,8 +16,8 @@ import {
 import {
   createCloudflareConnectorLayout,
   inspectCloudflareConnector,
+  assertCloudflareConnectorOwnership,
   stopCloudflareConnector,
-  validateObservedCloudflareConnector,
   type CloudflareConnectorLayout,
   type CloudflareConnectorPlatform,
   type ObservedCloudflareConnector,
@@ -390,12 +390,7 @@ function assertOwnedTunnel(
   tunnelId: string,
   tunnelName: string,
 ): void {
-  if (
-    tunnels.length !== 1 ||
-    tunnels[0]?.id !== tunnelId ||
-    tunnels[0].name !== tunnelName ||
-    tunnels[0].configSource !== 'cloudflare'
-  ) {
+  if (tunnels.length !== 1 || tunnels[0]?.id !== tunnelId || tunnels[0].name !== tunnelName) {
     throw new GwsEaError('foreign_cloudflare_tunnel', 'Cloudflare tunnel changed ownership during removal');
   }
 }
@@ -431,7 +426,7 @@ async function verifyManagedRemovalAuthority(
     `Removing managed callback ${claim.callback_url} requires temporary Cloudflare authorization.`,
   );
   const api = (dependencies.createCloudflareApi ?? ((accountToken) => createCloudflareApi({ accountToken })))(token);
-  await api.verifyToken();
+  // Listing zones proves the token, account-owned tokens included (KTD6 item 4).
   const zones = await api.listActiveZones();
   if (
     !zones.some(
@@ -529,17 +524,12 @@ async function removeManagedCloudflareIngress(
     if (tunnelId !== null && !tunnelMissing) {
       const observed = await api.getTunnelConfiguration(claim.account_id, tunnelId);
       currentConfiguration = assertManagedCloudflareConfigurationOwnership(observed.config, ownershipUniverse);
-      if (stepCompleted(receipt, 'configuration')) {
-        if (stable(currentConfiguration) !== stable(desired)) {
-          throw new GwsEaError(
-            'cloudflare_configuration_drift',
-            'Cloudflare tunnel configuration changed after route teardown',
-          );
-        }
-      } else if (!stepIntended(receipt, 'configuration') && stable(currentConfiguration) === stable(desired)) {
+      // A peer's reconciliation leaves an assistant under removal out of the
+      // route set (R12), so a route already gone before intent counts as done.
+      if (stepCompleted(receipt, 'configuration') && stable(currentConfiguration) !== stable(desired)) {
         throw new GwsEaError(
           'cloudflare_configuration_drift',
-          'The managed route disappeared before removal intent was recorded',
+          'Cloudflare tunnel configuration changed after route teardown',
         );
       }
     } else if (tunnelId !== null && !stepCompleted(receipt, 'configuration')) {
@@ -579,7 +569,7 @@ async function removeManagedCloudflareIngress(
         layout,
       );
       if (observedConnector) {
-        (dependencies.validateCloudflareConnector ?? validateObservedCloudflareConnector)(layout, observedConnector);
+        (dependencies.validateCloudflareConnector ?? assertCloudflareConnectorOwnership)(layout, observedConnector);
         if (!privateRootPresent) {
           throw new GwsEaError(
             'unsafe_connector_owner',

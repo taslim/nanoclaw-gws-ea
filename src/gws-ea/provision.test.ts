@@ -42,8 +42,7 @@ import {
   persistInstanceRuntime,
   type UpsertEnvVars,
 } from './service.js';
-import type { CloudflareApi } from './cloudflare-api.js';
-import type { ObservedCloudflareConnector } from './cloudflare-connector.js';
+import type { ManagedTransport } from './cloudflare-ingress.js';
 import {
   GwsEaError,
   PROVISION_STEPS,
@@ -1202,24 +1201,15 @@ describe('production provision step composition', () => {
     expect(importProviderCredential).not.toHaveBeenCalled();
   });
 
-  it('reconciles managed ingress and waits for the exact public callback without connection metadata', async () => {
+  it('hands the managed transport its instance, claim, and platform, and asks for the account token only through it', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, managedReservation(paths));
-    const connectorToken = 'connector-token-canary';
-    const accountToken = 'account-token-canary';
-    const order: string[] = [];
-    let connectorReady = false;
-    let publicProbeReads = 0;
-    const api = {
-      getTunnelToken: vi.fn(async () => {
-        order.push('connector-token');
-        return connectorToken;
-      }),
-      listTunnelConnections: vi.fn(async () => {
-        throw new Error('Provisioning must not depend on optional connection metadata');
-      }),
-    } as unknown as CloudflareApi;
-    const observedConnector = Object.freeze({}) as ObservedCloudflareConnector;
+    const claim = reserved.exclusive_resource_claims.ingress;
+    if (claim.mode !== 'managed-cloudflare') throw new Error('managed fixture');
+    const resources = [{ name: 'the managed transport', observe: async () => PRESENT, apply: async () => undefined }];
+    let transport: ManagedTransport | undefined;
+    const requested: string[] = [];
+    let retained: string | undefined;
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
@@ -1229,250 +1219,57 @@ describe('production provision step composition', () => {
           ...base.input,
           managedIngressSetup: {
             requireAccountToken: (accountId) => {
-              order.push(`account-token:${accountId}`);
-              return accountToken;
+              if (retained === undefined) {
+                throw new GwsEaError('cloudflare_token_required', 'A fresh Cloudflare API token is required.');
+              }
+              expect(accountId).toBe(claim.account_id);
+              return retained;
             },
           },
-        },
-      };
-      const dependencies: Partial<ProductionProvisionDependencies> = {
-        createCloudflareApi: vi.fn((options) => {
-          expect(options.accountToken).toBe(accountToken);
-          order.push('api');
-          return api;
-        }),
-        reconcileManagedCloudflareIngress: vi.fn(async (_paths, receivedApi, options) => {
-          expect(receivedApi).toBe(api);
-          expect(options).toEqual({ originHost: 'host.docker.internal' });
-          order.push('ingress');
-          return { tunnelId: '11111111-1111-4111-8111-111111111111', configurationVersion: 7, dnsRecordIds: {} };
-        }),
-        reconcileCloudflareConnector: vi.fn(async (layout, token) => {
-          expect(layout.rootDirectory).toBe(paths.cloudflareRoot);
-          expect(token).toBe(connectorToken);
-          order.push('connector');
-          connectorReady = true;
-          return observedConnector;
-        }),
-        inspectCloudflareConnector: vi.fn(async () => (connectorReady ? observedConnector : undefined)),
-        validateCloudflareConnectorState: vi.fn(async () => undefined),
-        validateObservedCloudflareConnector: vi.fn(),
-        verifyManagedRoute: vi.fn(async ({ endpointUrl, localEndpointUrl }) => {
-          expect(connectorReady).toBe(true);
-          expect(endpointUrl).toBe('https://assistant.example.com/webhook/gchat');
-          expect(localEndpointUrl).toBe('http://127.0.0.1:3101/webhook/gchat');
-          publicProbeReads += 1;
-          order.push(`public-probe:${publicProbeReads}`);
-          if (publicProbeReads === 1) {
-            throw new GwsEaError('endpoint_unreachable', 'Cloudflare route is still propagating');
-          }
-          return { endpointUrl, listenerId: '22222222-2222-4222-8222-222222222222' };
-        }),
-        managedTransportDelay: vi.fn(async () => undefined),
-      };
-      const phase = createProductionProvisionSteps(context, dependencies).establish_transport.resources[0]!;
-
-      await expect(phase.observe(context)).resolves.toEqual(ABSENT);
-      await expect(phase.apply(context)).resolves.toBeUndefined();
-      await expect(phase.observe(context)).resolves.toEqual(PRESENT);
-    });
-
-    expect(order).toEqual([
-      `account-token:${'a'.repeat(32)}`,
-      'api',
-      'ingress',
-      'connector-token',
-      'connector',
-      'public-probe:1',
-      'public-probe:2',
-      'public-probe:3',
-    ]);
-    expect(api.listTunnelConnections).not.toHaveBeenCalled();
-  });
-
-  it('resumes a healthy managed transport without requesting Cloudflare account authority', async () => {
-    const paths = await testPaths();
-    const reserved = await reserveInstance(paths, managedReservation(paths));
-    const observedConnector = Object.freeze({}) as ObservedCloudflareConnector;
-    const requestCloudflareAccountToken = vi.fn();
-    const createCloudflareApi = vi.fn();
-
-    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
-      const base = productionContext(operation, reserved);
-      const context: ProductionProvisionContext = {
-        ...base,
-        input: { ...base.input, requestCloudflareAccountToken },
-      };
-      const phase = createProductionProvisionSteps(context, {
-        createCloudflareApi,
-        inspectCloudflareConnector: vi.fn(async () => observedConnector),
-        validateCloudflareConnectorState: vi.fn(async () => undefined),
-        validateObservedCloudflareConnector: vi.fn(),
-        verifyManagedRoute: vi.fn(async ({ endpointUrl }) => ({
-          endpointUrl,
-          listenerId: '22222222-2222-4222-8222-222222222222',
-        })),
-      }).establish_transport.resources[0]!;
-
-      await expect(phase.observe(context)).resolves.toEqual(PRESENT);
-    });
-
-    expect(requestCloudflareAccountToken).not.toHaveBeenCalled();
-    expect(createCloudflareApi).not.toHaveBeenCalled();
-  });
-
-  it('marks missing durable connector state for managed repair instead of accepting a live container', async () => {
-    const paths = await testPaths();
-    const reserved = await reserveInstance(paths, managedReservation(paths));
-    const observedConnector = Object.freeze({}) as ObservedCloudflareConnector;
-    const requestCloudflareAccountToken = vi.fn();
-    const verifyManagedRoute = vi.fn();
-
-    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
-      const base = productionContext(operation, reserved);
-      const context: ProductionProvisionContext = {
-        ...base,
-        input: { ...base.input, requestCloudflareAccountToken },
-      };
-      const phase = createProductionProvisionSteps(context, {
-        inspectCloudflareConnector: vi.fn(async () => observedConnector),
-        validateObservedCloudflareConnector: vi.fn(),
-        validateCloudflareConnectorState: vi.fn(async () => {
-          throw new GwsEaError('cloudflare_connector_state_missing', 'Cloudflare connector private state is missing');
-        }),
-        verifyManagedRoute,
-      }).establish_transport.resources[0]!;
-
-      await expect(phase.observe(context)).resolves.toEqual(ABSENT);
-      expect(context.state.managedTransportObservation).toBe('Cloudflare connector private state is missing');
-    });
-
-    expect(verifyManagedRoute).not.toHaveBeenCalled();
-    expect(requestCloudflareAccountToken).not.toHaveBeenCalled();
-  });
-
-  it('refuses unsafe connector ownership before requesting account authority or mutating Cloudflare', async () => {
-    const paths = await testPaths();
-    const reserved = await reserveInstance(paths, managedReservation(paths));
-    const observedConnector = Object.freeze({}) as ObservedCloudflareConnector;
-    const requestCloudflareAccountToken = vi.fn();
-    const createCloudflareApi = vi.fn();
-
-    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
-      const base = productionContext(operation, reserved);
-      const context: ProductionProvisionContext = {
-        ...base,
-        input: { ...base.input, requestCloudflareAccountToken },
-      };
-      const phase = createProductionProvisionSteps(context, {
-        createCloudflareApi,
-        inspectCloudflareConnector: vi.fn(async () => observedConnector),
-        validateObservedCloudflareConnector: vi.fn(() => {
-          throw new GwsEaError('unsafe_connector_owner', 'Cloudflare connector ownership labels are invalid');
-        }),
-      }).establish_transport.resources[0]!;
-
-      await expect(phase.observe(context)).rejects.toMatchObject({ code: 'unsafe_connector_owner' });
-    });
-
-    expect(requestCloudflareAccountToken).not.toHaveBeenCalled();
-    expect(createCloudflareApi).not.toHaveBeenCalled();
-  });
-
-  it('fails closed when connector inspection cannot run Docker', async () => {
-    const paths = await testPaths();
-    const reserved = await reserveInstance(paths, managedReservation(paths));
-    const requestCloudflareAccountToken = vi.fn();
-    const createCloudflareApi = vi.fn();
-
-    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
-      const base = productionContext(operation, reserved);
-      const context: ProductionProvisionContext = {
-        ...base,
-        input: { ...base.input, requestCloudflareAccountToken },
-      };
-      const phase = createProductionProvisionSteps(context, {
-        createCloudflareApi,
-        inspectCloudflareConnector: vi.fn(async () => {
-          throw new GwsEaError('command_failed', 'Docker connector inspection failed');
-        }),
-      }).establish_transport.resources[0]!;
-
-      await expect(phase.observe(context)).rejects.toMatchObject({ code: 'command_failed' });
-    });
-
-    expect(requestCloudflareAccountToken).not.toHaveBeenCalled();
-    expect(createCloudflareApi).not.toHaveBeenCalled();
-  });
-
-  it('reports the observed managed drift before requesting one fresh token', async () => {
-    const paths = await testPaths();
-    const reserved = await reserveInstance(paths, managedReservation(paths));
-    const observation = 'The public Google Chat callback is routed to a different NanoClaw listener';
-    const requested: string[] = [];
-    const api = {
-      getTunnelToken: vi.fn(async () => 'connector-token'),
-    } as unknown as CloudflareApi;
-    const observedConnector = Object.freeze({}) as ObservedCloudflareConnector;
-
-    await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
-      const base = productionContext(operation, reserved);
-      const context: ProductionProvisionContext = {
-        ...base,
-        input: {
-          ...base.input,
-          requestCloudflareAccountToken: async (accountId, observed) => {
-            requested.push(`${accountId}:${observed}`);
-            return 'fresh-account-token';
+          requestCloudflareAccountToken: async (accountId, reason) => {
+            requested.push(`${accountId}:${reason}`);
+            return 'requested-account-token';
           },
         },
       };
-      const verifyManagedRoute = vi
-        .fn()
-        .mockRejectedValueOnce(new GwsEaError('managed_listener_mismatch', observation))
-        .mockResolvedValue({
-          endpointUrl: 'https://assistant.example.com/webhook/gchat',
-          listenerId: '22222222-2222-4222-8222-222222222222',
-        });
-      const phase = createProductionProvisionSteps(context, {
-        createCloudflareApi: vi.fn(() => api),
-        reconcileManagedCloudflareIngress: vi.fn(async () => ({
-          tunnelId: '11111111-1111-4111-8111-111111111111',
-          configurationVersion: 4,
-          dnsRecordIds: {},
-        })),
-        inspectCloudflareConnector: vi.fn(async () => observedConnector),
-        validateCloudflareConnectorState: vi.fn(async () => undefined),
-        validateObservedCloudflareConnector: vi.fn(),
-        reconcileCloudflareConnector: vi.fn(async () => observedConnector),
-        verifyManagedRoute,
-        managedTransportDelay: vi.fn(async () => undefined),
-      }).establish_transport.resources[0]!;
+      const step = createProductionProvisionSteps(context, {
+        managedTransportResources: (received) => {
+          transport = received;
+          return resources;
+        },
+      }).establish_transport;
 
-      await expect(phase.observe(context)).resolves.toEqual(ABSENT);
-      await expect(phase.apply(context)).resolves.toBeUndefined();
-      await expect(phase.observe(context)).resolves.toEqual(PRESENT);
+      expect(step.resources).toBe(resources);
+      expect(step.liveness).toBeDefined();
+      expect(transport).toMatchObject({
+        paths,
+        instanceId: reserved.instance_id,
+        claim,
+        platform: 'macos',
+        webhookPort: reserved.allocated_ports.nanoclaw_webhook,
+      });
+      await expect(transport!.accountToken('Cloudflare must route the callback')).resolves.toBe(
+        'requested-account-token',
+      );
+      retained = 'retained-account-token';
+      await expect(transport!.accountToken('Cloudflare must route the callback')).resolves.toBe(
+        'retained-account-token',
+      );
     });
 
-    expect(requested).toEqual([`${'a'.repeat(32)}:${observation}`]);
+    expect(requested).toEqual([`${claim.account_id}:Cloudflare must route the callback`]);
   });
 
   it('keeps existing transport behavior and invokes no Cloudflare dependency', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
-    const createCloudflareApi = vi.fn();
-    const reconcileManagedCloudflareIngress = vi.fn();
-    const inspectCloudflareConnector = vi.fn();
-    const reconcileCloudflareConnector = vi.fn();
+    const managedTransportResources = vi.fn();
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
       const phase = createProductionProvisionSteps(context, {
         verifyRoute: async ({ endpointUrl }) => endpointUrl,
-        createCloudflareApi,
-        reconcileManagedCloudflareIngress,
-        inspectCloudflareConnector,
-        reconcileCloudflareConnector,
+        managedTransportResources,
       }).establish_transport.resources[0]!;
 
       await expect(phase.observe(context)).resolves.toEqual(PRESENT);
@@ -1480,10 +1277,7 @@ describe('production provision step composition', () => {
       expect(createProductionProvisionSteps(context).establish_transport.liveness).toBeUndefined();
     });
 
-    expect(createCloudflareApi).not.toHaveBeenCalled();
-    expect(reconcileManagedCloudflareIngress).not.toHaveBeenCalled();
-    expect(inspectCloudflareConnector).not.toHaveBeenCalled();
-    expect(reconcileCloudflareConnector).not.toHaveBeenCalled();
+    expect(managedTransportResources).not.toHaveBeenCalled();
   });
 
   it('pauses with the exact project-scoped Chat configuration handoff', async () => {

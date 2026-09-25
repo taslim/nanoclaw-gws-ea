@@ -61,13 +61,13 @@ const defaultPrompts: PromptAdapter = {
 const CLOUDFLARE_ID_PATTERN = /^[0-9a-f]{32}$/u;
 const DNS_LABEL_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 const DNS_NAME_PATTERN = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
-const CLOUDFLARE_API_TOKEN_URL = 'https://dash.cloudflare.com/profile/api-tokens';
 export const CLOUDFLARE_API_TOKEN_GUIDANCE = [
-  'Create a scoped API token for the intended account and every zone used by managed assistants on this machine:',
+  'Create a scoped user or account-owned API token for the intended account and every zone used by managed assistants on this machine:',
   'Account · Cloudflare Tunnel: Edit',
   'Zone · Zone: Read',
   'Zone · DNS: Edit',
-  CLOUDFLARE_API_TOKEN_URL,
+  'User tokens: https://dash.cloudflare.com/profile/api-tokens',
+  'Account-owned tokens: https://dash.cloudflare.com/?to=/:account/api-tokens',
   '',
   'The token is used only for this setup run and is not stored.',
 ].join('\n');

@@ -1,4 +1,12 @@
+/**
+ * The Cloudflare REST seam (KTD6). Readers tolerate the documented optional
+ * and extra fields; ownership is decided by callers on exact values. Every
+ * request writes its method, path, and HTTP status to the step's raw log,
+ * never a body; non-token reads go to the fixture capture sink when enabled.
+ */
 import type { CloudflareZoneChoice, ManagedIngressSetupSession } from './create-input.js';
+import { redact, registerSecret } from './redact.js';
+import { activeStep } from './run-log.js';
 import { GwsEaError } from './types.js';
 import { hasControlCharacters, isRecord, requireString as requireText } from './validation.js';
 
@@ -6,13 +14,18 @@ const DEFAULT_BASE_URL = 'https://api.cloudflare.com/client/v4';
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_READ_ATTEMPTS = 3;
 const MAX_PAGES = 100;
-const MAX_RETRY_DELAY_MS = 30_000;
+const PER_PAGE = 50;
+const MAX_BACKOFF_MS = 30_000;
+/** Cloudflare blocks a rate-limited token for up to five minutes. */
+const MAX_RETRY_AFTER_MS = 300_000;
+const MAX_ERROR_MESSAGE_CHARACTERS = 200;
 const CLOUDFLARE_ID_PATTERN = /^[0-9a-f]{32}$/u;
 const TUNNEL_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const DNS_NAME_PATTERN = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 
 type Fetch = typeof globalThis.fetch;
 type Sleep = (delayMs: number) => Promise<void>;
+type Method = 'GET' | 'POST' | 'PUT' | 'DELETE';
 
 export interface CloudflareApiOptions {
   readonly accountToken: string;
@@ -23,32 +36,19 @@ export interface CloudflareApiOptions {
   readonly sleep?: Sleep;
 }
 
-interface CloudflareEnvelope {
-  readonly success: boolean;
-  readonly result: unknown;
-  readonly errors: readonly unknown[];
-  readonly messages: readonly unknown[];
-  readonly resultInfo?: CloudflareResultInfo;
-}
-
-interface CloudflareResultInfo {
-  readonly page: number;
-  readonly totalPages: number;
-}
-
+/** A remotely managed tunnel; locally managed ones are refused as foreign when read. */
 export interface CloudflareTunnel {
   readonly id: string;
   readonly name: string;
-  readonly configSource: 'cloudflare';
-  readonly status: string;
 }
 
+/** A tunnel's configuration: an empty one before the first write. */
 export interface CloudflareTunnelConfiguration {
-  readonly config: unknown;
-  readonly initialized: boolean;
+  readonly config: Readonly<Record<string, unknown>>;
   readonly version: number;
 }
 
+/** One connected connector; `configVersion` is optional in the documented schema. */
 export interface CloudflareTunnelConnection {
   readonly id?: string;
   readonly configVersion?: number;
@@ -72,17 +72,16 @@ export interface CloudflareDnsRecordWrite {
 }
 
 export interface CloudflareApi {
-  verifyToken(): Promise<void>;
+  /** Also proves the token, including account-owned tokens, which `/user/tokens/verify` rejects. */
   listActiveZones(): Promise<readonly CloudflareZoneChoice[]>;
   listTunnels(accountId: string, name: string): Promise<readonly CloudflareTunnel[]>;
   createTunnel(accountId: string, name: string): Promise<CloudflareTunnel>;
   getTunnelConfiguration(accountId: string, tunnelId: string): Promise<CloudflareTunnelConfiguration>;
-  replaceTunnelConfiguration(
-    accountId: string,
-    tunnelId: string,
-    config: unknown,
-  ): Promise<CloudflareTunnelConfiguration>;
+  /** Replace the whole configuration; callers confirm it by reading it back. */
+  replaceTunnelConfiguration(accountId: string, tunnelId: string, config: unknown): Promise<void>;
+  /** The connector token, registered with the redactor on receipt and never logged or captured. */
   getTunnelToken(accountId: string, tunnelId: string): Promise<string>;
+  /** Connector state comes only from here: tunnel objects lose `connections` on 2026-10-05. */
   listTunnelConnections(accountId: string, tunnelId: string): Promise<readonly CloudflareTunnelConnection[]>;
   listDnsRecords(zoneId: string, name: string): Promise<readonly CloudflareDnsRecord[]>;
   createDnsRecord(zoneId: string, record: CloudflareDnsRecordWrite): Promise<CloudflareDnsRecord>;
@@ -94,225 +93,223 @@ export interface RetainedManagedIngressSetupSession extends ManagedIngressSetupS
   requireAccountToken(accountId: string): string;
 }
 
+/**
+ * A change Cloudflare did not confirm: no answer or a 5xx (it may have been
+ * applied), or a 429 after its Retry-After (it was not). Either way the
+ * caller re-reads before deciding whether to send it again (KTD6 item 5).
+ */
 export class CloudflareAmbiguousMutationError extends GwsEaError {
-  constructor(operation: string) {
+  readonly status: number | undefined;
+
+  constructor(operation: string, status?: number, cause?: unknown) {
     super(
-      'cloudflare_mutation_ambiguous',
-      `Cloudflare did not confirm ${operation}; inspect the exact owned resource before retrying.`,
+      status === 429 ? 'cloudflare_rate_limited' : 'cloudflare_mutation_ambiguous',
+      status === 429
+        ? `Cloudflare rate-limited the request to ${operation} (HTTP 429)`
+        : `Cloudflare did not confirm the request to ${operation}${status === undefined ? ': no answer' : ` (HTTP ${status})`}`,
+      {
+        details: { operation, ...(status === undefined ? {} : { http_status: status }) },
+        ...(cause === undefined ? {} : { cause }),
+      },
     );
     this.name = 'CloudflareAmbiguousMutationError';
+    this.status = status;
   }
+
+  /** A rate-limited change was certainly not applied. */
+  get rateLimited(): boolean {
+    return this.status === 429;
+  }
+}
+
+function invalid(what: string): GwsEaError {
+  return new GwsEaError('invalid_cloudflare_response', `Cloudflare returned an invalid ${what}`);
 }
 
 function requireString(value: unknown, label: string, maxLength?: number): string {
   return requireText(value, `Cloudflare ${label}`, 'invalid_cloudflare_response', maxLength);
 }
 
-function requireCloudflareHexId(value: unknown, label: string): string {
-  const id = requireString(value, label, 32).toLowerCase();
-  if (!CLOUDFLARE_ID_PATTERN.test(id)) {
-    throw new GwsEaError('invalid_cloudflare_response', `Cloudflare returned an invalid ${label}`);
-  }
-  return id;
+function text(value: unknown): string {
+  return typeof value === 'string' ? value : '';
 }
 
-function requireCloudflareTunnelId(value: unknown, label: string): string {
+function integer(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
+function responseId(value: unknown, label: string, pattern: RegExp): string {
   const id = requireString(value, label, 36).toLowerCase();
-  if (!TUNNEL_ID_PATTERN.test(id)) {
-    throw new GwsEaError('invalid_cloudflare_response', `Cloudflare returned an invalid ${label}`);
-  }
+  if (!pattern.test(id)) throw invalid(label);
   return id;
 }
 
-function requireAccountOrZoneId(value: string, label: string): string {
+function requestId(value: string, label: string, pattern: RegExp): string {
   const id = value.toLowerCase();
-  if (!CLOUDFLARE_ID_PATTERN.test(id)) throw new GwsEaError('invalid_cloudflare_request', `${label} is invalid`);
+  if (!pattern.test(id)) throw new GwsEaError('invalid_cloudflare_request', `${label} is invalid`);
   return id;
 }
 
-function requireTunnelId(value: string): string {
-  const id = value.toLowerCase();
-  if (!TUNNEL_ID_PATTERN.test(id))
-    throw new GwsEaError('invalid_cloudflare_request', 'Cloudflare tunnel ID is invalid');
-  return id;
+function accountPath(accountId: string): string {
+  return `/accounts/${requestId(accountId, 'Cloudflare account ID', CLOUDFLARE_ID_PATTERN)}`;
 }
 
-function requireDnsName(value: string): string {
-  const name = value.toLowerCase();
-  if (name !== value || !DNS_NAME_PATTERN.test(name)) {
-    throw new GwsEaError('invalid_cloudflare_request', 'Cloudflare DNS name is invalid');
-  }
-  return name;
+function tunnelPath(accountId: string, tunnelId: string): string {
+  return `${accountPath(accountId)}/cfd_tunnel/${requestId(tunnelId, 'Cloudflare tunnel ID', TUNNEL_ID_PATTERN)}`;
 }
 
-function parseResultInfo(value: unknown): CloudflareResultInfo {
-  if (!isRecord(value)) throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare pagination is missing');
-  const { page, per_page: perPage, total_count: totalCount, total_pages: reportedTotalPages } = value;
-  if (typeof page !== 'number' || !Number.isInteger(page) || page < 1) {
-    throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare pagination is invalid');
-  }
-  const totalPages =
-    reportedTotalPages === undefined &&
-    typeof perPage === 'number' &&
-    Number.isInteger(perPage) &&
-    perPage > 0 &&
-    typeof totalCount === 'number' &&
-    Number.isInteger(totalCount) &&
-    totalCount >= 0
-      ? Math.max(1, Math.ceil(totalCount / perPage))
-      : reportedTotalPages;
-  if (typeof totalPages !== 'number' || !Number.isInteger(totalPages) || totalPages < page || totalPages > MAX_PAGES) {
-    throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare pagination is invalid');
-  }
-  return { page, totalPages };
+function zonePath(zoneId: string): string {
+  return `/zones/${requestId(zoneId, 'Cloudflare zone ID', CLOUDFLARE_ID_PATTERN)}`;
 }
 
-function parseEnvelope(
-  value: unknown,
-  options: { readonly paginated: boolean; readonly allowMissingResult: boolean },
-): CloudflareEnvelope {
-  if (
-    !isRecord(value) ||
-    typeof value.success !== 'boolean' ||
-    !Array.isArray(value.errors) ||
-    !Array.isArray(value.messages)
-  ) {
-    throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare returned an invalid response envelope');
-  }
-  if (!options.allowMissingResult && !Object.hasOwn(value, 'result')) {
-    throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare response has no result');
-  }
+/** The first documented `{ code, message }` error, with its message redacted and bounded. */
+function firstError(errors: unknown): { readonly code?: number; readonly message?: string } {
+  const first = Array.isArray(errors) ? errors.find(isRecord) : undefined;
+  if (!first) return {};
+  const message = redact(text(first.message)).replace(/\s+/gu, ' ').trim();
   return {
-    success: value.success,
-    result: value.result,
-    errors: value.errors,
-    messages: value.messages,
-    ...(options.paginated && value.success ? { resultInfo: parseResultInfo(value.result_info) } : {}),
+    ...(integer(first.code) === undefined ? {} : { code: integer(first.code) }),
+    ...(message ? { message: message.slice(0, MAX_ERROR_MESSAGE_CHARACTERS) } : {}),
   };
 }
 
-function cloudflareErrorCode(errors: readonly unknown[]): number | undefined {
-  for (const value of errors) {
-    if (isRecord(value) && typeof value.code === 'number' && Number.isInteger(value.code)) return value.code;
-  }
-  return undefined;
-}
-
-function failure(operation: string, status: number, errors: readonly unknown[]): GwsEaError {
-  const code = cloudflareErrorCode(errors);
-  const suffix = code === undefined ? '' : ` (Cloudflare code ${code})`;
-  if (status === 401 || status === 403 || code === 9_100 || code === 10_000) {
+function failure(operation: string, status: number, errors: unknown): GwsEaError {
+  const { code, message } = firstError(errors);
+  const observed = [`HTTP ${status}`, ...(code === undefined ? [] : [`code ${code}`])].join(', ');
+  const details = {
+    operation,
+    http_status: status,
+    ...(code === undefined ? {} : { cloudflare_code: code }),
+    ...(message === undefined ? {} : { cloudflare_message: message }),
+  };
+  const summary = `Cloudflare could not ${operation} (${observed})${message ? `: ${message}` : ''}`;
+  if (status === 401 || status === 403 || code === 9_109 || code === 10_000) {
     return new GwsEaError(
       'cloudflare_capability_missing',
-      `Cloudflare authorization cannot ${operation}${suffix}. Use an active token with Zone Read, DNS Edit, and Cloudflare Tunnel Edit for the selected resources.`,
+      `${summary}. Use an active token with Zone Read, DNS Edit, and Cloudflare Tunnel Edit for the selected resources.`,
+      { details },
     );
   }
-  return new GwsEaError('cloudflare_api_failed', `Cloudflare could not ${operation}${suffix}`);
+  return new GwsEaError(status >= 500 ? 'cloudflare_unavailable' : 'cloudflare_api_failed', summary, { details });
 }
 
 function isRetryableStatus(status: number): boolean {
-  return (
-    status === 408 ||
-    status === 425 ||
-    status === 429 ||
-    status === 500 ||
-    status === 502 ||
-    status === 503 ||
-    status === 504
-  );
+  return status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
-function retryDelay(response: Response, attempt: number): number {
+function backoff(attempt: number): number {
+  return Math.min(100 * 2 ** attempt, MAX_BACKOFF_MS);
+}
+
+function retryAfter(response: Response, attempt: number): number {
   const header = response.headers.get('retry-after');
   if (header) {
     const seconds = Number(header);
-    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1_000, MAX_RETRY_DELAY_MS);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1_000, MAX_RETRY_AFTER_MS);
     const timestamp = Date.parse(header);
-    if (Number.isFinite(timestamp)) return Math.min(Math.max(timestamp - Date.now(), 0), MAX_RETRY_DELAY_MS);
+    if (Number.isFinite(timestamp)) return Math.min(Math.max(timestamp - Date.now(), 0), MAX_RETRY_AFTER_MS);
   }
-  return Math.min(100 * 2 ** attempt, MAX_RETRY_DELAY_MS);
+  return backoff(attempt);
 }
 
 function parseTunnel(value: unknown): CloudflareTunnel {
-  if (!isRecord(value)) throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare returned an invalid tunnel');
-  if (value.config_src !== 'cloudflare') {
-    throw new GwsEaError('foreign_cloudflare_tunnel', 'Cloudflare tunnel is not remotely managed by Cloudflare');
-  }
+  if (!isRecord(value)) throw invalid('tunnel');
+  // Either documented field marks a remotely managed tunnel; `connections` is never read.
+  const remote = value.config_src === undefined ? value.remote_config === true : value.config_src === 'cloudflare';
+  if (!remote) throw new GwsEaError('foreign_cloudflare_tunnel', 'Cloudflare tunnel is not remotely managed');
   return {
-    id: requireCloudflareTunnelId(value.id, 'tunnel ID'),
+    id: responseId(value.id, 'tunnel ID', TUNNEL_ID_PATTERN),
     name: requireString(value.name, 'tunnel name', 100),
-    configSource: 'cloudflare',
-    status: requireString(value.status, 'tunnel status', 64),
   };
 }
 
-function invalidConfiguration(value: unknown): GwsEaError {
-  const shape = (entry: unknown): string => {
-    if (entry === undefined) return 'missing';
-    if (entry === null) return 'null';
-    if (Array.isArray(entry)) return 'array';
-    return typeof entry;
-  };
-  const summary = isRecord(value)
-    ? `config=${shape(value.config)}, version=${shape(value.version)}`
-    : `result=${shape(value)}`;
-  return new GwsEaError(
-    'invalid_cloudflare_response',
-    `Cloudflare returned an invalid tunnel configuration (${summary})`,
-  );
+function shape(value: unknown): string {
+  if (value === undefined) return 'missing';
+  if (value === null) return 'null';
+  return Array.isArray(value) ? 'array' : typeof value;
 }
 
-function parseConfiguration(value: unknown, allowUninitialized: boolean): CloudflareTunnelConfiguration {
-  // The current GET schema makes result, config, and version optional before
-  // the first configuration PUT. No error status is treated as initialization.
-  if (allowUninitialized && value === undefined) {
-    return { config: {}, initialized: false, version: 0 };
+/** Every field of the documented result is optional: a fresh tunnel has neither `config` nor `version`. */
+function parseConfiguration(value: unknown): CloudflareTunnelConfiguration {
+  if (value === undefined || value === null) return { config: {}, version: 0 };
+  const { config, version } = isRecord(value) ? value : { config: undefined, version: undefined };
+  if (
+    !isRecord(value) ||
+    (config !== undefined && config !== null && !isRecord(config)) ||
+    (version !== undefined && version !== null && integer(version) === undefined)
+  ) {
+    const summary = isRecord(value) ? `config=${shape(config)}, version=${shape(version)}` : `result=${shape(value)}`;
+    throw new GwsEaError(
+      'invalid_cloudflare_response',
+      `Cloudflare returned an invalid tunnel configuration (${summary})`,
+    );
   }
-  if (!isRecord(value)) throw invalidConfiguration(value);
-  const documentedKeys = new Set(['account_id', 'config', 'created_at', 'source', 'tunnel_id', 'version']);
-  if (Object.keys(value).some((key) => !documentedKeys.has(key))) {
-    throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare tunnel configuration contains unknown fields');
-  }
-  if (value.account_id !== undefined) requireCloudflareHexId(value.account_id, 'configuration account ID');
-  if (value.tunnel_id !== undefined) requireCloudflareTunnelId(value.tunnel_id, 'configuration tunnel ID');
-  if (value.created_at !== undefined) requireString(value.created_at, 'configuration creation time', 64);
   if (value.source !== undefined && value.source !== 'cloudflare') {
     throw new GwsEaError('foreign_cloudflare_tunnel', 'Cloudflare tunnel configuration is not remotely managed');
   }
-  if (
-    allowUninitialized &&
-    (value.version === undefined || value.version === 0) &&
-    (value.config === undefined ||
-      value.config === null ||
-      (isRecord(value.config) && Object.keys(value.config).length === 0))
-  ) {
-    return { config: {}, initialized: false, version: 0 };
-  }
-  if (!isRecord(value.config)) throw invalidConfiguration(value);
-  const version = value.version;
-  if (typeof version !== 'number' || !Number.isInteger(version) || version < 0) {
-    throw invalidConfiguration(value);
-  }
-  return { config: value.config, initialized: true, version };
+  return { config: isRecord(config) ? config : {}, version: integer(version) ?? 0 };
 }
 
-function parseDnsRecord(value: unknown): CloudflareDnsRecord {
-  if (!isRecord(value) || typeof value.proxied !== 'boolean') {
-    throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare returned an invalid DNS record');
-  }
-  const name = requireString(value.name, 'DNS record name', 253).toLowerCase();
-  if (!DNS_NAME_PATTERN.test(name)) {
-    throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare returned an invalid DNS record name');
-  }
+function parseConnection(value: unknown): CloudflareTunnelConnection {
+  if (!isRecord(value)) return {};
+  const configVersion = integer(value.config_version);
   return {
-    id: requireCloudflareHexId(value.id, 'DNS record ID'),
-    type: requireString(value.type, 'DNS record type', 16),
-    name,
-    content: requireString(value.content, 'DNS record content', 2048),
-    proxied: value.proxied,
-    comment:
-      value.comment === null || value.comment === undefined ? '' : requireString(value.comment, 'DNS comment', 500),
+    ...(typeof value.id === 'string' && value.id ? { id: value.id } : {}),
+    ...(configVersion === undefined ? {} : { configVersion }),
   };
+}
+
+/** Fields other than the ID are read as found: a record that differs is foreign to its caller, not invalid. */
+function parseDnsRecord(value: unknown): CloudflareDnsRecord {
+  if (!isRecord(value)) throw invalid('DNS record');
+  return {
+    id: responseId(value.id, 'DNS record ID', CLOUDFLARE_ID_PATTERN),
+    type: text(value.type),
+    name: text(value.name).toLowerCase(),
+    content: text(value.content),
+    proxied: value.proxied === true,
+    comment: text(value.comment),
+  };
+}
+
+function parseZone(value: unknown): CloudflareZoneChoice | undefined {
+  if (!isRecord(value) || !isRecord(value.account)) throw invalid('zone');
+  if (value.status !== 'active') return undefined;
+  const name = requireString(value.name, 'zone name', 253).toLowerCase();
+  if (!DNS_NAME_PATTERN.test(name)) throw invalid('zone name');
+  const accountId = responseId(value.account.id, 'account ID', CLOUDFLARE_ID_PATTERN);
+  return {
+    zoneId: responseId(value.id, 'zone ID', CLOUDFLARE_ID_PATTERN),
+    name,
+    status: 'active',
+    accountId,
+    accountName: text(value.account.name) || accountId,
+  };
+}
+
+/** The last page: an empty one, the reported last page (`total_pages: 0` for none), or a short page. */
+function isLastPage(page: number, count: number, info: unknown): boolean {
+  if (count === 0) return true;
+  if (isRecord(info)) {
+    const totalCount = integer(info.total_count);
+    const perPage = integer(info.per_page);
+    const totalPages =
+      integer(info.total_pages) ?? (totalCount !== undefined && perPage ? Math.ceil(totalCount / perPage) : undefined);
+    if (totalPages !== undefined) return page >= totalPages;
+  }
+  return count < PER_PAGE;
+}
+
+interface RequestOptions {
+  readonly query?: Readonly<Record<string, string>>;
+  readonly body?: unknown;
+  /** The result is a secret: never captured. */
+  readonly secret?: boolean;
+}
+
+interface Answer {
+  readonly result: unknown;
+  readonly resultInfo: unknown;
 }
 
 class CloudflareApiClient implements CloudflareApi {
@@ -331,6 +328,7 @@ class CloudflareApiClient implements CloudflareApi {
     if (baseUrl.protocol !== 'https:' || baseUrl.username || baseUrl.password || baseUrl.search || baseUrl.hash) {
       throw new GwsEaError('invalid_cloudflare_api', 'Cloudflare API base URL is invalid');
     }
+    registerSecret(options.accountToken);
     this.#accountToken = options.accountToken;
     this.#baseUrl = baseUrl.toString().replace(/\/$/u, '');
     this.#fetch = options.fetch ?? globalThis.fetch;
@@ -345,25 +343,22 @@ class CloudflareApiClient implements CloudflareApi {
     }
   }
 
-  async #request(
-    operation: string,
-    method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE',
-    path: string,
-    options: {
-      readonly query?: Readonly<Record<string, string>>;
-      readonly body?: unknown;
-      readonly paginated?: boolean;
-      readonly allowMissingResult?: boolean;
-    } = {},
-  ): Promise<CloudflareEnvelope> {
+  /**
+   * One call. Reads retry transient failures within their bound, honoring
+   * Retry-After. A change is sent once: after a 429 it waits Retry-After, then
+   * reports the change unconfirmed so the caller re-reads first.
+   */
+  async #request(operation: string, method: Method, path: string, options: RequestOptions = {}): Promise<Answer> {
     const url = new URL(`${this.#baseUrl}${path}`);
     for (const [key, value] of Object.entries(options.query ?? {})) url.searchParams.set(key, value);
-    const attempts = method === 'GET' ? this.#maxReadAttempts : 1;
-    for (let attempt = 0; attempt < attempts; attempt++) {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.#timeoutMs);
+    const reading = method === 'GET';
+    const attempts = reading ? this.#maxReadAttempts : 1;
+    for (let attempt = 0; ; attempt += 1) {
+      const last = attempt + 1 >= attempts;
+      let response: Response;
+      let body: string;
       try {
-        const response = await this.#fetch(url, {
+        response = await this.#fetch(url, {
           method,
           headers: {
             authorization: `Bearer ${this.#accountToken}`,
@@ -372,211 +367,152 @@ class CloudflareApiClient implements CloudflareApi {
           },
           ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
           redirect: 'error',
-          signal: controller.signal,
+          signal: AbortSignal.timeout(this.#timeoutMs),
         });
-        if (isRetryableStatus(response.status) && method === 'GET' && attempt + 1 < attempts) {
-          await this.#sleep(retryDelay(response, attempt));
-          continue;
-        }
-        if (isRetryableStatus(response.status) && method !== 'GET') {
-          throw new CloudflareAmbiguousMutationError(operation);
-        }
-        let raw: unknown;
-        try {
-          raw = await response.json();
-        } catch (_error) {
-          if (!response.ok) throw failure(operation, response.status, []);
-          throw new GwsEaError(
-            'invalid_cloudflare_response',
-            `Cloudflare returned invalid JSON while trying to ${operation}`,
-          );
-        }
-        const envelope = parseEnvelope(raw, {
-          paginated: options.paginated === true,
-          allowMissingResult: options.allowMissingResult === true,
-        });
-        if (!response.ok || !envelope.success) throw failure(operation, response.status, envelope.errors);
-        return envelope;
+        body = await response.text();
       } catch (error) {
-        if (error instanceof GwsEaError) throw error;
-        if (method !== 'GET') throw new CloudflareAmbiguousMutationError(operation);
-        if (attempt + 1 >= attempts) {
-          throw new GwsEaError('cloudflare_unavailable', `Cloudflare did not answer while trying to ${operation}`);
+        activeStep()?.write(`Cloudflare ${method} ${url.pathname}: no answer\n`);
+        if (!reading) throw new CloudflareAmbiguousMutationError(operation, undefined, error);
+        if (last) {
+          throw new GwsEaError('cloudflare_unavailable', `Cloudflare did not answer the request to ${operation}`, {
+            cause: error,
+            details: { operation },
+          });
         }
-        await this.#sleep(Math.min(100 * 2 ** attempt, MAX_RETRY_DELAY_MS));
-      } finally {
-        clearTimeout(timeout);
+        await this.#sleep(backoff(attempt));
+        continue;
       }
+      activeStep()?.write(`Cloudflare ${method} ${url.pathname}: HTTP ${response.status}, ${body.length} bytes\n`);
+      if (isRetryableStatus(response.status) && (reading ? !last : response.status === 429)) {
+        const wait = retryAfter(response, attempt);
+        activeStep()?.write(`Waiting ${Math.ceil(wait / 1_000)} s before Cloudflare is asked again\n`);
+        await this.#sleep(wait);
+        if (reading) continue;
+      }
+      if (!reading && isRetryableStatus(response.status)) {
+        throw new CloudflareAmbiguousMutationError(operation, response.status);
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        if (!response.ok) throw failure(operation, response.status, []);
+        throw new GwsEaError(
+          'invalid_cloudflare_response',
+          `Cloudflare answered the request to ${operation} with HTTP ${response.status} but no JSON`,
+          { details: { operation, http_status: response.status } },
+        );
+      }
+      if (!isRecord(parsed) || typeof parsed.success !== 'boolean') {
+        if (!response.ok) throw failure(operation, response.status, []);
+        throw invalid(`response envelope for ${operation}`);
+      }
+      if (!response.ok || !parsed.success) throw failure(operation, response.status, parsed.errors);
+      if (reading && !options.secret) {
+        activeStep()?.captureHttp({ method, url: url.toString(), status: response.status, body });
+      }
+      return { result: parsed.result, resultInfo: parsed.result_info };
     }
-    throw new GwsEaError('cloudflare_unavailable', `Cloudflare did not answer while trying to ${operation}`);
   }
 
   async #list<T>(
     operation: string,
     path: string,
     query: Readonly<Record<string, string>>,
-    parse: (value: unknown) => T,
+    parse: (value: unknown) => T | undefined,
   ): Promise<readonly T[]> {
     const values: T[] = [];
-    for (let page = 1; page <= MAX_PAGES; page++) {
-      const envelope = await this.#request(operation, 'GET', path, {
-        query: { ...query, page: String(page), per_page: '50' },
-        paginated: true,
+    for (let page = 1; page <= MAX_PAGES; page += 1) {
+      const { result, resultInfo } = await this.#request(operation, 'GET', path, {
+        query: { ...query, page: String(page), per_page: String(PER_PAGE) },
       });
-      if (!Array.isArray(envelope.result) || !envelope.resultInfo || envelope.resultInfo.page !== page) {
-        throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare returned an invalid paginated result');
+      if (!Array.isArray(result)) throw invalid(`list while trying to ${operation}`);
+      for (const item of result) {
+        const parsed = parse(item);
+        if (parsed !== undefined) values.push(parsed);
       }
-      values.push(...envelope.result.map(parse));
-      if (page === envelope.resultInfo.totalPages) return values;
+      if (isLastPage(page, result.length, resultInfo)) return values;
     }
     throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare pagination exceeded its safety bound');
   }
 
-  async verifyToken(): Promise<void> {
-    const { result } = await this.#request('verify the API token', 'GET', '/user/tokens/verify');
-    if (!isRecord(result) || result.status !== 'active') {
-      throw new GwsEaError('cloudflare_token_inactive', 'Cloudflare API token is not active');
-    }
+  listActiveZones(): Promise<readonly CloudflareZoneChoice[]> {
+    return this.#list('read active zones', '/zones', { status: 'active' }, parseZone);
   }
 
-  async listActiveZones(): Promise<readonly CloudflareZoneChoice[]> {
-    return this.#list('read active zones', '/zones', { status: 'active' }, (value) => {
-      if (!isRecord(value) || !isRecord(value.account) || value.status !== 'active') {
-        throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare returned an invalid active zone');
-      }
-      const name = requireString(value.name, 'zone name', 253).toLowerCase();
-      if (!DNS_NAME_PATTERN.test(name)) {
-        throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare returned an invalid zone name');
-      }
-      return {
-        zoneId: requireCloudflareHexId(value.id, 'zone ID'),
-        name,
-        status: 'active',
-        accountId: requireCloudflareHexId(value.account.id, 'account ID'),
-        accountName: requireString(value.account.name, 'account name', 256),
-      };
-    });
-  }
-
-  async listTunnels(accountId: string, name: string): Promise<readonly CloudflareTunnel[]> {
-    const account = requireAccountOrZoneId(accountId, 'Cloudflare account ID');
-    const tunnelName = requireString(name, 'tunnel name', 100);
+  listTunnels(accountId: string, name: string): Promise<readonly CloudflareTunnel[]> {
     return this.#list(
       'read managed tunnels',
-      `/accounts/${account}/cfd_tunnel`,
-      {
-        name: tunnelName,
-        is_deleted: 'false',
-      },
+      `${accountPath(accountId)}/cfd_tunnel`,
+      { name: requireString(name, 'tunnel name', 100), is_deleted: 'false' },
       parseTunnel,
     );
   }
 
   async createTunnel(accountId: string, name: string): Promise<CloudflareTunnel> {
-    const account = requireAccountOrZoneId(accountId, 'Cloudflare account ID');
-    const tunnelName = requireString(name, 'tunnel name', 100);
-    const { result } = await this.#request('create the managed tunnel', 'POST', `/accounts/${account}/cfd_tunnel`, {
-      body: { name: tunnelName, config_src: 'cloudflare' },
-    });
+    const { result } = await this.#request(
+      'create the managed tunnel',
+      'POST',
+      `${accountPath(accountId)}/cfd_tunnel`,
+      {
+        body: { name: requireString(name, 'tunnel name', 100), config_src: 'cloudflare' },
+      },
+    );
     return parseTunnel(result);
   }
 
   async getTunnelConfiguration(accountId: string, tunnelId: string): Promise<CloudflareTunnelConfiguration> {
-    const account = requireAccountOrZoneId(accountId, 'Cloudflare account ID');
-    const tunnel = requireTunnelId(tunnelId);
-    const { result } = await this.#request(
-      'read the tunnel configuration',
-      'GET',
-      `/accounts/${account}/cfd_tunnel/${tunnel}/configurations`,
-      { allowMissingResult: true },
-    );
-    return parseConfiguration(result, true);
+    const path = `${tunnelPath(accountId, tunnelId)}/configurations`;
+    return parseConfiguration((await this.#request('read the tunnel configuration', 'GET', path)).result);
   }
 
-  async replaceTunnelConfiguration(
-    accountId: string,
-    tunnelId: string,
-    config: unknown,
-  ): Promise<CloudflareTunnelConfiguration> {
-    const account = requireAccountOrZoneId(accountId, 'Cloudflare account ID');
-    const tunnel = requireTunnelId(tunnelId);
+  async replaceTunnelConfiguration(accountId: string, tunnelId: string, config: unknown): Promise<void> {
     if (!isRecord(config)) throw new GwsEaError('invalid_cloudflare_request', 'Tunnel configuration is invalid');
-    const { result } = await this.#request(
-      'replace the tunnel configuration',
-      'PUT',
-      `/accounts/${account}/cfd_tunnel/${tunnel}/configurations`,
-      { body: { config } },
-    );
-    return parseConfiguration(result, false);
+    const path = `${tunnelPath(accountId, tunnelId)}/configurations`;
+    await this.#request('replace the tunnel configuration', 'PUT', path, { body: { config } });
   }
 
   async getTunnelToken(accountId: string, tunnelId: string): Promise<string> {
-    const account = requireAccountOrZoneId(accountId, 'Cloudflare account ID');
-    const tunnel = requireTunnelId(tunnelId);
     const { result } = await this.#request(
       'read the connector token',
       'GET',
-      `/accounts/${account}/cfd_tunnel/${tunnel}/token`,
+      `${tunnelPath(accountId, tunnelId)}/token`,
+      {
+        secret: true,
+      },
     );
-    return requireString(result, 'connector token', 16_384);
+    const token = requireString(result, 'connector token', 16_384);
+    registerSecret(token);
+    return token;
   }
 
   async listTunnelConnections(accountId: string, tunnelId: string): Promise<readonly CloudflareTunnelConnection[]> {
-    const account = requireAccountOrZoneId(accountId, 'Cloudflare account ID');
-    const tunnel = requireTunnelId(tunnelId);
-    const { result } = await this.#request(
-      'read tunnel connections',
-      'GET',
-      `/accounts/${account}/cfd_tunnel/${tunnel}/connections`,
-    );
-    if (!Array.isArray(result)) {
-      throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare returned invalid tunnel connections');
-    }
-    return result.map((value) => {
-      if (!isRecord(value)) {
-        throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare returned an invalid tunnel connection');
-      }
-      const id = value.id;
-      const configVersion = value.config_version;
-      if (
-        (configVersion !== undefined &&
-          configVersion !== null &&
-          (typeof configVersion !== 'number' || !Number.isInteger(configVersion))) ||
-        (id !== undefined && id !== null && typeof id !== 'string')
-      ) {
-        throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare returned an invalid tunnel connection');
-      }
-      return {
-        ...(id === undefined || id === null ? {} : { id: requireString(id, 'connection ID', 128) }),
-        ...(configVersion === undefined || configVersion === null ? {} : { configVersion }),
-      };
-    });
+    const path = `${tunnelPath(accountId, tunnelId)}/connections`;
+    const { result } = await this.#request('read tunnel connections', 'GET', path);
+    if (!Array.isArray(result)) throw invalid('tunnel connection list');
+    return result.map(parseConnection);
   }
 
-  async listDnsRecords(zoneId: string, name: string): Promise<readonly CloudflareDnsRecord[]> {
-    const zone = requireAccountOrZoneId(zoneId, 'Cloudflare zone ID');
-    const dnsName = requireDnsName(name);
-    return this.#list('read DNS records', `/zones/${zone}/dns_records`, { name: dnsName }, parseDnsRecord);
+  listDnsRecords(zoneId: string, name: string): Promise<readonly CloudflareDnsRecord[]> {
+    const dnsName = name.toLowerCase();
+    if (dnsName !== name || !DNS_NAME_PATTERN.test(dnsName)) {
+      throw new GwsEaError('invalid_cloudflare_request', 'Cloudflare DNS name is invalid');
+    }
+    return this.#list('read DNS records', `${zonePath(zoneId)}/dns_records`, { name: dnsName }, parseDnsRecord);
   }
 
   async createDnsRecord(zoneId: string, record: CloudflareDnsRecordWrite): Promise<CloudflareDnsRecord> {
-    const zone = requireAccountOrZoneId(zoneId, 'Cloudflare zone ID');
-    const { result } = await this.#request('create the owned DNS record', 'POST', `/zones/${zone}/dns_records`, {
-      body: record,
-    });
-    return parseDnsRecord(result);
+    const path = `${zonePath(zoneId)}/dns_records`;
+    return parseDnsRecord((await this.#request('create the owned DNS record', 'POST', path, { body: record })).result);
   }
 
   async deleteDnsRecord(zoneId: string, recordId: string): Promise<void> {
-    const zone = requireAccountOrZoneId(zoneId, 'Cloudflare zone ID');
-    const id = requireAccountOrZoneId(recordId, 'Cloudflare DNS record ID');
-    await this.#request('delete the owned DNS record', 'DELETE', `/zones/${zone}/dns_records/${id}`);
+    const id = requestId(recordId, 'Cloudflare DNS record ID', CLOUDFLARE_ID_PATTERN);
+    await this.#request('delete the owned DNS record', 'DELETE', `${zonePath(zoneId)}/dns_records/${id}`);
   }
 
   async deleteTunnel(accountId: string, tunnelId: string): Promise<void> {
-    const account = requireAccountOrZoneId(accountId, 'Cloudflare account ID');
-    const tunnel = requireTunnelId(tunnelId);
-    await this.#request('delete the owned tunnel', 'DELETE', `/accounts/${account}/cfd_tunnel/${tunnel}`);
+    await this.#request('delete the owned tunnel', 'DELETE', tunnelPath(accountId, tunnelId));
   }
 }
 
@@ -584,6 +520,10 @@ export function createCloudflareApi(options: CloudflareApiOptions): CloudflareAp
   return new CloudflareApiClient(options);
 }
 
+/**
+ * The account token for one run: listing its zones proves it, and it is held
+ * in memory only for the accounts those zones belong to.
+ */
 export function createManagedIngressSetupSession(
   dependencies: {
     readonly clientFactory?: (accountToken: string) => CloudflareApi;
@@ -594,9 +534,7 @@ export function createManagedIngressSetupSession(
   let discovered: { readonly token: string; readonly accountIds: ReadonlySet<string> } | null = null;
   return {
     async discoverZones(accountToken) {
-      const api = clientFactory(accountToken);
-      await api.verifyToken();
-      const zones = await api.listActiveZones();
+      const zones = await clientFactory(accountToken).listActiveZones();
       discovered = { token: accountToken, accountIds: new Set(zones.map((zone) => zone.accountId)) };
       return zones;
     },
@@ -604,7 +542,7 @@ export function createManagedIngressSetupSession(
       if (!discovered || discovered.token !== accountToken) {
         throw new GwsEaError(
           'cloudflare_token_unverified',
-          'Cloudflare API token must be verified before it is retained for this run',
+          'Cloudflare API token must list its zones before it is retained for this run',
         );
       }
       retained = discovered;

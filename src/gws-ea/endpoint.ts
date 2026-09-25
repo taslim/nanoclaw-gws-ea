@@ -23,10 +23,17 @@ export interface ManagedGchatRouteInput {
   readonly localEndpointUrl: string;
 }
 
-export interface VerifiedManagedGchatRoute {
-  readonly endpointUrl: string;
-  readonly listenerId: string;
-}
+/** What the managed callback route answered, as seen from outside. */
+export type ManagedRouteObservation =
+  | { readonly status: 'routed'; readonly listenerId: string }
+  /**
+   * Nothing to change: the callback or the local listener did not answer, or
+   * Cloudflare's edge answered 5xx/53x because the tunnel or the assistant is
+   * down. The answer may change without any help (propagation, restarts).
+   */
+  | { readonly status: 'down'; readonly observed: string; readonly evidence: string }
+  /** The hostname does not resolve, or Cloudflare answered without this assistant's listener: the route or DNS needs repair. */
+  | { readonly status: 'misrouted'; readonly observed: string; readonly evidence: string };
 
 export interface EndpointVerificationDependencies {
   readonly fetch?: typeof globalThis.fetch;
@@ -56,20 +63,18 @@ export function validateExistingGchatEndpoint(value: string): string {
   return endpoint.href;
 }
 
+/** Unsigned traffic must be refused with 401, without a redirect. */
 async function expectUnauthorized(
   fetchImplementation: typeof globalThis.fetch,
   endpointUrl: string,
-  authorization: string | undefined,
   timeoutMs: number,
-): Promise<Response> {
+): Promise<void> {
   let response: Response;
   try {
-    const headers = new Headers({ 'content-type': 'application/json' });
-    if (authorization !== undefined) headers.set('authorization', authorization);
     response = await fetchImplementation(endpointUrl, {
       method: 'POST',
       redirect: 'manual',
-      headers,
+      headers: { 'content-type': 'application/json' },
       body: '{}',
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -83,9 +88,11 @@ async function expectUnauthorized(
     throw new GwsEaError('endpoint_redirect', 'Google Chat endpoint resolved to a different URL');
   }
   if (response.status !== 401) {
-    throw new GwsEaError('endpoint_auth_bypass', 'Google Chat endpoint must return 401 for unauthenticated traffic');
+    throw new GwsEaError(
+      'endpoint_auth_bypass',
+      `Google Chat endpoint must return 401 for unauthenticated traffic; it answered ${response.status}`,
+    );
   }
-  return response;
 }
 
 function validateLocalGchatEndpoint(value: string): string {
@@ -113,45 +120,6 @@ function validateLocalGchatEndpoint(value: string): string {
   return endpoint.href;
 }
 
-function requireWebhookId(response: Response, location: 'local' | 'public'): string {
-  const id = response.headers.get('x-nanoclaw-webhook-id')?.toLowerCase();
-  if (!id || !WEBHOOK_ID_PATTERN.test(id)) {
-    throw new GwsEaError(
-      'managed_listener_id_missing',
-      `The ${location} Google Chat callback did not identify its NanoClaw listener`,
-    );
-  }
-  return id;
-}
-
-async function expectManagedCatchAll(
-  fetchImplementation: typeof globalThis.fetch,
-  endpointUrl: string,
-  timeoutMs: number,
-): Promise<void> {
-  const wrongPathUrl = new URL(MANAGED_WRONG_PATH, endpointUrl).href;
-  let response: Response;
-  try {
-    response = await fetchImplementation(wrongPathUrl, {
-      method: 'GET',
-      redirect: 'manual',
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-  } catch {
-    throw new GwsEaError('managed_catch_all_unreachable', 'Managed Cloudflare catch-all is unreachable');
-  }
-  if (
-    (response.status >= 300 && response.status < 400) ||
-    response.redirected ||
-    (response.url !== '' && response.url !== wrongPathUrl)
-  ) {
-    throw new GwsEaError('endpoint_redirect', 'Managed Cloudflare catch-all must not redirect');
-  }
-  if (response.status !== 404 || response.headers.has('x-nanoclaw-webhook-id')) {
-    throw new GwsEaError('managed_catch_all_mismatch', 'Managed Cloudflare catch-all must return its own 404');
-  }
-}
-
 /**
  * Verify the operator-owned route without following redirects. A real signed
  * Google Chat event is the authentication proof; a fabricated JWT cannot
@@ -168,7 +136,7 @@ export async function verifyExistingGchatEndpoint(
   }
   const fetchImplementation = dependencies.fetch ?? globalThis.fetch;
   const timeoutMs = dependencies.timeoutMs ?? 10_000;
-  await expectUnauthorized(fetchImplementation, endpointUrl, undefined, timeoutMs);
+  await expectUnauthorized(fetchImplementation, endpointUrl, timeoutMs);
   return { endpointUrl, audienceUrl };
 }
 
@@ -178,37 +146,124 @@ export async function verifyExistingGchatRoute(
   dependencies: EndpointVerificationDependencies = {},
 ): Promise<string> {
   const endpointUrl = validateExistingGchatEndpoint(input.endpointUrl);
-  await expectUnauthorized(
-    dependencies.fetch ?? globalThis.fetch,
-    endpointUrl,
-    undefined,
-    dependencies.timeoutMs ?? 10_000,
-  );
+  await expectUnauthorized(dependencies.fetch ?? globalThis.fetch, endpointUrl, dependencies.timeoutMs ?? 10_000);
   return endpointUrl;
 }
 
+type Probe = { readonly response: Response } | { readonly failure: string };
+
+function webhookId(response: Response): string | undefined {
+  const id = response.headers.get('x-nanoclaw-webhook-id')?.toLowerCase();
+  return id && WEBHOOK_ID_PATTERN.test(id) ? id : undefined;
+}
+
+function isRedirect(response: Response, url: string): boolean {
+  return (
+    (response.status >= 300 && response.status < 400) ||
+    response.redirected ||
+    (response.url !== '' && response.url !== url)
+  );
+}
+
+function failureCode(error: unknown): string {
+  const cause = error instanceof Error ? error.cause : undefined;
+  const code = cause instanceof Error ? (cause as NodeJS.ErrnoException).code : undefined;
+  if (typeof code === 'string' && code) return code;
+  return error instanceof Error && error.name === 'TimeoutError' ? 'timed out' : 'no answer';
+}
+
 /**
- * Prove that Cloudflare forwards this callback to this instance's loopback
- * listener, preserves NanoClaw authentication, and owns the wrong-path 404.
+ * Observe the managed callback from outside, reporting what it answered:
+ * this instance's local listener must answer 401 with its listener ID, the
+ * public callback must reach that same listener without a redirect, and a
+ * path outside the route must get Cloudflare's own 404. Edge 5xx/53x are
+ * reported apart from other mismatches: they mean the tunnel or the
+ * assistant is down, which no route change repairs.
  */
-export async function verifyManagedGchatRoute(
+export async function observeManagedGchatRoute(
   input: ManagedGchatRouteInput,
   dependencies: EndpointVerificationDependencies = {},
-): Promise<VerifiedManagedGchatRoute> {
+): Promise<ManagedRouteObservation> {
   const endpointUrl = validateExistingGchatEndpoint(input.endpointUrl);
   const localEndpointUrl = validateLocalGchatEndpoint(input.localEndpointUrl);
   const fetchImplementation = dependencies.fetch ?? globalThis.fetch;
   const timeoutMs = dependencies.timeoutMs ?? 10_000;
-  const local = await expectUnauthorized(fetchImplementation, localEndpointUrl, undefined, timeoutMs);
-  const localListenerId = requireWebhookId(local, 'local');
-  const remote = await expectUnauthorized(fetchImplementation, endpointUrl, undefined, timeoutMs);
-  const publicListenerId = requireWebhookId(remote, 'public');
-  if (localListenerId !== publicListenerId) {
-    throw new GwsEaError(
-      'managed_listener_mismatch',
-      'The public Google Chat callback is routed to a different NanoClaw listener',
+  const probe = async (url: string, method: 'GET' | 'POST'): Promise<Probe> => {
+    try {
+      const response = await fetchImplementation(url, {
+        method,
+        redirect: 'manual',
+        ...(method === 'POST' ? { headers: { 'content-type': 'application/json' }, body: '{}' } : {}),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      return { response };
+      /* eslint-disable-next-line no-catch-all/no-catch-all -- Not answering is itself the observation. */
+    } catch (error) {
+      return { failure: failureCode(error) };
+    }
+  };
+  const down = (observed: string, evidence: string): ManagedRouteObservation => ({
+    status: 'down',
+    observed,
+    evidence,
+  });
+  const misrouted = (observed: string, evidence: string): ManagedRouteObservation => ({
+    status: 'misrouted',
+    observed,
+    evidence,
+  });
+  const evidenceOf = (method: string, url: string, seen: Probe): string =>
+    `${method} ${url}: ${'response' in seen ? `HTTP ${seen.response.status}` : seen.failure}`;
+
+  const local = await probe(localEndpointUrl, 'POST');
+  const listenerId = 'response' in local && local.response.status === 401 ? webhookId(local.response) : undefined;
+  if (!listenerId) {
+    const answer = 'response' in local ? `answered ${local.response.status}` : `did not answer (${local.failure})`;
+    return down(`the assistant's local listener ${answer}`, evidenceOf('POST', localEndpointUrl, local));
+  }
+
+  const remote = await probe(endpointUrl, 'POST');
+  const remoteEvidence = evidenceOf('POST', endpointUrl, remote);
+  if (!('response' in remote)) {
+    // A hostname that does not resolve has no DNS record (yet); anything else is the network.
+    return remote.failure === 'ENOTFOUND'
+      ? misrouted("the public callback's hostname does not resolve (ENOTFOUND)", remoteEvidence)
+      : down(`the public callback did not answer (${remote.failure})`, remoteEvidence);
+  }
+  const { status } = remote.response;
+  if (status >= 500) {
+    return down(
+      `the public callback answered ${status}, so the Cloudflare tunnel or the assistant is down`,
+      remoteEvidence,
     );
   }
-  await expectManagedCatchAll(fetchImplementation, endpointUrl, timeoutMs);
-  return { endpointUrl, listenerId: localListenerId };
+  if (isRedirect(remote.response, endpointUrl))
+    return misrouted(`the public callback answered ${status}, a redirect`, remoteEvidence);
+  const publicId = webhookId(remote.response);
+  if (!publicId) return misrouted(`the public callback answered ${status} without a NanoClaw listener`, remoteEvidence);
+  if (publicId !== listenerId)
+    return misrouted('the public callback reached a different NanoClaw listener', remoteEvidence);
+  if (status !== 401)
+    return misrouted(`the public callback answered ${status} instead of refusing unsigned traffic`, remoteEvidence);
+
+  const wrongPathUrl = new URL(MANAGED_WRONG_PATH, endpointUrl).href;
+  const wrong = await probe(wrongPathUrl, 'GET');
+  const wrongEvidence = evidenceOf('GET', wrongPathUrl, wrong);
+  if (!('response' in wrong)) return down(`a path outside the route did not answer (${wrong.failure})`, wrongEvidence);
+  if (wrong.response.status >= 500) {
+    return down(
+      `a path outside the route answered ${wrong.response.status}, so the Cloudflare tunnel is down`,
+      wrongEvidence,
+    );
+  }
+  if (webhookId(wrong.response)) {
+    return misrouted("a path outside the route reached NanoClaw instead of Cloudflare's 404", wrongEvidence);
+  }
+  if (wrong.response.status !== 404 || isRedirect(wrong.response, wrongPathUrl)) {
+    return misrouted(
+      `a path outside the route answered ${wrong.response.status} instead of Cloudflare's 404`,
+      wrongEvidence,
+    );
+  }
+  return { status: 'routed', listenerId };
 }

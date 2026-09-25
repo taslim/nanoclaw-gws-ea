@@ -282,6 +282,7 @@ describe('GWS-EA interactive create input', () => {
     expect(discoverZones).toHaveBeenCalledOnce();
     const cloudflareGuidance = note.mock.calls.find((call) => call[1] === 'Cloudflare access')?.[0];
     expect(cloudflareGuidance).toContain('https://dash.cloudflare.com/profile/api-tokens');
+    expect(cloudflareGuidance).toContain('Account-owned tokens: https://dash.cloudflare.com/?to=/:account/api-tokens');
     expect(cloudflareGuidance).toContain('Cloudflare Tunnel: Edit');
     expect(cloudflareGuidance).toContain('Zone: Read');
     expect(cloudflareGuidance).toContain('DNS: Edit');

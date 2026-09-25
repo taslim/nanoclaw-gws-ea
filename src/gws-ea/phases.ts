@@ -32,7 +32,8 @@ export interface ProvisionHumanPause {
 
 export type Observation =
   | { readonly status: 'present' }
-  | { readonly status: 'absent' }
+  /** `reason` says what was seen, for the wait message and a failure after setup. */
+  | { readonly status: 'absent'; readonly reason?: string }
   /** The observation could not decide; `evidence` is what was seen, for the log and the stop summary. */
   | { readonly status: 'unknown'; readonly reason: string; readonly evidence: string }
   | { readonly status: 'pause'; readonly pause: ProvisionHumanPause };
@@ -49,6 +50,11 @@ export interface StepResource<Context> {
    * applies anyway, for a resource created under the instance's own unique ID.
    */
   readonly unknown?: 'wait' | 'create-by-unique-id';
+  /**
+   * The observation reports a runtime that is still starting as unknown, so
+   * absent means stopped: liveness repairs it at once instead of waiting.
+   */
+  readonly absentMeansStopped?: boolean;
   readonly observe: (context: Context) => Promise<Observation>;
   /** Create or repair the resource; returns a pause when only a person can continue. */
   readonly apply: (context: Context) => Promise<ProvisionHumanPause | undefined>;
@@ -117,12 +123,18 @@ export async function runProvisionSteps<Context>(
     const look = async (): Promise<Observation> => {
       const seen = await resource.observe(context);
       if (seen.status === 'unknown') activeStep()?.write(`${resource.name}: ${seen.reason} (${seen.evidence})\n`);
+      if (seen.status === 'absent' && seen.reason) activeStep()?.write(`${resource.name}: ${seen.reason}\n`);
       return seen;
     };
     let seen = await look();
     for (const seconds of OBSERVATION_WAITS_SECONDS) {
       if (settled(seen)) return seen;
-      const reason = seen.status === 'unknown' ? seen.reason : `Waiting for ${resource.name}…`;
+      const reason =
+        seen.status === 'unknown'
+          ? seen.reason
+          : seen.status === 'absent' && seen.reason
+            ? `Waiting for ${resource.name}: ${seen.reason}`
+            : `Waiting for ${resource.name}…`;
       runtime.emit?.({ type: 'step-waiting', step: id, reason });
       await sleep(seconds * 1_000);
       seen = await look();
@@ -140,7 +152,7 @@ export async function runProvisionSteps<Context>(
     waitOnAbsent: boolean,
   ): Promise<Pause> => {
     const before = await observe(id, resource, {
-      waitOnAbsent,
+      waitOnAbsent: waitOnAbsent && resource.absentMeansStopped !== true,
       applyOnUnknown: resource.unknown === 'create-by-unique-id',
     });
     if (before.status === 'present') return undefined;
@@ -151,7 +163,8 @@ export async function runProvisionSteps<Context>(
     const after = await observe(id, resource, { waitOnAbsent: true, applyOnUnknown: false });
     if (after.status === 'present') return undefined;
     if (after.status === 'pause') return after.pause;
-    throw new GwsEaError('step_incomplete', `${resource.name} is still missing after it was set up`);
+    const seenReason = after.status === 'absent' && after.reason ? `: ${after.reason}` : '';
+    throw new GwsEaError('step_incomplete', `${resource.name} is still missing after it was set up${seenReason}`);
   };
 
   /**

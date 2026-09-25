@@ -386,6 +386,20 @@ async function acquireMachineLock(paths: ControlPlanePaths): Promise<() => void>
   throw new GwsEaError('registry_busy', 'The machine registry is busy; retry the command');
 }
 
+/**
+ * Hold the machine lock for one machine-wide effect: the Cloudflare route-set
+ * write, the last-assistant retirement decision, and connector repair
+ * (KTD6 item 7). Everything else locks per instance.
+ */
+export async function withMachineLock<T>(paths: ControlPlanePaths, callback: () => Promise<T>): Promise<T> {
+  const release = await acquireMachineLock(paths);
+  try {
+    return await callback();
+  } finally {
+    release();
+  }
+}
+
 export interface CloudflareCoordinateUpdate {
   readonly tunnelId?: string;
   readonly dnsRecordIds?: Readonly<Record<string, string>>;
@@ -399,13 +413,14 @@ export interface LockedCloudflareRegistry {
 /**
  * Hold the machine registry lock across one shared Cloudflare reconciliation.
  * The callback can persist only remote coordinates; it cannot rewrite claims.
+ * The tunnel coordinate never changes once recorded; a DNS record that
+ * vanished may be recreated, and its new ID replaces the old one.
  */
 export async function withLockedCloudflareRegistry<T>(
   paths: ControlPlanePaths,
   callback: (locked: LockedCloudflareRegistry) => Promise<T>,
 ): Promise<T> {
-  const release = await acquireMachineLock(paths);
-  try {
+  return withMachineLock(paths, async () => {
     let current = await readRegistryFile(paths);
     const locked: LockedCloudflareRegistry = {
       get registry() {
@@ -437,12 +452,6 @@ export async function withLockedCloudflareRegistry<T>(
           if (!instance || instance.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare') {
             throw new GwsEaError('invalid_claim', 'Cloudflare DNS coordinate has no managed reservation');
           }
-          if (
-            instance.exclusive_resource_claims.ingress.dns_record_id !== null &&
-            instance.exclusive_resource_claims.ingress.dns_record_id !== dnsRecordId
-          ) {
-            throw new GwsEaError('reservation_mismatch', 'Cloudflare DNS coordinate changed; refusing replacement');
-          }
           instances[instanceId] = {
             ...instance,
             exclusive_resource_claims: {
@@ -466,10 +475,8 @@ export async function withLockedCloudflareRegistry<T>(
         return current;
       },
     };
-    return await callback(locked);
-  } finally {
-    release();
-  }
+    return callback(locked);
+  });
 }
 
 /**
