@@ -347,10 +347,17 @@ function managedClaim(reservation: InstanceReservation): ManagedCloudflareIngres
   return ingress.mode === 'managed-cloudflare' ? ingress : undefined;
 }
 
-function managedPeers(registry: InstanceRegistry, instanceId: string): number {
-  return Object.values(registry.instances).filter(
+/**
+ * Other managed assistants that still need the machine's tunnel: every live
+ * one, and every removal that has not yet taken its route down. A receipt that
+ * cannot be read counts as still needing it.
+ */
+async function tunnelUsers(paths: ControlPlanePaths, registry: InstanceRegistry, instanceId: string): Promise<number> {
+  const peers = Object.values(registry.instances).filter(
     (instance) => instance.instance_id !== instanceId && managedClaim(instance) !== undefined,
-  ).length;
+  );
+  const receipts = await Promise.all(peers.map((peer) => readReceipt(paths, peer.instance_id)));
+  return receipts.filter((receipt) => receipt?.completed['managed-ingress'] === undefined).length;
 }
 
 /** Evaluate once, on first use. */
@@ -463,14 +470,18 @@ interface ManagedIngressRemoval {
   readonly connector: CloudflareConnectorLayout;
   readonly stopConnector: () => Promise<void>;
   readonly sleep: (milliseconds: number) => Promise<void>;
+  /** Record in the receipt that this route is gone; called under the machine lock. */
+  readonly recordRouteRemoved: () => Promise<void>;
 }
 
 /**
  * The assistant's route leaves the shared route set under the machine lock;
  * peers write it there too, so it is observed whenever the machine has a
- * tunnel. Its own DNS record follows. The last managed assistant then retires
- * the connector and tunnel, still under the machine lock, and forgets the
- * tunnel so the next managed assistant creates its own.
+ * tunnel. Its own DNS record follows. Once no other assistant needs the
+ * tunnel, this removal retires the connector and tunnel, still under the
+ * machine lock, and forgets the tunnel so the next managed assistant creates
+ * its own. Its route is recorded gone under that same lock, retiring or not,
+ * so of two removals deciding back to back exactly one retires.
  */
 async function removeManagedIngress(removal: ManagedIngressRemoval): Promise<void> {
   const { paths, reservation, claim, api } = removal;
@@ -512,20 +523,23 @@ async function removeManagedIngress(removal: ManagedIngressRemoval): Promise<voi
   }
 
   await withLockedCloudflareRegistry(paths, async (locked) => {
-    if (managedPeers(locked.registry, reservation.instance_id) > 0) return;
-    const metadata = requireCloudflareMetadata(locked.registry);
-    const retiring = await observeTunnel(api, metadata);
-    await removal.stopConnector();
-    if (retiring) {
-      await waitForTunnelConnectionsToClear(api, metadata.account_id, retiring.id, removal.sleep);
-      await deleteAndConfirm(
-        () => api.deleteTunnel(metadata.account_id, retiring.id),
-        async () => (await observeTunnel(api, metadata)) === undefined,
-        `tunnel ${metadata.tunnel_name}`,
-      );
+    if ((await tunnelUsers(paths, locked.registry, reservation.instance_id)) === 0) {
+      const metadata = requireCloudflareMetadata(locked.registry);
+      const retiring = await observeTunnel(api, metadata);
+      await removal.stopConnector();
+      if (retiring) {
+        await waitForTunnelConnectionsToClear(api, metadata.account_id, retiring.id, removal.sleep);
+        await deleteAndConfirm(
+          () => api.deleteTunnel(metadata.account_id, retiring.id),
+          async () => (await observeTunnel(api, metadata)) === undefined,
+          `tunnel ${metadata.tunnel_name}`,
+        );
+      }
+      await rm(removal.connector.rootDirectory, { recursive: true, force: true });
+      await locked.forgetTunnel();
     }
-    await rm(removal.connector.rootDirectory, { recursive: true, force: true });
-    await locked.forgetTunnel();
+    // A failed retirement records nothing, so a resumed removal retires again.
+    await removal.recordRouteRemoved();
   });
 }
 
@@ -667,7 +681,7 @@ export async function describeRemoval(paths: ControlPlanePaths, instanceId: stri
             callback: ingress.callback_url,
             dnsRecordId: ingress.dns_record_id,
             route: `${ingress.hostname} ${GCHAT_TUNNEL_PATH}`,
-            sharedIngress: managedPeers(registry, instanceId) > 0 ? 'retained-for-peers' : 'retired',
+            sharedIngress: (await tunnelUsers(paths, registry, instanceId)) > 0 ? 'retained-for-peers' : 'retired',
           },
   };
 }
@@ -764,7 +778,7 @@ async function removeLocked(
   });
 
   await runStep(reporter, { id: 'prerequisites' }, async () => {
-    const retiresConnector = pending.has('managed-ingress') && managedPeers(registry, instanceId) === 0;
+    const retiresConnector = pending.has('managed-ingress') && (await tunnelUsers(paths, registry, instanceId)) === 0;
     if (pending.has('nanoclaw') || pending.has('onecli') || retiresConnector) await docker();
     if (pending.has('gcp-project')) {
       await withSignIn(async () => {
@@ -800,6 +814,11 @@ async function removeLocked(
             ? dependencies.stopCloudflareConnector(connector, await docker())
             : stopCloudflareConnector(connector, { dockerEndpoint: await docker() }),
         sleep: dependencies.sleep ?? delay,
+        recordRouteRemoved: () =>
+          record((current) => ({
+            ...current,
+            completed: { ...current.completed, 'managed-ingress': new Date().toISOString() },
+          })),
       });
       return undefined;
     },

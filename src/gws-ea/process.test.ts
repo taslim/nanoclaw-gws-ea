@@ -421,6 +421,33 @@ describe('GWS-EA command runner', () => {
     expect(error.details?.stderrTail).toBe(`bad key ${REDACTED}`);
   });
 
+  it('trims retained stderr to whole lines, so no fragment of a secret survives the cut', async () => {
+    const run = await runLog();
+    const apiKey = `env-secret-${randomBytes(12).toString('hex')}`;
+    const kept = 20;
+    // Blank lines after the key fill the 64 KiB retained window, except for the key's last `kept` characters.
+    const script = `process.stderr.write('x'.repeat(4096) + process.env.ONECLI_API_KEY + '\\n'.repeat(${64 * 1024 - kept})); process.exitCode = 1;`;
+
+    const error = await run.step('provision_gcp', () =>
+      failure(
+        runSanitizedCommand({
+          command: NODE,
+          args: ['--eval', script],
+          cwd: process.cwd(),
+          env: buildToolEnvironment(process.env, { ONECLI_API_KEY: apiKey }),
+        }),
+      ),
+    );
+
+    const raw = await rawLog(run, '01-provision-gcp.log');
+    const tail = String(error.details?.stderrTail);
+    const cut = apiKey.length - kept;
+    for (const fragment of [apiKey.slice(0, cut), apiKey.slice(cut)]) {
+      expect(tail).not.toContain(fragment);
+      expect(raw).not.toContain(fragment);
+    }
+  });
+
   it('streams an opt-in build log over 1 MiB to the raw log, redacted', async () => {
     const secret = `build-secret-${randomBytes(12).toString('hex')}`;
     const secretDirectory = await temporaryRoot('build-secret');

@@ -22,7 +22,13 @@ import {
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { SanitizedCommand, SanitizedCommandOutcome } from './process.js';
 import { allocateInstanceId, readRegistry, withLockedCloudflareRegistry, writeInstanceMarker } from './registry.js';
-import { removeAssistant, type RemovalDependencies, type RemovalInteraction } from './remove.js';
+import {
+  describeRemoval,
+  RemovalPause,
+  removeAssistant,
+  type RemovalDependencies,
+  type RemovalInteraction,
+} from './remove.js';
 import { GwsEaError, type InstanceReservationInput, type ProvisionStepId } from './types.js';
 
 // Removal must never reach a real gcloud, Docker, service manager, or Cloudflare from these tests.
@@ -608,6 +614,106 @@ describe('removal from any partial state', () => {
     expect((await readRegistry(paths)).shared_infrastructure_metadata.cloudflare).toBeNull();
   });
 
+  it('retires the tunnel with the last route to leave, though an earlier removal is still paused', async () => {
+    const paths = await testPaths();
+    const paused = await reserve(paths, reservationInput(paths, { managed: true, dns: true }), {
+      started: ['materialize_checkout', 'provision_gcp', 'establish_transport'],
+    });
+    const last = await reserve(
+      paths,
+      reservationInput(paths, { managed: true, dns: true, label: 'peer', port: 34_001 }),
+      { started: ['materialize_checkout', 'establish_transport'] },
+    );
+    await recordTunnel(paths);
+    await mkdir(paths.cloudflareRoot, { recursive: true, mode: 0o700 });
+    const { dependencies, cloudflare, interaction } = world(paused);
+    cloudflare.tunnels = [{ id: TUNNEL_ID, name: await tunnelName(paths) }];
+    cloudflare.config = { ingress: [route(paused), route(last), CATCH_ALL] };
+    cloudflare.dns = [dnsRecord(paused), dnsRecord(last, 'd'.repeat(32))];
+    const stopConnector = vi.fn(async () => undefined);
+    const shared = { createCloudflareApi: () => cloudflare.api(), stopCloudflareConnector: stopConnector };
+
+    // A live peer keeps the tunnel; the paused removal's own route and record are gone.
+    await expect(removeAssistant(paths, paused.instance_id, { ...dependencies, ...shared })).rejects.toBeInstanceOf(
+      RemovalPause,
+    );
+    expect(cloudflare.config).toEqual({ ingress: [route(last), CATCH_ALL] });
+    expect(cloudflare.tunnels).toHaveLength(1);
+    expect(stopConnector).not.toHaveBeenCalled();
+
+    // The paused removal no longer needs the tunnel, so the last route to leave retires it.
+    await removeAssistant(paths, last.instance_id, { ...world(last).dependencies, ...shared });
+    expect(stopConnector).toHaveBeenCalledOnce();
+    expect(cloudflare.calls.filter((call) => call === 'tunnel')).toHaveLength(1);
+    expect(cloudflare.tunnels).toEqual([]);
+    expect(cloudflare.dns).toEqual([]);
+    expect(await exists(paths.cloudflareRoot)).toBe(false);
+    expect((await readRegistry(paths)).shared_infrastructure_metadata.cloudflare?.tunnel_id).toBeNull();
+
+    // Finishing the paused removal never asks Cloudflare again.
+    const outcome = await removeAssistant(paths, paused.instance_id, {
+      ...dependencies,
+      ...shared,
+      abandon: new Set(['gcp-project']),
+    });
+    expect(interaction.requestCloudflareAccountToken).toHaveBeenCalledOnce();
+    expect(outcome).toMatchObject({
+      removed: ['managed-ingress', 'instance-files'],
+      abandoned: [{ resource: 'gcp-project' }],
+    });
+    await expectGone(paths, paused);
+    expect((await readRegistry(paths)).shared_infrastructure_metadata.cloudflare).toBeNull();
+  });
+
+  it('retires the tunnel exactly once when the last two managed assistants are removed together', async () => {
+    const paths = await testPaths();
+    const started = ['materialize_checkout', 'establish_transport', 'start_nanoclaw'] as const;
+    const first = await reserve(paths, reservationInput(paths, { managed: true, dns: true }), { started });
+    const second = await reserve(
+      paths,
+      reservationInput(paths, { managed: true, dns: true, label: 'peer', port: 34_001 }),
+      { started },
+    );
+    await recordTunnel(paths);
+    await mkdir(paths.cloudflareRoot, { recursive: true, mode: 0o700 });
+    const cloudflare = new FakeCloudflare();
+    cloudflare.tunnels = [{ id: TUNNEL_ID, name: await tunnelName(paths) }];
+    cloudflare.config = { ingress: [route(first), route(second), CATCH_ALL] };
+    cloudflare.dns = [dnsRecord(first), dnsRecord(second, 'd'.repeat(32))];
+    const stopConnector = vi.fn(async () => undefined);
+    // Neither assistant leaves the registry until both have decided about the tunnel.
+    let decided = 0;
+    let bothDecided = (): void => undefined;
+    const decisions = new Promise<void>((resolve) => {
+      bothDecided = resolve;
+    });
+    const uninstallNanoclaw = vi.fn(async () => {
+      decided += 1;
+      if (decided === 2) bothDecided();
+      await decisions;
+    });
+    const remove = (input: InstanceReservationInput) =>
+      removeAssistant(paths, input.instance_id, {
+        ...world(input).dependencies,
+        createCloudflareApi: () => cloudflare.api(),
+        stopCloudflareConnector: stopConnector,
+        uninstallNanoclaw,
+      });
+
+    await Promise.all([remove(first), remove(second)]);
+
+    expect(uninstallNanoclaw).toHaveBeenCalledTimes(2);
+    expect(stopConnector).toHaveBeenCalledOnce();
+    expect(cloudflare.calls.filter((call) => call === 'tunnel')).toHaveLength(1);
+    expect(cloudflare.tunnels).toEqual([]);
+    expect(cloudflare.dns).toEqual([]);
+    expect(cloudflare.config).toEqual({ ingress: [CATCH_ALL] });
+    await expectGone(paths, first);
+    await expectGone(paths, second);
+    expect(await exists(paths.cloudflareRoot)).toBe(false);
+    expect((await readRegistry(paths)).shared_infrastructure_metadata.cloudflare).toBeNull();
+  });
+
   it("does not let one assistant's stuck removal block creating, resuming, or removing another", async () => {
     const paths = await testPaths();
     const stuck = await reserve(paths, reservationInput(paths, { managed: true, dns: true }), {
@@ -963,6 +1069,27 @@ describe('removal command', () => {
       cliRuntime(finalPaths, finalOutput, { confirmRemoval: async () => false }),
     );
     expect(finalOutput).toContain('Shared Cloudflare ingress: retired after this final managed callback');
+  });
+
+  it('previews shared ingress as retired once the only other managed removal has taken its route down', async () => {
+    const paths = await testPaths();
+    const target = await reserve(paths, reservationInput(paths, { managed: true, dns: true }));
+    const paused = await reserve(paths, reservationInput(paths, { managed: true, label: 'peer', port: 34_001 }), {
+      started: ['materialize_checkout', 'provision_gcp'],
+    });
+    await recordTunnel(paths);
+    const { dependencies, cloudflare } = world(paused);
+    cloudflare.tunnels = [{ id: TUNNEL_ID, name: await tunnelName(paths) }];
+    cloudflare.config = { ingress: [route(target), route(paused), CATCH_ALL] };
+    const sharedIngress = async () => {
+      const { ingress } = await describeRemoval(paths, target.instance_id);
+      return ingress.mode === 'managed-cloudflare' ? ingress.sharedIngress : undefined;
+    };
+
+    expect(await sharedIngress()).toBe('retained-for-peers');
+    await expect(removeAssistant(paths, paused.instance_id, dependencies)).rejects.toBeInstanceOf(RemovalPause);
+    expect(cloudflare.config).toEqual({ ingress: [route(target), CATCH_ALL] });
+    expect(await sharedIngress()).toBe('retired');
   });
 
   it('clears run-scoped Cloudflare authority when the remove command exits', async () => {

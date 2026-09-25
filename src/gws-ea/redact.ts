@@ -15,10 +15,14 @@ export const REDACTED = '[REDACTED]';
 const MINIMUM_SECRET_LENGTH = 8;
 const MAX_SECRET_FILE_BYTES = 1024 * 1024;
 const MAX_PENDING_LINE_CHARACTERS = 64 * 1024;
+const OMITTED_LINE = `[output line over ${MAX_PENDING_LINE_CHARACTERS / 1024} KiB omitted]`;
+// Enough of a dropped line's unscanned end to finish a PEM marker split across chunks.
+const PEM_MARKER_CARRY_CHARACTERS = 256;
 
 const PEM_BLOCK = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*?-----END [A-Z0-9 ]+-----/gu;
 const PEM_BEGIN = /-----BEGIN [A-Z0-9 ]+-----/u;
 const PEM_END = /-----END [A-Z0-9 ]+-----/u;
+const PEM_MARKER = /-----(BEGIN|END) [A-Z0-9 ]+-----/gu;
 const PEM_UNTIL_END = /^[\s\S]*?-----END [A-Z0-9 ]+-----/u;
 const PEM_FROM_BEGIN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*$/u;
 
@@ -111,13 +115,28 @@ export interface StreamRedactor {
 }
 
 /**
- * Line-buffered redaction for teed streams. A PEM block split across lines or
- * chunks is swallowed from its BEGIN marker through its END marker, so body
- * lines between them never pass.
+ * Line-buffered redaction for teed streams; a line is the unit of redaction. A
+ * PEM block split across lines or chunks is swallowed from its BEGIN marker
+ * through its END marker, so body lines between them never pass. A line longer
+ * than the bound cannot be redacted in bounded memory, so none of its text is
+ * written: one marker stands in for it, and its PEM markers still open or close
+ * a block.
  */
 export function createStreamRedactor(): StreamRedactor {
+  // While `dropping`, `pending` holds only the unscanned end of the dropped line.
   let pending = '';
   let insidePem = false;
+  let dropping = false;
+
+  // Dropped text moves the PEM state to its last marker; returns the end a split marker may still complete.
+  const skip = (text: string): string => {
+    let scanned = 0;
+    for (const marker of text.matchAll(PEM_MARKER)) {
+      insidePem = marker[1] === 'BEGIN';
+      scanned = marker.index + marker[0].length;
+    }
+    return text.slice(Math.max(scanned, text.length - PEM_MARKER_CARRY_CHARACTERS));
+  };
 
   const emit = (line: string, terminated: boolean): string => {
     const newline = terminated ? '\n' : '';
@@ -137,19 +156,36 @@ export function createStreamRedactor(): StreamRedactor {
 
   return {
     push(chunk) {
-      const lines = `${pending}${chunk}`.split('\n');
+      let text = `${pending}${chunk}`;
+      let output = '';
+      if (dropping) {
+        const newline = text.indexOf('\n');
+        if (newline === -1) {
+          pending = skip(text);
+          return '';
+        }
+        skip(text.slice(0, newline));
+        dropping = false;
+        // As emit() does, a line that leaves a PEM block open leaves its newline to the END line.
+        output = insidePem ? '' : '\n';
+        text = text.slice(newline + 1);
+      }
+      const lines = text.split('\n');
       pending = lines.pop() ?? '';
-      let output = lines.map((line) => emit(line, true)).join('');
+      output += lines.map((line) => emit(line, true)).join('');
       if (pending.length >= MAX_PENDING_LINE_CHARACTERS) {
-        output += emit(pending, false);
-        pending = '';
+        output += OMITTED_LINE;
+        pending = skip(pending);
+        dropping = true;
       }
       return output;
     },
     end() {
-      const remainder = pending;
+      const output = !dropping && pending ? emit(pending, false) : '';
       pending = '';
-      return remainder ? emit(remainder, false) : '';
+      insidePem = false;
+      dropping = false;
+      return output;
     },
   };
 }

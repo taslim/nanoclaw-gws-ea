@@ -19,6 +19,8 @@ const PEM_BODY = [
   'k3n0dBase64BodyLineTwoAbCdEfGhIjKlMnOpQrStUvWxYz0123',
 ];
 const PEM = ['-----BEGIN PRIVATE KEY-----', ...PEM_BODY, '-----END PRIVATE KEY-----'].join('\n');
+const MAX_LINE = 64 * 1024;
+const OMITTED = '[output line over 64 KiB omitted]';
 
 function uniqueSecret(label: string): string {
   return `${label}-${randomBytes(12).toString('hex')}`;
@@ -116,6 +118,69 @@ describe('GWS-EA redactor', () => {
     ].join('');
 
     expect(output).toBe(`step 1/3\n${REDACTED}\nstep 2/3 ${REDACTED}\nstep 3/3`);
+  });
+
+  it('omits a line too long to redact, so a registered secret split across the bound never passes', () => {
+    const stream = createStreamRedactor();
+    const secret = uniqueSecret('straddles-the-bound');
+    registerSecret(secret);
+    const output = [
+      stream.push(`${'x'.repeat(MAX_LINE - 10)}${secret.slice(0, 10)}`),
+      stream.push(`${secret.slice(10)}\n`),
+      stream.end(),
+    ].join('');
+
+    for (const part of [secret.slice(0, 10), secret.slice(10)]) expect(output).not.toContain(part);
+    expect(output).toBe(`${OMITTED}\n`);
+  });
+
+  it('omits a line too long to redact, so a token shape split across the bound never passes', () => {
+    const stream = createStreamRedactor();
+    const token = `ya29.${randomBytes(18).toString('hex')}`;
+    const output = [
+      stream.push(`${'x'.repeat(MAX_LINE - 11)} ${token.slice(0, 10)}`),
+      stream.push(`${token.slice(10)} done\n`),
+      stream.end(),
+    ].join('');
+
+    for (const part of [token.slice(0, 10), token.slice(10)]) expect(output).not.toContain(part);
+    expect(output).toBe(`${OMITTED}\n`);
+  });
+
+  it('writes one marker for an overlong line spread over chunks, then redacts the next line as usual', () => {
+    const stream = createStreamRedactor();
+    const secret = uniqueSecret('next-line');
+    registerSecret(secret);
+    const output = [
+      ...Array.from({ length: 4 }, () => stream.push('y'.repeat(MAX_LINE / 2))),
+      stream.push(`${'y'.repeat(100)}\nnext ${secret}\n`),
+      stream.end(),
+    ].join('');
+
+    expect(output).toBe(`${OMITTED}\nnext ${REDACTED}\n`);
+  });
+
+  it('keeps a PEM block swallowed when its BEGIN marker is inside an overlong dropped line', () => {
+    const begin = ' -----BEGIN PRIVATE KEY-----';
+    const rest = `${begin.slice(12)}\n${PEM_BODY.join('\n')}\n-----END PRIVATE KEY-----\nafter\n`;
+    // The marker straddles the bound, then straddles two later chunks of the dropped line.
+    const splits = [
+      [`${'x'.repeat(MAX_LINE - 12)}${begin.slice(0, 12)}`, rest],
+      ['x'.repeat(MAX_LINE), begin.slice(0, 12), rest],
+    ];
+    for (const chunks of splits) {
+      const stream = createStreamRedactor();
+      const output = [...chunks.map((chunk) => stream.push(chunk)), stream.end()].join('');
+      expect(output).toBe(`${OMITTED}\nafter\n`);
+    }
+  });
+
+  it('ends a stream cut off inside an overlong line with only its marker, then starts clean', () => {
+    const stream = createStreamRedactor();
+    const output = [stream.push('z'.repeat(MAX_LINE)), stream.push('the same line'), stream.end()].join('');
+
+    expect(output).toBe(OMITTED);
+    expect(stream.push('fresh line\n')).toBe('fresh line\n');
   });
 
   it('reads .env content as key names only', () => {

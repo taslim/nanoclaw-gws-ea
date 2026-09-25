@@ -231,6 +231,30 @@ function displayCommand(command: SanitizedCommand): string {
   return display.length > DISPLAY_CHARACTERS ? `${display.slice(0, DISPLAY_CHARACTERS)}…` : display;
 }
 
+/** Raw stderr kept as its newest whole lines within the bound, so a front trim never leaves part of a line or a secret on it. */
+function createRetainedStderr(): { append(chunk: string): void; text(): string } {
+  let retained = '';
+  // Set while the rest of a line the trim cut is dropped, through its newline.
+  let dropping = false;
+  return {
+    append(chunk) {
+      let text = chunk;
+      if (dropping) {
+        const newline = text.indexOf('\n');
+        if (newline === -1) return;
+        dropping = false;
+        text = text.slice(newline + 1);
+      }
+      retained = `${retained}${text}`;
+      if (retained.length <= STDERR_RETAINED_CHARACTERS) return;
+      const newline = retained.indexOf('\n', retained.length - STDERR_RETAINED_CHARACTERS - 1);
+      dropping = newline === -1;
+      retained = dropping ? '' : retained.slice(newline + 1);
+    },
+    text: () => retained,
+  };
+}
+
 function stderrTail(stderr: string): string {
   const tail = redact(stderr).trim().split('\n').slice(-STDERR_TAIL_LINES).join('\n');
   return tail.length > STDERR_TAIL_CHARACTERS ? tail.slice(-STDERR_TAIL_CHARACTERS) : tail;
@@ -360,7 +384,7 @@ function execute(
     const tees = command.stream ? { stdout: createStreamRedactor(), stderr: createStreamRedactor() } : undefined;
     let stdout = '';
     let stdoutBytes = 0;
-    let stderr = '';
+    const retainedStderr = createRetainedStderr();
     let startError: Error | undefined;
     let termination: 'timeout' | 'output_limit' | undefined;
     let pipeRelease: NodeJS.Timeout | undefined;
@@ -388,7 +412,7 @@ function execute(
       else stdout += chunk;
     });
     child.stderr.on('data', (chunk: string) => {
-      stderr = `${stderr}${chunk}`.slice(-STDERR_RETAINED_CHARACTERS);
+      retainedStderr.append(chunk);
       if (tees) step?.write(tees.stderr.push(chunk));
     });
     child.once('error', (error) => {
@@ -408,7 +432,7 @@ function execute(
       clearTimeout(pipeRelease);
       if (pid !== undefined) releaseGroup(pid);
       if (tees) step?.write(`${tees.stdout.end()}${tees.stderr.end()}`);
-      const facts: FailureFacts = { exitCode: code, signal, stderr };
+      const facts: FailureFacts = { exitCode: code, signal, stderr: retainedStderr.text() };
       if (startError !== undefined) {
         const errno = errorCode(startError, 'unknown');
         reject(
@@ -430,7 +454,7 @@ function execute(
       } else if (signal !== null) {
         reject(commandFailure('command_failed', `Command was terminated by ${signal}`, command, facts));
       } else {
-        resolve({ stdout, stderr, exitCode: code ?? 1 });
+        resolve({ stdout, stderr: retainedStderr.text(), exitCode: code ?? 1 });
       }
     });
   });
