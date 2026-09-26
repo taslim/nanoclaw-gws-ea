@@ -285,7 +285,7 @@ function parseZone(value: unknown): CloudflareZoneChoice | undefined {
     name,
     status: 'active',
     accountId,
-    accountName: text(value.account.name) || accountId,
+    accountName: text(value.account.name).trim() || accountId,
   };
 }
 

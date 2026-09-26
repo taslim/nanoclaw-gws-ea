@@ -331,16 +331,24 @@ describe('Cloudflare REST readers', () => {
     await expect(call(client)).rejects.toMatchObject({ code: 'invalid_cloudflare_response' });
   });
 
-  it('leaves out a zone that is not active', async () => {
+  it('leaves out a zone that is not active, and names an unnamed account by its ID', async () => {
     const pending = { ...zone, id: 'c'.repeat(32), name: 'pending.example', status: 'pending' };
+    const unnamed = { ...zone, id: 'd'.repeat(32), name: 'unnamed.example', account: { id: ACCOUNT_ID, name: '  ' } };
     const client = api(
       vi.fn<typeof globalThis.fetch>(async () =>
-        envelope([pending, zone], { page: 1, per_page: 50, count: 2, total_count: 2, total_pages: 1 }),
+        envelope([pending, zone, unnamed], { page: 1, per_page: 50, count: 3, total_count: 3, total_pages: 1 }),
       ),
     );
 
     await expect(client.listActiveZones()).resolves.toEqual([
       { zoneId: ZONE_ID, name: 'example.com', status: 'active', accountId: ACCOUNT_ID, accountName: 'Example account' },
+      {
+        zoneId: 'd'.repeat(32),
+        name: 'unnamed.example',
+        status: 'active',
+        accountId: ACCOUNT_ID,
+        accountName: ACCOUNT_ID,
+      },
     ]);
   });
 });
