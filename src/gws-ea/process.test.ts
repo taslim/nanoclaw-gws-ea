@@ -314,6 +314,33 @@ describe('GWS-EA command runner', () => {
     expect(error.details).toMatchObject({ signal: 'SIGKILL', exitCode: null });
   });
 
+  it('forwards a stop signal to a running child, so it ends at once rather than at its timeout', async () => {
+    const root = await temporaryRoot('forward');
+    const pidFile = path.join(root, 'child.pid');
+    // Stands in for the CLI's own handler, so the forwarder does not re-raise the signal at this process.
+    const handled = (): void => undefined;
+    process.on('SIGINT', handled);
+    try {
+      const running = runSanitizedCommand({
+        command: NODE,
+        args: [
+          '--eval',
+          `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`,
+        ],
+        cwd: root,
+        timeoutMs: 30_000,
+      });
+      await waitFor(() => readPid(pidFile));
+      process.emit('SIGINT', 'SIGINT');
+
+      const error = await failure(running);
+      expect(error.message).toContain('SIGINT');
+      expect(error.details).toMatchObject({ signal: 'SIGINT' });
+    } finally {
+      process.off('SIGINT', handled);
+    }
+  });
+
   it('never logs parsed stdout, only its byte count', async () => {
     const run = await runLog();
     const apiKey = `oc_${randomBytes(18).toString('hex')}`;
