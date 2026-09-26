@@ -1163,24 +1163,42 @@ describe('removal safety', () => {
     expect(cloudflare.tunnels).toEqual([tunnel]);
   });
 
-  it('waits for a stray NanoClaw host it stopped to exit, and names one that never does', async () => {
-    for (const exitsAfter of [2, Infinity]) {
+  it.each([
+    [
+      'the launchd job it booted out',
+      'macos',
+      (command: SanitizedCommand) => command.command === 'launchctl' && command.args[0] === 'print',
+      'launchd service is still loaded',
+    ],
+    [
+      'a stray NanoClaw host it stopped',
+      'linux',
+      (command: SanitizedCommand) => command.command === 'pgrep',
+      'host process is still running',
+    ],
+  ] as const)('waits for %s to go, and names one that never does', async (_what, platform, probed, stillThere) => {
+    for (const goneAfter of [2, Infinity]) {
       const paths = await testPaths();
       const input = await reserve(paths, reservationInput(paths), {
         started: ['materialize_checkout', 'start_nanoclaw'],
       });
       let checks = 0;
       const runCommand = async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> => {
-        if (command.command !== 'pgrep') return ok();
-        checks += 1;
-        return checks > exitsAfter ? failed('') : ok();
+        if (probed(command)) {
+          checks += 1;
+          return checks > goneAfter ? failed('') : ok();
+        }
+        return command.command === 'pgrep' ? failed('') : ok();
       };
       const sleep = vi.fn(async () => undefined);
       const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
 
-      const removal = removeAssistant(paths, input.instance_id, { ...dependencies, runCommand, sleep });
-      if (exitsAfter === Infinity) {
-        await expect(removal).rejects.toMatchObject({ code: 'nanoclaw_removal_incomplete' });
+      const removal = removeAssistant(paths, input.instance_id, { ...dependencies, platform, runCommand, sleep });
+      if (goneAfter === Infinity) {
+        await expect(removal).rejects.toMatchObject({
+          code: 'nanoclaw_removal_incomplete',
+          message: expect.stringContaining(stillThere),
+        });
         expect(checks).toBe(10);
       } else {
         await removal;
