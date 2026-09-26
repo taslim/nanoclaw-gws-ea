@@ -65,6 +65,7 @@ function prompts(overrides: Partial<InteractivePrompts> = {}): InteractivePrompt
     googleAccount: vi.fn(async () => {
       throw new Error('unexpected Google account prompt');
     }),
+    attendPause: vi.fn(async () => ({ kind: 'stop' as const })),
     ...overrides,
   };
 }

@@ -177,7 +177,7 @@ export interface InteractivePrompts {
   cloudflareAccountToken(request: CloudflareTokenRequest): Promise<string>;
   googleCloudSignIn(account?: string): Promise<void>;
   googleAccount(account: string): Promise<boolean>;
-  attendPause?(pause: ProvisionHumanPause, signal: AbortSignal): Promise<PauseResponse>;
+  attendPause(pause: ProvisionHumanPause, signal: AbortSignal): Promise<PauseResponse>;
 }
 
 export interface InteractionOptions {
@@ -273,9 +273,8 @@ export function createInteraction(options: InteractionOptions): Interaction {
       return withTerminal(() => prompts.googleAccount(account));
     },
     async attendPause(pause, signal) {
-      if (!prompts?.attendPause) return { kind: 'stop' };
-      const attend = prompts.attendPause;
-      return withTerminal(() => attend(pause, signal));
+      if (!prompts) return { kind: 'stop' };
+      return withTerminal(() => prompts.attendPause(pause, signal));
     },
     withDecisions(decisions) {
       return createInteraction({ ...options, decisions: { ...options.decisions, ...decisions } });
