@@ -681,9 +681,11 @@ describe('managed Cloudflare reconciliation', () => {
     });
     await preparePrivateDirectory(paths.removalRoot);
     await writePrivate(paths.removalFile(removing.instance_id), { active: true });
-    // Finder metadata and an interrupted receipt write are not removal receipts.
+    // Finder metadata, an interrupted receipt write, and a loose receipt left by an assistant
+    // no longer registered are not removals in progress.
     await writeFile(path.join(paths.removalRoot, '.DS_Store'), 'finder', { mode: 0o644 });
     await writeFile(`${paths.removalFile(target.instance_id)}.AAAAAAAAAAA.tmp`, '{', { mode: 0o600 });
+    await writeFile(paths.removalFile('99999999-9999-4999-8999-999999999999'), '{}', { mode: 0o644 });
 
     await expect(
       reconcileManagedCloudflareIngress(paths, cloud.api(), {

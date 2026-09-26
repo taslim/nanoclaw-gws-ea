@@ -39,10 +39,18 @@ async function tempDirectory(): Promise<string> {
   return directory;
 }
 
-/** A Docker Engine API stand-in on a unix socket, answering `GET /_ping`. */
-async function dockerDaemon(status = 200): Promise<{ readonly host: string; readonly socket: string }> {
+/** A Docker Engine API stand-in on a unix socket, answering `GET /_ping` and `GET /info`. */
+async function dockerDaemon(
+  status = 200,
+  securityOptions: readonly string[] = ['name=seccomp,profile=builtin'],
+): Promise<{ readonly host: string; readonly socket: string }> {
   const socket = path.join(await tempDirectory(), 'docker.sock');
   const server = createServer((request, response) => {
+    if (request.url === '/info') {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ ID: 'daemon', SecurityOptions: securityOptions }));
+      return;
+    }
     response.writeHead(request.url === '/_ping' ? status : 404).end('OK');
   });
   await new Promise<void>((resolve) => server.listen(socket, resolve));
@@ -224,6 +232,7 @@ describe('prerequisites', () => {
       nodePath: '/opt/homebrew/Cellar/node/22.20.0/bin/node',
       onecliCliPath: PINNED_ONECLI,
       dockerEndpoint: daemon.host,
+      rootlessDocker: false,
       account: 'operator@example.com',
     });
     expect(person.confirmGoogleAccount).toHaveBeenCalledWith('operator@example.com');
@@ -237,6 +246,19 @@ describe('prerequisites', () => {
       'gcloud auth list --filter=status:ACTIVE --format=value(account)',
       'gcloud auth print-access-token --account=operator@example.com --quiet',
     ]);
+  });
+
+  it('reports a rootless Docker daemon on Linux, whose containers cannot reach the host loopback', async () => {
+    const rootless = await dockerDaemon(200, ['name=seccomp,profile=builtin', 'name=rootless', 'name=cgroupns']);
+    const rootful = await dockerDaemon();
+    const on = async (daemon: { readonly host: string }, platform: NodeJS.Platform) => {
+      const host = fakeHost(daemon.host);
+      return (await checkPrerequisites(CREATE, operator(host), dependencies(host, { platform }))).rootlessDocker;
+    };
+
+    await expect(on(rootless, 'linux')).resolves.toBe(true);
+    await expect(on(rootful, 'linux')).resolves.toBe(false);
+    await expect(on(rootless, 'darwin')).resolves.toBe(false);
   });
 
   it('refuses a Node.js without process.execve, naming its version, before running anything', async () => {

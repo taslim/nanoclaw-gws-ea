@@ -174,9 +174,12 @@ export function verifyPrincipalBinding(input: PrincipalBindingVerificationInput)
              ON mga.messaging_group_id = mg.id AND mga.agent_group_id = p.main_agent_group_id
            JOIN agent_group_members member
              ON member.user_id = pu.user_id AND member.agent_group_id = p.main_agent_group_id
-           JOIN user_roles owner
-             ON owner.user_id = pu.user_id AND owner.role = 'owner' AND owner.agent_group_id IS NULL
           WHERE p.singleton = 1
+            -- A global role's NULL group escapes the key, so a retried grant can repeat the owner row.
+            AND EXISTS (
+              SELECT 1 FROM user_roles owner
+               WHERE owner.user_id = pu.user_id AND owner.role = 'owner' AND owner.agent_group_id IS NULL
+            )
             AND p.main_agent_group_id IS NOT NULL
             AND mg.channel_type = ?
             AND mg.instance = ?

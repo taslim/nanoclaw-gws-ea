@@ -266,6 +266,21 @@ describe('principal binding verification', () => {
     ).toEqual({ status: 'absent' });
   });
 
+  it('matches a principal whose owner role a retried bind granted again', async () => {
+    await host.ncl(['roles', 'grant', '--user', USER, '--role', 'owner']);
+    const welcomeEventId = principalWelcomeEventId(RUNTIME, MAIN, candidate());
+    await inbound(`${welcomeEventId}:${MAIN}`, BOUND_AT, 'chat', { text: 'welcome', senderId: USER });
+
+    expect(
+      verifyPrincipalBinding({
+        runtime: { ...RUNTIME, checkout_realpath: checkout },
+        adapterInstance: INSTANCE,
+        provisioningStartedAt: BOUND_AT,
+        selectedCandidate: candidate(),
+      }),
+    ).toMatchObject({ status: 'matched', agentGroupId: MAIN });
+  });
+
   it('is absent until the welcome is queued', () => {
     expect(
       verifyPrincipalBinding({

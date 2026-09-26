@@ -597,11 +597,16 @@ async function removeManagedIngress(removal: ManagedIngressRemoval): Promise<voi
 }
 
 /** Stop the instance service through its manager, then its host process, containers, and image. */
+/** How often, and how many times, removal checks that a stray host it stopped has exited. */
+const HOST_EXIT_POLL_MS = 500;
+const HOST_EXIT_CHECKS = 10;
+
 async function uninstallNanoclaw(
   reservation: InstanceReservation,
   runtime: LocalRuntime,
   platform: InstanceServicePlatform,
   run: SanitizedCommandOutcomeRunner,
+  sleep: (milliseconds: number) => Promise<void>,
 ): Promise<void> {
   const installId = reservation.instance_id.replaceAll('-', '');
   const recorded = { home_directory: runtime.homeDirectory, docker_endpoint: runtime.dockerEndpoint };
@@ -668,9 +673,14 @@ async function uninstallNanoclaw(
   const killed = await execute('pkill', ['-f', host], tools);
   if (killed.outcome.exitCode !== 0 && killed.outcome.exitCode !== 1)
     throw commandExitError(killed.command, killed.outcome);
-  const remaining = await execute('pgrep', ['-f', host], tools);
-  if (remaining.outcome.exitCode === 0) throw incomplete('The NanoClaw host process is still running');
-  if (remaining.outcome.exitCode !== 1) throw commandExitError(remaining.command, remaining.outcome);
+  // pkill only sends SIGTERM, so a stopping host gets a moment to exit before it counts as still running.
+  for (let check = 1; ; check += 1) {
+    const remaining = await execute('pgrep', ['-f', host], tools);
+    if (remaining.outcome.exitCode === 1) break;
+    if (remaining.outcome.exitCode !== 0) throw commandExitError(remaining.command, remaining.outcome);
+    if (check === HOST_EXIT_CHECKS) throw incomplete('The NanoClaw host process is still running');
+    await sleep(HOST_EXIT_POLL_MS);
+  }
 
   const { installLabel, imageTag } = coordinates(false);
   const containers = async (): Promise<string[]> =>
@@ -899,7 +909,13 @@ async function removeLocked(
       const runtime = await localRuntime();
       await (dependencies.uninstallNanoclaw
         ? dependencies.uninstallNanoclaw(reservation, runtime)
-        : uninstallNanoclaw(reservation, runtime, platform, dependencies.runCommand ?? runSanitizedCommandOutcome));
+        : uninstallNanoclaw(
+            reservation,
+            runtime,
+            platform,
+            dependencies.runCommand ?? runSanitizedCommandOutcome,
+            dependencies.sleep ?? delay,
+          ));
       return undefined;
     },
     'gcp-project': async () => {

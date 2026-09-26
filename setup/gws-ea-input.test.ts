@@ -18,6 +18,7 @@ const prerequisites: Prerequisites = {
   platform: 'macos',
   runningAsRoot: false,
   dockerEndpoint: 'unix:///Users/principal/.docker/run/docker.sock',
+  rootlessDocker: false,
   account: 'operator@example.test',
 };
 const providerCapabilityDigest = 'a'.repeat(64);
@@ -584,6 +585,22 @@ describe('GWS-EA unattended create input', () => {
       code: 'input_required',
       message: expect.stringContaining('GWS_EA_CLOUDFLARE_API_TOKEN'),
     });
+  });
+
+  it('refuses managed ingress on rootless Docker before asking Cloudflare, naming --endpoint', async () => {
+    const { endpoint: _endpoint, ...base } = FLAGS;
+    const discoverZones = vi.fn();
+    await expect(
+      unattended(
+        { ...base, ingress: 'managed-cloudflare', 'cloudflare-zone': 'example.com', 'hostname-label': 'aya' },
+        { get: (name) => (name === 'cloudflareAccountToken' ? 'supplied-cloudflare-token' : undefined) },
+        {
+          prerequisites: { ...prerequisites, platform: 'linux', rootlessDocker: true },
+          managedIngressSetup: { discoverZones, retainAccountToken: vi.fn(), clearAccountToken: vi.fn() },
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'managed_ingress_unsupported', message: expect.stringContaining('--endpoint') });
+    expect(discoverZones).not.toHaveBeenCalled();
   });
 
   it('requires --provider only when more than one provider is composed', async () => {

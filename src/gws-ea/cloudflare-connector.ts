@@ -57,7 +57,8 @@ export interface CloudflareConnectorNetworking {
 
 /**
  * How the connector reaches the assistants' loopback webhooks. On Linux it
- * shares the host's network, so loopback is the host's; on macOS Docker runs
+ * shares the host's network, so loopback is the host's (rootful Docker only:
+ * create refuses managed ingress on rootless Docker); on macOS Docker runs
  * it on a bridge that reaches the host through the host-gateway alias. The
  * rendered service, its drift check, and the tunnel's route origins all read
  * this one decision.

@@ -295,20 +295,37 @@ describe('GWS-EA instance runtime', () => {
     expect(cli.env?.HOME).toBe(config.home_directory);
   });
 
-  it('fails the start when launchd refuses the definition for any reason but a job that was not loaded', async () => {
+  it('retries a bootstrap launchd refuses while it removes the old job, and fails when it keeps refusing', async () => {
     const { config, home } = await fixture();
     await persistInstanceRuntime(config, upsertEnvVars);
     const refused = new GwsEaError('command_failed', 'Command failed (exit code 5): launchctl bootstrap', {
       details: { exitCode: 5, stderrTail: 'Bootstrap failed: 5: Input/output error' },
     });
-    const runner = vi.fn(async (command: SanitizedCommand) => {
-      if (command.args[0] === 'bootstrap') throw refused;
-      return { stdout: '', stderr: '' };
-    });
+    for (const refusals of [1, Infinity]) {
+      let bootstraps = 0;
+      const runner = vi.fn(async (command: SanitizedCommand) => {
+        if (command.args[0] === 'bootstrap' && ++bootstraps <= refusals) throw refused;
+        return { stdout: '', stderr: '' };
+      });
+      const sleep = vi.fn(async () => undefined);
+      const start = reconcileInstanceService(config, {
+        platform: 'macos',
+        homeDirectory: home,
+        runCommand: runner,
+        uid: 501,
+        sleep,
+      });
 
-    await expect(
-      reconcileInstanceService(config, { platform: 'macos', homeDirectory: home, runCommand: runner, uid: 501 }),
-    ).rejects.toBe(refused);
+      if (refusals === Infinity) {
+        await expect(start).rejects.toBe(refused);
+        expect(bootstraps).toBe(5);
+      } else {
+        await expect(start).resolves.toMatchObject({ layout: { manager: 'launchd' } });
+        expect(bootstraps).toBe(2);
+        expect(runner.mock.calls.at(-2)?.[0].args[0]).toBe('kickstart');
+      }
+      expect(sleep).toHaveBeenCalledTimes(bootstraps - 1);
+    }
   });
 
   it.each([

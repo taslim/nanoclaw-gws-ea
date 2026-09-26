@@ -68,7 +68,7 @@ export const CLOUDFLARE_API_TOKEN_GUIDANCE = [
   'User tokens: https://dash.cloudflare.com/profile/api-tokens',
   'Account-owned tokens: https://dash.cloudflare.com/?to=/:account/api-tokens',
   '',
-  'The token is used only for this setup run and is not stored.',
+  'While an assistant is being created, the token is kept in its owner-only secrets until the route is set up, then deleted; it is not stored otherwise.',
 ].join('\n');
 
 function cancelled(): never {
@@ -310,6 +310,12 @@ async function collectIngress(source: InputSource, assistantFirstName: string): 
     return { mode, endpointUrl: validateExistingGchatEndpoint(endpointUrl) };
   }
 
+  if (source.context.prerequisites.rootlessDocker) {
+    throw new GwsEaError(
+      'managed_ingress_unsupported',
+      'Managed Cloudflare ingress needs rootful Docker on Linux: its connector reaches this assistant on 127.0.0.1, which rootless Docker cannot reach. Use rootful Docker, or pass --endpoint with an existing HTTPS Google Chat endpoint.',
+    );
+  }
   const session = source.context.managedIngressSetup;
   if (!session) {
     throw new GwsEaError('managed_ingress_unavailable', 'Managed Cloudflare setup is unavailable in this release');

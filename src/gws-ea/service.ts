@@ -2,6 +2,7 @@ import { constants as fsConstants } from 'node:fs';
 import { access, lstat, mkdir, readFile, realpath } from 'node:fs/promises';
 import { userInfo } from 'node:os';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import { isErrno } from '../community-portal/errors.js';
 import { renderLaunchdService, renderSystemdService } from '../service-definition.js';
@@ -133,6 +134,8 @@ export interface InstanceServiceDependencies extends ServiceLayoutOptions {
   readonly uid?: number;
   /** Where the user-bus variables are read; absent ones are derived from the UID. */
   readonly ambientEnv?: NodeJS.ProcessEnv;
+  /** Waits between launchd `bootstrap` attempts. */
+  readonly sleep?: (milliseconds: number) => Promise<void>;
 }
 
 /** A (re)started service, with the pid its manager reports when it has one. */
@@ -487,6 +490,9 @@ async function ensureLingering(
   });
 }
 
+const BOOTSTRAP_ATTEMPTS = 5;
+const BOOTSTRAP_RETRY_MS = 500;
+
 /**
  * Write the service definition and (re)start it. launchd reloads a changed
  * definition only through `bootout` then `bootstrap`; `kickstart` without
@@ -515,7 +521,20 @@ export async function reconcileInstanceService(
     await command('launchctl', ['bootout', `${domain}/${layout.serviceIdentity}`]).catch((error: unknown) => {
       if (!notLoaded(error)) throw error;
     });
-    await command('launchctl', ['bootstrap', domain, layout.serviceDefinitionPath]);
+    // launchd can still be removing the job `bootout` unloaded, so `bootstrap` gets a few tries.
+    for (let attempt = 1; ; attempt += 1) {
+      const loaded = await command('launchctl', ['bootstrap', domain, layout.serviceDefinitionPath]).then(
+        () => true,
+        (error: unknown) => {
+          if (attempt === BOOTSTRAP_ATTEMPTS || !(error instanceof GwsEaError) || error.code !== 'command_failed') {
+            throw error;
+          }
+          return false;
+        },
+      );
+      if (loaded) break;
+      await (dependencies.sleep ?? delay)(BOOTSTRAP_RETRY_MS * attempt);
+    }
     await command('launchctl', ['kickstart', `${domain}/${layout.serviceIdentity}`]);
   } else {
     const prefix = layout.manager === 'systemd-user' ? ['--user'] : [];

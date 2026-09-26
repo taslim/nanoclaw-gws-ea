@@ -304,9 +304,10 @@ export async function activeRemovalInstanceIds(
     for (const entry of entries) {
       // Only `<instance id>.json` is a receipt; `.DS_Store` or a leftover `.tmp` is not.
       const instanceId = entry.name.endsWith('.json') ? entry.name.slice(0, -'.json'.length) : '';
-      if (!INSTANCE_ID_PATTERN.test(instanceId)) continue;
+      // A receipt left by an assistant no longer registered is ignored, however it is kept.
+      if (!INSTANCE_ID_PATTERN.test(instanceId) || !registry.instances[instanceId]) continue;
       await assertPrivateStateFile(path.join(paths.removalRoot, entry.name));
-      if (registry.instances[instanceId]) active.push(instanceId);
+      active.push(instanceId);
     }
     return active.sort();
   } catch (error) {

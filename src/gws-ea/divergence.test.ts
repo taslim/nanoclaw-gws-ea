@@ -123,11 +123,14 @@ describe('recorded divergence: the installed OneCLI adapter', () => {
   const onecliUrl = 'http://onecli.divergence.test';
   const gatewayUrl = 'http://gateway.divergence.test';
 
-  /** OneCLI's API and gateway behind `fetch`, recording every agent creation and approval decision. */
+  /**
+   * OneCLI's API and gateway behind `fetch`, recording every agent creation and
+   * approval decision. Like the gateway, a poll answers with the pending
+   * requests it does not exclude, and otherwise holds until stopped.
+   */
   function onecliServers(pending: readonly Record<string, unknown>[] = []) {
     const createdAgents: unknown[] = [];
     const decisions: Array<{ id: string; decision: unknown }> = [];
-    let polled = false;
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : String(input));
       if (url.origin === onecliUrl && url.pathname === '/v1/agents' && init?.method === 'POST') {
@@ -146,10 +149,9 @@ describe('recorded divergence: the installed OneCLI adapter', () => {
         return Response.json({});
       }
       if (url.origin === gatewayUrl && url.pathname === '/v1/approvals/pending') {
-        if (!polled) {
-          polled = true;
-          return Response.json({ requests: pending, timeoutSeconds: 30 });
-        }
+        const excluded = new Set(url.searchParams.get('exclude')?.split(',') ?? []);
+        const requests = pending.filter((request) => !excluded.has(String(request.id)));
+        if (requests.length > 0) return Response.json({ requests, timeoutSeconds: 30 });
         return new Promise<Response>((_resolve, reject) => {
           init?.signal?.addEventListener('abort', () => reject(new Error('stopped')), { once: true });
         });
@@ -221,13 +223,21 @@ describe('recorded divergence: the installed OneCLI adapter', () => {
     }
   }
 
-  it('leaves an approval pending when no decision is available', async () => {
+  it('leaves an approval pending when no decision is available, without asking again at once', async () => {
     const provider = await installedProvider();
     const servers = onecliServers([approval('undecided', 'owned-group')]);
-    const decide = vi.fn(async (_request: GatewayApprovalRequest) => 'unavailable' as const);
+    let firstAskedAt: number | undefined;
+    const decide = vi.fn(async (_request: GatewayApprovalRequest) => {
+      firstAskedAt ??= Date.now();
+      return 'unavailable' as const;
+    });
 
-    await subscribeUntil(provider, decide, () => expect(decide).toHaveBeenCalledOnce());
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Still subscribed a while after the first answer: the gateway would hand a pending request
+    // straight back, so it is not polled or decided again at once.
+    await subscribeUntil(provider, decide, () =>
+      expect(Date.now() - (firstAskedAt ?? Date.now())).toBeGreaterThan(100),
+    );
+    expect(decide).toHaveBeenCalledOnce();
     expect(servers.decisions).toEqual([]);
   });
 });

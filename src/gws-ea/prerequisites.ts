@@ -71,6 +71,8 @@ export interface Prerequisites {
   readonly onecliCliPath: string;
   /** The active Docker context's local `unix://` endpoint, answered by a running daemon. */
   readonly dockerEndpoint: string;
+  /** Docker runs rootless on Linux, so its containers cannot reach this host's loopback. */
+  readonly rootlessDocker: boolean;
   /** The signed-in Google Workspace account that owns the assistant's Google Cloud project. */
   readonly account: string;
 }
@@ -171,6 +173,36 @@ function pingDocker(socketPath: string): Promise<DockerDaemonState> {
       const errno = errorCode(error, 'unknown');
       resolve({ state: errno === 'EACCES' || errno === 'EPERM' ? 'no-permission' : 'stopped', evidence: errno });
     });
+    request.end();
+  });
+}
+
+/** Whether the daemon behind a unix socket runs rootless, per the Engine API's `GET /info`; no answer counts as not. */
+function dockerRunsRootless(socketPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const request = httpRequest(
+      { socketPath, path: '/info', method: 'GET', agent: false, timeout: DOCKER_PING_TIMEOUT_MS },
+      (response) => {
+        let body = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk: string) => (body += chunk));
+        response.on('end', () => {
+          let info: unknown;
+          try {
+            info = response.statusCode === 200 ? JSON.parse(body) : undefined;
+          } catch (error) {
+            if (!(error instanceof SyntaxError)) throw error;
+          }
+          const options: unknown[] = isRecord(info) && Array.isArray(info.SecurityOptions) ? info.SecurityOptions : [];
+          resolve(options.some((option) => typeof option === 'string' && option.split(',').includes('name=rootless')));
+        });
+      },
+    );
+    request.once('timeout', () => {
+      resolve(false);
+      request.destroy();
+    });
+    request.once('error', () => resolve(false));
     request.end();
   });
 }
@@ -349,6 +381,8 @@ export async function checkPrerequisites(
     request.command === 'resume' && request.dockerEndpoint !== undefined
       ? await probeRecordedDockerEndpoint(request.dockerEndpoint)
       : await resolveDockerEndpoint(runner);
+  const dockerSocket = unixSocketPath(dockerEndpoint);
+  const rootlessDocker = platform === 'linux' && dockerSocket !== undefined && (await dockerRunsRootless(dockerSocket));
   const account = await googleAccount(request, interaction, runner);
   return {
     platform,
@@ -357,6 +391,7 @@ export async function checkPrerequisites(
     nodePath,
     onecliCliPath,
     dockerEndpoint,
+    rootlessDocker,
     account,
   };
 }

@@ -10,6 +10,7 @@ import { chmod, copyFile, mkdtemp, readFile, rename, rm, writeFile } from 'node:
 import os from 'node:os';
 import path from 'node:path';
 
+import { errorCode } from '../community-portal/errors.js';
 import { isRegularFile, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import {
   exactVersion,
@@ -74,6 +75,22 @@ async function archiveBytes(response: Response, archive: string): Promise<Buffer
   return Buffer.concat(chunks);
 }
 
+/** The release archive at `url`; however the download fails, it fails as `onecli_download_failed`. */
+async function downloadArchive(fetchArchive: typeof fetch, url: string, archive: string): Promise<Buffer> {
+  try {
+    const response = await fetchArchive(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+    if (!response.ok) {
+      throw new GwsEaError('onecli_download_failed', `Downloading ${url} failed with HTTP ${response.status}`);
+    }
+    return await archiveBytes(response, archive);
+  } catch (error) {
+    if (error instanceof GwsEaError) throw error;
+    const reason =
+      error instanceof Error ? [error.message, errorCode(error.cause, '')].filter(Boolean).join(': ') : String(error);
+    throw new GwsEaError('onecli_download_failed', `Downloading ${url} failed: ${reason}`, { cause: error });
+  }
+}
+
 function releaseTarget(platform: NodeJS.Platform, arch: string): OnecliCliTarget | undefined {
   const system = platform === 'darwin' ? 'darwin' : platform === 'linux' ? 'linux' : undefined;
   const machine = arch === 'x64' ? 'amd64' : arch === 'arm64' ? 'arm64' : undefined;
@@ -101,11 +118,7 @@ export async function ensurePinnedOnecliCli(
   activeStep()?.write(`Installing OneCLI CLI ${pin.version} for gws-ea into ${installed}\n`);
   const archive = `onecli_${pin.version}_${target}.tar.gz`;
   const url = `https://github.com/onecli/onecli-cli/releases/download/v${pin.version}/${archive}`;
-  const response = await (dependencies.fetch ?? fetch)(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
-  if (!response.ok) {
-    throw new GwsEaError('onecli_download_failed', `Downloading ${url} failed with HTTP ${response.status}`);
-  }
-  const bytes = await archiveBytes(response, archive);
+  const bytes = await downloadArchive(dependencies.fetch ?? fetch, url, archive);
   const digest = createHash('sha256').update(bytes).digest('hex');
   if (digest !== pin.digests[target]) {
     throw new GwsEaError(

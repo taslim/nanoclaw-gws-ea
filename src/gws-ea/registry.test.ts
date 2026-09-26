@@ -134,6 +134,7 @@ const PREREQUISITES: Prerequisites = {
   nodePath: process.execPath,
   onecliCliPath: '/usr/local/bin/onecli',
   dockerEndpoint: 'unix:///var/run/docker.sock',
+  rootlessDocker: false,
   account: 'operator@example.test',
 };
 

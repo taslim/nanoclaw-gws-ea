@@ -197,8 +197,10 @@ async function canonicalRoots(roots: readonly string[]): Promise<string[]> {
 
 /**
  * Resolve an executable persisted into runtime.json and the service unit
- * (`node`, `onecli`) to its real path. Refused in a group- or world-writable
- * directory, inside any checkout, or inside a temporary directory.
+ * (`node`, `onecli`) to its real path. Refused when group- or world-writable
+ * itself, in a world-writable directory, inside any checkout, or inside a
+ * temporary directory. Homebrew and /Applications commonly have group-writable
+ * directories owned by root or the operator, so those are allowed.
  */
 export async function resolvePersistedExecutable(
   command: string,
@@ -212,7 +214,8 @@ export async function resolvePersistedExecutable(
       { details: { program: command, executable } },
     );
   const [file, directory] = await Promise.all([stat(executable), stat(path.dirname(executable))]);
-  if (((file.mode | directory.mode) & 0o022) !== 0) throw refuse('is in a group- or world-writable location');
+  if ((file.mode & 0o022) !== 0) throw refuse('is group- or world-writable');
+  if ((directory.mode & 0o002) !== 0) throw refuse('is in a world-writable directory');
   for (const root of await canonicalRoots([CONTROL_PLANE_ROOT, ...(options.checkoutRoots ?? [])])) {
     if (isWithinDirectory(executable, root)) throw refuse(`is inside a checkout (${root})`);
   }

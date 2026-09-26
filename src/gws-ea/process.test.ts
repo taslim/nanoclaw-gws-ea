@@ -557,7 +557,7 @@ describe('GWS-EA persisted executables', () => {
     ).rejects.toMatchObject({ code: 'untrusted_executable', message: expect.stringContaining('checkout') });
   });
 
-  it('refuses a persisted executable in a world-writable or temporary directory', async () => {
+  it('refuses a writable persisted executable or one in a world-writable or temporary directory', async () => {
     const root = await temporaryRoot('writable');
     const shared = path.join(root, 'shared');
     await mkdir(shared);
@@ -565,7 +565,22 @@ describe('GWS-EA persisted executables', () => {
     await writeFile(path.join(shared, 'node'), '#!/bin/sh\n', { mode: 0o755 });
     await expect(resolvePersistedExecutable(path.join(shared, 'node'))).rejects.toMatchObject({
       code: 'untrusted_executable',
-      message: expect.stringContaining('writable'),
+      message: expect.stringContaining('world-writable directory'),
+    });
+
+    // A group-writable directory, as Homebrew's, is allowed; the executable itself must not be.
+    const homebrew = path.join(root, 'homebrew');
+    await mkdir(homebrew);
+    await chmod(homebrew, 0o775);
+    await writeFile(path.join(homebrew, 'node'), '#!/bin/sh\n');
+    await chmod(path.join(homebrew, 'node'), 0o755);
+    await expect(resolvePersistedExecutable(path.join(homebrew, 'node'))).rejects.toMatchObject({
+      message: expect.stringContaining('temporary'),
+    });
+    await chmod(path.join(homebrew, 'node'), 0o775);
+    await expect(resolvePersistedExecutable(path.join(homebrew, 'node'))).rejects.toMatchObject({
+      code: 'untrusted_executable',
+      message: expect.stringContaining('is group- or world-writable'),
     });
 
     await writeFile(path.join(root, 'onecli'), '#!/bin/sh\n', { mode: 0o755 });

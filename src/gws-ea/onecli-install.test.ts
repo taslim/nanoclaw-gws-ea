@@ -113,6 +113,22 @@ describe("gws-ea's own OneCLI CLI", () => {
       }),
     ).rejects.toMatchObject({ code: 'onecli_download_failed', message: expect.stringContaining('HTTP 404') });
 
+    // A network failure names the archive's URL and the network's reason, like any other failed download.
+    await expect(
+      ensurePinnedOnecliCli(paths, pinFor('2.2.5', '0'.repeat(64)), {
+        fetch: async () => {
+          throw new TypeError('fetch failed', {
+            cause: Object.assign(new Error('getaddrinfo'), { code: 'ENOTFOUND' }),
+          });
+        },
+        platform: 'darwin',
+        arch: 'arm64',
+      }),
+    ).rejects.toMatchObject({
+      code: 'onecli_download_failed',
+      message: expect.stringMatching(/onecli_2\.2\.5_darwin_arm64\.tar\.gz failed: fetch failed: ENOTFOUND$/u),
+    });
+
     // An endless body is refused as soon as it passes the largest release, not buffered first.
     const chunk = new Uint8Array(1024 * 1024);
     let served = 0;

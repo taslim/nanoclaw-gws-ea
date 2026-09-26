@@ -1136,6 +1136,34 @@ describe('removal safety', () => {
       await expectGone(paths, input);
     },
   );
+
+  it('waits for a stray NanoClaw host it stopped to exit, and names one that never does', async () => {
+    for (const exitsAfter of [2, Infinity]) {
+      const paths = await testPaths();
+      const input = await reserve(paths, reservationInput(paths), {
+        started: ['materialize_checkout', 'start_nanoclaw'],
+      });
+      let checks = 0;
+      const runCommand = async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> => {
+        if (command.command !== 'pgrep') return ok();
+        checks += 1;
+        return checks > exitsAfter ? failed('') : ok();
+      };
+      const sleep = vi.fn(async () => undefined);
+      const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
+
+      const removal = removeAssistant(paths, input.instance_id, { ...dependencies, runCommand, sleep });
+      if (exitsAfter === Infinity) {
+        await expect(removal).rejects.toMatchObject({ code: 'nanoclaw_removal_incomplete' });
+        expect(checks).toBe(10);
+      } else {
+        await removal;
+        expect(checks).toBe(3);
+        await expectGone(paths, input);
+      }
+      expect(sleep).toHaveBeenCalledTimes(checks - 1);
+    }
+  });
 });
 
 describe('removal command', () => {

@@ -25,6 +25,7 @@ const READY: Prerequisites = {
   nodePath: '/opt/homebrew/bin/node',
   onecliCliPath: '/Users/operator/.local/share/gws-ea/tools/onecli/2.2.5/onecli',
   dockerEndpoint: 'unix:///Users/operator/.docker/run/docker.sock',
+  rootlessDocker: false,
   account: 'operator@example.com',
 };
 
