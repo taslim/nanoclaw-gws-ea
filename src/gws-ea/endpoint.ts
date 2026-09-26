@@ -1,4 +1,5 @@
 import { errorCode } from '../community-portal/errors.js';
+import { publicFetch } from './public-fetch.js';
 import { GwsEaError } from './types.js';
 
 const CALLBACK_PATH = '/webhook/gchat';
@@ -37,6 +38,7 @@ export type ManagedRouteObservation =
   | { readonly status: 'misrouted'; readonly observed: string; readonly evidence: string };
 
 export interface EndpointVerificationDependencies {
+  /** Reaches the callback as the internet does (public DNS), by default. */
   readonly fetch?: typeof globalThis.fetch;
   readonly timeoutMs?: number;
 }
@@ -135,7 +137,7 @@ export async function verifyExistingGchatEndpoint(
   if (endpointUrl !== audienceUrl) {
     throw new GwsEaError('audience_mismatch', 'Google Chat authentication audience must equal the claimed endpoint');
   }
-  const fetchImplementation = dependencies.fetch ?? globalThis.fetch;
+  const fetchImplementation = dependencies.fetch ?? publicFetch;
   const timeoutMs = dependencies.timeoutMs ?? 10_000;
   await expectUnauthorized(fetchImplementation, endpointUrl, timeoutMs);
   return { endpointUrl, audienceUrl };
@@ -147,7 +149,7 @@ export async function verifyExistingGchatRoute(
   dependencies: EndpointVerificationDependencies = {},
 ): Promise<string> {
   const endpointUrl = validateExistingGchatEndpoint(input.endpointUrl);
-  await expectUnauthorized(dependencies.fetch ?? globalThis.fetch, endpointUrl, dependencies.timeoutMs ?? 10_000);
+  await expectUnauthorized(dependencies.fetch ?? publicFetch, endpointUrl, dependencies.timeoutMs ?? 10_000);
   return endpointUrl;
 }
 
@@ -187,7 +189,7 @@ export async function observeManagedGchatRoute(
 ): Promise<ManagedRouteObservation> {
   const endpointUrl = validateExistingGchatEndpoint(input.endpointUrl);
   const localEndpointUrl = validateLocalGchatEndpoint(input.localEndpointUrl);
-  const fetchImplementation = dependencies.fetch ?? globalThis.fetch;
+  const fetchImplementation = dependencies.fetch ?? publicFetch;
   const timeoutMs = dependencies.timeoutMs ?? 10_000;
   const probe = async (url: string, method: 'GET' | 'POST'): Promise<Probe> => {
     try {
