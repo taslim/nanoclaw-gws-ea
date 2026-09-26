@@ -200,8 +200,10 @@ function dockerRunsRootless(socketPath: string): Promise<boolean | undefined> {
           } catch (error) {
             if (!(error instanceof SyntaxError)) throw error;
           }
-          const options = isRecord(info) && Array.isArray(info.SecurityOptions) ? info.SecurityOptions : undefined;
-          resolve(options?.some((option) => typeof option === 'string' && option.split(',').includes('name=rootless')));
+          const options: unknown = isRecord(info) ? info.SecurityOptions : undefined;
+          const listed =
+            Array.isArray(options) && options.every((option): option is string => typeof option === 'string');
+          resolve(listed ? options.some((option) => option.split(',').includes('name=rootless')) : undefined);
         });
       },
     );

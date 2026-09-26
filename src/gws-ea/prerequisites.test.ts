@@ -42,8 +42,8 @@ async function tempDirectory(): Promise<string> {
 /** A Docker Engine API stand-in on a unix socket, answering `GET /_ping` and `GET /info`. */
 async function dockerDaemon(
   status = 200,
-  /** Its `SecurityOptions`, or how `/info` fails: an error status, or a connection dropped mid-answer. */
-  info: readonly string[] | 'refused' | 'dropped' = ['name=seccomp,profile=builtin'],
+  /** Its `SecurityOptions`, or how `/info` fails: an error status, a connection dropped mid-answer, or entries that are not strings. */
+  info: readonly string[] | 'refused' | 'dropped' | 'malformed' = ['name=seccomp,profile=builtin'],
 ): Promise<{ readonly host: string; readonly socket: string }> {
   const socket = path.join(await tempDirectory(), 'docker.sock');
   const server = createServer((request, response) => {
@@ -56,7 +56,7 @@ async function dockerDaemon(
         setTimeout(() => response.destroy(), 10);
       } else {
         response.writeHead(200, { 'content-type': 'application/json' });
-        response.end(JSON.stringify({ ID: 'daemon', SecurityOptions: info }));
+        response.end(JSON.stringify({ ID: 'daemon', SecurityOptions: info === 'malformed' ? [null] : info }));
       }
       return;
     }
@@ -267,9 +267,10 @@ describe('prerequisites', () => {
     await expect(on(rootless, 'linux')).resolves.toBe(true);
     await expect(on(await dockerDaemon(), 'linux')).resolves.toBe(false);
     await expect(on(rootless, 'darwin')).resolves.toBe(false);
-    // A daemon that does not say, by an error or a dropped answer, is unknown rather than rootful.
-    await expect(on(await dockerDaemon(200, 'refused'), 'linux')).resolves.toBeUndefined();
-    await expect(on(await dockerDaemon(200, 'dropped'), 'linux')).resolves.toBeUndefined();
+    // A daemon that does not say, by an error, a dropped answer, or an unreadable list, is unknown rather than rootful.
+    for (const answer of ['refused', 'dropped', 'malformed'] as const) {
+      await expect(on(await dockerDaemon(200, answer), 'linux')).resolves.toBeUndefined();
+    }
   });
 
   it('refuses a Node.js without process.execve, naming its version, before running anything', async () => {
