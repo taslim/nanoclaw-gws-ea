@@ -29,7 +29,7 @@ import { holdLoopbackPorts, type HeldLoopbackPorts } from './ports.js';
 import { checkPrerequisites, type PrerequisiteRequest, type Prerequisites } from './prerequisites.js';
 import {
   installProductionBootstrapManifest,
-  recordedDockerEndpoint,
+  recordedHost,
   removeProductionBootstrapManifest,
   runProductionProvision,
   validateProductionBootstrapManifest,
@@ -536,9 +536,9 @@ class Cli {
         await readProvisionJournal(this.#paths, instanceId);
         const reservation = await getInstanceReservation(this.#paths, instanceId);
         const account = reservation.exclusive_resource_claims.gcp_account;
-        const dockerEndpoint = await recordedDockerEndpoint(this.#paths, reservation);
+        const host = await recordedHost(this.#paths, reservation);
         await this.#checkPrerequisites(
-          { command: 'resume', paths: this.#paths, account, ...(dockerEndpoint ? { dockerEndpoint } : {}) },
+          { command: 'resume', paths: this.#paths, account, checkoutRoot: reservation.checkout_realpath, ...host },
           interaction,
         );
       });

@@ -1318,16 +1318,19 @@ async function readInstanceState(paths: ControlPlanePaths, reservation: Instance
 }
 
 /**
- * The Docker endpoint create recorded for this instance: the runtime's once
+ * The host coordinates create recorded for this instance: the runtime's once
  * the host has started, the bootstrap manifest's before. Once recorded,
- * resume probes it rather than re-resolving the active context.
+ * resume probes the Docker endpoint rather than re-resolving the active
+ * context, and runs the OneCLI CLI this instance was created with.
  */
-export async function recordedDockerEndpoint(
+export async function recordedHost(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
-): Promise<string | undefined> {
+): Promise<{ readonly dockerEndpoint?: string; readonly onecliCliPath?: string }> {
   const { manifest, runtime } = await readInstanceState(paths, reservation);
-  return runtime?.docker_endpoint ?? manifest?.docker_endpoint;
+  const dockerEndpoint = runtime?.docker_endpoint ?? manifest?.docker_endpoint;
+  const onecliCliPath = runtime?.onecli_cli_path ?? manifest?.onecli_cli_path;
+  return { ...(dockerEndpoint ? { dockerEndpoint } : {}), ...(onecliCliPath ? { onecliCliPath } : {}) };
 }
 
 /** Build the production context from temporary bootstrap input or authoritative instance state. */

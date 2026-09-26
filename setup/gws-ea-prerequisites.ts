@@ -10,9 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import type { Interaction } from '../src/gws-ea/events.js';
 import { GCLOUD_INSTALL_URL } from '../src/gws-ea/gcloud.js';
-import { installPinnedOnecliCli, onecliInstallDirectory } from '../src/gws-ea/onecli-install.js';
 import { CONTROL_PLANE_ROOT } from '../src/gws-ea/paths.js';
-import { ONECLI_CLI_VERSION } from '../src/gws-ea/pins.js';
 import {
   checkPrerequisites,
   dockerAnswers,
@@ -52,7 +50,6 @@ export interface GuidedPrerequisiteDependencies {
   /** Runs `open -a Docker`. */
   readonly runCommand?: SanitizedCommandOutcomeRunner;
   readonly dockerAnswers?: (endpoint: string) => Promise<boolean>;
-  readonly installOnecli?: () => Promise<string>;
   readonly sleep?: (milliseconds: number) => Promise<void>;
 }
 
@@ -249,20 +246,6 @@ function fixFor(error: GwsEaError, dependencies: GuidedPrerequisiteDependencies)
             ).exitCode === 0,
         },
         ...(settle ? { settle } : {}),
-      };
-    }
-    case 'onecli_required': {
-      const directory = onecliInstallDirectory();
-      return {
-        title: 'OneCLI CLI',
-        steps: `Install OneCLI CLI ${ONECLI_CLI_VERSION} into ${directory}, then return to this terminal.\nhttps://github.com/onecli/onecli-cli/releases/tag/v${ONECLI_CLI_VERSION}`,
-        offer: {
-          question: `Install OneCLI CLI ${ONECLI_CLI_VERSION} into ${directory} now? It is downloaded from its GitHub release and checked against its pinned digest.`,
-          run: async () => {
-            await (dependencies.installOnecli ?? (() => installPinnedOnecliCli()))();
-            return true;
-          },
-        },
       };
     }
     case 'pnpm_required':

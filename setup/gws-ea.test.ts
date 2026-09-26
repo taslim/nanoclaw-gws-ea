@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { CliRuntime, FailureReport } from '../src/gws-ea/cli.js';
 import type { Interaction } from '../src/gws-ea/events.js';
+import type { PrerequisiteRequest } from '../src/gws-ea/prerequisites.js';
 
 const fixture = vi.hoisted(() => {
   const spinner = {
@@ -149,12 +150,19 @@ describe('GWS-EA driver', () => {
     expect(fixture.confirmAccount).toHaveBeenCalledWith('operator@example.com');
 
     const interaction = { marker: 'interaction' } as unknown as Interaction;
-    const request = {
+    const request: PrerequisiteRequest = {
       command: 'resume',
-      paths: { configRoot: '/config', stateRoot: '/state', logsRoot: '/state/logs', instancesRoot: '/state/instances' },
+      paths: {
+        configRoot: '/config',
+        stateRoot: '/state',
+        logsRoot: '/state/logs',
+        instancesRoot: '/state/instances',
+        onecliCliFile: (version) => `/state/tools/onecli/${version}/onecli`,
+      },
       account: 'reserved@example.com',
       dockerEndpoint: 'unix:///var/run/docker.sock',
-    } as const;
+      checkoutRoot: '/state/instances/x/nanoclaw',
+    };
     await runtime.checkPrerequisites!(request, interaction);
     expect(fixture.ensurePrerequisites).toHaveBeenCalledWith(request, interaction);
   });

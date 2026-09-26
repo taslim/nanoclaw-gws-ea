@@ -34,6 +34,8 @@ export interface ControlPlanePaths {
   bootstrapFile(instanceId: string): string;
   releasePreflightFile(instanceId: string): string;
   removalFile(instanceId: string): string;
+  /** gws-ea's own copy of one pinned OneCLI CLI version. */
+  onecliCliFile(version: string): string;
 }
 
 function nearestExistingAncestor(target: string): string {
@@ -98,6 +100,7 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
     bootstrapFile: (instanceId) => path.join(instanceRoot(instanceId), 'bootstrap.json'),
     releasePreflightFile: (instanceId) => path.join(instanceRoot(instanceId), 'release-preflight.json'),
     removalFile: (instanceId) => path.join(removalRoot, `${instanceId}.json`),
+    onecliCliFile: (version) => path.join(stateRoot, 'tools', 'onecli', version, 'onecli'),
   };
 }
 

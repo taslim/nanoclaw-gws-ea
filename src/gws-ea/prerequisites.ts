@@ -6,7 +6,6 @@
  */
 import { request as httpRequest } from 'node:http';
 import os from 'node:os';
-import path from 'node:path';
 
 import { errorCode } from '../community-portal/errors.js';
 import { SignInRequired, withGoogleSignIn, type Interaction } from './events.js';
@@ -17,6 +16,7 @@ import {
   isConsumerGoogleAccount,
   isGoogleAccountAddress,
 } from './gcloud.js';
+import { ensurePinnedOnecliCli, isRegularFile, releaseOnecliCliPin } from './onecli-install.js';
 import { ONECLI_CLI_VERSION } from './pins.js';
 import { protectFromAgentMounts } from './mount-allowlist.js';
 import { CONTROL_PLANE_ROOT, type ControlPlanePaths } from './paths.js';
@@ -38,7 +38,10 @@ const DOCKER_PING_TIMEOUT_MS = 5_000;
 const TOOL_TIMEOUT_MS = 30_000;
 
 /** gws-ea's own roots: executables may not live in its instances, and agent mounts may not reach any of them. */
-export type PrerequisitePaths = Pick<ControlPlanePaths, 'configRoot' | 'stateRoot' | 'logsRoot' | 'instancesRoot'>;
+export type PrerequisitePaths = Pick<
+  ControlPlanePaths,
+  'configRoot' | 'stateRoot' | 'logsRoot' | 'instancesRoot' | 'onecliCliFile'
+>;
 
 export type PrerequisiteRequest =
   /** `account` is `--google-account`; without it the operator confirms the signed-in account. */
@@ -52,6 +55,9 @@ export type PrerequisiteRequest =
       readonly paths: PrerequisitePaths;
       readonly account: string;
       readonly dockerEndpoint?: string;
+      /** The OneCLI CLI create recorded, and the release checkout whose pin can restore gws-ea's copy of it. */
+      readonly onecliCliPath?: string;
+      readonly checkoutRoot: string;
     };
 
 /** What the prerequisites established about this host, as create records it. */
@@ -61,7 +67,7 @@ export interface Prerequisites {
   readonly runningAsRoot: boolean;
   /** Real path of the Node.js running gws-ea, which can replace a process (`process.execve`). */
   readonly nodePath: string;
-  /** Real path of the OneCLI CLI; at create it reports the pinned version. */
+  /** Real path of gws-ea's own OneCLI CLI; at create it reports the pinned version. */
   readonly onecliCliPath: string;
   /** The active Docker context's local `unix://` endpoint, answered by a running daemon. */
   readonly dockerEndpoint: string;
@@ -80,6 +86,8 @@ export interface PrerequisiteDependencies {
   readonly platform?: NodeJS.Platform;
   /** The shared NanoClaw mount allowlist; its documented location under the home directory by default. */
   readonly mountAllowlistFile?: string;
+  readonly ensureOnecliCli?: typeof ensurePinnedOnecliCli;
+  readonly releaseOnecliCliPin?: typeof releaseOnecliCliPin;
 }
 
 function toolEnvironment(): Readonly<Record<string, string>> {
@@ -121,18 +129,20 @@ async function assertTools(runner: SanitizedCommandOutcomeRunner): Promise<void>
   );
 }
 
-async function locateOnecli(
-  resolvePersisted: typeof resolvePersistedExecutable,
-  checkoutRoots: readonly string[],
-): Promise<string> {
-  const searchPath = [path.join(os.homedir(), '.local', 'bin'), process.env.PATH ?? ''].join(path.delimiter);
-  return resolvePersisted('onecli', { searchPath, checkoutRoots }).catch((error: unknown) =>
-    missingExecutable(
-      error,
-      'onecli_required',
-      `OneCLI CLI ${ONECLI_CLI_VERSION} is required but was not found on PATH or in ~/.local/bin. Install it, then retry.`,
-    ),
-  );
+/**
+ * gws-ea's own OneCLI CLI. Create installs this launcher's pin, if gws-ea has
+ * not already. Resume keeps the CLI create recorded; when that was gws-ea's
+ * copy and it went missing, it is restored from the assistant's own pin.
+ */
+async function pinnedOnecliCli(request: PrerequisiteRequest, dependencies: PrerequisiteDependencies): Promise<string> {
+  const ensure = dependencies.ensureOnecliCli ?? ensurePinnedOnecliCli;
+  const recorded = request.command === 'resume' ? request.onecliCliPath : undefined;
+  if (recorded === undefined || recorded === request.paths.onecliCliFile(ONECLI_CLI_VERSION)) {
+    return ensure(request.paths);
+  }
+  if (request.command !== 'resume' || (await isRegularFile(recorded))) return recorded;
+  const pin = await (dependencies.releaseOnecliCliPin ?? releaseOnecliCliPin)(request.checkoutRoot);
+  return recorded === request.paths.onecliCliFile(pin.version) ? ensure(request.paths, pin) : recorded;
 }
 
 type DockerDaemonState =
@@ -321,7 +331,10 @@ export async function checkPrerequisites(
   });
   const nodePath = await resolvePersisted(node.execPath, { checkoutRoots });
   await assertTools(runner);
-  const onecliCliPath = await locateOnecli(resolvePersisted, checkoutRoots);
+  const onecliCliPath = await resolvePersisted(await pinnedOnecliCli(request, dependencies), { checkoutRoots }).catch(
+    (error: unknown) =>
+      missingExecutable(error, 'onecli_required', 'The OneCLI CLI this assistant was created with is missing.'),
+  );
   // Pins are compared when an assistant is created; a later launcher upgrade must not block its resume.
   if (request.command === 'create') {
     await assertInstalledOnecliCli(

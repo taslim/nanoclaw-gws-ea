@@ -603,7 +603,9 @@ function hostDependencies(
       }
       return ok();
     },
-    resolvePersisted: async (command) => (command === 'onecli' ? '/usr/local/bin/onecli' : process.execPath),
+    resolvePersisted: async (command) => (path.basename(command) === 'onecli' ? command : process.execPath),
+    // gws-ea's own OneCLI CLI, never downloaded in a test.
+    ensureOnecliCli: async (paths, pin) => paths.onecliCliFile(pin?.version ?? ONECLI_CLI_VERSION),
     node: { version: 'v22.20.0', execPath: process.execPath, execve: neverCalled },
     platform: 'linux',
     // Never the operator's real NanoClaw mount allowlist.
@@ -801,10 +803,12 @@ describe('gws-ea prerequisites', () => {
       advanceProvision: async () => ({ status: 'paused', pause: DM_PAUSE }),
     });
 
-    expect(requests).toEqual([{ command: 'resume', paths, account: 'operator@example.test' }]);
+    expect(requests).toEqual([
+      { command: 'resume', paths, account: 'operator@example.test', checkoutRoot: input.checkout_realpath },
+    ]);
   });
 
-  it('probes the Docker endpoint create recorded when resume checks prerequisites', async () => {
+  it('passes the Docker endpoint and OneCLI CLI create recorded when resume checks prerequisites', async () => {
     const paths = await testPaths();
     const input = reservation(paths);
     await installProductionBootstrapManifest(paths, input.instance_id, {
@@ -829,7 +833,9 @@ describe('gws-ea prerequisites', () => {
         command: 'resume',
         paths,
         account: 'operator@example.test',
+        checkoutRoot: input.checkout_realpath,
         dockerEndpoint: 'unix:///Users/operator/.docker/run/docker.sock',
+        onecliCliPath: '/usr/local/bin/onecli',
       },
     ]);
   });

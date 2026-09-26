@@ -11,7 +11,7 @@ import {
   RECORDED_GCLOUD_REAUTHENTICATION_FAILED,
   RECORDED_ONECLI_VERSION,
 } from './fixtures/recordings.js';
-import { ONECLI_CLI_VERSION } from './pins.js';
+import { ONECLI_CLI_ARCHIVE_DIGESTS, ONECLI_CLI_VERSION } from './pins.js';
 import {
   checkPrerequisites,
   resolveDockerEndpoint,
@@ -61,6 +61,8 @@ interface FakeHost {
   /** Accounts whose credentials no longer refresh. */
   readonly expired: Set<string>;
   readonly commands: string[];
+  /** gws-ea's OneCLI CLI copies installed during the check. */
+  readonly installedOnecli: string[];
 }
 
 function fakeHost(dockerHost: string): FakeHost {
@@ -72,6 +74,7 @@ function fakeHost(dockerHost: string): FakeHost {
     active: 'operator@example.com',
     expired: new Set(),
     commands: [],
+    installedOnecli: [],
   };
 }
 
@@ -138,11 +141,18 @@ function dependencies(host: FakeHost, overrides: Partial<PrerequisiteDependencie
   return {
     runCommand: hostRunner(host),
     resolvePersisted: async (command) => {
-      if (command === 'onecli') {
-        if (host.missing.has('onecli')) throw notFound('onecli');
-        return '/Users/operator/.local/bin/onecli';
+      if (path.basename(command) === 'onecli') {
+        if (host.missing.has(command)) throw notFound(command);
+        return command;
       }
       return '/opt/homebrew/Cellar/node/22.20.0/bin/node';
+    },
+    // gws-ea's own copy is always there unless a test removes it; the launcher pin needs no checkout.
+    ensureOnecliCli: async (paths, pin) => {
+      const installed = paths.onecliCliFile(pin?.version ?? ONECLI_CLI_VERSION);
+      host.installedOnecli.push(installed);
+      host.missing.delete(installed);
+      return installed;
     },
     node: { version: 'v22.20.0', execPath: '/opt/homebrew/bin/node', execve: neverCalled },
     platform: 'darwin',
@@ -172,7 +182,10 @@ const PATHS = {
   stateRoot: '/Users/operator/.local/share/gws-ea',
   logsRoot: '/Users/operator/.local/share/gws-ea/logs',
   instancesRoot: '/Users/operator/.local/share/gws-ea/instances',
+  onecliCliFile: (version: string) => `/Users/operator/.local/share/gws-ea/tools/onecli/${version}/onecli`,
 } as const;
+const PINNED_ONECLI = PATHS.onecliCliFile(ONECLI_CLI_VERSION);
+const CHECKOUT = '/Users/operator/.local/share/gws-ea/instances/1/nanoclaw';
 const CREATE: PrerequisiteRequest = { command: 'create', paths: PATHS };
 
 /** gws-ea's roots under a home directory, as the XDG defaults place them. */
@@ -186,9 +199,16 @@ function rootsUnder(home: string) {
   };
 }
 
-/** Resume names the Docker endpoint create recorded. */
-function resume(dockerEndpoint: string): PrerequisiteRequest {
-  return { command: 'resume', paths: PATHS, account: 'reserved@example.com', dockerEndpoint };
+/** Resume names the Docker endpoint and OneCLI CLI create recorded. */
+function resume(dockerEndpoint: string, onecliCliPath = PINNED_ONECLI): PrerequisiteRequest {
+  return {
+    command: 'resume',
+    paths: PATHS,
+    account: 'reserved@example.com',
+    dockerEndpoint,
+    onecliCliPath,
+    checkoutRoot: CHECKOUT,
+  };
 }
 
 describe('prerequisites', () => {
@@ -202,7 +222,7 @@ describe('prerequisites', () => {
       homeDirectory: os.homedir(),
       runningAsRoot: process.getuid?.() === 0,
       nodePath: '/opt/homebrew/Cellar/node/22.20.0/bin/node',
-      onecliCliPath: '/Users/operator/.local/bin/onecli',
+      onecliCliPath: PINNED_ONECLI,
       dockerEndpoint: daemon.host,
       account: 'operator@example.com',
     });
@@ -255,7 +275,7 @@ describe('prerequisites', () => {
     expect(host.commands.some((command) => command.startsWith('gcloud'))).toBe(false);
   });
 
-  it('requires the OneCLI CLI, pinned at create and present on resume', async () => {
+  it("uses gws-ea's own pinned OneCLI CLI, checking its version at create only", async () => {
     const daemon = await dockerDaemon();
     const host = fakeHost(daemon.host);
     host.onecliVersion = '2.0.0';
@@ -264,18 +284,35 @@ describe('prerequisites', () => {
       code: 'incompatible_onecli',
       message: expect.stringMatching(new RegExp(`2\\.0\\.0.*${ONECLI_CLI_VERSION.replaceAll('.', '\\.')}`, 'su')),
     });
+    expect(host.installedOnecli).toEqual([PINNED_ONECLI]);
 
     host.commands.length = 0;
     await expect(checkPrerequisites(resume(daemon.host), operator(host), dependencies(host))).resolves.toMatchObject({
-      account: 'reserved@example.com',
+      onecliCliPath: PINNED_ONECLI,
     });
     expect(host.commands).not.toContain('onecli version');
+  });
 
-    host.missing.add('onecli');
-    await expect(checkPrerequisites(resume(daemon.host), operator(host), dependencies(host))).rejects.toMatchObject({
-      code: 'onecli_required',
-      message: expect.stringContaining(ONECLI_CLI_VERSION),
-    });
+  it("restores gws-ea's copy of an assistant's older CLI from its release pin, and leaves any other CLI alone", async () => {
+    const daemon = await dockerDaemon();
+    const host = fakeHost(daemon.host);
+    const older = PATHS.onecliCliFile('2.1.0');
+    host.missing.add(older);
+    const releaseOnecliCliPin = vi.fn(async () => ({ version: '2.1.0', digests: ONECLI_CLI_ARCHIVE_DIGESTS }));
+
+    await expect(
+      checkPrerequisites(resume(daemon.host, older), operator(host), dependencies(host, { releaseOnecliCliPin })),
+    ).resolves.toMatchObject({ onecliCliPath: older });
+    expect(releaseOnecliCliPin).toHaveBeenCalledWith(CHECKOUT);
+    expect(host.installedOnecli).toEqual([older]);
+
+    // A CLI recorded outside gws-ea's own directory is never replaced; a missing one is named.
+    const shared = '/Users/operator/.local/bin/onecli';
+    host.missing.add(shared);
+    await expect(
+      checkPrerequisites(resume(daemon.host, shared), operator(host), dependencies(host, { releaseOnecliCliPin })),
+    ).rejects.toMatchObject({ code: 'onecli_required' });
+    expect(host.installedOnecli).toEqual([older]);
   });
 
   it('probes the Docker endpoint create recorded on resume, not the active context', async () => {

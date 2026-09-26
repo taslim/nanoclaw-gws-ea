@@ -1,32 +1,66 @@
 /**
- * Install the pinned OneCLI CLI into `~/.local/bin` from its GitHub release,
- * where NanoClaw's add-onecli installer puts it and where gws-ea looks first.
- * The archive is refused unless its sha256 is the pinned digest.
+ * gws-ea's own OneCLI CLI. Each pinned version is installed once, into its
+ * own directory under gws-ea's state root, from its GitHub release, and
+ * refused unless the archive matches its pinned sha256. Nothing else writes
+ * there, so another program installing or upgrading `onecli` never changes
+ * the CLI an assistant was created with.
  */
 import { createHash } from 'node:crypto';
-import { chmod, copyFile, lstat, mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { ONECLI_CLI_ARCHIVE_DIGESTS, ONECLI_CLI_VERSION, type OnecliCliTarget } from './pins.js';
+import { isErrno } from '../community-portal/errors.js';
+import type { ControlPlanePaths } from './paths.js';
+import {
+  exactVersion,
+  ONECLI_CLI_ARCHIVE_DIGESTS,
+  ONECLI_CLI_VERSION,
+  parseOnecliCliArchiveDigests,
+  PIN_NAMES,
+  type OnecliCliTarget,
+} from './pins.js';
 import {
   buildToolEnvironment,
   checkedRunner,
   runSanitizedCommandOutcome,
   type SanitizedCommandOutcomeRunner,
 } from './process.js';
+import { activeStep } from './run-log.js';
 import { GwsEaError } from './types.js';
+import { parseJson, requireRecord } from './validation.js';
 
 const DOWNLOAD_TIMEOUT_MS = 120_000;
 const MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
+
+/** One OneCLI CLI version and the sha256 of each of its release archives. */
+export interface OnecliCliPin {
+  readonly version: string;
+  readonly digests: Readonly<Record<OnecliCliTarget, string>>;
+}
+
+/** The OneCLI CLI this launcher pins. */
+export const LAUNCHER_ONECLI_CLI: OnecliCliPin = { version: ONECLI_CLI_VERSION, digests: ONECLI_CLI_ARCHIVE_DIGESTS };
+
+/** The OneCLI CLI a release checkout pins, from its own `src/gws-ea/versions.json`. */
+export async function releaseOnecliCliPin(checkoutRoot: string): Promise<OnecliCliPin> {
+  const file = path.join(checkoutRoot, 'src', 'gws-ea', 'versions.json');
+  const pins = requireRecord(
+    parseJson(await readFile(file, 'utf8'), 'the release pins', 'invalid_release_pin'),
+    'the release pins',
+    'invalid_release_pin',
+  );
+  return {
+    version: exactVersion(pins['onecli-cli'], PIN_NAMES.onecliCli),
+    digests: parseOnecliCliArchiveDigests(pins['onecli-cli-archives']),
+  };
+}
 
 export interface OnecliInstallDependencies {
   readonly fetch?: typeof fetch;
   readonly runCommand?: SanitizedCommandOutcomeRunner;
   readonly platform?: NodeJS.Platform;
   readonly arch?: string;
-  readonly installDirectory?: string;
-  readonly digests?: Readonly<Record<OnecliCliTarget, string>>;
 }
 
 function releaseTarget(platform: NodeJS.Platform, arch: string): OnecliCliTarget | undefined {
@@ -35,24 +69,37 @@ function releaseTarget(platform: NodeJS.Platform, arch: string): OnecliCliTarget
   return system && machine ? `${system}_${machine}` : undefined;
 }
 
-/** Where the pinned CLI is installed: the user's `~/.local/bin`. */
-export function onecliInstallDirectory(): string {
-  return path.join(os.homedir(), '.local', 'bin');
+/** Whether a regular file exists at `file`. */
+export async function isRegularFile(file: string): Promise<boolean> {
+  try {
+    return (await lstat(file)).isFile();
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) return false;
+    throw error;
+  }
 }
 
-/** Download, verify, and install the pinned OneCLI CLI; returns its installed path. */
-export async function installPinnedOnecliCli(dependencies: OnecliInstallDependencies = {}): Promise<string> {
+/** gws-ea's copy of a pinned OneCLI CLI, installed first when it is missing; returns its path. */
+export async function ensurePinnedOnecliCli(
+  paths: Pick<ControlPlanePaths, 'onecliCliFile'>,
+  pin: OnecliCliPin = LAUNCHER_ONECLI_CLI,
+  dependencies: OnecliInstallDependencies = {},
+): Promise<string> {
+  const installed = paths.onecliCliFile(exactVersion(pin.version, PIN_NAMES.onecliCli));
+  if (await isRegularFile(installed)) return installed;
+
   const platform = dependencies.platform ?? process.platform;
   const arch = dependencies.arch ?? process.arch;
   const target = releaseTarget(platform, arch);
   if (!target) {
     throw new GwsEaError(
       'onecli_install_unsupported',
-      `OneCLI CLI ${ONECLI_CLI_VERSION} has no build for ${platform} ${arch}`,
+      `OneCLI CLI ${pin.version} has no build for ${platform} ${arch}`,
     );
   }
-  const archive = `onecli_${ONECLI_CLI_VERSION}_${target}.tar.gz`;
-  const url = `https://github.com/onecli/onecli-cli/releases/download/v${ONECLI_CLI_VERSION}/${archive}`;
+  activeStep()?.write(`Installing OneCLI CLI ${pin.version} for gws-ea into ${installed}\n`);
+  const archive = `onecli_${pin.version}_${target}.tar.gz`;
+  const url = `https://github.com/onecli/onecli-cli/releases/download/v${pin.version}/${archive}`;
   const response = await (dependencies.fetch ?? fetch)(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
   if (!response.ok) {
     throw new GwsEaError('onecli_download_failed', `Downloading ${url} failed with HTTP ${response.status}`);
@@ -62,7 +109,7 @@ export async function installPinnedOnecliCli(dependencies: OnecliInstallDependen
     throw new GwsEaError('onecli_download_failed', `${archive} is larger than any OneCLI CLI release`);
   }
   const digest = createHash('sha256').update(bytes).digest('hex');
-  if (digest !== (dependencies.digests ?? ONECLI_CLI_ARCHIVE_DIGESTS)[target]) {
+  if (digest !== pin.digests[target]) {
     throw new GwsEaError(
       'onecli_digest_mismatch',
       `${archive} does not match its pinned sha256 (got ${digest}); nothing was installed`,
@@ -80,12 +127,10 @@ export async function installPinnedOnecliCli(dependencies: OnecliInstallDependen
       timeoutMs: 60_000,
     });
     const extracted = path.join(staging, 'onecli');
-    if (!(await lstat(extracted)).isFile()) {
+    if (!(await isRegularFile(extracted))) {
       throw new GwsEaError('onecli_download_failed', `${archive} does not contain the onecli program`);
     }
-    const directory = dependencies.installDirectory ?? onecliInstallDirectory();
-    await mkdir(directory, { recursive: true, mode: 0o755 });
-    const installed = path.join(directory, 'onecli');
+    await mkdir(path.dirname(installed), { recursive: true, mode: 0o700 });
     // Staged beside its target, so the rename that publishes it is atomic.
     const pending = `${installed}.gws-ea-${process.pid}`;
     try {

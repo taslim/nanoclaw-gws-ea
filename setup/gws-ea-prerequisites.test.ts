@@ -3,6 +3,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { PrerequisiteRequest, Prerequisites } from '../src/gws-ea/prerequisites.js';
+import type { SanitizedCommandOutcome } from '../src/gws-ea/process.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
 import { confirmGoogleAccount, ensurePrerequisites, signInToGoogleCloud } from './gws-ea-prerequisites.js';
 
@@ -22,7 +23,7 @@ const READY: Prerequisites = {
   homeDirectory: '/Users/operator',
   runningAsRoot: false,
   nodePath: '/opt/homebrew/bin/node',
-  onecliCliPath: '/Users/operator/.local/bin/onecli',
+  onecliCliPath: '/Users/operator/.local/share/gws-ea/tools/onecli/2.2.5/onecli',
   dockerEndpoint: 'unix:///Users/operator/.docker/run/docker.sock',
   account: 'operator@example.com',
 };
@@ -34,6 +35,7 @@ const REQUEST: PrerequisiteRequest = {
     stateRoot: '/Users/operator/.local/share/gws-ea',
     logsRoot: '/Users/operator/.local/share/gws-ea/logs',
     instancesRoot: '/Users/operator/.local/share/gws-ea/instances',
+    onecliCliFile: (version) => `/Users/operator/.local/share/gws-ea/tools/onecli/${version}/onecli`,
   },
 };
 
@@ -236,6 +238,29 @@ describe('GWS-EA guided prerequisites', () => {
     expect(check).toHaveBeenCalledTimes(2);
   });
 
+  it('says why starting Docker failed, then shows the manual step', async () => {
+    const check = failingThen(stoppedDocker());
+    const prompts = promptFixture([true, true]);
+    const runCommand = vi.fn(async (): Promise<SanitizedCommandOutcome> => {
+      throw new GwsEaError('executable_not_found', 'open was not found on PATH');
+    });
+
+    await expect(
+      ensurePrerequisites(REQUEST, terminal().interaction, {
+        check,
+        prompts,
+        platform: 'darwin',
+        runCommand,
+        dockerAnswers: async () => true,
+      }),
+    ).resolves.toBe(READY);
+
+    expect(prompts.note.mock.calls.map(([message]) => String(message))).toEqual([
+      'open was not found on PATH',
+      'Start Docker Desktop, then return to this terminal.',
+    ]);
+  });
+
   it('shows how to start Docker on Linux, then waits for its daemon', async () => {
     const check = failingThen(stoppedDocker());
     const prompts = promptFixture([true]);
@@ -255,42 +280,6 @@ describe('GWS-EA guided prerequisites', () => {
     expect(prompts.note).toHaveBeenCalledWith(expect.stringContaining('sudo systemctl start docker'), 'Docker');
     expect(runCommand).not.toHaveBeenCalled();
     expect(dockerAnswers).toHaveBeenCalledWith(ENDPOINT);
-  });
-
-  it('installs the pinned OneCLI CLI when the operator agrees', async () => {
-    const check = failingThen(new GwsEaError('onecli_required', 'OneCLI CLI is required'));
-    const prompts = promptFixture([true]);
-    const installOnecli = vi.fn(async () => '/Users/operator/.local/bin/onecli');
-
-    await expect(ensurePrerequisites(REQUEST, terminal().interaction, { check, prompts, installOnecli })).resolves.toBe(
-      READY,
-    );
-
-    expect(prompts.confirm).toHaveBeenCalledWith(
-      expect.objectContaining({ message: expect.stringContaining('checked against its pinned digest') }),
-    );
-    expect(installOnecli).toHaveBeenCalledOnce();
-    expect(prompts.note).not.toHaveBeenCalled();
-  });
-
-  it('says why an install failed, then offers the manual steps', async () => {
-    const check = failingThen(new GwsEaError('onecli_required', 'OneCLI CLI is required'));
-    const prompts = promptFixture([true, true]);
-    const installOnecli = vi.fn(async (): Promise<string> => {
-      throw new GwsEaError(
-        'onecli_digest_mismatch',
-        'onecli_2.2.5_darwin_arm64.tar.gz does not match its pinned sha256',
-      );
-    });
-
-    await expect(ensurePrerequisites(REQUEST, terminal().interaction, { check, prompts, installOnecli })).resolves.toBe(
-      READY,
-    );
-
-    expect(prompts.note.mock.calls.map(([message]) => String(message))).toEqual([
-      'onecli_2.2.5_darwin_arm64.tar.gz does not match its pinned sha256',
-      expect.stringContaining('https://github.com/onecli/onecli-cli/releases/tag/v2.2.5'),
-    ]);
   });
 
   it.each([
