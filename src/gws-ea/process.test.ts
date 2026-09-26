@@ -439,6 +439,32 @@ describe('GWS-EA command runner', () => {
     }
   });
 
+  it('drops a line longer than the retained window through its newline, keeping what follows', async () => {
+    const run = await runLog();
+    const apiKey = `env-secret-${randomBytes(12).toString('hex')}`;
+    // The long line arrives without its newline; the key, then its end and newline, come in later writes.
+    const script = [
+      `const later = (delay, text) => new Promise((resolve) => setTimeout(() => process.stderr.write(text, resolve), delay));`,
+      `process.stderr.write('y'.repeat(${70 * 1024}));`,
+      `later(50, process.env.ONECLI_API_KEY)`,
+      `.then(() => later(50, 'its end\\nafter the long line\\n'))`,
+      `.then(() => { process.exitCode = 1; });`,
+    ].join(' ');
+
+    const error = await run.step('provision_gcp', () =>
+      failure(
+        runSanitizedCommand({
+          command: NODE,
+          args: ['--eval', script],
+          cwd: process.cwd(),
+          env: buildToolEnvironment(process.env, { ONECLI_API_KEY: apiKey }),
+        }),
+      ),
+    );
+
+    expect(error.details?.stderrTail).toBe('after the long line');
+  });
+
   it('streams an opt-in build log over 1 MiB to the raw log, redacted', async () => {
     const secret = `build-secret-${randomBytes(12).toString('hex')}`;
     const secretDirectory = await temporaryRoot('build-secret');
