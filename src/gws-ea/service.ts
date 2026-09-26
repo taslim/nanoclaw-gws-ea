@@ -381,7 +381,7 @@ export function createInstanceServiceLayout(
 /** The runtime values a service manager's environment derives from. */
 export type ServiceManagerRuntime = Pick<PersistedInstanceRuntime, 'home_directory' | 'docker_endpoint'>;
 
-/** What the service manager starts the launcher with, and what the image build runs under. */
+/** What the service manager starts the launcher with: upstream NanoClaw's minimal service PATH. */
 function serviceEnvironment(config: ServiceManagerRuntime): Readonly<Record<string, string>> {
   return {
     HOME: config.home_directory,
@@ -663,10 +663,12 @@ export async function reconcileInstanceRuntime(
   const config = validateRuntimeConfig(configInput);
   await persistInstanceRuntime(config, dependencies.upsertEnvVars);
   const run = dependencies.runCommand ?? runSanitizedCommand;
-  const environment = buildToolEnvironment(
-    {},
-    { ...serviceEnvironment(config), NANOCLAW_INSTALL_ID: config.install_id },
-  );
+  // The build runs with the operator's tools, as release preflight's commands do; only the service keeps its minimal PATH.
+  const environment = buildToolEnvironment(dependencies.ambientEnv ?? process.env, {
+    HOME: config.home_directory,
+    DOCKER_HOST: config.docker_endpoint,
+    NANOCLAW_INSTALL_ID: config.install_id,
+  });
   const packageManifest = requireRecord(
     parseJson(
       await readFile(path.join(config.checkout_realpath, 'package.json'), 'utf8'),

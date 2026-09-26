@@ -514,17 +514,20 @@ describe('GWS-EA instance runtime', () => {
 
   it('prepares only the exact checkout image and service without invoking generic service setup', async () => {
     const { config, home } = await fixture();
-    const calls: Array<{ command: string; args: readonly string[]; cwd: string }> = [];
-    const runner = vi.fn(async (command: { command: string; args: readonly string[]; cwd: string }) => {
+    const calls: SanitizedCommand[] = [];
+    const runner = vi.fn(async (command: SanitizedCommand) => {
       calls.push(command);
       return { stdout: '', stderr: '' };
     });
+    // pnpm lives outside the service's minimal PATH, as a pnpm standalone install puts it.
+    const operatorPath = '/Users/operator/Library/pnpm/bin:/usr/bin:/bin';
     await reconcileInstanceRuntime(config, {
       upsertEnvVars,
       platform: 'macos',
       homeDirectory: home,
       runCommand: runner,
       uid: 501,
+      ambientEnv: { PATH: operatorPath, HOME: '/Users/elsewhere' },
     });
 
     expect(calls[0]).toMatchObject({
@@ -539,5 +542,14 @@ describe('GWS-EA instance runtime', () => {
     });
     expect(calls.flatMap((call) => call.args)).not.toContain('service');
     expect(calls.flatMap((call) => call.args).join(' ')).not.toContain('.local/bin/ncl');
+    // The build finds the operator's tools, against this instance's home, Docker endpoint, and install ID.
+    for (const call of calls.slice(0, 2)) {
+      expect(call.env).toMatchObject({
+        PATH: operatorPath,
+        HOME: config.home_directory,
+        DOCKER_HOST: config.docker_endpoint,
+        NANOCLAW_INSTALL_ID: config.install_id,
+      });
+    }
   });
 });
