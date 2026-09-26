@@ -298,35 +298,40 @@ describe('gws-ea stop summaries and exit codes', () => {
     expect(await readFile(log, 'utf8')).toMatch(/· paused at configure_channel \(chat_configuration_required\)\n$/u);
   });
 
-  it('records a run stopped by Ctrl-C, naming the step it was in', async () => {
-    const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
-    const ready = path.join(path.dirname(paths.configRoot), 'inside-step');
+  /**
+   * Resumes the instance in a child process whose runCli runtime also has
+   * `runtime` (source that may call `ready()`), sends it Ctrl-C once ready,
+   * and returns its exit code and progress log.
+   */
+  async function interruptWhenReady(
+    paths: ControlPlanePaths,
+    instanceId: string,
+    runtime: string,
+  ): Promise<{ readonly exitCode: number | null; readonly progress: string }> {
+    const readyFile = path.join(path.dirname(paths.configRoot), 'ready');
     const childScript = `
       import { writeFile } from 'node:fs/promises';
       import { runCli } from './src/gws-ea/cli.ts';
       import { runStep } from './src/gws-ea/events.ts';
       import { resolveControlPlanePaths } from './src/gws-ea/paths.ts';
-      await runCli(['resume', '--id', process.env.TEST_INSTANCE], {
+      const ready = () => writeFile(process.env.TEST_READY, 'ready');
+      process.exitCode = await runCli(['resume', '--id', process.env.TEST_INSTANCE], {
         paths: resolveControlPlanePaths(JSON.parse(process.env.TEST_PATHS)),
         stdout: () => undefined,
         stderr: () => undefined,
         checkPrerequisites: async () => JSON.parse(process.env.TEST_PREREQUISITES),
-        advanceProvision: (_operation, { runtime }) =>
-          runStep(runtime, { id: 'establish_transport' }, async () => {
-            await writeFile(process.env.TEST_READY, 'ready');
-            await new Promise((resolve) => setTimeout(resolve, 60_000));
-          }),
+        ${runtime}
       });
     `;
     const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', childScript], {
       cwd: process.cwd(),
       env: {
         ...process.env,
-        TEST_INSTANCE: input.instance_id,
+        TEST_INSTANCE: instanceId,
         TEST_PATHS: JSON.stringify({ configRoot: paths.configRoot, stateRoot: paths.stateRoot }),
         TEST_PREREQUISITES: JSON.stringify(PREREQUISITES),
-        TEST_READY: ready,
+        TEST_PAUSE: JSON.stringify(CHAT_PAUSE),
+        TEST_READY: readyFile,
       },
       stdio: 'ignore',
     });
@@ -334,7 +339,7 @@ describe('gws-ea stop summaries and exit codes', () => {
 
     for (let attempt = 0; attempt < 400; attempt += 1) {
       if (
-        await stat(ready).then(
+        await stat(readyFile).then(
           () => true,
           () => false,
         )
@@ -344,15 +349,61 @@ describe('gws-ea stop summaries and exit codes', () => {
     }
     child.kill('SIGINT');
 
-    expect(await exited).toBe(130);
-    const runs = path.join(paths.logsRoot, input.instance_id);
+    const exitCode = await exited;
+    const runs = path.join(paths.logsRoot, instanceId);
     const [run] = await readdir(runs);
-    const progress = await readFile(path.join(runs, run!, 'progress.log'), 'utf8');
+    return { exitCode, progress: await readFile(path.join(runs, run!, 'progress.log'), 'utf8') };
+  }
+
+  it('records a run stopped by Ctrl-C, naming the step it was in', async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation(paths));
+
+    const { exitCode, progress } = await interruptWhenReady(
+      paths,
+      input.instance_id,
+      `advanceProvision: (_operation, { runtime }) =>
+        runStep(runtime, { id: 'establish_transport' }, async () => {
+          await ready();
+          await new Promise((resolve) => setTimeout(resolve, 60_000));
+        }),`,
+    );
+
+    expect(exitCode).toBe(130);
     expect(progress).toMatch(/· interrupted at establish_transport \(SIGINT\)\n$/u);
     // The instance lock went with the process, so the next resume is not refused as busy.
     const operation = await acquireInstanceOperation(paths, input.instance_id);
     expect(operation).not.toBeNull();
     operation?.release();
+  }, 30_000);
+
+  it('stops only the wait when Ctrl-C arrives while a pause is attended, and reports the pause', async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation(paths));
+    const unexpected = `async () => { throw new Error('unexpected question'); }`;
+
+    const { exitCode, progress } = await interruptWhenReady(
+      paths,
+      input.instance_id,
+      `advanceProvision: async () => ({ status: 'paused', pause: JSON.parse(process.env.TEST_PAUSE) }),
+        prompts: {
+          providerCredential: ${unexpected},
+          cloudflareAccountToken: ${unexpected},
+          googleCloudSignIn: ${unexpected},
+          googleAccount: ${unexpected},
+          attendPause: async (_pause, signal) => {
+            await ready();
+            // Held open as a real question holds the terminal, until the wait is stopped.
+            const open = setTimeout(() => undefined, 60_000);
+            await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+            clearTimeout(open);
+            return { kind: 'stop' };
+          },
+        },`,
+    );
+
+    expect(exitCode).toBe(10);
+    expect(progress).toMatch(/· paused at configure_channel \(chat_configuration_required\)\n$/u);
   }, 30_000);
 
   it('exits 75 without advancing while another operation holds the instance lock', async () => {

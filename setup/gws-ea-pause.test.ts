@@ -1,3 +1,5 @@
+import * as clack from '@clack/prompts';
+import { PassThrough } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { ProvisionHumanPause } from '../src/gws-ea/phases.js';
@@ -15,6 +17,19 @@ function prompts(answer: unknown = true) {
   };
 }
 
+/** Real clack questions on an in-memory terminal, so cancelling them is clack's own behavior. */
+function clackPrompts() {
+  const input = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => input });
+  const output = new PassThrough();
+  return {
+    note: vi.fn(),
+    info: vi.fn(),
+    confirm: (options: Parameters<typeof clack.confirm>[0]) => clack.confirm({ ...options, input, output }),
+    select: (options: Parameters<typeof clack.select<string>>[0]) => clack.select({ ...options, input, output }),
+    isCancel: clack.isCancel,
+  };
+}
+
 function pause(overrides: Partial<ProvisionHumanPause> = {}): ProvisionHumanPause {
   return {
     kind: 'human-action',
@@ -25,6 +40,14 @@ function pause(overrides: Partial<ProvisionHumanPause> = {}): ProvisionHumanPaus
     ...overrides,
   };
 }
+
+const PRINCIPAL_CHOICE = pause({
+  code: 'principal_selection_required',
+  choices: [
+    { id: 'mg-1', label: 'Taslim Okunola (gchat:users/1)' },
+    { id: 'mg-2', label: 'Someone Else (gchat:users/2)' },
+  ],
+});
 
 const CHAT_CONFIGURATION = pause({
   phase: 'configure_channel',
@@ -56,21 +79,26 @@ describe('attending a pause at the terminal', () => {
   });
 
   it('lets the person choose the principal conversation, or stop', async () => {
-    const choices = pause({
-      code: 'principal_selection_required',
-      choices: [
-        { id: 'mg-1', label: 'Taslim Okunola (gchat:users/1)' },
-        { id: 'mg-2', label: 'Someone Else (gchat:users/2)' },
-      ],
-    });
-
-    await expect(attendPause(choices, new AbortController().signal, { prompts: prompts('mg-2') })).resolves.toEqual({
+    await expect(
+      attendPause(PRINCIPAL_CHOICE, new AbortController().signal, { prompts: prompts('mg-2') }),
+    ).resolves.toEqual({
       kind: 'continue',
       decisions: { messagingGroupId: 'mg-2' },
     });
-    await expect(attendPause(choices, new AbortController().signal, { prompts: prompts(CANCEL) })).resolves.toEqual({
+    await expect(
+      attendPause(PRINCIPAL_CHOICE, new AbortController().signal, { prompts: prompts(CANCEL) }),
+    ).resolves.toEqual({
       kind: 'stop',
     });
+  });
+
+  it('closes an open question and stops when the wait is stopped, as by SIGTERM', async () => {
+    for (const open of [PRINCIPAL_CHOICE, CHAT_CONFIGURATION]) {
+      const waiting = new AbortController();
+      const attended = attendPause(open, waiting.signal, { prompts: clackPrompts() });
+      waiting.abort();
+      await expect(attended).resolves.toEqual({ kind: 'stop' });
+    }
   });
 
   it('waits for what the person was asked to do, then continues on its own', async () => {
@@ -87,7 +115,7 @@ describe('attending a pause at the terminal', () => {
     expect(terminal.info).toHaveBeenCalledWith(expect.stringContaining('Press Ctrl-C to stop and resume later'));
   });
 
-  it('stops waiting when interrupted, and stops at once for a pause it cannot attend', async () => {
+  it('stops waiting when interrupted or when a check cannot finish, and at once for a pause it cannot attend', async () => {
     const waiting = new AbortController();
     const settled = vi.fn(async () => false);
     const sleep = vi.fn(async () => waiting.abort());
@@ -96,6 +124,14 @@ describe('attending a pause at the terminal', () => {
       kind: 'stop',
     });
     expect(settled).toHaveBeenCalledOnce();
+
+    // A check that cannot finish, as one Ctrl-C interrupts, stops the wait rather than failing the run.
+    const failing = vi.fn(async (): Promise<boolean> => {
+      throw new Error('Command was terminated by SIGINT');
+    });
+    await expect(
+      attendPause(pause({ settled: failing }), new AbortController().signal, { prompts: prompts(), sleep }),
+    ).resolves.toEqual({ kind: 'stop' });
 
     const terminal = prompts();
     await expect(

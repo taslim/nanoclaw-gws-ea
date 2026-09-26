@@ -14,11 +14,20 @@ const WATCH_INTERVAL_MS = 3_000;
 const WATCH_LIMIT_MS = 30 * 60_000;
 const STOP: PauseResponse = { kind: 'stop' };
 
+/** Each question is cancelled when `signal` aborts, as a Ctrl-C or a stop signal does. */
 interface PausePrompts {
   note(message: string, title?: string): void;
   info(message: string): void;
-  confirm(options: { readonly message: string; readonly initialValue: boolean }): Promise<unknown>;
-  select(options: { readonly message: string; readonly options: { value: string; label: string }[] }): Promise<unknown>;
+  confirm(options: {
+    readonly message: string;
+    readonly initialValue: boolean;
+    readonly signal: AbortSignal;
+  }): Promise<unknown>;
+  select(options: {
+    readonly message: string;
+    readonly options: { value: string; label: string }[];
+    readonly signal: AbortSignal;
+  }): Promise<unknown>;
   isCancel(value: unknown): boolean;
 }
 
@@ -60,6 +69,7 @@ export async function attendPause(
     const selected = await prompts.select({
       message: "Which conversation is the principal's?",
       options: pause.choices.map((choice) => ({ value: choice.id, label: choice.label })),
+      signal,
     });
     if (prompts.isCancel(selected) || typeof selected !== 'string') return STOP;
     return { kind: 'continue', decisions: { messagingGroupId: selected } };
@@ -67,7 +77,11 @@ export async function attendPause(
 
   if (pause.resumeFlag === '--chat-configured') {
     prompts.note(shown, 'Google Chat app');
-    const answer = await prompts.confirm({ message: 'Have you saved this configuration?', initialValue: true });
+    const answer = await prompts.confirm({
+      message: 'Have you saved this configuration?',
+      initialValue: true,
+      signal,
+    });
     return answer === true ? { kind: 'continue', decisions: { chatConfigured: true } } : STOP;
   }
 
@@ -75,7 +89,10 @@ export async function attendPause(
     prompts.note(shown, 'Waiting for you');
     prompts.info('Waiting: setup continues on its own once that happens. Press Ctrl-C to stop and resume later.');
     for (let waited = 0; waited < WATCH_LIMIT_MS && !signal.aborted; waited += WATCH_INTERVAL_MS) {
-      if (await pause.settled()) return { kind: 'continue' };
+      // A check that cannot finish, as when Ctrl-C stops it, ends the wait; resuming checks again.
+      const settled = await pause.settled().catch(() => undefined);
+      if (settled === undefined || signal.aborted) return STOP;
+      if (settled) return { kind: 'continue' };
       await sleep(WATCH_INTERVAL_MS, signal);
     }
   }
