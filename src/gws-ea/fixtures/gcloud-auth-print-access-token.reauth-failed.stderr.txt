@@ -1,0 +1,22 @@
+WARNING:  Python 3.9.x is no longer officially supported by the Google Cloud CLI
+and may not function correctly. Please use Python version 3.10 and up.
+To reinstall gcloud, run:
+    $ gcloud components reinstall
+
+This will also prompt to install a compatible version of Python.
+
+If you have a compatible Python interpreter installed, you can use it by setting
+the CLOUDSDK_PYTHON environment variable to point to it.
+
+ERROR: (gcloud.auth.print-access-token) There was a problem refreshing your current auth tokens: Reauthentication failed. cannot prompt during non-interactive execution.
+Please run:
+
+  $ gcloud auth login
+
+to obtain new credentials.
+
+If you have already logged in with a different account, run:
+
+  $ gcloud config set account ACCOUNT
+
+to select an already authenticated account to use.

@@ -1,13 +1,22 @@
 import { execFileSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { runArgumentCommand, type CommandRunner } from './checkout.js';
+import { CONTROL_PLANE_ROOT } from './paths.js';
+import { CLOUDFLARED_IMAGE, ONECLI_CLI_VERSION, ONECLI_GATEWAY_VERSION } from './pins.js';
+import { TOOL_ENVIRONMENT_KEYS, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { runReleasePreflight, type SetupCommand } from './release-preflight.js';
 import { providerProvisioningCapabilityDigest } from '../provider-provisioning-capability.js';
+
+/** gws-ea's pins, which a release carries at the same path as this launcher. */
+const PINS_FILE = 'src/gws-ea/versions.json';
+const LAUNCHER_PIN_FILE = JSON.parse(await readFile(path.join(CONTROL_PLANE_ROOT, PINS_FILE), 'utf8')) as Record<
+  string,
+  string
+>;
 
 const roots: string[] = [];
 
@@ -33,6 +42,10 @@ async function write(root: string, relativePath: string, contents: string): Prom
 function commit(root: string, message: string): void {
   git(root, 'add', '.');
   git(root, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', message);
+}
+
+async function writePins(root: string, changes: Record<string, string>): Promise<void> {
+  await write(root, PINS_FILE, `${JSON.stringify({ ...LAUNCHER_PIN_FILE, ...changes }, null, 2)}\n`);
 }
 
 async function releaseFixture(): Promise<string> {
@@ -76,11 +89,9 @@ async function releaseFixture(): Promise<string> {
       '',
     ].join('\n'),
   );
-  await write(
-    root,
-    'versions.json',
-    JSON.stringify({ 'onecli-gateway': '1.42.0', 'onecli-cli': '2.2.5' }, null, 2) + '\n',
-  );
+  // Upstream's root pins file carries none of gws-ea's pins.
+  await write(root, 'versions.json', `${JSON.stringify({ 'agent-image': 'example@sha256:0' }, null, 2)}\n`);
+  await write(root, PINS_FILE, await readFile(path.join(CONTROL_PLANE_ROOT, PINS_FILE), 'utf8'));
   await write(
     root,
     'templates/gws-ea/main/plugin.json',
@@ -117,6 +128,7 @@ async function releaseFixture(): Promise<string> {
   await write(root, 'container/skills/onecli-gateway/SKILL.md', '# OneCLI gateway\n');
   await write(root, 'container/skills/onecli-gateway/instructions.md', '# OneCLI instructions\n');
   await write(root, 'src/gws-ea/process.ts', 'export {};\n');
+  await write(root, 'src/gws-ea/cloudflare-connector.ts', 'export {};\n');
   await write(root, 'scripts/init-first-agent.ts', 'export {};\n');
   await write(root, 'src/modules/gws-ea-profile/index.ts', 'export {};\n');
   await write(root, 'src/modules/gws-ea-profile/migration.ts', 'export {};\n');
@@ -146,10 +158,10 @@ async function preflightInput(root: string) {
   } as const;
 }
 
-const fixtureCommandRunner: CommandRunner = async (spec) =>
+const fixtureCommandRunner: SanitizedCommandRunner = async (spec) =>
   spec.command === '/fixture/bin/onecli'
     ? { stdout: JSON.stringify({ version: '2.2.5', server_version: 'unknown' }), stderr: '' }
-    : runArgumentCommand(spec);
+    : runSanitizedCommand(spec);
 
 function recorder(commands: SetupCommand[]): (command: SetupCommand) => Promise<void> {
   return async (command) => {
@@ -164,7 +176,7 @@ function recorder(commands: SetupCommand[]): (command: SetupCommand) => Promise<
 function expectCommonEnvironment(environment: Readonly<Record<string, string>>, checkoutRoot: string): void {
   expect(environment.HOME).toBe(path.join(path.dirname(checkoutRoot), '.release-home'));
   for (const key of Object.keys(environment)) {
-    expect(['HOME', 'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE']).toContain(key);
+    expect([...TOOL_ENVIRONMENT_KEYS, 'HOME']).toContain(key);
   }
 }
 
@@ -201,7 +213,7 @@ describe('release preflight', () => {
     vi.stubEnv('ONECLI_HOME', '/tmp/hostile-onecli');
     vi.stubEnv('ANTHROPIC_API_KEY', 'must-not-propagate');
     vi.stubEnv('GOOGLE_APPLICATION_CREDENTIALS', '/tmp/hostile-google-key');
-    const gitEnvironments: Array<Readonly<Record<string, string>>> = [];
+    const gitEnvironments: Array<Readonly<Record<string, string>> | undefined> = [];
     let onecliEnvironment: Readonly<Record<string, string>> | undefined;
     const setupCommands: SetupCommand[] = [];
 
@@ -212,20 +224,18 @@ describe('release preflight', () => {
           return { stdout: JSON.stringify({ version: '2.2.5', server_version: 'unknown' }), stderr: '' };
         }
         gitEnvironments.push(spec.env);
-        return runArgumentCommand(spec);
+        return runSanitizedCommand(spec);
       },
       runSetupCommand: recorder(setupCommands),
     });
 
     expect(gitEnvironments.length).toBeGreaterThan(0);
     for (const environment of gitEnvironments) {
-      expect(environment.HOME).toBe(path.join(path.dirname(root), '.release-home'));
-      expect(environment.GIT_CONFIG_NOSYSTEM).toBe('1');
-      expect(environment.GIT_TERMINAL_PROMPT).toBe('0');
-      for (const key of Object.keys(environment)) {
-        expect(['HOME', 'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT']).toContain(
-          key,
-        );
+      expect(environment?.HOME).toBe(path.join(path.dirname(root), '.release-home'));
+      expect(environment?.GIT_CONFIG_NOSYSTEM).toBe('1');
+      expect(environment?.GIT_TERMINAL_PROMPT).toBe('0');
+      for (const key of Object.keys(environment ?? {})) {
+        expect([...TOOL_ENVIRONMENT_KEYS, 'HOME', 'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT']).toContain(key);
       }
     }
     expectCommonEnvironment(onecliEnvironment!, root);
@@ -255,6 +265,19 @@ describe('release preflight', () => {
       }),
     ).rejects.toMatchObject({ code });
     expect(commands).toEqual([]);
+  });
+
+  it('rejects an immutable cloudflared pin outside the launcher cohort, naming the pin', async () => {
+    const root = await releaseFixture();
+    const image = `cloudflare/cloudflared:2026.9.2@sha256:${'a'.repeat(64)}`;
+    await writePins(root, { cloudflared: image });
+    commit(root, 'different cloudflared cohort');
+
+    await expect(runReleasePreflight(await preflightInput(root))).rejects.toMatchObject({
+      code: 'cloudflared_release_mismatch',
+      message: expect.stringContaining(`cloudflared image ${image}`),
+      details: { pin: 'cloudflared image', release: image, launcher: CLOUDFLARED_IMAGE },
+    });
   });
 
   it('rejects a committed release without OneCLI gateway registration', async () => {
@@ -313,20 +336,40 @@ describe('release preflight', () => {
     expect(commands).toEqual([]);
   });
 
-  it('rejects target OneCLI pins that the launcher cannot execute before setup commands', async () => {
-    const root = await releaseFixture();
-    await write(
-      root,
-      'versions.json',
-      JSON.stringify({ 'onecli-gateway': '1.43.0', 'onecli-cli': '2.2.5' }, null, 2) + '\n',
-    );
-    commit(root, 'new OneCLI gateway cohort');
-    const commands: SetupCommand[] = [];
+  it.each([
+    ['onecli-gateway', 'OneCLI gateway', ONECLI_GATEWAY_VERSION],
+    ['onecli-cli', 'OneCLI CLI', ONECLI_CLI_VERSION],
+  ])(
+    'rejects a target %s pin the launcher cannot execute, naming it, before setup commands',
+    async (key, name, launcher) => {
+      const root = await releaseFixture();
+      await writePins(root, { [key]: '9.9.9' });
+      commit(root, 'new OneCLI cohort');
+      const commands: SetupCommand[] = [];
 
-    await expect(
-      runReleasePreflight(await preflightInput(root), { runSetupCommand: recorder(commands) }),
-    ).rejects.toMatchObject({ code: 'onecli_release_mismatch' });
-    expect(commands).toEqual([]);
+      await expect(
+        runReleasePreflight(await preflightInput(root), { runSetupCommand: recorder(commands) }),
+      ).rejects.toMatchObject({
+        code: 'onecli_release_mismatch',
+        message: expect.stringContaining(`pins ${name} 9.9.9, but this launcher pins ${launcher}`),
+        details: { pin: name, release: '9.9.9', launcher },
+      });
+      expect(commands).toEqual([]);
+    },
+  );
+
+  it.each([
+    ['cloudflare/cloudflared:latest'],
+    ['cloudflare/cloudflared:2026.9.1'],
+    ['cloudflare/cloudflared@sha256:' + 'a'.repeat(64)],
+  ])('rejects a mutable or incomplete cloudflared pin: %s', async (image) => {
+    const root = await releaseFixture();
+    await writePins(root, { cloudflared: image });
+    commit(root, 'invalid cloudflared pin');
+
+    await expect(runReleasePreflight(await preflightInput(root))).rejects.toMatchObject({
+      code: 'invalid_release_pin',
+    });
   });
 
   it('rejects an installed OneCLI CLI outside the selected cohort before setup commands', async () => {
@@ -338,7 +381,7 @@ describe('release preflight', () => {
         runCommand: async (spec) =>
           spec.command === '/fixture/bin/onecli'
             ? { stdout: JSON.stringify({ version: '2.2.4', server_version: 'unknown' }), stderr: '' }
-            : runArgumentCommand(spec),
+            : runSanitizedCommand(spec),
         runSetupCommand: recorder(commands),
       }),
     ).rejects.toMatchObject({ code: 'incompatible_onecli' });
@@ -375,7 +418,7 @@ describe('release preflight', () => {
   });
 
   it.each([
-    ['versions.json', JSON.stringify({ 'onecli-gateway': '^1.42.0', 'onecli-cli': '2.2.5' })],
+    [PINS_FILE, JSON.stringify({ ...LAUNCHER_PIN_FILE, 'onecli-gateway': '^1.42.0' })],
     [
       'package.json',
       JSON.stringify({

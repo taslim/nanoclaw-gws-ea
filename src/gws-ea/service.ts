@@ -1,30 +1,40 @@
 import { constants as fsConstants } from 'node:fs';
 import { access, lstat, mkdir, readFile, realpath } from 'node:fs/promises';
+import { userInfo } from 'node:os';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import { isErrno } from '../community-portal/errors.js';
 import { renderLaunchdService, renderSystemdService } from '../service-definition.js';
 import type { OnecliRuntimeLayout } from './onecli-compose.js';
-import { preparePrivateLocalDirectory, assertPrivateLocalDirectory } from './paths.js';
+import { preparePrivateDirectory, assertPrivateDirectory } from './paths.js';
 import {
-  buildAllowlistedEnvironment,
+  buildHostEnvironment,
+  buildToolEnvironment,
   replaceProcess,
   runSanitizedCommand,
   type SanitizedCommand,
   type SanitizedCommandResult,
   type SanitizedCommandRunner,
 } from './process.js';
-import { readOwnerOnlyFile, writePrivateTextFile } from './secrets.js';
-import { createInstanceServiceCoordinates, type InstanceServicePlatform } from './service-coordinates.js';
+import { activeStep } from './run-log.js';
+import { readOwnerOnlyFile, readOwnerOnlyJson, writePrivateTextFile } from './secrets.js';
+import {
+  createInstanceServiceCoordinates,
+  instanceServicePlatform,
+  type InstanceServicePlatform,
+} from './service-coordinates.js';
 import { validateExistingGchatEndpoint } from './endpoint.js';
+import { deriveWorkspaceAddOnIdentity, parseGcpProjectNumber } from './gcp-identity.js';
 import { assertInstanceId } from './registry.js';
-import { GwsEaError, type AllocatedPorts, type InstanceReservation } from './types.js';
-import { hasControlCharacters } from './validation.js';
+import { GwsEaError, ingressEndpointUrl, type AllocatedPorts, type InstanceReservation } from './types.js';
+import { parseJson, requireDockerEndpoint, requirePath, requireRecord, requireString } from './validation.js';
 
-export const INSTANCE_RUNTIME_SCHEMA_VERSION = 1 as const;
+const INSTANCE_RUNTIME_SCHEMA_VERSION = 1 as const;
 const PROVIDER_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
 const ONECLI_PROJECT_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/u;
 const SERVICE_PATH = '/usr/local/bin:/usr/bin:/bin';
+const INVALID_RUNTIME = 'invalid_runtime_config';
 
 export interface InstanceSecretFiles {
   readonly gchat_credentials: string;
@@ -32,23 +42,32 @@ export interface InstanceSecretFiles {
   readonly onecli_admin_api_key: string;
 }
 
-export interface InstanceRuntimeConfig {
+/**
+ * What `runtime.json` stores: the values nothing else determines, plus the
+ * local Docker endpoint create resolved. Everything derivable from
+ * them is recomputed on every read, so it can never disagree with them.
+ */
+export interface PersistedInstanceRuntime {
   readonly schema_version: typeof INSTANCE_RUNTIME_SCHEMA_VERSION;
   readonly instance_id: string;
-  readonly install_id: string;
   readonly deployed_commit: string;
   readonly checkout_realpath: string;
   readonly node_path: string;
   readonly home_directory: string;
   readonly allocated_ports: AllocatedPorts;
-  readonly agent_egress_network: string;
   readonly onecli_project: string;
-  readonly onecli_app_url: string;
-  readonly onecli_gateway_url: string;
-  readonly onecli_gateway_container: string;
   readonly onecli_cli_path: string;
   readonly selected_provider: string;
   readonly endpoint_url: string;
+  readonly docker_endpoint: string;
+}
+
+export interface InstanceRuntimeConfig extends PersistedInstanceRuntime {
+  readonly install_id: string;
+  readonly agent_egress_network: string;
+  readonly onecli_app_url: string;
+  readonly onecli_gateway_url: string;
+  readonly onecli_gateway_container: string;
   readonly secret_files: InstanceSecretFiles;
 }
 
@@ -56,6 +75,34 @@ export interface InstanceRuntimeInput {
   readonly nodePath: string;
   readonly homeDirectory: string;
   readonly selectedProvider: string;
+  readonly dockerEndpoint: string;
+}
+
+/**
+ * Upstream `setup/set-env.ts` `upsertEnvVars`, injected by the driver because
+ * `src/` cannot import `setup/`: it rewrites only the given keys of a
+ * checkout's `.env`, atomically, keeping every other writer's keys.
+ */
+export type UpsertEnvVars = (values: Record<string, string>, projectRoot: string) => unknown;
+
+/** The options upstream `waitForHost` takes that gws-ea uses. */
+export interface WaitForHostOptions {
+  readonly channel?: string;
+  readonly pid?: number;
+  readonly alive?: () => boolean;
+  readonly timeoutMs?: number;
+}
+
+/**
+ * Upstream `setup/lib/host-status.mjs`, injected by the driver because `src/`
+ * cannot import `setup/`. `queryHost` asks a checkout's running host for its
+ * status over `data/ncl.sock` and throws unless the host identifies that
+ * checkout; `waitForHost` polls it until the host (and a channel) is ready and
+ * throws the last reason, naming the checkout-relative `logs/nanoclaw.error.log`.
+ */
+export interface HostStatusHelpers {
+  readonly queryHost: (root: string, timeoutMs?: number) => Promise<unknown>;
+  readonly waitForHost: (root: string, options?: WaitForHostOptions) => Promise<unknown>;
 }
 
 export type { InstanceServicePlatform } from './service-coordinates.js';
@@ -85,19 +132,25 @@ export interface ServiceLayoutOptions {
 export interface InstanceServiceDependencies extends ServiceLayoutOptions {
   readonly runCommand?: SanitizedCommandRunner;
   readonly uid?: number;
-  readonly beforeBind?: () => Promise<void>;
+  /** Where the user-bus variables are read; absent ones are derived from the UID. */
+  readonly ambientEnv?: NodeJS.ProcessEnv;
+  /** Waits between launchd `bootstrap` attempts. */
+  readonly sleep?: (milliseconds: number) => Promise<void>;
 }
 
-function assertControlFree(value: string, label: string): string {
-  if (!value || hasControlCharacters(value)) {
-    throw new GwsEaError('invalid_runtime_config', `${label} is invalid`);
-  }
-  return value;
+/** A (re)started service, with the pid its manager reports when it has one. */
+export interface InstanceServiceStart {
+  readonly layout: InstanceServiceLayout;
+  readonly pid: number | undefined;
+}
+
+export interface InstanceRuntimeDependencies extends InstanceServiceDependencies {
+  readonly upsertEnvVars: UpsertEnvVars;
 }
 
 function assertPort(value: unknown, label: string): number {
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 65_535) {
-    throw new GwsEaError('invalid_runtime_config', `${label} is invalid`);
+    throw new GwsEaError(INVALID_RUNTIME, `${label} is invalid`);
   }
   return value;
 }
@@ -111,9 +164,47 @@ function expectedSecretFiles(checkout: string): InstanceSecretFiles {
   };
 }
 
+export function googleChatProjectNumberFile(config: Pick<InstanceRuntimeConfig, 'secret_files'>): string {
+  return path.join(path.dirname(config.secret_files.gchat_credentials), 'gchat-project-number');
+}
+
 function installId(instanceId: string): string {
   assertInstanceId(instanceId);
   return instanceId.replaceAll('-', '');
+}
+
+function deriveRuntime(persisted: PersistedInstanceRuntime): InstanceRuntimeConfig {
+  const project = persisted.onecli_project;
+  return {
+    ...persisted,
+    install_id: installId(persisted.instance_id),
+    agent_egress_network: `${project}-agent-egress`,
+    onecli_app_url: `http://127.0.0.1:${persisted.allocated_ports.onecli_app}`,
+    onecli_gateway_url: `http://127.0.0.1:${persisted.allocated_ports.onecli_gateway}`,
+    onecli_gateway_container: `${project}-gateway-1`,
+    secret_files: expectedSecretFiles(persisted.checkout_realpath),
+  };
+}
+
+function persistedRuntime(config: PersistedInstanceRuntime): PersistedInstanceRuntime {
+  return {
+    schema_version: config.schema_version,
+    instance_id: config.instance_id,
+    deployed_commit: config.deployed_commit,
+    checkout_realpath: config.checkout_realpath,
+    node_path: config.node_path,
+    home_directory: config.home_directory,
+    allocated_ports: config.allocated_ports,
+    onecli_project: config.onecli_project,
+    onecli_cli_path: config.onecli_cli_path,
+    selected_provider: config.selected_provider,
+    endpoint_url: config.endpoint_url,
+    docker_endpoint: config.docker_endpoint,
+  };
+}
+
+function runtimeFileContents(config: InstanceRuntimeConfig): string {
+  return `${JSON.stringify(persistedRuntime(config), null, 2)}\n`;
 }
 
 export function createInstanceRuntimeConfig(
@@ -131,172 +222,79 @@ export function createInstanceRuntimeConfig(
   ) {
     throw new GwsEaError('runtime_mismatch', 'OneCLI coordinates disagree with the immutable reservation');
   }
-  const checkout = path.resolve(reservation.checkout_realpath);
-  const config: InstanceRuntimeConfig = {
+  return validateRuntimeConfig({
     schema_version: INSTANCE_RUNTIME_SCHEMA_VERSION,
     instance_id: reservation.instance_id,
-    install_id: installId(reservation.instance_id),
     deployed_commit: reservation.deployed_commit,
-    checkout_realpath: checkout,
+    checkout_realpath: path.resolve(reservation.checkout_realpath),
     node_path: path.resolve(input.nodePath),
     home_directory: path.resolve(input.homeDirectory),
     allocated_ports: { ...reservation.allocated_ports },
-    agent_egress_network: onecli.agentEgressNetwork,
     onecli_project: onecli.project,
-    onecli_app_url: onecli.appUrl,
-    onecli_gateway_url: onecli.gatewayUrl,
-    onecli_gateway_container: `${onecli.project}-gateway-1`,
     onecli_cli_path: onecli.cliExecutable,
     selected_provider: input.selectedProvider.toLowerCase(),
-    endpoint_url: reservation.exclusive_resource_claims.endpoint_url,
-    secret_files: expectedSecretFiles(checkout),
-  };
-  validateRuntimeConfig(config);
-  return config;
+    endpoint_url: ingressEndpointUrl(reservation.exclusive_resource_claims.ingress),
+    docker_endpoint: input.dockerEndpoint,
+  } satisfies PersistedInstanceRuntime);
 }
 
-function record(value: unknown, label: string): Record<string, unknown> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    throw new GwsEaError('invalid_runtime_config', `${label} must be an object`);
-  }
-  return value as Record<string, unknown>;
-}
-
-function stringField(value: Record<string, unknown>, key: string): string {
-  if (typeof value[key] !== 'string') throw new GwsEaError('invalid_runtime_config', `${key} is invalid`);
-  return assertControlFree(value[key], key);
-}
-
-function assertExactKeys(value: Record<string, unknown>, keys: readonly string[], label: string): void {
-  const actual = Object.keys(value).sort();
-  const expected = [...keys].sort();
-  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
-    throw new GwsEaError('invalid_runtime_config', `${label} contains unknown or missing fields`);
-  }
-}
-
+/** Read the persisted values, ignoring any other field, and recompute the derived ones. */
 export function validateRuntimeConfig(value: unknown): InstanceRuntimeConfig {
-  const raw = record(value, 'Runtime config');
-  assertExactKeys(
-    raw,
-    [
-      'schema_version',
-      'instance_id',
-      'install_id',
-      'deployed_commit',
-      'checkout_realpath',
-      'node_path',
-      'home_directory',
-      'allocated_ports',
-      'agent_egress_network',
-      'onecli_project',
-      'onecli_app_url',
-      'onecli_gateway_url',
-      'onecli_gateway_container',
-      'onecli_cli_path',
-      'selected_provider',
-      'endpoint_url',
-      'secret_files',
-    ],
-    'Runtime config',
-  );
+  const raw = requireRecord(value, 'Runtime config', INVALID_RUNTIME);
   if (raw.schema_version !== INSTANCE_RUNTIME_SCHEMA_VERSION) {
     throw new GwsEaError('unsupported_runtime_config', 'Runtime config schema version is unsupported');
   }
-  const instanceId = stringField(raw, 'instance_id');
+  const instanceId = requireString(raw.instance_id, 'instance_id', INVALID_RUNTIME);
   assertInstanceId(instanceId);
-  const checkout = path.resolve(stringField(raw, 'checkout_realpath'));
-  if (checkout !== stringField(raw, 'checkout_realpath')) {
-    throw new GwsEaError('invalid_runtime_config', 'checkout_realpath must be absolute and normalized');
-  }
-  const portsRaw = record(raw.allocated_ports, 'allocated_ports');
-  assertExactKeys(portsRaw, ['nanoclaw_webhook', 'onecli_app', 'onecli_gateway'], 'allocated_ports');
+  const portsRaw = requireRecord(raw.allocated_ports, 'allocated_ports', INVALID_RUNTIME);
   const ports: AllocatedPorts = {
     nanoclaw_webhook: assertPort(portsRaw.nanoclaw_webhook, 'nanoclaw_webhook'),
     onecli_app: assertPort(portsRaw.onecli_app, 'onecli_app'),
     onecli_gateway: assertPort(portsRaw.onecli_gateway, 'onecli_gateway'),
   };
   if (new Set(Object.values(ports)).size !== 3) {
-    throw new GwsEaError('invalid_runtime_config', 'Allocated ports must be distinct');
+    throw new GwsEaError(INVALID_RUNTIME, 'Allocated ports must be distinct');
   }
-  const project = stringField(raw, 'onecli_project');
-  if (!ONECLI_PROJECT_PATTERN.test(project))
-    throw new GwsEaError('invalid_runtime_config', 'onecli_project is invalid');
-  const provider = stringField(raw, 'selected_provider');
-  if (!PROVIDER_PATTERN.test(provider)) throw new GwsEaError('invalid_runtime_config', 'selected_provider is invalid');
+  const project = requireString(raw.onecli_project, 'onecli_project', INVALID_RUNTIME);
+  if (!ONECLI_PROJECT_PATTERN.test(project)) throw new GwsEaError(INVALID_RUNTIME, 'onecli_project is invalid');
+  const provider = requireString(raw.selected_provider, 'selected_provider', INVALID_RUNTIME);
+  if (!PROVIDER_PATTERN.test(provider)) throw new GwsEaError(INVALID_RUNTIME, 'selected_provider is invalid');
   let endpointUrl: string;
   try {
-    endpointUrl = validateExistingGchatEndpoint(stringField(raw, 'endpoint_url'));
+    endpointUrl = validateExistingGchatEndpoint(requireString(raw.endpoint_url, 'endpoint_url', INVALID_RUNTIME));
   } catch {
-    throw new GwsEaError('invalid_runtime_config', 'endpoint_url is invalid');
+    throw new GwsEaError(INVALID_RUNTIME, 'endpoint_url is invalid');
   }
-  const secretRaw = record(raw.secret_files, 'secret_files');
-  assertExactKeys(secretRaw, ['gchat_credentials', 'onecli_runtime_api_key', 'onecli_admin_api_key'], 'secret_files');
-  const secretFiles: InstanceSecretFiles = {
-    gchat_credentials: stringField(secretRaw, 'gchat_credentials'),
-    onecli_runtime_api_key: stringField(secretRaw, 'onecli_runtime_api_key'),
-    onecli_admin_api_key: stringField(secretRaw, 'onecli_admin_api_key'),
-  };
-  const expectedSecrets = expectedSecretFiles(checkout);
-  if (JSON.stringify(secretFiles) !== JSON.stringify(expectedSecrets)) {
-    throw new GwsEaError('invalid_runtime_config', 'Secret files must stay in the instance-private secret directory');
-  }
-  const expectedInstallId = installId(instanceId);
-  if (
-    stringField(raw, 'install_id') !== expectedInstallId ||
-    stringField(raw, 'onecli_app_url') !== `http://127.0.0.1:${ports.onecli_app}` ||
-    stringField(raw, 'onecli_gateway_url') !== `http://127.0.0.1:${ports.onecli_gateway}` ||
-    stringField(raw, 'agent_egress_network') !== `${project}-agent-egress` ||
-    stringField(raw, 'onecli_gateway_container') !== `${project}-gateway-1`
-  ) {
-    throw new GwsEaError('runtime_mismatch', 'Runtime coordinates do not match the immutable instance identity');
-  }
-  const commit = stringField(raw, 'deployed_commit');
-  if (!/^[0-9a-f]{40}$/u.test(commit)) throw new GwsEaError('invalid_runtime_config', 'deployed_commit is invalid');
-  const nodePath = stringField(raw, 'node_path');
-  const onecliCliPath = stringField(raw, 'onecli_cli_path');
-  const homeDirectory = stringField(raw, 'home_directory');
-  if (
-    !path.isAbsolute(nodePath) ||
-    path.resolve(nodePath) !== nodePath ||
-    !path.isAbsolute(onecliCliPath) ||
-    path.resolve(onecliCliPath) !== onecliCliPath ||
-    !path.isAbsolute(homeDirectory) ||
-    path.resolve(homeDirectory) !== homeDirectory
-  ) {
-    throw new GwsEaError('invalid_runtime_config', 'Runtime paths must be absolute and normalized');
-  }
-  return {
+  const commit = requireString(raw.deployed_commit, 'deployed_commit', INVALID_RUNTIME);
+  if (!/^[0-9a-f]{40}$/u.test(commit)) throw new GwsEaError(INVALID_RUNTIME, 'deployed_commit is invalid');
+  return deriveRuntime({
     schema_version: INSTANCE_RUNTIME_SCHEMA_VERSION,
     instance_id: instanceId,
-    install_id: expectedInstallId,
     deployed_commit: commit,
-    checkout_realpath: checkout,
-    node_path: nodePath,
-    home_directory: homeDirectory,
+    checkout_realpath: requirePath(raw.checkout_realpath, 'checkout_realpath', INVALID_RUNTIME),
+    node_path: requirePath(raw.node_path, 'node_path', INVALID_RUNTIME),
+    home_directory: requirePath(raw.home_directory, 'home_directory', INVALID_RUNTIME),
     allocated_ports: ports,
-    agent_egress_network: `${project}-agent-egress`,
     onecli_project: project,
-    onecli_app_url: `http://127.0.0.1:${ports.onecli_app}`,
-    onecli_gateway_url: `http://127.0.0.1:${ports.onecli_gateway}`,
-    onecli_gateway_container: `${project}-gateway-1`,
-    onecli_cli_path: onecliCliPath,
+    onecli_cli_path: requirePath(raw.onecli_cli_path, 'onecli_cli_path', INVALID_RUNTIME),
     selected_provider: provider,
     endpoint_url: endpointUrl,
-    secret_files: secretFiles,
-  };
+    docker_endpoint: requireDockerEndpoint(raw.docker_endpoint, 'docker_endpoint', INVALID_RUNTIME),
+  });
 }
 
 function runtimeConfigFile(config: InstanceRuntimeConfig): string {
   return path.join(config.checkout_realpath, 'data', 'gws-ea', 'runtime.json');
 }
 
+/** The `.env` keys gws-ea owns; every other key belongs to another writer. */
 function instanceHostConfiguration(config: InstanceRuntimeConfig): Readonly<Record<string, string>> {
   return {
     NANOCLAW_INSTALL_ID: config.install_id,
     DEFAULT_AGENT_PROVIDER: config.selected_provider,
     NANOCLAW_GATEWAY_PROVIDER: 'onecli',
     WEBHOOK_PORT: String(config.allocated_ports.nanoclaw_webhook),
+    WEBHOOK_HOST: '127.0.0.1',
     NANOCLAW_EGRESS_LOCKDOWN: 'true',
     NANOCLAW_EGRESS_NETWORK: config.agent_egress_network,
     ONECLI_GATEWAY_CONTAINER: config.onecli_gateway_container,
@@ -305,54 +303,58 @@ function instanceHostConfiguration(config: InstanceRuntimeConfig): Readonly<Reco
   };
 }
 
-function environmentFileContents(config: InstanceRuntimeConfig): string {
-  return `${Object.entries(instanceHostConfiguration(config))
-    .map(([key, value]) => `${key}=${assertControlFree(value, key)}`)
-    .join('\n')}\n`;
-}
-
-async function writeOrVerify(file: string, contents: string): Promise<void> {
+/**
+ * Write `runtime.json` once. A later run leaves the file as it is when its
+ * persisted values agree, so fields another launcher added survive, and
+ * refuses when they disagree.
+ */
+async function persistRuntimeFile(config: InstanceRuntimeConfig): Promise<void> {
+  const file = runtimeConfigFile(config);
+  let existing: InstanceRuntimeConfig;
   try {
-    const existing = await readOwnerOnlyFile(file);
-    if (existing !== contents) {
-      throw new GwsEaError(
-        'runtime_conflict',
-        `Existing instance runtime file disagrees with reserved coordinates: ${file}`,
-      );
-    }
+    existing = await loadInstanceRuntimeConfig(file);
   } catch (error) {
     if (!isErrno(error, 'ENOENT')) throw error;
-    await writePrivateTextFile(file, contents);
+    await writePrivateTextFile(file, runtimeFileContents(config));
+    return;
+  }
+  if (runtimeFileContents(existing) !== runtimeFileContents(config)) {
+    throw new GwsEaError(
+      'runtime_conflict',
+      `Existing instance runtime file disagrees with reserved coordinates: ${file}`,
+    );
   }
 }
 
-export async function persistInstanceRuntime(configInput: InstanceRuntimeConfig): Promise<void> {
+export async function persistInstanceRuntime(
+  configInput: InstanceRuntimeConfig,
+  upsertEnvVars: UpsertEnvVars,
+): Promise<void> {
   const config = validateRuntimeConfig(configInput);
   const root = path.join(config.checkout_realpath, 'data', 'gws-ea');
-  await preparePrivateLocalDirectory(root);
-  await preparePrivateLocalDirectory(path.dirname(config.secret_files.gchat_credentials));
-  await preparePrivateLocalDirectory(path.join(config.checkout_realpath, 'logs'));
-  await writeOrVerify(runtimeConfigFile(config), `${JSON.stringify(config, null, 2)}\n`);
-  await writeOrVerify(path.join(config.checkout_realpath, '.env'), environmentFileContents(config));
+  await preparePrivateDirectory(root);
+  await preparePrivateDirectory(path.dirname(config.secret_files.gchat_credentials));
+  await preparePrivateDirectory(path.join(config.checkout_realpath, 'logs'));
+  await persistRuntimeFile(config);
+  const owned = instanceHostConfiguration(config);
+  upsertEnvVars({ ...owned }, config.checkout_realpath);
+  activeStep()?.envFile(
+    path.join(config.checkout_realpath, '.env'),
+    Object.entries(owned)
+      .map(([key, value]) => `${key}=${value}\n`)
+      .join(''),
+  );
 }
 
 export async function loadInstanceRuntimeConfig(file: string): Promise<InstanceRuntimeConfig> {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(await readOwnerOnlyFile(file)) as unknown;
-  } catch (error) {
-    if (error instanceof SyntaxError)
-      throw new GwsEaError('invalid_runtime_config', 'Runtime config is not valid JSON');
-    throw error;
-  }
-  const config = validateRuntimeConfig(parsed);
+  const config = validateRuntimeConfig(await readOwnerOnlyJson(file, 'Runtime config', INVALID_RUNTIME));
   if (file !== runtimeConfigFile(config)) {
     throw new GwsEaError('runtime_mismatch', 'Runtime config path does not match the selected checkout');
   }
   return config;
 }
 
-export function createInstanceServiceLayout(
+function createInstanceServiceLayout(
   configInput: InstanceRuntimeConfig,
   options: ServiceLayoutOptions,
 ): InstanceServiceLayout {
@@ -379,10 +381,15 @@ export function createInstanceServiceLayout(
   };
 }
 
-function serviceEnvironment(config: InstanceRuntimeConfig): Readonly<Record<string, string>> {
+/** The runtime values a service manager's environment derives from. */
+export type ServiceManagerRuntime = Pick<PersistedInstanceRuntime, 'home_directory' | 'docker_endpoint'>;
+
+/** What the service manager starts the launcher with: upstream NanoClaw's minimal service PATH. */
+function serviceEnvironment(config: ServiceManagerRuntime): Readonly<Record<string, string>> {
   return {
     HOME: config.home_directory,
     PATH: `${SERVICE_PATH}:${path.join(config.home_directory, '.local', 'bin')}`,
+    DOCKER_HOST: config.docker_endpoint,
   };
 }
 
@@ -414,10 +421,88 @@ async function assertExecutable(file: string): Promise<void> {
   await access(file, fsConstants.X_OK);
 }
 
+function requireUid(dependencies: Pick<InstanceServiceDependencies, 'uid'>): number {
+  const uid = dependencies.uid ?? process.getuid?.();
+  if (uid === undefined) throw new GwsEaError('unsupported_platform', 'The service manager requires a user ID');
+  return uid;
+}
+
+/**
+ * The environment `launchctl`, `systemctl`, and `loginctl` run with. A user
+ * service manager is reached over the user bus, so `systemctl --user` gets
+ * `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS`, derived from the UID when
+ * the caller has none (a non-login shell, sudo, cron).
+ */
+export function serviceManagerEnvironment(
+  config: ServiceManagerRuntime,
+  manager: InstanceServiceLayout['manager'],
+  dependencies: Pick<InstanceServiceDependencies, 'uid' | 'ambientEnv'>,
+): Readonly<Record<string, string>> {
+  if (manager !== 'systemd-user') return buildToolEnvironment({}, serviceEnvironment(config));
+  const ambient = dependencies.ambientEnv ?? process.env;
+  const runtimeDirectory = ambient.XDG_RUNTIME_DIR || `/run/user/${requireUid(dependencies)}`;
+  return buildToolEnvironment(
+    {},
+    {
+      ...serviceEnvironment(config),
+      XDG_RUNTIME_DIR: runtimeDirectory,
+      DBUS_SESSION_BUS_ADDRESS: ambient.DBUS_SESSION_BUS_ADDRESS || `unix:path=${runtimeDirectory}/bus`,
+    },
+  );
+}
+
+function servicePid(value: string | undefined): number | undefined {
+  const pid = Number(value?.trim());
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+/** `launchctl bootout` of a job that is not loaded fails in launchd's own words; nothing needed stopping. */
+function notLoaded(error: unknown): boolean {
+  return (
+    error instanceof GwsEaError &&
+    error.code === 'command_failed' &&
+    /No such process|Could not find/iu.test(String(error.details?.stderrTail ?? ''))
+  );
+}
+
+/**
+ * Lingering keeps a user's services running after logout. Enabling it
+ * for oneself needs no password where polkit allows it, so it is enabled
+ * here, once; where it is refused, the operator gets the one command to run.
+ */
+async function ensureLingering(
+  command: (program: string, args: readonly string[]) => Promise<string>,
+  dependencies: InstanceServiceDependencies,
+): Promise<void> {
+  const uid = String(requireUid(dependencies));
+  const lingering = await command('loginctl', ['show-user', uid, '--property', 'Linger', '--value']).then(
+    (value) => value.trim() === 'yes',
+    () => false,
+  );
+  if (lingering) return;
+  await command('loginctl', ['enable-linger']).catch((error: unknown) => {
+    const user = (dependencies.ambientEnv ?? process.env).USER || userInfo().username;
+    throw new GwsEaError(
+      'linger_required',
+      `Could not enable lingering, so this assistant would stop at logout. Run: sudo loginctl enable-linger ${user}, then resume.`,
+      { cause: error },
+    );
+  });
+}
+
+const BOOTSTRAP_ATTEMPTS = 5;
+const BOOTSTRAP_RETRY_MS = 500;
+
+/**
+ * Write the service definition and (re)start it. launchd reloads a changed
+ * definition only through `bootout` then `bootstrap`; `kickstart` without
+ * `-k` then demand-starts a job launchd left pended, without restarting a
+ * running one. systemd user services need lingering to survive logout.
+ */
 export async function reconcileInstanceService(
   configInput: InstanceRuntimeConfig,
   dependencies: InstanceServiceDependencies,
-): Promise<InstanceServiceLayout> {
+): Promise<InstanceServiceStart> {
   const config = validateRuntimeConfig(configInput);
   const layout = createInstanceServiceLayout(config, dependencies);
   await Promise.all([
@@ -428,28 +513,77 @@ export async function reconcileInstanceService(
   await mkdir(path.dirname(layout.serviceDefinitionPath), { recursive: true, mode: 0o700 });
   await writePrivateTextFile(layout.serviceDefinitionPath, renderInstanceService(config, layout));
   const run = dependencies.runCommand ?? runSanitizedCommand;
-  const environment = buildAllowlistedEnvironment({}, serviceEnvironment(config));
-  const command = async (program: string, args: readonly string[]): Promise<void> => {
-    await run({ command: program, args, cwd: config.checkout_realpath, env: environment, timeoutMs: 30_000 });
-  };
+  const environment = serviceManagerEnvironment(config, layout.manager, dependencies);
+  const command = async (program: string, args: readonly string[]): Promise<string> =>
+    (await run({ command: program, args, cwd: config.checkout_realpath, env: environment, timeoutMs: 30_000 })).stdout;
   if (layout.manager === 'launchd') {
-    await command('launchctl', ['unload', layout.serviceDefinitionPath]).catch(() => undefined);
-    await dependencies.beforeBind?.();
-    await command('launchctl', ['load', layout.serviceDefinitionPath]);
-    const uid = dependencies.uid ?? process.getuid?.();
-    if (uid === undefined) throw new GwsEaError('unsupported_platform', 'launchd requires a user ID');
-    const domain = `gui/${uid}/${layout.serviceIdentity}`;
-    await command('launchctl', ['kickstart', '-k', domain]);
-    await command('launchctl', ['print', domain]);
+    const domain = `gui/${requireUid(dependencies)}`;
+    await command('launchctl', ['bootout', `${domain}/${layout.serviceIdentity}`]).catch((error: unknown) => {
+      if (!notLoaded(error)) throw error;
+    });
+    // launchd can still be removing the job `bootout` unloaded, so `bootstrap` gets a few tries.
+    for (let attempt = 1; ; attempt += 1) {
+      const loaded = await command('launchctl', ['bootstrap', domain, layout.serviceDefinitionPath]).then(
+        () => true,
+        (error: unknown) => {
+          if (attempt === BOOTSTRAP_ATTEMPTS || !(error instanceof GwsEaError) || error.code !== 'command_failed') {
+            throw error;
+          }
+          return false;
+        },
+      );
+      if (loaded) break;
+      await (dependencies.sleep ?? delay)(BOOTSTRAP_RETRY_MS * attempt);
+    }
+    await command('launchctl', ['kickstart', `${domain}/${layout.serviceIdentity}`]);
   } else {
     const prefix = layout.manager === 'systemd-user' ? ['--user'] : [];
+    if (layout.manager === 'systemd-user') await ensureLingering(command, dependencies);
     await command('systemctl', [...prefix, 'daemon-reload']);
     await command('systemctl', [...prefix, 'enable', layout.serviceIdentity]);
-    await dependencies.beforeBind?.();
     await command('systemctl', [...prefix, 'restart', layout.serviceIdentity]);
-    await command('systemctl', [...prefix, 'is-active', layout.serviceIdentity]);
   }
-  return layout;
+  return { layout, pid: await instanceServicePid(config, dependencies) };
+}
+
+/**
+ * The pid of the instance's service process, or undefined when its manager
+ * runs none (not loaded, stopped, or waiting to restart). Liveness uses it to
+ * tell a host that is starting from one that is stopped.
+ */
+export async function instanceServicePid(
+  configInput: InstanceRuntimeConfig,
+  dependencies: InstanceServiceDependencies,
+): Promise<number | undefined> {
+  const config = validateRuntimeConfig(configInput);
+  const layout = createInstanceServiceLayout(config, dependencies);
+  const run = dependencies.runCommand ?? runSanitizedCommand;
+  const args =
+    layout.manager === 'launchd'
+      ? ['print', `gui/${requireUid(dependencies)}/${layout.serviceIdentity}`]
+      : [
+          ...(layout.manager === 'systemd-user' ? ['--user'] : []),
+          'show',
+          layout.serviceIdentity,
+          '--property',
+          'MainPID',
+          '--value',
+        ];
+  let stdout: string;
+  try {
+    ({ stdout } = await run({
+      command: layout.manager === 'launchd' ? 'launchctl' : 'systemctl',
+      args,
+      cwd: config.checkout_realpath,
+      env: serviceManagerEnvironment(config, layout.manager, dependencies),
+      timeoutMs: 30_000,
+    }));
+  } catch (error) {
+    // A manager that cannot report the service runs no process for it; starting it surfaces why.
+    if (error instanceof GwsEaError && error.code === 'command_failed') return undefined;
+    throw error;
+  }
+  return servicePid(layout.manager === 'launchd' ? /^\s*pid = (\d+)\s*$/mu.exec(stdout)?.[1] : stdout);
 }
 
 export function buildInstanceCliCommand(
@@ -459,38 +593,43 @@ export function buildInstanceCliCommand(
 ): SanitizedCommand {
   const config = validateRuntimeConfig(configInput);
   const layout = createInstanceServiceLayout(config, {
-    platform: process.platform === 'darwin' ? 'macos' : 'linux',
+    platform: instanceServicePlatform(),
     homeDirectory: config.home_directory,
   });
   return {
     command: layout.cliPath,
     args,
     cwd: config.checkout_realpath,
-    env: buildAllowlistedEnvironment(ambient, {
+    env: buildToolEnvironment(ambient, {
       HOME: config.home_directory,
       NANOCLAW_INSTALL_ID: config.install_id,
     }),
   };
 }
 
-export async function buildInstanceHostEnvironment(
+async function buildInstanceHostEnvironment(
   configInput: InstanceRuntimeConfig,
   ambient: NodeJS.ProcessEnv = process.env,
 ): Promise<Record<string, string>> {
   const config = validateRuntimeConfig(configInput);
-  await assertPrivateLocalDirectory(path.dirname(config.secret_files.gchat_credentials));
-  const [gchatCredentials, onecliRuntimeApiKey] = await Promise.all([
+  await assertPrivateDirectory(path.dirname(config.secret_files.gchat_credentials));
+  const [gchatCredentials, onecliRuntimeApiKey, projectNumberFile] = await Promise.all([
     readOwnerOnlyFile(config.secret_files.gchat_credentials),
     readOwnerOnlyFile(config.secret_files.onecli_runtime_api_key),
+    readOwnerOnlyFile(googleChatProjectNumberFile(config)),
   ]);
   if (!gchatCredentials.trim() || !onecliRuntimeApiKey.trim()) {
     throw new GwsEaError('invalid_secret', 'A required instance host credential is empty');
   }
-  return buildAllowlistedEnvironment(ambient, {
+  const projectNumber = parseGcpProjectNumber(projectNumberFile.trim());
+  if (!projectNumber) throw new GwsEaError('invalid_runtime_config', 'Google Chat project number is invalid');
+  return buildHostEnvironment(ambient, {
     HOME: config.home_directory,
+    DOCKER_HOST: config.docker_endpoint,
     ...instanceHostConfiguration(config),
     ONECLI_API_KEY: onecliRuntimeApiKey.trim(),
     GCHAT_CREDENTIALS: gchatCredentials,
+    GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL: deriveWorkspaceAddOnIdentity(projectNumber),
   });
 }
 
@@ -508,7 +647,7 @@ export async function runInstanceOnecliAdminCommand(
     command: config.onecli_cli_path,
     args,
     cwd: config.checkout_realpath,
-    env: buildAllowlistedEnvironment(dependencies.ambientEnv, {
+    env: buildToolEnvironment(dependencies.ambientEnv, {
       HOME: path.join(path.dirname(config.checkout_realpath), 'onecli', 'cli-home'),
       ONECLI_API_HOST: config.onecli_app_url,
       ONECLI_API_KEY: apiKey,
@@ -527,7 +666,7 @@ export async function launchInstanceHost(
     throw new GwsEaError('unsafe_runtime', 'The instance checkout is not the persisted physical path');
   }
   const layout = createInstanceServiceLayout(config, {
-    platform: process.platform === 'darwin' ? 'macos' : 'linux',
+    platform: instanceServicePlatform(),
     homeDirectory: config.home_directory,
   });
   await Promise.all([assertExecutable(config.node_path), assertRegularFile(layout.hostEntrypoint)]);
@@ -538,28 +677,30 @@ export async function launchInstanceHost(
 
 export async function reconcileInstanceRuntime(
   configInput: InstanceRuntimeConfig,
-  dependencies: InstanceServiceDependencies,
-): Promise<InstanceServiceLayout> {
+  dependencies: InstanceRuntimeDependencies,
+): Promise<InstanceServiceStart> {
   const config = validateRuntimeConfig(configInput);
-  await persistInstanceRuntime(config);
+  await persistInstanceRuntime(config, dependencies.upsertEnvVars);
   const run = dependencies.runCommand ?? runSanitizedCommand;
-  const environment = buildAllowlistedEnvironment(
-    {},
-    {
-      HOME: config.home_directory,
-      PATH: `${SERVICE_PATH}:${path.join(config.home_directory, '.local', 'bin')}`,
-      NANOCLAW_INSTALL_ID: config.install_id,
-    },
+  // The build runs with the operator's tools, as release preflight's commands do; only the service keeps its minimal PATH.
+  const environment = buildToolEnvironment(dependencies.ambientEnv ?? process.env, {
+    HOME: config.home_directory,
+    DOCKER_HOST: config.docker_endpoint,
+    NANOCLAW_INSTALL_ID: config.install_id,
+  });
+  const packageManifest = requireRecord(
+    parseJson(
+      await readFile(path.join(config.checkout_realpath, 'package.json'), 'utf8'),
+      'The selected checkout package.json',
+      'invalid_release',
+    ),
+    'The selected checkout package.json',
+    'invalid_release',
   );
-  const packageManifest = JSON.parse(await readFile(path.join(config.checkout_realpath, 'package.json'), 'utf8')) as {
-    version?: unknown;
-  };
-  if (typeof packageManifest.version !== 'string' || !packageManifest.version) {
-    throw new GwsEaError('invalid_release', 'The selected checkout package version is invalid');
-  }
+  const version = requireString(packageManifest.version, 'The selected checkout package version', 'invalid_release');
   await run({
     command: 'pnpm',
-    args: ['exec', 'tsx', 'scripts/upgrade-state.ts', 'set', packageManifest.version, 'gws-ea'],
+    args: ['exec', 'tsx', 'scripts/upgrade-state.ts', 'set', version, 'gws-ea'],
     cwd: config.checkout_realpath,
     env: environment,
     timeoutMs: 30_000,
@@ -570,6 +711,7 @@ export async function reconcileInstanceRuntime(
     cwd: config.checkout_realpath,
     env: environment,
     timeoutMs: 15 * 60_000,
+    stream: true,
   });
   return reconcileInstanceService(config, dependencies);
 }

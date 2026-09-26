@@ -1,40 +1,55 @@
 import path from 'node:path';
-import { createRequire } from 'node:module';
 
 import { stringify } from 'yaml';
 
 import { assertInstanceId } from './registry.js';
-
-const EXACT_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
-const require = createRequire(import.meta.url);
-
-function record(value: unknown, label: string): Record<string, unknown> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error(`${label} must be an object`);
-  }
-  return value as Record<string, unknown>;
-}
-
-function exactVersion(value: unknown, label: string): string {
-  if (typeof value !== 'string' || !EXACT_VERSION_PATTERN.test(value)) {
-    throw new Error(`${label} must be pinned to one exact version`);
-  }
-  return value;
-}
-
-const versionPins: unknown = require('../../versions.json');
-const packageManifest: unknown = require('../../package.json');
-const dependencies = record(record(packageManifest, 'package.json').dependencies, 'package.json dependencies');
-
-export const ONECLI_GATEWAY_VERSION = exactVersion(
-  record(versionPins, 'versions.json')['onecli-gateway'],
-  'OneCLI gateway',
-);
-export const ONECLI_CLI_VERSION = exactVersion(record(versionPins, 'versions.json')['onecli-cli'], 'OneCLI CLI');
-export const ONECLI_SDK_VERSION = exactVersion(dependencies['@onecli-sh/sdk'], 'OneCLI SDK');
+import { requireDockerEndpoint } from './validation.js';
 
 export const ONECLI_INSTANCE_LABEL = 'dev.gws-ea.instance-id' as const;
 export const ONECLI_RESOURCE_ROLE_LABEL = 'dev.gws-ea.onecli-role' as const;
+
+/**
+ * The OneCLI versions an instance's release pinned, as its release-preflight
+ * receipt records them. An instance runs these, never the launcher's own, so
+ * a launcher upgrade never upgrades a running assistant.
+ */
+export interface OnecliPins {
+  readonly gateway: string;
+  readonly cli: string;
+}
+
+export function onecliGatewayImage(pins: Pick<OnecliPins, 'gateway'>): string {
+  return `ghcr.io/onecli/onecli:${pins.gateway}`;
+}
+
+export const ONECLI_POSTGRES_IMAGE = 'postgres:18-alpine';
+
+/** Each service's healthcheck, in seconds; Compose starts them in this dependency order. */
+const HEALTH_BUDGETS = {
+  postgres: { interval: 2, timeout: 3, retries: 30 },
+  app: { interval: 2, timeout: 3, retries: 60 },
+  gateway: { interval: 2, timeout: 3, retries: 60 },
+} as const;
+
+/**
+ * How long `up --wait` may wait: every service, started after the one it
+ * depends on is healthy, may use its whole budget of failed checks, each an
+ * interval plus a timed-out probe.
+ */
+export const ONECLI_WAIT_TIMEOUT_SECONDS = Object.values(HEALTH_BUDGETS).reduce(
+  (total, budget) => total + budget.retries * (budget.interval + budget.timeout),
+  0,
+);
+
+function healthcheck(service: keyof typeof HEALTH_BUDGETS, test: string) {
+  const budget = HEALTH_BUDGETS[service];
+  return {
+    test: ['CMD-SHELL', test],
+    interval: `${budget.interval}s`,
+    timeout: `${budget.timeout}s`,
+    retries: budget.retries,
+  };
+}
 
 export interface OnecliRuntimeLayout {
   readonly instanceId: string;
@@ -48,7 +63,6 @@ export interface OnecliRuntimeLayout {
   readonly encryptionKeyFile: string;
   readonly gatewayInternalSecretFile: string;
   readonly providerStagingFile: string;
-  readonly canaryStagingFile: string;
   readonly backendNetwork: string;
   readonly agentEgressNetwork: string;
   readonly postgresVolume: string;
@@ -58,6 +72,8 @@ export interface OnecliRuntimeLayout {
   readonly appUrl: string;
   readonly gatewayUrl: string;
   readonly cliExecutable: string;
+  /** The local Docker endpoint recorded for this instance, given to every Docker command. */
+  readonly dockerEndpoint: string;
 }
 
 export interface OnecliRuntimeLayoutInput {
@@ -67,6 +83,7 @@ export interface OnecliRuntimeLayoutInput {
   readonly appPort: number;
   readonly gatewayPort: number;
   readonly cliExecutable: string;
+  readonly dockerEndpoint: string;
 }
 
 export function createOnecliRuntimeLayout(input: OnecliRuntimeLayoutInput): OnecliRuntimeLayout {
@@ -98,7 +115,6 @@ export function createOnecliRuntimeLayout(input: OnecliRuntimeLayoutInput): Onec
     encryptionKeyFile: path.join(secretsDirectory, 'encryption-key'),
     gatewayInternalSecretFile: path.join(secretsDirectory, 'gateway-internal-secret'),
     providerStagingFile: path.join(secretsDirectory, 'provider-credential.staging'),
-    canaryStagingFile: path.join(secretsDirectory, 'compatibility-canary.staging'),
     backendNetwork: `${project}-backend`,
     agentEgressNetwork: `${project}-agent-egress`,
     postgresVolume: `${project}-postgres`,
@@ -108,14 +124,15 @@ export function createOnecliRuntimeLayout(input: OnecliRuntimeLayoutInput): Onec
     appUrl: `http://127.0.0.1:${input.appPort}`,
     gatewayUrl: `http://127.0.0.1:${input.gatewayPort}`,
     cliExecutable: input.cliExecutable,
+    dockerEndpoint: requireDockerEndpoint(input.dockerEndpoint, 'Docker endpoint', 'invalid_runtime_config'),
   };
 }
 
-export function renderOnecliCompose(layout: OnecliRuntimeLayout): string {
+export function renderOnecliCompose(layout: OnecliRuntimeLayout, pins: Pick<OnecliPins, 'gateway'>): string {
   const labels = {
     [ONECLI_INSTANCE_LABEL]: layout.instanceId,
   };
-  const gatewayImage = `ghcr.io/onecli/onecli:${ONECLI_GATEWAY_VERSION}`;
+  const gatewayImage = onecliGatewayImage(pins);
   const databaseUrl = 'postgresql://onecli:$$(cat /run/secrets/postgres_password)@postgres:5432/onecli';
   const sharedSecrets = ['postgres_password', 'secret_encryption_key', 'gateway_internal_secret'];
 
@@ -123,7 +140,7 @@ export function renderOnecliCompose(layout: OnecliRuntimeLayout): string {
     {
       services: {
         postgres: {
-          image: 'postgres:18-alpine',
+          image: ONECLI_POSTGRES_IMAGE,
           restart: 'unless-stopped',
           environment: {
             POSTGRES_DB: 'onecli',
@@ -133,12 +150,7 @@ export function renderOnecliCompose(layout: OnecliRuntimeLayout): string {
           secrets: ['postgres_password'],
           volumes: [`${layout.postgresVolume}:/var/lib/postgresql`],
           networks: { backend: null },
-          healthcheck: {
-            test: ['CMD-SHELL', 'pg_isready -U onecli -d onecli'],
-            interval: '2s',
-            timeout: '3s',
-            retries: 30,
-          },
+          healthcheck: healthcheck('postgres', 'pg_isready -U onecli -d onecli'),
           labels: {
             ...labels,
             [ONECLI_RESOURCE_ROLE_LABEL]: 'postgres',
@@ -167,12 +179,7 @@ export function renderOnecliCompose(layout: OnecliRuntimeLayout): string {
           depends_on: {
             postgres: { condition: 'service_healthy' },
           },
-          healthcheck: {
-            test: ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:10254/api/health'],
-            interval: '2s',
-            timeout: '3s',
-            retries: 60,
-          },
+          healthcheck: healthcheck('app', 'wget -q -O /dev/null http://127.0.0.1:10254/api/health'),
           labels: {
             ...labels,
             [ONECLI_RESOURCE_ROLE_LABEL]: 'app',
@@ -203,12 +210,7 @@ export function renderOnecliCompose(layout: OnecliRuntimeLayout): string {
           depends_on: {
             app: { condition: 'service_healthy' },
           },
-          healthcheck: {
-            test: ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:10255/healthz'],
-            interval: '2s',
-            timeout: '3s',
-            retries: 60,
-          },
+          healthcheck: healthcheck('gateway', 'wget -q -O /dev/null http://127.0.0.1:10255/healthz'),
           labels: {
             ...labels,
             [ONECLI_RESOURCE_ROLE_LABEL]: 'gateway',

@@ -1,20 +1,14 @@
 import { createServer, type Server } from 'node:net';
 
+import { buildToolEnvironment, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { GwsEaError, type AllocatedPorts } from './types.js';
 
 export type AllocatedPortName = keyof AllocatedPorts;
 
-export interface LoopbackPortLease {
-  release(names?: readonly AllocatedPortName[]): Promise<void>;
-}
-
-export interface HeldLoopbackPorts extends LoopbackPortLease {
+/** Three loopback ports, held until the reservation that claims them is written. */
+export interface HeldLoopbackPorts {
   readonly ports: AllocatedPorts;
-}
-
-interface PortRequest {
-  readonly name: AllocatedPortName;
-  readonly port: number;
+  release(): Promise<void>;
 }
 
 async function closeServer(server: Server): Promise<void> {
@@ -22,18 +16,11 @@ async function closeServer(server: Server): Promise<void> {
   await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
 }
 
-async function closeServers(servers: ReadonlyMap<AllocatedPortName, Server>): Promise<void> {
-  const results = await Promise.allSettled([...servers.values()].map(closeServer));
-  const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
-  if (failure) throw failure.reason;
-}
-
-async function listenLoopback(server: Server, port: number): Promise<number> {
+async function listenLoopback(server: Server): Promise<number> {
   await new Promise<void>((resolve, reject) => {
-    const onError = (error: Error): void => reject(error);
-    server.once('error', onError);
-    server.listen(port, '127.0.0.1', () => {
-      server.off('error', onError);
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', reject);
       resolve();
     });
   });
@@ -44,81 +31,75 @@ async function listenLoopback(server: Server, port: number): Promise<number> {
   return address.port;
 }
 
-async function holdPorts(
-  requests: readonly PortRequest[],
-  portError: (request: PortRequest, error: unknown) => Error,
-): Promise<ReadonlyMap<AllocatedPortName, Server>> {
-  const servers = new Map(requests.map((request) => [request.name, createServer()]));
-  const results = await Promise.allSettled(
-    requests.map(async (request) => {
-      const server = servers.get(request.name);
-      if (!server) throw new GwsEaError('port_allocation_failed', 'Could not create a loopback port lease');
-      try {
-        return await listenLoopback(server, request.port);
-      } catch (error) {
-        throw portError(request, error);
-      }
-    }),
-  );
-  const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
-  if (!failure) return servers;
-  await closeServers(servers).catch(() => undefined);
-  throw failure.reason;
-}
-
-function createLease(servers: ReadonlyMap<AllocatedPortName, Server>): LoopbackPortLease {
-  return {
-    release: async (names = [...servers.keys()]) => {
-      const selected = new Map<AllocatedPortName, Server>();
-      for (const name of names) {
-        const server = servers.get(name);
-        if (server) selected.set(name, server);
-      }
-      await closeServers(selected);
-    },
-  };
-}
-
-/** Allocate and retain three new loopback ports until their runtimes are ready to bind. */
+/**
+ * Allocate three distinct loopback ports. They stay held until the caller
+ * releases them after reserving; the registry's port claims keep them unique
+ * among assistants from then on, and each runtime binds its own on start.
+ */
 export async function holdLoopbackPorts(): Promise<HeldLoopbackPorts> {
-  const names = ['nanoclaw_webhook', 'onecli_app', 'onecli_gateway'] as const;
-  const requests = names.map((name) => ({ name, port: 0 }));
-  const servers = await holdPorts(
-    requests,
-    () => new GwsEaError('port_allocation_failed', 'Could not allocate the required loopback ports'),
-  );
-  const port = (name: AllocatedPortName): number => {
-    const address = servers.get(name)?.address();
-    if (!address || typeof address === 'string') {
-      throw new GwsEaError('port_allocation_failed', 'Could not inspect an allocated loopback port');
-    }
-    return address.port;
+  const servers = [createServer(), createServer(), createServer()] as const;
+  const release = async (): Promise<void> => {
+    await Promise.all(servers.map(closeServer));
   };
+  let ports: number[];
+  try {
+    ports = await Promise.all(servers.map(listenLoopback));
+  } catch (error) {
+    await release().catch(() => undefined);
+    throw new GwsEaError('port_allocation_failed', 'Could not allocate the required loopback ports', { cause: error });
+  }
+  const [nanoclawWebhook, onecliApp, onecliGateway] = ports as [number, number, number];
   return {
-    ...createLease(servers),
-    ports: {
-      nanoclaw_webhook: port('nanoclaw_webhook'),
-      onecli_app: port('onecli_app'),
-      onecli_gateway: port('onecli_gateway'),
-    },
+    ports: { nanoclaw_webhook: nanoclawWebhook, onecli_app: onecliApp, onecli_gateway: onecliGateway },
+    release,
   };
 }
 
-/** Reclaim an instance's immutable ports before retrying an absent runtime. */
-export async function holdReservedLoopbackPorts(
-  instanceId: string,
-  ports: AllocatedPorts,
-  names: readonly AllocatedPortName[],
-): Promise<LoopbackPortLease> {
-  const requests = names.map((name) => ({ name, port: ports[name] }));
-  const servers = await holdPorts(
-    requests,
-    (request) =>
-      new GwsEaError(
-        'port_claim_lost',
-        `Reserved ${request.name} coordinate 127.0.0.1:${request.port} is unavailable. ` +
-          `Stop the process using it, then resume with: gws-ea resume --id ${instanceId}`,
-      ),
+/** The process listening on a TCP port, as `lsof` names it. */
+export interface PortHolder {
+  readonly pid: number;
+  readonly command: string | undefined;
+}
+
+/**
+ * Who listens on `port`, where `lsof` can tell: undefined when nothing does,
+ * or when `lsof` is missing or cannot say.
+ */
+export async function findPortHolder(
+  port: number,
+  run: SanitizedCommandRunner = runSanitizedCommand,
+): Promise<PortHolder | undefined> {
+  let stdout: string;
+  try {
+    ({ stdout } = await run({
+      command: 'lsof',
+      args: ['-nP', '+c', '0', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fpc'],
+      cwd: '/',
+      env: buildToolEnvironment(),
+      timeoutMs: 10_000,
+    }));
+  } catch (error) {
+    // lsof exits 1 when nothing listens; a missing lsof leaves the holder unnamed.
+    if (error instanceof GwsEaError && ['command_failed', 'executable_not_found'].includes(error.code)) {
+      return undefined;
+    }
+    throw error;
+  }
+  const fields = stdout.split('\n');
+  const pid = Number(fields.find((field) => field.startsWith('p'))?.slice(1));
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  return { pid, command: fields.find((field) => field.startsWith('c'))?.slice(1) || undefined };
+}
+
+/** A foreign process holds one of this assistant's allocated ports: name it. */
+export function portInUseError(label: string, port: number, holder: PortHolder, cause?: unknown): GwsEaError {
+  const who = holder.command ? `${holder.command} (pid ${holder.pid})` : `pid ${holder.pid}`;
+  return new GwsEaError(
+    'port_in_use',
+    `Another process, ${who}, holds this assistant's ${label} port 127.0.0.1:${port}. Stop it, then resume.`,
+    {
+      ...(cause === undefined ? {} : { cause }),
+      details: { port, pid: holder.pid, ...(holder.command ? { command: holder.command } : {}) },
+    },
   );
-  return createLease(servers);
 }

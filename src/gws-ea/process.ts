@@ -1,12 +1,20 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import { constants as fsConstants } from 'node:fs';
 import { access, realpath, stat } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
+import { performance } from 'node:perf_hooks';
+import type { Readable, Writable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 
+import { errorCode, isErrno } from '../community-portal/errors.js';
+import { CONTROL_PLANE_ROOT, isWithinDirectory } from './paths.js';
+import { createStreamRedactor, redact, registerSecret } from './redact.js';
+import { activeStep, type StepLog } from './run-log.js';
 import { GwsEaError } from './types.js';
 
-const SAFE_AMBIENT_KEYS = [
+/** Ambient variables the instance host process inherits. */
+const INSTANCE_HOST_ENVIRONMENT_KEYS = [
   'PATH',
   'LANG',
   'LC_ALL',
@@ -16,9 +24,41 @@ const SAFE_AMBIENT_KEYS = [
   'SSL_CERT_FILE',
   'SSL_CERT_DIR',
 ] as const;
+
+/**
+ * Ambient variables every tool the control plane runs inherits. Never
+ * SSH_AUTH_SOCK, GOOGLE_APPLICATION_CREDENTIALS, or any other CLOUDSDK_*,
+ * CLOUDFLARE_*, ONECLI_*, ANTHROPIC_*, or GCHAT_* variable.
+ */
+export const TOOL_ENVIRONMENT_KEYS = [
+  ...INSTANCE_HOST_ENVIRONMENT_KEYS,
+  'DOCKER_CONFIG',
+  'XDG_RUNTIME_DIR',
+  'DBUS_SESSION_BUS_ADDRESS',
+  'USER',
+  'LOGNAME',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'NO_PROXY',
+  'ALL_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'no_proxy',
+  'all_proxy',
+  'CLOUDSDK_CONFIG',
+  'CLOUDSDK_PYTHON',
+] as const;
+
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
-const DEFAULT_OUTPUT_LIMIT_BYTES = 1024 * 1024;
-const DEFAULT_EXECUTABLE_PATH = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
+const DEFAULT_PARSED_OUTPUT_LIMIT_BYTES = 16 * 1024 * 1024;
+const STDERR_RETAINED_CHARACTERS = 64 * 1024;
+const STDERR_TAIL_LINES = 20;
+const STDERR_TAIL_CHARACTERS = 4000;
+const DISPLAY_CHARACTERS = 400;
+const PIPE_RELEASE_GRACE_MS = 2_000;
+const SECRET_ENVIRONMENT_KEY = /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/u;
+const TEMPORARY_ROOTS = ['/tmp', '/var/tmp', '/dev/shm'];
+const FORWARDED_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
 
 export interface SanitizedCommand {
   readonly command: string;
@@ -26,7 +66,15 @@ export interface SanitizedCommand {
   readonly cwd: string;
   readonly env?: Readonly<Record<string, string>>;
   readonly timeoutMs?: number;
+  /** Cap on parsed stdout. Streamed output is never capped. */
   readonly outputLimitBytes?: number;
+  /**
+   * Tee stdout and stderr, redacted, into the active step's raw log instead of
+   * returning stdout. Only for output nobody parses: image builds and compose.
+   */
+  readonly stream?: boolean;
+  /** Text written to the child's stdin, then closed. Never logged. */
+  readonly input?: string;
 }
 
 export interface SanitizedCommandResult {
@@ -42,122 +90,27 @@ export interface SanitizedCommandOutcome extends SanitizedCommandResult {
 
 export type SanitizedCommandOutcomeRunner = (command: SanitizedCommand) => Promise<SanitizedCommandOutcome>;
 
-function currentUid(): number | undefined {
-  return typeof process.getuid === 'function' ? process.getuid() : undefined;
+export interface PersistedExecutableOptions {
+  readonly searchPath?: string;
+  /** Checkout roots besides the control plane's own, such as the instances root. */
+  readonly checkoutRoots?: readonly string[];
 }
 
-function isAllowedOwner(uid: number): boolean {
-  const owner = currentUid();
-  return uid === 0 || (owner !== undefined && uid === owner);
+interface FailureFacts {
+  readonly exitCode?: number | null;
+  readonly signal?: NodeJS.Signals | null;
+  readonly errno?: string;
+  readonly stderr?: string;
+  readonly timeoutMs?: number;
 }
 
-function isFilesystemError(error: unknown): error is NodeJS.ErrnoException {
-  return error instanceof Error && 'code' in error && typeof error.code === 'string';
-}
-
-async function assertTrustedPathComponent(component: string, expectFile: boolean): Promise<void> {
-  const info = await stat(component);
-  if (expectFile ? !info.isFile() : !info.isDirectory()) {
-    throw new GwsEaError('untrusted_executable', 'A required executable has an invalid filesystem type');
-  }
-  if ((info.mode & 0o002) !== 0) {
-    throw new GwsEaError('untrusted_executable', 'A required executable is stored in an unsafe location');
-  }
-  const allowedOwner = isAllowedOwner(info.uid);
-  if (!allowedOwner) {
-    throw new GwsEaError('untrusted_executable', 'A required executable is stored in an unsafe location');
-  }
-  // Homebrew and /Applications commonly have group-writable, root/current-user
-  // owned directories. Executable files themselves must not be group writable.
-  if ((info.mode & 0o020) !== 0 && expectFile) {
-    throw new GwsEaError('untrusted_executable', 'A required executable is stored in an unsafe location');
-  }
-}
-
-async function assertTrustedCanonicalPath(canonicalPath: string, expectFile: boolean): Promise<void> {
-  await assertTrustedPathComponent(canonicalPath, expectFile);
-  let directory = expectFile ? path.dirname(canonicalPath) : canonicalPath;
-  while (true) {
-    await assertTrustedPathComponent(directory, false);
-    const parent = path.dirname(directory);
-    if (parent === directory) return;
-    directory = parent;
-  }
-}
-
-async function trustedDirectory(directory: string): Promise<string | undefined> {
-  if (!path.isAbsolute(directory) || directory.includes('\0')) return undefined;
-  try {
-    const canonical = await realpath(directory);
-    await assertTrustedCanonicalPath(canonical, false);
-    return canonical;
-  } catch (error) {
-    if (!(error instanceof GwsEaError) && !isFilesystemError(error)) throw error;
-    return undefined;
-  }
-}
-
-async function trustedSearchPath(searchPath: string | undefined): Promise<readonly string[]> {
-  const requested = searchPath?.split(path.delimiter) ?? [];
-  const candidates = [...requested, ...DEFAULT_EXECUTABLE_PATH];
-  const trusted = await Promise.all(candidates.map(trustedDirectory));
-  return [...new Set(trusted.filter((entry): entry is string => entry !== undefined))];
-}
-
-async function resolveFromTrustedDirectories(command: string, directories: readonly string[]): Promise<string> {
-  if (!command || command.includes('\0')) {
-    throw new GwsEaError('untrusted_executable', 'A required executable name is invalid');
-  }
-  const candidates = path.isAbsolute(command)
-    ? [command]
-    : command === path.basename(command)
-      ? directories.map((directory) => path.join(directory, command))
-      : [];
-  const runningNode = await realpath(process.execPath);
-  for (const candidate of candidates) {
-    try {
-      await access(candidate, fsConstants.X_OK);
-      const canonical = await realpath(candidate);
-      await assertTrustedCanonicalPath(canonical, true);
-      return canonical;
-    } catch (error) {
-      if (!(error instanceof GwsEaError) && !isFilesystemError(error)) throw error;
-      // A hostile PATH entry must not shadow a later trusted installation.
-    }
-  }
-  if (!path.isAbsolute(command) && command === path.basename(process.execPath)) {
-    try {
-      await access(runningNode, fsConstants.X_OK);
-      await assertTrustedCanonicalPath(runningNode, true);
-      return runningNode;
-    } catch (error) {
-      if (!(error instanceof GwsEaError) && !isFilesystemError(error)) throw error;
-    }
-  }
-  throw new GwsEaError('untrusted_executable', `No trusted ${path.basename(command)} executable is available`);
-}
-
-/** Resolve a child-process executable to a canonical, non-publicly-writable path. */
-export async function resolveTrustedExecutable(command: string, searchPath?: string): Promise<string> {
-  return resolveFromTrustedDirectories(command, await trustedSearchPath(searchPath));
-}
-
-async function prepareTrustedCommand(command: SanitizedCommand): Promise<SanitizedCommand> {
-  const directories = await trustedSearchPath(command.env?.PATH);
-  const executable = await resolveFromTrustedDirectories(command.command, directories);
-  return {
-    ...command,
-    command: executable,
-    env: { ...command.env, PATH: directories.join(path.delimiter) },
-  };
-}
-
-export function buildAllowlistedEnvironment(
-  ambient: NodeJS.ProcessEnv = process.env,
-  overrides: Readonly<Record<string, string>> = {},
+function buildEnvironment(
+  keys: readonly string[],
+  ambient: NodeJS.ProcessEnv,
+  overrides: Readonly<Record<string, string>>,
 ): Record<string, string> {
   const environment: Record<string, string> = {};
-  for (const key of SAFE_AMBIENT_KEYS) {
+  for (const key of keys) {
     const value = ambient[key];
     if (value !== undefined) environment[key] = value;
   }
@@ -170,69 +123,410 @@ export function buildAllowlistedEnvironment(
   return environment;
 }
 
-export const runSanitizedCommandOutcome: SanitizedCommandOutcomeRunner = async (command) => {
-  const trusted = await prepareTrustedCommand({
-    ...command,
-    env: command.env ?? buildAllowlistedEnvironment(),
-  });
-  return new Promise<SanitizedCommandOutcome>((resolve, reject) => {
-    const child = spawn(trusted.command, [...trusted.args], {
-      cwd: trusted.cwd,
-      env: trusted.env,
-      shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    const limit = trusted.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES;
-    let stdout = '';
-    let stderr = '';
-    let outputBytes = 0;
-    let settled = false;
+/** Whether an environment variable's name marks its value as a secret. */
+export function isSecretEnvironmentKey(key: string): boolean {
+  return SECRET_ENVIRONMENT_KEY.test(key);
+}
 
-    const fail = (error: unknown): void => {
-      if (settled) return;
-      settled = true;
-      child.kill('SIGKILL');
-      reject(error);
-    };
-    const capture = (chunk: Buffer, destination: 'stdout' | 'stderr'): void => {
-      outputBytes += chunk.byteLength;
-      if (outputBytes > limit) {
-        fail(new GwsEaError('command_output_limit', 'A required child process exceeded its output limit'));
-        return;
-      }
-      if (destination === 'stdout') stdout += chunk.toString('utf8');
-      else stderr += chunk.toString('utf8');
-    };
+/** Environment for a tool the control plane runs: the tool allowlist plus explicit overrides. */
+export function buildToolEnvironment(
+  ambient: NodeJS.ProcessEnv = process.env,
+  overrides: Readonly<Record<string, string>> = {},
+): Record<string, string> {
+  return buildEnvironment(TOOL_ENVIRONMENT_KEYS, ambient, overrides);
+}
 
-    child.stdout.on('data', (chunk: Buffer) => capture(chunk, 'stdout'));
-    child.stderr.on('data', (chunk: Buffer) => capture(chunk, 'stderr'));
-    child.once('error', () => fail(new GwsEaError('command_failed', 'A required child process could not be started')));
-    child.once('close', (code, signal) => {
-      if (settled) return;
-      settled = true;
-      if (signal === 'SIGKILL') {
-        reject(new GwsEaError('command_timeout', 'A required child process timed out'));
-        return;
-      }
-      resolve({ stdout, stderr, exitCode: code ?? 1 });
-    });
+/** Environment for the instance host process: the host allowlist plus explicit overrides. */
+export function buildHostEnvironment(
+  ambient: NodeJS.ProcessEnv = process.env,
+  overrides: Readonly<Record<string, string>> = {},
+): Record<string, string> {
+  return buildEnvironment(INSTANCE_HOST_ENVIRONMENT_KEYS, ambient, overrides);
+}
 
-    const timeout = setTimeout(
-      () => fail(new GwsEaError('command_timeout', 'A required child process timed out')),
-      trusted.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    );
-    timeout.unref();
-    child.once('close', () => clearTimeout(timeout));
-  });
-};
+/** The operator's PATH minus empty and relative entries. */
+function executableSearchPath(value: string | undefined): string[] {
+  return (value ?? '').split(path.delimiter).filter((entry) => path.isAbsolute(entry));
+}
 
-export const runSanitizedCommand: SanitizedCommandRunner = async (command) => {
-  const result = await runSanitizedCommandOutcome(command);
-  if (result.exitCode !== 0) {
-    throw new GwsEaError('command_failed', 'A required child process failed');
+async function isExecutableFile(candidate: string): Promise<boolean> {
+  try {
+    await access(candidate, fsConstants.X_OK);
+    return (await stat(candidate)).isFile();
+  } catch (error) {
+    if (['ENOENT', 'ENOTDIR', 'EACCES', 'ELOOP'].includes(errorCode(error, ''))) return false;
+    throw error;
   }
-  return { stdout: result.stdout, stderr: result.stderr };
+}
+
+async function locateExecutable(command: string, searched: readonly string[]): Promise<string> {
+  if (!command || command.includes('\0') || (!path.isAbsolute(command) && command !== path.basename(command))) {
+    throw new GwsEaError('invalid_executable', `Executable must be a bare name or an absolute path: ${command}`);
+  }
+  const candidates = path.isAbsolute(command) ? [command] : searched.map((directory) => path.join(directory, command));
+  for (const candidate of candidates) {
+    if (await isExecutableFile(candidate)) return candidate;
+  }
+  throw new GwsEaError(
+    'executable_not_found',
+    path.isAbsolute(command) ? `${command} is not an executable file` : `${command} was not found on PATH`,
+    { details: { program: command, searched: path.isAbsolute(command) ? [] : [...searched] } },
+  );
+}
+
+/** Resolve a tool from the operator's PATH, ignoring empty and relative entries. */
+export async function resolveExecutable(
+  command: string,
+  searchPath: string | undefined = process.env.PATH,
+): Promise<string> {
+  return locateExecutable(command, executableSearchPath(searchPath));
+}
+
+async function canonicalRoots(roots: readonly string[]): Promise<string[]> {
+  return Promise.all(
+    roots.map(async (root) => {
+      try {
+        return await realpath(root);
+      } catch (error) {
+        if (isErrno(error, 'ENOENT')) return path.resolve(root);
+        throw error;
+      }
+    }),
+  );
+}
+
+/**
+ * Resolve an executable persisted into runtime.json and the service unit
+ * (`node`, `onecli`) to its real path. Refused when group- or world-writable
+ * itself, in a world-writable directory, inside any checkout, or inside a
+ * temporary directory. Homebrew and /Applications commonly have group-writable
+ * directories owned by root or the operator, so those are allowed.
+ */
+export async function resolvePersistedExecutable(
+  command: string,
+  options: PersistedExecutableOptions = {},
+): Promise<string> {
+  const executable = await realpath(await resolveExecutable(command, options.searchPath));
+  const refuse = (reason: string): GwsEaError =>
+    new GwsEaError(
+      'untrusted_executable',
+      `${path.basename(command)} at ${executable} ${reason}; install it in an operator-owned location, then retry`,
+      { details: { program: command, executable } },
+    );
+  const [file, directory] = await Promise.all([stat(executable), stat(path.dirname(executable))]);
+  if ((file.mode & 0o022) !== 0) throw refuse('is group- or world-writable');
+  if ((directory.mode & 0o002) !== 0) throw refuse('is in a world-writable directory');
+  for (const root of await canonicalRoots([CONTROL_PLANE_ROOT, ...(options.checkoutRoots ?? [])])) {
+    if (isWithinDirectory(executable, root)) throw refuse(`is inside a checkout (${root})`);
+  }
+  for (const root of await canonicalRoots([os.tmpdir(), ...TEMPORARY_ROOTS])) {
+    if (isWithinDirectory(executable, root)) throw refuse(`is inside a temporary directory (${root})`);
+  }
+  return executable;
+}
+
+function displayArgument(argument: string): string {
+  return argument === '' || /[\s"'\\$`]/u.test(argument) ? JSON.stringify(argument) : argument;
+}
+
+function displayCommand(command: SanitizedCommand): string {
+  const display = [command.command, ...command.args.map(redact)].map(displayArgument).join(' ');
+  return display.length > DISPLAY_CHARACTERS ? `${display.slice(0, DISPLAY_CHARACTERS)}…` : display;
+}
+
+/** Raw stderr kept as its newest whole lines within the bound, so a front trim never leaves part of a line or a secret on it. */
+function createRetainedStderr(): { append(chunk: string): void; text(): string } {
+  let retained = '';
+  // Set while the rest of a line the trim cut is dropped, through its newline.
+  let dropping = false;
+  return {
+    append(chunk) {
+      let text = chunk;
+      if (dropping) {
+        const newline = text.indexOf('\n');
+        if (newline === -1) return;
+        dropping = false;
+        text = text.slice(newline + 1);
+      }
+      retained = `${retained}${text}`;
+      if (retained.length <= STDERR_RETAINED_CHARACTERS) return;
+      const newline = retained.indexOf('\n', retained.length - STDERR_RETAINED_CHARACTERS - 1);
+      dropping = newline === -1;
+      retained = dropping ? '' : retained.slice(newline + 1);
+    },
+    text: () => retained,
+  };
+}
+
+function stderrTail(stderr: string): string {
+  const tail = redact(stderr).trim().split('\n').slice(-STDERR_TAIL_LINES).join('\n');
+  return tail.length > STDERR_TAIL_CHARACTERS ? tail.slice(-STDERR_TAIL_CHARACTERS) : tail;
+}
+
+function commandFailure(
+  code: string,
+  summary: string,
+  command: SanitizedCommand,
+  facts: FailureFacts,
+  cause?: unknown,
+): GwsEaError {
+  const details = {
+    program: command.command,
+    args: command.args.map(redact),
+    cwd: command.cwd,
+    exitCode: facts.exitCode ?? null,
+    signal: facts.signal ?? null,
+    errno: facts.errno ?? null,
+    stderrTail: stderrTail(facts.stderr ?? ''),
+    ...(facts.timeoutMs === undefined ? {} : { timeoutMs: facts.timeoutMs }),
+  };
+  const message = `${summary}: ${displayCommand(command)}`;
+  return new GwsEaError(code, message, cause === undefined ? { details } : { cause, details });
+}
+
+/** The error a caller raises for a command that exited non-zero. */
+export function commandExitError(command: SanitizedCommand, outcome: SanitizedCommandOutcome): GwsEaError {
+  return commandFailure('command_failed', `Command failed (exit code ${outcome.exitCode})`, command, {
+    exitCode: outcome.exitCode,
+    stderr: outcome.stderr,
+  });
+}
+
+// Children run in their own process groups so a timeout can kill grandchildren.
+// Signals the terminal sends to the control plane are forwarded to those groups,
+// and every live group is killed if the control plane exits.
+const activeGroups = new Set<number>();
+let forwarding = false;
+
+function signalGroup(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pid, signal);
+  } catch (error) {
+    if (!isErrno(error, 'ESRCH') && !isErrno(error, 'EPERM')) throw error;
+  }
+}
+
+function killActiveGroups(): void {
+  for (const pid of activeGroups) signalGroup(pid, 'SIGKILL');
+}
+
+const forwarders = new Map(
+  FORWARDED_SIGNALS.map((signal) => [
+    signal,
+    (): void => {
+      for (const pid of activeGroups) signalGroup(pid, signal);
+      if (process.listenerCount(signal) === 1) {
+        // Nothing else handles this signal: restore the default action and re-raise it.
+        stopForwarding();
+        process.kill(process.pid, signal);
+      }
+    },
+  ]),
+);
+
+function stopForwarding(): void {
+  if (!forwarding) return;
+  forwarding = false;
+  for (const [signal, listener] of forwarders) process.off(signal, listener);
+  process.off('exit', killActiveGroups);
+}
+
+function trackGroup(pid: number): void {
+  activeGroups.add(pid);
+  if (forwarding) return;
+  forwarding = true;
+  for (const [signal, listener] of forwarders) process.on(signal, listener);
+  process.on('exit', killActiveGroups);
+}
+
+function releaseGroup(pid: number): void {
+  activeGroups.delete(pid);
+  if (activeGroups.size === 0) stopForwarding();
+}
+
+async function assertWorkingDirectory(command: SanitizedCommand): Promise<void> {
+  let isDirectory: boolean;
+  try {
+    isDirectory = (await stat(command.cwd)).isDirectory();
+  } catch (error) {
+    const errno = errorCode(error, 'unknown');
+    throw commandFailure(
+      'command_failed',
+      `Working directory ${command.cwd} is unavailable (${errno})`,
+      command,
+      { errno },
+      error,
+    );
+  }
+  if (!isDirectory) {
+    throw commandFailure('command_failed', `Working directory ${command.cwd} is not a directory`, command, {
+      errno: 'ENOTDIR',
+    });
+  }
+}
+
+function execute(
+  command: SanitizedCommand,
+  executable: string,
+  environment: Readonly<Record<string, string>>,
+  step: StepLog | undefined,
+): Promise<SanitizedCommandOutcome> {
+  const timeoutMs = command.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const outputLimit = command.outputLimitBytes ?? DEFAULT_PARSED_OUTPUT_LIMIT_BYTES;
+  return new Promise((resolve, reject) => {
+    // stdin is a pipe only when there is input; stdout and stderr are always pipes.
+    const child = spawn(executable, [...command.args], {
+      cwd: command.cwd,
+      env: environment,
+      shell: false,
+      detached: true,
+      stdio: [command.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+    }) as ChildProcessByStdio<Writable | null, Readable, Readable>;
+    const pid = child.pid;
+    if (pid !== undefined) trackGroup(pid);
+    const tees = command.stream ? { stdout: createStreamRedactor(), stderr: createStreamRedactor() } : undefined;
+    let stdout = '';
+    let stdoutBytes = 0;
+    const retainedStderr = createRetainedStderr();
+    let startError: Error | undefined;
+    let termination: 'timeout' | 'output_limit' | undefined;
+    let pipeRelease: NodeJS.Timeout | undefined;
+
+    const terminate = (reason: 'timeout' | 'output_limit'): void => {
+      if (termination !== undefined) return;
+      termination = reason;
+      if (pid !== undefined) signalGroup(pid, 'SIGKILL');
+      // A process that escaped the group can hold the pipes open; stop waiting for it.
+      pipeRelease = setTimeout(() => {
+        child.stdout.destroy();
+        child.stderr.destroy();
+      }, PIPE_RELEASE_GRACE_MS);
+    };
+
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => {
+      if (tees) {
+        step?.write(tees.stdout.push(chunk));
+        return;
+      }
+      stdoutBytes += Buffer.byteLength(chunk);
+      if (stdoutBytes > outputLimit) terminate('output_limit');
+      else stdout += chunk;
+    });
+    child.stderr.on('data', (chunk: string) => {
+      retainedStderr.append(chunk);
+      if (tees) step?.write(tees.stderr.push(chunk));
+    });
+    child.once('error', (error) => {
+      startError = error;
+    });
+    if (command.input !== undefined && child.stdin) {
+      // A child that exits without reading its input closes the pipe; its exit status tells the story.
+      child.stdin.on('error', (error) => {
+        if (!isErrno(error, 'EPIPE')) startError ??= error;
+      });
+      child.stdin.end(command.input);
+    }
+    const timer = setTimeout(() => terminate('timeout'), timeoutMs);
+
+    child.once('close', (code, signal) => {
+      clearTimeout(timer);
+      clearTimeout(pipeRelease);
+      if (pid !== undefined) releaseGroup(pid);
+      if (tees) step?.write(`${tees.stdout.end()}${tees.stderr.end()}`);
+      const facts: FailureFacts = { exitCode: code, signal, stderr: retainedStderr.text() };
+      if (startError !== undefined) {
+        const errno = errorCode(startError, 'unknown');
+        reject(
+          commandFailure(
+            'command_failed',
+            `Command could not start (${errno})`,
+            command,
+            { ...facts, errno },
+            startError,
+          ),
+        );
+      } else if (termination === 'timeout') {
+        const seconds = (timeoutMs / 1000).toFixed(1);
+        reject(
+          commandFailure('command_timeout', `Command timed out after ${seconds}s`, command, { ...facts, timeoutMs }),
+        );
+      } else if (termination === 'output_limit') {
+        reject(commandFailure('command_output_limit', `Command output exceeded ${outputLimit} bytes`, command, facts));
+      } else if (signal !== null) {
+        reject(commandFailure('command_failed', `Command was terminated by ${signal}`, command, facts));
+      } else {
+        resolve({ stdout, stderr: retainedStderr.text(), exitCode: code ?? 1 });
+      }
+    });
+  });
+}
+
+function indent(text: string): string {
+  return text
+    .split('\n')
+    .map((line) => `    ${line}`)
+    .join('\n');
+}
+
+/**
+ * The one runner for every child process. Parsed stdout is never logged; the
+ * active step's raw log records the command, its outcome, the stdout byte
+ * count, and redacted stderr. Streamed output is teed through the redactor.
+ */
+export const runSanitizedCommandOutcome: SanitizedCommandOutcomeRunner = async (command) => {
+  const environment = { ...(command.env ?? buildToolEnvironment()) };
+  const searched = executableSearchPath(environment.PATH);
+  if (environment.PATH !== undefined) environment.PATH = searched.join(path.delimiter);
+  for (const [key, value] of Object.entries(environment)) {
+    if (isSecretEnvironmentKey(key)) registerSecret(value);
+  }
+  const step = activeStep();
+  step?.write(
+    `$ ${displayCommand(command)}\n  cwd: ${command.cwd}\n  env: ${Object.keys(environment).sort().join(', ')}\n`,
+  );
+  const started = performance.now();
+  try {
+    const executable = await locateExecutable(command.command, searched);
+    await assertWorkingDirectory(command);
+    const outcome = await execute(command, executable, environment, step);
+    const elapsed = `${((performance.now() - started) / 1000).toFixed(1)}s`;
+    const stdoutFact = command.stream
+      ? ''
+      : `; stdout: ${Buffer.byteLength(outcome.stdout)} bytes (parsed, not logged)`;
+    const stderrFact =
+      command.stream || !outcome.stderr.trim() ? '' : `\n  stderr:\n${indent(redact(outcome.stderr.trim()))}`;
+    step?.write(`  exit ${outcome.exitCode} after ${elapsed}${stdoutFact}${stderrFact}\n`);
+    if (!command.stream) step?.captureCommand({ program: command.command, args: command.args, ...outcome });
+    return outcome;
+  } catch (error) {
+    const tail = error instanceof GwsEaError ? error.details?.stderrTail : undefined;
+    step?.write(
+      `  failed: ${error instanceof Error ? error.message : String(error)}\n${typeof tail === 'string' && tail ? `  stderr (tail):\n${indent(tail)}\n` : ''}`,
+    );
+    throw error;
+  }
 };
+
+/** A runner that raises `commandExitError` for any non-zero exit. */
+export function checkedRunner(runner: SanitizedCommandOutcomeRunner): SanitizedCommandRunner {
+  return async (command) => {
+    const outcome = await runner(command);
+    if (outcome.exitCode !== 0) throw commandExitError(command, outcome);
+    return { stdout: outcome.stdout, stderr: outcome.stderr };
+  };
+}
+
+export const runSanitizedCommand: SanitizedCommandRunner = checkedRunner(runSanitizedCommandOutcome);
+
+/** Re-raise a program that is not installed as `code`, keeping where the runner looked; rethrow anything else. */
+export function missingExecutable(error: unknown, code: string, message: string): never {
+  if (error instanceof GwsEaError && error.code === 'executable_not_found') {
+    throw new GwsEaError(code, message, { cause: error, ...(error.details ? { details: error.details } : {}) });
+  }
+  throw error;
+}
 
 export function replaceProcess(
   executable: string,

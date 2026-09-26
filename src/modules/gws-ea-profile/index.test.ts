@@ -3,6 +3,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { ensureContainerConfig } from '../../db/container-configs.js';
+import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { dispatch } from '../../cli/dispatch.js';
 import { lookup } from '../../cli/registry.js';
@@ -177,6 +178,68 @@ describe('GWS-EA profile module', () => {
         main_agent_group_id: main.id,
       },
     });
+  });
+
+  it('binds the principal with the direct message that authenticated them, atomically, through ncl', async () => {
+    const user: User = {
+      id: 'gchat:users/principal',
+      kind: 'gchat',
+      display_name: 'Taslim',
+      created_at: '2026-09-18T01:00:00.000Z',
+    };
+    await createUser(user);
+    for (const [id, isGroup] of [
+      ['mg-dm', 0],
+      ['mg-space', 1],
+    ] as const) {
+      await createMessagingGroup({
+        id,
+        channel_type: 'gchat',
+        platform_id: `gchat:spaces/${id}`,
+        instance: 'gchat',
+        name: null,
+        is_group: isGroup,
+        unknown_sender_policy: 'strict',
+        created_at: '2026-09-18T01:00:00.000Z',
+      });
+    }
+    const bind = (messagingGroupId?: string) =>
+      dispatch(
+        {
+          id: 'bind',
+          command: 'gws-ea-profile-bind-principal',
+          args: {
+            'user-id': user.id,
+            'verified-at': '2026-09-18T02:00:00.000Z',
+            ...(messagingGroupId === undefined ? {} : { 'messaging-group-id': messagingGroupId }),
+          },
+        },
+        { caller: 'host' },
+      );
+    const dms = () => getDb().all('SELECT user_id, channel_type, messaging_group_id, resolved_at FROM user_dms');
+
+    expect(await bind()).toMatchObject({ ok: false, error: { message: '--messaging-group-id is required' } });
+    expect(await bind('mg-space')).toMatchObject({ ok: false, error: { message: /direct conversation/ } });
+    expect(await bind('mg-missing')).toMatchObject({ ok: false, error: { message: /not found/ } });
+    expect(await listVerifiedPrincipalUsers()).toEqual([]);
+    expect(await dms()).toEqual([]);
+
+    for (const attempt of [1, 2]) {
+      expect(await bind('mg-dm'), `attempt ${attempt}`).toEqual({
+        id: 'bind',
+        ok: true,
+        data: { user_id: user.id, verified_at: '2026-09-18T02:00:00.000Z', messaging_group_id: 'mg-dm' },
+      });
+    }
+    expect(await listVerifiedPrincipalUsers()).toEqual([{ user_id: user.id, verified_at: '2026-09-18T02:00:00.000Z' }]);
+    expect(await dms()).toEqual([
+      {
+        user_id: user.id,
+        channel_type: 'gchat',
+        messaging_group_id: 'mg-dm',
+        resolved_at: '2026-09-18T02:00:00.000Z',
+      },
+    ]);
   });
 
   it('accepts only canonical UTC timestamps for verified principal bindings', async () => {

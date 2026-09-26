@@ -1,6 +1,6 @@
 import { normalizeGatewayApprovalSummary } from '../gateway-approval-summary.js';
 /** OneCLI typed configuration and supervised native approval adapter. */
-import { OneCLI, ApprovalClient, type ContainerConfig, type ApprovalRequest } from '@onecli-sh/sdk';
+import { OneCLI, type ContainerConfig, type ApprovalRequest } from '@onecli-sh/sdk';
 
 import { DATA_DIR } from '../config.js';
 import { combinedCaBundle, stageOnecliFile } from './onecli-files.js';
@@ -10,6 +10,7 @@ import { log } from '../log.js';
 import {
   registerGatewayProvider,
   type GatewayApprovalRequest,
+  type GatewayApprovalDecision,
   type GatewayApprovalScope,
   type GatewayContribution,
   type GatewaySessionInput,
@@ -121,7 +122,9 @@ function monitorLease(signal: AbortSignal): Pick<GatewaySessionLease, 'onUnavail
 async function ensureSession(input: GatewaySessionInput, signal: AbortSignal): Promise<GatewaySessionLease> {
   // The OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
-  await onecli.ensureAgent({ name: input.groupName, identifier: input.key.agentGroupId });
+  if (input.disposition !== 'adopt') {
+    await onecli.ensureAgent({ name: input.groupName, identifier: input.key.agentGroupId });
+  }
   const config = await onecli.getContainerConfig({ agent: input.key.agentGroupId });
   log.info('OneCLI gateway applied', { agentGroupId: input.key.agentGroupId, sessionId: input.key.sessionId });
   return {
@@ -137,53 +140,129 @@ async function ensureSession(input: GatewaySessionInput, signal: AbortSignal): P
 }
 
 async function subscribeApprovals(
-  decide: (request: GatewayApprovalRequest) => Promise<'approve' | 'deny'>,
+  decide: (request: GatewayApprovalRequest) => Promise<GatewayApprovalDecision>,
   signal: AbortSignal,
   _resolved?: (requestId: string) => Promise<void>,
   scope?: GatewayApprovalScope,
 ): Promise<void> {
   if (!scope) throw new Error('OneCLI approval subscription requires installation ownership scope');
   const subscribedAt = Date.now();
-  const client = new ApprovalClient(
-    onecliUrl || 'https://api.onecli.sh',
-    onecliApiKey || '',
-    process.env.ONECLI_GATEWAY_URL || null,
-    process.env.ONECLI_PROJECT_ID || null,
-  );
-  let stopped = false;
-  const stop = () => {
-    if (!stopped) {
-      stopped = true;
-      client.stop();
-    }
-  };
   if (signal.aborted) return;
-  signal.addEventListener('abort', stop, { once: true });
+  const authHeaders: Record<string, string> = { Authorization: `Bearer ${onecliApiKey || ''}` };
+  if (process.env.ONECLI_PROJECT_ID) authHeaders['X-Project-Id'] = process.env.ONECLI_PROJECT_ID;
+  const gatewayUrl = await resolveApprovalGatewayUrl(authHeaders, signal);
+  const inFlight = new Set<string>();
   try {
-    // Unlike configureManualApproval, start exposes gateway-URL discovery failures.
-    await client.start(async (request: ApprovalRequest) => {
-      // The local gateway poll is shared by installations. Throwing from the
-      // pinned SDK callback submits no decision and leaves the request pending.
-      // Keep this outside the deny-on-translation-error block, even for stale
-      // requests: this copy has no authority over another copy's requests.
-      if (!(await scope.ownsAgentGroup(request.agent?.externalId ?? ''))) {
-        throw new Error('OneCLI approval belongs to another installation');
+    while (!signal.aborted) {
+      const url = new URL(`${gatewayUrl}/v1/approvals/pending`);
+      if (inFlight.size) url.searchParams.set('exclude', [...inFlight].join(','));
+      const response = await fetch(url, {
+        headers: authHeaders,
+        signal: AbortSignal.any([signal, AbortSignal.timeout(35_000)]),
+      });
+      if (!response.ok) throw new Error(`OneCLI approval poll failed (${response.status})`);
+      const payload: unknown = await response.json();
+      if (!isApprovalPoll(payload)) throw new Error('OneCLI approval poll returned invalid data');
+      for (const request of payload.requests) {
+        if (inFlight.has(request.id)) continue;
+        inFlight.add(request.id);
+        void (async () => {
+          try {
+            // A shared poll includes other installations. Never decide their requests.
+            if (!(await scope.ownsAgentGroup(request.agent.externalId ?? ''))) return;
+            let decision: 'approve' | 'deny';
+            if (signal.aborted || Date.parse(request.createdAt) < subscribedAt) {
+              decision = 'deny';
+            } else {
+              try {
+                const outcome = await decide(toGatewayApprovalRequest(request));
+                if (outcome === 'unavailable') return;
+                decision = outcome;
+              } catch (err) {
+                log.error('OneCLI approval translation failed closed', { requestId: request.id, err });
+                decision = 'deny';
+              }
+            }
+            if (signal.aborted) return;
+            const decisionUrl = new URL(`${gatewayUrl}/v1/approvals/${encodeURIComponent(request.id)}/decision`);
+            const submitted = await fetch(decisionUrl, {
+              method: 'POST',
+              headers: { ...authHeaders, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ decision }),
+              signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
+            });
+            if (!submitted.ok && submitted.status !== 410) {
+              throw new Error(`OneCLI approval decision failed (${submitted.status})`);
+            }
+          } catch (err) {
+            if (!signal.aborted)
+              log.error('OneCLI approval request failed and remains pending', { requestId: request.id, err });
+          } finally {
+            inFlight.delete(request.id);
+          }
+        })();
       }
-      if (signal.aborted || Date.parse(request.createdAt) < subscribedAt) return 'deny';
-      try {
-        return await decide(toGatewayApprovalRequest(request));
-      } catch (err) {
-        log.error('OneCLI approval translation failed closed', { requestId: request.id, err });
-        return 'deny';
-      }
-    });
-  } finally {
-    signal.removeEventListener('abort', stop);
-    stop();
+    }
+  } catch (error) {
+    if (!signal.aborted) throw error;
   }
 }
 
+async function resolveApprovalGatewayUrl(headers: Record<string, string>, signal: AbortSignal): Promise<string> {
+  const configured = process.env.ONECLI_GATEWAY_URL;
+  if (configured) return validatedGatewayUrl(configured);
+  const response = await fetch(
+    new URL(`${(onecliUrl || 'https://api.onecli.sh').replace(/\/+$/, '')}/v1/gateway-url`),
+    {
+      headers,
+      signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
+    },
+  );
+  if (!response.ok) throw new Error(`Failed to resolve gateway URL (${response.status})`);
+  const body: unknown = await response.json();
+  if (!body || typeof body !== 'object' || !('url' in body) || typeof body.url !== 'string') {
+    throw new Error('OneCLI returned an invalid gateway URL');
+  }
+  return validatedGatewayUrl(body.url);
+}
+
+function validatedGatewayUrl(value: string): string {
+  const url = new URL(value);
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+    throw new Error('OneCLI returned an invalid gateway URL');
+  }
+  return url.toString().replace(/\/+$/, '');
+}
+
+function isApprovalPoll(value: unknown): value is { requests: ApprovalRequest[] } {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    'requests' in value &&
+    Array.isArray(value.requests) &&
+    value.requests.every((request: unknown) => {
+      if (!request || typeof request !== 'object') return false;
+      const fields = request as Record<string, unknown>;
+      const agent = fields.agent;
+      return (
+        typeof fields.id === 'string' &&
+        typeof fields.createdAt === 'string' &&
+        typeof fields.method === 'string' &&
+        typeof fields.host === 'string' &&
+        typeof fields.path === 'string' &&
+        !!agent &&
+        typeof agent === 'object' &&
+        'name' in agent &&
+        typeof agent.name === 'string' &&
+        'externalId' in agent &&
+        (agent.externalId === null || typeof agent.externalId === 'string')
+      );
+    })
+  );
+}
+
 function toGatewayApprovalRequest(request: ApprovalRequest): GatewayApprovalRequest {
+  const path = request.path.split(/[?#]/, 1)[0];
   return {
     id: request.id,
     trigger: 'policy',
@@ -192,12 +271,12 @@ function toGatewayApprovalRequest(request: ApprovalRequest): GatewayApprovalRequ
     createdAt: request.createdAt,
     expiresAt: request.expiresAt,
     summary: normalizeGatewayApprovalSummary(
-      { agent: request.agent.name, method: request.method, host: request.host, path: request.path },
+      { agent: request.agent.name, method: request.method, host: request.host, path },
       (request as ApprovalRequest & { summary?: ApprovalSummary }).summary,
     ),
     title: 'Credentials Request',
     question: buildQuestion(request, request.agent.name),
-    audit: { method: request.method, host: request.host, path: request.path },
+    audit: { method: request.method, host: request.host, path },
   };
 }
 

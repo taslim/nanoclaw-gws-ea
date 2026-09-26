@@ -1,13 +1,12 @@
 import { runInstanceOnecliAdminCommand, validateRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
 import { runInstanceNclJson } from './ncl.js';
 import { GwsEaError } from './types.js';
-import { hasControlCharacters, isRecord } from './validation.js';
+import { EMAIL_PATTERN, isRecord, parseJson, requireString, unwrapData } from './validation.js';
 import { isValidTimezone } from '../timezone.js';
 
 const MAIN_TEMPLATE = 'gws-ea/main';
 const MAIN_GROUP_NAME = 'main';
 const MAIN_PLUGIN_NAME = 'gws-ea-main';
-const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/u;
 
 export interface MainIdentityInput {
   readonly assistantDisplayName: string;
@@ -33,23 +32,8 @@ interface OnecliAgent {
   readonly secretMode: string;
 }
 
-function unwrapData(value: unknown): unknown {
-  return isRecord(value) && 'data' in value ? value.data : value;
-}
-
-function parseJson(source: string, label: string): unknown {
-  try {
-    return JSON.parse(source) as unknown;
-  } catch {
-    throw new GwsEaError('invalid_child_output', `${label} returned invalid JSON`);
-  }
-}
-
 function safeString(value: unknown, label: string, maxLength = 256): string {
-  if (typeof value !== 'string' || value.length === 0 || value.length > maxLength || hasControlCharacters(value)) {
-    throw new GwsEaError('invalid_identity', `${label} is invalid`);
-  }
-  return value;
+  return requireString(value, label, 'invalid_identity', maxLength);
 }
 
 function parseGroupResult(value: unknown): { id: string; name: string } {
@@ -99,7 +83,7 @@ function exactAgent(agents: readonly OnecliAgent[], agentGroupId: string): Onecl
 
 async function defaultRunOnecliAdmin(config: InstanceRuntimeConfig, args: readonly string[]): Promise<unknown> {
   const result = await runInstanceOnecliAdminCommand(config, args);
-  return parseJson(result.stdout, 'OneCLI');
+  return parseJson(result.stdout, 'OneCLI output', 'invalid_child_output');
 }
 
 function validateInput(input: MainIdentityInput): MainIdentityInput {

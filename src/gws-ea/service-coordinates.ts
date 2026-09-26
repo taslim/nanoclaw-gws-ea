@@ -3,6 +3,11 @@ import path from 'node:path';
 import { getInstallScopedNames } from '../install-slug.js';
 
 export type InstanceServicePlatform = 'macos' | 'linux';
+
+/** The platform an instance service runs on: macOS for `darwin`, Linux for anything else. */
+export function instanceServicePlatform(platform: NodeJS.Platform = process.platform): InstanceServicePlatform {
+  return platform === 'darwin' ? 'macos' : 'linux';
+}
 export type InstanceServiceManager = 'launchd' | 'systemd-system' | 'systemd-user';
 
 export interface InstanceServiceCoordinateInput {

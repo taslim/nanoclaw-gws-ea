@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "instance_id": "__INSTANCE_ID__",
+  "install_id": "__INSTALL_ID__",
+  "deployed_commit": "3e28af43e476702724501d5efc04c79127df1958",
+  "checkout_realpath": "__CHECKOUT__",
+  "node_path": "/usr/local/bin/node",
+  "home_directory": "__HOME__",
+  "allocated_ports": {
+    "nanoclaw_webhook": 33001,
+    "onecli_app": 33101,
+    "onecli_gateway": 33201
+  },
+  "agent_egress_network": "gws-ea-__INSTALL_ID__-agent-egress",
+  "onecli_project": "gws-ea-__INSTALL_ID__",
+  "onecli_app_url": "http://127.0.0.1:33101",
+  "onecli_gateway_url": "http://127.0.0.1:33201",
+  "onecli_gateway_container": "gws-ea-__INSTALL_ID__-gateway-1",
+  "onecli_cli_path": "/opt/onecli/bin/onecli",
+  "selected_provider": "anthropic",
+  "endpoint_url": "https://target.example.test/webhook/gchat",
+  "secret_files": {
+    "gchat_credentials": "__SECRETS__/gchat-service-account.json",
+    "onecli_runtime_api_key": "__SECRETS__/onecli-runtime-api-key",
+    "onecli_admin_api_key": "__SECRETS__/onecli-admin-api-key"
+  }
+}

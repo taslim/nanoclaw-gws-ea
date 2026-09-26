@@ -3,21 +3,19 @@ import path from 'node:path';
 
 import { parse as parseYaml } from 'yaml';
 
-import {
-  prepareReleaseCommandEnvironments,
-  runArgumentCommand,
-  type CommandRunner,
-  type ReleaseCommandEnvironments,
-} from './checkout.js';
+import { prepareReleaseCommandEnvironments, type ReleaseCommandEnvironments } from './checkout.js';
+import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { GwsEaError } from './types.js';
-import { isRecord } from './validation.js';
+import { isRecord, parseJson, requireRecord } from './validation.js';
 import type { ProviderCredentialMetadata } from '../provider-credential.js';
 import { providerProvisioningCapabilityDigest } from '../provider-provisioning-capability.js';
-import { ONECLI_CLI_VERSION, ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './onecli-compose.js';
+import { exactVersion, LAUNCHER_PINS, ONECLI_SDK_VERSION, parsePins, PIN_NAMES, type GwsEaPins } from './pins.js';
 import { assertInstalledOnecliSdkVersion } from './onecli.js';
 
 const PROVIDER_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-const EXACT_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+const INCOMPLETE = 'incomplete_release';
+/** gws-ea's pins inside a release checkout. */
+const RELEASE_PINS_FILE = 'src/gws-ea/versions.json';
 
 export interface SetupCommand {
   command: 'pnpm';
@@ -35,7 +33,7 @@ export interface ReleasePreflightInput {
 }
 
 export interface ReleasePreflightRuntime {
-  runCommand?: CommandRunner;
+  runCommand?: SanitizedCommandRunner;
   runSetupCommand?: (command: SetupCommand) => Promise<void>;
 }
 
@@ -53,18 +51,14 @@ export interface ReleasePreflightResult {
 
 type JsonRecord = Record<string, unknown>;
 
-function requireRecord(value: unknown, label: string, code = 'incomplete_release'): JsonRecord {
-  if (!isRecord(value)) throw new GwsEaError(code, `${label} must be an object`);
-  return value;
-}
-
 async function readJson(file: string, label: string): Promise<JsonRecord> {
+  let source: string;
   try {
-    return requireRecord(JSON.parse(await readFile(file, 'utf8')) as unknown, label);
-  } catch (error) {
-    if (error instanceof GwsEaError) throw error;
-    throw new GwsEaError('incomplete_release', `${label} is missing or invalid`);
+    source = await readFile(file, 'utf8');
+  } catch {
+    throw new GwsEaError(INCOMPLETE, `${label} is missing`);
   }
+  return requireRecord(parseJson(source, label, INCOMPLETE), label, INCOMPLETE);
 }
 
 async function assertPhysicalCheckout(checkoutRoot: string): Promise<string> {
@@ -84,7 +78,7 @@ async function assertPhysicalCheckout(checkoutRoot: string): Promise<string> {
 async function git(
   checkoutRoot: string,
   args: readonly string[],
-  run: CommandRunner,
+  run: SanitizedCommandRunner,
   environments: ReleaseCommandEnvironments,
 ): Promise<string> {
   return (await run({ command: 'git', args, cwd: checkoutRoot, env: environments.git })).stdout.trim();
@@ -93,7 +87,7 @@ async function git(
 async function assertClean(
   checkoutRoot: string,
   phase: string,
-  run: CommandRunner,
+  run: SanitizedCommandRunner,
   environments: ReleaseCommandEnvironments,
 ): Promise<void> {
   const status = await git(checkoutRoot, ['status', '--porcelain=v1', '--untracked-files=all'], run, environments);
@@ -102,7 +96,7 @@ async function assertClean(
 
 async function assertDetachedCommit(
   checkoutRoot: string,
-  run: CommandRunner,
+  run: SanitizedCommandRunner,
   environments: ReleaseCommandEnvironments,
 ): Promise<void> {
   const head = await git(checkoutRoot, ['rev-parse', '--verify', 'HEAD^{commit}'], run, environments);
@@ -117,7 +111,7 @@ async function assertDetachedCommit(
 async function assertCommittedRegularFiles(
   checkoutRoot: string,
   relativePaths: readonly string[],
-  run: CommandRunner,
+  run: SanitizedCommandRunner,
   environments: ReleaseCommandEnvironments,
 ): Promise<void> {
   const [trackedResult, fileInfo] = await Promise.all([
@@ -196,17 +190,10 @@ async function assertBarrelImports(
   }
 }
 
-function exactVersion(value: unknown, label: string): string {
-  if (typeof value !== 'string' || !EXACT_VERSION_PATTERN.test(value)) {
-    throw new GwsEaError('invalid_release_pin', `${label} must be pinned to one exact version`);
-  }
-  return value;
-}
-
 function dependencyMap(manifest: JsonRecord, section: string): Record<string, string> {
   const value = manifest[section];
   if (value === undefined) return {};
-  const record = requireRecord(value, `package.json ${section}`);
+  const record = requireRecord(value, `package.json ${section}`, INCOMPLETE);
   const result: Record<string, string> = {};
   for (const [name, specifier] of Object.entries(record)) {
     if (typeof specifier !== 'string') {
@@ -227,14 +214,14 @@ function lockSpecifier(section: unknown, dependency: string): string | undefined
 
 async function validatePackageAndPins(
   checkoutRoot: string,
-): Promise<{ packageManager: string; gateway: string; cli: string; sdk: string }> {
+): Promise<{ packageManager: string; pins: GwsEaPins; sdk: string }> {
   const manifest = await readJson(path.join(checkoutRoot, 'package.json'), 'package.json');
   const packageManager = typeof manifest.packageManager === 'string' ? manifest.packageManager : '';
   const packageManagerMatch = /^pnpm@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/.exec(packageManager);
   if (!packageManagerMatch) {
     throw new GwsEaError('invalid_package_manager', 'package.json must declare one exact pnpm version');
   }
-  const scripts = requireRecord(manifest.scripts, 'package.json scripts');
+  const scripts = requireRecord(manifest.scripts, 'package.json scripts', INCOMPLETE);
   if (typeof scripts.build !== 'string' || scripts.build.length === 0) {
     throw new GwsEaError('incomplete_release', 'package.json must declare a build script');
   }
@@ -245,6 +232,7 @@ async function validatePackageAndPins(
     lockfile = requireRecord(
       parseYaml(await readFile(path.join(checkoutRoot, 'pnpm-lock.yaml'), 'utf8')),
       'pnpm lockfile',
+      INCOMPLETE,
     );
   } catch (error) {
     if (error instanceof GwsEaError) throw error;
@@ -263,19 +251,20 @@ async function validatePackageAndPins(
     }
   }
 
-  const versions = await readJson(path.join(checkoutRoot, 'versions.json'), 'versions.json');
-  const gateway = exactVersion(versions['onecli-gateway'], 'OneCLI gateway');
-  const cli = exactVersion(versions['onecli-cli'], 'OneCLI CLI');
+  const pins = parsePins(
+    await readJson(path.join(checkoutRoot, RELEASE_PINS_FILE), RELEASE_PINS_FILE),
+    RELEASE_PINS_FILE,
+  );
   if (lockSpecifier(rootImporter.dependencies, '@onecli-sh/sdk') !== sdk) {
     throw new GwsEaError('inconsistent_lockfile', 'pnpm lockfile does not match the pinned OneCLI SDK');
   }
-  return { packageManager, gateway, cli, sdk };
+  return { packageManager, pins, sdk };
 }
 
 async function validateComposition(
   checkoutRoot: string,
   provider: string,
-  run: CommandRunner,
+  run: SanitizedCommandRunner,
   environments: ReleaseCommandEnvironments,
 ): Promise<void> {
   if (!PROVIDER_PATTERN.test(provider)) {
@@ -284,7 +273,7 @@ async function validateComposition(
   const commonFiles = [
     'package.json',
     'pnpm-lock.yaml',
-    'versions.json',
+    RELEASE_PINS_FILE,
     'bin/gws-ea',
     'bin/ncl',
     'setup/gws-ea.ts',
@@ -294,6 +283,7 @@ async function validateComposition(
     'src/channels/gchat.ts',
     'src/channels/index.ts',
     'src/gws-ea/process.ts',
+    'src/gws-ea/cloudflare-connector.ts',
     'scripts/init-first-agent.ts',
     'src/modules/gws-ea-profile/index.ts',
     'src/modules/gws-ea-profile/migration.ts',
@@ -356,47 +346,74 @@ async function validateComposition(
   }
 
   const template = await readJson(path.join(checkoutRoot, 'templates/gws-ea/main/plugin.json'), 'gws-ea/main template');
-  const extensions = requireRecord(template.extensions, 'gws-ea/main extensions');
-  const nanoclaw = requireRecord(extensions['ai.nanoco.nanoclaw'], 'gws-ea/main NanoClaw extension');
+  const extensions = requireRecord(template.extensions, 'gws-ea/main extensions', INCOMPLETE);
+  const nanoclaw = requireRecord(extensions['ai.nanoco.nanoclaw'], 'gws-ea/main NanoClaw extension', INCOMPLETE);
   if (template.name !== 'gws-ea-main' || nanoclaw.agentName !== 'main') {
     throw new GwsEaError('incomplete_release', 'Committed gws-ea/main template is not the canonical main assistant');
   }
 }
 
-function assertLauncherOnecliCohort(pins: { gateway: string; cli: string; sdk: string }): void {
-  if (pins.gateway !== ONECLI_GATEWAY_VERSION || pins.cli !== ONECLI_CLI_VERSION || pins.sdk !== ONECLI_SDK_VERSION) {
+/**
+ * A release is provisioned only with the cohort this launcher runs: its pins
+ * must equal the launcher's. Compared at create only; resume never re-checks.
+ */
+function assertLauncherPins(release: GwsEaPins, sdk: string): void {
+  const update = 'update the GWS-EA launcher before provisioning it';
+  for (const key of ['onecliGateway', 'onecliCli'] as const) {
+    if (release[key] !== LAUNCHER_PINS[key]) {
+      throw new GwsEaError(
+        'onecli_release_mismatch',
+        `The selected release pins ${PIN_NAMES[key]} ${release[key]}, but this launcher pins ${LAUNCHER_PINS[key]}; ${update}`,
+        { details: { pin: PIN_NAMES[key], release: release[key], launcher: LAUNCHER_PINS[key] } },
+      );
+    }
+  }
+  if (sdk !== ONECLI_SDK_VERSION) {
     throw new GwsEaError(
       'onecli_release_mismatch',
-      'The selected release requires a different OneCLI cohort; update the GWS-EA launcher before provisioning it',
+      `The selected release pins OneCLI SDK ${sdk}, but this launcher pins ${ONECLI_SDK_VERSION}; ${update}`,
+      { details: { pin: 'OneCLI SDK', release: sdk, launcher: ONECLI_SDK_VERSION } },
+    );
+  }
+  if (release.cloudflaredImage !== LAUNCHER_PINS.cloudflaredImage) {
+    throw new GwsEaError(
+      'cloudflared_release_mismatch',
+      `The selected release pins ${PIN_NAMES.cloudflaredImage} ${release.cloudflaredImage}, but this launcher pins ${LAUNCHER_PINS.cloudflaredImage}; ${update}`,
+      {
+        details: {
+          pin: PIN_NAMES.cloudflaredImage,
+          release: release.cloudflaredImage,
+          launcher: LAUNCHER_PINS.cloudflaredImage,
+        },
+      },
     );
   }
 }
 
-async function assertInstalledOnecliCli(
+/** The OneCLI CLI at `executable` reports exactly `expectedVersion`. */
+export async function assertInstalledOnecliCli(
   executable: string,
   expectedVersion: string,
   checkoutRoot: string,
   environment: Readonly<Record<string, string>>,
-  run: CommandRunner,
+  run: SanitizedCommandRunner,
 ): Promise<void> {
   if (!path.isAbsolute(executable) || path.resolve(executable) !== executable) {
     throw new GwsEaError('incompatible_onecli', 'OneCLI CLI path must be absolute and normalized');
   }
   const result = await run({ command: executable, args: ['version'], cwd: checkoutRoot, env: environment });
-  let version: unknown;
-  try {
-    const parsed: unknown = JSON.parse(result.stdout);
-    version = isRecord(parsed) ? parsed.version : undefined;
-  } catch {
-    throw new GwsEaError('incompatible_onecli', 'Installed OneCLI CLI returned invalid version information');
-  }
+  const parsed = parseJson(result.stdout, 'Installed OneCLI CLI version information', 'incompatible_onecli');
+  const version = isRecord(parsed) ? parsed.version : undefined;
   if (version !== expectedVersion) {
-    throw new GwsEaError('incompatible_onecli', 'Installed OneCLI CLI does not match the selected release');
+    throw new GwsEaError(
+      'incompatible_onecli',
+      `Installed OneCLI CLI ${typeof version === 'string' ? version : '(unknown version)'} does not match the pinned ${expectedVersion}; install OneCLI CLI ${expectedVersion}, then retry`,
+    );
   }
 }
 
 async function defaultSetupCommand(command: SetupCommand): Promise<void> {
-  await runArgumentCommand({ ...command, timeoutMs: 20 * 60 * 1000 });
+  await runSanitizedCommand({ ...command, timeoutMs: 20 * 60 * 1000, stream: true });
 }
 
 /**
@@ -409,7 +426,7 @@ export async function runReleasePreflight(
 ): Promise<ReleasePreflightResult> {
   const checkoutRoot = await assertPhysicalCheckout(input.checkoutRoot);
   const environments = await prepareReleaseCommandEnvironments(path.dirname(checkoutRoot));
-  const runCommand = runtime.runCommand ?? runArgumentCommand;
+  const runCommand = runtime.runCommand ?? runSanitizedCommand;
   await assertDetachedCommit(checkoutRoot, runCommand, environments);
   await assertClean(checkoutRoot, 'initial preflight', runCommand, environments);
   const providerCapabilityDigest = await providerProvisioningCapabilityDigest(checkoutRoot);
@@ -420,11 +437,11 @@ export async function runReleasePreflight(
     );
   }
   await validateComposition(checkoutRoot, input.provider, runCommand, environments);
-  const pins = await validatePackageAndPins(checkoutRoot);
-  assertLauncherOnecliCohort(pins);
+  const { packageManager, pins, sdk } = await validatePackageAndPins(checkoutRoot);
+  assertLauncherPins(pins, sdk);
   await Promise.all([
-    assertInstalledOnecliCli(input.onecliCliPath, pins.cli, checkoutRoot, environments.common, runCommand),
-    assertInstalledOnecliSdkVersion(pins.sdk),
+    assertInstalledOnecliCli(input.onecliCliPath, pins.onecliCli, checkoutRoot, environments.common, runCommand),
+    assertInstalledOnecliSdkVersion(sdk),
   ]);
   const runSetupCommand = runtime.runSetupCommand ?? defaultSetupCommand;
 
@@ -443,7 +460,7 @@ export async function runReleasePreflight(
     provider: input.provider,
     providerCapabilityDigest,
     providerCredential: input.providerCredential,
-    packageManager: pins.packageManager,
-    onecli: { gateway: pins.gateway, cli: pins.cli, sdk: pins.sdk },
+    packageManager,
+    onecli: { gateway: pins.onecliGateway, cli: pins.onecliCli, sdk },
   };
 }

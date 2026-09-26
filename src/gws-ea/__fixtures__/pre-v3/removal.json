@@ -1,0 +1,70 @@
+{
+  "schema_version": 2,
+  "instance_id": "__INSTANCE_ID__",
+  "reservation": {
+    "instance_id": "__INSTANCE_ID__",
+    "checkout_realpath": "__CHECKOUT__",
+    "release_track": "dogfood",
+    "source_remote": "https://example.test/nanoclaw.git",
+    "deployed_commit": "3e28af43e476702724501d5efc04c79127df1958",
+    "allocated_ports": {
+      "nanoclaw_webhook": 33001,
+      "onecli_app": 33101,
+      "onecli_gateway": 33201
+    },
+    "exclusive_resource_claims": {
+      "ingress": {
+        "mode": "managed-cloudflare",
+        "account_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "zone_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "zone_name": "example.test",
+        "hostname": "target.example.test",
+        "callback_url": "https://target.example.test/webhook/gchat",
+        "dns_record_id": "cccccccccccccccccccccccccccccccc"
+      },
+      "gcp_project_id": "__GCP_PROJECT__",
+      "gcp_account": "operator@example.test",
+      "gchat_service_account": "gws-ea-chat@__GCP_PROJECT__.iam.gserviceaccount.com",
+      "workspace_email": "target@example.test",
+      "onecli_project": "gws-ea-__INSTALL_ID__"
+    }
+  },
+  "started_at": "2026-09-23T18:04:11.640Z",
+  "managed_ingress": {
+    "final": true,
+    "steps": {
+      "configuration": {
+        "intended_at": "2026-09-23T18:04:12.207Z",
+        "completed_at": "2026-09-23T18:04:13.915Z"
+      },
+      "dns": {
+        "intended_at": "2026-09-23T18:04:14.002Z",
+        "completed_at": null
+      },
+      "connector": {
+        "intended_at": null,
+        "completed_at": null
+      },
+      "connections": {
+        "intended_at": null,
+        "completed_at": null
+      },
+      "tunnel": {
+        "intended_at": null,
+        "completed_at": null
+      },
+      "private_state": {
+        "intended_at": null,
+        "completed_at": null
+      }
+    }
+  },
+  "completed": {
+    "ingress": null,
+    "nanoclaw": null,
+    "gcp_project": null,
+    "onecli": null,
+    "instance_files": null,
+    "registry": null
+  }
+}
