@@ -601,9 +601,11 @@ async function removeManagedIngress(removal: ManagedIngressRemoval): Promise<voi
 }
 
 /** Stop the instance service through its manager, then its host process, containers, and image. */
-/** How often, and how many times, removal checks that a stray host it stopped has exited. */
-const HOST_EXIT_POLL_MS = 500;
-const HOST_EXIT_CHECKS = 10;
+/** How often, and how many times, removal checks that what it stopped (the launchd job, a stray host) is gone. */
+const STOPPED_POLL_MS = 500;
+const STOPPED_CHECKS = 10;
+/** `launchctl print` exits with this, and only this, when the job is not loaded. */
+const LAUNCHD_JOB_NOT_FOUND = 113;
 
 async function uninstallNanoclaw(
   reservation: InstanceReservation,
@@ -628,6 +630,13 @@ async function uninstallNanoclaw(
   const runChecked = checkedRunner(run);
   const checked = async (program: string, args: readonly string[], env: Readonly<Record<string, string>>) =>
     (await runChecked(commandFor(program, args, env))).stdout;
+  /** Whether `present` still holds once what removal stopped has had a moment to go. */
+  const stillPresent = (present: () => Promise<boolean>): Promise<boolean> =>
+    pollUntil(present, (still) => !still, {
+      intervalMs: STOPPED_POLL_MS,
+      limitMs: (STOPPED_CHECKS - 1) * STOPPED_POLL_MS,
+      sleep,
+    });
   const coordinates = (runningAsRoot: boolean) =>
     createInstanceServiceCoordinates({ installId, homeDirectory: runtime.homeDirectory, platform, runningAsRoot });
 
@@ -637,11 +646,16 @@ async function uninstallNanoclaw(
     if (uid === undefined) throw new GwsEaError('unsupported_platform', 'launchd requires a user ID');
     const env = serviceManagerEnvironment(recorded, service.manager, {});
     const domain = `gui/${uid}/${service.serviceIdentity}`;
-    // A job that is not loaded refuses bootout; `print` then decides.
+    // A job that is not loaded refuses bootout; `print` then decides. bootout returns before
+    // launchd has finished removing the job, so the job gets a moment to go.
     await execute('launchctl', ['bootout', domain], env);
-    if ((await execute('launchctl', ['print', domain], env)).outcome.exitCode === 0) {
-      throw incomplete('The NanoClaw launchd service is still loaded');
-    }
+    const loaded = await stillPresent(async () => {
+      const printed = await execute('launchctl', ['print', domain], env);
+      if (printed.outcome.exitCode === LAUNCHD_JOB_NOT_FOUND) return false;
+      if (printed.outcome.exitCode !== 0) throw commandExitError(printed.command, printed.outcome);
+      return true;
+    });
+    if (loaded) throw incomplete('The NanoClaw launchd service is still loaded');
     await rm(service.serviceDefinitionPath, { force: true });
   } else {
     for (const runningAsRoot of [false, true]) {
@@ -678,16 +692,12 @@ async function uninstallNanoclaw(
   if (killed.outcome.exitCode !== 0 && killed.outcome.exitCode !== 1)
     throw commandExitError(killed.command, killed.outcome);
   // pkill only sends SIGTERM, so a stopping host gets a moment to exit before it counts as still running.
-  const hostRunning = await pollUntil(
-    async () => {
-      const remaining = await execute('pgrep', ['-f', host], tools);
-      if (remaining.outcome.exitCode === 1) return false;
-      if (remaining.outcome.exitCode !== 0) throw commandExitError(remaining.command, remaining.outcome);
-      return true;
-    },
-    (running) => !running,
-    { intervalMs: HOST_EXIT_POLL_MS, limitMs: (HOST_EXIT_CHECKS - 1) * HOST_EXIT_POLL_MS, sleep },
-  );
+  const hostRunning = await stillPresent(async () => {
+    const remaining = await execute('pgrep', ['-f', host], tools);
+    if (remaining.outcome.exitCode === 1) return false;
+    if (remaining.outcome.exitCode !== 0) throw commandExitError(remaining.command, remaining.outcome);
+    return true;
+  });
   if (hostRunning) throw incomplete('The NanoClaw host process is still running');
 
   const { installLabel, imageTag } = coordinates(false);
