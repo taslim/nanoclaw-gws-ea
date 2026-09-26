@@ -106,7 +106,12 @@ import {
   type GcpProjectInput,
 } from './gcloud.js';
 import type { RetainedManagedIngressSetupSession } from './cloudflare-api.js';
-import { forgetAccountToken, keepAccountToken, usableKeptAccountToken } from './cloudflare-token.js';
+import {
+  forgetAccountToken,
+  forgettingRefusedToken,
+  keepAccountToken,
+  usableKeptAccountToken,
+} from './cloudflare-token.js';
 import { managedTransportResources } from './cloudflare-ingress.js';
 
 export interface ProductionProvisionOptions {
@@ -634,7 +639,7 @@ function humanPause(phase: ProvisionStepId, code: string, message: string): Prov
 /** The run's Cloudflare token session: it checks a token against the account before holding it. */
 type ManagedAccountTokenSession = Pick<
   RetainedManagedIngressSetupSession,
-  'discoverZones' | 'retainAccountToken' | 'requireAccountToken'
+  'discoverZones' | 'retainAccountToken' | 'requireAccountToken' | 'clearAccountToken'
 >;
 
 function retainedAccountToken(session: ManagedAccountTokenSession | undefined, accountId: string): string | undefined {
@@ -683,6 +688,23 @@ async function requireManagedAccountToken(
   const asked = await context.input.requestCloudflareAccountToken(accountId, reason);
   await keepAccountToken(file, asked);
   return asked;
+}
+
+/** A managed-ingress change Cloudflare refuses forgets the token, held and kept, so the next attempt asks again. */
+function forgettingRefusedTokenOn(
+  context: ProductionProvisionContext,
+  resource: StepResource<ProductionProvisionContext>,
+): StepResource<ProductionProvisionContext> {
+  const file = context.operation.paths.keptCloudflareTokenFile(context.operation.instanceId);
+  return {
+    ...resource,
+    apply: (value) =>
+      forgettingRefusedToken(
+        file,
+        () => resource.apply(value),
+        () => context.input.managedIngressSetup?.clearAccountToken(),
+      ),
+  };
 }
 
 /** Once the route is set up, no Cloudflare account token stays on disk. */
@@ -1068,15 +1090,17 @@ export function createProductionProvisionSteps(
             label: 'Publishing the secure callback…',
             liveness: { label: 'Checking the secure callback…' },
             resources: [
-              ...dependencies.managedTransportResources({
-                paths: context.operation.paths,
-                instanceId: context.operation.instanceId,
-                claim: ingress,
-                platform: input.serviceDependencies.platform,
-                webhookPort: input.runtime.allocated_ports.nanoclaw_webhook,
-                dockerEndpoint: input.runtime.docker_endpoint,
-                accountToken: (reason) => requireManagedAccountToken(context, ingress.account_id, reason),
-              }),
+              ...dependencies
+                .managedTransportResources({
+                  paths: context.operation.paths,
+                  instanceId: context.operation.instanceId,
+                  claim: ingress,
+                  platform: input.serviceDependencies.platform,
+                  webhookPort: input.runtime.allocated_ports.nanoclaw_webhook,
+                  dockerEndpoint: input.runtime.docker_endpoint,
+                  accountToken: (reason) => requireManagedAccountToken(context, ingress.account_id, reason),
+                })
+                .map((resource) => forgettingRefusedTokenOn(context, resource)),
               keptAccountTokenForgotten(context),
             ],
           },

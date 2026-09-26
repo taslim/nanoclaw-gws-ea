@@ -648,6 +648,58 @@ describe('removal from any partial state', () => {
     }
   });
 
+  it.each([
+    ['cannot see the reserved zone', { code: 'cloudflare_dns_unobservable', resource: 'cloudflare-dns' }],
+    ['is refused deleting the tunnel', { code: 'cloudflare_capability_missing' }],
+  ])('forgets a kept token that %s, so the rerun asks for another', async (failure, stopped) => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(paths, { managed: true }), {
+      started: ['materialize_checkout', 'establish_transport'],
+    });
+    await recordTunnel(paths);
+    await mkdir(paths.cloudflareRoot, { recursive: true, mode: 0o700 });
+    const kept = paths.keptCloudflareTokenFile(input.instance_id);
+    await keepAccountToken(kept, 'kept-account-token');
+    const { dependencies, cloudflare, interaction } = world(input);
+    cloudflare.tunnels = [{ id: TUNNEL_ID, name: await tunnelName(paths) }];
+    cloudflare.config = { ingress: [route(input), CATCH_ALL] };
+    const createCloudflareApi = (token: string): CloudflareApi => {
+      const api = cloudflare.api();
+      if (token !== 'kept-account-token') return api;
+      if (failure === 'cannot see the reserved zone') {
+        return {
+          ...api,
+          listActiveZones: vi.fn<CloudflareApi['listActiveZones']>(async () => [
+            {
+              zoneId: 'e'.repeat(32),
+              name: 'other.test',
+              accountId: ACCOUNT_ID,
+              accountName: 'Test',
+              status: 'active',
+            },
+          ]),
+        };
+      }
+      return {
+        ...api,
+        deleteTunnel: vi.fn<CloudflareApi['deleteTunnel']>(async () => {
+          throw new GwsEaError('cloudflare_capability_missing', 'Cloudflare refused the token');
+        }),
+      };
+    };
+
+    await expect(
+      removeAssistant(paths, input.instance_id, { ...dependencies, createCloudflareApi }),
+    ).rejects.toMatchObject(stopped);
+    await expect(stat(kept)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(interaction.requestCloudflareAccountToken).not.toHaveBeenCalled();
+
+    await removeAssistant(paths, input.instance_id, { ...dependencies, createCloudflareApi });
+    expect(interaction.requestCloudflareAccountToken).toHaveBeenCalledOnce();
+    expect(cloudflare.tunnels).toEqual([]);
+    await expectGone(paths, input);
+  });
+
   it('counts an already-removed route and an already-deleted DNS record as done', async () => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput(paths, { managed: true, dns: true }), {

@@ -1306,6 +1306,7 @@ describe('production provision step composition', () => {
           managedIngressSetup: {
             discoverZones: vi.fn(),
             retainAccountToken: vi.fn(),
+            clearAccountToken: vi.fn(),
             requireAccountToken: (accountId) => {
               if (retained === undefined) {
                 throw new GwsEaError('cloudflare_token_required', 'A fresh Cloudflare API token is required.');
@@ -1327,7 +1328,7 @@ describe('production provision step composition', () => {
         },
       }).establish_transport;
 
-      expect(step.resources.slice(0, -1)).toEqual(resources);
+      expect(step.resources.slice(0, -1)).toMatchObject(resources.map(({ name, observe }) => ({ name, observe })));
       expect(step.resources.at(-1)?.name).toBe('the Cloudflare token kept for setup');
       expect(step.liveness).toBeDefined();
       expect(transport).toMatchObject({
@@ -1356,7 +1357,8 @@ describe('production provision step composition', () => {
     const claim = reserved.exclusive_resource_claims.ingress;
     if (claim.mode !== 'managed-cloudflare') throw new Error('managed fixture');
     const kept = paths.keptCloudflareTokenFile(reserved.instance_id);
-    const accepted = new Set(['first-token', 'second-token']);
+    const accepted = new Set(['first-token', 'second-token', 'third-token']);
+    const routable = new Set(['first-token', 'third-token']);
     const asked: string[] = [];
     let answering = true;
     /** One run's token session: it holds a token only after listing its zones. */
@@ -1379,6 +1381,9 @@ describe('production provision step composition', () => {
         }),
         retainAccountToken: vi.fn((token: string) => {
           held = token;
+        }),
+        clearAccountToken: vi.fn(() => {
+          held = undefined;
         }),
         requireAccountToken: (accountId: string) => {
           if (held === undefined || accountId !== claim.account_id) {
@@ -1407,11 +1412,28 @@ describe('production provision step composition', () => {
           {
             managedTransportResources: (received) => {
               transport = received;
-              return [];
+              return [
+                {
+                  name: 'the Cloudflare route',
+                  observe: async () => ABSENT,
+                  apply: async () => {
+                    const token = await received.accountToken('Cloudflare must route the callback');
+                    if (!routable.has(token)) {
+                      throw new GwsEaError('cloudflare_capability_missing', 'Cloudflare refused the tunnel change');
+                    }
+                    return undefined;
+                  },
+                },
+              ];
             },
           },
         );
-        return { token: await transport!.accountToken('Cloudflare must route the callback'), steps, base };
+        return {
+          token: await transport!.accountToken('Cloudflare must route the callback'),
+          transport: transport!,
+          steps,
+          base,
+        };
       });
 
     // The first run asks, and keeps the answer owner-only for this create's later runs.
@@ -1435,6 +1457,17 @@ describe('production provision step composition', () => {
     await expect(run('second-token')).resolves.toMatchObject({ token: 'second-token' });
     expect(asked).toEqual(['first-token', 'second-token']);
     expect(await readFile(kept, 'utf8')).toBe('second-token');
+
+    // A token that still lists zones but that Cloudflare refuses for the route change is forgotten
+    // too, held and kept, so the same run asks again.
+    const refused = await run('third-token');
+    if (!refused) throw new Error('the instance operation is busy');
+    const route = refused.steps.establish_transport.resources[0]!;
+    await expect(route.apply(refused.base)).rejects.toMatchObject({ code: 'cloudflare_capability_missing' });
+    await expect(stat(kept)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(refused.transport.accountToken('Cloudflare must route the callback')).resolves.toBe('third-token');
+    expect(asked).toEqual(['first-token', 'second-token', 'third-token']);
+    await expect(route.apply(refused.base)).resolves.toBeUndefined();
 
     // Once the route is set up, the step's last item deletes the kept token.
     const last = await run('unused');

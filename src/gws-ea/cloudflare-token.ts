@@ -47,6 +47,27 @@ export function forgetAccountToken(file: string): Promise<void> {
 }
 
 /**
+ * Runs `work`, which uses the Cloudflare token. When Cloudflare refuses it,
+ * the kept token is forgotten, and `onRefused` drops any copy held in memory,
+ * so the next attempt asks for another instead of reusing a refused one.
+ */
+export async function forgettingRefusedToken<T>(
+  file: string,
+  work: () => Promise<T>,
+  onRefused?: () => void,
+): Promise<T> {
+  try {
+    return await work();
+  } catch (error) {
+    if (isCloudflareTokenRefusal(error)) {
+      onRefused?.();
+      await forgetAccountToken(file);
+    }
+    throw error;
+  }
+}
+
+/**
  * The kept token and the zones it lists, when Cloudflare still accepts it for
  * `accountId`. One Cloudflare refuses, or one that no longer reaches the
  * account, is forgotten, so the caller asks for a new one.

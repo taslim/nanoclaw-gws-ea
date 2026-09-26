@@ -97,7 +97,7 @@ import {
   type SharedCloudflareMetadata,
 } from './types.js';
 import { canonicalTimestamp, isRecord, requireDockerEndpoint, requirePath } from './validation.js';
-import { usableKeptAccountToken } from './cloudflare-token.js';
+import { forgetAccountToken, forgettingRefusedToken, usableKeptAccountToken } from './cloudflare-token.js';
 import type { CloudflareZoneChoice } from './create-input.js';
 
 /** Resources in teardown order; the registry entry is released after all of them. */
@@ -503,6 +503,8 @@ async function cloudflareAuthority(
     ...(renamed ? [`${claim.zone_name} is now a different zone (${renamed.zoneId}), so the reserved one is gone`] : []),
   ].join('\n');
   if (leaveDnsBehind) return { api, dnsLeftBehind: evidence };
+  // A kept token that cannot see the zone is not reused: the rerun asks for one that can.
+  await forgetAccountToken(options.keptTokenFile);
   throw new RemovalPause(
     'cloudflare-dns',
     `Cloudflare cannot see zone ${claim.zone_name}, which holds this assistant's DNS record. If the zone was deleted, the record went with it; if not, rerun with a token that can read it.`,
@@ -869,26 +871,28 @@ async function removeLocked(
           },
         }));
       }
-      await removeManagedIngress({
-        paths,
-        reservation,
-        claim,
-        api,
-        // A record left behind in a zone the token cannot see is not looked for.
-        ownTransport: provisioning.started('establish_transport') && dnsLeftBehind === undefined,
-        originHost: connectorNetworking(connector.platform).originHost,
-        connector,
-        stopConnector: async () =>
-          dependencies.stopCloudflareConnector
-            ? dependencies.stopCloudflareConnector(connector, await docker())
-            : stopCloudflareConnector(connector, { dockerEndpoint: await docker() }),
-        sleep: dependencies.sleep ?? delay,
-        recordRouteRemoved: () =>
-          record((current) => ({
-            ...current,
-            completed: { ...current.completed, 'managed-ingress': new Date().toISOString() },
-          })),
-      });
+      await forgettingRefusedToken(paths.keptCloudflareTokenFile(instanceId), () =>
+        removeManagedIngress({
+          paths,
+          reservation,
+          claim,
+          api,
+          // A record left behind in a zone the token cannot see is not looked for.
+          ownTransport: provisioning.started('establish_transport') && dnsLeftBehind === undefined,
+          originHost: connectorNetworking(connector.platform).originHost,
+          connector,
+          stopConnector: async () =>
+            dependencies.stopCloudflareConnector
+              ? dependencies.stopCloudflareConnector(connector, await docker())
+              : stopCloudflareConnector(connector, { dockerEndpoint: await docker() }),
+          sleep: dependencies.sleep ?? delay,
+          recordRouteRemoved: () =>
+            record((current) => ({
+              ...current,
+              completed: { ...current.completed, 'managed-ingress': new Date().toISOString() },
+            })),
+        }),
+      );
       return undefined;
     },
     nanoclaw: async () => {
