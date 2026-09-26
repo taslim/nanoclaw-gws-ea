@@ -800,7 +800,11 @@ function removalPreviewLines(preview: RemovalPreview): string[] {
 /** What the operator must know after removal: the project deletion, and anything left behind. */
 function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undefined): string[] {
   const project = `Google Cloud project ${preview.gcpProject}`;
-  const names: Readonly<Record<AbandonableResource, string>> = { 'gcp-project': project };
+  const names: Readonly<Record<AbandonableResource, string>> = {
+    'gcp-project': project,
+    'cloudflare-dns':
+      preview.ingress.mode === 'managed-cloudflare' ? `DNS record ${preview.ingress.hostname}` : 'DNS record',
+  };
   return [
     ...(outcome?.removed.includes('gcp-project')
       ? [`${project}: deletion requested; it stays recoverable for 30 days, then Google Cloud deletes it.`]
@@ -826,7 +830,7 @@ function printHelp(output: LineWriter): void {
   output('         [--ingress existing --endpoint <https-url>]');
   output('         [--ingress managed-cloudflare --cloudflare-zone <zone> --hostname-label <label>]');
   output('  resume --id <instance_id> [--chat-configured] [--messaging-group-id <exact-id>]');
-  output('  remove --id <instance_id> [--yes] [--abandon gcp-project]');
+  output('  remove --id <instance_id> [--yes] [--abandon gcp-project,cloudflare-dns]');
   output('  Every command: [--secrets-file <owner-only file under the config root>] [--capture-fixtures]');
   output('  Secrets: GWS_EA_PROVIDER_CREDENTIAL, GWS_EA_CLOUDFLARE_API_TOKEN (environment or --secrets-file).');
   output('  Exit codes: 0 ready, 10 paused for a person, 1 failed, 75 busy.');

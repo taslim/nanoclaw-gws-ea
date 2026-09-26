@@ -444,6 +444,63 @@ describe('removal from any partial state', () => {
     await expectGone(paths, input);
   });
 
+  it('pauses when the token cannot see the reserved zone, then leaves only its DNS record behind on request', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(paths, { managed: true, dns: true }), {
+      started: ['materialize_checkout', 'establish_transport'],
+    });
+    const ingress = input.exclusive_resource_claims.ingress;
+    if (ingress.mode !== 'managed-cloudflare') throw new Error('expected managed ingress');
+    await recordTunnel(paths);
+    await mkdir(paths.cloudflareRoot, { recursive: true, mode: 0o700 });
+    const { dependencies, cloudflare, order } = world(input);
+    cloudflare.tunnels = [{ id: TUNNEL_ID, name: await tunnelName(paths) }];
+    cloudflare.config = { ingress: [route(input), CATCH_ALL] };
+    // The domain was deleted and added again: the token works, but the reserved zone is gone.
+    const api: CloudflareApi = {
+      ...cloudflare.api(),
+      listActiveZones: vi.fn<CloudflareApi['listActiveZones']>(async () => [
+        {
+          zoneId: 'e'.repeat(32),
+          name: ingress.zone_name,
+          accountId: ACCOUNT_ID,
+          accountName: 'Test',
+          status: 'active',
+        },
+      ]),
+    };
+    const io = { out: [] as string[], err: [] as string[] };
+    const cli = (args: readonly string[]): Promise<number> =>
+      runCli(['remove', '--id', input.instance_id, '--yes', ...args], {
+        paths,
+        stdout: (line) => io.out.push(line),
+        stderr: (line) => io.err.push(line),
+        removeAssistant: (removalPaths, id, options) =>
+          removeAssistant(removalPaths, id, {
+            ...dependencies,
+            createCloudflareApi: () => api,
+            ...options,
+            interaction: dependencies.interaction,
+          }),
+      });
+
+    expect(await cli([])).toBe(10);
+    const paused = io.out.join('\n');
+    expect(paused).toContain('Paused at prerequisites');
+    expect(paused).toContain(`Cloudflare cannot see zone ${ingress.zone_name}`);
+    expect(paused).toContain(`${ingress.zone_name} is now a different zone`);
+    expect(paused).toContain(`gws-ea remove --id ${input.instance_id} --yes --abandon cloudflare-dns`);
+    expect(order).toEqual([]);
+    expect(await exists(paths.removalFile(input.instance_id))).toBe(false);
+
+    io.out.length = 0;
+    expect(await cli(['--abandon', 'cloudflare-dns'])).toBe(0);
+    expect(order).toEqual(['configuration', 'connector', 'tunnel']);
+    expect(api.listDnsRecords).not.toHaveBeenCalled();
+    expect(io.out.join('\n')).toContain(`Left behind: DNS record ${ingress.hostname}`);
+    await expectGone(paths, input);
+  });
+
   it('restores a lifted key-creation policy before it deletes the project', async () => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput(paths), {
@@ -884,7 +941,7 @@ describe('removal safety', () => {
     expect(gcloud.mutations).toEqual(['projects delete']);
   });
 
-  it('verifies authority for the exact reserved zone before recording removal', async () => {
+  it('checks the exact reserved zone before recording removal, and pauses when the token cannot see it', async () => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput(paths, { managed: true }), {
       started: ['materialize_checkout', 'establish_transport'],
@@ -897,7 +954,7 @@ describe('removal safety', () => {
 
     await expect(
       removeAssistant(paths, input.instance_id, { ...dependencies, createCloudflareApi: () => api }),
-    ).rejects.toMatchObject({ code: 'cloudflare_capability_missing' });
+    ).rejects.toMatchObject({ code: 'cloudflare_dns_unobservable', resource: 'cloudflare-dns' });
     expect(await exists(paths.removalFile(input.instance_id))).toBe(false);
     expect(api.listTunnels).not.toHaveBeenCalled();
   });

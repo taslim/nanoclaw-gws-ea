@@ -102,9 +102,17 @@ import { canonicalTimestamp, isRecord, requireDockerEndpoint, requirePath } from
 export const REMOVAL_RESOURCES = ['managed-ingress', 'nanoclaw', 'gcp-project', 'onecli', 'instance-files'] as const;
 export type RemovalResource = (typeof REMOVAL_RESOURCES)[number];
 
-/** Resources an operator may leave behind when removal cannot observe them (`--abandon`). */
-export const ABANDONABLE_RESOURCES = ['gcp-project'] as const;
+/**
+ * What an operator may leave behind when removal cannot observe it (`--abandon`):
+ * the Google Cloud project, or the assistant's DNS record in a Cloudflare zone
+ * the token can no longer see (a deleted zone takes its records with it).
+ */
+export const ABANDONABLE_RESOURCES = ['gcp-project', 'cloudflare-dns'] as const;
 export type AbandonableResource = (typeof ABANDONABLE_RESOURCES)[number];
+
+function isAbandonable(resource: RemovalResource): resource is RemovalResource & AbandonableResource {
+  return ABANDONABLE_RESOURCES.some((candidate) => candidate === resource);
+}
 
 const RECEIPT_SCHEMA_VERSION = 3 as const;
 const INVALID_RECORD = 'invalid_runtime_config';
@@ -132,7 +140,7 @@ interface RemovalReceipt {
   readonly reservation: InstanceReservation;
   readonly started_at: string;
   readonly completed: Readonly<Partial<Record<RemovalResource, string>>>;
-  readonly abandoned: Readonly<Partial<Record<RemovalResource, Evidence>>>;
+  readonly abandoned: Readonly<Partial<Record<AbandonableResource, Evidence>>>;
   /** A key-creation policy `provision_gcp` lifted that Google refused to restore. */
   readonly key_policy_unrestored?: Evidence;
 }
@@ -267,7 +275,7 @@ async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promis
       reservation,
       started_at: canonicalTimestamp(raw.started_at) ?? new Date().toISOString(),
       completed: current ? entries(REMOVAL_RESOURCES, raw.completed, canonicalTimestamp) : {},
-      abandoned: current ? entries<RemovalResource, Evidence>(ABANDONABLE_RESOURCES, raw.abandoned, evidenceOf) : {},
+      abandoned: current ? entries(ABANDONABLE_RESOURCES, raw.abandoned, evidenceOf) : {},
       ...(unrestored ? { key_policy_unrestored: unrestored } : {}),
     };
   } catch (error) {
@@ -431,11 +439,24 @@ async function waitForTunnelConnectionsToClear(
 }
 
 /** The account token, proven against the exact reserved zone before anything changes. */
+interface CloudflareAuthority {
+  readonly api: CloudflareApi;
+  /** Set when the token cannot see the reserved zone and the operator leaves its DNS record behind. */
+  readonly dnsLeftBehind?: string;
+}
+
+/**
+ * A token that works, checked against the reserved zone. A zone it cannot see
+ * pauses removal: Cloudflare answers the same for a deleted zone, whose
+ * records went with it, and for a token without access, whose zone still
+ * holds the record, so only the operator can say which it is.
+ */
 async function cloudflareAuthority(
   claim: ManagedCloudflareIngressClaim,
   interaction: RemovalInteraction,
   createApi: (accountToken: string) => CloudflareApi,
-): Promise<CloudflareApi> {
+  leaveDnsBehind: boolean,
+): Promise<CloudflareAuthority> {
   const token = await interaction.requestCloudflareAccountToken({
     accountId: claim.account_id,
     reason: `Removing managed callback ${claim.callback_url} requires temporary Cloudflare authorization.`,
@@ -444,7 +465,7 @@ async function cloudflareAuthority(
   // Listing zones proves the token, account-owned tokens included.
   const zones = await api.listActiveZones();
   if (
-    !zones.some(
+    zones.some(
       (zone) =>
         zone.accountId === claim.account_id &&
         zone.zoneId === claim.zone_id &&
@@ -452,12 +473,21 @@ async function cloudflareAuthority(
         zone.status === 'active',
     )
   ) {
-    throw new GwsEaError(
-      'cloudflare_capability_missing',
-      `Cloudflare authorization cannot access reserved active zone ${claim.zone_name}.`,
-    );
+    return { api };
   }
-  return api;
+  const inAccount = zones.filter((zone) => zone.accountId === claim.account_id);
+  const renamed = inAccount.find((zone) => zone.name === claim.zone_name);
+  const evidence = [
+    `Reserved zone: ${claim.zone_name} (${claim.zone_id}) in account ${claim.account_id}`,
+    `Active zones this token can see in that account: ${inAccount.map((zone) => zone.name).join(', ') || 'none'}`,
+    ...(renamed ? [`${claim.zone_name} is now a different zone (${renamed.zoneId}), so the reserved one is gone`] : []),
+  ].join('\n');
+  if (leaveDnsBehind) return { api, dnsLeftBehind: evidence };
+  throw new RemovalPause(
+    'cloudflare-dns',
+    `Cloudflare cannot see zone ${claim.zone_name}, which holds this assistant's DNS record. If the zone was deleted, the record went with it; if not, rerun with a token that can read it.`,
+    evidence,
+  );
 }
 
 interface ManagedIngressRemoval {
@@ -749,7 +779,8 @@ async function removeLocked(
   };
   const pending = new Set(
     REMOVAL_RESOURCES.filter(
-      (resource) => owned[resource] && !receipt.completed[resource] && !receipt.abandoned[resource],
+      (resource) =>
+        owned[resource] && !receipt.completed[resource] && !(isAbandonable(resource) && receipt.abandoned[resource]),
     ),
   );
 
@@ -777,6 +808,7 @@ async function removeLocked(
       claim,
       interaction,
       dependencies.createCloudflareApi ?? ((accountToken) => createCloudflareApi({ accountToken })),
+      abandon.has('cloudflare-dns') || receipt.abandoned['cloudflare-dns'] !== undefined,
     );
   });
 
@@ -804,12 +836,23 @@ async function removeLocked(
     'managed-ingress': async () => {
       if (!claim) return undefined;
       const connector = createCloudflareConnectorLayout({ cloudflareRoot: paths.cloudflareRoot, platform });
+      const { api, dnsLeftBehind } = await cloudflare();
+      if (dnsLeftBehind !== undefined) {
+        await record((current) => ({
+          ...current,
+          abandoned: {
+            ...current.abandoned,
+            'cloudflare-dns': { at: new Date().toISOString(), evidence: dnsLeftBehind },
+          },
+        }));
+      }
       await removeManagedIngress({
         paths,
         reservation,
         claim,
-        api: await cloudflare(),
-        ownTransport: provisioning.started('establish_transport'),
+        api,
+        // A record left behind in a zone the token cannot see is not looked for.
+        ownTransport: provisioning.started('establish_transport') && dnsLeftBehind === undefined,
         originHost: dependencies.originHost ?? connectorNetworking(connector.platform).originHost,
         connector,
         stopConnector: async () =>
@@ -875,7 +918,7 @@ async function removeLocked(
     if (!pending.has(resource)) continue;
     const abandoned = await runStep(reporter, RESOURCE_STEPS[resource], removals[resource]);
     await record((current) =>
-      abandoned
+      abandoned && isAbandonable(resource)
         ? { ...current, abandoned: { ...current.abandoned, [resource]: abandoned } }
         : { ...current, completed: { ...current.completed, [resource]: new Date().toISOString() } },
     );
