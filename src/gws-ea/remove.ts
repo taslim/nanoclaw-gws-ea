@@ -604,6 +604,8 @@ async function removeManagedIngress(removal: ManagedIngressRemoval): Promise<voi
 /** How often, and how many times, removal checks that what it stopped (the launchd job, a stray host) is gone. */
 const STOPPED_POLL_MS = 500;
 const STOPPED_CHECKS = 10;
+/** `launchctl print` exits with this, and only this, when the job is not loaded. */
+const LAUNCHD_JOB_NOT_FOUND = 113;
 
 async function uninstallNanoclaw(
   reservation: InstanceReservation,
@@ -647,9 +649,13 @@ async function uninstallNanoclaw(
     // A job that is not loaded refuses bootout; `print` then decides. bootout returns before
     // launchd has finished removing the job, so the job gets a moment to go.
     await execute('launchctl', ['bootout', domain], env);
-    if (await stillPresent(async () => (await execute('launchctl', ['print', domain], env)).outcome.exitCode === 0)) {
-      throw incomplete('The NanoClaw launchd service is still loaded');
-    }
+    const loaded = await stillPresent(async () => {
+      const printed = await execute('launchctl', ['print', domain], env);
+      if (printed.outcome.exitCode === LAUNCHD_JOB_NOT_FOUND) return false;
+      if (printed.outcome.exitCode !== 0) throw commandExitError(printed.command, printed.outcome);
+      return true;
+    });
+    if (loaded) throw incomplete('The NanoClaw launchd service is still loaded');
     await rm(service.serviceDefinitionPath, { force: true });
   } else {
     for (const runningAsRoot of [false, true]) {

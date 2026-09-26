@@ -144,6 +144,9 @@ function failed(stderr: string): SanitizedCommandOutcome {
   return { stdout: '', stderr, exitCode: 1 };
 }
 
+/** What `launchctl print` answers for a job that is not loaded. */
+const NOT_LOADED: SanitizedCommandOutcome = { stdout: '', stderr: 'Could not find service', exitCode: 113 };
+
 /** One Google Cloud project as gcloud reports it to the reserved account. */
 class FakeGcloud {
   project: { labels: Record<string, string>; lifecycleState: string } | undefined;
@@ -1105,7 +1108,7 @@ describe('removal safety', () => {
         commands.push(command);
         if (['pkill', 'pgrep'].includes(command.command)) return failed('');
         if (command.args.includes('is-active')) return { stdout: 'inactive\n', stderr: '', exitCode: 3 };
-        if (command.args[0] === 'print') return { stdout: '', stderr: 'Could not find service', exitCode: 113 };
+        if (command.args[0] === 'print') return NOT_LOADED;
         return ok();
       };
       const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
@@ -1168,45 +1171,74 @@ describe('removal safety', () => {
       'the launchd job it booted out',
       'macos',
       (command: SanitizedCommand) => command.command === 'launchctl' && command.args[0] === 'print',
+      NOT_LOADED,
       'launchd service is still loaded',
     ],
     [
       'a stray NanoClaw host it stopped',
       'linux',
       (command: SanitizedCommand) => command.command === 'pgrep',
+      failed(''),
       'host process is still running',
     ],
-  ] as const)('waits for %s to go, and names one that never does', async (_what, platform, probed, stillThere) => {
-    for (const goneAfter of [2, Infinity]) {
-      const paths = await testPaths();
-      const input = await reserve(paths, reservationInput(paths), {
-        started: ['materialize_checkout', 'start_nanoclaw'],
-      });
-      let checks = 0;
-      const runCommand = async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> => {
-        if (probed(command)) {
-          checks += 1;
-          return checks > goneAfter ? failed('') : ok();
-        }
-        return command.command === 'pgrep' ? failed('') : ok();
-      };
-      const sleep = vi.fn(async () => undefined);
-      const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
-
-      const removal = removeAssistant(paths, input.instance_id, { ...dependencies, platform, runCommand, sleep });
-      if (goneAfter === Infinity) {
-        await expect(removal).rejects.toMatchObject({
-          code: 'nanoclaw_removal_incomplete',
-          message: expect.stringContaining(stillThere),
+  ] as const)(
+    'waits for %s to go, and names one that never does',
+    async (_what, platform, probed, gone, stillThere) => {
+      for (const goneAfter of [2, Infinity]) {
+        const paths = await testPaths();
+        const input = await reserve(paths, reservationInput(paths), {
+          started: ['materialize_checkout', 'start_nanoclaw'],
         });
-        expect(checks).toBe(10);
-      } else {
-        await removal;
-        expect(checks).toBe(3);
-        await expectGone(paths, input);
+        let checks = 0;
+        const runCommand = async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> => {
+          if (probed(command)) {
+            checks += 1;
+            return checks > goneAfter ? gone : ok();
+          }
+          return command.command === 'pgrep' ? failed('') : ok();
+        };
+        const sleep = vi.fn(async () => undefined);
+        const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
+
+        const removal = removeAssistant(paths, input.instance_id, { ...dependencies, platform, runCommand, sleep });
+        if (goneAfter === Infinity) {
+          await expect(removal).rejects.toMatchObject({
+            code: 'nanoclaw_removal_incomplete',
+            message: expect.stringContaining(stillThere),
+          });
+          expect(checks).toBe(10);
+        } else {
+          await removal;
+          expect(checks).toBe(3);
+          await expectGone(paths, input);
+        }
+        expect(sleep).toHaveBeenCalledTimes(checks - 1);
       }
-      expect(sleep).toHaveBeenCalledTimes(checks - 1);
-    }
+    },
+  );
+
+  it('stops, keeping the launchd definition, when launchctl print fails for another reason', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(paths), {
+      started: ['materialize_checkout', 'start_nanoclaw'],
+    });
+    const home = path.join(paths.stateRoot, 'home');
+    await writePrivate(path.join(input.checkout_realpath, 'data', 'gws-ea', 'runtime.json'), {
+      home_directory: home,
+      docker_endpoint: DOCKER,
+    });
+    const names = getInstallScopedNames(input.instance_id.replaceAll('-', ''));
+    const definition = path.join(home, 'Library', 'LaunchAgents', `${names.launchdLabel}.plist`);
+    await mkdir(path.dirname(definition), { recursive: true });
+    await writeFile(definition, 'plist', { mode: 0o600 });
+    const runCommand = async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> =>
+      command.args[0] === 'print' ? { stdout: '', stderr: 'Bad request.', exitCode: 5 } : ok();
+    const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
+
+    await expect(
+      removeAssistant(paths, input.instance_id, { ...dependencies, platform: 'macos', runCommand }),
+    ).rejects.toMatchObject({ code: 'command_failed' });
+    expect(await exists(definition)).toBe(true);
   });
 });
 
