@@ -56,6 +56,24 @@ export interface OnecliInstallDependencies {
   readonly arch?: string;
 }
 
+/** The archive's bytes, read no further than `MAX_ARCHIVE_BYTES`. */
+async function archiveBytes(response: Response, archive: string): Promise<Buffer> {
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  const reader = response.body?.getReader();
+  while (reader) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_ARCHIVE_BYTES) {
+      await reader.cancel();
+      throw new GwsEaError('onecli_download_failed', `${archive} is larger than any OneCLI CLI release`);
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks);
+}
+
 function releaseTarget(platform: NodeJS.Platform, arch: string): OnecliCliTarget | undefined {
   const system = platform === 'darwin' ? 'darwin' : platform === 'linux' ? 'linux' : undefined;
   const machine = arch === 'x64' ? 'amd64' : arch === 'arm64' ? 'arm64' : undefined;
@@ -87,10 +105,7 @@ export async function ensurePinnedOnecliCli(
   if (!response.ok) {
     throw new GwsEaError('onecli_download_failed', `Downloading ${url} failed with HTTP ${response.status}`);
   }
-  const bytes = Buffer.from(await response.arrayBuffer());
-  if (bytes.length > MAX_ARCHIVE_BYTES) {
-    throw new GwsEaError('onecli_download_failed', `${archive} is larger than any OneCLI CLI release`);
-  }
+  const bytes = await archiveBytes(response, archive);
   const digest = createHash('sha256').update(bytes).digest('hex');
   if (digest !== pin.digests[target]) {
     throw new GwsEaError(

@@ -103,7 +103,7 @@ describe("gws-ea's own OneCLI CLI", () => {
     await expect(stat(path.dirname(paths.onecliCliFile('2.2.5')))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('reports a failed download and a machine without a build', async () => {
+  it('reports a failed download, stops reading one larger than any release, and refuses a machine without a build', async () => {
     const paths = await testPaths();
     await expect(
       ensurePinnedOnecliCli(paths, pinFor('2.2.5', '0'.repeat(64)), {
@@ -112,6 +112,24 @@ describe("gws-ea's own OneCLI CLI", () => {
         arch: 'x64',
       }),
     ).rejects.toMatchObject({ code: 'onecli_download_failed', message: expect.stringContaining('HTTP 404') });
+
+    // An endless body is refused as soon as it passes the largest release, not buffered first.
+    const chunk = new Uint8Array(1024 * 1024);
+    let served = 0;
+    const endless = new ReadableStream<Uint8Array>({
+      pull: (controller) => {
+        served += 1;
+        controller.enqueue(chunk);
+      },
+    });
+    await expect(
+      ensurePinnedOnecliCli(paths, pinFor('2.2.5', '0'.repeat(64)), {
+        fetch: async () => new Response(endless),
+        platform: 'darwin',
+        arch: 'arm64',
+      }),
+    ).rejects.toMatchObject({ code: 'onecli_download_failed', message: expect.stringContaining('larger than') });
+    expect(served).toBeLessThan(70);
     const fetch = vi.fn();
     await expect(
       ensurePinnedOnecliCli(paths, pinFor('2.2.5', '0'.repeat(64)), { fetch, platform: 'win32', arch: 'x64' }),
