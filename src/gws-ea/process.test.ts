@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { chmod, copyFile, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -541,7 +541,7 @@ describe('GWS-EA persisted executables', () => {
 
   it('refuses a persisted node inside the control-plane checkout or an instance checkout', async () => {
     const inRepository = await temporaryRoot('checkout-node', process.cwd());
-    await copyFile(NODE, path.join(inRepository, 'node'));
+    await writeFile(path.join(inRepository, 'node'), '#!/bin/sh\n');
     await chmod(path.join(inRepository, 'node'), 0o755);
     await expect(resolvePersistedExecutable(path.join(inRepository, 'node'))).rejects.toMatchObject({
       code: 'untrusted_executable',
