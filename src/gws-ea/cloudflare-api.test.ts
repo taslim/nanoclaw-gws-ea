@@ -354,7 +354,7 @@ describe('Cloudflare REST readers', () => {
 });
 
 describe('Cloudflare token authority', () => {
-  it('proves an account-owned token by listing zones, with no verify call', async () => {
+  it('proves an account-owned token by listing zones, with no verify call, and holds only a proven token', async () => {
     const paths: string[] = [];
     const fetch = vi.fn<typeof globalThis.fetch>(async (input) => {
       const url = new URL(String(input));
@@ -367,8 +367,11 @@ describe('Cloudflare token authority', () => {
       clientFactory: (accountToken) => createCloudflareApi({ accountToken, fetch, baseUrl: BASE_URL }),
     });
 
+    // A token is held for the run only after it listed its zones, and only that token.
+    expect(() => session.retainAccountToken(TOKEN)).toThrow(/must list its zones/u);
     await expect(session.discoverZones(TOKEN)).resolves.toHaveLength(1);
     expect(paths).toEqual(['/client/v4/zones']);
+    expect(() => session.retainAccountToken('another-token')).toThrow(/must list its zones/u);
     session.retainAccountToken(TOKEN);
     expect(session.requireAccountToken(ACCOUNT_ID)).toBe(TOKEN);
     session.clearAccountToken();

@@ -60,11 +60,20 @@ describe('public fetch', () => {
     expect(seen).toHaveLength(2);
   });
 
-  it('fails as fetch does: ENOTFOUND when public DNS has no address, TimeoutError when nothing answers', async () => {
+  it('fails as fetch does: ENOTFOUND when public DNS has no address, a refused connection, TimeoutError when nothing answers', async () => {
     const fetch = createPublicFetch(publicDns('callback.test'));
     await expect(fetch('http://missing.test/webhook/gchat')).rejects.toMatchObject({
       name: 'TypeError',
       cause: { code: 'ENOTFOUND' },
+    });
+
+    const closed = createServer();
+    await new Promise<void>((resolve) => closed.listen(0, '127.0.0.1', resolve));
+    const { port: closedPort } = closed.address() as AddressInfo;
+    await new Promise<void>((resolve) => closed.close(() => resolve()));
+    await expect(fetch(`http://callback.test:${closedPort}/webhook/gchat`)).rejects.toMatchObject({
+      name: 'TypeError',
+      cause: { code: 'ECONNREFUSED' },
     });
 
     const { port } = await server(() => undefined);

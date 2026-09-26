@@ -588,6 +588,41 @@ describe('GWS-EA unattended create input', () => {
   });
 
   it.each([
+    ['no active zone', [], 'cloudflare_zone_required'],
+    [
+      'the same zone twice',
+      [
+        {
+          accountId: 'a'.repeat(32),
+          accountName: 'A',
+          zoneId: 'b'.repeat(32),
+          name: 'example.com',
+          status: 'active' as const,
+        },
+        {
+          accountId: 'a'.repeat(32),
+          accountName: 'A',
+          zoneId: 'b'.repeat(32),
+          name: 'example.com',
+          status: 'active' as const,
+        },
+      ],
+      'invalid_cloudflare_zone',
+    ],
+  ])('refuses a token whose zones show %s, before choosing one', async (_label, zones, code) => {
+    const { endpoint: _endpoint, ...base } = FLAGS;
+    const retainAccountToken = vi.fn();
+    await expect(
+      unattended(
+        { ...base, ingress: 'managed-cloudflare', 'cloudflare-zone': 'example.com', 'hostname-label': 'aya' },
+        { get: (name) => (name === 'cloudflareAccountToken' ? 'supplied-cloudflare-token' : undefined) },
+        { managedIngressSetup: { discoverZones: async () => zones, retainAccountToken, clearAccountToken: vi.fn() } },
+      ),
+    ).rejects.toMatchObject({ code });
+    expect(retainAccountToken).not.toHaveBeenCalled();
+  });
+
+  it.each([
     [true, 'This Docker runs rootless.'],
     [undefined, 'Docker did not say whether it runs rootless.'],
   ])(
