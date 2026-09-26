@@ -310,10 +310,13 @@ async function collectIngress(source: InputSource, assistantFirstName: string): 
     return { mode, endpointUrl: validateExistingGchatEndpoint(endpointUrl) };
   }
 
-  if (source.context.prerequisites.rootlessDocker) {
+  const { rootlessDocker } = source.context.prerequisites;
+  if (rootlessDocker !== false) {
     throw new GwsEaError(
       'managed_ingress_unsupported',
-      'Managed Cloudflare ingress needs rootful Docker on Linux: its connector reaches this assistant on 127.0.0.1, which rootless Docker cannot reach. Use rootful Docker, or pass --endpoint with an existing HTTPS Google Chat endpoint.',
+      `Managed Cloudflare ingress needs rootful Docker on Linux: its connector reaches this assistant on 127.0.0.1, which rootless Docker cannot reach. ${
+        rootlessDocker ? 'This Docker runs rootless.' : 'Docker did not say whether it runs rootless.'
+      } Use rootful Docker, or pass --endpoint with an existing HTTPS Google Chat endpoint.`,
     );
   }
   const session = source.context.managedIngressSetup;

@@ -587,21 +587,30 @@ describe('GWS-EA unattended create input', () => {
     });
   });
 
-  it('refuses managed ingress on rootless Docker before asking Cloudflare, naming --endpoint', async () => {
-    const { endpoint: _endpoint, ...base } = FLAGS;
-    const discoverZones = vi.fn();
-    await expect(
-      unattended(
-        { ...base, ingress: 'managed-cloudflare', 'cloudflare-zone': 'example.com', 'hostname-label': 'aya' },
-        { get: (name) => (name === 'cloudflareAccountToken' ? 'supplied-cloudflare-token' : undefined) },
-        {
-          prerequisites: { ...prerequisites, platform: 'linux', rootlessDocker: true },
-          managedIngressSetup: { discoverZones, retainAccountToken: vi.fn(), clearAccountToken: vi.fn() },
-        },
-      ),
-    ).rejects.toMatchObject({ code: 'managed_ingress_unsupported', message: expect.stringContaining('--endpoint') });
-    expect(discoverZones).not.toHaveBeenCalled();
-  });
+  it.each([
+    [true, 'This Docker runs rootless.'],
+    [undefined, 'Docker did not say whether it runs rootless.'],
+  ])(
+    'refuses managed ingress unless Linux Docker is known rootful, before asking Cloudflare (rootless: %s)',
+    async (rootlessDocker, reason) => {
+      const { endpoint: _endpoint, ...base } = FLAGS;
+      const discoverZones = vi.fn();
+      await expect(
+        unattended(
+          { ...base, ingress: 'managed-cloudflare', 'cloudflare-zone': 'example.com', 'hostname-label': 'aya' },
+          { get: (name) => (name === 'cloudflareAccountToken' ? 'supplied-cloudflare-token' : undefined) },
+          {
+            prerequisites: { ...prerequisites, platform: 'linux', rootlessDocker },
+            managedIngressSetup: { discoverZones, retainAccountToken: vi.fn(), clearAccountToken: vi.fn() },
+          },
+        ),
+      ).rejects.toMatchObject({
+        code: 'managed_ingress_unsupported',
+        message: expect.stringMatching(new RegExp(`${reason.replaceAll('.', '\\.')} .*--endpoint`, 'u')),
+      });
+      expect(discoverZones).not.toHaveBeenCalled();
+    },
+  );
 
   it('requires --provider only when more than one provider is composed', async () => {
     const providers = [provider('claude', 'Claude'), provider('codex', 'Codex')];
