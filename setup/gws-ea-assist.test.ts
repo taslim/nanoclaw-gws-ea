@@ -8,7 +8,7 @@ import type { FailureReport } from '../src/gws-ea/cli.js';
 import type { SanitizedCommand } from '../src/gws-ea/process.js';
 import { registerSecret } from '../src/gws-ea/redact.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
-import { CLAUDE_DIAGNOSIS_ARGS, offerDiagnosis, type DiagnosisUi } from './gws-ea-assist.js';
+import { offerDiagnosis, type DiagnosisUi } from './gws-ea-assist.js';
 
 const roots: string[] = [];
 
@@ -56,16 +56,6 @@ function ui(answer = true): DiagnosisUi & { readonly notes: Array<[string, strin
 }
 
 describe('GWS-EA failure diagnosis', () => {
-  it('is omitted without a TTY', async () => {
-    const { report } = await failure();
-    const prompts = ui();
-    const runClaude = vi.fn();
-
-    expect(await offerDiagnosis(report, { interactive: false, ui: prompts, runClaude })).toBe('skipped');
-    expect(prompts.confirm).not.toHaveBeenCalled();
-    expect(runClaude).not.toHaveBeenCalled();
-  });
-
   it('is omitted when claude is not installed', async () => {
     const { report } = await failure();
     const prompts = ui();
@@ -73,7 +63,6 @@ describe('GWS-EA failure diagnosis', () => {
 
     expect(
       await offerDiagnosis(report, {
-        interactive: true,
         ui: prompts,
         runClaude,
         locateClaude: async () => {
@@ -92,7 +81,6 @@ describe('GWS-EA failure diagnosis', () => {
 
     expect(
       await offerDiagnosis(report, {
-        interactive: true,
         ui: ui(false),
         runClaude,
         locateClaude: async () => '/usr/local/bin/claude',
@@ -113,7 +101,6 @@ describe('GWS-EA failure diagnosis', () => {
     });
 
     const outcome = await offerDiagnosis(report, {
-      interactive: true,
       ui: prompts,
       locateClaude: async () => '/usr/local/bin/claude',
       ambient: {
@@ -157,9 +144,15 @@ describe('GWS-EA failure diagnosis', () => {
     expect(commands).toHaveLength(1);
     const command = commands[0]!;
     expect(command.command).toBe('/usr/local/bin/claude');
-    expect(command.args).toEqual(CLAUDE_DIAGNOSIS_ARGS);
     expect(command.args).toEqual(
-      expect.arrayContaining(['-p', '--tools', '', '--strict-mcp-config', '--no-session-persistence']),
+      expect.arrayContaining([
+        '-p',
+        '--tools',
+        '',
+        '--strict-mcp-config',
+        '--no-session-persistence',
+        '--disable-slash-commands',
+      ]),
     );
     expect(command.args[command.args.indexOf('--mcp-config') + 1]).toBe('{"mcpServers":{}}');
     expect(command.args).not.toEqual(expect.arrayContaining(['--resume']));
@@ -187,7 +180,6 @@ describe('GWS-EA failure diagnosis', () => {
 
     expect(
       await offerDiagnosis(report, {
-        interactive: true,
         ui: prompts,
         locateClaude: async () => '/usr/local/bin/claude',
         runClaude: async () => ({
@@ -210,7 +202,6 @@ describe('GWS-EA failure diagnosis', () => {
 
     expect(
       await offerDiagnosis(report, {
-        interactive: true,
         ui: prompts,
         locateClaude: async () => '/usr/local/bin/claude',
         runClaude: async () => ({ exitCode: 1, stdout: '', stderr: 'Not logged in' }),

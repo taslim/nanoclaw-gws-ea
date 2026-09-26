@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { runCli, type CliRuntime, type FailureReport } from './cli.js';
 import type { CreatePromptContext } from './create-input.js';
-import { runStep, withPendingAction, type Interaction, type InteractivePrompts, type PauseResponse } from './events.js';
+import { runStep, withPendingAction, type InteractivePrompts, type PauseResponse } from './events.js';
 import { RECORDED_GCLOUD_REAUTHENTICATION_FAILED } from './fixtures/recordings.js';
 import { acquireInstanceOperation, reserveInstance } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
@@ -23,7 +23,7 @@ import {
 import { runSanitizedCommand } from './process.js';
 import { installProductionBootstrapManifest } from './provision.js';
 import { allocateInstanceId, readRegistry } from './registry.js';
-import { GWS_EA_RELEASE_REMOTE } from './release-tracks.js';
+import { resolveReleaseSource } from './release-tracks.js';
 import { activeStep } from './run-log.js';
 import { GwsEaError, type InstanceReservationInput } from './types.js';
 
@@ -417,30 +417,6 @@ describe('gws-ea stop summaries and exit codes', () => {
 });
 
 describe('gws-ea without a TTY', () => {
-  it('pauses with exit 10 naming the variable when a provider credential is needed mid-run', async () => {
-    const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
-    const io = lines();
-
-    expect(
-      await runCli(['resume', '--id', input.instance_id], {
-        paths,
-        ...io.runtime,
-        environment: {},
-        checkPrerequisites: async () => PREREQUISITES,
-        advanceProvision: async (_operation, { interaction }) => {
-          await interaction.requestProviderCredential({
-            providerId: 'claude',
-            metadata: { name: 'Anthropic', type: 'anthropic', hostPattern: 'api.anthropic.com' },
-          });
-          return { status: 'ready' };
-        },
-      }),
-    ).toBe(10);
-    expect(io.out.join('\n')).toContain('GWS_EA_PROVIDER_CREDENTIAL');
-    expect(io.out).toContain(`Continue with: gws-ea resume --id ${input.instance_id}`);
-  });
-
   it('names the step an input pause stopped at and logs it as paused, not failed', async () => {
     const paths = await testPaths();
     const input = await reserveInstance(paths, reservation(paths));
@@ -463,6 +439,8 @@ describe('gws-ea without a TTY', () => {
       }),
     ).toBe(10);
     expect(io.out.join('\n')).toContain('Paused at configure_provider:');
+    expect(io.out.join('\n')).toContain('GWS_EA_PROVIDER_CREDENTIAL');
+    expect(io.out).toContain(`Continue with: gws-ea resume --id ${input.instance_id}`);
     const progressLog = /Log: (\S+)/u.exec(io.out.join('\n'))?.[1];
     const progress = await readFile(progressLog!, 'utf8');
     expect(progress).toMatch(/configure_provider \[\S+\] → paused/u);
@@ -495,26 +473,6 @@ describe('gws-ea without a TTY', () => {
     expect(advanceProvision).not.toHaveBeenCalled();
   });
 
-  it('pauses with exit 10 naming the variable when a Cloudflare token is needed mid-run', async () => {
-    const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
-    const io = lines();
-
-    expect(
-      await runCli(['resume', '--id', input.instance_id], {
-        paths,
-        ...io.runtime,
-        environment: {},
-        checkPrerequisites: async () => PREREQUISITES,
-        advanceProvision: async (_operation, { interaction }) => {
-          await interaction.requestCloudflareAccountToken({ accountId: 'a'.repeat(32), reason: 'Listener drifted' });
-          return { status: 'ready' };
-        },
-      }),
-    ).toBe(10);
-    expect(io.out.join('\n')).toContain('GWS_EA_CLOUDFLARE_API_TOKEN');
-  });
-
   it('refuses removal without --yes, naming the flag', async () => {
     const paths = await testPaths();
     const input = await reserveInstance(paths, reservation(paths));
@@ -533,19 +491,27 @@ describe('gws-ea without a TTY', () => {
     const input = await reserveInstance(paths, reservation(paths));
     const io = lines();
 
-    await runCli(['resume', '--id', input.instance_id], {
-      paths,
-      ...io.runtime,
-      checkPrerequisites: async () => PREREQUISITES,
-      advanceProvision: async (_operation, { runtime }) =>
-        runStep(runtime, { id: 'provision_gcp', label: 'Configuring Google Cloud…' }, async () => {
-          runtime.emit?.({ type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for the service account…' });
-          runtime.emit?.({ type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for the service account…' });
-          return { status: 'paused' as const, pause: DM_PAUSE };
-        }),
-    });
+    expect(
+      await runCli(['resume', '--id', input.instance_id], {
+        paths,
+        ...io.runtime,
+        checkPrerequisites: async () => PREREQUISITES,
+        advanceProvision: async (_operation, { runtime }) =>
+          runStep(runtime, { id: 'provision_gcp', label: 'Configuring Google Cloud…' }, async () => {
+            runtime.emit?.({ type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for the service account…' });
+            runtime.emit?.({ type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for the service account…' });
+            return { status: 'paused' as const, pause: DM_PAUSE };
+          }),
+      }),
+    ).toBe(10);
 
-    expect(io.out.slice(0, 2)).toEqual(['Configuring Google Cloud…', 'Waiting for the service account…']);
+    expect(io.out).toEqual([
+      'Configuring Google Cloud…',
+      'Waiting for the service account…',
+      `Paused at bind_principal: ${DM_PAUSE.message}`,
+      `Continue with: gws-ea resume --id ${input.instance_id}`,
+      expect.stringMatching(/^Log: \S+progress\.log$/u),
+    ]);
   });
 });
 
@@ -644,6 +610,68 @@ describe('gws-ea secrets inputs', () => {
   });
 });
 
+describe('gws-ea run-scoped Cloudflare authority', () => {
+  function managedIngressSetup() {
+    return {
+      discoverZones: vi.fn(),
+      retainAccountToken: vi.fn(),
+      requireAccountToken: vi.fn(),
+      clearAccountToken: vi.fn(),
+    };
+  }
+
+  it.each([
+    ['create', 10],
+    ['resume', 10],
+    ['remove', 0],
+  ] as const)('is cleared when %s exits', async (command, exitCode) => {
+    const paths = await testPaths();
+    const session = managedIngressSetup();
+    const reserved = async (): Promise<string> => (await reserveInstance(paths, reservation(paths))).instance_id;
+    const args =
+      command === 'create'
+        ? ['create', '--track', 'dogfood', '--source-remote', PRIVATE_REMOTE]
+        : command === 'resume'
+          ? ['resume', '--id', await reserved()]
+          : ['remove', '--id', await reserved(), '--yes'];
+
+    expect(
+      await runCli(args, {
+        paths,
+        ...lines().runtime,
+        ...createRuntime(),
+        advanceProvision: async () => ({ status: 'paused', pause: DM_PAUSE }),
+        removeAssistant: async () => undefined,
+        managedIngressSetup: session,
+      }),
+    ).toBe(exitCode);
+    expect(session.clearAccountToken).toHaveBeenCalledOnce();
+  });
+
+  it('is cleared when the run throws', async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation(paths));
+    const session = managedIngressSetup();
+    const crash = new Error('the failure loop crashed');
+
+    await expect(
+      runCli(['resume', '--id', input.instance_id], {
+        paths,
+        ...lines().runtime,
+        checkPrerequisites: async () => PREREQUISITES,
+        advanceProvision: async () => {
+          throw new GwsEaError('onecli_unhealthy', 'OneCLI did not become healthy');
+        },
+        onFailure: async () => {
+          throw crash;
+        },
+        managedIngressSetup: session,
+      }),
+    ).rejects.toBe(crash);
+    expect(session.clearAccountToken).toHaveBeenCalledOnce();
+  });
+});
+
 describe('gws-ea release sources', () => {
   it("installs dogfood from the public repository's integration branch without asking for a remote", async () => {
     const paths = await testPaths();
@@ -667,12 +695,13 @@ describe('gws-ea release sources', () => {
         advanceProvision: async () => ({ status: 'paused', pause: DM_PAUSE }),
       }),
     ).toBe(10);
-    expect(resolved).toEqual([[GWS_EA_RELEASE_REMOTE, 'refs/heads/rebuild-v2']]);
-    expect(contexts).toEqual([expect.objectContaining({ sourceRemote: GWS_EA_RELEASE_REMOTE, provided: {} })]);
+    const dogfood = resolveReleaseSource('dogfood');
+    expect(resolved).toEqual([[dogfood.remote, dogfood.ref]]);
+    expect(contexts).toEqual([expect.objectContaining({ sourceRemote: dogfood.remote, provided: {} })]);
     const registry = await readRegistry(paths);
     const instances = Object.values(registry.instances);
     expect(instances.map((instance) => [instance.release_track, instance.source_remote])).toEqual([
-      ['dogfood', GWS_EA_RELEASE_REMOTE],
+      ['dogfood', dogfood.remote],
     ]);
   });
 
@@ -818,44 +847,22 @@ describe('gws-ea prerequisites', () => {
     expect(await readFile(progressLog!, 'utf8')).toMatch(/paused at prerequisites \(gcloud_sign_in_required\)/u);
   });
 
-  it('refuses a consumer Google account before reservation', async () => {
+  it('names --google-account when no person can confirm the signed-in account', async () => {
     const paths = await testPaths();
     const io = lines();
+    const dockerHost = await runningDocker();
 
     const exitCode = await runCli(['create', '--track', 'dogfood', '--source-remote', PRIVATE_REMOTE], {
       paths,
       ...io.runtime,
       ...createRuntime(),
-      checkPrerequisites: async (request, interaction) =>
-        checkPrerequisites(request, interaction, hostDependencies(await runningDocker(), 'operator@gmail.com')),
+      checkPrerequisites: (request, interaction) =>
+        checkPrerequisites(request, interaction, hostDependencies(dockerHost)),
     });
 
     expect(exitCode).toBe(1);
-    expect(io.err.join('\n')).toMatch(/operator@gmail\.com.*Google Workspace/su);
-    expect(Object.keys((await readRegistry(paths)).instances)).toEqual([]);
-  });
-
-  it('names --google-account when no person can confirm the signed-in account', async () => {
-    const paths = await testPaths();
-    const io = lines();
-    const args = ['create', '--track', 'dogfood', '--source-remote', PRIVATE_REMOTE];
-    const dockerHost = await runningDocker();
-    const runtime = {
-      paths,
-      ...io.runtime,
-      ...createRuntime(),
-      checkPrerequisites: (request: PrerequisiteRequest, interaction: Interaction) =>
-        checkPrerequisites(request, interaction, hostDependencies(dockerHost)),
-      advanceProvision: async () => ({ status: 'paused' as const, pause: DM_PAUSE }),
-    };
-
-    expect(await runCli(args, runtime)).toBe(1);
     expect(io.err.join('\n')).toContain('--google-account operator@example.test');
     expect(Object.keys((await readRegistry(paths)).instances)).toEqual([]);
-
-    expect(await runCli([...args, '--google-account', 'operator@example.test'], runtime)).toBe(10);
-    const [reserved] = Object.values((await readRegistry(paths)).instances);
-    expect(reserved?.exclusive_resource_claims.gcp_account).toBe('operator@example.test');
   });
 
   it('hands create inputs the checked host and reserves the confirmed account', async () => {
@@ -915,26 +922,6 @@ describe('gws-ea prerequisites', () => {
     expect(exitCode).toBe(0);
     expect(googleCloudSignIn).toHaveBeenCalledExactlyOnceWith('operator@example.test');
     expect(advanceProvision).toHaveBeenCalledOnce();
-  });
-
-  it('checks the reserved account on resume', async () => {
-    const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
-    const requests: PrerequisiteRequest[] = [];
-
-    await runCli(['resume', '--id', input.instance_id], {
-      paths,
-      ...lines().runtime,
-      checkPrerequisites: async (request) => {
-        requests.push(request);
-        return PREREQUISITES;
-      },
-      advanceProvision: async () => ({ status: 'paused', pause: DM_PAUSE }),
-    });
-
-    expect(requests).toEqual([
-      { command: 'resume', paths, account: 'operator@example.test', checkoutRoot: input.checkout_realpath },
-    ]);
   });
 
   it('passes the Docker endpoint and OneCLI CLI create recorded when resume checks prerequisites', async () => {

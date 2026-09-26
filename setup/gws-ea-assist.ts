@@ -33,7 +33,7 @@ import { GwsEaError } from '../src/gws-ea/types.js';
 import { note } from './lib/theme.js';
 
 /** `-p` with no tools, an empty strict MCP configuration, and nothing saved to resume. */
-export const CLAUDE_DIAGNOSIS_ARGS = [
+const CLAUDE_DIAGNOSIS_ARGS = [
   '-p',
   '--output-format',
   'text',
@@ -105,12 +105,10 @@ const terminalUi: DiagnosisUi = {
 };
 
 export interface DiagnosisDependencies {
-  readonly interactive?: boolean;
   readonly ui?: DiagnosisUi;
   readonly locateClaude?: () => Promise<string>;
   readonly runClaude?: SanitizedCommandOutcomeRunner;
   readonly ambient?: NodeJS.ProcessEnv;
-  readonly sourceRoot?: string;
 }
 
 export type DiagnosisOutcome = 'skipped' | 'declined' | 'answered' | 'unavailable';
@@ -138,7 +136,6 @@ async function writeBundleFile(directory: string, name: string, contents: string
 /** Stage the redacted bundle in a private directory beside the run's logs. */
 async function stageBundle(
   report: FailureReport,
-  sourceRoot: string,
 ): Promise<{ readonly directory: string; readonly files: readonly BundleFile[] }> {
   const directory = path.join(report.runDirectory, 'diagnosis');
   await preparePrivateDirectory(directory);
@@ -152,7 +149,7 @@ async function stageBundle(
     if (contents !== undefined) files.push({ name, contents: redact(contents) });
   }
   for (const source of STEP_SOURCES[report.step] ?? []) {
-    const contents = await readIfPresent(path.join(sourceRoot, source));
+    const contents = await readIfPresent(path.join(CONTROL_PLANE_ROOT, source));
     if (contents !== undefined) files.push({ name: path.join('sources', source), contents: redact(contents) });
   }
   await Promise.all(files.map((file) => writeBundleFile(directory, file.name, file.contents)));
@@ -212,15 +209,13 @@ function diagnosisEnvironment(ambient: NodeJS.ProcessEnv): Record<string, string
 }
 
 /**
- * Offer diagnosis of a failure. Omitted without a TTY or without `claude`;
- * sends nothing without consent; never executes a suggestion.
+ * Offer diagnosis of a failure; the driver wires this only on a TTY. Omitted
+ * without `claude`; sends nothing without consent; never executes a suggestion.
  */
 export async function offerDiagnosis(
   report: FailureReport,
   dependencies: DiagnosisDependencies = {},
 ): Promise<DiagnosisOutcome> {
-  const interactive = dependencies.interactive ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);
-  if (!interactive) return 'skipped';
   let claude: string;
   try {
     claude = await (dependencies.locateClaude ?? (() => resolveExecutable('claude')))();
@@ -230,7 +225,7 @@ export async function offerDiagnosis(
   }
   const ui = dependencies.ui ?? terminalUi;
 
-  const bundle = await stageBundle(report, dependencies.sourceRoot ?? CONTROL_PLANE_ROOT);
+  const bundle = await stageBundle(report);
   ui.note(consentText(bundle.directory, bundle.files), 'What leaves this machine');
   if (!(await ui.confirm('Send this bundle to Claude for a diagnosis?'))) return 'declined';
 

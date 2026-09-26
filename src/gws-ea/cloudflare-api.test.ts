@@ -307,6 +307,11 @@ describe('Cloudflare REST readers', () => {
       result: [{ ...zone, account: { id: TUNNEL_ID, name: 'Example account' } }],
     },
     {
+      label: 'zone name',
+      call: (client: CloudflareApi) => client.listActiveZones(),
+      result: [{ ...zone, name: 'not a zone' }],
+    },
+    {
       label: 'tunnel',
       call: (client: CloudflareApi) => client.listTunnels(ACCOUNT_ID, 'gws-ea-owned'),
       result: [{ ...tunnel, id: ACCOUNT_ID }],
@@ -324,6 +329,19 @@ describe('Cloudflare REST readers', () => {
     );
 
     await expect(call(client)).rejects.toMatchObject({ code: 'invalid_cloudflare_response' });
+  });
+
+  it('leaves out a zone that is not active', async () => {
+    const pending = { ...zone, id: 'c'.repeat(32), name: 'pending.example', status: 'pending' };
+    const client = api(
+      vi.fn<typeof globalThis.fetch>(async () =>
+        envelope([pending, zone], { page: 1, per_page: 50, count: 2, total_count: 2, total_pages: 1 }),
+      ),
+    );
+
+    await expect(client.listActiveZones()).resolves.toEqual([
+      { zoneId: ZONE_ID, name: 'example.com', status: 'active', accountId: ACCOUNT_ID, accountName: 'Example account' },
+    ]);
   });
 });
 

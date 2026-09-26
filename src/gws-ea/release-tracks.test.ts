@@ -1,13 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
-import { GWS_EA_RELEASE_REMOTE, resolveReleaseSource } from './release-tracks.js';
+import { resolveReleaseSource } from './release-tracks.js';
 
 const MIRROR = 'https://github.com/example/nanoclaw-gws-ea-mirror.git';
 
 describe('release sources', () => {
   it('follows the dogfood line on the public repository without asking for a remote', () => {
     expect(resolveReleaseSource('dogfood')).toEqual({
-      remote: GWS_EA_RELEASE_REMOTE,
+      remote: 'https://github.com/taslim/nanoclaw-gws-ea.git',
       ref: 'refs/heads/rebuild-v2',
     });
   });

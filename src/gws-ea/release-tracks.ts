@@ -1,6 +1,6 @@
 import { GwsEaError } from './types.js';
 
-export const GWS_EA_RELEASE_REMOTE = 'https://github.com/taslim/nanoclaw-gws-ea.git';
+const GWS_EA_RELEASE_REMOTE = 'https://github.com/taslim/nanoclaw-gws-ea.git';
 
 /**
  * The branch each product release track follows in the public repository, or

@@ -48,7 +48,7 @@ function provider(value: string, label: string): SetupProviderEntry {
 }
 
 describe('GWS-EA interactive create input', () => {
-  it('derives display names, defaults timezone from the system, and auto-selects the sole composed provider', async () => {
+  it('derives display names, defaults timezone from the system, auto-selects the sole provider, and keeps --endpoint off Cloudflare', async () => {
     const claude = provider('claude', 'Claude');
     const text = vi
       .fn()
@@ -58,6 +58,7 @@ describe('GWS-EA interactive create input', () => {
       .mockResolvedValueOnce('')
       .mockResolvedValueOnce('America/Los_Angeles');
     const select = vi.fn();
+    const discoverZones = vi.fn();
 
     const result = await collectGwsEaCreateInput(
       {
@@ -70,6 +71,7 @@ describe('GWS-EA interactive create input', () => {
           endpoint: 'https://assistant.example.test/webhook/gchat',
           'workspace-email': 'ada@example.test',
         },
+        managedIngressSetup: { discoverZones, retainAccountToken: vi.fn(), clearAccountToken: vi.fn() },
       },
       {
         providers: [claude],
@@ -88,6 +90,7 @@ describe('GWS-EA interactive create input', () => {
     );
 
     expect(select).not.toHaveBeenCalled();
+    expect(discoverZones).not.toHaveBeenCalled();
     expect(text).toHaveBeenCalledTimes(5);
     expect(text).toHaveBeenNthCalledWith(
       5,
@@ -377,58 +380,6 @@ describe('GWS-EA interactive create input', () => {
     expect(zoneSelect).toHaveBeenCalledTimes(2);
   });
 
-  it('keeps --endpoint on the existing path without consulting Cloudflare', async () => {
-    const discoverZones = vi.fn();
-    const select = vi.fn();
-    const text = vi
-      .fn()
-      .mockResolvedValueOnce('Aya')
-      .mockResolvedValueOnce('')
-      .mockResolvedValueOnce('Taslim')
-      .mockResolvedValueOnce('')
-      .mockResolvedValueOnce('UTC');
-
-    const result = await collectGwsEaCreateInput(
-      {
-        instanceId: '11111111-1111-4111-8111-111111111111',
-        prerequisites,
-        sourceRemote: 'https://example.test/nanoclaw.git',
-        secrets: NO_SECRETS,
-        track: 'prod',
-        provided: {
-          endpoint: 'https://aya.example.test/webhook/gchat',
-          'workspace-email': 'aya@example.test',
-        },
-        managedIngressSetup: {
-          discoverZones,
-          retainAccountToken: vi.fn(),
-          clearAccountToken: vi.fn(),
-        },
-      },
-      {
-        providers: [provider('claude', 'Claude')],
-        detectedTimezone: 'UTC',
-        providerCapabilityDigest,
-        prompts: {
-          note: vi.fn(),
-          text,
-          password: vi.fn(),
-          confirm: vi.fn(),
-          select,
-          isCancel: () => false,
-          logInfo: vi.fn(),
-        },
-      },
-    );
-
-    expect(result.ingress).toEqual({
-      mode: 'existing',
-      endpointUrl: 'https://aya.example.test/webhook/gchat',
-    });
-    expect(discoverZones).not.toHaveBeenCalled();
-    expect(select).not.toHaveBeenCalled();
-  });
-
   it('does not retain Cloudflare authority when hostname confirmation is declined', async () => {
     const retainAccountToken = vi.fn();
     const answers = ['Aya', '', 'Taslim', '', 'UTC', 'aya'];
@@ -475,74 +426,6 @@ describe('GWS-EA interactive create input', () => {
       ),
     ).rejects.toMatchObject({ code: 'cancelled' });
     expect(retainAccountToken).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    [
-      'inactive zone',
-      {
-        accountId: 'a'.repeat(32),
-        accountName: 'Principal account',
-        zoneId: 'b'.repeat(32),
-        name: 'example.com',
-        status: 'pending',
-      },
-    ],
-    [
-      'partial zone',
-      {
-        accountId: 'a'.repeat(32),
-        accountName: 'Principal account',
-        zoneId: '',
-        name: 'example.com',
-        status: 'active',
-      },
-    ],
-    [
-      'malformed zone',
-      {
-        accountId: 'a'.repeat(32),
-        accountName: 'Principal account',
-        zoneId: 'b'.repeat(32),
-        name: 'not a zone',
-        status: 'active',
-      },
-    ],
-  ])('rejects an %s returned by the discovery seam', async (_label, zone) => {
-    const answers = ['Aya', '', 'Taslim', '', 'UTC'];
-    await expect(
-      collectGwsEaCreateInput(
-        {
-          instanceId: '11111111-1111-4111-8111-111111111111',
-          prerequisites,
-          sourceRemote: 'https://example.test/nanoclaw.git',
-          secrets: NO_SECRETS,
-          track: 'prod',
-          provided: {
-            'workspace-email': 'aya@example.test',
-          },
-          managedIngressSetup: {
-            discoverZones: async () => [zone as never],
-            retainAccountToken: vi.fn(),
-            clearAccountToken: vi.fn(),
-          },
-        },
-        {
-          providers: [provider('claude', 'Claude')],
-          detectedTimezone: 'UTC',
-          providerCapabilityDigest,
-          prompts: {
-            note: vi.fn(),
-            text: vi.fn(async () => answers.shift()),
-            password: vi.fn(async () => 'token'),
-            confirm: vi.fn(),
-            select: vi.fn(async () => 'managed-cloudflare'),
-            isCancel: () => false,
-            logInfo: vi.fn(),
-          },
-        },
-      ),
-    ).rejects.toMatchObject({ code: 'invalid_cloudflare_zone' });
   });
 });
 

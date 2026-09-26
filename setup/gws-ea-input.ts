@@ -59,9 +59,7 @@ const defaultPrompts: PromptAdapter = {
   logInfo: (message) => p.log.info(message),
 };
 
-const CLOUDFLARE_ID_PATTERN = /^[0-9a-f]{32}$/u;
 const DNS_LABEL_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
-const DNS_NAME_PATTERN = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 export const CLOUDFLARE_API_TOKEN_GUIDANCE = [
   'Create a scoped user or account-owned API token for the intended account and every zone used by managed assistants on this machine:',
   'Account · Cloudflare Tunnel: Edit',
@@ -197,6 +195,7 @@ function validateDnsLabel(value: string): string | undefined {
     : 'Use 1-63 lowercase letters, numbers, or hyphens; start and end with a letter or number';
 }
 
+/** The zones arrive parsed and active from the Cloudflare seam; a choice needs at least one, each named once. */
 function validateDiscoveredZones(zones: readonly CloudflareZoneChoice[]): readonly CloudflareZoneChoice[] {
   if (zones.length === 0) {
     throw new GwsEaError('cloudflare_zone_required', 'The Cloudflare token has no active zones available');
@@ -204,17 +203,6 @@ function validateDiscoveredZones(zones: readonly CloudflareZoneChoice[]): readon
   const zoneIds = new Set<string>();
   const zoneNames = new Set<string>();
   for (const zone of zones) {
-    if (
-      Object.keys(zone).sort().join(',') !== 'accountId,accountName,name,status,zoneId' ||
-      !CLOUDFLARE_ID_PATTERN.test(zone.accountId) ||
-      !CLOUDFLARE_ID_PATTERN.test(zone.zoneId) ||
-      !zone.accountName.trim() ||
-      zone.status !== 'active' ||
-      zone.name !== zone.name.toLowerCase() ||
-      !DNS_NAME_PATTERN.test(zone.name)
-    ) {
-      throw new GwsEaError('invalid_cloudflare_zone', 'Cloudflare returned an invalid or inactive zone');
-    }
     if (zoneIds.has(zone.zoneId) || zoneNames.has(zone.name)) {
       throw new GwsEaError('invalid_cloudflare_zone', 'Cloudflare returned a duplicate zone');
     }

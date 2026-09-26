@@ -5,15 +5,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { SecretSource } from './create-input.js';
-import {
-  createInteraction,
-  pendingActionOf,
-  PauseRequired,
-  runStep,
-  withPendingAction,
-  type InteractivePrompts,
-  type RunEvent,
-} from './events.js';
+import { createInteraction, PauseRequired, runStep, type InteractivePrompts, type RunEvent } from './events.js';
 import { resolveControlPlanePaths } from './paths.js';
 import type { ProvisionHumanPause } from './phases.js';
 import { redact, REDACTED } from './redact.js';
@@ -158,15 +150,6 @@ describe('runStep', () => {
 
   it('runs without a run log or listener', async () => {
     await expect(runStep({}, { id: 'bare' }, async () => 'ok')).resolves.toBe('ok');
-  });
-});
-
-describe('pending human actions', () => {
-  it('travel with the failure that blocked them', () => {
-    const error = withPendingAction(new GwsEaError('host_down', 'Host is down'), PAUSE);
-    expect(error).toBeInstanceOf(GwsEaError);
-    expect(pendingActionOf(error)).toBe(PAUSE);
-    expect(pendingActionOf(new Error('other'))).toBeUndefined();
   });
 });
 

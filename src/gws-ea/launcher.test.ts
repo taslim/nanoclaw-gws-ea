@@ -24,21 +24,23 @@ describe('GWS-EA shell launcher', () => {
   it('uses the first absolute PATH entry and ignores empty and relative entries', async () => {
     const root = await temporaryRoot();
     const trustedBin = path.join(root, 'trusted-bin');
+    const laterBin = path.join(root, 'later-bin');
     const hostileMarker = path.join(root, 'hostile-ran');
     const hostile = `#!/bin/sh\nprintf hostile > ${JSON.stringify(hostileMarker)}\n`;
-    await Promise.all([mkdir(path.join(root, 'relative-bin')), mkdir(trustedBin)]);
+    await Promise.all([mkdir(path.join(root, 'relative-bin')), mkdir(trustedBin), mkdir(laterBin)]);
     await Promise.all([
       writeFile(path.join(root, 'node'), hostile, { mode: 0o755 }),
       writeFile(path.join(root, 'relative-bin', 'node'), hostile, { mode: 0o755 }),
+      writeFile(path.join(laterBin, 'node'), hostile, { mode: 0o755 }),
       writeFile(path.join(trustedBin, 'node'), '#!/bin/sh\nprintf "trusted:%s|%s" "$*" "$PATH"\n', { mode: 0o755 }),
     ]);
 
     const { stdout } = await execFileAsync('/bin/bash', [LAUNCHER, 'probe'], {
       cwd: root,
-      env: { PATH: `:relative-bin::${trustedBin}:` },
+      env: { PATH: `:relative-bin::${trustedBin}:${laterBin}:` },
     });
 
-    expect(stdout).toBe(`trusted:--import tsx setup/gws-ea.ts probe|${trustedBin}`);
+    expect(stdout).toBe(`trusted:--import tsx setup/gws-ea.ts probe|${trustedBin}:${laterBin}`);
     await expect(readFile(hostileMarker, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 

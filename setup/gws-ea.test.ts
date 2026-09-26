@@ -184,10 +184,14 @@ describe('GWS-EA driver', () => {
     await expect(onFailure!(report())).resolves.toBe('stop');
   });
 
-  it('asks before removal on a TTY', async () => {
+  it('asks before removal on a TTY, defaulting to keep the assistant', async () => {
     await main(['remove', '--id', 'x'], { interactive: true });
     fixture.confirm.mockResolvedValueOnce(false);
     await expect(runtimeOf().confirmRemoval!({ instanceId: 'x', gcpProject: 'p' } as never)).resolves.toBe(false);
+    expect(fixture.confirm).toHaveBeenCalledExactlyOnceWith({
+      message: expect.stringMatching(/assistant x .*GCP project p\?$/u),
+      initialValue: false,
+    });
   });
 });
 
@@ -208,6 +212,7 @@ describe('GWS-EA terminal presenter', () => {
     expect(fixture.spinner.message).toHaveBeenLastCalledWith(
       expect.stringContaining('Waiting for the service account'),
     );
+    expect(fixture.spinner.message).toHaveBeenLastCalledWith(expect.stringContaining('(1s)'));
     presenter.event({ type: 'step-completed', step: 'provision_gcp' });
     expect(fixture.spinner.stop).toHaveBeenCalledWith(expect.stringContaining('Configuring Google Cloud'));
   });

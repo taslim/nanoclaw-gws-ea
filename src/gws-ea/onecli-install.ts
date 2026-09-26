@@ -19,12 +19,7 @@ import {
   PIN_NAMES,
   type OnecliCliTarget,
 } from './pins.js';
-import {
-  buildToolEnvironment,
-  checkedRunner,
-  runSanitizedCommandOutcome,
-  type SanitizedCommandOutcomeRunner,
-} from './process.js';
+import { buildToolEnvironment, runSanitizedCommand } from './process.js';
 import { activeStep } from './run-log.js';
 import { GwsEaError } from './types.js';
 import { parseJson, requireRecord } from './validation.js';
@@ -39,7 +34,7 @@ export interface OnecliCliPin {
 }
 
 /** The OneCLI CLI this launcher pins. */
-export const LAUNCHER_ONECLI_CLI: OnecliCliPin = { version: ONECLI_CLI_VERSION, digests: ONECLI_CLI_ARCHIVE_DIGESTS };
+const LAUNCHER_ONECLI_CLI: OnecliCliPin = { version: ONECLI_CLI_VERSION, digests: ONECLI_CLI_ARCHIVE_DIGESTS };
 
 /** The OneCLI CLI a release checkout pins, from its own `src/gws-ea/versions.json`. */
 export async function releaseOnecliCliPin(checkoutRoot: string): Promise<OnecliCliPin> {
@@ -57,7 +52,6 @@ export async function releaseOnecliCliPin(checkoutRoot: string): Promise<OnecliC
 
 export interface OnecliInstallDependencies {
   readonly fetch?: typeof fetch;
-  readonly runCommand?: SanitizedCommandOutcomeRunner;
   readonly platform?: NodeJS.Platform;
   readonly arch?: string;
 }
@@ -108,7 +102,7 @@ export async function ensurePinnedOnecliCli(
   const staging = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-onecli-'));
   try {
     await writeFile(path.join(staging, archive), bytes, { mode: 0o600 });
-    await checkedRunner(dependencies.runCommand ?? runSanitizedCommandOutcome)({
+    await runSanitizedCommand({
       command: 'tar',
       args: ['-xzf', archive, 'onecli'],
       cwd: staging,
