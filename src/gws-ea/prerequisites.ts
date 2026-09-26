@@ -165,6 +165,12 @@ function pingDocker(socketPath: string): Promise<DockerDaemonState> {
   });
 }
 
+/** Whether a running Docker daemon answers at a local `unix://` endpoint. */
+export async function dockerAnswers(endpoint: string): Promise<boolean> {
+  const socket = unixSocketPath(endpoint);
+  return socket !== undefined && (await pingDocker(socket)).state === 'running';
+}
+
 function parseDockerContext(stdout: string): { readonly name: string; readonly endpoint: string } {
   const parsed = parseJson(stdout, 'docker context inspect output', 'invalid_docker_output');
   const context: unknown = Array.isArray(parsed) && parsed.length === 1 ? parsed[0] : undefined;

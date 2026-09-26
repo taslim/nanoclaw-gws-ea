@@ -58,6 +58,33 @@ export const ONECLI_GATEWAY_VERSION = LAUNCHER_PINS.onecliGateway;
 export const ONECLI_CLI_VERSION = LAUNCHER_PINS.onecliCli;
 export const CLOUDFLARED_IMAGE = LAUNCHER_PINS.cloudflaredImage;
 
+export type OnecliCliTarget = 'darwin_amd64' | 'darwin_arm64' | 'linux_amd64' | 'linux_arm64';
+
+/**
+ * The sha256 of each OneCLI CLI release archive the launcher may install, for
+ * the pinned CLI version; bump them with the version (GitHub lists each
+ * asset's digest). Only the launcher installs the CLI, so a release's copy
+ * need not carry them.
+ */
+export function parseOnecliCliArchiveDigests(value: unknown): Readonly<Record<OnecliCliTarget, string>> {
+  const digests = requireRecord(value, 'onecli-cli-archives', 'invalid_release_pin');
+  const digest = (target: OnecliCliTarget): string => {
+    const pinned = digests[target];
+    if (typeof pinned !== 'string' || !/^[0-9a-f]{64}$/u.test(pinned)) {
+      throw new GwsEaError('invalid_release_pin', `The OneCLI CLI ${target} archive must be pinned to a sha256 digest`);
+    }
+    return pinned;
+  };
+  return {
+    darwin_amd64: digest('darwin_amd64'),
+    darwin_arm64: digest('darwin_arm64'),
+    linux_amd64: digest('linux_amd64'),
+    linux_arm64: digest('linux_arm64'),
+  };
+}
+
+export const ONECLI_CLI_ARCHIVE_DIGESTS = parseOnecliCliArchiveDigests(launcherPins['onecli-cli-archives']);
+
 /** The OneCLI SDK is pinned by the checkout's own package.json. */
 const packageManifest: unknown = createRequire(import.meta.url)('../../package.json');
 export const ONECLI_SDK_VERSION = exactVersion(

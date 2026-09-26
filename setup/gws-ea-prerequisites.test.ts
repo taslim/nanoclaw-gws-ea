@@ -135,12 +135,20 @@ describe('GWS-EA Google account confirmation', () => {
 describe('GWS-EA guided prerequisites', () => {
   afterEach(() => vi.unstubAllEnvs());
 
+  const ENDPOINT = 'unix:///Users/operator/.docker/run/docker.sock';
+  const missingGcloud = () => new GwsEaError('gcloud_required', 'Google Cloud CLI is required');
+  const stoppedDocker = () =>
+    new GwsEaError('docker_stopped', 'Docker is not running', { details: { endpoint: ENDPOINT } });
+
+  function failingThen(...errors: GwsEaError[]) {
+    const check = vi.fn<(request: PrerequisiteRequest) => Promise<Prerequisites>>();
+    for (const error of errors) check.mockRejectedValueOnce(error);
+    return check.mockResolvedValue(READY);
+  }
+
   it('guides a Google Cloud CLI install, then continues the same run', async () => {
     vi.stubEnv('PATH', '/custom/bin:/usr/bin');
-    const check = vi
-      .fn<(request: PrerequisiteRequest) => Promise<Prerequisites>>()
-      .mockRejectedValueOnce(new GwsEaError('gcloud_required', 'Google Cloud CLI is required'))
-      .mockResolvedValueOnce(READY);
+    const check = failingThen(missingGcloud());
     const prompts = promptFixture([true]);
     const resolveExecutable = vi.fn(async () => '/Users/operator/google-cloud-sdk/bin/gcloud');
     const { order, interaction } = terminal();
@@ -156,15 +164,17 @@ describe('GWS-EA guided prerequisites', () => {
     );
     expect(order).toEqual(['suspend', 'guidance', 'resume']);
     expect(resolveExecutable).toHaveBeenCalledWith(
+      'gcloud',
       ['/custom/bin:/usr/bin', path.join(os.homedir(), 'google-cloud-sdk', 'bin')].join(path.delimiter),
     );
     expect(process.env.PATH?.split(path.delimiter)[0]).toBe('/Users/operator/google-cloud-sdk/bin');
   });
 
-  it('stops with the install link when the CLI is still missing', async () => {
-    const check = vi.fn(async () => {
-      throw new GwsEaError('gcloud_required', 'Google Cloud CLI is required');
+  it('guides again while a tool is still missing, then lets its failure stand', async () => {
+    const check = vi.fn(async (): Promise<Prerequisites> => {
+      throw missingGcloud();
     });
+    const prompts = promptFixture([true, true, true]);
 
     await expect(
       ensurePrerequisites(REQUEST, terminal().interaction, {
@@ -172,18 +182,20 @@ describe('GWS-EA guided prerequisites', () => {
         resolveExecutable: async () => {
           throw new GwsEaError('executable_not_found', 'gcloud was not found on PATH');
         },
-        prompts: promptFixture([true]),
+        prompts,
       }),
-    ).rejects.toMatchObject({
-      code: 'gcloud_required',
-      message: expect.stringContaining('https://cloud.google.com/sdk/docs/install'),
-    });
-    expect(check).toHaveBeenCalledOnce();
+    ).rejects.toMatchObject({ code: 'gcloud_required' });
+    expect(check).toHaveBeenCalledTimes(4);
+    expect(prompts.note.mock.calls.map(([message]) => String(message).startsWith('Still not ready.'))).toEqual([
+      false,
+      true,
+      true,
+    ]);
   });
 
   it('does not continue when the operator declines to install', async () => {
-    const check = vi.fn(async () => {
-      throw new GwsEaError('gcloud_required', 'Google Cloud CLI is required');
+    const check = vi.fn(async (): Promise<Prerequisites> => {
+      throw missingGcloud();
     });
 
     await expect(
@@ -196,18 +208,123 @@ describe('GWS-EA guided prerequisites', () => {
     expect(check).toHaveBeenCalledOnce();
   });
 
-  it('passes every other prerequisite failure through without guidance', async () => {
-    const stopped = new GwsEaError('docker_stopped', 'Docker is not running');
+  it('starts Docker Desktop on macOS when the operator agrees, and waits for its daemon', async () => {
+    const check = failingThen(stoppedDocker());
+    const prompts = promptFixture([true]);
+    const runCommand = vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 }));
+    const answers = [false, false, true];
+    const dockerAnswers = vi.fn(async () => answers.shift() ?? true);
+    const sleep = vi.fn(async () => undefined);
+
+    await expect(
+      ensurePrerequisites(REQUEST, terminal().interaction, {
+        check,
+        prompts,
+        platform: 'darwin',
+        runCommand,
+        dockerAnswers,
+        sleep,
+      }),
+    ).resolves.toBe(READY);
+
+    expect(prompts.confirm).toHaveBeenCalledWith(expect.objectContaining({ message: 'Start Docker Desktop now?' }));
+    expect(runCommand).toHaveBeenCalledWith(expect.objectContaining({ command: 'open', args: ['-a', 'Docker'] }));
+    expect(dockerAnswers).toHaveBeenCalledWith(ENDPOINT);
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(prompts.note).toHaveBeenCalledOnce();
+    expect(prompts.note).toHaveBeenCalledWith('Waiting up to 90 seconds for Docker to start…', 'Docker');
+    expect(check).toHaveBeenCalledTimes(2);
+  });
+
+  it('shows how to start Docker on Linux, then waits for its daemon', async () => {
+    const check = failingThen(stoppedDocker());
+    const prompts = promptFixture([true]);
+    const runCommand = vi.fn();
+    const dockerAnswers = vi.fn(async () => true);
+
+    await expect(
+      ensurePrerequisites(REQUEST, terminal().interaction, {
+        check,
+        prompts,
+        platform: 'linux',
+        runCommand,
+        dockerAnswers,
+      }),
+    ).resolves.toBe(READY);
+
+    expect(prompts.note).toHaveBeenCalledWith(expect.stringContaining('sudo systemctl start docker'), 'Docker');
+    expect(runCommand).not.toHaveBeenCalled();
+    expect(dockerAnswers).toHaveBeenCalledWith(ENDPOINT);
+  });
+
+  it('installs the pinned OneCLI CLI when the operator agrees', async () => {
+    const check = failingThen(new GwsEaError('onecli_required', 'OneCLI CLI is required'));
+    const prompts = promptFixture([true]);
+    const installOnecli = vi.fn(async () => '/Users/operator/.local/bin/onecli');
+
+    await expect(ensurePrerequisites(REQUEST, terminal().interaction, { check, prompts, installOnecli })).resolves.toBe(
+      READY,
+    );
+
+    expect(prompts.confirm).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining('checked against its pinned digest') }),
+    );
+    expect(installOnecli).toHaveBeenCalledOnce();
+    expect(prompts.note).not.toHaveBeenCalled();
+  });
+
+  it('says why an install failed, then offers the manual steps', async () => {
+    const check = failingThen(new GwsEaError('onecli_required', 'OneCLI CLI is required'));
+    const prompts = promptFixture([true, true]);
+    const installOnecli = vi.fn(async (): Promise<string> => {
+      throw new GwsEaError(
+        'onecli_digest_mismatch',
+        'onecli_2.2.5_darwin_arm64.tar.gz does not match its pinned sha256',
+      );
+    });
+
+    await expect(ensurePrerequisites(REQUEST, terminal().interaction, { check, prompts, installOnecli })).resolves.toBe(
+      READY,
+    );
+
+    expect(prompts.note.mock.calls.map(([message]) => String(message))).toEqual([
+      'onecli_2.2.5_darwin_arm64.tar.gz does not match its pinned sha256',
+      expect.stringContaining('https://github.com/onecli/onecli-cli/releases/tag/v2.2.5'),
+    ]);
+  });
+
+  it.each([
+    ['pnpm_required', 'darwin', 'corepack enable pnpm'],
+    ['git_required', 'darwin', 'xcode-select --install'],
+    ['git_required', 'linux', 'sudo apt install git'],
+    ['docker_required', 'linux', 'https://docs.docker.com/engine/install/'],
+  ] as const)('guides %s on %s with its install step', async (code, platform, step) => {
+    const prompts = promptFixture([true]);
+
+    await expect(
+      ensurePrerequisites(REQUEST, terminal().interaction, {
+        check: failingThen(new GwsEaError(code, 'missing')),
+        prompts,
+        platform,
+        resolveExecutable: async () => '/usr/bin/docker',
+      }),
+    ).resolves.toBe(READY);
+    expect(prompts.note).toHaveBeenCalledWith(expect.stringContaining(step), expect.any(String));
+  });
+
+  it('passes a failure it cannot guide through untouched', async () => {
+    const denied = new GwsEaError('docker_permission_denied', 'This user may not use the Docker daemon');
     const prompts = promptFixture();
 
     await expect(
       ensurePrerequisites(REQUEST, terminal().interaction, {
         check: async () => {
-          throw stopped;
+          throw denied;
         },
         prompts,
       }),
-    ).rejects.toBe(stopped);
+    ).rejects.toBe(denied);
     expect(prompts.note).not.toHaveBeenCalled();
+    expect(prompts.confirm).not.toHaveBeenCalled();
   });
 });
