@@ -15,6 +15,7 @@ import {
   managedTransportResources,
   reconcileManagedCloudflareIngress,
   renderManagedCloudflareConfiguration,
+  type ManagedIngressReconcileOptions,
   type ManagedTransport,
 } from './cloudflare-ingress.js';
 import type { RunEvent } from './events.js';
@@ -765,6 +766,45 @@ describe('managed Cloudflare reconciliation', () => {
     expect(cloud.count('POST', '/dns_records')).toBe(1);
     expect(cloud.tunnels).toHaveLength(1);
     expect(cloud.records).toHaveLength(1);
+  });
+
+  it('records that the tunnel is being created first, so a failure before its ID is recorded leaves a trace', async () => {
+    const paths = await testPaths();
+    const input = managedReservation(paths, 'assistant.example.com', 31_100);
+    await reserveInstance(paths, input);
+    const cloud = new FakeCloudflare();
+    // Cloudflare creates the tunnel, then the run stops before recording its ID.
+    cloud.intercept = (method, route) =>
+      method === 'GET' && route.endsWith('/configurations')
+        ? new Response(JSON.stringify({ success: false, errors: [{ code: 1000, message: 'bad request' }] }), {
+            status: 400,
+          })
+        : undefined;
+    const options: ManagedIngressReconcileOptions = {
+      instanceId: input.instance_id,
+      originHost: '127.0.0.1',
+      connector: createCloudflareConnectorLayout({ cloudflareRoot: paths.cloudflareRoot, platform: 'linux' }),
+    };
+
+    await expect(reconcileManagedCloudflareIngress(paths, cloud.api(), options)).rejects.toMatchObject({
+      code: 'cloudflare_api_failed',
+    });
+    expect(cloud.tunnels).toHaveLength(1);
+    expect((await readRegistry(paths)).shared_infrastructure_metadata.cloudflare).toMatchObject({
+      tunnel_id: null,
+      tunnel_creation_started_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T.*Z$/u),
+    });
+
+    // Resuming adopts the tunnel by its reserved name, records its ID, and clears the trace.
+    cloud.intercept = undefined;
+    await expect(reconcileManagedCloudflareIngress(paths, cloud.api(), options)).resolves.toMatchObject({
+      tunnelId: TUNNEL_ID,
+    });
+    expect(cloud.count('POST', '/cfd_tunnel')).toBe(1);
+    expect((await readRegistry(paths)).shared_infrastructure_metadata.cloudflare).toMatchObject({
+      tunnel_id: TUNNEL_ID,
+      tunnel_creation_started_at: null,
+    });
   });
 
   it('fails a missing zone read capability before any change', async () => {

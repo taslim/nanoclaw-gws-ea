@@ -524,6 +524,37 @@ describe('removal from any partial state', () => {
     expect((await readRegistry(paths)).shared_infrastructure_metadata.cloudflare).toBeNull();
   });
 
+  it('retires a tunnel whose creation started but was never recorded, from a peer that never set up transport', async () => {
+    const paths = await testPaths();
+    const crashed = await reserve(paths, reservationInput(paths, { managed: true }), {
+      started: ['materialize_checkout', 'establish_transport'],
+    });
+    const unstarted = await reserve(paths, reservationInput(paths, { managed: true, label: 'peer', port: 34_001 }), {
+      started: ['materialize_checkout'],
+    });
+    // The crash: Cloudflare created the tunnel, and only the start of its creation was recorded.
+    await withLockedCloudflareRegistry(paths, (locked) => locked.recordTunnelCreationStarted());
+    await mkdir(paths.cloudflareRoot, { recursive: true, mode: 0o700 });
+    const { dependencies, cloudflare } = world(crashed);
+    cloudflare.tunnels = [{ id: TUNNEL_ID, name: await tunnelName(paths) }];
+    const stopConnector = vi.fn(async () => undefined);
+    const shared = { createCloudflareApi: () => cloudflare.api(), stopCloudflareConnector: stopConnector };
+
+    // The crashed assistant's removal leaves the tunnel to the peer still registered.
+    await removeAssistant(paths, crashed.instance_id, { ...dependencies, ...shared });
+    expect(cloudflare.tunnels).toHaveLength(1);
+    expect(stopConnector).not.toHaveBeenCalled();
+
+    // The peer never set up transport, but the recorded creation tells its removal a tunnel may exist.
+    const peer = world(unstarted);
+    await removeAssistant(paths, unstarted.instance_id, { ...peer.dependencies, ...shared });
+    expect(peer.interaction.requestCloudflareAccountToken).toHaveBeenCalledOnce();
+    expect(stopConnector).toHaveBeenCalledOnce();
+    expect(cloudflare.tunnels).toEqual([]);
+    expect(await exists(paths.cloudflareRoot)).toBe(false);
+    expect((await readRegistry(paths)).shared_infrastructure_metadata.cloudflare).toBeNull();
+  });
+
   it('counts an already-removed route and an already-deleted DNS record as done', async () => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput(paths, { managed: true, dns: true }), {

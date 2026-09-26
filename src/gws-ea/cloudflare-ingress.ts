@@ -384,6 +384,8 @@ export async function reconcileManagedCloudflareIngress(
         `Cloudflare DNS name ${claim.hostname} already has records before this machine's tunnel exists`,
       );
     }
+    // Recorded first, so a crash after Cloudflare creates the tunnel still leaves a trace removal can follow.
+    if (!existing) await locked.recordTunnelCreationStarted();
     // A new tunnel starts empty, so creating it before reading its configuration changes nothing foreign.
     const tunnel = existing ?? (await createTunnel(api, metadata.account_id, metadata.tunnel_name));
     const current = await api.getTunnelConfiguration(metadata.account_id, tunnel.id);

@@ -27,7 +27,13 @@ import {
   type SharedCloudflareMetadata,
   type SharedInfrastructureMetadata,
 } from './types.js';
-import { EMAIL_PATTERN, isRecord, parseJson, requireString as requireText } from './validation.js';
+import {
+  EMAIL_PATTERN,
+  isRecord,
+  parseJson,
+  requireCanonicalTimestamp,
+  requireString as requireText,
+} from './validation.js';
 
 const INSTANCE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const RELEASE_TRACK_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
@@ -187,11 +193,20 @@ function validateSharedCloudflare(value: unknown): SharedCloudflareMetadata | nu
       throw new GwsEaError('invalid_registry', 'Cloudflare tunnel ID is invalid');
     }
   }
+  const creationStartedAt =
+    value.tunnel_creation_started_at === undefined || value.tunnel_creation_started_at === null
+      ? null
+      : requireCanonicalTimestamp(
+          value.tunnel_creation_started_at,
+          'invalid_registry',
+          'Cloudflare tunnel creation time is invalid',
+        );
   return {
     ownership_id: ownershipId,
     account_id: accountId,
     tunnel_name: tunnelName,
     tunnel_id: tunnelId,
+    tunnel_creation_started_at: creationStartedAt,
   };
 }
 
@@ -354,6 +369,7 @@ function sharedInfrastructureForReservation(
       account_id: ingress.account_id,
       tunnel_name: `gws-ea-${ownershipId.replaceAll('-', '')}`,
       tunnel_id: null,
+      tunnel_creation_started_at: null,
     },
   };
 }
@@ -404,6 +420,8 @@ export interface CloudflareCoordinateUpdate {
 export interface LockedCloudflareRegistry {
   readonly registry: InstanceRegistry;
   updateCoordinates(update: CloudflareCoordinateUpdate): Promise<InstanceRegistry>;
+  /** Record, before asking Cloudflare, that this machine's tunnel is being created. */
+  recordTunnelCreationStarted(): Promise<InstanceRegistry>;
   /** Forget a tunnel the last managed assistant's removal retired, so the next one creates its own. */
   forgetTunnel(): Promise<InstanceRegistry>;
 }
@@ -464,7 +482,26 @@ export async function withLockedCloudflareRegistry<T>(
             schema_version: REGISTRY_SCHEMA_VERSION,
             instances,
             shared_infrastructure_metadata: {
-              cloudflare: { ...cloudflare, tunnel_id: tunnelId },
+              cloudflare: { ...cloudflare, tunnel_id: tunnelId, tunnel_creation_started_at: null },
+            },
+          },
+          paths,
+        );
+        await writePrivate(paths.registryFile, next);
+        current = next;
+        return current;
+      },
+      async recordTunnelCreationStarted() {
+        const cloudflare = current.shared_infrastructure_metadata.cloudflare;
+        if (!cloudflare) {
+          throw new GwsEaError('cloudflare_state_missing', 'Shared Cloudflare ownership is not reserved');
+        }
+        if (cloudflare.tunnel_id !== null || cloudflare.tunnel_creation_started_at !== null) return current;
+        const next = validateRegistry(
+          {
+            ...current,
+            shared_infrastructure_metadata: {
+              cloudflare: { ...cloudflare, tunnel_creation_started_at: new Date().toISOString() },
             },
           },
           paths,
@@ -475,9 +512,16 @@ export async function withLockedCloudflareRegistry<T>(
       },
       async forgetTunnel() {
         const cloudflare = current.shared_infrastructure_metadata.cloudflare;
-        if (!cloudflare || cloudflare.tunnel_id === null) return current;
+        if (!cloudflare || (cloudflare.tunnel_id === null && cloudflare.tunnel_creation_started_at === null)) {
+          return current;
+        }
         const next = validateRegistry(
-          { ...current, shared_infrastructure_metadata: { cloudflare: { ...cloudflare, tunnel_id: null } } },
+          {
+            ...current,
+            shared_infrastructure_metadata: {
+              cloudflare: { ...cloudflare, tunnel_id: null, tunnel_creation_started_at: null },
+            },
+          },
           paths,
         );
         await writePrivate(paths.registryFile, next);

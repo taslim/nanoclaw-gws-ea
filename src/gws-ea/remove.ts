@@ -736,7 +736,9 @@ async function removeLocked(
   // Released last, so a released reservation left only local files and the receipt behind.
   const released = registry.instances[instanceId] === undefined;
   const started = (step: ProvisionStepId): boolean => !released && provisioning.started(step);
-  const tunnelRecorded = registry.shared_infrastructure_metadata.cloudflare?.tunnel_id !== null;
+  const shared = registry.shared_infrastructure_metadata.cloudflare;
+  // A recorded tunnel, or one whose creation started, may exist under the machine's tunnel name.
+  const tunnelRecorded = shared !== null && (shared.tunnel_id !== null || shared.tunnel_creation_started_at !== null);
   const owned: Readonly<Record<RemovalResource, boolean>> = {
     // Peers write every managed route into the shared set, so it is observed whenever the machine has a tunnel.
     'managed-ingress': claim !== undefined && (started('establish_transport') || (!released && tunnelRecorded)),

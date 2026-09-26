@@ -47,6 +47,12 @@ export interface SharedCloudflareMetadata {
   account_id: string;
   tunnel_name: string;
   tunnel_id: string | null;
+  /**
+   * Set under the machine lock before the tunnel is created, and cleared once
+   * its ID is recorded or it is retired, so a crash between the two leaves a
+   * record that a tunnel may exist under `tunnel_name`.
+   */
+  tunnel_creation_started_at: string | null;
 }
 
 export interface SharedInfrastructureMetadata {
