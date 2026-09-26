@@ -690,7 +690,7 @@ describe('create recovery contract', () => {
       }),
     ).toBe(10);
     const instanceId = output[0]!.slice('instance_id: '.length);
-    expect(resolveCalls).toEqual([['https://example.test/nanoclaw.git', 'refs/heads/dogfood']]);
+    expect(resolveCalls).toEqual([['https://example.test/nanoclaw.git', 'refs/heads/rebuild-v2']]);
     expect(portsReleased).toBe(true);
     expect(output.slice(1, 6)).toEqual([
       'Resolving the release…',

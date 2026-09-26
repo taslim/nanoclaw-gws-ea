@@ -36,7 +36,7 @@ import {
 } from './provision.js';
 import { redact, safeErrorCode, safeErrorMessage } from './redact.js';
 import { allocateInstanceId, assertInstanceId, getInstanceReservation, validateReservation } from './registry.js';
-import { resolveReleaseSource } from './release-tracks.js';
+import { resolveReleaseSource, type ReleaseSource } from './release-tracks.js';
 import {
   ABANDONABLE_RESOURCES,
   describeRemoval,
@@ -320,13 +320,14 @@ class Cli {
     const options = parseOptions(args, command);
     if (command === 'create') {
       const track = requireOption(options, 'track');
+      const source = resolveReleaseSource(track, options['source-remote']);
       return () =>
         this.#attempt({
           command,
           args,
           options,
           meta: { track },
-          work: (session) => this.#createWork(session, options, track),
+          work: (session) => this.#createWork(session, options, track, source),
         });
     }
     const instanceId = requireOption(options, 'id');
@@ -417,13 +418,11 @@ class Cli {
     { reporter, interaction, secrets, state }: Session,
     options: Options,
     track: string,
+    source: ReleaseSource,
   ): Promise<Outcome> {
     const paths = this.#paths;
     const run = reporter.run;
-    const sourceRemote = await runStep(reporter, { id: 'release_source' }, () =>
-      resolveReleaseSource({ track, sourceRemote: options['source-remote'], configRoot: paths.configRoot }),
-    );
-    run.userInput('release_source', sourceRemote);
+    run.userInput('release_source', `${source.remote} ${source.ref}`);
     const googleAccount = options['google-account'];
     const prerequisites = await runStep(reporter, PREREQUISITES_STEP, () =>
       this.#checkPrerequisites(
@@ -446,7 +445,7 @@ class Cli {
       collect({
         instanceId,
         track,
-        sourceRemote,
+        sourceRemote: source.remote,
         provided,
         secrets,
         prerequisites,
@@ -457,10 +456,10 @@ class Cli {
     run.userInput('provider', setup.bootstrapManifest.provider.id);
 
     const resolved = await runStep(reporter, { id: 'resolve_release', label: 'Resolving the release…' }, () =>
-      (this.#runtime.resolveRelease ?? resolveReleaseCommit)(sourceRemote, `refs/heads/${track}`),
+      (this.#runtime.resolveRelease ?? resolveReleaseCommit)(source.remote, source.ref),
     );
     await runStep(reporter, { id: 'reserve', label: 'Reserving the assistant…' }, async () => {
-      await this.#reserve(state, track, sourceRemote, setup, resolved.commit, prerequisites.account);
+      await this.#reserve(state, track, source.remote, setup, resolved.commit, prerequisites.account);
       await run.assignInstance(instanceId);
     });
 
@@ -820,7 +819,7 @@ function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undef
 
 function printHelp(output: LineWriter): void {
   output('Usage: gws-ea <create|resume|remove> [options]');
-  output('  create --track <track> [--source-remote <remote>] [--google-account <email>]');
+  output('  create --track <dogfood|prod> [--source-remote <remote>] [--google-account <email>]');
   output('         [--assistant-first-name <name> --assistant-last-name <name>]');
   output('         [--principal-first-name <name> --principal-last-name <name> --principal-timezone <iana>]');
   output('         [--workspace-email <email>] [--provider <id>]');

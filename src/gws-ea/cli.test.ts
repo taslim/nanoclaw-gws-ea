@@ -22,7 +22,7 @@ import {
 import { runSanitizedCommand } from './process.js';
 import { installProductionBootstrapManifest } from './provision.js';
 import { allocateInstanceId, readRegistry } from './registry.js';
-import { DOGFOOD_SOURCE_FILE, GWS_EA_RELEASE_REMOTE } from './release-tracks.js';
+import { GWS_EA_RELEASE_REMOTE } from './release-tracks.js';
 import { activeStep } from './run-log.js';
 import { GwsEaError, type InstanceReservationInput } from './types.js';
 
@@ -516,10 +516,9 @@ describe('gws-ea secrets inputs', () => {
 });
 
 describe('gws-ea release sources', () => {
-  it('resolves dogfood from the owner-only source file and never asks for or resolves the public repo', async () => {
+  it("installs dogfood from the public repository's integration branch without asking for a remote", async () => {
     const paths = await testPaths();
-    await writeOwnerFile(path.join(paths.configRoot, DOGFOOD_SOURCE_FILE), `${PRIVATE_REMOTE}\n`);
-    const resolved: string[] = [];
+    const resolved: Array<readonly [string, string]> = [];
     const contexts: unknown[] = [];
     const io = lines();
 
@@ -533,53 +532,25 @@ describe('gws-ea release sources', () => {
           return setupAnswers();
         },
         resolveRelease: async (sourceRemote, releaseRef) => {
-          resolved.push(sourceRemote);
+          resolved.push([sourceRemote, releaseRef]);
           return { sourceRemote, releaseRef, commit: 'b'.repeat(40) };
         },
         advanceProvision: async () => ({ status: 'paused', pause: DM_PAUSE }),
       }),
     ).toBe(10);
-    expect(resolved).toEqual([PRIVATE_REMOTE]);
-    expect(contexts).toEqual([expect.objectContaining({ sourceRemote: PRIVATE_REMOTE, provided: {} })]);
+    expect(resolved).toEqual([[GWS_EA_RELEASE_REMOTE, 'refs/heads/rebuild-v2']]);
+    expect(contexts).toEqual([expect.objectContaining({ sourceRemote: GWS_EA_RELEASE_REMOTE, provided: {} })]);
     const registry = await readRegistry(paths);
-    expect(Object.values(registry.instances).map((instance) => instance.source_remote)).toEqual([PRIVATE_REMOTE]);
+    const instances = Object.values(registry.instances);
+    expect(instances.map((instance) => [instance.release_track, instance.source_remote])).toEqual([
+      ['dogfood', GWS_EA_RELEASE_REMOTE],
+    ]);
   });
 
-  it('refuses a dogfood source file naming the public origin', async () => {
+  it('refuses prod before it has a release, before asking anything', async () => {
     const paths = await testPaths();
-    await writeOwnerFile(path.join(paths.configRoot, DOGFOOD_SOURCE_FILE), 'git@github.com:taslim/nanoclaw-gws-ea\n');
     const collectCreateInputs = vi.fn();
     const resolveRelease = vi.fn();
-    const io = lines();
-
-    expect(
-      await runCli(['create', '--track', 'dogfood'], {
-        paths,
-        ...io.runtime,
-        ...createRuntime(),
-        collectCreateInputs,
-        resolveRelease,
-      }),
-    ).toBe(1);
-    expect(io.err.join('\n')).toContain('public');
-    expect(collectCreateInputs).not.toHaveBeenCalled();
-    expect(resolveRelease).not.toHaveBeenCalled();
-  });
-
-  it('fails dogfood create without a source file or --source-remote, naming both', async () => {
-    const paths = await testPaths();
-    const io = lines();
-
-    expect(await runCli(['create', '--track', 'dogfood'], { paths, ...io.runtime, ...createRuntime() })).toBe(1);
-    const summary = io.err.join('\n');
-    expect(summary).toContain('--source-remote');
-    expect(summary).toContain(path.join(paths.configRoot, DOGFOOD_SOURCE_FILE));
-    expect(io.out).toEqual([]);
-  });
-
-  it('maps only prod to the public repository', async () => {
-    const paths = await testPaths();
-    const resolved: string[] = [];
     const io = lines();
 
     expect(
@@ -587,15 +558,23 @@ describe('gws-ea release sources', () => {
         paths,
         ...io.runtime,
         ...createRuntime(),
-        resolveRelease: async (sourceRemote, releaseRef) => {
-          resolved.push(sourceRemote);
-          return { sourceRemote, releaseRef, commit: 'b'.repeat(40) };
-        },
-        advanceProvision: async () => ({ status: 'ready' }),
+        collectCreateInputs,
+        resolveRelease,
       }),
-    ).toBe(0);
-    expect(resolved).toEqual([GWS_EA_RELEASE_REMOTE]);
-    expect(await runCli(['create', '--track', 'canary'], { paths, ...createRuntime(), ...lines().runtime })).toBe(1);
+    ).toBe(1);
+    expect(io.err.join('\n')).toContain('Release track prod has no release yet; use --track dogfood.');
+    expect(collectCreateInputs).not.toHaveBeenCalled();
+    expect(resolveRelease).not.toHaveBeenCalled();
+    expect(io.out).toEqual([]);
+  });
+
+  it('needs --source-remote for a track that is not a product track', async () => {
+    const paths = await testPaths();
+    const io = lines();
+
+    expect(await runCli(['create', '--track', 'canary'], { paths, ...io.runtime, ...createRuntime() })).toBe(1);
+    expect(io.err.join('\n')).toContain('--source-remote');
+    expect(io.out).toEqual([]);
   });
 });
 

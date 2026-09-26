@@ -52,7 +52,6 @@ const MAX_REPLY_CHARACTERS = 4000;
 /** The fixed gws-ea sources sent for each step; Claude cannot read anything else. */
 const STEP_SOURCES: Readonly<Record<string, readonly string[]>> = {
   secrets: ['src/gws-ea/create-input.ts'],
-  release_source: ['src/gws-ea/release-tracks.ts'],
   prerequisites: [
     'src/gws-ea/prerequisites.ts',
     'setup/gws-ea-prerequisites.ts',
