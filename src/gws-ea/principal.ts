@@ -36,7 +36,6 @@ export type PrincipalDiscoveryResult =
 
 export interface PrincipalDiscoveryDependencies {
   readonly runNcl?: (config: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
-  readonly runBootstrap?: (config: InstanceRuntimeConfig, args: readonly string[]) => Promise<void>;
   readonly runCommand?: SanitizedCommandRunner;
   readonly persistSelection?: (candidate: PrincipalCandidate) => Promise<PrincipalCandidate>;
 }
@@ -157,7 +156,7 @@ export async function listPrincipalCandidates(
   );
 }
 
-async function defaultRunBootstrap(
+async function runBootstrap(
   config: InstanceRuntimeConfig,
   args: readonly string[],
   run: SanitizedCommandRunner = runSanitizedCommand,
@@ -212,10 +211,6 @@ export async function reconcilePrincipalDm(
     throw new GwsEaError('invalid_arguments', 'Google Chat adapter instance is invalid');
   }
   const runNcl = dependencies.runNcl ?? runInstanceNclJson;
-  const runBootstrap =
-    dependencies.runBootstrap ??
-    ((runtimeConfig: InstanceRuntimeConfig, args: readonly string[]) =>
-      defaultRunBootstrap(runtimeConfig, args, dependencies.runCommand));
 
   // A non-null pointer is published only after main's OneCLI access is
   // verified, so it is the hard prerequisite for any principal wiring.
@@ -298,23 +293,27 @@ export async function reconcilePrincipalDm(
   ) {
     throw new GwsEaError('profile_mismatch', "Main's principal DM wiring was not confirmed");
   }
-  await runBootstrap(config, [
-    '--channel',
-    GCHAT_CHANNEL_TYPE,
-    '--user-id',
-    selected.userId,
-    '--platform-id',
-    selected.platformId,
-    '--display-name',
-    displayName,
-    '--agent-group-id',
-    mainAgentGroupId,
-    '--role',
-    'owner',
-    '--instance',
-    input.adapterInstance,
-    '--event-id',
-    stableEventId,
-  ]);
+  await runBootstrap(
+    config,
+    [
+      '--channel',
+      GCHAT_CHANNEL_TYPE,
+      '--user-id',
+      selected.userId,
+      '--platform-id',
+      selected.platformId,
+      '--display-name',
+      displayName,
+      '--agent-group-id',
+      mainAgentGroupId,
+      '--role',
+      'owner',
+      '--instance',
+      input.adapterInstance,
+      '--event-id',
+      stableEventId,
+    ],
+    dependencies.runCommand,
+  );
   return { status: 'bound', candidate: selected, agentGroupId: mainAgentGroupId, eventId: stableEventId };
 }

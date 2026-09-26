@@ -129,7 +129,6 @@ export interface ProductionProvisionInput {
   readonly runtime: InstanceRuntimeConfig;
   readonly gcp: GcpProjectInput;
   readonly providerCredentialMetadata?: ProviderCredentialMetadata;
-  readonly providerCredential?: ProviderCredential;
   readonly requestProviderCredential?: () => Promise<ProviderCredential>;
   readonly identity: MainIdentityInput;
   readonly adapterInstance: string;
@@ -971,7 +970,7 @@ export function createProductionProvisionSteps(
           name: 'the provider credential',
           observe: dependencies.observeProvider,
           apply: async (value) => {
-            const credential = value.input.providerCredential ?? (await value.input.requestProviderCredential?.());
+            const credential = await value.input.requestProviderCredential?.();
             if (!credential) {
               return humanPause(
                 'configure_provider',

@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { REDACTED } from './redact.js';
@@ -15,6 +15,7 @@ const OTHER_INSTANCE_ID = '11111111-1111-4111-8111-111111111111';
 const roots: string[] = [];
 
 afterEach(async () => {
+  vi.useRealTimers();
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
@@ -56,7 +57,7 @@ describe('GWS-EA run log', () => {
       return 'done';
     });
     await run.step('start_onecli', async (step) => {
-      step.mark('skipped');
+      step.mark('paused');
     });
     run.userInput('provider', 'claude');
     run.complete();
@@ -71,7 +72,7 @@ describe('GWS-EA run log', () => {
       /=== \[\S+Z\] provision_gcp \[\d+ms\] → success ===\n {2}project: gws-ea-0d8f6f7e3c2b4a1d9e8f\n {2}raw: steps\/01-provision-gcp\.log\n/u,
     );
     expect(progression).toMatch(
-      /=== \[\S+Z\] start_onecli \[\d+ms\] → skipped ===\n {2}raw: steps\/02-start-onecli\.log\n/u,
+      /=== \[\S+Z\] start_onecli \[\d+ms\] → paused ===\n {2}raw: steps\/02-start-onecli\.log\n/u,
     );
     expect(progression).toMatch(/=== \[\S+Z\] user-input → provider ===\n {2}value: claude\n/u);
     expect(progression).toMatch(/## \S+Z · completed \(total \d+s\)\n$/u);
@@ -152,11 +153,10 @@ describe('GWS-EA run log', () => {
 
   it('never lets concurrent runs share a directory or file', async () => {
     const paths = await controlPlanePaths();
-    const fixed = new Date('2026-09-25T10:00:00.000Z');
+    // Every run starts in the same second, so only the rest of its name keeps it apart.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-09-25T10:00:00.000Z') });
     const runs = await Promise.all(
-      Array.from({ length: 6 }, () =>
-        startRunLog({ paths, command: 'create', instanceId: INSTANCE_ID, now: () => fixed }),
-      ),
+      Array.from({ length: 6 }, () => startRunLog({ paths, command: 'create', instanceId: INSTANCE_ID })),
     );
 
     expect(new Set(runs.map((run) => run.directory)).size).toBe(runs.length);

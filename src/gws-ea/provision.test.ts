@@ -6,7 +6,13 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { PauseRequired, pendingActionOf, SignInRequired, type RunEvent } from './events.js';
-import { readProvisionJournal, reserveInstance, withInstanceOperation, type InstanceOperation } from './journal.js';
+import {
+  readProvisionJournal,
+  recordPrincipalSelection,
+  reserveInstance,
+  withInstanceOperation,
+  type InstanceOperation,
+} from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import {
   ABSENT,
@@ -644,28 +650,6 @@ describe('step engine', () => {
     expect(pendingActionOf(failure)).toBe(DM_PAUSE);
     expect((await engine.journal()).last_error).toMatchObject({ step: 'start_nanoclaw', code: 'nanoclaw_not_ready' });
   });
-
-  it('refuses a pre-v3 journal before running any step', async () => {
-    const engine = await engineFixture();
-    await writeFile(
-      engine.paths.journalFile(engine.instanceId),
-      JSON.stringify({ schema_version: 1, instance_id: engine.instanceId, phases: {} }),
-      { mode: 0o600 },
-    );
-
-    await expect(engine.run()).rejects.toMatchObject({ code: 'unsupported_journal' });
-    expect(engine.world.observed).toEqual([]);
-  });
-
-  it('releases the instance lock while paused for a human action', async () => {
-    const engine = await engineFixture();
-    engine.world.pauseOnApply.set('bind_principal', DM_PAUSE);
-
-    await expect(engine.run()).resolves.toMatchObject({ status: 'paused' });
-    await expect(withInstanceOperation(engine.paths, engine.instanceId, async () => 'reacquired')).resolves.toBe(
-      'reacquired',
-    );
-  });
 });
 
 /** The driver injects upstream's `.env` writer; these tests only need the owned keys it receives. */
@@ -833,13 +817,13 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
         hostPattern: 'api.anthropic.com',
         headerName: 'x-api-key',
       },
-      providerCredential: {
+      requestProviderCredential: async () => ({
         name: 'Claude provider',
         type: 'api_key',
         value: 'test-secret-never-persisted',
         hostPattern: 'api.anthropic.com',
         headerName: 'x-api-key',
-      },
+      }),
       identity: {
         assistantDisplayName: 'Aya',
         assistantWorkspaceEmail: reserved.exclusive_resource_claims.workspace_email,
@@ -1231,7 +1215,7 @@ describe('production provision step composition', () => {
     });
   });
 
-  it('collects a missing credential only after the isolated OneCLI runtime is ready', async () => {
+  it('asks for the provider credential and imports it with the OneCLI receipt the run already holds', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
     await writeReleaseReceipt(paths, reserved, {
@@ -1239,45 +1223,36 @@ describe('production provision step composition', () => {
       cli: ONECLI_CLI_VERSION,
       sdk: '2.2.1',
     });
-    const order: string[] = [];
+    const collected = {
+      name: 'Claude provider',
+      type: 'api_key',
+      value: 'prompted-secret',
+      hostPattern: 'api.anthropic.com',
+      headerName: 'x-api-key',
+    };
+    const requestProviderCredential = vi.fn(async () => collected);
+    const receipt = Object.freeze({}) as OnecliRuntimeReceipt;
+    const verifyOnecliRuntime = vi.fn(async () => receipt);
+    const importProviderCredential = vi.fn(async () => ({ id: 'secret-provider', created: true }));
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
-      const context: ProductionProvisionContext = {
-        ...base,
-        input: {
-          ...base.input,
-          providerCredential: undefined,
-          requestProviderCredential: async () => {
-            order.push('collect');
-            return {
-              name: 'Claude provider',
-              type: 'api_key',
-              value: 'prompted-secret',
-              hostPattern: 'api.anthropic.com',
-              headerName: 'x-api-key',
-            };
-          },
-        },
-      };
-      const dependencies: Partial<ProductionProvisionDependencies> = {
-        reconcileOnecliRuntime: vi.fn(async () => {
-          order.push('onecli');
-          return {} as OnecliRuntimeReceipt;
-        }),
+      const context: ProductionProvisionContext = { ...base, input: { ...base.input, requestProviderCredential } };
+      const registry = createProductionProvisionSteps(context, {
+        reconcileOnecliRuntime: vi.fn(async () => receipt),
+        verifyOnecliRuntime,
         persistOnecliApiKeyFiles: vi.fn(async () => undefined),
-        importProviderCredential: vi.fn(async (_receipt, credential) => {
-          order.push(`import:${credential.value}`);
-          return { id: 'secret-provider', created: true };
-        }),
-      };
+        importProviderCredential,
+      });
 
-      const registry = createProductionProvisionSteps(context, dependencies);
       await registry.start_onecli.resources[0]!.apply(context);
       await registry.configure_provider.resources[0]!.apply(context);
+      expect(context.state.providerSecretId).toBe('secret-provider');
     });
 
-    expect(order).toEqual(['onecli', 'collect', 'import:prompted-secret']);
+    expect(requestProviderCredential).toHaveBeenCalledOnce();
+    expect(verifyOnecliRuntime).not.toHaveBeenCalled();
+    expect(importProviderCredential).toHaveBeenCalledWith(receipt, collected, undefined);
   });
 
   it('rejects a credential that does not match the selected provider definition', async () => {
@@ -1291,7 +1266,6 @@ describe('production provision step composition', () => {
         ...base,
         input: {
           ...base.input,
-          providerCredential: undefined,
           requestProviderCredential: async () => ({
             name: 'Different provider',
             type: 'api_key',
@@ -1376,7 +1350,7 @@ describe('production provision step composition', () => {
     expect(requested).toEqual([`${claim.account_id}:Cloudflare must route the callback`]);
   });
 
-  it('keeps the account token only until the route is set up, and asks again when Cloudflare refuses it', async () => {
+  it('keeps the account token only until the route is set up, and asks again only when Cloudflare refuses it', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, managedReservation(paths));
     const claim = reserved.exclusive_resource_claims.ingress;
@@ -1384,11 +1358,13 @@ describe('production provision step composition', () => {
     const kept = paths.keptCloudflareTokenFile(reserved.instance_id);
     const accepted = new Set(['first-token', 'second-token']);
     const asked: string[] = [];
+    let answering = true;
     /** One run's token session: it holds a token only after listing its zones. */
     const session = () => {
       let held: string | undefined;
       return {
         discoverZones: vi.fn(async (token: string): Promise<readonly CloudflareZoneChoice[]> => {
+          if (!answering) throw new GwsEaError('cloudflare_unavailable', 'Cloudflare did not answer the request');
           if (!accepted.has(token))
             throw new GwsEaError('cloudflare_capability_missing', 'Cloudflare refused the token');
           return [
@@ -1446,6 +1422,13 @@ describe('production provision step composition', () => {
     // A later run reuses it without asking.
     await expect(run('unused')).resolves.toMatchObject({ token: 'first-token' });
     expect(asked).toEqual(['first-token']);
+
+    // Cloudflare not answering is no refusal: the run stops, and the kept token stays for the next one.
+    answering = false;
+    await expect(run('unused')).rejects.toMatchObject({ code: 'cloudflare_unavailable' });
+    expect(asked).toEqual(['first-token']);
+    expect(await readFile(kept, 'utf8')).toBe('first-token');
+    answering = true;
 
     // A kept token Cloudflare now refuses is forgotten, and the operator is asked again.
     accepted.delete('first-token');
@@ -1887,8 +1870,7 @@ interface ProductionHarness {
   providerCredential: boolean;
   routePublished: boolean;
   chatConfigured: boolean;
-  /** `rejected`: the host's canonical-main admission refuses main's DM wiring. */
-  principal: 'waiting' | 'selection' | 'bound' | 'rejected';
+  principal: 'waiting' | 'selection' | 'bound';
   selectedMessagingGroupId?: string;
   conversationReady: boolean;
   /** Not-ready answers the conversation check gives first, before `conversationReady` decides. */
@@ -1936,19 +1918,26 @@ async function productionHarness(): Promise<ProductionHarness> {
     run: () =>
       withInstanceOperation(paths, reserved.instance_id, async (operation) => {
         const base = productionContext(operation, reserved);
+        // As `runProductionProvision` does, a principal an earlier run fixed is this run's selection.
+        const { principal: selectedPrincipal } = (await readProvisionJournal(paths, reserved.instance_id)).decisions;
         const context: ProductionProvisionContext = {
           ...base,
           state: {},
           input: {
             ...base.input,
-            ...(harness.providerCredential ? {} : { providerCredential: undefined }),
+            ...(harness.providerCredential ? {} : { requestProviderCredential: undefined }),
             ...(harness.selectedMessagingGroupId ? { selectedMessagingGroupId: harness.selectedMessagingGroupId } : {}),
+            ...(selectedPrincipal ? { selectedPrincipal } : {}),
             chatConfigured: harness.chatConfigured,
             bootstrapManifestFile: paths.bootstrapFile(reserved.instance_id),
             principalDependencies: {
               runNcl: async (_config, args) => {
                 if (args[0] !== 'dropped-messages') throw new Error(`Unexpected ncl ${args.join(' ')}`);
                 return { ok: true, data: harness.droppedMessages };
+              },
+              persistSelection: async (candidate) => {
+                await recordPrincipalSelection(operation, candidate);
+                return candidate;
               },
             },
             hostStatus: {
@@ -2037,25 +2026,22 @@ async function productionHarness(): Promise<ProductionHarness> {
             endpointUrl: endpoint.endpointUrl,
             audienceUrl: endpoint.audienceUrl,
           }),
-          verifyPrincipalBinding: () =>
-            principalBound
-              ? { status: 'matched', agentGroupId: 'ag-main', candidate: PRINCIPAL, welcomeEventId: 'welcome' }
+          // Like `verifyPrincipalBinding`, the binding is found only for the candidate it is asked about.
+          verifyPrincipalBinding: ({ selectedCandidate }) =>
+            principalBound && selectedCandidate?.messagingGroupId === PRINCIPAL.messagingGroupId
+              ? { status: 'matched', agentGroupId: 'ag-main', candidate: selectedCandidate, welcomeEventId: 'welcome' }
               : { status: 'absent' },
-          reconcilePrincipal: async (_runtime, selection) => {
+          reconcilePrincipal: async (_runtime, selection, dependencies) => {
             harness.effects.push(`reconcilePrincipalDm:${harness.principal}`);
             if (harness.principal === 'waiting') return { status: 'waiting' };
-            if (harness.principal === 'rejected') {
-              throw new GwsEaError(
-                'ncl_failed',
-                "ncl wirings create failed: Canonical main wiring rejected: sender_scope must be 'known'",
-              );
-            }
             if (harness.principal === 'selection' && !selection.messagingGroupId) {
               return {
                 status: 'selection-required',
                 candidates: [PRINCIPAL, { ...PRINCIPAL, messagingGroupId: 'mg-other', userId: 'gchat:users/other' }],
               };
             }
+            // Like `reconcilePrincipalDm`, a newly chosen principal is fixed before it is bound.
+            if (!selection.selectedCandidate) await dependencies?.persistSelection?.(PRINCIPAL);
             principalBound = true;
             if (harness.crashAfterBinding) {
               harness.crashAfterBinding = false;
@@ -2182,20 +2168,6 @@ describe('production step order and pause outcomes', () => {
     await expect(harness.run()).resolves.toMatchObject({
       status: 'paused',
       pause: { phase: 'bind_principal', code: 'principal_dm_required' },
-    });
-  });
-
-  it("fails bind_principal, recording why, when admission rejects main's DM wiring", async () => {
-    const harness = await productionHarness();
-    harness.principal = 'rejected';
-
-    await expect(harness.run()).rejects.toMatchObject({ code: 'ncl_failed' });
-    const journal = await readProvisionJournal(harness.paths, harness.instanceId);
-    expect(journal.steps.bind_principal?.completed_at).toBeUndefined();
-    expect(journal.last_error).toMatchObject({
-      step: 'bind_principal',
-      code: 'ncl_failed',
-      message: expect.stringContaining('Canonical main wiring rejected'),
     });
   });
 

@@ -36,7 +36,7 @@ const STEPS_DIRECTORY = 'steps';
 const MAX_FIELD_CHARACTERS = 300;
 
 export type LogFieldValue = string | number | boolean;
-export type StepStatus = 'success' | 'skipped' | 'failed' | 'interactive' | 'paused';
+export type StepStatus = 'success' | 'failed' | 'paused';
 
 export interface CommandCapture {
   readonly program: string;
@@ -59,7 +59,7 @@ export interface StepLog {
   readonly rawLog: string;
   /** Record a short parsed fact on this step's progression entry. */
   fact(key: string, value: LogFieldValue): void;
-  mark(status: 'skipped' | 'interactive' | 'paused'): void;
+  mark(status: 'paused'): void;
   /** Append redacted text to this step's raw log. */
   write(text: string): void;
   /** Record a dotenv file by its key names only. */
@@ -94,7 +94,6 @@ export interface StartRunOptions {
   readonly secretDirectories?: readonly string[];
   /** Enables the fixture capture sink, writing to this directory. Off when absent. */
   readonly captureFixturesTo?: string;
-  readonly now?: () => Date;
 }
 
 const activeSteps = new AsyncLocalStorage<StepLog>();
@@ -160,8 +159,8 @@ function capturableHttpPath(method: string, url: string): string | undefined {
   return /\/tokens?(?:\/|$)/u.test(pathname) ? undefined : pathname;
 }
 
-async function createRunDirectory(parent: string, now: Date): Promise<{ id: string; directory: string }> {
-  const stamp = now
+async function createRunDirectory(parent: string): Promise<{ id: string; directory: string }> {
+  const stamp = new Date()
     .toISOString()
     .replace(/[-:]/gu, '')
     .replace(/\.\d+Z$/u, 'Z');
@@ -181,7 +180,6 @@ class Run implements RunLog {
   readonly id: string;
   #directory: string;
   readonly #paths: ControlPlanePaths;
-  readonly #now: () => Date;
   readonly #started = performance.now();
   readonly #captureDirectory: string | undefined;
   readonly #failures = new WeakMap<object, string>();
@@ -189,17 +187,10 @@ class Run implements RunLog {
   #stepCount = 0;
   #lastStep: string | undefined;
 
-  constructor(
-    id: string,
-    directory: string,
-    paths: ControlPlanePaths,
-    now: () => Date,
-    captureDirectory: string | undefined,
-  ) {
+  constructor(id: string, directory: string, paths: ControlPlanePaths, captureDirectory: string | undefined) {
     this.id = id;
     this.#directory = directory;
     this.#paths = paths;
-    this.#now = now;
     this.#captureDirectory = captureDirectory;
   }
 
@@ -217,7 +208,7 @@ class Run implements RunLog {
 
   header(command: string, instanceId: string | undefined, meta: Readonly<Record<string, LogFieldValue>>): void {
     this.append([
-      `## ${this.#now().toISOString()} · gws-ea ${command} started`,
+      `## ${new Date().toISOString()} · gws-ea ${command} started`,
       `  run: ${this.id}`,
       `  instance: ${instanceId ?? 'unreserved'}`,
       `  pid: ${process.pid}`,
@@ -234,7 +225,7 @@ class Run implements RunLog {
     const descriptor = fs.openSync(path.join(this.#directory, relativeRawLog), 'wx', 0o600);
     let open = true;
     const facts: Array<readonly [string, string]> = [];
-    let marked: 'skipped' | 'interactive' | 'paused' | undefined;
+    let marked: 'paused' | undefined;
     const write = (text: string): void => {
       if (open && text) fs.writeSync(descriptor, redact(text));
     };
@@ -253,7 +244,7 @@ class Run implements RunLog {
       captureHttp: (capture) => this.#captureHttp(capture),
     };
 
-    const startedAt = this.#now().toISOString();
+    const startedAt = new Date().toISOString();
     const started = performance.now();
     const entry = (status: StepStatus, error?: unknown): void => {
       this.append([
@@ -286,7 +277,7 @@ class Run implements RunLog {
   }
 
   userInput(key: string, value: string): void {
-    this.append([`=== [${this.#now().toISOString()}] user-input → ${key} ===`, `  value: ${field(value)}`, '']);
+    this.append([`=== [${new Date().toISOString()}] user-input → ${key} ===`, `  value: ${field(value)}`, '']);
   }
 
   async assignInstance(instanceId: string): Promise<void> {
@@ -300,31 +291,29 @@ class Run implements RunLog {
     await preparePrivateDirectory(parent);
     await rename(this.#directory, target);
     this.#directory = target;
-    this.append([`=== [${this.#now().toISOString()}] instance-reserved → ${instanceId} ===`, '']);
+    this.append([`=== [${new Date().toISOString()}] instance-reserved → ${instanceId} ===`, '']);
   }
 
   complete(): void {
     this.append([
-      `## ${this.#now().toISOString()} · completed (total ${formatTotal(performance.now() - this.#started)})`,
+      `## ${new Date().toISOString()} · completed (total ${formatTotal(performance.now() - this.#started)})`,
     ]);
   }
 
   pause(reason: string, step?: string): void {
     const pausedAt = step ?? this.#lastStep;
     const at = pausedAt ? ` at ${pausedAt}` : '';
-    this.append([`## ${this.#now().toISOString()} · paused${at} (${field(reason)})`]);
+    this.append([`## ${new Date().toISOString()} · paused${at} (${field(reason)})`]);
   }
 
   interrupt(signal: NodeJS.Signals): void {
     const at = this.#lastStep ? ` at ${this.#lastStep}` : '';
-    this.append([`## ${this.#now().toISOString()} · interrupted${at} (${signal})`]);
+    this.append([`## ${new Date().toISOString()} · interrupted${at} (${signal})`]);
   }
 
   abort(error: unknown): void {
     const step = typeof error === 'object' && error !== null ? this.#failures.get(error) : undefined;
-    this.append([
-      `## ${this.#now().toISOString()} · aborted${step ? ` at ${step}` : ''} (err=${safeErrorCode(error)})`,
-    ]);
+    this.append([`## ${new Date().toISOString()} · aborted${step ? ` at ${step}` : ''} (err=${safeErrorCode(error)})`]);
   }
 
   #stage(label: string, capture: Readonly<Record<string, unknown>>): void {
@@ -368,7 +357,6 @@ class Run implements RunLog {
 export async function startRunLog(options: StartRunOptions): Promise<RunLog> {
   if (options.instanceId !== undefined) assertInstanceId(options.instanceId);
   await Promise.all((options.secretDirectories ?? []).map(registerSecretDirectory));
-  const now = options.now ?? (() => new Date());
   const parent =
     options.instanceId === undefined
       ? options.paths.preReservationLogsRoot
@@ -376,9 +364,9 @@ export async function startRunLog(options: StartRunOptions): Promise<RunLog> {
   await preparePrivateDirectory(options.paths.logsRoot);
   await preparePrivateDirectory(parent);
   if (options.captureFixturesTo !== undefined) await preparePrivateDirectory(options.captureFixturesTo);
-  const { id, directory } = await createRunDirectory(parent, now());
+  const { id, directory } = await createRunDirectory(parent);
   await mkdir(path.join(directory, STEPS_DIRECTORY), { mode: 0o700 });
-  const run = new Run(id, directory, options.paths, now, options.captureFixturesTo);
+  const run = new Run(id, directory, options.paths, options.captureFixturesTo);
   run.header(options.command, options.instanceId, options.meta ?? {});
   return run;
 }

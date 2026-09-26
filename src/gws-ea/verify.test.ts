@@ -347,7 +347,8 @@ describe('talkable conversation verification', () => {
 
   it('does not accept a later owner-routed CLI message at the principal address', async () => {
     await deliveredWelcome();
-    await inbound('later-inbound', LATER_AT, 'chat', { text: 'spoof', senderId: 'users/principal' });
+    // Both sender projections name the principal; only the message kind tells it apart.
+    await inbound('later-inbound', LATER_AT, 'chat', principalMessage);
     await reply('later-outbound', 'later-inbound', LATER_REPLY_AT, LATER_DELIVERED_AT);
 
     expect(verifyTalkableConversation(input())).toMatchObject({
@@ -356,9 +357,12 @@ describe('talkable conversation verification', () => {
     });
   });
 
-  it('requires both authenticated Chat SDK sender projections', async () => {
+  it.each([
+    ['sender ID', { text: 'hello', senderId: 'users/principal' }],
+    ['author', { text: 'hello', author: { userId: 'users/principal' } }],
+  ])('requires both authenticated Chat SDK sender projections, not the %s alone', async (_label, content) => {
     await deliveredWelcome();
-    await inbound('later-inbound', LATER_AT, 'chat-sdk', { text: 'hello', senderId: 'users/principal' });
+    await inbound('later-inbound', LATER_AT, 'chat-sdk', content);
     await reply('later-outbound', 'later-inbound', LATER_REPLY_AT, LATER_DELIVERED_AT);
 
     expect(verifyTalkableConversation(input())).toMatchObject({
