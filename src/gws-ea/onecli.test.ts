@@ -5,18 +5,12 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
-  buildComposeEnvironment,
-  buildComposeInvocation,
-  buildOnecliCliEnvironment,
-  cleanupOnecliDockerOrphans,
   importProviderCredential,
   observeOnecliRuntime,
   onecliSecretMatchesCredentialMetadata,
   persistOnecliApiKeyFiles,
-  prepareOnecliRuntime,
   reconcileOnecliRuntime,
   removeOnecliRuntime,
-  validateObservedOnecliRuntime,
   verifyOnecliRuntime,
   type OnecliCommand,
   type OnecliCommandRunner,
@@ -35,6 +29,20 @@ const ONECLI_API_KEY = `oc_${'a'.repeat(64)}`;
 const DOCKER_ENDPOINT = 'unix:///Users/operator/.docker/run/docker.sock';
 /** The pins this instance's release recorded, deliberately not this launcher's. */
 const PINS: OnecliPins = { gateway: '1.41.3', cli: '2.2.4' };
+/** An operator shell that points Docker, Compose, and OneCLI at another runtime. */
+const HOSTILE_AMBIENT: NodeJS.ProcessEnv = {
+  PATH: '/safe/bin',
+  HOME: '/host/home',
+  LANG: 'en_US.UTF-8',
+  DOCKER_HOST: 'tcp://attacker.invalid:2376',
+  COMPOSE_PROJECT_NAME: 'victim',
+  COMPOSE_FILE: '/tmp/attacker.yml',
+  ONECLI_API_HOST: 'https://attacker.invalid',
+  ONECLI_API_KEY: 'ambient-secret',
+  POSTGRES_PASSWORD: 'ambient-postgres',
+  NANOCLAW_INSTALL_ID: 'victim',
+  GCHAT_CREDENTIALS: 'channel-secret',
+};
 const roots: string[] = [];
 
 afterEach(async () => {
@@ -79,221 +87,9 @@ describe('OneCLI child boundaries', () => {
       false,
     );
   });
-
-  it('uses explicit Compose coordinates, the recorded Docker endpoint, and no hostile ambient targeting', async () => {
-    const layout = await layoutFixture();
-    const env = buildOnecliCliEnvironment(
-      layout,
-      {
-        PATH: '/safe/bin',
-        HOME: '/host/home',
-        LANG: 'en_US.UTF-8',
-        COMPOSE_PROJECT_NAME: 'victim',
-        COMPOSE_FILE: '/tmp/attacker.yml',
-        ONECLI_API_HOST: 'https://attacker.invalid',
-        ONECLI_API_KEY: 'ambient-secret',
-        POSTGRES_PASSWORD: 'ambient-postgres',
-        NANOCLAW_INSTALL_ID: 'victim',
-        GCHAT_CREDENTIALS: 'channel-secret',
-      },
-      undefined,
-    );
-    const invocation = buildComposeInvocation(layout, ['config']);
-    const composeEnv = buildComposeEnvironment(layout, {
-      PATH: '/safe/bin',
-      DOCKER_HOST: 'tcp://attacker.invalid:2376',
-      HOME: '/host/home',
-      COMPOSE_PROJECT_NAME: 'victim',
-      COMPOSE_FILE: '/tmp/attacker.yml',
-      ONECLI_API_HOST: 'https://attacker.invalid',
-      POSTGRES_PASSWORD: 'ambient-postgres',
-      NANOCLAW_INSTALL_ID: 'victim',
-      GCHAT_CREDENTIALS: 'channel-secret',
-    });
-
-    expect(invocation).toEqual({
-      command: 'docker',
-      args: [
-        'compose',
-        '--project-name',
-        layout.project,
-        '--file',
-        layout.composeFile,
-        '--project-directory',
-        layout.rootDirectory,
-        '--env-file',
-        layout.envFile,
-        'config',
-      ],
-      cwd: layout.rootDirectory,
-    });
-    expect(env).toMatchObject({
-      PATH: '/safe/bin',
-      HOME: layout.cliHome,
-      LANG: 'en_US.UTF-8',
-      ONECLI_API_HOST: layout.appUrl,
-    });
-    expect(env).not.toHaveProperty('COMPOSE_PROJECT_NAME');
-    expect(env).not.toHaveProperty('COMPOSE_FILE');
-    expect(env).not.toHaveProperty('ONECLI_API_KEY');
-    expect(env).not.toHaveProperty('POSTGRES_PASSWORD');
-    expect(env).not.toHaveProperty('NANOCLAW_INSTALL_ID');
-    expect(env).not.toHaveProperty('GCHAT_CREDENTIALS');
-    expect(composeEnv).toEqual({ PATH: '/safe/bin', HOME: '/host/home', DOCKER_HOST: DOCKER_ENDPOINT });
-  });
 });
 
-describe('OneCLI runtime material', () => {
-  it('creates owner-only runtime files without embedding secrets in Compose or its env file', async () => {
-    const layout = await layoutFixture();
-    await prepareOnecliRuntime(layout, PINS);
-
-    for (const file of [
-      layout.composeFile,
-      layout.envFile,
-      layout.postgresPasswordFile,
-      layout.encryptionKeyFile,
-      layout.gatewayInternalSecretFile,
-    ]) {
-      expect((await stat(file)).mode & 0o777).toBe(0o600);
-    }
-    expect((await stat(layout.rootDirectory)).mode & 0o777).toBe(0o700);
-    expect((await stat(layout.secretsDirectory)).mode & 0o777).toBe(0o700);
-    const compose = await readFile(layout.composeFile, 'utf8');
-    const envFile = await readFile(layout.envFile, 'utf8');
-    for (const secretFile of [
-      layout.postgresPasswordFile,
-      layout.encryptionKeyFile,
-      layout.gatewayInternalSecretFile,
-    ]) {
-      const secret = (await readFile(secretFile, 'utf8')).trim();
-      expect(secret.length).toBeGreaterThan(30);
-      expect(compose).not.toContain(secret);
-      expect(envFile).not.toContain(secret);
-    }
-    expect((await readFile(layout.encryptionKeyFile, 'utf8')).trim()).toMatch(/^[A-Za-z0-9+/]+={0,2}$/u);
-    expect(compose).toContain(`ghcr.io/onecli/onecli:${PINS.gateway}`);
-  });
-});
-
-describe('OneCLI runtime verification', () => {
-  it('accepts only the exact labels, health, recorded image pins, ports, volumes, and network topology', async () => {
-    const layout = await layoutFixture();
-    expect(
-      validateObservedOnecliRuntime(layout, PINS, {
-        containers: [
-          {
-            service: 'postgres',
-            image: 'postgres:18-alpine',
-            instanceId: INSTANCE_ID,
-            project: layout.project,
-            running: true,
-            health: 'healthy',
-            publishedPorts: {},
-            networks: [layout.backendNetwork],
-            volumes: [{ name: layout.postgresVolume, destination: '/var/lib/postgresql' }],
-          },
-          {
-            service: 'app',
-            image: `ghcr.io/onecli/onecli:${PINS.gateway}`,
-            instanceId: INSTANCE_ID,
-            project: layout.project,
-            running: true,
-            health: 'healthy',
-            publishedPorts: { '10254/tcp': [{ hostIp: '127.0.0.1', hostPort: '31002' }] },
-            networks: [layout.backendNetwork],
-            volumes: [{ name: layout.appVolume, destination: '/app/data' }],
-          },
-          {
-            service: 'gateway',
-            image: `ghcr.io/onecli/onecli:${PINS.gateway}`,
-            instanceId: INSTANCE_ID,
-            project: layout.project,
-            running: true,
-            health: 'healthy',
-            publishedPorts: { '10255/tcp': [{ hostIp: '127.0.0.1', hostPort: '31003' }] },
-            networks: [layout.agentEgressNetwork, layout.backendNetwork],
-            volumes: [{ name: layout.appVolume, destination: '/app/data' }],
-          },
-        ],
-        networks: [
-          { name: layout.backendNetwork, instanceId: INSTANCE_ID, role: 'backend', internal: false },
-          { name: layout.agentEgressNetwork, instanceId: INSTANCE_ID, role: 'agent-egress', internal: true },
-        ],
-        volumes: [
-          { name: layout.postgresVolume, instanceId: INSTANCE_ID, role: 'postgres-data' },
-          { name: layout.appVolume, instanceId: INSTANCE_ID, role: 'app-data' },
-        ],
-      }),
-    ).toBeUndefined();
-  });
-
-  it('rejects a gateway that is not the only dual-homed service', async () => {
-    const layout = await layoutFixture();
-    expect(() =>
-      validateObservedOnecliRuntime(layout, PINS, {
-        containers: [
-          {
-            service: 'postgres',
-            image: 'postgres:18-alpine',
-            instanceId: INSTANCE_ID,
-            project: layout.project,
-            running: true,
-            health: 'healthy',
-            publishedPorts: {},
-            networks: [layout.backendNetwork, layout.agentEgressNetwork],
-            volumes: [{ name: layout.postgresVolume, destination: '/var/lib/postgresql' }],
-          },
-        ],
-        networks: [],
-        volumes: [],
-      }),
-    ).toThrow(/topology/i);
-  });
-
-  it('removes only correctly owned orphan containers before reconciliation', async () => {
-    const layout = await layoutFixture();
-    const calls: string[][] = [];
-    const runner: OnecliCommandRunner = async (command) => {
-      calls.push([...command.args]);
-      if (command.args[0] === 'container' && command.args[1] === 'ls') {
-        return { stdout: 'orphan-id\n', stderr: '' };
-      }
-      if (command.args[0] === 'container' && command.args[1] === 'inspect') {
-        return {
-          stdout: JSON.stringify([
-            {
-              Id: 'orphan-id',
-              Config: {
-                Image: 'irrelevant',
-                Labels: {
-                  'com.docker.compose.project': layout.project,
-                  'com.docker.compose.service': 'retired-service',
-                  'dev.gws-ea.instance-id': INSTANCE_ID,
-                },
-              },
-              State: { Running: false },
-              NetworkSettings: { Ports: {}, Networks: {} },
-              Mounts: [],
-            },
-          ]),
-          stderr: '',
-        };
-      }
-      if (command.args[0] === 'container' && command.args[1] === 'rm') {
-        return { stdout: 'orphan-id', stderr: '' };
-      }
-      throw new Error(`unexpected command: ${command.args.join(' ')}`);
-    };
-
-    await cleanupOnecliDockerOrphans({
-      layout,
-      runner,
-      environment: buildComposeEnvironment(layout, { PATH: '/safe/bin' }),
-    });
-    expect(calls).toContainEqual(['container', 'rm', '--force', 'orphan-id']);
-  });
-
+describe('OneCLI runtime removal', () => {
   it('removes and verifies only the exact owned OneCLI networks and volumes', async () => {
     const layout = await layoutFixture();
     let resourcesPresent = true;
@@ -369,6 +165,8 @@ type ServiceName = 'postgres' | 'app' | 'gateway';
 /** An in-memory Docker daemon and OneCLI CLI for one instance's runtime. */
 interface DockerWorld {
   readonly services: Map<ServiceName, { running: boolean; health: Health }>;
+  /** Containers outside the three services, by ID and as Docker inspects them, until `container rm` removes them. */
+  readonly strays: Map<string, unknown>;
   readonly calls: OnecliCommand[];
   /** Health a container takes when `up` (re)creates or starts it. */
   startsAs: Health;
@@ -379,6 +177,8 @@ interface DockerWorld {
   versionOutput?: string;
   /** The image the gateway container runs, instead of the recorded pin. */
   gatewayImage?: string;
+  /** The networks the postgres container joins, instead of the backend alone. */
+  postgresNetworks?: readonly string[];
 }
 
 function containerJson(layout: OnecliRuntimeLayout, service: ServiceName, state: { running: boolean; health: Health }) {
@@ -417,6 +217,7 @@ function containerJson(layout: OnecliRuntimeLayout, service: ServiceName, state:
 function dockerWorld(layout: OnecliRuntimeLayout, initial: Partial<Record<ServiceName, Health | 'stopped'>> = {}) {
   const world: DockerWorld = {
     services: new Map(),
+    strays: new Map(),
     calls: [],
     startsAs: 'healthy',
     serverVersion: PINS.gateway,
@@ -447,17 +248,29 @@ function dockerWorld(layout: OnecliRuntimeLayout, initial: Partial<Record<Servic
     }
     if (command.command !== 'docker') throw new Error(`unexpected program: ${command.command}`);
     if (args[0] === 'container' && args[1] === 'ls') {
-      return { stdout: [...world.services.keys()].map((service) => `id-${service}\n`).join(''), stderr: '' };
+      const ids = [...[...world.services.keys()].map((service) => `id-${service}`), ...world.strays.keys()];
+      return { stdout: ids.map((id) => `${id}\n`).join(''), stderr: '' };
     }
     if (args[0] === 'container' && args[1] === 'inspect') {
       return reply(
         args.slice(2).map((id) => {
+          const stray = world.strays.get(id);
+          if (stray !== undefined) return stray;
           const service = id.replace(/^id-/u, '') as ServiceName;
           const container = containerJson(layout, service, world.services.get(service)!);
           if (service === 'gateway' && world.gatewayImage !== undefined) container.Config.Image = world.gatewayImage;
+          if (service === 'postgres' && world.postgresNetworks !== undefined) {
+            container.NetworkSettings.Networks = Object.fromEntries(
+              world.postgresNetworks.map((network) => [network, {}]),
+            );
+          }
           return container;
         }),
       );
+    }
+    if (args[0] === 'container' && args[1] === 'rm') {
+      for (const id of args.slice(3)) world.strays.delete(id);
+      return { stdout: '', stderr: '' };
     }
     if (args[0] === 'network' && args[1] === 'inspect') {
       return reply([
@@ -560,6 +373,17 @@ describe('OneCLI runtime observation', () => {
     });
   });
 
+  it('refuses a runtime whose gateway is not the only dual-homed service', async () => {
+    const layout = await layoutFixture();
+    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
+    world.postgresNetworks = [layout.backendNetwork, layout.agentEgressNetwork];
+
+    await expect(observeOnecliRuntime(layout, PINS, { dockerCommandRunner: runner })).rejects.toMatchObject({
+      code: 'unsafe_onecli_topology',
+      message: expect.stringContaining('postgres'),
+    });
+  });
+
   it('is unknown, not absent, when Docker does not answer', async () => {
     const layout = await layoutFixture();
     const runner: OnecliCommandRunner = async () => {
@@ -574,7 +398,7 @@ describe('OneCLI runtime observation', () => {
 });
 
 describe('OneCLI runtime start and repair', () => {
-  it('pulls under its own timeout, then waits for health with an explicit timeout sized to the health budgets', async () => {
+  it('starts from owner-only material at its own Compose coordinates and Docker endpoint, under separate pull and health timeouts', async () => {
     const layout = await layoutFixture();
     const { world, runner } = dockerWorld(layout);
 
@@ -582,29 +406,93 @@ describe('OneCLI runtime start and repair', () => {
       dockerCommandRunner: runner,
       runCommand: runner,
       fetch: healthyFetch(),
+      ambientEnv: HOSTILE_AMBIENT,
     });
 
-    expect(composeCalls(world)).toEqual([
-      ['pull', '--policy', 'missing'],
-      [
-        'up',
-        '--detach',
-        '--wait',
-        '--wait-timeout',
-        String(ONECLI_WAIT_TIMEOUT_SECONDS),
-        '--pull',
-        'never',
-        '--remove-orphans',
-      ],
+    const project = [
+      'compose',
+      '--project-name',
+      layout.project,
+      '--file',
+      layout.composeFile,
+      '--project-directory',
+      layout.rootDirectory,
+      '--env-file',
+      layout.envFile,
+    ];
+    expect(world.calls.filter((call) => call.args[0] === 'compose').map(({ args, cwd }) => ({ args, cwd }))).toEqual([
+      { args: [...project, 'pull', '--policy', 'missing'], cwd: layout.rootDirectory },
+      {
+        args: [
+          ...project,
+          'up',
+          '--detach',
+          '--wait',
+          '--wait-timeout',
+          String(ONECLI_WAIT_TIMEOUT_SECONDS),
+          '--pull',
+          'never',
+          '--remove-orphans',
+        ],
+        cwd: layout.rootDirectory,
+      },
     ]);
     const pull = world.calls.find((call) => call.args.includes('pull'))!;
     const up = world.calls.find((call) => call.args.includes('up'))!;
     expect(pull).toMatchObject({ stream: true });
     expect(up.timeoutMs).toBeGreaterThan(ONECLI_WAIT_TIMEOUT_SECONDS * 1_000);
     expect(up.timeoutMs).not.toBe(pull.timeoutMs);
-    expect(world.calls.filter((call) => call.command === 'docker').map((call) => call.env?.DOCKER_HOST)).toEqual(
-      world.calls.filter((call) => call.command === 'docker').map(() => DOCKER_ENDPOINT),
+    const docker = world.calls.filter((call) => call.command === 'docker');
+    expect(docker.map((call) => call.env)).toEqual(
+      docker.map(() => ({ PATH: '/safe/bin', LANG: 'en_US.UTF-8', HOME: '/host/home', DOCKER_HOST: DOCKER_ENDPOINT })),
     );
+
+    for (const file of [
+      layout.composeFile,
+      layout.envFile,
+      layout.postgresPasswordFile,
+      layout.encryptionKeyFile,
+      layout.gatewayInternalSecretFile,
+    ]) {
+      expect((await stat(file)).mode & 0o777).toBe(0o600);
+    }
+    expect((await stat(layout.rootDirectory)).mode & 0o777).toBe(0o700);
+    expect((await stat(layout.secretsDirectory)).mode & 0o777).toBe(0o700);
+    const compose = await readFile(layout.composeFile, 'utf8');
+    const envFile = await readFile(layout.envFile, 'utf8');
+    for (const secretFile of [
+      layout.postgresPasswordFile,
+      layout.encryptionKeyFile,
+      layout.gatewayInternalSecretFile,
+    ]) {
+      const secret = (await readFile(secretFile, 'utf8')).trim();
+      expect(secret.length).toBeGreaterThan(30);
+      expect(compose).not.toContain(secret);
+      expect(envFile).not.toContain(secret);
+    }
+    expect((await readFile(layout.encryptionKeyFile, 'utf8')).trim()).toMatch(/^[A-Za-z0-9+/]+={0,2}$/u);
+    expect(compose).toContain(`ghcr.io/onecli/onecli:${PINS.gateway}`);
+  });
+
+  it('removes an owned container of a retired service before starting the runtime', async () => {
+    const layout = await layoutFixture();
+    const { world, runner } = dockerWorld(layout);
+    const postgres = containerJson(layout, 'postgres', { running: false, health: 'unhealthy' });
+    const labels = { ...postgres.Config.Labels, 'com.docker.compose.service': 'retired-service' };
+    world.strays.set('id-retired', { ...postgres, Id: 'id-retired', Config: { ...postgres.Config, Labels: labels } });
+
+    await reconcileOnecliRuntime(layout, PINS, {
+      dockerCommandRunner: runner,
+      runCommand: runner,
+      fetch: healthyFetch(),
+    });
+
+    const commands = world.calls.map((call) => call.args.join(' '));
+    const beforeCompose = commands.slice(
+      0,
+      commands.findIndex((command) => command.startsWith('compose ')),
+    );
+    expect(beforeCompose).toContain('container rm --force id-retired');
   });
 
   it('force-recreates only an unhealthy postgres on resume, then continues', async () => {
@@ -669,17 +557,22 @@ describe('OneCLI runtime start and repair', () => {
 });
 
 describe('OneCLI health and version check', () => {
-  it('accepts the runtime at this instance’s recorded pins and imports the provider credential through the CLI', async () => {
+  it('accepts the runtime at this instance’s recorded pins and imports the provider credential through a CLI aimed only at it', async () => {
     const layout = await layoutFixture();
-    await prepareOnecliRuntime(layout, PINS);
+    await mkdir(layout.secretsDirectory, { recursive: true, mode: 0o700 });
     const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
     const fetch = healthyFetch();
 
-    const receipt = await verifyOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, runCommand: runner, fetch });
+    const receipt = await verifyOnecliRuntime(layout, PINS, {
+      dockerCommandRunner: runner,
+      runCommand: runner,
+      fetch,
+      ambientEnv: HOSTILE_AMBIENT,
+    });
     const imported = await importProviderCredential(
       receipt,
       { name: 'Anthropic', type: 'anthropic', value: 'provider-real-secret', hostPattern: 'api.anthropic.com' },
-      { runCommand: runner },
+      { runCommand: runner, ambientEnv: HOSTILE_AMBIENT },
     );
 
     expect(fetch.mock.calls.map(([url]) => String(url)).sort()).toEqual(
@@ -688,8 +581,13 @@ describe('OneCLI health and version check', () => {
     expect(Object.isFrozen(receipt)).toBe(true);
     expect(Object.keys(receipt)).toEqual([]);
     expect(imported).toEqual({ id: 'secret-provider', created: true });
-    const cli = world.calls.filter((call) => call.command === layout.cliExecutable).map((call) => call.args.join(' '));
-    expect(cli.slice(0, 2)).toEqual(['auth api-key', 'version']);
+    const cliCalls = world.calls.filter((call) => call.command === layout.cliExecutable);
+    expect(cliCalls.slice(0, 2).map((call) => call.args.join(' '))).toEqual(['auth api-key', 'version']);
+    // Only the key `auth api-key` returned reaches the CLI; the ambient shell's key, host, and targets never do.
+    const [auth, ...keyed] = cliCalls;
+    const keyless = { PATH: '/safe/bin', LANG: 'en_US.UTF-8', HOME: layout.cliHome, ONECLI_API_HOST: layout.appUrl };
+    expect(auth?.env).toEqual(keyless);
+    expect(keyed.map((call) => call.env)).toEqual(keyed.map(() => ({ ...keyless, ONECLI_API_KEY })));
     const create = world.calls.find((call) => call.args[0] === 'secrets' && call.args[1] === 'create')!;
     expect(create.args).toContain('--file');
     expect(create.args).not.toContain('provider-real-secret');
@@ -743,7 +641,6 @@ describe('OneCLI health and version check', () => {
 
   it('removes an orphaned plaintext staging file before verifying or importing', async () => {
     const layout = await layoutFixture();
-    await prepareOnecliRuntime(layout, PINS);
     await mkdir(path.dirname(layout.providerStagingFile), { recursive: true });
     await writeFile(layout.providerStagingFile, 'orphaned-provider-secret', { mode: 0o600 });
     const { runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });

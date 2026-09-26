@@ -10,9 +10,7 @@ import { GwsEaError } from './types.js';
 import { allocateInstanceId } from './registry.js';
 import {
   buildInstanceCliCommand,
-  buildInstanceHostEnvironment,
   createInstanceRuntimeConfig,
-  createInstanceServiceLayout,
   googleChatProjectNumberFile,
   instanceServicePid,
   launchInstanceHost,
@@ -22,6 +20,7 @@ import {
   reconcileInstanceService,
   runInstanceOnecliAdminCommand,
   type InstanceRuntimeConfig,
+  type InstanceServiceLayout,
   type UpsertEnvVars,
 } from './service.js';
 import { writeOwnerOnlyFileExclusive } from './secrets.js';
@@ -97,18 +96,13 @@ async function fixture(): Promise<{ config: InstanceRuntimeConfig; home: string 
 
 describe('GWS-EA instance runtime', () => {
   it('persists only independent values and the Docker endpoint, and derives every instance target', async () => {
-    const { config, home } = await fixture();
+    const { config } = await fixture();
     await persistInstanceRuntime(config, upsertEnvVars);
-    const layout = createInstanceServiceLayout(config, { platform: 'macos', homeDirectory: home });
-    const environmentFile = await readFile(layout.environmentFile, 'utf8');
-    const manifest = await readFile(layout.runtimeConfigFile, 'utf8');
+    const environmentPath = path.join(config.checkout_realpath, '.env');
+    const environmentFile = await readFile(environmentPath, 'utf8');
+    const manifest = await readFile(path.join(config.checkout_realpath, 'data', 'gws-ea', 'runtime.json'), 'utf8');
 
     expect(config.install_id).toBe(config.instance_id.replaceAll('-', ''));
-    expect(layout.serviceIdentity).toBe(`com.nanoclaw-v2-${config.install_id}`);
-    expect(layout.imageTag).toBe(`nanoclaw-agent-v2-${config.install_id}:latest`);
-    expect(layout.installLabel).toBe(`nanoclaw-install=${config.install_id}`);
-    expect(layout.cliSocket).toBe(path.join(config.checkout_realpath, 'data', 'ncl.sock'));
-    expect(layout.standardOutputPath).toBe(path.join(config.checkout_realpath, 'logs', 'nanoclaw.log'));
     const secretsDirectory = path.join(path.dirname(config.checkout_realpath), 'secrets');
     expect(config.secret_files).toEqual({
       gchat_credentials: path.join(secretsDirectory, 'gchat-service-account.json'),
@@ -134,7 +128,7 @@ describe('GWS-EA instance runtime', () => {
       'selected_provider',
     ]);
     expect(JSON.parse(manifest)).toMatchObject({ docker_endpoint: DOCKER_ENDPOINT });
-    expect((await stat(layout.environmentFile)).mode & 0o777).toBe(0o600);
+    expect((await stat(environmentPath)).mode & 0o777).toBe(0o600);
   });
 
   it('loads a runtime file with unknown fields, recomputes derived values, and leaves the file as written', async () => {
@@ -177,45 +171,6 @@ describe('GWS-EA instance runtime', () => {
     expect(lines).toContain(`NANOCLAW_INSTALL_ID=${config.install_id}`);
   });
 
-  it('loads only host credentials into a fresh environment and rejects ambient redirects', async () => {
-    const { config } = await fixture();
-    await persistInstanceRuntime(config, upsertEnvVars);
-    await writeOwnerOnlyFileExclusive(
-      config.secret_files.gchat_credentials,
-      '{"client_email":"bot@example.test","private_key":"chat-secret-canary"}',
-    );
-    await writeOwnerOnlyFileExclusive(config.secret_files.onecli_runtime_api_key, 'runtime-secret-canary');
-    await writeOwnerOnlyFileExclusive(googleChatProjectNumberFile(config), '441811502258\n');
-    await writeOwnerOnlyFileExclusive(config.secret_files.onecli_admin_api_key, 'admin-secret-canary');
-
-    const environment = await buildInstanceHostEnvironment(config, {
-      PATH: '/safe/bin',
-      NANOCLAW_INSTALL_ID: 'victim',
-      WEBHOOK_PORT: '9',
-      WEBHOOK_HOST: '0.0.0.0',
-      ONECLI_URL: 'https://attacker.invalid',
-      ONECLI_API_KEY: 'ambient-secret',
-      GCHAT_CREDENTIALS: 'ambient-chat-secret',
-      GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL: 'service-999999999999@gcp-sa-gsuiteaddons.iam.gserviceaccount.com',
-      NODE_OPTIONS: '--import=/tmp/attacker.js',
-      DOCKER_HOST: 'tcp://attacker.invalid:2376',
-    });
-
-    expect(environment).toMatchObject({
-      DOCKER_HOST: DOCKER_ENDPOINT,
-      NANOCLAW_INSTALL_ID: config.install_id,
-      WEBHOOK_PORT: String(config.allocated_ports.nanoclaw_webhook),
-      WEBHOOK_HOST: '127.0.0.1',
-      NANOCLAW_EGRESS_NETWORK: config.agent_egress_network,
-      ONECLI_URL: config.onecli_app_url,
-      ONECLI_API_KEY: 'runtime-secret-canary',
-      GCHAT_CREDENTIALS: expect.stringContaining('chat-secret-canary'),
-      GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL: 'service-441811502258@gcp-sa-gsuiteaddons.iam.gserviceaccount.com',
-    });
-    expect(environment).not.toHaveProperty('NODE_OPTIONS');
-    expect(Object.values(environment)).not.toContain('admin-secret-canary');
-  });
-
   it('runs OneCLI administration through the pinned binary and admin-only credential file', async () => {
     const { config } = await fixture();
     await persistInstanceRuntime(config, upsertEnvVars);
@@ -251,10 +206,26 @@ describe('GWS-EA instance runtime', () => {
     expect(command?.env).not.toHaveProperty('GCHAT_CREDENTIALS');
   });
 
-  it('reloads a changed launchd definition with bootout then one bootstrap, and reports the pid', async () => {
+  it('reloads a changed launchd definition with bootout then one bootstrap, and reports its layout and pid', async () => {
     const { config, home } = await fixture();
     await persistInstanceRuntime(config, upsertEnvVars);
-    const layout = createInstanceServiceLayout(config, { platform: 'macos', homeDirectory: home });
+    const checkout = config.checkout_realpath;
+    const serviceIdentity = `com.nanoclaw-v2-${config.install_id}`;
+    const layout: InstanceServiceLayout = {
+      manager: 'launchd',
+      serviceIdentity,
+      serviceDefinitionPath: path.join(home, 'Library', 'LaunchAgents', `${serviceIdentity}.plist`),
+      runtimeConfigFile: path.join(checkout, 'data', 'gws-ea', 'runtime.json'),
+      environmentFile: path.join(checkout, '.env'),
+      launcherEntrypoint: path.join(checkout, 'dist', 'gws-ea', 'process.js'),
+      hostEntrypoint: path.join(checkout, 'dist', 'index.js'),
+      cliPath: path.join(checkout, 'bin', 'ncl'),
+      cliSocket: path.join(checkout, 'data', 'ncl.sock'),
+      standardOutputPath: path.join(checkout, 'logs', 'nanoclaw.log'),
+      standardErrorPath: path.join(checkout, 'logs', 'nanoclaw.error.log'),
+      imageTag: `nanoclaw-agent-v2-${config.install_id}:latest`,
+      installLabel: `nanoclaw-install=${config.install_id}`,
+    };
     await mkdir(path.dirname(layout.serviceDefinitionPath), { recursive: true });
     await writeFile(layout.serviceDefinitionPath, '<plist>an earlier launcher’s definition</plist>');
     const calls: SanitizedCommand[] = [];
@@ -472,7 +443,17 @@ describe('GWS-EA instance runtime', () => {
   it('fails before host start when a required secret is missing or unsafe', async () => {
     const { config } = await fixture();
     await persistInstanceRuntime(config, upsertEnvVars);
-    await expect(buildInstanceHostEnvironment(config)).rejects.toMatchObject({ code: 'ENOENT' });
+    const execve = vi.fn((): never => {
+      throw new Error('execve called');
+    });
+
+    await expect(
+      launchInstanceHost(path.join(config.checkout_realpath, 'data', 'gws-ea', 'runtime.json'), {}, execve),
+    ).rejects.toMatchObject({
+      code: 'ENOENT',
+      path: expect.stringContaining(`${path.dirname(config.secret_files.gchat_credentials)}${path.sep}`),
+    });
+    expect(execve).not.toHaveBeenCalled();
   });
 
   it('rejects an invalid Google Chat project number before host start', async () => {
@@ -481,11 +462,17 @@ describe('GWS-EA instance runtime', () => {
     await writeOwnerOnlyFileExclusive(config.secret_files.gchat_credentials, 'chat-credential');
     await writeOwnerOnlyFileExclusive(config.secret_files.onecli_runtime_api_key, 'runtime-key');
     await writeOwnerOnlyFileExclusive(googleChatProjectNumberFile(config), '0\n');
+    const execve = vi.fn((): never => {
+      throw new Error('execve called');
+    });
 
-    await expect(buildInstanceHostEnvironment(config)).rejects.toMatchObject({ code: 'invalid_runtime_config' });
+    await expect(
+      launchInstanceHost(path.join(config.checkout_realpath, 'data', 'gws-ea', 'runtime.json'), {}, execve),
+    ).rejects.toMatchObject({ code: 'invalid_runtime_config', message: expect.stringContaining('project number') });
+    expect(execve).not.toHaveBeenCalled();
   });
 
-  it('replaces the launcher with the exact checkout host and constructed environment', async () => {
+  it('replaces the launcher with the exact checkout host and only its host credentials, ignoring ambient redirects', async () => {
     const { config } = await fixture();
     await persistInstanceRuntime(config, upsertEnvVars);
     await writeOwnerOnlyFileExclusive(
@@ -494,6 +481,7 @@ describe('GWS-EA instance runtime', () => {
     );
     await writeOwnerOnlyFileExclusive(config.secret_files.onecli_runtime_api_key, 'runtime-secret-canary');
     await writeOwnerOnlyFileExclusive(googleChatProjectNumberFile(config), '441811502258\n');
+    await writeOwnerOnlyFileExclusive(config.secret_files.onecli_admin_api_key, 'admin-secret-canary');
     const calls: Array<{ file: string; args: readonly string[]; env: NodeJS.ProcessEnv }> = [];
     const marker = new Error('execve called');
     const execve = ((file: string, args: readonly string[], env: NodeJS.ProcessEnv): never => {
@@ -507,8 +495,16 @@ describe('GWS-EA instance runtime', () => {
           path.join(config.checkout_realpath, 'data', 'gws-ea', 'runtime.json'),
           {
             PATH: '/service/bin',
-            NODE_OPTIONS: '--import=/tmp/attacker.js',
+            NANOCLAW_INSTALL_ID: 'victim',
+            WEBHOOK_PORT: '9',
+            WEBHOOK_HOST: '0.0.0.0',
+            ONECLI_URL: 'https://attacker.invalid',
             ONECLI_API_KEY: 'ambient-secret',
+            GCHAT_CREDENTIALS: 'ambient-chat-secret',
+            GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL:
+              'service-999999999999@gcp-sa-gsuiteaddons.iam.gserviceaccount.com',
+            NODE_OPTIONS: '--import=/tmp/attacker.js',
+            DOCKER_HOST: 'tcp://attacker.invalid:2376',
           },
           execve,
         ),
@@ -521,9 +517,20 @@ describe('GWS-EA instance runtime', () => {
     expect(calls[0]).toMatchObject({
       file: config.node_path,
       args: [config.node_path, path.join(config.checkout_realpath, 'dist', 'index.js')],
+      env: {
+        DOCKER_HOST: DOCKER_ENDPOINT,
+        NANOCLAW_INSTALL_ID: config.install_id,
+        WEBHOOK_PORT: String(config.allocated_ports.nanoclaw_webhook),
+        WEBHOOK_HOST: '127.0.0.1',
+        NANOCLAW_EGRESS_NETWORK: config.agent_egress_network,
+        ONECLI_URL: config.onecli_app_url,
+        ONECLI_API_KEY: 'runtime-secret-canary',
+        GCHAT_CREDENTIALS: expect.stringContaining('chat-secret-canary'),
+        GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL: 'service-441811502258@gcp-sa-gsuiteaddons.iam.gserviceaccount.com',
+      },
     });
-    expect(calls[0]?.env.ONECLI_API_KEY).toBe('runtime-secret-canary');
     expect(calls[0]?.env).not.toHaveProperty('NODE_OPTIONS');
+    expect(Object.values(calls[0]?.env ?? {})).not.toContain('admin-secret-canary');
   });
 
   it('prepares only the exact checkout image and service without invoking generic service setup', async () => {

@@ -150,7 +150,7 @@ function dockerContext(
   };
 }
 
-export function buildComposeInvocation(layout: OnecliRuntimeLayout, args: readonly string[]): OnecliCommand {
+function buildComposeInvocation(layout: OnecliRuntimeLayout, args: readonly string[]): OnecliCommand {
   return {
     command: 'docker',
     args: [
@@ -169,7 +169,7 @@ export function buildComposeInvocation(layout: OnecliRuntimeLayout, args: readon
   };
 }
 
-export function buildOnecliCliEnvironment(
+function buildOnecliCliEnvironment(
   layout: OnecliRuntimeLayout,
   ambient: NodeJS.ProcessEnv = process.env,
   apiKey?: string,
@@ -182,7 +182,7 @@ export function buildOnecliCliEnvironment(
 }
 
 /** Docker's environment: the tool allowlist, the operator's HOME, and the instance's recorded endpoint. */
-export function buildComposeEnvironment(
+function buildComposeEnvironment(
   layout: Pick<OnecliRuntimeLayout, 'dockerEndpoint'>,
   ambient: NodeJS.ProcessEnv = process.env,
 ): Readonly<Record<string, string>> {
@@ -191,7 +191,7 @@ export function buildComposeEnvironment(
   return environment;
 }
 
-export async function prepareOnecliRuntime(layout: OnecliRuntimeLayout, pins: OnecliPins): Promise<void> {
+async function prepareOnecliRuntime(layout: OnecliRuntimeLayout, pins: OnecliPins): Promise<void> {
   await preparePrivateDirectory(layout.rootDirectory);
   await Promise.all([preparePrivateDirectory(layout.cliHome), preparePrivateDirectory(layout.secretsDirectory)]);
 
@@ -204,7 +204,7 @@ export async function prepareOnecliRuntime(layout: OnecliRuntimeLayout, pins: On
   await writePrivateTextFile(layout.envFile, '# Intentionally empty: runtime coordinates are passed explicitly.\n');
 }
 
-export function validateObservedOnecliRuntime(
+function validateObservedOnecliRuntime(
   layout: OnecliRuntimeLayout,
   pins: OnecliPins,
   observed: ObservedOnecliRuntime,
@@ -655,7 +655,7 @@ function assertOwnedContainers(layout: OnecliRuntimeLayout, containers: readonly
  * Remove owned containers outside the three services, or duplicates of one,
  * and return the containers that remain.
  */
-export async function cleanupOnecliDockerOrphans(docker: OnecliDocker): Promise<readonly InspectedOnecliContainer[]> {
+async function cleanupOnecliDockerOrphans(docker: OnecliDocker): Promise<readonly InspectedOnecliContainer[]> {
   const { layout, runner, environment } = docker;
   const containers = await inspectProjectContainers(docker);
   assertOwnedContainers(layout, containers);

@@ -354,7 +354,7 @@ export async function loadInstanceRuntimeConfig(file: string): Promise<InstanceR
   return config;
 }
 
-export function createInstanceServiceLayout(
+function createInstanceServiceLayout(
   configInput: InstanceRuntimeConfig,
   options: ServiceLayoutOptions,
 ): InstanceServiceLayout {
@@ -607,7 +607,7 @@ export function buildInstanceCliCommand(
   };
 }
 
-export async function buildInstanceHostEnvironment(
+async function buildInstanceHostEnvironment(
   configInput: InstanceRuntimeConfig,
   ambient: NodeJS.ProcessEnv = process.env,
 ): Promise<Record<string, string>> {
