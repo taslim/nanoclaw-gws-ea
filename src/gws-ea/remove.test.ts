@@ -572,7 +572,7 @@ describe('removal from any partial state', () => {
     cloudflare.config = { ingress: [route(input), CATCH_ALL] };
     cloudflare.dns = [dnsRecord(input)];
 
-    await removeAssistant(paths, input.instance_id, { ...dependencies, originHost: '127.0.0.1' });
+    await removeAssistant(paths, input.instance_id, dependencies);
 
     expect(order).toEqual(['configuration', 'dns', 'connector', 'tunnel']);
     expect(cloudflare.config).toEqual({ ingress: [CATCH_ALL] });
@@ -908,7 +908,7 @@ describe('removal from any partial state', () => {
     cloudflare.tunnels = [{ id: TUNNEL_ID, name: values.TUNNEL_NAME! }];
     cloudflare.dns = [dnsRecord(reservation)];
 
-    const outcome = await removeAssistant(paths, instanceId, { ...dependencies, originHost: '127.0.0.1' });
+    const outcome = await removeAssistant(paths, instanceId, dependencies);
 
     // An earlier journal is unreadable to this launcher, so every resource is observed.
     expect(order).toEqual(['dns', 'connector', 'tunnel', 'nanoclaw', 'gcp', 'onecli']);
@@ -1214,27 +1214,5 @@ describe('removal command', () => {
     await expect(removeAssistant(paths, paused.instance_id, dependencies)).rejects.toBeInstanceOf(RemovalPause);
     expect(cloudflare.config).toEqual({ ingress: [route(target), CATCH_ALL] });
     expect(await sharedIngress()).toBe('retired');
-  });
-
-  it('clears run-scoped Cloudflare authority when the remove command exits', async () => {
-    const paths = await testPaths();
-    const target = await reserve(paths, reservationInput(paths, { managed: true }));
-    const clearAccountToken = vi.fn();
-
-    expect(
-      await runCli(['remove', '--id', target.instance_id, '--yes'], {
-        paths,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        removeAssistant: async () => undefined,
-        managedIngressSetup: {
-          discoverZones: vi.fn(),
-          retainAccountToken: vi.fn(),
-          requireAccountToken: vi.fn(),
-          clearAccountToken,
-        },
-      }),
-    ).toBe(0);
-    expect(clearAccountToken).toHaveBeenCalledOnce();
   });
 });

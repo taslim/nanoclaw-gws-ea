@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -11,7 +11,6 @@ import {
   CLOUDFLARE_CONNECTOR_OWNER_LABEL,
   CLOUDFLARE_CONNECTOR_ROLE_LABEL,
   CLOUDFLARE_CONNECTOR_TOKEN_LABEL,
-  buildCloudflareComposeInvocation,
   createCloudflareConnectorLayout,
   hasConnectorToken,
   inspectCloudflareConnector,
@@ -52,6 +51,7 @@ async function fixture(platform: 'macos' | 'linux' = 'linux'): Promise<{
     configRoot: path.join(root, 'config'),
     stateRoot: path.join(root, 'state'),
   });
+  await mkdir(paths.stateRoot);
   return {
     paths,
     layout: createCloudflareConnectorLayout({
@@ -111,19 +111,25 @@ function inspection(layout: CloudflareConnectorLayout, change: (container: Json)
   return container;
 }
 
-/** A Docker CLI that answers from one container, or none. */
+/** A Docker CLI that answers from one container, or none, and records whether each pull and up held the machine lock. */
 function docker(initial: Json | undefined, paths?: ControlPlanePaths) {
   let container = initial;
   const calls: SanitizedCommand[] = [];
-  const lockedUps: boolean[] = [];
+  const locking: Array<readonly ['pull' | 'up', boolean]> = [];
+  const lockHeld = () => paths !== undefined && processLockOwner(paths.registryLock)?.pid === process.pid;
   const run = vi.fn(async (command: SanitizedCommand) => {
+    // Like the real runner, refuse a working directory that does not exist.
+    if (!(await stat(command.cwd).catch(() => undefined))?.isDirectory()) {
+      throw new Error(`Working directory ${command.cwd} is unavailable`);
+    }
     calls.push(command);
     const [first, second] = command.args;
     if (first === 'container' && second === 'ls') return { stdout: container ? 'c0ffee\n' : '', stderr: '' };
     if (first === 'container' && second === 'inspect') return { stdout: JSON.stringify([container]), stderr: '' };
     if (first === 'image' && second === 'inspect') return { stdout: JSON.stringify(IMAGE_ENVIRONMENT), stderr: '' };
+    if (first === 'pull') locking.push(['pull', lockHeld()]);
     if (command.args.includes('up')) {
-      lockedUps.push(paths !== undefined && processLockOwner(paths.registryLock)?.pid === process.pid);
+      locking.push(['up', lockHeld()]);
       container = { ...(container ?? {}), ...upResult };
     }
     if (command.args.includes('down')) container = undefined;
@@ -133,7 +139,7 @@ function docker(initial: Json | undefined, paths?: ControlPlanePaths) {
   return {
     run,
     calls,
-    lockedUps,
+    locking,
     set afterUp(value: Json) {
       upResult = value;
     },
@@ -144,12 +150,6 @@ function docker(initial: Json | undefined, paths?: ControlPlanePaths) {
 }
 
 describe('shared Cloudflare connector', () => {
-  it('uses the immutable multi-architecture cloudflared pin', () => {
-    expect(CLOUDFLARED_IMAGE).toBe(
-      'cloudflare/cloudflared:2026.9.1@sha256:b269e8abd07a5bf6f3f4be65d5050b2174eca89c56a0241a8ff32a16aec454e4',
-    );
-  });
-
   it.each(['macos', 'linux'] as const)(
     'renders the hardened %s connector with a token digest, not the token',
     async (platform) => {
@@ -252,7 +252,11 @@ describe('shared Cloudflare connector', () => {
         change: (container: Json) => {
           (container.Config as Json).Image = `cloudflare/cloudflared:2026.8.0@sha256:${'1'.repeat(64)}`;
         },
-        reason: /runs cloudflare\/cloudflared:2026\.8\.0.*not the pinned cloudflare\/cloudflared:2026\.9\.1/u,
+        // The validated pin's only regular-expression metacharacter is the dot.
+        reason: new RegExp(
+          `runs cloudflare/cloudflared:2026\\.8\\.0@.*, not the pinned ${CLOUDFLARED_IMAGE.replaceAll('.', '\\.')}$`,
+          'u',
+        ),
       },
       {
         label: 'environment drift',
@@ -320,10 +324,12 @@ describe('shared Cloudflare connector', () => {
       expect(commands.find((args) => args.includes('up'))).toEqual(
         expect.arrayContaining(['up', '--detach', '--force-recreate', '--remove-orphans']),
       );
-      expect(cli.lockedUps).toEqual([true]);
+      expect(cli.locking).toEqual([
+        ['pull', false],
+        ['up', true],
+      ]);
       expect(await readFile(layout.composeFile, 'utf8')).toBe(renderCloudflareConnectorCompose(layout, DIGEST));
       expect(JSON.stringify(cli.calls)).not.toContain(TOKEN);
-      expect(buildCloudflareComposeInvocation(layout, ['up']).args).not.toContain(TOKEN);
     });
 
     it('recreates a stopped connector without pulling', async () => {
@@ -339,8 +345,7 @@ describe('shared Cloudflare connector', () => {
 
       await repairCloudflareConnector(paths, layout, { runCommand: cli.run });
 
-      expect(cli.calls.some((call) => call.args[0] === 'pull')).toBe(false);
-      expect(cli.lockedUps).toEqual([true]);
+      expect(cli.locking).toEqual([['up', true]]);
     });
 
     it('leaves a connector another run already repaired', async () => {

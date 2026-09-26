@@ -200,7 +200,7 @@ export function renderCloudflareConnectorCompose(
   );
 }
 
-export function buildCloudflareComposeInvocation(
+function buildCloudflareComposeInvocation(
   layout: CloudflareConnectorLayout,
   args: readonly string[],
 ): SanitizedCommand {
@@ -280,7 +280,7 @@ export async function storeConnectorToken(layout: CloudflareConnectorLayout, tok
 }
 
 /** The Compose project and owner label, exactly: anything else in the project is refused, never replaced. */
-export function assertCloudflareConnectorOwnership(
+function assertCloudflareConnectorOwnership(
   layout: CloudflareConnectorLayout,
   observed: ObservedCloudflareConnector,
 ): void {

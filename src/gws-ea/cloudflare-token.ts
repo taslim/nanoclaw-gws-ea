@@ -15,7 +15,7 @@ import { readOwnerOnlyFile, removePrivateFile, writePrivateTextFile } from './se
 import { GwsEaError } from './types.js';
 
 /** Cloudflare refused the token itself, rather than failing to answer. */
-export function isCloudflareTokenRefusal(error: unknown): boolean {
+function isCloudflareTokenRefusal(error: unknown): boolean {
   return (
     error instanceof GwsEaError &&
     (error.code === 'cloudflare_capability_missing' || error.code === 'invalid_cloudflare_token')
@@ -23,7 +23,7 @@ export function isCloudflareTokenRefusal(error: unknown): boolean {
 }
 
 /** The kept token, or undefined when none is kept. */
-export async function readKeptAccountToken(file: string): Promise<string | undefined> {
+async function readKeptAccountToken(file: string): Promise<string | undefined> {
   try {
     const token = (await readOwnerOnlyFile(file)).trim();
     if (!token) return undefined;

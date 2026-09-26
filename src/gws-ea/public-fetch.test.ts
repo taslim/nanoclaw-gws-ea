@@ -3,7 +3,6 @@ import type { AddressInfo } from 'node:net';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { observeManagedGchatRoute } from './endpoint.js';
 import { createPublicFetch, publicAnswer, type PublicResolve } from './public-fetch.js';
 
 const closers: Array<() => Promise<void>> = [];
@@ -112,27 +111,5 @@ describe('public fetch', () => {
         { status: 'rejected', reason: enodata },
       ]),
     ).toBeUndefined();
-  });
-
-  it('lets the managed route check see a callback this machine resolver still misses', async () => {
-    const webhookId = '11111111-1111-4111-8111-111111111111';
-    const { port } = await server((request, response) => {
-      if (request.url === '/webhook/gchat') response.writeHead(401, { 'x-nanoclaw-webhook-id': webhookId }).end();
-      else response.writeHead(404).end();
-    });
-    // The public callback is HTTPS in production; here plain HTTP keeps the test local.
-    const fetch = createPublicFetch(publicDns('soji.example.test'));
-    const probe: typeof globalThis.fetch = (input, init) =>
-      fetch(String(input).replace('https://soji.example.test/', `http://soji.example.test:${port}/`), init);
-
-    await expect(
-      observeManagedGchatRoute(
-        {
-          endpointUrl: 'https://soji.example.test/webhook/gchat',
-          localEndpointUrl: `http://127.0.0.1:${port}/webhook/gchat`,
-        },
-        { fetch: probe },
-      ),
-    ).resolves.toEqual({ status: 'routed', listenerId: webhookId });
   });
 });

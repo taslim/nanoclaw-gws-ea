@@ -171,7 +171,6 @@ export interface RemovalOptions {
 /** Boundary seams; each defaults to the real one. */
 export interface RemovalDependencies extends RemovalOptions {
   readonly platform?: InstanceServicePlatform;
-  readonly originHost?: CloudflareOriginHost;
   readonly runCommand?: SanitizedCommandOutcomeRunner;
   readonly runGcloud?: GcloudCommandRunner;
   /** Probe the recorded Docker endpoint, else resolve the active local one. */
@@ -877,7 +876,7 @@ async function removeLocked(
         api,
         // A record left behind in a zone the token cannot see is not looked for.
         ownTransport: provisioning.started('establish_transport') && dnsLeftBehind === undefined,
-        originHost: dependencies.originHost ?? connectorNetworking(connector.platform).originHost,
+        originHost: connectorNetworking(connector.platform).originHost,
         connector,
         stopConnector: async () =>
           dependencies.stopCloudflareConnector

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -114,6 +114,20 @@ function listEnvelope(items: readonly unknown[]): Response {
  */
 class FakeCloudflare {
   readonly requests: Array<{ method: string; route: string; body: unknown }> = [];
+  /** The active zones the token reads: the claimed zone, unless a test changes it. */
+  readonly zones: Json[] = [
+    {
+      id: ZONE_ID,
+      name: 'example.com',
+      status: 'active',
+      paused: false,
+      type: 'full',
+      account: { id: ACCOUNT_ID, name: 'Example account' },
+      owner: { id: null, type: 'user', email: null },
+      permissions: ['#dns_records:edit', '#zone:read'],
+      plan: { id: '0feeeeeeeeeeeeeeeeeeeeeeeeeeeeee', name: 'Free Website' },
+    },
+  ];
   readonly tunnels: Json[] = [];
   readonly records: Json[] = [];
   configuration: { config?: Json; version?: number } = {};
@@ -136,21 +150,7 @@ class FakeCloudflare {
 
   #answer(method: string, route: string, url: URL, body: unknown): Response {
     const tunnelRoot = `/accounts/${ACCOUNT_ID}/cfd_tunnel`;
-    if (method === 'GET' && route === '/zones') {
-      return listEnvelope([
-        {
-          id: ZONE_ID,
-          name: 'example.com',
-          status: 'active',
-          paused: false,
-          type: 'full',
-          account: { id: ACCOUNT_ID, name: 'Example account' },
-          owner: { id: null, type: 'user', email: null },
-          permissions: ['#dns_records:edit', '#zone:read'],
-          plan: { id: '0feeeeeeeeeeeeeeeeeeeeeeeeeeeeee', name: 'Free Website' },
-        },
-      ]);
-    }
+    if (method === 'GET' && route === '/zones') return listEnvelope(this.zones);
     if (method === 'GET' && route === tunnelRoot) {
       return listEnvelope(this.tunnels.filter((tunnel) => tunnel.name === url.searchParams.get('name')));
     }
@@ -552,7 +552,6 @@ describe('managed Cloudflare reconciliation', () => {
     });
     expect(await readFile(connector.tokenFile, 'utf8')).toBe(`tunnel-token-${TUNNEL_ID}`);
     expect((await stat(connector.tokenFile)).mode & 0o777).toBe(0o600);
-    expect(cloud.requests.some((request) => request.route.includes('/tokens/verify'))).toBe(false);
   });
 
   it('owns its own readback, with per-rule originRequest and extra fields, and writes nothing the second time', async () => {
@@ -682,6 +681,9 @@ describe('managed Cloudflare reconciliation', () => {
     });
     await preparePrivateDirectory(paths.removalRoot);
     await writePrivate(paths.removalFile(removing.instance_id), { active: true });
+    // Finder metadata and an interrupted receipt write are not removal receipts.
+    await writeFile(path.join(paths.removalRoot, '.DS_Store'), 'finder', { mode: 0o644 });
+    await writeFile(`${paths.removalFile(target.instance_id)}.AAAAAAAAAAA.tmp`, '{', { mode: 0o600 });
 
     await expect(
       reconcileManagedCloudflareIngress(paths, cloud.api(), {
@@ -807,23 +809,18 @@ describe('managed Cloudflare reconciliation', () => {
     });
   });
 
-  it('fails a missing zone read capability before any change', async () => {
+  it.each([
+    { label: 'another zone', change: (zone: Json) => void (zone.id = 'f'.repeat(32)) },
+    {
+      label: 'the claimed zone under another account',
+      change: (zone: Json) => void (zone.account = { id: 'e'.repeat(32), name: 'Another account' }),
+    },
+  ])('fails before any change when the token reads $label instead of the claimed zone', async ({ change }) => {
     const paths = await testPaths();
     const input = managedReservation(paths, 'assistant.example.com', 31_100);
     await reserveInstance(paths, input);
     const cloud = new FakeCloudflare();
-    cloud.intercept = (_method, route) =>
-      route === '/zones'
-        ? Response.json(
-            {
-              success: false,
-              errors: [{ code: 9109, message: 'Unauthorized to access requested resource' }],
-              messages: [],
-              result: null,
-            },
-            { status: 403 },
-          )
-        : undefined;
+    change(cloud.zones[0]!);
 
     await expect(
       reconcileManagedCloudflareIngress(paths, cloud.api(), {

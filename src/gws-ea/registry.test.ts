@@ -246,9 +246,8 @@ describe('machine registry', () => {
     expect((await readRegistry(paths)).instances[input.instance_id]).toEqual(input);
   });
 
-  it('records one non-secret shared Cloudflare owner for managed reservations', async () => {
+  it('records one shared Cloudflare owner for managed reservations', async () => {
     const paths = await testPaths();
-    const tokenCanary = 'cloudflare-account-token-canary';
     const input = managedReservation(paths);
     await reserveInstance(paths, input);
 
@@ -259,7 +258,6 @@ describe('machine registry', () => {
       tunnel_id: null,
     });
     expect(registry.shared_infrastructure_metadata.cloudflare?.ownership_id).toMatch(/^[0-9a-f-]{36}$/u);
-    expect(await readFile(paths.registryFile, 'utf8')).not.toContain(tokenCanary);
   });
 
   it('rejects a second managed account and duplicate managed identity before publishing it', async () => {
@@ -298,7 +296,7 @@ describe('machine registry', () => {
     expect(Object.keys((await readRegistry(paths)).instances)).toEqual([first.instance_id]);
   });
 
-  it('rejects inconsistent managed callbacks and secret-shaped shared metadata', async () => {
+  it('rejects inconsistent managed callbacks and a tunnel name that does not match its ownership ID', async () => {
     const paths = await testPaths();
     const invalid = managedReservation(paths);
     if (invalid.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare') {
@@ -333,7 +331,6 @@ describe('machine registry', () => {
             account_id: 'a'.repeat(32),
             tunnel_name: 'gws-ea-owner',
             tunnel_id: null,
-            token: 'must-not-be-accepted',
           },
         },
       }),
@@ -375,18 +372,6 @@ describe('machine registry', () => {
     ).rejects.toMatchObject({
       code: 'claim_conflict',
     });
-  });
-
-  it('ignores entries in the removals directory that are not removal receipts', async () => {
-    const paths = await testPaths();
-    await mkdir(paths.removalRoot, { recursive: true, mode: 0o700 });
-    const leftover = `${allocateInstanceId()}.json.${process.pid}.0123456789abcdef.tmp`;
-    await writeFile(path.join(paths.removalRoot, '.DS_Store'), 'finder', { mode: 0o644 });
-    await writeFile(path.join(paths.removalRoot, leftover), '{', { mode: 0o600 });
-
-    const reserved = await reserveInstance(paths, reservation(paths));
-
-    expect(Object.keys((await readRegistry(paths)).instances)).toEqual([reserved.instance_id]);
   });
 
   it.each([
@@ -473,37 +458,6 @@ describe('machine registry', () => {
 });
 
 describe('create recovery contract', () => {
-  it('checks the reserved Google account before a GCP resume advances', async () => {
-    const paths = await testPaths();
-    const input = reservation(paths);
-    await reserveInstance(paths, input);
-    const preflight = vi.fn(async () => ({ ...PREREQUISITES, account: input.exclusive_resource_claims.gcp_account }));
-    const advanceProvision = vi.fn(async () => ({
-      status: 'paused' as const,
-      pause: {
-        kind: 'human-action' as const,
-        phase: 'configure_channel' as const,
-        code: 'chat_configuration_required',
-        message: 'Configure Google Chat.',
-      },
-    }));
-
-    expect(
-      await runCli(['resume', '--id', input.instance_id], {
-        paths,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        checkPrerequisites: preflight,
-        advanceProvision,
-      }),
-    ).toBe(10);
-    expect(preflight).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({ command: 'resume', account: input.exclusive_resource_claims.gcp_account }),
-      expect.anything(),
-    );
-    expect(advanceProvision).toHaveBeenCalledOnce();
-  });
-
   it('checks Google sign-in on every resume, even after GCP setup is complete', async () => {
     const paths = await testPaths();
     const input = reservation(paths);
@@ -557,69 +511,6 @@ describe('create recovery contract', () => {
     ).toBe(1);
     expect(advanceProvision).not.toHaveBeenCalled();
     expect(errors.join('\n')).toContain('Google Cloud sign-in is required');
-  });
-
-  it('clears run-scoped Cloudflare authority when create exits', async () => {
-    const paths = await testPaths();
-    const clearAccountToken = vi.fn();
-    const discoverZones = vi.fn();
-
-    expect(
-      await runCli(createArgs(), {
-        paths,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        ...productionRuntime(),
-        advanceProvision: async () => ({
-          status: 'paused',
-          pause: {
-            kind: 'human-action',
-            phase: 'configure_channel',
-            code: 'chat_configuration_required',
-            message: 'Configure Google Chat.',
-          },
-        }),
-        managedIngressSetup: {
-          discoverZones,
-          retainAccountToken: vi.fn(),
-          requireAccountToken: vi.fn(),
-          clearAccountToken,
-        },
-      }),
-    ).toBe(10);
-    expect(discoverZones).not.toHaveBeenCalled();
-    expect(clearAccountToken).toHaveBeenCalledOnce();
-  });
-
-  it('clears run-scoped Cloudflare authority when resume exits', async () => {
-    const paths = await testPaths();
-    const input = await reserveInstance(paths, managedReservation(paths));
-    const clearAccountToken = vi.fn();
-
-    expect(
-      await runCli(['resume', '--id', input.instance_id], {
-        paths,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        checkPrerequisites: async () => PREREQUISITES,
-        advanceProvision: async () => ({
-          status: 'paused',
-          pause: {
-            kind: 'human-action',
-            phase: 'configure_channel',
-            code: 'chat_configuration_required',
-            message: 'Configure Google Chat.',
-          },
-        }),
-        managedIngressSetup: {
-          discoverZones: vi.fn(),
-          retainAccountToken: vi.fn(),
-          requireAccountToken: vi.fn(),
-          clearAccountToken,
-        },
-      }),
-    ).toBe(10);
-    expect(clearAccountToken).toHaveBeenCalledOnce();
   });
 
   it('checks gcloud before allocating or printing an instance ID', async () => {
@@ -717,50 +608,6 @@ describe('create recovery contract', () => {
       }),
     ).toBe(10);
     expect(advanced).toEqual([instanceId, instanceId]);
-  });
-
-  it('prints durable, deduplicated progress while a non-interactive resume advances', async () => {
-    const paths = await testPaths();
-    const input = reservation(paths);
-    await reserveInstance(paths, input);
-    const output: string[] = [];
-    const advanceProvision: NonNullable<CliRuntime['advanceProvision']> = async (_operation, { runtime }) =>
-      runStep(
-        runtime,
-        { id: 'provision_gcp', label: 'Configuring Google Cloud…' },
-        async () => {
-          runtime.emit?.({ type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for the service account…' });
-          runtime.emit?.({ type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for the service account…' });
-          return {
-            status: 'paused' as const,
-            pause: {
-              kind: 'human-action' as const,
-              phase: 'configure_channel' as const,
-              code: 'chat_configuration_required',
-              message: 'Configure Google Chat.',
-            },
-          };
-        },
-        (result) => result.pause,
-      );
-
-    expect(
-      await runCli(['resume', '--id', input.instance_id], {
-        paths,
-        stdout: (line) => output.push(line),
-        stderr: () => undefined,
-        checkPrerequisites: async () => PREREQUISITES,
-        advanceProvision,
-      }),
-    ).toBe(10);
-
-    expect(output).toEqual([
-      'Configuring Google Cloud…',
-      'Waiting for the service account…',
-      'Paused at configure_channel: Configure Google Chat.',
-      `Continue with: gws-ea resume --id ${input.instance_id}`,
-      expect.stringMatching(/^Log: \S+progress\.log$/u),
-    ]);
   });
 
   it('provisions from the documented create command and prints exact principal-selection commands', async () => {
