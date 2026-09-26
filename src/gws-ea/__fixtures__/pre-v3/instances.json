@@ -1,0 +1,41 @@
+{
+  "schema_version": 2,
+  "instances": {
+    "__INSTANCE_ID__": {
+      "instance_id": "__INSTANCE_ID__",
+      "checkout_realpath": "__CHECKOUT__",
+      "release_track": "dogfood",
+      "source_remote": "https://example.test/nanoclaw.git",
+      "deployed_commit": "3e28af43e476702724501d5efc04c79127df1958",
+      "allocated_ports": {
+        "nanoclaw_webhook": 33001,
+        "onecli_app": 33101,
+        "onecli_gateway": 33201
+      },
+      "exclusive_resource_claims": {
+        "ingress": {
+          "mode": "managed-cloudflare",
+          "account_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "zone_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "zone_name": "example.test",
+          "hostname": "target.example.test",
+          "callback_url": "https://target.example.test/webhook/gchat",
+          "dns_record_id": "cccccccccccccccccccccccccccccccc"
+        },
+        "gcp_project_id": "__GCP_PROJECT__",
+        "gcp_account": "operator@example.test",
+        "gchat_service_account": "gws-ea-chat@__GCP_PROJECT__.iam.gserviceaccount.com",
+        "workspace_email": "target@example.test",
+        "onecli_project": "gws-ea-__INSTALL_ID__"
+      }
+    }
+  },
+  "shared_infrastructure_metadata": {
+    "cloudflare": {
+      "ownership_id": "__OWNERSHIP_ID__",
+      "account_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "tunnel_name": "__TUNNEL_NAME__",
+      "tunnel_id": "__TUNNEL_ID__"
+    }
+  }
+}

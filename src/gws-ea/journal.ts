@@ -1,32 +1,89 @@
-import { createHash, randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+/**
+ * The provision journal: the minimal durable record of one instance's
+ * provisioning. It is created together with the reservation, so a missing
+ * journal means nothing started, and every later write replaces it atomically
+ * under the instance operation lock.
+ *
+ * Readers ignore unknown fields. A journal from before schema 3, or from a
+ * launcher with a different step contract, is refused with guidance to remove
+ * and recreate the assistant: pre-release instances are disposable.
+ */
+import { lstat } from 'node:fs/promises';
 import path from 'node:path';
+
 import { readJson, writePrivate } from '../community-portal/private-file.js';
 import { processLock } from '../community-portal/process-lock.js';
 import { isErrno } from '../community-portal/errors.js';
 import {
-  assertPrivateLocalDirectory,
+  assertOwnedDestination,
   assertPrivateStateFile,
-  preparePrivateLocalDirectory,
+  preparePrivateDirectory,
   type ControlPlanePaths,
 } from './paths.js';
-import { assertInstanceId, getInstanceReservation } from './registry.js';
+import type { PrincipalCandidate } from './principal.js';
+import { parsePrincipalCandidate } from './principal-selection.js';
+import { safeErrorCode, safeErrorMessage } from './redact.js';
+import {
+  assertInstanceId,
+  getInstanceReservation,
+  stageReservation,
+  validateReservation,
+  withMachineLock,
+} from './registry.js';
+import { removePrivateFile } from './secrets.js';
 import {
   GwsEaError,
-  PROVISION_JOURNAL_SCHEMA_VERSION,
-  PROVISION_PHASES,
-  type JournalAttempt,
-  type JournalObservation,
-  type JournalPhase,
-  type ProvisionJournal,
-  type ProvisionPhase,
+  PROVISION_STEPS,
+  type InstanceReservation,
+  type InstanceReservationInput,
+  type ProvisionStepId,
 } from './types.js';
-import { hasControlCharacters, isRecord } from './validation.js';
+import { hasControlCharacters, isRecord, requireCanonicalTimestamp, requireString } from './validation.js';
 
-const ATTEMPT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const RESOURCE_KEY_PATTERN = /^[a-z][a-z0-9-]{0,31}:[0-9a-f]{64}$/;
-const FAILURE_CODE_PATTERN = /^[a-z][a-z0-9_.-]{0,63}$/;
-const RESOURCE_KIND_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
+export const PROVISION_JOURNAL_SCHEMA_VERSION = 3 as const;
+
+/**
+ * The step contract this launcher provisions under. Bump it when a launcher
+ * can no longer continue a journal an earlier launcher started: the steps,
+ * their order, or what a completed step promises changed.
+ */
+export const LAUNCHER_CONTRACT_VERSION = 1 as const;
+
+export interface JournalStep {
+  readonly started_at: string;
+  readonly completed_at?: string;
+}
+
+/** Human decisions supplied on re-entry. */
+export interface JournalDecisions {
+  /** `--chat-configured`: the operator finished the Google Chat app configuration. */
+  readonly chat_configuration_confirmed_at?: string;
+  /** The principal conversation, fixed once chosen. */
+  readonly principal?: PrincipalCandidate;
+}
+
+export interface JournalError {
+  readonly step: ProvisionStepId;
+  readonly code: string;
+  readonly message: string;
+  readonly at: string;
+  /** The failed step's raw log, or the run's progress log. */
+  readonly log?: string;
+}
+
+export interface ProvisionJournal {
+  readonly schema_version: typeof PROVISION_JOURNAL_SCHEMA_VERSION;
+  readonly instance_id: string;
+  readonly launcher_contract_version: typeof LAUNCHER_CONTRACT_VERSION;
+  /** When provisioning began: only principal messages after it count. */
+  readonly started_at: string;
+  readonly steps: Readonly<Partial<Record<ProvisionStepId, JournalStep>>>;
+  readonly decisions: JournalDecisions;
+  /** `provision_gcp` lifted the project's key-creation policy, so removal restores it. */
+  readonly key_policy_lifted: boolean;
+  readonly last_error?: JournalError;
+}
+
 const operationBrand: unique symbol = Symbol('gws-ea-instance-operation');
 const activeOperations = new WeakSet<object>();
 
@@ -37,151 +94,166 @@ export interface InstanceOperation {
   release(): void;
 }
 
-export interface BeginPhaseResult {
-  journal: ProvisionJournal;
-  attempt: JournalAttempt;
-  requires_reconciliation: boolean;
+function recreate(instanceId: string): string {
+  return `Remove it with gws-ea remove --id ${instanceId}, then create it again.`;
 }
 
-export type PhaseObservationInput = { matched: false; resource_key?: never } | { matched: true; resource_key: string };
-
-function assertExactKeys(value: Record<string, unknown>, expected: readonly string[], label: string): void {
-  const actual = Object.keys(value).sort();
-  const wanted = [...expected].sort();
-  if (actual.length !== wanted.length || actual.some((key, index) => key !== wanted[index])) {
-    throw new GwsEaError('invalid_journal', `${label} contains unknown or missing fields`);
-  }
+function invalid(message: string): GwsEaError {
+  return new GwsEaError('invalid_journal', message);
 }
 
-function requireIsoTimestamp(value: unknown, label: string): string {
-  if (typeof value !== 'string') throw new GwsEaError('invalid_journal', `${label} is invalid`);
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.valueOf()) || parsed.toISOString() !== value) {
-    throw new GwsEaError('invalid_journal', `${label} is invalid`);
-  }
-  return value;
+function timestamp(value: unknown, label: string): string {
+  return requireCanonicalTimestamp(value, 'invalid_journal', `Provision journal ${label} is invalid`);
 }
 
-function validateResourceKey(value: unknown): string {
-  if (typeof value !== 'string' || !RESOURCE_KEY_PATTERN.test(value)) {
-    throw new GwsEaError('invalid_journal', 'Journal resource key is invalid');
-  }
-  return value;
+function text(value: unknown, label: string): string {
+  return requireString(value, `Provision journal ${label}`, 'invalid_journal', 4_096);
 }
 
-function validateObservation(value: unknown, expectedResourceKey: string): JournalObservation {
-  if (!isRecord(value)) throw new GwsEaError('invalid_journal', 'Journal observation is invalid');
-  if (value.matched === true) {
-    assertExactKeys(value, ['matched', 'observed_at', 'resource_key'], 'Journal observation');
-    const resourceKey = validateResourceKey(value.resource_key);
-    if (resourceKey !== expectedResourceKey) {
-      throw new GwsEaError('resource_mismatch', 'Observed resource key does not match phase intent');
-    }
-    return {
-      matched: true,
-      observed_at: requireIsoTimestamp(value.observed_at, 'observed_at'),
-      resource_key: resourceKey,
+function parseSteps(value: unknown): ProvisionJournal['steps'] {
+  if (!isRecord(value)) throw invalid('Provision journal steps are invalid');
+  const steps: Partial<Record<ProvisionStepId, JournalStep>> = {};
+  for (const id of PROVISION_STEPS) {
+    const step = value[id];
+    if (step === undefined) continue;
+    if (!isRecord(step)) throw invalid(`Provision journal step ${id} is invalid`);
+    steps[id] = {
+      started_at: timestamp(step.started_at, `${id} start`),
+      ...(step.completed_at === undefined ? {} : { completed_at: timestamp(step.completed_at, `${id} completion`) }),
     };
   }
-  if (value.matched === false) {
-    assertExactKeys(value, ['matched', 'observed_at'], 'Journal observation');
-    return { matched: false, observed_at: requireIsoTimestamp(value.observed_at, 'observed_at') };
-  }
-  throw new GwsEaError('invalid_journal', 'Journal observation match result is invalid');
+  return steps;
 }
 
-function validateAttempt(value: unknown): JournalAttempt {
-  if (!isRecord(value)) throw new GwsEaError('invalid_journal', 'Journal attempt is invalid');
-  const allowedKeys = ['attempt_id', 'resource_key', 'intended_at', 'observation', 'failure', 'succeeded_at'];
-  const actualKeys = Object.keys(value);
-  if (
-    actualKeys.some((key) => !allowedKeys.includes(key)) ||
-    !['attempt_id', 'resource_key', 'intended_at'].every((key) => key in value)
-  ) {
-    throw new GwsEaError('invalid_journal', 'Journal attempt contains unknown or missing fields');
-  }
-  if (typeof value.attempt_id !== 'string' || !ATTEMPT_ID_PATTERN.test(value.attempt_id)) {
-    throw new GwsEaError('invalid_journal', 'Journal attempt ID is invalid');
-  }
-  const resourceKey = validateResourceKey(value.resource_key);
-  const attempt: JournalAttempt = {
-    attempt_id: value.attempt_id,
-    resource_key: resourceKey,
-    intended_at: requireIsoTimestamp(value.intended_at, 'intended_at'),
+function parseDecisions(value: unknown): JournalDecisions {
+  if (!isRecord(value)) throw invalid('Provision journal decisions are invalid');
+  return {
+    ...(value.chat_configuration_confirmed_at === undefined
+      ? {}
+      : { chat_configuration_confirmed_at: timestamp(value.chat_configuration_confirmed_at, 'Chat confirmation') }),
+    ...(value.principal === undefined ? {} : { principal: parsePrincipalCandidate(value.principal) }),
   };
-  if (value.observation !== undefined) attempt.observation = validateObservation(value.observation, resourceKey);
-  if (value.failure !== undefined) {
-    if (!isRecord(value.failure)) throw new GwsEaError('invalid_journal', 'Journal failure is invalid');
-    assertExactKeys(value.failure, ['code', 'failed_at'], 'Journal failure');
-    if (typeof value.failure.code !== 'string' || !FAILURE_CODE_PATTERN.test(value.failure.code)) {
-      throw new GwsEaError('invalid_journal', 'Journal failure code is invalid');
-    }
-    attempt.failure = {
-      code: value.failure.code,
-      failed_at: requireIsoTimestamp(value.failure.failed_at, 'failed_at'),
-    };
-  }
-  if (value.succeeded_at !== undefined) {
-    if (!attempt.observation?.matched || attempt.observation.resource_key !== resourceKey) {
-      throw new GwsEaError('invalid_journal', 'Successful attempt lacks a matching observed postcondition');
-    }
-    attempt.succeeded_at = requireIsoTimestamp(value.succeeded_at, 'succeeded_at');
-  }
-  return attempt;
 }
 
-function validatePhase(value: unknown): JournalPhase {
-  if (!isRecord(value)) throw new GwsEaError('invalid_journal', 'Journal phase is invalid');
-  assertExactKeys(value, ['attempts'], 'Journal phase');
-  if (!Array.isArray(value.attempts)) throw new GwsEaError('invalid_journal', 'Journal attempts are invalid');
-  const attempts = value.attempts.map(validateAttempt);
-  const ids = new Set(attempts.map((attempt) => attempt.attempt_id));
-  if (ids.size !== attempts.length) throw new GwsEaError('invalid_journal', 'Journal attempt IDs must be unique');
-  for (const [index, attempt] of attempts.entries()) {
-    if (attempt.succeeded_at && index !== attempts.length - 1) {
-      throw new GwsEaError('invalid_journal', 'A successful attempt must be the final phase attempt');
-    }
-    if (index < attempts.length - 1 && attempt.observation?.matched !== false) {
-      throw new GwsEaError('invalid_journal', 'A retry requires a negative reconciliation of the previous attempt');
-    }
-  }
-  return { attempts };
-}
-
-function validateJournal(value: unknown, expectedInstanceId: string): ProvisionJournal {
-  if (!isRecord(value)) throw new GwsEaError('invalid_journal', 'Provision journal is invalid');
-  assertExactKeys(value, ['schema_version', 'instance_id', 'phases'], 'Provision journal');
-  if (value.schema_version !== PROVISION_JOURNAL_SCHEMA_VERSION) {
-    throw new GwsEaError('unsupported_journal', 'Provision journal schema version is unsupported');
-  }
-  if (value.instance_id !== expectedInstanceId) {
-    throw new GwsEaError('journal_mismatch', 'Provision journal and registry instance IDs disagree');
-  }
-  if (!isRecord(value.phases)) throw new GwsEaError('invalid_journal', 'Provision journal phases are invalid');
-  assertExactKeys(value.phases, PROVISION_PHASES, 'Provision journal phases');
-
-  const phases = {} as Record<ProvisionPhase, JournalPhase>;
-  let foundIncomplete = false;
-  for (const phase of PROVISION_PHASES) {
-    const parsed = validatePhase(value.phases[phase]);
-    const succeeded = parsed.attempts.at(-1)?.succeeded_at !== undefined;
-    if (foundIncomplete && parsed.attempts.length > 0) {
-      throw new GwsEaError('invalid_journal', 'A later phase has state before its predecessor succeeded');
-    }
-    if (!succeeded) foundIncomplete = true;
-    phases[phase] = parsed;
+function parseError(value: unknown): JournalError {
+  if (!isRecord(value) || !PROVISION_STEPS.includes(value.step as ProvisionStepId)) {
+    throw invalid('Provision journal last error is invalid');
   }
   return {
-    schema_version: PROVISION_JOURNAL_SCHEMA_VERSION,
-    instance_id: expectedInstanceId,
-    phases,
+    step: value.step as ProvisionStepId,
+    code: text(value.code, 'error code'),
+    message: text(value.message, 'error message'),
+    at: timestamp(value.at, 'error time'),
+    ...(value.log === undefined ? {} : { log: text(value.log, 'error log') }),
   };
 }
 
-function emptyJournal(instanceId: string): ProvisionJournal {
-  const phases = {} as Record<ProvisionPhase, JournalPhase>;
-  for (const phase of PROVISION_PHASES) phases[phase] = { attempts: [] };
-  return { schema_version: PROVISION_JOURNAL_SCHEMA_VERSION, instance_id: instanceId, phases };
+function parseJournal(value: unknown, instanceId: string): ProvisionJournal {
+  if (!isRecord(value)) throw invalid('Provision journal is invalid');
+  if (value.schema_version !== PROVISION_JOURNAL_SCHEMA_VERSION) {
+    throw new GwsEaError(
+      'unsupported_journal',
+      `This assistant was set up by an earlier gws-ea and cannot be continued. ${recreate(instanceId)}`,
+    );
+  }
+  if (value.instance_id !== instanceId) {
+    throw new GwsEaError('journal_mismatch', 'Provision journal and registry instance IDs disagree');
+  }
+  if (value.launcher_contract_version !== LAUNCHER_CONTRACT_VERSION) {
+    throw new GwsEaError(
+      'incompatible_launcher',
+      `This assistant was set up by a gws-ea launcher with a different step contract ` +
+        `(${String(value.launcher_contract_version)}; this launcher uses ${LAUNCHER_CONTRACT_VERSION}). ${recreate(instanceId)}`,
+    );
+  }
+  if (typeof value.key_policy_lifted !== 'boolean') throw invalid('Provision journal key policy fact is invalid');
+  return {
+    schema_version: PROVISION_JOURNAL_SCHEMA_VERSION,
+    instance_id: instanceId,
+    launcher_contract_version: LAUNCHER_CONTRACT_VERSION,
+    started_at: timestamp(value.started_at, 'start'),
+    steps: parseSteps(value.steps),
+    decisions: parseDecisions(value.decisions),
+    key_policy_lifted: value.key_policy_lifted,
+    ...(value.last_error === undefined ? {} : { last_error: parseError(value.last_error) }),
+  };
+}
+
+/** Write a new journal for a reservation about to be published, before it becomes visible. */
+async function createProvisionJournal(paths: ControlPlanePaths, instanceId: string): Promise<ProvisionJournal> {
+  assertInstanceId(instanceId);
+  await preparePrivateDirectory(paths.instanceRoot(instanceId));
+  const file = paths.journalFile(instanceId);
+  const exists = await lstat(file).then(
+    () => true,
+    (error: unknown) => {
+      if (isErrno(error, 'ENOENT')) return false;
+      throw error;
+    },
+  );
+  if (exists) throw new GwsEaError('instance_state_exists', 'A provision journal already exists for this instance');
+  const journal: ProvisionJournal = {
+    schema_version: PROVISION_JOURNAL_SCHEMA_VERSION,
+    instance_id: instanceId,
+    launcher_contract_version: LAUNCHER_CONTRACT_VERSION,
+    started_at: new Date().toISOString(),
+    steps: {},
+    decisions: {},
+    key_policy_lifted: false,
+  };
+  await writePrivate(file, journal);
+  return journal;
+}
+
+/** Discard the journal of a reservation that was never published. */
+async function discardProvisionJournal(paths: ControlPlanePaths, instanceId: string): Promise<void> {
+  assertInstanceId(instanceId);
+  await removePrivateFile(paths.journalFile(instanceId));
+}
+
+/**
+ * Reserve an instance's claims and start its provision journal as one
+ * operation under the machine lock: the journal is written before the
+ * reservation is published, so a reserved instance always has one.
+ */
+export async function reserveInstance(
+  paths: ControlPlanePaths,
+  input: InstanceReservationInput,
+): Promise<InstanceReservation> {
+  const reservation = validateReservation(input, paths);
+  await assertOwnedDestination(reservation.checkout_realpath);
+  return withMachineLock(paths, async () => {
+    const staged = await stageReservation(paths, reservation);
+    await createProvisionJournal(paths, reservation.instance_id);
+    try {
+      await staged.publish();
+    } catch (error) {
+      // Keep the journal unless the reservation certainly did not publish.
+      if (!(await staged.published())) await discardProvisionJournal(paths, reservation.instance_id);
+      throw error;
+    }
+    return reservation;
+  });
+}
+
+export async function readProvisionJournal(paths: ControlPlanePaths, instanceId: string): Promise<ProvisionJournal> {
+  assertInstanceId(instanceId);
+  const file = paths.journalFile(instanceId);
+  let raw: unknown;
+  try {
+    await assertPrivateStateFile(file);
+    raw = await readJson<unknown>(file);
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) {
+      throw new GwsEaError(
+        'journal_missing',
+        `This assistant has no provision journal, so gws-ea cannot tell what was set up. ${recreate(instanceId)}`,
+      );
+    }
+    if (error instanceof GwsEaError) throw error;
+    throw invalid('Provision journal cannot be parsed safely');
+  }
+  return parseJournal(raw, instanceId);
 }
 
 function assertActiveOperation(operation: InstanceOperation): void {
@@ -190,12 +262,99 @@ function assertActiveOperation(operation: InstanceOperation): void {
   }
 }
 
+async function updateProvisionJournal(
+  operation: InstanceOperation,
+  change: (journal: ProvisionJournal) => ProvisionJournal,
+): Promise<ProvisionJournal> {
+  assertActiveOperation(operation);
+  const next = change(await readProvisionJournal(operation.paths, operation.instanceId));
+  await writePrivate(operation.paths.journalFile(operation.instanceId), next);
+  return next;
+}
+
+/** Record a step's first start; a resumed step keeps its original start. */
+export function recordStepStarted(operation: InstanceOperation, step: ProvisionStepId): Promise<ProvisionJournal> {
+  return updateProvisionJournal(operation, (journal) =>
+    journal.steps[step]
+      ? journal
+      : { ...journal, steps: { ...journal.steps, [step]: { started_at: new Date().toISOString() } } },
+  );
+}
+
+export function recordStepCompleted(operation: InstanceOperation, step: ProvisionStepId): Promise<ProvisionJournal> {
+  return updateProvisionJournal(operation, (journal) => {
+    const now = new Date().toISOString();
+    const { last_error: lastError, ...rest } = journal;
+    return {
+      ...rest,
+      ...(lastError && lastError.step !== step ? { last_error: lastError } : {}),
+      steps: { ...journal.steps, [step]: { started_at: journal.steps[step]?.started_at ?? now, completed_at: now } },
+    };
+  });
+}
+
+/** One bounded line, so a recorded failure always reads back. */
+function singleLine(value: string): string {
+  const printable = [...value].map((character) => (hasControlCharacters(character) ? ' ' : character)).join('');
+  return printable.replace(/\s+/gu, ' ').trim().slice(0, 1_000) || 'unknown';
+}
+
+/** Record why a step stopped; only a GWS-EA error's own message is kept, redacted. */
+export function recordStepFailure(
+  operation: InstanceOperation,
+  step: ProvisionStepId,
+  error: unknown,
+  log: string | undefined,
+): Promise<ProvisionJournal> {
+  const failure: JournalError = {
+    step,
+    code: singleLine(safeErrorCode(error)),
+    message: singleLine(safeErrorMessage(error)),
+    at: new Date().toISOString(),
+    ...(log ? { log: singleLine(log) } : {}),
+  };
+  return updateProvisionJournal(operation, (journal) => ({ ...journal, last_error: failure }));
+}
+
+export function recordChatConfigurationConfirmed(operation: InstanceOperation): Promise<ProvisionJournal> {
+  return updateProvisionJournal(operation, (journal) =>
+    journal.decisions.chat_configuration_confirmed_at
+      ? journal
+      : {
+          ...journal,
+          decisions: { ...journal.decisions, chat_configuration_confirmed_at: new Date().toISOString() },
+        },
+  );
+}
+
+/** Fix the principal conversation; a different later choice is refused. */
+export function recordPrincipalSelection(
+  operation: InstanceOperation,
+  candidate: PrincipalCandidate,
+): Promise<ProvisionJournal> {
+  const selected = parsePrincipalCandidate(candidate);
+  return updateProvisionJournal(operation, (journal) => {
+    const existing = journal.decisions.principal;
+    if (existing && JSON.stringify(existing) !== JSON.stringify(selected)) {
+      throw new GwsEaError(
+        'principal_selection_mismatch',
+        'The principal selection is already fixed for this instance',
+      );
+    }
+    return existing ? journal : { ...journal, decisions: { ...journal.decisions, principal: selected } };
+  });
+}
+
+export function recordKeyPolicyLifted(operation: InstanceOperation, lifted: boolean): Promise<ProvisionJournal> {
+  return updateProvisionJournal(operation, (journal) => ({ ...journal, key_policy_lifted: lifted }));
+}
+
 export async function acquireInstanceOperation(
   paths: ControlPlanePaths,
   instanceId: string,
 ): Promise<InstanceOperation | null> {
   assertInstanceId(instanceId);
-  await preparePrivateLocalDirectory(path.dirname(paths.instanceLock(instanceId)));
+  await preparePrivateDirectory(path.dirname(paths.instanceLock(instanceId)));
   const unlock = await processLock(paths.instanceLock(instanceId));
   if (!unlock) return null;
   try {
@@ -206,7 +365,7 @@ export async function acquireInstanceOperation(
       if (!isErrno(error, 'ENOENT')) throw error;
     }
     await getInstanceReservation(paths, instanceId);
-    await preparePrivateLocalDirectory(paths.instanceRoot(instanceId));
+    await preparePrivateDirectory(paths.instanceRoot(instanceId));
   } catch (error) {
     unlock();
     throw error;
@@ -239,171 +398,4 @@ export async function withInstanceOperation<T>(
   } finally {
     operation.release();
   }
-}
-
-export function journalResourceKey(kind: string, value: string): string {
-  if (!RESOURCE_KIND_PATTERN.test(kind)) throw new GwsEaError('invalid_resource_key', 'Resource key kind is invalid');
-  if (!value || hasControlCharacters(value)) {
-    throw new GwsEaError('invalid_resource_key', 'Resource key value is invalid');
-  }
-  return `${kind}:${createHash('sha256').update(value).digest('hex')}`;
-}
-
-async function readJournalFile(paths: ControlPlanePaths, instanceId: string): Promise<ProvisionJournal> {
-  const file = paths.journalFile(instanceId);
-  try {
-    await assertPrivateStateFile(file);
-    const raw = await readJson<unknown>(file);
-    return validateJournal(raw, instanceId);
-  } catch (error) {
-    if (error instanceof GwsEaError) throw error;
-    if (isErrno(error, 'ENOENT')) throw error;
-    throw new GwsEaError('invalid_journal', 'Provision journal cannot be parsed safely');
-  }
-}
-
-export async function readProvisionJournal(paths: ControlPlanePaths, instanceId: string): Promise<ProvisionJournal> {
-  assertInstanceId(instanceId);
-  await getInstanceReservation(paths, instanceId);
-  await assertPrivateLocalDirectory(paths.instanceRoot(instanceId));
-  return readJournalFile(paths, instanceId);
-}
-
-export async function ensureProvisionJournal(operation: InstanceOperation): Promise<ProvisionJournal> {
-  assertActiveOperation(operation);
-  try {
-    return await readJournalFile(operation.paths, operation.instanceId);
-  } catch (error) {
-    if (!isErrno(error, 'ENOENT')) throw error;
-  }
-  const journal = emptyJournal(operation.instanceId);
-  await writePrivate(operation.paths.journalFile(operation.instanceId), journal);
-  return journal;
-}
-
-export function firstIncompletePhase(journal: ProvisionJournal): ProvisionPhase | undefined {
-  return PROVISION_PHASES.find((phase) => journal.phases[phase].attempts.at(-1)?.succeeded_at === undefined);
-}
-
-async function persistJournal(operation: InstanceOperation, journal: ProvisionJournal): Promise<ProvisionJournal> {
-  assertActiveOperation(operation);
-  const validated = validateJournal(journal, operation.instanceId);
-  await writePrivate(operation.paths.journalFile(operation.instanceId), validated);
-  return validated;
-}
-
-export async function beginPhase(
-  operation: InstanceOperation,
-  phase: ProvisionPhase,
-  resourceKey: string,
-): Promise<BeginPhaseResult> {
-  assertActiveOperation(operation);
-  validateResourceKey(resourceKey);
-  const journal = await readJournalFile(operation.paths, operation.instanceId);
-  const incomplete = firstIncompletePhase(journal);
-  if (incomplete !== phase) {
-    throw new GwsEaError('phase_order', `Cannot begin phase; first incomplete phase is ${incomplete ?? 'none'}`);
-  }
-  const attempts = journal.phases[phase].attempts;
-  const previous = attempts.at(-1);
-  if (previous) {
-    if (previous.resource_key !== resourceKey) {
-      throw new GwsEaError('resource_mismatch', 'Resume cannot change the phase resource key');
-    }
-    if (previous.observation?.matched !== false) {
-      return { journal, attempt: previous, requires_reconciliation: true };
-    }
-  }
-  const attempt: JournalAttempt = {
-    attempt_id: randomUUID(),
-    resource_key: resourceKey,
-    intended_at: new Date().toISOString(),
-  };
-  attempts.push(attempt);
-  const persisted = await persistJournal(operation, journal);
-  return {
-    journal: persisted,
-    attempt: persisted.phases[phase].attempts.at(-1)!,
-    requires_reconciliation: false,
-  };
-}
-
-function currentAttempt(journal: ProvisionJournal, phase: ProvisionPhase, attemptId: string): JournalAttempt {
-  const attempt = journal.phases[phase].attempts.at(-1);
-  if (!attempt || attempt.attempt_id !== attemptId) {
-    throw new GwsEaError('attempt_mismatch', 'Journal attempt is not the current phase attempt');
-  }
-  return attempt;
-}
-
-export async function observePhase(
-  operation: InstanceOperation,
-  phase: ProvisionPhase,
-  attemptId: string,
-  observation: PhaseObservationInput,
-): Promise<ProvisionJournal> {
-  assertActiveOperation(operation);
-  const journal = await readJournalFile(operation.paths, operation.instanceId);
-  if (firstIncompletePhase(journal) !== phase) {
-    throw new GwsEaError('phase_order', 'Only the first incomplete phase may be observed');
-  }
-  const attempt = currentAttempt(journal, phase, attemptId);
-  if (observation.matched && observation.resource_key !== attempt.resource_key) {
-    throw new GwsEaError('resource_mismatch', 'Observed resource key does not match phase intent');
-  }
-  if (attempt.observation) {
-    const same =
-      attempt.observation.matched === observation.matched &&
-      (!observation.matched || attempt.observation.resource_key === observation.resource_key);
-    if (!same) throw new GwsEaError('observation_conflict', 'Phase already has a different observation');
-    return journal;
-  }
-  attempt.observation = {
-    matched: observation.matched,
-    observed_at: new Date().toISOString(),
-    ...(observation.matched ? { resource_key: observation.resource_key } : {}),
-  };
-  return persistJournal(operation, journal);
-}
-
-export async function commitPhaseSuccess(
-  operation: InstanceOperation,
-  phase: ProvisionPhase,
-  attemptId: string,
-): Promise<ProvisionJournal> {
-  assertActiveOperation(operation);
-  const journal = await readJournalFile(operation.paths, operation.instanceId);
-  const attempt = currentAttempt(journal, phase, attemptId);
-  if (attempt.succeeded_at) return journal;
-  if (!attempt.observation?.matched || attempt.observation.resource_key !== attempt.resource_key) {
-    throw new GwsEaError('postcondition_missing', 'Phase postcondition must be observed before success');
-  }
-  if (firstIncompletePhase(journal) !== phase) {
-    throw new GwsEaError('phase_order', 'Only the first incomplete phase may commit success');
-  }
-  attempt.succeeded_at = new Date().toISOString();
-  return persistJournal(operation, journal);
-}
-
-export async function recordPhaseFailure(
-  operation: InstanceOperation,
-  phase: ProvisionPhase,
-  attemptId: string,
-  code: string,
-): Promise<ProvisionJournal> {
-  assertActiveOperation(operation);
-  if (!FAILURE_CODE_PATTERN.test(code)) throw new GwsEaError('invalid_failure', 'Failure code is invalid');
-  const journal = await readJournalFile(operation.paths, operation.instanceId);
-  if (firstIncompletePhase(journal) !== phase) {
-    throw new GwsEaError('phase_order', 'Only the first incomplete phase may record failure');
-  }
-  const attempt = currentAttempt(journal, phase, attemptId);
-  attempt.failure = { code, failed_at: new Date().toISOString() };
-  return persistJournal(operation, journal);
-}
-
-export async function readRawJournalForDiagnostics(paths: ControlPlanePaths, instanceId: string): Promise<string> {
-  assertInstanceId(instanceId);
-  await assertPrivateStateFile(paths.journalFile(instanceId));
-  return readFile(paths.journalFile(instanceId), 'utf8');
 }

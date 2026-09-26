@@ -54,6 +54,7 @@ describe('Google Chat channel configuration', () => {
     delete process.env.GCHAT_CREDENTIALS;
     delete process.env.GCHAT_ENDPOINT_URL;
     delete process.env.GCHAT_BOT_USER_ID;
+    delete process.env.GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL;
     delete process.env.GOOGLE_CHAT_BOT_USER_ID;
     for (const key of alternateVerifierEnvKeys) delete process.env[key];
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-gchat-test-'));
@@ -71,6 +72,7 @@ describe('Google Chat channel configuration', () => {
     delete process.env.GCHAT_CREDENTIALS;
     delete process.env.GCHAT_ENDPOINT_URL;
     delete process.env.GCHAT_BOT_USER_ID;
+    delete process.env.GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL;
     delete process.env.GOOGLE_CHAT_BOT_USER_ID;
     for (const key of alternateVerifierEnvKeys) delete process.env[key];
   });
@@ -121,11 +123,35 @@ describe('Google Chat channel configuration', () => {
     });
   });
 
+  it('passes the exact Workspace Add-on identity to the Chat adapter', async () => {
+    process.env.GCHAT_CREDENTIALS = credentialEnv;
+    process.env.GCHAT_ENDPOINT_URL = endpointUrl;
+    process.env.GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL =
+      'service-441811502258@gcp-sa-gsuiteaddons.iam.gserviceaccount.com';
+
+    const factory = await registeredFactory();
+    await factory();
+
+    expect(mocks.createGoogleChatAdapter).toHaveBeenCalledWith({
+      credentials: { client_email: 'bot@example.test', private_key: 'secret' },
+      endpointUrl,
+      workspaceAddOnServiceAccountEmail: 'service-441811502258@gcp-sa-gsuiteaddons.iam.gserviceaccount.com',
+    });
+  });
+
   it('returns null only when Google Chat is wholly unconfigured', async () => {
     const factory = await registeredFactory();
 
     expect(factory()).toBeNull();
     expect(mocks.createGoogleChatAdapter).not.toHaveBeenCalled();
+  });
+
+  it('rejects a Workspace Add-on identity without the required Chat configuration', async () => {
+    process.env.GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL =
+      'service-441811502258@gcp-sa-gsuiteaddons.iam.gserviceaccount.com';
+
+    const factory = await registeredFactory();
+    expect(() => factory()).toThrow('GCHAT_CREDENTIALS');
   });
 
   it.each([

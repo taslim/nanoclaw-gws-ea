@@ -1,4 +1,5 @@
 import os from 'os';
+import { isIP } from 'node:net';
 import path from 'path';
 
 import { readEnvFile } from './env.js';
@@ -19,6 +20,7 @@ const envConfig = readEnvFile([
   'NANOCLAW_EGRESS_LOCKDOWN',
   'NANOCLAW_EGRESS_NETWORK',
   'WEBHOOK_PORT',
+  'WEBHOOK_HOST',
 ]);
 
 /**
@@ -115,6 +117,20 @@ export function getWebhookPort(): number {
     throw new Error(`Invalid WEBHOOK_PORT ${JSON.stringify(raw)}: expected an integer from 1 to 65535`);
   }
   return port;
+}
+
+// Resolve when the listener starts so a late process override still wins.
+// Vanilla NanoClaw remains public by default; managed installations opt into
+// loopback through their persisted service environment.
+export function getWebhookHost(): string {
+  const raw = process.env.WEBHOOK_HOST || envConfig.WEBHOOK_HOST || '0.0.0.0';
+  const validHostname =
+    raw.length <= 253 &&
+    raw.split('.').every((label) => /^(?=.{1,63}$)[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/u.test(label));
+  if (isIP(raw) === 0 && !validHostname) {
+    throw new Error(`Invalid WEBHOOK_HOST ${JSON.stringify(raw)}: expected an IP address or hostname`);
+  }
+  return raw;
 }
 
 // Timezone for scheduled tasks, message formatting, etc.

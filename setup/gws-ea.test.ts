@@ -1,45 +1,251 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const fixture = vi.hoisted(() => ({
-  runCli: vi.fn(async (_args: readonly string[], _runtime: unknown) => 0),
-  collect: vi.fn(async (_context: unknown, _dependencies: unknown) => ({ marker: 'collected' })),
-  authenticate: vi.fn(async (_provider: string, _providers: unknown) => ({ marker: 'authenticated' })),
-  providers: [{ value: 'claude' }],
-}));
+import type { CliRuntime, FailureReport } from '../src/gws-ea/cli.js';
+import type { Interaction } from '../src/gws-ea/events.js';
+import type { PrerequisiteRequest } from '../src/gws-ea/prerequisites.js';
 
+const fixture = vi.hoisted(() => {
+  const spinner = {
+    start: vi.fn(),
+    message: vi.fn(),
+    stop: vi.fn(),
+    error: vi.fn(),
+    clear: vi.fn(),
+  };
+  return {
+    runCli: vi.fn(async (_args: readonly string[], _runtime: unknown) => 0),
+    collect: vi.fn(async (_context: unknown, _dependencies: unknown) => ({ marker: 'collected' })),
+    authenticate: vi.fn(async (_provider: string, _providers: unknown) => ({ marker: 'authenticated' })),
+    providers: [{ value: 'claude' }],
+    spinner,
+    log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), message: vi.fn(), step: vi.fn() },
+    note: vi.fn(),
+    password: vi.fn(async () => 'fresh-cloudflare-token'),
+    confirm: vi.fn(async () => true),
+    ensurePrerequisites: vi.fn(async () => ({ account: 'operator@example.com' })),
+    signIn: vi.fn(async () => undefined),
+    confirmAccount: vi.fn(async () => true),
+    offerDiagnosis: vi.fn(async () => 'answered'),
+    dump: vi.fn(),
+  };
+});
+
+vi.mock('@clack/prompts', () => ({
+  log: fixture.log,
+  note: fixture.note,
+  password: fixture.password,
+  confirm: fixture.confirm,
+  spinner: () => fixture.spinner,
+  isCancel: () => false,
+}));
 vi.mock('../src/gws-ea/cli.js', () => ({ runCli: fixture.runCli }));
 vi.mock('./gws-ea-input.js', () => ({
   collectGwsEaCreateInput: fixture.collect,
   authenticateGwsEaProvider: fixture.authenticate,
+  CLOUDFLARE_API_TOKEN_GUIDANCE: 'cloudflare-token-guidance',
 }));
+vi.mock('./gws-ea-prerequisites.js', () => ({
+  ensurePrerequisites: fixture.ensurePrerequisites,
+  signInToGoogleCloud: fixture.signIn,
+  confirmGoogleAccount: fixture.confirmAccount,
+}));
+vi.mock('./gws-ea-assist.js', () => ({ offerDiagnosis: fixture.offerDiagnosis }));
+vi.mock('./lib/runner.js', () => ({ dumpTranscriptOnFailure: fixture.dump }));
 vi.mock('./providers/registry.js', () => ({ listSetupProviders: () => fixture.providers }));
 vi.mock('./providers/index.js', () => ({}));
 
-describe('GWS-EA launcher', () => {
+const { createTerminalPresenter, main } = await import('./gws-ea.js');
+/** Upstream's `.env` writer: the driver injects it unchanged. */
+const { upsertEnvVars } = await import('./set-env.js');
+/** Upstream's host readiness helpers (untyped ESM, so loaded by URL): the driver injects them unchanged. */
+const hostStatus = (await import(new URL('./lib/host-status.mjs', import.meta.url).href)) as Readonly<
+  Record<'queryHost' | 'waitForHost', unknown>
+>;
+
+function runtimeOf(call = 0): CliRuntime {
+  return fixture.runCli.mock.calls[call]![1] as CliRuntime;
+}
+
+function report(overrides: Partial<FailureReport> = {}): FailureReport {
+  return {
+    command: 'resume',
+    step: 'start_onecli',
+    code: 'onecli_unhealthy',
+    cause: 'OneCLI did not become healthy',
+    nextAction: 'Resume with: gws-ea resume --id x',
+    progressLog: '/logs/progress.log',
+    runDirectory: '/logs',
+    ...overrides,
+  };
+}
+
+describe('GWS-EA driver', () => {
   afterEach(() => {
-    process.exitCode = undefined;
     vi.clearAllMocks();
   });
 
-  it('passes one composed provider snapshot to both input collection and authentication', async () => {
-    const originalArgv = process.argv;
-    process.argv = ['node', 'setup/gws-ea.ts', 'create', '--track', 'prod'];
-    try {
-      await import('./gws-ea.js');
-    } finally {
-      process.argv = originalArgv;
-    }
+  it('runs unattended without a TTY: no spinner, prompts, gcloud guidance, or failure loop', async () => {
+    await main(['create', '--track', 'prod'], { interactive: false });
 
     expect(fixture.runCli).toHaveBeenCalledOnce();
-    const [args, unknownRuntime] = fixture.runCli.mock.calls[0]!;
-    const runtime = unknownRuntime as {
-      collectCreateInputs(context: unknown): Promise<unknown>;
-      authenticateProvider(provider: string): Promise<unknown>;
-    };
-    expect(args).toEqual(['create', '--track', 'prod']);
-    await runtime.collectCreateInputs({ marker: 'context' });
-    await runtime.authenticateProvider('claude');
-    expect(fixture.collect).toHaveBeenCalledWith({ marker: 'context' }, { providers: fixture.providers });
+    const runtime = runtimeOf();
+    expect(fixture.runCli.mock.calls[0]![0]).toEqual(['create', '--track', 'prod']);
+    expect(runtime.presenter).toBeUndefined();
+    expect(runtime.prompts).toBeUndefined();
+    expect(runtime.onFailure).toBeUndefined();
+    expect(runtime.checkPrerequisites).toBeUndefined();
+    expect(runtime.confirmRemoval).toBeUndefined();
+    expect(runtime.upsertEnvVars).toBe(upsertEnvVars);
+    expect(runtime.hostStatus?.queryHost).toBe(hostStatus.queryHost);
+    expect(runtime.hostStatus?.waitForHost).toBe(hostStatus.waitForHost);
+    await runtime.collectCreateInputs!({ marker: 'context' } as never);
+    expect(fixture.collect).toHaveBeenCalledWith(
+      { marker: 'context' },
+      { providers: fixture.providers, interactive: false },
+    );
+  });
+
+  it('relies on upstream waitForHost naming the checkout-relative error log that gws-ea rewrites', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-host-status-'));
+    const waitForHost = hostStatus.waitForHost as (root: string, options: { timeoutMs: number }) => Promise<unknown>;
+    try {
+      // No host listens in an empty checkout: the helper gives up with its reason and the relative log path.
+      await expect(waitForHost(root, { timeoutMs: 50 })).rejects.toThrow(/\. Check logs\/nanoclaw\.error\.log\.$/u);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('wires the spinner, prompts, gcloud guidance, and failure loop on a TTY', async () => {
+    await main(['resume', '--id', 'x'], { interactive: true });
+    const runtime = runtimeOf();
+
+    expect(runtime.presenter).toBeDefined();
+    expect(runtime.upsertEnvVars).toBe(upsertEnvVars);
+    expect(runtime.hostStatus?.waitForHost).toBe(hostStatus.waitForHost);
+    await runtime.collectCreateInputs!({ marker: 'context' } as never);
+    expect(fixture.collect).toHaveBeenCalledWith(
+      { marker: 'context' },
+      { providers: fixture.providers, interactive: true },
+    );
+
+    await runtime.prompts!.providerCredential('claude');
     expect(fixture.authenticate).toHaveBeenCalledWith('claude', fixture.providers);
+
+    await expect(
+      runtime.prompts!.cloudflareAccountToken({ accountId: 'a'.repeat(32), reason: 'The listener drifted.' }),
+    ).resolves.toBe('fresh-cloudflare-token');
+    expect(fixture.log.warn).toHaveBeenCalledWith('The listener drifted.');
+    expect(fixture.note).toHaveBeenCalledWith('cloudflare-token-guidance', 'Cloudflare access');
+    expect(fixture.log.warn.mock.invocationCallOrder[0]).toBeLessThan(fixture.password.mock.invocationCallOrder[0]!);
+    expect(fixture.note.mock.invocationCallOrder[0]).toBeLessThan(fixture.password.mock.invocationCallOrder[0]!);
+
+    await runtime.prompts!.googleCloudSignIn('reserved@example.com');
+    expect(fixture.signIn).toHaveBeenCalledWith('reserved@example.com');
+    await expect(runtime.prompts!.googleAccount('operator@example.com')).resolves.toBe(true);
+    expect(fixture.confirmAccount).toHaveBeenCalledWith('operator@example.com');
+
+    const interaction = { marker: 'interaction' } as unknown as Interaction;
+    const request: PrerequisiteRequest = {
+      command: 'resume',
+      paths: {
+        configRoot: '/config',
+        stateRoot: '/state',
+        logsRoot: '/state/logs',
+        instancesRoot: '/state/instances',
+        onecliCliFile: (version) => `/state/tools/onecli/${version}/onecli`,
+      },
+      account: 'reserved@example.com',
+      dockerEndpoint: 'unix:///var/run/docker.sock',
+      checkoutRoot: '/state/instances/x/nanoclaw',
+    };
+    await runtime.checkPrerequisites!(request, interaction);
+    expect(fixture.ensurePrerequisites).toHaveBeenCalledWith(request, interaction);
+  });
+
+  it('offers diagnosis, then a retry, after an interactive failure', async () => {
+    await main(['resume', '--id', 'x'], { interactive: true });
+    const { onFailure } = runtimeOf();
+
+    await expect(onFailure!(report())).resolves.toBe('retry');
+    expect(fixture.offerDiagnosis).toHaveBeenCalledWith(report());
+    expect(fixture.offerDiagnosis.mock.invocationCallOrder[0]).toBeLessThan(
+      fixture.confirm.mock.invocationCallOrder[0]!,
+    );
+    expect(fixture.confirm).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringMatching(/retry/iu) }),
+    );
+
+    fixture.confirm.mockResolvedValueOnce(false);
+    await expect(onFailure!(report())).resolves.toBe('stop');
+  });
+
+  it('asks before removal on a TTY, defaulting to keep the assistant', async () => {
+    await main(['remove', '--id', 'x'], { interactive: true });
+    fixture.confirm.mockResolvedValueOnce(false);
+    await expect(runtimeOf().confirmRemoval!({ instanceId: 'x', gcpProject: 'p' } as never)).resolves.toBe(false);
+    expect(fixture.confirm).toHaveBeenCalledExactlyOnceWith({
+      message: expect.stringMatching(/assistant x .*GCP project p\?$/u),
+      initialValue: false,
+    });
+  });
+});
+
+describe('GWS-EA terminal presenter', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('renders a labeled step as a spinner that shows its waiting reason and elapsed time', () => {
+    vi.useFakeTimers();
+    const presenter = createTerminalPresenter();
+
+    presenter.event({ type: 'step-started', step: 'provision_gcp', label: 'Configuring Google Cloud…' });
+    expect(fixture.spinner.start).toHaveBeenCalledWith(expect.stringContaining('Configuring Google Cloud'));
+    presenter.event({ type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for the service account…' });
+    vi.advanceTimersByTime(1000);
+    expect(fixture.spinner.message).toHaveBeenLastCalledWith(
+      expect.stringContaining('Waiting for the service account'),
+    );
+    expect(fixture.spinner.message).toHaveBeenLastCalledWith(expect.stringContaining('(1s)'));
+    presenter.event({ type: 'step-completed', step: 'provision_gcp' });
+    expect(fixture.spinner.stop).toHaveBeenCalledWith(expect.stringContaining('Configuring Google Cloud'));
+  });
+
+  it('hands the terminal over and back without losing the running step', () => {
+    const presenter = createTerminalPresenter();
+
+    presenter.event({ type: 'step-started', step: 'configure_provider', label: 'Connecting the AI provider…' });
+    presenter.suspend();
+    presenter.suspend();
+    expect(fixture.spinner.clear).toHaveBeenCalledOnce();
+    presenter.resume();
+    presenter.resume();
+    expect(fixture.spinner.start).toHaveBeenCalledTimes(2);
+    presenter.event({ type: 'step-failed', step: 'configure_provider', error: new Error('x') });
+    expect(fixture.spinner.error).toHaveBeenCalledWith(expect.stringContaining('Connecting the AI provider'));
+    presenter.resume();
+    expect(fixture.spinner.start).toHaveBeenCalledTimes(2);
+  });
+
+  it('ignores unlabeled steps and renders the failure summary with its redacted tail', () => {
+    const presenter = createTerminalPresenter();
+
+    presenter.event({ type: 'step-started', step: 'inputs' });
+    expect(fixture.spinner.start).not.toHaveBeenCalled();
+    presenter.report({
+      outcome: 'failed',
+      headline: 'Stopped at start_onecli: OneCLI did not become healthy',
+      details: ['Log: /logs/progress.log'],
+      tail: 'last stderr line',
+    });
+    expect(fixture.log.error).toHaveBeenCalledWith('Stopped at start_onecli: OneCLI did not become healthy');
+    expect(fixture.log.message).toHaveBeenCalledWith('Log: /logs/progress.log');
+    expect(fixture.dump).toHaveBeenCalledWith('last stderr line');
   });
 });

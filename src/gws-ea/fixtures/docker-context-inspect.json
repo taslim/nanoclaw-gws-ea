@@ -1,0 +1,11 @@
+{
+  "kind": "command",
+  "program": "docker",
+  "args": [
+    "context",
+    "inspect"
+  ],
+  "exit_code": 0,
+  "stdout": "[\n    {\n        \"Name\": \"desktop-linux\",\n        \"Metadata\": {\n            \"Description\": \"Docker Desktop\",\n            \"GODEBUG\": \"x509negativeserial=1\",\n            \"otel\": {\n                \"OTEL_EXPORTER_OTLP_ENDPOINT\": \"unix:///home/operator/.docker/run/user-analytics.otlp.grpc.sock\"\n            }\n        },\n        \"Endpoints\": {\n            \"docker\": {\n                \"Host\": \"unix:///home/operator/.docker/run/docker.sock\",\n                \"SkipTLSVerify\": false\n            }\n        },\n        \"TLSMaterial\": {},\n        \"Storage\": {\n            \"MetadataPath\": \"/home/operator/.docker/contexts/meta/0000000000000000000000000000000000000000000000000000000000000000\",\n            \"TLSPath\": \"/home/operator/.docker/contexts/tls/0000000000000000000000000000000000000000000000000000000000000000\"\n        }\n    }\n]\n",
+  "stderr": ""
+}

@@ -1,8 +1,14 @@
 import fs from 'node:fs';
-import { chmod, lstat, mkdir, statfs } from 'node:fs/promises';
+import { chmod, lstat, mkdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { isErrno } from '../community-portal/errors.js';
 import { GwsEaError } from './types.js';
+
+/** The checkout this control plane runs from (`src/gws-ea` and `dist/gws-ea` both sit two levels below it). */
+export const CONTROL_PLANE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 export interface ControlPlanePathOverrides {
   configRoot?: string;
@@ -15,7 +21,12 @@ export interface ControlPlanePaths {
   registryFile: string;
   registryLock: string;
   removalRoot: string;
+  ingressRoot: string;
+  cloudflareRoot: string;
   instancesRoot: string;
+  logsRoot: string;
+  preReservationLogsRoot: string;
+  instanceLogsRoot(instanceId: string): string;
   instanceRoot(instanceId: string): string;
   checkoutRoot(instanceId: string): string;
   journalFile(instanceId: string): string;
@@ -23,20 +34,12 @@ export interface ControlPlanePaths {
   markerFile(instanceId: string): string;
   bootstrapFile(instanceId: string): string;
   releasePreflightFile(instanceId: string): string;
-  principalSelectionFile(instanceId: string): string;
-  chatConfigurationFile(instanceId: string): string;
   removalFile(instanceId: string): string;
+  /** gws-ea's own copy of one pinned OneCLI CLI version. */
+  onecliCliFile(version: string): string;
+  /** The Cloudflare account token a create keeps until its route is set up. */
+  keptCloudflareTokenFile(instanceId: string): string;
 }
-
-const REMOTE_FILESYSTEM_TYPES = new Set([
-  0x6969n, // NFS
-  0x517bn, // SMB
-  0xff534d42n, // CIFS
-  0x73757245n, // CODA
-  0x5346414fn, // AFS
-  0x01021997n, // 9P
-  0x65735546n, // FUSE: may be backed by sshfs or another remote service
-]);
 
 function nearestExistingAncestor(target: string): string {
   let candidate = target;
@@ -48,15 +51,19 @@ function nearestExistingAncestor(target: string): string {
   return candidate;
 }
 
+/** `target` with every existing ancestor's symlinks resolved; the missing rest is kept as written. */
+export function canonicalPath(target: string): string {
+  const resolved = path.resolve(target);
+  const ancestor = nearestExistingAncestor(resolved);
+  return path.join(fs.realpathSync(ancestor), path.relative(ancestor, resolved));
+}
+
 function canonicalNewPath(target: string): string {
   const resolved = path.resolve(target);
   if (fs.existsSync(resolved) && fs.lstatSync(resolved).isSymbolicLink()) {
     throw new GwsEaError('unsafe_path', `Managed root must not be a symlink: ${resolved}`);
   }
-  const ancestor = nearestExistingAncestor(resolved);
-  const canonicalAncestor = fs.realpathSync(ancestor);
-  const relative = path.relative(ancestor, resolved);
-  return path.join(canonicalAncestor, relative);
+  return canonicalPath(resolved);
 }
 
 export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = {}): ControlPlanePaths {
@@ -70,6 +77,9 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
   );
   const instancesRoot = path.join(stateRoot, 'instances');
   const removalRoot = path.join(configRoot, 'removals');
+  const ingressRoot = path.join(stateRoot, 'ingress');
+  const cloudflareRoot = path.join(ingressRoot, 'cloudflare');
+  const logsRoot = path.join(stateRoot, 'logs');
   const instanceRoot = (instanceId: string): string => path.join(instancesRoot, instanceId);
   const checkoutRoot = (instanceId: string): string => path.join(instanceRoot(instanceId), 'nanoclaw');
 
@@ -79,7 +89,12 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
     registryFile: path.join(configRoot, 'instances.json'),
     registryLock: path.join(configRoot, 'instances.lock'),
     removalRoot,
+    ingressRoot,
+    cloudflareRoot,
     instancesRoot,
+    logsRoot,
+    preReservationLogsRoot: path.join(logsRoot, 'runs'),
+    instanceLogsRoot: (instanceId) => path.join(logsRoot, instanceId),
     instanceRoot,
     checkoutRoot,
     journalFile: (instanceId) => path.join(instanceRoot(instanceId), 'provision.json'),
@@ -87,70 +102,73 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
     markerFile: (instanceId) => path.join(checkoutRoot(instanceId), 'data', 'gws-ea', 'instance.json'),
     bootstrapFile: (instanceId) => path.join(instanceRoot(instanceId), 'bootstrap.json'),
     releasePreflightFile: (instanceId) => path.join(instanceRoot(instanceId), 'release-preflight.json'),
-    principalSelectionFile: (instanceId) => path.join(instanceRoot(instanceId), 'principal-selection.json'),
-    chatConfigurationFile: (instanceId) => path.join(instanceRoot(instanceId), 'chat-configured.json'),
     removalFile: (instanceId) => path.join(removalRoot, `${instanceId}.json`),
+    onecliCliFile: (version) => path.join(stateRoot, 'tools', 'onecli', version, 'onecli'),
+    keptCloudflareTokenFile: (instanceId) => path.join(instanceRoot(instanceId), 'secrets', 'cloudflare-account-token'),
   };
 }
 
-function unsignedFilesystemType(type: number | bigint): bigint {
-  return BigInt.asUintN(64, BigInt(type));
+/** Whether a regular file exists at `file`. */
+export async function isRegularFile(file: string): Promise<boolean> {
+  try {
+    return (await lstat(file)).isFile();
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) return false;
+    throw error;
+  }
 }
 
-export function isLocalFilesystemType(type: number | bigint): boolean {
-  return !REMOTE_FILESYSTEM_TYPES.has(unsignedFilesystemType(type));
+/** Whether `target` lies strictly inside `root` (both absolute, already canonical where it matters). */
+export function isWithinDirectory(target: string, root: string): boolean {
+  const relative = path.relative(root, target);
+  return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
-export async function assertLocalOwnedDestination(target: string): Promise<void> {
+/** No permission bits for group or others: `0600`/`0700` or stricter. */
+export function isOwnerOnlyMode(mode: number): boolean {
+  return (mode & 0o077) === 0;
+}
+
+function assertOwnedByCurrentUser(uid: number, message: string): void {
+  if (typeof process.getuid === 'function' && uid !== process.getuid()) throw new GwsEaError('unsafe_owner', message);
+}
+
+export async function assertOwnedDestination(target: string): Promise<void> {
   const ancestor = nearestExistingAncestor(path.resolve(target));
   const info = await lstat(ancestor);
   if (info.isSymbolicLink()) {
     throw new GwsEaError('unsafe_path', `Managed path resolves through a symlinked destination: ${ancestor}`);
   }
-  if (typeof process.getuid === 'function' && info.uid !== process.getuid()) {
-    throw new GwsEaError('unsafe_owner', `Managed path parent must be owned by the current user: ${ancestor}`);
-  }
-  const filesystem = await statfs(ancestor);
-  if (!isLocalFilesystemType(filesystem.type)) {
-    throw new GwsEaError('remote_filesystem', `Managed path must be on a local filesystem: ${target}`);
-  }
+  assertOwnedByCurrentUser(info.uid, `Managed path parent must be owned by the current user: ${ancestor}`);
 }
 
-export async function assertOwnedLocalDirectory(directory: string, requiredMode?: number): Promise<void> {
+export async function assertOwnedDirectory(directory: string): Promise<fs.Stats> {
   const info = await lstat(directory);
   if (info.isSymbolicLink() || !info.isDirectory()) {
     throw new GwsEaError('unsafe_path', `Managed root is not a physical directory: ${directory}`);
   }
-  if (typeof process.getuid === 'function' && info.uid !== process.getuid()) {
-    throw new GwsEaError('unsafe_owner', `Managed root must be owned by the current user: ${directory}`);
-  }
-  if (requiredMode !== undefined && (info.mode & 0o777) !== requiredMode) {
-    throw new GwsEaError(
-      'unsafe_mode',
-      `Managed root must have mode ${requiredMode.toString(8).padStart(4, '0')}: ${directory}`,
-    );
-  }
-  const filesystem = await statfs(directory);
-  if (!isLocalFilesystemType(filesystem.type)) {
-    throw new GwsEaError('remote_filesystem', `Managed root must be on a local filesystem: ${directory}`);
+  assertOwnedByCurrentUser(info.uid, `Managed root must be owned by the current user: ${directory}`);
+  return info;
+}
+
+export async function assertPrivateDirectory(directory: string): Promise<void> {
+  const resolved = path.resolve(directory);
+  if (!isOwnerOnlyMode((await assertOwnedDirectory(resolved)).mode)) {
+    throw new GwsEaError('unsafe_mode', `Managed root must be accessible only by its owner (0700): ${resolved}`);
   }
 }
 
-export async function preparePrivateLocalDirectory(directory: string): Promise<void> {
+export async function preparePrivateDirectory(directory: string): Promise<void> {
   const resolved = path.resolve(directory);
   if (fs.existsSync(resolved) && fs.lstatSync(resolved).isSymbolicLink()) {
     throw new GwsEaError('unsafe_path', `Managed root must not be a symlink: ${resolved}`);
   }
   if (!fs.existsSync(resolved)) {
-    await assertLocalOwnedDestination(resolved);
+    await assertOwnedDestination(resolved);
     await mkdir(resolved, { recursive: true, mode: 0o700 });
     await chmod(resolved, 0o700);
   }
-  await assertOwnedLocalDirectory(resolved, 0o700);
-}
-
-export async function assertPrivateLocalDirectory(directory: string): Promise<void> {
-  await assertOwnedLocalDirectory(path.resolve(directory), 0o700);
+  await assertPrivateDirectory(resolved);
 }
 
 export async function assertPrivateStateFile(file: string): Promise<void> {
@@ -158,10 +176,8 @@ export async function assertPrivateStateFile(file: string): Promise<void> {
   if (info.isSymbolicLink() || !info.isFile()) {
     throw new GwsEaError('unsafe_state', `Private state must be a regular file: ${file}`);
   }
-  if (typeof process.getuid === 'function' && info.uid !== process.getuid()) {
-    throw new GwsEaError('unsafe_owner', `Private state must be owned by the current user: ${file}`);
-  }
-  if ((info.mode & 0o777) !== 0o600) {
-    throw new GwsEaError('unsafe_mode', `Private state must have mode 0600: ${file}`);
+  assertOwnedByCurrentUser(info.uid, `Private state must be owned by the current user: ${file}`);
+  if (!isOwnerOnlyMode(info.mode)) {
+    throw new GwsEaError('unsafe_mode', `Private state must be readable only by its owner (0600): ${file}`);
   }
 }

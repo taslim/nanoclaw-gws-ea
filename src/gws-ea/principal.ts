@@ -5,10 +5,8 @@ import { INSTANCE_KEY_RE } from '../channels/channel-registry.js';
 import { runInstanceNclJson } from './ncl.js';
 import { buildInstanceCliCommand, validateRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
 import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
-import { GwsEaError } from './types.js';
-import { hasControlCharacters, isRecord } from './validation.js';
-
-const CHANNEL_TYPE = 'gchat';
+import { GCHAT_CHANNEL_TYPE, GwsEaError } from './types.js';
+import { canonicalTimestamp, hasControlCharacters, isRecord, unwrapData } from './validation.js';
 
 export interface PrincipalCandidate {
   readonly messagingGroupId: string;
@@ -38,7 +36,6 @@ export type PrincipalDiscoveryResult =
 
 export interface PrincipalDiscoveryDependencies {
   readonly runNcl?: (config: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
-  readonly runBootstrap?: (config: InstanceRuntimeConfig, args: readonly string[]) => Promise<void>;
   readonly runCommand?: SanitizedCommandRunner;
   readonly persistSelection?: (candidate: PrincipalCandidate) => Promise<PrincipalCandidate>;
 }
@@ -46,16 +43,6 @@ export interface PrincipalDiscoveryDependencies {
 interface MainProfile {
   readonly mainAgentGroupId: string;
   readonly principalDisplayName: string;
-}
-
-function unwrapData(value: unknown): unknown {
-  return isRecord(value) && 'data' in value ? value.data : value;
-}
-
-function canonicalTimestamp(value: unknown): string | undefined {
-  if (typeof value !== 'string') return undefined;
-  const parsed = new Date(value);
-  return Number.isFinite(parsed.getTime()) && parsed.toISOString() === value ? value : undefined;
 }
 
 function safeIdentifier(value: unknown): string | undefined {
@@ -93,7 +80,7 @@ function parseCandidate(
   const platformId = safeIdentifier(value.platform_id);
   const userId = safeIdentifier(value.user_id);
   if (
-    value.channel_type !== CHANNEL_TYPE ||
+    value.channel_type !== GCHAT_CHANNEL_TYPE ||
     value.instance !== adapterInstance ||
     value.reason !== 'no_agent_wired' ||
     value.sender_authenticated !== 1 ||
@@ -104,7 +91,7 @@ function parseCandidate(
     !authenticatedMessageId ||
     !messagingGroupId ||
     !platformId ||
-    !userId?.startsWith(`${CHANNEL_TYPE}:`)
+    !userId?.startsWith(`${GCHAT_CHANNEL_TYPE}:`)
   ) {
     return undefined;
   }
@@ -139,7 +126,37 @@ function parseCandidates(value: unknown, adapterInstance: string, provisioningSt
   );
 }
 
-async function defaultRunBootstrap(
+/**
+ * The authenticated first Google Chat DMs received since provisioning
+ * started, latest per conversation, without binding any of them.
+ */
+export async function listPrincipalCandidates(
+  configInput: InstanceRuntimeConfig,
+  input: Pick<PrincipalDiscoveryInput, 'adapterInstance' | 'provisioningStartedAt'>,
+  dependencies: Pick<PrincipalDiscoveryDependencies, 'runNcl'> = {},
+): Promise<readonly PrincipalCandidate[]> {
+  const provisioningStartedAt = canonicalTimestamp(input.provisioningStartedAt);
+  if (!provisioningStartedAt) throw new GwsEaError('invalid_arguments', 'Provisioning start timestamp is invalid');
+  const runNcl = dependencies.runNcl ?? runInstanceNclJson;
+  return parseCandidates(
+    await runNcl(validateRuntimeConfig(configInput), [
+      'dropped-messages',
+      'list',
+      '--channel-type',
+      GCHAT_CHANNEL_TYPE,
+      '--instance',
+      input.adapterInstance,
+      '--reason',
+      'no_agent_wired',
+      '--limit',
+      '200',
+    ]),
+    input.adapterInstance,
+    provisioningStartedAt,
+  );
+}
+
+async function runBootstrap(
   config: InstanceRuntimeConfig,
   args: readonly string[],
   run: SanitizedCommandRunner = runSanitizedCommand,
@@ -175,6 +192,12 @@ export function principalWelcomeEventId(
  * candidate is unambiguous and binds automatically; multiple candidates stay
  * read-only until the operator supplies one exact messaging-group ID.
  * Authentication alone never authorizes an owner grant.
+ *
+ * Binding order: the principal and its authenticated DM are bound
+ * first; then the host creates the principal's user, owner role, membership,
+ * and main's DM wiring, which its canonical-main admission accepts or
+ * rejects; then `init-first-agent` reuses those records and delivers the
+ * welcome once per stable event ID.
  */
 export async function reconcilePrincipalDm(
   configInput: InstanceRuntimeConfig,
@@ -188,10 +211,6 @@ export async function reconcilePrincipalDm(
     throw new GwsEaError('invalid_arguments', 'Google Chat adapter instance is invalid');
   }
   const runNcl = dependencies.runNcl ?? runInstanceNclJson;
-  const runBootstrap =
-    dependencies.runBootstrap ??
-    ((runtimeConfig: InstanceRuntimeConfig, args: readonly string[]) =>
-      defaultRunBootstrap(runtimeConfig, args, dependencies.runCommand));
 
   // A non-null pointer is published only after main's OneCLI access is
   // verified, so it is the hard prerequisite for any principal wiring.
@@ -201,22 +220,7 @@ export async function reconcilePrincipalDm(
     throw new GwsEaError('principal_selection_mismatch', 'The principal selection is already fixed for this instance');
   }
   if (!selected) {
-    const candidates = parseCandidates(
-      await runNcl(config, [
-        'dropped-messages',
-        'list',
-        '--channel-type',
-        CHANNEL_TYPE,
-        '--instance',
-        input.adapterInstance,
-        '--reason',
-        'no_agent_wired',
-        '--limit',
-        '200',
-      ]),
-      input.adapterInstance,
-      provisioningStartedAt,
-    );
+    const candidates = await listPrincipalCandidates(config, input, dependencies);
     if (input.messagingGroupId === undefined) {
       if (candidates.length === 0) return { status: 'waiting' };
       if (candidates.length > 1) return { status: 'selection-required', candidates };
@@ -228,7 +232,22 @@ export async function reconcilePrincipalDm(
     selected = await (dependencies.persistSelection?.(selected) ?? Promise.resolve(selected));
   }
 
-  const stableEventId = principalWelcomeEventId(config, profile.mainAgentGroupId, selected);
+  const mainAgentGroupId = profile.mainAgentGroupId;
+  const displayName = selected.senderName ?? profile.principalDisplayName;
+  const stableEventId = principalWelcomeEventId(config, mainAgentGroupId, selected);
+  // Every record is made through the host, so its wiring admission judges
+  // main's DM wiring when it is created; each command is idempotent, so a
+  // retry after a crash repeats the whole sequence safely.
+  await runNcl(config, [
+    'users',
+    'create',
+    '--id',
+    selected.userId,
+    '--kind',
+    GCHAT_CHANNEL_TYPE,
+    '--display-name',
+    displayName,
+  ]);
   const binding = unwrapData(
     await runNcl(config, [
       'gws-ea-profile',
@@ -237,37 +256,64 @@ export async function reconcilePrincipalDm(
       selected.userId,
       '--verified-at',
       selected.authenticatedMessageAt,
+      '--messaging-group-id',
+      selected.messagingGroupId,
     ]),
   );
   if (
     !isRecord(binding) ||
     binding.user_id !== selected.userId ||
-    binding.verified_at !== selected.authenticatedMessageAt
+    binding.verified_at !== selected.authenticatedMessageAt ||
+    binding.messaging_group_id !== selected.messagingGroupId
   ) {
     throw new GwsEaError('profile_mismatch', 'The principal user binding was not confirmed');
   }
-  await runBootstrap(config, [
-    '--channel',
-    CHANNEL_TYPE,
-    '--user-id',
-    selected.userId,
-    '--platform-id',
-    selected.platformId,
-    '--display-name',
-    selected.senderName ?? profile.principalDisplayName,
-    '--agent-group-id',
-    profile.mainAgentGroupId,
-    '--verified-principal',
-    '--role',
-    'owner',
-    '--instance',
-    input.adapterInstance,
-    '--sender-scope',
-    'known',
-    '--session-mode',
-    'agent-shared',
-    '--event-id',
-    stableEventId,
-  ]);
-  return { status: 'bound', candidate: selected, agentGroupId: profile.mainAgentGroupId, eventId: stableEventId };
+  await runNcl(config, ['roles', 'grant', '--user', selected.userId, '--role', 'owner']);
+  await runNcl(config, ['members', 'add', '--user', selected.userId, '--group', mainAgentGroupId]);
+  const wiring = unwrapData(
+    await runNcl(config, [
+      'wirings',
+      'create',
+      '--messaging-group-id',
+      selected.messagingGroupId,
+      '--agent-group-id',
+      mainAgentGroupId,
+      '--sender-scope',
+      'known',
+      '--session-mode',
+      'agent-shared',
+    ]),
+  );
+  if (
+    !isRecord(wiring) ||
+    wiring.messaging_group_id !== selected.messagingGroupId ||
+    wiring.agent_group_id !== mainAgentGroupId ||
+    wiring.sender_scope !== 'known' ||
+    wiring.session_mode !== 'agent-shared'
+  ) {
+    throw new GwsEaError('profile_mismatch', "Main's principal DM wiring was not confirmed");
+  }
+  await runBootstrap(
+    config,
+    [
+      '--channel',
+      GCHAT_CHANNEL_TYPE,
+      '--user-id',
+      selected.userId,
+      '--platform-id',
+      selected.platformId,
+      '--display-name',
+      displayName,
+      '--agent-group-id',
+      mainAgentGroupId,
+      '--role',
+      'owner',
+      '--instance',
+      input.adapterInstance,
+      '--event-id',
+      stableEventId,
+    ],
+    dependencies.runCommand,
+  );
+  return { status: 'bound', candidate: selected, agentGroupId: mainAgentGroupId, eventId: stableEventId };
 }

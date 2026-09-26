@@ -2,17 +2,19 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
-import { runCli } from './cli.js';
-import type { InstanceOperation } from './journal.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { runCli, type CliRuntime } from './cli.js';
+import { runStep } from './events.js';
 import {
-  allocateInstanceId,
-  assertRegistryMarkerAgreement,
-  readRegistry,
+  acquireInstanceOperation,
+  readProvisionJournal,
+  recordStepCompleted,
+  recordStepStarted,
   reserveInstance,
-  writeInstanceMarker,
-} from './registry.js';
-import { isLocalFilesystemType, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+} from './journal.js';
+import { allocateInstanceId, assertRegistryMarkerAgreement, readRegistry, writeInstanceMarker } from './registry.js';
+import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+import type { Prerequisites } from './prerequisites.js';
 import { GwsEaError, type InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
@@ -44,12 +46,34 @@ function reservation(paths: ControlPlanePaths, instanceId = allocateInstanceId()
       onecli_gateway: 31_003,
     },
     exclusive_resource_claims: {
-      endpoint_url: 'https://assistant.example.test/webhook/gchat',
+      ingress: {
+        mode: 'existing',
+        endpoint_url: 'https://assistant.example.test/webhook/gchat',
+      },
       gcp_project_id: 'assistant-project',
       gcp_account: 'operator@example.test',
       gchat_service_account: 'gws-ea-chat@assistant-project.iam.gserviceaccount.com',
       workspace_email: 'assistant@example.test',
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
+    },
+  };
+}
+
+function managedReservation(paths: ControlPlanePaths, instanceId = allocateInstanceId()): InstanceReservationInput {
+  const input = reservation(paths, instanceId);
+  return {
+    ...input,
+    exclusive_resource_claims: {
+      ...input.exclusive_resource_claims,
+      ingress: {
+        mode: 'managed-cloudflare',
+        account_id: 'a'.repeat(32),
+        zone_id: 'b'.repeat(32),
+        zone_name: 'example.com',
+        hostname: 'assistant.example.com',
+        callback_url: 'https://assistant.example.com/webhook/gchat',
+        dns_record_id: null,
+      },
     },
   };
 }
@@ -71,7 +95,7 @@ function createArgs(): string[] {
 function createSetupInput() {
   return {
     sourceRemote: 'https://example.test/nanoclaw.git',
-    endpoint: 'https://assistant.example.test/webhook/gchat',
+    ingress: { mode: 'existing', endpointUrl: 'https://assistant.example.test/webhook/gchat' },
     assistantWorkspaceEmail: 'assistant@example.test',
     bootstrapManifest: {
       schema_version: 1,
@@ -80,6 +104,7 @@ function createSetupInput() {
       home_directory: '/Users/operator',
       platform: process.platform === 'darwin' ? 'macos' : 'linux',
       running_as_root: false,
+      docker_endpoint: 'unix:///var/run/docker.sock',
       provider_capability_digest: providerCapabilityDigest,
       provider: {
         id: 'claude',
@@ -102,10 +127,21 @@ function createSetupInput() {
   } as const;
 }
 
+const PREREQUISITES: Prerequisites = {
+  platform: process.platform === 'darwin' ? 'macos' : 'linux',
+  homeDirectory: '/Users/operator',
+  runningAsRoot: false,
+  nodePath: process.execPath,
+  onecliCliPath: '/usr/local/bin/onecli',
+  dockerEndpoint: 'unix:///var/run/docker.sock',
+  rootlessDocker: false,
+  account: 'operator@example.test',
+};
+
 function productionRuntime() {
   return {
     collectCreateInputs: async () => createSetupInput(),
-    preflightGcloud: async () => ({ account: 'operator@example.test' }),
+    checkPrerequisites: async () => PREREQUISITES,
     resolveRelease: async (sourceRemote: string, releaseRef: string) => ({
       sourceRemote,
       releaseRef,
@@ -152,7 +188,7 @@ describe('machine registry', () => {
     const childScript = `
       import { writeFile, stat } from 'node:fs/promises';
       import { resolveControlPlanePaths } from './src/gws-ea/paths.ts';
-      import { reserveInstance } from './src/gws-ea/registry.ts';
+      import { reserveInstance } from './src/gws-ea/journal.ts';
       const input = JSON.parse(process.env.TEST_INPUT);
       const paths = resolveControlPlanePaths(JSON.parse(process.env.TEST_PATHS));
       await writeFile(process.env.TEST_READY, 'ready');
@@ -211,10 +247,137 @@ describe('machine registry', () => {
     expect((await readRegistry(paths)).instances[input.instance_id]).toEqual(input);
   });
 
+  it('records one shared Cloudflare owner for managed reservations', async () => {
+    const paths = await testPaths();
+    const input = managedReservation(paths);
+    await reserveInstance(paths, input);
+
+    const registry = await readRegistry(paths);
+    expect(registry.instances[input.instance_id]).toEqual(input);
+    expect(registry.shared_infrastructure_metadata.cloudflare).toMatchObject({
+      account_id: 'a'.repeat(32),
+      tunnel_id: null,
+    });
+    expect(registry.shared_infrastructure_metadata.cloudflare?.ownership_id).toMatch(/^[0-9a-f-]{36}$/u);
+  });
+
+  it('rejects a second managed account and duplicate managed identity before publishing it', async () => {
+    const paths = await testPaths();
+    const first = managedReservation(paths);
+    await reserveInstance(paths, first);
+
+    const duplicate = managedReservation(paths);
+    duplicate.allocated_ports.nanoclaw_webhook += 100;
+    duplicate.allocated_ports.onecli_app += 100;
+    duplicate.allocated_ports.onecli_gateway += 100;
+    duplicate.exclusive_resource_claims.gcp_project_id = 'second-project';
+    duplicate.exclusive_resource_claims.gchat_service_account = 'gws-ea-chat@second-project.iam.gserviceaccount.com';
+    duplicate.exclusive_resource_claims.workspace_email = 'second@example.test';
+    await expect(reserveInstance(paths, duplicate)).rejects.toMatchObject({ code: 'claim_conflict' });
+
+    const crossAccount = managedReservation(paths);
+    crossAccount.allocated_ports.nanoclaw_webhook += 200;
+    crossAccount.allocated_ports.onecli_app += 200;
+    crossAccount.allocated_ports.onecli_gateway += 200;
+    crossAccount.exclusive_resource_claims.gcp_project_id = 'third-project';
+    crossAccount.exclusive_resource_claims.gchat_service_account = 'gws-ea-chat@third-project.iam.gserviceaccount.com';
+    crossAccount.exclusive_resource_claims.workspace_email = 'third@example.test';
+    if (crossAccount.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare') {
+      throw new Error('managed reservation fixture is invalid');
+    }
+    crossAccount.exclusive_resource_claims.ingress = {
+      ...crossAccount.exclusive_resource_claims.ingress,
+      account_id: 'c'.repeat(32),
+      zone_id: 'd'.repeat(32),
+      zone_name: 'example.net',
+      hostname: 'third.example.net',
+      callback_url: 'https://third.example.net/webhook/gchat',
+    };
+    await expect(reserveInstance(paths, crossAccount)).rejects.toMatchObject({ code: 'cloudflare_account_conflict' });
+    expect(Object.keys((await readRegistry(paths)).instances)).toEqual([first.instance_id]);
+  });
+
+  it('rejects inconsistent managed callbacks and a tunnel name that does not match its ownership ID', async () => {
+    const paths = await testPaths();
+    const invalid = managedReservation(paths);
+    if (invalid.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare') {
+      throw new Error('managed reservation fixture is invalid');
+    }
+    invalid.exclusive_resource_claims.ingress = {
+      ...invalid.exclusive_resource_claims.ingress,
+      callback_url: 'https://other.example.com/webhook/gchat',
+    };
+    await expect(reserveInstance(paths, invalid)).rejects.toMatchObject({ code: 'invalid_claim' });
+
+    const nestedHostname = managedReservation(paths);
+    if (nestedHostname.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare') {
+      throw new Error('managed reservation fixture is invalid');
+    }
+    nestedHostname.exclusive_resource_claims.ingress = {
+      ...nestedHostname.exclusive_resource_claims.ingress,
+      hostname: 'nested.assistant.example.com',
+      callback_url: 'https://nested.assistant.example.com/webhook/gchat',
+    };
+    await expect(reserveInstance(paths, nestedHostname)).rejects.toMatchObject({ code: 'invalid_claim' });
+
+    await mkdir(paths.configRoot, { recursive: true, mode: 0o700 });
+    await writeFile(
+      paths.registryFile,
+      JSON.stringify({
+        schema_version: 2,
+        instances: {},
+        shared_infrastructure_metadata: {
+          cloudflare: {
+            ownership_id: allocateInstanceId(),
+            account_id: 'a'.repeat(32),
+            tunnel_name: 'gws-ea-owner',
+            tunnel_id: null,
+          },
+        },
+      }),
+      { mode: 0o600 },
+    );
+    await expect(readRegistry(paths)).rejects.toMatchObject({
+      code: 'invalid_registry',
+      message: expect.stringMatching(/tunnel name does not match its ownership ID/u),
+    });
+  });
+
+  it('loads a registry record with unknown fields and keeps its claims exact', async () => {
+    const paths = await testPaths();
+    const input = reservation(paths);
+    await reserveInstance(paths, input);
+    const stored = JSON.parse(await readFile(paths.registryFile, 'utf8')) as {
+      instances: Record<string, Record<string, unknown> & { exclusive_resource_claims: Record<string, unknown> }>;
+    } & Record<string, unknown>;
+    const instance = stored.instances[input.instance_id]!;
+    await writeFile(
+      paths.registryFile,
+      JSON.stringify({
+        ...stored,
+        written_by: 'a newer launcher',
+        instances: {
+          [input.instance_id]: {
+            ...instance,
+            added_later: { any: 'shape' },
+            exclusive_resource_claims: { ...instance.exclusive_resource_claims, note: 'extra' },
+          },
+        },
+      }),
+      { mode: 0o600 },
+    );
+
+    expect((await readRegistry(paths)).instances[input.instance_id]).toEqual(input);
+    await expect(
+      reserveInstance(paths, { ...reservation(paths), allocated_ports: input.allocated_ports }),
+    ).rejects.toMatchObject({
+      code: 'claim_conflict',
+    });
+  });
+
   it.each([
     ['corrupt JSON', '{not-json'],
     ['an unknown schema', JSON.stringify({ schema_version: 99, instances: {} })],
-    ['an unvalidated field', JSON.stringify({ schema_version: 1, instances: {}, surprise: true })],
   ])('stops mutation for %s', async (_label, contents) => {
     const paths = await testPaths();
     await mkdir(paths.configRoot, { recursive: true, mode: 0o700 });
@@ -245,13 +408,6 @@ describe('machine registry', () => {
       await expect(readRegistry(paths)).rejects.toThrow(/owned/i);
     },
   );
-
-  it('classifies known remote filesystem types as unsafe', () => {
-    expect(isLocalFilesystemType(0x6969)).toBe(false); // NFS
-    expect(isLocalFilesystemType(0xff534d42)).toBe(false); // CIFS
-    expect(isLocalFilesystemType(0x65735546)).toBe(false); // FUSE (may be remote)
-    expect(isLocalFilesystemType(0xef53)).toBe(true); // ext family
-  });
 
   it('fails closed when an immutable marker disagrees with the registry', async () => {
     const paths = await testPaths();
@@ -303,19 +459,77 @@ describe('machine registry', () => {
 });
 
 describe('create recovery contract', () => {
+  it('checks Google sign-in on every resume, even after GCP setup is complete', async () => {
+    const paths = await testPaths();
+    const input = reservation(paths);
+    await reserveInstance(paths, input);
+    const operation = await acquireInstanceOperation(paths, input.instance_id);
+    if (!operation) throw new Error('Test instance operation could not be acquired');
+    try {
+      for (const step of ['materialize_checkout', 'provision_gcp'] as const) {
+        await recordStepStarted(operation, step);
+        await recordStepCompleted(operation, step);
+      }
+    } finally {
+      operation.release();
+    }
+    const preflight = vi.fn(async () => ({ ...PREREQUISITES, account: input.exclusive_resource_claims.gcp_account }));
+    const advanceProvision = vi.fn(async () => ({ status: 'ready' as const }));
+
+    expect(
+      await runCli(['resume', '--id', input.instance_id], {
+        paths,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        checkPrerequisites: preflight,
+        advanceProvision,
+      }),
+    ).toBe(0);
+    expect(preflight).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ command: 'resume', account: input.exclusive_resource_claims.gcp_account }),
+      expect.anything(),
+    );
+    expect(advanceProvision).toHaveBeenCalledOnce();
+  });
+
+  it('does not advance a GCP resume when the reserved Google account needs sign-in', async () => {
+    const paths = await testPaths();
+    const input = reservation(paths);
+    await reserveInstance(paths, input);
+    const errors: string[] = [];
+    const advanceProvision = vi.fn();
+
+    expect(
+      await runCli(['resume', '--id', input.instance_id], {
+        paths,
+        stdout: () => undefined,
+        stderr: (line) => errors.push(line),
+        checkPrerequisites: async () => {
+          throw new GwsEaError('gcloud_auth_required', 'Google Cloud sign-in is required');
+        },
+        advanceProvision,
+      }),
+    ).toBe(1);
+    expect(advanceProvision).not.toHaveBeenCalled();
+    expect(errors.join('\n')).toContain('Google Cloud sign-in is required');
+  });
+
   it('checks gcloud before allocating or printing an instance ID', async () => {
     const paths = await testPaths();
     const stdout: string[] = [];
     const stderr: string[] = [];
 
-    const exitCode = await runCli(['create', '--track', 'dogfood'], {
-      paths,
-      stdout: (line) => stdout.push(line),
-      stderr: (line) => stderr.push(line),
-      preflightGcloud: async () => {
-        throw new GwsEaError('gcloud_required', 'Install gcloud, then retry.');
+    const exitCode = await runCli(
+      ['create', '--track', 'dogfood', '--source-remote', 'https://example.test/nanoclaw.git'],
+      {
+        paths,
+        stdout: (line) => stdout.push(line),
+        stderr: (line) => stderr.push(line),
+        checkPrerequisites: async () => {
+          throw new GwsEaError('gcloud_required', 'Install gcloud, then retry.');
+        },
       },
-    });
+    );
 
     expect(exitCode).toBe(1);
     expect(stdout).toEqual([]);
@@ -327,11 +541,13 @@ describe('create recovery contract', () => {
     const paths = await testPaths();
     const advanced: string[] = [];
     let portsReleased = false;
-    const advanceProvision = async (operation: InstanceOperation, _selection?: string, heldPorts?: unknown) => {
-      if (advanced.length === 0) {
-        expect(heldPorts).toBeDefined();
-        expect(portsReleased).toBe(false);
-      }
+    const advanceProvision: NonNullable<CliRuntime['advanceProvision']> = async (operation, { runtime }) => {
+      // The reservation claims the ports; each runtime binds its own when it starts.
+      expect(portsReleased).toBe(true);
+      await runStep(runtime, { id: 'provision_gcp', label: 'Configuring Google Cloud…' }, async () => {
+        runtime.emit?.({ type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for the service account…' });
+        runtime.emit?.({ type: 'step-waiting', step: 'provision_gcp', reason: 'Waiting for the service account…' });
+      });
       advanced.push(operation.instanceId);
       return {
         status: 'paused' as const,
@@ -350,7 +566,7 @@ describe('create recovery contract', () => {
         paths,
         stdout: (line) => output.push(line),
         stderr: () => undefined,
-        preflightGcloud: async () => ({ account: 'operator@example.test' }),
+        checkPrerequisites: async () => PREREQUISITES,
         advanceProvision,
         resolveRelease: async (sourceRemote, releaseRef) => {
           resolveCalls.push([sourceRemote, releaseRef]);
@@ -364,10 +580,17 @@ describe('create recovery contract', () => {
         }),
         collectCreateInputs: async () => createSetupInput(),
       }),
-    ).toBe(0);
+    ).toBe(10);
     const instanceId = output[0]!.slice('instance_id: '.length);
-    expect(resolveCalls).toEqual([['https://example.test/nanoclaw.git', 'refs/heads/dogfood']]);
+    expect(resolveCalls).toEqual([['https://example.test/nanoclaw.git', 'refs/heads/rebuild-v2']]);
     expect(portsReleased).toBe(true);
+    expect(output.slice(1, 6)).toEqual([
+      'Resolving the release…',
+      'Reserving the assistant…',
+      'Configuring Google Cloud…',
+      'Waiting for the service account…',
+      'Paused at bind_principal: Send the direct message.',
+    ]);
     expect((await readRegistry(paths)).instances[instanceId]).toMatchObject({
       deployed_commit: 'b'.repeat(40),
       allocated_ports: { nanoclaw_webhook: 34_101, onecli_app: 34_102, onecli_gateway: 34_103 },
@@ -381,9 +604,10 @@ describe('create recovery contract', () => {
         paths,
         stdout: () => undefined,
         stderr: () => undefined,
+        checkPrerequisites: async () => PREREQUISITES,
         advanceProvision,
       }),
-    ).toBe(0);
+    ).toBe(10);
     expect(advanced).toEqual([instanceId, instanceId]);
   });
 
@@ -410,7 +634,7 @@ describe('create recovery contract', () => {
     };
 
     expect(
-      await runCli(['create', '--track', 'dogfood'], {
+      await runCli(['create', '--track', 'dogfood', '--source-remote', 'https://example.test/nanoclaw.git'], {
         paths,
         stdout: (line) => output.push(line),
         stderr: () => undefined,
@@ -418,7 +642,7 @@ describe('create recovery contract', () => {
         collectCreateInputs,
         advanceProvision: async () => pause,
       }),
-    ).toBe(0);
+    ).toBe(10);
     expect(idWasPrintedBeforeCollection).toBe(true);
     const instanceId = output[0]!.slice('instance_id: '.length);
     expect(output).toContain(
@@ -434,9 +658,10 @@ describe('create recovery contract', () => {
         paths,
         stdout: (line) => resumeOutput.push(line),
         stderr: () => undefined,
+        checkPrerequisites: async () => PREREQUISITES,
         advanceProvision: async () => pause,
       }),
-    ).toBe(0);
+    ).toBe(10);
     expect(resumeOutput).toContain(
       `  "Primary DM": gws-ea resume --id ${instanceId} --messaging-group-id 'gchat:spaces/AAA'`,
     );
@@ -446,15 +671,18 @@ describe('create recovery contract', () => {
     const paths = await testPaths();
     const stdout: string[] = [];
     const stderr: string[] = [];
-    const exitCode = await runCli(['create', '--track', 'dogfood'], {
-      paths,
-      stdout: (line) => stdout.push(line),
-      stderr: (line) => stderr.push(line),
-      collectCreateInputs: async () => {
-        throw new GwsEaError('cancelled', 'Assistant creation was cancelled');
+    const exitCode = await runCli(
+      ['create', '--track', 'dogfood', '--source-remote', 'https://example.test/nanoclaw.git'],
+      {
+        paths,
+        stdout: (line) => stdout.push(line),
+        stderr: (line) => stderr.push(line),
+        collectCreateInputs: async () => {
+          throw new GwsEaError('cancelled', 'Assistant creation was cancelled');
+        },
+        checkPrerequisites: async () => PREREQUISITES,
       },
-      preflightGcloud: async () => ({ account: 'operator@example.test' }),
-    });
+    );
 
     expect(exitCode).toBe(1);
     expect(stdout[0]).toMatch(/^instance_id: [0-9a-f-]{36}$/u);
@@ -471,7 +699,7 @@ describe('create recovery contract', () => {
       stdout: (line) => stdout.push(line),
       stderr: (line) => stderr.push(line),
       collectCreateInputs: async () => createSetupInput(),
-      preflightGcloud: async () => ({ account: 'operator@example.test' }),
+      checkPrerequisites: async () => PREREQUISITES,
       resolveRelease: async () => {
         throw new GwsEaError('release_resolution_failed', 'Release track could not be resolved');
       },
@@ -499,7 +727,7 @@ describe('create recovery contract', () => {
         ...createSetupInput(),
         bootstrapManifest: { ...createSetupInput().bootstrapManifest, schema_version: 99 as 1 },
       }),
-      preflightGcloud: async () => ({ account: 'operator@example.test' }),
+      checkPrerequisites: async () => PREREQUISITES,
       resolveRelease: async (sourceRemote, releaseRef) => ({ sourceRemote, releaseRef, commit: 'b'.repeat(40) }),
       holdLoopbackPorts: async () => {
         throw new Error('ports must not be allocated for invalid setup input');
@@ -548,10 +776,10 @@ describe('create recovery contract', () => {
       paths,
       stdout: (line) => stdout.push(line),
       stderr: (line) => stderr.push(line),
-      initializeJournal: async () => {
+      ...productionRuntime(),
+      advanceProvision: async () => {
         throw new Error(secretCanary);
       },
-      ...productionRuntime(),
     });
 
     expect(exitCode).toBe(1);
@@ -561,6 +789,7 @@ describe('create recovery contract', () => {
     await expect(readFile(paths.bootstrapFile(instanceId), 'utf8')).resolves.toContain('"schema_version": 1');
     expect(stderr.join('\n')).toContain(`gws-ea resume --id ${instanceId}`);
     expect(`${stdout.join('\n')}\n${stderr.join('\n')}`).not.toContain(secretCanary);
+    expect((await readProvisionJournal(paths, instanceId)).steps).toEqual({});
 
     const resumed: string[] = [];
     expect(
@@ -568,6 +797,7 @@ describe('create recovery contract', () => {
         paths,
         stdout: () => undefined,
         stderr: () => undefined,
+        checkPrerequisites: async () => PREREQUISITES,
         advanceProvision: async (operation) => {
           resumed.push(operation.instanceId);
           return {
@@ -581,7 +811,7 @@ describe('create recovery contract', () => {
           };
         },
       }),
-    ).toBe(0);
+    ).toBe(10);
     expect(resumed).toEqual([instanceId]);
   });
 

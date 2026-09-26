@@ -58,11 +58,16 @@ export function runInheritScript(cmd: string, args: string[], options: InheritSc
       stdio: 'inherit',
       env: options.env ?? { ...process.env, NANOCLAW_SETUP_WIZARD: '1' },
     });
-    child.on('close', (code) => {
+    let settled = false;
+    const finish = (code: number): void => {
+      if (settled) return;
+      settled = true;
       // Deliberately not restoring raw mode: clack sets it per prompt, and
       // handing it back a cooked TTY is the state it expects to find.
       process.stdin.resume();
-      resolve(code ?? 1);
-    });
+      resolve(code);
+    };
+    child.once('error', () => finish(1));
+    child.once('close', (code) => finish(code ?? 1));
   });
 }
