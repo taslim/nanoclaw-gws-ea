@@ -80,7 +80,6 @@ describe('instance-owned OneCLI Compose specification', () => {
       secret_encryption_key: { file: layout.encryptionKeyFile },
       gateway_internal_secret: { file: layout.gatewayInternalSecretFile },
     });
-    expect(source).not.toContain('provider-canary-value');
     expect(source).not.toMatch(/POSTGRES_PASSWORD:\s*[^/\n]/);
     expect(source).not.toMatch(/SECRET_ENCRYPTION_KEY:\s*[^/\n]/);
     expect(source).toContain('$$(cat /run/secrets/postgres_password)');

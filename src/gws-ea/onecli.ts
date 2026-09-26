@@ -50,7 +50,7 @@ const INVALID_RUNTIME = 'invalid_onecli_runtime';
 const EXPECTED_SERVICES = ['postgres', 'app', 'gateway'] as const;
 
 /** Pulling runs on its own clock: a slow registry never eats into the health wait. */
-export const ONECLI_PULL_TIMEOUT_MS = 20 * 60_000;
+const ONECLI_PULL_TIMEOUT_MS = 20 * 60_000;
 /** `up --wait` itself waits `ONECLI_WAIT_TIMEOUT_SECONDS`; the margin covers creating the containers. */
 const UP_TIMEOUT_MS = (ONECLI_WAIT_TIMEOUT_SECONDS + 120) * 1_000;
 const INSPECT_TIMEOUT_MS = 30_000;

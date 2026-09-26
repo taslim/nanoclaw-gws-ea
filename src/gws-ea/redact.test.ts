@@ -101,7 +101,7 @@ describe('GWS-EA redactor', () => {
 
   it('leaves ordinary diagnostics intact', () => {
     const diagnostic =
-      'ERROR: (gcloud.projects.describe) NOT_FOUND: Project gws-ea-1234 was not found (proc_oc_handler, key-id 42)';
+      'ERROR: (gcloud.projects.describe) NOT_FOUND: Project gws-ea-1234 was not found (proc_oc_handler_registry_main, key-id 42)';
     expect(redact(diagnostic)).toBe(diagnostic);
   });
 

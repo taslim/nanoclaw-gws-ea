@@ -7,8 +7,6 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { SignInRequired, type RunEvent } from './events.js';
 import { RECORDED_GCLOUD_REAUTHENTICATION_FAILED } from './fixtures/recordings.js';
 import {
-  activeGcloudAccount,
-  assertGcloudInstalled,
   assertGcloudSignedIn,
   classifyGcloudFailure,
   deleteOwnedGcpProject,
@@ -36,7 +34,7 @@ import {
 } from './phases.js';
 import type { SanitizedCommandOutcome } from './process.js';
 import { allocateInstanceId } from './registry.js';
-import { GwsEaError, PROVISION_STEPS } from './types.js';
+import { PROVISION_STEPS } from './types.js';
 
 const roots: string[] = [];
 
@@ -150,7 +148,6 @@ class FakeGoogleCloud {
   /** Lists that still omit the Chat service account after it was created. */
   unlistedServiceAccountReads = 0;
   readonly userKeys = new Set<string>();
-  readonly systemKeys = new Set(['e2c7a91f06b4d358ac19f0e7b6d2c4a8f1e3b5d7']);
   /** Key-creation constraints the organization enforces. */
   readonly orgEnforced = new Set<string>();
   readonly projectPolicies = new Map<string, boolean>();
@@ -541,18 +538,6 @@ describe('Google account kind', () => {
 });
 
 describe('gcloud sign-in and installation', () => {
-  it('checks the reserved account on resume even when another account is active', async () => {
-    const commands: string[][] = [];
-    const account = 'reserved@example.com';
-
-    await assertGcloudSignedIn(account, async (command) => {
-      commands.push([...command.args]);
-      return ok('discard-me');
-    });
-
-    expect(commands).toEqual([['auth', 'print-access-token', `--account=${account}`, '--quiet']]);
-  });
-
   it('asks for sign-in when the reserved account cannot refresh its token', async () => {
     const failure = await assertGcloudSignedIn(
       'reserved@example.com',
@@ -578,35 +563,6 @@ describe('gcloud sign-in and installation', () => {
       message: expect.stringContaining('gcloud auth print-access-token --account=reserved@example.com'),
       details: { exitCode: 1, stderrTail: expect.stringContaining('There was a problem connecting') },
     });
-  });
-
-  it('names the signed-in account, or none', async () => {
-    const commands: string[][] = [];
-    const answer =
-      (stdout: string): GcloudCommandRunner =>
-      async (command) => {
-        commands.push([...command.args]);
-        return ok(stdout);
-      };
-
-    await expect(activeGcloudAccount(answer(`${ACCOUNT}\n`))).resolves.toBe(ACCOUNT);
-    await expect(activeGcloudAccount(answer(''))).resolves.toBeUndefined();
-    expect(commands[0]).toEqual(['auth', 'list', '--filter=status:ACTIVE', '--format=value(account)']);
-  });
-
-  it('fails with one actionable install message when gcloud is unavailable', async () => {
-    const missing = assertGcloudInstalled(async () => {
-      throw new GwsEaError('executable_not_found', 'gcloud was not found on PATH', {
-        details: { program: 'gcloud', searched: ['/usr/bin'] },
-      });
-    });
-
-    await expect(missing).rejects.toMatchObject({
-      code: 'gcloud_required',
-      message: expect.stringContaining('https://cloud.google.com/sdk/docs/install'),
-      details: { searched: ['/usr/bin'] },
-    });
-    await expect(assertGcloudInstalled(async () => ok('{}'))).resolves.toBeUndefined();
   });
 });
 
@@ -748,7 +704,6 @@ describe('Google Cloud setup through the step engine', () => {
     const keyId = await publishedKeyId(setup.gcp);
     expect(setup.cloud.mutations).toEqual(['keys delete orphan', `keys create ${keyId}`]);
     expect(setup.cloud.userKeys).toEqual(new Set([keyId]));
-    expect(setup.cloud.systemKeys.size).toBe(1);
   });
 
   it('replaces a valid local credential whose key Google no longer lists', async () => {

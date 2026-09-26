@@ -29,7 +29,7 @@ import { assertInstanceId } from './registry.js';
 import { GwsEaError, ingressEndpointUrl, type AllocatedPorts, type InstanceReservation } from './types.js';
 import { parseJson, requireDockerEndpoint, requirePath, requireRecord, requireString } from './validation.js';
 
-export const INSTANCE_RUNTIME_SCHEMA_VERSION = 1 as const;
+const INSTANCE_RUNTIME_SCHEMA_VERSION = 1 as const;
 const PROVIDER_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
 const ONECLI_PROJECT_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/u;
 const SERVICE_PATH = '/usr/local/bin:/usr/bin:/bin';

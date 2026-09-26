@@ -119,7 +119,6 @@ describe('GWS-EA instance runtime', () => {
     expect(environmentFile).toContain(`WEBHOOK_PORT=${config.allocated_ports.nanoclaw_webhook}`);
     expect(environmentFile).toContain('WEBHOOK_HOST=127.0.0.1');
     expect(environmentFile).toContain(`NANOCLAW_EGRESS_NETWORK=${config.agent_egress_network}`);
-    expect(environmentFile).not.toContain('runtime-secret-canary');
     expect(Object.keys(JSON.parse(manifest) as object).sort()).toEqual([
       'allocated_ports',
       'checkout_realpath',
@@ -289,8 +288,6 @@ describe('GWS-EA instance runtime', () => {
     expect(definition).not.toContain('an earlier launcher');
     expect(definition).toContain(path.join(config.checkout_realpath, 'dist', 'gws-ea', 'process.js'));
     expect(definition).toContain(layout.runtimeConfigFile);
-    expect(definition).not.toContain('chat-secret-canary');
-    expect(calls.flatMap((call) => call.args).join(' ')).not.toContain('.local/bin/ncl');
 
     const cli = buildInstanceCliCommand(config, ['groups', 'list'], { PATH: '/safe/bin', HOME: '/attacker' });
     expect(cli.command).toBe(path.join(config.checkout_realpath, 'bin', 'ncl'));

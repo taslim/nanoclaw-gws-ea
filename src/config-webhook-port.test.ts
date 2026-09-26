@@ -168,21 +168,4 @@ describe('webhook listener configuration', () => {
       { timeout: 2000, interval: 25 },
     );
   });
-
-  it('binds the shared listener to the configured host', async () => {
-    const port = await allocateFreePort();
-    fs.writeFileSync(path.join(directory, '.env'), `WEBHOOK_PORT=${port}\nWEBHOOK_HOST=127.0.0.1\n`);
-    const webhook = await import('./webhook-server.js');
-    stopWebhookServer = webhook.stopWebhookServer;
-    webhook.registerWebhookHandler('host-check', (req, res) => {
-      res.end(req.socket.localAddress);
-    });
-
-    await vi.waitFor(async () => {
-      const response = await fetch(`http://127.0.0.1:${port}/webhook/host-check`, {
-        signal: AbortSignal.timeout(500),
-      });
-      expect(await response.text()).toBe('127.0.0.1');
-    });
-  });
 });

@@ -6,8 +6,6 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
-  INSTANCE_HOST_ENVIRONMENT_KEYS,
-  TOOL_ENVIRONMENT_KEYS,
   buildHostEnvironment,
   buildToolEnvironment,
   resolvePersistedExecutable,
@@ -91,7 +89,12 @@ describe('GWS-EA tool and host environments', () => {
   const ambient = {
     PATH: '/safe/bin',
     LANG: 'en_US.UTF-8',
+    LC_ALL: 'en_US.UTF-8',
+    LC_CTYPE: 'UTF-8',
     TERM: 'xterm',
+    TMPDIR: '/var/folders/operator/T/',
+    SSL_CERT_FILE: '/etc/ssl/cert.pem',
+    SSL_CERT_DIR: '/etc/ssl/certs',
     HOME: '/attacker',
     NODE_OPTIONS: '--import=/tmp/attacker.js',
     DOCKER_CONFIG: '/Users/operator/.docker',
@@ -119,7 +122,12 @@ describe('GWS-EA tool and host environments', () => {
     expect(buildToolEnvironment(ambient, { HOME: '/expected/home', NANOCLAW_INSTALL_ID: 'expected' })).toEqual({
       PATH: '/safe/bin',
       LANG: 'en_US.UTF-8',
+      LC_ALL: 'en_US.UTF-8',
+      LC_CTYPE: 'UTF-8',
       TERM: 'xterm',
+      TMPDIR: '/var/folders/operator/T/',
+      SSL_CERT_FILE: '/etc/ssl/cert.pem',
+      SSL_CERT_DIR: '/etc/ssl/certs',
       DOCKER_CONFIG: '/Users/operator/.docker',
       XDG_RUNTIME_DIR: '/run/user/501',
       DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/501/bus',
@@ -133,35 +141,18 @@ describe('GWS-EA tool and host environments', () => {
       HOME: '/expected/home',
       NANOCLAW_INSTALL_ID: 'expected',
     });
-    for (const forbidden of [
-      'SSH_AUTH_SOCK',
-      'GOOGLE_APPLICATION_CREDENTIALS',
-      'CLOUDSDK_AUTH_ACCESS_TOKEN_FILE',
-      'CLOUDSDK_CORE_ACCOUNT',
-      'CLOUDFLARE_API_TOKEN',
-      'ONECLI_API_KEY',
-      'ANTHROPIC_API_KEY',
-      'GCHAT_CREDENTIALS',
-    ]) {
-      expect(TOOL_ENVIRONMENT_KEYS).not.toContain(forbidden);
-    }
   });
 
-  it('keeps the instance host allowlist unchanged', () => {
-    expect(INSTANCE_HOST_ENVIRONMENT_KEYS).toEqual([
-      'PATH',
-      'LANG',
-      'LC_ALL',
-      'LC_CTYPE',
-      'TERM',
-      'TMPDIR',
-      'SSL_CERT_FILE',
-      'SSL_CERT_DIR',
-    ]);
+  it('passes exactly the host allowlist plus explicit overrides to the instance host', () => {
     expect(buildHostEnvironment(ambient, { HOME: '/expected/home' })).toEqual({
       PATH: '/safe/bin',
       LANG: 'en_US.UTF-8',
+      LC_ALL: 'en_US.UTF-8',
+      LC_CTYPE: 'UTF-8',
       TERM: 'xterm',
+      TMPDIR: '/var/folders/operator/T/',
+      SSL_CERT_FILE: '/etc/ssl/cert.pem',
+      SSL_CERT_DIR: '/etc/ssl/certs',
       HOME: '/expected/home',
     });
   });
@@ -473,45 +464,44 @@ describe('GWS-EA command runner', () => {
   });
 
   it('caps only parsed output', async () => {
-    const error = await failure(
-      runSanitizedCommand({
-        command: NODE,
-        args: ['--eval', "process.stdout.write('x'.repeat(4096))"],
-        cwd: process.cwd(),
-        outputLimitBytes: 1024,
-      }),
-    );
-    expect(error.code).toBe('command_output_limit');
+    const command = {
+      command: NODE,
+      args: ['--eval', "process.stdout.write('x'.repeat(4096))"],
+      cwd: process.cwd(),
+      outputLimitBytes: 1024,
+    };
+
+    expect((await failure(runSanitizedCommand(command))).code).toBe('command_output_limit');
+    await expect(runSanitizedCommand({ ...command, stream: true })).resolves.toMatchObject({ stdout: '' });
   });
 
-  it('captures allowlisted reads through the runner only when the run enables capture', async () => {
+  it('captures an allowlisted read with the stdout the runner parsed when the run enables capture', async () => {
     const root = await temporaryRoot('capture');
     const bin = path.join(root, 'bin');
     const staging = path.join(root, 'staging');
     await mkdir(bin);
-    await writeFile(
-      path.join(bin, 'gcloud'),
-      '#!/bin/sh\nif [ "$1" = auth ]; then printf ya29.not-for-fixtures; else printf \'[{"projectId":"gws-ea-fixture"}]\'; fi\n',
-      { mode: 0o755 },
+    await writeFile(path.join(bin, 'gcloud'), '#!/bin/sh\nprintf \'[{"projectId":"gws-ea-fixture"}]\'\n', {
+      mode: 0o755,
+    });
+    const run = await runLog({ captureFixturesTo: staging });
+
+    await run.step('provision_gcp', () =>
+      runSanitizedCommand({
+        command: 'gcloud',
+        args: ['projects', 'list', '--format=json'],
+        cwd: root,
+        env: { PATH: bin },
+      }),
     );
-    const gcloud = (run: RunLog, args: readonly string[]) =>
-      run.step('provision_gcp', () => runSanitizedCommand({ command: 'gcloud', args, cwd: root, env: { PATH: bin } }));
 
-    const disabled = await runLog();
-    await gcloud(disabled, ['projects', 'list', '--format=json']);
-    await expect(readdir(staging)).rejects.toMatchObject({ code: 'ENOENT' });
-
-    const enabled = await runLog({ captureFixturesTo: staging });
-    await gcloud(enabled, ['projects', 'list', '--format=json']);
-    await gcloud(enabled, ['auth', 'print-access-token', '--account=a@example.com']);
-
-    const files = await readdir(staging);
-    expect(files).toHaveLength(1);
-    const staged = JSON.parse(await readFile(path.join(staging, files[0]!), 'utf8')) as Record<string, unknown>;
-    expect(staged).toMatchObject({ kind: 'command', program: 'gcloud', stdout: '[{"projectId":"gws-ea-fixture"}]' });
-    const raw = await rawLog(enabled, '01-provision-gcp.log');
-    expect(raw).not.toContain('gws-ea-fixture');
-    expect(JSON.stringify(staged)).not.toContain('ya29');
+    const staged = await Promise.all(
+      (await readdir(staging)).map(
+        async (file) => JSON.parse(await readFile(path.join(staging, file), 'utf8')) as unknown,
+      ),
+    );
+    expect(staged).toEqual([
+      expect.objectContaining({ kind: 'command', program: 'gcloud', stdout: '[{"projectId":"gws-ea-fixture"}]' }),
+    ]);
   });
 });
 

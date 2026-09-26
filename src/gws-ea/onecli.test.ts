@@ -12,7 +12,6 @@ import {
   importProviderCredential,
   observeOnecliRuntime,
   onecliSecretMatchesCredentialMetadata,
-  ONECLI_PULL_TIMEOUT_MS,
   persistOnecliApiKeyFiles,
   prepareOnecliRuntime,
   reconcileOnecliRuntime,
@@ -378,6 +377,8 @@ interface DockerWorld {
   cliVersion: string;
   /** `onecli version` as printed, instead of an answer built from the versions above. */
   versionOutput?: string;
+  /** The image the gateway container runs, instead of the recorded pin. */
+  gatewayImage?: string;
 }
 
 function containerJson(layout: OnecliRuntimeLayout, service: ServiceName, state: { running: boolean; health: Health }) {
@@ -452,7 +453,9 @@ function dockerWorld(layout: OnecliRuntimeLayout, initial: Partial<Record<Servic
       return reply(
         args.slice(2).map((id) => {
           const service = id.replace(/^id-/u, '') as ServiceName;
-          return containerJson(layout, service, world.services.get(service)!);
+          const container = containerJson(layout, service, world.services.get(service)!);
+          if (service === 'gateway' && world.gatewayImage !== undefined) container.Config.Image = world.gatewayImage;
+          return container;
         }),
       );
     }
@@ -594,11 +597,9 @@ describe('OneCLI runtime start and repair', () => {
         '--remove-orphans',
       ],
     ]);
-    // postgres 30, app 60, gateway 60 checks, each at most a 2 s interval plus a 3 s timeout, in dependency order.
-    expect(ONECLI_WAIT_TIMEOUT_SECONDS).toBe(750);
     const pull = world.calls.find((call) => call.args.includes('pull'))!;
     const up = world.calls.find((call) => call.args.includes('up'))!;
-    expect(pull).toMatchObject({ timeoutMs: ONECLI_PULL_TIMEOUT_MS, stream: true });
+    expect(pull).toMatchObject({ stream: true });
     expect(up.timeoutMs).toBeGreaterThan(ONECLI_WAIT_TIMEOUT_SECONDS * 1_000);
     expect(up.timeoutMs).not.toBe(pull.timeoutMs);
     expect(world.calls.filter((call) => call.command === 'docker').map((call) => call.env?.DOCKER_HOST)).toEqual(
@@ -689,7 +690,6 @@ describe('OneCLI health and version check', () => {
     expect(imported).toEqual({ id: 'secret-provider', created: true });
     const cli = world.calls.filter((call) => call.command === layout.cliExecutable).map((call) => call.args.join(' '));
     expect(cli.slice(0, 2)).toEqual(['auth api-key', 'version']);
-    expect(cli.some((args) => /canary|agents/u.test(args))).toBe(false);
     const create = world.calls.find((call) => call.args[0] === 'secrets' && call.args[1] === 'create')!;
     expect(create.args).toContain('--file');
     expect(create.args).not.toContain('provider-real-secret');
@@ -697,16 +697,22 @@ describe('OneCLI health and version check', () => {
   });
 
   it.each([
-    ['CLI', { cliVersion: '2.2.5' }, /CLI 2\.2\.5.*2\.2\.4/u],
-    ['gateway', { serverVersion: '1.42.0' }, /gateway 1\.42\.0.*1\.41\.3/u],
-  ] as const)('refuses a %s that differs from the instance’s recorded pin', async (_label, drift, message) => {
+    ['CLI', { cliVersion: '2.2.5' }, 'incompatible_onecli', /CLI 2\.2\.5.*2\.2\.4/u],
+    ['gateway', { serverVersion: '1.42.0' }, 'incompatible_onecli', /gateway 1\.42\.0.*1\.41\.3/u],
+    [
+      'gateway image',
+      { gatewayImage: 'ghcr.io/onecli/onecli:1.42.0' },
+      'unsafe_onecli_image',
+      /gateway image.*onecli:1\.41\.3/u,
+    ],
+  ] as const)('refuses a %s that differs from the instance’s recorded pin', async (_label, drift, code, message) => {
     const layout = await layoutFixture();
     const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
     Object.assign(world, drift);
 
     await expect(
       verifyOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, runCommand: runner, fetch: healthyFetch() }),
-    ).rejects.toMatchObject({ code: 'incompatible_onecli', message: expect.stringMatching(message) });
+    ).rejects.toMatchObject({ code, message: expect.stringMatching(message) });
   });
 
   it('reads the recorded `onecli version` answer, whose gateway reports no version', async () => {

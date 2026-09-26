@@ -14,7 +14,7 @@ import { activeStep, type StepLog } from './run-log.js';
 import { GwsEaError } from './types.js';
 
 /** Ambient variables the instance host process inherits. */
-export const INSTANCE_HOST_ENVIRONMENT_KEYS = [
+const INSTANCE_HOST_ENVIRONMENT_KEYS = [
   'PATH',
   'LANG',
   'LC_ALL',

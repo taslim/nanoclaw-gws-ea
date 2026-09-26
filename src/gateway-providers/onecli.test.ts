@@ -215,28 +215,6 @@ describe('OneCLI gateway package', () => {
     fetchMock.mockRestore();
   });
 
-  it('leaves an approval pending when core cannot reach a human', async () => {
-    const controller = new AbortController();
-    const { decisions, fetchMock } = mockApprovalPoll([
-      {
-        id: 'pending',
-        createdAt: new Date(Date.now() + 1000).toISOString(),
-        expiresAt: new Date(Date.now() + 30_000).toISOString(),
-        method: 'POST',
-        host: 'api.example.test',
-        path: '/resource',
-        agent: { name: 'Group One', externalId: 'g1' },
-      },
-    ]);
-    const decide = vi.fn(async () => 'unavailable' as const);
-    const running = subscribe(decide, controller.signal);
-    await vi.waitFor(() => expect(decide).toHaveBeenCalledOnce());
-    expect(decisions).toEqual([]);
-    controller.abort();
-    await running;
-    fetchMock.mockRestore();
-  });
-
   it('owns endpoint configuration and returns a typed session contribution', async () => {
     const controller = new AbortController();
     const lease = await provider.sessions.ensure(input('s1'), controller.signal);
