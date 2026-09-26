@@ -6,12 +6,11 @@
  * the CLI an assistant was created with.
  */
 import { createHash } from 'node:crypto';
-import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { isErrno } from '../community-portal/errors.js';
-import type { ControlPlanePaths } from './paths.js';
+import { isRegularFile, type ControlPlanePaths } from './paths.js';
 import {
   exactVersion,
   ONECLI_CLI_ARCHIVE_DIGESTS,
@@ -67,16 +66,6 @@ function releaseTarget(platform: NodeJS.Platform, arch: string): OnecliCliTarget
   const system = platform === 'darwin' ? 'darwin' : platform === 'linux' ? 'linux' : undefined;
   const machine = arch === 'x64' ? 'amd64' : arch === 'arm64' ? 'arm64' : undefined;
   return system && machine ? `${system}_${machine}` : undefined;
-}
-
-/** Whether a regular file exists at `file`. */
-export async function isRegularFile(file: string): Promise<boolean> {
-  try {
-    return (await lstat(file)).isFile();
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) return false;
-    throw error;
-  }
 }
 
 /** gws-ea's copy of a pinned OneCLI CLI, installed first when it is missing; returns its path. */

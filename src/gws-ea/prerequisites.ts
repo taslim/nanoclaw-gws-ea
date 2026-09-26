@@ -16,10 +16,10 @@ import {
   isConsumerGoogleAccount,
   isGoogleAccountAddress,
 } from './gcloud.js';
-import { ensurePinnedOnecliCli, isRegularFile, releaseOnecliCliPin } from './onecli-install.js';
+import { ensurePinnedOnecliCli, releaseOnecliCliPin } from './onecli-install.js';
 import { ONECLI_CLI_VERSION } from './pins.js';
 import { protectFromAgentMounts } from './mount-allowlist.js';
-import { CONTROL_PLANE_ROOT, type ControlPlanePaths } from './paths.js';
+import { CONTROL_PLANE_ROOT, isRegularFile, type ControlPlanePaths } from './paths.js';
 import {
   buildToolEnvironment,
   checkedRunner,

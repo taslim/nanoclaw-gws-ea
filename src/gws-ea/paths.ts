@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { isErrno } from '../community-portal/errors.js';
 import { GwsEaError } from './types.js';
 
 /** The checkout this control plane runs from (`src/gws-ea` and `dist/gws-ea` both sit two levels below it). */
@@ -36,6 +37,8 @@ export interface ControlPlanePaths {
   removalFile(instanceId: string): string;
   /** gws-ea's own copy of one pinned OneCLI CLI version. */
   onecliCliFile(version: string): string;
+  /** The Cloudflare account token a create keeps until its route is set up. */
+  keptCloudflareTokenFile(instanceId: string): string;
 }
 
 function nearestExistingAncestor(target: string): string {
@@ -101,7 +104,18 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
     releasePreflightFile: (instanceId) => path.join(instanceRoot(instanceId), 'release-preflight.json'),
     removalFile: (instanceId) => path.join(removalRoot, `${instanceId}.json`),
     onecliCliFile: (version) => path.join(stateRoot, 'tools', 'onecli', version, 'onecli'),
+    keptCloudflareTokenFile: (instanceId) => path.join(instanceRoot(instanceId), 'secrets', 'cloudflare-account-token'),
   };
+}
+
+/** Whether a regular file exists at `file`. */
+export async function isRegularFile(file: string): Promise<boolean> {
+  try {
+    return (await lstat(file)).isFile();
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) return false;
+    throw error;
+  }
 }
 
 /** Whether `target` lies strictly inside `root` (both absolute, already canonical where it matters). */

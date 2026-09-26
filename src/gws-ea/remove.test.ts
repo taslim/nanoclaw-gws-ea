@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -30,6 +30,7 @@ import {
   type RemovalInteraction,
 } from './remove.js';
 import { GwsEaError, type InstanceReservationInput, type ProvisionStepId } from './types.js';
+import { keepAccountToken } from './cloudflare-token.js';
 
 // Removal must never reach a real gcloud, Docker, service manager, or Cloudflare from these tests.
 vi.mock('./process.js', async (importOriginal) => {
@@ -610,6 +611,41 @@ describe('removal from any partial state', () => {
     expect(cloudflare.tunnels).toEqual([]);
     expect(await exists(paths.cloudflareRoot)).toBe(false);
     expect((await readRegistry(paths)).shared_infrastructure_metadata.cloudflare).toBeNull();
+  });
+
+  it('removes an unfinished create with the token it kept, asking only when Cloudflare refuses it', async () => {
+    for (const refused of [false, true]) {
+      const paths = await testPaths();
+      const input = await reserve(paths, reservationInput(paths, { managed: true }), {
+        started: ['materialize_checkout', 'establish_transport'],
+      });
+      await recordTunnel(paths);
+      await mkdir(paths.cloudflareRoot, { recursive: true, mode: 0o700 });
+      await keepAccountToken(paths.keptCloudflareTokenFile(input.instance_id), 'kept-account-token');
+      const { dependencies, cloudflare, interaction } = world(input);
+      cloudflare.tunnels = [{ id: TUNNEL_ID, name: await tunnelName(paths) }];
+      cloudflare.config = { ingress: [route(input), CATCH_ALL] };
+      const tokens: string[] = [];
+      const createCloudflareApi = (token: string): CloudflareApi => {
+        tokens.push(token);
+        const api = cloudflare.api();
+        if (!refused || token !== 'kept-account-token') return api;
+        return {
+          ...api,
+          listActiveZones: vi.fn<CloudflareApi['listActiveZones']>(async () => {
+            throw new GwsEaError('cloudflare_capability_missing', 'Cloudflare refused the token');
+          }),
+        };
+      };
+
+      await removeAssistant(paths, input.instance_id, { ...dependencies, createCloudflareApi });
+
+      expect(interaction.requestCloudflareAccountToken).toHaveBeenCalledTimes(refused ? 1 : 0);
+      expect(tokens).toEqual(refused ? ['kept-account-token', 'account-token-canary'] : ['kept-account-token']);
+      expect(cloudflare.tunnels).toEqual([]);
+      await expectGone(paths, input);
+      await expect(stat(paths.keptCloudflareTokenFile(input.instance_id))).rejects.toMatchObject({ code: 'ENOENT' });
+    }
   });
 
   it('counts an already-removed route and an already-deleted DNS record as done', async () => {

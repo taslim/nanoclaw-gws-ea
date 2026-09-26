@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -53,6 +53,7 @@ import {
   type InstanceReservationInput,
   type ProvisionStepId,
 } from './types.js';
+import type { CloudflareZoneChoice } from './create-input.js';
 
 const roots: string[] = [];
 const providerCapabilityDigest = 'c'.repeat(64);
@@ -1328,6 +1329,8 @@ describe('production provision step composition', () => {
         input: {
           ...base.input,
           managedIngressSetup: {
+            discoverZones: vi.fn(),
+            retainAccountToken: vi.fn(),
             requireAccountToken: (accountId) => {
               if (retained === undefined) {
                 throw new GwsEaError('cloudflare_token_required', 'A fresh Cloudflare API token is required.');
@@ -1349,7 +1352,8 @@ describe('production provision step composition', () => {
         },
       }).establish_transport;
 
-      expect(step.resources).toBe(resources);
+      expect(step.resources.slice(0, -1)).toEqual(resources);
+      expect(step.resources.at(-1)?.name).toBe('the Cloudflare token kept for setup');
       expect(step.liveness).toBeDefined();
       expect(transport).toMatchObject({
         paths,
@@ -1369,6 +1373,94 @@ describe('production provision step composition', () => {
     });
 
     expect(requested).toEqual([`${claim.account_id}:Cloudflare must route the callback`]);
+  });
+
+  it('keeps the account token only until the route is set up, and asks again when Cloudflare refuses it', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, managedReservation(paths));
+    const claim = reserved.exclusive_resource_claims.ingress;
+    if (claim.mode !== 'managed-cloudflare') throw new Error('managed fixture');
+    const kept = paths.keptCloudflareTokenFile(reserved.instance_id);
+    const accepted = new Set(['first-token', 'second-token']);
+    const asked: string[] = [];
+    /** One run's token session: it holds a token only after listing its zones. */
+    const session = () => {
+      let held: string | undefined;
+      return {
+        discoverZones: vi.fn(async (token: string): Promise<readonly CloudflareZoneChoice[]> => {
+          if (!accepted.has(token))
+            throw new GwsEaError('cloudflare_capability_missing', 'Cloudflare refused the token');
+          return [
+            {
+              zoneId: 'e'.repeat(32),
+              name: 'example.com',
+              accountId: claim.account_id,
+              accountName: 'A',
+              status: 'active',
+            },
+          ];
+        }),
+        retainAccountToken: vi.fn((token: string) => {
+          held = token;
+        }),
+        requireAccountToken: (accountId: string) => {
+          if (held === undefined || accountId !== claim.account_id) {
+            throw new GwsEaError('cloudflare_token_required', 'A fresh Cloudflare API token is required.');
+          }
+          return held;
+        },
+      };
+    };
+    const run = (answer: string) =>
+      withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+        const base = productionContext(operation, reserved);
+        let transport: ManagedTransport | undefined;
+        const steps = createProductionProvisionSteps(
+          {
+            ...base,
+            input: {
+              ...base.input,
+              managedIngressSetup: session(),
+              requestCloudflareAccountToken: async () => {
+                asked.push(answer);
+                return answer;
+              },
+            },
+          },
+          {
+            managedTransportResources: (received) => {
+              transport = received;
+              return [];
+            },
+          },
+        );
+        return { token: await transport!.accountToken('Cloudflare must route the callback'), steps, base };
+      });
+
+    // The first run asks, and keeps the answer owner-only for this create's later runs.
+    await expect(run('first-token')).resolves.toMatchObject({ token: 'first-token' });
+    expect(await readFile(kept, 'utf8')).toBe('first-token');
+    expect((await stat(kept)).mode & 0o777).toBe(0o600);
+
+    // A later run reuses it without asking.
+    await expect(run('unused')).resolves.toMatchObject({ token: 'first-token' });
+    expect(asked).toEqual(['first-token']);
+
+    // A kept token Cloudflare now refuses is forgotten, and the operator is asked again.
+    accepted.delete('first-token');
+    await expect(run('second-token')).resolves.toMatchObject({ token: 'second-token' });
+    expect(asked).toEqual(['first-token', 'second-token']);
+    expect(await readFile(kept, 'utf8')).toBe('second-token');
+
+    // Once the route is set up, the step's last item deletes the kept token.
+    const last = await run('unused');
+    if (!last) throw new Error('the instance operation is busy');
+    const { steps, base } = last;
+    const forgotten = steps.establish_transport.resources.at(-1)!;
+    await expect(forgotten.observe(base)).resolves.toMatchObject({ status: 'absent' });
+    await forgotten.apply(base);
+    await expect(forgotten.observe(base)).resolves.toBe(PRESENT);
+    await expect(stat(kept)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('keeps existing transport behavior and invokes no Cloudflare dependency', async () => {

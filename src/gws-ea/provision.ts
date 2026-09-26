@@ -18,6 +18,7 @@ import {
   type ProvisionResult,
   type ProvisionRuntime,
   type ProvisionSteps,
+  type StepResource,
 } from './phases.js';
 import { assertReleaseCheckoutAgreement, materializeReleaseCheckout, type ResolvedRelease } from './checkout.js';
 import { runReleasePreflight, type ReleasePreflightInput, type ReleasePreflightResult } from './release-preflight.js';
@@ -62,7 +63,7 @@ import {
 import { readOwnerOnlyFile, readOwnerOnlyJson, removePrivateFile, writePrivateTextFile } from './secrets.js';
 import { assertInstanceId, getInstanceReservation } from './registry.js';
 import { isErrno } from '../community-portal/errors.js';
-import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
+import { isRegularFile, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import { findPortHolder, portInUseError } from './ports.js';
 import {
   GwsEaError,
@@ -98,6 +99,13 @@ import {
   type GcpProjectInput,
 } from './gcloud.js';
 import type { RetainedManagedIngressSetupSession } from './cloudflare-api.js';
+import {
+  forgetAccountToken,
+  isCloudflareTokenRefusal,
+  keepAccountToken,
+  readKeptAccountToken,
+} from './cloudflare-token.js';
+import { activeStep } from './run-log.js';
 import { managedTransportResources } from './cloudflare-ingress.js';
 
 export interface ProductionProvisionOptions {
@@ -108,7 +116,7 @@ export interface ProductionProvisionOptions {
   /** Human input: credentials, sign-in, and decisions supplied on re-entry. */
   readonly interaction?: Interaction;
   readonly managedIngress?: {
-    readonly setupSession?: Pick<RetainedManagedIngressSetupSession, 'requireAccountToken'>;
+    readonly setupSession?: ManagedAccountTokenSession;
   };
   readonly runtime?: ProvisionRuntime;
 }
@@ -137,7 +145,7 @@ export interface ProductionProvisionInput {
   readonly principalDependencies?: PrincipalDiscoveryDependencies;
   readonly hostStatus: HostStatusHelpers;
   readonly ingress: IngressClaim;
-  readonly managedIngressSetup?: Pick<RetainedManagedIngressSetupSession, 'requireAccountToken'>;
+  readonly managedIngressSetup?: ManagedAccountTokenSession;
   readonly requestCloudflareAccountToken?: (accountId: string, observation: string) => Promise<string>;
 }
 
@@ -621,25 +629,85 @@ function humanPause(phase: ProvisionStepId, code: string, message: string): Prov
   return { kind: 'human-action', phase, code, message };
 }
 
+/** The run's Cloudflare token session: it checks a token against the account before holding it. */
+type ManagedAccountTokenSession = Pick<
+  RetainedManagedIngressSetupSession,
+  'discoverZones' | 'retainAccountToken' | 'requireAccountToken'
+>;
+
+function retainedAccountToken(session: ManagedAccountTokenSession | undefined, accountId: string): string | undefined {
+  try {
+    return session?.requireAccountToken(accountId);
+  } catch (error) {
+    if (!(error instanceof GwsEaError) || error.code !== 'cloudflare_token_required') throw error;
+    return undefined;
+  }
+}
+
+/** The kept token when it still reaches the account; one Cloudflare refuses is forgotten, so the operator is asked. */
+async function restoreKeptAccountToken(
+  file: string,
+  session: ManagedAccountTokenSession,
+  accountId: string,
+): Promise<string | undefined> {
+  const kept = await readKeptAccountToken(file);
+  if (kept === undefined) return undefined;
+  const zones = await session.discoverZones(kept).then(
+    (found) => found,
+    (error: unknown) => {
+      if (!isCloudflareTokenRefusal(error)) throw error;
+      return [];
+    },
+  );
+  if (zones.some((zone) => zone.accountId === accountId)) {
+    session.retainAccountToken(kept);
+    return session.requireAccountToken(accountId);
+  }
+  activeStep()?.write('The Cloudflare token kept for setup no longer reaches its account; asking for a new one\n');
+  await forgetAccountToken(file);
+  return undefined;
+}
+
 /**
  * The Cloudflare account token for one managed-ingress change: the one this
- * run already holds for the account, else one asked for with `reason`.
+ * run already holds for the account, else the one this create kept, else one
+ * asked for with `reason`. Whichever is used is kept until the route is set up.
  */
 async function requireManagedAccountToken(
   context: ProductionProvisionContext,
   accountId: string,
   reason: string,
 ): Promise<string> {
-  try {
-    const retained = context.input.managedIngressSetup?.requireAccountToken(accountId);
-    if (retained !== undefined) return retained;
-  } catch (error) {
-    if (!(error instanceof GwsEaError) || error.code !== 'cloudflare_token_required') throw error;
+  const file = context.operation.paths.keptCloudflareTokenFile(context.operation.instanceId);
+  const session = context.input.managedIngressSetup;
+  const held =
+    retainedAccountToken(session, accountId) ??
+    (session ? await restoreKeptAccountToken(file, session, accountId) : undefined);
+  if (held !== undefined) {
+    await keepAccountToken(file, held);
+    return held;
   }
   if (!context.input.requestCloudflareAccountToken) {
     throw new GwsEaError('cloudflare_token_required', `${reason}. A fresh Cloudflare API token is required.`);
   }
-  return context.input.requestCloudflareAccountToken(accountId, reason);
+  const asked = await context.input.requestCloudflareAccountToken(accountId, reason);
+  await keepAccountToken(file, asked);
+  return asked;
+}
+
+/** Once the route is set up, no Cloudflare account token stays on disk. */
+function keptAccountTokenForgotten(context: ProductionProvisionContext): StepResource<ProductionProvisionContext> {
+  const file = context.operation.paths.keptCloudflareTokenFile(context.operation.instanceId);
+  return {
+    name: 'the Cloudflare token kept for setup',
+    absentMeansStopped: true,
+    observe: async () =>
+      (await isRegularFile(file)) ? { status: 'absent', reason: 'setup no longer needs it' } : PRESENT,
+    apply: async () => {
+      await forgetAccountToken(file);
+      return undefined;
+    },
+  };
 }
 
 /**
@@ -961,15 +1029,18 @@ export function createProductionProvisionSteps(
         : {
             label: 'Publishing the secure callback…',
             liveness: { label: 'Checking the secure callback…' },
-            resources: dependencies.managedTransportResources({
-              paths: context.operation.paths,
-              instanceId: context.operation.instanceId,
-              claim: ingress,
-              platform: input.serviceDependencies.platform,
-              webhookPort: input.runtime.allocated_ports.nanoclaw_webhook,
-              dockerEndpoint: input.runtime.docker_endpoint,
-              accountToken: (reason) => requireManagedAccountToken(context, ingress.account_id, reason),
-            }),
+            resources: [
+              ...dependencies.managedTransportResources({
+                paths: context.operation.paths,
+                instanceId: context.operation.instanceId,
+                claim: ingress,
+                platform: input.serviceDependencies.platform,
+                webhookPort: input.runtime.allocated_ports.nanoclaw_webhook,
+                dockerEndpoint: input.runtime.docker_endpoint,
+                accountToken: (reason) => requireManagedAccountToken(context, ingress.account_id, reason),
+              }),
+              keptAccountTokenForgotten(context),
+            ],
           },
     configure_channel: {
       label: 'Checking Google Chat configuration…',
