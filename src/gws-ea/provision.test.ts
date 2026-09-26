@@ -54,6 +54,7 @@ import {
   type ProvisionStepId,
 } from './types.js';
 import type { CloudflareZoneChoice } from './create-input.js';
+import type { ConversationNotReadyReason } from './verify.js';
 
 const roots: string[] = [];
 const providerCapabilityDigest = 'c'.repeat(64);
@@ -1890,6 +1891,10 @@ interface ProductionHarness {
   principal: 'waiting' | 'selection' | 'bound' | 'rejected';
   selectedMessagingGroupId?: string;
   conversationReady: boolean;
+  /** Not-ready answers the conversation check gives first, before `conversationReady` decides. */
+  conversationReasons: ConversationNotReadyReason[];
+  /** Rows `ncl dropped-messages list` returns: authenticated first DMs awaiting a principal. */
+  droppedMessages: unknown[];
   /** The process dies right after the principal is bound, before the step completes. */
   crashAfterBinding: boolean;
   lastContext?: ProductionProvisionContext;
@@ -1926,6 +1931,8 @@ async function productionHarness(): Promise<ProductionHarness> {
     chatConfigured: true,
     principal: 'waiting',
     conversationReady: true,
+    conversationReasons: [],
+    droppedMessages: [],
     run: () =>
       withInstanceOperation(paths, reserved.instance_id, async (operation) => {
         const base = productionContext(operation, reserved);
@@ -1938,6 +1945,12 @@ async function productionHarness(): Promise<ProductionHarness> {
             ...(harness.selectedMessagingGroupId ? { selectedMessagingGroupId: harness.selectedMessagingGroupId } : {}),
             chatConfigured: harness.chatConfigured,
             bootstrapManifestFile: paths.bootstrapFile(reserved.instance_id),
+            principalDependencies: {
+              runNcl: async (_config, args) => {
+                if (args[0] !== 'dropped-messages') throw new Error(`Unexpected ncl ${args.join(' ')}`);
+                return { ok: true, data: harness.droppedMessages };
+              },
+            },
             hostStatus: {
               queryHost: async () => {
                 if (resources.has('host')) return hostStatusOf(reserved);
@@ -2050,18 +2063,21 @@ async function productionHarness(): Promise<ProductionHarness> {
             }
             return { status: 'bound', candidate: PRINCIPAL, agentGroupId: 'ag-main', eventId: 'welcome' };
           },
+          sleep: async (milliseconds) => void harness.sleeps.push(milliseconds),
           verifyConversation: () =>
-            harness.conversationReady
-              ? {
-                  ready: true,
-                  sessionId: 'session-main',
-                  welcomeInboundId: 'welcome-in',
-                  welcomeOutboundId: 'welcome-out',
-                  laterInboundId: 'later-in',
-                  laterOutboundId: 'later-out',
-                  deliveredAt: '2026-09-18T18:01:00.000Z',
-                }
-              : { ready: false, reason: 'later_principal_message_missing' },
+            harness.conversationReasons.length > 0
+              ? { ready: false, reason: harness.conversationReasons.shift()! }
+              : harness.conversationReady
+                ? {
+                    ready: true,
+                    sessionId: 'session-main',
+                    welcomeInboundId: 'welcome-in',
+                    welcomeOutboundId: 'welcome-out',
+                    laterInboundId: 'later-in',
+                    laterOutboundId: 'later-out',
+                    deliveredAt: '2026-09-18T18:01:00.000Z',
+                  }
+                : { ready: false, reason: 'later_principal_message_missing' },
         };
         const runtime = {
           emit: (event: RunEvent) => {
@@ -2281,6 +2297,69 @@ describe('production step order and pause outcomes', () => {
       `Errors logged since ${began} in ${errorLog}:`,
       `  ${logLine(new Date(start + 1_000), 'ERROR', '').slice(0, 14)} ERROR Delivery failed`,
     ]);
+  });
+
+  it('waits while the assistant delivers its welcome, then pauses for a reply it can watch for', async () => {
+    const harness = await productionHarness();
+    harness.principal = 'bound';
+    harness.conversationReady = false;
+    harness.conversationReasons = ['welcome_not_delivered', 'welcome_not_delivered', 'welcome_not_delivered'];
+
+    const paused = (await harness.run()) as Extract<ProvisionResult, { status: 'paused' }>;
+    expect(paused.pause).toMatchObject({
+      phase: 'verify_conversation',
+      code: 'later_principal_message_missing',
+      message: 'Send the assistant another message in Google Chat, such as a reply to its welcome.',
+    });
+    expect(harness.sleeps.filter((milliseconds) => milliseconds === 2_000)).toHaveLength(2);
+
+    // The pause watches for the reply without changing anything.
+    await expect(paused.pause.settled?.()).resolves.toBe(false);
+    harness.conversationReady = true;
+    await expect(paused.pause.settled?.()).resolves.toBe(true);
+  });
+
+  it('stops waiting on a delivery after a minute, and names it without a watch', async () => {
+    const harness = await productionHarness();
+    harness.principal = 'bound';
+    harness.conversationReady = false;
+    harness.conversationReasons = Array.from({ length: 40 }, () => 'welcome_not_delivered' as const);
+
+    const paused = (await harness.run()) as Extract<ProvisionResult, { status: 'paused' }>;
+    expect(paused.pause).toMatchObject({
+      code: 'welcome_not_delivered',
+      message: 'The assistant has not delivered its welcome; check the errors below, then resume.',
+    });
+    expect(paused.pause.settled).toBeUndefined();
+    expect(harness.sleeps.filter((milliseconds) => milliseconds === 2_000)).toHaveLength(30);
+  });
+
+  it('watches for the principal DM without binding anything', async () => {
+    const harness = await productionHarness();
+
+    const paused = (await harness.run()) as Extract<ProvisionResult, { status: 'paused' }>;
+    expect(paused.pause).toMatchObject({ phase: 'bind_principal', code: 'principal_dm_required' });
+    await expect(paused.pause.settled?.()).resolves.toBe(false);
+
+    const provisioningStartedAt = harness.lastContext!.input.provisioningStartedAt;
+    harness.droppedMessages = [
+      {
+        channel_type: 'gchat',
+        instance: harness.lastContext!.input.adapterInstance,
+        reason: 'no_agent_wired',
+        sender_authenticated: 1,
+        sender_kind: 'human',
+        is_group: 0,
+        authenticated_message_at: new Date(new Date(provisioningStartedAt).getTime() + 1_000).toISOString(),
+        authenticated_message_id: 'message-1',
+        messaging_group_id: 'mg-principal',
+        platform_id: 'gchat:spaces/principal',
+        user_id: 'gchat:users/principal',
+        sender_name: 'Principal',
+      },
+    ];
+    await expect(paused.pause.settled?.()).resolves.toBe(true);
+    expect(harness.effects.filter((effect) => effect.startsWith('reconcilePrincipalDm'))).toHaveLength(1);
   });
 
   it('pauses at verify_conversation until a later principal message is answered', async () => {

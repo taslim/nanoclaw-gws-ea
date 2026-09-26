@@ -171,6 +171,38 @@ describe('pending human actions', () => {
 });
 
 describe('Interaction port', () => {
+  it('attends a pause only at a terminal, and carries decisions made there into later runs', async () => {
+    const pause: ProvisionHumanPause = {
+      kind: 'human-action',
+      phase: 'configure_channel',
+      code: 'chat_configuration_required',
+      message: 'Finish the Google Chat app configuration, then confirm it.',
+      resumeFlag: '--chat-configured',
+    };
+    const options = {
+      decisions: { chatConfigured: false },
+      secrets: { get: () => undefined },
+      managedIngressSetup: ingressSetup(),
+    };
+    const signal = new AbortController().signal;
+
+    await expect(createInteraction(options).attendPause(pause, signal)).resolves.toEqual({ kind: 'stop' });
+
+    const terminal = { suspend: vi.fn(), resume: vi.fn() };
+    const attendPause = vi.fn(async () => ({ kind: 'continue' as const, decisions: { chatConfigured: true } }));
+    const interactive = createInteraction({ ...options, prompts: prompts({ attendPause }), terminal });
+    await expect(interactive.attendPause(pause, signal)).resolves.toEqual({
+      kind: 'continue',
+      decisions: { chatConfigured: true },
+    });
+    expect(attendPause).toHaveBeenCalledWith(pause, signal);
+    expect(terminal.suspend).toHaveBeenCalledOnce();
+
+    const decided = interactive.withDecisions({ chatConfigured: true });
+    expect(decided.decisions).toEqual({ chatConfigured: true });
+    expect(interactive.decisions).toEqual({ chatConfigured: false });
+  });
+
   it('uses a supplied provider credential without prompting', async () => {
     const terminal = { suspend: vi.fn(), resume: vi.fn() };
     const interaction = createInteraction({

@@ -127,6 +127,36 @@ function parseCandidates(value: unknown, adapterInstance: string, provisioningSt
   );
 }
 
+/**
+ * The authenticated first Google Chat DMs received since provisioning
+ * started, latest per conversation, without binding any of them.
+ */
+export async function listPrincipalCandidates(
+  configInput: InstanceRuntimeConfig,
+  input: Pick<PrincipalDiscoveryInput, 'adapterInstance' | 'provisioningStartedAt'>,
+  dependencies: Pick<PrincipalDiscoveryDependencies, 'runNcl'> = {},
+): Promise<readonly PrincipalCandidate[]> {
+  const provisioningStartedAt = canonicalTimestamp(input.provisioningStartedAt);
+  if (!provisioningStartedAt) throw new GwsEaError('invalid_arguments', 'Provisioning start timestamp is invalid');
+  const runNcl = dependencies.runNcl ?? runInstanceNclJson;
+  return parseCandidates(
+    await runNcl(validateRuntimeConfig(configInput), [
+      'dropped-messages',
+      'list',
+      '--channel-type',
+      GCHAT_CHANNEL_TYPE,
+      '--instance',
+      input.adapterInstance,
+      '--reason',
+      'no_agent_wired',
+      '--limit',
+      '200',
+    ]),
+    input.adapterInstance,
+    provisioningStartedAt,
+  );
+}
+
 async function defaultRunBootstrap(
   config: InstanceRuntimeConfig,
   args: readonly string[],
@@ -195,22 +225,7 @@ export async function reconcilePrincipalDm(
     throw new GwsEaError('principal_selection_mismatch', 'The principal selection is already fixed for this instance');
   }
   if (!selected) {
-    const candidates = parseCandidates(
-      await runNcl(config, [
-        'dropped-messages',
-        'list',
-        '--channel-type',
-        GCHAT_CHANNEL_TYPE,
-        '--instance',
-        input.adapterInstance,
-        '--reason',
-        'no_agent_wired',
-        '--limit',
-        '200',
-      ]),
-      input.adapterInstance,
-      provisioningStartedAt,
-    );
+    const candidates = await listPrincipalCandidates(config, input, dependencies);
     if (input.messagingGroupId === undefined) {
       if (candidates.length === 0) return { status: 'waiting' };
       if (candidates.length > 1) return { status: 'selection-required', candidates };

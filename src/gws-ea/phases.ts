@@ -28,6 +28,12 @@ export interface ProvisionHumanPause {
   readonly actionUrl?: string;
   readonly resumeFlag?: string;
   readonly choices?: readonly { readonly id: string; readonly label: string }[];
+  /**
+   * Whether what the person was asked to do has happened, checked cheaply and
+   * without changing anything, so a terminal can wait for it instead of
+   * stopping. Absent when nothing can observe it.
+   */
+  readonly settled?: () => Promise<boolean>;
 }
 
 export type Observation =

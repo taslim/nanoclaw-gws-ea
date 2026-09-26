@@ -77,7 +77,10 @@ export interface RunLog {
   /** Move a pre-reservation run under its newly reserved instance. */
   assignInstance(instanceId: string): Promise<void>;
   complete(): void;
-  pause(reason: string): void;
+  /** `step` is the step that paused, when a later check ran after it. */
+  pause(reason: string, step?: string): void;
+  /** The run was stopped by a signal, such as Ctrl-C. */
+  interrupt(signal: NodeJS.Signals): void;
   /** Close the run as failed, naming the step that raised this error. */
   abort(error: unknown): void;
 }
@@ -306,9 +309,15 @@ class Run implements RunLog {
     ]);
   }
 
-  pause(reason: string): void {
-    const at = this.#lastStep ? ` at ${this.#lastStep}` : '';
+  pause(reason: string, step?: string): void {
+    const pausedAt = step ?? this.#lastStep;
+    const at = pausedAt ? ` at ${pausedAt}` : '';
     this.append([`## ${this.#now().toISOString()} · paused${at} (${field(reason)})`]);
+  }
+
+  interrupt(signal: NodeJS.Signals): void {
+    const at = this.#lastStep ? ` at ${this.#lastStep}` : '';
+    this.append([`## ${this.#now().toISOString()} · interrupted${at} (${signal})`]);
   }
 
   abort(error: unknown): void {

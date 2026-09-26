@@ -15,6 +15,7 @@ import type { HostStatusHelpers } from '../src/gws-ea/service.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
 import { offerDiagnosis } from './gws-ea-assist.js';
 import { authenticateGwsEaProvider, CLOUDFLARE_API_TOKEN_GUIDANCE, collectGwsEaCreateInput } from './gws-ea-input.js';
+import { attendPause } from './gws-ea-pause.js';
 import { confirmGoogleAccount, ensurePrerequisites, signInToGoogleCloud } from './gws-ea-prerequisites.js';
 import { dumpTranscriptOnFailure } from './lib/runner.js';
 import { fitToWidth, fmtDuration } from './lib/theme.js';
@@ -142,6 +143,7 @@ function terminalPrompts(providers: readonly SetupProviderEntry[]): InteractiveP
     },
     googleCloudSignIn: (account) => signInToGoogleCloud(account),
     googleAccount: (account) => confirmGoogleAccount(account),
+    attendPause: (pause, signal) => attendPause(pause, signal),
   };
 }
 

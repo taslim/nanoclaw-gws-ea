@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import os from 'node:os';
@@ -7,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { runCli, type CliRuntime, type FailureReport } from './cli.js';
 import type { CreatePromptContext } from './create-input.js';
-import { runStep, withPendingAction, type Interaction } from './events.js';
+import { runStep, withPendingAction, type Interaction, type InteractivePrompts, type PauseResponse } from './events.js';
 import { RECORDED_GCLOUD_REAUTHENTICATION_FAILED } from './fixtures/recordings.js';
 import { acquireInstanceOperation, reserveInstance } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
@@ -132,6 +133,24 @@ const DM_PAUSE: ProvisionHumanPause = {
   message: 'Ask the principal to send a direct message to the configured Google Chat app, then resume.',
 };
 
+const CHAT_PAUSE: ProvisionHumanPause = {
+  kind: 'human-action',
+  phase: 'configure_channel',
+  code: 'chat_configuration_required',
+  message: "Finish this assistant's Google Chat app configuration, then confirm it.",
+  resumeFlag: '--chat-configured',
+};
+
+/** A terminal that is never asked anything but what a test adds. */
+function terminalPrompts(): InteractivePrompts {
+  return {
+    providerCredential: vi.fn(),
+    cloudflareAccountToken: vi.fn(),
+    googleCloudSignIn: vi.fn(),
+    googleAccount: vi.fn(),
+  };
+}
+
 async function writeOwnerFile(file: string, contents: string, mode = 0o600): Promise<void> {
   await writeFile(file, contents, { mode });
   await chmod(file, mode);
@@ -224,6 +243,116 @@ describe('gws-ea stop summaries and exit codes', () => {
     expect(io.out).toContain(`Continue with: gws-ea resume --id ${input.instance_id}`);
     expect(io.out.at(-1)).toMatch(/^Log: \S+progress\.log$/u);
   });
+
+  it('attends a pause at a terminal and runs on in the same process with the decision made', async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation(paths));
+    const io = lines();
+    const decided: boolean[] = [];
+    const attendPause = vi.fn(
+      async (): Promise<PauseResponse> => ({
+        kind: 'continue',
+        decisions: { chatConfigured: true },
+      }),
+    );
+
+    expect(
+      await runCli(['resume', '--id', input.instance_id], {
+        paths,
+        ...io.runtime,
+        checkPrerequisites: async () => PREREQUISITES,
+        prompts: { ...terminalPrompts(), attendPause },
+        advanceProvision: async (_operation, { interaction }) => {
+          decided.push(interaction.decisions.chatConfigured);
+          return decided.length === 1 ? { status: 'paused', pause: CHAT_PAUSE } : { status: 'ready' };
+        },
+      }),
+    ).toBe(0);
+    expect(decided).toEqual([false, true]);
+    expect(attendPause).toHaveBeenCalledWith(CHAT_PAUSE, expect.any(AbortSignal));
+    expect(io.out.join('\n')).not.toContain('Paused at');
+  });
+
+  it('reports a pause the person stops at, logged against the step that paused', async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation(paths));
+    const io = lines();
+
+    expect(
+      await runCli(['resume', '--id', input.instance_id], {
+        paths,
+        ...io.runtime,
+        checkPrerequisites: async () => PREREQUISITES,
+        prompts: { ...terminalPrompts(), attendPause: async () => ({ kind: 'stop' }) },
+        advanceProvision: async (_operation, { runtime }) => {
+          // A later runtime check runs after the step that paused, as before a real human pause.
+          await runStep(runtime, { id: 'establish_transport' }, async () => undefined);
+          return { status: 'paused', pause: CHAT_PAUSE };
+        },
+      }),
+    ).toBe(10);
+    expect(io.out).toContain(`Paused at configure_channel: ${CHAT_PAUSE.message}`);
+    expect(io.out).toContain(`Continue with: gws-ea resume --id ${input.instance_id} --chat-configured`);
+    const log = io.out.at(-1)?.replace(/^Log: /u, '') ?? '';
+    expect(await readFile(log, 'utf8')).toMatch(/· paused at configure_channel \(chat_configuration_required\)\n$/u);
+  });
+
+  it('records a run stopped by Ctrl-C, naming the step it was in', async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation(paths));
+    const ready = path.join(path.dirname(paths.configRoot), 'inside-step');
+    const childScript = `
+      import { writeFile } from 'node:fs/promises';
+      import { runCli } from './src/gws-ea/cli.ts';
+      import { runStep } from './src/gws-ea/events.ts';
+      import { resolveControlPlanePaths } from './src/gws-ea/paths.ts';
+      await runCli(['resume', '--id', process.env.TEST_INSTANCE], {
+        paths: resolveControlPlanePaths(JSON.parse(process.env.TEST_PATHS)),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        checkPrerequisites: async () => JSON.parse(process.env.TEST_PREREQUISITES),
+        advanceProvision: (_operation, { runtime }) =>
+          runStep(runtime, { id: 'establish_transport' }, async () => {
+            await writeFile(process.env.TEST_READY, 'ready');
+            await new Promise((resolve) => setTimeout(resolve, 60_000));
+          }),
+      });
+    `;
+    const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', childScript], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        TEST_INSTANCE: input.instance_id,
+        TEST_PATHS: JSON.stringify({ configRoot: paths.configRoot, stateRoot: paths.stateRoot }),
+        TEST_PREREQUISITES: JSON.stringify(PREREQUISITES),
+        TEST_READY: ready,
+      },
+      stdio: 'ignore',
+    });
+    const exited = new Promise<number | null>((resolve) => child.once('exit', (code) => resolve(code)));
+
+    for (let attempt = 0; attempt < 400; attempt += 1) {
+      if (
+        await stat(ready).then(
+          () => true,
+          () => false,
+        )
+      )
+        break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    child.kill('SIGINT');
+
+    expect(await exited).toBe(130);
+    const runs = path.join(paths.logsRoot, input.instance_id);
+    const [run] = await readdir(runs);
+    const progress = await readFile(path.join(runs, run!, 'progress.log'), 'utf8');
+    expect(progress).toMatch(/· interrupted at establish_transport \(SIGINT\)\n$/u);
+    // The instance lock went with the process, so the next resume is not refused as busy.
+    const operation = await acquireInstanceOperation(paths, input.instance_id);
+    expect(operation).not.toBeNull();
+    operation?.release();
+  }, 30_000);
 
   it('exits 75 without advancing while another operation holds the instance lock', async () => {
     const paths = await testPaths();

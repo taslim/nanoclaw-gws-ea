@@ -1,3 +1,4 @@
+import os from 'node:os';
 import path from 'node:path';
 
 import { resolveReleaseCommit, type ResolvedRelease } from './checkout.js';
@@ -17,6 +18,7 @@ import {
   runStep,
   type HumanDecisions,
   type Interaction,
+  type PauseResponse,
   type InteractivePrompts,
   type RunEvent,
   type StepReporter,
@@ -53,6 +55,9 @@ import { GwsEaError, type AllocatedPorts, type GwsEaErrorDetails, type InstanceR
 
 /** Unlabeled, so a scripted create's first line stays its `instance_id`. */
 const PREREQUISITES_STEP = { id: 'prerequisites' } as const;
+
+/** Signals that end a run, recorded in its log first. */
+const INTERRUPT_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
 
 /** `0` ready, `10` paused for a person, `1` failed, `75` busy. */
 export const EXIT_CODES = { ready: 0, paused: 10, failed: 1, busy: 75 } as const;
@@ -307,6 +312,8 @@ class Cli {
   readonly #presenter: Presenter;
   readonly #runtime: CliRuntime;
   readonly #managedIngressSetup: RetainedManagedIngressSetupSession;
+  /** Set while a terminal waits on a pause: a signal then stops the wait, not the run. */
+  #waiting: AbortController | undefined;
 
   constructor(runtime: CliRuntime, presenter: Presenter, managedIngressSetup: RetainedManagedIngressSetupSession) {
     this.#paths = runtime.paths ?? resolveControlPlanePaths();
@@ -518,13 +525,32 @@ class Cli {
     }
   }
 
+  /**
+   * Provision until ready or paused. A terminal attends each pause, asking
+   * or waiting for what it needs, and provisioning runs on in the same
+   * process; without one, or when the person stops, the pause is reported.
+   */
   async #provision(reporter: StepReporter, operation: InstanceOperation, interaction: Interaction): Promise<Outcome> {
-    const result = await runStep(reporter, { id: 'provision' }, () =>
-      this.#advance(operation, { interaction, runtime: reporter }),
-    );
-    return result.status === 'paused'
-      ? result
-      : { status: 'ready', message: `Instance ${operation.instanceId} is ready.` };
+    let current = interaction;
+    for (;;) {
+      const result = await runStep(reporter, { id: 'provision' }, () =>
+        this.#advance(operation, { interaction: current, runtime: reporter }),
+      );
+      if (result.status !== 'paused') return { status: 'ready', message: `Instance ${operation.instanceId} is ready.` };
+      const response = await this.#attend(current, result.pause);
+      if (response.kind === 'stop') return result;
+      if (response.decisions) current = current.withDecisions(response.decisions);
+    }
+  }
+
+  async #attend(interaction: Interaction, pause: ProvisionHumanPause): Promise<PauseResponse> {
+    const waiting = new AbortController();
+    this.#waiting = waiting;
+    try {
+      return await interaction.attendPause(pause, waiting.signal);
+    } finally {
+      this.#waiting = undefined;
+    }
   }
 
   async #resumeWork({ reporter, interaction }: Session, instanceId: string): Promise<Outcome> {
@@ -600,6 +626,16 @@ class Cli {
     };
     const continueWith = (extra?: string): string => this.#continueCommand(plan, state, extra);
     let run: RunLog | undefined;
+    // A signal while waiting on a pause stops the wait; otherwise the run ends, and its log says where.
+    const interrupted = (signal: NodeJS.Signals): void => {
+      if (this.#waiting) {
+        this.#waiting.abort();
+        return;
+      }
+      run?.interrupt(signal);
+      process.exit(128 + os.constants.signals[signal]);
+    };
+    for (const signal of INTERRUPT_SIGNALS) process.on(signal, interrupted);
     /* eslint-disable no-catch-all/no-catch-all -- The CLI boundary turns every failure into a redacted summary and exit code. */
     try {
       run = await startRunLog({
@@ -635,7 +671,7 @@ class Cli {
       });
       const outcome = await plan.work({ reporter, interaction, secrets, state });
       if (outcome.status === 'paused') {
-        run.pause(outcome.pause.code);
+        run.pause(outcome.pause.code, outcome.pause.phase);
         presenter.report(pauseReport(outcome.pause, continueWith, run.progressLog));
         return { status: 'done', exitCode: EXIT_CODES.paused };
       }
@@ -676,6 +712,8 @@ class Cli {
       const report = failureReport(plan.command, nextAction, state, run, error, failures[0], labels);
       presenter.report(failureStop(report, error));
       return { status: 'failed', report, retry: this.#retry(plan, state) };
+    } finally {
+      for (const signal of INTERRUPT_SIGNALS) process.off(signal, interrupted);
     }
     /* eslint-enable no-catch-all/no-catch-all */
   }

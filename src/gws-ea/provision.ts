@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import { existsSync } from 'node:fs';
 import { mkdir, rmdir } from 'node:fs/promises';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import {
   readProvisionJournal,
@@ -49,13 +50,19 @@ import {
 import { instanceServicePlatform } from './service-coordinates.js';
 import { runInstanceNclJson } from './ncl.js';
 import { reconcileMainIdentity, type MainIdentityDependencies, type MainIdentityInput } from './identity.js';
-import { reconcilePrincipalDm, type PrincipalCandidate, type PrincipalDiscoveryDependencies } from './principal.js';
+import {
+  listPrincipalCandidates,
+  reconcilePrincipalDm,
+  type PrincipalCandidate,
+  type PrincipalDiscoveryDependencies,
+} from './principal.js';
 import { verifyExistingGchatEndpoint, verifyExistingGchatRoute, validateExistingGchatEndpoint } from './endpoint.js';
 import {
   instanceErrorsSince,
   verifyPrincipalBinding,
   verifyTalkableConversation,
   type ConversationVerificationInput,
+  type ConversationNotReadyReason,
   type ConversationVerificationResult,
   type PrincipalBindingVerificationInput,
   type PrincipalBindingVerificationResult,
@@ -193,6 +200,7 @@ export interface ProductionProvisionDependencies {
   readonly verifyConversation: (input: ConversationVerificationInput) => ConversationVerificationResult;
   /** `establish_transport`'s resources in managed mode. */
   readonly managedTransportResources: typeof managedTransportResources;
+  readonly sleep: (milliseconds: number) => Promise<void>;
 }
 
 async function defaultObserveCheckout(context: ProductionProvisionContext): Promise<Observation> {
@@ -623,6 +631,7 @@ const defaultProductionDependencies: ProductionProvisionDependencies = {
   reconcilePrincipal: reconcilePrincipalDm,
   verifyConversation: verifyTalkableConversation,
   managedTransportResources,
+  sleep: delay,
 };
 
 function humanPause(phase: ProvisionStepId, code: string, message: string): ProvisionHumanPause {
@@ -715,6 +724,26 @@ function keptAccountTokenForgotten(context: ProductionProvisionContext): StepRes
  * and shows what the host logged as errors since the step began, which is
  * usually why a message has not arrived or been answered.
  */
+/** Conversation states the assistant resolves by itself, waited on rather than handed to a person. */
+const DELIVERY_REASONS: ReadonlySet<ConversationNotReadyReason> = new Set([
+  'binding_not_ready',
+  'session_not_ready',
+  'welcome_not_delivered',
+  'reply_not_delivered',
+]);
+const DELIVERY_WAIT_MS = 60_000;
+const DELIVERY_POLL_MS = 2_000;
+
+/** What a person is told when the conversation is still not ready. */
+const CONVERSATION_PAUSES: Readonly<Record<ConversationNotReadyReason, string>> = {
+  binding_not_ready: 'The principal conversation is not ready yet; check the errors below, then resume.',
+  session_not_ready:
+    "The assistant has not opened the principal's conversation yet; check the errors below, then resume.",
+  welcome_not_delivered: 'The assistant has not delivered its welcome; check the errors below, then resume.',
+  later_principal_message_missing: 'Send the assistant another message in Google Chat, such as a reply to its welcome.',
+  reply_not_delivered: 'The assistant has not answered the principal yet; check the errors below, then resume.',
+};
+
 async function principalPause(
   context: ProductionProvisionContext,
   phase: 'bind_principal' | 'verify_conversation',
@@ -742,13 +771,26 @@ async function principalResult(
   result: Awaited<ReturnType<typeof reconcilePrincipalDm>>,
 ): Promise<ProvisionHumanPause | undefined> {
   if (result.status === 'waiting') {
-    return principalPause(
-      context,
-      'bind_principal',
-      'principal_dm_required',
-      'Ask the principal to send a direct message to the configured Google Chat app, then resume.',
-      `Principal: ${context.input.identity.principalDisplayName} (not bound yet)`,
-    );
+    return {
+      ...(await principalPause(
+        context,
+        'bind_principal',
+        'principal_dm_required',
+        'Ask the principal to send a direct message to the configured Google Chat app.',
+        `Principal: ${context.input.identity.principalDisplayName} (not bound yet)`,
+      )),
+      settled: async () =>
+        (
+          await listPrincipalCandidates(
+            context.input.runtime,
+            {
+              adapterInstance: context.input.adapterInstance,
+              provisioningStartedAt: context.input.provisioningStartedAt,
+            },
+            context.input.principalDependencies,
+          )
+        ).length > 0,
+    };
   }
   if (result.status === 'selection-required') {
     return {
@@ -879,6 +921,21 @@ export function createProductionProvisionSteps(
     if (!conversationInput(value)) await observeBinding(value);
     const verificationInput = conversationInput(value);
     return verificationInput ? dependencies.verifyConversation(verificationInput) : undefined;
+  };
+  /** Until the assistant has delivered what it owes, re-check rather than hand the person a pause. */
+  const awaitDelivery = async (
+    value: ProductionProvisionContext,
+  ): Promise<ConversationVerificationResult | undefined> => {
+    let result = await verifyConversation(value);
+    for (
+      let waited = 0;
+      result && !result.ready && DELIVERY_REASONS.has(result.reason) && waited < DELIVERY_WAIT_MS;
+      waited += DELIVERY_POLL_MS
+    ) {
+      await dependencies.sleep(DELIVERY_POLL_MS);
+      result = await verifyConversation(value);
+    }
+    return result;
   };
   /** The principal's messages reach the assistant only through its host, and the connector when managed. */
   const principalPauseNeeds = ['start_nanoclaw', 'establish_transport'] as const;
@@ -1103,20 +1160,27 @@ export function createProductionProvisionSteps(
           name: 'the talkable conversation',
           observe: async (value) => ((await verifyConversation(value))?.ready ? PRESENT : ABSENT),
           apply: async (value) => {
-            const result = await verifyConversation(value);
+            const result = await awaitDelivery(value);
             const principal = value.state.principal;
             if (!result || !principal) {
               throw new GwsEaError('principal_not_ready', 'Principal binding is not available');
             }
-            return result.ready
-              ? undefined
-              : principalPause(
-                  value,
-                  'verify_conversation',
-                  result.reason,
-                  'Wait for the delivered welcome, then ask the principal to send a later Google Chat message and resume.',
-                  `Bound principal: ${principal.senderName ?? value.input.identity.principalDisplayName} (${principal.userId})`,
-                );
+            if (result.ready) return undefined;
+            const pause = await principalPause(
+              value,
+              'verify_conversation',
+              result.reason,
+              CONVERSATION_PAUSES[result.reason],
+              `Bound principal: ${principal.senderName ?? value.input.identity.principalDisplayName} (${principal.userId})`,
+            );
+            if (result.reason !== 'later_principal_message_missing') return pause;
+            return {
+              ...pause,
+              settled: async () => {
+                const now = await verifyConversation(value);
+                return !now || now.ready || now.reason !== 'later_principal_message_missing';
+              },
+            };
           },
         },
       ],

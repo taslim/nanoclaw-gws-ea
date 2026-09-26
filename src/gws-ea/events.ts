@@ -134,6 +134,11 @@ export interface HumanDecisions {
   readonly messagingGroupId?: string;
 }
 
+/** What to do after a human pause: stop and report it, or run on with any decisions the person made. */
+export type PauseResponse =
+  | { readonly kind: 'stop' }
+  | { readonly kind: 'continue'; readonly decisions?: Partial<HumanDecisions> };
+
 export interface ProviderCredentialRequest {
   readonly providerId: string;
   readonly metadata: ProviderCredentialMetadata;
@@ -156,6 +161,14 @@ export interface Interaction {
   confirmGoogleAccount(account: string): Promise<boolean>;
   /** Hand the terminal to an interactive child, suspending progress rendering around it. */
   withTerminal<T>(work: () => Promise<T>): Promise<T>;
+  /**
+   * Attend a human pause at a terminal: ask for a confirmation or a choice, or
+   * wait for what the person was asked to do. Without a terminal it stops.
+   * `signal` aborts a wait, which then stops.
+   */
+  attendPause(pause: ProvisionHumanPause, signal: AbortSignal): Promise<PauseResponse>;
+  /** The same port, with the decisions made while attending a pause. */
+  withDecisions(decisions: Partial<HumanDecisions>): Interaction;
 }
 
 /** What a person at the terminal can be asked. The driver supplies this only on a TTY. */
@@ -164,6 +177,7 @@ export interface InteractivePrompts {
   cloudflareAccountToken(request: CloudflareTokenRequest): Promise<string>;
   googleCloudSignIn(account?: string): Promise<void>;
   googleAccount(account: string): Promise<boolean>;
+  attendPause?(pause: ProvisionHumanPause, signal: AbortSignal): Promise<PauseResponse>;
 }
 
 export interface InteractionOptions {
@@ -257,6 +271,14 @@ export function createInteraction(options: InteractionOptions): Interaction {
         );
       }
       return withTerminal(() => prompts.googleAccount(account));
+    },
+    async attendPause(pause, signal) {
+      if (!prompts?.attendPause) return { kind: 'stop' };
+      const attend = prompts.attendPause;
+      return withTerminal(() => attend(pause, signal));
+    },
+    withDecisions(decisions) {
+      return createInteraction({ ...options, decisions: { ...options.decisions, ...decisions } });
     },
   };
 }
