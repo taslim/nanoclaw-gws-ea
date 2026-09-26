@@ -59,7 +59,8 @@ mkdir -p "$BIN_DIR"
 if [ -L "$LINK" ]; then
   PREVIOUS="$(readlink "$LINK")"
   if [ "$PREVIOUS" != "$LAUNCHER" ]; then
-    ln -sf "$LAUNCHER" "$LINK"
+    # -n replaces the link itself, even one that points at a directory, on macOS and Linux alike.
+    ln -sfn "$LAUNCHER" "$LINK"
     printf '%s\n' "Pointed $LINK at this checkout (it pointed at $PREVIOUS)."
   fi
 elif [ -e "$LINK" ]; then

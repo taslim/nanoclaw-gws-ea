@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { copyFile, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -103,6 +103,12 @@ describe('GWS-EA machine setup', () => {
     const moved = await setUp(second, home);
     expect(await readlink(link)).toBe(path.join(second, 'bin', 'gws-ea'));
     expect(moved.stdout).toContain(`(it pointed at ${path.join(first, 'bin', 'gws-ea')})`);
+
+    // A link to a directory is replaced itself, not followed into that directory.
+    await rm(link);
+    await symlink(first, link);
+    await setUp(second, home);
+    expect(await readlink(link)).toBe(path.join(second, 'bin', 'gws-ea'));
   });
 
   it('leaves a file it did not make alone, and stops on a failed bootstrap or any option', async () => {
