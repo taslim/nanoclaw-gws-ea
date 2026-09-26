@@ -6,11 +6,11 @@
  * the CLI an assistant was created with.
  */
 import { createHash } from 'node:crypto';
-import { chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { isRegularFile, type ControlPlanePaths } from './paths.js';
+import { isRegularFile, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import {
   exactVersion,
   ONECLI_CLI_ARCHIVE_DIGESTS,
@@ -119,7 +119,7 @@ export async function ensurePinnedOnecliCli(
     if (!(await isRegularFile(extracted))) {
       throw new GwsEaError('onecli_download_failed', `${archive} does not contain the onecli program`);
     }
-    await mkdir(path.dirname(installed), { recursive: true, mode: 0o700 });
+    await preparePrivateDirectory(path.dirname(installed));
     // Staged beside its target, so the rename that publishes it is atomic.
     const pending = `${installed}.gws-ea-${process.pid}`;
     try {

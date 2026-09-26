@@ -106,13 +106,7 @@ import {
   type GcpProjectInput,
 } from './gcloud.js';
 import type { RetainedManagedIngressSetupSession } from './cloudflare-api.js';
-import {
-  forgetAccountToken,
-  isCloudflareTokenRefusal,
-  keepAccountToken,
-  readKeptAccountToken,
-} from './cloudflare-token.js';
-import { activeStep } from './run-log.js';
+import { forgetAccountToken, keepAccountToken, usableKeptAccountToken } from './cloudflare-token.js';
 import { managedTransportResources } from './cloudflare-ingress.js';
 
 export interface ProductionProvisionOptions {
@@ -659,22 +653,10 @@ async function restoreKeptAccountToken(
   session: ManagedAccountTokenSession,
   accountId: string,
 ): Promise<string | undefined> {
-  const kept = await readKeptAccountToken(file);
-  if (kept === undefined) return undefined;
-  const zones = await session.discoverZones(kept).then(
-    (found) => found,
-    (error: unknown) => {
-      if (!isCloudflareTokenRefusal(error)) throw error;
-      return [];
-    },
-  );
-  if (zones.some((zone) => zone.accountId === accountId)) {
-    session.retainAccountToken(kept);
-    return session.requireAccountToken(accountId);
-  }
-  activeStep()?.write('The Cloudflare token kept for setup no longer reaches its account; asking for a new one\n');
-  await forgetAccountToken(file);
-  return undefined;
+  const kept = await usableKeptAccountToken(file, accountId, (token) => session.discoverZones(token));
+  if (!kept) return undefined;
+  session.retainAccountToken(kept.token);
+  return session.requireAccountToken(accountId);
 }
 
 /**
@@ -719,11 +701,6 @@ function keptAccountTokenForgotten(context: ProductionProvisionContext): StepRes
   };
 }
 
-/**
- * A pause while the principal's conversation is awaited. It names the person
- * and shows what the host logged as errors since the step began, which is
- * usually why a message has not arrived or been answered.
- */
 /** Conversation states the assistant resolves by itself, waited on rather than handed to a person. */
 const DELIVERY_REASONS: ReadonlySet<ConversationNotReadyReason> = new Set([
   'binding_not_ready',
@@ -744,6 +721,11 @@ const CONVERSATION_PAUSES: Readonly<Record<ConversationNotReadyReason, string>> 
   reply_not_delivered: 'The assistant has not answered the principal yet; check the errors below, then resume.',
 };
 
+/**
+ * A pause while the principal's conversation is awaited. It names the person
+ * and shows what the host logged as errors since the step began, which is
+ * usually why a message has not arrived or been answered.
+ */
 async function principalPause(
   context: ProductionProvisionContext,
   phase: 'bind_principal' | 'verify_conversation',

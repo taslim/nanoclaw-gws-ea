@@ -10,6 +10,7 @@ import path from 'node:path';
 import { isErrno } from '../community-portal/errors.js';
 import { preparePrivateDirectory } from './paths.js';
 import { registerSecret } from './redact.js';
+import { activeStep } from './run-log.js';
 import { readOwnerOnlyFile, removePrivateFile, writePrivateTextFile } from './secrets.js';
 import { GwsEaError } from './types.js';
 
@@ -43,4 +44,29 @@ export async function keepAccountToken(file: string, token: string): Promise<voi
 
 export function forgetAccountToken(file: string): Promise<void> {
   return removePrivateFile(file);
+}
+
+/**
+ * The kept token and the zones it lists, when Cloudflare still accepts it for
+ * `accountId`. One Cloudflare refuses, or one that no longer reaches the
+ * account, is forgotten, so the caller asks for a new one.
+ */
+export async function usableKeptAccountToken<Zone extends { readonly accountId: string }>(
+  file: string,
+  accountId: string,
+  listZones: (token: string) => Promise<readonly Zone[]>,
+): Promise<{ readonly token: string; readonly zones: readonly Zone[] } | undefined> {
+  const token = await readKeptAccountToken(file);
+  if (token === undefined) return undefined;
+  const zones = await listZones(token).then(
+    (found) => found,
+    (error: unknown) => {
+      if (!isCloudflareTokenRefusal(error)) throw error;
+      return [];
+    },
+  );
+  if (zones.some((zone) => zone.accountId === accountId)) return { token, zones };
+  activeStep()?.write('The Cloudflare token kept for setup no longer reaches its account; asking for a new one\n');
+  await forgetAccountToken(file);
+  return undefined;
 }

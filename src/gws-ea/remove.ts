@@ -97,7 +97,7 @@ import {
   type SharedCloudflareMetadata,
 } from './types.js';
 import { canonicalTimestamp, isRecord, requireDockerEndpoint, requirePath } from './validation.js';
-import { forgetAccountToken, isCloudflareTokenRefusal, readKeptAccountToken } from './cloudflare-token.js';
+import { usableKeptAccountToken } from './cloudflare-token.js';
 import type { CloudflareZoneChoice } from './create-input.js';
 
 /** Resources in teardown order; the registry entry is released after all of them. */
@@ -440,7 +440,6 @@ async function waitForTunnelConnectionsToClear(
   throw new GwsEaError('cloudflare_connections_active', 'Cloudflare tunnel still has active connector sessions');
 }
 
-/** The account token, proven against the exact reserved zone before anything changes. */
 /**
  * A Cloudflare client whose token lists zones in the reserved account, which
  * also proves it, account-owned tokens included: the token an unfinished
@@ -450,21 +449,14 @@ async function authorizedApi(
   claim: ManagedCloudflareIngressClaim,
   interaction: RemovalInteraction,
   createApi: (accountToken: string) => CloudflareApi,
-  keptToken: string,
+  keptTokenFile: string,
 ): Promise<{ readonly api: CloudflareApi; readonly zones: readonly CloudflareZoneChoice[] }> {
-  const kept = await readKeptAccountToken(keptToken);
-  if (kept !== undefined) {
-    const api = createApi(kept);
-    const zones = await api.listActiveZones().then(
-      (found) => found,
-      (error: unknown) => {
-        if (!isCloudflareTokenRefusal(error)) throw error;
-        return [];
-      },
-    );
-    if (zones.some((zone) => zone.accountId === claim.account_id)) return { api, zones };
-    await forgetAccountToken(keptToken);
-  }
+  let keptApi: CloudflareApi | undefined;
+  const kept = await usableKeptAccountToken(keptTokenFile, claim.account_id, (token) => {
+    keptApi = createApi(token);
+    return keptApi.listActiveZones();
+  });
+  if (kept && keptApi) return { api: keptApi, zones: kept.zones };
   const token = await interaction.requestCloudflareAccountToken({
     accountId: claim.account_id,
     reason: `Removing managed callback ${claim.callback_url} requires temporary Cloudflare authorization.`,
@@ -489,10 +481,10 @@ async function cloudflareAuthority(
   claim: ManagedCloudflareIngressClaim,
   interaction: RemovalInteraction,
   createApi: (accountToken: string) => CloudflareApi,
-  leaveDnsBehind: boolean,
-  keptToken: string,
+  options: { readonly leaveDnsBehind: boolean; readonly keptTokenFile: string },
 ): Promise<CloudflareAuthority> {
-  const { api, zones } = await authorizedApi(claim, interaction, createApi, keptToken);
+  const { leaveDnsBehind } = options;
+  const { api, zones } = await authorizedApi(claim, interaction, createApi, options.keptTokenFile);
   if (
     zones.some(
       (zone) =>
@@ -837,8 +829,10 @@ async function removeLocked(
       claim,
       interaction,
       dependencies.createCloudflareApi ?? ((accountToken) => createCloudflareApi({ accountToken })),
-      abandon.has('cloudflare-dns') || receipt.abandoned['cloudflare-dns'] !== undefined,
-      paths.keptCloudflareTokenFile(instanceId),
+      {
+        leaveDnsBehind: abandon.has('cloudflare-dns') || receipt.abandoned['cloudflare-dns'] !== undefined,
+        keptTokenFile: paths.keptCloudflareTokenFile(instanceId),
+      },
     );
   });
 

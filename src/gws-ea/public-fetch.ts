@@ -12,6 +12,8 @@ import { request as httpRequest, type IncomingHttpHeaders } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import type { LookupFunction } from 'node:net';
 
+import { errorCode } from '../community-portal/errors.js';
+
 const PUBLIC_RESOLVERS = ['1.1.1.1', '8.8.8.8'];
 const RESOLVER_TIMEOUT_MS = 3_000;
 /** Public DNS answered: the name has no address. */
@@ -25,10 +27,6 @@ export interface ResolvedAddress {
 /** Addresses for a hostname from public DNS; undefined when public DNS could not be reached. */
 export type PublicResolve = (hostname: string) => Promise<readonly ResolvedAddress[] | undefined>;
 
-function errnoCode(error: unknown): string | undefined {
-  return error instanceof Error && 'code' in error && typeof error.code === 'string' ? error.code : undefined;
-}
-
 /**
  * What public DNS said, from its A and AAAA answers: the addresses it gave,
  * none when it answered that the name has no address, or undefined when it
@@ -40,7 +38,7 @@ export function publicAnswer(
   const addresses = answers.flatMap((answer) => (answer.status === 'fulfilled' ? answer.value : []));
   if (addresses.length > 0) return addresses;
   const unanswered = answers.some(
-    (answer) => answer.status === 'rejected' && !NO_ADDRESS.has(errnoCode(answer.reason) ?? ''),
+    (answer) => answer.status === 'rejected' && !NO_ADDRESS.has(errorCode(answer.reason, '')),
   );
   return unanswered ? undefined : [];
 }
