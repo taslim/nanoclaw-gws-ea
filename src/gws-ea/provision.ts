@@ -71,6 +71,7 @@ import { readOwnerOnlyFile, readOwnerOnlyJson, removePrivateFile, writePrivateTe
 import { assertInstanceId, getInstanceReservation } from './registry.js';
 import { isErrno } from '../community-portal/errors.js';
 import { isRegularFile, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
+import { pollUntil } from './poll.js';
 import { findPortHolder, portInUseError } from './ports.js';
 import {
   GwsEaError,
@@ -926,20 +927,12 @@ export function createProductionProvisionSteps(
     return verificationInput ? dependencies.verifyConversation(verificationInput) : undefined;
   };
   /** Until the assistant has delivered what it owes, re-check rather than hand the person a pause. */
-  const awaitDelivery = async (
-    value: ProductionProvisionContext,
-  ): Promise<ConversationVerificationResult | undefined> => {
-    let result = await verifyConversation(value);
-    for (
-      let waited = 0;
-      result && !result.ready && DELIVERY_REASONS.has(result.reason) && waited < DELIVERY_WAIT_MS;
-      waited += DELIVERY_POLL_MS
-    ) {
-      await dependencies.sleep(DELIVERY_POLL_MS);
-      result = await verifyConversation(value);
-    }
-    return result;
-  };
+  const awaitDelivery = (value: ProductionProvisionContext): Promise<ConversationVerificationResult | undefined> =>
+    pollUntil(
+      () => verifyConversation(value),
+      (result) => !result || result.ready || !DELIVERY_REASONS.has(result.reason),
+      { intervalMs: DELIVERY_POLL_MS, limitMs: DELIVERY_WAIT_MS, sleep: dependencies.sleep },
+    );
   /** The principal's messages reach the assistant only through its host, and the connector when managed. */
   const principalPauseNeeds = ['start_nanoclaw', 'establish_transport'] as const;
 

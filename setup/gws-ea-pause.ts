@@ -9,6 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import type { PauseResponse } from '../src/gws-ea/events.js';
 import type { ProvisionHumanPause } from '../src/gws-ea/phases.js';
+import { pollUntil } from '../src/gws-ea/poll.js';
 
 const WATCH_INTERVAL_MS = 3_000;
 const WATCH_LIMIT_MS = 30 * 60_000;
@@ -34,7 +35,7 @@ interface PausePrompts {
 export interface PauseDependencies {
   readonly prompts?: PausePrompts;
   /** Waits between checks; resolves early when `signal` aborts. */
-  readonly sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  readonly sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
 }
 
 const defaultPrompts: PausePrompts = {
@@ -45,9 +46,9 @@ const defaultPrompts: PausePrompts = {
   isCancel: (value) => p.isCancel(value),
 };
 
-async function sleepUnlessAborted(milliseconds: number, signal: AbortSignal): Promise<void> {
+async function sleepUnlessAborted(milliseconds: number, signal?: AbortSignal): Promise<void> {
   await delay(milliseconds, undefined, { signal }).catch((error: unknown) => {
-    if (!signal.aborted) throw error;
+    if (!signal?.aborted) throw error;
   });
 }
 
@@ -85,16 +86,17 @@ export async function attendPause(
     return answer === true ? { kind: 'continue', decisions: { chatConfigured: true } } : STOP;
   }
 
-  if (pause.settled) {
+  const { settled } = pause;
+  if (settled) {
     prompts.note(shown, 'Waiting for you');
     prompts.info('Waiting: setup continues on its own once that happens. Press Ctrl-C to stop and resume later.');
-    for (let waited = 0; waited < WATCH_LIMIT_MS && !signal.aborted; waited += WATCH_INTERVAL_MS) {
-      // A check that cannot finish, as when Ctrl-C stops it, ends the wait; resuming checks again.
-      const settled = await pause.settled().catch(() => undefined);
-      if (settled === undefined || signal.aborted) return STOP;
-      if (settled) return { kind: 'continue' };
-      await sleep(WATCH_INTERVAL_MS, signal);
-    }
+    // A check that cannot finish, as when Ctrl-C stops it, ends the wait; resuming checks again.
+    const answer = await pollUntil(
+      () => settled().catch(() => undefined),
+      (now) => now !== false,
+      { intervalMs: WATCH_INTERVAL_MS, limitMs: WATCH_LIMIT_MS, sleep, signal },
+    );
+    if (answer === true && !signal.aborted) return { kind: 'continue' };
   }
   return STOP;
 }

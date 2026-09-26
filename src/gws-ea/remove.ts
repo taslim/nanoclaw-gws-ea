@@ -59,6 +59,7 @@ import { readProvisionJournal } from './journal.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { removeOnecliRuntime } from './onecli.js';
 import { CONTROL_PLANE_ROOT, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
+import { pollUntil } from './poll.js';
 import { probeRecordedDockerEndpoint, resolveDockerEndpoint } from './prerequisites.js';
 import {
   buildToolEnvironment,
@@ -432,11 +433,14 @@ async function waitForTunnelConnectionsToClear(
   tunnelId: string,
   sleep: (milliseconds: number) => Promise<void>,
 ): Promise<void> {
-  for (let attempt = 1; attempt <= CONNECTION_ATTEMPTS; attempt += 1) {
-    if ((await api.listTunnelConnections(accountId, tunnelId)).length === 0) return;
-    if (attempt < CONNECTION_ATTEMPTS) await sleep(CONNECTION_DELAY_MS);
+  const connections = await pollUntil(
+    () => api.listTunnelConnections(accountId, tunnelId),
+    (active) => active.length === 0,
+    { intervalMs: CONNECTION_DELAY_MS, limitMs: (CONNECTION_ATTEMPTS - 1) * CONNECTION_DELAY_MS, sleep },
+  );
+  if (connections.length > 0) {
+    throw new GwsEaError('cloudflare_connections_active', 'Cloudflare tunnel still has active connector sessions');
   }
-  throw new GwsEaError('cloudflare_connections_active', 'Cloudflare tunnel still has active connector sessions');
 }
 
 /**
@@ -674,13 +678,17 @@ async function uninstallNanoclaw(
   if (killed.outcome.exitCode !== 0 && killed.outcome.exitCode !== 1)
     throw commandExitError(killed.command, killed.outcome);
   // pkill only sends SIGTERM, so a stopping host gets a moment to exit before it counts as still running.
-  for (let check = 1; ; check += 1) {
-    const remaining = await execute('pgrep', ['-f', host], tools);
-    if (remaining.outcome.exitCode === 1) break;
-    if (remaining.outcome.exitCode !== 0) throw commandExitError(remaining.command, remaining.outcome);
-    if (check === HOST_EXIT_CHECKS) throw incomplete('The NanoClaw host process is still running');
-    await sleep(HOST_EXIT_POLL_MS);
-  }
+  const hostRunning = await pollUntil(
+    async () => {
+      const remaining = await execute('pgrep', ['-f', host], tools);
+      if (remaining.outcome.exitCode === 1) return false;
+      if (remaining.outcome.exitCode !== 0) throw commandExitError(remaining.command, remaining.outcome);
+      return true;
+    },
+    (running) => !running,
+    { intervalMs: HOST_EXIT_POLL_MS, limitMs: (HOST_EXIT_CHECKS - 1) * HOST_EXIT_POLL_MS, sleep },
+  );
+  if (hostRunning) throw incomplete('The NanoClaw host process is still running');
 
   const { installLabel, imageTag } = coordinates(false);
   const containers = async (): Promise<string[]> =>

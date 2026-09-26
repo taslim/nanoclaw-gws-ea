@@ -233,10 +233,31 @@ describe('GWS-EA guided prerequisites', () => {
     expect(prompts.confirm).toHaveBeenCalledWith(expect.objectContaining({ message: 'Start Docker Desktop now?' }));
     expect(runCommand).toHaveBeenCalledWith(expect.objectContaining({ command: 'open', args: ['-a', 'Docker'] }));
     expect(dockerAnswers).toHaveBeenCalledWith(ENDPOINT);
-    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledOnce();
     expect(prompts.note).toHaveBeenCalledOnce();
     expect(prompts.note).toHaveBeenCalledWith('Waiting up to 90 seconds for Docker to start…', 'Docker');
     expect(check).toHaveBeenCalledTimes(2);
+  });
+
+  it('lets a stopped Docker stand once it never answers within the guided waits', async () => {
+    const stopped = stoppedDocker();
+    const check = vi.fn(async (): Promise<Prerequisites> => {
+      throw stopped;
+    });
+    const sleep = vi.fn(async () => undefined);
+
+    await expect(
+      ensurePrerequisites(REQUEST, terminal().interaction, {
+        check,
+        prompts: promptFixture(),
+        platform: 'linux',
+        dockerAnswers: async () => false,
+        sleep,
+      }),
+    ).rejects.toBe(stopped);
+    expect(check).toHaveBeenCalledTimes(4);
+    // Each of the three guided rounds waits 90 seconds in 2-second polls, then gives up.
+    expect(sleep).toHaveBeenCalledTimes(3 * 45);
   });
 
   it('says why starting Docker failed, then shows the manual step', async () => {

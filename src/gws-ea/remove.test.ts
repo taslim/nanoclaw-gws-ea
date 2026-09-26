@@ -1137,6 +1137,32 @@ describe('removal safety', () => {
     },
   );
 
+  it('stops before deleting a retiring tunnel whose connector sessions never clear', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(paths, { managed: true }), {
+      started: ['materialize_checkout', 'establish_transport'],
+    });
+    await recordTunnel(paths);
+    await mkdir(paths.cloudflareRoot, { recursive: true, mode: 0o700 });
+    const { dependencies, cloudflare } = world(input);
+    const tunnel = { id: TUNNEL_ID, name: await tunnelName(paths) };
+    cloudflare.tunnels = [tunnel];
+    cloudflare.config = { ingress: [route(input), CATCH_ALL] };
+    const connections = vi.fn(async () => [{ id: 'connector-session' }]);
+    const sleep = vi.fn(async () => undefined);
+
+    await expect(
+      removeAssistant(paths, input.instance_id, {
+        ...dependencies,
+        createCloudflareApi: () => ({ ...cloudflare.api(), listTunnelConnections: connections }),
+        sleep,
+      }),
+    ).rejects.toMatchObject({ code: 'cloudflare_connections_active' });
+    expect(connections).toHaveBeenCalledTimes(30);
+    expect(sleep).toHaveBeenCalledTimes(29);
+    expect(cloudflare.tunnels).toEqual([tunnel]);
+  });
+
   it('waits for a stray NanoClaw host it stopped to exit, and names one that never does', async () => {
     for (const exitsAfter of [2, Infinity]) {
       const paths = await testPaths();

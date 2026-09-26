@@ -11,6 +11,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { Interaction } from '../src/gws-ea/events.js';
 import { GCLOUD_INSTALL_URL } from '../src/gws-ea/gcloud.js';
 import { CONTROL_PLANE_ROOT } from '../src/gws-ea/paths.js';
+import { pollUntil } from '../src/gws-ea/poll.js';
 import {
   checkPrerequisites,
   dockerAnswers,
@@ -189,10 +190,11 @@ async function waitForDocker(
 ): Promise<void> {
   if (await answers(endpoint)) return;
   prompts.note(`Waiting up to ${DOCKER_START_WAIT_MS / 1000} seconds for Docker to start…`, 'Docker');
-  for (let waited = 0; waited < DOCKER_START_WAIT_MS; waited += DOCKER_POLL_MS) {
-    await sleep(DOCKER_POLL_MS);
-    if (await answers(endpoint)) return;
-  }
+  await pollUntil(
+    () => answers(endpoint),
+    (up) => up,
+    { intervalMs: DOCKER_POLL_MS, limitMs: DOCKER_START_WAIT_MS, sleep },
+  );
 }
 
 function fixFor(error: GwsEaError, dependencies: GuidedPrerequisiteDependencies): Fix | undefined {
