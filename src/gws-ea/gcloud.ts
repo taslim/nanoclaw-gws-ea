@@ -596,7 +596,11 @@ async function createKey(context: GcpStepContext, dependencies: GcloudDependenci
 }
 
 /** Delete every user-managed key of the Chat account, once it is confirmed to be this assistant's. */
-async function deleteUserManagedKeys(gcloud: Gcloud, gcp: GcpProjectInput): Promise<void> {
+async function deleteUserManagedKeys(
+  gcloud: Gcloud,
+  gcp: GcpProjectInput,
+  dependencies: GcloudDependencies,
+): Promise<void> {
   const account = await readServiceAccount(gcloud, gcp);
   if ('failed' in account) {
     throw gcloudFailed(`Google Cloud could not list service account ${gcp.serviceAccountEmail}`, account.failed);
@@ -605,7 +609,15 @@ async function deleteUserManagedKeys(gcloud: Gcloud, gcp: GcpProjectInput): Prom
     throw new GwsEaError('gcp_service_account_missing', `Service account ${gcp.serviceAccountEmail} is not listed`);
   }
   assertOwnedServiceAccount(gcp, account.value);
-  const keys = await readUserManagedKeys(gcloud, gcp);
+  // Google lists a service account it created moments ago before its keys can be read: until then,
+  // listing them answers NOT_FOUND.
+  let keys = await readUserManagedKeys(gcloud, gcp);
+  for (const seconds of OBSERVATION_WAITS_SECONDS) {
+    if (!('failed' in keys) || !/\bNOT_FOUND\b/u.test(keys.failed.outcome.stderr)) break;
+    dependencies.onWait?.('Waiting for Google Cloud to make the new service account usable…');
+    await (dependencies.sleep ?? delay)(seconds * 1_000);
+    keys = await readUserManagedKeys(gcloud, gcp);
+  }
   if ('failed' in keys) {
     throw gcloudFailed(`Google Cloud could not list the keys of ${gcp.serviceAccountEmail}`, keys.failed);
   }
@@ -637,7 +649,7 @@ async function replaceKey(context: GcpStepContext, dependencies: GcloudDependenc
   let staged = await readKeyFile(staging, gcp);
   if (staged.status !== 'valid') {
     await rm(staging, { force: true });
-    await deleteUserManagedKeys(gcloudFor(gcp, dependencies), gcp);
+    await deleteUserManagedKeys(gcloudFor(gcp, dependencies), gcp, dependencies);
     await preparePrivateDirectory(path.dirname(gcp.credentialFile));
     const pause = await createKey(context, dependencies);
     if (pause) return pause;

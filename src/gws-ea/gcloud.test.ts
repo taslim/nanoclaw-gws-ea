@@ -147,6 +147,8 @@ class FakeGoogleCloud {
   serviceAccount: { displayName: string; description: string } | undefined;
   /** Lists that still omit the Chat service account after it was created. */
   unlistedServiceAccountReads = 0;
+  /** Key lists that still answer NOT_FOUND after the Chat service account was created. */
+  unresolvedKeyReads = 0;
   readonly userKeys = new Set<string>();
   /** Key-creation constraints the organization enforces. */
   readonly orgEnforced = new Set<string>();
@@ -288,7 +290,8 @@ class FakeGoogleCloud {
 
   #listKeys(): SanitizedCommandOutcome {
     const { projectId, serviceAccountEmail } = this.gcp;
-    if (!this.serviceAccount) {
+    if (!this.serviceAccount || this.unresolvedKeyReads > 0) {
+      if (this.serviceAccount) this.unresolvedKeyReads -= 1;
       return failed(
         `ERROR: (gcloud.iam.service-accounts.keys.list) NOT_FOUND: Service account projects/${projectId}/serviceAccounts/${serviceAccountEmail} does not exist.`,
       );
@@ -704,6 +707,31 @@ describe('Google Cloud setup through the step engine', () => {
     const keyId = await publishedKeyId(setup.gcp);
     expect(setup.cloud.mutations).toEqual(['keys delete orphan', `keys create ${keyId}`]);
     expect(setup.cloud.userKeys).toEqual(new Set([keyId]));
+  });
+
+  it('waits for a service account Google just created to become usable before replacing its keys', async () => {
+    const setup = await harness();
+    setup.cloud.ready().userKeys.add('orphan');
+    setup.cloud.unresolvedKeyReads = 2;
+
+    await expect(setup.run()).resolves.toEqual({ status: 'ready' });
+
+    expect(setup.sleeps).toEqual(FULL_WAIT.slice(0, 2));
+    expect(setup.cloud.mutations).toEqual(['keys delete orphan', `keys create ${await publishedKeyId(setup.gcp)}`]);
+  });
+
+  it('stops naming the listing when Google never makes the service account usable', async () => {
+    const setup = await harness();
+    setup.cloud.ready();
+    setup.cloud.unresolvedKeyReads = 99;
+
+    await expect(setup.run()).rejects.toMatchObject({
+      code: 'gcloud_failed',
+      message: expect.stringContaining(`could not list the keys of ${setup.gcp.serviceAccountEmail}`),
+      details: { stderrTail: expect.stringContaining('NOT_FOUND') },
+    });
+    expect(setup.sleeps).toEqual(FULL_WAIT);
+    expect(setup.cloud.mutations).toEqual([]);
   });
 
   it('replaces a valid local credential whose key Google no longer lists', async () => {
