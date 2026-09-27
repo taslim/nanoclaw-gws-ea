@@ -23,6 +23,17 @@ describe('polling until an answer holds', () => {
     expect(sleep).toHaveBeenCalledTimes(3);
   });
 
+  it('doubles the interval up to its maximum, counting each sleep toward the limit', async () => {
+    const sleep = vi.fn(async (_milliseconds: number) => undefined);
+
+    await pollUntil(
+      async () => false,
+      () => false,
+      { intervalMs: 1, maxIntervalMs: 30, limitMs: 100, sleep },
+    );
+    expect(sleep.mock.calls.map(([milliseconds]) => milliseconds)).toEqual([1, 2, 4, 8, 16, 30, 30, 30]);
+  });
+
   it('hands the signal to each sleep and probes no more once it aborts', async () => {
     const waiting = new AbortController();
     const probe = vi.fn(async () => false);
