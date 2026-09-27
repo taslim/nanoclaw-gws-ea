@@ -707,6 +707,42 @@ describe('managed Cloudflare reconciliation', () => {
     ).rejects.toMatchObject({ code: 'removal_in_progress' });
   });
 
+  it('keeps an older peer and B when A leaves a three-assistant route set', async () => {
+    const paths = await testPaths();
+    const older = managedReservation(paths, 'older.example.com', 31_100);
+    const first = managedReservation(paths, 'first.example.com', 31_200);
+    const second = managedReservation(paths, 'second.example.com', 31_300);
+    for (const input of [older, first, second]) await reserveInstance(paths, input);
+    const cloud = new FakeCloudflare();
+    const connector = createCloudflareConnectorLayout({ cloudflareRoot: paths.cloudflareRoot, platform: 'linux' });
+    const reconcile = (instanceId: string) =>
+      reconcileManagedCloudflareIngress(paths, cloud.api(), { instanceId, originHost: '127.0.0.1', connector });
+
+    await reconcile(older.instance_id);
+    await reconcile(first.instance_id);
+    expect(cloud.configuration.config?.ingress).toEqual([
+      { hostname: 'first.example.com', path: '^/webhook/gchat$', service: 'http://127.0.0.1:31200' },
+      { hostname: 'older.example.com', path: '^/webhook/gchat$', service: 'http://127.0.0.1:31100' },
+      { hostname: 'second.example.com', path: '^/webhook/gchat$', service: 'http://127.0.0.1:31300' },
+      { service: 'http_status:404' },
+    ]);
+    const olderRecord = cloud.records.find((record) => record.name === 'older.example.com');
+    expect(olderRecord).toBeDefined();
+    const tunnelId = (await readRegistry(paths)).shared_infrastructure_metadata.cloudflare?.tunnel_id;
+
+    await preparePrivateDirectory(paths.removalRoot);
+    await writePrivate(paths.removalFile(first.instance_id), { active: true });
+    await reconcile(second.instance_id);
+
+    expect(cloud.configuration.config?.ingress).toEqual([
+      { hostname: 'older.example.com', path: '^/webhook/gchat$', service: 'http://127.0.0.1:31100' },
+      { hostname: 'second.example.com', path: '^/webhook/gchat$', service: 'http://127.0.0.1:31300' },
+      { service: 'http_status:404' },
+    ]);
+    expect(cloud.records.find((record) => record.name === 'older.example.com')).toEqual(olderRecord);
+    expect((await readRegistry(paths)).shared_infrastructure_metadata.cloudflare?.tunnel_id).toBe(tunnelId);
+  });
+
   it.each(['foreign-config', 'foreign-dns'] as const)('refuses %s before changing anything', async (kind) => {
     const paths = await testPaths();
     const input = managedReservation(paths, 'assistant.example.com', 31_100);
