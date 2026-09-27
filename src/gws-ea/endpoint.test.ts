@@ -109,6 +109,38 @@ describe('managed Google Chat route observation', () => {
     expect(requests).toEqual([localEndpoint, ENDPOINT, wrongPath]);
   });
 
+  it('keeps two unsigned callback probes tied to distinct listeners', async () => {
+    const secondEndpoint = 'https://assistant-b.example.com/webhook/gchat';
+    const secondLocalEndpoint = 'http://127.0.0.1:31002/webhook/gchat';
+    const secondListenerId = '22222222-2222-4222-8222-222222222222';
+    const requests: Array<{ url: string; authorization: string | null }> = [];
+    const fetch = vi.fn<typeof globalThis.fetch>(async (url, init) => {
+      const requestUrl = String(url);
+      requests.push({ url: requestUrl, authorization: new Headers(init?.headers).get('authorization') });
+      if (requestUrl.endsWith('/__gws_ea_wrong_path__')) return new Response(null, { status: 404 });
+      const id = requestUrl === ENDPOINT || requestUrl === localEndpoint ? listenerId : secondListenerId;
+      return nanoclaw(id);
+    });
+
+    const a = await observeManagedGchatRoute({ endpointUrl: ENDPOINT, localEndpointUrl: localEndpoint }, { fetch });
+    const b = await observeManagedGchatRoute(
+      { endpointUrl: secondEndpoint, localEndpointUrl: secondLocalEndpoint },
+      { fetch },
+    );
+
+    expect(a).toEqual({ status: 'routed', listenerId });
+    expect(b).toEqual({ status: 'routed', listenerId: secondListenerId });
+    expect(requests.map(({ url }) => url)).toEqual([
+      localEndpoint,
+      ENDPOINT,
+      wrongPath,
+      secondLocalEndpoint,
+      secondEndpoint,
+      'https://assistant-b.example.com/__gws_ea_wrong_path__',
+    ]);
+    expect(requests.every(({ authorization }) => authorization === null)).toBe(true);
+  });
+
   it.each([502, 521, 530])('reports an edge %s as the tunnel or the assistant being down', async (status) => {
     await expect(observe((url) => (url === localEndpoint ? nanoclaw() : cloudflareError(status)))).resolves.toEqual({
       status: 'down',
