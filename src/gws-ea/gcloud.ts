@@ -22,14 +22,8 @@ import {
 } from './gcp-identity.js';
 import { readProvisionJournal, recordKeyPolicyLifted, type InstanceOperation } from './journal.js';
 import { CONTROL_PLANE_ROOT, preparePrivateDirectory } from './paths.js';
-import {
-  ABSENT,
-  OBSERVATION_WAITS_SECONDS,
-  PRESENT,
-  type Observation,
-  type ProvisionHumanPause,
-  type StepResource,
-} from './phases.js';
+import { ABSENT, PRESENT, type Observation, type ProvisionHumanPause, type StepResource } from './phases.js';
+import { pollUntil } from './poll.js';
 import {
   buildToolEnvironment,
   commandExitError,
@@ -56,6 +50,15 @@ const KEY_CREATION_CONSTRAINTS = [
   'iam.disableServiceAccountKeyCreation',
   'iam.managed.disableServiceAccountKeyCreation',
 ] as const;
+/**
+ * Google gives no maximum for a new service account, or a key just created,
+ * to become usable ("you might need to wait for 60 seconds or more"), so the
+ * wait ends at its figure for IAM changes: "typically 2 minutes, potentially
+ * 7 minutes or longer".
+ */
+const IAM_SETTLES_MS = 7 * 60_000;
+/** Google: organization policy changes "can take up to 15 minutes to be fully enforced". */
+const ORG_POLICY_SETTLES_MS = 15 * 60_000;
 const POLICY_ADMIN_ROLE = 'roles/orgpolicy.policyAdmin';
 const SERVICE_ACCOUNT_DISPLAY_NAME = 'GWS-EA Google Chat';
 const ACCOUNT_PATTERN = /^[^\s@]+@[^\s@]+$/u;
@@ -112,7 +115,7 @@ export type GcloudCommandRunner = SanitizedCommandOutcomeRunner;
 
 export interface GcloudDependencies {
   readonly runCommand?: GcloudCommandRunner;
-  /** Waits between key-creation attempts while Google applies a lifted policy. */
+  /** Waits between retries while Google makes a change usable. */
   readonly sleep?: (milliseconds: number) => Promise<void>;
   /** Reports such a wait. */
   readonly onWait?: (reason: string) => void;
@@ -540,9 +543,47 @@ async function restoreKeyCreationPolicy(context: GcpStepContext, dependencies: G
 }
 
 /**
- * Create a key into the staging file. When policy blocks creation, record the
- * lift in the journal, lift the policy on the dedicated project, retry while
- * Google applies the change, and restore the policy before returning.
+ * Retry `attempt` while its answer is `pending`, backing off from 1 s to
+ * 30 s as Google's retry guidance asks, for at most `limitMs`. Each wait is
+ * reported with `reason`; the last answer is returned for the caller to judge.
+ */
+function retryWhile<T>(
+  attempt: () => Promise<T>,
+  pending: (answer: T) => boolean,
+  limitMs: number,
+  reason: string,
+  dependencies: GcloudDependencies,
+): Promise<T> {
+  const sleep = dependencies.sleep ?? delay;
+  return pollUntil(attempt, (answer) => !pending(answer), {
+    intervalMs: 1_000,
+    maxIntervalMs: 30_000,
+    limitMs,
+    sleep: (milliseconds) => {
+      dependencies.onWait?.(reason);
+      return sleep(milliseconds);
+    },
+  });
+}
+
+function minutes(milliseconds: number): string {
+  return `${milliseconds / 60_000} minutes`;
+}
+
+/** A stop says when it leaves the key-creation policy lifted, so an operator who walks away knows. */
+async function keptLift({ operation, input }: GcpStepContext): Promise<string> {
+  const { key_policy_lifted } = await readProvisionJournal(operation.paths, operation.instanceId);
+  return key_policy_lifted
+    ? `; the key-creation policy on project ${input.gcp.projectId} stays lifted until the key exists, and gws-ea remove restores it`
+    : '';
+}
+
+/**
+ * Create a key into the staging file. When the key-creation policy blocks it,
+ * record the lift in the journal, lift the policy on the dedicated project,
+ * and retry while Google applies the change. The lift stays until the key
+ * exists, since restoring it early restarts Google's clock; a later run that
+ * is refused again lifts again, which sets the value it already has.
  */
 async function createKey(context: GcpStepContext, dependencies: GcloudDependencies): Promise<Pause> {
   const gcp = context.input.gcp;
@@ -563,44 +604,38 @@ async function createKey(context: GcpStepContext, dependencies: GcloudDependenci
     if (!succeeded(created)) await rm(staging, { force: true });
     return created;
   };
+  /** Refused by one of the key-creation constraints, which Google names in its answer. */
   const blocked = (attempt: Ran): boolean =>
-    !succeeded(attempt) && classifyGcloudFailure(attempt.outcome) === 'precondition';
+    !succeeded(attempt) &&
+    classifyGcloudFailure(attempt.outcome) === 'precondition' &&
+    KEY_CREATION_CONSTRAINTS.some((constraint) => attempt.outcome.stderr.includes(`constraints/${constraint}`));
 
   let created = await create();
   if (blocked(created)) {
     await recordKeyPolicyLifted(context.operation, true);
     const denied = await changeKeyCreationPolicy(gcp, false, dependencies);
     if (denied) return denied;
-    const sleep = dependencies.sleep ?? delay;
-    let restored: Pause;
-    try {
-      created = await create();
-      for (const seconds of OBSERVATION_WAITS_SECONDS) {
-        if (!blocked(created)) break;
-        dependencies.onWait?.('Waiting for Google Cloud to allow Google Chat key creation…');
-        await sleep(seconds * 1_000);
-        created = await create();
-      }
-    } finally {
-      restored = await restoreKeyCreationPolicy(context, dependencies);
-    }
-    if (restored) return restored;
+    created = await retryWhile(
+      create,
+      blocked,
+      ORG_POLICY_SETTLES_MS,
+      'Waiting for Google Cloud to allow Google Chat key creation…',
+      dependencies,
+    );
   }
   if (!succeeded(created)) {
     const message = blocked(created)
-      ? `Google Cloud still refused key creation on project ${gcp.projectId} after its policy was lifted; resume to retry`
+      ? `Google Cloud still refused key creation on project ${gcp.projectId} ${minutes(ORG_POLICY_SETTLES_MS)} after its policy was lifted, longer than Google documents`
       : `Google Cloud could not create a key for ${gcp.serviceAccountEmail}`;
-    throw gcloudFailed(message, created);
+    throw gcloudFailed(`${message}${await keptLift(context)}`, created);
   }
   return undefined;
 }
 
 /** Delete every user-managed key of the Chat account, once it is confirmed to be this assistant's. */
-async function deleteUserManagedKeys(
-  gcloud: Gcloud,
-  gcp: GcpProjectInput,
-  dependencies: GcloudDependencies,
-): Promise<void> {
+async function deleteUserManagedKeys(context: GcpStepContext, dependencies: GcloudDependencies): Promise<void> {
+  const gcp = context.input.gcp;
+  const gcloud = gcloudFor(gcp, dependencies);
   const account = await readServiceAccount(gcloud, gcp);
   if ('failed' in account) {
     throw gcloudFailed(`Google Cloud could not list service account ${gcp.serviceAccountEmail}`, account.failed);
@@ -611,15 +646,21 @@ async function deleteUserManagedKeys(
   assertOwnedServiceAccount(gcp, account.value);
   // Google lists a service account it created moments ago before its keys can be read: until then,
   // listing them answers NOT_FOUND.
-  let keys = await readUserManagedKeys(gcloud, gcp);
-  for (const seconds of OBSERVATION_WAITS_SECONDS) {
-    if (!('failed' in keys) || !/\bNOT_FOUND\b/u.test(keys.failed.outcome.stderr)) break;
-    dependencies.onWait?.('Waiting for Google Cloud to make the new service account usable…');
-    await (dependencies.sleep ?? delay)(seconds * 1_000);
-    keys = await readUserManagedKeys(gcloud, gcp);
-  }
+  const notYetUsable = (read: Read<readonly string[]>): boolean =>
+    'failed' in read && /\bNOT_FOUND\b/u.test(read.failed.outcome.stderr);
+  const keys = await retryWhile(
+    () => readUserManagedKeys(gcloud, gcp),
+    notYetUsable,
+    IAM_SETTLES_MS,
+    'Waiting for Google Cloud to make the new service account usable…',
+    dependencies,
+  );
   if ('failed' in keys) {
-    throw gcloudFailed(`Google Cloud could not list the keys of ${gcp.serviceAccountEmail}`, keys.failed);
+    const within = notYetUsable(keys) ? ` within ${minutes(IAM_SETTLES_MS)}` : '';
+    throw gcloudFailed(
+      `Google Cloud could not list the keys of ${gcp.serviceAccountEmail}${within}${await keptLift(context)}`,
+      keys.failed,
+    );
   }
   for (const key of keys.value) {
     const deleted = await gcloud([
@@ -641,7 +682,8 @@ async function deleteUserManagedKeys(
  * Keys converge by replacement. A key staged before an interruption is
  * published without creating another; otherwise this assistant's keys are
  * deleted and a new one is created to the staging file, validated, and
- * published atomically.
+ * published atomically once Google lists it, so a slow listing cannot lead
+ * the next run to create a second key while the first stays valid.
  */
 async function replaceKey(context: GcpStepContext, dependencies: GcloudDependencies): Promise<Pause> {
   const gcp = context.input.gcp;
@@ -649,7 +691,7 @@ async function replaceKey(context: GcpStepContext, dependencies: GcloudDependenc
   let staged = await readKeyFile(staging, gcp);
   if (staged.status !== 'valid') {
     await rm(staging, { force: true });
-    await deleteUserManagedKeys(gcloudFor(gcp, dependencies), gcp, dependencies);
+    await deleteUserManagedKeys(context, dependencies);
     await preparePrivateDirectory(path.dirname(gcp.credentialFile));
     const pause = await createKey(context, dependencies);
     if (pause) return pause;
@@ -659,6 +701,23 @@ async function replaceKey(context: GcpStepContext, dependencies: GcloudDependenc
       const problem = staged.status === 'unusable' ? staged.problem : 'no key file was written';
       throw new GwsEaError(INVALID_CREDENTIAL, `Google Cloud created an unusable Google Chat key: ${problem}`);
     }
+    const { keyId } = staged;
+    const listed = await retryWhile(
+      () => readUserManagedKeys(gcloudFor(gcp, dependencies), gcp),
+      (read) => !('failed' in read) && !read.value.includes(keyId),
+      IAM_SETTLES_MS,
+      'Waiting for Google Cloud to list the new Google Chat key…',
+      dependencies,
+    );
+    if ('failed' in listed) {
+      throw gcloudFailed(`Google Cloud could not list the keys of ${gcp.serviceAccountEmail}`, listed.failed);
+    }
+    if (!listed.value.includes(keyId)) {
+      throw new GwsEaError(
+        'gcp_key_unlisted',
+        `Google Cloud did not list the new key ${keyId} of ${gcp.serviceAccountEmail} within ${minutes(IAM_SETTLES_MS)}; resume to publish it${await keptLift(context)}`,
+      );
+    }
   }
   await writePrivateTextFile(gcp.credentialFile, staged.contents);
   await removePrivateFile(staging);
@@ -666,19 +725,14 @@ async function replaceKey(context: GcpStepContext, dependencies: GcloudDependenc
 }
 
 /**
- * `provision_gcp`'s resources, in order. A policy lift left by an
- * interrupted run is restored before anything else; the project is the one
- * resource created on an unknown observation, under the instance's own ID.
+ * `provision_gcp`'s resources, in order. The project is the one resource
+ * created on an unknown observation, under the instance's own ID. A lifted
+ * key-creation policy is restored last, once the key exists, including a lift
+ * an interrupted run left behind.
  */
 export function googleCloudResources(dependencies: GcloudDependencies = {}): readonly StepResource<GcpStepContext>[] {
   const gcloud = (context: GcpStepContext): Gcloud => gcloudFor(context.input.gcp, dependencies);
   return [
-    {
-      name: 'the Google Chat key-creation policy',
-      observe: async ({ operation }) =>
-        (await readProvisionJournal(operation.paths, operation.instanceId)).key_policy_lifted ? ABSENT : PRESENT,
-      apply: (context) => restoreKeyCreationPolicy(context, dependencies),
-    },
     {
       name: 'the Google Cloud project',
       unknown: 'create-by-unique-id',
@@ -778,6 +832,12 @@ export function googleCloudResources(dependencies: GcloudDependencies = {}): rea
         return keys.value.includes(local.keyId) ? PRESENT : ABSENT;
       },
       apply: (context) => replaceKey(context, dependencies),
+    },
+    {
+      name: 'the Google Chat key-creation policy',
+      observe: async ({ operation }) =>
+        (await readProvisionJournal(operation.paths, operation.instanceId)).key_policy_lifted ? ABSENT : PRESENT,
+      apply: (context) => restoreKeyCreationPolicy(context, dependencies),
     },
   ];
 }
