@@ -765,6 +765,22 @@ describe('Google Cloud setup through the step engine', () => {
     });
   });
 
+  it('keeps waiting for a new key through a listing that answers NOT_FOUND, then publishes it once', async () => {
+    const setup = await harness();
+    setup.cloud.ready();
+    const runCommand: GcloudCommandRunner = async (command) => {
+      const outcome = await setup.cloud.run(command);
+      // Google's reads can lag again right after one answered.
+      if (command.args.slice(0, 4).join(' ') === 'iam service-accounts keys create') setup.cloud.unresolvedKeyReads = 1;
+      return outcome;
+    };
+
+    await expect(setup.run(runCommand)).resolves.toEqual({ status: 'ready' });
+
+    expect(setup.cloud.mutations).toEqual([`keys create ${await publishedKeyId(setup.gcp)}`]);
+    expect(setup.sleeps).toEqual([1_000]);
+  });
+
   it('keeps an unlisted new key staged after 7 minutes, and publishes it on the next run without another', async () => {
     const setup = await harness();
     setup.cloud.ready().unlistedNewKeyReads = 999;

@@ -405,6 +405,15 @@ function assertOwnedServiceAccount(gcp: GcpProjectInput, account: Readonly<Recor
   }
 }
 
+/**
+ * Google lists a service account it created moments ago before every read
+ * can see it: until then, listing its keys answers NOT_FOUND, even right
+ * after a listing that answered.
+ */
+function notYetUsable(read: Read<readonly string[]>): boolean {
+  return 'failed' in read && /\bNOT_FOUND\b/u.test(read.failed.outcome.stderr);
+}
+
 /** The IDs of the Chat account's user-managed keys; an empty list is conclusive. */
 async function readUserManagedKeys(gcloud: Gcloud, gcp: GcpProjectInput): Promise<Read<readonly string[]>> {
   const listed = await gcloud([
@@ -644,10 +653,6 @@ async function deleteUserManagedKeys(context: GcpStepContext, dependencies: Gclo
     throw new GwsEaError('gcp_service_account_missing', `Service account ${gcp.serviceAccountEmail} is not listed`);
   }
   assertOwnedServiceAccount(gcp, account.value);
-  // Google lists a service account it created moments ago before its keys can be read: until then,
-  // listing them answers NOT_FOUND.
-  const notYetUsable = (read: Read<readonly string[]>): boolean =>
-    'failed' in read && /\bNOT_FOUND\b/u.test(read.failed.outcome.stderr);
   const keys = await retryWhile(
     () => readUserManagedKeys(gcloud, gcp),
     notYetUsable,
@@ -704,7 +709,7 @@ async function replaceKey(context: GcpStepContext, dependencies: GcloudDependenc
     const { keyId } = staged;
     const listed = await retryWhile(
       () => readUserManagedKeys(gcloudFor(gcp, dependencies), gcp),
-      (read) => !('failed' in read) && !read.value.includes(keyId),
+      (read) => ('failed' in read ? notYetUsable(read) : !read.value.includes(keyId)),
       IAM_SETTLES_MS,
       'Waiting for Google Cloud to list the new Google Chat key…',
       dependencies,
