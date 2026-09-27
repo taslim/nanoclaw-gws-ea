@@ -31,6 +31,14 @@ import {
   type OnecliPins,
   type OnecliRuntimeLayout,
 } from './onecli-compose.js';
+import {
+  ONECLI_WRAPPER_BASE_ARG,
+  ONECLI_WRAPPER_HASH_ARG,
+  ONECLI_WRAPPER_LABEL,
+  computeWrapperImageHash,
+  wrapperImageSourceDir,
+  wrapperImageTag,
+} from './onecli-gateway-image.js';
 import { ONECLI_SDK_VERSION } from './pins.js';
 import { GwsEaError } from './types.js';
 import {
@@ -51,6 +59,8 @@ const EXPECTED_SERVICES = ['postgres', 'app', 'gateway'] as const;
 
 /** Pulling runs on its own clock: a slow registry never eats into the health wait. */
 const ONECLI_PULL_TIMEOUT_MS = 20 * 60_000;
+/** Building the wrapper gateway image (base already local; only the small firewall layer is added). */
+const ONECLI_BUILD_TIMEOUT_MS = 10 * 60_000;
 /** `up --wait` itself waits `ONECLI_WAIT_TIMEOUT_SECONDS`; the margin covers creating the containers. */
 const UP_TIMEOUT_MS = (ONECLI_WAIT_TIMEOUT_SECONDS + 120) * 1_000;
 const INSPECT_TIMEOUT_MS = 30_000;
@@ -191,7 +201,11 @@ function buildComposeEnvironment(
   return environment;
 }
 
-async function prepareOnecliRuntime(layout: OnecliRuntimeLayout, pins: OnecliPins): Promise<void> {
+async function prepareOnecliRuntime(
+  layout: OnecliRuntimeLayout,
+  pins: OnecliPins,
+  gatewayImage: string,
+): Promise<void> {
   await preparePrivateDirectory(layout.rootDirectory);
   await Promise.all([preparePrivateDirectory(layout.cliHome), preparePrivateDirectory(layout.secretsDirectory)]);
 
@@ -200,14 +214,60 @@ async function prepareOnecliRuntime(layout: OnecliRuntimeLayout, pins: OnecliPin
     ensureRandomOwnerOnlyFile(layout.encryptionKeyFile, 'base64'),
     ensureRandomOwnerOnlyFile(layout.gatewayInternalSecretFile, 'base64url'),
   ]);
-  await writePrivateTextFile(layout.composeFile, renderOnecliCompose(layout, pins));
+  await writePrivateTextFile(layout.composeFile, renderOnecliCompose(layout, pins, gatewayImage));
   await writePrivateTextFile(layout.envFile, '# Intentionally empty: runtime coordinates are passed explicitly.\n');
+}
+
+/**
+ * Build the content-addressed wrapper gateway image if it is not already present.
+ * The tag encodes the build-context content hash, so an unchanged wrapper reuses
+ * the shared image and any firewall change yields a new tag that rebuilds here and
+ * fails identity verification until rebuilt (KTD5/KTD6). The base is already local
+ * (pulled for the app service), so only the small firewall layer is built.
+ */
+async function ensureWrapperGatewayImage(
+  docker: OnecliDocker,
+  pins: OnecliPins,
+  gatewayImage: string,
+  wrapperHash: string,
+): Promise<void> {
+  const { runner, environment, layout } = docker;
+  // `image ls -q` exits 0 whether or not the tag exists (empty stdout when absent),
+  // so a present image is a clean skip without catching a lookup failure.
+  const present = await runner({
+    command: 'docker',
+    args: ['image', 'ls', '--quiet', gatewayImage],
+    cwd: layout.rootDirectory,
+    env: environment,
+    timeoutMs: INSPECT_TIMEOUT_MS,
+  });
+  if (present.stdout.trim().length > 0) return;
+  await runner({
+    command: 'docker',
+    args: [
+      'build',
+      '--build-arg',
+      `${ONECLI_WRAPPER_BASE_ARG}=${onecliGatewayImage(pins)}`,
+      '--build-arg',
+      `${ONECLI_WRAPPER_HASH_ARG}=${wrapperHash}`,
+      '--label',
+      `${ONECLI_WRAPPER_LABEL}=${wrapperHash}`,
+      '--tag',
+      gatewayImage,
+      wrapperImageSourceDir(),
+    ],
+    cwd: layout.rootDirectory,
+    env: environment,
+    timeoutMs: ONECLI_BUILD_TIMEOUT_MS,
+    stream: true,
+  });
 }
 
 function validateObservedOnecliRuntime(
   layout: OnecliRuntimeLayout,
   pins: OnecliPins,
   observed: ObservedOnecliRuntime,
+  gatewayImage: string,
 ): void {
   for (const container of observed.containers) {
     const expectedNetworks = expectedNetworksForService(layout, container.service);
@@ -230,7 +290,8 @@ function validateObservedOnecliRuntime(
     if (!container.running || container.health !== 'healthy') {
       throw new GwsEaError('unhealthy_onecli', `OneCLI ${service} container is not healthy`);
     }
-    const expectedImage = service === 'postgres' ? ONECLI_POSTGRES_IMAGE : onecliGatewayImage(pins);
+    const expectedImage =
+      service === 'postgres' ? ONECLI_POSTGRES_IMAGE : service === 'gateway' ? gatewayImage : onecliGatewayImage(pins);
     if (container.image !== expectedImage) {
       throw new GwsEaError(
         'unsafe_onecli_image',
@@ -288,7 +349,8 @@ export async function observeOnecliRuntime(
     const containers = await inspectProjectContainers(docker);
     const seen = serviceObservation(layout, containers);
     if (seen.status !== 'present') return seen;
-    validateObservedOnecliRuntime(layout, pins, await inspectOnecliRuntime(docker, containers));
+    const gatewayImage = wrapperImageTag(await computeWrapperImageHash(pins));
+    validateObservedOnecliRuntime(layout, pins, await inspectOnecliRuntime(docker, containers), gatewayImage);
     return PRESENT;
   } catch (error) {
     if (!(error instanceof GwsEaError) || !['command_failed', 'command_timeout'].includes(error.code)) throw error;
@@ -334,7 +396,11 @@ export async function verifyOnecliRuntime(
   const runCommand = dependencies.runCommand ?? runSanitizedCommand;
   const fetchImplementation = dependencies.fetch ?? globalThis.fetch;
   await removePrivateFile(layout.providerStagingFile);
-  validateObservedOnecliRuntime(layout, pins, await inspectOnecliRuntime(dockerContext(layout, dependencies)));
+  const docker = dockerContext(layout, dependencies);
+  const wrapperHash = await computeWrapperImageHash(pins);
+  const gatewayImage = wrapperImageTag(wrapperHash);
+  validateObservedOnecliRuntime(layout, pins, await inspectOnecliRuntime(docker), gatewayImage);
+  await assertWrapperGatewayProvenance(docker, gatewayImage, wrapperHash);
   await Promise.all([
     assertHealthyEndpoint(fetchImplementation, `${layout.appUrl}/api/health`, 'OneCLI app'),
     assertHealthyEndpoint(fetchImplementation, `${layout.appUrl}/v1/health`, 'OneCLI versioned API'),
@@ -460,11 +526,16 @@ export async function reconcileOnecliRuntime(
 ): Promise<OnecliRuntimeReceipt> {
   const docker = dockerContext(layout, dependencies);
   const { runner, environment } = docker;
-  await prepareOnecliRuntime(layout, pins);
+  const wrapperHash = await computeWrapperImageHash(pins);
+  const gatewayImage = wrapperImageTag(wrapperHash);
+  await prepareOnecliRuntime(layout, pins, gatewayImage);
   await removePrivateFile(layout.providerStagingFile);
+  await ensureWrapperGatewayImage(docker, pins, gatewayImage, wrapperHash);
   const kept = await cleanupOnecliDockerOrphans(docker);
+  // Pull only the registry-sourced services; the gateway runs the locally built
+  // wrapper tag, which a registry pull would fail to resolve.
   await runner({
-    ...buildComposeInvocation(layout, ['pull', '--policy', 'missing']),
+    ...buildComposeInvocation(layout, ['pull', '--policy', 'missing', 'postgres', 'app']),
     env: environment,
     timeoutMs: ONECLI_PULL_TIMEOUT_MS,
     stream: true,
@@ -742,19 +813,45 @@ async function inspectProjectContainers(docker: OnecliDocker): Promise<readonly 
   return parseDockerContainers(inspection.stdout);
 }
 
+/**
+ * Prove the egress boundary from an agent's vantage: a throwaway container on the
+ * agent-egress network, reaching only the gateway proxy, must be unable to reach
+ * this instance's own OneCLI control plane, a private address on the DB port
+ * outside the backend subnet, or link-local/metadata — while public egress still
+ * works. Probes go through the gateway with a proxy-capable client (a bare `fetch`
+ * would bypass the proxy and falsely pass), classifying a target as reachable only
+ * when the gateway returns an HTTP response for it. Any violation fails closed
+ * (R11); provisioning refuses the runtime and no agent is spawned. Peer-instance
+ * isolation (R1 across instances), R4, R5, and R8 are proven in the live re-proof,
+ * where a peer, a real credential, and a human approver exist.
+ */
 async function verifyAgentNetworkIsolation(docker: OnecliDocker, pins: OnecliPins): Promise<void> {
   const { layout, runner, environment } = docker;
   const script = [
-    '(async () => {',
-    "const dns = require('node:dns').promises;",
-    "const response = await fetch('http://host.docker.internal:10255/healthz');",
-    "if (!response.ok) throw new Error('gateway health failed');",
-    "for (const host of ['app', 'postgres']) {",
-    '  try { await dns.lookup(host); throw new Error(`${host} resolved`); }',
-    "  catch (error) { if (String(error).includes('resolved')) throw error; }",
-    '}',
-    '})().catch((error) => { console.error(error.message); process.exit(1); });',
-  ].join(' ');
+    'const http = require("node:http");',
+    'const dns = require("node:dns").promises;',
+    // Forward-proxy GET through the gateway; resolves reachable only when the
+    // gateway returns an HTTP status (a blocked upstream resets/errors instead).
+    'function proxied(url){return new Promise((resolve)=>{let done=false;const finish=(v)=>{if(!done){done=true;resolve(v);}};',
+    'const u=new URL(url);const req=http.request({host:"host.docker.internal",port:10255,method:"GET",path:url,headers:{Host:u.host},timeout:7000},',
+    '(res)=>{res.resume();finish(res.statusCode!==undefined&&res.statusCode<500);});',
+    'req.on("timeout",()=>{req.destroy();finish(false);});req.on("error",()=>finish(false));req.end();});}',
+    'function healthz(){return new Promise((resolve)=>{const req=http.get("http://host.docker.internal:10255/healthz",{timeout:7000},',
+    '(res)=>{res.resume();resolve(res.statusCode===200);});req.on("timeout",()=>{req.destroy();resolve(false);});req.on("error",()=>resolve(false));});}',
+    '(async()=>{',
+    'if(!(await healthz()))throw new Error("gateway healthz unreachable");',
+    // R6: public egress must work.
+    'if(!(await proxied("http://example.com/")))throw new Error("public egress blocked");',
+    // R2: the instance\'s own OneCLI app admin API must be blocked.
+    'if(await proxied("http://app:10254/v1/secrets"))throw new Error("own app admin API reachable through gateway");',
+    // R1 scoping guard: a private address on the DB port outside the backend subnet must be blocked.
+    'if(await proxied("http://10.255.255.255:5432/"))throw new Error("private 5432 outside backend subnet reachable");',
+    // R3: link-local / cloud metadata must be blocked.
+    'if(await proxied("http://169.254.169.254/"))throw new Error("link-local/metadata reachable through gateway");',
+    // The agent container itself cannot resolve backend hosts (defense in depth).
+    'for(const host of ["app","postgres"]){try{await dns.lookup(host);throw new Error(host+" resolved by agent");}catch(e){if(String(e).includes("resolved by agent"))throw e;}}',
+    '})().catch((error)=>{console.error(error.message);process.exit(1);});',
+  ].join('');
   await runner({
     command: 'docker',
     args: [
@@ -773,6 +870,28 @@ async function verifyAgentNetworkIsolation(docker: OnecliDocker, pins: OnecliPin
     env: environment,
     timeoutMs: INSPECT_TIMEOUT_MS,
   });
+}
+
+/** Confirm the running gateway image was built from the current firewall content (KTD6). */
+async function assertWrapperGatewayProvenance(
+  docker: OnecliDocker,
+  gatewayImage: string,
+  wrapperHash: string,
+): Promise<void> {
+  const { runner, environment, layout } = docker;
+  const { stdout } = await runner({
+    command: 'docker',
+    args: ['image', 'inspect', gatewayImage, '--format', `{{index .Config.Labels "${ONECLI_WRAPPER_LABEL}"}}`],
+    cwd: layout.rootDirectory,
+    env: environment,
+    timeoutMs: INSPECT_TIMEOUT_MS,
+  });
+  if (stdout.trim() !== wrapperHash) {
+    throw new GwsEaError(
+      'unsafe_onecli_image',
+      `OneCLI gateway image ${gatewayImage} provenance label does not match its build content`,
+    );
+  }
 }
 
 function parseDockerContainers(source: string): readonly InspectedOnecliContainer[] {
