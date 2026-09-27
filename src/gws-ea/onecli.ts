@@ -35,9 +35,8 @@ import {
   ONECLI_WRAPPER_BASE_ARG,
   ONECLI_WRAPPER_HASH_ARG,
   ONECLI_WRAPPER_LABEL,
-  computeWrapperImageHash,
+  resolveWrapperGatewayImage,
   wrapperImageSourceDir,
-  wrapperImageTag,
 } from './onecli-gateway-image.js';
 import { ONECLI_SDK_VERSION } from './pins.js';
 import { GwsEaError } from './types.js';
@@ -349,7 +348,7 @@ export async function observeOnecliRuntime(
     const containers = await inspectProjectContainers(docker);
     const seen = serviceObservation(layout, containers);
     if (seen.status !== 'present') return seen;
-    const gatewayImage = wrapperImageTag(await computeWrapperImageHash(pins));
+    const { image: gatewayImage } = await resolveWrapperGatewayImage(pins);
     validateObservedOnecliRuntime(layout, pins, await inspectOnecliRuntime(docker, containers), gatewayImage);
     return PRESENT;
   } catch (error) {
@@ -393,15 +392,28 @@ export async function verifyOnecliRuntime(
   pins: OnecliPins,
   dependencies: OnecliRuntimeDependencies = {},
 ): Promise<OnecliRuntimeReceipt> {
+  return verifyResolvedOnecliRuntime(layout, pins, dependencies, await resolveWrapperGatewayImage(pins));
+}
+
+/**
+ * The verify body, given an already-resolved wrapper image. `reconcileOnecliRuntime`
+ * calls this with the hash/tag it computed for the build, so a reconcile hashes the
+ * wrapper source once rather than again here.
+ */
+async function verifyResolvedOnecliRuntime(
+  layout: OnecliRuntimeLayout,
+  pins: OnecliPins,
+  dependencies: OnecliRuntimeDependencies,
+  resolved: { readonly hash: string; readonly image: string },
+): Promise<OnecliRuntimeReceipt> {
   const runCommand = dependencies.runCommand ?? runSanitizedCommand;
   const fetchImplementation = dependencies.fetch ?? globalThis.fetch;
   await removePrivateFile(layout.providerStagingFile);
   const docker = dockerContext(layout, dependencies);
-  const wrapperHash = await computeWrapperImageHash(pins);
-  const gatewayImage = wrapperImageTag(wrapperHash);
+  const { hash: wrapperHash, image: gatewayImage } = resolved;
   validateObservedOnecliRuntime(layout, pins, await inspectOnecliRuntime(docker), gatewayImage);
-  await assertWrapperGatewayProvenance(docker, gatewayImage, wrapperHash);
   await Promise.all([
+    assertWrapperGatewayProvenance(docker, gatewayImage, wrapperHash),
     assertHealthyEndpoint(fetchImplementation, `${layout.appUrl}/api/health`, 'OneCLI app'),
     assertHealthyEndpoint(fetchImplementation, `${layout.appUrl}/v1/health`, 'OneCLI versioned API'),
     assertHealthyEndpoint(fetchImplementation, `${layout.gatewayUrl}/healthz`, 'OneCLI gateway'),
@@ -526,8 +538,8 @@ export async function reconcileOnecliRuntime(
 ): Promise<OnecliRuntimeReceipt> {
   const docker = dockerContext(layout, dependencies);
   const { runner, environment } = docker;
-  const wrapperHash = await computeWrapperImageHash(pins);
-  const gatewayImage = wrapperImageTag(wrapperHash);
+  const wrapper = await resolveWrapperGatewayImage(pins);
+  const { hash: wrapperHash, image: gatewayImage } = wrapper;
   await prepareOnecliRuntime(layout, pins, gatewayImage);
   await removePrivateFile(layout.providerStagingFile);
   await ensureWrapperGatewayImage(docker, pins, gatewayImage, wrapperHash);
@@ -565,7 +577,7 @@ export async function reconcileOnecliRuntime(
   } catch (error) {
     throw (await foreignPortError(docker, dependencies, error)) ?? error;
   }
-  const receipt = await verifyOnecliRuntime(layout, pins, dependencies);
+  const receipt = await verifyResolvedOnecliRuntime(layout, pins, dependencies, wrapper);
   await verifyAgentNetworkIsolation(docker, pins);
   return receipt;
 }

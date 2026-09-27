@@ -137,6 +137,9 @@ export function renderOnecliCompose(
     [ONECLI_INSTANCE_LABEL]: layout.instanceId,
   };
   const baseImage = onecliGatewayImage(pins);
+  // The gateway derives the same DATABASE_URL/SECRET_ENCRYPTION_KEY/GATEWAY_INTERNAL_SECRET
+  // from these secret files in its baked entrypoint (src/gws-ea/onecli-gateway-image/entrypoint.sh);
+  // keep the DSN shape and secret filenames in sync across both.
   const databaseUrl = 'postgresql://onecli:$$(cat /run/secrets/postgres_password)@postgres:5432/onecli';
   const sharedSecrets = ['postgres_password', 'secret_encryption_key', 'gateway_internal_secret'];
 

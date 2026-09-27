@@ -51,3 +51,11 @@ export async function computeWrapperImageHash(pins: Pick<OnecliPins, 'gateway'>)
 export function wrapperImageTag(hash: string): string {
   return `gws-ea-onecli-gateway:${hash}`;
 }
+
+/** Resolve the wrapper's content hash and image reference together — the single source for the hash→tag pairing. */
+export async function resolveWrapperGatewayImage(
+  pins: Pick<OnecliPins, 'gateway'>,
+): Promise<{ readonly hash: string; readonly image: string }> {
+  const hash = await computeWrapperImageHash(pins);
+  return { hash, image: wrapperImageTag(hash) };
+}
