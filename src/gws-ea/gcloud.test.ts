@@ -147,6 +147,10 @@ class FakeGoogleCloud {
   serviceAccount: { displayName: string; description: string } | undefined;
   /** Lists that still omit the Chat service account after it was created. */
   unlistedServiceAccountReads = 0;
+  /** Key lists that still answer NOT_FOUND after the Chat service account was created. */
+  unresolvedKeyReads = 0;
+  /** Key lists that still omit the key Google created last. */
+  unlistedNewKeyReads = 0;
   readonly userKeys = new Set<string>();
   /** Key-creation constraints the organization enforces. */
   readonly orgEnforced = new Set<string>();
@@ -157,6 +161,7 @@ class FakeGoogleCloud {
   readonly commands: string[] = [];
   readonly mutations: string[] = [];
   #keys = 0;
+  #newestKey: string | undefined;
 
   constructor(readonly gcp: GcpProjectInput) {}
 
@@ -288,14 +293,20 @@ class FakeGoogleCloud {
 
   #listKeys(): SanitizedCommandOutcome {
     const { projectId, serviceAccountEmail } = this.gcp;
-    if (!this.serviceAccount) {
+    if (!this.serviceAccount || this.unresolvedKeyReads > 0) {
+      if (this.serviceAccount) this.unresolvedKeyReads -= 1;
       return failed(
         `ERROR: (gcloud.iam.service-accounts.keys.list) NOT_FOUND: Service account projects/${projectId}/serviceAccounts/${serviceAccountEmail} does not exist.`,
       );
     }
+    let listed = [...this.userKeys];
+    if (this.#newestKey && this.unlistedNewKeyReads > 0) {
+      this.unlistedNewKeyReads -= 1;
+      listed = listed.filter((id) => id !== this.#newestKey);
+    }
     return ok(
       json(
-        [...this.userKeys].map((id) => ({
+        listed.map((id) => ({
           keyAlgorithm: 'KEY_ALG_RSA_2048',
           keyOrigin: 'GOOGLE_PROVIDED',
           keyType: 'USER_MANAGED',
@@ -332,6 +343,7 @@ class FakeGoogleCloud {
     this.#keys += 1;
     const id = `${String(this.#keys).padStart(2, '0')}${'5f0c3e1a9b7d2468ace0'.repeat(2)}`.slice(0, 40);
     this.userKeys.add(id);
+    this.#newestKey = id;
     await writeFile(file, keyFile(projectId, serviceAccountEmail, id), { mode: 0o600 });
     this.mutations.push(`keys create ${id}`);
     return ok('', `created key [${id}] of type [json] as [${file}] for [${serviceAccountEmail}]\n`);
@@ -463,6 +475,10 @@ async function writeCredential(file: string, contents: string, mode = 0o600): Pr
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   await writeFile(file, contents, { mode });
   await chmod(file, mode);
+}
+
+function waited(sleeps: readonly number[]): number {
+  return sleeps.reduce((total, milliseconds) => total + milliseconds, 0);
 }
 
 async function publishedKeyId(gcp: GcpProjectInput): Promise<string> {
@@ -706,6 +722,100 @@ describe('Google Cloud setup through the step engine', () => {
     expect(setup.cloud.userKeys).toEqual(new Set([keyId]));
   });
 
+  it('waits for a service account Google just created to become usable before replacing its keys', async () => {
+    const setup = await harness();
+    setup.cloud.ready().userKeys.add('orphan');
+    setup.cloud.unresolvedKeyReads = 2;
+
+    await expect(setup.run()).resolves.toEqual({ status: 'ready' });
+
+    expect(setup.sleeps).toEqual([1_000, 2_000]);
+    expect(setup.cloud.mutations).toEqual(['keys delete orphan', `keys create ${await publishedKeyId(setup.gcp)}`]);
+  });
+
+  it('stops with Google’s answer when the service account is still not usable after 7 minutes', async () => {
+    const setup = await harness();
+    setup.cloud.ready();
+    setup.cloud.unresolvedKeyReads = 999;
+
+    await expect(setup.run()).rejects.toMatchObject({
+      code: 'gcloud_failed',
+      message: expect.stringMatching(
+        new RegExp(`could not list the keys of ${setup.gcp.serviceAccountEmail} within 7 minutes`, 'u'),
+      ),
+      details: { stderrTail: expect.stringContaining('NOT_FOUND') },
+    });
+    expect(waited(setup.sleeps)).toBeGreaterThanOrEqual(7 * 60_000);
+    expect(Math.max(...setup.sleeps)).toBe(30_000);
+    expect(setup.cloud.mutations).toEqual([]);
+  });
+
+  it('waits for Google to list a key it just created before publishing it', async () => {
+    const setup = await harness();
+    setup.cloud.ready().unlistedNewKeyReads = 3;
+
+    await expect(setup.run()).resolves.toEqual({ status: 'ready' });
+
+    expect(setup.cloud.mutations).toEqual([`keys create ${await publishedKeyId(setup.gcp)}`]);
+    expect(setup.sleeps).toEqual([1_000, 2_000, 4_000]);
+    expect(setup.events).toContainEqual({
+      type: 'step-waiting',
+      step: 'provision_gcp',
+      reason: 'Waiting for Google Cloud to list the new Google Chat key…',
+    });
+  });
+
+  it('keeps waiting for a new key through a listing that answers NOT_FOUND, then publishes it once', async () => {
+    const setup = await harness();
+    setup.cloud.ready();
+    const runCommand: GcloudCommandRunner = async (command) => {
+      const outcome = await setup.cloud.run(command);
+      // Google's reads can lag again right after one answered.
+      if (command.args.slice(0, 4).join(' ') === 'iam service-accounts keys create') setup.cloud.unresolvedKeyReads = 1;
+      return outcome;
+    };
+
+    await expect(setup.run(runCommand)).resolves.toEqual({ status: 'ready' });
+
+    expect(setup.cloud.mutations).toEqual([`keys create ${await publishedKeyId(setup.gcp)}`]);
+    expect(setup.sleeps).toEqual([1_000]);
+  });
+
+  it('keeps an unlisted new key staged after 7 minutes, and publishes it on the next run without another', async () => {
+    const setup = await harness();
+    setup.cloud.ready().unlistedNewKeyReads = 999;
+
+    await expect(setup.run()).rejects.toMatchObject({
+      code: 'gcp_key_unlisted',
+      message: expect.stringContaining('within 7 minutes'),
+    });
+    expect(waited(setup.sleeps)).toBeGreaterThanOrEqual(7 * 60_000);
+    await expect(stat(setup.gcp.credentialFile)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(setup.staging)).resolves.toBeDefined();
+
+    setup.cloud.unlistedNewKeyReads = 0;
+    await expect(setup.run()).resolves.toEqual({ status: 'ready' });
+
+    expect(setup.cloud.mutations).toEqual([`keys create ${await publishedKeyId(setup.gcp)}`]);
+  });
+
+  it('fails at once, lifting nothing, when Google refuses a key for a reason other than the key policy', async () => {
+    const setup = await harness();
+    setup.cloud.ready();
+    const runCommand: GcloudCommandRunner = async (command) =>
+      command.args.slice(0, 4).join(' ') === 'iam service-accounts keys create'
+        ? failed('ERROR: (gcloud.iam.service-accounts.keys.create) FAILED_PRECONDITION: Precondition check failed.')
+        : setup.cloud.run(command);
+
+    await expect(setup.run(runCommand)).rejects.toMatchObject({
+      code: 'gcloud_failed',
+      message: expect.stringContaining(`could not create a key for ${setup.gcp.serviceAccountEmail}`),
+    });
+    expect(setup.cloud.mutations).toEqual([]);
+    expect(setup.sleeps).toEqual([]);
+    expect((await setup.journal()).key_policy_lifted).toBe(false);
+  });
+
   it('replaces a valid local credential whose key Google no longer lists', async () => {
     const setup = await harness();
     setup.cloud.ready().userKeys.add('other');
@@ -762,10 +872,11 @@ describe('Google Cloud setup through the step engine', () => {
     await expect(stat(setup.gcp.credentialFile)).resolves.toMatchObject({ size: Buffer.byteLength(contents) });
   });
 
-  it('lifts a blocking key policy only after recording the lift, and restores it before completing', async () => {
+  it('lifts a blocking key policy only after recording the lift, waits as long as Google takes, then restores it once the key exists', async () => {
     const setup = await harness();
     setup.cloud.ready().orgEnforced.add('iam.disableServiceAccountKeyCreation');
-    setup.cloud.policyLag = 1;
+    // Refused for about 8 minutes after the lift, as a slow organization can.
+    setup.cloud.policyLag = 20;
     const liftedWhenLifting: boolean[] = [];
     const runCommand: GcloudCommandRunner = async (command) => {
       if (command.args[1] === 'set-policy') liftedWhenLifting.push((await setup.journal()).key_policy_lifted);
@@ -781,7 +892,8 @@ describe('Google Cloud setup through the step engine', () => {
       ...KEY_CONSTRAINTS.map((constraint) => `set-policy ${constraint} enforce=true`),
     ]);
     expect(liftedWhenLifting).toEqual([true, true, true, true]);
-    expect(setup.sleeps).toEqual([1_000]);
+    expect(waited(setup.sleeps)).toBeGreaterThan(61_000);
+    expect(waited(setup.sleeps)).toBeLessThan(15 * 60_000);
     expect(setup.events).toContainEqual({
       type: 'step-waiting',
       step: 'provision_gcp',
@@ -793,25 +905,33 @@ describe('Google Cloud setup through the step engine', () => {
     await expect(stat(setup.staging)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('restores the policy and stops when Google keeps refusing the key after the lift', async () => {
+  it('keeps the lift and stops with Google’s answer when key creation is still refused 15 minutes after it', async () => {
     const setup = await harness();
     setup.cloud.ready().orgEnforced.add('iam.disableServiceAccountKeyCreation');
-    setup.cloud.policyLag = 99;
+    setup.cloud.policyLag = 999;
 
     const failure = await setup.run().catch((error: unknown) => error);
 
     expect(failure).toMatchObject({
       code: 'gcloud_failed',
-      message: expect.stringContaining('resume to retry'),
+      message: expect.stringMatching(/15 minutes.*stays lifted until the key exists.*gws-ea remove/su),
       details: { stderrTail: expect.stringContaining('FAILED_PRECONDITION') },
     });
-    expect(setup.sleeps).toEqual(FULL_WAIT);
+    expect(waited(setup.sleeps)).toBeGreaterThanOrEqual(15 * 60_000);
+    const lift = KEY_CONSTRAINTS.map((constraint) => `set-policy ${constraint} enforce=false`);
+    expect(setup.cloud.mutations).toEqual(lift);
+    expect((await setup.journal()).key_policy_lifted).toBe(true);
+    await expect(stat(setup.staging)).rejects.toMatchObject({ code: 'ENOENT' });
+
+    // Once Google applies the lift, the next run restores nothing before the key exists.
+    setup.cloud.policyLag = 0;
+    await expect(setup.run()).resolves.toEqual({ status: 'ready' });
     expect(setup.cloud.mutations).toEqual([
-      ...KEY_CONSTRAINTS.map((constraint) => `set-policy ${constraint} enforce=false`),
+      ...lift,
+      `keys create ${await publishedKeyId(setup.gcp)}`,
       ...KEY_CONSTRAINTS.map((constraint) => `set-policy ${constraint} enforce=true`),
     ]);
     expect((await setup.journal()).key_policy_lifted).toBe(false);
-    await expect(stat(setup.staging)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('stops on a project pending deletion, naming how to restore it', async () => {
@@ -825,7 +945,7 @@ describe('Google Cloud setup through the step engine', () => {
     expect(setup.cloud.mutations).toEqual([]);
   });
 
-  it('restores a policy lifted before a crash before anything else on the next run', async () => {
+  it('keeps a policy lifted before a crash until the next run has created the key', async () => {
     const setup = await harness();
     setup.cloud.ready().orgEnforced.add('iam.managed.disableServiceAccountKeyCreation');
     let lifted = 0;
@@ -841,19 +961,10 @@ describe('Google Cloud setup through the step engine', () => {
     expect([...setup.cloud.projectPolicies.values()]).toEqual([false, false]);
 
     const before = setup.cloud.mutations.length;
-    const commandsBefore = setup.cloud.commands.length;
     await expect(setup.run()).resolves.toEqual({ status: 'ready' });
 
-    // The first commands of the next run restore the policy.
-    expect(setup.cloud.commands.slice(commandsBefore, commandsBefore + 2)).toEqual([
-      expect.stringMatching(/^org-policies set-policy /u),
-      expect.stringMatching(/^org-policies set-policy /u),
-    ]);
-    const keyId = await publishedKeyId(setup.gcp);
     expect(setup.cloud.mutations.slice(before)).toEqual([
-      ...KEY_CONSTRAINTS.map((constraint) => `set-policy ${constraint} enforce=true`),
-      ...KEY_CONSTRAINTS.map((constraint) => `set-policy ${constraint} enforce=false`),
-      `keys create ${keyId}`,
+      `keys create ${await publishedKeyId(setup.gcp)}`,
       ...KEY_CONSTRAINTS.map((constraint) => `set-policy ${constraint} enforce=true`),
     ]);
     expect((await setup.journal()).key_policy_lifted).toBe(false);
@@ -881,9 +992,12 @@ describe('Google Cloud setup through the step engine', () => {
 
     setup.cloud.canSetPolicy = true;
     await expect(setup.run()).resolves.toEqual({ status: 'ready' });
-    expect(setup.cloud.mutations[0]).toBe('set-policy iam.disableServiceAccountKeyCreation enforce=true');
+    expect(setup.cloud.mutations).toEqual([
+      ...KEY_CONSTRAINTS.map((constraint) => `set-policy ${constraint} enforce=false`),
+      `keys create ${await publishedKeyId(setup.gcp)}`,
+      ...KEY_CONSTRAINTS.map((constraint) => `set-policy ${constraint} enforce=true`),
+    ]);
     expect((await setup.journal()).key_policy_lifted).toBe(false);
-    await publishedKeyId(setup.gcp);
   });
 
   it('stops with evidence and changes nothing when a read fails in an unrecognized way', async () => {

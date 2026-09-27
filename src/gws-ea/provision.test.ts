@@ -1053,7 +1053,7 @@ describe('production provision step composition', () => {
     expect(progress).toEqual([{ type: 'step-waiting', step: 'provision_gcp', reason }]);
   });
 
-  it('observes Google Cloud as its own resources, restoring a lifted key policy first', async () => {
+  it('observes Google Cloud as its own resources, restoring a lifted key policy only after the key', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
 
@@ -1061,11 +1061,11 @@ describe('production provision step composition', () => {
       const resources = createProductionProvisionSteps(productionContext(operation, reserved)).provision_gcp.resources;
 
       expect(resources.map((resource) => [resource.name, resource.unknown ?? 'wait'])).toEqual([
-        ['the Google Chat key-creation policy', 'wait'],
         ['the Google Cloud project', 'create-by-unique-id'],
         ['the Google Cloud APIs', 'wait'],
         ['the Google Chat service account', 'wait'],
         ['the Google Chat credential', 'wait'],
+        ['the Google Chat key-creation policy', 'wait'],
       ]);
     });
   });
