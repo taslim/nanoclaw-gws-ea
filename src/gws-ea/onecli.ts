@@ -418,6 +418,9 @@ async function verifyResolvedOnecliRuntime(
     assertHealthyEndpoint(fetchImplementation, `${layout.appUrl}/v1/health`, 'OneCLI versioned API'),
     assertHealthyEndpoint(fetchImplementation, `${layout.gatewayUrl}/healthz`, 'OneCLI gateway'),
   ]);
+  // Prove the egress boundary from an agent's vantage on every admission path —
+  // create and resume alike — so a healthy runtime is never accepted without it.
+  await verifyAgentNetworkIsolation(docker, pins);
 
   const keylessEnvironment = buildOnecliCliEnvironment(layout, dependencies.ambientEnv);
   const apiKeyResponse = parseRecord(
@@ -579,9 +582,7 @@ export async function reconcileOnecliRuntime(
   } catch (error) {
     throw (await foreignPortError(docker, dependencies, error)) ?? error;
   }
-  const receipt = await verifyResolvedOnecliRuntime(layout, pins, dependencies, wrapper);
-  await verifyAgentNetworkIsolation(docker, pins);
-  return receipt;
+  return verifyResolvedOnecliRuntime(layout, pins, dependencies, wrapper);
 }
 
 /**
@@ -830,38 +831,43 @@ async function inspectProjectContainers(docker: OnecliDocker): Promise<readonly 
 /**
  * Prove the egress boundary from an agent's vantage: a throwaway container on the
  * agent-egress network, reaching only the gateway proxy, must be unable to reach
- * this instance's own OneCLI control plane, a private address on the DB port
- * outside the backend subnet, or link-local/metadata — while public egress still
- * works. Probes go through the gateway with a proxy-capable client (a bare `fetch`
- * would bypass the proxy and falsely pass), classifying a target as reachable only
- * when the gateway returns an HTTP response for it. Any violation fails closed
- * (R11); provisioning refuses the runtime and no agent is spawned. Peer-instance
- * isolation (R1 across instances), R4, R5, and R8 are proven in the live re-proof,
- * where a peer, a real credential, and a human approver exist.
+ * this instance's own OneCLI app admin API (a real private listener) or link-local
+ * metadata — while public egress still works. Each target is a forward-proxy GET
+ * through the gateway: the gateway attempts the upstream connection to forward the
+ * request, so a target counts as reachable when it returns any HTTP response, and
+ * as blocked when the gateway cannot connect and resets/errors. Classifying on
+ * "any response" (not a status range) means a leaked target that answers with a
+ * 5xx is still caught, and a transient upstream 5xx on the public check is not a
+ * false failure. A bare `fetch` would bypass the proxy and falsely pass, so raw
+ * `http` is used; a CONNECT tunnel cannot be used because this gateway answers
+ * CONNECT with 200 to MITM TLS before it touches the upstream. Any violation fails
+ * closed (R11); provisioning refuses the runtime and spawns no agent. Cross-
+ * instance isolation on the DB port (which needs a real peer listener and cannot
+ * be probed for a non-HTTP port through an HTTP proxy), R4, R5, and R8 are proven
+ * in the live re-proof, where a peer, a real credential, and a human approver exist.
  */
 async function verifyAgentNetworkIsolation(docker: OnecliDocker, pins: OnecliPins): Promise<void> {
   const { layout, runner, environment } = docker;
   const script = [
     'const http = require("node:http");',
     'const dns = require("node:dns").promises;',
-    // Forward-proxy GET through the gateway; resolves reachable only when the
-    // gateway returns an HTTP status (a blocked upstream resets/errors instead).
-    'function proxied(url){return new Promise((resolve)=>{let done=false;const finish=(v)=>{if(!done){done=true;resolve(v);}};',
+    // Forward-proxy GET through the gateway. Reachable = the gateway returned any
+    // HTTP response (it connected to the upstream); blocked = it could not connect
+    // and reset/errored. "Any response" catches a leaked target that answers 5xx.
+    'function reached(url){return new Promise((resolve)=>{let done=false;const finish=(v)=>{if(!done){done=true;resolve(v);}};',
     'const u=new URL(url);const req=http.request({host:"host.docker.internal",port:10255,method:"GET",path:url,headers:{Host:u.host},timeout:7000},',
-    '(res)=>{res.resume();finish(res.statusCode!==undefined&&res.statusCode<500);});',
+    '(res)=>{res.resume();finish(true);});',
     'req.on("timeout",()=>{req.destroy();finish(false);});req.on("error",()=>finish(false));req.end();});}',
     'function healthz(){return new Promise((resolve)=>{const req=http.get("http://host.docker.internal:10255/healthz",{timeout:7000},',
     '(res)=>{res.resume();resolve(res.statusCode===200);});req.on("timeout",()=>{req.destroy();resolve(false);});req.on("error",()=>resolve(false));});}',
     '(async()=>{',
     'if(!(await healthz()))throw new Error("gateway healthz unreachable");',
     // R6: public egress must work.
-    'if(!(await proxied("http://example.com/")))throw new Error("public egress blocked");',
-    // R2: the instance\'s own OneCLI app admin API must be blocked.
-    'if(await proxied("http://app:10254/v1/secrets"))throw new Error("own app admin API reachable through gateway");',
-    // R1 scoping guard: a private address on the DB port outside the backend subnet must be blocked.
-    'if(await proxied("http://10.255.255.255:5432/"))throw new Error("private 5432 outside backend subnet reachable");',
-    // R3: link-local / cloud metadata must be blocked.
-    'if(await proxied("http://169.254.169.254/"))throw new Error("link-local/metadata reachable through gateway");',
+    'if(!(await reached("http://example.com/")))throw new Error("public egress blocked");',
+    // R2: the instance\'s own OneCLI app admin API (a real private listener) must be blocked.
+    'if(await reached("http://app:10254/v1/secrets"))throw new Error("own app admin API reachable through gateway");',
+    // R3: link-local / cloud metadata must be blocked (a real listener on a cloud host).
+    'if(await reached("http://169.254.169.254/"))throw new Error("link-local/metadata reachable through gateway");',
     // The agent container itself cannot resolve backend hosts (defense in depth).
     'for(const host of ["app","postgres"]){try{await dns.lookup(host);throw new Error(host+" resolved by agent");}catch(e){if(String(e).includes("resolved by agent"))throw e;}}',
     '})().catch((error)=>{console.error(error.message);process.exit(1);});',
