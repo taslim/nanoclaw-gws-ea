@@ -542,16 +542,18 @@ export async function reconcileOnecliRuntime(
   const { hash: wrapperHash, image: gatewayImage } = wrapper;
   await prepareOnecliRuntime(layout, pins, gatewayImage);
   await removePrivateFile(layout.providerStagingFile);
-  await ensureWrapperGatewayImage(docker, pins, gatewayImage, wrapperHash);
   const kept = await cleanupOnecliDockerOrphans(docker);
   // Pull only the registry-sourced services; the gateway runs the locally built
-  // wrapper tag, which a registry pull would fail to resolve.
+  // wrapper tag, which a registry pull would fail to resolve. The `app` image is
+  // the same OneCLI base the wrapper builds `FROM`, so pulling here (under the
+  // pull timeout) makes that base local before the build below.
   await runner({
     ...buildComposeInvocation(layout, ['pull', '--policy', 'missing', 'postgres', 'app']),
     env: environment,
     timeoutMs: ONECLI_PULL_TIMEOUT_MS,
     stream: true,
   });
+  await ensureWrapperGatewayImage(docker, pins, gatewayImage, wrapperHash);
   const up = (args: readonly string[]): Promise<unknown> =>
     runner({
       ...buildComposeInvocation(layout, [

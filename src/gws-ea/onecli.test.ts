@@ -191,6 +191,8 @@ interface DockerWorld {
   failBuild?: GwsEaError;
   /** When set, the provenance-label read returns this instead of the built content hash. */
   wrongProvenance?: string;
+  /** When set, the isolation probe (`docker run`) fails with this error, standing in for a detected leak. */
+  failProbe?: GwsEaError;
 }
 
 function containerJson(layout: OnecliRuntimeLayout, service: ServiceName, state: { running: boolean; health: Health }) {
@@ -315,7 +317,10 @@ function dockerWorld(layout: OnecliRuntimeLayout, initial: Partial<Record<Servic
         },
       ]);
     }
-    if (args[0] === 'run') return { stdout: '', stderr: '' };
+    if (args[0] === 'run') {
+      if (world.failProbe) throw world.failProbe;
+      return { stdout: '', stderr: '' };
+    }
     if (args[0] === 'build') {
       if (world.failBuild) throw world.failBuild;
       world.builtImage = true;
@@ -542,10 +547,26 @@ describe('OneCLI runtime start and repair', () => {
     expect(build.args).toContain(GATEWAY_IMAGE);
     expect(build.args.join(' ')).toContain(`ONECLI_BASE=ghcr.io/onecli/onecli:${PINS.gateway}`);
     expect(build.args.join(' ')).toContain(`GATEWAY_WRAPPER_HASH=${WRAPPER_HASH}`);
-    // The build precedes the pull so the local-only wrapper tag is never fetched from a registry.
+    // The pull (which fetches the base via the app image) precedes the build, so the
+    // base is local before `FROM`; the pull is scoped to postgres+app so the
+    // local-only wrapper tag is never fetched from a registry.
     const buildIndex = world.calls.findIndex((call) => call.args[0] === 'build');
     const pullIndex = world.calls.findIndex((call) => call.args.includes('pull'));
-    expect(buildIndex).toBeLessThan(pullIndex);
+    expect(pullIndex).toBeGreaterThanOrEqual(0);
+    expect(pullIndex).toBeLessThan(buildIndex);
+  });
+
+  it('aborts the reconcile and starts nothing when the wrapper image build fails', async () => {
+    const layout = await layoutFixture();
+    const { world, runner } = dockerWorld(layout);
+    world.wrapperImageMissing = true;
+    world.failBuild = new GwsEaError('command_failed', 'docker build failed');
+
+    await expect(
+      reconcileOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, runCommand: runner, fetch: healthyFetch() }),
+    ).rejects.toMatchObject({ code: 'command_failed' });
+    // A failed build must abort before compose brings anything up.
+    expect(world.calls.some((call) => call.args.includes('up'))).toBe(false);
   });
 
   it('reuses the present wrapper image instead of rebuilding it', async () => {
@@ -574,7 +595,22 @@ describe('OneCLI runtime start and repair', () => {
 
     const probe = world.calls.find((call) => call.args[0] === 'run')!;
     expect(probe.args).toContain(layout.agentEgressNetwork);
+    expect(probe.args).toContain('--rm');
+    // The probe is a throwaway agent-like container: the base image, entrypoint node.
+    expect(probe.args).toContain('--entrypoint');
     expect(probe.args).toContain('node');
+    expect(probe.args).toContain(`ghcr.io/onecli/onecli:${PINS.gateway}`);
+  });
+
+  it('fails the reconcile closed when the agent-egress isolation probe reports a leak', async () => {
+    const layout = await layoutFixture();
+    const { world, runner } = dockerWorld(layout);
+    // The probe (docker run of the isolation script) exits non-zero -> a leak was found.
+    world.failProbe = new GwsEaError('command_failed', 'own app admin API reachable through gateway');
+
+    await expect(
+      reconcileOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, runCommand: runner, fetch: healthyFetch() }),
+    ).rejects.toMatchObject({ code: 'command_failed' });
   });
 
   it('refuses a gateway image whose provenance label does not match its build content', async () => {
