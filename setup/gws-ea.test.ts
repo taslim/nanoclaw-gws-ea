@@ -1,12 +1,20 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import * as nanoclawService from '../scripts/update/service.js';
 import type { CliRuntime, FailureReport } from '../src/gws-ea/cli.js';
 import type { Interaction } from '../src/gws-ea/events.js';
 import type { PrerequisiteRequest } from '../src/gws-ea/prerequisites.js';
+import {
+  createServiceControl,
+  type NanoclawCommandRunner,
+  type NanoclawServiceHelpers,
+  type ServiceControlTarget,
+} from '../src/gws-ea/service-control.js';
+import { createInstanceServiceCoordinates, type InstanceServicePlatform } from '../src/gws-ea/service-coordinates.js';
 
 const fixture = vi.hoisted(() => {
   const spinner = {
@@ -70,6 +78,18 @@ function runtimeOf(call = 0): CliRuntime {
   return fixture.runCli.mock.calls[call]![1] as CliRuntime;
 }
 
+/** Service control runs NanoClaw's own update-controller helpers, unchanged. */
+function expectUpstreamServiceHelpers(runtime: CliRuntime): void {
+  expect(runtime.serviceHelpers).toEqual({
+    createCommandRunner: nanoclawService.createCommandRunner,
+    detectService: nanoclawService.detectService,
+    stopService: nanoclawService.stopService,
+    startService: nanoclawService.startService,
+    drainContainers: nanoclawService.drainContainers,
+    verifyServiceHealth: nanoclawService.verifyServiceHealth,
+  });
+}
+
 function report(overrides: Partial<FailureReport> = {}): FailureReport {
   return {
     command: 'resume',
@@ -102,6 +122,7 @@ describe('GWS-EA driver', () => {
     expect(runtime.upsertEnvVars).toBe(upsertEnvVars);
     expect(runtime.hostStatus?.queryHost).toBe(hostStatus.queryHost);
     expect(runtime.hostStatus?.waitForHost).toBe(hostStatus.waitForHost);
+    expectUpstreamServiceHelpers(runtime);
     await runtime.collectCreateInputs!({ marker: 'context' } as never);
     expect(fixture.collect).toHaveBeenCalledWith(
       { marker: 'context' },
@@ -127,6 +148,7 @@ describe('GWS-EA driver', () => {
     expect(runtime.presenter).toBeDefined();
     expect(runtime.upsertEnvVars).toBe(upsertEnvVars);
     expect(runtime.hostStatus?.waitForHost).toBe(hostStatus.waitForHost);
+    expectUpstreamServiceHelpers(runtime);
     await runtime.collectCreateInputs!({ marker: 'context' } as never);
     expect(fixture.collect).toHaveBeenCalledWith(
       { marker: 'context' },
@@ -247,5 +269,159 @@ describe('GWS-EA terminal presenter', () => {
     expect(fixture.log.error).toHaveBeenCalledWith('Stopped at start_onecli: OneCLI did not become healthy');
     expect(fixture.log.message).toHaveBeenCalledWith('Log: /logs/progress.log');
     expect(fixture.dump).toHaveBeenCalledWith('last stderr line');
+  });
+});
+
+describe("GWS-EA service control through NanoClaw's helpers", () => {
+  // The helpers the driver wires, with only their command runner faked: no real launchctl or systemctl runs.
+  const INSTALL_ID = '0123456789abcdef0123456789abcdef';
+  const UID = 501;
+  const homes: string[] = [];
+
+  afterEach(async () => {
+    vi.clearAllMocks();
+    for (const home of homes.splice(0)) await rm(home, { recursive: true, force: true });
+  });
+
+  async function wiredHelpers(runner: NanoclawCommandRunner): Promise<NanoclawServiceHelpers> {
+    await main(['remove', '--id', 'x'], { interactive: false });
+    const helpers = runtimeOf().serviceHelpers;
+    if (!helpers) throw new Error('The driver supplied no service helpers');
+    return { ...helpers, createCommandRunner: () => runner };
+  }
+
+  /** A home holding the service definition gws-ea writes for the install, where its coordinates put it. */
+  async function installed(platform: InstanceServicePlatform) {
+    const home = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-service-home-'));
+    homes.push(home);
+    const coordinates = createInstanceServiceCoordinates({
+      installId: INSTALL_ID,
+      homeDirectory: home,
+      platform,
+      runningAsRoot: false,
+    });
+    await mkdir(path.dirname(coordinates.serviceDefinitionPath), { recursive: true });
+    await writeFile(coordinates.serviceDefinitionPath, 'definition\n');
+    const target: ServiceControlTarget = {
+      checkoutRoot: path.join(home, 'nanoclaw'),
+      installId: INSTALL_ID,
+      homeDirectory: home,
+      dockerEndpoint: 'unix:///var/run/docker.sock',
+    };
+    return { coordinates, target };
+  }
+
+  /**
+   * launchd at `launchctl`: `bootout` unloads the job, but it lingers for
+   * `linger` more `print`s while launchd removes it, and `bootstrap` fails as
+   * launchd does while the job is still loaded.
+   */
+  function fakeLaunchd(label: string, state: { loaded: boolean; lingering: number }, linger = 0) {
+    const calls: string[] = [];
+    const service = `gui/${UID}/${label}`;
+    const runner: NanoclawCommandRunner = {
+      run(command, args) {
+        calls.push(`${command} ${args.join(' ')}`);
+        if (command === 'launchctl' && args[0] === 'bootout') {
+          if (!state.loaded)
+            throw new Error(`Command failed: launchctl bootout ${service}\nBoot-out failed: 3: No such process`);
+          state.loaded = false;
+          state.lingering = linger;
+          return '';
+        }
+        if (command === 'launchctl' && args[0] === 'bootstrap') {
+          if (state.loaded || state.lingering > 0) {
+            throw new Error(`Command failed: launchctl bootstrap gui/${UID}\nBootstrap failed: 5: Input/output error`);
+          }
+          state.loaded = true;
+          return '';
+        }
+        if (command === 'launchctl' && args[0] === 'kickstart' && state.loaded) return '';
+        throw new Error(`Unexpected command: ${command} ${args.join(' ')}`);
+      },
+      tryRun(command, args) {
+        calls.push(`${command} ${args.join(' ')}`);
+        if (command !== 'launchctl' || args[0] !== 'print') return { ok: false, stdout: '' };
+        if (state.lingering > 0) {
+          state.lingering -= 1;
+          return { ok: true, stdout: '' };
+        }
+        return { ok: state.loaded, stdout: '' };
+      },
+    };
+    return { runner, calls };
+  }
+
+  it.each([
+    ['macos', 'darwin', (identity: string) => `launchctl print gui/${UID}/${identity}`],
+    ['linux', 'linux', (identity: string) => `systemctl --user is-active --quiet ${identity}`],
+  ] as const)(
+    "detects the %s service at the label and definition gws-ea's coordinates produce (drift guard)",
+    async (platform, nodePlatform, probe) => {
+      const { coordinates, target } = await installed(platform);
+      const calls: string[] = [];
+      const runner: NanoclawCommandRunner = {
+        run: () => '',
+        tryRun(command, args) {
+          calls.push(`${command} ${args.join(' ')}`);
+          return { ok: true, stdout: '' };
+        },
+      };
+      const service = createServiceControl(await wiredHelpers(runner), target, {
+        platform: nodePlatform,
+        uid: UID,
+        ambientEnv: {},
+      });
+
+      expect(service.detect()).toMatchObject({
+        name: coordinates.serviceIdentity,
+        definition: coordinates.serviceDefinitionPath,
+        active: true,
+      });
+      expect(calls).toEqual([probe(coordinates.serviceIdentity)]);
+    },
+  );
+
+  it('starts a stopped (booted-out) assistant by bootstrapping and kickstarting it', async () => {
+    const { coordinates, target } = await installed('macos');
+    const { runner, calls } = fakeLaunchd(coordinates.serviceIdentity, { loaded: false, lingering: 0 });
+    const service = createServiceControl(await wiredHelpers(runner), target, {
+      platform: 'darwin',
+      uid: UID,
+      ambientEnv: {},
+    });
+
+    await expect(service.start()).resolves.toBe('started');
+
+    expect(calls).toEqual([
+      `launchctl print gui/${UID}/${coordinates.serviceIdentity}`,
+      `launchctl bootstrap gui/${UID} ${coordinates.serviceDefinitionPath}`,
+      `launchctl kickstart gui/${UID}/${coordinates.serviceIdentity}`,
+    ]);
+  });
+
+  it.each([
+    ['a running job', { loaded: true, lingering: 0 }],
+    ['a job a stop has just booted out', { loaded: false, lingering: 2 }],
+  ] as const)('restarts %s only once launchd has dropped it, so bootstrap never fails', async (_what, initial) => {
+    const { coordinates, target } = await installed('macos');
+    const { runner, calls } = fakeLaunchd(coordinates.serviceIdentity, { ...initial }, 3);
+    const sleep = vi.fn(async (_milliseconds: number) => undefined);
+    const service = createServiceControl(await wiredHelpers(runner), target, {
+      platform: 'darwin',
+      uid: UID,
+      ambientEnv: {},
+      sleep,
+    });
+
+    await expect(service.restart()).resolves.toBe('restarted');
+
+    const bootstrap = calls.indexOf(`launchctl bootstrap gui/${UID} ${coordinates.serviceDefinitionPath}`);
+    expect(bootstrap).toBeGreaterThan(calls.indexOf(`launchctl bootout gui/${UID}/${coordinates.serviceIdentity}`));
+    expect(calls.slice(bootstrap)).toEqual([
+      `launchctl bootstrap gui/${UID} ${coordinates.serviceDefinitionPath}`,
+      `launchctl kickstart gui/${UID}/${coordinates.serviceIdentity}`,
+    ]);
+    expect(sleep).toHaveBeenCalled();
   });
 });

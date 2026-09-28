@@ -9,9 +9,18 @@ import { pathToFileURL } from 'node:url';
 import * as p from '@clack/prompts';
 import k from 'kleur';
 
+import {
+  createCommandRunner,
+  detectService,
+  drainContainers,
+  startService,
+  stopService,
+  verifyServiceHealth,
+} from '../scripts/update/service.js';
 import { runCli, type CliRuntime, type FailureReport, type Presenter } from '../src/gws-ea/cli.js';
 import type { InteractivePrompts } from '../src/gws-ea/events.js';
 import type { HostStatusHelpers } from '../src/gws-ea/service.js';
+import type { NanoclawServiceHelpers } from '../src/gws-ea/service-control.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
 import { offerDiagnosis } from './gws-ea-assist.js';
 import { authenticateGwsEaProvider, CLOUDFLARE_API_TOKEN_GUIDANCE, collectGwsEaCreateInput } from './gws-ea-input.js';
@@ -167,6 +176,16 @@ async function loadHostStatus(): Promise<HostStatusHelpers> {
   };
 }
 
+/** Upstream's update-controller service helpers, unchanged: every assistant's host is controlled through them. */
+const serviceHelpers: NanoclawServiceHelpers = {
+  createCommandRunner,
+  detectService,
+  stopService,
+  startService,
+  drainContainers,
+  verifyServiceHealth,
+};
+
 /** Diagnosis first, then the retry offer; a retry re-runs prerequisites and resumes. */
 async function handleFailure(report: FailureReport): Promise<'retry' | 'stop'> {
   await offerDiagnosis(report);
@@ -183,10 +202,11 @@ export async function main(argv: readonly string[], options: { readonly interact
   const collectCreateInputs: CliRuntime['collectCreateInputs'] = (context) =>
     collectGwsEaCreateInput(context, { providers, interactive });
   const hostStatus = await loadHostStatus();
-  if (!interactive) return runCli(argv, { collectCreateInputs, upsertEnvVars, hostStatus });
+  if (!interactive) return runCli(argv, { collectCreateInputs, upsertEnvVars, hostStatus, serviceHelpers });
   return runCli(argv, {
     upsertEnvVars,
     hostStatus,
+    serviceHelpers,
     presenter: createTerminalPresenter(),
     prompts: terminalPrompts(providers),
     collectCreateInputs,

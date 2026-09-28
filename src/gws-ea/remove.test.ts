@@ -36,6 +36,7 @@ import {
   type RemovalDependencies,
   type RemovalInteraction,
 } from './remove.js';
+import type { NanoclawServiceHandle, NanoclawServiceHelpers } from './service-control.js';
 import { GwsEaError, type InstanceReservationInput, type ProvisionStepId } from './types.js';
 import { keepAccountToken } from './cloudflare-token.js';
 
@@ -151,8 +152,28 @@ function failed(stderr: string): SanitizedCommandOutcome {
   return { stdout: '', stderr, exitCode: 1 };
 }
 
-/** What `launchctl print` answers for a job that is not loaded. */
-const NOT_LOADED: SanitizedCommandOutcome = { stdout: '', stderr: 'Could not find service', exitCode: 113 };
+/**
+ * NanoClaw's service helpers, faked: detection answers what the service is
+ * now, a stop leaves it stopped, and a stop or drain lands in `order`.
+ */
+function nanoclawService(order: string[], detected: NanoclawServiceHandle) {
+  let current = detected;
+  return {
+    createCommandRunner: vi.fn<NanoclawServiceHelpers['createCommandRunner']>(() => ({
+      run: () => '',
+      tryRun: () => ({ ok: true, stdout: '' }),
+    })),
+    detectService: vi.fn<NanoclawServiceHelpers['detectService']>(() => current),
+    stopService: vi.fn<NanoclawServiceHelpers['stopService']>(async (handle) => {
+      order.push('service-stop');
+      current = { ...handle, active: false };
+    }),
+    startService: vi.fn<NanoclawServiceHelpers['startService']>(),
+    drainContainers: vi.fn<NanoclawServiceHelpers['drainContainers']>(async () => void order.push('drain')),
+    verifyServiceHealth: vi.fn<NanoclawServiceHelpers['verifyServiceHealth']>(async () => true),
+  } satisfies NanoclawServiceHelpers;
+}
+type FakeNanoclawService = ReturnType<typeof nanoclawService>;
 
 /** One Google Cloud project as gcloud reports it to the reserved account. */
 class FakeGcloud {
@@ -1300,7 +1321,7 @@ describe('removal safety', () => {
   });
 
   it.each(['linux', 'macos'] as const)(
-    'stops the %s service through its manager and cleans Docker at the recorded endpoint',
+    "stops the %s service through NanoClaw's helpers, then cleans up after it at the recorded endpoint",
     async (platform) => {
       const paths = await testPaths();
       const input = await reserve(paths, reservationInput(paths), {
@@ -1312,28 +1333,53 @@ describe('removal safety', () => {
         home_directory: home,
         docker_endpoint: recorded,
       });
-      const names = getInstallScopedNames(input.instance_id.replaceAll('-', ''));
+      const installId = input.instance_id.replaceAll('-', '');
+      const names = getInstallScopedNames(installId);
       const definition =
         platform === 'linux'
           ? path.join(home, '.config', 'systemd', 'user', `${names.systemdUnit}.service`)
           : path.join(home, 'Library', 'LaunchAgents', `${names.launchdLabel}.plist`);
       await mkdir(path.dirname(definition), { recursive: true });
       await writeFile(definition, 'unit', { mode: 0o600 });
+      const order: string[] = [];
+      const serviceHelpers = nanoclawService(order, {
+        mode: platform === 'linux' ? 'systemd-user' : 'launchd',
+        active: true,
+        name: platform === 'linux' ? names.systemdUnit : names.launchdLabel,
+        definition,
+      });
       const commands: SanitizedCommand[] = [];
       const runCommand = async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> => {
         commands.push(command);
+        order.push(`${command.command} ${command.args[0]}`);
         if (['pkill', 'pgrep'].includes(command.command)) return failed('');
         if (command.args.includes('is-active')) return { stdout: 'inactive\n', stderr: '', exitCode: 3 };
-        if (command.args[0] === 'print') return NOT_LOADED;
         return ok();
       };
       const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
 
-      await removeAssistant(paths, input.instance_id, { ...dependencies, platform, runCommand });
+      await removeAssistant(paths, input.instance_id, { ...dependencies, platform, runCommand, serviceHelpers });
 
+      // Bound to this assistant: its checkout, install, home, and recorded Docker endpoint.
+      expect(serviceHelpers.detectService).toHaveBeenCalledWith(
+        input.checkout_realpath,
+        expect.objectContaining({
+          platform: platform === 'linux' ? 'linux' : 'darwin',
+          home,
+          installSlug: installId,
+        }),
+      );
+      expect(serviceHelpers.createCommandRunner).toHaveBeenCalledWith({
+        env: expect.objectContaining({ HOME: home, DOCKER_HOST: recorded, NANOCLAW_INSTALL_ID: installId }),
+      });
       expect(await exists(definition)).toBe(false);
+      // NanoClaw stops the service; the stray-host kill, drain, and container removal follow it.
+      expect(order.indexOf('service-stop')).toBe(0);
+      expect(order.indexOf('pkill -f')).toBeLessThan(order.indexOf('drain'));
+      expect(order.indexOf('drain')).toBeLessThan(order.indexOf('docker ps'));
       const service = commands.filter((command) => ['launchctl', 'systemctl'].includes(command.command));
       if (platform === 'linux') {
+        // Disabled as well, so neither login nor boot starts it again.
         expect(service.map((command) => command.args.join(' '))).toEqual([
           `--user disable --now ${names.systemdUnit}.service`,
           `--user is-active ${names.systemdUnit}.service`,
@@ -1346,8 +1392,7 @@ describe('removal safety', () => {
           });
         }
       } else {
-        const domain = `gui/${process.getuid!()}/${names.launchdLabel}`;
-        expect(service.map((command) => command.args.join(' '))).toEqual([`bootout ${domain}`, `print ${domain}`]);
+        expect(service).toEqual([]);
       }
       const docker = commands.filter((command) => command.command === 'docker');
       expect(docker.map((command) => command.args.slice(0, 2).join(' '))).toEqual(['ps -aq', 'image ls']);
@@ -1355,6 +1400,61 @@ describe('removal safety', () => {
       await expectGone(paths, input);
     },
   );
+
+  it('cleans up a stray host and a stopped container though no service runs it', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(paths), {
+      started: ['materialize_checkout', 'start_nanoclaw'],
+    });
+    const { containerInstallLabel } = getInstallScopedNames(input.instance_id.replaceAll('-', ''));
+    const order: string[] = [];
+    const serviceHelpers = nanoclawService(order, { mode: 'unmanaged', active: true, name: '4242' });
+    let host = true;
+    let containers = ['stopped123'];
+    const runCommand = async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> => {
+      const line = `${command.command} ${command.args.join(' ')}`;
+      order.push(line);
+      if (command.command === 'pkill') {
+        host = false;
+        return ok();
+      }
+      if (command.command === 'pgrep') return host ? ok('4242\n') : failed('');
+      if (line === `docker ps -aq --filter label=${containerInstallLabel}`) return ok(containers.join('\n'));
+      if (line === 'docker rm --force stopped123') {
+        containers = [];
+        return ok();
+      }
+      return ok();
+    };
+    const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
+
+    await removeAssistant(paths, input.instance_id, { ...dependencies, runCommand, serviceHelpers });
+
+    // The host outside the service is not NanoClaw's to stop; the stray-host kill takes it.
+    expect(serviceHelpers.stopService).not.toHaveBeenCalled();
+    expect(order).toContain('drain');
+    expect(order.indexOf('drain')).toBeGreaterThan(order.findIndex((line) => line.startsWith('pkill')));
+    expect(order).toContain('docker rm --force stopped123');
+    expect(host).toBe(false);
+    expect(containers).toEqual([]);
+    await expectGone(paths, input);
+  });
+
+  it('refuses before any change when it has no NanoClaw service helpers to stop the host with', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(paths), {
+      started: ['materialize_checkout', 'start_nanoclaw'],
+    });
+    const runCommand = vi.fn(async (): Promise<SanitizedCommandOutcome> => ok());
+    const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
+
+    await expect(removeAssistant(paths, input.instance_id, { ...dependencies, runCommand })).rejects.toMatchObject({
+      code: 'interactive_setup_unavailable',
+    });
+    expect(runCommand).not.toHaveBeenCalled();
+    expect(await exists(paths.removalFile(input.instance_id))).toBe(false);
+    expect(await exists(paths.instanceRoot(input.instance_id))).toBe(true);
+  });
 
   it('stops before deleting a retiring tunnel whose connector sessions never clear', async () => {
     const paths = await testPaths();
@@ -1382,58 +1482,56 @@ describe('removal safety', () => {
     expect(cloudflare.tunnels).toEqual([tunnel]);
   });
 
+  it('waits for a stray NanoClaw host it stopped to go, and names one that never does', async () => {
+    for (const goneAfter of [2, Infinity]) {
+      const paths = await testPaths();
+      const input = await reserve(paths, reservationInput(paths), {
+        started: ['materialize_checkout', 'start_nanoclaw'],
+      });
+      let checks = 0;
+      const runCommand = async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> => {
+        if (command.command !== 'pgrep') return ok();
+        checks += 1;
+        return checks > goneAfter ? failed('') : ok();
+      };
+      const sleep = vi.fn(async () => undefined);
+      const serviceHelpers = nanoclawService([], { mode: 'none', active: false });
+      const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
+
+      const removal = removeAssistant(paths, input.instance_id, {
+        ...dependencies,
+        runCommand,
+        sleep,
+        serviceHelpers,
+      });
+      if (goneAfter === Infinity) {
+        await expect(removal).rejects.toMatchObject({
+          code: 'nanoclaw_removal_incomplete',
+          message: expect.stringContaining('host process is still running'),
+        });
+        expect(checks).toBe(10);
+      } else {
+        await removal;
+        expect(checks).toBe(3);
+        await expectGone(paths, input);
+      }
+      expect(sleep).toHaveBeenCalledTimes(checks - 1);
+    }
+  });
+
   it.each([
     [
-      'the launchd job it booted out',
-      'macos',
-      (command: SanitizedCommand) => command.command === 'launchctl' && command.args[0] === 'print',
-      NOT_LOADED,
-      'launchd service is still loaded',
+      'NanoClaw cannot stop it',
+      (helpers: FakeNanoclawService) =>
+        helpers.stopService.mockRejectedValueOnce(new Error('Boot-out failed: 5: Input/output error')),
+      /Input\/output error/u,
     ],
     [
-      'a stray NanoClaw host it stopped',
-      'linux',
-      (command: SanitizedCommand) => command.command === 'pgrep',
-      failed(''),
-      'host process is still running',
+      'its launchd job never leaves',
+      (helpers: FakeNanoclawService) => helpers.stopService.mockImplementationOnce(async () => undefined),
+      /still running after it was stopped/u,
     ],
-  ] as const)(
-    'waits for %s to go, and names one that never does',
-    async (_what, platform, probed, gone, stillThere) => {
-      for (const goneAfter of [2, Infinity]) {
-        const paths = await testPaths();
-        const input = await reserve(paths, reservationInput(paths), {
-          started: ['materialize_checkout', 'start_nanoclaw'],
-        });
-        let checks = 0;
-        const runCommand = async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> => {
-          if (probed(command)) {
-            checks += 1;
-            return checks > goneAfter ? gone : ok();
-          }
-          return command.command === 'pgrep' ? failed('') : ok();
-        };
-        const sleep = vi.fn(async () => undefined);
-        const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
-
-        const removal = removeAssistant(paths, input.instance_id, { ...dependencies, platform, runCommand, sleep });
-        if (goneAfter === Infinity) {
-          await expect(removal).rejects.toMatchObject({
-            code: 'nanoclaw_removal_incomplete',
-            message: expect.stringContaining(stillThere),
-          });
-          expect(checks).toBe(10);
-        } else {
-          await removal;
-          expect(checks).toBe(3);
-          await expectGone(paths, input);
-        }
-        expect(sleep).toHaveBeenCalledTimes(checks - 1);
-      }
-    },
-  );
-
-  it('stops, keeping the launchd definition, when launchctl print fails for another reason', async () => {
+  ] as const)('stops, keeping the service definition, when %s', async (_why, arrange, reason) => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput(paths), {
       started: ['materialize_checkout', 'start_nanoclaw'],
@@ -1447,14 +1545,18 @@ describe('removal safety', () => {
     const definition = path.join(home, 'Library', 'LaunchAgents', `${names.launchdLabel}.plist`);
     await mkdir(path.dirname(definition), { recursive: true });
     await writeFile(definition, 'plist', { mode: 0o600 });
-    const runCommand = async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> =>
-      command.args[0] === 'print' ? { stdout: '', stderr: 'Bad request.', exitCode: 5 } : ok();
+    const serviceHelpers = nanoclawService([], { mode: 'launchd', active: true, name: names.launchdLabel, definition });
+    arrange(serviceHelpers);
+    const runCommand = vi.fn(async (): Promise<SanitizedCommandOutcome> => ok());
     const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
 
     await expect(
-      removeAssistant(paths, input.instance_id, { ...dependencies, platform: 'macos', runCommand }),
-    ).rejects.toMatchObject({ code: 'command_failed' });
+      removeAssistant(paths, input.instance_id, { ...dependencies, platform: 'macos', runCommand, serviceHelpers }),
+    ).rejects.toThrow(reason);
     expect(await exists(definition)).toBe(true);
+    // Nothing after the service stop ran: no host kill, drain, or container removal.
+    expect(runCommand).not.toHaveBeenCalled();
+    expect(serviceHelpers.drainContainers).not.toHaveBeenCalled();
   });
 });
 

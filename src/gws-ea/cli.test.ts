@@ -24,6 +24,7 @@ import {
 import { runSanitizedCommand } from './process.js';
 import { installProductionBootstrapManifest } from './provision.js';
 import { allocateInstanceId, readRegistry } from './registry.js';
+import type { NanoclawServiceHelpers } from './service-control.js';
 import { resolveReleaseSource } from './release-tracks.js';
 import { activeStep } from './run-log.js';
 import { GwsEaError, releaseOf, type InstanceReservationInput } from './types.js';
@@ -575,6 +576,34 @@ describe('gws-ea without a TTY', () => {
     );
     expect(io.err.join('\n')).toContain('--yes');
     expect(remove).not.toHaveBeenCalled();
+  });
+
+  it("hands removal the driver's NanoClaw service helpers, which stop the host", async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation(paths));
+    const remove = vi.fn(async () => ({ removed: ['instance-files' as const], abandoned: [] }));
+    const serviceHelpers: NanoclawServiceHelpers = {
+      createCommandRunner: vi.fn(),
+      detectService: vi.fn(),
+      stopService: vi.fn(),
+      startService: vi.fn(),
+      drainContainers: vi.fn(),
+      verifyServiceHealth: vi.fn(),
+    };
+
+    expect(
+      await runCli(['remove', '--id', input.instance_id, '--yes'], {
+        paths,
+        ...lines().runtime,
+        removeAssistant: remove,
+        serviceHelpers,
+      }),
+    ).toBe(0);
+    expect(remove).toHaveBeenCalledExactlyOnceWith(
+      paths,
+      input.instance_id,
+      expect.objectContaining({ serviceHelpers }),
+    );
   });
 
   it('prints durable, deduplicated progress lines', async () => {

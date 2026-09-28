@@ -51,6 +51,7 @@ import {
 } from './remove.js';
 import { FIXTURE_STAGING_DIRECTORY, startRunLog, type RunLog } from './run-log.js';
 import type { HostStatusHelpers, UpsertEnvVars } from './service.js';
+import type { NanoclawServiceHelpers } from './service-control.js';
 import { GwsEaError, type AllocatedPorts, type GwsEaErrorDetails, type InstanceReservationInput } from './types.js';
 
 /** Unlabeled, so a scripted create's first line stays its `instance_id`. */
@@ -145,6 +146,8 @@ export interface CliRuntime {
   upsertEnvVars?: UpsertEnvVars;
   /** Upstream's host readiness helpers (`setup/lib/host-status.mjs`), which the driver supplies. */
   hostStatus?: HostStatusHelpers;
+  /** Upstream's service helpers (`scripts/update/service.ts`), which the driver supplies; they control each host. */
+  serviceHelpers?: NanoclawServiceHelpers;
 }
 
 const COMMON_OPTIONS = ['secrets-file'] as const;
@@ -625,7 +628,7 @@ class Cli {
     }
     const remove: RemoveAssistantRunner = this.#runtime.removeAssistant ?? removeAssistant;
     const removed = await runStep(reporter, { id: 'remove', label: 'Removing the assistant…' }, () =>
-      remove(this.#paths, instanceId, { interaction, abandon, reporter }),
+      remove(this.#paths, instanceId, { interaction, abandon, reporter, serviceHelpers: this.#runtime.serviceHelpers }),
     );
     return {
       status: 'ready',

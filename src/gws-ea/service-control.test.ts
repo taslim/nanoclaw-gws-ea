@@ -1,0 +1,268 @@
+import { describe, expect, it, vi } from 'vitest';
+
+import {
+  createServiceControl,
+  type NanoclawCommandRunner,
+  type NanoclawServiceHandle,
+  type NanoclawServiceHelpers,
+  type ServiceControlOptions,
+  type ServiceControlTarget,
+} from './service-control.js';
+
+const INSTALL_ID = '0123456789abcdef0123456789abcdef';
+const LABEL = `com.nanoclaw-v2-${INSTALL_ID}`;
+const TARGET: ServiceControlTarget = {
+  checkoutRoot: '/state/instances/x/nanoclaw',
+  installId: INSTALL_ID,
+  homeDirectory: '/Users/operator',
+  dockerEndpoint: 'unix:///Users/operator/.docker/run/docker.sock',
+};
+
+const LOADED: NanoclawServiceHandle = {
+  mode: 'launchd',
+  active: true,
+  name: LABEL,
+  definition: `/Users/operator/Library/LaunchAgents/${LABEL}.plist`,
+};
+const BOOTED_OUT: NanoclawServiceHandle = { ...LOADED, active: false };
+const NOT_INSTALLED: NanoclawServiceHandle = { mode: 'none', active: false };
+const UNMANAGED: NanoclawServiceHandle = { mode: 'unmanaged', active: true, name: '4242' };
+
+/**
+ * NanoClaw's helpers, faked: detection answers from `detections` in turn and
+ * then keeps its last answer; every helper call is recorded in order.
+ */
+function nanoclaw(...detections: NanoclawServiceHandle[]) {
+  const calls: string[] = [];
+  const runner: NanoclawCommandRunner = { run: () => '', tryRun: () => ({ ok: true, stdout: '' }) };
+  let detected = 0;
+  const helpers = {
+    createCommandRunner: vi.fn<NanoclawServiceHelpers['createCommandRunner']>(() => runner),
+    detectService: vi.fn<NanoclawServiceHelpers['detectService']>(() => {
+      calls.push('detect');
+      return detections[Math.min(detected++, detections.length - 1)]!;
+    }),
+    stopService: vi.fn<NanoclawServiceHelpers['stopService']>(async () => void calls.push('stop')),
+    startService: vi.fn<NanoclawServiceHelpers['startService']>(() => void calls.push('start')),
+    drainContainers: vi.fn<NanoclawServiceHelpers['drainContainers']>(async () => void calls.push('drain')),
+    verifyServiceHealth: vi.fn<NanoclawServiceHelpers['verifyServiceHealth']>(async () => {
+      calls.push('health');
+      return true;
+    }),
+  } satisfies NanoclawServiceHelpers;
+  return { helpers, calls, runner };
+}
+
+function control(helpers: NanoclawServiceHelpers, options: ServiceControlOptions = {}) {
+  const sleep = vi.fn(async (_milliseconds: number) => undefined);
+  return {
+    sleep,
+    service: createServiceControl(helpers, TARGET, { platform: 'darwin', uid: 501, ambientEnv: {}, sleep, ...options }),
+  };
+}
+
+describe('binding NanoClaw service helpers to one assistant', () => {
+  it("names the assistant's install, home, and user to every helper, and runs its commands in its environment", () => {
+    const { helpers, runner } = nanoclaw(LOADED);
+    const ambientEnv = {
+      PATH: '/opt/homebrew/bin:/usr/bin',
+      HOME: '/Users/someone-else',
+      DOCKER_HOST: 'unix:///var/run/another-docker.sock',
+      NANOCLAW_INSTALL_ID: 'another-install',
+      ANTHROPIC_API_KEY: 'provider-secret-canary',
+    };
+    const { service } = control(helpers, { platform: 'darwin', uid: 501, ambientEnv });
+
+    expect(service.detect()).toEqual(LOADED);
+
+    expect(helpers.createCommandRunner).toHaveBeenCalledExactlyOnceWith({
+      env: {
+        PATH: '/opt/homebrew/bin:/usr/bin',
+        HOME: TARGET.homeDirectory,
+        DOCKER_HOST: TARGET.dockerEndpoint,
+        NANOCLAW_INSTALL_ID: INSTALL_ID,
+      },
+    });
+    expect(helpers.detectService).toHaveBeenCalledExactlyOnceWith(TARGET.checkoutRoot, {
+      platform: 'darwin',
+      home: TARGET.homeDirectory,
+      uid: 501,
+      installSlug: INSTALL_ID,
+      runner,
+      sleep: expect.any(Function),
+      log: expect.any(Function),
+    });
+  });
+
+  it('reaches the systemd user manager over the user bus, derived from the UID when the caller has none', () => {
+    const { helpers } = nanoclaw(NOT_INSTALLED);
+    const { service } = control(helpers, { platform: 'linux', uid: 1000, ambientEnv: { PATH: '/usr/bin' } });
+
+    service.detect();
+
+    expect(helpers.createCommandRunner).toHaveBeenCalledExactlyOnceWith({
+      env: {
+        PATH: '/usr/bin',
+        HOME: TARGET.homeDirectory,
+        DOCKER_HOST: TARGET.dockerEndpoint,
+        NANOCLAW_INSTALL_ID: INSTALL_ID,
+        XDG_RUNTIME_DIR: '/run/user/1000',
+        DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus',
+      },
+    });
+    expect(helpers.detectService.mock.calls[0]![1]).toMatchObject({ platform: 'linux', uid: 1000 });
+  });
+});
+
+describe('start', () => {
+  it('starts a stopped (booted-out) assistant by passing its detected handle marked active', async () => {
+    const { helpers, calls } = nanoclaw(BOOTED_OUT);
+    const { service } = control(helpers);
+
+    await expect(service.start()).resolves.toBe('started');
+
+    expect(helpers.startService).toHaveBeenCalledExactlyOnceWith(
+      { ...BOOTED_OUT, active: true },
+      TARGET.checkoutRoot,
+      helpers.detectService.mock.calls[0]![1],
+    );
+    expect(calls).toEqual(['detect', 'start']);
+  });
+
+  it('leaves a running assistant as it is', async () => {
+    const { helpers, calls } = nanoclaw(LOADED);
+
+    await expect(control(helpers).service.start()).resolves.toBe('already-running');
+    expect(calls).toEqual(['detect']);
+  });
+});
+
+describe('stop', () => {
+  it('stops the service without draining its agents, then waits until detection shows it gone', async () => {
+    const { helpers, calls } = nanoclaw(LOADED, LOADED, LOADED, BOOTED_OUT);
+    const { service, sleep } = control(helpers);
+
+    await expect(service.stop()).resolves.toBe('stopped');
+
+    expect(helpers.stopService).toHaveBeenCalledExactlyOnceWith(LOADED, helpers.detectService.mock.calls[0]![1]);
+    expect(calls).toEqual(['detect', 'stop', 'detect', 'detect', 'detect']);
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(helpers.drainContainers).not.toHaveBeenCalled();
+  });
+
+  it('counts an assistant that is not running as already stopped', async () => {
+    for (const handle of [BOOTED_OUT, NOT_INSTALLED]) {
+      const { helpers, calls } = nanoclaw(handle);
+
+      await expect(control(helpers).service.stop()).resolves.toBe('already-stopped');
+      expect(calls).toEqual(['detect']);
+    }
+  });
+
+  it('fails, naming the service, when the job never leaves', async () => {
+    const { helpers, calls } = nanoclaw(LOADED);
+    const { service, sleep } = control(helpers);
+
+    await expect(service.stop()).rejects.toMatchObject({
+      code: 'service_still_running',
+      message: expect.stringContaining(LABEL),
+    });
+    // Bounded: every wait counted toward a limit well past launchd's own SIGKILL.
+    const waited = sleep.mock.calls.reduce((total, [milliseconds]) => total + milliseconds, 0);
+    expect(waited).toBeGreaterThanOrEqual(20_000);
+    expect(waited).toBeLessThanOrEqual(60_000);
+    expect(calls).not.toContain('start');
+  });
+});
+
+describe('restart', () => {
+  it('waits for launchd to drop the job before starting it again', async () => {
+    // A restart right after a stop: the job is still going for a few polls.
+    const { helpers, calls } = nanoclaw(LOADED, LOADED, LOADED, LOADED, BOOTED_OUT);
+    const { service } = control(helpers);
+
+    await expect(service.restart()).resolves.toBe('restarted');
+
+    expect(calls).toEqual(['detect', 'stop', 'detect', 'detect', 'detect', 'detect', 'start']);
+    expect(helpers.startService).toHaveBeenCalledExactlyOnceWith(
+      { ...LOADED, active: true },
+      TARGET.checkoutRoot,
+      helpers.detectService.mock.calls[0]![1],
+    );
+    expect(helpers.drainContainers).not.toHaveBeenCalled();
+  });
+
+  it('starts a stopped assistant', async () => {
+    const { helpers, calls } = nanoclaw(BOOTED_OUT);
+
+    await expect(control(helpers).service.restart()).resolves.toBe('started');
+    expect(calls).toEqual(['detect', 'start']);
+    expect(helpers.startService).toHaveBeenCalledWith(
+      { ...BOOTED_OUT, active: true },
+      TARGET.checkoutRoot,
+      expect.anything(),
+    );
+  });
+
+  it('never starts a job that did not leave', async () => {
+    const { helpers, calls } = nanoclaw(LOADED);
+
+    await expect(control(helpers).service.restart()).rejects.toMatchObject({ code: 'service_still_running' });
+    expect(calls).not.toContain('start');
+  });
+});
+
+describe('refusals', () => {
+  it.each([
+    ['start', 'service_not_installed'],
+    ['restart', 'service_not_installed'],
+  ] as const)('%s refuses when no service is installed', async (action, code) => {
+    const { helpers, calls } = nanoclaw(NOT_INSTALLED);
+
+    await expect(control(helpers).service[action]()).rejects.toMatchObject({ code });
+    expect(calls).toEqual(['detect']);
+  });
+
+  it.each(['start', 'stop', 'restart'] as const)(
+    '%s refuses a host running from the checkout outside its service',
+    async (action) => {
+      const { helpers, calls } = nanoclaw(UNMANAGED);
+
+      await expect(control(helpers).service[action]()).rejects.toMatchObject({
+        code: 'service_unmanaged',
+        message: expect.stringContaining('4242'),
+      });
+      expect(calls).toEqual(['detect']);
+    },
+  );
+});
+
+describe('drain and health', () => {
+  it("drains only the assistant's own containers, within the bound given", async () => {
+    const { helpers } = nanoclaw(LOADED);
+    const { service } = control(helpers);
+
+    await service.drain(5_000);
+
+    expect(helpers.drainContainers).toHaveBeenCalledExactlyOnceWith(
+      TARGET.checkoutRoot,
+      expect.objectContaining({ installSlug: INSTALL_ID }),
+      5_000,
+    );
+  });
+
+  it('verifies health against the detected service marked active, so a stopped one is never taken as healthy', async () => {
+    const { helpers } = nanoclaw(BOOTED_OUT);
+    helpers.verifyServiceHealth.mockResolvedValueOnce(false);
+    const { service } = control(helpers);
+
+    await expect(service.verifyHealth(10_000)).resolves.toBe(false);
+
+    expect(helpers.verifyServiceHealth).toHaveBeenCalledExactlyOnceWith(
+      { ...BOOTED_OUT, active: true },
+      TARGET.checkoutRoot,
+      expect.objectContaining({ installSlug: INSTALL_ID }),
+      10_000,
+    );
+  });
+});

@@ -289,6 +289,132 @@ describe('drain and health gates', () => {
   });
 });
 
+describe('an explicit install slug', () => {
+  // A controller acting on another install's checkout names that install; the
+  // path the checkout sits at (or this process's NANOCLAW_INSTALL_ID) does not.
+  const SLUG = '0123456789abcdef0123456789abcdef';
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  function unit(home: string, name: string): string {
+    const file = path.join(home, '.config', 'systemd', 'user', `${name}.service`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '[Service]\n');
+    return file;
+  }
+
+  it('detects the launchd job named for the slug, over this process NANOCLAW_INSTALL_ID', () => {
+    vi.stubEnv('NANOCLAW_INSTALL_ID', 'another-install');
+    const root = temp();
+    const name = `com.nanoclaw-v2-${SLUG}`;
+    const { env, calls, home } = makeEnv('darwin');
+    const plist = path.join(home, 'Library', 'LaunchAgents', `${name}.plist`);
+    fs.mkdirSync(path.dirname(plist), { recursive: true });
+    fs.writeFileSync(plist, '<plist/>\n');
+
+    expect(detectService(root, { ...env, installSlug: SLUG })).toEqual({
+      mode: 'launchd',
+      name,
+      definition: plist,
+      active: true,
+    });
+    expect(calls).toEqual([`launchctl print gui/1000/${name}`]);
+    // Without it, detection keeps today's derivation and finds nothing of this install's.
+    expect(detectService(root, env)).toMatchObject({ mode: 'none' });
+  });
+
+  it('detects the systemd user unit named for the slug', () => {
+    const root = temp();
+    const name = `nanoclaw-v2-${SLUG}`;
+    const { env, home } = makeEnv('linux', { [`systemctl --user is-active --quiet ${name}`]: { ok: false } });
+
+    const definition = unit(home, name);
+
+    expect(detectService(root, { ...env, installSlug: SLUG })).toEqual({
+      mode: 'systemd-user',
+      name,
+      definition,
+      active: false,
+    });
+  });
+
+  it('refuses a slug that is not an install ID before running anything', async () => {
+    const root = temp();
+    const { env, calls } = makeEnv('linux');
+    const named = { ...env, installSlug: '../another' };
+
+    expect(() => detectService(root, named)).toThrow(/Install slug must be/);
+    await expect(drainContainers(root, named)).rejects.toThrow(/Install slug must be/);
+    expect(calls).toEqual([]);
+  });
+
+  it("verifies the named install's own service, not the one the checkout path derives", async () => {
+    const root = temp();
+    const own = `nanoclaw-v2-${SLUG}`;
+    const derived = `nanoclaw-v2-${slug(root)}`;
+    const { env, home } = makeEnv('linux', {
+      [`systemctl --user is-active --quiet ${own}`]: { ok: true },
+      [`systemctl --user is-active --quiet ${derived}`]: { ok: false },
+      [`${path.join(root, 'bin', 'ncl')} groups list`]: { ok: true },
+    });
+    const definition = unit(home, own);
+    unit(home, derived);
+    fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'data', 'ncl.sock'), 'test socket stand-in');
+    const handle = { mode: 'systemd-user' as const, active: true, name: own, definition };
+
+    expect(await verifyServiceHealth(handle, root, { ...env, installSlug: SLUG }, 10)).toBe(true);
+    expect(await verifyServiceHealth(handle, root, env, 10)).toBe(false);
+  });
+
+  it("stops only the named install's containers", async () => {
+    const root = temp();
+    const listings: Record<string, string[]> = {
+      [`nanoclaw-install=${SLUG}`]: ['own111'],
+      [`nanoclaw-install=${slug(root)}`]: ['other222'],
+    };
+    const { env, calls } = makeEnv('linux');
+    env.runner.tryRun = (command, args) => {
+      calls.push(`${command} ${args.join(' ')}`);
+      if (args[0] === 'ps') return { ok: true, stdout: (listings[args[3]!.slice('label='.length)] ?? []).join('\n') };
+      if (args[0] === 'stop') {
+        for (const ids of Object.values(listings)) ids.splice(0, ids.length, ...ids.filter((id) => !args.includes(id)));
+      }
+      return { ok: true, stdout: '' };
+    };
+
+    await drainContainers(root, { ...env, installSlug: SLUG });
+
+    expect(calls.filter((call) => call.startsWith('docker stop'))).toEqual([
+      `docker stop -t ${CUTOVER_STOP_GRACE_SECONDS} own111`,
+    ]);
+    expect(listings[`nanoclaw-install=${slug(root)}`]).toEqual(['other222']);
+  });
+});
+
+describe('command runner environment', () => {
+  it('runs every command with the environment it was given, and only that', () => {
+    const runner = createCommandRunner({ env: { PATH: process.env.PATH ?? '', RUNNER_MARKER: 'instance' } });
+    const script = 'process.stdout.write(`${process.env.RUNNER_MARKER}|${process.env.HOME ?? "unset"}`)';
+
+    expect(runner.run('node', ['-e', script])).toBe('instance|unset');
+    expect(runner.tryRun('node', ['-e', script])).toEqual({ ok: true, stdout: 'instance|unset' });
+  });
+
+  it("keeps this process's environment when none is given", () => {
+    vi.stubEnv('RUNNER_MARKER', 'ambient');
+    try {
+      expect(createCommandRunner().run('node', ['-e', 'process.stdout.write(process.env.RUNNER_MARKER ?? "")'])).toBe(
+        'ambient',
+      );
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+});
+
 describe('command runner output capacity', () => {
   it('captures well over the 1 MiB default maxBuffer (ENOBUFS regression)', () => {
     // A full vitest run on a large repo exceeds Node's 1 MiB spawnSync default

@@ -5,11 +5,12 @@
  * resource is observed. An absent resource is done; an owned one is deleted
  * and observed again; a foreign one is refused by name; one that cannot be
  * observed pauses with evidence until the operator abandons it. Everything a
- * resource needs — Docker, Google sign-in, the Cloudflare token — is checked
- * before the first change, and removal locks only its own instance, so one
- * stuck removal never blocks another assistant. An unfinished update or
- * rollback never stops it: its staged, kept, and outgoing releases all sit
- * under the instance root, and go with it.
+ * resource needs — Docker, NanoClaw's service helpers, Google sign-in, the
+ * Cloudflare token — is checked before the first change, and removal locks
+ * only its own instance, so one stuck removal never blocks another assistant.
+ * NanoClaw's helpers stop the host; removal then cleans up what they leave.
+ * An unfinished update or rollback never stops it: its staged, kept, and
+ * outgoing releases all sit under the instance root, and go with it.
  */
 import { access, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -87,9 +88,11 @@ import {
 import { activeStep } from './run-log.js';
 import { readOwnerOnlyJson, removePrivateFile } from './secrets.js';
 import { serviceManagerEnvironment } from './service.js';
+import { createServiceControl, type NanoclawServiceHelpers } from './service-control.js';
 import {
   createInstanceServiceCoordinates,
   instanceServicePlatform,
+  type InstanceServiceCoordinates,
   type InstanceServicePlatform,
 } from './service-coordinates.js';
 import {
@@ -171,6 +174,8 @@ export interface RemovalOptions {
   /** Resources the operator accepts leaving behind if removal cannot observe them. */
   readonly abandon?: ReadonlySet<AbandonableResource>;
   readonly reporter?: StepReporter;
+  /** NanoClaw's service helpers (`scripts/update/service.ts`), which stop the host; the driver supplies them. */
+  readonly serviceHelpers?: NanoclawServiceHelpers;
 }
 
 /** Boundary seams; each defaults to the real one. */
@@ -638,19 +643,24 @@ async function removeManagedIngress(removal: ManagedIngressRemoval): Promise<voi
   });
 }
 
-/** Stop the instance service through its manager, then its host process, containers, and image. */
-/** How often, and how many times, removal checks that what it stopped (the launchd job, a stray host) is gone. */
+/** How often, and how many times, removal checks that a stray host it stopped is gone. */
 const STOPPED_POLL_MS = 500;
 const STOPPED_CHECKS = 10;
-/** `launchctl print` exits with this, and only this, when the job is not loaded. */
-const LAUNCHD_JOB_NOT_FOUND = 113;
 
+/**
+ * Stop the instance's host through NanoClaw's own service helpers, then clean
+ * up whatever that stop leaves: the service definition (a systemd unit is
+ * disabled too, so neither login nor boot starts it again), a host running
+ * outside the service, the agent containers (drained, then removed with any
+ * that had already stopped), and the image.
+ */
 async function uninstallNanoclaw(
   reservation: InstanceReservation,
   runtime: LocalRuntime,
   platform: InstanceServicePlatform,
   run: SanitizedCommandOutcomeRunner,
   sleep: (milliseconds: number) => Promise<void>,
+  serviceHelpers: NanoclawServiceHelpers,
 ): Promise<void> {
   const installId = reservation.instance_id.replaceAll('-', '');
   const recorded = { home_directory: runtime.homeDirectory, docker_endpoint: runtime.dockerEndpoint };
@@ -678,24 +688,8 @@ async function uninstallNanoclaw(
   const coordinates = (runningAsRoot: boolean) =>
     createInstanceServiceCoordinates({ installId, homeDirectory: runtime.homeDirectory, platform, runningAsRoot });
 
-  if (platform === 'macos') {
-    const service = coordinates(false);
-    const uid = process.getuid?.();
-    if (uid === undefined) throw new GwsEaError('unsupported_platform', 'launchd requires a user ID');
-    const env = serviceManagerEnvironment(recorded, service.manager, {});
-    const domain = `gui/${uid}/${service.serviceIdentity}`;
-    // A job that is not loaded refuses bootout; `print` then decides. bootout returns before
-    // launchd has finished removing the job, so the job gets a moment to go.
-    await execute('launchctl', ['bootout', domain], env);
-    const loaded = await stillPresent(async () => {
-      const printed = await execute('launchctl', ['print', domain], env);
-      if (printed.outcome.exitCode === LAUNCHD_JOB_NOT_FOUND) return false;
-      if (printed.outcome.exitCode !== 0) throw commandExitError(printed.command, printed.outcome);
-      return true;
-    });
-    if (loaded) throw incomplete('The NanoClaw launchd service is still loaded');
-    await rm(service.serviceDefinitionPath, { force: true });
-  } else {
+  const units: InstanceServiceCoordinates[] = [];
+  if (platform === 'linux') {
     for (const runningAsRoot of [false, true]) {
       const service = coordinates(runningAsRoot);
       const defined = await access(service.serviceDefinitionPath).then(
@@ -705,23 +699,42 @@ async function uninstallNanoclaw(
           throw error;
         },
       );
-      if (!defined) continue;
-      if (runningAsRoot && process.getuid?.() !== 0) {
-        throw new GwsEaError(
-          'root_required',
-          `Re-run removal with root privileges to remove ${service.serviceDefinitionPath}`,
-        );
-      }
-      const env = serviceManagerEnvironment(recorded, service.manager, {});
-      const scope = service.manager === 'systemd-user' ? ['--user'] : [];
-      const unit = `${service.serviceIdentity}.service`;
-      await execute('systemctl', [...scope, 'disable', '--now', unit], env);
-      if ((await execute('systemctl', [...scope, 'is-active', unit], env)).outcome.exitCode === 0) {
-        throw incomplete(`The NanoClaw service ${unit} is still active`);
-      }
-      await rm(service.serviceDefinitionPath, { force: true });
-      await checked('systemctl', [...scope, 'daemon-reload'], env);
+      if (defined) units.push(service);
     }
+  }
+  // A system unit is root's to remove, so removal without root refuses before anything stops.
+  const systemUnit = units.find((service) => service.manager === 'systemd-system');
+  if (systemUnit && process.getuid?.() !== 0) {
+    throw new GwsEaError(
+      'root_required',
+      `Re-run removal with root privileges to remove ${systemUnit.serviceDefinitionPath}`,
+    );
+  }
+
+  const control = createServiceControl(
+    serviceHelpers,
+    {
+      checkoutRoot: reservation.checkout_realpath,
+      installId,
+      homeDirectory: runtime.homeDirectory,
+      dockerEndpoint: runtime.dockerEndpoint,
+    },
+    { platform: platform === 'macos' ? 'darwin' : 'linux', sleep },
+  );
+  // A host running outside its service is not NanoClaw's to stop; the stray-host kill below takes it.
+  if (control.detect().mode !== 'unmanaged') await control.stop();
+
+  if (platform === 'macos') await rm(coordinates(false).serviceDefinitionPath, { force: true });
+  for (const service of units) {
+    const env = serviceManagerEnvironment(recorded, service.manager, {});
+    const scope = service.manager === 'systemd-user' ? ['--user'] : [];
+    const unit = `${service.serviceIdentity}.service`;
+    await execute('systemctl', [...scope, 'disable', '--now', unit], env);
+    if ((await execute('systemctl', [...scope, 'is-active', unit], env)).outcome.exitCode === 0) {
+      throw incomplete(`The NanoClaw service ${unit} is still active`);
+    }
+    await rm(service.serviceDefinitionPath, { force: true });
+    await checked('systemctl', [...scope, 'daemon-reload'], env);
   }
 
   const tools = buildToolEnvironment(process.env, { DOCKER_HOST: runtime.dockerEndpoint });
@@ -738,6 +751,8 @@ async function uninstallNanoclaw(
   });
   if (hostRunning) throw incomplete('The NanoClaw host process is still running');
 
+  // Nothing is left that could start another agent, so the drain is race-free.
+  await control.drain();
   const { installLabel, imageTag } = coordinates(false);
   const containers = async (): Promise<string[]> =>
     (await checked('docker', ['ps', '-aq', '--filter', `label=${installLabel}`], tools))
@@ -883,6 +898,25 @@ async function removeLocked(
     dockerEndpoint: await docker(),
     onecliCliPath: recorded.onecliCliPath,
   });
+  const serviceHelpers = dependencies.serviceHelpers;
+  const uninstall =
+    dependencies.uninstallNanoclaw ??
+    (serviceHelpers
+      ? (removed: InstanceReservation, runtime: LocalRuntime) =>
+          uninstallNanoclaw(
+            removed,
+            runtime,
+            platform,
+            dependencies.runCommand ?? runSanitizedCommandOutcome,
+            dependencies.sleep ?? delay,
+            serviceHelpers,
+          )
+      : undefined);
+  /** Only the launcher supplies NanoClaw's service helpers, so removal refuses before any change without them. */
+  const requireUninstall = (): NonNullable<typeof uninstall> => {
+    if (uninstall) return uninstall;
+    throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
+  };
   const account = claims.gcp_account;
   const withSignIn = <T>(body: () => Promise<T>): Promise<T> =>
     withGoogleSignIn(
@@ -904,6 +938,7 @@ async function removeLocked(
   });
 
   await runStep(reporter, { id: 'prerequisites' }, async () => {
+    if (pending.has('nanoclaw')) requireUninstall();
     const retiresConnector = pending.has('managed-ingress') && (await tunnelUsers(paths, registry, instanceId)) === 0;
     if (pending.has('nanoclaw') || pending.has('onecli') || retiresConnector) await docker();
     if (pending.has('gcp-project')) {
@@ -962,16 +997,7 @@ async function removeLocked(
       return undefined;
     },
     nanoclaw: async () => {
-      const runtime = await localRuntime();
-      await (dependencies.uninstallNanoclaw
-        ? dependencies.uninstallNanoclaw(reservation, runtime)
-        : uninstallNanoclaw(
-            reservation,
-            runtime,
-            platform,
-            dependencies.runCommand ?? runSanitizedCommandOutcome,
-            dependencies.sleep ?? delay,
-          ));
+      await requireUninstall()(reservation, await localRuntime());
       return undefined;
     },
     'gcp-project': async () => {
