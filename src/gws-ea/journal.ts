@@ -7,6 +7,10 @@
  * Readers ignore unknown fields. A journal from before schema 3, or from a
  * launcher with a different step contract, is refused with guidance to remove
  * and recreate the assistant: pre-release instances are disposable.
+ *
+ * The instance operation lock is here too, with its gate: a removal under way
+ * refuses every command, and an unfinished update or rollback refuses every
+ * command but the one that continues or reverts it (`operation.ts`).
  */
 import { lstat } from 'node:fs/promises';
 import path from 'node:path';
@@ -20,6 +24,7 @@ import {
   preparePrivateDirectory,
   type ControlPlanePaths,
 } from './paths.js';
+import { admitInstanceCommand, type OperationIntent } from './operation.js';
 import type { PrincipalCandidate } from './principal.js';
 import { parsePrincipalCandidate } from './principal-selection.js';
 import { safeErrorCode, safeErrorMessage } from './redact.js';
@@ -91,6 +96,8 @@ export interface InstanceOperation {
   readonly instanceId: string;
   readonly paths: ControlPlanePaths;
   readonly [operationBrand]: true;
+  /** Throws `operation_inactive` once released; every write under the lock checks it first. */
+  assertActive(): void;
   release(): void;
 }
 
@@ -349,9 +356,19 @@ export function recordKeyPolicyLifted(operation: InstanceOperation, lifted: bool
   return updateProvisionJournal(operation, (journal) => ({ ...journal, key_policy_lifted: lifted }));
 }
 
+/** Commands that move the release need the step contract the assistant was provisioned under. */
+const CONTRACT_BOUND: ReadonlySet<OperationIntent['command']> = new Set(['update', 'rollback']);
+
+/**
+ * Take the instance lock for one command, or null when another process holds
+ * it. Under the lock the command must pass the gate: no removal under way, and
+ * no unfinished update or rollback it would conflict with. `intent` names the
+ * command; provisioning (create and resume) is the default.
+ */
 export async function acquireInstanceOperation(
   paths: ControlPlanePaths,
   instanceId: string,
+  intent: OperationIntent = { command: 'resume' },
 ): Promise<InstanceOperation | null> {
   assertInstanceId(instanceId);
   await preparePrivateDirectory(path.dirname(paths.instanceLock(instanceId)));
@@ -360,12 +377,17 @@ export async function acquireInstanceOperation(
   try {
     try {
       await assertPrivateStateFile(paths.removalFile(instanceId));
-      throw new GwsEaError('removal_in_progress', 'Assistant removal is in progress; provisioning cannot resume');
+      throw new GwsEaError(
+        'removal_in_progress',
+        `Assistant removal is in progress; finish it with gws-ea remove --id ${instanceId}.`,
+      );
     } catch (error) {
       if (!isErrno(error, 'ENOENT')) throw error;
     }
-    await getInstanceReservation(paths, instanceId);
+    const reservation = await getInstanceReservation(paths, instanceId);
     await preparePrivateDirectory(paths.instanceRoot(instanceId));
+    await admitInstanceCommand(paths, reservation, intent);
+    if (CONTRACT_BOUND.has(intent.command)) await readProvisionJournal(paths, instanceId);
   } catch (error) {
     unlock();
     throw error;
@@ -375,6 +397,7 @@ export async function acquireInstanceOperation(
     instanceId,
     paths,
     [operationBrand]: true,
+    assertActive: () => assertActiveOperation(operation),
     release: () => {
       if (!active) return;
       active = false;

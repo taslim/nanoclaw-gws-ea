@@ -19,6 +19,13 @@ import {
   reserveInstance,
   withInstanceOperation,
 } from './journal.js';
+import {
+  advanceOperation,
+  beginOperation,
+  commitOperationRelease,
+  OPERATION_PHASES,
+  type OperationPhase,
+} from './operation.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { SanitizedCommand, SanitizedCommandOutcome } from './process.js';
 import { allocateInstanceId, readRegistry, withLockedCloudflareRegistry, writeInstanceMarker } from './registry.js';
@@ -1019,6 +1026,133 @@ describe('removal from any partial state', () => {
       instances: {},
       shared_infrastructure_metadata: { cloudflare: null },
     });
+  });
+});
+
+describe('removal mid-update', () => {
+  const TARGET = 'b'.repeat(40);
+  const RECORDED_DOCKER = 'unix:///var/run/recorded-docker.sock';
+
+  function release(input: InstanceReservationInput, commit: string) {
+    return { source_remote: input.source_remote, release_track: input.release_track, deployed_commit: commit };
+  }
+
+  async function checkoutAt(root: string, instanceId: string, commit: string, docker?: string): Promise<void> {
+    const state = path.join(root, 'data', 'gws-ea');
+    await mkdir(state, { recursive: true, mode: 0o700 });
+    await writePrivate(path.join(state, 'instance.json'), {
+      schema_version: 1,
+      instance_id: instanceId,
+      deployed_commit: commit,
+    });
+    if (docker) await writePrivate(path.join(state, 'runtime.json'), { docker_endpoint: docker });
+  }
+
+  /**
+   * An update from the reserved commit to `TARGET`, interrupted at `phase`,
+   * with the directories each phase leaves: the staged release beside the live
+   * one until the renames, then the live one at the target and the old one kept.
+   */
+  async function interruptedAt(
+    paths: ControlPlanePaths,
+    input: InstanceReservationInput,
+    phase: OperationPhase,
+  ): Promise<void> {
+    const id = input.instance_id;
+    const from = release(input, input.deployed_commit);
+    const to = release(input, TARGET);
+    const renamed = OPERATION_PHASES.indexOf(phase) >= OPERATION_PHASES.indexOf('swapped');
+    const live = paths.checkoutRoot(id);
+    const previous = paths.releaseCheckoutRoot(id, 'previous');
+    const next = paths.releaseCheckoutRoot(id, 'next');
+    await rm(live, { recursive: true, force: true });
+    if (phase === 'swapping') {
+      // Killed between the two renames: the old release is kept, the staged one not yet in place.
+      await checkoutAt(previous, id, input.deployed_commit, RECORDED_DOCKER);
+      await checkoutAt(next, id, TARGET);
+    } else if (renamed) {
+      await checkoutAt(live, id, TARGET, RECORDED_DOCKER);
+      await checkoutAt(previous, id, input.deployed_commit, RECORDED_DOCKER);
+    } else {
+      await checkoutAt(live, id, input.deployed_commit, RECORDED_DOCKER);
+      await checkoutAt(next, id, TARGET);
+    }
+    const operation = await acquireInstanceOperation(paths, id, { command: 'update', target: to });
+    if (!operation) throw new Error('The test instance operation was busy');
+    try {
+      await beginOperation(operation, { kind: 'update', from, to, follow_ups: [{ kind: 'refresh_template' }] });
+      for (const step of OPERATION_PHASES.slice(1, OPERATION_PHASES.indexOf(phase) + 1)) {
+        if (step === 'recorded') await commitOperationRelease(operation);
+        else {
+          await advanceOperation(
+            operation,
+            step,
+            step === 'stopped' ? { stop: { at: '2026-09-28T10:00:00.000Z', graceful: true } } : {},
+          );
+        }
+      }
+    } finally {
+      operation.release();
+    }
+    await mkdir(paths.releaseCheckoutRoot(id, 'outgoing'), { recursive: true, mode: 0o700 });
+  }
+
+  it.each(OPERATION_PHASES)('completes with an update interrupted at %s', async (phase) => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(paths), {
+      started: ['materialize_checkout', 'start_onecli', 'start_nanoclaw'],
+    });
+    await interruptedAt(paths, input, phase);
+    const reservation = (await readRegistry(paths)).instances[input.instance_id]!;
+    const { dependencies } = world(reservation);
+
+    const outcome = await removeAssistant(paths, input.instance_id, dependencies);
+
+    expect(outcome.removed).toEqual(['nanoclaw', 'onecli', 'instance-files']);
+    // The recorded Docker endpoint is found in whichever release holds it, even with no live checkout.
+    expect(dependencies.resolveDocker).toHaveBeenCalledWith(RECORDED_DOCKER);
+    expect(dependencies.uninstallNanoclaw).toHaveBeenCalledWith(reservation, expect.anything());
+    await expectGone(paths, reservation);
+  });
+
+  it('refuses before any effect when a kept or staged release carries another assistant', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(paths), {
+      started: ['materialize_checkout', 'start_nanoclaw'],
+    });
+    await interruptedAt(paths, input, 'swapped');
+    await checkoutAt(paths.releaseCheckoutRoot(input.instance_id, 'previous'), allocateInstanceId(), 'c'.repeat(40));
+    const { dependencies } = world(input);
+
+    await expect(removeAssistant(paths, input.instance_id, dependencies)).rejects.toMatchObject({
+      code: 'marker_mismatch',
+    });
+    expect(dependencies.uninstallNanoclaw).not.toHaveBeenCalled();
+    expect(await exists(paths.removalFile(input.instance_id))).toBe(false);
+    expect(await exists(paths.instanceRoot(input.instance_id))).toBe(true);
+  });
+
+  it('refuses a live checkout at a commit no unfinished operation explains', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(paths), { started: ['materialize_checkout'] });
+    await interruptedAt(paths, input, 'stopped');
+    await checkoutAt(paths.checkoutRoot(input.instance_id), input.instance_id, TARGET);
+
+    await expect(removeAssistant(paths, input.instance_id, world(input).dependencies)).rejects.toMatchObject({
+      code: 'marker_mismatch',
+    });
+    expect(await exists(paths.removalFile(input.instance_id))).toBe(false);
+  });
+
+  it('removes by instance identity alone when the operation record cannot be read', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(paths), { started: ['materialize_checkout'] });
+    await interruptedAt(paths, input, 'started');
+    await writeFile(paths.operationFile(input.instance_id), '{torn', { mode: 0o600 });
+
+    await removeAssistant(paths, input.instance_id, world(input).dependencies);
+
+    await expectGone(paths, input);
   });
 });
 

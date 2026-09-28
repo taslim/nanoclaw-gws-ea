@@ -63,7 +63,12 @@ const INTERRUPT_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
 export const EXIT_CODES = { ready: 0, paused: 10, failed: 1, busy: 75 } as const;
 
 type LineWriter = (line: string) => void;
-type Command = 'create' | 'resume' | 'remove';
+const COMMANDS = ['create', 'resume', 'remove'] as const;
+type Command = (typeof COMMANDS)[number];
+
+function isCommand(value: string | undefined): value is Command {
+  return COMMANDS.some((command) => command === value);
+}
 
 /** A stop summary. The line presenter prints it; the terminal presenter draws it with clack. */
 export interface StopReport {
@@ -190,6 +195,13 @@ function requireOption(options: Options, name: string): string {
   return value;
 }
 
+/** `--id`: the exact assistant a command acts on. */
+function targetInstance(options: Options): string {
+  const instanceId = requireOption(options, 'id');
+  assertInstanceId(instanceId);
+  return instanceId;
+}
+
 /** `--abandon a,b`: resources removal may leave behind when it cannot observe them. */
 function parseAbandon(value: string | undefined): ReadonlySet<AbandonableResource> {
   const abandonable: readonly string[] = ABANDONABLE_RESOURCES;
@@ -211,6 +223,11 @@ function shellQuote(value: string): string {
 
 function isBusy(error: unknown): boolean {
   return error instanceof GwsEaError && error.code === 'instance_busy';
+}
+
+/** An unfinished update or rollback refused the command; its message names what continues or reverts it. */
+function isOperationRefusal(error: unknown): boolean {
+  return error instanceof GwsEaError && error.code === 'operation_in_progress';
 }
 
 function busy(): GwsEaError {
@@ -322,46 +339,58 @@ class Cli {
     this.#managedIngressSetup = managedIngressSetup;
   }
 
-  /** Validate arguments up front; the returned attempt reports every later failure itself. */
+  /**
+   * Validate arguments up front; the returned attempt reports every later
+   * failure itself. Each command has its own branch, so none falls through
+   * to another command's work.
+   */
   prepare(command: Command, args: readonly string[]): () => Promise<Attempt> {
     const options = parseOptions(args, command);
-    if (command === 'create') {
-      const track = requireOption(options, 'track');
-      const source = resolveReleaseSource(track, options['source-remote']);
-      return () =>
-        this.#attempt({
-          command,
-          args,
-          options,
-          meta: { track },
-          work: (session) => this.#createWork(session, options, track, source),
-        });
+    switch (command) {
+      case 'create': {
+        const track = requireOption(options, 'track');
+        const source = resolveReleaseSource(track, options['source-remote']);
+        return () =>
+          this.#attempt({
+            command,
+            args,
+            options,
+            meta: { track },
+            work: (session) => this.#createWork(session, options, track, source),
+          });
+      }
+      case 'resume': {
+        const instanceId = targetInstance(options);
+        return () =>
+          this.#attempt({
+            command,
+            args,
+            options,
+            instanceId,
+            decisions: {
+              chatConfigured: options['chat-configured'] === 'true',
+              ...(options['messaging-group-id'] ? { messagingGroupId: options['messaging-group-id'] } : {}),
+            },
+            work: (session) => this.#resumeWork(session, instanceId),
+          });
+      }
+      case 'remove': {
+        const instanceId = targetInstance(options);
+        const abandon = parseAbandon(options.abandon);
+        return () =>
+          this.#attempt({
+            command,
+            args,
+            options,
+            instanceId,
+            work: (session) => this.#removeWork(session, options, instanceId, abandon),
+          });
+      }
+      default: {
+        const unhandled: never = command;
+        throw new GwsEaError('invalid_arguments', `Unknown command ${String(unhandled)}`);
+      }
     }
-    const instanceId = requireOption(options, 'id');
-    assertInstanceId(instanceId);
-    if (command === 'remove') {
-      const abandon = parseAbandon(options.abandon);
-      return () =>
-        this.#attempt({
-          command,
-          args,
-          options,
-          instanceId,
-          work: (session) => this.#removeWork(session, options, instanceId, abandon),
-        });
-    }
-    return () =>
-      this.#attempt({
-        command,
-        args,
-        options,
-        instanceId,
-        decisions: {
-          chatConfigured: options['chat-configured'] === 'true',
-          ...(options['messaging-group-id'] ? { messagingGroupId: options['messaging-group-id'] } : {}),
-        },
-        work: (session) => this.#resumeWork(session, instanceId),
-      });
   }
 
   /** The command that continues from where an attempt stopped; `extra` carries a pause's decision flag. */
@@ -470,7 +499,7 @@ class Cli {
       await run.assignInstance(instanceId);
     });
 
-    const operation = await acquireInstanceOperation(paths, instanceId);
+    const operation = await acquireInstanceOperation(paths, instanceId, { command: 'create' });
     if (!operation) throw busy();
     try {
       return await this.#provision(reporter, operation, interaction);
@@ -554,7 +583,7 @@ class Cli {
   }
 
   async #resumeWork({ reporter, interaction }: Session, instanceId: string): Promise<Outcome> {
-    const operation = await acquireInstanceOperation(this.#paths, instanceId);
+    const operation = await acquireInstanceOperation(this.#paths, instanceId, { command: 'resume' });
     if (!operation) throw busy();
     try {
       await runStep(reporter, PREREQUISITES_STEP, async () => {
@@ -699,6 +728,11 @@ class Cli {
       if (isBusy(error)) {
         presenter.report({ outcome: 'busy', headline: safeErrorMessage(error), details: log });
         return { status: 'done', exitCode: EXIT_CODES.busy };
+      }
+      // Retrying cannot help, and this command's own rerun is not the way on.
+      if (isOperationRefusal(error)) {
+        presenter.report({ outcome: 'failed', headline: safeErrorMessage(error), details: log });
+        return { status: 'done', exitCode: EXIT_CODES.failed };
       }
       const nextAction = this.#nextAction(plan, state);
       if (!run || (error instanceof GwsEaError && error.code === 'cancelled')) {
@@ -882,7 +916,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
     return EXIT_CODES.ready;
   }
   const command = args[0];
-  if (command !== 'create' && command !== 'resume' && command !== 'remove') {
+  if (!isCommand(command)) {
     errorOutput('Unknown command.');
     printHelp(errorOutput);
     return EXIT_CODES.failed;

@@ -12,10 +12,18 @@ import {
   recordStepStarted,
   reserveInstance,
 } from './journal.js';
-import { allocateInstanceId, assertRegistryMarkerAgreement, readRegistry, writeInstanceMarker } from './registry.js';
+import { advanceOperation, beginOperation, liveCheckoutCommits } from './operation.js';
+import {
+  allocateInstanceId,
+  assertCheckoutConsistent,
+  assertRegistryMarkerAgreement,
+  readRegistry,
+  swapInstanceRelease,
+  writeInstanceMarker,
+} from './registry.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { Prerequisites } from './prerequisites.js';
-import { GwsEaError, type InstanceReservationInput } from './types.js';
+import { GwsEaError, releaseOf, type InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
 const providerCapabilityDigest = 'd'.repeat(64);
@@ -578,6 +586,91 @@ describe('machine registry', () => {
     );
 
     await expect(assertRegistryMarkerAgreement(paths, input.instance_id)).rejects.toThrow(/marker.*mismatch/i);
+  });
+});
+
+describe('release compare-and-swap and live checkout agreement', () => {
+  const target = {
+    source_remote: 'https://example.test/prod.git',
+    release_track: 'prod',
+    deployed_commit: 'b'.repeat(40),
+  };
+
+  async function markerAt(paths: ControlPlanePaths, instanceId: string, commit: string, id = instanceId) {
+    await mkdir(path.dirname(paths.markerFile(instanceId)), { recursive: true, mode: 0o700 });
+    await writeFile(
+      paths.markerFile(instanceId),
+      JSON.stringify({ schema_version: 1, instance_id: id, deployed_commit: commit }),
+      { mode: 0o600 },
+    );
+  }
+
+  it('moves only the release fields, from the release it expects, leaving every claim and peer as it was', async () => {
+    const paths = await testPaths();
+    const input = reservation(paths);
+    const peer = distinctManagedReservation(paths);
+    await reserveInstance(paths, input);
+    await reserveInstance(paths, peer);
+    const before = await readRegistry(paths);
+
+    const moved = await swapInstanceRelease(paths, input.instance_id, releaseOf(input), target);
+
+    expect(moved).toEqual({ ...input, ...target });
+    const after = await readRegistry(paths);
+    expect(after.instances[input.instance_id]).toEqual(moved);
+    expect(after.instances[peer.instance_id]).toEqual(before.instances[peer.instance_id]);
+    expect(after.shared_infrastructure_metadata).toEqual(before.shared_infrastructure_metadata);
+    expect((await stat(paths.registryFile)).mode & 0o777).toBe(0o600);
+  });
+
+  it('refuses when the recorded release is not the one expected, or the instance is unknown', async () => {
+    const paths = await testPaths();
+    const input = reservation(paths);
+    await reserveInstance(paths, input);
+    const before = await readFile(paths.registryFile, 'utf8');
+
+    await expect(swapInstanceRelease(paths, input.instance_id, target, releaseOf(input))).rejects.toMatchObject({
+      code: 'reservation_mismatch',
+    });
+    await expect(
+      swapInstanceRelease(paths, input.instance_id, releaseOf(input), { ...target, release_track: 'Not A Track' }),
+    ).rejects.toMatchObject({ code: 'invalid_state' });
+    await expect(swapInstanceRelease(paths, allocateInstanceId(), releaseOf(input), target)).rejects.toMatchObject({
+      code: 'unknown_instance',
+    });
+    expect(await readFile(paths.registryFile, 'utf8')).toBe(before);
+  });
+
+  it('accepts the live marker at the commits an unfinished operation allows, and any commit only when told to', async () => {
+    const paths = await testPaths();
+    const input = reservation(paths);
+    await reserveInstance(paths, input);
+    const reserved = await readRegistry(paths).then((registry) => registry.instances[input.instance_id]!);
+    const operation = await acquireInstanceOperation(paths, input.instance_id, { command: 'update', target });
+    if (!operation) throw new Error('The test instance operation was busy');
+    try {
+      await beginOperation(operation, { kind: 'update', from: releaseOf(input), to: target });
+      await markerAt(paths, input.instance_id, target.deployed_commit);
+      const stopped = await advanceOperation(operation, 'stopped', {
+        stop: { at: '2026-09-28T10:00:00.000Z', graceful: true },
+      });
+      await expect(
+        assertCheckoutConsistent(paths, reserved, liveCheckoutCommits(reserved, stopped)),
+      ).rejects.toMatchObject({ code: 'marker_mismatch' });
+
+      await advanceOperation(operation, 'swapping');
+      const swapped = await advanceOperation(operation, 'swapped');
+      await expect(
+        assertCheckoutConsistent(paths, reserved, liveCheckoutCommits(reserved, swapped)),
+      ).resolves.toBeUndefined();
+      await expect(assertCheckoutConsistent(paths, reserved)).rejects.toMatchObject({ code: 'marker_mismatch' });
+      await expect(assertCheckoutConsistent(paths, reserved, null)).resolves.toBeUndefined();
+
+      await markerAt(paths, input.instance_id, target.deployed_commit, allocateInstanceId());
+      await expect(assertCheckoutConsistent(paths, reserved, null)).rejects.toMatchObject({ code: 'marker_mismatch' });
+    } finally {
+      operation.release();
+    }
   });
 });
 

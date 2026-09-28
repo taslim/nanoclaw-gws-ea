@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { writePrivate } from '../community-portal/private-file.js';
 import {
   acquireInstanceOperation,
   LAUNCHER_CONTRACT_VERSION,
@@ -16,9 +17,10 @@ import {
   reserveInstance,
   withInstanceOperation,
 } from './journal.js';
+import { beginOperation } from './operation.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { allocateInstanceId } from './registry.js';
-import { GwsEaError, type InstanceReservationInput } from './types.js';
+import { GwsEaError, releaseOf, type InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
 
@@ -220,6 +222,71 @@ describe('provision journal v3', () => {
     expect(reopened.steps.provision_gcp).toBeUndefined();
     expect(reopened.decisions.principal).toEqual(PRINCIPAL);
     expect(reopened.key_policy_lifted).toBe(true);
+  });
+
+  it('refuses provisioning under an unfinished update like a removal receipt, and releases the lock', async () => {
+    const { paths, input } = await fixture();
+    const target = { ...releaseOf(input), deployed_commit: 'b'.repeat(40) };
+    const operation = await acquireInstanceOperation(paths, input.instance_id, { command: 'update', target });
+    if (!operation) throw new Error('The test instance operation was busy');
+    try {
+      await beginOperation(operation, { kind: 'update', from: releaseOf(input), to: target });
+    } finally {
+      operation.release();
+    }
+
+    await expect(acquireInstanceOperation(paths, input.instance_id)).rejects.toMatchObject({
+      code: 'operation_in_progress',
+    });
+    await expect(withInstanceOperation(paths, input.instance_id, async () => 'ran')).rejects.toMatchObject({
+      code: 'operation_in_progress',
+    });
+    const reverting = await acquireInstanceOperation(paths, input.instance_id, { command: 'rollback' });
+    expect(reverting).not.toBeNull();
+    reverting?.release();
+
+    await writePrivate(paths.removalFile(input.instance_id), { instance_id: input.instance_id });
+    const removal = await acquireInstanceOperation(paths, input.instance_id, { command: 'rollback' }).catch(
+      (error: unknown) => error,
+    );
+    expect(removal).toMatchObject({ code: 'removal_in_progress' });
+    expect((removal as Error).message).toContain(`gws-ea remove --id ${input.instance_id}`);
+  });
+
+  it.each([
+    ['a pre-v3 journal', { schema_version: 1, phases: {} }, 'unsupported_journal'],
+    [
+      'an incompatible launcher contract',
+      { launcher_contract_version: LAUNCHER_CONTRACT_VERSION + 1 },
+      'incompatible_launcher',
+    ],
+  ] as const)('refuses to update or roll back after %s, naming remove and recreate', async (_label, change, code) => {
+    const { paths, input } = await fixture();
+    const contents = JSON.stringify({ ...(await rawJournal(paths, input.instance_id)), ...change });
+    await writeFile(paths.journalFile(input.instance_id), contents, { mode: 0o600 });
+    const target = { ...releaseOf(input), deployed_commit: 'b'.repeat(40) };
+
+    for (const intent of [{ command: 'update', target }, { command: 'rollback' }] as const) {
+      const refusal = await acquireInstanceOperation(paths, input.instance_id, intent).catch((error: unknown) => error);
+      expect(refusal).toMatchObject({ code });
+      expect((refusal as GwsEaError).message).toContain(
+        `gws-ea remove --id ${input.instance_id}, then create it again`,
+      );
+    }
+    // Commands that only operate the running host are not bound to the provisioning contract.
+    const start = await acquireInstanceOperation(paths, input.instance_id, { command: 'start' });
+    expect(start).not.toBeNull();
+    start?.release();
+  });
+
+  it('admits update and rollback for an assistant provisioned under this launcher contract', async () => {
+    const { paths, input } = await fixture();
+    const target = { ...releaseOf(input), deployed_commit: 'b'.repeat(40) };
+    for (const intent of [{ command: 'update', target }, { command: 'rollback' }] as const) {
+      const operation = await acquireInstanceOperation(paths, input.instance_id, intent);
+      expect(operation).not.toBeNull();
+      operation?.release();
+    }
   });
 
   it('gives the instance operation to one process at a time', async () => {

@@ -7,7 +7,9 @@
  * observed pauses with evidence until the operator abandons it. Everything a
  * resource needs — Docker, Google sign-in, the Cloudflare token — is checked
  * before the first change, and removal locks only its own instance, so one
- * stuck removal never blocks another assistant.
+ * stuck removal never blocks another assistant. An unfinished update or
+ * rollback never stops it: its staged, kept, and outgoing releases all sit
+ * under the instance root, and go with it.
  */
 import { access, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -58,6 +60,7 @@ import {
 import { readProvisionJournal } from './journal.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { removeOnecliRuntime } from './onecli.js';
+import { liveCheckoutCommits, readOperationRecord } from './operation.js';
 import { CONTROL_PLANE_ROOT, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import { pollUntil } from './poll.js';
 import { probeRecordedDockerEndpoint, resolveDockerEndpoint } from './prerequisites.js';
@@ -73,6 +76,7 @@ import {
 import {
   activeRemovalInstanceIds,
   assertCheckoutConsistent,
+  assertCheckoutMarker,
   assertInstanceId,
   getInstanceReservation,
   readRegistry,
@@ -318,18 +322,52 @@ async function readRecord(file: string): Promise<Record<string, unknown> | undef
   }
 }
 
+/** Where an unfinished update leaves a release beside the live checkout; `outgoing/` holds none it could run. */
+const KEPT_RELEASES = ['previous', 'next'] as const;
+
+/**
+ * The live checkout must carry this assistant's marker at the registry's
+ * commit, or at the one an unfinished update or rollback placed there; a
+ * record that cannot be read cannot say which, so only the marker's instance
+ * identity is checked. A kept or staged release is checked by its marker's
+ * instance identity alone, and staging may have stopped before writing one.
+ */
+async function assertOwnCheckouts(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<void> {
+  let commits: readonly string[] | null;
+  try {
+    commits = liveCheckoutCommits(reservation, await readOperationRecord(paths, reservation.instance_id));
+  } catch (error) {
+    if (!(error instanceof GwsEaError)) throw error;
+    activeStep()?.write(`${error.message}; the live checkout is checked by its instance identity alone\n`);
+    commits = null;
+  }
+  await assertCheckoutConsistent(paths, reservation, commits);
+  for (const slot of KEPT_RELEASES) {
+    const checkout = paths.releaseCheckoutRoot(reservation.instance_id, slot);
+    try {
+      await assertCheckoutMarker(checkout, reservation.instance_id, null);
+    } catch (error) {
+      if (isErrno(error, 'ENOENT') || (error instanceof GwsEaError && error.code === 'marker_missing')) continue;
+      throw error;
+    }
+  }
+}
+
 /**
  * The home directory, Docker endpoint, and OneCLI CLI the instance recorded:
- * `runtime.json` once the host started, else the bootstrap manifest create
- * wrote. Only these fields are read, so files an earlier launcher wrote still
- * remove cleanly.
+ * `runtime.json` once the host started (in the live checkout, or mid-update in
+ * the kept or staged release), else the bootstrap manifest create wrote. Only
+ * these fields are read, so files an earlier launcher wrote still remove
+ * cleanly.
  */
 async function readRecordedRuntime(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
 ): Promise<{ readonly homeDirectory?: string; readonly dockerEndpoint?: string; readonly onecliCliPath?: string }> {
+  const runtimeFile = (checkout: string): string => path.join(checkout, 'data', 'gws-ea', 'runtime.json');
   const records = await Promise.all([
-    readRecord(path.join(reservation.checkout_realpath, 'data', 'gws-ea', 'runtime.json')),
+    readRecord(runtimeFile(reservation.checkout_realpath)),
+    ...KEPT_RELEASES.map((slot) => readRecord(runtimeFile(paths.releaseCheckoutRoot(reservation.instance_id, slot)))),
     readRecord(paths.bootstrapFile(reservation.instance_id)),
   ]);
   const field = (key: string, parse: (value: unknown, label: string, code: string) => string): string | undefined => {
@@ -810,7 +848,7 @@ async function removeLocked(
   };
 
   // Everything below reads; nothing changes until the receipt is written.
-  await assertCheckoutConsistent(paths, reservation);
+  await assertOwnCheckouts(paths, reservation);
   const provisioning = await readProvisioningRecord(paths, instanceId);
   const recorded = await readRecordedRuntime(paths, reservation);
   // Released last, so a released reservation left only local files and the receipt behind.

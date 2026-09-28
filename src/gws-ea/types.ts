@@ -80,6 +80,30 @@ export interface InstanceReservationInput {
 
 export type InstanceReservation = Readonly<InstanceReservationInput>;
 
+/**
+ * Which release a reservation deploys: the only reservation fields an update
+ * or rollback moves, and only through the registry compare-and-swap.
+ */
+export type ReleaseCoordinates = Readonly<
+  Pick<InstanceReservationInput, 'source_remote' | 'release_track' | 'deployed_commit'>
+>;
+
+export function releaseOf(reservation: ReleaseCoordinates): ReleaseCoordinates {
+  return {
+    source_remote: reservation.source_remote,
+    release_track: reservation.release_track,
+    deployed_commit: reservation.deployed_commit,
+  };
+}
+
+export function sameRelease(left: ReleaseCoordinates, right: ReleaseCoordinates): boolean {
+  return (
+    left.source_remote === right.source_remote &&
+    left.release_track === right.release_track &&
+    left.deployed_commit === right.deployed_commit
+  );
+}
+
 export interface InstanceRegistry {
   schema_version: typeof REGISTRY_SCHEMA_VERSION;
   instances: Record<string, InstanceReservation>;

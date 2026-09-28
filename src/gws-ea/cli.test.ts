@@ -11,6 +11,7 @@ import type { CreatePromptContext } from './create-input.js';
 import { runStep, withPendingAction, type InteractivePrompts, type PauseResponse } from './events.js';
 import { RECORDED_GCLOUD_REAUTHENTICATION_FAILED } from './fixtures/recordings.js';
 import { acquireInstanceOperation, reserveInstance } from './journal.js';
+import { advanceOperation, beginOperation } from './operation.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { ONECLI_CLI_VERSION } from './pins.js';
 import type { ProvisionHumanPause } from './phases.js';
@@ -25,7 +26,7 @@ import { installProductionBootstrapManifest } from './provision.js';
 import { allocateInstanceId, readRegistry } from './registry.js';
 import { resolveReleaseSource } from './release-tracks.js';
 import { activeStep } from './run-log.js';
-import { GwsEaError, type InstanceReservationInput } from './types.js';
+import { GwsEaError, releaseOf, type InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
 const servers: Server[] = [];
@@ -524,6 +525,43 @@ describe('gws-ea without a TTY', () => {
     expect(io.err.join('\n')).toContain(`gws-ea remove --id ${input.instance_id}, then create it again`);
     expect(preflight).not.toHaveBeenCalled();
     expect(advanceProvision).not.toHaveBeenCalled();
+  });
+
+  it('refuses to resume mid-update instead of re-cloning the swapped-away checkout, naming what continues or reverts', async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation(paths));
+    const target = { ...releaseOf(input), deployed_commit: 'b'.repeat(40) };
+    const operation = await acquireInstanceOperation(paths, input.instance_id, { command: 'update', target });
+    if (!operation) throw new Error('The test instance operation was busy');
+    try {
+      await beginOperation(operation, { kind: 'update', from: releaseOf(input), to: target });
+      await advanceOperation(operation, 'stopped', { stop: { at: '2026-09-28T10:00:00.000Z', graceful: true } });
+      await advanceOperation(operation, 'swapping');
+      await advanceOperation(operation, 'swapped');
+    } finally {
+      operation.release();
+    }
+    const preflight = vi.fn(async () => PREREQUISITES);
+    const advanceProvision = vi.fn();
+    const io = lines();
+
+    expect(
+      await runCli(['resume', '--id', input.instance_id], {
+        paths,
+        ...io.runtime,
+        checkPrerequisites: preflight,
+        advanceProvision,
+      }),
+    ).toBe(1);
+    const summary = io.err.join('\n');
+    expect(summary).toContain('is unfinished (swapped)');
+    expect(summary).toContain(`gws-ea update --id ${input.instance_id}`);
+    expect(summary).toContain(`gws-ea rollback --id ${input.instance_id}`);
+    expect(summary).not.toContain('Resume with');
+    expect(summary).toMatch(/Log: \S+progress\.log/u);
+    expect(preflight).not.toHaveBeenCalled();
+    expect(advanceProvision).not.toHaveBeenCalled();
+    await expect(stat(paths.checkoutRoot(input.instance_id))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('refuses removal without --yes, naming the flag', async () => {
