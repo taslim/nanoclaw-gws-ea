@@ -793,6 +793,45 @@ describe('removal from any partial state', () => {
     expect((await readRegistry(paths)).shared_infrastructure_metadata.cloudflare).toBeNull();
   });
 
+  it('removes A while preserving B and an older assistant on the shared connector', async () => {
+    const paths = await testPaths();
+    const started = ['materialize_checkout', 'establish_transport', 'start_nanoclaw'] as const;
+    const first = await reserve(paths, reservationInput(paths, { managed: true, dns: true }), { started });
+    const second = await reserve(
+      paths,
+      reservationInput(paths, { managed: true, dns: true, label: 'peer', port: 34_001 }),
+      { started },
+    );
+    const olderInput = reservationInput(paths, { managed: true, dns: true, label: 'older', port: 35_001 });
+    if (olderInput.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare') {
+      throw new Error('managed reservation fixture is invalid');
+    }
+    olderInput.exclusive_resource_claims.ingress.dns_record_id = 'e'.repeat(32);
+    const older = await reserve(paths, olderInput, { started });
+    await recordTunnel(paths);
+    await mkdir(paths.cloudflareRoot, { recursive: true, mode: 0o700 });
+    const { dependencies, cloudflare } = world(first);
+    const name = await tunnelName(paths);
+    cloudflare.tunnels = [{ id: TUNNEL_ID, name }];
+    cloudflare.config = { ingress: [route(first), route(second), route(older), CATCH_ALL] };
+    cloudflare.dns = [dnsRecord(first), dnsRecord(second, 'd'.repeat(32)), dnsRecord(older, 'e'.repeat(32))];
+    const sharedBefore = (await readRegistry(paths)).shared_infrastructure_metadata.cloudflare;
+
+    await removeAssistant(paths, first.instance_id, dependencies);
+
+    await expectGone(paths, first);
+    expect(cloudflare.config).toEqual({ ingress: [route(older), route(second), CATCH_ALL] });
+    expect(cloudflare.dns).toEqual([dnsRecord(second, 'd'.repeat(32)), dnsRecord(older, 'e'.repeat(32))]);
+    expect(cloudflare.tunnels).toEqual([{ id: TUNNEL_ID, name }]);
+    expect(dependencies.stopCloudflareConnector).not.toHaveBeenCalled();
+    const registry = await readRegistry(paths);
+    expect(registry.instances[second.instance_id]).toEqual(second);
+    expect(registry.instances[older.instance_id]).toEqual(older);
+    expect(registry.shared_infrastructure_metadata.cloudflare).toEqual(sharedBefore);
+    expect(await exists(paths.markerFile(second.instance_id))).toBe(true);
+    expect(await exists(paths.markerFile(older.instance_id))).toBe(true);
+  });
+
   it('retires the tunnel with the last route to leave, though an earlier removal is still paused', async () => {
     const paths = await testPaths();
     const paused = await reserve(paths, reservationInput(paths, { managed: true, dns: true }), {
@@ -984,6 +1023,49 @@ describe('removal from any partial state', () => {
 });
 
 describe('removal safety', () => {
+  it.each(['unknown ID', 'mismatched marker'] as const)(
+    'refuses %s before touching either registered assistant',
+    async (condition) => {
+      const paths = await testPaths();
+      const started = ['materialize_checkout', 'establish_transport', 'start_onecli', 'start_nanoclaw'] as const;
+      const first = await reserve(paths, reservationInput(paths, { managed: true }), { started });
+      const second = await reserve(paths, reservationInput(paths, { managed: true, label: 'peer', port: 34_001 }), {
+        started,
+      });
+      const targetId = condition === 'unknown ID' ? allocateInstanceId() : first.instance_id;
+      if (condition === 'mismatched marker') {
+        await writeFile(
+          paths.markerFile(first.instance_id),
+          JSON.stringify({
+            schema_version: 1,
+            instance_id: second.instance_id,
+            deployed_commit: first.deployed_commit,
+          }),
+          { mode: 0o600 },
+        );
+      }
+      const before = await readFile(paths.registryFile);
+      const { dependencies, gcloud, cloudflare } = world(first);
+
+      await expect(removeAssistant(paths, targetId, dependencies)).rejects.toMatchObject({
+        code: condition === 'unknown ID' ? 'unknown_instance' : 'marker_mismatch',
+      });
+      expect(gcloud.calls).toEqual([]);
+      expect(cloudflare.calls).toEqual([]);
+      expect(dependencies.resolveDocker).not.toHaveBeenCalled();
+      expect(dependencies.uninstallNanoclaw).not.toHaveBeenCalled();
+      expect(dependencies.removeOnecli).not.toHaveBeenCalled();
+      expect(dependencies.stopCloudflareConnector).not.toHaveBeenCalled();
+      expect(await readFile(paths.registryFile)).toEqual(before);
+      expect((await readRegistry(paths)).instances).toEqual({
+        [first.instance_id]: first,
+        [second.instance_id]: second,
+      });
+      expect(await exists(paths.removalFile(targetId))).toBe(false);
+      expect(await exists(paths.markerFile(second.instance_id))).toBe(true);
+    },
+  );
+
   it('refuses before any effect when the checkout exists without its marker', async () => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput(paths), { started: ['materialize_checkout', 'provision_gcp'] });

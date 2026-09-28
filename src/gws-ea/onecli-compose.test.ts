@@ -113,4 +113,50 @@ describe('instance-owned OneCLI Compose specification', () => {
 
     expect(ONECLI_WAIT_TIMEOUT_SECONDS).toBe(budget);
   });
+
+  it('gives two instances separate Compose resources and loopback bindings', () => {
+    const first = createOnecliRuntimeLayout({
+      instanceId: INSTANCE_ID,
+      instanceRoot: '/private/instances/first',
+      project: 'gws-ea-12345678123441238123123456789abc',
+      appPort: 31_002,
+      gatewayPort: 31_003,
+      cliExecutable: '/opt/onecli/bin/onecli',
+      dockerEndpoint: 'unix:///var/run/docker.sock',
+    });
+    const second = createOnecliRuntimeLayout({
+      instanceId: 'fedcba98-7654-4321-8765-fedcba987654',
+      instanceRoot: '/private/instances/second',
+      project: 'gws-ea-fedcba98765443218765fedcba987654',
+      appPort: 32_002,
+      gatewayPort: 32_003,
+      cliExecutable: '/opt/onecli/bin/onecli',
+      dockerEndpoint: 'unix:///var/run/docker.sock',
+    });
+
+    for (const key of [
+      'project',
+      'rootDirectory',
+      'composeFile',
+      'cliHome',
+      'secretsDirectory',
+      'postgresPasswordFile',
+      'encryptionKeyFile',
+      'gatewayInternalSecretFile',
+      'backendNetwork',
+      'agentEgressNetwork',
+      'postgresVolume',
+      'appVolume',
+      'appUrl',
+      'gatewayUrl',
+    ] as const) {
+      expect(second[key], key).not.toBe(first[key]);
+    }
+    const firstCompose = record(parseYaml(renderOnecliCompose(first, PINS, WRAPPER_IMAGE)));
+    const secondCompose = record(parseYaml(renderOnecliCompose(second, PINS, WRAPPER_IMAGE)));
+    expect(record(record(firstCompose.services).app).ports).toEqual(['127.0.0.1:31002:10254']);
+    expect(record(record(secondCompose.services).app).ports).toEqual(['127.0.0.1:32002:10254']);
+    expect(record(record(firstCompose.services).gateway).ports).toEqual(['127.0.0.1:31003:10255']);
+    expect(record(record(secondCompose.services).gateway).ports).toEqual(['127.0.0.1:32003:10255']);
+  });
 });

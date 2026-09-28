@@ -78,6 +78,20 @@ function managedReservation(paths: ControlPlanePaths, instanceId = allocateInsta
   };
 }
 
+function distinctManagedReservation(paths: ControlPlanePaths): InstanceReservationInput {
+  const input = managedReservation(paths);
+  input.allocated_ports = { nanoclaw_webhook: 32_001, onecli_app: 32_002, onecli_gateway: 32_003 };
+  input.exclusive_resource_claims.gcp_project_id = 'second-project';
+  input.exclusive_resource_claims.gchat_service_account = 'gws-ea-chat@second-project.iam.gserviceaccount.com';
+  input.exclusive_resource_claims.workspace_email = 'second@example.test';
+  if (input.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare') {
+    throw new Error('managed reservation fixture is invalid');
+  }
+  input.exclusive_resource_claims.ingress.hostname = 'second.example.com';
+  input.exclusive_resource_claims.ingress.callback_url = 'https://second.example.com/webhook/gchat';
+  return input;
+}
+
 function createArgs(): string[] {
   return [
     'create',
@@ -259,6 +273,115 @@ describe('machine registry', () => {
       tunnel_id: null,
     });
     expect(registry.shared_infrastructure_metadata.cloudflare?.ownership_id).toMatch(/^[0-9a-f-]{36}$/u);
+  });
+
+  it.each([
+    [
+      'webhook port',
+      (first: InstanceReservationInput, second: InstanceReservationInput) => {
+        second.allocated_ports.nanoclaw_webhook = first.allocated_ports.nanoclaw_webhook;
+      },
+    ],
+    [
+      'OneCLI app port',
+      (first: InstanceReservationInput, second: InstanceReservationInput) => {
+        second.allocated_ports.onecli_app = first.allocated_ports.onecli_app;
+      },
+    ],
+    [
+      'OneCLI gateway port',
+      (first: InstanceReservationInput, second: InstanceReservationInput) => {
+        second.allocated_ports.onecli_gateway = first.allocated_ports.onecli_gateway;
+      },
+    ],
+    [
+      'GCP project and its derived Chat service account',
+      (first: InstanceReservationInput, second: InstanceReservationInput) => {
+        second.exclusive_resource_claims.gcp_project_id = first.exclusive_resource_claims.gcp_project_id;
+        second.exclusive_resource_claims.gchat_service_account = first.exclusive_resource_claims.gchat_service_account;
+      },
+    ],
+    [
+      'Workspace email',
+      (first: InstanceReservationInput, second: InstanceReservationInput) => {
+        second.exclusive_resource_claims.workspace_email = first.exclusive_resource_claims.workspace_email;
+      },
+    ],
+    [
+      'OneCLI project',
+      (first: InstanceReservationInput, second: InstanceReservationInput) => {
+        second.exclusive_resource_claims.onecli_project = first.exclusive_resource_claims.onecli_project;
+      },
+    ],
+    [
+      'managed hostname, callback, DNS name, and route',
+      (first: InstanceReservationInput, second: InstanceReservationInput) => {
+        second.exclusive_resource_claims.ingress = { ...first.exclusive_resource_claims.ingress };
+      },
+    ],
+    [
+      'DNS record ID',
+      (first: InstanceReservationInput, second: InstanceReservationInput) => {
+        if (
+          first.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare' ||
+          second.exclusive_resource_claims.ingress.mode !== 'managed-cloudflare'
+        ) {
+          throw new Error('managed reservation fixture is invalid');
+        }
+        first.exclusive_resource_claims.ingress.dns_record_id = 'c'.repeat(32);
+        second.exclusive_resource_claims.ingress.dns_record_id = first.exclusive_resource_claims.ingress.dns_record_id;
+      },
+    ],
+  ] as const)('refuses a competing %s claim without changing its owner', async (_claim, collide) => {
+    const paths = await testPaths();
+    const first = managedReservation(paths);
+    const second = distinctManagedReservation(paths);
+    collide(first, second);
+    await reserveInstance(paths, first);
+    const before = await readFile(paths.registryFile);
+
+    await expect(reserveInstance(paths, second)).rejects.toMatchObject({ code: 'claim_conflict' });
+    expect(await readFile(paths.registryFile)).toEqual(before);
+    expect((await readRegistry(paths)).instances).toEqual({ [first.instance_id]: first });
+    await expect(stat(paths.instanceRoot(second.instance_id))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('refuses an existing callback URL claimed by another instance', async () => {
+    const paths = await testPaths();
+    const first = reservation(paths);
+    const second = reservation(paths);
+    second.allocated_ports = { nanoclaw_webhook: 32_001, onecli_app: 32_002, onecli_gateway: 32_003 };
+    second.exclusive_resource_claims.gcp_project_id = 'second-project';
+    second.exclusive_resource_claims.gchat_service_account = 'gws-ea-chat@second-project.iam.gserviceaccount.com';
+    second.exclusive_resource_claims.workspace_email = 'second@example.test';
+    await reserveInstance(paths, first);
+
+    await expect(reserveInstance(paths, second)).rejects.toMatchObject({ code: 'claim_conflict' });
+    expect((await readRegistry(paths)).instances).toEqual({ [first.instance_id]: first });
+  });
+
+  it('keeps derived checkout and Chat identities tied to the instance and project', async () => {
+    const paths = await testPaths();
+    const first = managedReservation(paths);
+    const second = distinctManagedReservation(paths);
+    await reserveInstance(paths, first);
+    await reserveInstance(paths, second);
+    expect(Object.keys((await readRegistry(paths)).instances)).toEqual([first.instance_id, second.instance_id]);
+    expect(first.checkout_realpath).not.toBe(second.checkout_realpath);
+    expect(first.exclusive_resource_claims.gchat_service_account).not.toBe(
+      second.exclusive_resource_claims.gchat_service_account,
+    );
+    expect((await readRegistry(paths)).shared_infrastructure_metadata.cloudflare?.account_id).toBe('a'.repeat(32));
+
+    const invalidCheckout = distinctManagedReservation(paths);
+    invalidCheckout.checkout_realpath = first.checkout_realpath;
+    await expect(reserveInstance(paths, invalidCheckout)).rejects.toMatchObject({ code: 'unsafe_path' });
+
+    const invalidChatIdentity = distinctManagedReservation(paths);
+    invalidChatIdentity.exclusive_resource_claims.gchat_service_account =
+      first.exclusive_resource_claims.gchat_service_account;
+    await expect(reserveInstance(paths, invalidChatIdentity)).rejects.toMatchObject({ code: 'invalid_claim' });
+    expect(Object.keys((await readRegistry(paths)).instances)).toEqual([first.instance_id, second.instance_id]);
   });
 
   it('rejects a second managed account and duplicate managed identity before publishing it', async () => {
@@ -765,6 +888,30 @@ describe('create recovery contract', () => {
     await expect(stat(paths.bootstrapFile(instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(stat(paths.instanceRoot(instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
     expect((await readRegistry(paths)).instances).toEqual({});
+  });
+
+  it('stops a real create claim conflict before provisioning the second assistant', async () => {
+    const paths = await testPaths();
+    const owner = reservation(paths);
+    await reserveInstance(paths, owner);
+    const before = await readFile(paths.registryFile);
+    const advanceProvision = vi.fn();
+    const stderr: string[] = [];
+
+    expect(
+      await runCli(createArgs(), {
+        paths,
+        stdout: () => undefined,
+        stderr: (line) => stderr.push(line),
+        ...productionRuntime(),
+        advanceProvision,
+      }),
+    ).toBe(1);
+
+    expect(stderr.join('\n')).toMatch(/exclusive operational resource is already claimed/u);
+    expect(advanceProvision).not.toHaveBeenCalled();
+    expect(await readFile(paths.registryFile)).toEqual(before);
+    expect((await readRegistry(paths)).instances).toEqual({ [owner.instance_id]: owner });
   });
 
   it('prints the id before reservation and only the exact safe resume command after a post-reservation failure', async () => {
