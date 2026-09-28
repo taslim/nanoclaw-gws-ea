@@ -5,9 +5,10 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { isErrno } from '../community-portal/errors.js';
+import { readEnvFile } from '../env.js';
 import { renderLaunchdService, renderSystemdService } from '../service-definition.js';
 import type { OnecliRuntimeLayout } from './onecli-compose.js';
-import { preparePrivateDirectory, assertPrivateDirectory } from './paths.js';
+import { preparePrivateDirectory, assertPrivateDirectory, isRegularFile } from './paths.js';
 import {
   buildHostEnvironment,
   buildToolEnvironment,
@@ -326,6 +327,12 @@ async function persistRuntimeFile(config: InstanceRuntimeConfig): Promise<void> 
   }
 }
 
+/**
+ * Write `runtime.json` once, and gws-ea's `.env` keys where the checkout's
+ * `.env` does not set them, as NanoClaw reads it. A key it sets is the
+ * release's own, written by the create that deployed it, so a later start
+ * never rewrites it (KTD6); every other writer's keys are kept.
+ */
 export async function persistInstanceRuntime(
   configInput: InstanceRuntimeConfig,
   upsertEnvVars: UpsertEnvVars,
@@ -337,12 +344,13 @@ export async function persistInstanceRuntime(
   await preparePrivateDirectory(path.join(config.checkout_realpath, 'logs'));
   await persistRuntimeFile(config);
   const owned = instanceHostConfiguration(config);
-  upsertEnvVars({ ...owned }, config.checkout_realpath);
+  const present = readEnvFile(Object.keys(owned), config.checkout_realpath);
+  const missing = Object.entries(owned).filter(([key]) => present[key] === undefined);
+  if (missing.length === 0) return;
+  upsertEnvVars(Object.fromEntries(missing), config.checkout_realpath);
   activeStep()?.envFile(
     path.join(config.checkout_realpath, '.env'),
-    Object.entries(owned)
-      .map(([key, value]) => `${key}=${value}\n`)
-      .join(''),
+    missing.map(([key, value]) => `${key}=${value}\n`).join(''),
   );
 }
 
@@ -494,10 +502,13 @@ const BOOTSTRAP_ATTEMPTS = 5;
 const BOOTSTRAP_RETRY_MS = 500;
 
 /**
- * Write the service definition and (re)start it. launchd reloads a changed
- * definition only through `bootout` then `bootstrap`; `kickstart` without
- * `-k` then demand-starts a job launchd left pended, without restarting a
- * running one. systemd user services need lingering to survive logout.
+ * Write the service definition when it is missing, then (re)start it. An
+ * existing definition is the release's own, rendered by the create that
+ * deployed it, so a later start never renders it again (KTD6). launchd
+ * reloads a definition only through `bootout` then `bootstrap`; `kickstart`
+ * without `-k` then demand-starts a job launchd left pended, without
+ * restarting a running one. systemd user services need lingering to survive
+ * logout.
  */
 export async function reconcileInstanceService(
   configInput: InstanceRuntimeConfig,
@@ -510,8 +521,10 @@ export async function reconcileInstanceService(
     assertRegularFile(layout.hostEntrypoint),
     assertExecutable(layout.cliPath),
   ]);
-  await mkdir(path.dirname(layout.serviceDefinitionPath), { recursive: true, mode: 0o700 });
-  await writePrivateTextFile(layout.serviceDefinitionPath, renderInstanceService(config, layout));
+  if (!(await isRegularFile(layout.serviceDefinitionPath))) {
+    await mkdir(path.dirname(layout.serviceDefinitionPath), { recursive: true, mode: 0o700 });
+    await writePrivateTextFile(layout.serviceDefinitionPath, renderInstanceService(config, layout));
+  }
   const run = dependencies.runCommand ?? runSanitizedCommand;
   const environment = serviceManagerEnvironment(config, layout.manager, dependencies);
   const command = async (program: string, args: readonly string[]): Promise<string> =>
