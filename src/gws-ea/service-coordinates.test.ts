@@ -67,4 +67,23 @@ describe('GWS-EA service coordinates', () => {
   it.each(cases)('derives $name coordinates shared by provisioning and removal', ({ input, expected }) => {
     expect(createInstanceServiceCoordinates(input)).toEqual(expected);
   });
+
+  it.each(['macos', 'linux'] as const)(
+    'keeps two %s installations in distinct services and Docker scopes',
+    (platform) => {
+      const first = createInstanceServiceCoordinates({ installId, homeDirectory, platform, runningAsRoot: false });
+      const second = createInstanceServiceCoordinates({
+        installId: 'fedcba0987654321fedcba0987654321',
+        homeDirectory,
+        platform,
+        runningAsRoot: false,
+      });
+
+      expect(second.manager).toBe(first.manager);
+      expect(second.serviceIdentity).not.toBe(first.serviceIdentity);
+      expect(second.serviceDefinitionPath).not.toBe(first.serviceDefinitionPath);
+      expect(second.imageTag).not.toBe(first.imageTag);
+      expect(second.installLabel).not.toBe(first.installLabel);
+    },
+  );
 });

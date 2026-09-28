@@ -25,12 +25,13 @@ interface IdentityVerifier {
 interface ObservableGoogleChatAdapter {
   handleMessageEvent(event: unknown, options: unknown): void;
   oauth2Client: IdentityVerifier;
+  chat: { processMessage: (adapter: unknown, threadId: string, message: unknown, options: unknown) => void };
 }
 
-function webhookRequest(token?: string): Request {
+function webhookRequest(token?: string, url = endpointUrl, text = 'hello'): Request {
   const headers = new Headers({ 'content-type': 'application/json' });
   if (token) headers.set('authorization', `Bearer ${token}`);
-  return new Request(endpointUrl, {
+  return new Request(url, {
     method: 'POST',
     headers,
     body: JSON.stringify({
@@ -39,7 +40,7 @@ function webhookRequest(token?: string): Request {
           message: {
             name: 'spaces/space/messages/message',
             sender: { displayName: 'Principal', name: 'users/principal', type: 'HUMAN' },
-            text: 'hello',
+            text,
           },
           space: { name: 'spaces/space', type: 'DM' },
         },
@@ -47,6 +48,119 @@ function webhookRequest(token?: string): Request {
     }),
   });
 }
+
+const endpointB = 'https://assistant-b.example.com/webhook/gchat';
+const addOnIdentityA = 'service-441811502258@gcp-sa-gsuiteaddons.iam.gserviceaccount.com';
+const addOnIdentityB = 'service-999999999999@gcp-sa-gsuiteaddons.iam.gserviceaccount.com';
+
+interface VerifiedClaims {
+  readonly aud: string;
+  readonly email: string;
+}
+
+interface PinnedAdapterConfig {
+  readonly audience: string;
+  readonly addOnIdentity: string;
+  readonly clientEmail: string;
+  readonly projectId: string;
+  readonly botUserId: string;
+}
+
+function pinnedAdapter(config: PinnedAdapterConfig, claimsByToken: ReadonlyMap<string, VerifiedClaims>) {
+  const adapter = createGoogleChatAdapter({
+    credentials: {
+      client_email: config.clientEmail,
+      private_key: 'not-used-by-this-test',
+      project_id: config.projectId,
+    },
+    endpointUrl: config.audience,
+    botUserId: config.botUserId,
+    workspaceAddOnServiceAccountEmail: config.addOnIdentity,
+  });
+  const observable = adapter as unknown as ObservableGoogleChatAdapter;
+  const processMessage = vi.fn<ObservableGoogleChatAdapter['chat']['processMessage']>();
+  observable.chat = { processMessage };
+  const handleMessageEvent = vi.spyOn(observable, 'handleMessageEvent');
+  const verifyIdToken = vi
+    .spyOn(observable.oauth2Client, 'verifyIdToken')
+    .mockImplementation(async ({ audience: expected, idToken }) => {
+      const claims = claimsByToken.get(idToken);
+      if (!claims || claims.aud !== expected) throw new Error('Wrong recipient, payload audience does not match');
+      return {
+        getPayload: () => ({
+          ...claims,
+          email_verified: true,
+          iss: 'https://accounts.google.com',
+        }),
+      };
+    });
+  return { adapter, handleMessageEvent, processMessage, verifyIdToken };
+}
+
+describe('two pinned Google Chat audiences', () => {
+  const configA: PinnedAdapterConfig = {
+    audience: endpointUrl,
+    addOnIdentity: addOnIdentityA,
+    clientEmail: 'chat-bot@project-a.example.test',
+    projectId: 'project-a',
+    botUserId: 'users/111111111',
+  };
+  const configB: PinnedAdapterConfig = {
+    audience: endpointB,
+    addOnIdentity: addOnIdentityB,
+    clientEmail: 'chat-bot@project-b.example.test',
+    projectId: 'project-b',
+    botUserId: 'users/222222222',
+  };
+  const claims = new Map<string, VerifiedClaims>([
+    ['a-event', { aud: endpointUrl, email: addOnIdentityA }],
+    ['b-event', { aud: endpointB, email: addOnIdentityB }],
+    ['a-identity-b-audience', { aud: endpointB, email: addOnIdentityA }],
+  ]);
+
+  it('dispatches each verifier-accepted event only through its own adapter', async () => {
+    const a = pinnedAdapter(configA, claims);
+    const b = pinnedAdapter(configB, claims);
+
+    const aResponse = await a.adapter.handleWebhook(webhookRequest('a-event', endpointUrl, 'A marker'));
+    const bResponse = await b.adapter.handleWebhook(webhookRequest('b-event', endpointB, 'B marker'));
+
+    expect([aResponse.status, bResponse.status]).toEqual([200, 200]);
+    expect(a.verifyIdToken).toHaveBeenCalledWith({ idToken: 'a-event', audience: endpointUrl });
+    expect(b.verifyIdToken).toHaveBeenCalledWith({ idToken: 'b-event', audience: endpointB });
+    expect(a.handleMessageEvent).toHaveBeenCalledOnce();
+    expect(b.handleMessageEvent).toHaveBeenCalledOnce();
+    expect(a.processMessage).toHaveBeenCalledOnce();
+    expect(b.processMessage).toHaveBeenCalledOnce();
+    expect(a.processMessage.mock.calls[0]?.[2]).toMatchObject({ text: 'A marker' });
+    expect(b.processMessage.mock.calls[0]?.[2]).toMatchObject({ text: 'B marker' });
+  });
+
+  it('rejects an A-audience event at B before handler or bridge dispatch', async () => {
+    const a = pinnedAdapter(configA, claims);
+    const b = pinnedAdapter(configB, claims);
+
+    expect((await a.adapter.handleWebhook(webhookRequest('a-event', endpointUrl))).status).toBe(200);
+    const response = await b.adapter.handleWebhook(webhookRequest('a-event', endpointB));
+
+    expect(response.status).toBe(401);
+    expect(b.verifyIdToken).toHaveBeenCalledWith({ idToken: 'a-event', audience: endpointB });
+    expect(a.processMessage).toHaveBeenCalledOnce();
+    expect(b.handleMessageEvent).not.toHaveBeenCalled();
+    expect(b.processMessage).not.toHaveBeenCalled();
+  });
+
+  it('rejects A’s dedicated project identity even when the token names B’s audience', async () => {
+    const b = pinnedAdapter(configB, claims);
+
+    const response = await b.adapter.handleWebhook(webhookRequest('a-identity-b-audience', endpointB));
+
+    expect(response.status).toBe(401);
+    expect(b.verifyIdToken).toHaveBeenCalledWith({ idToken: 'a-identity-b-audience', audience: endpointB });
+    expect(b.handleMessageEvent).not.toHaveBeenCalled();
+    expect(b.processMessage).not.toHaveBeenCalled();
+  });
+});
 
 function verifiedEmail(token: string): string {
   switch (token) {
