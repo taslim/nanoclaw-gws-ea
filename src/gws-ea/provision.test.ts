@@ -37,6 +37,7 @@ import {
 } from './provision.js';
 import type { MainIdentityDependencies } from './identity.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
+import { computeWrapperImageHash, wrapperImageTag } from './onecli-gateway-image.js';
 import { ONECLI_CLI_VERSION, ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './pins.js';
 import type { OnecliRuntimeReceipt } from './onecli.js';
 import { findPortHolder } from './ports.js';
@@ -942,6 +943,9 @@ function runAlone(
   return runProvisionSteps(operation, context, steps as ProvisionSteps<ProductionProvisionContext>, runtime);
 }
 
+/** The content-addressed wrapper gateway image the launcher builds for its pins (real in-tree source). */
+const EXPECTED_GATEWAY_IMAGE = wrapperImageTag(await computeWrapperImageHash({ gateway: ONECLI_GATEWAY_VERSION }));
+
 /** A Docker CLI that reports this instance's three OneCLI services running healthy at the launcher's pins. */
 function healthyOnecliDocker(context: ProductionProvisionContext) {
   const layout = context.input.onecli;
@@ -955,7 +959,12 @@ function healthyOnecliDocker(context: ProductionProvisionContext) {
         (['postgres', 'app', 'gateway'] as const).map((service) => ({
           Id: `id-${service}`,
           Config: {
-            Image: service === 'postgres' ? 'postgres:18-alpine' : `ghcr.io/onecli/onecli:${ONECLI_GATEWAY_VERSION}`,
+            Image:
+              service === 'postgres'
+                ? 'postgres:18-alpine'
+                : service === 'gateway'
+                  ? EXPECTED_GATEWAY_IMAGE
+                  : `ghcr.io/onecli/onecli:${ONECLI_GATEWAY_VERSION}`,
             Labels: {
               'com.docker.compose.project': layout.project,
               'com.docker.compose.service': service,

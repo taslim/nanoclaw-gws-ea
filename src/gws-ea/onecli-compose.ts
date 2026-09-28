@@ -128,11 +128,18 @@ export function createOnecliRuntimeLayout(input: OnecliRuntimeLayoutInput): Onec
   };
 }
 
-export function renderOnecliCompose(layout: OnecliRuntimeLayout, pins: Pick<OnecliPins, 'gateway'>): string {
+export function renderOnecliCompose(
+  layout: OnecliRuntimeLayout,
+  pins: Pick<OnecliPins, 'gateway'>,
+  gatewayImage: string,
+): string {
   const labels = {
     [ONECLI_INSTANCE_LABEL]: layout.instanceId,
   };
-  const gatewayImage = onecliGatewayImage(pins);
+  const baseImage = onecliGatewayImage(pins);
+  // The gateway derives the same DATABASE_URL/SECRET_ENCRYPTION_KEY/GATEWAY_INTERNAL_SECRET
+  // from these secret files in its baked entrypoint (src/gws-ea/onecli-gateway-image/entrypoint.sh);
+  // keep the DSN shape and secret filenames in sync across both.
   const databaseUrl = 'postgresql://onecli:$$(cat /run/secrets/postgres_password)@postgres:5432/onecli';
   const sharedSecrets = ['postgres_password', 'secret_encryption_key', 'gateway_internal_secret'];
 
@@ -157,7 +164,7 @@ export function renderOnecliCompose(layout: OnecliRuntimeLayout, pins: Pick<Onec
           },
         },
         app: {
-          image: gatewayImage,
+          image: baseImage,
           restart: 'unless-stopped',
           command: [
             '/bin/sh',
@@ -188,11 +195,11 @@ export function renderOnecliCompose(layout: OnecliRuntimeLayout, pins: Pick<Onec
         gateway: {
           image: gatewayImage,
           restart: 'unless-stopped',
-          command: [
-            '/bin/sh',
-            '-ceu',
-            `export DATABASE_URL="${databaseUrl}" SECRET_ENCRYPTION_KEY="$$(cat /run/secrets/secret_encryption_key)" GATEWAY_INTERNAL_SECRET="$$(cat /run/secrets/gateway_internal_secret)"; exec onecli-gateway --port 10255 --data-dir /app/data`,
-          ],
+          // The wrapper image's ENTRYPOINT applies the egress firewall (needs
+          // NET_ADMIN) then setpriv-drops to non-root and execs onecli-gateway,
+          // so this service defines no command. NET_ADMIN is held only long
+          // enough to install the rules; the gateway process runs without it.
+          cap_add: ['NET_ADMIN'],
           environment: {
             NODE_ENV: 'production',
             APP_URL: 'http://app:10254',

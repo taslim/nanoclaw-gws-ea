@@ -21,6 +21,7 @@ import {
   type OnecliPins,
   type OnecliRuntimeLayout,
 } from './onecli-compose.js';
+import { computeWrapperImageHash, wrapperImageTag } from './onecli-gateway-image.js';
 import { RECORDED_ONECLI_VERSION } from './fixtures/recordings.js';
 import { GwsEaError } from './types.js';
 
@@ -29,6 +30,9 @@ const ONECLI_API_KEY = `oc_${'a'.repeat(64)}`;
 const DOCKER_ENDPOINT = 'unix:///Users/operator/.docker/run/docker.sock';
 /** The pins this instance's release recorded, deliberately not this launcher's. */
 const PINS: OnecliPins = { gateway: '1.41.3', cli: '2.2.4' };
+/** The content-addressed wrapper gateway image the launcher builds for these pins (real in-tree source). */
+const WRAPPER_HASH = await computeWrapperImageHash(PINS);
+const GATEWAY_IMAGE = wrapperImageTag(WRAPPER_HASH);
 /** An operator shell that points Docker, Compose, and OneCLI at another runtime. */
 const HOSTILE_AMBIENT: NodeJS.ProcessEnv = {
   PATH: '/safe/bin',
@@ -179,6 +183,16 @@ interface DockerWorld {
   gatewayImage?: string;
   /** The networks the postgres container joins, instead of the backend alone. */
   postgresNetworks?: readonly string[];
+  /** When set, the wrapper image existence probe reports it missing so reconcile builds it. */
+  wrapperImageMissing?: boolean;
+  /** Set true when the wrapper image build ran. */
+  builtImage?: boolean;
+  /** When set, the wrapper image build fails with this error. */
+  failBuild?: GwsEaError;
+  /** When set, the provenance-label read returns this instead of the built content hash. */
+  wrongProvenance?: string;
+  /** When set, the isolation probe (`docker run`) fails with this error, standing in for a detected leak. */
+  failProbe?: GwsEaError;
 }
 
 function containerJson(layout: OnecliRuntimeLayout, service: ServiceName, state: { running: boolean; health: Health }) {
@@ -190,7 +204,12 @@ function containerJson(layout: OnecliRuntimeLayout, service: ServiceName, state:
   return {
     Id: `id-${service}`,
     Config: {
-      Image: service === 'postgres' ? 'postgres:18-alpine' : `ghcr.io/onecli/onecli:${PINS.gateway}`,
+      Image:
+        service === 'postgres'
+          ? 'postgres:18-alpine'
+          : service === 'gateway'
+            ? GATEWAY_IMAGE
+            : `ghcr.io/onecli/onecli:${PINS.gateway}`,
       Labels: {
         'com.docker.compose.project': layout.project,
         'com.docker.compose.service': service,
@@ -298,7 +317,24 @@ function dockerWorld(layout: OnecliRuntimeLayout, initial: Partial<Record<Servic
         },
       ]);
     }
-    if (args[0] === 'run') return { stdout: '', stderr: '' };
+    if (args[0] === 'run') {
+      if (world.failProbe) throw world.failProbe;
+      return { stdout: '', stderr: '' };
+    }
+    if (args[0] === 'build') {
+      if (world.failBuild) throw world.failBuild;
+      world.builtImage = true;
+      return { stdout: '', stderr: '' };
+    }
+    if (args[0] === 'image' && args[1] === 'ls') {
+      // Existence probe (reconcile): image id when present, empty when a test says it is missing.
+      return { stdout: world.wrapperImageMissing ? '' : 'sha256:deadbeef\n', stderr: '' };
+    }
+    if (args[0] === 'image' && args[1] === 'inspect') {
+      // Provenance-label read (verify): return the built-content hash.
+      if (args.includes('--format')) return { stdout: `${world.wrongProvenance ?? WRAPPER_HASH}\n`, stderr: '' };
+      return { stdout: '', stderr: '' };
+    }
     if (args[0] === 'compose' && args.includes('pull')) return { stdout: '', stderr: '' };
     if (args[0] === 'compose' && args.includes('up')) {
       if (world.failUp) throw world.failUp;
@@ -421,7 +457,7 @@ describe('OneCLI runtime start and repair', () => {
       layout.envFile,
     ];
     expect(world.calls.filter((call) => call.args[0] === 'compose').map(({ args, cwd }) => ({ args, cwd }))).toEqual([
-      { args: [...project, 'pull', '--policy', 'missing'], cwd: layout.rootDirectory },
+      { args: [...project, 'pull', '--policy', 'missing', 'postgres', 'app'], cwd: layout.rootDirectory },
       {
         args: [
           ...project,
@@ -493,6 +529,98 @@ describe('OneCLI runtime start and repair', () => {
       commands.findIndex((command) => command.startsWith('compose ')),
     );
     expect(beforeCompose).toContain('container rm --force id-retired');
+  });
+
+  it('builds the content-addressed wrapper gateway image when absent, from the pinned base', async () => {
+    const layout = await layoutFixture();
+    const { world, runner } = dockerWorld(layout);
+    world.wrapperImageMissing = true;
+
+    await reconcileOnecliRuntime(layout, PINS, {
+      dockerCommandRunner: runner,
+      runCommand: runner,
+      fetch: healthyFetch(),
+    });
+
+    expect(world.builtImage).toBe(true);
+    const build = world.calls.find((call) => call.args[0] === 'build')!;
+    expect(build.args).toContain(GATEWAY_IMAGE);
+    expect(build.args.join(' ')).toContain(`ONECLI_BASE=ghcr.io/onecli/onecli:${PINS.gateway}`);
+    expect(build.args.join(' ')).toContain(`GATEWAY_WRAPPER_HASH=${WRAPPER_HASH}`);
+    // The pull (which fetches the base via the app image) precedes the build, so the
+    // base is local before `FROM`; the pull is scoped to postgres+app so the
+    // local-only wrapper tag is never fetched from a registry.
+    const buildIndex = world.calls.findIndex((call) => call.args[0] === 'build');
+    const pullIndex = world.calls.findIndex((call) => call.args.includes('pull'));
+    expect(pullIndex).toBeGreaterThanOrEqual(0);
+    expect(pullIndex).toBeLessThan(buildIndex);
+  });
+
+  it('aborts the reconcile and starts nothing when the wrapper image build fails', async () => {
+    const layout = await layoutFixture();
+    const { world, runner } = dockerWorld(layout);
+    world.wrapperImageMissing = true;
+    world.failBuild = new GwsEaError('command_failed', 'docker build failed');
+
+    await expect(
+      reconcileOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, runCommand: runner, fetch: healthyFetch() }),
+    ).rejects.toMatchObject({ code: 'command_failed' });
+    // A failed build must abort before compose brings anything up.
+    expect(world.calls.some((call) => call.args.includes('up'))).toBe(false);
+  });
+
+  it('reuses the present wrapper image instead of rebuilding it', async () => {
+    const layout = await layoutFixture();
+    const { world, runner } = dockerWorld(layout);
+
+    await reconcileOnecliRuntime(layout, PINS, {
+      dockerCommandRunner: runner,
+      runCommand: runner,
+      fetch: healthyFetch(),
+    });
+
+    expect(world.builtImage).toBeUndefined();
+    expect(world.calls.some((call) => call.args[0] === 'build')).toBe(false);
+  });
+
+  it('probes agent egress through the gateway on the internal network during reconcile', async () => {
+    const layout = await layoutFixture();
+    const { world, runner } = dockerWorld(layout);
+
+    await reconcileOnecliRuntime(layout, PINS, {
+      dockerCommandRunner: runner,
+      runCommand: runner,
+      fetch: healthyFetch(),
+    });
+
+    const probe = world.calls.find((call) => call.args[0] === 'run')!;
+    expect(probe.args).toContain(layout.agentEgressNetwork);
+    expect(probe.args).toContain('--rm');
+    // The probe is a throwaway agent-like container: the base image, entrypoint node.
+    expect(probe.args).toContain('--entrypoint');
+    expect(probe.args).toContain('node');
+    expect(probe.args).toContain(`ghcr.io/onecli/onecli:${PINS.gateway}`);
+  });
+
+  it('fails the reconcile closed when the agent-egress isolation probe reports a leak', async () => {
+    const layout = await layoutFixture();
+    const { world, runner } = dockerWorld(layout);
+    // The probe (docker run of the isolation script) exits non-zero -> a leak was found.
+    world.failProbe = new GwsEaError('command_failed', 'own app admin API reachable through gateway');
+
+    await expect(
+      reconcileOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, runCommand: runner, fetch: healthyFetch() }),
+    ).rejects.toMatchObject({ code: 'command_failed' });
+  });
+
+  it('refuses a gateway image whose provenance label does not match its build content', async () => {
+    const layout = await layoutFixture();
+    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
+    world.wrongProvenance = 'stale0000feedface';
+
+    await expect(
+      verifyOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, runCommand: runner, fetch: healthyFetch() }),
+    ).rejects.toMatchObject({ code: 'unsafe_onecli_image', message: expect.stringMatching(/provenance label/u) });
   });
 
   it('force-recreates only an unhealthy postgres on resume, then continues', async () => {
@@ -601,7 +729,7 @@ describe('OneCLI health and version check', () => {
       'gateway image',
       { gatewayImage: 'ghcr.io/onecli/onecli:1.42.0' },
       'unsafe_onecli_image',
-      /gateway image.*onecli:1\.41\.3/u,
+      /gateway image.*gws-ea-onecli-gateway/u,
     ],
   ] as const)('refuses a %s that differs from the instance’s recorded pin', async (_label, drift, code, message) => {
     const layout = await layoutFixture();
