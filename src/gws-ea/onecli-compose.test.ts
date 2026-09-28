@@ -152,8 +152,8 @@ describe('instance-owned OneCLI Compose specification', () => {
     ] as const) {
       expect(second[key], key).not.toBe(first[key]);
     }
-    const firstCompose = record(parseYaml(renderOnecliCompose(first, PINS)));
-    const secondCompose = record(parseYaml(renderOnecliCompose(second, PINS)));
+    const firstCompose = record(parseYaml(renderOnecliCompose(first, PINS, WRAPPER_IMAGE)));
+    const secondCompose = record(parseYaml(renderOnecliCompose(second, PINS, WRAPPER_IMAGE)));
     expect(record(record(firstCompose.services).app).ports).toEqual(['127.0.0.1:31002:10254']);
     expect(record(record(secondCompose.services).app).ports).toEqual(['127.0.0.1:32002:10254']);
     expect(record(record(firstCompose.services).gateway).ports).toEqual(['127.0.0.1:31003:10255']);
