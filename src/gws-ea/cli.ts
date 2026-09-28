@@ -1,7 +1,6 @@
 import os from 'node:os';
 import path from 'node:path';
 
-import { resolveReleaseCommit, type ResolvedRelease } from './checkout.js';
 import { createManagedIngressSetupSession, type RetainedManagedIngressSetupSession } from './cloudflare-api.js';
 import {
   CREATE_INPUT_FLAGS,
@@ -38,6 +37,7 @@ import {
 } from './provision.js';
 import { redact, safeErrorCode, safeErrorMessage } from './redact.js';
 import { allocateInstanceId, assertInstanceId, getInstanceReservation, validateReservation } from './registry.js';
+import { resolveReleaseTarget, type CreateTargetRequest, type ReleaseTarget } from './release-target.js';
 import { resolveReleaseSource, type ReleaseSource } from './release-tracks.js';
 import {
   ABANDONABLE_RESOURCES,
@@ -131,7 +131,8 @@ export interface CliRuntime {
   /** Interactive failure loop: diagnosis, then whether to retry. */
   onFailure?: (report: FailureReport) => Promise<'retry' | 'stop'>;
   advanceProvision?: AdvanceProvision;
-  resolveRelease?: (sourceRemote: string, releaseRef: string) => Promise<ResolvedRelease>;
+  /** Resolves the release create reserves: this tool's own commit on the track. */
+  resolveReleaseTarget?: (request: CreateTargetRequest) => Promise<ReleaseTarget>;
   holdLoopbackPorts?: () => Promise<HeldLoopbackPorts>;
   collectCreateInputs?: (context: CreatePromptContext) => Promise<CreateSetupAnswers>;
   reserveInstance?: typeof reserveInstance;
@@ -494,11 +495,11 @@ class Cli {
     run.userInput('ingress', setup.ingress.mode);
     run.userInput('provider', setup.bootstrapManifest.provider.id);
 
-    const resolved = await runStep(reporter, { id: 'resolve_release', label: 'Resolving the release…' }, () =>
-      (this.#runtime.resolveRelease ?? resolveReleaseCommit)(source.remote, source.ref),
+    const { release } = await runStep(reporter, { id: 'resolve_release', label: 'Resolving the release…' }, () =>
+      (this.#runtime.resolveReleaseTarget ?? resolveReleaseTarget)({ track, source }),
     );
     await runStep(reporter, { id: 'reserve', label: 'Reserving the assistant…' }, async () => {
-      await this.#reserve(state, track, source.remote, setup, resolved.commit, prerequisites.account);
+      await this.#reserve(state, track, source.remote, setup, release.deployed_commit, prerequisites.account);
       await run.assignInstance(instanceId);
     });
 

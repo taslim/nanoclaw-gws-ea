@@ -5,11 +5,16 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { assertReleaseCheckoutAgreement, materializeReleaseCheckout, resolveReleaseCommit } from './checkout.js';
+import {
+  assertReleaseCheckoutAgreement,
+  locateOnTrack,
+  materializeReleaseCheckout,
+  resolveToolCommit,
+} from './checkout.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
-import { TOOL_ENVIRONMENT_KEYS, runSanitizedCommand } from './process.js';
+import { TOOL_ENVIRONMENT_KEYS, runSanitizedCommand, type SanitizedCommand } from './process.js';
 import { reserveInstance } from './journal.js';
-import { allocateInstanceId } from './registry.js';
+import { allocateInstanceId, readInstanceMarkerFile } from './registry.js';
 import type { InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
@@ -113,22 +118,87 @@ function expectSanitizedEnvironment(
   }
 }
 
-describe('exact release checkout', () => {
-  it('materializes the recorded commit even when the release branch moves after resolution', async () => {
-    const source = await sourceFixture();
-    const resolved = await resolveReleaseCommit(source.remote, 'refs/heads/dogfood');
-    expect(resolved.commit).toBe(source.firstCommit);
+async function reserved(paths: ControlPlanePaths, sourceRemote: string, deployedCommit: string) {
+  const instanceId = allocateInstanceId();
+  return reserveInstance(paths, reservation(paths, instanceId, sourceRemote, deployedCommit));
+}
 
+describe('release track history', () => {
+  it('rejects a ref that peels to a non-commit object', async () => {
+    const source = await sourceFixture();
+    const blob = git(source.source, 'hash-object', '-w', '--stdin');
+    git(source.source, 'update-ref', 'refs/tags/not-a-commit', blob);
+    git(source.source, 'push', 'origin', 'refs/tags/not-a-commit');
+
+    await expect(
+      locateOnTrack({ remote: source.remote, ref: 'refs/tags/not-a-commit' }, { commit: source.firstCommit }),
+    ).rejects.toMatchObject({ code: 'release_ref_not_commit' });
+  });
+
+  it('rejects an invalid release ref before fetching it', async () => {
+    const source = await sourceFixture();
+
+    await expect(
+      locateOnTrack({ remote: source.remote, ref: 'refs/heads/../dogfood' }, { commit: source.firstCommit }),
+    ).rejects.toMatchObject({ code: 'invalid_release_ref' });
+  });
+
+  it('runs every Git child with an owned environment, fetches history without blobs, and never fetches lazily', async () => {
+    const source = await sourceFixture();
+    vi.stubEnv('GIT_CONFIG_GLOBAL', '/tmp/hostile-gitconfig');
+    vi.stubEnv('GIT_DIR', '/tmp/hostile-git-dir');
+    vi.stubEnv('GIT_ASKPASS', '/tmp/hostile-askpass');
+    vi.stubEnv('SSH_AUTH_SOCK', '/tmp/hostile-agent.sock');
+    vi.stubEnv('NPM_CONFIG_USERCONFIG', '/tmp/hostile-npmrc');
+    vi.stubEnv('PNPM_HOME', '/tmp/hostile-pnpm');
+    vi.stubEnv('ONECLI_HOME', '/tmp/hostile-onecli');
+    vi.stubEnv('ANTHROPIC_API_KEY', 'must-not-propagate');
+    vi.stubEnv('GOOGLE_APPLICATION_CREDENTIALS', '/tmp/hostile-google-key');
+    const observed: Array<{ args: readonly string[]; cwd: string; env: Readonly<Record<string, string>> | undefined }> =
+      [];
+    const runtime = {
+      fetchAuthentication: { askPassProgram: '/owned/askpass', sshAgentSocket: '/owned/agent.sock' },
+      runCommand: async (spec: SanitizedCommand) => {
+        observed.push({ args: spec.args, cwd: spec.cwd, env: spec.env });
+        return runSanitizedCommand(spec);
+      },
+    };
+
+    expect(await resolveToolCommit(source.source, runtime)).toBe(source.firstCommit);
+    await expect(
+      locateOnTrack({ remote: source.remote, ref: 'refs/heads/dogfood' }, { commit: source.firstCommit }, runtime),
+    ).resolves.toEqual({ onTrack: true });
+
+    const fetches = observed.filter((command) => command.args[0] === 'fetch');
+    expect(fetches).toHaveLength(1);
+    expect(fetches[0]?.args).toContain('--filter=blob:none');
+    for (const command of observed) {
+      const isFetch = command.args[0] === 'fetch';
+      const inTool = command.cwd === source.source;
+      expectSanitizedEnvironment(command.env, undefined, [
+        ...(isFetch ? ['GIT_ASKPASS', 'SSH_AUTH_SOCK'] : []),
+        ...(isFetch || inTool ? [] : ['GIT_NO_LAZY_FETCH']),
+      ]);
+      expect(command.env?.GIT_ASKPASS).toBe(isFetch ? '/owned/askpass' : undefined);
+      expect(command.env?.SSH_AUTH_SOCK).toBe(isFetch ? '/owned/agent.sock' : undefined);
+      expect(command.env?.GIT_NO_LAZY_FETCH).toBe(isFetch || inTool ? undefined : '1');
+    }
+  });
+});
+
+describe('exact release checkout', () => {
+  it('materializes the reserved commit even when the release branch has moved on', async () => {
+    const source = await sourceFixture();
     await write(source.source, 'release.txt', 'second\n');
     const movedCommit = commit(source.source, 'move release branch');
     git(source.source, 'push', 'origin', 'dogfood');
-    expect(movedCommit).not.toBe(resolved.commit);
+    expect(movedCommit).not.toBe(source.firstCommit);
 
     const paths = await controlPlanePaths();
-    const instanceId = allocateInstanceId();
-    await reserveInstance(paths, reservation(paths, instanceId, source.remote, resolved.commit));
+    const reservation = await reserved(paths, source.remote, source.firstCommit);
+    const instanceId = reservation.instance_id;
 
-    await materializeReleaseCheckout(paths, instanceId, resolved);
+    await materializeReleaseCheckout(paths, reservation);
 
     expect(git(paths.checkoutRoot(instanceId), 'rev-parse', 'HEAD')).toBe(source.firstCommit);
     expect(git(paths.checkoutRoot(instanceId), 'branch', '--show-current')).toBe('');
@@ -144,69 +214,49 @@ describe('exact release checkout', () => {
     });
   });
 
-  it('rejects a ref that peels to a non-commit object', async () => {
-    const source = await sourceFixture();
-    const blob = git(source.source, 'hash-object', '-w', '--stdin');
-    git(source.source, 'update-ref', 'refs/tags/not-a-commit', blob);
-    git(source.source, 'push', 'origin', 'refs/tags/not-a-commit');
+  it("stages an update's target reservation view in its release slot from the target's source, leaving the live release in place", async () => {
+    const dogfood = await sourceFixture();
+    const paths = await controlPlanePaths();
+    const deployed = await reserved(paths, dogfood.remote, dogfood.firstCommit);
+    const instanceId = deployed.instance_id;
+    await materializeReleaseCheckout(paths, deployed);
+    // A prod repository whose history carries the deployed commit, one commit ahead of it.
+    const prodRoot = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-prod-source-'));
+    roots.push(prodRoot);
+    const prodWork = path.join(prodRoot, 'work');
+    git(prodRoot, 'clone', '--quiet', dogfood.remote, prodWork);
+    git(prodWork, 'checkout', '--quiet', '-b', 'main');
+    await write(prodWork, 'release.txt', 'prod\n');
+    const prodCommit = commit(prodWork, 'prod release');
+    const prodRemote = path.join(prodRoot, 'remote.git');
+    git(prodRoot, 'clone', '--quiet', '--bare', prodWork, prodRemote);
+    const view = { ...deployed, source_remote: prodRemote, release_track: 'prod', deployed_commit: prodCommit };
 
-    await expect(resolveReleaseCommit(source.remote, 'refs/tags/not-a-commit')).rejects.toMatchObject({
-      code: 'release_ref_not_commit',
+    await expect(materializeReleaseCheckout(paths, view, {}, 'next')).resolves.toEqual(view);
+
+    const staged = paths.releaseCheckoutRoot(instanceId, 'next');
+    expect(git(staged, 'rev-parse', 'HEAD')).toBe(prodCommit);
+    expect(git(staged, 'branch', '--show-current')).toBe('');
+    expect(git(staged, 'status', '--porcelain')).toBe('');
+    expect(await readInstanceMarkerFile(path.join(staged, 'data', 'gws-ea', 'instance.json'))).toEqual({
+      schema_version: 1,
+      instance_id: instanceId,
+      deployed_commit: prodCommit,
     });
-  });
-
-  it('rejects an invalid release ref before fetching it', async () => {
-    const source = await sourceFixture();
-
-    await expect(resolveReleaseCommit(source.remote, 'refs/heads/../dogfood')).rejects.toMatchObject({
-      code: 'invalid_release_ref',
-    });
-  });
-
-  it('does not propagate hostile ambient configuration into release Git children', async () => {
-    const source = await sourceFixture();
-    vi.stubEnv('GIT_CONFIG_GLOBAL', '/tmp/hostile-gitconfig');
-    vi.stubEnv('GIT_DIR', '/tmp/hostile-git-dir');
-    vi.stubEnv('GIT_ASKPASS', '/tmp/hostile-askpass');
-    vi.stubEnv('SSH_AUTH_SOCK', '/tmp/hostile-agent.sock');
-    vi.stubEnv('NPM_CONFIG_USERCONFIG', '/tmp/hostile-npmrc');
-    vi.stubEnv('PNPM_HOME', '/tmp/hostile-pnpm');
-    vi.stubEnv('ONECLI_HOME', '/tmp/hostile-onecli');
-    vi.stubEnv('ANTHROPIC_API_KEY', 'must-not-propagate');
-    vi.stubEnv('GOOGLE_APPLICATION_CREDENTIALS', '/tmp/hostile-google-key');
-    const observed: Array<{ args: readonly string[]; env: Readonly<Record<string, string>> | undefined }> = [];
-
-    const resolved = await resolveReleaseCommit(source.remote, 'refs/heads/dogfood', {
-      fetchAuthentication: {
-        askPassProgram: '/owned/askpass',
-        sshAgentSocket: '/owned/agent.sock',
-      },
-      runCommand: async (spec) => {
-        observed.push({ args: spec.args, env: spec.env });
-        return runSanitizedCommand(spec);
-      },
-    });
-
-    expect(resolved.commit).toBe(source.firstCommit);
-    expect(observed.length).toBeGreaterThan(0);
-    for (const command of observed) {
-      const isFetch = command.args[0] === 'fetch';
-      expectSanitizedEnvironment(command.env, undefined, isFetch ? ['GIT_ASKPASS', 'SSH_AUTH_SOCK'] : []);
-      expect(command.env?.GIT_ASKPASS).toBe(isFetch ? '/owned/askpass' : undefined);
-      expect(command.env?.SSH_AUTH_SOCK).toBe(isFetch ? '/owned/agent.sock' : undefined);
-    }
+    await expect(stat(`${staged}.staging`)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(git(paths.checkoutRoot(instanceId), 'rev-parse', 'HEAD')).toBe(dogfood.firstCommit);
+    expect(await assertReleaseCheckoutAgreement(paths, instanceId)).toEqual(deployed);
   });
 
   it('rejects an existing checkout instead of reusing or overwriting it', async () => {
     const source = await sourceFixture();
-    const resolved = await resolveReleaseCommit(source.remote, 'refs/heads/dogfood');
     const paths = await controlPlanePaths();
-    const instanceId = allocateInstanceId();
-    await reserveInstance(paths, reservation(paths, instanceId, source.remote, resolved.commit));
+    const reservation = await reserved(paths, source.remote, source.firstCommit);
+    const instanceId = reservation.instance_id;
     await mkdir(paths.checkoutRoot(instanceId), { recursive: true });
     await write(paths.checkoutRoot(instanceId), 'owner.txt', 'someone else\n');
 
-    await expect(materializeReleaseCheckout(paths, instanceId, resolved)).rejects.toMatchObject({
+    await expect(materializeReleaseCheckout(paths, reservation)).rejects.toMatchObject({
       code: 'checkout_exists',
     });
     expect(await readFile(path.join(paths.checkoutRoot(instanceId), 'owner.txt'), 'utf8')).toBe('someone else\n');
@@ -214,41 +264,38 @@ describe('exact release checkout', () => {
 
   it('rejects a checkout path reached through a symlink', async () => {
     const source = await sourceFixture();
-    const resolved = await resolveReleaseCommit(source.remote, 'refs/heads/dogfood');
     const paths = await controlPlanePaths();
-    const instanceId = allocateInstanceId();
-    await reserveInstance(paths, reservation(paths, instanceId, source.remote, resolved.commit));
+    const reservation = await reserved(paths, source.remote, source.firstCommit);
+    const instanceId = reservation.instance_id;
     await mkdir(paths.instanceRoot(instanceId), { recursive: true });
     const target = path.join(path.dirname(paths.stateRoot), 'foreign-checkout');
     await mkdir(target);
     await symlink(target, paths.checkoutRoot(instanceId));
 
-    await expect(materializeReleaseCheckout(paths, instanceId, resolved)).rejects.toMatchObject({
+    await expect(materializeReleaseCheckout(paths, reservation)).rejects.toMatchObject({
       code: 'unsafe_checkout',
     });
   });
 
-  it('rejects a resolved release that disagrees with the immutable reservation', async () => {
+  it('refuses to publish into the live checkout a release the registry does not record', async () => {
     const source = await sourceFixture();
-    const resolved = await resolveReleaseCommit(source.remote, 'refs/heads/dogfood');
     const paths = await controlPlanePaths();
-    const instanceId = allocateInstanceId();
-    await reserveInstance(paths, reservation(paths, instanceId, source.remote, 'f'.repeat(40)));
+    const reservation = await reserved(paths, source.remote, 'f'.repeat(40));
 
-    await expect(materializeReleaseCheckout(paths, instanceId, resolved)).rejects.toMatchObject({
-      code: 'release_mismatch',
-    });
+    await expect(
+      materializeReleaseCheckout(paths, { ...reservation, deployed_commit: source.firstCommit }),
+    ).rejects.toMatchObject({ code: 'release_mismatch' });
+    await expect(stat(paths.checkoutRoot(reservation.instance_id))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('removes a newly-created partial checkout when exact-commit fetch fails', async () => {
     const source = await sourceFixture();
-    const resolved = await resolveReleaseCommit(source.remote, 'refs/heads/dogfood');
     const paths = await controlPlanePaths();
-    const instanceId = allocateInstanceId();
-    await reserveInstance(paths, reservation(paths, instanceId, source.remote, resolved.commit));
+    const reservation = await reserved(paths, source.remote, source.firstCommit);
+    const instanceId = reservation.instance_id;
 
     await expect(
-      materializeReleaseCheckout(paths, instanceId, resolved, {
+      materializeReleaseCheckout(paths, reservation, {
         runCommand: async (spec) => {
           if (spec.cwd === stagingRoot(paths, instanceId) && spec.args[0] === 'fetch') {
             throw new Error('fixture fetch failure');
@@ -263,13 +310,12 @@ describe('exact release checkout', () => {
 
   it('publishes the checkout atomically only after staging verification', async () => {
     const source = await sourceFixture();
-    const resolved = await resolveReleaseCommit(source.remote, 'refs/heads/dogfood');
     const paths = await controlPlanePaths();
-    const instanceId = allocateInstanceId();
-    await reserveInstance(paths, reservation(paths, instanceId, source.remote, resolved.commit));
+    const reservation = await reserved(paths, source.remote, source.firstCommit);
+    const instanceId = reservation.instance_id;
     const expectedHome = path.join(paths.instanceRoot(instanceId), '.release-home');
 
-    await materializeReleaseCheckout(paths, instanceId, resolved, {
+    await materializeReleaseCheckout(paths, reservation, {
       runCommand: async (spec) => {
         expectSanitizedEnvironment(spec.env, expectedHome);
         if (spec.cwd === stagingRoot(paths, instanceId)) {
@@ -279,21 +325,20 @@ describe('exact release checkout', () => {
       },
     });
 
-    expect(git(paths.checkoutRoot(instanceId), 'rev-parse', 'HEAD')).toBe(resolved.commit);
+    expect(git(paths.checkoutRoot(instanceId), 'rev-parse', 'HEAD')).toBe(source.firstCommit);
     await expect(stat(stagingRoot(paths, instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('publishes a complete owned staging checkout after an interrupted rename', async () => {
     const source = await sourceFixture();
-    const resolved = await resolveReleaseCommit(source.remote, 'refs/heads/dogfood');
     const paths = await controlPlanePaths();
-    const instanceId = allocateInstanceId();
-    await reserveInstance(paths, reservation(paths, instanceId, source.remote, resolved.commit));
-    await materializeReleaseCheckout(paths, instanceId, resolved);
+    const reservation = await reserved(paths, source.remote, source.firstCommit);
+    const instanceId = reservation.instance_id;
+    await materializeReleaseCheckout(paths, reservation);
     await rename(paths.checkoutRoot(instanceId), stagingRoot(paths, instanceId));
     const commands: string[] = [];
 
-    await materializeReleaseCheckout(paths, instanceId, resolved, {
+    await materializeReleaseCheckout(paths, reservation, {
       runCommand: async (spec) => {
         commands.push(spec.args[0] ?? '');
         return runSanitizedCommand(spec);
@@ -303,40 +348,38 @@ describe('exact release checkout', () => {
     expect(commands).not.toContain('init');
     expect(commands).not.toContain('fetch');
     expect(commands).not.toContain('checkout');
-    expect(git(paths.checkoutRoot(instanceId), 'rev-parse', 'HEAD')).toBe(resolved.commit);
+    expect(git(paths.checkoutRoot(instanceId), 'rev-parse', 'HEAD')).toBe(source.firstCommit);
   });
 
   it('cleans an owned partial staging checkout before retrying materialization', async () => {
     const source = await sourceFixture();
-    const resolved = await resolveReleaseCommit(source.remote, 'refs/heads/dogfood');
     const paths = await controlPlanePaths();
-    const instanceId = allocateInstanceId();
-    await reserveInstance(paths, reservation(paths, instanceId, source.remote, resolved.commit));
+    const reservation = await reserved(paths, source.remote, source.firstCommit);
+    const instanceId = reservation.instance_id;
     await mkdir(paths.instanceRoot(instanceId), { recursive: true, mode: 0o700 });
     await mkdir(stagingRoot(paths, instanceId), { mode: 0o700 });
     await write(stagingRoot(paths, instanceId), 'partial.txt', 'interrupted\n');
 
-    await materializeReleaseCheckout(paths, instanceId, resolved);
+    await materializeReleaseCheckout(paths, reservation);
 
     await expect(stat(path.join(paths.checkoutRoot(instanceId), 'partial.txt'))).rejects.toMatchObject({
       code: 'ENOENT',
     });
-    expect(git(paths.checkoutRoot(instanceId), 'rev-parse', 'HEAD')).toBe(resolved.commit);
+    expect(git(paths.checkoutRoot(instanceId), 'rev-parse', 'HEAD')).toBe(source.firstCommit);
   });
 
   it('does not clean a staging path that is a symlink', async () => {
     const source = await sourceFixture();
-    const resolved = await resolveReleaseCommit(source.remote, 'refs/heads/dogfood');
     const paths = await controlPlanePaths();
-    const instanceId = allocateInstanceId();
-    await reserveInstance(paths, reservation(paths, instanceId, source.remote, resolved.commit));
+    const reservation = await reserved(paths, source.remote, source.firstCommit);
+    const instanceId = reservation.instance_id;
     await mkdir(paths.instanceRoot(instanceId), { recursive: true, mode: 0o700 });
     const foreign = path.join(path.dirname(paths.stateRoot), 'foreign-staging');
     await mkdir(foreign);
     await write(foreign, 'owner.txt', 'preserve me\n');
     await symlink(foreign, stagingRoot(paths, instanceId));
 
-    await expect(materializeReleaseCheckout(paths, instanceId, resolved)).rejects.toMatchObject({
+    await expect(materializeReleaseCheckout(paths, reservation)).rejects.toMatchObject({
       code: 'unsafe_checkout',
     });
     expect(await readFile(path.join(foreign, 'owner.txt'), 'utf8')).toBe('preserve me\n');
@@ -344,13 +387,12 @@ describe('exact release checkout', () => {
 
   it('does not replace an unmarked final directory created while staging', async () => {
     const source = await sourceFixture();
-    const resolved = await resolveReleaseCommit(source.remote, 'refs/heads/dogfood');
     const paths = await controlPlanePaths();
-    const instanceId = allocateInstanceId();
-    await reserveInstance(paths, reservation(paths, instanceId, source.remote, resolved.commit));
+    const reservation = await reserved(paths, source.remote, source.firstCommit);
+    const instanceId = reservation.instance_id;
 
     await expect(
-      materializeReleaseCheckout(paths, instanceId, resolved, {
+      materializeReleaseCheckout(paths, reservation, {
         runCommand: async (spec) => {
           const result = await runSanitizedCommand(spec);
           if (spec.cwd === stagingRoot(paths, instanceId) && spec.args[0] === 'status') {

@@ -9,10 +9,23 @@ import {
   assertPrivateDirectory,
   preparePrivateDirectory,
   type ControlPlanePaths,
+  type ReleaseSlot,
 } from './paths.js';
-import { assertRegistryMarkerAgreement, getInstanceReservation, readInstanceMarkerFile } from './registry.js';
+import {
+  assertCheckoutMarker,
+  assertRegistryMarkerAgreement,
+  getInstanceReservation,
+  readInstanceMarkerFile,
+} from './registry.js';
 import { buildToolEnvironment, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
-import { GwsEaError, INSTANCE_MARKER_SCHEMA_VERSION, type InstanceMarker, type InstanceReservation } from './types.js';
+import type { ReleaseSource } from './release-tracks.js';
+import {
+  GwsEaError,
+  INSTANCE_MARKER_SCHEMA_VERSION,
+  sameRelease,
+  type InstanceMarker,
+  type InstanceReservation,
+} from './types.js';
 
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 
@@ -103,45 +116,163 @@ async function assertValidReleaseRef(
 }
 
 /**
- * Resolve and peel a release ref in a disposable object database. The caller
- * records only the returned full commit, never the movable ref.
+ * The tool's own commit: the release every create and update deploys, so
+ * everything the tool writes is correct for it by construction. A tracked
+ * change would make the tool differ from that commit and is refused, naming
+ * its files; untracked files belong to no release.
  */
-export async function resolveReleaseCommit(
-  sourceRemote: string,
-  releaseRef: string,
-  runtime: CheckoutRuntime = {},
-): Promise<ResolvedRelease> {
-  validateSourceRemote(sourceRemote);
+export async function resolveToolCommit(toolRoot: string, runtime: CheckoutRuntime = {}): Promise<string> {
   const run = runtime.runCommand ?? runSanitizedCommand;
-  const scratchRoot = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-resolve-'));
-  const repository = path.join(scratchRoot, 'objects.git');
+  const scratchRoot = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-tool-'));
   try {
-    const environment = await prepareReleaseCommandEnvironments(scratchRoot);
-    await run({ command: 'git', args: ['init', '--bare', repository], cwd: scratchRoot, env: environment.git });
-    await assertValidReleaseRef(repository, releaseRef, run, environment.git);
+    const { git: environment } = await prepareReleaseCommandEnvironments(scratchRoot);
+    const git = async (args: readonly string[]): Promise<string> =>
+      (await run({ command: 'git', args, cwd: toolRoot, env: environment })).stdout;
+    let head: string;
+    try {
+      head = await git(['rev-parse', '--verify', 'HEAD^{commit}']);
+    } catch (error) {
+      if (!(error instanceof GwsEaError) || error.code !== 'command_failed') throw error;
+      throw new GwsEaError(
+        'tool_checkout_unknown',
+        `gws-ea at ${toolRoot} is not a Git checkout, so it has no release to deploy; run gws-ea from a clone of its repository`,
+        { cause: error },
+      );
+    }
+    const commit = validateCommit(head.trim());
+    const files = (await git(['--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=no']))
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => line.slice(3));
+    if (files.length > 0) {
+      throw new GwsEaError(
+        'tool_checkout_modified',
+        `gws-ea's checkout has tracked changes, so it is not the release it would deploy: ${files.join(', ')}. Discard them, or run gws-ea from a clean checkout, then retry.`,
+        { details: { files } },
+      );
+    }
+    return commit;
+  } finally {
+    await rm(scratchRoot, { recursive: true, force: true });
+  }
+}
+
+export interface TrackCommits {
+  readonly commit: string;
+  /** For an update: the commit the assistant runs. */
+  readonly deployedCommit?: string;
+}
+
+/** Where a commit stands on a release track. */
+export interface TrackPosition {
+  /** The commit is reachable from the track's tip. */
+  readonly onTrack: boolean;
+  /**
+   * Where the deployed commit stands, when one was given: `behind` is a
+   * strict ancestor of the commit, the only place an update moves forward
+   * from; `elsewhere` is newer, diverged, or not in the track's history.
+   */
+  readonly deployed?: 'behind' | 'same' | 'elsewhere';
+}
+
+/** Which of `commits` the object database holds, never fetching one it lacks. */
+async function presentCommits(
+  repository: string,
+  commits: readonly string[],
+  run: SanitizedCommandRunner,
+  environment: Readonly<Record<string, string>>,
+): Promise<ReadonlySet<string>> {
+  const { stdout } = await run({
+    command: 'git',
+    args: ['cat-file', '--batch-check=%(objectname) %(objecttype)'],
+    cwd: repository,
+    env: environment,
+    input: `${commits.join('\n')}\n`,
+  });
+  return new Set(
+    stdout
+      .split('\n')
+      .map((line) => line.split(' '))
+      .filter(([, type]) => type === 'commit')
+      .map(([objectName]) => objectName!),
+  );
+}
+
+async function isAncestor(
+  repository: string,
+  ancestor: string,
+  descendant: string,
+  run: SanitizedCommandRunner,
+  environment: Readonly<Record<string, string>>,
+): Promise<boolean> {
+  try {
     await run({
       command: 'git',
-      args: ['fetch', '--no-tags', '--depth=1', '--end-of-options', sourceRemote, releaseRef],
+      args: ['merge-base', '--is-ancestor', ancestor, descendant],
       cwd: repository,
-      env: fetchEnvironment(environment.git, runtime.fetchAuthentication),
+      env: environment,
     });
+    return true;
+  } catch (error) {
+    // Exit 1 is Git's "not an ancestor"; anything else is a failure.
+    if (error instanceof GwsEaError && error.code === 'command_failed' && error.details?.exitCode === 1) return false;
+    throw error;
+  }
+}
 
-    let commit: string;
+/**
+ * Fetch the track branch's history without blobs into a disposable object
+ * database, and place `commit` (and an update's deployed commit) on it
+ * (KTD4). Only the commit graph is read, and lazy fetching is off, so a
+ * commit the history lacks counts as off the track rather than being fetched
+ * from wherever else the remote keeps it.
+ */
+export async function locateOnTrack(
+  source: ReleaseSource,
+  commits: TrackCommits,
+  runtime: CheckoutRuntime = {},
+): Promise<TrackPosition> {
+  validateSourceRemote(source.remote);
+  const commit = validateCommit(commits.commit);
+  const deployedCommit = commits.deployedCommit === undefined ? undefined : validateCommit(commits.deployedCommit);
+  const run = runtime.runCommand ?? runSanitizedCommand;
+  const scratchRoot = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-track-'));
+  const repository = path.join(scratchRoot, 'history.git');
+  try {
+    const environments = await prepareReleaseCommandEnvironments(scratchRoot);
+    const local = { ...environments.git, GIT_NO_LAZY_FETCH: '1' };
+    await run({ command: 'git', args: ['init', '--bare', repository], cwd: scratchRoot, env: local });
+    await assertValidReleaseRef(repository, source.ref, run, local);
+    await run({ command: 'git', args: ['remote', 'add', 'origin', source.remote], cwd: repository, env: local });
+    await run({
+      command: 'git',
+      args: ['fetch', '--no-tags', '--filter=blob:none', '--end-of-options', 'origin', source.ref],
+      cwd: repository,
+      env: fetchEnvironment(environments.git, runtime.fetchAuthentication),
+    });
+    let tip: string;
     try {
-      commit = validateCommit(
+      tip = validateCommit(
         (
           await run({
             command: 'git',
             args: ['rev-parse', '--verify', 'FETCH_HEAD^{commit}'],
             cwd: repository,
-            env: environment.git,
+            env: local,
           })
         ).stdout.trim(),
       );
     } catch {
       throw new GwsEaError('release_ref_not_commit', 'Release ref does not resolve to a commit');
     }
-    return { sourceRemote, releaseRef, commit };
+
+    const present = await presentCommits(repository, [commit, ...(deployedCommit ? [deployedCommit] : [])], run, local);
+    const onTrack = present.has(commit) && (await isAncestor(repository, commit, tip, run, local));
+    if (deployedCommit === undefined) return { onTrack };
+    if (deployedCommit === commit) return { onTrack, deployed: 'same' };
+    const behind =
+      onTrack && present.has(deployedCommit) && (await isAncestor(repository, deployedCommit, commit, run, local));
+    return { onTrack, deployed: behind ? 'behind' : 'elsewhere' };
   } finally {
     await rm(scratchRoot, { recursive: true, force: true });
   }
@@ -168,53 +299,56 @@ function markerPath(checkoutRoot: string): string {
   return path.join(checkoutRoot, 'data', 'gws-ea', 'instance.json');
 }
 
-async function writeStagingMarker(
-  checkoutRoot: string,
-  instanceId: string,
-  reservation: InstanceReservation,
-): Promise<void> {
+async function writeStagingMarker(checkoutRoot: string, reservation: InstanceReservation): Promise<void> {
   const file = markerPath(checkoutRoot);
   await preparePrivateDirectory(path.dirname(file));
   await writePrivate(file, {
     schema_version: INSTANCE_MARKER_SCHEMA_VERSION,
-    instance_id: instanceId,
+    instance_id: reservation.instance_id,
     deployed_commit: reservation.deployed_commit,
   } satisfies InstanceMarker);
 }
 
-async function assertStagingMarker(
-  checkoutRoot: string,
-  instanceId: string,
-  reservation: InstanceReservation,
-): Promise<void> {
+async function assertStagingMarker(checkoutRoot: string, reservation: InstanceReservation): Promise<void> {
   const marker = await readInstanceMarkerFile(markerPath(checkoutRoot));
-  if (marker.instance_id !== instanceId || marker.deployed_commit !== reservation.deployed_commit) {
+  if (marker.instance_id !== reservation.instance_id || marker.deployed_commit !== reservation.deployed_commit) {
     throw new GwsEaError('marker_mismatch', 'Staging instance marker mismatch; refusing mutation');
   }
 }
 
-function assertResolvedReleaseMatches(reservation: InstanceReservation, release: ResolvedRelease): void {
-  if (reservation.source_remote !== release.sourceRemote || reservation.deployed_commit !== release.commit) {
-    throw new GwsEaError('release_mismatch', 'Resolved release does not match the immutable instance reservation');
-  }
-}
-
-/** Materialize only the commit already recorded in the machine registry. */
+/**
+ * Materialize a reservation's release. Create publishes the registry's
+ * reservation at the live checkout, which only ever holds the release the
+ * registry records. An update stages its target reservation view (KTD17) in
+ * a release `slot` beside it, while the registry still names the release the
+ * update moves from.
+ */
 export async function materializeReleaseCheckout(
   paths: ControlPlanePaths,
-  instanceId: string,
-  release: ResolvedRelease,
+  reservation: InstanceReservation,
   runtime: CheckoutRuntime = {},
+  slot?: ReleaseSlot,
 ): Promise<InstanceReservation> {
-  const reservation = await getInstanceReservation(paths, instanceId);
-  assertResolvedReleaseMatches(reservation, release);
-  await assertCheckoutTargetAbsent(reservation.checkout_realpath);
-  await assertOwnedDestination(reservation.checkout_realpath);
+  const instanceId = reservation.instance_id;
+  const recorded = await getInstanceReservation(paths, instanceId);
+  if (!slot && !sameRelease(recorded, reservation)) {
+    throw new GwsEaError('release_mismatch', 'The live checkout holds only the release the registry records');
+  }
+  const destination = slot ? paths.releaseCheckoutRoot(instanceId, slot) : recorded.checkout_realpath;
+  await assertCheckoutTargetAbsent(destination);
+  await assertOwnedDestination(destination);
   await mkdir(paths.instanceRoot(instanceId), { recursive: true, mode: 0o700 });
   await assertPrivateDirectory(paths.instanceRoot(instanceId));
+  if (slot) await preparePrivateDirectory(paths.releaseRoot(instanceId, slot));
   const environments = await prepareReleaseCommandEnvironments(paths.instanceRoot(instanceId));
-  const stagingRoot = stagingCheckoutRoot(reservation.checkout_realpath);
+  const stagingRoot = stagingCheckoutRoot(destination);
   const run = runtime.runCommand ?? runSanitizedCommand;
+  const verifyPublished = async (): Promise<InstanceReservation> => {
+    if (!slot) return assertReleaseCheckoutAgreement(paths, instanceId, runtime);
+    await assertCheckoutMarker(destination, instanceId, [reservation.deployed_commit]);
+    await assertCheckoutRoot(destination, reservation, run, environments.git);
+    return reservation;
+  };
   try {
     const info = await lstat(stagingRoot);
     if (info.isSymbolicLink() || !info.isDirectory() || (await realpath(stagingRoot)) !== stagingRoot) {
@@ -222,8 +356,8 @@ export async function materializeReleaseCheckout(
     }
     await assertPrivateDirectory(stagingRoot);
     try {
-      await promoteStagingCheckout(stagingRoot, instanceId, reservation, run, environments.git);
-      return assertReleaseCheckoutAgreement(paths, instanceId, runtime);
+      await promoteStagingCheckout(stagingRoot, destination, reservation, run, environments.git);
+      return verifyPublished();
     } catch (error) {
       if (error instanceof GwsEaError && ['invalid_marker', 'marker_mismatch'].includes(error.code)) throw error;
       await rm(stagingRoot, { recursive: true, force: true });
@@ -254,9 +388,9 @@ export async function materializeReleaseCheckout(
       cwd: stagingRoot,
       env: environments.git,
     });
-    await writeStagingMarker(stagingRoot, instanceId, reservation);
-    await promoteStagingCheckout(stagingRoot, instanceId, reservation, run, environments.git);
-    const result = await assertReleaseCheckoutAgreement(paths, instanceId, runtime);
+    await writeStagingMarker(stagingRoot, reservation);
+    await promoteStagingCheckout(stagingRoot, destination, reservation, run, environments.git);
+    const result = await verifyPublished();
     completed = true;
     return result;
   } finally {
@@ -265,20 +399,20 @@ export async function materializeReleaseCheckout(
 }
 
 /**
- * Move a staged checkout into place once it carries this instance's marker,
- * sits at the reserved commit, and nothing occupies the checkout path.
+ * Move a staged checkout to `destination` once it carries this instance's
+ * marker, sits at the reservation's commit, and nothing occupies the path.
  */
 async function promoteStagingCheckout(
   stagingRoot: string,
-  instanceId: string,
+  destination: string,
   reservation: InstanceReservation,
   run: SanitizedCommandRunner,
   environment: Readonly<Record<string, string>>,
 ): Promise<void> {
-  await assertStagingMarker(stagingRoot, instanceId, reservation);
+  await assertStagingMarker(stagingRoot, reservation);
   await assertCheckoutRoot(stagingRoot, reservation, run, environment);
-  await assertCheckoutTargetAbsent(reservation.checkout_realpath);
-  await rename(stagingRoot, reservation.checkout_realpath);
+  await assertCheckoutTargetAbsent(destination);
+  await rename(stagingRoot, destination);
 }
 
 async function assertCheckoutRoot(
@@ -298,7 +432,7 @@ async function assertCheckoutRoot(
     ).stdout.trim(),
   );
   if (head !== reservation.deployed_commit) {
-    throw new GwsEaError('release_mismatch', 'Checkout HEAD does not match the immutable instance reservation');
+    throw new GwsEaError('release_mismatch', "Checkout HEAD does not match the reservation's release");
   }
   const branch = (
     await run({

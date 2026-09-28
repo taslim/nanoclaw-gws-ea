@@ -22,7 +22,12 @@ import {
   type StepResource,
 } from './phases.js';
 import { assertReleaseCheckoutAgreement, materializeReleaseCheckout, type ResolvedRelease } from './checkout.js';
-import { runReleasePreflight, type ReleasePreflightInput, type ReleasePreflightResult } from './release-preflight.js';
+import {
+  runReleasePreflight,
+  type DeployedSetup,
+  type ReleasePreflightInput,
+  type ReleasePreflightResult,
+} from './release-preflight.js';
 import {
   findCredentialSecret,
   importProviderCredential,
@@ -34,7 +39,12 @@ import {
   type OnecliRuntimeReceipt,
   type OnecliRuntimeDependencies,
 } from './onecli.js';
-import { createOnecliRuntimeLayout, type OnecliPins, type OnecliRuntimeLayout } from './onecli-compose.js';
+import {
+  createOnecliRuntimeLayout,
+  parseOnecliComposeImages,
+  type OnecliPins,
+  type OnecliRuntimeLayout,
+} from './onecli-compose.js';
 import {
   reconcileInstanceRuntime,
   runInstanceOnecliAdminCommand,
@@ -345,8 +355,7 @@ async function ensureReleaseCheckout(
     if (!['ENOENT', 'marker_missing', 'checkout_exists', 'unsafe_checkout'].includes(code ?? '')) throw error;
     await dependencies.materializeReleaseCheckout(
       context.operation.paths,
-      context.operation.instanceId,
-      context.input.release,
+      await getInstanceReservation(context.operation.paths, context.operation.instanceId),
     );
   }
   const result = await dependencies.runReleasePreflight(context.input.releasePreflight);
@@ -1438,6 +1447,10 @@ interface InstanceState {
   readonly runtime?: InstanceRuntimeConfig;
 }
 
+function instanceRuntimeFile(reservation: InstanceReservation): string {
+  return path.join(reservation.checkout_realpath, 'data', 'gws-ea', 'runtime.json');
+}
+
 async function readInstanceState(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<InstanceState> {
   const absent = (error: unknown): undefined => {
     if (isErrno(error, 'ENOENT')) return undefined;
@@ -1445,9 +1458,59 @@ async function readInstanceState(paths: ControlPlanePaths, reservation: Instance
   };
   const [manifest, runtime] = await Promise.all([
     loadProductionBootstrapManifest(paths.bootstrapFile(reservation.instance_id)).catch(absent),
-    loadInstanceRuntimeConfig(path.join(reservation.checkout_realpath, 'data', 'gws-ea', 'runtime.json')).catch(absent),
+    loadInstanceRuntimeConfig(instanceRuntimeFile(reservation)).catch(absent),
   ]);
   return { ...(manifest ? { manifest } : {}), ...(runtime ? { runtime } : {}) };
+}
+
+/** The instance's OneCLI layout, run through the CLI and Docker endpoint it records. */
+function instanceOnecliLayout(
+  paths: ControlPlanePaths,
+  reservation: InstanceReservation,
+  cliExecutable: string,
+  dockerEndpoint: string,
+): OnecliRuntimeLayout {
+  return createOnecliRuntimeLayout({
+    instanceId: reservation.instance_id,
+    instanceRoot: paths.instanceRoot(reservation.instance_id),
+    project: reservation.exclusive_resource_claims.onecli_project,
+    appPort: reservation.allocated_ports.onecli_app,
+    gatewayPort: reservation.allocated_ports.onecli_gateway,
+    cliExecutable,
+    dockerEndpoint,
+  });
+}
+
+export interface DeployedAssistantSetup extends DeployedSetup {
+  /** The OneCLI CLI the assistant's runtime runs. */
+  readonly onecliCliPath: string;
+}
+
+/**
+ * What a created assistant's own record says it runs (KTD6): the provider,
+ * credential metadata, and OneCLI cohort its release receipt records, the
+ * OneCLI CLI its runtime uses, and the Postgres image its Compose file names.
+ * An update holds the tool's release to these, never to the tool's own tree.
+ */
+export async function readDeployedSetup(
+  paths: ControlPlanePaths,
+  reservation: InstanceReservation,
+): Promise<DeployedAssistantSetup> {
+  const runtime = await loadInstanceRuntimeConfig(instanceRuntimeFile(reservation));
+  const receipt = await loadReleasePreflightReceipt(paths.releasePreflightFile(reservation.instance_id), {
+    instanceId: reservation.instance_id,
+    deployedCommit: reservation.deployed_commit,
+    provider: runtime.selected_provider,
+  });
+  const onecli = instanceOnecliLayout(paths, reservation, runtime.onecli_cli_path, runtime.docker_endpoint);
+  const images = parseOnecliComposeImages(await readOwnerOnlyFile(onecli.composeFile));
+  return {
+    onecli: receipt.onecli,
+    postgresImage: images.postgres,
+    provider: receipt.provider,
+    providerCredential: receipt.providerCredential,
+    onecliCliPath: runtime.onecli_cli_path,
+  };
 }
 
 /**
@@ -1488,25 +1551,15 @@ export async function runProductionProvision(
   }
   const reservation = await getInstanceReservation(operation.paths, operation.instanceId);
   const { manifest, runtime: persistedRuntime } = await readInstanceState(operation.paths, reservation);
-  const onecliLayout = (cliExecutable: string, dockerEndpoint: string): OnecliRuntimeLayout =>
-    createOnecliRuntimeLayout({
-      instanceId: reservation.instance_id,
-      instanceRoot: operation.paths.instanceRoot(reservation.instance_id),
-      project: reservation.exclusive_resource_claims.onecli_project,
-      appPort: reservation.allocated_ports.onecli_app,
-      gatewayPort: reservation.allocated_ports.onecli_gateway,
-      cliExecutable,
-      dockerEndpoint,
-    });
   let runtime: InstanceRuntimeConfig;
   let onecli: OnecliRuntimeLayout;
   if (persistedRuntime) {
     runtime = persistedRuntime;
-    onecli = onecliLayout(runtime.onecli_cli_path, runtime.docker_endpoint);
+    onecli = instanceOnecliLayout(operation.paths, reservation, runtime.onecli_cli_path, runtime.docker_endpoint);
   } else {
     if (!manifest) throw new GwsEaError('bootstrap_required', 'The temporary bootstrap manifest is missing');
     // The runtime records this layout's CLI path and Docker endpoint verbatim, so the layout matches it too.
-    onecli = onecliLayout(manifest.onecli_cli_path, manifest.docker_endpoint);
+    onecli = instanceOnecliLayout(operation.paths, reservation, manifest.onecli_cli_path, manifest.docker_endpoint);
     runtime = createInstanceRuntimeConfig(reservation, onecli, {
       nodePath: manifest.node_path,
       homeDirectory: manifest.home_directory,

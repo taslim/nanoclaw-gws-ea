@@ -23,6 +23,7 @@ import {
 } from './registry.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { Prerequisites } from './prerequisites.js';
+import type { CreateTargetRequest } from './release-target.js';
 import { GwsEaError, releaseOf, type InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
@@ -164,10 +165,8 @@ function productionRuntime() {
   return {
     collectCreateInputs: async () => createSetupInput(),
     checkPrerequisites: async () => PREREQUISITES,
-    resolveRelease: async (sourceRemote: string, releaseRef: string) => ({
-      sourceRemote,
-      releaseRef,
-      commit: 'b'.repeat(40),
+    resolveReleaseTarget: async ({ track, source }: CreateTargetRequest) => ({
+      release: { source_remote: source.remote, release_track: track, deployed_commit: 'b'.repeat(40) },
     }),
     holdLoopbackPorts: async () => ({
       ports: { nanoclaw_webhook: 34_101, onecli_app: 34_102, onecli_gateway: 34_103 },
@@ -784,9 +783,9 @@ describe('create recovery contract', () => {
         stderr: () => undefined,
         checkPrerequisites: async () => PREREQUISITES,
         advanceProvision,
-        resolveRelease: async (sourceRemote, releaseRef) => {
-          resolveCalls.push([sourceRemote, releaseRef]);
-          return { sourceRemote, releaseRef, commit: 'b'.repeat(40) };
+        resolveReleaseTarget: async ({ track, source }) => {
+          resolveCalls.push([source.remote, source.ref]);
+          return { release: { source_remote: source.remote, release_track: track, deployed_commit: 'b'.repeat(40) } };
         },
         holdLoopbackPorts: async () => ({
           ports: { nanoclaw_webhook: 34_101, onecli_app: 34_102, onecli_gateway: 34_103 },
@@ -916,7 +915,7 @@ describe('create recovery contract', () => {
       stderr: (line) => stderr.push(line),
       collectCreateInputs: async () => createSetupInput(),
       checkPrerequisites: async () => PREREQUISITES,
-      resolveRelease: async () => {
+      resolveReleaseTarget: async () => {
         throw new GwsEaError('release_resolution_failed', 'Release track could not be resolved');
       },
       holdLoopbackPorts: async () => {
@@ -944,7 +943,9 @@ describe('create recovery contract', () => {
         bootstrapManifest: { ...createSetupInput().bootstrapManifest, schema_version: 99 as 1 },
       }),
       checkPrerequisites: async () => PREREQUISITES,
-      resolveRelease: async (sourceRemote, releaseRef) => ({ sourceRemote, releaseRef, commit: 'b'.repeat(40) }),
+      resolveReleaseTarget: async ({ track, source }) => ({
+        release: { source_remote: source.remote, release_track: track, deployed_commit: 'b'.repeat(40) },
+      }),
       holdLoopbackPorts: async () => {
         throw new Error('ports must not be allocated for invalid setup input');
       },

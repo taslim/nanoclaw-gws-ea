@@ -25,6 +25,7 @@ import { runSanitizedCommand } from './process.js';
 import { installProductionBootstrapManifest } from './provision.js';
 import { allocateInstanceId, readRegistry } from './registry.js';
 import type { NanoclawServiceHelpers } from './service-control.js';
+import type { CreateTargetRequest } from './release-target.js';
 import { resolveReleaseSource } from './release-tracks.js';
 import { activeStep } from './run-log.js';
 import { GwsEaError, releaseOf, type InstanceReservationInput } from './types.js';
@@ -121,7 +122,9 @@ function createRuntime(): Partial<CliRuntime> {
   return {
     collectCreateInputs: async () => setupAnswers(),
     checkPrerequisites: async () => PREREQUISITES,
-    resolveRelease: async (sourceRemote, releaseRef) => ({ sourceRemote, releaseRef, commit: 'b'.repeat(40) }),
+    resolveReleaseTarget: async ({ track, source }) => ({
+      release: { source_remote: source.remote, release_track: track, deployed_commit: 'b'.repeat(40) },
+    }),
     holdLoopbackPorts: async () => ({
       ports: { nanoclaw_webhook: 34_101, onecli_app: 34_102, onecli_gateway: 34_103 },
       release: async () => undefined,
@@ -795,7 +798,7 @@ describe('gws-ea run-scoped Cloudflare authority', () => {
 describe('gws-ea release sources', () => {
   it("installs dogfood from the public repository's integration branch without asking for a remote", async () => {
     const paths = await testPaths();
-    const resolved: Array<readonly [string, string]> = [];
+    const resolved: CreateTargetRequest[] = [];
     const contexts: unknown[] = [];
     const io = lines();
 
@@ -808,15 +811,21 @@ describe('gws-ea release sources', () => {
           contexts.push(context);
           return setupAnswers();
         },
-        resolveRelease: async (sourceRemote, releaseRef) => {
-          resolved.push([sourceRemote, releaseRef]);
-          return { sourceRemote, releaseRef, commit: 'b'.repeat(40) };
+        resolveReleaseTarget: async (request) => {
+          resolved.push(request);
+          return {
+            release: {
+              source_remote: request.source.remote,
+              release_track: request.track,
+              deployed_commit: 'b'.repeat(40),
+            },
+          };
         },
         advanceProvision: async () => ({ status: 'paused', pause: DM_PAUSE }),
       }),
     ).toBe(10);
     const dogfood = resolveReleaseSource('dogfood');
-    expect(resolved).toEqual([[dogfood.remote, dogfood.ref]]);
+    expect(resolved).toEqual([{ track: 'dogfood', source: dogfood }]);
     expect(contexts).toEqual([expect.objectContaining({ sourceRemote: dogfood.remote, provided: {} })]);
     const registry = await readRegistry(paths);
     const instances = Object.values(registry.instances);
@@ -828,7 +837,7 @@ describe('gws-ea release sources', () => {
   it('refuses prod before it has a release, before asking anything', async () => {
     const paths = await testPaths();
     const collectCreateInputs = vi.fn();
-    const resolveRelease = vi.fn();
+    const resolveReleaseTarget = vi.fn();
     const io = lines();
 
     expect(
@@ -837,13 +846,47 @@ describe('gws-ea release sources', () => {
         ...io.runtime,
         ...createRuntime(),
         collectCreateInputs,
-        resolveRelease,
+        resolveReleaseTarget,
       }),
     ).toBe(1);
     expect(io.err.join('\n')).toContain('Release track prod has no release yet; use --track dogfood.');
     expect(collectCreateInputs).not.toHaveBeenCalled();
-    expect(resolveRelease).not.toHaveBeenCalled();
+    expect(resolveReleaseTarget).not.toHaveBeenCalled();
     expect(io.out).toEqual([]);
+  });
+
+  it("reserves the tool's own commit, and reserves nothing when the tool cannot deploy", async () => {
+    const deployed = await testPaths();
+    expect(
+      await runCli(['create', '--track', 'dogfood'], {
+        paths: deployed,
+        ...lines().runtime,
+        ...createRuntime(),
+        resolveReleaseTarget: async ({ track, source }) => ({
+          release: { source_remote: source.remote, release_track: track, deployed_commit: 'c'.repeat(40) },
+        }),
+        advanceProvision: async () => ({ status: 'paused', pause: DM_PAUSE }),
+      }),
+    ).toBe(10);
+    expect(Object.values((await readRegistry(deployed)).instances).map((instance) => instance.deployed_commit)).toEqual(
+      ['c'.repeat(40)],
+    );
+
+    const refused = await testPaths();
+    const io = lines();
+    expect(
+      await runCli(['create', '--track', 'dogfood'], {
+        paths: refused,
+        ...io.runtime,
+        ...createRuntime(),
+        resolveReleaseTarget: async () => {
+          throw new GwsEaError('release_not_on_track', 'This tool is not on release track dogfood.');
+        },
+      }),
+    ).toBe(1);
+    expect(io.err.join('\n')).toContain('This tool is not on release track dogfood.');
+    expect(io.err.join('\n')).toContain('Retry with: gws-ea create --track dogfood');
+    expect(Object.keys((await readRegistry(refused)).instances)).toEqual([]);
   });
 
   it('needs --source-remote for a track that is not a product track', async () => {
