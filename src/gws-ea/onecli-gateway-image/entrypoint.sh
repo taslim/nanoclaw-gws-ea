@@ -11,9 +11,14 @@ set -eu
 
 # DSN shape and secret filenames mirror the app service's command in
 # src/gws-ea/onecli-compose.ts (renderOnecliCompose); keep the two in sync.
-export DATABASE_URL="postgresql://onecli:$(cat /run/secrets/postgres_password)@postgres:5432/onecli"
-export SECRET_ENCRYPTION_KEY="$(cat /run/secrets/secret_encryption_key)"
-export GATEWAY_INTERNAL_SECRET="$(cat /run/secrets/gateway_internal_secret)"
+# Read each secret in its own assignment so `set -e` aborts on an unreadable
+# secret file — `export VAR="$(cat ...)"` would return export's status, not
+# cat's, and could launch the gateway with an empty credential (R9 fail-closed).
+PG_PASSWORD=$(cat /run/secrets/postgres_password)
+SECRET_ENCRYPTION_KEY=$(cat /run/secrets/secret_encryption_key)
+GATEWAY_INTERNAL_SECRET=$(cat /run/secrets/gateway_internal_secret)
+DATABASE_URL="postgresql://onecli:${PG_PASSWORD}@postgres:5432/onecli"
+export DATABASE_URL SECRET_ENCRYPTION_KEY GATEWAY_INTERNAL_SECRET
 
 exec setpriv --reuid node --regid node --init-groups --bounding-set -all --inh-caps -all \
   onecli-gateway --port 10255 --data-dir /app/data

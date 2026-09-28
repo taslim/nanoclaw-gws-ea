@@ -283,8 +283,9 @@ reach a local or LAN service — a local Ollama endpoint, a NAS, or another serv
 on the operator's machine. gws-ea assistants target cloud model providers and
 cloud services reached over public egress; local/LAN reach from inside the agent
 sandbox is outside gws-ea's egress identity. The wrapper image source lives in
-`src/gws-ea/onecli-gateway-image/`; the rules and their rationale are owned by
-`src/gws-ea/onecli-compose.ts` and `src/gws-ea/onecli.ts`.
+`src/gws-ea/onecli-gateway-image/`; the rules and their rationale live in
+`src/gws-ea/onecli-gateway-image/rules.sh`, and `src/gws-ea/onecli.ts` builds and
+verifies the image.
 
 ## Agent-provider credentials
 
