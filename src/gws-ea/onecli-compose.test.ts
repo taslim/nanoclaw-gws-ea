@@ -8,6 +8,8 @@ import { ONECLI_GATEWAY_VERSION } from './pins.js';
 const INSTANCE_ID = '12345678-1234-4123-8123-123456789abc';
 /** The pins the instance's release recorded; a later launcher's own pins never apply to it. */
 const PINS = { gateway: '1.41.3', cli: '2.2.4' } as const;
+/** The content-addressed wrapper gateway image the launcher builds and passes in. */
+const WRAPPER_IMAGE = 'gws-ea-onecli-gateway:0123456789abcdef';
 
 function record(value: unknown): Record<string, unknown> {
   expect(value).toBeTypeOf('object');
@@ -28,7 +30,7 @@ describe('instance-owned OneCLI Compose specification', () => {
       dockerEndpoint: 'unix:///var/run/docker.sock',
     });
 
-    const source = renderOnecliCompose(layout, PINS);
+    const source = renderOnecliCompose(layout, PINS, WRAPPER_IMAGE);
     const compose = record(parseYaml(source));
     const services = record(compose.services);
     const postgres = record(services.postgres);
@@ -38,9 +40,16 @@ describe('instance-owned OneCLI Compose specification', () => {
     expect(Object.keys(services).sort()).toEqual(['app', 'gateway', 'postgres']);
     expect(PINS.gateway).not.toBe(ONECLI_GATEWAY_VERSION);
     expect(app.image).toBe(`ghcr.io/onecli/onecli:${PINS.gateway}`);
-    expect(gateway.image).toBe(`ghcr.io/onecli/onecli:${PINS.gateway}`);
+    expect(gateway.image).toBe(WRAPPER_IMAGE);
     expect(postgres.image).toBe('postgres:18-alpine');
     expect(source).not.toContain('container_name');
+
+    // The gateway runs the wrapper image, which installs the egress firewall
+    // (needs NET_ADMIN) via its ENTRYPOINT and drops the capability before the
+    // gateway starts, so the service carries no command of its own.
+    expect(gateway.cap_add).toEqual(['NET_ADMIN']);
+    expect(gateway.command).toBeUndefined();
+    expect(app.cap_add).toBeUndefined();
 
     expect(postgres.ports).toBeUndefined();
     expect(app.ports).toEqual(['127.0.0.1:31002:10254']);
@@ -71,7 +80,7 @@ describe('instance-owned OneCLI Compose specification', () => {
       cliExecutable: '/opt/onecli/bin/onecli',
       dockerEndpoint: 'unix:///var/run/docker.sock',
     });
-    const source = renderOnecliCompose(layout, PINS);
+    const source = renderOnecliCompose(layout, PINS, WRAPPER_IMAGE);
     const compose = record(parseYaml(source));
     const secrets = record(compose.secrets);
 
@@ -95,7 +104,7 @@ describe('instance-owned OneCLI Compose specification', () => {
       cliExecutable: '/opt/onecli/bin/onecli',
       dockerEndpoint: 'unix:///var/run/docker.sock',
     });
-    const services = record(record(parseYaml(renderOnecliCompose(layout, PINS))).services);
+    const services = record(record(parseYaml(renderOnecliCompose(layout, PINS, WRAPPER_IMAGE))).services);
     const budget = Object.values(services).reduce<number>((total, service) => {
       const check = record(record(service).healthcheck);
       const seconds = (value: unknown) => Number(String(value).replace(/s$/u, ''));
