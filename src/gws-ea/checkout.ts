@@ -137,17 +137,18 @@ async function withScratchEnvironments<T>(
 }
 
 /**
- * The files a checkout's tracked tree differs in. Untracked files belong to no
- * release, and Git takes no optional lock, so its index is never rewritten.
+ * The paths `git status` reports for a checkout, narrowed by `options`. Git
+ * takes no optional lock, so its index is never rewritten.
  */
-async function trackedChanges(
+async function statusPaths(
   checkoutRoot: string,
   run: SanitizedCommandRunner,
   environment: Readonly<Record<string, string>>,
+  options: readonly string[],
 ): Promise<string[]> {
   const { stdout } = await run({
     command: 'git',
-    args: ['--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=no'],
+    args: ['--no-optional-locks', 'status', '--porcelain=v1', ...options],
     cwd: checkoutRoot,
     env: environment,
   });
@@ -155,6 +156,15 @@ async function trackedChanges(
     .split('\n')
     .filter(Boolean)
     .map((line) => line.slice(3));
+}
+
+/** The files a checkout's tracked tree differs in. Untracked files belong to no release. */
+function trackedChanges(
+  checkoutRoot: string,
+  run: SanitizedCommandRunner,
+  environment: Readonly<Record<string, string>>,
+): Promise<string[]> {
+  return statusPaths(checkoutRoot, run, environment, ['--untracked-files=no']);
 }
 
 /** The tool's own commit, read in its checkout; see `resolveToolCommit`. */
@@ -240,8 +250,7 @@ export async function committedTree(
 
 /**
  * The paths under `directory` where a checkout's working tree differs from
- * its HEAD: tracked changes, and untracked files Git does not ignore. Git
- * takes no optional lock, so its index is never rewritten.
+ * its HEAD: tracked changes, and untracked files Git does not ignore.
  */
 export async function workingTreeChanges(
   root: string,
@@ -249,18 +258,9 @@ export async function workingTreeChanges(
   runtime: CheckoutRuntime = {},
 ): Promise<string[]> {
   const run = runtime.runCommand ?? runSanitizedCommand;
-  return withScratchEnvironments('gws-ea-tree-', async ({ git: environment }) => {
-    const { stdout } = await run({
-      command: 'git',
-      args: ['--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=all', '--', directory],
-      cwd: root,
-      env: environment,
-    });
-    return stdout
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => line.slice(3));
-  });
+  return withScratchEnvironments('gws-ea-tree-', ({ git: environment }) =>
+    statusPaths(root, run, environment, ['--untracked-files=all', '--', directory]),
+  );
 }
 
 /** Where an assistant's deployed commit stands against the tool's own release. */

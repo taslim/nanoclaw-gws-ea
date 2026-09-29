@@ -193,7 +193,7 @@ function repoTags(tags: unknown): readonly string[] {
 }
 
 /** The tags `docker image inspect --format '{{json .RepoTags}}'` reports. */
-export function imageTags(output: string): readonly string[] {
+function imageTags(output: string): readonly string[] {
   let tags: unknown;
   try {
     tags = JSON.parse(output);
