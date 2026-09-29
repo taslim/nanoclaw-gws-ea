@@ -39,6 +39,7 @@ import {
   PROCEDURE,
   receiptCommit,
   release,
+  releaseAgentImageKey,
   RELEASE_GATEWAY,
   removeTemporaryRoots,
   repositoryImages,
@@ -747,8 +748,8 @@ describe('after a rollback', GIT_HEAVY, () => {
     const state = world(runtime);
     const base = imageBase(runtime);
     const ran = state.tags.get(`${base}:latest`)!;
-    // Nothing the agent image is built from changed, so the update's build gives back the image the assistant runs.
-    state.cachedBuild = true;
+    // The image the assistant runs already carries the release's key, so the update tags it rather than building.
+    state.labels.set(ran, releaseAgentImageKey(next));
     expect(await cli(host, state, next, runtime).run(['update', '--id', id, '--yes'])).toBe(0);
     expect([state.tags.get(`${base}:latest`), state.tags.get(`${base}:previous`)]).toEqual([ran, ran]);
     state.hangAt = 'untag';
@@ -1463,6 +1464,31 @@ describe('rollback isolation (AE3)', GIT_HEAVY, () => {
     expect(await snapshot(host.paths.instanceRoot(b.instance_id))).toEqual(bFiles);
     expect(state.tags.get(`${imageBase(b)}:latest`)).toBe(bLatest);
     expect(state.tags.get(`${imageBase(b)}:previous`)).toBe(bLatest);
+  });
+
+  it('keeps the agent image another assistant runs when one of two sharing it rolls back', async () => {
+    const host = await machine();
+    const b = await assistant(host, 37_101);
+    const { runtime: a, next, state, images } = await updatedAssistant({}, 37_001, host);
+    for (const tag of [`${imageBase(b)}:latest`, `${imageBase(b)}:ag-research`]) {
+      const id = imageId();
+      state.tags.set(tag, id);
+      state.ids.add(id);
+    }
+    // B, updated to the same release, runs the image A's update built, under its own tags.
+    expect(await cli(host, state, next, b).run(['update', '--id', b.instance_id, '--yes'])).toBe(0);
+    expect(state.tags.get(`${imageBase(b)}:latest`)).toBe(images.next);
+
+    expect(await cli(host, state, next, a).run(['rollback', '--id', a.instance_id, '--yes'])).toBe(0);
+
+    // A runs its first image again and keeps no tag on the shared one, which B still runs, whole.
+    expect(state.tags.get(`${imageBase(a)}:latest`)).toBe(images.first);
+    expect([...state.tags].filter(([, id]) => id === images.next).map(([tag]) => tag)).toEqual([
+      `${imageBase(b)}:latest`,
+    ]);
+    expect(state.ids.has(images.next)).toBe(true);
+    expect(state.labels.get(images.next)).toBe(releaseAgentImageKey(next));
+    expect(repositoryImages(state, imageBase(a)).untagged).toEqual([]);
   });
 });
 

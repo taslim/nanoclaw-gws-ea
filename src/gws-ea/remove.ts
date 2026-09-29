@@ -45,7 +45,7 @@ import {
   renderManagedCloudflareConfiguration,
   replaceManagedCloudflareConfiguration,
 } from './cloudflare-ingress.js';
-import { imageTags } from './cutover.js';
+import { imageTags } from './agent-image.js';
 import {
   PauseRequired,
   runStep,
@@ -855,9 +855,11 @@ async function uninstallNanoclaw(
     if ((await containers()).length > 0) throw incomplete('NanoClaw containers remain after removal');
   }
 
-  // Every tag in the assistant's own image repository goes: `:latest`, the `:next` an update staged, the
-  // `:previous` it kept, and each agent group's own image. Nothing outside that repository is named, so the
-  // OneCLI, gateway, and connector images assistants share stay (KTD19).
+  // Every tag in the assistant's own image repository goes: `:latest`, the `:next` an update staged (and the
+  // `:building` tag of an image its build had not yet labeled), the `:previous` it kept, and each agent group's own
+  // image. Removing a tag deletes its image only with the last tag naming it, so an agent image another assistant
+  // shares by content stays with that assistant's tags. Nothing outside the repository is named, so the OneCLI,
+  // gateway, and connector images assistants share stay too (KTD19).
   const repository = getInstallScopedNames(installId).containerImageBase;
   const tagged = async (): Promise<string[]> =>
     (await checked('docker', ['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}', repository], tools))
@@ -871,7 +873,7 @@ async function uninstallNanoclaw(
     if (remaining.length > 0) throw incomplete(`NanoClaw images remain after removal: ${remaining.join(', ')}`);
   }
   // An image a retag or rebuild displaced has no tag left to find it by, so it goes by the ID its record holds,
-  // unless another repository still tags it: identical builds share an ID.
+  // unless another repository still tags it: assistants share agent images by content.
   for (const imageId of teardown.recordedImages) {
     const inspected = await execute('docker', ['image', 'inspect', '--format', '{{json .RepoTags}}', imageId], tools);
     if (inspected.outcome.exitCode !== 0) {

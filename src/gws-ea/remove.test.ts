@@ -1683,6 +1683,38 @@ describe('removal after an update or rollback', () => {
     expect(named).toEqual([]);
   });
 
+  it('keeps the agent image a peer shares until the last assistant whose tag names it is removed', async () => {
+    const paths = await testPaths();
+    const { a, b, docker, dependencies } = await besidePeer(paths);
+    // Both updated to one release, so both run the one image A's update built and labeled, each under its own tag.
+    const shared = imageId('4');
+    for (const ran of [imageId('1'), imageId('5')]) docker.images.delete(ran);
+    docker.image(shared, `${repositoryOf(a)}:latest`, `${repositoryOf(b)}:latest`);
+    docker.containers = docker.containers.map((container) =>
+      [imageId('1'), imageId('5')].includes(container.image) ? { ...container, image: shared } : container,
+    );
+
+    await removeAssistant(paths, a.instance_id, dependencies);
+
+    expect(docker.of(a).tags).toEqual([]);
+    expect([...(docker.images.get(shared) ?? [])]).toEqual([`${repositoryOf(b)}:latest`]);
+    expect(docker.of(b).tags).toContain(`${repositoryOf(b)}:latest`);
+
+    await recordRuntime(paths, b.checkout_realpath);
+    const { uninstallNanoclaw: _uninstall, removeOnecli: _removeOnecli, ...peer } = world(b).dependencies;
+    await removeAssistant(paths, b.instance_id, {
+      ...peer,
+      runCommand: teardownCommands(docker),
+      serviceHelpers: nanoclawService([], { mode: 'none', active: false }),
+    });
+
+    // With the last tag naming it gone, so is the image; nothing of either assistant's is left.
+    expect(docker.images.has(shared)).toBe(false);
+    expect([docker.of(a).tags, docker.of(b).tags]).toEqual([[], []]);
+    expect([...docker.images.keys()].sort()).toEqual(Object.values(SHARED_IMAGES).sort());
+    await expectGone(paths, b);
+  });
+
   it('deletes a displaced image by the ID its record holds, unless another repository still tags it', async () => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput(paths), {

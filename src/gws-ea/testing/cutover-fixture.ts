@@ -21,6 +21,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { expect } from 'vitest';
 
+import { AGENT_IMAGE_KEY_LABEL, agentImageKey } from '../agent-image.js';
 import { materializeReleaseCheckout } from '../checkout.js';
 import { runCli, type CliRuntime } from '../cli.js';
 import { acquireInstanceOperation, recordStepCompleted, reserveInstance } from '../journal.js';
@@ -225,6 +226,15 @@ export async function nextRelease(
 
 export function imageBase(runtime: Pick<InstanceRuntimeConfig, 'install_id'>): string {
   return getInstallScopedNames(runtime.install_id).containerImageBase;
+}
+
+/** The content key of `release`'s agent image, built with the fixture's `.env` flags unless told otherwise. */
+export function releaseAgentImageKey(release: Release, flags: { readonly installCjkFonts?: boolean } = {}): string {
+  return agentImageKey({
+    contextTree: git(release.tool, 'rev-parse', `${release.commit}:container`),
+    installCjkFonts: flags.installCjkFonts ?? true,
+    hardenedImage: false,
+  });
 }
 
 /**
@@ -505,10 +515,14 @@ export function applying(...names: readonly string[]): Migrate {
  * Where an update is killed: the boundary call it never returns from. At
  * `restamp` the host finished restamping main's template; at
  * `restamp-partway` it had replaced only the plugin. At `untag` a rollback's
- * cleanup is removing the `:previous` tag it leaves.
+ * cleanup is removing the `:previous` tag it leaves. At `label` an update's
+ * agent image is built and not yet labeled; at `untag-build` it is labeled,
+ * and the unlabeled one still carries its `:building` tag.
  */
 export type HangPoint =
   | 'build'
+  | 'label'
+  | 'untag-build'
   | 'migrate'
   | 'stop'
   | 'stamp'
@@ -527,6 +541,8 @@ export interface World {
   /** Docker's images: each tag and the image ID it names; `ids` holds every image, tagged or not. */
   readonly tags: Map<string, string>;
   readonly ids: Set<string>;
+  /** The agent image key each image's label carries, by image ID. */
+  readonly labels: Map<string, string>;
   readonly commands: SanitizedCommand[];
   readonly serviceCalls: string[];
   readonly preflights: ReleasePreflightInput[];
@@ -546,7 +562,7 @@ export interface World {
   readonly healthWaits: Array<number | undefined>;
   migrate: Migrate;
   buildFails?: boolean;
-  /** Every layer of the agent image is cached, so the build of `:next` gives the image `:latest` names. */
+  /** Every layer of the agent image is cached, so NanoClaw's build gives back the image `:latest` names. */
   cachedBuild?: boolean;
   /** Every layer of a per-group image is cached, so its rebuild gives the image its tag already names. */
   cachedRebuild?: boolean;
@@ -584,10 +600,14 @@ export interface World {
 }
 
 let images = 0;
+/** When each image was created: in the order the fixture made them, a second apart. */
+const created = new Map<string, string>();
 
 export function imageId(): string {
   images += 1;
-  return `sha256:${createHash('sha256').update(`image ${images}`).digest('hex')}`;
+  const id = `sha256:${createHash('sha256').update(`image ${images}`).digest('hex')}`;
+  created.set(id, new Date(Date.UTC(2026, 8, 1) + images * 1_000).toISOString());
+  return id;
 }
 
 export function world(runtime: InstanceRuntimeConfig, migrate: Migrate = applying()): World {
@@ -601,6 +621,7 @@ export function world(runtime: InstanceRuntimeConfig, migrate: Migrate = applyin
     freeBytes: 1e15,
     tags,
     ids: new Set(tags.values()),
+    labels: new Map(),
     commands: [],
     serviceCalls: [],
     preflights: [],
@@ -652,7 +673,10 @@ function removeImage(state: World, reference: string): void {
   const named = state.tags.get(reference);
   if (named) {
     state.tags.delete(reference);
-    if (![...state.tags.values()].includes(named)) state.ids.delete(named);
+    if (![...state.tags.values()].includes(named)) {
+      state.ids.delete(named);
+      state.labels.delete(named);
+    }
     return;
   }
   if (!state.ids.has(reference)) throw dockerFailure(`Error response from daemon: No such image: ${reference}`);
@@ -664,6 +688,7 @@ function removeImage(state: World, reference: string): void {
   }
   for (const name of names) state.tags.delete(name);
   state.ids.delete(reference);
+  state.labels.delete(reference);
 }
 
 /** Tagged and untagged image IDs of one repository. */
@@ -671,6 +696,43 @@ export function repositoryImages(state: World, repository: string): { tagged: Se
   const tagged = new Set([...state.tags].filter(([name]) => name.startsWith(`${repository}:`)).map(([, id]) => id));
   const named = new Set(state.tags.values());
   return { tagged, untagged: [...state.ids].filter((id) => !named.has(id)) };
+}
+
+/** The value of each `flag` in `args`. */
+function flagValues(args: readonly string[], flag: string): string[] {
+  return args.flatMap((arg, index) => (args[index - 1] === flag ? [arg] : []));
+}
+
+/**
+ * `docker image ls --filter`, as Docker answers it for the filters an agent
+ * image lookup uses: `label=<key>=<value>` and `dangling=false`.
+ */
+function listFiltered(state: World, args: readonly string[]): string {
+  const tagged = new Set(state.tags.values());
+  const matches = (id: string): boolean =>
+    flagValues(args, '--filter').every((filter) => {
+      if (filter === 'dangling=false') return tagged.has(id);
+      const [name, value] = filter.replace(/^label=/u, '').split(/=(.*)/su);
+      return name === AGENT_IMAGE_KEY_LABEL && state.labels.get(id) === value;
+    });
+  return [...state.ids]
+    .filter(matches)
+    .map((id) => `${id}\n`)
+    .join('');
+}
+
+/** `docker image inspect <id>` as Docker prints it: the fields an agent image lookup reads. */
+function inspected(state: World, id: string): string {
+  if (!state.ids.has(id)) throw dockerFailure(`Error: No such image: ${id}`);
+  const label = state.labels.get(id);
+  return `${JSON.stringify([
+    {
+      Id: id,
+      RepoTags: [...state.tags].filter(([, named]) => named === id).map(([name]) => name),
+      Created: created.get(id) ?? '2026-09-01T00:00:00.000Z',
+      Config: { Labels: label === undefined ? null : { [AGENT_IMAGE_KEY_LABEL]: label } },
+    },
+  ])}\n`;
 }
 
 /** Git for real; Docker, `ps`, `lsof`, and the release's own scripts as `state` says. */
@@ -693,7 +755,7 @@ export function runner(state: World): SanitizedCommandRunner {
       state.onStamp?.();
       return { stdout: '', stderr: '' };
     }
-    if (spec.command === 'bash' && first?.endsWith(path.join('container', 'build.sh')) && second === 'next') {
+    if (spec.command === 'bash' && first?.endsWith(path.join('container', 'build.sh')) && second) {
       if (state.buildFails) {
         throw new GwsEaError('command_failed', 'bash exited with code 1', {
           details: { exitCode: 1, stderrTail: 'ERROR: failed to solve: process did not complete successfully' },
@@ -703,7 +765,7 @@ export function runner(state: World): SanitizedCommandRunner {
       const cached = state.cachedBuild ? state.tags.get(`${base}:latest`) : undefined;
       const id = cached ?? imageId();
       state.ids.add(id);
-      state.tags.set(`${base}:next`, id);
+      state.tags.set(`${base}:${second}`, id);
       await hang(state, 'build');
       return { stdout: '', stderr: '' };
     }
@@ -721,10 +783,16 @@ export function runner(state: World): SanitizedCommandRunner {
       if (first === 'image' && second === 'inspect' && joined.includes('{{.Size}}')) {
         return { stdout: `${IMAGE_BYTES}\n`, stderr: '' };
       }
+      if (first === 'image' && second === 'inspect' && !spec.args.includes('--format')) {
+        return { stdout: inspected(state, last), stderr: '' };
+      }
       if (first === 'image' && second === 'inspect') {
         if (!state.ids.has(last)) throw dockerFailure(`Error: No such image: ${last}`);
         const names = [...state.tags].filter(([, id]) => id === last).map(([name]) => name);
         return { stdout: `${JSON.stringify(names)}\n`, stderr: '' };
+      }
+      if (first === 'image' && second === 'ls' && spec.args.includes('--filter')) {
+        return { stdout: listFiltered(state, spec.args), stderr: '' };
       }
       if (first === 'image' && second === 'ls') {
         const id = state.tags.get(last);
@@ -739,7 +807,22 @@ export function runner(state: World): SanitizedCommandRunner {
       }
       if (first === 'image' && second === 'rm') {
         if (last.endsWith(':previous')) await hang(state, 'untag');
+        if (last.endsWith(':building')) await hang(state, 'untag-build');
         removeImage(state, last);
+        return { stdout: '', stderr: '' };
+      }
+      if (first === 'build' && last === '-') {
+        // A metadata-only build from stdin: the image it names `FROM`, with one label more.
+        await hang(state, 'label');
+        const from = /^FROM (\S+)\n$/u.exec(spec.input ?? '')?.[1];
+        const base = from ? (state.tags.get(from) ?? (state.ids.has(from) ? from : undefined)) : undefined;
+        if (!base) throw dockerFailure(`ERROR: failed to solve: ${from ?? 'no FROM'}: not found`);
+        const [label, value] = (flagValues(spec.args, '--label')[0] ?? '').split(/=(.*)/su);
+        if (label !== AGENT_IMAGE_KEY_LABEL || !value) throw new Error(`unexpected label build: ${joined}`);
+        const id = imageId();
+        state.ids.add(id);
+        state.labels.set(id, value);
+        state.tags.set(flagValues(spec.args, '--tag')[0]!, id);
         return { stdout: '', stderr: '' };
       }
       if (first === 'build') {
@@ -872,11 +955,14 @@ export function dependencies(state: World, release: Release, runtime: InstanceRu
       if (state.rebuildFails) {
         throw new GwsEaError('ncl_failed', `ncl ${args.join(' ')} failed: apt-get could not find package made-up`);
       }
-      // NanoClaw's buildAgentGroupImage moves the group's tag to an image built on the new base.
+      // NanoClaw's buildAgentGroupImage moves the group's tag to an image built on the new base, which inherits
+      // the base's labels, its agent image key included.
       const group = `${imageBase(config)}:${args[args.indexOf('--id') + 1]}`;
       const id = (state.cachedRebuild ? state.tags.get(group) : undefined) ?? imageId();
+      const inherited = state.labels.get(state.tags.get(`${imageBase(config)}:latest`) ?? '');
       state.ids.add(id);
       state.tags.set(group, id);
+      if (inherited !== undefined) state.labels.set(id, inherited);
       return { restarted: 0, rebuilt: true };
     },
     rename: (() => {
