@@ -10,7 +10,8 @@ import { runCli, type CliRuntime, type FailureReport } from './cli.js';
 import type { CreatePromptContext } from './create-input.js';
 import { runStep, withPendingAction, type InteractivePrompts, type PauseResponse } from './events.js';
 import { RECORDED_GCLOUD_REAUTHENTICATION_FAILED } from './fixtures/recordings.js';
-import { acquireInstanceOperation, reserveInstance } from './journal.js';
+import { acquireInstanceOperation, recordStepCompleted, reserveInstance } from './journal.js';
+import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { advanceOperation, beginOperation } from './operation.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { ONECLI_CLI_VERSION } from './pins.js';
@@ -24,11 +25,12 @@ import {
 import { runSanitizedCommand } from './process.js';
 import { installProductionBootstrapManifest } from './provision.js';
 import { allocateInstanceId, readRegistry } from './registry.js';
-import type { NanoclawServiceHelpers } from './service-control.js';
+import { createInstanceRuntimeConfig, persistInstanceRuntime, type InstanceRuntimeConfig } from './service.js';
+import { hostLogFiles, type NanoclawServiceHandle, type NanoclawServiceHelpers } from './service-control.js';
 import type { CreateTargetRequest } from './release-target.js';
 import { resolveReleaseSource } from './release-tracks.js';
 import { activeStep } from './run-log.js';
-import { GwsEaError, releaseOf, type InstanceReservationInput } from './types.js';
+import { GwsEaError, PROVISION_STEPS, releaseOf, type InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
 const servers: Server[] = [];
@@ -182,15 +184,24 @@ describe('gws-ea usage', () => {
     const io = lines();
 
     expect(await runCli([argument], io.runtime)).toBe(0);
-    expect(io.out[0]).toBe('Usage: gws-ea <create|resume|remove> [options]');
+    expect(io.out[0]).toBe('Usage: gws-ea <command> [options]');
     expect(io.err).toEqual([]);
+  });
+
+  it('prints the usage for --help given before --, and only then', async () => {
+    const io = lines();
+
+    expect(await runCli(['ncl', '--help', '--id', 'x'], io.runtime)).toBe(0);
+    expect(io.out[0]).toBe('Usage: gws-ea <command> [options]');
+    expect(io.out.join('\n')).toContain('ncl --id <instance_id> -- <ncl arguments>');
+    expect(io.out.join('\n')).toContain('logs --id <instance_id> [--errors] [--follow]');
   });
 
   it('names an unknown command before the usage and exits 1', async () => {
     const io = lines();
 
     expect(await runCli(['helpme'], io.runtime)).toBe(1);
-    expect(io.err.slice(0, 2)).toEqual(['Unknown command.', 'Usage: gws-ea <create|resume|remove> [options]']);
+    expect(io.err.slice(0, 2)).toEqual(['Unknown command.', 'Usage: gws-ea <command> [options]']);
     expect(io.out).toEqual([]);
   });
 });
@@ -1182,5 +1193,470 @@ describe('gws-ea interactive failure loop', () => {
       }),
     ).toBe(1);
     expect(advanceProvision).toHaveBeenCalledOnce();
+  });
+});
+
+/** The Docker endpoint a created assistant's runtime records. */
+const DOCKER_ENDPOINT = 'unix:///var/run/docker.sock';
+
+/** A stand-in for an assistant's `bin/ncl`: it prints each argument and the install it was given, then exits 7. */
+const NCL_SCRIPT = `#!/bin/sh
+printf '%s\\n' "$@"
+printf 'install %s\\n' "$NANOCLAW_INSTALL_ID"
+exit 7
+`;
+
+/** A reservation whose ports and claims differ from those of any other `port`. */
+function assistantReservation(paths: ControlPlanePaths, port: number): InstanceReservationInput {
+  const instanceId = allocateInstanceId();
+  return {
+    ...reservation(paths, instanceId),
+    allocated_ports: { nanoclaw_webhook: port, onecli_app: port + 1, onecli_gateway: port + 2 },
+    exclusive_resource_claims: {
+      ingress: { mode: 'existing', endpoint_url: `https://a${port}.example.test/webhook/gchat` },
+      gcp_project_id: `assistant-${port}`,
+      gcp_account: 'operator@example.test',
+      gchat_service_account: `gws-ea-chat@assistant-${port}.iam.gserviceaccount.com`,
+      workspace_email: `assistant-${port}@example.test`,
+      onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
+    },
+  };
+}
+
+/**
+ * A fully created assistant: every provision step complete, and the runtime
+ * record and `bin/ncl` in its checkout that its host was started with.
+ */
+async function createdAssistant(paths: ControlPlanePaths, port: number): Promise<InstanceRuntimeConfig> {
+  const reserved = await reserveInstance(paths, assistantReservation(paths, port));
+  const operation = await acquireInstanceOperation(paths, reserved.instance_id);
+  if (!operation) throw new Error('The test instance operation was busy');
+  try {
+    for (const step of PROVISION_STEPS) await recordStepCompleted(operation, step);
+  } finally {
+    operation.release();
+  }
+  const home = path.join(path.dirname(paths.configRoot), 'home');
+  await mkdir(home, { recursive: true, mode: 0o700 });
+  const onecli = createOnecliRuntimeLayout({
+    instanceId: reserved.instance_id,
+    instanceRoot: paths.instanceRoot(reserved.instance_id),
+    project: reserved.exclusive_resource_claims.onecli_project,
+    appPort: reserved.allocated_ports.onecli_app,
+    gatewayPort: reserved.allocated_ports.onecli_gateway,
+    cliExecutable: '/usr/local/bin/onecli',
+    dockerEndpoint: DOCKER_ENDPOINT,
+  });
+  const runtime = createInstanceRuntimeConfig(reserved, onecli, {
+    nodePath: process.execPath,
+    homeDirectory: home,
+    selectedProvider: 'claude',
+    dockerEndpoint: DOCKER_ENDPOINT,
+  });
+  await persistInstanceRuntime(runtime, () => undefined);
+  await mkdir(path.join(runtime.checkout_realpath, 'bin'), { mode: 0o700 });
+  await writeFile(path.join(runtime.checkout_realpath, 'bin', 'ncl'), NCL_SCRIPT, { mode: 0o700 });
+  return runtime;
+}
+
+/** The host's two log files, written where its service definition sends them. */
+async function writeHostLogs(checkout: string): Promise<{ readonly output: string; readonly errors: string }> {
+  const logs = hostLogFiles(checkout);
+  await mkdir(path.dirname(logs.output), { recursive: true });
+  await writeFile(logs.output, 'host started\nhost ready\n');
+  await writeFile(logs.errors, 'host warning\n');
+  return logs;
+}
+
+interface ServiceCall {
+  readonly helper: string;
+  readonly install: string;
+  readonly root?: string;
+}
+
+/**
+ * NanoClaw's service helpers, faked per install: an install's service runs
+ * while `running` says so, stopping and starting it flip that, and every call
+ * records the install and checkout it targeted.
+ */
+function nanoclawServices(running: Record<string, boolean>, options: { readonly healthy?: boolean } = {}) {
+  const calls: ServiceCall[] = [];
+  const handle = (install: string): NanoclawServiceHandle => ({
+    mode: 'launchd',
+    active: running[install] === true,
+    name: `com.nanoclaw-v2-${install}`,
+    definition: `/Users/operator/Library/LaunchAgents/com.nanoclaw-v2-${install}.plist`,
+  });
+  const helpers = {
+    createCommandRunner: vi.fn<NanoclawServiceHelpers['createCommandRunner']>(() => ({
+      run: () => '',
+      tryRun: () => ({ ok: true, stdout: '' }),
+    })),
+    detectService: vi.fn<NanoclawServiceHelpers['detectService']>((root, env) => {
+      calls.push({ helper: 'detect', install: env.installSlug, root });
+      return handle(env.installSlug);
+    }),
+    stopService: vi.fn<NanoclawServiceHelpers['stopService']>(async (_handle, env) => {
+      calls.push({ helper: 'stop', install: env.installSlug });
+      running[env.installSlug] = false;
+    }),
+    startService: vi.fn<NanoclawServiceHelpers['startService']>((_handle, root, env) => {
+      calls.push({ helper: 'start', install: env.installSlug, root });
+      running[env.installSlug] = true;
+    }),
+    drainContainers: vi.fn<NanoclawServiceHelpers['drainContainers']>(async (root, env) => {
+      calls.push({ helper: 'drain', install: env.installSlug, root });
+    }),
+    verifyServiceHealth: vi.fn<NanoclawServiceHelpers['verifyServiceHealth']>(async (_handle, root, env) => {
+      calls.push({ helper: 'health', install: env.installSlug, root });
+      return options.healthy ?? true;
+    }),
+  } satisfies NanoclawServiceHelpers;
+  return { helpers, calls, running };
+}
+
+interface Replacement {
+  readonly file: string;
+  readonly args: readonly string[];
+  readonly env: NodeJS.ProcessEnv;
+  readonly cwd: string;
+}
+
+/**
+ * Run the CLI with process replacement recorded instead of performed: what
+ * it would have replaced itself with, and from where, or its exit code when
+ * it ended without replacing itself.
+ */
+async function runReplacing(
+  args: readonly string[],
+  runtime: Partial<CliRuntime>,
+): Promise<{ readonly exitCode?: number; readonly replacement?: Replacement }> {
+  const replaced = new Error('execve called');
+  let replacement: Replacement | undefined;
+  const execve = ((file: string, argv: readonly string[], env: NodeJS.ProcessEnv): never => {
+    replacement = { file, args: argv, env, cwd: process.cwd() };
+    throw replaced;
+  }) as NonNullable<NodeJS.Process['execve']>;
+  const originalCwd = process.cwd();
+  try {
+    return { exitCode: await runCli(args, { ...runtime, execve }) };
+  } catch (error) {
+    if (error !== replaced || !replacement) throw error;
+    return { replacement };
+  } finally {
+    process.chdir(originalCwd);
+  }
+}
+
+/** Run the CLI in a child process as the launcher runs it, so it really replaces itself. */
+async function runCliInChild(
+  paths: ControlPlanePaths,
+  args: readonly string[],
+): Promise<{ readonly exitCode: number | null; readonly stdout: string; readonly stderr: string }> {
+  const childScript = `
+    import { runCli } from './src/gws-ea/cli.ts';
+    import { resolveControlPlanePaths } from './src/gws-ea/paths.ts';
+    process.exitCode = await runCli(JSON.parse(process.env.TEST_ARGS), {
+      paths: resolveControlPlanePaths(JSON.parse(process.env.TEST_PATHS)),
+    });
+  `;
+  const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', childScript], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      TEST_ARGS: JSON.stringify(args),
+      TEST_PATHS: JSON.stringify({ configRoot: paths.configRoot, stateRoot: paths.stateRoot }),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8').on('data', (chunk: string) => (stdout += chunk));
+  child.stderr.setEncoding('utf8').on('data', (chunk: string) => (stderr += chunk));
+  const exitCode = await new Promise<number | null>((resolve) => child.once('close', (code) => resolve(code)));
+  return { exitCode, stdout, stderr };
+}
+
+/** Leave an update of the assistant open at `stopped`, as a cutover interrupted after its stop would. */
+async function interruptUpdate(paths: ControlPlanePaths, instanceId: string): Promise<void> {
+  const registered = releaseOf((await readRegistry(paths)).instances[instanceId]!);
+  const target = { ...registered, deployed_commit: 'b'.repeat(40) };
+  const operation = await acquireInstanceOperation(paths, instanceId, { command: 'update', target });
+  if (!operation) throw new Error('The test instance operation was busy');
+  try {
+    await beginOperation(operation, { kind: 'update', from: registered, to: target });
+    await advanceOperation(operation, 'stopped', { stop: { at: '2026-09-28T10:00:00.000Z', graceful: true } });
+  } finally {
+    operation.release();
+  }
+}
+
+describe('gws-ea start, stop, and restart', () => {
+  it("stops only the named assistant's host while another runs, and stops neither one's agent containers (AE3)", async () => {
+    const paths = await testPaths();
+    const a = await createdAssistant(paths, 35_001);
+    const b = await createdAssistant(paths, 35_011);
+    const { helpers, calls, running } = nanoclawServices({ [a.install_id]: true, [b.install_id]: true });
+    const io = lines();
+
+    expect(await runCli(['stop', '--id', a.instance_id], { paths, ...io.runtime, serviceHelpers: helpers })).toBe(0);
+
+    expect(calls).toEqual([
+      { helper: 'detect', install: a.install_id, root: a.checkout_realpath },
+      { helper: 'stop', install: a.install_id },
+      { helper: 'detect', install: a.install_id, root: a.checkout_realpath },
+    ]);
+    expect(running).toEqual({ [a.install_id]: false, [b.install_id]: true });
+    expect(io.out).toContain(`Assistant ${a.instance_id} stopped.`);
+    expect(io.out.join('\n')).toContain('agent containers keep running');
+  });
+
+  it('counts stopping an already-stopped assistant as success', async () => {
+    const paths = await testPaths();
+    const a = await createdAssistant(paths, 35_001);
+    const { helpers, calls } = nanoclawServices({ [a.install_id]: false });
+    const io = lines();
+
+    expect(await runCli(['stop', '--id', a.instance_id], { paths, ...io.runtime, serviceHelpers: helpers })).toBe(0);
+
+    expect(calls.map(({ helper }) => helper)).toEqual(['detect']);
+    expect(io.out).toContain(`Assistant ${a.instance_id} is already stopped.`);
+  });
+
+  it.each([
+    ['start', false, 'started', ['detect', 'start', 'detect', 'health']],
+    ['restart', true, 'restarted', ['detect', 'stop', 'detect', 'start', 'detect', 'health']],
+  ] as const)(
+    '%s acts on the named service, then waits until its host answers, never draining its agents',
+    async (command, wasRunning, outcome, sequence) => {
+      const paths = await testPaths();
+      const a = await createdAssistant(paths, 35_001);
+      const { helpers, calls } = nanoclawServices({ [a.install_id]: wasRunning });
+      const io = lines();
+
+      expect(await runCli([command, '--id', a.instance_id], { paths, ...io.runtime, serviceHelpers: helpers })).toBe(0);
+
+      expect(calls.map(({ helper }) => helper)).toEqual(sequence);
+      expect(calls.every(({ install }) => install === a.install_id)).toBe(true);
+      expect(io.out).toContain(`Assistant ${a.instance_id} ${outcome}.`);
+    },
+  );
+
+  it('fails a start whose host never answers on its CLI socket, naming where its errors are', async () => {
+    const paths = await testPaths();
+    const a = await createdAssistant(paths, 35_001);
+    const { helpers } = nanoclawServices({ [a.install_id]: false }, { healthy: false });
+    const io = lines();
+
+    expect(await runCli(['start', '--id', a.instance_id], { paths, ...io.runtime, serviceHelpers: helpers })).toBe(1);
+
+    expect(helpers.startService).toHaveBeenCalledOnce();
+    const summary = io.err.join('\n');
+    expect(summary).toContain('never answered on its CLI socket');
+    expect(summary).toContain(`gws-ea logs --id ${a.instance_id} --errors`);
+    expect(summary).toContain(`Retry with: gws-ea start --id ${a.instance_id}`);
+    expect(summary).toMatch(/Log: \S+progress\.log/u);
+  });
+
+  it("controls the host only through NanoClaw's helpers: gws-ea itself runs no launchctl, systemctl, or docker", async () => {
+    const paths = await testPaths();
+    const a = await createdAssistant(paths, 35_001);
+    // Every service manager and container runtime gws-ea could reach records that it ran.
+    const bin = path.join(path.dirname(paths.configRoot), 'bin');
+    const ran = path.join(path.dirname(paths.configRoot), 'ran');
+    await mkdir(bin);
+    for (const tool of ['launchctl', 'systemctl', 'loginctl', 'docker']) {
+      await writeFile(path.join(bin, tool), `#!/bin/sh\necho "${tool} $*" >> '${ran}'\nexit 1\n`, { mode: 0o755 });
+    }
+    vi.stubEnv('PATH', bin);
+    try {
+      for (const [command, wasRunning] of [
+        ['stop', true],
+        ['start', false],
+        ['restart', true],
+      ] as const) {
+        const { helpers } = nanoclawServices({ [a.install_id]: wasRunning });
+        expect(
+          await runCli([command, '--id', a.instance_id], {
+            paths,
+            ...lines().runtime,
+            environment: { PATH: bin },
+            serviceHelpers: helpers,
+          }),
+        ).toBe(0);
+      }
+    } finally {
+      vi.unstubAllEnvs();
+    }
+
+    await expect(readFile(ran, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+});
+
+describe('gws-ea ncl', () => {
+  it("runs the named assistant's own bin/ncl with everything after -- untouched, in its CLI environment", async () => {
+    const paths = await testPaths();
+    const a = await createdAssistant(paths, 35_001);
+    await createdAssistant(paths, 35_011);
+    const io = lines();
+
+    const { replacement } = await runReplacing(
+      ['ncl', '--id', a.instance_id, '--', 'groups', 'list', '--json', '--help', '--', '-h'],
+      {
+        paths,
+        ...io.runtime,
+        environment: {
+          PATH: '/usr/bin:relative/bin:/bin',
+          LANG: 'C',
+          HOME: '/Users/someone-else',
+          NANOCLAW_INSTALL_ID: 'another-install',
+          ANTHROPIC_API_KEY: 'provider-secret-canary',
+        },
+      },
+    );
+
+    const ncl = path.join(a.checkout_realpath, 'bin', 'ncl');
+    expect(replacement).toEqual({
+      file: ncl,
+      args: [ncl, 'groups', 'list', '--json', '--help', '--', '-h'],
+      env: { PATH: '/usr/bin:/bin', LANG: 'C', HOME: a.home_directory, NANOCLAW_INSTALL_ID: a.install_id },
+      cwd: a.checkout_realpath,
+    });
+    expect(io.out).toEqual([]);
+    expect(io.err).toEqual([]);
+    // The instance lock was released before the handover, so ncl never holds it.
+    const operation = await acquireInstanceOperation(paths, a.instance_id);
+    expect(operation).not.toBeNull();
+    operation?.release();
+  });
+
+  it("returns ncl's own output and exit code, and hands it a --help given after --", async () => {
+    const paths = await testPaths();
+    const a = await createdAssistant(paths, 35_001);
+
+    const { exitCode, stdout } = await runCliInChild(paths, [
+      'ncl',
+      '--id',
+      a.instance_id,
+      '--',
+      'groups',
+      'list',
+      '--json',
+      '--help',
+    ]);
+
+    expect(exitCode).toBe(7);
+    expect(stdout).toBe(`groups\nlist\n--json\n--help\ninstall ${a.install_id}\n`);
+  }, 30_000);
+});
+
+describe('gws-ea logs', () => {
+  it('shows the host log with cat, or the error log with --errors, and follows with tail -f, at the paths its service definition names', async () => {
+    const paths = await testPaths();
+    const a = await createdAssistant(paths, 35_001);
+    const logs = await writeHostLogs(a.checkout_realpath);
+    const environment = { PATH: '/usr/bin:/bin', ANTHROPIC_API_KEY: 'provider-secret-canary' };
+
+    const shown = await runReplacing(['logs', '--id', a.instance_id], { paths, ...lines().runtime, environment });
+    const followed = await runReplacing(['logs', '--id', a.instance_id, '--errors', '--follow'], {
+      paths,
+      ...lines().runtime,
+      environment,
+    });
+
+    expect(shown.replacement).toMatchObject({ args: ['cat', logs.output], env: { PATH: '/usr/bin:/bin' } });
+    expect(path.basename(shown.replacement!.file)).toBe('cat');
+    expect(followed.replacement).toMatchObject({ args: ['tail', '-f', logs.errors], env: { PATH: '/usr/bin:/bin' } });
+    expect(path.basename(followed.replacement!.file)).toBe('tail');
+  });
+
+  it('streams the host log as the file holds it', async () => {
+    const paths = await testPaths();
+    const a = await createdAssistant(paths, 35_001);
+    await writeHostLogs(a.checkout_realpath);
+
+    const { exitCode, stdout, stderr } = await runCliInChild(paths, ['logs', '--id', a.instance_id]);
+
+    expect(exitCode).toBe(0);
+    expect(stdout).toBe('host started\nhost ready\n');
+    expect(stderr).toBe('');
+  }, 30_000);
+
+  it('names a log file that does not exist yet', async () => {
+    const paths = await testPaths();
+    const a = await createdAssistant(paths, 35_001);
+    const io = lines();
+
+    const { exitCode, replacement } = await runReplacing(['logs', '--id', a.instance_id, '--errors'], {
+      paths,
+      ...io.runtime,
+    });
+
+    expect(exitCode).toBe(1);
+    expect(replacement).toBeUndefined();
+    expect(io.err.join('\n')).toContain(`${hostLogFiles(a.checkout_realpath).errors} does not exist yet`);
+  });
+});
+
+describe('gws-ea on an assistant that is not ready to operate', () => {
+  it('refuses start, stop, restart, and ncl on an incomplete create, naming resume, while logs still shows the host log', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, assistantReservation(paths, 35_001));
+    const id = reserved.instance_id;
+    const logs = await writeHostLogs(reserved.checkout_realpath);
+    const { helpers } = nanoclawServices({});
+
+    for (const command of ['start', 'stop', 'restart', 'ncl']) {
+      const io = lines();
+      const { exitCode, replacement } = await runReplacing([command, '--id', id], {
+        paths,
+        ...io.runtime,
+        serviceHelpers: helpers,
+      });
+
+      expect(exitCode).toBe(1);
+      expect(replacement).toBeUndefined();
+      const summary = io.err.join('\n');
+      expect(summary).toContain('is not fully created');
+      expect(summary).toContain(`gws-ea resume --id ${id}`);
+      expect(summary).not.toContain('Retry with');
+    }
+    expect(helpers.detectService).not.toHaveBeenCalled();
+
+    const { replacement } = await runReplacing(['logs', '--id', id], { paths, ...lines().runtime });
+    expect(replacement?.args).toEqual(['cat', logs.output]);
+  });
+
+  it('refuses start, stop, restart, and ncl mid-update, naming what continues or reverts it, while logs names the update and still shows the host log', async () => {
+    const paths = await testPaths();
+    const a = await createdAssistant(paths, 35_001);
+    const logs = await writeHostLogs(a.checkout_realpath);
+    await interruptUpdate(paths, a.instance_id);
+    const { helpers } = nanoclawServices({ [a.install_id]: false });
+
+    for (const command of ['start', 'stop', 'restart', 'ncl']) {
+      const io = lines();
+      const { exitCode, replacement } = await runReplacing([command, '--id', a.instance_id], {
+        paths,
+        ...io.runtime,
+        serviceHelpers: helpers,
+      });
+
+      expect(exitCode).toBe(1);
+      expect(replacement).toBeUndefined();
+      const summary = io.err.join('\n');
+      expect(summary).toContain('is unfinished (stopped)');
+      expect(summary).toContain(`gws-ea update --id ${a.instance_id}`);
+      expect(summary).toContain(`gws-ea rollback --id ${a.instance_id}`);
+      expect(summary).not.toContain('Retry with');
+    }
+    expect(helpers.detectService).not.toHaveBeenCalled();
+
+    const io = lines();
+    const { replacement } = await runReplacing(['logs', '--id', a.instance_id], { paths, ...io.runtime });
+    expect(replacement?.args).toEqual(['cat', logs.output]);
+    expect(io.err.join('\n')).toContain('is unfinished (stopped)');
+    expect(io.err.join('\n')).toContain(`gws-ea update --id ${a.instance_id}`);
+    expect(io.out).toEqual([]);
   });
 });

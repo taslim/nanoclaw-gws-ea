@@ -1,6 +1,8 @@
+import { lstat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
+import { isErrno } from '../community-portal/errors.js';
 import { createManagedIngressSetupSession, type RetainedManagedIngressSetupSession } from './cloudflare-api.js';
 import {
   CREATE_INPUT_FLAGS,
@@ -24,10 +26,12 @@ import {
 } from './events.js';
 import { deriveGchatServiceAccountEmail, deriveGcpProjectId } from './gcloud.js';
 import { acquireInstanceOperation, readProvisionJournal, reserveInstance, type InstanceOperation } from './journal.js';
+import { inspectOperation, type OperationInspection } from './operation.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { ProvisionHumanPause, ProvisionResult, ProvisionRuntime } from './phases.js';
 import { holdLoopbackPorts, type HeldLoopbackPorts } from './ports.js';
 import { checkPrerequisites, type PrerequisiteRequest, type Prerequisites } from './prerequisites.js';
+import { buildToolEnvironment, replaceProcessWithCommand, type SanitizedCommand } from './process.js';
 import {
   installProductionBootstrapManifest,
   recordedHost,
@@ -50,9 +54,27 @@ import {
   type RemovalPreview,
 } from './remove.js';
 import { FIXTURE_STAGING_DIRECTORY, startRunLog, type RunLog } from './run-log.js';
-import type { HostStatusHelpers, UpsertEnvVars } from './service.js';
-import type { NanoclawServiceHelpers } from './service-control.js';
-import { GwsEaError, type AllocatedPorts, type GwsEaErrorDetails, type InstanceReservationInput } from './types.js';
+import {
+  buildInstanceCliCommand,
+  loadInstanceRuntimeConfig,
+  type HostStatusHelpers,
+  type InstanceRuntimeConfig,
+  type UpsertEnvVars,
+} from './service.js';
+import {
+  createServiceControl,
+  hostLogFiles,
+  runtimeServiceTarget,
+  type InstanceServiceControl,
+  type NanoclawServiceHelpers,
+} from './service-control.js';
+import {
+  GwsEaError,
+  PROVISION_STEPS,
+  type AllocatedPorts,
+  type GwsEaErrorDetails,
+  type InstanceReservationInput,
+} from './types.js';
 
 /** Unlabeled, so a scripted create's first line stays its `instance_id`. */
 const PREREQUISITES_STEP = { id: 'prerequisites' } as const;
@@ -64,8 +86,11 @@ const INTERRUPT_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
 export const EXIT_CODES = { ready: 0, paused: 10, failed: 1, busy: 75 } as const;
 
 type LineWriter = (line: string) => void;
-const COMMANDS = ['create', 'resume', 'remove'] as const;
+/** Commands that run as attempts: each with its own run log, stop summary, and failure loop. */
+const COMMANDS = ['create', 'resume', 'remove', 'start', 'stop', 'restart'] as const;
 type Command = (typeof COMMANDS)[number];
+/** The attempts that act on an assistant's host service alone. */
+type ServiceCommand = Extract<Command, 'start' | 'stop' | 'restart'>;
 
 function isCommand(value: string | undefined): value is Command {
   return COMMANDS.some((command) => command === value);
@@ -149,11 +174,24 @@ export interface CliRuntime {
   hostStatus?: HostStatusHelpers;
   /** Upstream's service helpers (`scripts/update/service.ts`), which the driver supplies; they control each host. */
   serviceHelpers?: NanoclawServiceHelpers;
+  /** Replaces this process with the tool `ncl` and `logs` hand it to; tests substitute it. */
+  execve?: NonNullable<NodeJS.Process['execve']>;
 }
+
+/** The flags a command takes: options with a value, and switches without. */
+export interface OptionSpec {
+  readonly values: readonly string[];
+  readonly switches: readonly string[];
+}
+
+/** Parsed flags: each option's value, and `'true'` for each switch given. */
+export type CommandOptions = Readonly<Record<string, string>>;
 
 const COMMON_OPTIONS = ['secrets-file'] as const;
 const COMMON_SWITCHES = ['capture-fixtures'] as const;
-const COMMAND_OPTIONS: Readonly<Record<Command, { values: readonly string[]; switches: readonly string[] }>> = {
+/** The host service commands name the assistant and nothing else: they read no secrets and capture nothing. */
+const SERVICE_OPTIONS: OptionSpec = { values: ['id'], switches: [] };
+const COMMAND_OPTIONS: Readonly<Record<Command, OptionSpec>> = {
   create: {
     values: ['track', 'source-remote', 'google-account', ...CREATE_INPUT_FLAGS, ...COMMON_OPTIONS],
     switches: COMMON_SWITCHES,
@@ -163,12 +201,12 @@ const COMMAND_OPTIONS: Readonly<Record<Command, { values: readonly string[]; swi
     switches: ['chat-configured', ...COMMON_SWITCHES],
   },
   remove: { values: ['id', 'abandon', ...COMMON_OPTIONS], switches: ['yes', ...COMMON_SWITCHES] },
+  start: SERVICE_OPTIONS,
+  stop: SERVICE_OPTIONS,
+  restart: SERVICE_OPTIONS,
 };
 
-type Options = Readonly<Record<string, string>>;
-
-function parseOptions(args: readonly string[], command: Command): Options {
-  const { values, switches } = COMMAND_OPTIONS[command];
+function parseOptions(args: readonly string[], { values, switches }: OptionSpec): CommandOptions {
   const options: Record<string, string> = {};
   for (let index = 0; index < args.length; ) {
     const flag = args[index];
@@ -193,14 +231,14 @@ function parseOptions(args: readonly string[], command: Command): Options {
   return options;
 }
 
-function requireOption(options: Options, name: string): string {
+function requireOption(options: CommandOptions, name: string): string {
   const value = options[name];
   if (!value) throw new GwsEaError('invalid_arguments', `Missing required option --${name}`);
   return value;
 }
 
 /** `--id`: the exact assistant a command acts on. */
-function targetInstance(options: Options): string {
+function targetInstance(options: CommandOptions): string {
   const instanceId = requireOption(options, 'id');
   assertInstanceId(instanceId);
   return instanceId;
@@ -229,9 +267,19 @@ function isBusy(error: unknown): boolean {
   return error instanceof GwsEaError && error.code === 'instance_busy';
 }
 
-/** An unfinished update or rollback refused the command; its message names what continues or reverts it. */
-function isOperationRefusal(error: unknown): boolean {
-  return error instanceof GwsEaError && error.code === 'operation_in_progress';
+/**
+ * The assistant's state refused the command: an unfinished update or
+ * rollback, a removal under way, or a create not yet finished. Its message
+ * names the command that moves the assistant on; rerunning this one cannot.
+ */
+const STATE_REFUSALS: ReadonlySet<string> = new Set([
+  'operation_in_progress',
+  'removal_in_progress',
+  'instance_not_created',
+]);
+
+function isStateRefusal(error: unknown): boolean {
+  return error instanceof GwsEaError && STATE_REFUSALS.has(error.code);
 }
 
 function busy(): GwsEaError {
@@ -321,7 +369,7 @@ interface Session {
 interface AttemptPlan {
   readonly command: Command;
   readonly args: readonly string[];
-  readonly options: Options;
+  readonly options: CommandOptions;
   readonly instanceId?: string;
   readonly meta?: Readonly<Record<string, string>>;
   readonly decisions?: HumanDecisions;
@@ -349,7 +397,7 @@ class Cli {
    * to another command's work.
    */
   prepare(command: Command, args: readonly string[]): () => Promise<Attempt> {
-    const options = parseOptions(args, command);
+    const options = parseOptions(args, COMMAND_OPTIONS[command]);
     switch (command) {
       case 'create': {
         const track = requireOption(options, 'track');
@@ -390,6 +438,19 @@ class Cli {
             work: (session) => this.#removeWork(session, options, instanceId, abandon),
           });
       }
+      case 'start':
+      case 'stop':
+      case 'restart': {
+        const instanceId = targetInstance(options);
+        return () =>
+          this.#attempt({
+            command,
+            args,
+            options,
+            instanceId,
+            work: (session) => this.#serviceWork(session, command, instanceId),
+          });
+      }
       default: {
         const unhandled: never = command;
         throw new GwsEaError('invalid_arguments', `Unknown command ${String(unhandled)}`);
@@ -402,23 +463,33 @@ class Cli {
     const secretsFile = plan.options['secrets-file'];
     const common = secretsFile ? `--secrets-file ${shellQuote(secretsFile)}` : undefined;
     const join = (...parts: Array<string | undefined>): string => parts.filter(Boolean).join(' ');
-    if (plan.command === 'remove') {
-      const abandon = [...new Set([...(plan.options.abandon?.split(',') ?? []), ...(extra ? [extra] : [])])];
-      return join(
-        `gws-ea remove --id ${state.instanceId}`,
-        plan.options.yes ? '--yes' : undefined,
-        abandon.length > 0 ? `--abandon ${abandon.join(',')}` : undefined,
-        common,
-      );
+    switch (plan.command) {
+      case 'remove': {
+        const abandon = [...new Set([...(plan.options.abandon?.split(',') ?? []), ...(extra ? [extra] : [])])];
+        return join(
+          `gws-ea remove --id ${state.instanceId}`,
+          plan.options.yes ? '--yes' : undefined,
+          abandon.length > 0 ? `--abandon ${abandon.join(',')}` : undefined,
+          common,
+        );
+      }
+      case 'start':
+      case 'stop':
+      case 'restart':
+        return `gws-ea ${plan.command} --id ${state.instanceId}`;
+      case 'create':
+      case 'resume': {
+        if (state.reserved && state.instanceId) return join(`gws-ea resume --id ${state.instanceId}`, extra, common);
+        const track = plan.options.track ?? '';
+        return `gws-ea create --track ${/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(track) ? track : '<track>'} (with the same options)`;
+      }
     }
-    if (state.reserved && state.instanceId) return join(`gws-ea resume --id ${state.instanceId}`, extra, common);
-    const track = plan.options.track ?? '';
-    return `gws-ea create --track ${/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(track) ? track : '<track>'} (with the same options)`;
   }
 
+  /** Create and resume continue by resuming once the assistant is reserved; every other attempt is retried as given. */
   #nextAction(plan: AttemptPlan, state: AttemptState): string {
-    const verb = plan.command !== 'remove' && state.reserved ? 'Resume' : 'Retry';
-    return `${verb} with: ${this.#continueCommand(plan, state)}`;
+    const resumes = (plan.command === 'create' || plan.command === 'resume') && state.reserved;
+    return `${resumes ? 'Resume' : 'Retry'} with: ${this.#continueCommand(plan, state)}`;
   }
 
   /** Retrying a reserved create resumes it; every other attempt reruns as given. */
@@ -456,7 +527,7 @@ class Cli {
 
   async #createWork(
     { reporter, interaction, secrets, state }: Session,
-    options: Options,
+    options: CommandOptions,
     track: string,
     source: ReleaseSource,
   ): Promise<Outcome> {
@@ -609,7 +680,7 @@ class Cli {
 
   async #removeWork(
     { reporter, interaction }: Session,
-    options: Options,
+    options: CommandOptions,
     instanceId: string,
     abandon: ReadonlySet<AbandonableResource>,
   ): Promise<Outcome> {
@@ -638,7 +709,72 @@ class Cli {
     };
   }
 
-  #secrets(options: Options): Promise<SecretSource> {
+  /**
+   * `start`, `stop`, and `restart` act on the assistant's host service alone,
+   * through NanoClaw's own helpers and with its semantics (KTD3): agent
+   * containers are left for the next start to adopt, and a stop lasts until
+   * the next start, login, or reboot. A start or restart ends only once the
+   * host answers on its CLI socket.
+   */
+  async #serviceWork({ reporter }: Session, command: ServiceCommand, instanceId: string): Promise<Outcome> {
+    const operation = await acquireInstanceOperation(this.#paths, instanceId, { command });
+    if (!operation) throw busy();
+    try {
+      const record = await loadCreatedRuntime(this.#paths, instanceId);
+      const helpers = this.#runtime.serviceHelpers;
+      if (!helpers) {
+        throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
+      }
+      const service = createServiceControl(helpers, runtimeServiceTarget(record));
+      switch (command) {
+        case 'start': {
+          const started = await runStep(reporter, { id: 'start', label: 'Starting the assistant…' }, () =>
+            service.start(),
+          );
+          await verifyServing(reporter, service, instanceId);
+          return {
+            status: 'ready',
+            message:
+              started === 'started'
+                ? `Assistant ${instanceId} started.`
+                : `Assistant ${instanceId} is already running.`,
+          };
+        }
+        case 'stop': {
+          const stopped = await runStep(reporter, { id: 'stop', label: 'Stopping the assistant…' }, () =>
+            service.stop(),
+          );
+          return stopped === 'stopped'
+            ? {
+                status: 'ready',
+                message: `Assistant ${instanceId} stopped.`,
+                details: [
+                  'Its agent containers keep running for the next start to adopt.',
+                  'It stays stopped until the next gws-ea start, login, or reboot.',
+                ],
+              }
+            : { status: 'ready', message: `Assistant ${instanceId} is already stopped.` };
+        }
+        case 'restart': {
+          const restarted = await runStep(reporter, { id: 'restart', label: 'Restarting the assistant…' }, () =>
+            service.restart(),
+          );
+          await verifyServing(reporter, service, instanceId);
+          return {
+            status: 'ready',
+            message:
+              restarted === 'restarted'
+                ? `Assistant ${instanceId} restarted.`
+                : `Assistant ${instanceId} was not running; it is now started.`,
+          };
+        }
+      }
+    } finally {
+      operation.release();
+    }
+  }
+
+  #secrets(options: CommandOptions): Promise<SecretSource> {
     return loadSecretSource({
       environment: this.#runtime.environment ?? process.env,
       ...(options['secrets-file'] ? { file: options['secrets-file'] } : {}),
@@ -734,7 +870,7 @@ class Cli {
         return { status: 'done', exitCode: EXIT_CODES.busy };
       }
       // Retrying cannot help, and this command's own rerun is not the way on.
-      if (isOperationRefusal(error)) {
+      if (isStateRefusal(error)) {
         presenter.report({ outcome: 'failed', headline: safeErrorMessage(error), details: log });
         return { status: 'done', exitCode: EXIT_CODES.failed };
       }
@@ -754,6 +890,220 @@ class Cli {
       for (const signal of INTERRUPT_SIGNALS) process.off(signal, interrupted);
     }
     /* eslint-enable no-catch-all/no-catch-all */
+  }
+}
+
+/**
+ * The runtime record of a fully created assistant, read from its own
+ * checkout (R18). The commands that operate a created assistant refuse one
+ * whose create has not finished, naming the resume that finishes it.
+ */
+async function loadCreatedRuntime(paths: ControlPlanePaths, instanceId: string): Promise<InstanceRuntimeConfig> {
+  const journal = await readProvisionJournal(paths, instanceId);
+  if (PROVISION_STEPS.some((step) => journal.steps[step]?.completed_at === undefined)) {
+    throw new GwsEaError(
+      'instance_not_created',
+      `Assistant ${instanceId} is not fully created; finish creating it with gws-ea resume --id ${instanceId}.`,
+    );
+  }
+  const reservation = await getInstanceReservation(paths, instanceId);
+  const runtime = await loadInstanceRuntimeConfig(
+    path.join(reservation.checkout_realpath, 'data', 'gws-ea', 'runtime.json'),
+  );
+  if (runtime.instance_id !== instanceId) {
+    throw new GwsEaError('runtime_mismatch', "The assistant's runtime record belongs to another instance");
+  }
+  return runtime;
+}
+
+/** Wait, as NanoClaw's own update does, until the host answers on its CLI socket. */
+async function verifyServing(
+  reporter: StepReporter,
+  service: InstanceServiceControl,
+  instanceId: string,
+): Promise<void> {
+  await runStep(reporter, { id: 'verify_host', label: 'Waiting for the assistant to answer…' }, async () => {
+    if (await service.verifyHealth()) return;
+    throw new GwsEaError(
+      'host_not_serving',
+      `Assistant ${instanceId}'s host never answered on its CLI socket; ` +
+        `see its errors with gws-ea logs --id ${instanceId} --errors.`,
+    );
+  });
+}
+
+/** How a command run outside the attempt loop ends: with an exit code, or by handing its process to a tool. */
+export type CommandEnd = { readonly exitCode: number } | { readonly replaceWith: SanitizedCommand };
+
+/**
+ * What a read-only command may use (KTD10). It loads no secrets, starts no
+ * run log, takes no lock, and repairs nothing, so it works in any state,
+ * mid-update and mid-removal included.
+ */
+export interface ReadOnlyContext {
+  readonly paths: ControlPlanePaths;
+  /** The command's result; scripts read it. */
+  readonly output: LineWriter;
+  /** Notes beside the result, such as an unfinished update, so the result stays alone on stdout. */
+  readonly errorOutput: LineWriter;
+  /** For the tools a command hands its process to: only the tool allowlist is read from it, never a secret. */
+  readonly environment: NodeJS.ProcessEnv;
+  /** Upstream's service helpers, for observing (never controlling) an assistant's service. */
+  readonly serviceHelpers?: NanoclawServiceHelpers;
+  /** Upstream's host readiness helpers, for asking a host its status. */
+  readonly hostStatus?: HostStatusHelpers;
+}
+
+/** A read-only command: its lines in `gws-ea --help`, its flags, and what it does. */
+export interface ReadOnlyCommand {
+  readonly usage: readonly string[];
+  readonly options: OptionSpec;
+  run(context: ReadOnlyContext, options: CommandOptions): Promise<CommandEnd>;
+}
+
+/**
+ * The read-only commands, by name. `runCli` dispatches them without the
+ * attempt loop, parsing each one's flags from its `options`, and `--help`
+ * prints each one's `usage` in this order.
+ */
+const READ_ONLY_COMMANDS: ReadonlyMap<string, ReadOnlyCommand> = new Map([
+  [
+    'logs',
+    {
+      usage: ['logs --id <instance_id> [--errors] [--follow]'],
+      options: { values: ['id'], switches: ['errors', 'follow'] },
+      run: showHostLog,
+    },
+  ],
+]);
+
+/** What `logs` notes about an unfinished update or rollback (KTD2), which never stops it. */
+function operationNote(inspection: OperationInspection): string | undefined {
+  switch (inspection.state) {
+    case 'none':
+    case 'recorded':
+      return undefined;
+    case 'open': {
+      const { record, next } = inspection;
+      const revert = next.revertWith ? `, or revert it with ${next.revertWith}` : '';
+      const subject = record.kind === 'update' ? 'An update' : 'A rollback';
+      return `${subject} of this assistant is unfinished (${record.phase}); continue it with ${next.continueWith}${revert}.`;
+    }
+    case 'unreadable':
+      return `This assistant's update or rollback record cannot be read: ${inspection.message}`;
+  }
+}
+
+/** Refuse a log file that is missing, or that is not a regular file, before any tool opens it. */
+async function assertLogFile(file: string, name: string): Promise<void> {
+  let isFile: boolean;
+  try {
+    isFile = (await lstat(file)).isFile();
+  } catch (error) {
+    if (!isErrno(error, 'ENOENT') && !isErrno(error, 'ENOTDIR')) throw error;
+    throw new GwsEaError('log_missing', `The ${name} ${file} does not exist yet.`);
+  }
+  if (!isFile) throw new GwsEaError('unsafe_log', `The ${name} ${file} is not a regular file.`);
+}
+
+/**
+ * `logs`: the assistant's host log, or its error log with `--errors`, at the
+ * paths its service definition sends them to. The process is handed to
+ * `cat`, or to `tail -f` with `--follow`, so the log streams as the file
+ * holds it. An unfinished update or rollback is named first, on stderr.
+ */
+async function showHostLog(context: ReadOnlyContext, options: CommandOptions): Promise<CommandEnd> {
+  const instanceId = targetInstance(options);
+  const reservation = await getInstanceReservation(context.paths, instanceId);
+  const note = operationNote(await inspectOperation(context.paths, reservation));
+  if (note) context.errorOutput(note);
+  const logs = hostLogFiles(reservation.checkout_realpath);
+  const file = options.errors ? logs.errors : logs.output;
+  await assertLogFile(file, options.errors ? 'host error log' : 'host log');
+  return {
+    replaceWith: {
+      command: options.follow ? 'tail' : 'cat',
+      args: options.follow ? ['-f', file] : [file],
+      cwd: path.dirname(file),
+      env: buildToolEnvironment(context.environment),
+    },
+  };
+}
+
+/** A command's own arguments, before any `--`, and everything after it, untouched. */
+function splitPassThrough(args: readonly string[]): {
+  readonly own: readonly string[];
+  readonly passThrough: readonly string[];
+} {
+  const separator = args.indexOf('--');
+  return separator === -1
+    ? { own: args, passThrough: [] }
+    : { own: args.slice(0, separator), passThrough: args.slice(separator + 1) };
+}
+
+const NCL_OPTIONS: OptionSpec = { values: ['id'], switches: [] };
+
+/**
+ * `ncl`: hand the process to the assistant's own `bin/ncl` with everything
+ * after `--` untouched (KTD13), in the environment `buildInstanceCliCommand`
+ * gives it. The gate is passed under the instance lock, which is released
+ * just before the handover: `ncl` talks to the running host over its socket,
+ * and a lock it held would outlive it.
+ */
+async function prepareNcl(
+  paths: ControlPlanePaths,
+  args: readonly string[],
+  environment: NodeJS.ProcessEnv,
+): Promise<CommandEnd> {
+  const { own, passThrough } = splitPassThrough(args);
+  const instanceId = targetInstance(parseOptions(own, NCL_OPTIONS));
+  const operation = await acquireInstanceOperation(paths, instanceId, { command: 'ncl' });
+  if (!operation) throw busy();
+  try {
+    const runtime = await loadCreatedRuntime(paths, instanceId);
+    return { replaceWith: buildInstanceCliCommand(runtime, passThrough, environment) };
+  } finally {
+    operation.release();
+  }
+}
+
+/** The stop summary and exit code of a command that failed outside the attempt loop. */
+function reportStop(presenter: Presenter, error: unknown): number {
+  if (isBusy(error)) {
+    presenter.report({ outcome: 'busy', headline: safeErrorMessage(error), details: [] });
+    return EXIT_CODES.busy;
+  }
+  const usage =
+    error instanceof GwsEaError && error.code === 'invalid_arguments' ? ['Run gws-ea --help for usage.'] : [];
+  presenter.report({ outcome: 'failed', headline: safeErrorMessage(error), details: usage });
+  return EXIT_CODES.failed;
+}
+
+/**
+ * Run a command outside the attempt loop: `ncl` and the read-only commands.
+ * A failure becomes a stop summary and exit code; a command that asks for it
+ * has the process handed to its tool, which then owns the exit code.
+ */
+async function runOutsideAttempts(
+  presenter: Presenter,
+  execve: CliRuntime['execve'],
+  run: () => Promise<CommandEnd>,
+): Promise<number> {
+  let end: CommandEnd;
+  /* eslint-disable no-catch-all/no-catch-all -- The CLI boundary turns every failure into a redacted summary and exit code. */
+  try {
+    end = await run();
+  } catch (error) {
+    return reportStop(presenter, error);
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+  if ('exitCode' in end) return end.exitCode;
+  try {
+    return await replaceProcessWithCommand(end.replaceWith, execve);
+  } catch (error) {
+    // A tool that cannot be started is reported; the replacement itself failing is not a stop summary.
+    if (!(error instanceof GwsEaError)) throw error;
+    return reportStop(presenter, error);
   }
 }
 
@@ -898,7 +1248,7 @@ function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undef
 }
 
 function printHelp(output: LineWriter): void {
-  output('Usage: gws-ea <create|resume|remove> [options]');
+  output('Usage: gws-ea <command> [options]');
   output('  create --track <dogfood|prod> [--source-remote <remote>] [--google-account <email>]');
   output('         [--assistant-first-name <name> --assistant-last-name <name>]');
   output('         [--principal-first-name <name> --principal-last-name <name> --principal-timezone <iana>]');
@@ -906,26 +1256,56 @@ function printHelp(output: LineWriter): void {
   output('         [--ingress existing --endpoint <https-url>]');
   output('         [--ingress managed-cloudflare --cloudflare-zone <zone> --hostname-label <label>]');
   output('  resume --id <instance_id> [--chat-configured] [--messaging-group-id <exact-id>]');
+  output('  start --id <instance_id>');
+  output('  stop --id <instance_id>');
+  output('         Agent containers keep running; the assistant stays stopped until the next start, login, or reboot.');
+  output('  restart --id <instance_id>');
+  for (const command of READ_ONLY_COMMANDS.values()) for (const line of command.usage) output(`  ${line}`);
+  output('  ncl --id <instance_id> -- <ncl arguments>');
   output('  remove --id <instance_id> [--yes] [--abandon gcp-project,cloudflare-dns]');
-  output('  Every command: [--secrets-file <owner-only file under the config root>] [--capture-fixtures]');
+  output('  create, resume, remove: [--secrets-file <owner-only file under the config root>] [--capture-fixtures]');
   output('  Secrets: GWS_EA_PROVIDER_CREDENTIAL, GWS_EA_CLOUDFLARE_API_TOKEN (environment or --secrets-file).');
-  output('  Exit codes: 0 ready, 10 paused for a person, 1 failed, 75 busy.');
+  output('  Exit codes: 0 ready, 10 paused for a person, 1 failed, 75 busy; ncl and logs exit as their tool does.');
 }
 
 export async function runCli(args: readonly string[], runtime: CliRuntime = {}): Promise<number> {
   const output = runtime.stdout ?? ((line) => process.stdout.write(`${line}\n`));
   const errorOutput = runtime.stderr ?? ((line) => process.stderr.write(`${line}\n`));
-  if (args.length === 0 || args[0] === 'help' || args.includes('--help') || args.includes('-h')) {
+  // gws-ea's own help is asked for only before `--`; what follows belongs to the tool it runs.
+  const { own } = splitPassThrough(args);
+  if (own.length === 0 || own[0] === 'help' || own.includes('--help') || own.includes('-h')) {
     printHelp(output);
     return EXIT_CODES.ready;
   }
   const command = args[0];
+  const presenter = runtime.presenter ?? createLinePresenter(output, errorOutput);
+  const environment = runtime.environment ?? process.env;
+  const readOnly = READ_ONLY_COMMANDS.get(command);
+  if (readOnly) {
+    return runOutsideAttempts(presenter, runtime.execve, async () =>
+      readOnly.run(
+        {
+          paths: runtime.paths ?? resolveControlPlanePaths(),
+          output,
+          errorOutput,
+          environment,
+          serviceHelpers: runtime.serviceHelpers,
+          hostStatus: runtime.hostStatus,
+        },
+        parseOptions(args.slice(1), readOnly.options),
+      ),
+    );
+  }
+  if (command === 'ncl') {
+    return runOutsideAttempts(presenter, runtime.execve, async () =>
+      prepareNcl(runtime.paths ?? resolveControlPlanePaths(), args.slice(1), environment),
+    );
+  }
   if (!isCommand(command)) {
     errorOutput('Unknown command.');
     printHelp(errorOutput);
     return EXIT_CODES.failed;
   }
-  const presenter = runtime.presenter ?? createLinePresenter(output, errorOutput);
   const managedIngressSetup = runtime.managedIngressSetup ?? createManagedIngressSetupSession();
   const cli = new Cli(runtime, presenter, managedIngressSetup);
   try {

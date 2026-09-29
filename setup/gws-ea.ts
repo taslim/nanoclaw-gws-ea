@@ -186,13 +186,17 @@ const serviceHelpers: NanoclawServiceHelpers = {
   verifyServiceHealth,
 };
 
-/** Diagnosis first, then the retry offer; a retry re-runs prerequisites and resumes. */
+/** What a retry does: a host service command runs again; the others re-check prerequisites and continue. */
+function retryOffer(command: FailureReport['command']): string {
+  return command === 'start' || command === 'stop' || command === 'restart'
+    ? `Retry now? gws-ea runs ${command} again.`
+    : 'Retry now? gws-ea re-checks prerequisites, then continues from where it stopped.';
+}
+
+/** Diagnosis first, then the retry offer. */
 async function handleFailure(report: FailureReport): Promise<'retry' | 'stop'> {
   await offerDiagnosis(report);
-  const answer = await p.confirm({
-    message: 'Retry now? gws-ea re-checks prerequisites, then continues from where it stopped.',
-    initialValue: true,
-  });
+  const answer = await p.confirm({ message: retryOffer(report.command), initialValue: true });
   return answer === true ? 'retry' : 'stop';
 }
 

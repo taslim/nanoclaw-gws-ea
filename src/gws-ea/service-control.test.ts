@@ -1,13 +1,24 @@
-import { describe, expect, it, vi } from 'vitest';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { createOnecliRuntimeLayout } from './onecli-compose.js';
+import { resolveControlPlanePaths } from './paths.js';
+import { allocateInstanceId } from './registry.js';
+import { createInstanceRuntimeConfig, reconcileInstanceService, type InstanceRuntimeConfig } from './service.js';
 import {
   createServiceControl,
+  hostLogFiles,
+  runtimeServiceTarget,
   type NanoclawCommandRunner,
   type NanoclawServiceHandle,
   type NanoclawServiceHelpers,
   type ServiceControlOptions,
   type ServiceControlTarget,
 } from './service-control.js';
+import type { InstanceReservation } from './types.js';
 
 const INSTALL_ID = '0123456789abcdef0123456789abcdef';
 const LABEL = `com.nanoclaw-v2-${INSTALL_ID}`;
@@ -265,4 +276,97 @@ describe('drain and health', () => {
       10_000,
     );
   });
+});
+
+describe("an assistant's own service coordinates", () => {
+  const roots: string[] = [];
+
+  afterEach(async () => {
+    for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
+  });
+
+  /** A created assistant's runtime record, with the checkout files its service definition names. */
+  async function createdRuntime(): Promise<InstanceRuntimeConfig> {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-service-control-'));
+    roots.push(root);
+    const paths = resolveControlPlanePaths({
+      configRoot: path.join(root, 'config'),
+      stateRoot: path.join(root, 'state'),
+    });
+    const instanceId = allocateInstanceId();
+    const checkout = paths.checkoutRoot(instanceId);
+    await mkdir(path.join(checkout, 'dist', 'gws-ea'), { recursive: true, mode: 0o700 });
+    await mkdir(path.join(checkout, 'bin'), { mode: 0o700 });
+    await writeFile(path.join(checkout, 'dist', 'index.js'), 'host');
+    await writeFile(path.join(checkout, 'dist', 'gws-ea', 'process.js'), 'launcher');
+    await writeFile(path.join(checkout, 'bin', 'ncl'), '#!/bin/sh\n', { mode: 0o700 });
+    const home = path.join(root, 'home');
+    await mkdir(home, { mode: 0o700 });
+    const reservation: InstanceReservation = {
+      instance_id: instanceId,
+      checkout_realpath: checkout,
+      release_track: 'dogfood',
+      source_remote: 'https://example.test/nanoclaw.git',
+      deployed_commit: 'a'.repeat(40),
+      allocated_ports: { nanoclaw_webhook: 31_001, onecli_app: 31_002, onecli_gateway: 31_003 },
+      exclusive_resource_claims: {
+        ingress: { mode: 'existing', endpoint_url: 'https://assistant.example.test/webhook/gchat' },
+        gcp_project_id: 'assistant-project',
+        gcp_account: 'operator@example.test',
+        gchat_service_account: 'gws-ea-chat@assistant-project.iam.gserviceaccount.com',
+        workspace_email: 'assistant@example.test',
+        onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
+      },
+    };
+    const onecli = createOnecliRuntimeLayout({
+      instanceId,
+      instanceRoot: paths.instanceRoot(instanceId),
+      project: reservation.exclusive_resource_claims.onecli_project,
+      appPort: 31_002,
+      gatewayPort: 31_003,
+      cliExecutable: '/usr/local/bin/onecli',
+      dockerEndpoint: TARGET.dockerEndpoint,
+    });
+    return createInstanceRuntimeConfig(reservation, onecli, {
+      nodePath: process.execPath,
+      homeDirectory: home,
+      selectedProvider: 'claude',
+      dockerEndpoint: TARGET.dockerEndpoint,
+    });
+  }
+
+  it('targets the checkout, install, home, and Docker endpoint the runtime record names', async () => {
+    const runtime = await createdRuntime();
+
+    expect(runtimeServiceTarget(runtime)).toEqual({
+      checkoutRoot: runtime.checkout_realpath,
+      installId: runtime.install_id,
+      homeDirectory: runtime.home_directory,
+      dockerEndpoint: runtime.docker_endpoint,
+    });
+  });
+
+  it.each(['macos', 'linux'] as const)(
+    'reads the log files the rendered %s service definition sends the host to (drift guard)',
+    async (platform) => {
+      const runtime = await createdRuntime();
+      // Only the definition is rendered; every service-manager command is faked.
+      const runCommand = vi.fn(async () => ({ stdout: 'yes\n', stderr: '' }));
+      const { layout } = await reconcileInstanceService(runtime, {
+        platform,
+        homeDirectory: runtime.home_directory,
+        runningAsRoot: false,
+        uid: 501,
+        ambientEnv: {},
+        runCommand,
+        sleep: async () => undefined,
+      });
+      const definition = await readFile(layout.serviceDefinitionPath, 'utf8');
+      const logs = hostLogFiles(runtime.checkout_realpath);
+
+      expect(logs).toEqual({ output: layout.standardOutputPath, errors: layout.standardErrorPath });
+      expect(definition).toContain(logs.output);
+      expect(definition).toContain(logs.errors);
+    },
+  );
 });

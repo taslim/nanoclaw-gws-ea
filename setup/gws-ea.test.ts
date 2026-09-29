@@ -206,6 +206,21 @@ describe('GWS-EA driver', () => {
     await expect(onFailure!(report())).resolves.toBe('stop');
   });
 
+  it.each(['start', 'stop', 'restart'] as const)(
+    'offers to run a failed %s again, since only create and resume continue from where they stopped',
+    async (command) => {
+      await main([command, '--id', 'x'], { interactive: true });
+      const { onFailure } = runtimeOf();
+
+      await onFailure!(report({ command, step: command, nextAction: `Retry with: gws-ea ${command} --id x` }));
+
+      expect(fixture.confirm).toHaveBeenCalledExactlyOnceWith({
+        message: `Retry now? gws-ea runs ${command} again.`,
+        initialValue: true,
+      });
+    },
+  );
+
   it('asks before removal on a TTY, defaulting to keep the assistant', async () => {
     await main(['remove', '--id', 'x'], { interactive: true });
     fixture.confirm.mockResolvedValueOnce(false);
@@ -423,5 +438,54 @@ describe("GWS-EA service control through NanoClaw's helpers", () => {
       `launchctl kickstart gui/${UID}/${coordinates.serviceIdentity}`,
     ]);
     expect(sleep).toHaveBeenCalled();
+  });
+
+  it("stops only the named assistant's job while another runs, and stops no agent container (AE3)", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-service-home-'));
+    homes.push(home);
+    const [a, b] = [INSTALL_ID, 'fedcba9876543210fedcba9876543210'].map((installId) =>
+      createInstanceServiceCoordinates({ installId, homeDirectory: home, platform: 'macos', runningAsRoot: false }),
+    );
+    for (const service of [a!, b!]) {
+      await mkdir(path.dirname(service.serviceDefinitionPath), { recursive: true });
+      await writeFile(service.serviceDefinitionPath, 'definition\n');
+    }
+    // Both jobs are loaded; `bootout` unloads the one it names, and `print` answers for the one it names.
+    const loaded = new Map([a!, b!].map((service) => [`gui/${UID}/${service.serviceIdentity}`, true]));
+    const calls: string[] = [];
+    const runner: NanoclawCommandRunner = {
+      run(command, args) {
+        calls.push(`${command} ${args.join(' ')}`);
+        if (command === 'launchctl' && args[0] === 'bootout' && loaded.has(args[1]!)) {
+          loaded.set(args[1]!, false);
+          return '';
+        }
+        throw new Error(`Unexpected command: ${command} ${args.join(' ')}`);
+      },
+      tryRun(command, args) {
+        calls.push(`${command} ${args.join(' ')}`);
+        return { ok: command === 'launchctl' && args[0] === 'print' && loaded.get(args[1]!) === true, stdout: '' };
+      },
+    };
+    const service = createServiceControl(
+      await wiredHelpers(runner),
+      {
+        checkoutRoot: path.join(home, 'a', 'nanoclaw'),
+        installId: INSTALL_ID,
+        homeDirectory: home,
+        dockerEndpoint: 'unix:///var/run/docker.sock',
+      },
+      { platform: 'darwin', uid: UID, ambientEnv: {} },
+    );
+
+    await expect(service.stop()).resolves.toBe('stopped');
+
+    // Only A's job is touched, and nothing lists or stops a container.
+    expect(calls).toEqual([
+      `launchctl print gui/${UID}/${a!.serviceIdentity}`,
+      `launchctl bootout gui/${UID}/${a!.serviceIdentity}`,
+      `launchctl print gui/${UID}/${a!.serviceIdentity}`,
+    ]);
+    expect(loaded.get(`gui/${UID}/${b!.serviceIdentity}`)).toBe(true);
   });
 });

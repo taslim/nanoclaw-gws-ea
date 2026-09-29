@@ -11,12 +11,13 @@
  * adopt, and the stop lasts until the next start, login, or reboot. Only
  * cutover and removal drain containers.
  */
+import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { pollUntil } from './poll.js';
 import { buildToolEnvironment } from './process.js';
 import { activeStep } from './run-log.js';
-import { serviceManagerEnvironment } from './service.js';
+import { serviceManagerEnvironment, type InstanceRuntimeConfig } from './service.js';
 import { GwsEaError } from './types.js';
 
 /** NanoClaw's `ServiceMode`: how detection found the service run. */
@@ -76,6 +77,35 @@ export interface ServiceControlTarget {
   readonly installId: string;
   readonly homeDirectory: string;
   readonly dockerEndpoint: string;
+}
+
+/** The service a created assistant's own runtime record names (R18). */
+export function runtimeServiceTarget(
+  runtime: Pick<InstanceRuntimeConfig, 'checkout_realpath' | 'install_id' | 'home_directory' | 'docker_endpoint'>,
+): ServiceControlTarget {
+  return {
+    checkoutRoot: runtime.checkout_realpath,
+    installId: runtime.install_id,
+    homeDirectory: runtime.home_directory,
+    dockerEndpoint: runtime.docker_endpoint,
+  };
+}
+
+/** Where a host service sends the host's output and its errors. */
+export interface HostLogFiles {
+  readonly output: string;
+  readonly errors: string;
+}
+
+/**
+ * The log files of the host run from `checkoutRoot`: NanoClaw's
+ * `logs/nanoclaw.log` and `logs/nanoclaw.error.log`, the paths the service
+ * definition gws-ea renders sends standard output and error to. A test holds
+ * the rendered definition to these, so `logs` reads what the host writes.
+ */
+export function hostLogFiles(checkoutRoot: string): HostLogFiles {
+  const logs = path.join(checkoutRoot, 'logs');
+  return { output: path.join(logs, 'nanoclaw.log'), errors: path.join(logs, 'nanoclaw.error.log') };
 }
 
 /** Boundary seams; each defaults to this process's. */
