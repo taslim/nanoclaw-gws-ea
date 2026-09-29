@@ -8,9 +8,12 @@
  * of disk, like the content-addressed gateway image (`onecli-gateway-image.ts`).
  *
  * No tag is shared, and none is added for sharing: an image lives exactly as
- * long as some assistant's tag names it. Every deletion goes by one of the
- * assistant's own tags, which only removes the image with its last tag, or by
- * ID only once no tag names the image (`deleteUntaggedImage`).
+ * long as some assistant's tag names it. An image an assistant still needs
+ * while no other tag of its own names it, one a switch took a tag off, is held
+ * under a tag of its own (`holdImage`). Nothing is deleted by ID: an image
+ * goes only when an assistant removes a tag of its own that was the last to
+ * name it, which Docker decides in one step (`releaseImage`), so another
+ * assistant's tag always keeps it.
  */
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
@@ -37,6 +40,8 @@ const IMAGE_ID = /^sha256:[0-9a-f]{64}$/u;
  * the key's included, so only these tags make an image the one a key names.
  */
 const AGENT_IMAGE_TAG = /^nanoclaw-agent-v2-[a-z0-9][a-z0-9_-]{0,31}:(?:latest|previous|next)$/u;
+/** How a hold's tag starts (see `heldImageTag`); an agent group's ID starts `ag-`, so none is taken for one. */
+const HELD_TAG_PREFIX = 'held-';
 const DOCKER_TIMEOUT_MS = 60_000;
 /** The label build adds no layer, but Docker still exports an image, which a busy daemon can take a while over. */
 const LABEL_BUILD_TIMEOUT_MS = 5 * 60_000;
@@ -199,21 +204,79 @@ export function imageTags(output: string): readonly string[] {
   return repoTags(tags);
 }
 
+/** The tag an assistant holds an image under, in its repository `base`, named by the image (see `holdImage`). */
+export function heldImageTag(base: string, imageId: string): string {
+  return `${base}:${HELD_TAG_PREFIX}${imageId.slice('sha256:'.length, 'sha256:'.length + 12)}`;
+}
+
 /**
- * Delete an image by ID unless a tag still names it (KTD19): a tag of any
- * assistant's, since assistants share images by content. One already gone is
- * done.
+ * Hold an image under a tag of the assistant's own (`heldImageTag`), so no
+ * assistant's release deletes it while this one may still need it. One
+ * already gone is not held.
  */
-export async function deleteUntaggedImage(context: ImageDocker, imageId: string): Promise<void> {
-  let inspected: string;
+export async function holdImage(context: ImageDocker, base: string, imageId: string): Promise<void> {
   try {
-    inspected = (await docker(context, ['image', 'inspect', '--format', '{{json .RepoTags}}', imageId])).stdout;
+    await docker(context, ['tag', imageId, heldImageTag(base, imageId)]);
+  } catch (error) {
+    if (!noSuchImage(error)) throw error;
+  }
+}
+
+/**
+ * Release an image the assistant no longer needs (KTD19): hold it, then
+ * remove the hold. Docker deletes an image with the last tag that names it,
+ * in one step, so the image goes only if no tag of any assistant's still
+ * names it, and a tag another assistant adds meanwhile keeps it. One already
+ * gone is released.
+ */
+export async function releaseImage(context: ImageDocker, base: string, imageId: string): Promise<void> {
+  const held = heldImageTag(base, imageId);
+  try {
+    await docker(context, ['tag', imageId, held]);
   } catch (error) {
     if (noSuchImage(error)) return;
     throw error;
   }
-  if (imageTags(inspected).length > 0) return;
-  await docker(context, ['image', 'rm', imageId]);
+  await docker(context, ['image', 'rm', held]);
+}
+
+/**
+ * Move an assistant's image tags (`move`) with every image in `imageIds`,
+ * those its record names, held while they move. After the move, an image a
+ * tag of the assistant's own names again gives up its hold. One the move left
+ * without such a tag keeps it until its record's follow-ups release it, or
+ * until a later move names it again.
+ */
+export async function moveHoldingImages(
+  context: ImageDocker,
+  base: string,
+  imageIds: readonly string[],
+  move: () => Promise<void>,
+): Promise<void> {
+  const held = [...new Set(imageIds)];
+  for (const id of held) await holdImage(context, base, id);
+  await move();
+  for (const id of held) {
+    let tags: readonly string[];
+    try {
+      tags = imageTags((await docker(context, ['image', 'inspect', '--format', '{{json .RepoTags}}', id])).stdout);
+    } catch (error) {
+      if (noSuchImage(error)) continue;
+      throw error;
+    }
+    const hold = heldImageTag(base, id);
+    const named = tags.some((tag) => tag.startsWith(`${base}:`) && !tag.startsWith(`${base}:${HELD_TAG_PREFIX}`));
+    if (named && tags.includes(hold)) await docker(context, ['image', 'rm', hold]);
+  }
+}
+
+/** Release every image the assistant holds: its holds as `docker image ls` lists them in its repository `base`. */
+async function releaseHeldImages(context: ImageDocker, base: string): Promise<void> {
+  const holds = (await docker(context, ['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}', base])).stdout
+    .split(/\r?\n/u)
+    .map((reference) => reference.trim())
+    .filter((reference) => reference.startsWith(`${base}:${HELD_TAG_PREFIX}`));
+  for (const hold of holds) await docker(context, ['image', 'rm', hold]);
 }
 
 /** What `docker image inspect` says of one image that matters for sharing it. */
@@ -254,9 +317,9 @@ async function inspectImage(context: ImageDocker, imageId: string): Promise<Insp
  * The image shared under `key`, or undefined when there is none: of the
  * images whose label carries exactly `key` and that some assistant tags as its
  * agent image (see `AGENT_IMAGE_TAG`), the newest, ties going to the greater
- * ID. An image no such tag names is either on its way out (whoever displaced
- * it deletes it by ID), so never taken up again, or an agent group's own image
- * built on the keyed one.
+ * ID. An image no such tag names is either on its way out (held by the
+ * assistant that displaced it until it releases it), so never taken up again,
+ * or an agent group's own image built on the keyed one.
  */
 export async function findSharedAgentImage(context: ImageDocker, key: string): Promise<string | undefined> {
   if (!AGENT_IMAGE_KEY.test(key)) throw new GwsEaError('invalid_agent_image_key', 'The agent image key is invalid');
@@ -290,6 +353,20 @@ export async function findSharedAgentImage(context: ImageDocker, key: string): P
   return shared[0]?.id;
 }
 
+/**
+ * Tag the image found shared as `target`, and say whether it could: one whose
+ * last tag went since it was found is gone.
+ */
+async function tagShared(context: ImageDocker, shared: string, target: string): Promise<boolean> {
+  try {
+    await docker(context, ['tag', shared, target]);
+    return true;
+  } catch (error) {
+    if (noSuchImage(error)) return false;
+    throw error;
+  }
+}
+
 /** How an assistant gets the agent image its release's key names. */
 export interface SharedAgentImageRequest {
   readonly key: string;
@@ -309,17 +386,15 @@ export interface SharedAgentImageRequest {
  * unlabeled image unless another tag names it. Until then the `building` tag
  * holds the unlabeled image, so a run killed anywhere in between leaves only
  * the assistant's own tags, which its next update's discard of the staging
- * removes, as does `remove`. Returns whether the image was shared or built.
+ * removes, as does `remove`. A shared image gone by the time it is tagged is
+ * built instead. Returns whether the image was shared or built.
  */
 export async function provideSharedAgentImage(
   context: ImageDocker,
   request: SharedAgentImageRequest,
 ): Promise<'shared' | 'built'> {
   const shared = await findSharedAgentImage(context, request.key);
-  if (shared) {
-    await docker(context, ['tag', shared, request.target]);
-    return 'shared';
-  }
+  if (shared && (await tagShared(context, shared, request.target))) return 'shared';
   await request.build();
   await docker(context, ['build', '--label', `${AGENT_IMAGE_KEY_LABEL}=${request.key}`, '--tag', request.target, '-'], {
     input: `FROM ${request.building}\n`,
@@ -330,16 +405,26 @@ export async function provideSharedAgentImage(
 }
 
 /**
- * Point `target` at the image shared under `key`, when there is one, and say
- * whether it did. The image `target` named before is deleted unless a tag
- * still names it.
+ * Point `target`, a tag of the new assistant's own in its repository `base`,
+ * at the image shared under `key`, when there is one, and say whether it did.
+ * The image `target` named before is held while the tag moves, then
+ * released. A create cut short leaves only that hold behind, and the next
+ * attempt releases every hold first: an assistant being created has recorded
+ * nothing that needs an image it holds.
  */
-export async function adoptSharedAgentImage(context: ImageDocker, key: string, target: string): Promise<boolean> {
+export async function adoptSharedAgentImage(
+  context: ImageDocker,
+  key: string,
+  base: string,
+  target: string,
+): Promise<boolean> {
+  await releaseHeldImages(context, base);
   const shared = await findSharedAgentImage(context, key);
   if (!shared) return false;
   const displaced = await taggedImageId(context, target);
   if (displaced === shared) return true;
-  await docker(context, ['tag', shared, target]);
-  if (displaced) await deleteUntaggedImage(context, displaced);
-  return true;
+  if (displaced) await holdImage(context, base, displaced);
+  const adopted = await tagShared(context, shared, target);
+  if (displaced) await releaseImage(context, base, displaced);
+  return adopted;
 }

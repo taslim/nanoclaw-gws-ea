@@ -58,6 +58,7 @@ import {
   finishFollowUps,
   finishSwap,
   imageIdOf,
+  moveRecordedImages,
   keepCutoverHostStopped,
   nextAgentImage,
   openCutoverHost,
@@ -1183,8 +1184,9 @@ async function swapReleases(cutover: Cutover): Promise<OperationRecord> {
 /**
  * Retag the agent images (KTD7): `:latest` moves to the image staging built
  * and `:previous` to the one the assistant ran. The moves are recorded by ID
- * before they are made, so a retag cut short replays exactly; the image
- * `:previous` named before is deleted once the release is recorded.
+ * before they are made, so a retag cut short replays exactly, and every image
+ * they name is held meanwhile (KTD19); the image `:previous` named before
+ * stays held until it is released once the release is recorded.
  */
 async function moveAgentImages(cutover: Cutover, record: OperationRecord): Promise<OperationRecord> {
   const base = getInstallScopedNames(cutover.runtime.install_id).containerImageBase;
@@ -1215,12 +1217,15 @@ async function moveAgentImages(cutover: Cutover, record: OperationRecord): Promi
       follow_ups: planFollowUps(current.follow_ups, displaced),
     });
   }
-  for (const image of current.images) await cutoverDocker(cutover, ['tag', image.image_id, image.tag]);
-  const latest = current.images.find((image) => image.tag === latestTag);
-  // `:next` now names the image `:latest` does, so removing it only removes the tag.
-  if (latest && (await imageIdOf(cutover, nextTag)) === latest.image_id) {
-    await cutoverDocker(cutover, ['image', 'rm', nextTag]);
-  }
+  const images = current.images;
+  await moveRecordedImages(cutover, images, async () => {
+    for (const image of images) await cutoverDocker(cutover, ['tag', image.image_id, image.tag]);
+    const latest = images.find((image) => image.tag === latestTag);
+    // `:next` now names the image `:latest` does, so removing it only removes the tag.
+    if (latest && (await imageIdOf(cutover, nextTag)) === latest.image_id) {
+      await cutoverDocker(cutover, ['image', 'rm', nextTag]);
+    }
+  });
   return current;
 }
 

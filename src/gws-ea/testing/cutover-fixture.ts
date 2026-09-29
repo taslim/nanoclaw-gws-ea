@@ -517,7 +517,9 @@ export function applying(...names: readonly string[]): Migrate {
  * `restamp-partway` it had replaced only the plugin. At `untag` a rollback's
  * cleanup is removing the `:previous` tag it leaves. At `label` an update's
  * agent image is built and not yet labeled; at `untag-build` it is labeled,
- * and the unlabeled one still carries its `:building` tag.
+ * and the unlabeled one still carries its `:building` tag. At `hold` an image
+ * is being held under a tag of the assistant's own, and at `release` that
+ * hold is being removed.
  */
 export type HangPoint =
   | 'build'
@@ -532,7 +534,9 @@ export type HangPoint =
   | 'rebuild'
   | 'restamp'
   | 'restamp-partway'
-  | 'untag';
+  | 'untag'
+  | 'hold'
+  | 'release';
 
 /** What every faked boundary holds, and what reached it. */
 export interface World {
@@ -610,7 +614,7 @@ export function imageId(): string {
   return id;
 }
 
-export function world(runtime: InstanceRuntimeConfig, migrate: Migrate = applying()): World {
+export function world(runtime: Pick<InstanceRuntimeConfig, 'install_id'>, migrate: Migrate = applying()): World {
   const tags = new Map([
     [`${imageBase(runtime)}:latest`, imageId()],
     [`${imageBase(runtime)}:ag-research`, imageId()],
@@ -652,10 +656,15 @@ export async function hang(state: World, point: HangPoint): Promise<void> {
   await never();
 }
 
+/** Whether a tag is one an assistant holds an image under (`heldImageTag`), which a switch never moves. */
+export function isHold(reference: string): boolean {
+  return /:held-[0-9a-f]{12}$/u.test(reference);
+}
+
 /** Tag an image as Docker does: the tag's former image stays, untagged unless another tag names it. */
 export function tag(state: World, reference: string, name: string): void {
   const id = state.tags.get(reference) ?? (state.ids.has(reference) ? reference : undefined);
-  if (!id) throw new GwsEaError('command_failed', `No such image: ${reference}`, { details: { exitCode: 1 } });
+  if (!id) throw dockerFailure(`Error response from daemon: No such image: ${reference}`);
   state.tags.set(name, id);
 }
 
@@ -794,9 +803,18 @@ export function runner(state: World): SanitizedCommandRunner {
       if (first === 'image' && second === 'ls' && spec.args.includes('--filter')) {
         return { stdout: listFiltered(state, spec.args), stderr: '' };
       }
+      if (first === 'image' && second === 'ls' && flagValues(spec.args, '--format')[0] === '{{.Repository}}:{{.Tag}}') {
+        const tags = [...state.tags.keys()].filter((name) => name.startsWith(`${last}:`));
+        return { stdout: tags.map((name) => `${name}\n`).join(''), stderr: '' };
+      }
       if (first === 'image' && second === 'ls') {
         const id = state.tags.get(last);
         return { stdout: id ? `${joined.includes('--no-trunc') ? id : id.slice(7, 19)}\n` : '', stderr: '' };
+      }
+      if (first === 'tag' && isHold(spec.args[2]!)) {
+        await hang(state, 'hold');
+        tag(state, spec.args[1]!, spec.args[2]!);
+        return { stdout: '', stderr: '' };
       }
       if (first === 'tag') {
         await hang(state, 'retag');
@@ -808,6 +826,7 @@ export function runner(state: World): SanitizedCommandRunner {
       if (first === 'image' && second === 'rm') {
         if (last.endsWith(':previous')) await hang(state, 'untag');
         if (last.endsWith(':building')) await hang(state, 'untag-build');
+        if (isHold(last)) await hang(state, 'release');
         removeImage(state, last);
         return { stdout: '', stderr: '' };
       }

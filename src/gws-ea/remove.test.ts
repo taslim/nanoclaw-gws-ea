@@ -512,6 +512,17 @@ class FakeDocker {
       if (!references) return { stdout: '', stderr: `Error response from daemon: No such image: ${id}`, exitCode: 1 };
       return ok(`${JSON.stringify([...references])}\n`);
     }
+    if (group === 'tag') {
+      const source = verb ?? '';
+      const target = rest[0] ?? '';
+      const id = this.images.has(source)
+        ? source
+        : [...this.images].find(([, references]) => references.has(source))?.[0];
+      if (!id) return { stdout: '', stderr: `Error response from daemon: No such image: ${source}`, exitCode: 1 };
+      for (const references of this.images.values()) references.delete(target);
+      this.images.get(id)?.add(target);
+      return ok();
+    }
     if (group === 'image' && verb === 'rm') {
       const refusals = rest.flatMap((reference) => this.#remove(reference) ?? []);
       return refusals.length === 0 ? ok() : { stdout: '', stderr: refusals.join('\n'), exitCode: 1 };

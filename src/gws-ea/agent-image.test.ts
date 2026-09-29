@@ -3,7 +3,9 @@
  * `container/build.sh` builds an image from, its `.env` flags read as the
  * script itself reads them (proven by running the script against a
  * recording container runtime), and the lookup takes up only an image some
- * tag names whose label carries exactly the key, the newest first.
+ * tag names whose label carries exactly the key, the newest first. An image
+ * is held under a tag of the assistant's own while it may be needed, and
+ * released only by removing that tag, never deleted by ID.
  */
 import { spawnSync } from 'node:child_process';
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -14,15 +16,20 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   AGENT_IMAGE_KEY_LABEL,
+  adoptSharedAgentImage,
   agentImageBuildFlags,
   agentImageKey,
   findSharedAgentImage,
+  heldImageTag,
+  moveHoldingImages,
   provideSharedAgentImage,
+  releaseImage,
   type AgentImageBuildFlags,
   type ImageDocker,
 } from './agent-image.js';
 import { CONTROL_PLANE_ROOT } from './paths.js';
 import type { SanitizedCommand } from './process.js';
+import { imageBase, imageId, isHold, runner, tag, world, type World } from './testing/cutover-fixture.js';
 import { GwsEaError } from './types.js';
 
 const roots: string[] = [];
@@ -271,5 +278,154 @@ describe('the image shared under a key', () => {
       `build --label ${AGENT_IMAGE_KEY_LABEL}=${key} --tag nanoclaw-agent-v2-b:next -`,
       'image rm nanoclaw-agent-v2-b:building',
     ]);
+  });
+});
+
+describe('holding and releasing an image', () => {
+  const a = { install_id: 'a'.repeat(32) };
+  const b = { install_id: 'b'.repeat(32) };
+  const key = agentImageKey(INPUTS);
+  const docker = (state: World): ImageDocker => ({ run: runner(state), cwd: '/', env: {} });
+  const namesOf = (state: World, image: string) =>
+    [...state.tags].filter(([, id]) => id === image).map(([name]) => name);
+  const holdsOf = (state: World) => [...state.tags.keys()].filter(isHold).sort();
+  const removedById = (state: World) =>
+    state.commands.some((command) => /^image rm sha256:/u.test(command.args.join(' ')));
+
+  it('deletes an image only with the last tag naming it, by removing its own hold', async () => {
+    const state = world(a);
+    const image = state.tags.get(`${imageBase(a)}:latest`)!;
+    // B shares the image A moved off.
+    tag(state, image, `${imageBase(b)}:latest`);
+    state.tags.delete(`${imageBase(a)}:latest`);
+
+    await releaseImage(docker(state), imageBase(a), image);
+    expect(namesOf(state, image)).toEqual([`${imageBase(b)}:latest`]);
+
+    state.tags.delete(`${imageBase(b)}:latest`);
+    await releaseImage(docker(state), imageBase(b), image);
+    expect(state.ids.has(image)).toBe(false);
+    // One already gone is released, and nothing was ever deleted by ID.
+    await releaseImage(docker(state), imageBase(a), image);
+    expect(removedById(state)).toBe(false);
+  });
+
+  it('keeps an image another assistant tags while it is being released', async () => {
+    const state = world(a);
+    const image = state.tags.get(`${imageBase(a)}:latest`)!;
+    state.tags.delete(`${imageBase(a)}:latest`);
+    const run = runner(state);
+    // B's update tags the image as its :next just as A, finding no tag on it, is releasing it.
+    const racing: ImageDocker = {
+      cwd: '/',
+      env: {},
+      run: async (command) => {
+        if (command.args[0] === 'image' && command.args[1] === 'rm') tag(state, image, `${imageBase(b)}:next`);
+        return run(command);
+      },
+    };
+
+    await releaseImage(racing, imageBase(a), image);
+
+    expect(namesOf(state, image)).toEqual([`${imageBase(b)}:next`]);
+  });
+
+  it('holds every image a move names, and keeps the hold only on one the move leaves without a tag of its own', async () => {
+    const state = world(a);
+    const base = imageBase(a);
+    const ran = state.tags.get(`${base}:latest`)!;
+    const built = imageId();
+    const kept = imageId();
+    state.ids.add(built).add(kept);
+    state.tags.set(`${base}:next`, built).set(`${base}:previous`, kept);
+    const during: string[][] = [];
+
+    await moveHoldingImages(docker(state), base, [built, ran, ran, kept], async () => {
+      during.push(holdsOf(state));
+      tag(state, built, `${base}:latest`);
+      tag(state, ran, `${base}:previous`);
+      state.tags.delete(`${base}:next`);
+    });
+
+    expect(during).toEqual([[built, ran, kept].map((id) => heldImageTag(base, id)).sort()]);
+    expect(holdsOf(state)).toEqual([heldImageTag(base, kept)]);
+    expect(namesOf(state, built)).toEqual([`${base}:latest`]);
+    expect(namesOf(state, ran)).toEqual([`${base}:previous`]);
+  });
+
+  it('builds the image when the shared one is gone by the time it is tagged', async () => {
+    const builds: string[] = [];
+    const shared = stubDocker([
+      { id: id('2'), tags: ['nanoclaw-agent-v2-a:latest'], created: '2026-09-28T10:00:00Z', key },
+    ]);
+    const vanishing: ImageDocker = {
+      ...shared,
+      run: async (command) => {
+        if (command.args[0] !== 'tag') return shared.run(command);
+        throw new GwsEaError('command_failed', 'docker exited with code 1', {
+          details: { exitCode: 1, stderrTail: `Error response from daemon: No such image: ${id('2')}` },
+        });
+      },
+    };
+
+    expect(
+      await provideSharedAgentImage(vanishing, {
+        key,
+        target: 'nanoclaw-agent-v2-b:next',
+        building: 'nanoclaw-agent-v2-b:building',
+        build: async () => void builds.push('build.sh building'),
+      }),
+    ).toBe('built');
+    expect(builds).toEqual(['build.sh building']);
+  });
+
+  it("adopts nothing, keeping the new assistant's :latest, when the shared image is gone before it is tagged", async () => {
+    const state = world(a);
+    const base = imageBase(a);
+    const own = state.tags.get(`${base}:latest`)!;
+    const shared = imageId();
+    state.ids.add(shared);
+    state.labels.set(shared, key);
+    state.tags.set(`${imageBase(b)}:latest`, shared);
+    const run = runner(state);
+    // B's removal drops the shared image's last tag as A tags it.
+    const racing: ImageDocker = {
+      cwd: '/',
+      env: {},
+      run: async (command) => {
+        if (command.args[0] === 'tag' && command.args[1] === shared) {
+          state.tags.delete(`${imageBase(b)}:latest`);
+          state.ids.delete(shared);
+        }
+        return run(command);
+      },
+    };
+
+    expect(await adoptSharedAgentImage(racing, key, base, `${base}:latest`)).toBe(false);
+    expect(namesOf(state, own)).toEqual([`${base}:latest`]);
+    expect(holdsOf(state)).toEqual([]);
+  });
+
+  it('converges from a create killed between adopting the shared image and releasing the one it displaced', async () => {
+    const state = world(a);
+    const base = imageBase(a);
+    const own = state.tags.get(`${base}:latest`)!;
+    const shared = imageId();
+    state.ids.add(shared);
+    state.labels.set(shared, key);
+    state.tags.set(`${imageBase(b)}:latest`, shared);
+    state.hangAt = 'release';
+    const reached = new Promise<void>((resolve) => (state.reached = resolve));
+
+    void adoptSharedAgentImage(docker(state), key, base, `${base}:latest`);
+    await reached;
+    expect(state.tags.get(`${base}:latest`)).toBe(shared);
+    expect(namesOf(state, own)).toEqual([heldImageTag(base, own)]);
+
+    state.hangAt = undefined;
+    expect(await adoptSharedAgentImage(docker(state), key, base, `${base}:latest`)).toBe(true);
+    expect(state.ids.has(own)).toBe(false);
+    expect(holdsOf(state)).toEqual([]);
+    expect(namesOf(state, shared).sort()).toEqual([`${base}:latest`, `${imageBase(b)}:latest`]);
   });
 });

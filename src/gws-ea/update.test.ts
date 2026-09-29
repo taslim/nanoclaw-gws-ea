@@ -36,6 +36,7 @@ import {
   imageBase,
   imageId,
   installLabel,
+  isHold,
   killDuringCutover,
   LIVE_MIGRATIONS,
   liveState,
@@ -71,6 +72,7 @@ import {
   type Release,
   type World,
 } from './testing/cutover-fixture.js';
+import { heldImageTag } from './agent-image.js';
 import { readKeptReleaseManifest } from './kept-release.js';
 import { acquireInstanceOperation } from './journal.js';
 import {
@@ -683,6 +685,8 @@ async function expectUpdated(host: Machine, runtime: InstanceRuntimeConfig, to: 
   expect(state.tags.get(`${base}:latest`)).not.toBe(ran);
   expect(state.tags.has(`${base}:next`)).toBe(false);
   expect(repositoryImages(state, base).untagged).toEqual([]);
+  // Nothing is held once the update's cleanup released the image it displaced.
+  expect([...state.tags.keys()].filter(isHold)).toEqual([]);
 }
 
 /** Where each kill leaves the update's record. */
@@ -1754,6 +1758,57 @@ describe('gws-ea update', GIT_HEAVY, () => {
     expect(state.tags.get(`${imageBase(b)}:latest`)).toBe(state.tags.get(`${imageBase(a)}:latest`));
     // It never asked how large B's image is: the shared one is already on disk.
     expect(state.commands.some((command) => command.args.includes('{{.Size}}'))).toBe(false);
+  });
+
+  it("leaves a peer's image alone when an update tagged onto it is declined", async () => {
+    const { host, a, b, next, state } = await pair();
+    expect(await cli(host, state, next, a).run(['update', '--id', a.instance_id, '--yes'])).toBe(0);
+    const shared = state.tags.get(`${imageBase(a)}:latest`)!;
+    const bRan = state.tags.get(`${imageBase(b)}:latest`)!;
+    let staged: string | undefined;
+    const declined = cli(host, state, next, b, {
+      confirmUpdate: async () => {
+        staged = state.tags.get(`${imageBase(b)}:next`);
+        return false;
+      },
+    });
+
+    expect(await declined.run(['update', '--id', b.instance_id])).toBe(0);
+
+    // B's staging took up A's image as its :next, and its discard removed only that tag.
+    expect(staged).toBe(shared);
+    expect(state.tags.has(`${imageBase(b)}:next`)).toBe(false);
+    expect(state.tags.get(`${imageBase(a)}:latest`)).toBe(shared);
+    expect(state.tags.get(`${imageBase(b)}:latest`)).toBe(bRan);
+    expect(state.labels.get(shared)).toBe(releaseAgentImageKey(next));
+    expect([...state.tags.keys()].filter(isHold)).toEqual([]);
+  });
+
+  it("rolls back an update cut short after its retag, though a peer's update since released the image it displaced", async () => {
+    const { host, a, b, next, state } = await pair();
+    // Both assistants keep the same image as :previous, as two assistants that moved from one release do.
+    const kept = imageId();
+    state.ids.add(kept);
+    for (const runtime of [a, b]) state.tags.set(`${imageBase(runtime)}:previous`, kept);
+    const aRan = state.tags.get(`${imageBase(a)}:latest`)!;
+    state.hangAt = 'verify';
+    await killDuringCutover(host, a, state, next);
+    delete state.hangAt;
+    // A's retag took its :previous off that image, and A holds it while its update may yet be reverted.
+    expect(state.tags.get(`${imageBase(a)}:previous`)).toBe(aRan);
+    expect(state.tags.get(heldImageTag(imageBase(a), kept))).toBe(kept);
+
+    // B's update moves its own :previous off the same image and releases it: A's hold keeps it.
+    expect(await cli(host, state, next, b).run(['update', '--id', b.instance_id, '--yes'])).toBe(0);
+    expect(state.ids.has(kept)).toBe(true);
+
+    expect(await cli(host, state, next, a).run(['rollback', '--id', a.instance_id, '--yes'])).toBe(0);
+
+    expect(state.tags.get(`${imageBase(a)}:latest`)).toBe(aRan);
+    expect(state.tags.get(`${imageBase(a)}:previous`)).toBe(kept);
+    // The image A's update built stays for B, which runs it; nothing is held any more.
+    expect(state.ids.has(state.tags.get(`${imageBase(b)}:latest`)!)).toBe(true);
+    expect([...state.tags.keys()].filter(isHold)).toEqual([]);
   });
 
   it("keeps the image the assistant runs when NanoClaw's build hands it back from the cache, labeling a copy", async () => {

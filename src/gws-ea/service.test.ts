@@ -624,15 +624,20 @@ describe('GWS-EA instance runtime', () => {
       ambientEnv: { PATH: operatorPath, HOME: '/Users/elsewhere' },
     });
 
-    // The tripwire is stamped, no image is shared under the release's key, and NanoClaw's container step builds one.
+    // The tripwire is stamped, nothing is held from an earlier attempt, no image is shared under the release's key,
+    // and NanoClaw's container step builds one.
     const key = agentImageKey({ contextTree: CONTAINER_TREE, installCjkFonts: false, hardenedImage: false });
-    const [stamp, tree, lookup, build] = calls;
+    const [stamp, tree, holds, lookup, build] = calls;
     expect(stamp).toMatchObject({
       command: 'pnpm',
       args: ['exec', 'tsx', 'scripts/upgrade-state.ts', 'set', '2.3.0', 'gws-ea'],
       cwd: config.checkout_realpath,
     });
     expect(tree).toMatchObject({ command: 'git', args: ['ls-tree', '--full-tree', 'a'.repeat(40), '--', 'container'] });
+    expect(holds).toMatchObject({
+      command: 'docker',
+      args: ['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}', `nanoclaw-agent-v2-${config.install_id}`],
+    });
     expect(lookup).toMatchObject({
       command: 'docker',
       args: expect.arrayContaining([`label=${AGENT_IMAGE_KEY_LABEL}=${key}`]),
@@ -655,15 +660,18 @@ describe('GWS-EA instance runtime', () => {
     }
   });
 
-  it('tags the agent image an update already built for the release as :latest, building none, and deletes the one it displaces', async () => {
+  it('tags the agent image an update already built for the release as :latest, building none, and releases the one it displaces', async () => {
     const { config, home } = await fixture();
     await persistInstanceRuntime(config, upsertEnvVars);
     await writeFile(path.join(config.checkout_realpath, '.env'), 'INSTALL_CJK_FONTS=true\n', { flag: 'a' });
     const key = agentImageKey({ contextTree: CONTAINER_TREE, installCjkFonts: true, hardenedImage: false });
     const shared = `sha256:${'5'.repeat(64)}`;
-    // An earlier, interrupted run of this step left an image of its own build that nothing else names.
+    // An earlier, interrupted run of this step left an image of its own build, and a hold it had yet to release.
     const earlier = `sha256:${'e'.repeat(64)}`;
-    const latest = `nanoclaw-agent-v2-${config.install_id}:latest`;
+    const repository = `nanoclaw-agent-v2-${config.install_id}`;
+    const latest = `${repository}:latest`;
+    const leftover = `${repository}:held-${'d'.repeat(12)}`;
+    const held = `${repository}:held-${'e'.repeat(12)}`;
     const peer = `nanoclaw-agent-v2-${'0'.repeat(32)}:latest`;
     const calls: SanitizedCommand[] = [];
     const runner = vi.fn(async (command: SanitizedCommand) => {
@@ -675,6 +683,9 @@ describe('GWS-EA instance runtime', () => {
           return `${shared}\n`;
         }
         if (group === 'image' && verb === 'ls' && command.args.at(-1) === latest) return `${earlier}\n`;
+        if (group === 'image' && verb === 'ls' && command.args.at(-1) === repository) {
+          return `${latest}\n${leftover}\n`;
+        }
         if (group === 'image' && verb === 'inspect' && command.args.at(-1) === shared) {
           return JSON.stringify([
             {
@@ -700,9 +711,13 @@ describe('GWS-EA instance runtime', () => {
     });
 
     const docker = calls.filter((call) => call.command === 'docker').map((call) => call.args.join(' '));
-    expect(docker).toContain(`tag ${shared} ${latest}`);
-    expect(docker).toContain(`image rm ${earlier}`);
-    expect(docker.indexOf(`image rm ${earlier}`)).toBeGreaterThan(docker.indexOf(`tag ${shared} ${latest}`));
+    // The earlier attempt's hold goes first; the image :latest named is held while the tag moves, then released by
+    // removing that hold, which deletes it only if no other tag names it. Nothing is deleted by ID.
+    expect(docker.indexOf(`image rm ${leftover}`)).toBe(docker.findIndex((call) => call.startsWith('image rm')));
+    expect(docker.indexOf(`image rm ${leftover}`)).toBeLessThan(docker.indexOf(`tag ${earlier} ${held}`));
+    expect(docker.indexOf(`tag ${earlier} ${held}`)).toBeLessThan(docker.indexOf(`tag ${shared} ${latest}`));
+    expect(docker.lastIndexOf(`image rm ${held}`)).toBeGreaterThan(docker.indexOf(`tag ${shared} ${latest}`));
+    expect(docker).not.toContain(`image rm ${earlier}`);
     expect(calls.some((call) => call.args.join(' ').includes('--step container'))).toBe(false);
     // The service still starts, on the shared image.
     expect(calls.some((call) => call.command === 'launchctl' && call.args[0] === 'bootstrap')).toBe(true);

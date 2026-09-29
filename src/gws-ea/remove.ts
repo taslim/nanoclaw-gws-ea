@@ -45,7 +45,7 @@ import {
   renderManagedCloudflareConfiguration,
   replaceManagedCloudflareConfiguration,
 } from './cloudflare-ingress.js';
-import { imageTags } from './agent-image.js';
+import { releaseImage } from './agent-image.js';
 import {
   PauseRequired,
   runStep,
@@ -367,8 +367,10 @@ async function readUnfinishedOperation(
 
 /**
  * The agent images an unfinished update or rollback retagged or displaced, by
- * ID. A displaced image keeps no tag to be found by, and the record is the
- * only place that names it until its follow-ups delete it.
+ * ID. The repository's tags name those its retag moved, the ones it holds
+ * included (see `moveRecordedImages`), but an agent group's image a rebuild
+ * displaced keeps no tag to be found by, and the record is the only place
+ * that names it until its follow-up releases it.
  */
 function recordedAgentImages(record: OperationRecord | undefined | null): readonly string[] {
   if (!record) return [];
@@ -856,10 +858,10 @@ async function uninstallNanoclaw(
   }
 
   // Every tag in the assistant's own image repository goes: `:latest`, the `:next` an update staged (and the
-  // `:building` tag of an image its build had not yet labeled), the `:previous` it kept, and each agent group's own
-  // image. Removing a tag deletes its image only with the last tag naming it, so an agent image another assistant
-  // shares by content stays with that assistant's tags. Nothing outside the repository is named, so the OneCLI,
-  // gateway, and connector images assistants share stay too (KTD19).
+  // `:building` tag of an image its build had not yet labeled), the `:previous` it kept, each agent group's own
+  // image, and each image it held. Removing a tag deletes its image only with the last tag naming it, so an agent
+  // image another assistant shares by content stays with that assistant's tags. Nothing outside the repository is
+  // named, so the OneCLI, gateway, and connector images assistants share stay too (KTD19).
   const repository = getInstallScopedNames(installId).containerImageBase;
   const tagged = async (): Promise<string[]> =>
     (await checked('docker', ['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}', repository], tools))
@@ -872,17 +874,10 @@ async function uninstallNanoclaw(
     const remaining = await tagged();
     if (remaining.length > 0) throw incomplete(`NanoClaw images remain after removal: ${remaining.join(', ')}`);
   }
-  // An image a retag or rebuild displaced has no tag left to find it by, so it goes by the ID its record holds,
-  // unless another repository still tags it: assistants share agent images by content.
-  for (const imageId of teardown.recordedImages) {
-    const inspected = await execute('docker', ['image', 'inspect', '--format', '{{json .RepoTags}}', imageId], tools);
-    if (inspected.outcome.exitCode !== 0) {
-      if (/No such image/iu.test(inspected.outcome.stderr)) continue;
-      throw commandExitError(inspected.command, inspected.outcome);
-    }
-    if (imageTags(inspected.outcome.stdout).length > 0) continue;
-    await checked('docker', ['image', 'rm', imageId], tools);
-  }
+  // An image a rebuild displaced has no tag left to find it by, so it is released by the ID its record holds, and
+  // stays while another repository still tags it: assistants share agent images by content.
+  const images = { run: runChecked, cwd: CONTROL_PLANE_ROOT, env: tools };
+  for (const imageId of teardown.recordedImages) await releaseImage(images, repository, imageId);
 }
 
 /** OneCLI's Compose project, through the recorded Docker endpoint; the CLI path is the one the instance stored. */

@@ -39,7 +39,7 @@ import Database from 'better-sqlite3';
 import { isErrno } from '../community-portal/errors.js';
 import { getInstallScopedNames } from '../install-slug.js';
 import { MUTABLE_PATHS } from '../mutable-paths.js';
-import { deleteUntaggedImage, taggedImageId, type ImageDocker } from './agent-image.js';
+import { moveHoldingImages, releaseImage, taggedImageId, type ImageDocker } from './agent-image.js';
 import { observeLiveCheckout } from './checkout.js';
 import { observeManagedGchatRoute, verifyExistingGchatRoute } from './endpoint.js';
 import { runStep, type StepReporter } from './events.js';
@@ -54,7 +54,13 @@ import { refreshMainTemplate, reverseMainTemplate, type TemplateFollowUp } from 
 import { runInstanceNclJson, type InstanceNclOptions } from './ncl.js';
 import { applyReleaseGateway, observeOnecliRuntime, restoreReleaseGateway, verifyOnecliRuntime } from './onecli.js';
 import type { OnecliPins, OnecliRuntimeLayout } from './onecli-compose.js';
-import { completeFollowUp, followUpKey, readOperationRecord, type OperationFollowUp } from './operation.js';
+import {
+  completeFollowUp,
+  followUpKey,
+  readOperationRecord,
+  type MovedImage,
+  type OperationFollowUp,
+} from './operation.js';
 import {
   instanceMarkerFile,
   instanceRuntimeFile,
@@ -1343,15 +1349,39 @@ export function assistantImageDocker(
   return { run: seams.runCommand ?? runSanitizedCommand, cwd, env: dockerEnvironment(runtime, seams) };
 }
 
+/** One assistant's images as `agent-image.ts` reaches them, through the Docker its cutover runs. */
+function hostImageDocker(host: AssistantDocker): ImageDocker {
+  return {
+    run: host.run,
+    cwd: host.operation.paths.instanceRoot(host.operation.instanceId),
+    env: dockerEnvironment(host.runtime, host.dependencies),
+  };
+}
+
 /** The ID of the image `reference` names, or undefined when it names none. */
 export function imageIdOf(host: AssistantDocker, reference: string): Promise<string | undefined> {
-  return taggedImageId(
-    {
-      run: host.run,
-      cwd: host.operation.paths.instanceRoot(host.operation.instanceId),
-      env: dockerEnvironment(host.runtime, host.dependencies),
-    },
-    reference,
+  return taggedImageId(hostImageDocker(host), reference);
+}
+
+/**
+ * Move an assistant's agent image tags (`move`) with every image its
+ * record's moves name held (KTD19): each image a tag moves to, and each it
+ * moves off. Until the record's follow-ups release them, no other
+ * assistant's release deletes an image this switch, or its reversal, may
+ * still point a tag at (see `moveHoldingImages`).
+ */
+export function moveRecordedImages(
+  host: AssistantDocker,
+  images: readonly MovedImage[],
+  move: () => Promise<void>,
+): Promise<void> {
+  return moveHoldingImages(
+    hostImageDocker(host),
+    getInstallScopedNames(host.runtime.install_id).containerImageBase,
+    images.flatMap((image) =>
+      image.displaced_image_id === null ? [image.image_id] : [image.image_id, image.displaced_image_id],
+    ),
+    move,
   );
 }
 
@@ -1690,8 +1720,9 @@ async function runFollowUp(
       return undefined;
     case 'delete_image':
       // Displaced by a retag or a rebuild; another assistant sharing it by content keeps it by its own tag (KTD19).
-      await deleteUntaggedImage(
+      await releaseImage(
         assistantImageDocker(runtime, dependencies, paths.instanceRoot(instanceId)),
+        getInstallScopedNames(runtime.install_id).containerImageBase,
         followUp.image_id,
       );
       return undefined;

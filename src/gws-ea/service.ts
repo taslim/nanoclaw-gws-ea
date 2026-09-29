@@ -897,9 +897,11 @@ async function adoptReleaseAgentImage(
     { repository: checkout, commit: config.deployed_commit, checkout },
     { runCommand: run },
   );
+  const names = getInstallScopedNames(config.install_id);
   return adoptSharedAgentImage(
     { run, cwd: checkout, env: environment },
     agentImageKey(inputs),
-    getInstallScopedNames(config.install_id).defaultContainerImage,
+    names.containerImageBase,
+    names.defaultContainerImage,
   );
 }
