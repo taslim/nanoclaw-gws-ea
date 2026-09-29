@@ -58,6 +58,15 @@ describe('GWS-EA ncl boundary', () => {
     await expect(runInstanceNclJson(config, ['groups', 'list'])).resolves.toEqual([{ id: 'main' }]);
   });
 
+  it('bounds a long command by the timeout its caller gives, not the default', async () => {
+    const config = await instanceWithNcl(`sleep 5\n${frameScript({ id: 'r1', ok: true, data: null }, 0)}`);
+
+    await expect(runInstanceNclJson(config, ['groups', 'restart'], { timeoutMs: 200 })).rejects.toMatchObject({
+      code: 'command_timeout',
+      details: expect.objectContaining({ timeoutMs: 200 }),
+    });
+  });
+
   it("surfaces NanoClaw's own error message when ncl exits 1 with an ok:false frame", async () => {
     const config = await instanceWithNcl(
       frameScript({ id: 'r1', ok: false, error: { code: 'handler-error', message: 'No agent group named main' } }, 1),

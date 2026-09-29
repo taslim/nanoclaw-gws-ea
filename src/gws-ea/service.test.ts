@@ -15,10 +15,14 @@ import {
   instanceServicePid,
   launchInstanceHost,
   loadInstanceRuntimeConfig,
+  instanceServiceDefinitionFile,
   persistInstanceRuntime,
+  readInstanceHostEnvironment,
   reconcileInstanceRuntime,
   reconcileInstanceService,
   runInstanceOnecliAdminCommand,
+  writeInstanceServiceDefinition,
+  writeReleaseRuntime,
   type InstanceRuntimeConfig,
   type InstanceServiceLayout,
   type UpsertEnvVars,
@@ -629,5 +633,63 @@ describe('GWS-EA instance runtime', () => {
         NANOCLAW_INSTALL_ID: config.install_id,
       });
     }
+  });
+});
+
+describe('rendering the release an update deploys', () => {
+  it("writes the release's runtime record and every gws-ea .env key into its staged checkout, keeping other keys", async () => {
+    const { config } = await fixture();
+    await persistInstanceRuntime(config, upsertEnvVars);
+    const staged = path.join(path.dirname(config.checkout_realpath), 'next', 'nanoclaw');
+    await mkdir(staged, { recursive: true, mode: 0o700 });
+    await writeFile(path.join(staged, '.env'), 'INSTALL_CJK_FONTS=true\nWEBHOOK_PORT=1\nONECLI_URL=http://stale\n', {
+      mode: 0o600,
+    });
+    const release = { ...config, deployed_commit: 'b'.repeat(40) };
+
+    await writeReleaseRuntime(release, staged, upsertEnvVars);
+
+    const written = JSON.parse(await readFile(path.join(staged, 'data', 'gws-ea', 'runtime.json'), 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    // The record is the release's, for the path it will run from once swapped live.
+    expect(written).toMatchObject({ deployed_commit: 'b'.repeat(40), checkout_realpath: config.checkout_realpath });
+    expect((await stat(path.join(staged, 'data', 'gws-ea', 'runtime.json'))).mode & 0o777).toBe(0o600);
+    const environment = await readFile(path.join(staged, '.env'), 'utf8');
+    expect(environment).toContain('INSTALL_CJK_FONTS=true');
+    expect(environment).toContain(`WEBHOOK_PORT=${config.allocated_ports.nanoclaw_webhook}`);
+    expect(environment).toContain(`ONECLI_URL=${config.onecli_app_url}`);
+    expect(environment).not.toContain('stale');
+    expect(readInstanceHostEnvironment(staged)).toEqual(readInstanceHostEnvironment(config.checkout_realpath));
+    expect(Object.keys(readInstanceHostEnvironment(staged))).not.toContain('INSTALL_CJK_FONTS');
+    // The live checkout is untouched.
+    expect(
+      JSON.parse(await readFile(path.join(config.checkout_realpath, 'data', 'gws-ea', 'runtime.json'), 'utf8')),
+    ).toMatchObject({ deployed_commit: config.deployed_commit });
+  });
+
+  it('writes the service definition an update renders only when it differs, and reloads systemd for it', async () => {
+    const { config, home } = await fixture();
+    const calls: SanitizedCommand[] = [];
+    const runCommand = vi.fn(async (command: SanitizedCommand) => {
+      calls.push(command);
+      return { stdout: '', stderr: '' };
+    });
+    for (const platform of ['macos', 'linux'] as const) {
+      const options = { platform, homeDirectory: home, runningAsRoot: false, runCommand, uid: 1000 };
+      const file = instanceServiceDefinitionFile(config, options);
+      await mkdir(path.dirname(file), { recursive: true });
+      await writeFile(file, 'the definition an earlier release rendered\n', { mode: 0o600 });
+
+      expect(await writeInstanceServiceDefinition(config, options)).toBe(true);
+      const rendered = await readFile(file, 'utf8');
+      expect(rendered).toContain(path.join(config.checkout_realpath, 'dist', 'gws-ea', 'process.js'));
+      expect((await stat(file)).mode & 0o777).toBe(0o600);
+      expect(await writeInstanceServiceDefinition(config, options)).toBe(false);
+      expect(await readFile(file, 'utf8')).toBe(rendered);
+    }
+    // launchd reads its definition when the job is bootstrapped; systemd must be told once it changed.
+    expect(calls.map((call) => [call.command, ...call.args])).toEqual([['systemctl', '--user', 'daemon-reload']]);
   });
 });

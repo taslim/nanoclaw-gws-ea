@@ -1072,7 +1072,9 @@ describe('removal mid-update', () => {
   /**
    * An update from the reserved commit to `TARGET`, interrupted at `phase`,
    * with the directories each phase leaves: the staged release beside the live
-   * one until the renames, then the live one at the target and the old one kept.
+   * one until the renames, then the live one at the target and the old one kept;
+   * the files kept with the outgoing release, the carry's build area, and the
+   * previous release an earlier update kept, set aside at the swap.
    */
   async function interruptedAt(
     paths: ControlPlanePaths,
@@ -1087,16 +1089,27 @@ describe('removal mid-update', () => {
     const previous = paths.releaseCheckoutRoot(id, 'previous');
     const next = paths.releaseCheckoutRoot(id, 'next');
     await rm(live, { recursive: true, force: true });
+    const kept = async (root: string): Promise<void> => {
+      await writePrivate(path.join(root, 'release-preflight.json'), { instance_id: id });
+      await writePrivate(path.join(root, 'host-environment.json'), { WEBHOOK_PORT: '1' });
+    };
+    const older = paths.releaseCheckoutRoot(id, 'superseded');
     if (phase === 'swapping') {
       // Killed between the two renames: the old release is kept, the staged one not yet in place.
       await checkoutAt(previous, id, input.deployed_commit, RECORDED_DOCKER);
+      await kept(paths.releaseRoot(id, 'previous'));
+      await checkoutAt(older, id, 'c'.repeat(40));
       await checkoutAt(next, id, TARGET);
     } else if (renamed) {
       await checkoutAt(live, id, TARGET, RECORDED_DOCKER);
       await checkoutAt(previous, id, input.deployed_commit, RECORDED_DOCKER);
+      await kept(paths.releaseRoot(id, 'previous'));
+      await checkoutAt(older, id, 'c'.repeat(40));
     } else {
       await checkoutAt(live, id, input.deployed_commit, RECORDED_DOCKER);
       await checkoutAt(next, id, TARGET);
+      await kept(path.join(paths.releaseRoot(id, 'next'), 'previous'));
+      await mkdir(path.join(paths.releaseRoot(id, 'next'), 'carrying', 'data'), { recursive: true, mode: 0o700 });
     }
     const operation = await acquireInstanceOperation(paths, id, { command: 'update', target: to });
     if (!operation) throw new Error('The test instance operation was busy');

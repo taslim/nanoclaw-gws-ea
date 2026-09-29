@@ -591,10 +591,21 @@ async function hostProbe({ context, reservation }: Subject): Promise<ProbeResult
   return OK;
 }
 
-/** OneCLI at the pins the assistant's release receipt records and the images its own Compose file names (KTD6). */
-async function onecliProbe({ context, reservation, runtime: record, observers }: Subject): Promise<ProbeResult> {
+/**
+ * OneCLI at the pins the live release's receipt records and the images its own
+ * Compose file names (KTD6); mid-update that receipt may be the release the
+ * update placed live (KTD17).
+ */
+async function onecliProbe({
+  context,
+  reservation,
+  inspection,
+  runtime: record,
+  observers,
+}: Subject): Promise<ProbeResult> {
   const runtime = requireRuntime(record);
-  const setup = await readDeployedSetup(context.paths, reservation);
+  const open = inspection.state === 'open' ? inspection.record : undefined;
+  const setup = await readDeployedSetup(context.paths, reservation, liveCheckoutCommits(reservation, open));
   const layout = createOnecliRuntimeLayout({
     instanceId: reservation.instance_id,
     instanceRoot: context.paths.instanceRoot(reservation.instance_id),

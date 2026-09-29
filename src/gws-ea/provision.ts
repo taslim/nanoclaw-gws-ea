@@ -235,7 +235,8 @@ interface ReleasePreflightReceipt extends ReleasePreflightResult {
 
 interface ReleasePreflightExpectation {
   readonly instanceId: string;
-  readonly deployedCommit: string;
+  /** The commits the receipt may name: the reservation's, and mid-update the one an operation placed live. */
+  readonly deployedCommits: readonly string[];
   readonly provider: string;
   readonly providerCapabilityDigest?: string;
   readonly providerCredential?: ProviderCredentialMetadata;
@@ -289,7 +290,7 @@ function validateReleasePreflightReceipt(
   if (
     receipt.schema_version !== 1 ||
     validated.instance_id !== expectation.instanceId ||
-    validated.deployed_commit !== expectation.deployedCommit ||
+    !expectation.deployedCommits.includes(validated.deployed_commit) ||
     validated.provider !== expectation.provider ||
     (expectation.providerCapabilityDigest !== undefined &&
       providerCapabilityDigest !== expectation.providerCapabilityDigest) ||
@@ -315,7 +316,7 @@ async function loadReleasePreflightReceipt(
 function instanceReleaseReceipt(context: ProductionProvisionContext): Promise<ReleasePreflightReceipt> {
   return loadReleasePreflightReceipt(context.operation.paths.releasePreflightFile(context.operation.instanceId), {
     instanceId: context.operation.instanceId,
-    deployedCommit: context.input.release.commit,
+    deployedCommits: [context.input.release.commit],
     provider: context.input.releasePreflight.provider,
     providerCapabilityDigest: context.input.releasePreflight.providerCapabilityDigest,
     providerCredential: context.input.releasePreflight.providerCredential,
@@ -1432,7 +1433,7 @@ async function resolveProvisionSource(
   }
   const preflight = await loadReleasePreflightReceipt(operation.paths.releasePreflightFile(operation.instanceId), {
     instanceId: operation.instanceId,
-    deployedCommit: reservation.deployed_commit,
+    deployedCommits: [reservation.deployed_commit],
     provider: runtime.selected_provider,
   });
   const profile = readPersistedProfile(runtime);
@@ -1504,15 +1505,18 @@ export interface DeployedAssistantSetup extends DeployedSetup {
  * credential metadata, and OneCLI cohort its release receipt records, the
  * OneCLI CLI its runtime uses, and the Postgres image its Compose file names.
  * An update holds the tool's release to these, never to the tool's own tree.
+ * The receipt must be for one of `commits`: the reservation's by default, or
+ * mid-update also the release an operation placed live (KTD17).
  */
 export async function readDeployedSetup(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
+  commits: readonly string[] = [reservation.deployed_commit],
 ): Promise<DeployedAssistantSetup> {
   const runtime = await loadInstanceRuntimeConfig(instanceRuntimeFile(reservation));
   const receipt = await loadReleasePreflightReceipt(paths.releasePreflightFile(reservation.instance_id), {
     instanceId: reservation.instance_id,
-    deployedCommit: reservation.deployed_commit,
+    deployedCommits: commits,
     provider: runtime.selected_provider,
   });
   const onecli = instanceOnecliLayout(paths, reservation, runtime.onecli_cli_path, runtime.docker_endpoint);

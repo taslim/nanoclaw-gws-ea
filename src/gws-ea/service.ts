@@ -289,7 +289,22 @@ function runtimeConfigFile(config: InstanceRuntimeConfig): string {
 }
 
 /** The `.env` keys gws-ea owns; every other key belongs to another writer. */
-function instanceHostConfiguration(config: InstanceRuntimeConfig): Readonly<Record<string, string>> {
+export const INSTANCE_HOST_ENV_KEYS = [
+  'NANOCLAW_INSTALL_ID',
+  'DEFAULT_AGENT_PROVIDER',
+  'NANOCLAW_GATEWAY_PROVIDER',
+  'WEBHOOK_PORT',
+  'WEBHOOK_HOST',
+  'NANOCLAW_EGRESS_LOCKDOWN',
+  'NANOCLAW_EGRESS_NETWORK',
+  'ONECLI_GATEWAY_CONTAINER',
+  'ONECLI_URL',
+  'GCHAT_ENDPOINT_URL',
+] as const;
+
+type InstanceHostEnvKey = (typeof INSTANCE_HOST_ENV_KEYS)[number];
+
+function instanceHostConfiguration(config: InstanceRuntimeConfig): Readonly<Record<InstanceHostEnvKey, string>> {
   return {
     NANOCLAW_INSTALL_ID: config.install_id,
     DEFAULT_AGENT_PROVIDER: config.selected_provider,
@@ -344,13 +359,45 @@ export async function persistInstanceRuntime(
   await preparePrivateDirectory(path.join(config.checkout_realpath, 'logs'));
   await persistRuntimeFile(config);
   const owned = instanceHostConfiguration(config);
-  const present = readEnvFile(Object.keys(owned), config.checkout_realpath);
+  const present = readInstanceHostEnvironment(config.checkout_realpath);
   const missing = Object.entries(owned).filter(([key]) => present[key] === undefined);
   if (missing.length === 0) return;
   upsertEnvVars(Object.fromEntries(missing), config.checkout_realpath);
   activeStep()?.envFile(
     path.join(config.checkout_realpath, '.env'),
     missing.map(([key, value]) => `${key}=${value}\n`).join(''),
+  );
+}
+
+/** gws-ea's `.env` keys as a checkout's `.env` holds them, as NanoClaw reads it; other writers' keys are not read. */
+export function readInstanceHostEnvironment(checkoutRoot: string): Record<string, string> {
+  return readEnvFile([...INSTANCE_HOST_ENV_KEYS], checkoutRoot);
+}
+
+/**
+ * Write the runtime record and gws-ea's `.env` keys of the release an update
+ * deploys into its staged checkout, before the swap makes it live (KTD6,
+ * KTD9). Only create and update render them; here they are the release's
+ * own, so every gws-ea key is written, replacing the outgoing release's,
+ * while every other writer's key the carried `.env` holds is kept.
+ */
+export async function writeReleaseRuntime(
+  configInput: InstanceRuntimeConfig,
+  checkoutRoot: string,
+  upsertEnvVars: UpsertEnvVars,
+): Promise<void> {
+  const config = validateRuntimeConfig(configInput);
+  const root = path.join(checkoutRoot, 'data', 'gws-ea');
+  await preparePrivateDirectory(root);
+  await preparePrivateDirectory(path.join(checkoutRoot, 'logs'));
+  await writePrivateTextFile(path.join(root, 'runtime.json'), runtimeFileContents(config));
+  const owned = instanceHostConfiguration(config);
+  upsertEnvVars({ ...owned }, checkoutRoot);
+  activeStep()?.envFile(
+    path.join(checkoutRoot, '.env'),
+    Object.entries(owned)
+      .map(([key, value]) => `${key}=${value}\n`)
+      .join(''),
   );
 }
 
@@ -432,6 +479,46 @@ function renderInstanceService(config: InstanceRuntimeConfig, layout: InstanceSe
         ...input,
         wantedBy: layout.manager === 'systemd-system' ? 'multi-user.target' : 'default.target',
       });
+}
+
+/** Where the service manager reads the assistant's service definition. */
+export function instanceServiceDefinitionFile(
+  configInput: InstanceRuntimeConfig,
+  options: ServiceLayoutOptions,
+): string {
+  return createInstanceServiceLayout(configInput, options).serviceDefinitionPath;
+}
+
+/**
+ * Write the service definition the release an update deploys renders, while
+ * its service is stopped (KTD6): only when it differs from the one installed,
+ * and systemd is then told to reload it. launchd reads a definition when the
+ * job is bootstrapped, which the next start does. Returns whether it changed.
+ */
+export async function writeInstanceServiceDefinition(
+  configInput: InstanceRuntimeConfig,
+  dependencies: InstanceServiceDependencies,
+): Promise<boolean> {
+  const config = validateRuntimeConfig(configInput);
+  const layout = createInstanceServiceLayout(config, dependencies);
+  const rendered = renderInstanceService(config, layout);
+  const installed = await readFile(layout.serviceDefinitionPath, 'utf8').catch((error: unknown) => {
+    if (isErrno(error, 'ENOENT')) return undefined;
+    throw error;
+  });
+  if (installed === rendered) return false;
+  await mkdir(path.dirname(layout.serviceDefinitionPath), { recursive: true, mode: 0o700 });
+  await writePrivateTextFile(layout.serviceDefinitionPath, rendered);
+  if (layout.manager !== 'launchd') {
+    await (dependencies.runCommand ?? runSanitizedCommand)({
+      command: 'systemctl',
+      args: [...(layout.manager === 'systemd-user' ? ['--user'] : []), 'daemon-reload'],
+      cwd: config.home_directory,
+      env: serviceManagerEnvironment(config, layout.manager, dependencies),
+      timeoutMs: 30_000,
+    });
+  }
+  return true;
 }
 
 async function assertRegularFile(file: string): Promise<void> {
@@ -705,6 +792,36 @@ export async function launchInstanceHost(
   return replaceProcess(config.node_path, [config.node_path, layout.hostEntrypoint], environment, execve);
 }
 
+/**
+ * Stamp NanoClaw's upgrade marker in `checkoutRoot` with the checkout's own
+ * script, as a sanctioned upgrade path does: the host's startup tripwire then
+ * accepts exactly the commit and tree the checkout holds, and refuses any
+ * other.
+ */
+export async function stampUpgradeState(
+  checkoutRoot: string,
+  run: SanitizedCommandRunner,
+  environment: Readonly<Record<string, string>>,
+): Promise<void> {
+  const packageManifest = requireRecord(
+    parseJson(
+      await readFile(path.join(checkoutRoot, 'package.json'), 'utf8'),
+      'The selected checkout package.json',
+      'invalid_release',
+    ),
+    'The selected checkout package.json',
+    'invalid_release',
+  );
+  const version = requireString(packageManifest.version, 'The selected checkout package version', 'invalid_release');
+  await run({
+    command: 'pnpm',
+    args: ['exec', 'tsx', 'scripts/upgrade-state.ts', 'set', version, 'gws-ea'],
+    cwd: checkoutRoot,
+    env: environment,
+    timeoutMs: 30_000,
+  });
+}
+
 export async function reconcileInstanceRuntime(
   configInput: InstanceRuntimeConfig,
   dependencies: InstanceRuntimeDependencies,
@@ -718,23 +835,7 @@ export async function reconcileInstanceRuntime(
     DOCKER_HOST: config.docker_endpoint,
     NANOCLAW_INSTALL_ID: config.install_id,
   });
-  const packageManifest = requireRecord(
-    parseJson(
-      await readFile(path.join(config.checkout_realpath, 'package.json'), 'utf8'),
-      'The selected checkout package.json',
-      'invalid_release',
-    ),
-    'The selected checkout package.json',
-    'invalid_release',
-  );
-  const version = requireString(packageManifest.version, 'The selected checkout package version', 'invalid_release');
-  await run({
-    command: 'pnpm',
-    args: ['exec', 'tsx', 'scripts/upgrade-state.ts', 'set', version, 'gws-ea'],
-    cwd: config.checkout_realpath,
-    env: environment,
-    timeoutMs: 30_000,
-  });
+  await stampUpgradeState(config.checkout_realpath, run, environment);
   await run({
     command: 'pnpm',
     args: ['exec', 'tsx', 'setup/index.ts', '--step', 'container'],

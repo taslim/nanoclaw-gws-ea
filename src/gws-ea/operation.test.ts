@@ -190,9 +190,20 @@ describe('operation record', () => {
       });
 
       const manifest = { central_migrations: ['001-initial'], session_tables: { messages_in: ['id', 'on_wake'] } };
-      const images = [{ tag: 'nanoclaw-agent-v2-x:latest', displaced_image_id: `sha256:${'e'.repeat(64)}` }];
+      const images = [
+        {
+          tag: 'nanoclaw-agent-v2-x:latest',
+          image_id: `sha256:${'f'.repeat(64)}`,
+          displaced_image_id: `sha256:${'e'.repeat(64)}`,
+        },
+        { tag: 'nanoclaw-agent-v2-x:previous', image_id: `sha256:${'e'.repeat(64)}`, displaced_image_id: null },
+      ];
       const facts = await recordOperationFacts(operation, { manifest, images });
       expect(facts).toMatchObject({ phase: 'swapped', manifest, images });
+      await expect(readOperationRecord(paths, instanceId)).resolves.toMatchObject({ images });
+      await expect(
+        recordOperationFacts(operation, { images: [{ ...images[0]!, image_id: 'latest' }] }),
+      ).rejects.toMatchObject({ code: 'invalid_operation' });
       await expect(advanceOperation(operation, 'recorded')).rejects.toMatchObject({ code: 'operation_phase' });
       await expect(commitOperationRelease(operation)).rejects.toMatchObject({ code: 'operation_phase' });
     } finally {

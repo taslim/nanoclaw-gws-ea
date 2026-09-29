@@ -5,6 +5,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  applyReleaseGateway,
   importProviderCredential,
   observeOnecliRuntime,
   onecliSecretMatchesCredentialMetadata,
@@ -845,6 +846,38 @@ describe("an update's gateway image", () => {
     });
 
     expect(world.calls.some((call) => call.args[0] === 'build')).toBe(false);
+  });
+
+  it('moves the assistant to the release gateway at the cutover: Compose file re-rendered, only the gateway recreated', async () => {
+    const layout = await layoutFixture();
+    await writeInstanceCompose(layout, RELEASE_GATEWAY_IMAGE);
+    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
+
+    await applyReleaseGateway(layout, PINS, { dockerCommandRunner: runner, ambientEnv: HOSTILE_AMBIENT });
+
+    const compose = await readFile(layout.composeFile, 'utf8');
+    expect(compose).toBe(renderOnecliCompose(layout, PINS, GATEWAY_IMAGE));
+    expect((await stat(layout.composeFile)).mode & 0o777).toBe(0o600);
+    // Only the gateway: no pull, no Postgres or app recreate, and nothing that removes a volume.
+    expect(composeCalls(world)).toEqual([
+      [
+        'up',
+        '--detach',
+        '--wait',
+        '--wait-timeout',
+        String(ONECLI_WAIT_TIMEOUT_SECONDS),
+        '--pull',
+        'never',
+        '--no-deps',
+        'gateway',
+      ],
+    ]);
+    expect(world.calls.flatMap((call) => call.args)).not.toContain('down');
+    expect(world.calls.every((call) => call.env?.DOCKER_HOST === DOCKER_ENDPOINT)).toBe(true);
+
+    // Run again after an interruption, it converges without rendering anything new.
+    await applyReleaseGateway(layout, PINS, { dockerCommandRunner: runner });
+    expect(await readFile(layout.composeFile, 'utf8')).toBe(compose);
   });
 
   it('touches Docker not at all when the release runs the gateway the assistant already runs', async () => {

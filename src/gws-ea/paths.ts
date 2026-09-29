@@ -13,9 +13,10 @@ export const CONTROL_PLANE_ROOT = path.resolve(path.dirname(fileURLToPath(import
 /**
  * Releases an instance keeps beside its live checkout, each under
  * `<instance>/<slot>/nanoclaw`: the one an update stages, the one it keeps as
- * the rollback point, and the one a rollback leaves.
+ * the rollback point, the one a rollback leaves, and the rollback point an
+ * update set aside at its swap, kept until the update is recorded.
  */
-export const RELEASE_SLOTS = ['next', 'previous', 'outgoing'] as const;
+export const RELEASE_SLOTS = ['next', 'previous', 'outgoing', 'superseded'] as const;
 export type ReleaseSlot = (typeof RELEASE_SLOTS)[number];
 
 /** The instance marker inside a checkout. */

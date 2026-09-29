@@ -32,7 +32,7 @@ import {
   reserveInstance,
   type InstanceOperation,
 } from './journal.js';
-import { inspectOperation, readOperationRecord, type OperationInspection, type OperationRecord } from './operation.js';
+import { inspectOperation, readOperationRecord, type OperationInspection } from './operation.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { ProvisionHumanPause, ProvisionResult, ProvisionRuntime } from './phases.js';
 import { holdLoopbackPorts, type HeldLoopbackPorts } from './ports.js';
@@ -76,14 +76,25 @@ import {
 import { LIST_USAGE, runListCommand, runStatusCommand, STATUS_USAGE, type ReadOnlyCommandRuntime } from './status.js';
 import {
   confirmStagedUpdate,
+  continueUpdate,
+  finishFollowUps,
   prepareUpdate,
   resolveUpdateIntent,
   updatePreviewLines,
+  type UpdatedAssistant,
+  type UpdateDependencies,
   type UpdatePreview,
   type UpdateRequest,
   type UpdateSeams,
 } from './update.js';
-import { GwsEaError, type AllocatedPorts, type GwsEaErrorDetails, type InstanceReservationInput } from './types.js';
+import {
+  GwsEaError,
+  sameRelease,
+  type AllocatedPorts,
+  type GwsEaErrorDetails,
+  type InstanceReservationInput,
+  type ReleaseCoordinates,
+} from './types.js';
 
 /** Unlabeled, so a scripted create's first line stays its `instance_id`. */
 const PREREQUISITES_STEP = { id: 'prerequisites' } as const;
@@ -821,10 +832,12 @@ class Cli {
 
   /**
    * `update`: stage this tool's release beside the running assistant, show
-   * what the update changes, and record it at `staged` once confirmed (R7,
-   * R8, R12). Confirmation is settled first, so a run that could never be
-   * confirmed stops before anything is read or staged. An update already under
-   * way to this release is not staged again.
+   * what the update changes, and once confirmed carry it through its cutover
+   * to the recorded release (R7, R8, R10, R12). Confirmation is settled first,
+   * so a run that could never be confirmed stops before anything is read or
+   * staged. An update already under way to this release is continued, not
+   * staged again, and a recorded one's follow-ups are finished before anything
+   * else (KTD2), even when this release is the one already recorded.
    */
   async #updateWork({ reporter }: Session, request: UpdateRequest, yes: boolean): Promise<Outcome> {
     const confirm = yes ? async (): Promise<boolean> => true : this.#runtime.confirmUpdate;
@@ -834,8 +847,8 @@ class Cli {
         'An update needs confirmation: pass --yes, or run gws-ea update in a terminal to be asked.',
       );
     }
-    const { serviceHelpers, toolProviderSetup } = this.#runtime;
-    if (!serviceHelpers || !toolProviderSetup) {
+    const { serviceHelpers, toolProviderSetup, upsertEnvVars, hostStatus } = this.#runtime;
+    if (!serviceHelpers || !toolProviderSetup || !upsertEnvVars || !hostStatus) {
       throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
     }
     const seams = this.#runtime.update ?? {};
@@ -848,13 +861,26 @@ class Cli {
     });
     if (!operation) throw busy();
     try {
+      const dependencies: UpdateDependencies = {
+        ...seams,
+        serviceHelpers,
+        providerSetup: await toolProviderSetup(),
+        upsertEnvVars,
+        hostStatus,
+        reporter,
+      };
       const unfinished = await readOperationRecord(this.#paths, request.instanceId);
-      if (unfinished && unfinished.phase !== 'recorded') return updateOutcome(unfinished);
-      const dependencies = { ...seams, serviceHelpers, providerSetup: await toolProviderSetup(), reporter };
-      const staged = await prepareUpdate(operation, intent, dependencies);
-      for (const line of updatePreviewLines(staged.preview)) this.#presenter.line(line);
-      const record = await confirmStagedUpdate(operation, staged, dependencies, confirm);
-      return record ? updateOutcome(record) : { status: 'ready', message: 'Update cancelled. Nothing was changed.' };
+      if (unfinished?.phase === 'recorded') {
+        await finishFollowUps(operation, dependencies);
+        if (sameRelease(unfinished.to, intent.target)) return finishedOutcome(request.instanceId, unfinished.to);
+      }
+      if (!unfinished || unfinished.phase === 'recorded') {
+        const staged = await prepareUpdate(operation, intent, dependencies);
+        for (const line of updatePreviewLines(staged.preview)) this.#presenter.line(line);
+        const record = await confirmStagedUpdate(operation, staged, dependencies, confirm);
+        if (!record) return { status: 'ready', message: 'Update cancelled. Nothing was changed.' };
+      }
+      return updatedOutcome(request.instanceId, await continueUpdate(operation, dependencies));
     } finally {
       operation.release();
     }
@@ -979,10 +1005,22 @@ class Cli {
   }
 }
 
-/** Where an update run leaves the assistant: its release as the update's record has it. */
-function updateOutcome(record: OperationRecord): Outcome {
-  const to = `${record.to.release_track} ${record.to.deployed_commit.slice(0, 12)}`;
-  return { status: 'ready', message: `Assistant ${record.instance_id}'s update to ${to} is ${record.phase}.` };
+function releaseName(release: ReleaseCoordinates): string {
+  return `${release.release_track} ${release.deployed_commit.slice(0, 12)}`;
+}
+
+/** Where an update leaves the assistant: on its release, the one it ran kept to roll back to. */
+function updatedOutcome(instanceId: string, updated: UpdatedAssistant): Outcome {
+  return {
+    status: 'ready',
+    message: `Assistant ${instanceId} was updated to ${releaseName(updated.to)}.`,
+    details: [`Its previous release, ${releaseName(updated.from)}, is kept to roll back to.`],
+  };
+}
+
+/** An update run that only finished the follow-ups of the release it would deploy. */
+function finishedOutcome(instanceId: string, release: ReleaseCoordinates): Outcome {
+  return { status: 'ready', message: `Assistant ${instanceId} runs ${releaseName(release)}; its update is finished.` };
 }
 
 /** Wait, as NanoClaw's own update does, until the host answers on its CLI socket. */
@@ -1365,8 +1403,12 @@ function printHelp(output: LineWriter): void {
   output('  restart --id <instance_id>');
   output('  update --id <instance_id> [--track <track>] [--source-remote <remote>] [--yes]');
   output(
-    "         Stages this gws-ea's release beside the running assistant and shows what changes before anything does.",
+    "         Stages this gws-ea's release beside the running assistant and shows what changes before anything does,",
   );
+  output(
+    '         then switches to it during a brief stop, verifies it, and keeps the previous release to roll back to.',
+  );
+  output('         Rerun it to continue an update that was cut short, or to retry the follow-ups one left.');
   for (const command of READ_ONLY_COMMANDS.values()) for (const line of command.usage) output(`  ${line}`);
   output('  ncl --id <instance_id> -- <ncl arguments>');
   output('  remove --id <instance_id> [--yes] [--abandon gcp-project,cloudflare-dns]');

@@ -19,6 +19,7 @@ import {
 } from './transaction.js';
 import { CUTOVER_STOP_CLI_TIMEOUT_MS, drainContainers, stopService } from './service.js';
 import { getInstallSlug } from '../../src/install-slug.js';
+import { MUTABLE_PATHS } from '../../src/mutable-paths.js';
 import type { CommandRunner, ServiceHandle } from './service.js';
 
 const roots: string[] = [];
@@ -261,6 +262,8 @@ describe('update-nanoclaw transaction end to end', () => {
 
     state = await cutoverUpdate(fixture.install, state.id, runtime);
     expect(state.phase).toBe('cutover');
+    // The snapshot covers the mutable paths NanoClaw declares in src/, the list gws-ea carries too.
+    expect(state.snapshot?.map((entry) => entry.relativePath)).toEqual([...MUTABLE_PATHS]);
     expect(fs.readFileSync(path.join(fixture.install, 'src/value.ts'), 'utf8')).toContain('new');
     expect(fs.readFileSync(path.join(fixture.install, 'local-customization.txt'), 'utf8')).toBe('keep me\n');
     expect(state.requirements).toHaveLength(1);

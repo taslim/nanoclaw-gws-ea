@@ -70,9 +70,14 @@ export interface SnapshotManifest {
   readonly session_tables: Readonly<Record<string, readonly string[]>>;
 }
 
-/** An agent image tag the operation moved, and the image it named before (null when it named none). */
+/**
+ * An agent image tag the operation moved: the image it names after the move,
+ * and the one it named before (null when it named none). Both by ID, so a
+ * move cut short replays exactly, and a reversal can move it back.
+ */
 export interface MovedImage {
   readonly tag: string;
+  readonly image_id: string;
   readonly displaced_image_id: string | null;
 }
 
@@ -204,6 +209,7 @@ function parseImage(value: unknown): MovedImage {
   if (!isRecord(value)) throw invalid('Operation record image is invalid');
   return {
     tag: matching(value.tag, IMAGE_TAG_PATTERN, 'image tag'),
+    image_id: matching(value.image_id, IMAGE_ID_PATTERN, 'image ID'),
     displaced_image_id:
       value.displaced_image_id === null ? null : matching(value.displaced_image_id, IMAGE_ID_PATTERN, 'image ID'),
   };
@@ -230,7 +236,8 @@ function parseFollowUp(value: unknown): OperationFollowUp {
   }
 }
 
-function followUpKey(followUp: OperationFollowUp): string {
+/** What makes two follow-ups the same work, so planning one twice records it once. */
+export function followUpKey(followUp: OperationFollowUp): string {
   switch (followUp.kind) {
     case 'rebuild_group_image':
       return `${followUp.kind}:${followUp.agent_group_id}`;
