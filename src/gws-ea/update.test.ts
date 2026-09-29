@@ -697,6 +697,7 @@ const KILLS: ReadonlyArray<readonly [string, (state: World) => void, OperationPh
   ['once the kept files moved into previous/', (state) => (state.renameKill = 2), 'swapping'],
   ['between the two checkout renames', (state) => (state.renameKill = 3), 'swapping'],
   ["before the new release's receipt is promoted", (state) => (state.renameKill = 4), 'swapping'],
+  ['after the swap, while holding the images it moves', (state) => (state.hangAt = 'hold'), 'swapped'],
   ['after the swap, while retagging images', (state) => (state.hangAt = 'retag'), 'swapped'],
   ['between the two image tags', (state) => (state.hangAt = 'second-tag'), 'swapped'],
   ['after the start, while verifying', (state) => (state.hangAt = 'verify'), 'started'],

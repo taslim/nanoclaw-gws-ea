@@ -971,6 +971,7 @@ const KILLS: ReadonlyArray<readonly [string, (state: World) => void, OperationPh
   ["at the swap's first rename", (state) => (state.renameKill = 1), 'swapping'],
   ['between the two checkout renames', (state) => (state.renameKill = 2), 'swapping'],
   ["before the kept release's files leave previous/", (state) => (state.renameKill = 4), 'swapping'],
+  ['after the swap, while holding the images it moves', (state) => (state.hangAt = 'hold'), 'swapped'],
   ['after the swap, while moving images', (state) => (state.hangAt = 'retag'), 'swapped'],
   ['after the start, while verifying', (state) => (state.hangAt = 'verify'), 'started'],
   ['once recorded, while rebuilding group images', (state) => (state.hangAt = 'rebuild'), 'recorded'],
