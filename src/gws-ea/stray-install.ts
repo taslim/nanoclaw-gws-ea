@@ -24,7 +24,7 @@ import {
 import { pollUntil } from './poll.js';
 import { resolveDockerEndpoint } from './prerequisites.js';
 import { buildToolEnvironment, runSanitizedCommandOutcome, type SanitizedCommandOutcomeRunner } from './process.js';
-import { uninstallNanoclaw } from './remove.js';
+import { repositoryTags, uninstallNanoclaw } from './remove.js';
 import type { HostStatusHelpers } from './service.js';
 import type { NanoclawServiceHelpers } from './service-control.js';
 import {
@@ -36,7 +36,7 @@ import { GwsEaError } from './types.js';
 import { isRecord } from './validation.js';
 
 /** How long the check before `create` and `update`, and `list`'s and `status`'s note, wait on Docker. */
-export const QUICK_CHECK_MS = 500;
+const QUICK_CHECK_MS = 500;
 /** How long `gws-ea cleanup`, which the operator asked for, waits on Docker. */
 export const FULL_CHECK_MS = 10_000;
 /** How often, and for how long, removal waits for a host it stopped to go. */
@@ -154,7 +154,7 @@ export async function detectStrayInstall(
   const stray = strayCoordinates(checkout);
   const run = checkout.runCommand ?? runSanitizedCommandOutcome;
   const env = buildToolEnvironment(process.env, { HOME: stray.homeDirectory });
-  const docker = async (args: readonly string[]): Promise<string[]> => {
+  const docker = async (args: readonly string[]): Promise<string> => {
     const { exitCode, stdout, stderr } = await run({
       command: 'docker',
       args,
@@ -163,10 +163,7 @@ export async function detectStrayInstall(
       timeoutMs: deadlineMs,
     });
     if (exitCode !== 0) throw new Error(stderr.trim() || `docker exited with code ${exitCode}`);
-    return stdout
-      .split(/\r?\n/u)
-      .map((line) => line.trim())
-      .filter(Boolean);
+    return stdout;
   };
   const shown = (file: string): string =>
     isWithinDirectory(file, stray.homeDirectory) ? `~${file.slice(stray.homeDirectory.length)}` : file;
@@ -177,9 +174,10 @@ export async function detectStrayInstall(
       docker(['ps', '-aq', '--filter', `label=${stray.containerInstallLabel}`]),
       docker(['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}', stray.containerImageBase]),
     ]).then(
-      ([containers, references]) => ({
-        containers: containers.length,
-        imageTags: references.filter((reference) => !reference.endsWith(':<none>')).length,
+      // Tags are counted as the teardown lists them, so a check finds exactly what a removal removes.
+      ([containers, images]) => ({
+        containers: containers.split(/\r?\n/u).filter((id) => id.trim()).length,
+        imageTags: repositoryTags(images, stray.containerImageBase).length,
       }),
       (error: unknown) => ({
         containers: 0,
@@ -254,8 +252,12 @@ export async function removeStrayInstall(
   // The files it was found by are state, named as the state below is removed.
   const removed = strayParts({ ...found, files: [] });
   const remove = async (target: string, label: string): Promise<void> => {
-    if (!(await exists(target))) return;
-    await rm(target, { recursive: true, force: true });
+    try {
+      await rm(target, { recursive: true });
+    } catch (error) {
+      if (isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR')) return;
+      throw error;
+    }
     removed.push(label);
   };
   const env = path.join(root, '.env');
@@ -268,7 +270,13 @@ export async function removeStrayInstall(
     await remove(path.join(root, entry), entry);
   }
   const logs = path.join(root, 'logs');
-  const logEntries = (await exists(logs)) ? (await readdir(logs)).filter((entry) => entry !== OWN_LOG) : [];
+  const logEntries = await readdir(logs).then(
+    (entries) => entries.filter((entry) => entry !== OWN_LOG),
+    (error: unknown) => {
+      if (isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR')) return [];
+      throw error;
+    },
+  );
   for (const entry of logEntries) await rm(path.join(logs, entry), { recursive: true, force: true });
   if (logEntries.length > 0) removed.push("NanoClaw's logs");
   // NanoClaw's setup links `ncl` to its checkout; a link to any other install stays.

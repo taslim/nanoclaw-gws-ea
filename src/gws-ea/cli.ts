@@ -982,11 +982,12 @@ class Cli {
     try {
       const confirm = updateConfirmation(yes, this.#runtime.confirmUpdateAll);
       const launcher = this.#updateLauncher();
+      const reporter: StepReporter = { emit: (event) => this.#presenter.event(event) };
       // Once for the run, not per assistant: every turn shares the tool checkout.
-      await this.#cleanStrayInstall({ emit: (event) => this.#presenter.event(event) });
+      await this.#cleanStrayInstall(reporter);
       const { releaseMigrations } = this.#runtime;
       const plan = await runStep(
-        { emit: (event) => this.#presenter.event(event) },
+        reporter,
         { id: 'check_assistants', label: 'Checking which assistants can be updated…' },
         async () =>
           planUpdateAll({

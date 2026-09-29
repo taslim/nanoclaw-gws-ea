@@ -241,6 +241,7 @@ export async function main(argv: readonly string[], options: { readonly interact
     collectGwsEaCreateInput(context, { providers, interactive });
   const hostStatus = await loadHostStatus();
   const providerSetup = toolProviderSetup(providers);
+  const checkout = toolCheckout();
   if (!interactive) {
     return runCli(argv, {
       collectCreateInputs,
@@ -248,7 +249,7 @@ export async function main(argv: readonly string[], options: { readonly interact
       hostStatus,
       serviceHelpers,
       toolProviderSetup: providerSetup,
-      toolCheckout: toolCheckout(),
+      toolCheckout: checkout,
     });
   }
   return runCli(argv, {
@@ -256,7 +257,7 @@ export async function main(argv: readonly string[], options: { readonly interact
     hostStatus,
     serviceHelpers,
     toolProviderSetup: providerSetup,
-    toolCheckout: toolCheckout(),
+    toolCheckout: checkout,
     presenter: createTerminalPresenter(),
     prompts: terminalPrompts(providers),
     collectCreateInputs,

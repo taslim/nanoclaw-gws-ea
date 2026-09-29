@@ -704,6 +704,14 @@ const STOPPED_CHECKS = 10;
 /** `launchctl print` exits with this, and only this, when the job is not loaded. */
 const LAUNCHD_JOB_NOT_FOUND = 113;
 
+/** The tags in `repository` that `docker image ls --format {{.Repository}}:{{.Tag}} <repository>` lists. */
+export function repositoryTags(listing: string, repository: string): string[] {
+  return listing
+    .split(/\r?\n/u)
+    .map((reference) => reference.trim())
+    .filter((reference) => reference.startsWith(`${repository}:`) && reference !== `${repository}:<none>`);
+}
+
 /** The NanoClaw install a teardown removes: an assistant's, or a stray one in the gws-ea tool checkout. */
 export type NanoclawInstall = Omit<ServiceControlTarget, 'instanceId'>;
 
@@ -858,10 +866,10 @@ export async function uninstallNanoclaw(install: NanoclawInstall, teardown: Nano
   // named, so the OneCLI, gateway, and connector images assistants share stay too (KTD19).
   const repository = getInstallScopedNames(installId).containerImageBase;
   const tagged = async (): Promise<string[]> =>
-    (await checked('docker', ['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}', repository], tools))
-      .split(/\r?\n/u)
-      .map((reference) => reference.trim())
-      .filter((reference) => reference.startsWith(`${repository}:`) && reference !== `${repository}:<none>`);
+    repositoryTags(
+      await checked('docker', ['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}', repository], tools),
+      repository,
+    );
   const references = await tagged();
   if (references.length > 0) {
     await checked('docker', ['image', 'rm', ...references], tools);
