@@ -36,6 +36,7 @@ function typescriptNames(installId?: string) {
 describe('install-slug.sh', () => {
   it.each([
     ['derived from the checkout path', undefined],
+    ['derived from the checkout path when NANOCLAW_INSTALL_ID is empty, as if unset', ''],
     ['NANOCLAW_INSTALL_ID, as a gws-ea assistant sets it', '0123456789abcdef0123456789abcdef'],
     ['a NANOCLAW_INSTALL_ID with every allowed character', 'prod-eks_1'],
   ])('names what src/install-slug.ts names for a slug %s', (_label, installId) => {

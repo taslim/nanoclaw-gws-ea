@@ -308,21 +308,33 @@ describe('an explicit install slug', () => {
   it('detects the launchd job named for the slug, over this process NANOCLAW_INSTALL_ID', () => {
     vi.stubEnv('NANOCLAW_INSTALL_ID', 'another-install');
     const root = temp();
-    const name = `com.nanoclaw-v2-${SLUG}`;
     const { env, calls, home } = makeEnv('darwin');
-    const plist = path.join(home, 'Library', 'LaunchAgents', `${name}.plist`);
-    fs.mkdirSync(path.dirname(plist), { recursive: true });
-    fs.writeFileSync(plist, '<plist/>\n');
+    // Both jobs are installed: the named install's, and the one this process's NANOCLAW_INSTALL_ID names.
+    const plist = (label: string): string => {
+      const file = path.join(home, 'Library', 'LaunchAgents', `${label}.plist`);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, '<plist/>\n');
+      return file;
+    };
+    const name = `com.nanoclaw-v2-${SLUG}`;
+    const definition = plist(name);
+    const ambient = 'com.nanoclaw-v2-another-install';
+    const ambientDefinition = plist(ambient);
 
     expect(detectService(root, { ...env, installSlug: SLUG })).toEqual({
       mode: 'launchd',
       name,
-      definition: plist,
+      definition,
       active: true,
     });
     expect(calls).toEqual([`launchctl print gui/1000/${name}`]);
-    // Without it, detection keeps today's derivation and finds nothing of this install's.
-    expect(detectService(root, env)).toMatchObject({ mode: 'none' });
+    // Without it, detection keeps today's derivation, which honors NANOCLAW_INSTALL_ID.
+    expect(detectService(root, env)).toEqual({
+      mode: 'launchd',
+      name: ambient,
+      definition: ambientDefinition,
+      active: true,
+    });
   });
 
   it('detects the systemd user unit named for the slug', () => {

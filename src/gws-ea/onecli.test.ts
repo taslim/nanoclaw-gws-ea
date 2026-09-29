@@ -452,7 +452,7 @@ describe('OneCLI runtime observation', () => {
     });
   });
 
-  it('finds a running runtime without its Compose file absent, so it is set up again', async () => {
+  it('reports a running runtime whose Compose file is missing as absent, so it is set up again', async () => {
     const layout = await layoutFixture();
     const { runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
 
@@ -928,6 +928,22 @@ describe("an update's gateway image", () => {
     });
     expect(composeCalls(world)).toEqual([]);
     expect(await readFile(layout.composeFile, 'utf8')).toBe(written);
+  });
+
+  it('refuses to restore a kept Compose file whose gateway is not a gws-ea wrapper image, changing nothing', async () => {
+    const layout = await layoutFixture();
+    const written = await writeInstanceCompose(layout, GATEWAY_IMAGE);
+    // The pinned OneCLI base itself, without the egress firewall the wrapper adds.
+    const unwrapped = `ghcr.io/onecli/onecli:${PINS.gateway}`;
+    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
+
+    await expect(
+      restoreReleaseGateway(layout, PINS, renderOnecliCompose(layout, PINS, unwrapped), {
+        dockerCommandRunner: runner,
+      }),
+    ).rejects.toMatchObject({ code: 'unsafe_onecli_image', message: expect.stringContaining(unwrapped) });
+    expect(await readFile(layout.composeFile, 'utf8')).toBe(written);
+    expect(composeCalls(world)).toEqual([]);
   });
 
   it('touches Docker not at all when the release runs the gateway the assistant already runs', async () => {

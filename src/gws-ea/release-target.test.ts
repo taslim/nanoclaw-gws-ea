@@ -6,7 +6,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { reserveInstance } from './journal.js';
-import { createOnecliRuntimeLayout, renderOnecliCompose } from './onecli-compose.js';
+import { createOnecliRuntimeLayout, ONECLI_POSTGRES_IMAGE, renderOnecliCompose } from './onecli-compose.js';
 import { wrapperImageTag } from './onecli-gateway-image.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { ONECLI_CLI_VERSION, ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './pins.js';
@@ -103,6 +103,7 @@ async function controlPlanePaths(): Promise<ControlPlanePaths> {
 
 interface AssistantRecord {
   readonly onecli?: { readonly gateway: string; readonly cli: string; readonly sdk: string };
+  readonly postgresImage?: string;
   readonly providerCredential?: ProviderCredentialMetadata;
 }
 
@@ -165,9 +166,12 @@ async function deployedAssistant(
     { mode: 0o600 },
   );
   await mkdir(onecli.rootDirectory, { recursive: true, mode: 0o700 });
-  await writeFile(onecli.composeFile, renderOnecliCompose(onecli, cohort, wrapperImageTag('0'.repeat(16))), {
-    mode: 0o600,
-  });
+  const compose = renderOnecliCompose(onecli, cohort, wrapperImageTag('0'.repeat(16)));
+  await writeFile(
+    onecli.composeFile,
+    record.postgresImage ? compose.replaceAll(ONECLI_POSTGRES_IMAGE, record.postgresImage) : compose,
+    { mode: 0o600 },
+  );
   return reserved;
 }
 
@@ -218,6 +222,26 @@ describe('the release create and update deploy', () => {
       message: expect.stringContaining('release track dogfood'),
       details: { track: 'dogfood', commit: side },
     });
+  });
+
+  it('refuses a commit off the track even where Git fetches it on demand, as Git before 2.44 does', async () => {
+    const dogfood = await releaseRepository(TRACK_BRANCH);
+    const side = await push(dogfood, 'side.txt', 'side');
+    const tool = await toolClone(dogfood.remote, side);
+    // Older Git ignores GIT_NO_LAZY_FETCH: the blob-less history fetches the side commit when asked about it,
+    // so only its ancestry keeps it off the track.
+    const olderGit: SanitizedCommandRunner = async (spec) => {
+      const env = { ...spec.env };
+      delete env.GIT_NO_LAZY_FETCH;
+      return runSanitizedCommand({ ...spec, env });
+    };
+
+    await expect(
+      resolveReleaseTarget(
+        { track: 'dogfood', source: trackSource(dogfood.remote) },
+        { toolRoot: tool, runCommand: olderGit },
+      ),
+    ).rejects.toMatchObject({ code: 'release_not_on_track', details: { track: 'dogfood', commit: side } });
   });
 
   it('refuses a tool checkout with tracked changes, naming the files, before fetching the track', async () => {
@@ -367,6 +391,7 @@ describe('the release an update deploys', () => {
       CREDENTIAL,
       'onecli_version_changed',
     ],
+    ['Postgres image', { postgresImage: 'postgres:17-alpine' }, CREDENTIAL, 'postgres_version_changed'],
     [
       "provider's credential metadata",
       {},

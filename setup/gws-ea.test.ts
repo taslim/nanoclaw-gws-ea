@@ -102,6 +102,24 @@ function expectUpstreamServiceHelpers(runtime: CliRuntime): void {
   });
 }
 
+/**
+ * What the driver gives every run, attended or not: upstream's `.env`, host
+ * readiness, and service helpers unchanged, and this tool's provider setup,
+ * without which every update stops before it starts.
+ */
+async function expectSharedWiring(runtime: CliRuntime): Promise<void> {
+  expect(runtime.upsertEnvVars).toBe(upsertEnvVars);
+  expect(runtime.hostStatus?.queryHost).toBe(hostStatus.queryHost);
+  expect(runtime.hostStatus?.waitForHost).toBe(hostStatus.waitForHost);
+  expectUpstreamServiceHelpers(runtime);
+  const setup = await runtime.toolProviderSetup!();
+  expect(setup.credentialMetadata('claude')).toEqual({
+    name: 'Anthropic',
+    type: 'anthropic',
+    hostPattern: 'api.anthropic.com',
+  });
+}
+
 function report(overrides: Partial<FailureReport> = {}): FailureReport {
   return {
     command: 'resume',
@@ -131,10 +149,7 @@ describe('GWS-EA driver', () => {
     expect(runtime.onFailure).toBeUndefined();
     expect(runtime.checkPrerequisites).toBeUndefined();
     expect(runtime.confirmRemoval).toBeUndefined();
-    expect(runtime.upsertEnvVars).toBe(upsertEnvVars);
-    expect(runtime.hostStatus?.queryHost).toBe(hostStatus.queryHost);
-    expect(runtime.hostStatus?.waitForHost).toBe(hostStatus.waitForHost);
-    expectUpstreamServiceHelpers(runtime);
+    await expectSharedWiring(runtime);
     await runtime.collectCreateInputs!({ marker: 'context' } as never);
     expect(fixture.collect).toHaveBeenCalledWith(
       { marker: 'context' },
@@ -158,9 +173,7 @@ describe('GWS-EA driver', () => {
     const runtime = runtimeOf();
 
     expect(runtime.presenter).toBeDefined();
-    expect(runtime.upsertEnvVars).toBe(upsertEnvVars);
-    expect(runtime.hostStatus?.waitForHost).toBe(hostStatus.waitForHost);
-    expectUpstreamServiceHelpers(runtime);
+    await expectSharedWiring(runtime);
     await runtime.collectCreateInputs!({ marker: 'context' } as never);
     expect(fixture.collect).toHaveBeenCalledWith(
       { marker: 'context' },
@@ -218,13 +231,19 @@ describe('GWS-EA driver', () => {
     await expect(onFailure!(report())).resolves.toBe('stop');
   });
 
-  it.each(['start', 'stop', 'restart'] as const)(
+  it.each([
+    ['start', 'start'],
+    ['stop', 'stop'],
+    ['restart', 'restart'],
+    ['update', 'stage_release'],
+    ['rollback', 'verify_release'],
+  ] as const)(
     'offers to run a failed %s again, since only create and resume continue from where they stopped',
-    async (command) => {
+    async (command, step) => {
       await main([command, '--id', 'x'], { interactive: true });
       const { onFailure } = runtimeOf();
 
-      await onFailure!(report({ command, step: command, nextAction: `Retry with: gws-ea ${command} --id x` }));
+      await onFailure!(report({ command, step, nextAction: `Retry with: gws-ea ${command} --id x` }));
 
       expect(fixture.confirm).toHaveBeenCalledExactlyOnceWith({
         message: `Retry now? gws-ea runs ${command} again.`,
@@ -268,17 +287,6 @@ describe('GWS-EA driver', () => {
     });
   });
 
-  it('offers to run a failed rollback again', async () => {
-    await main(['rollback', '--id', 'x'], { interactive: true });
-
-    await runtimeOf().onFailure!(report({ command: 'rollback', step: 'verify_release' }));
-
-    expect(fixture.confirm).toHaveBeenCalledExactlyOnceWith({
-      message: 'Retry now? gws-ea runs rollback again.',
-      initialValue: true,
-    });
-  });
-
   it('asks before an update on a TTY, naming the assistant and its new release, defaulting to wait', async () => {
     await main(['update', '--id', 'x'], { interactive: true });
     fixture.confirm.mockResolvedValueOnce(false);
@@ -289,17 +297,6 @@ describe('GWS-EA driver', () => {
     expect(fixture.confirm).toHaveBeenCalledExactlyOnceWith({
       message: `Update assistant x to dogfood ${'b'.repeat(12)}?`,
       initialValue: false,
-    });
-  });
-
-  it('offers to run a failed update again', async () => {
-    await main(['update', '--id', 'x'], { interactive: true });
-
-    await runtimeOf().onFailure!(report({ command: 'update', step: 'stage_release' }));
-
-    expect(fixture.confirm).toHaveBeenCalledExactlyOnceWith({
-      message: 'Retry now? gws-ea runs update again.',
-      initialValue: true,
     });
   });
 

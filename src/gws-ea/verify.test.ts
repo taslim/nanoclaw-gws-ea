@@ -6,7 +6,7 @@
  * as the router does. Only the container's own write — an assistant reply in
  * `outbound.db` — is inserted directly, into the schema NanoClaw created.
  */
-import { mkdir, mkdtemp, readdir, realpath, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -478,15 +478,46 @@ describe('read-only observation', () => {
     expect(readLatestDelivery(checkout)).toBeUndefined();
   });
 
-  it('reads the applied migrations and every session table', () => {
+  it('reads the applied migrations and every session table, merging its columns across sessions', async () => {
+    // A session sorting before the router's, left by a release whose `messages_in` has a column this one lacks,
+    // and an AUTOINCREMENT table, which makes SQLite add its internal `sqlite_sequence`.
+    const older = path.join(checkout, 'data', 'v2-sessions', MAIN, '0-older-session', 'inbound.db');
+    await mkdir(path.dirname(older));
+    const seeded = new Database(older);
+    try {
+      seeded.exec(`
+        CREATE TABLE messages_in (id TEXT PRIMARY KEY, routed_by TEXT);
+        CREATE TABLE deliveries (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT);
+        INSERT INTO deliveries (label) VALUES ('first');
+      `);
+      expect(
+        seeded.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'").get(),
+      ).toEqual({ name: 'sqlite_sequence' });
+    } finally {
+      seeded.close();
+    }
+    const routers = path.join(checkout, 'data', 'v2-sessions', MAIN, sessionId, 'inbound.db');
+    const columnsOf = (file: string, table: string): string[] => {
+      const session = new Database(file, { readonly: true });
+      try {
+        return (session.prepare('SELECT name FROM pragma_table_info(?)').all(table) as Array<{ name: string }>).map(
+          (column) => column.name,
+        );
+      } finally {
+        session.close();
+      }
+    };
+    const merged = [...new Set([older, routers].flatMap((file) => columnsOf(file, 'messages_in')))].sort();
+    expect(merged).toEqual(expect.arrayContaining(['routed_by', 'platform_id']));
+
     const manifest = readSchemaManifest(checkout);
 
     expect(manifest.central_migrations).toEqual(
       expect.arrayContaining(['host-coordination', 'module:gws-ea-profile:create-profile']),
     );
-    expect(manifest.session_tables['inbound.messages_in']).toEqual(
-      expect.arrayContaining(['id', 'kind', 'timestamp', 'platform_id']),
-    );
+    expect(manifest.session_tables['inbound.messages_in']).toEqual(merged);
+    expect(manifest.session_tables['inbound.deliveries']).toEqual(['id', 'label']);
+    expect(Object.keys(manifest.session_tables).filter((table) => /^\w+\.sqlite_/u.test(table))).toEqual([]);
     expect(manifest.session_tables['inbound.delivered']).toEqual(
       expect.arrayContaining(['message_out_id', 'status', 'delivered_at']),
     );
@@ -500,6 +531,9 @@ describe('read-only observation', () => {
     const before = (await readdir(data)).sort();
     expect(before).toContain('v2.db');
     expect(before).not.toContain('v2.db-wal');
+    // The header's write and read versions (bytes 18 and 19) are 2 only for a WAL database.
+    const header = await readFile(path.join(data, 'v2.db'));
+    expect([header[18], header[19]]).toEqual([2, 2]);
 
     expect(readSchemaManifest(checkout).central_migrations).toContain('host-coordination');
     expect(readLatestDelivery(checkout)).toMatchObject({ last: { messageOutId: 'out-welcome' } });

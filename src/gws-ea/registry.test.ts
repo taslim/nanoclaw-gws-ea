@@ -640,6 +640,39 @@ describe('release compare-and-swap and live checkout agreement', () => {
     expect(await readFile(paths.registryFile, 'utf8')).toBe(before);
   });
 
+  it.each([
+    ['commit', { deployed_commit: 'c'.repeat(40) }],
+    ['track', { release_track: 'prod' }],
+    ['source', { source_remote: 'https://example.test/fork.git' }],
+  ])('refuses a swap from a release that differs from the recorded one only in its %s', async (_field, change) => {
+    const paths = await testPaths();
+    const input = reservation(paths);
+    await reserveInstance(paths, input);
+    const before = await readFile(paths.registryFile, 'utf8');
+
+    await expect(
+      swapInstanceRelease(paths, input.instance_id, { ...releaseOf(input), ...change }, target),
+    ).rejects.toMatchObject({ code: 'reservation_mismatch' });
+    expect(await readFile(paths.registryFile, 'utf8')).toBe(before);
+  });
+
+  it("commits two assistants' concurrent swaps, neither overwriting the other's", async () => {
+    const paths = await testPaths();
+    const first = reservation(paths);
+    const second = distinctManagedReservation(paths);
+    await reserveInstance(paths, first);
+    await reserveInstance(paths, second);
+
+    await Promise.all([
+      swapInstanceRelease(paths, first.instance_id, releaseOf(first), target),
+      swapInstanceRelease(paths, second.instance_id, releaseOf(second), target),
+    ]);
+
+    const after = await readRegistry(paths);
+    expect(after.instances[first.instance_id]).toEqual({ ...first, ...target });
+    expect(after.instances[second.instance_id]).toEqual({ ...second, ...target });
+  });
+
   it('accepts the live marker at the commits an unfinished operation allows, and any commit only when told to', async () => {
     const paths = await testPaths();
     const input = reservation(paths);
