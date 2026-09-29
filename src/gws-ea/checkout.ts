@@ -24,11 +24,14 @@ import {
   GwsEaError,
   INSTANCE_MARKER_SCHEMA_VERSION,
   sameRelease,
+  shortCommit,
   type InstanceMarker,
   type InstanceReservation,
 } from './types.js';
 
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
+/** A Git object ID, in a SHA-1 or a SHA-256 repository. */
+const OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 export interface ResolvedRelease {
   sourceRemote: string;
@@ -134,17 +137,18 @@ async function withScratchEnvironments<T>(
 }
 
 /**
- * The files a checkout's tracked tree differs in. Untracked files belong to no
- * release, and Git takes no optional lock, so its index is never rewritten.
+ * The paths `git status` reports for a checkout, narrowed by `options`. Git
+ * takes no optional lock, so its index is never rewritten.
  */
-async function trackedChanges(
+async function statusPaths(
   checkoutRoot: string,
   run: SanitizedCommandRunner,
   environment: Readonly<Record<string, string>>,
+  options: readonly string[],
 ): Promise<string[]> {
   const { stdout } = await run({
     command: 'git',
-    args: ['--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=no'],
+    args: ['--no-optional-locks', 'status', '--porcelain=v1', ...options],
     cwd: checkoutRoot,
     env: environment,
   });
@@ -152,6 +156,15 @@ async function trackedChanges(
     .split('\n')
     .filter(Boolean)
     .map((line) => line.slice(3));
+}
+
+/** The files a checkout's tracked tree differs in. Untracked files belong to no release. */
+function trackedChanges(
+  checkoutRoot: string,
+  run: SanitizedCommandRunner,
+  environment: Readonly<Record<string, string>>,
+): Promise<string[]> {
+  return statusPaths(checkoutRoot, run, environment, ['--untracked-files=no']);
 }
 
 /** The tool's own commit, read in its checkout; see `resolveToolCommit`. */
@@ -194,6 +207,60 @@ async function readToolCommit(
 export async function resolveToolCommit(toolRoot: string, runtime: CheckoutRuntime = {}): Promise<string> {
   const run = runtime.runCommand ?? runSanitizedCommand;
   return withScratchEnvironments('gws-ea-tool-', ({ git: environment }) => readToolCommit(toolRoot, run, environment));
+}
+
+/**
+ * The ID of the Git tree `directory` holds at `commit`, read from the
+ * repository at `root`: its own objects only, nothing fetched even lazily,
+ * and no operator configuration read. The ID names the directory's committed
+ * content exactly, whatever the working tree holds.
+ */
+export async function committedTree(
+  root: string,
+  commit: string,
+  directory: string,
+  runtime: CheckoutRuntime = {},
+): Promise<string> {
+  const release = validateCommit(commit);
+  const run = runtime.runCommand ?? runSanitizedCommand;
+  return withScratchEnvironments('gws-ea-tree-', async ({ git: environment }) => {
+    const { stdout } = await run({
+      command: 'git',
+      args: ['ls-tree', '--full-tree', release, '--', directory],
+      cwd: root,
+      env: { ...environment, GIT_NO_LAZY_FETCH: '1' },
+    });
+    const entry = stdout.replace(/\n$/u, '');
+    if (!entry) {
+      throw new GwsEaError('incomplete_release', `Release ${shortCommit(release)} holds no ${directory}/ directory`);
+    }
+    const [mode, type, tree, ...rest] = entry.split(/[ \t]/u);
+    if (mode !== '040000' || type !== 'tree' || tree === undefined || !OBJECT_ID_PATTERN.test(tree)) {
+      throw new GwsEaError('invalid_child_output', `Git reported no tree for ${directory}/ in ${shortCommit(release)}`);
+    }
+    if (rest.join(' ') !== directory) {
+      throw new GwsEaError(
+        'invalid_child_output',
+        `Git reported another entry than ${directory}/ in ${shortCommit(release)}`,
+      );
+    }
+    return tree;
+  });
+}
+
+/**
+ * The paths under `directory` where a checkout's working tree differs from
+ * its HEAD: tracked changes, and untracked files Git does not ignore.
+ */
+export async function workingTreeChanges(
+  root: string,
+  directory: string,
+  runtime: CheckoutRuntime = {},
+): Promise<string[]> {
+  const run = runtime.runCommand ?? runSanitizedCommand;
+  return withScratchEnvironments('gws-ea-tree-', ({ git: environment }) =>
+    statusPaths(root, run, environment, ['--untracked-files=all', '--', directory]),
+  );
 }
 
 /** Where an assistant's deployed commit stands against the tool's own release. */

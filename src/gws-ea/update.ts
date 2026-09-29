@@ -4,8 +4,10 @@
  * beside the live checkout (KTD1): fetched, installed, built, and preflighted
  * in `<instance>/next/nanoclaw` with its receipt under `next/`, its
  * migrations tried on a copy of the live central database (KTD15), its agent
- * image built as `<base>:next` (KTD7), and its gateway image built when the
- * release changes it (KTD8). The preview then says what the cutover will
+ * image tagged `<base>:next` (KTD7) — the image another assistant already
+ * built from the same content when there is one, else built and labeled with
+ * its content key (see `agent-image.ts`) — and its gateway image built when
+ * the release changes it (KTD8). The preview then says what the cutover will
  * change.
  *
  * Nothing live changes before the operator confirms. A decline or a staging
@@ -27,15 +29,26 @@ import { isErrno } from '../community-portal/errors.js';
 import { writePrivate } from '../community-portal/private-file.js';
 import { getInstallScopedNames } from '../install-slug.js';
 import {
+  agentImageKey,
+  findSharedAgentImage,
+  provideSharedAgentImage,
+  readAgentImageInputs,
+  type AgentImageInputs,
+} from './agent-image.js';
+import {
   assertDeploymentCheckoutUnmodified,
   materializeReleaseCheckout,
   prepareReleaseCommandEnvironments,
   resolveToolCommit,
+  workingTreeChanges,
   type CheckoutRuntime,
 } from './checkout.js';
 import {
   assertCarriable,
   assertCheckoutQuiet,
+  assistantImageDocker,
+  BUILDING_AGENT_IMAGE_TAG,
+  buildingAgentImage,
   carryState,
   cutoverDocker,
   cutoverOnecli,
@@ -45,6 +58,7 @@ import {
   finishFollowUps,
   finishSwap,
   imageIdOf,
+  moveRecordedImages,
   keepCutoverHostStopped,
   nextAgentImage,
   openCutoverHost,
@@ -366,55 +380,92 @@ function gigabytes(bytes: number): string {
   return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 }
 
+/** The size Docker reports for the agent image the assistant runs. */
+async function agentImageBytes(
+  paths: ControlPlanePaths,
+  runtime: InstanceRuntimeConfig,
+  dependencies: UpdateDependencies,
+): Promise<number> {
+  const { stdout } = await (dependencies.runCommand ?? runSanitizedCommand)({
+    command: 'docker',
+    args: [
+      'image',
+      'inspect',
+      '--format',
+      '{{.Size}}',
+      getInstallScopedNames(runtime.install_id).defaultContainerImage,
+    ],
+    cwd: paths.instanceRoot(runtime.instance_id),
+    env: dockerEnvironment(runtime, dependencies),
+    timeoutMs: DOCKER_TIMEOUT_MS,
+  });
+  const size = Number(stdout.trim());
+  if (!Number.isSafeInteger(size) || size < 0) {
+    throw new GwsEaError('invalid_child_output', 'Docker reported an invalid agent image size');
+  }
+  return size;
+}
+
+/**
+ * Whether the agent image the release would build for this assistant is
+ * already built and shared under its content key, read before anything is
+ * staged: from the tool's checkout, which is the release (R6), and the
+ * assistant's own `.env` flags, which staging copies to the build.
+ */
+async function releaseAgentImageShared(
+  paths: ControlPlanePaths,
+  runtime: InstanceRuntimeConfig,
+  target: UpdateReleaseTarget,
+  dependencies: UpdateDependencies,
+): Promise<boolean> {
+  const inputs = await readAgentImageInputs(
+    {
+      repository: dependencies.toolRoot ?? CONTROL_PLANE_ROOT,
+      commit: target.release.deployed_commit,
+      checkout: runtime.checkout_realpath,
+    },
+    checkoutRuntime(dependencies),
+  );
+  const docker = assistantImageDocker(runtime, dependencies, paths.instanceRoot(runtime.instance_id));
+  return (await findSharedAgentImage(docker, agentImageKey(inputs))) !== undefined;
+}
+
 /**
  * Room for what the update adds before it can delete anything, mirroring the
  * upstream updater's check (KTD14). The live checkout's size stands for the
  * staged release's code, dependencies, and build together with the copy of
  * its state the cutover carries across; its central database's size for the
- * dry run's copy; its agent image's size for the new one. The live checkout
- * is kept whole as the previous release, so it frees nothing. Counted against
- * the instance's filesystem, which also holds Docker's disk where Docker runs
- * in a local VM.
+ * dry run's copy; its agent image's size for the new one, unless the release's
+ * image is already shared under its content key, which staging then tags
+ * without building. The live checkout is kept whole as the previous release,
+ * so it frees nothing. Counted against the instance's filesystem, which also
+ * holds Docker's disk where Docker runs in a local VM.
  */
 async function assertFreeDisk(
   paths: ControlPlanePaths,
   runtime: InstanceRuntimeConfig,
+  target: UpdateReleaseTarget,
   dependencies: UpdateDependencies,
 ): Promise<void> {
-  const run = dependencies.runCommand ?? runSanitizedCommand;
   const database = path.join(runtime.checkout_realpath, 'data', 'v2.db');
+  const shared = await releaseAgentImageShared(paths, runtime, target, dependencies);
   const [checkout, central, journal, image] = await Promise.all([
     treeBytes(runtime.checkout_realpath),
     fileBytes(database),
     fileBytes(`${database}-wal`),
-    run({
-      command: 'docker',
-      args: [
-        'image',
-        'inspect',
-        '--format',
-        '{{.Size}}',
-        getInstallScopedNames(runtime.install_id).defaultContainerImage,
-      ],
-      cwd: paths.instanceRoot(runtime.instance_id),
-      env: dockerEnvironment(runtime, dependencies),
-      timeoutMs: DOCKER_TIMEOUT_MS,
-    }).then(({ stdout }) => {
-      const size = Number(stdout.trim());
-      if (!Number.isSafeInteger(size) || size < 0) {
-        throw new GwsEaError('invalid_child_output', 'Docker reported an invalid agent image size');
-      }
-      return size;
-    }),
+    shared ? 0 : agentImageBytes(paths, runtime, dependencies),
   ]);
   const needed = checkout + central + journal + image + DISK_RESERVE_BYTES;
   const directory = paths.instanceRoot(runtime.instance_id);
   const free = await (dependencies.freeBytes ?? freeBytesAt)(directory);
   if (free >= needed) return;
+  const adds = shared
+    ? "the staged release and a copy of its state (the release's agent image is already built)"
+    : 'the staged release, a copy of its state, and a new agent image';
   throw new GwsEaError(
     'insufficient_disk',
-    `Updating assistant ${runtime.instance_id} needs about ${gigabytes(needed)} free for the staged release, a copy of its state, and a new agent image, and ${gigabytes(free)} is free at ${directory}. Free some space, then retry.`,
-    { details: { needed, free } },
+    `Updating assistant ${runtime.instance_id} needs about ${gigabytes(needed)} free for ${adds}, and ${gigabytes(free)} is free at ${directory}. Free some space, then retry.`,
+    { details: { needed, free, agentImageShared: shared } },
   );
 }
 
@@ -450,7 +501,7 @@ async function checkUpdate(
   }
   assertHostRunning(runtime, dependencies);
   await assertDeploymentCheckoutUnmodified(reservation, checkoutRuntime(dependencies));
-  await assertFreeDisk(paths, runtime, dependencies);
+  await assertFreeDisk(paths, runtime, target, dependencies);
   return { reservation, runtime, target };
 }
 
@@ -575,6 +626,71 @@ async function sameFiles(left: string, right: string, files: readonly string[]):
   return true;
 }
 
+/**
+ * NanoClaw's own `container/build.sh` run on the staged checkout, as the tag
+ * `building`, with the flags `inputs` names. Its build context must be the
+ * release's `container/` tree exactly, the tree its key names, so a checkout
+ * whose `container/` differs from it is refused before anything is built.
+ */
+async function buildReleaseAgentImage(
+  runtime: InstanceRuntimeConfig,
+  checkoutRoot: string,
+  inputs: AgentImageInputs,
+  dependencies: UpdateDependencies,
+): Promise<void> {
+  const run = dependencies.runCommand ?? runSanitizedCommand;
+  const changed = await workingTreeChanges(checkoutRoot, 'container', checkoutRuntime(dependencies));
+  if (changed.length > 0) {
+    throw new GwsEaError(
+      'checkout_drift',
+      `The staged release's container/ differs from the release, so its agent image would not be the one its content key names: ${changed.join(', ')}.`,
+      { details: { files: changed } },
+    );
+  }
+  await run({
+    command: 'bash',
+    args: [path.join(checkoutRoot, 'container', 'build.sh'), BUILDING_AGENT_IMAGE_TAG],
+    cwd: checkoutRoot,
+    env: {
+      ...dockerEnvironment(runtime, dependencies),
+      NANOCLAW_INSTALL_ID: runtime.install_id,
+      // build.sh prefers its caller's value to `.env`'s, so it builds with exactly the flag the key names.
+      INSTALL_CJK_FONTS: String(inputs.installCjkFonts),
+    },
+    timeoutMs: IMAGE_BUILD_TIMEOUT_MS,
+    stream: true,
+  });
+}
+
+/**
+ * Tag the staged release's agent image `:next` (KTD7): the image shared under
+ * its content key, the staged checkout's `container/` tree and the build
+ * flags of the `.env` staging copied beside it, when another assistant (or
+ * this one) already has it; otherwise NanoClaw's own build, labeled with the
+ * key (see `provideSharedAgentImage`).
+ */
+async function prepareReleaseAgentImage(
+  operation: InstanceOperation,
+  runtime: InstanceRuntimeConfig,
+  staged: { readonly checkoutRoot: string; readonly commit: string },
+  dependencies: UpdateDependencies,
+): Promise<void> {
+  const { checkoutRoot, commit } = staged;
+  const inputs = await readAgentImageInputs(
+    { repository: checkoutRoot, commit, checkout: checkoutRoot },
+    checkoutRuntime(dependencies),
+  );
+  await provideSharedAgentImage(
+    assistantImageDocker(runtime, dependencies, operation.paths.instanceRoot(operation.instanceId)),
+    {
+      key: agentImageKey(inputs),
+      target: nextAgentImage(runtime),
+      building: buildingAgentImage(runtime),
+      build: () => buildReleaseAgentImage(runtime, checkoutRoot, inputs, dependencies),
+    },
+  );
+}
+
 /** Stage the checked release in `next/` while the assistant serves, and preview the cutover. */
 async function stageRelease(
   operation: InstanceOperation,
@@ -625,16 +741,14 @@ async function stageRelease(
     },
   );
 
-  await runStep(reporter, { id: 'build_agent_image', label: 'Building the new agent image…' }, async () => {
+  await runStep(reporter, { id: 'build_agent_image', label: 'Preparing the new agent image…' }, async () => {
     await copyInstanceEnvironment(live, staged);
-    await run({
-      command: 'bash',
-      args: [path.join(staged, 'container', 'build.sh'), 'next'],
-      cwd: staged,
-      env: { ...dockerEnvironment(runtime, dependencies), NANOCLAW_INSTALL_ID: runtime.install_id },
-      timeoutMs: IMAGE_BUILD_TIMEOUT_MS,
-      stream: true,
-    });
+    await prepareReleaseAgentImage(
+      operation,
+      runtime,
+      { checkoutRoot: staged, commit: release.deployed_commit },
+      dependencies,
+    );
   });
 
   const gateway = await runStep(reporter, { id: 'prepare_gateway_image', label: 'Preparing the gateway image…' }, () =>
@@ -1070,8 +1184,9 @@ async function swapReleases(cutover: Cutover): Promise<OperationRecord> {
 /**
  * Retag the agent images (KTD7): `:latest` moves to the image staging built
  * and `:previous` to the one the assistant ran. The moves are recorded by ID
- * before they are made, so a retag cut short replays exactly; the image
- * `:previous` named before is deleted once the release is recorded.
+ * before they are made, so a retag cut short replays exactly, and every image
+ * they name is held meanwhile (KTD19); the image `:previous` named before
+ * stays held until it is released once the release is recorded.
  */
 async function moveAgentImages(cutover: Cutover, record: OperationRecord): Promise<OperationRecord> {
   const base = getInstallScopedNames(cutover.runtime.install_id).containerImageBase;
@@ -1102,12 +1217,15 @@ async function moveAgentImages(cutover: Cutover, record: OperationRecord): Promi
       follow_ups: planFollowUps(current.follow_ups, displaced),
     });
   }
-  for (const image of current.images) await cutoverDocker(cutover, ['tag', image.image_id, image.tag]);
-  const latest = current.images.find((image) => image.tag === latestTag);
-  // `:next` now names the image `:latest` does, so removing it only removes the tag.
-  if (latest && (await imageIdOf(cutover, nextTag)) === latest.image_id) {
-    await cutoverDocker(cutover, ['image', 'rm', nextTag]);
-  }
+  const images = current.images;
+  await moveRecordedImages(cutover, images, async () => {
+    for (const image of images) await cutoverDocker(cutover, ['tag', image.image_id, image.tag]);
+    const latest = images.find((image) => image.tag === latestTag);
+    // `:next` now names the image `:latest` does, so removing it only removes the tag.
+    if (latest && (await imageIdOf(cutover, nextTag)) === latest.image_id) {
+      await cutoverDocker(cutover, ['image', 'rm', nextTag]);
+    }
+  });
   return current;
 }
 

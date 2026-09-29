@@ -12,6 +12,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { heldImageTag } from './agent-image.js';
 import { finishFollowUps, restoredReleaseRoot } from './cutover.js';
 import type { RunEvent } from './events.js';
 import {
@@ -26,6 +27,7 @@ import {
   git,
   imageBase,
   imageId,
+  isHold,
   killDuringCutover,
   LIVE_MIGRATIONS,
   machine,
@@ -39,6 +41,7 @@ import {
   PROCEDURE,
   receiptCommit,
   release,
+  releaseAgentImageKey,
   RELEASE_GATEWAY,
   removeTemporaryRoots,
   repositoryImages,
@@ -268,6 +271,8 @@ async function expectRolledBack(
   expect(state.tags.has(`${base}:next`)).toBe(false);
   expect(state.tags.has(`${base}:previous`)).toBe(false);
   expect(repositoryImages(state, base).untagged).toEqual([]);
+  // Nothing is held once the rollback's cleanup released what it displaced.
+  expect([...state.tags.keys()].filter(isHold)).toEqual([]);
   expect(state.running).toBe(true);
   // Status: the previous commit is live, nothing is open, and no rollback is left.
   const observed = await status(host, state, next, runtime);
@@ -747,8 +752,8 @@ describe('after a rollback', GIT_HEAVY, () => {
     const state = world(runtime);
     const base = imageBase(runtime);
     const ran = state.tags.get(`${base}:latest`)!;
-    // Nothing the agent image is built from changed, so the update's build gives back the image the assistant runs.
-    state.cachedBuild = true;
+    // The image the assistant runs already carries the release's key, so the update tags it rather than building.
+    state.labels.set(ran, releaseAgentImageKey(next));
     expect(await cli(host, state, next, runtime).run(['update', '--id', id, '--yes'])).toBe(0);
     expect([state.tags.get(`${base}:latest`), state.tags.get(`${base}:previous`)]).toEqual([ran, ran]);
     state.hangAt = 'untag';
@@ -966,6 +971,7 @@ const KILLS: ReadonlyArray<readonly [string, (state: World) => void, OperationPh
   ["at the swap's first rename", (state) => (state.renameKill = 1), 'swapping'],
   ['between the two checkout renames', (state) => (state.renameKill = 2), 'swapping'],
   ["before the kept release's files leave previous/", (state) => (state.renameKill = 4), 'swapping'],
+  ['after the swap, while holding the images it moves', (state) => (state.hangAt = 'hold'), 'swapped'],
   ['after the swap, while moving images', (state) => (state.hangAt = 'retag'), 'swapped'],
   ['after the start, while verifying', (state) => (state.hangAt = 'verify'), 'started'],
   ['once recorded, while rebuilding group images', (state) => (state.hangAt = 'rebuild'), 'recorded'],
@@ -1378,8 +1384,10 @@ describe('a rollback of an update whose follow-ups are pending', GIT_HEAVY, () =
     state.rebuildFails = true;
     expect(await cli(host, state, second, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
     const record = await readOperationRecord(host.paths, runtime.instance_id);
-    // The image the second update displaced from `:previous` is tagged nowhere: only its record names it.
-    expect(repositoryImages(state, base).untagged).toEqual([oldest]);
+    // The image the second update displaced from `:previous` is held, under a tag of the assistant's own, until its
+    // record's cleanup releases it.
+    expect(state.tags.get(heldImageTag(base, oldest))).toBe(oldest);
+    expect([...state.tags.keys()].filter(isHold)).toEqual([heldImageTag(base, oldest)]);
     expect(record?.follow_ups).toContainEqual({ kind: 'delete_image', image_id: oldest });
     // Its cleanup never ran, so the release it set aside at its swap is still kept beside the previous one.
     expect(await exists(host.paths.releaseRoot(runtime.instance_id, 'superseded'))).toBe(true);
@@ -1397,6 +1405,7 @@ describe('a rollback of an update whose follow-ups are pending', GIT_HEAVY, () =
     expect(commitOf(runtime.checkout_realpath)).toBe(first.commit);
     expect(await readOperationRecord(host.paths, id)).toBeUndefined();
     expect(repositoryImages(state, imageBase(runtime)).untagged).toEqual([]);
+    expect([...state.tags.keys()].filter(isHold)).toEqual([]);
     expect(await exists(host.paths.releaseRoot(id, 'superseded'))).toBe(false);
   });
 
@@ -1420,6 +1429,7 @@ describe('a rollback of an update whose follow-ups are pending', GIT_HEAVY, () =
     expect(commitOf(runtime.checkout_realpath)).toBe(second.commit);
     expect(state.ids.has(oldest)).toBe(false);
     expect(repositoryImages(state, imageBase(runtime)).untagged).toEqual([]);
+    expect([...state.tags.keys()].filter(isHold)).toEqual([]);
   });
 });
 
@@ -1463,6 +1473,31 @@ describe('rollback isolation (AE3)', GIT_HEAVY, () => {
     expect(await snapshot(host.paths.instanceRoot(b.instance_id))).toEqual(bFiles);
     expect(state.tags.get(`${imageBase(b)}:latest`)).toBe(bLatest);
     expect(state.tags.get(`${imageBase(b)}:previous`)).toBe(bLatest);
+  });
+
+  it('keeps the agent image another assistant runs when one of two sharing it rolls back', async () => {
+    const host = await machine();
+    const b = await assistant(host, 37_101);
+    const { runtime: a, next, state, images } = await updatedAssistant({}, 37_001, host);
+    for (const tag of [`${imageBase(b)}:latest`, `${imageBase(b)}:ag-research`]) {
+      const id = imageId();
+      state.tags.set(tag, id);
+      state.ids.add(id);
+    }
+    // B, updated to the same release, runs the image A's update built, under its own tags.
+    expect(await cli(host, state, next, b).run(['update', '--id', b.instance_id, '--yes'])).toBe(0);
+    expect(state.tags.get(`${imageBase(b)}:latest`)).toBe(images.next);
+
+    expect(await cli(host, state, next, a).run(['rollback', '--id', a.instance_id, '--yes'])).toBe(0);
+
+    // A runs its first image again and keeps no tag on the shared one, which B still runs, whole.
+    expect(state.tags.get(`${imageBase(a)}:latest`)).toBe(images.first);
+    expect([...state.tags].filter(([, id]) => id === images.next).map(([tag]) => tag)).toEqual([
+      `${imageBase(b)}:latest`,
+    ]);
+    expect(state.ids.has(images.next)).toBe(true);
+    expect(state.labels.get(images.next)).toBe(releaseAgentImageKey(next));
+    expect(repositoryImages(state, imageBase(a)).untagged).toEqual([]);
   });
 });
 

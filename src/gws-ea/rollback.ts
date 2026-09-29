@@ -48,6 +48,7 @@ import {
   finishRollbackSwap,
   finishSwap,
   imageIdOf,
+  moveRecordedImages,
   keepCutoverHostStopped,
   leftoverPreviousTag,
   nextAgentImage,
@@ -801,7 +802,7 @@ async function abandonPreparation(rollback: Rollback): Promise<void> {
 
 /**
  * The follow-ups a rollback runs once recorded (KTD2): the images its retag
- * displaced, deleted by ID; and for a rollback of the recorded release, the
+ * displaced, released by ID; and for a rollback of the recorded release, the
  * per-group images rebuilt on the restored base with those they displace, a
  * previous release an update set aside and never deleted, and in code-only
  * mode the reversal of the update's restamp of main's template, when the kept
@@ -977,19 +978,22 @@ async function restoreReleaseFiles(rollback: Rollback, keptRoot: string, release
 /**
  * `swapped` → `started`: stop any host the OS started meanwhile; drop an
  * unrecorded update's `:next` tag, then move each agent image tag to the
- * image the restored release ran (recorded by ID before the rollback began);
- * put back its gateway and service definition; start the host.
+ * image the restored release ran (recorded by ID before the rollback began),
+ * every image the moves name held meanwhile (KTD19); put back its gateway and
+ * service definition; start the host.
  */
 async function startRestored(rollback: Rollback, record: OperationRecord): Promise<OperationRecord> {
   await keepCutoverHostStopped(rollback);
-  await runStep(rollback.reporter, { id: 'move_images', label: "Moving the assistant's images back…" }, async () => {
-    const next = nextAgentImage(rollback.runtime);
-    // Removed before the moves, while `:latest` may still name its image, so the image itself is deleted only by ID.
-    if (rollback.releases.restoreSetAside && (await imageIdOf(rollback, next))) {
-      await cutoverDocker(rollback, ['image', 'rm', next]);
-    }
-    for (const image of record.images) await cutoverDocker(rollback, ['tag', image.image_id, image.tag]);
-  });
+  await runStep(rollback.reporter, { id: 'move_images', label: "Moving the assistant's images back…" }, () =>
+    moveRecordedImages(rollback, record.images, async () => {
+      const next = nextAgentImage(rollback.runtime);
+      // Held already, so removing the tag never deletes the image the update built: its follow-up releases it.
+      if (rollback.releases.restoreSetAside && (await imageIdOf(rollback, next))) {
+        await cutoverDocker(rollback, ['image', 'rm', next]);
+      }
+      for (const image of record.images) await cutoverDocker(rollback, ['tag', image.image_id, image.tag]);
+    }),
+  );
   await restoreReleaseFiles(rollback, rollback.places.restored, rollback.to);
   await runStep(rollback.reporter, { id: 'start_release', label: 'Starting the previous release…' }, () =>
     rollback.service.start(),
@@ -1049,11 +1053,13 @@ async function returnToLeft(rollback: Rollback, record: OperationRecord): Promis
   await runStep(rollback.reporter, { id: 'return', label: 'Going back to the release it left…' }, async () => {
     const live = (await exists(places.live)) ? places.live : places.outgoingCheckout;
     await assertCheckoutQuiet(quietCheckoutOf(rollback, live), cutoverQuiescence(rollback));
-    for (const image of record.images) {
-      if (image.displaced_image_id !== null) {
-        await cutoverDocker(rollback, ['tag', image.displaced_image_id, image.tag]);
+    await moveRecordedImages(rollback, record.images, async () => {
+      for (const image of record.images) {
+        if (image.displaced_image_id !== null) {
+          await cutoverDocker(rollback, ['tag', image.displaced_image_id, image.tag]);
+        }
       }
-    }
+    });
     await reverseRollbackSwap(
       operation.paths,
       operation.instanceId,

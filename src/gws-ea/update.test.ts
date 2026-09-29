@@ -36,6 +36,7 @@ import {
   imageBase,
   imageId,
   installLabel,
+  isHold,
   killDuringCutover,
   LIVE_MIGRATIONS,
   liveState,
@@ -54,6 +55,7 @@ import {
   PROVIDER_SETUP,
   receiptCommit,
   release,
+  releaseAgentImageKey,
   RELEASE_GATEWAY,
   removeTemporaryRoots,
   repositoryImages,
@@ -70,6 +72,7 @@ import {
   type Release,
   type World,
 } from './testing/cutover-fixture.js';
+import { heldImageTag } from './agent-image.js';
 import { readKeptReleaseManifest } from './kept-release.js';
 import { acquireInstanceOperation } from './journal.js';
 import {
@@ -203,17 +206,27 @@ describe('staging an update while the assistant serves', GIT_HEAVY, () => {
       deployed_commit: next.commit,
       provider: 'claude',
     });
-    // The agent image was built from the staged checkout as :next, with the instance's own .env and identity.
+    // No image carried the release's key, so NanoClaw's build made one from the staged checkout, with the
+    // instance's own .env and identity, and gws-ea labeled it with the key as :next, adding no layer.
     expect(await readFile(path.join(checkout, '.env'), 'utf8')).toBe(
       await readFile(path.join(runtime.checkout_realpath, '.env'), 'utf8'),
     );
     const build = state.commands.find((command) => command.command === 'bash')!;
-    expect(build).toMatchObject({ args: [path.join(checkout, 'container', 'build.sh'), 'next'], cwd: checkout });
+    expect(build).toMatchObject({ args: [path.join(checkout, 'container', 'build.sh'), 'building'], cwd: checkout });
     expect(build.env).toMatchObject({
       NANOCLAW_INSTALL_ID: runtime.install_id,
       DOCKER_HOST: DOCKER,
       HOME: runtime.home_directory,
+      INSTALL_CJK_FONTS: 'true',
     });
+    const key = releaseAgentImageKey(next);
+    const label = state.commands.find((command) => command.command === 'docker' && command.args[0] === 'build')!;
+    expect(label).toMatchObject({
+      args: ['build', '--label', `dev.gws-ea.agent-key=${key}`, '--tag', `${imageBase(runtime)}:next`, '-'],
+      input: `FROM ${imageBase(runtime)}:building\n`,
+    });
+    expect(state.labels.get(state.tags.get(`${imageBase(runtime)}:next`)!)).toBe(key);
+    expect(repositoryImages(state, imageBase(runtime)).untagged).toEqual([]);
     expect(new Set(state.tags.keys())).toEqual(
       new Set([
         `${imageBase(runtime)}:latest`,
@@ -284,6 +297,34 @@ describe('staging an update while the assistant serves', GIT_HEAVY, () => {
     expect(await liveState(host, runtime)).toEqual(before);
     expect(state.running).toBe(true);
     expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();
+  });
+
+  it("refuses to build an agent image from a staged container/ that is not the release's, labeling nothing", async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    const tags = new Map(state.tags);
+    const deps = dependencies(state, next, runtime);
+    // Something the release's own install ran rewrote a file the image build copies.
+    const preflight = deps.runReleasePreflight!;
+    const changed: UpdateDependencies = {
+      ...deps,
+      runReleasePreflight: async (input, runtimeSeams) => {
+        await writeFile(path.join(input.checkoutRoot, LOCKFILE), 'lock rewritten\n');
+        return preflight(input, runtimeSeams);
+      },
+    };
+
+    await expect(stage(host, runtime, changed)).rejects.toMatchObject({
+      code: 'checkout_drift',
+      message: expect.stringContaining('container/agent-runner/bun.lock'),
+    });
+
+    expect(state.commands.some((command) => command.command === 'bash')).toBe(false);
+    expect(state.tags).toEqual(tags);
+    expect(state.labels.size).toBe(0);
+    expect(await exists(host.paths.releaseRoot(runtime.instance_id, 'next'))).toBe(false);
   });
 
   it('refuses a release whose migrations fail on a copy of the database, before building anything, and names them', async () => {
@@ -366,20 +407,56 @@ describe('staging an update while the assistant serves', GIT_HEAVY, () => {
       }
       const staged = await stage(host, runtime, dependencies(state, next, runtime));
 
-      // The :next image a killed build left is removed with next/, before anything is fetched again.
-      const nextImage = `${imageBase(runtime)}:next`;
+      // The image a killed build left, still under its :building tag, is removed with next/, as :next would be,
+      // before anything is fetched again.
+      const building = `${imageBase(runtime)}:building`;
       const docker = (args: string) =>
         state.commands.findIndex((command) => command.command === 'docker' && command.args.join(' ') === args);
       const fetch = state.commands.findIndex((command) => command.command === 'git' && command.args[0] === 'fetch');
-      expect(killed.tags.has(nextImage)).toBe(step === 'build');
-      expect(docker(`image ls --quiet ${nextImage}`)).toBeGreaterThanOrEqual(0);
-      expect(docker(`image ls --quiet ${nextImage}`)).toBeLessThan(fetch);
-      if (step === 'build') expect(docker(`image rm ${nextImage}`)).toBeLessThan(fetch);
-      expect(docker(`image rm ${nextImage}`) >= 0).toBe(step === 'build');
+      expect(killed.tags.has(building)).toBe(step === 'build');
+      for (const image of [`${imageBase(runtime)}:next`, building]) {
+        expect(docker(`image ls --quiet ${image}`)).toBeGreaterThanOrEqual(0);
+        expect(docker(`image ls --quiet ${image}`)).toBeLessThan(fetch);
+      }
+      // The staging that follows untags :building once it labels its own build, after the fetch.
+      const removed = docker(`image rm ${building}`);
+      expect(removed >= 0 && removed < fetch).toBe(step === 'build');
       expect(await exists(leftover)).toBe(false);
       expect(staged.preview.migrations).toEqual([ADDED_MIGRATION]);
       expect(git(staged.checkoutRoot, 'rev-parse', 'HEAD')).toBe(next.commit);
       expect(await inspectOperation(host.paths, reservation)).toEqual({ state: 'none', abandonedStaging: true });
+    },
+  );
+
+  it.each([
+    ['after its build, before it is labeled', 'label'],
+    ['once labeled, before its unlabeled build is untagged', 'untag-build'],
+  ] as const)(
+    'converges without leaking an image when killed %s, the next update staging it cleanly',
+    async (_label, point) => {
+      const host = await machine();
+      const runtime = await assistant(host);
+      const next = await nextRelease(host);
+      const state = world(runtime);
+      const base = imageBase(runtime);
+      state.hangAt = point;
+
+      await killDuringStaging(host, runtime, state, next);
+
+      // Every image the killed run made is still named by one of the assistant's own tags.
+      expect(state.tags.has(`${base}:building`)).toBe(true);
+      expect(state.tags.has(`${base}:next`)).toBe(point === 'untag-build');
+      expect(repositoryImages(state, base).untagged).toEqual([]);
+      delete state.hangAt;
+
+      const staged = await stage(host, runtime, dependencies(state, next, runtime));
+
+      expect(git(staged.checkoutRoot, 'rev-parse', 'HEAD')).toBe(next.commit);
+      expect(state.tags.has(`${base}:building`)).toBe(false);
+      expect(state.labels.get(state.tags.get(`${base}:next`)!)).toBe(releaseAgentImageKey(next));
+      // Nothing either run built is left without a tag: the discard took the killed run's images by their tags.
+      expect(repositoryImages(state, base).untagged).toEqual([]);
+      expect(new Set(state.tags.values())).toEqual(state.ids);
     },
   );
 
@@ -608,6 +685,8 @@ async function expectUpdated(host: Machine, runtime: InstanceRuntimeConfig, to: 
   expect(state.tags.get(`${base}:latest`)).not.toBe(ran);
   expect(state.tags.has(`${base}:next`)).toBe(false);
   expect(repositoryImages(state, base).untagged).toEqual([]);
+  // Nothing is held once the update's cleanup released the image it displaced.
+  expect([...state.tags.keys()].filter(isHold)).toEqual([]);
 }
 
 /** Where each kill leaves the update's record. */
@@ -618,6 +697,7 @@ const KILLS: ReadonlyArray<readonly [string, (state: World) => void, OperationPh
   ['once the kept files moved into previous/', (state) => (state.renameKill = 2), 'swapping'],
   ['between the two checkout renames', (state) => (state.renameKill = 3), 'swapping'],
   ["before the new release's receipt is promoted", (state) => (state.renameKill = 4), 'swapping'],
+  ['after the swap, while holding the images it moves', (state) => (state.hangAt = 'hold'), 'swapped'],
   ['after the swap, while retagging images', (state) => (state.hangAt = 'retag'), 'swapped'],
   ['between the two image tags', (state) => (state.hangAt = 'second-tag'), 'swapped'],
   ['after the start, while verifying', (state) => (state.hangAt = 'verify'), 'started'],
@@ -1504,7 +1584,7 @@ describe('gws-ea update', GIT_HEAVY, () => {
     ['is recorded', false],
     ['fails its checks and is rolled back', true],
   ] as const)(
-    'deletes no image a tag still names when an update whose builds reuse cached images %s',
+    'deletes no image a tag still names when an update that reuses the images the assistant runs %s',
     async (_label, fails) => {
       const host = await machine();
       const runtime = await assistant(host);
@@ -1516,10 +1596,11 @@ describe('gws-ea update', GIT_HEAVY, () => {
       const tagged = () =>
         Object.fromEntries(['latest', 'previous', 'ag-research'].map((tag) => [tag, state.tags.get(`${base}:${tag}`)]));
       const before = tagged();
-      // Nothing the agent images are built from changed, so Docker hands back the images it already has.
-      state.cachedBuild = true;
+      // Nothing the agent images are built from changed: the release's key names the image the first update
+      // built and labeled, which the assistant runs, and Docker hands back the group image it already has.
       state.cachedRebuild = true;
       const second = await nextRelease(host);
+      expect(state.labels.get(before.latest!)).toBe(releaseAgentImageKey(second));
       if (fails) {
         state.onStart = (checkout) => {
           if (git(checkout, 'rev-parse', 'HEAD') === second.commit) state.running = false;
@@ -1575,6 +1656,180 @@ describe('gws-ea update', GIT_HEAVY, () => {
     // The gateway image A moved off stays, as built: B, or a rollback, may run it.
     expect(state.tags.get(DEPLOYED_GATEWAY)).toBe(gateway);
     expect(state.ids.has(gateway)).toBe(true);
+  });
+
+  /**
+   * Two assistants created at the machine's first release on one Docker, A's
+   * world holding B's agent images beside its own, and the next release.
+   */
+  async function pair(): Promise<{
+    host: Machine;
+    a: InstanceRuntimeConfig;
+    b: InstanceRuntimeConfig;
+    next: Release;
+    state: World;
+  }> {
+    const host = await machine();
+    const a = await assistant(host, 37_001);
+    const b = await assistant(host, 37_101);
+    const next = await nextRelease(host);
+    const state = world(a);
+    for (const tag of [`${imageBase(b)}:latest`, `${imageBase(b)}:ag-research`]) {
+      const id = imageId();
+      state.tags.set(tag, id);
+      state.ids.add(id);
+    }
+    return { host, a, b, next, state };
+  }
+
+  /** NanoClaw's image builds, and gws-ea's label builds, among the commands run. */
+  function agentImageBuilds(state: World): string[] {
+    return state.commands
+      .filter(
+        (command) =>
+          command.command === 'bash' ||
+          (command.command === 'docker' && command.args[0] === 'build' && command.args.at(-1) === '-'),
+      )
+      .map((command) => [command.command, ...command.args].join(' '));
+  }
+
+  it('gives a second assistant updated to the same release the image the first built: no build, no new image', async () => {
+    const { host, a, b, next, state } = await pair();
+    expect(await cli(host, state, next, a).run(['update', '--id', a.instance_id, '--yes'])).toBe(0);
+    const shared = state.tags.get(`${imageBase(a)}:latest`)!;
+    expect(state.labels.get(shared)).toBe(releaseAgentImageKey(next));
+    const bRan = state.tags.get(`${imageBase(b)}:latest`)!;
+    const before = new Set(state.ids);
+    state.commands.length = 0;
+
+    expect(await cli(host, state, next, b).run(['update', '--id', b.instance_id, '--yes'])).toBe(0);
+
+    // B runs the very image A runs, under its own tags, and keeps the one it ran for its rollback.
+    expect(state.tags.get(`${imageBase(b)}:latest`)).toBe(shared);
+    expect(state.tags.get(`${imageBase(a)}:latest`)).toBe(shared);
+    expect(state.tags.get(`${imageBase(b)}:previous`)).toBe(bRan);
+    expect(state.tags.has(`${imageBase(b)}:next`)).toBe(false);
+    // Nothing was built for B, and the only image its update made is its own group's, rebuilt on the shared base.
+    expect(agentImageBuilds(state)).toEqual([]);
+    expect([...state.ids].filter((id) => !before.has(id))).toEqual([state.tags.get(`${imageBase(b)}:ag-research`)]);
+    // Each group's own image, rebuilt on the shared one, inherits its label; no other image carries the key.
+    const groupImages = new Set([a, b].map((runtime) => state.tags.get(`${imageBase(runtime)}:ag-research`)));
+    const keyed = [...state.labels].filter(([id, key]) => key === releaseAgentImageKey(next) && !groupImages.has(id));
+    expect(keyed.map(([id]) => id)).toEqual([shared]);
+    expect(repositoryImages(state, imageBase(b)).untagged).toEqual([]);
+  });
+
+  it('builds a separate image for an assistant whose .env asks for other build flags', async () => {
+    const { host, a, b, next, state } = await pair();
+    const environment = path.join(b.checkout_realpath, '.env');
+    await writeFile(
+      environment,
+      (await readFile(environment, 'utf8')).replace('INSTALL_CJK_FONTS=true', 'INSTALL_CJK_FONTS=false'),
+    );
+    expect(await cli(host, state, next, a).run(['update', '--id', a.instance_id, '--yes'])).toBe(0);
+
+    expect(await cli(host, state, next, b).run(['update', '--id', b.instance_id, '--yes'])).toBe(0);
+
+    const [aImage, bImage] = [a, b].map((runtime) => state.tags.get(`${imageBase(runtime)}:latest`)!);
+    expect(aImage).not.toBe(bImage);
+    expect(state.labels.get(aImage)).toBe(releaseAgentImageKey(next));
+    expect(state.labels.get(bImage)).toBe(releaseAgentImageKey(next, { installCjkFonts: false }));
+    expect(releaseAgentImageKey(next, { installCjkFonts: false })).not.toBe(releaseAgentImageKey(next));
+    const builds = state.commands.filter((command) => command.command === 'bash');
+    expect(builds.map((build) => build.env?.INSTALL_CJK_FONTS)).toEqual(['true', 'false']);
+  });
+
+  it("needs no room for an agent image when the release's is already shared, and still does when it is not", async () => {
+    const { host, a, b, next, state } = await pair();
+    // Room for a staged release and a copy of its state, not for another agent image.
+    state.freeBytes = 512 * 1024 ** 2;
+    const refused = cli(host, state, next, b);
+
+    expect(await refused.run(['update', '--id', b.instance_id, '--yes'])).toBe(1);
+    expect(refused.err.join('\n')).toContain('a copy of its state, and a new agent image');
+    expect(await exists(host.paths.releaseRoot(b.instance_id, 'next'))).toBe(false);
+
+    state.freeBytes = 1e15;
+    expect(await cli(host, state, next, a).run(['update', '--id', a.instance_id, '--yes'])).toBe(0);
+    state.freeBytes = 512 * 1024 ** 2;
+    state.commands.length = 0;
+
+    expect(await cli(host, state, next, b).run(['update', '--id', b.instance_id, '--yes'])).toBe(0);
+
+    expect(state.tags.get(`${imageBase(b)}:latest`)).toBe(state.tags.get(`${imageBase(a)}:latest`));
+    // It never asked how large B's image is: the shared one is already on disk.
+    expect(state.commands.some((command) => command.args.includes('{{.Size}}'))).toBe(false);
+  });
+
+  it("leaves a peer's image alone when an update tagged onto it is declined", async () => {
+    const { host, a, b, next, state } = await pair();
+    expect(await cli(host, state, next, a).run(['update', '--id', a.instance_id, '--yes'])).toBe(0);
+    const shared = state.tags.get(`${imageBase(a)}:latest`)!;
+    const bRan = state.tags.get(`${imageBase(b)}:latest`)!;
+    let staged: string | undefined;
+    const declined = cli(host, state, next, b, {
+      confirmUpdate: async () => {
+        staged = state.tags.get(`${imageBase(b)}:next`);
+        return false;
+      },
+    });
+
+    expect(await declined.run(['update', '--id', b.instance_id])).toBe(0);
+
+    // B's staging took up A's image as its :next, and its discard removed only that tag.
+    expect(staged).toBe(shared);
+    expect(state.tags.has(`${imageBase(b)}:next`)).toBe(false);
+    expect(state.tags.get(`${imageBase(a)}:latest`)).toBe(shared);
+    expect(state.tags.get(`${imageBase(b)}:latest`)).toBe(bRan);
+    expect(state.labels.get(shared)).toBe(releaseAgentImageKey(next));
+    expect([...state.tags.keys()].filter(isHold)).toEqual([]);
+  });
+
+  it("rolls back an update cut short after its retag, though a peer's update since released the image it displaced", async () => {
+    const { host, a, b, next, state } = await pair();
+    // Both assistants keep the same image as :previous, as two assistants that moved from one release do.
+    const kept = imageId();
+    state.ids.add(kept);
+    for (const runtime of [a, b]) state.tags.set(`${imageBase(runtime)}:previous`, kept);
+    const aRan = state.tags.get(`${imageBase(a)}:latest`)!;
+    state.hangAt = 'verify';
+    await killDuringCutover(host, a, state, next);
+    delete state.hangAt;
+    // A's retag took its :previous off that image, and A holds it while its update may yet be reverted.
+    expect(state.tags.get(`${imageBase(a)}:previous`)).toBe(aRan);
+    expect(state.tags.get(heldImageTag(imageBase(a), kept))).toBe(kept);
+
+    // B's update moves its own :previous off the same image and releases it: A's hold keeps it.
+    expect(await cli(host, state, next, b).run(['update', '--id', b.instance_id, '--yes'])).toBe(0);
+    expect(state.ids.has(kept)).toBe(true);
+
+    expect(await cli(host, state, next, a).run(['rollback', '--id', a.instance_id, '--yes'])).toBe(0);
+
+    expect(state.tags.get(`${imageBase(a)}:latest`)).toBe(aRan);
+    expect(state.tags.get(`${imageBase(a)}:previous`)).toBe(kept);
+    // The image A's update built stays for B, which runs it; nothing is held any more.
+    expect(state.ids.has(state.tags.get(`${imageBase(b)}:latest`)!)).toBe(true);
+    expect([...state.tags.keys()].filter(isHold)).toEqual([]);
+  });
+
+  it("keeps the image the assistant runs when NanoClaw's build hands it back from the cache, labeling a copy", async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    const base = imageBase(runtime);
+    const ran = state.tags.get(`${base}:latest`)!;
+    // Nothing the image is built from changed since it was built, unlabeled, so Docker's cache hands it back.
+    state.cachedBuild = true;
+
+    await stage(host, runtime, dependencies(state, next, runtime));
+
+    expect(state.tags.get(`${base}:latest`)).toBe(ran);
+    expect(state.ids.has(ran)).toBe(true);
+    const built = state.tags.get(`${base}:next`)!;
+    expect(built).not.toBe(ran);
+    expect(state.labels.get(built)).toBe(releaseAgentImageKey(next));
+    expect(state.tags.has(`${base}:building`)).toBe(false);
   });
 
   it('asks on a terminal with the preview, and a decline leaves no record and removes the staging', async () => {

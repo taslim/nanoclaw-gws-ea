@@ -29,6 +29,7 @@ import {
   machine,
   nextRelease,
   release,
+  releaseAgentImageKey,
   removeTemporaryRoots,
   services,
   snapshot,
@@ -255,7 +256,7 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
 
     // The failed assistant's own stop summary, with its own recovery guidance.
     const summary = err.join('\n');
-    expect(summary).toContain('Stopped at Building the new agent image (build_agent_image): bash exited with code 1');
+    expect(summary).toContain('Stopped at Preparing the new agent image (build_agent_image): bash exited with code 1');
     expect(summary).toContain(`Retry with: gws-ea update --id ${first.instance_id} --yes`);
     expect(await exists(host.paths.releaseRoot(first.instance_id, 'next'))).toBe(false);
     await expectOnRelease(host, first, host.first);
@@ -336,9 +337,9 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     expect(confirmUpdateAll).toHaveBeenCalledOnce();
     expect(confirmUpdate).not.toHaveBeenCalled();
     const summary = err.join('\n');
-    expect(summary).toContain('Stopped at Building the new agent image (build_agent_image): bash exited with code 1');
+    expect(summary).toContain('Stopped at Preparing the new agent image (build_agent_image): bash exited with code 1');
     expect(summary).toContain(`Retry with: gws-ea update --id ${first.instance_id}`);
-    expect(summary.match(/Stopped at Building the new agent image/gu)).toHaveLength(1);
+    expect(summary.match(/Stopped at Preparing the new agent image/gu)).toHaveLength(1);
     await expectOnRelease(host, first, host.first);
     expect(err.slice(-3)).toEqual([
       `update --all stopped at assistant ${first.instance_id}; 1 not attempted.`,
@@ -485,6 +486,24 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
       `Updated ${first.instance_id}: ${from} → ${to}`,
       `Updated ${second.instance_id}: ${from} → ${to}`,
     ]);
+  });
+
+  it("builds the release's agent image once for all the assistants it updates, each running that one image", async () => {
+    const host = await machine();
+    const first = await assistant(host, 37_001);
+    const second = await assistant(host, 37_101);
+    const next = await nextRelease(host);
+    const machineFleet = await fleet(host, next, [first, second]);
+    const { state } = machineFleet;
+
+    expect(await fleetCli(machineFleet).run(['update', '--all', '--yes'])).toBe(0);
+
+    await expectOnRelease(host, first, next.commit);
+    await expectOnRelease(host, second, next.commit);
+    expect(state.commands.filter((command) => command.command === 'bash')).toHaveLength(1);
+    const [image, other] = [first, second].map((runtime) => state.tags.get(`${imageBase(runtime)}:latest`));
+    expect(other).toBe(image);
+    expect(state.labels.get(image!)).toBe(releaseAgentImageKey(next));
   });
 
   it('stops with exit 75 when another command holds an assistant, leaving the next one untouched', async () => {

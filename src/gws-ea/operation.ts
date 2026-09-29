@@ -90,7 +90,8 @@ export interface SnapshotManifest {
 /**
  * An agent image tag the operation moved: the image it names after the move,
  * and the one it named before (null when it named none). Both by ID, so a
- * move cut short replays exactly, and a reversal can move it back.
+ * move cut short replays exactly, and a reversal can move it back; the
+ * assistant holds both while its moves may still need them (KTD19).
  */
 export interface MovedImage {
   readonly tag: string;

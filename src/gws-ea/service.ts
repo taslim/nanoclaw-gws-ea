@@ -6,7 +6,9 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import { isErrno } from '../community-portal/errors.js';
 import { readEnvFile } from '../env.js';
+import { getInstallScopedNames } from '../install-slug.js';
 import { renderLaunchdService, renderSystemdService } from '../service-definition.js';
+import { adoptSharedAgentImage, agentImageKey, readAgentImageInputs } from './agent-image.js';
 import type { OnecliRuntimeLayout } from './onecli-compose.js';
 import { preparePrivateDirectory, assertPrivateDirectory, instanceRuntimeFile, isRegularFile } from './paths.js';
 import {
@@ -862,13 +864,44 @@ export async function reconcileInstanceRuntime(
     NANOCLAW_INSTALL_ID: config.install_id,
   });
   await stampUpgradeState(config.checkout_realpath, run, environment);
-  await run({
-    command: 'pnpm',
-    args: ['exec', 'tsx', 'setup/index.ts', '--step', 'container'],
-    cwd: config.checkout_realpath,
-    env: environment,
-    timeoutMs: 15 * 60_000,
-    stream: true,
-  });
+  if (!(await adoptReleaseAgentImage(config, run, environment))) {
+    await run({
+      command: 'pnpm',
+      args: ['exec', 'tsx', 'setup/index.ts', '--step', 'container'],
+      cwd: config.checkout_realpath,
+      env: environment,
+      timeoutMs: 15 * 60_000,
+      stream: true,
+    });
+  }
   return reconcileInstanceService(config, dependencies);
+}
+
+/**
+ * Tag the agent image an update already built for this release and these
+ * build flags as the new assistant's `:latest`, and say whether there was one
+ * (see `agent-image.ts`): its content key is read from the checkout create
+ * deployed and its `.env`. Without one, NanoClaw's own container step builds
+ * and smoke-tests the image as it always has. That image is not labeled: the
+ * step runs `docker build` itself, without the agent-runner lockfile label
+ * `container/build.sh` adds, so it is not the image the key names. The
+ * assistant's first update moves it onto a shared one.
+ */
+async function adoptReleaseAgentImage(
+  config: InstanceRuntimeConfig,
+  run: SanitizedCommandRunner,
+  environment: Readonly<Record<string, string>>,
+): Promise<boolean> {
+  const checkout = config.checkout_realpath;
+  const inputs = await readAgentImageInputs(
+    { repository: checkout, commit: config.deployed_commit, checkout },
+    { runCommand: run },
+  );
+  const names = getInstallScopedNames(config.install_id);
+  return adoptSharedAgentImage(
+    { run, cwd: checkout, env: environment },
+    agentImageKey(inputs),
+    names.containerImageBase,
+    names.defaultContainerImage,
+  );
 }
