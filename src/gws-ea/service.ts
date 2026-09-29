@@ -362,6 +362,23 @@ export async function loadInstanceRuntimeConfig(file: string): Promise<InstanceR
   return config;
 }
 
+export interface HostLogFiles {
+  readonly output: string;
+  readonly errors: string;
+}
+
+/**
+ * The log files of the host run from `checkoutRoot`: NanoClaw's
+ * `logs/nanoclaw.log` and `logs/nanoclaw.error.log`, the paths the service
+ * definition gws-ea renders sends standard output and error to. The service
+ * layout below sends standard output and error here, so `logs` reads what the
+ * host writes.
+ */
+export function hostLogFiles(checkoutRoot: string): HostLogFiles {
+  const logs = path.join(checkoutRoot, 'logs');
+  return { output: path.join(logs, 'nanoclaw.log'), errors: path.join(logs, 'nanoclaw.error.log') };
+}
+
 function createInstanceServiceLayout(
   configInput: InstanceRuntimeConfig,
   options: ServiceLayoutOptions,
@@ -384,8 +401,8 @@ function createInstanceServiceLayout(
     hostEntrypoint: path.join(config.checkout_realpath, 'dist', 'index.js'),
     cliPath: path.join(config.checkout_realpath, 'bin', 'ncl'),
     cliSocket: path.join(config.checkout_realpath, 'data', 'ncl.sock'),
-    standardOutputPath: path.join(config.checkout_realpath, 'logs', 'nanoclaw.log'),
-    standardErrorPath: path.join(config.checkout_realpath, 'logs', 'nanoclaw.error.log'),
+    standardOutputPath: hostLogFiles(config.checkout_realpath).output,
+    standardErrorPath: hostLogFiles(config.checkout_realpath).errors,
   };
 }
 

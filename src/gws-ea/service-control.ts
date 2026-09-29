@@ -11,13 +11,14 @@
  * adopt, and the stop lasts until the next start, login, or reboot. Only
  * cutover and removal drain containers.
  */
-import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { pollUntil } from './poll.js';
 import { buildToolEnvironment } from './process.js';
 import { activeStep } from './run-log.js';
 import { serviceManagerEnvironment, type InstanceRuntimeConfig } from './service.js';
+
+export { hostLogFiles, type HostLogFiles } from './service.js';
 import { GwsEaError } from './types.js';
 
 /** NanoClaw's `ServiceMode`: how detection found the service run. */
@@ -92,22 +93,6 @@ export function runtimeServiceTarget(
 }
 
 /** Where a host service sends the host's output and its errors. */
-export interface HostLogFiles {
-  readonly output: string;
-  readonly errors: string;
-}
-
-/**
- * The log files of the host run from `checkoutRoot`: NanoClaw's
- * `logs/nanoclaw.log` and `logs/nanoclaw.error.log`, the paths the service
- * definition gws-ea renders sends standard output and error to. A test holds
- * the rendered definition to these, so `logs` reads what the host writes.
- */
-export function hostLogFiles(checkoutRoot: string): HostLogFiles {
-  const logs = path.join(checkoutRoot, 'logs');
-  return { output: path.join(logs, 'nanoclaw.log'), errors: path.join(logs, 'nanoclaw.error.log') };
-}
-
 /** Boundary seams; each defaults to this process's. */
 export interface ServiceControlOptions {
   readonly platform?: NodeJS.Platform;
