@@ -309,7 +309,8 @@ async function snapshotRoot(rollback: Rollback): Promise<string> {
   return (await exists(rollback.places.state)) ? rollback.places.state : rollback.places.previousCheckout;
 }
 
-function sameSchema(left: SnapshotManifest, right: SnapshotManifest): 'same' | SnapshotReason {
+/** Which schema moved between two manifests (KTD5): the central migrations, else the session tables and columns. */
+export function sameSchema(left: SnapshotManifest, right: SnapshotManifest): 'same' | SnapshotReason {
   const sorted = (names: readonly string[]): string => JSON.stringify([...names].sort());
   if (sorted(left.central_migrations) !== sorted(right.central_migrations)) return 'central_schema';
   const tables = (manifest: SnapshotManifest): string =>
