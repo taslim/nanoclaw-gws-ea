@@ -1,14 +1,16 @@
 import Database from 'better-sqlite3';
-import { open } from 'node:fs/promises';
+import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync } from 'node:fs';
+import { chmod, open } from 'node:fs/promises';
 import path from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
 
 import { isErrno } from '../community-portal/errors.js';
+import type { SnapshotManifest } from './operation.js';
 import { principalWelcomeEventId, type PrincipalCandidate } from './principal.js';
 import { redact } from './redact.js';
 import type { InstanceRuntimeConfig } from './service.js';
 import { GCHAT_CHANNEL_TYPE, GwsEaError } from './types.js';
-import { hasControlCharacters, requireCanonicalTimestamp } from './validation.js';
+import { hasControlCharacters, isRecord, requireCanonicalTimestamp } from './validation.js';
 
 /** How much of the error log's end is read, and how many of its lines are shown. */
 const ERROR_LOG_TAIL_BYTES = 64 * 1024;
@@ -129,8 +131,46 @@ function mainSessionId(central: Database.Database, agentGroupId: string): string
   return session?.id;
 }
 
+/** SQLite's largest backup step: every remaining page at once. */
+const SINGLE_STEP_PAGES = 0x7fffffff;
+
+/** Where SQLite's file header records its write and read format versions: 2 for WAL, 1 for a rollback journal. */
+const FORMAT_VERSION_OFFSETS = [18, 19] as const;
+const WAL_FORMAT = 2;
+const ROLLBACK_FORMAT = 1;
+
+/** A WAL database no connection has open: its writer closed it, so no `-wal` file remains. */
+function isClosedWalDatabase(file: string): boolean {
+  if (existsSync(`${file}-wal`)) return false;
+  const header = Buffer.alloc(FORMAT_VERSION_OFFSETS[1] + 1);
+  const descriptor = openSync(file, 'r');
+  try {
+    readSync(descriptor, header, 0, header.length, 0);
+  } finally {
+    closeSync(descriptor);
+  }
+  return FORMAT_VERSION_OFFSETS.every((offset) => header[offset] === WAL_FORMAT);
+}
+
+/**
+ * Open a database read-only without creating anything beside it. SQLite
+ * opens a WAL database by creating its `-wal` and `-shm` files, even for a
+ * read-only connection, and leaves them behind. A WAL database no connection
+ * has open holds every committed page in its main file, so it is read from an
+ * in-memory copy marked as a rollback-journal database, which SQLite reads
+ * without side files. One a writer has open already has its side files, and
+ * is read in place. So is one a writer opened while it was copied: that
+ * writer's `-wal` holds commits the copied main file may lack.
+ */
 function openReadonly(file: string): Database.Database {
   try {
+    if (isClosedWalDatabase(file)) {
+      const contents = readFileSync(file);
+      if (!existsSync(`${file}-wal`)) {
+        for (const offset of FORMAT_VERSION_OFFSETS) contents[offset] = ROLLBACK_FORMAT;
+        return new Database(contents, { readonly: true });
+      }
+    }
     return new Database(file, { readonly: true, fileMustExist: true });
   } catch {
     throw new GwsEaError('verification_state_missing', 'Required instance message state is missing');
@@ -393,6 +433,364 @@ export function verifyTalkableConversation(input: ConversationVerificationInput)
   }
 }
 
+function centralDatabaseFile(checkoutRoot: string): string {
+  return path.join(path.resolve(checkoutRoot), 'data', 'v2.db');
+}
+
+function hasTable(database: Database.Database, name: string): boolean {
+  return database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined;
+}
+
+/** Each session database under a checkout, keyed by its mailbox side: `inbound` or `outbound`. */
+function sessionDatabases(checkoutRoot: string): Array<{ readonly side: string; readonly file: string }> {
+  const directories = (directory: string): string[] => {
+    try {
+      return readdirSync(directory, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => path.join(directory, entry.name));
+    } catch (error) {
+      if (isErrno(error, 'ENOENT')) return [];
+      throw error;
+    }
+  };
+  const found: Array<{ side: string; file: string }> = [];
+  for (const group of directories(path.join(path.resolve(checkoutRoot), 'data', 'v2-sessions'))) {
+    for (const session of directories(group)) {
+      for (const entry of readdirSync(session, { withFileTypes: true })) {
+        const side = entry.isFile() ? /^(inbound|outbound)\.db$/u.exec(entry.name)?.[1] : undefined;
+        if (side) found.push({ side, file: path.join(session, entry.name) });
+      }
+    }
+  }
+  return found;
+}
+
+/**
+ * The schema a checkout's databases record (KTD5): the central migrations
+ * applied, in the order they ran, and every session table with its columns,
+ * keyed `<side>.<table>` and merged across sessions. Only read, never changed.
+ */
+export function readSchemaManifest(checkoutRoot: string): SnapshotManifest {
+  const migrations = readCentralMigrations(checkoutRoot);
+  const tables = new Map<string, Set<string>>();
+  for (const { side, file } of sessionDatabases(checkoutRoot)) {
+    const session = openReadonly(file);
+    try {
+      const names = session
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+        .all() as Array<{ name: string }>;
+      for (const { name } of names) {
+        const columns = tables.get(`${side}.${name}`) ?? new Set<string>();
+        for (const column of session.prepare('SELECT name FROM pragma_table_info(?)').all(name) as Array<{
+          name: string;
+        }>) {
+          columns.add(column.name);
+        }
+        tables.set(`${side}.${name}`, columns);
+      }
+    } finally {
+      session.close();
+    }
+  }
+  return {
+    central_migrations: migrations,
+    session_tables: Object.fromEntries(
+      [...tables.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([table, columns]) => [table, [...columns].sort()]),
+    ),
+  };
+}
+
+/** The central migrations a checkout's database records, in the order they ran. Only read, never changed. */
+export function readCentralMigrations(checkoutRoot: string): string[] {
+  const central = openReadonly(centralDatabaseFile(checkoutRoot));
+  try {
+    if (!hasTable(central, 'schema_version')) {
+      throw new GwsEaError('schema_unrecorded', 'The central database records no migrations');
+    }
+    return (central.prepare('SELECT name FROM schema_version ORDER BY version').all() as Array<{ name: string }>).map(
+      (row) => row.name,
+    );
+  } finally {
+    central.close();
+  }
+}
+
+/** An agent group whose container runs its own image, built on the base from its saved package lists. */
+export interface DerivedImageGroup {
+  readonly id: string;
+  readonly name: string;
+}
+
+/**
+ * The agent groups running a per-group image (`<imageBase>:<agent group ID>`,
+ * NanoClaw's `buildAgentGroupImage` tag), by name. Only read, never changed.
+ */
+export function readDerivedImageGroups(checkoutRoot: string, imageBase: string): DerivedImageGroup[] {
+  const central = openReadonly(centralDatabaseFile(checkoutRoot));
+  try {
+    if (!hasTable(central, 'container_configs')) return [];
+    const rows = central
+      .prepare(
+        `SELECT g.id, g.name, c.image_tag
+           FROM container_configs c JOIN agent_groups g ON g.id = c.agent_group_id
+          WHERE c.image_tag IS NOT NULL
+          ORDER BY g.name, g.id`,
+      )
+      .all() as Array<{ id: string; name: string; image_tag: string }>;
+    return rows.filter((row) => row.image_tag === `${imageBase}:${row.id}`).map(({ id, name }) => ({ id, name }));
+  } finally {
+    central.close();
+  }
+}
+
+/** Main as the assistant profile publishes it: its agent group, and the folder its files live in. */
+export interface MainGroup {
+  readonly id: string;
+  readonly folder: string;
+}
+
+/** NanoClaw's group folder grammar (`src/group-folder.ts`): one path segment, never a parent. */
+const GROUP_FOLDER = /^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?$/u;
+
+/** Main's agent group and folder, or undefined until the profile names one. Only read, never changed. */
+export function readMainGroup(checkoutRoot: string): MainGroup | undefined {
+  const central = openReadonly(centralDatabaseFile(checkoutRoot));
+  try {
+    if (!hasTable(central, 'gws_ea_profile') || !hasTable(central, 'agent_groups')) return undefined;
+    const main = central
+      .prepare(
+        `SELECT g.id, g.folder FROM gws_ea_profile p JOIN agent_groups g ON g.id = p.main_agent_group_id
+          WHERE p.singleton = 1`,
+      )
+      .get() as MainGroup | undefined;
+    if (main && !GROUP_FOLDER.test(main.folder)) {
+      throw new GwsEaError('invalid_main_group', `Main's group folder ${JSON.stringify(main.folder)} is not a folder`);
+    }
+    return main && { id: main.id, folder: main.folder };
+  } finally {
+    central.close();
+  }
+}
+
+function columnsOf(database: Database.Database, table: string): Set<string> {
+  return new Set(
+    (database.prepare('SELECT name FROM pragma_table_info(?)').all(table) as Array<{ name: string }>).map(
+      (column) => column.name,
+    ),
+  );
+}
+
+/**
+ * An agent group's MCP servers that `plugin` owns, by NanoClaw's ownership
+ * marker (each server's `plugin` field), as its container config holds them.
+ * Only read, never changed.
+ */
+export function readPluginMcpServers(
+  checkoutRoot: string,
+  agentGroupId: string,
+  plugin: string,
+): Readonly<Record<string, unknown>> {
+  const central = openReadonly(centralDatabaseFile(checkoutRoot));
+  let stored: string | undefined;
+  try {
+    if (!hasTable(central, 'container_configs') || !columnsOf(central, 'container_configs').has('mcp_servers')) {
+      return {};
+    }
+    stored = (
+      central.prepare('SELECT mcp_servers FROM container_configs WHERE agent_group_id = ?').get(agentGroupId) as
+        | { mcp_servers: string }
+        | undefined
+    )?.mcp_servers;
+  } finally {
+    central.close();
+  }
+  if (stored === undefined) return {};
+  let servers: unknown;
+  try {
+    servers = JSON.parse(stored);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    servers = undefined;
+  }
+  if (!isRecord(servers)) {
+    throw new GwsEaError('invalid_container_config', `Agent group ${agentGroupId}'s MCP servers are not a JSON object`);
+  }
+  // fromEntries defines each server as an own field, so a server named `__proto__` stays data.
+  return Object.fromEntries(
+    Object.entries(servers).filter(([, server]) => isRecord(server) && server.plugin === plugin),
+  );
+}
+
+/** A scheduled task series, as the row that runs next holds it. */
+export interface TaskSeries {
+  readonly series_id: string;
+  readonly recurrence: string | null;
+  readonly prompt: string;
+  readonly script: string | null;
+}
+
+/** NanoClaw's task content envelope (`src/modules/scheduling/task-content.ts`); a plain string predates it. */
+function taskContent(raw: string): Pick<TaskSeries, 'prompt' | 'script'> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    return { prompt: raw, script: null };
+  }
+  return isRecord(parsed)
+    ? {
+        prompt: typeof parsed.prompt === 'string' ? parsed.prompt : '',
+        script: typeof parsed.script === 'string' ? parsed.script : null,
+      }
+    : { prompt: raw, script: null };
+}
+
+const TASK_SLUG = /^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$/u;
+/** Docker's tag grammar, which NanoClaw's agent group IDs fit: one path segment. */
+const AGENT_GROUP_ID = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/u;
+const TASK_COLUMNS = ['kind', 'series_id', 'status', 'recurrence', 'content', 'seq'] as const;
+
+/**
+ * An agent group's task series whose IDs carry one of `slugs` (NanoClaw names
+ * a named task's series `<slug>-<4 hex>`), across its sessions: each as its
+ * live row holds it, or between runs its latest. Whether it is paused is the
+ * operator's, so it is left out. Only read, never changed.
+ */
+export function readTaskSeries(checkoutRoot: string, agentGroupId: string, slugs: readonly string[]): TaskSeries[] {
+  if (slugs.length === 0) return [];
+  if (!AGENT_GROUP_ID.test(agentGroupId)) throw new GwsEaError('invalid_agent_group', 'The agent group ID is invalid');
+  if (!slugs.every((slug) => TASK_SLUG.test(slug))) {
+    throw new GwsEaError('invalid_task_slug', 'A task slug is not one NanoClaw names a series with');
+  }
+  const series = new RegExp(`^(?:${slugs.join('|')})-[0-9a-f]{4}$`, 'u');
+  const found = new Map<string, { readonly live: boolean; readonly seq: number; readonly task: TaskSeries }>();
+  let sessions: string[];
+  try {
+    sessions = readdirSync(path.join(path.resolve(checkoutRoot), 'data', 'v2-sessions', agentGroupId), {
+      withFileTypes: true,
+    })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) return [];
+    throw error;
+  }
+  for (const session of sessions) {
+    const file = path.join(path.resolve(checkoutRoot), 'data', 'v2-sessions', agentGroupId, session, 'inbound.db');
+    if (!existsSync(file)) continue;
+    const inbound = openReadonly(file);
+    try {
+      if (!hasTable(inbound, 'messages_in')) continue;
+      const columns = columnsOf(inbound, 'messages_in');
+      if (!TASK_COLUMNS.every((column) => columns.has(column))) continue;
+      const rows = inbound
+        .prepare(
+          "SELECT series_id, status, recurrence, content, seq FROM messages_in WHERE kind = 'task' AND series_id IS NOT NULL",
+        )
+        .all() as Array<{ series_id: string; status: string; recurrence: string | null; content: string; seq: number }>;
+      for (const row of rows) {
+        if (!series.test(row.series_id)) continue;
+        const live = row.status === 'pending' || row.status === 'paused';
+        const kept = found.get(row.series_id);
+        if (kept && ((kept.live && !live) || (kept.live === live && kept.seq > row.seq))) continue;
+        found.set(row.series_id, {
+          live,
+          seq: row.seq,
+          task: { series_id: row.series_id, recurrence: row.recurrence, ...taskContent(row.content) },
+        });
+      }
+    } finally {
+      inbound.close();
+    }
+  }
+  return [...found.values()].map(({ task }) => task).sort((a, b) => a.series_id.localeCompare(b.series_id));
+}
+
+/**
+ * Copy a checkout's central database to `destination` as one consistent
+ * snapshot: an online backup whose every page moves in a single step, so a
+ * write the running host makes meanwhile restarts the copy rather than
+ * mixing into it. The live database is only read. The copy is owner-only.
+ */
+export async function backupCentralDatabase(checkoutRoot: string, destination: string): Promise<void> {
+  const central = openReadonly(centralDatabaseFile(checkoutRoot));
+  try {
+    await central.backup(destination, { progress: () => SINGLE_STEP_PAGES });
+  } finally {
+    central.close();
+  }
+  await chmod(destination, 0o600);
+}
+
+/** Main's latest delivery result, as its conversation's mailbox and the host's retry bookkeeping record it. */
+export interface LatestDelivery {
+  readonly mainAgentGroupId: string;
+  /** Main's conversation session, once it has one. */
+  readonly sessionId: string | undefined;
+  /** The newest result in that session's `delivered` table: `delivered` or `failed`. */
+  readonly last: { readonly messageOutId: string; readonly status: string; readonly at: string } | undefined;
+  /** That session's replies the host is still retrying (`delivery_attempts`), and the newest error it saw. */
+  readonly retrying: number;
+  readonly lastError: string | undefined;
+}
+
+/** Main's latest delivery result, or undefined until main is published. Only read, never changed. */
+export function readLatestDelivery(checkoutRoot: string): LatestDelivery | undefined {
+  const root = path.resolve(checkoutRoot);
+  const central = openReadonly(centralDatabaseFile(root));
+  let mainAgentGroupId: string;
+  let sessionId: string | undefined;
+  let retrying = 0;
+  let lastError: string | undefined;
+  try {
+    if (!hasTable(central, 'gws_ea_profile')) return undefined;
+    const profile = central.prepare('SELECT main_agent_group_id FROM gws_ea_profile WHERE singleton = 1').get() as
+      | { main_agent_group_id: string | null }
+      | undefined;
+    if (!profile?.main_agent_group_id) return undefined;
+    mainAgentGroupId = profile.main_agent_group_id;
+    sessionId = mainSessionId(central, mainAgentGroupId);
+    if (sessionId && hasTable(central, 'delivery_attempts')) {
+      const attempts = central
+        .prepare(
+          `SELECT COUNT(*) AS retrying,
+                  (SELECT last_error FROM delivery_attempts
+                    WHERE session_id = ? AND last_error IS NOT NULL
+                    ORDER BY last_attempt_at DESC LIMIT 1) AS last_error
+             FROM delivery_attempts WHERE session_id = ?`,
+        )
+        .get(sessionId, sessionId) as { retrying: number; last_error: string | null };
+      retrying = attempts.retrying;
+      lastError = attempts.last_error === null ? undefined : printableLogLine(attempts.last_error);
+    }
+  } finally {
+    central.close();
+  }
+  if (!sessionId) return { mainAgentGroupId, sessionId, last: undefined, retrying, lastError };
+  const inbound = openReadonly(path.join(root, 'data', 'v2-sessions', mainAgentGroupId, sessionId, 'inbound.db'));
+  let row: DeliveryRow | undefined;
+  try {
+    row = inbound
+      .prepare(
+        `SELECT message_out_id, status, delivered_at FROM delivered
+          ORDER BY delivered_at DESC, message_out_id DESC LIMIT 1`,
+      )
+      .get() as DeliveryRow | undefined;
+  } finally {
+    inbound.close();
+  }
+  return {
+    mainAgentGroupId,
+    sessionId,
+    last: row ? { messageOutId: row.message_out_id, status: row.status, at: row.delivered_at } : undefined,
+    retrying,
+    lastError,
+  };
+}
+
 export interface InstanceErrorLog {
   readonly file: string;
   /** The last lines of the entries logged at or after the given instant, oldest first, redacted. */
@@ -401,6 +799,36 @@ export interface InstanceErrorLog {
 
 function millisecondOfDay(hours: number, minutes: number, seconds: number, milliseconds: number): number {
   return ((hours * 60 + minutes) * 60 + seconds) * 1_000 + milliseconds;
+}
+
+/**
+ * A name an agent can choose (a file in its folder, a group, a task, a
+ * message ID in its outbound mailbox), made safe to print on the operator's
+ * terminal. Every control and format character, which could move the cursor,
+ * erase or rewrite a line, reach the clipboard, or reorder text, is shown as
+ * its JSON escape, and so is a backslash, so what is shown reads back as
+ * exactly one name. Unlike a log line, nothing is dropped: the operator sees
+ * the name the file really has. JSON output keeps the raw name.
+ */
+export function printableName(name: string): string {
+  return name.replace(/[\p{Cc}\p{Cf}\\]/gu, (character) => {
+    switch (character) {
+      case '\\':
+        return '\\\\';
+      case '\n':
+        return '\\n';
+      case '\r':
+        return '\\r';
+      case '\t':
+        return '\\t';
+      default:
+        // One escape per UTF-16 unit, as JSON writes a character outside the Basic Multilingual Plane.
+        return Array.from(
+          { length: character.length },
+          (_, index) => `\\u${character.charCodeAt(index).toString(16).padStart(4, '0')}`,
+        ).join('');
+    }
+  });
 }
 
 function printableLogLine(line: string): string {

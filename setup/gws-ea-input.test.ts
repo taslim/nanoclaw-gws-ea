@@ -699,7 +699,9 @@ describe('GWS-EA unattended create input', () => {
               providerCapabilityDigest,
             }),
           checkPrerequisites: async () => ({ ...prerequisites, nodePath: process.execPath }),
-          resolveRelease: async (sourceRemote, releaseRef) => ({ sourceRemote, releaseRef, commit: 'b'.repeat(40) }),
+          resolveReleaseTarget: async ({ track, source }) => ({
+            release: { source_remote: source.remote, release_track: track, deployed_commit: 'b'.repeat(40) },
+          }),
           holdLoopbackPorts: async () => ({
             ports: { nanoclaw_webhook: 35_101, onecli_app: 35_102, onecli_gateway: 35_103 },
             release: async () => undefined,

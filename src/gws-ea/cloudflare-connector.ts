@@ -1,10 +1,13 @@
 /**
  * The machine's one shared cloudflared connector. Ownership is the
- * Compose project plus the owner label, checked exactly. Any other difference
- * from the rendered service (image, environment, token, user, security,
- * network, mounts) is drift, repaired by force-recreating the connector from
- * the stored connector token under the machine lock. Repair never needs the
- * Cloudflare account token.
+ * Compose project plus the owner label, checked exactly. A running connector
+ * on another image or connector token than this tool would start is drift:
+ * every assistant shares it, so it is reported and left running, never
+ * replaced by one assistant's command (KTD11). Any other difference from the
+ * rendered service (environment, user, security, network, mounts), and a
+ * missing or stopped connector, is repaired by force-recreating it at this
+ * tool's pin from the stored connector token under the machine lock. Repair
+ * never needs the Cloudflare account token.
  */
 import { createHash } from 'node:crypto';
 import path from 'node:path';
@@ -129,6 +132,11 @@ export interface CloudflareConnectorDependencies {
   /** The Docker endpoint the assistant recorded; without one, Docker's active context. */
   readonly dockerEndpoint?: string;
 }
+
+/** The connector as observed; a present one reports how its image or token drifted from this tool's. */
+export type CloudflareConnectorObservation =
+  | Exclude<Observation, { readonly status: 'present' }>
+  | { readonly status: 'present'; readonly drift?: string };
 
 export function createCloudflareConnectorLayout(input: CloudflareConnectorLayoutInput): CloudflareConnectorLayout {
   if (input.platform !== 'macos' && input.platform !== 'linux') {
@@ -303,20 +311,35 @@ function sameSet(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value) => right.includes(value));
 }
 
-/** How an owned connector differs from its rendered service, or undefined when it does not. */
-function connectorDrift(
+/**
+ * How an owned connector's image or connector token differs from what this
+ * tool would start, or undefined when neither does. Another release or an
+ * earlier token started it; it is reported, never repaired (KTD11).
+ */
+function connectorDrift(observed: ObservedCloudflareConnector, tokenDigest: string): string | undefined {
+  const differences = [
+    ...(observed.image === CLOUDFLARED_IMAGE ? [] : [`runs ${observed.image}, not the pinned ${CLOUDFLARED_IMAGE}`]),
+    ...(observed.labels[CLOUDFLARE_CONNECTOR_TOKEN_LABEL] === tokenDigest
+      ? []
+      : ['was started with a different connector token']),
+  ];
+  return differences.length === 0 ? undefined : `it ${differences.join(' and ')}`;
+}
+
+/**
+ * How an owned connector differs from its rendered service beyond its image
+ * and token, or undefined when it does not. Its environment is compared with
+ * the image it runs, so another pin's own environment is not a difference.
+ */
+function connectorMisconfiguration(
   layout: CloudflareConnectorLayout,
   observed: ObservedCloudflareConnector,
-  expected: { readonly tokenDigest: string; readonly imageEnvironment: readonly string[] },
+  imageEnvironment: readonly string[],
 ): string | undefined {
-  if (observed.image !== CLOUDFLARED_IMAGE) return `runs ${observed.image}, not the pinned ${CLOUDFLARED_IMAGE}`;
   // Only variable names: an injected value could be a secret.
-  const added = observed.environment.filter((entry) => !expected.imageEnvironment.includes(entry));
+  const added = observed.environment.filter((entry) => !imageEnvironment.includes(entry));
   if (added.length > 0) {
     return `has environment its image does not set: ${added.map((entry) => entry.split('=')[0]).join(', ')}`;
-  }
-  if (observed.labels[CLOUDFLARE_CONNECTOR_TOKEN_LABEL] !== expected.tokenDigest) {
-    return 'was started with a different connector token';
   }
   if (
     observed.user !== layout.runtimeUser ||
@@ -359,10 +382,11 @@ async function imageEnvironment(
   runner: SanitizedCommandRunner,
   layout: CloudflareConnectorLayout,
   environment: Readonly<Record<string, string>>,
+  image: string,
 ): Promise<readonly string[]> {
   const { stdout } = await runner({
     command: 'docker',
-    args: ['image', 'inspect', '--format', '{{json .Config.Env}}', CLOUDFLARED_IMAGE],
+    args: ['image', 'inspect', '--format', '{{json .Config.Env}}', image],
     cwd: dockerDirectory(layout),
     env: environment,
     timeoutMs: INSPECT_TIMEOUT_MS,
@@ -371,40 +395,46 @@ async function imageEnvironment(
 }
 
 /**
- * Present when the owned connector runs exactly as rendered. A restarting
- * connector is unknown (it may still be starting); a missing, stopped, or
- * drifted one is absent, so liveness repairs it at once.
+ * Present when the owned connector runs as rendered; one on another image or
+ * connector token is present too, its drift reported, since replacing it
+ * would change every assistant's ingress (KTD11). A restarting connector is
+ * unknown (it may still be starting); a missing, stopped, or otherwise
+ * misconfigured one is absent, so liveness repairs it at once.
  */
 export async function observeCloudflareConnector(
   layout: CloudflareConnectorLayout,
   dependencies: CloudflareConnectorDependencies = {},
-): Promise<Observation> {
+): Promise<CloudflareConnectorObservation> {
   const runner = dependencies.runCommand ?? runSanitizedCommand;
   const environment = connectorEnvironment(dependencies);
   const observed = await inspectCloudflareConnector(layout, runner, environment);
   if (!observed) return { status: 'absent', reason: 'it has not been created' };
   assertCloudflareConnectorOwnership(layout, observed);
-  const drift = connectorDrift(layout, observed, {
-    tokenDigest: tokenDigest(await requireStoredToken(layout)),
-    imageEnvironment: observed.image === CLOUDFLARED_IMAGE ? await imageEnvironment(runner, layout, environment) : [],
-  });
-  if (drift) return { status: 'absent', reason: `it ${drift}` };
-  if (observed.state === 'running') return PRESENT;
+  const misconfigured = connectorMisconfiguration(
+    layout,
+    observed,
+    await imageEnvironment(runner, layout, environment, observed.image),
+  );
+  if (misconfigured) return { status: 'absent', reason: `it ${misconfigured}` };
+  const drift = connectorDrift(observed, tokenDigest(await requireStoredToken(layout)));
+  if (observed.state === 'running') return drift === undefined ? PRESENT : { status: 'present', drift };
   if (observed.state === 'restarting') {
+    const restarts = `state restarting, exit code ${observed.exitCode ?? 'unknown'}, ${observed.restartCount ?? 0} restarts`;
     return {
       status: 'unknown',
       reason: 'The Cloudflare connector is restarting',
-      evidence: `state restarting, exit code ${observed.exitCode ?? 'unknown'}, ${observed.restartCount ?? 0} restarts`,
+      evidence: drift === undefined ? restarts : `${restarts}; ${drift}`,
     };
   }
   return { status: 'absent', reason: `it is ${observed.state}` };
 }
 
 /**
- * Recreate the connector from the stored connector token. The image is pulled
- * first, outside the machine lock, only for a new or re-pinned connector; the
- * recreate runs under the lock after one more look, so concurrent repairs by
- * two assistants recreate it once.
+ * Recreate the connector at this tool's pin from the stored connector token.
+ * The image is pulled first, outside the machine lock, only when no connector
+ * runs it yet; the recreate runs under the lock after one more look, so
+ * concurrent repairs by two assistants recreate it once, and a connector
+ * another run started meanwhile is left as it is.
  */
 export async function repairCloudflareConnector(
   paths: ControlPlanePaths,

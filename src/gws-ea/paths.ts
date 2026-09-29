@@ -10,6 +10,25 @@ import { GwsEaError } from './types.js';
 /** The checkout this control plane runs from (`src/gws-ea` and `dist/gws-ea` both sit two levels below it). */
 export const CONTROL_PLANE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
+/**
+ * Releases an instance keeps beside its live checkout, each under
+ * `<instance>/<slot>/nanoclaw`: the one an update stages, the one it keeps as
+ * the rollback point, the one a rollback leaves, and the rollback point an
+ * update set aside at its swap, kept until the update is recorded.
+ */
+export const RELEASE_SLOTS = ['next', 'previous', 'outgoing', 'superseded'] as const;
+export type ReleaseSlot = (typeof RELEASE_SLOTS)[number];
+
+/** The instance marker inside a checkout. */
+export function instanceMarkerFile(checkoutRoot: string): string {
+  return path.join(checkoutRoot, 'data', 'gws-ea', 'instance.json');
+}
+
+/** The runtime record inside a checkout, written once its host first starts. */
+export function instanceRuntimeFile(checkoutRoot: string): string {
+  return path.join(checkoutRoot, 'data', 'gws-ea', 'runtime.json');
+}
+
 export interface ControlPlanePathOverrides {
   configRoot?: string;
   stateRoot?: string;
@@ -30,10 +49,15 @@ export interface ControlPlanePaths {
   instanceRoot(instanceId: string): string;
   checkoutRoot(instanceId: string): string;
   journalFile(instanceId: string): string;
+  /** The record of an update or rollback under way, beside the provision journal. */
+  operationFile(instanceId: string): string;
+  releaseRoot(instanceId: string, slot: ReleaseSlot): string;
+  releaseCheckoutRoot(instanceId: string, slot: ReleaseSlot): string;
   instanceLock(instanceId: string): string;
   markerFile(instanceId: string): string;
   bootstrapFile(instanceId: string): string;
-  releasePreflightFile(instanceId: string): string;
+  /** The release receipt: the live release's, or with `slot` the one kept beside that release. */
+  releasePreflightFile(instanceId: string, slot?: ReleaseSlot): string;
   removalFile(instanceId: string): string;
   /** gws-ea's own copy of one pinned OneCLI CLI version. */
   onecliCliFile(version: string): string;
@@ -82,6 +106,7 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
   const logsRoot = path.join(stateRoot, 'logs');
   const instanceRoot = (instanceId: string): string => path.join(instancesRoot, instanceId);
   const checkoutRoot = (instanceId: string): string => path.join(instanceRoot(instanceId), 'nanoclaw');
+  const releaseRoot = (instanceId: string, slot: ReleaseSlot): string => path.join(instanceRoot(instanceId), slot);
 
   return {
     configRoot,
@@ -98,10 +123,14 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
     instanceRoot,
     checkoutRoot,
     journalFile: (instanceId) => path.join(instanceRoot(instanceId), 'provision.json'),
+    operationFile: (instanceId) => path.join(instanceRoot(instanceId), 'operation.json'),
+    releaseRoot,
+    releaseCheckoutRoot: (instanceId, slot) => path.join(releaseRoot(instanceId, slot), 'nanoclaw'),
     instanceLock: (instanceId) => path.join(configRoot, 'locks', `${instanceId}.lock`),
-    markerFile: (instanceId) => path.join(checkoutRoot(instanceId), 'data', 'gws-ea', 'instance.json'),
+    markerFile: (instanceId) => instanceMarkerFile(checkoutRoot(instanceId)),
     bootstrapFile: (instanceId) => path.join(instanceRoot(instanceId), 'bootstrap.json'),
-    releasePreflightFile: (instanceId) => path.join(instanceRoot(instanceId), 'release-preflight.json'),
+    releasePreflightFile: (instanceId, slot) =>
+      path.join(slot ? releaseRoot(instanceId, slot) : instanceRoot(instanceId), 'release-preflight.json'),
     removalFile: (instanceId) => path.join(removalRoot, `${instanceId}.json`),
     onecliCliFile: (version) => path.join(stateRoot, 'tools', 'onecli', version, 'onecli'),
     keptCloudflareTokenFile: (instanceId) => path.join(instanceRoot(instanceId), 'secrets', 'cloudflare-account-token'),

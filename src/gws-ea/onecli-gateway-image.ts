@@ -47,9 +47,20 @@ export async function computeWrapperImageHash(pins: Pick<OnecliPins, 'gateway'>)
   return hash.digest('hex').slice(0, 16);
 }
 
+const WRAPPER_IMAGE_REPOSITORY = 'gws-ea-onecli-gateway';
+const WRAPPER_IMAGE_TAG = new RegExp(`^${WRAPPER_IMAGE_REPOSITORY}:([0-9a-f]{16})$`, 'u');
+
 /** The local, content-addressed wrapper image reference. Shared across instances built from the same content. */
 export function wrapperImageTag(hash: string): string {
-  return `gws-ea-onecli-gateway:${hash}`;
+  return `${WRAPPER_IMAGE_REPOSITORY}:${hash}`;
+}
+
+/**
+ * The content hash a wrapper image reference names, or undefined when it is
+ * not one. The image's provenance label must carry this hash (KTD6).
+ */
+export function wrapperImageHash(image: string): string | undefined {
+  return WRAPPER_IMAGE_TAG.exec(image)?.[1];
 }
 
 /** Resolve the wrapper's content hash and image reference together — the single source for the hash→tag pairing. */

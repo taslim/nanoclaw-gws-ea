@@ -36,8 +36,8 @@ import {
   type ProductionProvisionDependencies,
 } from './provision.js';
 import type { MainIdentityDependencies } from './identity.js';
-import { createOnecliRuntimeLayout } from './onecli-compose.js';
-import { computeWrapperImageHash, wrapperImageTag } from './onecli-gateway-image.js';
+import { createOnecliRuntimeLayout, renderOnecliCompose } from './onecli-compose.js';
+import { wrapperImageTag } from './onecli-gateway-image.js';
 import { ONECLI_CLI_VERSION, ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './pins.js';
 import type { OnecliRuntimeReceipt } from './onecli.js';
 import { findPortHolder } from './ports.js';
@@ -943,10 +943,22 @@ function runAlone(
   return runProvisionSteps(operation, context, steps as ProvisionSteps<ProductionProvisionContext>, runtime);
 }
 
-/** The content-addressed wrapper gateway image the launcher builds for its pins (real in-tree source). */
-const EXPECTED_GATEWAY_IMAGE = wrapperImageTag(await computeWrapperImageHash({ gateway: ONECLI_GATEWAY_VERSION }));
+/** The wrapper gateway an earlier release built from its own firewall files, not this tool's tree. */
+const RELEASE_WRAPPER_HASH = '0123456789abcdef';
+const RELEASE_GATEWAY_IMAGE = wrapperImageTag(RELEASE_WRAPPER_HASH);
 
-/** A Docker CLI that reports this instance's three OneCLI services running healthy at the launcher's pins. */
+/** The instance's own OneCLI Compose file, as its release rendered it. */
+async function writeReleaseCompose(context: ProductionProvisionContext): Promise<void> {
+  const layout = context.input.onecli;
+  await mkdir(layout.rootDirectory, { recursive: true, mode: 0o700 });
+  await writeFile(
+    layout.composeFile,
+    renderOnecliCompose(layout, { gateway: ONECLI_GATEWAY_VERSION }, RELEASE_GATEWAY_IMAGE),
+    { mode: 0o600 },
+  );
+}
+
+/** A Docker CLI that reports this instance's three OneCLI services running healthy as its release created them. */
 function healthyOnecliDocker(context: ProductionProvisionContext) {
   const layout = context.input.onecli;
   const labels = (role: string) => ({ 'dev.gws-ea.instance-id': layout.instanceId, 'dev.gws-ea.onecli-role': role });
@@ -963,7 +975,7 @@ function healthyOnecliDocker(context: ProductionProvisionContext) {
               service === 'postgres'
                 ? 'postgres:18-alpine'
                 : service === 'gateway'
-                  ? EXPECTED_GATEWAY_IMAGE
+                  ? RELEASE_GATEWAY_IMAGE
                   : `ghcr.io/onecli/onecli:${ONECLI_GATEWAY_VERSION}`,
             Labels: {
               'com.docker.compose.project': layout.project,
@@ -1011,6 +1023,8 @@ function healthyOnecliDocker(context: ProductionProvisionContext) {
         { Name: layout.appVolume, Labels: labels('app-data') },
       ]);
     }
+    // The provenance label the release's gateway build stamped.
+    if (kind === 'image' && verb === 'inspect') return { stdout: `${RELEASE_WRAPPER_HASH}\n`, stderr: '' };
     throw new Error(`unexpected docker command: ${command.args.join(' ')}`);
   };
 }
@@ -1189,7 +1203,7 @@ describe('production provision step composition', () => {
     });
   });
 
-  it('adopts a healthy OneCLI runtime interrupted before its API keys were persisted', async () => {
+  it('adopts a healthy OneCLI runtime its release created, interrupted before its API keys were persisted', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
     await writeReleaseReceipt(paths, reserved, {
@@ -1204,6 +1218,8 @@ describe('production provision step composition', () => {
         ...base,
         input: { ...base.input, onecliDependencies: { dockerCommandRunner: healthyOnecliDocker(base) } },
       };
+      // Its gateway is not the one this tool's tree builds; the instance's own record says which it runs.
+      await writeReleaseCompose(context);
       const reconcileOnecliRuntime = vi.fn(async () => Object.freeze({}) as OnecliRuntimeReceipt);
       const step = createProductionProvisionSteps(context, {
         reconcileOnecliRuntime,

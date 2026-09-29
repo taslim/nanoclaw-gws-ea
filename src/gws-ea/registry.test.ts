@@ -12,10 +12,19 @@ import {
   recordStepStarted,
   reserveInstance,
 } from './journal.js';
-import { allocateInstanceId, assertRegistryMarkerAgreement, readRegistry, writeInstanceMarker } from './registry.js';
+import { advanceOperation, beginOperation, liveCheckoutCommits } from './operation.js';
+import {
+  allocateInstanceId,
+  assertCheckoutConsistent,
+  assertRegistryMarkerAgreement,
+  readRegistry,
+  swapInstanceRelease,
+  writeInstanceMarker,
+} from './registry.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { Prerequisites } from './prerequisites.js';
-import { GwsEaError, type InstanceReservationInput } from './types.js';
+import type { CreateTargetRequest } from './release-target.js';
+import { GwsEaError, releaseOf, type InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
 const providerCapabilityDigest = 'd'.repeat(64);
@@ -156,10 +165,8 @@ function productionRuntime() {
   return {
     collectCreateInputs: async () => createSetupInput(),
     checkPrerequisites: async () => PREREQUISITES,
-    resolveRelease: async (sourceRemote: string, releaseRef: string) => ({
-      sourceRemote,
-      releaseRef,
-      commit: 'b'.repeat(40),
+    resolveReleaseTarget: async ({ track, source }: CreateTargetRequest) => ({
+      release: { source_remote: source.remote, release_track: track, deployed_commit: 'b'.repeat(40) },
     }),
     holdLoopbackPorts: async () => ({
       ports: { nanoclaw_webhook: 34_101, onecli_app: 34_102, onecli_gateway: 34_103 },
@@ -581,6 +588,124 @@ describe('machine registry', () => {
   });
 });
 
+describe('release compare-and-swap and live checkout agreement', () => {
+  const target = {
+    source_remote: 'https://example.test/prod.git',
+    release_track: 'prod',
+    deployed_commit: 'b'.repeat(40),
+  };
+
+  async function markerAt(paths: ControlPlanePaths, instanceId: string, commit: string, id = instanceId) {
+    await mkdir(path.dirname(paths.markerFile(instanceId)), { recursive: true, mode: 0o700 });
+    await writeFile(
+      paths.markerFile(instanceId),
+      JSON.stringify({ schema_version: 1, instance_id: id, deployed_commit: commit }),
+      { mode: 0o600 },
+    );
+  }
+
+  it('moves only the release fields, from the release it expects, leaving every claim and peer as it was', async () => {
+    const paths = await testPaths();
+    const input = reservation(paths);
+    const peer = distinctManagedReservation(paths);
+    await reserveInstance(paths, input);
+    await reserveInstance(paths, peer);
+    const before = await readRegistry(paths);
+
+    const moved = await swapInstanceRelease(paths, input.instance_id, releaseOf(input), target);
+
+    expect(moved).toEqual({ ...input, ...target });
+    const after = await readRegistry(paths);
+    expect(after.instances[input.instance_id]).toEqual(moved);
+    expect(after.instances[peer.instance_id]).toEqual(before.instances[peer.instance_id]);
+    expect(after.shared_infrastructure_metadata).toEqual(before.shared_infrastructure_metadata);
+    expect((await stat(paths.registryFile)).mode & 0o777).toBe(0o600);
+  });
+
+  it('refuses when the recorded release is not the one expected, or the instance is unknown', async () => {
+    const paths = await testPaths();
+    const input = reservation(paths);
+    await reserveInstance(paths, input);
+    const before = await readFile(paths.registryFile, 'utf8');
+
+    await expect(swapInstanceRelease(paths, input.instance_id, target, releaseOf(input))).rejects.toMatchObject({
+      code: 'reservation_mismatch',
+    });
+    await expect(
+      swapInstanceRelease(paths, input.instance_id, releaseOf(input), { ...target, release_track: 'Not A Track' }),
+    ).rejects.toMatchObject({ code: 'invalid_state' });
+    await expect(swapInstanceRelease(paths, allocateInstanceId(), releaseOf(input), target)).rejects.toMatchObject({
+      code: 'unknown_instance',
+    });
+    expect(await readFile(paths.registryFile, 'utf8')).toBe(before);
+  });
+
+  it.each([
+    ['commit', { deployed_commit: 'c'.repeat(40) }],
+    ['track', { release_track: 'prod' }],
+    ['source', { source_remote: 'https://example.test/fork.git' }],
+  ])('refuses a swap from a release that differs from the recorded one only in its %s', async (_field, change) => {
+    const paths = await testPaths();
+    const input = reservation(paths);
+    await reserveInstance(paths, input);
+    const before = await readFile(paths.registryFile, 'utf8');
+
+    await expect(
+      swapInstanceRelease(paths, input.instance_id, { ...releaseOf(input), ...change }, target),
+    ).rejects.toMatchObject({ code: 'reservation_mismatch' });
+    expect(await readFile(paths.registryFile, 'utf8')).toBe(before);
+  });
+
+  it("commits two assistants' concurrent swaps, neither overwriting the other's", async () => {
+    const paths = await testPaths();
+    const first = reservation(paths);
+    const second = distinctManagedReservation(paths);
+    await reserveInstance(paths, first);
+    await reserveInstance(paths, second);
+
+    await Promise.all([
+      swapInstanceRelease(paths, first.instance_id, releaseOf(first), target),
+      swapInstanceRelease(paths, second.instance_id, releaseOf(second), target),
+    ]);
+
+    const after = await readRegistry(paths);
+    expect(after.instances[first.instance_id]).toEqual({ ...first, ...target });
+    expect(after.instances[second.instance_id]).toEqual({ ...second, ...target });
+  });
+
+  it('accepts the live marker at the commits an unfinished operation allows, and any commit only when told to', async () => {
+    const paths = await testPaths();
+    const input = reservation(paths);
+    await reserveInstance(paths, input);
+    const reserved = await readRegistry(paths).then((registry) => registry.instances[input.instance_id]!);
+    const operation = await acquireInstanceOperation(paths, input.instance_id, { command: 'update', target });
+    if (!operation) throw new Error('The test instance operation was busy');
+    try {
+      await beginOperation(operation, { kind: 'update', from: releaseOf(input), to: target });
+      await markerAt(paths, input.instance_id, target.deployed_commit);
+      const stopped = await advanceOperation(operation, 'stopped', {
+        stop: { at: '2026-09-28T10:00:00.000Z', graceful: true },
+      });
+      await expect(
+        assertCheckoutConsistent(paths, reserved, liveCheckoutCommits(reserved, stopped)),
+      ).rejects.toMatchObject({ code: 'marker_mismatch' });
+
+      await advanceOperation(operation, 'swapping');
+      const swapped = await advanceOperation(operation, 'swapped');
+      await expect(
+        assertCheckoutConsistent(paths, reserved, liveCheckoutCommits(reserved, swapped)),
+      ).resolves.toBeUndefined();
+      await expect(assertCheckoutConsistent(paths, reserved)).rejects.toMatchObject({ code: 'marker_mismatch' });
+      await expect(assertCheckoutConsistent(paths, reserved, null)).resolves.toBeUndefined();
+
+      await markerAt(paths, input.instance_id, target.deployed_commit, allocateInstanceId());
+      await expect(assertCheckoutConsistent(paths, reserved, null)).rejects.toMatchObject({ code: 'marker_mismatch' });
+    } finally {
+      operation.release();
+    }
+  });
+});
+
 describe('create recovery contract', () => {
   it('checks Google sign-in on every resume, even after GCP setup is complete', async () => {
     const paths = await testPaths();
@@ -691,9 +816,9 @@ describe('create recovery contract', () => {
         stderr: () => undefined,
         checkPrerequisites: async () => PREREQUISITES,
         advanceProvision,
-        resolveRelease: async (sourceRemote, releaseRef) => {
-          resolveCalls.push([sourceRemote, releaseRef]);
-          return { sourceRemote, releaseRef, commit: 'b'.repeat(40) };
+        resolveReleaseTarget: async ({ track, source }) => {
+          resolveCalls.push([source.remote, source.ref]);
+          return { release: { source_remote: source.remote, release_track: track, deployed_commit: 'b'.repeat(40) } };
         },
         holdLoopbackPorts: async () => ({
           ports: { nanoclaw_webhook: 34_101, onecli_app: 34_102, onecli_gateway: 34_103 },
@@ -823,7 +948,7 @@ describe('create recovery contract', () => {
       stderr: (line) => stderr.push(line),
       collectCreateInputs: async () => createSetupInput(),
       checkPrerequisites: async () => PREREQUISITES,
-      resolveRelease: async () => {
+      resolveReleaseTarget: async () => {
         throw new GwsEaError('release_resolution_failed', 'Release track could not be resolved');
       },
       holdLoopbackPorts: async () => {
@@ -851,7 +976,9 @@ describe('create recovery contract', () => {
         bootstrapManifest: { ...createSetupInput().bootstrapManifest, schema_version: 99 as 1 },
       }),
       checkPrerequisites: async () => PREREQUISITES,
-      resolveRelease: async (sourceRemote, releaseRef) => ({ sourceRemote, releaseRef, commit: 'b'.repeat(40) }),
+      resolveReleaseTarget: async ({ track, source }) => ({
+        release: { source_remote: source.remote, release_track: track, deployed_commit: 'b'.repeat(40) },
+      }),
       holdLoopbackPorts: async () => {
         throw new Error('ports must not be allocated for invalid setup input');
       },

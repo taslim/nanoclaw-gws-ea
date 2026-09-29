@@ -8,7 +8,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CONTROL_PLANE_ROOT } from './paths.js';
 import { CLOUDFLARED_IMAGE, ONECLI_CLI_VERSION, ONECLI_GATEWAY_VERSION } from './pins.js';
 import { TOOL_ENVIRONMENT_KEYS, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
-import { runReleasePreflight, type SetupCommand } from './release-preflight.js';
+import {
+  assertUpdateKeepsSetup,
+  runReleasePreflight,
+  type DeployedSetup,
+  type ReleaseSetup,
+  type SetupCommand,
+} from './release-preflight.js';
 import { providerProvisioningCapabilityDigest } from '../provider-provisioning-capability.js';
 
 /** gws-ea's pins, which a release carries at the same path as this launcher. */
@@ -475,4 +481,47 @@ describe('release preflight', () => {
     ).rejects.toThrow(/src\/channels\/gchat\.ts/);
     expect(commands).toHaveLength(2);
   });
+});
+
+describe('update compatibility', () => {
+  const credential = { name: 'Anthropic', type: 'anthropic', hostPattern: 'api.anthropic.com' } as const;
+  const deployed: DeployedSetup = {
+    onecli: { gateway: '1.42.0', cli: '2.2.5', sdk: '2.2.1' },
+    postgresImage: 'postgres:18-alpine',
+    provider: 'claude',
+    providerCredential: credential,
+  };
+  const same: ReleaseSetup = {
+    onecli: deployed.onecli,
+    postgresImage: deployed.postgresImage,
+    providerCredential: credential,
+  };
+
+  it("accepts a release that keeps the assistant's OneCLI, Postgres, and provider setup", () => {
+    expect(() => assertUpdateKeepsSetup(deployed, { ...same, providerCredential: { ...credential } })).not.toThrow();
+  });
+
+  it.each([
+    ['OneCLI gateway', { onecli: { ...deployed.onecli, gateway: '1.43.0' } }, 'onecli_version_changed', '1.43.0'],
+    ['OneCLI CLI', { onecli: { ...deployed.onecli, cli: '2.3.0' } }, 'onecli_version_changed', '2.3.0'],
+    ['OneCLI SDK', { onecli: { ...deployed.onecli, sdk: '2.3.1' } }, 'onecli_version_changed', '2.3.1'],
+    ['Postgres image', { postgresImage: 'postgres:19-alpine' }, 'postgres_version_changed', 'postgres:19-alpine'],
+    [
+      'provider credential',
+      { providerCredential: { ...credential, hostPattern: 'api.example.test' } },
+      'provider_setup_changed',
+      'claude',
+    ],
+    ['provider', { providerCredential: undefined }, 'provider_not_composed', 'claude'],
+  ] as const)(
+    "refuses a release that changes the assistant's %s, naming it and the release to update from",
+    (name, change, code, named) => {
+      expect(() => assertUpdateKeepsSetup(deployed, { ...same, ...change })).toThrow(
+        expect.objectContaining({
+          code,
+          message: expect.stringMatching(new RegExp(`${name}.*${named.replaceAll('.', '\\.')}.*GWS-EA release`, 'u')),
+        }),
+      );
+    },
+  );
 });

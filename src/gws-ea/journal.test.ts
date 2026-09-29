@@ -3,9 +3,11 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { writePrivate } from '../community-portal/private-file.js';
 import {
   acquireInstanceOperation,
   LAUNCHER_CONTRACT_VERSION,
+  loadCreatedRuntime,
   readProvisionJournal,
   recordChatConfigurationConfirmed,
   recordKeyPolicyLifted,
@@ -16,9 +18,12 @@ import {
   reserveInstance,
   withInstanceOperation,
 } from './journal.js';
-import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
-import { allocateInstanceId } from './registry.js';
-import { GwsEaError, type InstanceReservationInput } from './types.js';
+import { createOnecliRuntimeLayout } from './onecli-compose.js';
+import { beginOperation } from './operation.js';
+import { instanceRuntimeFile, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+import { allocateInstanceId, getInstanceReservation } from './registry.js';
+import { createInstanceRuntimeConfig } from './service.js';
+import { GwsEaError, PROVISION_STEPS, releaseOf, type InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
 
@@ -220,6 +225,107 @@ describe('provision journal v3', () => {
     expect(reopened.steps.provision_gcp).toBeUndefined();
     expect(reopened.decisions.principal).toEqual(PRINCIPAL);
     expect(reopened.key_policy_lifted).toBe(true);
+  });
+
+  it('refuses provisioning under an unfinished update like a removal receipt, and releases the lock', async () => {
+    const { paths, input } = await fixture();
+    const target = { ...releaseOf(input), deployed_commit: 'b'.repeat(40) };
+    const operation = await acquireInstanceOperation(paths, input.instance_id, { command: 'update', target });
+    if (!operation) throw new Error('The test instance operation was busy');
+    try {
+      await beginOperation(operation, { kind: 'update', from: releaseOf(input), to: target });
+    } finally {
+      operation.release();
+    }
+
+    await expect(acquireInstanceOperation(paths, input.instance_id)).rejects.toMatchObject({
+      code: 'operation_in_progress',
+    });
+    await expect(withInstanceOperation(paths, input.instance_id, async () => 'ran')).rejects.toMatchObject({
+      code: 'operation_in_progress',
+    });
+    const reverting = await acquireInstanceOperation(paths, input.instance_id, { command: 'rollback' });
+    expect(reverting).not.toBeNull();
+    reverting?.release();
+
+    await writePrivate(paths.removalFile(input.instance_id), { instance_id: input.instance_id });
+    const removal = await acquireInstanceOperation(paths, input.instance_id, { command: 'rollback' }).catch(
+      (error: unknown) => error,
+    );
+    expect(removal).toMatchObject({ code: 'removal_in_progress' });
+    expect((removal as Error).message).toContain(`gws-ea remove --id ${input.instance_id}`);
+  });
+
+  it.each([
+    ['a pre-v3 journal', { schema_version: 1, phases: {} }, 'unsupported_journal'],
+    [
+      'an incompatible launcher contract',
+      { launcher_contract_version: LAUNCHER_CONTRACT_VERSION + 1 },
+      'incompatible_launcher',
+    ],
+  ] as const)('refuses to update or roll back after %s, naming remove and recreate', async (_label, change, code) => {
+    const { paths, input } = await fixture();
+    const contents = JSON.stringify({ ...(await rawJournal(paths, input.instance_id)), ...change });
+    await writeFile(paths.journalFile(input.instance_id), contents, { mode: 0o600 });
+    const target = { ...releaseOf(input), deployed_commit: 'b'.repeat(40) };
+
+    for (const intent of [{ command: 'update', target }, { command: 'rollback' }] as const) {
+      const refusal = await acquireInstanceOperation(paths, input.instance_id, intent).catch((error: unknown) => error);
+      expect(refusal).toMatchObject({ code });
+      expect((refusal as GwsEaError).message).toContain(
+        `gws-ea remove --id ${input.instance_id}, then create it again`,
+      );
+    }
+    // Commands that only operate the running host are not bound to the provisioning contract.
+    const start = await acquireInstanceOperation(paths, input.instance_id, { command: 'start' });
+    expect(start).not.toBeNull();
+    start?.release();
+  });
+
+  it('admits update and rollback for an assistant provisioned under this launcher contract', async () => {
+    const { paths, input } = await fixture();
+    const target = { ...releaseOf(input), deployed_commit: 'b'.repeat(40) };
+    for (const intent of [{ command: 'update', target }, { command: 'rollback' }] as const) {
+      const operation = await acquireInstanceOperation(paths, input.instance_id, intent);
+      expect(operation).not.toBeNull();
+      operation?.release();
+    }
+  });
+
+  it("refuses a runtime record in the assistant's own checkout that names another assistant (R17)", async () => {
+    const { paths, input } = await fixture();
+    const id = input.instance_id;
+    const operation = await acquireInstanceOperation(paths, id);
+    if (!operation) throw new Error('The test instance operation was busy');
+    try {
+      for (const step of PROVISION_STEPS) await recordStepCompleted(operation, step);
+    } finally {
+      operation.release();
+    }
+    const reserved = await getInstanceReservation(paths, id);
+    const onecli = createOnecliRuntimeLayout({
+      instanceId: id,
+      instanceRoot: paths.instanceRoot(id),
+      project: reserved.exclusive_resource_claims.onecli_project,
+      appPort: reserved.allocated_ports.onecli_app,
+      gatewayPort: reserved.allocated_ports.onecli_gateway,
+      cliExecutable: '/usr/local/bin/onecli',
+      dockerEndpoint: 'unix:///var/run/docker.sock',
+    });
+    const runtime = createInstanceRuntimeConfig(reserved, onecli, {
+      nodePath: process.execPath,
+      homeDirectory: paths.stateRoot,
+      selectedProvider: 'claude',
+      dockerEndpoint: 'unix:///var/run/docker.sock',
+    });
+    const file = instanceRuntimeFile(reserved.checkout_realpath);
+    await writePrivate(file, runtime);
+    expect(await loadCreatedRuntime(paths, id)).toEqual(runtime);
+
+    // Another assistant's record, at this checkout's own path: nothing gws-ea runs may act on it for this one.
+    await writePrivate(file, { ...runtime, instance_id: allocateInstanceId() });
+
+    await expect(loadCreatedRuntime(paths, id)).rejects.toMatchObject({ code: 'runtime_mismatch' });
   });
 
   it('gives the instance operation to one process at a time', async () => {

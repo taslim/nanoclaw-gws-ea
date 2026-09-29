@@ -475,7 +475,8 @@ function sentence(clause: string): string {
  *    observed locally from the recorded coordinates and the stored connector
  *    token: completed cloud setup is not re-proven.
  * 2. The connector, a local runtime repaired from the stored connector token
- *    without the account token.
+ *    without the account token. Every assistant shares it, so a running one
+ *    on another pin or token is logged as drift and left as it is (KTD11).
  * 3. The public callback, observed from outside. Edge 5xx/53x is waited on
  *    and never changes Cloudflare; a misroute or a hostname that does not
  *    resolve repairs the route, and the engine then waits for DNS and edge
@@ -520,7 +521,13 @@ export function managedTransportResources(
     {
       name: 'the Cloudflare connector',
       absentMeansStopped: true,
-      observe: () => observeCloudflareConnector(layout, connector),
+      observe: async () => {
+        const seen = await observeCloudflareConnector(layout, connector);
+        if (seen.status === 'present' && seen.drift !== undefined) {
+          activeStep()?.write(`the Cloudflare connector: ${seen.drift}; it is shared, so it is left as it is\n`);
+        }
+        return seen;
+      },
       apply: async () => {
         await repairCloudflareConnector(paths, layout, connector);
         return undefined;

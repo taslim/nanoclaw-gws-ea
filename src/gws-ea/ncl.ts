@@ -14,13 +14,28 @@ function parseFrame(stdout: string): Record<string, unknown> | undefined {
   }
 }
 
+/** How long a query of the running host may take. */
+const NCL_TIMEOUT_MS = 30_000;
+
+export interface InstanceNclOptions {
+  /** The bound for a command the host takes longer over, such as rebuilding an image. */
+  readonly timeoutMs?: number;
+}
+
 /**
  * Run `ncl <args> --json` and return the frame's data. `ncl` writes its
  * response frame and then exits 1 when the frame is not ok, so the frame is
  * read whatever the exit code and NanoClaw's own error message surfaces.
  */
-export async function runInstanceNclJson(config: InstanceRuntimeConfig, args: readonly string[]): Promise<unknown> {
-  const command = { ...buildInstanceCliCommand(config, [...args, '--json']), timeoutMs: 30_000 };
+export async function runInstanceNclJson(
+  config: InstanceRuntimeConfig,
+  args: readonly string[],
+  options: InstanceNclOptions = {},
+): Promise<unknown> {
+  const command = {
+    ...buildInstanceCliCommand(config, [...args, '--json']),
+    timeoutMs: options.timeoutMs ?? NCL_TIMEOUT_MS,
+  };
   const outcome = await runSanitizedCommandOutcome(command);
   const frame = parseFrame(outcome.stdout);
   if (frame?.ok === true && 'data' in frame && outcome.exitCode === 0) return frame.data;

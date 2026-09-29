@@ -1,7 +1,15 @@
 import os from 'node:os';
 import path from 'node:path';
 
-import { resolveReleaseCommit, type ResolvedRelease } from './checkout.js';
+import { formatLocalTime } from '../timezone.js';
+import {
+  READ_ONLY_COMMANDS,
+  requireOption,
+  targetInstance,
+  type CommandEnd,
+  type CommandOptions,
+  type OptionSpec,
+} from './cli-read-only.js';
 import { createManagedIngressSetupSession, type RetainedManagedIngressSetupSession } from './cloudflare-api.js';
 import {
   CREATE_INPUT_FLAGS,
@@ -11,6 +19,7 @@ import {
   type CreateSetupAnswers,
   type SecretSource,
 } from './create-input.js';
+import { finishFollowUps, type CutoverDependencies } from './cutover.js';
 import {
   createInteraction,
   pendingActionOf,
@@ -24,11 +33,19 @@ import {
   type StepReporter,
 } from './events.js';
 import { deriveGchatServiceAccountEmail, deriveGcpProjectId } from './gcloud.js';
-import { acquireInstanceOperation, readProvisionJournal, reserveInstance, type InstanceOperation } from './journal.js';
+import {
+  acquireInstanceOperation,
+  loadCreatedRuntime,
+  readProvisionJournal,
+  reserveInstance,
+  type InstanceOperation,
+} from './journal.js';
+import { readOperationRecord } from './operation.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { ProvisionHumanPause, ProvisionResult, ProvisionRuntime } from './phases.js';
 import { holdLoopbackPorts, type HeldLoopbackPorts } from './ports.js';
 import { checkPrerequisites, type PrerequisiteRequest, type Prerequisites } from './prerequisites.js';
+import { replaceProcessWithCommand } from './process.js';
 import {
   installProductionBootstrapManifest,
   recordedHost,
@@ -37,7 +54,13 @@ import {
   validateProductionBootstrapManifest,
 } from './provision.js';
 import { redact, safeErrorCode, safeErrorMessage } from './redact.js';
-import { allocateInstanceId, assertInstanceId, getInstanceReservation, validateReservation } from './registry.js';
+import { allocateInstanceId, getInstanceReservation, validateReservation } from './registry.js';
+import {
+  resolveReleaseTarget,
+  type CreateTargetRequest,
+  type ReleaseTarget,
+  type ToolProviderSetup,
+} from './release-target.js';
 import { resolveReleaseSource, type ReleaseSource } from './release-tracks.js';
 import {
   ABANDONABLE_RESOURCES,
@@ -49,9 +72,43 @@ import {
   type RemovalOutcome,
   type RemovalPreview,
 } from './remove.js';
+import {
+  localTimezone,
+  rollBack,
+  rollbackPreviewLines,
+  type RollbackOutcome,
+  type RollbackPreview,
+  type RollbackRequest,
+} from './rollback.js';
 import { FIXTURE_STAGING_DIRECTORY, startRunLog, type RunLog } from './run-log.js';
-import type { HostStatusHelpers, UpsertEnvVars } from './service.js';
-import { GwsEaError, type AllocatedPorts, type GwsEaErrorDetails, type InstanceReservationInput } from './types.js';
+import { buildInstanceCliCommand, type HostStatusHelpers, type UpsertEnvVars } from './service.js';
+import {
+  createServiceControl,
+  runtimeServiceTarget,
+  type InstanceServiceControl,
+  type NanoclawServiceHelpers,
+} from './service-control.js';
+import {
+  confirmStagedUpdate,
+  continueUpdate,
+  prepareUpdate,
+  resolveUpdateIntent,
+  updatePreviewLines,
+  type UpdatedAssistant,
+  type UpdateDependencies,
+  type UpdatePreview,
+  type UpdateRequest,
+  type UpdateSeams,
+} from './update.js';
+import {
+  GwsEaError,
+  sameRelease,
+  shortCommit,
+  type AllocatedPorts,
+  type GwsEaErrorDetails,
+  type InstanceReservationInput,
+  type ReleaseCoordinates,
+} from './types.js';
 
 /** Unlabeled, so a scripted create's first line stays its `instance_id`. */
 const PREREQUISITES_STEP = { id: 'prerequisites' } as const;
@@ -63,7 +120,15 @@ const INTERRUPT_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
 export const EXIT_CODES = { ready: 0, paused: 10, failed: 1, busy: 75 } as const;
 
 type LineWriter = (line: string) => void;
-type Command = 'create' | 'resume' | 'remove';
+/** Commands that run as attempts: each with its own run log, stop summary, and failure loop. */
+const COMMANDS = ['create', 'resume', 'remove', 'start', 'stop', 'restart', 'update', 'rollback'] as const;
+type Command = (typeof COMMANDS)[number];
+/** The attempts that act on an assistant's host service alone. */
+type ServiceCommand = Extract<Command, 'start' | 'stop' | 'restart'>;
+
+function isCommand(value: string | undefined): value is Command {
+  return COMMANDS.some((command) => command === value);
+}
 
 /** A stop summary. The line presenter prints it; the terminal presenter draws it with clack. */
 export interface StopReport {
@@ -125,7 +190,8 @@ export interface CliRuntime {
   /** Interactive failure loop: diagnosis, then whether to retry. */
   onFailure?: (report: FailureReport) => Promise<'retry' | 'stop'>;
   advanceProvision?: AdvanceProvision;
-  resolveRelease?: (sourceRemote: string, releaseRef: string) => Promise<ResolvedRelease>;
+  /** Resolves the release create reserves: this tool's own commit on the track. */
+  resolveReleaseTarget?: (request: CreateTargetRequest) => Promise<ReleaseTarget>;
   holdLoopbackPorts?: () => Promise<HeldLoopbackPorts>;
   collectCreateInputs?: (context: CreatePromptContext) => Promise<CreateSetupAnswers>;
   reserveInstance?: typeof reserveInstance;
@@ -140,11 +206,25 @@ export interface CliRuntime {
   upsertEnvVars?: UpsertEnvVars;
   /** Upstream's host readiness helpers (`setup/lib/host-status.mjs`), which the driver supplies. */
   hostStatus?: HostStatusHelpers;
+  /** Upstream's service helpers (`scripts/update/service.ts`), which the driver supplies; they control each host. */
+  serviceHelpers?: NanoclawServiceHelpers;
+  /** Replaces this process with the tool `ncl` and `logs` hand it to; tests substitute it. */
+  execve?: NonNullable<NodeJS.Process['execve']>;
+  /** This tool's provider setup, which the driver reads from `setup/providers` when an update needs it. */
+  toolProviderSetup?: () => Promise<ToolProviderSetup>;
+  /** Absent means an update requires `--yes`. */
+  confirmUpdate?: (preview: UpdatePreview) => Promise<boolean>;
+  /** Asks before a rollback restores the pre-update snapshot; absent means that restore requires `--yes`. */
+  confirmRollback?: (preview: RollbackPreview) => Promise<boolean>;
+  /** An update's boundary seams; each defaults to the real one. */
+  update?: UpdateSeams;
 }
 
 const COMMON_OPTIONS = ['secrets-file'] as const;
 const COMMON_SWITCHES = ['capture-fixtures'] as const;
-const COMMAND_OPTIONS: Readonly<Record<Command, { values: readonly string[]; switches: readonly string[] }>> = {
+/** The host service commands name the assistant and nothing else: they read no secrets and capture nothing. */
+const SERVICE_OPTIONS: OptionSpec = { values: ['id'], switches: [] };
+const COMMAND_OPTIONS: Readonly<Record<Command, OptionSpec>> = {
   create: {
     values: ['track', 'source-remote', 'google-account', ...CREATE_INPUT_FLAGS, ...COMMON_OPTIONS],
     switches: COMMON_SWITCHES,
@@ -154,12 +234,14 @@ const COMMAND_OPTIONS: Readonly<Record<Command, { values: readonly string[]; swi
     switches: ['chat-configured', ...COMMON_SWITCHES],
   },
   remove: { values: ['id', 'abandon', ...COMMON_OPTIONS], switches: ['yes', ...COMMON_SWITCHES] },
+  start: SERVICE_OPTIONS,
+  stop: SERVICE_OPTIONS,
+  restart: SERVICE_OPTIONS,
+  update: { values: ['id', 'track', 'source-remote'], switches: ['yes'] },
+  rollback: { values: ['id'], switches: ['snapshot', 'yes'] },
 };
 
-type Options = Readonly<Record<string, string>>;
-
-function parseOptions(args: readonly string[], command: Command): Options {
-  const { values, switches } = COMMAND_OPTIONS[command];
+function parseOptions(args: readonly string[], { values, switches }: OptionSpec): CommandOptions {
   const options: Record<string, string> = {};
   for (let index = 0; index < args.length; ) {
     const flag = args[index];
@@ -184,12 +266,6 @@ function parseOptions(args: readonly string[], command: Command): Options {
   return options;
 }
 
-function requireOption(options: Options, name: string): string {
-  const value = options[name];
-  if (!value) throw new GwsEaError('invalid_arguments', `Missing required option --${name}`);
-  return value;
-}
-
 /** `--abandon a,b`: resources removal may leave behind when it cannot observe them. */
 function parseAbandon(value: string | undefined): ReadonlySet<AbandonableResource> {
   const abandonable: readonly string[] = ABANDONABLE_RESOURCES;
@@ -211,6 +287,31 @@ function shellQuote(value: string): string {
 
 function isBusy(error: unknown): boolean {
   return error instanceof GwsEaError && error.code === 'instance_busy';
+}
+
+/**
+ * The assistant's state refused the command: an unfinished update or
+ * rollback, a removal under way, a create not yet finished, no host service
+ * installed to start, a stopped assistant an update cannot prove its release
+ * on, a release that is not newer than the one it runs, no release of its own
+ * kept to roll back to, or a rollback that went back to the release it left.
+ * Its message names the command that moves the assistant on; rerunning this
+ * one cannot.
+ */
+const STATE_REFUSALS: ReadonlySet<string> = new Set([
+  'operation_in_progress',
+  'removal_in_progress',
+  'instance_not_created',
+  'service_not_installed',
+  'host_not_running',
+  'release_not_newer',
+  'rollback_unavailable',
+  'kept_release_mismatch',
+  'rollback_failed',
+]);
+
+function isStateRefusal(error: unknown): boolean {
+  return error instanceof GwsEaError && STATE_REFUSALS.has(error.code);
 }
 
 function busy(): GwsEaError {
@@ -300,7 +401,7 @@ interface Session {
 interface AttemptPlan {
   readonly command: Command;
   readonly args: readonly string[];
-  readonly options: Options;
+  readonly options: CommandOptions;
   readonly instanceId?: string;
   readonly meta?: Readonly<Record<string, string>>;
   readonly decisions?: HumanDecisions;
@@ -322,46 +423,97 @@ class Cli {
     this.#managedIngressSetup = managedIngressSetup;
   }
 
-  /** Validate arguments up front; the returned attempt reports every later failure itself. */
+  /**
+   * Validate arguments up front; the returned attempt reports every later
+   * failure itself. Each command has its own branch, so none falls through
+   * to another command's work.
+   */
   prepare(command: Command, args: readonly string[]): () => Promise<Attempt> {
-    const options = parseOptions(args, command);
-    if (command === 'create') {
-      const track = requireOption(options, 'track');
-      const source = resolveReleaseSource(track, options['source-remote']);
-      return () =>
-        this.#attempt({
-          command,
-          args,
-          options,
-          meta: { track },
-          work: (session) => this.#createWork(session, options, track, source),
-        });
+    const options = parseOptions(args, COMMAND_OPTIONS[command]);
+    switch (command) {
+      case 'create': {
+        const track = requireOption(options, 'track');
+        const source = resolveReleaseSource(track, options['source-remote']);
+        return () =>
+          this.#attempt({
+            command,
+            args,
+            options,
+            meta: { track },
+            work: (session) => this.#createWork(session, options, track, source),
+          });
+      }
+      case 'resume': {
+        const instanceId = targetInstance(options);
+        return () =>
+          this.#attempt({
+            command,
+            args,
+            options,
+            instanceId,
+            decisions: {
+              chatConfigured: options['chat-configured'] === 'true',
+              ...(options['messaging-group-id'] ? { messagingGroupId: options['messaging-group-id'] } : {}),
+            },
+            work: (session) => this.#resumeWork(session, instanceId),
+          });
+      }
+      case 'remove': {
+        const instanceId = targetInstance(options);
+        const abandon = parseAbandon(options.abandon);
+        return () =>
+          this.#attempt({
+            command,
+            args,
+            options,
+            instanceId,
+            work: (session) => this.#removeWork(session, options, instanceId, abandon),
+          });
+      }
+      case 'start':
+      case 'stop':
+      case 'restart': {
+        const instanceId = targetInstance(options);
+        return () =>
+          this.#attempt({
+            command,
+            args,
+            options,
+            instanceId,
+            work: (session) => this.#serviceWork(session, command, instanceId),
+          });
+      }
+      case 'update': {
+        const request: UpdateRequest = {
+          instanceId: targetInstance(options),
+          ...(options.track === undefined ? {} : { track: options.track }),
+          ...(options['source-remote'] === undefined ? {} : { sourceRemote: options['source-remote'] }),
+        };
+        return () =>
+          this.#attempt({
+            command,
+            args,
+            options,
+            instanceId: request.instanceId,
+            work: (session) => this.#updateWork(session, request, options.yes === 'true'),
+          });
+      }
+      case 'rollback': {
+        const instanceId = targetInstance(options);
+        return () =>
+          this.#attempt({
+            command,
+            args,
+            options,
+            instanceId,
+            work: (session) => this.#rollbackWork(session, instanceId, options),
+          });
+      }
+      default: {
+        const unhandled: never = command;
+        throw new GwsEaError('invalid_arguments', `Unknown command ${String(unhandled)}`);
+      }
     }
-    const instanceId = requireOption(options, 'id');
-    assertInstanceId(instanceId);
-    if (command === 'remove') {
-      const abandon = parseAbandon(options.abandon);
-      return () =>
-        this.#attempt({
-          command,
-          args,
-          options,
-          instanceId,
-          work: (session) => this.#removeWork(session, options, instanceId, abandon),
-        });
-    }
-    return () =>
-      this.#attempt({
-        command,
-        args,
-        options,
-        instanceId,
-        decisions: {
-          chatConfigured: options['chat-configured'] === 'true',
-          ...(options['messaging-group-id'] ? { messagingGroupId: options['messaging-group-id'] } : {}),
-        },
-        work: (session) => this.#resumeWork(session, instanceId),
-      });
   }
 
   /** The command that continues from where an attempt stopped; `extra` carries a pause's decision flag. */
@@ -369,23 +521,49 @@ class Cli {
     const secretsFile = plan.options['secrets-file'];
     const common = secretsFile ? `--secrets-file ${shellQuote(secretsFile)}` : undefined;
     const join = (...parts: Array<string | undefined>): string => parts.filter(Boolean).join(' ');
-    if (plan.command === 'remove') {
-      const abandon = [...new Set([...(plan.options.abandon?.split(',') ?? []), ...(extra ? [extra] : [])])];
-      return join(
-        `gws-ea remove --id ${state.instanceId}`,
-        plan.options.yes ? '--yes' : undefined,
-        abandon.length > 0 ? `--abandon ${abandon.join(',')}` : undefined,
-        common,
-      );
+    switch (plan.command) {
+      case 'remove': {
+        const abandon = [...new Set([...(plan.options.abandon?.split(',') ?? []), ...(extra ? [extra] : [])])];
+        return join(
+          `gws-ea remove --id ${state.instanceId}`,
+          plan.options.yes ? '--yes' : undefined,
+          abandon.length > 0 ? `--abandon ${abandon.join(',')}` : undefined,
+          common,
+        );
+      }
+      case 'start':
+      case 'stop':
+      case 'restart':
+        return `gws-ea ${plan.command} --id ${state.instanceId}`;
+      case 'update': {
+        const { track, yes } = plan.options;
+        const remote = plan.options['source-remote'];
+        return join(
+          `gws-ea update --id ${state.instanceId}`,
+          track === undefined ? undefined : `--track ${shellQuote(track)}`,
+          remote === undefined ? undefined : `--source-remote ${shellQuote(remote)}`,
+          yes ? '--yes' : undefined,
+        );
+      }
+      case 'rollback':
+        return join(
+          `gws-ea rollback --id ${state.instanceId}`,
+          plan.options.snapshot ? '--snapshot' : undefined,
+          plan.options.yes ? '--yes' : undefined,
+        );
+      case 'create':
+      case 'resume': {
+        if (state.reserved && state.instanceId) return join(`gws-ea resume --id ${state.instanceId}`, extra, common);
+        const track = plan.options.track ?? '';
+        return `gws-ea create --track ${/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(track) ? track : '<track>'} (with the same options)`;
+      }
     }
-    if (state.reserved && state.instanceId) return join(`gws-ea resume --id ${state.instanceId}`, extra, common);
-    const track = plan.options.track ?? '';
-    return `gws-ea create --track ${/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(track) ? track : '<track>'} (with the same options)`;
   }
 
+  /** Create and resume continue by resuming once the assistant is reserved; every other attempt is retried as given. */
   #nextAction(plan: AttemptPlan, state: AttemptState): string {
-    const verb = plan.command !== 'remove' && state.reserved ? 'Resume' : 'Retry';
-    return `${verb} with: ${this.#continueCommand(plan, state)}`;
+    const resumes = (plan.command === 'create' || plan.command === 'resume') && state.reserved;
+    return `${resumes ? 'Resume' : 'Retry'} with: ${this.#continueCommand(plan, state)}`;
   }
 
   /** Retrying a reserved create resumes it; every other attempt reruns as given. */
@@ -423,7 +601,7 @@ class Cli {
 
   async #createWork(
     { reporter, interaction, secrets, state }: Session,
-    options: Options,
+    options: CommandOptions,
     track: string,
     source: ReleaseSource,
   ): Promise<Outcome> {
@@ -462,15 +640,15 @@ class Cli {
     run.userInput('ingress', setup.ingress.mode);
     run.userInput('provider', setup.bootstrapManifest.provider.id);
 
-    const resolved = await runStep(reporter, { id: 'resolve_release', label: 'Resolving the release…' }, () =>
-      (this.#runtime.resolveRelease ?? resolveReleaseCommit)(source.remote, source.ref),
+    const { release } = await runStep(reporter, { id: 'resolve_release', label: 'Resolving the release…' }, () =>
+      (this.#runtime.resolveReleaseTarget ?? resolveReleaseTarget)({ track, source }),
     );
     await runStep(reporter, { id: 'reserve', label: 'Reserving the assistant…' }, async () => {
-      await this.#reserve(state, track, source.remote, setup, resolved.commit, prerequisites.account);
+      await this.#reserve(state, track, source.remote, setup, release.deployed_commit, prerequisites.account);
       await run.assignInstance(instanceId);
     });
 
-    const operation = await acquireInstanceOperation(paths, instanceId);
+    const operation = await acquireInstanceOperation(paths, instanceId, { command: 'create' });
     if (!operation) throw busy();
     try {
       return await this.#provision(reporter, operation, interaction);
@@ -554,7 +732,7 @@ class Cli {
   }
 
   async #resumeWork({ reporter, interaction }: Session, instanceId: string): Promise<Outcome> {
-    const operation = await acquireInstanceOperation(this.#paths, instanceId);
+    const operation = await acquireInstanceOperation(this.#paths, instanceId, { command: 'resume' });
     if (!operation) throw busy();
     try {
       await runStep(reporter, PREREQUISITES_STEP, async () => {
@@ -576,7 +754,7 @@ class Cli {
 
   async #removeWork(
     { reporter, interaction }: Session,
-    options: Options,
+    options: CommandOptions,
     instanceId: string,
     abandon: ReadonlySet<AbandonableResource>,
   ): Promise<Outcome> {
@@ -596,7 +774,7 @@ class Cli {
     }
     const remove: RemoveAssistantRunner = this.#runtime.removeAssistant ?? removeAssistant;
     const removed = await runStep(reporter, { id: 'remove', label: 'Removing the assistant…' }, () =>
-      remove(this.#paths, instanceId, { interaction, abandon, reporter }),
+      remove(this.#paths, instanceId, { interaction, abandon, reporter, serviceHelpers: this.#runtime.serviceHelpers }),
     );
     return {
       status: 'ready',
@@ -605,7 +783,173 @@ class Cli {
     };
   }
 
-  #secrets(options: Options): Promise<SecretSource> {
+  /**
+   * `start`, `stop`, and `restart` act on the assistant's host service alone,
+   * through NanoClaw's own helpers and with its semantics (KTD3): agent
+   * containers are left for the next start to adopt, and a stop lasts until
+   * the next start, login, or reboot. A start or restart ends only once the
+   * host answers on its CLI socket.
+   */
+  async #serviceWork({ reporter }: Session, command: ServiceCommand, instanceId: string): Promise<Outcome> {
+    const operation = await acquireInstanceOperation(this.#paths, instanceId, { command });
+    if (!operation) throw busy();
+    try {
+      const record = await loadCreatedRuntime(this.#paths, instanceId);
+      const helpers = this.#runtime.serviceHelpers;
+      if (!helpers) {
+        throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
+      }
+      const service = createServiceControl(helpers, runtimeServiceTarget(record));
+      switch (command) {
+        case 'start': {
+          const started = await runStep(reporter, { id: 'start', label: 'Starting the assistant…' }, () =>
+            service.start(),
+          );
+          await verifyServing(reporter, service, instanceId);
+          return {
+            status: 'ready',
+            message:
+              started === 'started'
+                ? `Assistant ${instanceId} started.`
+                : `Assistant ${instanceId} is already running.`,
+          };
+        }
+        case 'stop': {
+          const stopped = await runStep(reporter, { id: 'stop', label: 'Stopping the assistant…' }, () =>
+            service.stop(),
+          );
+          return stopped === 'stopped'
+            ? {
+                status: 'ready',
+                message: `Assistant ${instanceId} stopped.`,
+                details: [
+                  'Its agent containers keep running for the next start to adopt.',
+                  'It stays stopped until the next gws-ea start, login, or reboot.',
+                ],
+              }
+            : { status: 'ready', message: `Assistant ${instanceId} is already stopped.` };
+        }
+        case 'restart': {
+          const restarted = await runStep(reporter, { id: 'restart', label: 'Restarting the assistant…' }, () =>
+            service.restart(),
+          );
+          await verifyServing(reporter, service, instanceId);
+          return {
+            status: 'ready',
+            message:
+              restarted === 'restarted'
+                ? `Assistant ${instanceId} restarted.`
+                : `Assistant ${instanceId} was not running; it is now started.`,
+          };
+        }
+      }
+    } finally {
+      operation.release();
+    }
+  }
+
+  /**
+   * `update`: stage this tool's release beside the running assistant, show
+   * what the update changes, and once confirmed carry it through its cutover
+   * to the recorded release (R7, R8, R10, R12). Confirmation is settled first,
+   * so a run that could never be confirmed stops before anything is read or
+   * staged. An update already under way to this release is continued, not
+   * staged again, and a recorded one's follow-ups are finished before anything
+   * else (KTD2), even when this release is the one already recorded.
+   */
+  async #updateWork({ reporter }: Session, request: UpdateRequest, yes: boolean): Promise<Outcome> {
+    const confirm = yes ? async (): Promise<boolean> => true : this.#runtime.confirmUpdate;
+    if (!confirm) {
+      throw new GwsEaError(
+        'input_required',
+        'An update needs confirmation: pass --yes, or run gws-ea update in a terminal to be asked.',
+      );
+    }
+    const { serviceHelpers, toolProviderSetup, upsertEnvVars, hostStatus } = this.#runtime;
+    if (!serviceHelpers || !toolProviderSetup || !upsertEnvVars || !hostStatus) {
+      throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
+    }
+    const seams = this.#runtime.update ?? {};
+    const intent = await runStep(reporter, { id: 'resolve_release', label: 'Resolving the release…' }, () =>
+      resolveUpdateIntent(this.#paths, request, seams),
+    );
+    const operation = await acquireInstanceOperation(this.#paths, request.instanceId, {
+      command: 'update',
+      target: intent.target,
+    });
+    if (!operation) throw busy();
+    try {
+      const dependencies: UpdateDependencies = {
+        ...seams,
+        serviceHelpers,
+        providerSetup: await toolProviderSetup(),
+        upsertEnvVars,
+        hostStatus,
+        reporter,
+      };
+      const unfinished = await readOperationRecord(this.#paths, request.instanceId);
+      if (unfinished?.phase === 'recorded') {
+        const notes = await finishFollowUps(operation, dependencies);
+        if (sameRelease(unfinished.to, intent.target)) {
+          return finishedOutcome(request.instanceId, unfinished.to, notes);
+        }
+      }
+      if (!unfinished || unfinished.phase === 'recorded') {
+        const staged = await prepareUpdate(operation, intent, dependencies);
+        for (const line of updatePreviewLines(staged.preview)) this.#presenter.line(line);
+        const record = await confirmStagedUpdate(operation, staged, dependencies, confirm);
+        if (!record) return { status: 'ready', message: 'Update cancelled. Nothing was changed.' };
+      }
+      return updatedOutcome(request.instanceId, await continueUpdate(operation, dependencies));
+    } finally {
+      operation.release();
+    }
+  }
+
+  /**
+   * `rollback`: return the assistant to the release kept in `previous/`, or
+   * settle what its record says is unfinished (R13-R16). A restore of the
+   * pre-update snapshot is shown first and needs confirmation: `--yes`, or a
+   * terminal to be asked on; a code-only rollback loses nothing and is not
+   * asked about. A recorded rollback's follow-ups run last.
+   */
+  async #rollbackWork({ reporter }: Session, instanceId: string, options: CommandOptions): Promise<Outcome> {
+    const { serviceHelpers, upsertEnvVars, hostStatus, confirmRollback } = this.#runtime;
+    if (!serviceHelpers || !upsertEnvVars || !hostStatus) {
+      throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
+    }
+    const timezone = localTimezone();
+    const confirm =
+      options.yes === 'true' ? async (): Promise<boolean> => true : confirmRollback ? confirmRollback : undefined;
+    const request: RollbackRequest = {
+      ...(options.snapshot === 'true' ? { snapshot: true } : {}),
+      present: (preview) => {
+        for (const line of rollbackPreviewLines(preview, timezone)) this.#presenter.line(line);
+      },
+      ...(confirm ? { confirm } : {}),
+    };
+    const operation = await acquireInstanceOperation(this.#paths, instanceId, { command: 'rollback' });
+    if (!operation) throw busy();
+    try {
+      const dependencies: CutoverDependencies = {
+        ...(this.#runtime.update ?? {}),
+        serviceHelpers,
+        upsertEnvVars,
+        hostStatus,
+        reporter,
+      };
+      const outcome = await rollBack(operation, dependencies, request);
+      const notes =
+        outcome.kind === 'rolled_back' || outcome.kind === 'follow_ups_finished'
+          ? await finishFollowUps(operation, dependencies)
+          : [];
+      return rollbackOutcome(instanceId, outcome, timezone, notes);
+    } finally {
+      operation.release();
+    }
+  }
+
+  #secrets(options: CommandOptions): Promise<SecretSource> {
     return loadSecretSource({
       environment: this.#runtime.environment ?? process.env,
       ...(options['secrets-file'] ? { file: options['secrets-file'] } : {}),
@@ -626,10 +970,12 @@ class Cli {
     };
     const continueWith = (extra?: string): string => this.#continueCommand(plan, state, extra);
     let run: RunLog | undefined;
-    // A signal while waiting on a pause stops the wait; otherwise the run ends, and its log says where.
+    // A signal while waiting on a pause stops the wait. Otherwise, or when the wait was already told to stop
+    // and has not (it may be stuck in a probe that cannot be aborted), the run ends, and its log says where.
     const interrupted = (signal: NodeJS.Signals): void => {
-      if (this.#waiting) {
-        this.#waiting.abort();
+      const waiting = this.#waiting;
+      if (waiting && !waiting.signal.aborted) {
+        waiting.abort();
         return;
       }
       run?.interrupt(signal);
@@ -700,6 +1046,11 @@ class Cli {
         presenter.report({ outcome: 'busy', headline: safeErrorMessage(error), details: log });
         return { status: 'done', exitCode: EXIT_CODES.busy };
       }
+      // Retrying cannot help, and this command's own rerun is not the way on.
+      if (isStateRefusal(error)) {
+        presenter.report({ outcome: 'failed', headline: safeErrorMessage(error), details: log });
+        return { status: 'done', exitCode: EXIT_CODES.failed };
+      }
       const nextAction = this.#nextAction(plan, state);
       if (!run || (error instanceof GwsEaError && error.code === 'cancelled')) {
         presenter.report({
@@ -716,6 +1067,169 @@ class Cli {
       for (const signal of INTERRUPT_SIGNALS) process.off(signal, interrupted);
     }
     /* eslint-enable no-catch-all/no-catch-all */
+  }
+}
+
+function releaseName(release: ReleaseCoordinates): string {
+  return `${release.release_track} ${shortCommit(release.deployed_commit)}`;
+}
+
+/**
+ * Where an update leaves the assistant: on its release, the one it ran kept
+ * to roll back to; what its follow-ups said, such as main's template kept,
+ * comes first.
+ */
+function updatedOutcome(instanceId: string, updated: UpdatedAssistant): Outcome {
+  return {
+    status: 'ready',
+    message: `Assistant ${instanceId} was updated to ${releaseName(updated.to)}.`,
+    details: [...updated.notes, `Its previous release, ${releaseName(updated.from)}, is kept to roll back to.`],
+  };
+}
+
+/** Where a rollback left the assistant, after what its follow-ups said. */
+function rollbackOutcome(
+  instanceId: string,
+  outcome: RollbackOutcome,
+  timezone: string,
+  notes: readonly string[],
+): Outcome {
+  switch (outcome.kind) {
+    case 'rolled_back':
+      return {
+        status: 'ready',
+        message: `Assistant ${instanceId} was rolled back to ${releaseName(outcome.to)}.`,
+        details: [
+          ...notes,
+          ...(outcome.mode === 'code_only'
+            ? [
+                'Only its code went back: every conversation, memory, and setting since the update was kept.',
+                `The release it left, ${releaseName(outcome.from)}, is kept in ${outcome.keptAt} until the next update or removal.`,
+              ]
+            : [
+                `Its snapshot from ${formatLocalTime(outcome.snapshotAt, timezone)} was restored.`,
+                `What it recorded since, with the release it left, ${releaseName(outcome.from)}, is kept in ${outcome.keptAt} until the next update or removal.`,
+              ]),
+        ],
+      };
+    case 'update_discarded':
+      return {
+        status: 'ready',
+        message: `The update of assistant ${instanceId} to ${releaseName(outcome.discarded)} was discarded; it runs ${releaseName(outcome.release)} again.`,
+      };
+    case 'follow_ups_finished':
+      return {
+        status: 'ready',
+        message: `Assistant ${instanceId} runs ${releaseName(outcome.release)}; its rollback is finished.`,
+        ...(notes.length > 0 ? { details: [...notes] } : {}),
+      };
+    case 'declined':
+      return {
+        status: 'ready',
+        message: `Rollback cancelled. Assistant ${instanceId} stays on ${releaseName(outcome.release)} as before.`,
+      };
+  }
+}
+
+/** An update run that only finished the follow-ups of the release it would deploy, and what they said. */
+function finishedOutcome(instanceId: string, release: ReleaseCoordinates, notes: readonly string[]): Outcome {
+  return {
+    status: 'ready',
+    message: `Assistant ${instanceId} runs ${releaseName(release)}; its update is finished.`,
+    ...(notes.length > 0 ? { details: [...notes] } : {}),
+  };
+}
+
+/** Wait, as NanoClaw's own update does, until the host answers on its CLI socket. */
+async function verifyServing(
+  reporter: StepReporter,
+  service: InstanceServiceControl,
+  instanceId: string,
+): Promise<void> {
+  await runStep(reporter, { id: 'verify_host', label: 'Waiting for the assistant to answer…' }, async () => {
+    if (await service.verifyHealth()) return;
+    throw new GwsEaError(
+      'host_not_serving',
+      `Assistant ${instanceId}'s host never answered on its CLI socket; ` +
+        `see its errors with gws-ea logs --id ${instanceId} --errors.`,
+    );
+  });
+}
+
+/** A command's own arguments, before any `--`, and everything after it, untouched. */
+function splitPassThrough(args: readonly string[]): {
+  readonly own: readonly string[];
+  readonly passThrough: readonly string[];
+} {
+  const separator = args.indexOf('--');
+  return separator === -1
+    ? { own: args, passThrough: [] }
+    : { own: args.slice(0, separator), passThrough: args.slice(separator + 1) };
+}
+
+const NCL_OPTIONS: OptionSpec = { values: ['id'], switches: [] };
+
+/**
+ * `ncl`: hand the process to the assistant's own `bin/ncl` with everything
+ * after `--` untouched (KTD13), in the environment `buildInstanceCliCommand`
+ * gives it. The gate is passed under the instance lock, which is released
+ * just before the handover: `ncl` talks to the running host over its socket,
+ * and a lock it held would outlive it.
+ */
+async function prepareNcl(
+  paths: ControlPlanePaths,
+  args: readonly string[],
+  environment: NodeJS.ProcessEnv,
+): Promise<CommandEnd> {
+  const { own, passThrough } = splitPassThrough(args);
+  const instanceId = targetInstance(parseOptions(own, NCL_OPTIONS));
+  const operation = await acquireInstanceOperation(paths, instanceId, { command: 'ncl' });
+  if (!operation) throw busy();
+  try {
+    const runtime = await loadCreatedRuntime(paths, instanceId);
+    return { replaceWith: buildInstanceCliCommand(runtime, passThrough, environment) };
+  } finally {
+    operation.release();
+  }
+}
+
+/** The stop summary and exit code of a command that failed outside the attempt loop. */
+function reportStop(presenter: Presenter, error: unknown): number {
+  if (isBusy(error)) {
+    presenter.report({ outcome: 'busy', headline: safeErrorMessage(error), details: [] });
+    return EXIT_CODES.busy;
+  }
+  const usage =
+    error instanceof GwsEaError && error.code === 'invalid_arguments' ? ['Run gws-ea --help for usage.'] : [];
+  presenter.report({ outcome: 'failed', headline: safeErrorMessage(error), details: usage });
+  return EXIT_CODES.failed;
+}
+
+/**
+ * Run a command outside the attempt loop: `ncl` and the read-only commands.
+ * A failure becomes a stop summary and exit code; a command that asks for it
+ * has the process handed to its tool, which then owns the exit code.
+ */
+async function runOutsideAttempts(
+  presenter: Presenter,
+  execve: CliRuntime['execve'],
+  run: () => Promise<CommandEnd>,
+): Promise<number> {
+  let end: CommandEnd;
+  /* eslint-disable no-catch-all/no-catch-all -- The CLI boundary turns every failure into a redacted summary and exit code. */
+  try {
+    end = await run();
+  } catch (error) {
+    return reportStop(presenter, error);
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+  if ('exitCode' in end) return end.exitCode;
+  try {
+    return await replaceProcessWithCommand(end.replaceWith, execve);
+  } catch (error) {
+    // A tool that cannot be started is reported; the replacement itself failing is not a stop summary.
+    if (!(error instanceof GwsEaError)) throw error;
+    return reportStop(presenter, error);
   }
 }
 
@@ -860,34 +1374,81 @@ function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undef
 }
 
 function printHelp(output: LineWriter): void {
-  output('Usage: gws-ea <create|resume|remove> [options]');
+  output('Usage: gws-ea <command> [options]');
   output('  create --track <dogfood|prod> [--source-remote <remote>] [--google-account <email>]');
   output('         [--assistant-first-name <name> --assistant-last-name <name>]');
   output('         [--principal-first-name <name> --principal-last-name <name> --principal-timezone <iana>]');
   output('         [--workspace-email <email>] [--provider <id>]');
   output('         [--ingress existing --endpoint <https-url>]');
   output('         [--ingress managed-cloudflare --cloudflare-zone <zone> --hostname-label <label>]');
+  output("         Deploys this gws-ea's own release, which must be committed, clean, and on the track.");
   output('  resume --id <instance_id> [--chat-configured] [--messaging-group-id <exact-id>]');
+  output('  start --id <instance_id>');
+  output('  stop --id <instance_id>');
+  output('         Agent containers keep running; the assistant stays stopped until the next start, login, or reboot.');
+  output('  restart --id <instance_id>');
+  output('  update --id <instance_id> [--track <track>] [--source-remote <remote>] [--yes]');
+  output(
+    "         Stages this gws-ea's release beside the running assistant and shows what changes before anything does,",
+  );
+  output(
+    '         then switches to it during a brief stop, verifies it, and keeps the previous release to roll back to.',
+  );
+  output('         --track and --source-remote move it to another track or repository that holds the release.');
+  output('         Rerun it to continue an update that was cut short, or to retry the follow-ups one left.');
+  output('  rollback --id <instance_id> [--snapshot] [--yes]');
+  output(
+    '         Returns to the kept previous release, keeping every message since the update unless it changed a schema;',
+  );
+  output('         then, or with --snapshot, it restores the pre-update snapshot after showing what that discards.');
+  output('         Rerun it to continue a rollback that was cut short, or to revert an update that is unfinished.');
+  for (const command of READ_ONLY_COMMANDS.values()) for (const line of command.usage) output(`  ${line}`);
+  output('  ncl --id <instance_id> -- <ncl arguments>');
+  output("         Runs the assistant's own ncl, passing everything after -- unchanged.");
   output('  remove --id <instance_id> [--yes] [--abandon gcp-project,cloudflare-dns]');
-  output('  Every command: [--secrets-file <owner-only file under the config root>] [--capture-fixtures]');
+  output('  create, resume, remove: [--secrets-file <owner-only file under the config root>] [--capture-fixtures]');
   output('  Secrets: GWS_EA_PROVIDER_CREDENTIAL, GWS_EA_CLOUDFLARE_API_TOKEN (environment or --secrets-file).');
-  output('  Exit codes: 0 ready, 10 paused for a person, 1 failed, 75 busy.');
+  output('  Exit codes: 0 ready, 10 paused for a person, 1 failed, 75 busy; ncl and logs exit as their tool does.');
 }
 
 export async function runCli(args: readonly string[], runtime: CliRuntime = {}): Promise<number> {
   const output = runtime.stdout ?? ((line) => process.stdout.write(`${line}\n`));
   const errorOutput = runtime.stderr ?? ((line) => process.stderr.write(`${line}\n`));
-  if (args.length === 0 || args[0] === 'help' || args.includes('--help') || args.includes('-h')) {
+  // gws-ea's own help is asked for only before `--`; what follows belongs to the tool it runs.
+  const { own } = splitPassThrough(args);
+  if (own.length === 0 || own[0] === 'help' || own.includes('--help') || own.includes('-h')) {
     printHelp(output);
     return EXIT_CODES.ready;
   }
   const command = args[0];
-  if (command !== 'create' && command !== 'resume' && command !== 'remove') {
+  const presenter = runtime.presenter ?? createLinePresenter(output, errorOutput);
+  const environment = runtime.environment ?? process.env;
+  const readOnly = READ_ONLY_COMMANDS.get(command);
+  if (readOnly) {
+    return runOutsideAttempts(presenter, runtime.execve, async () =>
+      readOnly.run(
+        {
+          paths: runtime.paths ?? resolveControlPlanePaths(),
+          output,
+          errorOutput,
+          environment,
+          serviceHelpers: runtime.serviceHelpers,
+          hostStatus: runtime.hostStatus,
+        },
+        parseOptions(args.slice(1), readOnly.options),
+      ),
+    );
+  }
+  if (command === 'ncl') {
+    return runOutsideAttempts(presenter, runtime.execve, async () =>
+      prepareNcl(runtime.paths ?? resolveControlPlanePaths(), args.slice(1), environment),
+    );
+  }
+  if (!isCommand(command)) {
     errorOutput('Unknown command.');
     printHelp(errorOutput);
     return EXIT_CODES.failed;
   }
-  const presenter = runtime.presenter ?? createLinePresenter(output, errorOutput);
   const managedIngressSetup = runtime.managedIngressSetup ?? createManagedIngressSetupSession();
   const cli = new Cli(runtime, presenter, managedIngressSetup);
   try {

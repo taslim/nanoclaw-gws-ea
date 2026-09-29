@@ -19,9 +19,25 @@ import {
   reserveInstance,
   withInstanceOperation,
 } from './journal.js';
-import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
-import type { SanitizedCommand, SanitizedCommandOutcome } from './process.js';
-import { allocateInstanceId, readRegistry, withLockedCloudflareRegistry, writeInstanceMarker } from './registry.js';
+import { ONECLI_INSTANCE_LABEL, ONECLI_RESOURCE_ROLE_LABEL } from './onecli-compose.js';
+import {
+  advanceOperation,
+  beginOperation,
+  commitOperationRelease,
+  OPERATION_PHASES,
+  type MovedImage,
+  type OperationFollowUp,
+  type OperationPhase,
+} from './operation.js';
+import { RELEASE_SLOTS, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+import type { SanitizedCommand, SanitizedCommandOutcome, SanitizedCommandOutcomeRunner } from './process.js';
+import {
+  allocateInstanceId,
+  readRegistry,
+  swapInstanceRelease,
+  withLockedCloudflareRegistry,
+  writeInstanceMarker,
+} from './registry.js';
 import {
   describeRemoval,
   RemovalPause,
@@ -29,7 +45,8 @@ import {
   type RemovalDependencies,
   type RemovalInteraction,
 } from './remove.js';
-import { GwsEaError, type InstanceReservationInput, type ProvisionStepId } from './types.js';
+import type { NanoclawServiceHandle, NanoclawServiceHelpers } from './service-control.js';
+import { GwsEaError, type InstanceReservationInput, type ProvisionStepId, type ReleaseCoordinates } from './types.js';
 import { keepAccountToken } from './cloudflare-token.js';
 
 // Removal must never reach a real gcloud, Docker, service manager, or Cloudflare from these tests.
@@ -46,10 +63,25 @@ vi.mock('./cloudflare-api.js', async (importOriginal) => ({
     throw new Error('A real Cloudflare client was created');
   },
 }));
+/**
+ * Root-owned files a test has removal find without writing them: a system
+ * unit lives at a fixed path under `/etc`, outside any test root. Only the
+ * existence check sees them; every other path is the real filesystem's.
+ */
+const rootOwnedFiles = vi.hoisted(() => new Set<string>());
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  const access: typeof actual.access = async (file, mode) => {
+    if (typeof file === 'string' && rootOwnedFiles.has(file)) return;
+    return actual.access(file, mode);
+  };
+  return { ...actual, access };
+});
 
 const roots: string[] = [];
 
 afterEach(async () => {
+  rootOwnedFiles.clear();
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
@@ -144,8 +176,28 @@ function failed(stderr: string): SanitizedCommandOutcome {
   return { stdout: '', stderr, exitCode: 1 };
 }
 
-/** What `launchctl print` answers for a job that is not loaded. */
-const NOT_LOADED: SanitizedCommandOutcome = { stdout: '', stderr: 'Could not find service', exitCode: 113 };
+/**
+ * NanoClaw's service helpers, faked: detection answers what the service is
+ * now, a stop leaves it stopped, and a stop or drain lands in `order`.
+ */
+function nanoclawService(order: string[], detected: NanoclawServiceHandle) {
+  let current = detected;
+  return {
+    createCommandRunner: vi.fn<NanoclawServiceHelpers['createCommandRunner']>(() => ({
+      run: () => '',
+      tryRun: () => ({ ok: true, stdout: '' }),
+    })),
+    detectService: vi.fn<NanoclawServiceHelpers['detectService']>(() => current),
+    stopService: vi.fn<NanoclawServiceHelpers['stopService']>(async (handle) => {
+      order.push('service-stop');
+      current = { ...handle, active: false };
+    }),
+    startService: vi.fn<NanoclawServiceHelpers['startService']>(),
+    drainContainers: vi.fn<NanoclawServiceHelpers['drainContainers']>(async () => void order.push('drain')),
+    verifyServiceHealth: vi.fn<NanoclawServiceHelpers['verifyServiceHealth']>(async () => true),
+  } satisfies NanoclawServiceHelpers;
+}
+type FakeNanoclawService = ReturnType<typeof nanoclawService>;
 
 /** One Google Cloud project as gcloud reports it to the reserved account. */
 class FakeGcloud {
@@ -253,6 +305,240 @@ class FakeCloudflare {
       }),
     };
   }
+}
+
+const COMPOSE_PROJECT = 'com.docker.compose.project';
+/** An agent group with its own image, `<repository>:<agent group ID>`. */
+const AGENT_GROUP = 'ag-research';
+
+/** An image ID, one hex digit repeated. */
+function imageId(digit: string): string {
+  return `sha256:${digit.repeat(64)}`;
+}
+
+function installOf(input: InstanceReservationInput): string {
+  return input.instance_id.replaceAll('-', '');
+}
+
+/** The assistant's own agent-image repository. */
+function repositoryOf(input: InstanceReservationInput): string {
+  return getInstallScopedNames(installOf(input)).containerImageBase;
+}
+
+interface FakeContainer {
+  readonly id: string;
+  /** The ID of the image it runs. */
+  readonly image: string;
+  readonly labels: Readonly<Record<string, string>>;
+}
+
+interface FakeNamedResource {
+  readonly name: string;
+  readonly labels: Readonly<Record<string, string>>;
+}
+
+/** The values each `flag` in `args` was given. */
+function flagValues(args: readonly string[], flag: string): string[] {
+  return args.flatMap((arg, index) => (args[index - 1] === flag ? [arg] : []));
+}
+
+/** Whether `labels` carries every `--filter label=<key>=<value>` in `args`. */
+function labelsMatch(labels: Readonly<Record<string, string>>, args: readonly string[]): boolean {
+  return flagValues(args, '--filter')
+    .filter((filter) => filter.startsWith('label='))
+    .every((filter) => {
+      const [key, value] = filter.slice('label='.length).split(/=(.*)/su);
+      return key !== undefined && labels[key] === value;
+    });
+}
+
+/**
+ * One Docker daemon, answering the commands removal runs the way Docker does:
+ * removing an image's last tag deletes the image; deleting by ID untags and
+ * deletes an image whose tags are all in one repository; nothing deletes an
+ * image a container runs; and `compose down` deletes the images its services
+ * ran only when given `--rmi`.
+ */
+class FakeDocker {
+  /** Each image by ID, with the references (`repository:tag`) naming it. */
+  readonly images = new Map<string, Set<string>>();
+  containers: FakeContainer[] = [];
+  networks: FakeNamedResource[] = [];
+  volumes: FakeNamedResource[] = [];
+  readonly calls: string[] = [];
+
+  image(id: string, ...references: string[]): this {
+    this.images.set(id, new Set(references));
+    return this;
+  }
+
+  /** Every reference in `repository`, sorted. */
+  tags(repository: string): string[] {
+    return [...this.images.values()]
+      .flatMap((references) => [...references])
+      .filter((reference) => reference.startsWith(`${repository}:`))
+      .sort();
+  }
+
+  /** An assistant as create and one update left it: its agent images and containers, and its OneCLI stack. */
+  assistant(
+    input: InstanceReservationInput,
+    images: { readonly latest: string; readonly previous: string; readonly group: string },
+    onecli: { readonly gateway: string; readonly postgres: string; readonly app: string },
+  ): this {
+    const install = installOf(input);
+    const repository = repositoryOf(input);
+    const project = input.exclusive_resource_claims.onecli_project;
+    this.image(images.latest, `${repository}:latest`)
+      .image(images.previous, `${repository}:previous`)
+      .image(images.group, `${repository}:${AGENT_GROUP}`);
+    const agent = { 'nanoclaw-install': install };
+    this.containers.push(
+      { id: `${install}-agent`, image: images.group, labels: agent },
+      { id: `${install}-exited`, image: images.latest, labels: agent },
+      ...(['postgres', 'app', 'gateway'] as const).map((service) => ({
+        id: `${install}-${service}`,
+        image: onecli[service],
+        labels: {
+          [COMPOSE_PROJECT]: project,
+          'com.docker.compose.service': service,
+          [ONECLI_INSTANCE_LABEL]: input.instance_id,
+        },
+      })),
+    );
+    const owned = (role: string) => ({
+      [COMPOSE_PROJECT]: project,
+      [ONECLI_INSTANCE_LABEL]: input.instance_id,
+      [ONECLI_RESOURCE_ROLE_LABEL]: role,
+    });
+    this.networks.push(
+      { name: `${project}-backend`, labels: owned('backend') },
+      { name: `${project}-agent-egress`, labels: owned('agent-egress') },
+    );
+    this.volumes.push(
+      { name: `${project}-postgres`, labels: owned('postgres-data') },
+      { name: `${project}-app`, labels: owned('app-data') },
+    );
+    return this;
+  }
+
+  /** Everything Docker holds for one assistant: its repository's tags, and its containers, networks, and volumes. */
+  of(input: InstanceReservationInput) {
+    const install = installOf(input);
+    const project = input.exclusive_resource_claims.onecli_project;
+    const mine = (labels: Readonly<Record<string, string>>): boolean =>
+      labels['nanoclaw-install'] === install || labels[COMPOSE_PROJECT] === project;
+    return {
+      tags: this.tags(repositoryOf(input)),
+      containers: this.containers.filter((container) => mine(container.labels)),
+      networks: this.networks.filter((network) => mine(network.labels)),
+      volumes: this.volumes.filter((volume) => mine(volume.labels)),
+    };
+  }
+
+  /** Delete an image by ID or reference, returning Docker's refusal, if any. */
+  #remove(reference: string): string | undefined {
+    const runBy = (id: string) => this.containers.find((container) => container.image === id);
+    const byId = this.images.get(reference);
+    if (byId) {
+      const repositories = new Set([...byId].map((tag) => tag.slice(0, tag.lastIndexOf(':'))));
+      if (repositories.size > 1) {
+        return `conflict: unable to delete ${reference} (must be forced) - image is referenced in multiple repositories`;
+      }
+      const container = runBy(reference);
+      if (container) {
+        return `conflict: unable to delete ${reference} - image is being used by container ${container.id}`;
+      }
+      this.images.delete(reference);
+      return undefined;
+    }
+    for (const [id, references] of this.images) {
+      if (!references.has(reference)) continue;
+      const container = runBy(id);
+      if (references.size === 1 && container) {
+        return `conflict: unable to remove repository reference "${reference}" (must force) - container ${container.id} is using its referenced image`;
+      }
+      references.delete(reference);
+      if (references.size === 0) this.images.delete(id);
+      return undefined;
+    }
+    return `Error response from daemon: No such image: ${reference}`;
+  }
+
+  run(args: readonly string[]): SanitizedCommandOutcome {
+    this.calls.push(args.join(' '));
+    const [group, verb, ...rest] = args;
+    const listed = (items: readonly string[]) => ok(items.map((item) => `${item}\n`).join(''));
+    if (group === 'ps' || (group === 'container' && verb === 'ls')) {
+      return listed(this.containers.filter((container) => labelsMatch(container.labels, args)).map(({ id }) => id));
+    }
+    if (group === 'rm' && verb === '--force') {
+      this.containers = this.containers.filter((container) => !rest.includes(container.id));
+      return ok();
+    }
+    if (group === 'container' && verb === 'inspect') {
+      const inspected = this.containers
+        .filter((container) => rest.includes(container.id))
+        .map((container) => ({
+          Id: container.id,
+          Config: {
+            Image: [...(this.images.get(container.image) ?? [])][0] ?? container.image,
+            Labels: container.labels,
+          },
+          State: { Running: true },
+          NetworkSettings: { Networks: {}, Ports: {} },
+          Mounts: [],
+        }));
+      return ok(JSON.stringify(inspected));
+    }
+    if ((group === 'network' || group === 'volume') && verb === 'ls') {
+      const named = flagValues(args, '--filter').flatMap((filter) => {
+        const exact = /^name=\^(.+)\$$/u.exec(filter);
+        return exact?.[1] ? [exact[1]] : [];
+      });
+      const resources = group === 'network' ? this.networks : this.volumes;
+      return listed(
+        resources
+          .filter((resource) => named.every((name) => resource.name === name) && labelsMatch(resource.labels, args))
+          .map(({ name }) => name),
+      );
+    }
+    if (group === 'image' && verb === 'ls' && flagValues(args, '--format')[0] === '{{.Repository}}:{{.Tag}}') {
+      return listed(this.tags(args.at(-1) ?? ''));
+    }
+    if (group === 'image' && verb === 'inspect' && flagValues(args, '--format')[0] === '{{json .RepoTags}}') {
+      const id = args.at(-1) ?? '';
+      const references = this.images.get(id);
+      if (!references) return { stdout: '', stderr: `Error response from daemon: No such image: ${id}`, exitCode: 1 };
+      return ok(`${JSON.stringify([...references])}\n`);
+    }
+    if (group === 'image' && verb === 'rm') {
+      const refusals = rest.flatMap((reference) => this.#remove(reference) ?? []);
+      return refusals.length === 0 ? ok() : { stdout: '', stderr: refusals.join('\n'), exitCode: 1 };
+    }
+    if (group === 'compose' && args.includes('down')) {
+      const project = flagValues(args, '--project-name')[0];
+      const inProject = (labels: Readonly<Record<string, string>>): boolean => labels[COMPOSE_PROJECT] === project;
+      const stopped = this.containers.filter((container) => inProject(container.labels));
+      this.containers = this.containers.filter((container) => !inProject(container.labels));
+      this.networks = this.networks.filter((network) => !inProject(network.labels));
+      if (args.includes('--volumes')) this.volumes = this.volumes.filter((volume) => !inProject(volume.labels));
+      // Compose only warns about an image it could not delete.
+      if (args.includes('--rmi')) for (const container of stopped) this.#remove(container.image);
+      return ok();
+    }
+    throw new Error(`Unexpected docker command: ${args.join(' ')}`);
+  }
+}
+
+/** Removal's local commands, Docker's answered by `docker`, with no stray host to find. */
+function teardownCommands(docker: FakeDocker, calls: string[] = []): SanitizedCommandOutcomeRunner {
+  return async (command) => {
+    calls.push(`${command.command} ${command.args.join(' ')}`);
+    if (command.command === 'docker') return docker.run(command.args);
+    if (command.command === 'pkill' || command.command === 'pgrep') return failed('');
+    throw new Error(`Unexpected command: ${command.command} ${command.args.join(' ')}`);
+  };
 }
 
 function route(input: InstanceReservationInput): Record<string, unknown> {
@@ -1022,6 +1308,400 @@ describe('removal from any partial state', () => {
   });
 });
 
+describe('removal after an update or rollback', () => {
+  const TARGET = 'b'.repeat(40);
+  const RECORDED_DOCKER = 'unix:///var/run/recorded-docker.sock';
+
+  function release(input: InstanceReservationInput, commit: string) {
+    return { source_remote: input.source_remote, release_track: input.release_track, deployed_commit: commit };
+  }
+
+  async function checkoutAt(root: string, instanceId: string, commit: string, docker?: string): Promise<void> {
+    const state = path.join(root, 'data', 'gws-ea');
+    await mkdir(state, { recursive: true, mode: 0o700 });
+    await writePrivate(path.join(state, 'instance.json'), {
+      schema_version: 1,
+      instance_id: instanceId,
+      deployed_commit: commit,
+    });
+    if (docker) await writePrivate(path.join(state, 'runtime.json'), { docker_endpoint: docker });
+  }
+
+  /** The runtime record of the release in `checkout`: a home of the test's own, and the recorded endpoint and CLI. */
+  async function recordRuntime(paths: ControlPlanePaths, checkout: string): Promise<void> {
+    await writePrivate(path.join(checkout, 'data', 'gws-ea', 'runtime.json'), {
+      home_directory: path.join(paths.stateRoot, 'home'),
+      docker_endpoint: RECORDED_DOCKER,
+      onecli_cli_path: '/opt/onecli/bin/onecli',
+    });
+  }
+
+  /** What an operation records as it runs: the follow-ups it planned, and the images it moved before `started`. */
+  interface Recorded {
+    readonly followUps?: readonly OperationFollowUp[];
+    readonly images?: readonly MovedImage[];
+  }
+
+  /** Run an update or rollback through its record until `phase`. */
+  async function operateUntil(
+    paths: ControlPlanePaths,
+    input: InstanceReservationInput,
+    phase: OperationPhase,
+    moving: {
+      readonly kind: 'update' | 'rollback';
+      readonly from: ReleaseCoordinates;
+      readonly to: ReleaseCoordinates;
+    },
+    recorded: Recorded,
+  ): Promise<void> {
+    const operation = await acquireInstanceOperation(
+      paths,
+      input.instance_id,
+      moving.kind === 'update' ? { command: 'update', target: moving.to } : { command: 'rollback' },
+    );
+    if (!operation) throw new Error('The test instance operation was busy');
+    try {
+      await beginOperation(operation, { ...moving, follow_ups: recorded.followUps ?? [{ kind: 'refresh_template' }] });
+      for (const step of OPERATION_PHASES.slice(1, OPERATION_PHASES.indexOf(phase) + 1)) {
+        if (step === 'recorded') await commitOperationRelease(operation);
+        else if (step === 'stopped') {
+          await advanceOperation(operation, step, { stop: { at: '2026-09-28T10:00:00.000Z', graceful: true } });
+        } else await advanceOperation(operation, step, step === 'started' ? { images: recorded.images ?? [] } : {});
+      }
+    } finally {
+      operation.release();
+    }
+  }
+
+  /**
+   * An update from the reserved commit to `TARGET`, interrupted at `phase`,
+   * with the directories each phase leaves: the staged release beside the live
+   * one until the renames, then the live one at the target and the old one kept;
+   * the files kept with the outgoing release, the carry's build area, and the
+   * previous release an earlier update kept, set aside at the swap.
+   */
+  async function interruptedAt(
+    paths: ControlPlanePaths,
+    input: InstanceReservationInput,
+    phase: OperationPhase,
+    recorded: Recorded = {},
+  ): Promise<void> {
+    const id = input.instance_id;
+    const renamed = OPERATION_PHASES.indexOf(phase) >= OPERATION_PHASES.indexOf('swapped');
+    const live = paths.checkoutRoot(id);
+    const previous = paths.releaseCheckoutRoot(id, 'previous');
+    const next = paths.releaseCheckoutRoot(id, 'next');
+    await rm(live, { recursive: true, force: true });
+    const kept = async (root: string): Promise<void> => {
+      await writePrivate(path.join(root, 'release-preflight.json'), { instance_id: id });
+      await writePrivate(path.join(root, 'host-environment.json'), { WEBHOOK_PORT: '1' });
+    };
+    const older = paths.releaseCheckoutRoot(id, 'superseded');
+    if (phase === 'swapping') {
+      // Killed between the two renames: the old release is kept, the staged one not yet in place.
+      await checkoutAt(previous, id, input.deployed_commit, RECORDED_DOCKER);
+      await kept(paths.releaseRoot(id, 'previous'));
+      await checkoutAt(older, id, 'c'.repeat(40));
+      await checkoutAt(next, id, TARGET);
+    } else if (renamed) {
+      await checkoutAt(live, id, TARGET, RECORDED_DOCKER);
+      await checkoutAt(previous, id, input.deployed_commit, RECORDED_DOCKER);
+      await kept(paths.releaseRoot(id, 'previous'));
+      await checkoutAt(older, id, 'c'.repeat(40));
+    } else {
+      await checkoutAt(live, id, input.deployed_commit, RECORDED_DOCKER);
+      await checkoutAt(next, id, TARGET);
+      await kept(path.join(paths.releaseRoot(id, 'next'), 'previous'));
+      await mkdir(path.join(paths.releaseRoot(id, 'next'), 'carrying', 'data'), { recursive: true, mode: 0o700 });
+    }
+    const moving = { kind: 'update', from: release(input, input.deployed_commit), to: release(input, TARGET) } as const;
+    await operateUntil(paths, input, phase, moving, recorded);
+    await mkdir(paths.releaseCheckoutRoot(id, 'outgoing'), { recursive: true, mode: 0o700 });
+  }
+
+  /**
+   * A rollback of an update to `TARGET`, back to the reserved commit,
+   * interrupted at `phase`. Before the renames the updated release is live and
+   * the one it replaced is kept in `previous/`; between them the updated
+   * release has moved to `outgoing/` and nothing is live; after them the
+   * restored release is live and the updated one kept in `outgoing/`. Only the
+   * updated release, the one that was running, holds a runtime record.
+   */
+  async function rolledBackAt(
+    paths: ControlPlanePaths,
+    input: InstanceReservationInput,
+    phase: OperationPhase,
+    recorded: Recorded,
+  ): Promise<void> {
+    const id = input.instance_id;
+    const original = release(input, input.deployed_commit);
+    const updated = release(input, TARGET);
+    await swapInstanceRelease(paths, id, original, updated);
+    const live = paths.checkoutRoot(id);
+    await rm(live, { recursive: true, force: true });
+    const reached = OPERATION_PHASES.indexOf(phase);
+    const running = reached < OPERATION_PHASES.indexOf('swapping') ? live : paths.releaseCheckoutRoot(id, 'outgoing');
+    await checkoutAt(running, id, TARGET);
+    await recordRuntime(paths, running);
+    const restored = reached > OPERATION_PHASES.indexOf('swapping') ? live : paths.releaseCheckoutRoot(id, 'previous');
+    await checkoutAt(restored, id, input.deployed_commit);
+    await operateUntil(paths, input, phase, { kind: 'rollback', from: updated, to: original }, recorded);
+  }
+
+  it.each(OPERATION_PHASES)('completes with an update interrupted at %s', async (phase) => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(paths), {
+      started: ['materialize_checkout', 'start_onecli', 'start_nanoclaw'],
+    });
+    await interruptedAt(paths, input, phase);
+    const reservation = (await readRegistry(paths)).instances[input.instance_id]!;
+    const { dependencies } = world(reservation);
+    // What the update left: its record and its releases, all under the instance root.
+    const lifecycle = [
+      paths.operationFile(input.instance_id),
+      ...RELEASE_SLOTS.map((slot) => paths.releaseRoot(input.instance_id, slot)),
+    ];
+    const left: string[] = [];
+    for (const artifact of lifecycle) if (await exists(artifact)) left.push(artifact);
+    expect(left).toEqual(
+      expect.arrayContaining([
+        paths.operationFile(input.instance_id),
+        paths.releaseRoot(input.instance_id, 'outgoing'),
+      ]),
+    );
+
+    const outcome = await removeAssistant(paths, input.instance_id, dependencies);
+
+    expect(outcome.removed).toEqual(['nanoclaw', 'onecli', 'instance-files']);
+    // The recorded Docker endpoint is found in whichever release holds it, even with no live checkout.
+    expect(dependencies.resolveDocker).toHaveBeenCalledWith(RECORDED_DOCKER);
+    expect(dependencies.uninstallNanoclaw).toHaveBeenCalledWith(reservation, expect.anything());
+    for (const artifact of left) expect(await exists(artifact), artifact).toBe(false);
+    await expectGone(paths, reservation);
+  });
+
+  it.each(OPERATION_PHASES)(
+    'completes with a rollback interrupted at %s, deleting the images its record names',
+    async (phase) => {
+      const paths = await testPaths();
+      const input = await reserve(paths, reservationInput(paths), {
+        started: ['materialize_checkout', 'start_nanoclaw'],
+      });
+      const repository = repositoryOf(input);
+      const updatedImage = imageId('1');
+      const originalImage = imageId('2');
+      const displacedGroupImage = imageId('9');
+      await rolledBackAt(paths, input, phase, {
+        followUps: [{ kind: 'delete_image', image_id: displacedGroupImage }],
+        images: [{ tag: `${repository}:latest`, image_id: originalImage, displaced_image_id: updatedImage }],
+      });
+      // Until the retag, `:latest` is the updated release's image and `:previous` the one it replaced; after it,
+      // the restored image is `:latest` and the updated one keeps no tag. Nor does a group image a rebuild displaced.
+      const docker = new FakeDocker().image(imageId('3'), `${repository}:${AGENT_GROUP}`).image(displacedGroupImage);
+      if (OPERATION_PHASES.indexOf(phase) >= OPERATION_PHASES.indexOf('started')) {
+        docker.image(originalImage, `${repository}:latest`).image(updatedImage);
+      } else {
+        docker.image(updatedImage, `${repository}:latest`).image(originalImage, `${repository}:previous`);
+      }
+      const reservation = (await readRegistry(paths)).instances[input.instance_id]!;
+      const { uninstallNanoclaw: _fake, ...dependencies } = world(reservation).dependencies;
+
+      const outcome = await removeAssistant(paths, input.instance_id, {
+        ...dependencies,
+        runCommand: teardownCommands(docker),
+        serviceHelpers: nanoclawService([], { mode: 'none', active: false }),
+      });
+
+      expect(outcome.removed).toEqual(['nanoclaw', 'instance-files']);
+      // The recorded endpoint is found in the release that was running, wherever the rollback left it.
+      expect(dependencies.resolveDocker).toHaveBeenCalledWith(RECORDED_DOCKER);
+      expect([...docker.images.keys()]).toEqual([]);
+      await expectGone(paths, reservation);
+    },
+  );
+
+  it.each(RELEASE_SLOTS)('refuses before any effect when its %s release carries another assistant', async (slot) => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(paths), {
+      started: ['materialize_checkout', 'start_nanoclaw'],
+    });
+    await interruptedAt(paths, input, 'swapped');
+    await checkoutAt(paths.releaseCheckoutRoot(input.instance_id, slot), allocateInstanceId(), 'c'.repeat(40));
+    const { dependencies } = world(input);
+
+    await expect(removeAssistant(paths, input.instance_id, dependencies)).rejects.toMatchObject({
+      code: 'marker_mismatch',
+    });
+    expect(dependencies.uninstallNanoclaw).not.toHaveBeenCalled();
+    expect(await exists(paths.removalFile(input.instance_id))).toBe(false);
+    expect(await exists(paths.instanceRoot(input.instance_id))).toBe(true);
+  });
+
+  it('refuses a live checkout at a commit no unfinished operation explains', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(paths), { started: ['materialize_checkout'] });
+    await interruptedAt(paths, input, 'stopped');
+    await checkoutAt(paths.checkoutRoot(input.instance_id), input.instance_id, TARGET);
+
+    await expect(removeAssistant(paths, input.instance_id, world(input).dependencies)).rejects.toMatchObject({
+      code: 'marker_mismatch',
+    });
+    expect(await exists(paths.removalFile(input.instance_id))).toBe(false);
+  });
+
+  it('removes by instance identity alone when the operation record cannot be read', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(paths), { started: ['materialize_checkout'] });
+    await interruptedAt(paths, input, 'started');
+    await writeFile(paths.operationFile(input.instance_id), '{torn', { mode: 0o600 });
+
+    await removeAssistant(paths, input.instance_id, world(input).dependencies);
+
+    await expectGone(paths, input);
+  });
+
+  /** Images every assistant may share: gateways by content, OneCLI's own, and the machine's connector. */
+  const SHARED_IMAGES = {
+    'gws-ea-onecli-gateway:0a1b2c3d4e5f': imageId('a'),
+    'gws-ea-onecli-gateway:6a7b8c9d0e1f': imageId('b'),
+    'postgres:18-alpine': imageId('c'),
+    'ghcr.io/onecli/onecli:1.4.0': imageId('d'),
+    'cloudflare/cloudflared:2025.8.0': imageId('e'),
+  } as const;
+
+  /**
+   * A, whose one update is recorded and finished, beside B on one Docker. A
+   * runs the gateway B moved on from and keeps for its rollback; B runs the
+   * newer one; both run OneCLI's images, and the connector runs its own.
+   */
+  async function besidePeer(paths: ControlPlanePaths) {
+    const started = ['materialize_checkout', 'start_onecli', 'start_nanoclaw'] as const;
+    const a = await reserve(paths, reservationInput(paths), { started });
+    const b = await reserve(paths, reservationInput(paths, { label: 'peer', port: 34_001 }), { started });
+    await interruptedAt(paths, a, 'recorded', { followUps: [] });
+    // Its finished follow-ups deleted what the swap set aside.
+    await rm(paths.releaseRoot(a.instance_id, 'superseded'), { recursive: true, force: true });
+    await rm(paths.releaseRoot(a.instance_id, 'outgoing'), { recursive: true, force: true });
+    await recordRuntime(paths, a.checkout_realpath);
+    const docker = new FakeDocker();
+    for (const [reference, id] of Object.entries(SHARED_IMAGES)) docker.image(id, reference);
+    const onecli = { postgres: imageId('c'), app: imageId('d') };
+    docker
+      .assistant(
+        a,
+        { latest: imageId('1'), previous: imageId('2'), group: imageId('3') },
+        { ...onecli, gateway: imageId('a') },
+      )
+      .assistant(
+        b,
+        { latest: imageId('5'), previous: imageId('6'), group: imageId('7') },
+        { ...onecli, gateway: imageId('b') },
+      );
+    docker.containers.push({ id: 'cloudflared', image: imageId('e'), labels: {} });
+    const calls: string[] = [];
+    const { uninstallNanoclaw: _uninstall, removeOnecli: _removeOnecli, ...dependencies } = world(a).dependencies;
+    return {
+      a,
+      b,
+      docker,
+      calls,
+      dependencies: {
+        ...dependencies,
+        runCommand: teardownCommands(docker, calls),
+        serviceHelpers: nanoclawService([], { mode: 'none', active: false }),
+      },
+    };
+  }
+
+  it("deletes previous/, :previous, and every group's image after an update, and nothing of another assistant's", async () => {
+    const paths = await testPaths();
+    const { a, b, docker, calls, dependencies } = await besidePeer(paths);
+    const repository = repositoryOf(a);
+    expect(await exists(paths.releaseCheckoutRoot(a.instance_id, 'previous'))).toBe(true);
+    expect(docker.of(a).tags).toEqual([
+      `${repository}:${AGENT_GROUP}`,
+      `${repository}:latest`,
+      `${repository}:previous`,
+    ]);
+    const peer = docker.of(b);
+
+    await removeAssistant(paths, a.instance_id, dependencies);
+
+    // Nothing of A's is left: no tag in its repository, no image it built, no container, network, or volume.
+    expect(docker.of(a)).toEqual({ tags: [], containers: [], networks: [], volumes: [] });
+    for (const digit of ['1', '2', '3']) expect(docker.images.has(imageId(digit))).toBe(false);
+    await expectGone(paths, a);
+    // B's are exactly as they were, and removal never named B.
+    expect(docker.of(b)).toEqual(peer);
+    expect(await exists(paths.markerFile(b.instance_id))).toBe(true);
+    expect(calls.filter((call) => call.includes(installOf(b)) || call.includes(b.instance_id))).toEqual([]);
+  });
+
+  it('keeps the gateway image B runs, the one it keeps for its rollback, and every other shared image', async () => {
+    const paths = await testPaths();
+    const { a, b, docker, calls, dependencies } = await besidePeer(paths);
+    const shared = (): Record<string, string[]> =>
+      Object.fromEntries(Object.values(SHARED_IMAGES).map((id) => [id, [...(docker.images.get(id) ?? [])]]));
+    const before = shared();
+
+    await removeAssistant(paths, a.instance_id, dependencies);
+
+    // A's gateway container went with its OneCLI stack, but not the image it ran, which B's rollback needs.
+    expect(docker.of(a).containers).toEqual([]);
+    expect(shared()).toEqual(before);
+    expect(docker.containers.find((container) => container.id === `${installOf(b)}-gateway`)?.image).toBe(imageId('b'));
+    const named = calls.filter((call) =>
+      Object.entries(SHARED_IMAGES).some(([reference, id]) => call.includes(reference) || call.includes(id)),
+    );
+    expect(named).toEqual([]);
+  });
+
+  it('deletes a displaced image by the ID its record holds, unless another repository still tags it', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(paths), {
+      started: ['materialize_checkout', 'start_nanoclaw'],
+    });
+    const repository = repositoryOf(input);
+    const peerRepository = getInstallScopedNames(allocateInstanceId().replaceAll('-', '')).containerImageBase;
+    const built = imageId('1');
+    const ran = imageId('2');
+    const olderPrevious = imageId('8');
+    const olderGroup = imageId('9');
+    const identical = imageId('f');
+    // Recorded, with its cleanup still to run: the retag displaced the previous `:previous`, the group rebuild
+    // displaced the group's old image, and an earlier displaced image is an identical build another assistant tags.
+    await interruptedAt(paths, input, 'recorded', {
+      followUps: [
+        { kind: 'delete_image', image_id: olderPrevious },
+        { kind: 'delete_image', image_id: olderGroup },
+        { kind: 'delete_image', image_id: identical },
+      ],
+      images: [
+        { tag: `${repository}:latest`, image_id: built, displaced_image_id: ran },
+        { tag: `${repository}:previous`, image_id: ran, displaced_image_id: olderPrevious },
+      ],
+    });
+    await recordRuntime(paths, input.checkout_realpath);
+    const docker = new FakeDocker()
+      .image(built, `${repository}:latest`)
+      .image(ran, `${repository}:previous`)
+      .image(imageId('3'), `${repository}:${AGENT_GROUP}`)
+      .image(olderPrevious)
+      .image(olderGroup)
+      .image(identical, `${peerRepository}:latest`);
+    const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
+
+    await removeAssistant(paths, input.instance_id, {
+      ...dependencies,
+      runCommand: teardownCommands(docker),
+      serviceHelpers: nanoclawService([], { mode: 'none', active: false }),
+    });
+
+    expect([...docker.images]).toEqual([[identical, new Set([`${peerRepository}:latest`])]]);
+    await expectGone(paths, input);
+  });
+});
+
 describe('removal safety', () => {
   it.each(['unknown ID', 'mismatched marker'] as const)(
     'refuses %s before touching either registered assistant',
@@ -1166,7 +1846,7 @@ describe('removal safety', () => {
   });
 
   it.each(['linux', 'macos'] as const)(
-    'stops the %s service through its manager and cleans Docker at the recorded endpoint',
+    "stops the %s service through NanoClaw's helpers, then cleans up after it at the recorded endpoint",
     async (platform) => {
       const paths = await testPaths();
       const input = await reserve(paths, reservationInput(paths), {
@@ -1178,28 +1858,53 @@ describe('removal safety', () => {
         home_directory: home,
         docker_endpoint: recorded,
       });
-      const names = getInstallScopedNames(input.instance_id.replaceAll('-', ''));
+      const installId = input.instance_id.replaceAll('-', '');
+      const names = getInstallScopedNames(installId);
       const definition =
         platform === 'linux'
           ? path.join(home, '.config', 'systemd', 'user', `${names.systemdUnit}.service`)
           : path.join(home, 'Library', 'LaunchAgents', `${names.launchdLabel}.plist`);
       await mkdir(path.dirname(definition), { recursive: true });
       await writeFile(definition, 'unit', { mode: 0o600 });
+      const order: string[] = [];
+      const serviceHelpers = nanoclawService(order, {
+        mode: platform === 'linux' ? 'systemd-user' : 'launchd',
+        active: true,
+        name: platform === 'linux' ? names.systemdUnit : names.launchdLabel,
+        definition,
+      });
       const commands: SanitizedCommand[] = [];
       const runCommand = async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> => {
         commands.push(command);
+        order.push(`${command.command} ${command.args[0]}`);
         if (['pkill', 'pgrep'].includes(command.command)) return failed('');
         if (command.args.includes('is-active')) return { stdout: 'inactive\n', stderr: '', exitCode: 3 };
-        if (command.args[0] === 'print') return NOT_LOADED;
         return ok();
       };
       const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
 
-      await removeAssistant(paths, input.instance_id, { ...dependencies, platform, runCommand });
+      await removeAssistant(paths, input.instance_id, { ...dependencies, platform, runCommand, serviceHelpers });
 
+      // Bound to this assistant: its checkout, install, home, and recorded Docker endpoint.
+      expect(serviceHelpers.detectService).toHaveBeenCalledWith(
+        input.checkout_realpath,
+        expect.objectContaining({
+          platform: platform === 'linux' ? 'linux' : 'darwin',
+          home,
+          installSlug: installId,
+        }),
+      );
+      expect(serviceHelpers.createCommandRunner).toHaveBeenCalledWith({
+        env: expect.objectContaining({ HOME: home, DOCKER_HOST: recorded, NANOCLAW_INSTALL_ID: installId }),
+      });
       expect(await exists(definition)).toBe(false);
+      // NanoClaw stops the service; the stray-host kill, drain, and container removal follow it.
+      expect(order.indexOf('service-stop')).toBe(0);
+      expect(order.indexOf('pkill -f')).toBeLessThan(order.indexOf('drain'));
+      expect(order.indexOf('drain')).toBeLessThan(order.indexOf('docker ps'));
       const service = commands.filter((command) => ['launchctl', 'systemctl'].includes(command.command));
       if (platform === 'linux') {
+        // Disabled as well, so neither login nor boot starts it again.
         expect(service.map((command) => command.args.join(' '))).toEqual([
           `--user disable --now ${names.systemdUnit}.service`,
           `--user is-active ${names.systemdUnit}.service`,
@@ -1212,13 +1917,196 @@ describe('removal safety', () => {
           });
         }
       } else {
-        const domain = `gui/${process.getuid!()}/${names.launchdLabel}`;
-        expect(service.map((command) => command.args.join(' '))).toEqual([`bootout ${domain}`, `print ${domain}`]);
+        expect(service).toEqual([]);
       }
       const docker = commands.filter((command) => command.command === 'docker');
       expect(docker.map((command) => command.args.slice(0, 2).join(' '))).toEqual(['ps -aq', 'image ls']);
       for (const command of docker) expect(command.env?.DOCKER_HOST).toBe(recorded);
       await expectGone(paths, input);
+    },
+  );
+
+  it('cleans up a stray host and a stopped container though no service runs it', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(paths), {
+      started: ['materialize_checkout', 'start_nanoclaw'],
+    });
+    const { containerInstallLabel } = getInstallScopedNames(input.instance_id.replaceAll('-', ''));
+    const order: string[] = [];
+    const serviceHelpers = nanoclawService(order, { mode: 'unmanaged', active: true, name: '4242' });
+    let host = true;
+    let containers = ['stopped123'];
+    const runCommand = async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> => {
+      const line = `${command.command} ${command.args.join(' ')}`;
+      order.push(line);
+      if (command.command === 'pkill') {
+        host = false;
+        return ok();
+      }
+      if (command.command === 'pgrep') return host ? ok('4242\n') : failed('');
+      if (line === `docker ps -aq --filter label=${containerInstallLabel}`) return ok(containers.join('\n'));
+      if (line === 'docker rm --force stopped123') {
+        containers = [];
+        return ok();
+      }
+      return ok();
+    };
+    const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
+
+    await removeAssistant(paths, input.instance_id, { ...dependencies, runCommand, serviceHelpers });
+
+    // The host outside the service is not NanoClaw's to stop; the stray-host kill takes it.
+    expect(serviceHelpers.stopService).not.toHaveBeenCalled();
+    expect(order).toContain('drain');
+    expect(order.indexOf('drain')).toBeGreaterThan(order.findIndex((line) => line.startsWith('pkill')));
+    expect(order).toContain('docker rm --force stopped123');
+    expect(host).toBe(false);
+    expect(containers).toEqual([]);
+    await expectGone(paths, input);
+  });
+
+  /**
+   * launchd holding a job under the assistant's label whose plist was deleted
+   * outside gws-ea: `print` finds the job while it is loaded, `bootout` unloads
+   * it and stops its host unless it `sticks`, and a host killed while its job
+   * is loaded is only started again.
+   */
+  function launchdWithoutPlist(
+    input: InstanceReservationInput,
+    launchd: { loaded: boolean; readonly sticks: boolean },
+  ) {
+    const job = `gui/${process.getuid?.()}/${getInstallScopedNames(installOf(input)).launchdLabel}`;
+    const state = { host: launchd.loaded };
+    const order: string[] = [];
+    const runCommand = async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> => {
+      const line = `${command.command} ${command.args.join(' ')}`;
+      order.push(line);
+      if (line === `launchctl print ${job}`) {
+        return launchd.loaded ? ok() : { stdout: '', stderr: 'Could not find service', exitCode: 113 };
+      }
+      if (line === `launchctl bootout ${job}`) {
+        if (launchd.sticks) return { stdout: '', stderr: 'Boot-out failed: 5: Input/output error', exitCode: 5 };
+        launchd.loaded = false;
+        state.host = false;
+        return ok();
+      }
+      if (command.command === 'pkill') state.host = launchd.loaded;
+      if (command.command === 'pgrep') return state.host ? ok('4242\n') : failed('');
+      if (command.command === 'launchctl') throw new Error(`Unexpected command: ${line}`);
+      return ok();
+    };
+    // NanoClaw finds a job by its plist, so it sees at most a host running outside any service.
+    const serviceHelpers = nanoclawService(
+      order,
+      state.host ? { mode: 'unmanaged', active: true, name: '4242' } : { mode: 'none', active: false },
+    );
+    return { job, state, order, runCommand, serviceHelpers };
+  }
+
+  async function macosRemoval(paths: ControlPlanePaths) {
+    const input = await reserve(paths, reservationInput(paths), {
+      started: ['materialize_checkout', 'start_nanoclaw'],
+    });
+    await writePrivate(path.join(input.checkout_realpath, 'data', 'gws-ea', 'runtime.json'), {
+      home_directory: path.join(paths.stateRoot, 'home'),
+      docker_endpoint: DOCKER,
+    });
+    const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
+    return { input, dependencies: { ...dependencies, platform: 'macos' as const } };
+  }
+
+  it('boots out by its label a launchd job still loaded after its plist was deleted, before killing its host', async () => {
+    const paths = await testPaths();
+    const { input, dependencies } = await macosRemoval(paths);
+    const launchd = { loaded: true, sticks: false };
+    const { job, state, order, runCommand, serviceHelpers } = launchdWithoutPlist(input, launchd);
+
+    await removeAssistant(paths, input.instance_id, { ...dependencies, runCommand, serviceHelpers });
+
+    expect(serviceHelpers.stopService).not.toHaveBeenCalled();
+    expect(order).toContain(`launchctl bootout ${job}`);
+    expect(order.indexOf(`launchctl bootout ${job}`)).toBeLessThan(order.findIndex((line) => line.startsWith('pkill')));
+    expect({ loaded: launchd.loaded, host: state.host }).toEqual({ loaded: false, host: false });
+    await expectGone(paths, input);
+  });
+
+  it('asks launchd by label, and boots out nothing, when no job is loaded', async () => {
+    const paths = await testPaths();
+    const { input, dependencies } = await macosRemoval(paths);
+    const { job, order, runCommand, serviceHelpers } = launchdWithoutPlist(input, { loaded: false, sticks: false });
+
+    await removeAssistant(paths, input.instance_id, { ...dependencies, runCommand, serviceHelpers });
+
+    expect(order.filter((line) => line.startsWith('launchctl'))).toEqual([`launchctl print ${job}`]);
+    await expectGone(paths, input);
+  });
+
+  it('stops, killing nothing, when a launchd job without its plist stays loaded after its bootout', async () => {
+    const paths = await testPaths();
+    const { input, dependencies } = await macosRemoval(paths);
+    const { order, runCommand, serviceHelpers } = launchdWithoutPlist(input, { loaded: true, sticks: true });
+
+    await expect(
+      removeAssistant(paths, input.instance_id, { ...dependencies, runCommand, serviceHelpers }),
+    ).rejects.toMatchObject({ code: 'nanoclaw_removal_incomplete', message: expect.stringContaining('still loaded') });
+    expect(order.some((line) => line.startsWith('pkill'))).toBe(false);
+    expect(serviceHelpers.drainContainers).not.toHaveBeenCalled();
+    expect(await exists(paths.instanceRoot(input.instance_id))).toBe(true);
+  });
+
+  it('refuses before any change when it has no NanoClaw service helpers to stop the host with', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(paths), {
+      started: ['materialize_checkout', 'start_nanoclaw'],
+    });
+    const runCommand = vi.fn(async (): Promise<SanitizedCommandOutcome> => ok());
+    const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
+
+    await expect(removeAssistant(paths, input.instance_id, { ...dependencies, runCommand })).rejects.toMatchObject({
+      code: 'interactive_setup_unavailable',
+    });
+    expect(runCommand).not.toHaveBeenCalled();
+    expect(await exists(paths.removalFile(input.instance_id))).toBe(false);
+    expect(await exists(paths.instanceRoot(input.instance_id))).toBe(true);
+  });
+
+  it.runIf(typeof process.getuid === 'function' && process.getuid() !== 0)(
+    'refuses without root when a system unit runs beside the user unit, before stopping or touching either',
+    async () => {
+      const paths = await testPaths();
+      const input = await reserve(paths, reservationInput(paths), {
+        started: ['materialize_checkout', 'start_nanoclaw'],
+      });
+      const home = path.join(paths.stateRoot, 'home');
+      await writePrivate(path.join(input.checkout_realpath, 'data', 'gws-ea', 'runtime.json'), {
+        home_directory: home,
+        docker_endpoint: DOCKER,
+      });
+      const { systemdUnit } = getInstallScopedNames(installOf(input));
+      const userUnit = path.join(home, '.config', 'systemd', 'user', `${systemdUnit}.service`);
+      await mkdir(path.dirname(userUnit), { recursive: true });
+      await writeFile(userUnit, 'user unit', { mode: 0o600 });
+      const systemUnit = path.join('/etc/systemd/system', `${systemdUnit}.service`);
+      rootOwnedFiles.add(systemUnit);
+      const order: string[] = [];
+      const serviceHelpers = nanoclawService(order, {
+        mode: 'systemd-user',
+        active: true,
+        name: systemdUnit,
+        definition: userUnit,
+      });
+      const runCommand = vi.fn(async (): Promise<SanitizedCommandOutcome> => ok());
+      const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
+
+      await expect(
+        removeAssistant(paths, input.instance_id, { ...dependencies, platform: 'linux', runCommand, serviceHelpers }),
+      ).rejects.toMatchObject({ code: 'root_required', message: expect.stringContaining(systemUnit) });
+      // No service stopped or disabled, no host killed, no container drained, and the user unit still in place.
+      expect(serviceHelpers.stopService).not.toHaveBeenCalled();
+      expect(runCommand).not.toHaveBeenCalled();
+      expect(order).toEqual([]);
+      expect(await readFile(userUnit, 'utf8')).toBe('user unit');
+      expect(await exists(paths.instanceRoot(input.instance_id))).toBe(true);
     },
   );
 
@@ -1248,58 +2136,56 @@ describe('removal safety', () => {
     expect(cloudflare.tunnels).toEqual([tunnel]);
   });
 
+  it('waits for a stray NanoClaw host it stopped to go, and names one that never does', async () => {
+    for (const goneAfter of [2, Infinity]) {
+      const paths = await testPaths();
+      const input = await reserve(paths, reservationInput(paths), {
+        started: ['materialize_checkout', 'start_nanoclaw'],
+      });
+      let checks = 0;
+      const runCommand = async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> => {
+        if (command.command !== 'pgrep') return ok();
+        checks += 1;
+        return checks > goneAfter ? failed('') : ok();
+      };
+      const sleep = vi.fn(async () => undefined);
+      const serviceHelpers = nanoclawService([], { mode: 'none', active: false });
+      const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
+
+      const removal = removeAssistant(paths, input.instance_id, {
+        ...dependencies,
+        runCommand,
+        sleep,
+        serviceHelpers,
+      });
+      if (goneAfter === Infinity) {
+        await expect(removal).rejects.toMatchObject({
+          code: 'nanoclaw_removal_incomplete',
+          message: expect.stringContaining('host process is still running'),
+        });
+        expect(checks).toBe(10);
+      } else {
+        await removal;
+        expect(checks).toBe(3);
+        await expectGone(paths, input);
+      }
+      expect(sleep).toHaveBeenCalledTimes(checks - 1);
+    }
+  });
+
   it.each([
     [
-      'the launchd job it booted out',
-      'macos',
-      (command: SanitizedCommand) => command.command === 'launchctl' && command.args[0] === 'print',
-      NOT_LOADED,
-      'launchd service is still loaded',
+      'NanoClaw cannot stop it',
+      (helpers: FakeNanoclawService) =>
+        helpers.stopService.mockRejectedValueOnce(new Error('Boot-out failed: 5: Input/output error')),
+      /Input\/output error/u,
     ],
     [
-      'a stray NanoClaw host it stopped',
-      'linux',
-      (command: SanitizedCommand) => command.command === 'pgrep',
-      failed(''),
-      'host process is still running',
+      'its launchd job never leaves',
+      (helpers: FakeNanoclawService) => helpers.stopService.mockImplementationOnce(async () => undefined),
+      /still running after it was stopped/u,
     ],
-  ] as const)(
-    'waits for %s to go, and names one that never does',
-    async (_what, platform, probed, gone, stillThere) => {
-      for (const goneAfter of [2, Infinity]) {
-        const paths = await testPaths();
-        const input = await reserve(paths, reservationInput(paths), {
-          started: ['materialize_checkout', 'start_nanoclaw'],
-        });
-        let checks = 0;
-        const runCommand = async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> => {
-          if (probed(command)) {
-            checks += 1;
-            return checks > goneAfter ? gone : ok();
-          }
-          return command.command === 'pgrep' ? failed('') : ok();
-        };
-        const sleep = vi.fn(async () => undefined);
-        const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
-
-        const removal = removeAssistant(paths, input.instance_id, { ...dependencies, platform, runCommand, sleep });
-        if (goneAfter === Infinity) {
-          await expect(removal).rejects.toMatchObject({
-            code: 'nanoclaw_removal_incomplete',
-            message: expect.stringContaining(stillThere),
-          });
-          expect(checks).toBe(10);
-        } else {
-          await removal;
-          expect(checks).toBe(3);
-          await expectGone(paths, input);
-        }
-        expect(sleep).toHaveBeenCalledTimes(checks - 1);
-      }
-    },
-  );
-
-  it('stops, keeping the launchd definition, when launchctl print fails for another reason', async () => {
+  ] as const)('stops, keeping the service definition, when %s', async (_why, arrange, reason) => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput(paths), {
       started: ['materialize_checkout', 'start_nanoclaw'],
@@ -1313,14 +2199,18 @@ describe('removal safety', () => {
     const definition = path.join(home, 'Library', 'LaunchAgents', `${names.launchdLabel}.plist`);
     await mkdir(path.dirname(definition), { recursive: true });
     await writeFile(definition, 'plist', { mode: 0o600 });
-    const runCommand = async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> =>
-      command.args[0] === 'print' ? { stdout: '', stderr: 'Bad request.', exitCode: 5 } : ok();
+    const serviceHelpers = nanoclawService([], { mode: 'launchd', active: true, name: names.launchdLabel, definition });
+    arrange(serviceHelpers);
+    const runCommand = vi.fn(async (): Promise<SanitizedCommandOutcome> => ok());
     const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
 
     await expect(
-      removeAssistant(paths, input.instance_id, { ...dependencies, platform: 'macos', runCommand }),
-    ).rejects.toMatchObject({ code: 'command_failed' });
+      removeAssistant(paths, input.instance_id, { ...dependencies, platform: 'macos', runCommand, serviceHelpers }),
+    ).rejects.toThrow(reason);
     expect(await exists(definition)).toBe(true);
+    // Nothing after the service stop ran: no host kill, drain, or container removal.
+    expect(runCommand).not.toHaveBeenCalled();
+    expect(serviceHelpers.drainContainers).not.toHaveBeenCalled();
   });
 });
 

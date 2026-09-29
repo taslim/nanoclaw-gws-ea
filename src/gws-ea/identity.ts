@@ -4,9 +4,10 @@ import { GwsEaError } from './types.js';
 import { EMAIL_PATTERN, isRecord, parseJson, requireString, unwrapData } from './validation.js';
 import { isValidTimezone } from '../timezone.js';
 
-const MAIN_TEMPLATE = 'gws-ea/main';
-const MAIN_GROUP_NAME = 'main';
-const MAIN_PLUGIN_NAME = 'gws-ea-main';
+/** The template create stamps main from, the group it names, and the plugin it stamps into main's folder. */
+export const MAIN_TEMPLATE = 'gws-ea/main';
+export const MAIN_GROUP_NAME = 'main';
+export const MAIN_PLUGIN_NAME = 'gws-ea-main';
 
 export interface MainIdentityInput {
   readonly assistantDisplayName: string;
@@ -36,13 +37,19 @@ function safeString(value: unknown, label: string, maxLength = 256): string {
   return requireString(value, label, 'invalid_identity', maxLength);
 }
 
+/**
+ * The main group `ncl groups create --template` answered with: the group it
+ * stamped, or, when a group already carries the plugin, the group its restamp
+ * plan names. Without `--yes` that plan is only a plan, and nothing is
+ * restamped (KTD12).
+ */
 function parseGroupResult(value: unknown): { id: string; name: string } {
   const data = unwrapData(value);
   if (!isRecord(data)) throw new GwsEaError('invalid_child_output', 'ncl returned an invalid main group');
   const nested = data.group;
   const candidate = isRecord(nested) ? nested : data;
-  if (nested !== undefined && (data.plugin !== MAIN_PLUGIN_NAME || data.applied !== true)) {
-    throw new GwsEaError('invalid_child_output', 'ncl returned an invalid main template restamp');
+  if (nested !== undefined && (data.plugin !== MAIN_PLUGIN_NAME || data.applied !== false)) {
+    throw new GwsEaError('invalid_child_output', 'ncl returned an invalid plan for the existing main group');
   }
   const id = safeString(candidate.id, 'Main agent group ID');
   const name = safeString(candidate.name, 'Main agent group name', 120);
@@ -137,6 +144,9 @@ async function reconcileAllSecretMode(
  * Reconcile the canonical main group and its credential boundary. The profile
  * pointer is published last, so principal binding cannot observe a canonical
  * main until its provider and instance-vault-wide OneCLI access have been verified.
+ * Main is stamped from its template only when no group carries it yet: an
+ * existing main is found, never restamped, so a customized template survives
+ * every repair (R11, KTD12).
  */
 export async function reconcileMainIdentity(
   configInput: InstanceRuntimeConfig,
@@ -149,7 +159,7 @@ export async function reconcileMainIdentity(
   const runOnecliAdmin = dependencies.runOnecliAdmin ?? defaultRunOnecliAdmin;
 
   const group = parseGroupResult(
-    await runNcl(config, ['groups', 'create', '--template', MAIN_TEMPLATE, '--name', MAIN_GROUP_NAME, '--yes']),
+    await runNcl(config, ['groups', 'create', '--template', MAIN_TEMPLATE, '--name', MAIN_GROUP_NAME]),
   );
   const updatedConfig = unwrapData(
     await runNcl(config, ['groups', 'config', 'update', '--id', group.id, '--provider', config.selected_provider]),

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { getInstallSlug } from '../../src/install-slug.js';
+import { MUTABLE_PATHS } from '../../src/mutable-paths.js';
 import { installGateway } from '../../setup/gateways/install.js';
 import { resolveGatewaySelection } from '../../setup/gateways/selection.js';
 import { upsertEnvVar } from '../../setup/set-env.js';
@@ -363,8 +364,6 @@ export async function validateUpdate(
     throw err;
   }
 }
-
-const MUTABLE_PATHS = ['.env', 'data', 'groups', 'store', 'start-nanoclaw.sh', 'nanoclaw.pid'];
 
 // A mutable root that is a symlink to nowhere makes the snapshot walk throw a
 // bare ENOENT. Report it by name up front so the operator is not told merely

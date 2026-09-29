@@ -3,11 +3,12 @@ import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } fro
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   buildHostEnvironment,
   buildToolEnvironment,
+  replaceProcessWithCommand,
   resolvePersistedExecutable,
   runSanitizedCommand,
   runSanitizedCommandOutcome,
@@ -555,6 +556,66 @@ describe('GWS-EA command runner', () => {
     expect(staged).toEqual([
       expect.objectContaining({ kind: 'command', program: 'gcloud', stdout: '[{"projectId":"gws-ea-fixture"}]' }),
     ]);
+  });
+});
+
+describe('GWS-EA process replacement', () => {
+  type Execve = NonNullable<NodeJS.Process['execve']>;
+
+  /** An execve that records what it would have run, then stops the test's process from being replaced. */
+  function recordingExecve() {
+    const calls: Array<{ file: string; args: readonly string[]; env: NodeJS.ProcessEnv }> = [];
+    const replaced = new Error('execve called');
+    const execve = ((file: string, args: readonly string[], env: NodeJS.ProcessEnv): never => {
+      calls.push({ file, args, env });
+      throw replaced;
+    }) as Execve;
+    return { calls, execve, replaced };
+  }
+
+  it('hands the process to a command as the runner would run it: resolved on its own PATH, from its directory, with exactly its environment', async () => {
+    const root = await temporaryRoot('replace');
+    const bin = path.join(root, 'bin');
+    await mkdir(bin);
+    await writeFile(path.join(bin, 'gws-ea-tool'), '#!/bin/sh\n', { mode: 0o755 });
+    const { calls, execve, replaced } = recordingExecve();
+    const originalCwd = process.cwd();
+    let cwdAtReplacement: string | undefined;
+    try {
+      await expect(
+        replaceProcessWithCommand(
+          { command: 'gws-ea-tool', args: ['-f', 'a file'], cwd: root, env: { PATH: `relative:${bin}:`, LANG: 'C' } },
+          ((...args: Parameters<Execve>): never => {
+            cwdAtReplacement = process.cwd();
+            return execve(...args);
+          }) as Execve,
+        ),
+      ).rejects.toBe(replaced);
+    } finally {
+      process.chdir(originalCwd);
+    }
+
+    expect(calls).toEqual([
+      { file: path.join(bin, 'gws-ea-tool'), args: ['gws-ea-tool', '-f', 'a file'], env: { PATH: bin, LANG: 'C' } },
+    ]);
+    expect(cwdAtReplacement).toBe(root);
+  });
+
+  it('never replaces the process with a command it cannot run', async () => {
+    const root = await temporaryRoot('replace-refused');
+    const { execve } = recordingExecve();
+    const replace = vi.fn(execve);
+    const originalCwd = process.cwd();
+
+    await expect(
+      replaceProcessWithCommand({ command: 'gws-ea-no-such-tool', args: [], cwd: root, env: { PATH: root } }, replace),
+    ).rejects.toMatchObject({ code: 'executable_not_found', details: { searched: [root] } });
+    await expect(
+      replaceProcessWithCommand({ command: '/bin/sh', args: [], cwd: path.join(root, 'missing'), env: {} }, replace),
+    ).rejects.toMatchObject({ code: 'command_failed', details: { errno: 'ENOENT' } });
+
+    expect(replace).not.toHaveBeenCalled();
+    expect(process.cwd()).toBe(originalCwd);
   });
 });
 

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { getInstallSlug } from '../../src/install-slug.js';
+import { getInstallScopedNames, getInstallSlug, type InstallScopedNames } from '../../src/install-slug.js';
 
 export interface RunOptions {
   /** Kill the subprocess and fail the call after this long. Unset = no bound. */
@@ -15,10 +15,16 @@ export interface CommandRunner {
   tryRun(command: string, args: string[], cwd?: string, options?: RunOptions): { ok: boolean; stdout: string };
 }
 
-export function createCommandRunner(): CommandRunner {
+export interface CommandRunnerOptions {
+  /** The environment every command runs with. Unset = this process's environment. */
+  env?: NodeJS.ProcessEnv;
+}
+
+export function createCommandRunner({ env }: CommandRunnerOptions = {}): CommandRunner {
   const run = (command: string, args: string[], cwd?: string, options?: RunOptions): string =>
     execFileSync(command, args, {
       cwd,
+      env,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: options?.timeoutMs,
@@ -65,6 +71,12 @@ export interface ServiceEnvironment {
   sleep(ms: number): Promise<void>;
   /** Progress line for a wait the operator would otherwise read as a hang. */
   log?(message: string): void;
+  /**
+   * The install whose service and containers these helpers act on. Unset =
+   * the slug the checkout path (or `NANOCLAW_INSTALL_ID`) derives; a caller
+   * controlling another install's checkout names that install here.
+   */
+  installSlug?: string;
 }
 
 export function defaultServiceEnvironment(runner = createCommandRunner()): ServiceEnvironment {
@@ -92,10 +104,15 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/** The service and container names of the install `env` targets. */
+function installNames(projectRoot: string, env: ServiceEnvironment): InstallScopedNames {
+  return getInstallScopedNames(env.installSlug ?? getInstallSlug(projectRoot));
+}
+
 export function detectService(projectRoot: string, env: ServiceEnvironment): ServiceHandle {
-  const slug = getInstallSlug(projectRoot);
+  const names = installNames(projectRoot, env);
   if (env.platform === 'darwin') {
-    const name = `com.nanoclaw-v2-${slug}`;
+    const name = names.launchdLabel;
     const definition = path.join(env.home, 'Library', 'LaunchAgents', `${name}.plist`);
     if (fs.existsSync(definition)) {
       return {
@@ -108,7 +125,7 @@ export function detectService(projectRoot: string, env: ServiceEnvironment): Ser
   }
 
   if (env.platform === 'linux') {
-    const name = `nanoclaw-v2-${slug}`;
+    const name = names.systemdUnit;
     const userDefinition = path.join(env.home, '.config', 'systemd', 'user', `${name}.service`);
     const systemDefinition = `/etc/systemd/system/${name}.service`;
     if (fs.existsSync(userDefinition)) {
@@ -248,7 +265,7 @@ export const CUTOVER_LIST_CLI_TIMEOUT_MS = 15_000;
  */
 export async function drainContainers(projectRoot: string, env: ServiceEnvironment, timeoutMs = 60_000): Promise<void> {
   const runtime = process.env.CONTAINER_RUNTIME ?? 'docker';
-  const label = `nanoclaw-install=${getInstallSlug(projectRoot)}`;
+  const label = installNames(projectRoot, env).containerInstallLabel;
   const list = (): { ok: boolean; ids: string[] } => {
     const listed = env.runner.tryRun(runtime, ['ps', '-q', '--filter', `label=${label}`], undefined, {
       timeoutMs: CUTOVER_LIST_CLI_TIMEOUT_MS,

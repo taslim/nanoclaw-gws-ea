@@ -33,6 +33,12 @@ const IMAGE_ENVIRONMENT = [
   'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
   'SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt',
 ];
+/**
+ * The cloudflared another release pinned, and the environment its image sets:
+ * a connector started from it is not this tool's to replace.
+ */
+const OTHER_PIN = `cloudflare/cloudflared:2026.8.0@sha256:${'1'.repeat(64)}`;
+const OTHER_PIN_ENVIRONMENT = [...IMAGE_ENVIRONMENT, 'TUNNEL_ORIGIN_CERT=/etc/cloudflared/cert.pem'];
 const roots: string[] = [];
 
 afterEach(async () => {
@@ -126,7 +132,10 @@ function docker(initial: Json | undefined, paths?: ControlPlanePaths) {
     const [first, second] = command.args;
     if (first === 'container' && second === 'ls') return { stdout: container ? 'c0ffee\n' : '', stderr: '' };
     if (first === 'container' && second === 'inspect') return { stdout: JSON.stringify([container]), stderr: '' };
-    if (first === 'image' && second === 'inspect') return { stdout: JSON.stringify(IMAGE_ENVIRONMENT), stderr: '' };
+    if (first === 'image' && second === 'inspect') {
+      const image = command.args.at(-1);
+      return { stdout: JSON.stringify(image === OTHER_PIN ? OTHER_PIN_ENVIRONMENT : IMAGE_ENVIRONMENT), stderr: '' };
+    }
     if (first === 'pull') locking.push(['pull', lockHeld()]);
     if (command.args.includes('up')) {
       locking.push(['up', lockHeld()]);
@@ -246,31 +255,62 @@ describe('shared Cloudflare connector', () => {
       });
     });
 
+    it('waits on a restarting connector on another pin rather than replacing it, naming the drift', async () => {
+      await expect(
+        observe((container) => {
+          container.State = { Status: 'restarting', Running: true, Restarting: true, ExitCode: 1 };
+          (container.Config as Json).Image = OTHER_PIN;
+          (container.Config as Json).Env = [...OTHER_PIN_ENVIRONMENT];
+        }),
+      ).resolves.toEqual({
+        status: 'unknown',
+        reason: 'The Cloudflare connector is restarting',
+        evidence: `state restarting, exit code 1, 0 restarts; it runs ${OTHER_PIN}, not the pinned ${CLOUDFLARED_IMAGE}`,
+      });
+    });
+
     it.each([
       {
-        label: 'a cloudflared pin bump',
+        label: 'another cloudflared pin',
         change: (container: Json) => {
-          (container.Config as Json).Image = `cloudflare/cloudflared:2026.8.0@sha256:${'1'.repeat(64)}`;
+          (container.Config as Json).Image = OTHER_PIN;
+          (container.Config as Json).Env = [...OTHER_PIN_ENVIRONMENT];
         },
         // The validated pin's only regular-expression metacharacter is the dot.
-        reason: new RegExp(
-          `runs cloudflare/cloudflared:2026\\.8\\.0@.*, not the pinned ${CLOUDFLARED_IMAGE.replaceAll('.', '\\.')}$`,
+        drift: new RegExp(
+          `^it runs cloudflare/cloudflared:2026\\.8\\.0@.*, not the pinned ${CLOUDFLARED_IMAGE.replaceAll('.', '\\.')}$`,
           'u',
         ),
       },
+      {
+        label: 'another connector token',
+        change: (container: Json) => {
+          ((container.Config as Json).Labels as Json)[CLOUDFLARE_CONNECTOR_TOKEN_LABEL] = 'f'.repeat(64);
+        },
+        drift: /^it was started with a different connector token$/u,
+      },
+    ])(
+      'finds a running connector on $label present, reporting the drift and changing nothing',
+      async ({ change, drift }) => {
+        const { layout } = await fixture();
+        await storeConnectorToken(layout, TOKEN);
+        const cli = docker(inspection(layout, change));
+
+        const observed = await observeCloudflareConnector(layout, { runCommand: cli.run });
+
+        expect(observed).toEqual({ status: 'present', drift: expect.stringMatching(drift) });
+        expect(JSON.stringify(observed)).not.toContain(TOKEN);
+        expect(cli.calls.filter((call) => call.args[0] === 'pull' || call.args.includes('up'))).toEqual([]);
+      },
+    );
+
+    it.each([
       {
         label: 'environment drift',
         change: (container: Json) => {
           (container.Config as Json).Env = [...IMAGE_ENVIRONMENT, `TUNNEL_TOKEN=${TOKEN}`];
         },
         reason: /environment its image does not set: TUNNEL_TOKEN$/u,
-      },
-      {
-        label: 'a rotated connector token',
-        change: (container: Json) => {
-          ((container.Config as Json).Labels as Json)[CLOUDFLARE_CONNECTOR_TOKEN_LABEL] = 'f'.repeat(64);
-        },
-        reason: /was started with a different connector token/u,
       },
       {
         label: 'token-file mount drift',
@@ -311,12 +351,17 @@ describe('shared Cloudflare connector', () => {
   });
 
   describe('repair', () => {
-    it('pulls a missing image outside the lock, then recreates the connector under the machine lock', async () => {
+    it('starts a missing connector at this tool’s pin: pulled outside the lock, created under the machine lock', async () => {
       const { paths, layout } = await fixture();
       await storeConnectorToken(layout, TOKEN);
       const cli = docker(undefined, paths);
       cli.afterUp = inspection(layout);
 
+      await expect(observeCloudflareConnector(layout, { runCommand: cli.run })).resolves.toEqual({
+        status: 'absent',
+        reason: 'it has not been created',
+      });
+      cli.calls.length = 0;
       await repairCloudflareConnector(paths, layout, { runCommand: cli.run, ambientEnv: { PATH: '/usr/bin' } });
 
       const commands = cli.calls.map((call) => call.args.filter((arg) => !arg.startsWith('/')));
@@ -328,6 +373,7 @@ describe('shared Cloudflare connector', () => {
         ['pull', false],
         ['up', true],
       ]);
+      // The rendered service, and so the created container, runs this tool's pinned image.
       expect(await readFile(layout.composeFile, 'utf8')).toBe(renderCloudflareConnectorCompose(layout, DIGEST));
       expect(JSON.stringify(cli.calls)).not.toContain(TOKEN);
     });
