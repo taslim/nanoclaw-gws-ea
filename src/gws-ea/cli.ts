@@ -1241,7 +1241,10 @@ const READ_ONLY_COMMANDS: ReadonlyMap<string, ReadOnlyCommand> = new Map([
   [
     'logs',
     {
-      usage: ['logs --id <instance_id> [--errors] [--follow]'],
+      usage: [
+        'logs --id <instance_id> [--errors] [--follow]',
+        "       Prints the assistant's host log, or its error log with --errors; --follow keeps printing.",
+      ],
       options: { values: ['id'], switches: ['errors', 'follow'] },
       run: showHostLog,
     },
@@ -1526,6 +1529,7 @@ function printHelp(output: LineWriter): void {
   output('         [--workspace-email <email>] [--provider <id>]');
   output('         [--ingress existing --endpoint <https-url>]');
   output('         [--ingress managed-cloudflare --cloudflare-zone <zone> --hostname-label <label>]');
+  output("         Deploys this gws-ea's own release, which must be committed, clean, and on the track.");
   output('  resume --id <instance_id> [--chat-configured] [--messaging-group-id <exact-id>]');
   output('  start --id <instance_id>');
   output('  stop --id <instance_id>');
@@ -1538,6 +1542,7 @@ function printHelp(output: LineWriter): void {
   output(
     '         then switches to it during a brief stop, verifies it, and keeps the previous release to roll back to.',
   );
+  output('         --track and --source-remote move it to another track or repository that holds the release.');
   output('         Rerun it to continue an update that was cut short, or to retry the follow-ups one left.');
   output('  rollback --id <instance_id> [--snapshot] [--yes]');
   output(
@@ -1547,6 +1552,7 @@ function printHelp(output: LineWriter): void {
   output('         Rerun it to continue a rollback that was cut short, or to revert an update that is unfinished.');
   for (const command of READ_ONLY_COMMANDS.values()) for (const line of command.usage) output(`  ${line}`);
   output('  ncl --id <instance_id> -- <ncl arguments>');
+  output("         Runs the assistant's own ncl, passing everything after -- unchanged.");
   output('  remove --id <instance_id> [--yes] [--abandon gcp-project,cloudflare-dns]');
   output('  create, resume, remove: [--secrets-file <owner-only file under the config root>] [--capture-fixtures]');
   output('  Secrets: GWS_EA_PROVIDER_CREDENTIAL, GWS_EA_CLOUDFLARE_API_TOKEN (environment or --secrets-file).');
