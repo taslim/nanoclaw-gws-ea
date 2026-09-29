@@ -251,16 +251,19 @@ export async function main(argv: readonly string[], options: { readonly interact
         message: `Permanently remove assistant ${preview.instanceId} and request deletion of GCP project ${preview.gcpProject}?`,
         initialValue: false,
       })) === true,
-    confirmUpdate: async (preview) => {
-      const answer = await p.confirm({
+    confirmUpdate: async (preview) =>
+      (await p.confirm({
         message: `Update assistant ${preview.instanceId} to ${preview.to.release_track} ${preview.to.deployed_commit.slice(0, 12)}?`,
         initialValue: false,
-      });
-      // Ctrl-C or Esc is not a no: update --all stops there, where a no only skips the assistant.
-      if (p.isCancel(answer)) {
-        throw new GwsEaError('cancelled', `The update of assistant ${preview.instanceId} was cancelled`);
-      }
-      return answer === true;
+      })) === true,
+    confirmUpdateAll: async (plan) => {
+      const count = plan.candidates.filter((candidate) => candidate.eligible).length;
+      return (
+        (await p.confirm({
+          message: `Update ${count} ${count === 1 ? 'assistant' : 'assistants'} to this tool's release ${plan.toolCommit.slice(0, 12)}, as planned above?`,
+          initialValue: false,
+        })) === true
+      );
     },
     confirmRollback: async (preview) =>
       (await p.confirm({

@@ -1,18 +1,23 @@
 /**
- * `update --all` updates, one at a time and in the order `list` shows them,
- * every assistant on the machine that can move to the tool's release, and
- * skips and reports the rest. Each assistant is built by the cutover fixture
- * as create leaves it; they share one Docker and one release repository, and
- * each one's host answers for its own checkout. Git, SQLite, and the files are
- * real; the service manager, Docker, the release's scripts, the hosts,
- * OneCLI, and `ncl` are faked at their boundaries.
+ * `update --all` shows its plan, asks once, then updates, one at a time and
+ * in the order `list` shows them, every assistant on the machine that can
+ * move to the tool's release, and skips and reports the rest. Each assistant
+ * is built by the cutover fixture as create leaves it; they share one Docker
+ * and one release repository, and each one's host answers for its own
+ * checkout. Git, SQLite, and the files are real; the service manager, Docker,
+ * the release's scripts and migration registry, the hosts, OneCLI, and `ncl`
+ * are faked at their boundaries.
  */
 import { mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { migrations as builtInMigrations } from '../db/migrations/index.js';
+import { gwsEaProfileMigration } from '../modules/gws-ea-profile/migration.js';
 import {
+  ADDED_MIGRATION,
+  applying,
   assistant,
   cli,
   exists,
@@ -20,6 +25,7 @@ import {
   hostStatus,
   imageBase,
   imageId,
+  LIVE_MIGRATIONS,
   machine,
   nextRelease,
   release,
@@ -37,8 +43,9 @@ import { advanceOperation, beginOperation, readOperationRecord } from './operati
 import { allocateInstanceId, getInstanceReservation, swapInstanceRelease } from './registry.js';
 import type { HostStatusHelpers, InstanceRuntimeConfig } from './service.js';
 import type { NanoclawServiceHelpers } from './service-control.js';
-import { GwsEaError, releaseOf, type ReleaseCoordinates } from './types.js';
+import { releaseOf, type ReleaseCoordinates } from './types.js';
 import type { UpdatePreview } from './update.js';
+import { registeredReleaseMigrations, type UpdateAllPlan } from './update-all.js';
 
 afterEach(removeTemporaryRoots);
 
@@ -104,12 +111,16 @@ function fleetHosts({ host, state, assistants }: Fleet): HostStatusHelpers {
   };
 }
 
-/** `gws-ea` on the fleet's machine, with the tool at its next release. */
+/**
+ * `gws-ea` on the fleet's machine, with the tool at its next release, whose
+ * migrations are those every assistant has applied unless a test adds one.
+ */
 function fleetCli(fleet: Fleet, overrides: Partial<CliRuntime> = {}) {
   const [first] = fleet.assistants;
   return cli(fleet.host, fleet.state, fleet.next, first!, {
     serviceHelpers: fleetServices(fleet),
     hostStatus: fleetHosts(fleet),
+    releaseMigrations: async () => LIVE_MIGRATIONS,
     ...overrides,
   });
 }
@@ -124,11 +135,6 @@ async function openUpdate(host: Machine, runtime: InstanceRuntimeConfig, to: Rel
   } finally {
     operation.release();
   }
-}
-
-/** What the terminal's prompt throws when the operator presses Ctrl-C or Esc at an update's preview. */
-function cancel(preview: UpdatePreview): GwsEaError {
-  return new GwsEaError('cancelled', `The update of assistant ${preview.instanceId} was cancelled`);
 }
 
 /** Everything an update could change of one assistant: its files, run logs, registry entry, and images. */
@@ -181,11 +187,13 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     const skipped = [current, stopped, unfinished, offTrack];
     const before = await Promise.all(skipped.map((runtime) => footprint(machineFleet, runtime)));
     const confirmUpdate = vi.fn(async (_preview: UpdatePreview) => false);
-    const { run, out, err } = fleetCli(machineFleet, { confirmUpdate });
+    const confirmUpdateAll = vi.fn(async (_plan: UpdateAllPlan) => false);
+    const { run, out, err } = fleetCli(machineFleet, { confirmUpdate, confirmUpdateAll });
 
     expect(await run(['update', '--all', '--yes'])).toBe(0);
 
-    // --yes answers every preview: nothing is asked.
+    // --yes answers the plan's question, and no assistant is asked about on its own.
+    expect(confirmUpdateAll).not.toHaveBeenCalled();
     expect(confirmUpdate).not.toHaveBeenCalled();
     expect(err).toEqual([]);
     // Only the two that could move were updated, in list order, each with its own preview and summary.
@@ -199,7 +207,10 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     ]);
     await expectOnRelease(host, earlier, next.commit);
     await expectOnRelease(host, later, next.commit);
-    // The ones that cannot move are named up front, with why and what moves them, before anything is updated.
+    // The plan names, before anything is updated, each one that moves, from and to, with the migrations it adds,
+    // then the ones that cannot move, with why and what moves them.
+    const from = `dogfood ${short(host.first)}`;
+    const to = `dogfood ${short(next.commit)}`;
     const reasons = [
       `Skipped ${current.instance_id}: It already runs dogfood ${short(next.commit)}, this tool's release.`,
       `Skipped ${stopped.instance_id}: It is stopped, and an update proves its new release on a running assistant; start it with gws-ea start --id ${stopped.instance_id}, then update it.`,
@@ -214,12 +225,12 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     const firstTurn = out.indexOf(`Updating assistant ${earlier.instance_id} (1 of 2)…`);
     expect(out.slice(0, firstTurn)).toEqual([
       'Checking which assistants can be updated…',
-      `Updating 2 assistants to this tool's release ${short(next.commit)}, one at a time: ${earlier.instance_id}, ${later.instance_id}.`,
+      `Plan: update 2 assistants to this tool's release ${short(next.commit)}, one at a time:`,
+      `Update ${earlier.instance_id}: ${from} → ${to}; database migrations to add: none`,
+      `Update ${later.instance_id}: ${from} → ${to}; database migrations to add: none`,
       ...reasons,
     ]);
     // Then summarized: what was updated, from and to, and what was skipped, and why.
-    const from = `dogfood ${short(host.first)}`;
-    const to = `dogfood ${short(next.commit)}`;
     expect(out.slice(-7)).toEqual([
       'update --all finished: 2 updated, 4 skipped.',
       `Updated ${earlier.instance_id}: ${from} → ${to}`,
@@ -282,9 +293,7 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     expect(await run(['update', '--all', '--yes'])).toBe(1);
 
     // The first went to the release the run announced; the second was refused before anything was staged.
-    expect(out).toContain(
-      `Updating 2 assistants to this tool's release ${short(next.commit)}, one at a time: ${first.instance_id}, ${second.instance_id}.`,
-    );
+    expect(out).toContain(`Plan: update 2 assistants to this tool's release ${short(next.commit)}, one at a time:`);
     await expectOnRelease(host, first, next.commit);
     await expectOnRelease(host, second, host.first);
     expect(await exists(host.paths.releaseRoot(second.instance_id, 'next'))).toBe(false);
@@ -317,12 +326,14 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
       .mockResolvedValueOnce('retry')
       .mockResolvedValue('stop');
     const confirmUpdate = vi.fn(async (_preview: UpdatePreview) => true);
-    const { run, out, err } = fleetCli(machineFleet, { onFailure, confirmUpdate });
+    const confirmUpdateAll = vi.fn(async (_plan: UpdateAllPlan) => true);
+    const { run, out, err } = fleetCli(machineFleet, { onFailure, confirmUpdate, confirmUpdateAll });
 
     expect(await run(['update', '--all'])).toBe(1);
 
     expect(onFailure).not.toHaveBeenCalled();
-    // The build failed before any preview: nothing was asked either.
+    // Only the plan was asked about, once.
+    expect(confirmUpdateAll).toHaveBeenCalledOnce();
     expect(confirmUpdate).not.toHaveBeenCalled();
     const summary = err.join('\n');
     expect(summary).toContain('Stopped at Building the new agent image (build_agent_image): bash exited with code 1');
@@ -381,96 +392,99 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     );
   });
 
-  it('skips an assistant whose preview is declined, changing nothing of it, and updates the next', async () => {
+  it('shows the whole plan and asks once, before anything is staged; a no changes nothing (exit 0)', async () => {
     const host = await machine();
     const first = await assistant(host, 37_001);
-    const second = await assistant(host, 37_101);
+    const unreadable = await assistant(host, 37_101);
     const next = await nextRelease(host);
-    const machineFleet = await fleet(host, next, [first, second]);
-    const asked: string[] = [];
-    const { run, out } = fleetCli(machineFleet, {
-      confirmUpdate: async (preview) => {
-        asked.push(preview.instanceId);
-        return preview.instanceId === second.instance_id;
-      },
-    });
-
-    expect(await run(['update', '--all'])).toBe(0);
-
-    expect(asked).toEqual([first.instance_id, second.instance_id]);
-    await expectOnRelease(host, first, host.first);
-    expect(await exists(host.paths.releaseRoot(first.instance_id, 'next'))).toBe(false);
-    expect(machineFleet.state.tags.has(`${imageBase(first)}:next`)).toBe(false);
-    await expectOnRelease(host, second, next.commit);
-    expect(out.slice(-3)).toEqual([
-      'update --all finished: 1 updated, 1 declined.',
-      `Updated ${second.instance_id}: dogfood ${short(host.first)} → dogfood ${short(next.commit)}`,
-      `Declined ${first.instance_id}: nothing was changed`,
-    ]);
-  });
-
-  it('stops the whole run when the operator cancels at a preview, changing neither assistant (exit 0)', async () => {
-    const host = await machine();
-    const first = await assistant(host, 37_001);
-    const second = await assistant(host, 37_101);
-    const next = await nextRelease(host);
-    const machineFleet = await fleet(host, next, [first, second]);
-    const { logs: _logs, ...cancelled } = await footprint(machineFleet, first);
-    const untouched = await footprint(machineFleet, second);
-    const asked: string[] = [];
+    const machineFleet = await fleet(host, next, [first, unreadable]);
+    // A database the plan cannot read is named, not a reason to stop.
+    await writeFile(path.join(unreadable.checkout_realpath, 'data', 'v2.db'), 'not a database\n');
+    const before = await Promise.all(machineFleet.assistants.map((runtime) => footprint(machineFleet, runtime)));
+    const asked: Array<{ readonly toolCommit: string; readonly shown: readonly string[]; readonly staged: boolean }> =
+      [];
+    const confirmUpdate = vi.fn(async (_preview: UpdatePreview) => true);
     const { run, out, err } = fleetCli(machineFleet, {
-      confirmUpdate: async (preview) => {
-        asked.push(preview.instanceId);
-        throw cancel(preview);
+      releaseMigrations: async () => [...LIVE_MIGRATIONS, ADDED_MIGRATION],
+      confirmUpdate,
+      confirmUpdateAll: async (plan) => {
+        const staging = machineFleet.assistants.map((runtime) =>
+          exists(host.paths.releaseRoot(runtime.instance_id, 'next')),
+        );
+        asked.push({
+          toolCommit: plan.toolCommit,
+          shown: [...out],
+          staged: (await Promise.all(staging)).some(Boolean),
+        });
+        return false;
       },
     });
 
     expect(await run(['update', '--all'])).toBe(0);
 
-    expect(asked).toEqual([first.instance_id]);
+    const from = `dogfood ${short(host.first)}`;
+    const to = `dogfood ${short(next.commit)}`;
+    const plan = [
+      'Checking which assistants can be updated…',
+      `Plan: update 2 assistants to this tool's release ${short(next.commit)}, one at a time:`,
+      `Update ${first.instance_id}: ${from} → ${to}; database migrations to add: ${ADDED_MIGRATION}`,
+      `Update ${unreadable.instance_id}: ${from} → ${to}; database migrations to add: unknown (its database could not be read)`,
+    ];
+    // Asked once, about the whole plan, with nothing yet staged; no assistant is asked about on its own.
+    expect(asked).toEqual([{ toolCommit: next.commit, shown: plan, staged: false }]);
+    expect(confirmUpdate).not.toHaveBeenCalled();
+    expect(out).toEqual([...plan, 'Update cancelled. Nothing was changed.']);
     expect(err).toEqual([]);
-    // The cancelled assistant is left as a decline leaves it: its staging removed, nothing recorded or moved.
-    expect(out).toContain('Removing the staged release…');
-    expect(out).toContain('Update cancelled. Nothing was changed.');
-    const { logs: _after, ...left } = await footprint(machineFleet, first);
-    expect(left).toEqual(cancelled);
-    await expectOnRelease(host, first, host.first);
-    expect(await exists(host.paths.releaseRoot(first.instance_id, 'next'))).toBe(false);
-    expect(machineFleet.state.tags.has(`${imageBase(first)}:next`)).toBe(false);
-    expect(out.slice(-3)).toEqual([
-      `update --all was stopped by the operator at assistant ${first.instance_id}; 1 not attempted.`,
-      `Stopped at ${first.instance_id} by the operator; nothing of it was changed.`,
-      `Not attempted: ${second.instance_id}`,
-    ]);
-    // The next one was only observed, never staged or asked about.
-    expect(await footprint(machineFleet, second)).toEqual(untouched);
-    expect(new Set(serviceCallsOf(machineFleet.state, second))).toEqual(new Set([`detect ${second.install_id}`]));
+    // Nothing of either changed: files, run logs, registry entry, and images; each was only observed.
+    expect(await Promise.all(machineFleet.assistants.map((runtime) => footprint(machineFleet, runtime)))).toEqual(
+      before,
+    );
+    for (const runtime of machineFleet.assistants) {
+      expect(new Set(serviceCallsOf(machineFleet.state, runtime))).toEqual(new Set([`detect ${runtime.install_id}`]));
+    }
   });
 
-  it('keeps update --id cancelling at its preview exactly as a decline: the same output, exit 0', async () => {
+  it('updates every assistant in its plan once that is confirmed, never asking about one on its own', async () => {
     const host = await machine();
-    const declined = await assistant(host, 37_001);
-    const cancelled = await assistant(host, 37_101);
+    const first = await assistant(host, 37_001);
+    const second = await assistant(host, 37_101);
     const next = await nextRelease(host);
-    const machineFleet = await fleet(host, next, [declined, cancelled]);
-    const no = fleetCli(machineFleet, { confirmUpdate: async () => false });
-    const stop = fleetCli(machineFleet, {
-      confirmUpdate: async (preview) => {
-        throw cancel(preview);
-      },
+    const machineFleet = await fleet(host, next, [first, second]);
+    machineFleet.state.migrate = applying(ADDED_MIGRATION);
+    // Asked, each assistant would be declined.
+    const confirmUpdate = vi.fn(async (_preview: UpdatePreview) => false);
+    const confirmUpdateAll = vi.fn(async (_plan: UpdateAllPlan) => true);
+    const { run, out, err } = fleetCli(machineFleet, {
+      releaseMigrations: async () => [...LIVE_MIGRATIONS, ADDED_MIGRATION],
+      confirmUpdate,
+      confirmUpdateAll,
     });
 
-    expect(await no.run(['update', '--id', declined.instance_id])).toBe(0);
-    expect(await stop.run(['update', '--id', cancelled.instance_id])).toBe(0);
+    expect(await run(['update', '--all'])).toBe(0);
 
-    const anonymous = (lines: readonly string[], runtime: InstanceRuntimeConfig): string[] =>
-      lines.map((line) => line.replaceAll(runtime.instance_id, '<id>'));
-    expect(anonymous(stop.out, cancelled)).toEqual(anonymous(no.out, declined));
-    expect(stop.out.at(-1)).toBe('Update cancelled. Nothing was changed.');
-    expect(stop.err).toEqual([]);
-    await expectOnRelease(host, cancelled, host.first);
-    expect(await exists(host.paths.releaseRoot(cancelled.instance_id, 'next'))).toBe(false);
-    expect(machineFleet.state.tags.has(`${imageBase(cancelled)}:next`)).toBe(false);
+    expect(confirmUpdateAll).toHaveBeenCalledOnce();
+    expect(confirmUpdate).not.toHaveBeenCalled();
+    expect(err).toEqual([]);
+    await expectOnRelease(host, first, next.commit);
+    await expectOnRelease(host, second, next.commit);
+    // What the plan said each adds is what each one's dry run on a copy of its database added.
+    const from = `dogfood ${short(host.first)}`;
+    const to = `dogfood ${short(next.commit)}`;
+    expect(out).toContain(
+      `Update ${first.instance_id}: ${from} → ${to}; database migrations to add: ${ADDED_MIGRATION}`,
+    );
+    expect(out).toContain(
+      `Update ${second.instance_id}: ${from} → ${to}; database migrations to add: ${ADDED_MIGRATION}`,
+    );
+    expect(out.filter((line) => line.startsWith('Database migrations to add: '))).toEqual([
+      `Database migrations to add: ${ADDED_MIGRATION}`,
+      `Database migrations to add: ${ADDED_MIGRATION}`,
+    ]);
+    expect(out.slice(-3)).toEqual([
+      'update --all finished: 2 updated.',
+      `Updated ${first.instance_id}: ${from} → ${to}`,
+      `Updated ${second.instance_id}: ${from} → ${to}`,
+    ]);
   });
 
   it('stops with exit 75 when another command holds an assistant, leaving the next one untouched', async () => {
@@ -498,7 +512,7 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     expect(await footprint(machineFleet, second)).toEqual(untouched);
   });
 
-  it('exits 0 with nothing to update when no assistant can move, staging nothing', async () => {
+  it('exits 0 with nothing to update when no assistant can move, staging nothing and asking nothing', async () => {
     const host = await machine();
     const current = await assistant(host, 37_001);
     const stopped = await assistant(host, 37_101);
@@ -506,10 +520,12 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     const machineFleet = await fleet(host, next, [current, stopped]);
     expect(await fleetCli(machineFleet).run(['update', '--id', current.instance_id, '--yes'])).toBe(0);
     machineFleet.stopped.add(stopped.install_id);
-    const { run, out } = fleetCli(machineFleet);
+    const confirmUpdateAll = vi.fn(async (_plan: UpdateAllPlan) => true);
+    const { run, out } = fleetCli(machineFleet, { confirmUpdateAll });
 
-    expect(await run(['update', '--all', '--yes'])).toBe(0);
+    expect(await run(['update', '--all'])).toBe(0);
 
+    expect(confirmUpdateAll).not.toHaveBeenCalled();
     expect(out).toEqual([
       'Checking which assistants can be updated…',
       `Nothing to update: no assistant here can move to this tool's release ${short(next.commit)}.`,
@@ -645,5 +661,14 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
       `Updated ${other.instance_id}: dogfood ${short(host.first)} → dogfood ${short(next.commit)}`,
       `Skipped ${pending.instance_id}: It is stopped, and an update proves its new release on a running assistant; start it with gws-ea start --id ${pending.instance_id}, then update it.`,
     ]);
+  });
+});
+
+describe("the release's migrations, as update --all plans with them", () => {
+  it("are NanoClaw's registry as its migration script registers it: its own migrations in order, then its modules'", async () => {
+    const names = await registeredReleaseMigrations();
+
+    expect(names.slice(0, builtInMigrations.length)).toEqual(builtInMigrations.map((migration) => migration.name));
+    expect(names.slice(builtInMigrations.length)).toContain(gwsEaProfileMigration.name);
   });
 });

@@ -271,8 +271,9 @@ describe('GWS-EA driver', () => {
       allowAmbientConfiguration: false,
     });
     expect(setup.credentialMetadata('opencode')).toBeUndefined();
-    // Without a TTY nobody can be asked, so an update, and a rollback's snapshot restore, need --yes.
+    // Without a TTY nobody can be asked, so an update, update --all, and a rollback's snapshot restore, need --yes.
     expect(runtime.confirmUpdate).toBeUndefined();
+    expect(runtime.confirmUpdateAll).toBeUndefined();
     expect(runtime.confirmRollback).toBeUndefined();
   });
 
@@ -302,15 +303,35 @@ describe('GWS-EA driver', () => {
     });
   });
 
-  it('reports an update prompt the operator cancels as cancelled, not as a no, so update --all stops there', async () => {
+  it('asks once before update --all on a TTY, naming how many assistants and the release, defaulting to wait', async () => {
     await main(['update', '--all'], { interactive: true });
-    fixture.confirm.mockResolvedValueOnce(fixture.cancel);
-    const preview = { instanceId: 'x', to: { release_track: 'dogfood', deployed_commit: 'b'.repeat(40) } };
+    fixture.confirm.mockResolvedValueOnce(false);
+    const plan = {
+      toolCommit: 'c'.repeat(40),
+      candidates: [
+        { instanceId: 'x', eligible: true },
+        { instanceId: 'y', eligible: false, reason: 'It is stopped.' },
+        { instanceId: 'z', eligible: true },
+      ],
+    };
 
-    await expect(runtimeOf().confirmUpdate!(preview as never)).rejects.toMatchObject({
-      code: 'cancelled',
-      message: 'The update of assistant x was cancelled',
+    await expect(runtimeOf().confirmUpdateAll!(plan as never)).resolves.toBe(false);
+
+    expect(fixture.confirm).toHaveBeenCalledExactlyOnceWith({
+      message: `Update 2 assistants to this tool's release ${'c'.repeat(12)}, as planned above?`,
+      initialValue: false,
     });
+  });
+
+  it('takes Ctrl-C or Esc at an update prompt as a no', async () => {
+    await main(['update', '--all'], { interactive: true });
+    const { confirmUpdate, confirmUpdateAll } = runtimeOf();
+    const preview = { instanceId: 'x', to: { release_track: 'dogfood', deployed_commit: 'b'.repeat(40) } };
+    const plan = { toolCommit: 'c'.repeat(40), candidates: [{ instanceId: 'x', eligible: true }] };
+    fixture.confirm.mockResolvedValueOnce(fixture.cancel).mockResolvedValueOnce(fixture.cancel);
+
+    await expect(confirmUpdate!(preview as never)).resolves.toBe(false);
+    await expect(confirmUpdateAll!(plan as never)).resolves.toBe(false);
   });
 
   it('asks before removal on a TTY, defaulting to keep the assistant', async () => {

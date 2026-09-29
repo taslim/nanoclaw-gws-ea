@@ -216,11 +216,14 @@ describe('gws-ea usage', () => {
     expect(io.out).toContain('  update --id <instance_id> [--track <track>] [--source-remote <remote>] [--yes]');
   });
 
-  it('names update --all and its option', async () => {
+  it('names update --all and its option, and says it asks once, about its plan, unless --yes is given', async () => {
     const io = lines();
 
     expect(await runCli(['--help'], io.runtime)).toBe(0);
-    expect(io.out).toContain('  update --all [--yes]');
+    const usage = io.out.indexOf('  update --all [--yes]');
+    expect(io.out.slice(usage + 1, io.out.indexOf('  rollback --id <instance_id> [--snapshot] [--yes]'))).toEqual([
+      '         Shows the plan, asks once, then updates every assistant that can take this release, one at a time; --yes skips the question.',
+    ]);
   });
 
   it('names rollback and each of its options', async () => {
