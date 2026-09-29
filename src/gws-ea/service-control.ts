@@ -17,9 +17,10 @@ import { pollUntil } from './poll.js';
 import { buildToolEnvironment } from './process.js';
 import { activeStep } from './run-log.js';
 import { serviceManagerEnvironment, type InstanceRuntimeConfig } from './service.js';
-
-export { hostLogFiles, type HostLogFiles } from './service.js';
 import { GwsEaError } from './types.js';
+
+/** Where a host service sends the host's output and its errors. */
+export { hostLogFiles, type HostLogFiles } from './service.js';
 
 /** NanoClaw's `ServiceMode`: how detection found the service run. */
 export type NanoclawServiceMode = 'launchd' | 'systemd-user' | 'systemd-system' | 'nohup' | 'unmanaged' | 'none';
@@ -92,7 +93,6 @@ export function runtimeServiceTarget(
   };
 }
 
-/** Where a host service sends the host's output and its errors. */
 /** Boundary seams; each defaults to this process's. */
 export interface ServiceControlOptions {
   readonly platform?: NodeJS.Platform;

@@ -56,7 +56,7 @@ import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { readDeployedSetup } from './provision.js';
 import { redact, safeErrorMessage } from './redact.js';
 import { assertInstanceId, readRegistry } from './registry.js';
-import { readKeptPreviousRelease } from './rollback.js';
+import { readKeptPreviousRelease, sameSchema } from './rollback.js';
 import {
   loadInstanceRuntimeConfig,
   runInstanceOnecliAdminCommand,
@@ -203,16 +203,6 @@ export interface AssistantListing {
   readonly assistants: readonly ListedAssistant[];
 }
 
-export const LIST_JSON_FIELDS = [
-  'instance_id',
-  'hostname',
-  'track',
-  'deployed_commit',
-  'service',
-  'operation',
-  'removal_in_progress',
-] as const satisfies readonly (keyof ListedAssistant)[];
-
 /** What the registry records: the reservation, never presented as health. */
 export interface RegistryView {
   readonly hostname: string;
@@ -273,19 +263,6 @@ export interface AssistantStatus {
   readonly schema: SchemaView;
   readonly probes: AssistantProbes;
 }
-
-export const STATUS_JSON_FIELDS = [
-  'instance_id',
-  'observed_at',
-  'registry',
-  'operation',
-  'removal_in_progress',
-  'release',
-  'rollback',
-  'templates',
-  'schema',
-  'probes',
-] as const satisfies readonly (keyof AssistantStatus)[];
 
 /** The boundaries `status` observes through; each defaults to the real one. */
 export interface StatusObservers {
@@ -825,8 +802,9 @@ function schemaView(read: SchemaRead): SchemaView {
 
 /**
  * The kept previous release, and whether either schema moved since it (R13,
- * R15). It is available exactly when `rollback` would take it: kept whole,
- * with its manifest naming this assistant and its marker's release.
+ * R15), decided as `rollback` decides it. It is available exactly when
+ * `rollback` would take it: kept whole, with its manifest naming this
+ * assistant and its marker's release.
  */
 async function observeRollback({ context, reservation, observers }: Subject, live: SchemaRead): Promise<RollbackView> {
   const previous = context.paths.releaseCheckoutRoot(reservation.instance_id, 'previous');
@@ -846,11 +824,10 @@ async function observeRollback({ context, reservation, observers }: Subject, liv
   if ('error' in live) return unknownMove(live.error);
   const kept = readSchema(observers, previous);
   if ('error' in kept) return unknownMove(kept.error);
-  const [now, before] = [fingerprints(live.manifest), fingerprints(kept.manifest)];
   return {
     available: true,
     previous_commit: commit,
-    schema_moved: now.central !== before.central || now.session !== before.session,
+    schema_moved: sameSchema(live.manifest, kept.manifest) !== 'same',
     reason: null,
   };
 }

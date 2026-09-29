@@ -309,16 +309,18 @@ function isBusy(error: unknown): boolean {
 
 /**
  * The assistant's state refused the command: an unfinished update or
- * rollback, a removal under way, a create not yet finished, a stopped
- * assistant an update cannot prove its release on, a release that is not
- * newer than the one it runs, no release of its own kept to roll back to, or
- * a rollback that went back to the release it left. Its message names the
- * command that moves the assistant on; rerunning this one cannot.
+ * rollback, a removal under way, a create not yet finished, no host service
+ * installed to start, a stopped assistant an update cannot prove its release
+ * on, a release that is not newer than the one it runs, no release of its own
+ * kept to roll back to, or a rollback that went back to the release it left.
+ * Its message names the command that moves the assistant on; rerunning this
+ * one cannot.
  */
 const STATE_REFUSALS: ReadonlySet<string> = new Set([
   'operation_in_progress',
   'removal_in_progress',
   'instance_not_created',
+  'service_not_installed',
   'host_not_running',
   'release_not_newer',
   'rollback_unavailable',
@@ -986,10 +988,12 @@ class Cli {
     };
     const continueWith = (extra?: string): string => this.#continueCommand(plan, state, extra);
     let run: RunLog | undefined;
-    // A signal while waiting on a pause stops the wait; otherwise the run ends, and its log says where.
+    // A signal while waiting on a pause stops the wait. Otherwise, or when the wait was already told to stop
+    // and has not (it may be stuck in a probe that cannot be aborted), the run ends, and its log says where.
     const interrupted = (signal: NodeJS.Signals): void => {
-      if (this.#waiting) {
-        this.#waiting.abort();
+      const waiting = this.#waiting;
+      if (waiting && !waiting.signal.aborted) {
+        waiting.abort();
         return;
       }
       run?.interrupt(signal);
@@ -1199,11 +1203,6 @@ export interface ReadOnlyCommand {
   run(context: ReadOnlyContext, options: CommandOptions): Promise<CommandEnd>;
 }
 
-/**
- * The read-only commands, by name. `runCli` dispatches them without the
- * attempt loop, parsing each one's flags from its `options`, and `--help`
- * prints each one's `usage` in this order.
- */
 /** The observation runtime `list` and `status` read through; everything it holds is read-only. */
 function observationRuntime(context: ReadOnlyContext): ReadOnlyCommandRuntime {
   return {
@@ -1215,6 +1214,11 @@ function observationRuntime(context: ReadOnlyContext): ReadOnlyCommandRuntime {
   };
 }
 
+/**
+ * The read-only commands, by name. `runCli` dispatches them without the
+ * attempt loop, parsing each one's flags from its `options`, and `--help`
+ * prints each one's `usage` in this order.
+ */
 const READ_ONLY_COMMANDS: ReadonlyMap<string, ReadOnlyCommand> = new Map([
   [
     'list',

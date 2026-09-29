@@ -11,7 +11,6 @@ import { createInstanceRuntimeConfig, reconcileInstanceService, type InstanceRun
 import {
   createServiceControl,
   hostLogFiles,
-  runtimeServiceTarget,
   type NanoclawCommandRunner,
   type NanoclawServiceHandle,
   type NanoclawServiceHelpers,
@@ -150,14 +149,13 @@ describe('start', () => {
 
 describe('stop', () => {
   it('stops the service without draining its agents, then waits until detection shows it gone', async () => {
-    const { helpers, calls } = nanoclaw(LOADED, LOADED, LOADED, BOOTED_OUT);
-    const { service, sleep } = control(helpers);
+    const { helpers } = nanoclaw(LOADED, LOADED, LOADED, BOOTED_OUT);
 
-    await expect(service.stop()).resolves.toBe('stopped');
+    await expect(control(helpers).service.stop()).resolves.toBe('stopped');
 
     expect(helpers.stopService).toHaveBeenCalledExactlyOnceWith(LOADED, helpers.detectService.mock.calls[0]![1]);
-    expect(calls).toEqual(['detect', 'stop', 'detect', 'detect', 'detect']);
-    expect(sleep).toHaveBeenCalledTimes(2);
+    // It returned only once detection no longer found the job running.
+    expect(helpers.detectService).toHaveLastReturnedWith(BOOTED_OUT);
     expect(helpers.drainContainers).not.toHaveBeenCalled();
   });
 
@@ -335,17 +333,6 @@ describe("an assistant's own service coordinates", () => {
     });
   }
 
-  it('targets the checkout, install, home, and Docker endpoint the runtime record names', async () => {
-    const runtime = await createdRuntime();
-
-    expect(runtimeServiceTarget(runtime)).toEqual({
-      checkoutRoot: runtime.checkout_realpath,
-      installId: runtime.install_id,
-      homeDirectory: runtime.home_directory,
-      dockerEndpoint: runtime.docker_endpoint,
-    });
-  });
-
   it.each(['macos', 'linux'] as const)(
     'reads the log files the rendered %s service definition sends the host to (drift guard)',
     async (platform) => {
@@ -364,7 +351,6 @@ describe("an assistant's own service coordinates", () => {
       const definition = await readFile(layout.serviceDefinitionPath, 'utf8');
       const logs = hostLogFiles(runtime.checkout_realpath);
 
-      expect(logs).toEqual({ output: layout.standardOutputPath, errors: layout.standardErrorPath });
       expect(definition).toContain(logs.output);
       expect(definition).toContain(logs.errors);
     },

@@ -22,14 +22,13 @@ import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { PRESENT } from './phases.js';
 import type { PrincipalCandidate } from './principal.js';
 import { runSanitizedCommand, type SanitizedCommand } from './process.js';
+import { redact } from './redact.js';
 import { allocateInstanceId, writeInstanceMarker } from './registry.js';
 import { createInstanceRuntimeConfig, persistInstanceRuntime, type HostStatusHelpers } from './service.js';
 import type { NanoclawServiceHelpers } from './service-control.js';
 import {
-  LIST_JSON_FIELDS,
   LIST_USAGE,
   PROBE_NAMES,
-  STATUS_JSON_FIELDS,
   STATUS_USAGE,
   runListCommand,
   runStatusCommand,
@@ -39,18 +38,6 @@ import {
 import { commitAll, git } from './testing/cutover-fixture.js';
 import { GwsEaError, releaseOf, type InstanceReservation, type ReleaseCoordinates } from './types.js';
 import type { LatestDelivery } from './verify.js';
-
-/** Every file `list` and `status` open through `node:fs/promises`, so a test can prove what they never read. */
-const opened = vi.hoisted((): string[] => []);
-vi.mock('node:fs/promises', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('node:fs/promises')>();
-  const recorded = <F extends (...args: never[]) => unknown>(original: F): F =>
-    ((...args: Parameters<F>) => {
-      opened.push(String(args[0]));
-      return original(...args);
-    }) as F;
-  return { ...actual, open: recorded(actual.open), readFile: recorded(actual.readFile) };
-});
 
 const roots: string[] = [];
 
@@ -69,6 +56,37 @@ const LISTENER = '6f1c2b1e-8d4a-4c1e-9b7a-2f3e4d5c6b7a';
 const NOW = new Date('2026-09-28T14:30:00.000Z');
 const DELIVERED_AT = '2026-09-28T14:00:00.000Z';
 const SENTINEL = 'sentinel-secret-value-7f3a9c';
+
+/** The fields `list --json` prints for each assistant, in order, as its help documents them. */
+const LIST_FIELDS = [
+  'instance_id',
+  'hostname',
+  'track',
+  'deployed_commit',
+  'service',
+  'operation',
+  'removal_in_progress',
+] as const;
+
+/** The fields `status --json` prints, in order, as its help documents them. */
+const STATUS_FIELDS = [
+  'instance_id',
+  'observed_at',
+  'registry',
+  'operation',
+  'removal_in_progress',
+  'release',
+  'rollback',
+  'templates',
+  'schema',
+  'probes',
+] as const;
+
+/** A schema fingerprint as `status` prints it. */
+const FINGERPRINT = /^sha256:[0-9a-f]{64}$/u;
+
+/** How the machine's shared connector differs from what this tool would run. */
+const CONNECTOR_DRIFT = 'it was started with a different connector token';
 
 interface Machine {
   readonly root: string;
@@ -232,9 +250,30 @@ async function updateStoppedAt(paths: ControlPlanePaths, reservation: InstanceRe
   }
 }
 
-/** What each fake boundary reports, per checkout, and what reached it. */
+/** A removal cut short: its receipt, which removal writes before it removes anything. */
+async function removalStarted(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<void> {
+  await writePrivate(paths.removalFile(reservation.instance_id), {
+    instance_id: reservation.instance_id,
+    reservation,
+    started_at: NOW.toISOString(),
+  });
+}
+
+/** The staging an interrupted update left behind: `next/`, with no operation record. */
+async function stagingLeft(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<void> {
+  await mkdir(paths.releaseCheckoutRoot(reservation.instance_id, 'next'), { recursive: true, mode: 0o700 });
+}
+
+/** NanoClaw's install slug for an assistant: its instance ID without dashes. */
+function installOf(reservation: InstanceReservation): string {
+  return reservation.instance_id.replaceAll('-', '');
+}
+
+/** What each fake boundary reports, and what reached it. */
 interface World {
-  /** Checkouts whose service runs. */
+  /** Installs with a NanoClaw service defined, by install slug. */
+  readonly installed: ReadonlySet<string>;
+  /** Installs whose service runs. */
   readonly active: Set<string>;
   /** Checkouts whose host answers on its socket, its webhook, and `ncl`. */
   readonly serving: Set<string>;
@@ -246,7 +285,8 @@ interface World {
 function world(...assistants: readonly InstanceReservation[]): World {
   const checkouts = assistants.map((reservation) => reservation.checkout_realpath);
   return {
-    active: new Set(checkouts),
+    installed: new Set(assistants.map(installOf)),
+    active: new Set(assistants.map(installOf)),
     serving: new Set(checkouts),
     ports: new Map(
       assistants.map((reservation) => [reservation.checkout_realpath, reservation.allocated_ports.nanoclaw_webhook]),
@@ -260,17 +300,27 @@ function unused(): never {
   throw new Error('list and status never change a service');
 }
 
-function serviceHelpers(state: World): NanoclawServiceHelpers {
+/**
+ * NanoClaw's service helpers, faked as its detection finds a service: by the
+ * install slug and the home its definition lives under, which name launchd's
+ * label and plist, never by the checkout.
+ */
+function serviceHelpers(state: World, home: string): NanoclawServiceHelpers {
   return {
     createCommandRunner: ({ env }) => {
       state.serviceEnvironments.push(env);
       return { run: unused, tryRun: unused };
     },
-    detectService: (root) => ({
-      mode: 'launchd',
-      name: `com.nanoclaw.${path.basename(root)}`,
-      active: state.active.has(root),
-    }),
+    detectService: (_root, env) => {
+      if (env.home !== home || !state.installed.has(env.installSlug)) return { mode: 'none', active: false };
+      const label = `com.nanoclaw-v2-${env.installSlug}`;
+      return {
+        mode: 'launchd',
+        name: label,
+        definition: path.join(env.home, 'Library', 'LaunchAgents', `${label}.plist`),
+        active: state.active.has(env.installSlug),
+      };
+    },
     stopService: async () => unused(),
     startService: unused,
     drainContainers: async () => unused(),
@@ -407,7 +457,7 @@ function command(host: Machine, state: World, observers: Partial<StatusObservers
     paths: host.paths,
     stdout: (line) => output.stdout.push(line),
     stderr: (line) => output.stderr.push(line),
-    serviceHelpers: serviceHelpers(state),
+    serviceHelpers: serviceHelpers(state, host.root),
     hostStatus: hostStatus(state),
     observers,
     toolRoot: host.tool,
@@ -432,16 +482,23 @@ interface StatusShape {
   rollback: Record<string, unknown>;
   templates: Record<string, unknown>;
   operation: Record<string, unknown>;
+  schema: Record<string, unknown>;
 }
 
 describe('status', () => {
-  it('reports every probe as ok for a healthy assistant, with its release, rollback, and template facts', async () => {
+  it('reports every probe as ok for a healthy assistant, with its release, rollback, template, and schema facts', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
     await bound(host.paths, reservation.instance_id);
+    // Beside the healthy host: a removal cut short, staging an interrupted update left, and a drifted shared connector.
+    await removalStarted(host.paths, reservation);
+    await stagingLeft(host.paths, reservation);
     const state = world(reservation);
 
-    const { exitCode, status } = await statusJson(host, state, reservation.instance_id);
+    const { exitCode, status } = await statusJson(host, state, reservation.instance_id, {
+      ...healthyObservers(state),
+      connector: async () => ({ status: 'present', drift: CONNECTOR_DRIFT }),
+    });
 
     expect(exitCode).toBe(0);
     expect(Object.keys(status.probes)).toEqual([...PROBE_NAMES]);
@@ -449,7 +506,8 @@ describe('status', () => {
     expect(status.probes.checkout).toMatchObject({ commit: host.release });
     expect(status.probes.service).toMatchObject({ state: 'running' });
     expect(status.probes.main_identity).toMatchObject({ agent_group_id: MAIN });
-    expect(status.probes.connector).toMatchObject({ drift: null });
+    // A shared connector's drift is reported, never counted against this assistant (KTD11).
+    expect(status.probes.connector).toEqual({ status: 'ok', reason: null, drift: CONNECTOR_DRIFT });
     expect(status.probes.delivery).toMatchObject({
       last: { status: 'delivered', message_out_id: 'out-welcome', at: DELIVERED_AT },
       retrying: 0,
@@ -465,8 +523,8 @@ describe('status', () => {
         source_remote: host.tool,
         deployed_commit: host.release,
       },
-      operation: { state: 'none', abandoned_staging: false },
-      removal_in_progress: false,
+      operation: { state: 'none', abandoned_staging: true },
+      removal_in_progress: true,
       release: { deployed_commit: host.release, tool_commit: host.release, behind_tool_release: false, reason: null },
       rollback: {
         available: false,
@@ -475,7 +533,12 @@ describe('status', () => {
         reason: `Assistant ${reservation.instance_id} keeps no previous release, so there is nothing to roll back to.`,
       },
       templates: { customized: [EDITED_PERSONA, EDITED_TASK], reason: null },
-      schema: { latest_migration: 'host-coordination', reason: null },
+      schema: {
+        central_fingerprint: expect.stringMatching(FINGERPRINT),
+        session_fingerprint: expect.stringMatching(FINGERPRINT),
+        latest_migration: 'host-coordination',
+        reason: null,
+      },
     });
   });
 
@@ -552,30 +615,47 @@ describe('status', () => {
     expect(text).toContain(`gws-ea update --id ${reservation.instance_id}`);
   });
 
-  it('reports the kept previous release and whether either schema moved since it', async () => {
+  it('reports the kept previous release, whether either schema moved since it, and a fingerprint of each', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
-    const previous = host.paths.releaseCheckoutRoot(reservation.instance_id, 'previous');
     const previousCommit = 'e'.repeat(40);
     await keepPrevious(host.paths, reservation, previousCommit);
     const state = world(reservation);
-    const manifests = new Map<string, SnapshotManifest>([
-      [reservation.checkout_realpath, MANIFEST],
-      [previous, { ...MANIFEST, central_migrations: ['initial-v2-schema'] }],
-    ]);
-    const observers = { ...healthyObservers(state), schema: (root: string) => manifests.get(root) ?? MANIFEST };
+    // The kept release's databases record MANIFEST; each case sets what the live checkout's record.
+    let live = MANIFEST;
+    const observers: Partial<StatusObservers> = {
+      ...healthyObservers(state),
+      schema: (root) => (root === reservation.checkout_realpath ? live : MANIFEST),
+    };
+    const observe = async (manifest: SnapshotManifest): Promise<StatusShape> => {
+      live = manifest;
+      return (await statusJson(host, state, reservation.instance_id, observers)).status;
+    };
 
-    const moved = await statusJson(host, state, reservation.instance_id, observers);
-    manifests.set(previous, MANIFEST);
-    const unmoved = await statusJson(host, state, reservation.instance_id, observers);
+    const unmoved = await observe(MANIFEST);
+    const central = await observe({
+      ...MANIFEST,
+      central_migrations: [...MANIFEST.central_migrations, 'agent-grants'],
+    });
+    const session = await observe({
+      ...MANIFEST,
+      session_tables: { ...MANIFEST.session_tables, 'inbound.messages_in': ['id', 'on_wake'] },
+    });
 
-    expect(moved.status.rollback).toEqual({
+    expect(unmoved.rollback).toEqual({
       available: true,
       previous_commit: previousCommit,
-      schema_moved: true,
+      schema_moved: false,
       reason: null,
     });
-    expect(unmoved.status.rollback).toMatchObject({ available: true, schema_moved: false });
+    // Either schema moving alone makes a rollback restore the pre-update snapshot (KTD5).
+    expect(central.rollback).toMatchObject({ available: true, previous_commit: previousCommit, schema_moved: true });
+    expect(session.rollback).toMatchObject({ available: true, previous_commit: previousCommit, schema_moved: true });
+    // Each fingerprint follows its own schema alone.
+    expect(central.schema.central_fingerprint).not.toBe(unmoved.schema.central_fingerprint);
+    expect(central.schema.session_fingerprint).toBe(unmoved.schema.session_fingerprint);
+    expect(session.schema.session_fingerprint).not.toBe(unmoved.schema.session_fingerprint);
+    expect(session.schema.central_fingerprint).toBe(unmoved.schema.central_fingerprint);
   });
 
   it.each([
@@ -615,7 +695,10 @@ describe('status', () => {
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
     await bound(host.paths, reservation.instance_id);
     const state = world(reservation);
-    const { runtime, output } = command(host, state);
+    const { runtime, output } = command(host, state, {
+      ...healthyObservers(state),
+      connector: async () => ({ status: 'present', drift: CONNECTOR_DRIFT }),
+    });
 
     expect(await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false })).toBe(0);
 
@@ -624,6 +707,9 @@ describe('status', () => {
     expect(text).toContain('Observed: Sep 28, 2026, 10:30 AM');
     expect(text).toContain('Sep 28, 2026, 10:00 AM');
     for (const name of PROBE_NAMES) expect(text).toMatch(new RegExp(`^ {2}ok +${name}\\b`, 'mu'));
+    expect(text).toMatch(
+      new RegExp(`^ {2}ok +connector +${CONNECTOR_DRIFT}; it is shared, so it is left as it is$`, 'mu'),
+    );
     expect(text).toContain(
       'Templates: customized, kept by updates: instructions.prepend.md (changed), task Weekly review (changed)',
     );
@@ -646,21 +732,23 @@ describe('status', () => {
 });
 
 describe('list', () => {
-  it('shows every assistant, and the phase of one mid-update', async () => {
+  it('shows every assistant, the phase of one mid-update, and the removal and staging another left', async () => {
     const host = await machine();
     const alpha = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
     const beta = await assistant(host, { label: 'beta', port: 36_011, ingress: 'existing' });
     const target: ReleaseCoordinates = { ...releaseOf(beta), deployed_commit: 'c'.repeat(40) };
     await updateStoppedAt(host.paths, beta, target);
+    await removalStarted(host.paths, alpha);
+    await stagingLeft(host.paths, alpha);
     const state = world(alpha, beta);
-    state.active.delete(beta.checkout_realpath);
+    state.active.delete(installOf(beta));
 
     const json = command(host, state);
     expect(await runListCommand(json.runtime, { json: true })).toBe(0);
     const listing = JSON.parse(json.output.stdout.join('\n')) as { assistants: Array<Record<string, unknown>> };
 
     expect(listing.assistants).toHaveLength(2);
-    for (const entry of listing.assistants) expect(Object.keys(entry)).toEqual([...LIST_JSON_FIELDS]);
+    for (const entry of listing.assistants) expect(Object.keys(entry)).toEqual([...LIST_FIELDS]);
     expect(listing.assistants).toEqual(
       expect.arrayContaining([
         {
@@ -669,8 +757,8 @@ describe('list', () => {
           track: 'dogfood',
           deployed_commit: host.release,
           service: { state: 'running', reason: null },
-          operation: { state: 'none', abandoned_staging: false },
-          removal_in_progress: false,
+          operation: { state: 'none', abandoned_staging: true },
+          removal_in_progress: true,
         },
         {
           instance_id: beta.instance_id,
@@ -699,7 +787,7 @@ describe('list', () => {
     const lines = text.output.stdout.join('\n');
     expect(lines).toMatch(
       new RegExp(
-        `${alpha.instance_id} +alpha\\.example\\.test +dogfood +${host.release.slice(0, 12)} +running +-`,
+        `${alpha.instance_id} +alpha\\.example\\.test +dogfood +${host.release.slice(0, 12)} +running +removing`,
         'u',
       ),
     );
@@ -710,6 +798,11 @@ describe('list', () => {
       ),
     );
     expect(lines).toContain(`continue with gws-ea update --id ${beta.instance_id}`);
+    // Each thing left under way is named beside the table, with the command that settles it.
+    expect(lines).toMatch(new RegExp(`^${alpha.instance_id}: Removal .*gws-ea remove --id ${alpha.instance_id}`, 'mu'));
+    expect(lines).toMatch(
+      new RegExp(`^${alpha.instance_id}: .*staging .*gws-ea update --id ${alpha.instance_id}`, 'mu'),
+    );
   });
 
   it('says so when no assistant is registered', async () => {
@@ -810,8 +903,19 @@ async function sessionMailbox(checkout: string): Promise<void> {
   }
 }
 
+/** What observing may ask Docker and Git: the read-only verbs the observers use, and nothing that changes state. */
+const READ_ONLY_VERBS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ['docker', new Set(['container ls', 'container inspect', 'image inspect'])],
+  ['git', new Set(['rev-parse', 'status', 'cat-file', 'merge-base'])],
+]);
+
+/** A command's verb: Docker's object and action, or Git's subcommand after its global options. */
+function verbOf({ command, args }: SanitizedCommand): string {
+  return command === 'docker' ? args.slice(0, 2).join(' ') : (args.find((arg) => !arg.startsWith('-')) ?? '');
+}
+
 describe('read-only commands', () => {
-  it('write no file, read no secrets file, and pass no secret environment variable', async () => {
+  it('write no file, load no secret, pass no secret environment variable, and ask Docker and Git only to read', async () => {
     const host = await machine();
     const alpha = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
     const beta = await assistant(host, { label: 'beta', port: 36_011, ingress: 'existing' });
@@ -841,7 +945,6 @@ describe('read-only commands', () => {
     }
     const before = await snapshot(host.root);
     expect([...before.keys()]).not.toContain(path.relative(host.root, `${alpha.checkout_realpath}/data/v2.db-wal`));
-    opened.length = 0;
 
     const outputs: Output[] = [];
     for (const json of [true, false]) {
@@ -855,10 +958,13 @@ describe('read-only commands', () => {
       }
     }
 
-    const reads = [...opened];
     expect(await snapshot(host.root)).toEqual(before);
-    expect(reads).not.toContain(secretsFile);
-    expect(reads).toContain(host.paths.registryFile);
+    // Neither the secrets file nor the environment was loaded: loading registers every secret for redaction.
+    expect(redact(SENTINEL)).toBe(SENTINEL);
+    expect(new Set(state.commands.map(({ command: tool }) => tool))).toEqual(new Set(['docker', 'git']));
+    for (const run of state.commands) {
+      expect(READ_ONLY_VERBS.get(run.command)?.has(verbOf(run)), [run.command, ...run.args].join(' ')).toBe(true);
+    }
     const everything = JSON.stringify({ outputs, commands: state.commands, env: state.serviceEnvironments });
     expect(everything).not.toContain(SENTINEL);
     expect(everything).not.toContain('GWS_EA_');
@@ -883,8 +989,8 @@ describe('help', () => {
   it('names every JSON field the commands print', () => {
     const help = [...LIST_USAGE, ...STATUS_USAGE].join('\n');
     for (const field of [
-      ...LIST_JSON_FIELDS,
-      ...STATUS_JSON_FIELDS,
+      ...LIST_FIELDS,
+      ...STATUS_FIELDS,
       ...PROBE_NAMES,
       'tool_commit',
       'behind_tool_release',
@@ -902,6 +1008,6 @@ describe('help', () => {
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
     const { status } = await statusJson(host, world(reservation), reservation.instance_id);
 
-    expect(Object.keys(status)).toEqual([...STATUS_JSON_FIELDS]);
+    expect(Object.keys(status)).toEqual([...STATUS_FIELDS]);
   });
 });
