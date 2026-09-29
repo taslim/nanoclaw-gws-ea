@@ -502,7 +502,8 @@ export function applying(...names: readonly string[]): Migrate {
 /**
  * Where an update is killed: the boundary call it never returns from. At
  * `restamp` the host finished restamping main's template; at
- * `restamp-partway` it had replaced only the plugin.
+ * `restamp-partway` it had replaced only the plugin. At `untag` a rollback's
+ * cleanup is removing the `:previous` tag it leaves.
  */
 export type HangPoint =
   | 'build'
@@ -514,7 +515,8 @@ export type HangPoint =
   | 'verify'
   | 'rebuild'
   | 'restamp'
-  | 'restamp-partway';
+  | 'restamp-partway'
+  | 'untag';
 
 /** What every faked boundary holds, and what reached it. */
 export interface World {
@@ -734,6 +736,7 @@ export function runner(state: World): SanitizedCommandRunner {
         return { stdout: '', stderr: '' };
       }
       if (first === 'image' && second === 'rm') {
+        if (last.endsWith(':previous')) await hang(state, 'untag');
         removeImage(state, last);
         return { stdout: '', stderr: '' };
       }

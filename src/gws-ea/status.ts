@@ -194,6 +194,8 @@ export interface ListedAssistant {
   readonly hostname: string;
   readonly track: string;
   readonly deployed_commit: string;
+  /** Whether the tool's release is ahead of it, as `status` reports it. */
+  readonly release: ReleaseView;
   readonly service: { readonly state: ServiceState; readonly reason: string | null };
   readonly operation: OperationView;
   readonly removal_in_progress: boolean;
@@ -373,19 +375,39 @@ function resolveObservers(overrides: Partial<StatusObservers> = {}): StatusObser
   };
 }
 
-/** The runtime create recorded once the host first started; absent before. */
+/** The runtime create recorded once the host first started, at the live checkout; `why` says why it is missing. */
 type RuntimeRecord =
   | { readonly state: 'recorded'; readonly config: InstanceRuntimeConfig }
-  | { readonly state: 'missing' }
+  | { readonly state: 'missing'; readonly why: string }
   | { readonly state: 'unreadable'; readonly error: unknown };
 
-async function readRuntimeRecord(reservation: InstanceReservation): Promise<RuntimeRecord> {
+/** Where an unfinished update or rollback may have the live checkout moved aside, or not yet in place. */
+const SWITCHING: ReadonlySet<OperationPhase> = new Set(['swapping', 'swapped']);
+
+/**
+ * Why the live checkout holds no runtime record: an update or rollback is
+ * switching releases (or a rollback going back is), or the host has never
+ * been started.
+ */
+function missingRuntime(inspection: OperationInspection): string {
+  if (inspection.state === 'open' && (SWITCHING.has(inspection.record.phase) || inspection.record.returning)) {
+    return `The assistant is mid-switch; ${inspection.next.continueWith} finishes it.`;
+  }
+  return 'The assistant has no runtime record: its host has never been started.';
+}
+
+async function readRuntimeRecord(
+  reservation: InstanceReservation,
+  inspection: OperationInspection,
+): Promise<RuntimeRecord> {
   try {
     const file = instanceRuntimeFile(reservation.checkout_realpath);
     return { state: 'recorded', config: await loadInstanceRuntimeConfig(file) };
     // eslint-disable-next-line no-catch-all/no-catch-all -- An unreadable runtime is reported by each probe that needs it.
   } catch (error) {
-    return isErrno(error, 'ENOENT') ? { state: 'missing' } : { state: 'unreadable', error };
+    return isErrno(error, 'ENOENT')
+      ? { state: 'missing', why: missingRuntime(inspection) }
+      : { state: 'unreadable', error };
   }
 }
 
@@ -394,7 +416,7 @@ function requireRuntime(record: RuntimeRecord): InstanceRuntimeConfig {
     case 'recorded':
       return record.config;
     case 'missing':
-      throw new Unobservable('The assistant has no runtime record: its host has never been started.');
+      throw new Unobservable(record.why);
     case 'unreadable':
       throw record.error;
   }
@@ -729,8 +751,15 @@ async function deliveryProbe({ reservation, observers }: Subject): Promise<Probe
   return { ...OK, ...facts };
 }
 
-/** Whether the tool's own release is ahead of the assistant's, from the tool's history alone. */
-async function observeRelease({ context, reservation, observers }: Subject): Promise<ReleaseView> {
+/**
+ * Whether the tool's own release is ahead of the assistant's, from the tool's
+ * history alone: local and read-only, so `list` asks it of every assistant.
+ */
+async function observeRelease({
+  context,
+  reservation,
+  observers,
+}: Pick<Subject, 'context' | 'reservation' | 'observers'>): Promise<ReleaseView> {
   const deployed = reservation.deployed_commit;
   try {
     const { toolCommit, position } = await locateAgainstToolRelease(context.toolRoot ?? CONTROL_PLANE_ROOT, deployed, {
@@ -885,9 +914,9 @@ export async function observeAssistantStatus(
   const reservation = await findReservation(context.paths, instanceId);
   const observedAt = (context.now ?? (() => new Date()))().toISOString();
   const observers = resolveObservers(context.observers);
-  const [inspection, runtime, removal] = await Promise.all([
-    inspect(context.paths, reservation),
-    readRuntimeRecord(reservation),
+  const inspection = await inspect(context.paths, reservation);
+  const [runtime, removal] = await Promise.all([
+    readRuntimeRecord(reservation, inspection),
     removalInProgress(context.paths, instanceId),
   ]);
   const subject: Subject = { context, observers, reservation, inspection, runtime };
@@ -953,9 +982,13 @@ export async function observeAssistantStatus(
   };
 }
 
-/** Every registered assistant, from local state and cheap service detection only (R1). */
+/**
+ * Every registered assistant, from local state only (R1): the registry, cheap
+ * service detection, and where each stands against the tool's own release.
+ */
 export async function listAssistants(context: ObservationContext): Promise<AssistantListing> {
   const registry = await readRegistry(context.paths);
+  const observers = resolveObservers(context.observers);
   const reservations = Object.values(registry.instances).sort(
     (left, right) =>
       hostnameOf(left.exclusive_resource_claims.ingress).localeCompare(
@@ -964,10 +997,11 @@ export async function listAssistants(context: ObservationContext): Promise<Assis
   );
   const assistants = await Promise.all(
     reservations.map(async (reservation): Promise<ListedAssistant> => {
-      const [inspection, runtime, removal] = await Promise.all([
-        inspect(context.paths, reservation),
-        readRuntimeRecord(reservation),
+      const inspection = await inspect(context.paths, reservation);
+      const [runtime, removal, release] = await Promise.all([
+        readRuntimeRecord(reservation, inspection),
         removalInProgress(context.paths, reservation.instance_id),
+        observeRelease({ context, reservation, observers }),
       ]);
       const service = await observeService(context, runtime);
       return {
@@ -975,6 +1009,7 @@ export async function listAssistants(context: ObservationContext): Promise<Assis
         hostname: hostnameOf(reservation.exclusive_resource_claims.ingress),
         track: reservation.release_track,
         deployed_commit: reservation.deployed_commit,
+        release,
         service: { state: service.state, reason: service.reason },
         operation: operationView(inspection),
         removal_in_progress: removal,
@@ -1041,15 +1076,22 @@ function table(rows: readonly (readonly string[])[]): string[] {
   );
 }
 
+/** Whether an assistant is behind the tool's release, as `list` shows it. */
+function behindCell(release: ReleaseView): string {
+  if (release.behind_tool_release === null) return 'unknown';
+  return release.behind_tool_release ? 'yes' : 'no';
+}
+
 function renderList(listing: AssistantListing): string[] {
   if (listing.assistants.length === 0) return ['No assistants are registered on this machine.'];
   const rows = [
-    ['INSTANCE ID', 'HOSTNAME', 'TRACK', 'COMMIT', 'SERVICE', 'OPERATION'],
+    ['INSTANCE ID', 'HOSTNAME', 'TRACK', 'COMMIT', 'BEHIND TOOL', 'SERVICE', 'OPERATION'],
     ...listing.assistants.map((assistant) => [
       assistant.instance_id,
       assistant.hostname,
       assistant.track,
       shortCommit(assistant.deployed_commit),
+      behindCell(assistant.release),
       assistant.service.state,
       assistant.removal_in_progress ? 'removing' : operationSummary(assistant.operation),
     ]),
@@ -1148,9 +1190,11 @@ function renderStatus(status: AssistantStatus, timezone: string): string[] {
  */
 export const LIST_USAGE: readonly string[] = [
   'list [--json]',
-  '       Every assistant on this machine, from local state only. JSON: {"assistants": [...]}, each with',
-  '       instance_id, hostname, track, deployed_commit, service (state: running|stopped|not_installed|',
-  '       unmanaged|unknown, reason), operation (state: none|open|recorded|unreadable), removal_in_progress.',
+  "       Every assistant on this machine, from local state only; BEHIND TOOL says whether this gws-ea's",
+  '       release is newer. JSON: {"assistants": [...]}, each with instance_id, hostname, track,',
+  '       deployed_commit, release (deployed_commit, tool_commit, behind_tool_release: true|false, or null',
+  '       with a reason when unknown), service (state: running|stopped|not_installed|unmanaged|unknown,',
+  '       reason), operation (state: none|open|recorded|unreadable), removal_in_progress.',
 ];
 
 export const STATUS_USAGE: readonly string[] = [

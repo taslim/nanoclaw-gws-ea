@@ -6,7 +6,19 @@
  * faked at their boundaries; Git and SQLite are real.
  */
 import { createHash } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, utimes, writeFile } from 'node:fs/promises';
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  readlink,
+  realpath,
+  rename,
+  rm,
+  utimes,
+  writeFile,
+} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -24,9 +36,10 @@ import {
   type OperationFollowUp,
   type OperationIntent,
   type OperationKind,
+  type OperationPhase,
   type SnapshotManifest,
 } from './operation.js';
-import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+import { instanceRuntimeFile, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { PRESENT } from './phases.js';
 import type { PrincipalCandidate } from './principal.js';
 import { runSanitizedCommand, type SanitizedCommand } from './process.js';
@@ -71,6 +84,7 @@ const LIST_FIELDS = [
   'hostname',
   'track',
   'deployed_commit',
+  'release',
   'service',
   'operation',
   'removal_in_progress',
@@ -128,19 +142,24 @@ interface AssistantOptions {
   readonly label: string;
   readonly port: number;
   readonly ingress: 'existing' | 'managed-cloudflare';
+  /** The repository it was created from and the release it runs: the tool's first release unless given. */
+  readonly from?: { readonly repository: string; readonly commit: string };
 }
 
 /** An assistant create finished: its reservation, checkout, marker, runtime, release receipt, and Compose file. */
-async function assistant(host: Machine, { label, port, ingress }: AssistantOptions): Promise<InstanceReservation> {
+async function assistant(
+  host: Machine,
+  { label, port, ingress, from = { repository: host.tool, commit: host.release } }: AssistantOptions,
+): Promise<InstanceReservation> {
   const { paths } = host;
   const instanceId = allocateInstanceId();
   const callback = `https://${label}.example.test/webhook/gchat`;
   const reserved = await reserveInstance(paths, {
     instance_id: instanceId,
     checkout_realpath: paths.checkoutRoot(instanceId),
-    source_remote: host.tool,
+    source_remote: from.repository,
     release_track: 'dogfood',
-    deployed_commit: host.release,
+    deployed_commit: from.commit,
     allocated_ports: { nanoclaw_webhook: port, onecli_app: port + 1, onecli_gateway: port + 2 },
     exclusive_resource_claims: {
       ingress:
@@ -163,8 +182,8 @@ async function assistant(host: Machine, { label, port, ingress }: AssistantOptio
     },
   });
   const checkout = paths.checkoutRoot(instanceId);
-  git(host.root, 'clone', '--quiet', host.tool, checkout);
-  git(checkout, 'checkout', '--quiet', '--detach', host.release);
+  git(host.root, 'clone', '--quiet', from.repository, checkout);
+  git(checkout, 'checkout', '--quiet', '--detach', from.commit);
   await writeInstanceMarker(paths, instanceId);
   const onecli = createOnecliRuntimeLayout({
     instanceId,
@@ -189,7 +208,7 @@ async function assistant(host: Machine, { label, port, ingress }: AssistantOptio
     `${JSON.stringify({
       schema_version: 1,
       instance_id: instanceId,
-      deployed_commit: host.release,
+      deployed_commit: from.commit,
       provider: 'claude',
       providerCapabilityDigest: 'c'.repeat(64),
       providerCredential: CREDENTIAL,
@@ -246,13 +265,18 @@ async function keepPrevious(paths: ControlPlanePaths, reservation: InstanceReser
   await writePrivate(path.join(root, 'release-preflight.json'), { instance_id: id, deployed_commit: commit });
 }
 
-/** The release an update to `to` is moving this assistant towards, unfinished at `stopped`. */
-async function updateStoppedAt(paths: ControlPlanePaths, reservation: InstanceReservation, to: ReleaseCoordinates) {
+/** The release an update to `to` is moving this assistant towards, unfinished at `phase`. */
+async function updateUnfinishedAt(
+  paths: ControlPlanePaths,
+  reservation: InstanceReservation,
+  to: ReleaseCoordinates,
+  phase: OperationPhase = 'stopped',
+) {
   const operation = await acquireInstanceOperation(paths, reservation.instance_id, { command: 'update', target: to });
   if (!operation) throw new Error('The test instance operation was busy');
   try {
     await beginOperation(operation, { kind: 'update', from: releaseOf(reservation), to });
-    await advanceOperation(operation, 'stopped', { stop: { at: NOW.toISOString(), graceful: true } });
+    await advanceOperation(operation, phase, { stop: { at: NOW.toISOString(), graceful: true } });
   } finally {
     operation.release();
   }
@@ -761,6 +785,38 @@ describe('status', () => {
     );
   });
 
+  it('names what finishes an update mid-switch for a live checkout it moved, and a host never started as such', async () => {
+    const host = await machine();
+    const switching = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const unstarted = await assistant(host, { label: 'beta', port: 36_011, ingress: 'existing' });
+    const target: ReleaseCoordinates = { ...releaseOf(switching), deployed_commit: 'c'.repeat(40) };
+    await updateUnfinishedAt(host.paths, switching, target, 'swapping');
+    // Between the swap's renames: the live checkout is kept in previous/, and the staged one is not yet in its place.
+    const previous = host.paths.releaseCheckoutRoot(switching.instance_id, 'previous');
+    await mkdir(path.dirname(previous), { recursive: true, mode: 0o700 });
+    await rename(switching.checkout_realpath, previous);
+    // The other's host never started, so it has no runtime record.
+    await rm(instanceRuntimeFile(unstarted.checkout_realpath));
+    const state = world(switching, unstarted);
+    const midSwitch = `The assistant is mid-switch; gws-ea update --id ${switching.instance_id} finishes it.`;
+    const neverStarted = 'The assistant has no runtime record: its host has never been started.';
+
+    const switchingStatus = (await statusJson(host, state, switching.instance_id)).status;
+    const unstartedStatus = (await statusJson(host, state, unstarted.instance_id)).status;
+    const listed = command(host, state);
+    expect(await runListCommand(listed.runtime, { json: true })).toBe(0);
+    const listing = JSON.parse(listed.output.stdout.join('\n')) as {
+      assistants: Array<{ instance_id: string; service: unknown }>;
+    };
+
+    expect(switchingStatus.probes.service).toEqual({ status: 'unknown', reason: midSwitch, state: 'unknown' });
+    expect(unstartedStatus.probes.service).toEqual({ status: 'unknown', reason: neverStarted, state: 'unknown' });
+    expect(Object.fromEntries(listing.assistants.map(({ instance_id, service }) => [instance_id, service]))).toEqual({
+      [switching.instance_id]: { state: 'unknown', reason: midSwitch },
+      [unstarted.instance_id]: { state: 'unknown', reason: neverStarted },
+    });
+  });
+
   it('refuses an unknown assistant ID with exit code 1', async () => {
     const host = await machine();
     const state = world();
@@ -782,7 +838,7 @@ describe('list', () => {
     const alpha = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
     const beta = await assistant(host, { label: 'beta', port: 36_011, ingress: 'existing' });
     const target: ReleaseCoordinates = { ...releaseOf(beta), deployed_commit: 'c'.repeat(40) };
-    await updateStoppedAt(host.paths, beta, target);
+    await updateUnfinishedAt(host.paths, beta, target);
     await removalStarted(host.paths, alpha);
     await stagingLeft(host.paths, alpha);
     const state = world(alpha, beta);
@@ -791,6 +847,12 @@ describe('list', () => {
     const json = command(host, state);
     expect(await runListCommand(json.runtime, { json: true })).toBe(0);
     const listing = JSON.parse(json.output.stdout.join('\n')) as { assistants: Array<Record<string, unknown>> };
+    const current = {
+      deployed_commit: host.release,
+      tool_commit: host.release,
+      behind_tool_release: false,
+      reason: null,
+    };
 
     expect(listing.assistants).toHaveLength(2);
     for (const entry of listing.assistants) expect(Object.keys(entry)).toEqual([...LIST_FIELDS]);
@@ -801,6 +863,7 @@ describe('list', () => {
           hostname: 'alpha.example.test',
           track: 'dogfood',
           deployed_commit: host.release,
+          release: current,
           service: { state: 'running', reason: null },
           operation: { state: 'none', abandoned_staging: true },
           removal_in_progress: true,
@@ -810,6 +873,7 @@ describe('list', () => {
           hostname: 'beta.example.test',
           track: 'dogfood',
           deployed_commit: host.release,
+          release: current,
           service: { state: 'stopped', reason: 'Its service is stopped.' },
           operation: {
             state: 'open',
@@ -832,13 +896,13 @@ describe('list', () => {
     const lines = text.output.stdout.join('\n');
     expect(lines).toMatch(
       new RegExp(
-        `${alpha.instance_id} +alpha\\.example\\.test +dogfood +${host.release.slice(0, 12)} +running +removing`,
+        `${alpha.instance_id} +alpha\\.example\\.test +dogfood +${host.release.slice(0, 12)} +no +running +removing`,
         'u',
       ),
     );
     expect(lines).toMatch(
       new RegExp(
-        `${beta.instance_id} +beta\\.example\\.test +dogfood +${host.release.slice(0, 12)} +stopped +update stopped`,
+        `${beta.instance_id} +beta\\.example\\.test +dogfood +${host.release.slice(0, 12)} +no +stopped +update stopped`,
         'u',
       ),
     );
@@ -848,6 +912,74 @@ describe('list', () => {
     expect(lines).toMatch(
       new RegExp(`^${alpha.instance_id}: .*staging .*gws-ea update --id ${alpha.instance_id}`, 'mu'),
     );
+  });
+
+  it("says whether each assistant is behind the tool's release, from the tool's own history", async () => {
+    const host = await machine();
+    const behind = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const toolRelease = await nextRelease(host);
+    const current = await assistant(host, {
+      label: 'beta',
+      port: 36_011,
+      ingress: 'existing',
+      from: { repository: host.tool, commit: toolRelease },
+    });
+    // A release of a repository the tool's checkout never fetched, so its history cannot place it.
+    const elsewhere = path.join(host.root, 'elsewhere');
+    await mkdir(elsewhere);
+    git(elsewhere, 'init', '--quiet', '-b', 'dogfood');
+    await writeFile(path.join(elsewhere, 'release.txt'), 'elsewhere\n');
+    const foreign = commitAll(elsewhere, 'a release the tool never saw');
+    const unplaced = await assistant(host, {
+      label: 'gamma',
+      port: 36_021,
+      ingress: 'existing',
+      from: { repository: elsewhere, commit: foreign },
+    });
+    const state = world(behind, current, unplaced);
+
+    const json = command(host, state);
+    expect(await runListCommand(json.runtime, { json: true })).toBe(0);
+    const text = command(host, state);
+    expect(await runListCommand(text.runtime, { json: false })).toBe(0);
+
+    const listing = JSON.parse(json.output.stdout.join('\n')) as {
+      assistants: Array<{ instance_id: string; release: unknown }>;
+    };
+    expect(Object.fromEntries(listing.assistants.map(({ instance_id, release }) => [instance_id, release]))).toEqual({
+      [behind.instance_id]: {
+        deployed_commit: host.release,
+        tool_commit: toolRelease,
+        behind_tool_release: true,
+        reason: null,
+      },
+      [current.instance_id]: {
+        deployed_commit: toolRelease,
+        tool_commit: toolRelease,
+        behind_tool_release: false,
+        reason: null,
+      },
+      [unplaced.instance_id]: {
+        deployed_commit: foreign,
+        tool_commit: toolRelease,
+        behind_tool_release: null,
+        reason: `The tool's checkout does not hold ${foreign.slice(0, 12)}, so it cannot tell.`,
+      },
+    });
+    const lines = text.output.stdout.join('\n');
+    expect(lines).toMatch(/^INSTANCE ID +HOSTNAME +TRACK +COMMIT +BEHIND TOOL +SERVICE +OPERATION$/mu);
+    for (const [reservation, cell] of [
+      [behind, 'yes'],
+      [current, 'no'],
+      [unplaced, 'unknown'],
+    ] as const) {
+      expect(lines).toMatch(
+        new RegExp(
+          `^${reservation.instance_id} +\\S+ +dogfood +${reservation.deployed_commit.slice(0, 12)} +${cell} +running +-$`,
+          'mu',
+        ),
+      );
+    }
   });
 
   it('says so when no assistant is registered', async () => {

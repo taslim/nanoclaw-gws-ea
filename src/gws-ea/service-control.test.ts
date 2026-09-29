@@ -19,9 +19,12 @@ import {
 } from './service-control.js';
 import type { InstanceReservation } from './types.js';
 
-const INSTALL_ID = '0123456789abcdef0123456789abcdef';
+const INSTANCE_ID = '01234567-89ab-cdef-0123-456789abcdef';
+/** NanoClaw's install slug: the instance ID without dashes. */
+const INSTALL_ID = INSTANCE_ID.replaceAll('-', '');
 const LABEL = `com.nanoclaw-v2-${INSTALL_ID}`;
 const TARGET: ServiceControlTarget = {
+  instanceId: INSTANCE_ID,
   checkoutRoot: '/state/instances/x/nanoclaw',
   installId: INSTALL_ID,
   homeDirectory: '/Users/operator',
@@ -222,15 +225,18 @@ describe('restart', () => {
 });
 
 describe('refusals', () => {
-  it.each([
-    ['start', 'service_not_installed'],
-    ['restart', 'service_not_installed'],
-  ] as const)('%s refuses when no service is installed', async (action, code) => {
-    const { helpers, calls } = nanoclaw(NOT_INSTALLED);
+  it.each(['start', 'restart'] as const)(
+    '%s refuses when no service is installed, naming the command that installs it',
+    async (action) => {
+      const { helpers, calls } = nanoclaw(NOT_INSTALLED);
 
-    await expect(control(helpers).service[action]()).rejects.toMatchObject({ code });
-    expect(calls).toEqual(['detect']);
-  });
+      await expect(control(helpers).service[action]()).rejects.toMatchObject({
+        code: 'service_not_installed',
+        message: `No NanoClaw service is installed for ${TARGET.checkoutRoot}; gws-ea resume --id ${INSTANCE_ID} installs it.`,
+      });
+      expect(calls).toEqual(['detect']);
+    },
+  );
 
   it.each(['start', 'stop', 'restart'] as const)(
     '%s refuses a host running from the checkout outside its service',

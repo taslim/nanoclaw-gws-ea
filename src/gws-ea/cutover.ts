@@ -15,7 +15,7 @@
  * through NanoClaw's helpers, agent images looked up by ID, the checks that a
  * started release serves, and the follow-ups a recorded release runs.
  */
-import { constants as fsConstants, lstatSync, readdirSync, type Stats } from 'node:fs';
+import { closeSync, constants as fsConstants, lstatSync, openSync, readdirSync, readSync, type Stats } from 'node:fs';
 import {
   chmod,
   copyFile,
@@ -84,7 +84,7 @@ import {
   type ServiceControlOptions,
 } from './service-control.js';
 import { instanceServicePlatform } from './service-coordinates.js';
-import { GwsEaError, shortCommit, type InstanceReservation, type ReleaseCoordinates } from './types.js';
+import { GwsEaError, releaseOf, shortCommit, type InstanceReservation, type ReleaseCoordinates } from './types.js';
 import { isRecord } from './validation.js';
 import { readDerivedImageGroups } from './verify.js';
 
@@ -392,7 +392,37 @@ function hostStoppedGracefully(database: Database.Database, now: string): boolea
   );
 }
 
-/** The databases under `directory` that have a `-journal` or `-wal` beside them. */
+/** The 16 bytes every SQLite database file begins with. */
+const SQLITE_HEADER = Buffer.from('SQLite format 3\0', 'latin1');
+
+/**
+ * Whether `file` is a SQLite database: a regular file, never reached through
+ * a link, that begins with SQLite's header. Agents write under `data/`, so a
+ * name with a side file beside it proves nothing.
+ */
+function isSqliteDatabase(file: string): boolean {
+  let descriptor: number;
+  try {
+    if (!lstatSync(file).isFile()) return false;
+    descriptor = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch (error) {
+    // Gone, or swapped for a link since it was looked at: either way no database is there.
+    if (isErrno(error, 'ENOENT') || isErrno(error, 'ELOOP')) return false;
+    throw error;
+  }
+  try {
+    const header = Buffer.alloc(SQLITE_HEADER.length);
+    return readSync(descriptor, header, 0, header.length, 0) === header.length && header.equals(SQLITE_HEADER);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+/**
+ * The SQLite databases under `directory` that have a `-journal` or `-wal`
+ * beside them. Anything else there is not opened: the carry copies it, with
+ * its side file, as it copies any file.
+ */
 function databasesWithSideFiles(directory: string): string[] {
   const found = new Set<string>();
   const walk = (current: string): void => {
@@ -405,11 +435,7 @@ function databasesWithSideFiles(directory: string): string[] {
       const side = /^(.*)-(?:journal|wal)$/u.exec(entry.name);
       if (!side || !entry.isFile()) continue;
       const database = path.join(current, side[1]!);
-      try {
-        if (lstatSync(database).isFile()) found.add(database);
-      } catch (error) {
-        if (!isErrno(error, 'ENOENT')) throw error;
-      }
+      if (isSqliteDatabase(database)) found.add(database);
     }
   };
   walk(directory);
@@ -419,10 +445,11 @@ function databasesWithSideFiles(directory: string): string[] {
 /**
  * Settle a quiet checkout's databases before they are copied (KTD18): a
  * TRUNCATE checkpoint folds the central WAL into `v2.db` and must find no
- * busy frames, and every other database with a side file — a session's hot
- * journal above all — is opened read-write and read once, which rolls it back.
- * No lazy migration runs: only SQLite opens them. Reports whether the host
- * that stopped left its lease stopped.
+ * busy frames, and every other SQLite database with a side file — a
+ * session's hot journal above all — is opened read-write and read once,
+ * which rolls it back. No lazy migration runs: only SQLite opens them. A
+ * file that is no SQLite database is never opened, whatever lies beside it.
+ * Reports whether the host that stopped left its lease stopped.
  */
 export function settleCheckoutDatabases(checkoutRoot: string, now: Date = new Date()): SettledCheckout {
   const data = path.join(checkoutRoot, 'data');
@@ -1257,7 +1284,10 @@ export function dockerEnvironment(
   });
 }
 
-export function cutoverDocker(host: CutoverHost, args: readonly string[]) {
+/** What running Docker for one assistant takes: the assistant, its runtime, and the runner and seams to use. */
+export type AssistantDocker = Pick<CutoverHost, 'operation' | 'runtime' | 'run' | 'dependencies'>;
+
+export function cutoverDocker(host: AssistantDocker, args: readonly string[]) {
   return host.run({
     command: 'docker',
     args,
@@ -1271,7 +1301,7 @@ const DOCKER_TIMEOUT_MS = 60_000;
 const IMAGE_ID = /^sha256:[0-9a-f]{64}$/u;
 
 /** The ID of the image `reference` names, or undefined when it names none. */
-export async function imageIdOf(host: CutoverHost, reference: string): Promise<string | undefined> {
+export async function imageIdOf(host: AssistantDocker, reference: string): Promise<string | undefined> {
   const listed = new Set(
     (await cutoverDocker(host, ['image', 'ls', '--quiet', '--no-trunc', reference])).stdout
       .split(/\r?\n/u)
@@ -1309,6 +1339,15 @@ export async function stopCutoverHost(host: CutoverHost, label: string): Promise
     await host.service.stop();
     await host.service.drain();
   });
+}
+
+/**
+ * Stop again, before a rename or a start, any host the OS started since the
+ * cutover stopped it (`RunAtLoad`, `KeepAlive`). The same step as the stop,
+ * told apart by its label: the host is normally still stopped.
+ */
+export function keepCutoverHostStopped(host: CutoverHost): Promise<void> {
+  return stopCutoverHost(host, 'Making sure the assistant is still stopped…');
 }
 
 /**
@@ -1653,6 +1692,38 @@ function sentenceCase(text: string): string {
 }
 
 /**
+ * Whether, with no update or rollback open, the release last recorded is a
+ * rollback's that keeps nothing to roll back to: the release it left is kept
+ * in `outgoing/` (until the next update is recorded), and `previous/` is gone.
+ * A rollback that put back the previous release its unrecorded update had
+ * set aside keeps one, and so does one that went back.
+ */
+async function rolledBackKeepingNone(paths: ControlPlanePaths, instanceId: string): Promise<boolean> {
+  const [previous, outgoing] = await Promise.all([
+    lstatIfPresent(paths.releaseRoot(instanceId, 'previous')),
+    lstatIfPresent(paths.releaseRoot(instanceId, 'outgoing')),
+  ]);
+  return previous === undefined && outgoing !== undefined;
+}
+
+/**
+ * The `:previous` tag a recorded rollback leaves (KTD7, KTD19): the rollback
+ * points `:latest` back at the image `:previous` names and keeps no release
+ * to roll back to, so `:previous` would read as the image the assistant runs.
+ * Derived from the state each time it is asked, never recorded. Returns the
+ * tag only while it names the image `:latest` names, so removing it untags
+ * and never deletes an image.
+ */
+export async function leftoverPreviousTag(host: AssistantDocker): Promise<string | undefined> {
+  const { paths, instanceId } = host.operation;
+  if (!(await rolledBackKeepingNone(paths, instanceId))) return undefined;
+  const base = getInstallScopedNames(host.runtime.install_id).containerImageBase;
+  const previous = await imageIdOf(host, `${base}:previous`);
+  if (previous === undefined || previous !== (await imageIdOf(host, `${base}:latest`))) return undefined;
+  return `${base}:previous`;
+}
+
+/**
  * Run a recorded update's or rollback's follow-ups (KTD2): the per-group image
  * rebuilds and main's template refresh or its reversal first, then, once they
  * all succeeded, the cleanup of the superseded releases and displaced images.
@@ -1660,6 +1731,13 @@ function sentenceCase(text: string): string {
  * with the last. A failure never rolls back: it stays in the record, `status`
  * reports it, and the next run of the same command retries it. Returns what
  * the operator is told about the follow-ups that finished.
+ *
+ * A rollback's cleanup also drops the `:previous` tag it leaves (see
+ * `leftoverPreviousTag`), derived from the state rather than recorded, and
+ * before any recorded cleanup is struck, so a run cut short keeps the record
+ * that has `rollback --id` finish it. One recorded with nothing else to
+ * follow up has no record left: `rollback --id` finds its leftover tag
+ * instead.
  */
 export async function finishFollowUps(
   operation: InstanceOperation,
@@ -1668,9 +1746,13 @@ export async function finishFollowUps(
   operation.assertActive();
   const { paths, instanceId } = operation;
   const record = await readOperationRecord(paths, instanceId);
-  if (!record || record.phase !== 'recorded') return [];
+  if (record && record.phase !== 'recorded') return [];
+  const rolledBack = await rolledBackKeepingNone(paths, instanceId);
+  if (!record && !rolledBack) return [];
   const runtime = await loadCreatedRuntime(paths, instanceId);
   const reporter = dependencies.reporter ?? {};
+  const kind = record?.kind ?? 'rollback';
+  const pending = record?.follow_ups ?? [];
   const failures: string[] = [];
   const notes: string[] = [];
   const attempt = async (followUp: OperationFollowUp, label: string): Promise<void> => {
@@ -1685,19 +1767,37 @@ export async function finishFollowUps(
       failures.push(`${describeFollowUp(followUp)}: ${safeErrorMessage(error)}`);
     }
   };
-  for (const followUp of record.follow_ups.filter((pending) => !isCleanup(pending))) {
+  for (const followUp of pending.filter((planned) => !isCleanup(planned))) {
     await attempt(followUp, `${sentenceCase(describeFollowUp(followUp))}…`);
   }
+  if (failures.length === 0 && rolledBack) {
+    const docker: AssistantDocker = {
+      operation,
+      runtime,
+      run: dependencies.runCommand ?? runSanitizedCommand,
+      dependencies,
+    };
+    try {
+      await runStep(reporter, { id: 'untag_previous_image', label: `Cleaning up after the ${kind}…` }, async () => {
+        const tag = await leftoverPreviousTag(docker);
+        if (tag) await cutoverDocker(docker, ['image', 'rm', tag]);
+      });
+    } catch (error) {
+      if (!(error instanceof GwsEaError)) throw error;
+      failures.push(`removing its leftover :previous image tag: ${safeErrorMessage(error)}`);
+    }
+  }
   if (failures.length === 0) {
-    for (const followUp of record.follow_ups.filter(isCleanup)) {
-      await attempt(followUp, `Cleaning up after the ${record.kind}…`);
+    for (const followUp of pending.filter(isCleanup)) {
+      await attempt(followUp, `Cleaning up after the ${kind}…`);
     }
   }
   if (failures.length === 0) return notes;
+  const release = record?.to ?? releaseOf(await getInstanceReservation(paths, instanceId));
   throw new GwsEaError(
     'follow_ups_failed',
-    `Assistant ${instanceId} runs ${releaseLine(record.to)}, but ${failures.length === 1 ? 'a follow-up' : `${failures.length} follow-ups`} of its ${record.kind} failed: ${failures.join('; ')}. ` +
-      `gws-ea status --id ${instanceId} lists what is left, and gws-ea ${record.kind} --id ${instanceId} retries it.` +
+    `Assistant ${instanceId} runs ${releaseLine(release)}, but ${failures.length === 1 ? 'a follow-up' : `${failures.length} follow-ups`} of its ${kind} failed: ${failures.join('; ')}. ` +
+      `${record ? `gws-ea status --id ${instanceId} lists what is left, and ` : ''}gws-ea ${kind} --id ${instanceId} retries it.` +
       notes.map((note) => ` ${note}`).join(''),
   );
 }

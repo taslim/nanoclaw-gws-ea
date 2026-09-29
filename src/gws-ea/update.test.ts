@@ -1249,6 +1249,69 @@ describe('gws-ea update', GIT_HEAVY, () => {
     expect(await readFile(path.join(live, PERSONA), 'utf8')).toBe(stampedPersona('1'));
   });
 
+  it('reports its stop once, and names the checks before the swap and the start that it is still stopped', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    const started: Array<readonly [string, string | undefined]> = [];
+    const deps: UpdateDependencies = {
+      ...dependencies(state, next, runtime),
+      reporter: {
+        emit: (event) => {
+          if (event.type === 'step-started') started.push([event.step, event.label]);
+        },
+      },
+    };
+    const intent = await resolveUpdateIntent(host.paths, { instanceId: runtime.instance_id }, deps);
+    const operation = await acquireInstanceOperation(host.paths, runtime.instance_id, {
+      command: 'update',
+      target: intent.target,
+    });
+    if (!operation) throw new Error('The test instance operation was busy');
+    try {
+      await confirmStagedUpdate(operation, await prepareUpdate(operation, intent, deps), deps, async () => true);
+      await continueUpdate(operation, deps);
+    } finally {
+      operation.release();
+    }
+
+    // One stop step throughout; the checks that no host started since read as what they are.
+    expect(started.filter(([step]) => ['stop_host', 'swap_releases', 'move_images'].includes(step))).toEqual([
+      ['stop_host', 'Stopping the assistant for the switch…'],
+      ['stop_host', 'Making sure the assistant is still stopped…'],
+      ['swap_releases', 'Switching to the new release…'],
+      ['stop_host', 'Making sure the assistant is still stopped…'],
+      ['move_images', "Moving the assistant's images to the new release…"],
+    ]);
+  });
+
+  it('never opens a file an agent planted beside a -journal or -wal, and carries it as it is', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    await converse(runtime, 'm1');
+    const session = path.join(runtime.checkout_realpath, SESSION);
+    // Named as databases are, with side files beside them, but no SQLite database: opened, they would fail the cutover.
+    const planted = {
+      'notes.db': 'Notes an agent keeps.\n',
+      'notes.db-journal': 'Not a journal.\n',
+      'scratch.db': '',
+      'scratch.db-wal': 'Not a log.\n',
+    };
+    for (const [file, contents] of Object.entries(planted)) await writeFile(path.join(session, file), contents);
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    const ran = state.tags.get(`${imageBase(runtime)}:latest`)!;
+
+    expect(await cli(host, state, next, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
+
+    await expectUpdated(host, runtime, next, state, ran);
+    for (const [file, contents] of Object.entries(planted)) {
+      expect(await readFile(path.join(session, file), 'utf8'), file).toBe(contents);
+    }
+    expect(messages(runtime.checkout_realpath)).toEqual(['m1']);
+  });
+
   it('moves the assistant to another track and repository that holds the release, and rollback moves it back (AE1)', async () => {
     const host = await machine();
     const runtime = await assistant(host);

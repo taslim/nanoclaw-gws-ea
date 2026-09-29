@@ -45,6 +45,7 @@ import {
   finishFollowUps,
   finishSwap,
   imageIdOf,
+  keepCutoverHostStopped,
   nextAgentImage,
   openCutoverHost,
   planFollowUps,
@@ -1037,7 +1038,7 @@ async function stopAndCarry(cutover: Cutover, record: OperationRecord): Promise<
 async function swapReleases(cutover: Cutover): Promise<OperationRecord> {
   const { operation, reporter, reservation, dependencies } = cutover;
   const { paths, instanceId } = operation;
-  await stopCutoverHost(cutover, STOP_LABEL);
+  await keepCutoverHostStopped(cutover);
   await runStep(reporter, { id: 'swap_releases', label: 'Switching to the new release…' }, async () => {
     // Between the two renames the outgoing release is no longer at the live path, but in previous/.
     const outgoing = (await exists(reservation.checkout_realpath))
@@ -1114,7 +1115,7 @@ async function gatewayChanged(cutover: Cutover, pins: OnecliPins): Promise<boole
  */
 async function startRelease(cutover: Cutover, record: OperationRecord): Promise<OperationRecord> {
   const { operation, reporter } = cutover;
-  await stopCutoverHost(cutover, STOP_LABEL);
+  await keepCutoverHostStopped(cutover);
   await runStep(reporter, { id: 'move_images', label: "Moving the assistant's images to the new release…" }, () =>
     moveAgentImages(cutover, record),
   );
