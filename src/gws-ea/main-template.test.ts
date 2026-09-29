@@ -30,9 +30,11 @@ import { createAgentFromTemplate } from '../templates/create-agent.js';
 import { restampAgentFromTemplate } from '../templates/restamp.js';
 import {
   decideMainFolder,
+  describeCustomized,
   inspectMainFolder,
   parseTemplateRestamp,
   taskNameSlug,
+  type CustomizedTemplateFile,
   type TemplateRestamp,
 } from './main-template.js';
 import { GwsEaError } from './types.js';
@@ -117,6 +119,27 @@ describe("main's template against NanoClaw's own stamp", () => {
         { surface: 'persona', name: 'instructions.prepend.md', change: 'changed' },
       ],
     });
+  });
+
+  it('names a file the agent added with its control characters escaped, and inspection keeps the name exactly', async () => {
+    const main = await stamped();
+    // An escape that erases the line it is on, a carriage return, and a line break, all legal in a file name.
+    const planted = 'notes\u001b[2K\rnothing customized\n.md';
+    writeFileSync(path.join(main.folder, 'additional_context', planted), 'Planted.\n');
+
+    const inspected = await inspectMainFolder(main.folder, TEMPLATE);
+
+    const added: CustomizedTemplateFile = {
+      surface: 'context',
+      name: `additional_context/${planted}`,
+      change: 'added',
+    };
+    expect(inspected).toEqual({ kind: 'stamped', customized: [added] });
+    const described = describeCustomized([added, { surface: 'skill', name: 'brief\u202eing', change: 'changed' }]);
+    expect(described).not.toMatch(/[\p{Cc}\p{Cf}]/u);
+    expect(described).toBe(
+      'additional_context/notes\\u001b[2K\\rnothing customized\\n.md (added), skill brief\\u202eing (changed)',
+    );
   });
 
   it('has nothing to compare in a folder the template never stamped, or against a release without it', async () => {

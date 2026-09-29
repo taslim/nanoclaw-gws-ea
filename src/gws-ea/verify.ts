@@ -796,6 +796,36 @@ function millisecondOfDay(hours: number, minutes: number, seconds: number, milli
   return ((hours * 60 + minutes) * 60 + seconds) * 1_000 + milliseconds;
 }
 
+/**
+ * A name an agent can choose (a file in its folder, a group, a task, a
+ * message ID in its outbound mailbox), made safe to print on the operator's
+ * terminal. Every control and format character, which could move the cursor,
+ * erase or rewrite a line, reach the clipboard, or reorder text, is shown as
+ * its JSON escape, and so is a backslash, so what is shown reads back as
+ * exactly one name. Unlike a log line, nothing is dropped: the operator sees
+ * the name the file really has. JSON output keeps the raw name.
+ */
+export function printableName(name: string): string {
+  return name.replace(/[\p{Cc}\p{Cf}\\]/gu, (character) => {
+    switch (character) {
+      case '\\':
+        return '\\\\';
+      case '\n':
+        return '\\n';
+      case '\r':
+        return '\\r';
+      case '\t':
+        return '\\t';
+      default:
+        // One escape per UTF-16 unit, as JSON writes a character outside the Basic Multilingual Plane.
+        return Array.from(
+          { length: character.length },
+          (_, index) => `\\u${character.charCodeAt(index).toString(16).padStart(4, '0')}`,
+        ).join('');
+    }
+  });
+}
+
 function printableLogLine(line: string): string {
   const text = [...stripVTControlCharacters(line)]
     .map((character) => (hasControlCharacters(character) ? ' ' : character))

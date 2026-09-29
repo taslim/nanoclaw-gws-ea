@@ -10,9 +10,9 @@ import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import Database from 'better-sqlite3';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { finishFollowUps, readKeptReleaseManifest, restoredReleaseRoot } from './cutover.js';
+import { finishFollowUps, restoredReleaseRoot } from './cutover.js';
 import {
   ADDED_MIGRATION,
   applying,
@@ -29,6 +29,7 @@ import {
   LIVE_MIGRATIONS,
   machine,
   MAIN_TEMPLATE_DIR,
+  makeMain,
   mainTemplate,
   MEMORY,
   messages,
@@ -45,21 +46,51 @@ import {
   snapshot,
   stampedPersona,
   status,
+  temporaryRoot,
   world,
   type Machine,
   type Release,
   type World,
 } from './testing/cutover-fixture.js';
 import { acquireInstanceOperation } from './journal.js';
+import { readKeptReleaseManifest } from './kept-release.js';
 import { advanceOperation, readOperationRecord, type OperationPhase, type OperationRecord } from './operation.js';
 import { instanceMarkerFile } from './paths.js';
 import { getInstanceReservation, swapInstanceRelease } from './registry.js';
-import { rollBack, summarizeDiscard, type RollbackPreview } from './rollback.js';
+import {
+  readKeptPreviousRelease,
+  rollBack,
+  rollbackPreviewLines,
+  summarizeDiscard,
+  type RollbackPreview,
+} from './rollback.js';
 import type { InstanceRuntimeConfig } from './service.js';
 import { releaseOf } from './types.js';
 import { readCentralMigrations } from './verify.js';
 
+/**
+ * The operation record's write as its release is recorded, failed once as a
+ * full disk fails it when `recordedWrite` is armed: the one right after the
+ * registry's compare-and-swap.
+ */
+const failing = vi.hoisted(() => ({ recordedWrite: false }));
+vi.mock('../community-portal/private-file.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../community-portal/private-file.js')>();
+  const writePrivate: typeof actual.writePrivate = async (file, value) => {
+    const recorded = typeof value === 'object' && value !== null && 'phase' in value && value.phase === 'recorded';
+    if (failing.recordedWrite && file.endsWith('/operation.json') && recorded) {
+      failing.recordedWrite = false;
+      throw Object.assign(new Error(`ENOSPC: no space left on device, write '${file}'`), { code: 'ENOSPC' });
+    }
+    return actual.writePrivate(file, value);
+  };
+  return { ...actual, writePrivate };
+});
+
 afterEach(removeTemporaryRoots);
+afterEach(() => {
+  failing.recordedWrite = false;
+});
 
 /** Each case clones, stages, and swaps real Git checkouts twice, which a loaded machine slows. */
 const GIT_HEAVY = { timeout: 90_000 } as const;
@@ -736,6 +767,96 @@ describe('gws-ea rollback refusals', GIT_HEAVY, () => {
     expect(state.events.slice(events)).toEqual([]);
     expect(await snapshot(host.paths.instanceRoot(id))).toEqual(before);
   });
+
+  /** Rewrite the commit a checkout's marker names, as a hand edit or a copy from elsewhere would. */
+  async function markAt(checkout: string, commit: string): Promise<void> {
+    const file = instanceMarkerFile(checkout);
+    const marker = JSON.parse(await readFile(file, 'utf8')) as Record<string, unknown>;
+    await writeFile(file, JSON.stringify({ ...marker, deployed_commit: commit }), { mode: 0o600 });
+  }
+
+  type Updated = Awaited<ReturnType<typeof updatedAssistant>>;
+
+  /** Each refusal's case: what it changes on the updated assistant, and what it then says. */
+  const UNAVAILABLE: ReadonlyArray<
+    readonly [string, (updated: Updated) => Promise<void> | void, (updated: Updated) => string]
+  > = [
+    [
+      'its live checkout runs a release the registry does not name',
+      ({ runtime }) => markAt(runtime.checkout_realpath, 'c'.repeat(40)),
+      ({ host, runtime }) =>
+        `Assistant ${runtime.instance_id} runs ${'c'.repeat(12)}, and its kept release is ${host.first.slice(0, 12)}, so there is nothing to roll back to.`,
+    ],
+    [
+      'the release it keeps is the one it runs',
+      async ({ host, runtime, next }) => {
+        const id = runtime.instance_id;
+        const manifest = path.join(host.paths.releaseRoot(id, 'previous'), 'release-manifest.json');
+        const kept = JSON.parse(await readFile(manifest, 'utf8')) as { release: Record<string, unknown> };
+        await writeFile(
+          manifest,
+          JSON.stringify({ ...kept, release: { ...kept.release, deployed_commit: next.commit } }),
+          { mode: 0o600 },
+        );
+        await markAt(host.paths.releaseCheckoutRoot(id, 'previous'), next.commit);
+      },
+      ({ runtime, next }) =>
+        `Assistant ${runtime.instance_id} runs ${next.commit.slice(0, 12)}, and its kept release is ${next.commit.slice(0, 12)}, so there is nothing to roll back to.`,
+    ],
+    ...(['latest', 'previous'] as const).map(
+      (tag) =>
+        [
+          `its agent image :${tag} is gone`,
+          ({ runtime, state }: Updated) => {
+            state.tags.delete(`${imageBase(runtime)}:${tag}`);
+          },
+          ({ host, runtime }: Updated) =>
+            `Assistant ${runtime.instance_id}'s agent image ${imageBase(runtime)}:${tag} is missing, so dogfood ${host.first.slice(0, 12)} cannot run again.`,
+        ] as const,
+    ),
+  ];
+
+  it.each(UNAVAILABLE)('refuses when %s, before changing anything', async (_label, arrange, refusal) => {
+    const updated = await updatedAssistant();
+    const { host, runtime, next, state } = updated;
+    const id = runtime.instance_id;
+    await arrange(updated);
+    const before = await snapshot(host.paths.instanceRoot(id));
+    const registered = await getInstanceReservation(host.paths, id);
+    const tags = new Map(state.tags);
+    const events = state.events.length;
+    const { run, err } = cli(host, state, next, runtime);
+
+    expect(await run(['rollback', '--id', id, '--yes'])).toBe(1);
+
+    expect(err.join('\n')).toContain(refusal(updated));
+    expect(state.events.slice(events)).toEqual([]);
+    expect(state.running).toBe(true);
+    expect(state.tags).toEqual(tags);
+    expect(await getInstanceReservation(host.paths, id)).toEqual(registered);
+    expect(await readOperationRecord(host.paths, id)).toBeUndefined();
+    expect(await snapshot(host.paths.instanceRoot(id))).toEqual(before);
+  });
+
+  it('refuses a kept release whose checkout is at another commit than its manifest names, changing nothing', async () => {
+    const { host, runtime, next, state } = await updatedAssistant();
+    const id = runtime.instance_id;
+    const checkout = host.paths.releaseCheckoutRoot(id, 'previous');
+    await markAt(checkout, 'c'.repeat(40));
+    const before = await snapshot(host.paths.instanceRoot(id));
+    const events = state.events.length;
+    const { run, err } = cli(host, state, next, runtime);
+
+    expect(await run(['rollback', '--id', id, '--yes'])).toBe(1);
+
+    expect(err.join('\n')).toContain(
+      `The release kept in ${checkout} is at ${'c'.repeat(12)}, not the ${host.first.slice(0, 12)} its manifest names.`,
+    );
+    await expect(readKeptPreviousRelease(host.paths, id)).rejects.toMatchObject({ code: 'invalid_kept_release' });
+    expect(state.events.slice(events)).toEqual([]);
+    expect(await readOperationRecord(host.paths, id)).toBeUndefined();
+    expect(await snapshot(host.paths.instanceRoot(id))).toEqual(before);
+  });
 });
 
 /** Where each kill leaves the rollback's record. */
@@ -821,6 +942,39 @@ describe('a rollback killed partway', GIT_HEAVY, () => {
       await expectRolledBack(host, runtime, next, state, images.first);
     },
   );
+
+  it('stands by a rollback the registry committed when the record write after it fails, and rollback settles it', async () => {
+    const { host, runtime, next, state, images } = await updatedAssistant();
+    const id = runtime.instance_id;
+    const live = runtime.checkout_realpath;
+    await converse(runtime, 'm2');
+    const { run, err, out } = cli(host, state, next, runtime);
+    failing.recordedWrite = true;
+
+    expect(await run(['rollback', '--id', id, '--yes'])).toBe(1);
+
+    // The write failed once the registry named the restored release, and nothing went back to the one it left.
+    expect(failing.recordedWrite).toBe(false);
+    expect(err.join('\n')).toContain(
+      `Assistant ${id} runs dogfood ${host.first.slice(0, 12)}: its rollback was committed before that failed, so it stands, and gws-ea rollback --id ${id} finishes recording it.`,
+    );
+    expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, host.first));
+    expect(commitOf(live)).toBe(host.first);
+    expect(await receiptCommit(instanceMarkerFile(live))).toBe(host.first);
+    expect(await receiptCommit(host.paths.releasePreflightFile(id))).toBe(host.first);
+    expect(state.tags.get(`${imageBase(runtime)}:latest`)).toBe(images.first);
+    expect(state.running).toBe(true);
+    expect((await readOperationRecord(host.paths, id))?.phase).toBe('verified');
+    const checks = state.healthWaits.length;
+
+    expect(await run(['rollback', '--id', id, '--yes'])).toBe(0);
+
+    // The rerun settled the record through its gate and ran the follow-ups, without verifying again.
+    expect(state.healthWaits).toHaveLength(checks);
+    await expectRolledBack(host, runtime, next, state, images.first);
+    expect(messages(live)).toEqual(['m1', 'm2']);
+    expect(out).toContain(`Assistant ${id} runs dogfood ${host.first.slice(0, 12)}; its rollback is finished.`);
+  });
 
   it.each([
     ['receives a message, and carries it', false],
@@ -1126,11 +1280,14 @@ describe('a rollback of an update whose follow-ups are pending', GIT_HEAVY, () =
     // The image the second update displaced from `:previous` is tagged nowhere: only its record names it.
     expect(repositoryImages(state, base).untagged).toEqual([oldest]);
     expect(record?.follow_ups).toContainEqual({ kind: 'delete_image', image_id: oldest });
+    // Its cleanup never ran, so the release it set aside at its swap is still kept beside the previous one.
+    expect(await exists(host.paths.releaseRoot(runtime.instance_id, 'superseded'))).toBe(true);
+    expect(record?.follow_ups).toContainEqual({ kind: 'delete_release', release: 'superseded_previous' });
     state.rebuildFails = false;
     return { host, runtime, first, second, state, oldest };
   }
 
-  it('takes the update over, carrying every image deletion it planned, and leaves no image behind', async () => {
+  it('takes the update over, carrying every image deletion it planned, and leaves no image or set-aside release behind', async () => {
     const { host, runtime, first, second, state } = await pendingUpdate();
     const id = runtime.instance_id;
 
@@ -1263,6 +1420,50 @@ describe('what a snapshot restore discards', () => {
       files: { count: 0, paths: [] },
       orphanedAgents: [],
     });
+  });
+
+  it('shows the files an agent named with their control characters escaped, the summary keeping each name exactly', async () => {
+    const root = await temporaryRoot('gws-ea-discard-');
+    const [snapshotRoot, currentRoot] = [path.join(root, 'snapshot'), path.join(root, 'current')];
+    for (const checkout of [snapshotRoot, currentRoot]) {
+      mkdirSync(path.join(checkout, 'data'), { recursive: true });
+      mkdirSync(path.join(checkout, 'groups', 'main'), { recursive: true });
+      const central = new Database(path.join(checkout, 'data', 'v2.db'));
+      central.exec('CREATE TABLE agent_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL)');
+      central.close();
+    }
+    // A name the agent chose in its own folder: an escape that erases the line it is on, then a line break.
+    const planted = 'notes\u001b[2K\rNothing is lost.\n.md';
+    writeFileSync(path.join(currentRoot, 'groups', 'main', planted), 'planted\n');
+
+    const discarded = await summarizeDiscard(currentRoot, snapshotRoot);
+    const lines = rollbackPreviewLines(
+      {
+        instanceId: '00000000-0000-4000-8000-000000000000',
+        from: {
+          source_remote: 'https://example.test/nanoclaw.git',
+          release_track: 'dogfood',
+          deployed_commit: 'b'.repeat(40),
+        },
+        to: {
+          source_remote: 'https://example.test/nanoclaw.git',
+          release_track: 'dogfood',
+          deployed_commit: 'a'.repeat(40),
+        },
+        snapshotAt: '2026-09-28T12:00:00.000Z',
+        reason: 'requested',
+        discarded,
+        keptAt: path.join(root, 'outgoing'),
+      },
+      'UTC',
+    );
+
+    // What the rollback receipt records keeps the name as it is; what the operator reads shows it inert.
+    expect(discarded.files).toEqual({ count: 1, paths: [path.join('main', planted)] });
+    for (const line of lines) expect(line).not.toMatch(/[\p{Cc}\p{Cf}]/u);
+    expect(lines).toContain(
+      `  Memory and group files changed since: 1 (${path.join('main', 'notes\\u001b[2K\\rNothing is lost.\\n.md')})`,
+    );
   });
 });
 
@@ -1414,6 +1615,28 @@ describe("main's template across a rollback (KTD12)", GIT_HEAVY, () => {
       if (named !== 'instructions.prepend.md') expect(await persona(runtime)).toBe(refreshed);
     },
   );
+
+  it('leaves main as the update refreshed it when another group became main since, touching no file', async () => {
+    const { host, runtime, next, state } = await updatedAssistant(mainTemplate('2'));
+    const id = runtime.instance_id;
+    makeMain(runtime.checkout_realpath, 'ag-research');
+    const groups = path.join(runtime.checkout_realpath, 'groups');
+    const before = await contents(groups);
+    state.restamps.length = 0;
+    const { run, out } = cli(host, state, next, runtime);
+
+    expect(await run(['rollback', '--id', id])).toBe(0);
+
+    expect(commitOf(runtime.checkout_realpath)).toBe(host.first);
+    expect(out.join('\n')).toContain(
+      "Main's template was left as the update refreshed it, because main is no longer the group it restamped.",
+    );
+    // Nothing was planned or applied, on the group that was main or the one that is now.
+    expect(state.restamps).toEqual([]);
+    expect(await contents(groups)).toEqual(before);
+    expect(await persona(runtime)).toBe(stampedPersona('2'));
+    expect(await readOperationRecord(host.paths, id)).toBeUndefined();
+  });
 
   it('finishes a reversal killed partway when the rollback is run again', async () => {
     const { host, runtime, next, state } = await updatedAssistant(mainTemplate('2'));

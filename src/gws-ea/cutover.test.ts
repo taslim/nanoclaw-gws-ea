@@ -35,8 +35,6 @@ import {
   copyReleaseRecords,
   finishRollbackSwap,
   finishSwap,
-  keepReleaseFiles,
-  keptReleaseFiles,
   openFileHolders,
   restoreSetAsideState,
   reverseRollbackSwap,
@@ -46,9 +44,9 @@ import {
   setAsideState,
   setAsideStateRoot,
   settleCheckoutDatabases,
-  stagedKeptFilesRoot,
   type QuietCheckout,
 } from './cutover.js';
+import { keepReleaseFiles, keptReleaseFiles, stagedKeptFilesRoot } from './kept-release.js';
 import { instanceMarkerFile, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { runSanitizedCommand, type SanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { allocateInstanceId } from './registry.js';
@@ -745,6 +743,18 @@ describe('swapping the releases', () => {
     await finishSwap(paths, instanceId, { from: FROM, to: TO });
 
     expect(await layout(paths, instanceId)).toEqual(AFTER_SWAP(true));
+  });
+
+  it('puts the outgoing receipt live after a reversal cut short between moving the promoted one back and writing it', async () => {
+    const { paths, instanceId } = await readyToSwap(true);
+    await finishSwap(paths, instanceId, { from: FROM, to: TO });
+    // The reversal had made next/ again and moved the promoted receipt back into it, then was killed.
+    await mkdir(paths.releaseRoot(instanceId, 'next'), { mode: 0o700 });
+    await rename(paths.releasePreflightFile(instanceId), paths.releasePreflightFile(instanceId, 'next'));
+
+    await reverseSwap(paths, instanceId, { from: FROM, to: TO });
+
+    expect(await layout(paths, instanceId)).toEqual(BEFORE_SWAP(true));
   });
 
   it('refuses a layout it cannot place, renaming nothing', async () => {

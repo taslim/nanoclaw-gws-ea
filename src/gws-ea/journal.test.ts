@@ -7,6 +7,7 @@ import { writePrivate } from '../community-portal/private-file.js';
 import {
   acquireInstanceOperation,
   LAUNCHER_CONTRACT_VERSION,
+  loadCreatedRuntime,
   readProvisionJournal,
   recordChatConfigurationConfirmed,
   recordKeyPolicyLifted,
@@ -17,10 +18,12 @@ import {
   reserveInstance,
   withInstanceOperation,
 } from './journal.js';
+import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { beginOperation } from './operation.js';
-import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
-import { allocateInstanceId } from './registry.js';
-import { GwsEaError, releaseOf, type InstanceReservationInput } from './types.js';
+import { instanceRuntimeFile, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+import { allocateInstanceId, getInstanceReservation } from './registry.js';
+import { createInstanceRuntimeConfig } from './service.js';
+import { GwsEaError, PROVISION_STEPS, releaseOf, type InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
 
@@ -287,6 +290,42 @@ describe('provision journal v3', () => {
       expect(operation).not.toBeNull();
       operation?.release();
     }
+  });
+
+  it("refuses a runtime record in the assistant's own checkout that names another assistant (R17)", async () => {
+    const { paths, input } = await fixture();
+    const id = input.instance_id;
+    const operation = await acquireInstanceOperation(paths, id);
+    if (!operation) throw new Error('The test instance operation was busy');
+    try {
+      for (const step of PROVISION_STEPS) await recordStepCompleted(operation, step);
+    } finally {
+      operation.release();
+    }
+    const reserved = await getInstanceReservation(paths, id);
+    const onecli = createOnecliRuntimeLayout({
+      instanceId: id,
+      instanceRoot: paths.instanceRoot(id),
+      project: reserved.exclusive_resource_claims.onecli_project,
+      appPort: reserved.allocated_ports.onecli_app,
+      gatewayPort: reserved.allocated_ports.onecli_gateway,
+      cliExecutable: '/usr/local/bin/onecli',
+      dockerEndpoint: 'unix:///var/run/docker.sock',
+    });
+    const runtime = createInstanceRuntimeConfig(reserved, onecli, {
+      nodePath: process.execPath,
+      homeDirectory: paths.stateRoot,
+      selectedProvider: 'claude',
+      dockerEndpoint: 'unix:///var/run/docker.sock',
+    });
+    const file = instanceRuntimeFile(reserved.checkout_realpath);
+    await writePrivate(file, runtime);
+    expect(await loadCreatedRuntime(paths, id)).toEqual(runtime);
+
+    // Another assistant's record, at this checkout's own path: nothing gws-ea runs may act on it for this one.
+    await writePrivate(file, { ...runtime, instance_id: allocateInstanceId() });
+
+    await expect(loadCreatedRuntime(paths, id)).rejects.toMatchObject({ code: 'runtime_mismatch' });
   });
 
   it('gives the instance operation to one process at a time', async () => {

@@ -445,6 +445,16 @@ async function restampMain(state: World, config: InstanceRuntimeConfig, args: re
   };
 }
 
+/** Make another of the checkout's agent groups main, as the profile names it. */
+export function makeMain(checkout: string, agentGroupId: string): void {
+  const database = new Database(path.join(checkout, 'data', 'v2.db'));
+  try {
+    database.prepare('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1').run(agentGroupId);
+  } finally {
+    database.close();
+  }
+}
+
 /** What the assistant's conversations and memory hold: a session message row and a memory file. */
 export async function converse(runtime: InstanceRuntimeConfig, ...messages: readonly string[]): Promise<void> {
   const session = path.join(runtime.checkout_realpath, SESSION);
@@ -564,6 +574,8 @@ export interface World {
   hangAt?: HangPoint;
   /** Kill the swap at its rename number `renameKill`. */
   renameKill?: number;
+  /** Every rename of a swap fails, as a filesystem gone read-only fails it. */
+  renameFails?: boolean;
   reached?: () => void;
 }
 
@@ -862,22 +874,23 @@ export function dependencies(state: World, release: Release, runtime: InstanceRu
       state.tags.set(group, id);
       return { restarted: 0, rebuilt: true };
     },
-    ...(state.renameKill === undefined
-      ? {}
-      : {
-          rename: (() => {
-            let calls = 0;
-            return async (from: string, to: string) => {
-              calls += 1;
-              if (calls >= state.renameKill!) {
-                state.reached?.();
-                await never();
-              }
-              const { rename } = await import('node:fs/promises');
-              await rename(from, to);
-            };
-          })(),
-        }),
+    rename: (() => {
+      let calls = 0;
+      return async (from: string, to: string) => {
+        calls += 1;
+        if (state.renameKill !== undefined && calls >= state.renameKill) {
+          state.reached?.();
+          await never();
+        }
+        if (state.renameFails) {
+          throw Object.assign(new Error(`EROFS: read-only file system, rename '${from}' -> '${to}'`), {
+            code: 'EROFS',
+          });
+        }
+        const { rename } = await import('node:fs/promises');
+        await rename(from, to);
+      };
+    })(),
   };
 }
 

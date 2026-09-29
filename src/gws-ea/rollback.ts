@@ -48,13 +48,10 @@ import {
   finishRollbackSwap,
   finishSwap,
   imageIdOf,
-  keepReleaseFiles,
-  keptReleaseFiles,
   nextAgentImage,
   openCutoverHost,
   planFollowUps,
   quietCheckoutOf,
-  readKeptReleaseManifest,
   removeUpdateStaging,
   restoredReleaseRoot,
   restoreSetAsideState,
@@ -68,14 +65,20 @@ import {
   verifyServingRelease,
   type CutoverDependencies,
   type CutoverHost,
-  type KeptReleaseManifest,
   type RollbackReleases,
 } from './cutover.js';
+import {
+  keepReleaseFiles,
+  keptReleaseFiles,
+  readKeptReleaseManifest,
+  type KeptReleaseManifest,
+} from './kept-release.js';
 import { runStep } from './events.js';
 import { assertInstanceCreated, type InstanceOperation } from './journal.js';
 import { parseOnecliComposeImages, type OnecliPins } from './onecli-compose.js';
 import {
   advanceOperation,
+  assertNotCommitted,
   beginOperation,
   beginOperationReturn,
   commitOperationRelease,
@@ -105,7 +108,7 @@ import {
 } from './service.js';
 import { GwsEaError, releaseOf, shortCommit, type InstanceReservation, type ReleaseCoordinates } from './types.js';
 import { isRecord } from './validation.js';
-import { backupCentralDatabase, readDerivedImageGroups, readSchemaManifest } from './verify.js';
+import { backupCentralDatabase, printableName, readDerivedImageGroups, readSchemaManifest } from './verify.js';
 
 /** How many IDs and paths a discard summary lists; the counts are always whole. */
 const LISTED = 20;
@@ -610,7 +613,7 @@ export function isLossless(summary: DiscardSummary): boolean {
 
 function listed(rows: DiscardedRows): string {
   const more = rows.count > rows.ids.length ? `, and ${rows.count - rows.ids.length} more` : '';
-  return rows.count === 0 ? 'none' : `${rows.count} (${rows.ids.join(', ')}${more})`;
+  return rows.count === 0 ? 'none' : `${rows.count} (${rows.ids.map(printableName).join(', ')}${more})`;
 }
 
 const REASONS: Readonly<Record<SnapshotReason, string>> = {
@@ -629,7 +632,7 @@ export function rollbackPreviewLines(preview: RollbackPreview, timezone: string)
     `Restores the snapshot taken ${formatLocalTime(preview.snapshotAt, timezone)}, because ${REASONS[preview.reason]}.`,
   ];
   if (isLossless(discarded)) return [...lines, 'Nothing recorded since the snapshot is lost: the restore is lossless.'];
-  const tables = discarded.centralRows.map(({ table, count }) => `${table} ${count}`).join(', ');
+  const tables = discarded.centralRows.map(({ table, count }) => `${printableName(table)} ${count}`).join(', ');
   const more = discarded.files.count > discarded.files.paths.length ? ', …' : '';
   return [
     ...lines,
@@ -639,8 +642,8 @@ export function rollbackPreviewLines(preview: RollbackPreview, timezone: string)
     `  Scheduled task firings that repeat: ${listed(discarded.taskFirings)}`,
     `  Replies delivered again: ${listed(discarded.redelivered)}`,
     `  Central rows added since: ${tables || 'none'}`,
-    `  Memory and group files changed since: ${discarded.files.count === 0 ? 'none' : `${discarded.files.count} (${discarded.files.paths.join(', ')}${more})`}`,
-    `  OneCLI agents left orphaned with their grants: ${discarded.orphanedAgents.join(', ') || 'none'}`,
+    `  Memory and group files changed since: ${discarded.files.count === 0 ? 'none' : `${discarded.files.count} (${discarded.files.paths.map(printableName).join(', ')}${more})`}`,
+    `  OneCLI agents left orphaned with their grants: ${discarded.orphanedAgents.map(printableName).join(', ') || 'none'}`,
     `The discarded state is kept in ${preview.keptAt} until the next update or removal.`,
   ];
 }
@@ -1089,7 +1092,7 @@ function returned(rollback: Rollback, mode: RollbackMode | undefined, cause: unk
  * Run a rollback whose swap began until it is recorded. A failure once the
  * swap moved the live checkout goes back to the release it left; one before
  * changed nothing live, and gives the rollback up as a failure before its
- * swap does.
+ * swap does. One the registry already records stands (`assertNotCommitted`).
  */
 async function finishRollback(rollback: Rollback, start: OperationRecord): Promise<void> {
   let record = start;
@@ -1119,6 +1122,7 @@ async function finishRollback(rollback: Rollback, start: OperationRecord): Promi
       }
     }
   } catch (error) {
+    await assertNotCommitted(rollback.operation, error);
     const failed = (await readOperationRecord(rollback.operation.paths, rollback.operation.instanceId)) ?? record;
     if (failed.phase === 'recorded') throw error;
     if (failed.phase === 'swapping' && !failed.returning && (await unwindSwap(rollback))) {

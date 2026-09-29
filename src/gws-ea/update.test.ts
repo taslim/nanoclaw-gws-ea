@@ -15,7 +15,7 @@ import { lstat, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises
 import path from 'node:path';
 
 import Database from 'better-sqlite3';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   ADDED_MIGRATION,
@@ -39,6 +39,7 @@ import {
   liveState,
   LOCKFILE,
   machine,
+  makeMain,
   MAIN_BASELINE,
   MAIN_FOLDER,
   mainTemplate,
@@ -66,7 +67,7 @@ import {
   type Release,
   type World,
 } from './testing/cutover-fixture.js';
-import { readKeptReleaseManifest } from './cutover.js';
+import { readKeptReleaseManifest } from './kept-release.js';
 import { acquireInstanceOperation } from './journal.js';
 import {
   advanceOperation,
@@ -81,16 +82,41 @@ import { getInstanceReservation, swapInstanceRelease } from './registry.js';
 import type { InstanceRuntimeConfig } from './service.js';
 import { GwsEaError, PROVISION_STEPS, releaseOf, type ReleaseCoordinates } from './types.js';
 import {
+  confirmStagedUpdate,
+  continueUpdate,
   dryRunReleaseMigrations,
   prepareUpdate,
   resolveUpdateIntent,
   updatePreviewLines,
   type StagedUpdate,
   type UpdateDependencies,
+  type UpdatePreview,
 } from './update.js';
 import { readCentralMigrations } from './verify.js';
 
+/**
+ * The operation record's write as its release is recorded, failed once as a
+ * full disk fails it when `recordedWrite` is armed: the one right after the
+ * registry's compare-and-swap.
+ */
+const failing = vi.hoisted(() => ({ recordedWrite: false }));
+vi.mock('../community-portal/private-file.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../community-portal/private-file.js')>();
+  const writePrivate: typeof actual.writePrivate = async (file, value) => {
+    const recorded = typeof value === 'object' && value !== null && 'phase' in value && value.phase === 'recorded';
+    if (failing.recordedWrite && file.endsWith('/operation.json') && recorded) {
+      failing.recordedWrite = false;
+      throw Object.assign(new Error(`ENOSPC: no space left on device, write '${file}'`), { code: 'ENOSPC' });
+    }
+    return actual.writePrivate(file, value);
+  };
+  return { ...actual, writePrivate };
+});
+
 afterEach(removeTemporaryRoots);
+afterEach(() => {
+  failing.recordedWrite = false;
+});
 
 /** Stage an update of `runtime`'s assistant under its instance lock, as the command does. */
 async function stage(host: Machine, runtime: InstanceRuntimeConfig, deps: UpdateDependencies): Promise<StagedUpdate> {
@@ -369,6 +395,42 @@ describe('staging an update while the assistant serves', GIT_HEAVY, () => {
       code: 'instance_not_created',
       message: expect.stringContaining(`gws-ea resume --id ${runtime.instance_id}`),
     });
+  });
+});
+
+describe('the update preview', () => {
+  it('shows the group and file names an agent chose with their control characters escaped', () => {
+    // A group named with an OSC 52 clipboard write, and a file in main's folder that erases its line and breaks it.
+    const group = 'research\u001b]52;c;cHduZWQ=\u0007';
+    const file = 'additional_context/notes\u001b[2K\rkept\n.md';
+    const coordinates = (commit: string): ReleaseCoordinates => ({
+      source_remote: 'https://example.test/nanoclaw.git',
+      release_track: 'dogfood',
+      deployed_commit: commit.repeat(40),
+    });
+    const preview: UpdatePreview = {
+      instanceId: '00000000-0000-4000-8000-000000000000',
+      from: coordinates('a'),
+      to: coordinates('b'),
+      migrations: [],
+      gateway: { current: DEPLOYED_GATEWAY, release: DEPLOYED_GATEWAY },
+      groupImages: [{ id: 'ag-research', name: group }],
+      agentRunnerLockChanged: true,
+      sessionSchemaChanged: false,
+      mainTemplate: { kind: 'customized', customized: [{ surface: 'context', name: file, change: 'added' }] },
+    };
+
+    const lines = updatePreviewLines(preview);
+
+    for (const line of lines) expect(line).not.toMatch(/[\p{Cc}\p{Cf}]/u);
+    const shown = 'research\\u001b]52;c;cHduZWQ=\\u0007 (ag-research)';
+    expect(lines).toContain(`Agent group images rebuilt after the update: ${shown}`);
+    expect(lines).toContain(
+      `Until rebuilt, ${shown} run the previous agent-runner dependencies, so their first turns may fail and retry.`,
+    );
+    expect(lines).toContain(
+      "Main's template: kept as it is, because these are customized: additional_context/notes\\u001b[2K\\rkept\\n.md (added)",
+    );
   });
 });
 
@@ -655,6 +717,45 @@ describe('an update killed during its cutover', GIT_HEAVY, () => {
       await expectUpdated(host, runtime, next, state, ran);
     },
   );
+
+  it('stands by a release the registry committed when the record write after it fails, and update settles it', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    await converse(runtime, 'm1');
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    const ran = state.tags.get(`${imageBase(runtime)}:latest`)!;
+    const id = runtime.instance_id;
+    const live = runtime.checkout_realpath;
+    const { run, err, out } = cli(host, state, next, runtime);
+    failing.recordedWrite = true;
+
+    expect(await run(['update', '--id', id, '--yes'])).toBe(1);
+
+    // The write failed once the registry named the release, and nothing was reverted: it runs as recorded there.
+    expect(failing.recordedWrite).toBe(false);
+    const summary = err.join('\n');
+    expect(summary).toContain(
+      `Assistant ${id} runs dogfood ${next.commit.slice(0, 12)}: its update was committed before that failed, so it stands, and gws-ea update --id ${id} finishes recording it.`,
+    );
+    expect(summary).not.toContain('rollback');
+    expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, next.commit));
+    expect(git(live, 'rev-parse', 'HEAD')).toBe(next.commit);
+    expect(await receiptCommit(instanceMarkerFile(live))).toBe(next.commit);
+    expect(await receiptCommit(host.paths.releasePreflightFile(id))).toBe(next.commit);
+    expect(state.tags.get(`${imageBase(runtime)}:previous`)).toBe(ran);
+    expect(state.running).toBe(true);
+    expect((await readOperationRecord(host.paths, id))?.phase).toBe('verified');
+    const checks = state.healthWaits.length;
+
+    expect(await run(['update', '--id', id, '--yes'])).toBe(0);
+
+    // The rerun settled the record through its gate and ran the follow-ups, without verifying again.
+    expect(state.healthWaits).toHaveLength(checks);
+    await expectUpdated(host, runtime, next, state, ran);
+    expect(messages(live)).toEqual(['m1']);
+    expect(out).toContain(`Assistant ${id} runs dogfood ${next.commit.slice(0, 12)}; its update is finished.`);
+  });
 
   it('re-stops a host the OS started at stopped, and carries the state it wrote since', async () => {
     const host = await machine();
@@ -993,6 +1094,59 @@ describe('the cutover refuses to go on', GIT_HEAVY, () => {
       expect(state.running).toBe(true);
     },
   );
+
+  it('names rollback when rolling the failed release back fails too, and rollback then finishes it', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    await converse(runtime, 'm1');
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    const ran = state.tags.get(`${imageBase(runtime)}:latest`)!;
+    const id = runtime.instance_id;
+    // The new release's route is down, and once it started the filesystem refuses renames, so no swap back runs.
+    state.onStart = (checkout) => {
+      const failing = git(checkout, 'rev-parse', 'HEAD') === next.commit;
+      state.routeDown = failing;
+      if (failing) state.renameFails = true;
+    };
+    const deps = dependencies(state, next, runtime);
+    const intent = await resolveUpdateIntent(host.paths, { instanceId: id }, deps);
+    const operation = await acquireInstanceOperation(host.paths, id, { command: 'update', target: intent.target });
+    if (!operation) throw new Error('The test instance operation was busy');
+    try {
+      const staged = await prepareUpdate(operation, intent, deps);
+      await confirmStagedUpdate(operation, staged, deps, async () => true);
+
+      await expect(continueUpdate(operation, deps)).rejects.toMatchObject({
+        code: 'update_recovery_failed',
+        message: expect.stringMatching(
+          new RegExp(
+            `The update to dogfood ${next.commit.slice(0, 12)} stopped at started, and rolling it back did not finish: .+ ` +
+              `Continue the rollback with gws-ea rollback --id ${id}\\.$`,
+            'u',
+          ),
+        ),
+        details: expect.objectContaining({ continueWith: `gws-ea rollback --id ${id}` }),
+      });
+    } finally {
+      operation.release();
+    }
+    expect(await readOperationRecord(host.paths, id)).toBeDefined();
+    expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, host.first));
+
+    state.renameFails = false;
+    const { run, out } = cli(host, state, next, runtime);
+    expect(await run(['rollback', '--id', id, '--yes'])).toBe(0);
+
+    expect(out).toContain(`Assistant ${id} was rolled back to dogfood ${host.first.slice(0, 12)}.`);
+    expect(await readOperationRecord(host.paths, id)).toBeUndefined();
+    expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, host.first));
+    expect(git(runtime.checkout_realpath, 'rev-parse', 'HEAD')).toBe(host.first);
+    expect(await receiptCommit(host.paths.releasePreflightFile(id))).toBe(host.first);
+    expect(state.tags.get(`${imageBase(runtime)}:latest`)).toBe(ran);
+    expect(messages(runtime.checkout_realpath)).toEqual(['m1']);
+    expect(state.running).toBe(true);
+  });
 
   it('when the host answers while the live checkout is not at the target, recording nothing and rolling back', async () => {
     const host = await machine();
@@ -1613,6 +1767,46 @@ describe("main's template across an update (R11, KTD12)", GIT_HEAVY, () => {
       expect(state.restamps).toEqual([{ instanceId: id, args: [...PLAN, '--yes'] }]);
       expect(out.join('\n')).toContain("Main's template was refreshed from this release.");
       expect((await keptRestamp(host, runtime))?.settled).toBeDefined();
+      expect(await readOperationRecord(host.paths, id)).toBeUndefined();
+    },
+  );
+
+  it.each([
+    [
+      'a file in its folder changed',
+      (runtime: InstanceRuntimeConfig) =>
+        writeFile(path.join(runtime.checkout_realpath, PERSONA), 'My own instructions.\n'),
+      "and instructions.prepend.md changed since it began, so main's files were kept as they are.",
+    ],
+    [
+      'another group became main',
+      async (runtime: InstanceRuntimeConfig) => makeMain(runtime.checkout_realpath, 'ag-research'),
+      'and main is no longer the group it began on, so it was not finished.',
+    ],
+  ] as const)(
+    'leaves a refresh killed partway as it is when %s while it was down, touching no file',
+    async (_label, change, outcome) => {
+      const host = await machine();
+      const runtime = await assistant(host);
+      const next = await nextRelease(host, mainTemplate('2'));
+      const state = world(runtime);
+      state.hangAt = 'restamp-partway';
+      const id = runtime.instance_id;
+      await killDuringCutover(host, runtime, state, next);
+      await change(runtime);
+      const groups = path.join(runtime.checkout_realpath, 'groups');
+      const before = await snapshot(groups);
+      delete state.hangAt;
+      state.restamps.length = 0;
+      const { run, out } = cli(host, state, next, runtime);
+
+      expect(await run(['update', '--id', id, '--yes'])).toBe(0);
+
+      expect(out.join('\n')).toContain(`Main's template refresh was cut short, ${outcome}`);
+      // Neither planned nor applied: whatever landed while it was down stays, and so does the half-done restamp.
+      expect(state.restamps).toEqual([]);
+      expect(await snapshot(groups)).toEqual(before);
+      expect((await keptRestamp(host, runtime))?.settled).toBeUndefined();
       expect(await readOperationRecord(host.paths, id)).toBeUndefined();
     },
   );

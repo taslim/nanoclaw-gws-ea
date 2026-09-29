@@ -21,6 +21,7 @@ import { writePrivate } from '../community-portal/private-file.js';
 import { isErrno } from '../community-portal/errors.js';
 import type { InstanceOperation } from './journal.js';
 import type { ControlPlanePaths } from './paths.js';
+import { safeErrorMessage } from './redact.js';
 import {
   assertInstanceId,
   getInstanceReservation,
@@ -459,6 +460,30 @@ export async function admitInstanceCommand(
   if (!resolved || resolved.phase === 'recorded') return;
   const refused = refusal(resolved, intent);
   if (refused) throw refused;
+}
+
+/**
+ * Recovery's first read, the resolution the gate makes (KTD2): an operation
+ * that failed before it was recorded may have passed its commit point anyway.
+ * When the registry already names its target, the compare-and-swap ran and
+ * only the record write after it failed, so the release stands and nothing
+ * may revert it: this throws `cause` reported that way, naming the command
+ * whose gate settles the record and runs its follow-ups. Nothing is written,
+ * since the write that failed may fail again. Otherwise it returns, and
+ * recovery goes on.
+ */
+export async function assertNotCommitted(operation: InstanceOperation, cause: unknown): Promise<void> {
+  operation.assertActive();
+  const { paths, instanceId } = operation;
+  const record = await readOperationRecord(paths, instanceId);
+  if (!record || !committedByRegistry(record, await getInstanceReservation(paths, instanceId))) return;
+  const { continueWith } = operationNextSteps(record);
+  throw new GwsEaError(
+    'operation_unsettled',
+    `${safeErrorMessage(cause)} Assistant ${instanceId} runs ${record.to.release_track} ${shortCommit(record.to.deployed_commit)}: ` +
+      `its ${record.kind} was committed before that failed, so it stands, and ${continueWith} finishes recording it.`,
+    { cause, details: { phase: record.phase, continueWith } },
+  );
 }
 
 async function exists(target: string): Promise<boolean> {

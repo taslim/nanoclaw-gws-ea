@@ -33,7 +33,7 @@ import type { InstanceNclOptions } from './ncl.js';
 import type { InstanceRuntimeConfig } from './service.js';
 import { GwsEaError } from './types.js';
 import { isRecord, unwrapData } from './validation.js';
-import { readMainGroup, readPluginMcpServers, readTaskSeries } from './verify.js';
+import { printableName, readMainGroup, readPluginMcpServers, readTaskSeries } from './verify.js';
 
 /** Where the NanoClaw extension keeps a plugin's persona, context, and tasks (`src/templates/extension.ts`). */
 const EXTENSION = 'ai.nanoco.nanoclaw';
@@ -347,7 +347,10 @@ export async function inspectMainTemplate(checkoutRoot: string): Promise<MainTem
 /** How a list of customized files and surfaces reads in a sentence. */
 export function describeCustomized(customized: readonly CustomizedTemplateFile[]): string {
   return customized
-    .map(({ surface, name, change }) => `${FILE_SURFACES.has(surface) ? name : `${surface} ${name}`} (${change})`)
+    .map(({ surface, name, change }) => {
+      const shown = printableName(name);
+      return `${FILE_SURFACES.has(surface) ? shown : `${surface} ${shown}`} (${change})`;
+    })
     .join(', ');
 }
 
@@ -461,7 +464,7 @@ export async function planMainRestamp(
 function recreatedTasks(changes: readonly RestampChange[]): string {
   const created = changes.filter((change) => change.surface === 'task' && change.action === 'create');
   return created.length > 0
-    ? ` It created these scheduled tasks, paused: ${created.map((change) => change.name).join(', ')}.`
+    ? ` It created these scheduled tasks, paused: ${created.map((change) => printableName(change.name)).join(', ')}.`
     : '';
 }
 
@@ -512,7 +515,7 @@ async function finishRefresh(followUp: TemplateFollowUp, main: MainFolder, pendi
       found[relative] !== (pending.files_after[relative] ?? null),
   );
   if (changed.length > 0) {
-    return `Main's template refresh was cut short, and ${changed.join(', ')} changed since it began, so main's files were kept as they are.`;
+    return `Main's template refresh was cut short, and ${changed.map(printableName).join(', ')} changed since it began, so main's files were kept as they are.`;
   }
   const applied = await restampMain(followUp, main.agentGroupId, true);
   await followUp.record({
@@ -592,11 +595,12 @@ export async function reverseMainTemplate(followUp: TemplateFollowUp): Promise<s
     const changed = area.filter(
       (relative) => !refreshed(relative) && found[relative] !== (restored.get(relative) ?? null),
     );
-    if (changed.length > 0) return left(`its reversal was cut short, and ${changed.join(', ')} changed since`);
+    if (changed.length > 0)
+      return left(`its reversal was cut short, and ${changed.map(printableName).join(', ')} changed since`);
   } else {
     const changed: string[] = [];
     const files = area.filter((relative) => !refreshed(relative));
-    if (files.length > 0) changed.push(files.join(', '));
+    if (files.length > 0) changed.push(files.map(printableName).join(', '));
     if (recorded.settled) {
       const now = settledState(checkout, main, recorded.task_slugs);
       if (now.mcp_servers !== recorded.settled.mcp_servers) changed.push('its plugin MCP servers');

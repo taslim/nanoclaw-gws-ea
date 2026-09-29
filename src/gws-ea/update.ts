@@ -45,8 +45,6 @@ import {
   finishFollowUps,
   finishSwap,
   imageIdOf,
-  keepReleaseFiles,
-  keptReleaseFiles,
   nextAgentImage,
   openCutoverHost,
   planFollowUps,
@@ -54,7 +52,6 @@ import {
   removeUpdateStaging,
   reverseSwapBeforeLiveMoved,
   settleCheckoutDatabases,
-  stagedKeptFilesRoot,
   stopCutoverHost,
   verifyServingRelease,
   type CutoverDependencies,
@@ -62,6 +59,7 @@ import {
   type CutoverSeams,
   type SwapReleases,
 } from './cutover.js';
+import { keepReleaseFiles, keptReleaseFiles, stagedKeptFilesRoot } from './kept-release.js';
 import { runStep } from './events.js';
 import { loadCreatedRuntime, type InstanceOperation } from './journal.js';
 import {
@@ -75,6 +73,7 @@ import { parseOnecliComposeImages, type OnecliPins } from './onecli-compose.js';
 import { resolveWrapperGatewayImage } from './onecli-gateway-image.js';
 import {
   advanceOperation,
+  assertNotCommitted,
   beginOperation,
   commitOperationRelease,
   operationNextSteps,
@@ -122,6 +121,7 @@ import {
 } from './types.js';
 import {
   backupCentralDatabase,
+  printableName,
   readCentralMigrations,
   readDerivedImageGroups,
   readSchemaManifest,
@@ -744,7 +744,7 @@ function mainTemplateLine(decision: MainTemplateDecision): string {
 /** The preview, one fact per line (R8). */
 export function updatePreviewLines(preview: UpdatePreview): string[] {
   const { from, to, gateway, groupImages } = preview;
-  const groups = groupImages.map((group) => `${group.name} (${group.id})`).join(', ');
+  const groups = groupImages.map((group) => `${printableName(group.name)} (${group.id})`).join(', ');
   return [
     `Assistant: ${preview.instanceId}`,
     `From: ${releaseLine(from)}`,
@@ -821,13 +821,15 @@ async function resumeOutgoingHost(host: CutoverHost, record: OperationRecord): P
 
 /**
  * Recovery for an update that failed before its release was recorded (R14).
- * Once its renames ran, the update is rolled back by R13's rule, which its own
- * confirmation covers: code only when neither schema moved, else the snapshot
- * its stop left. Before that nothing ran on the release: the old release's
- * host is started again (see `resumeOutgoingHost`), the record stays open
- * with its staging, and the failure names the commands that continue or
- * revert it. Either way the failure is reported, with where the assistant was
- * left.
+ * The registry is read first: an update it already names was committed, so
+ * it stands, and is reported for `update --id` to finish recording (see
+ * `assertNotCommitted`). Once its renames ran, the update is rolled back by
+ * R13's rule, which its own confirmation covers: code only when neither
+ * schema moved, else the snapshot its stop left. Before that nothing ran on
+ * the release: the old release's host is started again (see
+ * `resumeOutgoingHost`), the record stays open with its staging, and the
+ * failure names the commands that continue or revert it. Either way the
+ * failure is reported, with where the assistant was left.
  */
 export async function recoverUpdate(
   operation: InstanceOperation,
@@ -836,6 +838,7 @@ export async function recoverUpdate(
 ): Promise<never> {
   operation.assertActive();
   const { record, cause } = failed;
+  await assertNotCommitted(operation, cause);
   const failure = `${safeErrorMessage(cause)} The update to ${releaseLine(record.to)} stopped at ${record.phase}`;
   const details: GwsEaErrorDetails = { ...(cause instanceof GwsEaError ? cause.details : {}), phase: record.phase };
   if (record.kind === 'update' && RENAMED.has(record.phase)) {
