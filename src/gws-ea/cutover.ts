@@ -39,6 +39,7 @@ import Database from 'better-sqlite3';
 import { isErrno } from '../community-portal/errors.js';
 import { getInstallScopedNames } from '../install-slug.js';
 import { MUTABLE_PATHS } from '../mutable-paths.js';
+import { moveHoldingImages, releaseImage, taggedImageId, type ImageDocker } from './agent-image.js';
 import { observeLiveCheckout } from './checkout.js';
 import { observeManagedGchatRoute, verifyExistingGchatRoute } from './endpoint.js';
 import { runStep, type StepReporter } from './events.js';
@@ -53,7 +54,13 @@ import { refreshMainTemplate, reverseMainTemplate, type TemplateFollowUp } from 
 import { runInstanceNclJson, type InstanceNclOptions } from './ncl.js';
 import { applyReleaseGateway, observeOnecliRuntime, restoreReleaseGateway, verifyOnecliRuntime } from './onecli.js';
 import type { OnecliPins, OnecliRuntimeLayout } from './onecli-compose.js';
-import { completeFollowUp, followUpKey, readOperationRecord, type OperationFollowUp } from './operation.js';
+import {
+  completeFollowUp,
+  followUpKey,
+  readOperationRecord,
+  type MovedImage,
+  type OperationFollowUp,
+} from './operation.js';
 import {
   instanceMarkerFile,
   instanceRuntimeFile,
@@ -1332,27 +1339,63 @@ export function cutoverDocker(host: AssistantDocker, args: readonly string[]) {
 }
 
 const DOCKER_TIMEOUT_MS = 60_000;
-const IMAGE_ID = /^sha256:[0-9a-f]{64}$/u;
 
-/** The ID of the image `reference` names, or undefined when it names none. */
-export async function imageIdOf(host: AssistantDocker, reference: string): Promise<string | undefined> {
-  const listed = new Set(
-    (await cutoverDocker(host, ['image', 'ls', '--quiet', '--no-trunc', reference])).stdout
-      .split(/\r?\n/u)
-      .map((line) => line.trim())
-      .filter(Boolean),
-  );
-  const [id, ...others] = listed;
-  if (id === undefined) return undefined;
-  if (others.length > 0 || !IMAGE_ID.test(id)) {
-    throw new GwsEaError('invalid_child_output', `Docker reported no single image ID for ${reference}`);
-  }
-  return id;
+/** One assistant's images as `agent-image.ts` reaches them: from its instance directory, through its Docker. */
+export function assistantImageDocker(
+  runtime: InstanceRuntimeConfig,
+  seams: Pick<CutoverSeams, 'runCommand' | 'ambientEnv'>,
+  cwd: string,
+): ImageDocker {
+  return { run: seams.runCommand ?? runSanitizedCommand, cwd, env: dockerEnvironment(runtime, seams) };
 }
 
-/** The tag an update builds its agent image as, beside the `:latest` the assistant runs. */
+/** One assistant's images as `agent-image.ts` reaches them, through the Docker its cutover runs. */
+function hostImageDocker(host: AssistantDocker): ImageDocker {
+  return {
+    run: host.run,
+    cwd: host.operation.paths.instanceRoot(host.operation.instanceId),
+    env: dockerEnvironment(host.runtime, host.dependencies),
+  };
+}
+
+/** The ID of the image `reference` names, or undefined when it names none. */
+export function imageIdOf(host: AssistantDocker, reference: string): Promise<string | undefined> {
+  return taggedImageId(hostImageDocker(host), reference);
+}
+
+/**
+ * Move an assistant's agent image tags (`move`) with every image its
+ * record's moves name held (KTD19): each image a tag moves to, and each it
+ * moves off. Until the record's follow-ups release them, no other
+ * assistant's release deletes an image this switch, or its reversal, may
+ * still point a tag at (see `moveHoldingImages`).
+ */
+export function moveRecordedImages(
+  host: AssistantDocker,
+  images: readonly MovedImage[],
+  move: () => Promise<void>,
+): Promise<void> {
+  return moveHoldingImages(
+    hostImageDocker(host),
+    getInstallScopedNames(host.runtime.install_id).containerImageBase,
+    images.flatMap((image) =>
+      image.displaced_image_id === null ? [image.image_id] : [image.image_id, image.displaced_image_id],
+    ),
+    move,
+  );
+}
+
+/** The tag an update gives its agent image, beside the `:latest` the assistant runs. */
 export function nextAgentImage(runtime: Pick<InstanceRuntimeConfig, 'install_id'>): string {
   return `${getInstallScopedNames(runtime.install_id).containerImageBase}:next`;
+}
+
+/** The tag NanoClaw's build gives an update's agent image before it is labeled with its key and tagged `:next`. */
+export const BUILDING_AGENT_IMAGE_TAG = 'building';
+
+/** The image an update's build tags `BUILDING_AGENT_IMAGE_TAG`, in the assistant's own repository. */
+export function buildingAgentImage(runtime: Pick<InstanceRuntimeConfig, 'install_id'>): string {
+  return `${getInstallScopedNames(runtime.install_id).containerImageBase}:${BUILDING_AGENT_IMAGE_TAG}`;
 }
 
 /** Add follow-ups to those planned, each at most once. */
@@ -1385,9 +1428,10 @@ export function keepCutoverHostStopped(host: CutoverHost): Promise<void> {
 }
 
 /**
- * Remove an update's staging: the `:next` image, then `next/`. The image goes
- * first, so a staging whose image could not be removed is still found as
- * abandoned.
+ * Remove an update's staging: its image tags, `:next` and the `:building` one
+ * its build had not yet labeled, then `next/`. Each tag is removed as a tag,
+ * so an image another assistant shares stays; the tags go first, so a staging
+ * whose image could not be removed is still found as abandoned.
  */
 export async function removeUpdateStaging(
   paths: ControlPlanePaths,
@@ -1396,7 +1440,6 @@ export async function removeUpdateStaging(
   seams: Pick<CutoverSeams, 'runCommand' | 'ambientEnv'>,
 ): Promise<void> {
   const run = seams.runCommand ?? runSanitizedCommand;
-  const image = nextAgentImage(runtime);
   const docker = (args: readonly string[]) =>
     run({
       command: 'docker',
@@ -1405,7 +1448,9 @@ export async function removeUpdateStaging(
       env: dockerEnvironment(runtime, seams),
       timeoutMs: DOCKER_TIMEOUT_MS,
     });
-  if ((await docker(['image', 'ls', '--quiet', image])).stdout.trim()) await docker(['image', 'rm', image]);
+  for (const image of [nextAgentImage(runtime), buildingAgentImage(runtime)]) {
+    if ((await docker(['image', 'ls', '--quiet', image])).stdout.trim()) await docker(['image', 'rm', image]);
+  }
   await rm(paths.releaseRoot(instanceId, 'next'), { recursive: true, force: true });
 }
 
@@ -1617,48 +1662,6 @@ async function rebuildGroupImage(
   );
 }
 
-/** The tags `docker image inspect --format '{{json .RepoTags}}'` reports. */
-export function imageTags(output: string): readonly string[] {
-  let tags: unknown;
-  try {
-    tags = JSON.parse(output);
-  } catch (error) {
-    if (!(error instanceof SyntaxError)) throw error;
-    throw new GwsEaError('invalid_child_output', 'Docker reported invalid image tags', { cause: error });
-  }
-  // Docker reports an image no tag names with an empty list, or none at all.
-  if (tags === null) return [];
-  if (!Array.isArray(tags) || !tags.every((tag): tag is string => typeof tag === 'string')) {
-    throw new GwsEaError('invalid_child_output', 'Docker reported invalid image tags');
-  }
-  return tags;
-}
-
-/** Delete an image a retag or rebuild displaced, by ID, unless a tag still names it (KTD19). */
-async function deleteDisplacedImage(
-  runtime: InstanceRuntimeConfig,
-  imageId: string,
-  dependencies: CutoverSeams,
-  cwd: string,
-): Promise<void> {
-  const run = dependencies.runCommand ?? runSanitizedCommand;
-  const command = (args: readonly string[]) =>
-    run({ command: 'docker', args, cwd, env: dockerEnvironment(runtime, dependencies), timeoutMs: DOCKER_TIMEOUT_MS });
-  let inspected: string;
-  try {
-    inspected = (await command(['image', 'inspect', '--format', '{{json .RepoTags}}', imageId])).stdout;
-  } catch (error) {
-    const gone =
-      error instanceof GwsEaError &&
-      error.code === 'command_failed' &&
-      /No such image/iu.test(String(error.details?.stderrTail ?? ''));
-    if (gone) return;
-    throw error;
-  }
-  if (imageTags(inspected).length > 0) return;
-  await command(['image', 'rm', imageId]);
-}
-
 /**
  * A template follow-up's view of the release its restamp is recorded with:
  * for a refresh, the one the update kept in `previous/`; for a reversal, the
@@ -1716,7 +1719,12 @@ async function runFollowUp(
       });
       return undefined;
     case 'delete_image':
-      await deleteDisplacedImage(runtime, followUp.image_id, dependencies, paths.instanceRoot(instanceId));
+      // Displaced by a retag or a rebuild; another assistant sharing it by content keeps it by its own tag (KTD19).
+      await releaseImage(
+        assistantImageDocker(runtime, dependencies, paths.instanceRoot(instanceId)),
+        getInstallScopedNames(runtime.install_id).containerImageBase,
+        followUp.image_id,
+      );
       return undefined;
   }
 }
