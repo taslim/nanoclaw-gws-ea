@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -1706,6 +1706,24 @@ describe('gws-ea ncl', () => {
     expect(exitCode).toBe(7);
     expect(stdout).toBe(`groups\nlist\n--json\n--help\ninstall ${a.install_id}\n`);
   }, 30_000);
+
+  it('exits 75 while another command holds the instance lock, and never hands the process to its ncl', async () => {
+    const paths = await testPaths();
+    const a = await createdAssistant(paths, 35_001);
+    const held = await acquireInstanceOperation(paths, a.instance_id, { command: 'restart' });
+    if (!held) throw new Error('The test instance operation was busy');
+    const io = lines();
+
+    const { exitCode, replacement } = await runReplacing(['ncl', '--id', a.instance_id, '--', 'groups', 'list'], {
+      paths,
+      ...io.runtime,
+    }).finally(() => held.release());
+
+    expect(exitCode).toBe(75);
+    expect(replacement).toBeUndefined();
+    expect(io.err).toEqual(['Instance operation is already in progress; no action was taken.']);
+    expect(io.out).toEqual([]);
+  });
 });
 
 describe('gws-ea logs', () => {
@@ -1755,6 +1773,36 @@ describe('gws-ea logs', () => {
     expect(exitCode).toBe(1);
     expect(replacement).toBeUndefined();
     expect(io.err.join('\n')).toContain(`${hostLogFiles(a.checkout_realpath).errors} does not exist yet`);
+  });
+
+  it.each([
+    [
+      'a symlink to another file',
+      async (log: string, elsewhere: string) => {
+        await writeFile(elsewhere, 'not the host log\n');
+        await symlink(elsewhere, log);
+      },
+    ],
+    [
+      'a directory',
+      async (log: string) => {
+        await mkdir(log);
+      },
+    ],
+  ] as const)('refuses a host log that is %s before any tool opens it', async (_kind, place) => {
+    const paths = await testPaths();
+    const a = await createdAssistant(paths, 35_001);
+    const log = hostLogFiles(a.checkout_realpath).output;
+    await mkdir(path.dirname(log), { recursive: true });
+    await place(log, path.join(path.dirname(paths.configRoot), 'elsewhere'));
+    const io = lines();
+
+    const { exitCode, replacement } = await runReplacing(['logs', '--id', a.instance_id], { paths, ...io.runtime });
+
+    expect(exitCode).toBe(1);
+    expect(replacement).toBeUndefined();
+    expect(io.err).toEqual([`The host log ${log} is not a regular file.`]);
+    expect(io.out).toEqual([]);
   });
 });
 

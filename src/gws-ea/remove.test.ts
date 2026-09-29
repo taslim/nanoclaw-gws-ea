@@ -63,10 +63,25 @@ vi.mock('./cloudflare-api.js', async (importOriginal) => ({
     throw new Error('A real Cloudflare client was created');
   },
 }));
+/**
+ * Root-owned files a test has removal find without writing them: a system
+ * unit lives at a fixed path under `/etc`, outside any test root. Only the
+ * existence check sees them; every other path is the real filesystem's.
+ */
+const rootOwnedFiles = vi.hoisted(() => new Set<string>());
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  const access: typeof actual.access = async (file, mode) => {
+    if (typeof file === 'string' && rootOwnedFiles.has(file)) return;
+    return actual.access(file, mode);
+  };
+  return { ...actual, access };
+});
 
 const roots: string[] = [];
 
 afterEach(async () => {
+  rootOwnedFiles.clear();
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
@@ -2054,6 +2069,46 @@ describe('removal safety', () => {
     expect(await exists(paths.removalFile(input.instance_id))).toBe(false);
     expect(await exists(paths.instanceRoot(input.instance_id))).toBe(true);
   });
+
+  it.runIf(typeof process.getuid === 'function' && process.getuid() !== 0)(
+    'refuses without root when a system unit runs beside the user unit, before stopping or touching either',
+    async () => {
+      const paths = await testPaths();
+      const input = await reserve(paths, reservationInput(paths), {
+        started: ['materialize_checkout', 'start_nanoclaw'],
+      });
+      const home = path.join(paths.stateRoot, 'home');
+      await writePrivate(path.join(input.checkout_realpath, 'data', 'gws-ea', 'runtime.json'), {
+        home_directory: home,
+        docker_endpoint: DOCKER,
+      });
+      const { systemdUnit } = getInstallScopedNames(installOf(input));
+      const userUnit = path.join(home, '.config', 'systemd', 'user', `${systemdUnit}.service`);
+      await mkdir(path.dirname(userUnit), { recursive: true });
+      await writeFile(userUnit, 'user unit', { mode: 0o600 });
+      const systemUnit = path.join('/etc/systemd/system', `${systemdUnit}.service`);
+      rootOwnedFiles.add(systemUnit);
+      const order: string[] = [];
+      const serviceHelpers = nanoclawService(order, {
+        mode: 'systemd-user',
+        active: true,
+        name: systemdUnit,
+        definition: userUnit,
+      });
+      const runCommand = vi.fn(async (): Promise<SanitizedCommandOutcome> => ok());
+      const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
+
+      await expect(
+        removeAssistant(paths, input.instance_id, { ...dependencies, platform: 'linux', runCommand, serviceHelpers }),
+      ).rejects.toMatchObject({ code: 'root_required', message: expect.stringContaining(systemUnit) });
+      // No service stopped or disabled, no host killed, no container drained, and the user unit still in place.
+      expect(serviceHelpers.stopService).not.toHaveBeenCalled();
+      expect(runCommand).not.toHaveBeenCalled();
+      expect(order).toEqual([]);
+      expect(await readFile(userUnit, 'utf8')).toBe('user unit');
+      expect(await exists(paths.instanceRoot(input.instance_id))).toBe(true);
+    },
+  );
 
   it('stops before deleting a retiring tunnel whose connector sessions never clear', async () => {
     const paths = await testPaths();
