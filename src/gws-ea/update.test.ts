@@ -1848,7 +1848,7 @@ describe('gws-ea update', GIT_HEAVY, () => {
     expect(await run(['update', '--id', runtime.instance_id])).toBe(0);
 
     expect(asked).toEqual([expect.objectContaining({ to: release(host, next.commit) })]);
-    expect(out).toContain('Update cancelled. Nothing was changed.');
+    expect(out).toContain('Update cancelled. The assistant is unchanged.');
     expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();
     expect(await exists(host.paths.releaseRoot(runtime.instance_id, 'next'))).toBe(false);
     expect(state.tags.has(`${imageBase(runtime)}:next`)).toBe(false);

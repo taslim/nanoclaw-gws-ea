@@ -89,6 +89,15 @@ import {
   type NanoclawServiceHelpers,
 } from './service-control.js';
 import {
+  detectStrayInstall,
+  FULL_CHECK_MS,
+  removeStrayInstall,
+  strayParts,
+  type StrayInstall,
+  type StrayLauncher,
+  type ToolCheckout,
+} from './stray-install.js';
+import {
   confirmStagedUpdate,
   continueUpdate,
   prepareUpdate,
@@ -128,7 +137,7 @@ export const EXIT_CODES = { ready: 0, paused: 10, failed: 1, busy: 75 } as const
 
 type LineWriter = (line: string) => void;
 /** Commands that run as attempts: each with its own run log, stop summary, and failure loop. */
-const COMMANDS = ['create', 'resume', 'remove', 'start', 'stop', 'restart', 'update', 'rollback'] as const;
+const COMMANDS = ['create', 'resume', 'remove', 'start', 'stop', 'restart', 'update', 'rollback', 'cleanup'] as const;
 type Command = (typeof COMMANDS)[number];
 /** The attempts that act on an assistant's host service alone. */
 type ServiceCommand = Extract<Command, 'start' | 'stop' | 'restart'>;
@@ -229,6 +238,8 @@ export interface CliRuntime {
   confirmRollback?: (preview: RollbackPreview) => Promise<boolean>;
   /** An update's boundary seams; each defaults to the real one. */
   update?: UpdateSeams;
+  /** The checkout this tool runs from, which only the launcher names: a stray NanoClaw install there is removed. */
+  toolCheckout?: ToolCheckout;
 }
 
 /** The launcher's helpers an update runs with. */
@@ -255,6 +266,7 @@ const COMMAND_OPTIONS: Readonly<Record<Command, OptionSpec>> = {
   restart: SERVICE_OPTIONS,
   update: { values: ['id', 'track', 'source-remote'], switches: ['yes', 'all'] },
   rollback: { values: ['id'], switches: ['snapshot', 'yes'] },
+  cleanup: { values: [], switches: [] },
 };
 
 function parseOptions(args: readonly string[], { values, switches }: OptionSpec): CommandOptions {
@@ -546,6 +558,8 @@ class Cli {
             work: (session) => this.#rollbackWork(session, instanceId, options),
           });
       }
+      case 'cleanup':
+        return () => this.#attempt({ command, args, options, work: (session) => this.#cleanupWork(session) });
       default: {
         const unhandled: never = command;
         throw new GwsEaError('invalid_arguments', `Unknown command ${String(unhandled)}`);
@@ -588,6 +602,8 @@ class Cli {
           plan.options.snapshot ? '--snapshot' : undefined,
           plan.options.yes ? '--yes' : undefined,
         );
+      case 'cleanup':
+        return 'gws-ea cleanup';
       case 'create':
       case 'resume': {
         if (state.reserved && state.instanceId) return join(`gws-ea resume --id ${state.instanceId}`, extra, common);
@@ -655,6 +671,8 @@ class Cli {
     const instanceId = allocateInstanceId();
     state.instanceId = instanceId;
     this.#presenter.line(`instance_id: ${instanceId}`);
+    // After the ID, which scripts read as the first line.
+    await this.#cleanStrayInstall(reporter);
 
     const provided: Partial<Record<CreateInputFlag, string>> = {};
     for (const flag of CREATE_INPUT_FLAGS) if (options[flag] !== undefined) provided[flag] = options[flag];
@@ -896,6 +914,7 @@ class Cli {
   /** `update --id`: one assistant's update, reported as its stop summary. */
   async #updateWork({ reporter }: Session, request: UpdateRequest, yes: boolean): Promise<Outcome> {
     const confirm = updateConfirmation(yes, this.#runtime.confirmUpdate);
+    await this.#cleanStrayInstall(reporter);
     const update = await this.#updateAssistant(reporter, request, confirm, this.#updateLauncher());
     return updateOutcome(request.instanceId, update);
   }
@@ -963,9 +982,12 @@ class Cli {
     try {
       const confirm = updateConfirmation(yes, this.#runtime.confirmUpdateAll);
       const launcher = this.#updateLauncher();
+      const reporter: StepReporter = { emit: (event) => this.#presenter.event(event) };
+      // Once for the run, not per assistant: every turn shares the tool checkout.
+      await this.#cleanStrayInstall(reporter);
       const { releaseMigrations } = this.#runtime;
       const plan = await runStep(
-        { emit: (event) => this.#presenter.event(event) },
+        reporter,
         { id: 'check_assistants', label: 'Checking which assistants can be updated…' },
         async () =>
           planUpdateAll({
@@ -1060,6 +1082,70 @@ class Cli {
     } finally {
       operation.release();
     }
+  }
+
+  /** What stray handling needs, which only the launcher supplies. */
+  #strayHandling(): (StrayLauncher & { readonly checkout: ToolCheckout }) | undefined {
+    const { toolCheckout, hostStatus, serviceHelpers } = this.#runtime;
+    return toolCheckout && hostStatus && serviceHelpers
+      ? { checkout: toolCheckout, hostStatus, serviceHelpers }
+      : undefined;
+  }
+
+  /**
+   * What `create` and `update` start with (R3–R5): a stray NanoClaw install in
+   * the tool checkout is removed without asking, since gws-ea is the only way
+   * NanoClaw runs there. With none, nothing is printed; a failure is one
+   * warning, and the command goes on.
+   */
+  async #cleanStrayInstall(reporter: StepReporter): Promise<void> {
+    const stray = this.#strayHandling();
+    if (!stray) return;
+    const { checkout } = stray;
+    const line = await runStep(reporter, { id: 'clean_stray' }, async () => {
+      let found: StrayInstall | undefined;
+      try {
+        found = await detectStrayInstall(checkout, this.#paths);
+        if (strayParts(found).length === 0) return undefined;
+        const removed = await removeStrayInstall(checkout, found, stray);
+        return `Removed a stray NanoClaw install from ${checkout.root}: ${removed.join(', ')}.`;
+        // eslint-disable-next-line no-catch-all/no-catch-all -- A stray install never stops a create or update; its failure is a warning.
+      } catch (error) {
+        const what = found
+          ? `remove the stray NanoClaw install in ${checkout.root} (${strayParts(found).join(', ')})`
+          : `check ${checkout.root} for a stray NanoClaw install`;
+        return `Warning: could not ${what}; retry with gws-ea cleanup. ${safeErrorMessage(error)}`;
+      }
+    });
+    if (line) this.#presenter.line(line);
+  }
+
+  /** `cleanup`: what `create` and `update` start with, asked for, so Docker that cannot be checked is a failure (KTD7). */
+  async #cleanupWork({ reporter }: Session): Promise<Outcome> {
+    const stray = this.#strayHandling();
+    if (!stray) throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
+    const { checkout } = stray;
+    const found = await runStep(
+      reporter,
+      { id: 'check_stray', label: 'Checking the tool checkout for a stray NanoClaw install…' },
+      async () => {
+        const detected = await detectStrayInstall(checkout, this.#paths, FULL_CHECK_MS);
+        if (strayParts(detected).length === 0 && detected.unchecked) {
+          throw new GwsEaError(
+            'docker_unavailable',
+            `Docker did not answer, so its containers and images could not be checked: ${detected.unchecked}`,
+          );
+        }
+        return detected;
+      },
+    );
+    if (strayParts(found).length === 0) {
+      return { status: 'ready', message: `No stray NanoClaw install in ${checkout.root}.` };
+    }
+    const removed = await runStep(reporter, { id: 'remove_stray', label: 'Removing the stray NanoClaw install…' }, () =>
+      removeStrayInstall(checkout, found, stray),
+    );
+    return { status: 'ready', message: `Removed the stray NanoClaw install from ${checkout.root}.`, details: removed };
   }
 
   #secrets(options: CommandOptions): Promise<SecretSource> {
@@ -1255,7 +1341,7 @@ function finishedOutcome(instanceId: string, release: ReleaseCoordinates, notes:
 
 /** The stop summary of one assistant's update; undefined when its preview was declined. */
 function updateOutcome(instanceId: string, update: AssistantUpdate | undefined): Outcome {
-  if (!update) return { status: 'ready', message: 'Update cancelled. Nothing was changed.' };
+  if (!update) return { status: 'ready', message: 'Update cancelled. The assistant is unchanged.' };
   switch (update.kind) {
     case 'updated':
       return updatedOutcome(instanceId, update.updated);
@@ -1558,6 +1644,10 @@ function printHelp(output: LineWriter): void {
   output('  ncl --id <instance_id> -- <ncl arguments>');
   output("         Runs the assistant's own ncl, passing everything after -- unchanged.");
   output('  remove --id <instance_id> [--yes] [--abandon gcp-project,cloudflare-dns]');
+  output('  cleanup');
+  output(
+    '         Removes a NanoClaw install set up or started in the checkout gws-ea runs from; create and update do this first.',
+  );
   output('  create, resume, remove: [--secrets-file <owner-only file under the config root>] [--capture-fixtures]');
   output('  Secrets: GWS_EA_PROVIDER_CREDENTIAL, GWS_EA_CLOUDFLARE_API_TOKEN (environment or --secrets-file).');
   output('  Exit codes: 0 ready, 10 paused for a person, 1 failed, 75 busy; ncl and logs exit as their tool does.');
@@ -1586,6 +1676,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
           environment,
           serviceHelpers: runtime.serviceHelpers,
           hostStatus: runtime.hostStatus,
+          toolCheckout: runtime.toolCheckout,
         },
         parseOptions(args.slice(1), readOnly.options),
       ),

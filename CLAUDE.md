@@ -196,6 +196,12 @@ when implementing or debugging in an area it covers. Because `docs/rebuild/` is
 gitignored during the rebuild, these learnings remain local unless the user later
 chooses a tracked knowledge location.
 
+The operator runs `gws-ea` from a checkout of this repository
+(`~/.local/bin/gws-ea` links into it). In that checkout, do not run
+`pnpm run dev`, `./container/build.sh`, NanoClaw's setup, or a service install:
+each creates a separate NanoClaw install there, which gws-ea removes, its state
+included, on its next `create`, `update`, or `cleanup`.
+
 - For substantive work, use Compound Engineering. Use `$ce-brainstorm` only when
   product behavior is genuinely unsettled, `$ce-plan` to turn an accepted rebuild
   slice into an implementation-ready plan, and `$ce-work` to implement and verify
