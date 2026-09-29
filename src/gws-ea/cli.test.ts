@@ -216,6 +216,13 @@ describe('gws-ea usage', () => {
     expect(io.out).toContain('  update --id <instance_id> [--track <track>] [--source-remote <remote>] [--yes]');
   });
 
+  it('names update --all and its option', async () => {
+    const io = lines();
+
+    expect(await runCli(['--help'], io.runtime)).toBe(0);
+    expect(io.out).toContain('  update --all [--yes]');
+  });
+
   it('names rollback and each of its options', async () => {
     const io = lines();
 
@@ -251,6 +258,39 @@ describe('gws-ea usage', () => {
     ).toBe(1);
     expect(await everythingUnder(paths)).toEqual(before);
     expect(io.err).toEqual(['Unknown option --to', 'Run gws-ea --help for usage.']);
+  });
+
+  it.each([
+    ['--id', allocateInstanceId(), 'Pass either --id or --all, not both.'],
+    [
+      '--track',
+      'dogfood',
+      '--all keeps each assistant on its own track and repository; move one elsewhere with gws-ea update --id <instance_id> --track <track>.',
+    ],
+    [
+      '--source-remote',
+      PRIVATE_REMOTE,
+      '--all keeps each assistant on its own track and repository; move one elsewhere with gws-ea update --id <instance_id> --track <track>.',
+    ],
+  ])('refuses update --all with %s before anything runs', async (flag, value, refusal) => {
+    const paths = await testPaths();
+    await reserveInstance(paths, reservation(paths));
+    const before = await everythingUnder(paths);
+    const services = nanoclawServices({});
+    const io = lines();
+
+    expect(
+      await runCli(['update', '--all', flag, value, '--yes'], {
+        paths,
+        ...io.runtime,
+        serviceHelpers: services.helpers,
+        toolProviderSetup: vi.fn(),
+      }),
+    ).toBe(1);
+    expect(io.err).toEqual([refusal, 'Run gws-ea --help for usage.']);
+    expect(io.out).toEqual([]);
+    expect(services.calls).toEqual([]);
+    expect(await everythingUnder(paths)).toEqual(before);
   });
 
   it('names an unknown command before the usage and exits 1', async () => {
@@ -716,6 +756,33 @@ describe('gws-ea without a TTY', () => {
     );
     expect(io.err.join('\n')).toContain('--yes');
     expect(remove).not.toHaveBeenCalled();
+  });
+
+  it('refuses update --all without --yes, as update --id does, before any assistant is read or observed', async () => {
+    const paths = await testPaths();
+    await reserveInstance(paths, reservation(paths));
+    const before = await everythingUnder(paths);
+    const services = nanoclawServices({});
+    const toolProviderSetup = vi.fn();
+    const io = lines();
+
+    expect(
+      await runCli(['update', '--all'], {
+        paths,
+        ...io.runtime,
+        serviceHelpers: services.helpers,
+        toolProviderSetup,
+        upsertEnvVars: vi.fn(),
+        hostStatus: { queryHost: vi.fn(), waitForHost: vi.fn() },
+      }),
+    ).toBe(1);
+    expect(io.err).toEqual([
+      'An update needs confirmation: pass --yes, or run gws-ea update in a terminal to be asked.',
+    ]);
+    expect(io.out).toEqual([]);
+    expect(services.calls).toEqual([]);
+    expect(toolProviderSetup).not.toHaveBeenCalled();
+    expect(await everythingUnder(paths)).toEqual(before);
   });
 
   it("hands removal the driver's NanoClaw service helpers, which stop the host", async () => {

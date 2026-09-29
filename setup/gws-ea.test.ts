@@ -45,7 +45,9 @@ const fixture = vi.hoisted(() => {
     log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), message: vi.fn(), step: vi.fn() },
     note: vi.fn(),
     password: vi.fn(async () => 'fresh-cloudflare-token'),
-    confirm: vi.fn(async () => true),
+    confirm: vi.fn(async (): Promise<boolean | symbol> => true),
+    /** What clack's prompts return when the operator presses Ctrl-C or Esc. */
+    cancel: Symbol('clack:cancel'),
     ensurePrerequisites: vi.fn(async () => ({ account: 'operator@example.com' })),
     signIn: vi.fn(async () => undefined),
     confirmAccount: vi.fn(async () => true),
@@ -60,7 +62,7 @@ vi.mock('@clack/prompts', () => ({
   password: fixture.password,
   confirm: fixture.confirm,
   spinner: () => fixture.spinner,
-  isCancel: () => false,
+  isCancel: (value: unknown) => value === fixture.cancel,
 }));
 vi.mock('../src/gws-ea/cli.js', () => ({ runCli: fixture.runCli }));
 vi.mock('./gws-ea-input.js', () => ({
@@ -300,6 +302,17 @@ describe('GWS-EA driver', () => {
     });
   });
 
+  it('reports an update prompt the operator cancels as cancelled, not as a no, so update --all stops there', async () => {
+    await main(['update', '--all'], { interactive: true });
+    fixture.confirm.mockResolvedValueOnce(fixture.cancel);
+    const preview = { instanceId: 'x', to: { release_track: 'dogfood', deployed_commit: 'b'.repeat(40) } };
+
+    await expect(runtimeOf().confirmUpdate!(preview as never)).rejects.toMatchObject({
+      code: 'cancelled',
+      message: 'The update of assistant x was cancelled',
+    });
+  });
+
   it('asks before removal on a TTY, defaulting to keep the assistant', async () => {
     await main(['remove', '--id', 'x'], { interactive: true });
     fixture.confirm.mockResolvedValueOnce(false);
@@ -368,7 +381,8 @@ describe('GWS-EA terminal presenter', () => {
 
 describe("GWS-EA service control through NanoClaw's helpers", () => {
   // The helpers the driver wires, with only their command runner faked: no real launchctl or systemctl runs.
-  const INSTALL_ID = '0123456789abcdef0123456789abcdef';
+  const INSTANCE_ID = '01234567-89ab-cdef-0123-456789abcdef';
+  const INSTALL_ID = INSTANCE_ID.replaceAll('-', '');
   const UID = 501;
   const homes: string[] = [];
 
@@ -397,6 +411,7 @@ describe("GWS-EA service control through NanoClaw's helpers", () => {
     await mkdir(path.dirname(coordinates.serviceDefinitionPath), { recursive: true });
     await writeFile(coordinates.serviceDefinitionPath, 'definition\n');
     const target: ServiceControlTarget = {
+      instanceId: INSTANCE_ID,
       checkoutRoot: path.join(home, 'nanoclaw'),
       installId: INSTALL_ID,
       homeDirectory: home,
@@ -549,6 +564,7 @@ describe("GWS-EA service control through NanoClaw's helpers", () => {
     const service = createServiceControl(
       await wiredHelpers(runner),
       {
+        instanceId: INSTANCE_ID,
         checkoutRoot: path.join(home, 'a', 'nanoclaw'),
         installId: INSTALL_ID,
         homeDirectory: home,
