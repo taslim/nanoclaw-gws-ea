@@ -1,9 +1,11 @@
 import Database from 'better-sqlite3';
+import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import path from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
 
 import { isErrno } from '../community-portal/errors.js';
+import type { SnapshotManifest } from './operation.js';
 import { principalWelcomeEventId, type PrincipalCandidate } from './principal.js';
 import { redact } from './redact.js';
 import type { InstanceRuntimeConfig } from './service.js';
@@ -129,9 +131,39 @@ function mainSessionId(central: Database.Database, agentGroupId: string): string
   return session?.id;
 }
 
+/** Where SQLite's file header records its write and read format versions: 2 for WAL, 1 for a rollback journal. */
+const FORMAT_VERSION_OFFSETS = [18, 19] as const;
+const WAL_FORMAT = 2;
+const ROLLBACK_FORMAT = 1;
+
+/** A WAL database no connection has open: its writer closed it, so no `-wal` file remains. */
+function isClosedWalDatabase(file: string): boolean {
+  if (existsSync(`${file}-wal`)) return false;
+  const header = Buffer.alloc(FORMAT_VERSION_OFFSETS[1] + 1);
+  const descriptor = openSync(file, 'r');
+  try {
+    readSync(descriptor, header, 0, header.length, 0);
+  } finally {
+    closeSync(descriptor);
+  }
+  return FORMAT_VERSION_OFFSETS.every((offset) => header[offset] === WAL_FORMAT);
+}
+
+/**
+ * Open a database read-only without creating anything beside it. SQLite
+ * opens a WAL database by creating its `-wal` and `-shm` files, even for a
+ * read-only connection, and leaves them behind. A WAL database no connection
+ * has open holds every committed page in its main file, so it is read from an
+ * in-memory copy marked as a rollback-journal database, which SQLite reads
+ * without side files. One a writer has open already has its side files, and
+ * is read in place.
+ */
 function openReadonly(file: string): Database.Database {
   try {
-    return new Database(file, { readonly: true, fileMustExist: true });
+    if (!isClosedWalDatabase(file)) return new Database(file, { readonly: true, fileMustExist: true });
+    const contents = readFileSync(file);
+    for (const offset of FORMAT_VERSION_OFFSETS) contents[offset] = ROLLBACK_FORMAT;
+    return new Database(contents, { readonly: true });
   } catch {
     throw new GwsEaError('verification_state_missing', 'Required instance message state is missing');
   }
@@ -391,6 +423,152 @@ export function verifyTalkableConversation(input: ConversationVerificationInput)
     outbound?.close();
     inbound.close();
   }
+}
+
+function centralDatabaseFile(checkoutRoot: string): string {
+  return path.join(path.resolve(checkoutRoot), 'data', 'v2.db');
+}
+
+function hasTable(database: Database.Database, name: string): boolean {
+  return database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined;
+}
+
+/** Each session database under a checkout, keyed by its mailbox side: `inbound` or `outbound`. */
+function sessionDatabases(checkoutRoot: string): Array<{ readonly side: string; readonly file: string }> {
+  const directories = (directory: string): string[] => {
+    try {
+      return readdirSync(directory, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => path.join(directory, entry.name));
+    } catch (error) {
+      if (isErrno(error, 'ENOENT')) return [];
+      throw error;
+    }
+  };
+  const found: Array<{ side: string; file: string }> = [];
+  for (const group of directories(path.join(path.resolve(checkoutRoot), 'data', 'v2-sessions'))) {
+    for (const session of directories(group)) {
+      for (const entry of readdirSync(session, { withFileTypes: true })) {
+        const side = entry.isFile() ? /^(inbound|outbound)\.db$/u.exec(entry.name)?.[1] : undefined;
+        if (side) found.push({ side, file: path.join(session, entry.name) });
+      }
+    }
+  }
+  return found;
+}
+
+/**
+ * The schema a checkout's databases record (KTD5): the central migrations
+ * applied, in the order they ran, and every session table with its columns,
+ * keyed `<side>.<table>` and merged across sessions. Only read, never changed.
+ */
+export function readSchemaManifest(checkoutRoot: string): SnapshotManifest {
+  const central = openReadonly(centralDatabaseFile(checkoutRoot));
+  let migrations: string[];
+  try {
+    if (!hasTable(central, 'schema_version')) {
+      throw new GwsEaError('schema_unrecorded', 'The central database records no migrations');
+    }
+    migrations = (
+      central.prepare('SELECT name FROM schema_version ORDER BY version').all() as Array<{ name: string }>
+    ).map((row) => row.name);
+  } finally {
+    central.close();
+  }
+  const tables = new Map<string, Set<string>>();
+  for (const { side, file } of sessionDatabases(checkoutRoot)) {
+    const session = openReadonly(file);
+    try {
+      const names = session
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+        .all() as Array<{ name: string }>;
+      for (const { name } of names) {
+        const columns = tables.get(`${side}.${name}`) ?? new Set<string>();
+        for (const column of session.prepare('SELECT name FROM pragma_table_info(?)').all(name) as Array<{
+          name: string;
+        }>) {
+          columns.add(column.name);
+        }
+        tables.set(`${side}.${name}`, columns);
+      }
+    } finally {
+      session.close();
+    }
+  }
+  return {
+    central_migrations: migrations,
+    session_tables: Object.fromEntries(
+      [...tables.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([table, columns]) => [table, [...columns].sort()]),
+    ),
+  };
+}
+
+/** Main's latest delivery result, as its conversation's mailbox and the host's retry bookkeeping record it. */
+export interface LatestDelivery {
+  readonly mainAgentGroupId: string;
+  /** Main's conversation session, once it has one. */
+  readonly sessionId: string | undefined;
+  /** The newest result in that session's `delivered` table: `delivered` or `failed`. */
+  readonly last: { readonly messageOutId: string; readonly status: string; readonly at: string } | undefined;
+  /** That session's replies the host is still retrying (`delivery_attempts`), and the newest error it saw. */
+  readonly retrying: number;
+  readonly lastError: string | undefined;
+}
+
+/** Main's latest delivery result, or undefined until main is published. Only read, never changed. */
+export function readLatestDelivery(checkoutRoot: string): LatestDelivery | undefined {
+  const root = path.resolve(checkoutRoot);
+  const central = openReadonly(centralDatabaseFile(root));
+  let mainAgentGroupId: string;
+  let sessionId: string | undefined;
+  let retrying = 0;
+  let lastError: string | undefined;
+  try {
+    if (!hasTable(central, 'gws_ea_profile')) return undefined;
+    const profile = central.prepare('SELECT main_agent_group_id FROM gws_ea_profile WHERE singleton = 1').get() as
+      | { main_agent_group_id: string | null }
+      | undefined;
+    if (!profile?.main_agent_group_id) return undefined;
+    mainAgentGroupId = profile.main_agent_group_id;
+    sessionId = mainSessionId(central, mainAgentGroupId);
+    if (sessionId && hasTable(central, 'delivery_attempts')) {
+      const attempts = central
+        .prepare(
+          `SELECT COUNT(*) AS retrying,
+                  (SELECT last_error FROM delivery_attempts
+                    WHERE session_id = ? AND last_error IS NOT NULL
+                    ORDER BY last_attempt_at DESC LIMIT 1) AS last_error
+             FROM delivery_attempts WHERE session_id = ?`,
+        )
+        .get(sessionId, sessionId) as { retrying: number; last_error: string | null };
+      retrying = attempts.retrying;
+      lastError = attempts.last_error === null ? undefined : printableLogLine(attempts.last_error);
+    }
+  } finally {
+    central.close();
+  }
+  if (!sessionId) return { mainAgentGroupId, sessionId, last: undefined, retrying, lastError };
+  const inbound = openReadonly(path.join(root, 'data', 'v2-sessions', mainAgentGroupId, sessionId, 'inbound.db'));
+  let row: DeliveryRow | undefined;
+  try {
+    row = inbound
+      .prepare(
+        `SELECT message_out_id, status, delivered_at FROM delivered
+          ORDER BY delivered_at DESC, message_out_id DESC LIMIT 1`,
+      )
+      .get() as DeliveryRow | undefined;
+  } finally {
+    inbound.close();
+  }
+  return {
+    mainAgentGroupId,
+    sessionId,
+    last: row ? { messageOutId: row.message_out_id, status: row.status, at: row.delivered_at } : undefined,
+    retrying,
+    lastError,
+  };
 }
 
 export interface InstanceErrorLog {

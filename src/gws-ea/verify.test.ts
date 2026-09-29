@@ -6,7 +6,7 @@
  * as the router does. Only the container's own write — an assistant reply in
  * `outbound.db` — is inserted directly, into the schema NanoClaw created.
  */
-import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, realpath, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -14,7 +14,13 @@ import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { principalWelcomeEventId, type PrincipalCandidate } from './principal.js';
-import { verifyPrincipalBinding, verifyTalkableConversation, type ConversationVerificationInput } from './verify.js';
+import {
+  readLatestDelivery,
+  readSchemaManifest,
+  verifyPrincipalBinding,
+  verifyTalkableConversation,
+  type ConversationVerificationInput,
+} from './verify.js';
 
 const MAIN = 'ag-main';
 const USER = 'gchat:users/principal';
@@ -417,5 +423,95 @@ describe('talkable conversation verification', () => {
     }
 
     expect(verifyTalkableConversation(input())).toMatchObject({ ready: false, reason: 'binding_not_ready' });
+  });
+});
+
+describe('read-only observation', () => {
+  it("reads the latest delivery result of main's conversation, and the replies the host is still retrying", async () => {
+    expect(readLatestDelivery(checkout)).toEqual({
+      mainAgentGroupId: MAIN,
+      sessionId,
+      last: undefined,
+      retrying: 0,
+      lastError: undefined,
+    });
+
+    await deliveredWelcome();
+    expect(readLatestDelivery(checkout)).toEqual({
+      mainAgentGroupId: MAIN,
+      sessionId,
+      last: { messageOutId: 'out-welcome', status: 'delivered', at: WELCOME_DELIVERED_AT },
+      retrying: 0,
+      lastError: undefined,
+    });
+
+    await inbound('later-inbound', LATER_AT, 'chat-sdk', principalMessage);
+    await reply('later-outbound', 'later-inbound', LATER_REPLY_AT);
+    vi.setSystemTime(new Date(LATER_DELIVERED_AT));
+    await host.withMailboxSession(MAIN, sessionId, (mailbox) => mailbox.markDeliveryFailed('later-outbound'));
+    const { recordDeliveryAttempt } = await import('../db/coordination.js');
+    await recordDeliveryAttempt({
+      messageId: 'out-retrying',
+      sessionId,
+      now: LATER_DELIVERED_AT,
+      nextAttemptAt: '2026-09-18T18:02:00.000Z',
+      error: 'Google Chat answered 503',
+    });
+
+    expect(readLatestDelivery(checkout)).toEqual({
+      mainAgentGroupId: MAIN,
+      sessionId,
+      last: { messageOutId: 'later-outbound', status: 'failed', at: LATER_DELIVERED_AT },
+      retrying: 1,
+      lastError: 'Google Chat answered 503',
+    });
+  });
+
+  it('has no delivery to report until main is published', () => {
+    const central = new Database(path.join(checkout, 'data', 'v2.db'));
+    try {
+      central.exec('UPDATE gws_ea_profile SET main_agent_group_id = NULL');
+    } finally {
+      central.close();
+    }
+
+    expect(readLatestDelivery(checkout)).toBeUndefined();
+  });
+
+  it('reads the applied migrations and every session table', () => {
+    const manifest = readSchemaManifest(checkout);
+
+    expect(manifest.central_migrations).toEqual(
+      expect.arrayContaining(['host-coordination', 'module:gws-ea-profile:create-profile']),
+    );
+    expect(manifest.session_tables['inbound.messages_in']).toEqual(
+      expect.arrayContaining(['id', 'kind', 'timestamp', 'platform_id']),
+    );
+    expect(manifest.session_tables['inbound.delivered']).toEqual(
+      expect.arrayContaining(['message_out_id', 'status', 'delivered_at']),
+    );
+    expect(manifest.session_tables['outbound.messages_out']).toEqual(expect.arrayContaining(['in_reply_to']));
+  });
+
+  it('never leaves side files beside a WAL database its writer has closed', async () => {
+    await deliveredWelcome();
+    await host.closeDb();
+    const data = path.join(checkout, 'data');
+    const before = (await readdir(data)).sort();
+    expect(before).toContain('v2.db');
+    expect(before).not.toContain('v2.db-wal');
+
+    expect(readSchemaManifest(checkout).central_migrations).toContain('host-coordination');
+    expect(readLatestDelivery(checkout)).toMatchObject({ last: { messageOutId: 'out-welcome' } });
+    expect(
+      verifyPrincipalBinding({
+        runtime: { ...RUNTIME, checkout_realpath: checkout },
+        adapterInstance: INSTANCE,
+        provisioningStartedAt: BOUND_AT,
+        selectedCandidate: candidate(),
+      }),
+    ).toEqual({ status: 'absent' });
+
+    expect((await readdir(data)).sort()).toEqual(before);
   });
 });

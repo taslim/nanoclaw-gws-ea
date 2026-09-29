@@ -68,6 +68,7 @@ import {
   type InstanceServiceControl,
   type NanoclawServiceHelpers,
 } from './service-control.js';
+import { LIST_USAGE, runListCommand, runStatusCommand, STATUS_USAGE, type ReadOnlyCommandRuntime } from './status.js';
 import {
   GwsEaError,
   PROVISION_STEPS,
@@ -966,7 +967,41 @@ export interface ReadOnlyCommand {
  * attempt loop, parsing each one's flags from its `options`, and `--help`
  * prints each one's `usage` in this order.
  */
+/** The observation runtime `list` and `status` read through; everything it holds is read-only. */
+function observationRuntime(context: ReadOnlyContext): ReadOnlyCommandRuntime {
+  return {
+    paths: context.paths,
+    stdout: context.output,
+    stderr: context.errorOutput,
+    serviceHelpers: context.serviceHelpers,
+    hostStatus: context.hostStatus,
+  };
+}
+
 const READ_ONLY_COMMANDS: ReadonlyMap<string, ReadOnlyCommand> = new Map([
+  [
+    'list',
+    {
+      usage: LIST_USAGE,
+      options: { values: [], switches: ['json'] },
+      run: async (context, options) => ({
+        exitCode: await runListCommand(observationRuntime(context), { json: options.json === 'true' }),
+      }),
+    },
+  ],
+  [
+    'status',
+    {
+      usage: STATUS_USAGE,
+      options: { values: ['id'], switches: ['json'] },
+      run: async (context, options) => ({
+        exitCode: await runStatusCommand(observationRuntime(context), {
+          instanceId: targetInstance(options),
+          json: options.json === 'true',
+        }),
+      }),
+    },
+  ],
   [
     'logs',
     {

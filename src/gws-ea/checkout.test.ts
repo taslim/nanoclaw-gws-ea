@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -7,8 +7,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   assertReleaseCheckoutAgreement,
+  locateAgainstToolRelease,
   locateOnTrack,
   materializeReleaseCheckout,
+  observeLiveCheckout,
   resolveToolCommit,
 } from './checkout.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
@@ -395,7 +397,7 @@ describe('exact release checkout', () => {
       materializeReleaseCheckout(paths, reservation, {
         runCommand: async (spec) => {
           const result = await runSanitizedCommand(spec);
-          if (spec.cwd === stagingRoot(paths, instanceId) && spec.args[0] === 'status') {
+          if (spec.cwd === stagingRoot(paths, instanceId) && spec.args.includes('status')) {
             await mkdir(paths.checkoutRoot(instanceId), { mode: 0o700 });
             await write(paths.checkoutRoot(instanceId), 'owner.txt', 'preserve me\n');
           }
@@ -405,5 +407,105 @@ describe('exact release checkout', () => {
     ).rejects.toMatchObject({ code: 'checkout_exists' });
     expect(await readFile(path.join(paths.checkoutRoot(instanceId), 'owner.txt'), 'utf8')).toBe('preserve me\n');
     await expect(stat(stagingRoot(paths, instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+});
+
+/** Git's index as it is on disk: a read that refreshed it would change its bytes or its modification time. */
+async function indexState(checkoutRoot: string): Promise<{ readonly bytes: string; readonly modified: number }> {
+  const index = path.join(checkoutRoot, '.git', 'index');
+  return { bytes: (await readFile(index)).toString('base64'), modified: (await stat(index)).mtimeMs };
+}
+
+/** Make Git's cached stat of a tracked file stale without changing it, so an ordinary `git status` rewrites the index. */
+async function staleIndexEntry(checkoutRoot: string, relativePath: string): Promise<void> {
+  const later = new Date(Date.now() + 60_000);
+  await utimes(path.join(checkoutRoot, relativePath), later, later);
+}
+
+describe('read-only observation', () => {
+  it("places an assistant's commit against the tool's own release from the tool's history, never fetching", async () => {
+    const source = await sourceFixture();
+    await write(source.source, 'release.txt', 'second\n');
+    const second = commit(source.source, 'second release');
+    const subcommands: string[] = [];
+    const runtime = {
+      runCommand: async (spec: SanitizedCommand) => {
+        subcommands.push(spec.args.find((argument) => !argument.startsWith('-')) ?? '');
+        return runSanitizedCommand(spec);
+      },
+    };
+
+    await expect(locateAgainstToolRelease(source.source, source.firstCommit, runtime)).resolves.toEqual({
+      toolCommit: second,
+      position: 'behind',
+    });
+    await expect(locateAgainstToolRelease(source.source, second, runtime)).resolves.toEqual({
+      toolCommit: second,
+      position: 'same',
+    });
+    // A commit the tool's history does not hold cannot be placed.
+    await expect(locateAgainstToolRelease(source.source, 'f'.repeat(40), runtime)).resolves.toEqual({
+      toolCommit: second,
+      position: 'unknown',
+    });
+    // A tool older than the assistant's release is not ahead of it.
+    git(source.source, 'checkout', '--quiet', '--detach', source.firstCommit);
+    await expect(locateAgainstToolRelease(source.source, second, runtime)).resolves.toEqual({
+      toolCommit: source.firstCommit,
+      position: 'elsewhere',
+    });
+    expect(subcommands).not.toContain('fetch');
+  });
+
+  it("never refreshes the tool checkout's index while placing a commit", async () => {
+    const source = await sourceFixture();
+    await staleIndexEntry(source.source, 'release.txt');
+    const before = await indexState(source.source);
+
+    await locateAgainstToolRelease(source.source, source.firstCommit);
+
+    expect(await indexState(source.source)).toEqual(before);
+  });
+
+  it('observes the live checkout without creating anything under the instance or refreshing its index', async () => {
+    const source = await sourceFixture();
+    const paths = await controlPlanePaths();
+    const reservation = await reserved(paths, source.remote, source.firstCommit);
+    const instanceId = reservation.instance_id;
+    const checkout = paths.checkoutRoot(instanceId);
+    await materializeReleaseCheckout(paths, reservation);
+    const helper = path.join(paths.instanceRoot(instanceId), '.release-home');
+    await rm(helper, { recursive: true, force: true });
+    await staleIndexEntry(checkout, 'release.txt');
+    const before = await indexState(checkout);
+
+    await expect(observeLiveCheckout(reservation, [source.firstCommit])).resolves.toBe(source.firstCommit);
+
+    await expect(stat(helper)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await indexState(checkout)).toEqual(before);
+    // The fixture is sensitive: an ordinary status does rewrite this index.
+    git(checkout, 'status', '--porcelain');
+    expect(await indexState(checkout)).not.toEqual(before);
+  });
+
+  it('accepts only the commits the live checkout may hold, and refuses a tracked edit', async () => {
+    const source = await sourceFixture();
+    const paths = await controlPlanePaths();
+    const reservation = await reserved(paths, source.remote, source.firstCommit);
+    const checkout = paths.checkoutRoot(reservation.instance_id);
+    await materializeReleaseCheckout(paths, reservation);
+    const operationTarget = 'e'.repeat(40);
+
+    // An unfinished operation's commits are accepted alongside the registry's.
+    await expect(observeLiveCheckout(reservation, [operationTarget, source.firstCommit])).resolves.toBe(
+      source.firstCommit,
+    );
+    await expect(observeLiveCheckout(reservation, [operationTarget])).rejects.toMatchObject({
+      code: 'marker_mismatch',
+    });
+    await write(checkout, 'release.txt', 'edited\n');
+    await expect(observeLiveCheckout(reservation, [source.firstCommit])).rejects.toMatchObject({
+      code: 'checkout_drift',
+    });
   });
 });

@@ -7,6 +7,7 @@ import { writePrivate } from '../community-portal/private-file.js';
 import {
   assertOwnedDestination,
   assertPrivateDirectory,
+  instanceMarkerFile,
   preparePrivateDirectory,
   type ControlPlanePaths,
   type ReleaseSlot,
@@ -116,6 +117,57 @@ async function assertValidReleaseRef(
 }
 
 /**
+ * Run `use` with release command environments whose HOME is a scratch
+ * directory outside every instance, removed afterwards: Git reads no
+ * operator configuration, and nothing is created under an instance.
+ */
+async function withScratchEnvironments<T>(
+  prefix: string,
+  use: (environments: ReleaseCommandEnvironments, scratchRoot: string) => Promise<T>,
+): Promise<T> {
+  const scratchRoot = await mkdtemp(path.join(os.tmpdir(), prefix));
+  try {
+    return await use(await prepareReleaseCommandEnvironments(scratchRoot), scratchRoot);
+  } finally {
+    await rm(scratchRoot, { recursive: true, force: true });
+  }
+}
+
+/** The tool's own commit, read in its checkout; see `resolveToolCommit`. */
+async function readToolCommit(
+  toolRoot: string,
+  run: SanitizedCommandRunner,
+  environment: Readonly<Record<string, string>>,
+): Promise<string> {
+  const git = async (args: readonly string[]): Promise<string> =>
+    (await run({ command: 'git', args, cwd: toolRoot, env: environment })).stdout;
+  let head: string;
+  try {
+    head = await git(['rev-parse', '--verify', 'HEAD^{commit}']);
+  } catch (error) {
+    if (!(error instanceof GwsEaError) || error.code !== 'command_failed') throw error;
+    throw new GwsEaError(
+      'tool_checkout_unknown',
+      `gws-ea at ${toolRoot} is not a Git checkout, so it has no release to deploy; run gws-ea from a clone of its repository`,
+      { cause: error },
+    );
+  }
+  const commit = validateCommit(head.trim());
+  const files = (await git(['--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=no']))
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => line.slice(3));
+  if (files.length > 0) {
+    throw new GwsEaError(
+      'tool_checkout_modified',
+      `gws-ea's checkout has tracked changes, so it is not the release it would deploy: ${files.join(', ')}. Discard them, or run gws-ea from a clean checkout, then retry.`,
+      { details: { files } },
+    );
+  }
+  return commit;
+}
+
+/**
  * The tool's own commit: the release every create and update deploys, so
  * everything the tool writes is correct for it by construction. A tracked
  * change would make the tool differ from that commit and is refused, naming
@@ -123,38 +175,45 @@ async function assertValidReleaseRef(
  */
 export async function resolveToolCommit(toolRoot: string, runtime: CheckoutRuntime = {}): Promise<string> {
   const run = runtime.runCommand ?? runSanitizedCommand;
-  const scratchRoot = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-tool-'));
-  try {
-    const { git: environment } = await prepareReleaseCommandEnvironments(scratchRoot);
-    const git = async (args: readonly string[]): Promise<string> =>
-      (await run({ command: 'git', args, cwd: toolRoot, env: environment })).stdout;
-    let head: string;
-    try {
-      head = await git(['rev-parse', '--verify', 'HEAD^{commit}']);
-    } catch (error) {
-      if (!(error instanceof GwsEaError) || error.code !== 'command_failed') throw error;
-      throw new GwsEaError(
-        'tool_checkout_unknown',
-        `gws-ea at ${toolRoot} is not a Git checkout, so it has no release to deploy; run gws-ea from a clone of its repository`,
-        { cause: error },
-      );
+  return withScratchEnvironments('gws-ea-tool-', ({ git: environment }) => readToolCommit(toolRoot, run, environment));
+}
+
+/** Where an assistant's deployed commit stands against the tool's own release. */
+export interface ToolReleasePosition {
+  /** The tool's own commit: the release an update would deploy. */
+  readonly toolCommit: string;
+  /**
+   * `behind`: a strict ancestor of the tool's commit, so an update can move
+   * it forward; `same`: the tool's commit; `elsewhere`: newer than it or
+   * diverged from it; `unknown`: the tool's history does not hold the commit.
+   */
+  readonly position: 'behind' | 'same' | 'elsewhere' | 'unknown';
+}
+
+/**
+ * Place `commit` against the tool's own release using only the tool's own
+ * history: nothing is fetched, even lazily, and the tool's index is never
+ * refreshed. Track membership is left to update, which fetches the track.
+ */
+export async function locateAgainstToolRelease(
+  toolRoot: string,
+  commit: string,
+  runtime: CheckoutRuntime = {},
+): Promise<ToolReleasePosition> {
+  const deployed = validateCommit(commit);
+  const run = runtime.runCommand ?? runSanitizedCommand;
+  return withScratchEnvironments<ToolReleasePosition>('gws-ea-tool-', async ({ git: environment }) => {
+    const toolCommit = await readToolCommit(toolRoot, run, environment);
+    if (deployed === toolCommit) return { toolCommit, position: 'same' };
+    const local = { ...environment, GIT_NO_LAZY_FETCH: '1' };
+    if (!(await presentCommits(toolRoot, [deployed], run, local)).has(deployed)) {
+      return { toolCommit, position: 'unknown' };
     }
-    const commit = validateCommit(head.trim());
-    const files = (await git(['--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=no']))
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => line.slice(3));
-    if (files.length > 0) {
-      throw new GwsEaError(
-        'tool_checkout_modified',
-        `gws-ea's checkout has tracked changes, so it is not the release it would deploy: ${files.join(', ')}. Discard them, or run gws-ea from a clean checkout, then retry.`,
-        { details: { files } },
-      );
-    }
-    return commit;
-  } finally {
-    await rm(scratchRoot, { recursive: true, force: true });
-  }
+    return {
+      toolCommit,
+      position: (await isAncestor(toolRoot, deployed, toolCommit, run, local)) ? 'behind' : 'elsewhere',
+    };
+  });
 }
 
 export interface TrackCommits {
@@ -236,10 +295,8 @@ export async function locateOnTrack(
   const commit = validateCommit(commits.commit);
   const deployedCommit = commits.deployedCommit === undefined ? undefined : validateCommit(commits.deployedCommit);
   const run = runtime.runCommand ?? runSanitizedCommand;
-  const scratchRoot = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-track-'));
-  const repository = path.join(scratchRoot, 'history.git');
-  try {
-    const environments = await prepareReleaseCommandEnvironments(scratchRoot);
+  return withScratchEnvironments<TrackPosition>('gws-ea-track-', async (environments, scratchRoot) => {
+    const repository = path.join(scratchRoot, 'history.git');
     const local = { ...environments.git, GIT_NO_LAZY_FETCH: '1' };
     await run({ command: 'git', args: ['init', '--bare', repository], cwd: scratchRoot, env: local });
     await assertValidReleaseRef(repository, source.ref, run, local);
@@ -273,9 +330,7 @@ export async function locateOnTrack(
     const behind =
       onTrack && present.has(deployedCommit) && (await isAncestor(repository, deployedCommit, commit, run, local));
     return { onTrack, deployed: behind ? 'behind' : 'elsewhere' };
-  } finally {
-    await rm(scratchRoot, { recursive: true, force: true });
-  }
+  });
 }
 
 async function assertCheckoutTargetAbsent(checkoutRoot: string): Promise<void> {
@@ -295,12 +350,8 @@ function stagingCheckoutRoot(checkoutRoot: string): string {
   return `${checkoutRoot}.staging`;
 }
 
-function markerPath(checkoutRoot: string): string {
-  return path.join(checkoutRoot, 'data', 'gws-ea', 'instance.json');
-}
-
 async function writeStagingMarker(checkoutRoot: string, reservation: InstanceReservation): Promise<void> {
-  const file = markerPath(checkoutRoot);
+  const file = instanceMarkerFile(checkoutRoot);
   await preparePrivateDirectory(path.dirname(file));
   await writePrivate(file, {
     schema_version: INSTANCE_MARKER_SCHEMA_VERSION,
@@ -310,7 +361,7 @@ async function writeStagingMarker(checkoutRoot: string, reservation: InstanceRes
 }
 
 async function assertStagingMarker(checkoutRoot: string, reservation: InstanceReservation): Promise<void> {
-  const marker = await readInstanceMarkerFile(markerPath(checkoutRoot));
+  const marker = await readInstanceMarkerFile(instanceMarkerFile(checkoutRoot));
   if (marker.instance_id !== reservation.instance_id || marker.deployed_commit !== reservation.deployed_commit) {
     throw new GwsEaError('marker_mismatch', 'Staging instance marker mismatch; refusing mutation');
   }
@@ -346,7 +397,7 @@ export async function materializeReleaseCheckout(
   const verifyPublished = async (): Promise<InstanceReservation> => {
     if (!slot) return assertReleaseCheckoutAgreement(paths, instanceId, runtime);
     await assertCheckoutMarker(destination, instanceId, [reservation.deployed_commit]);
-    await assertCheckoutRoot(destination, reservation, run, environments.git);
+    await assertCheckoutRoot(destination, reservation.deployed_commit, run, environments.git);
     return reservation;
   };
   try {
@@ -410,14 +461,18 @@ async function promoteStagingCheckout(
   environment: Readonly<Record<string, string>>,
 ): Promise<void> {
   await assertStagingMarker(stagingRoot, reservation);
-  await assertCheckoutRoot(stagingRoot, reservation, run, environment);
+  await assertCheckoutRoot(stagingRoot, reservation.deployed_commit, run, environment);
   await assertCheckoutTargetAbsent(destination);
   await rename(stagingRoot, destination);
 }
 
+/**
+ * A checkout sits detached at `commit` with a clean tree. Git is told not to
+ * take optional locks, so reading its status never rewrites the index.
+ */
 async function assertCheckoutRoot(
   checkoutRoot: string,
-  reservation: InstanceReservation,
+  commit: string,
   run: SanitizedCommandRunner,
   environment: Readonly<Record<string, string>>,
 ): Promise<void> {
@@ -431,7 +486,7 @@ async function assertCheckoutRoot(
       })
     ).stdout.trim(),
   );
-  if (head !== reservation.deployed_commit) {
+  if (head !== commit) {
     throw new GwsEaError('release_mismatch', "Checkout HEAD does not match the reservation's release");
   }
   const branch = (
@@ -447,12 +502,23 @@ async function assertCheckoutRoot(
   const status = (
     await run({
       command: 'git',
-      args: ['status', '--porcelain=v1', '--untracked-files=all'],
+      args: ['--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=all'],
       cwd: checkoutRoot,
       env: environment,
     })
   ).stdout.trim();
   if (status) throw new GwsEaError('checkout_drift', `Release checkout is not clean:\n${status}`);
+}
+
+/** The reserved checkout is a physical directory at exactly its reserved real path. */
+async function assertPhysicalCheckout(reservation: InstanceReservation): Promise<void> {
+  const info = await lstat(reservation.checkout_realpath);
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new GwsEaError('unsafe_checkout', 'Reserved checkout must be a physical directory');
+  }
+  if ((await realpath(reservation.checkout_realpath)) !== reservation.checkout_realpath) {
+    throw new GwsEaError('unsafe_checkout', 'Checkout real path does not match the immutable reservation');
+  }
 }
 
 /** Verify registry, physical checkout, detached HEAD, marker, commit, and clean tree agree. */
@@ -462,16 +528,30 @@ export async function assertReleaseCheckoutAgreement(
   runtime: CheckoutRuntime = {},
 ): Promise<InstanceReservation> {
   const reservation = await assertRegistryMarkerAgreement(paths, instanceId);
-  const info = await lstat(reservation.checkout_realpath);
-  if (info.isSymbolicLink() || !info.isDirectory()) {
-    throw new GwsEaError('unsafe_checkout', 'Reserved checkout must be a physical directory');
-  }
-  if ((await realpath(reservation.checkout_realpath)) !== reservation.checkout_realpath) {
-    throw new GwsEaError('unsafe_checkout', 'Checkout real path does not match the immutable reservation');
-  }
-
+  await assertPhysicalCheckout(reservation);
   const run = runtime.runCommand ?? runSanitizedCommand;
   const environments = await prepareReleaseCommandEnvironments(paths.instanceRoot(instanceId));
-  await assertCheckoutRoot(reservation.checkout_realpath, reservation, run, environments.git);
+  await assertCheckoutRoot(reservation.checkout_realpath, reservation.deployed_commit, run, environments.git);
   return reservation;
+}
+
+/**
+ * The live checkout as a read-only command observes it: the checks
+ * `assertReleaseCheckoutAgreement` makes, against any of `commits` (the
+ * registry's, plus any an unfinished update or rollback placed there), with
+ * Git's HOME outside the instance, so nothing under it is created or changed.
+ * Returns the commit the checkout holds.
+ */
+export async function observeLiveCheckout(
+  reservation: InstanceReservation,
+  commits: readonly string[],
+  runtime: CheckoutRuntime = {},
+): Promise<string> {
+  const root = reservation.checkout_realpath;
+  await assertCheckoutMarker(root, reservation.instance_id, commits);
+  const { deployed_commit: commit } = await readInstanceMarkerFile(instanceMarkerFile(root));
+  await assertPhysicalCheckout(reservation);
+  const run = runtime.runCommand ?? runSanitizedCommand;
+  await withScratchEnvironments('gws-ea-checkout-', ({ git }) => assertCheckoutRoot(root, commit, run, git));
+  return commit;
 }
