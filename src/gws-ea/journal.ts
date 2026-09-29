@@ -36,6 +36,7 @@ import {
   withMachineLock,
 } from './registry.js';
 import { removePrivateFile } from './secrets.js';
+import { loadInstanceRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
 import {
   GwsEaError,
   PROVISION_STEPS,
@@ -241,6 +242,34 @@ export async function reserveInstance(
     }
     return reservation;
   });
+}
+
+/**
+ * The commands that operate a created assistant refuse one whose create has
+ * not finished (a provision step not yet completed), naming the resume that
+ * finishes it.
+ */
+export async function assertInstanceCreated(paths: ControlPlanePaths, instanceId: string): Promise<void> {
+  const journal = await readProvisionJournal(paths, instanceId);
+  if (PROVISION_STEPS.some((step) => journal.steps[step]?.completed_at === undefined)) {
+    throw new GwsEaError(
+      'instance_not_created',
+      `Assistant ${instanceId} is not fully created; finish creating it with gws-ea resume --id ${instanceId}.`,
+    );
+  }
+}
+
+/** The runtime record of a fully created assistant, read from its own checkout (R18). */
+export async function loadCreatedRuntime(paths: ControlPlanePaths, instanceId: string): Promise<InstanceRuntimeConfig> {
+  await assertInstanceCreated(paths, instanceId);
+  const reservation = await getInstanceReservation(paths, instanceId);
+  const runtime = await loadInstanceRuntimeConfig(
+    path.join(reservation.checkout_realpath, 'data', 'gws-ea', 'runtime.json'),
+  );
+  if (runtime.instance_id !== instanceId) {
+    throw new GwsEaError('runtime_mismatch', "The assistant's runtime record belongs to another instance");
+  }
+  return runtime;
 }
 
 export async function readProvisionJournal(paths: ControlPlanePaths, instanceId: string): Promise<ProvisionJournal> {

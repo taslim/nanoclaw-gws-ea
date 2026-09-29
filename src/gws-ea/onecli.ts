@@ -301,6 +301,31 @@ async function ensureWrapperGatewayImage(docker: OnecliDocker, pins: OnecliPins,
   });
 }
 
+/** The gateway image an instance runs, and the one the release an update stages runs. */
+export interface GatewayImageChange {
+  readonly current: string;
+  readonly release: string;
+}
+
+/**
+ * Make the release's wrapper gateway image ready before an update's stop
+ * (KTD8), from this tool's tree, which is the release it deploys (R6). Only
+ * when its tag differs from the one the instance's Compose file names is
+ * Docker asked for it, and built when absent; content-addressed tags never
+ * collide, so a build never replaces what another assistant runs. The
+ * Compose file and the running runtime are left for the cutover.
+ */
+export async function prepareReleaseGatewayImage(
+  layout: OnecliRuntimeLayout,
+  pins: OnecliPins,
+  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'runCommand' | 'ambientEnv'> = {},
+): Promise<GatewayImageChange> {
+  const { gateway: current } = await instanceOnecliImages(layout, pins);
+  const { image: release } = await resolveWrapperGatewayImage(pins);
+  if (release !== current) await ensureWrapperGatewayImage(dockerContext(layout, dependencies), pins, release);
+  return { current, release };
+}
+
 function validateObservedOnecliRuntime(
   layout: OnecliRuntimeLayout,
   observed: ObservedOnecliRuntime,

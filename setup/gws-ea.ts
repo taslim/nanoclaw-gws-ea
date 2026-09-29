@@ -19,9 +19,11 @@ import {
 } from '../scripts/update/service.js';
 import { runCli, type CliRuntime, type FailureReport, type Presenter } from '../src/gws-ea/cli.js';
 import type { InteractivePrompts } from '../src/gws-ea/events.js';
+import type { ToolProviderSetup } from '../src/gws-ea/release-target.js';
 import type { HostStatusHelpers } from '../src/gws-ea/service.js';
 import type { NanoclawServiceHelpers } from '../src/gws-ea/service-control.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
+import { providerProvisioningCapabilityDigest } from '../src/provider-provisioning-capability.js';
 import { offerDiagnosis } from './gws-ea-assist.js';
 import { authenticateGwsEaProvider, CLOUDFLARE_API_TOKEN_GUIDANCE, collectGwsEaCreateInput } from './gws-ea-input.js';
 import { attendPause } from './gws-ea-pause.js';
@@ -186,11 +188,26 @@ const serviceHelpers: NanoclawServiceHelpers = {
   verifyServiceHealth,
 };
 
-/** What a retry does: a host service command runs again; the others re-check prerequisites and continue. */
+/** What a retry does: a host service command or an update runs again; the others re-check prerequisites and continue. */
 function retryOffer(command: FailureReport['command']): string {
-  return command === 'start' || command === 'stop' || command === 'restart'
+  return command === 'start' || command === 'stop' || command === 'restart' || command === 'update'
     ? `Retry now? gws-ea runs ${command} again.`
     : 'Retry now? gws-ea re-checks prerequisites, then continues from where it stopped.';
+}
+
+/**
+ * This tool's provider setup, which an update holds the assistant's to: the
+ * provisioning capability digest of the checkout it runs from, and the
+ * credential metadata each composed provider declares, as create reads them.
+ */
+function toolProviderSetup(providers: readonly SetupProviderEntry[]): () => Promise<ToolProviderSetup> {
+  return async () => ({
+    capabilityDigest: await providerProvisioningCapabilityDigest(process.cwd()),
+    credentialMetadata: (id) =>
+      providers
+        .find((provider) => provider.value === id)
+        ?.provisioning?.credentialMetadata({ allowAmbientConfiguration: false }),
+  });
 }
 
 /** Diagnosis first, then the retry offer. */
@@ -206,11 +223,21 @@ export async function main(argv: readonly string[], options: { readonly interact
   const collectCreateInputs: CliRuntime['collectCreateInputs'] = (context) =>
     collectGwsEaCreateInput(context, { providers, interactive });
   const hostStatus = await loadHostStatus();
-  if (!interactive) return runCli(argv, { collectCreateInputs, upsertEnvVars, hostStatus, serviceHelpers });
+  const providerSetup = toolProviderSetup(providers);
+  if (!interactive) {
+    return runCli(argv, {
+      collectCreateInputs,
+      upsertEnvVars,
+      hostStatus,
+      serviceHelpers,
+      toolProviderSetup: providerSetup,
+    });
+  }
   return runCli(argv, {
     upsertEnvVars,
     hostStatus,
     serviceHelpers,
+    toolProviderSetup: providerSetup,
     presenter: createTerminalPresenter(),
     prompts: terminalPrompts(providers),
     collectCreateInputs,
@@ -218,6 +245,11 @@ export async function main(argv: readonly string[], options: { readonly interact
     confirmRemoval: async (preview) =>
       (await p.confirm({
         message: `Permanently remove assistant ${preview.instanceId} and request deletion of GCP project ${preview.gcpProject}?`,
+        initialValue: false,
+      })) === true,
+    confirmUpdate: async (preview) =>
+      (await p.confirm({
+        message: `Update assistant ${preview.instanceId} to ${preview.to.release_track} ${preview.to.deployed_commit.slice(0, 12)}?`,
         initialValue: false,
       })) === true,
     onFailure: handleFailure,

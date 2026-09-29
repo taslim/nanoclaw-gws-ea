@@ -15,6 +15,7 @@ import {
   type ServiceControlTarget,
 } from '../src/gws-ea/service-control.js';
 import { createInstanceServiceCoordinates, type InstanceServicePlatform } from '../src/gws-ea/service-coordinates.js';
+import { providerProvisioningCapabilityDigest } from '../src/provider-provisioning-capability.js';
 
 const fixture = vi.hoisted(() => {
   const spinner = {
@@ -28,7 +29,18 @@ const fixture = vi.hoisted(() => {
     runCli: vi.fn(async (_args: readonly string[], _runtime: unknown) => 0),
     collect: vi.fn(async (_context: unknown, _dependencies: unknown) => ({ marker: 'collected' })),
     authenticate: vi.fn(async (_provider: string, _providers: unknown) => ({ marker: 'authenticated' })),
-    providers: [{ value: 'claude' }],
+    providers: [
+      {
+        value: 'claude',
+        provisioning: {
+          credentialMetadata: vi.fn((_options: unknown) => ({
+            name: 'Anthropic',
+            type: 'anthropic',
+            hostPattern: 'api.anthropic.com',
+          })),
+        },
+      },
+    ],
     spinner,
     log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), message: vi.fn(), step: vi.fn() },
     note: vi.fn(),
@@ -220,6 +232,51 @@ describe('GWS-EA driver', () => {
       });
     },
   );
+
+  it("gives an update this tool's provider setup, read only when an update asks for it", async () => {
+    await main(['update', '--id', 'x'], { interactive: false });
+    const runtime = runtimeOf();
+    expect(fixture.providers[0]!.provisioning.credentialMetadata).not.toHaveBeenCalled();
+
+    const setup = await runtime.toolProviderSetup!();
+
+    expect(setup.capabilityDigest).toBe(await providerProvisioningCapabilityDigest(process.cwd()));
+    expect(setup.credentialMetadata('claude')).toEqual({
+      name: 'Anthropic',
+      type: 'anthropic',
+      hostPattern: 'api.anthropic.com',
+    });
+    expect(fixture.providers[0]!.provisioning.credentialMetadata).toHaveBeenCalledWith({
+      allowAmbientConfiguration: false,
+    });
+    expect(setup.credentialMetadata('opencode')).toBeUndefined();
+    // Without a TTY nobody can be asked, so an update needs --yes.
+    expect(runtime.confirmUpdate).toBeUndefined();
+  });
+
+  it('asks before an update on a TTY, naming the assistant and its new release, defaulting to wait', async () => {
+    await main(['update', '--id', 'x'], { interactive: true });
+    fixture.confirm.mockResolvedValueOnce(false);
+    const preview = { instanceId: 'x', to: { release_track: 'dogfood', deployed_commit: 'b'.repeat(40) } };
+
+    await expect(runtimeOf().confirmUpdate!(preview as never)).resolves.toBe(false);
+
+    expect(fixture.confirm).toHaveBeenCalledExactlyOnceWith({
+      message: `Update assistant x to dogfood ${'b'.repeat(12)}?`,
+      initialValue: false,
+    });
+  });
+
+  it('offers to run a failed update again', async () => {
+    await main(['update', '--id', 'x'], { interactive: true });
+
+    await runtimeOf().onFailure!(report({ command: 'update', step: 'stage_release' }));
+
+    expect(fixture.confirm).toHaveBeenCalledExactlyOnceWith({
+      message: 'Retry now? gws-ea runs update again.',
+      initialValue: true,
+    });
+  });
 
   it('asks before removal on a TTY, defaulting to keep the assistant', async () => {
     await main(['remove', '--id', 'x'], { interactive: true });

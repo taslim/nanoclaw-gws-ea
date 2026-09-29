@@ -197,6 +197,20 @@ describe('gws-ea usage', () => {
     expect(io.out.join('\n')).toContain('logs --id <instance_id> [--errors] [--follow]');
   });
 
+  it('names update and each of its options', async () => {
+    const io = lines();
+
+    expect(await runCli(['--help'], io.runtime)).toBe(0);
+    expect(io.out).toContain('  update --id <instance_id> [--track <track>] [--source-remote <remote>] [--yes]');
+  });
+
+  it('refuses an update option it does not take, before anything runs', async () => {
+    const io = lines();
+
+    expect(await runCli(['update', '--id', allocateInstanceId(), '--to', 'a'.repeat(40)], io.runtime)).toBe(1);
+    expect(io.err).toEqual(['Unknown option --to', 'Run gws-ea --help for usage.']);
+  });
+
   it('names an unknown command before the usage and exits 1', async () => {
     const io = lines();
 

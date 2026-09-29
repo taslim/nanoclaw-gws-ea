@@ -98,6 +98,7 @@ export interface OperationRecord {
   readonly updated_at: string;
   /** The cutover's stop; required from `stopped` on. */
   readonly stop?: OperationStop;
+  /** The live schema: as staging read it, until the stop records it again. */
   readonly manifest?: SnapshotManifest;
   readonly images: readonly MovedImage[];
   /** Planned before `recorded`; what is left of it after. */
@@ -108,7 +109,7 @@ export interface OperationRecord {
 export type OperationFacts = Partial<Pick<OperationRecord, 'stop' | 'manifest' | 'images' | 'follow_ups'>>;
 
 export type OperationStart = Pick<OperationRecord, 'kind' | 'from' | 'to'> &
-  Partial<Pick<OperationRecord, 'follow_ups'>>;
+  Partial<Pick<OperationRecord, 'manifest' | 'follow_ups'>>;
 
 /**
  * A command that takes the instance lock, and for `update` the release it
@@ -487,6 +488,7 @@ export async function beginOperation(operation: InstanceOperation, start: Operat
     phase: 'staged',
     started_at: now,
     updated_at: now,
+    ...(start.manifest ? { manifest: start.manifest } : {}),
     images: [],
     follow_ups: start.follow_ups ?? [],
   });
@@ -615,5 +617,10 @@ export function targetReservationView(reservation: InstanceReservation, record: 
   if (record.instance_id !== reservation.instance_id) {
     throw new GwsEaError('operation_mismatch', 'The operation record belongs to another instance');
   }
-  return { ...reservation, ...releaseOf(record.to) };
+  return reservationAt(reservation, record.to);
+}
+
+/** The registry entry with `release` overlaid: the view an update stages before it writes its record. */
+export function reservationAt(reservation: InstanceReservation, release: ReleaseCoordinates): InstanceReservation {
+  return { ...reservation, ...releaseOf(release) };
 }

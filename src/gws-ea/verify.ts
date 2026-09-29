@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync } from 'node:fs';
-import { open } from 'node:fs/promises';
+import { chmod, open } from 'node:fs/promises';
 import path from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
 
@@ -130,6 +130,9 @@ function mainSessionId(central: Database.Database, agentGroupId: string): string
     .get(agentGroupId) as SessionRow | undefined;
   return session?.id;
 }
+
+/** SQLite's largest backup step: every remaining page at once. */
+const SINGLE_STEP_PAGES = 0x7fffffff;
 
 /** Where SQLite's file header records its write and read format versions: 2 for WAL, 1 for a rollback journal. */
 const FORMAT_VERSION_OFFSETS = [18, 19] as const;
@@ -463,18 +466,7 @@ function sessionDatabases(checkoutRoot: string): Array<{ readonly side: string; 
  * keyed `<side>.<table>` and merged across sessions. Only read, never changed.
  */
 export function readSchemaManifest(checkoutRoot: string): SnapshotManifest {
-  const central = openReadonly(centralDatabaseFile(checkoutRoot));
-  let migrations: string[];
-  try {
-    if (!hasTable(central, 'schema_version')) {
-      throw new GwsEaError('schema_unrecorded', 'The central database records no migrations');
-    }
-    migrations = (
-      central.prepare('SELECT name FROM schema_version ORDER BY version').all() as Array<{ name: string }>
-    ).map((row) => row.name);
-  } finally {
-    central.close();
-  }
+  const migrations = readCentralMigrations(checkoutRoot);
   const tables = new Map<string, Set<string>>();
   for (const { side, file } of sessionDatabases(checkoutRoot)) {
     const session = openReadonly(file);
@@ -503,6 +495,65 @@ export function readSchemaManifest(checkoutRoot: string): SnapshotManifest {
         .map(([table, columns]) => [table, [...columns].sort()]),
     ),
   };
+}
+
+/** The central migrations a checkout's database records, in the order they ran. Only read, never changed. */
+export function readCentralMigrations(checkoutRoot: string): string[] {
+  const central = openReadonly(centralDatabaseFile(checkoutRoot));
+  try {
+    if (!hasTable(central, 'schema_version')) {
+      throw new GwsEaError('schema_unrecorded', 'The central database records no migrations');
+    }
+    return (central.prepare('SELECT name FROM schema_version ORDER BY version').all() as Array<{ name: string }>).map(
+      (row) => row.name,
+    );
+  } finally {
+    central.close();
+  }
+}
+
+/** An agent group whose container runs its own image, built on the base from its saved package lists. */
+export interface DerivedImageGroup {
+  readonly id: string;
+  readonly name: string;
+}
+
+/**
+ * The agent groups running a per-group image (`<imageBase>:<agent group ID>`,
+ * NanoClaw's `buildAgentGroupImage` tag), by name. Only read, never changed.
+ */
+export function readDerivedImageGroups(checkoutRoot: string, imageBase: string): DerivedImageGroup[] {
+  const central = openReadonly(centralDatabaseFile(checkoutRoot));
+  try {
+    if (!hasTable(central, 'container_configs')) return [];
+    const rows = central
+      .prepare(
+        `SELECT g.id, g.name, c.image_tag
+           FROM container_configs c JOIN agent_groups g ON g.id = c.agent_group_id
+          WHERE c.image_tag IS NOT NULL
+          ORDER BY g.name, g.id`,
+      )
+      .all() as Array<{ id: string; name: string; image_tag: string }>;
+    return rows.filter((row) => row.image_tag === `${imageBase}:${row.id}`).map(({ id, name }) => ({ id, name }));
+  } finally {
+    central.close();
+  }
+}
+
+/**
+ * Copy a checkout's central database to `destination` as one consistent
+ * snapshot: an online backup whose every page moves in a single step, so a
+ * write the running host makes meanwhile restarts the copy rather than
+ * mixing into it. The live database is only read. The copy is owner-only.
+ */
+export async function backupCentralDatabase(checkoutRoot: string, destination: string): Promise<void> {
+  const central = openReadonly(centralDatabaseFile(checkoutRoot));
+  try {
+    await central.backup(destination, { progress: () => SINGLE_STEP_PAGES });
+  } finally {
+    central.close();
+  }
+  await chmod(destination, 0o600);
 }
 
 /** Main's latest delivery result, as its conversation's mailbox and the host's retry bookkeeping record it. */

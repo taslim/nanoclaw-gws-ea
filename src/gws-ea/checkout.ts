@@ -133,6 +133,27 @@ async function withScratchEnvironments<T>(
   }
 }
 
+/**
+ * The files a checkout's tracked tree differs in. Untracked files belong to no
+ * release, and Git takes no optional lock, so its index is never rewritten.
+ */
+async function trackedChanges(
+  checkoutRoot: string,
+  run: SanitizedCommandRunner,
+  environment: Readonly<Record<string, string>>,
+): Promise<string[]> {
+  const { stdout } = await run({
+    command: 'git',
+    args: ['--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=no'],
+    cwd: checkoutRoot,
+    env: environment,
+  });
+  return stdout
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => line.slice(3));
+}
+
 /** The tool's own commit, read in its checkout; see `resolveToolCommit`. */
 async function readToolCommit(
   toolRoot: string,
@@ -153,10 +174,7 @@ async function readToolCommit(
     );
   }
   const commit = validateCommit(head.trim());
-  const files = (await git(['--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=no']))
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => line.slice(3));
+  const files = await trackedChanges(toolRoot, run, environment);
   if (files.length > 0) {
     throw new GwsEaError(
       'tool_checkout_modified',
@@ -476,6 +494,25 @@ async function assertCheckoutRoot(
   run: SanitizedCommandRunner,
   environment: Readonly<Record<string, string>>,
 ): Promise<void> {
+  await assertDetachedAt(checkoutRoot, commit, run, environment);
+  const status = (
+    await run({
+      command: 'git',
+      args: ['--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=all'],
+      cwd: checkoutRoot,
+      env: environment,
+    })
+  ).stdout.trim();
+  if (status) throw new GwsEaError('checkout_drift', `Release checkout is not clean:\n${status}`);
+}
+
+/** A checkout's HEAD is detached at `commit`. */
+async function assertDetachedAt(
+  checkoutRoot: string,
+  commit: string,
+  run: SanitizedCommandRunner,
+  environment: Readonly<Record<string, string>>,
+): Promise<void> {
   const head = validateCommit(
     (
       await run({
@@ -498,16 +535,6 @@ async function assertCheckoutRoot(
     })
   ).stdout.trim();
   if (branch !== 'HEAD') throw new GwsEaError('checkout_not_detached', 'Release checkout HEAD must be detached');
-
-  const status = (
-    await run({
-      command: 'git',
-      args: ['--no-optional-locks', 'status', '--porcelain=v1', '--untracked-files=all'],
-      cwd: checkoutRoot,
-      env: environment,
-    })
-  ).stdout.trim();
-  if (status) throw new GwsEaError('checkout_drift', `Release checkout is not clean:\n${status}`);
 }
 
 /** The reserved checkout is a physical directory at exactly its reserved real path. */
@@ -554,4 +581,31 @@ export async function observeLiveCheckout(
   const run = runtime.runCommand ?? runSanitizedCommand;
   await withScratchEnvironments('gws-ea-checkout-', ({ git }) => assertCheckoutRoot(root, commit, run, git));
   return commit;
+}
+
+/**
+ * The live checkout an update moves from: its marker and detached HEAD at the
+ * release the registry records. A tracked edit would stay behind with the
+ * release it edits, so it is refused, naming the files; untracked files belong
+ * to no release and are left alone. Git's HOME is outside the instance, and
+ * Git takes no optional lock, so nothing under the instance changes.
+ */
+export async function assertDeploymentCheckoutUnmodified(
+  reservation: InstanceReservation,
+  runtime: CheckoutRuntime = {},
+): Promise<void> {
+  const root = reservation.checkout_realpath;
+  await assertCheckoutMarker(root, reservation.instance_id, [reservation.deployed_commit]);
+  await assertPhysicalCheckout(reservation);
+  const run = runtime.runCommand ?? runSanitizedCommand;
+  await withScratchEnvironments('gws-ea-checkout-', async ({ git }) => {
+    await assertDetachedAt(root, reservation.deployed_commit, run, git);
+    const files = await trackedChanges(root, run, git);
+    if (files.length === 0) return;
+    throw new GwsEaError(
+      'deployment_checkout_modified',
+      `Assistant ${reservation.instance_id}'s checkout ${root} has tracked changes, which an update would leave behind with its release: ${files.join(', ')}. Discard them, then retry.`,
+      { details: { files } },
+    );
+  });
 }

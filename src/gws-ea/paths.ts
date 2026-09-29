@@ -50,7 +50,8 @@ export interface ControlPlanePaths {
   instanceLock(instanceId: string): string;
   markerFile(instanceId: string): string;
   bootstrapFile(instanceId: string): string;
-  releasePreflightFile(instanceId: string): string;
+  /** The release receipt: the live release's, or with `slot` the one kept beside that release. */
+  releasePreflightFile(instanceId: string, slot?: ReleaseSlot): string;
   removalFile(instanceId: string): string;
   /** gws-ea's own copy of one pinned OneCLI CLI version. */
   onecliCliFile(version: string): string;
@@ -122,7 +123,8 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
     instanceLock: (instanceId) => path.join(configRoot, 'locks', `${instanceId}.lock`),
     markerFile: (instanceId) => instanceMarkerFile(checkoutRoot(instanceId)),
     bootstrapFile: (instanceId) => path.join(instanceRoot(instanceId), 'bootstrap.json'),
-    releasePreflightFile: (instanceId) => path.join(instanceRoot(instanceId), 'release-preflight.json'),
+    releasePreflightFile: (instanceId, slot) =>
+      path.join(slot ? releaseRoot(instanceId, slot) : instanceRoot(instanceId), 'release-preflight.json'),
     removalFile: (instanceId) => path.join(removalRoot, `${instanceId}.json`),
     onecliCliFile: (version) => path.join(stateRoot, 'tools', 'onecli', version, 'onecli'),
     keptCloudflareTokenFile: (instanceId) => path.join(instanceRoot(instanceId), 'secrets', 'cloudflare-account-token'),

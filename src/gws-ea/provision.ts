@@ -328,19 +328,32 @@ async function instanceOnecliPins(context: ProductionProvisionContext): Promise<
   return { gateway: onecli.gateway, cli: onecli.cli };
 }
 
-async function persistReleasePreflightReceipt(
-  context: ProductionProvisionContext,
+/** Record what a release preflight established for `instanceId` at `deployedCommit`, owner-only, at `file`. */
+export async function writeReleasePreflightReceipt(
+  file: string,
+  instanceId: string,
+  deployedCommit: string,
   result: ReleasePreflightResult,
 ): Promise<void> {
   const receipt: ReleasePreflightReceipt = {
     schema_version: 1,
-    instance_id: context.operation.instanceId,
-    deployed_commit: context.input.release.commit,
+    instance_id: instanceId,
+    deployed_commit: deployedCommit,
     ...result,
   };
-  await writePrivateTextFile(
-    context.operation.paths.releasePreflightFile(context.operation.instanceId),
-    `${JSON.stringify(receipt, null, 2)}\n`,
+  await writePrivateTextFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
+}
+
+async function persistReleasePreflightReceipt(
+  context: ProductionProvisionContext,
+  result: ReleasePreflightResult,
+): Promise<void> {
+  const { paths, instanceId } = context.operation;
+  await writeReleasePreflightReceipt(
+    paths.releasePreflightFile(instanceId),
+    instanceId,
+    context.input.release.commit,
+    result,
   );
 }
 
@@ -1464,7 +1477,7 @@ async function readInstanceState(paths: ControlPlanePaths, reservation: Instance
 }
 
 /** The instance's OneCLI layout, run through the CLI and Docker endpoint it records. */
-function instanceOnecliLayout(
+export function instanceOnecliLayout(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
   cliExecutable: string,

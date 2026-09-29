@@ -6,6 +6,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  assertDeploymentCheckoutUnmodified,
   assertReleaseCheckoutAgreement,
   locateAgainstToolRelease,
   locateOnTrack,
@@ -507,5 +508,55 @@ describe('read-only observation', () => {
     await expect(observeLiveCheckout(reservation, [source.firstCommit])).rejects.toMatchObject({
       code: 'checkout_drift',
     });
+  });
+
+  it('lets an update move a live checkout whose only changes are untracked, without touching its index', async () => {
+    const source = await sourceFixture();
+    const paths = await controlPlanePaths();
+    const reservation = await reserved(paths, source.remote, source.firstCommit);
+    const checkout = paths.checkoutRoot(reservation.instance_id);
+    await materializeReleaseCheckout(paths, reservation);
+    await write(checkout, 'notes.txt', 'an agent wrote this; it belongs to no release\n');
+    await staleIndexEntry(checkout, 'release.txt');
+    const before = await indexState(checkout);
+
+    await expect(assertDeploymentCheckoutUnmodified(reservation)).resolves.toBeUndefined();
+
+    expect(await indexState(checkout)).toEqual(before);
+  });
+
+  it('refuses to move a live checkout with tracked edits, naming each edited file', async () => {
+    const source = await sourceFixture();
+    await write(source.source, 'second.txt', 'second\n');
+    const commitWithTwoFiles = commit(source.source, 'two tracked files');
+    git(source.source, 'push', 'origin', 'dogfood');
+    const paths = await controlPlanePaths();
+    const reservation = await reserved(paths, source.remote, commitWithTwoFiles);
+    const checkout = paths.checkoutRoot(reservation.instance_id);
+    await materializeReleaseCheckout(paths, reservation);
+    await write(checkout, 'release.txt', 'edited\n');
+    await rm(path.join(checkout, 'second.txt'));
+    await write(checkout, 'notes.txt', 'untracked\n');
+
+    const refusal = assertDeploymentCheckoutUnmodified(reservation);
+
+    await expect(refusal).rejects.toMatchObject({
+      code: 'deployment_checkout_modified',
+      message: expect.stringMatching(/release\.txt, second\.txt/u),
+      details: { files: ['release.txt', 'second.txt'] },
+    });
+    await expect(refusal).rejects.toSatisfy((error: Error) => !error.message.includes('notes.txt'));
+  });
+
+  it('refuses to move a live checkout that is not at the release the registry records', async () => {
+    const source = await sourceFixture();
+    const paths = await controlPlanePaths();
+    const reservation = await reserved(paths, source.remote, source.firstCommit);
+    const checkout = paths.checkoutRoot(reservation.instance_id);
+    await materializeReleaseCheckout(paths, reservation);
+    await write(checkout, 'release.txt', 'moved\n');
+    git(checkout, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qam', 'local commit');
+
+    await expect(assertDeploymentCheckoutUnmodified(reservation)).rejects.toMatchObject({ code: 'release_mismatch' });
   });
 });

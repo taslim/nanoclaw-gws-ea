@@ -9,6 +9,7 @@ import {
   observeOnecliRuntime,
   onecliSecretMatchesCredentialMetadata,
   persistOnecliApiKeyFiles,
+  prepareReleaseGatewayImage,
   reconcileOnecliRuntime,
   removeOnecliRuntime,
   verifyOnecliRuntime,
@@ -811,6 +812,52 @@ describe('OneCLI runtime start and repair', () => {
     expect((failure as Error).message).toContain(`127.0.0.1:${layout.gatewayPort}`);
     expect((failure as Error).cause).toBe(world.failUp);
     expect(holders.sort()).toEqual([layout.appPort, layout.gatewayPort].sort());
+  });
+});
+
+describe("an update's gateway image", () => {
+  it('builds the release gateway before the stop when its tag differs, and leaves the running runtime alone', async () => {
+    const layout = await layoutFixture();
+    const written = await writeInstanceCompose(layout, RELEASE_GATEWAY_IMAGE);
+    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
+    world.wrapperImageMissing = true;
+
+    await expect(
+      prepareReleaseGatewayImage(layout, PINS, { dockerCommandRunner: runner, ambientEnv: HOSTILE_AMBIENT }),
+    ).resolves.toEqual({ current: RELEASE_GATEWAY_IMAGE, release: GATEWAY_IMAGE });
+
+    const build = world.calls.find((call) => call.args[0] === 'build')!;
+    expect(build.args).toContain(GATEWAY_IMAGE);
+    expect(build.env?.DOCKER_HOST).toBe(DOCKER_ENDPOINT);
+    // Only the image is built: the Compose file and every container stay as they are until the cutover.
+    expect(await readFile(layout.composeFile, 'utf8')).toBe(written);
+    expect(world.calls.map((call) => call.args.slice(0, 2).join(' '))).toEqual(['image ls', 'build --build-arg']);
+  });
+
+  it('reuses a release gateway image another assistant already built', async () => {
+    const layout = await layoutFixture();
+    await writeInstanceCompose(layout, RELEASE_GATEWAY_IMAGE);
+    const { world, runner } = dockerWorld(layout);
+
+    await expect(prepareReleaseGatewayImage(layout, PINS, { dockerCommandRunner: runner })).resolves.toEqual({
+      current: RELEASE_GATEWAY_IMAGE,
+      release: GATEWAY_IMAGE,
+    });
+
+    expect(world.calls.some((call) => call.args[0] === 'build')).toBe(false);
+  });
+
+  it('touches Docker not at all when the release runs the gateway the assistant already runs', async () => {
+    const layout = await layoutFixture();
+    await writeInstanceCompose(layout, GATEWAY_IMAGE);
+    const { world, runner } = dockerWorld(layout);
+
+    await expect(prepareReleaseGatewayImage(layout, PINS, { dockerCommandRunner: runner })).resolves.toEqual({
+      current: GATEWAY_IMAGE,
+      release: GATEWAY_IMAGE,
+    });
+
+    expect(world.calls).toEqual([]);
   });
 });
 
