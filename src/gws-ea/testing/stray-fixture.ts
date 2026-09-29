@@ -130,9 +130,12 @@ export async function toolCheckoutWorld(options: { readonly platform?: 'macos' |
   const host: FakeHost = {};
   const order: string[] = [];
   const calls: string[] = [];
+  /** Each command's timeout, which the runner kills it at. */
+  const deadlines: Array<number | undefined> = [];
   const runCommand: SanitizedCommandOutcomeRunner = async (command) => {
     const line = `${command.command} ${command.args.join(' ')}`;
     calls.push(line);
+    deadlines.push(command.timeoutMs);
     order.push(line);
     if (command.command === 'docker') return docker.run(command.args);
     // No launchd job is loaded and no host runs from the checkout's dist/.
@@ -206,6 +209,7 @@ export async function toolCheckoutWorld(options: { readonly platform?: 'macos' |
     host,
     order,
     calls,
+    deadlines,
     runCommand,
     checkout,
     serviceHelpers,

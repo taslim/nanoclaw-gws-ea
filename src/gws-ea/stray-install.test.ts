@@ -185,12 +185,32 @@ describe('detectStrayInstall', () => {
   });
 
   it.each([
-    ["an assistant's checkout", async (w: World) => w.write('data/gws-ea/instance.json', '{}'), (w: World) => w.paths],
+    [
+      "an assistant's checkout, by its marker",
+      async (w: World) => w.write('data/gws-ea/instance.json', '{}'),
+      (w: World) => w.paths,
+    ],
+    [
+      "an assistant's checkout, by its runtime record",
+      async (w: World) => w.write('data/gws-ea/runtime.json', '{}'),
+      (w: World) => w.paths,
+    ],
+    [
+      "a checkout under gws-ea's state root",
+      async () => undefined,
+      (w: World) => resolveControlPlanePaths({ configRoot: path.join(w.base, 'config'), stateRoot: w.base }),
+    ],
     [
       "a checkout holding gws-ea's state",
       async () => undefined,
       (w: World) =>
         resolveControlPlanePaths({ configRoot: path.join(w.base, 'config'), stateRoot: path.join(w.root, 'state') }),
+    ],
+    [
+      "a checkout holding gws-ea's config",
+      async () => undefined,
+      (w: World) =>
+        resolveControlPlanePaths({ configRoot: path.join(w.root, 'config'), stateRoot: path.join(w.base, 'state') }),
     ],
   ] as const)('never looks inside %s', async (_case, arrange, paths) => {
     const w = await world();
@@ -331,19 +351,34 @@ describe('removeStrayInstall', () => {
     expect(await present(path.join(w.root, 'data'))).toBe(false);
   });
 
-  it.each([
-    ['keeps answering after SIGTERM', (host: FakeHost) => Object.assign(host, { pid: 4242, ignoresSigterm: true })],
-    ['exists but does not answer in time', (host: FakeHost) => Object.assign(host, { silent: true })],
-  ] as const)('keeps all state while a host %s', async (_case, arrange) => {
+  async function expectStateKept(w: World): Promise<void> {
+    for (const kept of ['data/v2.db', 'groups/main/CLAUDE.md', 'store/messages.db', '.env', 'logs/nanoclaw.log']) {
+      expect(await present(path.join(w.root, kept))).toBe(true);
+    }
+  }
+
+  it('touches nothing while a host started by hand ignores SIGTERM', async () => {
     const w = await strayWorld();
-    arrange(w.host);
+    Object.assign(w.host, { pid: 4242, ignoresSigterm: true } satisfies FakeHost);
 
     await expect(
       removeStrayInstall(w.checkout, await detectStrayInstall(w.checkout, w.paths), w.launcher),
     ).rejects.toMatchObject({ code: 'nanoclaw_removal_incomplete', message: expect.stringContaining('data/ncl.sock') });
-    for (const kept of ['data/v2.db', 'groups/main/CLAUDE.md', 'store/messages.db', '.env', 'logs/nanoclaw.log']) {
-      expect(await present(path.join(w.root, kept))).toBe(true);
-    }
+    // The teardown never ran beside a host that could still start containers.
+    expect(w.serviceHelpers.stopService).not.toHaveBeenCalled();
+    expect(w.docker.containers.map(({ id }) => id)).toEqual(['agent', 'exited', 'soji-agent']);
+    expect(w.docker.tags(w.names.containerImageBase)).toHaveLength(2);
+    await expectStateKept(w);
+  });
+
+  it('keeps all state while a host exists but does not answer in time', async () => {
+    const w = await strayWorld();
+    w.host.silent = true;
+
+    await expect(
+      removeStrayInstall(w.checkout, await detectStrayInstall(w.checkout, w.paths), w.launcher),
+    ).rejects.toMatchObject({ code: 'nanoclaw_removal_incomplete', message: expect.stringContaining('data/ncl.sock') });
+    await expectStateKept(w);
   });
 
   it('keeps all state when the teardown cannot remove a tag', async () => {

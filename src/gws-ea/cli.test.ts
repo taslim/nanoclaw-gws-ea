@@ -2030,6 +2030,9 @@ describe('gws-ea and a stray NanoClaw install in its own checkout', () => {
     expect(run.out[1]).toBe(without.out[1]);
     expect(run.out.filter((line) => /stray|NanoClaw install/u.test(line))).toEqual([]);
     expect(w.calls).toEqual(PROBES(w));
+    // A Docker that does not answer is given up on within half a second, so the check never stalls create.
+    expect(w.deadlines).toHaveLength(2);
+    for (const deadline of w.deadlines) expect(deadline).toBeLessThanOrEqual(500);
   });
 
   it("removes a stray install right after create's instance_id line, then creates", async () => {
