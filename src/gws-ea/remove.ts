@@ -10,7 +10,9 @@
  * only its own instance, so one stuck removal never blocks another assistant.
  * NanoClaw's helpers stop the host; removal then cleans up what they leave.
  * An unfinished update or rollback never stops it: its staged, kept, and
- * outgoing releases all sit under the instance root, and go with it.
+ * outgoing releases all sit under the instance root, and go with it. So does
+ * every image the assistant's updates and rollbacks built or displaced, while
+ * the images assistants share stay (KTD19).
  */
 import { access, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -20,6 +22,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { writePrivate } from '../community-portal/private-file.js';
 import { processLock } from '../community-portal/process-lock.js';
 import { isErrno } from '../community-portal/errors.js';
+import { getInstallScopedNames } from '../install-slug.js';
 import {
   CloudflareAmbiguousMutationError,
   createCloudflareApi,
@@ -61,8 +64,8 @@ import {
 import { readProvisionJournal } from './journal.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { removeOnecliRuntime } from './onecli.js';
-import { liveCheckoutCommits, readOperationRecord } from './operation.js';
-import { CONTROL_PLANE_ROOT, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
+import { liveCheckoutCommits, readOperationRecord, type OperationRecord } from './operation.js';
+import { CONTROL_PLANE_ROOT, preparePrivateDirectory, type ControlPlanePaths, type ReleaseSlot } from './paths.js';
 import { pollUntil } from './poll.js';
 import { probeRecordedDockerEndpoint, resolveDockerEndpoint } from './prerequisites.js';
 import {
@@ -181,6 +184,7 @@ export interface RemovalOptions {
 /** Boundary seams; each defaults to the real one. */
 export interface RemovalDependencies extends RemovalOptions {
   readonly platform?: InstanceServicePlatform;
+  /** Runs local teardown: the service manager fallback, the stray-host kill, and Docker. */
   readonly runCommand?: SanitizedCommandOutcomeRunner;
   readonly runGcloud?: GcloudCommandRunner;
   /** Probe the recorded Docker endpoint, else resolve the active local one. */
@@ -327,26 +331,67 @@ async function readRecord(file: string): Promise<Record<string, unknown> | undef
   }
 }
 
-/** Where an unfinished update leaves a release beside the live checkout; `outgoing/` holds none it could run. */
-const KEPT_RELEASES = ['previous', 'next'] as const;
+/**
+ * Where updates and rollbacks keep releases beside the live checkout, newest
+ * first: the one an update stages, the one a rollback left, the rollback
+ * point, and the rollback point an update set aside at its swap.
+ */
+const KEPT_RELEASES = ['next', 'outgoing', 'previous', 'superseded'] as const satisfies readonly ReleaseSlot[];
+
+/**
+ * The record of an unfinished update or rollback: undefined when there is
+ * none, null when it cannot be read. Removal goes on without what an
+ * unreadable one would say.
+ */
+async function readUnfinishedOperation(
+  paths: ControlPlanePaths,
+  instanceId: string,
+): Promise<OperationRecord | undefined | null> {
+  try {
+    return await readOperationRecord(paths, instanceId);
+  } catch (error) {
+    if (!(error instanceof GwsEaError)) throw error;
+    activeStep()?.write(
+      `${error.message}; the live checkout is checked by its instance identity alone, and only the images its repository still tags are deleted\n`,
+    );
+    return null;
+  }
+}
+
+/**
+ * The agent images an unfinished update or rollback retagged or displaced, by
+ * ID. A displaced image keeps no tag to be found by, and the record is the
+ * only place that names it until its follow-ups delete it.
+ */
+function recordedAgentImages(record: OperationRecord | undefined | null): readonly string[] {
+  if (!record) return [];
+  const moved = record.images.flatMap((image) =>
+    image.displaced_image_id === null ? [image.image_id] : [image.image_id, image.displaced_image_id],
+  );
+  const displaced = record.follow_ups.flatMap((followUp) =>
+    followUp.kind === 'delete_image' ? [followUp.image_id] : [],
+  );
+  return [...new Set([...moved, ...displaced])];
+}
 
 /**
  * The live checkout must carry this assistant's marker at the registry's
  * commit, or at the one an unfinished update or rollback placed there; a
  * record that cannot be read cannot say which, so only the marker's instance
- * identity is checked. A kept or staged release is checked by its marker's
- * instance identity alone, and staging may have stopped before writing one.
+ * identity is checked. Every kept release, wherever an update or rollback
+ * left it, is checked by its marker's instance identity alone, and staging
+ * may have stopped before writing one.
  */
-async function assertOwnCheckouts(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<void> {
-  let commits: readonly string[] | null;
-  try {
-    commits = liveCheckoutCommits(reservation, await readOperationRecord(paths, reservation.instance_id));
-  } catch (error) {
-    if (!(error instanceof GwsEaError)) throw error;
-    activeStep()?.write(`${error.message}; the live checkout is checked by its instance identity alone\n`);
-    commits = null;
-  }
-  await assertCheckoutConsistent(paths, reservation, commits);
+async function assertOwnCheckouts(
+  paths: ControlPlanePaths,
+  reservation: InstanceReservation,
+  operation: OperationRecord | undefined | null,
+): Promise<void> {
+  await assertCheckoutConsistent(
+    paths,
+    reservation,
+    operation === null ? null : liveCheckoutCommits(reservation, operation),
+  );
   for (const slot of KEPT_RELEASES) {
     const checkout = paths.releaseCheckoutRoot(reservation.instance_id, slot);
     try {
@@ -360,10 +405,10 @@ async function assertOwnCheckouts(paths: ControlPlanePaths, reservation: Instanc
 
 /**
  * The home directory, Docker endpoint, and OneCLI CLI the instance recorded:
- * `runtime.json` once the host started (in the live checkout, or mid-update in
- * the kept or staged release), else the bootstrap manifest create wrote. Only
- * these fields are read, so files an earlier launcher wrote still remove
- * cleanly.
+ * `runtime.json` once the host started (in the live checkout, or, with an
+ * update or rollback cut short, the newest kept release holding one), else
+ * the bootstrap manifest create wrote. Only these fields are read, so files
+ * an earlier launcher wrote still remove cleanly.
  */
 async function readRecordedRuntime(
   paths: ControlPlanePaths,
@@ -643,25 +688,53 @@ async function removeManagedIngress(removal: ManagedIngressRemoval): Promise<voi
   });
 }
 
-/** How often, and how many times, removal checks that a stray host it stopped is gone. */
+/** How often, and how many times, removal checks that what it stopped (a launchd job, a stray host) is gone. */
 const STOPPED_POLL_MS = 500;
 const STOPPED_CHECKS = 10;
+/** `launchctl print` exits with this, and only this, when the job is not loaded. */
+const LAUNCHD_JOB_NOT_FOUND = 113;
+
+/** The tags `docker image inspect --format '{{json .RepoTags}}'` reports. */
+function imageTags(output: string): readonly string[] {
+  let tags: unknown;
+  try {
+    tags = JSON.parse(output);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    throw new GwsEaError('invalid_child_output', 'Docker reported invalid image tags', { cause: error });
+  }
+  // Docker reports an image no tag names with an empty list, or none at all.
+  if (tags === null) return [];
+  if (!Array.isArray(tags) || !tags.every((tag): tag is string => typeof tag === 'string')) {
+    throw new GwsEaError('invalid_child_output', 'Docker reported invalid image tags');
+  }
+  return tags;
+}
+
+/** What removing the host uses besides the runtime the instance recorded. */
+interface NanoclawTeardown {
+  readonly platform: InstanceServicePlatform;
+  readonly run: SanitizedCommandOutcomeRunner;
+  readonly sleep: (milliseconds: number) => Promise<void>;
+  readonly serviceHelpers: NanoclawServiceHelpers;
+  /** The agent image IDs an unfinished update or rollback recorded. */
+  readonly recordedImages: readonly string[];
+}
 
 /**
  * Stop the instance's host through NanoClaw's own service helpers, then clean
- * up whatever that stop leaves: the service definition (a systemd unit is
- * disabled too, so neither login nor boot starts it again), a host running
- * outside the service, the agent containers (drained, then removed with any
- * that had already stopped), and the image.
+ * up whatever that stop leaves: the service definition (a launchd job whose
+ * plist is gone, which NanoClaw cannot find, is booted out by its label, and
+ * a systemd unit is disabled too, so neither login nor boot starts it again),
+ * a host running outside the service, the agent containers (drained, then
+ * removed with any that had already stopped), and the agent images.
  */
 async function uninstallNanoclaw(
   reservation: InstanceReservation,
   runtime: LocalRuntime,
-  platform: InstanceServicePlatform,
-  run: SanitizedCommandOutcomeRunner,
-  sleep: (milliseconds: number) => Promise<void>,
-  serviceHelpers: NanoclawServiceHelpers,
+  teardown: NanoclawTeardown,
 ): Promise<void> {
+  const { platform, run, sleep } = teardown;
   const installId = reservation.instance_id.replaceAll('-', '');
   const recorded = { home_directory: runtime.homeDirectory, docker_endpoint: runtime.dockerEndpoint };
   const incomplete = (message: string): GwsEaError => new GwsEaError('nanoclaw_removal_incomplete', message);
@@ -687,6 +760,24 @@ async function uninstallNanoclaw(
     });
   const coordinates = (runningAsRoot: boolean) =>
     createInstanceServiceCoordinates({ installId, homeDirectory: runtime.homeDirectory, platform, runningAsRoot });
+  /** Boot a launchd job out by its label, then wait until launchd no longer has it loaded. */
+  const bootOutByLabel = async (service: InstanceServiceCoordinates): Promise<void> => {
+    const uid = process.getuid?.();
+    if (uid === undefined) throw new GwsEaError('unsupported_platform', 'launchd requires a user ID');
+    const env = serviceManagerEnvironment(recorded, service.manager, {});
+    const job = `gui/${uid}/${service.serviceIdentity}`;
+    const loaded = async (): Promise<boolean> => {
+      const printed = await execute('launchctl', ['print', job], env);
+      if (printed.outcome.exitCode === LAUNCHD_JOB_NOT_FOUND) return false;
+      if (printed.outcome.exitCode !== 0) throw commandExitError(printed.command, printed.outcome);
+      return true;
+    };
+    if (!(await loaded())) return;
+    // A bootout that failed leaves the job loaded, which the wait reports. One that worked returns before
+    // launchd has finished removing the job, so the job gets a moment to go.
+    await execute('launchctl', ['bootout', job], env);
+    if (await stillPresent(loaded)) throw incomplete('The NanoClaw launchd service is still loaded');
+  };
 
   const units: InstanceServiceCoordinates[] = [];
   if (platform === 'linux') {
@@ -712,7 +803,7 @@ async function uninstallNanoclaw(
   }
 
   const control = createServiceControl(
-    serviceHelpers,
+    teardown.serviceHelpers,
     {
       checkoutRoot: reservation.checkout_realpath,
       installId,
@@ -721,10 +812,17 @@ async function uninstallNanoclaw(
     },
     { platform: platform === 'macos' ? 'darwin' : 'linux', sleep },
   );
+  const detected = control.detect();
   // A host running outside its service is not NanoClaw's to stop; the stray-host kill below takes it.
-  if (control.detect().mode !== 'unmanaged') await control.stop();
+  if (detected.mode !== 'unmanaged') await control.stop();
 
-  if (platform === 'macos') await rm(coordinates(false).serviceDefinitionPath, { force: true });
+  if (platform === 'macos') {
+    const service = coordinates(false);
+    // NanoClaw finds a launchd job by its plist, so a job still loaded after its plist was deleted is booted
+    // out by its label, before the stray-host kill below: launchd would only start that host again.
+    if (detected.mode !== 'launchd') await bootOutByLabel(service);
+    await rm(service.serviceDefinitionPath, { force: true });
+  }
   for (const service of units) {
     const env = serviceManagerEnvironment(recorded, service.manager, {});
     const scope = service.manager === 'systemd-user' ? ['--user'] : [];
@@ -753,7 +851,7 @@ async function uninstallNanoclaw(
 
   // Nothing is left that could start another agent, so the drain is race-free.
   await control.drain();
-  const { installLabel, imageTag } = coordinates(false);
+  const { installLabel } = coordinates(false);
   const containers = async (): Promise<string[]> =>
     (await checked('docker', ['ps', '-aq', '--filter', `label=${installLabel}`], tools))
       .split(/\r?\n/u)
@@ -764,11 +862,32 @@ async function uninstallNanoclaw(
     await checked('docker', ['rm', '--force', ...ids], tools);
     if ((await containers()).length > 0) throw incomplete('NanoClaw containers remain after removal');
   }
-  const image = async (): Promise<boolean> =>
-    (await checked('docker', ['image', 'ls', '--quiet', '--no-trunc', imageTag], tools)).trim() !== '';
-  if (await image()) {
-    await checked('docker', ['image', 'rm', imageTag], tools);
-    if (await image()) throw incomplete('The NanoClaw image remains after removal');
+
+  // Every tag in the assistant's own image repository goes: `:latest`, the `:next` an update staged, the
+  // `:previous` it kept, and each agent group's own image. Nothing outside that repository is named, so the
+  // OneCLI, gateway, and connector images assistants share stay (KTD19).
+  const repository = getInstallScopedNames(installId).containerImageBase;
+  const tagged = async (): Promise<string[]> =>
+    (await checked('docker', ['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}', repository], tools))
+      .split(/\r?\n/u)
+      .map((reference) => reference.trim())
+      .filter((reference) => reference.startsWith(`${repository}:`) && reference !== `${repository}:<none>`);
+  const references = await tagged();
+  if (references.length > 0) {
+    await checked('docker', ['image', 'rm', ...references], tools);
+    const remaining = await tagged();
+    if (remaining.length > 0) throw incomplete(`NanoClaw images remain after removal: ${remaining.join(', ')}`);
+  }
+  // An image a retag or rebuild displaced has no tag left to find it by, so it goes by the ID its record holds,
+  // unless another repository still tags it: identical builds share an ID.
+  for (const imageId of teardown.recordedImages) {
+    const inspected = await execute('docker', ['image', 'inspect', '--format', '{{json .RepoTags}}', imageId], tools);
+    if (inspected.outcome.exitCode !== 0) {
+      if (/No such image/iu.test(inspected.outcome.stderr)) continue;
+      throw commandExitError(inspected.command, inspected.outcome);
+    }
+    if (imageTags(inspected.outcome.stdout).length > 0) continue;
+    await checked('docker', ['image', 'rm', imageId], tools);
   }
 }
 
@@ -777,6 +896,7 @@ async function removeOnecli(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
   runtime: LocalRuntime,
+  run: SanitizedCommandOutcomeRunner,
 ): Promise<void> {
   await removeOnecliRuntime(
     createOnecliRuntimeLayout({
@@ -788,6 +908,7 @@ async function removeOnecli(
       cliExecutable: runtime.onecliCliPath ?? (await resolveExecutable('onecli')),
       dockerEndpoint: runtime.dockerEndpoint,
     }),
+    { dockerCommandRunner: checkedRunner(run) },
   );
 }
 
@@ -863,7 +984,8 @@ async function removeLocked(
   };
 
   // Everything below reads; nothing changes until the receipt is written.
-  await assertOwnCheckouts(paths, reservation);
+  const operation = await readUnfinishedOperation(paths, instanceId);
+  await assertOwnCheckouts(paths, reservation, operation);
   const provisioning = await readProvisioningRecord(paths, instanceId);
   const recorded = await readRecordedRuntime(paths, reservation);
   // Released last, so a released reservation left only local files and the receipt behind.
@@ -898,19 +1020,19 @@ async function removeLocked(
     dockerEndpoint: await docker(),
     onecliCliPath: recorded.onecliCliPath,
   });
+  const run = dependencies.runCommand ?? runSanitizedCommandOutcome;
   const serviceHelpers = dependencies.serviceHelpers;
   const uninstall =
     dependencies.uninstallNanoclaw ??
     (serviceHelpers
       ? (removed: InstanceReservation, runtime: LocalRuntime) =>
-          uninstallNanoclaw(
-            removed,
-            runtime,
+          uninstallNanoclaw(removed, runtime, {
             platform,
-            dependencies.runCommand ?? runSanitizedCommandOutcome,
-            dependencies.sleep ?? delay,
+            run,
+            sleep: dependencies.sleep ?? delay,
             serviceHelpers,
-          )
+            recordedImages: recordedAgentImages(operation),
+          })
       : undefined);
   /** Only the launcher supplies NanoClaw's service helpers, so removal refuses before any change without them. */
   const requireUninstall = (): NonNullable<typeof uninstall> => {
@@ -1030,7 +1152,7 @@ async function removeLocked(
       const runtime = await localRuntime();
       await (dependencies.removeOnecli
         ? dependencies.removeOnecli(reservation, runtime)
-        : removeOnecli(paths, reservation, runtime));
+        : removeOnecli(paths, reservation, runtime, run));
       return undefined;
     },
     'instance-files': async () => {
