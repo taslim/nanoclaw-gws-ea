@@ -52,6 +52,7 @@ import {
   planFollowUps,
   quietCheckoutOf,
   removeUpdateStaging,
+  reverseSwapBeforeLiveMoved,
   settleCheckoutDatabases,
   stagedKeptFilesRoot,
   stopCutoverHost,
@@ -91,7 +92,7 @@ import { CONTROL_PLANE_ROOT, instanceMarkerFile, isRegularFile, type ControlPlan
 import { LAUNCHER_PINS } from './pins.js';
 import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { instanceOnecliLayout, readDeployedSetup, writeReleasePreflightReceipt } from './provision.js';
-import { safeErrorMessage } from './redact.js';
+import { redact, safeErrorMessage } from './redact.js';
 import { getInstanceReservation } from './registry.js';
 import { runReleasePreflight } from './release-preflight.js';
 import { resolveReleaseTarget, type ToolProviderSetup, type UpdateReleaseTarget } from './release-target.js';
@@ -773,18 +774,60 @@ export interface FailedCutover {
   /** The update's record as the failure left it: its phase says how far the cutover got. */
   readonly record: OperationRecord;
   readonly cause: unknown;
+  /** The host the cutover opened, whose service recovery may start again; absent when it failed before that. */
+  readonly host?: CutoverHost;
 }
 
 /** From here on the assistant ran the update's release, so a failure rolls it back (R14). */
 const RENAMED: ReadonlySet<OperationRecord['phase']> = new Set(['swapped', 'started', 'verified']);
 
+/** What recovery did with the host of the release an update never swapped out. */
+type OutgoingHost =
+  | { readonly kind: 'serving' }
+  | { readonly kind: 'stopped'; readonly failure: unknown }
+  | { readonly kind: 'left' };
+
+/**
+ * Start the old release's host again after a failure before the swap moved
+ * the live checkout, so the assistant keeps serving: the live checkout still
+ * holds that release whole, and continuing the update stops it, proves it
+ * quiet, and carries its state again, so nothing it records meanwhile is lost
+ * (KTD2). A swap cut short is first taken back to `stopped`. Once the live
+ * checkout moved, only finishing or reverting the swap puts a release there,
+ * so the host is left as it is.
+ */
+async function resumeOutgoingHost(host: CutoverHost, record: OperationRecord): Promise<OutgoingHost> {
+  const { operation, dependencies } = host;
+  try {
+    if (record.phase === 'swapping') {
+      const reversed = await reverseSwapBeforeLiveMoved(
+        operation.paths,
+        operation.instanceId,
+        { from: record.from.deployed_commit, to: record.to.deployed_commit },
+        dependencies.rename ? { rename: dependencies.rename } : {},
+      );
+      if (!reversed) return { kind: 'left' };
+      await advanceOperation(operation, 'stopped');
+    }
+    await runStep(host.reporter, { id: 'start_outgoing', label: 'Starting the assistant again…' }, () =>
+      host.service.start(),
+    );
+    return { kind: 'serving' };
+    // eslint-disable-next-line no-catch-all/no-catch-all -- NanoClaw's service helpers fail with plain errors; the operator is told the assistant is stopped, and why.
+  } catch (error) {
+    return { kind: 'stopped', failure: error };
+  }
+}
+
 /**
  * Recovery for an update that failed before its release was recorded (R14).
  * Once its renames ran, the update is rolled back by R13's rule, which its own
  * confirmation covers: code only when neither schema moved, else the snapshot
- * its stop left. Before that nothing ran on the release, so the record stays
- * open and the failure names the commands that continue or revert it. Either
- * way the failure is reported, with where the assistant was left.
+ * its stop left. Before that nothing ran on the release: the old release's
+ * host is started again (see `resumeOutgoingHost`), the record stays open
+ * with its staging, and the failure names the commands that continue or
+ * revert it. Either way the failure is reported, with where the assistant was
+ * left.
  */
 export async function recoverUpdate(
   operation: InstanceOperation,
@@ -813,11 +856,34 @@ export async function recoverUpdate(
     });
   }
   const next = operationNextSteps(record);
-  throw new GwsEaError(
-    'update_interrupted',
-    `${failure} and is unfinished: continue it with ${next.continueWith}${revertClause(next)}.`,
-    { cause, details: { ...details, continueWith: next.continueWith, revertWith: next.revertWith ?? null } },
-  );
+  const unfinished = { ...details, continueWith: next.continueWith, revertWith: next.revertWith ?? null };
+  const outgoing: OutgoingHost = failed.host ? await resumeOutgoingHost(failed.host, record) : { kind: 'left' };
+  const from = releaseLine(record.from);
+  switch (outgoing.kind) {
+    case 'serving':
+      throw new GwsEaError(
+        'update_interrupted',
+        `${failure}, before its swap; the assistant runs ${from}, and the update is unfinished: continue it with ${next.continueWith}${revertClause(next)}.`,
+        { cause, details: unfinished },
+      );
+    case 'stopped': {
+      // NanoClaw's service helpers report why they failed as a plain error, so its text is shown, redacted.
+      const reason = outgoing.failure instanceof Error ? outgoing.failure.message : String(outgoing.failure);
+      const discard = next.revertWith ? `, or discard it and start ${from} again with ${next.revertWith}` : '';
+      throw new GwsEaError(
+        'update_interrupted',
+        `${failure}, before its swap, and starting ${from} again failed: ${redact(reason).replace(/\.$/u, '')}. ` +
+          `Assistant ${record.instance_id} is stopped: continue the update with ${next.continueWith}${discard}.`,
+        { cause, details: unfinished },
+      );
+    }
+    case 'left':
+      throw new GwsEaError(
+        'update_interrupted',
+        `${failure} and is unfinished: continue it with ${next.continueWith}${revertClause(next)}.`,
+        { cause, details: unfinished },
+      );
+  }
 }
 
 /** What every update cutover phase works from, read once per run. */
@@ -1081,9 +1147,27 @@ async function verifyRelease(cutover: Cutover, record: OperationRecord): Promise
   return advanceOperation(cutover.operation, 'verified');
 }
 
+/**
+ * Go on with a swap an earlier run left under way (KTD2). One cut short
+ * before it moved the live checkout is taken back to `stopped`, since the OS
+ * may have started the old host from the live path since: its stop,
+ * quiescence proof, and carry run again, unconditionally. One that moved it
+ * is finished.
+ */
+async function resumeSwap(cutover: Cutover, record: OperationRecord): Promise<OperationRecord> {
+  const { operation, dependencies } = cutover;
+  const reversed = await reverseSwapBeforeLiveMoved(
+    operation.paths,
+    operation.instanceId,
+    cutover.releases,
+    dependencies.rename ? { rename: dependencies.rename } : {},
+  );
+  return reversed ? advanceOperation(operation, 'stopped') : record;
+}
+
 /** Run the cutover from the phase its record reached until the release is recorded. */
 async function runCutover(cutover: Cutover, start: OperationRecord): Promise<void> {
-  let record = start;
+  let record = start.phase === 'swapping' ? await resumeSwap(cutover, start) : start;
   for (;;) {
     switch (record.phase) {
       case 'staged':
@@ -1134,13 +1218,19 @@ export async function continueUpdate(
     throw new GwsEaError('operation_missing', `Assistant ${instanceId} has no update under way.`);
   }
   if (record.phase !== 'recorded') {
+    let cutover: Cutover | undefined;
     try {
-      await runCutover(await prepareCutover(operation, record, dependencies), record);
+      cutover = await prepareCutover(operation, record, dependencies);
+      await runCutover(cutover, record);
       // eslint-disable-next-line no-catch-all/no-catch-all -- Every failure before the commit point goes to recovery, which reports it.
     } catch (error) {
       return recoverUpdate(
         operation,
-        { record: (await readOperationRecord(paths, instanceId)) ?? record, cause: error },
+        {
+          record: (await readOperationRecord(paths, instanceId)) ?? record,
+          cause: error,
+          ...(cutover ? { host: cutover } : {}),
+        },
         dependencies,
       );
     }

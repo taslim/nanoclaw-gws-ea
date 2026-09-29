@@ -609,6 +609,26 @@ describe('a rollback in the operation record', () => {
     expect(await readOperationRecord(paths, instanceId)).toBeUndefined();
   });
 
+  it('drops the mode of a rollback whose swap is taken back to stopped, so it is decided again', async () => {
+    const { paths, instanceId } = await fixture();
+    await updateTo(paths, instanceId, 'recorded', []);
+    const operation = await held(paths, instanceId, { command: 'rollback' });
+    try {
+      await beginOperation(operation, { kind: 'rollback', from: TO, to: FROM });
+      await advanceOperation(operation, 'stopped', { stop: STOP });
+      await advanceOperation(operation, 'swapping', { mode: 'code_only', follow_ups: [REBUILD] });
+
+      const back = await advanceOperation(operation, 'stopped');
+
+      expect(back).toMatchObject({ phase: 'stopped', stop: STOP, follow_ups: [REBUILD] });
+      expect(back).not.toHaveProperty('mode');
+      expect(await readOperationRecord(paths, instanceId)).not.toHaveProperty('mode');
+      expect(await advanceOperation(operation, 'swapping', { mode: 'snapshot' })).toMatchObject({ mode: 'snapshot' });
+    } finally {
+      operation.release();
+    }
+  });
+
   it('gives back the unrecorded update a withdrawn rollback replaced, and refuses once its swap began', async () => {
     const { paths, instanceId } = await fixture();
     await updateTo(paths, instanceId, 'swapped');

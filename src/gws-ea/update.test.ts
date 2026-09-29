@@ -33,6 +33,7 @@ import {
   IMAGE_BYTES,
   imageBase,
   imageId,
+  installLabel,
   killDuringCutover,
   LIVE_MIGRATIONS,
   liveState,
@@ -119,9 +120,9 @@ async function killDuringStaging(host: Machine, runtime: InstanceRuntimeConfig, 
     target: intent.target,
   });
   if (!operation) throw new Error('The test instance operation was busy');
-  const reached = new Promise<void>((resolve) => (state.reached = resolve));
-  const abandoned = prepareUpdate(operation, intent, deps);
-  await Promise.race([reached, abandoned]);
+  const reached = new Promise<'killed'>((resolve) => (state.reached = () => resolve('killed')));
+  const abandoned = prepareUpdate(operation, intent, deps).then(() => 'finished' as const);
+  expect(await Promise.race([reached, abandoned])).toBe('killed');
   operation.release();
 }
 
@@ -311,21 +312,6 @@ describe('staging an update while the assistant serves', GIT_HEAVY, () => {
     );
     expect(await exists(host.paths.releaseRoot(runtime.instance_id, 'next'))).toBe(false);
     expect(state.preflights).toEqual([]);
-  });
-
-  it('refuses a stopped assistant, naming gws-ea start, and stages nothing', async () => {
-    const host = await machine();
-    const runtime = await assistant(host);
-    const next = await nextRelease(host);
-    const state = world(runtime);
-    state.running = false;
-
-    await expect(stage(host, runtime, dependencies(state, next, runtime))).rejects.toMatchObject({
-      code: 'host_not_running',
-      message: expect.stringContaining(`gws-ea start --id ${runtime.instance_id}`),
-    });
-
-    expect(await exists(host.paths.releaseRoot(runtime.instance_id, 'next'))).toBe(false);
   });
 
   it.each(['build', 'migrate'] as const)(
@@ -697,6 +683,64 @@ describe('an update killed during its cutover', GIT_HEAVY, () => {
     expect(messages(host.paths.releaseCheckoutRoot(runtime.instance_id, 'previous'))).toEqual(['m1', 'm2']);
   });
 
+  it.each([
+    ["at the swap's first rename", 1],
+    ['once the kept files moved into previous/', 2],
+  ] as const)(
+    'carries again what a host the OS started records once killed %s, before the live checkout moved',
+    async (_label, at) => {
+      const host = await machine();
+      const runtime = await assistant(host);
+      await converse(runtime, 'm1');
+      const next = await nextRelease(host);
+      const state = world(runtime);
+      const ran = state.tags.get(`${imageBase(runtime)}:latest`)!;
+      state.renameKill = at;
+      await killDuringCutover(host, runtime, state, next);
+      expect((await readOperationRecord(host.paths, runtime.instance_id))?.phase).toBe('swapping');
+
+      // The OS starts the old host again from the live path, which the swap had not moved, and it serves a message.
+      state.running = true;
+      await converse(runtime, 'm2');
+      delete state.renameKill;
+
+      expect(await cli(host, state, next, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
+
+      await expectUpdated(host, runtime, next, state, ran);
+      expect(messages(runtime.checkout_realpath)).toEqual(['m1', 'm2']);
+      expect(messages(host.paths.releaseCheckoutRoot(runtime.instance_id, 'previous'))).toEqual(['m1', 'm2']);
+    },
+  );
+
+  it('carries again what a host the OS started records once killed after setting an older previous release aside', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    await converse(runtime, 'm1');
+    const first = await nextRelease(host);
+    const state = world(runtime);
+    expect(await cli(host, state, first, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
+    const second = await nextRelease(host);
+    // The swap's first rename sets the kept release aside; it is killed at its second.
+    state.renameKill = 2;
+    await killDuringCutover(host, runtime, state, second);
+    const id = runtime.instance_id;
+    expect(await exists(host.paths.releaseRoot(id, 'superseded'))).toBe(true);
+    state.running = true;
+    await converse(runtime, 'm2');
+    delete state.renameKill;
+
+    expect(await cli(host, state, second, runtime).run(['update', '--id', id, '--yes'])).toBe(0);
+
+    expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, second.commit));
+    expect(git(runtime.checkout_realpath, 'rev-parse', 'HEAD')).toBe(second.commit);
+    expect(messages(runtime.checkout_realpath)).toEqual(['m1', 'm2']);
+    const previous = host.paths.releaseCheckoutRoot(id, 'previous');
+    expect(git(previous, 'rev-parse', 'HEAD')).toBe(first.commit);
+    expect(messages(previous)).toEqual(['m1', 'm2']);
+    expect(await exists(host.paths.releaseRoot(id, 'superseded'))).toBe(false);
+    expect(await readOperationRecord(host.paths, id)).toBeUndefined();
+  });
+
   it('stops a host the OS started at swapped before it moves any image, then starts the release again', async () => {
     const host = await machine();
     const runtime = await assistant(host);
@@ -719,52 +763,142 @@ describe('an update killed during its cutover', GIT_HEAVY, () => {
   });
 });
 
+/** The central database's side files, which a stop's checkpoint folds away and SQLite recreates on every open. */
+function centralSideFiles(checkout: string): string[] {
+  return ['-wal', '-shm'].map((suffix) => path.join(checkout, 'data', `v2.db${suffix}`));
+}
+
 describe('the cutover refuses to go on', GIT_HEAVY, () => {
-  it("when the live database's migrations changed since staging, before recording the stop", async () => {
+  it("when the live database's migrations changed since staging, before recording the stop, serving the old release again", async () => {
     const host = await machine();
     const runtime = await assistant(host);
+    await converse(runtime, 'm1');
     const next = await nextRelease(host);
     const state = world(runtime, applying(ADDED_MIGRATION));
+    const ran = state.tags.get(`${imageBase(runtime)}:latest`)!;
     state.hangAt = 'stop';
     await killDuringCutover(host, runtime, state, next);
     // Something migrated the live database while the update waited to stop it.
     applying(FAILING_MIGRATION)(path.join(runtime.checkout_realpath, 'data', 'v2.db'));
     delete state.hangAt;
+    const id = runtime.instance_id;
+    const live = runtime.checkout_realpath;
+    const staging = host.paths.releaseRoot(id, 'next');
+    const liveBefore = await snapshot(live, centralSideFiles(live));
+    const stagingBefore = await snapshot(staging);
     const { run, err } = cli(host, state, next, runtime);
 
-    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
+    expect(await run(['update', '--id', id, '--yes'])).toBe(1);
 
-    expect(err.join('\n')).toContain(FAILING_MIGRATION);
-    expect(err.join('\n')).toContain(`gws-ea rollback --id ${runtime.instance_id}`);
-    expect((await readOperationRecord(host.paths, runtime.instance_id))?.phase).toBe('staged');
-    expect(await exists(path.join(host.paths.releaseCheckoutRoot(runtime.instance_id, 'next'), SESSION))).toBe(false);
+    const summary = err.join('\n');
+    expect(summary).toContain(FAILING_MIGRATION);
+    expect(summary).toContain(`gws-ea update --id ${id}`);
+    expect(summary).toContain(`gws-ea rollback --id ${id}`);
+    // The old release serves again at once; the staging waits with its record, and the live state is as it was.
+    expect(state.running).toBe(true);
+    expect((await readOperationRecord(host.paths, id))?.phase).toBe('staged');
+    expect(await snapshot(staging)).toEqual(stagingBefore);
+    expect(await snapshot(live, centralSideFiles(live))).toEqual(liveBefore);
+
+    // Its dry run no longer speaks for the live database: rollback discards the staging, and a new update stages again.
+    expect(await run(['rollback', '--id', id, '--yes'])).toBe(0);
+    expect(await exists(staging)).toBe(false);
+    expect(state.running).toBe(true);
+    expect(await run(['update', '--id', id, '--yes'])).toBe(0);
+    await expectUpdated(host, runtime, next, state, ran);
+    expect(messages(live)).toEqual(['m1']);
   });
 
-  it('when anything still holds its data open, before copying or moving anything', async () => {
+  it('when anything still holds its data open, before copying or moving anything, serving the old release again', async () => {
     const host = await machine();
     const runtime = await assistant(host);
     await converse(runtime, 'm1');
     const next = await nextRelease(host);
     const state = world(runtime);
+    const ran = state.tags.get(`${imageBase(runtime)}:latest`)!;
     const live = runtime.checkout_realpath;
     const before = await snapshot(live);
     // A leftover opener, idle: an operator's sqlite3 shell on a session database.
     state.openFiles = `p4242\ncsqlite3\nf5\nn${path.join(live, SESSION, 'inbound.db')}\n`;
     const { run, err } = cli(host, state, next, runtime);
+    const id = runtime.instance_id;
 
-    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
+    expect(await run(['update', '--id', id, '--yes'])).toBe(1);
 
     const summary = err.join('\n');
     expect(summary).toContain(`sqlite3 (PID 4242) holds ${path.join(live, SESSION, 'inbound.db')}`);
-    expect(summary).toContain(`gws-ea rollback --id ${runtime.instance_id}`);
-    expect((await readOperationRecord(host.paths, runtime.instance_id))?.phase).toBe('staged');
-    // Nothing was copied, settled, or moved.
+    expect(summary).toContain(`gws-ea update --id ${id}`);
+    expect(summary).toContain(`gws-ea rollback --id ${id}`);
+    expect(state.running).toBe(true);
+    expect((await readOperationRecord(host.paths, id))?.phase).toBe('staged');
+    // Nothing was copied, settled, or moved; the staging waits as it was built.
     expect(await snapshot(live)).toEqual(before);
-    const staged = host.paths.releaseCheckoutRoot(runtime.instance_id, 'next');
+    const staged = host.paths.releaseCheckoutRoot(id, 'next');
+    expect(git(staged, 'rev-parse', 'HEAD')).toBe(next.commit);
     expect(await exists(path.join(staged, SESSION))).toBe(false);
-    expect(await exists(path.join(host.paths.releaseRoot(runtime.instance_id, 'next'), 'carrying'))).toBe(false);
-    expect(await exists(host.paths.releaseRoot(runtime.instance_id, 'previous'))).toBe(false);
-    expect(releaseOf(await getInstanceReservation(host.paths, runtime.instance_id))).toEqual(release(host, host.first));
+    expect(await exists(path.join(host.paths.releaseRoot(id, 'next'), 'carrying'))).toBe(false);
+    expect(await exists(host.paths.releaseRoot(id, 'previous'))).toBe(false);
+    expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, host.first));
+
+    // Once it lets go, the update goes on from its record, staging nothing again.
+    state.openFiles = '';
+    expect(await run(['update', '--id', id, '--yes'])).toBe(0);
+    expect(state.preflights).toHaveLength(1);
+    await expectUpdated(host, runtime, next, state, ran);
+    expect(messages(live)).toEqual(['m1']);
+  });
+
+  it('when a container of its install outlives the drain, before copying anything, serving the old release again', async () => {
+    const host = await machine();
+    const a = await assistant(host, 37_001);
+    const b = await assistant(host, 37_101);
+    await converse(a, 'm1');
+    const next = await nextRelease(host);
+    const state = world(a);
+    const ran = state.tags.get(`${imageBase(a)}:latest`)!;
+    // Another assistant's agents run on, which is no concern of A's; one of A's own stays after the drain.
+    state.containers.set(installLabel(b), ['b0b0b0b0b0b0']);
+    state.containers.set(installLabel(a), ['a0a0a0a0a0a0']);
+    const live = a.checkout_realpath;
+    const before = await snapshot(live);
+    const { run, err } = cli(host, state, next, a);
+    const id = a.instance_id;
+
+    expect(await run(['update', '--id', id, '--yes'])).toBe(1);
+
+    expect(err.join('\n')).toContain("containers a0a0a0a0a0a0 still carry its install's label");
+    expect(state.running).toBe(true);
+    expect((await readOperationRecord(host.paths, id))?.phase).toBe('staged');
+    expect(await snapshot(live)).toEqual(before);
+    expect(await exists(path.join(host.paths.releaseCheckoutRoot(id, 'next'), SESSION))).toBe(false);
+
+    // Once it is gone, the update goes on.
+    state.containers.delete(installLabel(a));
+    expect(await run(['update', '--id', id, '--yes'])).toBe(0);
+    await expectUpdated(host, a, next, state, ran);
+  });
+
+  it('says the assistant is stopped, naming what brings it back, when starting the old release again fails too', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    const live = runtime.checkout_realpath;
+    state.openFiles = `p4242\ncsqlite3\nf5\nn${path.join(live, 'data', 'v2.db')}\n`;
+    state.startFails = true;
+    const { run, err } = cli(host, state, next, runtime);
+    const id = runtime.instance_id;
+
+    expect(await run(['update', '--id', id, '--yes'])).toBe(1);
+
+    const summary = err.join('\n');
+    expect(summary).toContain(`sqlite3 (PID 4242) holds ${path.join(live, 'data', 'v2.db')}`);
+    expect(summary).toContain('Bootstrap failed: 5: Input/output error');
+    expect(summary).toContain(`Assistant ${id} is stopped`);
+    expect(summary).toContain(`gws-ea update --id ${id}`);
+    expect(summary).toContain(`gws-ea rollback --id ${id}`);
+    expect(state.running).toBe(false);
+    expect((await readOperationRecord(host.paths, id))?.phase).toBe('staged');
   });
 
   it('when something opens its data after the carry, just before the first rename, moving nothing', async () => {
@@ -784,18 +918,81 @@ describe('the cutover refuses to go on', GIT_HEAVY, () => {
 
     expect(err.join('\n')).toContain(`node (PID 5150) holds ${path.join(live, 'data', 'v2.db')}`);
     const id = runtime.instance_id;
-    expect((await readOperationRecord(host.paths, id))?.phase).toBe('swapping');
+    // The swap never moved the live checkout, so the old release serves again and the update goes back to its stop.
+    expect(state.running).toBe(true);
+    expect((await readOperationRecord(host.paths, id))?.phase).toBe('stopped');
     expect(git(live, 'rev-parse', 'HEAD')).toBe(host.first);
     expect(git(host.paths.releaseCheckoutRoot(id, 'next'), 'rev-parse', 'HEAD')).toBe(next.commit);
     expect(await exists(host.paths.releaseRoot(id, 'previous'))).toBe(false);
 
-    // Once it lets go, the update goes on from its record.
+    // Once it lets go, the update stops the old release again and carries what it recorded meanwhile.
     state.openFiles = '';
     delete state.onStamp;
+    await converse(runtime, 'm2');
     expect(await run(['update', '--id', id, '--yes'])).toBe(0);
     await expectUpdated(host, runtime, next, state, ran);
-    expect(messages(live)).toEqual(['m1']);
+    expect(messages(live)).toEqual(['m1', 'm2']);
   });
+
+  it.each([
+    [
+      'its listener answers with another listener ID',
+      DEPLOYED_GATEWAY,
+      (state: World, failing: boolean): void => {
+        state.listenerAnswer = failing ? '22222222-2222-4222-8222-222222222222' : undefined;
+      },
+    ],
+    [
+      'OneCLI is not present, its gateway unchanged',
+      RELEASE_GATEWAY,
+      (state: World, failing: boolean): void => {
+        state.onecliObservation = failing ? { status: 'absent', reason: 'the gateway is not running' } : undefined;
+      },
+    ],
+    [
+      'OneCLI fails its checks on the gateway it changed',
+      DEPLOYED_GATEWAY,
+      (state: World, failing: boolean): void => {
+        state.onecliVerifyFails = failing;
+      },
+    ],
+    [
+      'its host answers without its webhook port',
+      DEPLOYED_GATEWAY,
+      (state: World, failing: boolean): void => {
+        state.webhookPort = failing ? 38_999 : undefined;
+      },
+    ],
+    [
+      'its route is down',
+      DEPLOYED_GATEWAY,
+      (state: World, failing: boolean): void => {
+        state.routeDown = failing;
+      },
+    ],
+  ] as const)(
+    'when the new release serves but %s, recording nothing and rolling back',
+    async (_label, gateway, fail) => {
+      const host = await machine();
+      const runtime = await assistant(host, 37_001, gateway);
+      const next = await nextRelease(host);
+      const state = world(runtime);
+      // Only the new release fails; the one the rollback restores serves.
+      state.onStart = (checkout) => fail(state, git(checkout, 'rev-parse', 'HEAD') === next.commit);
+      const { run, err } = cli(host, state, next, runtime);
+
+      expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
+
+      expect(err.join('\n')).toContain(`The update to dogfood ${next.commit.slice(0, 12)} stopped at started`);
+      expect(err.join('\n')).toContain('so it was rolled back');
+      expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();
+      expect(releaseOf(await getInstanceReservation(host.paths, runtime.instance_id))).toEqual(
+        release(host, host.first),
+      );
+      expect(git(runtime.checkout_realpath, 'rev-parse', 'HEAD')).toBe(host.first);
+      expect(state.running).toBe(true);
+    },
+  );
 
   it('when the host answers while the live checkout is not at the target, recording nothing and rolling back', async () => {
     const host = await machine();
@@ -898,6 +1095,47 @@ describe('gws-ea update', GIT_HEAVY, () => {
     expect(await readFile(path.join(live, PERSONA), 'utf8')).toBe(stampedPersona('1'));
   });
 
+  it('moves the assistant to another track and repository that holds the release, and rollback moves it back (AE1)', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    await converse(runtime, 'm1');
+    const id = runtime.instance_id;
+    const live = runtime.checkout_realpath;
+    // A mirror of the release repository, whose own track carries a release the original does not.
+    const mirror = path.join(host.root, 'mirror.git');
+    git(host.root, 'clone', '--quiet', '--bare', host.remote, mirror);
+    git(mirror, 'config', 'uploadpack.allowFilter', 'true');
+    const next = await nextRelease(host, {}, { remote: mirror, branch: 'canary' });
+    const state = world(runtime);
+    const registered = await getInstanceReservation(host.paths, id);
+    const agentGroups = (): unknown[] => {
+      const database = new Database(path.join(live, 'data', 'v2.db'), { readonly: true });
+      try {
+        return database.prepare('SELECT * FROM agent_groups ORDER BY id').all();
+      } finally {
+        database.close();
+      }
+    };
+    const groups = agentGroups();
+    const memory = await readFile(path.join(live, MEMORY), 'utf8');
+    const { run } = cli(host, state, next, runtime);
+
+    expect(await run(['update', '--id', id, '--track', 'canary', '--source-remote', mirror, '--yes'])).toBe(0);
+
+    // Only the release moved: the instance, its ports and claims, and everything it recorded are as they were.
+    const moved = { source_remote: mirror, release_track: 'canary', deployed_commit: next.commit };
+    expect(await getInstanceReservation(host.paths, id)).toEqual({ ...registered, ...moved });
+    expect(git(live, 'rev-parse', 'HEAD')).toBe(next.commit);
+    expect(messages(live)).toEqual(['m1']);
+    expect(await readFile(path.join(live, MEMORY), 'utf8')).toBe(memory);
+    expect(agentGroups()).toEqual(groups);
+
+    expect(await run(['rollback', '--id', id, '--yes'])).toBe(0);
+
+    expect(await getInstanceReservation(host.paths, id)).toEqual(registered);
+    expect(git(live, 'rev-parse', 'HEAD')).toBe(host.first);
+  });
+
   it("allows a killed host's claim lease when the stop was not graceful", async () => {
     const host = await machine();
     const runtime = await assistant(host);
@@ -978,6 +1216,42 @@ describe('gws-ea update', GIT_HEAVY, () => {
     );
   });
 
+  it.each([
+    ['is recorded', false],
+    ['fails its checks and is rolled back', true],
+  ] as const)(
+    'deletes no image a tag still names when an update whose builds reuse cached images %s',
+    async (_label, fails) => {
+      const host = await machine();
+      const runtime = await assistant(host);
+      const id = runtime.instance_id;
+      const first = await nextRelease(host);
+      const state = world(runtime);
+      expect(await cli(host, state, first, runtime).run(['update', '--id', id, '--yes'])).toBe(0);
+      const base = imageBase(runtime);
+      const tagged = () =>
+        Object.fromEntries(['latest', 'previous', 'ag-research'].map((tag) => [tag, state.tags.get(`${base}:${tag}`)]));
+      const before = tagged();
+      // Nothing the agent images are built from changed, so Docker hands back the images it already has.
+      state.cachedBuild = true;
+      state.cachedRebuild = true;
+      const second = await nextRelease(host);
+      if (fails) {
+        state.onStart = (checkout) => {
+          if (git(checkout, 'rev-parse', 'HEAD') === second.commit) state.running = false;
+        };
+      }
+
+      expect(await cli(host, state, second, runtime).run(['update', '--id', id, '--yes'])).toBe(fails ? 1 : 0);
+
+      expect(git(runtime.checkout_realpath, 'rev-parse', 'HEAD')).toBe(fails ? first.commit : second.commit);
+      expect(await readOperationRecord(host.paths, id)).toBeUndefined();
+      const after = tagged();
+      expect(after).toEqual(fails ? before : { ...before, previous: before.latest });
+      for (const image of Object.values(after)) expect(state.ids.has(image!)).toBe(true);
+    },
+  );
+
   it("updates one assistant without touching another's checkout, state, service, images, OneCLI, or connector", async () => {
     const host = await machine();
     const a = await assistant(host, 37_001);
@@ -989,6 +1263,7 @@ describe('gws-ea update', GIT_HEAVY, () => {
     state.ids.add(bLatest);
     const bRegistered = await getInstanceReservation(host.paths, b.instance_id);
     const bFiles = await snapshot(host.paths.instanceRoot(b.instance_id));
+    const gateway = state.tags.get(DEPLOYED_GATEWAY)!;
 
     expect(await cli(host, state, next, a).run(['update', '--id', a.instance_id, '--yes'])).toBe(0);
 
@@ -1013,6 +1288,9 @@ describe('gws-ea update', GIT_HEAVY, () => {
     expect(await getInstanceReservation(host.paths, b.instance_id)).toEqual(bRegistered);
     expect(await snapshot(host.paths.instanceRoot(b.instance_id))).toEqual(bFiles);
     expect(state.tags.get(`${imageBase(b)}:latest`)).toBe(bLatest);
+    // The gateway image A moved off stays, as built: B, or a rollback, may run it.
+    expect(state.tags.get(DEPLOYED_GATEWAY)).toBe(gateway);
+    expect(state.ids.has(gateway)).toBe(true);
   });
 
   it('asks on a terminal with the preview, and a decline leaves no record and removes the staging', async () => {
@@ -1053,7 +1331,7 @@ describe('gws-ea update', GIT_HEAVY, () => {
     expect(await exists(host.paths.releaseRoot(runtime.instance_id, 'next'))).toBe(false);
   });
 
-  it('refuses a stopped assistant naming gws-ea start, without offering to retry the update', async () => {
+  it('refuses a stopped assistant naming gws-ea start, staging nothing, and without offering to retry the update', async () => {
     const host = await machine();
     const runtime = await assistant(host);
     const next = await nextRelease(host);
@@ -1066,6 +1344,8 @@ describe('gws-ea update', GIT_HEAVY, () => {
     const summary = err.join('\n');
     expect(summary).toContain(`gws-ea start --id ${runtime.instance_id}`);
     expect(summary).not.toContain('Retry with');
+    expect(await exists(host.paths.releaseRoot(runtime.instance_id, 'next'))).toBe(false);
+    expect(state.running).toBe(false);
   });
 
   it('refuses to start another update while one to a different release is unfinished, naming what continues it', async () => {

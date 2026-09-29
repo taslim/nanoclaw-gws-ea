@@ -51,9 +51,9 @@ import {
   type World,
 } from './testing/cutover-fixture.js';
 import { acquireInstanceOperation } from './journal.js';
-import { readOperationRecord, type OperationPhase, type OperationRecord } from './operation.js';
+import { advanceOperation, readOperationRecord, type OperationPhase, type OperationRecord } from './operation.js';
 import { instanceMarkerFile } from './paths.js';
-import { getInstanceReservation } from './registry.js';
+import { getInstanceReservation, swapInstanceRelease } from './registry.js';
 import { rollBack, summarizeDiscard, type RollbackPreview } from './rollback.js';
 import type { InstanceRuntimeConfig } from './service.js';
 import { releaseOf } from './types.js';
@@ -339,17 +339,6 @@ function runtimeCompose(host: Machine, runtime: InstanceRuntimeConfig): string {
 }
 
 describe('gws-ea rollback of an update that moved a schema (AE6)', GIT_HEAVY, () => {
-  /** An update whose new host applies a migration to the live database when it starts, as NanoClaw's does. */
-  async function migratedAssistant() {
-    const updated = await updatedAssistantWith((state, _runtime, next) => {
-      state.onStart = (checkout) => {
-        if (startsAs(checkout, next.commit)) applying(ADDED_MIGRATION)(path.join(checkout, 'data', 'v2.db'));
-      };
-    });
-    await converse(updated.runtime, 'm2');
-    return updated;
-  }
-
   it('shows the snapshot time and what it discards, and refuses without --yes when nobody can be asked', async () => {
     const { host, runtime, next, state } = await migratedAssistant();
     const id = runtime.instance_id;
@@ -480,6 +469,20 @@ async function updatedAssistantWith(prepare: (state: World, runtime: InstanceRun
   prepare(state, runtime, next);
   expect(await cli(host, state, next, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
   return { host, runtime, next, state, images: { first, next: state.tags.get(`${imageBase(runtime)}:latest`)! } };
+}
+
+/**
+ * `updatedAssistant`, whose new host applies a migration to the live database
+ * when it starts, as NanoClaw's does, and then receives message `m2`.
+ */
+async function migratedAssistant() {
+  const updated = await updatedAssistantWith((state, _runtime, next) => {
+    state.onStart = (checkout) => {
+      if (startsAs(checkout, next.commit)) applying(ADDED_MIGRATION)(path.join(checkout, 'data', 'v2.db'));
+    };
+  });
+  await converse(updated.runtime, 'm2');
+  return updated;
 }
 
 describe('an update that fails after its swap (AE2, R14)', GIT_HEAVY, () => {
@@ -665,6 +668,41 @@ describe('gws-ea rollback refusals', GIT_HEAVY, () => {
     expect(await exists(path.join(host.paths.releaseRoot(id, 'previous'), 'state'))).toBe(false);
   });
 
+  it('gives up when something opens the live data just before the first rename, moving nothing, and starts it again', async () => {
+    const { host, runtime, next, state, images } = await updatedAssistant();
+    const id = runtime.instance_id;
+    const live = runtime.checkout_realpath;
+    await converse(runtime, 'm2');
+    const previous = host.paths.releaseCheckoutRoot(id, 'previous');
+    const kept = await contents(previous);
+    // Opened once the kept release is prepared: stamping its tripwire is the last of that.
+    state.onStamp = () => {
+      state.openFiles = `p5150\ncnode\nf9\nn${path.join(live, 'data', 'v2.db')}\n`;
+    };
+    const { run, err } = cli(host, state, next, runtime);
+
+    expect(await run(['rollback', '--id', id, '--yes'])).toBe(1);
+
+    const summary = err.join('\n');
+    expect(summary).toContain(`node (PID 5150) holds ${path.join(live, 'data', 'v2.db')}`);
+    expect(summary).toContain(
+      `stopped before changing anything, and the assistant stays on dogfood ${next.commit.slice(0, 12)}`,
+    );
+    expect(await readOperationRecord(host.paths, id)).toBeUndefined();
+    expect(state.running).toBe(true);
+    expect(commitOf(live)).toBe(next.commit);
+    expect(messages(live)).toEqual(['m1', 'm2']);
+    expect(await contents(previous)).toEqual(kept);
+    expect(await exists(host.paths.releaseCheckoutRoot(id, 'outgoing'))).toBe(false);
+
+    // Once it lets go, the rollback runs.
+    state.openFiles = '';
+    delete state.onStamp;
+    expect(await run(['rollback', '--id', id, '--yes'])).toBe(0);
+    await expectRolledBack(host, runtime, next, state, images.first);
+    expect(messages(live)).toEqual(['m1', 'm2']);
+  });
+
   it('refuses an assistant that keeps no previous release, without offering to retry', async () => {
     const host = await machine();
     const runtime = await assistant(host);
@@ -756,23 +794,139 @@ describe('a rollback killed partway', GIT_HEAVY, () => {
     },
   );
 
-  it('re-stops a host the OS started at stopped, and carries the messages it received since', async () => {
+  it.each(['verified', 'committed to the registry'] as const)(
+    'killed once %s, is recorded and finished by rollback without verifying again',
+    async (point) => {
+      const { host, runtime, next, state, images } = await updatedAssistant();
+      const id = runtime.instance_id;
+      state.hangAt = 'verify';
+      await killDuringRollback(host, runtime, state, next);
+      // The process got past verification and recorded it, then (for the second case) moved the registry too.
+      const operation = await acquireInstanceOperation(host.paths, id, { command: 'rollback' });
+      if (!operation) throw new Error('The test instance operation was busy');
+      try {
+        await advanceOperation(operation, 'verified');
+      } finally {
+        operation.release();
+      }
+      if (point === 'committed to the registry') {
+        await swapInstanceRelease(host.paths, id, release(host, next.commit), release(host, host.first));
+      }
+      delete state.hangAt;
+      const checks = state.healthWaits.length;
+
+      expect(await cli(host, state, next, runtime).run(['rollback', '--id', id, '--yes'])).toBe(0);
+
+      expect(state.healthWaits).toHaveLength(checks);
+      await expectRolledBack(host, runtime, next, state, images.first);
+    },
+  );
+
+  it.each([
+    ['receives a message, and carries it', false],
+    ['also adds a session column, and restores the snapshot the schema now calls for', true],
+  ] as const)('re-stops a host the OS started at stopped that %s', async (_label, addsColumn) => {
     const { host, runtime, next, state, images } = await updatedAssistant();
     const id = runtime.instance_id;
+    const live = runtime.checkout_realpath;
     state.hangAt = 'stamp';
     await killDuringRollback(host, runtime, state, next);
     expect((await readOperationRecord(host.paths, id))?.phase).toBe('stopped');
     // The OS starts the release being left again (RunAtLoad), and it receives a message.
     state.running = true;
     await converse(runtime, 'm2');
+    if (addsColumn) addSessionColumn(live);
     delete state.hangAt;
     const stops = state.serviceCalls.filter((call) => call.startsWith('stop')).length;
+    const asked: RollbackPreview[] = [];
+    const { run } = cli(host, state, next, runtime, {
+      confirmRollback: async (preview) => {
+        asked.push(preview);
+        return true;
+      },
+    });
 
-    expect(await cli(host, state, next, runtime).run(['rollback', '--id', id, '--yes'])).toBe(0);
+    expect(await run(['rollback', '--id', id])).toBe(0);
 
     expect(state.serviceCalls.filter((call) => call.startsWith('stop')).length).toBeGreaterThan(stops);
     await expectRolledBack(host, runtime, next, state, images.first);
-    expect(messages(runtime.checkout_realpath)).toEqual(['m1', 'm2']);
+    // The mode is decided from the schema as the second stop found it, not as the first recorded it (KTD5).
+    if (addsColumn) {
+      expect(asked.map((preview) => preview.reason)).toEqual(['session_schema']);
+      expect(messages(live)).toEqual(['m1']);
+      const columns = rows(path.join(live, SESSION, 'inbound.db'), 'messages_in');
+      expect(Object.keys(columns[0] as object)).not.toContain('routed_by');
+    } else {
+      expect(asked).toEqual([]);
+      expect(messages(live)).toEqual(['m1', 'm2']);
+    }
+  });
+
+  it('carries again what a host the OS started records once killed at the first rename, before the live checkout moved', async () => {
+    const { host, runtime, next, state, images } = await updatedAssistant();
+    const id = runtime.instance_id;
+    await converse(runtime, 'm2');
+    state.renameKill = 1;
+    await killDuringRollback(host, runtime, state, next);
+    expect(await readOperationRecord(host.paths, id)).toMatchObject({ phase: 'swapping', mode: 'code_only' });
+    // The OS starts the release being left again from the live path, which the swap had not moved; it receives a message.
+    state.running = true;
+    await converse(runtime, 'm3');
+    delete state.renameKill;
+
+    expect(await cli(host, state, next, runtime).run(['rollback', '--id', id, '--yes'])).toBe(0);
+
+    await expectRolledBack(host, runtime, next, state, images.first);
+    expect(messages(runtime.checkout_realpath)).toEqual(['m1', 'm2', 'm3']);
+  });
+
+  it('decides and asks again once killed at the first rename, counting what a host the OS started recorded since', async () => {
+    const { host, runtime, next, state, images } = await migratedAssistant();
+    const id = runtime.instance_id;
+    state.renameKill = 1;
+    await killDuringRollback(host, runtime, state, next);
+    expect(await readOperationRecord(host.paths, id)).toMatchObject({ phase: 'swapping', mode: 'snapshot' });
+    state.running = true;
+    await converse(runtime, 'm3');
+    delete state.renameKill;
+    const asked: RollbackPreview[] = [];
+    const { run } = cli(host, state, next, runtime, {
+      confirmRollback: async (preview) => {
+        asked.push(preview);
+        return true;
+      },
+    });
+
+    expect(await run(['rollback', '--id', id])).toBe(0);
+
+    expect(asked.map((preview) => preview.discarded.inbound)).toEqual([{ count: 2, ids: ['m2', 'm3'] }]);
+    await expectRolledBack(host, runtime, next, state, images.first);
+    expect(messages(runtime.checkout_realpath)).toEqual(['m1']);
+    expect(messages(host.paths.releaseCheckoutRoot(id, 'outgoing'))).toEqual(['m1', 'm2', 'm3']);
+  });
+
+  it('refuses the snapshot it decides again once killed at the first rename when nobody can confirm it', async () => {
+    const { host, runtime, next, state } = await migratedAssistant();
+    const id = runtime.instance_id;
+    const previous = host.paths.releaseCheckoutRoot(id, 'previous');
+    const kept = await contents(previous);
+    state.renameKill = 1;
+    await killDuringRollback(host, runtime, state, next);
+    state.running = true;
+    await converse(runtime, 'm3');
+    delete state.renameKill;
+    const { run, out, err } = cli(host, state, next, runtime);
+
+    expect(await run(['rollback', '--id', id])).toBe(1);
+
+    expect(out.join('\n')).toContain('Inbound messages lost: 2 (m2, m3)');
+    expect(err.join('\n')).toContain('pass --yes');
+    // Given up as before its swap: the release it would leave runs on, and the kept release is as its update left it.
+    expect(await readOperationRecord(host.paths, id)).toBeUndefined();
+    expect(commitOf(runtime.checkout_realpath)).toBe(next.commit);
+    expect(messages(runtime.checkout_realpath)).toEqual(['m1', 'm2', 'm3']);
+    expect(await contents(previous)).toEqual(kept);
+    expect(state.running).toBe(true);
   });
 
   it('stops a host the OS started at swapped before it moves any image, then starts the restored release', async () => {

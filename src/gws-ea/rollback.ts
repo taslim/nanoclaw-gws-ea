@@ -13,10 +13,14 @@
  * the next update or removal (KTD19).
  *
  * Each phase is recorded as it completes, so a rollback cut short anywhere is
- * continued by the next `rollback --id`. One that fails once its swap began
- * goes back to the release it left, whole, and says so; after a code-only
- * failure the snapshot is offered instead. An update not yet swapped is not
- * rolled back but discarded, and its host started again.
+ * continued by the next `rollback --id`; one cut short before its swap moved
+ * the live checkout is decided and prepared again, since the release it
+ * leaves may have run from the live path since. One that fails once its swap
+ * moved the live checkout goes back to the release it left, whole, and says
+ * so; after a code-only failure the snapshot is offered instead. One that
+ * fails before is given up, and the release it would leave started again. An
+ * update not yet swapped is not rolled back but discarded, and its host
+ * started again.
  */
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
@@ -55,6 +59,7 @@ import {
   restoredReleaseRoot,
   restoreSetAsideState,
   reverseRollbackSwap,
+  reverseRollbackSwapBeforeLiveMoved,
   reverseSwap,
   setAsideState,
   setAsideStateRoot,
@@ -887,6 +892,24 @@ async function prepareRollback(rollback: Rollback, record: OperationRecord): Pro
 }
 
 /**
+ * Take a rollback's swap back to `stopped` when it never moved the live
+ * checkout, dropping its mode (see `reverseRollbackSwapBeforeLiveMoved`): the
+ * release it leaves may have run from the live path since, so the mode is
+ * decided, and the kept release prepared, again. Returns the record then, or
+ * undefined when the live checkout moved.
+ */
+async function unwindSwap(rollback: Rollback): Promise<OperationRecord | undefined> {
+  const { operation, dependencies } = rollback;
+  const reversed = await reverseRollbackSwapBeforeLiveMoved(
+    operation.paths,
+    operation.instanceId,
+    rollback.releases,
+    dependencies.rename ? { rename: dependencies.rename } : {},
+  );
+  return reversed ? advanceOperation(operation, 'stopped') : undefined;
+}
+
+/**
  * `swapping` → `swapped`: with the host stopped (again, in case the OS
  * started one) and the checkout at the live path proven quiet, swap the
  * releases from wherever an interrupted swap left them.
@@ -1062,7 +1085,12 @@ function returned(rollback: Rollback, mode: RollbackMode | undefined, cause: unk
   );
 }
 
-/** Run a rollback whose swap began until it is recorded; a failure goes back to the release it left. */
+/**
+ * Run a rollback whose swap began until it is recorded. A failure once the
+ * swap moved the live checkout goes back to the release it left; one before
+ * changed nothing live, and gives the rollback up as a failure before its
+ * swap does.
+ */
 async function finishRollback(rollback: Rollback, start: OperationRecord): Promise<void> {
   let record = start;
   try {
@@ -1091,9 +1119,12 @@ async function finishRollback(rollback: Rollback, start: OperationRecord): Promi
       }
     }
   } catch (error) {
-    // Every failure once the swap began goes back to the release left, and is reported; a recorded one stays.
     const failed = (await readOperationRecord(rollback.operation.paths, rollback.operation.instanceId)) ?? record;
     if (failed.phase === 'recorded') throw error;
+    if (failed.phase === 'swapping' && !failed.returning && (await unwindSwap(rollback))) {
+      await abandonPreparation(rollback);
+      throw notPrepared(rollback, error);
+    }
     try {
       await returnToLeft(rollback, failed);
     } catch (returnError) {
@@ -1108,13 +1139,19 @@ async function finishRollback(rollback: Rollback, start: OperationRecord): Promi
   }
 }
 
-/** Carry a rollback record from its phase to recorded: prepare when it has not swapped, then finish. */
+/**
+ * Carry a rollback record from its phase to recorded: prepare when it has not
+ * swapped, or when an earlier run's swap never moved the live checkout, then
+ * finish.
+ */
 async function runRollback(rollback: Rollback, start: OperationRecord): Promise<RollbackOutcome> {
   if (start.returning) {
     await returnToLeft(rollback, start);
     throw returned(rollback, start.mode, undefined);
   }
-  const record = start.phase === 'staged' || start.phase === 'stopped' ? await prepareRollback(rollback, start) : start;
+  const current = start.phase === 'swapping' ? ((await unwindSwap(rollback)) ?? start) : start;
+  const record =
+    current.phase === 'staged' || current.phase === 'stopped' ? await prepareRollback(rollback, current) : current;
   if (!record) return { kind: 'declined', release: rollback.from };
   const { mode } = record;
   if (!mode) {

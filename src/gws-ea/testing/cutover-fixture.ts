@@ -27,6 +27,7 @@ import { acquireInstanceOperation, recordStepCompleted, reserveInstance } from '
 import { createOnecliRuntimeLayout, renderOnecliCompose } from '../onecli-compose.js';
 import { resolveWrapperGatewayImage, wrapperImageTag } from '../onecli-gateway-image.js';
 import { CONTROL_PLANE_ROOT, instanceRuntimeFile, resolveControlPlanePaths, type ControlPlanePaths } from '../paths.js';
+import type { Observation } from '../phases.js';
 import { LAUNCHER_PINS, ONECLI_SDK_VERSION } from '../pins.js';
 import { runSanitizedCommand, type SanitizedCommand, type SanitizedCommandRunner } from '../process.js';
 import { allocateInstanceId, getInstanceReservation } from '../registry.js';
@@ -197,15 +198,25 @@ export interface Release {
 
 let releases = 0;
 
-/** Push the next release to the track, changing `files`. */
-export async function nextRelease(host: Machine, files: Readonly<Record<string, string>> = {}): Promise<Release> {
+/** Where a release is pushed: a repository, and the branch there that carries it. */
+export interface ReleaseDestination {
+  readonly remote: string;
+  readonly branch: string;
+}
+
+/** Push the next release, changing `files`, to the track's branch of the release repository or to `to`. */
+export async function nextRelease(
+  host: Machine,
+  files: Readonly<Record<string, string>> = {},
+  to: ReleaseDestination = { remote: host.remote, branch: TRACK_BRANCH },
+): Promise<Release> {
   releases += 1;
   await write(host.work, 'release.txt', `release ${releases}\n`);
   for (const [file, contents] of Object.entries(files)) await write(host.work, file, contents);
   const commit = commitAll(host.work, `release ${releases}`);
-  git(host.work, 'push', '--quiet', 'origin', `HEAD:refs/heads/${TRACK_BRANCH}`);
+  git(host.work, 'push', '--quiet', to.remote, `HEAD:refs/heads/${to.branch}`);
   const tool = path.join(host.root, `tool-${commit.slice(0, 8)}`);
-  git(host.root, 'clone', '--quiet', host.remote, tool);
+  git(host.root, 'clone', '--quiet', to.remote, tool);
   git(tool, 'checkout', '--quiet', '--detach', commit);
   return { commit, tool };
 }
@@ -256,8 +267,12 @@ export function centralDatabase(runtime: InstanceRuntimeConfig): void {
   }
 }
 
-/** An assistant create finished at the machine's first release. */
-export async function assistant(host: Machine, port = 37_001): Promise<InstanceRuntimeConfig> {
+/** An assistant create finished at the machine's first release, its Compose file naming `gateway`. */
+export async function assistant(
+  host: Machine,
+  port = 37_001,
+  gateway: string = DEPLOYED_GATEWAY,
+): Promise<InstanceRuntimeConfig> {
   const { paths } = host;
   const instanceId = allocateInstanceId();
   const reserved = await reserveInstance(paths, {
@@ -323,7 +338,7 @@ export async function assistant(host: Machine, port = 37_001): Promise<InstanceR
     { mode: 0o600 },
   );
   await mkdir(onecli.rootDirectory, { recursive: true, mode: 0o700 });
-  await writeFile(onecli.composeFile, renderOnecliCompose(onecli, COHORT, DEPLOYED_GATEWAY), { mode: 0o600 });
+  await writeFile(onecli.composeFile, renderOnecliCompose(onecli, COHORT, gateway), { mode: 0o600 });
   centralDatabase(runtime);
   await stampMain(runtime.checkout_realpath);
   return runtime;
@@ -517,13 +532,31 @@ export interface World {
   readonly healthWaits: Array<number | undefined>;
   migrate: Migrate;
   buildFails?: boolean;
+  /** Every layer of the agent image is cached, so the build of `:next` gives the image `:latest` names. */
+  cachedBuild?: boolean;
+  /** Every layer of a per-group image is cached, so its rebuild gives the image its tag already names. */
+  cachedRebuild?: boolean;
   /** What `ps` lists, and what `lsof` finds open under a checkout's data/. */
   processes: string;
   openFiles: string;
+  /** The containers `docker ps --all` lists, by the install label it filters on. */
+  readonly containers: Map<string, readonly string[]>;
   /** The listener ID the running host answers with. */
   listener: string;
+  /** The listener ID the local listener answers with instead, as another host's would. */
+  listenerAnswer?: string;
+  /** The webhook port the host reports instead of its own. */
+  webhookPort?: number;
+  /** The callback route answers 502, as a tunnel with nothing behind it does. */
+  routeDown?: boolean;
+  /** What observing OneCLI finds instead of it present, when its gateway did not change. */
+  onecliObservation?: Observation;
+  /** OneCLI's health or isolation check fails, when its gateway changed. */
+  onecliVerifyFails?: boolean;
   /** Runs when the host starts, from the live checkout, as the host would. */
   onStart?: (checkout: string) => void;
+  /** The service manager refuses to start the host. */
+  startFails?: boolean;
   /** Runs once the release's tripwire is stamped: the last of the carry. */
   onStamp?: () => void;
   rebuildFails?: boolean;
@@ -564,8 +597,14 @@ export function world(runtime: InstanceRuntimeConfig, migrate: Migrate = applyin
     migrate,
     processes: '',
     openFiles: '',
+    containers: new Map(),
     listener: '11111111-1111-4111-8111-111111111111',
   };
+}
+
+/** The label Docker finds an install's agent containers by. */
+export function installLabel(runtime: Pick<InstanceRuntimeConfig, 'install_id'>): string {
+  return getInstallScopedNames(runtime.install_id).containerInstallLabel;
 }
 
 export const never = (): Promise<never> => new Promise(() => undefined);
@@ -581,6 +620,34 @@ export function tag(state: World, reference: string, name: string): void {
   const id = state.tags.get(reference) ?? (state.ids.has(reference) ? reference : undefined);
   if (!id) throw new GwsEaError('command_failed', `No such image: ${reference}`, { details: { exitCode: 1 } });
   state.tags.set(name, id);
+}
+
+function dockerFailure(stderrTail: string): GwsEaError {
+  return new GwsEaError('command_failed', 'docker exited with code 1', { details: { exitCode: 1, stderrTail } });
+}
+
+/**
+ * Remove an image as `docker image rm` does without `--force`. A tag is
+ * untagged, and its image deleted once no tag names it. An ID deletes its
+ * image, untagging the one tag that names it; one several tags name is
+ * refused.
+ */
+function removeImage(state: World, reference: string): void {
+  const named = state.tags.get(reference);
+  if (named) {
+    state.tags.delete(reference);
+    if (![...state.tags.values()].includes(named)) state.ids.delete(named);
+    return;
+  }
+  if (!state.ids.has(reference)) throw dockerFailure(`Error response from daemon: No such image: ${reference}`);
+  const names = [...state.tags].filter(([, id]) => id === reference).map(([name]) => name);
+  if (names.length > 1) {
+    throw dockerFailure(
+      `Error response from daemon: conflict: unable to delete ${reference.slice(7, 19)} (must be forced) - image is referenced in multiple repositories`,
+    );
+  }
+  for (const name of names) state.tags.delete(name);
+  state.ids.delete(reference);
 }
 
 /** Tagged and untagged image IDs of one repository. */
@@ -616,9 +683,11 @@ export function runner(state: World): SanitizedCommandRunner {
           details: { exitCode: 1, stderrTail: 'ERROR: failed to solve: process did not complete successfully' },
         });
       }
-      const id = imageId();
+      const base = getInstallScopedNames(spec.env?.NANOCLAW_INSTALL_ID ?? '').containerImageBase;
+      const cached = state.cachedBuild ? state.tags.get(`${base}:latest`) : undefined;
+      const id = cached ?? imageId();
       state.ids.add(id);
-      state.tags.set(`${getInstallScopedNames(spec.env?.NANOCLAW_INSTALL_ID ?? '').containerImageBase}:next`, id);
+      state.tags.set(`${base}:next`, id);
       await hang(state, 'build');
       return { stdout: '', stderr: '' };
     }
@@ -629,16 +698,15 @@ export function runner(state: World): SanitizedCommandRunner {
     }
     if (spec.command === 'docker') {
       const last = spec.args.at(-1)!;
-      if (first === 'ps') return { stdout: '', stderr: '' };
+      if (first === 'ps') {
+        const label = spec.args[spec.args.indexOf('--filter') + 1]?.replace(/^label=/u, '') ?? '';
+        return { stdout: (state.containers.get(label) ?? []).map((id) => `${id}\n`).join(''), stderr: '' };
+      }
       if (first === 'image' && second === 'inspect' && joined.includes('{{.Size}}')) {
         return { stdout: `${IMAGE_BYTES}\n`, stderr: '' };
       }
       if (first === 'image' && second === 'inspect') {
-        if (!state.ids.has(last)) {
-          throw new GwsEaError('command_failed', 'docker exited with code 1', {
-            details: { exitCode: 1, stderrTail: `Error: No such image: ${last}` },
-          });
-        }
+        if (!state.ids.has(last)) throw dockerFailure(`Error: No such image: ${last}`);
         const names = [...state.tags].filter(([, id]) => id === last).map(([name]) => name);
         return { stdout: `${JSON.stringify(names)}\n`, stderr: '' };
       }
@@ -654,14 +722,7 @@ export function runner(state: World): SanitizedCommandRunner {
         return { stdout: '', stderr: '' };
       }
       if (first === 'image' && second === 'rm') {
-        const id = state.tags.get(last);
-        if (id) {
-          state.tags.delete(last);
-          if (![...state.tags.values()].includes(id)) state.ids.delete(id);
-        } else {
-          if ([...state.tags.values()].includes(last)) throw new Error(`a tagged image was removed: ${last}`);
-          state.ids.delete(last);
-        }
+        removeImage(state, last);
         return { stdout: '', stderr: '' };
       }
       if (first === 'build') {
@@ -694,6 +755,7 @@ export function services(state: World): NanoclawServiceHelpers {
     },
     startService: (_handle, root, env) => {
       state.serviceCalls.push(`start ${env.installSlug}`);
+      if (state.startFails) throw new Error('Bootstrap failed: 5: Input/output error');
       state.events.push('start');
       state.running = true;
       state.onStart?.(root);
@@ -715,7 +777,11 @@ export function hostStatus(state: World, runtime: InstanceRuntimeConfig): HostSt
     pid: 4242,
     instance_id: `host-${state.serviceCalls.length}`,
     project_root: root,
-    webhook: { id: state.listener, port: runtime.allocated_ports.nanoclaw_webhook, paths: ['/webhook/gchat'] },
+    webhook: {
+      id: state.listener,
+      port: state.webhookPort ?? runtime.allocated_ports.nanoclaw_webhook,
+      paths: ['/webhook/gchat'],
+    },
     channels: [{ instance: 'gchat', type: 'gchat', connected: true }],
   });
   return {
@@ -755,7 +821,10 @@ export function dependencies(state: World, release: Release, runtime: InstanceRu
       const url = String(input);
       state.fetched.push(`${init?.method ?? 'GET'} ${url}`);
       if (!state.running) throw new TypeError('fetch failed');
-      return new Response(null, { status: 401, headers: { 'x-nanoclaw-webhook-id': state.listener } });
+      const local = new URL(url).hostname === '127.0.0.1';
+      if (!local && state.routeDown) return new Response(null, { status: 502 });
+      const listener = local ? (state.listenerAnswer ?? state.listener) : state.listener;
+      return new Response(null, { status: 401, headers: { 'x-nanoclaw-webhook-id': listener } });
     },
     onecli: {
       // As the real ones do, each writes the Compose file of the gateway it recreates.
@@ -770,10 +839,13 @@ export function dependencies(state: World, release: Release, runtime: InstanceRu
       },
       verify: async (layout) => {
         state.onecli.push(`verify ${layout.project}`);
+        if (state.onecliVerifyFails) {
+          throw new GwsEaError('onecli_isolation_failed', 'An agent reached the network around the gateway.');
+        }
       },
       observe: async (layout) => {
         state.onecli.push(`observe ${layout.project}`);
-        return { status: 'present' };
+        return state.onecliObservation ?? { status: 'present' };
       },
     },
     ncl: async (config, args, options) => {
@@ -784,9 +856,10 @@ export function dependencies(state: World, release: Release, runtime: InstanceRu
         throw new GwsEaError('ncl_failed', `ncl ${args.join(' ')} failed: apt-get could not find package made-up`);
       }
       // NanoClaw's buildAgentGroupImage moves the group's tag to an image built on the new base.
-      const id = imageId();
+      const group = `${imageBase(config)}:${args[args.indexOf('--id') + 1]}`;
+      const id = (state.cachedRebuild ? state.tags.get(group) : undefined) ?? imageId();
       state.ids.add(id);
-      state.tags.set(`${imageBase(config)}:${args[args.indexOf('--id') + 1]}`, id);
+      state.tags.set(group, id);
       return { restarted: 0, rebuilt: true };
     },
     ...(state.renameKill === undefined

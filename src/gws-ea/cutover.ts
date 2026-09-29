@@ -801,12 +801,15 @@ function describeLayout(layout: SwapLayout): string {
   ].join(', ');
 }
 
+/** A swap's releases as observed, and the stage (an index of `SWAP_STAGES`) they are at. */
+interface PlacedSwap {
+  readonly places: SwapPlaces;
+  readonly layout: SwapLayout;
+  readonly stage: number;
+}
+
 /** Observe the releases and place them, refusing, before anything moves, a layout no swap step leaves. */
-async function placeSwap(
-  paths: ControlPlanePaths,
-  instanceId: string,
-  releases: SwapReleases,
-): Promise<{ readonly places: SwapPlaces; readonly layout: SwapLayout; readonly stage: number }> {
+async function placeSwap(paths: ControlPlanePaths, instanceId: string, releases: SwapReleases): Promise<PlacedSwap> {
   const places = swapPlaces(paths, instanceId);
   const layout = await observeSwap(places, instanceId);
   const stage = swapStage(layout, releases);
@@ -855,8 +858,31 @@ export async function reverseSwap(
   releases: SwapReleases,
   seams: SwapSeams = {},
 ): Promise<void> {
+  await reversePlacedSwap(await placeSwap(paths, instanceId, releases), seams);
+}
+
+/**
+ * Take back a swap cut short before it moved the live checkout, and say
+ * whether it was. Until then the live path still holds the outgoing release,
+ * which the OS may have started again since, recording what the carry never
+ * took; so the swap is undone, and the stop and carry run again (KTD2). Once
+ * the live checkout moved, whatever ran from the live path ran on the carried
+ * state, and the swap is left to be finished.
+ */
+export async function reverseSwapBeforeLiveMoved(
+  paths: ControlPlanePaths,
+  instanceId: string,
+  releases: SwapReleases,
+  seams: SwapSeams = {},
+): Promise<boolean> {
+  const placed = await placeSwap(paths, instanceId, releases);
+  if (placed.stage >= SWAP_STAGES.indexOf('live_moved')) return false;
+  await reversePlacedSwap(placed, seams);
+  return true;
+}
+
+async function reversePlacedSwap({ places, layout, stage }: PlacedSwap, seams: SwapSeams): Promise<void> {
   const move = seams.rename ?? rename;
-  const { places, layout, stage } = await placeSwap(paths, instanceId, releases);
   const reached = (step: SwapStage): boolean => stage >= SWAP_STAGES.indexOf(step);
   if (reached('swapped')) await mkdir(places.next, { mode: 0o700 });
   if (reached('receipt_promoted')) await move(places.liveReceipt, places.stagedReceipt);
@@ -1072,11 +1098,18 @@ function describeRollbackLayout(layout: RollbackLayout): string {
   ].join(', ');
 }
 
+/** A rollback's releases as observed, and the stage (an index of `ROLLBACK_STAGES`) they are at. */
+interface PlacedRollback {
+  readonly places: RollbackPlaces;
+  readonly layout: RollbackLayout;
+  readonly stage: number;
+}
+
 async function placeRollback(
   paths: ControlPlanePaths,
   instanceId: string,
   releases: RollbackReleases,
-): Promise<{ readonly places: RollbackPlaces; readonly layout: RollbackLayout; readonly stage: number }> {
+): Promise<PlacedRollback> {
   const places = rollbackPlaces(paths, instanceId);
   const layout = await observeRollback(places, instanceId);
   const stage = rollbackStage(layout, releases);
@@ -1126,8 +1159,34 @@ export async function reverseRollbackSwap(
   releases: RollbackReleases,
   seams: SwapSeams = {},
 ): Promise<void> {
+  await reversePlacedRollbackSwap(await placeRollback(paths, instanceId, releases), releases, seams);
+}
+
+/**
+ * Take back a rollback's swap cut short before it moved the live checkout,
+ * and say whether it was. Until then the release the rollback leaves is still
+ * at the live path, where the OS may have started it again since, so the
+ * rollback is decided and prepared again (KTD2, KTD5). Once the live checkout
+ * moved, the swap is left to be finished or gone back from.
+ */
+export async function reverseRollbackSwapBeforeLiveMoved(
+  paths: ControlPlanePaths,
+  instanceId: string,
+  releases: RollbackReleases,
+  seams: SwapSeams = {},
+): Promise<boolean> {
+  const placed = await placeRollback(paths, instanceId, releases);
+  if (placed.stage >= ROLLBACK_STAGES.indexOf('outgoing_moved')) return false;
+  await reversePlacedRollbackSwap(placed, releases, seams);
+  return true;
+}
+
+async function reversePlacedRollbackSwap(
+  { places, layout, stage }: PlacedRollback,
+  releases: RollbackReleases,
+  seams: SwapSeams,
+): Promise<void> {
   const move = seams.rename ?? rename;
-  const { places, layout, stage } = await placeRollback(paths, instanceId, releases);
   const reached = (step: RollbackStage): boolean => stage >= ROLLBACK_STAGES.indexOf(step);
   if (reached('swapped') && releases.restoreSetAside && layout.previous) await move(places.previous, places.superseded);
   if (reached('kept_moved')) await move(places.restored, places.previous);

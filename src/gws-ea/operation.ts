@@ -590,7 +590,9 @@ export async function beginOperation(operation: InstanceOperation, start: Operat
  * Move an open operation to `phase`, adding `facts`. Re-entering the current
  * phase records fresh facts (a cutover restarted from `stopped` stops again);
  * the one move back is `swapping → stopped`, once recovery reversed the
- * renames. `recorded` is reached only through `commitOperationRelease`.
+ * renames, and it drops a rollback's mode, which is fixed only as it enters
+ * `swapping` and so is decided again (KTD5). `recorded` is reached only
+ * through `commitOperationRelease`.
  */
 export async function advanceOperation(
   operation: InstanceOperation,
@@ -610,7 +612,9 @@ export async function advanceOperation(
       `An update or rollback cannot move back from ${record.phase} to ${phase}`,
     );
   }
-  return writeRecord(operation.paths, { ...record, ...facts, phase, updated_at: new Date().toISOString() });
+  const { mode: _mode, ...undecided } = record;
+  const kept = rank(phase) < rank('swapping') ? undecided : record;
+  return writeRecord(operation.paths, { ...kept, ...facts, phase, updated_at: new Date().toISOString() });
 }
 
 /**

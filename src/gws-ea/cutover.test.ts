@@ -40,7 +40,9 @@ import {
   openFileHolders,
   restoreSetAsideState,
   reverseRollbackSwap,
+  reverseRollbackSwapBeforeLiveMoved,
   reverseSwap,
+  reverseSwapBeforeLiveMoved,
   setAsideState,
   setAsideStateRoot,
   settleCheckoutDatabases,
@@ -702,6 +704,21 @@ describe('swapping the releases', () => {
     },
   );
 
+  it.each([...crashes, [6, true] as const, [5, false] as const])(
+    'takes back only a swap that had not moved the live checkout, killed at rename %i (older previous: %s)',
+    async (at, older) => {
+      const { paths, instanceId } = await readyToSwap(older);
+      await killedSwap(paths, instanceId, at);
+      // The live checkout moves at the third rename with an older previous release to set aside, else the second.
+      const moved = at > (older ? 3 : 2);
+      const cut = await layout(paths, instanceId);
+
+      expect(await reverseSwapBeforeLiveMoved(paths, instanceId, { from: FROM, to: TO })).toBe(!moved);
+
+      expect(await layout(paths, instanceId)).toEqual(moved ? cut : BEFORE_SWAP(older));
+    },
+  );
+
   it.each([1, 2, 3, 4, 5])('reverses again after a reversal killed at its rename %i', async (at) => {
     const { paths, instanceId } = await readyToSwap(true);
     await finishSwap(paths, instanceId, { from: FROM, to: TO });
@@ -907,6 +924,21 @@ describe("swapping a rollback's releases", () => {
       await reverseRollbackSwap(paths, instanceId, releases(restoreSetAside));
 
       expect(await rollbackLayout(paths, instanceId)).toEqual(BEFORE_ROLLBACK(withSetAside));
+    },
+  );
+
+  it.each([...cases, [6, true, true] as const, [5, true, false] as const])(
+    'takes back only a rollback swap that had not moved the live checkout, killed at rename %i (set aside: %s, put back: %s)',
+    async (at, withSetAside, restoreSetAside) => {
+      const { paths, instanceId } = await readyToRollBack(withSetAside);
+      await killedSwap(paths, instanceId, restoreSetAside, at);
+      // Its first rename moves the live checkout to outgoing/.
+      const moved = at > 1;
+      const cut = await rollbackLayout(paths, instanceId);
+
+      expect(await reverseRollbackSwapBeforeLiveMoved(paths, instanceId, releases(restoreSetAside))).toBe(!moved);
+
+      expect(await rollbackLayout(paths, instanceId)).toEqual(moved ? cut : BEFORE_ROLLBACK(withSetAside));
     },
   );
 
