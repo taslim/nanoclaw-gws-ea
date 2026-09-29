@@ -31,6 +31,7 @@ import { hostLogFiles, type NanoclawServiceHandle, type NanoclawServiceHelpers }
 import type { CreateTargetRequest } from './release-target.js';
 import { resolveReleaseSource } from './release-tracks.js';
 import { activeStep } from './run-log.js';
+import { present, removeToolCheckouts, toolCheckoutWorld, type ToolCheckoutWorld } from './testing/stray-fixture.js';
 import { GwsEaError, PROVISION_STEPS, releaseOf, type InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
@@ -44,6 +45,7 @@ const PRIVATE_REMOTE = 'git@github.com:example/nanoclaw-gws-ea-private.git';
 afterEach(async () => {
   for (const server of servers.splice(0)) await new Promise((resolve) => server.close(resolve));
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
+  await removeToolCheckouts();
 });
 
 async function testPaths(): Promise<ControlPlanePaths> {
@@ -761,12 +763,14 @@ describe('gws-ea without a TTY', () => {
     expect(remove).not.toHaveBeenCalled();
   });
 
-  it('refuses update --all without --yes, as update --id does, before any assistant is read or observed', async () => {
+  it('refuses update --all without --yes, as update --id does, before any assistant is read or observed, or the tool checkout cleaned', async () => {
     const paths = await testPaths();
     await reserveInstance(paths, reservation(paths));
     const before = await everythingUnder(paths);
     const services = nanoclawServices({});
     const toolProviderSetup = vi.fn();
+    const stray = await toolCheckoutWorld();
+    await stray.write('data/v2.db');
     const io = lines();
 
     expect(
@@ -777,6 +781,7 @@ describe('gws-ea without a TTY', () => {
         toolProviderSetup,
         upsertEnvVars: vi.fn(),
         hostStatus: { queryHost: vi.fn(), waitForHost: vi.fn() },
+        toolCheckout: stray.checkout,
       }),
     ).toBe(1);
     expect(io.err).toEqual([
@@ -786,6 +791,8 @@ describe('gws-ea without a TTY', () => {
     expect(services.calls).toEqual([]);
     expect(toolProviderSetup).not.toHaveBeenCalled();
     expect(await everythingUnder(paths)).toEqual(before);
+    expect(stray.calls).toEqual([]);
+    expect(await present(path.join(stray.root, 'data', 'v2.db'))).toBe(true);
   });
 
   it("hands removal the driver's NanoClaw service helpers, which stop the host", async () => {
@@ -1985,5 +1992,251 @@ describe('gws-ea on an assistant that is not ready to operate', () => {
     expect(io.err.join('\n')).toContain('is unfinished (stopped)');
     expect(io.err.join('\n')).toContain(`gws-ea update --id ${a.instance_id}`);
     expect(io.out).toEqual([]);
+  });
+});
+
+describe('gws-ea and a stray NanoClaw install in its own checkout', () => {
+  /** What the launcher gives every run for stray handling: the checkout it runs from, and upstream's helpers. */
+  function launcherStrayHandling(w: ToolCheckoutWorld): Partial<CliRuntime> {
+    return { toolCheckout: w.checkout, hostStatus: w.hostStatus, serviceHelpers: w.serviceHelpers };
+  }
+
+  const PROBES = (w: ToolCheckoutWorld): string[] => [
+    `docker ps -aq --filter label=nanoclaw-install=${w.slug}`,
+    `docker image ls --format {{.Repository}}:{{.Tag}} ${w.names.containerImageBase}`,
+  ];
+
+  async function create(paths: ControlPlanePaths, runtime: Partial<CliRuntime>) {
+    const io = lines();
+    const exitCode = await runCli(['create', '--track', 'dogfood'], {
+      paths,
+      ...io.runtime,
+      ...createRuntime(),
+      advanceProvision: async () => ({ status: 'paused', pause: DM_PAUSE }),
+      ...runtime,
+    });
+    return { exitCode, ...io };
+  }
+
+  it('adds nothing to create when there is no stray install, after only a quick check', async () => {
+    const w = await toolCheckoutWorld();
+    const without = await create(await testPaths(), {});
+
+    const run = await create(await testPaths(), launcherStrayHandling(w));
+
+    expect(run.exitCode).toBe(10);
+    expect(run.out[0]).toMatch(/^instance_id: /u);
+    expect(run.out.length).toBe(without.out.length);
+    expect(run.out[1]).toBe(without.out[1]);
+    expect(run.out.filter((line) => /stray|NanoClaw install/u.test(line))).toEqual([]);
+    expect(w.calls).toEqual(PROBES(w));
+  });
+
+  it("removes a stray install right after create's instance_id line, then creates", async () => {
+    const paths = await testPaths();
+    const w = await toolCheckoutWorld();
+    await w.write('data/v2.db');
+
+    const run = await create(paths, launcherStrayHandling(w));
+
+    expect(run.exitCode).toBe(10);
+    expect(run.out[0]).toMatch(/^instance_id: /u);
+    expect(run.out[1]).toBe(`Removed a stray NanoClaw install from ${w.root}: data/.`);
+    expect(await present(path.join(w.root, 'data'))).toBe(false);
+    expect(run.out).toContain(`Paused at bind_principal: ${DM_PAUSE.message}`);
+  });
+
+  it('warns once and goes on creating when the stray install cannot be removed', async () => {
+    const paths = await testPaths();
+    const w = await toolCheckoutWorld();
+    await w.write('data/v2.db');
+    const checkout = {
+      ...w.checkout,
+      resolveDocker: async (): Promise<string> => {
+        throw new GwsEaError('docker_stopped', 'Docker is not running at unix:///fake/docker.sock');
+      },
+    };
+
+    const run = await create(paths, { ...launcherStrayHandling(w), toolCheckout: checkout });
+
+    expect(run.exitCode).toBe(10);
+    expect(run.out.filter((line) => line.includes('stray'))).toEqual([
+      `Warning: could not remove the stray NanoClaw install in ${w.root} (data/v2.db); retry with gws-ea cleanup. Docker is not running at unix:///fake/docker.sock`,
+    ]);
+    expect(await present(path.join(w.root, 'data', 'v2.db'))).toBe(true);
+  });
+
+  it("looks for no stray install without the launcher's service helpers", async () => {
+    const paths = await testPaths();
+    const w = await toolCheckoutWorld();
+    await w.write('data/v2.db');
+
+    const run = await create(paths, { toolCheckout: w.checkout, hostStatus: w.hostStatus });
+
+    expect(run.exitCode).toBe(10);
+    expect(w.calls).toEqual([]);
+    expect(await present(path.join(w.root, 'data', 'v2.db'))).toBe(true);
+  });
+
+  it('removes a stray install before update --id resolves its release', async () => {
+    const paths = await testPaths();
+    const w = await toolCheckoutWorld();
+    await w.write('data/v2.db');
+    const io = lines();
+
+    expect(
+      await runCli(['update', '--id', allocateInstanceId(), '--yes'], {
+        paths,
+        ...io.runtime,
+        ...launcherStrayHandling(w),
+        toolProviderSetup: vi.fn(),
+        upsertEnvVars: vi.fn(),
+      }),
+    ).toBe(1);
+
+    const removed = io.out.indexOf(`Removed a stray NanoClaw install from ${w.root}: data/.`);
+    expect(removed).toBeGreaterThanOrEqual(0);
+    expect(removed).toBeLessThan(io.out.indexOf('Resolving the release…'));
+  });
+
+  it('cleanup says there is nothing to remove, and exits 0', async () => {
+    const paths = await testPaths();
+    const w = await toolCheckoutWorld();
+    const io = lines();
+
+    expect(await runCli(['cleanup'], { paths, ...io.runtime, ...launcherStrayHandling(w) })).toBe(0);
+
+    expect(io.out.at(-1)).toBe(`No stray NanoClaw install in ${w.root}.`);
+    expect(w.calls).toEqual(PROBES(w));
+  });
+
+  it('cleanup names what it removed, and exits 0', async () => {
+    const paths = await testPaths();
+    const w = await toolCheckoutWorld();
+    await w.installService();
+    await w.write('data/v2.db');
+    w.docker.image('sha256:a', `${w.names.containerImageBase}:latest`);
+    const io = lines();
+
+    expect(await runCli(['cleanup'], { paths, ...io.runtime, ...launcherStrayHandling(w) })).toBe(0);
+
+    expect(io.out.slice(-4)).toEqual([
+      `Removed the stray NanoClaw install from ${w.root}.`,
+      `~/Library/LaunchAgents/${w.names.launchdLabel}.plist`,
+      '1 image tag',
+      'data/',
+    ]);
+    expect(w.docker.tags(w.names.containerImageBase)).toEqual([]);
+  });
+
+  it('cleanup names what is left when removal fails, and exits 1', async () => {
+    const paths = await testPaths();
+    const w = await toolCheckoutWorld();
+    await w.write('data/v2.db');
+    w.host.silent = true;
+    const io = lines();
+
+    expect(await runCli(['cleanup'], { paths, ...io.runtime, ...launcherStrayHandling(w) })).toBe(1);
+
+    expect(io.err.join('\n')).toContain(`A NanoClaw host still answers on ${w.root}/data/ncl.sock`);
+    expect(io.err.join('\n')).toContain('Retry with: gws-ea cleanup');
+    expect(await present(path.join(w.root, 'data', 'v2.db'))).toBe(true);
+  });
+
+  it('cleanup fails, exiting 1, when Docker cannot be checked', async () => {
+    const paths = await testPaths();
+    const w = await toolCheckoutWorld();
+    w.docker.unreachable = true;
+    const io = lines();
+
+    expect(await runCli(['cleanup'], { paths, ...io.runtime, ...launcherStrayHandling(w) })).toBe(1);
+
+    expect(io.err.join('\n')).toContain('Docker did not answer, so its containers and images could not be checked');
+  });
+
+  it('cleanup takes no options, and runs only through the launcher', async () => {
+    const paths = await testPaths();
+    const w = await toolCheckoutWorld();
+    const io = lines();
+
+    expect(await runCli(['cleanup', '--yes'], { paths, ...io.runtime, ...launcherStrayHandling(w) })).toBe(1);
+    expect(io.err.join('\n')).toContain('Unknown option --yes');
+    expect(await runCli(['cleanup'], { paths, ...io.runtime })).toBe(1);
+    expect(io.err.join('\n')).toContain('Run this command through the gws-ea launcher');
+    expect(w.calls).toEqual([]);
+  });
+
+  it('lists cleanup in the usage', async () => {
+    const io = lines();
+
+    expect(await runCli(['--help'], io.runtime)).toBe(0);
+
+    expect(io.out).toContain('  cleanup');
+  });
+
+  it('notes a stray install beside list and status on stderr, leaving their output and exit codes alone', async () => {
+    const paths = await testPaths();
+    const a = await createdAssistant(paths, 35_001);
+    const { helpers } = nanoclawServices({ [a.install_id]: true });
+    const w = await toolCheckoutWorld();
+    const observe = async (args: readonly string[], toolCheckout?: ToolCheckoutWorld['checkout']) => {
+      const io = lines();
+      const exitCode = await runCli(args, {
+        paths,
+        ...io.runtime,
+        serviceHelpers: helpers,
+        ...(toolCheckout ? { toolCheckout } : {}),
+      });
+      return { exitCode, ...io };
+    };
+    const commands = [['list'], ['list', '--json'], ['status', '--id', allocateInstanceId()]] as const;
+    const without = await Promise.all(commands.map((args) => observe(args)));
+    // Only a tag in its image repository is left of it.
+    w.docker.image('sha256:a', `${w.names.containerImageBase}:latest`);
+
+    for (const [index, args] of commands.entries()) {
+      const run = await observe(args, w.checkout);
+      expect(run.exitCode).toBe(without[index]!.exitCode);
+      expect(run.out).toEqual(without[index]!.out);
+      expect(run.err).toEqual([
+        ...without[index]!.err,
+        `Note: a stray NanoClaw install is in ${w.root} (1 image tag); gws-ea cleanup removes it.`,
+      ]);
+    }
+  });
+
+  it('adds no note, and changes nothing else, when Docker does not answer', async () => {
+    const paths = await testPaths();
+    const w = await toolCheckoutWorld();
+    w.docker.unreachable = true;
+    const baseline = lines();
+    const io = lines();
+
+    expect(await runCli(['list'], { paths, ...baseline.runtime })).toBe(0);
+    expect(await runCli(['list'], { paths, ...io.runtime, toolCheckout: w.checkout })).toBe(0);
+
+    expect(io.out).toEqual(baseline.out);
+    expect(io.err).toEqual([]);
+    expect(w.calls).toEqual(PROBES(w));
+  });
+
+  it('adds no note, and changes nothing else, when the check itself fails', async () => {
+    const paths = await testPaths();
+    const w = await toolCheckoutWorld();
+    await w.write('data/v2.db');
+    const baseline = lines();
+    const io = lines();
+    expect(await runCli(['list'], { paths, ...baseline.runtime })).toBe(0);
+    // Its database cannot even be looked for.
+    await chmod(path.join(w.root, 'data'), 0o000);
+
+    try {
+      expect(await runCli(['list'], { paths, ...io.runtime, toolCheckout: w.checkout })).toBe(0);
+    } finally {
+      await chmod(path.join(w.root, 'data'), 0o700);
+    }
+
+    expect(io.out).toEqual(baseline.out);
+    expect(io.err).toEqual([]);
   });
 });

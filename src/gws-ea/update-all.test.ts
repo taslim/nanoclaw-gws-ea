@@ -39,6 +39,7 @@ import {
   type World,
 } from './testing/cutover-fixture.js';
 import type { CliRuntime } from './cli.js';
+import { removeToolCheckouts, toolCheckoutWorld } from './testing/stray-fixture.js';
 import { acquireInstanceOperation, reserveInstance } from './journal.js';
 import { advanceOperation, beginOperation, readOperationRecord } from './operation.js';
 import { allocateInstanceId, getInstanceReservation, swapInstanceRelease } from './registry.js';
@@ -48,7 +49,10 @@ import { releaseOf, type ReleaseCoordinates } from './types.js';
 import type { UpdatePreview } from './update.js';
 import { registeredReleaseMigrations, type UpdateAllPlan } from './update-all.js';
 
-afterEach(removeTemporaryRoots);
+afterEach(async () => {
+  await removeTemporaryRoots();
+  await removeToolCheckouts();
+});
 
 /** Each case clones, fetches, and stages real Git repositories, which a loaded machine slows. */
 const GIT_HEAVY = { timeout: 60_000 } as const;
@@ -434,7 +438,7 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     // Asked once, about the whole plan, with nothing yet staged; no assistant is asked about on its own.
     expect(asked).toEqual([{ toolCommit: next.commit, shown: plan, staged: false }]);
     expect(confirmUpdate).not.toHaveBeenCalled();
-    expect(out).toEqual([...plan, 'Update cancelled. Nothing was changed.']);
+    expect(out).toEqual([...plan, 'Update cancelled. No assistant was changed.']);
     expect(err).toEqual([]);
     // Nothing of either changed: files, run logs, registry entry, and images; each was only observed.
     expect(await Promise.all(machineFleet.assistants.map((runtime) => footprint(machineFleet, runtime)))).toEqual(
@@ -455,14 +459,21 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     // Asked, each assistant would be declined.
     const confirmUpdate = vi.fn(async (_preview: UpdatePreview) => false);
     const confirmUpdateAll = vi.fn(async (_plan: UpdateAllPlan) => true);
+    const tool = await toolCheckoutWorld();
     const { run, out, err } = fleetCli(machineFleet, {
       releaseMigrations: async () => [...LIVE_MIGRATIONS, ADDED_MIGRATION],
       confirmUpdate,
       confirmUpdateAll,
+      toolCheckout: tool.checkout,
     });
 
     expect(await run(['update', '--all'])).toBe(0);
 
+    // The tool checkout was checked for a stray NanoClaw install once for the run, not once per assistant.
+    expect(tool.calls).toEqual([
+      `docker ps -aq --filter label=nanoclaw-install=${tool.slug}`,
+      `docker image ls --format {{.Repository}}:{{.Tag}} ${tool.names.containerImageBase}`,
+    ]);
     expect(confirmUpdateAll).toHaveBeenCalledOnce();
     expect(confirmUpdate).not.toHaveBeenCalled();
     expect(err).toEqual([]);
