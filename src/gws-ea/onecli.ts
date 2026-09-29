@@ -3,7 +3,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 
 import { isErrno } from '../community-portal/errors.js';
-import { preparePrivateDirectory } from './paths.js';
+import { isRegularFile, preparePrivateDirectory } from './paths.js';
 import { PRESENT, type Observation } from './phases.js';
 import { findPortHolder, portInUseError, type PortHolder } from './ports.js';
 import {
@@ -23,19 +23,21 @@ import {
 } from './secrets.js';
 import {
   ONECLI_INSTANCE_LABEL,
-  ONECLI_POSTGRES_IMAGE,
   ONECLI_RESOURCE_ROLE_LABEL,
   ONECLI_WAIT_TIMEOUT_SECONDS,
   onecliGatewayImage,
+  parseOnecliComposeImages,
   renderOnecliCompose,
   type OnecliPins,
   type OnecliRuntimeLayout,
+  type OnecliServiceImages,
 } from './onecli-compose.js';
 import {
   ONECLI_WRAPPER_BASE_ARG,
   ONECLI_WRAPPER_HASH_ARG,
   ONECLI_WRAPPER_LABEL,
   resolveWrapperGatewayImage,
+  wrapperImageHash,
   wrapperImageSourceDir,
 } from './onecli-gateway-image.js';
 import { ONECLI_SDK_VERSION } from './pins.js';
@@ -200,11 +202,13 @@ function buildComposeEnvironment(
   return environment;
 }
 
-async function prepareOnecliRuntime(
-  layout: OnecliRuntimeLayout,
-  pins: OnecliPins,
-  gatewayImage: string,
-): Promise<void> {
+/**
+ * Prepare the instance's private material. A new instance's Compose file is
+ * rendered from this tool's tree, which is the release it deploys; an existing
+ * one is the release's own record of what the instance runs, so it is never
+ * rendered again here (KTD6).
+ */
+async function prepareOnecliRuntime(layout: OnecliRuntimeLayout, pins: OnecliPins): Promise<void> {
   await preparePrivateDirectory(layout.rootDirectory);
   await Promise.all([preparePrivateDirectory(layout.cliHome), preparePrivateDirectory(layout.secretsDirectory)]);
 
@@ -213,23 +217,51 @@ async function prepareOnecliRuntime(
     ensureRandomOwnerOnlyFile(layout.encryptionKeyFile, 'base64'),
     ensureRandomOwnerOnlyFile(layout.gatewayInternalSecretFile, 'base64url'),
   ]);
-  await writePrivateTextFile(layout.composeFile, renderOnecliCompose(layout, pins, gatewayImage));
-  await writePrivateTextFile(layout.envFile, '# Intentionally empty: runtime coordinates are passed explicitly.\n');
+  if (!(await isRegularFile(layout.composeFile))) {
+    const { image } = await resolveWrapperGatewayImage(pins);
+    await writePrivateTextFile(layout.composeFile, renderOnecliCompose(layout, pins, image));
+  }
+  if (!(await isRegularFile(layout.envFile))) {
+    await writePrivateTextFile(layout.envFile, '# Intentionally empty: runtime coordinates are passed explicitly.\n');
+  }
+}
+
+/** What the instance runs, as its own Compose file names it, with the content hash its gateway tag carries. */
+interface InstanceOnecliImages extends OnecliServiceImages {
+  readonly gatewayHash: string;
 }
 
 /**
- * Build the content-addressed wrapper gateway image if it is not already present.
- * The tag encodes the build-context content hash, so an unchanged wrapper reuses
- * the shared image and any firewall change yields a new tag that rebuilds here and
- * fails identity verification until rebuilt (KTD5/KTD6). The base is already local
- * (pulled for the app service), so only the small firewall layer is built.
+ * The images the instance's own Compose file runs, never recomputed from any
+ * tree (KTD6). The app must run the OneCLI its release pinned, and the gateway
+ * must be a wrapper tag, whose hash its image's provenance label carries. A
+ * missing file raises the underlying ENOENT for the caller to interpret.
  */
-async function ensureWrapperGatewayImage(
-  docker: OnecliDocker,
-  pins: OnecliPins,
-  gatewayImage: string,
-  wrapperHash: string,
-): Promise<void> {
+async function instanceOnecliImages(layout: OnecliRuntimeLayout, pins: OnecliPins): Promise<InstanceOnecliImages> {
+  const images = parseOnecliComposeImages(await readOwnerOnlyFile(layout.composeFile));
+  const pinned = onecliGatewayImage(pins);
+  if (images.app !== pinned) {
+    throw new GwsEaError(
+      INVALID_RUNTIME,
+      `The OneCLI Compose file runs ${images.app}, not this assistant's pinned ${pinned}`,
+    );
+  }
+  const gatewayHash = wrapperImageHash(images.gateway);
+  if (gatewayHash === undefined) {
+    throw new GwsEaError('unsafe_onecli_image', `OneCLI gateway image ${images.gateway} is not a gws-ea wrapper image`);
+  }
+  return { ...images, gatewayHash };
+}
+
+/**
+ * Build the instance's wrapper gateway image when it is not already present.
+ * The tag encodes the build-context content hash, so an unchanged wrapper
+ * reuses the shared image (KTD5). Only this tool's tree can be built here, so
+ * a missing image another release built is refused rather than replaced by
+ * this tool's firewall. The base is already local (pulled for the app
+ * service), so only the small firewall layer is built.
+ */
+async function ensureWrapperGatewayImage(docker: OnecliDocker, pins: OnecliPins, gatewayImage: string): Promise<void> {
   const { runner, environment, layout } = docker;
   // `image ls -q` exits 0 whether or not the tag exists (empty stdout when absent),
   // so a present image is a clean skip without catching a lookup failure.
@@ -241,6 +273,13 @@ async function ensureWrapperGatewayImage(
     timeoutMs: INSPECT_TIMEOUT_MS,
   });
   if (present.stdout.trim().length > 0) return;
+  const wrapper = await resolveWrapperGatewayImage(pins);
+  if (wrapper.image !== gatewayImage) {
+    throw new GwsEaError(
+      'onecli_gateway_image_missing',
+      `This assistant's OneCLI gateway image ${gatewayImage} is missing, and this tool builds ${wrapper.image}. Resume it with the gws-ea release it runs to rebuild its gateway.`,
+    );
+  }
   await runner({
     command: 'docker',
     args: [
@@ -248,9 +287,9 @@ async function ensureWrapperGatewayImage(
       '--build-arg',
       `${ONECLI_WRAPPER_BASE_ARG}=${onecliGatewayImage(pins)}`,
       '--build-arg',
-      `${ONECLI_WRAPPER_HASH_ARG}=${wrapperHash}`,
+      `${ONECLI_WRAPPER_HASH_ARG}=${wrapper.hash}`,
       '--label',
-      `${ONECLI_WRAPPER_LABEL}=${wrapperHash}`,
+      `${ONECLI_WRAPPER_LABEL}=${wrapper.hash}`,
       '--tag',
       gatewayImage,
       wrapperImageSourceDir(),
@@ -262,11 +301,114 @@ async function ensureWrapperGatewayImage(
   });
 }
 
-function validateObservedOnecliRuntime(
+/** The gateway image an instance runs, and the one the release an update stages runs. */
+export interface GatewayImageChange {
+  readonly current: string;
+  readonly release: string;
+}
+
+/**
+ * Make the release's wrapper gateway image ready before an update's stop
+ * (KTD8), from this tool's tree, which is the release it deploys (R6). Only
+ * when its tag differs from the one the instance's Compose file names is
+ * Docker asked for it, and built when absent; content-addressed tags never
+ * collide, so a build never replaces what another assistant runs. The
+ * Compose file and the running runtime are left for the cutover.
+ */
+export async function prepareReleaseGatewayImage(
   layout: OnecliRuntimeLayout,
   pins: OnecliPins,
+  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'runCommand' | 'ambientEnv'> = {},
+): Promise<GatewayImageChange> {
+  const { gateway: current } = await instanceOnecliImages(layout, pins);
+  const { image: release } = await resolveWrapperGatewayImage(pins);
+  if (release !== current) await ensureWrapperGatewayImage(dockerContext(layout, dependencies), pins, release);
+  return { current, release };
+}
+
+/**
+ * Move an instance to the gateway the release an update deploys builds, at
+ * its cutover (KTD8): that image, which staging built, is made present
+ * first, so a failed build leaves the Compose file naming the gateway still
+ * running; only then is the file rendered for it and only the gateway
+ * recreated. `compose up` keeps every volume, and Postgres and the app run on
+ * as they are, since an update never changes their versions (R9). Rendered
+ * from this tool's tree, which is the release (R6). Run again after an
+ * interruption, it converges.
+ */
+export async function applyReleaseGateway(
+  layout: OnecliRuntimeLayout,
+  pins: OnecliPins,
+  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'runCommand' | 'ambientEnv'> = {},
+): Promise<void> {
+  const docker = dockerContext(layout, dependencies);
+  const { image } = await resolveWrapperGatewayImage(pins);
+  const { gateway } = await instanceOnecliImages(layout, pins);
+  await ensureWrapperGatewayImage(docker, pins, image);
+  if (gateway !== image) await writePrivateTextFile(layout.composeFile, renderOnecliCompose(layout, pins, image));
+  await docker.runner({
+    ...buildComposeInvocation(layout, [
+      'up',
+      '--detach',
+      '--wait',
+      '--wait-timeout',
+      String(ONECLI_WAIT_TIMEOUT_SECONDS),
+      '--pull',
+      'never',
+      '--no-deps',
+      'gateway',
+    ]),
+    env: docker.environment,
+    timeoutMs: UP_TIMEOUT_MS,
+    stream: true,
+  });
+}
+
+/**
+ * Put back the Compose file a kept release ran with and recreate the gateway
+ * it names, at a rollback (KTD8): the gateway image that release built is
+ * still present, since assistant commands never delete one; only when it is
+ * missing and this tool's tree builds the same content is it built again,
+ * and otherwise it is refused before the Compose file changes. Only the
+ * gateway is recreated, and every volume is kept. Run again after an
+ * interruption, it converges.
+ */
+export async function restoreReleaseGateway(
+  layout: OnecliRuntimeLayout,
+  pins: OnecliPins,
+  compose: string,
+  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'runCommand' | 'ambientEnv'> = {},
+): Promise<void> {
+  const docker = dockerContext(layout, dependencies);
+  const { gateway } = parseOnecliComposeImages(compose);
+  if (wrapperImageHash(gateway) === undefined) {
+    throw new GwsEaError('unsafe_onecli_image', `OneCLI gateway image ${gateway} is not a gws-ea wrapper image`);
+  }
+  await ensureWrapperGatewayImage(docker, pins, gateway);
+  if ((await readOwnerOnlyFile(layout.composeFile)) !== compose)
+    await writePrivateTextFile(layout.composeFile, compose);
+  await docker.runner({
+    ...buildComposeInvocation(layout, [
+      'up',
+      '--detach',
+      '--wait',
+      '--wait-timeout',
+      String(ONECLI_WAIT_TIMEOUT_SECONDS),
+      '--pull',
+      'never',
+      '--no-deps',
+      'gateway',
+    ]),
+    env: docker.environment,
+    timeoutMs: UP_TIMEOUT_MS,
+    stream: true,
+  });
+}
+
+function validateObservedOnecliRuntime(
+  layout: OnecliRuntimeLayout,
   observed: ObservedOnecliRuntime,
-  gatewayImage: string,
+  expected: OnecliServiceImages,
 ): void {
   for (const container of observed.containers) {
     const expectedNetworks = expectedNetworksForService(layout, container.service);
@@ -289,8 +431,7 @@ function validateObservedOnecliRuntime(
     if (!container.running || container.health !== 'healthy') {
       throw new GwsEaError('unhealthy_onecli', `OneCLI ${service} container is not healthy`);
     }
-    const expectedImage =
-      service === 'postgres' ? ONECLI_POSTGRES_IMAGE : service === 'gateway' ? gatewayImage : onecliGatewayImage(pins);
+    const expectedImage = expected[service];
     if (container.image !== expectedImage) {
       throw new GwsEaError(
         'unsafe_onecli_image',
@@ -333,10 +474,12 @@ function validateObservedOnecliRuntime(
 
 /**
  * The runtime as liveness sees it. Present when all three services run
- * healthy exactly as rendered; a service Docker still reports as starting is
- * unknown, so the engine waits; a missing, stopped, or unhealthy one is
- * absent, so it is repaired at once. Another instance's container in this
- * project stops the run; Docker failing to answer is unknown.
+ * healthy exactly as the instance's own Compose file names them, the gateway's
+ * image carrying the provenance its tag names; a service Docker still reports
+ * as starting is unknown, so the engine waits; a missing, stopped, or
+ * unhealthy one, or a missing Compose file, is absent, so it is repaired at
+ * once. Another instance's container in this project stops the run; Docker
+ * failing to answer is unknown.
  */
 export async function observeOnecliRuntime(
   layout: OnecliRuntimeLayout,
@@ -348,8 +491,15 @@ export async function observeOnecliRuntime(
     const containers = await inspectProjectContainers(docker);
     const seen = serviceObservation(layout, containers);
     if (seen.status !== 'present') return seen;
-    const { image: gatewayImage } = await resolveWrapperGatewayImage(pins);
-    validateObservedOnecliRuntime(layout, pins, await inspectOnecliRuntime(docker, containers), gatewayImage);
+    let expected: InstanceOnecliImages;
+    try {
+      expected = await instanceOnecliImages(layout, pins);
+    } catch (error) {
+      if (isErrno(error, 'ENOENT')) return { status: 'absent', reason: 'its Compose file is missing' };
+      throw error;
+    }
+    validateObservedOnecliRuntime(layout, await inspectOnecliRuntime(docker, containers), expected);
+    await assertWrapperGatewayProvenance(docker, expected);
     return PRESENT;
   } catch (error) {
     if (!(error instanceof GwsEaError) || !['command_failed', 'command_timeout'].includes(error.code)) throw error;
@@ -382,38 +532,25 @@ function serviceObservation(layout: OnecliRuntimeLayout, containers: readonly Ob
 }
 
 /**
- * The health and version check. The runtime must run healthy at this
- * instance's pinned images, answer on its health endpoints, and report this
- * instance's pinned CLI and gateway versions. The receipt carries the local
- * API key for importing the provider credential and persisting the key files.
+ * The health and version check. The runtime must run healthy at the images
+ * the instance's own Compose file names, answer on its health endpoints, and
+ * report this instance's pinned CLI and gateway versions. The receipt carries
+ * the local API key for importing the provider credential and persisting the
+ * key files.
  */
 export async function verifyOnecliRuntime(
   layout: OnecliRuntimeLayout,
   pins: OnecliPins,
   dependencies: OnecliRuntimeDependencies = {},
 ): Promise<OnecliRuntimeReceipt> {
-  return verifyResolvedOnecliRuntime(layout, pins, dependencies, await resolveWrapperGatewayImage(pins));
-}
-
-/**
- * The verify body, given an already-resolved wrapper image. `reconcileOnecliRuntime`
- * calls this with the hash/tag it computed for the build, so a reconcile hashes the
- * wrapper source once rather than again here.
- */
-async function verifyResolvedOnecliRuntime(
-  layout: OnecliRuntimeLayout,
-  pins: OnecliPins,
-  dependencies: OnecliRuntimeDependencies,
-  resolved: { readonly hash: string; readonly image: string },
-): Promise<OnecliRuntimeReceipt> {
   const runCommand = dependencies.runCommand ?? runSanitizedCommand;
   const fetchImplementation = dependencies.fetch ?? globalThis.fetch;
   await removePrivateFile(layout.providerStagingFile);
   const docker = dockerContext(layout, dependencies);
-  const { hash: wrapperHash, image: gatewayImage } = resolved;
-  validateObservedOnecliRuntime(layout, pins, await inspectOnecliRuntime(docker), gatewayImage);
+  const expected = await instanceOnecliImages(layout, pins);
+  validateObservedOnecliRuntime(layout, await inspectOnecliRuntime(docker), expected);
   await Promise.all([
-    assertWrapperGatewayProvenance(docker, gatewayImage, wrapperHash),
+    assertWrapperGatewayProvenance(docker, expected),
     assertHealthyEndpoint(fetchImplementation, `${layout.appUrl}/api/health`, 'OneCLI app'),
     assertHealthyEndpoint(fetchImplementation, `${layout.appUrl}/v1/health`, 'OneCLI versioned API'),
     assertHealthyEndpoint(fetchImplementation, `${layout.gatewayUrl}/healthz`, 'OneCLI gateway'),
@@ -529,10 +666,11 @@ async function writeOrVerifyOwnerOnlySecret(file: string, value: string): Promis
 }
 
 /**
- * Start or repair the runtime: pull missing images under their own
- * timeout, force-recreate only a service Docker reports unhealthy, then
- * start everything and wait for health within the budget the healthchecks
- * allow. A failed start names a foreign process on an allocated port.
+ * Start or repair the runtime its Compose file describes: pull missing images
+ * under their own timeout, force-recreate only a service Docker reports
+ * unhealthy, then start everything and wait for health within the budget the
+ * healthchecks allow. A failed start names a foreign process on an allocated
+ * port.
  */
 export async function reconcileOnecliRuntime(
   layout: OnecliRuntimeLayout,
@@ -541,9 +679,8 @@ export async function reconcileOnecliRuntime(
 ): Promise<OnecliRuntimeReceipt> {
   const docker = dockerContext(layout, dependencies);
   const { runner, environment } = docker;
-  const wrapper = await resolveWrapperGatewayImage(pins);
-  const { hash: wrapperHash, image: gatewayImage } = wrapper;
-  await prepareOnecliRuntime(layout, pins, gatewayImage);
+  await prepareOnecliRuntime(layout, pins);
+  const { gateway: gatewayImage } = await instanceOnecliImages(layout, pins);
   await removePrivateFile(layout.providerStagingFile);
   const kept = await cleanupOnecliDockerOrphans(docker);
   // Pull only the registry-sourced services; the gateway runs the locally built
@@ -556,7 +693,7 @@ export async function reconcileOnecliRuntime(
     timeoutMs: ONECLI_PULL_TIMEOUT_MS,
     stream: true,
   });
-  await ensureWrapperGatewayImage(docker, pins, gatewayImage, wrapperHash);
+  await ensureWrapperGatewayImage(docker, pins, gatewayImage);
   const up = (args: readonly string[]): Promise<unknown> =>
     runner({
       ...buildComposeInvocation(layout, [
@@ -582,7 +719,7 @@ export async function reconcileOnecliRuntime(
   } catch (error) {
     throw (await foreignPortError(docker, dependencies, error)) ?? error;
   }
-  return verifyResolvedOnecliRuntime(layout, pins, dependencies, wrapper);
+  return verifyOnecliRuntime(layout, pins, dependencies);
 }
 
 /**
@@ -892,24 +1029,20 @@ async function verifyAgentNetworkIsolation(docker: OnecliDocker, pins: OnecliPin
   });
 }
 
-/** Confirm the running gateway image was built from the current firewall content (KTD6). */
-async function assertWrapperGatewayProvenance(
-  docker: OnecliDocker,
-  gatewayImage: string,
-  wrapperHash: string,
-): Promise<void> {
+/** Confirm the gateway image was built from the firewall content its tag names (KTD6). */
+async function assertWrapperGatewayProvenance(docker: OnecliDocker, expected: InstanceOnecliImages): Promise<void> {
   const { runner, environment, layout } = docker;
   const { stdout } = await runner({
     command: 'docker',
-    args: ['image', 'inspect', gatewayImage, '--format', `{{index .Config.Labels "${ONECLI_WRAPPER_LABEL}"}}`],
+    args: ['image', 'inspect', expected.gateway, '--format', `{{index .Config.Labels "${ONECLI_WRAPPER_LABEL}"}}`],
     cwd: layout.rootDirectory,
     env: environment,
     timeoutMs: INSPECT_TIMEOUT_MS,
   });
-  if (stdout.trim() !== wrapperHash) {
+  if (stdout.trim() !== expected.gatewayHash) {
     throw new GwsEaError(
       'unsafe_onecli_image',
-      `OneCLI gateway image ${gatewayImage} provenance label does not match its build content`,
+      `OneCLI gateway image ${expected.gateway} provenance label does not match its build content`,
     );
   }
 }

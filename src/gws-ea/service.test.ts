@@ -15,10 +15,14 @@ import {
   instanceServicePid,
   launchInstanceHost,
   loadInstanceRuntimeConfig,
+  instanceServiceDefinitionFile,
   persistInstanceRuntime,
+  readInstanceHostEnvironment,
   reconcileInstanceRuntime,
   reconcileInstanceService,
   runInstanceOnecliAdminCommand,
+  writeInstanceServiceDefinition,
+  writeReleaseRuntime,
   type InstanceRuntimeConfig,
   type InstanceServiceLayout,
   type UpsertEnvVars,
@@ -155,20 +159,22 @@ describe('GWS-EA instance runtime', () => {
     ).rejects.toMatchObject({ code: 'runtime_conflict' });
   });
 
-  it('keeps a .env key another writer added when resume persists the runtime again', async () => {
+  it('adds only the gws-ea .env keys that are missing when resume persists the runtime again', async () => {
     const { config } = await fixture();
     await persistInstanceRuntime(config, upsertEnvVars);
     const environmentFile = path.join(config.checkout_realpath, '.env');
-    const stale = (await readFile(environmentFile, 'utf8')).replace('WEBHOOK_HOST=127.0.0.1', 'WEBHOOK_HOST=0.0.0.0');
-    await writeFile(environmentFile, `${stale}# added by /add-telegram\nTELEGRAM_BOT_TOKEN=skill-value\n`);
+    // An earlier release quoted its value; the egress network key was lost; a skill added its own.
+    const earlier = (await readFile(environmentFile, 'utf8'))
+      .replace('WEBHOOK_HOST=127.0.0.1', 'WEBHOOK_HOST="127.0.0.1"')
+      .replace(`NANOCLAW_EGRESS_NETWORK=${config.agent_egress_network}\n`, '');
+    await writeFile(environmentFile, `${earlier}# added by /add-telegram\nTELEGRAM_BOT_TOKEN=skill-value\n`);
 
     await persistInstanceRuntime(config, upsertEnvVars);
 
-    const lines = (await readFile(environmentFile, 'utf8')).split('\n');
-    expect(lines).toContain('TELEGRAM_BOT_TOKEN=skill-value');
-    expect(lines).toContain('# added by /add-telegram');
-    expect(lines.filter((line) => line.startsWith('WEBHOOK_HOST='))).toEqual(['WEBHOOK_HOST=127.0.0.1']);
-    expect(lines).toContain(`NANOCLAW_INSTALL_ID=${config.install_id}`);
+    const contents = await readFile(environmentFile, 'utf8');
+    expect(contents).toBe(
+      `${earlier}# added by /add-telegram\nTELEGRAM_BOT_TOKEN=skill-value\nNANOCLAW_EGRESS_NETWORK=${config.agent_egress_network}\n`,
+    );
   });
 
   it('runs OneCLI administration through the pinned binary and admin-only credential file', async () => {
@@ -206,7 +212,7 @@ describe('GWS-EA instance runtime', () => {
     expect(command?.env).not.toHaveProperty('GCHAT_CREDENTIALS');
   });
 
-  it('reloads a changed launchd definition with bootout then one bootstrap, and reports its layout and pid', async () => {
+  it('keeps an existing launchd definition as written, reloading it with bootout then one bootstrap, and reports its layout and pid', async () => {
     const { config, home } = await fixture();
     await persistInstanceRuntime(config, upsertEnvVars);
     const checkout = config.checkout_realpath;
@@ -227,7 +233,8 @@ describe('GWS-EA instance runtime', () => {
       installLabel: `nanoclaw-install=${config.install_id}`,
     };
     await mkdir(path.dirname(layout.serviceDefinitionPath), { recursive: true });
-    await writeFile(layout.serviceDefinitionPath, '<plist>an earlier launcher’s definition</plist>');
+    const earlier = '<plist>the definition an earlier release rendered</plist>';
+    await writeFile(layout.serviceDefinitionPath, earlier);
     const calls: SanitizedCommand[] = [];
     const runner = vi.fn(async (command: SanitizedCommand) => {
       calls.push(command);
@@ -256,9 +263,8 @@ describe('GWS-EA instance runtime', () => {
       ['launchctl', 'print', domain],
     ]);
     expect(started).toEqual({ layout, pid: 4242 });
-    expect(definition).not.toContain('an earlier launcher');
-    expect(definition).toContain(path.join(config.checkout_realpath, 'dist', 'gws-ea', 'process.js'));
-    expect(definition).toContain(layout.runtimeConfigFile);
+    // An existing definition is the release's own: starting the service never re-renders it.
+    expect(definition).toBe(earlier);
 
     const cli = buildInstanceCliCommand(config, ['groups', 'list'], { PATH: '/safe/bin', HOME: '/attacker' });
     expect(cli.command).toBe(path.join(config.checkout_realpath, 'bin', 'ncl'));
@@ -392,7 +398,7 @@ describe('GWS-EA instance runtime', () => {
     ]);
   });
 
-  it('carries the recorded Docker endpoint in the service definition and the image build', async () => {
+  it('renders a new instance’s service definition and every gws-ea .env key, carrying the recorded Docker endpoint', async () => {
     const { config, home } = await fixture();
     const calls: SanitizedCommand[] = [];
     const runner = vi.fn(async (command: SanitizedCommand) => {
@@ -412,9 +418,64 @@ describe('GWS-EA instance runtime', () => {
       const definition = await readFile(layout.serviceDefinitionPath, 'utf8');
       expect(definition).toContain(DOCKER_ENDPOINT);
       expect(definition).toMatch(platform === 'macos' ? /<key>DOCKER_HOST<\/key>/u : /Environment=DOCKER_HOST=/u);
+      expect(definition).toContain(layout.launcherEntrypoint);
+      expect(definition).toContain(layout.runtimeConfigFile);
     }
     const build = calls.find((call) => call.args.includes('container'))!;
     expect(build.env?.DOCKER_HOST).toBe(DOCKER_ENDPOINT);
+    const environment = await readFile(path.join(config.checkout_realpath, '.env'), 'utf8');
+    expect(environment.trimEnd().split('\n').sort()).toEqual(
+      [
+        `NANOCLAW_INSTALL_ID=${config.install_id}`,
+        'DEFAULT_AGENT_PROVIDER=claude',
+        'NANOCLAW_GATEWAY_PROVIDER=onecli',
+        `WEBHOOK_PORT=${config.allocated_ports.nanoclaw_webhook}`,
+        'WEBHOOK_HOST=127.0.0.1',
+        'NANOCLAW_EGRESS_LOCKDOWN=true',
+        `NANOCLAW_EGRESS_NETWORK=${config.agent_egress_network}`,
+        `ONECLI_GATEWAY_CONTAINER=${config.onecli_gateway_container}`,
+        `ONECLI_URL=${config.onecli_app_url}`,
+        `GCHAT_ENDPOINT_URL=${config.endpoint_url}`,
+      ].sort(),
+    );
+  });
+
+  it('resumes with an existing service definition and .env byte-identical, however this tool would render them', async () => {
+    const { config, home } = await fixture();
+    await persistInstanceRuntime(config, upsertEnvVars);
+    const environmentFile = path.join(config.checkout_realpath, '.env');
+    const environment = `# written by an earlier release\n${(await readFile(environmentFile, 'utf8')).replace(/=(.*)$/gmu, '="$1"')}`;
+    await writeFile(environmentFile, environment, { mode: 0o600 });
+    const definitionFile = path.join(home, 'Library', 'LaunchAgents', `com.nanoclaw-v2-${config.install_id}.plist`);
+    const definition = '<plist>the definition an earlier release rendered</plist>\n';
+    await mkdir(path.dirname(definitionFile), { recursive: true });
+    await writeFile(definitionFile, definition, { mode: 0o600 });
+    const calls: string[][] = [];
+    const runner = vi.fn(async (command: SanitizedCommand) => {
+      calls.push([command.command, ...command.args]);
+      return { stdout: '', stderr: '' };
+    });
+    const upsert = vi.fn(upsertEnvVars);
+
+    const { layout } = await reconcileInstanceRuntime(config, {
+      upsertEnvVars: upsert,
+      platform: 'macos',
+      homeDirectory: home,
+      runCommand: runner,
+      uid: 501,
+    });
+
+    expect(layout.serviceDefinitionPath).toBe(definitionFile);
+    expect(await readFile(definitionFile, 'utf8')).toBe(definition);
+    expect(upsert).not.toHaveBeenCalled();
+    expect(await readFile(environmentFile, 'utf8')).toBe(environment);
+    // The service still restarts from the definition it has.
+    expect(calls.filter(([program]) => program === 'launchctl').map(([, verb]) => verb)).toEqual([
+      'bootout',
+      'bootstrap',
+      'kickstart',
+      'print',
+    ]);
   });
 
   it.each([
@@ -572,5 +633,63 @@ describe('GWS-EA instance runtime', () => {
         NANOCLAW_INSTALL_ID: config.install_id,
       });
     }
+  });
+});
+
+describe('rendering the release an update deploys', () => {
+  it("writes the release's runtime record and every gws-ea .env key into its staged checkout, keeping other keys", async () => {
+    const { config } = await fixture();
+    await persistInstanceRuntime(config, upsertEnvVars);
+    const staged = path.join(path.dirname(config.checkout_realpath), 'next', 'nanoclaw');
+    await mkdir(staged, { recursive: true, mode: 0o700 });
+    await writeFile(path.join(staged, '.env'), 'INSTALL_CJK_FONTS=true\nWEBHOOK_PORT=1\nONECLI_URL=http://stale\n', {
+      mode: 0o600,
+    });
+    const release = { ...config, deployed_commit: 'b'.repeat(40) };
+
+    await writeReleaseRuntime(release, staged, upsertEnvVars);
+
+    const written = JSON.parse(await readFile(path.join(staged, 'data', 'gws-ea', 'runtime.json'), 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    // The record is the release's, for the path it will run from once swapped live.
+    expect(written).toMatchObject({ deployed_commit: 'b'.repeat(40), checkout_realpath: config.checkout_realpath });
+    expect((await stat(path.join(staged, 'data', 'gws-ea', 'runtime.json'))).mode & 0o777).toBe(0o600);
+    const environment = await readFile(path.join(staged, '.env'), 'utf8');
+    expect(environment).toContain('INSTALL_CJK_FONTS=true');
+    expect(environment).toContain(`WEBHOOK_PORT=${config.allocated_ports.nanoclaw_webhook}`);
+    expect(environment).toContain(`ONECLI_URL=${config.onecli_app_url}`);
+    expect(environment).not.toContain('stale');
+    expect(readInstanceHostEnvironment(staged)).toEqual(readInstanceHostEnvironment(config.checkout_realpath));
+    expect(Object.keys(readInstanceHostEnvironment(staged))).not.toContain('INSTALL_CJK_FONTS');
+    // The live checkout is untouched.
+    expect(
+      JSON.parse(await readFile(path.join(config.checkout_realpath, 'data', 'gws-ea', 'runtime.json'), 'utf8')),
+    ).toMatchObject({ deployed_commit: config.deployed_commit });
+  });
+
+  it('writes the service definition an update renders only when it differs, and reloads systemd for it', async () => {
+    const { config, home } = await fixture();
+    const calls: SanitizedCommand[] = [];
+    const runCommand = vi.fn(async (command: SanitizedCommand) => {
+      calls.push(command);
+      return { stdout: '', stderr: '' };
+    });
+    for (const platform of ['macos', 'linux'] as const) {
+      const options = { platform, homeDirectory: home, runningAsRoot: false, runCommand, uid: 1000 };
+      const file = instanceServiceDefinitionFile(config, options);
+      await mkdir(path.dirname(file), { recursive: true });
+      await writeFile(file, 'the definition an earlier release rendered\n', { mode: 0o600 });
+
+      expect(await writeInstanceServiceDefinition(config, options)).toBe(true);
+      const rendered = await readFile(file, 'utf8');
+      expect(rendered).toContain(path.join(config.checkout_realpath, 'dist', 'gws-ea', 'process.js'));
+      expect((await stat(file)).mode & 0o777).toBe(0o600);
+      expect(await writeInstanceServiceDefinition(config, options)).toBe(false);
+      expect(await readFile(file, 'utf8')).toBe(rendered);
+    }
+    // launchd reads its definition when the job is bootstrapped; systemd must be told once it changed.
+    expect(calls.map((call) => [call.command, ...call.args])).toEqual([['systemctl', '--user', 'daemon-reload']]);
   });
 });

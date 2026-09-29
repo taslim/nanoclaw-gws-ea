@@ -22,7 +22,12 @@ import {
   type StepResource,
 } from './phases.js';
 import { assertReleaseCheckoutAgreement, materializeReleaseCheckout, type ResolvedRelease } from './checkout.js';
-import { runReleasePreflight, type ReleasePreflightInput, type ReleasePreflightResult } from './release-preflight.js';
+import {
+  runReleasePreflight,
+  type DeployedSetup,
+  type ReleasePreflightInput,
+  type ReleasePreflightResult,
+} from './release-preflight.js';
 import {
   findCredentialSecret,
   importProviderCredential,
@@ -34,7 +39,12 @@ import {
   type OnecliRuntimeReceipt,
   type OnecliRuntimeDependencies,
 } from './onecli.js';
-import { createOnecliRuntimeLayout, type OnecliPins, type OnecliRuntimeLayout } from './onecli-compose.js';
+import {
+  createOnecliRuntimeLayout,
+  parseOnecliComposeImages,
+  type OnecliPins,
+  type OnecliRuntimeLayout,
+} from './onecli-compose.js';
 import {
   reconcileInstanceRuntime,
   runInstanceOnecliAdminCommand,
@@ -70,7 +80,7 @@ import {
 import { readOwnerOnlyFile, readOwnerOnlyJson, removePrivateFile, writePrivateTextFile } from './secrets.js';
 import { assertInstanceId, getInstanceReservation } from './registry.js';
 import { isErrno } from '../community-portal/errors.js';
-import { isRegularFile, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
+import { instanceRuntimeFile, isRegularFile, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import { pollUntil } from './poll.js';
 import { findPortHolder, portInUseError } from './ports.js';
 import {
@@ -225,7 +235,8 @@ interface ReleasePreflightReceipt extends ReleasePreflightResult {
 
 interface ReleasePreflightExpectation {
   readonly instanceId: string;
-  readonly deployedCommit: string;
+  /** The commits the receipt may name: the reservation's, and mid-update the one an operation placed live. */
+  readonly deployedCommits: readonly string[];
   readonly provider: string;
   readonly providerCapabilityDigest?: string;
   readonly providerCredential?: ProviderCredentialMetadata;
@@ -279,7 +290,7 @@ function validateReleasePreflightReceipt(
   if (
     receipt.schema_version !== 1 ||
     validated.instance_id !== expectation.instanceId ||
-    validated.deployed_commit !== expectation.deployedCommit ||
+    !expectation.deployedCommits.includes(validated.deployed_commit) ||
     validated.provider !== expectation.provider ||
     (expectation.providerCapabilityDigest !== undefined &&
       providerCapabilityDigest !== expectation.providerCapabilityDigest) ||
@@ -305,7 +316,7 @@ async function loadReleasePreflightReceipt(
 function instanceReleaseReceipt(context: ProductionProvisionContext): Promise<ReleasePreflightReceipt> {
   return loadReleasePreflightReceipt(context.operation.paths.releasePreflightFile(context.operation.instanceId), {
     instanceId: context.operation.instanceId,
-    deployedCommit: context.input.release.commit,
+    deployedCommits: [context.input.release.commit],
     provider: context.input.releasePreflight.provider,
     providerCapabilityDigest: context.input.releasePreflight.providerCapabilityDigest,
     providerCredential: context.input.releasePreflight.providerCredential,
@@ -318,19 +329,32 @@ async function instanceOnecliPins(context: ProductionProvisionContext): Promise<
   return { gateway: onecli.gateway, cli: onecli.cli };
 }
 
-async function persistReleasePreflightReceipt(
-  context: ProductionProvisionContext,
+/** Record what a release preflight established for `instanceId` at `deployedCommit`, owner-only, at `file`. */
+export async function writeReleasePreflightReceipt(
+  file: string,
+  instanceId: string,
+  deployedCommit: string,
   result: ReleasePreflightResult,
 ): Promise<void> {
   const receipt: ReleasePreflightReceipt = {
     schema_version: 1,
-    instance_id: context.operation.instanceId,
-    deployed_commit: context.input.release.commit,
+    instance_id: instanceId,
+    deployed_commit: deployedCommit,
     ...result,
   };
-  await writePrivateTextFile(
-    context.operation.paths.releasePreflightFile(context.operation.instanceId),
-    `${JSON.stringify(receipt, null, 2)}\n`,
+  await writePrivateTextFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
+}
+
+async function persistReleasePreflightReceipt(
+  context: ProductionProvisionContext,
+  result: ReleasePreflightResult,
+): Promise<void> {
+  const { paths, instanceId } = context.operation;
+  await writeReleasePreflightReceipt(
+    paths.releasePreflightFile(instanceId),
+    instanceId,
+    context.input.release.commit,
+    result,
   );
 }
 
@@ -345,8 +369,7 @@ async function ensureReleaseCheckout(
     if (!['ENOENT', 'marker_missing', 'checkout_exists', 'unsafe_checkout'].includes(code ?? '')) throw error;
     await dependencies.materializeReleaseCheckout(
       context.operation.paths,
-      context.operation.instanceId,
-      context.input.release,
+      await getInstanceReservation(context.operation.paths, context.operation.instanceId),
     );
   }
   const result = await dependencies.runReleasePreflight(context.input.releasePreflight);
@@ -1410,7 +1433,7 @@ async function resolveProvisionSource(
   }
   const preflight = await loadReleasePreflightReceipt(operation.paths.releasePreflightFile(operation.instanceId), {
     instanceId: operation.instanceId,
-    deployedCommit: reservation.deployed_commit,
+    deployedCommits: [reservation.deployed_commit],
     provider: runtime.selected_provider,
   });
   const profile = readPersistedProfile(runtime);
@@ -1445,9 +1468,62 @@ async function readInstanceState(paths: ControlPlanePaths, reservation: Instance
   };
   const [manifest, runtime] = await Promise.all([
     loadProductionBootstrapManifest(paths.bootstrapFile(reservation.instance_id)).catch(absent),
-    loadInstanceRuntimeConfig(path.join(reservation.checkout_realpath, 'data', 'gws-ea', 'runtime.json')).catch(absent),
+    loadInstanceRuntimeConfig(instanceRuntimeFile(reservation.checkout_realpath)).catch(absent),
   ]);
   return { ...(manifest ? { manifest } : {}), ...(runtime ? { runtime } : {}) };
+}
+
+/** The instance's OneCLI layout, run through the CLI and Docker endpoint it records. */
+export function instanceOnecliLayout(
+  paths: ControlPlanePaths,
+  reservation: InstanceReservation,
+  cliExecutable: string,
+  dockerEndpoint: string,
+): OnecliRuntimeLayout {
+  return createOnecliRuntimeLayout({
+    instanceId: reservation.instance_id,
+    instanceRoot: paths.instanceRoot(reservation.instance_id),
+    project: reservation.exclusive_resource_claims.onecli_project,
+    appPort: reservation.allocated_ports.onecli_app,
+    gatewayPort: reservation.allocated_ports.onecli_gateway,
+    cliExecutable,
+    dockerEndpoint,
+  });
+}
+
+export interface DeployedAssistantSetup extends DeployedSetup {
+  /** The OneCLI CLI the assistant's runtime runs. */
+  readonly onecliCliPath: string;
+}
+
+/**
+ * What a created assistant's own record says it runs (KTD6): the provider,
+ * credential metadata, and OneCLI cohort its release receipt records, the
+ * OneCLI CLI its runtime uses, and the Postgres image its Compose file names.
+ * An update holds the tool's release to these, never to the tool's own tree.
+ * The receipt must be for one of `commits`: the reservation's by default, or
+ * mid-update also the release an operation placed live (KTD17).
+ */
+export async function readDeployedSetup(
+  paths: ControlPlanePaths,
+  reservation: InstanceReservation,
+  commits: readonly string[] = [reservation.deployed_commit],
+): Promise<DeployedAssistantSetup> {
+  const runtime = await loadInstanceRuntimeConfig(instanceRuntimeFile(reservation.checkout_realpath));
+  const receipt = await loadReleasePreflightReceipt(paths.releasePreflightFile(reservation.instance_id), {
+    instanceId: reservation.instance_id,
+    deployedCommits: commits,
+    provider: runtime.selected_provider,
+  });
+  const onecli = instanceOnecliLayout(paths, reservation, runtime.onecli_cli_path, runtime.docker_endpoint);
+  const images = parseOnecliComposeImages(await readOwnerOnlyFile(onecli.composeFile));
+  return {
+    onecli: receipt.onecli,
+    postgresImage: images.postgres,
+    provider: receipt.provider,
+    providerCredential: receipt.providerCredential,
+    onecliCliPath: runtime.onecli_cli_path,
+  };
 }
 
 /**
@@ -1488,25 +1564,15 @@ export async function runProductionProvision(
   }
   const reservation = await getInstanceReservation(operation.paths, operation.instanceId);
   const { manifest, runtime: persistedRuntime } = await readInstanceState(operation.paths, reservation);
-  const onecliLayout = (cliExecutable: string, dockerEndpoint: string): OnecliRuntimeLayout =>
-    createOnecliRuntimeLayout({
-      instanceId: reservation.instance_id,
-      instanceRoot: operation.paths.instanceRoot(reservation.instance_id),
-      project: reservation.exclusive_resource_claims.onecli_project,
-      appPort: reservation.allocated_ports.onecli_app,
-      gatewayPort: reservation.allocated_ports.onecli_gateway,
-      cliExecutable,
-      dockerEndpoint,
-    });
   let runtime: InstanceRuntimeConfig;
   let onecli: OnecliRuntimeLayout;
   if (persistedRuntime) {
     runtime = persistedRuntime;
-    onecli = onecliLayout(runtime.onecli_cli_path, runtime.docker_endpoint);
+    onecli = instanceOnecliLayout(operation.paths, reservation, runtime.onecli_cli_path, runtime.docker_endpoint);
   } else {
     if (!manifest) throw new GwsEaError('bootstrap_required', 'The temporary bootstrap manifest is missing');
     // The runtime records this layout's CLI path and Docker endpoint verbatim, so the layout matches it too.
-    onecli = onecliLayout(manifest.onecli_cli_path, manifest.docker_endpoint);
+    onecli = instanceOnecliLayout(operation.paths, reservation, manifest.onecli_cli_path, manifest.docker_endpoint);
     runtime = createInstanceRuntimeConfig(reservation, onecli, {
       nodePath: manifest.node_path,
       homeDirectory: manifest.home_directory,

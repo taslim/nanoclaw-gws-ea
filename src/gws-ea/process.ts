@@ -470,15 +470,24 @@ function indent(text: string): string {
     .join('\n');
 }
 
+/** The environment a command runs with, its PATH reduced to absolute entries, and the directories searched for it. */
+function commandEnvironment(command: SanitizedCommand): {
+  readonly environment: Record<string, string>;
+  readonly searched: readonly string[];
+} {
+  const environment = { ...(command.env ?? buildToolEnvironment()) };
+  const searched = executableSearchPath(environment.PATH);
+  if (environment.PATH !== undefined) environment.PATH = searched.join(path.delimiter);
+  return { environment, searched };
+}
+
 /**
  * The one runner for every child process. Parsed stdout is never logged; the
  * active step's raw log records the command, its outcome, the stdout byte
  * count, and redacted stderr. Streamed output is teed through the redactor.
  */
 export const runSanitizedCommandOutcome: SanitizedCommandOutcomeRunner = async (command) => {
-  const environment = { ...(command.env ?? buildToolEnvironment()) };
-  const searched = executableSearchPath(environment.PATH);
-  if (environment.PATH !== undefined) environment.PATH = searched.join(path.delimiter);
+  const { environment, searched } = commandEnvironment(command);
   for (const [key, value] of Object.entries(environment)) {
     if (isSecretEnvironmentKey(key)) registerSecret(value);
   }
@@ -528,16 +537,46 @@ export function missingExecutable(error: unknown, code: string, message: string)
   throw error;
 }
 
+function execveUnavailable(): GwsEaError {
+  return new GwsEaError('execve_unavailable', 'This Node.js runtime cannot replace its own process');
+}
+
 export function replaceProcess(
   executable: string,
   args: readonly string[],
   environment: Readonly<Record<string, string>>,
   execve: NonNullable<NodeJS.Process['execve']> | undefined = process.execve,
 ): never {
-  if (execve === undefined) {
-    throw new GwsEaError('execve_unavailable', 'This Node.js runtime cannot replace the service launcher process');
-  }
+  if (execve === undefined) throw execveUnavailable();
   return execve(executable, args, { ...environment });
+}
+
+/** Wait until everything already written to stdout and stderr is out: a replaced process cannot finish it. */
+async function flushStandardStreams(): Promise<void> {
+  await Promise.all(
+    [process.stdout, process.stderr].map((stream) => new Promise<void>((resolve) => stream.write('', () => resolve()))),
+  );
+}
+
+/**
+ * Hand this process to `command`, found and started as the runner would run
+ * it: the executable resolved on the command's own PATH, from its working
+ * directory, with exactly its environment. The tool inherits stdin, stdout,
+ * stderr, and signals, and its exit code is the process's. Nothing is
+ * replaced when the tool or its directory is missing. Only the command, its
+ * arguments, working directory, and environment apply.
+ */
+export async function replaceProcessWithCommand(
+  command: SanitizedCommand,
+  execve: NonNullable<NodeJS.Process['execve']> | undefined = process.execve,
+): Promise<never> {
+  if (execve === undefined) throw execveUnavailable();
+  const { environment, searched } = commandEnvironment(command);
+  const executable = await locateExecutable(command.command, searched);
+  await assertWorkingDirectory(command);
+  await flushStandardStreams();
+  process.chdir(command.cwd);
+  return replaceProcess(executable, [command.command, ...command.args], environment, execve);
 }
 
 async function runLauncherCommand(args: readonly string[]): Promise<void> {

@@ -7,7 +7,7 @@ import { prepareReleaseCommandEnvironments, type ReleaseCommandEnvironments } fr
 import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { GwsEaError } from './types.js';
 import { isRecord, parseJson, requireRecord } from './validation.js';
-import type { ProviderCredentialMetadata } from '../provider-credential.js';
+import { sameCredentialMetadata, type ProviderCredentialMetadata } from '../provider-credential.js';
 import { providerProvisioningCapabilityDigest } from '../provider-provisioning-capability.js';
 import { exactVersion, LAUNCHER_PINS, ONECLI_SDK_VERSION, parsePins, PIN_NAMES, type GwsEaPins } from './pins.js';
 import { assertInstalledOnecliSdkVersion } from './onecli.js';
@@ -386,6 +386,69 @@ function assertLauncherPins(release: GwsEaPins, sdk: string): void {
           launcher: LAUNCHER_PINS.cloudflaredImage,
         },
       },
+    );
+  }
+}
+
+/** The OneCLI cohort, Postgres image, and provider setup an assistant runs, as its own record says (KTD6). */
+export interface DeployedSetup {
+  readonly onecli: ReleasePreflightResult['onecli'];
+  readonly postgresImage: string;
+  readonly provider: string;
+  readonly providerCredential: ProviderCredentialMetadata;
+}
+
+/**
+ * The same for the tool's release. The credential is the one the release's
+ * setup declares for the assistant's provider, or undefined when the release
+ * does not compose that provider.
+ */
+export interface ReleaseSetup {
+  readonly onecli: ReleasePreflightResult['onecli'];
+  readonly postgresImage: string;
+  readonly providerCredential: ProviderCredentialMetadata | undefined;
+}
+
+/**
+ * An update keeps the assistant's OneCLI and Postgres versions and its
+ * provider setup (R9, KTD20): it neither migrates the OneCLI vault nor runs
+ * provider setup again. The provider capability digest is not compared; it
+ * changes with most releases while no provider code runs during an update.
+ */
+export function assertUpdateKeepsSetup(deployed: DeployedSetup, release: ReleaseSetup): void {
+  const retry = 'so run the update from a GWS-EA release that';
+  for (const [key, name] of [
+    ['gateway', PIN_NAMES.onecliGateway],
+    ['cli', PIN_NAMES.onecliCli],
+    ['sdk', 'OneCLI SDK'],
+  ] as const) {
+    if (release.onecli[key] !== deployed.onecli[key]) {
+      throw new GwsEaError(
+        'onecli_version_changed',
+        `This release pins ${name} ${release.onecli[key]}, but the assistant runs ${deployed.onecli[key]}; an update cannot change OneCLI versions, ${retry} pins ${name} ${deployed.onecli[key]}`,
+        { details: { pin: name, release: release.onecli[key], deployed: deployed.onecli[key] } },
+      );
+    }
+  }
+  if (release.postgresImage !== deployed.postgresImage) {
+    throw new GwsEaError(
+      'postgres_version_changed',
+      `This release runs OneCLI on the Postgres image ${release.postgresImage}, but the assistant runs ${deployed.postgresImage}; an update cannot change Postgres versions, ${retry} runs ${deployed.postgresImage}`,
+      { details: { release: release.postgresImage, deployed: deployed.postgresImage } },
+    );
+  }
+  if (!release.providerCredential) {
+    throw new GwsEaError(
+      'provider_not_composed',
+      `This release does not compose the assistant's provider ${deployed.provider}, and an update cannot change provider setup, ${retry} composes it`,
+      { details: { provider: deployed.provider } },
+    );
+  }
+  if (!sameCredentialMetadata(release.providerCredential, deployed.providerCredential)) {
+    throw new GwsEaError(
+      'provider_setup_changed',
+      `This release declares a different provider credential for ${deployed.provider} than the assistant was set up with; an update cannot change provider setup, ${retry} keeps it`,
+      { details: { provider: deployed.provider } },
     );
   }
 }

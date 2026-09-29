@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -31,6 +31,7 @@ import {
 import { CLOUDFLARED_IMAGE } from './pins.js';
 import type { SanitizedCommand } from './process.js';
 import { allocateInstanceId, readRegistry } from './registry.js';
+import { startRunLog, type RunLog } from './run-log.js';
 import { GwsEaError, PROVISION_STEPS, type InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
@@ -406,7 +407,7 @@ async function transportFixture(
     tokenRequests,
     reserve: (hostname: string, webhookPort: number) =>
       reserveInstance(paths, managedReservation(paths, hostname, webhookPort)),
-    run: async (instanceId = reserved.instance_id) => {
+    run: async (instanceId = reserved.instance_id, log?: RunLog) => {
       const registry = await readRegistry(paths);
       const claim = registry.instances[instanceId]!.exclusive_resource_claims.ingress;
       if (claim.mode !== 'managed-cloudflare') throw new Error('managed fixture');
@@ -440,7 +441,11 @@ async function transportFixture(
         },
       } as ProvisionSteps<unknown>;
       const result = await withInstanceOperation(paths, instanceId, (operation) =>
-        runProvisionSteps(operation, {}, steps, { sleep, emit: (event) => void events.push(event) }),
+        runProvisionSteps(operation, {}, steps, {
+          sleep,
+          emit: (event) => void events.push(event),
+          ...(log ? { run: log } : {}),
+        }),
       );
       if (!result) throw new Error('The instance operation was busy');
       return result;
@@ -930,19 +935,28 @@ describe('managed Cloudflare transport step', () => {
     expect(world.cloud.requests).toEqual([]);
   });
 
-  it('recreates the connector when the cloudflared pin moves, with no prompt', async () => {
+  it('leaves a running connector on another cloudflared pin as it is, and logs the drift', async () => {
     const world = await transportFixture();
     await world.run();
+    // Another release started the shared connector at its own pin.
     const previous = `cloudflare/cloudflared:2026.8.0@sha256:${'1'.repeat(64)}`;
     world.docker.container!.image = previous;
+    world.docker.images.add(previous);
     world.docker.images.delete(CLOUDFLARED_IMAGE);
     world.docker.calls.length = 0;
+    const log = await startRunLog({ paths: world.paths, command: 'resume', instanceId: world.instanceId });
 
-    await expect(world.run()).resolves.toEqual({ status: 'ready' });
+    await expect(world.run(world.instanceId, log)).resolves.toEqual({ status: 'ready' });
 
     expect(world.tokenRequests).toHaveLength(1);
-    expect(world.docker.calls.filter((args) => args[0] === 'pull')).toEqual([['pull', CLOUDFLARED_IMAGE]]);
-    expect(world.docker.container?.image).toBe(CLOUDFLARED_IMAGE);
+    expect(world.docker.calls.filter((args) => args[0] === 'pull' || args.includes('up'))).toEqual([]);
+    expect(world.docker.container?.image).toBe(previous);
+    const stepLog = (await readdir(log.directory, { recursive: true })).find((file) =>
+      file.endsWith('establish-transport.log'),
+    );
+    expect(await readFile(path.join(log.directory, stepLog!), 'utf8')).toContain(
+      `the Cloudflare connector: it runs ${previous}, not the pinned ${CLOUDFLARED_IMAGE}`,
+    );
   });
 
   it('waits for a connector that reports no config_version, then a newer one, before checking a new route', async () => {

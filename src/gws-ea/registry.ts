@@ -10,6 +10,7 @@ import {
   assertOwnedDirectory,
   assertPrivateDirectory,
   assertPrivateStateFile,
+  instanceMarkerFile,
   preparePrivateDirectory,
   type ControlPlanePaths,
 } from './paths.js';
@@ -18,12 +19,14 @@ import {
   INSTANCE_MARKER_SCHEMA_VERSION,
   REGISTRY_SCHEMA_VERSION,
   ingressEndpointUrl,
+  sameRelease,
   type AllocatedPorts,
   type ExclusiveResourceClaims,
   type IngressClaim,
   type InstanceMarker,
   type InstanceRegistry,
   type InstanceReservation,
+  type ReleaseCoordinates,
   type SharedCloudflareMetadata,
   type SharedInfrastructureMetadata,
 } from './types.js';
@@ -215,6 +218,20 @@ function validateSharedInfrastructure(value: unknown): SharedInfrastructureMetad
   return { cloudflare: validateSharedCloudflare(value.cloudflare) };
 }
 
+/** A release's source, track, and commit exactly as a reservation holds them; anything else raises `invalid_state`. */
+export function validateReleaseCoordinates(value: unknown): ReleaseCoordinates {
+  if (!isRecord(value)) throw new GwsEaError('invalid_state', 'Release coordinates are invalid');
+  const releaseTrack = requireString(value.release_track, 'release_track', 64);
+  if (!RELEASE_TRACK_PATTERN.test(releaseTrack)) throw new GwsEaError('invalid_state', 'Release track is invalid');
+  const deployedCommit = requireString(value.deployed_commit, 'deployed_commit', 40).toLowerCase();
+  if (!COMMIT_PATTERN.test(deployedCommit)) throw new GwsEaError('invalid_state', 'Deployed commit is invalid');
+  return {
+    source_remote: validateSourceRemote(value.source_remote),
+    release_track: releaseTrack,
+    deployed_commit: deployedCommit,
+  };
+}
+
 export function validateReservation(value: unknown, paths: ControlPlanePaths): InstanceReservation {
   if (!isRecord(value)) throw new GwsEaError('invalid_state', 'Instance reservation is invalid');
   const instanceId = requireString(value.instance_id, 'instance_id', 36);
@@ -224,16 +241,13 @@ export function validateReservation(value: unknown, paths: ControlPlanePaths): I
   if (path.resolve(checkout) !== expectedCheckout) {
     throw new GwsEaError('unsafe_path', 'Checkout path does not match the reserved instance path');
   }
-  const releaseTrack = requireString(value.release_track, 'release_track', 64);
-  if (!RELEASE_TRACK_PATTERN.test(releaseTrack)) throw new GwsEaError('invalid_state', 'Release track is invalid');
-  const deployedCommit = requireString(value.deployed_commit, 'deployed_commit', 40).toLowerCase();
-  if (!COMMIT_PATTERN.test(deployedCommit)) throw new GwsEaError('invalid_state', 'Deployed commit is invalid');
+  const release = validateReleaseCoordinates(value);
   return {
     instance_id: instanceId,
     checkout_realpath: expectedCheckout,
-    release_track: releaseTrack,
-    source_remote: validateSourceRemote(value.source_remote),
-    deployed_commit: deployedCommit,
+    release_track: release.release_track,
+    source_remote: release.source_remote,
+    deployed_commit: release.deployed_commit,
     allocated_ports: validatePorts(value.allocated_ports),
     exclusive_resource_claims: validateClaims(value.exclusive_resource_claims),
   };
@@ -584,6 +598,36 @@ export async function getInstanceReservation(
   return instance;
 }
 
+/**
+ * The single commit point of an update or rollback: under the machine lock,
+ * move one reservation's release from `expected` to `next`. Nothing else in
+ * the registry changes, and a reservation whose release is not `expected` is
+ * refused, so two writers can never both commit.
+ */
+export async function swapInstanceRelease(
+  paths: ControlPlanePaths,
+  instanceId: string,
+  expected: ReleaseCoordinates,
+  next: ReleaseCoordinates,
+): Promise<InstanceReservation> {
+  assertInstanceId(instanceId);
+  const release = validateReleaseCoordinates(next);
+  return withMachineLock(paths, async () => {
+    const registry = await readRegistryFile(paths);
+    const stored = registry.instances[instanceId];
+    if (!stored) throw new GwsEaError('unknown_instance', 'Unknown instance ID');
+    if (!sameRelease(stored, expected)) {
+      throw new GwsEaError('reservation_mismatch', "The assistant's recorded release changed; refusing to replace it");
+    }
+    const moved = validateReservation({ ...stored, ...release }, paths);
+    await writePrivate(
+      paths.registryFile,
+      validateRegistry({ ...registry, instances: { ...registry.instances, [instanceId]: moved } }, paths),
+    );
+    return moved;
+  });
+}
+
 export async function releaseInstanceReservation(
   paths: ControlPlanePaths,
   expected: InstanceReservation,
@@ -640,10 +684,18 @@ export async function readInstanceMarkerFile(file: string): Promise<InstanceMark
   }
 }
 
-async function assertMarkerAgreement(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<void> {
-  await assertOwnedDirectory(reservation.checkout_realpath);
-  const marker = await readInstanceMarkerFile(paths.markerFile(reservation.instance_id));
-  if (marker.instance_id !== reservation.instance_id || marker.deployed_commit !== reservation.deployed_commit) {
+/**
+ * A checkout is a physical directory whose marker names `instanceId` and, unless
+ * `commits` is null, one of `commits`.
+ */
+export async function assertCheckoutMarker(
+  checkoutRoot: string,
+  instanceId: string,
+  commits: readonly string[] | null,
+): Promise<void> {
+  await assertOwnedDirectory(checkoutRoot);
+  const marker = await readInstanceMarkerFile(instanceMarkerFile(checkoutRoot));
+  if (marker.instance_id !== instanceId || (commits !== null && !commits.includes(marker.deployed_commit))) {
     throw new GwsEaError('marker_mismatch', 'Instance marker mismatch; refusing mutation');
   }
 }
@@ -653,18 +705,22 @@ export async function assertRegistryMarkerAgreement(
   instanceId: string,
 ): Promise<InstanceReservation> {
   const reservation = await getInstanceReservation(paths, instanceId);
-  await assertMarkerAgreement(paths, reservation);
+  await assertCheckoutMarker(reservation.checkout_realpath, instanceId, [reservation.deployed_commit]);
   return reservation;
 }
 
 /**
  * A missing checkout without its marker is consistent: it was never
  * materialized, or is already removed. A present checkout must carry this
- * reservation's marker before anything touches it.
+ * reservation's marker before anything touches it, at one of `commits`: the
+ * registry's by default, plus the one an unfinished update or rollback placed
+ * there (`liveCheckoutCommits`). Null checks the instance identity alone, for
+ * removal when that operation cannot be read.
  */
 export async function assertCheckoutConsistent(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
+  commits: readonly string[] | null = [reservation.deployed_commit],
 ): Promise<void> {
   try {
     await lstat(reservation.checkout_realpath);
@@ -672,7 +728,7 @@ export async function assertCheckoutConsistent(
     if (isErrno(error, 'ENOENT')) return;
     throw error;
   }
-  await assertMarkerAgreement(paths, reservation);
+  await assertCheckoutMarker(paths.checkoutRoot(reservation.instance_id), reservation.instance_id, commits);
 }
 
 export async function writeInstanceMarker(paths: ControlPlanePaths, instanceId: string): Promise<void> {

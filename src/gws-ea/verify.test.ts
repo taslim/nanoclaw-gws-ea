@@ -6,7 +6,8 @@
  * as the router does. Only the container's own write — an assistant reply in
  * `outbound.db` — is inserted directly, into the schema NanoClaw created.
  */
-import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -14,7 +15,24 @@ import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { principalWelcomeEventId, type PrincipalCandidate } from './principal.js';
-import { verifyPrincipalBinding, verifyTalkableConversation, type ConversationVerificationInput } from './verify.js';
+import {
+  readLatestDelivery,
+  readSchemaManifest,
+  verifyPrincipalBinding,
+  verifyTalkableConversation,
+  type ConversationVerificationInput,
+} from './verify.js';
+
+/** What happens to a file just before it is read whole, as a writer opening a database mid-copy would. */
+const reading = vi.hoisted(() => ({ before: undefined as ((file: string) => void) | undefined }));
+vi.mock('node:fs', async (importOriginal) => {
+  const fs = await importOriginal<typeof import('node:fs')>();
+  const readFileSync = (...args: Parameters<typeof fs.readFileSync>): ReturnType<typeof fs.readFileSync> => {
+    if (typeof args[0] === 'string') reading.before?.(args[0]);
+    return fs.readFileSync(...args);
+  };
+  return { ...fs, readFileSync };
+});
 
 const MAIN = 'ag-main';
 const USER = 'gchat:users/principal';
@@ -417,5 +435,153 @@ describe('talkable conversation verification', () => {
     }
 
     expect(verifyTalkableConversation(input())).toMatchObject({ ready: false, reason: 'binding_not_ready' });
+  });
+});
+
+describe('read-only observation', () => {
+  it("reads the latest delivery result of main's conversation, and the replies the host is still retrying", async () => {
+    expect(readLatestDelivery(checkout)).toEqual({
+      mainAgentGroupId: MAIN,
+      sessionId,
+      last: undefined,
+      retrying: 0,
+      lastError: undefined,
+    });
+
+    await deliveredWelcome();
+    expect(readLatestDelivery(checkout)).toEqual({
+      mainAgentGroupId: MAIN,
+      sessionId,
+      last: { messageOutId: 'out-welcome', status: 'delivered', at: WELCOME_DELIVERED_AT },
+      retrying: 0,
+      lastError: undefined,
+    });
+
+    await inbound('later-inbound', LATER_AT, 'chat-sdk', principalMessage);
+    await reply('later-outbound', 'later-inbound', LATER_REPLY_AT);
+    vi.setSystemTime(new Date(LATER_DELIVERED_AT));
+    await host.withMailboxSession(MAIN, sessionId, (mailbox) => mailbox.markDeliveryFailed('later-outbound'));
+    const { recordDeliveryAttempt } = await import('../db/coordination.js');
+    await recordDeliveryAttempt({
+      messageId: 'out-retrying',
+      sessionId,
+      now: LATER_DELIVERED_AT,
+      nextAttemptAt: '2026-09-18T18:02:00.000Z',
+      error: 'Google Chat answered 503',
+    });
+
+    expect(readLatestDelivery(checkout)).toEqual({
+      mainAgentGroupId: MAIN,
+      sessionId,
+      last: { messageOutId: 'later-outbound', status: 'failed', at: LATER_DELIVERED_AT },
+      retrying: 1,
+      lastError: 'Google Chat answered 503',
+    });
+  });
+
+  it('has no delivery to report until main is published', () => {
+    const central = new Database(path.join(checkout, 'data', 'v2.db'));
+    try {
+      central.exec('UPDATE gws_ea_profile SET main_agent_group_id = NULL');
+    } finally {
+      central.close();
+    }
+
+    expect(readLatestDelivery(checkout)).toBeUndefined();
+  });
+
+  it('reads the applied migrations and every session table, merging its columns across sessions', async () => {
+    // A session sorting before the router's, left by a release whose `messages_in` has a column this one lacks,
+    // and an AUTOINCREMENT table, which makes SQLite add its internal `sqlite_sequence`.
+    const older = path.join(checkout, 'data', 'v2-sessions', MAIN, '0-older-session', 'inbound.db');
+    await mkdir(path.dirname(older));
+    const seeded = new Database(older);
+    try {
+      seeded.exec(`
+        CREATE TABLE messages_in (id TEXT PRIMARY KEY, routed_by TEXT);
+        CREATE TABLE deliveries (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT);
+        INSERT INTO deliveries (label) VALUES ('first');
+      `);
+      expect(
+        seeded.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'").get(),
+      ).toEqual({ name: 'sqlite_sequence' });
+    } finally {
+      seeded.close();
+    }
+    const routers = path.join(checkout, 'data', 'v2-sessions', MAIN, sessionId, 'inbound.db');
+    const columnsOf = (file: string, table: string): string[] => {
+      const session = new Database(file, { readonly: true });
+      try {
+        return (session.prepare('SELECT name FROM pragma_table_info(?)').all(table) as Array<{ name: string }>).map(
+          (column) => column.name,
+        );
+      } finally {
+        session.close();
+      }
+    };
+    const merged = [...new Set([older, routers].flatMap((file) => columnsOf(file, 'messages_in')))].sort();
+    expect(merged).toEqual(expect.arrayContaining(['routed_by', 'platform_id']));
+
+    const manifest = readSchemaManifest(checkout);
+
+    expect(manifest.central_migrations).toEqual(
+      expect.arrayContaining(['host-coordination', 'module:gws-ea-profile:create-profile']),
+    );
+    expect(manifest.session_tables['inbound.messages_in']).toEqual(merged);
+    expect(manifest.session_tables['inbound.deliveries']).toEqual(['id', 'label']);
+    expect(Object.keys(manifest.session_tables).filter((table) => /^\w+\.sqlite_/u.test(table))).toEqual([]);
+    expect(manifest.session_tables['inbound.delivered']).toEqual(
+      expect.arrayContaining(['message_out_id', 'status', 'delivered_at']),
+    );
+    expect(manifest.session_tables['outbound.messages_out']).toEqual(expect.arrayContaining(['in_reply_to']));
+  });
+
+  it('never leaves side files beside a WAL database its writer has closed', async () => {
+    await deliveredWelcome();
+    await host.closeDb();
+    const data = path.join(checkout, 'data');
+    const before = (await readdir(data)).sort();
+    expect(before).toContain('v2.db');
+    expect(before).not.toContain('v2.db-wal');
+    // The header's write and read versions (bytes 18 and 19) are 2 only for a WAL database.
+    const header = await readFile(path.join(data, 'v2.db'));
+    expect([header[18], header[19]]).toEqual([2, 2]);
+
+    expect(readSchemaManifest(checkout).central_migrations).toContain('host-coordination');
+    expect(readLatestDelivery(checkout)).toMatchObject({ last: { messageOutId: 'out-welcome' } });
+    expect(
+      verifyPrincipalBinding({
+        runtime: { ...RUNTIME, checkout_realpath: checkout },
+        adapterInstance: INSTANCE,
+        provisioningStartedAt: BOUND_AT,
+        selectedCandidate: candidate(),
+      }),
+    ).toEqual({ status: 'absent' });
+
+    expect((await readdir(data)).sort()).toEqual(before);
+  });
+
+  it('reads in place a WAL database a writer opened while it was being copied', async () => {
+    await host.closeDb();
+    const file = path.join(checkout, 'data', 'v2.db');
+    expect(existsSync(`${file}-wal`)).toBe(false);
+    // The host starting mid-copy: opening the database creates its `-wal`, where the migration it records stays.
+    let writer: Database.Database | undefined;
+    reading.before = (read) => {
+      if (read !== file || writer) return;
+      writer = new Database(file);
+      writer
+        .prepare(
+          `INSERT INTO schema_version (version, name, applied)
+           SELECT MAX(version) + 1, 'recorded-mid-copy', ? FROM schema_version`,
+        )
+        .run(new Date().toISOString());
+    };
+    try {
+      expect(readSchemaManifest(checkout).central_migrations).toContain('recorded-mid-copy');
+    } finally {
+      reading.before = undefined;
+      writer?.close();
+    }
   });
 });

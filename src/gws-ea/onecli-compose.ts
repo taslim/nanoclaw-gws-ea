@@ -1,9 +1,10 @@
 import path from 'node:path';
 
-import { stringify } from 'yaml';
+import { parse, stringify } from 'yaml';
 
 import { assertInstanceId } from './registry.js';
-import { requireDockerEndpoint } from './validation.js';
+import { GwsEaError } from './types.js';
+import { isRecord, requireDockerEndpoint } from './validation.js';
 
 export const ONECLI_INSTANCE_LABEL = 'dev.gws-ea.instance-id' as const;
 export const ONECLI_RESOURCE_ROLE_LABEL = 'dev.gws-ea.onecli-role' as const;
@@ -265,6 +266,33 @@ export function renderOnecliCompose(
     },
     { lineWidth: 0, aliasDuplicateObjects: false },
   );
+}
+
+/** The image each OneCLI service runs. */
+export type OnecliServiceImages = Readonly<Record<'postgres' | 'app' | 'gateway', string>>;
+
+/**
+ * The images an instance's own Compose file runs. Only each service's image
+ * is read, so a file any release rendered reads the same way; everything else
+ * in it is that release's.
+ */
+export function parseOnecliComposeImages(source: string): OnecliServiceImages {
+  let compose: unknown;
+  try {
+    compose = parse(source);
+  } catch {
+    throw new GwsEaError('invalid_onecli_runtime', 'The OneCLI Compose file is not valid YAML');
+  }
+  const services = isRecord(compose) && isRecord(compose.services) ? compose.services : {};
+  const image = (service: keyof OnecliServiceImages): string => {
+    const definition = services[service];
+    const value = isRecord(definition) ? definition.image : undefined;
+    if (typeof value !== 'string' || value === '') {
+      throw new GwsEaError('invalid_onecli_runtime', `The OneCLI Compose file names no ${service} image`);
+    }
+    return value;
+  };
+  return { postgres: image('postgres'), app: image('app'), gateway: image('gateway') };
 }
 
 function assertPort(value: number, name: string): void {
