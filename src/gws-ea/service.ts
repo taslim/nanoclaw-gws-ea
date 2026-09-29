@@ -506,9 +506,39 @@ export async function writeInstanceServiceDefinition(
     if (isErrno(error, 'ENOENT')) return undefined;
     throw error;
   });
-  if (installed === rendered) return false;
+  return installServiceDefinition(config, layout, rendered, installed, dependencies);
+}
+
+/**
+ * Put back the service definition a kept release ran with, while its service
+ * is stopped (KTD6): a rollback restores it rather than rendering one. Only
+ * when it differs from the one installed, and systemd is then told to reload
+ * it. Returns whether it changed.
+ */
+export async function restoreInstanceServiceDefinition(
+  configInput: InstanceRuntimeConfig,
+  kept: string,
+  dependencies: InstanceServiceDependencies,
+): Promise<boolean> {
+  const config = validateRuntimeConfig(configInput);
+  const layout = createInstanceServiceLayout(config, dependencies);
+  const installed = await readFile(layout.serviceDefinitionPath, 'utf8').catch((error: unknown) => {
+    if (isErrno(error, 'ENOENT')) return undefined;
+    throw error;
+  });
+  return installServiceDefinition(config, layout, kept, installed, dependencies);
+}
+
+async function installServiceDefinition(
+  config: InstanceRuntimeConfig,
+  layout: InstanceServiceLayout,
+  definition: string,
+  installed: string | undefined,
+  dependencies: InstanceServiceDependencies,
+): Promise<boolean> {
+  if (installed === definition) return false;
   await mkdir(path.dirname(layout.serviceDefinitionPath), { recursive: true, mode: 0o700 });
-  await writePrivateTextFile(layout.serviceDefinitionPath, rendered);
+  await writePrivateTextFile(layout.serviceDefinitionPath, definition);
   if (layout.manager !== 'launchd') {
     await (dependencies.runCommand ?? runSanitizedCommand)({
       command: 'systemctl',

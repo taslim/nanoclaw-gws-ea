@@ -7,7 +7,7 @@
  * real `lsof` finds a real idle opener.
  */
 import { spawn } from 'node:child_process';
-import { copyFileSync, existsSync, statSync } from 'node:fs';
+import { copyFileSync, existsSync, readFileSync, statSync } from 'node:fs';
 import {
   chmod,
   lstat,
@@ -35,11 +35,17 @@ import {
   assertCarriable,
   assertCheckoutQuiet,
   carryState,
+  copyReleaseRecords,
+  finishRollbackSwap,
   finishSwap,
   keepReleaseFiles,
   keptReleaseFiles,
   openFileHolders,
+  restoreSetAsideState,
+  reverseRollbackSwap,
   reverseSwap,
+  setAsideState,
+  setAsideStateRoot,
   settleCheckoutDatabases,
   stagedKeptFilesRoot,
   type QuietCheckout,
@@ -587,6 +593,12 @@ async function readyToSwap(withOlder: boolean): Promise<{ paths: ControlPlanePat
   const compose = path.join(paths.instanceRoot(instanceId), 'compose.yaml');
   await writeFile(compose, 'services: {}\n', { mode: 0o600 });
   await keepReleaseFiles(stagedKeptFilesRoot(paths, instanceId), {
+    manifest: {
+      schema_version: 1,
+      instance_id: instanceId,
+      release: { source_remote: 'https://example.test/nanoclaw.git', release_track: 'dogfood', deployed_commit: FROM },
+      snapshot_at: '2026-09-28T10:00:00.000Z',
+    },
     receipt: paths.releasePreflightFile(instanceId),
     compose,
     serviceDefinition: undefined,
@@ -765,5 +777,301 @@ describe('swapping the releases', () => {
       code: 'swap_layout_unknown',
     });
     expect(await layout(paths, instanceId)).toEqual(before);
+  });
+});
+
+/**
+ * An instance stopped for a rollback from `TO` (live) to `FROM` (kept in
+ * `previous/`, its own state already set aside), with the live release's
+ * files kept in `outgoing/`, and, for a rollback reverting an unrecorded
+ * update, the previous release that update set aside.
+ */
+async function readyToRollBack(withSetAside: boolean): Promise<{ paths: ControlPlanePaths; instanceId: string }> {
+  const root = await temporaryRoot('gws-ea-rollback-swap-');
+  const paths = resolveControlPlanePaths({
+    configRoot: path.join(root, 'config'),
+    stateRoot: path.join(root, 'state'),
+  });
+  const instanceId = allocateInstanceId();
+  await mkdir(paths.instanceRoot(instanceId), { recursive: true, mode: 0o700 });
+  await checkoutAt(paths.checkoutRoot(instanceId), instanceId, TO);
+  await writeFile(paths.releasePreflightFile(instanceId), receipt(instanceId, TO), { mode: 0o600 });
+  await checkoutAt(paths.releaseCheckoutRoot(instanceId, 'previous'), instanceId, FROM);
+  const previous = paths.releaseRoot(instanceId, 'previous');
+  await writeFile(keptReleaseFiles(previous).receipt, receipt(instanceId, FROM), { mode: 0o600 });
+  await writeFile(keptReleaseFiles(previous).hostEnvironment, '{"WEBHOOK_PORT":"2"}', { mode: 0o600 });
+  await mkdir(setAsideStateRoot(previous), { mode: 0o700 });
+  const compose = path.join(paths.instanceRoot(instanceId), 'compose.yaml');
+  await writeFile(compose, 'services: {}\n', { mode: 0o600 });
+  await keepReleaseFiles(paths.releaseRoot(instanceId, 'outgoing'), {
+    manifest: {
+      schema_version: 1,
+      instance_id: instanceId,
+      release: { source_remote: 'https://example.test/nanoclaw.git', release_track: 'dogfood', deployed_commit: TO },
+      snapshot_at: '2026-09-28T11:00:00.000Z',
+    },
+    receipt: paths.releasePreflightFile(instanceId),
+    compose,
+    serviceDefinition: undefined,
+    hostEnvironment: { WEBHOOK_PORT: '1' },
+  });
+  if (withSetAside) await checkoutAt(paths.releaseCheckoutRoot(instanceId, 'superseded'), instanceId, OLDER);
+  return { paths, instanceId };
+}
+
+/** Where a rollback's releases are: each checkout's commit, and which receipt and kept files sit where. */
+async function rollbackLayout(paths: ControlPlanePaths, instanceId: string) {
+  const commit = async (checkout: string): Promise<string | null> =>
+    (await exists(checkout)) ? (await readFile(path.join(checkout, 'release.txt'), 'utf8')).slice(0, 1) : null;
+  const deployed = async (file: string): Promise<string | null> =>
+    (await exists(file))
+      ? String((JSON.parse(await readFile(file, 'utf8')) as { deployed_commit: string }).deployed_commit).slice(0, 1)
+      : null;
+  const previous = paths.releaseRoot(instanceId, 'previous');
+  const restored = path.join(paths.releaseRoot(instanceId, 'outgoing'), 'restored');
+  return {
+    live: await commit(paths.checkoutRoot(instanceId)),
+    liveReceipt: await deployed(paths.releasePreflightFile(instanceId)),
+    previous: await commit(paths.releaseCheckoutRoot(instanceId, 'previous')),
+    previousReceipt: await deployed(keptReleaseFiles(previous).receipt),
+    previousState: await exists(setAsideStateRoot(previous)),
+    outgoing: await commit(paths.releaseCheckoutRoot(instanceId, 'outgoing')),
+    outgoingReceipt: await deployed(keptReleaseFiles(paths.releaseRoot(instanceId, 'outgoing')).receipt),
+    restoredEnvironment: (await exists(keptReleaseFiles(restored).hostEnvironment))
+      ? JSON.parse(await readFile(keptReleaseFiles(restored).hostEnvironment, 'utf8'))
+      : null,
+    restoredState: await exists(setAsideStateRoot(restored)),
+    superseded: await commit(paths.releaseCheckoutRoot(instanceId, 'superseded')),
+  };
+}
+
+const BEFORE_ROLLBACK = (withSetAside: boolean) => ({
+  live: 'b',
+  liveReceipt: 'b',
+  previous: 'a',
+  previousReceipt: 'a',
+  previousState: true,
+  outgoing: null,
+  outgoingReceipt: 'b',
+  restoredEnvironment: null,
+  restoredState: false,
+  superseded: withSetAside ? 'c' : null,
+});
+
+const AFTER_ROLLBACK = (withSetAside: boolean, restoreSetAside: boolean) => ({
+  live: 'a',
+  liveReceipt: 'a',
+  previous: withSetAside && restoreSetAside ? 'c' : null,
+  previousReceipt: null,
+  previousState: false,
+  outgoing: 'b',
+  outgoingReceipt: 'b',
+  restoredEnvironment: { WEBHOOK_PORT: '2' },
+  restoredState: true,
+  superseded: withSetAside && !restoreSetAside ? 'c' : null,
+});
+
+describe("swapping a rollback's releases", () => {
+  const releases = (restoreSetAside: boolean) => ({ from: TO, to: FROM, restoreSetAside });
+  const killedSwap = async (
+    paths: ControlPlanePaths,
+    instanceId: string,
+    restoreSetAside: boolean,
+    at: number,
+  ): Promise<void> => {
+    await finishRollbackSwap(paths, instanceId, releases(restoreSetAside), { rename: killedRename(at).rename }).catch(
+      (error: unknown) => {
+        if (!(error instanceof Error) || error.message !== 'killed') throw error;
+      },
+    );
+  };
+  // Four renames, and a fifth when the rollback puts back the release its update set aside.
+  const cases = [
+    ...[1, 2, 3, 4, 5].map((at) => [at, true, true] as const),
+    ...[1, 2, 3, 4].map((at) => [at, true, false] as const),
+    ...[1, 2, 3, 4].map((at) => [at, false, false] as const),
+  ];
+
+  it.each([
+    [true, true],
+    [true, false],
+    [false, false],
+  ] as const)(
+    'moves live to outgoing/ and previous live, the rest of previous/ to outgoing/restored/ (set aside: %s, put back: %s)',
+    async (withSetAside, restoreSetAside) => {
+      const { paths, instanceId } = await readyToRollBack(withSetAside);
+      expect(await rollbackLayout(paths, instanceId)).toEqual(BEFORE_ROLLBACK(withSetAside));
+
+      await finishRollbackSwap(paths, instanceId, releases(restoreSetAside));
+
+      expect(await rollbackLayout(paths, instanceId)).toEqual(AFTER_ROLLBACK(withSetAside, restoreSetAside));
+    },
+  );
+
+  it.each(cases)(
+    'finishes a rollback swap killed at rename %i (set aside: %s, put back: %s)',
+    async (at, withSetAside, restoreSetAside) => {
+      const { paths, instanceId } = await readyToRollBack(withSetAside);
+      await killedSwap(paths, instanceId, restoreSetAside, at);
+
+      await finishRollbackSwap(paths, instanceId, releases(restoreSetAside));
+
+      expect(await rollbackLayout(paths, instanceId)).toEqual(AFTER_ROLLBACK(withSetAside, restoreSetAside));
+    },
+  );
+
+  it.each([...cases, [6, true, true] as const, [5, true, false] as const])(
+    'goes back from a rollback swap killed at rename %i (set aside: %s, put back: %s)',
+    async (at, withSetAside, restoreSetAside) => {
+      const { paths, instanceId } = await readyToRollBack(withSetAside);
+      await killedSwap(paths, instanceId, restoreSetAside, at);
+
+      await reverseRollbackSwap(paths, instanceId, releases(restoreSetAside));
+
+      expect(await rollbackLayout(paths, instanceId)).toEqual(BEFORE_ROLLBACK(withSetAside));
+    },
+  );
+
+  it.each([1, 2, 3, 4, 5, 6])('goes back again after a return killed at its rename %i', async (at) => {
+    const { paths, instanceId } = await readyToRollBack(true);
+    await finishRollbackSwap(paths, instanceId, releases(true));
+    await reverseRollbackSwap(paths, instanceId, releases(true), { rename: killedRename(at).rename }).catch(
+      (error: unknown) => {
+        if (!(error instanceof Error) || error.message !== 'killed') throw error;
+      },
+    );
+
+    await reverseRollbackSwap(paths, instanceId, releases(true));
+
+    expect(await rollbackLayout(paths, instanceId)).toEqual(BEFORE_ROLLBACK(true));
+  });
+
+  it('puts the outgoing receipt live after a return cut short between moving the restored one back and writing it', async () => {
+    const { paths, instanceId } = await readyToRollBack(false);
+    await finishRollbackSwap(paths, instanceId, releases(false));
+    // The return had moved the rest of previous/ back and the restored receipt with it, then was killed.
+    const previous = paths.releaseRoot(instanceId, 'previous');
+    await rename(path.join(paths.releaseRoot(instanceId, 'outgoing'), 'restored'), previous);
+    await rename(paths.releasePreflightFile(instanceId), keptReleaseFiles(previous).receipt);
+
+    await reverseRollbackSwap(paths, instanceId, releases(false));
+
+    expect(await rollbackLayout(paths, instanceId)).toEqual(BEFORE_ROLLBACK(false));
+  });
+
+  it('refuses a layout no rollback leaves, and one without the outgoing release kept, moving nothing', async () => {
+    const { paths, instanceId } = await readyToRollBack(false);
+    await rm(paths.releaseCheckoutRoot(instanceId, 'previous'), { recursive: true });
+    const before = await rollbackLayout(paths, instanceId);
+
+    await expect(finishRollbackSwap(paths, instanceId, releases(false))).rejects.toMatchObject({
+      code: 'swap_layout_unknown',
+    });
+    await expect(reverseRollbackSwap(paths, instanceId, releases(false))).rejects.toMatchObject({
+      code: 'swap_layout_unknown',
+    });
+    expect(await rollbackLayout(paths, instanceId)).toEqual(before);
+
+    const unprepared = await readyToRollBack(false);
+    await rm(unprepared.paths.releaseRoot(unprepared.instanceId, 'outgoing'), { recursive: true });
+    await expect(finishRollbackSwap(unprepared.paths, unprepared.instanceId, releases(false))).rejects.toMatchObject({
+      code: 'swap_layout_unknown',
+    });
+    expect(commitOfCheckout(unprepared.paths.checkoutRoot(unprepared.instanceId))).toBe(TO);
+  });
+});
+
+function commitOfCheckout(checkout: string): string | null {
+  return existsSync(checkout) ? readFileSync(path.join(checkout, 'release.txt'), 'utf8') : null;
+}
+
+describe("setting a kept release's own state aside", () => {
+  /** A kept release with state in every carried root it has, and a live one to carry in. */
+  async function releases() {
+    const root = await temporaryRoot('gws-ea-set-aside-');
+    const kept = path.join(root, 'previous', 'nanoclaw');
+    const live = path.join(root, 'nanoclaw');
+    for (const [checkout, who] of [
+      [kept, 'kept'],
+      [live, 'live'],
+    ] as const) {
+      await checkoutAt(checkout, allocateInstanceId(), who === 'kept' ? FROM : TO);
+      await write(checkout, 'data/gws-ea/runtime.json', `{"release":"${who}"}`);
+      await write(checkout, 'data/circuit-breaker.json', `{"crashes":"${who}"}`);
+      await write(checkout, 'groups/main/CLAUDE.local.md', `${who} memory\n`, 0o640);
+      await write(checkout, '.env', `WHO=${who}\n`);
+    }
+    // Only the live release has a store: carried in, it must not be taken for the kept release's own.
+    await write(live, 'store/auth.json', 'live store');
+    return { root, kept, live, state: setAsideStateRoot(path.join(root, 'previous')) };
+  }
+
+  it('moves every carried root aside, whole, before anything is carried in', async () => {
+    const { kept, state } = await releases();
+    const own = await tree(kept);
+
+    await setAsideState(kept, state);
+
+    expect(await readdir(kept)).toEqual(['release.txt']);
+    const moved = await tree(state);
+    for (const [key, value] of own) if (key !== '.' && key !== 'release.txt') expect(moved.get(key)).toBe(value);
+    // Set aside already, it is left as it is.
+    await setAsideState(kept, state);
+    expect(await tree(state)).toEqual(moved);
+  });
+
+  it('goes on with a set-aside cut short, and puts the state back after a carry, marker and runtime record included', async () => {
+    const { root, kept, live, state } = await releases();
+    const own = await tree(kept);
+    // Cut short after one root moved: the building area holds it, the rest are still the release's own.
+    await mkdir(`${state}.building`, { mode: 0o700 });
+    await rename(path.join(kept, 'groups'), path.join(`${state}.building`, 'groups'));
+
+    await setAsideState(kept, state);
+    await carryState(live, kept);
+    await copyReleaseRecords(state, kept);
+
+    expect(await readFile(path.join(kept, 'groups', 'main', 'CLAUDE.local.md'), 'utf8')).toBe('live memory\n');
+    expect(await readFile(instanceMarkerFile(kept), 'utf8')).toContain(FROM);
+    expect(await readFile(path.join(kept, 'data', 'gws-ea', 'runtime.json'), 'utf8')).toBe('{"release":"kept"}');
+    expect(await exists(path.join(kept, 'data', 'circuit-breaker.json'))).toBe(false);
+
+    await restoreSetAsideState(kept, state);
+
+    const back = await tree(kept);
+    for (const [key, value] of own) {
+      // The kept release's circuit breaker counted a run long gone, and is not put back.
+      if (key === path.join('data', 'circuit-breaker.json')) continue;
+      expect(back.get(key)).toBe(value);
+    }
+    expect(back.has('store')).toBe(false);
+    expect((await readdir(path.join(root, 'previous'))).sort()).toEqual(['nanoclaw']);
+  });
+
+  it('puts back a set-aside cut short before anything was carried in by moving its roots back', async () => {
+    const { root, kept, state } = await releases();
+    const own = await tree(kept);
+    await mkdir(`${state}.building`, { mode: 0o700 });
+    await rename(path.join(kept, 'data'), path.join(`${state}.building`, 'data'));
+
+    await restoreSetAsideState(kept, state);
+
+    expect(await tree(kept)).toEqual(own);
+    expect((await readdir(path.join(root, 'previous'))).sort()).toEqual(['nanoclaw']);
+  });
+
+  it('starts a restore cut short over from state that is still whole', async () => {
+    const { kept, live, state } = await releases();
+    const own = await tree(kept);
+    await setAsideState(kept, state);
+    await carryState(live, kept);
+    // A restore killed while copying back: a half-built root beside the checkout, the set-aside state untouched.
+    await write(path.dirname(kept), 'carrying/groups/partial', 'half');
+
+    await restoreSetAsideState(kept, state);
+
+    const back = await tree(kept);
+    for (const [key, value] of own) if (!key.includes('circuit-breaker')) expect(back.get(key)).toBe(value);
+    expect(await exists(state)).toBe(false);
   });
 });

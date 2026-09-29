@@ -250,8 +250,33 @@ describe('GWS-EA driver', () => {
       allowAmbientConfiguration: false,
     });
     expect(setup.credentialMetadata('opencode')).toBeUndefined();
-    // Without a TTY nobody can be asked, so an update needs --yes.
+    // Without a TTY nobody can be asked, so an update, and a rollback's snapshot restore, need --yes.
     expect(runtime.confirmUpdate).toBeUndefined();
+    expect(runtime.confirmRollback).toBeUndefined();
+  });
+
+  it('asks before a rollback restores a snapshot on a TTY, naming the assistant and the release, defaulting to keep what it recorded', async () => {
+    await main(['rollback', '--id', 'x'], { interactive: true });
+    fixture.confirm.mockResolvedValueOnce(false);
+    const preview = { instanceId: 'x', to: { release_track: 'dogfood', deployed_commit: 'a'.repeat(40) } };
+
+    await expect(runtimeOf().confirmRollback!(preview as never)).resolves.toBe(false);
+
+    expect(fixture.confirm).toHaveBeenCalledExactlyOnceWith({
+      message: `Restore assistant x's pre-update snapshot on dogfood ${'a'.repeat(12)}, discarding what it recorded since?`,
+      initialValue: false,
+    });
+  });
+
+  it('offers to run a failed rollback again', async () => {
+    await main(['rollback', '--id', 'x'], { interactive: true });
+
+    await runtimeOf().onFailure!(report({ command: 'rollback', step: 'verify_release' }));
+
+    expect(fixture.confirm).toHaveBeenCalledExactlyOnceWith({
+      message: 'Retry now? gws-ea runs rollback again.',
+      initialValue: true,
+    });
   });
 
   it('asks before an update on a TTY, naming the assistant and its new release, defaulting to wait', async () => {

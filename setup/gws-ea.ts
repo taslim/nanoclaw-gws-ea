@@ -190,7 +190,11 @@ const serviceHelpers: NanoclawServiceHelpers = {
 
 /** What a retry does: a host service command or an update runs again; the others re-check prerequisites and continue. */
 function retryOffer(command: FailureReport['command']): string {
-  return command === 'start' || command === 'stop' || command === 'restart' || command === 'update'
+  return command === 'start' ||
+    command === 'stop' ||
+    command === 'restart' ||
+    command === 'update' ||
+    command === 'rollback'
     ? `Retry now? gws-ea runs ${command} again.`
     : 'Retry now? gws-ea re-checks prerequisites, then continues from where it stopped.';
 }
@@ -250,6 +254,11 @@ export async function main(argv: readonly string[], options: { readonly interact
     confirmUpdate: async (preview) =>
       (await p.confirm({
         message: `Update assistant ${preview.instanceId} to ${preview.to.release_track} ${preview.to.deployed_commit.slice(0, 12)}?`,
+        initialValue: false,
+      })) === true,
+    confirmRollback: async (preview) =>
+      (await p.confirm({
+        message: `Restore assistant ${preview.instanceId}'s pre-update snapshot on ${preview.to.release_track} ${preview.to.deployed_commit.slice(0, 12)}, discarding what it recorded since?`,
         initialValue: false,
       })) === true,
     onFailure: handleFailure,

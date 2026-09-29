@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
+import { formatLocalTime } from '../timezone.js';
 import { createManagedIngressSetupSession, type RetainedManagedIngressSetupSession } from './cloudflare-api.js';
 import {
   CREATE_INPUT_FLAGS,
@@ -12,6 +13,7 @@ import {
   type CreateSetupAnswers,
   type SecretSource,
 } from './create-input.js';
+import { finishFollowUps, type CutoverDependencies } from './cutover.js';
 import {
   createInteraction,
   pendingActionOf,
@@ -64,6 +66,14 @@ import {
   type RemovalOutcome,
   type RemovalPreview,
 } from './remove.js';
+import {
+  localTimezone,
+  rollBack,
+  rollbackPreviewLines,
+  type RollbackOutcome,
+  type RollbackPreview,
+  type RollbackRequest,
+} from './rollback.js';
 import { FIXTURE_STAGING_DIRECTORY, startRunLog, type RunLog } from './run-log.js';
 import { buildInstanceCliCommand, type HostStatusHelpers, type UpsertEnvVars } from './service.js';
 import {
@@ -77,7 +87,6 @@ import { LIST_USAGE, runListCommand, runStatusCommand, STATUS_USAGE, type ReadOn
 import {
   confirmStagedUpdate,
   continueUpdate,
-  finishFollowUps,
   prepareUpdate,
   resolveUpdateIntent,
   updatePreviewLines,
@@ -107,7 +116,7 @@ export const EXIT_CODES = { ready: 0, paused: 10, failed: 1, busy: 75 } as const
 
 type LineWriter = (line: string) => void;
 /** Commands that run as attempts: each with its own run log, stop summary, and failure loop. */
-const COMMANDS = ['create', 'resume', 'remove', 'start', 'stop', 'restart', 'update'] as const;
+const COMMANDS = ['create', 'resume', 'remove', 'start', 'stop', 'restart', 'update', 'rollback'] as const;
 type Command = (typeof COMMANDS)[number];
 /** The attempts that act on an assistant's host service alone. */
 type ServiceCommand = Extract<Command, 'start' | 'stop' | 'restart'>;
@@ -200,6 +209,8 @@ export interface CliRuntime {
   toolProviderSetup?: () => Promise<ToolProviderSetup>;
   /** Absent means an update requires `--yes`. */
   confirmUpdate?: (preview: UpdatePreview) => Promise<boolean>;
+  /** Asks before a rollback restores the pre-update snapshot; absent means that restore requires `--yes`. */
+  confirmRollback?: (preview: RollbackPreview) => Promise<boolean>;
   /** An update's boundary seams; each defaults to the real one. */
   update?: UpdateSeams;
 }
@@ -231,6 +242,7 @@ const COMMAND_OPTIONS: Readonly<Record<Command, OptionSpec>> = {
   stop: SERVICE_OPTIONS,
   restart: SERVICE_OPTIONS,
   update: { values: ['id', 'track', 'source-remote'], switches: ['yes'] },
+  rollback: { values: ['id'], switches: ['snapshot', 'yes'] },
 };
 
 function parseOptions(args: readonly string[], { values, switches }: OptionSpec): CommandOptions {
@@ -297,9 +309,10 @@ function isBusy(error: unknown): boolean {
 /**
  * The assistant's state refused the command: an unfinished update or
  * rollback, a removal under way, a create not yet finished, a stopped
- * assistant an update cannot prove its release on, or a release that is not
- * newer than the one it runs. Its message names the command that moves the
- * assistant on; rerunning this one cannot.
+ * assistant an update cannot prove its release on, a release that is not
+ * newer than the one it runs, no release of its own kept to roll back to, or
+ * a rollback that went back to the release it left. Its message names the
+ * command that moves the assistant on; rerunning this one cannot.
  */
 const STATE_REFUSALS: ReadonlySet<string> = new Set([
   'operation_in_progress',
@@ -307,6 +320,9 @@ const STATE_REFUSALS: ReadonlySet<string> = new Set([
   'instance_not_created',
   'host_not_running',
   'release_not_newer',
+  'rollback_unavailable',
+  'kept_release_mismatch',
+  'rollback_failed',
 ]);
 
 function isStateRefusal(error: unknown): boolean {
@@ -497,6 +513,17 @@ class Cli {
             work: (session) => this.#updateWork(session, request, options.yes === 'true'),
           });
       }
+      case 'rollback': {
+        const instanceId = targetInstance(options);
+        return () =>
+          this.#attempt({
+            command,
+            args,
+            options,
+            instanceId,
+            work: (session) => this.#rollbackWork(session, instanceId, options),
+          });
+      }
       default: {
         const unhandled: never = command;
         throw new GwsEaError('invalid_arguments', `Unknown command ${String(unhandled)}`);
@@ -533,6 +560,12 @@ class Cli {
           yes ? '--yes' : undefined,
         );
       }
+      case 'rollback':
+        return join(
+          `gws-ea rollback --id ${state.instanceId}`,
+          plan.options.snapshot ? '--snapshot' : undefined,
+          plan.options.yes ? '--yes' : undefined,
+        );
       case 'create':
       case 'resume': {
         if (state.reserved && state.instanceId) return join(`gws-ea resume --id ${state.instanceId}`, extra, common);
@@ -886,6 +919,48 @@ class Cli {
     }
   }
 
+  /**
+   * `rollback`: return the assistant to the release kept in `previous/`, or
+   * settle what its record says is unfinished (R13-R16). A restore of the
+   * pre-update snapshot is shown first and needs confirmation: `--yes`, or a
+   * terminal to be asked on; a code-only rollback loses nothing and is not
+   * asked about. A recorded rollback's follow-ups run last.
+   */
+  async #rollbackWork({ reporter }: Session, instanceId: string, options: CommandOptions): Promise<Outcome> {
+    const { serviceHelpers, upsertEnvVars, hostStatus, confirmRollback } = this.#runtime;
+    if (!serviceHelpers || !upsertEnvVars || !hostStatus) {
+      throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
+    }
+    const timezone = localTimezone();
+    const confirm =
+      options.yes === 'true' ? async (): Promise<boolean> => true : confirmRollback ? confirmRollback : undefined;
+    const request: RollbackRequest = {
+      ...(options.snapshot === 'true' ? { snapshot: true } : {}),
+      present: (preview) => {
+        for (const line of rollbackPreviewLines(preview, timezone)) this.#presenter.line(line);
+      },
+      ...(confirm ? { confirm } : {}),
+    };
+    const operation = await acquireInstanceOperation(this.#paths, instanceId, { command: 'rollback' });
+    if (!operation) throw busy();
+    try {
+      const dependencies: CutoverDependencies = {
+        ...(this.#runtime.update ?? {}),
+        serviceHelpers,
+        upsertEnvVars,
+        hostStatus,
+        reporter,
+      };
+      const outcome = await rollBack(operation, dependencies, request);
+      if (outcome.kind === 'rolled_back' || outcome.kind === 'follow_ups_finished') {
+        await finishFollowUps(operation, dependencies);
+      }
+      return rollbackOutcome(instanceId, outcome, timezone);
+    } finally {
+      operation.release();
+    }
+  }
+
   #secrets(options: CommandOptions): Promise<SecretSource> {
     return loadSecretSource({
       environment: this.#runtime.environment ?? process.env,
@@ -1016,6 +1091,42 @@ function updatedOutcome(instanceId: string, updated: UpdatedAssistant): Outcome 
     message: `Assistant ${instanceId} was updated to ${releaseName(updated.to)}.`,
     details: [`Its previous release, ${releaseName(updated.from)}, is kept to roll back to.`],
   };
+}
+
+/** Where a rollback left the assistant. */
+function rollbackOutcome(instanceId: string, outcome: RollbackOutcome, timezone: string): Outcome {
+  switch (outcome.kind) {
+    case 'rolled_back':
+      return {
+        status: 'ready',
+        message: `Assistant ${instanceId} was rolled back to ${releaseName(outcome.to)}.`,
+        details:
+          outcome.mode === 'code_only'
+            ? [
+                'Only its code went back: every conversation, memory, and setting since the update was kept.',
+                `The release it left, ${releaseName(outcome.from)}, is kept in ${outcome.keptAt} until the next update or removal.`,
+              ]
+            : [
+                `Its snapshot from ${formatLocalTime(outcome.snapshotAt, timezone)} was restored.`,
+                `What it recorded since, with the release it left, ${releaseName(outcome.from)}, is kept in ${outcome.keptAt} until the next update or removal.`,
+              ],
+      };
+    case 'update_discarded':
+      return {
+        status: 'ready',
+        message: `The update of assistant ${instanceId} to ${releaseName(outcome.discarded)} was discarded; it runs ${releaseName(outcome.release)} again.`,
+      };
+    case 'follow_ups_finished':
+      return {
+        status: 'ready',
+        message: `Assistant ${instanceId} runs ${releaseName(outcome.release)}; its rollback is finished.`,
+      };
+    case 'declined':
+      return {
+        status: 'ready',
+        message: `Rollback cancelled. Assistant ${instanceId} stays on ${releaseName(outcome.release)} as before.`,
+      };
+  }
 }
 
 /** An update run that only finished the follow-ups of the release it would deploy. */
@@ -1409,6 +1520,12 @@ function printHelp(output: LineWriter): void {
     '         then switches to it during a brief stop, verifies it, and keeps the previous release to roll back to.',
   );
   output('         Rerun it to continue an update that was cut short, or to retry the follow-ups one left.');
+  output('  rollback --id <instance_id> [--snapshot] [--yes]');
+  output(
+    '         Returns to the kept previous release, keeping every message since the update unless it changed a schema;',
+  );
+  output('         then, or with --snapshot, it restores the pre-update snapshot after showing what that discards.');
+  output('         Rerun it to continue a rollback that was cut short, or to revert an update that is unfinished.');
   for (const command of READ_ONLY_COMMANDS.values()) for (const line of command.usage) output(`  ${line}`);
   output('  ncl --id <instance_id> -- <ncl arguments>');
   output('  remove --id <instance_id> [--yes] [--abandon gcp-project,cloudflare-dns]');

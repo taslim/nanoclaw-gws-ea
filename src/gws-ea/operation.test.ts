@@ -8,8 +8,10 @@ import { acquireInstanceOperation, reserveInstance, type InstanceOperation } fro
 import {
   advanceOperation,
   beginOperation,
+  beginOperationReturn,
   commitOperationRelease,
   completeFollowUp,
+  completeOperationReturn,
   discardOperation,
   inspectOperation,
   liveCheckoutCommits,
@@ -17,6 +19,7 @@ import {
   readOperationRecord,
   recordOperationFacts,
   targetReservationView,
+  withdrawRollback,
   type OperationFollowUp,
   type OperationIntent,
   type OperationPhase,
@@ -508,6 +511,11 @@ describe('target reservation view and live checkout agreement (KTD17)', () => {
     const reverting: OperationRecord = { ...base, kind: 'rollback', commit_point: 'record', from: TO, to: FROM };
     expect(liveCheckoutCommits(reserved, reverting)).toEqual([FROM.deployed_commit, TO.deployed_commit]);
     expect(liveCheckoutCommits(reserved, { ...reverting, phase: 'swapped' })).toEqual([FROM.deployed_commit]);
+    // Going back, it may have put the release it left live again at any phase.
+    expect(liveCheckoutCommits(reserved, { ...reverting, phase: 'started', returning: true })).toEqual([
+      FROM.deployed_commit,
+      TO.deployed_commit,
+    ]);
 
     const view: InstanceReservation = targetReservationView(reserved, base);
     expect(view).toEqual({ ...reserved, ...TO });
@@ -515,5 +523,135 @@ describe('target reservation view and live checkout agreement (KTD17)', () => {
     expect(() => targetReservationView(reserved, { ...base, instance_id: allocateInstanceId() })).toThrow(
       expect.objectContaining({ code: 'operation_mismatch' }),
     );
+  });
+});
+
+/** An image ID, as Docker names one. */
+function image(seed: string): string {
+  return `sha256:${seed.repeat(64).slice(0, 64)}`;
+}
+
+describe('a rollback in the operation record', () => {
+  it('takes over a recorded update with follow-ups pending, carrying its image deletions, and gives it back if withdrawn', async () => {
+    const { paths, instanceId } = await fixture();
+    const displaced: OperationFollowUp = { kind: 'delete_image', image_id: image('d') };
+    await updateTo(paths, instanceId, 'recorded', [REBUILD, displaced, CLEANUP]);
+    const pending = await readOperationRecord(paths, instanceId);
+
+    const operation = await held(paths, instanceId, { command: 'rollback' });
+    try {
+      // Only a rollback of the recorded release takes it over.
+      await expect(beginOperation(operation, { kind: 'update', from: TO, to: NEWER })).rejects.toMatchObject({
+        code: 'operation_follow_ups_pending',
+      });
+      const rollback = await beginOperation(operation, { kind: 'rollback', from: TO, to: FROM });
+      expect(rollback).toMatchObject({
+        kind: 'rollback',
+        commit_point: 'registry',
+        phase: 'staged',
+        follow_ups: [displaced],
+        superseded: pending,
+      });
+      await advanceOperation(operation, 'stopped', { stop: STOP });
+
+      await withdrawRollback(operation);
+    } finally {
+      operation.release();
+    }
+    expect(await readOperationRecord(paths, instanceId)).toEqual({ ...pending, updated_at: expect.any(String) });
+  });
+
+  it('commits a rollback that took over an update through the registry, dropping the update it replaced', async () => {
+    const { paths, instanceId } = await fixture();
+    await updateTo(paths, instanceId, 'recorded', [REBUILD]);
+    const operation = await held(paths, instanceId, { command: 'rollback' });
+    try {
+      await beginOperation(operation, { kind: 'rollback', from: TO, to: FROM, follow_ups: [CLEANUP] });
+      await advanceOperation(operation, 'stopped', { stop: STOP });
+      await advanceOperation(operation, 'swapping', { mode: 'code_only' });
+      for (const phase of ['swapped', 'started', 'verified'] as const) await advanceOperation(operation, phase);
+
+      expect(await commitOperationRelease(operation)).toMatchObject({ kind: 'rollback', mode: 'code_only' });
+    } finally {
+      operation.release();
+    }
+    expect((await getInstanceReservation(paths, instanceId)).deployed_commit).toBe(FROM.deployed_commit);
+    expect(await rawRecord(paths, instanceId)).not.toHaveProperty('superseded');
+  });
+
+  it('goes back from a failed swap to stopped, keeping every image it moved and every deletion it planned', async () => {
+    const { paths, instanceId } = await fixture();
+    await updateTo(paths, instanceId, 'recorded', []);
+    const moved = { tag: 'nanoclaw-agent-v2-x:latest', image_id: image('a'), displaced_image_id: image('b') };
+    const deletion: OperationFollowUp = { kind: 'delete_image', image_id: image('b') };
+    const operation = await held(paths, instanceId, { command: 'rollback' });
+    try {
+      await beginOperation(operation, { kind: 'rollback', from: TO, to: FROM, images: [moved] });
+      await expect(beginOperationReturn(operation)).rejects.toMatchObject({ code: 'operation_phase' });
+      await advanceOperation(operation, 'stopped', { stop: STOP });
+      await advanceOperation(operation, 'swapping', { mode: 'snapshot', follow_ups: [deletion] });
+      await advanceOperation(operation, 'swapped');
+      await advanceOperation(operation, 'started');
+
+      expect(await beginOperationReturn(operation)).toMatchObject({ phase: 'started', returning: true });
+      // Returning, it only finishes its return: it neither moves on nor commits.
+      await expect(advanceOperation(operation, 'verified')).rejects.toMatchObject({ code: 'operation_phase' });
+      await expect(commitOperationRelease(operation)).rejects.toMatchObject({ code: 'operation_phase' });
+      const back = await completeOperationReturn(operation);
+      expect(back).toMatchObject({ phase: 'stopped', images: [moved], follow_ups: [deletion] });
+      expect(back).not.toHaveProperty('mode');
+      expect(back).not.toHaveProperty('returning');
+
+      await withdrawRollback(operation);
+    } finally {
+      operation.release();
+    }
+    expect(await readOperationRecord(paths, instanceId)).toBeUndefined();
+  });
+
+  it('gives back the unrecorded update a withdrawn rollback replaced, and refuses once its swap began', async () => {
+    const { paths, instanceId } = await fixture();
+    await updateTo(paths, instanceId, 'swapped');
+    const update = await readOperationRecord(paths, instanceId);
+    const operation = await held(paths, instanceId, { command: 'rollback' });
+    try {
+      const reverting = await beginOperation(operation, { kind: 'rollback', from: TO, to: FROM });
+      expect(reverting).toMatchObject({ commit_point: 'record', superseded: update });
+      expect(await withdrawRollback(operation)).toBe(true);
+      expect(await readOperationRecord(paths, instanceId)).toEqual({ ...update, updated_at: expect.any(String) });
+
+      await beginOperation(operation, { kind: 'rollback', from: TO, to: FROM });
+      await advanceOperation(operation, 'stopped', { stop: STOP });
+      await advanceOperation(operation, 'swapping', { mode: 'code_only' });
+      await expect(withdrawRollback(operation)).rejects.toMatchObject({ code: 'operation_in_progress' });
+      // Gone back once, it no longer holds the update, whose staging it may have dropped: it stays.
+      await beginOperationReturn(operation);
+      const back = await completeOperationReturn(operation);
+      expect(back).not.toHaveProperty('superseded');
+      expect(await withdrawRollback(operation)).toBe(false);
+    } finally {
+      operation.release();
+    }
+    expect(await readOperationRecord(paths, instanceId)).toMatchObject({ kind: 'rollback', phase: 'stopped' });
+  });
+
+  it.each([
+    ['an update with a rollback mode', { kind: 'update', mode: 'code_only' }],
+    ['an update returning', { kind: 'update', returning: true }],
+    ['a rollback returning before its swap', { kind: 'rollback', phase: 'stopped', returning: true }],
+    ['an unknown rollback mode', { kind: 'rollback', mode: 'partial' }],
+    ['a superseded record that is not a recorded update', { kind: 'rollback', superseded: { kind: 'rollback' } }],
+  ] as const)('refuses a record holding %s', async (_label, fields) => {
+    const { paths, instanceId } = await fixture();
+    await updateTo(paths, instanceId, 'stopped');
+    const raw = await rawRecord(paths, instanceId);
+    const superseded = 'superseded' in fields ? { ...raw, ...fields.superseded, phase: 'recorded' } : undefined;
+    await writeFile(
+      paths.operationFile(instanceId),
+      JSON.stringify({ ...raw, ...fields, ...(superseded ? { superseded } : {}) }),
+      { mode: 0o600 },
+    );
+
+    await expect(readOperationRecord(paths, instanceId)).rejects.toMatchObject({ code: 'invalid_operation' });
   });
 });

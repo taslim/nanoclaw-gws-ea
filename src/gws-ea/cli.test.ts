@@ -204,6 +204,26 @@ describe('gws-ea usage', () => {
     expect(io.out).toContain('  update --id <instance_id> [--track <track>] [--source-remote <remote>] [--yes]');
   });
 
+  it('names rollback and each of its options', async () => {
+    const io = lines();
+
+    expect(await runCli(['--help'], io.runtime)).toBe(0);
+    expect(io.out).toContain('  rollback --id <instance_id> [--snapshot] [--yes]');
+  });
+
+  it('refuses a rollback option it does not take, or one without --id, before anything runs', async () => {
+    const io = lines();
+
+    expect(await runCli(['rollback', '--id', allocateInstanceId(), '--to', 'a'.repeat(40)], io.runtime)).toBe(1);
+    expect(await runCli(['rollback', '--yes'], io.runtime)).toBe(1);
+    expect(io.err).toEqual([
+      'Unknown option --to',
+      'Run gws-ea --help for usage.',
+      'Missing required option --id',
+      'Run gws-ea --help for usage.',
+    ]);
+  });
+
   it('refuses an update option it does not take, before anything runs', async () => {
     const io = lines();
 

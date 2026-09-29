@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   applyReleaseGateway,
+  restoreReleaseGateway,
   importProviderCredential,
   observeOnecliRuntime,
   onecliSecretMatchesCredentialMetadata,
@@ -878,6 +879,55 @@ describe("an update's gateway image", () => {
     // Run again after an interruption, it converges without rendering anything new.
     await applyReleaseGateway(layout, PINS, { dockerCommandRunner: runner });
     expect(await readFile(layout.composeFile, 'utf8')).toBe(compose);
+  });
+
+  it("puts a rollback's kept Compose file back and recreates only the gateway from the image it kept, converging when rerun", async () => {
+    const layout = await layoutFixture();
+    await writeInstanceCompose(layout, GATEWAY_IMAGE);
+    const kept = renderOnecliCompose(layout, PINS, RELEASE_GATEWAY_IMAGE);
+    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
+
+    await restoreReleaseGateway(layout, PINS, kept, { dockerCommandRunner: runner, ambientEnv: HOSTILE_AMBIENT });
+
+    expect(await readFile(layout.composeFile, 'utf8')).toBe(kept);
+    expect((await stat(layout.composeFile)).mode & 0o777).toBe(0o600);
+    // The kept image is present: nothing is built or pulled, and only the gateway is recreated.
+    expect(world.calls.some((call) => call.args[0] === 'build')).toBe(false);
+    expect(composeCalls(world)).toEqual([
+      [
+        'up',
+        '--detach',
+        '--wait',
+        '--wait-timeout',
+        String(ONECLI_WAIT_TIMEOUT_SECONDS),
+        '--pull',
+        'never',
+        '--no-deps',
+        'gateway',
+      ],
+    ]);
+    expect(world.calls.every((call) => call.env?.DOCKER_HOST === DOCKER_ENDPOINT)).toBe(true);
+
+    await restoreReleaseGateway(layout, PINS, kept, { dockerCommandRunner: runner });
+    expect(await readFile(layout.composeFile, 'utf8')).toBe(kept);
+  });
+
+  it('refuses to restore a kept gateway image that is gone and that this tool does not build, leaving it unstarted', async () => {
+    const layout = await layoutFixture();
+    const written = await writeInstanceCompose(layout, GATEWAY_IMAGE);
+    const { world, runner } = dockerWorld(layout);
+    world.wrapperImageMissing = true;
+
+    await expect(
+      restoreReleaseGateway(layout, PINS, renderOnecliCompose(layout, PINS, RELEASE_GATEWAY_IMAGE), {
+        dockerCommandRunner: runner,
+      }),
+    ).rejects.toMatchObject({
+      code: 'onecli_gateway_image_missing',
+      message: expect.stringContaining(RELEASE_GATEWAY_IMAGE),
+    });
+    expect(composeCalls(world)).toEqual([]);
+    expect(await readFile(layout.composeFile, 'utf8')).toBe(written);
   });
 
   it('touches Docker not at all when the release runs the gateway the assistant already runs', async () => {

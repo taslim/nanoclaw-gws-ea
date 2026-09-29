@@ -362,6 +362,47 @@ export async function applyReleaseGateway(
   });
 }
 
+/**
+ * Put back the Compose file a kept release ran with and recreate the gateway
+ * it names, at a rollback (KTD8): the gateway image that release built is
+ * still present, since assistant commands never delete one; only when it is
+ * missing and this tool's tree builds the same content is it built again,
+ * and otherwise it is refused before the Compose file changes. Only the
+ * gateway is recreated, and every volume is kept. Run again after an
+ * interruption, it converges.
+ */
+export async function restoreReleaseGateway(
+  layout: OnecliRuntimeLayout,
+  pins: OnecliPins,
+  compose: string,
+  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'runCommand' | 'ambientEnv'> = {},
+): Promise<void> {
+  const docker = dockerContext(layout, dependencies);
+  const { gateway } = parseOnecliComposeImages(compose);
+  if (wrapperImageHash(gateway) === undefined) {
+    throw new GwsEaError('unsafe_onecli_image', `OneCLI gateway image ${gateway} is not a gws-ea wrapper image`);
+  }
+  await ensureWrapperGatewayImage(docker, pins, gateway);
+  if ((await readOwnerOnlyFile(layout.composeFile)) !== compose)
+    await writePrivateTextFile(layout.composeFile, compose);
+  await docker.runner({
+    ...buildComposeInvocation(layout, [
+      'up',
+      '--detach',
+      '--wait',
+      '--wait-timeout',
+      String(ONECLI_WAIT_TIMEOUT_SECONDS),
+      '--pull',
+      'never',
+      '--no-deps',
+      'gateway',
+    ]),
+    env: docker.environment,
+    timeoutMs: UP_TIMEOUT_MS,
+    stream: true,
+  });
+}
+
 function validateObservedOnecliRuntime(
   layout: OnecliRuntimeLayout,
   observed: ObservedOnecliRuntime,

@@ -20,9 +20,8 @@
  * that fails before it is recorded is handed to recovery.
  */
 import { constants as fsConstants } from 'node:fs';
-import { chmod, copyFile, lstat, mkdir, readdir, readFile, realpath, rm, statfs } from 'node:fs/promises';
+import { chmod, copyFile, lstat, mkdir, readdir, readFile, realpath, statfs } from 'node:fs/promises';
 import path from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
 
 import { isErrno } from '../community-portal/errors.js';
 import { writePrivate } from '../community-portal/private-file.js';
@@ -30,7 +29,6 @@ import { getInstallScopedNames } from '../install-slug.js';
 import {
   assertDeploymentCheckoutUnmodified,
   materializeReleaseCheckout,
-  observeLiveCheckout,
   prepareReleaseCommandEnvironments,
   resolveToolCommit,
   type CheckoutRuntime,
@@ -39,34 +37,39 @@ import {
   assertCarriable,
   assertCheckoutQuiet,
   carryState,
+  cutoverDocker,
+  cutoverOnecli,
+  cutoverQuiescence,
+  cutoverServiceDependencies,
+  dockerEnvironment,
+  finishFollowUps,
   finishSwap,
+  imageIdOf,
   keepReleaseFiles,
   keptReleaseFiles,
+  nextAgentImage,
+  openCutoverHost,
+  planFollowUps,
+  quietCheckoutOf,
+  removeUpdateStaging,
   settleCheckoutDatabases,
   stagedKeptFilesRoot,
-  type QuiescenceSeams,
-  type QuietCheckout,
+  stopCutoverHost,
+  verifyServingRelease,
+  type CutoverDependencies,
+  type CutoverHost,
+  type CutoverSeams,
   type SwapReleases,
 } from './cutover.js';
-import { observeManagedGchatRoute, verifyExistingGchatRoute } from './endpoint.js';
-import { runStep, type StepReporter } from './events.js';
+import { runStep } from './events.js';
 import { loadCreatedRuntime, type InstanceOperation } from './journal.js';
-import { runInstanceNclJson, type InstanceNclOptions } from './ncl.js';
-import {
-  applyReleaseGateway,
-  observeOnecliRuntime,
-  prepareReleaseGatewayImage,
-  verifyOnecliRuntime,
-  type GatewayImageChange,
-} from './onecli.js';
-import { parseOnecliComposeImages, type OnecliPins, type OnecliRuntimeLayout } from './onecli-compose.js';
+import { prepareReleaseGatewayImage, type GatewayImageChange } from './onecli.js';
+import { parseOnecliComposeImages, type OnecliPins } from './onecli-compose.js';
 import { resolveWrapperGatewayImage } from './onecli-gateway-image.js';
 import {
   advanceOperation,
   beginOperation,
   commitOperationRelease,
-  completeFollowUp,
-  followUpKey,
   operationNextSteps,
   readOperationRecord,
   recordOperationFacts,
@@ -78,38 +81,26 @@ import {
   type SnapshotManifest,
 } from './operation.js';
 import { CONTROL_PLANE_ROOT, instanceMarkerFile, isRegularFile, type ControlPlanePaths } from './paths.js';
-import type { Observation } from './phases.js';
 import { LAUNCHER_PINS } from './pins.js';
-import { pollUntil } from './poll.js';
-import { buildToolEnvironment, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
+import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { instanceOnecliLayout, readDeployedSetup, writeReleasePreflightReceipt } from './provision.js';
-import { redact, safeErrorMessage } from './redact.js';
+import { safeErrorMessage } from './redact.js';
 import { getInstanceReservation } from './registry.js';
 import { runReleasePreflight } from './release-preflight.js';
 import { resolveReleaseTarget, type ToolProviderSetup, type UpdateReleaseTarget } from './release-target.js';
 import { resolveReleaseSource, type ReleaseSource } from './release-tracks.js';
-import { readOwnerOnlyFile, readOwnerOnlyJson } from './secrets.js';
+import { describeRollback, localTimezone, revertUpdate } from './rollback.js';
+import { readOwnerOnlyFile } from './secrets.js';
 import {
   createInstanceRuntimeConfig,
   instanceServiceDefinitionFile,
   readInstanceHostEnvironment,
   stampUpgradeState,
-  validateRuntimeConfig,
   writeInstanceServiceDefinition,
   writeReleaseRuntime,
-  type HostStatusHelpers,
   type InstanceRuntimeConfig,
-  type InstanceServiceDependencies,
-  type UpsertEnvVars,
 } from './service.js';
-import {
-  createServiceControl,
-  runtimeServiceTarget,
-  type InstanceServiceControl,
-  type NanoclawServiceHelpers,
-  type ServiceControlOptions,
-} from './service-control.js';
-import { instanceServicePlatform } from './service-coordinates.js';
+import { createServiceControl, runtimeServiceTarget } from './service-control.js';
 import {
   GwsEaError,
   INSTANCE_MARKER_SCHEMA_VERSION,
@@ -120,7 +111,6 @@ import {
   type InstanceReservation,
   type ReleaseCoordinates,
 } from './types.js';
-import { isRecord } from './validation.js';
 import {
   backupCentralDatabase,
   readCentralMigrations,
@@ -154,52 +144,18 @@ export interface UpdateRequest {
   readonly sourceRemote?: string;
 }
 
-/** OneCLI as a cutover moves and checks it; each step defaults to the real one. */
-export interface CutoverOnecli {
-  /** Recreate the gateway at the image the release builds (KTD8). */
-  apply(layout: OnecliRuntimeLayout, pins: OnecliPins): Promise<void>;
-  /** Its health and versions, and the isolation probe through the gateway: after the gateway changed. */
-  verify(layout: OnecliRuntimeLayout, pins: OnecliPins): Promise<void>;
-  /** Its health alone: when the gateway did not change. */
-  observe(layout: OnecliRuntimeLayout, pins: OnecliPins): Promise<Observation>;
-}
-
 /** Boundary seams; each defaults to the real one. */
-export interface UpdateSeams {
+export interface UpdateSeams extends CutoverSeams {
   /** The tool's checkout, whose commit an update deploys; the one this control plane runs from by default. */
   readonly toolRoot?: string;
-  /** Runs Git, Docker, `ps`, `lsof`, and the release's migration, image build, and tripwire scripts. */
-  readonly runCommand?: SanitizedCommandRunner;
   readonly runReleasePreflight?: typeof runReleasePreflight;
   /** Bytes free to this user on the filesystem holding `directory`. */
   readonly freeBytes?: (directory: string) => Promise<number>;
-  /** Where the tool environment of the image builds and Docker is read. */
-  readonly ambientEnv?: NodeJS.ProcessEnv;
-  /** The service manager's platform and user, and the waits every poll takes. */
-  readonly service?: ServiceControlOptions;
-  /** Reaches the new host's listener and its callback route (public DNS for the route by default). */
-  readonly fetch?: typeof globalThis.fetch;
-  readonly onecli?: Partial<CutoverOnecli>;
-  /** `ncl <args> --json` through the assistant's own host. */
-  readonly ncl?: (
-    runtime: InstanceRuntimeConfig,
-    args: readonly string[],
-    options?: InstanceNclOptions,
-  ) => Promise<unknown>;
-  /** Renames the swap makes. */
-  readonly rename?: (from: string, to: string) => Promise<void>;
 }
 
-export interface UpdateDependencies extends UpdateSeams {
-  /** Upstream's service helpers, which the driver supplies: staging only looks at the service, the cutover controls it. */
-  readonly serviceHelpers: NanoclawServiceHelpers;
+export interface UpdateDependencies extends CutoverDependencies, UpdateSeams {
   /** The tool's provider setup, which the driver reads from `setup/providers`. */
   readonly providerSetup: ToolProviderSetup;
-  /** Upstream's `.env` upsert (`setup/set-env.ts`), which the driver supplies: the cutover writes gws-ea's keys with it. */
-  readonly upsertEnvVars: UpsertEnvVars;
-  /** Upstream's host readiness helpers, which the driver supplies: verification asks the new host for its status. */
-  readonly hostStatus: HostStatusHelpers;
-  readonly reporter?: StepReporter;
 }
 
 /**
@@ -278,19 +234,6 @@ export async function resolveUpdateIntent(
   };
 }
 
-/** The image tag an update builds its agent image as, beside the `:latest` the assistant runs. */
-function nextAgentImage(runtime: InstanceRuntimeConfig): string {
-  return `${getInstallScopedNames(runtime.install_id).containerImageBase}:next`;
-}
-
-/** Docker's environment for one assistant: the operator's tools, its home, and its Docker endpoint. */
-function dockerEnvironment(runtime: InstanceRuntimeConfig, seams: UpdateSeams): Readonly<Record<string, string>> {
-  return buildToolEnvironment(seams.ambientEnv ?? process.env, {
-    HOME: runtime.home_directory,
-    DOCKER_HOST: runtime.docker_endpoint,
-  });
-}
-
 async function exists(target: string): Promise<boolean> {
   try {
     await lstat(target);
@@ -321,18 +264,7 @@ export async function discardUpdateStaging(
       `The staged release belongs to this assistant's unfinished ${record.kind}; continue or revert it instead.`,
     );
   }
-  const run = seams.runCommand ?? runSanitizedCommand;
-  const image = nextAgentImage(runtime);
-  const docker = (args: readonly string[]) =>
-    run({
-      command: 'docker',
-      args,
-      cwd: paths.instanceRoot(instanceId),
-      env: dockerEnvironment(runtime, seams),
-      timeoutMs: DOCKER_TIMEOUT_MS,
-    });
-  if ((await docker(['image', 'ls', '--quiet', image])).stdout.trim()) await docker(['image', 'rm', image]);
-  await rm(paths.releaseRoot(instanceId, 'next'), { recursive: true, force: true });
+  await removeUpdateStaging(paths, instanceId, runtime, seams);
 }
 
 /** Remove what a failed staging left, keeping the failure: what cannot be removed is left for the next update. */
@@ -804,14 +736,6 @@ export function updatePreviewLines(preview: UpdatePreview): string[] {
   ];
 }
 
-/** How long the new host may take to serve, and what a killed host's claim lease adds (`src/host-instance.ts`). */
-const HOST_READY_MS = 60_000;
-const HOST_LEASE_MS = 90_000;
-const PROBE_INTERVAL_MS = 1_000;
-const LISTENER_TIMEOUT_MS = 10_000;
-/** At least the host's own bound on building an agent group's image (`src/container-runner.ts`), plus its restart. */
-const GROUP_IMAGE_REBUILD_TIMEOUT_MS = 20 * 60_000;
-
 /** An update that failed before its release was recorded (R14), as recovery receives it. */
 export interface FailedCutover {
   /** The update's record as the failure left it: its phase says how far the cutover got. */
@@ -819,76 +743,59 @@ export interface FailedCutover {
   readonly cause: unknown;
 }
 
+/** From here on the assistant ran the update's release, so a failure rolls it back (R14). */
+const RENAMED: ReadonlySet<OperationRecord['phase']> = new Set(['swapped', 'started', 'verified']);
+
 /**
  * Recovery for an update that failed before its release was recorded (R14).
- * Rollback (U9) reverts it here by R13's rule, which the update's own
- * confirmation covers. Until then the record stays open, so every other
- * command is refused, and the failure names the commands that continue or
- * revert it.
+ * Once its renames ran, the update is rolled back by R13's rule, which its own
+ * confirmation covers: code only when neither schema moved, else the snapshot
+ * its stop left. Before that nothing ran on the release, so the record stays
+ * open and the failure names the commands that continue or revert it. Either
+ * way the failure is reported, with where the assistant was left.
  */
-export async function recoverUpdate(operation: InstanceOperation, failed: FailedCutover): Promise<never> {
+export async function recoverUpdate(
+  operation: InstanceOperation,
+  failed: FailedCutover,
+  dependencies: UpdateDependencies,
+): Promise<never> {
   operation.assertActive();
   const { record, cause } = failed;
+  const failure = `${safeErrorMessage(cause)} The update to ${releaseLine(record.to)} stopped at ${record.phase}`;
+  const details: GwsEaErrorDetails = { ...(cause instanceof GwsEaError ? cause.details : {}), phase: record.phase };
+  if (record.kind === 'update' && RENAMED.has(record.phase)) {
+    let rolledBack: string;
+    try {
+      rolledBack = describeRollback(await revertUpdate(operation, dependencies), localTimezone());
+    } catch (error) {
+      throw new GwsEaError(
+        'update_recovery_failed',
+        `${failure}, and rolling it back did not finish: ${safeErrorMessage(error)} ` +
+          `Continue the rollback with gws-ea rollback --id ${record.instance_id}.`,
+        { cause, details: { ...details, continueWith: `gws-ea rollback --id ${record.instance_id}` } },
+      );
+    }
+    throw new GwsEaError('update_rolled_back', `${failure}, so it was rolled back: ${rolledBack}`, {
+      cause,
+      details,
+    });
+  }
   const next = operationNextSteps(record);
-  const details: GwsEaErrorDetails = {
-    ...(cause instanceof GwsEaError ? cause.details : {}),
-    phase: record.phase,
-    continueWith: next.continueWith,
-    revertWith: next.revertWith ?? null,
-  };
   throw new GwsEaError(
     'update_interrupted',
-    `${safeErrorMessage(cause)} The update to ${releaseLine(record.to)} stopped at ${record.phase} and is unfinished: ` +
-      `continue it with ${next.continueWith}${next.revertWith ? `, or revert it with ${next.revertWith}` : ''}.`,
-    { cause, details },
+    `${failure} and is unfinished: continue it with ${next.continueWith}${next.revertWith ? `, or revert it with ${next.revertWith}` : ''}.`,
+    { cause, details: { ...details, continueWith: next.continueWith, revertWith: next.revertWith ?? null } },
   );
 }
 
-/** What every cutover phase works from, read once per run. */
-interface Cutover {
-  readonly operation: InstanceOperation;
+/** What every update cutover phase works from, read once per run. */
+interface Cutover extends CutoverHost {
   readonly dependencies: UpdateDependencies;
-  readonly reporter: StepReporter;
-  readonly run: SanitizedCommandRunner;
-  /** The registry's reservation: it names the release the update moves from until the commit point. */
-  readonly reservation: InstanceReservation;
   /** The reservation with the update's target overlaid (KTD17). */
   readonly target: InstanceReservation;
-  /** The assistant's runtime: its checkout path, install, home, and Docker endpoint are the same on either release. */
-  readonly runtime: InstanceRuntimeConfig;
   /** The runtime record the release the update deploys runs with. */
   readonly release: InstanceRuntimeConfig;
   readonly releases: SwapReleases;
-  readonly onecli: OnecliRuntimeLayout;
-  readonly service: InstanceServiceControl;
-  readonly uid: number | undefined;
-}
-
-/**
- * The runtime record of whichever of the assistant's releases holds one: the
- * live checkout's, or mid-swap the outgoing release's in `previous/` or the
- * staged one's in `next/`. Only the fields the two releases share are used.
- */
-async function readCutoverRuntime(
-  paths: ControlPlanePaths,
-  reservation: InstanceReservation,
-): Promise<InstanceRuntimeConfig> {
-  const id = reservation.instance_id;
-  const checkouts = [
-    reservation.checkout_realpath,
-    paths.releaseCheckoutRoot(id, 'previous'),
-    paths.releaseCheckoutRoot(id, 'next'),
-  ];
-  for (const checkout of checkouts) {
-    const file = path.join(checkout, 'data', 'gws-ea', 'runtime.json');
-    if (!(await isRegularFile(file))) continue;
-    const runtime = validateRuntimeConfig(await readOwnerOnlyJson(file, 'Runtime config', 'invalid_runtime_config'));
-    if (runtime.instance_id === id && runtime.checkout_realpath === reservation.checkout_realpath) return runtime;
-  }
-  throw new GwsEaError(
-    'runtime_missing',
-    `None of assistant ${id}'s releases holds its runtime record, so its update cannot go on.`,
-  );
 }
 
 async function prepareCutover(
@@ -896,128 +803,23 @@ async function prepareCutover(
   record: OperationRecord,
   dependencies: UpdateDependencies,
 ): Promise<Cutover> {
-  const reservation = await getInstanceReservation(operation.paths, operation.instanceId);
-  const runtime = await readCutoverRuntime(operation.paths, reservation);
-  const onecli = instanceOnecliLayout(operation.paths, reservation, runtime.onecli_cli_path, runtime.docker_endpoint);
-  const target = targetReservationView(reservation, record);
+  const host = await openCutoverHost(operation, dependencies);
+  const target = targetReservationView(host.reservation, record);
   return {
-    operation,
+    ...host,
     dependencies,
-    reporter: dependencies.reporter ?? {},
-    run: dependencies.runCommand ?? runSanitizedCommand,
-    reservation,
     target,
-    runtime,
-    release: createInstanceRuntimeConfig(target, onecli, {
-      nodePath: runtime.node_path,
-      homeDirectory: runtime.home_directory,
-      selectedProvider: runtime.selected_provider,
-      dockerEndpoint: runtime.docker_endpoint,
+    release: createInstanceRuntimeConfig(target, host.onecli, {
+      nodePath: host.runtime.node_path,
+      homeDirectory: host.runtime.home_directory,
+      selectedProvider: host.runtime.selected_provider,
+      dockerEndpoint: host.runtime.docker_endpoint,
     }),
     releases: { from: record.from.deployed_commit, to: record.to.deployed_commit },
-    onecli,
-    service: createServiceControl(dependencies.serviceHelpers, runtimeServiceTarget(runtime), dependencies.service),
-    uid: dependencies.service?.uid ?? process.getuid?.(),
   };
 }
 
-/** How every cutover wait sleeps. */
-function sleeper({ dependencies }: Cutover): (milliseconds: number) => Promise<void> {
-  return dependencies.service?.sleep ?? ((milliseconds) => delay(milliseconds));
-}
-
-function quietCheckout(cutover: Cutover, checkoutRoot: string): QuietCheckout {
-  return {
-    checkoutRoot,
-    installId: cutover.runtime.install_id,
-    homeDirectory: cutover.runtime.home_directory,
-    dockerEndpoint: cutover.runtime.docker_endpoint,
-  };
-}
-
-function quiescenceSeams({ run, dependencies }: Cutover): QuiescenceSeams {
-  return {
-    runCommand: run,
-    ...(dependencies.service?.platform ? { platform: dependencies.service.platform } : {}),
-    ...(dependencies.ambientEnv ? { ambientEnv: dependencies.ambientEnv } : {}),
-    ...(dependencies.service?.sleep ? { sleep: dependencies.service.sleep } : {}),
-  };
-}
-
-function serviceDependencies(cutover: Cutover): InstanceServiceDependencies {
-  const { dependencies, runtime, uid } = cutover;
-  return {
-    platform: instanceServicePlatform(dependencies.service?.platform),
-    homeDirectory: runtime.home_directory,
-    runningAsRoot: uid === 0,
-    runCommand: cutover.run,
-    ...(uid === undefined ? {} : { uid }),
-    ...(dependencies.ambientEnv ? { ambientEnv: dependencies.ambientEnv } : {}),
-  };
-}
-
-function cutoverOnecli({ run, dependencies }: Cutover): CutoverOnecli {
-  const boundaries = {
-    runCommand: run,
-    dockerCommandRunner: run,
-    ...(dependencies.ambientEnv ? { ambientEnv: dependencies.ambientEnv } : {}),
-    ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
-  };
-  return {
-    apply: dependencies.onecli?.apply ?? ((layout, pins) => applyReleaseGateway(layout, pins, boundaries)),
-    verify:
-      dependencies.onecli?.verify ??
-      (async (layout, pins) => {
-        await verifyOnecliRuntime(layout, pins, boundaries);
-      }),
-    observe: dependencies.onecli?.observe ?? ((layout, pins) => observeOnecliRuntime(layout, pins, boundaries)),
-  };
-}
-
-function docker(cutover: Cutover, args: readonly string[]) {
-  return cutover.run({
-    command: 'docker',
-    args,
-    cwd: cutover.operation.paths.instanceRoot(cutover.operation.instanceId),
-    env: dockerEnvironment(cutover.runtime, cutover.dependencies),
-    timeoutMs: DOCKER_TIMEOUT_MS,
-  });
-}
-
-const IMAGE_ID = /^sha256:[0-9a-f]{64}$/u;
-
-/** The ID of the image `reference` names, or undefined when it names none. */
-async function imageIdOf(cutover: Cutover, reference: string): Promise<string | undefined> {
-  const listed = new Set(
-    (await docker(cutover, ['image', 'ls', '--quiet', '--no-trunc', reference])).stdout
-      .split(/\r?\n/u)
-      .map((line) => line.trim())
-      .filter(Boolean),
-  );
-  const [id, ...others] = listed;
-  if (id === undefined) return undefined;
-  if (others.length > 0 || !IMAGE_ID.test(id)) {
-    throw new GwsEaError('invalid_child_output', `Docker reported no single image ID for ${reference}`);
-  }
-  return id;
-}
-
-/** Add follow-ups to those planned, each at most once. */
-function plan(planned: readonly OperationFollowUp[], added: readonly OperationFollowUp[]): OperationFollowUp[] {
-  const known = new Set(planned.map(followUpKey));
-  return [...planned, ...added.filter((followUp) => !known.has(followUpKey(followUp)))];
-}
-
-/**
- * Stop the host and its agents. Service control waits until the job is gone;
- * the drain stops the containers the host leaves for the next start to adopt.
- */
-async function stopHost(cutover: Cutover): Promise<void> {
-  await runStep(cutover.reporter, { id: 'stop_host', label: 'Stopping the assistant for the switch…' }, async () => {
-    await cutover.service.stop();
-    await cutover.service.drain();
-  });
-}
+const STOP_LABEL = 'Stopping the assistant for the switch…';
 
 /** The live migrations must still be the ones staging read, or the dry run no longer speaks for them. */
 function assertMigrationsUnchanged(record: OperationRecord, checkoutRoot: string): void {
@@ -1047,9 +849,10 @@ async function displacedGroupImages(cutover: Cutover, record: OperationRecord): 
  * Write what the release runs with into its staged checkout, the outgoing
  * one's state already carried in: its marker, runtime record, and gws-ea's
  * `.env` keys (KTD9), then its upgrade tripwire, stamped by its own script.
- * The outgoing release's own files are gathered to be kept beside it.
+ * The outgoing release's own files are gathered to be kept beside it, with
+ * its manifest: the release it is, and when its host stopped.
  */
-async function carryIntoRelease(cutover: Cutover): Promise<void> {
+async function carryIntoRelease(cutover: Cutover, stoppedAt: string): Promise<void> {
   const { operation, runtime, release, reservation, dependencies } = cutover;
   const { paths, instanceId } = operation;
   const live = reservation.checkout_realpath;
@@ -1065,8 +868,14 @@ async function carryIntoRelease(cutover: Cutover): Promise<void> {
     ...dockerEnvironment(runtime, dependencies),
     NANOCLAW_INSTALL_ID: runtime.install_id,
   });
-  const definition = instanceServiceDefinitionFile(runtime, serviceDependencies(cutover));
+  const definition = instanceServiceDefinitionFile(runtime, cutoverServiceDependencies(cutover));
   await keepReleaseFiles(stagedKeptFilesRoot(paths, instanceId), {
+    manifest: {
+      schema_version: 1,
+      instance_id: instanceId,
+      release: releaseOf(reservation),
+      snapshot_at: stoppedAt,
+    },
     receipt: paths.releasePreflightFile(instanceId),
     compose: cutover.onecli.composeFile,
     serviceDefinition: (await isRegularFile(definition)) ? definition : undefined,
@@ -1086,13 +895,13 @@ async function stopAndCarry(cutover: Cutover, record: OperationRecord): Promise<
   const { paths, instanceId } = operation;
   const live = reservation.checkout_realpath;
   await assertCarriable(live);
-  await stopHost(cutover);
+  await stopCutoverHost(cutover, STOP_LABEL);
   const stoppedAt = new Date().toISOString();
   const { graceful, manifest } = await runStep(
     reporter,
     { id: 'prove_quiet', label: 'Checking nothing still uses its state…' },
     async () => {
-      await assertCheckoutQuiet(quietCheckout(cutover, live), quiescenceSeams(cutover));
+      await assertCheckoutQuiet(quietCheckoutOf(cutover, live), cutoverQuiescence(cutover));
       const settled = settleCheckoutDatabases(live);
       assertMigrationsUnchanged(record, live);
       return { graceful: settled.graceful, manifest: readSchemaManifest(live) };
@@ -1101,12 +910,12 @@ async function stopAndCarry(cutover: Cutover, record: OperationRecord): Promise<
   const stopped = await advanceOperation(operation, 'stopped', {
     stop: { at: stoppedAt, graceful },
     manifest,
-    follow_ups: plan(record.follow_ups, await displacedGroupImages(cutover, record)),
+    follow_ups: planFollowUps(record.follow_ups, await displacedGroupImages(cutover, record)),
   });
   await runStep(
     reporter,
     { id: 'carry_state', label: 'Carrying conversations, memory, and settings to the new release…' },
-    () => carryIntoRelease(cutover),
+    () => carryIntoRelease(cutover, stoppedAt),
   );
   const kept: OperationFollowUp[] = [
     ...((await exists(paths.releaseRoot(instanceId, 'previous')))
@@ -1116,7 +925,7 @@ async function stopAndCarry(cutover: Cutover, record: OperationRecord): Promise<
       ? [{ kind: 'delete_release' as const, release: 'outgoing' as const }]
       : []),
   ];
-  return advanceOperation(operation, 'swapping', { follow_ups: plan(stopped.follow_ups, kept) });
+  return advanceOperation(operation, 'swapping', { follow_ups: planFollowUps(stopped.follow_ups, kept) });
 }
 
 /**
@@ -1127,13 +936,13 @@ async function stopAndCarry(cutover: Cutover, record: OperationRecord): Promise<
 async function swapReleases(cutover: Cutover): Promise<OperationRecord> {
   const { operation, reporter, reservation, dependencies } = cutover;
   const { paths, instanceId } = operation;
-  await stopHost(cutover);
+  await stopCutoverHost(cutover, STOP_LABEL);
   await runStep(reporter, { id: 'swap_releases', label: 'Switching to the new release…' }, async () => {
     // Between the two renames the outgoing release is no longer at the live path, but in previous/.
     const outgoing = (await exists(reservation.checkout_realpath))
       ? reservation.checkout_realpath
       : paths.releaseCheckoutRoot(instanceId, 'previous');
-    await assertCheckoutQuiet(quietCheckout(cutover, outgoing), quiescenceSeams(cutover));
+    await assertCheckoutQuiet(quietCheckoutOf(cutover, outgoing), cutoverQuiescence(cutover));
     await finishSwap(paths, instanceId, cutover.releases, dependencies.rename ? { rename: dependencies.rename } : {});
   });
   return advanceOperation(operation, 'swapped');
@@ -1149,7 +958,7 @@ async function moveAgentImages(cutover: Cutover, record: OperationRecord): Promi
   const base = getInstallScopedNames(cutover.runtime.install_id).containerImageBase;
   const latestTag = `${base}:latest`;
   const previousTag = `${base}:previous`;
-  const nextTag = `${base}:next`;
+  const nextTag = nextAgentImage(cutover.runtime);
   let current = record;
   if (current.images.length === 0) {
     const [ran, kept, built] = await Promise.all([
@@ -1171,14 +980,14 @@ async function moveAgentImages(cutover: Cutover, record: OperationRecord): Promi
       kept && kept !== ran && kept !== built ? [{ kind: 'delete_image', image_id: kept }] : [];
     current = await recordOperationFacts(cutover.operation, {
       images,
-      follow_ups: plan(current.follow_ups, displaced),
+      follow_ups: planFollowUps(current.follow_ups, displaced),
     });
   }
-  for (const image of current.images) await docker(cutover, ['tag', image.image_id, image.tag]);
+  for (const image of current.images) await cutoverDocker(cutover, ['tag', image.image_id, image.tag]);
   const latest = current.images.find((image) => image.tag === latestTag);
   // `:next` now names the image `:latest` does, so removing it only removes the tag.
   if (latest && (await imageIdOf(cutover, nextTag)) === latest.image_id) {
-    await docker(cutover, ['image', 'rm', nextTag]);
+    await cutoverDocker(cutover, ['image', 'rm', nextTag]);
   }
   return current;
 }
@@ -1204,7 +1013,7 @@ async function gatewayChanged(cutover: Cutover, pins: OnecliPins): Promise<boole
  */
 async function startRelease(cutover: Cutover, record: OperationRecord): Promise<OperationRecord> {
   const { operation, reporter } = cutover;
-  await stopHost(cutover);
+  await stopCutoverHost(cutover, STOP_LABEL);
   await runStep(reporter, { id: 'move_images', label: "Moving the assistant's images to the new release…" }, () =>
     moveAgentImages(cutover, record),
   );
@@ -1215,147 +1024,29 @@ async function startRelease(cutover: Cutover, record: OperationRecord): Promise<
     );
   }
   await runStep(reporter, { id: 'start_release', label: 'Starting the new release…' }, async () => {
-    await writeInstanceServiceDefinition(cutover.release, serviceDependencies(cutover));
+    await writeInstanceServiceDefinition(cutover.release, cutoverServiceDependencies(cutover));
     await cutover.service.start();
   });
   return advanceOperation(operation, 'started');
 }
 
-function hostFailure(error: unknown, checkoutRoot: string): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return redact(message.replaceAll('logs/nanoclaw.error.log', path.join(checkoutRoot, 'logs', 'nanoclaw.error.log')));
-}
-
-/** The listener ID of the host serving the live checkout, once it answers with Google Chat connected. */
-async function servingListener(cutover: Cutover, budgetMs: number): Promise<string> {
-  const root = cutover.reservation.checkout_realpath;
-  const port = cutover.reservation.allocated_ports.nanoclaw_webhook;
-  let status: unknown;
-  try {
-    status = await cutover.dependencies.hostStatus.waitForHost(root, { channel: 'gchat', timeoutMs: budgetMs });
-  } catch (error) {
-    // Upstream waitForHost reports every failure as a plain Error naming why the host is not ready.
-    throw new GwsEaError('host_not_serving', `The new release's host is not serving: ${hostFailure(error, root)}`, {
-      cause: error,
-    });
-  }
-  const webhook = isRecord(status) ? status.webhook : undefined;
-  if (!isRecord(webhook) || webhook.port !== port || typeof webhook.id !== 'string' || !webhook.id) {
-    throw new GwsEaError(
-      'host_not_serving',
-      `The new release's host answers without its Google Chat listener on port ${port}.`,
-    );
-  }
-  return webhook.id;
-}
-
-/** What the local listener answered: its status, and the listener ID it named. */
-async function askListener(fetchListener: typeof globalThis.fetch, url: string): Promise<string> {
-  try {
-    const response = await fetchListener(url, {
-      method: 'POST',
-      redirect: 'manual',
-      headers: { 'content-type': 'application/json' },
-      body: '{}',
-      signal: AbortSignal.timeout(LISTENER_TIMEOUT_MS),
-    });
-    return `HTTP ${response.status} from listener ${response.headers.get('x-nanoclaw-webhook-id') ?? 'none'}`;
-    // eslint-disable-next-line no-catch-all/no-catch-all -- Not answering is itself the answer.
-  } catch {
-    return 'no answer';
-  }
-}
-
-/** The new host's listener refuses unsigned traffic with 401 and its own listener ID. */
-async function assertListenerServes(cutover: Cutover, listener: string, budgetMs: number): Promise<void> {
-  const url = `http://127.0.0.1:${cutover.reservation.allocated_ports.nanoclaw_webhook}/webhook/gchat`;
-  const expected = `HTTP 401 from listener ${listener}`;
-  const answer = await pollUntil(
-    () => askListener(cutover.dependencies.fetch ?? globalThis.fetch, url),
-    (seen) => seen === expected,
-    { intervalMs: PROBE_INTERVAL_MS, limitMs: budgetMs, sleep: sleeper(cutover) },
-  );
-  if (answer === expected) return;
-  throw new GwsEaError(
-    'listener_not_serving',
-    `The new release's listener at ${url} answered ${answer}, not 401 from the host's listener ${listener}.`,
-  );
-}
-
-/** The callback reaches the new listener (managed) or refuses unsigned traffic (existing), observed read-only. */
-async function assertRouteServes(cutover: Cutover, listener: string, budgetMs: number): Promise<void> {
-  const ingress = cutover.reservation.exclusive_resource_claims.ingress;
-  const fetchRoute = cutover.dependencies.fetch ? { fetch: cutover.dependencies.fetch } : {};
-  const wait = { intervalMs: PROBE_INTERVAL_MS, limitMs: budgetMs, sleep: sleeper(cutover) };
-  if (ingress.mode === 'existing') {
-    const failure = await pollUntil(
-      () =>
-        verifyExistingGchatRoute({ endpointUrl: ingress.endpoint_url }, fetchRoute).then(
-          () => undefined,
-          (error: unknown) => {
-            if (error instanceof GwsEaError) return error;
-            throw error;
-          },
-        ),
-      (seen) => seen === undefined,
-      wait,
-    );
-    if (failure) throw failure;
-    return;
-  }
-  const seen = await pollUntil(
-    () =>
-      observeManagedGchatRoute(
-        {
-          endpointUrl: ingress.callback_url,
-          localEndpointUrl: `http://127.0.0.1:${cutover.reservation.allocated_ports.nanoclaw_webhook}/webhook/gchat`,
-        },
-        fetchRoute,
-      ),
-    (route) => route.status === 'routed',
-    wait,
-  );
-  if (seen.status !== 'routed') {
-    throw new GwsEaError('route_not_serving', `The assistant's callback does not reach it: ${seen.observed}.`);
-  }
-  if (seen.listenerId !== listener) {
-    throw new GwsEaError('route_not_serving', "The assistant's callback reaches another listener than the new host's.");
-  }
-}
-
 /**
- * `started` → `verified`: the host serves on the release. Its service is
- * healthy; the live checkout is the target, marker and commit and clean tree,
- * and the host answers for it, which NanoClaw's upgrade tripwire allows only
- * at the commit its checkout was stamped for; its listener answers 401 with
- * the new host's listener ID; OneCLI is healthy, and still isolates agents
- * when the gateway changed; and the callback route reaches it. A killed host's
- * claim lease can delay the new one, so its stop lengthens every wait.
+ * `started` → `verified`: the host serves on the release (see
+ * `verifyServingRelease`); after a killed host its claim lease lengthens every
+ * wait, and when the release changed the gateway the isolation probe runs.
  */
 async function verifyRelease(cutover: Cutover, record: OperationRecord): Promise<OperationRecord> {
-  const { operation, reporter } = cutover;
-  await runStep(reporter, { id: 'verify_release', label: 'Checking the new release serves…' }, async () => {
-    // A host that went down since it was started is started again; a running one is left as it is.
-    await cutover.service.start();
-    const budget = record.stop?.graceful === false ? HOST_READY_MS + HOST_LEASE_MS : HOST_READY_MS;
-    if (!(await cutover.service.verifyHealth(budget))) {
-      throw new GwsEaError('host_not_serving', "The new release's host service never became healthy.");
-    }
-    await observeLiveCheckout(cutover.target, [cutover.releases.to], { runCommand: cutover.run });
-    const listener = await servingListener(cutover, budget);
-    await assertListenerServes(cutover, listener, budget);
+  await runStep(cutover.reporter, { id: 'verify_release', label: 'Checking the new release serves…' }, async () => {
     const pins = await releasePins(cutover);
-    const onecli = cutoverOnecli(cutover);
-    if (await gatewayChanged(cutover, pins)) await onecli.verify(cutover.onecli, pins);
-    else {
-      const seen = await onecli.observe(cutover.onecli, pins);
-      if (seen.status !== 'present') {
-        throw new GwsEaError('onecli_not_serving', `The credential vault is not healthy on the new release.`);
-      }
-    }
-    await assertRouteServes(cutover, listener, budget);
+    await verifyServingRelease(cutover, {
+      view: cutover.target,
+      pins,
+      leaseHeld: record.stop?.graceful === false,
+      gatewayChanged: await gatewayChanged(cutover, pins),
+      subject: 'The new release',
+    });
   });
-  return advanceOperation(operation, 'verified');
+  return advanceOperation(cutover.operation, 'verified');
 }
 
 /** Run the cutover from the phase its record reached until the release is recorded. */
@@ -1414,164 +1105,13 @@ export async function continueUpdate(
       await runCutover(await prepareCutover(operation, record, dependencies), record);
       // eslint-disable-next-line no-catch-all/no-catch-all -- Every failure before the commit point goes to recovery, which reports it.
     } catch (error) {
-      return recoverUpdate(operation, {
-        record: (await readOperationRecord(paths, instanceId)) ?? record,
-        cause: error,
-      });
+      return recoverUpdate(
+        operation,
+        { record: (await readOperationRecord(paths, instanceId)) ?? record, cause: error },
+        dependencies,
+      );
     }
   }
   await finishFollowUps(operation, dependencies);
   return { from: record.from, to: record.to };
-}
-
-function describeFollowUp(followUp: OperationFollowUp): string {
-  switch (followUp.kind) {
-    case 'rebuild_group_image':
-      return `rebuilding agent group ${followUp.agent_group_id}'s image`;
-    case 'refresh_template':
-      return "refreshing main's template";
-    case 'reverse_template_restamp':
-      return "reversing main's template refresh";
-    case 'delete_release':
-      return followUp.release === 'outgoing'
-        ? 'deleting the outgoing release'
-        : 'deleting the superseded previous release';
-    case 'delete_image':
-      return `deleting image ${followUp.image_id.slice(0, 19)}`;
-  }
-}
-
-/** Work that brings the release up to date, before any cleanup. */
-function isCleanup(followUp: OperationFollowUp): boolean {
-  return followUp.kind === 'delete_release' || followUp.kind === 'delete_image';
-}
-
-/**
- * Rebuild an agent group's own image on the new base with the assistant's own
- * `ncl` (KTD7): NanoClaw's `buildAgentGroupImage`, then a restart of that
- * group's containers. A group that no longer runs its own image is done.
- */
-async function rebuildGroupImage(
-  runtime: InstanceRuntimeConfig,
-  agentGroupId: string,
-  dependencies: UpdateDependencies,
-): Promise<void> {
-  const base = getInstallScopedNames(runtime.install_id).containerImageBase;
-  if (!readDerivedImageGroups(runtime.checkout_realpath, base).some((group) => group.id === agentGroupId)) return;
-  const result = await (dependencies.ncl ?? runInstanceNclJson)(
-    runtime,
-    ['groups', 'restart', '--id', agentGroupId, '--rebuild'],
-    { timeoutMs: GROUP_IMAGE_REBUILD_TIMEOUT_MS },
-  );
-  if (isRecord(result) && result.rebuilt === true) return;
-  const reason = isRecord(result) && typeof result.error === 'string' ? `: ${result.error}` : '';
-  throw new GwsEaError(
-    'group_image_not_rebuilt',
-    `NanoClaw did not rebuild agent group ${agentGroupId}'s image${reason}.`,
-  );
-}
-
-/** Delete an image a retag or rebuild displaced, by ID, unless a tag still names it (KTD19). */
-async function deleteDisplacedImage(
-  runtime: InstanceRuntimeConfig,
-  imageId: string,
-  dependencies: UpdateDependencies,
-  cwd: string,
-): Promise<void> {
-  const run = dependencies.runCommand ?? runSanitizedCommand;
-  const command = (args: readonly string[]) =>
-    run({ command: 'docker', args, cwd, env: dockerEnvironment(runtime, dependencies), timeoutMs: DOCKER_TIMEOUT_MS });
-  let tags: unknown;
-  try {
-    tags = JSON.parse((await command(['image', 'inspect', '--format', '{{json .RepoTags}}', imageId])).stdout);
-  } catch (error) {
-    if (error instanceof SyntaxError)
-      throw new GwsEaError('invalid_child_output', 'Docker reported invalid image tags');
-    const gone =
-      error instanceof GwsEaError &&
-      error.code === 'command_failed' &&
-      /No such image/iu.test(String(error.details?.stderrTail ?? ''));
-    if (gone) return;
-    throw error;
-  }
-  // Docker reports an image no tag names with an empty list, or none at all.
-  if (tags !== null && !Array.isArray(tags)) {
-    throw new GwsEaError('invalid_child_output', 'Docker reported invalid image tags');
-  }
-  if (tags !== null && tags.length > 0) return;
-  await command(['image', 'rm', imageId]);
-}
-
-async function runFollowUp(
-  operation: InstanceOperation,
-  runtime: InstanceRuntimeConfig,
-  followUp: OperationFollowUp,
-  dependencies: UpdateDependencies,
-): Promise<void> {
-  const { paths, instanceId } = operation;
-  switch (followUp.kind) {
-    case 'rebuild_group_image':
-      return rebuildGroupImage(runtime, followUp.agent_group_id, dependencies);
-    case 'refresh_template':
-    case 'reverse_template_restamp':
-      // Planned only by a gws-ea that refreshes templates (U10); this one leaves it for that release to finish.
-      throw new GwsEaError(
-        'follow_up_unsupported',
-        `This gws-ea does not run ${describeFollowUp(followUp)}; finish it with the gws-ea release that planned it.`,
-      );
-    case 'delete_release':
-      return rm(paths.releaseRoot(instanceId, followUp.release === 'outgoing' ? 'outgoing' : 'superseded'), {
-        recursive: true,
-        force: true,
-      });
-    case 'delete_image':
-      return deleteDisplacedImage(runtime, followUp.image_id, dependencies, paths.instanceRoot(instanceId));
-  }
-}
-
-/**
- * Run a recorded update's or rollback's follow-ups (KTD2): the per-group image
- * rebuilds first, then, once they all succeeded, the cleanup of the superseded
- * releases and displaced images. Each is struck from the record as it
- * finishes, and the record is deleted with the last. A failure never rolls
- * back: it stays in the record, `status` reports it, and the next
- * `update --id` retries it.
- */
-export async function finishFollowUps(operation: InstanceOperation, dependencies: UpdateDependencies): Promise<void> {
-  operation.assertActive();
-  const { paths, instanceId } = operation;
-  const record = await readOperationRecord(paths, instanceId);
-  if (!record || record.phase !== 'recorded') return;
-  const runtime = await loadCreatedRuntime(paths, instanceId);
-  const reporter = dependencies.reporter ?? {};
-  const failures: string[] = [];
-  const attempt = async (followUp: OperationFollowUp, label: string): Promise<void> => {
-    try {
-      await runStep(reporter, { id: followUp.kind, label }, () =>
-        runFollowUp(operation, runtime, followUp, dependencies),
-      );
-      await completeFollowUp(operation, followUp);
-    } catch (error) {
-      if (!(error instanceof GwsEaError)) throw error;
-      failures.push(`${describeFollowUp(followUp)}: ${safeErrorMessage(error)}`);
-    }
-  };
-  for (const followUp of record.follow_ups.filter((pending) => !isCleanup(pending))) {
-    await attempt(followUp, `${sentenceCase(describeFollowUp(followUp))}…`);
-  }
-  if (failures.length === 0) {
-    for (const followUp of record.follow_ups.filter(isCleanup)) {
-      await attempt(followUp, 'Cleaning up after the update…');
-    }
-  }
-  if (failures.length === 0) return;
-  throw new GwsEaError(
-    'follow_ups_failed',
-    `Assistant ${instanceId} runs ${releaseLine(record.to)}, but ${failures.length === 1 ? 'a follow-up' : `${failures.length} follow-ups`} of its ${record.kind} failed: ${failures.join('; ')}. ` +
-      `gws-ea status --id ${instanceId} lists what is left, and gws-ea update --id ${instanceId} retries it.`,
-  );
-}
-
-function sentenceCase(text: string): string {
-  return `${text.charAt(0).toUpperCase()}${text.slice(1)}`;
 }
