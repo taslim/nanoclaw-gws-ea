@@ -796,6 +796,7 @@ async function uninstallNanoclaw(
   const control = createServiceControl(
     teardown.serviceHelpers,
     {
+      instanceId: reservation.instance_id,
       checkoutRoot: reservation.checkout_realpath,
       installId,
       homeDirectory: runtime.homeDirectory,

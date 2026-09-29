@@ -48,6 +48,8 @@ import {
   finishRollbackSwap,
   finishSwap,
   imageIdOf,
+  keepCutoverHostStopped,
+  leftoverPreviousTag,
   nextAgentImage,
   openCutoverHost,
   planFollowUps,
@@ -919,7 +921,7 @@ async function unwindSwap(rollback: Rollback): Promise<OperationRecord | undefin
  */
 async function swapRollback(rollback: Rollback): Promise<OperationRecord> {
   const { places, operation, dependencies } = rollback;
-  await stopCutoverHost(rollback, STOP_LABEL);
+  await keepCutoverHostStopped(rollback);
   await runStep(rollback.reporter, { id: 'swap_releases', label: 'Switching to the previous release…' }, async () => {
     const live = (await exists(places.live)) ? places.live : places.outgoingCheckout;
     await assertCheckoutQuiet(quietCheckoutOf(rollback, live), cutoverQuiescence(rollback));
@@ -979,7 +981,7 @@ async function restoreReleaseFiles(rollback: Rollback, keptRoot: string, release
  * put back its gateway and service definition; start the host.
  */
 async function startRestored(rollback: Rollback, record: OperationRecord): Promise<OperationRecord> {
-  await stopCutoverHost(rollback, STOP_LABEL);
+  await keepCutoverHostStopped(rollback);
   await runStep(rollback.reporter, { id: 'move_images', label: "Moving the assistant's images back…" }, async () => {
     const next = nextAgentImage(rollback.runtime);
     // Removed before the moves, while `:latest` may still name its image, so the image itself is deleted only by ID.
@@ -1217,7 +1219,7 @@ async function revertOpenUpdate(
   const { paths, instanceId } = operation;
   let record = update;
   if (record.phase === 'swapping') {
-    await stopCutoverHost(host, STOP_LABEL);
+    await keepCutoverHostStopped(host);
     const releases = { from: record.from.deployed_commit, to: record.to.deployed_commit };
     const live = host.reservation.checkout_realpath;
     const liveCommit = (await exists(instanceMarkerFile(live)))
@@ -1250,7 +1252,9 @@ async function revertOpenUpdate(
  * Every refusal comes before anything changes: no previous release, one of
  * another assistant, or its agent image gone. The mode is first judged while
  * the assistant serves, so a snapshot restore nobody can confirm is refused
- * before the stop; it is decided again, and confirmed, once stopped.
+ * before the stop; it is decided again, and confirmed, once stopped. A
+ * rollback recorded with nothing else to follow up leaves no record, so the
+ * `:previous` tag its cleanup had yet to drop is what says it is unfinished.
  */
 async function rollBackRecorded(
   operation: InstanceOperation,
@@ -1259,6 +1263,7 @@ async function rollBackRecorded(
 ): Promise<RollbackOutcome> {
   const host = await openCutoverHost(operation, dependencies);
   const { instanceId } = operation;
+  if (await leftoverPreviousTag(host)) return { kind: 'follow_ups_finished', release: releaseOf(host.reservation) };
   const kept = await readKeptPreviousRelease(host.operation.paths, instanceId);
   const from = releaseOf(host.reservation);
   const to = kept.release;

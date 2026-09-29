@@ -256,6 +256,15 @@ export async function main(argv: readonly string[], options: { readonly interact
         message: `Update assistant ${preview.instanceId} to ${preview.to.release_track} ${preview.to.deployed_commit.slice(0, 12)}?`,
         initialValue: false,
       })) === true,
+    confirmUpdateAll: async (plan) => {
+      const count = plan.candidates.filter((candidate) => candidate.eligible).length;
+      return (
+        (await p.confirm({
+          message: `Update ${count} ${count === 1 ? 'assistant' : 'assistants'} to this tool's release ${plan.toolCommit.slice(0, 12)}, as planned above?`,
+          initialValue: false,
+        })) === true
+      );
+    },
     confirmRollback: async (preview) =>
       (await p.confirm({
         message: `Restore assistant ${preview.instanceId}'s pre-update snapshot on ${preview.to.release_track} ${preview.to.deployed_commit.slice(0, 12)}, discarding what it recorded since?`,

@@ -101,6 +101,13 @@ import {
   type UpdateSeams,
 } from './update.js';
 import {
+  planUpdateAll,
+  runUpdateAll,
+  type AssistantUpdate,
+  type UpdateAllPlan,
+  type UpdateTurn,
+} from './update-all.js';
+import {
   GwsEaError,
   sameRelease,
   shortCommit,
@@ -214,11 +221,20 @@ export interface CliRuntime {
   toolProviderSetup?: () => Promise<ToolProviderSetup>;
   /** Absent means an update requires `--yes`. */
   confirmUpdate?: (preview: UpdatePreview) => Promise<boolean>;
+  /** Asks once, after `update --all` shows its plan and before anything is staged; absent means it requires `--yes`. */
+  confirmUpdateAll?: (plan: UpdateAllPlan) => Promise<boolean>;
+  /** The central migrations this tool's release applies, which `update --all`'s plan names; its registry when absent. */
+  releaseMigrations?: () => Promise<readonly string[]>;
   /** Asks before a rollback restores the pre-update snapshot; absent means that restore requires `--yes`. */
   confirmRollback?: (preview: RollbackPreview) => Promise<boolean>;
   /** An update's boundary seams; each defaults to the real one. */
   update?: UpdateSeams;
 }
+
+/** The launcher's helpers an update runs with. */
+type UpdateLauncher = Required<
+  Pick<CliRuntime, 'serviceHelpers' | 'toolProviderSetup' | 'upsertEnvVars' | 'hostStatus'>
+>;
 
 const COMMON_OPTIONS = ['secrets-file'] as const;
 const COMMON_SWITCHES = ['capture-fixtures'] as const;
@@ -237,7 +253,7 @@ const COMMAND_OPTIONS: Readonly<Record<Command, OptionSpec>> = {
   start: SERVICE_OPTIONS,
   stop: SERVICE_OPTIONS,
   restart: SERVICE_OPTIONS,
-  update: { values: ['id', 'track', 'source-remote'], switches: ['yes'] },
+  update: { values: ['id', 'track', 'source-remote'], switches: ['yes', 'all'] },
   rollback: { values: ['id'], switches: ['snapshot', 'yes'] },
 };
 
@@ -264,6 +280,21 @@ function parseOptions(args: readonly string[], { values, switches }: OptionSpec)
     index += 2;
   }
   return options;
+}
+
+/**
+ * `update --all` moves every assistant on its own track and repository, so it
+ * names no assistant, and moving one elsewhere stays a decision made for it
+ * alone, with `update --id`.
+ */
+function assertUpdatesEveryAssistant(options: CommandOptions): void {
+  if (options.id !== undefined) throw new GwsEaError('invalid_arguments', 'Pass either --id or --all, not both.');
+  if (options.track !== undefined || options['source-remote'] !== undefined) {
+    throw new GwsEaError(
+      'invalid_arguments',
+      '--all keeps each assistant on its own track and repository; move one elsewhere with gws-ea update --id <instance_id> --track <track>.',
+    );
+  }
 }
 
 /** `--abandon a,b`: resources removal may leave behind when it cannot observe them. */
@@ -294,9 +325,10 @@ function isBusy(error: unknown): boolean {
  * rollback, a removal under way, a create not yet finished, no host service
  * installed to start, a stopped assistant an update cannot prove its release
  * on, a release that is not newer than the one it runs, no release of its own
- * kept to roll back to, or a rollback that went back to the release it left.
- * Its message names the command that moves the assistant on; rerunning this
- * one cannot.
+ * kept to roll back to, or a rollback that went back to the release it left;
+ * or, in a turn of `update --all`, the tool's checkout moved off the release
+ * the run set out with. Its message names the command that moves the
+ * assistant on; rerunning this one cannot.
  */
 const STATE_REFUSALS: ReadonlySet<string> = new Set([
   'operation_in_progress',
@@ -308,6 +340,7 @@ const STATE_REFUSALS: ReadonlySet<string> = new Set([
   'rollback_unavailable',
   'kept_release_mismatch',
   'rollback_failed',
+  'tool_checkout_moved',
 ]);
 
 function isStateRefusal(error: unknown): boolean {
@@ -484,6 +517,10 @@ class Cli {
           });
       }
       case 'update': {
+        if (options.all === 'true') {
+          assertUpdatesEveryAssistant(options);
+          return () => this.#updateAll(options.yes === 'true');
+        }
         const request: UpdateRequest = {
           instanceId: targetInstance(options),
           ...(options.track === undefined ? {} : { track: options.track }),
@@ -848,27 +885,37 @@ class Cli {
     }
   }
 
-  /**
-   * `update`: stage this tool's release beside the running assistant, show
-   * what the update changes, and once confirmed carry it through its cutover
-   * to the recorded release (R7, R8, R10, R12). Confirmation is settled first,
-   * so a run that could never be confirmed stops before anything is read or
-   * staged. An update already under way to this release is continued, not
-   * staged again, and a recorded one's follow-ups are finished before anything
-   * else (KTD2), even when this release is the one already recorded.
-   */
-  async #updateWork({ reporter }: Session, request: UpdateRequest, yes: boolean): Promise<Outcome> {
-    const confirm = yes ? async (): Promise<boolean> => true : this.#runtime.confirmUpdate;
-    if (!confirm) {
-      throw new GwsEaError(
-        'input_required',
-        'An update needs confirmation: pass --yes, or run gws-ea update in a terminal to be asked.',
-      );
-    }
+  #updateLauncher(): UpdateLauncher {
     const { serviceHelpers, toolProviderSetup, upsertEnvVars, hostStatus } = this.#runtime;
     if (!serviceHelpers || !toolProviderSetup || !upsertEnvVars || !hostStatus) {
       throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
     }
+    return { serviceHelpers, toolProviderSetup, upsertEnvVars, hostStatus };
+  }
+
+  /** `update --id`: one assistant's update, reported as its stop summary. */
+  async #updateWork({ reporter }: Session, request: UpdateRequest, yes: boolean): Promise<Outcome> {
+    const confirm = updateConfirmation(yes, this.#runtime.confirmUpdate);
+    const update = await this.#updateAssistant(reporter, request, confirm, this.#updateLauncher());
+    return updateOutcome(request.instanceId, update);
+  }
+
+  /**
+   * One assistant's update, which `update --id` and each turn of `update
+   * --all` run: stage this tool's release beside the running assistant, show
+   * what the update changes, and once confirmed carry it through its cutover
+   * to the recorded release (R7, R8, R10, R12). An update already under way
+   * to this release is continued, not staged again, and a recorded one's
+   * follow-ups are finished before anything else (KTD2), even when this
+   * release is the one already recorded. Undefined when its preview was
+   * declined, which removed the staging.
+   */
+  async #updateAssistant(
+    reporter: Session['reporter'],
+    request: UpdateRequest,
+    confirm: (preview: UpdatePreview) => Promise<boolean>,
+    launcher: UpdateLauncher,
+  ): Promise<AssistantUpdate | undefined> {
     const seams = this.#runtime.update ?? {};
     const intent = await runStep(reporter, { id: 'resolve_release', label: 'Resolving the release…' }, () =>
       resolveUpdateIntent(this.#paths, request, seams),
@@ -881,29 +928,95 @@ class Cli {
     try {
       const dependencies: UpdateDependencies = {
         ...seams,
-        serviceHelpers,
-        providerSetup: await toolProviderSetup(),
-        upsertEnvVars,
-        hostStatus,
+        serviceHelpers: launcher.serviceHelpers,
+        providerSetup: await launcher.toolProviderSetup(),
+        upsertEnvVars: launcher.upsertEnvVars,
+        hostStatus: launcher.hostStatus,
         reporter,
       };
       const unfinished = await readOperationRecord(this.#paths, request.instanceId);
       if (unfinished?.phase === 'recorded') {
         const notes = await finishFollowUps(operation, dependencies);
-        if (sameRelease(unfinished.to, intent.target)) {
-          return finishedOutcome(request.instanceId, unfinished.to, notes);
-        }
+        if (sameRelease(unfinished.to, intent.target)) return { kind: 'completed', release: unfinished.to, notes };
       }
       if (!unfinished || unfinished.phase === 'recorded') {
         const staged = await prepareUpdate(operation, intent, dependencies);
         for (const line of updatePreviewLines(staged.preview)) this.#presenter.line(line);
-        const record = await confirmStagedUpdate(operation, staged, dependencies, confirm);
-        if (!record) return { status: 'ready', message: 'Update cancelled. Nothing was changed.' };
+        if (!(await confirmStagedUpdate(operation, staged, dependencies, confirm))) return undefined;
       }
-      return updatedOutcome(request.instanceId, await continueUpdate(operation, dependencies));
+      return { kind: 'updated', updated: await continueUpdate(operation, dependencies) };
     } finally {
       operation.release();
     }
+  }
+
+  /**
+   * `update --all`: every assistant that can move to this tool's release, one
+   * at a time in `list` order, each through `update --id`'s own attempt, with
+   * its run log, progress, preview, and stop summary; the rest are skipped
+   * and named (see `update-all.ts`). The plan is confirmed once, at a
+   * terminal or by `--yes`; how, and the launcher, are settled before any
+   * assistant is read.
+   */
+  async #updateAll(yes: boolean): Promise<Attempt> {
+    /* eslint-disable no-catch-all/no-catch-all -- The CLI boundary turns every failure before the first turn into a redacted summary and exit code. */
+    try {
+      const confirm = updateConfirmation(yes, this.#runtime.confirmUpdateAll);
+      const launcher = this.#updateLauncher();
+      const { releaseMigrations } = this.#runtime;
+      const plan = await runStep(
+        { emit: (event) => this.#presenter.event(event) },
+        { id: 'check_assistants', label: 'Checking which assistants can be updated…' },
+        async () =>
+          planUpdateAll({
+            paths: this.#paths,
+            serviceHelpers: launcher.serviceHelpers,
+            providerSetup: await launcher.toolProviderSetup(),
+            seams: this.#runtime.update ?? {},
+            ...(releaseMigrations ? { releaseMigrations } : {}),
+          }),
+      );
+      const summary = await runUpdateAll(
+        plan,
+        confirm,
+        (instanceId, toolCommit) => this.#updateTurn(instanceId, toolCommit, yes, launcher),
+        (line) => this.#presenter.line(line),
+      );
+      this.#presenter.report(summary);
+      return { status: 'done', exitCode: EXIT_CODES[summary.outcome] };
+    } catch (error) {
+      return { status: 'done', exitCode: reportStop(this.#presenter, error) };
+    }
+    /* eslint-enable no-catch-all/no-catch-all */
+  }
+
+  /**
+   * One assistant's turn in `update --all`: the attempt `update --id <id>`
+   * runs, pinned to the run's release, which reports its own end and recovery
+   * guidance. Its preview is shown, not asked about: the plan's confirmation
+   * covers it. A failure ends the turn without the interactive retry loop:
+   * the run stops there.
+   */
+  async #updateTurn(
+    instanceId: string,
+    toolCommit: string,
+    yes: boolean,
+    launcher: UpdateLauncher,
+  ): Promise<UpdateTurn> {
+    const request: UpdateRequest = { instanceId, expectedToolCommit: toolCommit };
+    const turn: { ended?: AssistantUpdate } = {};
+    const attempt = await this.#attempt({
+      command: 'update',
+      args: ['--id', instanceId, ...(yes ? ['--yes'] : [])],
+      options: { id: instanceId, ...(yes ? { yes: 'true' } : {}) },
+      instanceId,
+      work: async ({ reporter }) => {
+        turn.ended = await this.#updateAssistant(reporter, request, confirmWithoutAsking, launcher);
+        return updateOutcome(instanceId, turn.ended);
+      },
+    });
+    if (attempt.status === 'done' && attempt.exitCode === EXIT_CODES.ready && turn.ended) return turn.ended;
+    return { kind: attempt.status === 'done' && attempt.exitCode === EXIT_CODES.busy ? 'busy' : 'failed' };
   }
 
   /**
@@ -1138,6 +1251,41 @@ function finishedOutcome(instanceId: string, release: ReleaseCoordinates, notes:
     message: `Assistant ${instanceId} runs ${releaseName(release)}; its update is finished.`,
     ...(notes.length > 0 ? { details: [...notes] } : {}),
   };
+}
+
+/** The stop summary of one assistant's update; undefined when its preview was declined. */
+function updateOutcome(instanceId: string, update: AssistantUpdate | undefined): Outcome {
+  if (!update) return { status: 'ready', message: 'Update cancelled. Nothing was changed.' };
+  switch (update.kind) {
+    case 'updated':
+      return updatedOutcome(instanceId, update.updated);
+    case 'completed':
+      return finishedOutcome(instanceId, update.release, update.notes);
+  }
+}
+
+/** Confirmed without asking: `--yes`, or a turn of an `update --all` whose plan was confirmed. */
+async function confirmWithoutAsking(): Promise<boolean> {
+  return true;
+}
+
+/**
+ * How an update is confirmed: `--yes`, or a terminal to ask on. Settled
+ * first, so a run that could never be confirmed stops before anything is
+ * read or staged.
+ */
+function updateConfirmation<Preview>(
+  yes: boolean,
+  prompt: ((preview: Preview) => Promise<boolean>) | undefined,
+): (preview: Preview) => Promise<boolean> {
+  const confirm = yes ? confirmWithoutAsking : prompt;
+  if (!confirm) {
+    throw new GwsEaError(
+      'input_required',
+      'An update needs confirmation: pass --yes, or run gws-ea update in a terminal to be asked.',
+    );
+  }
+  return confirm;
 }
 
 /** Wait, as NanoClaw's own update does, until the host answers on its CLI socket. */
@@ -1396,6 +1544,10 @@ function printHelp(output: LineWriter): void {
   );
   output('         --track and --source-remote move it to another track or repository that holds the release.');
   output('         Rerun it to continue an update that was cut short, or to retry the follow-ups one left.');
+  output('  update --all [--yes]');
+  output(
+    '         Shows the plan, asks once, then updates every assistant that can take this release, one at a time; --yes skips the question.',
+  );
   output('  rollback --id <instance_id> [--snapshot] [--yes]');
   output(
     '         Returns to the kept previous release, keeping every message since the update unless it changed a schema;',
