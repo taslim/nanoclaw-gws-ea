@@ -904,8 +904,10 @@ class Cli {
       };
       const unfinished = await readOperationRecord(this.#paths, request.instanceId);
       if (unfinished?.phase === 'recorded') {
-        await finishFollowUps(operation, dependencies);
-        if (sameRelease(unfinished.to, intent.target)) return finishedOutcome(request.instanceId, unfinished.to);
+        const notes = await finishFollowUps(operation, dependencies);
+        if (sameRelease(unfinished.to, intent.target)) {
+          return finishedOutcome(request.instanceId, unfinished.to, notes);
+        }
       }
       if (!unfinished || unfinished.phase === 'recorded') {
         const staged = await prepareUpdate(operation, intent, dependencies);
@@ -952,10 +954,11 @@ class Cli {
         reporter,
       };
       const outcome = await rollBack(operation, dependencies, request);
-      if (outcome.kind === 'rolled_back' || outcome.kind === 'follow_ups_finished') {
-        await finishFollowUps(operation, dependencies);
-      }
-      return rollbackOutcome(instanceId, outcome, timezone);
+      const notes =
+        outcome.kind === 'rolled_back' || outcome.kind === 'follow_ups_finished'
+          ? await finishFollowUps(operation, dependencies)
+          : [];
+      return rollbackOutcome(instanceId, outcome, timezone, notes);
     } finally {
       operation.release();
     }
@@ -1084,24 +1087,34 @@ function releaseName(release: ReleaseCoordinates): string {
   return `${release.release_track} ${release.deployed_commit.slice(0, 12)}`;
 }
 
-/** Where an update leaves the assistant: on its release, the one it ran kept to roll back to. */
+/**
+ * Where an update leaves the assistant: on its release, the one it ran kept
+ * to roll back to; what its follow-ups said, such as main's template kept,
+ * comes first.
+ */
 function updatedOutcome(instanceId: string, updated: UpdatedAssistant): Outcome {
   return {
     status: 'ready',
     message: `Assistant ${instanceId} was updated to ${releaseName(updated.to)}.`,
-    details: [`Its previous release, ${releaseName(updated.from)}, is kept to roll back to.`],
+    details: [...updated.notes, `Its previous release, ${releaseName(updated.from)}, is kept to roll back to.`],
   };
 }
 
-/** Where a rollback left the assistant. */
-function rollbackOutcome(instanceId: string, outcome: RollbackOutcome, timezone: string): Outcome {
+/** Where a rollback left the assistant, after what its follow-ups said. */
+function rollbackOutcome(
+  instanceId: string,
+  outcome: RollbackOutcome,
+  timezone: string,
+  notes: readonly string[],
+): Outcome {
   switch (outcome.kind) {
     case 'rolled_back':
       return {
         status: 'ready',
         message: `Assistant ${instanceId} was rolled back to ${releaseName(outcome.to)}.`,
-        details:
-          outcome.mode === 'code_only'
+        details: [
+          ...notes,
+          ...(outcome.mode === 'code_only'
             ? [
                 'Only its code went back: every conversation, memory, and setting since the update was kept.',
                 `The release it left, ${releaseName(outcome.from)}, is kept in ${outcome.keptAt} until the next update or removal.`,
@@ -1109,7 +1122,8 @@ function rollbackOutcome(instanceId: string, outcome: RollbackOutcome, timezone:
             : [
                 `Its snapshot from ${formatLocalTime(outcome.snapshotAt, timezone)} was restored.`,
                 `What it recorded since, with the release it left, ${releaseName(outcome.from)}, is kept in ${outcome.keptAt} until the next update or removal.`,
-              ],
+              ]),
+        ],
       };
     case 'update_discarded':
       return {
@@ -1120,6 +1134,7 @@ function rollbackOutcome(instanceId: string, outcome: RollbackOutcome, timezone:
       return {
         status: 'ready',
         message: `Assistant ${instanceId} runs ${releaseName(outcome.release)}; its rollback is finished.`,
+        ...(notes.length > 0 ? { details: [...notes] } : {}),
       };
     case 'declined':
       return {
@@ -1129,9 +1144,13 @@ function rollbackOutcome(instanceId: string, outcome: RollbackOutcome, timezone:
   }
 }
 
-/** An update run that only finished the follow-ups of the release it would deploy. */
-function finishedOutcome(instanceId: string, release: ReleaseCoordinates): Outcome {
-  return { status: 'ready', message: `Assistant ${instanceId} runs ${releaseName(release)}; its update is finished.` };
+/** An update run that only finished the follow-ups of the release it would deploy, and what they said. */
+function finishedOutcome(instanceId: string, release: ReleaseCoordinates, notes: readonly string[]): Outcome {
+  return {
+    status: 'ready',
+    message: `Assistant ${instanceId} runs ${releaseName(release)}; its update is finished.`,
+    ...(notes.length > 0 ? { details: [...notes] } : {}),
+  };
 }
 
 /** Wait, as NanoClaw's own update does, until the host answers on its CLI socket. */

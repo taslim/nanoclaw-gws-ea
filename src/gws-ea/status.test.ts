@@ -98,7 +98,7 @@ async function machine(): Promise<Machine> {
   const tool = path.join(root, 'tool');
   await mkdir(tool);
   git(tool, 'init', '--quiet', '-b', 'dogfood');
-  await writeFile(path.join(tool, '.gitignore'), 'data/\nlogs/\n.env\n');
+  await writeFile(path.join(tool, '.gitignore'), 'data/\nlogs/\ngroups/\n.env\n');
   await writeFile(path.join(tool, 'release.txt'), 'first\n');
   return { root, paths, tool, release: commitAll(tool, 'first release') };
 }
@@ -211,6 +211,25 @@ async function bound(paths: ControlPlanePaths, instanceId: string): Promise<void
   }
 }
 
+/** A previous release an update kept: its checkout's marker, its manifest naming this assistant, and its receipt. */
+async function keepPrevious(paths: ControlPlanePaths, reservation: InstanceReservation, commit: string): Promise<void> {
+  const id = reservation.instance_id;
+  const previous = paths.releaseCheckoutRoot(id, 'previous');
+  await writePrivate(path.join(previous, 'data', 'gws-ea', 'instance.json'), {
+    schema_version: 1,
+    instance_id: id,
+    deployed_commit: commit,
+  });
+  const root = paths.releaseRoot(id, 'previous');
+  await writePrivate(path.join(root, 'release-manifest.json'), {
+    schema_version: 1,
+    instance_id: id,
+    release: { ...releaseOf(reservation), deployed_commit: commit },
+    snapshot_at: NOW.toISOString(),
+  });
+  await writePrivate(path.join(root, 'release-preflight.json'), { instance_id: id, deployed_commit: commit });
+}
+
 /** The release an update to `to` is moving this assistant towards, unfinished at `stopped`. */
 async function updateStoppedAt(paths: ControlPlanePaths, reservation: InstanceReservation, to: ReleaseCoordinates) {
   const operation = await acquireInstanceOperation(paths, reservation.instance_id, { command: 'update', target: to });
@@ -301,17 +320,22 @@ function callbackFetch(state: World): typeof globalThis.fetch {
   };
 }
 
+/** NanoClaw's restamp plan for main: its persona is left to the file comparison, its task is its own. */
 const RESTAMP_PLAN = {
   group: { id: MAIN, name: 'main' },
   plugin: 'gws-ea-main',
   applied: false,
   changes: [
     { surface: 'plugin', name: 'plugins/gws-ea-main', action: 'unchanged' },
-    { surface: 'persona', name: 'PREPEND.md', action: 'update', customized: true },
+    { surface: 'persona', name: 'instructions.prepend.md', action: 'update', customized: true },
+    { surface: 'task', name: 'Weekly review', action: 'update', customized: true },
   ],
   report: [],
   note: 'Dry run.',
 };
+
+const EDITED_PERSONA = { surface: 'persona', name: 'instructions.prepend.md', change: 'changed' } as const;
+const EDITED_TASK = { surface: 'task', name: 'Weekly review', change: 'changed' } as const;
 
 function ncl(state: World): StatusObservers['ncl'] {
   return async (runtime, args) => {
@@ -378,6 +402,7 @@ function healthyObservers(state: World): StatusObservers {
     }),
     schema: () => MANIFEST,
     delivery: () => DELIVERED,
+    mainTemplate: async () => ({ kind: 'stamped', customized: [EDITED_PERSONA] }),
   };
 }
 
@@ -453,8 +478,13 @@ describe('status', () => {
       operation: { state: 'none', abandoned_staging: false },
       removal_in_progress: false,
       release: { deployed_commit: host.release, tool_commit: host.release, behind_tool_release: false, reason: null },
-      rollback: { available: false, previous_commit: null, schema_moved: null, reason: 'No previous release is kept.' },
-      templates: { customized: [{ surface: 'persona', name: 'PREPEND.md' }], reason: null },
+      rollback: {
+        available: false,
+        previous_commit: null,
+        schema_moved: null,
+        reason: `Assistant ${reservation.instance_id} keeps no previous release, so there is nothing to roll back to.`,
+      },
+      templates: { customized: [EDITED_PERSONA, EDITED_TASK], reason: null },
       schema: { latest_migration: 'host-coordination', reason: null },
     });
   });
@@ -480,7 +510,11 @@ describe('status', () => {
     for (const name of ['checkout', 'onecli', 'principal', 'connector', 'delivery']) {
       expect(status.probes[name], name).toMatchObject({ status: 'ok' });
     }
-    expect(status.templates).toMatchObject({ customized: null, reason: expect.any(String) });
+    // Main's files are read without the host; only its skills, MCP servers, and tasks need it.
+    expect(status.templates).toEqual({
+      customized: [EDITED_PERSONA],
+      reason: expect.stringMatching(/^Only its files were compared; its skills, MCP servers, and tasks were not: /u),
+    });
   });
 
   it("reports a OneCLI unsafe-image refusal as that probe's failure without aborting the others", async () => {
@@ -533,11 +567,7 @@ describe('status', () => {
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
     const previous = host.paths.releaseCheckoutRoot(reservation.instance_id, 'previous');
     const previousCommit = 'e'.repeat(40);
-    await writePrivate(path.join(previous, 'data', 'gws-ea', 'instance.json'), {
-      schema_version: 1,
-      instance_id: reservation.instance_id,
-      deployed_commit: previousCommit,
-    });
+    await keepPrevious(host.paths, reservation, previousCommit);
     const state = world(reservation);
     const manifests = new Map<string, SnapshotManifest>([
       [reservation.checkout_realpath, MANIFEST],
@@ -558,6 +588,38 @@ describe('status', () => {
     expect(unmoved.status.rollback).toMatchObject({ available: true, schema_moved: false });
   });
 
+  it.each([
+    ['without its manifest', 'manifest', /keeps a previous release without its manifest/u],
+    ['whose manifest names another assistant', 'other', /belongs to another assistant/u],
+    ['without its receipt', 'receipt', /keeps a previous release without its receipt/u],
+  ] as const)(
+    'offers no rollback for a previous release %s, as rollback would refuse it',
+    async (_label, flaw, why) => {
+      const host = await machine();
+      const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+      const root = host.paths.releaseRoot(reservation.instance_id, 'previous');
+      await keepPrevious(host.paths, reservation, 'e'.repeat(40));
+      if (flaw === 'manifest') await rm(path.join(root, 'release-manifest.json'));
+      if (flaw === 'receipt') await rm(path.join(root, 'release-preflight.json'));
+      if (flaw === 'other') {
+        const manifest = JSON.parse(await readFile(path.join(root, 'release-manifest.json'), 'utf8')) as object;
+        await writePrivate(path.join(root, 'release-manifest.json'), {
+          ...manifest,
+          instance_id: allocateInstanceId(),
+        });
+      }
+
+      const { status } = await statusJson(host, world(reservation), reservation.instance_id);
+
+      expect(status.rollback).toEqual({
+        available: false,
+        previous_commit: null,
+        schema_moved: null,
+        reason: expect.stringMatching(why),
+      });
+    },
+  );
+
   it('renders its observations as text, with times in the install timezone', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
@@ -572,7 +634,9 @@ describe('status', () => {
     expect(text).toContain('Observed: Sep 28, 2026, 10:30 AM');
     expect(text).toContain('Sep 28, 2026, 10:00 AM');
     for (const name of PROBE_NAMES) expect(text).toMatch(new RegExp(`^ {2}ok +${name}\\b`, 'mu'));
-    expect(text).toContain('persona PREPEND.md');
+    expect(text).toContain(
+      'Templates: customized, kept by updates: instructions.prepend.md (changed), task Weekly review (changed)',
+    );
     expect(output.stderr).toEqual([]);
   });
 
@@ -717,6 +781,31 @@ function hostDatabases(checkout: string, migrations: readonly string[]): void {
   }
 }
 
+/**
+ * Main stamped from its template, as create leaves it, then customized: its
+ * persona edited and a note added beside its operating procedure.
+ */
+async function stampedMain(checkout: string): Promise<void> {
+  const central = new Database(path.join(checkout, 'data', 'v2.db'));
+  try {
+    central.exec(`CREATE TABLE agent_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, folder TEXT NOT NULL UNIQUE)`);
+    central.prepare("INSERT INTO agent_groups VALUES (?, 'main', 'main')").run(MAIN);
+  } finally {
+    central.close();
+  }
+  const main = path.join(checkout, 'groups', 'main');
+  const plugin = path.join(main, 'plugins', 'gws-ea-main');
+  const context = path.join(plugin, 'ai.nanoco.nanoclaw', 'context');
+  await mkdir(path.join(context, 'additional_context'), { recursive: true });
+  await writeFile(path.join(plugin, 'plugin.json'), '{"name":"gws-ea-main"}\n');
+  await writeFile(path.join(context, 'instructions.md'), '# Main\n\nStamped instructions.\n');
+  await writeFile(path.join(context, 'additional_context', 'procedure.md'), 'Stamped procedure.\n');
+  await mkdir(path.join(main, 'additional_context'), { recursive: true });
+  await writeFile(path.join(main, 'instructions.prepend.md'), '# Main\n\nMy own instructions.\n');
+  await writeFile(path.join(main, 'additional_context', 'procedure.md'), 'Stamped procedure.\n');
+  await writeFile(path.join(main, 'additional_context', 'notes.md'), 'Notes.\n');
+}
+
 async function sessionMailbox(checkout: string): Promise<void> {
   const directory = path.join(checkout, 'data', 'v2-sessions', MAIN, SESSION);
   await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -739,12 +828,9 @@ describe('read-only commands', () => {
     await bound(host.paths, alpha.instance_id);
     hostDatabases(alpha.checkout_realpath, ['initial-v2-schema', 'host-coordination']);
     await sessionMailbox(alpha.checkout_realpath);
+    await stampedMain(alpha.checkout_realpath);
     const previous = host.paths.releaseCheckoutRoot(alpha.instance_id, 'previous');
-    await writePrivate(path.join(previous, 'data', 'gws-ea', 'instance.json'), {
-      schema_version: 1,
-      instance_id: alpha.instance_id,
-      deployed_commit: 'e'.repeat(40),
-    });
+    await keepPrevious(host.paths, alpha, 'e'.repeat(40));
     hostDatabases(previous, ['initial-v2-schema']);
     const secretsFile = path.join(host.paths.configRoot, 'secrets.env');
     await writeFile(secretsFile, `GWS_EA_PROVIDER_CREDENTIAL=${SENTINEL}\n`, { mode: 0o600 });
@@ -790,6 +876,14 @@ describe('read-only commands', () => {
     const status = JSON.parse(outputs[1]!.stdout.join('\n')) as StatusShape;
     expect(status.probes.delivery).toMatchObject({ status: 'ok', last: { message_out_id: 'out-welcome' } });
     expect(status.rollback).toMatchObject({ available: true, schema_moved: true });
+    expect(status.templates).toEqual({
+      customized: [
+        { surface: 'context', name: 'additional_context/notes.md', change: 'added' },
+        { surface: 'persona', name: 'instructions.prepend.md', change: 'changed' },
+        EDITED_TASK,
+      ],
+      reason: null,
+    });
     expect(status.probes.checkout).toMatchObject({ status: 'ok', commit: host.release });
     expect(status.probes.onecli).toMatchObject({ status: 'degraded', reason: 'It has not been created.' });
   });

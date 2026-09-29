@@ -3,15 +3,17 @@
  * repository, assistants built as create leaves them (a registry reservation
  * and completed journal, a Git checkout detached at its release with its
  * marker, runtime, and `.env`, the release receipt, the OneCLI Compose file,
- * and a central database the host left closed), and every boundary a cutover
- * crosses faked: the service manager, Docker, `ps`, `lsof`, the release's
- * install, build, migration, and tripwire scripts, the host's status and
- * listener, OneCLI, and `ncl`. Git, SQLite, and the files are real. Each test
- * file removes the machines it made with `removeTemporaryRoots`.
+ * main stamped from the release's template, and a central database the host
+ * left closed), and every boundary a cutover crosses faked: the service
+ * manager, Docker, `ps`, `lsof`, the release's install, build, migration, and
+ * tripwire scripts, the host's status and listener, OneCLI, and `ncl`, whose
+ * restamp of main's template writes main's files as NanoClaw's does. Git,
+ * SQLite, and the files are real. Each test file removes the machines it made
+ * with `removeTemporaryRoots`.
  */
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, writeFile } from 'node:fs/promises';
+import { cp, lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, writeFile } from 'node:fs/promises';
 import { writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -98,6 +100,32 @@ export const PROVIDER_SETUP: ToolProviderSetup = {
 };
 export const SESSION = path.join('data', 'v2-sessions', 'ag-main', 'session-1');
 export const MEMORY = path.join('groups', 'main', 'CLAUDE.local.md');
+/** Main's template in a release, main's folder, the plugin stamped into it, and the files that plugin stamps. */
+export const MAIN_TEMPLATE_DIR = path.join('templates', 'gws-ea', 'main');
+export const MAIN_FOLDER = path.join('groups', 'main');
+export const MAIN_BASELINE = path.join(MAIN_FOLDER, 'plugins', 'gws-ea-main');
+export const PERSONA = path.join(MAIN_FOLDER, 'instructions.prepend.md');
+export const PROCEDURE = path.join(MAIN_FOLDER, 'additional_context', 'operating-procedure.md');
+const MAIN_CONTEXT = path.join(MAIN_TEMPLATE_DIR, 'ai.nanoco.nanoclaw', 'context');
+
+/** Main's template as a release ships it at `version`: its manifest, persona, and operating procedure. */
+export function mainTemplate(version: string): Record<string, string> {
+  return {
+    [path.join(MAIN_TEMPLATE_DIR, 'plugin.json')]: `${JSON.stringify({
+      $schema: 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json',
+      name: 'gws-ea-main',
+      version: '1.0.0',
+    })}\n`,
+    // Trailing blank lines: NanoClaw stamps the persona trimmed.
+    [path.join(MAIN_CONTEXT, 'instructions.md')]: `# Main executive assistant\n\nInstructions ${version}.\n\n`,
+    [path.join(MAIN_CONTEXT, 'additional_context', 'operating-procedure.md')]: `Operating procedure ${version}.\n`,
+  };
+}
+
+/** Main's persona as NanoClaw stamps it from `mainTemplate(version)`. */
+export function stampedPersona(version: string): string {
+  return `# Main executive assistant\n\nInstructions ${version}.\n`;
+}
 
 export function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -150,6 +178,7 @@ export async function machine(): Promise<Machine> {
   await write(work, 'release.txt', 'first\n');
   await write(work, LOCKFILE, 'lock 1\n');
   for (const source of SESSION_SCHEMA_SOURCES) await write(work, source, `// ${source} 1\n`);
+  for (const [file, contents] of Object.entries(mainTemplate('1'))) await write(work, file, contents);
   // Never run: the tests' runner stands in for the release's own image build.
   await write(work, 'container/build.sh', '#!/bin/bash\nexit 99\n');
   const first = commitAll(work, 'first release');
@@ -187,8 +216,9 @@ export function imageBase(runtime: Pick<InstanceRuntimeConfig, 'install_id'>): s
 
 /**
  * The central database a host left closed (WAL, no side files): the live
- * migrations, and three agent groups, one of them running a per-group image
- * NanoClaw built on the base, and one an image of its own.
+ * migrations, the profile naming main, no sessions yet, and three agent
+ * groups, one of them running a per-group image NanoClaw built on the base,
+ * and one an image of its own.
  */
 export function centralDatabase(runtime: InstanceRuntimeConfig): void {
   const database = new Database(path.join(runtime.checkout_realpath, 'data', 'v2.db'));
@@ -199,7 +229,14 @@ export function centralDatabase(runtime: InstanceRuntimeConfig): void {
       CREATE TABLE agent_groups (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, folder TEXT NOT NULL UNIQUE, agent_provider TEXT, created_at TEXT NOT NULL
       );
-      CREATE TABLE container_configs (agent_group_id TEXT PRIMARY KEY, image_tag TEXT);
+      CREATE TABLE container_configs (
+        agent_group_id TEXT PRIMARY KEY, image_tag TEXT, mcp_servers TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE TABLE gws_ea_profile (singleton INTEGER PRIMARY KEY, main_agent_group_id TEXT);
+      INSERT INTO gws_ea_profile VALUES (1, 'ag-main');
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY, agent_group_id TEXT, messaging_group_id TEXT, thread_id TEXT, status TEXT, created_at TEXT
+      );
     `);
     LIVE_MIGRATIONS.forEach((name, index) =>
       database.prepare('INSERT INTO schema_version VALUES (?, ?, ?)').run(index + 1, name, '2026-09-01T00:00:00.000Z'),
@@ -211,8 +248,8 @@ export function centralDatabase(runtime: InstanceRuntimeConfig): void {
     ] as const) {
       database
         .prepare('INSERT INTO agent_groups VALUES (?, ?, ?, NULL, ?)')
-        .run(id, name, id, '2026-09-01T00:00:00.000Z');
-      database.prepare('INSERT INTO container_configs VALUES (?, ?)').run(id, image);
+        .run(id, name, id === 'ag-main' ? 'main' : id, '2026-09-01T00:00:00.000Z');
+      database.prepare('INSERT INTO container_configs (agent_group_id, image_tag) VALUES (?, ?)').run(id, image);
     }
   } finally {
     database.close();
@@ -288,7 +325,109 @@ export async function assistant(host: Machine, port = 37_001): Promise<InstanceR
   await mkdir(onecli.rootDirectory, { recursive: true, mode: 0o700 });
   await writeFile(onecli.composeFile, renderOnecliCompose(onecli, COHORT, DEPLOYED_GATEWAY), { mode: 0o600 });
   centralDatabase(runtime);
+  await stampMain(runtime.checkout_realpath);
   return runtime;
+}
+
+/** Every file under `root`, by path relative to it; none when it is absent. */
+async function filesUnder(root: string, prefix = ''): Promise<string[]> {
+  let entries;
+  try {
+    entries = await readdir(path.join(root, prefix), { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+  const found: string[] = [];
+  for (const entry of entries) {
+    const relative = prefix ? path.join(prefix, entry.name) : entry.name;
+    if (entry.isDirectory()) found.push(...(await filesUnder(root, relative)));
+    else found.push(relative);
+  }
+  return found;
+}
+
+/** What a plugin stamps into main's folder beside itself, as NanoClaw writes it: its persona, trimmed, and each context file. */
+async function stampedContext(plugin: string): Promise<Map<string, string>> {
+  const context = path.join(plugin, 'ai.nanoco.nanoclaw', 'context');
+  const stamped = new Map<string, string>();
+  for (const file of await filesUnder(context)) {
+    if (!file.endsWith('.md')) continue;
+    const text = await readFile(path.join(context, file), 'utf8');
+    if (file === 'instructions.md') stamped.set('instructions.prepend.md', `${text.trimEnd()}\n`);
+    else stamped.set(file, text);
+  }
+  return stamped;
+}
+
+/** Stamp main from the checkout's own template, as create's `ncl groups create --template` does. */
+export async function stampMain(checkout: string): Promise<void> {
+  const template = path.join(checkout, MAIN_TEMPLATE_DIR);
+  await cp(template, path.join(checkout, MAIN_BASELINE), { recursive: true });
+  for (const [file, contents] of await stampedContext(template)) {
+    await write(path.join(checkout, MAIN_FOLDER), file, contents);
+  }
+}
+
+/**
+ * NanoClaw's restamp of main from the live release's template
+ * (`src/templates/restamp.ts`), as `ncl groups create --template --id`
+ * answers: its plan, or with `--yes` the restamp itself, the plugin replaced
+ * whole and then each file. Only the files are modelled: `state.restampPlan`
+ * adds what the plan says of main's skills, MCP servers, and tasks.
+ */
+async function restampMain(state: World, config: InstanceRuntimeConfig, args: readonly string[]): Promise<unknown> {
+  state.restamps.push({ instanceId: config.instance_id, args });
+  state.onRestamp?.(config.checkout_realpath, args);
+  if (state.restampFails) {
+    throw new GwsEaError('ncl_failed', `ncl ${args.join(' ')} failed: Cannot read the previously stamped plugin`);
+  }
+  const apply = args.includes('--yes');
+  const checkout = config.checkout_realpath;
+  const template = path.join(checkout, MAIN_TEMPLATE_DIR);
+  const baseline = path.join(checkout, MAIN_BASELINE);
+  const [wanted, stamped] = await Promise.all([stampedContext(template), stampedContext(baseline)]);
+  const changes: Array<Record<string, unknown>> = [];
+  const writes: Array<() => Promise<void>> = [];
+  for (const file of [...new Set([...wanted.keys(), ...stamped.keys()])].sort()) {
+    const target = path.join(checkout, MAIN_FOLDER, file);
+    const live = await readFile(target, 'utf8').catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return undefined;
+      throw error;
+    });
+    const want = wanted.get(file);
+    const surface = file === 'instructions.prepend.md' ? 'persona' : 'context';
+    if (want === live) {
+      if (want !== undefined) changes.push({ surface, name: file, action: 'unchanged' });
+      continue;
+    }
+    changes.push({
+      surface,
+      name: file,
+      action: want === undefined ? 'remove' : live === undefined ? 'create' : 'update',
+      ...(live !== undefined && live !== stamped.get(file) ? { customized: true } : {}),
+    });
+    writes.push(async () => {
+      await rm(target, { force: true });
+      if (want !== undefined) await write(path.join(checkout, MAIN_FOLDER), file, want);
+    });
+  }
+  changes.push(...(state.restampPlan ?? []));
+  if (apply) {
+    await rm(baseline, { recursive: true, force: true });
+    await cp(template, baseline, { recursive: true });
+    await hang(state, 'restamp-partway');
+    for (const change of writes) await change();
+    await hang(state, 'restamp');
+  }
+  return {
+    group: { id: args[args.indexOf('--id') + 1], name: 'main', folder: 'main' },
+    plugin: 'gws-ea-main',
+    applied: apply,
+    changes,
+    report: [],
+    note: apply ? 'Restamp applied.' : 'DRY RUN — nothing was changed. Re-run with --yes to apply.',
+  };
 }
 
 /** What the assistant's conversations and memory hold: a session message row and a memory file. */
@@ -335,8 +474,22 @@ export function applying(...names: readonly string[]): Migrate {
   };
 }
 
-/** Where an update is killed: the boundary call it never returns from. */
-export type HangPoint = 'build' | 'migrate' | 'stop' | 'stamp' | 'retag' | 'second-tag' | 'verify' | 'rebuild';
+/**
+ * Where an update is killed: the boundary call it never returns from. At
+ * `restamp` the host finished restamping main's template; at
+ * `restamp-partway` it had replaced only the plugin.
+ */
+export type HangPoint =
+  | 'build'
+  | 'migrate'
+  | 'stop'
+  | 'stamp'
+  | 'retag'
+  | 'second-tag'
+  | 'verify'
+  | 'rebuild'
+  | 'restamp'
+  | 'restamp-partway';
 
 /** What every faked boundary holds, and what reached it. */
 export interface World {
@@ -350,6 +503,13 @@ export interface World {
   readonly preflights: ReleasePreflightInput[];
   readonly onecli: string[];
   readonly rebuilds: Array<{ readonly args: readonly string[]; readonly timeoutMs: number | undefined }>;
+  /** `ncl groups create --template` calls: main's restamp, planned or applied, and whose host it asked. */
+  readonly restamps: Array<{ readonly instanceId: string; readonly args: readonly string[] }>;
+  /** What NanoClaw's restamp plan says beyond main's files: its skills, MCP servers, and tasks. */
+  restampPlan?: Array<Record<string, unknown>>;
+  restampFails?: boolean;
+  /** Runs as main's restamp is asked for, before NanoClaw answers: whatever the agent does meanwhile. */
+  onRestamp?: (checkout: string, args: readonly string[]) => void;
   readonly fetched: string[];
   /** The service's stops and starts, and Docker's tag moves, in order. */
   readonly events: string[];
@@ -397,6 +557,7 @@ export function world(runtime: InstanceRuntimeConfig, migrate: Migrate = applyin
     preflights: [],
     onecli: [],
     rebuilds: [],
+    restamps: [],
     fetched: [],
     events: [],
     healthWaits: [],
@@ -616,6 +777,7 @@ export function dependencies(state: World, release: Release, runtime: InstanceRu
       },
     },
     ncl: async (config, args, options) => {
+      if (args[0] === 'groups' && args[1] === 'create') return restampMain(state, config, args);
       state.rebuilds.push({ args, timeoutMs: options?.timeoutMs });
       await hang(state, 'rebuild');
       if (state.rebuildFails) {

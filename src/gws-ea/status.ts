@@ -28,7 +28,15 @@ import {
   type CloudflareConnectorObservation,
 } from './cloudflare-connector.js';
 import { observeManagedGchatRoute, verifyExistingGchatEndpoint } from './endpoint.js';
+import { MAIN_GROUP_NAME } from './identity.js';
 import { readProvisionJournal } from './journal.js';
+import {
+  describeCustomized,
+  inspectMainTemplate,
+  planMainRestamp,
+  type CustomizedTemplateFile,
+  type MainTemplateInspection,
+} from './main-template.js';
 import { runInstanceNclJson } from './ncl.js';
 import { observeOnecliRuntime } from './onecli.js';
 import { createOnecliRuntimeLayout, type OnecliPins, type OnecliRuntimeLayout } from './onecli-compose.js';
@@ -42,12 +50,13 @@ import {
   type OperationRecord,
   type SnapshotManifest,
 } from './operation.js';
-import { CONTROL_PLANE_ROOT, instanceMarkerFile, isRegularFile, type ControlPlanePaths } from './paths.js';
+import { CONTROL_PLANE_ROOT, isRegularFile, type ControlPlanePaths } from './paths.js';
 import type { Observation } from './phases.js';
 import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { readDeployedSetup } from './provision.js';
 import { redact, safeErrorMessage } from './redact.js';
-import { assertInstanceId, readInstanceMarkerFile, readRegistry } from './registry.js';
+import { assertInstanceId, readRegistry } from './registry.js';
+import { readKeptPreviousRelease } from './rollback.js';
 import {
   loadInstanceRuntimeConfig,
   runInstanceOnecliAdminCommand,
@@ -77,10 +86,6 @@ import {
 const OBSERVED = 0;
 const FAILED = 1;
 
-/** The template create stamps main from; its restamp plan names what the operator customized. */
-const MAIN_TEMPLATE = 'gws-ea/main';
-const MAIN_PLUGIN = 'gws-ea-main';
-const MAIN_GROUP_NAME = 'main';
 /** The Google Chat adapter instance create registers. */
 const ADAPTER_INSTANCE = 'gchat';
 /** Command failures that mean a probe could not run its observation, not that it saw something wrong. */
@@ -229,14 +234,17 @@ export interface RollbackView {
   readonly reason: string | null;
 }
 
-export interface CustomizedTemplateFile {
-  readonly surface: string;
-  readonly name: string;
-}
+export type { CustomizedTemplateFile } from './main-template.js';
 
 export interface TemplatesView {
-  /** Main's template files the operator changed, which updates keep; null when unknown. */
+  /**
+   * What of main's template is customized, which updates keep (R11): its
+   * files, compared with what the plugin it was stamped from stamps, and the
+   * skills, MCP servers, and tasks NanoClaw's restamp plan flags. Null when
+   * unknown.
+   */
   readonly customized: readonly CustomizedTemplateFile[] | null;
+  /** Why the list is unknown, or what it leaves out; null when it is whole. */
   readonly reason: string | null;
 }
 
@@ -292,6 +300,8 @@ export interface StatusObservers {
   /** The schema a checkout's databases record. */
   readonly schema: (checkoutRoot: string) => SnapshotManifest;
   readonly delivery: (checkoutRoot: string) => LatestDelivery | undefined;
+  /** Main's template files in a checkout, compared with the plugin they were stamped from. */
+  readonly mainTemplate: (checkoutRoot: string) => Promise<MainTemplateInspection>;
 }
 
 /** What `list` and `status` observe with. The driver supplies NanoClaw's helpers; the rest default. */
@@ -380,6 +390,7 @@ function resolveObservers(overrides: Partial<StatusObservers> = {}): StatusObser
     principalBinding: overrides.principalBinding ?? verifyPrincipalBinding,
     schema: overrides.schema ?? readSchemaManifest,
     delivery: overrides.delivery ?? readLatestDelivery,
+    mainTemplate: overrides.mainTemplate ?? inspectMainTemplate,
   };
 }
 
@@ -817,27 +828,19 @@ function schemaView(read: SchemaRead): SchemaView {
   };
 }
 
-/** The kept previous release, and whether either schema moved since it (R13, R15). */
+/**
+ * The kept previous release, and whether either schema moved since it (R13,
+ * R15). It is available exactly when `rollback` would take it: kept whole,
+ * with its manifest naming this assistant and its marker's release.
+ */
 async function observeRollback({ context, reservation, observers }: Subject, live: SchemaRead): Promise<RollbackView> {
   const previous = context.paths.releaseCheckoutRoot(reservation.instance_id, 'previous');
-  const unavailable = (reason: string | null): RollbackView => ({
-    available: false,
-    previous_commit: null,
-    schema_moved: null,
-    reason,
-  });
   let commit: string;
   try {
-    const marker = await readInstanceMarkerFile(instanceMarkerFile(previous));
-    if (marker.instance_id !== reservation.instance_id) {
-      return unavailable('The kept previous release belongs to another assistant.');
-    }
-    commit = marker.deployed_commit;
+    commit = (await readKeptPreviousRelease(context.paths, reservation.instance_id)).release.deployed_commit;
     // eslint-disable-next-line no-catch-all/no-catch-all -- A previous release that cannot be read is reported, never thrown.
   } catch (error) {
-    if (error instanceof GwsEaError && error.code === 'marker_missing')
-      return unavailable('No previous release is kept.');
-    return unavailable(failure(error).reason);
+    return { available: false, previous_commit: null, schema_moved: null, reason: failure(error).reason };
   }
   const unknownMove = (error: unknown): RollbackView => ({
     available: true,
@@ -858,30 +861,34 @@ async function observeRollback({ context, reservation, observers }: Subject, liv
 }
 
 /**
- * Main's template files the operator customized, which updates keep (R11).
- * NanoClaw's restamp planned against main's own release template, with the
- * group named and without `--yes`, only plans: nothing is stamped or changed.
+ * What of main's template the operator customized, which updates keep (R11):
+ * its files, read from main's folder whether or not the host runs, and the
+ * skills, MCP servers, and tasks NanoClaw's restamp plan flags, which only
+ * the running host can plan. Planned with the group named and without
+ * `--yes`, the restamp only plans: nothing is stamped or changed.
  */
 async function observeTemplates(subject: Subject, main: () => Promise<string>): Promise<TemplatesView> {
+  let files: readonly CustomizedTemplateFile[];
   try {
-    const runtime = requireRuntime(subject.runtime);
-    const plan = unwrapData(
-      await subject.observers.ncl(runtime, ['groups', 'create', '--template', MAIN_TEMPLATE, '--id', await main()]),
-    );
-    if (!isRecord(plan) || plan.plugin !== MAIN_PLUGIN || plan.applied !== false || !Array.isArray(plan.changes)) {
-      throw new GwsEaError('invalid_child_output', "ncl returned an invalid plan for main's template");
-    }
-    const customized = plan.changes.filter(isRecord).filter((change) => change.customized === true);
-    return {
-      customized: customized.map((change) => ({
-        surface: optionalString(change.surface) ?? 'unknown',
-        name: optionalString(change.name) ?? 'unknown',
-      })),
-      reason: null,
-    };
+    const inspected = await subject.observers.mainTemplate(subject.reservation.checkout_realpath);
+    if (inspected.kind === 'not_stamped') return { customized: null, reason: sentence(inspected.reason) };
+    files = inspected.customized;
     // eslint-disable-next-line no-catch-all/no-catch-all -- Customization that cannot be observed is reported, never thrown.
   } catch (error) {
     return { customized: null, reason: failure(error).reason };
+  }
+  try {
+    const runtime = requireRuntime(subject.runtime);
+    return {
+      customized: [...files, ...(await planMainRestamp(runtime, await main(), subject.observers.ncl))],
+      reason: null,
+    };
+    // eslint-disable-next-line no-catch-all/no-catch-all -- What the host cannot plan is reported beside the files it read.
+  } catch (error) {
+    return {
+      customized: files,
+      reason: `Only its files were compared; its skills, MCP servers, and tasks were not: ${failure(error).reason ?? 'unknown'}`,
+    };
   }
 }
 
@@ -1129,12 +1136,13 @@ function renderStatus(status: AssistantStatus, timezone: string): string[] {
   const { registry, templates, schema } = status;
   const ingress = registry.ingress_mode === 'managed-cloudflare' ? 'managed Cloudflare' : 'operator endpoint';
   const operation = operationDetail(status.instance_id, status.operation, status.removal_in_progress);
-  const customized =
+  const listed =
     templates.customized === null
       ? `unknown: ${templates.reason ?? ''}`
       : templates.customized.length === 0
         ? 'none customized'
-        : `customized, kept by updates: ${templates.customized.map((file) => `${file.surface} ${file.name}`).join(', ')}`;
+        : `customized, kept by updates: ${describeCustomized(templates.customized)}`;
+  const customized = templates.customized !== null && templates.reason ? `${listed}. ${templates.reason}` : listed;
   const schemaLine =
     schema.central_fingerprint === null || schema.session_fingerprint === null
       ? `unknown: ${schema.reason ?? ''}`
@@ -1178,7 +1186,8 @@ export const STATUS_USAGE: readonly string[] = [
   '       One assistant, observed live and read-only; it never repairs. JSON: instance_id, observed_at,',
   '       registry (the record, not health), operation, removal_in_progress, release (deployed_commit,',
   '       tool_commit, behind_tool_release), rollback (available, previous_commit, schema_moved),',
-  '       templates (customized), schema (central_fingerprint, session_fingerprint, latest_migration),',
+  '       templates (customized: surface, name, change changed|deleted|added; reason), schema',
+  '       (central_fingerprint, session_fingerprint, latest_migration),',
   '       probes: checkout, service, host, onecli, main_identity, principal, route, connector (managed',
   '       Cloudflare only, with drift), delivery; each probe has status ok|degraded|unknown and a reason.',
   '       list and status exit 0 once they observed, whatever the health; status exits 1 for an unknown ID.',

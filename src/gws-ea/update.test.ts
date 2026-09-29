@@ -9,6 +9,8 @@
  * release's install, build, migration, and tripwire scripts, the host's
  * status and listener, OneCLI, and `ncl` are faked at their boundaries.
  */
+import { createHash } from 'node:crypto';
+import { writeFileSync } from 'node:fs';
 import { lstat, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -36,10 +38,15 @@ import {
   liveState,
   LOCKFILE,
   machine,
+  MAIN_BASELINE,
+  MAIN_FOLDER,
+  mainTemplate,
   MEMORY,
   messages,
   nextRelease,
   ONECLI_CLI,
+  PERSONA,
+  PROCEDURE,
   PROVIDER_SETUP,
   receiptCommit,
   release,
@@ -49,6 +56,7 @@ import {
   runtimeCommit,
   SESSION,
   snapshot,
+  stampedPersona,
   status,
   temporaryRoot,
   world,
@@ -57,6 +65,7 @@ import {
   type Release,
   type World,
 } from './cutover-fixture.js';
+import { readKeptReleaseManifest } from './cutover.js';
 import { acquireInstanceOperation } from './journal.js';
 import {
   advanceOperation,
@@ -139,6 +148,7 @@ describe('staging an update while the assistant serves', GIT_HEAVY, () => {
       groupImages: [{ id: 'ag-research', name: 'research' }],
       agentRunnerLockChanged: false,
       sessionSchemaChanged: false,
+      mainTemplate: { kind: 'unchanged' },
     });
     // It served throughout: the service was only looked at.
     expect(state.running).toBe(true);
@@ -193,6 +203,7 @@ describe('staging an update while the assistant serves', GIT_HEAVY, () => {
     expect(preview).toContain(ADDED_MIGRATION);
     expect(preview).toContain(`${DEPLOYED_GATEWAY} → ${RELEASE_GATEWAY}`);
     expect(preview).toContain('research (ag-research)');
+    expect(preview).toContain("Main's template: unchanged in this release");
     expect(preview).toMatch(/failure after the swap may restore the pre-update snapshot/u);
   });
 
@@ -882,6 +893,9 @@ describe('gws-ea update', GIT_HEAVY, () => {
     expect(state.rebuilds[0]!.timeoutMs).toBeGreaterThanOrEqual(15 * 60_000);
     expect(state.ids.has(research)).toBe(false);
     expect(state.healthWaits).toEqual([60_000]);
+    // The release stamps what main was stamped with, so main is not restamped.
+    expect(state.restamps).toEqual([]);
+    expect(await readFile(path.join(live, PERSONA), 'utf8')).toBe(stampedPersona('1'));
   });
 
   it("allows a killed host's claim lease when the stop was not graceful", async () => {
@@ -1069,5 +1083,273 @@ describe('gws-ea update', GIT_HEAVY, () => {
     expect(summary).toContain(`gws-ea rollback --id ${runtime.instance_id}`);
     expect(state.preflights).toEqual([]);
     expect(await exists(host.paths.releaseRoot(runtime.instance_id, 'next'))).toBe(false);
+  });
+});
+
+describe("main's template across an update (R11, KTD12)", GIT_HEAVY, () => {
+  const MAIN_ID = 'ag-main';
+  const PLAN = ['groups', 'create', '--template', 'gws-ea/main', '--id', MAIN_ID];
+  const TEMPLATE_INSTRUCTIONS = path.join('ai.nanoco.nanoclaw', 'context', 'instructions.md');
+
+  function digest(contents: string): string {
+    return `sha256:${createHash('sha256').update(contents).digest('hex')}`;
+  }
+
+  /** The restamp of main the update recorded with the release it kept. */
+  async function keptRestamp(host: Machine, runtime: InstanceRuntimeConfig) {
+    const id = runtime.instance_id;
+    return (await readKeptReleaseManifest(host.paths.releaseRoot(id, 'previous'), id)).template_restamp;
+  }
+
+  async function mainFiles(checkout: string): Promise<{ persona: string; procedure: string; baseline: string }> {
+    return {
+      persona: await readFile(path.join(checkout, PERSONA), 'utf8'),
+      procedure: await readFile(path.join(checkout, PROCEDURE), 'utf8'),
+      baseline: await readFile(path.join(checkout, MAIN_BASELINE, TEMPLATE_INSTRUCTIONS), 'utf8'),
+    };
+  }
+
+  const FIRST = {
+    persona: stampedPersona('1'),
+    procedure: 'Operating procedure 1.\n',
+    baseline: mainTemplate('1')[path.join('templates', 'gws-ea', 'main', TEMPLATE_INSTRUCTIONS)],
+  };
+  const SECOND = {
+    persona: stampedPersona('2'),
+    procedure: 'Operating procedure 2.\n',
+    baseline: mainTemplate('2')[path.join('templates', 'gws-ea', 'main', TEMPLATE_INSTRUCTIONS)],
+  };
+
+  it("refreshes an uncustomized main from the release's template once the update is recorded", async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host, mainTemplate('2'));
+    const state = world(runtime);
+    const { run, out } = cli(host, state, next, runtime);
+    const id = runtime.instance_id;
+
+    expect(await run(['update', '--id', id, '--yes'])).toBe(0);
+
+    expect(await mainFiles(runtime.checkout_realpath)).toEqual(SECOND);
+    // NanoClaw's own restamp on the new host did it: planned, then applied, with main named.
+    expect(state.restamps).toEqual([
+      { instanceId: id, args: PLAN },
+      { instanceId: id, args: [...PLAN, '--yes'] },
+    ]);
+    const printed = out.join('\n');
+    expect(printed).toContain("Main's template: refreshed from this release once the update is recorded");
+    expect(printed).toContain("Main's template was refreshed from this release.");
+    // What it changed is kept with the release it replaced, for a rollback to reverse; that release keeps main as it was.
+    const restamp = await keptRestamp(host, runtime);
+    expect(restamp).toMatchObject({
+      agent_group_id: MAIN_ID,
+      settled: { mcp_servers: expect.stringMatching(/^sha256:/u), tasks: expect.stringMatching(/^sha256:/u) },
+    });
+    expect(restamp?.files_before['instructions.prepend.md']).toBe(digest(stampedPersona('1')));
+    expect(restamp?.files_after['instructions.prepend.md']).toBe(digest(stampedPersona('2')));
+    expect(await mainFiles(host.paths.releaseCheckoutRoot(id, 'previous'))).toEqual(FIRST);
+    expect(await readOperationRecord(host.paths, id)).toBeUndefined();
+  });
+
+  it('keeps an edited persona, names it in the preview and in status, and restamps nothing', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    await writeFile(path.join(runtime.checkout_realpath, PERSONA), 'My own instructions.\n');
+    const next = await nextRelease(host, mainTemplate('2'));
+    const state = world(runtime);
+    const { run, out } = cli(host, state, next, runtime);
+
+    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
+
+    expect(await mainFiles(runtime.checkout_realpath)).toEqual({ ...FIRST, persona: 'My own instructions.\n' });
+    expect(state.restamps).toEqual([]);
+    expect(out.join('\n')).toContain(
+      "Main's template: kept as it is, because these are customized: instructions.prepend.md (changed)",
+    );
+    expect(await keptRestamp(host, runtime)).toBeUndefined();
+    const observed = await status(host, state, next, runtime);
+    expect(observed.templates).toEqual({
+      customized: [{ surface: 'persona', name: 'instructions.prepend.md', change: 'changed' }],
+      reason: expect.stringContaining('Only its files were compared'),
+    });
+  });
+
+  it.each([
+    [
+      'a file added where the stamp has none',
+      (checkout: string) => write(checkout, path.join(MAIN_FOLDER, 'additional_context', 'notes.md'), 'Notes.\n'),
+      { surface: 'context', name: 'additional_context/notes.md', change: 'added' },
+    ],
+    [
+      'a stamped file deleted',
+      (checkout: string) => rm(path.join(checkout, PROCEDURE)),
+      { surface: 'context', name: 'additional_context/operating-procedure.md', change: 'deleted' },
+    ],
+  ] as const)('counts %s as customized, and restamps nothing', async (_label, customize, customized) => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    await customize(runtime.checkout_realpath);
+    const next = await nextRelease(host, mainTemplate('2'));
+    const state = world(runtime);
+
+    const staged = await stage(host, runtime, dependencies(state, next, runtime));
+    expect(staged.preview.mainTemplate).toEqual({ kind: 'customized', customized: [customized] });
+    // The update removes the staging this left, and stages again.
+    expect(await cli(host, state, next, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
+
+    expect(state.restamps).toEqual([]);
+    expect(await readFile(path.join(runtime.checkout_realpath, PERSONA), 'utf8')).toBe(FIRST.persona);
+    expect((await status(host, state, next, runtime)).templates.customized).toEqual([customized]);
+  });
+
+  it('decides again before restamping, keeping a file edited after the preview promised a refresh', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host, mainTemplate('2'));
+    const state = world(runtime);
+    // The agent edits its persona once the new release serves, before the refresh runs.
+    state.onStart = (checkout) => writeFileSync(path.join(checkout, PERSONA), 'Edited while updating.\n');
+    const { run, out } = cli(host, state, next, runtime);
+
+    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
+
+    const printed = out.join('\n');
+    expect(printed).toContain("Main's template: refreshed from this release once the update is recorded");
+    expect(printed).toContain(
+      "Main's template was kept as it is, because these are customized: instructions.prepend.md (changed).",
+    );
+    expect(state.restamps).toEqual([]);
+    expect(await mainFiles(runtime.checkout_realpath)).toEqual({ ...FIRST, persona: 'Edited while updating.\n' });
+    expect(await keptRestamp(host, runtime)).toBeUndefined();
+  });
+
+  it('decides once more after NanoClaw plans the restamp, keeping a file edited while it planned', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host, mainTemplate('2'));
+    const state = world(runtime);
+    state.onRestamp = (checkout, args) => {
+      if (!args.includes('--yes')) writeFileSync(path.join(checkout, PROCEDURE), 'Edited while planning.\n');
+    };
+    const { run, out } = cli(host, state, next, runtime);
+
+    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
+
+    expect(state.restamps).toEqual([{ instanceId: runtime.instance_id, args: PLAN }]);
+    expect(out.join('\n')).toContain(
+      "Main's template was kept as it is, because these are customized: additional_context/operating-procedure.md (changed).",
+    );
+    expect(await mainFiles(runtime.checkout_realpath)).toEqual({ ...FIRST, procedure: 'Edited while planning.\n' });
+    expect(await keptRestamp(host, runtime)).toBeUndefined();
+  });
+
+  it("keeps main's template when NanoClaw's plan flags a customized task, only planning the restamp", async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host, mainTemplate('2'));
+    const state = world(runtime);
+    state.restampPlan = [{ surface: 'task', name: 'Weekly review', action: 'update', customized: true }];
+    const { run, out } = cli(host, state, next, runtime);
+
+    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
+
+    expect(state.restamps).toEqual([{ instanceId: runtime.instance_id, args: PLAN }]);
+    expect(out.join('\n')).toContain(
+      "Main's template was kept as it is, because these are customized: task Weekly review (changed).",
+    );
+    expect(await mainFiles(runtime.checkout_realpath)).toEqual(FIRST);
+  });
+
+  it('keeps a failed restamp as a follow-up that leaves start and ncl usable, and retries it next time', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host, mainTemplate('2'));
+    const state = world(runtime);
+    state.restampFails = true;
+    const { run, err, out } = cli(host, state, next, runtime);
+    const id = runtime.instance_id;
+
+    expect(await run(['update', '--id', id, '--yes'])).toBe(1);
+
+    expect(err.join('\n')).toContain("refreshing main's template");
+    expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, next.commit));
+    expect(await readOperationRecord(host.paths, id)).toMatchObject({
+      phase: 'recorded',
+      follow_ups: expect.arrayContaining([{ kind: 'refresh_template' }]),
+    });
+    expect((await status(host, state, next, runtime)).operation).toMatchObject({
+      state: 'recorded',
+      follow_ups: expect.arrayContaining([{ kind: 'refresh_template' }]),
+    });
+    expect(await mainFiles(runtime.checkout_realpath)).toEqual(FIRST);
+    // The gate is released: the assistant starts and its ncl is admitted.
+    expect(await run(['start', '--id', id])).toBe(0);
+    const ncl = await acquireInstanceOperation(host.paths, id, { command: 'ncl' });
+    expect(ncl).not.toBeNull();
+    ncl?.release();
+
+    state.restampFails = false;
+    expect(await run(['update', '--id', id, '--yes'])).toBe(0);
+
+    expect(await mainFiles(runtime.checkout_realpath)).toEqual(SECOND);
+    expect(out.slice(-2)).toEqual([
+      `Assistant ${id} runs dogfood ${next.commit.slice(0, 12)}; its update is finished.`,
+      "Main's template was refreshed from this release.",
+    ]);
+    expect(await readOperationRecord(host.paths, id)).toBeUndefined();
+  });
+
+  it.each(['restamp', 'restamp-partway'] as const)(
+    'finishes a refresh killed at %s when the update is run again',
+    async (point) => {
+      const host = await machine();
+      const runtime = await assistant(host);
+      const next = await nextRelease(host, mainTemplate('2'));
+      const state = world(runtime);
+      state.hangAt = point;
+      const id = runtime.instance_id;
+
+      await killDuringCutover(host, runtime, state, next);
+
+      // The restamp was recorded before it ran, and never settled.
+      const pending = await keptRestamp(host, runtime);
+      expect(pending).toMatchObject({ agent_group_id: MAIN_ID });
+      expect(pending?.settled).toBeUndefined();
+      expect(await readOperationRecord(host.paths, id)).toMatchObject({
+        phase: 'recorded',
+        follow_ups: expect.arrayContaining([{ kind: 'refresh_template' }]),
+      });
+      const cut = await mainFiles(runtime.checkout_realpath);
+      expect(cut.baseline).toBe(SECOND.baseline);
+      expect(cut.persona).toBe(point === 'restamp' ? SECOND.persona : FIRST.persona);
+      delete state.hangAt;
+      state.restamps.length = 0;
+      const { run, out } = cli(host, state, next, runtime);
+
+      expect(await run(['update', '--id', id, '--yes'])).toBe(0);
+
+      // Finished, not decided again: its own half-done restamp is not taken for a customization.
+      expect(await mainFiles(runtime.checkout_realpath)).toEqual(SECOND);
+      expect(state.restamps).toEqual([{ instanceId: id, args: [...PLAN, '--yes'] }]);
+      expect(out.join('\n')).toContain("Main's template was refreshed from this release.");
+      expect((await keptRestamp(host, runtime))?.settled).toBeDefined();
+      expect(await readOperationRecord(host.paths, id)).toBeUndefined();
+    },
+  );
+
+  it("refreshes one assistant's main without touching another's", async () => {
+    const host = await machine();
+    const a = await assistant(host, 37_001);
+    const b = await assistant(host, 37_101);
+    const next = await nextRelease(host, mainTemplate('2'));
+    const state = world(a);
+    const bFiles = await snapshot(host.paths.instanceRoot(b.instance_id));
+
+    expect(await cli(host, state, next, a).run(['update', '--id', a.instance_id, '--yes'])).toBe(0);
+
+    expect(await mainFiles(a.checkout_realpath)).toEqual(SECOND);
+    expect(state.restamps.map((call) => call.instanceId)).toEqual([a.instance_id, a.instance_id]);
+    expect(await snapshot(host.paths.instanceRoot(b.instance_id))).toEqual(bFiles);
+    expect(await mainFiles(b.checkout_realpath)).toEqual(FIRST);
   });
 });

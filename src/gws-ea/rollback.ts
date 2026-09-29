@@ -85,7 +85,7 @@ import {
   type RollbackMode,
   type SnapshotManifest,
 } from './operation.js';
-import { instanceMarkerFile, isRegularFile } from './paths.js';
+import { instanceMarkerFile, isRegularFile, type ControlPlanePaths } from './paths.js';
 import { readDeployedSetup } from './provision.js';
 import { safeErrorMessage } from './redact.js';
 import { readInstanceMarkerFile } from './registry.js';
@@ -270,11 +270,14 @@ const STOP_LABEL = 'Stopping the assistant for the rollback…';
 
 /**
  * The kept previous release (R15): its manifest must name this assistant,
- * and its checkout's marker the same assistant and release. Refuses, naming
- * why, when none is kept.
+ * and its checkout's marker the same assistant and release, with its receipt
+ * beside it. Refuses, naming why, when none is kept. Only reads, so `status`
+ * offers a rollback exactly when this would allow one.
  */
-async function keptPrevious(host: CutoverHost): Promise<KeptReleaseManifest> {
-  const { paths, instanceId } = host.operation;
+export async function readKeptPreviousRelease(
+  paths: ControlPlanePaths,
+  instanceId: string,
+): Promise<KeptReleaseManifest> {
   const root = paths.releaseRoot(instanceId, 'previous');
   const checkout = paths.releaseCheckoutRoot(instanceId, 'previous');
   const unavailable = (why: string): GwsEaError =>
@@ -792,10 +795,13 @@ async function abandonPreparation(rollback: Rollback): Promise<void> {
 /**
  * The follow-ups a rollback runs once recorded (KTD2): the images its retag
  * displaced, deleted by ID; and for a rollback of the recorded release, the
- * per-group images rebuilt on the restored base with those they displace, and
- * a previous release an update set aside and never deleted. A rollback
- * reverting an unrecorded update rebuilt nothing, since that update's rebuilds
- * never ran, and puts its set-aside release back.
+ * per-group images rebuilt on the restored base with those they displace, a
+ * previous release an update set aside and never deleted, and in code-only
+ * mode the reversal of the update's restamp of main's template, when the kept
+ * release records one (KTD12). A snapshot restore brings main's files back
+ * with the rest of the snapshot. A rollback reverting an unrecorded update
+ * rebuilt nothing and restamped nothing, since that update's follow-ups never
+ * ran, and puts its set-aside release back.
  */
 async function rollbackFollowUps(
   rollback: Rollback,
@@ -821,8 +827,10 @@ async function rollbackFollowUps(
   const superseded: OperationFollowUp[] = (await exists(paths.releaseRoot(instanceId, 'superseded')))
     ? [{ kind: 'delete_release', release: 'superseded_previous' }]
     : [];
-  // Template reversal (KTD12) is planned here too, for a code-only rollback of an update that restamped main.
-  return [...rebuilds, ...displaced, ...superseded];
+  const restamped =
+    mode === 'code_only' && (await readKeptReleaseManifest(rollback.places.previous, instanceId)).template_restamp;
+  const template: OperationFollowUp[] = restamped ? [{ kind: 'reverse_template_restamp' }] : [];
+  return [...rebuilds, ...template, ...displaced, ...superseded];
 }
 
 /** A rollback given up before its swap: nothing changed, and the release it would have left runs again. */
@@ -873,9 +881,11 @@ async function prepareRollback(rollback: Rollback, record: OperationRecord): Pro
     await abandonPreparation(rollback);
     throw notPrepared(rollback, error);
   }
+  // The template reversal depends on the mode, decided again after a code-only attempt went back.
+  const planned = record.follow_ups.filter((followUp) => followUp.kind !== 'reverse_template_restamp');
   return advanceOperation(rollback.operation, 'swapping', {
     mode: stopped.mode,
-    follow_ups: planFollowUps(record.follow_ups, await rollbackFollowUps(rollback, record, stopped.mode)),
+    follow_ups: planFollowUps(planned, await rollbackFollowUps(rollback, record, stopped.mode)),
   });
 }
 
@@ -1211,7 +1221,7 @@ async function rollBackRecorded(
 ): Promise<RollbackOutcome> {
   const host = await openCutoverHost(operation, dependencies);
   const { instanceId } = operation;
-  const kept = await keptPrevious(host);
+  const kept = await readKeptPreviousRelease(host.operation.paths, instanceId);
   const from = releaseOf(host.reservation);
   const to = kept.release;
   const live = await readInstanceMarkerFile(instanceMarkerFile(host.reservation.checkout_realpath));

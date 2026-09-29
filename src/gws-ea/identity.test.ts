@@ -38,6 +38,9 @@ function runtimeConfig(): InstanceRuntimeConfig {
 
 interface FakeState {
   groupCreated: number;
+  /** Main's persona as NanoClaw holds it: stamped from the template, or edited since. */
+  persona: string;
+  groupCreateArgs: Array<readonly string[]>;
   provider: string | null;
   profileWrites: number;
   agents: Array<{ id: string; identifier: string; name: string; secretMode: 'all' | 'selective' }>;
@@ -50,6 +53,8 @@ function harness(options: { failAfterSecretModeOnce?: boolean; neverApplySecretM
 } {
   const state: FakeState = {
     groupCreated: 0,
+    persona: 'stamped from the template',
+    groupCreateArgs: [],
     provider: null,
     profileWrites: 0,
     agents: [],
@@ -58,12 +63,20 @@ function harness(options: { failAfterSecretModeOnce?: boolean; neverApplySecretM
   let failed = false;
   const runNcl = vi.fn(async (_config: InstanceRuntimeConfig, args: readonly string[]) => {
     if (args[0] === 'groups' && args[1] === 'create') {
+      state.groupCreateArgs.push(args);
       const group = { id: GROUP_ID, name: 'main', folder: 'main', agent_provider: null, created_at: 'now' };
       if (state.groupCreated === 0) {
         state.groupCreated += 1;
         return group;
       }
-      return { group, plugin: 'gws-ea-main', applied: true, changes: [], report: [], note: 'applied' };
+      // As NanoClaw does: a group already carrying the plugin is restamped with --yes, and only planned without.
+      const apply = args.includes('--yes');
+      const customized = state.persona !== 'stamped from the template';
+      if (apply) state.persona = 'stamped from the template';
+      const changes = customized
+        ? [{ surface: 'persona', name: 'instructions.prepend.md', action: 'update', customized }]
+        : [];
+      return { group, plugin: 'gws-ea-main', applied: apply, changes, report: [], note: apply ? 'applied' : 'DRY RUN' };
     }
     if (args[0] === 'groups' && args[1] === 'config') {
       state.provider = args[args.indexOf('--provider') + 1] ?? null;
@@ -137,6 +150,41 @@ describe('main identity reconciliation', () => {
     expect(state.provider).toBe('claude');
     expect(state.secretModeWrites).toBe(0);
     expect(state.profileWrites).toBe(2);
+  });
+
+  it('never restamps an existing main, so repairing a changed profile keeps its edited persona', async () => {
+    const { state, dependencies } = harness();
+    await reconcileMainIdentity(runtimeConfig(), input, dependencies);
+    state.persona = 'edited by the principal';
+
+    // A resume that finds the profile different repairs the identity.
+    const repaired = await reconcileMainIdentity(
+      runtimeConfig(),
+      { ...input, principalTimezone: 'Europe/London' },
+      dependencies,
+    );
+
+    expect(repaired.agentGroupId).toBe(GROUP_ID);
+    expect(state.persona).toBe('edited by the principal');
+    expect(state.groupCreated).toBe(1);
+    expect(state.groupCreateArgs).toEqual([
+      ['groups', 'create', '--template', 'gws-ea/main', '--name', 'main'],
+      ['groups', 'create', '--template', 'gws-ea/main', '--name', 'main'],
+    ]);
+    expect(state.profileWrites).toBe(2);
+  });
+
+  it('refuses an answer that says the existing main was restamped', async () => {
+    const { state, dependencies } = harness();
+    await reconcileMainIdentity(runtimeConfig(), input, dependencies);
+    const runNcl = dependencies.runNcl!;
+    const restamping: MainIdentityDependencies = {
+      ...dependencies,
+      runNcl: (config, args) => runNcl(config, args[1] === 'create' ? [...args, '--yes'] : args),
+    };
+
+    await expect(reconcileMainIdentity(runtimeConfig(), input, restamping)).rejects.toThrow(/existing main group/u);
+    expect(state.profileWrites).toBe(1);
   });
 
   it('resumes after an ambiguous all-mode side effect without duplicating main or its OneCLI agent', async () => {

@@ -44,6 +44,13 @@ import { observeLiveCheckout } from './checkout.js';
 import { observeManagedGchatRoute, verifyExistingGchatRoute } from './endpoint.js';
 import { runStep, type StepReporter } from './events.js';
 import { loadCreatedRuntime, type InstanceOperation } from './journal.js';
+import {
+  parseTemplateRestamp,
+  refreshMainTemplate,
+  reverseMainTemplate,
+  type TemplateFollowUp,
+  type TemplateRestamp,
+} from './main-template.js';
 import { runInstanceNclJson, type InstanceNclOptions } from './ncl.js';
 import { applyReleaseGateway, observeOnecliRuntime, restoreReleaseGateway, verifyOnecliRuntime } from './onecli.js';
 import type { OnecliPins, OnecliRuntimeLayout } from './onecli-compose.js';
@@ -557,6 +564,12 @@ export interface KeptReleaseManifest {
   readonly instance_id: string;
   readonly release: ReleaseCoordinates;
   readonly snapshot_at: string;
+  /**
+   * The restamp of main's template the update that kept this release ran once
+   * it was recorded (KTD12): what it changed, recorded before it ran and
+   * again once it settled, so a code-only rollback back here can reverse it.
+   */
+  readonly template_restamp?: TemplateRestamp;
 }
 
 /** A kept release's manifest, refused when it belongs to another assistant: a release is restorable only into its own. */
@@ -586,7 +599,20 @@ export async function readKeptReleaseManifest(releaseRoot: string, instanceId: s
     instance_id: instanceId,
     release,
     snapshot_at: requireCanonicalTimestamp(value.snapshot_at, 'invalid_kept_release', `${file} names no snapshot time`),
+    ...(value.template_restamp === undefined
+      ? {}
+      : { template_restamp: parseTemplateRestamp(value.template_restamp, invalid) }),
   };
+}
+
+/** Record main's template restamp with a kept release, in place of any recorded before (one atomic write). */
+export async function recordKeptTemplateRestamp(
+  releaseRoot: string,
+  instanceId: string,
+  restamp: TemplateRestamp,
+): Promise<void> {
+  const manifest = await readKeptReleaseManifest(releaseRoot, instanceId);
+  await writePrivate(keptReleaseFiles(releaseRoot).manifest, { ...manifest, template_restamp: restamp });
 }
 
 /** The live release's files a cutover keeps. */
@@ -1612,30 +1638,65 @@ async function deleteDisplacedImage(
   await command(['image', 'rm', imageId]);
 }
 
+/**
+ * A template follow-up's view of the release its restamp is recorded with:
+ * for a refresh, the one the update kept in `previous/`; for a reversal, the
+ * restored release's own files, which its rollback moved to
+ * `outgoing/restored/`.
+ */
+function templateFollowUp(
+  operation: InstanceOperation,
+  runtime: InstanceRuntimeConfig,
+  releaseRoot: string,
+  dependencies: CutoverSeams,
+): TemplateFollowUp {
+  return {
+    runtime,
+    ncl: dependencies.ncl ?? runInstanceNclJson,
+    recorded: async () => {
+      try {
+        return (await readKeptReleaseManifest(releaseRoot, operation.instanceId)).template_restamp;
+      } catch (error) {
+        if (!isErrno(error, 'ENOENT')) throw error;
+        throw new GwsEaError(
+          'kept_release_missing',
+          `The release kept in ${releaseRoot} has no manifest, so main's template restamp cannot be recorded with it.`,
+        );
+      }
+    },
+    record: (restamp) => recordKeptTemplateRestamp(releaseRoot, operation.instanceId, restamp),
+  };
+}
+
+/** Run one follow-up; returns what the operator is told about it, if anything. */
 async function runFollowUp(
   operation: InstanceOperation,
   runtime: InstanceRuntimeConfig,
   followUp: OperationFollowUp,
   dependencies: CutoverSeams,
-): Promise<void> {
+): Promise<string | undefined> {
   const { paths, instanceId } = operation;
   switch (followUp.kind) {
     case 'rebuild_group_image':
-      return rebuildGroupImage(runtime, followUp.agent_group_id, dependencies);
+      await rebuildGroupImage(runtime, followUp.agent_group_id, dependencies);
+      return undefined;
     case 'refresh_template':
+      return refreshMainTemplate(
+        templateFollowUp(operation, runtime, paths.releaseRoot(instanceId, 'previous'), dependencies),
+      );
     case 'reverse_template_restamp':
-      // Planned only by a gws-ea that refreshes templates (U10); this one leaves it for that release to finish.
-      throw new GwsEaError(
-        'follow_up_unsupported',
-        `This gws-ea does not run ${describeFollowUp(followUp)}; finish it with the gws-ea release that planned it.`,
+      return reverseMainTemplate(
+        templateFollowUp(operation, runtime, restoredReleaseRoot(paths, instanceId), dependencies),
       );
     case 'delete_release':
-      return rm(paths.releaseRoot(instanceId, followUp.release === 'outgoing' ? 'outgoing' : 'superseded'), {
+      await rm(paths.releaseRoot(instanceId, followUp.release === 'outgoing' ? 'outgoing' : 'superseded'), {
         recursive: true,
         force: true,
       });
+      return undefined;
     case 'delete_image':
-      return deleteDisplacedImage(runtime, followUp.image_id, dependencies, paths.instanceRoot(instanceId));
+      await deleteDisplacedImage(runtime, followUp.image_id, dependencies, paths.instanceRoot(instanceId));
+      return undefined;
   }
 }
 
@@ -1645,26 +1706,32 @@ function sentenceCase(text: string): string {
 
 /**
  * Run a recorded update's or rollback's follow-ups (KTD2): the per-group image
- * rebuilds first, then, once they all succeeded, the cleanup of the superseded
- * releases and displaced images. Each is struck from the record as it
- * finishes, and the record is deleted with the last. A failure never rolls
- * back: it stays in the record, `status` reports it, and the next run of the
- * same command retries it.
+ * rebuilds and main's template refresh or its reversal first, then, once they
+ * all succeeded, the cleanup of the superseded releases and displaced images.
+ * Each is struck from the record as it finishes, and the record is deleted
+ * with the last. A failure never rolls back: it stays in the record, `status`
+ * reports it, and the next run of the same command retries it. Returns what
+ * the operator is told about the follow-ups that finished.
  */
-export async function finishFollowUps(operation: InstanceOperation, dependencies: CutoverDependencies): Promise<void> {
+export async function finishFollowUps(
+  operation: InstanceOperation,
+  dependencies: CutoverDependencies,
+): Promise<readonly string[]> {
   operation.assertActive();
   const { paths, instanceId } = operation;
   const record = await readOperationRecord(paths, instanceId);
-  if (!record || record.phase !== 'recorded') return;
+  if (!record || record.phase !== 'recorded') return [];
   const runtime = await loadCreatedRuntime(paths, instanceId);
   const reporter = dependencies.reporter ?? {};
   const failures: string[] = [];
+  const notes: string[] = [];
   const attempt = async (followUp: OperationFollowUp, label: string): Promise<void> => {
     try {
-      await runStep(reporter, { id: followUp.kind, label }, () =>
+      const note = await runStep(reporter, { id: followUp.kind, label }, () =>
         runFollowUp(operation, runtime, followUp, dependencies),
       );
       await completeFollowUp(operation, followUp);
+      if (note) notes.push(note);
     } catch (error) {
       if (!(error instanceof GwsEaError)) throw error;
       failures.push(`${describeFollowUp(followUp)}: ${safeErrorMessage(error)}`);
@@ -1678,10 +1745,11 @@ export async function finishFollowUps(operation: InstanceOperation, dependencies
       await attempt(followUp, `Cleaning up after the ${record.kind}…`);
     }
   }
-  if (failures.length === 0) return;
+  if (failures.length === 0) return notes;
   throw new GwsEaError(
     'follow_ups_failed',
     `Assistant ${instanceId} runs ${releaseLine(record.to)}, but ${failures.length === 1 ? 'a follow-up' : `${failures.length} follow-ups`} of its ${record.kind} failed: ${failures.join('; ')}. ` +
-      `gws-ea status --id ${instanceId} lists what is left, and gws-ea ${record.kind} --id ${instanceId} retries it.`,
+      `gws-ea status --id ${instanceId} lists what is left, and gws-ea ${record.kind} --id ${instanceId} retries it.` +
+      notes.map((note) => ` ${note}`).join(''),
   );
 }

@@ -10,7 +10,7 @@ import { principalWelcomeEventId, type PrincipalCandidate } from './principal.js
 import { redact } from './redact.js';
 import type { InstanceRuntimeConfig } from './service.js';
 import { GCHAT_CHANNEL_TYPE, GwsEaError } from './types.js';
-import { hasControlCharacters, requireCanonicalTimestamp } from './validation.js';
+import { hasControlCharacters, isRecord, requireCanonicalTimestamp } from './validation.js';
 
 /** How much of the error log's end is read, and how many of its lines are shown. */
 const ERROR_LOG_TAIL_BYTES = 64 * 1024;
@@ -538,6 +538,170 @@ export function readDerivedImageGroups(checkoutRoot: string, imageBase: string):
   } finally {
     central.close();
   }
+}
+
+/** Main as the assistant profile publishes it: its agent group, and the folder its files live in. */
+export interface MainGroup {
+  readonly id: string;
+  readonly folder: string;
+}
+
+/** NanoClaw's group folder grammar (`src/group-folder.ts`): one path segment, never a parent. */
+const GROUP_FOLDER = /^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?$/u;
+
+/** Main's agent group and folder, or undefined until the profile names one. Only read, never changed. */
+export function readMainGroup(checkoutRoot: string): MainGroup | undefined {
+  const central = openReadonly(centralDatabaseFile(checkoutRoot));
+  try {
+    if (!hasTable(central, 'gws_ea_profile') || !hasTable(central, 'agent_groups')) return undefined;
+    const main = central
+      .prepare(
+        `SELECT g.id, g.folder FROM gws_ea_profile p JOIN agent_groups g ON g.id = p.main_agent_group_id
+          WHERE p.singleton = 1`,
+      )
+      .get() as MainGroup | undefined;
+    if (main && !GROUP_FOLDER.test(main.folder)) {
+      throw new GwsEaError('invalid_main_group', `Main's group folder ${JSON.stringify(main.folder)} is not a folder`);
+    }
+    return main && { id: main.id, folder: main.folder };
+  } finally {
+    central.close();
+  }
+}
+
+function columnsOf(database: Database.Database, table: string): Set<string> {
+  return new Set(
+    (database.prepare('SELECT name FROM pragma_table_info(?)').all(table) as Array<{ name: string }>).map(
+      (column) => column.name,
+    ),
+  );
+}
+
+/**
+ * An agent group's MCP servers that `plugin` owns, by NanoClaw's ownership
+ * marker (each server's `plugin` field), as its container config holds them.
+ * Only read, never changed.
+ */
+export function readPluginMcpServers(
+  checkoutRoot: string,
+  agentGroupId: string,
+  plugin: string,
+): Readonly<Record<string, unknown>> {
+  const central = openReadonly(centralDatabaseFile(checkoutRoot));
+  let stored: string | undefined;
+  try {
+    if (!hasTable(central, 'container_configs') || !columnsOf(central, 'container_configs').has('mcp_servers')) {
+      return {};
+    }
+    stored = (
+      central.prepare('SELECT mcp_servers FROM container_configs WHERE agent_group_id = ?').get(agentGroupId) as
+        | { mcp_servers: string }
+        | undefined
+    )?.mcp_servers;
+  } finally {
+    central.close();
+  }
+  if (stored === undefined) return {};
+  let servers: unknown;
+  try {
+    servers = JSON.parse(stored);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    servers = undefined;
+  }
+  if (!isRecord(servers)) {
+    throw new GwsEaError('invalid_container_config', `Agent group ${agentGroupId}'s MCP servers are not a JSON object`);
+  }
+  // fromEntries defines each server as an own field, so a server named `__proto__` stays data.
+  return Object.fromEntries(
+    Object.entries(servers).filter(([, server]) => isRecord(server) && server.plugin === plugin),
+  );
+}
+
+/** A scheduled task series, as the row that runs next holds it. */
+export interface TaskSeries {
+  readonly series_id: string;
+  readonly recurrence: string | null;
+  readonly prompt: string;
+  readonly script: string | null;
+}
+
+/** NanoClaw's task content envelope (`src/modules/scheduling/task-content.ts`); a plain string predates it. */
+function taskContent(raw: string): Pick<TaskSeries, 'prompt' | 'script'> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    return { prompt: raw, script: null };
+  }
+  return isRecord(parsed)
+    ? {
+        prompt: typeof parsed.prompt === 'string' ? parsed.prompt : '',
+        script: typeof parsed.script === 'string' ? parsed.script : null,
+      }
+    : { prompt: raw, script: null };
+}
+
+const TASK_SLUG = /^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$/u;
+/** Docker's tag grammar, which NanoClaw's agent group IDs fit: one path segment. */
+const AGENT_GROUP_ID = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/u;
+const TASK_COLUMNS = ['kind', 'series_id', 'status', 'recurrence', 'content', 'seq'] as const;
+
+/**
+ * An agent group's task series whose IDs carry one of `slugs` (NanoClaw names
+ * a named task's series `<slug>-<4 hex>`), across its sessions: each as its
+ * live row holds it, or between runs its latest. Whether it is paused is the
+ * operator's, so it is left out. Only read, never changed.
+ */
+export function readTaskSeries(checkoutRoot: string, agentGroupId: string, slugs: readonly string[]): TaskSeries[] {
+  if (slugs.length === 0) return [];
+  if (!AGENT_GROUP_ID.test(agentGroupId)) throw new GwsEaError('invalid_agent_group', 'The agent group ID is invalid');
+  if (!slugs.every((slug) => TASK_SLUG.test(slug))) {
+    throw new GwsEaError('invalid_task_slug', 'A task slug is not one NanoClaw names a series with');
+  }
+  const series = new RegExp(`^(?:${slugs.join('|')})-[0-9a-f]{4}$`, 'u');
+  const found = new Map<string, { readonly live: boolean; readonly seq: number; readonly task: TaskSeries }>();
+  let sessions: string[];
+  try {
+    sessions = readdirSync(path.join(path.resolve(checkoutRoot), 'data', 'v2-sessions', agentGroupId), {
+      withFileTypes: true,
+    })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) return [];
+    throw error;
+  }
+  for (const session of sessions) {
+    const file = path.join(path.resolve(checkoutRoot), 'data', 'v2-sessions', agentGroupId, session, 'inbound.db');
+    if (!existsSync(file)) continue;
+    const inbound = openReadonly(file);
+    try {
+      if (!hasTable(inbound, 'messages_in')) continue;
+      const columns = columnsOf(inbound, 'messages_in');
+      if (!TASK_COLUMNS.every((column) => columns.has(column))) continue;
+      const rows = inbound
+        .prepare(
+          "SELECT series_id, status, recurrence, content, seq FROM messages_in WHERE kind = 'task' AND series_id IS NOT NULL",
+        )
+        .all() as Array<{ series_id: string; status: string; recurrence: string | null; content: string; seq: number }>;
+      for (const row of rows) {
+        if (!series.test(row.series_id)) continue;
+        const live = row.status === 'pending' || row.status === 'paused';
+        const kept = found.get(row.series_id);
+        if (kept && ((kept.live && !live) || (kept.live === live && kept.seq > row.seq))) continue;
+        found.set(row.series_id, {
+          live,
+          seq: row.seq,
+          task: { series_id: row.series_id, recurrence: row.recurrence, ...taskContent(row.content) },
+        });
+      }
+    } finally {
+      inbound.close();
+    }
+  }
+  return [...found.values()].map(({ task }) => task).sort((a, b) => a.series_id.localeCompare(b.series_id));
 }
 
 /**
