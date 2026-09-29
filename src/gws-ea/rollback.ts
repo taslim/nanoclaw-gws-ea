@@ -98,7 +98,7 @@ import {
   restoreInstanceServiceDefinition,
   stampUpgradeState,
 } from './service.js';
-import { GwsEaError, releaseOf, type InstanceReservation, type ReleaseCoordinates } from './types.js';
+import { GwsEaError, releaseOf, shortCommit, type InstanceReservation, type ReleaseCoordinates } from './types.js';
 import { isRecord } from './validation.js';
 import { backupCentralDatabase, readDerivedImageGroups, readSchemaManifest } from './verify.js';
 
@@ -173,12 +173,8 @@ export type RollbackOutcome =
   /** The snapshot restore was declined; the assistant stays on `release` as before. */
   | { readonly kind: 'declined'; readonly release: ReleaseCoordinates };
 
-function short(commit: string): string {
-  return commit.slice(0, 12);
-}
-
 function releaseLine(release: ReleaseCoordinates): string {
-  return `${release.release_track} ${short(release.deployed_commit)}`;
+  return `${release.release_track} ${shortCommit(release.deployed_commit)}`;
 }
 
 async function exists(target: string): Promise<boolean> {
@@ -300,7 +296,7 @@ export async function readKeptPreviousRelease(
   if (marker.deployed_commit !== manifest.release.deployed_commit) {
     throw new GwsEaError(
       'invalid_kept_release',
-      `The release kept in ${checkout} is at ${short(marker.deployed_commit)}, not the ${short(manifest.release.deployed_commit)} its manifest names.`,
+      `The release kept in ${checkout} is at ${shortCommit(marker.deployed_commit)}, not the ${shortCommit(manifest.release.deployed_commit)} its manifest names.`,
     );
   }
   if (!(await isRegularFile(keptReleaseFiles(root).receipt)))
@@ -1228,7 +1224,7 @@ async function rollBackRecorded(
   if (live.deployed_commit !== from.deployed_commit || to.deployed_commit === from.deployed_commit) {
     throw new GwsEaError(
       'rollback_unavailable',
-      `Assistant ${instanceId} runs ${short(live.deployed_commit)}, and its kept release is ${short(to.deployed_commit)}, so there is nothing to roll back to.`,
+      `Assistant ${instanceId} runs ${shortCommit(live.deployed_commit)}, and its kept release is ${shortCommit(to.deployed_commit)}, so there is nothing to roll back to.`,
     );
   }
   const base = getInstallScopedNames(host.runtime.install_id).containerImageBase;

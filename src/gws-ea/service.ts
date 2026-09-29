@@ -8,7 +8,7 @@ import { isErrno } from '../community-portal/errors.js';
 import { readEnvFile } from '../env.js';
 import { renderLaunchdService, renderSystemdService } from '../service-definition.js';
 import type { OnecliRuntimeLayout } from './onecli-compose.js';
-import { preparePrivateDirectory, assertPrivateDirectory, isRegularFile } from './paths.js';
+import { preparePrivateDirectory, assertPrivateDirectory, instanceRuntimeFile, isRegularFile } from './paths.js';
 import {
   buildHostEnvironment,
   buildToolEnvironment,
@@ -284,10 +284,6 @@ export function validateRuntimeConfig(value: unknown): InstanceRuntimeConfig {
   });
 }
 
-function runtimeConfigFile(config: InstanceRuntimeConfig): string {
-  return path.join(config.checkout_realpath, 'data', 'gws-ea', 'runtime.json');
-}
-
 /** The `.env` keys gws-ea owns; every other key belongs to another writer. */
 export const INSTANCE_HOST_ENV_KEYS = [
   'NANOCLAW_INSTALL_ID',
@@ -325,7 +321,7 @@ function instanceHostConfiguration(config: InstanceRuntimeConfig): Readonly<Reco
  * refuses when they disagree.
  */
 async function persistRuntimeFile(config: InstanceRuntimeConfig): Promise<void> {
-  const file = runtimeConfigFile(config);
+  const file = instanceRuntimeFile(config.checkout_realpath);
   let existing: InstanceRuntimeConfig;
   try {
     existing = await loadInstanceRuntimeConfig(file);
@@ -390,7 +386,7 @@ export async function writeReleaseRuntime(
   const root = path.join(checkoutRoot, 'data', 'gws-ea');
   await preparePrivateDirectory(root);
   await preparePrivateDirectory(path.join(checkoutRoot, 'logs'));
-  await writePrivateTextFile(path.join(root, 'runtime.json'), runtimeFileContents(config));
+  await writePrivateTextFile(instanceRuntimeFile(checkoutRoot), runtimeFileContents(config));
   const owned = instanceHostConfiguration(config);
   upsertEnvVars({ ...owned }, checkoutRoot);
   activeStep()?.envFile(
@@ -403,7 +399,7 @@ export async function writeReleaseRuntime(
 
 export async function loadInstanceRuntimeConfig(file: string): Promise<InstanceRuntimeConfig> {
   const config = validateRuntimeConfig(await readOwnerOnlyJson(file, 'Runtime config', INVALID_RUNTIME));
-  if (file !== runtimeConfigFile(config)) {
+  if (file !== instanceRuntimeFile(config.checkout_realpath)) {
     throw new GwsEaError('runtime_mismatch', 'Runtime config path does not match the selected checkout');
   }
   return config;
@@ -442,7 +438,7 @@ function createInstanceServiceLayout(
   });
   return {
     ...coordinates,
-    runtimeConfigFile: runtimeConfigFile(config),
+    runtimeConfigFile: instanceRuntimeFile(config.checkout_realpath),
     environmentFile: path.join(config.checkout_realpath, '.env'),
     launcherEntrypoint: path.join(config.checkout_realpath, 'dist', 'gws-ea', 'process.js'),
     hostEntrypoint: path.join(config.checkout_realpath, 'dist', 'index.js'),

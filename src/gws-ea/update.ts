@@ -80,6 +80,7 @@ import {
   readOperationRecord,
   recordOperationFacts,
   reservationAt,
+  revertClause,
   targetReservationView,
   type MovedImage,
   type OperationFollowUp,
@@ -112,6 +113,7 @@ import {
   INSTANCE_MARKER_SCHEMA_VERSION,
   releaseOf,
   sameRelease,
+  shortCommit,
   type GwsEaErrorDetails,
   type InstanceMarker,
   type InstanceReservation,
@@ -214,10 +216,6 @@ interface CheckedUpdate {
   readonly reservation: InstanceReservation;
   readonly runtime: InstanceRuntimeConfig;
   readonly target: UpdateReleaseTarget;
-}
-
-function short(commit: string): string {
-  return commit.slice(0, 12);
 }
 
 function checkoutRuntime(seams: UpdateSeams): CheckoutRuntime {
@@ -428,7 +426,7 @@ async function checkUpdate(
   if (!sameRelease(target.release, intent.target)) {
     throw new GwsEaError(
       'release_changed',
-      `gws-ea moved from ${short(intent.target.deployed_commit)} to ${short(target.release.deployed_commit)} while this update started; retry it.`,
+      `gws-ea moved from ${shortCommit(intent.target.deployed_commit)} to ${shortCommit(target.release.deployed_commit)} while this update started; retry it.`,
     );
   }
   assertHostRunning(runtime, dependencies);
@@ -726,7 +724,7 @@ export async function confirmStagedUpdate(
 }
 
 function releaseLine(release: ReleaseCoordinates): string {
-  return `${release.release_track} ${short(release.deployed_commit)}`;
+  return `${release.release_track} ${shortCommit(release.deployed_commit)}`;
 }
 
 function mainTemplateLine(decision: MainTemplateDecision): string {
@@ -817,7 +815,7 @@ export async function recoverUpdate(
   const next = operationNextSteps(record);
   throw new GwsEaError(
     'update_interrupted',
-    `${failure} and is unfinished: continue it with ${next.continueWith}${next.revertWith ? `, or revert it with ${next.revertWith}` : ''}.`,
+    `${failure} and is unfinished: continue it with ${next.continueWith}${revertClause(next)}.`,
     { cause, details: { ...details, continueWith: next.continueWith, revertWith: next.revertWith ?? null } },
   );
 }

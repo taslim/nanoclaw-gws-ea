@@ -57,6 +57,7 @@ import type { OnecliPins, OnecliRuntimeLayout } from './onecli-compose.js';
 import { completeFollowUp, followUpKey, readOperationRecord, type OperationFollowUp } from './operation.js';
 import {
   instanceMarkerFile,
+  instanceRuntimeFile,
   isRegularFile,
   isWithinDirectory,
   type ControlPlanePaths,
@@ -84,7 +85,7 @@ import {
   type ServiceControlOptions,
 } from './service-control.js';
 import { instanceServicePlatform } from './service-coordinates.js';
-import { GwsEaError, type InstanceReservation, type ReleaseCoordinates } from './types.js';
+import { GwsEaError, shortCommit, type InstanceReservation, type ReleaseCoordinates } from './types.js';
 import { isRecord, requireCanonicalTimestamp } from './validation.js';
 import { readDerivedImageGroups } from './verify.js';
 
@@ -788,7 +789,7 @@ function swapStage(layout: SwapLayout, { from, to }: SwapReleases): SwapStage | 
 }
 
 function describeLayout(layout: SwapLayout): string {
-  const commit = (value: string | undefined): string => (value === undefined ? 'none' : value.slice(0, 12));
+  const commit = (value: string | undefined): string => (value === undefined ? 'none' : shortCommit(value));
   return [
     `live ${commit(layout.live)}`,
     `live receipt ${commit(layout.liveReceipt)}`,
@@ -811,7 +812,7 @@ async function placeSwap(
   const stage = swapStage(layout, releases);
   if (stage === undefined) {
     throw layoutFault(
-      `Assistant ${instanceId}'s releases are in a layout no swap from ${releases.from.slice(0, 12)} to ${releases.to.slice(0, 12)} leaves (${describeLayout(layout)}); nothing was moved.`,
+      `Assistant ${instanceId}'s releases are in a layout no swap from ${shortCommit(releases.from)} to ${shortCommit(releases.to)} leaves (${describeLayout(layout)}); nothing was moved.`,
     );
   }
   return { places, layout, stage: SWAP_STAGES.indexOf(stage) };
@@ -1059,7 +1060,7 @@ function rollbackStage(
 }
 
 function describeRollbackLayout(layout: RollbackLayout): string {
-  const commit = (value: string | undefined): string => (value === undefined ? 'none' : value.slice(0, 12));
+  const commit = (value: string | undefined): string => (value === undefined ? 'none' : shortCommit(value));
   return [
     `live ${commit(layout.live)}`,
     `live receipt ${commit(layout.liveReceipt)}`,
@@ -1081,7 +1082,7 @@ async function placeRollback(
   const stage = rollbackStage(layout, releases);
   if (stage === undefined) {
     throw layoutFault(
-      `Assistant ${instanceId}'s releases are in a layout no rollback from ${releases.from.slice(0, 12)} to ${releases.to.slice(0, 12)} leaves (${describeRollbackLayout(layout)}); nothing was moved.`,
+      `Assistant ${instanceId}'s releases are in a layout no rollback from ${shortCommit(releases.from)} to ${shortCommit(releases.to)} leaves (${describeRollbackLayout(layout)}); nothing was moved.`,
     );
   }
   return { places, layout, stage: ROLLBACK_STAGES.indexOf(stage) };
@@ -1219,7 +1220,7 @@ async function readCutoverRuntime(
     ...RUNTIME_SLOTS.map((slot) => paths.releaseCheckoutRoot(id, slot)),
   ];
   for (const checkout of checkouts) {
-    const file = path.join(checkout, 'data', 'gws-ea', 'runtime.json');
+    const file = instanceRuntimeFile(checkout);
     if (!(await isRegularFile(file))) continue;
     const runtime = validateRuntimeConfig(await readOwnerOnlyJson(file, 'Runtime config', 'invalid_runtime_config'));
     if (runtime.instance_id === id && runtime.checkout_realpath === reservation.checkout_realpath) return runtime;
@@ -1555,7 +1556,7 @@ export async function verifyServingRelease(host: CutoverHost, release: ServingRe
 const GROUP_IMAGE_REBUILD_TIMEOUT_MS = 20 * 60_000;
 
 function releaseLine(release: ReleaseCoordinates): string {
-  return `${release.release_track} ${release.deployed_commit.slice(0, 12)}`;
+  return `${release.release_track} ${shortCommit(release.deployed_commit)}`;
 }
 
 function describeFollowUp(followUp: OperationFollowUp): string {
@@ -1606,6 +1607,23 @@ async function rebuildGroupImage(
   );
 }
 
+/** The tags `docker image inspect --format '{{json .RepoTags}}'` reports. */
+export function imageTags(output: string): readonly string[] {
+  let tags: unknown;
+  try {
+    tags = JSON.parse(output);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    throw new GwsEaError('invalid_child_output', 'Docker reported invalid image tags', { cause: error });
+  }
+  // Docker reports an image no tag names with an empty list, or none at all.
+  if (tags === null) return [];
+  if (!Array.isArray(tags) || !tags.every((tag): tag is string => typeof tag === 'string')) {
+    throw new GwsEaError('invalid_child_output', 'Docker reported invalid image tags');
+  }
+  return tags;
+}
+
 /** Delete an image a retag or rebuild displaced, by ID, unless a tag still names it (KTD19). */
 async function deleteDisplacedImage(
   runtime: InstanceRuntimeConfig,
@@ -1616,13 +1634,10 @@ async function deleteDisplacedImage(
   const run = dependencies.runCommand ?? runSanitizedCommand;
   const command = (args: readonly string[]) =>
     run({ command: 'docker', args, cwd, env: dockerEnvironment(runtime, dependencies), timeoutMs: DOCKER_TIMEOUT_MS });
-  let tags: unknown;
+  let inspected: string;
   try {
-    tags = JSON.parse((await command(['image', 'inspect', '--format', '{{json .RepoTags}}', imageId])).stdout);
+    inspected = (await command(['image', 'inspect', '--format', '{{json .RepoTags}}', imageId])).stdout;
   } catch (error) {
-    if (error instanceof SyntaxError) {
-      throw new GwsEaError('invalid_child_output', 'Docker reported invalid image tags', { cause: error });
-    }
     const gone =
       error instanceof GwsEaError &&
       error.code === 'command_failed' &&
@@ -1630,11 +1645,7 @@ async function deleteDisplacedImage(
     if (gone) return;
     throw error;
   }
-  // Docker reports an image no tag names with an empty list, or none at all.
-  if (tags !== null && !Array.isArray(tags)) {
-    throw new GwsEaError('invalid_child_output', 'Docker reported invalid image tags');
-  }
-  if (tags !== null && tags.length > 0) return;
+  if (imageTags(inspected).length > 0) return;
   await command(['image', 'rm', imageId]);
 }
 

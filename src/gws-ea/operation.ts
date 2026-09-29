@@ -28,7 +28,14 @@ import {
   validateReleaseCoordinates,
 } from './registry.js';
 import { readOwnerOnlyJson, removePrivateFile } from './secrets.js';
-import { GwsEaError, releaseOf, sameRelease, type InstanceReservation, type ReleaseCoordinates } from './types.js';
+import {
+  GwsEaError,
+  releaseOf,
+  sameRelease,
+  shortCommit,
+  type InstanceReservation,
+  type ReleaseCoordinates,
+} from './types.js';
 import { isRecord, requireCanonicalTimestamp, requireString } from './validation.js';
 
 export const OPERATION_RECORD_SCHEMA_VERSION = 1 as const;
@@ -392,8 +399,9 @@ export function operationNextSteps(record: OperationRecord): OperationNextSteps 
     : { continueWith: `gws-ea rollback --id ${id}` };
 }
 
-function abbreviate(commit: string): string {
-  return commit.slice(0, 12);
+/** The clause naming what reverts an unfinished operation, or nothing when only continuing it can. */
+export function revertClause(next: OperationNextSteps): string {
+  return next.revertWith ? `, or revert it with ${next.revertWith}` : '';
 }
 
 /**
@@ -404,15 +412,14 @@ function abbreviate(commit: string): string {
  */
 function inProgress(record: OperationRecord, deploying?: ReleaseCoordinates): GwsEaError {
   const next = operationNextSteps(record);
-  const staged = abbreviate(record.to.deployed_commit);
+  const staged = shortCommit(record.to.deployed_commit);
   const subject = `${record.kind === 'update' ? 'An update' : 'A rollback'} of this assistant`;
-  const moved = deploying ? `, and this gws-ea deploys ${abbreviate(deploying.deployed_commit)}` : '';
+  const moved = deploying ? `, and this gws-ea deploys ${shortCommit(deploying.deployed_commit)}` : '';
   const continued = deploying ? `${next.continueWith} from the gws-ea at ${staged}` : next.continueWith;
-  const revert = next.revertWith ? `, or revert it with ${next.revertWith}` : '';
   return new GwsEaError(
     'operation_in_progress',
     `${subject} to ${record.to.release_track} ${staged} is unfinished (${record.phase})${moved}. ` +
-      `Continue it with ${continued}${revert}.`,
+      `Continue it with ${continued}${revertClause(next)}.`,
     { details: { phase: record.phase, continueWith: next.continueWith, revertWith: next.revertWith ?? null } },
   );
 }

@@ -5,7 +5,6 @@
  * file. The host, service manager, Docker, OneCLI, and the callback are
  * faked at their boundaries; Git and SQLite are real.
  */
-import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, utimes, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -37,6 +36,7 @@ import {
   type ReadOnlyCommandRuntime,
   type StatusObservers,
 } from './status.js';
+import { commitAll, git } from './testing/cutover-fixture.js';
 import { GwsEaError, releaseOf, type InstanceReservation, type ReleaseCoordinates } from './types.js';
 import type { LatestDelivery } from './verify.js';
 
@@ -69,16 +69,6 @@ const LISTENER = '6f1c2b1e-8d4a-4c1e-9b7a-2f3e4d5c6b7a';
 const NOW = new Date('2026-09-28T14:30:00.000Z');
 const DELIVERED_AT = '2026-09-28T14:00:00.000Z';
 const SENTINEL = 'sentinel-secret-value-7f3a9c';
-
-function git(cwd: string, ...args: string[]): string {
-  return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-}
-
-function commitAll(repository: string, message: string): string {
-  git(repository, 'add', '.');
-  git(repository, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '--quiet', '-m', message);
-  return git(repository, 'rev-parse', 'HEAD');
-}
 
 interface Machine {
   readonly root: string;

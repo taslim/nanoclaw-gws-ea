@@ -12,11 +12,9 @@ import {
   chmod,
   lstat,
   mkdir,
-  mkdtemp,
   readdir,
   readFile,
   readlink,
-  realpath,
   rename,
   rm,
   stat,
@@ -24,7 +22,6 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import net from 'node:net';
-import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 
@@ -53,35 +50,16 @@ import {
 import { instanceMarkerFile, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { runSanitizedCommand, type SanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { allocateInstanceId } from './registry.js';
+import { exists, removeTemporaryRoots, temporaryRoot } from './testing/cutover-fixture.js';
 import { GwsEaError } from './types.js';
 
-const roots: string[] = [];
-
-afterEach(async () => {
-  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
-});
-
-async function temporaryRoot(prefix: string): Promise<string> {
-  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), prefix)));
-  roots.push(root);
-  return root;
-}
+afterEach(removeTemporaryRoots);
 
 async function write(root: string, relativePath: string, contents: string | Buffer, mode = 0o600): Promise<void> {
   const file = path.join(root, relativePath);
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   await writeFile(file, contents, { mode });
   await chmod(file, mode);
-}
-
-async function exists(target: string): Promise<boolean> {
-  return lstat(target).then(
-    () => true,
-    (error: NodeJS.ErrnoException) => {
-      if (error.code === 'ENOENT') return false;
-      throw error;
-    },
-  );
 }
 
 /** Every entry under `root`: type, mode, and content hash. */

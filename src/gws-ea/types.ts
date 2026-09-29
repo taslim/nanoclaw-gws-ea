@@ -88,6 +88,11 @@ export type ReleaseCoordinates = Readonly<
   Pick<InstanceReservationInput, 'source_remote' | 'release_track' | 'deployed_commit'>
 >;
 
+/** A commit as messages show it: its first 12 hex digits. */
+export function shortCommit(commit: string): string {
+  return commit.slice(0, 12);
+}
+
 export function releaseOf(reservation: ReleaseCoordinates): ReleaseCoordinates {
   return {
     source_remote: reservation.source_remote,

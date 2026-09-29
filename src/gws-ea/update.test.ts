@@ -64,7 +64,7 @@ import {
   type Machine,
   type Release,
   type World,
-} from './cutover-fixture.js';
+} from './testing/cutover-fixture.js';
 import { readKeptReleaseManifest } from './cutover.js';
 import { acquireInstanceOperation } from './journal.js';
 import {

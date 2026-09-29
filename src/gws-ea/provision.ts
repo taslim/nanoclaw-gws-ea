@@ -80,7 +80,7 @@ import {
 import { readOwnerOnlyFile, readOwnerOnlyJson, removePrivateFile, writePrivateTextFile } from './secrets.js';
 import { assertInstanceId, getInstanceReservation } from './registry.js';
 import { isErrno } from '../community-portal/errors.js';
-import { isRegularFile, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
+import { instanceRuntimeFile, isRegularFile, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import { pollUntil } from './poll.js';
 import { findPortHolder, portInUseError } from './ports.js';
 import {
@@ -1461,10 +1461,6 @@ interface InstanceState {
   readonly runtime?: InstanceRuntimeConfig;
 }
 
-function instanceRuntimeFile(reservation: InstanceReservation): string {
-  return path.join(reservation.checkout_realpath, 'data', 'gws-ea', 'runtime.json');
-}
-
 async function readInstanceState(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<InstanceState> {
   const absent = (error: unknown): undefined => {
     if (isErrno(error, 'ENOENT')) return undefined;
@@ -1472,7 +1468,7 @@ async function readInstanceState(paths: ControlPlanePaths, reservation: Instance
   };
   const [manifest, runtime] = await Promise.all([
     loadProductionBootstrapManifest(paths.bootstrapFile(reservation.instance_id)).catch(absent),
-    loadInstanceRuntimeConfig(instanceRuntimeFile(reservation)).catch(absent),
+    loadInstanceRuntimeConfig(instanceRuntimeFile(reservation.checkout_realpath)).catch(absent),
   ]);
   return { ...(manifest ? { manifest } : {}), ...(runtime ? { runtime } : {}) };
 }
@@ -1513,7 +1509,7 @@ export async function readDeployedSetup(
   reservation: InstanceReservation,
   commits: readonly string[] = [reservation.deployed_commit],
 ): Promise<DeployedAssistantSetup> {
-  const runtime = await loadInstanceRuntimeConfig(instanceRuntimeFile(reservation));
+  const runtime = await loadInstanceRuntimeConfig(instanceRuntimeFile(reservation.checkout_realpath));
   const receipt = await loadReleasePreflightReceipt(paths.releasePreflightFile(reservation.instance_id), {
     instanceId: reservation.instance_id,
     deployedCommits: commits,

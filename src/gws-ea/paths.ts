@@ -24,6 +24,11 @@ export function instanceMarkerFile(checkoutRoot: string): string {
   return path.join(checkoutRoot, 'data', 'gws-ea', 'instance.json');
 }
 
+/** The runtime record inside a checkout, written once its host first starts. */
+export function instanceRuntimeFile(checkoutRoot: string): string {
+  return path.join(checkoutRoot, 'data', 'gws-ea', 'runtime.json');
+}
+
 export interface ControlPlanePathOverrides {
   configRoot?: string;
   stateRoot?: string;

@@ -21,36 +21,36 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { expect } from 'vitest';
 
-import { materializeReleaseCheckout } from './checkout.js';
-import { runCli, type CliRuntime } from './cli.js';
-import { acquireInstanceOperation, recordStepCompleted, reserveInstance } from './journal.js';
-import { createOnecliRuntimeLayout, renderOnecliCompose } from './onecli-compose.js';
-import { resolveWrapperGatewayImage, wrapperImageTag } from './onecli-gateway-image.js';
-import { CONTROL_PLANE_ROOT, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
-import { LAUNCHER_PINS, ONECLI_SDK_VERSION } from './pins.js';
-import { runSanitizedCommand, type SanitizedCommand, type SanitizedCommandRunner } from './process.js';
-import { allocateInstanceId, getInstanceReservation } from './registry.js';
-import type { ReleasePreflightInput } from './release-preflight.js';
-import type { ToolProviderSetup } from './release-target.js';
+import { materializeReleaseCheckout } from '../checkout.js';
+import { runCli, type CliRuntime } from '../cli.js';
+import { acquireInstanceOperation, recordStepCompleted, reserveInstance } from '../journal.js';
+import { createOnecliRuntimeLayout, renderOnecliCompose } from '../onecli-compose.js';
+import { resolveWrapperGatewayImage, wrapperImageTag } from '../onecli-gateway-image.js';
+import { CONTROL_PLANE_ROOT, instanceRuntimeFile, resolveControlPlanePaths, type ControlPlanePaths } from '../paths.js';
+import { LAUNCHER_PINS, ONECLI_SDK_VERSION } from '../pins.js';
+import { runSanitizedCommand, type SanitizedCommand, type SanitizedCommandRunner } from '../process.js';
+import { allocateInstanceId, getInstanceReservation } from '../registry.js';
+import type { ReleasePreflightInput } from '../release-preflight.js';
+import type { ToolProviderSetup } from '../release-target.js';
 import {
   createInstanceRuntimeConfig,
   persistInstanceRuntime,
   type HostStatusHelpers,
   type InstanceRuntimeConfig,
   type UpsertEnvVars,
-} from './service.js';
-import type { NanoclawServiceHelpers } from './service-control.js';
-import { observeAssistantStatus } from './status.js';
-import { GwsEaError, PROVISION_STEPS, releaseOf, type ReleaseCoordinates } from './types.js';
+} from '../service.js';
+import type { NanoclawServiceHelpers } from '../service-control.js';
+import { observeAssistantStatus } from '../status.js';
+import { GwsEaError, PROVISION_STEPS, releaseOf, type ReleaseCoordinates } from '../types.js';
 import {
   confirmStagedUpdate,
   continueUpdate,
   prepareUpdate,
   resolveUpdateIntent,
   type UpdateDependencies,
-} from './update.js';
-import { readCentralMigrations } from './verify.js';
-import { getInstallScopedNames } from '../install-slug.js';
+} from '../update.js';
+import { readCentralMigrations } from '../verify.js';
+import { getInstallScopedNames } from '../../install-slug.js';
 
 const roots: string[] = [];
 
@@ -932,5 +932,5 @@ export function receiptCommit(file: string): Promise<string> {
 }
 
 export function runtimeCommit(checkout: string): Promise<string> {
-  return receiptCommit(path.join(checkout, 'data', 'gws-ea', 'runtime.json'));
+  return receiptCommit(instanceRuntimeFile(checkout));
 }

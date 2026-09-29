@@ -21,6 +21,7 @@ import { isErrno } from '../community-portal/errors.js';
 import {
   assertOwnedDestination,
   assertPrivateStateFile,
+  instanceRuntimeFile,
   preparePrivateDirectory,
   type ControlPlanePaths,
 } from './paths.js';
@@ -263,9 +264,7 @@ export async function assertInstanceCreated(paths: ControlPlanePaths, instanceId
 export async function loadCreatedRuntime(paths: ControlPlanePaths, instanceId: string): Promise<InstanceRuntimeConfig> {
   await assertInstanceCreated(paths, instanceId);
   const reservation = await getInstanceReservation(paths, instanceId);
-  const runtime = await loadInstanceRuntimeConfig(
-    path.join(reservation.checkout_realpath, 'data', 'gws-ea', 'runtime.json'),
-  );
+  const runtime = await loadInstanceRuntimeConfig(instanceRuntimeFile(reservation.checkout_realpath));
   if (runtime.instance_id !== instanceId) {
     throw new GwsEaError('runtime_mismatch', "The assistant's runtime record belongs to another instance");
   }

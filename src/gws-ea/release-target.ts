@@ -13,7 +13,7 @@ import { LAUNCHER_PINS, ONECLI_SDK_VERSION } from './pins.js';
 import { readDeployedSetup } from './provision.js';
 import { assertUpdateKeepsSetup, type ReleasePreflightInput } from './release-preflight.js';
 import type { ReleaseSource } from './release-tracks.js';
-import { GwsEaError, type InstanceReservation, type ReleaseCoordinates } from './types.js';
+import { GwsEaError, shortCommit, type InstanceReservation, type ReleaseCoordinates } from './types.js';
 import type { ProviderCredentialMetadata } from '../provider-credential.js';
 
 /** The tool's own provider setup, which the driver reads from `setup/providers`. */
@@ -60,10 +60,6 @@ export interface ReleaseTargetRuntime extends CheckoutRuntime {
   readonly toolRoot?: string;
 }
 
-function short(commit: string): string {
-  return commit.slice(0, 12);
-}
-
 /**
  * Hold the tool's release to the setup the assistant runs, before anything
  * is fetched or staged. The tool's own pins are the release's: its checkout
@@ -100,13 +96,13 @@ function assertMovesForward(
   if (deployed === 'same') {
     throw new GwsEaError(
       'release_not_newer',
-      `Assistant ${id} already runs ${short(commit)}, this tool's release; there is nothing to update`,
+      `Assistant ${id} already runs ${shortCommit(commit)}, this tool's release; there is nothing to update`,
       { details },
     );
   }
   throw new GwsEaError(
     'release_not_newer',
-    `Assistant ${id} runs ${short(reservation.deployed_commit)}, which this tool's release ${short(commit)} on track ${track} does not descend from, and an update only moves forward. Run gws-ea rollback --id ${id} to return to its previous release, or update this tool to a later release first.`,
+    `Assistant ${id} runs ${shortCommit(reservation.deployed_commit)}, which this tool's release ${shortCommit(commit)} on track ${track} does not descend from, and an update only moves forward. Run gws-ea rollback --id ${id} to return to its previous release, or update this tool to a later release first.`,
     { details },
   );
 }
@@ -139,7 +135,7 @@ export async function resolveReleaseTarget(
   if (!position.onTrack) {
     throw new GwsEaError(
       'release_not_on_track',
-      `gws-ea is at ${short(commit)}, which is not on release track ${track}; run gws-ea from a commit on that track, or choose the --track it is on`,
+      `gws-ea is at ${shortCommit(commit)}, which is not on release track ${track}; run gws-ea from a commit on that track, or choose the --track it is on`,
       { details: { track, ref: source.ref, commit } },
     );
   }

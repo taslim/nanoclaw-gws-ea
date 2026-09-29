@@ -45,6 +45,7 @@ import {
   renderManagedCloudflareConfiguration,
   replaceManagedCloudflareConfiguration,
 } from './cloudflare-ingress.js';
+import { imageTags } from './cutover.js';
 import {
   PauseRequired,
   runStep,
@@ -65,7 +66,13 @@ import { readProvisionJournal } from './journal.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { removeOnecliRuntime } from './onecli.js';
 import { liveCheckoutCommits, readOperationRecord, type OperationRecord } from './operation.js';
-import { CONTROL_PLANE_ROOT, preparePrivateDirectory, type ControlPlanePaths, type ReleaseSlot } from './paths.js';
+import {
+  CONTROL_PLANE_ROOT,
+  instanceRuntimeFile,
+  preparePrivateDirectory,
+  type ControlPlanePaths,
+  type ReleaseSlot,
+} from './paths.js';
 import { pollUntil } from './poll.js';
 import { probeRecordedDockerEndpoint, resolveDockerEndpoint } from './prerequisites.js';
 import {
@@ -414,10 +421,11 @@ async function readRecordedRuntime(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
 ): Promise<{ readonly homeDirectory?: string; readonly dockerEndpoint?: string; readonly onecliCliPath?: string }> {
-  const runtimeFile = (checkout: string): string => path.join(checkout, 'data', 'gws-ea', 'runtime.json');
   const records = await Promise.all([
-    readRecord(runtimeFile(reservation.checkout_realpath)),
-    ...KEPT_RELEASES.map((slot) => readRecord(runtimeFile(paths.releaseCheckoutRoot(reservation.instance_id, slot)))),
+    readRecord(instanceRuntimeFile(reservation.checkout_realpath)),
+    ...KEPT_RELEASES.map((slot) =>
+      readRecord(instanceRuntimeFile(paths.releaseCheckoutRoot(reservation.instance_id, slot))),
+    ),
     readRecord(paths.bootstrapFile(reservation.instance_id)),
   ]);
   const field = (key: string, parse: (value: unknown, label: string, code: string) => string): string | undefined => {
@@ -693,23 +701,6 @@ const STOPPED_POLL_MS = 500;
 const STOPPED_CHECKS = 10;
 /** `launchctl print` exits with this, and only this, when the job is not loaded. */
 const LAUNCHD_JOB_NOT_FOUND = 113;
-
-/** The tags `docker image inspect --format '{{json .RepoTags}}'` reports. */
-function imageTags(output: string): readonly string[] {
-  let tags: unknown;
-  try {
-    tags = JSON.parse(output);
-  } catch (error) {
-    if (!(error instanceof SyntaxError)) throw error;
-    throw new GwsEaError('invalid_child_output', 'Docker reported invalid image tags', { cause: error });
-  }
-  // Docker reports an image no tag names with an empty list, or none at all.
-  if (tags === null) return [];
-  if (!Array.isArray(tags) || !tags.every((tag): tag is string => typeof tag === 'string')) {
-    throw new GwsEaError('invalid_child_output', 'Docker reported invalid image tags');
-  }
-  return tags;
-}
 
 /** What removing the host uses besides the runtime the instance recorded. */
 interface NanoclawTeardown {

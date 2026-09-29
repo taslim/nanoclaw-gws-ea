@@ -50,7 +50,7 @@ import {
   type OperationRecord,
   type SnapshotManifest,
 } from './operation.js';
-import { CONTROL_PLANE_ROOT, isRegularFile, type ControlPlanePaths } from './paths.js';
+import { CONTROL_PLANE_ROOT, instanceRuntimeFile, isRegularFile, type ControlPlanePaths } from './paths.js';
 import type { Observation } from './phases.js';
 import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { readDeployedSetup } from './provision.js';
@@ -63,11 +63,17 @@ import {
   type HostStatusHelpers,
   type InstanceRuntimeConfig,
 } from './service.js';
-import { createServiceControl, type NanoclawServiceHandle, type NanoclawServiceHelpers } from './service-control.js';
+import {
+  createServiceControl,
+  runtimeServiceTarget,
+  type NanoclawServiceHandle,
+  type NanoclawServiceHelpers,
+} from './service-control.js';
 import { instanceServicePlatform } from './service-coordinates.js';
 import {
   GwsEaError,
   ingressEndpointUrl,
+  shortCommit,
   type IngressClaim,
   type InstanceReservation,
   type ReleaseCoordinates,
@@ -161,7 +167,7 @@ export const PROBE_NAMES = [
   'delivery',
 ] as const satisfies readonly (keyof AssistantProbes)[];
 
-interface OperationFacts {
+interface OperationRecordFacts {
   readonly kind: OperationKind;
   readonly phase: OperationPhase;
   readonly from: ReleaseCoordinates;
@@ -173,11 +179,11 @@ interface OperationFacts {
 /** An assistant's update or rollback, as the operation record and the registry show it. */
 export type OperationView =
   | { readonly state: 'none'; readonly abandoned_staging: boolean }
-  | ({ readonly state: 'open' } & OperationFacts & {
+  | ({ readonly state: 'open' } & OperationRecordFacts & {
         readonly continue_with: string;
         readonly revert_with: string | null;
       })
-  | ({ readonly state: 'recorded' } & OperationFacts & {
+  | ({ readonly state: 'recorded' } & OperationRecordFacts & {
         readonly follow_ups: readonly OperationFollowUp[];
         readonly abandoned_staging: boolean;
       })
@@ -333,10 +339,6 @@ class Unobservable extends Error {}
 
 const OK: ProbeResult = Object.freeze({ status: 'ok', reason: null });
 
-function short(commit: string): string {
-  return commit.slice(0, 12);
-}
-
 /** `clause` as a sentence: capitalized, ending in a full stop. */
 function sentence(clause: string): string {
   const text = clause.trim();
@@ -402,7 +404,7 @@ type RuntimeRecord =
 
 async function readRuntimeRecord(reservation: InstanceReservation): Promise<RuntimeRecord> {
   try {
-    const file = path.join(reservation.checkout_realpath, 'data', 'gws-ea', 'runtime.json');
+    const file = instanceRuntimeFile(reservation.checkout_realpath);
     return { state: 'recorded', config: await loadInstanceRuntimeConfig(file) };
     // eslint-disable-next-line no-catch-all/no-catch-all -- An unreadable runtime is reported by each probe that needs it.
   } catch (error) {
@@ -431,7 +433,7 @@ async function inspect(paths: ControlPlanePaths, reservation: InstanceReservatio
   }
 }
 
-function operationFacts(record: OperationRecord): OperationFacts {
+function operationFacts(record: OperationRecord): OperationRecordFacts {
   return {
     kind: record.kind,
     phase: record.phase,
@@ -501,23 +503,16 @@ function serviceObservation(handle: NanoclawServiceHandle): ProbeResult & Servic
 
 function observeService(
   context: ObservationContext,
-  reservation: InstanceReservation,
   runtimeRecord: RuntimeRecord,
 ): Promise<ProbeResult & ServiceFacts> {
   return probe<ServiceFacts>(
     async () => {
       if (!context.serviceHelpers) throw new Unobservable(`${LAUNCHER_REQUIRED}'s service helpers.`);
       const runtime = requireRuntime(runtimeRecord);
-      const control = createServiceControl(
-        context.serviceHelpers,
-        {
-          checkoutRoot: reservation.checkout_realpath,
-          installId: runtime.install_id,
-          homeDirectory: runtime.home_directory,
-          dockerEndpoint: runtime.docker_endpoint,
-        },
-        { platform: context.platform, uid: context.uid },
-      );
+      const control = createServiceControl(context.serviceHelpers, runtimeServiceTarget(runtime), {
+        platform: context.platform,
+        uid: context.uid,
+      });
       return serviceObservation(control.detect());
     },
     { state: 'unknown' },
@@ -769,7 +764,7 @@ async function observeRelease({ context, reservation, observers }: Subject): Pro
           deployed_commit: deployed,
           tool_commit: toolCommit,
           behind_tool_release: null,
-          reason: `The tool's checkout does not hold ${short(deployed)}, so it cannot tell.`,
+          reason: `The tool's checkout does not hold ${shortCommit(deployed)}, so it cannot tell.`,
         }
       : {
           deployed_commit: deployed,
@@ -937,7 +932,7 @@ export async function observeAssistantStatus(
     templates,
   ] = await Promise.all([
     probe<CheckoutFacts>(() => checkoutProbe(subject), { commit: null }),
-    observeService(context, reservation, runtime),
+    observeService(context, runtime),
     probe(() => hostProbe(subject), {}),
     probe(() => onecliProbe(subject), {}),
     probe<MainIdentityFacts>(() => mainIdentityProbe(subject, main), { agent_group_id: null }),
@@ -997,7 +992,7 @@ export async function listAssistants(context: ObservationContext): Promise<Assis
         readRuntimeRecord(reservation),
         removalInProgress(context.paths, reservation.instance_id),
       ]);
-      const service = await observeService(context, reservation, runtime);
+      const service = await observeService(context, runtime);
       return {
         instance_id: reservation.instance_id,
         hostname: hostnameOf(reservation.exclusive_resource_claims.ingress),
@@ -1038,14 +1033,14 @@ function operationDetail(instanceId: string, operation: OperationView, removal: 
     case 'open': {
       const revert = operation.revert_with ? `, or revert with ${operation.revert_with}` : '';
       lines.push(
-        `${sentence(operation.kind)} to ${operation.to.release_track} ${short(operation.to.deployed_commit)} is unfinished ` +
+        `${sentence(operation.kind)} to ${operation.to.release_track} ${shortCommit(operation.to.deployed_commit)} is unfinished ` +
           `(${operation.phase}); continue with ${operation.continue_with}${revert}.`,
       );
       break;
     }
     case 'recorded':
       lines.push(
-        `Its ${operation.kind} to ${short(operation.to.deployed_commit)} is recorded, with follow-ups still to run: ` +
+        `Its ${operation.kind} to ${shortCommit(operation.to.deployed_commit)} is recorded, with follow-ups still to run: ` +
           `${operation.follow_ups.map((followUp) => followUp.kind).join(', ')}; the next gws-ea update --id ${instanceId} retries them.`,
       );
       if (operation.abandoned_staging) {
@@ -1077,7 +1072,7 @@ function renderList(listing: AssistantListing): string[] {
       assistant.instance_id,
       assistant.hostname,
       assistant.track,
-      short(assistant.deployed_commit),
+      shortCommit(assistant.deployed_commit),
       assistant.service.state,
       assistant.removal_in_progress ? 'removing' : operationSummary(assistant.operation),
     ]),
@@ -1091,19 +1086,19 @@ function renderList(listing: AssistantListing): string[] {
 }
 
 function releaseLine(instanceId: string, release: ReleaseView): string {
-  const runs = `runs ${short(release.deployed_commit)}`;
+  const runs = `runs ${shortCommit(release.deployed_commit)}`;
   if (release.behind_tool_release === null || release.tool_commit === null) return `${runs}; ${release.reason ?? ''}`;
   if (release.behind_tool_release) {
-    return `${runs}; the tool's release ${short(release.tool_commit)} is newer: update it with gws-ea update --id ${instanceId}`;
+    return `${runs}; the tool's release ${shortCommit(release.tool_commit)} is newer: update it with gws-ea update --id ${instanceId}`;
   }
   return release.tool_commit === release.deployed_commit
     ? `${runs}, the tool's release`
-    : `${runs}; the tool's release ${short(release.tool_commit)} is not ahead of it`;
+    : `${runs}; the tool's release ${shortCommit(release.tool_commit)} is not ahead of it`;
 }
 
 function rollbackLine(rollback: RollbackView): string {
   if (!rollback.available || rollback.previous_commit === null) return rollback.reason ?? 'none';
-  const to = `to ${short(rollback.previous_commit)}`;
+  const to = `to ${shortCommit(rollback.previous_commit)}`;
   if (rollback.schema_moved === null) return `${to}; whether the schema moved is unknown: ${rollback.reason ?? ''}`;
   return rollback.schema_moved
     ? `${to}: the schema moved, so it restores the pre-update snapshot`
@@ -1113,7 +1108,7 @@ function rollbackLine(rollback: RollbackView): string {
 function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes, timezone: string): string {
   switch (name) {
     case 'checkout':
-      return probes.checkout.commit ? `at ${short(probes.checkout.commit)}` : '';
+      return probes.checkout.commit ? `at ${shortCommit(probes.checkout.commit)}` : '';
     case 'service':
       return probes.service.state;
     case 'main_identity':

@@ -34,7 +34,7 @@ import {
   reserveInstance,
   type InstanceOperation,
 } from './journal.js';
-import { inspectOperation, readOperationRecord, type OperationInspection } from './operation.js';
+import { inspectOperation, readOperationRecord, revertClause, type OperationInspection } from './operation.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { ProvisionHumanPause, ProvisionResult, ProvisionRuntime } from './phases.js';
 import { holdLoopbackPorts, type HeldLoopbackPorts } from './ports.js';
@@ -99,6 +99,7 @@ import {
 import {
   GwsEaError,
   sameRelease,
+  shortCommit,
   type AllocatedPorts,
   type GwsEaErrorDetails,
   type InstanceReservationInput,
@@ -1084,7 +1085,7 @@ class Cli {
 }
 
 function releaseName(release: ReleaseCoordinates): string {
-  return `${release.release_track} ${release.deployed_commit.slice(0, 12)}`;
+  return `${release.release_track} ${shortCommit(release.deployed_commit)}`;
 }
 
 /**
@@ -1259,9 +1260,8 @@ function operationNote(inspection: OperationInspection): string | undefined {
       return undefined;
     case 'open': {
       const { record, next } = inspection;
-      const revert = next.revertWith ? `, or revert it with ${next.revertWith}` : '';
       const subject = record.kind === 'update' ? 'An update' : 'A rollback';
-      return `${subject} of this assistant is unfinished (${record.phase}); continue it with ${next.continueWith}${revert}.`;
+      return `${subject} of this assistant is unfinished (${record.phase}); continue it with ${next.continueWith}${revertClause(next)}.`;
     }
     case 'unreadable':
       return `This assistant's update or rollback record cannot be read: ${inspection.message}`;

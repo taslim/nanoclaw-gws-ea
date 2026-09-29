@@ -3,7 +3,7 @@
  * leaves it, to the release its update kept. Git, SQLite, and the files are
  * real; the service manager, Docker, `ps`, `lsof`, the release's scripts, the
  * host's status and listener, OneCLI, and `ncl` are faked at their boundaries
- * (see `cutover-fixture.ts`).
+ * (see `testing/cutover-fixture.ts`).
  */
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
@@ -49,7 +49,7 @@ import {
   type Machine,
   type Release,
   type World,
-} from './cutover-fixture.js';
+} from './testing/cutover-fixture.js';
 import { acquireInstanceOperation } from './journal.js';
 import { readOperationRecord, type OperationPhase, type OperationRecord } from './operation.js';
 import { instanceMarkerFile } from './paths.js';

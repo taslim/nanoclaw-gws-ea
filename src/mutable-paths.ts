@@ -5,5 +5,3 @@
  * everything else in a checkout belongs to the release.
  */
 export const MUTABLE_PATHS = ['.env', 'data', 'groups', 'store', 'start-nanoclaw.sh', 'nanoclaw.pid'] as const;
-
-export type MutablePath = (typeof MUTABLE_PATHS)[number];
