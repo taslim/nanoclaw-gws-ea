@@ -73,6 +73,8 @@ export interface NanoclawServiceHelpers {
 
 /** The one assistant a service control acts on, as its runtime records it. */
 export interface ServiceControlTarget {
+  /** Its instance ID, which the commands its refusals name take. */
+  readonly instanceId: string;
   /** The live checkout the service runs from. */
   readonly checkoutRoot: string;
   /** NanoClaw's install slug: the instance ID without dashes. */
@@ -83,9 +85,13 @@ export interface ServiceControlTarget {
 
 /** The service a created assistant's own runtime record names (R18). */
 export function runtimeServiceTarget(
-  runtime: Pick<InstanceRuntimeConfig, 'checkout_realpath' | 'install_id' | 'home_directory' | 'docker_endpoint'>,
+  runtime: Pick<
+    InstanceRuntimeConfig,
+    'instance_id' | 'checkout_realpath' | 'install_id' | 'home_directory' | 'docker_endpoint'
+  >,
 ): ServiceControlTarget {
   return {
+    instanceId: runtime.instance_id,
     checkoutRoot: runtime.checkout_realpath,
     installId: runtime.install_id,
     homeDirectory: runtime.home_directory,
@@ -192,7 +198,10 @@ export function createServiceControl(
   /** Starting needs the service NanoClaw installed; resume installs a missing one. */
   const installed = (handle: NanoclawServiceHandle): NanoclawServiceHandle => {
     if (handle.mode !== 'none') return handle;
-    throw new GwsEaError('service_not_installed', `No NanoClaw service is installed for ${root}; resume installs it.`);
+    throw new GwsEaError(
+      'service_not_installed',
+      `No NanoClaw service is installed for ${root}; gws-ea resume --id ${target.instanceId} installs it.`,
+    );
   };
 
   const stopUntilGone = async (handle: NanoclawServiceHandle): Promise<void> => {

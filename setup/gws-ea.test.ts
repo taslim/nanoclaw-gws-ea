@@ -45,7 +45,9 @@ const fixture = vi.hoisted(() => {
     log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), message: vi.fn(), step: vi.fn() },
     note: vi.fn(),
     password: vi.fn(async () => 'fresh-cloudflare-token'),
-    confirm: vi.fn(async () => true),
+    confirm: vi.fn(async (): Promise<boolean | symbol> => true),
+    /** What clack's prompts return when the operator presses Ctrl-C or Esc. */
+    cancel: Symbol('clack:cancel'),
     ensurePrerequisites: vi.fn(async () => ({ account: 'operator@example.com' })),
     signIn: vi.fn(async () => undefined),
     confirmAccount: vi.fn(async () => true),
@@ -60,7 +62,7 @@ vi.mock('@clack/prompts', () => ({
   password: fixture.password,
   confirm: fixture.confirm,
   spinner: () => fixture.spinner,
-  isCancel: () => false,
+  isCancel: (value: unknown) => value === fixture.cancel,
 }));
 vi.mock('../src/gws-ea/cli.js', () => ({ runCli: fixture.runCli }));
 vi.mock('./gws-ea-input.js', () => ({
@@ -269,8 +271,9 @@ describe('GWS-EA driver', () => {
       allowAmbientConfiguration: false,
     });
     expect(setup.credentialMetadata('opencode')).toBeUndefined();
-    // Without a TTY nobody can be asked, so an update, and a rollback's snapshot restore, need --yes.
+    // Without a TTY nobody can be asked, so an update, update --all, and a rollback's snapshot restore, need --yes.
     expect(runtime.confirmUpdate).toBeUndefined();
+    expect(runtime.confirmUpdateAll).toBeUndefined();
     expect(runtime.confirmRollback).toBeUndefined();
   });
 
@@ -298,6 +301,37 @@ describe('GWS-EA driver', () => {
       message: `Update assistant x to dogfood ${'b'.repeat(12)}?`,
       initialValue: false,
     });
+  });
+
+  it('asks once before update --all on a TTY, naming how many assistants and the release, defaulting to wait', async () => {
+    await main(['update', '--all'], { interactive: true });
+    fixture.confirm.mockResolvedValueOnce(false);
+    const plan = {
+      toolCommit: 'c'.repeat(40),
+      candidates: [
+        { instanceId: 'x', eligible: true },
+        { instanceId: 'y', eligible: false, reason: 'It is stopped.' },
+        { instanceId: 'z', eligible: true },
+      ],
+    };
+
+    await expect(runtimeOf().confirmUpdateAll!(plan as never)).resolves.toBe(false);
+
+    expect(fixture.confirm).toHaveBeenCalledExactlyOnceWith({
+      message: `Update 2 assistants to this tool's release ${'c'.repeat(12)}, as planned above?`,
+      initialValue: false,
+    });
+  });
+
+  it('takes Ctrl-C or Esc at an update prompt as a no', async () => {
+    await main(['update', '--all'], { interactive: true });
+    const { confirmUpdate, confirmUpdateAll } = runtimeOf();
+    const preview = { instanceId: 'x', to: { release_track: 'dogfood', deployed_commit: 'b'.repeat(40) } };
+    const plan = { toolCommit: 'c'.repeat(40), candidates: [{ instanceId: 'x', eligible: true }] };
+    fixture.confirm.mockResolvedValueOnce(fixture.cancel).mockResolvedValueOnce(fixture.cancel);
+
+    await expect(confirmUpdate!(preview as never)).resolves.toBe(false);
+    await expect(confirmUpdateAll!(plan as never)).resolves.toBe(false);
   });
 
   it('asks before removal on a TTY, defaulting to keep the assistant', async () => {
@@ -368,7 +402,8 @@ describe('GWS-EA terminal presenter', () => {
 
 describe("GWS-EA service control through NanoClaw's helpers", () => {
   // The helpers the driver wires, with only their command runner faked: no real launchctl or systemctl runs.
-  const INSTALL_ID = '0123456789abcdef0123456789abcdef';
+  const INSTANCE_ID = '01234567-89ab-cdef-0123-456789abcdef';
+  const INSTALL_ID = INSTANCE_ID.replaceAll('-', '');
   const UID = 501;
   const homes: string[] = [];
 
@@ -397,6 +432,7 @@ describe("GWS-EA service control through NanoClaw's helpers", () => {
     await mkdir(path.dirname(coordinates.serviceDefinitionPath), { recursive: true });
     await writeFile(coordinates.serviceDefinitionPath, 'definition\n');
     const target: ServiceControlTarget = {
+      instanceId: INSTANCE_ID,
       checkoutRoot: path.join(home, 'nanoclaw'),
       installId: INSTALL_ID,
       homeDirectory: home,
@@ -549,6 +585,7 @@ describe("GWS-EA service control through NanoClaw's helpers", () => {
     const service = createServiceControl(
       await wiredHelpers(runner),
       {
+        instanceId: INSTANCE_ID,
         checkoutRoot: path.join(home, 'a', 'nanoclaw'),
         installId: INSTALL_ID,
         homeDirectory: home,

@@ -13,6 +13,7 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { finishFollowUps, restoredReleaseRoot } from './cutover.js';
+import type { RunEvent } from './events.js';
 import {
   ADDED_MIGRATION,
   applying,
@@ -44,6 +45,7 @@ import {
   runtimeCommit,
   SESSION,
   snapshot,
+  SQLITE_HEADER,
   stampedPersona,
   status,
   temporaryRoot,
@@ -230,8 +232,8 @@ function forgottenImages(state: World, runtime: InstanceRuntimeConfig, record: O
  * The assistant once a rollback from `next` to the machine's first release is
  * recorded and finished: every record names the first release, the release
  * left is kept whole in `outgoing/`, `:latest` is the first release's image
- * again and the one the update built is gone, and nothing is kept to roll
- * back to or left open.
+ * again and the one the update built is gone, no `:previous` tag is left
+ * naming it, and nothing is kept to roll back to or left open.
  */
 async function expectRolledBack(
   host: Machine,
@@ -264,6 +266,7 @@ async function expectRolledBack(
   const base = imageBase(runtime);
   expect(state.tags.get(`${base}:latest`)).toBe(ran);
   expect(state.tags.has(`${base}:next`)).toBe(false);
+  expect(state.tags.has(`${base}:previous`)).toBe(false);
   expect(repositoryImages(state, base).untagged).toEqual([]);
   expect(state.running).toBe(true);
   // Status: the previous commit is live, nothing is open, and no rollback is left.
@@ -271,6 +274,16 @@ async function expectRolledBack(
   expect(observed.operation).toEqual({ state: 'none', abandoned_staging: false });
   expect(observed.rollback).toMatchObject({ available: false, previous_commit: null });
   expect(observed.registry).toMatchObject({ deployed_commit: host.first });
+}
+
+/** Leave every agent group on the base image, so none has an image of its own to rebuild. */
+function withoutGroupImages(checkout: string): void {
+  const database = new Database(path.join(checkout, 'data', 'v2.db'));
+  try {
+    database.prepare('UPDATE container_configs SET image_tag = NULL').run();
+  } finally {
+    database.close();
+  }
 }
 
 /** Start a rollback and abandon it at `state.hangAt` or the swap's rename `state.renameKill`, as if killed there. */
@@ -331,6 +344,35 @@ describe('gws-ea rollback of an update that moved no schema (AE6)', GIT_HEAVY, (
     ]);
   });
 
+  it('reports its stop once, and names the checks before the swap and the start that it is still stopped', async () => {
+    const { host, runtime, next, state } = await updatedAssistant();
+    const started: Array<readonly [string, string | undefined]> = [];
+    const deps = {
+      ...dependencies(state, next, runtime),
+      reporter: {
+        emit: (event: RunEvent) => {
+          if (event.type === 'step-started') started.push([event.step, event.label]);
+        },
+      },
+    };
+    const operation = await acquireInstanceOperation(host.paths, runtime.instance_id, { command: 'rollback' });
+    if (!operation) throw new Error('The test instance operation was busy');
+    try {
+      expect(await rollBack(operation, deps, { present: () => undefined })).toMatchObject({ kind: 'rolled_back' });
+    } finally {
+      operation.release();
+    }
+
+    // One stop step throughout; the checks that no host started since read as what they are.
+    expect(started.filter(([step]) => ['stop_host', 'swap_releases', 'move_images'].includes(step))).toEqual([
+      ['stop_host', 'Stopping the assistant for the rollback…'],
+      ['stop_host', 'Making sure the assistant is still stopped…'],
+      ['swap_releases', 'Switching to the previous release…'],
+      ['stop_host', 'Making sure the assistant is still stopped…'],
+      ['move_images', "Moving the assistant's images back…"],
+    ]);
+  });
+
   it('carries the state whole: stale side files beside the kept release never replay onto what it takes over', async () => {
     const { host, runtime, next, state, images } = await updatedAssistant();
     const id = runtime.instance_id;
@@ -362,6 +404,27 @@ describe('gws-ea rollback of an update that moved no schema (AE6)', GIT_HEAVY, (
     const setAside = path.join(host.paths.releaseRoot(id, 'outgoing'), 'restored', 'state');
     expect(await exists(path.join(setAside, 'data', 'v2.db-wal'))).toBe(true);
     expect(messages(setAside)).toEqual(['m1']);
+  });
+
+  it('never opens a file an agent planted beside a -journal or -wal, even with SQLite’s header, and carries it back as it is', async () => {
+    const { host, runtime, next, state, images } = await updatedAssistant();
+    const session = path.join(runtime.checkout_realpath, SESSION);
+    // SQLite's header and nothing a database holds: SQLite would delete each side file as it refused the file.
+    const planted = {
+      'evil.db': SQLITE_HEADER,
+      'evil.db-journal': 'Not a journal.\n',
+      'forged.db': `${SQLITE_HEADER}${'junk'.repeat(256)}`,
+      'forged.db-wal': 'Not a log.\n',
+    };
+    for (const [file, contents] of Object.entries(planted)) await writeFile(path.join(session, file), contents);
+
+    expect(await cli(host, state, next, runtime).run(['rollback', '--id', runtime.instance_id, '--yes'])).toBe(0);
+
+    await expectRolledBack(host, runtime, next, state, images.first);
+    for (const [file, contents] of Object.entries(planted)) {
+      expect(await readFile(path.join(session, file), 'utf8'), file).toBe(contents);
+    }
+    expect(messages(runtime.checkout_realpath)).toEqual(['m1']);
   });
 });
 
@@ -658,11 +721,13 @@ describe('after a rollback', GIT_HEAVY, () => {
     const id = runtime.instance_id;
     const { run, err } = cli(host, state, next, runtime);
     expect(await run(['rollback', '--id', id, '--yes'])).toBe(0);
+    expect(state.tags.has(`${imageBase(runtime)}:previous`)).toBe(false);
 
     expect(await run(['rollback', '--id', id, '--yes'])).toBe(1);
     expect(err.join('\n')).toContain(`Assistant ${id} keeps no previous release`);
     expect(await exists(host.paths.releaseRoot(id, 'outgoing'))).toBe(true);
 
+    // With no `:previous` tag to displace, the next update's retag still keeps the image the assistant ran.
     expect(await run(['update', '--id', id, '--yes'])).toBe(0);
 
     expect(commitOf(runtime.checkout_realpath)).toBe(next.commit);
@@ -671,6 +736,41 @@ describe('after a rollback', GIT_HEAVY, () => {
     expect(await readOperationRecord(host.paths, id)).toBeUndefined();
     expect(state.tags.get(`${imageBase(runtime)}:previous`)).toBe(images.first);
     expect(repositoryImages(state, imageBase(runtime)).untagged).toEqual([]);
+  });
+
+  it('drops the :previous tag of one recorded with nothing else to follow up, and rollback finishes a drop cut short', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const id = runtime.instance_id;
+    withoutGroupImages(runtime.checkout_realpath);
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    const base = imageBase(runtime);
+    const ran = state.tags.get(`${base}:latest`)!;
+    // Nothing the agent image is built from changed, so the update's build gives back the image the assistant runs.
+    state.cachedBuild = true;
+    expect(await cli(host, state, next, runtime).run(['update', '--id', id, '--yes'])).toBe(0);
+    expect([state.tags.get(`${base}:latest`), state.tags.get(`${base}:previous`)]).toEqual([ran, ran]);
+    state.hangAt = 'untag';
+
+    await killDuringRollback(host, runtime, state, next);
+
+    // Recorded with nothing else to follow up, it left no record: only its tag says it is unfinished.
+    expect(await readOperationRecord(host.paths, id)).toBeUndefined();
+    expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, host.first));
+    expect(state.tags.get(`${base}:previous`)).toBe(ran);
+    delete state.hangAt;
+    const { run, out, err } = cli(host, state, next, runtime);
+
+    expect(await run(['rollback', '--id', id, '--yes'])).toBe(0);
+
+    expect(out).toContain(`Assistant ${id} runs dogfood ${host.first.slice(0, 12)}; its rollback is finished.`);
+    expect(state.tags.has(`${base}:previous`)).toBe(false);
+    expect(state.tags.get(`${base}:latest`)).toBe(ran);
+    expect(state.ids.has(ran)).toBe(true);
+    // Finished, it refuses again, as any assistant that keeps nothing to roll back to does.
+    expect(await run(['rollback', '--id', id, '--yes'])).toBe(1);
+    expect(err.join('\n')).toContain(`Assistant ${id} keeps no previous release`);
   });
 });
 
@@ -869,6 +969,7 @@ const KILLS: ReadonlyArray<readonly [string, (state: World) => void, OperationPh
   ['after the swap, while moving images', (state) => (state.hangAt = 'retag'), 'swapped'],
   ['after the start, while verifying', (state) => (state.hangAt = 'verify'), 'started'],
   ['once recorded, while rebuilding group images', (state) => (state.hangAt = 'rebuild'), 'recorded'],
+  ['once recorded, while dropping the :previous tag it leaves', (state) => (state.hangAt = 'untag'), 'recorded'],
 ];
 
 describe('a rollback killed partway', GIT_HEAVY, () => {
@@ -1331,6 +1432,7 @@ describe('rollback isolation (AE3)', GIT_HEAVY, () => {
     const { runtime: a, next, state } = await updatedAssistant({}, 37_001, host);
     const bLatest = imageId();
     state.tags.set(`${imageBase(b)}:latest`, bLatest);
+    state.tags.set(`${imageBase(b)}:previous`, bLatest);
     state.ids.add(bLatest);
     state.commands.length = 0;
     state.serviceCalls.length = 0;
@@ -1360,6 +1462,7 @@ describe('rollback isolation (AE3)', GIT_HEAVY, () => {
     expect(await getInstanceReservation(host.paths, b.instance_id)).toEqual(bRegistered);
     expect(await snapshot(host.paths.instanceRoot(b.instance_id))).toEqual(bFiles);
     expect(state.tags.get(`${imageBase(b)}:latest`)).toBe(bLatest);
+    expect(state.tags.get(`${imageBase(b)}:previous`)).toBe(bLatest);
   });
 });
 

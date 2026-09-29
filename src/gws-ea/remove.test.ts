@@ -1520,6 +1520,33 @@ describe('removal after an update or rollback', () => {
     },
   );
 
+  it('removes what a finished rollback leaves: the release it left, and a repository with no :previous tag', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(paths), {
+      started: ['materialize_checkout', 'start_nanoclaw'],
+    });
+    const repository = repositoryOf(input);
+    // Recorded with nothing left to follow up, and its cleanup dropped `:previous`: only `:latest` names the image.
+    await rolledBackAt(paths, input, 'recorded', { followUps: [] });
+    expect(await exists(paths.operationFile(input.instance_id))).toBe(false);
+    expect(await exists(paths.releaseRoot(input.instance_id, 'previous'))).toBe(false);
+    const docker = new FakeDocker()
+      .image(imageId('2'), `${repository}:latest`)
+      .image(imageId('3'), `${repository}:${AGENT_GROUP}`);
+    const reservation = (await readRegistry(paths)).instances[input.instance_id]!;
+    const { uninstallNanoclaw: _fake, ...dependencies } = world(reservation).dependencies;
+
+    const outcome = await removeAssistant(paths, input.instance_id, {
+      ...dependencies,
+      runCommand: teardownCommands(docker),
+      serviceHelpers: nanoclawService([], { mode: 'none', active: false }),
+    });
+
+    expect(outcome.removed).toEqual(['nanoclaw', 'instance-files']);
+    expect([...docker.images.keys()]).toEqual([]);
+    await expectGone(paths, reservation);
+  });
+
   it.each(RELEASE_SLOTS)('refuses before any effect when its %s release carries another assistant', async (slot) => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput(paths), {

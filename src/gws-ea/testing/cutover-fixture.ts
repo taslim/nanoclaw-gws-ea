@@ -100,6 +100,8 @@ export const PROVIDER_SETUP: ToolProviderSetup = {
   credentialMetadata: (provider) => (provider === 'claude' ? CREDENTIAL : undefined),
 };
 export const SESSION = path.join('data', 'v2-sessions', 'ag-main', 'session-1');
+/** The 16 bytes every SQLite database begins with, which a file an agent writes can begin with too. */
+export const SQLITE_HEADER = 'SQLite format 3\0';
 export const MEMORY = path.join('groups', 'main', 'CLAUDE.local.md');
 /** Main's template in a release, main's folder, the plugin stamped into it, and the files that plugin stamps. */
 export const MAIN_TEMPLATE_DIR = path.join('templates', 'gws-ea', 'main');
@@ -502,7 +504,8 @@ export function applying(...names: readonly string[]): Migrate {
 /**
  * Where an update is killed: the boundary call it never returns from. At
  * `restamp` the host finished restamping main's template; at
- * `restamp-partway` it had replaced only the plugin.
+ * `restamp-partway` it had replaced only the plugin. At `untag` a rollback's
+ * cleanup is removing the `:previous` tag it leaves.
  */
 export type HangPoint =
   | 'build'
@@ -514,7 +517,8 @@ export type HangPoint =
   | 'verify'
   | 'rebuild'
   | 'restamp'
-  | 'restamp-partway';
+  | 'restamp-partway'
+  | 'untag';
 
 /** What every faked boundary holds, and what reached it. */
 export interface World {
@@ -734,6 +738,7 @@ export function runner(state: World): SanitizedCommandRunner {
         return { stdout: '', stderr: '' };
       }
       if (first === 'image' && second === 'rm') {
+        if (last.endsWith(':previous')) await hang(state, 'untag');
         removeImage(state, last);
         return { stdout: '', stderr: '' };
       }

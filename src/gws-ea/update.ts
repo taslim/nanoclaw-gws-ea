@@ -45,6 +45,7 @@ import {
   finishFollowUps,
   finishSwap,
   imageIdOf,
+  keepCutoverHostStopped,
   nextAgentImage,
   openCutoverHost,
   planFollowUps,
@@ -151,6 +152,12 @@ export interface UpdateRequest {
   readonly track?: string;
   /** `--source-remote`: the assistant's recorded source remote unless given (KTD4). */
   readonly sourceRemote?: string;
+  /**
+   * `update --all`'s release: the tool's commit when the run began. A tool
+   * checkout that has moved off it since is refused before anything is
+   * staged, so one run never deploys two releases. `update --id` pins none.
+   */
+  readonly expectedToolCommit?: string;
 }
 
 /** Boundary seams; each defaults to the real one. */
@@ -226,7 +233,8 @@ function checkoutRuntime(seams: UpdateSeams): CheckoutRuntime {
 /**
  * The release `update` would deploy: the tool's own commit, on the track the
  * operator names or the assistant's own, from the source remote the operator
- * names or the assistant's recorded one.
+ * names or the assistant's recorded one. A request pinned to a commit the
+ * tool's checkout has since moved off is refused.
  */
 export async function resolveUpdateIntent(
   paths: ControlPlanePaths,
@@ -236,7 +244,17 @@ export async function resolveUpdateIntent(
   const reservation = await getInstanceReservation(paths, request.instanceId);
   const track = request.track ?? reservation.release_track;
   const source = resolveReleaseSource(track, request.sourceRemote ?? reservation.source_remote);
-  const commit = await resolveToolCommit(seams.toolRoot ?? CONTROL_PLANE_ROOT, checkoutRuntime(seams));
+  const toolRoot = seams.toolRoot ?? CONTROL_PLANE_ROOT;
+  const commit = await resolveToolCommit(toolRoot, checkoutRuntime(seams));
+  const expected = request.expectedToolCommit;
+  if (expected !== undefined && commit !== expected) {
+    throw new GwsEaError(
+      'tool_checkout_moved',
+      `gws-ea's checkout ${toolRoot} moved from ${shortCommit(expected)} to ${shortCommit(commit)} while update --all ran, ` +
+        `so assistant ${request.instanceId} was not updated: one run deploys only the release it started with, ${shortCommit(expected)}. ` +
+        `Run gws-ea update --all again to update to ${shortCommit(commit)}.`,
+    );
+  }
   return {
     instanceId: request.instanceId,
     track,
@@ -1037,7 +1055,7 @@ async function stopAndCarry(cutover: Cutover, record: OperationRecord): Promise<
 async function swapReleases(cutover: Cutover): Promise<OperationRecord> {
   const { operation, reporter, reservation, dependencies } = cutover;
   const { paths, instanceId } = operation;
-  await stopCutoverHost(cutover, STOP_LABEL);
+  await keepCutoverHostStopped(cutover);
   await runStep(reporter, { id: 'swap_releases', label: 'Switching to the new release…' }, async () => {
     // Between the two renames the outgoing release is no longer at the live path, but in previous/.
     const outgoing = (await exists(reservation.checkout_realpath))
@@ -1114,7 +1132,7 @@ async function gatewayChanged(cutover: Cutover, pins: OnecliPins): Promise<boole
  */
 async function startRelease(cutover: Cutover, record: OperationRecord): Promise<OperationRecord> {
   const { operation, reporter } = cutover;
-  await stopCutoverHost(cutover, STOP_LABEL);
+  await keepCutoverHostStopped(cutover);
   await runStep(reporter, { id: 'move_images', label: "Moving the assistant's images to the new release…" }, () =>
     moveAgentImages(cutover, record),
   );

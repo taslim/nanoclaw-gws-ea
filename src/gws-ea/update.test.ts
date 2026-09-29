@@ -9,10 +9,12 @@
  * release's install, build, migration, and tripwire scripts, the host's
  * status and listener, OneCLI, and `ncl` are faked at their boundaries.
  */
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
 import { lstat, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -58,6 +60,7 @@ import {
   runtimeCommit,
   SESSION,
   snapshot,
+  SQLITE_HEADER,
   stampedPersona,
   status,
   temporaryRoot,
@@ -1247,6 +1250,133 @@ describe('gws-ea update', GIT_HEAVY, () => {
     // The release stamps what main was stamped with, so main is not restamped.
     expect(state.restamps).toEqual([]);
     expect(await readFile(path.join(live, PERSONA), 'utf8')).toBe(stampedPersona('1'));
+  });
+
+  it('reports its stop once, and names the checks before the swap and the start that it is still stopped', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    const started: Array<readonly [string, string | undefined]> = [];
+    const deps: UpdateDependencies = {
+      ...dependencies(state, next, runtime),
+      reporter: {
+        emit: (event) => {
+          if (event.type === 'step-started') started.push([event.step, event.label]);
+        },
+      },
+    };
+    const intent = await resolveUpdateIntent(host.paths, { instanceId: runtime.instance_id }, deps);
+    const operation = await acquireInstanceOperation(host.paths, runtime.instance_id, {
+      command: 'update',
+      target: intent.target,
+    });
+    if (!operation) throw new Error('The test instance operation was busy');
+    try {
+      await confirmStagedUpdate(operation, await prepareUpdate(operation, intent, deps), deps, async () => true);
+      await continueUpdate(operation, deps);
+    } finally {
+      operation.release();
+    }
+
+    // One stop step throughout; the checks that no host started since read as what they are.
+    expect(started.filter(([step]) => ['stop_host', 'swap_releases', 'move_images'].includes(step))).toEqual([
+      ['stop_host', 'Stopping the assistant for the switch…'],
+      ['stop_host', 'Making sure the assistant is still stopped…'],
+      ['swap_releases', 'Switching to the new release…'],
+      ['stop_host', 'Making sure the assistant is still stopped…'],
+      ['move_images', "Moving the assistant's images to the new release…"],
+    ]);
+  });
+
+  it('never opens a file an agent planted beside a -journal or -wal, header or not, and carries it as it is', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    await converse(runtime, 'm1');
+    const session = path.join(runtime.checkout_realpath, SESSION);
+    // Named as databases are, with side files beside them, but no SQLite database: opened, they would fail the
+    // cutover. The last two even begin with SQLite's header, and SQLite deletes such a file's side file as it
+    // refuses it.
+    const planted = {
+      'notes.db': 'Notes an agent keeps.\n',
+      'notes.db-journal': 'Not a journal.\n',
+      'scratch.db': '',
+      'scratch.db-wal': 'Not a log.\n',
+      'evil.db': SQLITE_HEADER,
+      'evil.db-journal': 'Not a journal.\n',
+      'forged.db': `${SQLITE_HEADER}${'junk'.repeat(256)}`,
+      'forged.db-wal': 'Not a log.\n',
+    };
+    for (const [file, contents] of Object.entries(planted)) await writeFile(path.join(session, file), contents);
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    const ran = state.tags.get(`${imageBase(runtime)}:latest`)!;
+
+    expect(await cli(host, state, next, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
+
+    await expectUpdated(host, runtime, next, state, ran);
+    for (const [file, contents] of Object.entries(planted)) {
+      expect(await readFile(path.join(session, file), 'utf8'), file).toBe(contents);
+    }
+    expect(messages(runtime.checkout_realpath)).toEqual(['m1']);
+  });
+
+  it('refuses the cutover when a session mailbox it owns cannot be settled, naming it, and serves the old release again', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    await converse(runtime, 'm1');
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    const live = runtime.checkout_realpath;
+    const inbound = path.join(live, SESSION, 'inbound.db');
+    const forged = `${SQLITE_HEADER}${'junk'.repeat(256)}`;
+    const id = runtime.instance_id;
+    // Corrupted once the release is staged, as the preview waits: only the settle after the stop meets it.
+    const { run, err } = cli(host, state, next, runtime, {
+      confirmUpdate: async () => {
+        writeFileSync(inbound, forged);
+        writeFileSync(`${inbound}-journal`, 'Not a journal.\n');
+        return true;
+      },
+    });
+
+    expect(await run(['update', '--id', id])).toBe(1);
+
+    const summary = err.join('\n');
+    expect(summary).toContain(`${inbound} is not a database SQLite can open (SQLITE_NOTADB: file is not a database)`);
+    expect(summary).toContain(`gws-ea update --id ${id}`);
+    expect(state.running).toBe(true);
+    expect((await readOperationRecord(host.paths, id))?.phase).toBe('staged');
+    expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, host.first));
+    expect(git(live, 'rev-parse', 'HEAD')).toBe(host.first);
+    expect(await exists(host.paths.releaseRoot(id, 'previous'))).toBe(false);
+  });
+
+  it("never opens a pipe planted at a mailbox's name beside a -journal, which would wait for a writer forever", async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    await converse(runtime, 'm1');
+    const pipe = path.join(runtime.checkout_realpath, SESSION, 'outbound.db');
+    execFileSync('mkfifo', [pipe]);
+    await writeFile(`${pipe}-journal`, 'Not a journal.\n');
+    // A writer waiting on the pipe: whatever opens it to read is let go at once instead of hanging the test, and
+    // the writer, done, exits.
+    const writer = spawn('sh', ['-c', 'printf x > "$0"', pipe], { stdio: 'ignore' });
+    const exited = new Promise<'exited'>((resolve) => writer.once('exit', () => resolve('exited')));
+    try {
+      const next = await nextRelease(host);
+      const state = world(runtime);
+      const ran = state.tags.get(`${imageBase(runtime)}:latest`)!;
+
+      expect(await cli(host, state, next, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
+
+      await expectUpdated(host, runtime, next, state, ran);
+      expect(messages(runtime.checkout_realpath)).toEqual(['m1']);
+      // Nothing opened the pipe: its writer still waits.
+      expect(await Promise.race([exited, delay(250).then(() => 'waiting' as const)])).toBe('waiting');
+    } finally {
+      writer.kill();
+    }
   });
 
   it('moves the assistant to another track and repository that holds the release, and rollback moves it back (AE1)', async () => {
