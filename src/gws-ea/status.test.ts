@@ -17,7 +17,15 @@ import { writePrivate } from '../community-portal/private-file.js';
 import { acquireInstanceOperation, recordPrincipalSelection, reserveInstance } from './journal.js';
 import { createOnecliRuntimeLayout, renderOnecliCompose } from './onecli-compose.js';
 import { wrapperImageTag } from './onecli-gateway-image.js';
-import { advanceOperation, beginOperation, type SnapshotManifest } from './operation.js';
+import {
+  advanceOperation,
+  beginOperation,
+  commitOperationRelease,
+  type OperationFollowUp,
+  type OperationIntent,
+  type OperationKind,
+  type SnapshotManifest,
+} from './operation.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { PRESENT } from './phases.js';
 import type { PrincipalCandidate } from './principal.js';
@@ -245,6 +253,24 @@ async function updateStoppedAt(paths: ControlPlanePaths, reservation: InstanceRe
   try {
     await beginOperation(operation, { kind: 'update', from: releaseOf(reservation), to });
     await advanceOperation(operation, 'stopped', { stop: { at: NOW.toISOString(), graceful: true } });
+  } finally {
+    operation.release();
+  }
+}
+
+/** An update or rollback to `to` whose release is recorded, with `followUp` still to run. */
+async function recordedWith(
+  paths: ControlPlanePaths,
+  reservation: InstanceReservation,
+  { kind, to, followUp }: { kind: OperationKind; to: ReleaseCoordinates; followUp: OperationFollowUp },
+): Promise<void> {
+  const intent: OperationIntent = kind === 'update' ? { command: 'update', target: to } : { command: 'rollback' };
+  const operation = await acquireInstanceOperation(paths, reservation.instance_id, intent);
+  if (!operation) throw new Error('The test instance operation was busy');
+  try {
+    await beginOperation(operation, { kind, from: releaseOf(reservation), to, follow_ups: [followUp] });
+    await advanceOperation(operation, 'verified', { stop: { at: NOW.toISOString(), graceful: true } });
+    await commitOperationRelease(operation);
   } finally {
     operation.release();
   }
@@ -714,6 +740,25 @@ describe('status', () => {
       'Templates: customized, kept by updates: instructions.prepend.md (changed), task Weekly review (changed)',
     );
     expect(output.stderr).toEqual([]);
+  });
+
+  it.each([
+    ['update', { kind: 'refresh_template' }],
+    ['rollback', { kind: 'reverse_template_restamp' }],
+  ] as const)("names a recorded %s's own command as the one that retries its follow-ups", async (kind, followUp) => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const to: ReleaseCoordinates = { ...releaseOf(reservation), deployed_commit: 'c'.repeat(40) };
+    await recordedWith(host.paths, reservation, { kind, to, followUp });
+    const { runtime, output } = command(host, world(reservation));
+
+    expect(await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false })).toBe(0);
+
+    // After a rollback, update --id would go on to stage a new update rather than only retry its follow-ups.
+    expect(output.stdout).toContain(
+      `  Operation: Its ${kind} to ${'c'.repeat(12)} is recorded, with follow-ups still to run: ${followUp.kind}; ` +
+        `the next gws-ea ${kind} --id ${reservation.instance_id} retries them.`,
+    );
   });
 
   it('refuses an unknown assistant ID with exit code 1', async () => {

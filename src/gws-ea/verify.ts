@@ -159,14 +159,19 @@ function isClosedWalDatabase(file: string): boolean {
  * has open holds every committed page in its main file, so it is read from an
  * in-memory copy marked as a rollback-journal database, which SQLite reads
  * without side files. One a writer has open already has its side files, and
- * is read in place.
+ * is read in place. So is one a writer opened while it was copied: that
+ * writer's `-wal` holds commits the copied main file may lack.
  */
 function openReadonly(file: string): Database.Database {
   try {
-    if (!isClosedWalDatabase(file)) return new Database(file, { readonly: true, fileMustExist: true });
-    const contents = readFileSync(file);
-    for (const offset of FORMAT_VERSION_OFFSETS) contents[offset] = ROLLBACK_FORMAT;
-    return new Database(contents, { readonly: true });
+    if (isClosedWalDatabase(file)) {
+      const contents = readFileSync(file);
+      if (!existsSync(`${file}-wal`)) {
+        for (const offset of FORMAT_VERSION_OFFSETS) contents[offset] = ROLLBACK_FORMAT;
+        return new Database(contents, { readonly: true });
+      }
+    }
+    return new Database(file, { readonly: true, fileMustExist: true });
   } catch {
     throw new GwsEaError('verification_state_missing', 'Required instance message state is missing');
   }

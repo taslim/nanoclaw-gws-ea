@@ -489,7 +489,7 @@ describe('read-only observation', () => {
     expect(await indexState(checkout)).not.toEqual(before);
   });
 
-  it('accepts only the commits the live checkout may hold, and refuses a tracked edit', async () => {
+  it('accepts only the commits the live checkout may hold, and refuses a tracked edit by name', async () => {
     const source = await sourceFixture();
     const paths = await controlPlanePaths();
     const reservation = await reserved(paths, source.remote, source.firstCommit);
@@ -505,12 +505,36 @@ describe('read-only observation', () => {
       code: 'marker_mismatch',
     });
     await write(checkout, 'release.txt', 'edited\n');
-    await expect(observeLiveCheckout(reservation, [source.firstCommit])).rejects.toMatchObject({
+    await write(checkout, 'notes.txt', 'untracked\n');
+
+    const refusal = observeLiveCheckout(reservation, [source.firstCommit]);
+
+    await expect(refusal).rejects.toMatchObject({
       code: 'checkout_drift',
+      message: expect.stringMatching(/tracked changes: release\.txt\.$/u),
+      details: { files: ['release.txt'] },
     });
   });
 
-  it('lets an update move a live checkout whose only changes are untracked, without touching its index', async () => {
+  it("refuses a live checkout whose HEAD is not detached at its marker's commit", async () => {
+    const source = await sourceFixture();
+    const paths = await controlPlanePaths();
+    const reservation = await reserved(paths, source.remote, source.firstCommit);
+    const checkout = paths.checkoutRoot(reservation.instance_id);
+    await materializeReleaseCheckout(paths, reservation);
+
+    git(checkout, 'checkout', '--quiet', '-b', 'local');
+    await expect(observeLiveCheckout(reservation, [source.firstCommit])).rejects.toMatchObject({
+      code: 'checkout_not_detached',
+    });
+    await write(checkout, 'release.txt', 'moved\n');
+    git(checkout, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qam', 'local commit');
+    await expect(observeLiveCheckout(reservation, [source.firstCommit])).rejects.toMatchObject({
+      code: 'release_mismatch',
+    });
+  });
+
+  it('accepts a live checkout whose only changes are untracked, for status and update alike, without touching its index', async () => {
     const source = await sourceFixture();
     const paths = await controlPlanePaths();
     const reservation = await reserved(paths, source.remote, source.firstCommit);
@@ -520,6 +544,7 @@ describe('read-only observation', () => {
     await staleIndexEntry(checkout, 'release.txt');
     const before = await indexState(checkout);
 
+    await expect(observeLiveCheckout(reservation, [source.firstCommit])).resolves.toBe(source.firstCommit);
     await expect(assertDeploymentCheckoutUnmodified(reservation)).resolves.toBeUndefined();
 
     expect(await indexState(checkout)).toEqual(before);

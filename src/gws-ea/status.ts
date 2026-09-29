@@ -135,7 +135,7 @@ export interface DeliveryFacts {
 }
 
 export interface AssistantProbes {
-  /** The live checkout agrees with its record: marker, detached commit, clean tree. */
+  /** The live checkout agrees with its record: marker, detached commit, no tracked changes. */
   readonly checkout: ProbeResult & CheckoutFacts;
   /** The host's service, as NanoClaw's own service helpers detect it. */
   readonly service: ProbeResult & ServiceFacts;
@@ -1018,7 +1018,7 @@ function operationDetail(instanceId: string, operation: OperationView, removal: 
     case 'recorded':
       lines.push(
         `Its ${operation.kind} to ${shortCommit(operation.to.deployed_commit)} is recorded, with follow-ups still to run: ` +
-          `${operation.follow_ups.map((followUp) => followUp.kind).join(', ')}; the next gws-ea update --id ${instanceId} retries them.`,
+          `${operation.follow_ups.map((followUp) => followUp.kind).join(', ')}; the next gws-ea ${operation.kind} --id ${instanceId} retries them.`,
       );
       if (operation.abandoned_staging) {
         lines.push(`An interrupted update left staging behind; the next gws-ea update --id ${instanceId} removes it.`);

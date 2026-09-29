@@ -563,10 +563,23 @@ export async function assertReleaseCheckoutAgreement(
 }
 
 /**
- * The live checkout as a read-only command observes it: the checks
- * `assertReleaseCheckoutAgreement` makes, against any of `commits` (the
- * registry's, plus any an unfinished update or rollback placed there), with
- * Git's HOME outside the instance, so nothing under it is created or changed.
+ * The tracked files a live checkout differs in, once its HEAD is found
+ * detached at `commit`. A live checkout's contract: untracked files belong to
+ * no release, so they never count. Git's HOME is outside the instance, and Git
+ * takes no optional lock, so nothing under the instance is created or changed.
+ */
+async function liveTrackedChanges(root: string, commit: string, run: SanitizedCommandRunner): Promise<string[]> {
+  return withScratchEnvironments('gws-ea-checkout-', async ({ git }) => {
+    await assertDetachedAt(root, commit, run, git);
+    return trackedChanges(root, run, git);
+  });
+}
+
+/**
+ * The live checkout as a read-only command observes it: its marker at any of
+ * `commits` (the registry's, plus any an unfinished update or rollback placed
+ * there), a physical directory at its reserved path, HEAD detached at the
+ * marker's commit, and no tracked changes, which are refused by name.
  * Returns the commit the checkout holds.
  */
 export async function observeLiveCheckout(
@@ -578,17 +591,21 @@ export async function observeLiveCheckout(
   await assertCheckoutMarker(root, reservation.instance_id, commits);
   const { deployed_commit: commit } = await readInstanceMarkerFile(instanceMarkerFile(root));
   await assertPhysicalCheckout(reservation);
-  const run = runtime.runCommand ?? runSanitizedCommand;
-  await withScratchEnvironments('gws-ea-checkout-', ({ git }) => assertCheckoutRoot(root, commit, run, git));
+  const files = await liveTrackedChanges(root, commit, runtime.runCommand ?? runSanitizedCommand);
+  if (files.length > 0) {
+    throw new GwsEaError(
+      'checkout_drift',
+      `Assistant ${reservation.instance_id}'s live checkout ${root} has tracked changes: ${files.join(', ')}.`,
+      { details: { files } },
+    );
+  }
   return commit;
 }
 
 /**
  * The live checkout an update moves from: its marker and detached HEAD at the
  * release the registry records. A tracked edit would stay behind with the
- * release it edits, so it is refused, naming the files; untracked files belong
- * to no release and are left alone. Git's HOME is outside the instance, and
- * Git takes no optional lock, so nothing under the instance changes.
+ * release it edits, so it is refused, naming the files.
  */
 export async function assertDeploymentCheckoutUnmodified(
   reservation: InstanceReservation,
@@ -597,15 +614,11 @@ export async function assertDeploymentCheckoutUnmodified(
   const root = reservation.checkout_realpath;
   await assertCheckoutMarker(root, reservation.instance_id, [reservation.deployed_commit]);
   await assertPhysicalCheckout(reservation);
-  const run = runtime.runCommand ?? runSanitizedCommand;
-  await withScratchEnvironments('gws-ea-checkout-', async ({ git }) => {
-    await assertDetachedAt(root, reservation.deployed_commit, run, git);
-    const files = await trackedChanges(root, run, git);
-    if (files.length === 0) return;
-    throw new GwsEaError(
-      'deployment_checkout_modified',
-      `Assistant ${reservation.instance_id}'s checkout ${root} has tracked changes, which an update would leave behind with its release: ${files.join(', ')}. Discard them, then retry.`,
-      { details: { files } },
-    );
-  });
+  const files = await liveTrackedChanges(root, reservation.deployed_commit, runtime.runCommand ?? runSanitizedCommand);
+  if (files.length === 0) return;
+  throw new GwsEaError(
+    'deployment_checkout_modified',
+    `Assistant ${reservation.instance_id}'s checkout ${root} has tracked changes, which an update would leave behind with its release: ${files.join(', ')}. Discard them, then retry.`,
+    { details: { files } },
+  );
 }

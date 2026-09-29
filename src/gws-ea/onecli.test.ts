@@ -881,6 +881,20 @@ describe("an update's gateway image", () => {
     expect(await readFile(layout.composeFile, 'utf8')).toBe(compose);
   });
 
+  it('leaves the Compose file naming the running gateway and recreates nothing when the release gateway build fails', async () => {
+    const layout = await layoutFixture();
+    const written = await writeInstanceCompose(layout, RELEASE_GATEWAY_IMAGE);
+    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
+    world.wrapperImageMissing = true;
+    world.failBuild = new GwsEaError('command_failed', 'docker build failed');
+
+    await expect(applyReleaseGateway(layout, PINS, { dockerCommandRunner: runner })).rejects.toBe(world.failBuild);
+
+    // The file still names the image the gateway runs, so observation sees no drift.
+    expect(await readFile(layout.composeFile, 'utf8')).toBe(written);
+    expect(composeCalls(world)).toEqual([]);
+  });
+
   it("puts a rollback's kept Compose file back and recreates only the gateway from the image it kept, converging when rerun", async () => {
     const layout = await layoutFixture();
     await writeInstanceCompose(layout, GATEWAY_IMAGE);

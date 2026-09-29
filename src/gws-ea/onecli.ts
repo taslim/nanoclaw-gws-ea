@@ -328,11 +328,13 @@ export async function prepareReleaseGatewayImage(
 
 /**
  * Move an instance to the gateway the release an update deploys builds, at
- * its cutover (KTD8): its Compose file is rendered for that image, which
- * staging built, and only the gateway is recreated; `compose up` keeps every
- * volume, and Postgres and the app run on as they are, since an update never
- * changes their versions (R9). Rendered from this tool's tree, which is the
- * release (R6). Run again after an interruption, it converges.
+ * its cutover (KTD8): that image, which staging built, is made present
+ * first, so a failed build leaves the Compose file naming the gateway still
+ * running; only then is the file rendered for it and only the gateway
+ * recreated. `compose up` keeps every volume, and Postgres and the app run on
+ * as they are, since an update never changes their versions (R9). Rendered
+ * from this tool's tree, which is the release (R6). Run again after an
+ * interruption, it converges.
  */
 export async function applyReleaseGateway(
   layout: OnecliRuntimeLayout,
@@ -342,8 +344,8 @@ export async function applyReleaseGateway(
   const docker = dockerContext(layout, dependencies);
   const { image } = await resolveWrapperGatewayImage(pins);
   const { gateway } = await instanceOnecliImages(layout, pins);
-  if (gateway !== image) await writePrivateTextFile(layout.composeFile, renderOnecliCompose(layout, pins, image));
   await ensureWrapperGatewayImage(docker, pins, image);
+  if (gateway !== image) await writePrivateTextFile(layout.composeFile, renderOnecliCompose(layout, pins, image));
   await docker.runner({
     ...buildComposeInvocation(layout, [
       'up',

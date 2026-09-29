@@ -6,6 +6,7 @@
  * as the router does. Only the container's own write — an assistant reply in
  * `outbound.db` — is inserted directly, into the schema NanoClaw created.
  */
+import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, realpath, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -21,6 +22,17 @@ import {
   verifyTalkableConversation,
   type ConversationVerificationInput,
 } from './verify.js';
+
+/** What happens to a file just before it is read whole, as a writer opening a database mid-copy would. */
+const reading = vi.hoisted(() => ({ before: undefined as ((file: string) => void) | undefined }));
+vi.mock('node:fs', async (importOriginal) => {
+  const fs = await importOriginal<typeof import('node:fs')>();
+  const readFileSync = (...args: Parameters<typeof fs.readFileSync>): ReturnType<typeof fs.readFileSync> => {
+    if (typeof args[0] === 'string') reading.before?.(args[0]);
+    return fs.readFileSync(...args);
+  };
+  return { ...fs, readFileSync };
+});
 
 const MAIN = 'ag-main';
 const USER = 'gchat:users/principal';
@@ -547,5 +559,29 @@ describe('read-only observation', () => {
     ).toEqual({ status: 'absent' });
 
     expect((await readdir(data)).sort()).toEqual(before);
+  });
+
+  it('reads in place a WAL database a writer opened while it was being copied', async () => {
+    await host.closeDb();
+    const file = path.join(checkout, 'data', 'v2.db');
+    expect(existsSync(`${file}-wal`)).toBe(false);
+    // The host starting mid-copy: opening the database creates its `-wal`, where the migration it records stays.
+    let writer: Database.Database | undefined;
+    reading.before = (read) => {
+      if (read !== file || writer) return;
+      writer = new Database(file);
+      writer
+        .prepare(
+          `INSERT INTO schema_version (version, name, applied)
+           SELECT MAX(version) + 1, 'recorded-mid-copy', ? FROM schema_version`,
+        )
+        .run(new Date().toISOString());
+    };
+    try {
+      expect(readSchemaManifest(checkout).central_migrations).toContain('recorded-mid-copy');
+    } finally {
+      reading.before = undefined;
+      writer?.close();
+    }
   });
 });

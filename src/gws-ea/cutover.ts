@@ -1460,7 +1460,7 @@ export interface ServingRelease {
 
 /**
  * Check a started release serves. Its service is healthy; the live checkout
- * is the release, marker and commit and clean tree, and the host answers for
+ * is the release, marker and commit with no tracked changes, and the host answers for
  * it, which NanoClaw's upgrade tripwire allows only at the commit its
  * checkout was stamped for; its listener answers 401 with the host's own
  * listener ID; OneCLI is healthy, and still isolates agents when the gateway
