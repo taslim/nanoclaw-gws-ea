@@ -1,6 +1,8 @@
+import { realpathSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -83,6 +85,8 @@ vi.mock('./providers/index.js', () => ({}));
 const { createTerminalPresenter, main } = await import('./gws-ea.js');
 /** Upstream's `.env` writer: the driver injects it unchanged. */
 const { upsertEnvVars } = await import('./set-env.js');
+/** Upstream's `.env` backup, which keeps a stray install's `.env` aside: the driver injects it unchanged. */
+const { backupEnv } = await import('./uninstall/remove.js');
 /** Upstream's host readiness helpers (untyped ESM, so loaded by URL): the driver injects them unchanged. */
 const hostStatus = (await import(new URL('./lib/host-status.mjs', import.meta.url).href)) as Readonly<
   Record<'queryHost' | 'waitForHost', unknown>
@@ -114,6 +118,11 @@ async function expectSharedWiring(runtime: CliRuntime): Promise<void> {
   expect(runtime.hostStatus?.queryHost).toBe(hostStatus.queryHost);
   expect(runtime.hostStatus?.waitForHost).toBe(hostStatus.waitForHost);
   expectUpstreamServiceHelpers(runtime);
+  // Only the launcher names the checkout it runs from, by its real path, where a stray NanoClaw install is removed.
+  expect(runtime.toolCheckout).toEqual({
+    root: realpathSync(fileURLToPath(new URL('..', import.meta.url))),
+    backupEnv,
+  });
   const setup = await runtime.toolProviderSetup!();
   expect(setup.credentialMetadata('claude')).toEqual({
     name: 'Anthropic',
@@ -239,6 +248,7 @@ describe('GWS-EA driver', () => {
     ['restart', 'restart'],
     ['update', 'stage_release'],
     ['rollback', 'verify_release'],
+    ['cleanup', 'remove_stray'],
   ] as const)(
     'offers to run a failed %s again, since only create and resume continue from where they stopped',
     async (command, step) => {

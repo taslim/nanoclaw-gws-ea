@@ -98,7 +98,7 @@ import {
 import { activeStep } from './run-log.js';
 import { readOwnerOnlyJson, removePrivateFile } from './secrets.js';
 import { serviceManagerEnvironment } from './service.js';
-import { createServiceControl, type NanoclawServiceHelpers } from './service-control.js';
+import { createServiceControl, type NanoclawServiceHelpers, type ServiceControlTarget } from './service-control.js';
 import {
   createInstanceServiceCoordinates,
   instanceServicePlatform,
@@ -704,8 +704,19 @@ const STOPPED_CHECKS = 10;
 /** `launchctl print` exits with this, and only this, when the job is not loaded. */
 const LAUNCHD_JOB_NOT_FOUND = 113;
 
-/** What removing the host uses besides the runtime the instance recorded. */
-interface NanoclawTeardown {
+/** The tags in `repository` that `docker image ls --format {{.Repository}}:{{.Tag}} <repository>` lists. */
+export function repositoryTags(listing: string, repository: string): string[] {
+  return listing
+    .split(/\r?\n/u)
+    .map((reference) => reference.trim())
+    .filter((reference) => reference.startsWith(`${repository}:`) && reference !== `${repository}:<none>`);
+}
+
+/** The NanoClaw install a teardown removes: an assistant's, or a stray one in the gws-ea tool checkout. */
+export type NanoclawInstall = Omit<ServiceControlTarget, 'instanceId'>;
+
+/** What removing the host uses besides the install itself. */
+export interface NanoclawTeardown {
   readonly platform: InstanceServicePlatform;
   readonly run: SanitizedCommandOutcomeRunner;
   readonly sleep: (milliseconds: number) => Promise<void>;
@@ -722,14 +733,10 @@ interface NanoclawTeardown {
  * a host running outside the service, the agent containers (drained, then
  * removed with any that had already stopped), and the agent images.
  */
-async function uninstallNanoclaw(
-  reservation: InstanceReservation,
-  runtime: LocalRuntime,
-  teardown: NanoclawTeardown,
-): Promise<void> {
+export async function uninstallNanoclaw(install: NanoclawInstall, teardown: NanoclawTeardown): Promise<void> {
   const { platform, run, sleep } = teardown;
-  const installId = reservation.instance_id.replaceAll('-', '');
-  const recorded = { home_directory: runtime.homeDirectory, docker_endpoint: runtime.dockerEndpoint };
+  const { installId, checkoutRoot, homeDirectory, dockerEndpoint } = install;
+  const recorded = { home_directory: homeDirectory, docker_endpoint: dockerEndpoint };
   const incomplete = (message: string): GwsEaError => new GwsEaError('nanoclaw_removal_incomplete', message);
   const commandFor = (
     program: string,
@@ -752,7 +759,7 @@ async function uninstallNanoclaw(
       sleep,
     });
   const coordinates = (runningAsRoot: boolean) =>
-    createInstanceServiceCoordinates({ installId, homeDirectory: runtime.homeDirectory, platform, runningAsRoot });
+    createInstanceServiceCoordinates({ installId, homeDirectory, platform, runningAsRoot });
   /** Boot a launchd job out by its label, then wait until launchd no longer has it loaded. */
   const bootOutByLabel = async (service: InstanceServiceCoordinates): Promise<void> => {
     const uid = process.getuid?.();
@@ -795,15 +802,10 @@ async function uninstallNanoclaw(
     );
   }
 
+  // Removal only detects, stops, and drains; the instance ID names nothing but a start's refusal.
   const control = createServiceControl(
     teardown.serviceHelpers,
-    {
-      instanceId: reservation.instance_id,
-      checkoutRoot: reservation.checkout_realpath,
-      installId,
-      homeDirectory: runtime.homeDirectory,
-      dockerEndpoint: runtime.dockerEndpoint,
-    },
+    { ...install, instanceId: installId },
     { platform: platform === 'macos' ? 'darwin' : 'linux', sleep },
   );
   const detected = control.detect();
@@ -829,8 +831,8 @@ async function uninstallNanoclaw(
     await checked('systemctl', [...scope, 'daemon-reload'], env);
   }
 
-  const tools = buildToolEnvironment(process.env, { DOCKER_HOST: runtime.dockerEndpoint });
-  const host = path.join(reservation.checkout_realpath, 'dist', 'index.js').replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+  const tools = buildToolEnvironment(process.env, { DOCKER_HOST: dockerEndpoint });
+  const host = path.join(checkoutRoot, 'dist', 'index.js').replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
   const killed = await execute('pkill', ['-f', host], tools);
   if (killed.outcome.exitCode !== 0 && killed.outcome.exitCode !== 1)
     throw commandExitError(killed.command, killed.outcome);
@@ -864,10 +866,10 @@ async function uninstallNanoclaw(
   // named, so the OneCLI, gateway, and connector images assistants share stay too (KTD19).
   const repository = getInstallScopedNames(installId).containerImageBase;
   const tagged = async (): Promise<string[]> =>
-    (await checked('docker', ['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}', repository], tools))
-      .split(/\r?\n/u)
-      .map((reference) => reference.trim())
-      .filter((reference) => reference.startsWith(`${repository}:`) && reference !== `${repository}:<none>`);
+    repositoryTags(
+      await checked('docker', ['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}', repository], tools),
+      repository,
+    );
   const references = await tagged();
   if (references.length > 0) {
     await checked('docker', ['image', 'rm', ...references], tools);
@@ -1015,13 +1017,21 @@ async function removeLocked(
     dependencies.uninstallNanoclaw ??
     (serviceHelpers
       ? (removed: InstanceReservation, runtime: LocalRuntime) =>
-          uninstallNanoclaw(removed, runtime, {
-            platform,
-            run,
-            sleep: dependencies.sleep ?? delay,
-            serviceHelpers,
-            recordedImages: recordedAgentImages(operation),
-          })
+          uninstallNanoclaw(
+            {
+              checkoutRoot: removed.checkout_realpath,
+              installId: removed.instance_id.replaceAll('-', ''),
+              homeDirectory: runtime.homeDirectory,
+              dockerEndpoint: runtime.dockerEndpoint,
+            },
+            {
+              platform,
+              run,
+              sleep: dependencies.sleep ?? delay,
+              serviceHelpers,
+              recordedImages: recordedAgentImages(operation),
+            },
+          )
       : undefined);
   /** Only the launcher supplies NanoClaw's service helpers, so removal refuses before any change without them. */
   const requireUninstall = (): NonNullable<typeof uninstall> => {

@@ -380,7 +380,7 @@ export async function runUpdateAll(
   for (const line of planLines(plan.candidates)) present(line);
   // Asked once, before anything is staged: a no changes nothing, as a no to `update --id` does.
   if (!(await confirm(plan))) {
-    return { outcome: 'ready', headline: 'Update cancelled. Nothing was changed.', details: [] };
+    return { outcome: 'ready', headline: 'Update cancelled. No assistant was changed.', details: [] };
   }
   const ended = new Map<string, AssistantUpdate>();
   for (const [index, instanceId] of eligible.entries()) {

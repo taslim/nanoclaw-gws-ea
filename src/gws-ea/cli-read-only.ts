@@ -17,6 +17,7 @@ import { assertInstanceId, getInstanceReservation } from './registry.js';
 import type { HostStatusHelpers } from './service.js';
 import { hostLogFiles, type NanoclawServiceHelpers } from './service-control.js';
 import { LIST_USAGE, runListCommand, runStatusCommand, STATUS_USAGE, type ReadOnlyCommandRuntime } from './status.js';
+import { detectStrayInstall, strayNote, type ToolCheckout } from './stray-install.js';
 import { GwsEaError } from './types.js';
 
 type LineWriter = (line: string) => void;
@@ -63,6 +64,8 @@ export interface ReadOnlyContext {
   readonly serviceHelpers?: NanoclawServiceHelpers;
   /** Upstream's host readiness helpers, for asking a host its status. */
   readonly hostStatus?: HostStatusHelpers;
+  /** The checkout this tool runs from, which only the launcher names; `list` and `status` note a stray install there. */
+  readonly toolCheckout?: ToolCheckout;
 }
 
 /** A read-only command: its lines in `gws-ea --help`, its flags, and what it does. */
@@ -84,6 +87,30 @@ function observationRuntime(context: ReadOnlyContext): ReadOnlyCommandRuntime {
 }
 
 /**
+ * The note `list` and `status` add on stderr when the tool checkout holds a
+ * stray NanoClaw install (R6). It is checked beside the command, so it adds
+ * no wait, and a check that fails adds no note.
+ */
+async function strayInstallNote(context: ReadOnlyContext): Promise<string | undefined> {
+  if (!context.toolCheckout) return undefined;
+  try {
+    return strayNote(await detectStrayInstall(context.toolCheckout, context.paths));
+    // eslint-disable-next-line no-catch-all/no-catch-all -- The note is an observation beside the result; like a failed status probe, it never fails the command.
+  } catch {
+    return undefined;
+  }
+}
+
+/** Run `list` or `status`, then add the stray install note beside its result. */
+async function withStrayInstallNote(context: ReadOnlyContext, command: () => Promise<number>): Promise<CommandEnd> {
+  const note = strayInstallNote(context);
+  const exitCode = await command();
+  const text = await note;
+  if (text) context.errorOutput(text);
+  return { exitCode };
+}
+
+/**
  * The read-only commands, by name. `runCli` dispatches them without the
  * attempt loop, parsing each one's flags from its `options`, and `--help`
  * prints each one's `usage` in this order.
@@ -94,9 +121,10 @@ export const READ_ONLY_COMMANDS: ReadonlyMap<string, ReadOnlyCommand> = new Map(
     {
       usage: LIST_USAGE,
       options: { values: [], switches: ['json'] },
-      run: async (context, options) => ({
-        exitCode: await runListCommand(observationRuntime(context), { json: options.json === 'true' }),
-      }),
+      run: (context, options) =>
+        withStrayInstallNote(context, () =>
+          runListCommand(observationRuntime(context), { json: options.json === 'true' }),
+        ),
     },
   ],
   [
@@ -104,12 +132,12 @@ export const READ_ONLY_COMMANDS: ReadonlyMap<string, ReadOnlyCommand> = new Map(
     {
       usage: STATUS_USAGE,
       options: { values: ['id'], switches: ['json'] },
-      run: async (context, options) => ({
-        exitCode: await runStatusCommand(observationRuntime(context), {
-          instanceId: targetInstance(options),
-          json: options.json === 'true',
-        }),
-      }),
+      run: (context, options) => {
+        const instanceId = targetInstance(options);
+        return withStrayInstallNote(context, () =>
+          runStatusCommand(observationRuntime(context), { instanceId, json: options.json === 'true' }),
+        );
+      },
     },
   ],
   [

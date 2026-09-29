@@ -4,6 +4,7 @@
  * Without a TTY it adds none of them, so every input comes from flags, the
  * environment, or the secrets file, and every stop is a durable line.
  */
+import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
 import * as p from '@clack/prompts';
@@ -19,9 +20,11 @@ import {
 } from '../scripts/update/service.js';
 import { runCli, type CliRuntime, type FailureReport, type Presenter } from '../src/gws-ea/cli.js';
 import type { InteractivePrompts } from '../src/gws-ea/events.js';
+import { CONTROL_PLANE_ROOT } from '../src/gws-ea/paths.js';
 import type { ToolProviderSetup } from '../src/gws-ea/release-target.js';
 import type { HostStatusHelpers } from '../src/gws-ea/service.js';
 import type { NanoclawServiceHelpers } from '../src/gws-ea/service-control.js';
+import type { ToolCheckout } from '../src/gws-ea/stray-install.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
 import { providerProvisioningCapabilityDigest } from '../src/provider-provisioning-capability.js';
 import { offerDiagnosis } from './gws-ea-assist.js';
@@ -32,6 +35,7 @@ import { dumpTranscriptOnFailure } from './lib/runner.js';
 import { fitToWidth, fmtDuration } from './lib/theme.js';
 import { listSetupProviders, type SetupProviderEntry } from './providers/registry.js';
 import { upsertEnvVars } from './set-env.js';
+import { backupEnv } from './uninstall/remove.js';
 import './providers/index.js';
 
 interface RunningStep {
@@ -188,13 +192,22 @@ const serviceHelpers: NanoclawServiceHelpers = {
   verifyServiceHealth,
 };
 
-/** What a retry does: a host service command or an update runs again; the others re-check prerequisites and continue. */
+/**
+ * The checkout this tool runs from, where a NanoClaw install gws-ea does not
+ * manage is removed; its `.env` is kept aside with NanoClaw's own backup.
+ */
+function toolCheckout(): ToolCheckout {
+  return { root: realpathSync(CONTROL_PLANE_ROOT), backupEnv };
+}
+
+/** What a retry does: a host service command, an update, or a cleanup runs again; the others re-check prerequisites and continue. */
 function retryOffer(command: FailureReport['command']): string {
   return command === 'start' ||
     command === 'stop' ||
     command === 'restart' ||
     command === 'update' ||
-    command === 'rollback'
+    command === 'rollback' ||
+    command === 'cleanup'
     ? `Retry now? gws-ea runs ${command} again.`
     : 'Retry now? gws-ea re-checks prerequisites, then continues from where it stopped.';
 }
@@ -228,6 +241,7 @@ export async function main(argv: readonly string[], options: { readonly interact
     collectGwsEaCreateInput(context, { providers, interactive });
   const hostStatus = await loadHostStatus();
   const providerSetup = toolProviderSetup(providers);
+  const checkout = toolCheckout();
   if (!interactive) {
     return runCli(argv, {
       collectCreateInputs,
@@ -235,6 +249,7 @@ export async function main(argv: readonly string[], options: { readonly interact
       hostStatus,
       serviceHelpers,
       toolProviderSetup: providerSetup,
+      toolCheckout: checkout,
     });
   }
   return runCli(argv, {
@@ -242,6 +257,7 @@ export async function main(argv: readonly string[], options: { readonly interact
     hostStatus,
     serviceHelpers,
     toolProviderSetup: providerSetup,
+    toolCheckout: checkout,
     presenter: createTerminalPresenter(),
     prompts: terminalPrompts(providers),
     collectCreateInputs,
