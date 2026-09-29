@@ -100,6 +100,8 @@ export const PROVIDER_SETUP: ToolProviderSetup = {
   credentialMetadata: (provider) => (provider === 'claude' ? CREDENTIAL : undefined),
 };
 export const SESSION = path.join('data', 'v2-sessions', 'ag-main', 'session-1');
+/** The 16 bytes every SQLite database begins with, which a file an agent writes can begin with too. */
+export const SQLITE_HEADER = 'SQLite format 3\0';
 export const MEMORY = path.join('groups', 'main', 'CLAUDE.local.md');
 /** Main's template in a release, main's folder, the plugin stamped into it, and the files that plugin stamps. */
 export const MAIN_TEMPLATE_DIR = path.join('templates', 'gws-ea', 'main');

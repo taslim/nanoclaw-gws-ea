@@ -906,8 +906,11 @@ describe('list', () => {
         'u',
       ),
     );
-    expect(lines).toContain(`continue with gws-ea update --id ${beta.instance_id}`);
     // Each thing left under way is named beside the table, with the command that settles it.
+    expect(text.output.stdout).toContain(
+      `${beta.instance_id}: Its update to dogfood ${'c'.repeat(12)} is unfinished (stopped); ` +
+        `continue it with gws-ea update --id ${beta.instance_id}, or revert it with gws-ea rollback --id ${beta.instance_id}.`,
+    );
     expect(lines).toMatch(new RegExp(`^${alpha.instance_id}: Removal .*gws-ea remove --id ${alpha.instance_id}`, 'mu'));
     expect(lines).toMatch(
       new RegExp(`^${alpha.instance_id}: .*staging .*gws-ea update --id ${alpha.instance_id}`, 'mu'),

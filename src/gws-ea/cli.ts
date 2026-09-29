@@ -319,9 +319,10 @@ function isBusy(error: unknown): boolean {
  * rollback, a removal under way, a create not yet finished, no host service
  * installed to start, a stopped assistant an update cannot prove its release
  * on, a release that is not newer than the one it runs, no release of its own
- * kept to roll back to, or a rollback that went back to the release it left.
- * Its message names the command that moves the assistant on; rerunning this
- * one cannot.
+ * kept to roll back to, or a rollback that went back to the release it left;
+ * or, in a turn of `update --all`, the tool's checkout moved off the release
+ * the run set out with. Its message names the command that moves the
+ * assistant on; rerunning this one cannot.
  */
 const STATE_REFUSALS: ReadonlySet<string> = new Set([
   'operation_in_progress',
@@ -333,6 +334,7 @@ const STATE_REFUSALS: ReadonlySet<string> = new Set([
   'rollback_unavailable',
   'kept_release_mismatch',
   'rollback_failed',
+  'tool_checkout_moved',
 ]);
 
 function isStateRefusal(error: unknown): boolean {
@@ -995,7 +997,7 @@ class Cli {
       );
       const summary = await runUpdateAll(
         plan,
-        (instanceId) => this.#updateTurn(instanceId, yes, confirm, launcher),
+        (instanceId, toolCommit) => this.#updateTurn(instanceId, toolCommit, yes, confirm, launcher),
         (line) => this.#presenter.line(line),
       );
       this.#presenter.report(summary);
@@ -1008,15 +1010,18 @@ class Cli {
 
   /**
    * One assistant's turn in `update --all`: the attempt `update --id <id>`
-   * runs, which reports its own end and recovery guidance. A failure ends the
-   * turn without the interactive retry loop: the run stops there.
+   * runs, pinned to the run's release, which reports its own end and recovery
+   * guidance. A failure ends the turn without the interactive retry loop: the
+   * run stops there.
    */
   async #updateTurn(
     instanceId: string,
+    toolCommit: string,
     yes: boolean,
     confirm: (preview: UpdatePreview) => Promise<boolean>,
     launcher: UpdateLauncher,
   ): Promise<UpdateTurn> {
+    const request: UpdateRequest = { instanceId, expectedToolCommit: toolCommit };
     const turn: { ended?: AssistantUpdate } = {};
     const attempt = await this.#attempt({
       command: 'update',
@@ -1024,7 +1029,7 @@ class Cli {
       options: { id: instanceId, ...(yes ? { yes: 'true' } : {}) },
       instanceId,
       work: async ({ reporter }) => {
-        turn.ended = await this.#updateAssistant(reporter, { instanceId }, confirm, launcher);
+        turn.ended = await this.#updateAssistant(reporter, request, confirm, launcher);
         return updateOutcome(instanceId, turn.ended);
       },
     });

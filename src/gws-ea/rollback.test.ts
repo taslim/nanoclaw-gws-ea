@@ -45,6 +45,7 @@ import {
   runtimeCommit,
   SESSION,
   snapshot,
+  SQLITE_HEADER,
   stampedPersona,
   status,
   temporaryRoot,
@@ -403,6 +404,27 @@ describe('gws-ea rollback of an update that moved no schema (AE6)', GIT_HEAVY, (
     const setAside = path.join(host.paths.releaseRoot(id, 'outgoing'), 'restored', 'state');
     expect(await exists(path.join(setAside, 'data', 'v2.db-wal'))).toBe(true);
     expect(messages(setAside)).toEqual(['m1']);
+  });
+
+  it('never opens a file an agent planted beside a -journal or -wal, even with SQLite’s header, and carries it back as it is', async () => {
+    const { host, runtime, next, state, images } = await updatedAssistant();
+    const session = path.join(runtime.checkout_realpath, SESSION);
+    // SQLite's header and nothing a database holds: SQLite would delete each side file as it refused the file.
+    const planted = {
+      'evil.db': SQLITE_HEADER,
+      'evil.db-journal': 'Not a journal.\n',
+      'forged.db': `${SQLITE_HEADER}${'junk'.repeat(256)}`,
+      'forged.db-wal': 'Not a log.\n',
+    };
+    for (const [file, contents] of Object.entries(planted)) await writeFile(path.join(session, file), contents);
+
+    expect(await cli(host, state, next, runtime).run(['rollback', '--id', runtime.instance_id, '--yes'])).toBe(0);
+
+    await expectRolledBack(host, runtime, next, state, images.first);
+    for (const [file, contents] of Object.entries(planted)) {
+      expect(await readFile(path.join(session, file), 'utf8'), file).toBe(contents);
+    }
+    expect(messages(runtime.checkout_realpath)).toEqual(['m1']);
   });
 });
 

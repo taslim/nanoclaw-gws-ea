@@ -152,6 +152,12 @@ export interface UpdateRequest {
   readonly track?: string;
   /** `--source-remote`: the assistant's recorded source remote unless given (KTD4). */
   readonly sourceRemote?: string;
+  /**
+   * `update --all`'s release: the tool's commit when the run began. A tool
+   * checkout that has moved off it since is refused before anything is
+   * staged, so one run never deploys two releases. `update --id` pins none.
+   */
+  readonly expectedToolCommit?: string;
 }
 
 /** Boundary seams; each defaults to the real one. */
@@ -227,7 +233,8 @@ function checkoutRuntime(seams: UpdateSeams): CheckoutRuntime {
 /**
  * The release `update` would deploy: the tool's own commit, on the track the
  * operator names or the assistant's own, from the source remote the operator
- * names or the assistant's recorded one.
+ * names or the assistant's recorded one. A request pinned to a commit the
+ * tool's checkout has since moved off is refused.
  */
 export async function resolveUpdateIntent(
   paths: ControlPlanePaths,
@@ -237,7 +244,17 @@ export async function resolveUpdateIntent(
   const reservation = await getInstanceReservation(paths, request.instanceId);
   const track = request.track ?? reservation.release_track;
   const source = resolveReleaseSource(track, request.sourceRemote ?? reservation.source_remote);
-  const commit = await resolveToolCommit(seams.toolRoot ?? CONTROL_PLANE_ROOT, checkoutRuntime(seams));
+  const toolRoot = seams.toolRoot ?? CONTROL_PLANE_ROOT;
+  const commit = await resolveToolCommit(toolRoot, checkoutRuntime(seams));
+  const expected = request.expectedToolCommit;
+  if (expected !== undefined && commit !== expected) {
+    throw new GwsEaError(
+      'tool_checkout_moved',
+      `gws-ea's checkout ${toolRoot} moved from ${shortCommit(expected)} to ${shortCommit(commit)} while update --all ran, ` +
+        `so assistant ${request.instanceId} was not updated: one run deploys only the release it started with, ${shortCommit(expected)}. ` +
+        `Run gws-ea update --all again to update to ${shortCommit(commit)}.`,
+    );
+  }
   return {
     instanceId: request.instanceId,
     track,

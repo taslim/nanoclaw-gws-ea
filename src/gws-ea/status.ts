@@ -1032,6 +1032,27 @@ function operationSummary(operation: OperationView): string {
   }
 }
 
+/**
+ * What an operator is told of an update or rollback left unfinished, naming
+ * what continues or reverts it, or of a record that cannot be read: `status`,
+ * `list`, and `update --all` word it alike.
+ */
+export function unfinishedOperation(
+  operation: Extract<OperationView, { readonly state: 'open' | 'unreadable' }>,
+): string {
+  switch (operation.state) {
+    case 'open': {
+      const revert = operation.revert_with ? `, or revert it with ${operation.revert_with}` : '';
+      return (
+        `Its ${operation.kind} to ${operation.to.release_track} ${shortCommit(operation.to.deployed_commit)} is unfinished ` +
+        `(${operation.phase}); continue it with ${operation.continue_with}${revert}.`
+      );
+    }
+    case 'unreadable':
+      return `Its update or rollback record cannot be read: ${operation.message}`;
+  }
+}
+
 /** What an operator does about an assistant's update, rollback, or removal, if anything. */
 function operationDetail(instanceId: string, operation: OperationView, removal: boolean): string[] {
   const lines: string[] = [];
@@ -1042,14 +1063,10 @@ function operationDetail(instanceId: string, operation: OperationView, removal: 
         lines.push(`An interrupted update left staging behind; the next gws-ea update --id ${instanceId} removes it.`);
       }
       break;
-    case 'open': {
-      const revert = operation.revert_with ? `, or revert with ${operation.revert_with}` : '';
-      lines.push(
-        `${sentence(operation.kind)} to ${operation.to.release_track} ${shortCommit(operation.to.deployed_commit)} is unfinished ` +
-          `(${operation.phase}); continue with ${operation.continue_with}${revert}.`,
-      );
+    case 'open':
+    case 'unreadable':
+      lines.push(unfinishedOperation(operation));
       break;
-    }
     case 'recorded':
       lines.push(
         `Its ${operation.kind} to ${shortCommit(operation.to.deployed_commit)} is recorded, with follow-ups still to run: ` +
@@ -1058,9 +1075,6 @@ function operationDetail(instanceId: string, operation: OperationView, removal: 
       if (operation.abandoned_staging) {
         lines.push(`An interrupted update left staging behind; the next gws-ea update --id ${instanceId} removes it.`);
       }
-      break;
-    case 'unreadable':
-      lines.push(`Its update or rollback record cannot be read: ${operation.message}`);
       break;
   }
   return lines;

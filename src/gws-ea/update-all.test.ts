@@ -260,6 +260,127 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     expect(new Set(serviceCallsOf(machineFleet.state, second))).toEqual(new Set([`detect ${second.install_id}`]));
   });
 
+  it("stops at the turn that finds the tool's checkout moved off the release the run set out with, updating it to neither", async () => {
+    const host = await machine();
+    const first = await assistant(host, 37_001);
+    const second = await assistant(host, 37_101);
+    const next = await nextRelease(host);
+    const machineFleet = await fleet(host, next, [first, second]);
+    // A later release on the track, which the tool's checkout, still clean, is moved to once the first turn ends.
+    const later = await nextRelease(host);
+    const { logs: _logs, ...untouched } = await footprint(machineFleet, second);
+    const out: string[] = [];
+    const { run, err } = fleetCli(machineFleet, {
+      stdout: (line) => {
+        out.push(line);
+        if (line !== `Updating assistant ${second.instance_id} (2 of 2)…`) return;
+        git(next.tool, 'fetch', '--quiet', 'origin');
+        git(next.tool, 'checkout', '--quiet', '--detach', later.commit);
+      },
+    });
+
+    expect(await run(['update', '--all', '--yes'])).toBe(1);
+
+    // The first went to the release the run announced; the second was refused before anything was staged.
+    expect(out).toContain(
+      `Updating 2 assistants to this tool's release ${short(next.commit)}, one at a time: ${first.instance_id}, ${second.instance_id}.`,
+    );
+    await expectOnRelease(host, first, next.commit);
+    await expectOnRelease(host, second, host.first);
+    expect(await exists(host.paths.releaseRoot(second.instance_id, 'next'))).toBe(false);
+    const { logs: _after, ...left } = await footprint(machineFleet, second);
+    expect(left).toEqual(untouched);
+    expect(new Set(serviceCallsOf(machineFleet.state, second))).toEqual(new Set([`detect ${second.install_id}`]));
+    expect(err).toContain(
+      `gws-ea's checkout ${next.tool} moved from ${short(next.commit)} to ${short(later.commit)} while update --all ran, ` +
+        `so assistant ${second.instance_id} was not updated: one run deploys only the release it started with, ${short(next.commit)}. ` +
+        `Run gws-ea update --all again to update to ${short(later.commit)}.`,
+    );
+    expect(err.slice(-3)).toEqual([
+      `update --all stopped at assistant ${second.instance_id}.`,
+      `Updated ${first.instance_id}: dogfood ${short(host.first)} → dogfood ${short(next.commit)}`,
+      `Stopped at ${second.instance_id}; its summary above says why and what to run.`,
+    ]);
+  });
+
+  it('never offers to retry a failed turn when run interactively: it stops there as it does with --yes', async () => {
+    const host = await machine();
+    const first = await assistant(host, 37_001);
+    const second = await assistant(host, 37_101);
+    const next = await nextRelease(host);
+    const machineFleet = await fleet(host, next, [first, second]);
+    machineFleet.state.buildFails = true;
+    const untouched = await footprint(machineFleet, second);
+    // Asked, it would retry once, then stop.
+    const onFailure = vi
+      .fn<NonNullable<CliRuntime['onFailure']>>()
+      .mockResolvedValueOnce('retry')
+      .mockResolvedValue('stop');
+    const confirmUpdate = vi.fn(async (_preview: UpdatePreview) => true);
+    const { run, out, err } = fleetCli(machineFleet, { onFailure, confirmUpdate });
+
+    expect(await run(['update', '--all'])).toBe(1);
+
+    expect(onFailure).not.toHaveBeenCalled();
+    // The build failed before any preview: nothing was asked either.
+    expect(confirmUpdate).not.toHaveBeenCalled();
+    const summary = err.join('\n');
+    expect(summary).toContain('Stopped at Building the new agent image (build_agent_image): bash exited with code 1');
+    expect(summary).toContain(`Retry with: gws-ea update --id ${first.instance_id}`);
+    expect(summary.match(/Stopped at Building the new agent image/gu)).toHaveLength(1);
+    await expectOnRelease(host, first, host.first);
+    expect(err.slice(-3)).toEqual([
+      `update --all stopped at assistant ${first.instance_id}; 1 not attempted.`,
+      `Stopped at ${first.instance_id}; its summary above says why and what to run.`,
+      `Not attempted: ${second.instance_id}`,
+    ]);
+    expect(out).not.toContain(`Updating assistant ${second.instance_id} (2 of 2)…`);
+    expect(await footprint(machineFleet, second)).toEqual(untouched);
+  });
+
+  it('skips one whose service is not installed, runs outside it, or cannot be observed, or whose record is unreadable', async () => {
+    const host = await machine();
+    const notInstalled = await assistant(host, 37_001);
+    const unmanaged = await assistant(host, 37_101);
+    const unobserved = await assistant(host, 37_201);
+    const unreadable = await assistant(host, 37_301);
+    const next = await nextRelease(host);
+    const machineFleet = await fleet(host, next, [notInstalled, unmanaged, unobserved, unreadable]);
+    await writeFile(host.paths.operationFile(unreadable.instance_id), '{ not a record\n', { mode: 0o600 });
+    const base = fleetServices(machineFleet);
+    const serviceHelpers: NanoclawServiceHelpers = {
+      ...base,
+      detectService: (root, env) => {
+        switch (env.installSlug) {
+          case notInstalled.install_id:
+            return { mode: 'none', active: false };
+          case unmanaged.install_id:
+            return { mode: 'unmanaged', active: true, pid: 4343 };
+          case unobserved.install_id:
+            throw Object.assign(new Error('launchctl print failed'), { code: 'EPERM' });
+          default:
+            return base.detectService(root, env);
+        }
+      },
+    };
+    const before = await Promise.all(machineFleet.assistants.map((runtime) => footprint(machineFleet, runtime)));
+    const { run, out } = fleetCli(machineFleet, { serviceHelpers });
+
+    expect(await run(['update', '--all', '--yes'])).toBe(0);
+
+    expect(out).toEqual([
+      'Checking which assistants can be updated…',
+      `Nothing to update: no assistant here can move to this tool's release ${short(next.commit)}.`,
+      `Skipped ${notInstalled.instance_id}: No NanoClaw service is installed for it; gws-ea resume --id ${notInstalled.instance_id} installs it.`,
+      `Skipped ${unmanaged.instance_id}: A NanoClaw host runs from its checkout outside its service (PID 4343). Stop that process and start it with gws-ea start --id ${unmanaged.instance_id}, then update it.`,
+      `Skipped ${unobserved.instance_id}: Its service could not be observed: The observation failed (EPERM).`,
+      `Skipped ${unreadable.instance_id}: Its update or rollback record cannot be read: Operation record is not valid JSON`,
+    ]);
+    expect(await Promise.all(machineFleet.assistants.map((runtime) => footprint(machineFleet, runtime)))).toEqual(
+      before,
+    );
+  });
+
   it('skips an assistant whose preview is declined, changing nothing of it, and updates the next', async () => {
     const host = await machine();
     const first = await assistant(host, 37_001);
@@ -494,6 +615,35 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
       'update --all finished: 1 completed, 1 skipped.',
       `Completed ${pending.instance_id}'s update to dogfood ${short(next.commit)}: its follow-ups are done`,
       `Skipped ${done.instance_id}: It already runs dogfood ${short(next.commit)}, this tool's release.`,
+    ]);
+  });
+
+  it("skips a stopped assistant whose update to the tool's release left follow-ups, which need its host, and goes on", async () => {
+    const host = await machine();
+    const pending = await assistant(host, 37_001);
+    const other = await assistant(host, 37_101);
+    const next = await nextRelease(host);
+    const machineFleet = await fleet(host, next, [pending, other]);
+    machineFleet.state.rebuildFails = true;
+    expect(await fleetCli(machineFleet).run(['update', '--id', pending.instance_id, '--yes'])).toBe(1);
+    machineFleet.state.rebuildFails = false;
+    machineFleet.stopped.add(pending.install_id);
+    const record = await readOperationRecord(host.paths, pending.instance_id);
+    expect(record?.phase).toBe('recorded');
+    expect(record?.follow_ups).toContainEqual(expect.objectContaining({ kind: 'rebuild_group_image' }));
+    const rebuilds = machineFleet.state.rebuilds.length;
+    const { run, out } = fleetCli(machineFleet);
+
+    expect(await run(['update', '--all', '--yes'])).toBe(0);
+
+    // Skipped as any stopped assistant is, its follow-ups left for its host; only the other one's rebuild ran.
+    expect(await readOperationRecord(host.paths, pending.instance_id)).toEqual(record);
+    expect(machineFleet.state.rebuilds.length).toBe(rebuilds + 1);
+    await expectOnRelease(host, other, next.commit);
+    expect(out.slice(-3)).toEqual([
+      'update --all finished: 1 updated, 1 skipped.',
+      `Updated ${other.instance_id}: dogfood ${short(host.first)} → dogfood ${short(next.commit)}`,
+      `Skipped ${pending.instance_id}: It is stopped, and an update proves its new release on a running assistant; start it with gws-ea start --id ${pending.instance_id}, then update it.`,
     ]);
   });
 });

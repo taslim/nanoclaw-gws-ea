@@ -10,7 +10,11 @@
  * skipped and reported, with the command that moves it; each other one then
  * takes its turn through `update --id`'s own path, which checks everything
  * again under its lock. A recorded update's follow-ups are finished before
- * anything else, as `update --id` finishes them, even at the tool's release.
+ * anything else, as `update --id` finishes them, even at the tool's release;
+ * they run through the assistant's host, so a stopped one is skipped first.
+ * The tool's commit is read once, as the run begins, and every check and
+ * turn is pinned to it: a turn that finds the tool's checkout moved refuses
+ * before it stages anything, so one run never deploys two releases.
  *
  * A declined preview skips that assistant. A failure, another command
  * holding the assistant, or the operator cancelling its prompt stops the run
@@ -25,7 +29,7 @@ import { safeErrorMessage } from './redact.js';
 import { getInstanceReservation } from './registry.js';
 import { resolveReleaseTarget, type ToolProviderSetup } from './release-target.js';
 import type { NanoclawServiceHelpers } from './service-control.js';
-import { listAssistants, type ListedAssistant } from './status.js';
+import { listAssistants, unfinishedOperation, type ListedAssistant } from './status.js';
 import { GwsEaError, sameRelease, shortCommit, type ReleaseCoordinates } from './types.js';
 import { resolveUpdateIntent, type UpdatedAssistant, type UpdateSeams } from './update.js';
 
@@ -43,7 +47,7 @@ export type UpdateCandidate =
   | { readonly instanceId: string; readonly eligible: false; readonly reason: string };
 
 export interface UpdateAllPlan {
-  /** The tool's own commit: the release every turn deploys. */
+  /** The tool's own commit as the run began: the release every turn deploys, or refuses to move from. */
   readonly toolCommit: string;
   /** Every registered assistant, in `list` order. */
   readonly candidates: readonly UpdateCandidate[];
@@ -91,18 +95,15 @@ function serviceRefusal({ instance_id: id, service }: ListedAssistant): string |
   }
 }
 
-/** Why the assistant's update or rollback record keeps it from an update, naming what moves it on. */
+/** Why the assistant's update or rollback record keeps it from an update, naming what moves it on, as `status` does. */
 function operationRefusal({ operation }: ListedAssistant): string | undefined {
   switch (operation.state) {
     case 'none':
     case 'recorded':
       return undefined;
-    case 'open': {
-      const revert = operation.revert_with ? `, or revert it with ${operation.revert_with}` : '';
-      return `Its ${operation.kind} to ${releaseName(operation.to)} is unfinished (${operation.phase}); continue it with ${operation.continue_with}${revert}.`;
-    }
+    case 'open':
     case 'unreadable':
-      return `Its update or rollback record cannot be read: ${operation.message}`;
+      return unfinishedOperation(operation);
   }
 }
 
@@ -112,10 +113,19 @@ function operationRefusal({ operation }: ListedAssistant): string | undefined {
  * message; anything else is not an answer, so it is thrown, naming the
  * assistant, and nothing runs.
  */
-async function classify(context: UpdateAllContext, listed: ListedAssistant): Promise<UpdateCandidate> {
+async function classify(
+  context: UpdateAllContext,
+  listed: ListedAssistant,
+  toolCommit: string,
+): Promise<UpdateCandidate> {
   const { paths, seams } = context;
   const instanceId = listed.instance_id;
   const skip = (reason: string): UpdateCandidate => ({ instanceId, eligible: false, reason });
+  // An update proves its release, and a recorded one's follow-ups run, through the assistant's running host.
+  const ifRunning = (): UpdateCandidate => {
+    const stopped = serviceRefusal(listed);
+    return stopped ? skip(stopped) : { instanceId, eligible: true };
+  };
   if (listed.removal_in_progress) {
     return skip(`Its removal is in progress; finish it with gws-ea remove --id ${instanceId}.`);
   }
@@ -123,11 +133,9 @@ async function classify(context: UpdateAllContext, listed: ListedAssistant): Pro
   if (unfinished) return skip(unfinished);
   try {
     await assertInstanceCreated(paths, instanceId);
-    const intent = await resolveUpdateIntent(paths, { instanceId }, seams);
+    const intent = await resolveUpdateIntent(paths, { instanceId, expectedToolCommit: toolCommit }, seams);
     // `update --id` finishes a recorded operation's follow-ups first, and is done when it recorded this release.
-    if (listed.operation.state === 'recorded' && sameRelease(listed.operation.to, intent.target)) {
-      return { instanceId, eligible: true };
-    }
+    if (listed.operation.state === 'recorded' && sameRelease(listed.operation.to, intent.target)) return ifRunning();
     const reservation = await getInstanceReservation(paths, instanceId);
     if (reservation.deployed_commit === intent.target.deployed_commit) {
       return skip(`It already runs ${releaseName(intent.target)}, this tool's release.`);
@@ -152,8 +160,7 @@ async function classify(context: UpdateAllContext, listed: ListedAssistant): Pro
       { cause: error },
     );
   }
-  const stopped = serviceRefusal(listed);
-  return stopped ? skip(stopped) : { instanceId, eligible: true };
+  return ifRunning();
 }
 
 /**
@@ -177,7 +184,7 @@ export async function planUpdateAll(context: UpdateAllContext): Promise<UpdateAl
   });
   // One at a time: each resolution fetches its track, which may ask for credentials.
   const candidates: UpdateCandidate[] = [];
-  for (const listed of assistants) candidates.push(await classify(context, listed));
+  for (const listed of assistants) candidates.push(await classify(context, listed, toolCommit));
   return { toolCommit, candidates };
 }
 
@@ -259,13 +266,14 @@ function stopOf(
 }
 
 /**
- * Give each eligible assistant its turn through `updateOne`, in order, and
- * summarize the run. The skipped ones are named first; a failed or busy turn,
- * or one the operator cancelled, stops the run there.
+ * Give each eligible assistant its turn through `updateOne`, in order, pinned
+ * to the plan's tool commit, and summarize the run. The skipped ones are
+ * named first; a failed or busy turn, or one the operator cancelled, stops
+ * the run there.
  */
 export async function runUpdateAll(
   plan: UpdateAllPlan,
-  updateOne: (instanceId: string) => Promise<UpdateTurn>,
+  updateOne: (instanceId: string, toolCommit: string) => Promise<UpdateTurn>,
   present: (line: string) => void,
 ): Promise<UpdateAllSummary> {
   const eligible = plan.candidates.flatMap((candidate) => (candidate.eligible ? [candidate.instanceId] : []));
@@ -287,7 +295,7 @@ export async function runUpdateAll(
   const ended = new Map<string, EndedUpdate>();
   for (const [index, instanceId] of eligible.entries()) {
     present(`Updating assistant ${instanceId} (${index + 1} of ${eligible.length})…`);
-    const turn = await updateOne(instanceId);
+    const turn = await updateOne(instanceId, plan.toolCommit);
     if (turn.kind === 'failed' || turn.kind === 'busy' || turn.kind === 'cancelled') {
       const rest = eligible.slice(index + 1);
       const { outcome, headline, where } = stopOf(

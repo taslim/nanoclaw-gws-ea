@@ -360,11 +360,13 @@ interface CheckpointResult {
  * Open `file` read-write as SQLite itself, running nothing of the release's:
  * the first read rolls back a hot journal, and a WAL database has its log
  * folded into the main file and truncated. A reader holding the log back
- * leaves busy frames, and is refused rather than waited on.
+ * leaves busy frames, and is refused rather than waited on; a file SQLite
+ * cannot open or settle is refused, naming it.
  */
 function settleDatabase<T>(file: string, read: (database: Database.Database) => T): T {
-  const database = new Database(file, { fileMustExist: true, timeout: 0 });
+  let database: Database.Database | undefined;
   try {
+    database = new Database(file, { fileMustExist: true, timeout: 0 });
     database.prepare('SELECT count(*) FROM sqlite_master').get();
     if (String(database.pragma('journal_mode', { simple: true })) === 'wal') {
       const [result] = database.pragma('wal_checkpoint(TRUNCATE)') as CheckpointResult[];
@@ -376,8 +378,15 @@ function settleDatabase<T>(file: string, read: (database: Database.Database) => 
       }
     }
     return read(database);
+  } catch (error) {
+    if (!(error instanceof Database.SqliteError)) throw error;
+    throw new GwsEaError(
+      'database_unreadable',
+      `${file} is not a database SQLite can open (${error.code}: ${error.message}), so it cannot be copied whole.`,
+      { cause: error },
+    );
   } finally {
-    database.close();
+    database?.close();
   }
 }
 
@@ -418,46 +427,71 @@ function isSqliteDatabase(file: string): boolean {
   }
 }
 
-/**
- * The SQLite databases under `directory` that have a `-journal` or `-wal`
- * beside them. Anything else there is not opened: the carry copies it, with
- * its side file, as it copies any file.
- */
-function databasesWithSideFiles(directory: string): string[] {
-  const found = new Set<string>();
-  const walk = (current: string): void => {
-    for (const entry of readdirSync(current, { withFileTypes: true })) {
-      const target = path.join(current, entry.name);
-      if (entry.isDirectory()) {
-        walk(target);
-        continue;
-      }
-      const side = /^(.*)-(?:journal|wal)$/u.exec(entry.name);
-      if (!side || !entry.isFile()) continue;
-      const database = path.join(current, side[1]!);
-      if (isSqliteDatabase(database)) found.add(database);
-    }
-  };
-  walk(directory);
-  return [...found].sort();
+/** The directories in `directory`, none reached through a link; none when it is gone. */
+function subdirectories(directory: string): string[] {
+  try {
+    return readdirSync(directory, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => path.join(directory, entry.name))
+      .sort();
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) return [];
+    throw error;
+  }
+}
+
+/** Whether a regular `-journal` or `-wal` file lies beside `database`. */
+function hasSideFile(database: string): boolean {
+  return ['-journal', '-wal'].some(
+    (suffix) => lstatSync(`${database}${suffix}`, { throwIfNoEntry: false })?.isFile() === true,
+  );
 }
 
 /**
- * Settle a quiet checkout's databases before they are copied (KTD18): a
- * TRUNCATE checkpoint folds the central WAL into `v2.db` and must find no
- * busy frames, and every other SQLite database with a side file — a
- * session's hot journal above all — is opened read-write and read once,
- * which rolls it back. No lazy migration runs: only SQLite opens them. A
- * file that is no SQLite database is never opened, whatever lies beside it.
- * Reports whether the host that stopped left its lease stopped.
+ * The session mailboxes under the checkout's `data/`,
+ * `v2-sessions/<agent group>/<session>/inbound.db` and `outbound.db`, that
+ * are SQLite databases with a side file beside them: besides `v2.db`, the
+ * only databases there the host owns. Nothing else is looked at.
+ */
+function mailboxesWithSideFiles(data: string): string[] {
+  const found: string[] = [];
+  for (const group of subdirectories(path.join(data, 'v2-sessions'))) {
+    for (const session of subdirectories(group)) {
+      for (const name of ['inbound.db', 'outbound.db']) {
+        const mailbox = path.join(session, name);
+        if (hasSideFile(mailbox) && isSqliteDatabase(mailbox)) found.push(mailbox);
+      }
+    }
+  }
+  return found;
+}
+
+/**
+ * Settle a quiet checkout's own databases before they are copied (KTD18).
+ * It must already be proven quiet (`assertCheckoutQuiet`): nothing holds any
+ * of them open. Only SQLite opens them, so no lazy migration runs:
+ *
+ * - the central `v2.db` always: a TRUNCATE checkpoint folds its WAL in and
+ *   must find no busy frames;
+ * - each session mailbox with a `-journal` or `-wal` beside it, when it is a
+ *   regular file, reached through no link, that begins with SQLite's header:
+ *   opened read-write and read once, which rolls back a hot journal and folds
+ *   a log in.
+ *
+ * Either one SQLite cannot open or settle fails the settle, naming it.
+ * Nothing else under `data/` is ever opened, whatever its name, contents, or
+ * side files: an agent's own database, or a file planted beside a side file,
+ * is copied whole by the carry with the side files beside it, and SQLite
+ * rolls back its hot journal or replays its log the next time something
+ * opens it read-write. Reports whether the host that stopped left its lease
+ * stopped.
  */
 export function settleCheckoutDatabases(checkoutRoot: string, now: Date = new Date()): SettledCheckout {
   const data = path.join(checkoutRoot, 'data');
-  const central = path.join(data, 'v2.db');
-  const graceful = settleDatabase(central, (database) => hostStoppedGracefully(database, now.toISOString()));
-  for (const file of databasesWithSideFiles(data)) {
-    if (file !== central) settleDatabase(file, () => undefined);
-  }
+  const graceful = settleDatabase(path.join(data, 'v2.db'), (database) =>
+    hostStoppedGracefully(database, now.toISOString()),
+  );
+  for (const mailbox of mailboxesWithSideFiles(data)) settleDatabase(mailbox, () => undefined);
   return { graceful };
 }
 
