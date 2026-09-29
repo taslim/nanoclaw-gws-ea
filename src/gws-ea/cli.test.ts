@@ -31,6 +31,7 @@ import { hostLogFiles, type NanoclawServiceHandle, type NanoclawServiceHelpers }
 import type { CreateTargetRequest } from './release-target.js';
 import { resolveReleaseSource } from './release-tracks.js';
 import { activeStep } from './run-log.js';
+import { FULL_CHECK_MS } from './stray-install.js';
 import { present, removeToolCheckouts, toolCheckoutWorld, type ToolCheckoutWorld } from './testing/stray-fixture.js';
 import { GwsEaError, PROVISION_STEPS, releaseOf, type InstanceReservationInput } from './types.js';
 
@@ -2069,6 +2070,39 @@ describe('gws-ea and a stray NanoClaw install in its own checkout', () => {
     expect(await present(path.join(w.root, 'data', 'v2.db'))).toBe(true);
   });
 
+  it('adds nothing to create when Docker does not answer and nothing else is stray', async () => {
+    const w = await toolCheckoutWorld();
+    w.docker.unreachable = true;
+    const without = await create(await testPaths(), {});
+
+    const run = await create(await testPaths(), launcherStrayHandling(w));
+
+    expect(run.exitCode).toBe(10);
+    expect(run.out.length).toBe(without.out.length);
+    expect(run.out.filter((line) => /stray|NanoClaw install/u.test(line))).toEqual([]);
+  });
+
+  it('warns once and goes on creating when the check itself fails', async () => {
+    const paths = await testPaths();
+    const w = await toolCheckoutWorld();
+    await w.write('data/v2.db');
+    // Its database cannot even be looked for.
+    await chmod(path.join(w.root, 'data'), 0o000);
+
+    let run: Awaited<ReturnType<typeof create>>;
+    try {
+      run = await create(paths, launcherStrayHandling(w));
+    } finally {
+      await chmod(path.join(w.root, 'data'), 0o700);
+    }
+
+    expect(run.exitCode).toBe(10);
+    expect(run.out.filter((line) => line.includes('stray'))).toEqual([
+      `Warning: could not check ${w.root} for a stray NanoClaw install; retry with gws-ea cleanup. Unexpected control-plane failure.`,
+    ]);
+    expect(await present(path.join(w.root, 'data', 'v2.db'))).toBe(true);
+  });
+
   it("looks for no stray install without the launcher's service helpers", async () => {
     const paths = await testPaths();
     const w = await toolCheckoutWorld();
@@ -2130,6 +2164,8 @@ describe('gws-ea and a stray NanoClaw install in its own checkout', () => {
       'data/',
     ]);
     expect(w.docker.tags(w.names.containerImageBase)).toEqual([]);
+    // Asked for, the check gives a slow Docker longer than create's and update's quick one does.
+    expect(w.deadlines.slice(0, 2)).toEqual([FULL_CHECK_MS, FULL_CHECK_MS]);
   });
 
   it('cleanup names what is left when removal fails, and exits 1', async () => {

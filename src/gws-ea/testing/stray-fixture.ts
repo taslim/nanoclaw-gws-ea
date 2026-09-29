@@ -4,7 +4,7 @@
  * stray NanoClaw install there touches, faked at its boundary. Files are real,
  * and `.env` is kept aside by NanoClaw's own backup.
  */
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -146,16 +146,28 @@ export async function toolCheckoutWorld(options: { readonly platform?: 'macos' |
   };
   const plist = path.join(home, 'Library', 'LaunchAgents', `${names.launchdLabel}.plist`);
   let service: NanoclawServiceHandle = { mode: 'none', active: false };
+  /** The PIDs NanoClaw's nohup stop sent SIGTERM to. */
+  const signaled = new Set<number>();
   const serviceHelpers = {
     createCommandRunner: vi.fn<NanoclawServiceHelpers['createCommandRunner']>(() => ({
       run: () => '',
       tryRun: () => ({ ok: true, stdout: '' }),
     })),
-    detectService: vi.fn<NanoclawServiceHelpers['detectService']>(() =>
-      existsSync(plist) ? service : { mode: 'none', active: false },
-    ),
+    detectService: vi.fn<NanoclawServiceHelpers['detectService']>(() => {
+      if (existsSync(plist)) return service;
+      // NanoClaw's nohup mode on Linux: its launcher and PID file. Any live process holding the PID counts as the
+      // host, as NanoClaw's own check does, so a stale file's PID is taken as alive until something signals it.
+      const launcher = path.join(root, 'start-nanoclaw.sh');
+      const pidFile = path.join(root, 'nanoclaw.pid');
+      if ((options.platform ?? 'macos') === 'linux' && existsSync(launcher) && existsSync(pidFile)) {
+        const pid = Number(readFileSync(pidFile, 'utf8'));
+        return { mode: 'nohup', definition: launcher, pid, active: !signaled.has(pid) };
+      }
+      return { mode: 'none', active: false };
+    }),
     stopService: vi.fn<NanoclawServiceHelpers['stopService']>(async (handle) => {
-      order.push('service-stop');
+      order.push(handle.pid === undefined ? 'service-stop' : `service-stop ${handle.pid}`);
+      if (handle.pid !== undefined) signaled.add(handle.pid);
       service = { ...handle, active: false };
     }),
     startService: vi.fn<NanoclawServiceHelpers['startService']>(),

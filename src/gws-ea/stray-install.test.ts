@@ -316,15 +316,43 @@ describe('removeStrayInstall', () => {
     expect(strayParts(await detectStrayInstall(w.checkout, w.paths))).toEqual([]);
   });
 
-  it('removes a nohup install on Linux, its launcher and PID file included', async () => {
+  it('removes a nohup install on Linux without signaling the PID its stale PID file names', async () => {
     const w = await world({ platform: 'linux' });
     await w.write('start-nanoclaw.sh', '#!/bin/sh');
+    // No host answers, so another process may hold this PID by now.
     await w.write('nanoclaw.pid', '4242');
 
     const removed = await removeStrayInstall(w.checkout, await detectStrayInstall(w.checkout, w.paths), w.launcher);
 
-    expect(removed).toEqual(['start-nanoclaw.sh', 'nanoclaw.pid']);
+    expect(removed).toEqual(['nanoclaw.pid', 'start-nanoclaw.sh']);
+    expect(w.serviceHelpers.stopService).not.toHaveBeenCalled();
     expect(await readdir(w.root)).toEqual([]);
+  });
+
+  it('removes a root linked elsewhere by its link, never what it points at', async () => {
+    const w = await strayWorld();
+    const elsewhere = path.join(w.base, 'elsewhere');
+    for (const entry of ['data', 'groups', 'logs']) {
+      const target = path.join(elsewhere, entry);
+      await mkdir(target, { recursive: true });
+      await writeFile(path.join(target, 'kept'), entry);
+      await rm(path.join(w.root, entry), { recursive: true });
+      await symlink(target, path.join(w.root, entry));
+    }
+    // Its database is found through the link.
+    await writeFile(path.join(elsewhere, 'data', 'v2.db'), 'db');
+
+    const removed = await removeStrayInstall(w.checkout, await detectStrayInstall(w.checkout, w.paths), w.launcher);
+
+    for (const entry of ['data', 'groups', 'logs']) {
+      expect(await readFile(path.join(elsewhere, entry, 'kept'), 'utf8')).toBe(entry);
+    }
+    expect(await present(path.join(w.root, 'data'))).toBe(false);
+    expect(await present(path.join(w.root, 'groups'))).toBe(false);
+    // A logs/ linked elsewhere, which holds gws-ea's own log too, is left alone.
+    expect(await present(path.join(w.root, 'logs'))).toBe(true);
+    expect(removed).toContain('data/');
+    expect(removed).not.toContain("NanoClaw's logs");
   });
 
   it("keeps an ncl link to another install's checkout", async () => {
@@ -413,7 +441,7 @@ describe('removeStrayInstall', () => {
 
   it('finishes on a rerun what an interrupted removal left', async () => {
     const w = await strayWorld();
-    failingRemovals.add(path.join(w.root, 'store/'));
+    failingRemovals.add(path.join(w.root, 'store'));
 
     await expect(
       removeStrayInstall(w.checkout, await detectStrayInstall(w.checkout, w.paths), w.launcher),

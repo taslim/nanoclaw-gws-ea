@@ -7,6 +7,7 @@
  * `update`, and `cleanup` remove it whole, and `list` and `status` note it.
  */
 import { createHash } from 'node:crypto';
+import type { Stats } from 'node:fs';
 import { lstat, readdir, readlink, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -108,14 +109,18 @@ export function strayNote(stray: StrayInstall): string | undefined {
   return `Note: a stray NanoClaw install is in ${stray.root} (${parts.join(', ')}); gws-ea cleanup removes it.`;
 }
 
-async function exists(file: string): Promise<boolean> {
+/** What is at `file` itself, never what a final symlink there points at; undefined when nothing is. */
+async function entryAt(file: string): Promise<Stats | undefined> {
   try {
-    await lstat(file);
-    return true;
+    return await lstat(file);
   } catch (error) {
-    if (isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR')) return false;
+    if (isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR')) return undefined;
     throw error;
   }
+}
+
+async function exists(file: string): Promise<boolean> {
+  return (await entryAt(file)) !== undefined;
 }
 
 /** Where the stray install lives: the slug NanoClaw derives from the checkout's own path, never from the environment (KTD3). */
@@ -196,7 +201,9 @@ export async function detectStrayInstall(
  * then removes the service, any host it left, the containers, and every tag
  * in the stray's image repository (KTD2). State goes only once no host
  * answers, and `data/` last, so an interrupted removal stays detectable and
- * the next run finishes it. Returns what it removed, named for the operator.
+ * the next run finishes it. Each entry is removed by its own name, so one
+ * linked elsewhere loses its link, never what it points at. Returns what it
+ * removed, named for the operator.
  */
 export async function removeStrayInstall(
   checkout: ToolCheckout,
@@ -222,8 +229,22 @@ export async function removeStrayInstall(
       'nanoclaw_removal_incomplete',
       `A NanoClaw host still answers on ${path.join(root, 'data', 'ncl.sock')}; stop it, then retry.`,
     );
+  // The parts it was found by that are files are state, named as they are removed.
+  const removed = strayParts({ ...found, files: [] });
+  const remove = async (target: string, label: string): Promise<void> => {
+    try {
+      await rm(target, { recursive: true });
+    } catch (error) {
+      if (isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR')) return;
+      throw error;
+    }
+    removed.push(label);
+  };
 
   const answering = await host();
+  // With no host listening, a nohup PID file is stale, and its PID may belong to another process by now, which
+  // NanoClaw's own nohup stop would signal.
+  if (answering === undefined) await remove(path.join(root, 'nanoclaw.pid'), 'nanoclaw.pid');
   if (typeof answering === 'number') {
     (checkout.terminate ?? terminate)(answering);
     // Gone, or replaced by a service manager restarting it, which the teardown stops.
@@ -249,34 +270,25 @@ export async function removeStrayInstall(
   );
   if ((await host()) !== undefined) throw stillAnswering();
 
-  // The files it was found by are state, named as the state below is removed.
-  const removed = strayParts({ ...found, files: [] });
-  const remove = async (target: string, label: string): Promise<void> => {
-    try {
-      await rm(target, { recursive: true });
-    } catch (error) {
-      if (isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR')) return;
-      throw error;
-    }
-    removed.push(label);
-  };
   const env = path.join(root, '.env');
   if (await exists(env)) {
     const backup = checkout.backupEnv(env);
     await rm(env, { force: true });
     removed.push(`.env (kept as ${path.basename(backup)})`);
   }
-  for (const entry of ['groups/', 'store/', 'start-nanoclaw.sh', 'nanoclaw.pid']) {
-    await remove(path.join(root, entry), entry);
+  for (const [entry, label] of [
+    ['groups', 'groups/'],
+    ['store', 'store/'],
+    ['start-nanoclaw.sh', 'start-nanoclaw.sh'],
+    ['nanoclaw.pid', 'nanoclaw.pid'],
+  ] as const) {
+    await remove(path.join(root, entry), label);
   }
+  // A logs/ linked elsewhere is not the checkout's to empty, and it holds gws-ea's own log too.
   const logs = path.join(root, 'logs');
-  const logEntries = await readdir(logs).then(
-    (entries) => entries.filter((entry) => entry !== OWN_LOG),
-    (error: unknown) => {
-      if (isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR')) return [];
-      throw error;
-    },
-  );
+  const logEntries = (await entryAt(logs))?.isDirectory()
+    ? (await readdir(logs)).filter((entry) => entry !== OWN_LOG)
+    : [];
   for (const entry of logEntries) await rm(path.join(logs, entry), { recursive: true, force: true });
   if (logEntries.length > 0) removed.push("NanoClaw's logs");
   // NanoClaw's setup links `ncl` to its checkout; a link to any other install stays.
@@ -289,7 +301,7 @@ export async function removeStrayInstall(
     },
   );
   if (linked === path.join(root, 'bin', 'ncl')) await remove(ncl, '~/.local/bin/ncl');
-  await remove(path.join(root, 'data/'), 'data/');
+  await remove(path.join(root, 'data'), 'data/');
   return removed;
 }
 
