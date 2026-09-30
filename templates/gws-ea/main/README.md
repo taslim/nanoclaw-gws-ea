@@ -2,7 +2,7 @@
 
 This Agent Plugins 1.0 template creates the canonical `main` executive-assistant agent group.
 
-Its always-loaded instructions establish the generic assistant/principal relationship and point to the concise operating procedure in `ai.nanoco.nanoclaw/context/additional_context/operating-procedure.md`. Names and other instance identity come from runtime context; they are intentionally absent here.
+Its always-loaded instructions establish the generic assistant/principal relationship and point to the concise operating procedure in `ai.nanoco.nanoclaw/context/additional_context/operating-procedure.md` and the Google Workspace guidance in `ai.nanoco.nanoclaw/context/additional_context/google.md`. The `gws-ea-welcome` skill runs the principal's first conversation: it asks them to share their calendars and then offers concrete work from what it can see. Names and other instance identity come from runtime context; they are intentionally absent here.
 
 Stamp the template through NanoClaw's existing local template path:
 

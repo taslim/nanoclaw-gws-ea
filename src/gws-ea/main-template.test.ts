@@ -115,6 +115,7 @@ describe("main's template against NanoClaw's own stamp", () => {
     expect(await inspectMainFolder(main.folder, TEMPLATE)).toEqual({
       kind: 'stamped',
       customized: [
+        { surface: 'context', name: 'additional_context/google.md', change: 'changed' },
         { surface: 'context', name: 'additional_context/operating-procedure.md', change: 'changed' },
         { surface: 'persona', name: 'instructions.prepend.md', change: 'changed' },
       ],

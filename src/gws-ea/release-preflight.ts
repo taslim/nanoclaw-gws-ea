@@ -280,6 +280,7 @@ async function validateComposition(
     'setup/gws-ea-input.ts',
     'src/provider-credential.ts',
     'templates/gws-ea/main/plugin.json',
+    'templates/gws-ea/main/skills/gws-ea-welcome/SKILL.md',
     'src/channels/gchat.ts',
     'src/channels/index.ts',
     'src/gws-ea/process.ts',

@@ -38,6 +38,13 @@ function principalAddressesSentence(principal: string, emails: readonly string[]
     : ` ${principal}'s email addresses are ${quoted}.`;
 }
 
+/** The assistant's own address, where the principal shares calendars; quoted exactly when it can be. */
+function assistantAddressSentence(assistant: string, email: string | null): string {
+  if (email === null) return '';
+  const shown = email.includes('`') ? escapeMarkdownInline(email) : `\`${email}\``;
+  return ` ${assistant}'s own Google Workspace address is ${shown}.`;
+}
+
 async function identitySection(_group: AgentGroup): Promise<{ name: string; body: string } | undefined> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return undefined;
   const profile = await getGwsEaProfile();
@@ -46,7 +53,7 @@ async function identitySection(_group: AgentGroup): Promise<{ name: string; body
   const principal = escapeMarkdownInline(profile.principal_display_name);
   return {
     name: 'Assistant Identity',
-    body: `${assistant} is the assistant. ${principal} is the principal. They are separate people: act and communicate as ${assistant}, support ${principal}, and never present the assistant as the principal.${principalAddressesSentence(principal, profile.principal_emails)}`,
+    body: `${assistant} is the assistant. ${principal} is the principal. They are separate people: act and communicate as ${assistant}, support ${principal}, and never present the assistant as the principal.${assistantAddressSentence(assistant, profile.assistant_workspace_email)}${principalAddressesSentence(principal, profile.principal_emails)}`,
   };
 }
 

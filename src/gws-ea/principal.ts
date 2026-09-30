@@ -176,6 +176,14 @@ async function runBootstrap(
   });
 }
 
+/**
+ * The first message main receives: the GWS-EA welcome skill from the main
+ * template, which asks the principal for their calendars, instead of
+ * NanoClaw's generic capability tour.
+ */
+export const GWS_EA_WELCOME_INSTRUCTION =
+  'System instruction: run /gws-ea-welcome to introduce yourself to the principal in this new conversation.';
+
 export function principalWelcomeEventId(
   config: Pick<InstanceRuntimeConfig, 'instance_id'>,
   mainAgentGroupId: string,
@@ -312,6 +320,8 @@ export async function reconcilePrincipalDm(
       input.adapterInstance,
       '--event-id',
       stableEventId,
+      '--welcome',
+      GWS_EA_WELCOME_INSTRUCTION,
     ],
     dependencies.runCommand,
   );

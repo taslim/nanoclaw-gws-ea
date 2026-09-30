@@ -443,4 +443,9 @@ describe("the principal's email addresses", () => {
     const [section] = await getRequiredProjectDocSections(main);
     expect(section?.body).toContain("Taslim's email address is `taslim@example.test`.");
   });
+
+  it("names the assistant's own Google address, so the principal knows where to share calendars", async () => {
+    const [section] = await getRequiredProjectDocSections(main);
+    expect(section?.body).toContain("Aya's own Google Workspace address is `aya@example.test`.");
+  });
 });

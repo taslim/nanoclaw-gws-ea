@@ -28,6 +28,8 @@ const TEMPLATE_ROOT = path.resolve('templates', 'gws-ea', 'main');
 const CONTEXT_ROOT = path.join(TEMPLATE_ROOT, NANOCLAW_EXTENSION_NS, 'context');
 const INSTRUCTIONS_FILE = path.join(CONTEXT_ROOT, 'instructions.md');
 const PROCEDURE_FILE = path.join(CONTEXT_ROOT, 'additional_context', 'operating-procedure.md');
+const GOOGLE_FILE = path.join(CONTEXT_ROOT, 'additional_context', 'google.md');
+const WELCOME_FILE = path.join(TEMPLATE_ROOT, 'skills', 'gws-ea-welcome', 'SKILL.md');
 const REQUIRED_README_CONTRACT = [
   '# GWS-EA main',
   'canonical `main` executive-assistant agent group',
@@ -43,6 +45,7 @@ const REQUIRED_INSTRUCTIONS_CONTRACT = [
   "Escalate only when the next step requires the principal's non-delegable judgment, authority, relationship, presence, or voice",
   'Access never implies permission, relationship, or instruction authority.',
   'read `additional_context/operating-procedure.md` before substantive work',
+  'read `additional_context/google.md` before any Google Workspace work',
 ];
 const REQUIRED_PROCEDURE_CONTRACT = [
   'Inspect the relevant source of truth before acting.',
@@ -51,12 +54,29 @@ const REQUIRED_PROCEDURE_CONTRACT = [
   'Delegation does not transfer credentials, memory, permissions, or authority',
   'Apply these rules when the relevant Workspace capability is available.',
   'If no durable mechanism is available, do not promise autonomous follow-up.',
+  "A calendar is the principal's when its ID is one of the principal's addresses",
+  "Never change another person's calendar",
+  'Until scheduling with other people is available, do not create or change an event that has other attendees.',
+  'For a job that will take more than a moment, first reply with one line saying what you will do',
+  'Learn scheduling preferences with the schedule statistics tool',
+];
+const REQUIRED_GOOGLE_CONTRACT = [
+  'Use the Google Workspace tools for calendars',
+  'Never send the principal a connect link',
+];
+const REQUIRED_WELCOME_CONTRACT = [
+  'name: gws-ea-welcome',
+  'share their calendars with you',
+  'two or three concrete things',
+  'Never ask "How can I help?"',
 ];
 const EXPECTED_FILES = [
   'README.md',
+  'ai.nanoco.nanoclaw/context/additional_context/google.md',
   'ai.nanoco.nanoclaw/context/additional_context/operating-procedure.md',
   'ai.nanoco.nanoclaw/context/instructions.md',
   'plugin.json',
+  'skills/gws-ea-welcome/SKILL.md',
 ];
 
 function listFiles(dir: string, relative = ''): string[] {
@@ -88,9 +108,12 @@ describe('gws-ea/main template', () => {
     expect(template.name).toBe('gws-ea-main');
     expect(template.agentName).toBe('main');
     expect(template.instructions).toBe(instructionsSource);
-    expect(template.contextExtras.map(({ name }) => name)).toEqual(['additional_context/operating-procedure.md']);
+    expect(template.contextExtras.map(({ name }) => name)).toEqual([
+      'additional_context/google.md',
+      'additional_context/operating-procedure.md',
+    ]);
     expect(template.mcpServers).toEqual({});
-    expect(template.skills).toEqual([]);
+    expect(template.skills.map(({ name }) => name)).toEqual(['gws-ea-welcome']);
     expect(template.tasks).toEqual([]);
     expect(template.report).toEqual([]);
   });
@@ -136,6 +159,15 @@ describe('gws-ea/main template', () => {
     for (const contract of REQUIRED_PROCEDURE_CONTRACT) {
       expect(procedure).toContain(contract);
     }
+    const google = fs.readFileSync(GOOGLE_FILE, 'utf-8');
+    for (const contract of REQUIRED_GOOGLE_CONTRACT) {
+      expect(google).toContain(contract);
+    }
+    const welcome = fs.readFileSync(WELCOME_FILE, 'utf-8');
+    for (const contract of REQUIRED_WELCOME_CONTRACT) {
+      expect(welcome).toContain(contract);
+    }
+    expect(procedure).not.toMatch(/managed calendars|managed-calendar|calendar portfolio/iu);
   });
 
   it('contains no deployment configuration, secrets, endpoints, or personal identity', () => {
@@ -158,9 +190,9 @@ describe('gws-ea/main template', () => {
       /(?:provider|model|package|credential|secret|token|api[_-]?key|endpoint|assistant[_-]?name|principal[_-]?name|email)/i,
     );
 
-    const runtimeText = [fs.readFileSync(INSTRUCTIONS_FILE, 'utf-8'), fs.readFileSync(PROCEDURE_FILE, 'utf-8')].join(
-      '\n',
-    );
+    const runtimeText = [INSTRUCTIONS_FILE, PROCEDURE_FILE, GOOGLE_FILE, WELCOME_FILE]
+      .map((file) => fs.readFileSync(file, 'utf-8'))
+      .join('\n');
     expect(runtimeText).not.toMatch(/https?:\/\//i);
     expect(runtimeText).not.toMatch(/-----BEGIN [A-Z ]*PRIVATE KEY-----/);
     expect(runtimeText).not.toMatch(/\b(?:provider|model|packages_(?:apt|npm)|mcp_servers)\s*[:=]/i);

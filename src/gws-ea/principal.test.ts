@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { InboundEvent } from '../channels/adapter.js';
 import { CONTROL_PLANE_ROOT } from './paths.js';
 import {
+  GWS_EA_WELCOME_INSTRUCTION,
   principalWelcomeEventId,
   reconcilePrincipalDm,
   type PrincipalCandidate,
@@ -277,9 +278,16 @@ describe('verified principal first-DM reconciliation', () => {
           'gchat-assistant',
           '--event-id',
           (first as { eventId: string }).eventId,
+          '--welcome',
+          GWS_EA_WELCOME_INSTRUCTION,
         ],
       }),
     );
+  });
+
+  it('asks for the GWS-EA welcome rather than the generic capability tour', () => {
+    expect(GWS_EA_WELCOME_INSTRUCTION).toContain('/gws-ea-welcome');
+    expect(GWS_EA_WELCOME_INSTRUCTION).not.toContain('/welcome ');
   });
 
   it('fails without bootstrapping when the host does not confirm the principal wiring', async () => {

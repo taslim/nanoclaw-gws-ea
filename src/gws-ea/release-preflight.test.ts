@@ -113,6 +113,7 @@ async function releaseFixture(): Promise<string> {
       2,
     ) + '\n',
   );
+  await write(root, 'templates/gws-ea/main/skills/gws-ea-welcome/SKILL.md', '# GWS-EA welcome\n');
   await write(root, 'bin/ncl', '#!/usr/bin/env bash\nexit 0\n');
   await write(root, 'bin/gws-ea', '#!/usr/bin/env bash\nexit 0\n');
   await chmod(path.join(root, 'bin/ncl'), 0o755);
@@ -256,6 +257,7 @@ describe('release preflight', () => {
 
   it.each([
     ['template', 'templates/gws-ea/main/plugin.json', 'incomplete_release'],
+    ['GWS-EA welcome', 'templates/gws-ea/main/skills/gws-ea-welcome/SKILL.md', 'incomplete_release'],
     ['Google Chat adapter', 'src/channels/gchat.ts', 'incomplete_release'],
     ['GWS-EA interactive launcher', 'setup/gws-ea-input.ts', 'incomplete_release'],
     ['GWS-EA service launcher', 'src/gws-ea/process.ts', 'incomplete_release'],
