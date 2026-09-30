@@ -8,7 +8,7 @@
  * check and the OneCLI servers behind `fetch`.
  */
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import net, { type AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -368,3 +368,120 @@ async function freePort(): Promise<number> {
   await new Promise<void>((resolve) => probe.close(() => resolve()));
   return port;
 }
+
+const FAILURE_NOTICE = "Something went wrong on my side and I couldn't finish that. Please send it again.";
+
+describe('recorded divergence: Google Chat shows a working reaction', () => {
+  it('reacts to the principal’s message once a reply takes about 4 seconds and removes it before the reply', async () => {
+    await freshInstall();
+    vi.useFakeTimers();
+    try {
+      const { withWorkingReaction } = await import('../channels/gchat.js');
+      const events: string[] = [];
+      let host: import('../channels/adapter.js').ChannelSetup | undefined;
+      const adapter = withWorkingReaction(
+        {
+          name: 'gchat',
+          channelType: 'gchat',
+          supportsThreads: true,
+          isConnected: () => true,
+          setup: async (config) => {
+            host = config;
+          },
+          teardown: async () => undefined,
+          deliver: async (platformId) => {
+            events.push(`post ${platformId}`);
+            return undefined;
+          },
+        },
+        {
+          addReaction: async (_thread, messageId, emoji) => void events.push(`add ${messageId} ${emoji}`),
+          removeReaction: async (_thread, messageId, emoji) => void events.push(`remove ${messageId} ${emoji}`),
+        },
+      );
+      await adapter.setup({ onInbound: vi.fn(), onInboundEvent: vi.fn(), onMetadata: vi.fn(), onAction: vi.fn() });
+      await host!.onInbound('gchat:spaces/dm', 'gchat:spaces/dm:dGhyZWFk:dm', {
+        id: 'spaces/dm/messages/one',
+        kind: 'chat-sdk',
+        content: { text: 'what is on Thursday?' },
+        timestamp: new Date().toISOString(),
+        authenticatedSender: { userId: 'users/principal', kind: 'human' },
+      });
+      await adapter.setTyping!('gchat:spaces/dm', null);
+      await vi.advanceTimersByTimeAsync(4_000);
+      await adapter.setTyping!('gchat:spaces/dm', null);
+      await adapter.deliver('gchat:spaces/dm', null, { kind: 'chat', content: { text: 'Two meetings.' } });
+
+      expect(events).toEqual([
+        'add spaces/dm/messages/one 👀',
+        'remove spaces/dm/messages/one 👀',
+        'post gchat:spaces/dm',
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('is applied to the registered Google Chat channel', async () => {
+    const source = await readFile(path.join(originalCwd, 'src/channels/gchat.ts'), 'utf8');
+    expect(source).toContain('return withWorkingReaction(bridge, gchatAdapter);');
+  });
+});
+
+describe('recorded divergence: a failure reaches the principal as one plain sentence', () => {
+  it('tells the chat a failed message came from, and no one for a message from the host', async () => {
+    const directory = await freshInstall();
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    await db.createAgentGroup({
+      id: 'ag-1',
+      name: 'Main',
+      folder: 'main',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    await db.createMessagingGroup({
+      id: 'mg-1',
+      channel_type: 'gchat',
+      platform_id: 'gchat:spaces/dm',
+      name: 'Principal',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: new Date().toISOString(),
+    });
+    await mkdir(path.join(directory, 'groups'), { recursive: true });
+    await import('../mailbox/compose.js');
+    const { resolveSession } = await import('../session-manager.js');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    const delivery = await import('../delivery.js');
+    const sent: Array<{ threadId: string | null; content: string }> = [];
+    delivery.setDeliveryAdapter({
+      async deliver(_channelType, _platformId, threadId, _kind, content) {
+        sent.push({ threadId, content });
+        return 'spaces/dm/messages/notice';
+      },
+    });
+
+    await delivery.sendFailureNotice(
+      session,
+      { channelType: 'agent', platformId: 'ag-1', threadId: null },
+      { onlyToThatChat: true },
+    );
+    await delivery.sendFailureNotice(
+      session,
+      { channelType: 'gchat', platformId: 'gchat:spaces/dm', threadId: 'spaces/dm/threads/t1' },
+      { onlyToThatChat: true },
+    );
+
+    expect(sent).toEqual([{ threadId: 'spaces/dm/threads/t1', content: JSON.stringify({ text: FAILURE_NOTICE }) }]);
+  });
+
+  it('keeps the agent runner’s failed-turn sentence and its time and schedule tools', async () => {
+    const pollLoop = await readFile(path.join(originalCwd, 'container/agent-runner/src/poll-loop.ts'), 'utf8');
+    const tools = await readFile(path.join(originalCwd, 'container/agent-runner/src/mcp-tools/index.ts'), 'utf8');
+    expect(pollLoop).toContain(`const FAILURE_NOTICE_TEXT = ${JSON.stringify(FAILURE_NOTICE)};`);
+    expect(tools).toContain("import './time.js';");
+    expect(tools).toContain("import './schedule-stats.js';");
+  });
+});

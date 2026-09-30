@@ -41,6 +41,15 @@ import type { OutboundMessage } from './mailbox/index.js';
 const ACTIVE_POLL_MS = 1000;
 const SWEEP_POLL_MS = 60_000;
 const MAX_DELIVERY_ATTEMPTS = 3;
+
+/**
+ * The one plain sentence the principal sees whenever the assistant could not
+ * finish what they asked. The agent-runner sends the same sentence for a
+ * failed run (container/agent-runner/src/poll-loop.ts); the two runtimes share
+ * no modules, so the text is written in both places.
+ */
+const FAILURE_NOTICE_TEXT = "Something went wrong on my side and I couldn't finish that. Please send it again.";
+
 /**
  * Sessions drained in parallel per poll tick. A visit is one mailbox round
  * trip (read the queue) plus the channel sends; serially, a tick scaled as
@@ -294,6 +303,7 @@ async function drainSession(session: Session): Promise<void> {
     }
   }
 
+  let failureNoticeSent = false;
   for (const msg of pending) {
     try {
       const platformMsgId = await deliverMessage(msg, session);
@@ -341,6 +351,11 @@ async function drainSession(session: Session): Promise<void> {
         try {
           await withExistingMailboxSession(agentGroup.id, session.id, (mailbox) => mailbox.markDeliveryFailed(msg.id));
           await clearAttemptRow(msg.id);
+          // One notice per pass, however many replies failed with it.
+          if (!failureNoticeSent && isUserFacingPost(msg)) {
+            failureNoticeSent = true;
+            await sendFailureNotice(session, msg);
+          }
         } catch (markErr) {
           log.error('Failed to record permanent delivery failure', {
             messageId: msg.id,
@@ -554,6 +569,67 @@ async function deliverMessage(
   clearOutbox(session.agent_group_id, session.id, msg.id);
 
   return platformMsgId;
+}
+
+/**
+ * A row the principal would have seen as a message. System actions, task run
+ * logs, and agent-to-agent traffic are not; neither is a reaction the agent
+ * placed, which is decoration rather than a reply.
+ */
+function isUserFacingPost(msg: OutboundMessage): boolean {
+  if (msg.kind === 'system' || msg.kind === 'task_log' || msg.channelType === 'agent') return false;
+  if (!msg.channelType || !msg.platformId) return false;
+  let content: unknown;
+  /* eslint-disable no-catch-all/no-catch-all -- an unreadable row was still meant for the channel */
+  try {
+    content = JSON.parse(msg.content);
+  } catch {
+    return true;
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+  return (content as { operation?: unknown } | null)?.operation !== 'reaction';
+}
+
+/**
+ * Tell the session's conversation, in the one fixed sentence, that the
+ * assistant could not finish. Used for a reply that failed permanently and
+ * for an inbound message that failed after its last retry
+ * (src/reconcile-session.ts). The reason goes to the host log only.
+ *
+ * The notice goes to the chat the session serves, in the failed reply's
+ * thread when that reply was bound for the same chat. It is one direct send
+ * through the channel adapter, never queued or retried, so a channel that is
+ * itself failing cannot turn one notice into a stream of them. A session with
+ * no chat (a task session) or whose chat the bot has left has no one to tell.
+ */
+export async function sendFailureNotice(
+  session: Session,
+  failed?: { channelType: string | null; platformId: string | null; threadId: string | null },
+  options: { readonly onlyToThatChat?: boolean } = {},
+): Promise<void> {
+  if (!deliveryAdapter || !session.messaging_group_id) return;
+  const mg = await getMessagingGroup(session.messaging_group_id);
+  if (!mg || mg.detached_at) return;
+  const sameChat = failed?.channelType === mg.channel_type && failed.platformId === mg.platform_id;
+  // A failure is reported only to the chat it came from when the caller asks.
+  if (options.onlyToThatChat && !sameChat) return;
+  const threadId = sameChat ? failed.threadId : session.thread_id;
+  /* eslint-disable no-catch-all/no-catch-all -- the notice is best effort; its failure is logged, never retried */
+  try {
+    await deliveryAdapter.deliver(
+      mg.channel_type,
+      mg.platform_id,
+      threadId,
+      'chat',
+      JSON.stringify({ text: FAILURE_NOTICE_TEXT }),
+      undefined,
+      mg.instance,
+    );
+    log.info('Failure notice delivered', { sessionId: session.id, channelType: mg.channel_type });
+  } catch (err) {
+    log.error('Failure notice could not be delivered', { sessionId: session.id, channelType: mg.channel_type, err });
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
 }
 
 /**

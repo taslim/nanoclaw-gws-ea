@@ -91,7 +91,7 @@ describe('stripHarnessTagArtifacts', () => {
 
 // Delivery boundaries exercised through the real processQuery path:
 // - Wrapped result message bodies are sanitized before delivery.
-// - Bare error-result diagnostics without result.error receive a generic notice.
+// - Error-result diagnostics, with or without result.error, receive the fixed notice.
 // Mid-turn sanitization is covered in poll-loop.midturn.test.ts; provider billing
 // errors are covered separately in providers/claude.errors.test.ts.
 describe('harness tag artifacts stripped from deliveries (wiring)', () => {
@@ -127,13 +127,15 @@ describe('harness tag artifacts stripped from deliveries (wiring)', () => {
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0].content).text).toBe('The agent run failed. Check the logs for details.');
+    expect(JSON.parse(out[0].content).text).toBe(
+      "Something went wrong on my side and I couldn't finish that. Please send it again.",
+    );
     // No re-wrap nudge — an error result must not re-hammer the gateway.
     expect(pushes).toHaveLength(0);
   });
 });
 
-it('sanitizes the dedicated provider error field without delivering private result text', async () => {
+it('keeps the dedicated provider error field and private result text out of the channel', async () => {
   const { query, pushes } = makeResultQuery({
     type: 'result',
     text: 'Private raw transport diagnostic',
@@ -145,7 +147,10 @@ it('sanitizes the dedicated provider error field without delivering private resu
 
   const out = getUndeliveredMessages();
   expect(out).toHaveLength(1);
-  expect(JSON.parse(out[0].content).text).toBe('Please try again later.');
+  expect(JSON.parse(out[0].content).text).toBe(
+    "Something went wrong on my side and I couldn't finish that. Please send it again.",
+  );
+  expect(out[0].content).not.toContain('Please try again later.');
   expect(out[0].content).not.toContain('Private raw transport diagnostic');
   expect(pushes).toHaveLength(0);
 });

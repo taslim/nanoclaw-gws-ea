@@ -45,6 +45,11 @@ export interface MessageRetry {
   id: string;
   tries: number;
   processAfter: string | null;
+  /** Where the message came from, so a failure is reported back to that chat only. */
+  kind: string;
+  channelType: string | null;
+  platformId: string | null;
+  threadId: string | null;
 }
 
 export interface ProcessingClaim {

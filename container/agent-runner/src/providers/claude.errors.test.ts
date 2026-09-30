@@ -47,42 +47,48 @@ afterEach(() => {
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-it.each([false, true])('delivers the Claude SDK billing error once, with prior reply=%s', async (partialReply) => {
-  sdkMessages.push({ type: 'system', subtype: 'init', session_id: 'billing-session' });
-  if (partialReply) {
-    sdkMessages.push({
-      type: 'assistant',
-      message: { content: [{ type: 'text', text: '<message to="main">Finished the first step.</message>' }] },
-    });
-  }
-  sdkMessages.push({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: [BILLING_ERROR] });
-  const provider = createProvider('claude');
-  provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
-  const query = provider.query({ prompt: 'continue', cwd: tmp });
-  const pushes: string[] = [];
-  query.push = (message) => pushes.push(message);
-  const exchanges: ProviderExchange[] = [];
+const FAILURE_NOTICE = "Something went wrong on my side and I couldn't finish that. Please send it again.";
 
-  await processQuery(
-    query,
-    { platformId: 'chan-1', channelType: 'discord', threadId: null, inReplyTo: 'm1' },
-    ['m1'],
-    'claude',
-    (exchange) => exchanges.push(exchange),
-    'continue',
-    undefined,
-    claudeRuntimeContract.textDelivery === 'mid-turn-complete',
-  );
+it.each([false, true])(
+  'answers a Claude SDK billing error with the fixed sentence once, with prior reply=%s',
+  async (partialReply) => {
+    sdkMessages.push({ type: 'system', subtype: 'init', session_id: 'billing-session' });
+    if (partialReply) {
+      sdkMessages.push({
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: '<message to="main">Finished the first step.</message>' }] },
+      });
+    }
+    sdkMessages.push({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: [BILLING_ERROR] });
+    const provider = createProvider('claude');
+    provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
+    const query = provider.query({ prompt: 'continue', cwd: tmp });
+    const pushes: string[] = [];
+    query.push = (message) => pushes.push(message);
+    const exchanges: ProviderExchange[] = [];
 
-  expect(getUndeliveredMessages().map((row) => JSON.parse(row.content).text)).toEqual([
-    ...(partialReply ? ['Finished the first step.'] : []),
-    BILLING_ERROR,
-  ]);
-  expect(exchanges).toEqual([
-    { prompt: 'continue', result: BILLING_ERROR, continuation: 'billing-session', status: 'error' },
-  ]);
-  expect(pushes).toHaveLength(0);
-});
+    await processQuery(
+      query,
+      { platformId: 'chan-1', channelType: 'discord', threadId: null, inReplyTo: 'm1' },
+      ['m1'],
+      'claude',
+      (exchange) => exchanges.push(exchange),
+      'continue',
+      undefined,
+      claudeRuntimeContract.textDelivery === 'mid-turn-complete',
+    );
+
+    // The billing error stays in the exchange archive and the log; the chat gets the fixed sentence.
+    expect(getUndeliveredMessages().map((row) => JSON.parse(row.content).text)).toEqual([
+      ...(partialReply ? ['Finished the first step.'] : []),
+      FAILURE_NOTICE,
+    ]);
+    expect(exchanges).toEqual([
+      { prompt: 'continue', result: BILLING_ERROR, continuation: 'billing-session', status: 'error' },
+    ]);
+    expect(pushes).toHaveLength(0);
+  },
+);
 
 it('keeps a Claude task billing failure in its task log and out of chat', async () => {
   sdkMessages.push({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: [BILLING_ERROR] });

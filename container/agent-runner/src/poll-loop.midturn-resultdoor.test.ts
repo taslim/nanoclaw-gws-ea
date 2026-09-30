@@ -231,7 +231,9 @@ describe('error and interrupted turns', () => {
       true,
     );
 
-    expect(deliveredTexts()).toEqual(['The agent run failed. Check the logs for details.']);
+    expect(deliveredTexts()).toEqual([
+      "Something went wrong on my side and I couldn't finish that. Please send it again.",
+    ]);
     expect(pushes).toHaveLength(0);
     expect(exchanges).toHaveLength(1);
     expect(exchanges[0].status).toBe('error');
@@ -270,7 +272,10 @@ describe('error and interrupted turns', () => {
       true,
     );
 
-    expect(deliveredTexts()).toEqual(['Sent before failure.', 'The agent run failed. Check the logs for details.']);
+    expect(deliveredTexts()).toEqual([
+      'Sent before failure.',
+      "Something went wrong on my side and I couldn't finish that. Please send it again.",
+    ]);
     expect(pushes).toHaveLength(0);
     expect(exchanges).toHaveLength(1);
     expect(exchanges[0].status).toBe('error');
@@ -290,8 +295,11 @@ describe('error and interrupted turns', () => {
 
     expect(deliveredTexts()).toEqual(
       progress
-        ? ['Progress before failure.', 'The agent run failed. Check the logs for details.']
-        : ['The agent run failed. Check the logs for details.'],
+        ? [
+            'Progress before failure.',
+            "Something went wrong on my side and I couldn't finish that. Please send it again.",
+          ]
+        : ["Something went wrong on my side and I couldn't finish that. Please send it again."],
     );
     expect(pushes).toHaveLength(0);
   });
@@ -310,7 +318,10 @@ describe('error and interrupted turns', () => {
     ).rejects.toThrow('SDK stream died');
 
     // The mid-turn write is durable — an interrupted turn cannot claw it back.
-    expect(deliveredTexts()).toEqual(['Sent before the crash.', 'The agent run failed. Check the logs for details.']);
+    expect(deliveredTexts()).toEqual([
+      'Sent before the crash.',
+      "Something went wrong on my side and I couldn't finish that. Please send it again.",
+    ]);
   });
 });
 
