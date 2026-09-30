@@ -287,6 +287,8 @@ async function validateComposition(
     'scripts/init-first-agent.ts',
     'src/modules/gws-ea-profile/index.ts',
     'src/modules/gws-ea-profile/migration.ts',
+    'src/modules/gws-ea-preferences/index.ts',
+    'src/modules/gws-ea-preferences/migration.ts',
     'src/modules/index.ts',
   ];
   const gatewayFiles = [
@@ -318,6 +320,7 @@ async function validateComposition(
     await assertBarrelImports(checkoutRoot, [
       { barrel: 'src/channels/index.ts', moduleName: 'gchat', code: 'incomplete_release' },
       { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-profile/index', code: 'incomplete_release' },
+      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-preferences/index', code: 'incomplete_release' },
       { barrel: 'src/gateway-providers/index.ts', moduleName: 'installed', code: 'gateway_not_composed' },
       { barrel: 'src/gateway-providers/installed.ts', moduleName: 'onecli', code: 'gateway_not_composed' },
       ...[

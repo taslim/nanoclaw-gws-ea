@@ -138,7 +138,13 @@ async function releaseFixture(): Promise<string> {
   await write(root, 'scripts/init-first-agent.ts', 'export {};\n');
   await write(root, 'src/modules/gws-ea-profile/index.ts', 'export {};\n');
   await write(root, 'src/modules/gws-ea-profile/migration.ts', 'export {};\n');
-  await write(root, 'src/modules/index.ts', "import './gws-ea-profile/index.js';\n");
+  await write(root, 'src/modules/gws-ea-preferences/index.ts', 'export {};\n');
+  await write(root, 'src/modules/gws-ea-preferences/migration.ts', 'export {};\n');
+  await write(
+    root,
+    'src/modules/index.ts',
+    "import './gws-ea-profile/index.js';\nimport './gws-ea-preferences/index.js';\n",
+  );
   await write(root, 'src/provider-contracts/claude.ts', "export const provider = 'claude';\n");
   await write(root, 'src/provider-contracts/index.ts', "import './claude.js';\n");
   await write(root, 'setup/providers/claude.ts', "export const provider = 'claude';\n");
@@ -254,6 +260,7 @@ describe('release preflight', () => {
     ['GWS-EA interactive launcher', 'setup/gws-ea-input.ts', 'incomplete_release'],
     ['GWS-EA service launcher', 'src/gws-ea/process.ts', 'incomplete_release'],
     ['GWS-EA profile migration', 'src/modules/gws-ea-profile/migration.ts', 'incomplete_release'],
+    ['GWS-EA preferences migration', 'src/modules/gws-ea-preferences/migration.ts', 'incomplete_release'],
     ['OneCLI gateway adapter', 'src/gateway-providers/onecli.ts', 'gateway_not_composed'],
     ['OneCLI agent instructions', 'container/skills/onecli-gateway/SKILL.md', 'gateway_not_composed'],
     ['provider host contract', 'src/provider-contracts/claude.ts', 'provider_not_composed'],
