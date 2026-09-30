@@ -172,6 +172,7 @@ function bootstrapManifest(paths: ControlPlanePaths): ProductionBootstrapManifes
       assistant_display_name: 'Aya',
       principal_display_name: 'Principal',
       principal_timezone: 'America/Los_Angeles',
+      principal_emails: ['principal@example.test'],
     },
     selected_messaging_group_id: null,
   };
@@ -680,6 +681,30 @@ describe('production bootstrap trust boundary', () => {
       code: 'invalid_bootstrap_manifest',
       message: expect.stringContaining('docker_endpoint'),
     });
+  });
+
+  it("keeps the principal's addresses lowercased and each once, and refuses a manifest without a valid one", async () => {
+    const paths = await testPaths();
+    const file = path.join(path.dirname(paths.configRoot), 'setup.json');
+    const manifest = bootstrapManifest(paths);
+    const load = async (principalEmails: unknown) => {
+      await writeFile(
+        file,
+        JSON.stringify({ ...manifest, identity: { ...manifest.identity, principal_emails: principalEmails } }),
+        { mode: 0o600 },
+      );
+      return loadProductionBootstrapManifest(file);
+    };
+
+    await expect(
+      load(['Principal@Example.test', 'second@example.test', 'principal@example.test']),
+    ).resolves.toMatchObject({ identity: { principal_emails: ['principal@example.test', 'second@example.test'] } });
+    for (const invalid of [undefined, [], ['not-an-email'], 'principal@example.test']) {
+      await expect(load(invalid), JSON.stringify(invalid)).rejects.toMatchObject({
+        code: 'invalid_bootstrap_manifest',
+        message: expect.stringMatching(/principal email/i),
+      });
+    }
   });
 
   it('stages and removes only the validated bootstrap file before reservation publication', async () => {

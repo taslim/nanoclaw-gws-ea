@@ -59,6 +59,7 @@ import {
 } from './service.js';
 import { instanceServicePlatform } from './service-coordinates.js';
 import { runInstanceNclJson } from './ncl.js';
+import { normalizePrincipalEmail } from './create-input.js';
 import { reconcileMainIdentity, type MainIdentityDependencies, type MainIdentityInput } from './identity.js';
 import {
   listPrincipalCandidates,
@@ -1236,6 +1237,8 @@ export interface ProductionBootstrapManifest {
     readonly assistant_display_name: string;
     readonly principal_display_name: string;
     readonly principal_timezone: string;
+    /** The principal's addresses create collected: one or more, lowercased, each once. */
+    readonly principal_emails: readonly string[];
   };
   readonly selected_messaging_group_id: string | null;
 }
@@ -1244,6 +1247,18 @@ const INVALID_BOOTSTRAP = 'invalid_bootstrap_manifest';
 
 function bootstrapString(value: unknown, label: string, maximum?: number): string {
   return requireString(value, label, INVALID_BOOTSTRAP, maximum);
+}
+
+function bootstrapPrincipalEmails(value: unknown): readonly string[] {
+  const invalid = (): GwsEaError =>
+    new GwsEaError(INVALID_BOOTSTRAP, 'Bootstrap principal email addresses must be one or more email addresses');
+  if (!Array.isArray(value) || value.length === 0) throw invalid();
+  const emails = value.map((candidate) => {
+    const email = typeof candidate === 'string' ? normalizePrincipalEmail(candidate) : undefined;
+    if (email === undefined) throw invalid();
+    return email;
+  });
+  return [...new Set(emails)];
 }
 
 export function validateProductionBootstrapManifest(value: unknown): ProductionBootstrapManifest {
@@ -1294,6 +1309,7 @@ export function validateProductionBootstrapManifest(value: unknown): ProductionB
       assistant_display_name: bootstrapString(identity.assistant_display_name, 'assistant display name', 120),
       principal_display_name: bootstrapString(identity.principal_display_name, 'principal display name', 120),
       principal_timezone: bootstrapString(identity.principal_timezone, 'principal timezone', 128),
+      principal_emails: bootstrapPrincipalEmails(identity.principal_emails),
     },
     selected_messaging_group_id:
       selected === null || selected === undefined
@@ -1427,6 +1443,7 @@ async function resolveProvisionSource(
         assistantWorkspaceEmail: reservation.exclusive_resource_claims.workspace_email,
         principalDisplayName: manifest.identity.principal_display_name,
         principalTimezone: manifest.identity.principal_timezone,
+        principalEmails: manifest.identity.principal_emails,
       },
       bootstrapMessagingGroupId: manifest.selected_messaging_group_id,
     };
@@ -1444,6 +1461,7 @@ async function resolveProvisionSource(
     providerCredentialMetadata: preflight.providerCredential,
     providerCapabilityDigest: preflight.providerCapabilityDigest,
     profile,
+    // No principal addresses: once main is published, the profile holds them and the principal and operator change them.
     identity: {
       assistantDisplayName: profile.assistant_display_name,
       assistantWorkspaceEmail: profile.assistant_workspace_email,

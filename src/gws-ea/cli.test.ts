@@ -107,6 +107,7 @@ function setupAnswers() {
         assistant_display_name: 'Aya',
         principal_display_name: 'Principal',
         principal_timezone: 'America/Los_Angeles',
+        principal_emails: ['principal@example.test'],
       },
       selected_messaging_group_id: null,
     },
@@ -1111,6 +1112,76 @@ describe('gws-ea release sources', () => {
     expect(await runCli(['create', '--track', 'canary'], { paths, ...io.runtime, ...createRuntime() })).toBe(1);
     expect(io.err.join('\n')).toContain('--source-remote');
     expect(io.out).toEqual([]);
+  });
+});
+
+describe("gws-ea create and the principal's email addresses", () => {
+  async function contextsOf(extra: readonly string[]): Promise<CreatePromptContext[]> {
+    const paths = await testPaths();
+    const contexts: CreatePromptContext[] = [];
+    expect(
+      await runCli(['create', '--track', 'dogfood', '--source-remote', PRIVATE_REMOTE, ...extra], {
+        paths,
+        ...lines().runtime,
+        ...createRuntime(),
+        collectCreateInputs: async (context) => {
+          contexts.push(context);
+          return setupAnswers();
+        },
+        advanceProvision: async () => ({ status: 'paused', pause: DM_PAUSE }),
+      }),
+    ).toBe(10);
+    return contexts;
+  }
+
+  it('hands create inputs every --principal-email, lowercased and each once', async () => {
+    const contexts = await contextsOf([
+      '--principal-email',
+      'Taslim@Example.test',
+      '--principal-email',
+      'taslim@work.example.test',
+      '--principal-email',
+      'TASLIM@example.test',
+    ]);
+
+    expect(contexts.map((context) => context.providedPrincipalEmails)).toEqual([
+      ['taslim@example.test', 'taslim@work.example.test'],
+    ]);
+  });
+
+  it('hands create inputs no address when none is passed, so a person is asked', async () => {
+    const contexts = await contextsOf([]);
+
+    expect(contexts.map((context) => context.providedPrincipalEmails)).toEqual([[]]);
+  });
+
+  it.each([
+    [['--principal-email', 'not-an-email'], '--principal-email: "not-an-email" is not an email address'],
+    [['--principal-email'], 'Option --principal-email requires a value'],
+  ])('refuses %j before anything runs, naming the flag', async (extra, message) => {
+    const paths = await testPaths();
+    const before = await everythingUnder(paths);
+    const collectCreateInputs = vi.fn();
+    const io = lines();
+
+    expect(
+      await runCli(['create', '--track', 'dogfood', '--principal-email', 'taslim@example.test', ...extra], {
+        paths,
+        ...io.runtime,
+        ...createRuntime(),
+        collectCreateInputs,
+      }),
+    ).toBe(1);
+    expect(io.err).toEqual([message, 'Run gws-ea --help for usage.']);
+    expect(collectCreateInputs).not.toHaveBeenCalled();
+    expect(await everythingUnder(paths)).toEqual(before);
+  });
+
+  it('names --principal-email in the usage, once per address', async () => {
+    const io = lines();
+
+    expect(await runCli(['--help'], io.runtime)).toBe(0);
+    expect(io.out.join('\n')).toContain('[--principal-email <email>]...');
   });
 });
 

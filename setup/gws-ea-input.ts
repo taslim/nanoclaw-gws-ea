@@ -2,6 +2,8 @@ import * as p from '@clack/prompts';
 
 import {
   describeSecretInput,
+  normalizePrincipalEmail,
+  PRINCIPAL_EMAIL_FLAG,
   type CloudflareZoneChoice,
   type CreateIngressAnswer,
   type CreateInputFlag,
@@ -167,6 +169,53 @@ function workspaceEmailProblem(value: string): string | undefined {
   if (!EMAIL_PATTERN.test(value)) return 'Enter a valid email address';
   if (isConsumerGoogleAccount(value)) return 'Enter a Google Workspace address, not a personal Google account';
   return undefined;
+}
+
+/**
+ * The principal's addresses from `--principal-email`, or asked for when a
+ * person is present. Never the assistant's own address.
+ */
+async function principalEmailsInput(source: InputSource, assistantWorkspaceEmail: string): Promise<string[]> {
+  const assistant = assistantWorkspaceEmail.trim().toLowerCase();
+  const provided = source.context.providedPrincipalEmails;
+  if (provided.length > 0) {
+    if (provided.includes(assistant)) {
+      throw new GwsEaError(
+        'invalid_arguments',
+        `--${PRINCIPAL_EMAIL_FLAG}: ${assistant} is the assistant's own address; give the principal's addresses`,
+        { details: { flag: `--${PRINCIPAL_EMAIL_FLAG}` } },
+      );
+    }
+    return [...provided];
+  }
+  if (!source.interactive) {
+    throw new GwsEaError(
+      'input_required',
+      `Missing --${PRINCIPAL_EMAIL_FLAG}; pass it once per address, or run gws-ea create in a terminal to be asked.`,
+      { details: { flag: `--${PRINCIPAL_EMAIL_FLAG}` } },
+    );
+  }
+  const answer = await askText(source.prompts, 'Principal email addresses', {
+    placeholder: 'Comma-separated',
+    validate: (value) => principalEmailsFrom(value, assistant).problem,
+  });
+  return principalEmailsFrom(answer, assistant).emails;
+}
+
+function principalEmailsFrom(value: string, assistant: string): { emails: string[]; problem?: string } {
+  const entries = value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== '');
+  if (entries.length === 0) return { emails: [], problem: 'Enter at least one email address' };
+  const emails: string[] = [];
+  for (const entry of entries) {
+    const email = normalizePrincipalEmail(entry);
+    if (email === undefined) return { emails: [], problem: `${entry} is not an email address` };
+    if (email === assistant) return { emails: [], problem: `${email} is the assistant's own address` };
+    if (!emails.includes(email)) emails.push(email);
+  }
+  return { emails };
 }
 
 function systemTimezone(): string {
@@ -417,6 +466,7 @@ export async function collectGwsEaCreateInput(
   const assistantWorkspaceEmail = await textInput(source, 'workspace-email', 'Assistant Google Workspace email', {
     validate: workspaceEmailProblem,
   });
+  const principalEmails = await principalEmailsInput(source, assistantWorkspaceEmail);
   const ingress = await collectIngress(source, assistantFirst);
   const provider = await chooseProvider(providers, source);
   const metadata = provider.provisioning.credentialMetadata({ allowAmbientConfiguration: false });
@@ -448,6 +498,7 @@ export async function collectGwsEaCreateInput(
         assistant_display_name: displayName(assistantFirst, assistantLast),
         principal_display_name: displayName(principalFirst, principalLast),
         principal_timezone: principalTimezone,
+        principal_emails: principalEmails,
       },
       selected_messaging_group_id: null,
     },
