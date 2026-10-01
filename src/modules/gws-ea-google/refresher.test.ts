@@ -169,13 +169,21 @@ describe('the Google token refresher', () => {
     expect(log.warn).toHaveBeenCalled();
   });
 
-  it('never writes a token or the refresh token into a log line', async () => {
-    const f = fake({ scope: () => 'https://www.googleapis.com/auth/gmail.modify' });
-    const { refresher: r, log } = refresher(f, () => GRANT, { now: 0 });
+  it('never writes a token, the refresh token, or the client secret into a log line', async () => {
+    // Every line the refresher logs: a renewal, a token Google did not narrow, and a revoked sign-in.
+    const renewed = refresher(fake(), () => GRANT, { now: 0 });
+    const unnarrowed = refresher(fake({ scope: () => 'https://www.googleapis.com/auth/gmail.modify' }), () => GRANT, {
+      now: 0,
+    });
+    const revoked = refresher(fake({ error: 'invalid_grant' }), () => GRANT, { now: 0 });
+    for (const run of [renewed, unnarrowed, revoked]) await run.refresher.tick();
 
-    await r.tick();
-
-    const logged = JSON.stringify([log.info.mock.calls, log.warn.mock.calls, log.error.mock.calls]);
+    expect(renewed.log.info).toHaveBeenCalledWith('Renewed Google access for agents', expect.anything());
+    expect(unnarrowed.log.warn).toHaveBeenCalled();
+    expect(revoked.log.error).toHaveBeenCalled();
+    const logged = JSON.stringify(
+      [renewed, unnarrowed, revoked].map(({ log }) => [log.info.mock.calls, log.warn.mock.calls, log.error.mock.calls]),
+    );
     expect(logged).not.toContain('ya29.');
     expect(logged).not.toContain(GRANT.refresh_token);
     expect(logged).not.toContain(GRANT.client_secret);

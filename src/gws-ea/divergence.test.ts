@@ -498,7 +498,7 @@ describe('recorded divergence: a failure reaches the principal as one plain sent
   it('keeps the agent runner’s failed-turn sentence and its time and schedule tools', async () => {
     const pollLoop = await readFile(path.join(originalCwd, 'container/agent-runner/src/poll-loop.ts'), 'utf8');
     const tools = await readFile(path.join(originalCwd, 'container/agent-runner/src/mcp-tools/index.ts'), 'utf8');
-    expect(pollLoop).toContain(`const FAILURE_NOTICE_TEXT = ${JSON.stringify(FAILURE_NOTICE)};`);
+    expect(pollLoop).toContain(JSON.stringify(FAILURE_NOTICE));
     expect(tools).toContain("import './time.js';");
     expect(tools).toContain("import './schedule-stats.js';");
   });

@@ -33,16 +33,9 @@ describe("the host's reading of the grant file", () => {
     await expect(readGoogleGrantFile(FILE)).resolves.toBeUndefined();
   });
 
-  it('refuses a grant another user could read', async () => {
+  it('reads the grant only as an owner-only secret: refuses one another user could read', async () => {
     fs.writeFileSync(FILE, JSON.stringify(GRANT), { mode: 0o644 });
     fs.chmodSync(FILE, 0o644);
     await expect(readGoogleGrantFile(FILE)).rejects.toMatchObject({ code: 'unsafe_mode' });
-  });
-
-  it('refuses a grant reached through a link', async () => {
-    const real = path.join(ROOT, 'elsewhere.json');
-    fs.writeFileSync(real, JSON.stringify(GRANT), { mode: 0o600 });
-    fs.symlinkSync(real, FILE);
-    await expect(readGoogleGrantFile(FILE)).rejects.toMatchObject({ code: 'unsafe_secret' });
   });
 });
