@@ -2,6 +2,9 @@ import { GwsEaError } from './types.js';
 
 const GWS_EA_RELEASE_REMOTE = 'https://github.com/taslim/nanoclaw-gws-ea.git';
 
+/** What an assistant's record accepts as a track: also the branch a non-product track installs. */
+export const RELEASE_TRACK_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
 /**
  * The branch each product release track follows in the public repository, or
  * `null` while the track has no release. A track names a release line; which
@@ -27,6 +30,13 @@ export interface ReleaseSource {
  * same name in the repository `--source-remote` names.
  */
 export function resolveReleaseSource(track: string, sourceRemote?: string): ReleaseSource {
+  if (!RELEASE_TRACK_PATTERN.test(track)) {
+    throw new GwsEaError(
+      'invalid_release_track',
+      `Release track ${track} is not a valid track name: use lowercase letters, digits, '.', '_', and '-', ` +
+        `starting with a letter or digit, at most 64 characters. A branch with '/' in its name cannot be a track.`,
+    );
+  }
   const override = sourceRemote?.trim() || undefined;
   if (!Object.hasOwn(PRODUCT_TRACKS, track)) {
     if (!override) {

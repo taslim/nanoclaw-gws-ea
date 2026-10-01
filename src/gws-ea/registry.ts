@@ -6,6 +6,7 @@ import { processLock } from '../community-portal/process-lock.js';
 import { isErrno } from '../community-portal/errors.js';
 import { deriveGchatServiceAccountEmail, GCP_PROJECT_PATTERN } from './gcp-identity.js';
 import { validateExistingGchatEndpoint } from './endpoint.js';
+import { RELEASE_TRACK_PATTERN } from './release-tracks.js';
 import {
   assertOwnedDirectory,
   assertPrivateDirectory,
@@ -39,7 +40,6 @@ import {
 } from './validation.js';
 
 const INSTANCE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const RELEASE_TRACK_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 const ONECLI_PROJECT_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 const CLOUDFLARE_ID_PATTERN = /^[0-9a-f]{32}$/;
