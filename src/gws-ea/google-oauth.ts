@@ -145,9 +145,13 @@ const CALLBACK_PAGE = (heading: string): string =>
  * Google's redirect to the loopback server, resolving with its query. It
  * listens at once, so no redirect is missed, but the time limit starts only
  * at `arm`, once the operator is ready to sign in; `cancel` stops the wait.
+ * Only a redirect carrying this sign-in's `state` ends the wait: any other
+ * request to the port is refused, so another local process cannot cut the
+ * operator's sign-in short.
  */
 function awaitRedirect(
   server: Server,
+  state: string,
   timeoutMs: number,
 ): { readonly done: Promise<URLSearchParams>; arm(): void; cancel(): void } {
   let timer: NodeJS.Timeout | undefined;
@@ -159,6 +163,12 @@ function awaitRedirect(
       const url = new URL(request.url ?? '/', 'http://127.0.0.1');
       if (url.pathname !== '/' || (!url.searchParams.has('code') && !url.searchParams.has('error'))) {
         response.writeHead(404).end();
+        return;
+      }
+      if (url.searchParams.get('state') !== state) {
+        response
+          .writeHead(400, { 'content-type': 'text/html; charset=utf-8' })
+          .end(CALLBACK_PAGE('This is not the sign-in gws-ea is waiting for.'));
         return;
       }
       response
@@ -210,7 +220,7 @@ export async function signInAsAssistant(input: AssistantSignInInput): Promise<Go
   let query: URLSearchParams;
   let redirect: ReturnType<typeof awaitRedirect> | undefined;
   try {
-    redirect = awaitRedirect(server, input.timeoutMs ?? SIGN_IN_TIMEOUT_MS);
+    redirect = awaitRedirect(server, state, input.timeoutMs ?? SIGN_IN_TIMEOUT_MS);
     const authorization = new URL(GOOGLE_AUTHORIZATION_ENDPOINT);
     authorization.search = new URLSearchParams({
       client_id: input.client.client_id,
@@ -232,8 +242,6 @@ export async function signInAsAssistant(input: AssistantSignInInput): Promise<Go
     server.close();
   }
 
-  if (query.get('state') !== state)
-    throw signInFailed('The Google sign-in returned to the wrong request; run it again');
   const refusal = query.get('error');
   if (refusal !== null) {
     throw signInFailed(

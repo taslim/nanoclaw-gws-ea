@@ -216,12 +216,41 @@ describe('signing in as the assistant', () => {
     ).rejects.toMatchObject({ code: 'google_sign_in_failed' });
   });
 
-  it('refuses a redirect whose state does not match, without exchanging its code', async () => {
+  it('refuses a request with another state and keeps waiting for the real redirect', async () => {
+    const g = google();
+    const refused: number[] = [];
+    const present = vi.fn(async (url: string) => {
+      const authUrl = new URL(url);
+      const redirect = (query: Record<string, string>): URL => {
+        const target = new URL(authUrl.searchParams.get('redirect_uri') ?? '');
+        for (const [key, value] of Object.entries(query)) target.searchParams.set(key, value);
+        return target;
+      };
+      refused.push((await fetch(redirect({ code: 'forged-code', state: 'not-the-state' }))).status);
+      void fetch(redirect({ code: 'auth-code', state: authUrl.searchParams.get('state') ?? '' })).catch(
+        () => undefined,
+      );
+    });
+
+    const grant = await signInAsAssistant({ client: CLIENT, account: 'robin@example.test', present, fetch: g.fetch });
+
+    expect(refused).toEqual([400]);
+    expect(g.exchanges.map((exchange) => exchange.get('code'))).toEqual(['auth-code']);
+    expect(grant.account).toBe('robin@example.test');
+  });
+
+  it('never exchanges a code that arrives with another state', async () => {
     const g = google();
     const b = browser(() => ({ code: 'forged-code', state: 'not-the-state' }));
     await expect(
-      signInAsAssistant({ client: CLIENT, account: 'robin@example.test', present: b.present, fetch: g.fetch }),
-    ).rejects.toMatchObject({ code: 'google_sign_in_failed' });
+      signInAsAssistant({
+        client: CLIENT,
+        account: 'robin@example.test',
+        present: b.present,
+        fetch: g.fetch,
+        timeoutMs: 300,
+      }),
+    ).rejects.toMatchObject({ code: 'google_sign_in_timeout' });
     expect(g.exchanges).toEqual([]);
   });
 

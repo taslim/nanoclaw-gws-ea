@@ -1444,16 +1444,20 @@ async function resolveProvisionSource(
   manifest: ProductionBootstrapManifest | undefined,
 ): Promise<ProvisionSource> {
   if (manifest) {
+    const profile = readPersistedProfile(runtime);
     return {
       providerCredentialMetadata: bootstrapProviderCredential(manifest),
       providerCapabilityDigest: manifest.provider_capability_digest,
-      profile: readPersistedProfile(runtime),
+      profile,
       identity: {
         assistantDisplayName: manifest.identity.assistant_display_name,
         assistantWorkspaceEmail: reservation.exclusive_resource_claims.workspace_email,
         principalDisplayName: manifest.identity.principal_display_name,
         principalTimezone: manifest.identity.principal_timezone,
-        principalEmails: manifest.identity.principal_emails,
+        // Create's addresses seed the profile once. A manifest that outlived
+        // publication (its removal was interrupted) must not replace
+        // addresses the principal or operator changed since.
+        ...(profile ? {} : { principalEmails: manifest.identity.principal_emails }),
       },
       bootstrapMessagingGroupId: manifest.selected_messaging_group_id,
     };
