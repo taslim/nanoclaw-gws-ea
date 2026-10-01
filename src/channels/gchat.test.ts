@@ -256,3 +256,60 @@ describe('Google Chat channel configuration', () => {
     expect(mocks.createGoogleChatAdapter).not.toHaveBeenCalled();
   });
 });
+
+describe('Google Chat quoted messages', () => {
+  function event(quotedMessageMetadata?: Record<string, unknown>): Record<string, unknown> {
+    return {
+      chat: {
+        messagePayload: {
+          space: { name: 'spaces/dm', spaceType: 'DIRECT_MESSAGE' },
+          message: { name: 'spaces/dm/messages/new', text: 'Can you move this?', quotedMessageMetadata },
+        },
+      },
+    };
+  }
+
+  it('gives the agent the quoted text and its sender', async () => {
+    const { extractGchatReplyContext } = await import('./gchat.js');
+
+    expect(
+      extractGchatReplyContext(
+        event({
+          name: 'spaces/dm/messages/old',
+          quoteType: 'REPLY',
+          quotedMessageSnapshot: { sender: 'Robin', text: 'Thursday runs 9 to 5 with no break.' },
+        }),
+      ),
+    ).toEqual({ sender: 'Robin', text: 'Thursday runs 9 to 5 with no break.' });
+  });
+
+  it('gives nothing for a message that quotes nothing, or a quote with no text', async () => {
+    const { extractGchatReplyContext } = await import('./gchat.js');
+
+    expect(extractGchatReplyContext(event())).toBeNull();
+    expect(extractGchatReplyContext(event({ name: 'spaces/dm/messages/old', quotedMessageSnapshot: {} }))).toBeNull();
+    expect(extractGchatReplyContext({})).toBeNull();
+  });
+
+  it('names an unnamed sender rather than dropping the quote', async () => {
+    const { extractGchatReplyContext } = await import('./gchat.js');
+
+    expect(
+      extractGchatReplyContext(event({ name: 'spaces/dm/messages/old', quotedMessageSnapshot: { text: 'Lunch?' } })),
+    ).toEqual({ sender: 'unknown', text: 'Lunch?' });
+  });
+
+  it('is wired into the registered Google Chat bridge', async () => {
+    process.env.GCHAT_CREDENTIALS = credentialEnv;
+    process.env.GCHAT_ENDPOINT_URL = endpointUrl;
+    const { extractGchatReplyContext } = await import('./gchat.js');
+
+    await (
+      await registeredFactory()
+    )();
+
+    expect(mocks.createChatSdkBridge).toHaveBeenCalledWith(
+      expect.objectContaining({ extractReplyContext: extractGchatReplyContext }),
+    );
+  });
+});

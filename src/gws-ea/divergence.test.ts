@@ -8,7 +8,7 @@
  * check and the OneCLI servers behind `fetch`.
  */
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm } from 'node:fs/promises';
 import net, { type AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -27,6 +27,10 @@ const external = vi.hoisted(() => ({ requestWake: vi.fn(async () => true) }));
 vi.mock('@chat-adapter/gchat', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@chat-adapter/gchat')>();
   return { ...actual, createGoogleChatAdapter: vi.fn(actual.createGoogleChatAdapter) };
+});
+vi.mock('../channels/chat-sdk-bridge.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../channels/chat-sdk-bridge.js')>();
+  return { ...actual, createChatSdkBridge: vi.fn(actual.createChatSdkBridge) };
 });
 vi.mock('../channels/channel-registry.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../channels/channel-registry.js')>();
@@ -370,6 +374,76 @@ async function freePort(): Promise<number> {
 }
 
 const FAILURE_NOTICE = "Something went wrong on my side and I couldn't finish that. Please send it again.";
+
+describe('recorded divergence: Google Chat gives the agent the message a principal quotes', () => {
+  it('hands the registered bridge a reply-context hook that reads the quoted snapshot', async () => {
+    await freshInstall();
+    vi.stubEnv('GCHAT_CREDENTIALS', JSON.stringify({ client_email: 'bot@example.test', private_key: 'secret' }));
+    vi.stubEnv('GCHAT_ENDPOINT_URL', 'https://assistant.example.test/webhook/gchat');
+    const bridge = await import('../channels/chat-sdk-bridge.js');
+    await import('../channels/gchat.js');
+    const registry = await import('../channels/channel-registry.js');
+    const registration = vi
+      .mocked(registry.registerChannelAdapter)
+      .mock.calls.find(([name]) => name === 'gchat')?.[1] as ChannelRegistration | undefined;
+
+    await registration!.factory();
+
+    const hook = vi.mocked(bridge.createChatSdkBridge).mock.calls[0]?.[0].extractReplyContext;
+    expect(
+      hook?.({
+        chat: {
+          messagePayload: {
+            message: { quotedMessageMetadata: { quotedMessageSnapshot: { sender: 'Robin', text: 'Lunch at 1?' } } },
+          },
+        },
+      }),
+    ).toEqual({ sender: 'Robin', text: 'Lunch at 1?' });
+  });
+});
+
+describe('recorded divergence: a Google Chat message keeps its attachments', () => {
+  it('saves an attachment from a message whose ID holds slashes', async () => {
+    const directory = await freshInstall();
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    await db.createAgentGroup({
+      id: 'ag-1',
+      name: 'Main',
+      folder: 'main',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    await db.createMessagingGroup({
+      id: 'mg-1',
+      channel_type: 'gchat',
+      platform_id: 'gchat:spaces/dm',
+      name: 'Principal',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: new Date().toISOString(),
+    });
+    await mkdir(path.join(directory, 'groups'), { recursive: true });
+    await import('../mailbox/compose.js');
+    const { resolveSession, sessionDir, writeSessionMessage } = await import('../session-manager.js');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+
+    await writeSessionMessage('ag-1', session.id, {
+      id: 'spaces/dm/messages/abc.abc',
+      kind: 'chat-sdk',
+      timestamp: new Date().toISOString(),
+      platformId: 'gchat:spaces/dm',
+      channelType: 'gchat',
+      threadId: null,
+      content: JSON.stringify({ text: 'agenda', attachments: [{ name: 'agenda.txt', data: 'YWdlbmRh' }] }),
+    });
+
+    const inbox = path.join(sessionDir('ag-1', session.id), 'inbox');
+    const [folder] = await readdir(inbox);
+    expect(await readFile(path.join(inbox, folder!, 'agenda.txt'), 'utf8')).toBe('agenda');
+  });
+});
 
 describe('recorded divergence: a failure reaches the principal as one plain sentence', () => {
   it('tells the chat a failed message came from, and no one for a message from the host', async () => {

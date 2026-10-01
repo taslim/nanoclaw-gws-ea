@@ -18,8 +18,11 @@
  * This test asserts the SECURE behaviour (nothing written outside). It FAILS
  * against the current code, demonstrating the gap.
  */
+import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
+
+import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./config.js', async () => {
@@ -29,6 +32,7 @@ vi.mock('./config.js', async () => {
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from './db/index.js';
 import { createSession } from './db/sessions.js';
+import { inboundDbPath } from './mailbox/sqlite/paths.js';
 import { initSessionFolder, sessionDir, writeSessionMessage } from './session-manager.js';
 import type { Session } from './types.js';
 
@@ -99,5 +103,58 @@ describe('extractAttachmentFiles — inbox-root symlink containment (#2828 sibli
     const escaped = path.join(canaryDir, 'evil-inbox-root', 'pwn.txt');
     expect(fs.existsSync(escaped)).toBe(false);
     expect(fs.readdirSync(canaryDir)).toHaveLength(0);
+  });
+});
+
+describe('extractAttachmentFiles — a platform message ID that is not a file name', () => {
+  const GCHAT_ID = 'spaces/AAAA/messages/BBBB.BBBB';
+
+  function storedContent(id: string): Record<string, unknown> {
+    const inbound = new Database(inboundDbPath(AG, SESS), { readonly: true });
+    const row = inbound.prepare('SELECT content FROM messages_in WHERE id = ?').get(id) as { content: string };
+    inbound.close();
+    return JSON.parse(row.content) as Record<string, unknown>;
+  }
+
+  it('saves the attachment in a folder named for a hash of the ID, and points the message at it', async () => {
+    const content = JSON.stringify({
+      text: 'the agenda',
+      attachments: [{ name: 'agenda.txt', data: Buffer.from('agenda bytes').toString('base64') }],
+    });
+
+    await writeSessionMessage(AG, SESS, {
+      id: GCHAT_ID,
+      kind: 'chat-sdk',
+      timestamp: now(),
+      platformId: 'gchat:spaces/AAAA',
+      channelType: 'gchat',
+      threadId: null,
+      content,
+    });
+
+    const folder = `msg-${createHash('sha256').update(GCHAT_ID).digest('hex').slice(0, 32)}`;
+    const stored = storedContent(GCHAT_ID);
+    expect(stored.attachments).toEqual([{ name: 'agenda.txt', localPath: `inbox/${folder}/agenda.txt` }]);
+    expect(fs.readFileSync(path.join(sessionDir(AG, SESS), 'inbox', folder, 'agenda.txt'), 'utf8')).toBe(
+      'agenda bytes',
+    );
+  });
+
+  it('leaves a message with no attachment bytes as it was, creating no folder', async () => {
+    const content = JSON.stringify({ text: 'hello', attachments: [] });
+
+    await writeSessionMessage(AG, SESS, {
+      id: GCHAT_ID,
+      kind: 'chat-sdk',
+      timestamp: now(),
+      platformId: 'gchat:spaces/AAAA',
+      channelType: 'gchat',
+      threadId: null,
+      content,
+    });
+
+    expect(storedContent(GCHAT_ID)).toEqual({ text: 'hello', attachments: [] });
+    const inbox = path.join(sessionDir(AG, SESS), 'inbox');
+    expect(fs.existsSync(inbox) ? fs.readdirSync(inbox) : []).toEqual([]);
   });
 });
