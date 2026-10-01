@@ -58,7 +58,7 @@ export interface GoogleConnectionDependencies {
 }
 
 function consoleUrl(projectId: string): string {
-  const url = new URL('https://console.cloud.google.com/auth/clients');
+  const url = new URL('https://console.cloud.google.com/auth/overview');
   url.searchParams.set('project', projectId);
   return url.href;
 }
@@ -70,9 +70,8 @@ function clientPause(context: GoogleConnectionContext): ProvisionHumanPause {
     code: 'google_client_required',
     message: "Create the assistant's Google sign-in client, then continue with its file.",
     details: [
-      'In Google Auth platform, set the audience to Internal.',
-      'Under Clients, create an OAuth client of type Desktop app and download its JSON.',
-      'Make the file readable only by you: chmod 600 <file>',
+      'Choose Get started: name the app after the assistant, pick your email for support, choose Internal, add a contact email, and create it.',
+      'Under Clients, create a client of type Desktop app, and download its JSON.',
     ],
     actionUrl: consoleUrl(context.input.gcp.projectId),
     resumeFlag: `${GOOGLE_CLIENT_FILE_FLAG} <file>`,

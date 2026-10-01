@@ -189,9 +189,10 @@ describe("connecting the assistant's Google account", () => {
       phase: 'connect_google',
       code: 'google_client_required',
       resumeFlag: `${GOOGLE_CLIENT_FILE_FLAG} <file>`,
-      actionUrl: `https://console.cloud.google.com/auth/clients?project=${GCP.projectId}`,
+      actionUrl: `https://console.cloud.google.com/auth/overview?project=${GCP.projectId}`,
     });
-    expect(pause?.details?.join('\n')).toMatch(/Internal.*\n.*Desktop app/su);
+    expect(pause?.details?.join('\n')).toMatch(/Get started.*Internal.*\n.*Clients.*Desktop app.*download/su);
+    expect(pause?.details?.join('\n')).not.toContain('chmod');
     expect(signIn).not.toHaveBeenCalled();
   });
 
@@ -262,17 +263,14 @@ describe("connecting the assistant's Google account", () => {
     });
   });
 
-  it('refuses a downloaded client another user can read, before keeping anything', async () => {
+  it('takes the download as the browser saved it, and keeps only a private copy', async () => {
     const world = new World();
     const resources = googleConnectionResources({ gcloud: { runCommand: world.runCommand }, fetch: world.fetch });
+    const download = writeDownloadedClient(0o644);
 
-    await expect(
-      connect(
-        resources,
-        context(async () => grant(), writeDownloadedClient(0o644)),
-      ),
-    ).rejects.toMatchObject({ code: 'unsafe_mode' });
-    expect(fs.existsSync(path.join(SECRETS, 'google-oauth-client.json'))).toBe(false);
+    await expect(resources[1]!.apply(context(async () => grant(), download))).resolves.toBeUndefined();
+
+    expect(fs.statSync(path.join(SECRETS, 'google-oauth-client.json')).mode & 0o777).toBe(0o600);
   });
 
   it("reports the calendar check's reason when Google does not return the assistant's own calendar", async () => {

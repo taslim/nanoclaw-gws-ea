@@ -54,9 +54,20 @@ describe('the downloaded OAuth client', () => {
     });
   });
 
-  it('refuses a client file another user can read, before parsing it', async () => {
+  it('reads the download as the browser saved it, readable by others', async () => {
     const file = writeClientFile('open.json', { installed: CLIENT }, 0o644);
-    await expect(readGoogleOAuthClientFile(file)).rejects.toMatchObject({ code: 'unsafe_mode' });
+    await expect(readGoogleOAuthClientFile(file)).resolves.toEqual(CLIENT);
+  });
+
+  it('refuses a client file reached through a link, or too large to be a client download', async () => {
+    const real = writeClientFile('real.json', { installed: CLIENT });
+    const link = path.join(ROOT, 'link.json');
+    fs.symlinkSync(real, link);
+    await expect(readGoogleOAuthClientFile(link)).rejects.toMatchObject({ code: 'invalid_google_client' });
+
+    const large = path.join(ROOT, 'large.json');
+    fs.writeFileSync(large, JSON.stringify({ installed: CLIENT, padding: 'x'.repeat(70_000) }));
+    await expect(readGoogleOAuthClientFile(large)).rejects.toMatchObject({ code: 'invalid_google_client' });
   });
 
   it('refuses a client ID that is not a Google OAuth client', async () => {

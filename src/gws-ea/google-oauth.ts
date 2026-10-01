@@ -8,6 +8,8 @@
  * stay out of process arguments and are registered for redaction on sight.
  */
 import { createHash, randomBytes } from 'node:crypto';
+import { constants as fsConstants } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 
 import { isErrno } from '../community-portal/errors.js';
@@ -22,7 +24,7 @@ import { GOOGLE_TOKEN_ENDPOINT } from '../modules/gws-ea-google/tokens.js';
 import { registerSecret } from './redact.js';
 import { readOwnerOnlyJson } from './secrets.js';
 import { GwsEaError } from './types.js';
-import { isRecord } from './validation.js';
+import { isRecord, parseJson } from './validation.js';
 
 export const GOOGLE_AUTHORIZATION_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
 export const GOOGLE_USERINFO_ENDPOINT = 'https://openidconnect.googleapis.com/v1/userinfo';
@@ -52,12 +54,39 @@ function clientFrom(value: unknown, label: string): GoogleOAuthClient {
   return { client_id: id, client_secret: secret };
 }
 
+/** Larger than any client download Google produces. */
+const MAX_CLIENT_FILE_BYTES = 64 * 1024;
+
 /**
- * Read the client JSON the operator downloaded. It must be owner-only and a
- * Desktop app client, whose loopback redirect needs no registration.
+ * The downloaded file, read as the browser saved it: setup keeps its own
+ * owner-only copy, so the download's permissions do not matter. It must be
+ * the file itself, not a link, and small enough to be a client download.
+ */
+async function readDownloadedJson(file: string): Promise<unknown> {
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch (error) {
+    if (isErrno(error, 'ELOOP'))
+      throw invalidClient('The Google OAuth client file is a link; give the downloaded file');
+    throw error;
+  }
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) throw invalidClient('The Google OAuth client file is not a regular file');
+    if (info.size > MAX_CLIENT_FILE_BYTES) throw invalidClient('The Google OAuth client file is too large to be one');
+    return parseJson(await handle.readFile('utf8'), 'Google OAuth client file', 'invalid_google_client');
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Read the client JSON the operator downloaded. It must be a Desktop app
+ * client, whose loopback redirect needs no registration.
  */
 export async function readGoogleOAuthClientFile(file: string): Promise<GoogleOAuthClient> {
-  const value = await readOwnerOnlyJson(file, 'Google OAuth client file', 'invalid_google_client');
+  const value = await readDownloadedJson(file);
   if (!isRecord(value)) throw invalidClient('The Google OAuth client file is not a client download');
   if (value.installed === undefined) {
     throw invalidClient(
