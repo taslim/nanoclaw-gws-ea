@@ -274,7 +274,7 @@ const COMMAND_OPTIONS: Readonly<Record<Command, CommandOptionSpec>> = {
     repeatable: [PRINCIPAL_EMAIL_FLAG],
   },
   resume: {
-    values: ['id', 'messaging-group-id', ...COMMON_OPTIONS],
+    values: ['id', 'messaging-group-id', 'google-client-file', ...COMMON_OPTIONS],
     switches: ['chat-configured', ...COMMON_SWITCHES],
   },
   remove: { values: ['id', 'abandon', ...COMMON_OPTIONS], switches: ['yes', ...COMMON_SWITCHES] },
@@ -523,6 +523,9 @@ class Cli {
             decisions: {
               chatConfigured: options['chat-configured'] === 'true',
               ...(options['messaging-group-id'] ? { messagingGroupId: options['messaging-group-id'] } : {}),
+              ...(options['google-client-file']
+                ? { googleClientFile: path.resolve(options['google-client-file']) }
+                : {}),
             },
             work: (session) => this.#resumeWork(session, instanceId),
           });
@@ -1644,6 +1647,9 @@ function printHelp(output: LineWriter): void {
   output('         [--ingress managed-cloudflare --cloudflare-zone <zone> --hostname-label <label>]');
   output("         Deploys this gws-ea's own release, which must be committed, clean, and on the track.");
   output('  resume --id <instance_id> [--chat-configured] [--messaging-group-id <exact-id>]');
+  output(
+    "         [--google-client-file <file>]  (the Desktop OAuth client downloaded for the assistant's Google sign-in)",
+  );
   output('  start --id <instance_id>');
   output('  stop --id <instance_id>');
   output('         Agent containers keep running; the assistant stays stopped until the next start, login, or reboot.');

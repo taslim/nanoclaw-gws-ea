@@ -110,7 +110,8 @@ import {
 } from '../provider-credential.js';
 import { assertProviderProvisioningCapabilityDigest } from '../provider-provisioning-capability.js';
 import { googleChatConfigurationUrl } from './chat-configuration.js';
-import type { Interaction } from './events.js';
+import { PauseRequired, type Interaction } from './events.js';
+import { googleConnectionResources, type GoogleConnectionInput } from './google-connection.js';
 import {
   getOwnedGcpProjectNumber,
   googleCloudResources,
@@ -164,6 +165,8 @@ export interface ProductionProvisionInput {
   readonly ingress: IngressClaim;
   readonly managedIngressSetup?: ManagedAccountTokenSession;
   readonly requestCloudflareAccountToken?: (accountId: string, observation: string) => Promise<string>;
+  /** The assistant's Google sign-in (`connect_google`, KTD2, KTD5). */
+  readonly google: GoogleConnectionInput;
 }
 
 export interface ProductionProvisionState {
@@ -210,6 +213,8 @@ export interface ProductionProvisionDependencies {
   readonly verifyConversation: (input: ConversationVerificationInput) => ConversationVerificationResult;
   /** `establish_transport`'s resources in managed mode. */
   readonly managedTransportResources: typeof managedTransportResources;
+  /** `connect_google`'s resources. */
+  readonly googleConnectionResources: typeof googleConnectionResources;
   readonly sleep: (milliseconds: number) => Promise<void>;
 }
 
@@ -654,6 +659,7 @@ const defaultProductionDependencies: ProductionProvisionDependencies = {
   reconcilePrincipal: reconcilePrincipalDm,
   verifyConversation: verifyTalkableConversation,
   managedTransportResources,
+  googleConnectionResources,
   sleep: delay,
 };
 
@@ -1149,6 +1155,10 @@ export function createProductionProvisionSteps(
           },
         },
       ],
+    },
+    connect_google: {
+      label: "Connecting the assistant's Google account…",
+      resources: dependencies.googleConnectionResources(),
     },
     bind_principal: {
       label: 'Connecting the principal conversation…',
@@ -1667,6 +1677,18 @@ export async function runProductionProvision(
               interaction.requestCloudflareAccountToken({ accountId, reason }),
           }
         : {}),
+      google: {
+        runtime,
+        assistantWorkspaceEmail: source.identity.assistantWorkspaceEmail,
+        ...(interaction?.decisions.googleClientFile ? { clientFile: interaction.decisions.googleClientFile } : {}),
+        signIn: (request) => {
+          if (interaction) return interaction.signInAssistantToGoogle(request);
+          throw new PauseRequired('google_sign_in_required', `Sign the assistant in to Google as ${request.account}.`, [
+            `Run this at a terminal on this machine, with a browser: ${request.resumeCommand}`,
+          ]);
+        },
+        resumeCommand: `gws-ea resume --id ${operation.instanceId}`,
+      },
     },
   };
   const gcpAccount = reservation.exclusive_resource_claims.gcp_account;

@@ -161,6 +161,7 @@ function terminalPrompts(): InteractivePrompts {
     cloudflareAccountToken: vi.fn(),
     googleCloudSignIn: vi.fn(),
     googleAccount: vi.fn(),
+    googleWorkspaceSignIn: vi.fn(),
     attendPause: async () => ({ kind: 'stop' }),
   };
 }
@@ -1362,6 +1363,7 @@ describe('gws-ea prerequisites', () => {
         cloudflareAccountToken: vi.fn(),
         googleCloudSignIn,
         googleAccount: vi.fn(),
+        googleWorkspaceSignIn: vi.fn(),
         attendPause: async () => ({ kind: 'stop' }),
       },
       checkPrerequisites: (request, interaction) =>

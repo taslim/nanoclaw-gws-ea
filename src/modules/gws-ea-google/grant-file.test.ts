@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { readGoogleGrantFile } from './index.js';
+import { readGoogleGrantFile } from './grant-file.js';
 
 const ROOT = '/tmp/nanoclaw-gws-ea-google-test';
 const FILE = path.join(ROOT, 'secrets', 'google-grant.json');

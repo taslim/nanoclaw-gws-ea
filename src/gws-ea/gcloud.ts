@@ -45,6 +45,8 @@ const INVALID_CREDENTIAL = 'invalid_gchat_credential';
 const PROJECT_LABEL_INSTANCE = 'gws-ea-instance';
 const PROJECT_LABEL_MANAGED = 'gws-ea-managed';
 const REQUIRED_APIS = ['chat.googleapis.com', 'iam.googleapis.com', 'orgpolicy.googleapis.com'] as const;
+/** The Workspace APIs the assistant's own Google sign-in calls (KTD2); enabled by the Google connection. */
+export const GOOGLE_WORKSPACE_APIS = ['calendar-json.googleapis.com', 'gmail.googleapis.com'] as const;
 /** The legacy and managed constraints that can block service-account key creation. */
 const KEY_CREATION_CONSTRAINTS = [
   'iam.disableServiceAccountKeyCreation',
@@ -134,10 +136,14 @@ export interface GcpProjectInput extends GcpProjectCoordinates {
   readonly credentialFile: string;
 }
 
-/** What `provision_gcp`'s resources read from the step context. */
-export interface GcpStepContext {
-  readonly operation: InstanceOperation;
+/** A step context that names the assistant's Google Cloud project. */
+export interface GcpProjectContext {
   readonly input: { readonly gcp: GcpProjectInput };
+}
+
+/** What `provision_gcp`'s resources read from the step context. */
+export interface GcpStepContext extends GcpProjectContext {
+  readonly operation: InstanceOperation;
 }
 
 type Pause = ProvisionHumanPause | undefined;
@@ -735,6 +741,44 @@ async function replaceKey(context: GcpStepContext, dependencies: GcloudDependenc
  * key-creation policy is restored last, once the key exists, including a lift
  * an interrupted run left behind.
  */
+/** The project has every API in `apis` enabled; enabling them is idempotent. */
+function enabledApisResource(
+  name: string,
+  apis: readonly string[],
+  dependencies: GcloudDependencies,
+): StepResource<GcpProjectContext> {
+  const gcloud = (context: GcpProjectContext): Gcloud => gcloudFor(context.input.gcp, dependencies);
+  return {
+    name,
+    observe: async (context) => {
+      const gcp = context.input.gcp;
+      const listed = await gcloud(context)([
+        'services',
+        'list',
+        '--enabled',
+        `--project=${gcp.projectId}`,
+        '--format=value(config.name)',
+      ]);
+      if (!succeeded(listed)) return unknownRead(`the APIs of project ${gcp.projectId}`, listed);
+      const enabled = new Set(listed.outcome.stdout.split('\n').map((line) => line.trim()));
+      return apis.every((api) => enabled.has(api)) ? PRESENT : ABSENT;
+    },
+    apply: async (context) => {
+      const gcp = context.input.gcp;
+      const enabled = await gcloud(context)(['services', 'enable', ...apis, `--project=${gcp.projectId}`]);
+      if (!succeeded(enabled)) {
+        throw gcloudFailed(`Google Cloud could not enable APIs on project ${gcp.projectId}`, enabled);
+      }
+      return undefined;
+    },
+  };
+}
+
+/** The Calendar and Gmail APIs the assistant's sign-in calls, in its own project. */
+export function googleWorkspaceApisResource(dependencies: GcloudDependencies = {}): StepResource<GcpProjectContext> {
+  return enabledApisResource('the Google Workspace APIs', GOOGLE_WORKSPACE_APIS, dependencies);
+}
+
 export function googleCloudResources(dependencies: GcloudDependencies = {}): readonly StepResource<GcpStepContext>[] {
   const gcloud = (context: GcpStepContext): Gcloud => gcloudFor(context.input.gcp, dependencies);
   return [
@@ -766,30 +810,7 @@ export function googleCloudResources(dependencies: GcloudDependencies = {}): rea
         return undefined;
       },
     },
-    {
-      name: 'the Google Cloud APIs',
-      observe: async (context) => {
-        const gcp = context.input.gcp;
-        const listed = await gcloud(context)([
-          'services',
-          'list',
-          '--enabled',
-          `--project=${gcp.projectId}`,
-          '--format=value(config.name)',
-        ]);
-        if (!succeeded(listed)) return unknownRead(`the APIs of project ${gcp.projectId}`, listed);
-        const enabled = new Set(listed.outcome.stdout.split('\n').map((line) => line.trim()));
-        return REQUIRED_APIS.every((api) => enabled.has(api)) ? PRESENT : ABSENT;
-      },
-      apply: async (context) => {
-        const gcp = context.input.gcp;
-        const enabled = await gcloud(context)(['services', 'enable', ...REQUIRED_APIS, `--project=${gcp.projectId}`]);
-        if (!succeeded(enabled)) {
-          throw gcloudFailed(`Google Cloud could not enable APIs on project ${gcp.projectId}`, enabled);
-        }
-        return undefined;
-      },
-    },
+    enabledApisResource('the Google Cloud APIs', REQUIRED_APIS, dependencies),
     {
       name: 'the Google Chat service account',
       observe: async (context) => {
