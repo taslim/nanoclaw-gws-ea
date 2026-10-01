@@ -249,6 +249,29 @@ describe('signing in as the assistant', () => {
     await new Promise((resolve) => setTimeout(resolve, 40));
   });
 
+  it('starts the sign-in wait only once the operator is ready, however long that takes', async () => {
+    const g = google();
+    let authUrl: URL | undefined;
+    const grant = signInAsAssistant({
+      client: CLIENT,
+      account: 'robin@example.test',
+      present: async (url) => {
+        authUrl = new URL(url);
+        // The operator takes longer to get ready than the whole wait allows.
+        await new Promise((resolve) => setTimeout(resolve, 80));
+      },
+      fetch: g.fetch,
+      timeoutMs: 40,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const redirect = new URL(authUrl?.searchParams.get('redirect_uri') ?? '');
+    redirect.searchParams.set('code', 'auth-code');
+    redirect.searchParams.set('state', authUrl?.searchParams.get('state') ?? '');
+    void fetch(redirect).catch(() => undefined);
+
+    await expect(grant).resolves.toMatchObject({ account: 'robin@example.test' });
+  });
+
   it('gives up when nobody finishes signing in', async () => {
     const g = google();
     await expect(

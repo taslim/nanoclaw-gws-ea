@@ -127,7 +127,7 @@ export interface AssistantSignInInput {
   readonly client: GoogleOAuthClient;
   /** The declared Workspace address; any other account is refused. */
   readonly account: string;
-  /** Show the operator the consent URL and open it in their browser. */
+  /** Show the operator the consent URL and open it once they are ready; the time limit starts after. */
   readonly present: (url: string) => Promise<void>;
   readonly fetch?: typeof globalThis.fetch;
   readonly now?: () => number;
@@ -141,13 +141,20 @@ function signInFailed(message: string): GwsEaError {
 const CALLBACK_PAGE = (heading: string): string =>
   `<!doctype html><meta charset="utf-8"><title>${heading}</title><p>${heading} You can close this tab.</p>`;
 
-/** Google's redirect to the loopback server, resolving with its query; `cancel` stops the wait. */
-function awaitRedirect(server: Server, timeoutMs: number): { readonly done: Promise<URLSearchParams>; cancel(): void } {
+/**
+ * Google's redirect to the loopback server, resolving with its query. It
+ * listens at once, so no redirect is missed, but the time limit starts only
+ * at `arm`, once the operator is ready to sign in; `cancel` stops the wait.
+ */
+function awaitRedirect(
+  server: Server,
+  timeoutMs: number,
+): { readonly done: Promise<URLSearchParams>; arm(): void; cancel(): void } {
   let timer: NodeJS.Timeout | undefined;
+  let expire: (() => void) | undefined;
   const done = new Promise<URLSearchParams>((resolve, reject) => {
-    timer = setTimeout(() => {
+    expire = () =>
       reject(new GwsEaError('google_sign_in_timeout', 'Google sign-in was not finished in time; run it again'));
-    }, timeoutMs);
     server.on('request', (request, response) => {
       const url = new URL(request.url ?? '/', 'http://127.0.0.1');
       if (url.pathname !== '/' || (!url.searchParams.has('code') && !url.searchParams.has('error'))) {
@@ -161,7 +168,13 @@ function awaitRedirect(server: Server, timeoutMs: number): { readonly done: Prom
       resolve(url.searchParams);
     });
   });
-  return { done, cancel: () => clearTimeout(timer) };
+  return {
+    done,
+    arm: () => {
+      timer = setTimeout(() => expire?.(), timeoutMs);
+    },
+    cancel: () => clearTimeout(timer),
+  };
 }
 
 async function listenOnLoopback(): Promise<{ server: Server; redirectUri: string }> {
@@ -212,6 +225,7 @@ export async function signInAsAssistant(input: AssistantSignInInput): Promise<Go
       login_hint: account,
     }).toString();
     await input.present(authorization.href);
+    redirect.arm();
     query = await redirect.done;
   } finally {
     redirect?.cancel();
