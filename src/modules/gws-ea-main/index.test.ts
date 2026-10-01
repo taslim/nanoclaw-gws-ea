@@ -23,6 +23,7 @@ const REQUIRED_GUIDANCE = [
   'Other agent groups are parts of this same assistant, not separate people.',
   'Your job is to turn their direction into finished outcomes',
   'Carry accepted work to completion with your tools and connected agent groups',
+  'the test is whether a great human executive assistant who has worked with the principal for years would do, say, or ask it.',
   'Escalate only when the next step would:',
   'need something only the principal can give: their judgment, authority, relationship, presence, or voice;',
   'leave a serious risk that cannot be undone, even after you have reduced it as far as you can.',
