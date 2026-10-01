@@ -177,12 +177,14 @@ async function runBootstrap(
 }
 
 /**
- * The first message main receives: the GWS-EA welcome skill from the main
- * template, which asks the principal for their calendars, instead of
- * NanoClaw's generic capability tour.
+ * The first message main receives. Main's `welcome` is the GWS-EA skill its
+ * template stamps, which asks the principal for their calendars; NanoClaw's
+ * own capability tour is not among main's skills (KTD11, KTD13). Passed
+ * explicitly so NanoClaw's default, which can point at a channel addendum
+ * for its own welcome, never reaches main.
  */
 export const GWS_EA_WELCOME_INSTRUCTION =
-  'System instruction: run /gws-ea-welcome to introduce yourself to the principal in this new conversation.';
+  'System instruction: run /welcome to introduce yourself to the principal in this new conversation.';
 
 export function principalWelcomeEventId(
   config: Pick<InstanceRuntimeConfig, 'instance_id'>,

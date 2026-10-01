@@ -113,7 +113,7 @@ async function releaseFixture(): Promise<string> {
       2,
     ) + '\n',
   );
-  await write(root, 'templates/gws-ea/main/skills/gws-ea-welcome/SKILL.md', '# GWS-EA welcome\n');
+  await write(root, 'templates/gws-ea/main/skills/welcome/SKILL.md', '# Welcome\n');
   await write(root, 'bin/ncl', '#!/usr/bin/env bash\nexit 0\n');
   await write(root, 'bin/gws-ea', '#!/usr/bin/env bash\nexit 0\n');
   await chmod(path.join(root, 'bin/ncl'), 0o755);
@@ -139,12 +139,14 @@ async function releaseFixture(): Promise<string> {
   await write(root, 'scripts/init-first-agent.ts', 'export {};\n');
   await write(root, 'src/modules/gws-ea-profile/index.ts', 'export {};\n');
   await write(root, 'src/modules/gws-ea-profile/migration.ts', 'export {};\n');
+  await write(root, 'src/modules/gws-ea-main/index.ts', 'export {};\n');
+  await write(root, 'src/modules/gws-ea-main/guidance.md', '# Guidance\n');
   await write(root, 'src/modules/gws-ea-preferences/index.ts', 'export {};\n');
   await write(root, 'src/modules/gws-ea-preferences/migration.ts', 'export {};\n');
   await write(
     root,
     'src/modules/index.ts',
-    "import './gws-ea-profile/index.js';\nimport './gws-ea-preferences/index.js';\n",
+    "import './gws-ea-main/index.js';\nimport './gws-ea-profile/index.js';\nimport './gws-ea-preferences/index.js';\n",
   );
   await write(root, 'src/provider-contracts/claude.ts', "export const provider = 'claude';\n");
   await write(root, 'src/provider-contracts/index.ts', "import './claude.js';\n");
@@ -257,7 +259,8 @@ describe('release preflight', () => {
 
   it.each([
     ['template', 'templates/gws-ea/main/plugin.json', 'incomplete_release'],
-    ['GWS-EA welcome', 'templates/gws-ea/main/skills/gws-ea-welcome/SKILL.md', 'incomplete_release'],
+    ['GWS-EA welcome', 'templates/gws-ea/main/skills/welcome/SKILL.md', 'incomplete_release'],
+    ['GWS-EA guidance', 'src/modules/gws-ea-main/guidance.md', 'incomplete_release'],
     ['Google Chat adapter', 'src/channels/gchat.ts', 'incomplete_release'],
     ['GWS-EA interactive launcher', 'setup/gws-ea-input.ts', 'incomplete_release'],
     ['GWS-EA service launcher', 'src/gws-ea/process.ts', 'incomplete_release'],

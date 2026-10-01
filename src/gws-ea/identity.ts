@@ -179,8 +179,8 @@ async function reconcileAllSecretMode(
 /**
  * Reconcile the canonical main group and its credential boundary. The profile
  * pointer is published last, so principal binding cannot observe a canonical
- * main until its provider, its container timezone, and instance-vault-wide
- * OneCLI access have been verified. Main's container runs in the principal
+ * main until its provider, its container timezone, its shared skills, and
+ * instance-vault-wide OneCLI access have been verified. Main's container runs in the principal
  * timezone the profile publishes, so every reconcile sets it (KTD7).
  * Main is stamped from its template only when no group carries it yet: an
  * existing main is found, never restamped, so a customized template survives
@@ -219,6 +219,18 @@ export async function reconcileMainIdentity(
     updatedConfig.timezone !== input.principalTimezone
   ) {
     throw new GwsEaError('main_group_mismatch', 'Canonical main provider and timezone reconciliation did not persist');
+  }
+
+  // Main's shared skills are the release's own list (KTD13); the host
+  // re-applies it on every start, so only an explicit list is checked here.
+  const skills = unwrapData(await runNcl(config, ['gws-ea-main', 'reconcile', '--agent-group-id', group.id]));
+  if (
+    !isRecord(skills) ||
+    skills.agent_group_id !== group.id ||
+    !Array.isArray(skills.skills) ||
+    !skills.skills.every((skill) => typeof skill === 'string')
+  ) {
+    throw new GwsEaError('main_group_mismatch', "Canonical main's skills did not reconcile to the release's list");
   }
 
   const onecliAgentId = await reconcileAllSecretMode(config, group.id, runOnecliAdmin);

@@ -280,12 +280,14 @@ async function validateComposition(
     'setup/gws-ea-input.ts',
     'src/provider-credential.ts',
     'templates/gws-ea/main/plugin.json',
-    'templates/gws-ea/main/skills/gws-ea-welcome/SKILL.md',
+    'templates/gws-ea/main/skills/welcome/SKILL.md',
     'src/channels/gchat.ts',
     'src/channels/index.ts',
     'src/gws-ea/process.ts',
     'src/gws-ea/cloudflare-connector.ts',
     'scripts/init-first-agent.ts',
+    'src/modules/gws-ea-main/index.ts',
+    'src/modules/gws-ea-main/guidance.md',
     'src/modules/gws-ea-profile/index.ts',
     'src/modules/gws-ea-profile/migration.ts',
     'src/modules/gws-ea-preferences/index.ts',
@@ -320,6 +322,7 @@ async function validateComposition(
     );
     await assertBarrelImports(checkoutRoot, [
       { barrel: 'src/channels/index.ts', moduleName: 'gchat', code: 'incomplete_release' },
+      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-main/index', code: 'incomplete_release' },
       { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-profile/index', code: 'incomplete_release' },
       { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-preferences/index', code: 'incomplete_release' },
       { barrel: 'src/gateway-providers/index.ts', moduleName: 'installed', code: 'gateway_not_composed' },

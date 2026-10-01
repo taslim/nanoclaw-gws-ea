@@ -285,9 +285,10 @@ describe('verified principal first-DM reconciliation', () => {
     );
   });
 
-  it('asks for the GWS-EA welcome rather than the generic capability tour', () => {
-    expect(GWS_EA_WELCOME_INSTRUCTION).toContain('/gws-ea-welcome');
-    expect(GWS_EA_WELCOME_INSTRUCTION).not.toContain('/welcome ');
+  it("runs main's own welcome for the principal, never NanoClaw's channel addendum", () => {
+    expect(GWS_EA_WELCOME_INSTRUCTION).toContain('run /welcome ');
+    expect(GWS_EA_WELCOME_INSTRUCTION).toContain('the principal');
+    expect(GWS_EA_WELCOME_INSTRUCTION).not.toMatch(/addend|\/app\/skills/u);
   });
 
   it('fails without bootstrapping when the host does not confirm the principal wiring', async () => {

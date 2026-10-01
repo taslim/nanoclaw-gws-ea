@@ -50,6 +50,10 @@ interface FakeState {
   principalEmails: readonly string[];
   agents: Array<{ id: string; identifier: string; name: string; secretMode: 'all' | 'selective' }>;
   secretModeWrites: number;
+  /** Main's shared skills as its container config holds them. */
+  skills: readonly string[] | 'all';
+  /** Every ncl call, in order, by its first two words. */
+  calls: string[];
 }
 
 function flagValue(args: readonly string[], flag: string): string | undefined {
@@ -63,6 +67,8 @@ function harness(
     neverApplySecretMode?: boolean;
     /** A NanoClaw whose config update leaves the timezone as it was. */
     ignoreTimezone?: boolean;
+    /** A release whose main reconcile leaves main on every shared skill. */
+    ignoreSkills?: boolean;
   } = {},
 ): {
   state: FakeState;
@@ -79,9 +85,16 @@ function harness(
     principalEmails: [],
     agents: [],
     secretModeWrites: 0,
+    skills: 'all',
+    calls: [],
   };
   let failed = false;
   const runNcl = vi.fn(async (_config: InstanceRuntimeConfig, args: readonly string[]) => {
+    state.calls.push(`${args[0]} ${args[1]}`);
+    if (args[0] === 'gws-ea-main' && args[1] === 'reconcile') {
+      if (!options.ignoreSkills) state.skills = ['agent-browser'];
+      return { agent_group_id: flagValue(args, '--agent-group-id'), skills: state.skills };
+    }
     if (args[0] === 'groups' && args[1] === 'create') {
       state.groupCreateArgs.push(args);
       const group = { id: GROUP_ID, name: 'main', folder: 'main', agent_provider: null, created_at: 'now' };
@@ -273,6 +286,23 @@ describe('main identity reconciliation', () => {
     const { state, dependencies } = harness({ ignoreTimezone: true });
 
     await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).rejects.toThrow(/did not persist/i);
+    expect(state.profileWrites).toBe(0);
+  });
+
+  it("gives main the release's skills before the profile publishes it", async () => {
+    const { state, dependencies } = harness();
+
+    await reconcileMainIdentity(runtimeConfig(), input, dependencies);
+
+    expect(state.skills).toEqual(['agent-browser']);
+    expect(state.calls.indexOf('gws-ea-main reconcile')).toBeGreaterThan(state.calls.indexOf('groups create'));
+    expect(state.calls.indexOf('gws-ea-main reconcile')).toBeLessThan(state.calls.indexOf('gws-ea-profile reconcile'));
+  });
+
+  it("fails before publishing the profile when main's skills stay NanoClaw's full set", async () => {
+    const { state, dependencies } = harness({ ignoreSkills: true });
+
+    await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).rejects.toThrow(/skills/i);
     expect(state.profileWrites).toBe(0);
   });
 
