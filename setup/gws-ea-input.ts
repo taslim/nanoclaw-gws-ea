@@ -2,7 +2,6 @@ import * as p from '@clack/prompts';
 
 import {
   describeSecretInput,
-  normalizePrincipalEmail,
   PRINCIPAL_EMAIL_FLAG,
   type CloudflareZoneChoice,
   type CreateIngressAnswer,
@@ -10,6 +9,7 @@ import {
   type CreatePromptContext,
   type CreateSetupAnswers,
 } from '../src/gws-ea/create-input.js';
+import { normalizePrincipalEmail } from '../src/gws-ea/validation.js';
 import { validateExistingGchatEndpoint } from '../src/gws-ea/endpoint.js';
 import { isConsumerGoogleAccount } from '../src/gws-ea/gcloud.js';
 import { registerSecret } from '../src/gws-ea/redact.js';

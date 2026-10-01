@@ -1,8 +1,14 @@
-import { normalizePrincipalEmail } from './create-input.js';
 import { runInstanceOnecliAdminCommand, validateRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
 import { runInstanceNclJson } from './ncl.js';
 import { GwsEaError } from './types.js';
-import { EMAIL_PATTERN, isRecord, parseJson, requireString, unwrapData } from './validation.js';
+import {
+  EMAIL_PATTERN,
+  isRecord,
+  normalizePrincipalEmail,
+  parseJson,
+  requireString,
+  unwrapData,
+} from './validation.js';
 import { isValidTimezone } from '../timezone.js';
 
 /** The template create stamps main from, the group it names, and the plugin it stamps into main's folder. */

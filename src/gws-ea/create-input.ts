@@ -4,22 +4,10 @@ import type { ProductionBootstrapManifest } from './provision.js';
 import { registerSecret } from './redact.js';
 import { readOperatorFile } from './secrets.js';
 import { GwsEaError } from './types.js';
-import { EMAIL_PATTERN, hasControlCharacters } from './validation.js';
+import { normalizePrincipalEmail } from './validation.js';
 
 /** `--principal-email`, given once per address the principal uses. */
 export const PRINCIPAL_EMAIL_FLAG = 'principal-email';
-
-/**
- * A principal address as every layer stores it: trimmed and lowercased.
- * Undefined when `value` cannot be one. Agents see each address quoted in a
- * code span, so an address may not hold a backtick.
- */
-export function normalizePrincipalEmail(value: string): string | undefined {
-  const email = value.trim().toLowerCase();
-  const valid =
-    email.length <= 254 && EMAIL_PATTERN.test(email) && !email.includes('`') && !hasControlCharacters(email);
-  return valid ? email : undefined;
-}
 
 /** Every `--principal-email`, each validated, lowercased, and kept once in the order given. */
 export function parsePrincipalEmailFlags(values: readonly string[]): readonly string[] {

@@ -363,23 +363,39 @@ describe('GWS-EA scheduling preferences store', () => {
       basis: 'Asked to keep Friday afternoons free.',
     });
 
-    await removeSchedulingPreference({ kind: 'working-hours', weekday: 'monday' });
-    await removeSchedulingPreference({ kind: 'meeting-length', meetingKind: 'one-on-one' });
-    await removeSchedulingPreference({ kind: 'protected-window', id: window.id });
+    await removeSchedulingPreference({ kind: 'working-hours', weekday: 'monday', source: 'principal' });
+    await removeSchedulingPreference({ kind: 'meeting-length', meetingKind: 'one-on-one', source: 'learned' });
+    await removeSchedulingPreference({ kind: 'protected-window', id: window.id, source: 'principal' });
 
     expect(await getSchedulingPreferences()).toEqual(EMPTY);
-    await expect(removeSchedulingPreference({ kind: 'working-hours', weekday: 'mon' })).rejects.toThrow(
-      /no working hours/i,
-    );
-    await expect(removeSchedulingPreference({ kind: 'protected-window', id: window.id })).rejects.toThrow(
-      /no protected window/i,
-    );
-    await expect(removeSchedulingPreference({ kind: 'buffer', meetingKind: 'default' })).rejects.toThrow(/no buffer/i);
+    await expect(
+      removeSchedulingPreference({ kind: 'working-hours', weekday: 'mon', source: 'principal' }),
+    ).rejects.toThrow(/no working hours/i);
+    await expect(
+      removeSchedulingPreference({ kind: 'protected-window', id: window.id, source: 'principal' }),
+    ).rejects.toThrow(/no protected window/i);
+    await expect(
+      removeSchedulingPreference({ kind: 'buffer', meetingKind: 'default', source: 'principal' }),
+    ).rejects.toThrow(/no buffer/i);
 
     // An unset field accepts a learned value again once the principal's is forgotten.
     await expect(
       setSchedulingPreference(mondayHours('learned', '08:30', '18:00', 'Usual first and last meeting.')),
     ).resolves.toMatchObject({ source: 'learned' });
+  });
+
+  it('never lets a learned removal erase a value the principal set; the principal can remove it', async () => {
+    const principalSet = await setSchedulingPreference(mondayHours('principal', '09:00', '17:00', 'Said so.'));
+
+    await expect(
+      removeSchedulingPreference({ kind: 'working-hours', weekday: 'mon', source: 'learned' }),
+    ).rejects.toThrow('Working hours for Monday: set by the principal, so a learned value cannot remove it');
+    expect((await getSchedulingPreferences()).working_hours).toEqual([principalSet]);
+
+    await expect(
+      removeSchedulingPreference({ kind: 'working-hours', weekday: 'mon', source: 'principal' }),
+    ).resolves.toEqual({ kind: 'working-hours', weekday: 'mon' });
+    expect((await getSchedulingPreferences()).working_hours).toEqual([]);
   });
 
   it('identifies a protected window by its days and hours, so relearning it updates the same window', async () => {

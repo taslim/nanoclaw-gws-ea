@@ -69,6 +69,8 @@ class World {
   readonly gcloudCalls: string[] = [];
 
   revoked = false;
+  /** A second secret by the same name, as a creation race between the refresher and this step leaves. */
+  duplicateSecret = false;
 
   readonly runCommand = vi.fn(async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> => {
     const args = command.args.filter((arg) => !arg.startsWith('--account=') && arg !== '--quiet');
@@ -100,12 +102,25 @@ class World {
     const route = new URL(url).pathname;
     if (new Headers(init?.headers).get('authorization') !== 'Bearer oc_admin_key') return json({}, 401);
     if (route === '/v1/secrets' && init?.method === 'GET') {
-      return json([...this.secrets].map(([name, s]) => ({ id: s.id, name, hostPattern: s.hostPattern })));
+      const listed = [...this.secrets].map(([name, s]) => ({ id: s.id, name, hostPattern: s.hostPattern }));
+      const [first] = listed;
+      return json(this.duplicateSecret && first ? [...listed, { ...first, id: 'sec-duplicate' }] : listed);
+    }
+    if (route === '/v1/secrets/sec-duplicate' && init?.method === 'DELETE') {
+      this.duplicateSecret = false;
+      return json({});
     }
     const body = JSON.parse(String(init?.body ?? '{}')) as { name?: string; hostPattern: string; value: string };
     if (route === '/v1/secrets' && init?.method === 'POST') {
       this.secrets.set(String(body.name), { id: 'sec-1', hostPattern: body.hostPattern, value: body.value });
       return json({}, 201);
+    }
+    if (route === '/v1/secrets/sec-1' && init?.method === 'PATCH') {
+      for (const [name, secret] of this.secrets) {
+        if (secret.id === 'sec-1')
+          this.secrets.set(name, { ...secret, hostPattern: body.hostPattern, value: body.value });
+      }
+      return json({ success: true });
     }
     return json({}, 404);
   }) as unknown as typeof globalThis.fetch;
@@ -247,6 +262,55 @@ describe("connecting the assistant's Google account", () => {
     expect(signIn).toHaveBeenCalledWith(expect.objectContaining({ client: CLIENT }));
   });
 
+  it('signs in again when Google no longer accepts the grant on disk', async () => {
+    const world = new World();
+    const signIn = vi.fn(async () => {
+      world.revoked = false;
+      return grant({ granted_at: '2026-10-01T09:00:00.000Z' });
+    });
+    const resources = googleConnectionResources({ gcloud: { runCommand: world.runCommand }, fetch: world.fetch });
+    await connect(
+      resources,
+      context(async () => grant(), writeDownloadedClient()),
+    );
+    world.revoked = true;
+
+    expect(await resources[2]!.observe(context(signIn))).toEqual({
+      status: 'absent',
+      reason: 'Google no longer accepts the sign-in',
+    });
+    await expect(connect(resources, context(signIn))).resolves.toBeUndefined();
+
+    expect(signIn).toHaveBeenCalledWith(expect.objectContaining({ client: CLIENT, account: ACCOUNT }));
+    expect(JSON.parse(fs.readFileSync(path.join(SECRETS, 'google-grant.json'), 'utf8'))).toMatchObject({
+      granted_at: '2026-10-01T09:00:00.000Z',
+    });
+  });
+
+  it('keeps one Calendar secret when a creation race left two', async () => {
+    const world = new World();
+    const resources = googleConnectionResources({ gcloud: { runCommand: world.runCommand }, fetch: world.fetch });
+    await connect(
+      resources,
+      context(async () => grant(), writeDownloadedClient()),
+    );
+    world.duplicateSecret = true;
+
+    expect(await resources[3]!.observe(context(async () => grant()))).toEqual({
+      status: 'absent',
+      reason: `OneCLI holds 2 secrets named ${GOOGLE_SERVICES.calendar.secretName}`,
+    });
+    await expect(
+      connect(
+        resources,
+        context(async () => grant()),
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(world.duplicateSecret).toBe(false);
+    expect(world.secrets.get(GOOGLE_SERVICES.calendar.secretName)?.value).toMatch(/^ya29\.calendar-/);
+  });
+
   it('signs in again when a release asks for a scope the grant lacks', async () => {
     const world = new World();
     const signIn = vi.fn(async () => grant());
@@ -319,7 +383,7 @@ describe('observing the Google connection for status', () => {
 
     await expect(observeGoogleConnection(runtime(), ACCOUNT, { fetch: world.fetch })).resolves.toMatchObject({
       status: 'degraded',
-      reason: `agents have no Calendar access in OneCLI; ${repair}`,
+      reason: `agents have no Calendar access: OneCLI has no ${GOOGLE_SERVICES.calendar.secretName} secret; ${repair}`,
     });
     world.revoked = true;
     await expect(observeGoogleConnection(runtime(), ACCOUNT, { fetch: world.fetch })).resolves.toEqual({

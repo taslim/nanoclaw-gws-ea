@@ -4,8 +4,9 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { loadSecretSource, normalizePrincipalEmail, parsePrincipalEmailFlags } from './create-input.js';
+import { loadSecretSource, parsePrincipalEmailFlags } from './create-input.js';
 import { redact, REDACTED } from './redact.js';
+import { normalizePrincipalEmail } from './validation.js';
 
 const roots: string[] = [];
 

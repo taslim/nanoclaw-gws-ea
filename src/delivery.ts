@@ -607,16 +607,21 @@ export async function sendFailureNotice(
   failed?: { channelType: string | null; platformId: string | null; threadId: string | null },
   options: { readonly onlyToThatChat?: boolean } = {},
 ): Promise<void> {
-  if (!deliveryAdapter || !session.messaging_group_id) return;
-  const mg = await getMessagingGroup(session.messaging_group_id);
-  if (!mg || mg.detached_at) return;
-  const sameChat = failed?.channelType === mg.channel_type && failed.platformId === mg.platform_id;
-  // A failure is reported only to the chat it came from when the caller asks.
-  if (options.onlyToThatChat && !sameChat) return;
-  const threadId = sameChat ? failed.threadId : session.thread_id;
+  const adapter = deliveryAdapter;
+  const messagingGroupId = session.messaging_group_id;
+  if (!adapter || !messagingGroupId) return;
+  // Best effort from the lookup on: a caller's own work must never fail
+  // because the notice could not be sent, so every failure is logged, never
+  // retried, and never thrown.
   /* eslint-disable no-catch-all/no-catch-all -- the notice is best effort; its failure is logged, never retried */
   try {
-    await deliveryAdapter.deliver(
+    const mg = await getMessagingGroup(messagingGroupId);
+    if (!mg || mg.detached_at) return;
+    const sameChat = failed?.channelType === mg.channel_type && failed.platformId === mg.platform_id;
+    // A failure is reported only to the chat it came from when the caller asks.
+    if (options.onlyToThatChat && !sameChat) return;
+    const threadId = sameChat ? failed.threadId : session.thread_id;
+    await adapter.deliver(
       mg.channel_type,
       mg.platform_id,
       threadId,
@@ -627,7 +632,7 @@ export async function sendFailureNotice(
     );
     log.info('Failure notice delivered', { sessionId: session.id, channelType: mg.channel_type });
   } catch (err) {
-    log.error('Failure notice could not be delivered', { sessionId: session.id, channelType: mg.channel_type, err });
+    log.error('Failure notice could not be delivered', { sessionId: session.id, err });
   }
   /* eslint-enable no-catch-all/no-catch-all */
 }

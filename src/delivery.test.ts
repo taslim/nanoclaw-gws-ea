@@ -41,6 +41,7 @@ import {
   registerDeliveryAction,
   registerDeliveryBatchPreview,
   registerPostDeliveryHook,
+  sendFailureNotice,
   setDeliveryAdapter,
 } from './delivery.js';
 import { unguarded } from './guard/index.js';
@@ -890,5 +891,22 @@ describe('deliverSessionMessages — permanent failure notice', () => {
     await drain(session, 3);
 
     expect(calls).toEqual([]);
+  });
+
+  it('stays best effort when the chat cannot be looked up, so the caller carries on', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    const calls = rejectEverythingButTheNotice();
+    const logged = vi.spyOn(log, 'error').mockImplementation(() => undefined);
+    await closeDb();
+
+    await expect(sendFailureNotice(session)).resolves.toBeUndefined();
+
+    expect(calls).toEqual([]);
+    expect(logged).toHaveBeenCalledWith(
+      'Failure notice could not be delivered',
+      expect.objectContaining({ sessionId: session.id }),
+    );
+    await runMigrations(await initTestDb());
   });
 });

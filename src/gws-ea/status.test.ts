@@ -621,6 +621,29 @@ describe('status', () => {
     });
   });
 
+  it("reports a Google connection that stopped working as the workspace probe's failure, naming the account", async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    await bound(host.paths, reservation.instance_id);
+    const state = world(reservation);
+    const reason = `Google no longer accepts the sign-in; connect it with gws-ea connect-google --id ${reservation.instance_id}`;
+
+    const { exitCode, status } = await statusJson(host, state, reservation.instance_id, {
+      ...healthyObservers(state),
+      google: async (_runtime, declaredEmail) => ({ status: 'degraded', account: declaredEmail, reason }),
+    });
+
+    expect(exitCode).toBe(0);
+    expect(status.probes.workspace).toEqual({
+      status: 'degraded',
+      reason,
+      account: reservation.exclusive_resource_claims.workspace_email,
+    });
+    for (const name of Object.keys(status.probes).filter((probe) => probe !== 'workspace')) {
+      expect(status.probes[name], name).toMatchObject({ status: 'ok' });
+    }
+  });
+
   it("reports a OneCLI unsafe-image refusal as that probe's failure without aborting the others", async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });

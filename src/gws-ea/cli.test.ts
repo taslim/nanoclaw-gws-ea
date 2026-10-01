@@ -10,12 +10,13 @@ import { runCli, type CliRuntime, type FailureReport } from './cli.js';
 import type { CreatePromptContext } from './create-input.js';
 import { runStep, withPendingAction, type InteractivePrompts, type PauseResponse } from './events.js';
 import { RECORDED_GCLOUD_REAUTHENTICATION_FAILED } from './fixtures/recordings.js';
+import type { GoogleConnectionContext } from './google-connection.js';
 import { acquireInstanceOperation, recordStepCompleted, reserveInstance } from './journal.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { advanceOperation, beginOperation } from './operation.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { ONECLI_CLI_VERSION } from './pins.js';
-import type { ProvisionHumanPause } from './phases.js';
+import type { ProvisionHumanPause, StepResource } from './phases.js';
 import {
   checkPrerequisites,
   type PrerequisiteDependencies,
@@ -35,6 +36,19 @@ import { FULL_CHECK_MS } from './stray-install.js';
 import { present, removeToolCheckouts, toolCheckoutWorld, type ToolCheckoutWorld } from './testing/stray-fixture.js';
 import { GwsEaError, PROVISION_STEPS, releaseOf, type InstanceReservationInput } from './types.js';
 
+/** `connect-google`'s step resources: the real ones unless a test supplies its own. */
+const googleConnection = vi.hoisted(() => ({
+  resources: undefined as readonly StepResource<GoogleConnectionContext>[] | undefined,
+}));
+vi.mock('./google-connection.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./google-connection.js')>();
+  return {
+    ...actual,
+    googleConnectionResources: (...args: Parameters<typeof actual.googleConnectionResources>) =>
+      googleConnection.resources ?? actual.googleConnectionResources(...args),
+  };
+});
+
 const roots: string[] = [];
 const servers: Server[] = [];
 
@@ -44,6 +58,7 @@ function neverCalled(): never {
 const PRIVATE_REMOTE = 'git@github.com:example/nanoclaw-gws-ea-private.git';
 
 afterEach(async () => {
+  googleConnection.resources = undefined;
   for (const server of servers.splice(0)) await new Promise((resolve) => server.close(resolve));
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
   await removeToolCheckouts();
@@ -1691,6 +1706,77 @@ describe('gws-ea connect-google', () => {
     expect(await runCli(['connect-google', '--id', reserved.instance_id], { paths, ...io.runtime })).toBe(1);
 
     expect(io.err.join('\n')).toContain(`gws-ea resume --id ${reserved.instance_id}`);
+  });
+
+  /** A created assistant whose release carries Google access. */
+  async function googleReadyAssistant(paths: ControlPlanePaths) {
+    const runtime = await createdAssistant(paths, 35_001);
+    const reservation = (await readRegistry(paths)).instances[runtime.instance_id];
+    if (!reservation) throw new Error('The test assistant was not registered');
+    const module = path.join(reservation.checkout_realpath, 'src', 'modules', 'gws-ea-google');
+    await mkdir(module, { recursive: true });
+    await writeFile(path.join(module, 'index.ts'), 'export {};\n');
+    return { instanceId: runtime.instance_id, email: reservation.exclusive_resource_claims.workspace_email };
+  }
+
+  it("runs the step's resources for the assistant's own account and reports it connected", async () => {
+    const paths = await testPaths();
+    const { instanceId, email } = await googleReadyAssistant(paths);
+    const accounts: string[] = [];
+    googleConnection.resources = [
+      {
+        name: "the assistant's Google sign-in",
+        observe: async (context) => {
+          accounts.push(context.input.google.assistantWorkspaceEmail);
+          return { status: 'present' };
+        },
+        apply: async () => undefined,
+      },
+    ];
+    const io = lines();
+
+    expect(
+      await runCli(['connect-google', '--id', instanceId], {
+        paths,
+        ...io.runtime,
+        checkPrerequisites: async () => PREREQUISITES,
+      }),
+    ).toBe(0);
+
+    expect(accounts).toEqual([email]);
+    expect(io.out.join('\n')).toContain(`Assistant ${instanceId} is connected to Google as ${email}.`);
+  });
+
+  it('stops for the operator with the command that continues it', async () => {
+    const paths = await testPaths();
+    const { instanceId } = await googleReadyAssistant(paths);
+    const pause: ProvisionHumanPause = {
+      kind: 'human-action',
+      phase: 'connect_google',
+      code: 'google_client_required',
+      message: "Create the assistant's Google sign-in client.",
+      resumeFlag: '--google-client-file <file>',
+    };
+    googleConnection.resources = [
+      {
+        name: "the assistant's Google sign-in client",
+        observe: async () => ({ status: 'pause', pause }),
+        apply: async () => pause,
+      },
+    ];
+    const io = lines();
+
+    expect(
+      await runCli(['connect-google', '--id', instanceId], {
+        paths,
+        ...io.runtime,
+        checkPrerequisites: async () => PREREQUISITES,
+      }),
+    ).toBe(10);
+
+    const output = [...io.out, ...io.err].join('\n');
+    expect(output).toContain("Create the assistant's Google sign-in client.");
+    expect(output).toContain(`gws-ea connect-google --id ${instanceId} --google-client-file <file>`);
   });
 });
 

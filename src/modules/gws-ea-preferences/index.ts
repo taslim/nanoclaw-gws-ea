@@ -207,17 +207,18 @@ function setInput(args: Record<string, unknown>): SetPreferenceInput {
 function removeTarget(args: Record<string, unknown>): PreferenceTarget {
   const kind = parseKind(args.kind);
   const field = REMOVE_FIELD[kind];
-  onlyFields(args, kind, [field]);
+  onlyFields(args, kind, [field, 'source']);
   const value = requiredString(args, field, kind);
+  const source = requiredString(args, 'source', kind);
   switch (kind) {
     case 'working-hours':
-      return { kind, weekday: value };
+      return { kind, weekday: value, source };
     case 'protected-window':
-      return { kind, id: value };
+      return { kind, id: value, source };
     case 'meeting-length':
     case 'buffer':
     case 'preferred-time':
-      return { kind, meetingKind: value };
+      return { kind, meetingKind: value, source };
     default: {
       const unreachable: never = kind;
       throw new Error(`Unknown preference kind: ${String(unreachable)}`);
@@ -238,6 +239,13 @@ async function assertMainCaller(ctx: CallerContext): Promise<void> {
   }
 }
 
+const SOURCE_ARG: ColumnDef = {
+  name: 'source',
+  type: 'string',
+  description: 'Who is making the change.',
+  required: true,
+  enum: ['principal', 'learned'],
+};
 const KIND_ARG: ColumnDef = {
   name: 'kind',
   type: 'string',
@@ -303,13 +311,7 @@ registerResource({
         '  preferred-time    --meeting-kind, --start and --end, optional --weekdays (every day when omitted)',
       args: [
         KIND_ARG,
-        {
-          name: 'source',
-          type: 'string',
-          description: 'Who set the value.',
-          required: true,
-          enum: ['principal', 'learned'],
-        },
+        SOURCE_ARG,
         { name: 'basis', type: 'string', description: 'Where the value came from, in one short line.', required: true },
         WEEKDAY_ARG,
         {
@@ -338,11 +340,13 @@ registerResource({
     remove: {
       access: 'open',
       description:
-        'Forget one preference, returning it to unset: --weekday for working-hours, --id for protected-window, --meeting-kind otherwise.',
-      args: [KIND_ARG, WEEKDAY_ARG, ID_ARG, MEETING_KIND_ARG],
+        'Forget one preference, returning it to unset: --weekday for working-hours, --id for protected-window, --meeting-kind otherwise.\n\n' +
+        'Use --source principal when the principal asks you to forget it, and --source learned when you drop a value on your own inference. ' +
+        'A learned removal never removes a value the principal set.',
+      args: [KIND_ARG, SOURCE_ARG, WEEKDAY_ARG, ID_ARG, MEETING_KIND_ARG],
       examples: [
-        'ncl preferences remove --kind working-hours --weekday mon',
-        'ncl preferences remove --kind protected-window --id w-1a2b3c4d',
+        'ncl preferences remove --kind working-hours --weekday mon --source principal',
+        'ncl preferences remove --kind protected-window --id w-1a2b3c4d --source principal',
       ],
       handler: async (args, ctx) => {
         await assertMainCaller(ctx);

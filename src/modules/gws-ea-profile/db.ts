@@ -1,5 +1,5 @@
 import { getDb } from '../../db/connection.js';
-import { EMAIL_PATTERN, hasControlCharacters } from '../../gws-ea/validation.js';
+import { EMAIL_PATTERN, hasControlCharacters, normalizePrincipalEmail } from '../../gws-ea/validation.js';
 import { isValidTimezone } from '../../timezone.js';
 
 export interface GwsEaProfile {
@@ -52,15 +52,10 @@ function identifier(value: string, label: string): string {
   return value;
 }
 
-/**
- * A principal address as the profile stores it: trimmed and lowercased. It is
- * shown to agents in a code span, so it may not hold a backtick.
- */
+/** A principal address as the profile stores it (`normalizePrincipalEmail`); anything else is refused. */
 function principalEmail(value: string): string {
-  const email = value.trim().toLowerCase();
-  if (!EMAIL_PATTERN.test(email) || email.length > 254 || email.includes('`') || hasControlCharacters(email)) {
-    throw new Error(`Principal email address is invalid: ${JSON.stringify(value)}`);
-  }
+  const email = normalizePrincipalEmail(value);
+  if (email === undefined) throw new Error(`Principal email address is invalid: ${JSON.stringify(value)}`);
   return email;
 }
 

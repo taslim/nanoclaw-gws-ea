@@ -59,7 +59,6 @@ import {
 } from './service.js';
 import { instanceServicePlatform } from './service-coordinates.js';
 import { runInstanceNclJson } from './ncl.js';
-import { normalizePrincipalEmail } from './create-input.js';
 import { reconcileMainIdentity, type MainIdentityDependencies, type MainIdentityInput } from './identity.js';
 import {
   listPrincipalCandidates,
@@ -93,6 +92,7 @@ import {
 } from './types.js';
 import {
   isRecord,
+  normalizePrincipalEmail,
   optionalString,
   parseJson,
   requireDockerEndpoint,

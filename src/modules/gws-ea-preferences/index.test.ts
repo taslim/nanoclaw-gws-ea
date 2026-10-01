@@ -127,7 +127,9 @@ describe('GWS-EA preferences ncl resource', () => {
       preferred_times: [{ meeting_kind: 'external', weekdays: ['tue', 'thu'] }],
     });
 
-    expect(await run('preferences-remove', { kind: 'protected-window', id: windowId }, caller)).toEqual({
+    expect(
+      await run('preferences-remove', { kind: 'protected-window', id: windowId, source: 'principal' }, caller),
+    ).toEqual({
       id: 'preferences-remove',
       ok: true,
       data: { removed: { kind: 'protected-window', id: windowId } },
@@ -141,10 +143,21 @@ describe('GWS-EA preferences ncl resource', () => {
       basis: 'Run.',
     });
     const [{ id: runId }] = (await getSchedulingPreferences()).protected_windows;
-    expect(await run(`preferences-remove-${runId}`, { kind: 'protected-window' }, caller)).toMatchObject({ ok: true });
     expect(
-      await run('preferences-remove', { kind: 'meeting-length', 'meeting-kind': 'one-on-one' }, caller),
+      await run(`preferences-remove-${runId}`, { kind: 'protected-window', source: 'principal' }, caller),
+    ).toMatchObject({
+      ok: true,
+    });
+    expect(
+      await run(
+        'preferences-remove',
+        { kind: 'meeting-length', 'meeting-kind': 'one-on-one', source: 'learned' },
+        caller,
+      ),
     ).toMatchObject({ ok: true, data: { removed: { kind: 'meeting-length', meeting_kind: 'one-on-one' } } });
+    expect(await run('preferences-remove', { kind: 'buffer', 'meeting-kind': 'default' }, caller)).toMatchObject({
+      ok: false,
+    });
     expect(await getSchedulingPreferences()).toMatchObject({ protected_windows: [], meeting_lengths: [] });
   });
 
@@ -241,11 +254,13 @@ describe('GWS-EA preferences ncl resource', () => {
   });
 
   it('rejects a remove that names the wrong field for its kind', async () => {
-    expect(await run('preferences-remove', { kind: 'working-hours', 'meeting-kind': 'default' })).toMatchObject({
+    expect(
+      await run('preferences-remove', { kind: 'working-hours', 'meeting-kind': 'default', source: 'principal' }),
+    ).toMatchObject({
       ok: false,
       error: { message: expect.stringMatching(/--meeting-kind does not apply to working-hours/) },
     });
-    expect(await run('preferences-remove', { kind: 'buffer' })).toMatchObject({
+    expect(await run('preferences-remove', { kind: 'buffer', source: 'principal' })).toMatchObject({
       ok: false,
       error: { message: expect.stringMatching(/--meeting-kind is required for buffer/) },
     });
@@ -255,7 +270,7 @@ describe('GWS-EA preferences ncl resource', () => {
     for (const [command, args] of [
       ['preferences-get', {}],
       ['preferences-set', { kind: 'buffer', 'meeting-kind': 'default', minutes: '5', source: 'learned', basis: 'b' }],
-      ['preferences-remove', { kind: 'buffer', 'meeting-kind': 'default' }],
+      ['preferences-remove', { kind: 'buffer', 'meeting-kind': 'default', source: 'principal' }],
     ] as const) {
       expect(await run(command, args, agent(other.id)), command).toMatchObject({
         ok: false,

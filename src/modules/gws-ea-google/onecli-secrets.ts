@@ -53,34 +53,42 @@ export async function listInjectedSecrets(api: OnecliApi): Promise<InjectedSecre
   });
 }
 
-/** The one secret named `name`, or none; two by that name are refused rather than guessed between. */
-export async function findInjectedSecret(api: OnecliApi, name: string): Promise<InjectedSecret | undefined> {
-  const matching = (await listInjectedSecrets(api)).filter((secret) => secret.name === name);
-  if (matching.length > 1) throw new Error(`OneCLI holds more than one secret named ${name}`);
-  return matching[0];
+/**
+ * Every secret named `name`. One is the healthy state; two arise only when the
+ * host's refresher and a `connect-google` run create the secret at the same
+ * moment, and the next `upsertBearerSecret` keeps one and removes the rest.
+ */
+export async function findInjectedSecrets(api: OnecliApi, name: string): Promise<InjectedSecret[]> {
+  return (await listInjectedSecrets(api)).filter((secret) => secret.name === name);
 }
 
-/** Create or update the bearer-token secret `name` on `hostPattern`, with `value` only in the request body. */
+/**
+ * Create or update the bearer-token secret `name` on `hostPattern`, with
+ * `value` only in the request body. When more than one secret holds the name,
+ * the first is updated and the others are deleted, so a creation race heals on
+ * the next write instead of leaving two tokens on the same host.
+ */
 export async function upsertBearerSecret(
   api: OnecliApi,
   secret: { readonly name: string; readonly hostPattern: string; readonly value: string },
 ): Promise<'created' | 'updated'> {
-  const existing = await findInjectedSecret(api, secret.name);
-  if (existing) {
-    await call(api, 'PATCH', `/v1/secrets/${encodeURIComponent(existing.id)}`, {
+  const [existing, ...duplicates] = await findInjectedSecrets(api, secret.name);
+  if (!existing) {
+    await call(api, 'POST', '/v1/secrets', {
+      name: secret.name,
+      type: 'generic',
       value: secret.value,
       hostPattern: secret.hostPattern,
-      pathPattern: null,
       injectionConfig: BEARER_INJECTION,
     });
-    return 'updated';
+    return 'created';
   }
-  await call(api, 'POST', '/v1/secrets', {
-    name: secret.name,
-    type: 'generic',
+  await call(api, 'PATCH', `/v1/secrets/${encodeURIComponent(existing.id)}`, {
     value: secret.value,
     hostPattern: secret.hostPattern,
+    pathPattern: null,
     injectionConfig: BEARER_INJECTION,
   });
-  return 'created';
+  for (const duplicate of duplicates) await call(api, 'DELETE', `/v1/secrets/${encodeURIComponent(duplicate.id)}`);
+  return 'updated';
 }

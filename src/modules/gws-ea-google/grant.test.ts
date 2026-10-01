@@ -7,7 +7,7 @@ import {
   missingGoogleScopes,
   parseGoogleGrant,
 } from './grant.js';
-import { findInjectedSecret, upsertBearerSecret } from './onecli-secrets.js';
+import { findInjectedSecrets, upsertBearerSecret } from './onecli-secrets.js';
 
 const VALID = {
   schema_version: 1,
@@ -61,12 +61,25 @@ describe("OneCLI's injected secrets", () => {
     return { url: 'http://127.0.0.1:31002', apiKey: 'oc_key', fetch };
   }
 
-  it('refuses to choose between two secrets with the same name', async () => {
+  it('keeps one of two secrets a creation race left with the same name, updating it and deleting the other', async () => {
+    const onWrite = vi.fn();
     const entries = [
       { id: 'a', name: 'google-calendar', hostPattern: 'www.googleapis.com' },
+      { id: 'other', name: 'github', hostPattern: 'api.github.com' },
       { id: 'b', name: 'google-calendar', hostPattern: 'www.googleapis.com' },
     ];
-    await expect(findInjectedSecret(api(entries), 'google-calendar')).rejects.toThrow(/more than one/);
+
+    const result = await upsertBearerSecret(api(entries, onWrite), {
+      name: 'google-calendar',
+      hostPattern: 'www.googleapis.com',
+      value: 'ya29.secret',
+    });
+
+    expect(result).toBe('updated');
+    expect(onWrite.mock.calls.map(([method, url]) => `${String(method)} ${String(url)}`)).toEqual([
+      'PATCH http://127.0.0.1:31002/v1/secrets/a',
+      'DELETE http://127.0.0.1:31002/v1/secrets/b',
+    ]);
   });
 
   it('updates the existing secret by ID, with the token only in the body', async () => {
@@ -86,7 +99,7 @@ describe("OneCLI's injected secrets", () => {
 
   it('reports a refused request by status, without the key', async () => {
     const fetch = vi.fn(async () => new Response('{}', { status: 401 })) as unknown as typeof globalThis.fetch;
-    const error = await findInjectedSecret({ url: 'http://127.0.0.1:31002', apiKey: 'oc_key', fetch }, 'x').catch(
+    const error = await findInjectedSecrets({ url: 'http://127.0.0.1:31002', apiKey: 'oc_key', fetch }, 'x').catch(
       (caught: unknown) => caught,
     );
     expect(String(error)).toMatch(/HTTP 401/);

@@ -11,10 +11,20 @@
  * gateway's injection is OneCLI's fixed behavior, proven live once (U1),
  * while what varies per assistant is the grant, its scopes, and the secret.
  */
-import { GOOGLE_SERVICES, missingGoogleScopes, type GoogleGrant } from '../modules/gws-ea-google/grant.js';
+import {
+  GOOGLE_SERVICES,
+  missingGoogleScopes,
+  type GoogleGrant,
+  type GoogleService,
+} from '../modules/gws-ea-google/grant.js';
 import { readGoogleGrantFile } from '../modules/gws-ea-google/grant-file.js';
-import { findInjectedSecret, upsertBearerSecret, type OnecliApi } from '../modules/gws-ea-google/onecli-secrets.js';
-import { GoogleGrantRevokedError, mintServiceToken } from '../modules/gws-ea-google/tokens.js';
+import {
+  findInjectedSecrets,
+  upsertBearerSecret,
+  type InjectedSecret,
+  type OnecliApi,
+} from '../modules/gws-ea-google/onecli-secrets.js';
+import { GoogleGrantRevokedError, mintServiceToken, type TokenOptions } from '../modules/gws-ea-google/tokens.js';
 import type { AssistantGoogleSignInRequest } from './events.js';
 import { googleWorkspaceApisResource, type GcloudDependencies, type GcpProjectContext } from './gcloud.js';
 import {
@@ -100,6 +110,28 @@ export function grantProblem(grant: GoogleGrant | undefined, account: string): s
   return missing.length > 0 ? `the sign-in lacks ${missing.join(', ')}` : undefined;
 }
 
+/** Why OneCLI's secrets named for `service` do not inject its token, or undefined when exactly one does. */
+function injectedSecretProblem(secrets: readonly InjectedSecret[], service: GoogleService): string | undefined {
+  const [secret, ...others] = secrets;
+  if (!secret) return `OneCLI has no ${service.secretName} secret`;
+  if (others.length > 0) return `OneCLI holds ${secrets.length} secrets named ${service.secretName}`;
+  if (secret.hostPattern !== service.hostPattern) {
+    return `OneCLI's ${service.secretName} secret is on ${secret.hostPattern}`;
+  }
+  return undefined;
+}
+
+/** Whether Google still honors `grant`: a revoked or expired sign-in is absent, so applying signs in again. */
+async function grantAccepted(grant: GoogleGrant, tokenOptions: TokenOptions): Promise<boolean> {
+  try {
+    await mintServiceToken(grant, GOOGLE_SERVICES.calendar, tokenOptions);
+    return true;
+  } catch (error) {
+    if (error instanceof GoogleGrantRevokedError) return false;
+    throw error;
+  }
+}
+
 async function requireGrant(context: GoogleConnectionContext): Promise<GoogleGrant> {
   const google = context.input.google;
   const grant = await readGoogleGrantFile(googleGrantFile(google.runtime));
@@ -112,7 +144,7 @@ export function googleConnectionResources(
   dependencies: GoogleConnectionDependencies = {},
 ): readonly StepResource<GoogleConnectionContext>[] {
   const fetchImpl = dependencies.fetch;
-  const tokenOptions = {
+  const tokenOptions: TokenOptions = {
     ...(fetchImpl ? { fetch: fetchImpl } : {}),
     ...(dependencies.now ? { now: dependencies.now } : {}),
   };
@@ -139,7 +171,12 @@ export function googleConnectionResources(
         const google = context.input.google;
         const grant = await readGoogleGrantFile(googleGrantFile(google.runtime));
         const problem = grantProblem(grant, google.assistantWorkspaceEmail);
-        return problem ? { status: 'absent', reason: problem } : PRESENT;
+        if (problem || !grant) return { status: 'absent', reason: problem };
+        // A grant on disk proves nothing once Google revokes it; the host's
+        // refresher picks up a new sign-in on its next tick.
+        return (await grantAccepted(grant, tokenOptions))
+          ? PRESENT
+          : { status: 'absent', reason: 'Google no longer accepts the sign-in' };
       },
       apply: async (context) => {
         const google = context.input.google;
@@ -165,14 +202,11 @@ export function googleConnectionResources(
       name: "the assistant's Calendar access for agents",
       observe: async (context): Promise<Observation> => {
         const service = GOOGLE_SERVICES.calendar;
-        const secret = await findInjectedSecret(
-          await onecliApi(context.input.google.runtime, fetchImpl),
-          service.secretName,
+        const problem = injectedSecretProblem(
+          await findInjectedSecrets(await onecliApi(context.input.google.runtime, fetchImpl), service.secretName),
+          service,
         );
-        if (!secret) return { status: 'absent', reason: `OneCLI has no ${service.secretName} secret` };
-        return secret.hostPattern === service.hostPattern
-          ? PRESENT
-          : { status: 'absent', reason: `OneCLI's ${service.secretName} secret is on ${secret.hostPattern}` };
+        return problem ? { status: 'absent', reason: problem } : PRESENT;
       },
       apply: async (context) => {
         const service = GOOGLE_SERVICES.calendar;
@@ -227,19 +261,19 @@ export async function observeGoogleConnection(
   const problem = grantProblem(grant, declaredEmail);
   if (problem || !grant)
     return { status: 'degraded', account: grant?.account ?? null, reason: `${problem}; ${repair}` };
-  try {
-    await mintServiceToken(grant, GOOGLE_SERVICES.calendar, dependencies.fetch ? { fetch: dependencies.fetch } : {});
-  } catch (error) {
-    if (!(error instanceof GoogleGrantRevokedError)) throw error;
+  if (!(await grantAccepted(grant, dependencies.fetch ? { fetch: dependencies.fetch } : {}))) {
     return { status: 'degraded', account: grant.account, reason: `Google no longer accepts the sign-in; ${repair}` };
   }
   const service = GOOGLE_SERVICES.calendar;
-  const secret = await findInjectedSecret(await onecliApi(runtime, dependencies.fetch), service.secretName);
-  if (!secret || secret.hostPattern !== service.hostPattern) {
+  const secretProblem = injectedSecretProblem(
+    await findInjectedSecrets(await onecliApi(runtime, dependencies.fetch), service.secretName),
+    service,
+  );
+  if (secretProblem) {
     return {
       status: 'degraded',
       account: grant.account,
-      reason: `agents have no Calendar access in OneCLI; ${repair}`,
+      reason: `agents have no Calendar access: ${secretProblem}; ${repair}`,
     };
   }
   return { status: 'connected', account: grant.account };
