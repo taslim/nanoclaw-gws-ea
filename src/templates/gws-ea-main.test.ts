@@ -37,7 +37,7 @@ const REQUIRED_WELCOME_CONTRACT = [
   'name: welcome',
   'share their calendars with you',
   'two or three concrete things',
-  'Never ask "How can I help?"',
+  'End on that question rather than "How can I help?"',
   'Follow the Executive Assistant section throughout.',
 ];
 const EXPECTED_FILES = ['README.md', 'plugin.json', 'skills/welcome/SKILL.md'];
