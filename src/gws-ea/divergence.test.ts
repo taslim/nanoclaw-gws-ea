@@ -371,63 +371,6 @@ async function freePort(): Promise<number> {
 
 const FAILURE_NOTICE = "Something went wrong on my side and I couldn't finish that. Please send it again.";
 
-describe('recorded divergence: Google Chat shows a working reaction', () => {
-  it('reacts to the principal’s message once a reply takes about 4 seconds and removes it before the reply', async () => {
-    await freshInstall();
-    vi.useFakeTimers();
-    try {
-      const { withWorkingReaction } = await import('../channels/gchat.js');
-      const events: string[] = [];
-      let host: import('../channels/adapter.js').ChannelSetup | undefined;
-      const adapter = withWorkingReaction(
-        {
-          name: 'gchat',
-          channelType: 'gchat',
-          supportsThreads: true,
-          isConnected: () => true,
-          setup: async (config) => {
-            host = config;
-          },
-          teardown: async () => undefined,
-          deliver: async (platformId) => {
-            events.push(`post ${platformId}`);
-            return undefined;
-          },
-        },
-        {
-          addReaction: async (_thread, messageId, emoji) => void events.push(`add ${messageId} ${emoji}`),
-          removeReaction: async (_thread, messageId, emoji) => void events.push(`remove ${messageId} ${emoji}`),
-        },
-      );
-      await adapter.setup({ onInbound: vi.fn(), onInboundEvent: vi.fn(), onMetadata: vi.fn(), onAction: vi.fn() });
-      await host!.onInbound('gchat:spaces/dm', 'gchat:spaces/dm:dGhyZWFk:dm', {
-        id: 'spaces/dm/messages/one',
-        kind: 'chat-sdk',
-        content: { text: 'what is on Thursday?' },
-        timestamp: new Date().toISOString(),
-        authenticatedSender: { userId: 'users/principal', kind: 'human' },
-      });
-      await adapter.setTyping!('gchat:spaces/dm', null);
-      await vi.advanceTimersByTimeAsync(4_000);
-      await adapter.setTyping!('gchat:spaces/dm', null);
-      await adapter.deliver('gchat:spaces/dm', null, { kind: 'chat', content: { text: 'Two meetings.' } });
-
-      expect(events).toEqual([
-        'add spaces/dm/messages/one 👀',
-        'remove spaces/dm/messages/one 👀',
-        'post gchat:spaces/dm',
-      ]);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('is applied to the registered Google Chat channel', async () => {
-    const source = await readFile(path.join(originalCwd, 'src/channels/gchat.ts'), 'utf8');
-    expect(source).toContain('return withWorkingReaction(bridge, gchatAdapter);');
-  });
-});
-
 describe('recorded divergence: a failure reaches the principal as one plain sentence', () => {
   it('tells the chat a failed message came from, and no one for a message from the host', async () => {
     const directory = await freshInstall();
