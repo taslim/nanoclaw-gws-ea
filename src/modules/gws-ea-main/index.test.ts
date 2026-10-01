@@ -39,6 +39,7 @@ const REQUIRED_GUIDANCE = [
   "Never change another person's calendar",
   'Until scheduling with other people is available, do not create or change an event that has other attendees',
   'For a job that will take more than a moment, first reply with one line saying what you will do',
+  'Sound like a trusted colleague: warm and professional, confident without hedging',
   'Learn scheduling preferences with the schedule statistics tool',
   'Scheduling preferences (working hours, protected windows, meeting lengths, buffers, preferred times) go in their typed store',
   'Other standing instructions (how to address the principal, how to handle a kind of request, what to always or never do) go in your persona file',
