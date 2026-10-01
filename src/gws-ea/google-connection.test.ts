@@ -10,6 +10,7 @@ import { deriveGchatServiceAccountEmail } from './gcp-identity.js';
 import {
   GOOGLE_CLIENT_FILE_FLAG,
   googleConnectionResources,
+  observeGoogleConnection,
   PRIMARY_CALENDAR_URL,
   type GoogleConnectionContext,
 } from './google-connection.js';
@@ -67,6 +68,8 @@ class World {
   minted = 0;
   readonly gcloudCalls: string[] = [];
 
+  revoked = false;
+
   readonly runCommand = vi.fn(async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> => {
     const args = command.args.filter((arg) => !arg.startsWith('--account=') && arg !== '--quiet');
     this.gcloudCalls.push(args.join(' '));
@@ -84,6 +87,7 @@ class World {
     const url = String(input);
     const json = (body: unknown, status = 200): Response => new Response(JSON.stringify(body), { status });
     if (url === GOOGLE_TOKEN_ENDPOINT) {
+      if (this.revoked) return json({ error: 'invalid_grant' }, 400);
       this.minted += 1;
       const scope = new URLSearchParams(String(init?.body)).get('scope') ?? '';
       return json({ access_token: `ya29.calendar-${this.minted}`, expires_in: 3599, scope });
@@ -282,5 +286,48 @@ describe("connecting the assistant's Google account", () => {
         context(async () => grant(), writeDownloadedClient()),
       ),
     ).rejects.toThrow(/did not return the assistant's own calendar/);
+  });
+});
+
+describe('observing the Google connection for status', () => {
+  const repair = 'connect it with gws-ea connect-google --id 11111111-1111-4111-8111-111111111111';
+
+  it('reports a connected assistant by its account', async () => {
+    const world = new World();
+    const resources = googleConnectionResources({ gcloud: { runCommand: world.runCommand }, fetch: world.fetch });
+    await connect(
+      resources,
+      context(async () => grant(), writeDownloadedClient()),
+    );
+
+    await expect(observeGoogleConnection(runtime(), ACCOUNT, { fetch: world.fetch })).resolves.toEqual({
+      status: 'connected',
+      account: ACCOUNT,
+    });
+  });
+
+  it('names the command that connects an assistant that has not signed in, as one created before this', async () => {
+    const world = new World();
+    await expect(observeGoogleConnection(runtime(), ACCOUNT, { fetch: world.fetch })).resolves.toEqual({
+      status: 'degraded',
+      account: null,
+      reason: `the assistant has not signed in to Google yet; ${repair}`,
+    });
+  });
+
+  it('reports a sign-in Google no longer accepts, and missing Calendar access for agents', async () => {
+    const world = new World();
+    fs.writeFileSync(path.join(SECRETS, 'google-grant.json'), JSON.stringify(grant()), { mode: 0o600 });
+
+    await expect(observeGoogleConnection(runtime(), ACCOUNT, { fetch: world.fetch })).resolves.toMatchObject({
+      status: 'degraded',
+      reason: `agents have no Calendar access in OneCLI; ${repair}`,
+    });
+    world.revoked = true;
+    await expect(observeGoogleConnection(runtime(), ACCOUNT, { fetch: world.fetch })).resolves.toEqual({
+      status: 'degraded',
+      account: ACCOUNT,
+      reason: `Google no longer accepts the sign-in; ${repair}`,
+    });
   });
 });

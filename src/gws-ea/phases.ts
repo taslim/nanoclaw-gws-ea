@@ -99,22 +99,11 @@ export type ProvisionResult =
 type Pause = ProvisionHumanPause | undefined;
 
 /**
- * Run order: one liveness pass over completed runtime steps, then every
- * incomplete step in order. The caller runs prerequisites first and owns the
- * instance operation; a returned pause lets it release the lock.
+ * Observing and ensuring a step's resources, shared by the journaled run and
+ * a single step run outside it.
  */
-export async function runProvisionSteps<Context>(
-  operation: InstanceOperation,
-  context: Context,
-  steps: ProvisionSteps<Context>,
-  runtime: ProvisionRuntime = {},
-): Promise<ProvisionResult> {
+function resourceRunner<Context>(context: Context, runtime: ProvisionRuntime) {
   const sleep = runtime.sleep ?? ((milliseconds: number) => delay(milliseconds));
-  let journal: ProvisionJournal = await readProvisionJournal(operation.paths, operation.instanceId);
-  assertContinuable(journal);
-  // An assistant created under an earlier contract runs only that contract's steps.
-  const order = contractSteps(journal.launcher_contract_version);
-  const completed = (id: ProvisionStepId): boolean => journal.steps[id]?.completed_at !== undefined;
 
   /**
    * Observe until conclusive. Unknown is re-observed on the wait schedule, and
@@ -178,15 +167,65 @@ export async function runProvisionSteps<Context>(
     throw new GwsEaError('step_incomplete', `${resource.name} is still missing after it was set up${seenReason}`);
   };
 
-  /**
-   * A step that finds the Google sign-in expired signs in once, then runs
-   * again from its observations: whatever it already changed now observes
-   * present, so no change is made twice.
-   */
-  const withSignIn = (body: () => Promise<Pause>): Promise<Pause> =>
-    withGoogleSignIn(body, runtime.signIn, (refusal) =>
-      activeStep()?.write(`${refusal.message}; signing in, then running the step again\n`),
-    );
+  return {
+    async ensureAll(id: ProvisionStepId, resources: readonly StepResource<Context>[], waitOnAbsent: boolean) {
+      for (const resource of resources) {
+        const pause = await ensure(id, resource, waitOnAbsent);
+        if (pause) return pause;
+      }
+      return undefined;
+    },
+    /**
+     * A step that finds the Google sign-in expired signs in once, then runs
+     * again from its observations: whatever it already changed now observes
+     * present, so no change is made twice.
+     */
+    withSignIn(body: () => Promise<Pause>): Promise<Pause> {
+      return withGoogleSignIn(body, runtime.signIn, (refusal) =>
+        activeStep()?.write(`${refusal.message}; signing in, then running the step again\n`),
+      );
+    },
+  };
+}
+
+/**
+ * Run one step's resources outside the provision journal, as a command that
+ * repairs or extends a created assistant does: the same observations, waits,
+ * and sign-in retry, with nothing recorded as a provisioning step.
+ */
+export async function runStepOutsideJournal<Context>(
+  id: ProvisionStepId,
+  step: ProvisionStep<Context>,
+  context: Context,
+  runtime: ProvisionRuntime = {},
+): Promise<ProvisionResult> {
+  const runner = resourceRunner(context, runtime);
+  const pause = await runStep(
+    runtime,
+    { id, label: step.label },
+    () => runner.withSignIn(() => runner.ensureAll(id, step.resources, false)),
+    (paused) => paused,
+  );
+  return pause ? { status: 'paused', pause } : { status: 'ready' };
+}
+
+/**
+ * Run order: one liveness pass over completed runtime steps, then every
+ * incomplete step in order. The caller runs prerequisites first and owns the
+ * instance operation; a returned pause lets it release the lock.
+ */
+export async function runProvisionSteps<Context>(
+  operation: InstanceOperation,
+  context: Context,
+  steps: ProvisionSteps<Context>,
+  runtime: ProvisionRuntime = {},
+): Promise<ProvisionResult> {
+  let journal: ProvisionJournal = await readProvisionJournal(operation.paths, operation.instanceId);
+  assertContinuable(journal);
+  // An assistant created under an earlier contract runs only that contract's steps.
+  const order = contractSteps(journal.launcher_contract_version);
+  const completed = (id: ProvisionStepId): boolean => journal.steps[id]?.completed_at !== undefined;
+  const runner = resourceRunner(context, runtime);
 
   /** Run a step's body as a logged step, recording any failure in the journal. */
   const stepRun = (id: ProvisionStepId, label: string, body: () => Promise<Pause>): Promise<Pause> =>
@@ -195,7 +234,7 @@ export async function runProvisionSteps<Context>(
       { id, label },
       async () => {
         try {
-          return await withSignIn(body);
+          return await runner.withSignIn(body);
         } catch (error) {
           if (!(error instanceof PauseRequired)) {
             const log = activeStep()?.rawLog ?? runtime.run?.progressLog;
@@ -207,13 +246,8 @@ export async function runProvisionSteps<Context>(
       (pause) => pause,
     );
 
-  const ensureAll = async (id: ProvisionStepId, waitOnAbsent: boolean): Promise<Pause> => {
-    for (const resource of steps[id].resources) {
-      const pause = await ensure(id, resource, waitOnAbsent);
-      if (pause) return pause;
-    }
-    return undefined;
-  };
+  const ensureAll = (id: ProvisionStepId, waitOnAbsent: boolean): Promise<Pause> =>
+    runner.ensureAll(id, steps[id].resources, waitOnAbsent);
 
   /** Liveness: the same observation, waited on before any local repair. */
   const checkRuntime = (id: ProvisionStepId): Promise<Pause> =>

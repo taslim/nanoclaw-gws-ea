@@ -493,6 +493,7 @@ function healthyObservers(state: World): StatusObservers {
     schema: () => MANIFEST,
     delivery: () => DELIVERED,
     mainTemplate: async () => ({ kind: 'stamped', customized: [EDITED_PERSONA] }),
+    google: async (_runtime, declaredEmail) => ({ status: 'connected', account: declaredEmail }),
   };
 }
 

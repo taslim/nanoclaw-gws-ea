@@ -14,7 +14,7 @@
 import { GOOGLE_SERVICES, missingGoogleScopes, type GoogleGrant } from '../modules/gws-ea-google/grant.js';
 import { readGoogleGrantFile } from '../modules/gws-ea-google/grant-file.js';
 import { findInjectedSecret, upsertBearerSecret, type OnecliApi } from '../modules/gws-ea-google/onecli-secrets.js';
-import { mintServiceToken } from '../modules/gws-ea-google/tokens.js';
+import { GoogleGrantRevokedError, mintServiceToken } from '../modules/gws-ea-google/tokens.js';
 import type { AssistantGoogleSignInRequest } from './events.js';
 import { googleWorkspaceApisResource, type GcloudDependencies, type GcpProjectContext } from './gcloud.js';
 import {
@@ -86,7 +86,7 @@ async function onecliApi(runtime: InstanceRuntimeConfig, fetchImpl?: typeof glob
 }
 
 /** Whether `grant` is the declared account's, with every scope this release asks for; else why not. */
-function grantProblem(grant: GoogleGrant | undefined, account: string): string | undefined {
+export function grantProblem(grant: GoogleGrant | undefined, account: string): string | undefined {
   if (!grant) return 'the assistant has not signed in to Google yet';
   if (grant.account !== account.toLowerCase()) {
     return `Google is signed in as ${grant.account}, not the assistant's account ${account}`;
@@ -200,4 +200,42 @@ export function googleConnectionResources(
       apply: async () => undefined,
     },
   ];
+}
+
+/** The assistant's Google connection as `status` reports it. */
+export type GoogleConnectionReport =
+  | { readonly status: 'connected'; readonly account: string }
+  | { readonly status: 'degraded'; readonly account: string | null; readonly reason: string };
+
+/**
+ * Observe the connection without changing it: the grant is the declared
+ * account's with every scope, Google still accepts it, and OneCLI holds the
+ * Calendar secret agents use. Each problem names the command that repairs it.
+ */
+export async function observeGoogleConnection(
+  runtime: InstanceRuntimeConfig,
+  declaredEmail: string,
+  dependencies: { readonly fetch?: typeof globalThis.fetch } = {},
+): Promise<GoogleConnectionReport> {
+  const repair = `connect it with gws-ea connect-google --id ${runtime.instance_id}`;
+  const grant = await readGoogleGrantFile(googleGrantFile(runtime));
+  const problem = grantProblem(grant, declaredEmail);
+  if (problem || !grant)
+    return { status: 'degraded', account: grant?.account ?? null, reason: `${problem}; ${repair}` };
+  try {
+    await mintServiceToken(grant, GOOGLE_SERVICES.calendar, dependencies.fetch ? { fetch: dependencies.fetch } : {});
+  } catch (error) {
+    if (!(error instanceof GoogleGrantRevokedError)) throw error;
+    return { status: 'degraded', account: grant.account, reason: `Google no longer accepts the sign-in; ${repair}` };
+  }
+  const service = GOOGLE_SERVICES.calendar;
+  const secret = await findInjectedSecret(await onecliApi(runtime, dependencies.fetch), service.secretName);
+  if (!secret || secret.hostPattern !== service.hostPattern) {
+    return {
+      status: 'degraded',
+      account: grant.account,
+      reason: `agents have no Calendar access in OneCLI; ${repair}`,
+    };
+  }
+  return { status: 'connected', account: grant.account };
 }

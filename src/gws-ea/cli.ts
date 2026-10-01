@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -44,7 +45,13 @@ import {
 } from './journal.js';
 import { readOperationRecord } from './operation.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
-import type { ProvisionHumanPause, ProvisionResult, ProvisionRuntime } from './phases.js';
+import { googleConnectionResources } from './google-connection.js';
+import {
+  runStepOutsideJournal,
+  type ProvisionHumanPause,
+  type ProvisionResult,
+  type ProvisionRuntime,
+} from './phases.js';
 import { holdLoopbackPorts, type HeldLoopbackPorts } from './ports.js';
 import { checkPrerequisites, type PrerequisiteRequest, type Prerequisites } from './prerequisites.js';
 import { replaceProcessWithCommand } from './process.js';
@@ -139,7 +146,18 @@ export const EXIT_CODES = { ready: 0, paused: 10, failed: 1, busy: 75 } as const
 
 type LineWriter = (line: string) => void;
 /** Commands that run as attempts: each with its own run log, stop summary, and failure loop. */
-const COMMANDS = ['create', 'resume', 'remove', 'start', 'stop', 'restart', 'update', 'rollback', 'cleanup'] as const;
+const COMMANDS = [
+  'create',
+  'resume',
+  'remove',
+  'start',
+  'stop',
+  'restart',
+  'update',
+  'rollback',
+  'cleanup',
+  'connect-google',
+] as const;
 type Command = (typeof COMMANDS)[number];
 /** The attempts that act on an assistant's host service alone. */
 type ServiceCommand = Extract<Command, 'start' | 'stop' | 'restart'>;
@@ -278,6 +296,7 @@ const COMMAND_OPTIONS: Readonly<Record<Command, CommandOptionSpec>> = {
     switches: ['chat-configured', ...COMMON_SWITCHES],
   },
   remove: { values: ['id', 'abandon', ...COMMON_OPTIONS], switches: ['yes', ...COMMON_SWITCHES] },
+  'connect-google': { values: ['id', 'google-client-file', ...COMMON_OPTIONS], switches: COMMON_SWITCHES },
   start: SERVICE_OPTIONS,
   stop: SERVICE_OPTIONS,
   restart: SERVICE_OPTIONS,
@@ -587,6 +606,23 @@ class Cli {
       }
       case 'cleanup':
         return () => this.#attempt({ command, args, options, work: (session) => this.#cleanupWork(session) });
+      case 'connect-google': {
+        const instanceId = targetInstance(options);
+        return () =>
+          this.#attempt({
+            command,
+            args,
+            options,
+            instanceId,
+            decisions: {
+              chatConfigured: false,
+              ...(options['google-client-file']
+                ? { googleClientFile: path.resolve(options['google-client-file']) }
+                : {}),
+            },
+            work: (session) => this.#connectGoogleWork(session, instanceId),
+          });
+      }
       default: {
         const unhandled: never = command;
         throw new GwsEaError('invalid_arguments', `Unknown command ${String(unhandled)}`);
@@ -631,6 +667,8 @@ class Cli {
         );
       case 'cleanup':
         return 'gws-ea cleanup';
+      case 'connect-google':
+        return join(`gws-ea connect-google --id ${state.instanceId}`, extra, common);
       case 'create':
       case 'resume': {
         if (state.reserved && state.instanceId) return join(`gws-ea resume --id ${state.instanceId}`, extra, common);
@@ -874,6 +912,73 @@ class Cli {
    * the next start, login, or reboot. A start or restart ends only once the
    * host answers on its CLI socket.
    */
+  /**
+   * Connect a created assistant's own Google account (KTD5): the same
+   * resources as create's `connect_google` step, outside the provision
+   * journal, so an assistant created before Google access gains it without
+   * being recreated, and a lost or outdated sign-in is repaired.
+   */
+  async #connectGoogleWork({ reporter, interaction }: Session, instanceId: string): Promise<Outcome> {
+    const operation = await acquireInstanceOperation(this.#paths, instanceId, { command: 'connect-google' });
+    if (!operation) throw busy();
+    try {
+      const runtime = await loadCreatedRuntime(this.#paths, instanceId);
+      const reservation = await getInstanceReservation(this.#paths, instanceId);
+      const claims = reservation.exclusive_resource_claims;
+      if (!existsSync(path.join(reservation.checkout_realpath, 'src', 'modules', 'gws-ea-google', 'index.ts'))) {
+        throw new GwsEaError(
+          'update_required',
+          `This assistant runs a release without Google access. Update it first: gws-ea update --id ${instanceId}`,
+        );
+      }
+      await runStep(reporter, PREREQUISITES_STEP, async () => {
+        const host = await recordedHost(this.#paths, reservation);
+        await this.#checkPrerequisites(
+          {
+            command: 'resume',
+            paths: this.#paths,
+            account: claims.gcp_account,
+            checkoutRoot: reservation.checkout_realpath,
+            ...host,
+          },
+          interaction,
+        );
+      });
+      const result = await runStepOutsideJournal(
+        'connect_google',
+        { label: "Connecting the assistant's Google account…", resources: googleConnectionResources() },
+        {
+          input: {
+            gcp: {
+              instanceId,
+              projectId: claims.gcp_project_id,
+              account: claims.gcp_account,
+              serviceAccountEmail: claims.gchat_service_account,
+              credentialFile: runtime.secret_files.gchat_credentials,
+              cwd: reservation.checkout_realpath,
+            },
+            google: {
+              runtime,
+              assistantWorkspaceEmail: claims.workspace_email,
+              ...(interaction.decisions.googleClientFile ? { clientFile: interaction.decisions.googleClientFile } : {}),
+              signIn: (request) => interaction.signInAssistantToGoogle(request),
+              resumeCommand: `gws-ea connect-google --id ${instanceId}`,
+            },
+          },
+        },
+        { ...reporter, signIn: () => interaction.signInToGoogleCloud(claims.gcp_account) },
+      );
+      if (result.status === 'paused') return result;
+      return {
+        status: 'ready',
+        message: `Assistant ${instanceId} is connected to Google as ${claims.workspace_email}.`,
+        details: ['Its host keeps the Calendar access agents use fresh while it runs.'],
+      };
+    } finally {
+      operation.release();
+    }
+  }
+
   async #serviceWork({ reporter }: Session, command: ServiceCommand, instanceId: string): Promise<Outcome> {
     const operation = await acquireInstanceOperation(this.#paths, instanceId, { command });
     if (!operation) throw busy();
@@ -1650,6 +1755,8 @@ function printHelp(output: LineWriter): void {
   output(
     "         [--google-client-file <file>]  (the Desktop OAuth client downloaded for the assistant's Google sign-in)",
   );
+  output('  connect-google --id <instance_id> [--google-client-file <file>]');
+  output('         Signs the assistant in to Google as its own account, or repairs that sign-in; safe to rerun.');
   output('  start --id <instance_id>');
   output('  stop --id <instance_id>');
   output('         Agent containers keep running; the assistant stays stopped until the next start, login, or reboot.');

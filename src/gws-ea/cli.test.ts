@@ -1672,6 +1672,28 @@ async function interruptUpdate(paths: ControlPlanePaths, instanceId: string): Pr
   }
 }
 
+describe('gws-ea connect-google', () => {
+  it('refuses an assistant whose release predates Google access, naming the update', async () => {
+    const paths = await testPaths();
+    const a = await createdAssistant(paths, 35_001);
+    const io = lines();
+
+    expect(await runCli(['connect-google', '--id', a.instance_id], { paths, ...io.runtime })).toBe(1);
+
+    expect(io.err.join('\n')).toContain(`gws-ea update --id ${a.instance_id}`);
+  });
+
+  it('refuses an assistant that is not fully created, naming the resume', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, assistantReservation(paths, 35_021));
+    const io = lines();
+
+    expect(await runCli(['connect-google', '--id', reserved.instance_id], { paths, ...io.runtime })).toBe(1);
+
+    expect(io.err.join('\n')).toContain(`gws-ea resume --id ${reserved.instance_id}`);
+  });
+});
+
 describe('gws-ea start, stop, and restart', () => {
   it("stops only the named assistant's host while another runs, and stops neither one's agent containers (AE3)", async () => {
     const paths = await testPaths();
