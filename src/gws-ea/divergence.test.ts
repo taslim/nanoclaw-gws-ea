@@ -18,6 +18,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { ChannelRegistration, InboundEvent } from '../channels/adapter.js';
 import type { GatewayApprovalRequest, GatewaySessionInput } from '../gateway-providers/gateway-provider-registry.js';
+import { EXPOSED_GOOGLE_SERVICES } from '../modules/gws-ea-google/grant.js';
 import { deriveWorkspaceAddOnIdentity } from './gcp-identity.js';
 import { CONTROL_PLANE_ROOT } from './paths.js';
 
@@ -500,5 +501,41 @@ describe('recorded divergence: a failure reaches the principal as one plain sent
     expect(pollLoop).toContain(`const FAILURE_NOTICE_TEXT = ${JSON.stringify(FAILURE_NOTICE)};`);
     expect(tools).toContain("import './time.js';");
     expect(tools).toContain("import './schedule-stats.js';");
+  });
+});
+
+describe('recorded divergence: the agent image carries the pinned Google tool', () => {
+  /** The Dockerfile with line continuations joined, so each instruction is one line. */
+  async function dockerfileInstructions(): Promise<string[]> {
+    const source = await readFile(path.join(originalCwd, 'container/Dockerfile'), 'utf8');
+    return source.replace(/\\\n\s*/g, ' ').split('\n');
+  }
+
+  it('installs gog at an exact version, checked against a pinned SHA-256 for each architecture', async () => {
+    const instructions = await dockerfileInstructions();
+    const arg = (name: string) => instructions.find((line) => line.startsWith(`ARG ${name}=`))?.split('=')[1];
+
+    expect(arg('GOGCLI_VERSION')).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(arg('GOGCLI_SHA256_AMD64')).toMatch(/^[0-9a-f]{64}$/);
+    expect(arg('GOGCLI_SHA256_ARM64')).toMatch(/^[0-9a-f]{64}$/);
+    const install = instructions.find((line) => line.startsWith('RUN') && line.includes('gogcli'));
+    expect(install).toContain(
+      'releases/download/v${GOGCLI_VERSION}/gogcli_${GOGCLI_VERSION}_linux_${TARGETARCH}.tar.gz',
+    );
+    expect(install).toMatch(/sha256sum -c - && .*install -m 0755 \/tmp\/gog \/usr\/local\/bin\/gog/);
+  });
+
+  it('gives gog a placeholder token and exactly the Google services the release exposes', async () => {
+    const env = new Map(
+      (await dockerfileInstructions())
+        .filter((line) => line.startsWith('ENV GOG_'))
+        .flatMap((line) => line.slice('ENV '.length).trim().split(/\s+/))
+        .map((pair) => pair.split('=') as [string, string]),
+    );
+
+    expect(env.get('GOG_ACCESS_TOKEN')).toBe('gateway-managed');
+    expect(env.get('GOG_ENABLE_COMMANDS')).toBe(EXPOSED_GOOGLE_SERVICES.join(','));
+    expect(env.get('GOG_JSON')).toBe('1');
+    expect(env.get('GOG_WRAP_UNTRUSTED')).toBe('1');
   });
 });

@@ -22,8 +22,12 @@ import { getGwsEaProfile } from '../gws-ea-profile/db.js';
 /** The guidance, relative to the checkout the host runs from, as NanoClaw reads its other instruction files. */
 export const GUIDANCE_PATH = path.join('src', 'modules', 'gws-ea-main', 'guidance.md');
 
-/** NanoClaw's shared skills `main` loads. NanoClaw adds the gateway's own skill, and the template supplies `welcome`. */
-export const MAIN_SHARED_SKILLS: readonly string[] = ['agent-browser'];
+/**
+ * The shared skills (`container/skills/`) `main` loads: web research and the
+ * Google tool's rules and commands. NanoClaw adds the gateway's own skill, and
+ * the template supplies `welcome`.
+ */
+export const MAIN_SHARED_SKILLS: readonly string[] = ['agent-browser', 'google-workspace'];
 
 async function mainAgentGroupId(): Promise<string | null> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return null;

@@ -11,7 +11,7 @@ Your name, your own Google Workspace address, and the principal's addresses are 
 
 ## Step 1: Check what you can already see
 
-Look through the calendars you can see for the principal's, as the Executive Assistant section describes. If you can already see one, they shared before you asked: skip Step 2 and go to Step 3.
+Find the principal's calendars as the `google-workspace` skill shows, and tell which are theirs as the Executive Assistant section describes. If you can already see one, they shared before you asked: skip Step 2 and go to Step 3.
 
 ## Step 2: Ask for their calendars
 

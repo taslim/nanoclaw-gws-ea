@@ -191,4 +191,32 @@ describe("main's skills", () => {
   it('starts cleanly before any main exists', async () => {
     await expect(startHost()).resolves.toBeUndefined();
   });
+
+  it('names only skills the release ships', () => {
+    for (const skill of MAIN_SHARED_SKILLS) {
+      expect(fs.existsSync(path.resolve('container', 'skills', skill, 'SKILL.md')), skill).toBe(true);
+    }
+  });
+
+  it("gives main the Google tool's rules in its document, and a group without the skill none of them", async () => {
+    const main = group('ag-main');
+    const research = group('ag-research', 'research');
+    await createGroup(main);
+    await createGroup(research);
+    await publishMain(main);
+    await updateContainerConfigJson(research.id, 'skills', ['agent-browser']);
+    await startHost();
+    const rules = fs.readFileSync(path.resolve('container', 'skills', 'google-workspace', 'instructions.md'), 'utf8');
+
+    const compose = async (value: AgentGroup): Promise<string> => {
+      const groupDir = path.join(TEST_ROOT, value.folder);
+      await composeGroupProjectDoc(value, groupDir, { fileName: 'CLAUDE.md' });
+      return fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8');
+    };
+
+    expect(await compose(main)).toContain(`# NanoClaw Skill: google-workspace\n\n${rules.trim()}`);
+    const other = await compose(research);
+    expect(other).not.toContain('google-workspace');
+    expect(other).not.toContain('`gog`');
+  });
 });

@@ -281,6 +281,8 @@ async function validateComposition(
     'src/provider-credential.ts',
     'templates/gws-ea/main/plugin.json',
     'templates/gws-ea/main/skills/welcome/SKILL.md',
+    'container/skills/google-workspace/SKILL.md',
+    'container/skills/google-workspace/instructions.md',
     'src/channels/gchat.ts',
     'src/channels/index.ts',
     'src/gws-ea/process.ts',
