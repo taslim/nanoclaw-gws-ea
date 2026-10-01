@@ -15,6 +15,8 @@ export interface GoogleService {
   readonly hostPattern: string;
   /** What its access token is limited to. */
   readonly scopes: readonly string[];
+  /** The container skill (`container/skills/<skill>/`) that teaches agents to use it. */
+  readonly skill: string;
 }
 
 export const GOOGLE_SERVICES = {
@@ -26,11 +28,13 @@ export const GOOGLE_SERVICES = {
       'https://www.googleapis.com/auth/calendar.calendarlist',
       'https://www.googleapis.com/auth/calendar.freebusy',
     ],
+    skill: 'gcalendar',
   },
   gmail: {
     secretName: 'google-gmail',
     hostPattern: 'gmail.googleapis.com',
     scopes: ['https://www.googleapis.com/auth/gmail.modify'],
+    skill: 'gmail',
   },
 } as const satisfies Record<string, GoogleService>;
 
@@ -38,6 +42,13 @@ export type GoogleServiceId = keyof typeof GOOGLE_SERVICES;
 
 /** The services whose tokens reach agents in this release. Gmail is consented but not exposed until Checkpoint 4. */
 export const EXPOSED_GOOGLE_SERVICES: readonly GoogleServiceId[] = ['calendar'];
+
+/**
+ * The skills of the exposed services. A service's skill rides with the
+ * service: every agent group that can reach the service gets its skill, and a
+ * service not yet exposed contributes none.
+ */
+export const EXPOSED_GOOGLE_SKILLS: readonly string[] = EXPOSED_GOOGLE_SERVICES.map((id) => GOOGLE_SERVICES[id].skill);
 
 /** What the sign-in asks for: the account's identity, and every service the slice uses. */
 export const GOOGLE_SIGN_IN_SCOPES: readonly string[] = [

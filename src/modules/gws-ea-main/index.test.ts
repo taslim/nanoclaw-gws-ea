@@ -35,7 +35,7 @@ const REQUIRED_GUIDANCE = [
   'Delegation does not transfer credentials, memory, permissions, or authority',
   'Apply each rule below when you have the Workspace capability it concerns.',
   'When you have no way to track work over time, do not promise to follow up later',
-  "A calendar is the principal's when its ID is one of the principal's addresses",
+  'Your gcalendar instructions say which of them are the principal',
   "Never change another person's calendar",
   'Until scheduling with other people is available, do not create or change an event that has other attendees',
   'For a job that will take more than a moment, first reply with one line saying what you will do',
@@ -196,27 +196,5 @@ describe("main's skills", () => {
     for (const skill of MAIN_SHARED_SKILLS) {
       expect(fs.existsSync(path.resolve('container', 'skills', skill, 'SKILL.md')), skill).toBe(true);
     }
-  });
-
-  it("gives main the Google tool's rules in its document, and a group without the skill none of them", async () => {
-    const main = group('ag-main');
-    const research = group('ag-research', 'research');
-    await createGroup(main);
-    await createGroup(research);
-    await publishMain(main);
-    await updateContainerConfigJson(research.id, 'skills', ['agent-browser']);
-    await startHost();
-    const rules = fs.readFileSync(path.resolve('container', 'skills', 'google-workspace', 'instructions.md'), 'utf8');
-
-    const compose = async (value: AgentGroup): Promise<string> => {
-      const groupDir = path.join(TEST_ROOT, value.folder);
-      await composeGroupProjectDoc(value, groupDir, { fileName: 'CLAUDE.md' });
-      return fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8');
-    };
-
-    expect(await compose(main)).toContain(`# NanoClaw Skill: google-workspace\n\n${rules.trim()}`);
-    const other = await compose(research);
-    expect(other).not.toContain('google-workspace');
-    expect(other).not.toContain('`gog`');
   });
 });

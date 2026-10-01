@@ -1,5 +1,5 @@
 ---
-name: google-workspace
+name: gcalendar
 description: How to work in Google Calendar with the `gog` command. It covers finding the principal's calendars, reading events and free/busy, and creating, moving, or cancelling events, including one occurrence of a recurring event. Use it before any calendar task, such as checking availability, finding a time, blocking or protecting time, preparing for a meeting, or saying what's on the principal's schedule, even when the request doesn't mention the calendar.
 allowed-tools: Bash(gog:*)
 ---
@@ -19,7 +19,7 @@ Google doesn't add a calendar to your list when someone shares it with you, so a
 
 1. `gog calendar calendars` lists the calendars in your list, with your `accessRole` on each: `owner`, `writer` (you can change events), `reader` (you can see details), or `freeBusyReader` (you can see only when they're busy).
 2. For each of the principal's addresses in the Assistant Identity section that isn't in the list, run `gog calendar subscribe <address>`. A primary calendar's ID is its owner's address. Success means the principal has shared it, and it now appears in your list with your access role. `404 notFound` means they haven't shared it yet.
-3. Decide whose each calendar is by the Executive Assistant section's rule. `dataOwner`, the owner's address, appears only on secondary calendars; a primary calendar's owner is its ID.
+3. Decide whose each calendar is by the ownership rule in your gcalendar instructions. `dataOwner`, the owner's address, appears only on secondary calendars; a primary calendar's owner is its ID.
 
 You can add a secondary calendar only by its ID, which Google sends in its sharing email. If a request needs a calendar of the principal's that you can't find, ask them for its Calendar ID: in Google Calendar settings, they open the calendar and copy it from "Integrate calendar". Then subscribe to it.
 

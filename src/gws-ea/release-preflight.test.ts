@@ -134,8 +134,8 @@ async function releaseFixture(): Promise<string> {
   await write(root, 'src/gateway-providers/onecli-files.ts', 'export {};\n');
   await write(root, 'container/skills/onecli-gateway/SKILL.md', '# OneCLI gateway\n');
   await write(root, 'container/skills/onecli-gateway/instructions.md', '# OneCLI instructions\n');
-  await write(root, 'container/skills/google-workspace/SKILL.md', '# Google Workspace\n');
-  await write(root, 'container/skills/google-workspace/instructions.md', '# Google Workspace rules\n');
+  await write(root, 'container/skills/gcalendar/SKILL.md', '# gcalendar\n');
+  await write(root, 'container/skills/gcalendar/instructions.md', '# gcalendar rules\n');
   await write(root, 'src/gws-ea/process.ts', 'export {};\n');
   await write(root, 'src/gws-ea/cloudflare-connector.ts', 'export {};\n');
   await write(root, 'scripts/init-first-agent.ts', 'export {};\n');
@@ -265,7 +265,7 @@ describe('release preflight', () => {
     ['GWS-EA welcome', 'templates/gws-ea/main/skills/welcome/SKILL.md', 'incomplete_release'],
     ['GWS-EA guidance', 'src/modules/gws-ea-main/guidance.md', 'incomplete_release'],
     ['GWS-EA Google access', 'src/modules/gws-ea-google/index.ts', 'incomplete_release'],
-    ['Google tool rules', 'container/skills/google-workspace/instructions.md', 'incomplete_release'],
+    ['Google Calendar rules', 'container/skills/gcalendar/instructions.md', 'incomplete_release'],
     ['Google Chat adapter', 'src/channels/gchat.ts', 'incomplete_release'],
     ['GWS-EA interactive launcher', 'setup/gws-ea-input.ts', 'incomplete_release'],
     ['GWS-EA service launcher', 'src/gws-ea/process.ts', 'incomplete_release'],
