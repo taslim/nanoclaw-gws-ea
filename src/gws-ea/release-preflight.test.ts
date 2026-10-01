@@ -139,6 +139,7 @@ async function releaseFixture(): Promise<string> {
   await write(root, 'scripts/init-first-agent.ts', 'export {};\n');
   await write(root, 'src/modules/gws-ea-profile/index.ts', 'export {};\n');
   await write(root, 'src/modules/gws-ea-profile/migration.ts', 'export {};\n');
+  await write(root, 'src/modules/gws-ea-google/index.ts', 'export {};\n');
   await write(root, 'src/modules/gws-ea-main/index.ts', 'export {};\n');
   await write(root, 'src/modules/gws-ea-main/guidance.md', '# Guidance\n');
   await write(root, 'src/modules/gws-ea-preferences/index.ts', 'export {};\n');
@@ -146,7 +147,7 @@ async function releaseFixture(): Promise<string> {
   await write(
     root,
     'src/modules/index.ts',
-    "import './gws-ea-main/index.js';\nimport './gws-ea-profile/index.js';\nimport './gws-ea-preferences/index.js';\n",
+    "import './gws-ea-google/index.js';\nimport './gws-ea-main/index.js';\nimport './gws-ea-profile/index.js';\nimport './gws-ea-preferences/index.js';\n",
   );
   await write(root, 'src/provider-contracts/claude.ts', "export const provider = 'claude';\n");
   await write(root, 'src/provider-contracts/index.ts', "import './claude.js';\n");
@@ -261,6 +262,7 @@ describe('release preflight', () => {
     ['template', 'templates/gws-ea/main/plugin.json', 'incomplete_release'],
     ['GWS-EA welcome', 'templates/gws-ea/main/skills/welcome/SKILL.md', 'incomplete_release'],
     ['GWS-EA guidance', 'src/modules/gws-ea-main/guidance.md', 'incomplete_release'],
+    ['GWS-EA Google access', 'src/modules/gws-ea-google/index.ts', 'incomplete_release'],
     ['Google Chat adapter', 'src/channels/gchat.ts', 'incomplete_release'],
     ['GWS-EA interactive launcher', 'setup/gws-ea-input.ts', 'incomplete_release'],
     ['GWS-EA service launcher', 'src/gws-ea/process.ts', 'incomplete_release'],

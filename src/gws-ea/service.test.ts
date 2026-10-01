@@ -600,6 +600,7 @@ describe('GWS-EA instance runtime', () => {
         ONECLI_API_KEY: 'runtime-secret-canary',
         GCHAT_CREDENTIALS: expect.stringContaining('chat-secret-canary'),
         GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL: 'service-441811502258@gcp-sa-gsuiteaddons.iam.gserviceaccount.com',
+        GWS_EA_GOOGLE_GRANT_FILE: path.join(path.dirname(config.secret_files.gchat_credentials), 'google-grant.json'),
       },
     });
     expect(calls[0]?.env).not.toHaveProperty('NODE_OPTIONS');

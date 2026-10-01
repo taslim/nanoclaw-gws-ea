@@ -286,6 +286,7 @@ async function validateComposition(
     'src/gws-ea/process.ts',
     'src/gws-ea/cloudflare-connector.ts',
     'scripts/init-first-agent.ts',
+    'src/modules/gws-ea-google/index.ts',
     'src/modules/gws-ea-main/index.ts',
     'src/modules/gws-ea-main/guidance.md',
     'src/modules/gws-ea-profile/index.ts',
@@ -322,6 +323,7 @@ async function validateComposition(
     );
     await assertBarrelImports(checkoutRoot, [
       { barrel: 'src/channels/index.ts', moduleName: 'gchat', code: 'incomplete_release' },
+      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-google/index', code: 'incomplete_release' },
       { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-main/index', code: 'incomplete_release' },
       { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-profile/index', code: 'incomplete_release' },
       { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-preferences/index', code: 'incomplete_release' },
