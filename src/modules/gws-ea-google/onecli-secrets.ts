@@ -4,6 +4,8 @@
  * body, never in a process argument. OneCLI sets the header on every matching
  * request, replacing the placeholder a tool sends.
  */
+import { isRecord } from '../../gws-ea/validation.js';
+
 export interface OnecliApi {
   /** OneCLI's app URL, e.g. `http://127.0.0.1:31002`. */
   readonly url: string;
@@ -18,10 +20,6 @@ export interface InjectedSecret {
 }
 
 const BEARER_INJECTION = { headerName: 'Authorization', valueFormat: 'Bearer {value}' } as const;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 async function call(api: OnecliApi, method: string, route: string, body?: unknown): Promise<Response> {
   const fetchImpl = api.fetch ?? globalThis.fetch;

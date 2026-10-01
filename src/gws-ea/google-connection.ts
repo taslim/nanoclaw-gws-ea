@@ -19,15 +19,22 @@ import type { AssistantGoogleSignInRequest } from './events.js';
 import { googleWorkspaceApisResource, type GcloudDependencies, type GcpProjectContext } from './gcloud.js';
 import {
   readGoogleOAuthClientFile,
+  readJson,
   readStoredGoogleOAuthClient,
   storeGoogleOAuthClient,
   writeGoogleGrant,
   type GoogleOAuthClient,
 } from './google-oauth.js';
 import { ABSENT, PRESENT, type Observation, type ProvisionHumanPause, type StepResource } from './phases.js';
-import { readOwnerOnlyFile, removePrivateFile } from './secrets.js';
-import { googleGrantFile, googleOAuthClientFile, type InstanceRuntimeConfig } from './service.js';
+import { removePrivateFile } from './secrets.js';
+import {
+  googleGrantFile,
+  googleOAuthClientFile,
+  readOnecliAdminApiKey,
+  type InstanceRuntimeConfig,
+} from './service.js';
 import { GwsEaError } from './types.js';
+import { isRecord } from './validation.js';
 
 /** The resume flag that supplies the downloaded OAuth client. */
 export const GOOGLE_CLIENT_FILE_FLAG = '--google-client-file';
@@ -79,8 +86,7 @@ function clientPause(context: GoogleConnectionContext): ProvisionHumanPause {
 }
 
 async function onecliApi(runtime: InstanceRuntimeConfig, fetchImpl?: typeof globalThis.fetch): Promise<OnecliApi> {
-  const apiKey = (await readOwnerOnlyFile(runtime.secret_files.onecli_admin_api_key)).trim();
-  if (!apiKey) throw new GwsEaError('invalid_secret', 'The OneCLI administrative credential is empty');
+  const apiKey = await readOnecliAdminApiKey(runtime);
   return { url: runtime.onecli_app_url, apiKey, ...(fetchImpl ? { fetch: fetchImpl } : {}) };
 }
 
@@ -188,9 +194,9 @@ export function googleConnectionResources(
           headers: { authorization: `Bearer ${token.accessToken}` },
           signal: AbortSignal.timeout(15_000),
         });
-        const body: unknown = await response.json().catch(() => undefined);
+        const body = await readJson(response);
         if (!response.ok) return { status: 'absent', reason: `Google Calendar answered HTTP ${response.status}` };
-        const id = typeof body === 'object' && body !== null && 'id' in body ? body.id : undefined;
+        const id = isRecord(body) ? body.id : undefined;
         return id === grant.account
           ? PRESENT
           : { status: 'absent', reason: "Google Calendar did not return the assistant's own calendar" };

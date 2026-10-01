@@ -867,11 +867,10 @@ export function createTimeTools(zone: string, now: () => number = Date.now): Mcp
           } else {
             for (let minute = window.start; minute < window.end; minute += interval) {
               const wall = wallClockOf(day.plus({ minutes: minute }));
-              const instants = instantsAt(wall, zone).filter((at) => at >= start && at < end);
-              const [first, second] = instants;
+              const everyInstant = instantsAt(wall, zone);
+              const [first, second] = everyInstant.filter((at) => at >= start && at < end);
               if (first === undefined) {
-                if (instantsAt(wall, zone).length === 0)
-                  skipped.push(`${describeLocalTime(wall)} does not exist in ${zone}.`);
+                if (everyInstant.length === 0) skipped.push(`${describeLocalTime(wall)} does not exist in ${zone}.`);
                 continue;
               }
               const local = first.setLocale('en-US');

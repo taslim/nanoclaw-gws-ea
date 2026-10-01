@@ -110,7 +110,7 @@ import {
 } from '../provider-credential.js';
 import { assertProviderProvisioningCapabilityDigest } from '../provider-provisioning-capability.js';
 import { googleChatConfigurationUrl } from './chat-configuration.js';
-import { PauseRequired, type Interaction } from './events.js';
+import { googleSignInPause, type Interaction } from './events.js';
 import { googleConnectionResources, type GoogleConnectionInput } from './google-connection.js';
 import {
   getOwnedGcpProjectNumber,
@@ -1683,9 +1683,7 @@ export async function runProductionProvision(
         ...(interaction?.decisions.googleClientFile ? { clientFile: interaction.decisions.googleClientFile } : {}),
         signIn: (request) => {
           if (interaction) return interaction.signInAssistantToGoogle(request);
-          throw new PauseRequired('google_sign_in_required', `Sign the assistant in to Google as ${request.account}.`, [
-            `Run this at a terminal on this machine, with a browser: ${request.resumeCommand}`,
-          ]);
+          throw googleSignInPause(request);
         },
         resumeCommand: `gws-ea resume --id ${operation.instanceId}`,
       },

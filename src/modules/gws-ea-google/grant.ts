@@ -5,6 +5,7 @@
  * the account; it lives in the instance's owner-only `secrets/` directory and
  * never in a container.
  */
+import { canonicalTimestamp, hasControlCharacters, isRecord } from '../../gws-ea/validation.js';
 
 /** A Google service the release can expose to agents, each through its own OneCLI secret. */
 export interface GoogleService {
@@ -79,7 +80,7 @@ export const GOOGLE_GRANT_FILE_NAME = 'google-grant.json';
 export const GOOGLE_GRANT_FILE_ENV = 'GWS_EA_GOOGLE_GRANT_FILE';
 
 function requireText(value: unknown, label: string, maximum = 4_096): string {
-  if (typeof value !== 'string' || value.length === 0 || value.length > maximum || /[\p{Cc}]/u.test(value)) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > maximum || hasControlCharacters(value)) {
     throw new Error(`Google grant ${label} is invalid`);
   }
   return value;
@@ -87,21 +88,18 @@ function requireText(value: unknown, label: string, maximum = 4_096): string {
 
 /** Parse a grant file's content; any other shape is refused rather than used. */
 export function parseGoogleGrant(value: unknown): GoogleGrant {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('Google grant is invalid');
-  const record = value as Record<string, unknown>;
-  if (record.schema_version !== GOOGLE_GRANT_SCHEMA_VERSION) throw new Error('Google grant schema is unsupported');
-  const scopes = record.scopes;
+  if (!isRecord(value)) throw new Error('Google grant is invalid');
+  if (value.schema_version !== GOOGLE_GRANT_SCHEMA_VERSION) throw new Error('Google grant schema is unsupported');
+  const scopes = value.scopes;
   if (!Array.isArray(scopes) || scopes.length === 0) throw new Error('Google grant scopes are invalid');
-  const grantedAt = requireText(record.granted_at, 'time', 64);
-  if (Number.isNaN(Date.parse(grantedAt)) || new Date(grantedAt).toISOString() !== grantedAt) {
-    throw new Error('Google grant time is invalid');
-  }
+  const grantedAt = requireText(value.granted_at, 'time', 64);
+  if (canonicalTimestamp(grantedAt) === undefined) throw new Error('Google grant time is invalid');
   return {
     schema_version: GOOGLE_GRANT_SCHEMA_VERSION,
-    account: requireText(record.account, 'account', 254).toLowerCase(),
-    client_id: requireText(record.client_id, 'client ID', 512),
-    client_secret: requireText(record.client_secret, 'client secret', 512),
-    refresh_token: requireText(record.refresh_token, 'refresh token'),
+    account: requireText(value.account, 'account', 254).toLowerCase(),
+    client_id: requireText(value.client_id, 'client ID', 512),
+    client_secret: requireText(value.client_secret, 'client secret', 512),
+    refresh_token: requireText(value.refresh_token, 'refresh token'),
     scopes: scopes.map((scope, index) => requireText(scope, `scope ${index + 1}`, 512)),
     granted_at: grantedAt,
   };

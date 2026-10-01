@@ -2,6 +2,7 @@ import { registerResource, type ColumnDef } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
+import { optionalString } from '../../gws-ea/validation.js';
 import { registerRequiredProjectDocSection, type RequiredProjectDocSection } from '../../project-doc-sections.js';
 import {
   getSchedulingPreferences,
@@ -18,6 +19,7 @@ import {
   type SetPreferenceInput,
   type Weekday,
 } from './db.js';
+import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { gwsEaPreferencesMigration } from './migration.js';
 
 registerMigration(gwsEaPreferencesMigration);
@@ -136,11 +138,6 @@ function requiredString(args: Record<string, unknown>, key: string, kind: Prefer
   return value;
 }
 
-function optionalString(args: Record<string, unknown>, key: string): string | undefined {
-  const value = args[key];
-  return typeof value === 'string' ? value : undefined;
-}
-
 function requiredNumber(args: Record<string, unknown>, key: string, kind: PreferenceKind): number {
   const value = args[key];
   if (typeof value !== 'number') throw new Error(`${flag(key)} is required for ${kind}`);
@@ -148,7 +145,7 @@ function requiredNumber(args: Record<string, unknown>, key: string, kind: Prefer
 }
 
 function weekdayList(args: Record<string, unknown>): string[] | undefined {
-  const value = optionalString(args, 'weekdays');
+  const value = optionalString(args.weekdays);
   return value === undefined
     ? undefined
     : value
@@ -176,11 +173,11 @@ function setInput(args: Record<string, unknown>): SetPreferenceInput {
     case 'protected-window':
       return {
         kind,
-        id: optionalString(args, 'id'),
+        id: optionalString(args.id),
         weekdays: weekdayList(args),
         start: requiredString(args, 'start', kind),
         end: requiredString(args, 'end', kind),
-        reason: optionalString(args, 'reason'),
+        reason: optionalString(args.reason),
         ...provenance,
       };
     case 'meeting-length':
@@ -235,10 +232,7 @@ function removeTarget(args: Record<string, unknown>): PreferenceTarget {
  */
 async function assertMainCaller(ctx: CallerContext): Promise<void> {
   if (ctx.caller === 'host') return;
-  const profile = await getDb().get<{ main_agent_group_id: string | null }>(
-    'SELECT main_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
-  );
-  const mainAgentGroupId = profile?.main_agent_group_id ?? null;
+  const mainAgentGroupId = await getMainAgentGroupId();
   if (mainAgentGroupId === null || ctx.agentGroupId !== mainAgentGroupId) {
     throw new Error("The principal's scheduling preferences are available only to main");
   }

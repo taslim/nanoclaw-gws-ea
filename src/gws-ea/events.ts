@@ -147,6 +147,13 @@ export interface AssistantGoogleSignInRequest {
   readonly resumeCommand: string;
 }
 
+/** The pause a sign-in becomes when no one is at a terminal to complete it. */
+export function googleSignInPause({ account, resumeCommand }: AssistantGoogleSignInRequest): PauseRequired {
+  return new PauseRequired('google_sign_in_required', `Sign the assistant in to Google as ${account}.`, [
+    `Run this at a terminal on this machine, with a browser: ${resumeCommand}`,
+  ]);
+}
+
 /** What to do after a human pause: stop and report it, or run on with any decisions the person made. */
 export type PauseResponse =
   | { readonly kind: 'stop' }
@@ -289,12 +296,9 @@ export function createInteraction(options: InteractionOptions): Interaction {
       }
       return withTerminal(() => prompts.googleAccount(account));
     },
-    async signInAssistantToGoogle({ client, account, resumeCommand }) {
-      if (!prompts) {
-        throw new PauseRequired('google_sign_in_required', `Sign the assistant in to Google as ${account}.`, [
-          `Run this at a terminal on this machine, with a browser: ${resumeCommand}`,
-        ]);
-      }
+    async signInAssistantToGoogle(request) {
+      if (!prompts) throw googleSignInPause(request);
+      const { client, account } = request;
       return signInAsAssistant({
         client,
         account,

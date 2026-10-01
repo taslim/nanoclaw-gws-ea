@@ -790,14 +790,20 @@ async function buildInstanceHostEnvironment(
   });
 }
 
+/** The instance's OneCLI administrative key, from its owner-only secret file; an empty file is refused. */
+export async function readOnecliAdminApiKey(config: InstanceRuntimeConfig): Promise<string> {
+  const apiKey = (await readOwnerOnlyFile(config.secret_files.onecli_admin_api_key)).trim();
+  if (!apiKey) throw new GwsEaError('invalid_secret', 'The OneCLI administrative credential is empty');
+  return apiKey;
+}
+
 export async function runInstanceOnecliAdminCommand(
   configInput: InstanceRuntimeConfig,
   args: readonly string[],
   dependencies: { readonly runCommand?: SanitizedCommandRunner; readonly ambientEnv?: NodeJS.ProcessEnv } = {},
 ): Promise<SanitizedCommandResult> {
   const config = validateRuntimeConfig(configInput);
-  const apiKey = (await readOwnerOnlyFile(config.secret_files.onecli_admin_api_key)).trim();
-  if (!apiKey) throw new GwsEaError('invalid_secret', 'The OneCLI administrative credential is empty');
+  const apiKey = await readOnecliAdminApiKey(config);
   await assertExecutable(config.onecli_cli_path);
   const run = dependencies.runCommand ?? runSanitizedCommand;
   return run({

@@ -4,6 +4,7 @@
  * refused rather than injected: a consented but unexposed service, Gmail in
  * this checkpoint, must stay out of every agent's reach.
  */
+import { isRecord } from '../../gws-ea/validation.js';
 import type { GoogleGrant, GoogleService } from './grant.js';
 
 export const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
@@ -28,10 +29,6 @@ export interface ServiceToken {
 export interface TokenOptions {
   readonly fetch?: typeof globalThis.fetch;
   readonly now?: () => number;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 /** Exchange the grant's refresh token for an access token limited to `service`'s scopes. */

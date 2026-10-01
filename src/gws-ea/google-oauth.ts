@@ -191,7 +191,7 @@ async function listenOnLoopback(): Promise<{ server: Server; redirectUri: string
   return { server, redirectUri: `http://127.0.0.1:${address.port}` };
 }
 
-async function readJson(response: Response): Promise<unknown> {
+export async function readJson(response: Response): Promise<unknown> {
   return response.json().catch(() => undefined);
 }
 

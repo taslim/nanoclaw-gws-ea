@@ -17,7 +17,7 @@ import { onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
 import { registerRequiredProjectDocSection } from '../../project-doc-sections.js';
 import type { AgentGroup } from '../../types.js';
-import { getGwsEaProfile } from '../gws-ea-profile/db.js';
+import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
 
 /** The guidance, relative to the checkout the host runs from, as NanoClaw reads its other instruction files. */
 export const GUIDANCE_PATH = path.join('src', 'modules', 'gws-ea-main', 'guidance.md');
@@ -31,7 +31,7 @@ export const MAIN_SHARED_SKILLS: readonly string[] = ['agent-browser', 'google-w
 
 async function mainAgentGroupId(): Promise<string | null> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return null;
-  return (await getGwsEaProfile()).main_agent_group_id;
+  return getMainAgentGroupId();
 }
 
 async function guidanceSection(group: AgentGroup): Promise<{ name: string; body: string } | undefined> {

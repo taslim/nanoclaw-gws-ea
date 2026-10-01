@@ -11,6 +11,7 @@ import {
   addPrincipalAddress,
   bindVerifiedPrincipalUser,
   getGwsEaProfile,
+  getMainAgentGroupId,
   listPrincipalAddresses,
   reconcileGwsEaProfile,
   removePrincipalAddress,
@@ -164,10 +165,8 @@ register({
  */
 async function assertMayChangePrincipalAddresses(ctx: CallerContext): Promise<void> {
   if (ctx.caller === 'host') return;
-  const profile = await getDb().get<{ main_agent_group_id: string | null }>(
-    'SELECT main_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
-  );
-  if (!profile?.main_agent_group_id || profile.main_agent_group_id !== ctx.agentGroupId) {
+  const mainAgentGroupId = await getMainAgentGroupId();
+  if (!mainAgentGroupId || mainAgentGroupId !== ctx.agentGroupId) {
     throw new Error("Only main changes the principal's addresses, on the principal's word.");
   }
 }

@@ -1,8 +1,6 @@
 import { getDb } from '../../db/connection.js';
-import { hasControlCharacters } from '../../gws-ea/validation.js';
+import { EMAIL_PATTERN, hasControlCharacters } from '../../gws-ea/validation.js';
 import { isValidTimezone } from '../../timezone.js';
-
-const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/u;
 
 export interface GwsEaProfile {
   readonly assistant_display_name: string | null;
@@ -100,6 +98,14 @@ export function validateGwsEaProfileInput(input: ReconcileGwsEaProfileInput): Re
 
 export async function listPrincipalAddresses(): Promise<PrincipalAddress[]> {
   return getDb().all<PrincipalAddress>('SELECT email, added_at FROM gws_ea_principal_addresses ORDER BY email');
+}
+
+/** The canonical main's agent group, or null until setup names one. */
+export async function getMainAgentGroupId(): Promise<string | null> {
+  const row = await getDb().get<{ main_agent_group_id: string | null }>(
+    'SELECT main_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
+  );
+  return row?.main_agent_group_id ?? null;
 }
 
 export async function getGwsEaProfile(): Promise<GwsEaProfile> {
