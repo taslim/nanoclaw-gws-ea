@@ -522,6 +522,24 @@ describe('recorded divergence: the agent runner describes delivery so a sent rep
   });
 });
 
+describe('recorded divergence: a subagent cannot message the conversation', () => {
+  it("refuses the delivery tools inside a subagent, in the Claude provider's tool hook", async () => {
+    const provider = await readFile(path.join(originalCwd, 'container/agent-runner/src/providers/claude.ts'), 'utf8');
+
+    expect(provider).toContain('if (i.agent_id !== undefined && SUBAGENT_DENIED_TOOLS.has(toolName)) {');
+    for (const tool of [
+      'send_message',
+      'send_file',
+      'edit_message',
+      'add_reaction',
+      'send_card',
+      'ask_user_question',
+    ]) {
+      expect(provider).toContain(`'${tool}'`);
+    }
+  });
+});
+
 describe('recorded divergence: the agent image carries the pinned Google tool', () => {
   /** The Dockerfile with line continuations joined, so each instruction is one line. */
   async function dockerfileInstructions(): Promise<string[]> {
