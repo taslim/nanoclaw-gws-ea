@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { PauseRequired, pendingActionOf, SignInRequired, type RunEvent } from './events.js';
 import {
+  contractSteps,
   readProvisionJournal,
   recordPrincipalSelection,
   reserveInstance,
@@ -172,6 +173,7 @@ function bootstrapManifest(paths: ControlPlanePaths): ProductionBootstrapManifes
       assistant_display_name: 'Aya',
       principal_display_name: 'Principal',
       principal_timezone: 'America/Los_Angeles',
+      principal_emails: ['principal@example.test'],
     },
     selected_messaging_group_id: null,
   };
@@ -261,6 +263,7 @@ function worldSteps(world: World, ingress: 'existing' | 'managed' = 'existing'):
     start_nanoclaw: runtime('start_nanoclaw'),
     establish_transport: ingress === 'managed' ? runtime('establish_transport') : step('establish_transport'),
     configure_channel: step('configure_channel'),
+    connect_google: step('connect_google'),
     bind_principal: step('bind_principal', { pauseNeeds: principalPauseNeeds }),
     verify_conversation: step('verify_conversation', { pauseNeeds: principalPauseNeeds }),
   };
@@ -323,7 +326,46 @@ function startedSteps(events: readonly RunEvent[]): string[] {
 
 const FULL_WAIT = OBSERVATION_WAITS_SECONDS.map((seconds) => seconds * 1_000);
 
+/** Rewrite the instance's journal as an earlier launcher left it: contract 1, with `steps` complete. */
+async function contractOneJournal(engine: Awaited<ReturnType<typeof engineFixture>>, steps: readonly string[]) {
+  const file = engine.paths.journalFile(engine.instanceId);
+  const raw = JSON.parse(await readFile(file, 'utf8')) as Record<string, unknown>;
+  const at = new Date().toISOString();
+  await writeFile(
+    file,
+    JSON.stringify({
+      ...raw,
+      launcher_contract_version: 1,
+      steps: Object.fromEntries(steps.map((step) => [step, { started_at: at, completed_at: at }])),
+    }),
+    { mode: 0o600 },
+  );
+}
+
 describe('step engine', () => {
+  it('runs only its own steps for an assistant created under contract 1, never the Google sign-in', async () => {
+    const engine = await engineFixture();
+    await contractOneJournal(engine, contractSteps(1));
+    for (const id of contractSteps(1)) engine.world.present.add(id);
+
+    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+
+    expect(startedSteps(engine.events)).not.toContain('connect_google');
+    expect(engine.world.applied).toEqual([]);
+    expect((await engine.journal()).steps.connect_google).toBeUndefined();
+  });
+
+  it('refuses to finish a contract 1 setup, naming remove and recreate', async () => {
+    const engine = await engineFixture();
+    await contractOneJournal(engine, ['materialize_checkout', 'provision_gcp']);
+
+    const refusal = await engine.run().catch((error: unknown) => error);
+
+    expect(refusal).toMatchObject({ code: 'incompatible_launcher' });
+    expect(String((refusal as Error).message)).toContain(`gws-ea remove --id ${engine.instanceId}`);
+    expect(engine.world.applied).toEqual([]);
+  });
+
   it('runs a fresh instance in order, recording when each step started and completed', async () => {
     const engine = await engineFixture();
 
@@ -682,6 +724,30 @@ describe('production bootstrap trust boundary', () => {
     });
   });
 
+  it("keeps the principal's addresses lowercased and each once, and refuses a manifest without a valid one", async () => {
+    const paths = await testPaths();
+    const file = path.join(path.dirname(paths.configRoot), 'setup.json');
+    const manifest = bootstrapManifest(paths);
+    const load = async (principalEmails: unknown) => {
+      await writeFile(
+        file,
+        JSON.stringify({ ...manifest, identity: { ...manifest.identity, principal_emails: principalEmails } }),
+        { mode: 0o600 },
+      );
+      return loadProductionBootstrapManifest(file);
+    };
+
+    await expect(
+      load(['Principal@Example.test', 'second@example.test', 'principal@example.test']),
+    ).resolves.toMatchObject({ identity: { principal_emails: ['principal@example.test', 'second@example.test'] } });
+    for (const invalid of [undefined, [], ['not-an-email'], 'principal@example.test']) {
+      await expect(load(invalid), JSON.stringify(invalid)).rejects.toMatchObject({
+        code: 'invalid_bootstrap_manifest',
+        message: expect.stringMatching(/principal email/i),
+      });
+    }
+  });
+
   it('stages and removes only the validated bootstrap file before reservation publication', async () => {
     const paths = await testPaths();
     const input = reservation(paths);
@@ -842,6 +908,14 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
       },
       ingress: reserved.exclusive_resource_claims.ingress,
       hostStatus: servingHost(reserved),
+      google: {
+        runtime,
+        assistantWorkspaceEmail: reserved.exclusive_resource_claims.workspace_email,
+        signIn: async () => {
+          throw new Error('unexpected Google sign-in');
+        },
+        resumeCommand: `gws-ea resume --id ${reserved.instance_id}`,
+      },
     },
   };
 }
@@ -2046,6 +2120,16 @@ async function productionHarness(): Promise<ProductionHarness> {
             },
           ],
           getOwnedGcpProjectNumber: async () => '441811502258',
+          googleConnectionResources: () => [
+            {
+              name: "the assistant's Google account",
+              observe: async () => (resources.has('google') ? PRESENT : ABSENT),
+              apply: async () => {
+                effect('connectGoogle', 'google');
+                return undefined;
+              },
+            },
+          ],
           observeOnecli: async () => (resources.has('onecli') ? PRESENT : ABSENT),
           reconcileOnecliRuntime: async () => {
             effect('reconcileOnecliRuntime', 'onecli');
@@ -2152,6 +2236,7 @@ describe('production step order and pause outcomes', () => {
     'start_nanoclaw',
     'establish_transport',
     'configure_channel',
+    'connect_google',
     'bind_principal',
   ];
 
@@ -2170,6 +2255,7 @@ describe('production step order and pause outcomes', () => {
       'importProviderCredential',
       'reconcileInstanceRuntime',
       'reconcileMainIdentity',
+      'connectGoogle',
       'reconcilePrincipalDm:waiting',
     ]);
 
@@ -2204,6 +2290,7 @@ describe('production step order and pause outcomes', () => {
       'importProviderCredential',
       'reconcileInstanceRuntime',
       'reconcileMainIdentity',
+      'connectGoogle',
     ]);
   });
 

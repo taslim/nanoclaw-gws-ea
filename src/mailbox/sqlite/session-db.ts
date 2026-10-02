@@ -9,6 +9,7 @@ import Database from 'better-sqlite3';
 
 import { createInboundRecord } from '../model.js';
 import type { InboundWrite } from '../model.js';
+import type { MessageRetry } from '../types.js';
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
 
 /** Apply the inbound or outbound schema to a DB file. Idempotent. */
@@ -127,14 +128,14 @@ export function retryWithBackoff(db: Database.Database, messageId: string, backo
   db.prepare('UPDATE messages_in SET tries = tries + 1, process_after = ? WHERE id = ?').run(processAfter, messageId);
 }
 
-export function getMessageForRetry(
-  db: Database.Database,
-  messageId: string,
-  status: string,
-): { id: string; tries: number; processAfter: string | null } | undefined {
+export function getMessageForRetry(db: Database.Database, messageId: string, status: string): MessageRetry | undefined {
   return db
-    .prepare('SELECT id, tries, process_after as processAfter FROM messages_in WHERE id = ? AND status = ?')
-    .get(messageId, status) as { id: string; tries: number; processAfter: string | null } | undefined;
+    .prepare(
+      `SELECT id, tries, process_after as processAfter, kind, channel_type as channelType,
+              platform_id as platformId, thread_id as threadId
+         FROM messages_in WHERE id = ? AND status = ?`,
+    )
+    .get(messageId, status) as MessageRetry | undefined;
 }
 
 export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Database): void {

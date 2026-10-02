@@ -1,4 +1,6 @@
 import * as clack from '@clack/prompts';
+import os from 'node:os';
+import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -13,6 +15,7 @@ function prompts(answer: unknown = true) {
     info: vi.fn(),
     confirm: vi.fn(async () => answer),
     select: vi.fn(async () => answer),
+    text: vi.fn(async () => answer),
     isCancel: (value: unknown) => value === CANCEL,
   };
 }
@@ -26,6 +29,7 @@ function clackPrompts() {
     info: vi.fn(),
     confirm: (options: Parameters<typeof clack.confirm>[0]) => clack.confirm({ ...options, input, output }),
     select: (options: Parameters<typeof clack.select<string>>[0]) => clack.select({ ...options, input, output }),
+    text: (options: Parameters<typeof clack.text>[0]) => clack.text({ ...options, input, output }),
     isCancel: clack.isCancel,
   };
 }
@@ -58,7 +62,38 @@ const CHAT_CONFIGURATION = pause({
   resumeFlag: '--chat-configured',
 });
 
+const GOOGLE_CLIENT = pause({
+  phase: 'connect_google',
+  code: 'google_client_required',
+  message: "Create the assistant's Google sign-in client, then continue with its file.",
+  details: ['Under Clients, create an OAuth client of type Desktop app and download its JSON.'],
+  actionUrl: 'https://console.cloud.google.com/auth/clients?project=gws-ea-robin',
+  resumeFlag: '--google-client-file <file>',
+});
+
 describe('attending a pause at the terminal', () => {
+  it('asks for the downloaded Google client file in place, with its instructions and link', async () => {
+    const terminal = prompts('~/Downloads/client.json');
+
+    await expect(attendPause(GOOGLE_CLIENT, new AbortController().signal, { prompts: terminal })).resolves.toEqual({
+      kind: 'continue',
+      decisions: { googleClientFile: path.join(os.homedir(), 'Downloads', 'client.json') },
+    });
+    expect(terminal.note).toHaveBeenCalledWith(
+      expect.stringContaining(
+        'Desktop app and download its JSON.\nOpen: https://console.cloud.google.com/auth/clients',
+      ),
+      "The assistant's Google sign-in client",
+    );
+
+    await expect(
+      attendPause(GOOGLE_CLIENT, new AbortController().signal, { prompts: prompts(CANCEL) }),
+    ).resolves.toEqual({ kind: 'stop' });
+    await expect(
+      attendPause(GOOGLE_CLIENT, new AbortController().signal, { prompts: prompts('   ') }),
+    ).resolves.toEqual({ kind: 'stop' });
+  });
+
   it('confirms the Google Chat configuration in place, with its values and link', async () => {
     const terminal = prompts(true);
 

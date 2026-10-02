@@ -4,8 +4,9 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { loadSecretSource } from './create-input.js';
+import { loadSecretSource, parsePrincipalEmailFlags } from './create-input.js';
 import { redact, REDACTED } from './redact.js';
+import { normalizePrincipalEmail } from './validation.js';
 
 const roots: string[] = [];
 
@@ -27,6 +28,34 @@ async function secretsFile(directory: string, contents: string, mode = 0o600): P
   await chmod(file, mode);
   return file;
 }
+
+describe('principal email inputs', () => {
+  it('keeps every --principal-email once, lowercased, in the order given', () => {
+    expect(parsePrincipalEmailFlags([' Ada@Example.TEST ', 'second@work.example.test', 'ada@example.test'])).toEqual([
+      'ada@example.test',
+      'second@work.example.test',
+    ]);
+    expect(parsePrincipalEmailFlags([])).toEqual([]);
+  });
+
+  it.each(['not-an-email', 'ada@example', 'a`b@example.test', `${'a'.repeat(250)}@example.test`])(
+    'refuses %s at input, naming the flag',
+    (value) => {
+      expect(() => parsePrincipalEmailFlags(['ada@example.test', value])).toThrow(
+        expect.objectContaining({
+          code: 'invalid_arguments',
+          message: expect.stringMatching(/^--principal-email: /u),
+          details: { flag: '--principal-email' },
+        }),
+      );
+    },
+  );
+
+  it('normalizes one address the way every layer stores it, or says it cannot be one', () => {
+    expect(normalizePrincipalEmail(' Ada@Example.TEST')).toBe('ada@example.test');
+    expect(normalizePrincipalEmail('ada@example')).toBeUndefined();
+  });
+});
 
 describe('secret inputs', () => {
   it('reads secrets from the environment first, then an owner-only file, and registers them', async () => {

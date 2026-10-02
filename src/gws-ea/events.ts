@@ -4,9 +4,11 @@
  * (setup/gws-ea*.ts) renders the events and supplies the terminal prompts;
  * nothing here imports setup/.
  */
+import type { GoogleGrant } from '../modules/gws-ea-google/grant.js';
 import type { ProviderCredential, ProviderCredentialMetadata } from '../provider-credential.js';
 import type { RetainedManagedIngressSetupSession } from './cloudflare-api.js';
 import { describeSecretInput, SECRET_INPUTS, type SecretInput, type SecretSource } from './create-input.js';
+import { signInAsAssistant, type GoogleOAuthClient } from './google-oauth.js';
 import type { ProvisionHumanPause } from './phases.js';
 import { registerSecret } from './redact.js';
 import type { RunLog, StepLog } from './run-log.js';
@@ -132,6 +134,24 @@ export interface HumanDecisions {
   readonly chatConfigured: boolean;
   /** `--messaging-group-id`: the principal conversation the operator chose. */
   readonly messagingGroupId?: string;
+  /** `--google-client-file`: the Desktop OAuth client the operator downloaded for the assistant's sign-in. */
+  readonly googleClientFile?: string;
+}
+
+/** Sign the assistant in to Google as its own account (KTD2). */
+export interface AssistantGoogleSignInRequest {
+  readonly client: GoogleOAuthClient;
+  /** The assistant's declared Workspace address. */
+  readonly account: string;
+  /** The command that continues this run, for when no one is at a terminal. */
+  readonly resumeCommand: string;
+}
+
+/** The pause a sign-in becomes when no one is at a terminal to complete it. */
+export function googleSignInPause({ account, resumeCommand }: AssistantGoogleSignInRequest): PauseRequired {
+  return new PauseRequired('google_sign_in_required', `Sign the assistant in to Google as ${account}.`, [
+    `Run this at a terminal on this machine, with a browser: ${resumeCommand}`,
+  ]);
 }
 
 /** What to do after a human pause: stop and report it, or run on with any decisions the person made. */
@@ -159,6 +179,8 @@ export interface Interaction {
   signInToGoogleCloud(account?: string): Promise<void>;
   /** Create: whether the signed-in `account` should own the new assistant's Google Cloud project. */
   confirmGoogleAccount(account: string): Promise<boolean>;
+  /** The assistant's own Google sign-in, through the operator's browser; pauses without a terminal. */
+  signInAssistantToGoogle(request: AssistantGoogleSignInRequest): Promise<GoogleGrant>;
   /** Hand the terminal to an interactive child, suspending progress rendering around it. */
   withTerminal<T>(work: () => Promise<T>): Promise<T>;
   /**
@@ -177,6 +199,8 @@ export interface InteractivePrompts {
   cloudflareAccountToken(request: CloudflareTokenRequest): Promise<string>;
   googleCloudSignIn(account?: string): Promise<void>;
   googleAccount(account: string): Promise<boolean>;
+  /** Show the consent URL and open it in the operator's browser, asking them to sign in as `account`. */
+  googleWorkspaceSignIn(url: string, account: string): Promise<void>;
   attendPause(pause: ProvisionHumanPause, signal: AbortSignal): Promise<PauseResponse>;
 }
 
@@ -271,6 +295,15 @@ export function createInteraction(options: InteractionOptions): Interaction {
         );
       }
       return withTerminal(() => prompts.googleAccount(account));
+    },
+    async signInAssistantToGoogle(request) {
+      if (!prompts) throw googleSignInPause(request);
+      const { client, account } = request;
+      return signInAsAssistant({
+        client,
+        account,
+        present: (url) => withTerminal(() => prompts.googleWorkspaceSignIn(url, account)),
+      });
     },
     async attendPause(pause, signal) {
       if (!prompts) return { kind: 'stop' };

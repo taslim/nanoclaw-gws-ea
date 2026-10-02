@@ -42,12 +42,35 @@ interface FakeState {
   persona: string;
   groupCreateArgs: Array<readonly string[]>;
   provider: string | null;
+  /** Main's container timezone as its container config holds it; null follows the install's. */
+  timezone: string | null;
   profileWrites: number;
+  profileWriteArgs: Array<readonly string[]>;
+  /** The principal's addresses as the profile holds them. */
+  principalEmails: readonly string[];
   agents: Array<{ id: string; identifier: string; name: string; secretMode: 'all' | 'selective' }>;
   secretModeWrites: number;
+  /** Main's shared skills as its container config holds them. */
+  skills: readonly string[] | 'all';
+  /** Every ncl call, in order, by its first two words. */
+  calls: string[];
 }
 
-function harness(options: { failAfterSecretModeOnce?: boolean; neverApplySecretMode?: boolean } = {}): {
+function flagValue(args: readonly string[], flag: string): string | undefined {
+  const index = args.indexOf(flag);
+  return index === -1 ? undefined : args[index + 1];
+}
+
+function harness(
+  options: {
+    failAfterSecretModeOnce?: boolean;
+    neverApplySecretMode?: boolean;
+    /** A NanoClaw whose config update leaves the timezone as it was. */
+    ignoreTimezone?: boolean;
+    /** A release whose main reconcile leaves main on every shared skill. */
+    ignoreSkills?: boolean;
+  } = {},
+): {
   state: FakeState;
   dependencies: MainIdentityDependencies;
 } {
@@ -56,12 +79,22 @@ function harness(options: { failAfterSecretModeOnce?: boolean; neverApplySecretM
     persona: 'stamped from the template',
     groupCreateArgs: [],
     provider: null,
+    timezone: null,
     profileWrites: 0,
+    profileWriteArgs: [],
+    principalEmails: [],
     agents: [],
     secretModeWrites: 0,
+    skills: 'all',
+    calls: [],
   };
   let failed = false;
   const runNcl = vi.fn(async (_config: InstanceRuntimeConfig, args: readonly string[]) => {
+    state.calls.push(`${args[0]} ${args[1]}`);
+    if (args[0] === 'gws-ea-main' && args[1] === 'reconcile') {
+      if (!options.ignoreSkills) state.skills = ['agent-browser'];
+      return { agent_group_id: flagValue(args, '--agent-group-id'), skills: state.skills };
+    }
     if (args[0] === 'groups' && args[1] === 'create') {
       state.groupCreateArgs.push(args);
       const group = { id: GROUP_ID, name: 'main', folder: 'main', agent_provider: null, created_at: 'now' };
@@ -79,12 +112,20 @@ function harness(options: { failAfterSecretModeOnce?: boolean; neverApplySecretM
       return { group, plugin: 'gws-ea-main', applied: apply, changes, report: [], note: apply ? 'applied' : 'DRY RUN' };
     }
     if (args[0] === 'groups' && args[1] === 'config') {
-      state.provider = args[args.indexOf('--provider') + 1] ?? null;
-      return { agent_group_id: GROUP_ID, provider: state.provider };
+      state.provider = flagValue(args, '--provider') ?? state.provider;
+      if (!options.ignoreTimezone) state.timezone = flagValue(args, '--timezone') ?? state.timezone;
+      return { agent_group_id: GROUP_ID, provider: state.provider, timezone: state.timezone };
     }
     if (args[0] === 'gws-ea-profile' && args[1] === 'reconcile') {
       state.profileWrites += 1;
-      return { main_agent_group_id: GROUP_ID };
+      state.profileWriteArgs.push(args);
+      const declared = flagValue(args, '--principal-emails');
+      if (declared !== undefined) state.principalEmails = JSON.parse(declared) as string[];
+      return {
+        main_agent_group_id: GROUP_ID,
+        principal_timezone: flagValue(args, '--principal-timezone'),
+        principal_emails: state.principalEmails,
+      };
     }
     throw new Error(`Unexpected ncl call: ${args.join(' ')}`);
   });
@@ -227,5 +268,95 @@ describe('main identity reconciliation', () => {
 
     await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).rejects.toThrow(/collision/i);
     expect(state.profileWrites).toBe(0);
+  });
+
+  it("sets main's container timezone to the profile's, and changes it when the profile changes", async () => {
+    const { state, dependencies } = harness();
+
+    await reconcileMainIdentity(runtimeConfig(), { ...input, principalTimezone: 'Africa/Lagos' }, dependencies);
+    expect(state.timezone).toBe('Africa/Lagos');
+    expect(flagValue(state.profileWriteArgs.at(-1)!, '--principal-timezone')).toBe('Africa/Lagos');
+
+    await reconcileMainIdentity(runtimeConfig(), { ...input, principalTimezone: 'America/New_York' }, dependencies);
+    expect(state.timezone).toBe('America/New_York');
+    expect(flagValue(state.profileWriteArgs.at(-1)!, '--principal-timezone')).toBe('America/New_York');
+  });
+
+  it("fails before publishing the profile when main's container timezone does not persist", async () => {
+    const { state, dependencies } = harness({ ignoreTimezone: true });
+
+    await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).rejects.toThrow(/did not persist/i);
+    expect(state.profileWrites).toBe(0);
+  });
+
+  it("gives main the release's skills before the profile publishes it", async () => {
+    const { state, dependencies } = harness();
+
+    await reconcileMainIdentity(runtimeConfig(), input, dependencies);
+
+    expect(state.skills).toEqual(['agent-browser']);
+    expect(state.calls.indexOf('gws-ea-main reconcile')).toBeGreaterThan(state.calls.indexOf('groups create'));
+    expect(state.calls.indexOf('gws-ea-main reconcile')).toBeLessThan(state.calls.indexOf('gws-ea-profile reconcile'));
+  });
+
+  it("fails before publishing the profile when main's skills stay NanoClaw's full set", async () => {
+    const { state, dependencies } = harness({ ignoreSkills: true });
+
+    await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).rejects.toThrow(/skills/i);
+    expect(state.profileWrites).toBe(0);
+  });
+
+  it("publishes the principal's declared addresses with the profile, lowercased and each once", async () => {
+    const { state, dependencies } = harness();
+
+    await reconcileMainIdentity(
+      runtimeConfig(),
+      { ...input, principalEmails: ['Taslim@Example.test', 'taslim@work.example.test', 'taslim@example.test'] },
+      dependencies,
+    );
+
+    expect(flagValue(state.profileWriteArgs[0]!, '--principal-emails')).toBe(
+      JSON.stringify(['taslim@example.test', 'taslim@work.example.test']),
+    );
+    expect(state.principalEmails).toEqual(['taslim@example.test', 'taslim@work.example.test']);
+  });
+
+  it("leaves the principal's addresses to the profile when a reconcile declares none", async () => {
+    const { state, dependencies } = harness();
+    state.principalEmails = ['added-by-the-principal@example.test'];
+
+    await reconcileMainIdentity(runtimeConfig(), input, dependencies);
+
+    expect(state.profileWriteArgs[0]).not.toContain('--principal-emails');
+    expect(state.principalEmails).toEqual(['added-by-the-principal@example.test']);
+  });
+
+  it.each([
+    ['a malformed address', ['taslim@example.test', 'not-an-email']],
+    ['no address', []],
+    ["the assistant's own address", ['taslim@example.test', 'AYA@example.test']],
+  ])('rejects principal addresses with %s before mutating NanoClaw or OneCLI', async (_case, principalEmails) => {
+    const { state, dependencies } = harness();
+
+    await expect(
+      reconcileMainIdentity(runtimeConfig(), { ...input, principalEmails }, dependencies),
+    ).rejects.toMatchObject({ code: 'invalid_identity' });
+    expect(state).toMatchObject({ groupCreated: 0, provider: null, timezone: null, profileWrites: 0, agents: [] });
+  });
+
+  it("fails when the profile does not hold the principal's declared addresses", async () => {
+    const { dependencies } = harness();
+    const runNcl = dependencies.runNcl!;
+    const forgetful: MainIdentityDependencies = {
+      ...dependencies,
+      runNcl: async (config, args) => {
+        const result = await runNcl(config, args);
+        return args[0] === 'gws-ea-profile' ? { main_agent_group_id: GROUP_ID, principal_emails: [] } : result;
+      },
+    };
+
+    await expect(
+      reconcileMainIdentity(runtimeConfig(), { ...input, principalEmails: ['taslim@example.test'] }, forgetful),
+    ).rejects.toMatchObject({ code: 'profile_mismatch' });
   });
 });

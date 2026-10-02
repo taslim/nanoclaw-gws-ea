@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -14,6 +15,8 @@ import { createManagedIngressSetupSession, type RetainedManagedIngressSetupSessi
 import {
   CREATE_INPUT_FLAGS,
   loadSecretSource,
+  parsePrincipalEmailFlags,
+  PRINCIPAL_EMAIL_FLAG,
   type CreateInputFlag,
   type CreatePromptContext,
   type CreateSetupAnswers,
@@ -42,7 +45,13 @@ import {
 } from './journal.js';
 import { readOperationRecord } from './operation.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
-import type { ProvisionHumanPause, ProvisionResult, ProvisionRuntime } from './phases.js';
+import { googleConnectionResources } from './google-connection.js';
+import {
+  runStepOutsideJournal,
+  type ProvisionHumanPause,
+  type ProvisionResult,
+  type ProvisionRuntime,
+} from './phases.js';
 import { holdLoopbackPorts, type HeldLoopbackPorts } from './ports.js';
 import { checkPrerequisites, type PrerequisiteRequest, type Prerequisites } from './prerequisites.js';
 import { replaceProcessWithCommand } from './process.js';
@@ -137,7 +146,18 @@ export const EXIT_CODES = { ready: 0, paused: 10, failed: 1, busy: 75 } as const
 
 type LineWriter = (line: string) => void;
 /** Commands that run as attempts: each with its own run log, stop summary, and failure loop. */
-const COMMANDS = ['create', 'resume', 'remove', 'start', 'stop', 'restart', 'update', 'rollback', 'cleanup'] as const;
+const COMMANDS = [
+  'create',
+  'resume',
+  'remove',
+  'start',
+  'stop',
+  'restart',
+  'update',
+  'rollback',
+  'cleanup',
+  'connect-google',
+] as const;
 type Command = (typeof COMMANDS)[number];
 /** The attempts that act on an assistant's host service alone. */
 type ServiceCommand = Extract<Command, 'start' | 'stop' | 'restart'>;
@@ -251,16 +271,32 @@ const COMMON_OPTIONS = ['secrets-file'] as const;
 const COMMON_SWITCHES = ['capture-fixtures'] as const;
 /** The host service commands name the assistant and nothing else: they read no secrets and capture nothing. */
 const SERVICE_OPTIONS: OptionSpec = { values: ['id'], switches: [] };
-const COMMAND_OPTIONS: Readonly<Record<Command, OptionSpec>> = {
+
+/** A command's flags, with the options it takes once per value. */
+interface CommandOptionSpec extends OptionSpec {
+  /** Options given once per value, such as create's `--principal-email`; their values keep the order given. */
+  readonly repeatable?: readonly string[];
+}
+
+interface ParsedOptions {
+  /** Each option given once, and `'true'` for each switch. */
+  readonly options: CommandOptions;
+  /** Each repeatable option's values, in the order given. */
+  readonly repeated: Readonly<Record<string, readonly string[]>>;
+}
+
+const COMMAND_OPTIONS: Readonly<Record<Command, CommandOptionSpec>> = {
   create: {
     values: ['track', 'source-remote', 'google-account', ...CREATE_INPUT_FLAGS, ...COMMON_OPTIONS],
     switches: COMMON_SWITCHES,
+    repeatable: [PRINCIPAL_EMAIL_FLAG],
   },
   resume: {
-    values: ['id', 'messaging-group-id', ...COMMON_OPTIONS],
+    values: ['id', 'messaging-group-id', 'google-client-file', ...COMMON_OPTIONS],
     switches: ['chat-configured', ...COMMON_SWITCHES],
   },
   remove: { values: ['id', 'abandon', ...COMMON_OPTIONS], switches: ['yes', ...COMMON_SWITCHES] },
+  'connect-google': { values: ['id', 'google-client-file', ...COMMON_OPTIONS], switches: COMMON_SWITCHES },
   start: SERVICE_OPTIONS,
   stop: SERVICE_OPTIONS,
   restart: SERVICE_OPTIONS,
@@ -269,13 +305,18 @@ const COMMAND_OPTIONS: Readonly<Record<Command, OptionSpec>> = {
   cleanup: { values: [], switches: [] },
 };
 
-function parseOptions(args: readonly string[], { values, switches }: OptionSpec): CommandOptions {
+function parseOptions(
+  args: readonly string[],
+  { values, switches, repeatable = [] }: CommandOptionSpec,
+): ParsedOptions {
   const options: Record<string, string> = {};
+  const repeated: Record<string, string[]> = {};
   for (let index = 0; index < args.length; ) {
     const flag = args[index];
     if (!flag?.startsWith('--')) throw new GwsEaError('invalid_arguments', 'Expected an option flag');
     const name = flag.slice(2);
-    if (!values.includes(name) && !switches.includes(name)) {
+    const repeats = repeatable.includes(name);
+    if (!repeats && !values.includes(name) && !switches.includes(name)) {
       throw new GwsEaError('invalid_arguments', `Unknown option --${name}`);
     }
     if (options[name] !== undefined) throw new GwsEaError('invalid_arguments', `Option --${name} was provided twice`);
@@ -288,10 +329,11 @@ function parseOptions(args: readonly string[], { values, switches }: OptionSpec)
     if (value === undefined || value.startsWith('--')) {
       throw new GwsEaError('invalid_arguments', `Option --${name} requires a value`);
     }
-    options[name] = value;
+    if (repeats) (repeated[name] ??= []).push(value);
+    else options[name] = value;
     index += 2;
   }
-  return options;
+  return { options, repeated };
 }
 
 /**
@@ -474,18 +516,19 @@ class Cli {
    * to another command's work.
    */
   prepare(command: Command, args: readonly string[]): () => Promise<Attempt> {
-    const options = parseOptions(args, COMMAND_OPTIONS[command]);
+    const { options, repeated } = parseOptions(args, COMMAND_OPTIONS[command]);
     switch (command) {
       case 'create': {
         const track = requireOption(options, 'track');
         const source = resolveReleaseSource(track, options['source-remote']);
+        const principalEmails = parsePrincipalEmailFlags(repeated[PRINCIPAL_EMAIL_FLAG] ?? []);
         return () =>
           this.#attempt({
             command,
             args,
             options,
             meta: { track },
-            work: (session) => this.#createWork(session, options, track, source),
+            work: (session) => this.#createWork(session, options, track, source, principalEmails),
           });
       }
       case 'resume': {
@@ -499,6 +542,9 @@ class Cli {
             decisions: {
               chatConfigured: options['chat-configured'] === 'true',
               ...(options['messaging-group-id'] ? { messagingGroupId: options['messaging-group-id'] } : {}),
+              ...(options['google-client-file']
+                ? { googleClientFile: path.resolve(options['google-client-file']) }
+                : {}),
             },
             work: (session) => this.#resumeWork(session, instanceId),
           });
@@ -560,6 +606,23 @@ class Cli {
       }
       case 'cleanup':
         return () => this.#attempt({ command, args, options, work: (session) => this.#cleanupWork(session) });
+      case 'connect-google': {
+        const instanceId = targetInstance(options);
+        return () =>
+          this.#attempt({
+            command,
+            args,
+            options,
+            instanceId,
+            decisions: {
+              chatConfigured: false,
+              ...(options['google-client-file']
+                ? { googleClientFile: path.resolve(options['google-client-file']) }
+                : {}),
+            },
+            work: (session) => this.#connectGoogleWork(session, instanceId),
+          });
+      }
       default: {
         const unhandled: never = command;
         throw new GwsEaError('invalid_arguments', `Unknown command ${String(unhandled)}`);
@@ -604,6 +667,8 @@ class Cli {
         );
       case 'cleanup':
         return 'gws-ea cleanup';
+      case 'connect-google':
+        return join(`gws-ea connect-google --id ${state.instanceId}`, extra, common);
       case 'create':
       case 'resume': {
         if (state.reserved && state.instanceId) return join(`gws-ea resume --id ${state.instanceId}`, extra, common);
@@ -657,6 +722,7 @@ class Cli {
     options: CommandOptions,
     track: string,
     source: ReleaseSource,
+    principalEmails: readonly string[],
   ): Promise<Outcome> {
     const paths = this.#paths;
     const run = reporter.run;
@@ -687,6 +753,7 @@ class Cli {
         track,
         sourceRemote: source.remote,
         provided,
+        providedPrincipalEmails: principalEmails,
         secrets,
         prerequisites,
         managedIngressSetup: this.#managedIngressSetup,
@@ -845,6 +912,73 @@ class Cli {
    * the next start, login, or reboot. A start or restart ends only once the
    * host answers on its CLI socket.
    */
+  /**
+   * Connect a created assistant's own Google account (KTD5): the same
+   * resources as create's `connect_google` step, outside the provision
+   * journal, so an assistant created before Google access gains it without
+   * being recreated, and a lost or outdated sign-in is repaired.
+   */
+  async #connectGoogleWork({ reporter, interaction }: Session, instanceId: string): Promise<Outcome> {
+    const operation = await acquireInstanceOperation(this.#paths, instanceId, { command: 'connect-google' });
+    if (!operation) throw busy();
+    try {
+      const runtime = await loadCreatedRuntime(this.#paths, instanceId);
+      const reservation = await getInstanceReservation(this.#paths, instanceId);
+      const claims = reservation.exclusive_resource_claims;
+      if (!existsSync(path.join(reservation.checkout_realpath, 'src', 'modules', 'gws-ea-google', 'index.ts'))) {
+        throw new GwsEaError(
+          'update_required',
+          `This assistant runs a release without Google access. Update it first: gws-ea update --id ${instanceId}`,
+        );
+      }
+      await runStep(reporter, PREREQUISITES_STEP, async () => {
+        const host = await recordedHost(this.#paths, reservation);
+        await this.#checkPrerequisites(
+          {
+            command: 'resume',
+            paths: this.#paths,
+            account: claims.gcp_account,
+            checkoutRoot: reservation.checkout_realpath,
+            ...host,
+          },
+          interaction,
+        );
+      });
+      const result = await runStepOutsideJournal(
+        'connect_google',
+        { label: "Connecting the assistant's Google account…", resources: googleConnectionResources() },
+        {
+          input: {
+            gcp: {
+              instanceId,
+              projectId: claims.gcp_project_id,
+              account: claims.gcp_account,
+              serviceAccountEmail: claims.gchat_service_account,
+              credentialFile: runtime.secret_files.gchat_credentials,
+              cwd: reservation.checkout_realpath,
+            },
+            google: {
+              runtime,
+              assistantWorkspaceEmail: claims.workspace_email,
+              ...(interaction.decisions.googleClientFile ? { clientFile: interaction.decisions.googleClientFile } : {}),
+              signIn: (request) => interaction.signInAssistantToGoogle(request),
+              resumeCommand: `gws-ea connect-google --id ${instanceId}`,
+            },
+          },
+        },
+        { ...reporter, signIn: () => interaction.signInToGoogleCloud(claims.gcp_account) },
+      );
+      if (result.status === 'paused') return result;
+      return {
+        status: 'ready',
+        message: `Assistant ${instanceId} is connected to Google as ${claims.workspace_email}.`,
+        details: ['Its host keeps the Calendar access agents use fresh while it runs.'],
+      };
+    } finally {
+      operation.release();
+    }
+  }
+
   async #serviceWork({ reporter }: Session, command: ServiceCommand, instanceId: string): Promise<Outcome> {
     const operation = await acquireInstanceOperation(this.#paths, instanceId, { command });
     if (!operation) throw busy();
@@ -1416,7 +1550,7 @@ async function prepareNcl(
   environment: NodeJS.ProcessEnv,
 ): Promise<CommandEnd> {
   const { own, passThrough } = splitPassThrough(args);
-  const instanceId = targetInstance(parseOptions(own, NCL_OPTIONS));
+  const instanceId = targetInstance(parseOptions(own, NCL_OPTIONS).options);
   const operation = await acquireInstanceOperation(paths, instanceId, { command: 'ncl' });
   if (!operation) throw busy();
   try {
@@ -1612,11 +1746,17 @@ function printHelp(output: LineWriter): void {
   output('  create --track <dogfood|prod> [--source-remote <remote>] [--google-account <email>]');
   output('         [--assistant-first-name <name> --assistant-last-name <name>]');
   output('         [--principal-first-name <name> --principal-last-name <name> --principal-timezone <iana>]');
+  output('         [--principal-email <email>]...  (once per address the principal uses)');
   output('         [--workspace-email <email>] [--provider <id>]');
   output('         [--ingress existing --endpoint <https-url>]');
   output('         [--ingress managed-cloudflare --cloudflare-zone <zone> --hostname-label <label>]');
   output("         Deploys this gws-ea's own release, which must be committed, clean, and on the track.");
   output('  resume --id <instance_id> [--chat-configured] [--messaging-group-id <exact-id>]');
+  output(
+    "         [--google-client-file <file>]  (the Desktop OAuth client downloaded for the assistant's Google sign-in)",
+  );
+  output('  connect-google --id <instance_id> [--google-client-file <file>]');
+  output('         Signs the assistant in to Google as its own account, or repairs that sign-in; safe to rerun.');
   output('  start --id <instance_id>');
   output('  stop --id <instance_id>');
   output('         Agent containers keep running; the assistant stays stopped until the next start, login, or reboot.');
@@ -1678,7 +1818,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
           hostStatus: runtime.hostStatus,
           toolCheckout: runtime.toolCheckout,
         },
-        parseOptions(args.slice(1), readOnly.options),
+        parseOptions(args.slice(1), readOnly.options).options,
       ),
     );
   }

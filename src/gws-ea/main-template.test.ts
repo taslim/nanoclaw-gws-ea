@@ -5,7 +5,16 @@
  * template; the readers of main's MCP servers and task series run on real
  * SQLite files.
  */
-import { cpSync, mkdirSync, rmSync, symlinkSync, writeFileSync, appendFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 
 import Database from 'better-sqlite3';
@@ -57,6 +66,17 @@ afterEach(async () => {
   rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
+/**
+ * Give the test's copy of the template a persona and a context file, as
+ * releases before Slice 2 stamped them: main's file-by-file comparison
+ * still governs every assistant those releases created.
+ */
+function stampingPersonaAndContext(): void {
+  mkdirSync(path.join(CONTEXT, 'additional_context'), { recursive: true });
+  writeFileSync(path.join(CONTEXT, 'instructions.md'), 'You are main.\n');
+  writeFileSync(path.join(CONTEXT, PROCEDURE), '# Operating procedure\n');
+}
+
 /** Main stamped by NanoClaw's own create, from the test's copy of the real template. */
 async function stamped(): Promise<{ readonly id: string; readonly folder: string }> {
   const { group } = await createAgentFromTemplate('gws-ea/main');
@@ -65,6 +85,49 @@ async function stamped(): Promise<{ readonly id: string; readonly folder: string
 
 describe("main's template against NanoClaw's own stamp", () => {
   it('reads what NanoClaw stamps and restamps from the real template as uncustomized', async () => {
+    const main = await stamped();
+
+    expect(await inspectMainFolder(main.folder, TEMPLATE)).toEqual({ kind: 'stamped', customized: [] });
+    expect(await decideMainFolder(main.folder, TEMPLATE)).toEqual({ kind: 'unchanged' });
+
+    // A release that changes the welcome.
+    appendFileSync(path.join(TEMPLATE, 'skills', 'welcome', 'SKILL.md'), '\nKeep it to one message.\n');
+    expect(await decideMainFolder(main.folder, TEMPLATE)).toEqual({ kind: 'refresh' });
+
+    await restampAgentFromTemplate('gws-ea/main', main.id, { apply: true });
+
+    expect(await inspectMainFolder(main.folder, TEMPLATE)).toEqual({ kind: 'stamped', customized: [] });
+    expect(await decideMainFolder(main.folder, TEMPLATE)).toEqual({ kind: 'unchanged' });
+  });
+
+  it("leaves the persona the principal's instructions go into out of the comparison, so updates keep coming", async () => {
+    const main = await stamped();
+    writeFileSync(path.join(main.folder, 'instructions.prepend.md'), 'Call me Tas.\n');
+
+    expect(await inspectMainFolder(main.folder, TEMPLATE)).toEqual({ kind: 'stamped', customized: [] });
+    appendFileSync(path.join(TEMPLATE, 'skills', 'welcome', 'SKILL.md'), '\nKeep it to one message.\n');
+    expect(await decideMainFolder(main.folder, TEMPLATE)).toEqual({ kind: 'refresh' });
+
+    await restampAgentFromTemplate('gws-ea/main', main.id, { apply: true });
+
+    expect(readFileSync(path.join(main.folder, 'instructions.prepend.md'), 'utf8')).toBe('Call me Tas.\n');
+  });
+
+  it('removes the persona and procedure an earlier release stamped, unless they were changed', async () => {
+    stampingPersonaAndContext();
+    const main = await stamped();
+    rmSync(path.join(TEMPLATE, 'ai.nanoco.nanoclaw'), { recursive: true });
+
+    expect(await decideMainFolder(main.folder, TEMPLATE)).toEqual({ kind: 'refresh' });
+    await restampAgentFromTemplate('gws-ea/main', main.id, { apply: true });
+
+    expect(existsSync(path.join(main.folder, 'instructions.prepend.md'))).toBe(false);
+    expect(existsSync(path.join(main.folder, PROCEDURE))).toBe(false);
+    expect(await inspectMainFolder(main.folder, TEMPLATE)).toEqual({ kind: 'stamped', customized: [] });
+  });
+
+  it('reads what NanoClaw stamps and restamps from a template with a persona and context as uncustomized', async () => {
+    stampingPersonaAndContext();
     const main = await stamped();
 
     expect(await inspectMainFolder(main.folder, TEMPLATE)).toEqual({ kind: 'stamped', customized: [] });
@@ -83,6 +146,7 @@ describe("main's template against NanoClaw's own stamp", () => {
   });
 
   it("counts every edit, deletion, and addition, where NanoClaw's own plan misses the deletion and the addition", async () => {
+    stampingPersonaAndContext();
     const main = await stamped();
     writeFileSync(path.join(main.folder, 'instructions.prepend.md'), 'My own instructions.\n');
     rmSync(path.join(main.folder, PROCEDURE));
@@ -103,6 +167,7 @@ describe("main's template against NanoClaw's own stamp", () => {
   });
 
   it('never follows a link the agent planted in its folder, and counts it as customized', async () => {
+    stampingPersonaAndContext();
     const main = await stamped();
     const outside = path.join(TEST_ROOT, 'outside');
     mkdirSync(outside);
@@ -122,6 +187,7 @@ describe("main's template against NanoClaw's own stamp", () => {
   });
 
   it('names a file the agent added with its control characters escaped, and inspection keeps the name exactly', async () => {
+    stampingPersonaAndContext();
     const main = await stamped();
     // An escape that erases the line it is on, a carriage return, and a line break, all legal in a file name.
     const planted = 'notes\u001b[2K\rnothing customized\n.md';

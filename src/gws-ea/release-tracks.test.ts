@@ -38,8 +38,23 @@ describe('release sources', () => {
     );
   });
 
+  it('refuses a track name an assistant cannot record, before anything is fetched, saying why', () => {
+    for (const track of ['feat/calendar', 'Canary', '-canary', 'a'.repeat(65)]) {
+      expect(() => resolveReleaseSource(track, MIRROR)).toThrow(
+        expect.objectContaining({
+          code: 'invalid_release_track',
+          message: expect.stringContaining('lowercase letters, digits') as unknown,
+        }),
+      );
+    }
+    expect(resolveReleaseSource('gws-ea-calendar_connected.2', MIRROR)).toEqual({
+      remote: MIRROR,
+      ref: 'refs/heads/gws-ea-calendar_connected.2',
+    });
+  });
+
   it('treats only its own tracks as product tracks', () => {
-    expect(() => resolveReleaseSource('toString')).toThrow(
+    expect(() => resolveReleaseSource('constructor')).toThrow(
       expect.objectContaining({ code: 'release_source_required' }),
     );
   });

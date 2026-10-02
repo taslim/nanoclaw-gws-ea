@@ -31,6 +31,7 @@ import { offerDiagnosis } from './gws-ea-assist.js';
 import { authenticateGwsEaProvider, CLOUDFLARE_API_TOKEN_GUIDANCE, collectGwsEaCreateInput } from './gws-ea-input.js';
 import { attendPause } from './gws-ea-pause.js';
 import { confirmGoogleAccount, ensurePrerequisites, signInToGoogleCloud } from './gws-ea-prerequisites.js';
+import { confirmThenOpen, formatNoteLink } from './lib/browser.js';
 import { dumpTranscriptOnFailure } from './lib/runner.js';
 import { fitToWidth, fmtDuration } from './lib/theme.js';
 import { listSetupProviders, type SetupProviderEntry } from './providers/registry.js';
@@ -158,6 +159,19 @@ function terminalPrompts(providers: readonly SetupProviderEntry[]): InteractiveP
     },
     googleCloudSignIn: (account) => signInToGoogleCloud(account),
     googleAccount: (account) => confirmGoogleAccount(account),
+    async googleWorkspaceSignIn(url, account) {
+      p.note(
+        [
+          `Next, sign in to Google as ${account}, the assistant's own account, and allow every permission.`,
+          'Use a browser window where you can sign in as the assistant, such as a private window or a browser profile for it.',
+          formatNoteLink(url),
+        ]
+          .filter((line) => line !== null)
+          .join('\n'),
+        "The assistant's Google sign-in",
+      );
+      await confirmThenOpen(url, `Ready to sign in as ${account}? Press Enter to open your browser`);
+    },
     attendPause: (pause, signal) => attendPause(pause, signal),
   };
 }

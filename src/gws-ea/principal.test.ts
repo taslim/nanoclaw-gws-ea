@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { InboundEvent } from '../channels/adapter.js';
 import { CONTROL_PLANE_ROOT } from './paths.js';
 import {
+  GWS_EA_WELCOME_INSTRUCTION,
   principalWelcomeEventId,
   reconcilePrincipalDm,
   type PrincipalCandidate,
@@ -277,9 +278,17 @@ describe('verified principal first-DM reconciliation', () => {
           'gchat-assistant',
           '--event-id',
           (first as { eventId: string }).eventId,
+          '--welcome',
+          GWS_EA_WELCOME_INSTRUCTION,
         ],
       }),
     );
+  });
+
+  it("runs main's own welcome for the principal, never NanoClaw's channel addendum", () => {
+    expect(GWS_EA_WELCOME_INSTRUCTION).toContain('run /welcome ');
+    expect(GWS_EA_WELCOME_INSTRUCTION).toContain('the principal');
+    expect(GWS_EA_WELCOME_INSTRUCTION).not.toMatch(/addend|\/app\/skills/u);
   });
 
   it('fails without bootstrapping when the host does not confirm the principal wiring', async () => {

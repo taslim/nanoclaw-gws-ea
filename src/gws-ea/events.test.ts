@@ -65,6 +65,9 @@ function prompts(overrides: Partial<InteractivePrompts> = {}): InteractivePrompt
     googleAccount: vi.fn(async () => {
       throw new Error('unexpected Google account prompt');
     }),
+    googleWorkspaceSignIn: vi.fn(async () => {
+      throw new Error('unexpected Google sign-in prompt');
+    }),
     attendPause: vi.fn(async () => ({ kind: 'stop' as const })),
     ...overrides,
   };
@@ -297,6 +300,20 @@ describe('Interaction port', () => {
       message: expect.stringContaining('--google-account operator@example.test'),
       details: { flag: '--google-account' },
     });
+
+    const assistant = await interaction
+      .signInAssistantToGoogle({
+        client: { client_id: '123-abc.apps.googleusercontent.com', client_secret: 'GOCSPX-desktop-secret' },
+        account: 'robin@example.test',
+        resumeCommand: 'gws-ea resume --id 11111111-1111-4111-8111-111111111111',
+      })
+      .catch((error: unknown) => error);
+    expect(assistant).toBeInstanceOf(PauseRequired);
+    expect(assistant).toMatchObject({ code: 'google_sign_in_required' });
+    expect((assistant as PauseRequired).message).toContain('robin@example.test');
+    expect((assistant as PauseRequired).instructions.join('\n')).toContain(
+      'gws-ea resume --id 11111111-1111-4111-8111-111111111111',
+    );
   });
 
   it('asks a person to confirm the Google account, with progress suspended', async () => {

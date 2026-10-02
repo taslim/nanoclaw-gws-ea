@@ -1,10 +1,12 @@
 /**
  * Attending a gws-ea pause at the terminal, so a run can go on in the same
- * process: the Google Chat configuration is confirmed in place, a principal
- * conversation is chosen from a list, and what the person was asked to do is
- * waited for. Anything else stops, and the CLI reports how to resume.
+ * process: the Google Chat configuration is confirmed in place, the
+ * assistant's downloaded Google client is located, a principal conversation
+ * is chosen from a list, and what the person was asked to do is waited for. Anything else stops, and the CLI reports how to resume.
  */
 import * as p from '@clack/prompts';
+import os from 'node:os';
+import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import type { PauseResponse } from '../src/gws-ea/events.js';
@@ -29,6 +31,11 @@ interface PausePrompts {
     readonly options: { value: string; label: string }[];
     readonly signal: AbortSignal;
   }): Promise<unknown>;
+  text(options: {
+    readonly message: string;
+    readonly placeholder: string;
+    readonly signal: AbortSignal;
+  }): Promise<unknown>;
   isCancel(value: unknown): boolean;
 }
 
@@ -43,8 +50,14 @@ const defaultPrompts: PausePrompts = {
   info: (message) => p.log.info(message),
   confirm: (options) => p.confirm(options),
   select: (options) => p.select(options),
+  text: (options) => p.text(options),
   isCancel: (value) => p.isCancel(value),
 };
+
+/** A path as the operator types it: `~` is their home, and a relative path is from here. */
+function typedPath(value: string): string {
+  return path.resolve(value === '~' || value.startsWith('~/') ? path.join(os.homedir(), value.slice(1)) : value);
+}
 
 async function sleepUnlessAborted(milliseconds: number, signal?: AbortSignal): Promise<void> {
   await delay(milliseconds, undefined, { signal }).catch((error: unknown) => {
@@ -84,6 +97,17 @@ export async function attendPause(
       signal,
     });
     return answer === true ? { kind: 'continue', decisions: { chatConfigured: true } } : STOP;
+  }
+
+  if (pause.code === 'google_client_required') {
+    prompts.note(shown, "The assistant's Google sign-in client");
+    const answer = await prompts.text({
+      message: 'Where is the downloaded client JSON?',
+      placeholder: '~/Downloads/client_secret.json',
+      signal,
+    });
+    if (prompts.isCancel(answer) || typeof answer !== 'string' || !answer.trim()) return STOP;
+    return { kind: 'continue', decisions: { googleClientFile: typedPath(answer.trim()) } };
   }
 
   const { settled } = pause;

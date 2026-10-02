@@ -57,7 +57,8 @@ describe('GWS-EA interactive create input', () => {
       .mockResolvedValueOnce('Lovelace')
       .mockResolvedValueOnce('Taslim')
       .mockResolvedValueOnce('')
-      .mockResolvedValueOnce('America/Los_Angeles');
+      .mockResolvedValueOnce('America/Los_Angeles')
+      .mockResolvedValueOnce(' Taslim@Example.test, t@other.test ,taslim@example.test');
     const select = vi.fn();
     const discoverZones = vi.fn();
 
@@ -66,6 +67,7 @@ describe('GWS-EA interactive create input', () => {
         instanceId: '11111111-1111-4111-8111-111111111111',
         prerequisites,
         sourceRemote: 'https://example.test/nanoclaw.git',
+        providedPrincipalEmails: [],
         secrets: NO_SECRETS,
         track: 'dogfood',
         provided: {
@@ -92,11 +94,12 @@ describe('GWS-EA interactive create input', () => {
 
     expect(select).not.toHaveBeenCalled();
     expect(discoverZones).not.toHaveBeenCalled();
-    expect(text).toHaveBeenCalledTimes(5);
+    expect(text).toHaveBeenCalledTimes(6);
     expect(text).toHaveBeenNthCalledWith(
       5,
       expect.objectContaining({ message: 'Principal timezone', initialValue: 'America/Los_Angeles' }),
     );
+    expect(text).toHaveBeenNthCalledWith(6, expect.objectContaining({ message: 'Principal email addresses' }));
     expect(result).toEqual({
       ingress: { mode: 'existing', endpointUrl: 'https://assistant.example.test/webhook/gchat' },
       assistantWorkspaceEmail: 'ada@example.test',
@@ -124,11 +127,11 @@ describe('GWS-EA interactive create input', () => {
           assistant_display_name: 'Ada Lovelace',
           principal_display_name: 'Taslim',
           principal_timezone: 'America/Los_Angeles',
+          principal_emails: ['taslim@example.test', 't@other.test'],
         },
         selected_messaging_group_id: null,
       },
     });
-    expect(JSON.stringify(result)).not.toMatch(/principal.*email/iu);
   });
 
   it('offers only composed providers and uses the selected provider metadata', async () => {
@@ -148,6 +151,7 @@ describe('GWS-EA interactive create input', () => {
         instanceId: '11111111-1111-4111-8111-111111111111',
         prerequisites,
         sourceRemote: 'https://example.test/nanoclaw.git',
+        providedPrincipalEmails: ['taslim@example.test'],
         secrets: NO_SECRETS,
         track: 'prod',
         provided: {
@@ -205,6 +209,7 @@ describe('GWS-EA interactive create input', () => {
         instanceId: '11111111-1111-4111-8111-111111111111',
         prerequisites,
         sourceRemote: 'https://example.test/nanoclaw.git',
+        providedPrincipalEmails: ['taslim@example.test'],
         secrets: NO_SECRETS,
         track: 'prod',
         provided: {},
@@ -256,6 +261,7 @@ describe('GWS-EA interactive create input', () => {
         instanceId: '11111111-1111-4111-8111-111111111111',
         prerequisites,
         sourceRemote: 'https://example.test/nanoclaw.git',
+        providedPrincipalEmails: ['taslim@example.test'],
         secrets: NO_SECRETS,
         track: 'prod',
         provided: {
@@ -331,6 +337,7 @@ describe('GWS-EA interactive create input', () => {
         instanceId: '11111111-1111-4111-8111-111111111111',
         prerequisites,
         sourceRemote: 'https://example.test/nanoclaw.git',
+        providedPrincipalEmails: ['taslim@example.test'],
         secrets: NO_SECRETS,
         track: 'prod',
         provided: {
@@ -391,6 +398,7 @@ describe('GWS-EA interactive create input', () => {
           instanceId: '11111111-1111-4111-8111-111111111111',
           prerequisites,
           sourceRemote: 'https://example.test/nanoclaw.git',
+          providedPrincipalEmails: ['taslim@example.test'],
           secrets: NO_SECRETS,
           track: 'prod',
           provided: {
@@ -474,12 +482,18 @@ describe('GWS-EA unattended create input', () => {
     endpoint: 'https://aya.example.test/webhook/gchat',
   } as const;
 
-  function unattended(provided: Record<string, string>, secrets: SecretSource = NO_SECRETS, extra = {}) {
+  function unattended(
+    provided: Record<string, string>,
+    secrets: SecretSource = NO_SECRETS,
+    extra = {},
+    providedPrincipalEmails: readonly string[] = ['taslim@example.test'],
+  ) {
     return collectGwsEaCreateInput(
       {
         instanceId: '11111111-1111-4111-8111-111111111111',
         prerequisites,
         sourceRemote: 'https://example.test/nanoclaw.git',
+        providedPrincipalEmails,
         secrets,
         track: 'dogfood',
         provided,
@@ -503,8 +517,23 @@ describe('GWS-EA unattended create input', () => {
       assistant_display_name: 'Aya',
       principal_display_name: 'Taslim Khan',
       principal_timezone: 'America/Los_Angeles',
+      principal_emails: ['taslim@example.test'],
     });
     expect(unattendedPrompts.text).not.toHaveBeenCalled();
+  });
+
+  it('names --principal-email when no principal address is given', async () => {
+    await expect(unattended(FLAGS, NO_SECRETS, {}, [])).rejects.toMatchObject({
+      code: 'input_required',
+      message: expect.stringContaining('--principal-email'),
+    });
+  });
+
+  it("refuses the assistant's own address as the principal's", async () => {
+    await expect(unattended(FLAGS, NO_SECRETS, {}, ['aya@example.test'])).rejects.toMatchObject({
+      code: 'invalid_arguments',
+      message: expect.stringContaining('--principal-email'),
+    });
   });
 
   it.each(['assistant-first-name', 'principal-first-name', 'principal-timezone', 'workspace-email'] as const)(
@@ -660,6 +689,7 @@ describe('GWS-EA unattended create input', () => {
       instanceId: '11111111-1111-4111-8111-111111111111',
       prerequisites,
       sourceRemote: 'https://example.test/nanoclaw.git',
+      providedPrincipalEmails: ['taslim@example.test'],
       secrets: NO_SECRETS,
       track: 'dogfood',
     };
@@ -686,6 +716,8 @@ describe('GWS-EA unattended create input', () => {
           '--source-remote',
           '/srv/git/nanoclaw.git',
           ...Object.entries(FLAGS).flatMap(([flag, value]) => [`--${flag}`, value]),
+          '--principal-email',
+          'taslim@example.test',
         ],
         {
           paths,

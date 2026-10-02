@@ -113,6 +113,7 @@ async function releaseFixture(): Promise<string> {
       2,
     ) + '\n',
   );
+  await write(root, 'templates/gws-ea/main/skills/welcome/SKILL.md', '# Welcome\n');
   await write(root, 'bin/ncl', '#!/usr/bin/env bash\nexit 0\n');
   await write(root, 'bin/gws-ea', '#!/usr/bin/env bash\nexit 0\n');
   await chmod(path.join(root, 'bin/ncl'), 0o755);
@@ -133,12 +134,23 @@ async function releaseFixture(): Promise<string> {
   await write(root, 'src/gateway-providers/onecli-files.ts', 'export {};\n');
   await write(root, 'container/skills/onecli-gateway/SKILL.md', '# OneCLI gateway\n');
   await write(root, 'container/skills/onecli-gateway/instructions.md', '# OneCLI instructions\n');
+  await write(root, 'container/skills/gcalendar/SKILL.md', '# gcalendar\n');
+  await write(root, 'container/skills/gcalendar/instructions.md', '# gcalendar rules\n');
   await write(root, 'src/gws-ea/process.ts', 'export {};\n');
   await write(root, 'src/gws-ea/cloudflare-connector.ts', 'export {};\n');
   await write(root, 'scripts/init-first-agent.ts', 'export {};\n');
   await write(root, 'src/modules/gws-ea-profile/index.ts', 'export {};\n');
   await write(root, 'src/modules/gws-ea-profile/migration.ts', 'export {};\n');
-  await write(root, 'src/modules/index.ts', "import './gws-ea-profile/index.js';\n");
+  await write(root, 'src/modules/gws-ea-google/index.ts', 'export {};\n');
+  await write(root, 'src/modules/gws-ea-main/index.ts', 'export {};\n');
+  await write(root, 'src/modules/gws-ea-main/guidance.md', '# Guidance\n');
+  await write(root, 'src/modules/gws-ea-preferences/index.ts', 'export {};\n');
+  await write(root, 'src/modules/gws-ea-preferences/migration.ts', 'export {};\n');
+  await write(
+    root,
+    'src/modules/index.ts',
+    "import './gws-ea-google/index.js';\nimport './gws-ea-main/index.js';\nimport './gws-ea-profile/index.js';\nimport './gws-ea-preferences/index.js';\n",
+  );
   await write(root, 'src/provider-contracts/claude.ts', "export const provider = 'claude';\n");
   await write(root, 'src/provider-contracts/index.ts', "import './claude.js';\n");
   await write(root, 'setup/providers/claude.ts', "export const provider = 'claude';\n");
@@ -250,10 +262,15 @@ describe('release preflight', () => {
 
   it.each([
     ['template', 'templates/gws-ea/main/plugin.json', 'incomplete_release'],
+    ['GWS-EA welcome', 'templates/gws-ea/main/skills/welcome/SKILL.md', 'incomplete_release'],
+    ['GWS-EA guidance', 'src/modules/gws-ea-main/guidance.md', 'incomplete_release'],
+    ['GWS-EA Google access', 'src/modules/gws-ea-google/index.ts', 'incomplete_release'],
+    ['Google Calendar rules', 'container/skills/gcalendar/instructions.md', 'incomplete_release'],
     ['Google Chat adapter', 'src/channels/gchat.ts', 'incomplete_release'],
     ['GWS-EA interactive launcher', 'setup/gws-ea-input.ts', 'incomplete_release'],
     ['GWS-EA service launcher', 'src/gws-ea/process.ts', 'incomplete_release'],
     ['GWS-EA profile migration', 'src/modules/gws-ea-profile/migration.ts', 'incomplete_release'],
+    ['GWS-EA preferences migration', 'src/modules/gws-ea-preferences/migration.ts', 'incomplete_release'],
     ['OneCLI gateway adapter', 'src/gateway-providers/onecli.ts', 'gateway_not_composed'],
     ['OneCLI agent instructions', 'container/skills/onecli-gateway/SKILL.md', 'gateway_not_composed'],
     ['provider host contract', 'src/provider-contracts/claude.ts', 'provider_not_composed'],

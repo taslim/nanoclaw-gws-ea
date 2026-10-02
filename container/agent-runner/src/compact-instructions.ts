@@ -26,7 +26,7 @@ export function buildDeliverySentences(names: string[], taskId: string | null): 
         `Available destinations: ${formatDestinationNames(names)}.`,
       ]
     : [
-        'You MUST wrap all responses in <message to="name">...</message> blocks.',
+        'You MUST wrap every reply in a <message to="name">...</message> block or send it with send_message; text outside them is not delivered.',
         `Available destinations: ${formatDestinationNames(names)}.`,
       ];
 }
@@ -48,8 +48,7 @@ export function buildPostCompactionReminder(names: string[], taskId: string | nu
 export function buildCompactInstructions(names: string[], taskId: string | null): string {
   const sentences = buildDeliverySentences(names, taskId);
   const deliveryReminder = sentences.map(
-    (sentence, index) =>
-      `   ${index === 0 ? '"' : ''}${sentence}${index === sentences.length - 1 ? '"' : ''}`,
+    (sentence, index) => `   ${index === 0 ? '"' : ''}${sentence}${index === sentences.length - 1 ? '"' : ''}`,
   );
 
   return [

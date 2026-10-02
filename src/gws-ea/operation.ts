@@ -154,7 +154,9 @@ export type OperationStart = Pick<OperationRecord, 'kind' | 'from' | 'to'> &
  * its own, so an open record never stops them.
  */
 export type OperationIntent =
-  | { readonly command: 'create' | 'resume' | 'start' | 'stop' | 'restart' | 'ncl' | 'rollback' }
+  | {
+      readonly command: 'create' | 'resume' | 'start' | 'stop' | 'restart' | 'ncl' | 'rollback' | 'connect-google';
+    }
   | { readonly command: 'update'; readonly target: ReleaseCoordinates };
 
 /** The commands that continue or revert an unfinished operation. */
@@ -439,6 +441,7 @@ function refusal(record: OperationRecord, intent: OperationIntent): GwsEaError |
     case 'stop':
     case 'restart':
     case 'ncl':
+    case 'connect-google':
       return inProgress(record);
   }
 }

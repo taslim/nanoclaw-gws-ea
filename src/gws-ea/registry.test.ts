@@ -144,6 +144,7 @@ function createSetupInput() {
         assistant_display_name: 'Aya',
         principal_display_name: 'Principal',
         principal_timezone: 'America/Los_Angeles',
+        principal_emails: ['principal@example.test'],
       },
       selected_messaging_group_id: null,
     },

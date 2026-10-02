@@ -471,7 +471,9 @@ describe('poll loop — provider error recovery', () => {
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0].content).text).toBe('The agent run failed. Check the logs for details.');
+    expect(JSON.parse(out[0].content).text).toBe(
+      "Something went wrong on my side and I couldn't finish that. Please send it again.",
+    );
     expect(out[0].content).not.toContain('API rate limit exceeded');
 
     // Input message should be marked completed despite the error
@@ -500,7 +502,9 @@ describe('poll loop — stale session recovery', () => {
     // A safe notice reaches the user; the provider diagnostic stays private.
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0].content).text).toBe('The agent run failed. Check the logs for details.');
+    expect(JSON.parse(out[0].content).text).toBe(
+      "Something went wrong on my side and I couldn't finish that. Please send it again.",
+    );
     expect(out[0].content).not.toContain('session not found');
 
     // Continuation was cleared (isSessionInvalid returned true)

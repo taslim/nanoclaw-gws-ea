@@ -119,6 +119,39 @@ COPY cli-tools.json install-cli-tools.sh /tmp/
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     sh /tmp/install-cli-tools.sh /tmp/cli-tools.json
 
+# ---- Google Workspace CLI (gogcli) -------------------------------------------
+# GWS-EA's Google tool. A single Go binary, pinned by version and by the
+# SHA-256 of each architecture's release archive (from the release's
+# checksums.txt), so a rebuild can never pick up a different build. Bump the
+# version and both checksums together.
+#
+# gog never holds a credential: GOG_ACCESS_TOKEN is a placeholder the OneCLI
+# gateway replaces with the assistant's current Google token, which the host
+# keeps fresh, and with no stored account gog has nothing to refresh itself.
+# GOG_ENABLE_COMMANDS lists the Google services this release exposes; it must
+# match EXPOSED_GOOGLE_SERVICES in src/modules/gws-ea-google/grant.ts. JSON
+# output with untrusted-content markers keeps other people's event text
+# visibly apart from instructions.
+ARG GOGCLI_VERSION=0.42.0
+ARG GOGCLI_SHA256_AMD64=1967a962a57d689958c408dd0abc784792c3712da9d0a90650bb76ab7e3de388
+ARG GOGCLI_SHA256_ARM64=84ce3002acea162596068c8b25e364aade634d204ae6122b714e686ca783b028
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+        amd64) sha="$GOGCLI_SHA256_AMD64" ;; \
+        arm64) sha="$GOGCLI_SHA256_ARM64" ;; \
+        *) echo "gogcli: no pinned build for architecture '$TARGETARCH'" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL -o /tmp/gogcli.tar.gz \
+        "https://github.com/openclaw/gogcli/releases/download/v${GOGCLI_VERSION}/gogcli_${GOGCLI_VERSION}_linux_${TARGETARCH}.tar.gz" && \
+    echo "${sha}  /tmp/gogcli.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/gogcli.tar.gz -C /tmp ./gog && \
+    install -m 0755 /tmp/gog /usr/local/bin/gog && \
+    rm -f /tmp/gogcli.tar.gz /tmp/gog
+ENV GOG_ACCESS_TOKEN=gateway-managed \
+    GOG_ENABLE_COMMANDS=calendar \
+    GOG_JSON=1 \
+    GOG_WRAP_UNTRUSTED=1
+
 # ---- ncl CLI wrapper ----------------------------------------------------------
 # Actual script lives in the mounted source at /app/src/cli/ncl.ts.
 RUN printf '#!/bin/sh\nexec bun /app/src/cli/ncl.ts "$@"\n' > /usr/local/bin/ncl && \

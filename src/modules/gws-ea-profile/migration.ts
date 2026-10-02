@@ -24,3 +24,17 @@ export const gwsEaProfileMigration: ModuleMigration = {
     `);
   },
 };
+
+/** The principal's email addresses: one row each, stored lowercased, so each address is held once. */
+export const gwsEaPrincipalAddressesMigration: ModuleMigration = {
+  version: 2,
+  name: 'module:gws-ea-profile:principal-addresses',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_principal_addresses (
+        email     TEXT PRIMARY KEY,
+        added_at  TEXT NOT NULL
+      );
+    `);
+  },
+};

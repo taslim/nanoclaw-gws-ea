@@ -34,12 +34,13 @@ import fs from 'fs';
 import { getSessionClaim } from './db/coordination.js';
 import { getSession, isTaskThread, updateSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
+import { sendFailureNotice } from './delivery.js';
 import { log } from './log.js';
 import { heartbeatPath, withExistingMailboxSession } from './session-manager.js';
 import { getContainerStartedAtMs, isContainerRunning, killContainer } from './container-runner.js';
 import { requestWake } from './request-wake.js';
 import type { Session } from './types.js';
-import type { ContainerState, InboundMailbox, OutboundMailbox } from './mailbox/index.js';
+import type { ContainerState, InboundMailbox, MessageRetry, OutboundMailbox } from './mailbox/index.js';
 
 // Absolute idle ceiling for a running container. If the heartbeat file hasn't
 // been touched in this long, the container is either stuck or doing genuinely
@@ -129,21 +130,31 @@ async function reconcileActiveSession(session: Session): Promise<void> {
   const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) return;
 
+  // Told after the mailbox work has committed, and outside it: the notice is
+  // a channel send that must not hold the session.
+  const failedMessages = await reconcileSessionMailbox(session, agentGroup.id);
+  // Only a message the principal sent is answered: host notes and other
+  // agents' messages ride the agent channel and have no one to tell.
+  const fromChat = failedMessages.find((message) => message.channelType !== null && message.channelType !== 'agent');
+  if (fromChat) await sendFailureNotice(session, fromChat, { onlyToThatChat: true });
+}
+
+/** One mailbox pass. Returns the inbound messages it gave up on. */
+async function reconcileSessionMailbox(session: Session, agentGroupId: string): Promise<MessageRetry[]> {
+  const failedMessages: MessageRetry[] = [];
   try {
     let dueCount = 0;
     let shouldWake = false;
-    const exists = await withExistingMailboxSession(agentGroup.id, session.id, async (mailbox) => {
+    const failedBeforeWake = await withExistingMailboxSession(agentGroupId, session.id, async (mailbox) => {
       mailbox.applyProcessingAcks(mailbox.getTerminalProcessingAcks());
       dueCount = mailbox.countDueMessages();
       shouldWake = dueCount > 0 && !isContainerRunning(session.id);
-      if (!shouldWake) {
-        await maintainSessionMailbox(mailbox, session, agentGroup.id);
-      }
-      return true;
+      return shouldWake ? [] : maintainSessionMailbox(mailbox, session, agentGroupId);
     });
-    if (!exists) return;
+    if (failedBeforeWake === undefined) return [];
+    failedMessages.push(...failedBeforeWake);
 
-    if (!shouldWake) return;
+    if (!shouldWake) return failedMessages;
 
     // Waking refreshes routing through the mailbox. Keep it outside the
     // session transaction so serialized implementations do not re-enter
@@ -151,30 +162,30 @@ async function reconcileActiveSession(session: Session): Promise<void> {
     log.info('Waking container for due messages', { sessionId: session.id, count: dueCount });
     await requestWake(session, 'due-message');
 
-    await withExistingMailboxSession(agentGroup.id, session.id, async (mailbox) => {
-      await maintainSessionMailbox(mailbox, session, agentGroup.id);
-    });
+    failedMessages.push(
+      ...((await withExistingMailboxSession(agentGroupId, session.id, (mailbox) =>
+        maintainSessionMailbox(mailbox, session, agentGroupId),
+      )) ?? []),
+    );
   } catch (err) {
     log.error('Session mailbox sweep failed', {
-      agentGroupId: agentGroup.id,
+      agentGroupId,
       sessionId: session.id,
       err,
     });
   }
+  return failedMessages;
 }
 
+/** Returns the inbound messages given up on after their last retry. */
 async function maintainSessionMailbox(
   mailbox: InboundMailbox & OutboundMailbox,
   session: Session,
   agentGroupId: string,
-): Promise<void> {
-  const alive = isContainerRunning(session.id);
-  if (alive) {
-    await enforceRunningContainerSla(mailbox, mailbox, session, agentGroupId);
-  }
-  if (!alive) {
-    resetStuckProcessingRows(mailbox, mailbox, session, 'container not running');
-  }
+): Promise<MessageRetry[]> {
+  const failedMessages = isContainerRunning(session.id)
+    ? await enforceRunningContainerSla(mailbox, mailbox, session, agentGroupId)
+    : resetStuckProcessingRows(mailbox, mailbox, session, 'container not running');
 
   // MODULE-HOOK:scheduling-recurrence:start
   const { handleRecurrence } = await import('./modules/scheduling/recurrence.js');
@@ -198,6 +209,8 @@ async function maintainSessionMailbox(
     log.error('Echo backlog prune failed', { sessionId: session.id, err });
   }
   // MODULE-HOOK:cross-session-echo-prune:end
+
+  return failedMessages;
 }
 
 function heartbeatMtimeMs(agentGroupId: string, sessionId: string): number {
@@ -232,7 +245,7 @@ async function enforceRunningContainerSla(
   outDb: OutboundMailbox,
   session: Session,
   agentGroupId: string,
-): Promise<void> {
+): Promise<MessageRetry[]> {
   let incarnationStartMs = 0;
   const claimRow = await getSessionClaim(session.id);
   if (claimRow?.claimed_at) {
@@ -256,7 +269,7 @@ async function enforceRunningContainerSla(
     claims: gatedClaims,
   });
 
-  if (decision.action === 'ok') return;
+  if (decision.action === 'ok') return [];
 
   if (decision.action === 'kill-ceiling') {
     log.warn('Killing container past absolute ceiling', {
@@ -265,8 +278,7 @@ async function enforceRunningContainerSla(
       ceilingMs: decision.ceilingMs,
     });
     killContainer(session.id, 'absolute-ceiling');
-    resetStuckProcessingRows(inDb, outDb, session, 'absolute-ceiling');
-    return;
+    return resetStuckProcessingRows(inDb, outDb, session, 'absolute-ceiling');
   }
 
   log.warn('Killing container — message claimed then silent', {
@@ -276,7 +288,7 @@ async function enforceRunningContainerSla(
     toleranceMs: decision.toleranceMs,
   });
   killContainer(session.id, 'claim-stuck');
-  resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
+  return resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
 }
 
 export function _resetStuckProcessingRowsForTesting(
@@ -284,18 +296,20 @@ export function _resetStuckProcessingRowsForTesting(
   outDb: OutboundMailbox,
   session: Session,
   reason: string,
-): void {
-  resetStuckProcessingRows(inDb, outDb, session, reason);
+): MessageRetry[] {
+  return resetStuckProcessingRows(inDb, outDb, session, reason);
 }
 
+/** Returns the messages it marked failed after their last retry. */
 function resetStuckProcessingRows(
   inDb: InboundMailbox,
   outDb: OutboundMailbox,
   session: Session,
   reason: string,
-): void {
+): MessageRetry[] {
   const claims = outDb.getProcessingClaims();
   const now = Date.now();
+  const failedMessages: MessageRetry[] = [];
   for (const { messageId } of claims) {
     const msg = inDb.getMessageForRetry(messageId, 'pending');
     if (!msg) continue;
@@ -307,6 +321,7 @@ function resetStuckProcessingRows(
 
     if (msg.tries >= MAX_TRIES) {
       inDb.markMessageFailed(msg.id);
+      failedMessages.push(msg);
       log.warn('Message marked as failed after max retries', {
         messageId: msg.id,
         sessionId: session.id,
@@ -337,4 +352,5 @@ function resetStuckProcessingRows(
   } catch (err) {
     log.warn('Failed to clear orphan processing claims', { sessionId: session.id, err });
   }
+  return failedMessages;
 }

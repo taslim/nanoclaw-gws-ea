@@ -13,6 +13,7 @@ export const PROVISION_STEPS = [
   'start_nanoclaw',
   'establish_transport',
   'configure_channel',
+  'connect_google',
   'bind_principal',
   'verify_conversation',
 ] as const;

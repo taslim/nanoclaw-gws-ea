@@ -7,7 +7,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { deriveAttachmentName } from './attachment-naming.js';
-import { isSafeAttachmentName } from './attachment-safety.js';
+import { inboxFolderName, isSafeAttachmentName } from './attachment-safety.js';
 import type { OutboundFile } from './channels/adapter.js';
 import { DATA_DIR } from './config.js';
 import { ensureContainedInboxDir, isPathInside } from './inbox-safety.js';
@@ -331,7 +331,8 @@ export async function writeSessionMessage(
  * with a matching id to redirect the host's write.
  *
  * Defenses, mirrored from the outbound side:
- *   1. basename check on `messageId` and `filename`.
+ *   1. basename check on `filename`; a `messageId` that is not a safe file
+ *      name (every Google Chat ID holds `/`) names its folder by a hash.
  *   2. lstat of the inbox dir to refuse pre-placed symlinks.
  *   3. realpath-based containment under the session inbox root.
  *   4. `wx` flag on writeFileSync to refuse following a pre-existing symlink
@@ -353,11 +354,7 @@ function extractAttachmentFiles(
   const attachments = parsed.attachments as Array<Record<string, unknown>> | undefined;
   if (!Array.isArray(attachments)) return contentStr;
 
-  if (!isSafeAttachmentName(messageId)) {
-    log.warn('Rejecting unsafe inbound message id', { messageId });
-    return contentStr;
-  }
-
+  const inboxFolder = inboxFolderName(messageId);
   const inboxRoot = path.join(sessionDir(agentGroupId, sessionId), 'inbox');
   // Resolved lazily on the first attachment that actually carries bytes, so a
   // message whose attachments have no inline `data` never creates an inbox dir.
@@ -381,7 +378,7 @@ function extractAttachmentFiles(
     }
 
     if (!inboxResolved) {
-      inboxDir = ensureContainedInboxDir(inboxRoot, messageId, { messageId });
+      inboxDir = ensureContainedInboxDir(inboxRoot, inboxFolder, { messageId });
       inboxResolved = true;
     }
     // Unsafe inbox (symlink / escape) — no attachment can be written safely.
@@ -406,7 +403,7 @@ function extractAttachmentFiles(
     }
 
     att.name = filename;
-    att.localPath = `inbox/${messageId}/${filename}`;
+    att.localPath = `inbox/${inboxFolder}/${filename}`;
     delete att.data;
     changed = true;
     log.debug('Saved attachment to inbox', { messageId, filename, size: att.size });

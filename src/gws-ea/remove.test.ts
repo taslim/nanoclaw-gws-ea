@@ -2371,6 +2371,7 @@ describe('removal command', () => {
             cloudflareAccountToken: requestToken,
             googleCloudSignIn: vi.fn(),
             googleAccount: vi.fn(),
+            googleWorkspaceSignIn: vi.fn(),
             attendPause: async () => ({ kind: 'stop' }),
           },
         }),

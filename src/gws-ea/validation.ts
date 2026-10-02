@@ -24,6 +24,18 @@ export function hasControlCharacters(value: string): boolean {
   });
 }
 
+/**
+ * A principal address as every layer stores it: trimmed and lowercased.
+ * Undefined when `value` cannot be one. Agents see each address quoted in a
+ * code span, so an address may not hold a backtick.
+ */
+export function normalizePrincipalEmail(value: string): string | undefined {
+  const email = value.trim().toLowerCase();
+  const valid =
+    email.length <= 254 && EMAIL_PATTERN.test(email) && !email.includes('`') && !hasControlCharacters(email);
+  return valid ? email : undefined;
+}
+
 /** Parse JSON text; malformed text raises `code`. */
 export function parseJson(source: string, label: string, code: string): unknown {
   try {
