@@ -8,7 +8,7 @@
  * check and the OneCLI servers behind `fetch`.
  */
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm } from 'node:fs/promises';
 import net, { type AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -18,6 +18,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { ChannelRegistration, InboundEvent } from '../channels/adapter.js';
 import type { GatewayApprovalRequest, GatewaySessionInput } from '../gateway-providers/gateway-provider-registry.js';
+import { EXPOSED_GOOGLE_SERVICES } from '../modules/gws-ea-google/grant.js';
 import { deriveWorkspaceAddOnIdentity } from './gcp-identity.js';
 import { CONTROL_PLANE_ROOT } from './paths.js';
 
@@ -27,6 +28,10 @@ const external = vi.hoisted(() => ({ requestWake: vi.fn(async () => true) }));
 vi.mock('@chat-adapter/gchat', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@chat-adapter/gchat')>();
   return { ...actual, createGoogleChatAdapter: vi.fn(actual.createGoogleChatAdapter) };
+});
+vi.mock('../channels/chat-sdk-bridge.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../channels/chat-sdk-bridge.js')>();
+  return { ...actual, createChatSdkBridge: vi.fn(actual.createChatSdkBridge) };
 });
 vi.mock('../channels/channel-registry.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../channels/channel-registry.js')>();
@@ -368,3 +373,205 @@ async function freePort(): Promise<number> {
   await new Promise<void>((resolve) => probe.close(() => resolve()));
   return port;
 }
+
+const FAILURE_NOTICE = "Something went wrong on my side and I couldn't finish that. Please send it again.";
+
+describe('recorded divergence: Google Chat gives the agent the message a principal quotes', () => {
+  it('hands the registered bridge a reply-context hook that reads the quoted snapshot', async () => {
+    await freshInstall();
+    vi.stubEnv('GCHAT_CREDENTIALS', JSON.stringify({ client_email: 'bot@example.test', private_key: 'secret' }));
+    vi.stubEnv('GCHAT_ENDPOINT_URL', 'https://assistant.example.test/webhook/gchat');
+    const bridge = await import('../channels/chat-sdk-bridge.js');
+    await import('../channels/gchat.js');
+    const registry = await import('../channels/channel-registry.js');
+    const registration = vi
+      .mocked(registry.registerChannelAdapter)
+      .mock.calls.find(([name]) => name === 'gchat')?.[1] as ChannelRegistration | undefined;
+
+    await registration!.factory();
+
+    const hook = vi.mocked(bridge.createChatSdkBridge).mock.calls[0]?.[0].extractReplyContext;
+    expect(
+      hook?.({
+        chat: {
+          messagePayload: {
+            message: { quotedMessageMetadata: { quotedMessageSnapshot: { sender: 'Robin', text: 'Lunch at 1?' } } },
+          },
+        },
+      }),
+    ).toEqual({ sender: 'Robin', text: 'Lunch at 1?' });
+  });
+});
+
+describe('recorded divergence: a Google Chat message keeps its attachments', () => {
+  it('saves an attachment from a message whose ID holds slashes', async () => {
+    const directory = await freshInstall();
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    await db.createAgentGroup({
+      id: 'ag-1',
+      name: 'Main',
+      folder: 'main',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    await db.createMessagingGroup({
+      id: 'mg-1',
+      channel_type: 'gchat',
+      platform_id: 'gchat:spaces/dm',
+      name: 'Principal',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: new Date().toISOString(),
+    });
+    await mkdir(path.join(directory, 'groups'), { recursive: true });
+    await import('../mailbox/compose.js');
+    const { resolveSession, sessionDir, writeSessionMessage } = await import('../session-manager.js');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+
+    await writeSessionMessage('ag-1', session.id, {
+      id: 'spaces/dm/messages/abc.abc',
+      kind: 'chat-sdk',
+      timestamp: new Date().toISOString(),
+      platformId: 'gchat:spaces/dm',
+      channelType: 'gchat',
+      threadId: null,
+      content: JSON.stringify({ text: 'agenda', attachments: [{ name: 'agenda.txt', data: 'YWdlbmRh' }] }),
+    });
+
+    const inbox = path.join(sessionDir('ag-1', session.id), 'inbox');
+    const [folder] = await readdir(inbox);
+    expect(await readFile(path.join(inbox, folder!, 'agenda.txt'), 'utf8')).toBe('agenda');
+  });
+});
+
+describe('recorded divergence: a failure reaches the principal as one plain sentence', () => {
+  it('tells the chat a failed message came from, and no one for a message from the host', async () => {
+    const directory = await freshInstall();
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    await db.createAgentGroup({
+      id: 'ag-1',
+      name: 'Main',
+      folder: 'main',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    await db.createMessagingGroup({
+      id: 'mg-1',
+      channel_type: 'gchat',
+      platform_id: 'gchat:spaces/dm',
+      name: 'Principal',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: new Date().toISOString(),
+    });
+    await mkdir(path.join(directory, 'groups'), { recursive: true });
+    await import('../mailbox/compose.js');
+    const { resolveSession } = await import('../session-manager.js');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    const delivery = await import('../delivery.js');
+    const sent: Array<{ threadId: string | null; content: string }> = [];
+    delivery.setDeliveryAdapter({
+      async deliver(_channelType, _platformId, threadId, _kind, content) {
+        sent.push({ threadId, content });
+        return 'spaces/dm/messages/notice';
+      },
+    });
+
+    await delivery.sendFailureNotice(
+      session,
+      { channelType: 'agent', platformId: 'ag-1', threadId: null },
+      { onlyToThatChat: true },
+    );
+    await delivery.sendFailureNotice(
+      session,
+      { channelType: 'gchat', platformId: 'gchat:spaces/dm', threadId: 'spaces/dm/threads/t1' },
+      { onlyToThatChat: true },
+    );
+
+    expect(sent).toEqual([{ threadId: 'spaces/dm/threads/t1', content: JSON.stringify({ text: FAILURE_NOTICE }) }]);
+  });
+
+  it('keeps the agent runner’s failed-turn sentence and its time and schedule tools', async () => {
+    const pollLoop = await readFile(path.join(originalCwd, 'container/agent-runner/src/poll-loop.ts'), 'utf8');
+    const tools = await readFile(path.join(originalCwd, 'container/agent-runner/src/mcp-tools/index.ts'), 'utf8');
+    expect(pollLoop).toContain(JSON.stringify(FAILURE_NOTICE));
+    expect(tools).toContain("import './time.js';");
+    expect(tools).toContain("import './schedule-stats.js';");
+  });
+});
+
+describe('recorded divergence: the agent runner describes delivery so a sent reply is not followed by a note', () => {
+  it('says a sent reply ends the turn, and never asks for every line to be wrapped, in the prompt, the nudge, or compaction', async () => {
+    const runner = path.join(originalCwd, 'container/agent-runner/src');
+    const destinations = await readFile(path.join(runner, 'destinations.ts'), 'utf8');
+    const compaction = await readFile(path.join(runner, 'compact-instructions.ts'), 'utf8');
+    const pollLoop = await readFile(path.join(runner, 'poll-loop.ts'), 'utf8');
+
+    expect(destinations).toContain(
+      'Wrap every reply in a `<message to="name">…</message>` block: text outside a block is not delivered',
+    );
+    expect(destinations).toContain(
+      'When `send_message` has already delivered your reply, end the turn without another block',
+    );
+    expect(compaction).not.toContain('You MUST wrap all responses');
+    expect(pollLoop).not.toContain('All output must be wrapped');
+  });
+});
+
+describe('recorded divergence: a subagent cannot message the conversation', () => {
+  it("refuses the delivery tools inside a subagent, in the Claude provider's tool hook", async () => {
+    const provider = await readFile(path.join(originalCwd, 'container/agent-runner/src/providers/claude.ts'), 'utf8');
+
+    expect(provider).toContain('if (i.agent_id !== undefined && SUBAGENT_DENIED_TOOLS.has(toolName)) {');
+    for (const tool of [
+      'send_message',
+      'send_file',
+      'edit_message',
+      'add_reaction',
+      'send_card',
+      'ask_user_question',
+    ]) {
+      expect(provider).toContain(`'${tool}'`);
+    }
+  });
+});
+
+describe('recorded divergence: the agent image carries the pinned Google tool', () => {
+  /** The Dockerfile with line continuations joined, so each instruction is one line. */
+  async function dockerfileInstructions(): Promise<string[]> {
+    const source = await readFile(path.join(originalCwd, 'container/Dockerfile'), 'utf8');
+    return source.replace(/\\\n\s*/g, ' ').split('\n');
+  }
+
+  it('installs gog at an exact version, checked against a pinned SHA-256 for each architecture', async () => {
+    const instructions = await dockerfileInstructions();
+    const arg = (name: string) => instructions.find((line) => line.startsWith(`ARG ${name}=`))?.split('=')[1];
+
+    expect(arg('GOGCLI_VERSION')).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(arg('GOGCLI_SHA256_AMD64')).toMatch(/^[0-9a-f]{64}$/);
+    expect(arg('GOGCLI_SHA256_ARM64')).toMatch(/^[0-9a-f]{64}$/);
+    const install = instructions.find((line) => line.startsWith('RUN') && line.includes('gogcli'));
+    expect(install).toContain(
+      'releases/download/v${GOGCLI_VERSION}/gogcli_${GOGCLI_VERSION}_linux_${TARGETARCH}.tar.gz',
+    );
+    expect(install).toMatch(/sha256sum -c - && .*install -m 0755 \/tmp\/gog \/usr\/local\/bin\/gog/);
+  });
+
+  it('gives gog a placeholder token and exactly the Google services the release exposes', async () => {
+    const env = new Map(
+      (await dockerfileInstructions())
+        .filter((line) => line.startsWith('ENV GOG_'))
+        .flatMap((line) => line.slice('ENV '.length).trim().split(/\s+/))
+        .map((pair) => pair.split('=') as [string, string]),
+    );
+
+    expect(env.get('GOG_ACCESS_TOKEN')).toBe('gateway-managed');
+    expect(env.get('GOG_ENABLE_COMMANDS')).toBe(EXPOSED_GOOGLE_SERVICES.join(','));
+    expect(env.get('GOG_JSON')).toBe('1');
+    expect(env.get('GOG_WRAP_UNTRUSTED')).toBe('1');
+  });
+});

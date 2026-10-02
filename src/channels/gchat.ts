@@ -6,7 +6,7 @@ import { createGoogleChatAdapter } from '@chat-adapter/gchat';
 
 import { readEnvFile } from '../env.js';
 import type { ChannelDefaults } from './adapter.js';
-import { createChatSdkBridge } from './chat-sdk-bridge.js';
+import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
 
 const GCHAT_ENV_KEYS = [
@@ -94,6 +94,26 @@ function rejectAlternateVerifierConfiguration(): void {
   );
 }
 
+function record(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+/**
+ * The message a Google Chat message quotes, from the snapshot Google includes
+ * in the event (`quotedMessageMetadata.quotedMessageSnapshot`), so the agent
+ * sees what is being answered. A quote without text gives nothing.
+ */
+export function extractGchatReplyContext(raw: Record<string, unknown>): ReplyContext | null {
+  const message = record(record(record(raw.chat)?.messagePayload)?.message);
+  const snapshot = record(record(message?.quotedMessageMetadata)?.quotedMessageSnapshot);
+  const text = snapshot?.text;
+  if (typeof text !== 'string' || !text.trim()) return null;
+  const sender = snapshot?.sender;
+  return { sender: typeof sender === 'string' && sender.trim() ? sender : 'unknown', text };
+}
+
 /**
  * Dedicated bot app on a threaded platform. `mention` (not sticky) is the
  * conservative group default; operators upgrade per wiring.
@@ -141,6 +161,7 @@ registerChannelAdapter('gchat', {
       concurrency: 'concurrent',
       supportsThreads: true,
       defaults: GCHAT_DEFAULTS,
+      extractReplyContext: extractGchatReplyContext,
     });
   },
   defaults: GCHAT_DEFAULTS,

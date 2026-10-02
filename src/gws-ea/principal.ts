@@ -176,6 +176,16 @@ async function runBootstrap(
   });
 }
 
+/**
+ * The first message main receives. Main's `welcome` is the GWS-EA skill its
+ * template stamps, which asks the principal for their calendars; NanoClaw's
+ * own capability tour is not among main's skills (KTD11, KTD13). Passed
+ * explicitly so NanoClaw's default, which can point at a channel addendum
+ * for its own welcome, never reaches main.
+ */
+export const GWS_EA_WELCOME_INSTRUCTION =
+  'System instruction: run /welcome to introduce yourself to the principal in this new conversation.';
+
 export function principalWelcomeEventId(
   config: Pick<InstanceRuntimeConfig, 'instance_id'>,
   mainAgentGroupId: string,
@@ -312,6 +322,8 @@ export async function reconcilePrincipalDm(
       input.adapterInstance,
       '--event-id',
       stableEventId,
+      '--welcome',
+      GWS_EA_WELCOME_INSTRUCTION,
     ],
     dependencies.runCommand,
   );

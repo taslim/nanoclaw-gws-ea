@@ -30,6 +30,7 @@ import {
 import { validateExistingGchatEndpoint } from './endpoint.js';
 import { deriveWorkspaceAddOnIdentity, parseGcpProjectNumber } from './gcp-identity.js';
 import { assertInstanceId } from './registry.js';
+import { GOOGLE_GRANT_FILE_ENV, GOOGLE_GRANT_FILE_NAME } from '../modules/gws-ea-google/grant.js';
 import { GwsEaError, ingressEndpointUrl, type AllocatedPorts, type InstanceReservation } from './types.js';
 import { parseJson, requireDockerEndpoint, requirePath, requireRecord, requireString } from './validation.js';
 
@@ -169,6 +170,16 @@ function expectedSecretFiles(checkout: string): InstanceSecretFiles {
 
 export function googleChatProjectNumberFile(config: Pick<InstanceRuntimeConfig, 'secret_files'>): string {
   return path.join(path.dirname(config.secret_files.gchat_credentials), 'gchat-project-number');
+}
+
+/** The assistant's Google sign-in, which the host refreshes (KTD2). */
+export function googleGrantFile(config: Pick<InstanceRuntimeConfig, 'secret_files'>): string {
+  return path.join(path.dirname(config.secret_files.gchat_credentials), GOOGLE_GRANT_FILE_NAME);
+}
+
+/** The OAuth client the operator supplied, kept until a sign-in turns it into a grant. */
+export function googleOAuthClientFile(config: Pick<InstanceRuntimeConfig, 'secret_files'>): string {
+  return path.join(path.dirname(config.secret_files.gchat_credentials), 'google-oauth-client.json');
 }
 
 function installId(instanceId: string): string {
@@ -775,7 +786,15 @@ async function buildInstanceHostEnvironment(
     ONECLI_API_KEY: onecliRuntimeApiKey.trim(),
     GCHAT_CREDENTIALS: gchatCredentials,
     GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL: deriveWorkspaceAddOnIdentity(projectNumber),
+    [GOOGLE_GRANT_FILE_ENV]: googleGrantFile(config),
   });
+}
+
+/** The instance's OneCLI administrative key, from its owner-only secret file; an empty file is refused. */
+export async function readOnecliAdminApiKey(config: InstanceRuntimeConfig): Promise<string> {
+  const apiKey = (await readOwnerOnlyFile(config.secret_files.onecli_admin_api_key)).trim();
+  if (!apiKey) throw new GwsEaError('invalid_secret', 'The OneCLI administrative credential is empty');
+  return apiKey;
 }
 
 export async function runInstanceOnecliAdminCommand(
@@ -784,8 +803,7 @@ export async function runInstanceOnecliAdminCommand(
   dependencies: { readonly runCommand?: SanitizedCommandRunner; readonly ambientEnv?: NodeJS.ProcessEnv } = {},
 ): Promise<SanitizedCommandResult> {
   const config = validateRuntimeConfig(configInput);
-  const apiKey = (await readOwnerOnlyFile(config.secret_files.onecli_admin_api_key)).trim();
-  if (!apiKey) throw new GwsEaError('invalid_secret', 'The OneCLI administrative credential is empty');
+  const apiKey = await readOnecliAdminApiKey(config);
   await assertExecutable(config.onecli_cli_path);
   const run = dependencies.runCommand ?? runSanitizedCommand;
   return run({

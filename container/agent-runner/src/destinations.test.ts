@@ -38,9 +38,21 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
 
     const prompt = buildSystemPromptAddendum('Casa');
 
-    expect(prompt).toContain('Wrap each delivered message');
+    expect(prompt).toContain('Wrap every reply in a `<message to="name">');
     expect(prompt).toContain('<message to="name">');
     expect(prompt).toContain('`casa`');
+  });
+
+  it('tells a chat agent that text outside a block stays private, and that a reply already sent ends the turn', () => {
+    seedDestination('casa', 'Casa', 'whatsapp', 'group-1@g.us');
+
+    const chat = buildSystemPromptAddendum('Casa');
+    const task = buildSystemPromptAddendum('Casa', { kind: 'task', taskId: 'daily-briefing-a25c' });
+
+    expect(chat).toContain('Wrap every reply in a `<message to="name">…</message>` block: text outside a block is not delivered');
+    expect(chat).toContain('When `send_message` has already delivered your reply, end the turn without another block');
+    expect(chat).not.toContain('finish with the outcome');
+    expect(task).not.toContain('already delivered your reply');
   });
 
   it('handles the no-destination case without crashing', () => {
@@ -55,7 +67,7 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
 
     const prompt = buildSystemPromptAddendum('Casa');
 
-    expect(prompt).toContain('Wrap each delivered message');
+    expect(prompt).toContain('Wrap every reply in a `<message to="name">');
     expect(prompt).toContain('<message to="name">');
     expect(prompt).toContain('default to addressing the destination it came `from`');
     expect(prompt).toContain('`casa`');

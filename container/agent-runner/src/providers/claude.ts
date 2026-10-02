@@ -114,6 +114,13 @@ class MessageStream {
   }
 }
 
+/** The nanoclaw tools that put something in front of a person. */
+const SUBAGENT_DENIED_TOOLS: ReadonlySet<string> = new Set(
+  ['send_message', 'send_file', 'edit_message', 'add_reaction', 'send_card', 'ask_user_question'].map(
+    (name) => `mcp__nanoclaw__${name}`,
+  ),
+);
+
 /**
  * PreToolUse hook: record the current tool + its declared timeout so the host
  * sweep can widen its stuck tolerance while Bash is running a long-declared
@@ -121,13 +128,26 @@ class MessageStream {
  * block the call here instead of letting the agent hang.
  */
 const preToolUseHook: HookCallback = async (input) => {
-  const i = input as { tool_name?: string; tool_input?: Record<string, unknown> };
+  const i = input as { tool_name?: string; tool_input?: Record<string, unknown>; agent_id?: string };
   const toolName = i.tool_name ?? '';
   if (SDK_DISALLOWED_TOOLS.includes(toolName)) {
     return {
       decision: 'block',
       stopReason: `Tool '${toolName}' is not available in this environment — use the nanoclaw equivalent.`,
     } as unknown as ReturnType<HookCallback>;
+  }
+  // The SDK sets agent_id only on calls made inside a subagent. A subagent
+  // works for the agent that started it and reports back through its result;
+  // only the agent itself speaks in the conversation.
+  if (i.agent_id !== undefined && SUBAGENT_DENIED_TOOLS.has(toolName)) {
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason:
+          'A subagent does not message anyone. Return what you found as your result; the agent that started you decides what to send.',
+      },
+    };
   }
   // Bash exposes its timeout via the tool_input.timeout field (ms). Any other
   // tool: no declared timeout.

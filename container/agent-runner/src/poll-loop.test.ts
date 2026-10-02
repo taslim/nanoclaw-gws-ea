@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
@@ -456,11 +456,30 @@ describe('error result with no <message> envelope', () => {
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0].content).text).toBe('The agent run failed. Check the logs for details.');
+    expect(JSON.parse(out[0].content).text).toBe(
+      "Something went wrong on my side and I couldn't finish that. Please send it again.",
+    );
     expect(out[0].platform_id).toBe('chan-1');
     expect(out[0].channel_type).toBe('discord');
     // No re-wrap nudge — an error result must not re-hammer the gateway.
     expect(pushes).toHaveLength(0);
+  });
+
+  it("sends the fixed sentence in place of the provider's error, which goes only to the log", async () => {
+    const providerError = '403 billing_error: Spending limit reached. Update your billing settings to continue.';
+    const { query, pushes } = makeResultQuery({ type: 'result', text: '', error: providerError, isError: true });
+    const logged = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+      expect(getUndeliveredMessages().map((row) => row.content)).toEqual([
+        JSON.stringify({ text: "Something went wrong on my side and I couldn't finish that. Please send it again." }),
+      ]);
+      expect(logged.mock.calls.map(([line]) => String(line)).some((line) => line.includes(providerError))).toBe(true);
+      expect(pushes).toHaveLength(0);
+    } finally {
+      logged.mockRestore();
+    }
   });
 
   it.each([
@@ -472,7 +491,7 @@ describe('error result with no <message> envelope', () => {
     const exchanges: ProviderExchange[] = [];
     await processQuery(query, ERR_ROUTING, ['m1'], 'mock', (exchange) => exchanges.push(exchange), 'prompt', undefined);
     expect(getUndeliveredMessages().map((row) => JSON.parse(row.content).text)).toEqual([
-      'The agent run failed. Check the logs for details.',
+      "Something went wrong on my side and I couldn't finish that. Please send it again.",
     ]);
     expect(exchanges).toHaveLength(1);
     expect(exchanges[0].status).toBe('error');
@@ -488,6 +507,9 @@ describe('error result with no <message> envelope', () => {
     expect(getUndeliveredMessages()).toHaveLength(0);
     expect(pushes).toHaveLength(1);
     expect(pushes[0]).toContain('was not delivered');
+    // The nudge asks for the reply, never for every line of output to be wrapped.
+    expect(pushes[0]).toContain('Please re-send your reply');
+    expect(pushes[0]).not.toContain('All output must be wrapped');
   });
 });
 
@@ -506,7 +528,7 @@ it('delivers completed wrapped text while recording the failed turn exactly once
 
   expect(getUndeliveredMessages().map((row) => JSON.parse(row.content).text)).toEqual([
     'Completed before failure.',
-    'The agent run failed. Check the logs for details.',
+    "Something went wrong on my side and I couldn't finish that. Please send it again.",
   ]);
   expect(exchanges).toEqual([{ prompt: 'prompt', result: text, continuation: 'sess-1', status: 'error' }]);
   expect(pushes).toHaveLength(0);

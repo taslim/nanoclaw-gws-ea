@@ -92,6 +92,7 @@ import {
 } from './types.js';
 import {
   isRecord,
+  normalizePrincipalEmail,
   optionalString,
   parseJson,
   requireDockerEndpoint,
@@ -109,7 +110,8 @@ import {
 } from '../provider-credential.js';
 import { assertProviderProvisioningCapabilityDigest } from '../provider-provisioning-capability.js';
 import { googleChatConfigurationUrl } from './chat-configuration.js';
-import type { Interaction } from './events.js';
+import { googleSignInPause, type Interaction } from './events.js';
+import { googleConnectionResources, type GoogleConnectionInput } from './google-connection.js';
 import {
   getOwnedGcpProjectNumber,
   googleCloudResources,
@@ -163,6 +165,8 @@ export interface ProductionProvisionInput {
   readonly ingress: IngressClaim;
   readonly managedIngressSetup?: ManagedAccountTokenSession;
   readonly requestCloudflareAccountToken?: (accountId: string, observation: string) => Promise<string>;
+  /** The assistant's Google sign-in (`connect_google`, KTD2, KTD5). */
+  readonly google: GoogleConnectionInput;
 }
 
 export interface ProductionProvisionState {
@@ -209,6 +213,8 @@ export interface ProductionProvisionDependencies {
   readonly verifyConversation: (input: ConversationVerificationInput) => ConversationVerificationResult;
   /** `establish_transport`'s resources in managed mode. */
   readonly managedTransportResources: typeof managedTransportResources;
+  /** `connect_google`'s resources. */
+  readonly googleConnectionResources: typeof googleConnectionResources;
   readonly sleep: (milliseconds: number) => Promise<void>;
 }
 
@@ -653,6 +659,7 @@ const defaultProductionDependencies: ProductionProvisionDependencies = {
   reconcilePrincipal: reconcilePrincipalDm,
   verifyConversation: verifyTalkableConversation,
   managedTransportResources,
+  googleConnectionResources,
   sleep: delay,
 };
 
@@ -1149,6 +1156,10 @@ export function createProductionProvisionSteps(
         },
       ],
     },
+    connect_google: {
+      label: "Connecting the assistant's Google account…",
+      resources: dependencies.googleConnectionResources(),
+    },
     bind_principal: {
       label: 'Connecting the principal conversation…',
       pauseNeeds: principalPauseNeeds,
@@ -1236,6 +1247,8 @@ export interface ProductionBootstrapManifest {
     readonly assistant_display_name: string;
     readonly principal_display_name: string;
     readonly principal_timezone: string;
+    /** The principal's addresses create collected: one or more, lowercased, each once. */
+    readonly principal_emails: readonly string[];
   };
   readonly selected_messaging_group_id: string | null;
 }
@@ -1244,6 +1257,18 @@ const INVALID_BOOTSTRAP = 'invalid_bootstrap_manifest';
 
 function bootstrapString(value: unknown, label: string, maximum?: number): string {
   return requireString(value, label, INVALID_BOOTSTRAP, maximum);
+}
+
+function bootstrapPrincipalEmails(value: unknown): readonly string[] {
+  const invalid = (): GwsEaError =>
+    new GwsEaError(INVALID_BOOTSTRAP, 'Bootstrap principal email addresses must be one or more email addresses');
+  if (!Array.isArray(value) || value.length === 0) throw invalid();
+  const emails = value.map((candidate) => {
+    const email = typeof candidate === 'string' ? normalizePrincipalEmail(candidate) : undefined;
+    if (email === undefined) throw invalid();
+    return email;
+  });
+  return [...new Set(emails)];
 }
 
 export function validateProductionBootstrapManifest(value: unknown): ProductionBootstrapManifest {
@@ -1294,6 +1319,7 @@ export function validateProductionBootstrapManifest(value: unknown): ProductionB
       assistant_display_name: bootstrapString(identity.assistant_display_name, 'assistant display name', 120),
       principal_display_name: bootstrapString(identity.principal_display_name, 'principal display name', 120),
       principal_timezone: bootstrapString(identity.principal_timezone, 'principal timezone', 128),
+      principal_emails: bootstrapPrincipalEmails(identity.principal_emails),
     },
     selected_messaging_group_id:
       selected === null || selected === undefined
@@ -1418,15 +1444,20 @@ async function resolveProvisionSource(
   manifest: ProductionBootstrapManifest | undefined,
 ): Promise<ProvisionSource> {
   if (manifest) {
+    const profile = readPersistedProfile(runtime);
     return {
       providerCredentialMetadata: bootstrapProviderCredential(manifest),
       providerCapabilityDigest: manifest.provider_capability_digest,
-      profile: readPersistedProfile(runtime),
+      profile,
       identity: {
         assistantDisplayName: manifest.identity.assistant_display_name,
         assistantWorkspaceEmail: reservation.exclusive_resource_claims.workspace_email,
         principalDisplayName: manifest.identity.principal_display_name,
         principalTimezone: manifest.identity.principal_timezone,
+        // Create's addresses seed the profile once. A manifest that outlived
+        // publication (its removal was interrupted) must not replace
+        // addresses the principal or operator changed since.
+        ...(profile ? {} : { principalEmails: manifest.identity.principal_emails }),
       },
       bootstrapMessagingGroupId: manifest.selected_messaging_group_id,
     };
@@ -1444,6 +1475,7 @@ async function resolveProvisionSource(
     providerCredentialMetadata: preflight.providerCredential,
     providerCapabilityDigest: preflight.providerCapabilityDigest,
     profile,
+    // No principal addresses: once main is published, the profile holds them and the principal and operator change them.
     identity: {
       assistantDisplayName: profile.assistant_display_name,
       assistantWorkspaceEmail: profile.assistant_workspace_email,
@@ -1649,6 +1681,16 @@ export async function runProductionProvision(
               interaction.requestCloudflareAccountToken({ accountId, reason }),
           }
         : {}),
+      google: {
+        runtime,
+        assistantWorkspaceEmail: source.identity.assistantWorkspaceEmail,
+        ...(interaction?.decisions.googleClientFile ? { clientFile: interaction.decisions.googleClientFile } : {}),
+        signIn: (request) => {
+          if (interaction) return interaction.signInAssistantToGoogle(request);
+          throw googleSignInPause(request);
+        },
+        resumeCommand: `gws-ea resume --id ${operation.instanceId}`,
+      },
     },
   };
   const gcpAccount = reservation.exclusive_resource_claims.gcp_account;

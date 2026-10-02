@@ -39,6 +39,13 @@ const ACTIVE_POLL_INTERVAL_MS = 500;
 /** Consecutive driver-classified failures before a fresh runner is required. */
 const MAILBOX_FAILURE_STREAK_EXIT = 10;
 
+/**
+ * The one plain sentence the principal sees when a run fails. The host sends
+ * the same sentence for its own failure paths (src/delivery.ts); the two
+ * runtimes share no modules, so the text is written in both places.
+ */
+const FAILURE_NOTICE_TEXT = "Something went wrong on my side and I couldn't finish that. Please send it again.";
+
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
 }
@@ -635,9 +642,11 @@ export async function processQuery(
           if (routing.taskRun && !taskBlockNudged) await autoAppendTaskLog(archivedResult);
           if (failed && !routing.taskRun) {
             // A failed turn needs a visible notice even after a partial reply.
-            // Only the provider's dedicated error field is channel content;
-            // unwrapped model output and raw diagnostics remain private.
-            await deliverErrorResult(routing, event.error ?? 'The agent run failed. Check the logs for details.');
+            // The provider's error, unwrapped model output, and raw
+            // diagnostics are private: the error goes to the log, which the
+            // host records, and the channel gets the fixed sentence.
+            if (event.error) log(`Provider error: ${event.error}`);
+            await deliverFailureNotice(routing);
           }
           // An unwrapped final text only warrants the wrap-nudge when NOTHING
           // was delivered this turn — hasUnwrapped already folds in the
@@ -655,10 +664,9 @@ export async function processQuery(
             const destinations = getAllDestinations();
             const names = destinations.map((d) => d.name).join(', ');
             pushRetry(
-              `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
-                `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
-                `Your destinations: ${names}. ` +
-                `Please re-send your response with the correct wrapping.</system>`,
+              `<system>Your response was not delivered — nothing this turn was inside a <message to="name">...</message> block. ` +
+                `Please re-send your reply in one: every reply must be wrapped, and text outside a block, including <internal> scratchpad, is not delivered. ` +
+                `Your destinations: ${names}.</system>`,
             );
           }
           if (willRetryTaskBlocks) {
@@ -721,7 +729,7 @@ export async function processQuery(
           continue;
         noticed.push(target);
         try {
-          await deliverErrorResult(target, 'The agent run failed. Check the logs for details.');
+          await deliverFailureNotice(target);
         } catch (noticeError) {
           log(
             `Failed to deliver query error notice: ${noticeError instanceof Error ? noticeError.message : String(noticeError)}`,
@@ -771,9 +779,9 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
   }
 }
 
-/** Send the dedicated provider error or a generic failure notice. */
-async function deliverErrorResult(routing: RoutingContext, text: string): Promise<void> {
-  log('Error result notice — delivering to channel');
+/** Tell the conversation, in the one fixed sentence, that the run failed. */
+async function deliverFailureNotice(routing: RoutingContext): Promise<void> {
+  log('Failed run — delivering the failure notice to the channel');
   await writeMessageOut({
     id: generateId(),
     in_reply_to: routing.inReplyTo,
@@ -781,7 +789,7 @@ async function deliverErrorResult(routing: RoutingContext, text: string): Promis
     platform_id: routing.platformId,
     channel_type: routing.channelType,
     thread_id: routing.threadId,
-    content: JSON.stringify({ text: stripHarnessTagArtifacts(text) }),
+    content: JSON.stringify({ text: FAILURE_NOTICE_TEXT }),
   });
 }
 

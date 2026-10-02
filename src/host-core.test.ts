@@ -213,7 +213,7 @@ describe('session manager', () => {
     expect(fs.readFileSync(outside, 'utf-8')).toBe('ORIGINAL');
   });
 
-  it('should reject inbound attachments when messageId is unsafe', async () => {
+  it('keeps inbound attachments inside the inbox when messageId is unsafe', async () => {
     initSessionFolder('ag-1', 'sess-test');
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
@@ -228,9 +228,10 @@ describe('session manager', () => {
     });
 
     const inboxRoot = path.join(sessionDir('ag-1', session.id), 'inbox');
-    if (fs.existsSync(inboxRoot)) {
-      expect(fs.readdirSync(inboxRoot)).toEqual([]);
-    }
+    const folders = fs.readdirSync(inboxRoot);
+    expect(folders).toEqual([expect.stringMatching(/^msg-[0-9a-f]{32}$/)]);
+    expect(fs.readFileSync(path.join(inboxRoot, folders[0]!, 'photo.png'), 'utf-8')).toBe('PNGBYTES');
+    expect(fs.existsSync(path.join(inboxRoot, '..', '..', 'escape'))).toBe(false);
   });
 
   it('should still save inbound attachments with safe basenames', async () => {

@@ -105,25 +105,27 @@ describe('delivery attempts survive a restart', () => {
     insertOutbound('ag-1', session.id, 'out-poison');
     await seedPriorAttempts('out-poison', session.id, 2);
 
-    let callCount = 0;
+    const sends: string[] = [];
     setDeliveryAdapter({
-      async deliver() {
-        callCount++;
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        sends.push((JSON.parse(content) as { text: string }).text);
         throw new Error('still failing after the restart');
       },
     });
 
     // One live failure — attempt 3 of 3 overall. The old in-memory counter
     // would have called this attempt 1 and retried the poison message
-    // through every future crash loop.
+    // through every future crash loop. Giving up tries once to tell the
+    // principal.
+    const notice = "Something went wrong on my side and I couldn't finish that. Please send it again.";
     await deliverSessionMessages(session);
-    expect(callCount).toBe(1);
+    expect(sends).toEqual(['hello', notice]);
     expect(deliveredRow('ag-1', session.id, 'out-poison')?.status).toBe('failed');
     expect(await getDeliveryAttempt('out-poison')).toBeUndefined();
 
     // And it stays failed — the adapter is never consulted again.
     await deliverSessionMessages(session);
-    expect(callCount).toBe(1);
+    expect(sends).toEqual(['hello', notice]);
   });
 
   it('a success after the restart clears the persisted count', async () => {

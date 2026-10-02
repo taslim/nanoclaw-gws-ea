@@ -39,6 +39,7 @@ import {
 } from './main-template.js';
 import { runInstanceNclJson } from './ncl.js';
 import { observeOnecliRuntime } from './onecli.js';
+import { observeGoogleConnection, type GoogleConnectionReport } from './google-connection.js';
 import { createOnecliRuntimeLayout, type OnecliPins, type OnecliRuntimeLayout } from './onecli-compose.js';
 import {
   inspectOperation,
@@ -133,6 +134,10 @@ export interface DeliveryFacts {
   readonly last: DeliveryView | null;
   readonly retrying: number | null;
 }
+export interface WorkspaceFacts {
+  /** The Google account the assistant is signed in as. */
+  readonly account: string | null;
+}
 
 export interface AssistantProbes {
   /** The live checkout agrees with its record: marker, detached commit, no tracked changes. */
@@ -145,6 +150,8 @@ export interface AssistantProbes {
   readonly onecli: ProbeResult;
   /** Main as published, on the assistant's provider, with its OneCLI agent granted every secret. */
   readonly main_identity: ProbeResult & MainIdentityFacts;
+  /** The assistant's own Google sign-in, accepted by Google, with Calendar access in OneCLI for agents. */
+  readonly workspace: ProbeResult & WorkspaceFacts;
   /** The principal binding and its queued welcome. */
   readonly principal: ProbeResult;
   /** The callback: the managed route from outside, or the operator's endpoint. */
@@ -161,6 +168,7 @@ export const PROBE_NAMES = [
   'host',
   'onecli',
   'main_identity',
+  'workspace',
   'principal',
   'route',
   'connector',
@@ -287,6 +295,8 @@ export interface StatusObservers {
   readonly delivery: (checkoutRoot: string) => LatestDelivery | undefined;
   /** Main's template files in a checkout, compared with the plugin they were stamped from. */
   readonly mainTemplate: (checkoutRoot: string) => Promise<MainTemplateInspection>;
+  /** The assistant's Google connection, observed without changing it. */
+  readonly google: (runtime: InstanceRuntimeConfig, declaredEmail: string) => Promise<GoogleConnectionReport>;
 }
 
 /** What `list` and `status` observe with. The driver supplies NanoClaw's helpers; the rest default. */
@@ -369,6 +379,10 @@ function resolveObservers(overrides: Partial<StatusObservers> = {}): StatusObser
       overrides.connector ??
       ((layout, dockerEndpoint) => observeCloudflareConnector(layout, { runCommand, dockerEndpoint })),
     principalBinding: overrides.principalBinding ?? verifyPrincipalBinding,
+    google:
+      overrides.google ??
+      ((runtime, declaredEmail) =>
+        observeGoogleConnection(runtime, declaredEmail, overrides.fetch ? { fetch: overrides.fetch } : {})),
     schema: overrides.schema ?? readSchemaManifest,
     delivery: overrides.delivery ?? readLatestDelivery,
     mainTemplate: overrides.mainTemplate ?? inspectMainTemplate,
@@ -671,6 +685,19 @@ async function mainIdentityProbe(
   return { ...OK, agent_group_id: agentGroupId };
 }
 
+/** The assistant's own Google sign-in, as `connect_google` left it and Google still accepts it. */
+async function workspaceProbe({
+  reservation,
+  runtime: record,
+  observers,
+}: Subject): Promise<ProbeResult & WorkspaceFacts> {
+  const runtime = requireRuntime(record);
+  const report = await observers.google(runtime, reservation.exclusive_resource_claims.workspace_email);
+  return report.status === 'connected'
+    ? { ...OK, account: report.account }
+    : { status: 'degraded', reason: report.reason, account: report.account };
+}
+
 /** The principal conversation bind_principal fixed, still bound, with its welcome queued. */
 async function principalProbe({ context, reservation, observers }: Subject): Promise<ProbeResult> {
   const journal = await readProvisionJournal(context.paths, reservation.instance_id);
@@ -929,6 +956,7 @@ export async function observeAssistantStatus(
     host,
     onecli,
     mainIdentity,
+    workspace,
     principal,
     route,
     connector,
@@ -942,6 +970,7 @@ export async function observeAssistantStatus(
     probe(() => hostProbe(subject), {}),
     probe(() => onecliProbe(subject), {}),
     probe<MainIdentityFacts>(() => mainIdentityProbe(subject, main), { agent_group_id: null }),
+    probe<WorkspaceFacts>(() => workspaceProbe(subject), { account: null }),
     probe(() => principalProbe(subject), {}),
     probe(() => routeProbe(subject), {}),
     managed ? probe<ConnectorFacts>(() => connectorProbe(subject), { drift: null }) : undefined,
@@ -974,6 +1003,7 @@ export async function observeAssistantStatus(
       host,
       onecli,
       main_identity: mainIdentity,
+      workspace,
       principal,
       route,
       ...(connector ? { connector } : {}),
@@ -1146,6 +1176,8 @@ function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes
       return probes.service.state;
     case 'main_identity':
       return probes.main_identity.agent_group_id ?? '';
+    case 'workspace':
+      return probes.workspace.account ?? '';
     case 'connector':
       return probes.connector?.drift ? `${probes.connector.drift}; it is shared, so it is left as it is` : '';
     case 'delivery': {
@@ -1218,7 +1250,7 @@ export const STATUS_USAGE: readonly string[] = [
   '       tool_commit, behind_tool_release), rollback (available, previous_commit, schema_moved),',
   '       templates (customized: surface, name, change changed|deleted|added; reason), schema',
   '       (central_fingerprint, session_fingerprint, latest_migration),',
-  '       probes: checkout, service, host, onecli, main_identity, principal, route, connector (managed',
+  '       probes: checkout, service, host, onecli, main_identity, workspace (account), principal, route, connector (managed',
   '       Cloudflare only, with drift), delivery; each probe has status ok|degraded|unknown and a reason.',
   '       list and status exit 0 once they observed, whatever the health; status exits 1 for an unknown ID.',
 ];

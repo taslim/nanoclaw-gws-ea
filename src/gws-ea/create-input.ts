@@ -4,6 +4,26 @@ import type { ProductionBootstrapManifest } from './provision.js';
 import { registerSecret } from './redact.js';
 import { readOperatorFile } from './secrets.js';
 import { GwsEaError } from './types.js';
+import { normalizePrincipalEmail } from './validation.js';
+
+/** `--principal-email`, given once per address the principal uses. */
+export const PRINCIPAL_EMAIL_FLAG = 'principal-email';
+
+/** Every `--principal-email`, each validated, lowercased, and kept once in the order given. */
+export function parsePrincipalEmailFlags(values: readonly string[]): readonly string[] {
+  const emails = values.map((value) => {
+    const email = normalizePrincipalEmail(value);
+    if (email === undefined) {
+      throw new GwsEaError(
+        'invalid_arguments',
+        `--${PRINCIPAL_EMAIL_FLAG}: ${JSON.stringify(value)} is not an email address`,
+        { details: { flag: `--${PRINCIPAL_EMAIL_FLAG}` } },
+      );
+    }
+    return email;
+  });
+  return [...new Set(emails)];
+}
 
 /** One flag per create prompt, so `create` can run without a person. */
 export const CREATE_INPUT_FLAGS = [
@@ -119,6 +139,12 @@ export interface CreatePromptContext {
   /** The checked host and confirmed Google account this assistant is created on. */
   readonly prerequisites: Prerequisites;
   readonly provided: Readonly<Partial<Record<CreateInputFlag, string>>>;
+  /**
+   * Every `--principal-email`, validated and lowercased; empty when none was
+   * passed, so create asks for them. They become the bootstrap identity's
+   * `principal_emails`.
+   */
+  readonly providedPrincipalEmails: readonly string[];
   readonly secrets: SecretSource;
   readonly managedIngressSetup?: ManagedIngressSetupSession;
 }

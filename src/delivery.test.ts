@@ -25,17 +25,26 @@ vi.mock('./config.js', async () => {
 });
 
 const TEST_DIR = '/tmp/nanoclaw-test-delivery';
+const FAILURE_NOTICE = "Something went wrong on my side and I couldn't finish that. Please send it again.";
+
+function isFailureNotice(content: string): boolean {
+  return (JSON.parse(content) as { text?: unknown }).text === FAILURE_NOTICE;
+}
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
+import { setMessagingGroupDetachedAt } from './db/messaging-groups.js';
 import { getDeliveredIds } from './mailbox/sqlite/session-db.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import { resolveSession, resolveTaskSession, withMailboxSession } from './session-manager.js';
 import {
   deliverSessionMessages,
+  registerDeliveryAction,
   registerDeliveryBatchPreview,
   registerPostDeliveryHook,
+  sendFailureNotice,
   setDeliveryAdapter,
 } from './delivery.js';
+import { unguarded } from './guard/index.js';
 import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
 import { createDestination } from './modules/agent-to-agent/db/agent-destinations.js';
 import { getAgentMailbox } from './mailbox/index.js';
@@ -230,9 +239,11 @@ describe('deliverSessionMessages — retry and permanent failure', () => {
     insertOutbound('ag-1', session.id, 'out-flaky');
 
     let callCount = 0;
+    let noticeAttempts = 0;
     setDeliveryAdapter({
-      async deliver() {
-        callCount++;
+      async deliver(_ct, _pid, _tid, _kind, content) {
+        if (isFailureNotice(content)) noticeAttempts++;
+        else callCount++;
         throw new Error('network timeout');
       },
     });
@@ -245,13 +256,16 @@ describe('deliverSessionMessages — retry and permanent failure', () => {
     await deliverSessionMessages(session);
     expect(callCount).toBe(2);
 
-    // Attempt 3 — should mark as permanently failed
+    // Attempt 3 — should mark as permanently failed, and try once to say so
     await deliverSessionMessages(session);
     expect(callCount).toBe(3);
+    expect(noticeAttempts).toBe(1);
 
-    // Attempt 4 — message is now in delivered (as failed), adapter not called
+    // Attempt 4 — message is now in delivered (as failed), adapter not called;
+    // the undeliverable notice is not retried either.
     await deliverSessionMessages(session);
     expect(callCount).toBe(3);
+    expect(noticeAttempts).toBe(1);
 
     // Verify the message is in the delivered table with 'failed' status
     const delivered = await withMailboxSession('ag-1', session.id, (mailbox) => mailbox.getDeliveredIds());
@@ -431,8 +445,10 @@ describe('deliverSessionMessages — permission check', () => {
     await deliverSessionMessages(session);
     await deliverSessionMessages(session);
 
-    // Adapter never called — permission check throws before reaching it
-    expect(calls).toHaveLength(0);
+    // The unauthorized message never reached the adapter — the permission
+    // check throws before it. The principal hears about it in their own chat.
+    expect(calls).toHaveLength(1);
+    expect(isFailureNotice(calls[0]!)).toBe(true);
 
     // Message is marked as permanently failed
     const delivered = await withMailboxSession('ag-1', session.id, (mailbox) => mailbox.getDeliveredIds());
@@ -737,5 +753,160 @@ describe('deliverSessionMessages — post-delivery hooks', () => {
     const delivered = getDeliveredIds(openInboundDb('ag-1', session.id));
     expect(delivered.has('th-1')).toBe(true);
     expect(delivered.has('th-2')).toBe(true);
+  });
+});
+
+describe('deliverSessionMessages — permanent failure notice', () => {
+  function insertRow(
+    agentGroupId: string,
+    sessionId: string,
+    row: { id: string; kind: string; content: Record<string, unknown>; threadId?: string | null },
+  ): void {
+    const db = new Database(outboundDbPath(agentGroupId, sessionId));
+    db.prepare(
+      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, content)
+       VALUES (?, ?, ?, 'telegram:123', 'telegram', ?, ?)`,
+    ).run(row.id, now(), row.kind, row.threadId ?? null, JSON.stringify(row.content));
+    db.close();
+  }
+
+  interface Call {
+    channelType: string;
+    platformId: string;
+    threadId: string | null;
+    kind: string;
+    content: string;
+    instance: string | undefined;
+  }
+
+  /** Every send fails except the failure notice, which the channel accepts. */
+  function rejectEverythingButTheNotice(): Call[] {
+    const calls: Call[] = [];
+    setDeliveryAdapter({
+      async deliver(channelType, platformId, threadId, kind, content, _files, instance) {
+        calls.push({ channelType, platformId, threadId, kind, content, instance });
+        if (isFailureNotice(content)) return 'notice-1';
+        throw new Error('message too long');
+      },
+    });
+    return calls;
+  }
+
+  async function drain(session: Parameters<typeof deliverSessionMessages>[0], times: number): Promise<void> {
+    for (let i = 0; i < times; i++) await deliverSessionMessages(session);
+  }
+
+  it('sends one plain sentence to the principal when user-facing messages fail permanently', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertRow('ag-1', session.id, { id: 'out-a', kind: 'chat', content: { text: 'A' }, threadId: 'thread-7' });
+    insertRow('ag-1', session.id, { id: 'out-b', kind: 'chat', content: { text: 'B' }, threadId: 'thread-7' });
+    const calls = rejectEverythingButTheNotice();
+
+    await drain(session, 4);
+
+    const notices = calls.filter((call) => isFailureNotice(call.content));
+    expect(notices).toEqual([
+      {
+        channelType: 'telegram',
+        platformId: 'telegram:123',
+        threadId: 'thread-7',
+        kind: 'chat',
+        content: JSON.stringify({ text: FAILURE_NOTICE }),
+        instance: 'telegram',
+      },
+    ]);
+    // Each failed message was still tried exactly MAX_DELIVERY_ATTEMPTS times.
+    expect(calls.filter((call) => !isFailureNotice(call.content))).toHaveLength(6);
+  });
+
+  it('keeps the provider error out of the channel', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertRow('ag-1', session.id, { id: 'out-a', kind: 'chat', content: { text: 'A' } });
+    const calls = rejectEverythingButTheNotice();
+
+    await drain(session, 3);
+
+    expect(calls.map((call) => call.content).join('\n')).not.toContain('message too long');
+  });
+
+  it('sends nothing for a system message that fails permanently', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    registerDeliveryAction(
+      'test_failure_notice_explodes',
+      async () => {
+        throw new Error('system action failed');
+      },
+      unguarded('test action'),
+    );
+    insertRow('ag-1', session.id, {
+      id: 'out-sys',
+      kind: 'system',
+      content: { action: 'test_failure_notice_explodes' },
+    });
+    const calls = rejectEverythingButTheNotice();
+
+    await drain(session, 3);
+
+    expect(calls).toEqual([]);
+    const delivered = await withMailboxSession('ag-1', session.id, (mailbox) => mailbox.getDeliveredIds());
+    expect(delivered.has('out-sys')).toBe(true);
+  });
+
+  it('sends nothing when a reaction the agent placed cannot be delivered', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertRow('ag-1', session.id, {
+      id: 'out-reaction',
+      kind: 'chat',
+      content: { operation: 'reaction', messageId: 'plat-1', emoji: 'thumbs_up' },
+    });
+    const calls = rejectEverythingButTheNotice();
+
+    await drain(session, 3);
+
+    expect(calls.filter((call) => isFailureNotice(call.content))).toEqual([]);
+  });
+
+  it('sends nothing from a task session, which has no conversation to tell', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveTaskSession('ag-1', 'daily-digest-a1b2');
+    insertRow('ag-1', session.id, { id: 'out-task', kind: 'chat', content: { text: 'digest' } });
+    const calls = rejectEverythingButTheNotice();
+
+    await drain(session, 3);
+
+    expect(calls.filter((call) => isFailureNotice(call.content))).toEqual([]);
+  });
+
+  it('sends nothing into a chat the bot was removed from', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertRow('ag-1', session.id, { id: 'out-a', kind: 'chat', content: { text: 'A' } });
+    await setMessagingGroupDetachedAt('mg-1', now());
+    const calls = rejectEverythingButTheNotice();
+
+    await drain(session, 3);
+
+    expect(calls).toEqual([]);
+  });
+
+  it('stays best effort when the chat cannot be looked up, so the caller carries on', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    const calls = rejectEverythingButTheNotice();
+    const logged = vi.spyOn(log, 'error').mockImplementation(() => undefined);
+    await closeDb();
+
+    await expect(sendFailureNotice(session)).resolves.toBeUndefined();
+
+    expect(calls).toEqual([]);
+    expect(logged).toHaveBeenCalledWith(
+      'Failure notice could not be delivered',
+      expect.objectContaining({ sessionId: session.id }),
+    );
+    await runMigrations(await initTestDb());
   });
 });
