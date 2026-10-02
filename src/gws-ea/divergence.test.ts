@@ -504,6 +504,22 @@ describe('recorded divergence: a failure reaches the principal as one plain sent
   });
 });
 
+describe('recorded divergence: the agent runner describes delivery so a sent reply is not followed by a note', () => {
+  it('says a sent reply ends the turn, and never asks for every line to be wrapped, in the prompt, the nudge, or compaction', async () => {
+    const runner = path.join(originalCwd, 'container/agent-runner/src');
+    const destinations = await readFile(path.join(runner, 'destinations.ts'), 'utf8');
+    const compaction = await readFile(path.join(runner, 'compact-instructions.ts'), 'utf8');
+    const pollLoop = await readFile(path.join(runner, 'poll-loop.ts'), 'utf8');
+
+    expect(destinations).toContain('Text outside a block is not delivered');
+    expect(destinations).toContain(
+      'When `send_message` has already delivered your reply, end the turn without another block',
+    );
+    expect(compaction).not.toContain('You MUST wrap all responses');
+    expect(pollLoop).not.toContain('All output must be wrapped');
+  });
+});
+
 describe('recorded divergence: the agent image carries the pinned Google tool', () => {
   /** The Dockerfile with line continuations joined, so each instruction is one line. */
   async function dockerfileInstructions(): Promise<string[]> {

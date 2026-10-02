@@ -664,10 +664,9 @@ export async function processQuery(
             const destinations = getAllDestinations();
             const names = destinations.map((d) => d.name).join(', ');
             pushRetry(
-              `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
-                `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
-                `Your destinations: ${names}. ` +
-                `Please re-send your response with the correct wrapping.</system>`,
+              `<system>Your response was not delivered — nothing this turn was inside a <message to="name">...</message> block. ` +
+                `Please re-send your reply in one; text outside a block, including <internal> scratchpad, is not delivered. ` +
+                `Your destinations: ${names}.</system>`,
             );
           }
           if (willRetryTaskBlocks) {

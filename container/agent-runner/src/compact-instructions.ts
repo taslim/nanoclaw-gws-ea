@@ -26,7 +26,7 @@ export function buildDeliverySentences(names: string[], taskId: string | null): 
         `Available destinations: ${formatDestinationNames(names)}.`,
       ]
     : [
-        'You MUST wrap all responses in <message to="name">...</message> blocks.',
+        'Deliver every reply in a <message to="name">...</message> block or with send_message; text outside them is not delivered.',
         `Available destinations: ${formatDestinationNames(names)}.`,
       ];
 }

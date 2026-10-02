@@ -128,7 +128,7 @@ function buildDestinationsSection(mode: SessionMode): string {
   }
 
   lines.push(
-    'Wrap each delivered message in a `<message to="name">…</message>` block; include several blocks in one response to address several destinations. `<internal>…</internal>` marks thinking you don\'t want sent.',
+    'Each `<message to="name">…</message>` block in your response is delivered as its own message; include several blocks to address several destinations. Text outside a block is not delivered, and `<internal>…</internal>` marks it as scratchpad explicitly.',
   );
   lines.push('');
   lines.push(
@@ -136,11 +136,15 @@ function buildDestinationsSection(mode: SessionMode): string {
   );
   lines.push('');
   lines.push(
-    'The `send_message` MCP tool is the same delivery, available mid-turn — handy for a quick acknowledgment ("on it") before a slow tool call. Always pass its explicit `to` destination. Each `send_message` call and each final-response `<message>` block lands as its own message in the conversation, so they read as a sequence rather than as one combined reply.',
+    'The `send_message` MCP tool is the same delivery, available mid-turn — handy for a quick acknowledgment ("on it") before a slow tool call. Always pass its explicit `to` destination. Each `send_message` call and each `<message>` block lands as its own message in the conversation, so they read as a sequence rather than as one combined reply.',
   );
   lines.push('');
   lines.push(
-    'For a short turn, do not narrate. For longer work, send one acknowledgment and then updates only at meaningful milestones, especially before slow operations. Never narrate micro-steps; finish with the outcome, not a play-by-play.',
+    'When `send_message` has already delivered your reply, end the turn without another block to that destination: every block arrives as one more message, so a closing note such as "Sent." would reach them too.',
+  );
+  lines.push('');
+  lines.push(
+    'For a short turn, do not narrate. For longer work, send one acknowledgment and then updates only at meaningful milestones, especially before slow operations. Never narrate micro-steps; make your reply the outcome, not a play-by-play.',
   );
   return lines.join('\n');
 }

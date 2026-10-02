@@ -19,11 +19,12 @@ describe('compaction delivery reminder', () => {
     expect(instructions).not.toContain('<message to="name">');
   });
 
-  it('renders the delivery reminder byte-identically to the pre-extraction wording', () => {
+  it('renders the delivery reminder as the canonical sentences, quoted for the summary', () => {
     const chat = buildCompactInstructions(['family', 'ops'], null);
+    expect(chat).not.toContain('all responses');
     expect(chat).toContain(
       [
-        '   "You MUST wrap all responses in <message to="name">...</message> blocks.',
+        '   "Deliver every reply in a <message to="name">...</message> block or with send_message; text outside them is not delivered.',
         '   Available destinations: `family`, `ops`."',
       ].join('\n'),
     );
@@ -45,7 +46,8 @@ describe('post-compaction reminder', () => {
 
     expect(reminder).toBe(
       '<system>The conversation was just compacted into a summary. Delivery instructions can be lost in ' +
-        'that summary, so as a reminder: You MUST wrap all responses in <message to="name">...</message> blocks. ' +
+        'that summary, so as a reminder: Deliver every reply in a <message to="name">...</message> block or with send_message; ' +
+        'text outside them is not delivered. ' +
         'Available destinations: `family`, `ops`.</system>',
     );
   });

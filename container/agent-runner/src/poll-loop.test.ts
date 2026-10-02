@@ -507,6 +507,9 @@ describe('error result with no <message> envelope', () => {
     expect(getUndeliveredMessages()).toHaveLength(0);
     expect(pushes).toHaveLength(1);
     expect(pushes[0]).toContain('was not delivered');
+    // The nudge asks for the reply, never for every line of output to be wrapped.
+    expect(pushes[0]).toContain('Please re-send your reply');
+    expect(pushes[0]).not.toContain('All output must be wrapped');
   });
 });
 
