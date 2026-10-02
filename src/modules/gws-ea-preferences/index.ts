@@ -4,6 +4,7 @@ import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { optionalString } from '../../gws-ea/validation.js';
 import { registerRequiredProjectDocSection, type RequiredProjectDocSection } from '../../project-doc-sections.js';
+import type { AgentGroup } from '../../types.js';
 import {
   getSchedulingPreferences,
   getSchedulingPreferenceValues,
@@ -83,8 +84,23 @@ function summarizeSchedulingPreferences(values: SchedulingPreferenceValues): str
   );
 }
 
-async function preferencesSection(): Promise<RequiredProjectDocSection | undefined> {
+/**
+ * main reads the store, which it also changes: a copy in its document is
+ * written when the container starts, so it would go stale the moment main
+ * set or forgot a value, and a fresh conversation would act on the old one.
+ */
+export const MAIN_PREFERENCES_POINTER =
+  "The principal's scheduling preferences (working hours, protected times, default meeting lengths, buffers, and preferred times) live in their typed store. Read them with `ncl preferences get` before you schedule anything or describe them: the store is the only current copy, and a value from earlier in the conversation may have changed since.";
+
+async function isCanonicalMain(group: AgentGroup): Promise<boolean> {
+  return (await getDb().hasTable('gws_ea_profile')) && group.id === (await getMainAgentGroupId());
+}
+
+async function preferencesSection(group: AgentGroup): Promise<RequiredProjectDocSection | undefined> {
   if (!(await getDb().hasTable('gws_ea_pref_working_hours'))) return undefined;
+  if (await isCanonicalMain(group)) return { name: 'Scheduling Preferences', body: MAIN_PREFERENCES_POINTER };
+  // Other groups cannot read the store, so they get the values as of their
+  // container's start, never a basis or a reason.
   const body = summarizeSchedulingPreferences(await getSchedulingPreferenceValues());
   return body === undefined ? undefined : { name: 'Scheduling Preferences', body };
 }

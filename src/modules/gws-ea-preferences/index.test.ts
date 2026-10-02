@@ -12,7 +12,7 @@ import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
 import type { AgentGroup } from '../../types.js';
 import '../gws-ea-profile/index.js';
 import { getSchedulingPreferences, setSchedulingPreference } from './db.js';
-import './index.js';
+import { MAIN_PREFERENCES_POINTER } from './index.js';
 
 const TEST_ROOT = '/tmp/nanoclaw-gws-ea-preferences-test';
 
@@ -288,10 +288,28 @@ describe('GWS-EA preferences ncl resource', () => {
 });
 
 describe('GWS-EA preferences project-doc section', () => {
-  it('adds no section until a preference is stored', async () => {
-    expect((await getRequiredProjectDocSections(main)).map((section) => section.name)).not.toContain(
+  it('adds no section to another group until a preference is stored', async () => {
+    expect((await getRequiredProjectDocSections(other)).map((section) => section.name)).not.toContain(
       'Scheduling Preferences',
     );
+  });
+
+  it('points main at the live store, whatever it holds, and never copies a value it could change', async () => {
+    const pointer = { name: 'Scheduling Preferences', body: MAIN_PREFERENCES_POINTER };
+    expect(await getRequiredProjectDocSections(main)).toContainEqual(pointer);
+    expect(MAIN_PREFERENCES_POINTER).toContain('`ncl preferences get`');
+
+    await setSchedulingPreference({
+      kind: 'protected-window',
+      start: '00:00',
+      end: '10:00',
+      source: 'principal',
+      basis: 'Said no meetings before 10.',
+    });
+    expect(await getRequiredProjectDocSections(main)).toContainEqual(pointer);
+    const groupDir = path.join(TEST_ROOT, main.folder);
+    await composeGroupProjectDoc(main, groupDir, { fileName: 'CLAUDE.md' });
+    expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8')).not.toContain('00:00-10:00');
   });
 
   it('summarizes the stored values with their source for the next session and omits reasons and bases', async () => {
@@ -384,8 +402,8 @@ describe('GWS-EA preferences project-doc section', () => {
     );
     expect(section?.body).not.toMatch(/Therapy|Board prep|Acme|Wants ten|Morning run|cluster/);
 
-    const groupDir = path.join(TEST_ROOT, main.folder);
-    await composeGroupProjectDoc(main, groupDir, { fileName: 'CLAUDE.md' });
+    const groupDir = path.join(TEST_ROOT, other.folder);
+    await composeGroupProjectDoc(other, groupDir, { fileName: 'CLAUDE.md' });
     const document = fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8');
     expect(document).toContain('# Scheduling Preferences');
     expect(document).toContain('- Monday: 09:00-17:00 (set by the principal)');
