@@ -511,7 +511,9 @@ describe('recorded divergence: the agent runner describes delivery so a sent rep
     const compaction = await readFile(path.join(runner, 'compact-instructions.ts'), 'utf8');
     const pollLoop = await readFile(path.join(runner, 'poll-loop.ts'), 'utf8');
 
-    expect(destinations).toContain('Text outside a block is not delivered');
+    expect(destinations).toContain(
+      'Wrap every reply in a `<message to="name">…</message>` block: text outside a block is not delivered',
+    );
     expect(destinations).toContain(
       'When `send_message` has already delivered your reply, end the turn without another block',
     );

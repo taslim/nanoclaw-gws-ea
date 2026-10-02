@@ -38,7 +38,7 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
 
     const prompt = buildSystemPromptAddendum('Casa');
 
-    expect(prompt).toContain('is delivered as its own message');
+    expect(prompt).toContain('Wrap every reply in a `<message to="name">');
     expect(prompt).toContain('<message to="name">');
     expect(prompt).toContain('`casa`');
   });
@@ -49,7 +49,7 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
     const chat = buildSystemPromptAddendum('Casa');
     const task = buildSystemPromptAddendum('Casa', { kind: 'task', taskId: 'daily-briefing-a25c' });
 
-    expect(chat).toContain('Text outside a block is not delivered');
+    expect(chat).toContain('Wrap every reply in a `<message to="name">…</message>` block: text outside a block is not delivered');
     expect(chat).toContain('When `send_message` has already delivered your reply, end the turn without another block');
     expect(chat).not.toContain('finish with the outcome');
     expect(task).not.toContain('already delivered your reply');
@@ -67,7 +67,7 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
 
     const prompt = buildSystemPromptAddendum('Casa');
 
-    expect(prompt).toContain('is delivered as its own message');
+    expect(prompt).toContain('Wrap every reply in a `<message to="name">');
     expect(prompt).toContain('<message to="name">');
     expect(prompt).toContain('default to addressing the destination it came `from`');
     expect(prompt).toContain('`casa`');

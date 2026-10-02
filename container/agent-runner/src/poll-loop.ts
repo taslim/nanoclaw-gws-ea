@@ -665,7 +665,7 @@ export async function processQuery(
             const names = destinations.map((d) => d.name).join(', ');
             pushRetry(
               `<system>Your response was not delivered — nothing this turn was inside a <message to="name">...</message> block. ` +
-                `Please re-send your reply in one; text outside a block, including <internal> scratchpad, is not delivered. ` +
+                `Please re-send your reply in one: every reply must be wrapped, and text outside a block, including <internal> scratchpad, is not delivered. ` +
                 `Your destinations: ${names}.</system>`,
             );
           }

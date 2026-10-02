@@ -128,7 +128,7 @@ function buildDestinationsSection(mode: SessionMode): string {
   }
 
   lines.push(
-    'Each `<message to="name">…</message>` block in your response is delivered as its own message; include several blocks to address several destinations. Text outside a block is not delivered, and `<internal>…</internal>` marks it as scratchpad explicitly.',
+    'Wrap every reply in a `<message to="name">…</message>` block: text outside a block is not delivered, and `<internal>…</internal>` marks it as scratchpad explicitly. Include several blocks in one response to address several destinations; each block lands as its own message.',
   );
   lines.push('');
   lines.push(
