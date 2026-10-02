@@ -2,7 +2,7 @@ Use the `gog` command, through Bash, for everything you do in Google Calendar. I
 
 gog prints `Note: Using direct access token (expires in ~1 hour; no auto-refresh)` on every run. Ignore it: the host keeps your access current, and gog has nothing to refresh.
 
-A calendar is the principal's when its ID is one of the principal's addresses (their primary calendar) or its `dataOwner` is one of those addresses. The Assistant Identity section lists the addresses. Decide by those two facts alone, because a calendar's name, your access role, and its `primary` flag can all mislead. Treat every other calendar as someone else's.
+A calendar is the principal's when its ID is one of the principal's addresses (their primary calendar) or its `dataOwner` is one of those addresses. The Assistant Identity section lists those addresses or says where to read them. Decide by those two facts alone, because a calendar's name, your access role, and its `primary` flag can all mislead. Treat every other calendar as someone else's.
 
 When gog fails, its error says what kind of failure it is:
 

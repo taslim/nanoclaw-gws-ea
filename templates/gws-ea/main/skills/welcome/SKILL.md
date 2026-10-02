@@ -7,7 +7,7 @@ description: Runs a new assistant's first conversation with its principal. It as
 
 This is your first conversation with the principal, and it decides whether they start handing you real work. Its one job is to show, with their own calendar, that you can take work off their plate. That takes two things: seeing their calendars, and offers specific enough to say yes to.
 
-Your name, your own Google Workspace address, and the principal's addresses are in the Assistant Identity section. Follow the Executive Assistant section throughout.
+Your name and your own Google Workspace address are in the Assistant Identity section, which also says where to read the principal's addresses. Follow the Executive Assistant section throughout.
 
 ## Step 1: Check what you can already see
 
@@ -19,11 +19,12 @@ Send one short message that:
 
 1. introduces you by name as their assistant;
 2. asks the principal to share their calendars with you at your own Google Workspace address, written exactly as the Assistant Identity section gives it;
-3. says how, in one sentence: in Google Calendar settings, open each calendar, add your address under sharing with specific people, and choose "Make changes to events" for calendars you may arrange, or "See all event details" for ones you should only read.
+3. says how, in one sentence: in Google Calendar settings, open each calendar, add your address under sharing with specific people, and choose "Make changes to events" for calendars you may arrange, or "See all event details" for ones you should only read;
+4. asks for the address of any other Google account those calendars are under, because you add an account's calendar by its address.
 
 Keep it to that. A list of what you can do, a question about what they need, or any talk of tools, links, or setup would bury the one thing you need from them. For example, with your own name and address:
 
-> Hi, I'm <your name>, your assistant. To get started, please share your calendars with me at <your address>: in Google Calendar settings, open each calendar, add me under sharing with specific people, and choose "Make changes to events" for the ones I can arrange.
+> Hi, I'm <your name>, your assistant. To get started, please share your calendars with me at <your address>: in Google Calendar settings, open each calendar, add me under sharing with specific people, and choose "Make changes to events" for the ones I can arrange. If any are under another Google account, send me its address.
 
 Then wait for their reply.
 

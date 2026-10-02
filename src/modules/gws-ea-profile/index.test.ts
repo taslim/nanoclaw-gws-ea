@@ -12,7 +12,7 @@ import { composeGroupProjectDoc } from '../../project-doc-compose.js';
 import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
 import type { AgentGroup, User } from '../../types.js';
 import { bindVerifiedPrincipalUser, getGwsEaProfile, listVerifiedPrincipalUsers, reconcileGwsEaProfile } from './db.js';
-import './index.js';
+import { MAIN_PRINCIPAL_ADDRESSES_POINTER } from './index.js';
 
 const TEST_ROOT = '/tmp/nanoclaw-gws-ea-profile-test';
 
@@ -427,21 +427,27 @@ describe("the principal's email addresses", () => {
     expect(lookup('gws-ea-profile-reconcile')).toMatchObject({ access: 'hidden', hostOnly: true });
   });
 
-  it("lists every current address in every group's identity section", async () => {
+  it('points main at the live address list, which it changes mid-conversation, and copies none', async () => {
+    const [section] = await getRequiredProjectDocSections(main);
+
+    expect(section?.body).toContain(MAIN_PRINCIPAL_ADDRESSES_POINTER);
+    expect(section?.body).not.toMatch(/taslim@(work\.)?example\.test/u);
+  });
+
+  it("lists every current address in another group's identity section", async () => {
     await run('principal-addresses-add', { email: 'first_last@example.test' });
     await run('principal-addresses-remove', { email: 'taslim@work.example.test' });
 
-    for (const candidate of [main, research]) {
-      const [section] = await getRequiredProjectDocSections(candidate);
-      expect(section?.body).toContain(
-        "Taslim's email addresses are `first_last@example.test` and `taslim@example.test`.",
-      );
-      expect(section?.body).not.toContain('taslim@work.example.test');
-    }
+    const [section] = await getRequiredProjectDocSections(research);
+    expect(section?.body).toContain(
+      "Taslim's email addresses are `first_last@example.test` and `taslim@example.test`.",
+    );
+    expect(section?.body).not.toContain('taslim@work.example.test');
+    expect(section?.body).not.toContain('ncl principal-addresses');
 
     await run('principal-addresses-remove', { email: 'first_last@example.test' });
-    const [section] = await getRequiredProjectDocSections(main);
-    expect(section?.body).toContain("Taslim's email address is `taslim@example.test`.");
+    const [single] = await getRequiredProjectDocSections(research);
+    expect(single?.body).toContain("Taslim's email address is `taslim@example.test`.");
   });
 
   it("names the assistant's own Google address, so the principal knows where to share calendars", async () => {

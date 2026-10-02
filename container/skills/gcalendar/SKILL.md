@@ -15,13 +15,13 @@ Two habits prevent most mistakes:
 
 ## Find the principal's calendars
 
-Google doesn't add a calendar to your list when someone shares it with you, so add the principal's yourself:
+Sharing a calendar with you doesn't add it to your list, whichever account it comes from: Google adds one only when you subscribe to it by its ID. An account's main (primary) calendar has the account's address as its ID. Any other calendar's ID is in Google's sharing email, and its owner can copy it from that calendar's "Integrate calendar" settings.
 
 1. `gog calendar calendars` lists the calendars in your list, with your `accessRole` on each: `owner`, `writer` (you can change events), `reader` (you can see details), or `freeBusyReader` (you can see only when they're busy).
-2. For each of the principal's addresses in the Assistant Identity section that isn't in the list, run `gog calendar subscribe <address>`. A primary calendar's ID is its owner's address. Success means the principal has shared it, and it now appears in your list with your access role. `404 notFound` means they haven't shared it yet.
+2. For each of the principal's addresses that isn't in the list, run `gog calendar subscribe <address>`. Success means the principal has shared it, and it now appears in your list with your access role. `404 notFound` means they haven't shared it yet.
 3. Decide whose each calendar is by the ownership rule in your gcalendar instructions. `dataOwner`, the owner's address, appears only on secondary calendars; a primary calendar's owner is its ID.
 
-You can add a secondary calendar only by its ID, which Google sends in its sharing email. If a request needs a calendar of the principal's that you can't find, ask them for its Calendar ID: in Google Calendar settings, they open the calendar and copy it from "Integrate calendar". Then subscribe to it.
+Add any other calendar with `gog calendar subscribe <calendarId>`. To stop using a calendar, run `gog calendar unsubscribe <calendarId>`: it leaves your list, and the sharing stays until its owner changes it.
 
 ## Read
 
