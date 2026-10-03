@@ -1,6 +1,7 @@
 import { getDb } from '../../db/connection.js';
 import { EMAIL_PATTERN, hasControlCharacters, normalizePrincipalEmail } from '../../gws-ea/validation.js';
 import { isValidTimezone } from '../../timezone.js';
+import { identityMatchKey } from '../gws-ea-people/fingerprint.js';
 
 export interface GwsEaProfile {
   readonly assistant_display_name: string | null;
@@ -114,6 +115,25 @@ export async function getGwsEaProfile(): Promise<GwsEaProfile> {
   return { ...profile, principal_emails: (await listPrincipalAddresses()).map((address) => address.email) };
 }
 
+/**
+ * Hold `email` as one of the principal's addresses; holding it already
+ * changes nothing. What is the principal's is no person's (KTD8), so a
+ * person identity matching the address in any spelling leaves its record in
+ * the same transaction. True when the address is new.
+ */
+async function holdPrincipalAddress(email: string, addedAt: string): Promise<boolean> {
+  const db = getDb();
+  const result = await db.run(
+    'INSERT INTO gws_ea_principal_addresses (email, added_at) VALUES (?, ?) ON CONFLICT(email) DO NOTHING',
+    email,
+    addedAt,
+  );
+  if (await db.hasTable('gws_ea_people_identities')) {
+    await db.run('DELETE FROM gws_ea_people_identities WHERE match_key = ?', identityMatchKey(`email:${email}`));
+  }
+  return result.changes > 0;
+}
+
 /** Make the profile hold exactly `emails`, keeping when each one it already held was added. */
 async function replacePrincipalAddresses(emails: readonly string[], addedAt: string): Promise<void> {
   const db = getDb();
@@ -121,13 +141,7 @@ async function replacePrincipalAddresses(emails: readonly string[], addedAt: str
   for (const { email } of await listPrincipalAddresses()) {
     if (!wanted.has(email)) await db.run('DELETE FROM gws_ea_principal_addresses WHERE email = ?', email);
   }
-  for (const email of emails) {
-    await db.run(
-      'INSERT INTO gws_ea_principal_addresses (email, added_at) VALUES (?, ?) ON CONFLICT(email) DO NOTHING',
-      email,
-      addedAt,
-    );
-  }
+  for (const email of emails) await holdPrincipalAddress(email, addedAt);
 }
 
 export async function reconcileGwsEaProfile(input: ReconcileGwsEaProfileInput): Promise<GwsEaProfile> {
@@ -178,12 +192,7 @@ export async function addPrincipalAddress(value: string): Promise<{ readonly ema
   const db = getDb();
   return db.transaction(async () => {
     assertNotAssistant(email, await assistantWorkspaceEmail());
-    const result = await db.run(
-      'INSERT INTO gws_ea_principal_addresses (email, added_at) VALUES (?, ?) ON CONFLICT(email) DO NOTHING',
-      email,
-      new Date().toISOString(),
-    );
-    return { email, added: result.changes > 0 };
+    return { email, added: await holdPrincipalAddress(email, new Date().toISOString()) };
   });
 }
 

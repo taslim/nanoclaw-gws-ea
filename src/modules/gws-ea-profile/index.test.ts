@@ -11,10 +11,17 @@ import { lookup } from '../../cli/registry.js';
 import { composeGroupProjectDoc } from '../../project-doc-compose.js';
 import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
 import type { AgentGroup, User } from '../../types.js';
+import { registerMigration } from '../../db/migrations/index.js';
+import { addPerson, getPerson, updatePerson } from '../gws-ea-people/db.js';
+import { gwsEaPeopleMigration } from '../gws-ea-people/migration.js';
 import { bindVerifiedPrincipalUser, getGwsEaProfile, listVerifiedPrincipalUsers, reconcileGwsEaProfile } from './db.js';
 import { MAIN_PRINCIPAL_ADDRESSES_POINTER } from './index.js';
 
 const TEST_ROOT = '/tmp/nanoclaw-gws-ea-profile-test';
+
+// The people store's tables alone, so an address made the principal's can be
+// seen leaving a person's record; its document section stays out of these tests.
+registerMigration(gwsEaPeopleMigration);
 
 function group(id: string, name = 'main'): AgentGroup {
   return { id, name, folder: id, agent_provider: null, created_at: '2026-09-18T00:00:00.000Z' };
@@ -363,6 +370,36 @@ describe("the principal's email addresses", () => {
       'taslim@work.example.test',
       'third@example.test',
     ]);
+  });
+
+  it("releases a person's identity that matches an address made the principal's, and keeps the person", async () => {
+    const sam = await addPerson({
+      name: 'Sam O',
+      level: 'known',
+      source: 'learned',
+      basis: 'On two invitations.',
+      identity: 'email:sam.o@gmail.com',
+      identitySource: 'calendar',
+    });
+    await updatePerson({ id: sam.id, source: 'principal', addIdentity: 'email:sam@shared.example.test' });
+
+    expect(await run('principal-addresses-add', { email: 'SamO+home@gmail.com' }, agent(main.id))).toMatchObject({
+      ok: true,
+      data: { email: 'samo+home@gmail.com', added: true },
+    });
+    expect((await getPerson(sam.id))?.identities.map((identity) => identity.handle)).toEqual([
+      'email:sam@shared.example.test',
+    ]);
+
+    await reconcileGwsEaProfile({
+      assistantDisplayName: 'Aya',
+      assistantWorkspaceEmail: 'aya@example.test',
+      principalDisplayName: 'Taslim',
+      principalTimezone: 'Africa/Lagos',
+      mainAgentGroupId: main.id,
+      principalEmails: ['taslim@example.test', 'sam@shared.example.test'],
+    });
+    expect(await getPerson(sam.id)).toMatchObject({ name: 'Sam O', identities: [] });
   });
 
   it('refuses to add a malformed address or the assistant’s own', async () => {
