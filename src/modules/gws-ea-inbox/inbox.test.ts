@@ -1030,6 +1030,35 @@ describe('health', () => {
     await addPrincipalAddress('pat@unpinned.example');
     expect((await getInboxHealth()).principalDomainsWithoutSelector).toEqual(['home.example', 'unpinned.example']);
   });
+
+  it('reaches status through a hidden host-only command, in the shape status reads', async () => {
+    gmail.historyFailures = 5;
+    for (let i = 0; i < 5; i += 1) await inbox.tick();
+
+    const report = await dispatch({ id: 'h', command: 'gws-ea-inbox-health', args: {} }, { caller: 'host' });
+    expect(report).toEqual({ id: 'h', ok: true, data: await getInboxHealth() });
+    expect(report).toMatchObject({
+      data: {
+        state: 'unhealthy',
+        reason: expect.any(String),
+        since: expect.any(String),
+        lastSuccessAt: expect.any(String),
+        calendarNotifications: { state: 'ok', reason: null },
+        principalDomainsWithoutSelector: ['home.example'],
+      },
+    });
+
+    const agent = await dispatch(
+      { id: 'a', command: 'gws-ea-inbox-health', args: {} },
+      { caller: 'agent', agentGroupId: 'ag-main', sessionId: main.id, messagingGroupId: 'mg-dm' },
+    );
+    expect(agent.ok).toBe(false);
+    const unknown = await dispatch(
+      { id: 'u', command: 'gws-ea-inbox-health', args: { verbose: true } },
+      { caller: 'host' },
+    );
+    expect(unknown).toMatchObject({ ok: false, error: { message: expect.stringContaining('--verbose') } });
+  });
 });
 
 describe('calendar notifications', () => {

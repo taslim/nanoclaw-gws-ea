@@ -8,7 +8,8 @@
  * check and the OneCLI servers behind `fetch`.
  */
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readdir, readFile, realpath, rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink } from 'node:fs/promises';
 import net, { type AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,7 +18,10 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { ChannelRegistration, InboundEvent } from '../channels/adapter.js';
+import type { ContainerConfig } from '../container-config.js';
 import type { GatewayApprovalRequest, GatewaySessionInput } from '../gateway-providers/gateway-provider-registry.js';
+import type { ProviderStateVolume } from '../provider-contracts/registry.js';
+import type { AgentGroup, Session } from '../types.js';
 import { deriveWorkspaceAddOnIdentity } from './gcp-identity.js';
 import { CONTROL_PLANE_ROOT } from './paths.js';
 
@@ -731,5 +735,322 @@ describe('recorded divergence: the agent image carries the pinned Google tool', 
     }
     expect(main).toMatchObject({ GOG_ACCESS_TOKEN: 'gateway-managed', GOG_GMAIL_NO_SEND: '1' });
     expect(Object.keys(spawnEnv(['reply', 'shell'])).filter((key) => key.startsWith('GOG_'))).toEqual([]);
+  });
+});
+
+/** A fresh install with a migrated central DB, which the guard closes when it ends. */
+async function migratedInstall(): Promise<{ readonly install: string; readonly db: typeof import('../db/index.js') }> {
+  const install = await freshInstall();
+  const db = await import('../db/index.js');
+  // The capability column, as the host's module barrel registers it.
+  await import('../modules/capabilities/index.js');
+  await db.runMigrations(await db.initTestDb());
+  cleanups.push(() => db.closeDb());
+  return { install, db };
+}
+
+function agentGroup(id: string): AgentGroup {
+  return { id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() };
+}
+
+describe('recorded divergence: a module can refuse a session before it starts', () => {
+  it('runs every registered session admission policy before the gateway is asked to start a session', async () => {
+    await freshInstall();
+    const runner = await import('../container-runner.js');
+    const source = await readFile(path.join(originalCwd, 'src/container-runner.ts'), 'utf8');
+    runner.registerSessionAdmissionPolicy('divergence:refuse', ({ key }) => {
+      if (key.agentGroupId === 'drifted-group') throw new Error('its configuration drifted');
+    });
+    const session = (agentGroupId: string): Parameters<typeof runner.assertSessionAdmitted>[0] => ({
+      disposition: 'adopt',
+      key: { installSlug: 'install', agentGroupId, sessionId: 'session-1' },
+      credentialScope: { kind: 'all' },
+    });
+
+    await expect(runner.assertSessionAdmitted(session('drifted-group'))).rejects.toThrow('its configuration drifted');
+    await expect(runner.assertSessionAdmitted(session('other-group'))).resolves.toBeUndefined();
+    // Spawn and adoption both start their gateway session here; admission runs before the gateway is asked.
+    const ensure = source.slice(source.indexOf('async function ensureGatewaySession('));
+    expect(ensure.slice(0, ensure.indexOf('const controller = new AbortController();'))).toContain(
+      'await assertSessionAdmitted({',
+    );
+  });
+});
+
+describe('recorded divergence: a group without conversation-context keeps its sessions sealed', () => {
+  it("declares Claude's home as conversation state, which a sealed session holds on its own", async () => {
+    await freshInstall();
+    const registry = await import('../provider-contracts/registry.js');
+    await import('../provider-contracts/index.js');
+    const claude = registry.getProviderHostContract('claude')!;
+    const home = (contract: typeof claude) => contract.stateVolumes.find((volume) => volume.id === 'claude-home');
+
+    expect(home(claude)).toMatchObject({ scope: 'group', sealedScope: 'session' });
+    const sealed = registry.sealedSessionContract(claude);
+    expect(home(sealed)).toMatchObject({ scope: 'session' });
+    expect(home(sealed)).not.toHaveProperty('sealedScope');
+    expect(sealed.skillBackings.find((backing) => backing.id === 'claude-skills')).toMatchObject({
+      templateCopies: 'copy',
+    });
+
+    const withHome = (volume: Partial<ProviderStateVolume>) => ({
+      ...claude,
+      stateVolumes: claude.stateVolumes.map((candidate) =>
+        candidate.id === 'claude-home' ? { ...candidate, ...volume } : candidate,
+      ),
+    });
+    expect(() => registry.assertProviderHostContractShape('claude', claude)).not.toThrow();
+    expect(() => registry.assertProviderHostContractShape('claude', withHome({ scope: 'session' }))).toThrow(
+      /sealedScope applies only to a group volume/,
+    );
+    expect(() =>
+      registry.assertProviderHostContractShape(
+        'claude',
+        withHome({ sealedScope: 'group' as unknown as ProviderStateVolume['sealedScope'] }),
+      ),
+    ).toThrow(/sealedScope/);
+  });
+
+  it("mounts each sealed session its own Claude home, seeded with settings, and a shared group's sessions one home", async () => {
+    const { install, db } = await migratedInstall();
+    const { ensureContainerConfig } = await import('../db/container-configs.js');
+    const { initGroupFilesystem } = await import('../group-init.js');
+    const { resolveCapabilities } = await import('../capabilities.js');
+    const { buildMounts } = await import('../container-runner.js');
+    const group = agentGroup('ag-sealed');
+    await db.createAgentGroup(group);
+    await ensureContainerConfig(group.id);
+    await initGroupFilesystem(group, {});
+    const claudeHome = async (capabilities: readonly string[], sessionId: string) => {
+      const config: ContainerConfig = {
+        mcpServers: {},
+        packages: { apt: [], npm: [] },
+        additionalMounts: [],
+        skills: [],
+        capabilities: [...capabilities],
+      };
+      const session = { id: sessionId, agent_group_id: group.id } as Session;
+      const mounts = await buildMounts(group, session, config, 'claude', {});
+      return mounts.find((mount) => mount.containerPath === '/home/node/.claude')?.hostPath;
+    };
+    const sessions = path.join(install, 'data', 'v2-sessions', group.id);
+
+    expect(await claudeHome(['reply'], 'thread-1')).toBe(path.join(sessions, 'thread-1', '.claude-shared'));
+    expect(await claudeHome(['reply'], 'thread-2')).toBe(path.join(sessions, 'thread-2', '.claude-shared'));
+    expect(existsSync(path.join(sessions, 'thread-1', '.claude-shared', 'settings.json'))).toBe(true);
+    const all = resolveCapabilities('all', 'divergence');
+    expect(await claudeHome(all, 'thread-1')).toBe(path.join(sessions, '.claude-shared'));
+    expect(await claudeHome(all, 'thread-2')).toBe(path.join(sessions, '.claude-shared'));
+    // The provider contribution is realized from the same sealed contract as the mounts.
+    const runner = await readFile(path.join(originalCwd, 'src/container-runner.ts'), 'utf8');
+    expect(runner.split('sessionHostContract(provider, containerConfig.capabilities)').length - 1).toBe(2);
+  });
+
+  it("keeps a sealed session's runner from scaffolding memory, installing its hook, or archiving its conversation", async () => {
+    const read = (file: string) => readFile(path.join(originalCwd, 'container/agent-runner/src', file), 'utf8');
+    const provider = await read('providers/claude.ts');
+    const entry = await read('index.ts');
+    const history = await read('providers/claude-history.ts');
+    const contract = await read('provider-contracts/claude.ts');
+    const hook = await read('memory/session-hook.ts');
+    const sealed = await read('memory/sealed.ts');
+
+    expect(sealed).toContain('return !capabilities.has(CONVERSATION_CONTEXT_CAPABILITY);');
+    expect(sealed).toContain('if (sealed) return SEALED_MEMORY_SESSION_HOOK;');
+    expect(entry).toContain('prepareSessionMemory(sealed)');
+    expect(entry).toContain('if (sealed) delete provider.onExchangeComplete;');
+    expect(provider).toContain('this.sealed = sessionsSealed(runnerCapabilities())');
+    expect(provider).toContain('...(this.sealed ? {} : { PreCompact:');
+    expect(provider).toContain('archive: !this.sealed');
+    expect(history).toContain('if (input.archive !== false)');
+    expect(contract).toContain('if (hook.sources.length > 0)');
+    expect(hook).toMatch(
+      /export const SEALED_MEMORY_SESSION_HOOK: MemorySessionHookRegistration = \{[^}]*sources: \[\],/u,
+    );
+  });
+});
+
+describe('recorded divergence: a module can refuse a destination on every write path', () => {
+  it('refuses a destination a registered policy refuses, writing no row, and writes the ones it admits', async () => {
+    const { db } = await migratedInstall();
+    const admission = await import('../db/wiring-admission.js');
+    const { createDestination } = await import('../modules/agent-to-agent/db/agent-destinations.js');
+    for (const id of ['ag-a', 'ag-protected']) await db.createAgentGroup(agentGroup(id));
+    admission.registerDestinationAdmissionPolicy('divergence:protected', ({ proposed }) =>
+      proposed.target_id === 'ag-protected' ? 'nothing reaches the protected group' : undefined,
+    );
+    const destination = (localName: string, targetId: string) => ({
+      agent_group_id: 'ag-a',
+      local_name: localName,
+      target_type: 'agent' as const,
+      target_id: targetId,
+      created_at: new Date().toISOString(),
+    });
+
+    await expect(createDestination(destination('protected', 'ag-protected'))).rejects.toBeInstanceOf(
+      admission.DestinationRefusedError,
+    );
+    await createDestination(destination('self', 'ag-a'));
+    expect(await db.getDb().all('SELECT local_name FROM agent_destinations')).toEqual([{ local_name: 'self' }]);
+  });
+
+  it('judges the destinations ncl destinations add and create_agent write, through the same seam', async () => {
+    const read = (file: string) => readFile(path.join(originalCwd, file), 'utf8');
+    const writer = await read('src/modules/agent-to-agent/db/agent-destinations.ts');
+    const createAgent = await read('src/modules/agent-to-agent/create-agent.ts');
+    const cli = await read('src/cli/resources/destinations.ts');
+
+    expect(writer).toContain('await assertDestinationAdmitted({ proposed: row });');
+    // create_agent judges both of its rows before it writes the group, so a refusal leaves nothing behind.
+    expect(createAgent).toContain('destinationRefusal({ proposed })');
+    expect(createAgent.indexOf('destinationRefusal({ proposed })')).toBeLessThan(
+      createAgent.indexOf('const newGroup: AgentGroup = {'),
+    );
+    expect(cli).toContain('await createDestination({');
+    expect(cli).not.toContain('INSERT INTO agent_destinations');
+  });
+});
+
+describe('recorded divergence: instructions follow the capabilities that use them', () => {
+  it('teaches the file tools, account connection, and memory only to the keys that use them', async () => {
+    await freshInstall();
+    const { grantsInstructions } = await import('../capabilities.js');
+
+    for (const [module, key, other] of [
+      ['files-send', 'files-send', 'reply'],
+      ['connect', 'shell', 'reply'],
+      ['memory', 'conversation-context', 'reply'],
+    ] as const) {
+      expect(grantsInstructions(module, new Set([other])), module).toBe(false);
+      expect(grantsInstructions(module, new Set([key])), module).toBe(true);
+    }
+  });
+
+  it('keeps memory, conversation history, account connection, and ncl out of the base instructions', async () => {
+    const read = (file: string) => readFile(path.join(originalCwd, file), 'utf8');
+    const base = await read('container/CLAUDE.md');
+    const core = await read('container/agent-runner/src/mcp-tools/core.instructions.md');
+
+    for (const heading of ['## Memory', '## Conversation history', '## Connecting external accounts']) {
+      expect(base).not.toContain(heading);
+    }
+    expect(base).not.toMatch(/\bncl\b/u);
+    expect(core).not.toContain('send_file');
+    expect(await read('container/agent-runner/src/mcp-tools/connect.instructions.md')).toContain(
+      '## Connecting external accounts',
+    );
+    expect(await read('container/agent-runner/src/mcp-tools/memory.instructions.md')).toContain('## Memory');
+    expect(await read('src/project-doc-compose.ts')).toContain(
+      'renderBaseInstructions(instructions, spec.instructions)',
+    );
+  });
+
+  it("composes a reply-only group's document with no ncl, account connection, or memory, and an `all` group's with each", async () => {
+    const { install, db } = await migratedInstall();
+    await mkdir(path.join(install, 'container'));
+    for (const entry of ['CLAUDE.md', 'agent-runner']) {
+      await symlink(path.join(originalCwd, 'container', entry), path.join(install, 'container', entry));
+    }
+    const configs = await import('../db/container-configs.js');
+    const { composeGroupProjectDoc } = await import('../project-doc-compose.js');
+    const compose = async (id: string, capabilities: readonly string[] | 'all') => {
+      const group = agentGroup(id);
+      await db.createAgentGroup(group);
+      await configs.ensureContainerConfig(id);
+      await configs.updateContainerConfigJson(id, 'capabilities', capabilities);
+      const directory = path.join(install, 'groups', id);
+      await composeGroupProjectDoc(group, directory, { fileName: 'CLAUDE.md' });
+      const doc = await readFile(path.join(directory, 'CLAUDE.md'), 'utf8');
+      // The composed-at-spawn header is an operator's marker, not instruction.
+      return doc.slice(doc.indexOf('\n'));
+    };
+
+    const reply = await compose('ag-reply', ['reply']);
+    expect(reply).not.toMatch(/\bncl\b/u);
+    expect(reply).not.toContain('## Memory');
+    expect(reply).not.toContain('## Connecting external accounts');
+    const all = await compose('ag-all', 'all');
+    expect(all).toMatch(/\bncl\b/u);
+    expect(all).toContain('## Memory');
+    expect(all).toContain('## Connecting external accounts');
+  });
+});
+
+describe("recorded divergence: a protected agent group is the host's alone", () => {
+  const agent = { kind: 'agent', agentGroupId: 'ag-owner', sessionId: 'session-owner' } as const;
+
+  it('denies every agent command that names it, even an owner agent with global CLI scope, and allows the host', async () => {
+    await freshInstall();
+    const { guard } = await import('../guard/index.js');
+    const { registerProtectedGroupPolicy } = await import('../cli/guard.js');
+    const { commandGuard } = await import('../cli/registry.js');
+    await import('../cli/resources/index.js');
+    registerProtectedGroupPolicy('divergence:protected', (agentGroupId) =>
+      agentGroupId === 'g' ? 'it is the host’s alone' : undefined,
+    );
+
+    expect(await guard(commandGuard('groups-config-update'), { actor: agent, payload: { id: 'g' } })).toMatchObject({
+      effect: 'deny',
+      reason: expect.stringContaining('it is the host’s alone'),
+    });
+    expect(
+      await guard(commandGuard('groups-config-update'), { actor: { kind: 'host' }, payload: { id: 'g' } }),
+    ).toMatchObject({ effect: 'allow' });
+  });
+
+  it('denies its self-modification requests rather than carding them for approval', async () => {
+    await freshInstall();
+    const { guard } = await import('../guard/index.js');
+    const { registerProtectedGroupPolicy } = await import('../cli/guard.js');
+    const drivers = await import('../drivers/index.js');
+    const { DockerSessionDriver } = await import('../drivers/docker-driver.js');
+    const { FIXTURE_POLICY } = await import('../drivers/spec-fixture.js');
+    const { selfModAddMcpServer, selfModInstallPackages } = await import('../modules/self-mod/guard.js');
+    // A runtime that can rebuild images, so install_packages reaches the group check.
+    drivers.resetSessionDriver(new DockerSessionDriver(FIXTURE_POLICY));
+    cleanups.push(async () => drivers.resetSessionDriver(null));
+    registerProtectedGroupPolicy('divergence:protected', (agentGroupId) =>
+      agentGroupId === 'g' ? 'it is the host’s alone' : undefined,
+    );
+    const actor = (agentGroupId: string) => ({ kind: 'agent', agentGroupId, sessionId: 'session-1' }) as const;
+
+    for (const action of [selfModInstallPackages, selfModAddMcpServer]) {
+      const payload = { apt: ['jq'], name: 'tools' };
+      expect(await guard(action, { actor: actor('g'), payload }), action.action).toMatchObject({ effect: 'deny' });
+      expect(await guard(action, { actor: actor('ag-other'), payload }), action.action).toMatchObject({
+        effect: 'hold',
+      });
+    }
+  });
+});
+
+describe('recorded divergence: a module can refuse a role grant', () => {
+  it('refuses a grant a registered policy refuses, on the module writer and the ncl roles grant path', async () => {
+    const { db } = await migratedInstall();
+    const roles = await import('../modules/permissions/db/user-roles.js');
+    const { upsertUser } = await import('../modules/permissions/db/users.js');
+    const now = new Date().toISOString();
+    for (const id of ['email:sam@example.test', 'gchat:users/principal']) {
+      await upsertUser({ id, kind: id.split(':')[0]!, display_name: id, created_at: now });
+    }
+    roles.registerRoleGrantPolicy('divergence:no-email-privilege', (grant) =>
+      grant.user_id.startsWith('email:') ? 'an email identity never holds a role' : undefined,
+    );
+    const grant = (userId: string) => ({
+      user_id: userId,
+      role: 'owner' as const,
+      agent_group_id: null,
+      granted_by: null,
+      granted_at: now,
+    });
+
+    await expect(roles.grantRole(grant('email:sam@example.test'))).rejects.toThrow(
+      'an email identity never holds a role',
+    );
+    await roles.grantRole(grant('gchat:users/principal'));
+    expect(await db.getDb().all('SELECT user_id FROM user_roles')).toEqual([{ user_id: 'gchat:users/principal' }]);
+    const cli = await readFile(path.join(originalCwd, 'src/cli/resources/roles.ts'), 'utf8');
+    expect(cli).toContain('assertRoleGrantAdmitted({');
+    expect(cli.indexOf('assertRoleGrantAdmitted({')).toBeLessThan(cli.indexOf('INSERT INTO user_roles'));
   });
 });

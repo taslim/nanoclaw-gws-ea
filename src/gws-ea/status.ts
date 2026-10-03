@@ -130,6 +130,22 @@ export interface MainIdentityFacts {
 export interface ExternalEmailFacts {
   readonly agent_group_id: string | null;
 }
+/** Calendar notifications for the principal's calendars, as the inbox records turning them on. */
+export interface CalendarNotificationsView {
+  readonly state: 'unknown' | 'ok' | 'failing';
+  readonly reason: string | null;
+}
+export interface InboxFacts {
+  /** The inbox's polling, as the host records it. */
+  readonly state: 'healthy' | 'unhealthy' | null;
+  /** When it became unhealthy; null while healthy. */
+  readonly since: string | null;
+  /** When a poll last succeeded. */
+  readonly last_success_at: string | null;
+  readonly calendar_notifications: CalendarNotificationsView | null;
+  /** The principal's domains with no pinned DKIM selector: no mail from them counts as the principal's. */
+  readonly domains_without_selector: readonly string[] | null;
+}
 export interface ConnectorFacts {
   readonly drift: string | null;
 }
@@ -158,6 +174,12 @@ export interface AssistantProbes {
    * or reaching its inbox, and its OneCLI agent in selective mode.
    */
   readonly external_email: ProbeResult & ExternalEmailFacts;
+  /**
+   * The assistant's inbox as the host reports it: polling healthy, calendar
+   * notifications on for the principal's calendars, and a DKIM selector pinned
+   * for each of the principal's domains.
+   */
+  readonly inbox: ProbeResult & InboxFacts;
   /** The assistant's own Google sign-in, accepted by Google, with Calendar access in OneCLI for agents. */
   readonly workspace: ProbeResult & WorkspaceFacts;
   /** The principal binding and its queued welcome. */
@@ -177,6 +199,7 @@ export const PROBE_NAMES = [
   'onecli',
   'main_identity',
   'external_email',
+  'inbox',
   'workspace',
   'principal',
   'route',
@@ -737,6 +760,97 @@ async function externalEmailProbe(
   return { ...OK, agent_group_id: agentGroupId };
 }
 
+const INBOX_STATES = ['healthy', 'unhealthy'] as const;
+const CALENDAR_NOTIFICATION_STATES = ['unknown', 'ok', 'failing'] as const;
+
+function oneOf<T extends string>(values: readonly T[], value: unknown): value is T {
+  return typeof value === 'string' && (values as readonly string[]).includes(value);
+}
+
+function nullableString(value: unknown): value is string | null {
+  return value === null || typeof value === 'string';
+}
+
+/** The inbox's health as the host's `getInboxHealth` reports it, with every field checked. */
+interface InboxHealthReport {
+  readonly state: (typeof INBOX_STATES)[number];
+  readonly reason: string | null;
+  readonly since: string | null;
+  readonly lastSuccessAt: string | null;
+  readonly calendarNotifications: CalendarNotificationsView;
+  readonly principalDomainsWithoutSelector: readonly string[];
+}
+
+function parseInboxHealth(value: unknown): InboxHealthReport {
+  const invalid = () => new GwsEaError('invalid_child_output', 'ncl returned an invalid inbox report');
+  if (!isRecord(value) || !isRecord(value.calendarNotifications)) throw invalid();
+  const { state, reason, since, lastSuccessAt, principalDomainsWithoutSelector: domains } = value;
+  const calendar = value.calendarNotifications;
+  if (
+    !oneOf(INBOX_STATES, state) ||
+    !nullableString(reason) ||
+    !nullableString(since) ||
+    !nullableString(lastSuccessAt) ||
+    !oneOf(CALENDAR_NOTIFICATION_STATES, calendar.state) ||
+    !nullableString(calendar.reason) ||
+    !Array.isArray(domains) ||
+    !domains.every((domain): domain is string => typeof domain === 'string')
+  ) {
+    throw invalid();
+  }
+  return {
+    state,
+    reason,
+    since,
+    lastSuccessAt,
+    calendarNotifications: { state: calendar.state, reason: calendar.reason },
+    principalDomainsWithoutSelector: domains,
+  };
+}
+
+/** `clause`, followed by the host's reason when it gave one. */
+function because(clause: string, reason: string | null): string {
+  return reason ? `${clause}: ${redact(reason)}` : clause;
+}
+
+/**
+ * The assistant's inbox as the running host reports it: polling Gmail without
+ * failing, calendar notifications on for the principal's calendars, and a
+ * DKIM selector pinned for each of the principal's domains. Until one is
+ * pinned for a domain, no mail from it counts as the principal's, so the
+ * operator is told how to pin it.
+ */
+async function inboxProbe(subject: Subject): Promise<ProbeResult & InboxFacts> {
+  const runtime = requireRuntime(subject.runtime);
+  const health = parseInboxHealth(unwrapData(await subject.observers.ncl(runtime, ['gws-ea-inbox', 'health'])));
+  const facts: InboxFacts = {
+    state: health.state,
+    since: health.since,
+    last_success_at: health.lastSuccessAt,
+    calendar_notifications: health.calendarNotifications,
+    domains_without_selector: health.principalDomainsWithoutSelector,
+  };
+  const problems: string[] = [];
+  if (health.state === 'unhealthy') problems.push(because('the inbox is unhealthy', health.reason));
+  const calendar = health.calendarNotifications;
+  if (calendar.state === 'failing') {
+    problems.push(
+      because("calendar notifications for the principal's calendars could not be turned on", calendar.reason),
+    );
+  } else if (calendar.state === 'unknown') {
+    problems.push(because("calendar notifications for the principal's calendars are not on yet", calendar.reason));
+  }
+  for (const domain of health.principalDomainsWithoutSelector) {
+    problems.push(
+      `no DKIM selector is pinned for ${domain}, so no mail from it counts as the principal's; ` +
+        `pin one with gws-ea ncl --id ${subject.reservation.instance_id} -- dkim-selectors pin --domain ${domain} --selector <s>, ` +
+        `where <s> is the s= of Gmail's dkim=pass result on mail the principal sent the assistant`,
+    );
+  }
+  if (problems.length > 0) return { status: 'degraded', reason: problems.map(sentence).join(' '), ...facts };
+  return { ...OK, ...facts };
+}
+
 /** The assistant's own Google sign-in, as `connect_google` left it and Google still accepts it. */
 async function workspaceProbe({
   reservation,
@@ -1010,6 +1124,7 @@ export async function observeAssistantStatus(
     onecli,
     mainIdentity,
     externalEmail,
+    inbox,
     workspace,
     principal,
     route,
@@ -1025,6 +1140,13 @@ export async function observeAssistantStatus(
     probe(() => onecliProbe(subject), {}),
     probe<MainIdentityFacts>(() => mainIdentityProbe(subject, main, agents), { agent_group_id: null }),
     probe<ExternalEmailFacts>(() => externalEmailProbe(subject, agents), { agent_group_id: null }),
+    probe<InboxFacts>(() => inboxProbe(subject), {
+      state: null,
+      since: null,
+      last_success_at: null,
+      calendar_notifications: null,
+      domains_without_selector: null,
+    }),
     probe<WorkspaceFacts>(() => workspaceProbe(subject), { account: null }),
     probe(() => principalProbe(subject), {}),
     probe(() => routeProbe(subject), {}),
@@ -1059,6 +1181,7 @@ export async function observeAssistantStatus(
       onecli,
       main_identity: mainIdentity,
       external_email: externalEmail,
+      inbox,
       workspace,
       principal,
       route,
@@ -1234,6 +1357,10 @@ function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes
       return probes.main_identity.agent_group_id ?? '';
     case 'external_email':
       return probes.external_email.agent_group_id ?? '';
+    case 'inbox': {
+      const polled = probes.inbox.last_success_at;
+      return polled ? `last polled ${formatLocalTime(polled, timezone)}` : '';
+    }
     case 'workspace':
       return probes.workspace.account ?? '';
     case 'connector':
@@ -1308,8 +1435,9 @@ export const STATUS_USAGE: readonly string[] = [
   '       tool_commit, behind_tool_release), rollback (available, previous_commit, schema_moved),',
   '       templates (customized: surface, name, change changed|deleted|added; reason), schema',
   '       (central_fingerprint, session_fingerprint, latest_migration),',
-  '       probes: checkout, service, host, onecli, main_identity, external_email, workspace (account), principal, route,',
-  '       connector (managed Cloudflare only, with drift), delivery; each probe has status ok|degraded|unknown and a reason.',
+  '       probes: checkout, service, host, onecli, main_identity, external_email, inbox (state, since, last_success_at,',
+  '       calendar_notifications, domains_without_selector), workspace (account), principal, route, connector (managed',
+  '       Cloudflare only, with drift), delivery; each probe has status ok|degraded|unknown and a reason.',
   '       list and status exit 0 once they observed, whatever the health; status exits 1 for an unknown ID.',
 ];
 

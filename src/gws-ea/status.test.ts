@@ -438,6 +438,8 @@ function ncl(state: World): StatusObservers['ncl'] {
         return { main_agent_group_id: MAIN, assistant_display_name: 'Aya' };
       case 'gws-ea-external-email health':
         return { agent_group_id: EXTERNAL_EMAIL, problems: [] };
+      case 'gws-ea-inbox health':
+        return HEALTHY_INBOX;
       case `groups get --id ${MAIN}`:
         return { id: MAIN, name: 'main' };
       case `groups config get --id ${MAIN}`:
@@ -449,6 +451,17 @@ function ncl(state: World): StatusObservers['ncl'] {
     }
   };
 }
+
+/** The inbox as the host's `getInboxHealth` reports a working one. */
+const HEALTHY_INBOX = {
+  state: 'healthy',
+  reason: null,
+  since: null,
+  lastSuccessAt: '2026-09-28T14:29:00.000Z',
+  consecutiveFailures: 0,
+  calendarNotifications: { state: 'ok', reason: null },
+  principalDomainsWithoutSelector: [],
+} as const;
 
 /** OneCLI's agents: main granted every secret, external-email in selective mode. */
 const ONECLI_AGENTS = [
@@ -570,6 +583,15 @@ describe('status', () => {
     expect(status.probes.checkout).toMatchObject({ commit: host.release });
     expect(status.probes.service).toMatchObject({ state: 'running' });
     expect(status.probes.main_identity).toMatchObject({ agent_group_id: MAIN });
+    expect(status.probes.inbox).toEqual({
+      status: 'ok',
+      reason: null,
+      state: 'healthy',
+      since: null,
+      last_success_at: HEALTHY_INBOX.lastSuccessAt,
+      calendar_notifications: { state: 'ok', reason: null },
+      domains_without_selector: [],
+    });
     // A shared connector's drift is reported, never counted against this assistant (KTD11).
     expect(status.probes.connector).toEqual({ status: 'ok', reason: null, drift: CONNECTOR_DRIFT });
     expect(status.probes.delivery).toMatchObject({
@@ -738,6 +760,86 @@ describe('status', () => {
     for (const name of Object.keys(missing.status.probes).filter((probe) => probe !== 'external_email')) {
       expect(missing.status.probes[name], name).toMatchObject({ status: 'ok' });
     }
+  });
+
+  it('reports the inbox as the host reports it, degraded while it fails, calendar news is off, or a domain has no selector', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    await bound(host.paths, reservation.instance_id);
+    const state = world(reservation);
+    const healthy = healthyObservers(state);
+    const reporting = (health: unknown) => ({
+      ...healthy,
+      ncl: (async (runtime, args) =>
+        args.join(' ') === 'gws-ea-inbox health'
+          ? health
+          : healthy.ncl(runtime, args)) satisfies StatusObservers['ncl'],
+    });
+
+    const ok = command(host, state);
+    await runStatusCommand(ok.runtime, { instanceId: reservation.instance_id, json: false });
+    expect(ok.output.stdout).toContainEqual(expect.stringMatching(/^ {2}ok {8}inbox {11}last polled /u));
+
+    const unhealthySince = '2026-09-28T13:00:00.000Z';
+    const failing = await statusJson(
+      host,
+      state,
+      reservation.instance_id,
+      reporting({
+        ...HEALTHY_INBOX,
+        state: 'unhealthy',
+        reason: 'Gmail answered 401',
+        since: unhealthySince,
+        calendarNotifications: { state: 'failing', reason: 'the calendar list refused the change' },
+        principalDomainsWithoutSelector: ['example.com'],
+      }),
+    );
+    expect(failing.status.probes.inbox).toEqual({
+      status: 'degraded',
+      reason:
+        'The inbox is unhealthy: Gmail answered 401. ' +
+        "Calendar notifications for the principal's calendars could not be turned on: the calendar list refused the change. " +
+        "No DKIM selector is pinned for example.com, so no mail from it counts as the principal's; " +
+        `pin one with gws-ea ncl --id ${reservation.instance_id} -- dkim-selectors pin --domain example.com --selector <s>, ` +
+        "where <s> is the s= of Gmail's dkim=pass result on mail the principal sent the assistant.",
+      state: 'unhealthy',
+      since: unhealthySince,
+      last_success_at: HEALTHY_INBOX.lastSuccessAt,
+      calendar_notifications: { state: 'failing', reason: 'the calendar list refused the change' },
+      domains_without_selector: ['example.com'],
+    });
+    for (const name of Object.keys(failing.status.probes).filter((probe) => probe !== 'inbox')) {
+      expect(failing.status.probes[name], name).toMatchObject({ status: 'ok' });
+    }
+
+    // Before the host first turns calendar notifications on, the inbox is not yet whole.
+    const calendarPending = await statusJson(
+      host,
+      state,
+      reservation.instance_id,
+      reporting({ ...HEALTHY_INBOX, calendarNotifications: { state: 'unknown', reason: null } }),
+    );
+    expect(calendarPending.status.probes.inbox).toMatchObject({
+      status: 'degraded',
+      reason: "Calendar notifications for the principal's calendars are not on yet.",
+      state: 'healthy',
+    });
+
+    const invalid = await statusJson(
+      host,
+      state,
+      reservation.instance_id,
+      reporting({ ...HEALTHY_INBOX, principalDomainsWithoutSelector: 'example.com' }),
+    );
+    expect(invalid.status.probes.inbox).toEqual({
+      status: 'degraded',
+      reason: 'ncl returned an invalid inbox report',
+      state: null,
+      since: null,
+      last_success_at: null,
+      calendar_notifications: null,
+      domains_without_selector: null,
+    });
   });
 
   it("reports an assistant behind the tool's release with both commits", async () => {
@@ -1275,6 +1377,9 @@ describe('help', () => {
       'schema_moved',
       'customized',
       'drift',
+      'last_success_at',
+      'calendar_notifications',
+      'domains_without_selector',
     ]) {
       expect(help, field).toContain(field);
     }

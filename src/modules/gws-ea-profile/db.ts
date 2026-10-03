@@ -229,6 +229,39 @@ async function assistantWorkspaceEmail(): Promise<string | null> {
   return profile?.assistant_workspace_email ?? null;
 }
 
+/**
+ * `value` as the profile would hold it, refused when it is malformed or the
+ * assistant's own address; `held` says whether the profile holds it already.
+ */
+export async function proposedPrincipalAddress(
+  value: string,
+): Promise<{ readonly email: string; readonly held: boolean }> {
+  const email = principalEmail(value);
+  assertNotAssistant(email, await assistantWorkspaceEmail());
+  const row = await getDb().get<{ present: number }>(
+    'SELECT 1 AS present FROM gws_ea_principal_addresses WHERE email = ?',
+    email,
+  );
+  return { email, held: row !== undefined };
+}
+
+/**
+ * The verified principal user who confirms a change on a card: the most
+ * recently verified one with a direct message to receive it. Undefined until
+ * a principal is bound.
+ */
+export async function principalApproverUserId(): Promise<string | undefined> {
+  const row = await getDb().get<{ user_id: string }>(
+    `SELECT principal.user_id
+       FROM gws_ea_principal_users principal
+       JOIN user_dms dm ON dm.user_id = principal.user_id
+       JOIN messaging_groups direct ON direct.id = dm.messaging_group_id
+      ORDER BY principal.verified_at DESC, dm.resolved_at DESC
+      LIMIT 1`,
+  );
+  return row?.user_id;
+}
+
 /** Add one of the principal's addresses; adding one the profile already holds changes nothing. */
 export async function addPrincipalAddress(value: string): Promise<{ readonly email: string; readonly added: boolean }> {
   const email = principalEmail(value);

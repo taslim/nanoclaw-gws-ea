@@ -135,6 +135,9 @@ async function releaseFixture(): Promise<string> {
   await write(root, 'src/modules/gws-ea-inbox/index.ts', 'export {};\n');
   await write(root, 'src/modules/gws-ea-inbox/migration.ts', 'export {};\n');
   await write(root, 'container/agent-runner/src/mcp-tools/files-send.instructions.md', '# files-send\n');
+  await write(root, 'container/agent-runner/src/mcp-tools/connect.instructions.md', '# connect\n');
+  await write(root, 'container/agent-runner/src/mcp-tools/memory.instructions.md', '# memory\n');
+  await write(root, 'container/agent-runner/src/memory/sealed.ts', 'export {};\n');
   await write(root, 'templates/gws-ea/main/skills/welcome/SKILL.md', '# Welcome\n');
   await write(root, 'bin/ncl', '#!/usr/bin/env bash\nexit 0\n');
   await write(root, 'bin/gws-ea', '#!/usr/bin/env bash\nexit 0\n');
@@ -299,6 +302,13 @@ describe('release preflight', () => {
     ['external-email guidance', 'src/modules/gws-ea-external-email/guidance.md', 'incomplete_release'],
     ['GWS-EA inbox', 'src/modules/gws-ea-inbox/index.ts', 'incomplete_release'],
     ['GWS-EA inbox migration', 'src/modules/gws-ea-inbox/migration.ts', 'incomplete_release'],
+    [
+      'account-connection instructions',
+      'container/agent-runner/src/mcp-tools/connect.instructions.md',
+      'incomplete_release',
+    ],
+    ['memory instructions', 'container/agent-runner/src/mcp-tools/memory.instructions.md', 'incomplete_release'],
+    ['sealed-session runner rule', 'container/agent-runner/src/memory/sealed.ts', 'incomplete_release'],
     ['GWS-EA welcome', 'templates/gws-ea/main/skills/welcome/SKILL.md', 'incomplete_release'],
     ['GWS-EA guidance', 'src/modules/gws-ea-main/guidance.md', 'incomplete_release'],
     ['GWS-EA Google access', 'src/modules/gws-ea-google/index.ts', 'incomplete_release'],

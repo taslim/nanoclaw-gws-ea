@@ -21,6 +21,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import { registerChannelAdapter } from '../../channels/channel-registry.js';
 import { registerResource, type ColumnDef } from '../../cli/crud.js';
+import { register } from '../../cli/registry.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { registerDeliveryFailedHook, registerPostDeliveryHook } from '../../delivery.js';
@@ -29,6 +30,7 @@ import { onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
 import type { OutboundMessage } from '../../mailbox/index.js';
 import { getExternalEmailAgentGroupId } from '../gws-ea-external-email/index.js';
+import { getInboxHealth } from './health.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
 import { identityMatchKey } from '../gws-ea-people/fingerprint.js';
@@ -213,6 +215,21 @@ registerResource({
       },
     },
   },
+});
+
+// What status reads, from the host only: `getInboxHealth()` exactly as follow-through reads it.
+register({
+  name: 'gws-ea-inbox-health',
+  description:
+    "Report the inbox's health, calendar notifications, and the principal's domains with no pinned DKIM selector.",
+  access: 'hidden',
+  hostOnly: true,
+  parseArgs(raw) {
+    const unknown = Object.keys(raw);
+    if (unknown.length > 0) throw new Error(`Unknown inbox field: --${unknown[0]}`);
+    return undefined;
+  },
+  handler: async () => getInboxHealth(),
 });
 
 // ---------------------------------------------------------------------------
