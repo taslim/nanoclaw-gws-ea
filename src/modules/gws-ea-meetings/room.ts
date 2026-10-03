@@ -58,7 +58,7 @@ import {
   writeMeetingNote,
   type RoomCandidate,
 } from './notes.js';
-import { eventSpan, slotIdFor, type Span } from './slots.js';
+import { eventSpan, iso, slotIdFor, type Span } from './slots.js';
 
 /** At most this many candidates go to main: it weighs a few, never a calendar's worth. */
 const MAX_CANDIDATES = 5;
@@ -71,10 +71,6 @@ export interface RoomDeps {
   readonly openTimes: (meeting: Meeting, range: Span, ignore: readonly EventRef[]) => Promise<Span[]>;
   /** Hold offered slots for a meeting, as its own `hold` does; refused when one is no longer open. */
   readonly holdSlots: (meeting: Meeting, slotIds: readonly string[]) => Promise<unknown>;
-}
-
-function iso(instant: number): string {
-  return new Date(instant).toISOString();
 }
 
 /** Whether `level` matters less to the principal than `than`. */

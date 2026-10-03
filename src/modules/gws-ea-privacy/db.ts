@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 
 import { getDb } from '../../db/connection.js';
-import { hasControlCharacters } from '../../gws-ea/validation.js';
+import { hasControlCharacters, parseLine } from '../../gws-ea/validation.js';
 import {
   canonicalText,
   HISTORY_DIGIT_LENGTH,
@@ -23,7 +23,7 @@ export interface PrivateValue {
 }
 
 /** Unvalidated caller input: the store checks each field. */
-export interface AddPrivateValueInput {
+interface AddPrivateValueInput {
   readonly label: string;
   readonly kind: string;
   readonly value: string;
@@ -35,14 +35,6 @@ function parseKind(value: string): PrivateValueKind {
   const kind = PRIVATE_VALUE_KINDS.find((candidate) => candidate === value);
   if (!kind) throw new Error(`Kind ${JSON.stringify(value)} is invalid: use ${PRIVATE_VALUE_KINDS.join(', ')}`);
   return kind;
-}
-
-function parseLabel(value: string): string {
-  const label = value.trim();
-  if (!label || label.length > LABEL_MAX_LENGTH || hasControlCharacters(label)) {
-    throw new Error(`Label must be one line of 1 to ${LABEL_MAX_LENGTH} characters`);
-  }
-  return label;
 }
 
 function parseValue(kind: PrivateValueKind, value: string): string {
@@ -85,7 +77,7 @@ export async function addPrivateValue(
   input: AddPrivateValueInput,
 ): Promise<PrivateValue & { readonly added: boolean }> {
   const kind = parseKind(input.kind);
-  const label = parseLabel(input.label);
+  const label = parseLine(input.label, 'Label', LABEL_MAX_LENGTH);
   const value = parseValue(kind, input.value);
   const key = valueKey(kind, value);
   const db = getDb();

@@ -12,15 +12,13 @@
  * A note's id derives from what it reports, so writing it again is a no-op.
  */
 import { resolveGroupTimezone } from '../../container-config.js';
-import { isUniqueViolation } from '../../db/errors.js';
-import { getSession } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { requestWake } from '../../request-wake.js';
-import { resolveSession, writeSessionMessage } from '../../session-manager.js';
+import { writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from '../gws-ea-inbox/index.js';
-import { principalContact } from '../gws-ea-privacy/audience.js';
 import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { isDuplicateNote, writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import type { Meeting, MeetingKind, MeetingLevel, Outcome } from './db.js';
 
 export const OUTCOME_NOTE_TYPE = 'gws-ea-meetings.outcome';
@@ -81,10 +79,6 @@ export interface OutcomeNote {
   readonly unanswered?: true;
 }
 
-function isDuplicateNote(error: unknown): boolean {
-  return isUniqueViolation(error) && error instanceof Error && /messages_in\.id\b/iu.test(error.message);
-}
-
 /** Who a meeting is with, for a note: each name and address. */
 export function who(meeting: { readonly counterparts: readonly NoteCounterpart[] }): string {
   return meeting.counterparts
@@ -115,29 +109,22 @@ export async function writeMainNote<Note extends { readonly type: string; readon
   text: string,
   at: string,
 ): Promise<void> {
-  const mainAgentGroupId = await requireMainAgentGroupId();
-  const principal = await principalContact();
-  if (principal === undefined) throw new Error('There is no principal direct message to report the meeting to');
-  const { directMessage } = principal;
-  const { session } = await resolveSession(mainAgentGroupId, directMessage.id, null, 'agent-shared');
-  try {
-    await writeSessionMessage(mainAgentGroupId, session.id, {
-      id,
-      kind: 'chat',
-      timestamp: at,
-      platformId: directMessage.platform_id,
-      channelType: directMessage.channel_type,
-      threadId: null,
-      content: JSON.stringify({ text, sender: 'system', senderId: 'system', note }),
-      trigger: true,
-    });
-  } catch (error) {
-    if (!isDuplicateNote(error)) throw error;
-    log.info('Meeting note already written', { meetingId: note.meeting_id, type: note.type });
-    return;
+  const result = await writeNoteForMain({ id, timestamp: at, text, fields: { note }, wake: true });
+  switch (result) {
+    case 'no-main':
+      throw new Error('There is no main agent to report the meeting to');
+    case 'no-principal':
+      throw new Error('There is no principal direct message to report the meeting to');
+    case 'already-written':
+      log.info('Meeting note already written', { meetingId: note.meeting_id, type: note.type });
+      return;
+    case 'written':
+      return;
+    default: {
+      const unreachable: never = result;
+      throw new Error(`Unknown note result: ${String(unreachable)}`);
+    }
   }
-  const fresh = await getSession(session.id);
-  if (fresh) await requestWake(fresh, 'inbound-message');
 }
 
 /** Write how a meeting ended into main's shared session, once per meeting and outcome. */

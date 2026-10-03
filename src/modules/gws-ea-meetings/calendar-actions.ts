@@ -90,6 +90,7 @@ import {
   blocksTime,
   eventSpan,
   isOpen,
+  iso,
   localDaySpan,
   openSlots,
   parseClock,
@@ -97,6 +98,7 @@ import {
   READ_MARGIN_MS,
   schedulingRules,
   slotIdFor,
+  usesPersonalHours,
   zonedInstant,
   type LocalDate,
   type SchedulingRules,
@@ -159,10 +161,6 @@ function bookingEventId(meetingId: string): string {
 
 function domainOf(address: string): string {
   return address.slice(address.lastIndexOf('@') + 1).toLowerCase();
-}
-
-function iso(instant: number): string {
-  return new Date(instant).toISOString();
 }
 
 function slotSpan(slot: { readonly start_at: string; readonly end_at: string }): Span {
@@ -296,7 +294,7 @@ function freeTimeHeading(meeting: Meeting, proposedOpen: boolean | undefined, fo
   }
   if (found) return `Open times for meeting ${meeting.id}, best first:`;
   if (oneDay) return 'Nothing is open that day: call free_time without a date for other days.';
-  return meeting.level === 'inner-circle' || meeting.level === 'close'
+  return usesPersonalHours(meeting.level)
     ? "Nothing in the meeting's window is open. Report needs-room with outcome."
     : "Nothing in the meeting's window is open: report gave-up with outcome, so main can tell the principal.";
 }
@@ -348,8 +346,11 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     const busy: Span[] = [];
     const room = await getRoomMadeBy(meeting.id);
     if (room?.state === 'reserved') busy.push({ start: Date.parse(room.start_at), end: Date.parse(room.end_at) });
-    for (const calendarId of await calendarsOf(meeting)) {
-      for (const event of await calendar().listEvents(calendarId, from, to)) {
+    const listings = await Promise.all(
+      (await calendarsOf(meeting)).map((calendarId) => calendar().listEvents(calendarId, from, to)),
+    );
+    for (const events of listings) {
+      for (const event of events) {
         if (isOwn(event) || !blocksTime(event, view.book.principal)) continue;
         const taken = eventSpan(event, view.timezone);
         if (taken) busy.push(taken);
@@ -425,6 +426,23 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     recordOwnCalendarChange(calendarId, eventId);
   }
 
+  /**
+   * Move an existing event to the slot's time, in place, unless it is there
+   * already. Only the time changes: the principal's own title, place and
+   * notes stay as they are, and Google sends the attendees the update. False
+   * when the event is no longer on the calendar.
+   */
+  async function moveEvent(calendarId: string, eventId: string, slot: OfferedSlot, timezone: string): Promise<boolean> {
+    const current = await calendar().getEvent(calendarId, eventId);
+    if (!current || current.status === 'cancelled') return false;
+    const span = eventSpan(current, timezone);
+    if (!span || span.start !== Date.parse(slot.start_at) || span.end !== Date.parse(slot.end_at)) {
+      await calendar().patchEvent(calendarId, eventId, { start: slot.start_at, end: slot.end_at }, 'all');
+      recordOwnCalendarChange(calendarId, eventId);
+    }
+    return true;
+  }
+
   /** Delete one recorded hold, if its event still carries this meeting's tag; then forget the record. */
   async function removeHold(hold: Hold): Promise<void> {
     const event = await calendar().getEvent(hold.calendar_id, hold.event_id);
@@ -475,20 +493,8 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
       if (meeting.event_calendar_id === null || meeting.event_id === null) {
         throw new Error(`Reschedule ${meeting.id} names no event`);
       }
-      const current = await calendar().getEvent(meeting.event_calendar_id, meeting.event_id);
-      if (!current || current.status === 'cancelled') {
+      if (!(await moveEvent(meeting.event_calendar_id, meeting.event_id, slot, view.timezone))) {
         throw refused('The event this meeting moves is no longer on the calendar: report gave-up with outcome.');
-      }
-      const span = eventSpan(current, view.timezone);
-      if (!span || span.start !== Date.parse(slot.start_at) || span.end !== Date.parse(slot.end_at)) {
-        // Only the time changes: the principal's own title, place and notes stay as they are.
-        await calendar().patchEvent(
-          meeting.event_calendar_id,
-          meeting.event_id,
-          { start: slot.start_at, end: slot.end_at },
-          'all',
-        );
-        recordOwnCalendarChange(meeting.event_calendar_id, meeting.event_id);
       }
       return {
         meeting_id: meeting.id,
@@ -805,21 +811,10 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     if (closed.length > 0) {
       throw refused(`${slot.slot_id} is no longer open: call free_time again for times to offer instead.`);
     }
-    const current = await calendar().getEvent(existing.calendar_id, existing.event_id);
-    if (!current || current.status === 'cancelled') {
+    if (!(await moveEvent(existing.calendar_id, existing.event_id, slot, view.timezone))) {
       throw refused(
         'The booked event is no longer on the principal’s calendar, so there is nothing to move. Tell them so, and offer nothing.',
       );
-    }
-    const span = eventSpan(current, view.timezone);
-    if (!span || span.start !== Date.parse(slot.start_at) || span.end !== Date.parse(slot.end_at)) {
-      await calendar().patchEvent(
-        existing.calendar_id,
-        existing.event_id,
-        { start: slot.start_at, end: slot.end_at },
-        'all',
-      );
-      recordOwnCalendarChange(existing.calendar_id, existing.event_id);
     }
     const timezone = await mainTimezone();
     const minutes = Math.round((Date.parse(slot.end_at) - Date.parse(slot.start_at)) / MINUTE);

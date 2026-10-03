@@ -3,7 +3,7 @@
  * table holds). Nothing here talks to Google, a session, or the inbox.
  */
 import { getDb } from '../../db/connection.js';
-import { identityMatchKey } from '../gws-ea-people/fingerprint.js';
+import { identityMatchKey } from '../../gws-ea/validation.js';
 import { PERSON_LEVELS, type PersonLevel } from '../gws-ea-people/db.js';
 
 export const MEETING_KINDS = ['arrange', 'reschedule', 'ask_organizer'] as const;

@@ -1097,10 +1097,23 @@ function sessionHostContract(provider: string, capabilities: readonly string[]):
  * start as a group's copy is at group init.
  */
 async function realizeSessionSurfaces(
-  ...args: Parameters<typeof realizeProviderSpawnSurfaces>
+  provider: string,
+  contract: ProviderHostContract,
+  agentGroupId: string,
+  groupDir: string,
+  sessionDirectory: string,
+  selectedSkills: readonly string[],
+  actions: Parameters<typeof realizeProviderSpawnSurfaces>[6],
 ): Promise<ProviderSpawnRealization> {
-  const realization = await realizeProviderSpawnSurfaces(...args);
-  const [, contract, agentGroupId, , sessionDirectory] = args;
+  const realization = await realizeProviderSpawnSurfaces(
+    provider,
+    contract,
+    agentGroupId,
+    groupDir,
+    sessionDirectory,
+    selectedSkills,
+    actions,
+  );
   for (const file of contract.files) {
     const prepare = file.prepare;
     if (prepare.operation !== 'create-if-missing') continue;

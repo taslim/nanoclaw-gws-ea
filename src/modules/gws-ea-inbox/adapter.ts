@@ -1,5 +1,5 @@
 /**
- * Robin's inbox as a NanoClaw channel adapter (KTD4). Inbound, it polls
+ * The assistant's inbox as a NanoClaw channel adapter (KTD4). Inbound, it polls
  * Gmail's history each minute for messages added to INBOX and routes each one
  * (routing.ts); outbound, `deliver` sends a thread's reply (outbound.ts).
  *

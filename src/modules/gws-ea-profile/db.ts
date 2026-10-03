@@ -1,7 +1,10 @@
+import type { CallerContext } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
+import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { EMAIL_PATTERN, hasControlCharacters, normalizePrincipalEmail } from '../../gws-ea/validation.js';
 import { isValidTimezone } from '../../timezone.js';
-import { identityMatchKey } from '../gws-ea-people/fingerprint.js';
+import type { MessagingGroup } from '../../types.js';
+import { removeMatchingIdentities } from '../gws-ea-people/db.js';
 
 export interface GwsEaProfile {
   readonly assistant_display_name: string | null;
@@ -113,6 +116,19 @@ export async function getMainAgentGroupId(): Promise<string | null> {
   return row?.main_agent_group_id ?? null;
 }
 
+/**
+ * Refuse every caller but the host and the canonical main. A resource's
+ * guard admits any agent whose CLI scope reaches it, so a resource that is
+ * main's alone checks here; `resource` names it in the refusal.
+ */
+export async function assertMainCaller(ctx: CallerContext, resource: string): Promise<void> {
+  if (ctx.caller === 'host') return;
+  const mainAgentGroupId = await getMainAgentGroupId();
+  if (mainAgentGroupId === null || ctx.agentGroupId !== mainAgentGroupId) {
+    throw new Error(`The principal's ${resource} are available only to main`);
+  }
+}
+
 /** `external-email`'s agent group, or null until the host creates it. */
 export async function getExternalEmailAgentGroupId(): Promise<string | null> {
   const row = await getDb().get<{ external_email_agent_group_id: string | null }>(
@@ -171,9 +187,7 @@ async function holdPrincipalAddress(email: string, addedAt: string): Promise<boo
     email,
     addedAt,
   );
-  if (await db.hasTable('gws_ea_people_identities')) {
-    await db.run('DELETE FROM gws_ea_people_identities WHERE match_key = ?', identityMatchKey(`email:${email}`));
-  }
+  await removeMatchingIdentities(`email:${email}`);
   return result.changes > 0;
 }
 
@@ -245,21 +259,45 @@ export async function proposedPrincipalAddress(
   return { email, held: row !== undefined };
 }
 
+/** A verified principal identity and its direct message with the assistant. */
+export interface PrincipalContact {
+  readonly userId: string;
+  readonly directMessage: MessagingGroup;
+}
+
 /**
- * The verified principal user who confirms a change on a card: the most
- * recently verified one with a direct message to receive it. Undefined until
- * a principal is bound.
+ * Where the principal is reached: the most recently verified principal
+ * identity whose direct message the assistant is still in. While every such
+ * message is detached, the most recent one, so a note for main keeps its
+ * route; whoever sends to it checks `detached_at` first. Undefined until a
+ * principal is bound with a direct message.
  */
-export async function principalApproverUserId(): Promise<string | undefined> {
-  const row = await getDb().get<{ user_id: string }>(
-    `SELECT principal.user_id
+export async function principalContact(): Promise<PrincipalContact | undefined> {
+  const db = getDb();
+  if (!(await db.hasTable('gws_ea_principal_users'))) return undefined;
+  const row = await db.get<{ user_id: string; messaging_group_id: string }>(
+    `SELECT principal.user_id, dm.messaging_group_id
        FROM gws_ea_principal_users principal
        JOIN user_dms dm ON dm.user_id = principal.user_id
        JOIN messaging_groups direct ON direct.id = dm.messaging_group_id
-      ORDER BY principal.verified_at DESC, dm.resolved_at DESC
+      ORDER BY CASE WHEN direct.detached_at IS NULL OR direct.detached_at = '' THEN 0 ELSE 1 END,
+               principal.verified_at DESC, dm.resolved_at DESC
       LIMIT 1`,
   );
-  return row?.user_id;
+  if (!row) return undefined;
+  const directMessage = await getMessagingGroup(row.messaging_group_id);
+  return directMessage ? { userId: row.user_id, directMessage } : undefined;
+}
+
+/**
+ * The verified principal user who confirms a change on a card: the one
+ * `principalContact` names, while the card can reach their direct message.
+ * Undefined until a principal is bound, or while every direct message of
+ * theirs is detached.
+ */
+export async function principalApproverUserId(): Promise<string | undefined> {
+  const contact = await principalContact();
+  return contact && !contact.directMessage.detached_at ? contact.userId : undefined;
 }
 
 /** Add one of the principal's addresses; adding one the profile already holds changes nothing. */

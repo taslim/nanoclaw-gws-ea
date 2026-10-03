@@ -31,7 +31,7 @@ import { writeActionResponse } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { registerDeliveryAction } from '../../delivery.js';
-import type { DeliveryGuardSpec, GuardedDeliveryHandler } from '../../delivery-guard.js';
+import type { DeliveryGuardSpec } from '../../delivery-guard.js';
 import type { GuardedAction } from '../../guard/index.js';
 import { onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
@@ -126,26 +126,24 @@ function guardSpec(guardAction: GuardedAction): DeliveryGuardSpec {
   };
 }
 
-const MAIN_REQUESTS: ReadonlyArray<readonly [string, GuardedDeliveryHandler]> = [
-  ['meeting_arrange', handoff.arrange],
-  ['meeting_reschedule', handoff.reschedule],
-  ['meeting_ask_organizer', handoff.askOrganizer],
-  ['meeting_cancel', handoff.cancel],
-  ['meeting_amend', handoff.amend],
+/** Every request, by action name, with its guard; each is answered once (`answering`). */
+const REQUESTS: ReadonlyArray<readonly [string, Handle, GuardedAction]> = [
+  // main's
+  ['meeting_arrange', handoff.arrange, meetingRequestAction],
+  ['meeting_reschedule', handoff.reschedule, meetingRequestAction],
+  ['meeting_ask_organizer', handoff.askOrganizer, meetingRequestAction],
+  ['meeting_cancel', handoff.cancel, meetingRequestAction],
+  ['meeting_amend', handoff.amend, meetingRequestAction],
+  // external-email's outcome, and its calendar tools
+  ['meeting_outcome', handoff.outcome, meetingOutcomeAction],
+  [FREE_TIME_ACTION, actions.freeTime, meetingCalendarAction],
+  ['meeting_hold', actions.hold, meetingCalendarAction],
+  ['meeting_release_holds', actions.releaseHoldsRequest, meetingCalendarAction],
+  ['meeting_book', actions.book, meetingCalendarAction],
 ];
 
-/** external-email's calendar tools, each answered once like every request. */
-const CALENDAR_REQUESTS: ReadonlyArray<readonly [string, Handle]> = [
-  [FREE_TIME_ACTION, actions.freeTime],
-  ['meeting_hold', actions.hold],
-  ['meeting_release_holds', actions.releaseHoldsRequest],
-  ['meeting_book', actions.book],
-];
-
-for (const [action, handler] of MAIN_REQUESTS) registerDeliveryAction(action, handler, guardSpec(meetingRequestAction));
-registerDeliveryAction('meeting_outcome', handoff.outcome, guardSpec(meetingOutcomeAction));
-for (const [action, handle] of CALENDAR_REQUESTS) {
-  registerDeliveryAction(action, answering(action, handle), guardSpec(meetingCalendarAction));
+for (const [action, handle, guardAction] of REQUESTS) {
+  registerDeliveryAction(action, answering(action, handle), guardSpec(guardAction));
 }
 
 registerPersonForgetHook('gws-ea-meetings:purge', (person) => handoff.forgetPerson(person));

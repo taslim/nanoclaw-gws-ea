@@ -37,6 +37,7 @@ import type { CallerContext } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
+import { setMessagingGroupDetachedAt } from '../../db/messaging-groups.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { setDeliveryAdapter } from '../../delivery.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
@@ -281,6 +282,44 @@ describe('a new principal address once the inbox exists', () => {
     });
     expect(await addresses()).not.toContain(NEW_ADDRESS);
     expect(await pendingApprovals()).toEqual([]);
+  });
+
+  it('sends the card to a principal identity whose direct message still has the assistant, never a detached one', async () => {
+    const later = 'gchat:users/principal-later';
+    await createMessagingGroup({
+      id: 'mg-dm-later',
+      channel_type: DM.channelType,
+      platform_id: 'gchat:spaces/dm-later',
+      name: 'Principal',
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+    await upsertUser({ id: later, kind: 'gchat', display_name: 'Taslim', created_at: now() });
+    await bindVerifiedPrincipalUser(later, new Date(Date.now() + 60_000).toISOString());
+    await upsertUserDm({
+      user_id: later,
+      channel_type: 'gchat',
+      messaging_group_id: 'mg-dm-later',
+      resolved_at: now(),
+    });
+    await setMessagingGroupDetachedAt('mg-dm-later', now());
+
+    await run('principal-addresses-add', { email: NEW_ADDRESS }, agent(main));
+    const [approval] = await pendingApprovals();
+    expect(approval).toMatchObject({ approver_user_id: PRINCIPAL, platform_id: DM.platformId });
+    expect(sent.map((card) => card.platformId)).toEqual([DM.platformId]);
+  });
+
+  it("refuses a new address while the principal's only direct message is detached", async () => {
+    await setMessagingGroupDetachedAt('mg-dm', now());
+
+    expect(await run('principal-addresses-add', { email: NEW_ADDRESS }, agent(main))).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/No verified principal/) },
+    });
+    expect(await pendingApprovals()).toEqual([]);
+    expect(sent).toEqual([]);
   });
 
   it('drops an approval whose clicker is no longer the verified principal, keeping the address out', async () => {

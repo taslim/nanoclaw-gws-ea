@@ -916,31 +916,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     if (live) throw refused(`Meeting ${live.id} is already working on that event: amend or cancel it instead`);
     const room = roomForId === undefined ? undefined : await roomFor(roomForId, bookingCalendarId, eventId);
     const counterparts = await Promise.all(addresses.map((address) => counterpartForAddress(address)));
-
-    // A meeting the assistant booked keeps its thread: the new job continues there.
-    const booked = await findBookedMeetingForEvent(bookingCalendarId, eventId);
-    const bookedSession = booked?.session_id ? await getSession(booked.session_id) : undefined;
-    const bookedThread = booked ? await getThreadParticipants(booked.thread_key) : undefined;
-    if (booked && bookedSession?.status === 'active' && bookedThread?.state === 'open') {
-      const meeting = await createMeeting({
-        kind: 'reschedule',
-        session,
-        requestId,
-        counterparts,
-        bookingCalendarId,
-        event: { calendarId: bookingCalendarId, eventId },
-        lengthMinutes,
-        window,
-        purpose,
-        constraints,
-        meetingKind,
-        threadKey: booked.thread_key,
-        replaces: booked,
-        ...(room ? { room } : {}),
-      });
-      return openOrAbandon(meeting, { kind: 'takeover', session: bookedSession });
-    }
-    const meeting = await createMeeting({
+    const creation: Omit<Creation, 'threadKey' | 'replaces'> = {
       kind: 'reschedule',
       session,
       requestId,
@@ -952,9 +928,18 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       purpose,
       constraints,
       meetingKind,
-      threadKey: mintThreadKey(),
       ...(room ? { room } : {}),
-    });
+    };
+
+    // A meeting the assistant booked keeps its thread: the new job continues there.
+    const booked = await findBookedMeetingForEvent(bookingCalendarId, eventId);
+    const bookedSession = booked?.session_id ? await getSession(booked.session_id) : undefined;
+    const bookedThread = booked ? await getThreadParticipants(booked.thread_key) : undefined;
+    if (booked && bookedSession?.status === 'active' && bookedThread?.state === 'open') {
+      const meeting = await createMeeting({ ...creation, threadKey: booked.thread_key, replaces: booked });
+      return openOrAbandon(meeting, { kind: 'takeover', session: bookedSession });
+    }
+    const meeting = await createMeeting({ ...creation, threadKey: mintThreadKey() });
     return openOrAbandon(meeting, { kind: 'new', opener: 'arrange' });
   }
 
@@ -1042,10 +1027,10 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
 
   /** End a meeting as cancelled and tell the people the assistant wrote to; true when they were told. */
   async function endCancelled(meeting: Meeting): Promise<boolean> {
-    await stopMeeting(meeting, 'cancelled', true);
-    const told = await sendCancelLine(meeting);
-    await closeMeetingThread(meeting);
-    await deps.releaseHolds(meeting);
+    let told = false;
+    await endMeeting(meeting, 'cancelled', true, async () => {
+      told = await sendCancelLine(meeting);
+    });
     return told;
   }
 
@@ -1490,12 +1475,19 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   }
 
   /**
-   * End a meeting: stopped, its thread closed, and then its holds released.
-   * Releasing comes last, so a failure there leaves nothing open; the holds
-   * stay recorded and a repeat releases them.
+   * End a meeting: stopped, then `afterStop` (a cancel's line to its people,
+   * sent while the thread is still open), its thread closed, and then its
+   * holds released. Releasing comes last, so a failure there leaves nothing
+   * open; the holds stay recorded and a repeat releases them.
    */
-  async function endMeeting(meeting: Meeting, state: MeetingState, kill: boolean): Promise<void> {
+  async function endMeeting(
+    meeting: Meeting,
+    state: MeetingState,
+    kill: boolean,
+    afterStop?: () => Promise<void>,
+  ): Promise<void> {
     await stopMeeting(meeting, state, kill);
+    if (afterStop) await afterStop();
     await closeMeetingThread(meeting);
     await deps.releaseHolds(meeting);
   }
@@ -1614,12 +1606,13 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   }
 
   return {
-    arrange: answering('meeting_arrange', arrange),
-    reschedule: answering('meeting_reschedule', reschedule),
-    askOrganizer: answering('meeting_ask_organizer', askOrganizer),
-    cancel: answering('meeting_cancel', (content) => cancel(content)),
-    amend: answering('meeting_amend', (content) => amend(content)),
-    outcome: answering('meeting_outcome', (content, session) => outcome(content, session)),
+    // The requests, each registered under its action name and answered once (`index.ts`).
+    arrange,
+    reschedule,
+    askOrganizer,
+    cancel,
+    amend,
+    outcome,
     /** End a meeting from the host (a booked event passes). */
     endMeeting,
     giveUpUnanswered,
@@ -1627,5 +1620,3 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     forgetPerson,
   };
 }
-
-export type MeetingHandoff = ReturnType<typeof createMeetingHandoff>;

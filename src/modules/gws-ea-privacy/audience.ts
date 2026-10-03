@@ -10,10 +10,8 @@
  * included, is "others".
  */
 import { getDb } from '../../db/connection.js';
-import { getMessagingGroup } from '../../db/messaging-groups.js';
 import type { OutboundSend } from '../../delivery.js';
 import { normalizePrincipalEmail } from '../../gws-ea/validation.js';
-import type { MessagingGroup } from '../../types.js';
 import { listPrincipalAddresses } from '../gws-ea-profile/db.js';
 
 /**
@@ -66,25 +64,4 @@ export async function resolveAudience(send: OutboundSend): Promise<Audience> {
   const resolver = recipientResolvers.get(send.channelType);
   if (resolver) return audienceForAddresses(await resolver(send));
   return (await isPrincipalDirectMessage(send.channelType, send.platformId)) ? 'principal' : 'others';
-}
-
-/** The most recently verified principal identity that has a direct message, with that message. */
-export interface PrincipalContact {
-  readonly userId: string;
-  readonly directMessage: MessagingGroup;
-}
-
-export async function principalContact(): Promise<PrincipalContact | undefined> {
-  const db = getDb();
-  if (!(await db.hasTable('gws_ea_principal_users'))) return undefined;
-  const row = await db.get<{ user_id: string; messaging_group_id: string }>(
-    `SELECT principal.user_id, dm.messaging_group_id
-       FROM gws_ea_principal_users principal
-       JOIN user_dms dm ON dm.user_id = principal.user_id
-      ORDER BY principal.verified_at DESC, dm.resolved_at DESC
-      LIMIT 1`,
-  );
-  if (!row) return undefined;
-  const directMessage = await getMessagingGroup(row.messaging_group_id);
-  return directMessage ? { userId: row.user_id, directMessage } : undefined;
 }

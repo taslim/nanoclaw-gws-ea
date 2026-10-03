@@ -25,14 +25,13 @@
  * cannot turn one notice into a stream of them. Why the failure happened goes
  * to the host log only.
  */
-import { getDb } from '../../db/connection.js';
-import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getDeliveryAdapter, registerDeliveryAction, registerDeliveryFailedHook } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { log } from '../../log.js';
 import type { OutboundMessage } from '../../mailbox/index.js';
 import { registerInboundFailedHook } from '../../reconcile-session.js';
-import type { MessagingGroup, Session } from '../../types.js';
+import type { Session } from '../../types.js';
+import { principalContact } from '../gws-ea-profile/db.js';
 
 /** The one plain sentence the principal sees whenever the assistant could not finish. */
 const FAILURE_NOTICE_TEXT = "Something went wrong on my side and I couldn't finish that. Please send it again.";
@@ -49,20 +48,6 @@ interface Route {
 /** A conversation with a person, not a host note or another agent. */
 function isPersonRoute(route: Route): boolean {
   return route.channelType !== null && route.platformId !== null && route.channelType !== 'agent';
-}
-
-/** The direct message of the most recently verified principal identity (bound by gws-ea-profile). */
-async function principalDirectMessage(): Promise<MessagingGroup | undefined> {
-  const db = getDb();
-  if (!(await db.hasTable('gws_ea_principal_users'))) return undefined;
-  const row = await db.get<{ messaging_group_id: string }>(
-    `SELECT dm.messaging_group_id
-       FROM gws_ea_principal_users principal
-       JOIN user_dms dm ON dm.user_id = principal.user_id
-      ORDER BY principal.verified_at DESC, dm.resolved_at DESC
-      LIMIT 1`,
-  );
-  return row ? getMessagingGroup(row.messaging_group_id) : undefined;
 }
 
 /** What a notice's log lines name it by. */
@@ -82,7 +67,7 @@ async function deliverToPrincipal(text: string, route: Route | undefined, notice
   if (!adapter) return false;
   /* eslint-disable no-catch-all/no-catch-all -- the notice is best effort; its failure is logged, never retried */
   try {
-    const dm = await principalDirectMessage();
+    const dm = (await principalContact())?.directMessage;
     if (!dm || dm.detached_at) {
       log.info(`${notice.label} not sent: no reachable principal direct message`, notice.fields);
       return false;

@@ -9,13 +9,8 @@
  * A note's ID derives from the Gmail message it reports, so routing the same
  * message again finds the note already written.
  */
-import { getSession } from '../../db/sessions.js';
-import { isUniqueViolation } from '../../db/errors.js';
 import { log } from '../../log.js';
-import { requestWake } from '../../request-wake.js';
-import { resolveSession, writeSessionMessage } from '../../session-manager.js';
-import { principalContact } from '../gws-ea-privacy/audience.js';
-import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import type { CalendarChange } from './calendar-notifications.js';
 
 export type InboxNote =
@@ -54,37 +49,17 @@ export interface MainNote {
   readonly wake: boolean;
 }
 
-function isDuplicateNote(error: unknown): boolean {
-  return isUniqueViolation(error) && error instanceof Error && /messages_in\.id\b/iu.test(error.message);
-}
-
 /** Write a note into `main`'s shared session; throws when there is no `main` or no principal to route it to. */
 export async function writeMainNote(note: MainNote, at: string): Promise<void> {
-  const mainAgentGroupId = await getMainAgentGroupId();
-  const principal = await principalContact();
-  if (mainAgentGroupId === null || principal === undefined) {
+  const result = await writeNoteForMain({
+    id: note.id,
+    timestamp: at,
+    text: note.text,
+    fields: { note: note.note },
+    wake: note.wake,
+  });
+  if (result === 'no-main' || result === 'no-principal') {
     throw new Error('The inbox has no main agent or no principal direct message to report to');
   }
-  const { directMessage } = principal;
-  const { session } = await resolveSession(mainAgentGroupId, directMessage.id, null, 'agent-shared');
-  try {
-    await writeSessionMessage(mainAgentGroupId, session.id, {
-      id: note.id,
-      kind: 'chat',
-      timestamp: at,
-      platformId: directMessage.platform_id,
-      channelType: directMessage.channel_type,
-      threadId: null,
-      content: JSON.stringify({ text: note.text, sender: 'system', senderId: 'system', note: note.note }),
-      trigger: note.wake,
-    });
-  } catch (error) {
-    if (!isDuplicateNote(error)) throw error;
-    log.info('Inbox note already written', { noteId: note.id });
-    return;
-  }
-  if (note.wake) {
-    const fresh = await getSession(session.id);
-    if (fresh) await requestWake(fresh, 'inbound-message');
-  }
+  if (result === 'already-written') log.info('Inbox note already written', { noteId: note.id });
 }

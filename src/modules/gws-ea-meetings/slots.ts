@@ -105,6 +105,11 @@ const SUNDAY_FIRST: readonly Weekday[] = ['sun', 'mon', 'tue', 'wed', 'thu', 'fr
 // Time zones
 // ---------------------------------------------------------------------------
 
+/** An instant as ISO-8601 UTC, the way the store and Google take it. */
+export function iso(instant: number): string {
+  return new Date(instant).toISOString();
+}
+
 const formatters = new Map<string, Intl.DateTimeFormat>();
 
 function formatter(timezone: string): Intl.DateTimeFormat {
@@ -298,7 +303,8 @@ export function schedulingRules(values: SchedulingPreferenceValues, meetingKind:
 // Open times
 // ---------------------------------------------------------------------------
 
-function usesPersonalHours(level: MeetingLevel): boolean {
+/** The inner circle and close: they may meet outside working hours, and only they report needs-room. */
+export function usesPersonalHours(level: MeetingLevel): boolean {
   return level === 'inner-circle' || level === 'close';
 }
 

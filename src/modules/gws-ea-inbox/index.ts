@@ -33,7 +33,7 @@ import { getExternalEmailAgentGroupId } from '../gws-ea-external-email/index.js'
 import { getInboxHealth } from './health.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
-import { identityMatchKey } from '../gws-ea-people/fingerprint.js';
+import { identityMatchKey } from '../../gws-ea/validation.js';
 import { registerPersonForgetHook } from '../gws-ea-people/index.js';
 import { registerRecipientResolver } from '../gws-ea-privacy/index.js';
 import { registerRoleGrantPolicy } from '../permissions/db/user-roles.js';

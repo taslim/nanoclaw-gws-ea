@@ -46,11 +46,15 @@ export const SDK_DISALLOWED_TOOLS = [
   'ReportFindings',
 ];
 
-// Tool allowlist for NanoClaw agent containers. MCP-tool entries are derived
-// from the registered `mcpServers` map so that any server added via
-// `add_mcp_server` (or wired in container.json directly) is reachable to the
-// agent — without this, the SDK's allowedTools filter silently drops every
-// MCP namespace not listed here.
+// The built-in half of the SDK's `allowedTools`; `resolveClaudeMcpServers`
+// appends one `mcp__<server>__*` pattern per registered MCP server. These are
+// permission allow rules: they pre-approve calls, which `bypassPermissions`
+// approves anyway, so a built-in missing here (such as the `subagents` key's
+// Agent, ListAgents and Workflow) is still offered. What an agent is offered
+// comes from `tools` and `disallowedTools`, which `resolveClaudeToolOptions`
+// sets from its capabilities. Two entries do widen the pinned Claude Code's
+// default set: Glob or Grep adds both, and TodoWrite adds TaskCreate,
+// TaskGet, TaskList and TaskUpdate.
 export const TOOL_ALLOWLIST = [
   'Bash',
   'Read',

@@ -98,6 +98,9 @@ import {
   type GmailMessageRef,
   type Inbox,
 } from './index.js';
+import { MAX_ROUTING_ATTEMPTS } from './adapter.js';
+import { recordFailedAttempt } from './db.js';
+import { MAX_RELEASE_ATTEMPTS } from './threads.js';
 
 const ROBIN = 'robin@assistant.example';
 const PRINCIPAL = 'pat@principal.example';
@@ -814,6 +817,50 @@ describe('a thread the principal copies Robin into (F1)', () => {
     });
     await inbox.tick();
     expect(contents(session).some((c) => c.text.includes('Tuesday works.'))).toBe(true);
+  });
+
+  it('gives held mail its whole release budget, however many polls it took to route', async () => {
+    gmail.receive({
+      threadId: 'g-acme',
+      from: `Pat <${PRINCIPAL}>`,
+      auth: 'principal',
+      to: [`Acme Sales <${SALES}>`],
+      cc: [`Robin <${ROBIN}>`],
+      messageId: '<p1@principal.example>',
+      body: 'Please find us a time.',
+    });
+    await inbox.tick();
+    const threadKey = String(notes('gws-ea-inbox.copy-in')[0].note?.thread_key);
+
+    const held = gmail.receive({
+      threadId: 'g-acme',
+      from: `Acme Sales <${SALES}>`,
+      to: [PRINCIPAL],
+      cc: [ROBIN],
+      inReplyTo: '<p1@principal.example>',
+      body: 'Tuesday or Wednesday?',
+    });
+    // The polls that failed to route it before one held it.
+    for (let attempt = 1; attempt < MAX_ROUTING_ATTEMPTS; attempt += 1) await recordFailedAttempt(held, now());
+    await inbox.tick();
+
+    await authorizeThread({ kind: 'copy-in', threadKey });
+    const { session } = await openThreadSession(threadKey);
+    await writeSessionMessage(session.agent_group_id, session.id, {
+      id: 'brief',
+      kind: 'chat',
+      timestamp: now(),
+      content: JSON.stringify({ text: 'brief' }),
+    });
+    poisoned.add(`${held}:${session.agent_group_id}`);
+    expect(await releaseHeldMail(threadKey)).toEqual({ released: 0 });
+    for (let attempt = 2; attempt < MAX_RELEASE_ATTEMPTS; attempt += 1) await inbox.tick();
+    expect(chatSends).toEqual([]);
+
+    poisoned.clear();
+    await inbox.tick();
+    expect(contents(session).some((c) => c.text.includes('Tuesday or Wednesday?'))).toBe(true);
+    expect(chatSends).toEqual([]);
   });
 });
 

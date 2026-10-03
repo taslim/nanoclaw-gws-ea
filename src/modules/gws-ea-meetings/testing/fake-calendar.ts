@@ -74,8 +74,6 @@ export class FakeCalendar implements MeetingsCalendarApi {
   readonly writes: CalendarWriteRecord[] = [];
   /** Colleagues' shared free/busy, by address; an address absent here is hidden from the assistant. */
   readonly sharedFreeBusy = new Map<string, Array<{ start: string; end: string }>>();
-  /** The address that organizes events the assistant creates on each calendar, when not the calendar's id. */
-  readonly calendarOwners = new Map<string, string>();
   calls = 0;
   failure: Error | undefined;
   private injected: InjectedFailure[] = [];
@@ -147,7 +145,6 @@ export class FakeCalendar implements MeetingsCalendarApi {
       if (failure) throw failure.error;
       return 'exists' as const;
     }
-    const organizer = this.calendarOwners.get(calendarId) ?? calendarId;
     this.events.push(
       apply(
         {
@@ -155,7 +152,7 @@ export class FakeCalendar implements MeetingsCalendarApi {
           id: eventId,
           iCalUID: `${eventId}@google.com`,
           status: 'confirmed',
-          organizer: { email: organizer },
+          organizer: { email: calendarId },
         },
         event,
       ),

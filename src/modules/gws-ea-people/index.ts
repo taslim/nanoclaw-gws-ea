@@ -13,7 +13,7 @@ import { registerMigration } from '../../db/migrations/index.js';
 import { optionalString } from '../../gws-ea/validation.js';
 import { registerRequiredProjectDocSection, type RequiredProjectDocSection } from '../../project-doc-sections.js';
 import type { AgentGroup } from '../../types.js';
-import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { assertMainCaller, getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import {
   addPerson,
   addPersonInstruction,
@@ -64,12 +64,7 @@ registerRequiredProjectDocSection('gws-ea-people:pointer', peopleSection);
  * refuses every verb, so main learns of it at once.
  */
 async function asMain<T>(ctx: CallerContext, work: () => Promise<T>): Promise<T> {
-  if (ctx.caller !== 'host') {
-    const mainAgentGroupId = await getMainAgentGroupId();
-    if (mainAgentGroupId === null || ctx.agentGroupId !== mainAgentGroupId) {
-      throw new Error("The principal's people are available only to main");
-    }
-  }
+  await assertMainCaller(ctx, 'people');
   await assertPeopleStoreRunning();
   return work();
 }

@@ -8,6 +8,10 @@
 import { randomBytes } from 'node:crypto';
 
 const SOURCE = 'gmail';
+// The agent runner neutralizes the same markers and tokens in the calendar
+// text it wraps (`sanitizeUntrusted` in
+// container/agent-runner/src/mcp-tools/calendar-facts.ts). The two runtimes
+// share no code, so a token added to one list is added to both.
 const MARKER = /<<<\s*(?:END[\s_]+)?EXTERNAL[\s_]+UNTRUSTED[\s_]+CONTENT(?:\s+[^>]*)?\s*>>>/giu;
 const SPECIAL_TOKENS = [
   '<|im_start|>',
@@ -24,6 +28,12 @@ const SPECIAL_TOKENS = [
   '[/INST]',
   '<<SYS>>',
   '<</SYS>>',
+  '<|channel|>',
+  '<|message|>',
+  '<|return|>',
+  '<|call|>',
+  '<start_of_turn>',
+  '<end_of_turn>',
 ];
 const RESERVED_SPECIAL_TOKEN = /<\|reserved_special_token_\d+\|>/gu;
 

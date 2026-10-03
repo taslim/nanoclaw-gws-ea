@@ -66,6 +66,7 @@ const UNTRUSTED_SOURCE = 'google_api';
 const GOG_WRAPPED =
   /^<<<EXTERNAL_UNTRUSTED_CONTENT id="([0-9a-f]+)">>>\nSource: [^\n]*\n---\n([\s\S]*)\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id="\1">>>$/;
 const UNTRUSTED_MARKER = /<<<\s*(?:END[\s_]+)?EXTERNAL[\s_]+UNTRUSTED[\s_]+CONTENT(?:\s+[^>]*)?\s*>>>/gi;
+/** The host keeps its own list in `src/modules/gws-ea-inbox/untrusted.ts`; keep the two in step. */
 const SPECIAL_TOKENS = [
   '<|im_start|>',
   '<|im_end|>',
@@ -199,6 +200,9 @@ function normalizeEmail(value: string): string | null {
  * and without the dots Gmail ignores. The people store keys identities the
  * same way. Used only to recognise the principal and the assistant, so a
  * variant spelling can never give either of them a record.
+ *
+ * The host holds the same rule as `identityMatchKey` in
+ * `src/gws-ea/validation.ts`; change both together.
  */
 function mailboxKey(email: string): string {
   const at = email.lastIndexOf('@');

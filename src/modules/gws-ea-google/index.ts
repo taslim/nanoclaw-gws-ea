@@ -27,7 +27,7 @@ import {
   type HostGoogleServiceId,
 } from './grant.js';
 import { readGoogleGrantFile } from './grant-file.js';
-import { createGoogleTokenRefresher, type GoogleTokenRefresher } from './refresher.js';
+import { createGoogleTokenRefresher, GATEWAY_TOKEN_PLACEHOLDER, type GoogleTokenRefresher } from './refresher.js';
 
 /** How often the host checks whether a token needs renewing. */
 const TICK_MS = 60_000;
@@ -90,7 +90,7 @@ registerContainerEnv('gws-ea-google:gog', ({ capabilities }): Record<string, str
   ).flatMap((id) => GOG_COMMANDS[id]);
   if (commands.length === 0) return {};
   return {
-    GOG_ACCESS_TOKEN: 'gateway-managed',
+    GOG_ACCESS_TOKEN: GATEWAY_TOKEN_PLACEHOLDER,
     GOG_ENABLE_COMMANDS_EXACT: commands.join(','),
     GOG_GMAIL_NO_SEND: '1',
     GOG_JSON: '1',

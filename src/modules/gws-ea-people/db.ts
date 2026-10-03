@@ -1,15 +1,15 @@
 import { randomBytes } from 'node:crypto';
 
 import { getDb } from '../../db/connection.js';
-import { hasControlCharacters, normalizePrincipalEmail } from '../../gws-ea/validation.js';
-import { getGwsEaProfile, listVerifiedPrincipalUsers } from '../gws-ea-profile/db.js';
 import {
-  createFingerprintKey,
-  fingerprintKeyFile,
-  identityFingerprint,
+  hasControlCharacters,
   identityMatchKey,
-  readFingerprintKey,
-} from './fingerprint.js';
+  normalizePrincipalEmail,
+  parseLine,
+  parseOptionalLine,
+} from '../../gws-ea/validation.js';
+import { getGwsEaProfile, listVerifiedPrincipalUsers } from '../gws-ea-profile/db.js';
+import { createFingerprintKey, fingerprintKeyFile, identityFingerprint, readFingerprintKey } from './fingerprint.js';
 
 /** The fixed set of levels, closest first (R13). Anyone without a record is `unknown`, which is never stored. */
 export const PERSON_LEVELS = ['inner-circle', 'close', 'active', 'known'] as const;
@@ -191,18 +191,6 @@ function parseChangeSource(value: string): ChangeSource {
   const source = CHANGE_SOURCES.find((candidate) => candidate === value);
   if (!source) throw new Error(`Source ${JSON.stringify(value)} is invalid: use principal or learned`);
   return source;
-}
-
-function parseLine(value: string, label: string, maxLength: number): string {
-  const text = value.trim();
-  if (!text || text.length > maxLength || hasControlCharacters(text)) {
-    throw new Error(`${label} must be one line of 1 to ${maxLength} characters`);
-  }
-  return text;
-}
-
-function parseOptionalLine(value: string, label: string, maxLength: number): string | null {
-  return value.trim() === '' ? null : parseLine(value, label, maxLength);
 }
 
 /** Notes may run to several lines; any other control character is refused. */
@@ -431,6 +419,18 @@ async function admitIdentity(
   );
 }
 
+/**
+ * Take `handle`, in every spelling that reaches the same mailbox, from
+ * whichever person holds it, inside the caller's transaction. Not a forget:
+ * no hook runs and no fingerprint is kept. Without the people store there is
+ * nothing to take.
+ */
+export async function removeMatchingIdentities(handle: string): Promise<void> {
+  const db = getDb();
+  if (!(await db.hasTable('gws_ea_people_identities'))) return;
+  await db.run('DELETE FROM gws_ea_people_identities WHERE match_key = ?', identityMatchKey(handle));
+}
+
 async function rememberName(personId: string, name: string, now: string): Promise<void> {
   const db = getDb();
   const key = nameKey(name);
@@ -517,8 +517,10 @@ async function requirePersonRow(id: string): Promise<{ readonly name: string; re
 async function summarize(rows: readonly SummaryRow[]): Promise<PersonSummary[]> {
   if (rows.length === 0) return [];
   const handles = new Map<string, string[]>(rows.map((row) => [row.id, []]));
+  const placeholders = [...handles.keys()].map(() => '?').join(', ');
   const identities = await getDb().all<{ readonly person_id: string; readonly handle: string }>(
-    'SELECT person_id, handle FROM gws_ea_people_identities ORDER BY handle',
+    `SELECT person_id, handle FROM gws_ea_people_identities WHERE person_id IN (${placeholders}) ORDER BY handle`,
+    ...handles.keys(),
   );
   for (const { person_id, handle } of identities) handles.get(person_id)?.push(handle);
   return rows.map((row) => ({ ...row, identities: handles.get(row.id) ?? [] }));

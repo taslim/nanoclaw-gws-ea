@@ -1,5 +1,4 @@
 import { registerResource, type ColumnDef } from '../../cli/crud.js';
-import type { CallerContext } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { optionalString } from '../../gws-ea/validation.js';
@@ -20,7 +19,7 @@ import {
   type SetPreferenceInput,
   type Weekday,
 } from './db.js';
-import { getMainAgentGroupId, projectDocAudience } from '../gws-ea-profile/db.js';
+import { assertMainCaller, projectDocAudience } from '../gws-ea-profile/db.js';
 import { gwsEaPreferencesMigration } from './migration.js';
 
 registerMigration(gwsEaPreferencesMigration);
@@ -244,19 +243,6 @@ function removeTarget(args: Record<string, unknown>): PreferenceTarget {
   }
 }
 
-/**
- * The guard admits the host and any agent whose CLI scope reaches this
- * resource; the preferences, with their main-only basis and reason, belong to
- * the canonical main alone.
- */
-async function assertMainCaller(ctx: CallerContext): Promise<void> {
-  if (ctx.caller === 'host') return;
-  const mainAgentGroupId = await getMainAgentGroupId();
-  if (mainAgentGroupId === null || ctx.agentGroupId !== mainAgentGroupId) {
-    throw new Error("The principal's scheduling preferences are available only to main");
-  }
-}
-
 const SOURCE_ARG: ColumnDef = {
   name: 'source',
   type: 'string',
@@ -311,7 +297,7 @@ registerResource({
         'Read every stored preference with its source, basis, and update time, and each protected window with its reason and ID.',
       args: [],
       handler: async (_args, ctx) => {
-        await assertMainCaller(ctx);
+        await assertMainCaller(ctx, 'scheduling preferences');
         return getSchedulingPreferences();
       },
     },
@@ -351,7 +337,7 @@ registerResource({
         'ncl preferences set --kind meeting-length --meeting-kind one-on-one --minutes 30 --source learned --basis "Most common one-on-one length over eight weeks"',
       ],
       handler: async (args, ctx) => {
-        await assertMainCaller(ctx);
+        await assertMainCaller(ctx, 'scheduling preferences');
         return setSchedulingPreference(setInput(args));
       },
     },
@@ -367,7 +353,7 @@ registerResource({
         'ncl preferences remove --kind protected-window --id w-1a2b3c4d --source principal',
       ],
       handler: async (args, ctx) => {
-        await assertMainCaller(ctx);
+        await assertMainCaller(ctx, 'scheduling preferences');
         return { removed: await removeSchedulingPreference(removeTarget(args)) };
       },
     },

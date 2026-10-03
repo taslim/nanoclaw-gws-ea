@@ -247,7 +247,7 @@ export function parseCalendarNotification(mail: ParsedMail): CalendarNotice | un
 }
 
 // ---------------------------------------------------------------------------
-// Robin's own changes
+// The assistant's own changes
 // ---------------------------------------------------------------------------
 
 /** How long after the assistant changes an event a notification about it is taken as its own. */

@@ -117,11 +117,36 @@ export async function isSettled(gmailMessageId: string): Promise<boolean> {
   return row?.settled_at !== undefined && row.settled_at !== null;
 }
 
-export async function settleMessage(gmailMessageId: string, outcome: string, at: string): Promise<void> {
+/** Where routing left a message, as its settled record names it. */
+export type RouteOutcome =
+  | 'own'
+  | 'calendar-unreadable'
+  | 'calendar-not-principal'
+  | 'calendar-own-change'
+  | 'forged-calendar-notification'
+  | 'automated'
+  | 'principal-note'
+  | 'copy-in'
+  | 'thread'
+  | 'held'
+  | 'rate-limited'
+  | 'cold-note'
+  | 'closed-thread-note'
+  | 'gone'
+  | 'not-in-inbox'
+  | 'calendar-note'
+  | 'set-aside';
+
+/**
+ * Record where a message was routed. Its routing attempts end here, so the
+ * count starts over for held mail's release (`MAX_RELEASE_ATTEMPTS`).
+ */
+export async function settleMessage(gmailMessageId: string, outcome: RouteOutcome, at: string): Promise<void> {
   await getDb().run(
     `INSERT INTO gws_ea_inbox_messages (gmail_message_id, outcome, attempts, first_seen_at, settled_at)
        VALUES (?, ?, 0, ?, ?)
-       ON CONFLICT (gmail_message_id) DO UPDATE SET outcome = excluded.outcome, settled_at = excluded.settled_at`,
+       ON CONFLICT (gmail_message_id) DO UPDATE
+          SET outcome = excluded.outcome, settled_at = excluded.settled_at, attempts = 0`,
     gmailMessageId,
     outcome,
     at,
@@ -129,7 +154,7 @@ export async function settleMessage(gmailMessageId: string, outcome: string, at:
   );
 }
 
-/** Count one failed attempt to route a message; returns the attempts so far. */
+/** Count one failed attempt to route a message, or to release it once held; returns the attempts so far. */
 export async function recordFailedAttempt(gmailMessageId: string, at: string): Promise<number> {
   const db = getDb();
   await db.run(

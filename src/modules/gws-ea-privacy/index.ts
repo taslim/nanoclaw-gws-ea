@@ -30,11 +30,15 @@ import { getSession } from '../../db/sessions.js';
 import { registerOutboundGuard, type OutboundGuardDecision, type OutboundSend } from '../../delivery.js';
 import { ALLOW, DENY, defineGuardedAction, guard, HOLD, type GuardActor } from '../../guard/index.js';
 import { log } from '../../log.js';
-import { requestWake } from '../../request-wake.js';
-import { resolveSession, writeSessionMessage } from '../../session-manager.js';
 import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
-import { getMainAgentGroupId, isVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
-import { principalContact, resolveAudience, type Audience } from './audience.js';
+import {
+  assertMainCaller,
+  getMainAgentGroupId,
+  isVerifiedPrincipalUser,
+  principalApproverUserId,
+} from '../gws-ea-profile/db.js';
+import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
+import { resolveAudience, type Audience } from './audience.js';
 import {
   addPrivateValue,
   getPrivateValue,
@@ -216,16 +220,6 @@ async function judgeSend(send: OutboundSend): Promise<OutboundGuardDecision> {
 async function signalThreadStopped(key: ThreadKey, kind: PrivateValueKind, refusals: number): Promise<void> {
   /* eslint-disable no-catch-all/no-catch-all -- the stop holds either way; telling main is best effort and logged */
   try {
-    const mainAgentGroupId = await getMainAgentGroupId();
-    const principal = await principalContact();
-    if (mainAgentGroupId === null || principal === undefined) {
-      log.warn('Privacy stop not signalled: no main or no principal direct message', {
-        channelType: key.channelType,
-      });
-      return;
-    }
-    const { directMessage } = principal;
-    const { session } = await resolveSession(mainAgentGroupId, directMessage.id, null, 'agent-shared');
     const stoppedAt = new Date().toISOString();
     const signal: ThreadStoppedSignal = {
       type: THREAD_STOPPED_SIGNAL,
@@ -236,22 +230,19 @@ async function signalThreadStopped(key: ThreadKey, kind: PrivateValueKind, refus
       thread_id: key.threadId,
       stopped_at: stoppedAt,
     };
-    await writeSessionMessage(mainAgentGroupId, session.id, {
+    const result = await writeNoteForMain({
       id: `privacy-stop-${randomUUID()}`,
-      kind: 'chat',
       timestamp: stoppedAt,
-      platformId: directMessage.platform_id,
-      channelType: directMessage.channel_type,
-      threadId: null,
-      content: JSON.stringify({
-        text: stoppedSignalText(kind, refusals),
-        sender: 'system',
-        senderId: 'system',
-        signal,
-      }),
+      text: stoppedSignalText(kind, refusals),
+      fields: { signal },
+      wake: true,
     });
-    const fresh = await getSession(session.id);
-    if (fresh) await requestWake(fresh, 'inbound-message');
+    if (result === 'no-main' || result === 'no-principal') {
+      log.warn('Privacy stop not signalled: no main or no principal direct message', {
+        channelType: key.channelType,
+      });
+      return;
+    }
     log.info('Privacy stop signalled to main', { channelType: key.channelType, kind });
   } catch (err) {
     log.error('Privacy stop could not be signalled to main', { channelType: key.channelType, err });
@@ -310,9 +301,9 @@ const removePrivateValueAction = defineGuardedAction({
     if (actor.kind !== 'agent' || mainAgentGroupId === null || actor.agentGroupId !== mainAgentGroupId) {
       return DENY('Only main may ask to remove a private value.');
     }
-    const principal = await principalContact();
-    if (!principal) return DENY('No verified principal can confirm removing a private value yet.');
-    return HOLD('removing a private value switches its check off, so the principal confirms it', principal.userId);
+    const approver = await principalApproverUserId();
+    if (approver === undefined) return DENY('No verified principal can confirm removing a private value yet.');
+    return HOLD('removing a private value switches its check off, so the principal confirms it', approver);
   },
 });
 
@@ -373,15 +364,6 @@ registerApprovalHandler(REMOVAL_APPROVAL, async ({ session, payload, approval, u
 // `ncl private-values list | add | remove` — main's path to the store.
 // ---------------------------------------------------------------------------
 
-/** The guard admits the host and any agent whose CLI scope reaches this resource; the values are main's alone. */
-async function assertMainCaller(ctx: CallerContext): Promise<void> {
-  if (ctx.caller === 'host') return;
-  const mainAgentGroupId = await getMainAgentGroupId();
-  if (mainAgentGroupId === null || ctx.agentGroupId !== mainAgentGroupId) {
-    throw new Error("The principal's private values are available only to main");
-  }
-}
-
 function stringArg(args: Record<string, unknown>, key: string): string {
   const value = args[key];
   if (typeof value !== 'string') throw new Error(`--${key} is required`);
@@ -418,7 +400,7 @@ registerResource({
       description: "List the principal's private values with their labels and kinds.",
       args: [],
       handler: async (_args, ctx) => {
-        await assertMainCaller(ctx);
+        await assertMainCaller(ctx, 'private values');
         return listPrivateValues();
       },
     },
@@ -437,7 +419,7 @@ registerResource({
         'ncl private-values add --label "Personal mobile" --kind phone --value "+1 415 555 0134"',
       ],
       handler: async (args, ctx) => {
-        await assertMainCaller(ctx);
+        await assertMainCaller(ctx, 'private values');
         return addPrivateValue({
           label: stringArg(args, 'label'),
           kind: stringArg(args, 'kind'),
@@ -452,7 +434,7 @@ registerResource({
       args: [{ name: 'id', type: 'string', description: 'The value to remove (from `list`).', required: true }],
       examples: ['ncl private-values remove --id pv-1a2b3c4d5e6f'],
       handler: async (args, ctx) => {
-        await assertMainCaller(ctx);
+        await assertMainCaller(ctx, 'private values');
         const id = stringArg(args, 'id');
         const value = await getPrivateValue(id);
         if (!value) throw new Error(`No private value ${JSON.stringify(id)} exists`);
