@@ -17,13 +17,12 @@ describe('sealed sessions', () => {
     expect(sessionsSealed(new Set(['reply', 'conversation-context']))).toBe(false);
   });
 
-  it('keep no group memory: no scaffold, and a registration that installs no hook', () => {
+  it('keep no group memory: no scaffold, and the sealed hook registration', () => {
     const base = tempBase();
     try {
       const hook = prepareSessionMemory(true, base);
 
       expect(hook).toBe(SEALED_MEMORY_SESSION_HOOK);
-      expect(hook.sources).toEqual([]);
       expect(fs.existsSync(path.join(base, 'memory'))).toBe(false);
     } finally {
       fs.rmSync(base, { recursive: true, force: true });

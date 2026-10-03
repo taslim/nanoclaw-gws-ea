@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { dispatch } from '../../cli/dispatch.js';
 import type { CallerContext } from '../../cli/frame.js';
-import { commandGuard, lookup } from '../../cli/registry.js';
+import { lookup } from '../../cli/registry.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { composeGroupProjectDoc } from '../../project-doc-compose.js';
@@ -73,13 +73,7 @@ afterEach(async () => {
 });
 
 describe('GWS-EA people ncl resource', () => {
-  it('registers every verb as an open, guarded people command', () => {
-    for (const verb of VERBS) {
-      const command = lookup(`people-${verb}`);
-      expect(command, verb).toMatchObject({ access: 'open', resource: 'people', action: `people.${verb}` });
-      expect(command?.hostOnly, verb).toBeFalsy();
-      expect(commandGuard(`people-${verb}`).action, verb).toBe(`people.${verb}`);
-    }
+  it('registers no generic people-create or people-delete, so every write goes through its own verb', () => {
     for (const generic of ['create', 'delete']) expect(lookup(`people-${generic}`), generic).toBeUndefined();
   });
 

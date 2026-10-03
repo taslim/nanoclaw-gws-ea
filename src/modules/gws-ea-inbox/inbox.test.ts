@@ -57,6 +57,7 @@ import {
 } from '../../channels/channel-registry.js';
 import { dispatch } from '../../cli/dispatch.js';
 import { getDb } from '../../db/connection.js';
+import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { getMessagingGroupAgents, getMessagingGroupsByChannel } from '../../db/messaging-groups.js';
 import { deliverSessionMessages, setDeliveryAdapter } from '../../delivery.js';
@@ -489,6 +490,9 @@ beforeEach(async () => {
   ] as const) {
     await createAgentGroup({ id, name, folder: name, agent_provider: null, created_at: now() });
   }
+  // As in production, main's CLI scope is global, so only `hostOnly` keeps a host command from it.
+  await ensureContainerConfig('ag-main');
+  await updateContainerConfigScalars('ag-main', { cli_scope: 'global' });
   await createMessagingGroup({
     id: 'mg-dm',
     channel_type: 'gchat',
@@ -565,7 +569,7 @@ describe('the inbox', () => {
       { id: 'x', command: 'dkim-selectors-pin', args: { domain: 'principal.example', selector: 'evil' } },
       { caller: 'agent', agentGroupId: 'ag-main', sessionId: main.id, messagingGroupId: 'mg-dm' },
     );
-    expect(agent.ok).toBe(false);
+    expect(agent).toMatchObject({ ok: false, error: { code: 'forbidden' } });
     const list = await dispatch({ id: 'y', command: 'dkim-selectors-list', args: {} }, { caller: 'host' });
     expect(list).toMatchObject({ ok: true, data: [{ domain: 'principal.example', selector: 'google' }] });
   });
@@ -1099,7 +1103,7 @@ describe('health', () => {
       { id: 'a', command: 'gws-ea-inbox-health', args: {} },
       { caller: 'agent', agentGroupId: 'ag-main', sessionId: main.id, messagingGroupId: 'mg-dm' },
     );
-    expect(agent.ok).toBe(false);
+    expect(agent).toMatchObject({ ok: false, error: { code: 'forbidden' } });
     const unknown = await dispatch(
       { id: 'u', command: 'gws-ea-inbox-health', args: { verbose: true } },
       { caller: 'host' },

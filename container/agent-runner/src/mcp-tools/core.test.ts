@@ -138,17 +138,21 @@ describe('send_message MCP tool — in_reply_to plumbing', () => {
   });
 });
 
-describe('send_message / send_file — thread for a channel destination', () => {
+describe('send_message / send_file — a channel destination', () => {
   // send_file stages the file under /workspace/outbox, which only exists in a
-  // container. Routing is what's under test, so stub the copy.
+  // container, so stub the filesystem and record where each copy would land.
+  let copies: Array<[string, string]> = [];
   let fsSpies: Array<{ mockRestore(): void }> = [];
 
   beforeEach(() => {
     seedChannelDestination('current-chat', 'slack', 'C123');
+    copies = [];
     fsSpies = [
       spyOn(fs, 'existsSync').mockReturnValue(true),
       spyOn(fs, 'mkdirSync').mockReturnValue(undefined),
-      spyOn(fs, 'copyFileSync').mockReturnValue(undefined),
+      spyOn(fs, 'copyFileSync').mockImplementation((src, dest) => {
+        copies.push([String(src), String(dest)]);
+      }),
     ];
   });
 
@@ -205,50 +209,32 @@ describe('send_message / send_file — thread for a channel destination', () => 
 
     expect(await sendBoth()).toEqual([null, null]);
   });
-});
 
-describe('send_file — staging stays inside its outbox', () => {
-  let copies: Array<[string, string]> = [];
-  let fsSpies: Array<{ mockRestore(): void }> = [];
-
-  beforeEach(() => {
-    seedChannelDestination('current-chat', 'slack', 'C123');
-    copies = [];
-    fsSpies = [
-      spyOn(fs, 'existsSync').mockReturnValue(true),
-      spyOn(fs, 'mkdirSync').mockReturnValue(undefined),
-      spyOn(fs, 'copyFileSync').mockImplementation((src, dest) => {
-        copies.push([String(src), String(dest)]);
-      }),
-    ];
-  });
-
-  afterEach(() => {
-    for (const spy of fsSpies) spy.mockRestore();
-  });
-
-  it.each(['../../../home/node/.claude/settings.json', '/workspace/agent/.claude/settings.json', '..\\..\\x'])(
-    'keeps only the basename of filename %j',
-    async (filename) => {
+  describe('staging stays inside its outbox', () => {
+    it.each([
+      ['../../../home/node/.claude/settings.json', 'settings.json'],
+      ['/workspace/agent/.claude/settings.json', 'settings.json'],
+      // On POSIX a backslash is part of the name, so it stays inside the outbox verbatim.
+      ['..\\..\\x', '..\\..\\x'],
+    ])('stages filename %j as %j', async (filename, staged) => {
       const result = (await sendFile.handler({ to: 'current-chat', path: '/tmp/report.txt', filename })) as {
         isError?: boolean;
       };
 
       expect(result.isError).toBeUndefined();
       const [, dest] = copies[0]!;
-      const outboxDir = path.dirname(dest);
-      expect(path.dirname(outboxDir)).toBe('/workspace/outbox');
-      expect(path.basename(dest)).toBe(path.basename(filename));
+      expect(path.dirname(path.dirname(dest))).toBe('/workspace/outbox');
+      expect(path.basename(dest)).toBe(staged);
       const [row] = getUndeliveredMessages();
-      expect(JSON.parse(row!.content).files).toEqual([path.basename(filename)]);
-    },
-  );
+      expect(JSON.parse(row!.content).files).toEqual([staged]);
+    });
 
-  it.each(['..', '.', ''])('falls back to the source basename for filename %j', async (filename) => {
-    await sendFile.handler({ to: 'current-chat', path: '/tmp/report.txt', filename });
+    it.each(['..', '.', ''])('falls back to the source basename for filename %j', async (filename) => {
+      await sendFile.handler({ to: 'current-chat', path: '/tmp/report.txt', filename });
 
-    const [, dest] = copies[0]!;
-    expect(path.basename(dest)).toBe('report.txt');
-    expect(path.dirname(path.dirname(dest))).toBe('/workspace/outbox');
+      const [, dest] = copies[0]!;
+      expect(path.basename(dest)).toBe('report.txt');
+      expect(path.dirname(path.dirname(dest))).toBe('/workspace/outbox');
+    });
   });
 });

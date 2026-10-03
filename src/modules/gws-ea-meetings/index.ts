@@ -59,7 +59,7 @@ registerMigration(gwsEaMeetingsRoomsMigration);
 const FOLLOW_THROUGH_INTERVAL_MS = 60_000;
 
 /** main's side of the handoff: the five requests. */
-export const MEETINGS_CAPABILITY = 'gws-ea-meetings';
+const MEETINGS_CAPABILITY = 'gws-ea-meetings';
 
 registerCapability(MEETINGS_CAPABILITY, {
   description:

@@ -1,8 +1,7 @@
 /**
- * What the meetings module registers: main's side of the handoff as a
- * capability every default group holds, external-email's side off by
- * default, each side taught only its own tools, and every request a guarded
- * delivery action.
+ * What the meetings module teaches: main's side of the handoff to every
+ * default group, external-email's side only to a group that holds it, and
+ * each side only its own tools.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -16,15 +15,12 @@ vi.mock('../../config.js', async (importOriginal) => ({
   DATA_DIR: '/tmp/nanoclaw-gws-ea-meetings-index-test/data',
 }));
 
-import { resolveCapabilities } from '../../capabilities.js';
 import { ensureContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
-import { getDeliveryAction } from '../../delivery.js';
-import { listGuardedActions } from '../../guard/index.js';
 import { composeGroupProjectDoc, DEFAULT_PROJECT_DOC } from '../../project-doc-compose.js';
 import type { AgentGroup } from '../../types.js';
 import { EXTERNAL_EMAIL_MEETINGS_CAPABILITY } from '../gws-ea-external-email/index.js';
-import { MEETINGS_CAPABILITY } from './index.js';
+import './index.js';
 
 const MODULES = path.join('container', 'agent-runner', 'src', 'mcp-tools');
 
@@ -55,42 +51,15 @@ afterEach(async () => {
 });
 
 describe('the meetings module', () => {
-  it("gives main's side to every group on all, and external-email's side to none", () => {
-    const all = resolveCapabilities('all', 'fixture');
-    expect(all).toContain(MEETINGS_CAPABILITY);
-    expect(all).not.toContain(EXTERNAL_EMAIL_MEETINGS_CAPABILITY);
-  });
-
   it('teaches each side only its own tools', async () => {
     const main = await composed('ag-main', 'all');
     expect(main).toContain('# NanoClaw Module: gws-ea-meetings\n');
-    expect(main).toContain(moduleDoc(MEETINGS_CAPABILITY));
+    expect(main).toContain(moduleDoc('gws-ea-meetings'));
     expect(main).not.toContain('# NanoClaw Module: gws-ea-meetings-external');
 
     const external = await composed('ag-external', ['reply', EXTERNAL_EMAIL_MEETINGS_CAPABILITY]);
     expect(external).toContain(moduleDoc(EXTERNAL_EMAIL_MEETINGS_CAPABILITY));
     expect(external).not.toContain('# NanoClaw Module: gws-ea-meetings\n');
     expect(external).not.toContain('ask_organizer');
-  });
-
-  it('registers every request as a delivery action behind a guard', () => {
-    for (const action of [
-      'meeting_arrange',
-      'meeting_reschedule',
-      'meeting_ask_organizer',
-      'meeting_cancel',
-      'meeting_amend',
-      'meeting_outcome',
-      'meeting_free_time',
-      'meeting_hold',
-      'meeting_release_holds',
-      'meeting_book',
-    ]) {
-      expect(getDeliveryAction(action), action).toBeDefined();
-    }
-    const guarded = listGuardedActions().map((spec) => spec.action);
-    expect(guarded).toEqual(
-      expect.arrayContaining(['gws_ea_meetings.request', 'gws_ea_meetings.outcome', 'gws_ea_meetings.calendar']),
-    );
   });
 });

@@ -97,17 +97,23 @@ describe('the principal', () => {
     ['dmarc=fail', { results: results('principal.example', 'google', 'fail') }],
     ['a failed DKIM signature', { results: results('principal.example', 'google', 'pass', 'fail') }],
     ['a selector nobody pinned', { results: results('principal.example', 'marketing') }],
-    ['a display-name spoof', { from: `"${PRINCIPAL}" <pat@evil.example>`, results: results('evil.example', 'google') }],
-    ['a lookalike domain', { from: 'Pat <pat@principa1.example>', results: results('principa1.example', 'google') }],
-    [
-      'a lookalike in another script',
-      { from: 'Pat <pat@prіncipal.example>', results: results('prіncipal.example', 'google') },
-    ],
     ['a differing Sender', { extra: [{ name: 'Sender', value: 'Bulk <bulk@principal.example>' }] }],
     ['a List-Id', { extra: [{ name: 'List-Id', value: '<team.principal.example>' }] }],
     ['two From mailboxes', { from: `${PRINCIPAL}, other@principal.example` }],
   ])('is not recognized from %s', (_label, options) => {
     expect(authenticateSender(message(options), CONTEXT).kind).not.toBe('principal');
+  });
+
+  it.each([
+    ['a display-name spoof', `"${PRINCIPAL}" <pat@evil.example>`, 'pat@evil.example'],
+    ['a lookalike domain', 'Pat <pat@principa1.example>', 'pat@principa1.example'],
+    ['a lookalike in another script', 'Pat <pat@prіncipal.example>', 'pat@prіncipal.example'],
+  ])('takes %s, signed by its own domain, for its own address and never the principal', (_label, from, address) => {
+    const signed = results(address.slice(address.indexOf('@') + 1), 'google');
+    expect(authenticateSender(message({ from, results: signed }), CONTEXT)).toMatchObject({
+      kind: 'authenticated',
+      address,
+    });
   });
 
   it('is never recognized while no selector is pinned for its domain, nor taken for anyone else', () => {

@@ -4,8 +4,7 @@
  *
  * Drives the real delivery actions, guards, router, inbox channel, privacy
  * guard, people store and session DBs against an in-memory Gmail and Google
- * Calendar. Only the container runtime and its wake are mocked. U12's
- * bookings and offered slots are written directly, as its tools will.
+ * Calendar. Only the container runtime and its wake are mocked.
  */
 import fs from 'fs';
 import os from 'os';
@@ -46,23 +45,16 @@ vi.mock('./calendar-api.js', async (importOriginal) => {
   };
 });
 
-import type { ChannelAdapter, ChannelSetup } from '../../channels/adapter.js';
-import {
-  createChannelDeliveryAdapter,
-  initChannelAdapters,
-  registerChannelAdapter,
-  teardownChannelAdapters,
-} from '../../channels/channel-registry.js';
+import { teardownChannelAdapters } from '../../channels/channel-registry.js';
 import type { ResponseFrame } from '../../cli/frame.js';
 import { dispatch } from '../../cli/dispatch.js';
 import { killContainer } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { getSession } from '../../db/sessions.js';
-import { deliverSessionMessages, getDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
+import { deliverSessionMessages, getDeliveryAction } from '../../delivery.js';
 import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { requestWake } from '../../request-wake.js';
-import { routeInbound } from '../../router.js';
 import { resolveSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import '../permissions/index.js';
@@ -80,19 +72,23 @@ import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
 import '../gws-ea-privacy/index.js';
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import '../gws-ea-external-email/index.js';
-import {
-  createInbox,
-  EMAIL_CHANNEL_DEFAULTS,
-  ensureInbox,
-  getThreadParticipants,
-  GoogleApiError,
-  INBOX_PLATFORM_ID,
-  type Inbox,
-} from '../gws-ea-inbox/index.js';
+import { ensureInbox, getThreadParticipants, GoogleApiError, type Inbox } from '../gws-ea-inbox/index.js';
 import { consumeOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
-import { getMeeting, type Meeting } from './index.js';
+import { getMeeting } from './index.js';
 import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
 import { FakeGmail, header } from './testing/fake-gmail.js';
+import {
+  ask,
+  contents,
+  data,
+  meeting,
+  meetingSession,
+  notes,
+  refusal,
+  reply,
+  slotsOf,
+  startInbox,
+} from './testing/scheduling.js';
 
 const ROBIN = 'robin@assistant.example';
 const PRINCIPAL = 'pat@principal.example';
@@ -120,7 +116,6 @@ let main: Session;
 let sam: Person;
 let dana: Person;
 let olu: Person;
-let requestCount = 0;
 
 function now(): string {
   return new Date().toISOString();
@@ -135,76 +130,6 @@ function inDays(days: number, hours = 0): string {
 
 const WINDOW = { window_start: inDays(7, 9), window_end: inDays(11, 17) };
 
-const hostSetup: ChannelSetup = {
-  async onInbound(platformId, threadId, message) {
-    await routeInbound({
-      channelType: 'email',
-      instance: 'email',
-      platformId,
-      threadId,
-      message: {
-        id: message.id,
-        kind: message.kind,
-        content: JSON.stringify(message.content),
-        timestamp: message.timestamp,
-        isMention: message.isMention,
-        isGroup: message.isGroup,
-        authenticatedSender: message.authenticatedSender,
-      },
-    });
-  },
-  onInboundEvent: () => undefined,
-  onMetadata: () => undefined,
-  onAction: () => undefined,
-};
-
-function chatAdapter(): ChannelAdapter {
-  return {
-    name: 'gchat',
-    channelType: 'gchat',
-    supportsThreads: false,
-    async setup() {},
-    async teardown() {},
-    isConnected: () => true,
-    async deliver() {
-      return 'chat-message';
-    },
-  };
-}
-
-interface InboundRow {
-  id: string;
-  kind: string;
-  trigger: number;
-  thread_id: string | null;
-  content: string;
-}
-
-function inbound(session: Session): InboundRow[] {
-  const file = inboundDbPath(session.agent_group_id, session.id);
-  if (!fs.existsSync(file)) return [];
-  const db = new Database(file, { readonly: true });
-  const rows = db
-    .prepare('SELECT id, kind, trigger, thread_id, content FROM messages_in ORDER BY seq')
-    .all() as InboundRow[];
-  db.close();
-  return rows;
-}
-
-interface Content {
-  text?: string;
-  sender?: string;
-  type?: string;
-  requestId?: string;
-  frame?: ResponseFrame;
-  note?: { type: string; [key: string]: unknown };
-  brief?: { type: string; meeting_id: string; version: number; [key: string]: unknown };
-}
-
-function contents(session: Session): Array<Content & { row: InboundRow }> {
-  return inbound(session).map((row) => ({ ...(JSON.parse(row.content) as Content), row }));
-}
-
 /** What a tool reads back: the session's `action_response` for one request. */
 function responses(session: Session, requestId: string): ResponseFrame[] {
   return contents(session)
@@ -213,51 +138,11 @@ function responses(session: Session, requestId: string): ResponseFrame[] {
 }
 
 function meetingNotes(outcome?: string) {
-  return contents(main).filter(
-    (c) => c.note?.type === 'gws-ea-meetings.outcome' && (outcome === undefined || c.note.outcome === outcome),
-  );
+  return notes(main, 'gws-ea-meetings.outcome').filter((c) => outcome === undefined || c.note?.outcome === outcome);
 }
 
 function briefs(session: Session) {
   return contents(session).filter((c) => c.brief !== undefined);
-}
-
-/** Send one typed request from a session, as delivery does, and read its answer. */
-async function ask(
-  session: Session,
-  action: string,
-  fields: Record<string, unknown>,
-  requestId = `req-${++requestCount}`,
-): Promise<ResponseFrame> {
-  const handler = getDeliveryAction(action);
-  if (!handler) throw new Error(`no delivery action ${action}`);
-  await handler({ action, requestId, ...fields }, session);
-  const answers = responses(session, requestId);
-  expect(answers).toHaveLength(1);
-  return answers[0];
-}
-
-function data(frame: ResponseFrame): Record<string, unknown> {
-  if (!frame.ok) throw new Error(`refused: ${frame.error.message}`);
-  return frame.data as Record<string, unknown>;
-}
-
-function refusal(frame: ResponseFrame): string {
-  if (frame.ok) throw new Error(`accepted: ${JSON.stringify(frame.data)}`);
-  return frame.error.message;
-}
-
-async function meeting(id: unknown): Promise<Meeting> {
-  const found = await getMeeting(String(id));
-  if (!found) throw new Error(`no meeting ${String(id)}`);
-  return found;
-}
-
-async function meetingSession(id: unknown): Promise<Session> {
-  const { session_id } = await meeting(id);
-  const session = session_id === null ? undefined : await getSession(session_id);
-  if (!session) throw new Error(`meeting ${String(id)} has no session`);
-  return session;
 }
 
 function arrangeWith(person: Person, extra: Record<string, unknown> = {}): Record<string, unknown> {
@@ -272,49 +157,23 @@ function arrangeWith(person: Person, extra: Record<string, unknown> = {}): Recor
   };
 }
 
-function queueReply(session: Session, id: string, text: string, threadKey: string): void {
-  const db = new Database(outboundDbPath(session.agent_group_id, session.id));
-  db.prepare(
-    `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, content)
-     VALUES (?, ?, 'chat', ?, 'email', ?, ?)`,
-  ).run(id, now(), INBOX_PLATFORM_ID, threadKey, JSON.stringify({ text }));
-  db.close();
-}
-
-async function reply(session: Session, threadKey: string, text: string): Promise<void> {
-  queueReply(session, `out-${Math.random().toString(36).slice(2)}`, text, threadKey);
-  await deliverSessionMessages(session);
-}
-
 async function count(table: string): Promise<number> {
   const row = await getDb().get<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`);
   return row?.n ?? 0;
 }
 
-async function recordBooking(meetingId: string, start: string, end: string, eventId = 'robin-booked-1') {
-  await getDb().run(
-    `INSERT INTO gws_ea_meeting_bookings (meeting_id, calendar_id, event_id, start_at, end_at, booked_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-    meetingId,
-    PRINCIPAL,
-    eventId,
-    start,
-    end,
-    now(),
-  );
+interface BookedTime {
+  readonly calendar_id: string;
+  readonly event_id: string;
+  readonly start: string;
+  readonly end: string;
 }
 
-async function startInbox(): Promise<void> {
-  await teardownChannelAdapters();
-  inbox = createInbox({
-    gmail,
-    calendar: { list: async () => [...calendar.calendars.values()], patchNotifications: async () => undefined },
-    sleep: async () => undefined,
-  });
-  registerChannelAdapter('email', { factory: () => inbox.adapter, defaults: EMAIL_CHANNEL_DEFAULTS });
-  registerChannelAdapter('gchat', { factory: chatAdapter });
-  await initChannelAdapters(() => hostSetup);
-  setDeliveryAdapter(createChannelDeliveryAdapter());
+/** external-email books the first time free_time offers, with its own tools. */
+async function bookFirstTime(session: Session, meetingId: unknown): Promise<BookedTime> {
+  const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: meetingId }));
+  return data(await ask(session, 'meeting_book', { meeting_id: meetingId, slot_id: slot.slot_id }))
+    .booking as BookedTime;
 }
 
 /** The principal copies Robin into a thread with Acme Sales; returns the thread key from main's note. */
@@ -423,7 +282,7 @@ beforeEach(async () => {
   calendar.calendars.set(COLLEAGUE_CALENDAR, { id: COLLEAGUE_CALENDAR, accessRole: 'writer' });
 
   await ensureInbox('ag-external');
-  await startInbox();
+  inbox = await startInbox(gmail, calendar);
   main = (await resolveSession('ag-main', 'mg-dm', null, 'agent-shared')).session;
   await inbox.tick();
 });
@@ -590,7 +449,7 @@ describe('a request replayed after a host restart', () => {
     expect(briefs(session)).toHaveLength(1);
 
     const meetingId = String(data(arranged).meeting_id);
-    await recordBooking(meetingId, inDays(8, 10), inDays(8, 10.5));
+    await bookFirstTime(session, meetingId);
     const booked = await ask(session, 'meeting_outcome', { meeting_id: meetingId, outcome: 'booked' }, 'req-booked');
     await getDeliveryAction('meeting_outcome')?.(
       { action: 'meeting_outcome', requestId: 'req-booked', meeting_id: meetingId, outcome: 'booked' },
@@ -604,31 +463,38 @@ describe('a request replayed after a host restart', () => {
     expect(meetingNotes('booked')).toHaveLength(1);
   });
 
-  it('returns the first result for reschedule and ask_organizer too', async () => {
+  it('finishes the meeting it already created when the host stopped before recording the answer', async () => {
     calendar.put(principalEvent('evt-review', OLU));
     calendar.put(invitation('evt-invite', OLU));
-    const rescheduleFields = {
-      calendar_id: PRINCIPAL,
-      event_id: 'evt-review',
-      ...WINDOW,
-      purpose: 'Moving the review',
-    };
-    const askFields = { calendar_id: PRINCIPAL, event_id: 'evt-invite', ...WINDOW, purpose: 'Your Tuesday invitation' };
+    const requests = [
+      ['meeting_arrange', 'req-arrange', arrangeWith(sam)],
+      [
+        'meeting_reschedule',
+        'req-move',
+        { calendar_id: PRINCIPAL, event_id: 'evt-review', ...WINDOW, purpose: 'Moving the review' },
+      ],
+      [
+        'meeting_ask_organizer',
+        'req-ask',
+        { calendar_id: PRINCIPAL, event_id: 'evt-invite', ...WINDOW, purpose: 'Your Tuesday invitation' },
+      ],
+    ] as const;
+    const created = new Map<string, unknown>();
+    for (const [action, requestId, fields] of requests) {
+      created.set(requestId, data(await ask(main, action, fields, requestId)).meeting_id);
+    }
+    // The meetings opened, but the host stopped before it recorded or wrote their answers.
+    await getDb().run('DELETE FROM gws_ea_meeting_requests');
+    const answers = new Database(inboundDbPath(main.agent_group_id, main.id));
+    answers.prepare("DELETE FROM messages_in WHERE json_extract(content, '$.type') = 'action_response'").run();
+    answers.close();
 
-    const moved = await ask(main, 'meeting_reschedule', rescheduleFields, 'req-move');
-    const asked = await ask(main, 'meeting_ask_organizer', askFields, 'req-ask');
-    await getDeliveryAction('meeting_reschedule')?.(
-      { action: 'meeting_reschedule', requestId: 'req-move', ...rescheduleFields },
-      main,
-    );
-    await getDeliveryAction('meeting_ask_organizer')?.(
-      { action: 'meeting_ask_organizer', requestId: 'req-ask', ...askFields },
-      main,
-    );
-    expect(responses(main, 'req-move')).toEqual([moved]);
-    expect(responses(main, 'req-ask')).toEqual([asked]);
-    expect(await count('gws_ea_meetings')).toBe(2);
-    expect(await count('gws_ea_inbox_threads')).toBe(2);
+    for (const [action, requestId, fields] of requests) {
+      expect(data(await ask(main, action, fields, requestId)).meeting_id).toBe(created.get(requestId));
+      expect(briefs(await meetingSession(created.get(requestId)))).toHaveLength(1);
+    }
+    expect(await count('gws_ea_meetings')).toBe(3);
+    expect(await count('gws_ea_inbox_threads')).toBe(3);
   });
 
   it('answers a failed request with its error once, and never runs it again as a new side effect', async () => {
@@ -675,9 +541,14 @@ describe('outcome', () => {
     const secondSession = await meetingSession(second.meeting_id);
     const other = (await resolveSession('ag-other', 'mg-other', null, 'shared')).session;
 
-    for (const caller of [main, other, secondSession]) {
-      refusal(await ask(caller, 'meeting_outcome', { meeting_id: first.meeting_id, outcome: 'gave-up' }));
+    for (const caller of [main, other]) {
+      expect(
+        refusal(await ask(caller, 'meeting_outcome', { meeting_id: first.meeting_id, outcome: 'gave-up' })),
+      ).toMatch(/Only external-email reports/);
     }
+    expect(
+      refusal(await ask(secondSession, 'meeting_outcome', { meeting_id: first.meeting_id, outcome: 'gave-up' })),
+    ).toMatch(/Use only the meeting your brief names/);
     expect((await meeting(first.meeting_id)).state).toBe('active');
     expect(meetingNotes()).toHaveLength(0);
   });
@@ -691,7 +562,7 @@ describe('outcome', () => {
     ).toMatch(/book/);
     expect(meetingNotes()).toHaveLength(0);
 
-    await recordBooking(String(answer.meeting_id), inDays(8, 10), inDays(8, 10.5));
+    const booking = await bookFirstTime(session, answer.meeting_id);
     vi.mocked(requestWake).mockClear();
     data(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'booked' }));
 
@@ -701,7 +572,7 @@ describe('outcome', () => {
     expect(note.note).toMatchObject({
       meeting_id: answer.meeting_id,
       outcome: 'booked',
-      booking: { calendar_id: PRINCIPAL, event_id: 'robin-booked-1' },
+      booking: { calendar_id: PRINCIPAL, event_id: booking.event_id, start: booking.start, end: booking.end },
     });
     expect(note.text).toContain('Sam Lee');
     expect(note.text).toContain('one line');
@@ -869,16 +740,11 @@ describe('ask_organizer', () => {
     calendar.put({ ...invitation('evt-invite', OLU, 13, 14) });
     refusal(await ask(session, 'meeting_outcome', { meeting_id: meetingId, outcome: 'settled' }));
 
-    // Moved to a slot external-email offered: accepted.
-    await getDb().run(
-      `INSERT INTO gws_ea_meeting_slots (meeting_id, slot_id, start_at, end_at, offered_at) VALUES (?, ?, ?, ?, ?)`,
-      meetingId,
-      'slot-1',
-      inDays(9, 15),
-      inDays(9, 16),
-      now(),
-    );
-    calendar.put({ ...invitation('evt-invite', OLU, 15, 16) });
+    // Moved to a time external-email offered: accepted on that alone, even with something else there since.
+    const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: meetingId }));
+    const at = { start: { dateTime: slot.start }, end: { dateTime: slot.end } };
+    calendar.put({ ...principalEvent('evt-later', SAM), ...at });
+    calendar.put({ ...invitation('evt-invite', OLU), ...at });
     data(await ask(session, 'meeting_outcome', { meeting_id: meetingId, outcome: 'settled' }));
     expect((await meeting(meetingId)).state).toBe('settled');
     expect(meetingNotes('settled')).toHaveLength(1);
@@ -946,18 +812,13 @@ describe('reschedule', () => {
   it('continues in the thread of a meeting the assistant booked, which it takes over', async () => {
     const arranged = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
     const session = await meetingSession(arranged.meeting_id);
-    await recordBooking(String(arranged.meeting_id), inDays(8, 10), inDays(8, 10.5), 'robin-booked-1');
+    const booking = await bookFirstTime(session, arranged.meeting_id);
     data(await ask(session, 'meeting_outcome', { meeting_id: arranged.meeting_id, outcome: 'booked' }));
-    calendar.put({
-      ...principalEvent('robin-booked-1', SAM, 10, 11),
-      start: { dateTime: inDays(8, 10) },
-      end: { dateTime: inDays(8, 10.5) },
-    });
 
     const moved = data(
       await ask(main, 'meeting_reschedule', {
         calendar_id: PRINCIPAL,
-        event_id: 'robin-booked-1',
+        event_id: booking.event_id,
         ...WINDOW,
         purpose: 'Moving our intro',
       }),
@@ -1090,17 +951,12 @@ describe('cancel for an event the principal organizes (R8)', () => {
     const stored = await meeting(arranged.meeting_id);
     const session = await meetingSession(arranged.meeting_id);
     await reply(session, stored.thread_key, 'Hello Sam, I am Robin. Would Tuesday at 10:00 work?');
-    await recordBooking(stored.id, inDays(8, 10), inDays(8, 10.5), 'robin-booked-1');
+    const booking = await bookFirstTime(session, stored.id);
     data(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'booked' }));
-    calendar.put({
-      ...principalEvent('robin-booked-1', SAM),
-      start: { dateTime: inDays(8, 10) },
-      end: { dateTime: inDays(8, 10.5) },
-    });
 
-    const answer = data(await ask(main, 'meeting_cancel', { calendar_id: PRINCIPAL, event_id: 'robin-booked-1' }));
+    const answer = data(await ask(main, 'meeting_cancel', { calendar_id: PRINCIPAL, event_id: booking.event_id }));
     expect(answer).toMatchObject({ state: 'cancelled', meeting_id: stored.id });
-    expect(calendar.event(PRINCIPAL, 'robin-booked-1')?.status).toBe('cancelled');
+    expect(calendar.event(PRINCIPAL, booking.event_id)?.status).toBe('cancelled');
     expect((await meeting(stored.id)).state).toBe('cancelled');
     expect((await getSession(session.id))?.status).toBe('closed');
     expect(await getThreadParticipants(stored.thread_key)).toMatchObject({ state: 'closed' });

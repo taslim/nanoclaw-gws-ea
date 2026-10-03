@@ -3,8 +3,6 @@
  * a typed request the host answers with an `action_response` (KTD5).
  */
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
 import { requestAction } from '../action-request.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
@@ -21,25 +19,10 @@ import {
   releaseHolds,
   reschedule,
 } from './gws-ea-meetings.js';
-import { createMcpServer } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 beforeEach(() => initTestSessionDb());
 afterEach(() => closeSessionDb());
-
-async function served(grants: readonly string[]): Promise<string[]> {
-  const server = createMcpServer(async (action) => action(), new Set(grants));
-  const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
-  const client = new Client({ name: 'meetings-fixture', version: '1' });
-  await server.connect(serverTransport);
-  await client.connect(clientTransport);
-  try {
-    return (await client.listTools()).tools.map((tool) => tool.name).sort();
-  } finally {
-    await client.close();
-    await server.close();
-  }
-}
 
 /** The host's side: wait for the request, then answer it the way delivery does. */
 async function answerNext(frame: (requestId: string) => unknown): Promise<Record<string, unknown>> {
@@ -66,18 +49,6 @@ async function call(tool: McpToolDefinition, args: Record<string, unknown>, fram
 const WINDOW = { window_start: '2026-10-12T09:00:00+01:00', window_end: '2026-10-16T17:00:00+01:00' };
 
 describe('the meeting tools', () => {
-  it("serve main's five requests under one key and external-email's calendar tools and outcome under its own", async () => {
-    expect(await served(['gws-ea-meetings'])).toEqual(['amend', 'arrange', 'ask_organizer', 'cancel', 'reschedule']);
-    expect(await served(['gws-ea-meetings-external'])).toEqual([
-      'book',
-      'free_time',
-      'hold',
-      'outcome',
-      'release_holds',
-    ]);
-    expect(await served(['reply'])).toEqual([]);
-  });
-
   it('send arrange as one typed request carried by its own outbound message, and return the host’s answer', async () => {
     const args = {
       people: [{ person_id: 'p-0123456789ab' }],

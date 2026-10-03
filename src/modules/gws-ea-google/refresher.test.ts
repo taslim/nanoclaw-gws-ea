@@ -1,6 +1,3 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 
 import type {
@@ -10,8 +7,6 @@ import type {
 import { AGENT_GOOGLE_SERVICES, GOOGLE_SIGN_IN_SCOPES, type GoogleGrant } from './grant.js';
 import { createGoogleTokenRefresher, RENEW_BEFORE_EXPIRY_MS, STALE_GMAIL_SECRET } from './refresher.js';
 import { GOOGLE_TOKEN_ENDPOINT } from './tokens.js';
-
-const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 const GRANT: GoogleGrant = {
   schema_version: 1,
@@ -124,6 +119,7 @@ describe('the Google token refresher', () => {
       'https://www.googleapis.com/auth/gmail.readonly',
       'https://www.googleapis.com/auth/directory.readonly',
     ]);
+    expect(w.minted.map((form) => form.get('scope')).join(' ')).not.toContain(MODIFY);
     expect(w.minted[0]?.get('grant_type')).toBe('refresh_token');
     expect([...w.vault.keys()]).toEqual(AGENT_SECRETS);
     expect(w.vault.get('google-gmail-read')).toEqual({
@@ -138,23 +134,6 @@ describe('the Google token refresher', () => {
       },
     });
     expect(w.vault.get('google-directory')?.host).toBe('people.googleapis.com');
-  });
-
-  it('writes only through the connection it is given, and never asks for a gmail.modify token', async () => {
-    const w = world();
-    await refresher(w, () => GRANT, { now: 0 }).refresher.tick();
-
-    for (const [input] of vi.mocked(w.fetch).mock.calls) expect(String(input)).toBe(GOOGLE_TOKEN_ENDPOINT);
-    expect(w.minted.map((form) => form.get('scope'))).not.toContain(MODIFY);
-    expect(w.writes).toEqual(AGENT_SECRETS.map((name) => `create ${name}`));
-  });
-
-  it('carries no client of its own for the gateway, which the connection owns', () => {
-    const source = fs.readFileSync(path.join(HERE, 'refresher.ts'), 'utf8');
-    expect(source).not.toMatch(/\/v1\/secrets|onecli/iu);
-    // Compiled with the host, which builds only src/.
-    expect(source).not.toMatch(/from '(?:\.\.\/)+setup\//u);
-    expect(fs.existsSync(path.join(HERE, 'onecli-secrets.ts'))).toBe(false);
   });
 
   it('removes the stale gmail.modify secret an earlier release left, once', async () => {

@@ -11,7 +11,6 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const TEST_DIR = '/tmp/nanoclaw-test-gws-ea-calendar-actions';
@@ -46,12 +45,8 @@ vi.mock('./calendar-api.js', async (importOriginal) => {
   };
 });
 
-import type { ResponseFrame } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
-import { getSession } from '../../db/sessions.js';
-import { getDeliveryAction } from '../../delivery.js';
-import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import '../permissions/index.js';
@@ -72,8 +67,9 @@ import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import '../gws-ea-external-email/index.js';
 import { consumeOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import { ensureInbox, GoogleApiError } from '../gws-ea-inbox/index.js';
-import { getBooking, getMeeting, listOfferedSlots, type Meeting } from './index.js';
+import { getBooking, listOfferedSlots } from './index.js';
 import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
+import { ask, data, meeting, meetingSession, refusal, slotsOf, type OfferedSlot } from './testing/scheduling.js';
 
 const ROBIN = 'robin@northwind.example';
 const PRINCIPAL = 'pat@northwind.example';
@@ -101,85 +97,14 @@ let sam: Person;
 let dana: Person;
 let kim: Person;
 let lee: Person;
-let requestCount = 0;
 
 function now(): string {
   return new Date().toISOString();
 }
 
-interface InboundRow {
-  id: string;
-  kind: string;
-  content: string;
-}
-
-function inbound(session: Session): InboundRow[] {
-  const file = inboundDbPath(session.agent_group_id, session.id);
-  if (!fs.existsSync(file)) return [];
-  const db = new Database(file, { readonly: true });
-  const rows = db.prepare('SELECT id, kind, content FROM messages_in ORDER BY seq').all() as InboundRow[];
-  db.close();
-  return rows;
-}
-
-function responses(session: Session, requestId: string): ResponseFrame[] {
-  return inbound(session)
-    .map((row) => JSON.parse(row.content) as { type?: string; requestId?: string; frame?: ResponseFrame })
-    .filter((content) => content.type === 'action_response' && content.requestId === requestId)
-    .map((content) => content.frame as ResponseFrame);
-}
-
-async function ask(
-  session: Session,
-  action: string,
-  fields: Record<string, unknown>,
-  requestId = `req-${++requestCount}`,
-): Promise<ResponseFrame> {
-  const handler = getDeliveryAction(action);
-  if (!handler) throw new Error(`no delivery action ${action}`);
-  await handler({ action, requestId, ...fields }, session);
-  const answers = responses(session, requestId);
-  expect(answers).toHaveLength(1);
-  return answers[0];
-}
-
-function data(frame: ResponseFrame): Record<string, unknown> {
-  if (!frame.ok) throw new Error(`refused: ${frame.error.message}`);
-  return frame.data as Record<string, unknown>;
-}
-
-function refusal(frame: ResponseFrame): string {
-  if (frame.ok) throw new Error(`accepted: ${JSON.stringify(frame.data)}`);
-  return frame.error.message;
-}
-
-async function meeting(id: unknown): Promise<Meeting> {
-  const found = await getMeeting(String(id));
-  if (!found) throw new Error(`no meeting ${String(id)}`);
-  return found;
-}
-
-async function meetingSession(id: unknown): Promise<Session> {
-  const { session_id } = await meeting(id);
-  const session = session_id === null ? undefined : await getSession(session_id);
-  if (!session) throw new Error(`meeting ${String(id)} has no session`);
-  return session;
-}
-
 async function count(table: string): Promise<number> {
   const row = await getDb().get<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`);
   return row?.n ?? 0;
-}
-
-interface OfferedSlot {
-  readonly slot_id: string;
-  readonly start: string;
-  readonly end: string;
-  readonly held: boolean;
-}
-
-function slotsOf(frame: ResponseFrame): OfferedSlot[] {
-  return data(frame).slots as OfferedSlot[];
 }
 
 /** The principal's own meeting, with a title, a description and a guest the counterpart must never see. */
@@ -422,7 +347,7 @@ describe('free_time', () => {
     const second = await arranged(sam);
     expect(refusal(await ask(main, 'meeting_free_time', { meeting_id: first.meeting.id }))).toMatch(/external-email/);
     expect(refusal(await ask(second.session, 'meeting_free_time', { meeting_id: first.meeting.id }))).toMatch(
-      /conversation/,
+      /Use only the meeting your brief names/,
     );
     expect(await listOfferedSlots(first.meeting.id)).toEqual([]);
   });

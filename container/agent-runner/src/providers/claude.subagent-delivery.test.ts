@@ -18,27 +18,11 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   },
 }));
 
-// Every key a host grants a group stored as `all`, unless a test narrows it.
-const ALL = [
-  'reply',
-  'files-send',
-  'files-read',
-  'files-write',
-  'shell',
-  'web',
-  'subagents',
-  'conversation-context',
-  'mcp-servers',
-  'interactive',
-  'agents',
-  'self-mod',
-  'time',
-  'schedule-stats',
-  'calendar-facts',
-];
-let grants: ReadonlySet<string> = new Set(ALL);
+// The group's keys: Bash needs one that grants it, while the hook passes
+// NanoClaw's own tools whatever the group holds (its tool server gates them).
+const GRANTS: ReadonlySet<string> = new Set(['shell']);
 const actualConfig = await import('../config.js');
-mock.module('../config.js', () => ({ ...actualConfig, runnerCapabilities: () => grants }));
+mock.module('../config.js', () => ({ ...actualConfig, runnerCapabilities: () => GRANTS }));
 
 await import('./index.js');
 await import('../provider-contracts/index.js');
@@ -53,7 +37,6 @@ beforeEach(() => {
   previousHome = process.env.HOME;
   process.env.HOME = tmp;
   capturedOptions = undefined;
-  grants = new Set(ALL);
   initTestSessionDb();
 });
 
@@ -103,17 +86,6 @@ it.each(DELIVERY_TOOLS)("refuses a subagent's %s, telling it to report back inst
       permissionDecision: 'deny',
       permissionDecisionReason: expect.stringContaining('Return what you found as your result'),
     },
-  });
-});
-
-it.each(DELIVERY_TOOLS)("refuses a subagent's %s in a group holding only reply", async (tool) => {
-  grants = new Set(['reply']);
-  const hook = await preToolUseHook();
-
-  const decision = await hook(call(`mcp__nanoclaw__${tool}`, true));
-
-  expect(decision).toMatchObject({
-    hookSpecificOutput: { permissionDecision: 'deny' },
   });
 });
 

@@ -36,6 +36,7 @@ import {
   EXTERNAL_EMAIL_CAPABILITIES,
   EXTERNAL_EMAIL_MEETINGS_CAPABILITY,
   EXTERNAL_EMAIL_PLUGIN,
+  externalEmailHealth,
   GUIDANCE_PATH,
   getExternalEmailAgentGroupId,
 } from './index.js';
@@ -297,5 +298,24 @@ describe("changes to external-email's configuration", () => {
     );
     expect(host).toMatchObject({ ok: true });
     expect(parseStoredCapabilities((await getContainerConfig(ee.id))?.capabilities, ee.name)).toEqual(['reply']);
+  });
+});
+
+describe("external-email's health", () => {
+  it('reaches status through a hidden host-only command that no agent may run, main included', async () => {
+    const main = group('ag-main');
+    await createGroup(main);
+    await publishMain(main);
+    await updateContainerConfigScalars(main.id, { cli_scope: 'global' });
+    await startHost();
+
+    const report = await dispatch({ id: 'h', command: 'gws-ea-external-email-health', args: {} }, { caller: 'host' });
+    expect(report).toEqual({ id: 'h', ok: true, data: await externalEmailHealth() });
+
+    const fromMain = await dispatch(
+      { id: 'a', command: 'gws-ea-external-email-health', args: {} },
+      { caller: 'agent', sessionId: 'sess-main', agentGroupId: main.id, messagingGroupId: 'mg-dm' },
+    );
+    expect(fromMain).toMatchObject({ ok: false, error: { code: 'forbidden' } });
   });
 });

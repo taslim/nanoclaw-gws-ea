@@ -8,6 +8,8 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
 import { closeSessionDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
+// The barrel loads every tool module under its key; a tool module imported
+// ahead of it would register its tools without one.
 import './index.js';
 import { createMcpServer, loadToolModule, registerTools } from './server.js';
 
@@ -32,8 +34,8 @@ const ALL = [
   'calendar-facts',
 ];
 
-/** What NanoClaw's server served before capabilities existed. */
-const TODAY = [
+/** Every tool of the default-on keys. */
+const DEFAULT_ON_TOOLS = [
   'add_mcp_server',
   'add_reaction',
   'ask_user_question',
@@ -82,20 +84,20 @@ afterEach(() => {
 });
 
 describe('NanoClaw tool server capabilities', () => {
-  it('serves a group holding every key the tools it served before capabilities', async () => {
-    expect(await served(ALL)).toEqual(TODAY);
-  });
-
-  it('serves a group holding reply and time only send_message and the time tools', async () => {
-    expect(await served(['reply', 'time'])).toEqual(['send_message', ...TIME_TOOLS].sort());
-  });
-
-  it('keeps files-send apart from reply', async () => {
-    expect(await served(['files-send'])).toEqual(['add_reaction', 'edit_message', 'send_file']);
-  });
-
-  it('serves nothing to a group holding no keys', async () => {
-    expect(await served([])).toEqual([]);
+  it.each<[string, readonly string[], readonly string[]]>([
+    ['every default-on key', ALL, DEFAULT_ON_TOOLS],
+    ['reply and time', ['reply', 'time'], ['send_message', ...TIME_TOOLS].sort()],
+    ['files-send', ['files-send'], ['add_reaction', 'edit_message', 'send_file']],
+    ['calendar-facts', ['calendar-facts'], ['find_conflicts', 'people_stats']],
+    ['gws-ea-meetings', ['gws-ea-meetings'], ['amend', 'arrange', 'ask_organizer', 'cancel', 'reschedule']],
+    [
+      'gws-ea-meetings-external',
+      ['gws-ea-meetings-external'],
+      ['book', 'free_time', 'hold', 'outcome', 'release_holds'],
+    ],
+    ['no keys', [], []],
+  ])('serves a group holding %s exactly the tools of its keys', async (_holding, grants, tools) => {
+    expect(await served(grants)).toEqual(tools);
   });
 
   it('refuses a call to a tool outside the held keys as unknown', async () => {

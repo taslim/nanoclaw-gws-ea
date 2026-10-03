@@ -185,6 +185,17 @@ export async function setUpScheduling(testDir: string, google: { calendar: unkno
   calendar.calendars.set(PRINCIPAL, { id: PRINCIPAL, accessRole: 'writer', primary: false });
 
   await ensureInbox('ag-external');
+  const inbox = await startInbox(gmail, calendar);
+  const main = (await resolveSession('ag-main', 'mg-dm', null, 'agent-shared')).session;
+  await inbox.tick();
+  return { gmail, calendar, inbox, main, people };
+}
+
+/**
+ * Start the inbox on `gmail` and `calendar`, with the principal's chat, behind
+ * the real channel registry and delivery adapter.
+ */
+export async function startInbox(gmail: FakeGmail, calendar: FakeCalendar): Promise<Inbox> {
   await teardownChannelAdapters();
   const inbox = createInbox({
     gmail,
@@ -195,9 +206,7 @@ export async function setUpScheduling(testDir: string, google: { calendar: unkno
   registerChannelAdapter('gchat', { factory: chatAdapter });
   await initChannelAdapters(() => hostSetup);
   setDeliveryAdapter(createChannelDeliveryAdapter());
-  const main = (await resolveSession('ag-main', 'mg-dm', null, 'agent-shared')).session;
-  await inbox.tick();
-  return { gmail, calendar, inbox, main, people };
+  return inbox;
 }
 
 export async function tearDownScheduling(testDir: string): Promise<void> {

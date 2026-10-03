@@ -4,7 +4,6 @@ import {
   AGENT_GOOGLE_SERVICES,
   EXPOSED_GOOGLE_SERVICES,
   EXPOSED_GOOGLE_SKILLS,
-  GOOGLE_SERVICES,
   GOOGLE_SIGN_IN_SCOPES,
   HOST_GOOGLE_SERVICES,
   missingGoogleScopes,
@@ -47,7 +46,6 @@ describe("the assistant's Google grant", () => {
       'https://www.googleapis.com/auth/directory.readonly',
       'https://www.googleapis.com/auth/gmail.modify',
     ]);
-    expect(GOOGLE_SERVICES).toEqual({ ...AGENT_GOOGLE_SERVICES, ...HOST_GOOGLE_SERVICES });
   });
 
   it("names each required scope a grant lacks, accepting Google's long form of email", () => {

@@ -14,20 +14,6 @@ function specifiers(file: string): string[] {
 }
 
 describe('the runtime credential connection', () => {
-  it('is loaded by the compiled host without importing anything from setup/', () => {
-    const hostFiles = [
-      'gateway-providers/credential-connection.ts',
-      'gateway-providers/gateway-provider-registry.ts',
-      'gateway-providers/index.ts',
-    ].map((file) => path.join(SRC, file));
-    for (const file of hostFiles) {
-      for (const specifier of specifiers(file).filter((s) => s.startsWith('.'))) {
-        const resolved = path.resolve(path.dirname(file), specifier);
-        expect(resolved.startsWith(SRC + path.sep), `${path.relative(ROOT, file)} imports ${specifier}`).toBe(true);
-      }
-    }
-  });
-
   it('is the one contract setup hands its providers, re-exported rather than declared twice', () => {
     const setupStore = path.join(ROOT, 'setup', 'gateways', 'credential-store.ts');
     const source = fs.readFileSync(setupStore, 'utf8');

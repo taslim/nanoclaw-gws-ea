@@ -15,7 +15,6 @@ import {
   openSlots,
   schedulingRules,
   slotIdFor,
-  workingDayEnd,
   workingDaysLater,
   zonedInstant,
   type SchedulingRules,
@@ -260,13 +259,20 @@ describe('choosing which times to offer', () => {
   const now = MONDAY_NINE;
   const earliest = now + HOUR;
 
-  it('prefers the next two working days for an active counterpart', () => {
-    const q = query({ window: WEEK, level: 'active', earliest });
-    const best = bestSlots(q, openSlots(q), 5, now);
-    expect(best).toHaveLength(5);
-    const horizon = at('2026-10-06T16:00:00Z'); // Tuesday 17:00
-    expect(best.filter((slot) => slot.end <= horizon)).toHaveLength(4);
-    expect(best.slice(0, 2).map((slot) => weekday(slot.start))).toEqual(['Mon', 'Tue']);
+  it('prefers the next two working days for an active counterpart, from the next one once the day is over', () => {
+    const twoWeeks = span('2026-10-04T23:00:00Z', '2026-10-18T23:00:00Z');
+    for (const [from, horizon] of [
+      // Monday 09:00: Monday and Tuesday, to Tuesday 17:00.
+      [MONDAY_NINE, '2026-10-06T16:00:00Z'],
+      // Friday 18:00: Friday is over, so Monday and Tuesday, to Tuesday 17:00.
+      [at('2026-10-09T17:00:00Z'), '2026-10-13T16:00:00Z'],
+    ] as const) {
+      const q = query({ window: twoWeeks, level: 'active', earliest: from + HOUR });
+      const best = bestSlots(q, openSlots(q), 5, from);
+      expect(best).toHaveLength(5);
+      expect(best.filter((slot) => slot.end <= at(horizon))).toHaveLength(4);
+      expect(best.slice(0, 2).map((slot) => weekday(slot.start))).toEqual(['Mon', 'Tue']);
+    }
   });
 
   it('spreads a known or unknown counterpart’s times across the window, with no other preference', () => {
@@ -325,15 +331,6 @@ describe('choosing which times to offer', () => {
 });
 
 describe('working days', () => {
-  it('end on the working day the count reaches, skipping weekends and finished days', () => {
-    // Monday 09:00: Monday is the first working day, Tuesday the second.
-    expect(iso(workingDayEnd(MONDAY_NINE, 2, WEEKDAY_RULES, LONDON) ?? 0)).toBe('2026-10-06T16:00:00.000Z');
-    // Friday 18:00: Friday is over, so Monday and Tuesday.
-    expect(iso(workingDayEnd(at('2026-10-09T17:00:00Z'), 2, WEEKDAY_RULES, LONDON) ?? 0)).toBe(
-      '2026-10-13T16:00:00.000Z',
-    );
-  });
-
   it('assume Monday to Friday, 09:00 to 17:00, until the principal has working hours', () => {
     const none = schedulingRules(
       { working_hours: [], protected_windows: [], meeting_lengths: [], buffers: [], preferred_times: [] },

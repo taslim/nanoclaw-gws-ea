@@ -53,7 +53,7 @@ await import('./index.js');
 await import('../provider-contracts/index.js');
 const { createProvider } = await import('./factory.js');
 const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
-const { BASE_BUILTIN_TOOLS, SDK_DISALLOWED_TOOLS, TOOL_ALLOWLIST } = await import('./claude-config.js');
+const { SDK_DISALLOWED_TOOLS, TOOL_ALLOWLIST } = await import('./claude-config.js');
 
 /** The list a host writes into container.json for a group stored as `all`. */
 const ALL = [
@@ -229,6 +229,7 @@ describe('the pinned SDK offers only granted built-in tools', () => {
     const offered = await wireTools(await optionsFor(REPLY_AND_TIME));
 
     expect(offered.filter((tool) => WITHHELD_FROM_REPLY_AND_TIME.includes(tool))).toEqual([]);
+    expect(offered).toContain('Skill');
   }, 60_000);
 
   it("offers a group holding every key exactly today's tools", async () => {
@@ -260,14 +261,9 @@ describe('the SDK options a group holding every key gets', () => {
 });
 
 describe('a group holding reply and time', () => {
-  it('is offered only the built-ins every agent keeps, with nothing else to start', async () => {
+  it("starts no MCP server but NanoClaw's own", async () => {
     const options = await optionsFor(REPLY_AND_TIME);
 
-    expect(options.tools).toEqual([...BASE_BUILTIN_TOOLS]);
-    expect(options.disallowedTools).toEqual(expect.arrayContaining(['Bash', 'Read', 'WebFetch', 'Write', 'Agent']));
-    expect(options.allowedTools).toEqual(
-      expect.not.arrayContaining(['Bash', 'Read', 'WebSearch', 'Task', 'mcp__custom_server__*']),
-    );
     expect(Object.keys(options.mcpServers ?? {})).toEqual(['nanoclaw']);
     expect(options.strictMcpConfig).toBe(true);
     // claude.ai connectors stay off without mcp-servers.
@@ -304,17 +300,11 @@ describe('a group holding reply and time', () => {
   });
 });
 
-describe('a container.json without a valid capability list', () => {
-  it.each([[{}], [{ capabilities: 'all' }], [{ capabilities: ['reply', 7] }]])(
-    'grants no tools at all (%j)',
-    async (raw) => {
-      const { capabilities } = actualConfig.runnerConfigFromRaw(raw);
-      const options = await optionsFor([...capabilities]);
+it('gives a group holding no keys no tools, no other server, and no Skill', async () => {
+  const options = await optionsFor([]);
 
-      expect(options.tools).toEqual([]);
-      expect(Object.keys(options.mcpServers ?? {})).toEqual(['nanoclaw']);
-      const hook = await hookFor([...capabilities]);
-      expect(await hook(call('Skill'))).toMatchObject({ hookSpecificOutput: { permissionDecision: 'deny' } });
-    },
-  );
+  expect(options.tools).toEqual([]);
+  expect(Object.keys(options.mcpServers ?? {})).toEqual(['nanoclaw']);
+  const hook = await hookFor([]);
+  expect(await hook(call('Skill'))).toMatchObject({ hookSpecificOutput: { permissionDecision: 'deny' } });
 });

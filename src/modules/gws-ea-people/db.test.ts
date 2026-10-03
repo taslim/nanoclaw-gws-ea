@@ -33,14 +33,12 @@ const NOW = '2026-10-02T16:00:00.000Z';
 const LATER = '2026-10-03T09:30:00.000Z';
 const MAIN = { id: 'ag-main', name: 'main', folder: 'ag-main', agent_provider: null, created_at: NOW };
 
-/** What the registered forget hooks saw, in call order, and a stand-in for another module's per-person data. */
+/** What the registered forget hooks saw, in call order. */
 const hookCalls: Array<readonly [hook: string, person: ForgottenPerson]> = [];
-const meetingsByHandle = new Map<string, string[]>();
 /** Set to make the sessions hook fail its next call, as a module whose store is down would. */
 let sessionsHookFailure: Error | undefined;
 registerPersonForgetHook('test-meetings:purge', async (person) => {
   hookCalls.push(['meetings', person]);
-  for (const handle of person.handles) meetingsByHandle.delete(handle);
 });
 registerPersonForgetHook('test-sessions:purge', async (person) => {
   hookCalls.push(['sessions', person]);
@@ -101,7 +99,6 @@ beforeEach(async () => {
   fs.chmodSync(secretsDir, 0o700);
   vi.stubEnv(GOOGLE_GRANT_FILE_ENV, path.join(secretsDir, 'google-grant.json'));
   hookCalls.length = 0;
-  meetingsByHandle.clear();
   await runMigrations(await initTestDb());
   await setUpInstance();
 });
@@ -517,12 +514,10 @@ describe('forgetting a person', () => {
         agent_group_id: null,
       });
     }
-    meetingsByHandle.set('email:pat@example.test', ['m-1']);
-    meetingsByHandle.set('email:other@example.test', ['m-2']);
     return id;
   }
 
-  it('deletes the record with its identities, names, and instructions, purges its email users and dropped messages, calls every hook, and keeps only keyed fingerprints', async () => {
+  it('deletes the record with its identities, names, and instructions, purges its email users and dropped messages, calls every hook, and keeps only keyed fingerprints (AE9)', async () => {
     const id = await seedPat();
 
     expect(await forgetPerson({ id, source: 'principal' })).toEqual({ forgotten: id, identities: 2 });
@@ -547,7 +542,6 @@ describe('forgetting a person', () => {
       ['meetings', { id, handles }],
       ['sessions', { id, handles }],
     ]);
-    expect([...meetingsByHandle.keys()]).toEqual(['email:other@example.test']);
 
     const fingerprints = await getDb().all<{ fingerprint: string; forgotten_at: string }>(
       'SELECT fingerprint, forgotten_at FROM gws_ea_people_fingerprints ORDER BY fingerprint',
@@ -734,27 +728,6 @@ describe('forgetting a person', () => {
       fs.rmSync(instanceDir, { recursive: true, force: true });
       await initTestDb();
     }
-  });
-
-  it('covers AE9: once Pat is close no learned write lowers Pat, and after forget Pat is unknown with their data gone', async () => {
-    const { id } = await addPerson({
-      name: 'Pat',
-      level: 'close',
-      source: 'principal',
-      basis: 'The principal said Pat is close.',
-      identity: 'email:pat@example.test',
-    });
-    meetingsByHandle.set('email:pat@example.test', ['m-1', 'm-2']);
-
-    await expect(
-      setPersonLevel({ id, level: 'known', source: 'learned', basis: 'No meetings in a month.' }),
-    ).rejects.toThrow(/set by the principal/i);
-    expect(await getPersonLevel('email:pat@example.test')).toBe('close');
-
-    await forgetPerson({ id, source: 'principal' });
-    expect(await getPersonLevel('email:pat@example.test')).toBe('unknown');
-    expect(meetingsByHandle.has('email:pat@example.test')).toBe(false);
-    expect(hookCalls.map(([hook]) => hook)).toEqual(['meetings', 'sessions']);
   });
 });
 

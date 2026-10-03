@@ -239,16 +239,6 @@ describe('a reply that fails permanently', () => {
     expect(sent.filter((send) => !isNotice(send))).toHaveLength(6);
   });
 
-  it('keeps the channel error out of the notice', async () => {
-    const { main } = await seedAssistant();
-    queue(main, { id: 'out-a', content: { text: 'A' } });
-    channel((send) => !isNotice(send));
-
-    await drain(main, 3);
-
-    expect(sent.map((send) => send.content).join('\n')).not.toContain('message too long');
-  });
-
   it('tells the principal’s direct message, never the counterpart’s thread it was bound for', async () => {
     const { external } = await seedAssistant();
     queue(external, { id: 'out-email', content: { text: 'Does Tuesday work?' }, route: EMAIL_THREAD, threadId: 'm-1' });

@@ -2,11 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
-// The barrel loads first, so the module's tools register under their capability key.
-import './index.js';
 import {
   createCalendarFactTools,
   type Conflict,
@@ -14,7 +10,6 @@ import {
   type PeopleStatsResult,
   type PersonStats,
 } from './calendar-facts.js';
-import { createMcpServer } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 const ZONE = 'Europe/London';
@@ -622,11 +617,12 @@ describe('reading gog files', () => {
   });
 
   it('refuses a malformed file, naming it', async () => {
+    const firstPage = writeRaw('{"events": [], "nextPageToken": "abc"}');
     const malformed: Array<[string, string]> = [
       [writeRaw('{"events": ['), 'not valid JSON'],
       [writeRaw('{"items": []}'), 'gog calendar events'],
       [writeRaw('[]'), 'gog calendar events'],
-      [writeRaw('{"events": [], "nextPageToken": "abc"}'), '--all-pages'],
+      [firstPage, '--all-pages'],
       [writeRaw('{"events": [], "nextPageTokens": [{"calendarId": "x", "nextPageToken": "abc"}]}'), '--all-pages'],
       [
         writeRaw(
@@ -652,35 +648,14 @@ describe('reading gog files', () => {
       ],
     ];
 
-    for (const tool of tools()) {
-      for (const [file, reason] of malformed) {
-        const text = await refusal(tool, { files: [file] });
-        expect(text).toContain(file);
-        expect(text).toContain(reason);
-      }
+    for (const [file, reason] of malformed) {
+      const text = await refusal(findConflicts, { files: [file] });
+      expect(text).toContain(file);
+      expect(text).toContain(reason);
     }
-  });
-});
-
-describe('registration', () => {
-  async function served(grants: readonly string[]): Promise<string[]> {
-    const server = createMcpServer(async (action) => action(), new Set(grants));
-    const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
-    const client = new Client({ name: 'calendar-facts-fixture', version: '1' });
-    await server.connect(serverTransport);
-    await client.connect(clientTransport);
-    try {
-      return (await client.listTools()).tools.map((tool) => tool.name).sort();
-    } finally {
-      await client.close();
-      await server.close();
-    }
-  }
-
-  it('serves both tools only to a group holding calendar-facts', async () => {
-    expect(await served(['calendar-facts'])).toEqual(['find_conflicts', 'people_stats']);
-    const withoutKey = await served(['reply', 'time', 'schedule-stats']);
-    expect(withoutKey).not.toContain('find_conflicts');
-    expect(withoutKey).not.toContain('people_stats');
+    // people_stats reads its files through the same reader.
+    const statsRefusal = await refusal(peopleStats, { files: [firstPage] });
+    expect(statsRefusal).toContain(firstPage);
+    expect(statsRefusal).toContain('--all-pages');
   });
 });

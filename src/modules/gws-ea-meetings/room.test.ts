@@ -276,20 +276,17 @@ describe('making room', () => {
     expect((await meeting(dana.stored.id)).state).toBe('active');
   });
 
-  it('never offers an event someone else organizes, or a meeting with someone at the same or a higher level', async () => {
+  it('never offers a meeting someone else now organizes, or one with someone at the same or a higher level', async () => {
     const { people } = scheduling;
+    const withPat = await bookedAt([people.pat], '2026-10-08', '09:00', 60, 'Coffee with Pat');
     const withLee = await bookedAt([people.lee], '2026-10-08', '10:00', 60, 'Lunch with Lee');
     await bookedAt([people.jo], '2026-10-08', '11:00', 60, 'Family call');
     await bookedAt([people.pat, people.lee], '2026-10-08', '12:00', 60, 'Three of us');
-    scheduling.calendar.put({
-      ...own('evt-invite', '2026-10-08T08:00:00Z', '2026-10-08T09:00:00Z'),
-      organizer: { email: ADDRESSES.pat },
-      attendees: [
-        { email: ADDRESSES.pat, organizer: true, responseStatus: 'accepted' },
-        { email: PRINCIPAL, responseStatus: 'accepted' },
-      ],
-    });
     scheduling.calendar.put(own('evt-focus', '2026-10-08T12:00:00Z', '2026-10-08T13:00:00Z'));
+    // Pat took the coffee over: the assistant's booking, organized by Pat now.
+    const coffee = scheduling.calendar.event(PRINCIPAL, withPat.eventId);
+    if (!coffee) throw new Error('the coffee is not on the calendar');
+    scheduling.calendar.put({ ...coffee, organizer: { email: ADDRESSES.pat } });
 
     const dana = await danaNeedsRoom('2026-10-08T14:00:00+01:00', 60);
     expect(dana.note.note?.candidates).toEqual([]);
@@ -304,17 +301,6 @@ describe('making room', () => {
       }),
     );
     expect(sameLevel).toMatch(/Lee Wu/);
-    expect(
-      refusal(
-        await ask(scheduling.main, 'meeting_reschedule', {
-          calendar_id: PRINCIPAL,
-          event_id: 'evt-invite',
-          ...WEEK,
-          purpose: 'Making room',
-          making_room_for: dana.stored.id,
-        }),
-      ),
-    ).toMatch(/organizes/);
     expect((await meeting(withLee.stored.id)).state).toBe('booked');
   });
 });

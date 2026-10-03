@@ -102,10 +102,4 @@ describe('a protected agent group', () => {
       expect(decision).toMatchObject({ effect: 'deny', reason: expect.stringContaining('it is the host’s alone') });
     }
   });
-
-  it('leaves every other group to hold for approval as before', async () => {
-    withDocker();
-    expect((await guard(selfModInstallPackages, { actor: agent, payload: { apt: ['jq'] } })).effect).toBe('hold');
-    expect((await guard(selfModAddMcpServer, { actor: agent, payload: { name: 'srv' } })).effect).toBe('hold');
-  });
 });

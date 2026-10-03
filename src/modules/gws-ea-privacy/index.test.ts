@@ -29,7 +29,7 @@ vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn().mockResolvedValue
 
 import { dispatch } from '../../cli/dispatch.js';
 import type { CallerContext } from '../../cli/frame.js';
-import { commandGuard, lookup } from '../../cli/registry.js';
+import { lookup } from '../../cli/registry.js';
 import { getDb } from '../../db/connection.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
@@ -214,14 +214,9 @@ afterEach(async () => {
 });
 
 describe('private values in ncl', () => {
-  it('registers add, list, and remove as open private-values commands', () => {
-    for (const verb of ['add', 'list', 'remove']) {
-      expect(lookup(`private-values-${verb}`), verb).toMatchObject({
-        access: 'open',
-        resource: 'private-values',
-        action: `private-values.${verb}`,
-      });
-      expect(commandGuard(`private-values-${verb}`).action).toBe(`private-values.${verb}`);
+  it('registers no generic verb, which would skip the main-only check and the removal card', () => {
+    for (const generic of ['get', 'create', 'update', 'delete']) {
+      expect(lookup(`private-values-${generic}`), generic).toBeUndefined();
     }
   });
 
@@ -333,6 +328,28 @@ describe('removing a private value', () => {
     });
     expect(await listPrivateValues()).toHaveLength(1);
     expect(notes(main).at(-1)).toMatch(/rejected/i);
+  });
+
+  it('keeps the value when the clicker is no longer the verified principal, though another one is', async () => {
+    const id = await addHome();
+    await run('private-values-remove', { id }, agent(main));
+    const [approval] = await pendingApprovals();
+    const successor = 'gchat:users/principal-later';
+    await upsertUser({ id: successor, kind: 'gchat', display_name: 'Pat', created_at: now() });
+    await bindVerifiedPrincipalUser(successor, now());
+    await upsertUserDm({ user_id: successor, channel_type: 'gchat', messaging_group_id: 'mg-dm', resolved_at: now() });
+    await getDb().run('DELETE FROM gws_ea_principal_users WHERE user_id = ?', PRINCIPAL);
+
+    await handleApprovalsResponse({
+      questionId: approval.approval_id,
+      value: 'approve',
+      userId: PRINCIPAL,
+      channelType: DM.channelType,
+      platformId: DM.platformId,
+      threadId: null,
+    });
+    expect(await listPrivateValues()).toHaveLength(1);
+    expect(notes(main).at(-1)).toMatch(/only the principal can confirm/);
   });
 
   it('lets the operator remove a value directly, and refuses an unknown one', async () => {
@@ -476,13 +493,6 @@ describe('the audience check on delivery', () => {
 });
 
 describe('the shared check', () => {
-  it("refuses main's arrange purpose with a private value before it reaches external-email", async () => {
-    await addHome();
-    const verdict = await checkOutbound('Coffee at 123 Main Street to talk about the offsite', 'others');
-    expect(verdict).toEqual({ allowed: false, kind: 'address', reason: expect.stringMatching(/address/) });
-    if (!verdict.allowed) expect(verdict.reason).not.toMatch(/main|springfield|home/i);
-  });
-
   it.each([
     ['an event title', ['Lunch at 123 Main St', '', '', '']],
     ['a location', ['Lunch', '123 Main St, Springfield', '', '']],

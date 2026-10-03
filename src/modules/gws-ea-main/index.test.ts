@@ -10,7 +10,6 @@ import { getHostStartCallbacks } from '../../host-lifecycle.js';
 import { composeGroupProjectDoc } from '../../project-doc-compose.js';
 import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
 import type { AgentGroup } from '../../types.js';
-import { EXPOSED_GOOGLE_SKILLS } from '../gws-ea-google/grant.js';
 import { reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import { GUIDANCE_PATH, MAIN_SHARED_SKILLS } from './index.js';
 import '../gws-ea-profile/index.js';
@@ -235,11 +234,9 @@ describe("main's skills", () => {
       { caller: 'host' },
     );
 
-    expect(response).toMatchObject({ ok: true, data: { agent_group_id: main.id, skills: [...MAIN_SHARED_SKILLS] } });
-    expect(await skillsOf(main.id)).toEqual([...MAIN_SHARED_SKILLS]);
-    expect(MAIN_SHARED_SKILLS).not.toContain('welcome');
-    expect(MAIN_SHARED_SKILLS).not.toContain('self-customize');
-    expect(MAIN_SHARED_SKILLS).not.toContain('frontend-engineer');
+    const skills = ['agent-browser', 'gcalendar', 'gmail', 'gpeople'];
+    expect(response).toMatchObject({ ok: true, data: { agent_group_id: main.id, skills } });
+    expect(await skillsOf(main.id)).toEqual(skills);
   });
 
   it('refuses a group with no container config, and an unknown flag', async () => {
@@ -254,11 +251,6 @@ describe("main's skills", () => {
       { caller: 'host' },
     );
     expect(flag).toMatchObject({ ok: false });
-  });
-
-  it("lists the skill of every Google capability, which main's capabilities then bound", () => {
-    expect(MAIN_SHARED_SKILLS).toEqual(['agent-browser', ...EXPOSED_GOOGLE_SKILLS]);
-    expect(EXPOSED_GOOGLE_SKILLS).toEqual(['gcalendar', 'gmail', 'gpeople']);
   });
 
   it("rewrites no group's skills when the host starts, main's included", async () => {

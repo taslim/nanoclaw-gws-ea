@@ -521,6 +521,8 @@ describe("external-email's pointer and audience", () => {
 
   it('records the pointer beside main, once, and never moves it', async () => {
     expect(await getExternalEmailAgentGroupId()).toBeNull();
+    await expect(recordExternalEmailAgentGroupId('ag-missing')).rejects.toThrow(/FOREIGN KEY/i);
+    expect(await getExternalEmailAgentGroupId()).toBeNull();
     await recordExternalEmailAgentGroupId(ee.id);
     await recordExternalEmailAgentGroupId(ee.id);
 
@@ -529,7 +531,6 @@ describe("external-email's pointer and audience", () => {
       external_email_agent_group_id: ee.id,
     });
     await expect(recordExternalEmailAgentGroupId(research.id)).rejects.toThrow(/already bound/);
-    await expect(recordExternalEmailAgentGroupId('ag-missing')).rejects.toThrow();
   });
 
   it('writes each document for its audience: external-email gets the two names and no address', async () => {

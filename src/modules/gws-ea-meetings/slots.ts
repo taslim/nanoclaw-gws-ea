@@ -419,12 +419,7 @@ export function bestSlots(query: SlotQuery, open: readonly Span[], limit: number
  * principal's working hours and clock; undefined when the principal works no
  * days at all.
  */
-export function workingDayEnd(
-  from: number,
-  count: number,
-  rules: SchedulingRules,
-  timezone: string,
-): number | undefined {
+function workingDayEnd(from: number, count: number, rules: SchedulingRules, timezone: string): number | undefined {
   if (rules.workingHours.size === 0) return undefined;
   let counted = 0;
   let date: LocalDate = localTime(from, timezone);

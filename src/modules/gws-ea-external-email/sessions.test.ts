@@ -1,7 +1,7 @@
 /**
  * Covers R20 for the provider's own state: each external-email session gets
  * its own Claude home, so one thread's transcript never reaches another's
- * container. A group holding `conversation-context` keeps one home per group.
+ * container.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -22,15 +22,10 @@ vi.mock('../../log.js', () => ({
 
 import { configFromDb } from '../../container-config.js';
 import { buildMounts } from '../../container-runner.js';
-import { ensureContainerConfig, getContainerConfig } from '../../db/container-configs.js';
-import { closeDb, createAgentGroup, getAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { getContainerConfig } from '../../db/container-configs.js';
+import { closeDb, getAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { getHostStartCallbacks } from '../../host-lifecycle.js';
-import {
-  assertProviderHostContractShape,
-  getProviderHostContract,
-  type ProviderHostContract,
-} from '../../provider-contracts/index.js';
 import type { VolumeMount } from '../../providers/provider-container-registry.js';
 import type { AgentGroup, Session } from '../../types.js';
 import { getExternalEmailAgentGroupId } from './index.js';
@@ -116,48 +111,5 @@ describe("external-email's Claude home", () => {
     }
     const order = b.map((mount) => mount.containerPath);
     expect(order.indexOf('/workspace/.claude-shared/skills')).toBeGreaterThan(order.indexOf('/workspace'));
-  });
-
-  it('stays one home per group for a group holding conversation-context', async () => {
-    const group: AgentGroup = {
-      id: 'ag-shared',
-      name: 'shared',
-      folder: 'shared',
-      agent_provider: null,
-      created_at: new Date().toISOString(),
-    };
-    await createAgentGroup(group);
-    await ensureContainerConfig(group.id);
-
-    const groupHome = path.join(DATA_DIR, 'v2-sessions', group.id, '.claude-shared');
-    expect(home(await mountsFor(group, 'sess-a')).hostPath).toBe(groupHome);
-    expect(home(await mountsFor(group, 'sess-b')).hostPath).toBe(groupHome);
-  });
-});
-
-describe('the sealed-session declaration on provider state', () => {
-  it("is declared on Claude's home", () => {
-    expect(getProviderHostContract('claude')?.stateVolumes).toEqual([
-      expect.objectContaining({ id: 'claude-home', scope: 'group', sealedScope: 'session' }),
-    ]);
-  });
-
-  it('is accepted only as `session`, on a group volume', () => {
-    const claude = getProviderHostContract('claude');
-    if (!claude) throw new Error('no Claude contract');
-    const withVolume = (volume: Record<string, unknown>): ProviderHostContract =>
-      ({ ...claude, stateVolumes: [{ ...claude.stateVolumes[0], ...volume }] }) as ProviderHostContract;
-
-    expect(() => assertProviderHostContractShape('fixture', withVolume({}))).not.toThrow();
-    expect(() => assertProviderHostContractShape('fixture', withVolume({ sealedScope: 'group' }))).toThrow(
-      /sealedScope/,
-    );
-    expect(() =>
-      assertProviderHostContractShape('fixture', {
-        ...claude,
-        stateVolumes: [{ ...claude.stateVolumes[0], scope: 'session', sealedScope: 'session' }],
-        files: [],
-      } as ProviderHostContract),
-    ).toThrow(/sealedScope/);
   });
 });

@@ -2,12 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import {
-  credentialsWithinCapabilities,
-  listCapabilityKeys,
-  resolveCapabilities,
-  skillsWithinCapabilities,
-} from '../../capabilities.js';
+import { credentialsWithinCapabilities, resolveCapabilities, skillsWithinCapabilities } from '../../capabilities.js';
 import type { ContainerConfig } from '../../container-config.js';
 import { composeSessionSpec } from '../../container-runner.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
@@ -120,12 +115,6 @@ afterEach(async () => {
 });
 
 describe('Google capabilities', () => {
-  it('registers one key per agent-facing service, on by default, so a group on `all` holds every one', () => {
-    expect(EXPOSED_GOOGLE_SERVICES.map((id) => AGENT_GOOGLE_SERVICES[id].capability)).toEqual(GOOGLE_KEYS);
-    expect(listCapabilityKeys()).toEqual(expect.arrayContaining(GOOGLE_KEYS));
-    expect(resolveCapabilities('all', 'main')).toEqual(expect.arrayContaining(GOOGLE_KEYS));
-  });
-
   it("bounds each service's skill by its key", () => {
     const skills = ['agent-browser', 'gcalendar', 'gmail', 'gpeople'];
     const calendarOnly = new Set(['shell', 'google-calendar']);

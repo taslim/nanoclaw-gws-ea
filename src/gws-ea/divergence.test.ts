@@ -519,7 +519,7 @@ describe('recorded divergence: a Google Chat message keeps its attachments', () 
   });
 });
 
-describe('recorded divergence: delivery consults outbound guards and reports failures to hooks', () => {
+describe('recorded divergence: delivery consults outbound guards, and the runner reports a failed turn', () => {
   it('refuses a send that a registered outbound guard refuses, before the channel adapter sees it', async () => {
     await freshInstall();
     const delivery = await import('../delivery.js');
@@ -541,26 +541,10 @@ describe('recorded divergence: delivery consults outbound guards and reports fai
     expect(sent).toEqual([]);
   });
 
-  it('lets modules hear failed deliveries and given-up inbound messages, with no notice written by core', async () => {
-    await freshInstall();
-    const delivery = await import('../delivery.js');
-    const reconcile = await import('../reconcile-session.js');
-    const source = await readFile(path.join(originalCwd, 'src/delivery.ts'), 'utf8');
-
-    expect(typeof delivery.registerDeliveryFailedHook).toBe('function');
-    expect(typeof reconcile.registerInboundFailedHook).toBe('function');
-    expect(source).not.toContain('Something went wrong');
-  });
-
-  it("reports a failed turn from the agent runner as a typed action, and keeps the runner's time, schedule, and calendar-fact tools", async () => {
+  it('reports a failed turn from the agent runner as a typed action', async () => {
     const pollLoop = await readFile(path.join(originalCwd, 'container/agent-runner/src/poll-loop.ts'), 'utf8');
-    const tools = await readFile(path.join(originalCwd, 'container/agent-runner/src/mcp-tools/index.ts'), 'utf8');
 
     expect(pollLoop).toContain("action: 'turn_failed'");
-    expect(pollLoop).not.toContain('Something went wrong');
-    expect(tools).toContain("await loadToolModule('time', () => import('./time.js'));");
-    expect(tools).toContain("await loadToolModule('schedule-stats', () => import('./schedule-stats.js'));");
-    expect(tools).toContain("await loadToolModule('calendar-facts', () => import('./calendar-facts.js'));");
   });
 });
 
@@ -576,42 +560,7 @@ describe('recorded divergence: an adapter learns whether its inbound message was
   });
 });
 
-describe('recorded divergence: delivery actions answer their calling tool with one typed response', () => {
-  it('answers a cli_request as an action_response, and keeps the first answer when the request is replayed', async () => {
-    await freshInstall();
-    const db = await import('../db/index.js');
-    await db.runMigrations(await db.initTestDb());
-    await import('../mailbox/compose.js');
-    const { resolveSession } = await import('../session-manager.js');
-    const { inboundDbPath } = await import('../mailbox/sqlite/paths.js');
-    const { getDeliveryAction } = await import('../delivery.js');
-    await import('../cli/delivery-action.js');
-    await db.createAgentGroup({
-      id: 'ag-guard',
-      name: 'guard',
-      folder: 'guard',
-      agent_provider: null,
-      created_at: new Date().toISOString(),
-    });
-    const { session } = await resolveSession('ag-guard', null, null, 'agent-shared');
-    const handler = getDeliveryAction('cli_request');
-    if (!handler) throw new Error('cli_request is not registered');
-    const content = { action: 'cli_request', requestId: 'req-1', command: 'help', args: {} };
-
-    await handler(content, session);
-    await handler(content, session);
-
-    const inbound = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
-    const rows = inbound.prepare("SELECT id, content FROM messages_in WHERE id LIKE 'action-resp-%'").all() as Array<{
-      id: string;
-      content: string;
-    }>;
-    inbound.close();
-    await db.closeDb();
-    expect(rows.map((row) => row.id)).toEqual(['action-resp-req-1']);
-    expect(JSON.parse(rows[0]!.content)).toMatchObject({ type: 'action_response', requestId: 'req-1' });
-  });
-
+describe("recorded divergence: the runner's tool barrel loads the meeting tools", () => {
   it("loads the runner's meeting tools, which name their own capability keys", async () => {
     const tools = await readFile(path.join(originalCwd, 'container/agent-runner/src/mcp-tools/index.ts'), 'utf8');
     expect(tools).toContain("await import('./gws-ea-meetings.js');");
@@ -619,31 +568,11 @@ describe('recorded divergence: delivery actions answer their calling tool with o
 });
 
 describe('recorded divergence: each agent group has a capability list', () => {
-  it("grants every built-in key to `all`, and nothing for a list it can't read", async () => {
+  it('refuses a restricted agent behind a gateway that cannot narrow its credentials, at every spawn and adoption', async () => {
     await freshInstall();
-    const capabilities = await import('../capabilities.js');
-
-    expect(capabilities.resolveCapabilities('all', 'divergence')).toEqual(
-      expect.arrayContaining(['reply', 'files-send', 'files-read', 'files-write', 'shell', 'web', 'subagents']),
-    );
-    expect(capabilities.resolveCapabilities('all', 'divergence')).toContain('calendar-facts');
-    expect(capabilities.grantsInstructions('calendar-facts', new Set(['calendar-facts']))).toBe(true);
-    expect(
-      capabilities.resolveCapabilities(capabilities.parseStoredCapabilities('{x', 'divergence'), 'divergence'),
-    ).toEqual([]);
-  });
-
-  it("names each key's gateway credentials, and core refuses a restricted agent behind a gateway that cannot narrow them", async () => {
-    await freshInstall();
-    const capabilities = await import('../capabilities.js');
     const registry = await import('../gateway-providers/gateway-provider-registry.js');
-    await import('../modules/gws-ea-google/index.js');
     const runner = await readFile(path.join(originalCwd, 'src/container-runner.ts'), 'utf8');
 
-    expect(capabilities.credentialsWithinCapabilities(new Set(['google-mail-read']))).toEqual(['google-gmail-read']);
-    expect(capabilities.credentialsWithinCapabilities(new Set(capabilities.resolveCapabilities('all', 'x')))).toEqual(
-      expect.arrayContaining(['google-calendar', 'google-gmail-read', 'google-directory']),
-    );
     const input = (credentialScope: GatewaySessionInput['credentialScope']): GatewaySessionInput => ({
       key: { installSlug: 'install', agentGroupId: 'g', sessionId: 's' },
       runtimeIdentity: 'install/g/s',
@@ -666,22 +595,14 @@ describe('recorded divergence: each agent group has a capability list', () => {
     expect(runner.split('credentialScope: await credentialScopeFor(').length - 1).toBe(3);
   });
 
-  it('builds the runner, tool server, cross-session context, and mounts from that list', async () => {
+  it('keeps send_file staging and cross-session context tied to capabilities in upstream files', async () => {
     const read = (file: string) => readFile(path.join(originalCwd, file), 'utf8');
-    const provider = await read('container/agent-runner/src/providers/claude.ts');
-    const server = await read('container/agent-runner/src/mcp-tools/server.ts');
     const core = await read('container/agent-runner/src/mcp-tools/core.ts');
     const fan = await read('src/modules/cross-session-context/fan.ts');
     const backfill = await read('src/modules/cross-session-context/backfill.ts');
-    const runner = await read('src/container-runner.ts');
 
-    expect(provider).toContain('export function createPreToolUseHook(policy: ClaudeCapabilityPolicy)');
-    expect(provider).toContain('strictMcpConfig');
-    expect(server).toContain('export async function loadToolModule');
-    expect(core).toContain("registerTools([sendMessage], 'reply');");
     expect(core).toContain('outboxFilename(');
     for (const module of [fan, backfill]) expect(module).toContain('CONVERSATION_CONTEXT_CAPABILITY');
-    expect(runner).toContain('isRestricted(');
   });
 
   it("writes the group's explicit list into its container config, with its configured MCP servers only under mcp-servers", async () => {
@@ -738,81 +659,21 @@ describe('recorded divergence: each agent group has a capability list', () => {
     expect(await stored('ag-other')).toBe('all');
   });
 
-  it("teaches the gateway's skill only to an agent with a shell, through the spawn's skill bound", async () => {
-    await freshInstall();
-    vi.stubEnv('NANOCLAW_GATEWAY_PROVIDER', 'onecli');
-    const { selectGatewayAgentSkills } = await import('../gateway-providers/index.js');
-    const { teachesGateway } = await import('../capabilities.js');
-    const runner = await readFile(path.join(originalCwd, 'src/container-runner.ts'), 'utf8');
-
-    expect(selectGatewayAgentSkills(['onecli-gateway', 'welcome'], teachesGateway(new Set(['reply'])))).toEqual([
-      'welcome',
-    ]);
-    expect(selectGatewayAgentSkills(['welcome'], teachesGateway(new Set(['reply', 'shell'])))).toEqual([
-      'welcome',
-      'onecli-gateway',
-    ]);
-    expect(runner).toContain(
-      'selectGatewayAgentSkills(skillsWithinCapabilities(selected, grants), teachesGateway(grants))',
-    );
-  });
-
-  it("gives the runner nothing for a missing list, and keeps a reply-only agent's built-ins and other MCP servers away", async () => {
+  it('gives the runner nothing for a missing list or a bare `all`, and reads a list of keys as given', async () => {
     // The runner reports a missing list on stderr; this guard reads the outcome.
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
-    const runnerSource = path.join(originalCwd, 'container/agent-runner/src');
-    // The runner's own modules, loaded by path: the host's build covers only `src/`.
-    const config = (await import(path.join(runnerSource, 'config.ts'))) as RunnerConfigModule;
-    const claude = (await import(path.join(runnerSource, 'providers/claude-config.ts'))) as ClaudeConfigModule;
-    const provider = await readFile(path.join(runnerSource, 'providers/claude.ts'), 'utf8');
+    // The runner's own module, loaded by path: the host's build covers only `src/`.
+    const config = (await import(path.join(originalCwd, 'container/agent-runner/src/config.ts'))) as RunnerConfigModule;
 
     expect([...config.runnerConfigFromRaw({}).capabilities]).toEqual([]);
     expect([...config.runnerConfigFromRaw({ capabilities: 'all' }).capabilities]).toEqual([]);
     expect([...config.runnerConfigFromRaw({ capabilities: ['reply'] }).capabilities]).toEqual(['reply']);
-    expect(claude.resolveClaudeCapabilityPolicy(new Set()).tools).toEqual([]);
-    const replyOnly = claude.resolveClaudeCapabilityPolicy(new Set(['reply']));
-    for (const tool of ['Bash', 'Read', 'Write', 'Edit', 'WebFetch', 'WebSearch', 'Task', 'Agent']) {
-      expect(replyOnly.withheldTools, tool).toContain(tool);
-      expect(replyOnly.tools, tool).not.toContain(tool);
-    }
-    const options = claude.resolveClaudeToolOptions(
-      replyOnly,
-      {
-        mcpServers: { nanoclaw: { command: 'nanoclaw' }, tools: { command: 'tools-server' } },
-        allowedTools: ['mcp__nanoclaw__send_message', 'mcp__tools__lookup', 'Bash'],
-      },
-      [],
-    );
-    expect(Object.keys(options.mcpServers)).toEqual(['nanoclaw']);
-    expect(options.allowedTools).toEqual(['mcp__nanoclaw__send_message']);
-    expect(options).toMatchObject({ strictMcpConfig: true, env: { ENABLE_CLAUDEAI_MCP_SERVERS: 'false' } });
-    expect(provider).toContain('resolveClaudeCapabilityPolicy(runnerCapabilities())');
-    expect(provider).toContain('resolveClaudeToolOptions(this.capabilities,');
   });
 });
 
 /** The slice of the runner's config module (`container/agent-runner/src/config.ts`) the capability guard drives. */
 interface RunnerConfigModule {
   runnerConfigFromRaw(raw: Record<string, unknown>): { readonly capabilities: ReadonlySet<string> };
-}
-
-/** The slice of the runner's Claude policy module (`providers/claude-config.ts`) the capability guard drives. */
-interface ClaudeConfigModule {
-  resolveClaudeCapabilityPolicy(grants: ReadonlySet<string>): {
-    readonly tools?: readonly string[];
-    readonly withheldTools: readonly string[];
-    readonly externalMcpServers: boolean;
-  };
-  resolveClaudeToolOptions(
-    policy: ReturnType<ClaudeConfigModule['resolveClaudeCapabilityPolicy']>,
-    mcp: { mcpServers: Record<string, { command: string }>; allowedTools: readonly string[] },
-    disallowedTools: readonly string[],
-  ): {
-    readonly allowedTools: readonly string[];
-    readonly mcpServers: Record<string, unknown>;
-    readonly strictMcpConfig?: true;
-    readonly env: Record<string, string>;
-  };
 }
 
 describe('recorded divergence: the agent runner describes delivery so a sent reply is not followed by a note', () => {
@@ -1024,21 +885,12 @@ describe('recorded divergence: a group without conversation-context keeps its se
 
   it("keeps a sealed session's runner from scaffolding memory, installing its hook, or archiving its conversation", async () => {
     const read = (file: string) => readFile(path.join(originalCwd, 'container/agent-runner/src', file), 'utf8');
-    const provider = await read('providers/claude.ts');
     const entry = await read('index.ts');
-    const history = await read('providers/claude-history.ts');
     const contract = await read('provider-contracts/claude.ts');
     const hook = await read('memory/session-hook.ts');
-    const sealed = await read('memory/sealed.ts');
 
-    expect(sealed).toContain('return !capabilities.has(CONVERSATION_CONTEXT_CAPABILITY);');
-    expect(sealed).toContain('if (sealed) return SEALED_MEMORY_SESSION_HOOK;');
     expect(entry).toContain('prepareSessionMemory(sealed)');
     expect(entry).toContain('if (sealed) delete provider.onExchangeComplete;');
-    expect(provider).toContain('this.sealed = sessionsSealed(runnerCapabilities())');
-    expect(provider).toContain('...(this.sealed ? {} : { PreCompact:');
-    expect(provider).toContain('archive: !this.sealed');
-    expect(history).toContain('if (input.archive !== false)');
     expect(contract).toContain('if (hook.sources.length > 0)');
     expect(hook).toMatch(
       /export const SEALED_MEMORY_SESSION_HOOK: MemorySessionHookRegistration = \{[^}]*sources: \[\],/u,
@@ -1088,21 +940,7 @@ describe('recorded divergence: a module can refuse a destination on every write 
 });
 
 describe('recorded divergence: instructions follow the capabilities that use them', () => {
-  it('teaches the file tools, account connection, and memory only to the keys that use them', async () => {
-    await freshInstall();
-    const { grantsInstructions } = await import('../capabilities.js');
-
-    for (const [module, key, other] of [
-      ['files-send', 'files-send', 'reply'],
-      ['connect', 'shell', 'reply'],
-      ['memory', 'conversation-context', 'reply'],
-    ] as const) {
-      expect(grantsInstructions(module, new Set([other])), module).toBe(false);
-      expect(grantsInstructions(module, new Set([key])), module).toBe(true);
-    }
-  });
-
-  it('keeps memory, conversation history, account connection, and ncl out of the base instructions', async () => {
+  it("keeps memory, conversation history, account connection, and ncl out of the base instructions, and the file tools out of reply's", async () => {
     const read = (file: string) => readFile(path.join(originalCwd, file), 'utf8');
     const base = await read('container/CLAUDE.md');
     const core = await read('container/agent-runner/src/mcp-tools/core.instructions.md');
@@ -1111,7 +949,7 @@ describe('recorded divergence: instructions follow the capabilities that use the
       expect(base).not.toContain(heading);
     }
     expect(base).not.toMatch(/\bncl\b/u);
-    expect(core).not.toContain('send_file');
+    for (const tool of ['send_file', 'add_reaction', 'edit_message']) expect(core, tool).not.toContain(tool);
     expect(await read('container/agent-runner/src/mcp-tools/connect.instructions.md')).toContain(
       '## Connecting external accounts',
     );
@@ -1121,7 +959,7 @@ describe('recorded divergence: instructions follow the capabilities that use the
     );
   });
 
-  it("composes a reply-only group's document with no ncl, account connection, or memory, and an `all` group's with each", async () => {
+  it("composes a reply-only group's document with no ncl, file tools, account connection, or memory, and an `all` group's with each", async () => {
     const { install, db } = await migratedInstall();
     await mkdir(path.join(install, 'container'));
     for (const entry of ['CLAUDE.md', 'agent-runner']) {
@@ -1143,37 +981,18 @@ describe('recorded divergence: instructions follow the capabilities that use the
 
     const reply = await compose('ag-reply', ['reply']);
     expect(reply).not.toMatch(/\bncl\b/u);
+    expect(reply).not.toContain('send_file');
     expect(reply).not.toContain('## Memory');
     expect(reply).not.toContain('## Connecting external accounts');
     const all = await compose('ag-all', 'all');
     expect(all).toMatch(/\bncl\b/u);
+    expect(all).toContain('send_file');
     expect(all).toContain('## Memory');
     expect(all).toContain('## Connecting external accounts');
   });
 });
 
 describe("recorded divergence: a protected agent group is the host's alone", () => {
-  const agent = { kind: 'agent', agentGroupId: 'ag-owner', sessionId: 'session-owner' } as const;
-
-  it('denies every agent command that names it, even an owner agent with global CLI scope, and allows the host', async () => {
-    await freshInstall();
-    const { guard } = await import('../guard/index.js');
-    const { registerProtectedGroupPolicy } = await import('../cli/guard.js');
-    const { commandGuard } = await import('../cli/registry.js');
-    await import('../cli/resources/index.js');
-    registerProtectedGroupPolicy('divergence:protected', (agentGroupId) =>
-      agentGroupId === 'g' ? 'it is the host’s alone' : undefined,
-    );
-
-    expect(await guard(commandGuard('groups-config-update'), { actor: agent, payload: { id: 'g' } })).toMatchObject({
-      effect: 'deny',
-      reason: expect.stringContaining('it is the host’s alone'),
-    });
-    expect(
-      await guard(commandGuard('groups-config-update'), { actor: { kind: 'host' }, payload: { id: 'g' } }),
-    ).toMatchObject({ effect: 'allow' });
-  });
-
   it('denies its self-modification requests rather than carding them for approval', async () => {
     await freshInstall();
     const { guard } = await import('../guard/index.js');

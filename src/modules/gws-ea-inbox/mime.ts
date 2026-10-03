@@ -431,10 +431,6 @@ export function encodeRaw(mime: string): string {
   return Buffer.from(mime, 'utf8').toString('base64url');
 }
 
-export function decodeRaw(raw: string): string {
-  return Buffer.from(raw, 'base64url').toString('utf8');
-}
-
 /** A Message-ID allocated before the send, so a retry can find the message it may already have sent. */
 export function newMessageId(domain: string): string {
   return `<gws-ea.${randomUUID()}@${domain}>`;

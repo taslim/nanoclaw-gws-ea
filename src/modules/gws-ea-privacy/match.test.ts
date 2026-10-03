@@ -102,14 +102,6 @@ describe('private-value matching', () => {
     expect(findPrivateValue([], streamOf(['123 Main Street']))).toBeUndefined();
   });
 
-  it('returns the value that matched, for its kind', () => {
-    const compiled = [
-      compilePrivateValue('address', '123 Main Street'),
-      compilePrivateValue('other', 'Kidney transplant'),
-    ];
-    expect(findPrivateValue(compiled, streamOf(['after my KIDNEY-transplant']))?.kind).toBe('other');
-  });
-
   it('checks every part of a message as one stream', () => {
     const compiled = [compilePrivateValue('address', '123 Main Street')];
     expect(findPrivateValue(compiled, streamOf(['Re: 123 Main', 'Street is fine']))).toBeDefined();

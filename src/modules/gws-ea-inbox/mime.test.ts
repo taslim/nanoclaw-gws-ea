@@ -3,7 +3,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { buildOutboundMime, decodeRaw, encodeRaw, parseAddressList, parseGmailMessage, splitQuoted } from './mime.js';
+import { buildOutboundMime, parseAddressList, parseGmailMessage, splitQuoted } from './mime.js';
 
 function data(text: string): string {
   return Buffer.from(text, 'utf8').toString('base64url');
@@ -137,7 +137,6 @@ describe('a reply', () => {
     expect(Buffer.from(body.replace(/\r\n/g, ''), 'base64').toString('utf8')).toBe(
       'Tuesday at 10:00 works.\r\nSee you then.',
     );
-    expect(decodeRaw(encodeRaw(raw))).toBe(raw);
   });
 
   it('cannot be given extra headers through a value', () => {

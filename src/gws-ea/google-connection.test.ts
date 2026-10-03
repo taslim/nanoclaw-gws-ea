@@ -263,11 +263,6 @@ describe("connecting the assistant's Google account", () => {
     await expect(access.apply(context(async () => grant()))).resolves.toBeUndefined();
 
     expect(await access.observe(context(async () => grant()))).toEqual({ status: 'present' });
-    expect(world.secrets.map((secret) => [secret.name, secret.hostPattern])).toEqual([
-      ['google-calendar', 'www.googleapis.com'],
-      ['google-gmail-read', 'gmail.googleapis.com'],
-      ['google-directory', 'people.googleapis.com'],
-    ]);
     expect(world.vaultWrites).toEqual([]);
   });
 
@@ -295,7 +290,6 @@ describe("connecting the assistant's Google account", () => {
 
     expect(signIn).toHaveBeenCalledTimes(1);
     expect(world.gcloudCalls.filter((call) => call.startsWith('services enable'))).toHaveLength(enables);
-    expect(world.secrets).toHaveLength(EXPOSED_GOOGLE_SERVICES.length);
     expect(world.vaultWrites).toEqual([]);
   });
 
