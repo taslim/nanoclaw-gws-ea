@@ -10,6 +10,10 @@
  *   - an inbound message the host gave up processing (registerInboundFailedHook);
  *   - a turn the agent runner reports as failed (the `turn_failed` delivery action).
  *
+ * Other GWS-EA modules that own a sentence of their own (the inbox, for mail
+ * it set aside or an inbox it cannot reach) send it through
+ * `sendPrincipalNotice`, to the same audience by the same path.
+ *
  * Each report sends at most one sentence. Only a failure in a conversation
  * with a person counts: host notes and agent-to-agent traffic ride the
  * `agent` channel, and a task session serves no conversation. A failure in
@@ -61,33 +65,62 @@ async function principalDirectMessage(): Promise<MessagingGroup | undefined> {
   return row ? getMessagingGroup(row.messaging_group_id) : undefined;
 }
 
-async function tellPrincipal(cause: Cause, session: Session, route: Route): Promise<void> {
+/** What a notice's log lines name it by. */
+interface NoticeLog {
+  readonly label: 'Failure notice' | 'Notice';
+  readonly fields: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * Send `text` to the principal's direct message as one direct send, in
+ * `route`'s thread when the route is that direct message. Best effort: the
+ * work it reports is already recorded, so a failure is logged, never retried,
+ * and never thrown. Returns whether it was delivered.
+ */
+async function deliverToPrincipal(text: string, route: Route | undefined, notice: NoticeLog): Promise<boolean> {
   const adapter = getDeliveryAdapter();
-  if (!adapter) return;
-  // Best effort from the lookup on: the work that failed is already recorded,
-  // so a notice failure is logged, never retried, and never thrown.
+  if (!adapter) return false;
   /* eslint-disable no-catch-all/no-catch-all -- the notice is best effort; its failure is logged, never retried */
   try {
     const dm = await principalDirectMessage();
     if (!dm || dm.detached_at) {
-      log.info('Failure notice not sent: no reachable principal direct message', { cause, sessionId: session.id });
-      return;
+      log.info(`${notice.label} not sent: no reachable principal direct message`, notice.fields);
+      return false;
     }
-    const inDm = route.channelType === dm.channel_type && route.platformId === dm.platform_id;
+    const inDm = route !== undefined && route.channelType === dm.channel_type && route.platformId === dm.platform_id;
     await adapter.deliver(
       dm.channel_type,
       dm.platform_id,
       inDm ? route.threadId : null,
       'chat',
-      JSON.stringify({ text: FAILURE_NOTICE_TEXT }),
+      JSON.stringify({ text }),
       undefined,
       dm.instance,
     );
-    log.info('Failure notice delivered', { cause, sessionId: session.id });
+    log.info(`${notice.label} delivered`, notice.fields);
+    return true;
   } catch (err) {
-    log.error('Failure notice could not be delivered', { cause, sessionId: session.id, err });
+    log.error(`${notice.label} could not be delivered`, { ...notice.fields, err });
+    return false;
   }
   /* eslint-enable no-catch-all/no-catch-all */
+}
+
+async function tellPrincipal(cause: Cause, session: Session, route: Route): Promise<void> {
+  await deliverToPrincipal(FAILURE_NOTICE_TEXT, route, {
+    label: 'Failure notice',
+    fields: { cause, sessionId: session.id },
+  });
+}
+
+/**
+ * One plain sentence to the principal, at the top of their direct message,
+ * for a module that owns its own wording (such as the inbox reporting a
+ * message it set aside). It passes the outbound guard like any send, and is
+ * never queued or retried. Returns whether it was delivered.
+ */
+export async function sendPrincipalNotice(text: string, cause: string): Promise<boolean> {
+  return deliverToPrincipal(text, undefined, { label: 'Notice', fields: { cause } });
 }
 
 /** A row a person would have seen as a message; a reaction the agent placed is decoration, not a reply. */

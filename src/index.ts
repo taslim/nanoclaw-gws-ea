@@ -104,8 +104,10 @@ async function main(): Promise<void> {
   // 2. Channel adapters
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
     return {
+      // Resolves once the message is routed and rejects when routing fails,
+      // so an adapter that keeps its own cursor retries rather than skips.
       onInbound(platformId, threadId, message) {
-        inboundReady
+        return inboundReady
           .then(() =>
             routeInbound({
               channelType: adapter.channelType,
@@ -125,8 +127,9 @@ async function main(): Promise<void> {
               },
             }),
           )
-          .catch((err) => {
+          .catch((err: unknown) => {
             log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
+            throw err;
           });
       },
       onInboundEvent(event) {

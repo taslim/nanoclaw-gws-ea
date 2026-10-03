@@ -1,4 +1,5 @@
 import { getDb } from '../../db/connection.js';
+import { assertRoleGrantAdmitted } from '../../modules/permissions/db/user-roles.js';
 import { registerResource } from '../crud.js';
 
 registerResource({
@@ -38,6 +39,7 @@ registerResource({
         if (!userId) throw new Error('--user is required');
         if (!role || !['owner', 'admin'].includes(role)) throw new Error('--role must be owner or admin');
         if (role === 'owner' && groupId) throw new Error('owner role is always global (do not pass --group)');
+        assertRoleGrantAdmitted({ user_id: userId, role: role as 'owner' | 'admin', agent_group_id: groupId });
         await getDb().run(
           `INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at)
              VALUES (?, ?, ?, ?, ?)

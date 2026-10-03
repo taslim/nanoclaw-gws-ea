@@ -556,6 +556,18 @@ describe('recorded divergence: delivery consults outbound guards and reports fai
   });
 });
 
+describe('recorded divergence: an adapter learns whether its inbound message was routed', () => {
+  it("returns the host's routing promise from onInbound, rejecting when routing fails", async () => {
+    const host = await readFile(path.join(originalCwd, 'src/index.ts'), 'utf8');
+    const onInbound = host.slice(host.indexOf('onInbound(platformId, threadId, message) {'));
+    const body = onInbound.slice(0, onInbound.indexOf('onInboundEvent('));
+
+    expect(body).toContain('return inboundReady');
+    expect(body).toContain("log.error('Failed to route inbound message'");
+    expect(body).toMatch(/log\.error\('Failed to route inbound message'[^;]*;\s*throw err;/);
+  });
+});
+
 describe('recorded divergence: each agent group has a capability list', () => {
   it("grants every built-in key to `all`, and nothing for a list it can't read", async () => {
     await freshInstall();

@@ -59,10 +59,13 @@ export const AGENT_GOOGLE_SERVICES = {
 /**
  * Google services only the host uses (KTD6): their tokens are minted on
  * demand, held in host memory, and never become a gateway credential. Gmail's
- * modify scope reads and sends the assistant's own inbox.
+ * modify scope reads and sends the assistant's own inbox. The host's Calendar
+ * token, with the same scopes agents' Calendar token has, turns on the
+ * principal's calendar notifications and runs the host's calendar actions.
  */
 export const HOST_GOOGLE_SERVICES = {
   gmail: { scopes: ['https://www.googleapis.com/auth/gmail.modify'] },
+  'calendar-host': { scopes: AGENT_GOOGLE_SERVICES.calendar.scopes },
 } as const satisfies Record<string, GoogleServiceScopes>;
 
 export type AgentGoogleServiceId = keyof typeof AGENT_GOOGLE_SERVICES;
@@ -82,11 +85,9 @@ export const EXPOSED_GOOGLE_SKILLS: readonly string[] = EXPOSED_GOOGLE_SERVICES.
   (id) => AGENT_GOOGLE_SERVICES[id].skill,
 );
 
-/** What the sign-in asks for: the account's identity, and every service, agent-facing and host-only. */
+/** What the sign-in asks for, each once: the account's identity, and every service, agent-facing and host-only. */
 export const GOOGLE_SIGN_IN_SCOPES: readonly string[] = [
-  'openid',
-  'email',
-  ...Object.values(GOOGLE_SERVICES).flatMap((service) => service.scopes),
+  ...new Set(['openid', 'email', ...Object.values(GOOGLE_SERVICES).flatMap((service) => service.scopes)]),
 ];
 
 /** The scopes a grant must hold: the identity scopes Google reports in full form, and every service's. */
