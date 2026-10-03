@@ -204,6 +204,16 @@ function trimRecent(sends: readonly RecentSend[]): RecentSend[] {
   return kept;
 }
 
+/** Forget what one outbound thread has sent, once its conversation is over. */
+export async function deleteThreadRecord(key: ThreadKey): Promise<void> {
+  await getDb().run(
+    'DELETE FROM gws_ea_privacy_threads WHERE channel_type = ? AND platform_id = ? AND thread_id = ?',
+    key.channelType,
+    key.platformId,
+    key.threadId ?? '',
+  );
+}
+
 /**
  * Judge one send to anyone but the principal against its thread, and record
  * the outcome in the same transaction.

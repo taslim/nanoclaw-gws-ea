@@ -1,0 +1,372 @@
+/**
+ * The meeting store's reads and writes (see `migration.ts` for what each
+ * table holds). Nothing here talks to Google, a session, or the inbox.
+ */
+import { getDb } from '../../db/connection.js';
+import { identityMatchKey } from '../gws-ea-people/fingerprint.js';
+import { PERSON_LEVELS, type PersonLevel } from '../gws-ea-people/db.js';
+
+export const MEETING_KINDS = ['arrange', 'reschedule', 'ask_organizer'] as const;
+export type MeetingKind = (typeof MEETING_KINDS)[number];
+
+/** A live meeting holds its thread; every other state has ended it. */
+export const LIVE_STATES = ['opening', 'active', 'booked'] as const;
+export type MeetingState =
+  | (typeof LIVE_STATES)[number]
+  | 'settled'
+  | 'not-scheduling'
+  | 'gave-up'
+  | 'cancelled'
+  | 'stopped'
+  | 'superseded'
+  | 'failed';
+
+/** A person's level, or `unknown` for an address nobody with a record holds. */
+export type MeetingLevel = PersonLevel | 'unknown';
+
+/** Closest first: the meeting's level is the last of its counterparts' in this order. */
+export const LEVEL_ORDER: readonly MeetingLevel[] = [...PERSON_LEVELS, 'unknown'];
+
+export function lowestLevel(levels: readonly MeetingLevel[]): MeetingLevel {
+  return levels.reduce<MeetingLevel>(
+    (lowest, level) => (LEVEL_ORDER.indexOf(level) > LEVEL_ORDER.indexOf(lowest) ? level : lowest),
+    'inner-circle',
+  );
+}
+
+export const OUTCOMES = ['booked', 'settled', 'needs-room', 'not-scheduling', 'gave-up'] as const;
+export type Outcome = (typeof OUTCOMES)[number];
+
+export interface MeetingCounterpart {
+  /** The address the host took from a record, from Google, or from the principal's own message. */
+  readonly address: string;
+  readonly person_id: string | null;
+  /** The record's name when the brief was written; null for someone without a record. */
+  readonly name: string | null;
+  readonly level: MeetingLevel;
+}
+
+interface MeetingRow {
+  readonly id: string;
+  readonly kind: MeetingKind;
+  readonly requested_by_session: string;
+  readonly request_id: string;
+  readonly state: MeetingState;
+  readonly level: MeetingLevel;
+  /** Where `book` creates or moves the event; null for an ask_organizer meeting. */
+  readonly booking_calendar_id: string | null;
+  /** The event a reschedule moves, or the invitation an ask_organizer is about. */
+  readonly event_calendar_id: string | null;
+  readonly event_id: string | null;
+  readonly length_minutes: number;
+  readonly window_start: string;
+  readonly window_end: string;
+  readonly purpose: string;
+  readonly constraints: string | null;
+  readonly thread_key: string;
+  readonly session_id: string | null;
+  readonly brief_version: number;
+  /** The booked meeting a reschedule took over its thread from. */
+  readonly replaces_meeting_id: string | null;
+  /** Follow-through deadlines (KTD12): the nudge, then the release and gave-up. */
+  readonly nudge_at: string | null;
+  readonly give_up_at: string | null;
+  readonly created_at: string;
+  readonly updated_at: string;
+  readonly ended_at: string | null;
+}
+
+export interface Meeting extends MeetingRow {
+  readonly counterparts: readonly MeetingCounterpart[];
+}
+
+export type NewMeeting = Omit<
+  MeetingRow,
+  'state' | 'session_id' | 'brief_version' | 'nudge_at' | 'give_up_at' | 'created_at' | 'updated_at' | 'ended_at'
+>;
+
+export type MeetingPatch = Partial<
+  Pick<
+    MeetingRow,
+    | 'state'
+    | 'session_id'
+    | 'length_minutes'
+    | 'window_start'
+    | 'window_end'
+    | 'constraints'
+    | 'brief_version'
+    | 'nudge_at'
+    | 'give_up_at'
+    | 'ended_at'
+  >
+>;
+
+const PATCHABLE: readonly (keyof MeetingPatch)[] = [
+  'state',
+  'session_id',
+  'length_minutes',
+  'window_start',
+  'window_end',
+  'constraints',
+  'brief_version',
+  'nudge_at',
+  'give_up_at',
+  'ended_at',
+];
+
+const LIVE = LIVE_STATES.map((state) => `'${state}'`).join(', ');
+
+async function withCounterparts(row: MeetingRow | undefined): Promise<Meeting | undefined> {
+  if (!row) return undefined;
+  const counterparts = await getDb().all<MeetingCounterpart>(
+    `SELECT address, person_id, name, level FROM gws_ea_meeting_counterparts
+      WHERE meeting_id = ? ORDER BY position`,
+    row.id,
+  );
+  return { ...row, counterparts };
+}
+
+export async function getMeeting(id: string): Promise<Meeting | undefined> {
+  return withCounterparts(await getDb().get<MeetingRow>('SELECT * FROM gws_ea_meetings WHERE id = ?', id));
+}
+
+/** The meeting a request created, found again when the same request is replayed. */
+export async function findMeetingByRequest(sessionId: string, requestId: string): Promise<Meeting | undefined> {
+  return withCounterparts(
+    await getDb().get<MeetingRow>(
+      'SELECT * FROM gws_ea_meetings WHERE requested_by_session = ? AND request_id = ?',
+      sessionId,
+      requestId,
+    ),
+  );
+}
+
+/** The live meeting that holds a thread, if any. */
+export async function findLiveMeetingOnThread(threadKey: string): Promise<Meeting | undefined> {
+  return withCounterparts(
+    await getDb().get<MeetingRow>(
+      `SELECT * FROM gws_ea_meetings WHERE thread_key = ? AND state IN (${LIVE})`,
+      threadKey,
+    ),
+  );
+}
+
+/** The live meeting about an existing event (a reschedule or an ask_organizer), if any. */
+export async function findLiveMeetingForEvent(calendarId: string, eventId: string): Promise<Meeting | undefined> {
+  return withCounterparts(
+    await getDb().get<MeetingRow>(
+      `SELECT * FROM gws_ea_meetings
+        WHERE event_calendar_id = ? AND event_id = ? AND state IN ('opening', 'active')
+        ORDER BY created_at DESC LIMIT 1`,
+      calendarId,
+      eventId,
+    ),
+  );
+}
+
+/** The booked meeting whose own booking is this event, if any. */
+export async function findBookedMeetingForEvent(calendarId: string, eventId: string): Promise<Meeting | undefined> {
+  return withCounterparts(
+    await getDb().get<MeetingRow>(
+      `SELECT m.* FROM gws_ea_meetings m
+         JOIN gws_ea_meeting_bookings b ON b.meeting_id = m.id
+        WHERE b.calendar_id = ? AND b.event_id = ? AND m.state = 'booked'
+        ORDER BY m.created_at DESC LIMIT 1`,
+      calendarId,
+      eventId,
+    ),
+  );
+}
+
+export async function insertMeeting(
+  meeting: NewMeeting,
+  counterparts: readonly MeetingCounterpart[],
+  at: string,
+): Promise<void> {
+  const db = getDb();
+  await db.transaction(async () => {
+    await db.run(
+      `INSERT INTO gws_ea_meetings
+         (id, kind, requested_by_session, request_id, state, level, booking_calendar_id, event_calendar_id,
+          event_id, length_minutes, window_start, window_end, purpose, constraints, thread_key, session_id,
+          brief_version, replaces_meeting_id, nudge_at, give_up_at, created_at, updated_at, ended_at)
+       VALUES (?, ?, ?, ?, 'opening', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, NULL, NULL, ?, ?, NULL)`,
+      meeting.id,
+      meeting.kind,
+      meeting.requested_by_session,
+      meeting.request_id,
+      meeting.level,
+      meeting.booking_calendar_id,
+      meeting.event_calendar_id,
+      meeting.event_id,
+      meeting.length_minutes,
+      meeting.window_start,
+      meeting.window_end,
+      meeting.purpose,
+      meeting.constraints,
+      meeting.thread_key,
+      meeting.replaces_meeting_id,
+      at,
+      at,
+    );
+    for (const [position, counterpart] of counterparts.entries()) {
+      await db.run(
+        `INSERT INTO gws_ea_meeting_counterparts (meeting_id, position, address, person_id, name, level)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        meeting.id,
+        position,
+        counterpart.address,
+        counterpart.person_id,
+        counterpart.name,
+        counterpart.level,
+      );
+    }
+  });
+}
+
+export async function updateMeeting(id: string, patch: MeetingPatch, at: string): Promise<void> {
+  const keys = PATCHABLE.filter((key) => patch[key] !== undefined);
+  if (keys.length === 0) return;
+  await getDb().run(
+    `UPDATE gws_ea_meetings SET ${keys.map((key) => `${key} = ?`).join(', ')}, updated_at = ? WHERE id = ?`,
+    ...keys.map((key) => patch[key]),
+    at,
+    id,
+  );
+}
+
+/** Clear a meeting's deadlines: no nudge and no give-up follows. */
+export async function clearDeadlines(id: string, at: string): Promise<void> {
+  await getDb().run(
+    'UPDATE gws_ea_meetings SET nudge_at = NULL, give_up_at = NULL, updated_at = ? WHERE id = ?',
+    at,
+    id,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Requests and outcomes, recorded once
+// ---------------------------------------------------------------------------
+
+/** The answer already given to a request (its JSON), when it was answered before. */
+export async function getRecordedResponse(sessionId: string, requestId: string): Promise<string | undefined> {
+  const row = await getDb().get<{ readonly response: string }>(
+    'SELECT response FROM gws_ea_meeting_requests WHERE session_id = ? AND request_id = ?',
+    sessionId,
+    requestId,
+  );
+  return row?.response;
+}
+
+/** Record a request's answer. The first answer stands. */
+export async function recordResponse(
+  sessionId: string,
+  requestId: string,
+  action: string,
+  meetingId: string | null,
+  response: string,
+  at: string,
+): Promise<void> {
+  await getDb().run(
+    `INSERT INTO gws_ea_meeting_requests (session_id, request_id, action, meeting_id, response, answered_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT (session_id, request_id) DO NOTHING`,
+    sessionId,
+    requestId,
+    action,
+    meetingId,
+    response,
+    at,
+  );
+}
+
+/** The data an outcome already returned (its JSON), when the meeting reported it before. */
+export async function getRecordedOutcome(meetingId: string, outcome: Outcome): Promise<string | undefined> {
+  const row = await getDb().get<{ readonly response: string }>(
+    'SELECT response FROM gws_ea_meeting_outcomes WHERE meeting_id = ? AND outcome = ?',
+    meetingId,
+    outcome,
+  );
+  return row?.response;
+}
+
+export async function recordOutcome(meetingId: string, outcome: Outcome, response: string, at: string): Promise<void> {
+  await getDb().run(
+    `INSERT INTO gws_ea_meeting_outcomes (meeting_id, outcome, response, recorded_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT (meeting_id, outcome) DO NOTHING`,
+    meetingId,
+    outcome,
+    response,
+    at,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// What the calendar actions record
+// ---------------------------------------------------------------------------
+
+export interface Booking {
+  readonly meeting_id: string;
+  readonly calendar_id: string;
+  readonly event_id: string;
+  readonly start_at: string;
+  readonly end_at: string;
+  readonly booked_at: string;
+}
+
+/** The event the host's own `book` created or moved for the meeting, if it has booked one. */
+export async function getBooking(meetingId: string): Promise<Booking | undefined> {
+  return getDb().get<Booking>('SELECT * FROM gws_ea_meeting_bookings WHERE meeting_id = ?', meetingId);
+}
+
+export interface OfferedSlot {
+  readonly slot_id: string;
+  readonly start_at: string;
+  readonly end_at: string;
+}
+
+/** Every candidate time the host offered for the meeting. */
+export async function listOfferedSlots(meetingId: string): Promise<OfferedSlot[]> {
+  return getDb().all<OfferedSlot>(
+    'SELECT slot_id, start_at, end_at FROM gws_ea_meeting_slots WHERE meeting_id = ? ORDER BY start_at',
+    meetingId,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Forgetting
+// ---------------------------------------------------------------------------
+
+/** Every meeting a forgotten person is a counterpart in, by record or by any spelling of their addresses. */
+export async function meetingsWithPerson(personId: string, handles: readonly string[]): Promise<Meeting[]> {
+  const keys = new Set(
+    handles.filter((handle) => handle.toLowerCase().startsWith('email:')).map((handle) => identityMatchKey(handle)),
+  );
+  const rows = await getDb().all<{
+    readonly meeting_id: string;
+    readonly address: string;
+    readonly person_id: string | null;
+  }>('SELECT meeting_id, address, person_id FROM gws_ea_meeting_counterparts');
+  const ids = new Set(
+    rows
+      .filter((row) => row.person_id === personId || keys.has(identityMatchKey(`email:${row.address}`)))
+      .map((row) => row.meeting_id),
+  );
+  const meetings: Meeting[] = [];
+  for (const id of ids) {
+    const meeting = await getMeeting(id);
+    if (meeting) meetings.push(meeting);
+  }
+  return meetings;
+}
+
+/** Delete a meeting and everything recorded for it. */
+export async function deleteMeeting(id: string): Promise<void> {
+  const db = getDb();
+  await db.transaction(async () => {
+    await db.run('DELETE FROM gws_ea_meeting_requests WHERE meeting_id = ?', id);
+    await db.run('UPDATE gws_ea_meetings SET replaces_meeting_id = NULL WHERE replaces_meeting_id = ?', id);
+    await db.run('DELETE FROM gws_ea_meetings WHERE id = ?', id);
+  });
+}

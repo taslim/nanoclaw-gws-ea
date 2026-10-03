@@ -572,6 +572,48 @@ describe('recorded divergence: an adapter learns whether its inbound message was
   });
 });
 
+describe('recorded divergence: delivery actions answer their calling tool with one typed response', () => {
+  it('answers a cli_request as an action_response, and keeps the first answer when the request is replayed', async () => {
+    await freshInstall();
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    await import('../mailbox/compose.js');
+    const { resolveSession } = await import('../session-manager.js');
+    const { inboundDbPath } = await import('../mailbox/sqlite/paths.js');
+    const { getDeliveryAction } = await import('../delivery.js');
+    await import('../cli/delivery-action.js');
+    await db.createAgentGroup({
+      id: 'ag-guard',
+      name: 'guard',
+      folder: 'guard',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    const { session } = await resolveSession('ag-guard', null, null, 'agent-shared');
+    const handler = getDeliveryAction('cli_request');
+    if (!handler) throw new Error('cli_request is not registered');
+    const content = { action: 'cli_request', requestId: 'req-1', command: 'help', args: {} };
+
+    await handler(content, session);
+    await handler(content, session);
+
+    const inbound = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
+    const rows = inbound.prepare("SELECT id, content FROM messages_in WHERE id LIKE 'action-resp-%'").all() as Array<{
+      id: string;
+      content: string;
+    }>;
+    inbound.close();
+    await db.closeDb();
+    expect(rows.map((row) => row.id)).toEqual(['action-resp-req-1']);
+    expect(JSON.parse(rows[0]!.content)).toMatchObject({ type: 'action_response', requestId: 'req-1' });
+  });
+
+  it("loads the runner's meeting tools, which name their own capability keys", async () => {
+    const tools = await readFile(path.join(originalCwd, 'container/agent-runner/src/mcp-tools/index.ts'), 'utf8');
+    expect(tools).toContain("await import('./gws-ea-meetings.js');");
+  });
+});
+
 describe('recorded divergence: each agent group has a capability list', () => {
   it("grants every built-in key to `all`, and nothing for a list it can't read", async () => {
     await freshInstall();

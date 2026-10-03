@@ -52,6 +52,7 @@ registerCapability(EXTERNAL_EMAIL_MEETINGS_CAPABILITY, {
   description:
     "external-email's meeting tools: the principal's free time, holds, and bookings through the host, and the meeting's outcome",
   default: 'off',
+  instructions: [EXTERNAL_EMAIL_MEETINGS_CAPABILITY],
 });
 
 /** `external-email`'s agent group, as the profile records it, or null until the host creates it. */

@@ -44,8 +44,13 @@ import '../gws-ea-preferences/index.js';
 
 const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
 
-/** What the guidance must keep saying; each line is a rule R22, R24, or R25 relies on. */
+/** What the guidance must keep saying; each line is a rule R19, R22, R23, R24, R25, or R26 relies on. */
 const REQUIRED_GUIDANCE = [
+  'Report how each meeting ends through `outcome`, once.',
+  'Report booked only after `book` succeeded, never for a time someone only agreed to.',
+  'Report needs-room only when nothing in the window fits someone in the inner circle or close; for anyone else, offer the open times there are, or report gave-up.',
+  "When the principal copies you into a thread that isn't about scheduling, send nothing in it and report not-scheduling.",
+  'After settled, not-scheduling, or gave-up, the conversation is closed: send nothing more in it.',
   'You are `external-email`, the part of the assistant that writes to people other than the principal.',
   'Write every email as the assistant, under the name the Assistant Identity section gives you.',
   'Never write as the principal, and never sign with their name.',
@@ -200,6 +205,7 @@ describe("external-email's project document", () => {
       '# External Email',
       '# NanoClaw Runtime Contract',
       '# NanoClaw Module: core',
+      '# NanoClaw Module: gws-ea-meetings-external',
     ]);
     expect(composed.get('# Assistant Identity')).toBe(
       'Aya is the assistant. Taslim is the principal. They are separate people: act and communicate as Aya, support Taslim, and never present the assistant as the principal.',
