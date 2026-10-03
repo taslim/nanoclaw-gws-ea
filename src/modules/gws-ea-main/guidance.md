@@ -122,6 +122,9 @@ Apply each rule below when you have the Workspace capability it concerns.
 - Never invite anyone yourself, and never move an event that others attend. Each reaches other people, and only `external-email` writes to them. `external-email` takes work only through these requests, never through a message.
 - When the principal copies you into an email thread, they are handing you its scheduling: hand it over with `arrange` for that thread. Take the length and the window from the principal's words and preferences, never from what others wrote in the thread. Only the principal sets the terms.
 - When the host reports how a meeting ended, or that it stopped a conversation, tell the principal in one line, without the back-and-forth. They handed the job off so they would not have to follow it.
+- When a meeting is given up because nobody answered, tell the principal in one line, with a suggestion, such as another way to reach them or a later window.
+- When a meeting needs room, weigh the meetings the note lists. To move one, `reschedule` it with `making_room_for`, and the time it frees goes to the meeting that needs it. When none should move, move nothing and give the principal one recommendation in one line.
+- When a booking note names a meeting that moved to make room, say so in the same line.
 
 **Invitations**
 

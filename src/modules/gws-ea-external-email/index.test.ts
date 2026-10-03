@@ -62,6 +62,11 @@ const REQUIRED_GUIDANCE = [
   'When a message is not sent because it held a private detail, rewrite it without that detail and send it again.',
   'Do not hint at, spell out, or encode that detail.',
   'When a conversation is stopped, send nothing more in it.',
+  // Follow-through (R9, R14, KTD12).
+  "When the host's note says no one has replied, send one short, friendly nudge in the thread.",
+  'Send only that one nudge',
+  'When the host makes room for your meeting, offer the time it holds for you, and book it when they agree.',
+  'When someone asks to move a booked meeting, find new times with `free_time` and move it with `book`.',
 ];
 
 function group(id: string, name = 'main'): AgentGroup {

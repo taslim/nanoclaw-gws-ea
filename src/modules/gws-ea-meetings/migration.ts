@@ -149,3 +149,32 @@ export const gwsEaMeetingsCalendarActionsMigration: ModuleMigration = {
     `);
   },
 };
+
+/**
+ * Making room (KTD12; R14, R23): `gws_ea_meeting_rooms` holds each
+ * reschedule `main` sent to make room, by the meeting doing the move. It
+ * names the meeting the room is for, the booked meeting that moves, and the
+ * time reserved for the first: busy for the move, and held for the meeting
+ * it is for once the move is booked (`given`), or reported to `main` when
+ * that time was taken first (`lost`).
+ */
+export const gwsEaMeetingsRoomsMigration: ModuleMigration = {
+  version: 3,
+  name: 'module:gws-ea-meetings:rooms',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_meeting_rooms (
+        by_meeting_id     TEXT PRIMARY KEY REFERENCES gws_ea_meetings(id) ON DELETE CASCADE,
+        for_meeting_id    TEXT NOT NULL REFERENCES gws_ea_meetings(id) ON DELETE CASCADE,
+        moved_meeting_id  TEXT NOT NULL REFERENCES gws_ea_meetings(id) ON DELETE CASCADE,
+        start_at          TEXT NOT NULL,
+        end_at            TEXT NOT NULL,
+        state             TEXT NOT NULL CHECK (state IN ('reserved', 'given', 'lost')),
+        chosen_at         TEXT NOT NULL,
+        settled_at        TEXT
+      );
+      CREATE INDEX idx_gws_ea_meeting_rooms_for ON gws_ea_meeting_rooms (for_meeting_id);
+      CREATE INDEX idx_gws_ea_meeting_rooms_moved ON gws_ea_meeting_rooms (moved_meeting_id);
+    `);
+  },
+};

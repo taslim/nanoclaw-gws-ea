@@ -259,6 +259,33 @@ export async function threadInboundMessage(
   };
 }
 
+/**
+ * Told once an email from anyone but the principal reached its thread's
+ * session: follow-through's quiet-thread deadlines read it as a reply
+ * (KTD12). Each hook is isolated: a failure is logged, and the delivery
+ * stands.
+ */
+export type ThreadReplyHook = (threadKey: string) => Promise<void>;
+
+const threadReplyHooks = new Map<string, ThreadReplyHook>();
+
+export function registerThreadReplyHook(id: string, hook: ThreadReplyHook): void {
+  if (threadReplyHooks.has(id)) throw new Error(`Thread-reply hook "${id}" is already registered`);
+  threadReplyHooks.set(id, hook);
+}
+
+async function runThreadReplyHooks(threadKey: string): Promise<void> {
+  for (const [id, hook] of threadReplyHooks) {
+    /* eslint-disable no-catch-all/no-catch-all -- the email reached its session either way; a hook failure is logged */
+    try {
+      await hook(threadKey);
+    } catch (err) {
+      log.error('Thread-reply hook failed', { hookId: id, threadKey, err });
+    }
+    /* eslint-enable no-catch-all/no-catch-all */
+  }
+}
+
 /** Hand one email to its open thread's session, through the host's router. */
 export async function deliverToSession(
   thread: InboxThread,
@@ -270,6 +297,9 @@ export async function deliverToSession(
   const setup = runtime.setup();
   if (!setup) throw new Error('The inbox channel is not set up yet');
   await setup.onInbound(INBOX_PLATFORM_ID, thread.threadKey, await threadInboundMessage(mail, verdict, at));
+  if (verdict.kind === 'authenticated' || verdict.kind === 'unauthenticated') {
+    await runThreadReplyHooks(thread.threadKey);
+  }
 }
 
 // ---------------------------------------------------------------------------

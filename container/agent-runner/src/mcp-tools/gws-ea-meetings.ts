@@ -8,8 +8,11 @@
  *   organizes with others.
  * - `external-email` (capability `gws-ea-meetings-external`) offers the
  *   principal's times with `free_time`, holds them with `hold`, frees them
- *   with `release_holds`, books the one agreed with `book`, all by slot id
- *   (KTD11), and reports how the meeting ended with `outcome`.
+ *   with `release_holds`, books the one agreed with `book` (and moves a
+ *   booked meeting with it), all by slot id (KTD11), and reports how the
+ *   meeting ended with `outcome`.
+ * - `reschedule` with `making_room_for` moves a meeting a needs-room note
+ *   listed, and the time it frees goes to the meeting that needs it (R14).
  *
  * Each tool writes one request and waits for the host's answer. The host
  * checks every request against the caller and the meeting, so these
@@ -221,7 +224,7 @@ export const reschedule: McpToolDefinition = {
   tool: {
     name: 'reschedule',
     description:
-      "Have external-email move a meeting the principal organizes to a new time, writing to the other attendees and moving the event once they agree. Use it for an event on the principal's calendar that the principal (or the assistant for them) organized. For an event someone else organized, use ask_organizer.",
+      "Have external-email move a meeting the principal organizes to a new time, writing to the other attendees and moving the event once they agree. Use it for an event on the principal's calendar that the principal (or the assistant for them) organized. For an event someone else organized, use ask_organizer. To make room for a meeting that needs it, pass making_room_for with one of the meetings its note lists: the time the move frees goes to that meeting.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -235,6 +238,11 @@ export const reschedule: McpToolDefinition = {
         purpose: PURPOSE,
         constraints: CONSTRAINTS,
         meeting_kind: MEETING_KIND,
+        making_room_for: {
+          type: 'string',
+          description:
+            'The id of a meeting whose note says it needs room, when this move makes room for it. Only an event that note lists can move for it.',
+        },
       },
       required: ['calendar_id', 'event_id', 'window_start', 'window_end', 'purpose'],
     },
@@ -245,7 +253,7 @@ export const reschedule: McpToolDefinition = {
       fieldsOf(
         args,
         { calendar_id: 'string', event_id: 'string', window_start: 'string', window_end: 'string', purpose: 'string' },
-        { length_minutes: 'integer', constraints: 'string', meeting_kind: 'string' },
+        { length_minutes: 'integer', constraints: 'string', meeting_kind: 'string', making_room_for: 'string' },
       ),
       context?.signal,
     );
@@ -427,7 +435,7 @@ export const book: McpToolDefinition = {
   tool: {
     name: 'book',
     description:
-      "Book the time the other side picked, by its slot id. The host creates the meeting on the principal's calendar from your brief, invites the people in it, and releases the other holds; for a meeting being moved, it moves the existing event. Then report booked with outcome.",
+      "Book the time the other side picked, by its slot id. The host creates the meeting on the principal's calendar from your brief, invites the people in it, and releases the other holds; for a meeting being moved, it moves the existing event. Then report booked with outcome. Once the meeting is booked, a newly offered slot moves the booked event there instead, and main hears of it.",
     inputSchema: {
       type: 'object' as const,
       properties: {

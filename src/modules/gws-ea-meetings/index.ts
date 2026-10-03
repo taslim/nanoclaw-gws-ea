@@ -17,25 +17,46 @@
  *
  * A forgotten person's meetings, threads, and sessions are purged, and a
  * thread the audience check stops ends its meeting at once.
+ *
+ * Follow-through (KTD12, `follow-through.ts`) runs on a module timer each
+ * minute: a quiet thread's nudge and give-up, closing a booked meeting's
+ * conversation once its event has passed, and holds or rooms left to
+ * finish. The inbox tells it when a counterpart replies. Making room (R14,
+ * `room.ts`) lists the meetings that could move for a needs-room outcome.
  */
+import { setTimeout as delay } from 'node:timers/promises';
+
 import { registerCapability } from '../../capabilities.js';
 import { writeActionResponse } from '../../cli/delivery-action.js';
+import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import type { DeliveryGuardSpec, GuardedDeliveryHandler } from '../../delivery-guard.js';
 import type { GuardedAction } from '../../guard/index.js';
+import { onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
+import { getInboxHealth, registerThreadReplyHook } from '../gws-ea-inbox/index.js';
 import { registerPersonForgetHook } from '../gws-ea-people/index.js';
 import { registerThreadStoppedHook } from '../gws-ea-privacy/index.js';
 import { createMeetingsCalendarApi, type MeetingsCalendarApi } from './calendar-api.js';
 import { createCalendarActions, FREE_TIME_ACTION } from './calendar-actions.js';
+import { createFollowThrough } from './follow-through.js';
 import { meetingCalendarAction, meetingOutcomeAction, meetingRequestAction } from './guard.js';
 import { answering, createMeetingHandoff, requestIdOf, type Handle } from './handoff.js';
-import { gwsEaMeetingsCalendarActionsMigration, gwsEaMeetingsMigration } from './migration.js';
+import {
+  gwsEaMeetingsCalendarActionsMigration,
+  gwsEaMeetingsMigration,
+  gwsEaMeetingsRoomsMigration,
+} from './migration.js';
+import { createRoom } from './room.js';
 
 registerMigration(gwsEaMeetingsMigration);
 registerMigration(gwsEaMeetingsCalendarActionsMigration);
+registerMigration(gwsEaMeetingsRoomsMigration);
+
+/** How often follow-through runs. */
+const FOLLOW_THROUGH_INTERVAL_MS = 60_000;
 
 /** main's side of the handoff: the five requests. */
 export const MEETINGS_CAPABILITY = 'gws-ea-meetings';
@@ -52,11 +73,28 @@ let calendar: MeetingsCalendarApi | undefined;
 const calendarApi = (): MeetingsCalendarApi =>
   (calendar ??= createMeetingsCalendarApi({ token: () => hostGoogleAccessToken('calendar-host') }));
 
-const actions = createCalendarActions({ calendar: calendarApi });
+// Making room and booking each need the other: a booked move hands its room over, and the room
+// holds through the calendar actions. Each reaches the other only when called.
+const room = createRoom({
+  calendar: calendarApi,
+  openTimes: (meeting, range, ignore) => actions.openTimes(meeting, range, ignore),
+  holdSlots: (meeting, slotIds) => actions.holdSlots(meeting, slotIds),
+});
+const actions = createCalendarActions({ calendar: calendarApi, afterBooking: room.handOverFrom });
 const handoff = createMeetingHandoff({
   calendar: calendarApi,
   releaseHolds: actions.releaseHolds,
   bookDirectly: actions.bookDirectly,
+  roomCandidates: room.candidates,
+  roomCandidate: room.candidate,
+});
+const followThrough = createFollowThrough({
+  calendar: calendarApi,
+  inboxHealth: getInboxHealth,
+  giveUp: handoff.giveUpUnanswered,
+  closeBooked: (meeting) => handoff.endMeeting(meeting, 'booked', true),
+  releaseHolds: (meeting) => actions.releaseHolds(meeting, 'all'),
+  handOverRoom: room.handOver,
 });
 
 /** Every request is answered, a refusal included, so the calling tool never waits it out. */
@@ -112,6 +150,24 @@ for (const [action, handle] of CALENDAR_REQUESTS) {
 
 registerPersonForgetHook('gws-ea-meetings:purge', (person) => handoff.forgetPerson(person));
 registerThreadStoppedHook('gws-ea-meetings:close', (thread) => handoff.threadStopped(thread));
+registerThreadReplyHook('gws-ea-meetings:follow-through', (threadKey) => followThrough.replied(threadKey));
+
+/** One pass of follow-through, as the host's timer runs it each minute. Never throws. */
+export function runFollowThrough(): Promise<void> {
+  return followThrough.tick();
+}
+
+onHostStart(async ({ signal }) => {
+  if (!(await getDb().hasTable('gws_ea_meetings'))) return;
+  // Started, not awaited: host startup never waits on Google. The first pass runs at once,
+  // so a deadline that came due while the host was down fires as soon as the inbox has read past it.
+  void (async () => {
+    while (!signal.aborted) {
+      await followThrough.tick();
+      await delay(FOLLOW_THROUGH_INTERVAL_MS, undefined, { signal }).catch(() => undefined);
+    }
+  })();
+});
 
 export { createMeetingsCalendarApi, type CalendarEvent, type MeetingsCalendarApi } from './calendar-api.js';
 export {
@@ -127,4 +183,12 @@ export {
   type OfferedSlot,
   type Outcome,
 } from './db.js';
-export { OUTCOME_NOTE_TYPE, type OutcomeNote } from './notes.js';
+export {
+  MOVED_NOTE_TYPE,
+  NUDGE_NOTE_TYPE,
+  OUTCOME_NOTE_TYPE,
+  ROOM_LOST_NOTE_TYPE,
+  ROOM_NOTE_TYPE,
+  type OutcomeNote,
+  type RoomCandidate,
+} from './notes.js';

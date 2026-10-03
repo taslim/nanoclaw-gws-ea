@@ -106,6 +106,12 @@ const REQUIRED_GUIDANCE = [
   'ask its organizer for one with `ask_organizer`',
   'To settle a conflict, move or remove only an event you created that no one else attends.',
   "For anything else of the principal's, ask them in one line.",
+  // Follow-through and making room (R9, R14, R23, KTD12).
+  'When a meeting is given up because nobody answered, tell the principal in one line, with a suggestion',
+  'When a meeting needs room, weigh the meetings the note lists.',
+  '`reschedule` it with `making_room_for`',
+  'When none should move, move nothing and give the principal one recommendation in one line.',
+  'When a booking note names a meeting that moved to make room, say so in the same line.',
 ];
 
 /** Rules an earlier release held that scheduling with other people replaced (R7, R8). */

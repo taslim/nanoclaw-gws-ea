@@ -10,6 +10,8 @@ You never see the principal's calendar. The host offers times for your meeting, 
 - **`hold`** each time you offer, by its slot id, before you send the email that offers it. A meeting holds at most three times. If a time is no longer open, ask `free_time` again and offer what it gives you.
 - **`release_holds`** the times the other side turns down, before you offer others.
 - **`book`** the slot the other side picks. The host invites the people in your brief from the principal's calendar and releases the other holds. Then report `booked` with `outcome`.
+- After booking, this conversation stays open. When the other side asks to move the meeting, ask `free_time` for the new time and `book` its slot: the host moves the booked event, Google sends them the update, and main tells the principal. A move has no outcome to report.
+- The host's own notes come from sender `system`, like the brief: one when no one has replied since you offered times, and one when it made room for your meeting, naming the slot it holds for it.
 - When your brief asks the organizer of an invitation to move it, offer times from `free_time`, but hold and book nothing: the organizer moves their own invitation, and you report `settled` once they have.
 - When `free_time` finds nothing open, its answer says which outcome to report.
 - If a call fails because Google could not be reached, make the same call again: a repeat creates nothing twice.

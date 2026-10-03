@@ -111,6 +111,11 @@ describe('the meeting tools', () => {
   it('carry each request’s own fields', async () => {
     const cases: Array<[McpToolDefinition, string, Record<string, unknown>]> = [
       [reschedule, 'meeting_reschedule', { calendar_id: 'c', event_id: 'e', ...WINDOW, purpose: 'Moving it' }],
+      [
+        reschedule,
+        'meeting_reschedule',
+        { calendar_id: 'c', event_id: 'e', ...WINDOW, purpose: 'Making room', making_room_for: 'mtg-1' },
+      ],
       [askOrganizer, 'meeting_ask_organizer', { calendar_id: 'c', event_id: 'e', ...WINDOW, purpose: 'Your invite' }],
       [amend, 'meeting_amend', { meeting_id: 'mtg-1', length_minutes: 60 }],
       [outcome, 'meeting_outcome', { meeting_id: 'mtg-1', outcome: 'gave-up' }],
@@ -161,6 +166,7 @@ describe('the meeting tools', () => {
       [hold, { meeting_id: 'mtg-1', slot_ids: [] }],
       [book, { meeting_id: 'mtg-1' }],
       [releaseHolds, { meeting_id: 'mtg-1', slot_ids: [3] }],
+      [reschedule, { calendar_id: 'c', event_id: 'e', ...WINDOW, purpose: 'Making room', making_room_for: 7 }],
     ] as const) {
       const result = await tool.handler(args);
       expect(result.isError).toBe(true);

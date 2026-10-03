@@ -18,7 +18,13 @@
  *   Google's invitations sent; for a reschedule it moves the original event
  *   instead, keeping its id. The id is derived from the meeting, so a retry
  *   after a partial failure finds the event it made. It then releases every
- *   hold.
+ *   hold. Once the meeting is booked, `book` with a newly offered slot moves
+ *   the booked event there in place, when the counterpart asks, and main
+ *   hears of it in a note.
+ * - The first hold starts the meeting's follow-through deadlines (KTD12);
+ *   a booking clears them. A reschedule making room for another meeting
+ *   treats the time it frees as taken, and once it is booked that time goes
+ *   to the meeting it was for (`room.ts`).
  * - `release_holds` deletes only the meeting's holds the assistant recorded
  *   placing, and only while the event still carries that meeting's tag.
  *
@@ -31,13 +37,11 @@
 import { createHash } from 'node:crypto';
 
 import { resolveGroupTimezone } from '../../container-config.js';
-import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 import { formatLocalTime, isValidTimezone } from '../../timezone.js';
 import type { Session } from '../../types.js';
 import { recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import { listPrincipalCalendars } from '../gws-ea-inbox/db.js';
-import { getSchedulingPreferenceValues, type SchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
 import { audienceForAddresses, checkOutbound } from '../gws-ea-privacy/index.js';
 import { getGwsEaProfile } from '../gws-ea-profile/db.js';
 import type {
@@ -55,25 +59,32 @@ import {
   getBooking,
   getMeeting,
   getOfferedSlot,
+  getRoomMadeBy,
   LIVE_STATES,
   listHolds,
   recordBooking,
   recordHold,
   recordOfferedSlots,
+  startDeadlines,
+  updateBookingTime,
   type Booking,
   type Hold,
   type Meeting,
   type OfferedSlot,
 } from './db.js';
+import { deadlinesFrom } from './follow-through.js';
 import {
   addressBook,
   invalid,
   meetingIdOf,
+  principalPreferences,
   principalTimezone,
   refused,
   type AddressBook,
+  type Answer,
   type Handle,
 } from './handoff.js';
+import { MOVED_NOTE_TYPE, mainTimezone, noteCounterparts, who, writeMainNote } from './notes.js';
 import {
   bestSlots,
   blocksTime,
@@ -104,9 +115,9 @@ const MAX_HOLDS = 3;
 /** No time is offered that starts sooner than this. */
 const MIN_NOTICE_MINUTES = 60;
 
-/** The private tags on the assistant's own events. */
-const TAG_MEETING = 'gwsEaMeeting';
-const TAG_ROLE = 'gwsEaRole';
+/** The private tags on the assistant's own events: no one but the assistant can set them. */
+export const TAG_MEETING = 'gwsEaMeeting';
+export const TAG_ROLE = 'gwsEaRole';
 const TAG_SLOT = 'gwsEaSlot';
 
 const MINUTE = 60_000;
@@ -115,15 +126,19 @@ const SLOT_ID = /^slot-[0-9a-f]{12}$/u;
 export interface CalendarActionsDeps {
   /** The host's own Calendar client. */
   readonly calendar: () => MeetingsCalendarApi;
+  /**
+   * Called once a meeting's booking is in place: a reschedule making room
+   * hands the time it freed to the meeting it was for. Its failure leaves
+   * the booking standing, and follow-through finishes it.
+   */
+  readonly afterBooking: (meeting: Meeting) => Promise<void>;
 }
 
-const NO_PREFERENCES: SchedulingPreferenceValues = {
-  working_hours: [],
-  protected_windows: [],
-  meeting_lengths: [],
-  buffers: [],
-  preferred_times: [],
-};
+/** An event to leave out of a meeting's busy time, by its id or its iCalendar id. */
+export interface EventRef {
+  readonly id: string;
+  readonly iCalUID?: string;
+}
 
 /** A Google event id from its parts: lowercase hex, which Google's id alphabet allows. */
 function eventIdFor(...parts: readonly string[]): string {
@@ -168,7 +183,7 @@ function fitsMeeting(slot: OfferedSlot | Hold, meeting: Meeting): boolean {
 }
 
 /** A slot as the agent reads it: its weekday, date and local start and end, in `timezone`. */
-function slotLabel(span: Span, timezone: string): string {
+export function slotLabel(span: Span, timezone: string): string {
   const weekday = new Date(span.start).toLocaleDateString('en-US', { timeZone: timezone, weekday: 'long' });
   const end = new Date(span.end).toLocaleTimeString('en-US', {
     timeZone: timezone,
@@ -229,12 +244,6 @@ function narrowingOf(content: Record<string, unknown>): Narrowing {
   };
 }
 
-/** The principal's preferences, or none while the store does not exist yet. */
-async function preferenceValues(): Promise<SchedulingPreferenceValues> {
-  if (!(await getDb().hasTable('gws_ea_pref_working_hours'))) return NO_PREFERENCES;
-  return getSchedulingPreferenceValues();
-}
-
 /** What every action needs to know about a meeting's calendar. */
 interface View {
   readonly timezone: string;
@@ -251,7 +260,7 @@ async function viewOf(meeting: Meeting): Promise<View> {
   return {
     timezone: await principalTimezone(),
     book: await addressBook(),
-    rules: schedulingRules(await preferenceValues(), meeting.meeting_kind),
+    rules: schedulingRules(await principalPreferences(), meeting.meeting_kind),
     colleagues:
       assistantDomain === undefined
         ? []
@@ -323,19 +332,22 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
 
   /**
    * Time taken in `span`: the principal's events that block time, apart from
-   * this meeting's own holds and booking and the event it moves, and every
-   * visible colleague's busy time.
+   * this meeting's own holds and booking, the event it moves, and any event
+   * in `ignore`; every visible colleague's busy time; and, for a reschedule
+   * making room, the time it frees for the meeting it is making room for.
    */
-  async function busyIn(meeting: Meeting, view: View, span: Span): Promise<Busy> {
+  async function busyIn(meeting: Meeting, view: View, span: Span, ignore: readonly EventRef[] = []): Promise<Busy> {
     const margin = view.rules.bufferMinutes * MINUTE + READ_MARGIN_MS;
     const from = iso(span.start - margin);
     const to = iso(span.end + margin);
     const moving = await movingEventOf(meeting);
+    const left = moving ? [moving, ...ignore] : ignore;
     const isOwn = (event: ListedEvent): boolean =>
       event.tags?.[TAG_MEETING] === meeting.id ||
-      (moving !== undefined &&
-        (event.id === moving.id || (moving.iCalUID !== undefined && event.iCalUID === moving.iCalUID)));
+      left.some((ref) => event.id === ref.id || (ref.iCalUID !== undefined && event.iCalUID === ref.iCalUID));
     const busy: Span[] = [];
+    const room = await getRoomMadeBy(meeting.id);
+    if (room?.state === 'reserved') busy.push({ start: Date.parse(room.start_at), end: Date.parse(room.end_at) });
     for (const calendarId of await calendarsOf(meeting)) {
       for (const event of await calendar().listEvents(calendarId, from, to)) {
         if (isOwn(event) || !blocksTime(event, view.book.principal)) continue;
@@ -534,10 +546,10 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
   // The requests
   // -------------------------------------------------------------------------
 
-  /** The meeting this conversation runs, still live. */
+  /** The meeting this conversation runs, still live: a booked one only until its event has passed. */
   async function ownLiveMeeting(content: Record<string, unknown>, session: Session): Promise<Meeting> {
     const meeting = await ownMeeting(content, session);
-    if (!LIVE_STATES.some((state) => state === meeting.state)) {
+    if (!LIVE_STATES.some((state) => state === meeting.state) || meeting.ended_at !== null) {
       throw refused(`Meeting ${meeting.id} has ended (${meeting.state}): send nothing more in this conversation.`);
     }
     return meeting;
@@ -666,15 +678,19 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     };
   };
 
-  const hold: Handle = async (content, session) => {
-    const meeting = await ownLiveMeeting(content, session);
+  /**
+   * Hold offered slots on the meeting's booking calendar, each only while it
+   * is still open, and start its follow-through deadlines. Holding a slot
+   * held already changes nothing. The meeting's own `hold`, and the host
+   * when it hands a freed time to the meeting that needed room.
+   */
+  async function holdSlots(meeting: Meeting, slotIds: readonly string[]): Promise<OfferedSlot[]> {
     assertBooks(meeting);
     if (meeting.state === 'booked' || (await getBooking(meeting.id)) !== undefined) {
       throw refused(`Meeting ${meeting.id} is booked: there is nothing more to hold.`);
     }
     const calendarId = meeting.booking_calendar_id;
     if (calendarId === null) throw new Error(`Meeting ${meeting.id} has no booking calendar`);
-    const slotIds = slotIdsOf(content.slot_ids, MAX_HOLDS);
     const existing = await listHolds(meeting.id);
     const heldIds = new Set(existing.map((held) => held.slot_id));
     const fresh = slotIds.filter((slotId) => !heldIds.has(slotId));
@@ -726,6 +742,15 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
         meeting.id,
       );
     }
+    const at = new Date();
+    await startDeadlines(meeting.id, await deadlinesFrom(at.getTime()), at.toISOString());
+    return slots;
+  }
+
+  const hold: Handle = async (content, session) => {
+    const meeting = await ownLiveMeeting(content, session);
+    assertBooks(meeting);
+    const slots = await holdSlots(meeting, slotIdsOf(content.slot_ids, MAX_HOLDS));
     const display = await resolveGroupTimezone(session.agent_group_id);
     return {
       meetingId: meeting.id,
@@ -762,6 +787,80 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     };
   };
 
+  /**
+   * Move a booked meeting's event to a newly offered slot, in place, when
+   * the counterpart asks: only its time changes, Google sends the attendees
+   * the update, and main hears of it in one note. The note is written before
+   * the new time is recorded, under an id for this move, so a repeat after
+   * any failure finishes the move and tells main once.
+   */
+  async function moveBooking(
+    meeting: Meeting,
+    existing: Booking,
+    slot: OfferedSlot,
+    view: View,
+    display: string,
+  ): Promise<Answer> {
+    const closed = await closedSlots(meeting, view, [slot]);
+    if (closed.length > 0) {
+      throw refused(`${slot.slot_id} is no longer open: call free_time again for times to offer instead.`);
+    }
+    const current = await calendar().getEvent(existing.calendar_id, existing.event_id);
+    if (!current || current.status === 'cancelled') {
+      throw refused(
+        'The booked event is no longer on the principal’s calendar, so there is nothing to move. Tell them so, and offer nothing.',
+      );
+    }
+    const span = eventSpan(current, view.timezone);
+    if (!span || span.start !== Date.parse(slot.start_at) || span.end !== Date.parse(slot.end_at)) {
+      await calendar().patchEvent(
+        existing.calendar_id,
+        existing.event_id,
+        { start: slot.start_at, end: slot.end_at },
+        'all',
+      );
+      recordOwnCalendarChange(existing.calendar_id, existing.event_id);
+    }
+    const timezone = await mainTimezone();
+    const minutes = Math.round((Date.parse(slot.end_at) - Date.parse(slot.start_at)) / MINUTE);
+    await writeMainNote(
+      `meeting-moved-${meeting.id}-${Date.parse(existing.start_at)}-${slot.slot_id}`,
+      {
+        type: MOVED_NOTE_TYPE,
+        meeting_id: meeting.id,
+        purpose: meeting.purpose,
+        counterparts: noteCounterparts(meeting),
+        booking: {
+          calendar_id: existing.calendar_id,
+          event_id: existing.event_id,
+          start: slot.start_at,
+          end: slot.end_at,
+        },
+        previous: { start: existing.start_at, end: existing.end_at },
+      },
+      `At their request, meeting ${meeting.id}, "${meeting.purpose}" with ${who(meeting)}, moved from ` +
+        `${formatLocalTime(existing.start_at, timezone)} to ${formatLocalTime(slot.start_at, timezone)} (${minutes} minutes), ` +
+        `on calendar ${existing.calendar_id}. Google sent them the update. Tell the principal in one line.`,
+      new Date().toISOString(),
+    );
+    await updateBookingTime(meeting.id, slot.start_at, slot.end_at);
+    return {
+      meetingId: meeting.id,
+      data: {
+        meeting_id: meeting.id,
+        booking: {
+          calendar_id: existing.calendar_id,
+          event_id: existing.event_id,
+          start: slot.start_at,
+          end: slot.end_at,
+        },
+        message:
+          `Moved: ${slotLabel(slotSpan(slot), display)}. Google sends ${meeting.counterparts.map((c) => c.address).join(', ')} ` +
+          "the update from the principal's calendar, and main tells the principal. There is no outcome to report.",
+      },
+    };
+  }
+
   const book: Handle = async (content, session) => {
     const meeting = await ownLiveMeeting(content, session);
     assertBooks(meeting);
@@ -773,6 +872,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     let booking: Booking;
     if (existing) {
       if (existing.start_at !== slot.start_at || existing.end_at !== slot.end_at) {
+        if (meeting.state === 'booked') return moveBooking(meeting, existing, slot, view, display);
         throw refused(
           `Meeting ${meeting.id} is already booked for ${slotLabel(slotSpan(existing), display)}. Report booked with outcome if you have not.`,
         );
@@ -790,14 +890,34 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     }
     await clearDeadlines(meeting.id, new Date().toISOString());
     let holdsLeft = '';
-    /* eslint-disable no-catch-all/no-catch-all -- the booking stands; holds left over go on a repeat of book or when the meeting ends */
+    /* eslint-disable no-catch-all/no-catch-all -- the booking stands; holds left over go on a repeat of book, or follow-through releases them */
     try {
       await releaseHolds(meeting, 'all');
     } catch (err) {
       log.warn('A booked meeting’s holds were not all released', { meetingId: meeting.id, err });
       holdsLeft = ' Some holds could not be released yet: call book again with the same slot to finish.';
     }
+    try {
+      await deps.afterBooking(meeting);
+    } catch (err) {
+      log.warn('What follows a booking did not finish; follow-through finishes it', { meetingId: meeting.id, err });
+    }
     /* eslint-enable no-catch-all/no-catch-all */
+    if (meeting.state === 'booked') {
+      return {
+        meetingId: meeting.id,
+        data: {
+          meeting_id: meeting.id,
+          booking: {
+            calendar_id: booking.calendar_id,
+            event_id: booking.event_id,
+            start: booking.start_at,
+            end: booking.end_at,
+          },
+          message: `Meeting ${meeting.id} is booked for ${slotLabel(slotSpan(booking), display)}: nothing changed.${holdsLeft}`,
+        },
+      };
+    }
     const moved = meeting.kind === 'reschedule';
     return {
       meetingId: meeting.id,
@@ -861,6 +981,19 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     }
   }
 
+  /**
+   * Open times for a meeting inside `range`, best first, as if the events in
+   * `ignore` were not on the calendar: what moving them would free (R14).
+   */
+  async function openTimes(meeting: Meeting, range: Span, ignore: readonly EventRef[]): Promise<Span[]> {
+    const view = await viewOf(meeting);
+    const now = Date.now();
+    const earliest = now + MIN_NOTICE_MINUTES * MINUTE;
+    const { busy } = await busyIn(meeting, view, range, ignore);
+    const query = queryFor(meeting, view, busy, earliest);
+    return bestSlots(query, openSlots(query, range), MAX_OFFERED, now);
+  }
+
   return {
     freeTime,
     hold,
@@ -868,6 +1001,8 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     book,
     releaseHolds,
     bookDirectly,
+    holdSlots,
+    openTimes,
   };
 }
 

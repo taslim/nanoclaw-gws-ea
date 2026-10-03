@@ -118,14 +118,17 @@ const PATCHABLE: readonly (keyof MeetingPatch)[] = [
 
 const LIVE = LIVE_STATES.map((state) => `'${state}'`).join(', ');
 
-async function withCounterparts(row: MeetingRow | undefined): Promise<Meeting | undefined> {
-  if (!row) return undefined;
+async function attachCounterparts(row: MeetingRow): Promise<Meeting> {
   const counterparts = await getDb().all<MeetingCounterpart>(
     `SELECT address, person_id, name, level FROM gws_ea_meeting_counterparts
       WHERE meeting_id = ? ORDER BY position`,
     row.id,
   );
   return { ...row, counterparts };
+}
+
+async function withCounterparts(row: MeetingRow | undefined): Promise<Meeting | undefined> {
+  return row ? attachCounterparts(row) : undefined;
 }
 
 export async function getMeeting(id: string): Promise<Meeting | undefined> {
@@ -143,11 +146,11 @@ export async function findMeetingByRequest(sessionId: string, requestId: string)
   );
 }
 
-/** The live meeting that holds a thread, if any. */
+/** The live meeting that holds a thread, if any: a booked one only until its event has passed. */
 export async function findLiveMeetingOnThread(threadKey: string): Promise<Meeting | undefined> {
   return withCounterparts(
     await getDb().get<MeetingRow>(
-      `SELECT * FROM gws_ea_meetings WHERE thread_key = ? AND state IN (${LIVE})`,
+      `SELECT * FROM gws_ea_meetings WHERE thread_key = ? AND state IN (${LIVE}) AND ended_at IS NULL`,
       threadKey,
     ),
   );
@@ -166,13 +169,13 @@ export async function findLiveMeetingForEvent(calendarId: string, eventId: strin
   );
 }
 
-/** The booked meeting whose own booking is this event, if any. */
+/** The booked meeting whose own booking is this event, if any, until the event has passed. */
 export async function findBookedMeetingForEvent(calendarId: string, eventId: string): Promise<Meeting | undefined> {
   return withCounterparts(
     await getDb().get<MeetingRow>(
       `SELECT m.* FROM gws_ea_meetings m
          JOIN gws_ea_meeting_bookings b ON b.meeting_id = m.id
-        WHERE b.calendar_id = ? AND b.event_id = ? AND m.state = 'booked'
+        WHERE b.calendar_id = ? AND b.event_id = ? AND m.state = 'booked' AND m.ended_at IS NULL
         ORDER BY m.created_at DESC LIMIT 1`,
       calendarId,
       eventId,
@@ -245,6 +248,105 @@ export async function clearDeadlines(id: string, at: string): Promise<void> {
     at,
     id,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Follow-through (KTD12)
+// ---------------------------------------------------------------------------
+
+export interface Deadlines {
+  readonly nudge_at: string;
+  readonly give_up_at: string;
+}
+
+/** Start an active meeting's deadlines, unless some are already running: a later hold never pushes them out. */
+export async function startDeadlines(id: string, deadlines: Deadlines, at: string): Promise<void> {
+  await getDb().run(
+    `UPDATE gws_ea_meetings SET nudge_at = ?, give_up_at = ?, updated_at = ?
+      WHERE id = ? AND state = 'active' AND nudge_at IS NULL AND give_up_at IS NULL`,
+    deadlines.nudge_at,
+    deadlines.give_up_at,
+    at,
+    id,
+  );
+}
+
+/** Start an active meeting's deadlines again, from a reply. */
+export async function restartDeadlines(id: string, deadlines: Deadlines, at: string): Promise<void> {
+  await getDb().run(
+    `UPDATE gws_ea_meetings SET nudge_at = ?, give_up_at = ?, updated_at = ? WHERE id = ? AND state = 'active'`,
+    deadlines.nudge_at,
+    deadlines.give_up_at,
+    at,
+    id,
+  );
+}
+
+/**
+ * Record the nudge sent for the deadline `nudgeAt`, and when giving up
+ * follows it. Changes nothing when the deadline is no longer that one: a
+ * reply started the count again meanwhile, and its deadlines stand.
+ */
+export async function recordNudged(id: string, nudgeAt: string, giveUpAt: string, at: string): Promise<void> {
+  await getDb().run(
+    'UPDATE gws_ea_meetings SET nudge_at = NULL, give_up_at = ?, updated_at = ? WHERE id = ? AND nudge_at = ?',
+    giveUpAt,
+    at,
+    id,
+    nudgeAt,
+  );
+}
+
+/** Every meeting still being arranged that has a deadline running. */
+export async function listMeetingsWithDeadlines(): Promise<Meeting[]> {
+  const rows = await getDb().all<MeetingRow>(
+    `SELECT * FROM gws_ea_meetings
+      WHERE state = 'active' AND (nudge_at IS NOT NULL OR give_up_at IS NOT NULL)
+      ORDER BY created_at`,
+  );
+  return Promise.all(rows.map((row) => attachCounterparts(row)));
+}
+
+interface BookingColumns {
+  readonly b_calendar_id: string;
+  readonly b_event_id: string;
+  readonly b_start_at: string;
+  readonly b_end_at: string;
+  readonly b_booked_at: string;
+}
+
+/** Every booked meeting whose conversation is still open, with its booking, earliest first. */
+export async function listOpenBookings(): Promise<Array<{ readonly meeting: Meeting; readonly booking: Booking }>> {
+  const rows = await getDb().all<MeetingRow & BookingColumns>(
+    `SELECT m.*, b.calendar_id AS b_calendar_id, b.event_id AS b_event_id, b.start_at AS b_start_at,
+            b.end_at AS b_end_at, b.booked_at AS b_booked_at
+       FROM gws_ea_meetings m JOIN gws_ea_meeting_bookings b ON b.meeting_id = m.id
+      WHERE m.state = 'booked' AND m.ended_at IS NULL
+      ORDER BY b.start_at`,
+  );
+  return Promise.all(
+    rows.map(async ({ b_calendar_id, b_event_id, b_start_at, b_end_at, b_booked_at, ...row }) => ({
+      meeting: await attachCounterparts(row),
+      booking: {
+        meeting_id: row.id,
+        calendar_id: b_calendar_id,
+        event_id: b_event_id,
+        start_at: b_start_at,
+        end_at: b_end_at,
+        booked_at: b_booked_at,
+      },
+    })),
+  );
+}
+
+/** Every meeting that is no longer being arranged but still has holds recorded: a release that failed. */
+export async function listSettledMeetingsWithHolds(): Promise<Meeting[]> {
+  const rows = await getDb().all<MeetingRow>(
+    `SELECT * FROM gws_ea_meetings m
+      WHERE m.state NOT IN ('opening', 'active')
+        AND EXISTS (SELECT 1 FROM gws_ea_meeting_holds h WHERE h.meeting_id = m.id)`,
+  );
+  return Promise.all(rows.map((row) => attachCounterparts(row)));
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +467,16 @@ export async function recordOfferedSlots(meetingId: string, slots: readonly Offe
   });
 }
 
+/** Where the booked event is now, after a move. */
+export async function updateBookingTime(meetingId: string, startAt: string, endAt: string): Promise<void> {
+  await getDb().run(
+    'UPDATE gws_ea_meeting_bookings SET start_at = ?, end_at = ? WHERE meeting_id = ?',
+    startAt,
+    endAt,
+    meetingId,
+  );
+}
+
 /** Record the event `book` created or moved. The first booking stands. */
 export async function recordBooking(booking: Booking): Promise<void> {
   await getDb().run(
@@ -424,6 +536,80 @@ export async function recordHold(hold: Hold): Promise<void> {
 /** Forget a hold once its event is gone. */
 export async function deleteHold(meetingId: string, slotId: string): Promise<void> {
   await getDb().run('DELETE FROM gws_ea_meeting_holds WHERE meeting_id = ? AND slot_id = ?', meetingId, slotId);
+}
+
+// ---------------------------------------------------------------------------
+// Making room (R14, R23)
+// ---------------------------------------------------------------------------
+
+export type RoomState = 'reserved' | 'given' | 'lost';
+
+export interface Room {
+  /** The reschedule moving a booked meeting to make the room. */
+  readonly by_meeting_id: string;
+  /** The meeting that needs the room. */
+  readonly for_meeting_id: string;
+  /** The booked meeting that moves. */
+  readonly moved_meeting_id: string;
+  /** The time reserved for the meeting that needs it. */
+  readonly start_at: string;
+  readonly end_at: string;
+  readonly state: RoomState;
+  readonly chosen_at: string;
+  readonly settled_at: string | null;
+}
+
+export async function insertRoom(room: Omit<Room, 'state' | 'settled_at'>): Promise<void> {
+  await getDb().run(
+    `INSERT INTO gws_ea_meeting_rooms
+       (by_meeting_id, for_meeting_id, moved_meeting_id, start_at, end_at, state, chosen_at, settled_at)
+     VALUES (?, ?, ?, ?, ?, 'reserved', ?, NULL)
+     ON CONFLICT (by_meeting_id) DO NOTHING`,
+    room.by_meeting_id,
+    room.for_meeting_id,
+    room.moved_meeting_id,
+    room.start_at,
+    room.end_at,
+    room.chosen_at,
+  );
+}
+
+/** The room a reschedule is making, if it is making one. */
+export async function getRoomMadeBy(byMeetingId: string): Promise<Room | undefined> {
+  return getDb().get<Room>('SELECT * FROM gws_ea_meeting_rooms WHERE by_meeting_id = ?', byMeetingId);
+}
+
+/** The room given to a meeting, if one was. */
+export async function getRoomGivenTo(forMeetingId: string): Promise<Room | undefined> {
+  return getDb().get<Room>(
+    `SELECT * FROM gws_ea_meeting_rooms WHERE for_meeting_id = ? AND state = 'given'
+      ORDER BY settled_at DESC LIMIT 1`,
+    forMeetingId,
+  );
+}
+
+/** Rooms whose move is booked but whose time has not gone to the meeting it is for yet. */
+export async function listRoomsAwaitingHandover(): Promise<Room[]> {
+  return getDb().all<Room>(
+    `SELECT r.* FROM gws_ea_meeting_rooms r
+      WHERE r.state = 'reserved'
+        AND EXISTS (SELECT 1 FROM gws_ea_meeting_bookings b WHERE b.meeting_id = r.by_meeting_id)`,
+  );
+}
+
+/** Settle a reserved room once; returns false when it was settled already. */
+export async function settleRoom(
+  byMeetingId: string,
+  state: Exclude<RoomState, 'reserved'>,
+  at: string,
+): Promise<boolean> {
+  const result = await getDb().run(
+    "UPDATE gws_ea_meeting_rooms SET state = ?, settled_at = ? WHERE by_meeting_id = ? AND state = 'reserved'",
+    state,
+    at,
+    byMeetingId,
+  );
+  return result.changes > 0;
 }
 
 // ---------------------------------------------------------------------------

@@ -411,7 +411,7 @@ export function bestSlots(query: SlotQuery, open: readonly Span[], limit: number
 /**
  * The end of the `count`th working day that ends after `from`, on the
  * principal's working hours and clock; undefined when the principal works no
- * days at all. Follow-through deadlines count working days the same way.
+ * days at all.
  */
 export function workingDayEnd(
   from: number,
@@ -431,6 +431,32 @@ export function workingDayEnd(
     if (counted === count) return end;
   }
   return undefined;
+}
+
+/**
+ * The instant `count` working days after `from`, on the principal's working
+ * hours and clock: the same time of day on the `count`th working day after
+ * the one `from` falls in, never past that day's close. A `from` outside
+ * working hours counts from the start of the next working day, so the
+ * weekend and days off never count. Without any working day it assumes
+ * Monday to Friday, 09:00 to 17:00. Follow-through deadlines use it (KTD12).
+ */
+export function workingDaysLater(from: number, count: number, rules: SchedulingRules, timezone: string): number {
+  const hours = rules.workingHours.size > 0 ? rules.workingHours : DEFAULT_WORKING_HOURS;
+  /** The first working day after `date`, with its hours. */
+  const nextWorkingDay = (date: LocalDate): { readonly date: LocalDate; readonly hours: ClockRange } => {
+    for (let next = nextDate(date); ; next = nextDate(next)) {
+      const range = hours.get(weekdayOf(next));
+      if (range) return { date: next, hours: range };
+    }
+  };
+  const local = localTime(from, timezone);
+  const today = hours.get(local.weekday);
+  const duringToday = today !== undefined && local.minuteOfDay < today.end;
+  let day = duringToday ? { date: local, hours: today } : nextWorkingDay(local);
+  const minute = duringToday ? Math.max(local.minuteOfDay, today.start) : day.hours.start;
+  for (let counted = 0; counted < count; counted += 1) day = nextWorkingDay(day.date);
+  return zonedInstant(day.date, Math.min(Math.max(minute, day.hours.start), day.hours.end), timezone);
 }
 
 /** A slot's id: opaque, and the same for the same meeting and time on every call. */

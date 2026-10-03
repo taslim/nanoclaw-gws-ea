@@ -29,7 +29,13 @@
  * - An outcome becomes a typed note in `main`'s shared session. Booked comes
  *   only after the host's own booking; settled only after the invitation is
  *   re-read and found moved to an offered time or clear of conflicts;
- *   needs-room only for someone in the inner circle or close.
+ *   needs-room only for someone in the inner circle or close, and its note
+ *   lists the meetings that could move to make room (R14, `room.ts`).
+ * - `reschedule` with `making_room_for` moves one of those, and reserves the
+ *   time it frees for the meeting that needs it (R23). That meeting's
+ *   booking note names the meeting that moved.
+ * - Follow-through ends a meeting nobody answered, and closes a booked one
+ *   once its event has passed (`follow-through.ts`).
  */
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
@@ -66,6 +72,7 @@ import { normalizeAddress } from '../gws-ea-inbox/mime.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { findPeople, getPerson } from '../gws-ea-people/db.js';
 import { checkOutbound, deleteThreadRecord, type ThreadKey } from '../gws-ea-privacy/index.js';
+import { getSchedulingPreferenceValues, type SchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
 import { getGwsEaProfile, listPrincipalAddresses } from '../gws-ea-profile/db.js';
 import type { CalendarEvent, MeetingsCalendarApi } from './calendar-api.js';
 import { blocksTime, eventSpan } from './slots.js';
@@ -80,7 +87,10 @@ import {
   getMeeting,
   getRecordedOutcome,
   getRecordedResponse,
+  getRoomGivenTo,
+  getRoomMadeBy,
   insertMeeting,
+  insertRoom,
   LIVE_STATES,
   listOfferedSlots,
   lowestLevel,
@@ -96,7 +106,15 @@ import {
   type MeetingState,
   type Outcome,
 } from './db.js';
-import { OUTCOME_NOTE_TYPE, requireMainAgentGroupId, writeOutcomeNote, type OutcomeNote } from './notes.js';
+import {
+  mainTimezone,
+  noteCounterparts,
+  OUTCOME_NOTE_TYPE,
+  who,
+  writeOutcomeNote,
+  type OutcomeNote,
+  type RoomCandidate,
+} from './notes.js';
 
 export interface MeetingHandoffDeps {
   /** The host's own Calendar client. */
@@ -114,6 +132,10 @@ export interface MeetingHandoffDeps {
    * when it is not such a meeting or no time is free, so it goes by email.
    */
   readonly bookDirectly: (meeting: Meeting) => Promise<Booking | undefined>;
+  /** The booked meetings that could move to make room for one that needs it, earliest first (R14). */
+  readonly roomCandidates: (meeting: Meeting) => Promise<readonly RoomCandidate[]>;
+  /** That event as a candidate to move for `meeting`; refused, saying why, when it may not move for it. */
+  readonly roomCandidate: (meeting: Meeting, calendarId: string, eventId: string) => Promise<RoomCandidate>;
 }
 
 /** A request the host refuses as asked: the caller reads why and can ask differently. */
@@ -176,9 +198,9 @@ function optionalText(value: unknown, label: string, max: number): string | unde
   return value === undefined || value === null ? undefined : text(value, label, max);
 }
 
-export function meetingIdOf(content: Record<string, unknown>): string {
-  const id = content.meeting_id;
-  if (typeof id !== 'string' || !MEETING_ID.test(id)) throw invalid('meeting_id must be a meeting id, such as mtg-…');
+export function meetingIdOf(content: Record<string, unknown>, field = 'meeting_id'): string {
+  const id = content[field];
+  if (typeof id !== 'string' || !MEETING_ID.test(id)) throw invalid(`${field} must be a meeting id, such as mtg-…`);
   return id;
 }
 
@@ -330,7 +352,7 @@ async function counterpartForPerson(ref: PersonRef, book: AddressBook): Promise<
 }
 
 /** A counterpart from an address Google or the principal's message gave: their record if they have one. */
-async function counterpartForAddress(address: string): Promise<MeetingCounterpart> {
+export async function counterpartForAddress(address: string): Promise<MeetingCounterpart> {
   const found = await findPeople(`email:${address}`);
   const person = found.matched_by === 'identity' && found.people.length === 1 ? found.people[0] : undefined;
   return person
@@ -347,19 +369,33 @@ function distinct(counterparts: readonly MeetingCounterpart[]): MeetingCounterpa
   });
 }
 
-function who(meeting: Pick<Meeting, 'counterparts'>): string {
-  return meeting.counterparts
-    .map((counterpart) => (counterpart.name ? `${counterpart.name} (${counterpart.address})` : counterpart.address))
-    .join(', ');
-}
-
 /** The principal's timezone, which their preferences and all-day events are on. */
 export async function principalTimezone(): Promise<string> {
   return (await getGwsEaProfile()).principal_timezone ?? TIMEZONE;
 }
 
+const NO_PREFERENCES: SchedulingPreferenceValues = {
+  working_hours: [],
+  protected_windows: [],
+  meeting_lengths: [],
+  buffers: [],
+  preferred_times: [],
+};
+
+/** The principal's scheduling preferences, or none while the store does not exist yet. */
+export async function principalPreferences(): Promise<SchedulingPreferenceValues> {
+  if (!(await getDb().hasTable('gws_ea_pref_working_hours'))) return NO_PREFERENCES;
+  return getSchedulingPreferenceValues();
+}
+
+/** Whether the principal organizes an event: one of their addresses, or the calendar it is on, is its organizer. */
+export function organizedByPrincipal(event: CalendarEvent, calendarId: string, book: AddressBook): boolean {
+  const organizer = event.organizer?.email;
+  return organizer !== undefined && (book.principal.has(organizer) || organizer === calendarId.toLowerCase());
+}
+
 /** The people besides the principal and the assistant on an event: its guests to tell. */
-function guestsOf(event: CalendarEvent, book: AddressBook): string[] {
+export function guestsOf(event: CalendarEvent, book: AddressBook): string[] {
   return [
     ...new Set(
       (event.attendees ?? [])
@@ -445,12 +481,6 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       );
     }
     return entry.id;
-  }
-
-  /** Whether the principal organizes an event: one of their addresses, or the calendar it is on, is its organizer. */
-  function organizedByPrincipal(event: CalendarEvent, calendarId: string, book: AddressBook): boolean {
-    const organizer = event.organizer?.email;
-    return organizer !== undefined && (book.principal.has(organizer) || organizer === calendarId.toLowerCase());
   }
 
   /** A timed, live event, with its span and length in minutes. */
@@ -728,6 +758,8 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     readonly threadKey: string;
     /** A booked meeting whose thread and session this one takes over. */
     readonly replaces?: Meeting;
+    /** The room this reschedule makes: for which meeting, by moving which, and the time it frees. */
+    readonly room?: { readonly forMeetingId: string; readonly candidate: RoomCandidate };
   }
 
   async function createMeeting(creation: Creation): Promise<Meeting> {
@@ -762,6 +794,16 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         );
         if (creation.replaces?.session_id) {
           await updateMeeting(id, { session_id: creation.replaces.session_id }, at);
+        }
+        if (creation.room) {
+          await insertRoom({
+            by_meeting_id: id,
+            for_meeting_id: creation.room.forMeetingId,
+            moved_meeting_id: creation.room.candidate.meeting_id,
+            start_at: creation.room.candidate.frees.start,
+            end_at: creation.room.candidate.frees.end,
+            chosen_at: at,
+          });
         }
       });
     } catch (error) {
@@ -847,6 +889,10 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     const purpose = text(content.purpose, 'purpose', PURPOSE_MAX);
     const constraints = optionalText(content.constraints, 'constraints', CONSTRAINTS_MAX);
     const meetingKind = meetingKindOf(content);
+    const roomForId =
+      content.making_room_for === undefined || content.making_room_for === null
+        ? undefined
+        : meetingIdOf(content, 'making_room_for');
 
     const bookingCalendarId = await requirePrincipalCalendar(calendarId, true);
     const { event, minutes } = await requireTimedEvent(bookingCalendarId, eventId);
@@ -868,6 +914,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     await assertShareable(purpose, constraints);
     const live = await findLiveMeetingForEvent(bookingCalendarId, eventId);
     if (live) throw refused(`Meeting ${live.id} is already working on that event: amend or cancel it instead`);
+    const room = roomForId === undefined ? undefined : await roomFor(roomForId, bookingCalendarId, eventId);
     const counterparts = await Promise.all(addresses.map((address) => counterpartForAddress(address)));
 
     // A meeting the assistant booked keeps its thread: the new job continues there.
@@ -889,6 +936,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         meetingKind,
         threadKey: booked.thread_key,
         replaces: booked,
+        ...(room ? { room } : {}),
       });
       return openOrAbandon(meeting, { kind: 'takeover', session: bookedSession });
     }
@@ -905,8 +953,30 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       constraints,
       meetingKind,
       threadKey: mintThreadKey(),
+      ...(room ? { room } : {}),
     });
     return openOrAbandon(meeting, { kind: 'new', opener: 'arrange' });
+  }
+
+  /**
+   * The room a reschedule makes (R14, R23): only for a meeting still waiting
+   * for room after it reported needs-room, and only by moving a meeting the
+   * host lists as a candidate for it now.
+   */
+  async function roomFor(
+    forMeetingId: string,
+    calendarId: string,
+    eventId: string,
+  ): Promise<{ readonly forMeetingId: string; readonly candidate: RoomCandidate }> {
+    const forMeeting = await requireMeeting(forMeetingId);
+    const waiting =
+      forMeeting.state === 'active' &&
+      forMeeting.ended_at === null &&
+      (await getRecordedOutcome(forMeeting.id, 'needs-room')) !== undefined;
+    if (!waiting) {
+      throw refused(`Meeting ${forMeeting.id} is not waiting for room: make room only for a meeting that needs it`);
+    }
+    return { forMeetingId, candidate: await deps.roomCandidate(forMeeting, calendarId, eventId) };
   }
 
   async function askOrganizer(content: Record<string, unknown>, session: Session, requestId: string): Promise<Answer> {
@@ -982,6 +1052,9 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   async function cancelMeeting(meeting: Meeting): Promise<Answer> {
     if (!isLive(meeting.state) && meeting.state !== 'cancelled') {
       throw refused(`Meeting ${meeting.id} has already ended (${meeting.state})`);
+    }
+    if (meeting.state === 'booked' && meeting.ended_at !== null) {
+      throw refused(`Meeting ${meeting.id} has already ended: its event has passed`);
     }
     const told = await endCancelled(meeting);
     return {
@@ -1121,19 +1194,58 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     'gave-up': 'gave-up',
   };
 
-  async function mainTimezone(): Promise<string> {
-    return resolveGroupTimezone(await requireMainAgentGroupId());
+  /** What a note adds about room: the meeting that moved for this one, or the one a failed move was for. */
+  interface RoomContext {
+    readonly candidates?: readonly RoomCandidate[];
+    readonly madeRoomBy?: NonNullable<OutcomeNote['made_room_by']>;
+    /** The meeting a reschedule was making room for, while that room is still unmade. */
+    readonly roomFor?: Meeting;
   }
 
-  function outcomeText(meeting: Meeting, outcome: Outcome, booking: Booking | undefined, timezone: string): string {
+  function candidateLine(candidate: RoomCandidate, timezone: string): string {
+    const people = candidate.people.map((person) => `${person.name ?? person.address} (${person.level})`).join(', ');
+    return (
+      `- meeting ${candidate.meeting_id}: "${candidate.purpose}" with ${people}, ${formatLocalTime(candidate.start, timezone)} ` +
+      `(calendar_id ${candidate.calendar_id}, event_id ${candidate.event_id}); it frees ${formatLocalTime(candidate.frees.start, timezone)}`
+    );
+  }
+
+  function needsRoomText(meeting: Meeting, candidates: readonly RoomCandidate[], timezone: string): string {
+    const opening = `Meeting ${meeting.id} with ${who(meeting)} (${meeting.level}) needs room: nothing open in its window fits.`;
+    if (candidates.length === 0) {
+      return (
+        `${opening} No meeting the assistant arranged with someone who matters less can move to make it, and the principal's own ` +
+        'events and invitations from others never move for it. Move nothing: give the principal one recommendation in one line, ' +
+        'such as which of their own plans could give way, or a later window.'
+      );
+    }
+    return [
+      `${opening} The assistant arranged these meetings with people who matter less, and moving one frees a time that fits:`,
+      ...candidates.map((candidate) => candidateLine(candidate, timezone)),
+      `To move one, reschedule it with making_room_for ${meeting.id}: the time it frees goes to this meeting. ` +
+        'If none should move, move nothing and give the principal one recommendation in one line.',
+    ].join('\n');
+  }
+
+  function outcomeText(
+    meeting: Meeting,
+    outcome: Outcome,
+    booking: Booking | undefined,
+    timezone: string,
+    room: RoomContext,
+  ): string {
     switch (outcome) {
       case 'booked': {
         if (!booking) throw new Error('A booked note needs its booking');
         const moved = meeting.kind === 'reschedule' ? 'moved to' : 'booked for';
         const minutes = Math.round((Date.parse(booking.end_at) - Date.parse(booking.start_at)) / MINUTE);
+        const madeRoom = room.madeRoomBy
+          ? ` To make room for it, "${room.madeRoomBy.purpose}" with ${who(room.madeRoomBy)} moved` +
+            (room.madeRoomBy.moved_to ? ` to ${formatLocalTime(room.madeRoomBy.moved_to.start, timezone)}.` : '.')
+          : '';
         return (
           `Meeting ${meeting.id} is ${moved} ${formatLocalTime(booking.start_at, timezone)} (${minutes} minutes): ` +
-          `"${meeting.purpose}" with ${who(meeting)}, on calendar ${booking.calendar_id}. Tell the principal in one line.`
+          `"${meeting.purpose}" with ${who(meeting)}, on calendar ${booking.calendar_id}.${madeRoom} Tell the principal in one line.`
         );
       }
       case 'settled':
@@ -1142,10 +1254,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
           'Tell the principal in one line.'
         );
       case 'needs-room':
-        return (
-          `Meeting ${meeting.id} with ${who(meeting)} (${meeting.level}) needs room: nothing open in its window fits. ` +
-          "Decide whether to make room for them under the principal's rules; if you cannot, tell the principal in one line."
-        );
+        return needsRoomText(meeting, room.candidates ?? [], timezone);
       case 'not-scheduling':
         return (
           `The thread the principal copied you into with ${who(meeting)} is not about scheduling, so external-email will not handle it (meeting ${meeting.id}). ` +
@@ -1154,8 +1263,51 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       case 'gave-up':
         return (
           `external-email gave up on meeting ${meeting.id}, "${meeting.purpose}" with ${who(meeting)}: no time was agreed. ` +
-          'Tell the principal in one line, with a suggestion.'
+          'Tell the principal in one line, with a suggestion.' +
+          roomStillNeeded(room)
         );
+      default: {
+        const unreachable: never = outcome;
+        throw new Error(`Unknown outcome ${String(unreachable)}`);
+      }
+    }
+  }
+
+  /** For a move that was making room and ended without it: that meeting still needs room. */
+  function roomStillNeeded(room: RoomContext): string {
+    return room.roomFor
+      ? ` It was moving to make room for meeting ${room.roomFor.id} with ${who(room.roomFor)}, which still needs room: ` +
+          'move another meeting the needs-room note listed, or tell the principal in one line with your recommendation.'
+      : '';
+  }
+
+  /** What a note about this outcome says about room. */
+  async function roomContext(meeting: Meeting, outcome: Outcome): Promise<RoomContext> {
+    switch (outcome) {
+      case 'needs-room':
+        return { candidates: await deps.roomCandidates(meeting) };
+      case 'booked': {
+        const given = await getRoomGivenTo(meeting.id);
+        const moved = given ? await getMeeting(given.moved_meeting_id) : undefined;
+        if (!given || !moved) return {};
+        const movedTo = await getBooking(given.by_meeting_id);
+        return {
+          madeRoomBy: {
+            meeting_id: moved.id,
+            purpose: moved.purpose,
+            counterparts: noteCounterparts(moved),
+            moved_to: movedTo ? { start: movedTo.start_at, end: movedTo.end_at } : null,
+          },
+        };
+      }
+      case 'gave-up': {
+        const making = await getRoomMadeBy(meeting.id);
+        const roomFor = making?.state === 'reserved' ? await getMeeting(making.for_meeting_id) : undefined;
+        return roomFor ? { roomFor } : {};
+      }
+      case 'settled':
+      case 'not-scheduling':
+        return {};
       default: {
         const unreachable: never = outcome;
         throw new Error(`Unknown outcome ${String(unreachable)}`);
@@ -1168,7 +1320,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       'Recorded: booked. The principal hears it from main. Stay ready in this thread for any change they ask for.',
     settled: 'Recorded: settled. This conversation is now closed: send nothing more in it.',
     'needs-room':
-      'Recorded: needs-room. main decides whether to make room; wait for a new brief before offering anything else.',
+      'Recorded: needs-room. main decides whether to make room; wait for a message from the host before offering anything else.',
     'not-scheduling': 'Recorded: not-scheduling. This conversation is now closed: send nothing more in it.',
     'gave-up': 'Recorded: gave-up. This conversation is now closed: send nothing more in it.',
   };
@@ -1264,6 +1416,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     }
 
     const at = new Date().toISOString();
+    const room = await roomContext(meeting, kind);
     const note: OutcomeNote = {
       type: OUTCOME_NOTE_TYPE,
       meeting_id: meeting.id,
@@ -1271,7 +1424,9 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       kind: meeting.kind,
       purpose: meeting.purpose,
       level: meeting.level,
-      counterparts: meeting.counterparts.map(({ name, address }) => ({ name, address })),
+      counterparts: noteCounterparts(meeting),
+      ...(room.candidates ? { candidates: room.candidates } : {}),
+      ...(room.madeRoomBy ? { made_room_by: room.madeRoomBy } : {}),
       ...(booking
         ? {
             booking: {
@@ -1288,7 +1443,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     };
     // The note's id is fixed per meeting and outcome, so it is written once
     // however often this runs; the state changes after it are safe to repeat.
-    await writeOutcomeNote(note, outcomeText(meeting, kind, booking, await mainTimezone()), at);
+    await writeOutcomeNote(note, outcomeText(meeting, kind, booking, await mainTimezone(), room), at);
     if (kind === 'booked') {
       await updateMeeting(meeting.id, { state: 'booked' }, at);
       await clearDeadlines(meeting.id, at);
@@ -1377,6 +1532,38 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     /* eslint-enable no-catch-all/no-catch-all */
   }
 
+  /**
+   * Give up on a meeting nobody answered (KTD12, R9): the host reports
+   * gave-up to main itself, ends the meeting and its conversation, and
+   * releases its holds, with no agent turn. Safe to repeat: the note is
+   * written once, and a release that fails leaves its holds for a later pass.
+   */
+  async function giveUpUnanswered(meeting: Meeting): Promise<void> {
+    const current = await requireMeeting(meeting.id);
+    if (current.state !== 'active') return;
+    const at = new Date().toISOString();
+    const room = await roomContext(current, 'gave-up');
+    const note: OutcomeNote = {
+      type: OUTCOME_NOTE_TYPE,
+      meeting_id: current.id,
+      outcome: 'gave-up',
+      kind: current.kind,
+      purpose: current.purpose,
+      level: current.level,
+      counterparts: noteCounterparts(current),
+      unanswered: true,
+    };
+    const text =
+      `Nobody answered meeting ${current.id}, "${current.purpose}" with ${who(current)}, in the two working days after a nudge, ` +
+      'so its held times were released and its thread closed. Tell the principal in one line, with a suggestion, ' +
+      'such as another way to reach them or a later window.' +
+      roomStillNeeded(room);
+    await writeOutcomeNote(note, text, at);
+    const data = { meeting_id: current.id, outcome: 'gave-up', message: OUTCOME_REPLIES['gave-up'] };
+    await recordOutcome(current.id, 'gave-up', JSON.stringify(data), at);
+    await endMeeting(current, 'gave-up', true);
+  }
+
   /** A thread the audience check stopped: its meeting ends at once, so the thread can wake nothing. */
   async function threadStopped(key: ThreadKey): Promise<void> {
     if (key.channelType !== EMAIL_CHANNEL_TYPE || key.platformId !== INBOX_PLATFORM_ID || key.threadId === null) return;
@@ -1433,8 +1620,9 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     cancel: answering('meeting_cancel', (content) => cancel(content)),
     amend: answering('meeting_amend', (content) => amend(content)),
     outcome: answering('meeting_outcome', (content, session) => outcome(content, session)),
-    /** End a meeting from the host (follow-through gives up, a booked event passes). */
+    /** End a meeting from the host (a booked event passes). */
     endMeeting,
+    giveUpUnanswered,
     threadStopped,
     forgetPerson,
   };

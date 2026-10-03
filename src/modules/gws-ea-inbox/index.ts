@@ -270,6 +270,7 @@ export {
   type GmailMessageRef,
 } from './gmail-api.js';
 export { getInboxHealth, type InboxHealth } from './health.js';
+export { registerThreadReplyHook, type ThreadReplyHook } from './routing.js';
 export { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from './runtime.js';
 export {
   allowedRecipients,

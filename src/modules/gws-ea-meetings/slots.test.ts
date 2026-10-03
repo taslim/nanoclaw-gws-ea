@@ -16,6 +16,7 @@ import {
   schedulingRules,
   slotIdFor,
   workingDayEnd,
+  workingDaysLater,
   zonedInstant,
   type SchedulingRules,
   type SlotQuery,
@@ -339,5 +340,81 @@ describe('working days', () => {
       null,
     );
     expect(openSlots(query({ window: WEEK, rules: none }))).toEqual(openSlots(query({ window: WEEK })));
+  });
+});
+
+describe('working days later (follow-through deadlines)', () => {
+  const later = (from: string, count: number, rules = WEEKDAY_RULES, timezone = LONDON) =>
+    iso(workingDaysLater(at(from), count, rules, timezone));
+
+  it('land at the same time of day the given number of working days on, skipping the weekend', () => {
+    // Monday 11:30 in London.
+    expect(later('2026-10-05T10:30:00Z', 2)).toBe('2026-10-07T10:30:00.000Z');
+    // Thursday 15:00 to Monday 15:00, past the weekend.
+    expect(later('2026-10-08T14:00:00Z', 2)).toBe('2026-10-12T14:00:00.000Z');
+  });
+
+  it('count from the start of the working day when it begins outside working hours', () => {
+    // Monday 08:00: from Monday 09:00.
+    expect(later('2026-10-05T07:00:00Z', 2)).toBe('2026-10-07T08:00:00.000Z');
+    // Friday 18:00 and Saturday noon: from Monday 09:00.
+    expect(later('2026-10-09T17:00:00Z', 2)).toBe('2026-10-14T08:00:00.000Z');
+    expect(later('2026-10-10T11:00:00Z', 2)).toBe('2026-10-14T08:00:00.000Z');
+  });
+
+  it("follow the principal's own days and hours on their clock, across a clock change", () => {
+    const shortWeek = schedulingRules(
+      {
+        working_hours: [
+          ...workingDays('10:00', '16:00', ['mon', 'tue', 'wed', 'thu']),
+          { ...PROVENANCE, weekday: 'fri', off: true as const },
+        ],
+        protected_windows: [],
+        meeting_lengths: [],
+        buffers: [],
+        preferred_times: [],
+      },
+      null,
+    );
+    // Thursday 17:00 in New York: Friday is off, so from Monday 10:00 to Wednesday 10:00.
+    expect(later('2026-10-08T21:00:00Z', 2, shortWeek, NEW_YORK)).toBe('2026-10-14T14:00:00.000Z');
+    // Wednesday 15:30 in New York, a day before the clocks go back: to Monday 15:30, now on standard time.
+    expect(later('2026-10-28T19:30:00Z', 2, shortWeek, NEW_YORK)).toBe('2026-11-02T20:30:00.000Z');
+  });
+
+  it('end at the close of a shorter day rather than past it', () => {
+    const shortFriday = schedulingRules(
+      {
+        working_hours: [
+          ...workingDays('09:00', '17:00', ['mon', 'tue', 'wed', 'thu']),
+          ...workingDays('09:00', '13:00', ['fri']),
+        ],
+        protected_windows: [],
+        meeting_lengths: [],
+        buffers: [],
+        preferred_times: [],
+      },
+      null,
+    );
+    // Wednesday 16:00 to Friday, which ends at 13:00.
+    expect(later('2026-10-07T15:00:00Z', 2, shortFriday)).toBe('2026-10-09T12:00:00.000Z');
+  });
+
+  it('assume Monday to Friday, 09:00 to 17:00, when the principal works no day at all', () => {
+    const never = schedulingRules(
+      {
+        working_hours: (['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] as const).map((weekday) => ({
+          ...PROVENANCE,
+          weekday,
+          off: true as const,
+        })),
+        protected_windows: [],
+        meeting_lengths: [],
+        buffers: [],
+        preferred_times: [],
+      },
+      null,
+    );
+    expect(later('2026-10-05T07:00:00Z', 2, never)).toBe('2026-10-07T08:00:00.000Z');
   });
 });
