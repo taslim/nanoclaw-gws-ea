@@ -81,10 +81,16 @@ describe('the meetings module', () => {
       'meeting_cancel',
       'meeting_amend',
       'meeting_outcome',
+      'meeting_free_time',
+      'meeting_hold',
+      'meeting_release_holds',
+      'meeting_book',
     ]) {
       expect(getDeliveryAction(action), action).toBeDefined();
     }
     const guarded = listGuardedActions().map((spec) => spec.action);
-    expect(guarded).toEqual(expect.arrayContaining(['gws_ea_meetings.request', 'gws_ea_meetings.outcome']));
+    expect(guarded).toEqual(
+      expect.arrayContaining(['gws_ea_meetings.request', 'gws_ea_meetings.outcome', 'gws_ea_meetings.calendar']),
+    );
   });
 });

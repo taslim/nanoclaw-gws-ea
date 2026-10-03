@@ -20,8 +20,12 @@
  *   from the people store. Mail held for the thread follows it.
  * - The purpose and constraints are length-capped and pass the audience
  *   check before `external-email` sees them.
+ * - `arrange` with colleagues alone whose free/busy Google shows books the
+ *   time directly, with no email and no session (R11).
  * - `cancel` ends a meeting, closes its session, and tells the people the
- *   assistant wrote to in one checked line; `amend` writes a new brief.
+ *   assistant wrote to in one checked line. Given an event the principal
+ *   organizes with others instead, it deletes the event with Google's own
+ *   cancellation notice to them (R8). `amend` writes a new brief.
  * - An outcome becomes a typed note in `main`'s shared session. Booked comes
  *   only after the host's own booking; settled only after the invitation is
  *   re-read and found moved to an offered time or clear of conflicts;
@@ -44,9 +48,9 @@ import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import { requestWake } from '../../request-wake.js';
 import { destroySessionMailbox, sessionDir, writeSessionMessage } from '../../session-manager.js';
-import { formatLocalTime, parseZonedToUtc } from '../../timezone.js';
+import { formatLocalTime } from '../../timezone.js';
 import type { Session } from '../../types.js';
-import { isPrincipalCalendar } from '../gws-ea-inbox/calendar-notifications.js';
+import { isPrincipalCalendar, recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import { listPrincipalCalendars } from '../gws-ea-inbox/db.js';
 import {
   authorizeThread,
@@ -64,6 +68,7 @@ import { findPeople, getPerson } from '../gws-ea-people/db.js';
 import { checkOutbound, deleteThreadRecord, type ThreadKey } from '../gws-ea-privacy/index.js';
 import { getGwsEaProfile, listPrincipalAddresses } from '../gws-ea-profile/db.js';
 import type { CalendarEvent, MeetingsCalendarApi } from './calendar-api.js';
+import { blocksTime, eventSpan } from './slots.js';
 import {
   clearDeadlines,
   deleteMeeting,
@@ -94,14 +99,21 @@ import {
 import { OUTCOME_NOTE_TYPE, requireMainAgentGroupId, writeOutcomeNote, type OutcomeNote } from './notes.js';
 
 export interface MeetingHandoffDeps {
-  /** The host's own Calendar reads. */
+  /** The host's own Calendar client. */
   readonly calendar: () => MeetingsCalendarApi;
   /**
-   * Release every hold the host created for a meeting that is ending. The
-   * calendar actions (U12) create holds and supply this; with none created
-   * there is nothing to release.
+   * Release the holds the host placed for a meeting: every one when the
+   * meeting ends, or only those that no longer fit its length and window.
+   * Throws when one could not be released; it stays recorded for the next
+   * attempt.
    */
-  readonly releaseHolds: (meeting: Meeting) => Promise<void>;
+  readonly releaseHolds: (meeting: Meeting, which?: 'all' | 'stale') => Promise<void>;
+  /**
+   * Book a new meeting directly when everyone in it is a colleague whose
+   * free/busy Google shows (R11), at the best time free for all; undefined
+   * when it is not such a meeting or no time is free, so it goes by email.
+   */
+  readonly bookDirectly: (meeting: Meeting) => Promise<Booking | undefined>;
 }
 
 /** A request the host refuses as asked: the caller reads why and can ask differently. */
@@ -115,11 +127,11 @@ export class MeetingRequestError extends Error {
   }
 }
 
-function invalid(message: string): MeetingRequestError {
+export function invalid(message: string): MeetingRequestError {
   return new MeetingRequestError('invalid-args', message);
 }
 
-function refused(message: string): MeetingRequestError {
+export function refused(message: string): MeetingRequestError {
   return new MeetingRequestError('forbidden', message);
 }
 
@@ -132,6 +144,9 @@ const THREAD_KEY = /^mail-[A-Za-z0-9-]{1,80}$/u;
 const MEETING_ID = /^mtg-[0-9a-f-]{36}$/u;
 const EVENT_ID = /^[A-Za-z0-9_-]{1,1024}$/u;
 const PERSON_ID = /^p-[0-9a-f]{12}$/u;
+/** The preferences store's shape for a kind of meeting, such as `one-on-one`. */
+const MEETING_KIND = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
+const MEETING_KIND_MAX = 40;
 const DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})$/iu;
 const PURPOSE_MAX = 120;
 const CONSTRAINTS_MAX = 500;
@@ -161,7 +176,7 @@ function optionalText(value: unknown, label: string, max: number): string | unde
   return value === undefined || value === null ? undefined : text(value, label, max);
 }
 
-function meetingIdOf(content: Record<string, unknown>): string {
+export function meetingIdOf(content: Record<string, unknown>): string {
   const id = content.meeting_id;
   if (typeof id !== 'string' || !MEETING_ID.test(id)) throw invalid('meeting_id must be a meeting id, such as mtg-…');
   return id;
@@ -189,6 +204,16 @@ function eventIdOf(content: Record<string, unknown>): string {
   const id = content.event_id;
   if (typeof id !== 'string' || !EVENT_ID.test(id)) throw invalid('event_id must be an event id from the calendar');
   return id;
+}
+
+/** The kind of meeting whose preferences apply, when main named one. */
+function meetingKindOf(content: Record<string, unknown>): string | undefined {
+  const kind = content.meeting_kind;
+  if (kind === undefined || kind === null) return undefined;
+  if (typeof kind !== 'string' || kind.length > MEETING_KIND_MAX || !MEETING_KIND.test(kind)) {
+    throw invalid('meeting_kind must be a kind of meeting as the preferences name it, such as one-on-one');
+  }
+  return kind;
 }
 
 function lengthOf(value: unknown): number {
@@ -260,12 +285,12 @@ async function assertShareable(purpose: string | undefined, constraints: string 
 // Who the meeting is with
 // ---------------------------------------------------------------------------
 
-interface AddressBook {
+export interface AddressBook {
   readonly principal: ReadonlySet<string>;
   readonly assistant: ReadonlySet<string>;
 }
 
-async function addressBook(): Promise<AddressBook> {
+export async function addressBook(): Promise<AddressBook> {
   return {
     principal: new Set((await listPrincipalAddresses()).map((address) => address.email)),
     assistant: await assistantAddresses(),
@@ -328,37 +353,84 @@ function who(meeting: Pick<Meeting, 'counterparts'>): string {
     .join(', ');
 }
 
-// ---------------------------------------------------------------------------
-// The calendar, as Google reports it now
-// ---------------------------------------------------------------------------
-
-interface Span {
-  readonly start: number;
-  readonly end: number;
+/** The principal's timezone, which their preferences and all-day events are on. */
+export async function principalTimezone(): Promise<string> {
+  return (await getGwsEaProfile()).principal_timezone ?? TIMEZONE;
 }
 
-/** An event's span: a timed event's instants, an all-day event's days on the principal's clock. */
-function spanOf(event: CalendarEvent, timezone: string): Span | undefined {
-  const { start, end } = event;
-  if (start?.dateTime !== undefined && end?.dateTime !== undefined) {
-    const span = { start: Date.parse(start.dateTime), end: Date.parse(end.dateTime) };
-    return Number.isNaN(span.start) || Number.isNaN(span.end) ? undefined : span;
+/** The people besides the principal and the assistant on an event: its guests to tell. */
+function guestsOf(event: CalendarEvent, book: AddressBook): string[] {
+  return [
+    ...new Set(
+      (event.attendees ?? [])
+        .filter((attendee) => attendee.resource !== true)
+        .flatMap((attendee) => normalizeAddress(attendee.email ?? '') ?? [])
+        .filter((address) => !book.principal.has(address) && !book.assistant.has(address)),
+    ),
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// Answering every request exactly once
+// ---------------------------------------------------------------------------
+
+/** What a request's handler returns: the data its answer carries, and the meeting it concerns. */
+export interface Answer {
+  readonly meetingId: string | null;
+  readonly data: Record<string, unknown>;
+}
+
+function errorFrame(requestId: string, error: unknown): ResponseFrame {
+  if (error instanceof MeetingRequestError) {
+    return { id: requestId, ok: false, error: { code: error.code, message: error.message } };
   }
-  if (start?.date !== undefined && end?.date !== undefined) {
-    return {
-      start: parseZonedToUtc(`${start.date}T00:00:00`, timezone).getTime(),
-      end: parseZonedToUtc(`${end.date}T00:00:00`, timezone).getTime(),
-    };
-  }
-  return undefined;
+  const reason = error instanceof Error ? error.message : String(error);
+  return {
+    id: requestId,
+    ok: false,
+    error: { code: 'handler-error', message: `The host could not do it: ${reason}` },
+  };
+}
+
+export type Handle = (content: Record<string, unknown>, session: Session, requestId: string) => Promise<Answer>;
+
+/**
+ * A delivery action that answers its request once. The answer, an error
+ * included, is recorded before it is written, so a replay writes the same
+ * answer again and runs nothing.
+ */
+export function answering(action: string, handle: Handle): GuardedDeliveryHandler {
+  return async (content, session) => {
+    const requestId = requestIdOf(content);
+    if (requestId === undefined) return;
+    const recorded = await getRecordedResponse(session.id, requestId);
+    if (recorded !== undefined) {
+      await writeActionResponse(session, requestId, JSON.parse(recorded) as ResponseFrame);
+      return;
+    }
+    let frame: ResponseFrame;
+    let meetingId: string | null = null;
+    /* eslint-disable no-catch-all/no-catch-all -- every request is answered, a failure included; nothing is rethrown into a retry */
+    try {
+      const answer = await handle(content, session, requestId);
+      meetingId = answer.meetingId;
+      frame = { id: requestId, ok: true, data: answer.data };
+    } catch (error) {
+      if (error instanceof MeetingRequestError) {
+        log.info('Meeting request refused', { action, requestId, sessionId: session.id, reason: error.message });
+      } else {
+        log.error('Meeting request failed', { action, requestId, sessionId: session.id, err: error });
+      }
+      frame = errorFrame(requestId, error);
+    }
+    /* eslint-enable no-catch-all/no-catch-all */
+    await recordResponse(session.id, requestId, action, meetingId, JSON.stringify(frame), new Date().toISOString());
+    await writeActionResponse(session, requestId, frame);
+  };
 }
 
 export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   const calendar = () => deps.calendar();
-
-  async function principalTimezone(): Promise<string> {
-    return (await getGwsEaProfile()).principal_timezone ?? TIMEZONE;
-  }
 
   /** A calendar of the principal's in the assistant's list; with `write`, one it can change. */
   async function requirePrincipalCalendar(calendarId: string, write: boolean): Promise<string> {
@@ -375,6 +447,12 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     return entry.id;
   }
 
+  /** Whether the principal organizes an event: one of their addresses, or the calendar it is on, is its organizer. */
+  function organizedByPrincipal(event: CalendarEvent, calendarId: string, book: AddressBook): boolean {
+    const organizer = event.organizer?.email;
+    return organizer !== undefined && (book.principal.has(organizer) || organizer === calendarId.toLowerCase());
+  }
+
   /** A timed, live event, with its span and length in minutes. */
   async function requireTimedEvent(
     calendarId: string,
@@ -383,7 +461,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     const event = await calendar().getEvent(calendarId, eventId);
     if (!event || event.status === 'cancelled') throw refused(`There is no event ${eventId} on calendar ${calendarId}`);
     if (event.start?.dateTime === undefined) throw refused('An all-day event cannot be moved this way');
-    const span = spanOf(event, await principalTimezone());
+    const span = eventSpan(event, await principalTimezone());
     if (!span || span.end <= span.start) throw refused('Google reports no readable time for that event');
     return { event, minutes: Math.round((span.end - span.start) / MINUTE) };
   }
@@ -542,11 +620,6 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     /* eslint-enable no-catch-all/no-catch-all */
   }
 
-  interface Answer {
-    readonly meetingId: string | null;
-    readonly data: Record<string, unknown>;
-  }
-
   const KIND_WORDS: Readonly<Record<MeetingKind, string>> = {
     arrange: 'to arrange',
     reschedule: 'to move',
@@ -576,8 +649,56 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     }
   }
 
+  function bookedDirectlyAnswer(meeting: Meeting, booking: Booking, timezone: string): Answer {
+    const minutes = Math.round((Date.parse(booking.end_at) - Date.parse(booking.start_at)) / MINUTE);
+    return {
+      meetingId: meeting.id,
+      data: {
+        meeting_id: meeting.id,
+        state: 'booked',
+        booking: {
+          calendar_id: booking.calendar_id,
+          event_id: booking.event_id,
+          start: booking.start_at,
+          end: booking.end_at,
+        },
+        message:
+          `Booked directly: "${meeting.purpose}" with ${who(meeting)}, ${formatLocalTime(booking.start_at, timezone)} ` +
+          `(${minutes} minutes), on calendar ${booking.calendar_id}. Their calendars showed the time free, so Google's ` +
+          'invitation went to them and nobody was emailed. Tell the principal in one line.',
+      },
+    };
+  }
+
+  /**
+   * A new meeting with colleagues alone whose free/busy is visible is booked
+   * at once (R11); any other goes to external-email by email.
+   */
+  async function openArranged(meeting: Meeting, opening: Opening): Promise<Answer> {
+    if (opening.kind === 'new' && meeting.kind === 'arrange') {
+      let booking: Booking | undefined;
+      try {
+        booking = await deps.bookDirectly(meeting);
+      } catch (error) {
+        await abandon(meeting);
+        throw error;
+      }
+      if (booking) {
+        const at = new Date().toISOString();
+        await updateMeeting(meeting.id, { state: 'booked' }, at);
+        await clearDeadlines(meeting.id, at);
+        return bookedDirectlyAnswer(meeting, booking, await mainTimezone());
+      }
+    }
+    return openOrAbandon(meeting, opening);
+  }
+
   /** Finish a meeting a replayed request had already created. */
   async function resume(meeting: Meeting): Promise<Answer> {
+    if (meeting.state === 'booked' && meeting.session_id === null) {
+      const booking = await getBooking(meeting.id);
+      if (booking) return bookedDirectlyAnswer(meeting, booking, await mainTimezone());
+    }
     if (meeting.state === 'active' || meeting.state === 'booked') return openedAnswer(meeting);
     if (meeting.state !== 'opening') throw refused(`Meeting ${meeting.id} did not open (${meeting.state})`);
     if (meeting.replaces_meeting_id !== null) {
@@ -586,12 +707,10 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       return openOrAbandon(meeting, { kind: 'takeover', session });
     }
     const thread = await getThreadParticipants(meeting.thread_key);
-    return openOrAbandon(
-      meeting,
-      thread?.origin === 'copy-in'
-        ? { kind: 'copy-in' }
-        : { kind: 'new', opener: meeting.kind === 'ask_organizer' ? 'ask_organizer' : 'arrange' },
-    );
+    if (thread?.origin === 'copy-in') return openOrAbandon(meeting, { kind: 'copy-in' });
+    const opening: Opening = { kind: 'new', opener: meeting.kind === 'ask_organizer' ? 'ask_organizer' : 'arrange' };
+    // No thread yet: the first attempt stopped before choosing between booking directly and email.
+    return thread === undefined ? openArranged(meeting, opening) : openOrAbandon(meeting, opening);
   }
 
   interface Creation {
@@ -605,6 +724,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     readonly window: Window;
     readonly purpose: string;
     readonly constraints: string | undefined;
+    readonly meetingKind: string | undefined;
     readonly threadKey: string;
     /** A booked meeting whose thread and session this one takes over. */
     readonly replaces?: Meeting;
@@ -633,6 +753,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
             window_end: creation.window.end,
             purpose: creation.purpose,
             constraints: creation.constraints ?? null,
+            meeting_kind: creation.meetingKind ?? null,
             thread_key: creation.threadKey,
             replaces_meeting_id: creation.replaces?.id ?? null,
           },
@@ -666,6 +787,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     const window = checkedWindow(windowOf(content), lengthMinutes, at);
     const purpose = text(content.purpose, 'purpose', PURPOSE_MAX);
     const constraints = optionalText(content.constraints, 'constraints', CONSTRAINTS_MAX);
+    const meetingKind = meetingKindOf(content);
     const book = await addressBook();
 
     let counterparts: MeetingCounterpart[];
@@ -708,9 +830,10 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       window,
       purpose,
       constraints,
+      meetingKind,
       threadKey: threadKey ?? mintThreadKey(),
     });
-    return openOrAbandon(meeting, opening);
+    return openArranged(meeting, opening);
   }
 
   async function reschedule(content: Record<string, unknown>, session: Session, requestId: string): Promise<Answer> {
@@ -723,24 +846,17 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     const window = windowOf(content);
     const purpose = text(content.purpose, 'purpose', PURPOSE_MAX);
     const constraints = optionalText(content.constraints, 'constraints', CONSTRAINTS_MAX);
+    const meetingKind = meetingKindOf(content);
 
     const bookingCalendarId = await requirePrincipalCalendar(calendarId, true);
     const { event, minutes } = await requireTimedEvent(bookingCalendarId, eventId);
     const book = await addressBook();
-    const organizer = event.organizer?.email;
-    if (organizer === undefined || !(book.principal.has(organizer) || organizer === bookingCalendarId.toLowerCase())) {
+    if (!organizedByPrincipal(event, bookingCalendarId, book)) {
       throw refused(
         'Someone else organizes that event, so it cannot be moved from here: use ask_organizer to ask its organizer instead.',
       );
     }
-    const addresses = [
-      ...new Set(
-        (event.attendees ?? [])
-          .filter((attendee) => attendee.resource !== true)
-          .flatMap((attendee) => normalizeAddress(attendee.email ?? '') ?? [])
-          .filter((address) => !book.principal.has(address) && !book.assistant.has(address)),
-      ),
-    ];
+    const addresses = guestsOf(event, book);
     if (addresses.length === 0) throw refused('Nobody else is invited to that event: move it on the calendar yourself');
     const lengthMinutes = askedLength ?? minutes;
     if (lengthMinutes < MIN_LENGTH || lengthMinutes > MAX_LENGTH) {
@@ -770,6 +886,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         window,
         purpose,
         constraints,
+        meetingKind,
         threadKey: booked.thread_key,
         replaces: booked,
       });
@@ -786,6 +903,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       window,
       purpose,
       constraints,
+      meetingKind,
       threadKey: mintThreadKey(),
     });
     return openOrAbandon(meeting, { kind: 'new', opener: 'arrange' });
@@ -834,19 +952,38 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       window,
       purpose,
       constraints,
+      meetingKind: undefined,
       threadKey: mintThreadKey(),
     });
     return openOrAbandon(meeting, { kind: 'new', opener: 'ask_organizer' });
   }
 
   async function cancel(content: Record<string, unknown>): Promise<Answer> {
-    const meeting = await requireMeeting(meetingIdOf(content));
-    if (!isLive(meeting.state) && meeting.state !== 'cancelled') {
-      throw refused(`Meeting ${meeting.id} has already ended (${meeting.state})`);
+    const namesEvent = content.calendar_id !== undefined || content.event_id !== undefined;
+    if (content.meeting_id !== undefined) {
+      if (namesEvent) throw invalid('Give either meeting_id, or calendar_id with event_id, not both');
+      return cancelMeeting(await requireMeeting(meetingIdOf(content)));
     }
+    if (namesEvent) return cancelEvent(calendarIdOf(content), eventIdOf(content));
+    throw invalid(
+      'Give the meeting_id of a meeting you handed over, or the calendar_id and event_id of an event the principal organizes',
+    );
+  }
+
+  /** End a meeting as cancelled and tell the people the assistant wrote to; true when they were told. */
+  async function endCancelled(meeting: Meeting): Promise<boolean> {
     await stopMeeting(meeting, 'cancelled', true);
     const told = await sendCancelLine(meeting);
     await closeMeetingThread(meeting);
+    await deps.releaseHolds(meeting);
+    return told;
+  }
+
+  async function cancelMeeting(meeting: Meeting): Promise<Answer> {
+    if (!isLive(meeting.state) && meeting.state !== 'cancelled') {
+      throw refused(`Meeting ${meeting.id} has already ended (${meeting.state})`);
+    }
+    const told = await endCancelled(meeting);
     return {
       meetingId: meeting.id,
       data: {
@@ -856,6 +993,56 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         message: told
           ? `Meeting ${meeting.id} is cancelled, its conversation closed, and ${who(meeting)} told in one line.`
           : `Meeting ${meeting.id} is cancelled and its conversation closed. The assistant had not written to ${who(meeting)}, so nobody was told.`,
+      },
+    };
+  }
+
+  /**
+   * Cancel an event the principal organizes with others (R8): Google's own
+   * cancellation notice goes to its guests, as a human assistant's delete
+   * would send, and a meeting the assistant was working on for that event
+   * ends as a cancelled meeting does.
+   */
+  async function cancelEvent(requestedCalendarId: string, eventId: string): Promise<Answer> {
+    const calendarId = await requirePrincipalCalendar(requestedCalendarId, true);
+    const event = await calendar().getEvent(calendarId, eventId);
+    if (!event) throw refused(`There is no event ${eventId} on calendar ${calendarId}`);
+    const book = await addressBook();
+    const alreadyCancelled = event.status === 'cancelled';
+    if (!alreadyCancelled && !organizedByPrincipal(event, calendarId, book)) {
+      throw refused(
+        'Someone else organizes that event, so it cannot be cancelled from here: use ask_organizer to ask its organizer, or decline it.',
+      );
+    }
+    const guests = guestsOf(event, book);
+    if (!alreadyCancelled && guests.length === 0) {
+      throw refused('Nobody else is invited to that event: delete it on the calendar yourself');
+    }
+    const bound = [
+      await findLiveMeetingForEvent(calendarId, eventId),
+      await findBookedMeetingForEvent(calendarId, eventId),
+    ].filter((meeting): meeting is Meeting => meeting !== undefined);
+    if (!alreadyCancelled) {
+      await calendar().deleteEvent(calendarId, eventId, 'all');
+      recordOwnCalendarChange(calendarId, eventId);
+    }
+    for (const meeting of bound) await endCancelled(meeting);
+
+    const span = eventSpan(event, await principalTimezone());
+    const when = span ? ` at ${formatLocalTime(new Date(span.start).toISOString(), await mainTimezone())}` : '';
+    const ended = bound.length > 0 ? `, and meeting ${bound.map((meeting) => meeting.id).join(', ')} is ended` : '';
+    return {
+      meetingId: bound[0]?.id ?? null,
+      data: {
+        calendar_id: calendarId,
+        event_id: eventId,
+        state: 'cancelled',
+        ...(bound.length > 0 ? { meeting_id: bound[0].id } : {}),
+        guests,
+        message: alreadyCancelled
+          ? `The event${when} on calendar ${calendarId} was already cancelled; nothing more was sent.`
+          : `The event${when} on calendar ${calendarId} is cancelled. Google sent its guests (${guests.join(', ')}) ` +
+            `its own cancellation notice${ended}. Tell the principal in one line.`,
       },
     };
   }
@@ -904,6 +1091,13 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     const amended = await requireMeeting(meeting.id);
     await writeBrief(amended, session, version, 'continuing');
     await requestWake(session, 'inbound-message');
+    /* eslint-disable no-catch-all/no-catch-all -- the brief stands; a hold that no longer fits cannot be booked, and is released when the meeting ends */
+    try {
+      await deps.releaseHolds(amended, 'stale');
+    } catch (err) {
+      log.warn('Holds that no longer fit an amended meeting were not all released', { meetingId: meeting.id, err });
+    }
+    /* eslint-enable no-catch-all/no-catch-all */
     return {
       meetingId: meeting.id,
       data: {
@@ -991,7 +1185,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       );
     }
     const timezone = await principalTimezone();
-    const span = spanOf(event, timezone);
+    const span = eventSpan(event, timezone);
     if (!span) throw refused('Google reports no readable time for the invitation');
     const offered = await listOfferedSlots(meeting.id);
     if (offered.some((slot) => Date.parse(slot.start_at) === span.start && Date.parse(slot.end_at) === span.end)) {
@@ -1008,13 +1202,8 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       );
       conflicts += events.filter((other) => {
         if (other.id === event.id || (event.iCalUID !== undefined && other.iCalUID === event.iCalUID)) return false;
-        if (other.status === 'cancelled' || other.transparency === 'transparent') return false;
-        const declined = (other.attendees ?? []).some(
-          (attendee) =>
-            attendee.email !== undefined && principal.has(attendee.email) && attendee.responseStatus === 'declined',
-        );
-        if (declined) return false;
-        const otherSpan = spanOf(other, timezone);
+        if (!blocksTime(other, principal)) return false;
+        const otherSpan = eventSpan(other, timezone);
         return otherSpan !== undefined && otherSpan.start < span.end && otherSpan.end > span.start;
       }).length;
     }
@@ -1126,12 +1315,11 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     if (kill) killContainer(sessionId, 'its meeting ended');
   }
 
-  /** Stop the meeting: its state, its deadlines, its holds, and its session, which never wakes again. */
+  /** Stop the meeting: its state, its deadlines, and its session, which never wakes again. */
   async function stopMeeting(meeting: Meeting, state: MeetingState, kill: boolean): Promise<void> {
     const at = new Date().toISOString();
     await updateMeeting(meeting.id, { state, ended_at: meeting.ended_at ?? at }, at);
     await clearDeadlines(meeting.id, at);
-    await deps.releaseHolds(meeting);
     if (meeting.session_id !== null) await closeSession(meeting.session_id, kill);
   }
 
@@ -1146,9 +1334,15 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     });
   }
 
+  /**
+   * End a meeting: stopped, its thread closed, and then its holds released.
+   * Releasing comes last, so a failure there leaves nothing open; the holds
+   * stay recorded and a repeat releases them.
+   */
   async function endMeeting(meeting: Meeting, state: MeetingState, kill: boolean): Promise<void> {
     await stopMeeting(meeting, state, kill);
     await closeMeetingThread(meeting);
+    await deps.releaseHolds(meeting);
   }
 
   /** The one checked line a cancel sends, in the thread, to the people the assistant already wrote to. */
@@ -1213,9 +1407,8 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   async function forgetPerson(person: { readonly id: string; readonly handles: readonly string[] }): Promise<void> {
     if (!(await getDb().hasTable('gws_ea_meetings'))) return;
     const meetings = await meetingsWithPerson(person.id, person.handles);
-    for (const meeting of meetings) {
-      if (isLive(meeting.state)) await deps.releaseHolds(meeting);
-    }
+    // Every meeting, ended ones too: a hold a failed release left behind goes before its record does.
+    for (const meeting of meetings) await deps.releaseHolds(meeting);
     for (const meeting of meetings) await deleteMeeting(meeting.id);
     for (const threadKey of new Set(meetings.map((meeting) => meeting.thread_key))) {
       if (await findLiveMeetingOnThread(threadKey)) continue;
@@ -1231,59 +1424,6 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       );
       if (!stillBound) await purgeSession(sessionId);
     }
-  }
-
-  // -------------------------------------------------------------------------
-  // Answering every request exactly once
-  // -------------------------------------------------------------------------
-
-  function errorFrame(requestId: string, error: unknown): ResponseFrame {
-    if (error instanceof MeetingRequestError) {
-      return { id: requestId, ok: false, error: { code: error.code, message: error.message } };
-    }
-    const reason = error instanceof Error ? error.message : String(error);
-    return {
-      id: requestId,
-      ok: false,
-      error: { code: 'handler-error', message: `The host could not do it: ${reason}` },
-    };
-  }
-
-  type Handle = (content: Record<string, unknown>, session: Session, requestId: string) => Promise<Answer>;
-
-  /**
-   * A delivery action that answers its request once. The answer, an error
-   * included, is recorded before it is written, so a replay writes the same
-   * answer again and runs nothing.
-   */
-  function answering(action: string, handle: Handle): GuardedDeliveryHandler {
-    return async (content, session) => {
-      const requestId = requestIdOf(content);
-      if (requestId === undefined) return;
-      const recorded = await getRecordedResponse(session.id, requestId);
-      if (recorded !== undefined) {
-        await writeActionResponse(session, requestId, JSON.parse(recorded) as ResponseFrame);
-        return;
-      }
-      let frame: ResponseFrame;
-      let meetingId: string | null = null;
-      /* eslint-disable no-catch-all/no-catch-all -- every request is answered, a failure included; nothing is rethrown into a retry */
-      try {
-        const answer = await handle(content, session, requestId);
-        meetingId = answer.meetingId;
-        frame = { id: requestId, ok: true, data: answer.data };
-      } catch (error) {
-        if (error instanceof MeetingRequestError) {
-          log.info('Meeting request refused', { action, requestId, sessionId: session.id, reason: error.message });
-        } else {
-          log.error('Meeting request failed', { action, requestId, sessionId: session.id, err: error });
-        }
-        frame = errorFrame(requestId, error);
-      }
-      /* eslint-enable no-catch-all/no-catch-all */
-      await recordResponse(session.id, requestId, action, meetingId, JSON.stringify(frame), new Date().toISOString());
-      await writeActionResponse(session, requestId, frame);
-    };
   }
 
   return {

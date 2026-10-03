@@ -38,15 +38,11 @@ vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn().mockResolvedValue
 const google = vi.hoisted(() => ({ calendar: undefined as unknown }));
 vi.mock('./calendar-api.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./calendar-api.js')>();
-  const current = () => google.calendar as import('./calendar-api.js').MeetingsCalendarApi;
+  const { delegatingCalendarApi } = await import('./testing/fake-calendar.js');
   return {
     ...actual,
-    createMeetingsCalendarApi: () => ({
-      getCalendar: (calendarId: string) => current().getCalendar(calendarId),
-      getEvent: (calendarId: string, eventId: string) => current().getEvent(calendarId, eventId),
-      listEvents: (calendarId: string, timeMin: string, timeMax: string) =>
-        current().listEvents(calendarId, timeMin, timeMax),
-    }),
+    createMeetingsCalendarApi: () =>
+      delegatingCalendarApi(() => google.calendar as import('./calendar-api.js').MeetingsCalendarApi),
   };
 });
 
@@ -91,15 +87,15 @@ import {
   getThreadParticipants,
   GoogleApiError,
   INBOX_PLATFORM_ID,
-  type CalendarListEntry,
   type GmailApi,
   type GmailHistoryRecord,
   type GmailMessage,
   type GmailMessageRef,
   type Inbox,
 } from '../gws-ea-inbox/index.js';
-import type { CalendarEvent, MeetingsCalendarApi } from './calendar-api.js';
+import { consumeOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import { getMeeting, type Meeting } from './index.js';
+import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
 
 const ROBIN = 'robin@assistant.example';
 const PRINCIPAL = 'pat@principal.example';
@@ -233,57 +229,6 @@ class FakeGmail implements GmailApi {
     this.messages.set(id, { id, threadId, labelIds: ['SENT'], payload: { mimeType: 'text/plain', headers } });
     this.sent.push({ id, threadId, headers, text });
     return { id, threadId };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// An in-memory Google Calendar, as the assistant's token sees it
-// ---------------------------------------------------------------------------
-
-interface StoredEvent extends CalendarEvent {
-  readonly calendarId: string;
-}
-
-class FakeCalendar implements MeetingsCalendarApi {
-  readonly calendars = new Map<string, CalendarListEntry>();
-  readonly events: StoredEvent[] = [];
-  calls = 0;
-  failure: Error | undefined;
-
-  private call(): void {
-    this.calls += 1;
-    if (this.failure) throw this.failure;
-  }
-
-  async getCalendar(calendarId: string) {
-    this.call();
-    return this.calendars.get(calendarId.toLowerCase());
-  }
-
-  async getEvent(calendarId: string, eventId: string) {
-    this.call();
-    return this.events.find((e) => e.calendarId === calendarId && e.id === eventId);
-  }
-
-  async listEvents(calendarId: string, timeMin: string, timeMax: string) {
-    this.call();
-    const min = Date.parse(timeMin);
-    const max = Date.parse(timeMax);
-    return this.events.filter((e) => {
-      if (e.calendarId !== calendarId || !e.start?.dateTime || !e.end?.dateTime) return false;
-      return Date.parse(e.start.dateTime) < max && Date.parse(e.end.dateTime) > min;
-    });
-  }
-
-  put(event: StoredEvent): void {
-    const index = this.events.findIndex((e) => e.calendarId === event.calendarId && e.id === event.id);
-    if (index >= 0) this.events.splice(index, 1, event);
-    else this.events.push(event);
-  }
-
-  remove(calendarId: string, eventId: string): void {
-    const index = this.events.findIndex((e) => e.calendarId === calendarId && e.id === eventId);
-    if (index >= 0) this.events.splice(index, 1);
   }
 }
 
@@ -1213,6 +1158,76 @@ describe('cancel', () => {
       counterparts_told: false,
     });
     expect(gmail.sent).toHaveLength(0);
+  });
+});
+
+describe('cancel for an event the principal organizes (R8)', () => {
+  it("deletes it with Google's own cancellation notice to its guests, and no text of the assistant's", async () => {
+    calendar.put(principalEvent('evt-review', SAM, 10, 11));
+    const answer = data(await ask(main, 'meeting_cancel', { calendar_id: PRINCIPAL, event_id: 'evt-review' }));
+    expect(answer).toMatchObject({ calendar_id: PRINCIPAL, event_id: 'evt-review', state: 'cancelled' });
+    expect(String(answer.message)).toContain(SAM);
+    expect(calendar.writes).toEqual([
+      { op: 'delete', calendarId: PRINCIPAL, eventId: 'evt-review', sendUpdates: 'all' },
+    ]);
+    expect(calendar.event(PRINCIPAL, 'evt-review')?.status).toBe('cancelled');
+    // The notification Google sends about it is the assistant's own change.
+    expect(consumeOwnCalendarChange(PRINCIPAL, 'evt-review', new Date())).toBe(true);
+    expect(gmail.sent).toHaveLength(0);
+    expect(await count('gws_ea_meetings')).toBe(0);
+  });
+
+  it('refuses an event someone else organizes: ask its organizer instead', async () => {
+    calendar.put(invitation('evt-theirs', OLU));
+    const message = refusal(await ask(main, 'meeting_cancel', { calendar_id: PRINCIPAL, event_id: 'evt-theirs' }));
+    expect(message).toMatch(/ask_organizer/);
+    expect(calendar.writes).toEqual([]);
+    expect(calendar.event(PRINCIPAL, 'evt-theirs')?.status).toBe('confirmed');
+  });
+
+  it('refuses an event on a calendar the assistant cannot change', async () => {
+    calendar.put({ ...principalEvent('evt-holiday', SAM), calendarId: READ_ONLY_CALENDAR });
+    const message = refusal(
+      await ask(main, 'meeting_cancel', { calendar_id: READ_ONLY_CALENDAR, event_id: 'evt-holiday' }),
+    );
+    expect(message).toMatch(/calendar/i);
+    expect(calendar.writes).toEqual([]);
+  });
+
+  it('answers a replay with the first result, and deletes nothing twice', async () => {
+    calendar.put(principalEvent('evt-review', SAM, 10, 11));
+    const fields = { calendar_id: PRINCIPAL, event_id: 'evt-review' };
+    const first = await ask(main, 'meeting_cancel', fields, 'req-cancel-event');
+    await getDeliveryAction('meeting_cancel')?.(
+      { action: 'meeting_cancel', requestId: 'req-cancel-event', ...fields },
+      main,
+    );
+    expect(responses(main, 'req-cancel-event')).toEqual([first]);
+    // Asked again as a new request, it is already cancelled.
+    expect(data(await ask(main, 'meeting_cancel', fields))).toMatchObject({ state: 'cancelled' });
+    expect(calendar.writes.filter((write) => write.op === 'delete')).toHaveLength(1);
+  });
+
+  it('ends a meeting the assistant booked as that event, as cancelling the meeting does', async () => {
+    const arranged = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
+    const stored = await meeting(arranged.meeting_id);
+    const session = await meetingSession(arranged.meeting_id);
+    await reply(session, stored.thread_key, 'Hello Sam, I am Robin. Would Tuesday at 10:00 work?');
+    await recordBooking(stored.id, inDays(8, 10), inDays(8, 10.5), 'robin-booked-1');
+    data(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'booked' }));
+    calendar.put({
+      ...principalEvent('robin-booked-1', SAM),
+      start: { dateTime: inDays(8, 10) },
+      end: { dateTime: inDays(8, 10.5) },
+    });
+
+    const answer = data(await ask(main, 'meeting_cancel', { calendar_id: PRINCIPAL, event_id: 'robin-booked-1' }));
+    expect(answer).toMatchObject({ state: 'cancelled', meeting_id: stored.id });
+    expect(calendar.event(PRINCIPAL, 'robin-booked-1')?.status).toBe('cancelled');
+    expect((await meeting(stored.id)).state).toBe('cancelled');
+    expect((await getSession(session.id))?.status).toBe('closed');
+    expect(await getThreadParticipants(stored.thread_key)).toMatchObject({ state: 'closed' });
+    expect(gmail.sent).toHaveLength(2);
   });
 });
 

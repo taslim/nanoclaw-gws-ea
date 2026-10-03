@@ -9,7 +9,18 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { requestAction } from '../action-request.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
-import { amend, arrange, askOrganizer, cancel, outcome, reschedule } from './gws-ea-meetings.js';
+import {
+  amend,
+  arrange,
+  askOrganizer,
+  book,
+  cancel,
+  freeTime,
+  hold,
+  outcome,
+  releaseHolds,
+  reschedule,
+} from './gws-ea-meetings.js';
 import { createMcpServer } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -55,9 +66,15 @@ async function call(tool: McpToolDefinition, args: Record<string, unknown>, fram
 const WINDOW = { window_start: '2026-10-12T09:00:00+01:00', window_end: '2026-10-16T17:00:00+01:00' };
 
 describe('the meeting tools', () => {
-  it("serve main's five requests under one key and external-email's outcome under its own", async () => {
+  it("serve main's five requests under one key and external-email's calendar tools and outcome under its own", async () => {
     expect(await served(['gws-ea-meetings'])).toEqual(['amend', 'arrange', 'ask_organizer', 'cancel', 'reschedule']);
-    expect(await served(['gws-ea-meetings-external'])).toEqual(['outcome']);
+    expect(await served(['gws-ea-meetings-external'])).toEqual([
+      'book',
+      'free_time',
+      'hold',
+      'outcome',
+      'release_holds',
+    ]);
     expect(await served(['reply'])).toEqual([]);
   });
 
@@ -97,6 +114,30 @@ describe('the meeting tools', () => {
       [askOrganizer, 'meeting_ask_organizer', { calendar_id: 'c', event_id: 'e', ...WINDOW, purpose: 'Your invite' }],
       [amend, 'meeting_amend', { meeting_id: 'mtg-1', length_minutes: 60 }],
       [outcome, 'meeting_outcome', { meeting_id: 'mtg-1', outcome: 'gave-up' }],
+      [cancel, 'meeting_cancel', { meeting_id: 'mtg-1' }],
+      [cancel, 'meeting_cancel', { calendar_id: 'c', event_id: 'e' }],
+      [
+        arrange,
+        'meeting_arrange',
+        {
+          people: [{ person_id: 'p-0123456789ab' }],
+          calendar_id: 'c',
+          length_minutes: 30,
+          ...WINDOW,
+          purpose: 'Intro',
+          meeting_kind: 'one-on-one',
+        },
+      ],
+      [freeTime, 'meeting_free_time', { meeting_id: 'mtg-1' }],
+      [
+        freeTime,
+        'meeting_free_time',
+        { meeting_id: 'mtg-1', date: '2026-10-14', time: '15:00', timezone: 'America/New_York' },
+      ],
+      [hold, 'meeting_hold', { meeting_id: 'mtg-1', slot_ids: ['slot-3fa9c2e1b7d0', 'slot-0b1c2d3e4f5a'] }],
+      [releaseHolds, 'meeting_release_holds', { meeting_id: 'mtg-1' }],
+      [releaseHolds, 'meeting_release_holds', { meeting_id: 'mtg-1', slot_ids: ['slot-3fa9c2e1b7d0'] }],
+      [book, 'meeting_book', { meeting_id: 'mtg-1', slot_id: 'slot-3fa9c2e1b7d0' }],
     ];
     for (const [tool, action, args] of cases) {
       const { request } = await call(tool, args, (id) => ({ id, ok: true, data: { message: 'ok' } }));
@@ -110,8 +151,16 @@ describe('the meeting tools', () => {
     for (const [tool, args] of [
       [arrange, { calendar_id: 'c', length_minutes: 30, ...WINDOW }],
       [cancel, {}],
+      [cancel, { calendar_id: 'c' }],
+      [cancel, { meeting_id: 'mtg-1', calendar_id: 'c', event_id: 'e' }],
       [outcome, { meeting_id: 'mtg-1', outcome: 'done' }],
       [amend, { meeting_id: 'mtg-1', length_minutes: '60' }],
+      [freeTime, {}],
+      [freeTime, { meeting_id: 'mtg-1', time: '15:00' }],
+      [hold, { meeting_id: 'mtg-1', slot_ids: 'slot-3fa9c2e1b7d0' }],
+      [hold, { meeting_id: 'mtg-1', slot_ids: [] }],
+      [book, { meeting_id: 'mtg-1' }],
+      [releaseHolds, { meeting_id: 'mtg-1', slot_ids: [3] }],
     ] as const) {
       const result = await tool.handler(args);
       expect(result.isError).toBe(true);

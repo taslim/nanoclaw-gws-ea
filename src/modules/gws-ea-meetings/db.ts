@@ -63,6 +63,8 @@ interface MeetingRow {
   readonly window_end: string;
   readonly purpose: string;
   readonly constraints: string | null;
+  /** The kind of meeting whose buffer and preferred times apply; null for the principal's defaults. */
+  readonly meeting_kind: string | null;
   readonly thread_key: string;
   readonly session_id: string | null;
   readonly brief_version: number;
@@ -188,9 +190,9 @@ export async function insertMeeting(
     await db.run(
       `INSERT INTO gws_ea_meetings
          (id, kind, requested_by_session, request_id, state, level, booking_calendar_id, event_calendar_id,
-          event_id, length_minutes, window_start, window_end, purpose, constraints, thread_key, session_id,
-          brief_version, replaces_meeting_id, nudge_at, give_up_at, created_at, updated_at, ended_at)
-       VALUES (?, ?, ?, ?, 'opening', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, NULL, NULL, ?, ?, NULL)`,
+          event_id, length_minutes, window_start, window_end, purpose, constraints, meeting_kind, thread_key,
+          session_id, brief_version, replaces_meeting_id, nudge_at, give_up_at, created_at, updated_at, ended_at)
+       VALUES (?, ?, ?, ?, 'opening', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, NULL, NULL, ?, ?, NULL)`,
       meeting.id,
       meeting.kind,
       meeting.requested_by_session,
@@ -204,6 +206,7 @@ export async function insertMeeting(
       meeting.window_end,
       meeting.purpose,
       meeting.constraints,
+      meeting.meeting_kind,
       meeting.thread_key,
       meeting.replaces_meeting_id,
       at,
@@ -332,6 +335,95 @@ export async function listOfferedSlots(meetingId: string): Promise<OfferedSlot[]
     'SELECT slot_id, start_at, end_at FROM gws_ea_meeting_slots WHERE meeting_id = ? ORDER BY start_at',
     meetingId,
   );
+}
+
+/** One time the host offered for the meeting, when it did. */
+export async function getOfferedSlot(meetingId: string, slotId: string): Promise<OfferedSlot | undefined> {
+  return getDb().get<OfferedSlot>(
+    'SELECT slot_id, start_at, end_at FROM gws_ea_meeting_slots WHERE meeting_id = ? AND slot_id = ?',
+    meetingId,
+    slotId,
+  );
+}
+
+/** Record the times offered; a time offered before keeps its first record. */
+export async function recordOfferedSlots(meetingId: string, slots: readonly OfferedSlot[], at: string): Promise<void> {
+  const db = getDb();
+  await db.transaction(async () => {
+    for (const slot of slots) {
+      await db.run(
+        `INSERT INTO gws_ea_meeting_slots (meeting_id, slot_id, start_at, end_at, offered_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (meeting_id, slot_id) DO NOTHING`,
+        meetingId,
+        slot.slot_id,
+        slot.start_at,
+        slot.end_at,
+        at,
+      );
+    }
+  });
+}
+
+/** Record the event `book` created or moved. The first booking stands. */
+export async function recordBooking(booking: Booking): Promise<void> {
+  await getDb().run(
+    `INSERT INTO gws_ea_meeting_bookings (meeting_id, calendar_id, event_id, start_at, end_at, booked_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT (meeting_id) DO NOTHING`,
+    booking.meeting_id,
+    booking.calendar_id,
+    booking.event_id,
+    booking.start_at,
+    booking.end_at,
+    booking.booked_at,
+  );
+}
+
+/** How many times a meeting's requests of one action were answered, refusals and failures aside. */
+export async function countAnswers(meetingId: string, action: string): Promise<number> {
+  const row = await getDb().get<{ readonly n: number }>(
+    'SELECT COUNT(*) AS n FROM gws_ea_meeting_requests WHERE meeting_id = ? AND action = ?',
+    meetingId,
+    action,
+  );
+  return row?.n ?? 0;
+}
+
+export interface Hold {
+  readonly meeting_id: string;
+  readonly slot_id: string;
+  readonly calendar_id: string;
+  readonly event_id: string;
+  readonly start_at: string;
+  readonly end_at: string;
+  readonly held_at: string;
+}
+
+/** Every hold the assistant may have placed for the meeting, earliest first. */
+export async function listHolds(meetingId: string): Promise<Hold[]> {
+  return getDb().all<Hold>('SELECT * FROM gws_ea_meeting_holds WHERE meeting_id = ? ORDER BY start_at', meetingId);
+}
+
+/** Record a hold before its event is created; recording it again changes nothing. */
+export async function recordHold(hold: Hold): Promise<void> {
+  await getDb().run(
+    `INSERT INTO gws_ea_meeting_holds (meeting_id, slot_id, calendar_id, event_id, start_at, end_at, held_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT (meeting_id, slot_id) DO NOTHING`,
+    hold.meeting_id,
+    hold.slot_id,
+    hold.calendar_id,
+    hold.event_id,
+    hold.start_at,
+    hold.end_at,
+    hold.held_at,
+  );
+}
+
+/** Forget a hold once its event is gone. */
+export async function deleteHold(meetingId: string, slotId: string): Promise<void> {
+  await getDb().run('DELETE FROM gws_ea_meeting_holds WHERE meeting_id = ? AND slot_id = ?', meetingId, slotId);
 }
 
 // ---------------------------------------------------------------------------

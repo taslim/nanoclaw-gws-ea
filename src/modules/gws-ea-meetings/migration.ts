@@ -116,3 +116,36 @@ export const gwsEaMeetingsMigration: ModuleMigration = {
     `);
   },
 };
+
+/**
+ * The calendar actions' own state (KTD11):
+ *
+ * - `gws_ea_meetings.meeting_kind`: the kind of meeting main named, such as
+ *   `one-on-one`, whose buffer and preferred times apply; null for the
+ *   principal's `default` values.
+ * - `gws_ea_meeting_holds`: each hold the assistant placed for a meeting, by
+ *   the slot it holds and the event it created. Recorded before the event is
+ *   created, so a release always finds every hold the assistant may have
+ *   placed, and touches no other event.
+ */
+export const gwsEaMeetingsCalendarActionsMigration: ModuleMigration = {
+  version: 2,
+  name: 'module:gws-ea-meetings:calendar-actions',
+  async up(db) {
+    await db.exec(`
+      ALTER TABLE gws_ea_meetings ADD COLUMN meeting_kind TEXT CHECK (meeting_kind IS NULL OR meeting_kind <> '');
+
+      CREATE TABLE gws_ea_meeting_holds (
+        meeting_id   TEXT NOT NULL REFERENCES gws_ea_meetings(id) ON DELETE CASCADE,
+        slot_id      TEXT NOT NULL CHECK (slot_id <> ''),
+        calendar_id  TEXT NOT NULL CHECK (calendar_id <> ''),
+        event_id     TEXT NOT NULL CHECK (event_id <> ''),
+        start_at     TEXT NOT NULL,
+        end_at       TEXT NOT NULL,
+        held_at      TEXT NOT NULL,
+        PRIMARY KEY (meeting_id, slot_id),
+        UNIQUE (calendar_id, event_id)
+      );
+    `);
+  },
+};

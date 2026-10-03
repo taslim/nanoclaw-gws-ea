@@ -4,9 +4,12 @@
  *
  * - `main` (capability `gws-ea-meetings`) hands a scheduling job over with
  *   `arrange`, `reschedule` or `ask_organizer`, and changes one with
- *   `amend` or `cancel`.
- * - `external-email` (capability `gws-ea-meetings-external`) reports how a
- *   meeting ended with `outcome`.
+ *   `amend` or `cancel`; `cancel` also calls off an event the principal
+ *   organizes with others.
+ * - `external-email` (capability `gws-ea-meetings-external`) offers the
+ *   principal's times with `free_time`, holds them with `hold`, frees them
+ *   with `release_holds`, books the one agreed with `book`, all by slot id
+ *   (KTD11), and reports how the meeting ended with `outcome`.
  *
  * Each tool writes one request and waits for the host's answer. The host
  * checks every request against the caller and the meeting, so these
@@ -35,7 +38,7 @@ function err(text: string): CallToolResult {
 }
 
 /** A field's shape, checked before anything is sent; the host checks its meaning. */
-type Field = 'string' | 'integer' | 'people';
+type Field = 'string' | 'integer' | 'people' | 'strings';
 
 function fieldProblem(name: string, value: unknown, field: Field): string | undefined {
   switch (field) {
@@ -55,6 +58,12 @@ function fieldProblem(name: string, value: unknown, field: Field): string | unde
         )
         ? undefined
         : `${name} must list people as { person_id, email? }`;
+    case 'strings':
+      return Array.isArray(value) &&
+        value.length > 0 &&
+        value.every((item) => typeof item === 'string' && item.trim() !== '')
+        ? undefined
+        : `${name} must list one or more ids`;
     default: {
       const unreachable: never = field;
       throw new Error(`Unknown field shape ${String(unreachable)}`);
@@ -138,6 +147,12 @@ const CONSTRAINTS = {
     'Anything external-email must respect, such as "mornings only" or "video call". Write only what the other side may read. Up to 500 characters.',
 } as const;
 
+const MEETING_KIND = {
+  type: 'string',
+  description:
+    "The kind of meeting, as the principal's preferences name kinds, such as one-on-one: its buffer and preferred times apply. Leave it out to use the default ones.",
+} as const;
+
 // ---------------------------------------------------------------------------
 // main's requests
 // ---------------------------------------------------------------------------
@@ -146,7 +161,7 @@ export const arrange: McpToolDefinition = {
   tool: {
     name: 'arrange',
     description:
-      "Hand a new meeting to external-email, which emails the other people, finds a time, and books it on the principal's calendar. Use it once you know who, how long, and roughly when. For a thread the principal copied you into, pass its thread_key instead of people. You get a note when the meeting is booked or ends.",
+      "Hand a new meeting to external-email, which emails the other people, finds a time, and books it on the principal's calendar. Use it once you know who, how long, and roughly when. For a thread the principal copied you into, pass its thread_key instead of people. You get a note when the meeting is booked or ends. When everyone is a colleague in the assistant's organization whose calendar Google shows, the host books the first time free for all at once and its answer is the booking: nobody is emailed.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -175,6 +190,7 @@ export const arrange: McpToolDefinition = {
         ...WINDOW_PROPERTIES,
         purpose: PURPOSE,
         constraints: CONSTRAINTS,
+        meeting_kind: MEETING_KIND,
       },
       required: ['calendar_id', 'length_minutes', 'window_start', 'window_end', 'purpose'],
     },
@@ -194,7 +210,7 @@ export const arrange: McpToolDefinition = {
           window_end: 'string',
           purpose: 'string',
         },
-        { people: 'people', thread_key: 'string', constraints: 'string' },
+        { people: 'people', thread_key: 'string', constraints: 'string', meeting_kind: 'string' },
       ),
       context?.signal,
     );
@@ -218,6 +234,7 @@ export const reschedule: McpToolDefinition = {
         ...WINDOW_PROPERTIES,
         purpose: PURPOSE,
         constraints: CONSTRAINTS,
+        meeting_kind: MEETING_KIND,
       },
       required: ['calendar_id', 'event_id', 'window_start', 'window_end', 'purpose'],
     },
@@ -228,7 +245,7 @@ export const reschedule: McpToolDefinition = {
       fieldsOf(
         args,
         { calendar_id: 'string', event_id: 'string', window_start: 'string', window_end: 'string', purpose: 'string' },
-        { length_minutes: 'integer', constraints: 'string' },
+        { length_minutes: 'integer', constraints: 'string', meeting_kind: 'string' },
       ),
       context?.signal,
     );
@@ -269,15 +286,27 @@ export const cancel: McpToolDefinition = {
   tool: {
     name: 'cancel',
     description:
-      'Call off a meeting you handed to external-email: its email thread is closed and the people it wrote to get one short line saying the meeting is off. It does not delete an event already booked; delete that on the calendar yourself if the principal wants it gone.',
+      'Call something off when the principal asks. Give meeting_id for a meeting you handed to external-email: its email thread is closed and the people it wrote to get one short line saying the meeting is off; an event it already booked stays until you cancel that too. Or give calendar_id and event_id for an event the principal organizes with others, on a calendar you can change: the host deletes it and Google sends its guests the cancellation. For an event someone else organizes, use ask_organizer or decline it instead.',
     inputSchema: {
       type: 'object' as const,
-      properties: { meeting_id: { type: 'string', description: 'The meeting’s id, such as mtg-….' } },
-      required: ['meeting_id'],
+      properties: {
+        meeting_id: { type: 'string', description: 'The meeting’s id, such as mtg-….' },
+        calendar_id: { type: 'string', description: 'The calendar the event is on, instead of meeting_id.' },
+        event_id: { type: 'string', description: 'The event’s id on that calendar, with calendar_id.' },
+      },
     },
   },
   async handler(args, context) {
-    return send('meeting_cancel', fieldsOf(args, { meeting_id: 'string' }), context?.signal);
+    if (args.meeting_id !== undefined) {
+      if (args.calendar_id !== undefined || args.event_id !== undefined) {
+        return err('Give either meeting_id, or calendar_id with event_id, not both.');
+      }
+      return send('meeting_cancel', fieldsOf(args, { meeting_id: 'string' }), context?.signal);
+    }
+    if (args.calendar_id === undefined && args.event_id === undefined) {
+      return err('Give the meeting_id of a meeting you handed over, or the calendar_id and event_id of an event.');
+    }
+    return send('meeting_cancel', fieldsOf(args, { calendar_id: 'string', event_id: 'string' }), context?.signal);
   },
 };
 
@@ -311,6 +340,109 @@ export const amend: McpToolDefinition = {
 };
 
 // ---------------------------------------------------------------------------
+// external-email's calendar tools
+// ---------------------------------------------------------------------------
+
+const MEETING_ID = { type: 'string', description: 'The meeting id from your brief.' } as const;
+
+export const freeTime: McpToolDefinition = {
+  tool: {
+    name: 'free_time',
+    description:
+      "Get open times for this conversation's meeting, best first, each with a slot id and its day and local time. The host works them out from the principal's calendar and preferences: you never see the calendar itself. With date (and time), it looks at that day only (and checks that exact start), in timezone when you give one. Calls are capped per meeting.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        meeting_id: MEETING_ID,
+        date: {
+          type: 'string',
+          description: 'Only this day, as YYYY-MM-DD, such as a day the other side asked about.',
+        },
+        time: {
+          type: 'string',
+          description: 'With date: check this exact start, as 24-hour HH:MM, such as a time the other side proposed.',
+        },
+        timezone: {
+          type: 'string',
+          description:
+            "The other side's timezone, such as America/New_York, when you know it: date and time are read in it, and each time is also shown in it.",
+        },
+      },
+      required: ['meeting_id'],
+    },
+  },
+  async handler(args, context) {
+    if (args.time !== undefined && args.date === undefined) return err('Give the date the time is on.');
+    return send(
+      'meeting_free_time',
+      fieldsOf(args, { meeting_id: 'string' }, { date: 'string', time: 'string', timezone: 'string' }),
+      context?.signal,
+    );
+  },
+};
+
+export const hold: McpToolDefinition = {
+  tool: {
+    name: 'hold',
+    description:
+      "Hold the times you offer on the principal's calendar, by their slot ids from free_time, so nothing else takes them while the other side chooses. At most three per meeting. A time that is no longer open is refused.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        meeting_id: MEETING_ID,
+        slot_ids: { type: 'array', items: { type: 'string' }, description: 'The slot ids of the times you offer.' },
+      },
+      required: ['meeting_id', 'slot_ids'],
+    },
+  },
+  async handler(args, context) {
+    return send('meeting_hold', fieldsOf(args, { meeting_id: 'string', slot_ids: 'strings' }), context?.signal);
+  },
+};
+
+export const releaseHolds: McpToolDefinition = {
+  tool: {
+    name: 'release_holds',
+    description:
+      'Release the times you held for this meeting when the other side turns them down: the slot ids given, or every hold when you give none. Booking releases the other holds by itself.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        meeting_id: MEETING_ID,
+        slot_ids: { type: 'array', items: { type: 'string' }, description: 'The held slot ids to release.' },
+      },
+      required: ['meeting_id'],
+    },
+  },
+  async handler(args, context) {
+    return send(
+      'meeting_release_holds',
+      fieldsOf(args, { meeting_id: 'string' }, { slot_ids: 'strings' }),
+      context?.signal,
+    );
+  },
+};
+
+export const book: McpToolDefinition = {
+  tool: {
+    name: 'book',
+    description:
+      "Book the time the other side picked, by its slot id. The host creates the meeting on the principal's calendar from your brief, invites the people in it, and releases the other holds; for a meeting being moved, it moves the existing event. Then report booked with outcome.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        meeting_id: MEETING_ID,
+        slot_id: { type: 'string', description: 'The slot id of the time they picked.' },
+      },
+      required: ['meeting_id', 'slot_id'],
+    },
+  },
+  async handler(args, context) {
+    return send('meeting_book', fieldsOf(args, { meeting_id: 'string', slot_id: 'string' }), context?.signal);
+  },
+};
+
+// ---------------------------------------------------------------------------
 // external-email's report
 // ---------------------------------------------------------------------------
 
@@ -337,4 +469,4 @@ export const outcome: McpToolDefinition = {
 };
 
 registerTools([arrange, reschedule, askOrganizer, cancel, amend], MAIN_CAPABILITY);
-registerTools([outcome], EXTERNAL_CAPABILITY);
+registerTools([freeTime, hold, releaseHolds, book, outcome], EXTERNAL_CAPABILITY);

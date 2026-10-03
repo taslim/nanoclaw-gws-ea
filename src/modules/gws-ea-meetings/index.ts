@@ -4,11 +4,14 @@
  *
  *   - `main` → host: `meeting_arrange`, `meeting_reschedule`,
  *     `meeting_ask_organizer`, `meeting_cancel`, `meeting_amend`.
- *   - `external-email` → host: `meeting_outcome`.
+ *   - `external-email` → host: `meeting_free_time`, `meeting_hold`,
+ *     `meeting_release_holds`, `meeting_book` (`calendar-actions.ts`), and
+ *     `meeting_outcome`.
  *
  * Each is a delivery action with a guard (`guard.ts`) that binds the caller
- * to the profile's agent pointers and an outcome to its meeting's session.
- * Each request gets one `action_response`, errors included (`handoff.ts`).
+ * to the profile's agent pointers, and external-email's to its meeting's
+ * session. Each request gets one `action_response`, errors included
+ * (`answering` in `handoff.ts`).
  * `main` holds its side through the `gws-ea-meetings` capability, on by
  * default; `external-email`'s side is `gws-ea-meetings-external`.
  *
@@ -26,11 +29,13 @@ import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { registerPersonForgetHook } from '../gws-ea-people/index.js';
 import { registerThreadStoppedHook } from '../gws-ea-privacy/index.js';
 import { createMeetingsCalendarApi, type MeetingsCalendarApi } from './calendar-api.js';
-import { meetingOutcomeAction, meetingRequestAction } from './guard.js';
-import { createMeetingHandoff, requestIdOf } from './handoff.js';
-import { gwsEaMeetingsMigration } from './migration.js';
+import { createCalendarActions, FREE_TIME_ACTION } from './calendar-actions.js';
+import { meetingCalendarAction, meetingOutcomeAction, meetingRequestAction } from './guard.js';
+import { answering, createMeetingHandoff, requestIdOf, type Handle } from './handoff.js';
+import { gwsEaMeetingsCalendarActionsMigration, gwsEaMeetingsMigration } from './migration.js';
 
 registerMigration(gwsEaMeetingsMigration);
+registerMigration(gwsEaMeetingsCalendarActionsMigration);
 
 /** main's side of the handoff: the five requests. */
 export const MEETINGS_CAPABILITY = 'gws-ea-meetings';
@@ -43,12 +48,15 @@ registerCapability(MEETINGS_CAPABILITY, {
 });
 
 let calendar: MeetingsCalendarApi | undefined;
+// Built on first use: only a GWS-EA host with the assistant's Google sign-in reads a calendar.
+const calendarApi = (): MeetingsCalendarApi =>
+  (calendar ??= createMeetingsCalendarApi({ token: () => hostGoogleAccessToken('calendar-host') }));
 
+const actions = createCalendarActions({ calendar: calendarApi });
 const handoff = createMeetingHandoff({
-  // Built on first use: only a GWS-EA host with the assistant's Google sign-in reads a calendar.
-  calendar: () => (calendar ??= createMeetingsCalendarApi({ token: () => hostGoogleAccessToken('calendar-host') })),
-  // The handoff creates no holds; the calendar actions that create them supply their release.
-  releaseHolds: async () => undefined,
+  calendar: calendarApi,
+  releaseHolds: actions.releaseHolds,
+  bookDirectly: actions.bookDirectly,
 });
 
 /** Every request is answered, a refusal included, so the calling tool never waits it out. */
@@ -88,8 +96,19 @@ const MAIN_REQUESTS: ReadonlyArray<readonly [string, GuardedDeliveryHandler]> = 
   ['meeting_amend', handoff.amend],
 ];
 
+/** external-email's calendar tools, each answered once like every request. */
+const CALENDAR_REQUESTS: ReadonlyArray<readonly [string, Handle]> = [
+  [FREE_TIME_ACTION, actions.freeTime],
+  ['meeting_hold', actions.hold],
+  ['meeting_release_holds', actions.releaseHoldsRequest],
+  ['meeting_book', actions.book],
+];
+
 for (const [action, handler] of MAIN_REQUESTS) registerDeliveryAction(action, handler, guardSpec(meetingRequestAction));
 registerDeliveryAction('meeting_outcome', handoff.outcome, guardSpec(meetingOutcomeAction));
+for (const [action, handle] of CALENDAR_REQUESTS) {
+  registerDeliveryAction(action, answering(action, handle), guardSpec(meetingCalendarAction));
+}
 
 registerPersonForgetHook('gws-ea-meetings:purge', (person) => handoff.forgetPerson(person));
 registerThreadStoppedHook('gws-ea-meetings:close', (thread) => handoff.threadStopped(thread));
