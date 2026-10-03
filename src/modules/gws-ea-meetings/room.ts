@@ -30,6 +30,7 @@ import {
   getBooking,
   getMeeting,
   getRoomMadeBy,
+  isScheduling,
   LEVEL_ORDER,
   listOpenBookings,
   recordOfferedSlots,
@@ -38,6 +39,7 @@ import {
   type Meeting,
   type MeetingLevel,
   type Room,
+  type SchedulingMeeting,
 } from './db.js';
 import {
   addressBook,
@@ -68,9 +70,9 @@ export interface RoomDeps {
   /** The host's own Calendar client. */
   readonly calendar: () => MeetingsCalendarApi;
   /** Open times for a meeting inside `range`, best first, as if the events in `ignore` were not there. */
-  readonly openTimes: (meeting: Meeting, range: Span, ignore: readonly EventRef[]) => Promise<Span[]>;
+  readonly openTimes: (meeting: SchedulingMeeting, range: Span, ignore: readonly EventRef[]) => Promise<Span[]>;
   /** Hold offered slots for a meeting, as its own `hold` does; refused when one is no longer open. */
-  readonly holdSlots: (meeting: Meeting, slotIds: readonly string[]) => Promise<unknown>;
+  readonly holdSlots: (meeting: SchedulingMeeting, slotIds: readonly string[]) => Promise<unknown>;
 }
 
 /** Whether `level` matters less to the principal than `than`. */
@@ -86,7 +88,7 @@ export function createRoom(deps: RoomDeps) {
    * the candidate it is, or why it may not move for it.
    */
   async function judge(
-    meeting: Meeting,
+    meeting: SchedulingMeeting,
     moved: Meeting,
     booking: Booking,
     book: AddressBook,
@@ -132,7 +134,7 @@ export function createRoom(deps: RoomDeps) {
   }
 
   /** The booked meetings that could move to make room for `meeting`, earliest first. */
-  async function candidates(meeting: Meeting): Promise<RoomCandidate[]> {
+  async function candidates(meeting: SchedulingMeeting): Promise<RoomCandidate[]> {
     const book = await addressBook();
     const timezone = await principalTimezone();
     const window = { start: Date.parse(meeting.window_start), end: Date.parse(meeting.window_end) };
@@ -151,7 +153,7 @@ export function createRoom(deps: RoomDeps) {
   }
 
   /** That event as a candidate for `meeting`; refused, saying why, when it may not move for it. */
-  async function candidate(meeting: Meeting, calendarId: string, eventId: string): Promise<RoomCandidate> {
+  async function candidate(meeting: SchedulingMeeting, calendarId: string, eventId: string): Promise<RoomCandidate> {
     const moved = await findBookedMeetingForEvent(calendarId, eventId);
     const booking = moved ? await getBooking(moved.id) : undefined;
     if (!moved || !booking) {
@@ -173,7 +175,13 @@ export function createRoom(deps: RoomDeps) {
     if (room.state !== 'reserved') return;
     const at = new Date().toISOString();
     const target = await getMeeting(room.for_meeting_id);
-    if (!target || target.state !== 'active' || target.ended_at !== null || target.session_id === null) {
+    if (
+      !target ||
+      !isScheduling(target) ||
+      target.state !== 'active' ||
+      target.ended_at !== null ||
+      target.session_id === null
+    ) {
       // main ended that meeting meanwhile: there is no one to give the time to.
       await settleRoom(room.by_meeting_id, 'lost', at);
       return;
@@ -206,7 +214,7 @@ export function createRoom(deps: RoomDeps) {
   }
 
   /** Hand over the room a just-booked move made, if it was making one. */
-  async function handOverFrom(moved: Meeting): Promise<void> {
+  async function handOverFrom(moved: SchedulingMeeting): Promise<void> {
     const room = await getRoomMadeBy(moved.id);
     if (room) await handOver(room);
   }

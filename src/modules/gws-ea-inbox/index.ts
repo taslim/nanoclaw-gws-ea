@@ -3,12 +3,13 @@
  * Google Calendar's notification emails as calendar news (KTD9).
  *
  * - Inbound mail is routed per message (routing.ts): `main` hears principal
- *   mail, copy-ins, calendar changes, and cold mail as typed notes;
- *   `external-email` hears only threads the principal or `main` authorized,
- *   one session per thread.
- * - Replies leave through ordinary delivery to the thread's allowed
- *   recipients, which the audience check resolves through the same list
- *   (outbound.ts, recipients.ts).
+ *   mail, calendar changes, and every other email as typed notes, and
+ *   triages each thread the host holds for it; `external-email` hears only
+ *   threads `main` handed over, one session per thread.
+ * - Replies leave through ordinary delivery to everyone on the thread, as
+ *   placed in To, Cc, and Bcc, which the audience check resolves through the
+ *   same people (outbound.ts, recipients.ts). The principal's own email is
+ *   answered to them alone (`sendPrincipalReply`).
  * - The operator pins the DKIM selectors the principal's mail must be signed
  *   with (`ncl dkim-selectors`); until one is pinned for a domain, no mail
  *   from it is the principal's.
@@ -39,7 +40,7 @@ import { registerRecipientResolver } from '../gws-ea-privacy/index.js';
 import { registerRoleGrantPolicy } from '../permissions/db/user-roles.js';
 import { createInbox, EMAIL_CHANNEL_DEFAULTS, type Inbox } from './adapter.js';
 import { createCalendarListApi } from './calendar-notifications.js';
-import { deleteSends, listPinnedSelectors, pinSelector, unpinSelector, type InboxThread } from './db.js';
+import { deleteSends, listPinnedSelectors, pinSelector, unpinSelector } from './db.js';
 import { createGmailApi } from './gmail-api.js';
 import { gwsEaInboxMigration } from './migration.js';
 import { contentHash, replyText, resolveRecipients } from './outbound.js';
@@ -107,7 +108,7 @@ registerDeliveryFailedHook(async (failed) => {
   }
 });
 
-// A forgotten person leaves no held mail, rate count, or thread address behind.
+// A forgotten person leaves no held mail, rate count, or place on a thread behind.
 registerPersonForgetHook('gws-ea-inbox:purge', async ({ handles }) => {
   const db = getDb();
   if (!(await db.hasTable('gws_ea_inbox_threads'))) return;
@@ -127,12 +128,12 @@ registerPersonForgetHook('gws-ea-inbox:purge', async ({ handles }) => {
     for (const row of await db.all<{ sender: string }>('SELECT DISTINCT sender FROM gws_ea_inbox_sender_counts')) {
       if (isForgotten(row.sender)) await db.run('DELETE FROM gws_ea_inbox_sender_counts WHERE sender = ?', row.sender);
     }
-    const columns = ['counterparts', 'participants', 'authenticated_senders'] as const;
+    const columns = ['people_to', 'people_cc', 'people_bcc'] as const;
     for (const row of await db.all<Record<(typeof columns)[number] | 'thread_key', string>>(
-      'SELECT thread_key, counterparts, participants, authenticated_senders FROM gws_ea_inbox_threads',
+      'SELECT thread_key, people_to, people_cc, people_bcc FROM gws_ea_inbox_threads',
     )) {
       for (const column of columns) {
-        const addresses = JSON.parse(row[column]) as InboxThread['participants'];
+        const addresses = JSON.parse(row[column]) as readonly string[];
         const kept = addresses.filter((address) => !isForgotten(address));
         if (kept.length !== addresses.length) {
           await db.run(
@@ -269,14 +270,20 @@ export {
   type GmailMessage,
   type GmailMessageRef,
 } from './gmail-api.js';
+export type { ThreadOrigin, ThreadPeople, ThreadState } from './db.js';
 export { getInboxHealth, type InboxHealth } from './health.js';
+export type { HeldMailFields, InboxNote } from './notes.js';
+export { sendPrincipalReply, type PrincipalReply } from './outbound.js';
+export type { Placement } from './recipients.js';
 export { registerThreadReplyHook, type ThreadReplyHook } from './routing.js';
 export { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from './runtime.js';
 export {
-  allowedRecipients,
+  addThreadPeople,
+  arrangeThreadPeople,
   authorizeThread,
   closeThread,
   getThreadParticipants,
+  handBackHeldThread,
   mintThreadKey,
   openThreadSession,
   releaseHeldMail,

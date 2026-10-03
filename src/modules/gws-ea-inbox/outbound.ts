@@ -1,7 +1,12 @@
 /**
  * Replies leave through ordinary delivery (KTD4). The channel adapter's
  * `deliver` sends one plain-text message in the thread's Gmail thread to the
- * thread's send list, the same list the audience check resolved (KTD7).
+ * thread's people, in To, Cc, and Bcc as placed: every one of them is an
+ * address the audience check resolved (KTD7, KTD16).
+ *
+ * The principal's own email is answered apart from any thread
+ * (`sendPrincipalReply`, R41): to the principal's verified address that
+ * wrote it, alone, in its Gmail thread.
  *
  * A send never happens twice. Before Gmail is called, the host stores a
  * pending send with a pre-allocated Message-ID. A retry of the same reply
@@ -22,11 +27,12 @@ import type { OutboundMessage } from '../../channels/adapter.js';
 import { OutboundRefusedError, type OutboundSend } from '../../delivery.js';
 import { log } from '../../log.js';
 import { audienceForAddresses, checkOutbound } from '../gws-ea-privacy/index.js';
-import { getGwsEaProfile } from '../gws-ea-profile/db.js';
+import { getGwsEaProfile, listPrincipalAddresses } from '../gws-ea-profile/db.js';
 import {
   addThreadMessageIds,
   findSend,
   findThreadByGmailId,
+  getPrincipalMessage,
   getThread,
   insertPendingSend,
   markSendSent,
@@ -36,9 +42,17 @@ import {
   type SendRecord,
 } from './db.js';
 import { GoogleApiError, RECONCILIATION_HEADERS, type GmailApi } from './gmail-api.js';
-import { buildOutboundMime, domainOf, encodeRaw, headerValues, messageIdsOf, newMessageId } from './mime.js';
-import { recipientsForThread, sendListOf } from './recipients.js';
-import { assistantAddresses, INBOX_PLATFORM_ID, type InboxRuntime } from './runtime.js';
+import {
+  buildOutboundMime,
+  domainOf,
+  encodeRaw,
+  headerValues,
+  messageIdsOf,
+  newMessageId,
+  type Mailbox,
+} from './mime.js';
+import { everyone, recipientsForThread, sendPeople } from './recipients.js';
+import { activeInbox, assistantAddresses, INBOX_PLATFORM_ID, type InboxRuntime } from './runtime.js';
 
 /** How long to wait before each retry of a Gmail send that failed on Gmail's side. */
 export const SEND_BACKOFF_MS: readonly number[] = [1_000, 3_000];
@@ -72,14 +86,15 @@ function listKey(threadKey: string, hash: string): string {
 }
 
 /**
- * The recipient resolver the audience check uses for every email send: the
- * exact addresses the send goes to. The list is kept for the send that
+ * The recipient resolver the audience check uses for every email send: every
+ * address the send reaches, Bcc included. The list is kept for the send that
  * follows, which refuses to go out if the thread's recipients changed in
  * between.
  */
 export async function resolveRecipients(send: OutboundSend): Promise<readonly string[]> {
   if (send.platformId !== INBOX_PLATFORM_ID || send.threadId === null) return [];
-  const list = await recipientsForThread(send.threadId, await assistantAddresses());
+  const people = await recipientsForThread(send.threadId, await assistantAddresses());
+  const list = people === undefined ? [] : everyone(people);
   let text: string;
   /* eslint-disable no-catch-all/no-catch-all -- content the send cannot carry still resolves; the send itself refuses it */
   try {
@@ -136,21 +151,20 @@ async function findSent(
 }
 
 async function sendWithBackoff(
-  gmail: GmailApi,
+  runtime: InboxRuntime,
   raw: string,
   record: SendRecord,
   gmailThreadId: string | null,
-  sleep: (ms: number) => Promise<void>,
 ): Promise<{ readonly id: string; readonly threadId: string }> {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      return await gmail.send({ raw, ...(gmailThreadId === null ? {} : { threadId: gmailThreadId }) });
+      return await runtime.gmail.send({ raw, ...(gmailThreadId === null ? {} : { threadId: gmailThreadId }) });
     } catch (error) {
       const delay = SEND_BACKOFF_MS[attempt];
       if (!(error instanceof GoogleApiError) || !error.retryable || delay === undefined) throw error;
       log.warn('Gmail did not take a reply; checking for it, then retrying', { status: error.status, attempt });
-      await sleep(delay);
-      const found = await findSent(gmail, record.rfcMessageId, gmailThreadId);
+      await runtime.sleep(delay);
+      const found = await findSent(runtime.gmail, record.rfcMessageId, gmailThreadId);
       if (found) return found;
     }
   }
@@ -162,7 +176,6 @@ async function completeSend(
   record: SendRecord,
   sent: { readonly id: string; readonly threadId: string },
   thread: InboxThread,
-  recipients: readonly string[],
   at: string,
 ): Promise<string> {
   await markSendSent(record.id, sent.id, at);
@@ -174,12 +187,9 @@ async function completeSend(
     headerValues(copy?.payload?.headers ?? [], name).flatMap((value) => messageIdsOf(value)),
   );
   await addThreadMessageIds(thread.threadKey, ids, at);
-  const claim = thread.gmailThreadId === null && (await findThreadByGmailId(sent.threadId)) === undefined;
-  await updateThread(
-    thread.threadKey,
-    { participants: recipients, ...(claim ? { gmailThreadId: sent.threadId } : {}) },
-    at,
-  );
+  if (thread.gmailThreadId === null && (await findThreadByGmailId(sent.threadId)) === undefined) {
+    await updateThread(thread.threadKey, { gmailThreadId: sent.threadId }, at);
+  }
   log.info('Reply sent from the inbox', { threadKey: thread.threadKey, gmailMessageId: sent.id });
   return sent.id;
 }
@@ -188,13 +198,21 @@ function replySubject(subject: string): string {
   return subject === '' || /^re:/iu.test(subject) ? subject : `Re: ${subject}`;
 }
 
+/** The assistant as every email it sends names it. */
+async function assistantMailbox(runtime: InboxRuntime): Promise<Mailbox> {
+  const profile = await getGwsEaProfile();
+  return {
+    address: await runtime.gmailAddress(),
+    ...(profile.assistant_display_name ? { displayName: profile.assistant_display_name } : {}),
+  };
+}
+
 /** The channel adapter's `deliver`: send one reply in its thread, exactly once. */
 export async function sendReply(
   runtime: InboxRuntime,
   platformId: string,
   threadKey: string | null,
   message: OutboundMessage,
-  sleep: (ms: number) => Promise<void>,
 ): Promise<string | undefined> {
   if (platformId !== INBOX_PLATFORM_ID || threadKey === null) {
     throw new Error('The email channel sends only within an inbox thread');
@@ -208,11 +226,12 @@ export async function sendReply(
   const hash = contentHash(threadKey, text);
   const checked = resolvedLists.get(listKey(threadKey, hash));
   resolvedLists.delete(listKey(threadKey, hash));
-  let record = await findSend(threadKey, hash);
+  let record = await findSend({ threadKey }, hash);
   // Gmail took this reply, but its delivery was never recorded: answer from the record.
   if (record?.state === 'sent') return record.gmailMessageId ?? undefined;
 
-  const recipients = sendListOf(thread, await assistantAddresses());
+  const people = sendPeople(thread.people, await assistantAddresses());
+  const recipients = everyone(people);
   if (checked !== undefined && !sameList(checked, recipients)) {
     throw new Error("The thread's recipients changed after the reply was checked; it is checked and sent again");
   }
@@ -223,14 +242,13 @@ export async function sendReply(
   const at = runtime.now().toISOString();
   if (record?.state === 'pending') {
     const found = await findSent(runtime.gmail, record.rfcMessageId, thread.gmailThreadId);
-    if (found) return completeSend(runtime.gmail, record, found, thread, recipients, at);
+    if (found) return completeSend(runtime.gmail, record, found, thread, at);
   } else {
-    const from = await runtime.gmailAddress();
     record = {
       id: randomUUID(),
-      threadKey,
+      scope: { threadKey },
       contentHash: hash,
-      rfcMessageId: newMessageId(domainOf(from)),
+      rfcMessageId: newMessageId(domainOf(await runtime.gmailAddress())),
       state: 'pending',
       gmailMessageId: null,
     };
@@ -238,14 +256,10 @@ export async function sendReply(
   }
 
   const prior = (await threadMessageIds(threadKey)).filter((id) => id !== record.rfcMessageId);
-  const profile = await getGwsEaProfile();
   const raw = encodeRaw(
     buildOutboundMime({
-      from: {
-        address: await runtime.gmailAddress(),
-        ...(profile.assistant_display_name ? { displayName: profile.assistant_display_name } : {}),
-      },
-      to: recipients,
+      from: await assistantMailbox(runtime),
+      ...people,
       subject: prior.length === 0 ? thread.subject : replySubject(thread.subject),
       messageId: record.rfcMessageId,
       ...(prior.length === 0 ? {} : { inReplyTo: prior[prior.length - 1] }),
@@ -254,6 +268,82 @@ export async function sendReply(
       date: runtime.now(),
     }),
   );
-  const sent = await sendWithBackoff(runtime.gmail, raw, record, thread.gmailThreadId, sleep);
-  return completeSend(runtime.gmail, record, sent, thread, recipients, at);
+  const sent = await sendWithBackoff(runtime, raw, record, thread.gmailThreadId);
+  return completeSend(runtime.gmail, record, sent, thread, at);
+}
+
+// ---------------------------------------------------------------------------
+// The principal's email, answered by email (R41)
+// ---------------------------------------------------------------------------
+
+export interface PrincipalReply {
+  /** The principal's message being answered, by its Gmail message id, as their note gave it. */
+  readonly gmailMessageId: string;
+  /** Plain text, sent as written. */
+  readonly text: string;
+  /** The request this answers: a replay of it sends nothing again. */
+  readonly requestId: string;
+}
+
+/**
+ * Answer one of the principal's messages by email: only to the principal's
+ * address that wrote it, as Gmail verified it, in its Gmail thread, from the
+ * assistant, in plain text. A replay of the same request returns the message
+ * Gmail already holds. Throws for a message the inbox did not record as the
+ * principal's, or whose address is no longer theirs. Returns Gmail's id for
+ * the reply.
+ */
+export async function sendPrincipalReply(input: PrincipalReply): Promise<string> {
+  const runtime = activeInbox();
+  if (!runtime) throw new Error('The inbox is not running, so no email can be sent');
+  const message = await getPrincipalMessage(input.gmailMessageId);
+  if (!message) throw new Error(`Gmail message ${input.gmailMessageId} is not an email from the principal`);
+  const principal = new Set((await listPrincipalAddresses()).map((address) => address.email));
+  if (!principal.has(message.address)) {
+    throw new Error(`${message.address} is no longer one of the principal's addresses`);
+  }
+  if (input.text.trim() === '') throw new Error('A reply needs text');
+
+  const scope = { principalMessageId: message.gmailMessageId };
+  const hash = createHash('sha256').update('principal-reply').update('\u0000').update(input.requestId).digest('hex');
+  let record = await findSend(scope, hash);
+  if (record?.state === 'sent' && record.gmailMessageId !== null) return record.gmailMessageId;
+  const at = runtime.now().toISOString();
+  if (record?.state === 'pending') {
+    const found = await findSent(runtime.gmail, record.rfcMessageId, message.gmailThreadId);
+    if (found) {
+      await markSendSent(record.id, found.id, at);
+      return found.id;
+    }
+  } else {
+    record = {
+      id: randomUUID(),
+      scope,
+      contentHash: hash,
+      rfcMessageId: newMessageId(domainOf(await runtime.gmailAddress())),
+      state: 'pending',
+      gmailMessageId: null,
+    };
+    await insertPendingSend(record, at);
+  }
+
+  const answered = message.rfcMessageId === null ? [] : [message.rfcMessageId];
+  const raw = encodeRaw(
+    buildOutboundMime({
+      from: await assistantMailbox(runtime),
+      to: [message.address],
+      cc: [],
+      bcc: [],
+      subject: replySubject(message.subject),
+      messageId: record.rfcMessageId,
+      ...(message.rfcMessageId === null ? {} : { inReplyTo: message.rfcMessageId }),
+      references: [...message.referenceIds, ...answered].slice(-MAX_REFERENCES),
+      text: input.text,
+      date: runtime.now(),
+    }),
+  );
+  const sent = await sendWithBackoff(runtime, raw, record, message.gmailThreadId);
+  await markSendSent(record.id, sent.id, at);
+  log.info("Replied to the principal's email", { gmailMessageId: message.gmailMessageId, replyId: sent.id });
+  return sent.id;
 }

@@ -3,10 +3,12 @@
  * against the profile's agent pointers, never against anything the agent
  * says about itself:
  *
- * - `main` alone hands meetings over and changes or cancels them;
- * - `external-email` alone reports an outcome or uses a meeting's calendar
- *   tools, and only for the meeting bound to the very session it calls
- *   from, so one thread can never act on another's meeting.
+ * - `main` alone hands meetings and replies over, changes or cancels them,
+ *   dismisses a thread waiting for it, and answers the principal by email;
+ * - `external-email` alone reports an outcome, uses a meeting's calendar
+ *   tools, or places the people its replies go to, and only for the meeting
+ *   bound to the very session it calls from, so one thread can never act on
+ *   another's meeting.
  *
  * No decision here ever holds for approval: these are structural checks.
  */
@@ -19,7 +21,9 @@ export const meetingRequestAction = defineGuardedAction({
   decide: async ({ actor }) => {
     const mainAgentGroupId = await getMainAgentGroupId();
     if (actor.kind !== 'agent' || mainAgentGroupId === null || actor.agentGroupId !== mainAgentGroupId) {
-      return DENY('Only main hands meetings to external-email, or changes or cancels them.');
+      return DENY(
+        'Only main hands work to external-email, changes or cancels it, dismisses a thread, or answers the principal by email.',
+      );
     }
     return ALLOW("main, by the profile's pointer");
   },
@@ -63,6 +67,19 @@ export const meetingCalendarAction = defineGuardedAction({
       actor,
       payload,
       "Only external-email offers, holds or books a meeting's times.",
+    );
+    return refusal === undefined ? ALLOW("external-email, from the meeting's own session") : DENY(refusal);
+  },
+});
+
+/** recipients: external-email places the people on its own meeting's thread, and no other. */
+export const meetingRecipientsAction = defineGuardedAction({
+  action: 'gws_ea_meetings.recipients',
+  decide: async ({ actor, payload }) => {
+    const refusal = await fromOwnMeetingSession(
+      actor,
+      payload,
+      'Only external-email places the people its replies go to, in its own thread.',
     );
     return refusal === undefined ? ALLOW("external-email, from the meeting's own session") : DENY(refusal);
   },

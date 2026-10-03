@@ -1,8 +1,8 @@
 /**
- * Typed notes for `main` (KTD4, KTD9). Mail meant for `main` never enters the
- * email channel: the host writes a note into `main`'s shared session, routed
- * to the principal's direct message, so `main`'s answer reaches the
- * principal. Each note carries its typed fields in `content.note` and one
+ * Typed notes for `main` (KTD4, KTD9, KTD16). Mail meant for `main` never
+ * enters the email channel: the host writes a note into `main`'s shared
+ * session, routed to the principal's direct message, so `main`'s answer
+ * reaches the principal. Each note carries its typed fields in `content.note` and one
  * plain explanation in `content.text`; anything another person wrote is
  * wrapped as untrusted.
  *
@@ -10,8 +10,25 @@
  * message again finds the note already written.
  */
 import { log } from '../../log.js';
+import type { PersonLevel } from '../gws-ea-people/db.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import type { CalendarChange } from './calendar-notifications.js';
+
+/** An email from anyone but the principal, as the host read it, in a thread held for `main`. */
+export interface HeldMailFields {
+  readonly thread_key: string;
+  readonly gmail_message_id: string;
+  /** The From address as written, or null when From is not one mailbox; it is proven only when `verified`. */
+  readonly sender: string | null;
+  /** Whether Gmail's authentication proved the sender. */
+  readonly verified: boolean;
+  /** The sender's level, present only when Gmail verified a sender who has a record (R21). */
+  readonly level?: PersonLevel;
+  /** As the sender wrote it, so untrusted. */
+  readonly subject: string;
+  /** Everyone on the message but the assistant. */
+  readonly people: readonly string[];
+}
 
 export type InboxNote =
   | {
@@ -29,8 +46,10 @@ export type InboxNote =
       /** The thread's other people: everyone on the principal's message but the principal and the assistant. */
       readonly participants: readonly string[];
     }
-  | { readonly type: 'gws-ea-inbox.cold-mail'; readonly gmail_message_id: string }
-  | { readonly type: 'gws-ea-inbox.closed-thread-mail'; readonly thread_key: string; readonly gmail_message_id: string }
+  /** A new thread held for `main` to triage: the email that started it. */
+  | ({ readonly type: 'gws-ea-inbox.inbound'; readonly gmail_thread_id: string } & HeldMailFields)
+  /** A later email in a thread still held for `main`. */
+  | ({ readonly type: 'gws-ea-inbox.held-mail' } & HeldMailFields)
   | {
       readonly type: 'gws-ea-inbox.calendar-changes';
       readonly changes: readonly {
@@ -45,7 +64,7 @@ export interface MainNote {
   readonly id: string;
   readonly text: string;
   readonly note: InboxNote;
-  /** Whether `main` should take a turn now; cold mail waits for its next one. */
+  /** Whether `main` should take a turn now; otherwise the note waits for its next one. */
   readonly wake: boolean;
 }
 

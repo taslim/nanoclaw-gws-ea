@@ -9,15 +9,20 @@ import type { ModuleMigration } from '../../db/migrations/index.js';
  *   it concerns (the event a reschedule moves, the invitation an
  *   ask_organizer is about); its length, window, purpose and constraints;
  *   its state; the thread and session it is bound to; its brief's version;
- *   and its follow-through deadlines. At most one live meeting holds a
- *   thread at a time.
+ *   and its follow-through deadlines. A `respond` job writes one reply in a
+ *   thread waiting for main: it has no length or window, and records when
+ *   its reply was delivered. At most one live meeting holds a thread at a
+ *   time.
  * - `gws_ea_meeting_counterparts`: who the meeting is with: each address the
- *   host took from a person's record, from Google, or from the principal's
- *   own message, with that person's name and level as the brief showed them.
+ *   host took from a person's record, from Google, from the mail of a thread
+ *   held for main, or from main, with that person's name and level as the
+ *   brief showed them.
  * - `gws_ea_meeting_requests`: each typed request's answer, keyed on the
  *   session and the outbound message that carried it, so a replay returns
  *   the first answer.
- * - `gws_ea_meeting_outcomes`: each outcome a meeting reported, once.
+ * - `gws_ea_meeting_outcomes`: each outcome a meeting reported, once. A
+ *   reply's `responded` is recorded when delivery records its email, and its
+ *   `gave-up` when delivery gives up on it.
  * - `gws_ea_meeting_slots`: the candidate times the host offered for a
  *   meeting, by slot id (written by the calendar actions).
  * - `gws_ea_meeting_bookings`: the event the host's own `book` created or
@@ -31,20 +36,20 @@ export const gwsEaMeetingsMigration: ModuleMigration = {
     await db.exec(`
       CREATE TABLE gws_ea_meetings (
         id                    TEXT PRIMARY KEY CHECK (id LIKE 'mtg-%'),
-        kind                  TEXT NOT NULL CHECK (kind IN ('arrange', 'reschedule', 'ask_organizer')),
+        kind                  TEXT NOT NULL CHECK (kind IN ('arrange', 'reschedule', 'ask_organizer', 'respond')),
         requested_by_session  TEXT NOT NULL,
         request_id            TEXT NOT NULL,
         state                 TEXT NOT NULL CHECK (state IN (
-                                'opening', 'active', 'booked', 'settled', 'not-scheduling', 'gave-up',
+                                'opening', 'active', 'booked', 'settled', 'not-scheduling', 'responded', 'gave-up',
                                 'cancelled', 'stopped', 'superseded', 'failed'
                               )),
         level                 TEXT NOT NULL CHECK (level IN ('inner-circle', 'close', 'active', 'known', 'unknown')),
         booking_calendar_id   TEXT CHECK (booking_calendar_id <> ''),
         event_calendar_id     TEXT CHECK (event_calendar_id <> ''),
         event_id              TEXT CHECK (event_id <> ''),
-        length_minutes        INTEGER NOT NULL CHECK (length_minutes BETWEEN 5 AND 480),
-        window_start          TEXT NOT NULL,
-        window_end            TEXT NOT NULL,
+        length_minutes        INTEGER CHECK (length_minutes BETWEEN 5 AND 480),
+        window_start          TEXT,
+        window_end            TEXT,
         purpose               TEXT NOT NULL CHECK (purpose <> ''),
         constraints           TEXT CHECK (constraints <> ''),
         thread_key            TEXT NOT NULL CHECK (thread_key LIKE 'mail-%'),
@@ -53,12 +58,16 @@ export const gwsEaMeetingsMigration: ModuleMigration = {
         replaces_meeting_id   TEXT,
         nudge_at              TEXT,
         give_up_at            TEXT,
+        replied_at            TEXT,
         created_at            TEXT NOT NULL,
         updated_at            TEXT NOT NULL,
         ended_at              TEXT,
         UNIQUE (requested_by_session, request_id),
-        CHECK (kind = 'ask_organizer' OR booking_calendar_id IS NOT NULL),
-        CHECK (kind = 'arrange' OR (event_calendar_id IS NOT NULL AND event_id IS NOT NULL))
+        CHECK (kind IN ('ask_organizer', 'respond') OR booking_calendar_id IS NOT NULL),
+        CHECK (kind IN ('arrange', 'respond') OR (event_calendar_id IS NOT NULL AND event_id IS NOT NULL)),
+        CHECK ((kind = 'respond') = (length_minutes IS NULL)),
+        CHECK ((length_minutes IS NULL) = (window_start IS NULL) AND (window_start IS NULL) = (window_end IS NULL)),
+        CHECK (kind = 'respond' OR replied_at IS NULL)
       );
       CREATE UNIQUE INDEX idx_gws_ea_meetings_live_thread
         ON gws_ea_meetings (thread_key) WHERE state IN ('opening', 'active', 'booked');
@@ -89,7 +98,9 @@ export const gwsEaMeetingsMigration: ModuleMigration = {
 
       CREATE TABLE gws_ea_meeting_outcomes (
         meeting_id   TEXT NOT NULL REFERENCES gws_ea_meetings(id) ON DELETE CASCADE,
-        outcome      TEXT NOT NULL CHECK (outcome IN ('booked', 'settled', 'needs-room', 'not-scheduling', 'gave-up')),
+        outcome      TEXT NOT NULL CHECK (outcome IN (
+                       'booked', 'settled', 'needs-room', 'not-scheduling', 'gave-up', 'responded'
+                     )),
         response     TEXT NOT NULL,
         recorded_at  TEXT NOT NULL,
         PRIMARY KEY (meeting_id, outcome)

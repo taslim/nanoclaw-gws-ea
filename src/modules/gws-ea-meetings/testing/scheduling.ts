@@ -44,6 +44,7 @@ import { addPerson, type Person } from '../../gws-ea-people/db.js';
 import '../../gws-ea-preferences/index.js';
 import '../../gws-ea-privacy/index.js';
 import '../../gws-ea-external-email/index.js';
+import '../../gws-ea-notices/index.js';
 import {
   createInbox,
   EMAIL_CHANNEL_DEFAULTS,
@@ -70,10 +71,19 @@ export const ADDRESSES = {
   jo: 'jo@family.example',
 } as const;
 
+/** One message the host sent in Google Chat, such as a notice in the principal's direct message. */
+export interface ChatSend {
+  readonly platformId: string;
+  readonly threadId: string | null;
+  readonly text: string | undefined;
+}
+
 export interface Scheduling {
   readonly gmail: FakeGmail;
   readonly calendar: FakeCalendar;
   readonly inbox: Inbox;
+  /** Everything the host sent in Google Chat. */
+  readonly chat: ChatSend[];
   readonly main: Session;
   /** Acme Sales and Pat Lee are known, Sam Kay active, Dana Fox and Lee Wu close, Jo Fox inner circle. */
   readonly people: Readonly<Record<keyof typeof ADDRESSES, Person>>;
@@ -102,7 +112,7 @@ const hostSetup: ChannelSetup = {
   onAction: () => undefined,
 };
 
-function chatAdapter(): ChannelAdapter {
+function chatAdapter(chat: ChatSend[]): ChannelAdapter {
   return {
     name: 'gchat',
     channelType: 'gchat',
@@ -110,7 +120,9 @@ function chatAdapter(): ChannelAdapter {
     async setup() {},
     async teardown() {},
     isConnected: () => true,
-    async deliver() {
+    async deliver(platformId, threadId, message) {
+      const content = message.content as { readonly text?: unknown } | null;
+      chat.push({ platformId, threadId, text: typeof content?.text === 'string' ? content.text : undefined });
       return 'chat-message';
     },
   };
@@ -185,17 +197,19 @@ export async function setUpScheduling(testDir: string, google: { calendar: unkno
   calendar.calendars.set(PRINCIPAL, { id: PRINCIPAL, accessRole: 'writer', primary: false });
 
   await ensureInbox('ag-external');
-  const inbox = await startInbox(gmail, calendar);
+  const chat: ChatSend[] = [];
+  const inbox = await startInbox(gmail, calendar, chat);
   const main = (await resolveSession('ag-main', 'mg-dm', null, 'agent-shared')).session;
   await inbox.tick();
-  return { gmail, calendar, inbox, main, people };
+  return { gmail, calendar, inbox, chat, main, people };
 }
 
 /**
  * Start the inbox on `gmail` and `calendar`, with the principal's chat, behind
- * the real channel registry and delivery adapter.
+ * the real channel registry and delivery adapter. `chat` collects what the
+ * host sends in Google Chat.
  */
-export async function startInbox(gmail: FakeGmail, calendar: FakeCalendar): Promise<Inbox> {
+export async function startInbox(gmail: FakeGmail, calendar: FakeCalendar, chat: ChatSend[] = []): Promise<Inbox> {
   await teardownChannelAdapters();
   const inbox = createInbox({
     gmail,
@@ -203,7 +217,7 @@ export async function startInbox(gmail: FakeGmail, calendar: FakeCalendar): Prom
     sleep: async () => undefined,
   });
   registerChannelAdapter('email', { factory: () => inbox.adapter, defaults: EMAIL_CHANNEL_DEFAULTS });
-  registerChannelAdapter('gchat', { factory: chatAdapter });
+  registerChannelAdapter('gchat', { factory: () => chatAdapter(chat) });
   await initChannelAdapters(() => hostSetup);
   setDeliveryAdapter(createChannelDeliveryAdapter());
   return inbox;

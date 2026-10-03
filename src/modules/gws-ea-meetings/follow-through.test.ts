@@ -449,7 +449,7 @@ async function booked(person: Person): Promise<Offered> {
 }
 
 describe('a booked meeting', () => {
-  it('closes its conversation once its event has passed, and later thread mail reaches main as a note', async () => {
+  it('closes its conversation once its event has passed, and later thread mail reaches main for triage', async () => {
     const { stored, session } = await booked(scheduling.people.acme);
     const booking = await getBooking(stored.id);
     if (!booking) throw new Error('no booking');
@@ -477,8 +477,9 @@ describe('a booked meeting', () => {
     const before = contents(session).length;
     await theyWrite(`Acme Sales <${ADDRESSES.acme}>`, 'Thanks for the meeting, great to meet you.');
     expect(contents(session)).toHaveLength(before);
-    const [late] = notes(scheduling.main, 'gws-ea-inbox.closed-thread-mail');
-    expect(late.note).toMatchObject({ thread_key: stored.thread_key });
+    const [late] = notes(scheduling.main, 'gws-ea-inbox.inbound');
+    expect(late.note).toMatchObject({ sender: ADDRESSES.acme, verified: true });
+    expect(late.note?.thread_key).not.toBe(stored.thread_key);
 
     // A finished meeting is not cancelled again.
     expect(refusal(await ask(scheduling.main, 'meeting_cancel', { meeting_id: stored.id }))).toMatch(/ended/);

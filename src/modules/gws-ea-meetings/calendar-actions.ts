@@ -69,7 +69,9 @@ import {
   updateBookingTime,
   type Booking,
   type Hold,
+  isScheduling,
   type Meeting,
+  type SchedulingMeeting,
   type OfferedSlot,
 } from './db.js';
 import { deadlinesFrom } from './follow-through.js';
@@ -133,7 +135,7 @@ export interface CalendarActionsDeps {
    * hands the time it freed to the meeting it was for. Its failure leaves
    * the booking standing, and follow-through finishes it.
    */
-  readonly afterBooking: (meeting: Meeting) => Promise<void>;
+  readonly afterBooking: (meeting: SchedulingMeeting) => Promise<void>;
 }
 
 /** An event to leave out of a meeting's busy time, by its id or its iCalendar id. */
@@ -167,12 +169,12 @@ function slotSpan(slot: { readonly start_at: string; readonly end_at: string }):
   return { start: Date.parse(slot.start_at), end: Date.parse(slot.end_at) };
 }
 
-function meetingWindow(meeting: Meeting): Span {
+function meetingWindow(meeting: SchedulingMeeting): Span {
   return { start: Date.parse(meeting.window_start), end: Date.parse(meeting.window_end) };
 }
 
 /** Whether a slot still has the meeting's length and lies inside its window. */
-function fitsMeeting(slot: OfferedSlot | Hold, meeting: Meeting): boolean {
+function fitsMeeting(slot: OfferedSlot | Hold, meeting: SchedulingMeeting): boolean {
   const span = slotSpan(slot);
   const window = meetingWindow(meeting);
   return (
@@ -252,7 +254,7 @@ interface View {
   readonly assistantName: string | null;
 }
 
-async function viewOf(meeting: Meeting): Promise<View> {
+async function viewOf(meeting: SchedulingMeeting): Promise<View> {
   const profile = await getGwsEaProfile();
   const assistantDomain = profile.assistant_workspace_email ? domainOf(profile.assistant_workspace_email) : undefined;
   return {
@@ -267,7 +269,7 @@ async function viewOf(meeting: Meeting): Promise<View> {
   };
 }
 
-function holdFields(meeting: Meeting, view: View): Pick<EventWrite, 'summary' | 'description'> {
+function holdFields(meeting: SchedulingMeeting, view: View): Pick<EventWrite, 'summary' | 'description'> {
   const holder = view.assistantName ?? 'The assistant';
   return {
     summary: `Hold: ${meeting.purpose}`,
@@ -275,7 +277,7 @@ function holdFields(meeting: Meeting, view: View): Pick<EventWrite, 'summary' | 
   };
 }
 
-function bookingFields(meeting: Meeting, view: View): Pick<EventWrite, 'summary' | 'description'> {
+function bookingFields(meeting: SchedulingMeeting, view: View): Pick<EventWrite, 'summary' | 'description'> {
   return {
     summary: meeting.purpose,
     description: view.assistantName
@@ -285,7 +287,12 @@ function bookingFields(meeting: Meeting, view: View): Pick<EventWrite, 'summary'
 }
 
 /** What a free_time answer opens with: what was found, and what to do when nothing was. */
-function freeTimeHeading(meeting: Meeting, proposedOpen: boolean | undefined, found: boolean, oneDay: boolean): string {
+function freeTimeHeading(
+  meeting: SchedulingMeeting,
+  proposedOpen: boolean | undefined,
+  found: boolean,
+  oneDay: boolean,
+): string {
   if (proposedOpen === true) return 'That time is open:';
   if (proposedOpen === false) {
     return found
@@ -307,7 +314,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
   // -------------------------------------------------------------------------
 
   /** The principal's calendars, and the meeting's own, each once. */
-  async function calendarsOf(meeting: Meeting): Promise<string[]> {
+  async function calendarsOf(meeting: SchedulingMeeting): Promise<string[]> {
     const ids = new Map<string, string>();
     for (const id of [...(await listPrincipalCalendars()), meeting.booking_calendar_id, meeting.event_calendar_id]) {
       if (id !== null && !ids.has(id.toLowerCase())) ids.set(id.toLowerCase(), id);
@@ -316,7 +323,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
   }
 
   /** The event a reschedule moves, or the invitation an organizer is asked to move: it never blocks itself. */
-  async function movingEventOf(meeting: Meeting): Promise<{ id: string; iCalUID?: string } | undefined> {
+  async function movingEventOf(meeting: SchedulingMeeting): Promise<{ id: string; iCalUID?: string } | undefined> {
     if (meeting.event_calendar_id === null || meeting.event_id === null) return undefined;
     const event = await calendar().getEvent(meeting.event_calendar_id, meeting.event_id);
     return { id: meeting.event_id, ...(event?.iCalUID === undefined ? {} : { iCalUID: event.iCalUID }) };
@@ -334,7 +341,12 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
    * in `ignore`; every visible colleague's busy time; and, for a reschedule
    * making room, the time it frees for the meeting it is making room for.
    */
-  async function busyIn(meeting: Meeting, view: View, span: Span, ignore: readonly EventRef[] = []): Promise<Busy> {
+  async function busyIn(
+    meeting: SchedulingMeeting,
+    view: View,
+    span: Span,
+    ignore: readonly EventRef[] = [],
+  ): Promise<Busy> {
     const margin = view.rules.bufferMinutes * MINUTE + READ_MARGIN_MS;
     const from = iso(span.start - margin);
     const to = iso(span.end + margin);
@@ -374,7 +386,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     return { busy, hidden };
   }
 
-  function queryFor(meeting: Meeting, view: View, busy: readonly Span[], earliest: number): SlotQuery {
+  function queryFor(meeting: SchedulingMeeting, view: View, busy: readonly Span[], earliest: number): SlotQuery {
     return {
       timezone: view.timezone,
       level: meeting.level,
@@ -481,13 +493,15 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     }
   }
 
+  /** Release a meeting's holds: every one, or only those that no longer fit it. A reply never holds any. */
   async function releaseHolds(meeting: Meeting, which: 'all' | 'stale' = 'all'): Promise<void> {
     const holds = await listHolds(meeting.id);
-    await removeHolds(meeting.id, which === 'all' ? holds : holds.filter((hold) => !fitsMeeting(hold, meeting)));
+    const stale = (hold: Hold) => !isScheduling(meeting) || !fitsMeeting(hold, meeting);
+    await removeHolds(meeting.id, which === 'all' ? holds : holds.filter(stale));
   }
 
   /** Create the meeting's event, or move the event a reschedule is about; returns the booking to record. */
-  async function placeBooking(meeting: Meeting, view: View, slot: OfferedSlot): Promise<Booking> {
+  async function placeBooking(meeting: SchedulingMeeting, view: View, slot: OfferedSlot): Promise<Booking> {
     const bookedAt = new Date().toISOString();
     if (meeting.kind === 'reschedule') {
       if (meeting.event_calendar_id === null || meeting.event_id === null) {
@@ -533,7 +547,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
   }
 
   /** The booking's text may reach its attendees, so nothing private passes (R24). A move writes no text. */
-  async function assertBookable(meeting: Meeting, view: View): Promise<void> {
+  async function assertBookable(meeting: SchedulingMeeting, view: View): Promise<void> {
     if (meeting.kind === 'reschedule') return;
     const fields = bookingFields(meeting, view);
     const check = await checkOutbound(
@@ -553,7 +567,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
   // -------------------------------------------------------------------------
 
   /** The meeting this conversation runs, still live: a booked one only until its event has passed. */
-  async function ownLiveMeeting(content: Record<string, unknown>, session: Session): Promise<Meeting> {
+  async function ownLiveMeeting(content: Record<string, unknown>, session: Session): Promise<SchedulingMeeting> {
     const meeting = await ownMeeting(content, session);
     if (!LIVE_STATES.some((state) => state === meeting.state) || meeting.ended_at !== null) {
       throw refused(`Meeting ${meeting.id} has ended (${meeting.state}): send nothing more in this conversation.`);
@@ -561,14 +575,17 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     return meeting;
   }
 
-  async function ownMeeting(content: Record<string, unknown>, session: Session): Promise<Meeting> {
+  async function ownMeeting(content: Record<string, unknown>, session: Session): Promise<SchedulingMeeting> {
     const meeting = await getMeeting(meetingIdOf(content));
     if (!meeting || meeting.session_id !== session.id) throw refused("That meeting is not this conversation's");
+    if (!isScheduling(meeting)) {
+      throw refused('This conversation writes one reply: it has no times to offer, hold, or book.');
+    }
     return meeting;
   }
 
   /** Only a meeting the assistant books has holds and a booking. */
-  function assertBooks(meeting: Meeting): void {
+  function assertBooks(meeting: SchedulingMeeting): void {
     if (meeting.kind === 'ask_organizer') {
       throw refused(
         'This meeting asks the organizer of an invitation to move it: offer times from free_time, hold and book nothing, and report settled once they have moved it.',
@@ -577,7 +594,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
   }
 
   /** The offered slots named, each still the meeting's length and inside its window. */
-  async function offeredSlots(meeting: Meeting, slotIds: readonly string[]): Promise<OfferedSlot[]> {
+  async function offeredSlots(meeting: SchedulingMeeting, slotIds: readonly string[]): Promise<OfferedSlot[]> {
     const slots: OfferedSlot[] = [];
     for (const slotId of slotIds) {
       const slot = await getOfferedSlot(meeting.id, slotId);
@@ -593,7 +610,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
   }
 
   /** Whether every slot is open now, by the same rules that offered it. */
-  async function closedSlots(meeting: Meeting, view: View, slots: readonly OfferedSlot[]): Promise<string[]> {
+  async function closedSlots(meeting: SchedulingMeeting, view: View, slots: readonly OfferedSlot[]): Promise<string[]> {
     const spans = slots.map(slotSpan);
     const covering = {
       start: Math.min(...spans.map((span) => span.start)),
@@ -690,7 +707,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
    * held already changes nothing. The meeting's own `hold`, and the host
    * when it hands a freed time to the meeting that needed room.
    */
-  async function holdSlots(meeting: Meeting, slotIds: readonly string[]): Promise<OfferedSlot[]> {
+  async function holdSlots(meeting: SchedulingMeeting, slotIds: readonly string[]): Promise<OfferedSlot[]> {
     assertBooks(meeting);
     if (meeting.state === 'booked' || (await getBooking(meeting.id)) !== undefined) {
       throw refused(`Meeting ${meeting.id} is booked: there is nothing more to hold.`);
@@ -801,7 +818,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
    * any failure finishes the move and tells main once.
    */
   async function moveBooking(
-    meeting: Meeting,
+    meeting: SchedulingMeeting,
     existing: Booking,
     slot: OfferedSlot,
     view: View,
@@ -938,7 +955,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
    * Google's invitation and no email. Undefined when the meeting is not
    * such a meeting, or nothing in its window is free.
    */
-  async function bookDirectly(meeting: Meeting): Promise<Booking | undefined> {
+  async function bookDirectly(meeting: SchedulingMeeting): Promise<Booking | undefined> {
     if (meeting.kind !== 'arrange' || meeting.booking_calendar_id === null) return undefined;
     const view = await viewOf(meeting);
     if (view.colleagues.length === 0 || view.colleagues.length !== meeting.counterparts.length) return undefined;
@@ -980,7 +997,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
    * Open times for a meeting inside `range`, best first, as if the events in
    * `ignore` were not on the calendar: what moving them would free (R14).
    */
-  async function openTimes(meeting: Meeting, range: Span, ignore: readonly EventRef[]): Promise<Span[]> {
+  async function openTimes(meeting: SchedulingMeeting, range: Span, ignore: readonly EventRef[]): Promise<Span[]> {
     const view = await viewOf(meeting);
     const now = Date.now();
     const earliest = now + MIN_NOTICE_MINUTES * MINUTE;

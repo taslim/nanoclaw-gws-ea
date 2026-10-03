@@ -332,7 +332,7 @@ describe('arrange', () => {
     expect(vi.mocked(requestWake)).toHaveBeenCalledWith(expect.objectContaining({ id: session.id }), 'inbound-message');
 
     const thread = await getThreadParticipants(stored.thread_key);
-    expect(thread).toMatchObject({ origin: 'arrange', state: 'open', counterparts: [SAM] });
+    expect(thread).toMatchObject({ origin: 'arrange', state: 'open', people: { to: [SAM], cc: [], bcc: [] } });
   });
 
   it('takes the lowest level among several counterparts', async () => {
@@ -387,13 +387,6 @@ describe('arrange', () => {
       body: 'Let us do two hours sometime next month instead.',
     });
     await inbox.tick();
-
-    refusal(
-      await ask(main, 'meeting_arrange', {
-        ...arrangeWith(sam),
-        thread_key: threadKey,
-      }),
-    );
 
     const fields = {
       thread_key: threadKey,
@@ -674,7 +667,7 @@ describe('outcome', () => {
     expect((await meeting(close.meeting_id)).state).toBe('active');
   });
 
-  it('closes a copied-in thread that is not about scheduling, and lets main tell the principal in one line (R19)', async () => {
+  it('hands a copied-in thread that is not about scheduling back to main to triage (R19)', async () => {
     const threadKey = await copyRobinIn();
     const answer = data(
       await ask(main, 'meeting_arrange', {
@@ -689,11 +682,13 @@ describe('outcome', () => {
     data(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'not-scheduling' }));
 
     const [note] = meetingNotes('not-scheduling');
-    expect(note.text).toMatch(/can't take it on yet/);
-    expect(note.text).toContain('one line');
+    expect(note.note).toMatchObject({ thread_key: threadKey });
+    expect(note.text).toContain(`thread_key ${threadKey}`);
+    expect(note.text).not.toMatch(/can't take it on/);
     expect((await meeting(answer.meeting_id)).state).toBe('not-scheduling');
     expect((await getSession(session.id))?.status).toBe('closed');
-    expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'closed' });
+    expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'awaiting-arrange' });
+    expect(gmail.sent).toHaveLength(0);
   });
 
   it('refuses not-scheduling for a thread main opened for scheduling', async () => {
@@ -774,13 +769,13 @@ describe('ask_organizer', () => {
     expect(stored.counterparts).toEqual([{ address: OLU, person_id: olu.id, name: 'Olu Ade', level: 'known' }]);
     expect(await getThreadParticipants(stored.thread_key)).toMatchObject({
       origin: 'ask_organizer',
-      counterparts: [OLU],
+      people: { to: [OLU], cc: [], bcc: [] },
     });
   });
 
-  it('is refused for an organizer without a record (R16)', async () => {
+  it('writes to an organizer without a record, who is judged like anyone else (R16)', async () => {
     calendar.put(invitation('evt-stranger', LEE));
-    const message = refusal(
+    const answer = data(
       await ask(main, 'meeting_ask_organizer', {
         calendar_id: PRINCIPAL,
         event_id: 'evt-stranger',
@@ -788,9 +783,13 @@ describe('ask_organizer', () => {
         purpose: 'Your invitation',
       }),
     );
-    expect(message).toMatch(/record/);
-    expect(await count('gws_ea_meetings')).toBe(0);
-    expect(await count('gws_ea_inbox_threads')).toBe(0);
+    const stored = await meeting(answer.meeting_id);
+    expect(stored).toMatchObject({ kind: 'ask_organizer', level: 'unknown' });
+    expect(stored.counterparts).toEqual([{ address: LEE, person_id: null, name: null, level: 'unknown' }]);
+    expect(await getThreadParticipants(stored.thread_key)).toMatchObject({
+      origin: 'ask_organizer',
+      people: { to: [LEE], cc: [], bcc: [] },
+    });
   });
 
   it('accepts settled only once the invitation moved to an offered slot or its conflict cleared', async () => {

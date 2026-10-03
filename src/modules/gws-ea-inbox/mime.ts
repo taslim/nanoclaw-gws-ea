@@ -4,8 +4,13 @@
  *
  * Inbound, only headers and readable text are taken; attachments are counted,
  * never fetched. Outbound, a reply is one `text/plain` part with no quote and
- * no signature, addressed with To only: there is never a Cc or a Bcc, and no
+ * no signature, addressed to exactly the To, Cc, and Bcc it is given, and no
  * value can add a header, because every header value is reduced to one line.
+ *
+ * Bcc goes in a header because that is the only way `users.messages.send`
+ * takes recipients: Gmail sends to the To, Cc, and Bcc headers of the raw
+ * message, and removes Bcc from the copies it delivers. Gmail reads those
+ * headers only above the MIME headers, so they come first.
  */
 import { randomUUID } from 'node:crypto';
 
@@ -323,8 +328,11 @@ export function splitQuoted(text: string): { readonly own: string; readonly quot
 
 export interface OutboundMime {
   readonly from: Mailbox;
-  /** The send list, exactly; it is also what the audience check saw. */
+  /** The recipients, exactly as placed; together they are what the audience check saw. */
   readonly to: readonly string[];
+  readonly cc: readonly string[];
+  /** Delivered to, never shown to anyone else. */
+  readonly bcc: readonly string[];
   readonly subject: string;
   readonly messageId: string;
   readonly inReplyTo?: string;
@@ -399,18 +407,27 @@ function foldIds(ids: readonly string[]): string {
   return lines.join('\r\n ');
 }
 
-/** A plain-text message, as the RFC 822 text `users.messages.send` takes (before base64url). */
-export function buildOutboundMime(input: OutboundMime): string {
-  if (input.to.length === 0) throw new Error('A message needs at least one recipient');
-  const to = input.to.map((address) => {
+function addressLine(name: 'To' | 'Cc' | 'Bcc', addresses: readonly string[]): string[] {
+  if (addresses.length === 0) return [];
+  const checked = addresses.map((address) => {
     const normalized = normalizeAddress(address);
     if (normalized === undefined) throw new Error(`Not an email address: ${JSON.stringify(address)}`);
     return normalized;
   });
+  return [`${name}: ${checked.join(', ')}`];
+}
+
+/** A plain-text message, as the RFC 822 text `users.messages.send` takes (before base64url). */
+export function buildOutboundMime(input: OutboundMime): string {
+  if (input.to.length + input.cc.length + input.bcc.length === 0) {
+    throw new Error('A message needs at least one recipient');
+  }
   const references = input.references.map(messageIdToken);
   const headers = [
     `From: ${mailboxText(input.from)}`,
-    `To: ${to.join(', ')}`,
+    ...addressLine('To', input.to),
+    ...addressLine('Cc', input.cc),
+    ...addressLine('Bcc', input.bcc),
     `Subject: ${headerText(input.subject)}`,
     `Date: ${mailDate(input.date)}`,
     `Message-ID: ${messageIdToken(input.messageId)}`,

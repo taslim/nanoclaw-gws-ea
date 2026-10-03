@@ -6,8 +6,15 @@ import { getDb } from '../../db/connection.js';
 import { identityMatchKey } from '../../gws-ea/validation.js';
 import { PERSON_LEVELS, type PersonLevel } from '../gws-ea-people/db.js';
 
-export const MEETING_KINDS = ['arrange', 'reschedule', 'ask_organizer'] as const;
+/**
+ * What `main` handed over: a meeting to arrange, move, or ask an organizer
+ * to move, or one reply to write in a thread waiting for it (`respond`),
+ * which has no length or window.
+ */
+export const MEETING_KINDS = ['arrange', 'reschedule', 'ask_organizer', 'respond'] as const;
 export type MeetingKind = (typeof MEETING_KINDS)[number];
+/** The kinds that find a time. */
+export type SchedulingKind = Exclude<MeetingKind, 'respond'>;
 
 /** A live meeting holds its thread; every other state has ended it. */
 export const LIVE_STATES = ['opening', 'active', 'booked'] as const;
@@ -15,6 +22,7 @@ export type MeetingState =
   | (typeof LIVE_STATES)[number]
   | 'settled'
   | 'not-scheduling'
+  | 'responded'
   | 'gave-up'
   | 'cancelled'
   | 'stopped'
@@ -34,11 +42,11 @@ export function lowestLevel(levels: readonly MeetingLevel[]): MeetingLevel {
   );
 }
 
-export const OUTCOMES = ['booked', 'settled', 'needs-room', 'not-scheduling', 'gave-up'] as const;
+export const OUTCOMES = ['booked', 'settled', 'needs-room', 'not-scheduling', 'gave-up', 'responded'] as const;
 export type Outcome = (typeof OUTCOMES)[number];
 
 export interface MeetingCounterpart {
-  /** The address the host took from a record, from Google, or from the principal's own message. */
+  /** The address the host took from a record, from Google, from mail, or from `main`. */
   readonly address: string;
   readonly person_id: string | null;
   /** The record's name when the brief was written; null for someone without a record. */
@@ -46,21 +54,17 @@ export interface MeetingCounterpart {
   readonly level: MeetingLevel;
 }
 
-interface MeetingRow {
+interface MeetingFields {
   readonly id: string;
-  readonly kind: MeetingKind;
   readonly requested_by_session: string;
   readonly request_id: string;
   readonly state: MeetingState;
   readonly level: MeetingLevel;
-  /** Where `book` creates or moves the event; null for an ask_organizer meeting. */
+  /** Where `book` creates or moves the event; null for an ask_organizer meeting or a reply. */
   readonly booking_calendar_id: string | null;
   /** The event a reschedule moves, or the invitation an ask_organizer is about. */
   readonly event_calendar_id: string | null;
   readonly event_id: string | null;
-  readonly length_minutes: number;
-  readonly window_start: string;
-  readonly window_end: string;
   readonly purpose: string;
   readonly constraints: string | null;
   /** The kind of meeting whose buffer and preferred times apply; null for the principal's defaults. */
@@ -73,35 +77,67 @@ interface MeetingRow {
   /** Follow-through deadlines (KTD12): the nudge, then the release and gave-up. */
   readonly nudge_at: string | null;
   readonly give_up_at: string | null;
+  /** When a reply's email was delivered in its thread; null until then, and for every other kind. */
+  readonly replied_at: string | null;
   readonly created_at: string;
   readonly updated_at: string;
   readonly ended_at: string | null;
 }
 
-export interface Meeting extends MeetingRow {
-  readonly counterparts: readonly MeetingCounterpart[];
+/** A meeting's terms: a length and a window to find a time in, or none for a reply. */
+export type MeetingTerms =
+  | {
+      readonly kind: SchedulingKind;
+      readonly length_minutes: number;
+      readonly window_start: string;
+      readonly window_end: string;
+    }
+  | {
+      readonly kind: 'respond';
+      readonly length_minutes: null;
+      readonly window_start: null;
+      readonly window_end: null;
+    };
+
+type MeetingRow = MeetingFields & MeetingTerms;
+
+export type Meeting = MeetingRow & { readonly counterparts: readonly MeetingCounterpart[] };
+/** A meeting that finds a time: every kind but `respond`. */
+export type SchedulingMeeting = Extract<Meeting, { readonly kind: SchedulingKind }>;
+
+export function isScheduling(meeting: Meeting): meeting is SchedulingMeeting {
+  return meeting.kind !== 'respond';
 }
 
-export type NewMeeting = Omit<
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+
+export type NewMeeting = DistributiveOmit<
   MeetingRow,
-  'state' | 'session_id' | 'brief_version' | 'nudge_at' | 'give_up_at' | 'created_at' | 'updated_at' | 'ended_at'
+  | 'state'
+  | 'session_id'
+  | 'brief_version'
+  | 'nudge_at'
+  | 'give_up_at'
+  | 'replied_at'
+  | 'created_at'
+  | 'updated_at'
+  | 'ended_at'
 >;
 
-export type MeetingPatch = Partial<
-  Pick<
-    MeetingRow,
-    | 'state'
-    | 'session_id'
-    | 'length_minutes'
-    | 'window_start'
-    | 'window_end'
-    | 'constraints'
-    | 'brief_version'
-    | 'nudge_at'
-    | 'give_up_at'
-    | 'ended_at'
-  >
->;
+export interface MeetingPatch {
+  readonly state?: MeetingState;
+  readonly session_id?: string;
+  /** A scheduling meeting's terms, as `amend` changes them. */
+  readonly length_minutes?: number;
+  readonly window_start?: string;
+  readonly window_end?: string;
+  readonly constraints?: string;
+  readonly brief_version?: number;
+  readonly nudge_at?: string | null;
+  readonly give_up_at?: string | null;
+  readonly replied_at?: string;
+  readonly ended_at?: string;
+}
 
 const PATCHABLE: readonly (keyof MeetingPatch)[] = [
   'state',
@@ -113,6 +149,7 @@ const PATCHABLE: readonly (keyof MeetingPatch)[] = [
   'brief_version',
   'nudge_at',
   'give_up_at',
+  'replied_at',
   'ended_at',
 ];
 
@@ -239,6 +276,61 @@ export async function updateMeeting(id: string, patch: MeetingPatch, at: string)
     at,
     id,
   );
+}
+
+/**
+ * Add counterparts `main` named to a meeting, after those it has, and lower
+ * its level to the lowest among them all. Someone already in it stays as
+ * they are, so adding the same people again changes nothing.
+ */
+export async function addCounterparts(
+  meetingId: string,
+  counterparts: readonly MeetingCounterpart[],
+  at: string,
+): Promise<void> {
+  const db = getDb();
+  await db.transaction(async () => {
+    const row = await db.get<{ readonly next: number }>(
+      'SELECT COALESCE(MAX(position) + 1, 0) AS next FROM gws_ea_meeting_counterparts WHERE meeting_id = ?',
+      meetingId,
+    );
+    let position = row?.next ?? 0;
+    for (const counterpart of counterparts) {
+      const added = await db.run(
+        `INSERT INTO gws_ea_meeting_counterparts (meeting_id, position, address, person_id, name, level)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (meeting_id, address) DO NOTHING`,
+        meetingId,
+        position,
+        counterpart.address,
+        counterpart.person_id,
+        counterpart.name,
+        counterpart.level,
+      );
+      if (added.changes > 0) position += 1;
+    }
+    const levels = await db.all<{ readonly level: MeetingLevel }>(
+      'SELECT level FROM gws_ea_meeting_counterparts WHERE meeting_id = ?',
+      meetingId,
+    );
+    await db.run(
+      'UPDATE gws_ea_meetings SET level = ?, updated_at = ? WHERE id = ?',
+      lowestLevel(levels.map((counterpart) => counterpart.level)),
+      at,
+      meetingId,
+    );
+  });
+}
+
+/** Whether another meeting on the thread got past opening: an earlier conversation had the thread and its mail. */
+export async function hadEarlierMeetingOnThread(threadKey: string, meetingId: string): Promise<boolean> {
+  const row = await getDb().get<{ readonly found: number }>(
+    `SELECT 1 AS found FROM gws_ea_meetings
+      WHERE thread_key = ? AND id <> ? AND state NOT IN ('opening', 'failed') LIMIT 1`,
+    threadKey,
+    meetingId,
+  );
+  return row !== undefined;
 }
 
 /** Clear a meeting's deadlines: no nudge and no give-up follows. */

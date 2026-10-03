@@ -1,7 +1,8 @@
 /**
  * What the meetings module teaches: main's side of the handoff to every
  * default group, external-email's side only to a group that holds it, and
- * each side only its own tools.
+ * each side only its own tools. Each side's capability names every tool it
+ * grants, so an operator choosing capabilities sees them all.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -14,6 +15,19 @@ vi.mock('../../config.js', async (importOriginal) => ({
   GROUPS_DIR: '/tmp/nanoclaw-gws-ea-meetings-index-test/groups',
   DATA_DIR: '/tmp/nanoclaw-gws-ea-meetings-index-test/data',
 }));
+
+/** Every capability as its module registered it, by key. */
+const registered = vi.hoisted(() => new Map<string, { readonly description: string }>());
+vi.mock('../../capabilities.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../capabilities.js')>();
+  return {
+    ...actual,
+    registerCapability: (key: string, def: Parameters<typeof actual.registerCapability>[1]) => {
+      registered.set(key, def);
+      actual.registerCapability(key, def);
+    },
+  };
+});
 
 import { ensureContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
@@ -61,5 +75,25 @@ describe('the meetings module', () => {
     expect(external).toContain(moduleDoc(EXTERNAL_EMAIL_MEETINGS_CAPABILITY));
     expect(external).not.toContain('# NanoClaw Module: gws-ea-meetings\n');
     expect(external).not.toContain('ask_organizer');
+  });
+
+  it("names every tool each side's capability grants", () => {
+    const tools: Readonly<Record<string, readonly string[]>> = {
+      'gws-ea-meetings': [
+        'arrange',
+        'reschedule',
+        'ask_organizer',
+        'cancel',
+        'amend',
+        'respond',
+        'dismiss',
+        'reply_to_principal',
+      ],
+      [EXTERNAL_EMAIL_MEETINGS_CAPABILITY]: ['free_time', 'hold', 'release_holds', 'book', 'recipients', 'outcome'],
+    };
+    for (const [key, names] of Object.entries(tools)) {
+      const description = registered.get(key)?.description ?? '';
+      for (const name of names) expect(description, `${key} names ${name}`).toContain(name);
+    }
   });
 });

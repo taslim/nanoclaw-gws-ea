@@ -3,8 +3,9 @@
  *
  * - To `main`: in its shared session, routed to the principal's direct
  *   message, so main's one line reaches the principal (R26). How a meeting
- *   ended, a booked meeting the counterpart moved, and a room that could not
- *   be held.
+ *   ended or a reply went out, an email in a meeting's thread that could not
+ *   be sent, a step in its conversation that failed, a booked meeting the
+ *   counterpart moved, and a room that could not be held.
  * - To a meeting's own `external-email` session: host-only messages from
  *   sender `system`, which no email can be, in the meeting's thread. The
  *   nudge for a quiet thread, and the time room was made for (KTD12).
@@ -26,6 +27,10 @@ export const OUTCOME_NOTE_TYPE = 'gws-ea-meetings.outcome';
 export const MOVED_NOTE_TYPE = 'gws-ea-meetings.moved';
 /** The time freed to make room was taken before it could be held. */
 export const ROOM_LOST_NOTE_TYPE = 'gws-ea-meetings.room-lost';
+/** To main: an email in a meeting's thread that delivery gave up on, while the meeting goes on. */
+export const UNSENT_NOTE_TYPE = 'gws-ea-meetings.unsent';
+/** To main: a meeting's conversation could not process an email, or a turn of it failed, so nothing answered. */
+export const STALLED_NOTE_TYPE = 'gws-ea-meetings.stalled';
 /** To a meeting's session: nobody has replied, so nudge them once. */
 export const NUDGE_NOTE_TYPE = 'gws-ea-meetings.nudge';
 /** To a meeting's session: room was made, and its time is held for the meeting. */
@@ -77,6 +82,10 @@ export interface OutcomeNote {
   };
   /** On a gave-up outcome the host reported itself: nobody answered after a nudge. */
   readonly unanswered?: true;
+  /** On a gave-up outcome for a reply: delivery gave up on its email, so it was never sent. */
+  readonly undelivered?: true;
+  /** On a responded or not-scheduling outcome: the thread, waiting for main again, to arrange, respond, or dismiss. */
+  readonly thread_key?: string;
 }
 
 /** Who a meeting is with, for a note: each name and address. */

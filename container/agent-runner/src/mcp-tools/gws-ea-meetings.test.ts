@@ -1,6 +1,7 @@
 /**
- * The meeting tools: main's five requests and external-email's outcome, each
- * a typed request the host answers with an `action_response` (KTD5).
+ * The meeting tools: main's requests, and external-email's calendar tools,
+ * recipients and outcome, each a typed request the host answers with an
+ * `action_response` (KTD5).
  */
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
@@ -13,11 +14,15 @@ import {
   askOrganizer,
   book,
   cancel,
+  dismiss,
   freeTime,
   hold,
   outcome,
+  recipients,
   releaseHolds,
+  replyToPrincipal,
   reschedule,
+  respond,
 } from './gws-ea-meetings.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -114,6 +119,39 @@ describe('the meeting tools', () => {
       [releaseHolds, 'meeting_release_holds', { meeting_id: 'mtg-1' }],
       [releaseHolds, 'meeting_release_holds', { meeting_id: 'mtg-1', slot_ids: ['slot-3fa9c2e1b7d0'] }],
       [book, 'meeting_book', { meeting_id: 'mtg-1', slot_id: 'slot-3fa9c2e1b7d0' }],
+      [
+        arrange,
+        'meeting_arrange',
+        {
+          people: [{ person_id: 'p-0123456789ab', email: 'sam@studio.example' }, { email: 'kim@else.example' }],
+          calendar_id: 'c',
+          length_minutes: 30,
+          ...WINDOW,
+          purpose: 'Intro',
+          copy_principal: true,
+        },
+      ],
+      [
+        arrange,
+        'meeting_arrange',
+        { thread_key: 'mail-inbound-1', calendar_id: 'c', length_minutes: 30, ...WINDOW, purpose: 'Catch up' },
+      ],
+      [amend, 'meeting_amend', { meeting_id: 'mtg-1', people: [{ person_id: 'p-0123456789ab' }] }],
+      [respond, 'meeting_respond', { thread_key: 'mail-inbound-1', purpose: 'Decline kindly' }],
+      [
+        respond,
+        'meeting_respond',
+        { thread_key: 'mail-inbound-1', purpose: 'Holding line', constraints: 'Say a week at most.' },
+      ],
+      [dismiss, 'meeting_dismiss', { thread_key: 'mail-inbound-1' }],
+      [replyToPrincipal, 'meeting_reply_to_principal', { gmail_message_id: '18c2f0a1b2', text: 'Done.\nIt is at 4.' }],
+      [recipients, 'meeting_recipients', { meeting_id: 'mtg-1', to: ['sales@acme.example'] }],
+      [
+        recipients,
+        'meeting_recipients',
+        { meeting_id: 'mtg-1', to: ['sales@acme.example'], cc: [], bcc: ['alex@principal.example'] },
+      ],
+      [outcome, 'meeting_outcome', { meeting_id: 'mtg-1', outcome: 'responded' }],
     ];
     for (const [tool, action, args] of cases) {
       const { request } = await call(tool, args, (id) => ({ id, ok: true, data: { message: 'ok' } }));
@@ -138,6 +176,20 @@ describe('the meeting tools', () => {
       [book, { meeting_id: 'mtg-1' }],
       [releaseHolds, { meeting_id: 'mtg-1', slot_ids: [3] }],
       [reschedule, { calendar_id: 'c', event_id: 'e', ...WINDOW, purpose: 'Making room', making_room_for: 7 }],
+      [arrange, { calendar_id: 'c', length_minutes: 30, ...WINDOW, purpose: 'Intro', people: [{ name: 'Sam' }] }],
+      [
+        arrange,
+        { calendar_id: 'c', length_minutes: 30, ...WINDOW, purpose: 'Intro', thread_key: 'k', copy_principal: 'yes' },
+      ],
+      [amend, { meeting_id: 'mtg-1', people: [] }],
+      [respond, { thread_key: 'mail-inbound-1' }],
+      [respond, { purpose: 'Decline kindly' }],
+      [dismiss, {}],
+      [replyToPrincipal, { gmail_message_id: '18c2f0a1b2' }],
+      [replyToPrincipal, { text: 'Done.' }],
+      [recipients, { meeting_id: 'mtg-1' }],
+      [recipients, { meeting_id: 'mtg-1', to: [] }],
+      [recipients, { meeting_id: 'mtg-1', to: ['sales@acme.example'], bcc: 'alex@principal.example' }],
     ] as const) {
       const result = await tool.handler(args);
       expect(result.isError).toBe(true);

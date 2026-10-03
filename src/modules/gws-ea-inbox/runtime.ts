@@ -22,6 +22,8 @@ export interface InboxRuntime {
   /** That address when Gmail has already reported it, without asking. */
   knownGmailAddress(): string | undefined;
   now(): Date;
+  /** Wait between retries of a Gmail call. */
+  sleep(ms: number): Promise<void>;
 }
 
 let active: InboxRuntime | undefined;

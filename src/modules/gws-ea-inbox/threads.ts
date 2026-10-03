@@ -1,24 +1,26 @@
 /**
- * The inbox's threads, as the meeting handoff (U11) drives them (KTD4, KTD5).
+ * The inbox's threads, as the meeting handoff (U11) drives them (KTD4, KTD5,
+ * KTD16).
  *
- * A thread is authorized only when `arrange` or `ask_organizer` opens it, or
- * when the principal's verified message copied the assistant in. Its mail is
- * held until its `external-email` session is open and has its brief:
+ * A thread reaches `external-email` only when `main` hands it over: a new
+ * thread `arrange` or `ask_organizer` opens, or a thread the host holds for
+ * `main` (one the principal copied the assistant into, or one anyone else
+ * started). Its mail is held until its session is open and has its brief:
  *
  * 1. `mintThreadKey()` names a new thread for a meeting.
- * 2. `authorizeThread(...)` authorizes it: a new thread to the meeting's
- *    counterparts, or a copied-in thread whose counterparts the principal's
- *    own message named.
+ * 2. `authorizeThread(...)` authorizes it: a new thread to the people `main`
+ *    named, or a held thread, whose people are those on its mail.
  * 3. `openThreadSession(threadKey)` opens the thread's session, with the
  *    address the brief and every reply use.
  * 4. The handoff writes the brief into that session.
  * 5. `releaseHeldMail(threadKey)` opens the thread to its mail and hands the
  *    session whatever arrived before, in order.
  *
- * `allowedRecipients` and `getThreadParticipants` read a thread;
- * `closeThread` ends it, after which its mail reaches `main` as a note.
- * `handBackCopiedInThread` returns a copied-in thread whose arrange failed
- * to waiting for arrange, its held mail kept.
+ * `getThreadParticipants` reads a thread. `arrangeThreadPeople` places its
+ * people for the next replies, and `addThreadPeople` adds someone `main`
+ * names (recipients.ts). `handBackHeldThread` returns a held thread to
+ * waiting for `main`, its later mail held again; `closeThread` ends a thread,
+ * after which its mail starts a new one held for `main`.
  */
 import { randomUUID } from 'node:crypto';
 
@@ -40,12 +42,13 @@ import {
   uniqueAddresses,
   updateThread,
   type InboxThread,
+  type ThreadPeople,
   type ThreadState,
 } from './db.js';
 import { GoogleApiError } from './gmail-api.js';
-import { normalizeAddress, parseGmailMessage } from './mime.js';
+import { parseGmailMessage } from './mime.js';
 import { noticeSetAside } from './notices.js';
-import { allowedRecipientsOf } from './recipients.js';
+import { arranged, requireAddress, withAdded, type Placement } from './recipients.js';
 import { deliverToSession, loadRoutingContext } from './routing.js';
 import { activeInbox, assistantAddresses, EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from './runtime.js';
 
@@ -59,14 +62,11 @@ export interface ThreadView {
   readonly origin: InboxThread['origin'];
   readonly subject: string;
   readonly gmailThreadId: string | null;
-  /** The meeting's counterparts: the base of the thread's allowed recipients. */
-  readonly counterparts: readonly string[];
-  /** Who the next reply goes to: the current participants inside the ceiling. */
-  readonly participants: readonly string[];
-  /** The principal's addresses a verified message put on the thread. */
-  readonly principalAddresses: readonly string[];
-  /** Senders Gmail authenticated in the thread. */
-  readonly authenticatedSenders: readonly string[];
+  /**
+   * Who the next reply goes to, as placed: those on the latest message, or as
+   * `main` added or `external-email` arranged them since.
+   */
+  readonly people: ThreadPeople;
   readonly sessionId: string | null;
 }
 
@@ -77,12 +77,14 @@ function view(thread: InboxThread): ThreadView {
     origin: thread.origin,
     subject: thread.subject,
     gmailThreadId: thread.gmailThreadId,
-    counterparts: thread.counterparts,
-    participants: thread.participants,
-    principalAddresses: thread.principalAddresses,
-    authenticatedSenders: thread.authenticatedSenders,
+    people: thread.people,
     sessionId: thread.sessionId,
   };
+}
+
+/** A thread the host holds for `main` until it takes it over. */
+function isHeldForMain(thread: InboxThread): boolean {
+  return thread.origin === 'copy-in' || thread.origin === 'inbound';
 }
 
 function requireKey(threadKey: string): string {
@@ -114,14 +116,25 @@ export type AuthorizeThreadInput =
       readonly opener: 'arrange' | 'ask_organizer';
       /** The first email's subject; checked like anything else sent to the counterparts. */
       readonly subject: string;
-      /** The addresses the host took from the people store or from Google, never from mail. */
+      /** The people `main` named, on To: taken from the people store or from Google, never from mail. */
       readonly counterparts: readonly string[];
+      /** Copy the principal, on Cc, from their first address; only when `main` asks. */
+      readonly copyPrincipal?: boolean;
     }
   | {
-      /** A thread the principal copied the assistant into, as its copy-in note named it. */
-      readonly kind: 'copy-in';
+      /** A thread the host holds for `main`, as its note named it: copied in by the principal, or started by anyone else. */
+      readonly kind: 'held';
       readonly threadKey: string;
     };
+
+/** The principal's first address: the one they added first. */
+async function principalCopyAddress(): Promise<string> {
+  const [first] = [...(await listPrincipalAddresses())].sort(
+    (a, b) => a.added_at.localeCompare(b.added_at) || a.email.localeCompare(b.email),
+  );
+  if (!first) throw new Error('The principal has no address to copy');
+  return first.email;
+}
 
 /**
  * Authorize a thread for `external-email`. Repeating the same authorization
@@ -132,8 +145,8 @@ export async function authorizeThread(input: AuthorizeThreadInput): Promise<Thre
   const existing = await getThread(threadKey);
   const at = new Date().toISOString();
 
-  if (input.kind === 'copy-in') {
-    if (!existing || existing.origin !== 'copy-in') throw new Error(`No copied-in thread ${threadKey}`);
+  if (input.kind === 'held') {
+    if (!existing || !isHeldForMain(existing)) throw new Error(`Thread ${threadKey} is not held for main`);
     if (existing.state === 'closed') throw new Error(`Thread ${threadKey} is closed`);
     if (existing.state === 'awaiting-arrange') {
       await updateThread(threadKey, { state: 'authorized' }, at);
@@ -145,12 +158,10 @@ export async function authorizeThread(input: AuthorizeThreadInput): Promise<Thre
   const assistant = await assistantAddresses();
   const principal = new Set((await listPrincipalAddresses()).map((address) => address.email));
   const counterparts = uniqueAddresses(
-    input.counterparts.map((address) => {
-      const normalized = normalizeAddress(address);
-      if (normalized === undefined) throw new Error(`Not an email address: ${JSON.stringify(address)}`);
-      if (assistant.has(normalized)) throw new Error('The assistant is never its own counterpart');
-      if (principal.has(normalized)) throw new Error('A thread the assistant opens never copies the principal');
-      return normalized;
+    input.counterparts.map((value) => {
+      const address = requireAddress(value, assistant);
+      if (principal.has(address)) throw new Error('Copy the principal with copyPrincipal, never as a counterpart');
+      return address;
     }),
   );
   if (counterparts.length === 0) throw new Error('A thread needs at least one counterpart');
@@ -159,12 +170,9 @@ export async function authorizeThread(input: AuthorizeThreadInput): Promise<Thre
     throw new Error(`A thread's subject must be one line of 1 to ${SUBJECT_MAX_LENGTH} characters`);
   }
   if (existing) {
-    const same =
-      existing.origin === input.opener &&
-      existing.subject === subject &&
-      existing.counterparts.length === counterparts.length &&
-      existing.counterparts.every((address) => counterparts.includes(address));
-    if (!same) throw new Error(`Thread ${threadKey} is already authorized for something else`);
+    if (existing.origin !== input.opener || existing.subject !== subject) {
+      throw new Error(`Thread ${threadKey} is already authorized for something else`);
+    }
     return view(existing);
   }
   const check = await checkOutbound(subject, await audienceForAddresses(counterparts));
@@ -176,10 +184,7 @@ export async function authorizeThread(input: AuthorizeThreadInput): Promise<Thre
       state: 'authorized',
       gmailThreadId: null,
       subject,
-      counterparts,
-      participants: counterparts,
-      authenticatedSenders: [],
-      principalAddresses: [],
+      people: { to: counterparts, cc: input.copyPrincipal === true ? [await principalCopyAddress()] : [], bcc: [] },
     },
     at,
   );
@@ -267,30 +272,62 @@ export async function releaseHeldMail(threadKey: string): Promise<{ readonly rel
   return { released };
 }
 
-/** The ceiling of who any reply in the thread may go to. */
-export async function allowedRecipients(threadKey: string): Promise<readonly string[]> {
-  return allowedRecipientsOf(await requireThread(threadKey), await assistantAddresses());
-}
-
 /** The thread as the inbox holds it, or undefined. */
 export async function getThreadParticipants(threadKey: string): Promise<ThreadView | undefined> {
   const thread = await getThread(requireKey(threadKey));
   return thread ? view(thread) : undefined;
 }
 
-/**
- * Hand a copied-in thread whose arrange failed back to the principal: it
- * waits for arrange again, its mail held as before. Closing the session it
- * had is the caller's; the next arrange opens a new one.
- */
-export async function handBackCopiedInThread(threadKey: string): Promise<void> {
+/** A thread whose people may still change: not closed. */
+async function requireLiveThread(threadKey: string): Promise<InboxThread> {
   const thread = await requireThread(threadKey);
-  if (thread.origin !== 'copy-in') throw new Error(`Thread ${threadKey} was not copied in`);
+  if (thread.state === 'closed') throw new Error(`Thread ${threadKey} is closed`);
+  return thread;
+}
+
+/**
+ * Place the thread's people for its next replies (R40): only people already
+ * on it, each once, someone on To. Anyone left out is off the thread until a
+ * message or `main` puts them back. It holds until the next message in the
+ * thread replaces the people.
+ */
+export async function arrangeThreadPeople(threadKey: string, people: ThreadPeople): Promise<ThreadView> {
+  const thread = await requireLiveThread(threadKey);
+  const placed = arranged(thread.people, people, await assistantAddresses());
+  await updateThread(threadKey, { people: placed }, new Date().toISOString());
+  return view({ ...thread, people: placed });
+}
+
+/** Add people `main` names to the thread, on To or Cc; someone already on it moves there. */
+export async function addThreadPeople(
+  threadKey: string,
+  addresses: readonly string[],
+  placement: Placement,
+): Promise<ThreadView> {
+  const thread = await requireLiveThread(threadKey);
+  const people = withAdded(thread.people, addresses, placement, await assistantAddresses());
+  await updateThread(threadKey, { people }, new Date().toISOString());
+  return view({ ...thread, people });
+}
+
+/**
+ * Return a thread held for `main` to waiting for it, its people kept: after a
+ * takeover failed, or after `respond` answered while `main` waits on the
+ * principal. Mail that arrives from then on is held, and `main` hears of it,
+ * until it takes the thread over again or dismisses it. Closing the session
+ * the thread had is the caller's; the next takeover opens one.
+ */
+export async function handBackHeldThread(threadKey: string): Promise<void> {
+  const thread = await requireThread(threadKey);
+  if (!isHeldForMain(thread)) throw new Error(`Thread ${threadKey} is not held for main`);
   if (thread.state === 'awaiting-arrange' || thread.state === 'closed') return;
   await updateThread(threadKey, { state: 'awaiting-arrange' }, new Date().toISOString());
 }
 
-/** End a thread: nothing more is held or delivered to its session, and later mail reaches `main` as a note. */
+/**
+ * End a thread: nothing more is held or delivered to its session, and later
+ * mail in it starts a new thread held for `main`.
+ */
 export async function closeThread(threadKey: string): Promise<void> {
   await requireThread(threadKey);
   for (const gmailMessageId of await heldMessages(threadKey)) await dropHeldMessage(gmailMessageId);

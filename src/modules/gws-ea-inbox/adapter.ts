@@ -23,6 +23,7 @@ import {
   getInboxState,
   isSettled,
   openThreadsWithHeldMail,
+  prunePrincipalMessages,
   pruneSenderCounts,
   pruneSettledMessages,
   recordFailedAttempt,
@@ -46,6 +47,8 @@ const MAX_HISTORY_PAGES = 10;
 const RESYNC_LIMIT = 100;
 /** How long a settled message is remembered, and so how far back a resync reaches. */
 const SETTLED_RETENTION_MS = 30 * 24 * 3_600_000;
+/** How long the principal's messages can be answered by email. */
+const PRINCIPAL_MESSAGE_RETENTION_MS = SETTLED_RETENTION_MS;
 const SENDER_COUNT_RETENTION_MS = 24 * 3_600_000;
 
 /**
@@ -109,6 +112,7 @@ export function createInbox(deps: InboxDeps): Inbox {
     },
     knownGmailAddress: () => gmailAddress,
     now,
+    sleep,
   };
 
   /** Route messages in order; true when every one settled or was set aside. */
@@ -243,6 +247,7 @@ export function createInbox(deps: InboxDeps): Inbox {
       }
       await finishReleases();
       await pruneSettledMessages(new Date(at.getTime() - SETTLED_RETENTION_MS).toISOString());
+      await prunePrincipalMessages(new Date(at.getTime() - PRINCIPAL_MESSAGE_RETENTION_MS).toISOString());
       await pruneSenderCounts(new Date(at.getTime() - SENDER_COUNT_RETENTION_MS).toISOString());
     } catch (error) {
       log.error('The inbox poll could not finish', { reason: reasonOf(error) });
@@ -264,7 +269,7 @@ export function createInbox(deps: InboxDeps): Inbox {
       if (activeInbox() === runtime) setActiveInbox(undefined);
     },
     isConnected: () => setup !== undefined,
-    deliver: (platformId, threadId, message) => sendReply(runtime, platformId, threadId, message, sleep),
+    deliver: (platformId, threadId, message) => sendReply(runtime, platformId, threadId, message),
   };
 
   return { adapter, tick };

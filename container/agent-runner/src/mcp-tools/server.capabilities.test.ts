@@ -89,11 +89,15 @@ describe('NanoClaw tool server capabilities', () => {
     ['reply and time', ['reply', 'time'], ['send_message', ...TIME_TOOLS].sort()],
     ['files-send', ['files-send'], ['add_reaction', 'edit_message', 'send_file']],
     ['calendar-facts', ['calendar-facts'], ['find_conflicts', 'people_stats']],
-    ['gws-ea-meetings', ['gws-ea-meetings'], ['amend', 'arrange', 'ask_organizer', 'cancel', 'reschedule']],
+    [
+      'gws-ea-meetings',
+      ['gws-ea-meetings'],
+      ['amend', 'arrange', 'ask_organizer', 'cancel', 'dismiss', 'reply_to_principal', 'reschedule', 'respond'],
+    ],
     [
       'gws-ea-meetings-external',
       ['gws-ea-meetings-external'],
-      ['book', 'free_time', 'hold', 'outcome', 'release_holds'],
+      ['book', 'free_time', 'hold', 'outcome', 'recipients', 'release_holds'],
     ],
     ['no keys', [], []],
   ])('serves a group holding %s exactly the tools of its keys', async (_holding, grants, tools) => {

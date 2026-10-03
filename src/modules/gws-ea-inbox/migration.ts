@@ -9,12 +9,16 @@ import type { ModuleMigration } from '../../db/migrations/index.js';
  * - `gws_ea_inbox_messages`: each Gmail message seen, with its routing outcome
  *   once settled and its failed attempts until then, so a message routes once.
  * - `gws_ea_inbox_threads`: each thread's key, Gmail thread, authorization,
- *   and the addresses its recipient ceiling is built from (JSON arrays).
+ *   and its people as its next reply places them, in To, Cc, and Bcc (JSON
+ *   arrays).
  * - `gws_ea_inbox_thread_messages`: the Message-IDs known in each thread,
  *   in order, for matching replies and writing `References`.
  * - `gws_ea_inbox_held`: mail for a thread whose session is not open yet.
+ * - `gws_ea_inbox_principal_messages`: each message Gmail verified as the
+ *   principal's, with what a reply needs to answer only them, in its thread.
  * - `gws_ea_inbox_sends`: a send between allocating its Message-ID and the
- *   delivery being recorded, so a retry finds what Gmail may already hold.
+ *   delivery being recorded, so a retry finds what Gmail may already hold:
+ *   a reply in a thread, or a reply to one of the principal's messages.
  * - `gws_ea_inbox_sender_counts`: messages per sender per hour.
  * - `gws_ea_inbox_calendars`: the principal's calendars in the assistant's
  *   calendar list, whose notifications the host turned on.
@@ -51,14 +55,13 @@ export const gwsEaInboxMigration: ModuleMigration = {
 
       CREATE TABLE gws_ea_inbox_threads (
         thread_key             TEXT PRIMARY KEY CHECK (thread_key LIKE 'mail-%'),
-        origin                 TEXT NOT NULL CHECK (origin IN ('arrange', 'ask_organizer', 'copy-in')),
+        origin                 TEXT NOT NULL CHECK (origin IN ('arrange', 'ask_organizer', 'copy-in', 'inbound')),
         state                  TEXT NOT NULL CHECK (state IN ('awaiting-arrange', 'authorized', 'open', 'closed')),
         gmail_thread_id        TEXT UNIQUE,
         subject                TEXT NOT NULL,
-        counterparts           TEXT NOT NULL,
-        participants           TEXT NOT NULL,
-        authenticated_senders  TEXT NOT NULL,
-        principal_addresses    TEXT NOT NULL,
+        people_to              TEXT NOT NULL,
+        people_cc              TEXT NOT NULL,
+        people_bcc             TEXT NOT NULL,
         session_id             TEXT,
         created_at             TEXT NOT NULL,
         updated_at             TEXT NOT NULL
@@ -81,17 +84,32 @@ export const gwsEaInboxMigration: ModuleMigration = {
       );
       CREATE INDEX idx_gws_ea_inbox_held_thread ON gws_ea_inbox_held(thread_key, held_at);
 
+      CREATE TABLE gws_ea_inbox_principal_messages (
+        gmail_message_id  TEXT PRIMARY KEY,
+        address           TEXT NOT NULL,
+        gmail_thread_id   TEXT NOT NULL,
+        rfc_message_id    TEXT,
+        reference_ids     TEXT NOT NULL,
+        subject           TEXT NOT NULL,
+        received_at       TEXT NOT NULL
+      );
+      CREATE INDEX idx_gws_ea_inbox_principal_messages_received
+        ON gws_ea_inbox_principal_messages(received_at);
+
       CREATE TABLE gws_ea_inbox_sends (
-        id                TEXT PRIMARY KEY,
-        thread_key        TEXT NOT NULL REFERENCES gws_ea_inbox_threads(thread_key) ON DELETE CASCADE,
-        content_hash      TEXT NOT NULL,
-        rfc_message_id    TEXT NOT NULL UNIQUE,
-        state             TEXT NOT NULL CHECK (state IN ('pending', 'sent')),
-        gmail_message_id  TEXT,
-        created_at        TEXT NOT NULL,
-        updated_at        TEXT NOT NULL
+        id                    TEXT PRIMARY KEY,
+        thread_key            TEXT REFERENCES gws_ea_inbox_threads(thread_key) ON DELETE CASCADE,
+        principal_message_id  TEXT REFERENCES gws_ea_inbox_principal_messages(gmail_message_id) ON DELETE CASCADE,
+        content_hash          TEXT NOT NULL,
+        rfc_message_id        TEXT NOT NULL UNIQUE,
+        state                 TEXT NOT NULL CHECK (state IN ('pending', 'sent')),
+        gmail_message_id      TEXT,
+        created_at            TEXT NOT NULL,
+        updated_at            TEXT NOT NULL,
+        CHECK ((thread_key IS NULL) <> (principal_message_id IS NULL))
       );
       CREATE INDEX idx_gws_ea_inbox_sends_content ON gws_ea_inbox_sends(thread_key, content_hash);
+      CREATE INDEX idx_gws_ea_inbox_sends_principal ON gws_ea_inbox_sends(principal_message_id, content_hash);
 
       CREATE TABLE gws_ea_inbox_sender_counts (
         sender        TEXT NOT NULL,

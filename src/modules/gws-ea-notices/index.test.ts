@@ -1,5 +1,7 @@
 /**
- * Failure notices reach only the principal, in their direct message (R38).
+ * Failure notices reach only the principal, in their direct message (R38),
+ * and only for main's own conversations: a failure in external-email's is
+ * the meetings module's to report to main.
  *
  * Drives the real core paths that report a failure (delivery, reconcile, and
  * the runner's `turn_failed` action) with this module registered on their
@@ -39,11 +41,11 @@ import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { reconcileSession } from '../../reconcile-session.js';
 import { resolveSession, resolveTaskSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
-import { bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
+import { bindVerifiedPrincipalUser, recordExternalEmailAgentGroupId } from '../gws-ea-profile/db.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
 import '../gws-ea-profile/index.js';
-import './index.js';
+import { registerTurnFailedHook } from './index.js';
 
 const TEST_DIR = '/tmp/nanoclaw-test-gws-ea-notices';
 const NOTICE = "Something went wrong on my side and I couldn't finish that. Please send it again.";
@@ -62,6 +64,12 @@ interface Sent {
 }
 
 let sent: Sent[];
+
+/** Every failed turn the notices module handed on: another module's to report. */
+const handedOn: Array<{ sessionId: string; threadId: string | null }> = [];
+registerTurnFailedHook('gws-ea-notices-test:record', async (route, session) => {
+  handedOn.push({ sessionId: session.id, threadId: route.threadId });
+});
 
 function now(): string {
   return new Date().toISOString();
@@ -121,6 +129,8 @@ async function seedAssistant(): Promise<{ main: Session; external: Session }> {
   await upsertUser({ id: PRINCIPAL, kind: 'gchat', display_name: 'Pat', created_at: now() });
   await bindVerifiedPrincipalUser(PRINCIPAL, now());
   await upsertUserDm({ user_id: PRINCIPAL, channel_type: 'gchat', messaging_group_id: 'mg-dm', resolved_at: now() });
+  await getDb().run("UPDATE gws_ea_profile SET main_agent_group_id = 'ag-main' WHERE singleton = 1");
+  await recordExternalEmailAgentGroupId('ag-external');
   return {
     main: (await resolveSession('ag-main', 'mg-dm', null, 'shared')).session,
     external: (await resolveSession('ag-external', 'mg-email', null, 'shared')).session,
@@ -217,6 +227,7 @@ beforeEach(async () => {
   vi.mocked(isContainerRunning).mockReturnValue(false);
   vi.mocked(killContainer).mockReset();
   sent = [];
+  handedOn.length = 0;
   channel();
 });
 
@@ -239,15 +250,26 @@ describe('a reply that fails permanently', () => {
     expect(sent.filter((send) => !isNotice(send))).toHaveLength(6);
   });
 
-  it('tells the principal’s direct message, never the counterpart’s thread it was bound for', async () => {
+  it('sends nothing for an email external-email could not send: the principal asked for nothing there', async () => {
     const { external } = await seedAssistant();
     queue(external, { id: 'out-email', content: { text: 'Does Tuesday work?' }, route: EMAIL_THREAD, threadId: 'm-1' });
     channel((send) => !isNotice(send));
 
     await drain(external, 3);
 
-    expect(notices()).toEqual([noticeInDm(null)]);
-    expect(sent.filter((send) => send.channelType === 'email').every((send) => !isNotice(send))).toBe(true);
+    expect(sent.filter((send) => send.channelType === 'email')).toHaveLength(3);
+    expect(notices()).toEqual([]);
+  });
+
+  it('sends nothing for any session but main’s', async () => {
+    const { main } = await seedAssistant();
+    await getDb().run("UPDATE gws_ea_profile SET main_agent_group_id = 'ag-external' WHERE singleton = 1");
+    queue(main, { id: 'out-a', content: { text: 'A' } });
+    channel((send) => !isNotice(send));
+
+    await drain(main, 3);
+
+    expect(notices()).toEqual([]);
   });
 
   it('sends nothing for a system message that fails permanently', async () => {
@@ -370,13 +392,14 @@ describe('an inbound message given up after its last retry', () => {
     expect(sent).toEqual([noticeInDm('spaces/dm/threads/t1')]);
   });
 
-  it('tells the principal’s direct message, never the counterpart who wrote', async () => {
+  it('sends nothing for an email external-email could not handle, and never writes to the counterpart', async () => {
     const { external } = await seedAssistant();
     seedClaimed(external, 'in-email', 2, MAX_TRIES, { kind: 'chat-sdk', ...EMAIL_THREAD, threadId: 'm-1' });
 
     await reconcileSession(external.id);
 
-    expect(sent).toEqual([noticeInDm(null)]);
+    expect(inboundStatus(external, 'in-email')).toBe('failed');
+    expect(sent).toEqual([]);
   });
 
   it('says nothing when the message came from the host, not a person', async () => {
@@ -427,22 +450,49 @@ describe('a failed turn the runner reports', () => {
     });
   }
 
-  it('produces the sentence in the thread of main’s own conversation', async () => {
+  it('produces the sentence in the thread of main’s own conversation, and hands nothing on', async () => {
     const { main } = await seedAssistant();
     reportTurnFailed(main, { ...DM, threadId: 'spaces/dm/threads/t1' });
 
     await drain(main, 1);
 
     expect(sent).toEqual([noticeInDm('spaces/dm/threads/t1')]);
+    expect(handedOn).toEqual([]);
   });
 
-  it('in an external-email thread notifies the principal’s direct message and never the thread', async () => {
+  it('in an external-email thread sends nothing, to the principal or the thread, and hands it to its owner', async () => {
     const { external } = await seedAssistant();
     reportTurnFailed(external, { ...EMAIL_THREAD, threadId: 'm-1' });
 
     await drain(external, 1);
 
-    expect(sent).toEqual([noticeInDm(null)]);
+    expect(sent).toEqual([]);
+    expect(handedOn).toEqual([{ sessionId: external.id, threadId: 'm-1' }]);
+  });
+
+  it('hands on a failed turn even when one owner’s hook fails', async () => {
+    const { external } = await seedAssistant();
+    const logged = vi.spyOn(log, 'error').mockImplementation(() => undefined);
+    registerTurnFailedHook('gws-ea-notices-test:explodes', async () => {
+      throw new Error('owner failed');
+    });
+    try {
+      reportTurnFailed(external, { ...EMAIL_THREAD, threadId: 'm-2' });
+
+      await drain(external, 1);
+
+      expect(handedOn).toEqual([{ sessionId: external.id, threadId: 'm-2' }]);
+      expect(logged).toHaveBeenCalledWith(
+        'Turn-failed hook failed',
+        expect.objectContaining({ hookId: 'gws-ea-notices-test:explodes' }),
+      );
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it('refuses a second hook under the same id', () => {
+    expect(() => registerTurnFailedHook('gws-ea-notices-test:record', async () => undefined)).toThrow(/already/);
   });
 
   it('says nothing for a turn another agent or the host started', async () => {

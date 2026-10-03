@@ -5,7 +5,19 @@
 import { getDb } from '../../db/connection.js';
 
 export type ThreadState = 'awaiting-arrange' | 'authorized' | 'open' | 'closed';
-export type ThreadOrigin = 'arrange' | 'ask_organizer' | 'copy-in';
+/**
+ * How a thread began: `arrange` and `ask_organizer` opened it; the principal
+ * copied the assistant in (`copy-in`); or someone else wrote (`inbound`). The
+ * last two are held for `main` until it takes them over.
+ */
+export type ThreadOrigin = 'arrange' | 'ask_organizer' | 'copy-in' | 'inbound';
+
+/** Who a thread's next reply goes to, each placed in To, Cc, or Bcc; every address appears once. */
+export interface ThreadPeople {
+  readonly to: readonly string[];
+  readonly cc: readonly string[];
+  readonly bcc: readonly string[];
+}
 
 /** A thread as stored, its address lists parsed. */
 export interface InboxThread {
@@ -14,14 +26,8 @@ export interface InboxThread {
   readonly state: ThreadState;
   readonly gmailThreadId: string | null;
   readonly subject: string;
-  /** The meeting's counterparts: set when the thread is authorized. */
-  readonly counterparts: readonly string[];
-  /** The addresses on the thread's latest message that reached its ceiling. */
-  readonly participants: readonly string[];
-  /** Senders Gmail authenticated in this thread. */
-  readonly authenticatedSenders: readonly string[];
-  /** The principal's addresses that a verified message put on this thread. */
-  readonly principalAddresses: readonly string[];
+  /** Its people: those on its latest message, as `main` added or `external-email` arranged them since. */
+  readonly people: ThreadPeople;
   readonly sessionId: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
@@ -33,19 +39,19 @@ interface ThreadRow {
   state: ThreadState;
   gmail_thread_id: string | null;
   subject: string;
-  counterparts: string;
-  participants: string;
-  authenticated_senders: string;
-  principal_addresses: string;
+  people_to: string;
+  people_cc: string;
+  people_bcc: string;
   session_id: string | null;
   created_at: string;
   updated_at: string;
 }
 
-function addresses(json: string): string[] {
+/** A JSON list of strings, as the inbox stores addresses and Message-IDs. */
+function stringList(json: string): string[] {
   const parsed: unknown = JSON.parse(json);
   if (!Array.isArray(parsed) || !parsed.every((item): item is string => typeof item === 'string')) {
-    throw new Error('An inbox thread holds a malformed address list');
+    throw new Error('An inbox row holds a malformed list');
   }
   return parsed;
 }
@@ -57,10 +63,7 @@ function toThread(row: ThreadRow): InboxThread {
     state: row.state,
     gmailThreadId: row.gmail_thread_id,
     subject: row.subject,
-    counterparts: addresses(row.counterparts),
-    participants: addresses(row.participants),
-    authenticatedSenders: addresses(row.authenticated_senders),
-    principalAddresses: addresses(row.principal_addresses),
+    people: { to: stringList(row.people_to), cc: stringList(row.people_cc), bcc: stringList(row.people_bcc) },
     sessionId: row.session_id,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -129,9 +132,8 @@ export type RouteOutcome =
   | 'copy-in'
   | 'thread'
   | 'held'
+  | 'inbound'
   | 'rate-limited'
-  | 'cold-note'
-  | 'closed-thread-note'
   | 'gone'
   | 'not-in-inbox'
   | 'calendar-note'
@@ -212,27 +214,23 @@ export interface NewThread {
   readonly state: ThreadState;
   readonly gmailThreadId: string | null;
   readonly subject: string;
-  readonly counterparts: readonly string[];
-  readonly participants: readonly string[];
-  readonly authenticatedSenders: readonly string[];
-  readonly principalAddresses: readonly string[];
+  readonly people: ThreadPeople;
 }
 
 export async function insertThread(thread: NewThread, at: string): Promise<void> {
   await getDb().run(
     `INSERT INTO gws_ea_inbox_threads (
-       thread_key, origin, state, gmail_thread_id, subject, counterparts, participants,
-       authenticated_senders, principal_addresses, session_id, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+       thread_key, origin, state, gmail_thread_id, subject, people_to, people_cc, people_bcc,
+       session_id, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
     thread.threadKey,
     thread.origin,
     thread.state,
     thread.gmailThreadId,
     thread.subject,
-    JSON.stringify(thread.counterparts),
-    JSON.stringify(thread.participants),
-    JSON.stringify(thread.authenticatedSenders),
-    JSON.stringify(thread.principalAddresses),
+    JSON.stringify(thread.people.to),
+    JSON.stringify(thread.people.cc),
+    JSON.stringify(thread.people.bcc),
     at,
     at,
   );
@@ -241,33 +239,29 @@ export async function insertThread(thread: NewThread, at: string): Promise<void>
 export interface ThreadUpdate {
   readonly state?: ThreadState;
   readonly gmailThreadId?: string | null;
-  readonly counterparts?: readonly string[];
-  readonly participants?: readonly string[];
-  readonly authenticatedSenders?: readonly string[];
-  readonly principalAddresses?: readonly string[];
+  readonly people?: ThreadPeople;
   readonly sessionId?: string;
 }
 
-const UPDATE_COLUMNS: Readonly<Record<keyof ThreadUpdate, string>> = {
-  state: 'state',
-  gmailThreadId: 'gmail_thread_id',
-  counterparts: 'counterparts',
-  participants: 'participants',
-  authenticatedSenders: 'authenticated_senders',
-  principalAddresses: 'principal_addresses',
-  sessionId: 'session_id',
-};
-
 export async function updateThread(threadKey: string, update: ThreadUpdate, at: string): Promise<void> {
-  const params: Record<string, unknown> = { thread_key: threadKey, updated_at: at };
-  const assignments = ['updated_at = @updated_at'];
-  for (const [key, value] of Object.entries(update) as [keyof ThreadUpdate, ThreadUpdate[keyof ThreadUpdate]][]) {
-    if (value === undefined) continue;
-    const column = UPDATE_COLUMNS[key];
-    assignments.push(`${column} = @${column}`);
-    params[column] = Array.isArray(value) ? JSON.stringify(value) : value;
-  }
-  await getDb().run(`UPDATE gws_ea_inbox_threads SET ${assignments.join(', ')} WHERE thread_key = @thread_key`, params);
+  const columns: Record<string, unknown> = {
+    ...(update.state === undefined ? {} : { state: update.state }),
+    ...(update.gmailThreadId === undefined ? {} : { gmail_thread_id: update.gmailThreadId }),
+    ...(update.people === undefined
+      ? {}
+      : {
+          people_to: JSON.stringify(update.people.to),
+          people_cc: JSON.stringify(update.people.cc),
+          people_bcc: JSON.stringify(update.people.bcc),
+        }),
+    ...(update.sessionId === undefined ? {} : { session_id: update.sessionId }),
+  };
+  const assignments = ['updated_at = @updated_at', ...Object.keys(columns).map((column) => `${column} = @${column}`)];
+  await getDb().run(`UPDATE gws_ea_inbox_threads SET ${assignments.join(', ')} WHERE thread_key = @thread_key`, {
+    ...columns,
+    thread_key: threadKey,
+    updated_at: at,
+  });
 }
 
 /** Record Message-IDs as the thread's, in order; one already known keeps its thread and place. */
@@ -337,12 +331,90 @@ export async function openThreadsWithHeldMail(): Promise<string[]> {
 }
 
 // ---------------------------------------------------------------------------
+// The principal's messages
+// ---------------------------------------------------------------------------
+
+/** A message Gmail verified as the principal's: what a reply to them alone needs. */
+export interface PrincipalMessage {
+  readonly gmailMessageId: string;
+  /** The principal's address that wrote it, as Gmail verified it. */
+  readonly address: string;
+  readonly gmailThreadId: string;
+  readonly rfcMessageId: string | null;
+  /** The message's own References, oldest first. */
+  readonly referenceIds: readonly string[];
+  readonly subject: string;
+  readonly receivedAt: string;
+}
+
+interface PrincipalMessageRow {
+  gmail_message_id: string;
+  address: string;
+  gmail_thread_id: string;
+  rfc_message_id: string | null;
+  reference_ids: string;
+  subject: string;
+  received_at: string;
+}
+
+/** Record a message as the principal's; recording it again changes nothing. */
+export async function recordPrincipalMessage(message: PrincipalMessage): Promise<void> {
+  await getDb().run(
+    `INSERT INTO gws_ea_inbox_principal_messages
+       (gmail_message_id, address, gmail_thread_id, rfc_message_id, reference_ids, subject, received_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT (gmail_message_id) DO NOTHING`,
+    message.gmailMessageId,
+    message.address,
+    message.gmailThreadId,
+    message.rfcMessageId,
+    JSON.stringify(message.referenceIds),
+    message.subject,
+    message.receivedAt,
+  );
+}
+
+export async function getPrincipalMessage(gmailMessageId: string): Promise<PrincipalMessage | undefined> {
+  const row = await getDb().get<PrincipalMessageRow>(
+    'SELECT * FROM gws_ea_inbox_principal_messages WHERE gmail_message_id = ?',
+    gmailMessageId,
+  );
+  return row
+    ? {
+        gmailMessageId: row.gmail_message_id,
+        address: row.address,
+        gmailThreadId: row.gmail_thread_id,
+        rfcMessageId: row.rfc_message_id,
+        referenceIds: stringList(row.reference_ids),
+        subject: row.subject,
+        receivedAt: row.received_at,
+      }
+    : undefined;
+}
+
+/** Forget the principal's messages received before `before`, and the replies in flight to them. */
+export async function prunePrincipalMessages(before: string): Promise<void> {
+  const db = getDb();
+  await db.transaction(async () => {
+    await db.run(
+      `DELETE FROM gws_ea_inbox_sends WHERE principal_message_id IN
+         (SELECT gmail_message_id FROM gws_ea_inbox_principal_messages WHERE received_at < ?)`,
+      before,
+    );
+    await db.run('DELETE FROM gws_ea_inbox_principal_messages WHERE received_at < ?', before);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Sends in flight
 // ---------------------------------------------------------------------------
 
+/** What a send answers: a reply in an inbox thread, or a reply to one of the principal's messages. */
+export type SendScope = { readonly threadKey: string } | { readonly principalMessageId: string };
+
 export interface SendRecord {
   readonly id: string;
-  readonly threadKey: string;
+  readonly scope: SendScope;
   readonly contentHash: string;
   readonly rfcMessageId: string;
   readonly state: 'pending' | 'sent';
@@ -351,26 +423,34 @@ export interface SendRecord {
 
 interface SendRow {
   id: string;
-  thread_key: string;
+  thread_key: string | null;
+  principal_message_id: string | null;
   content_hash: string;
   rfc_message_id: string;
   state: 'pending' | 'sent';
   gmail_message_id: string | null;
 }
 
-/** The oldest in-flight send of this content in this thread. */
-export async function findSend(threadKey: string, contentHash: string): Promise<SendRecord | undefined> {
+function scopeColumn(scope: SendScope): { readonly column: string; readonly value: string } {
+  return 'threadKey' in scope
+    ? { column: 'thread_key', value: scope.threadKey }
+    : { column: 'principal_message_id', value: scope.principalMessageId };
+}
+
+/** The oldest in-flight send of this content in this scope. */
+export async function findSend(scope: SendScope, contentHash: string): Promise<SendRecord | undefined> {
+  const { column, value } = scopeColumn(scope);
   const row = await getDb().get<SendRow>(
-    `SELECT id, thread_key, content_hash, rfc_message_id, state, gmail_message_id
-       FROM gws_ea_inbox_sends WHERE thread_key = ? AND content_hash = ?
+    `SELECT id, thread_key, principal_message_id, content_hash, rfc_message_id, state, gmail_message_id
+       FROM gws_ea_inbox_sends WHERE ${column} = ? AND content_hash = ?
       ORDER BY created_at, id LIMIT 1`,
-    threadKey,
+    value,
     contentHash,
   );
   return row
     ? {
         id: row.id,
-        threadKey: row.thread_key,
+        scope,
         contentHash: row.content_hash,
         rfcMessageId: row.rfc_message_id,
         state: row.state,
@@ -379,24 +459,32 @@ export async function findSend(threadKey: string, contentHash: string): Promise<
     : undefined;
 }
 
-/** A pending send and its Message-ID as the thread's, written together before Gmail is called. */
+/**
+ * A pending send, written before Gmail is called. A reply in a thread records
+ * its Message-ID as the thread's in the same transaction.
+ */
 export async function insertPendingSend(
   record: Omit<SendRecord, 'state' | 'gmailMessageId'>,
   at: string,
 ): Promise<void> {
   const db = getDb();
+  const threadKey = 'threadKey' in record.scope ? record.scope.threadKey : null;
+  const principalMessageId = 'principalMessageId' in record.scope ? record.scope.principalMessageId : null;
   await db.transaction(async () => {
     await db.run(
-      `INSERT INTO gws_ea_inbox_sends (id, thread_key, content_hash, rfc_message_id, state, gmail_message_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'pending', NULL, ?, ?)`,
+      `INSERT INTO gws_ea_inbox_sends (
+         id, thread_key, principal_message_id, content_hash, rfc_message_id, state, gmail_message_id,
+         created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, ?)`,
       record.id,
-      record.threadKey,
+      threadKey,
+      principalMessageId,
       record.contentHash,
       record.rfcMessageId,
       at,
       at,
     );
-    await addThreadMessageIds(record.threadKey, [record.rfcMessageId], at);
+    if (threadKey !== null) await addThreadMessageIds(threadKey, [record.rfcMessageId], at);
   });
 }
 
@@ -409,6 +497,7 @@ export async function markSendSent(id: string, gmailMessageId: string, at: strin
   );
 }
 
+/** A thread reply's records once delivery recorded or gave up on it. */
 export async function deleteSends(threadKey: string, contentHash: string, state: 'pending' | 'sent'): Promise<void> {
   await getDb().run(
     'DELETE FROM gws_ea_inbox_sends WHERE thread_key = ? AND content_hash = ? AND state = ?',
