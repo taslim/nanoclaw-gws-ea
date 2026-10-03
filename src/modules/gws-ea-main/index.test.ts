@@ -42,6 +42,7 @@ const REQUIRED_GUIDANCE = [
   "The principal's email addresses go in `ncl principal-addresses`",
   'add an address they say is theirs without asking them to confirm it',
   'a new address takes effect only after they confirm it on a card',
+  'You reach only the public internet.',
   "An account's main calendar needs only that address: add it as theirs and subscribe",
   'Ask for a Calendar ID only for any other calendar',
   'When they want you to stop using a calendar, unsubscribe from it.',

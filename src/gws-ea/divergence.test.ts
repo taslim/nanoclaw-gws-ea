@@ -4,12 +4,14 @@
  * Each guard drives the real upstream-owned module through the behavior gws-ea
  * depends on, so a skill refresh or upstream update that drops a recorded
  * divergence fails this suite, not a live assistant. Only effects outside the
- * guarded modules are replaced: container wake-up, and Google's certificate
- * check and the OneCLI servers behind `fetch`.
+ * guarded modules are replaced: container wake-up, launchd and Docker behind
+ * the update helpers' command runner, and Google's certificate check and the
+ * OneCLI servers behind `fetch`. Modules outside `src/` (scripts and the agent
+ * runner) load by path, since the host's build covers only `src/`.
  */
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import net, { type AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -24,6 +26,7 @@ import type { ProviderStateVolume } from '../provider-contracts/registry.js';
 import type { AgentGroup, Session } from '../types.js';
 import { deriveWorkspaceAddOnIdentity } from './gcp-identity.js';
 import { CONTROL_PLANE_ROOT } from './paths.js';
+import type { NanoclawCommandRunner, NanoclawServiceEnvironment, NanoclawServiceHelpers } from './service-control.js';
 
 const external = vi.hoisted(() => ({ requestWake: vi.fn(async () => true) }));
 
@@ -45,6 +48,8 @@ vi.mock('../request-wake.js', () => ({ requestWake: external.requestWake }));
 
 const originalCwd = process.cwd();
 const cleanups: Array<() => Promise<void>> = [];
+/** Runs a NanoClaw script the way its package scripts do, outside this test's module graph. */
+const TSX_LOADER = path.join(CONTROL_PLANE_ROOT, 'node_modules', 'tsx', 'dist', 'loader.mjs');
 
 afterEach(async () => {
   process.chdir(originalCwd);
@@ -340,7 +345,6 @@ describe('recorded divergence: the webhook server honors a loopback WEBHOOK_HOST
 });
 
 describe('recorded divergence: init-first-agent takes an optional welcome event ID', () => {
-  const tsxLoader = path.join(CONTROL_PLANE_ROOT, 'node_modules', 'tsx', 'dist', 'loader.mjs');
   const initFirstAgent = path.join(CONTROL_PLANE_ROOT, 'scripts', 'init-first-agent.ts');
 
   function welcome(cwd: string): Promise<{ readonly status: number | null; readonly stderr: string }> {
@@ -349,7 +353,7 @@ describe('recorded divergence: init-first-agent takes an optional welcome event 
         process.execPath,
         [
           '--import',
-          tsxLoader,
+          TSX_LOADER,
           initFirstAgent,
           '--channel',
           'gchat',
@@ -679,7 +683,137 @@ describe('recorded divergence: each agent group has a capability list', () => {
     for (const module of [fan, backfill]) expect(module).toContain('CONVERSATION_CONTEXT_CAPABILITY');
     expect(runner).toContain('isRestricted(');
   });
+
+  it("writes the group's explicit list into its container config, with its configured MCP servers only under mcp-servers", async () => {
+    const { db } = await migratedInstall();
+    const configs = await import('../db/container-configs.js');
+    const { configFromDb } = await import('../container-config.js');
+    const { resolveCapabilities } = await import('../capabilities.js');
+    const group = agentGroup('ag-config');
+    await db.createAgentGroup(group);
+    await configs.ensureContainerConfig(group.id);
+    await configs.updateContainerConfigJson(group.id, 'mcp_servers', { tools: { command: 'tools-server' } });
+    const config = async () => configFromDb((await configs.getContainerConfig(group.id))!, group);
+
+    const all = await config();
+    expect(all.capabilities).toEqual(resolveCapabilities('all', group.name));
+    expect(all.mcpServers).toEqual({ tools: expect.objectContaining({ command: 'tools-server' }) });
+    await configs.updateContainerConfigJson(group.id, 'capabilities', ['reply']);
+    const replyOnly = await config();
+    expect(replyOnly.capabilities).toEqual(['reply']);
+    expect(replyOnly.mcpServers).toEqual({});
+  });
+
+  it("changes a list only through ncl groups config update, refusing unknown keys and an agent naming another group's", async () => {
+    const { db } = await migratedInstall();
+    const { ensureContainerConfig, getContainerConfig } = await import('../db/container-configs.js');
+    const { dispatch } = await import('../cli/dispatch.js');
+    const { lookup } = await import('../cli/registry.js');
+    await import('../cli/resources/index.js');
+    for (const id of ['ag-own', 'ag-other']) {
+      await db.createAgentGroup(agentGroup(id));
+      await ensureContainerConfig(id);
+    }
+    const update = (capabilities: string) =>
+      dispatch(
+        { id: 'capabilities', command: 'groups-config-update', args: { id: 'ag-own', capabilities } },
+        { caller: 'host' },
+      );
+    const stored = async (id: string): Promise<unknown> => JSON.parse((await getContainerConfig(id))!.capabilities!);
+
+    expect(await update('reply,teleport')).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/unknown capability "teleport"/u) },
+    });
+    expect(await stored('ag-own')).toBe('all');
+    expect(await update('time, reply')).toMatchObject({ ok: true });
+    expect(await stored('ag-own')).toEqual(['reply', 'time']);
+    // Even an approved request from an agent of any CLI scope.
+    await expect(
+      lookup('groups-config-update')!.handler(
+        { id: 'ag-other', capabilities: 'reply' },
+        { caller: 'agent', agentGroupId: 'ag-own', sessionId: 'session-1', messagingGroupId: 'mg-own' },
+      ),
+    ).rejects.toThrow(/only its own capabilities/u);
+    expect(await stored('ag-other')).toBe('all');
+  });
+
+  it("teaches the gateway's skill only to an agent with a shell, through the spawn's skill bound", async () => {
+    await freshInstall();
+    vi.stubEnv('NANOCLAW_GATEWAY_PROVIDER', 'onecli');
+    const { selectGatewayAgentSkills } = await import('../gateway-providers/index.js');
+    const { teachesGateway } = await import('../capabilities.js');
+    const runner = await readFile(path.join(originalCwd, 'src/container-runner.ts'), 'utf8');
+
+    expect(selectGatewayAgentSkills(['onecli-gateway', 'welcome'], teachesGateway(new Set(['reply'])))).toEqual([
+      'welcome',
+    ]);
+    expect(selectGatewayAgentSkills(['welcome'], teachesGateway(new Set(['reply', 'shell'])))).toEqual([
+      'welcome',
+      'onecli-gateway',
+    ]);
+    expect(runner).toContain(
+      'selectGatewayAgentSkills(skillsWithinCapabilities(selected, grants), teachesGateway(grants))',
+    );
+  });
+
+  it("gives the runner nothing for a missing list, and keeps a reply-only agent's built-ins and other MCP servers away", async () => {
+    // The runner reports a missing list on stderr; this guard reads the outcome.
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const runnerSource = path.join(originalCwd, 'container/agent-runner/src');
+    // The runner's own modules, loaded by path: the host's build covers only `src/`.
+    const config = (await import(path.join(runnerSource, 'config.ts'))) as RunnerConfigModule;
+    const claude = (await import(path.join(runnerSource, 'providers/claude-config.ts'))) as ClaudeConfigModule;
+    const provider = await readFile(path.join(runnerSource, 'providers/claude.ts'), 'utf8');
+
+    expect([...config.runnerConfigFromRaw({}).capabilities]).toEqual([]);
+    expect([...config.runnerConfigFromRaw({ capabilities: 'all' }).capabilities]).toEqual([]);
+    expect([...config.runnerConfigFromRaw({ capabilities: ['reply'] }).capabilities]).toEqual(['reply']);
+    expect(claude.resolveClaudeCapabilityPolicy(new Set()).tools).toEqual([]);
+    const replyOnly = claude.resolveClaudeCapabilityPolicy(new Set(['reply']));
+    for (const tool of ['Bash', 'Read', 'Write', 'Edit', 'WebFetch', 'WebSearch', 'Task', 'Agent']) {
+      expect(replyOnly.withheldTools, tool).toContain(tool);
+      expect(replyOnly.tools, tool).not.toContain(tool);
+    }
+    const options = claude.resolveClaudeToolOptions(
+      replyOnly,
+      {
+        mcpServers: { nanoclaw: { command: 'nanoclaw' }, tools: { command: 'tools-server' } },
+        allowedTools: ['mcp__nanoclaw__send_message', 'mcp__tools__lookup', 'Bash'],
+      },
+      [],
+    );
+    expect(Object.keys(options.mcpServers)).toEqual(['nanoclaw']);
+    expect(options.allowedTools).toEqual(['mcp__nanoclaw__send_message']);
+    expect(options).toMatchObject({ strictMcpConfig: true, env: { ENABLE_CLAUDEAI_MCP_SERVERS: 'false' } });
+    expect(provider).toContain('resolveClaudeCapabilityPolicy(runnerCapabilities())');
+    expect(provider).toContain('resolveClaudeToolOptions(this.capabilities,');
+  });
 });
+
+/** The slice of the runner's config module (`container/agent-runner/src/config.ts`) the capability guard drives. */
+interface RunnerConfigModule {
+  runnerConfigFromRaw(raw: Record<string, unknown>): { readonly capabilities: ReadonlySet<string> };
+}
+
+/** The slice of the runner's Claude policy module (`providers/claude-config.ts`) the capability guard drives. */
+interface ClaudeConfigModule {
+  resolveClaudeCapabilityPolicy(grants: ReadonlySet<string>): {
+    readonly tools?: readonly string[];
+    readonly withheldTools: readonly string[];
+    readonly externalMcpServers: boolean;
+  };
+  resolveClaudeToolOptions(
+    policy: ReturnType<ClaudeConfigModule['resolveClaudeCapabilityPolicy']>,
+    mcp: { mcpServers: Record<string, { command: string }>; allowedTools: readonly string[] },
+    disallowedTools: readonly string[],
+  ): {
+    readonly allowedTools: readonly string[];
+    readonly mcpServers: Record<string, unknown>;
+    readonly strictMcpConfig?: true;
+    readonly env: Record<string, string>;
+  };
+}
 
 describe('recorded divergence: the agent runner describes delivery so a sent reply is not followed by a note', () => {
   it('says a sent reply ends the turn, and never asks for every line to be wrapped, in the prompt, the nudge, or compaction', async () => {
@@ -1094,5 +1228,192 @@ describe('recorded divergence: a module can refuse a role grant', () => {
     const cli = await readFile(path.join(originalCwd, 'src/cli/resources/roles.ts'), 'utf8');
     expect(cli).toContain('assertRoleGrantAdmitted({');
     expect(cli.indexOf('assertRoleGrantAdmitted({')).toBeLessThan(cli.indexOf('INSERT INTO user_roles'));
+  });
+});
+
+/** Run a program to completion with its output collected. */
+function runProgram(
+  command: string,
+  args: readonly string[],
+  options: { readonly cwd: string; readonly env?: NodeJS.ProcessEnv },
+): Promise<{ readonly status: number | null; readonly stdout: string; readonly stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd: options.cwd, env: options.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString('utf8');
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf8');
+    });
+    child.on('error', reject);
+    child.on('close', (status) => resolve({ status, stdout, stderr }));
+  });
+}
+
+describe("recorded divergence: NanoClaw's update helpers act on the install they are given", () => {
+  type UpdateHelpers = Pick<NanoclawServiceHelpers, 'createCommandRunner' | 'detectService' | 'drainContainers'>;
+
+  /** `scripts/update/service.ts`, loaded by path: the host's build covers only `src/`. */
+  async function updateHelpers(): Promise<UpdateHelpers> {
+    return (await import(path.join(originalCwd, 'scripts/update/service.ts'))) as UpdateHelpers;
+  }
+
+  it("detects and drains the named install's service and containers, not those the checkout derives", async () => {
+    const home = await realpath(await mkdtemp(path.join(os.tmpdir(), 'gws-ea-divergence-home-')));
+    cleanups.push(() => rm(home, { recursive: true, force: true }));
+    const label = 'com.nanoclaw-v2-gwsguard';
+    await mkdir(path.join(home, 'Library', 'LaunchAgents'), { recursive: true });
+    await writeFile(path.join(home, 'Library', 'LaunchAgents', `${label}.plist`), '');
+    const commands: string[] = [];
+    const runner: NanoclawCommandRunner = {
+      run: () => '',
+      tryRun: (command, args) => {
+        commands.push([command, ...args].join(' '));
+        return { ok: true, stdout: '' };
+      },
+    };
+    const env: NanoclawServiceEnvironment = {
+      platform: 'darwin',
+      home,
+      uid: 501,
+      runner,
+      installSlug: 'gwsguard',
+      sleep: async () => undefined,
+    };
+    // What the checkout alone would name: this process's install ID.
+    vi.stubEnv('NANOCLAW_INSTALL_ID', 'another-install');
+    vi.stubEnv('CONTAINER_RUNTIME', 'docker');
+    const helpers = await updateHelpers();
+
+    expect(helpers.detectService(path.join(home, 'checkout'), env)).toMatchObject({
+      mode: 'launchd',
+      name: label,
+      active: true,
+    });
+    await helpers.drainContainers(path.join(home, 'checkout'), env);
+    expect(commands).toEqual([
+      `launchctl print gui/501/${label}`,
+      'docker ps -q --filter label=nanoclaw-install=gwsguard',
+    ]);
+  });
+
+  it('runs every command with the environment it was given, and only that', async () => {
+    vi.stubEnv('GWS_EA_DIVERGENCE_AMBIENT', 'ambient');
+    const helpers = await updateHelpers();
+    const runner = helpers.createCommandRunner({ env: { GWS_EA_DIVERGENCE_GIVEN: 'given' } });
+
+    expect(
+      runner.run(process.execPath, [
+        '-e',
+        'process.stdout.write(String(process.env.GWS_EA_DIVERGENCE_GIVEN) + "/" + String(process.env.GWS_EA_DIVERGENCE_AMBIENT))',
+      ]),
+    ).toBe('given/undefined');
+  });
+
+  it('snapshots the mutable paths NanoClaw declares in src/, the list gws-ea carries at cutover', async () => {
+    const transaction = await readFile(path.join(originalCwd, 'scripts/update/transaction.ts'), 'utf8');
+
+    expect(transaction).toContain("import { MUTABLE_PATHS } from '../../src/mutable-paths.js';");
+    expect(transaction).not.toMatch(/\bconst MUTABLE_PATHS\b/u);
+  });
+
+  it("names the install's service and image from NANOCLAW_INSTALL_ID in the shell helpers, as the TS helper does", async () => {
+    const { getInstallScopedNames } = await import('../install-slug.js');
+    const names = (installId: string) =>
+      runProgram(
+        'bash',
+        [
+          '-c',
+          '. "$1" && container_image_base && printf "\\n" && launchd_label',
+          'install-slug',
+          path.join(originalCwd, 'setup/lib/install-slug.sh'),
+        ],
+        { cwd: os.tmpdir(), env: { PATH: process.env.PATH, NANOCLAW_INSTALL_ID: installId } },
+      );
+
+    const expected = getInstallScopedNames('gwsguard');
+    expect(await names('gwsguard')).toMatchObject({
+      status: 0,
+      stdout: `${expected.containerImageBase}\n${expected.launchdLabel}`,
+    });
+    expect(await names('Not An ID')).toMatchObject({ status: 1, stdout: '' });
+  });
+});
+
+describe('recorded divergence: the migration script applies module migrations', () => {
+  it('records the capabilities and gws-ea module migrations in a fresh central database', async () => {
+    const install = await freshInstall();
+    const run = await runProgram(
+      process.execPath,
+      ['--import', TSX_LOADER, path.join(originalCwd, 'scripts/migrate.ts')],
+      {
+        cwd: install,
+        env: process.env,
+      },
+    );
+    expect(run, run.stderr).toMatchObject({ status: 0 });
+
+    const central = new Database(path.join(install, 'data', 'v2.db'), { readonly: true });
+    try {
+      const applied = central.prepare('SELECT name FROM schema_version').all() as Array<{ name: string }>;
+      expect(applied.map((row) => row.name)).toEqual(
+        expect.arrayContaining([
+          'module:capabilities:container-config-capabilities',
+          'module:gws-ea-profile:create-profile',
+        ]),
+      );
+    } finally {
+      central.close();
+    }
+  });
+});
+
+describe("recorded divergence: the host's own sends pass the outbound guards, and only a channel asserts a sender", () => {
+  it('hands the guarded delivery adapter to the approval coordinator and the host modules', async () => {
+    const host = await readFile(path.join(originalCwd, 'src/index.ts'), 'utf8');
+
+    expect(host).toContain('const guardedDelivery = setDeliveryAdapter(deliveryAdapter);');
+    expect(host).toMatch(/startGatewayApprovalCoordinator\(gatewayProvider, guardedDelivery,/u);
+    expect(host).toContain('startHostModules({ db, deliveryAdapter: guardedDelivery,');
+  });
+
+  it("forwards a channel's authenticated sender, and drops one an admin transport's routed event carries", async () => {
+    const host = await readFile(path.join(originalCwd, 'src/index.ts'), 'utf8');
+    const onInbound = host.slice(host.indexOf('onInbound(platformId, threadId, message) {'));
+    const channelMessage = onInbound.slice(0, onInbound.indexOf('onInboundEvent('));
+    const adminEvent = onInbound.slice(onInbound.indexOf('onInboundEvent('), onInbound.indexOf('onMetadata('));
+
+    expect(channelMessage).toContain('authenticatedSender: message.authenticatedSender,');
+    expect(adminEvent).toContain('authenticatedSender: undefined,');
+    expect(adminEvent).toContain("deduplicate: adapter.channelType === 'cli' ? event.message.deduplicate : undefined,");
+  });
+});
+
+describe('recorded divergence: the base checkout composes the secured Google Chat channel', () => {
+  /** The slice of `scripts/skill-directives.ts` this guard drives. */
+  interface SkillDirectives {
+    parseDirectives(markdown: string): ReadonlyArray<{ readonly kind: string; readonly body: readonly string[] }>;
+  }
+
+  it('pins the Chat SDK core to the Google Chat adapter, and add-gchat neither copies over nor removes the adapter', async () => {
+    const read = (file: string) => readFile(path.join(originalCwd, file), 'utf8');
+    const manifest = JSON.parse(await read('package.json')) as { dependencies: Record<string, string> };
+    const adapterVersion = manifest.dependencies['@chat-adapter/gchat'];
+    const { parseDirectives } = (await import(
+      path.join(originalCwd, 'scripts/skill-directives.ts')
+    )) as SkillDirectives;
+    const skill = parseDirectives(await read('.claude/skills/add-gchat/SKILL.md'));
+
+    expect(adapterVersion).toMatch(/^\d+\.\d+\.\d+$/u);
+    expect(manifest.dependencies.chat).toBe(adapterVersion);
+    expect(skill.filter((directive) => directive.kind === 'copy').flatMap((directive) => directive.body)).toEqual([
+      'src/channels/gchat-registration.test.ts',
+    ]);
+    expect(skill.filter((directive) => directive.kind === 'dep').flatMap((directive) => directive.body)).toEqual([
+      `@chat-adapter/gchat@${adapterVersion}`,
+    ]);
+    expect(await read('.claude/skills/add-gchat/REMOVE.md')).not.toMatch(/\brm\b[^\n]*src\/channels\/gchat\.ts/u);
   });
 });
