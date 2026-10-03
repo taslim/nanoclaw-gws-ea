@@ -80,6 +80,12 @@ export interface AddPersonInput {
   readonly level: string;
   /** `principal` when the principal said so; `learned` when the assistant derived it. */
   readonly source: string;
+  /**
+   * Who chose the level, when it differs from `source`: `learned` when the
+   * principal gave the person but not where they stand, so the level stays
+   * the assistant's judgment and learning may revise it. Defaults to `source`.
+   */
+  readonly levelSource?: string;
   readonly basis: string;
   readonly organization?: string;
   readonly notes?: string;
@@ -630,6 +636,8 @@ export async function getPersonLevel(identity: string): Promise<PersonLevel | 'u
 /** Keep a new person, with exactly one level. */
 export async function addPerson(input: AddPersonInput): Promise<Person> {
   const author = parseChangeSource(input.source);
+  const levelSource = input.levelSource === undefined ? author : parseChangeSource(input.levelSource);
+  if (levelSource === 'principal') assertPrincipal(author, 'Only the principal sets a level as theirs');
   const name = parseLine(input.name, 'Name', NAME_MAX_LENGTH);
   const level = parseLevel(input.level);
   const basis = parseLine(input.basis, 'Basis', BASIS_MAX_LENGTH);
@@ -646,7 +654,7 @@ export async function addPerson(input: AddPersonInput): Promise<Person> {
   const rememberedName =
     input.rememberedName === undefined ? undefined : parseLine(input.rememberedName, 'Name', NAME_MAX_LENGTH);
   if (rememberedName !== undefined) assertPrincipal(author, 'Only the principal teaches a name to remember');
-  assertLevelWritable(undefined, author, level);
+  assertLevelWritable(undefined, levelSource, level);
 
   const key = await loadFingerprintKey();
   const id = newId('p');
@@ -663,7 +671,7 @@ export async function addPerson(input: AddPersonInput): Promise<Person> {
       organization,
       notes,
       level,
-      author,
+      levelSource,
       basis,
       now,
       now,

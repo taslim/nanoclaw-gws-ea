@@ -193,11 +193,18 @@ registerResource({
       access: 'open',
       description:
         'Keep a new person with exactly one level.\n\n' +
-        "Use --source principal for someone the principal tells you about, and --source learned for someone you came to know from the calendar, mail, or the directory: a learned level is active or known, and a learned identity names where you found it with --identity-source. An identity the principal had forgotten is refused to learning; only the principal can add it back. The principal's own addresses and yours are never a person's.",
+        "Use --source principal for someone the principal tells you about, and --source learned for someone you came to know from the calendar, mail, or the directory: a learned level is active or known, and a learned identity names where you found it with --identity-source. When the principal gives you someone but not where they stand, add --level-source learned: the level is then your judgment, and learning may revise it. An identity the principal had forgotten is refused to learning; only the principal can add it back. The principal's own addresses and yours are never a person's.",
       args: [
         { ...NAME_ARG, required: true },
         { ...LEVEL_ARG, required: true },
         SOURCE_ARG,
+        {
+          name: 'level_source',
+          type: 'string',
+          enum: [...CHANGE_SOURCES],
+          description:
+            'Who chose the level, when not --source: learned when the principal gave you the person but not where they stand.',
+        },
         BASIS_ARG,
         ORGANIZATION_ARG,
         NOTES_ARG,
@@ -215,7 +222,8 @@ registerResource({
       ],
       examples: [
         'ncl people add --name "Pat Doe" --level close --source principal --basis "Said Pat is a close friend" --identity pat@example.com --remembered-name Pat',
-        'ncl people add --name "Sam Lee" --level known --source learned --basis "On three invitations this month" --identity email:sam@example.com --identity-source calendar',
+        'ncl people add --name "Sam Lee" --level active --source learned --basis "6 months to 2 Oct: 9 meetings, 4 one-on-ones" --identity email:sam@example.com --identity-source calendar',
+        'ncl people add --name "Ann Ito" --level known --source principal --level-source learned --basis "Principal gave her address; no meetings yet" --identity ann@example.com --remembered-name Ann',
       ],
       handler: async (args, ctx) =>
         asMain(ctx, async () =>
@@ -223,6 +231,7 @@ registerResource({
             name: requiredString(args, 'name'),
             level: requiredString(args, 'level'),
             source: requiredString(args, 'source'),
+            levelSource: optionalString(args.level_source),
             basis: requiredString(args, 'basis'),
             organization: optionalString(args.organization),
             notes: optionalString(args.notes),

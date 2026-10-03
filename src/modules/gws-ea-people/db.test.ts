@@ -202,6 +202,33 @@ describe('GWS-EA people store', () => {
     expect(await getPerson(person.id)).toEqual(expected);
   });
 
+  it("keeps the principal's address and name with a level that stays the assistant's judgment", async () => {
+    const sam = await addPerson({
+      name: 'Sam Lee',
+      level: 'known',
+      source: 'principal',
+      levelSource: 'learned',
+      basis: 'The principal gave their address; no meetings yet.',
+      identity: 'sam@example.test',
+      rememberedName: 'Sam',
+    });
+
+    expect(sam.level_source).toBe('learned');
+    expect(sam.identities).toEqual([{ handle: 'email:sam@example.test', source: 'principal', added_at: NOW }]);
+    expect(sam.remembered_names).toEqual(['Sam']);
+    // Learning may revise a level that was its own judgment, up to active.
+    expect(
+      (await setPersonLevel({ id: sam.id, level: 'active', source: 'learned', basis: '3 one-on-ones.' })).level,
+    ).toBe('active');
+    // A learned add cannot claim the principal chose the level, and a judged level still stops at active.
+    await expect(
+      addPerson(pat({ name: 'Ann', identity: undefined, source: 'learned', levelSource: 'principal', level: 'known' })),
+    ).rejects.toThrow(/only the principal/i);
+    await expect(
+      addPerson(pat({ name: 'Ann', identity: undefined, levelSource: 'learned', level: 'close' })),
+    ).rejects.toThrow(/learned level stops at active/i);
+  });
+
   it('stores an identity as a channel-qualified handle, qualifying a bare address and lowercasing email', async () => {
     const { id } = await addPerson(pat({ identity: 'Pat@Example.TEST' }));
     const updated = await updatePerson({ id, source: 'principal', addIdentity: 'gchat:users/1234' });
@@ -582,7 +609,7 @@ describe('forgetting a person', () => {
       name: 'Pat Doe',
       level: 'known',
       source: 'learned',
-      basis: 'On three invitations.',
+      basis: '6 months to 2 Oct: 3 meetings.',
       identitySource: 'calendar',
     } as const;
     for (const identity of ['email:pat.doe@gmail.com', 'PatDoe+invites@gmail.com', 'p.a.t.doe@googlemail.com']) {

@@ -53,6 +53,6 @@ Send the offers in one message: a one-line opener, one line per offer, then a sh
 >
 > Which should I do?
 
-After you send the offers, learn the principal's scheduling preferences as the Executive Assistant section describes. Don't mention it unless they ask; the welcome is about their week, not your setup.
+After you send the offers, learn the principal's scheduling preferences and their people, as the Executive Assistant section describes. Don't mention either unless they ask; the welcome is about their week, not your setup.
 
 If the principal corrects you during the welcome, apply the correction and store it where the Executive Assistant section says that kind of information belongs.

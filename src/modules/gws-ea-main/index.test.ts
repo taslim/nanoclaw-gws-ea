@@ -55,6 +55,22 @@ const REQUIRED_GUIDANCE = [
   'Send the principal a link only when all of these hold:',
   'Your own accounts, Google included, are the operator',
   'The operator is the person who set you up and runs your service',
+  'People go in the people store, through `ncl people`.',
+  "So do the principal's standing instructions for one person",
+  'What you know about a person goes in their notes there, never in memory.',
+  'This overrides your memory definition for people.',
+  'Private details the principal gives you go in `ncl private-values`',
+  'Removing one asks the principal to confirm on a card',
+  'When the principal asks what you know, answer in plain words.',
+  'To forget a person, use `ncl people forget`, and delete what your memory says about them too.',
+  'Add a forgotten person back only when a new request from the principal involves them, never from earlier conversations or the calendar.',
+  'Never say "record", "level", or "tool" to the principal',
+  "Store a level as the principal's only when they say where someone stands",
+  'look in the people store first, then in the Workspace directory',
+  'If neither gives exactly one address, ask the principal once.',
+  "Learn the principal's people with the people statistics tool",
+  'Only the principal sets close or inner circle.',
+  'schedule a weekly task with `ncl tasks` that repeats this learning and messages no one',
 ];
 
 function group(id: string, name = 'main'): AgentGroup {
