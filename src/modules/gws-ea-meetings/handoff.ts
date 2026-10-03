@@ -98,6 +98,7 @@ import {
 import { normalizeAddress } from '../gws-ea-inbox/mime.js';
 import { loadRoutingContext } from '../gws-ea-inbox/routing.js';
 import { activeInbox, assistantAddresses } from '../gws-ea-inbox/runtime.js';
+import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
 import { findPeople, getPerson } from '../gws-ea-people/db.js';
 import { checkOutbound, deleteThreadRecord, type ThreadKey } from '../gws-ea-privacy/index.js';
 import { getSchedulingPreferenceValues, type SchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
@@ -214,6 +215,8 @@ const PURPOSE_MAX = 120;
 /** A reply's purpose says what the one reply must do: decline, route, acknowledge, or hold. */
 const REPLY_PURPOSE_MAX = 500;
 const CONSTRAINTS_MAX = 500;
+/** How much of a list of addresses only email gave is shown, wrapped as untrusted. */
+const MAIL_ADDRESSES_MAX = 2_000;
 /** The principal's own email is answered in full, so it may run to several paragraphs. */
 const PRINCIPAL_REPLY_MAX = 20_000;
 const MIN_LENGTH = 5;
@@ -671,17 +674,52 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     return counterpart.name ? `${counterpart.name} <${counterpart.address}>` : counterpart.address;
   }
 
-  /** Who a reply in the thread reaches now, as the thread places them, the principal named as such. */
-  function repliesGoTo(people: ThreadPeople, meeting: Meeting, principal: ReadonlySet<string>): string {
-    const label = (address: string): string => {
-      if (principal.has(address)) return `the principal <${address}>`;
-      const counterpart = meeting.counterparts.find((c) => c.address === address);
-      return counterpart ? personText(counterpart) : address;
-    };
-    const placed = PLACEMENTS.filter(([field]) => people[field].length > 0).map(
-      ([field, name]) => `${name} ${people[field].map(label).join(', ')}`,
+  /**
+   * People, for text the host writes (KTD16). The principal and the meeting's
+   * counterparts are named: the host or main put them there. Anyone else is
+   * on the thread because an email named them, and an email can name anyone,
+   * so their addresses stay inside the untrusted wrapper.
+   */
+  function peopleText(
+    groups: readonly (readonly [label: string, addresses: readonly string[]])[],
+    meeting: Pick<Meeting, 'counterparts'>,
+    principal: ReadonlySet<string>,
+  ): string {
+    const named: string[] = [];
+    const fromMail: string[] = [];
+    for (const [label, addresses] of groups) {
+      const names: string[] = [];
+      const others: string[] = [];
+      for (const address of addresses) {
+        const counterpart = meeting.counterparts.find((c) => c.address === address);
+        if (principal.has(address)) names.push(`the principal <${address}>`);
+        else if (counterpart) names.push(personText(counterpart));
+        else others.push(address);
+      }
+      const prefix = label === '' ? '' : `${label} `;
+      if (names.length > 0) named.push(prefix + names.join(', '));
+      if (others.length > 0) fromMail.push(prefix + others.join(', '));
+    }
+    if (fromMail.length === 0) return named.length === 0 ? 'no one' : named.join('; ');
+    const wrapped = untrustedLine(fromMail.join('; '), MAIL_ADDRESSES_MAX);
+    return named.length === 0
+      ? `people only email put on the thread: ${wrapped}`
+      : `${named.join('; ')}; and people only email put on the thread: ${wrapped}`;
+  }
+
+  /** A thread's people by placement, To first, leaving out an empty one. */
+  function placed(people: ThreadPeople): (readonly [string, readonly string[]])[] {
+    return PLACEMENTS.filter(([field]) => people[field].length > 0).map(
+      ([field, name]) => [name, people[field]] as const,
     );
-    return placed.length === 0 ? 'Your replies go to no one yet.' : `Your replies go to: ${placed.join('; ')}.`;
+  }
+
+  /** Who a reply in the thread reaches now, as the thread places them. */
+  function repliesGoTo(people: ThreadPeople, meeting: Meeting, principal: ReadonlySet<string>): string {
+    const groups = placed(people);
+    return groups.length === 0
+      ? 'Your replies go to no one yet.'
+      : `Your replies go to: ${peopleText(groups, meeting, principal)}.`;
   }
 
   function termsText(meeting: Meeting, timezone: string): string[] {
@@ -1953,7 +1991,9 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
    */
   async function sendFailed(meeting: SchedulingMeeting, msg: OutboundMessage): Promise<void> {
     const thread = await getThreadParticipants(meeting.thread_key);
-    const to = thread ? everyoneOn(thread.people).join(', ') : who(meeting);
+    const to = thread
+      ? peopleText([['', everyoneOn(thread.people)]], meeting, (await addressBook()).principal)
+      : who(meeting);
     await writeMainNote(
       `meeting-unsent-${meeting.id}-${msg.id}`,
       {
@@ -1964,8 +2004,8 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         purpose: meeting.purpose,
         counterparts: noteCounterparts(meeting),
       },
-      `An email external-email wrote in meeting ${meeting.id}'s thread, to ${to}, could not be sent: email delivery kept failing ` +
-        `("${meeting.purpose}", thread_key ${meeting.thread_key}). ` +
+      `An email external-email wrote in meeting ${meeting.id}'s thread could not be sent: email delivery kept failing ` +
+        `("${meeting.purpose}", thread_key ${meeting.thread_key}). It was to ${to}. ` +
         (meeting.state === 'booked'
           ? 'The meeting stays booked as it is: cancel it, or tell the principal in one line if it matters.'
           : 'The meeting is still being arranged, but nothing will come of it on its own: amend it, cancel it, or tell the principal in one line.'),
@@ -2079,9 +2119,12 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       const meeting = await meetingInThread(retry, session);
       if (!meeting || (!isScheduling(meeting) && meeting.state !== 'active')) continue;
       const sender = await emailSender(retry.id, session);
-      const what = sender
-        ? `An email from ${sender.address}${sender.verified ? '' : ', which Gmail could not verify,'}`
-        : 'A message';
+      // An unverified From is whatever the sender typed, so only a verified one is named.
+      const what = !sender
+        ? 'A message'
+        : sender.verified
+          ? `An email from ${sender.address}`
+          : 'An email whose sender Gmail could not verify';
       await stalled(
         meeting,
         'unprocessed',
@@ -2134,31 +2177,30 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     if (!thread || (thread.state !== 'open' && thread.state !== 'authorized')) {
       throw refused('This thread is not open for replies.');
     }
+    const { principal } = await addressBook();
     const onThread = everyoneOn(thread.people);
-    const placed = [...wanted.to, ...wanted.cc, ...wanted.bcc];
-    const newcomers = [...new Set(placed.filter((address) => !onThread.includes(address)))];
+    const chosen = [...wanted.to, ...wanted.cc, ...wanted.bcc];
+    const newcomers = [...new Set(chosen.filter((address) => !onThread.includes(address)))];
     if (newcomers.length > 0) {
       throw refused(
-        `${newcomers.join(', ')} ${newcomers.length === 1 ? 'is' : 'are'} not on this thread, and you cannot add anyone. ` +
-          `To include someone new, invite the people on the thread to copy them in. On it now: ${onThread.join(', ')}.`,
+        `${newcomers.length === 1 ? 'This address is' : 'These addresses are'} not on this thread, and you cannot add anyone: ` +
+          `${untrustedLine(newcomers.join(', '), MAIL_ADDRESSES_MAX)}\n` +
+          `To include someone new, invite the people on the thread to copy them in. On it now: ${peopleText(placed(thread.people), meeting, principal)}.`,
       );
     }
-    const twice = placed.find((address, index) => placed.indexOf(address) !== index);
+    const twice = chosen.find((address, index) => chosen.indexOf(address) !== index);
     if (twice !== undefined) throw invalid(`${twice} can be placed only once`);
     if (wanted.to.length === 0) throw invalid('Put at least one person on to');
     const people = (await arrangeThreadPeople(meeting.thread_key, wanted)).people;
-    const left = onThread.filter((address) => !placed.includes(address));
-    const line = PLACEMENTS.filter(([field]) => people[field].length > 0)
-      .map(([field, name]) => `${name} ${people[field].join(', ')}`)
-      .join('; ');
+    const left = onThread.filter((address) => !chosen.includes(address));
     return {
       meetingId: meeting.id,
       data: {
         meeting_id: meeting.id,
         ...people,
         message:
-          `Your replies in this thread now go to: ${line}.` +
-          (left.length === 0 ? '' : ` Left off: ${left.join(', ')}.`) +
+          `Your replies in this thread now go to: ${peopleText(placed(people), meeting, principal)}.` +
+          (left.length === 0 ? '' : ` Left off: ${peopleText([['', left]], meeting, principal)}.`) +
           ' This holds until the next email in the thread changes who is on it.',
       },
     };

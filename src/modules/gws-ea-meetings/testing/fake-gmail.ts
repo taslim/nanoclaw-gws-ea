@@ -20,6 +20,8 @@ export interface IncomingMail {
   readonly body?: string;
   readonly threadId?: string;
   readonly principal?: boolean;
+  /** Mail Gmail could not authenticate: a From anyone could have written. */
+  readonly unverified?: boolean;
 }
 
 export interface SentMail {
@@ -61,7 +63,9 @@ export class FakeGmail implements GmailApi {
     const domain = mail.from.slice(mail.from.lastIndexOf('@') + 1).replace('>', '');
     const auth = mail.principal
       ? `mx.google.com;\r\n dkim=pass header.i=@${domain} header.s=google header.b=a;\r\n dmarc=pass (p=REJECT) header.from=${domain}`
-      : `mx.google.com;\r\n dkim=pass header.i=@${domain} header.s=s1 header.b=a;\r\n dmarc=pass (p=NONE) header.from=${domain}`;
+      : mail.unverified
+        ? `mx.google.com;\r\n spf=softfail smtp.mailfrom=${domain};\r\n dmarc=bestguesspass header.from=${domain}`
+        : `mx.google.com;\r\n dkim=pass header.i=@${domain} header.s=s1 header.b=a;\r\n dmarc=pass (p=NONE) header.from=${domain}`;
     const headers: Header[] = [
       { name: 'Delivered-To', value: this.assistant },
       { name: 'Received', value: 'from mail.example by mx.google.com with ESMTPS id y' },

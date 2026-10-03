@@ -46,6 +46,14 @@ export type InboxNote =
       /** The thread's other people: everyone on the principal's message but the principal and the assistant. */
       readonly participants: readonly string[];
     }
+  /** The principal's email in a thread still held for `main`. */
+  | {
+      readonly type: 'gws-ea-inbox.principal-held-mail';
+      readonly thread_key: string;
+      readonly gmail_message_id: string;
+      readonly gmail_thread_id: string;
+      readonly from: string;
+    }
   /** A new thread held for `main` to triage: the email that started it. */
   | ({ readonly type: 'gws-ea-inbox.inbound'; readonly gmail_thread_id: string } & HeldMailFields)
   /** A later email in a thread still held for `main`. */
