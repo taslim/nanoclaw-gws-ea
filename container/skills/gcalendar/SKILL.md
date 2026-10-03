@@ -50,7 +50,9 @@ For one occurrence of a recurring invitation, pass that occurrence's own `id`. `
 - Cancel: `gog calendar delete <calendarId> <eventId> --force`.
 - One occurrence of a recurring event: pass that occurrence's own `id` from `events`, because the series ID changes or cancels every occurrence. For one occurrence and all after it, pass the series ID with `--scope future --original-start <the occurrence's originalStartTime.dateTime, exactly as events printed it>`.
 
-Before you add attendees by name (`--attendees` on `create`, `--add-attendee` on `update`), turn each name into an address: from the people store first when you have one (`ncl people find`), then from the directory with the gpeople skill. Never guess an address.
+Adding attendees (`--attendees` on `create`, `--add-attendee` on `update`) invites other people. Moving an event they attend changes their plans. When you have `arrange`, do neither yourself: hand the meeting over with `arrange` or `reschedule` instead. Otherwise, before you add attendees by name, turn each name into an address: from the people store first when you have one (`ncl people find`), then from the directory with the gpeople skill. Never guess an address.
+
+To tell whether you created an event, compare its `creator.email` with your own address.
 
 Create focus time as an ordinary event, without `--event-type`. Google's focus-time events decline other people's invitations by default, which would answer people on the principal's behalf.
 

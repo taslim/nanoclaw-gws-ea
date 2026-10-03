@@ -44,8 +44,10 @@ import '../gws-ea-preferences/index.js';
 
 const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
 
-/** What the guidance must keep saying; each line is a rule R19, R22, R23, R24, R25, or R26 relies on. */
+/** What the guidance must keep saying; each line is a rule R5, R19, R22, R23, R24, R25, or R26 relies on. */
 const REQUIRED_GUIDANCE = [
+  'Offer two or three times at once, so the other person can choose in one reply.',
+  'Offer only times `free_time` returned, and hold or book each one by its slot id.',
   'Report how each meeting ends through `outcome`, once.',
   'Report booked only after `book` succeeded, never for a time someone only agreed to.',
   'Report needs-room only when nothing in the window fits someone in the inner circle or close; for anyone else, offer the open times there are, or report gave-up.',
