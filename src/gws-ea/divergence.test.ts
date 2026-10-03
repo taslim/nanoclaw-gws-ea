@@ -477,7 +477,7 @@ describe('recorded divergence: delivery consults outbound guards and reports fai
     expect(source).not.toContain('Something went wrong');
   });
 
-  it("reports a failed turn from the agent runner as a typed action, and keeps the runner's time and schedule tools", async () => {
+  it("reports a failed turn from the agent runner as a typed action, and keeps the runner's time, schedule, and calendar-fact tools", async () => {
     const pollLoop = await readFile(path.join(originalCwd, 'container/agent-runner/src/poll-loop.ts'), 'utf8');
     const tools = await readFile(path.join(originalCwd, 'container/agent-runner/src/mcp-tools/index.ts'), 'utf8');
 
@@ -485,6 +485,7 @@ describe('recorded divergence: delivery consults outbound guards and reports fai
     expect(pollLoop).not.toContain('Something went wrong');
     expect(tools).toContain("await loadToolModule('time', () => import('./time.js'));");
     expect(tools).toContain("await loadToolModule('schedule-stats', () => import('./schedule-stats.js'));");
+    expect(tools).toContain("await loadToolModule('calendar-facts', () => import('./calendar-facts.js'));");
   });
 });
 
@@ -496,6 +497,8 @@ describe('recorded divergence: each agent group has a capability list', () => {
     expect(capabilities.resolveCapabilities('all', 'divergence')).toEqual(
       expect.arrayContaining(['reply', 'files-send', 'files-read', 'files-write', 'shell', 'web', 'subagents']),
     );
+    expect(capabilities.resolveCapabilities('all', 'divergence')).toContain('calendar-facts');
+    expect(capabilities.grantsInstructions('calendar-facts', new Set(['calendar-facts']))).toBe(true);
     expect(
       capabilities.resolveCapabilities(capabilities.parseStoredCapabilities('{x', 'divergence'), 'divergence'),
     ).toEqual([]);

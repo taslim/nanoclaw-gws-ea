@@ -32,6 +32,7 @@ const BUILT_IN = [
   'self-mod',
   'time',
   'schedule-stats',
+  'calendar-facts',
 ];
 
 // A key a module adds for one product agent: never part of `all`.
@@ -96,7 +97,17 @@ describe('what a list grants on the host', () => {
   const all = new Set(resolveCapabilities('all', 'g'));
 
   it('brings only the instructions of held keys', () => {
-    for (const doc of ['agents', 'cli', 'core', 'interactive', 'schedule-stats', 'scheduling', 'self-mod', 'time']) {
+    for (const doc of [
+      'agents',
+      'calendar-facts',
+      'cli',
+      'core',
+      'interactive',
+      'schedule-stats',
+      'scheduling',
+      'self-mod',
+      'time',
+    ]) {
       expect(grantsInstructions(doc, all)).toBe(true);
     }
     expect(

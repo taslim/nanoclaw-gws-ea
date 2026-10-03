@@ -492,6 +492,7 @@ describe('composeGroupProjectDoc capabilities', () => {
     expect(headings(await compose(ag))).toEqual([
       '# NanoClaw Runtime Contract',
       '# NanoClaw Module: agents',
+      '# NanoClaw Module: calendar-facts',
       '# NanoClaw Module: cli',
       '# NanoClaw Module: core',
       '# NanoClaw Module: interactive',

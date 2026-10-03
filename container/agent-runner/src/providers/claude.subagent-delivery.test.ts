@@ -34,6 +34,7 @@ const ALL = [
   'self-mod',
   'time',
   'schedule-stats',
+  'calendar-facts',
 ];
 let grants: ReadonlySet<string> = new Set(ALL);
 const actualConfig = await import('../config.js');

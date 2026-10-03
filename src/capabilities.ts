@@ -110,6 +110,11 @@ registerCapability('schedule-stats', {
   default: 'on',
   instructions: ['schedule-stats'],
 });
+registerCapability('calendar-facts', {
+  description: 'find_conflicts, people_stats',
+  default: 'on',
+  instructions: ['calendar-facts'],
+});
 
 // Durable bad state (a stale key in the DB) would otherwise log on every
 // spawn; warn once per distinct problem per host process instead.

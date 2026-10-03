@@ -19,6 +19,7 @@ await loadToolModule('agents', () => import('./agents.js'));
 await loadToolModule('self-mod', () => import('./self-mod.js'));
 await loadToolModule('time', () => import('./time.js'));
 await loadToolModule('schedule-stats', () => import('./schedule-stats.js'));
+await loadToolModule('calendar-facts', () => import('./calendar-facts.js'));
 // Module barrel — loads registration modules, including the singular mailbox
 // slot. A module registering tools passes its own capability key.
 await import('../modules/index.js');

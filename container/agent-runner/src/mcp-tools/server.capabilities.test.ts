@@ -29,6 +29,7 @@ const ALL = [
   'self-mod',
   'time',
   'schedule-stats',
+  'calendar-facts',
 ];
 
 /** What NanoClaw's server served before capabilities existed. */
@@ -38,7 +39,9 @@ const TODAY = [
   'ask_user_question',
   'create_agent',
   'edit_message',
+  'find_conflicts',
   'install_packages',
+  'people_stats',
   'schedule_stats',
   'send_card',
   'send_file',

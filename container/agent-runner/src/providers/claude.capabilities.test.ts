@@ -71,6 +71,7 @@ const ALL = [
   'self-mod',
   'time',
   'schedule-stats',
+  'calendar-facts',
 ];
 
 const CONFIGURED_SERVERS = {
