@@ -160,31 +160,44 @@ async function overRateLimit(sender: string, at: Date): Promise<boolean> {
 /**
  * Take a message into its thread's record: its Message-IDs, and its people,
  * which replace the thread's whoever sent it, as a person reads a thread.
- * Safe to repeat.
+ * Only a message Gmail verified vouches for the people on it. Safe to repeat.
  */
-async function recordInThread(thread: InboxThread, mail: ParsedMail, context: RoutingContext): Promise<InboxThread> {
+async function recordInThread(
+  thread: InboxThread,
+  mail: ParsedMail,
+  verified: boolean,
+  context: RoutingContext,
+): Promise<InboxThread> {
   const people = peopleOnMessage(mail, context.assistant);
+  const vouched = verified ? uniqueAddresses([...thread.vouched, ...everyone(people)]) : thread.vouched;
   const claimGmailThread = thread.gmailThreadId === null && (await findThreadByGmailId(mail.threadId)) === undefined;
   const at = iso(context.at);
-  await updateThread(thread.threadKey, { people, ...(claimGmailThread ? { gmailThreadId: mail.threadId } : {}) }, at);
+  await updateThread(
+    thread.threadKey,
+    { people, vouched, ...(claimGmailThread ? { gmailThreadId: mail.threadId } : {}) },
+    at,
+  );
   await addThreadMessageIds(thread.threadKey, messageIdsOf(mail), at);
-  return { ...thread, people, gmailThreadId: claimGmailThread ? mail.threadId : thread.gmailThreadId };
+  return { ...thread, people, vouched, gmailThreadId: claimGmailThread ? mail.threadId : thread.gmailThreadId };
 }
 
 /**
- * Open a thread held for `main`, started by `mail`, its people those on it.
- * An inbound thread holds `mail` itself, for the session `main` hands it to;
- * a copy-in's first message is the principal's, which `main` reads in its
- * note. `ended` is the finished thread the message arrived in, if any.
+ * Open a thread held for `main`, started by `mail`, its people those on it,
+ * vouched for when Gmail verified `mail`. An inbound thread holds `mail`
+ * itself, for the session `main` hands it to; a copy-in's first message is
+ * the principal's, which `main` reads in its note. `ended` is the finished
+ * thread the message arrived in, if any.
  */
 async function openHeldThread(
   origin: HeldOrigin,
   mail: ParsedMail,
   ended: InboxThread | undefined,
   sender: string | undefined,
+  verified: boolean,
   context: RoutingContext,
 ): Promise<string> {
   const threadKey = heldThreadKey(origin, mail.id);
+  const people = peopleOnMessage(mail, context.assistant);
   const at = iso(context.at);
   await getDb().transaction(async () => {
     if (ended?.gmailThreadId === mail.threadId) {
@@ -198,7 +211,8 @@ async function openHeldThread(
         state: 'awaiting-arrange',
         gmailThreadId: mail.threadId,
         subject: mail.subject,
-        people: peopleOnMessage(mail, context.assistant),
+        people,
+        vouched: verified ? everyone(people) : [],
       },
       at,
     );
@@ -576,7 +590,7 @@ async function routePrincipal(
   }
   const thread = await findThread(mail);
   if (thread && thread.state !== 'closed') {
-    const recorded = await recordInThread(thread, mail, context);
+    const recorded = await recordInThread(thread, mail, true, context);
     if (recorded.state === 'awaiting-arrange') {
       // main is still deciding, so it reads their words now; the note goes first, as in routeOther.
       await writeMainNote(principalHeldNote(mail, verdict.address, recorded.threadKey), at);
@@ -584,7 +598,7 @@ async function routePrincipal(
     return toThreadOrHold(recorded, mail, verdict, runtime, context);
   }
   // The thread is the principal's to hand over, so main hears of it.
-  await openHeldThread('copy-in', mail, thread, undefined, context);
+  await openHeldThread('copy-in', mail, thread, undefined, true, context);
   await writeMainNote(copyInNote(mail, verdict.address, copyKey, others), at);
   return settled('copy-in');
 }
@@ -609,11 +623,18 @@ async function routeOther(
   const thread = await findThread(mail);
   if (!thread || thread.state === 'closed') {
     // Nothing is handling this conversation: main triages it.
-    const threadKey = await openHeldThread('inbound', mail, thread, verdict.address, context);
+    const threadKey = await openHeldThread(
+      'inbound',
+      mail,
+      thread,
+      verdict.address,
+      verdict.kind === 'authenticated',
+      context,
+    );
     await writeMainNote(inboundNote(mail, await heldMailFields(mail, verdict, threadKey, context), context), at);
     return settled('inbound');
   }
-  const recorded = await recordInThread(thread, mail, context);
+  const recorded = await recordInThread(thread, mail, verdict.kind === 'authenticated', context);
   if (recorded.state === 'awaiting-arrange') {
     // main is still deciding, so it hears of the email. The note goes first: if holding then fails and main
     // takes the thread over before the retry, the retry delivers the email instead of holding it, never both.

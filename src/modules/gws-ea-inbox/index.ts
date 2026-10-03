@@ -128,9 +128,9 @@ registerPersonForgetHook('gws-ea-inbox:purge', async ({ handles }) => {
     for (const row of await db.all<{ sender: string }>('SELECT DISTINCT sender FROM gws_ea_inbox_sender_counts')) {
       if (isForgotten(row.sender)) await db.run('DELETE FROM gws_ea_inbox_sender_counts WHERE sender = ?', row.sender);
     }
-    const columns = ['people_to', 'people_cc', 'people_bcc'] as const;
+    const columns = ['people_to', 'people_cc', 'people_bcc', 'vouched_people'] as const;
     for (const row of await db.all<Record<(typeof columns)[number] | 'thread_key', string>>(
-      'SELECT thread_key, people_to, people_cc, people_bcc FROM gws_ea_inbox_threads',
+      'SELECT thread_key, people_to, people_cc, people_bcc, vouched_people FROM gws_ea_inbox_threads',
     )) {
       for (const column of columns) {
         const addresses = JSON.parse(row[column]) as readonly string[];

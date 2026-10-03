@@ -48,7 +48,7 @@ import {
 import { GoogleApiError } from './gmail-api.js';
 import { parseGmailMessage } from './mime.js';
 import { noticeSetAside } from './notices.js';
-import { arranged, requireAddress, withAdded, type Placement } from './recipients.js';
+import { arranged, everyone, requireAddress, withAdded, type Placement } from './recipients.js';
 import { deliverToSession, loadRoutingContext } from './routing.js';
 import { activeInbox, assistantAddresses, EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from './runtime.js';
 
@@ -67,6 +67,8 @@ export interface ThreadView {
    * `main` added or `external-email` arranged them since.
    */
   readonly people: ThreadPeople;
+  /** Everyone the principal, a sender Gmail verified, or `main` put on the thread: only their records apply. */
+  readonly vouched: readonly string[];
   readonly sessionId: string | null;
 }
 
@@ -78,6 +80,7 @@ function view(thread: InboxThread): ThreadView {
     subject: thread.subject,
     gmailThreadId: thread.gmailThreadId,
     people: thread.people,
+    vouched: thread.vouched,
     sessionId: thread.sessionId,
   };
 }
@@ -177,6 +180,8 @@ export async function authorizeThread(input: AuthorizeThreadInput): Promise<Thre
   }
   const check = await checkOutbound(subject, await audienceForAddresses(counterparts));
   if (!check.allowed) throw new Error(`The subject was refused: ${check.reason}`);
+  const people = { to: counterparts, cc: input.copyPrincipal === true ? [await principalCopyAddress()] : [], bcc: [] };
+  // main named everyone on a thread it starts.
   await insertThread(
     {
       threadKey,
@@ -184,7 +189,8 @@ export async function authorizeThread(input: AuthorizeThreadInput): Promise<Thre
       state: 'authorized',
       gmailThreadId: null,
       subject,
-      people: { to: counterparts, cc: input.copyPrincipal === true ? [await principalCopyAddress()] : [], bcc: [] },
+      people,
+      vouched: everyone(people),
     },
     at,
   );
@@ -305,9 +311,12 @@ export async function addThreadPeople(
   placement: Placement,
 ): Promise<ThreadView> {
   const thread = await requireLiveThread(threadKey);
-  const people = withAdded(thread.people, addresses, placement, await assistantAddresses());
-  await updateThread(threadKey, { people }, new Date().toISOString());
-  return view({ ...thread, people });
+  const assistant = await assistantAddresses();
+  const people = withAdded(thread.people, addresses, placement, assistant);
+  // main named them, so their records apply.
+  const vouched = uniqueAddresses([...thread.vouched, ...addresses.map((value) => requireAddress(value, assistant))]);
+  await updateThread(threadKey, { people, vouched }, new Date().toISOString());
+  return view({ ...thread, people, vouched });
 }
 
 /**

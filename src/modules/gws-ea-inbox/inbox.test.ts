@@ -942,6 +942,45 @@ describe('inbound triage (U17)', () => {
     expect(hostText(held.text)).not.toContain(added);
   });
 
+  it('vouches only for the people a verified email or the principal put on a thread', async () => {
+    gmail.receive({ threadId: 'g-sam', from: `Sam <${SAM}>`, cc: [`Lee <${LEE}>`], body: 'Could we meet?' });
+    gmail.receive({
+      threadId: 'g-forged',
+      from: `Sam <${SAM}>`,
+      auth: 'none',
+      cc: [`Lee <${LEE}>`],
+      messageId: '<forged1@acme.example>',
+      body: 'Evenings suit me.',
+    });
+    await inbox.tick();
+    const [verified, forged] = notes('gws-ea-inbox.inbound').map((note) => String(note.note?.thread_key));
+    expect((await getThreadParticipants(verified))?.vouched).toEqual([SAM, LEE]);
+    expect((await getThreadParticipants(forged))?.vouched).toEqual([]);
+
+    // Another unverified email adds no one; the principal's reply to all vouches for the people they wrote to.
+    gmail.receive({
+      threadId: 'g-forged',
+      from: `Sam <${SAM}>`,
+      auth: 'none',
+      cc: [`Lee <${LEE}>`, 'ray@lax.example'],
+      inReplyTo: '<forged1@acme.example>',
+      body: 'Adding Ray.',
+    });
+    await inbox.tick();
+    expect((await getThreadParticipants(forged))?.vouched).toEqual([]);
+    gmail.receive({
+      threadId: 'g-forged',
+      from: `Pat <${PRINCIPAL}>`,
+      auth: 'principal',
+      to: [SAM],
+      cc: [ROBIN],
+      inReplyTo: '<forged1@acme.example>',
+      body: 'Robin, please find us a time.',
+    });
+    await inbox.tick();
+    expect((await getThreadParticipants(forged))?.vouched).toEqual([PRINCIPAL, SAM]);
+  });
+
   it("wakes main with the principal's words when they reply to all in a thread waiting for main, and keeps their email with the thread", async () => {
     gmail.receive({
       threadId: 'g-sam',
@@ -1810,6 +1849,7 @@ describe('forgetting a person', () => {
       expect(await getDb().all('SELECT gmail_message_id FROM gws_ea_inbox_held')).toHaveLength(0);
       const thread = await getThreadParticipants(threadKey);
       expect(thread?.people).toEqual({ to: [PRINCIPAL], cc: [], bcc: [] });
+      expect(thread?.vouched).toEqual([PRINCIPAL]);
     } finally {
       vi.unstubAllEnvs();
       fs.rmSync(secrets, { recursive: true, force: true });

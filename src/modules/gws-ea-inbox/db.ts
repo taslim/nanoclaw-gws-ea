@@ -28,6 +28,12 @@ export interface InboxThread {
   readonly subject: string;
   /** Its people: those on its latest message, as `main` added or `external-email` arranged them since. */
   readonly people: ThreadPeople;
+  /**
+   * Everyone the principal, a sender Gmail verified, or `main` put on the
+   * thread, whether or not they are on it now. Only for these does a record's
+   * level and name apply: an unverified email can name anyone (R21).
+   */
+  readonly vouched: readonly string[];
   readonly sessionId: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
@@ -42,6 +48,7 @@ interface ThreadRow {
   people_to: string;
   people_cc: string;
   people_bcc: string;
+  vouched_people: string;
   session_id: string | null;
   created_at: string;
   updated_at: string;
@@ -64,6 +71,7 @@ function toThread(row: ThreadRow): InboxThread {
     gmailThreadId: row.gmail_thread_id,
     subject: row.subject,
     people: { to: stringList(row.people_to), cc: stringList(row.people_cc), bcc: stringList(row.people_bcc) },
+    vouched: stringList(row.vouched_people),
     sessionId: row.session_id,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -215,14 +223,15 @@ export interface NewThread {
   readonly gmailThreadId: string | null;
   readonly subject: string;
   readonly people: ThreadPeople;
+  readonly vouched: readonly string[];
 }
 
 export async function insertThread(thread: NewThread, at: string): Promise<void> {
   await getDb().run(
     `INSERT INTO gws_ea_inbox_threads (
        thread_key, origin, state, gmail_thread_id, subject, people_to, people_cc, people_bcc,
-       session_id, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+       vouched_people, session_id, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
     thread.threadKey,
     thread.origin,
     thread.state,
@@ -231,6 +240,7 @@ export async function insertThread(thread: NewThread, at: string): Promise<void>
     JSON.stringify(thread.people.to),
     JSON.stringify(thread.people.cc),
     JSON.stringify(thread.people.bcc),
+    JSON.stringify(thread.vouched),
     at,
     at,
   );
@@ -240,6 +250,7 @@ export interface ThreadUpdate {
   readonly state?: ThreadState;
   readonly gmailThreadId?: string | null;
   readonly people?: ThreadPeople;
+  readonly vouched?: readonly string[];
   readonly sessionId?: string;
 }
 
@@ -254,6 +265,7 @@ export async function updateThread(threadKey: string, update: ThreadUpdate, at: 
           people_cc: JSON.stringify(update.people.cc),
           people_bcc: JSON.stringify(update.people.bcc),
         }),
+    ...(update.vouched === undefined ? {} : { vouched_people: JSON.stringify(update.vouched) }),
     ...(update.sessionId === undefined ? {} : { session_id: update.sessionId }),
   };
   const assignments = ['updated_at = @updated_at', ...Object.keys(columns).map((column) => `${column} = @${column}`)];

@@ -489,13 +489,29 @@ function everyoneOn(people: ThreadPeople): string[] {
   return [...new Set([...people.to, ...people.cc, ...people.bcc])];
 }
 
-/** The people on a thread besides the principal and the assistant, as counterparts. */
+/**
+ * The people on a thread besides the principal and the assistant, as
+ * counterparts. A record's level and name apply only to someone the
+ * principal, a sender Gmail verified, or main put on the thread: an
+ * unverified email can name anyone, so anyone else is judged as unknown (R21).
+ */
 async function threadCounterparts(thread: ThreadView, book: AddressBook): Promise<MeetingCounterpart[]> {
+  const vouched = new Set(thread.vouched);
   return Promise.all(
     everyoneOn(thread.people)
       .filter((address) => !book.principal.has(address) && !book.assistant.has(address))
-      .map((address) => counterpartForAddress(address)),
+      .map(
+        async (address): Promise<MeetingCounterpart> =>
+          vouched.has(address)
+            ? counterpartForAddress(address)
+            : { address, person_id: null, name: null, level: 'unknown' },
+      ),
   );
+}
+
+/** A thread's counterparts with the people main named: main's naming of someone wins, then anyone new. */
+function withNamed(thread: readonly MeetingCounterpart[], named: readonly MeetingCounterpart[]): MeetingCounterpart[] {
+  return distinct([...thread.map((c) => named.find((n) => n.address === c.address) ?? c), ...named]);
 }
 
 /** A thread waiting for `main`, with no meeting in progress, that `arrange` or `respond` may take over. */
@@ -1125,7 +1141,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         );
       }
       // The thread's own people, from its mail, and anyone main adds.
-      counterparts = distinct([...(await threadCounterparts(await requireHeldThread(threadKey), book)), ...named]);
+      counterparts = withNamed(await threadCounterparts(await requireHeldThread(threadKey), book), named);
       if (counterparts.length === 0) throw refused('Nobody but the principal is on that thread');
       opening = { kind: 'held' };
     } else {

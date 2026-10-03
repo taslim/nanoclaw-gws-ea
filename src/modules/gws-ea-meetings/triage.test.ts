@@ -236,6 +236,43 @@ describe('AE10: Sam, who has a record, emails the assistant for time', () => {
     });
   });
 
+  it('takes no record’s level or name for a sender Gmail could not verify, unless main names them', async () => {
+    const forged = await emailed({
+      threadId: 'g-forged',
+      from: `Sam Kay <${ADDRESSES.sam}>`,
+      unverified: true,
+      to: [ROBIN],
+      subject: 'Catch up?',
+      body: 'Evenings suit me best.',
+    });
+    const answer = data(await ask(scheduling.main, 'meeting_arrange', arrangeOn(forged.threadKey)));
+    const stored = await meeting(answer.meeting_id);
+    expect(stored.counterparts).toEqual([{ address: ADDRESSES.sam, person_id: null, name: null, level: 'unknown' }]);
+    expect(stored.level).toBe('unknown');
+
+    // main naming Sam vouches for him, so his record applies.
+    const named = await emailed({
+      threadId: 'g-forged-again',
+      from: `Sam Kay <${ADDRESSES.sam}>`,
+      unverified: true,
+      to: [ROBIN],
+      subject: 'Catch up again?',
+      body: 'Any time works.',
+    });
+    const vouched = data(
+      await ask(
+        scheduling.main,
+        'meeting_arrange',
+        arrangeOn(named.threadKey, { people: [{ person_id: scheduling.people.sam.id }] }),
+      ),
+    );
+    const withRecord = await meeting(vouched.meeting_id);
+    expect(withRecord.counterparts).toEqual([
+      { address: ADDRESSES.sam, person_id: scheduling.people.sam.id, name: 'Sam Kay', level: 'active' },
+    ]);
+    expect(withRecord.level).toBe('active');
+  });
+
   it('refuses a thread key that is not a thread waiting for main, naming no copy-in key', async () => {
     const message = refusal(await ask(scheduling.main, 'meeting_arrange', arrangeOn('not-a-key')));
     expect(message).not.toContain('mail-copy');

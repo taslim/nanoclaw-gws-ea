@@ -62,6 +62,7 @@ export const gwsEaInboxMigration: ModuleMigration = {
         people_to              TEXT NOT NULL,
         people_cc              TEXT NOT NULL,
         people_bcc             TEXT NOT NULL,
+        vouched_people         TEXT NOT NULL,
         session_id             TEXT,
         created_at             TEXT NOT NULL,
         updated_at             TEXT NOT NULL
