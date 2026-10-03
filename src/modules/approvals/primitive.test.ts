@@ -18,7 +18,12 @@ import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { createSession, getPendingApprovalsByAction } from '../../db/sessions.js';
-import { setDeliveryAdapter, type ChannelDeliveryAdapter } from '../../delivery.js';
+import {
+  registerOutboundGuard,
+  setDeliveryAdapter,
+  type ChannelDeliveryAdapter,
+  type OutboundSend,
+} from '../../delivery.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { upsertUser } from '../permissions/db/users.js';
@@ -152,5 +157,68 @@ describe('requestApproval delivery failure', () => {
 
     expect(await getPendingApprovalsByAction('test_action')).toHaveLength(1);
     expect(vi.mocked(writeSessionMessage)).not.toHaveBeenCalled();
+  });
+});
+
+describe('requestApproval and the outbound guard', () => {
+  /** Guards cannot be unregistered, so this one refuses only while a test asks it to. */
+  let refuse = false;
+  const judged: OutboundSend[] = [];
+  registerOutboundGuard('test:approval-card', (send) => {
+    judged.push(send);
+    return refuse ? { effect: 'refuse', reason: 'not for this audience.' } : { effect: 'allow' };
+  });
+
+  beforeEach(() => {
+    refuse = false;
+    judged.length = 0;
+  });
+
+  it('passes the approval card through the guard before the channel sees it', async () => {
+    const sent: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        sent.push(content);
+        return 'pm-1';
+      },
+    });
+
+    await requestApproval({
+      session,
+      agentName: 'Agent',
+      action: 'test_action',
+      payload: { key: 'value' },
+      title: 'Test Approval',
+      question: 'Approve the thing?',
+    });
+
+    expect(judged.map(({ channelType, platformId, kind }) => ({ channelType, platformId, kind }))).toEqual([
+      { channelType: DM_CHANNEL, platformId: DM_PLATFORM, kind: 'chat-sdk' },
+    ]);
+    expect(sent).toEqual([judged[0]!.content]);
+  });
+
+  it('a refused card never reaches the channel, leaves no pending row, and the agent hears it was not delivered', async () => {
+    refuse = true;
+    const sent: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        sent.push(content);
+        return 'pm-1';
+      },
+    });
+
+    await requestApproval({
+      session,
+      agentName: 'Agent',
+      action: 'test_action',
+      payload: { key: 'value' },
+      title: 'Test Approval',
+      question: 'Approve the thing?',
+    });
+
+    expect(sent).toEqual([]);
+    expect(await getPendingApprovalsByAction('test_action')).toHaveLength(0);
+    expect(lastNotifyText()).toMatch(/test_action failed: could not deliver/);
   });
 });

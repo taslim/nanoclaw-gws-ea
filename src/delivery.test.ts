@@ -24,27 +24,34 @@ vi.mock('./config.js', async () => {
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-delivery', GROUPS_DIR: '/tmp/nanoclaw-test-delivery/groups' };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-delivery';
-const FAILURE_NOTICE = "Something went wrong on my side and I couldn't finish that. Please send it again.";
+// Recording pass-through: the real cross-session copy runs; the guard tests read whether it was asked to.
+vi.mock('./modules/cross-session-context/index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./modules/cross-session-context/index.js')>();
+  return { ...actual, fanOutboundMessage: vi.fn(actual.fanOutboundMessage) };
+});
 
-function isFailureNotice(content: string): boolean {
-  return (JSON.parse(content) as { text?: unknown }).text === FAILURE_NOTICE;
-}
+const TEST_DIR = '/tmp/nanoclaw-test-delivery';
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
-import { setMessagingGroupDetachedAt } from './db/messaging-groups.js';
 import { getDeliveredIds } from './mailbox/sqlite/session-db.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import { resolveSession, resolveTaskSession, withMailboxSession } from './session-manager.js';
 import {
   deliverSessionMessages,
+  getDeliveryAdapter,
+  OutboundRefusedError,
   registerDeliveryAction,
   registerDeliveryBatchPreview,
+  registerDeliveryFailedHook,
+  registerOutboundGuard,
   registerPostDeliveryHook,
-  sendFailureNotice,
   setDeliveryAdapter,
+  type OutboundGuardDecision,
+  type OutboundSend,
 } from './delivery.js';
 import { unguarded } from './guard/index.js';
+import { wakeContainer } from './container-runner.js';
+import { fanOutboundMessage } from './modules/cross-session-context/index.js';
 import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
 import { createDestination } from './modules/agent-to-agent/db/agent-destinations.js';
 import { getAgentMailbox } from './mailbox/index.js';
@@ -239,11 +246,9 @@ describe('deliverSessionMessages — retry and permanent failure', () => {
     insertOutbound('ag-1', session.id, 'out-flaky');
 
     let callCount = 0;
-    let noticeAttempts = 0;
     setDeliveryAdapter({
-      async deliver(_ct, _pid, _tid, _kind, content) {
-        if (isFailureNotice(content)) noticeAttempts++;
-        else callCount++;
+      async deliver() {
+        callCount++;
         throw new Error('network timeout');
       },
     });
@@ -256,16 +261,13 @@ describe('deliverSessionMessages — retry and permanent failure', () => {
     await deliverSessionMessages(session);
     expect(callCount).toBe(2);
 
-    // Attempt 3 — should mark as permanently failed, and try once to say so
+    // Attempt 3 — should mark as permanently failed
     await deliverSessionMessages(session);
     expect(callCount).toBe(3);
-    expect(noticeAttempts).toBe(1);
 
-    // Attempt 4 — message is now in delivered (as failed), adapter not called;
-    // the undeliverable notice is not retried either.
+    // Attempt 4 — message is now in delivered (as failed), adapter not called
     await deliverSessionMessages(session);
     expect(callCount).toBe(3);
-    expect(noticeAttempts).toBe(1);
 
     // Verify the message is in the delivered table with 'failed' status
     const delivered = await withMailboxSession('ag-1', session.id, (mailbox) => mailbox.getDeliveredIds());
@@ -445,10 +447,8 @@ describe('deliverSessionMessages — permission check', () => {
     await deliverSessionMessages(session);
     await deliverSessionMessages(session);
 
-    // The unauthorized message never reached the adapter — the permission
-    // check throws before it. The principal hears about it in their own chat.
-    expect(calls).toHaveLength(1);
-    expect(isFailureNotice(calls[0]!)).toBe(true);
+    // Adapter never called — permission check throws before reaching it
+    expect(calls).toHaveLength(0);
 
     // Message is marked as permanently failed
     const delivered = await withMailboxSession('ag-1', session.id, (mailbox) => mailbox.getDeliveredIds());
@@ -756,157 +756,286 @@ describe('deliverSessionMessages — post-delivery hooks', () => {
   });
 });
 
-describe('deliverSessionMessages — permanent failure notice', () => {
-  function insertRow(
-    agentGroupId: string,
-    sessionId: string,
-    row: { id: string; kind: string; content: Record<string, unknown>; threadId?: string | null },
-  ): void {
-    const db = new Database(outboundDbPath(agentGroupId, sessionId));
-    db.prepare(
-      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, content)
-       VALUES (?, ?, ?, 'telegram:123', 'telegram', ?, ?)`,
-    ).run(row.id, now(), row.kind, row.threadId ?? null, JSON.stringify(row.content));
-    db.close();
-  }
+function insertRow(
+  agentGroupId: string,
+  sessionId: string,
+  row: { id: string; kind: string; content: Record<string, unknown>; threadId?: string | null },
+): void {
+  const db = new Database(outboundDbPath(agentGroupId, sessionId));
+  db.prepare(
+    `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, content)
+     VALUES (?, ?, ?, 'telegram:123', 'telegram', ?, ?)`,
+  ).run(row.id, now(), row.kind, row.threadId ?? null, JSON.stringify(row.content));
+  db.close();
+}
 
-  interface Call {
-    channelType: string;
-    platformId: string;
-    threadId: string | null;
-    kind: string;
+/** Status the host recorded for an outbound row, or undefined while it is still queued. */
+function deliveryStatus(agentGroupId: string, sessionId: string, messageId: string): string | undefined {
+  const db = new Database(inboundDbPath(agentGroupId, sessionId), { readonly: true });
+  const row = db.prepare('SELECT status FROM delivered WHERE message_out_id = ?').get(messageId) as
+    | { status: string }
+    | undefined;
+  db.close();
+  return row?.status;
+}
+
+/** What the host told the session's agent, as it reads it. */
+function agentNotes(agentGroupId: string, sessionId: string): unknown[] {
+  const db = openInboundDb(agentGroupId, sessionId);
+  const rows = db.prepare("SELECT content FROM messages_in WHERE channel_type = 'agent' ORDER BY seq").all() as Array<{
     content: string;
-    instance: string | undefined;
-  }
+  }>;
+  db.close();
+  return rows.map((row) => JSON.parse(row.content) as unknown);
+}
 
-  /** Every send fails except the failure notice, which the channel accepts. */
-  function rejectEverythingButTheNotice(): Call[] {
-    const calls: Call[] = [];
-    setDeliveryAdapter({
-      async deliver(channelType, platformId, threadId, kind, content, _files, instance) {
-        calls.push({ channelType, platformId, threadId, kind, content, instance });
-        if (isFailureNotice(content)) return 'notice-1';
-        throw new Error('message too long');
-      },
-    });
-    return calls;
-  }
-
-  async function drain(session: Parameters<typeof deliverSessionMessages>[0], times: number): Promise<void> {
-    for (let i = 0; i < times; i++) await deliverSessionMessages(session);
-  }
-
-  it('sends one plain sentence to the principal when user-facing messages fail permanently', async () => {
-    await seedAgentAndChannel();
-    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
-    insertRow('ag-1', session.id, { id: 'out-a', kind: 'chat', content: { text: 'A' }, threadId: 'thread-7' });
-    insertRow('ag-1', session.id, { id: 'out-b', kind: 'chat', content: { text: 'B' }, threadId: 'thread-7' });
-    const calls = rejectEverythingButTheNotice();
-
-    await drain(session, 4);
-
-    const notices = calls.filter((call) => isFailureNotice(call.content));
-    expect(notices).toEqual([
-      {
-        channelType: 'telegram',
-        platformId: 'telegram:123',
-        threadId: 'thread-7',
-        kind: 'chat',
-        content: JSON.stringify({ text: FAILURE_NOTICE }),
-        instance: 'telegram',
-      },
-    ]);
-    // Each failed message was still tried exactly MAX_DELIVERY_ATTEMPTS times.
-    expect(calls.filter((call) => !isFailureNotice(call.content))).toHaveLength(6);
-  });
-
-  it('keeps the provider error out of the channel', async () => {
-    await seedAgentAndChannel();
-    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
-    insertRow('ag-1', session.id, { id: 'out-a', kind: 'chat', content: { text: 'A' } });
-    const calls = rejectEverythingButTheNotice();
-
-    await drain(session, 3);
-
-    expect(calls.map((call) => call.content).join('\n')).not.toContain('message too long');
-  });
-
-  it('sends nothing for a system message that fails permanently', async () => {
+describe('deliverSessionMessages — delivery-failed hooks', () => {
+  it('hear once, after the pass, about every row it gave up on', async () => {
     await seedAgentAndChannel();
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     registerDeliveryAction(
-      'test_failure_notice_explodes',
+      'test_delivery_failed_hook_explodes',
       async () => {
         throw new Error('system action failed');
       },
       unguarded('test action'),
     );
+    insertRow('ag-1', session.id, { id: 'df-chat', kind: 'chat', content: { text: 'A' }, threadId: 'thread-7' });
     insertRow('ag-1', session.id, {
-      id: 'out-sys',
+      id: 'df-sys',
       kind: 'system',
-      content: { action: 'test_failure_notice_explodes' },
+      content: { action: 'test_delivery_failed_hook_explodes' },
     });
-    const calls = rejectEverythingButTheNotice();
-
-    await drain(session, 3);
-
-    expect(calls).toEqual([]);
-    const delivered = await withMailboxSession('ag-1', session.id, (mailbox) => mailbox.getDeliveredIds());
-    expect(delivered.has('out-sys')).toBe(true);
-  });
-
-  it('sends nothing when a reaction the agent placed cannot be delivered', async () => {
-    await seedAgentAndChannel();
-    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
-    insertRow('ag-1', session.id, {
-      id: 'out-reaction',
-      kind: 'chat',
-      content: { operation: 'reaction', messageId: 'plat-1', emoji: 'thumbs_up' },
+    const heard: Array<Array<{ id: string; kind: string; threadId: string | null }>> = [];
+    registerDeliveryFailedHook((failed, s) => {
+      if (s.id !== session.id) return;
+      heard.push(
+        failed.map(({ id, kind, threadId }) => ({ id, kind, threadId })).sort((a, b) => a.id.localeCompare(b.id)),
+      );
     });
-    const calls = rejectEverythingButTheNotice();
+    setDeliveryAdapter({
+      async deliver() {
+        throw new Error('network timeout');
+      },
+    });
 
-    await drain(session, 3);
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    expect(heard).toEqual([]);
 
-    expect(calls.filter((call) => isFailureNotice(call.content))).toEqual([]);
+    await deliverSessionMessages(session);
+    expect(heard).toEqual([
+      [
+        { id: 'df-chat', kind: 'chat', threadId: 'thread-7' },
+        { id: 'df-sys', kind: 'system', threadId: null },
+      ],
+    ]);
+
+    await deliverSessionMessages(session);
+    expect(heard).toHaveLength(1);
   });
 
-  it('sends nothing from a task session, which has no conversation to tell', async () => {
-    await seedAgentAndChannel();
-    const { session } = await resolveTaskSession('ag-1', 'daily-digest-a1b2');
-    insertRow('ag-1', session.id, { id: 'out-task', kind: 'chat', content: { text: 'digest' } });
-    const calls = rejectEverythingButTheNotice();
-
-    await drain(session, 3);
-
-    expect(calls.filter((call) => isFailureNotice(call.content))).toEqual([]);
-  });
-
-  it('sends nothing into a chat the bot was removed from', async () => {
-    await seedAgentAndChannel();
-    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
-    insertRow('ag-1', session.id, { id: 'out-a', kind: 'chat', content: { text: 'A' } });
-    await setMessagingGroupDetachedAt('mg-1', now());
-    const calls = rejectEverythingButTheNotice();
-
-    await drain(session, 3);
-
-    expect(calls).toEqual([]);
-  });
-
-  it('stays best effort when the chat cannot be looked up, so the caller carries on', async () => {
+  it('a throwing hook never breaks the recorded failure or the hooks after it', async () => {
     await seedAgentAndChannel();
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
-    const calls = rejectEverythingButTheNotice();
-    const logged = vi.spyOn(log, 'error').mockImplementation(() => undefined);
-    await closeDb();
+    insertOutbound('ag-1', session.id, 'df-throws');
+    registerDeliveryFailedHook((_failed, s) => {
+      if (s.id === session.id) throw new Error('hook exploded');
+    });
+    const after: string[] = [];
+    registerDeliveryFailedHook((failed, s) => {
+      if (s.id === session.id) after.push(...failed.map((m) => m.id));
+    });
+    setDeliveryAdapter({
+      async deliver() {
+        throw new Error('network timeout');
+      },
+    });
 
-    await expect(sendFailureNotice(session)).resolves.toBeUndefined();
+    for (let attempt = 0; attempt < 3; attempt++) await deliverSessionMessages(session);
 
-    expect(calls).toEqual([]);
-    expect(logged).toHaveBeenCalledWith(
-      'Failure notice could not be delivered',
-      expect.objectContaining({ sessionId: session.id }),
+    expect(deliveryStatus('ag-1', session.id, 'df-throws')).toBe('failed');
+    expect(after).toEqual(['df-throws']);
+  });
+});
+
+/**
+ * One guard serves the whole file: guards cannot be unregistered, so it is
+ * registered on first use and each test sets what it decides. Until a test
+ * arms it, no guard is registered at all.
+ */
+type GuardDecide = (send: OutboundSend) => OutboundGuardDecision | Promise<OutboundGuardDecision>;
+let guardDecides: GuardDecide | null = null;
+let guardRegistered = false;
+
+function armGuard(decide: GuardDecide): void {
+  guardDecides = decide;
+  if (guardRegistered) return;
+  guardRegistered = true;
+  registerOutboundGuard('test:delivery', (send) => (guardDecides ? guardDecides(send) : { effect: 'allow' }));
+}
+
+describe('outbound guard at the adapter boundary', () => {
+  afterEach(() => {
+    guardDecides = null;
+  });
+
+  function recordSends(): OutboundSend[] {
+    const sent: OutboundSend[] = [];
+    setDeliveryAdapter({
+      async deliver(channelType, platformId, threadId, kind, content, files, instance) {
+        sent.push({ channelType, platformId, threadId, instance, kind, content, files });
+        return 'pm-1';
+      },
+    });
+    return sent;
+  }
+
+  it('without a guard, the adapter receives each send untouched', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'ng-1');
+    const sent = recordSends();
+
+    await deliverSessionMessages(session);
+
+    expect(sent).toEqual([
+      {
+        channelType: 'telegram',
+        platformId: 'telegram:123',
+        threadId: null,
+        instance: 'telegram',
+        kind: 'chat',
+        content: JSON.stringify({ text: 'hello' }),
+        files: undefined,
+      },
+    ]);
+    expect(deliveryStatus('ag-1', session.id, 'ng-1')).toBe('delivered');
+  });
+
+  it('shows the guard the send as the adapter would receive it, and an allowed send goes out', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertRow('ag-1', session.id, { id: 'ok-1', kind: 'chat', content: { text: 'see you at 3' }, threadId: 't-1' });
+    const sent = recordSends();
+    const seen: OutboundSend[] = [];
+    armGuard((send) => {
+      seen.push(send);
+      return { effect: 'allow' };
+    });
+    vi.mocked(fanOutboundMessage).mockClear();
+
+    await deliverSessionMessages(session);
+
+    expect(seen).toEqual([
+      {
+        channelType: 'telegram',
+        platformId: 'telegram:123',
+        threadId: 't-1',
+        instance: 'telegram',
+        kind: 'chat',
+        content: JSON.stringify({ text: 'see you at 3' }),
+        files: undefined,
+      },
+    ]);
+    expect(sent).toEqual(seen);
+    expect(deliveryStatus('ag-1', session.id, 'ok-1')).toBe('delivered');
+    expect(fanOutboundMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('a refused send is closed unsent: no copy, no hook, no retry, and the sending agent is told why', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertRow('ag-1', session.id, { id: 'rf-1', kind: 'chat', content: { text: 'I live at 1 Main St' } });
+    insertRow('ag-1', session.id, { id: 'rf-2', kind: 'chat', content: { text: 'Tuesday works' } });
+    const sent = recordSends();
+    const consulted: string[] = [];
+    armGuard((send) => {
+      consulted.push(send.content);
+      return send.content.includes('Main St')
+        ? { effect: 'refuse', reason: 'it names a private address.' }
+        : { effect: 'allow' };
+    });
+    const delivered: string[] = [];
+    registerPostDeliveryHook((msg, s) => {
+      if (s.id === session.id) delivered.push(msg.id);
+    });
+    const failed: string[] = [];
+    registerDeliveryFailedHook((rows, s) => {
+      if (s.id === session.id) failed.push(...rows.map((row) => row.id));
+    });
+    vi.mocked(fanOutboundMessage).mockClear();
+    vi.mocked(wakeContainer).mockClear();
+
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+
+    // Only the allowed reply reached the channel, and the refused one was judged once.
+    expect(sent.map((send) => send.content)).toEqual([JSON.stringify({ text: 'Tuesday works' })]);
+    expect(consulted.filter((content) => content.includes('Main St'))).toHaveLength(1);
+    expect(deliveryStatus('ag-1', session.id, 'rf-1')).toBe('failed');
+    expect(deliveryStatus('ag-1', session.id, 'rf-2')).toBe('delivered');
+    // Copied to sibling sessions and hooked only for what was sent.
+    expect(vi.mocked(fanOutboundMessage).mock.calls.map(([msg]) => msg.id)).toEqual(['rf-2']);
+    expect(delivered).toEqual(['rf-2']);
+    expect(failed).toEqual([]);
+    expect(agentNotes('ag-1', session.id)).toEqual([
+      { text: 'Your message was not sent: it names a private address.', sender: 'system', senderId: 'system' },
+    ]);
+    expect(wakeContainer).toHaveBeenCalledWith(expect.objectContaining({ id: session.id }));
+  });
+
+  it('a throwing guard fails closed: nothing is sent, the error is logged, and the row takes the retry path', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'th-guard');
+    const sent = recordSends();
+    armGuard(() => {
+      throw new Error('guard store unavailable');
+    });
+    const errors = vi.spyOn(log, 'error').mockImplementation(() => undefined);
+
+    try {
+      await deliverSessionMessages(session);
+      expect(deliveryStatus('ag-1', session.id, 'th-guard')).toBeUndefined();
+      await deliverSessionMessages(session);
+      await deliverSessionMessages(session);
+
+      expect(sent).toEqual([]);
+      expect(deliveryStatus('ag-1', session.id, 'th-guard')).toBe('failed');
+      expect(errors).toHaveBeenCalledWith(
+        'Outbound guard threw — the send fails closed',
+        expect.objectContaining({ guardId: 'test:delivery' }),
+      );
+      expect(agentNotes('ag-1', session.id)).toEqual([]);
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it('a host send through getDeliveryAdapter() passes the guard too', async () => {
+    const sent = recordSends();
+    armGuard(() => ({ effect: 'refuse', reason: 'not for this audience.' }));
+
+    const refused = getDeliveryAdapter()!.deliver(
+      'telegram',
+      'telegram:123',
+      null,
+      'chat-sdk',
+      JSON.stringify({ type: 'ask_question', questionId: 'q-1', title: 'Approve?' }),
     );
-    await runMigrations(await initTestDb());
+
+    await expect(refused).rejects.toBeInstanceOf(OutboundRefusedError);
+    await expect(refused).rejects.toMatchObject({ guardId: 'test:delivery', reason: 'not for this audience.' });
+    expect(sent).toEqual([]);
+  });
+
+  it('rejects a guard ID outside the module:name form and a second guard under one ID', () => {
+    const allow = (): OutboundGuardDecision => ({ effect: 'allow' });
+    expect(() => registerOutboundGuard('no-namespace', allow)).toThrow('Invalid outbound guard ID: no-namespace');
+    registerOutboundGuard('test:duplicate', allow);
+    expect(() => registerOutboundGuard('test:duplicate', allow)).toThrow(
+      'Outbound guard already registered: test:duplicate',
+    );
   });
 });

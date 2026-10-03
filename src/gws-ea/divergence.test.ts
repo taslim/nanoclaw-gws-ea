@@ -374,8 +374,6 @@ async function freePort(): Promise<number> {
   return port;
 }
 
-const FAILURE_NOTICE = "Something went wrong on my side and I couldn't finish that. Please send it again.";
-
 describe('recorded divergence: Google Chat gives the agent the message a principal quotes', () => {
   it('hands the registered bridge a reply-context hook that reads the quoted snapshot', async () => {
     await freshInstall();
@@ -446,59 +444,45 @@ describe('recorded divergence: a Google Chat message keeps its attachments', () 
   });
 });
 
-describe('recorded divergence: a failure reaches the principal as one plain sentence', () => {
-  it('tells the chat a failed message came from, and no one for a message from the host', async () => {
-    const directory = await freshInstall();
-    const db = await import('../db/index.js');
-    await db.runMigrations(await db.initTestDb());
-    cleanups.push(() => db.closeDb());
-    await db.createAgentGroup({
-      id: 'ag-1',
-      name: 'Main',
-      folder: 'main',
-      agent_provider: null,
-      created_at: new Date().toISOString(),
-    });
-    await db.createMessagingGroup({
-      id: 'mg-1',
-      channel_type: 'gchat',
-      platform_id: 'gchat:spaces/dm',
-      name: 'Principal',
-      is_group: 0,
-      unknown_sender_policy: 'public',
-      created_at: new Date().toISOString(),
-    });
-    await mkdir(path.join(directory, 'groups'), { recursive: true });
-    await import('../mailbox/compose.js');
-    const { resolveSession } = await import('../session-manager.js');
-    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+describe('recorded divergence: delivery consults outbound guards and reports failures to hooks', () => {
+  it('refuses a send that a registered outbound guard refuses, before the channel adapter sees it', async () => {
+    await freshInstall();
     const delivery = await import('../delivery.js');
-    const sent: Array<{ threadId: string | null; content: string }> = [];
-    delivery.setDeliveryAdapter({
-      async deliver(_channelType, _platformId, threadId, _kind, content) {
-        sent.push({ threadId, content });
-        return 'spaces/dm/messages/notice';
+    const sent: string[] = [];
+    delivery.registerOutboundGuard('divergence:refuse', () => ({
+      effect: 'refuse',
+      reason: 'it names a private value',
+    }));
+    const guarded = delivery.setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        sent.push(content);
+        return 'sent';
       },
     });
 
-    await delivery.sendFailureNotice(
-      session,
-      { channelType: 'agent', platformId: 'ag-1', threadId: null },
-      { onlyToThatChat: true },
-    );
-    await delivery.sendFailureNotice(
-      session,
-      { channelType: 'gchat', platformId: 'gchat:spaces/dm', threadId: 'spaces/dm/threads/t1' },
-      { onlyToThatChat: true },
-    );
-
-    expect(sent).toEqual([{ threadId: 'spaces/dm/threads/t1', content: JSON.stringify({ text: FAILURE_NOTICE }) }]);
+    await expect(
+      guarded.deliver('gchat', 'gchat:spaces/dm', null, 'chat', JSON.stringify({ text: 'x' })),
+    ).rejects.toBeInstanceOf(delivery.OutboundRefusedError);
+    expect(sent).toEqual([]);
   });
 
-  it('keeps the agent runner’s failed-turn sentence and its time and schedule tools', async () => {
+  it('lets modules hear failed deliveries and given-up inbound messages, with no notice written by core', async () => {
+    await freshInstall();
+    const delivery = await import('../delivery.js');
+    const reconcile = await import('../reconcile-session.js');
+    const source = await readFile(path.join(originalCwd, 'src/delivery.ts'), 'utf8');
+
+    expect(typeof delivery.registerDeliveryFailedHook).toBe('function');
+    expect(typeof reconcile.registerInboundFailedHook).toBe('function');
+    expect(source).not.toContain('Something went wrong');
+  });
+
+  it("reports a failed turn from the agent runner as a typed action, and keeps the runner's time and schedule tools", async () => {
     const pollLoop = await readFile(path.join(originalCwd, 'container/agent-runner/src/poll-loop.ts'), 'utf8');
     const tools = await readFile(path.join(originalCwd, 'container/agent-runner/src/mcp-tools/index.ts'), 'utf8');
-    expect(pollLoop).toContain(JSON.stringify(FAILURE_NOTICE));
+
+    expect(pollLoop).toContain("action: 'turn_failed'");
+    expect(pollLoop).not.toContain('Something went wrong');
     expect(tools).toContain("import './time.js';");
     expect(tools).toContain("import './schedule-stats.js';");
   });

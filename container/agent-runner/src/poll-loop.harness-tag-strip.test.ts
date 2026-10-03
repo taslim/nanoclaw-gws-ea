@@ -38,6 +38,9 @@ function makeResultQuery(result: ProviderEvent): { query: AgentQuery; pushes: st
   };
 }
 
+/** The failed turn as the runner reports it to the host: a typed action carrying the turn's route. */
+const TURN_FAILED = { action: 'turn_failed', channelType: 'discord', platformId: 'chan-1', threadId: null };
+
 const ROUTING = {
   platformId: 'chan-1',
   channelType: 'discord',
@@ -116,7 +119,7 @@ describe('harness tag artifacts stripped from deliveries (wiring)', () => {
     expect(pushes).toHaveLength(0);
   });
 
-  it('replaces bare error-result text and artifacts with a safe notice', async () => {
+  it('reports a bare error result to the host as a failed turn, with none of its text or artifacts', async () => {
     const { query, pushes } = makeResultQuery({
       type: 'result',
       text: 'Raw provider diagnostic: transport terminated.\n<dispatch>',
@@ -126,10 +129,7 @@ describe('harness tag artifacts stripped from deliveries (wiring)', () => {
     await processQuery(query, ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
 
     const out = getUndeliveredMessages();
-    expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0].content).text).toBe(
-      "Something went wrong on my side and I couldn't finish that. Please send it again.",
-    );
+    expect(out.map((row) => [row.kind, JSON.parse(row.content)])).toEqual([['system', TURN_FAILED]]);
     // No re-wrap nudge — an error result must not re-hammer the gateway.
     expect(pushes).toHaveLength(0);
   });
@@ -146,10 +146,7 @@ it('keeps the dedicated provider error field and private result text out of the 
   await processQuery(query, ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
 
   const out = getUndeliveredMessages();
-  expect(out).toHaveLength(1);
-  expect(JSON.parse(out[0].content).text).toBe(
-    "Something went wrong on my side and I couldn't finish that. Please send it again.",
-  );
+  expect(out.map((row) => [row.kind, JSON.parse(row.content)])).toEqual([['system', TURN_FAILED]]);
   expect(out[0].content).not.toContain('Please try again later.');
   expect(out[0].content).not.toContain('Private raw transport diagnostic');
   expect(pushes).toHaveLength(0);

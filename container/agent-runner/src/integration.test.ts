@@ -458,8 +458,11 @@ describe('poll loop — exchange hook (onExchangeComplete)', () => {
   });
 });
 
+/** The failed turn as the runner reports it to the host: a typed action carrying the turn's route. */
+const TURN_FAILED = { action: 'turn_failed', channelType: 'discord', platformId: 'chan-1', threadId: null };
+
 describe('poll loop — provider error recovery', () => {
-  it('writes a safe error notice to outbound and continues loop on provider throw', async () => {
+  it('reports the failed turn to the host and continues the loop on provider throw', async () => {
     insertMessage('m1', { sender: 'Alice', text: 'trigger error' }, { platformId: 'chan-1', channelType: 'discord' });
 
     const provider = new ThrowingProvider('API rate limit exceeded');
@@ -470,10 +473,7 @@ describe('poll loop — provider error recovery', () => {
     controller.abort();
 
     const out = getUndeliveredMessages();
-    expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0].content).text).toBe(
-      "Something went wrong on my side and I couldn't finish that. Please send it again.",
-    );
+    expect(out.map((row) => [row.kind, JSON.parse(row.content)])).toEqual([['system', TURN_FAILED]]);
     expect(out[0].content).not.toContain('API rate limit exceeded');
 
     // Input message should be marked completed despite the error
@@ -499,12 +499,9 @@ describe('poll loop — stale session recovery', () => {
     await waitFor(() => getUndeliveredMessages().length > 0, 2000);
     controller.abort();
 
-    // A safe notice reaches the user; the provider diagnostic stays private.
+    // The host hears the turn failed; the provider diagnostic stays private.
     const out = getUndeliveredMessages();
-    expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0].content).text).toBe(
-      "Something went wrong on my side and I couldn't finish that. Please send it again.",
-    );
+    expect(out.map((row) => [row.kind, JSON.parse(row.content)])).toEqual([['system', TURN_FAILED]]);
     expect(out[0].content).not.toContain('session not found');
 
     // Continuation was cleared (isSessionInvalid returned true)

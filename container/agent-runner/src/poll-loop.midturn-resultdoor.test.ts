@@ -69,6 +69,16 @@ function deliveredTexts(): string[] {
     .map((m) => (JSON.parse(m.content) as { text: string }).text);
 }
 
+/** The failed turn as the runner reports it to the host: a typed action carrying the turn's route. */
+const TURN_FAILED = { action: 'turn_failed', channelType: 'discord', platformId: 'chan-1', threadId: null };
+
+/** Failed turns the runner reported to the host, in order. */
+function turnFailures(): unknown[] {
+  return getUndeliveredMessages()
+    .filter((m) => m.kind === 'system')
+    .map((m) => JSON.parse(m.content) as unknown);
+}
+
 function nudges(pushes: string[]): string[] {
   return pushes.filter((p) => p.includes('was not delivered'));
 }
@@ -231,9 +241,8 @@ describe('error and interrupted turns', () => {
       true,
     );
 
-    expect(deliveredTexts()).toEqual([
-      "Something went wrong on my side and I couldn't finish that. Please send it again.",
-    ]);
+    expect(deliveredTexts()).toEqual([]);
+    expect(turnFailures()).toEqual([TURN_FAILED]);
     expect(pushes).toHaveLength(0);
     expect(exchanges).toHaveLength(1);
     expect(exchanges[0].status).toBe('error');
@@ -272,10 +281,8 @@ describe('error and interrupted turns', () => {
       true,
     );
 
-    expect(deliveredTexts()).toEqual([
-      'Sent before failure.',
-      "Something went wrong on my side and I couldn't finish that. Please send it again.",
-    ]);
+    expect(deliveredTexts()).toEqual(['Sent before failure.']);
+    expect(turnFailures()).toEqual([TURN_FAILED]);
     expect(pushes).toHaveLength(0);
     expect(exchanges).toHaveLength(1);
     expect(exchanges[0].status).toBe('error');
@@ -293,14 +300,8 @@ describe('error and interrupted turns', () => {
 
     await processQuery(query, CHAT_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, true);
 
-    expect(deliveredTexts()).toEqual(
-      progress
-        ? [
-            'Progress before failure.',
-            "Something went wrong on my side and I couldn't finish that. Please send it again.",
-          ]
-        : ["Something went wrong on my side and I couldn't finish that. Please send it again."],
-    );
+    expect(deliveredTexts()).toEqual(progress ? ['Progress before failure.'] : []);
+    expect(turnFailures()).toEqual([TURN_FAILED]);
     expect(pushes).toHaveLength(0);
   });
 
@@ -318,10 +319,8 @@ describe('error and interrupted turns', () => {
     ).rejects.toThrow('SDK stream died');
 
     // The mid-turn write is durable — an interrupted turn cannot claw it back.
-    expect(deliveredTexts()).toEqual([
-      'Sent before the crash.',
-      "Something went wrong on my side and I couldn't finish that. Please send it again.",
-    ]);
+    expect(deliveredTexts()).toEqual(['Sent before the crash.']);
+    expect(turnFailures()).toEqual([TURN_FAILED]);
   });
 });
 

@@ -34,7 +34,6 @@ import fs from 'fs';
 import { getSessionClaim } from './db/coordination.js';
 import { getSession, isTaskThread, updateSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
-import { sendFailureNotice } from './delivery.js';
 import { log } from './log.js';
 import { heartbeatPath, withExistingMailboxSession } from './session-manager.js';
 import { getContainerStartedAtMs, isContainerRunning, killContainer } from './container-runner.js';
@@ -119,6 +118,24 @@ export function shouldCloseTaskSession(
   return isTaskThread(threadId) && !containerRunning && liveTaskCount === 0;
 }
 
+/**
+ * Inbound-failed hooks.
+ *
+ * Registered modules hear, once per reconcile pass, about the inbound
+ * messages the host gave up on after MAX_TRIES, each with where it came
+ * from. They run after the mailbox work has committed and outside the
+ * mailbox session, so a hook may open its own sessions or send through a
+ * channel. Each invocation is isolated: a failing hook never affects the
+ * reconcile or the hooks after it.
+ */
+export type InboundFailedHook = (failed: readonly MessageRetry[], session: Session) => void | Promise<void>;
+
+const inboundFailedHooks: InboundFailedHook[] = [];
+
+export function registerInboundFailedHook(hook: InboundFailedHook): void {
+  inboundFailedHooks.push(hook);
+}
+
 /** Reconcile one session against current state. Missing/closed sessions no-op. */
 export async function reconcileSession(sessionId: string): Promise<void> {
   const session = await getSession(sessionId);
@@ -130,13 +147,19 @@ async function reconcileActiveSession(session: Session): Promise<void> {
   const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) return;
 
-  // Told after the mailbox work has committed, and outside it: the notice is
-  // a channel send that must not hold the session.
+  // Hooks hear after the mailbox work has committed, and outside it: a hook
+  // may send through a channel, which must not hold the session.
   const failedMessages = await reconcileSessionMailbox(session, agentGroup.id);
-  // Only a message the principal sent is answered: host notes and other
-  // agents' messages ride the agent channel and have no one to tell.
-  const fromChat = failedMessages.find((message) => message.channelType !== null && message.channelType !== 'agent');
-  if (fromChat) await sendFailureNotice(session, fromChat, { onlyToThatChat: true });
+  if (failedMessages.length === 0) return;
+  for (const hook of inboundFailedHooks) {
+    /* eslint-disable no-catch-all/no-catch-all -- a failing hook must never affect the reconcile or other hooks */
+    try {
+      await hook(failedMessages, session);
+    } catch (err) {
+      log.warn('Inbound-failed hook failed', { sessionId: session.id, err });
+    }
+    /* eslint-enable no-catch-all/no-catch-all */
+  }
 }
 
 /** One mailbox pass. Returns the inbound messages it gave up on. */
