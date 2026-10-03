@@ -34,4 +34,5 @@ import './gws-ea-preferences/index.js';
 import './gws-ea-people/index.js';
 import './gws-ea-notices/index.js';
 import './gws-ea-privacy/index.js';
+import './gws-ea-external-email/index.js';
 import './community-portal/index.js';

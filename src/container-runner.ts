@@ -25,6 +25,7 @@ import {
   TIMEZONE,
 } from './config.js';
 import {
+  CONVERSATION_CONTEXT_CAPABILITY,
   credentialsWithinCapabilities,
   isRestricted,
   parseStoredCapabilities,
@@ -75,7 +76,13 @@ import { validateAdditionalMounts } from './modules/mount-security/index.js';
 // Provider contracts use a separate barrel so update-skills identity detection
 // remains tied to src/providers/index.ts.
 import './provider-contracts/index.js';
-import { getProviderHostContract, type ProviderHostContract } from './provider-contracts/registry.js';
+import { getProviderFileTransformer, type ProviderFileDiagnostic } from './provider-contracts/file-transformers.js';
+import {
+  getProviderHostContract,
+  sealedSessionContract,
+  type ProviderHostContract,
+} from './provider-contracts/registry.js';
+import { writeAtomic } from './migrate-claude-memory-settings.js';
 import { resolveProviderName } from './providers/provider-name.js';
 import {
   providerStateVolumePath,
@@ -595,7 +602,7 @@ export function watchGatewayAvailability(
  * keys name plus its model provider's. Read at every spawn and adoption, as
  * the gateway applies it at each.
  */
-async function credentialScopeFor(
+export async function credentialScopeFor(
   agentGroup: AgentGroup,
   session: Pick<Session, 'agent_provider'>,
 ): Promise<GatewayCredentialScope> {
@@ -610,14 +617,53 @@ async function credentialScopeFor(
   };
 }
 
+/**
+ * What a session admission policy judges: a session about to be spawned or
+ * adopted, and the credentials the gateway would scope its agent to. Every
+ * session start passes here before the gateway is asked and before anything
+ * runs, spawned and adopted alike.
+ */
+export interface SessionAdmissionInput {
+  readonly disposition: 'create' | 'adopt';
+  readonly key: GatewaySessionInput['key'];
+  readonly credentialScope: GatewayCredentialScope;
+}
+
+/** A module's invariant on the sessions it may start; it refuses one by throwing. */
+export type SessionAdmissionPolicy = (input: SessionAdmissionInput) => void | Promise<void>;
+
+const sessionAdmissionPolicies = new Map<string, SessionAdmissionPolicy>();
+const SESSION_ADMISSION_POLICY_ID = /^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/u;
+
+/**
+ * Register an invariant checked before every session start, such as a group
+ * whose configuration must not drift. IDs take the `module:name` form.
+ */
+export function registerSessionAdmissionPolicy(id: string, policy: SessionAdmissionPolicy): void {
+  if (!SESSION_ADMISSION_POLICY_ID.test(id)) throw new Error(`Invalid session admission policy ID: ${id}`);
+  if (sessionAdmissionPolicies.has(id)) throw new Error(`Session admission policy already registered: ${id}`);
+  sessionAdmissionPolicies.set(id, policy);
+}
+
+/** Run every session admission policy; the first refusal stops the session from starting. */
+export async function assertSessionAdmitted(input: SessionAdmissionInput): Promise<void> {
+  for (const policy of sessionAdmissionPolicies.values()) await policy(input);
+}
+
 async function ensureGatewaySession(input: GatewaySessionInput): Promise<GatewaySessionControl> {
   if (gatewayUnavailableReason) {
     throw new Error(`Gateway session admission is closed: ${gatewayUnavailableReason}`);
   }
   // Before the gateway is asked: a restricted agent never starts behind a
-  // gateway that would ignore its credential scope.
+  // gateway that would ignore its credential scope, and no session starts
+  // that a registered admission policy refuses.
   const gatewayProvider = getGatewayProvider();
   assertCredentialScopeEnforced(gatewayProvider, input);
+  await assertSessionAdmitted({
+    disposition: input.disposition ?? 'create',
+    key: input.key,
+    credentialScope: input.credentialScope,
+  });
   const controller = new AbortController();
   const generation = gatewayAdmissionGeneration;
   try {
@@ -995,7 +1041,7 @@ export async function resolveProviderContribution(
 ): Promise<{ provider: string; contribution: ProviderContainerContribution; surfaces?: ProviderSpawnRealization }> {
   const provider = resolveProviderName(session.agent_provider, containerConfig.provider);
   const fn = getProviderContainerConfig(provider);
-  const contract = getProviderHostContract(provider);
+  const contract = sessionHostContract(provider, containerConfig.capabilities);
   if (!contract && !fn) {
     // Same as before contracts existed: the group spawns with the default
     // (Claude) surfaces. Say so once per spawn so an operator can spot it.
@@ -1016,7 +1062,7 @@ export async function resolveProviderContribution(
     throw new Error(`Provider '${provider}' host contract requires a legacy host adapter`);
   }
 
-  const surfaces = await realizeProviderSpawnSurfaces(
+  const surfaces = await realizeSessionSurfaces(
     provider,
     contract,
     agentGroup.id,
@@ -1031,6 +1077,62 @@ export async function resolveProviderContribution(
   return { provider, contribution: surfaces.contribution, surfaces };
 }
 
+/**
+ * The provider contract a session realizes. A group without
+ * `conversation-context` keeps its sessions sealed: nothing of one session
+ * reaches another, so each state volume that holds conversation state
+ * (`ProviderStateVolume.sealedScope`) is realized per session.
+ */
+function sessionHostContract(provider: string, capabilities: readonly string[]): ProviderHostContract | undefined {
+  const contract = getProviderHostContract(provider);
+  // A missing list holds nothing, as the runner reads one: the sessions are sealed.
+  if (!contract || new Set(capabilities).has(CONVERSATION_CONTEXT_CAPABILITY)) return contract;
+  return sealedSessionContract(contract);
+}
+
+/**
+ * Realize a session's provider surfaces. A session that holds a volume on
+ * its own also gets its own copy of each file the provider prepares there at
+ * group init: written when the session first starts, then reconciled at each
+ * start as a group's copy is at group init.
+ */
+async function realizeSessionSurfaces(
+  ...args: Parameters<typeof realizeProviderSpawnSurfaces>
+): Promise<ProviderSpawnRealization> {
+  const realization = await realizeProviderSpawnSurfaces(...args);
+  const [, contract, agentGroupId, , sessionDirectory] = args;
+  for (const file of contract.files) {
+    const prepare = file.prepare;
+    if (prepare.operation !== 'create-if-missing') continue;
+    const volume = contract.stateVolumes.find((candidate) => candidate.id === file.volumeId);
+    if (volume?.scope !== 'session') continue;
+    const target = path.join(providerStateVolumePath(volume, agentGroupId, sessionDirectory), file.relativePath);
+    if (!fs.existsSync(target)) {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, prepare.content, { flag: 'wx' });
+    } else if (file.reconcile) {
+      reconcileSessionFile(file.reconcile.transformer, target);
+    }
+  }
+  return realization;
+}
+
+function reconcileSessionFile(transformerName: string, target: string): void {
+  const transformer = getProviderFileTransformer(transformerName);
+  if (!transformer) throw new Error(`Unknown provider file transformer '${transformerName}'`);
+  const diagnostics: ProviderFileDiagnostic[] = [];
+  /* eslint-disable no-catch-all/no-catch-all -- as at group init, a file that cannot be read or written is reported and left as it is */
+  try {
+    const result = transformer.transform(fs.readFileSync(target, 'utf-8'), target);
+    diagnostics.push(...(result.diagnostics ?? []));
+    if (result.kind === 'replace') writeAtomic(target, result.content);
+  } catch (err) {
+    diagnostics.push(transformer.mapIoFailure(err, target));
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+  for (const diagnostic of diagnostics) log[diagnostic.level](diagnostic.message, diagnostic.fields);
+}
+
 export async function buildMounts(
   agentGroup: AgentGroup,
   session: Session,
@@ -1041,7 +1143,7 @@ export async function buildMounts(
 ): Promise<VolumeMount[]> {
   const projectRoot = process.cwd();
 
-  const contract = getProviderHostContract(provider);
+  const contract = sessionHostContract(provider, containerConfig.capabilities);
   // Undeclared payloads stay on the legacy capability gate. Declared payloads
   // are realized below from their contract.
   const defaultSurfaces = !contract && !providerProvidesAgentSurfaces(provider);
@@ -1055,7 +1157,7 @@ export async function buildMounts(
   const lateSkillViewMounts = new Map<string, VolumeMount[]>();
   let skillBackingPaths = new Map<string, string>();
   if (contract) {
-    providerSurfaces ??= await realizeProviderSpawnSurfaces(
+    providerSurfaces ??= await realizeSessionSurfaces(
       provider,
       contract,
       agentGroup.id,
@@ -1150,7 +1252,8 @@ export async function buildMounts(
   }
 
   // Per-group .claude-shared at /home/node/.claude (provider state, settings,
-  // skill symlinks). Per agent group, not per session.
+  // skill symlinks). Per agent group, not per session, except for a group
+  // whose sessions are sealed (see `sessionHostContract`).
   if (contract) {
     for (const volume of contract.stateVolumes) {
       const hostPath = providerStateVolumePath(volume, agentGroup.id, sessDir);
@@ -1296,11 +1399,13 @@ function restrictedSurfaceMounts(input: {
     const location = backing.location;
     let containerPath: string;
     let mountClass: VolumeMount['mountClass'];
+    let sessionVolume: string | undefined;
     if (location.kind === 'state-volume') {
       const volume = contract?.stateVolumes.find((candidate) => candidate.id === location.volumeId);
       if (!volume) throw new Error(`skill backing '${backing.id}' references unknown volume '${location.volumeId}'`);
       containerPath = path.posix.join(volume.containerPath, location.subdirectory, backing.skillsSubdirectory);
       mountClass = volume.mountClass;
+      if (volume.scope === 'session') sessionVolume = volume.directory;
     } else {
       containerPath = path.posix.join(
         '/workspace/agent',
@@ -1317,6 +1422,18 @@ function restrictedSurfaceMounts(input: {
       mountClass,
       scope,
     });
+    // A session volume lives inside the session directory, which /workspace
+    // mounts writable, so its skills are reachable there too: the same layer
+    // goes over that path, or a skill written there would load.
+    if (sessionVolume !== undefined) {
+      mounts.push({
+        hostPath: path.join(backingRoot, backing.skillsSubdirectory),
+        containerPath: path.posix.join('/workspace', sessionVolume, location.subdirectory, backing.skillsSubdirectory),
+        readonly: true,
+        mountClass: 'group-state',
+        scope,
+      });
+    }
   }
   if (claudeProject) {
     const projectDir = path.join(groupDir, CLAUDE_PROJECT_DIR);

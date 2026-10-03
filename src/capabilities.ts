@@ -77,14 +77,17 @@ registerCapability('reply', {
 registerCapability('files-send', {
   description: 'send_file, edit_message, add_reaction',
   default: 'on',
+  instructions: ['files-send'],
 });
 registerCapability('files-read', { description: 'Read, Glob, Grep', default: 'on' });
 registerCapability('files-write', { description: 'Write, Edit, NotebookEdit', default: 'on' });
 registerCapability(SHELL_CAPABILITY, {
   description: 'Bash, and with it ncl and every command-line skill',
   default: 'on',
-  // Both documents teach `ncl`, which the agent runs through the shell.
-  instructions: ['cli', 'scheduling'],
+  // `cli` and `scheduling` teach `ncl`, which the agent runs through the
+  // shell; `connect` teaches connecting an account through the gateway, whose
+  // credentials reach the agent only through commands it runs.
+  instructions: ['cli', 'scheduling', 'connect'],
   skills: ['agent-browser', 'frontend-engineer', 'self-customize'],
 });
 registerCapability('web', { description: 'WebSearch, WebFetch', default: 'on' });
@@ -93,8 +96,12 @@ registerCapability('subagents', {
   default: 'on',
 });
 registerCapability(CONVERSATION_CONTEXT_CAPABILITY, {
-  description: "context from the conversation's other sessions, by fan-out and backfill",
+  description:
+    "context from the conversation's other sessions, by fan-out and backfill, and one provider state (such as Claude's home) shared by all the group's sessions",
   default: 'on',
+  // Group memory and the conversation archive are shared by every session;
+  // a group without the key keeps neither (the runner's memory/sealed.ts).
+  instructions: ['memory'],
 });
 registerCapability(MCP_SERVERS_CAPABILITY, {
   description: 'configured, plugin, and claude.ai connector MCP servers',

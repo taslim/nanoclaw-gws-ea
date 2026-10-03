@@ -96,9 +96,11 @@ export const BASE_INSTRUCTIONS_PATH = path.join('container', 'CLAUDE.md');
 export const MEMORY_NOTE_PLACEHOLDER = '{{provider-memory-note}}';
 
 /**
- * Render the canonical base instructions with the provider's memory note
- * substituted (or the placeholder stripped without a trace). The no-facts
- * render is byte-identical to the template minus the placeholder paragraph.
+ * Render canonical instructions with the provider's memory note substituted
+ * (or the placeholder stripped without a trace). The no-facts render is
+ * byte-identical to the template minus the placeholder paragraph. The
+ * placeholder lives in the `memory` instructions, which only a group holding
+ * `conversation-context` is taught.
  */
 export function renderBaseInstructions(template: string, facts?: ProviderInstructionFacts): string {
   const files = facts?.nativeOverrideFiles ?? [];
@@ -241,7 +243,8 @@ export async function composeGroupProjectDoc(
       const moduleName = match[1];
       if (cliDisabled && NCL_DEPENDENT_MODULES.has(moduleName)) continue;
       if (!grantsInstructions(moduleName, grants)) continue;
-      push(`NanoClaw Module: ${moduleName}`, fs.readFileSync(path.join(mcpToolsHostDir, entry), 'utf-8'), true);
+      const instructions = fs.readFileSync(path.join(mcpToolsHostDir, entry), 'utf-8');
+      push(`NanoClaw Module: ${moduleName}`, renderBaseInstructions(instructions, spec.instructions), true);
     }
   }
 

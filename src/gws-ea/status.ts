@@ -127,6 +127,9 @@ export interface ServiceFacts {
 export interface MainIdentityFacts {
   readonly agent_group_id: string | null;
 }
+export interface ExternalEmailFacts {
+  readonly agent_group_id: string | null;
+}
 export interface ConnectorFacts {
   readonly drift: string | null;
 }
@@ -150,6 +153,11 @@ export interface AssistantProbes {
   readonly onecli: ProbeResult;
   /** Main as published, on the assistant's provider, with its OneCLI agent granted every secret. */
   readonly main_identity: ProbeResult & MainIdentityFacts;
+  /**
+   * external-email as the host stamped it, no destination joining it to main
+   * or reaching its inbox, and its OneCLI agent in selective mode.
+   */
+  readonly external_email: ProbeResult & ExternalEmailFacts;
   /** The assistant's own Google sign-in, accepted by Google, with Calendar access in OneCLI for agents. */
   readonly workspace: ProbeResult & WorkspaceFacts;
   /** The principal binding and its queued welcome. */
@@ -168,6 +176,7 @@ export const PROBE_NAMES = [
   'host',
   'onecli',
   'main_identity',
+  'external_email',
   'workspace',
   'principal',
   'route',
@@ -646,13 +655,23 @@ async function publishedMain({ runtime: record, observers }: Subject): Promise<s
   return main;
 }
 
+/** The assistant's OneCLI agents, as its own OneCLI lists them. */
+async function onecliAgents({ runtime: record, observers }: Subject): Promise<readonly Record<string, unknown>[]> {
+  const agents = unwrapData(await observers.onecliAdmin(requireRuntime(record), ['agents', 'list', '--max', '0']));
+  if (!Array.isArray(agents) || !agents.every(isRecord)) {
+    throw new GwsEaError('invalid_child_output', 'OneCLI returned an invalid agent list');
+  }
+  return agents;
+}
+
 /** Main as published, on the assistant's provider, with its OneCLI agent granted every secret. */
 async function mainIdentityProbe(
   subject: Subject,
   main: () => Promise<string>,
+  listAgents: () => Promise<readonly Record<string, unknown>[]>,
 ): Promise<ProbeResult & MainIdentityFacts> {
   const runtime = requireRuntime(subject.runtime);
-  const { ncl, onecliAdmin } = subject.observers;
+  const { ncl } = subject.observers;
   const agentGroupId = await main();
   const degraded = (reason: string): ProbeResult & MainIdentityFacts => ({
     status: 'degraded',
@@ -670,17 +689,50 @@ async function mainIdentityProbe(
   if (provider !== runtime.selected_provider) {
     return degraded(`Main runs provider ${provider ?? '(none)'}, not the assistant's ${runtime.selected_provider}.`);
   }
-  const agents = unwrapData(await onecliAdmin(runtime, ['agents', 'list', '--max', '0']));
-  if (!Array.isArray(agents) || !agents.every(isRecord)) {
-    throw new GwsEaError('invalid_child_output', 'OneCLI returned an invalid agent list');
-  }
-  const matching = agents.filter((agent) => agent.identifier === agentGroupId);
+  const matching = (await listAgents()).filter((agent) => agent.identifier === agentGroupId);
   const [agent] = matching;
   if (!agent) return degraded('Main has no OneCLI agent.');
   if (matching.length > 1) return degraded('Several OneCLI agents claim main.');
   if (agent.name !== MAIN_GROUP_NAME) return degraded("Main's OneCLI agent is not named main.");
   if (agent.secretMode !== 'all') {
     return degraded(`Main's OneCLI agent is granted ${optionalString(agent.secretMode) ?? 'no'} secrets, not all.`);
+  }
+  return { ...OK, agent_group_id: agentGroupId };
+}
+
+/**
+ * external-email as the running host reports it: as the host stamped it, with
+ * no destination joining it to main or reaching its inbox. Its OneCLI agent,
+ * which OneCLI creates at its first session, must be in selective mode: core
+ * scopes it to the model provider's secret at every start and refuses a start
+ * it cannot scope, so selective mode is what status can see of that.
+ */
+async function externalEmailProbe(
+  subject: Subject,
+  listAgents: () => Promise<readonly Record<string, unknown>[]>,
+): Promise<ProbeResult & ExternalEmailFacts> {
+  const runtime = requireRuntime(subject.runtime);
+  const health = unwrapData(await subject.observers.ncl(runtime, ['gws-ea-external-email', 'health']));
+  if (
+    !isRecord(health) ||
+    !Array.isArray(health.problems) ||
+    !health.problems.every((problem): problem is string => typeof problem === 'string')
+  ) {
+    throw new GwsEaError('invalid_child_output', 'ncl returned an invalid external-email report');
+  }
+  const agentGroupId = optionalString(health.agent_group_id) ?? null;
+  const degraded = (reason: string): ProbeResult & ExternalEmailFacts => ({
+    status: 'degraded',
+    reason,
+    agent_group_id: agentGroupId,
+  });
+  if (health.problems.length > 0) return degraded(health.problems.map(sentence).join(' '));
+  if (agentGroupId === null) return degraded('External-email has not been created.');
+  const agent = (await listAgents()).find((candidate) => candidate.identifier === agentGroupId);
+  if (agent && agent.secretMode !== 'selective') {
+    return degraded(
+      `External-email's OneCLI agent is granted ${optionalString(agent.secretMode) ?? 'no'} secrets, not only the model provider's.`,
+    );
   }
   return { ...OK, agent_group_id: agentGroupId };
 }
@@ -948,6 +1000,7 @@ export async function observeAssistantStatus(
   ]);
   const subject: Subject = { context, observers, reservation, inspection, runtime };
   const main = once(() => publishedMain(subject));
+  const agents = once(() => onecliAgents(subject));
   const live = readSchema(observers, reservation.checkout_realpath);
   const managed = reservation.exclusive_resource_claims.ingress.mode === 'managed-cloudflare';
   const [
@@ -956,6 +1009,7 @@ export async function observeAssistantStatus(
     host,
     onecli,
     mainIdentity,
+    externalEmail,
     workspace,
     principal,
     route,
@@ -969,7 +1023,8 @@ export async function observeAssistantStatus(
     observeService(context, runtime),
     probe(() => hostProbe(subject), {}),
     probe(() => onecliProbe(subject), {}),
-    probe<MainIdentityFacts>(() => mainIdentityProbe(subject, main), { agent_group_id: null }),
+    probe<MainIdentityFacts>(() => mainIdentityProbe(subject, main, agents), { agent_group_id: null }),
+    probe<ExternalEmailFacts>(() => externalEmailProbe(subject, agents), { agent_group_id: null }),
     probe<WorkspaceFacts>(() => workspaceProbe(subject), { account: null }),
     probe(() => principalProbe(subject), {}),
     probe(() => routeProbe(subject), {}),
@@ -1003,6 +1058,7 @@ export async function observeAssistantStatus(
       host,
       onecli,
       main_identity: mainIdentity,
+      external_email: externalEmail,
       workspace,
       principal,
       route,
@@ -1176,6 +1232,8 @@ function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes
       return probes.service.state;
     case 'main_identity':
       return probes.main_identity.agent_group_id ?? '';
+    case 'external_email':
+      return probes.external_email.agent_group_id ?? '';
     case 'workspace':
       return probes.workspace.account ?? '';
     case 'connector':
@@ -1224,7 +1282,7 @@ function renderStatus(status: AssistantStatus, timezone: string): string[] {
     const result = status.probes[name];
     if (!result) continue;
     const detail = result.reason ?? probeDetail(name, status.probes, timezone);
-    lines.push(`  ${result.status.padEnd(8)}  ${name.padEnd(13)}  ${detail}`.trimEnd());
+    lines.push(`  ${result.status.padEnd(8)}  ${name.padEnd(14)}  ${detail}`.trimEnd());
   }
   lines.push(`Observed: ${formatLocalTime(status.observed_at, timezone)}`);
   return lines;
@@ -1250,8 +1308,8 @@ export const STATUS_USAGE: readonly string[] = [
   '       tool_commit, behind_tool_release), rollback (available, previous_commit, schema_moved),',
   '       templates (customized: surface, name, change changed|deleted|added; reason), schema',
   '       (central_fingerprint, session_fingerprint, latest_migration),',
-  '       probes: checkout, service, host, onecli, main_identity, workspace (account), principal, route, connector (managed',
-  '       Cloudflare only, with drift), delivery; each probe has status ok|degraded|unknown and a reason.',
+  '       probes: checkout, service, host, onecli, main_identity, external_email, workspace (account), principal, route,',
+  '       connector (managed Cloudflare only, with drift), delivery; each probe has status ok|degraded|unknown and a reason.',
   '       list and status exit 0 once they observed, whatever the health; status exits 1 for an unknown ID.',
 ];
 

@@ -115,6 +115,10 @@ describe('composeGroupProjectDoc delivery', () => {
     expect(doc).toContain(read('container', 'skills', 'fixture-gateway', 'instructions.md'));
     expect(doc).toContain(read('container', 'agent-runner', 'src', 'mcp-tools', 'cli.instructions.md'));
     expect(doc).toContain(read('container', 'agent-runner', 'src', 'mcp-tools', 'core.instructions.md'));
+    expect(doc).toContain(read('container', 'agent-runner', 'src', 'mcp-tools', 'connect.instructions.md'));
+    expect(doc).toContain(
+      renderBaseInstructions(read('container', 'agent-runner', 'src', 'mcp-tools', 'memory.instructions.md')),
+    );
   });
 
   it('inlines MCP server instructions from the container config', async () => {
@@ -315,11 +319,18 @@ describe('composeGroupProjectDoc spec', () => {
   // rendered base must be byte-identical to the template minus its placeholder
   // paragraph, so the Claude document never changes when facts are added for
   // other providers.
-  it('renders the canonical base byte-identically when no provider facts are declared', () => {
-    const template = fs.readFileSync(path.join(process.cwd(), BASE_INSTRUCTIONS_PATH), 'utf-8');
-    expect(template.split(MEMORY_NOTE_PLACEHOLDER)).toHaveLength(2);
-    expect(renderBaseInstructions(template)).toBe(template.replace(`\n\n${MEMORY_NOTE_PLACEHOLDER}`, ''));
-    expect(renderBaseInstructions(template)).not.toContain(MEMORY_NOTE_PLACEHOLDER);
+  it('renders the canonical instructions byte-identically when no provider facts are declared', () => {
+    const base = fs.readFileSync(path.join(process.cwd(), BASE_INSTRUCTIONS_PATH), 'utf-8');
+    // The memory note lives with the memory instructions, which follow `conversation-context`.
+    expect(base).not.toContain(MEMORY_NOTE_PLACEHOLDER);
+    expect(renderBaseInstructions(base)).toBe(base);
+    const memory = fs.readFileSync(
+      path.join(process.cwd(), 'container', 'agent-runner', 'src', 'mcp-tools', 'memory.instructions.md'),
+      'utf-8',
+    );
+    expect(memory.split(MEMORY_NOTE_PLACEHOLDER)).toHaveLength(2);
+    expect(renderBaseInstructions(memory)).toBe(memory.replace(`\n\n${MEMORY_NOTE_PLACEHOLDER}`, ''));
+    expect(renderBaseInstructions(memory)).not.toContain(MEMORY_NOTE_PLACEHOLDER);
   });
 
   it('renders provider facts as canonical prose in the declared slots', async () => {
@@ -485,7 +496,11 @@ describe('composeGroupProjectDoc capabilities', () => {
   }
 
   // Characterization, recorded before capabilities existed: every section a
-  // default group composed then, in order.
+  // default group composed then, in order. Since then three passages moved
+  // into documents a key names, with their text unchanged: the file and
+  // reaction tools (`files-send`), connecting accounts (`connect`, by
+  // `shell`), and memory with the conversation archive (`memory`, by
+  // `conversation-context`).
   it('composes a group holding every key exactly as before capabilities', async () => {
     const ag = await seedWithServer('ag-caps-all', 'caps-all-group');
 
@@ -494,8 +509,11 @@ describe('composeGroupProjectDoc capabilities', () => {
       '# NanoClaw Module: agents',
       '# NanoClaw Module: calendar-facts',
       '# NanoClaw Module: cli',
+      '# NanoClaw Module: connect',
       '# NanoClaw Module: core',
+      '# NanoClaw Module: files-send',
       '# NanoClaw Module: interactive',
+      '# NanoClaw Module: memory',
       '# NanoClaw Module: schedule-stats',
       '# NanoClaw Module: scheduling',
       '# NanoClaw Module: self-mod',
@@ -518,11 +536,32 @@ describe('composeGroupProjectDoc capabilities', () => {
     const ag = await seedWithServer('ag-caps-narrow', 'caps-narrow-group');
     await updateContainerConfigJson(ag.id, 'capabilities', ['reply', 'time']);
 
-    expect(headings(await compose(ag))).toEqual([
+    const doc = await compose(ag);
+    expect(headings(doc)).toEqual([
       '# NanoClaw Runtime Contract',
       '# NanoClaw Module: core',
       '# NanoClaw Module: time',
     ]);
+    // Without a shell nothing teaches `ncl` or connecting an account, and with
+    // sealed sessions nothing teaches group memory or the conversation archive.
+    // (The composed-at-spawn header is an operator's marker, not instruction.)
+    const taught = doc.slice(doc.indexOf('\n'));
+    expect(taught).not.toMatch(/\bncl\b/u);
+    expect(taught).not.toMatch(/connect/iu);
+    expect(taught).not.toContain('memory/');
+    expect(taught).not.toContain('conversations/');
+  });
+
+  it('teaches connecting accounts with a shell, and memory with conversation-context', async () => {
+    const ag = await seedWithServer('ag-caps-parts', 'caps-parts-group');
+
+    await updateContainerConfigJson(ag.id, 'capabilities', ['reply', 'shell']);
+    expect(headings(await compose(ag))).toContain('# NanoClaw Module: connect');
+    expect(headings(await compose(ag))).not.toContain('# NanoClaw Module: memory');
+
+    await updateContainerConfigJson(ag.id, 'capabilities', ['reply', 'conversation-context']);
+    expect(headings(await compose(ag))).toContain('# NanoClaw Module: memory');
+    expect(headings(await compose(ag))).not.toContain('# NanoClaw Module: connect');
   });
 
   it('bounds the skill selection: a skill no key names needs shell', async () => {

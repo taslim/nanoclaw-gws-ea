@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
 import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('./log.js', () => ({
@@ -105,8 +108,11 @@ describe('what a list grants on the host', () => {
       'agents',
       'calendar-facts',
       'cli',
+      'connect',
       'core',
+      'files-send',
       'interactive',
+      'memory',
       'schedule-stats',
       'scheduling',
       'self-mod',
@@ -115,8 +121,29 @@ describe('what a list grants on the host', () => {
       expect(grantsInstructions(doc, all)).toBe(true);
     }
     expect(
-      ['cli', 'scheduling', 'self-mod', 'core', 'time'].filter((doc) => grantsInstructions(doc, replyAndTime)),
+      ['cli', 'connect', 'scheduling', 'self-mod', 'core', 'files-send', 'memory', 'time'].filter((doc) =>
+        grantsInstructions(doc, replyAndTime),
+      ),
     ).toEqual(['core', 'time']);
+  });
+
+  // `reply` teaches send_message alone; the file and reaction tools are taught
+  // only with the key that grants them.
+  it('splits the outbound tool documents between reply and files-send', () => {
+    const read = (name: string): string =>
+      fs.readFileSync(
+        path.join(process.cwd(), 'container/agent-runner/src/mcp-tools', `${name}.instructions.md`),
+        'utf8',
+      );
+    const core = read('core');
+    const files = read('files-send');
+
+    expect(core).toContain('`send_message`');
+    for (const tool of ['send_file', 'add_reaction', 'edit_message']) expect(core).not.toContain(tool);
+    expect(files).toContain('`send_file`');
+    expect(files).toContain('`add_reaction`');
+    expect(grantsInstructions('files-send', new Set(['reply']))).toBe(false);
+    expect(grantsInstructions('files-send', new Set(['files-send']))).toBe(true);
   });
 
   it('leaves out instructions no key names', () => {

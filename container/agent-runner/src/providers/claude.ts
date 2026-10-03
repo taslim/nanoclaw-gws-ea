@@ -2,6 +2,7 @@ import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '
 
 import { runnerCapabilities } from '../config.js';
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
+import { sessionsSealed } from '../memory/sealed.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import type { ResolvedRuntimeConfiguration } from '../provider-contracts/registry.js';
 // The execution-policy, inference, MCP, and memory derivations live in
@@ -247,6 +248,8 @@ export class ClaudeProvider implements AgentProvider {
   private memorySessionHook?: MemorySessionHookRegistration;
   private capabilities: ClaudeCapabilityPolicy;
   private preToolUseHook: HookCallback;
+  /** A sealed session archives no transcript into the group's conversations/ (memory/sealed.ts). */
+  private sealed: boolean;
 
   /**
    * `configuration` is the contract's configuration as resolved by core
@@ -267,6 +270,7 @@ export class ClaudeProvider implements AgentProvider {
     // Fixed for the life of the container, so the policy and hook are built once.
     this.capabilities = resolveClaudeCapabilityPolicy(runnerCapabilities());
     this.preToolUseHook = createPreToolUseHook(this.capabilities);
+    this.sealed = sessionsSealed(runnerCapabilities());
   }
 
   /**
@@ -292,7 +296,10 @@ export class ClaudeProvider implements AgentProvider {
    * cold-resume within the host's idle ceiling (see claude-history.ts).
    */
   maybeRotateContinuation(continuation: string, _cwd: string): string | null {
-    return rotateClaudeContinuation({ continuation, assistantName: this.assistantName, log }, REAL_CLOCK);
+    return rotateClaudeContinuation(
+      { continuation, assistantName: this.assistantName, archive: !this.sealed, log },
+      REAL_CLOCK,
+    );
   }
 
   query(input: QueryInput): AgentQuery {
@@ -339,7 +346,7 @@ export class ClaudeProvider implements AgentProvider {
           PreToolUse: [{ hooks: [this.preToolUseHook] }],
           PostToolUse: [{ hooks: [postToolUseHook] }],
           PostToolUseFailure: [{ hooks: [postToolUseHook] }],
-          PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
+          ...(this.sealed ? {} : { PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }] }),
         },
       },
     });

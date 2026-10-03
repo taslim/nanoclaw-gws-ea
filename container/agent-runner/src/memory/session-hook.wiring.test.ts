@@ -10,8 +10,10 @@ describe('Claude memory hook wiring', () => {
     'utf-8',
   );
 
-  it('passes the shared hook to Claude without a second SDK hook path', () => {
-    expect(runnerSource).toMatch(/registerProviderMemorySessionHook\(providerName, provider, MEMORY_SESSION_HOOK\)/);
+  it("passes the session's memory hook to Claude without a second SDK hook path", () => {
+    expect(runnerSource).toMatch(/registerProviderMemorySessionHook\(providerName, provider, memoryHook\)/);
+    // A sealed session archives no exchange through a provider's exchange hook.
+    expect(runnerSource).toContain('if (sealed) delete provider.onExchangeComplete;');
     expect(providerSource).toMatch(
       /registerMemorySessionHook\(hook: MemorySessionHookRegistration, memory\?: unknown\)/,
     );

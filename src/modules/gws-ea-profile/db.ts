@@ -9,10 +9,19 @@ export interface GwsEaProfile {
   readonly principal_display_name: string | null;
   readonly principal_timezone: string | null;
   readonly main_agent_group_id: string | null;
+  /** The agent group the host created for `external-email`, or null until it has. */
+  readonly external_email_agent_group_id: string | null;
   readonly updated_at: string | null;
   /** The principal's email addresses, sorted. */
   readonly principal_emails: readonly string[];
 }
+
+/**
+ * Who a project document is written for (KTD14): `main` reads live pointers,
+ * `external-email` gets nothing but names and its guidance, and any other
+ * group what its capabilities allow.
+ */
+export type ProjectDocAudience = 'main' | 'external-email' | 'other';
 
 export interface ReconcileGwsEaProfileInput {
   readonly assistantDisplayName: string;
@@ -104,10 +113,44 @@ export async function getMainAgentGroupId(): Promise<string | null> {
   return row?.main_agent_group_id ?? null;
 }
 
+/** `external-email`'s agent group, or null until the host creates it. */
+export async function getExternalEmailAgentGroupId(): Promise<string | null> {
+  const row = await getDb().get<{ external_email_agent_group_id: string | null }>(
+    'SELECT external_email_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
+  );
+  return row?.external_email_agent_group_id ?? null;
+}
+
+/**
+ * Record the agent group the host created for `external-email`. Recording the
+ * same group again changes nothing; the pointer never moves to another one.
+ */
+export async function recordExternalEmailAgentGroupId(agentGroupId: string): Promise<void> {
+  identifier(agentGroupId, 'external-email agent group ID');
+  const db = getDb();
+  await db.transaction(async () => {
+    const current = await getExternalEmailAgentGroupId();
+    if (current === agentGroupId) return;
+    if (current !== null) throw new Error(`external-email is already bound to ${current}`);
+    await db.run('UPDATE gws_ea_profile SET external_email_agent_group_id = ? WHERE singleton = 1', agentGroupId);
+  });
+}
+
+/** Whom `agentGroupId`'s project document is written for. Without a profile every group is `other`. */
+export async function projectDocAudience(agentGroupId: string): Promise<ProjectDocAudience> {
+  if (!(await getDb().hasTable('gws_ea_profile'))) return 'other';
+  const row = await getDb().get<{ main_agent_group_id: string | null; external_email_agent_group_id: string | null }>(
+    'SELECT main_agent_group_id, external_email_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
+  );
+  if (row?.main_agent_group_id === agentGroupId) return 'main';
+  if (row?.external_email_agent_group_id === agentGroupId) return 'external-email';
+  return 'other';
+}
+
 export async function getGwsEaProfile(): Promise<GwsEaProfile> {
   const profile = await getDb().get<Omit<GwsEaProfile, 'principal_emails'>>(
     `SELECT assistant_display_name, assistant_workspace_email, principal_display_name,
-            principal_timezone, main_agent_group_id, updated_at
+            principal_timezone, main_agent_group_id, external_email_agent_group_id, updated_at
        FROM gws_ea_profile
       WHERE singleton = 1`,
   );

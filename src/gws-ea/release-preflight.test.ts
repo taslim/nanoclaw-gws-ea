@@ -113,6 +113,26 @@ async function releaseFixture(): Promise<string> {
       2,
     ) + '\n',
   );
+  await write(
+    root,
+    'templates/gws-ea/external-email/plugin.json',
+    JSON.stringify(
+      {
+        $schema: 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json',
+        name: 'gws-ea-external-email',
+        version: '1.0.0',
+        description: 'fixture',
+        extensions: { 'ai.nanoco.nanoclaw': { agentName: 'external-email' } },
+      },
+      null,
+      2,
+    ) + '\n',
+  );
+  for (const file of ['index.ts', 'group.ts', 'destination-policy.ts']) {
+    await write(root, `src/modules/gws-ea-external-email/${file}`, 'export {};\n');
+  }
+  await write(root, 'src/modules/gws-ea-external-email/guidance.md', '# external-email\n');
+  await write(root, 'container/agent-runner/src/mcp-tools/files-send.instructions.md', '# files-send\n');
   await write(root, 'templates/gws-ea/main/skills/welcome/SKILL.md', '# Welcome\n');
   await write(root, 'bin/ncl', '#!/usr/bin/env bash\nexit 0\n');
   await write(root, 'bin/gws-ea', '#!/usr/bin/env bash\nexit 0\n');
@@ -160,7 +180,7 @@ async function releaseFixture(): Promise<string> {
   await write(
     root,
     'src/modules/index.ts',
-    "import './capabilities/index.js';\nimport './gws-ea-google/index.js';\nimport './gws-ea-main/index.js';\nimport './gws-ea-profile/index.js';\nimport './gws-ea-preferences/index.js';\nimport './gws-ea-people/index.js';\nimport './gws-ea-notices/index.js';\nimport './gws-ea-privacy/index.js';\n",
+    "import './capabilities/index.js';\nimport './gws-ea-google/index.js';\nimport './gws-ea-main/index.js';\nimport './gws-ea-profile/index.js';\nimport './gws-ea-preferences/index.js';\nimport './gws-ea-people/index.js';\nimport './gws-ea-notices/index.js';\nimport './gws-ea-privacy/index.js';\nimport './gws-ea-external-email/index.js';\n",
   );
   await write(root, 'src/provider-contracts/claude.ts', "export const provider = 'claude';\n");
   await write(root, 'src/provider-contracts/index.ts', "import './claude.js';\n");
@@ -273,6 +293,8 @@ describe('release preflight', () => {
 
   it.each([
     ['template', 'templates/gws-ea/main/plugin.json', 'incomplete_release'],
+    ['external-email template', 'templates/gws-ea/external-email/plugin.json', 'incomplete_release'],
+    ['external-email guidance', 'src/modules/gws-ea-external-email/guidance.md', 'incomplete_release'],
     ['GWS-EA welcome', 'templates/gws-ea/main/skills/welcome/SKILL.md', 'incomplete_release'],
     ['GWS-EA guidance', 'src/modules/gws-ea-main/guidance.md', 'incomplete_release'],
     ['GWS-EA Google access', 'src/modules/gws-ea-google/index.ts', 'incomplete_release'],

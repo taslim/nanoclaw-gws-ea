@@ -281,6 +281,12 @@ async function validateComposition(
     'src/provider-credential.ts',
     'templates/gws-ea/main/plugin.json',
     'templates/gws-ea/main/skills/welcome/SKILL.md',
+    'templates/gws-ea/external-email/plugin.json',
+    'src/modules/gws-ea-external-email/index.ts',
+    'src/modules/gws-ea-external-email/group.ts',
+    'src/modules/gws-ea-external-email/destination-policy.ts',
+    'src/modules/gws-ea-external-email/guidance.md',
+    'container/agent-runner/src/mcp-tools/files-send.instructions.md',
     'container/skills/gcalendar/SKILL.md',
     'container/skills/gcalendar/instructions.md',
     'container/skills/gmail/SKILL.md',
@@ -343,6 +349,7 @@ async function validateComposition(
       { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-people/index', code: 'incomplete_release' },
       { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-notices/index', code: 'incomplete_release' },
       { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-privacy/index', code: 'incomplete_release' },
+      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-external-email/index', code: 'incomplete_release' },
       { barrel: 'src/modules/index.ts', moduleName: 'capabilities/index', code: 'incomplete_release' },
       { barrel: 'src/gateway-providers/index.ts', moduleName: 'installed', code: 'gateway_not_composed' },
       { barrel: 'src/gateway-providers/installed.ts', moduleName: 'onecli', code: 'gateway_not_composed' },
@@ -371,11 +378,18 @@ async function validateComposition(
     throw error;
   }
 
-  const template = await readJson(path.join(checkoutRoot, 'templates/gws-ea/main/plugin.json'), 'gws-ea/main template');
-  const extensions = requireRecord(template.extensions, 'gws-ea/main extensions', INCOMPLETE);
-  const nanoclaw = requireRecord(extensions['ai.nanoco.nanoclaw'], 'gws-ea/main NanoClaw extension', INCOMPLETE);
-  if (template.name !== 'gws-ea-main' || nanoclaw.agentName !== 'main') {
-    throw new GwsEaError('incomplete_release', 'Committed gws-ea/main template is not the canonical main assistant');
+  await assertProductTemplate(checkoutRoot, 'main');
+  await assertProductTemplate(checkoutRoot, 'external-email');
+}
+
+/** A product agent's committed template must stamp exactly that agent. */
+async function assertProductTemplate(checkoutRoot: string, agentName: 'main' | 'external-email'): Promise<void> {
+  const label = `gws-ea/${agentName}`;
+  const template = await readJson(path.join(checkoutRoot, `templates/${label}/plugin.json`), `${label} template`);
+  const extensions = requireRecord(template.extensions, `${label} extensions`, INCOMPLETE);
+  const nanoclaw = requireRecord(extensions['ai.nanoco.nanoclaw'], `${label} NanoClaw extension`, INCOMPLETE);
+  if (template.name !== `gws-ea-${agentName}` || nanoclaw.agentName !== agentName) {
+    throw new GwsEaError('incomplete_release', `Committed ${label} template is not the canonical ${agentName} agent`);
   }
 }
 

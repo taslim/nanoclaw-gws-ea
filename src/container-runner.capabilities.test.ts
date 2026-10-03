@@ -77,10 +77,13 @@ describe('restricted surfaces', () => {
     const mounts = await mountsFor(ag, ['reply', 'files-write']);
 
     const byPath = new Map(mounts.map((mount) => [mount.containerPath, mount]));
-    expect(byPath.get('/home/node/.claude/skills')).toMatchObject({
-      hostPath: path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared', 'skills'),
-      readonly: true,
-    });
+    // Without conversation-context its sessions are sealed, so the Claude home
+    // is the session's own, and its skills are reachable through the writable
+    // session mount too: the same read-only layer goes over both paths.
+    const sessionSkills = path.join(DATA_DIR, 'v2-sessions', ag.id, `${ag.id}-session`, '.claude-shared', 'skills');
+    for (const containerPath of ['/home/node/.claude/skills', '/workspace/.claude-shared/skills']) {
+      expect(byPath.get(containerPath), containerPath).toMatchObject({ hostPath: sessionSkills, readonly: true });
+    }
     expect(byPath.get('/workspace/agent/.claude')).toMatchObject({
       hostPath: path.join(GROUPS_DIR, ag.folder, '.claude'),
       readonly: true,
@@ -91,6 +94,7 @@ describe('restricted surfaces', () => {
     expect(byPath.get('/workspace/agent')).toMatchObject({ readonly: false });
     const order = mounts.map((mount) => mount.containerPath);
     expect(order.indexOf('/home/node/.claude/skills')).toBeGreaterThan(order.indexOf('/home/node/.claude'));
+    expect(order.indexOf('/workspace/.claude-shared/skills')).toBeGreaterThan(order.indexOf('/workspace'));
     expect(order.indexOf('/workspace/agent/.claude')).toBeGreaterThan(order.indexOf('/workspace/agent'));
     // The composed document and container.json are read-only for every group.
     expect(byPath.get('/workspace/agent/CLAUDE.md')).toMatchObject({ readonly: true });

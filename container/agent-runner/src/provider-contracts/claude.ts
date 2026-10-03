@@ -63,12 +63,16 @@ function writeMemorySessionHook(hook: RuntimeMemoryHookInput): void {
   const nextSessionStart = sessionStart
     .map((entry) => removeMemoryCommands(entry, memoryCommands))
     .filter((entry) => entry !== undefined);
-  nextSessionStart.push({
-    matcher: hook.sources.join('|'),
-    hooks: [{ type: 'command', command: hook.command, timeout: 10 }],
-  });
+  // A registration with no sources keeps memory off: the hook is only removed.
+  if (hook.sources.length > 0) {
+    nextSessionStart.push({
+      matcher: hook.sources.join('|'),
+      hooks: [{ type: 'command', command: hook.command, timeout: 10 }],
+    });
+  }
 
-  hooks.SessionStart = nextSessionStart;
+  if (nextSessionStart.length > 0) hooks.SessionStart = nextSessionStart;
+  else delete hooks.SessionStart;
   parsed.hooks = hooks;
   // Seed user defaults; existing values and higher-priority project/local settings win.
   const settings = { ...tone.toSettings(tone.default), ...parsed };

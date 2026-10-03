@@ -23,6 +23,7 @@ import { FIXTURE_POLICY } from '../../drivers/spec-fixture.js';
 import type { SessionDriver } from '../../drivers/types.js';
 import { guard } from '../../guard/index.js';
 import type { PendingApproval } from '../../types.js';
+import { registerProtectedGroupPolicy } from '../../cli/guard.js';
 import { selfModAddMcpServer, selfModInstallPackages } from './guard.js';
 
 const agent = { kind: 'agent', agentGroupId: 'g1', sessionId: 's1' } as const;
@@ -85,5 +86,26 @@ describe('add_mcp_server needs no rebuild and must not inherit the gate', () => 
     // silently strip a real capability from every group on such a driver.
     const decision = await guard(selfModAddMcpServer, { actor: agent, payload: { name: 'srv' } });
     expect(decision.effect).toBe('hold');
+  });
+});
+
+describe('a protected agent group', () => {
+  registerProtectedGroupPolicy('self-mod-test:protected', (agentGroupId) =>
+    agentGroupId === 'g-protected' ? 'it is the host’s alone' : undefined,
+  );
+  const protectedAgent = { kind: 'agent', agentGroupId: 'g-protected', sessionId: 's1' } as const;
+
+  it('is DENIED every self-modification, never carded for approval', async () => {
+    withDocker();
+    for (const action of [selfModInstallPackages, selfModAddMcpServer]) {
+      const decision = await guard(action, { actor: protectedAgent, payload: { apt: ['jq'], name: 'srv' } });
+      expect(decision).toMatchObject({ effect: 'deny', reason: expect.stringContaining('it is the host’s alone') });
+    }
+  });
+
+  it('leaves every other group to hold for approval as before', async () => {
+    withDocker();
+    expect((await guard(selfModInstallPackages, { actor: agent, payload: { apt: ['jq'] } })).effect).toBe('hold');
+    expect((await guard(selfModAddMcpServer, { actor: agent, payload: { name: 'srv' } })).effect).toBe('hold');
   });
 });

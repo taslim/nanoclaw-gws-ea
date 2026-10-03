@@ -13,15 +13,21 @@ import {
   getGwsEaProfile,
   getMainAgentGroupId,
   listPrincipalAddresses,
+  projectDocAudience,
   reconcileGwsEaProfile,
   removePrincipalAddress,
   validateGwsEaProfileInput,
 } from './db.js';
-import { gwsEaPrincipalAddressesMigration, gwsEaProfileMigration } from './migration.js';
+import {
+  gwsEaExternalEmailPointerMigration,
+  gwsEaPrincipalAddressesMigration,
+  gwsEaProfileMigration,
+} from './migration.js';
 import './wiring-policy.js';
 
 registerMigration(gwsEaProfileMigration);
 registerMigration(gwsEaPrincipalAddressesMigration);
+registerMigration(gwsEaExternalEmailPointerMigration);
 
 function escapeMarkdownInline(value: string): string {
   const special = new Set(['\\', '`', '*', '_', '{', '}', '[', ']', '<', '>', '#']);
@@ -54,21 +60,29 @@ function assistantAddressSentence(assistant: string, email: string | null): stri
 export const MAIN_PRINCIPAL_ADDRESSES_POINTER =
   " The principal's email addresses decide which calendars are theirs. Read them with `ncl principal-addresses list` before you decide whose a calendar is: the list is the only current copy, and an address may have been added or removed since you last read it.";
 
+/**
+ * Who the assistant and the principal are, for each audience (KTD14). Main
+ * reads the principal's addresses live. `external-email` writes to people
+ * other than the principal, so it gets the two names and no address of
+ * either. Any other group gets the addresses as of its container's start:
+ * the default `group` CLI scope leaves the live list out of its reach.
+ */
 async function identitySection(group: AgentGroup): Promise<{ name: string; body: string } | undefined> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return undefined;
   const profile = await getGwsEaProfile();
   if (profile.assistant_display_name === null || profile.principal_display_name === null) return undefined;
   const assistant = escapeMarkdownInline(profile.assistant_display_name);
   const principal = escapeMarkdownInline(profile.principal_display_name);
-  // The default `group` CLI scope leaves the list out of reach of other groups,
-  // so they get the addresses as of their container's start.
+  const names = `${assistant} is the assistant. ${principal} is the principal. They are separate people: act and communicate as ${assistant}, support ${principal}, and never present the assistant as the principal.`;
+  const audience = await projectDocAudience(group.id);
+  if (audience === 'external-email') return { name: 'Assistant Identity', body: names };
   const addresses =
-    group.id === profile.main_agent_group_id
+    audience === 'main'
       ? MAIN_PRINCIPAL_ADDRESSES_POINTER
       : principalAddressesSentence(principal, profile.principal_emails);
   return {
     name: 'Assistant Identity',
-    body: `${assistant} is the assistant. ${principal} is the principal. They are separate people: act and communicate as ${assistant}, support ${principal}, and never present the assistant as the principal.${assistantAddressSentence(assistant, profile.assistant_workspace_email)}${addresses}`,
+    body: `${names}${assistantAddressSentence(assistant, profile.assistant_workspace_email)}${addresses}`,
   };
 }
 

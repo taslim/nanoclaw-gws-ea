@@ -20,7 +20,7 @@ import {
   type SetPreferenceInput,
   type Weekday,
 } from './db.js';
-import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { getMainAgentGroupId, projectDocAudience } from '../gws-ea-profile/db.js';
 import { gwsEaPreferencesMigration } from './migration.js';
 
 registerMigration(gwsEaPreferencesMigration);
@@ -92,15 +92,17 @@ function summarizeSchedulingPreferences(values: SchedulingPreferenceValues): str
 export const MAIN_PREFERENCES_POINTER =
   "The principal's scheduling preferences (working hours, protected times, default meeting lengths, buffers, and preferred times) live in their typed store. Read them with `ncl preferences get` before you schedule anything or describe them: the store is the only current copy, and a value from earlier in the conversation may have changed since.";
 
-async function isCanonicalMain(group: AgentGroup): Promise<boolean> {
-  return (await getDb().hasTable('gws_ea_profile')) && group.id === (await getMainAgentGroupId());
-}
-
+/**
+ * The preferences each audience is given (KTD14). `external-email` gets
+ * none: it learns the principal's time only as free slots from the host.
+ * Other groups cannot read the store, so they get the values as of their
+ * container's start, never a basis or a reason.
+ */
 async function preferencesSection(group: AgentGroup): Promise<RequiredProjectDocSection | undefined> {
   if (!(await getDb().hasTable('gws_ea_pref_working_hours'))) return undefined;
-  if (await isCanonicalMain(group)) return { name: 'Scheduling Preferences', body: MAIN_PREFERENCES_POINTER };
-  // Other groups cannot read the store, so they get the values as of their
-  // container's start, never a basis or a reason.
+  const audience = await projectDocAudience(group.id);
+  if (audience === 'main') return { name: 'Scheduling Preferences', body: MAIN_PREFERENCES_POINTER };
+  if (audience === 'external-email') return undefined;
   const body = summarizeSchedulingPreferences(await getSchedulingPreferenceValues());
   return body === undefined ? undefined : { name: 'Scheduling Preferences', body };
 }
