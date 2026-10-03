@@ -458,7 +458,7 @@ export const outcome: McpToolDefinition = {
   tool: {
     name: 'outcome',
     description:
-      "Report how this conversation's meeting ended, once. booked: after book succeeded. settled: the organizer moved their invitation. needs-room: nothing in the window fits, for someone in the inner circle or close. not-scheduling: the thread is not about arranging a meeting. gave-up: no time could be agreed. The host fills in the details for the principal.",
+      "Report how this conversation's meeting ended. Report each ending once, except needs-room, which you report again whenever free_time says so. booked: after book succeeded. settled: the organizer moved their invitation. needs-room: nothing in the window fits, for someone in the inner circle or close. not-scheduling: the thread is not about arranging a meeting. gave-up: no time could be agreed. The host fills in the details for the principal.",
     inputSchema: {
       type: 'object' as const,
       properties: {

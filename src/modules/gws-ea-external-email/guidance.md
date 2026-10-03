@@ -21,7 +21,7 @@ Those are the only times known to be free and within the principal's preferences
 
 ## How a meeting ends
 
-Report how each meeting ends through `outcome`, once.
+Report how each meeting ends through `outcome`, once. Report `needs-room` again only when `free_time` tells you to.
 Report booked only after `book` succeeded, never for a time someone only agreed to.
 Report needs-room only when nothing in the window fits someone in the inner circle or close; for anyone else, offer the open times there are, or report gave-up.
 When the principal copies you into a thread that isn't about scheduling, send nothing in it and report not-scheduling.

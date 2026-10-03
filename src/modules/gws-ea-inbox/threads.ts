@@ -17,6 +17,8 @@
  *
  * `allowedRecipients` and `getThreadParticipants` read a thread;
  * `closeThread` ends it, after which its mail reaches `main` as a note.
+ * `handBackCopiedInThread` returns a copied-in thread whose arrange failed
+ * to waiting for arrange, its held mail kept.
  */
 import { randomUUID } from 'node:crypto';
 
@@ -274,6 +276,18 @@ export async function allowedRecipients(threadKey: string): Promise<readonly str
 export async function getThreadParticipants(threadKey: string): Promise<ThreadView | undefined> {
   const thread = await getThread(requireKey(threadKey));
   return thread ? view(thread) : undefined;
+}
+
+/**
+ * Hand a copied-in thread whose arrange failed back to the principal: it
+ * waits for arrange again, its mail held as before. Closing the session it
+ * had is the caller's; the next arrange opens a new one.
+ */
+export async function handBackCopiedInThread(threadKey: string): Promise<void> {
+  const thread = await requireThread(threadKey);
+  if (thread.origin !== 'copy-in') throw new Error(`Thread ${threadKey} was not copied in`);
+  if (thread.state === 'awaiting-arrange' || thread.state === 'closed') return;
+  await updateThread(threadKey, { state: 'awaiting-arrange' }, new Date().toISOString());
 }
 
 /** End a thread: nothing more is held or delivered to its session, and later mail reaches `main` as a note. */

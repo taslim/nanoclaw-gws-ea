@@ -50,6 +50,7 @@ import type { Session } from '../../types.js';
 import { getThreadParticipants, GoogleApiError } from '../gws-ea-inbox/index.js';
 import { setSchedulingPreference } from '../gws-ea-preferences/db.js';
 import type { Person } from '../gws-ea-people/db.js';
+import { claimGiveUp } from './db.js';
 import { getBooking, runFollowThrough, type Meeting } from './index.js';
 import type { StoredEvent } from './testing/fake-calendar.js';
 import {
@@ -134,10 +135,15 @@ async function offered(person: Person, extra: Record<string, unknown> = {}): Pro
   return { stored, session, slots };
 }
 
-/** A counterpart writes in the meeting's thread. */
-async function theyWrite(from: string, body: string): Promise<void> {
-  const [first] = scheduling.gmail.sent;
-  scheduling.gmail.receive({ threadId: first.threadId, from, to: [ROBIN], subject: 'Re: Partnership intro', body });
+/** A counterpart writes in the thread of an email the assistant sent, the first by default. */
+async function theyWrite(from: string, body: string, inThreadOf = scheduling.gmail.sent[0]): Promise<void> {
+  scheduling.gmail.receive({
+    threadId: inThreadOf.threadId,
+    from,
+    to: [ROBIN],
+    subject: 'Re: Partnership intro',
+    body,
+  });
   await scheduling.inbox.tick();
 }
 
@@ -317,6 +323,102 @@ describe('deadlines', () => {
     await reach('2026-10-07T09:01:00.000Z');
     expect(notes(session, NUDGE)).toHaveLength(1);
     expect((await meeting(stored.id)).state).toBe('active');
+  });
+
+  describe('act on each meeting as it is when the pass reaches it', () => {
+    /** While the pass releases the first meeting's holds with Google, `meanwhile` runs. */
+    function duringFirstRelease(meanwhile: () => Promise<void>): void {
+      const deleteEvent = scheduling.calendar.deleteEvent.bind(scheduling.calendar);
+      vi.spyOn(scheduling.calendar, 'deleteEvent').mockImplementationOnce(async (...args) => {
+        await meanwhile();
+        return deleteEvent(...args);
+      });
+    }
+
+    /** Pat replies in their meeting's thread: the second the assistant wrote to. */
+    const patReplies = () =>
+      theyWrite(`Pat Lee <${ADDRESSES.pat}>`, 'Sorry for the wait: the second time works.', scheduling.gmail.sent[1]);
+
+    it('so a reply read after the pass began stops its give-up', async () => {
+      const acme = await offered(scheduling.people.acme);
+      vi.setSystemTime(new Date('2026-10-05T07:30:00.000Z'));
+      const pat = await offered(scheduling.people.pat);
+      // Both held before Monday's working day began: both are nudged on Wednesday, and give up on Friday.
+      await reach('2026-10-07T08:01:00.000Z');
+      expect(await meeting(pat.stored.id)).toMatchObject({ nudge_at: null, give_up_at: '2026-10-09T08:01:00.000Z' });
+
+      // Friday's pass reads both, and gives up on Acme's first; Pat replies meanwhile.
+      duringFirstRelease(patReplies);
+      await reach('2026-10-09T08:02:00.000Z');
+
+      expect((await meeting(acme.stored.id)).state).toBe('gave-up');
+      expect(contents(pat.session).some((content) => content.text?.includes('the second time works'))).toBe(true);
+      // Pat's quiet count starts again from the reply, and the meeting carries on.
+      expect(await meeting(pat.stored.id)).toMatchObject({
+        state: 'active',
+        nudge_at: '2026-10-13T08:02:00.000Z',
+        give_up_at: '2026-10-15T08:02:00.000Z',
+      });
+      expect((await getSession(pat.session.id))?.status).toBe('active');
+      expect(vi.mocked(killContainer)).not.toHaveBeenCalledWith(pat.session.id, expect.anything());
+      expect(holds().filter((event) => event.tags?.gwsEaMeeting === pat.stored.id)).toHaveLength(3);
+      expect(notes(scheduling.main, OUTCOME).map((note) => note.note?.meeting_id)).toEqual([acme.stored.id]);
+    });
+
+    it('so a reply read after the pass began stops its nudge', async () => {
+      const acme = await offered(scheduling.people.acme);
+      await reach('2026-10-07T08:01:00.000Z');
+      // Pat's times are held on Wednesday at 09:05, so Pat's nudge comes due on Friday at 09:05.
+      vi.setSystemTime(new Date('2026-10-07T08:05:00.000Z'));
+      const pat = await offered(scheduling.people.pat);
+      expect(await meeting(pat.stored.id)).toMatchObject({ nudge_at: '2026-10-09T08:05:00.000Z' });
+
+      // Friday's pass reads both, and gives up on Acme's first; Pat replies meanwhile.
+      duringFirstRelease(patReplies);
+      await reach('2026-10-09T08:06:00.000Z');
+
+      expect((await meeting(acme.stored.id)).state).toBe('gave-up');
+      expect(notes(pat.session, NUDGE)).toEqual([]);
+      expect(await meeting(pat.stored.id)).toMatchObject({ state: 'active', nudge_at: '2026-10-13T08:06:00.000Z' });
+    });
+  });
+
+  it('stand as they were when main cannot be told of a give-up, and a later pass gives up', async () => {
+    const { stored, session } = await offered(scheduling.people.acme);
+    await reach('2026-10-07T08:01:00.000Z');
+    await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = NULL WHERE singleton = 1');
+    await reach('2026-10-09T08:02:00.000Z');
+    // Nothing ended that main has not heard of: the times stay held, and a reply would still count.
+    expect(await meeting(stored.id)).toMatchObject({
+      state: 'active',
+      ended_at: null,
+      give_up_at: '2026-10-09T08:01:00.000Z',
+    });
+    expect(holds()).toHaveLength(3);
+    expect((await getSession(session.id))?.status).toBe('active');
+
+    await getDb().run("UPDATE gws_ea_profile SET main_agent_group_id = 'ag-main' WHERE singleton = 1");
+    await reach('2026-10-09T08:03:00.000Z');
+    expect(await meeting(stored.id)).toMatchObject({ state: 'gave-up', give_up_at: null });
+    expect(holds()).toEqual([]);
+    expect(notes(scheduling.main, OUTCOME)).toHaveLength(1);
+  });
+
+  it('finish a give-up the host claimed and then stopped before ending', async () => {
+    const { stored, session } = await offered(scheduling.people.acme);
+    await reach('2026-10-07T08:01:00.000Z');
+    vi.setSystemTime(new Date('2026-10-09T08:02:00.000Z'));
+    expect(await claimGiveUp(stored.id, '2026-10-09T08:01:00.000Z', new Date().toISOString())).toBe(true);
+
+    // The host comes back.
+    await reach('2026-10-09T08:03:00.000Z');
+    expect(await meeting(stored.id)).toMatchObject({ state: 'gave-up', nudge_at: null, give_up_at: null });
+    expect((await getSession(session.id))?.status).toBe('closed');
+    expect(await getThreadParticipants(stored.thread_key)).toMatchObject({ state: 'closed' });
+    expect(holds()).toEqual([]);
+    const [gaveUp, ...again] = notes(scheduling.main, OUTCOME);
+    expect(again).toEqual([]);
+    expect(gaveUp.note).toMatchObject({ meeting_id: stored.id, outcome: 'gave-up', unanswered: true });
   });
 
   it('release on a later pass the holds a give-up could not release at once', async () => {

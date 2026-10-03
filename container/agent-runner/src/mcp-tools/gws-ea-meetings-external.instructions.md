@@ -16,4 +16,4 @@ You never see the principal's calendar. The host offers times for your meeting, 
 - When `free_time` finds nothing open, its answer says which outcome to report.
 - If a call fails because Google could not be reached, make the same call again: a repeat creates nothing twice.
 
-**`outcome`** reports how the meeting ended, once, with the meeting id from your brief: `booked`, `settled`, `needs-room`, `not-scheduling`, or `gave-up`. The host fills in the details for the principal. If the host refuses an outcome, its answer says why; do what it says instead of sending the same outcome again.
+**`outcome`** reports how the meeting ended, with the meeting id from your brief: `booked`, `settled`, `needs-room`, `not-scheduling`, or `gave-up`. Report each ending once. `needs-room` is the one you may report again: when a new brief or freed time still leaves nothing in the window, `free_time` tells you to report it. The host fills in the details for the principal. If the host refuses an outcome, its answer says why; do what it says instead of sending the same outcome again.

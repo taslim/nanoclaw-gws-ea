@@ -63,6 +63,7 @@ import {
   closeThread,
   EMAIL_CHANNEL_TYPE,
   getThreadParticipants,
+  GoogleApiError,
   INBOX_PLATFORM_ID,
   mintThreadKey,
   openThreadSession,
@@ -70,6 +71,7 @@ import {
 } from '../gws-ea-inbox/index.js';
 import { normalizeAddress } from '../gws-ea-inbox/mime.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
+import { handBackCopiedInThread } from '../gws-ea-inbox/threads.js';
 import { findPeople, getPerson } from '../gws-ea-people/db.js';
 import { checkOutbound, deleteThreadRecord, type ThreadKey } from '../gws-ea-privacy/index.js';
 import { getSchedulingPreferenceValues, type SchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
@@ -77,6 +79,7 @@ import { getGwsEaProfile, listPrincipalAddresses } from '../gws-ea-profile/db.js
 import type { CalendarEvent, MeetingsCalendarApi } from './calendar-api.js';
 import { blocksTime, eventSpan } from './slots.js';
 import {
+  claimGiveUp,
   clearDeadlines,
   deleteMeeting,
   findBookedMeetingForEvent,
@@ -98,6 +101,7 @@ import {
   OUTCOMES,
   recordOutcome,
   recordResponse,
+  releaseGiveUp,
   updateMeeting,
   type Booking,
   type Meeting,
@@ -587,6 +591,21 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   }
 
   /**
+   * Open the thread to its mail and hand over what it held; how many reached
+   * the session now. Gmail failing for a moment fails nothing: the thread is
+   * open by then, so the inbox's next poll hands over what is still held.
+   */
+  async function releaseHeld(threadKey: string): Promise<number> {
+    try {
+      return (await releaseHeldMail(threadKey)).released;
+    } catch (error) {
+      if (!(error instanceof GoogleApiError) || !error.retryable) throw error;
+      log.warn('Held mail waits for the next inbox poll: Gmail could not be read', { threadKey, err: error });
+      return 0;
+    }
+  }
+
+  /**
    * Bind the meeting to its thread and session, write the brief, and only
    * then let the thread's mail in. Every step is safe to repeat, so a replay
    * after a restart finishes what the first attempt began.
@@ -614,7 +633,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       opening.kind === 'new' ? 'new-thread' : opening.kind === 'copy-in' ? 'copied-in' : 'continuing';
     await writeBrief({ ...meeting, session_id: session.id }, session, 1, setting);
     await updateMeeting(meeting.id, { brief_version: 1 }, new Date().toISOString());
-    const released = opening.kind === 'takeover' ? 0 : (await releaseHeldMail(meeting.thread_key)).released;
+    const released = opening.kind === 'takeover' ? 0 : await releaseHeld(meeting.thread_key);
     // Held mail reaching the session woke it; otherwise the brief does.
     if (released === 0) await requestWake(session, 'inbound-message');
     await updateMeeting(meeting.id, { state: 'active' }, new Date().toISOString());
@@ -640,10 +659,12 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       }
       await updateMeeting(meeting.id, { state: 'failed', ended_at: at }, at);
       const thread = await getThreadParticipants(meeting.thread_key);
-      // A copied-in thread still waiting for arrange stays the principal's to hand over again.
       if (!thread || thread.state === 'closed' || thread.state === 'awaiting-arrange') return;
+      // A copied-in thread stays the principal's to hand over again, its held mail kept.
+      // Either way its mail stops first, so none reaches the session being closed.
+      if (thread.origin === 'copy-in') await handBackCopiedInThread(meeting.thread_key);
+      else await closeThread(meeting.thread_key);
       if (thread.sessionId !== null) await closeSession(thread.sessionId, true);
-      await closeThread(meeting.thread_key);
     } catch (err) {
       log.error('A meeting that failed to open could not be undone', { meetingId: meeting.id, err });
     }
@@ -1352,12 +1373,15 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     }
   }
 
-  async function outcome(content: Record<string, unknown>, session: Session): Promise<Answer> {
+  async function outcome(content: Record<string, unknown>, session: Session, requestId: string): Promise<Answer> {
     const meeting = await requireMeeting(meetingIdOf(content));
     const kind = OUTCOMES.find((value) => value === content.outcome);
     if (kind === undefined) throw invalid(`outcome must be one of ${OUTCOMES.join(', ')}`);
     if (meeting.session_id !== session.id) throw refused("That meeting is not this conversation's");
-    const recorded = await getRecordedOutcome(meeting.id, kind);
+    // needs-room leaves the meeting being arranged, and comes again when an amended window or a
+    // turned-down room still leaves no time: each report is new. Every other outcome is reported once.
+    const repeatable = kind === 'needs-room';
+    const recorded = repeatable ? undefined : await getRecordedOutcome(meeting.id, kind);
     if (recorded !== undefined) return { meetingId: meeting.id, data: JSON.parse(recorded) as Record<string, unknown> };
     // A replay that stopped between the state change and the record finishes here.
     if (meeting.state !== 'active' && meeting.state !== OUTCOME_STATES[kind]) {
@@ -1426,9 +1450,14 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         ? { invitation: { calendar_id: meeting.event_calendar_id, event_id: meeting.event_id } }
         : {}),
     };
-    // The note's id is fixed per meeting and outcome, so it is written once
-    // however often this runs; the state changes after it are safe to repeat.
-    await writeOutcomeNote(note, outcomeText(meeting, kind, booking, await mainTimezone(), room), at);
+    // The note's id is fixed per meeting and outcome, or per needs-room report, so it is written
+    // once however often this runs; the state changes after it are safe to repeat.
+    await writeOutcomeNote(
+      note,
+      outcomeText(meeting, kind, booking, await mainTimezone(), room),
+      at,
+      repeatable ? requestId : undefined,
+    );
     if (kind === 'booked') {
       await updateMeeting(meeting.id, { state: 'booked' }, at);
       await clearDeadlines(meeting.id, at);
@@ -1458,8 +1487,8 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   /** Stop the meeting: its state, its deadlines, and its session, which never wakes again. */
   async function stopMeeting(meeting: Meeting, state: MeetingState, kill: boolean): Promise<void> {
     const at = new Date().toISOString();
-    await updateMeeting(meeting.id, { state, ended_at: meeting.ended_at ?? at }, at);
-    await clearDeadlines(meeting.id, at);
+    // One write: an ended meeting never shows a deadline, which marks a give-up not yet finished.
+    await updateMeeting(meeting.id, { state, ended_at: meeting.ended_at ?? at, nudge_at: null, give_up_at: null }, at);
     if (meeting.session_id !== null) await closeSession(meeting.session_id, kill);
   }
 
@@ -1525,35 +1554,48 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   }
 
   /**
-   * Give up on a meeting nobody answered (KTD12, R9): the host reports
-   * gave-up to main itself, ends the meeting and its conversation, and
-   * releases its holds, with no agent turn. Safe to repeat: the note is
-   * written once, and a release that fails leaves its holds for a later pass.
+   * Give up on a meeting nobody answered (KTD12, R9), once it claims the
+   * deadline `giveUpAt` it came due on: a reply read first started the count
+   * again, and wins. The host reports gave-up to main itself, ends the
+   * meeting and its conversation, and releases its holds, with no agent turn.
+   * Safe to repeat: a claimed give-up keeps its deadline until the meeting is
+   * stopped, and one main could not be told of is released; the note is
+   * written once, and a release of holds that fails leaves them for a later pass.
    */
-  async function giveUpUnanswered(meeting: Meeting): Promise<void> {
-    const current = await requireMeeting(meeting.id);
-    if (current.state !== 'active') return;
+  async function giveUpUnanswered(meeting: Meeting, giveUpAt: string): Promise<void> {
     const at = new Date().toISOString();
-    const room = await roomContext(current, 'gave-up');
+    if (!(await claimGiveUp(meeting.id, giveUpAt, at))) return;
+    const current = await requireMeeting(meeting.id);
+    try {
+      await reportUnanswered(current, at);
+    } catch (error) {
+      await releaseGiveUp(current.id, giveUpAt, new Date().toISOString());
+      throw error;
+    }
+    await endMeeting(current, 'gave-up', true);
+  }
+
+  /** Tell main nobody answered the meeting, and record the outcome. */
+  async function reportUnanswered(meeting: Meeting, at: string): Promise<void> {
+    const room = await roomContext(meeting, 'gave-up');
     const note: OutcomeNote = {
       type: OUTCOME_NOTE_TYPE,
-      meeting_id: current.id,
+      meeting_id: meeting.id,
       outcome: 'gave-up',
-      kind: current.kind,
-      purpose: current.purpose,
-      level: current.level,
-      counterparts: noteCounterparts(current),
+      kind: meeting.kind,
+      purpose: meeting.purpose,
+      level: meeting.level,
+      counterparts: noteCounterparts(meeting),
       unanswered: true,
     };
     const text =
-      `Nobody answered meeting ${current.id}, "${current.purpose}" with ${who(current)}, in the two working days after a nudge, ` +
+      `Nobody answered meeting ${meeting.id}, "${meeting.purpose}" with ${who(meeting)}, in the two working days after a nudge, ` +
       'so its held times were released and its thread closed. Tell the principal in one line, with a suggestion, ' +
       'such as another way to reach them or a later window.' +
       roomStillNeeded(room);
     await writeOutcomeNote(note, text, at);
-    const data = { meeting_id: current.id, outcome: 'gave-up', message: OUTCOME_REPLIES['gave-up'] };
-    await recordOutcome(current.id, 'gave-up', JSON.stringify(data), at);
-    await endMeeting(current, 'gave-up', true);
+    const data = { meeting_id: meeting.id, outcome: 'gave-up', message: OUTCOME_REPLIES['gave-up'] };
+    await recordOutcome(meeting.id, 'gave-up', JSON.stringify(data), at);
   }
 
   /** A thread the audience check stopped: its meeting ends at once, so the thread can wake nothing. */

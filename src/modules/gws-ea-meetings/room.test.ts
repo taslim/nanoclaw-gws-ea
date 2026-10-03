@@ -45,6 +45,7 @@ vi.mock('./calendar-api.js', async (importOriginal) => {
 });
 
 import { getDb } from '../../db/connection.js';
+import { getDeliveryAction } from '../../delivery.js';
 import { requestWake } from '../../request-wake.js';
 import type { Session } from '../../types.js';
 import type { Person } from '../gws-ea-people/db.js';
@@ -302,5 +303,44 @@ describe('making room', () => {
     );
     expect(sameLevel).toMatch(/Lee Wu/);
     expect((await meeting(withLee.stored.id)).state).toBe('booked');
+  });
+
+  it('lists the meetings that could move again when an amended meeting still needs room, once per report', async () => {
+    const { people } = scheduling;
+    const coffee = await bookedAt([people.pat], '2026-10-08', '10:00', 30, 'Coffee');
+    const tea = await bookedAt([people.pat], '2026-10-09', '10:00', 30, 'Tea');
+    // Thursday and Friday mornings are full around them.
+    for (const day of ['2026-10-08', '2026-10-09']) {
+      scheduling.calendar.put(own(`evt-early-${day}`, `${day}T08:00:00Z`, `${day}T09:00:00Z`));
+      scheduling.calendar.put(own(`evt-late-${day}`, `${day}T09:30:00Z`, `${day}T11:00:00Z`));
+    }
+    const dana = await danaNeedsRoom();
+    expect((dana.note.note?.candidates as Candidate[]).map((c) => c.meeting_id)).toEqual([coffee.stored.id]);
+
+    // main moves the meeting to Friday morning, where nothing is open either: it still needs room.
+    data(
+      await ask(scheduling.main, 'meeting_amend', {
+        meeting_id: dana.stored.id,
+        window_start: '2026-10-09T09:00:00+01:00',
+        window_end: '2026-10-09T12:00:00+01:00',
+      }),
+    );
+    expect(data(await ask(dana.session, 'meeting_free_time', { meeting_id: dana.stored.id })).slots).toEqual([]);
+    const report = { meeting_id: dana.stored.id, outcome: 'needs-room' };
+    data(await ask(dana.session, 'meeting_outcome', report, 'req-needs-room-again'));
+
+    const needsRoom = () => notes(scheduling.main, OUTCOME).filter((c) => c.note?.outcome === 'needs-room');
+    expect(needsRoom()).toHaveLength(2);
+    // main hears of it again, with what could move in the new window.
+    expect((needsRoom()[1].note?.candidates as Candidate[]).map((c) => c.meeting_id)).toEqual([tea.stored.id]);
+
+    // The host stopped after the note but before it recorded the answer: the replay writes no third note.
+    await getDb().run('DELETE FROM gws_ea_meeting_requests WHERE request_id = ?', 'req-needs-room-again');
+    await getDeliveryAction('meeting_outcome')?.(
+      { action: 'meeting_outcome', requestId: 'req-needs-room-again', ...report },
+      dana.session,
+    );
+    expect(needsRoom()).toHaveLength(2);
+    expect((await meeting(dana.stored.id)).state).toBe('active');
   });
 });

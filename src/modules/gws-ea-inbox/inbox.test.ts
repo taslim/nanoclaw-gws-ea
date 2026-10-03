@@ -58,9 +58,10 @@ import {
 import { dispatch } from '../../cli/dispatch.js';
 import { getDb } from '../../db/connection.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
+import { getDeliveryAttempt } from '../../db/coordination.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { getMessagingGroupAgents, getMessagingGroupsByChannel } from '../../db/messaging-groups.js';
-import { deliverSessionMessages, setDeliveryAdapter } from '../../delivery.js';
+import { deliverSessionMessages, registerOutboundGuard, setDeliveryAdapter } from '../../delivery.js';
 import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { requestWake } from '../../request-wake.js';
 import { routeInbound } from '../../router.js';
@@ -108,6 +109,7 @@ const PRINCIPAL = 'pat@principal.example';
 const PRINCIPAL_HOME = 'pat@home.example';
 const PRINCIPAL_USER = 'gchat:users/pat';
 const SAM = 'sam@acme.example';
+const LEE = 'lee@acme.example';
 const SALES = 'sales@acme.example';
 
 // ---------------------------------------------------------------------------
@@ -476,12 +478,29 @@ function to(mail: SentMail): string[] {
   return (header(mail.headers, 'To') ?? '').split(',').map((a) => a.trim());
 }
 
+/**
+ * Runs once, inside the next email send, after the audience check resolved its
+ * recipients and before the inbox sends it: mail the poll takes in at that
+ * moment. Guards run in registration order, so this one follows the privacy
+ * guard registered when its module loaded.
+ */
+let betweenCheckAndSend: (() => Promise<void>) | undefined;
+registerOutboundGuard('test:between-check-and-send', async (send) => {
+  const run = betweenCheckAndSend;
+  if (send.channelType === 'email' && run) {
+    betweenCheckAndSend = undefined;
+    await run();
+  }
+  return { effect: 'allow' };
+});
+
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
   await runMigrations(await initTestDb());
   vi.mocked(requestWake).mockClear();
   poisoned.clear();
+  betweenCheckAndSend = undefined;
   chatSends = [];
 
   for (const [id, name] of [
@@ -934,6 +953,43 @@ describe('outbound mail', () => {
     await reply(session, threadKey, 'Noted.');
     expect(to(gmail.sent[1])).toEqual([SAM]);
     expect(header(gmail.sent[1].headers, 'Cc')).toBeUndefined();
+  });
+
+  it('holds a reply whose recipients changed after its audience check, then checks and sends it to the new list', async () => {
+    const { threadKey, session } = await arrangeWithSam();
+    await reply(session, threadKey, 'Hello Sam');
+    // Sam's colleague, whom Gmail authenticates, replies to all after the check saw only Sam.
+    betweenCheckAndSend = async () => {
+      gmail.receive({ threadId: gmail.sent[0].threadId, from: `Lee <${LEE}>`, cc: [SAM], body: 'Adding myself.' });
+      await inbox.tick();
+    };
+    const id = await reply(session, threadKey, 'Tuesday at 10:00 works.');
+    expect(gmail.sent).toHaveLength(1);
+    expect((await getDeliveryAttempt(id))?.last_error).toBe(
+      "The thread's recipients changed after the reply was checked; it is checked and sent again",
+    );
+
+    await deliverSessionMessages(session);
+    expect(gmail.sent).toHaveLength(2);
+    expect(to(gmail.sent[1]).sort()).toEqual([LEE, SAM]);
+    expect(deliveryStatus(session, id)).toBe('delivered');
+  });
+
+  it('sends once when mail between the check and the send leaves the same recipients in another order', async () => {
+    const { threadKey, session } = await arrangeWithSam();
+    await reply(session, threadKey, 'Hello Sam');
+    gmail.receive({ threadId: gmail.sent[0].threadId, from: `Lee <${LEE}>`, cc: [SAM], body: 'Adding myself.' });
+    await inbox.tick();
+    expect((await getThreadParticipants(threadKey))?.participants).toEqual([LEE, SAM]);
+    betweenCheckAndSend = async () => {
+      gmail.receive({ threadId: gmail.sent[0].threadId, from: `Sam <${SAM}>`, cc: [LEE], body: 'Welcome, Lee.' });
+      await inbox.tick();
+    };
+    const id = await reply(session, threadKey, 'Tuesday at 10:00 works.');
+    expect((await getThreadParticipants(threadKey))?.participants).toEqual([SAM, LEE]);
+    expect(gmail.sent).toHaveLength(2);
+    expect(to(gmail.sent[1]).sort()).toEqual([LEE, SAM]);
+    expect(deliveryStatus(session, id)).toBe('delivered');
   });
 
   it('copies only the principal address used on a copied-in thread, and none on an arrange thread', async () => {

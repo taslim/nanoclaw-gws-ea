@@ -297,11 +297,42 @@ export async function recordNudged(id: string, nudgeAt: string, giveUpAt: string
   );
 }
 
-/** Every meeting still being arranged that has a deadline running. */
+/**
+ * Claim the give-up due at `giveUpAt`: the meeting stops being arranged at
+ * once, so a reply read after this restarts nothing, and keeps the deadline
+ * until it has ended, so a pass after a failure or a restart finishes it.
+ * False when that deadline no longer stands: a reply started the count again,
+ * or a booking or an outcome ended it first.
+ */
+export async function claimGiveUp(id: string, giveUpAt: string, at: string): Promise<boolean> {
+  const result = await getDb().run(
+    `UPDATE gws_ea_meetings SET state = 'gave-up', ended_at = COALESCE(ended_at, ?), updated_at = ?
+      WHERE id = ? AND state IN ('active', 'gave-up') AND nudge_at IS NULL AND give_up_at = ?`,
+    at,
+    at,
+    id,
+    giveUpAt,
+  );
+  return result.changes > 0;
+}
+
+/** Release a claimed give-up main could not be told of: the meeting is arranged again until a later pass reports it. */
+export async function releaseGiveUp(id: string, giveUpAt: string, at: string): Promise<void> {
+  await getDb().run(
+    `UPDATE gws_ea_meetings SET state = 'active', ended_at = NULL, updated_at = ?
+      WHERE id = ? AND state = 'gave-up' AND give_up_at = ?`,
+    at,
+    id,
+    giveUpAt,
+  );
+}
+
+/** Every meeting still being arranged that has a deadline running, and every give-up claimed but not yet finished. */
 export async function listMeetingsWithDeadlines(): Promise<Meeting[]> {
   const rows = await getDb().all<MeetingRow>(
     `SELECT * FROM gws_ea_meetings
-      WHERE state = 'active' AND (nudge_at IS NOT NULL OR give_up_at IS NOT NULL)
+      WHERE (state = 'active' AND (nudge_at IS NOT NULL OR give_up_at IS NOT NULL))
+         OR (state = 'gave-up' AND give_up_at IS NOT NULL)
       ORDER BY created_at`,
   );
   return Promise.all(rows.map((row) => attachCounterparts(row)));

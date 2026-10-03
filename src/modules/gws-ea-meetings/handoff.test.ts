@@ -422,6 +422,83 @@ describe('arrange', () => {
     expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'open' });
   });
 
+  describe('a copied-in thread with mail held for it', () => {
+    const fields = () => ({
+      calendar_id: PRINCIPAL,
+      length_minutes: 45,
+      ...WINDOW,
+      purpose: 'Partnership follow-up',
+    });
+
+    async function copiedInWithHeldMail(): Promise<string> {
+      const threadKey = await copyRobinIn();
+      gmail.receive({
+        threadId: 'g-acme',
+        from: `Acme Sales <${SALES}>`,
+        to: [PRINCIPAL],
+        cc: [ROBIN],
+        subject: 'Re: Partnership',
+        body: 'Thursday afternoon works for us.',
+      });
+      await inbox.tick();
+      return threadKey;
+    }
+
+    it('opens when Gmail cannot be read as its mail is handed over, and the next poll hands the mail over', async () => {
+      const threadKey = await copiedInWithHeldMail();
+      vi.spyOn(gmail, 'getMessage').mockRejectedValueOnce(
+        new GoogleApiError(503, 'Google refused /gmail/v1/users/me/messages: backend error'),
+      );
+
+      const answer = data(await ask(main, 'meeting_arrange', { thread_key: threadKey, ...fields() }));
+      const stored = await meeting(answer.meeting_id);
+      expect(stored.state).toBe('active');
+      expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'open' });
+      const session = await meetingSession(stored.id);
+      // The brief wakes the session; the mail is still held.
+      expect(contents(session).map((c) => c.brief?.meeting_id)).toEqual([stored.id]);
+      expect(vi.mocked(requestWake)).toHaveBeenCalledWith(
+        expect.objectContaining({ id: session.id }),
+        'inbound-message',
+      );
+
+      await inbox.tick();
+      const [, held, ...more] = contents(session);
+      expect(more).toEqual([]);
+      expect(held.text).toContain('Thursday afternoon works for us.');
+      expect(await count('gws_ea_inbox_held')).toBe(0);
+      expect(await count('gws_ea_meetings')).toBe(1);
+    });
+
+    it('is handed back to wait for arrange, its held mail kept, when its arrange fails, so main can arrange it again', async () => {
+      const threadKey = await copiedInWithHeldMail();
+      vi.spyOn(gmail, 'getMessage').mockRejectedValueOnce(
+        new GoogleApiError(403, 'Google refused /gmail/v1/users/me/messages: insufficient permission'),
+      );
+
+      expect(await ask(main, 'meeting_arrange', { thread_key: threadKey, ...fields() })).toMatchObject({
+        ok: false,
+        error: { code: 'handler-error' },
+      });
+      const failed = await getDb().get<{ state: string; session_id: string }>(
+        'SELECT state, session_id FROM gws_ea_meetings',
+      );
+      expect(failed?.state).toBe('failed');
+      expect((await getSession(String(failed?.session_id)))?.status).toBe('closed');
+      expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'awaiting-arrange' });
+      expect(await count('gws_ea_inbox_held')).toBe(1);
+
+      const answer = data(await ask(main, 'meeting_arrange', { thread_key: threadKey, ...fields() }));
+      const session = await meetingSession(answer.meeting_id);
+      expect(session.id).not.toBe(failed?.session_id);
+      const [brief, held, ...more] = contents(session);
+      expect(more).toEqual([]);
+      expect(brief.brief?.meeting_id).toBe(answer.meeting_id);
+      expect(held.text).toContain('Thursday afternoon works for us.');
+      expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'open' });
+    });
+  });
+
   it('is refused to every caller but main', async () => {
     const other = (await resolveSession('ag-other', 'mg-other', null, 'shared')).session;
     expect(refusal(await ask(other, 'meeting_arrange', arrangeWith(sam)))).toMatch(/main/);

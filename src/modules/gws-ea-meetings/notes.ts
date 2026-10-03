@@ -127,9 +127,13 @@ export async function writeMainNote<Note extends { readonly type: string; readon
   }
 }
 
-/** Write how a meeting ended into main's shared session, once per meeting and outcome. */
-export async function writeOutcomeNote(note: OutcomeNote, text: string, at: string): Promise<void> {
-  await writeMainNote(`meeting-${note.outcome}-${note.meeting_id}`, note, text, at);
+/**
+ * Write how a meeting ended into main's shared session, once per meeting and
+ * outcome; with `report`, the request that carried it, once per report.
+ */
+export async function writeOutcomeNote(note: OutcomeNote, text: string, at: string, report?: string): Promise<void> {
+  const id = `meeting-${note.outcome}-${note.meeting_id}`;
+  await writeMainNote(report === undefined ? id : `${id}-${report}`, note, text, at);
 }
 
 /**

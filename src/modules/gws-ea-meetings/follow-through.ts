@@ -31,6 +31,7 @@ import type { MeetingsCalendarApi } from './calendar-api.js';
 import {
   clearDeadlines,
   findLiveMeetingOnThread,
+  getMeeting,
   listHolds,
   listMeetingsWithDeadlines,
   listOpenBookings,
@@ -69,8 +70,11 @@ export interface FollowThroughDeps {
   /** The host's own Calendar client. */
   readonly calendar: () => MeetingsCalendarApi;
   readonly inboxHealth: () => Promise<InboxHealth>;
-  /** Report gave-up for a meeting nobody answered, end it, and release its holds (throws when a hold stays). */
-  readonly giveUp: (meeting: Meeting) => Promise<void>;
+  /**
+   * Report gave-up for a meeting nobody answered, end it, and release its
+   * holds (throws when a hold stays), unless the deadline `giveUpAt` no longer stands.
+   */
+  readonly giveUp: (meeting: Meeting, giveUpAt: string) => Promise<void>;
   /** End a booked meeting whose event has passed: its conversation and thread close. */
   readonly closeBooked: (meeting: Meeting) => Promise<void>;
   /** Release every hold the meeting still has recorded (throws when one stays). */
@@ -100,8 +104,14 @@ async function step(what: string, meetingId: string, action: () => Promise<void>
 }
 
 export function createFollowThrough(deps: FollowThroughDeps) {
-  /** Wake the meeting's session to nudge once, and count two working days on to giving up. */
-  async function nudge(meeting: Meeting, nudgeAt: string, now: number): Promise<void> {
+  /**
+   * Wake the meeting's session to nudge once, and count two working days on
+   * to giving up; nothing when the deadline `nudgeAt` no longer stands.
+   */
+  async function nudge(meetingId: string, nudgeAt: string, now: number): Promise<void> {
+    // Read again: a reply since the pass listed the meeting started its count again.
+    const meeting = await getMeeting(meetingId);
+    if (meeting?.state !== 'active' || meeting.nudge_at !== nudgeAt) return;
     const at = new Date(now).toISOString();
     const session = meeting.session_id === null ? undefined : await getSession(meeting.session_id);
     if (session?.status === 'active') {
@@ -122,21 +132,26 @@ export function createFollowThrough(deps: FollowThroughDeps) {
     await recordNudged(meeting.id, nudgeAt, giveUpAt, at);
   }
 
+  /**
+   * Each meeting's due deadline, from one read of the store. Earlier
+   * meetings' steps take time, so each step acts only while the deadline it
+   * was read with still stands.
+   */
   async function runDeadlines(now: number): Promise<void> {
     const meetings = await listMeetingsWithDeadlines();
     if (meetings.length === 0) return;
     const health = await deps.inboxHealth();
     for (const meeting of meetings) {
       // The nudge comes first: a give-up never fires before the nudge it follows.
-      if (meeting.nudge_at !== null) {
-        const nudgeAt = meeting.nudge_at;
+      const { nudge_at: nudgeAt, give_up_at: giveUpAt } = meeting;
+      if (nudgeAt !== null) {
         if (isDue(nudgeAt, now) && readPast(health, Date.parse(nudgeAt))) {
-          await step('nudge', meeting.id, () => nudge(meeting, nudgeAt, now));
+          await step('nudge', meeting.id, () => nudge(meeting.id, nudgeAt, now));
         }
         continue;
       }
-      if (isDue(meeting.give_up_at, now) && readPast(health, Date.parse(meeting.give_up_at))) {
-        await step('give up', meeting.id, () => deps.giveUp(meeting));
+      if (isDue(giveUpAt, now) && readPast(health, Date.parse(giveUpAt))) {
+        await step('give up', meeting.id, () => deps.giveUp(meeting, giveUpAt));
       }
     }
   }

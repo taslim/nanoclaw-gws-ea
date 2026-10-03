@@ -50,6 +50,7 @@ const REQUIRED_GUIDANCE = [
   'Offer two or three times at once, so the other person can choose in one reply.',
   'Offer only times `free_time` returned, and hold or book each one by its slot id.',
   'Report how each meeting ends through `outcome`, once.',
+  'Report `needs-room` again only when `free_time` tells you to.',
   'Report booked only after `book` succeeded, never for a time someone only agreed to.',
   'Report needs-room only when nothing in the window fits someone in the inner circle or close; for anyone else, offer the open times there are, or report gave-up.',
   "When the principal copies you into a thread that isn't about scheduling, send nothing in it and report not-scheduling.",
