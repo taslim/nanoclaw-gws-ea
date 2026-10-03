@@ -132,10 +132,14 @@ async function releaseFixture(): Promise<string> {
   await write(root, 'src/gateway-providers/installed.ts', "import './onecli.js';\n");
   await write(root, 'src/gateway-providers/onecli.ts', 'export {};\n');
   await write(root, 'src/gateway-providers/onecli-files.ts', 'export {};\n');
+  await write(root, 'src/gateway-providers/onecli-credentials.ts', 'export {};\n');
   await write(root, 'container/skills/onecli-gateway/SKILL.md', '# OneCLI gateway\n');
   await write(root, 'container/skills/onecli-gateway/instructions.md', '# OneCLI instructions\n');
   await write(root, 'container/skills/gcalendar/SKILL.md', '# gcalendar\n');
   await write(root, 'container/skills/gcalendar/instructions.md', '# gcalendar rules\n');
+  await write(root, 'container/skills/gmail/SKILL.md', '# gmail\n');
+  await write(root, 'container/skills/gpeople/SKILL.md', '# gpeople\n');
+  await write(root, 'src/container-env.ts', 'export {};\n');
   await write(root, 'src/gws-ea/process.ts', 'export {};\n');
   await write(root, 'src/gws-ea/cloudflare-connector.ts', 'export {};\n');
   await write(root, 'scripts/init-first-agent.ts', 'export {};\n');
@@ -273,6 +277,9 @@ describe('release preflight', () => {
     ['GWS-EA guidance', 'src/modules/gws-ea-main/guidance.md', 'incomplete_release'],
     ['GWS-EA Google access', 'src/modules/gws-ea-google/index.ts', 'incomplete_release'],
     ['Google Calendar rules', 'container/skills/gcalendar/instructions.md', 'incomplete_release'],
+    ['Gmail skill', 'container/skills/gmail/SKILL.md', 'incomplete_release'],
+    ['Workspace directory skill', 'container/skills/gpeople/SKILL.md', 'incomplete_release'],
+    ['module container env seam', 'src/container-env.ts', 'incomplete_release'],
     ['Google Chat adapter', 'src/channels/gchat.ts', 'incomplete_release'],
     ['GWS-EA interactive launcher', 'setup/gws-ea-input.ts', 'incomplete_release'],
     ['GWS-EA service launcher', 'src/gws-ea/process.ts', 'incomplete_release'],
@@ -284,6 +291,7 @@ describe('release preflight', () => {
     ['GWS-EA private values migration', 'src/modules/gws-ea-privacy/migration.ts', 'incomplete_release'],
     ['per-group capabilities migration', 'src/modules/capabilities/migration.ts', 'incomplete_release'],
     ['OneCLI gateway adapter', 'src/gateway-providers/onecli.ts', 'gateway_not_composed'],
+    ['OneCLI credential connection', 'src/gateway-providers/onecli-credentials.ts', 'gateway_not_composed'],
     ['OneCLI agent instructions', 'container/skills/onecli-gateway/SKILL.md', 'gateway_not_composed'],
     ['provider host contract', 'src/provider-contracts/claude.ts', 'provider_not_composed'],
     ['provider runtime', 'container/agent-runner/src/providers/claude.ts', 'provider_not_composed'],

@@ -5,6 +5,7 @@ vi.mock('./log.js', () => ({
 }));
 
 import {
+  credentialsWithinCapabilities,
   grantsInstructions,
   isRestricted,
   listCapabilityKeys,
@@ -37,10 +38,13 @@ const BUILT_IN = [
 
 // A key a module adds for one product agent: never part of `all`.
 registerCapability('fixture-product-tools', { description: 'fixture', default: 'off', instructions: ['fixture'] });
+// Keys a module adds whose tools reach stored gateway credentials.
+registerCapability('fixture-vault-a', { description: 'fixture', default: 'off', credentials: ['vault-a'] });
+registerCapability('fixture-vault-b', { description: 'fixture', default: 'off', credentials: ['vault-b', 'vault-a'] });
 
 describe('capability registry', () => {
   it('registers every built-in key, with module keys after them', () => {
-    expect(listCapabilityKeys()).toEqual([...BUILT_IN, 'fixture-product-tools']);
+    expect(listCapabilityKeys()).toEqual([...BUILT_IN, 'fixture-product-tools', 'fixture-vault-a', 'fixture-vault-b']);
   });
 
   it('refuses a duplicate, malformed, or reserved key', () => {
@@ -127,6 +131,17 @@ describe('what a list grants on the host', () => {
     ]);
     expect(skillsWithinCapabilities(['welcome', 'agent-browser', 'gcalendar'], replyAndTime)).toEqual(['welcome']);
     expect(skillsWithinCapabilities(['welcome'], new Set(['time']))).toEqual([]);
+  });
+
+  it('names every credential the held keys bring, once each, in registry order', () => {
+    expect(credentialsWithinCapabilities(new Set(['fixture-vault-b', 'reply', 'fixture-vault-a']))).toEqual([
+      'vault-a',
+      'vault-b',
+    ]);
+    expect(credentialsWithinCapabilities(new Set(['fixture-vault-b']))).toEqual(['vault-b', 'vault-a']);
+    // Built-in keys name none, so a list of them may use no stored credential at all.
+    expect(credentialsWithinCapabilities(all)).toEqual([]);
+    expect(credentialsWithinCapabilities(replyAndTime)).toEqual([]);
   });
 
   it('teaches the gateway and lifts the read-only layers only with a shell', () => {

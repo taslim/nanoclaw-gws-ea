@@ -75,9 +75,13 @@ manages only resources it owns. Everything else is core's.
 ```ts
 interface GatewayProviderDefinition {
   kind: string;
+  credentials?: {
+    connection(target: GatewayCredentialTarget): GatewayRuntimeCredentialConnection;
+  };
   agentSkills: readonly string[];
   sessions: {
     ensure(input: GatewaySessionInput, signal: AbortSignal): Promise<GatewaySessionLease>;
+    enforcesCredentialScope?: true;
     reapOrphans?(): void | Promise<void>;
   };
   approvals: {
@@ -91,6 +95,39 @@ interface GatewayProviderDefinition {
 `disposition` distinguishes creation from adoption: an adapter must not create
 replacement identity for a runtime that survived a host restart. Core invokes
 optional `reapOrphans` only after it has considered surviving runtimes.
+
+**`ensure` applies the session's credential scope.** `GatewaySessionInput`
+carries `credentialScope`, which core derives at every spawn and adoption from
+the group's capabilities. A capability names the gateway credentials it lets
+an agent use in its definition (`CapabilityDef.credentials` in
+`src/capabilities.ts`), and `credentialsWithinCapabilities` collects them for
+a group's held keys:
+
+- `{ kind: 'all' }` for a group stored as `all`. It adds no restriction: the
+  identity keeps whatever the gateway's own policy grants it, and an adapter
+  must not widen or narrow it on NanoClaw's behalf.
+- `{ kind: 'only', credentials, modelDomains }` for a group with an explicit
+  list. The identity may use exactly the named credentials (connection names,
+  as in `GatewayCredentialTarget.name`) plus those injected within the agent
+  provider's `modelDomains`, a domain covering its subdomains. A named
+  credential the gateway does not hold is simply not granted.
+
+Only a gateway that declares `sessions.enforcesCredentialScope: true` receives
+an `only` scope. Core checks the declaration before it calls `ensure`
+(`assertCredentialScopeEnforced`) and refuses to start the session otherwise,
+naming the gateway and the group, because an older adapter would ignore the
+scope and give a restricted agent everything its policy allows. A declaring
+adapter applies the scope before `ensure` returns, so the agent never runs
+with more, and re-applies it on every call, because the gateway may have
+recreated the identity in its default mode since. When it cannot apply or
+verify the scope, `ensure` fails and the session does not start.
+
+OneCLI applies `only` as selective secret mode with exactly the matching
+secret ids, refuses two secrets with one scoped name, reads the result back,
+and then flushes its gateway's cached connect decisions
+(`POST /v1/cache/invalidate`): the gateway caches each agent's resolved
+injections for up to a minute, and OneCLI's agent routes do not flush that
+cache themselves.
 
 The signal stops the current host's observation. Existing install-scoped
 adapters can retain their signal cleanup. Adapters owning per-session resources
@@ -350,6 +387,27 @@ credential — and to refuse plaintext endpoints early. OneCLI declares nothing.
 `PROVIDER_CREDENTIAL_CONNECTION_SEAM_VERSION` gates a provider skill whose
 install needs `connection()`; an older core's store lacks it and the skill must
 refuse before copying any payload.
+
+## Runtime credentials
+
+The connection contract lives in `src/gateway-providers/credential-connection.ts`,
+because the host compiles only `src/`; `setup/gateways/credential-store.ts`
+re-exports it unchanged, so setup and the host share one definition. A gateway
+that lets the host store caller-described credentials while it runs declares
+`credentials.connection(target)` on its definition. It returns a
+`GatewayRuntimeCredentialConnection`: the setup contract plus `remove()`, which
+deletes the entry `find()` observed, does nothing when it observed none, and,
+like the writes, re-reads native metadata and refuses an entry that changed
+since. A host module that writes a credential (a token it refreshes, for
+example) uses only this connection, never the gateway's native API, and is
+that credential's only writer.
+
+OneCLI implements the connection once, in its payload's
+`src/gateway-providers/onecli-credentials.ts`. The installed copy serves its
+provider definition; its setup scripts import the payload copy in place, so
+the file has no runtime import and each caller passes its own management
+settings. Its requests carry the configured project (`X-Project-Id`), refuse
+redirects, and never echo a response, which can preview a secret.
 
 ## Account connection is separate from request approval
 

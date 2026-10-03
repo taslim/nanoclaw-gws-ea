@@ -28,7 +28,7 @@ function fixture(kind: string, skills: readonly string[], calls: string[]): Gate
     agentSkills: skills,
     sessions: {
       async ensure(input, signal) {
-        calls.push(`ensure:${input.runtimeIdentity}:${signal.aborted}`);
+        calls.push(`ensure:${input.runtimeIdentity}:${input.credentialScope.kind}:${signal.aborted}`);
         return { contribution: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' } } } };
       },
     },
@@ -48,6 +48,7 @@ const input: GatewaySessionInput = {
   containerName: 'test-session',
   groupName: 'Fixture',
   capabilities: {} as never,
+  credentialScope: { kind: 'only', credentials: ['fixture-credential'], modelDomains: ['example.com'] },
 };
 
 describe('gateway provider registry', () => {
@@ -69,11 +70,29 @@ describe('gateway provider registry', () => {
     approvalSubscription.abort();
     await selected.approvals.subscribe(async () => 'deny', approvalSubscription.signal);
 
-    expect(activeCalls).toEqual(['ensure:test/g1/s1:false', 'ensure:test/g1/s1:false', 'subscribe:active']);
+    expect(activeCalls).toEqual(['ensure:test/g1/s1:only:false', 'ensure:test/g1/s1:only:false', 'subscribe:active']);
     expect(inactiveCalls).toEqual([]);
     expect(gateway.selectGatewayAgentSkills(['welcome', 'inactive-skill'], true)).toEqual(['welcome', 'active-skill']);
     // An agent with no way to use the gateway is taught none.
     expect(gateway.selectGatewayAgentSkills(['welcome', 'inactive-skill', 'active-skill'], false)).toEqual(['welcome']);
+  });
+
+  it('refuses a restricted session on a gateway that does not declare it enforces credential scopes', async () => {
+    const registry = await import('./gateway-provider-registry.js');
+    const undeclared = fixture('undeclared', [], []);
+    const declared: GatewayProviderDefinition = {
+      ...undeclared,
+      kind: 'declared',
+      sessions: { ...undeclared.sessions, enforcesCredentialScope: true },
+    };
+    const open = { ...input, credentialScope: { kind: 'all' } } satisfies GatewaySessionInput;
+
+    expect(() => registry.assertCredentialScopeEnforced(undeclared, input)).toThrow(
+      "Gateway 'undeclared' does not enforce credential scopes, so agent group Fixture (g1), " +
+        'whose capabilities restrict its credentials, cannot start',
+    );
+    expect(() => registry.assertCredentialScopeEnforced(undeclared, open)).not.toThrow();
+    expect(() => registry.assertCredentialScopeEnforced(declared, input)).not.toThrow();
   });
 
   it('fails closed when the selected registration is missing', async () => {
@@ -100,7 +119,7 @@ describe('gateway provider registry', () => {
 
   it('keeps provider implementations outside NanoClaw orchestration registries', () => {
     const dir = path.dirname(fileURLToPath(import.meta.url));
-    const coreFiles = new Set(['gateway-provider-registry.ts', 'index.ts', 'installed.ts']);
+    const coreFiles = new Set(['gateway-provider-registry.ts', 'index.ts', 'installed.ts', 'credential-connection.ts']);
     const forbidden = [
       'host-lifecycle',
       '/delivery',

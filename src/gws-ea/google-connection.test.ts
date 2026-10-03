@@ -2,7 +2,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { GOOGLE_SERVICES, GOOGLE_SIGN_IN_SCOPES, type GoogleGrant } from '../modules/gws-ea-google/grant.js';
+import {
+  AGENT_GOOGLE_SERVICES,
+  EXPOSED_GOOGLE_SERVICES,
+  GOOGLE_SIGN_IN_SCOPES,
+  HOST_GOOGLE_SERVICES,
+  type GoogleGrant,
+} from '../modules/gws-ea-google/grant.js';
 import { GOOGLE_TOKEN_ENDPOINT } from '../modules/gws-ea-google/tokens.js';
 import type { AssistantGoogleSignInRequest } from './events.js';
 import { GOOGLE_WORKSPACE_APIS, type GcpProjectInput } from './gcloud.js';
@@ -17,6 +23,7 @@ import {
 import type { Observation, ProvisionHumanPause, StepResource } from './phases.js';
 import type { SanitizedCommand, SanitizedCommandOutcome } from './process.js';
 import type { InstanceRuntimeConfig } from './service.js';
+import { GwsEaError } from './types.js';
 
 const ROOT = '/tmp/nanoclaw-gws-ea-google-connection-test';
 const SECRETS = path.join(ROOT, 'secrets');
@@ -59,18 +66,31 @@ const GCP: GcpProjectInput = {
   cwd: ROOT,
 };
 
-/** Google Cloud, Google's OAuth and Calendar endpoints, and OneCLI's secrets API, in memory. */
+/**
+ * Google Cloud, Google's OAuth and Calendar endpoints, and OneCLI's secrets
+ * API, in memory. The vault is read-only to this step: only the host's
+ * refresher publishes, which `publish()` stands in for.
+ */
 class World {
   enabledApis = new Set<string>(['chat.googleapis.com']);
-  secrets = new Map<string, { id: string; hostPattern: string; value: string }>();
+  secrets: { id: string; name: string; hostPattern: string }[] = [];
   calendarStatus = 200;
   calendarId = ACCOUNT;
   minted = 0;
   readonly gcloudCalls: string[] = [];
+  /** Every request to OneCLI other than a read of its secret metadata. */
+  readonly vaultWrites: string[] = [];
 
   revoked = false;
-  /** A second secret by the same name, as a creation race between the refresher and this step leaves. */
-  duplicateSecret = false;
+
+  /** What the host's refresher does once it sees a sign-in: one secret per agent-facing service. */
+  publish(): void {
+    for (const id of EXPOSED_GOOGLE_SERVICES) {
+      const service = AGENT_GOOGLE_SERVICES[id];
+      if (this.secrets.some((secret) => secret.name === service.secretName)) continue;
+      this.secrets.push({ id: `sec-${id}`, name: service.secretName, hostPattern: service.hostPattern });
+    }
+  }
 
   readonly runCommand = vi.fn(async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> => {
     const args = command.args.filter((arg) => !arg.startsWith('--account=') && arg !== '--quiet');
@@ -101,27 +121,11 @@ class World {
     }
     const route = new URL(url).pathname;
     if (new Headers(init?.headers).get('authorization') !== 'Bearer oc_admin_key') return json({}, 401);
-    if (route === '/v1/secrets' && init?.method === 'GET') {
-      const listed = [...this.secrets].map(([name, s]) => ({ id: s.id, name, hostPattern: s.hostPattern }));
-      const [first] = listed;
-      return json(this.duplicateSecret && first ? [...listed, { ...first, id: 'sec-duplicate' }] : listed);
+    if (route === '/v1/secrets' && (init?.method ?? 'GET') === 'GET') {
+      expect(init?.redirect).toBe('error');
+      return json(this.secrets);
     }
-    if (route === '/v1/secrets/sec-duplicate' && init?.method === 'DELETE') {
-      this.duplicateSecret = false;
-      return json({});
-    }
-    const body = JSON.parse(String(init?.body ?? '{}')) as { name?: string; hostPattern: string; value: string };
-    if (route === '/v1/secrets' && init?.method === 'POST') {
-      this.secrets.set(String(body.name), { id: 'sec-1', hostPattern: body.hostPattern, value: body.value });
-      return json({}, 201);
-    }
-    if (route === '/v1/secrets/sec-1' && init?.method === 'PATCH') {
-      for (const [name, secret] of this.secrets) {
-        if (secret.id === 'sec-1')
-          this.secrets.set(name, { ...secret, hostPattern: body.hostPattern, value: body.value });
-      }
-      return json({ success: true });
-    }
+    this.vaultWrites.push(`${init?.method ?? 'GET'} ${route}`);
     return json({}, 404);
   }) as unknown as typeof globalThis.fetch;
 }
@@ -175,6 +179,19 @@ async function connect(
   return undefined;
 }
 
+/** The step's resources against `world`, where the host publishes once the step has waited `afterWaits` times. */
+function resourcesFor(world: World, afterWaits = 1): readonly StepResource<GoogleConnectionContext>[] {
+  let waits = 0;
+  return googleConnectionResources({
+    gcloud: { runCommand: world.runCommand },
+    fetch: world.fetch,
+    sleep: async () => {
+      waits += 1;
+      if (waits >= afterWaits) world.publish();
+    },
+  });
+}
+
 function writeDownloadedClient(mode = 0o600): string {
   const file = path.join(ROOT, 'downloads', 'client.json');
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -195,11 +212,12 @@ describe("connecting the assistant's Google account", () => {
   it('enables the APIs, then pauses for the OAuth client with Console instructions', async () => {
     const world = new World();
     const signIn = vi.fn(async () => grant());
-    const resources = googleConnectionResources({ gcloud: { runCommand: world.runCommand }, fetch: world.fetch });
+    const resources = resourcesFor(world);
 
     const pause = await connect(resources, context(signIn));
 
     for (const api of GOOGLE_WORKSPACE_APIS) expect(world.enabledApis.has(api)).toBe(true);
+    expect(GOOGLE_WORKSPACE_APIS).toContain('people.googleapis.com');
     expect(pause).toMatchObject({
       phase: 'connect_google',
       code: 'google_client_required',
@@ -211,13 +229,13 @@ describe("connecting the assistant's Google account", () => {
     expect(signIn).not.toHaveBeenCalled();
   });
 
-  it('signs in with the supplied client, keeps the grant, and puts a Calendar token in OneCLI', async () => {
+  it('signs in with the supplied client and keeps the grant, writing nothing into OneCLI', async () => {
     const world = new World();
     const signIn = vi.fn(async (request: AssistantGoogleSignInRequest) => {
       expect(request).toMatchObject({ client: CLIENT, account: ACCOUNT });
       return grant();
     });
-    const resources = googleConnectionResources({ gcloud: { runCommand: world.runCommand }, fetch: world.fetch });
+    const resources = resourcesFor(world);
 
     await expect(connect(resources, context(signIn, writeDownloadedClient()))).resolves.toBeUndefined();
 
@@ -225,14 +243,51 @@ describe("connecting the assistant's Google account", () => {
     expect(fs.statSync(grantFile).mode & 0o777).toBe(0o600);
     expect(JSON.parse(fs.readFileSync(grantFile, 'utf8'))).toMatchObject({ account: ACCOUNT, ...CLIENT });
     expect(fs.existsSync(path.join(SECRETS, 'google-oauth-client.json'))).toBe(false);
-    expect(world.secrets.get(GOOGLE_SERVICES.calendar.secretName)).toMatchObject({ hostPattern: 'www.googleapis.com' });
+    expect(world.vaultWrites).toEqual([]);
     expect(signIn).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits for the host to publish each service's secret before the step is done", async () => {
+    const world = new World();
+    const resources = resourcesFor(world, 3);
+    await connect(
+      resources.slice(0, 3),
+      context(async () => grant(), writeDownloadedClient()),
+    );
+    const access = resources[3]!;
+
+    expect(await access.observe(context(async () => grant()))).toEqual({
+      status: 'absent',
+      reason: 'OneCLI has no google-calendar, google-gmail-read, or google-directory secret yet',
+    });
+    await expect(access.apply(context(async () => grant()))).resolves.toBeUndefined();
+
+    expect(await access.observe(context(async () => grant()))).toEqual({ status: 'present' });
+    expect(world.secrets.map((secret) => [secret.name, secret.hostPattern])).toEqual([
+      ['google-calendar', 'www.googleapis.com'],
+      ['google-gmail-read', 'gmail.googleapis.com'],
+      ['google-directory', 'people.googleapis.com'],
+    ]);
+    expect(world.vaultWrites).toEqual([]);
+  });
+
+  it('gives up waiting with the reason, when the host never publishes', async () => {
+    const world = new World();
+    const resources = resourcesFor(world, Number.POSITIVE_INFINITY);
+    fs.writeFileSync(path.join(SECRETS, 'google-grant.json'), JSON.stringify(grant()), { mode: 0o600 });
+
+    const error = await resources[3]!.apply(context(async () => grant())).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(GwsEaError);
+    expect(error).toMatchObject({ code: 'google_access_unpublished' });
+    expect(String(error)).toMatch(/host has not published.*google-calendar.*host's log/su);
+    expect(world.vaultWrites).toEqual([]);
   });
 
   it('changes nothing when run again on a connected assistant', async () => {
     const world = new World();
     const signIn = vi.fn(async () => grant());
-    const resources = googleConnectionResources({ gcloud: { runCommand: world.runCommand }, fetch: world.fetch });
+    const resources = resourcesFor(world);
     await connect(resources, context(signIn, writeDownloadedClient()));
     const enables = world.gcloudCalls.filter((call) => call.startsWith('services enable')).length;
 
@@ -240,13 +295,14 @@ describe("connecting the assistant's Google account", () => {
 
     expect(signIn).toHaveBeenCalledTimes(1);
     expect(world.gcloudCalls.filter((call) => call.startsWith('services enable'))).toHaveLength(enables);
-    expect([...world.secrets.keys()]).toEqual([GOOGLE_SERVICES.calendar.secretName]);
+    expect(world.secrets).toHaveLength(EXPOSED_GOOGLE_SERVICES.length);
+    expect(world.vaultWrites).toEqual([]);
   });
 
   it('signs in again, with the client it already has, when the grant is for another account', async () => {
     const world = new World();
     const signIn = vi.fn(async () => grant());
-    const resources = googleConnectionResources({ gcloud: { runCommand: world.runCommand }, fetch: world.fetch });
+    const resources = resourcesFor(world);
     fs.writeFileSync(
       path.join(SECRETS, 'google-grant.json'),
       JSON.stringify(grant({ account: 'taslim@example.test' })),
@@ -268,7 +324,7 @@ describe("connecting the assistant's Google account", () => {
       world.revoked = false;
       return grant({ granted_at: '2026-10-01T09:00:00.000Z' });
     });
-    const resources = googleConnectionResources({ gcloud: { runCommand: world.runCommand }, fetch: world.fetch });
+    const resources = resourcesFor(world);
     await connect(
       resources,
       context(async () => grant(), writeDownloadedClient()),
@@ -287,28 +343,20 @@ describe("connecting the assistant's Google account", () => {
     });
   });
 
-  it('keeps one Calendar secret when a creation race left two', async () => {
+  it('reports two secrets with one name rather than choosing or deleting either', async () => {
     const world = new World();
-    const resources = googleConnectionResources({ gcloud: { runCommand: world.runCommand }, fetch: world.fetch });
+    const resources = resourcesFor(world);
     await connect(
       resources,
       context(async () => grant(), writeDownloadedClient()),
     );
-    world.duplicateSecret = true;
+    world.secrets.push({ id: 'sec-duplicate', name: 'google-calendar', hostPattern: 'www.googleapis.com' });
 
     expect(await resources[3]!.observe(context(async () => grant()))).toEqual({
       status: 'absent',
-      reason: `OneCLI holds 2 secrets named ${GOOGLE_SERVICES.calendar.secretName}`,
+      reason: 'OneCLI holds 2 secrets named google-calendar',
     });
-    await expect(
-      connect(
-        resources,
-        context(async () => grant()),
-      ),
-    ).resolves.toBeUndefined();
-
-    expect(world.duplicateSecret).toBe(false);
-    expect(world.secrets.get(GOOGLE_SERVICES.calendar.secretName)?.value).toMatch(/^ya29\.calendar-/);
+    expect(world.vaultWrites).toEqual([]);
   });
 
   it('signs in again when a release asks for a scope the grant lacks', async () => {
@@ -316,20 +364,25 @@ describe("connecting the assistant's Google account", () => {
     const signIn = vi.fn(async () => grant());
     fs.writeFileSync(
       path.join(SECRETS, 'google-grant.json'),
-      JSON.stringify(grant({ scopes: ['openid', 'email', ...GOOGLE_SERVICES.calendar.scopes] })),
+      JSON.stringify(
+        grant({
+          scopes: ['openid', 'email', ...AGENT_GOOGLE_SERVICES.calendar.scopes, ...HOST_GOOGLE_SERVICES.gmail.scopes],
+        }),
+      ),
       { mode: 0o600 },
     );
-    const resources = googleConnectionResources({ gcloud: { runCommand: world.runCommand }, fetch: world.fetch });
+    const resources = resourcesFor(world);
 
     expect(await resources[2]!.observe(context(signIn))).toEqual({
       status: 'absent',
-      reason: `the sign-in lacks ${GOOGLE_SERVICES.gmail.scopes.join(', ')}`,
+      reason:
+        'the sign-in lacks https://www.googleapis.com/auth/gmail.readonly, https://www.googleapis.com/auth/directory.readonly',
     });
   });
 
   it('takes the download as the browser saved it, and keeps only a private copy', async () => {
     const world = new World();
-    const resources = googleConnectionResources({ gcloud: { runCommand: world.runCommand }, fetch: world.fetch });
+    const resources = resourcesFor(world);
     const download = writeDownloadedClient(0o644);
 
     await expect(resources[1]!.apply(context(async () => grant(), download))).resolves.toBeUndefined();
@@ -340,7 +393,7 @@ describe("connecting the assistant's Google account", () => {
   it("reports the calendar check's reason when Google does not return the assistant's own calendar", async () => {
     const world = new World();
     world.calendarId = 'someone-else@example.test';
-    const resources = googleConnectionResources({ gcloud: { runCommand: world.runCommand }, fetch: world.fetch });
+    const resources = resourcesFor(world);
 
     await expect(
       connect(
@@ -356,7 +409,7 @@ describe('observing the Google connection for status', () => {
 
   it('reports a connected assistant by its account', async () => {
     const world = new World();
-    const resources = googleConnectionResources({ gcloud: { runCommand: world.runCommand }, fetch: world.fetch });
+    const resources = resourcesFor(world);
     await connect(
       resources,
       context(async () => grant(), writeDownloadedClient()),
@@ -377,19 +430,69 @@ describe('observing the Google connection for status', () => {
     });
   });
 
-  it('reports a sign-in Google no longer accepts, and missing Calendar access for agents', async () => {
+  it("reports a sign-in Google no longer accepts, and agents' missing Google access", async () => {
     const world = new World();
     fs.writeFileSync(path.join(SECRETS, 'google-grant.json'), JSON.stringify(grant()), { mode: 0o600 });
 
     await expect(observeGoogleConnection(runtime(), ACCOUNT, { fetch: world.fetch })).resolves.toMatchObject({
       status: 'degraded',
-      reason: `agents have no Calendar access: OneCLI has no ${GOOGLE_SERVICES.calendar.secretName} secret; ${repair}`,
+      reason: `agents have no Google access: OneCLI has no google-calendar, google-gmail-read, or google-directory secret yet; ${repair}`,
     });
     world.revoked = true;
     await expect(observeGoogleConnection(runtime(), ACCOUNT, { fetch: world.fetch })).resolves.toEqual({
       status: 'degraded',
       account: ACCOUNT,
       reason: `Google no longer accepts the sign-in; ${repair}`,
+    });
+  });
+
+  it('names the missing scopes and the connect-google repair for an assistant signed in before this release', async () => {
+    const world = new World();
+    world.publish();
+    fs.writeFileSync(
+      path.join(SECRETS, 'google-grant.json'),
+      JSON.stringify(
+        grant({
+          scopes: ['openid', 'email', ...AGENT_GOOGLE_SERVICES.calendar.scopes, ...HOST_GOOGLE_SERVICES.gmail.scopes],
+        }),
+      ),
+      { mode: 0o600 },
+    );
+
+    await expect(observeGoogleConnection(runtime(), ACCOUNT, { fetch: world.fetch })).resolves.toEqual({
+      status: 'degraded',
+      account: ACCOUNT,
+      reason: `the sign-in lacks https://www.googleapis.com/auth/gmail.readonly, https://www.googleapis.com/auth/directory.readonly; ${repair}`,
+    });
+  });
+
+  it.each([
+    ['the stale google-gmail secret', { name: 'google-gmail', hostPattern: 'gmail.googleapis.com' }],
+    ['any other secret Gmail would accept', { name: 'mail-helper', hostPattern: '*.googleapis.com' }],
+  ])('flags %s, which can carry gmail.modify, ahead of everything else', async (_label, secret) => {
+    const world = new World();
+    world.publish();
+    world.secrets.push({ id: 'sec-modify', ...secret });
+    fs.writeFileSync(path.join(SECRETS, 'google-grant.json'), JSON.stringify(grant()), { mode: 0o600 });
+
+    await expect(observeGoogleConnection(runtime(), ACCOUNT, { fetch: world.fetch })).resolves.toEqual({
+      status: 'degraded',
+      account: ACCOUNT,
+      reason:
+        `OneCLI holds ${secret.name} on ${secret.hostPattern}, which an agent could use to reach Gmail beyond ` +
+        "reading it (gmail.modify); remove it from the assistant's OneCLI",
+    });
+  });
+
+  it('does not mistake the read-only Gmail secret or unrelated Google secrets for gmail.modify', async () => {
+    const world = new World();
+    world.publish();
+    world.secrets.push({ id: 'sec-other', name: 'drive', hostPattern: 'www.googleapis.com' });
+    fs.writeFileSync(path.join(SECRETS, 'google-grant.json'), JSON.stringify(grant()), { mode: 0o600 });
+
+    await expect(observeGoogleConnection(runtime(), ACCOUNT, { fetch: world.fetch })).resolves.toEqual({
+      status: 'connected',
+      account: ACCOUNT,
     });
   });
 });

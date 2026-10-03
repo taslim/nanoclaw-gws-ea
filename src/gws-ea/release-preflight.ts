@@ -283,6 +283,9 @@ async function validateComposition(
     'templates/gws-ea/main/skills/welcome/SKILL.md',
     'container/skills/gcalendar/SKILL.md',
     'container/skills/gcalendar/instructions.md',
+    'container/skills/gmail/SKILL.md',
+    'container/skills/gpeople/SKILL.md',
+    'src/container-env.ts',
     'src/channels/gchat.ts',
     'src/channels/index.ts',
     'src/gws-ea/process.ts',
@@ -309,6 +312,7 @@ async function validateComposition(
     'src/gateway-providers/installed.ts',
     'src/gateway-providers/onecli.ts',
     'src/gateway-providers/onecli-files.ts',
+    'src/gateway-providers/onecli-credentials.ts',
     'container/skills/onecli-gateway/SKILL.md',
     'container/skills/onecli-gateway/instructions.md',
   ];

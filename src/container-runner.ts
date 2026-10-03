@@ -24,8 +24,16 @@ import {
   INSTALL_SLUG,
   TIMEZONE,
 } from './config.js';
-import { isRestricted, skillsWithinCapabilities, teachesGateway } from './capabilities.js';
+import {
+  credentialsWithinCapabilities,
+  isRestricted,
+  parseStoredCapabilities,
+  resolveCapabilities,
+  skillsWithinCapabilities,
+  teachesGateway,
+} from './capabilities.js';
 import { CONTAINER_PLUGINS_DIR, materializeContainerJson } from './container-config.js';
+import { composeContainerEnv } from './container-env.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { updateContainerConfigScalars } from './db/container-configs.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
@@ -49,10 +57,12 @@ import type { SupervisedHandle, SupervisedSnapshot } from './drivers/session-eve
 import { GROUP_FOLDER_LABEL, labelValueLegal, specInvalid } from './drivers/types.js';
 import type { ContainerSpec, MountSpec, SessionFailure, SessionSpec } from './drivers/types.js';
 import {
+  assertCredentialScopeEnforced,
   gatewayRuntimeIdentity,
   getGatewayProvider,
   selectGatewayAgentSkills,
   type GatewayContribution,
+  type GatewayCredentialScope,
   type GatewaySessionInput,
   type GatewaySessionLease,
 } from './gateway-providers/index.js';
@@ -297,6 +307,7 @@ async function retryPendingAdoption(session: Session): Promise<boolean> {
       groupName: group.name,
       containerName: snapshot.handle.name,
       capabilities: driver.capabilities(),
+      credentialScope: await credentialScopeFor(group, session),
     });
   } catch (err) {
     await releaseClaimQuietly(session.id, claimIncarnation);
@@ -406,6 +417,7 @@ async function spawnContainer(session: Session): Promise<void> {
     groupName: agentGroup.name,
     containerName,
     capabilities: driver.capabilities(),
+    credentialScope: await credentialScopeFor(agentGroup, session),
   });
   const admissionGeneration = gatewayAdmissionGeneration;
   const gateway = gatewaySession.lease.contribution;
@@ -577,14 +589,39 @@ export function watchGatewayAvailability(
   return unavailable;
 }
 
+/**
+ * The stored credentials the group's capabilities let its agent use: the
+ * gateway's own policy for a group on `all`, else exactly the credentials its
+ * keys name plus its model provider's. Read at every spawn and adoption, as
+ * the gateway applies it at each.
+ */
+async function credentialScopeFor(
+  agentGroup: AgentGroup,
+  session: Pick<Session, 'agent_provider'>,
+): Promise<GatewayCredentialScope> {
+  const row = await getContainerConfig(agentGroup.id);
+  const selection = parseStoredCapabilities(row?.capabilities, agentGroup.name);
+  if (selection === 'all') return { kind: 'all' };
+  const provider = resolveProviderName(session.agent_provider, row?.provider);
+  return {
+    kind: 'only',
+    credentials: credentialsWithinCapabilities(new Set(resolveCapabilities(selection, agentGroup.name))),
+    modelDomains: getProviderHostContract(provider)?.modelDomains ?? [],
+  };
+}
+
 async function ensureGatewaySession(input: GatewaySessionInput): Promise<GatewaySessionControl> {
   if (gatewayUnavailableReason) {
     throw new Error(`Gateway session admission is closed: ${gatewayUnavailableReason}`);
   }
+  // Before the gateway is asked: a restricted agent never starts behind a
+  // gateway that would ignore its credential scope.
+  const gatewayProvider = getGatewayProvider();
+  assertCredentialScopeEnforced(gatewayProvider, input);
   const controller = new AbortController();
   const generation = gatewayAdmissionGeneration;
   try {
-    const session = { lease: await getGatewayProvider().sessions.ensure(input, controller.signal), controller };
+    const session = { lease: await gatewayProvider.sessions.ensure(input, controller.signal), controller };
     if (gatewayUnavailableReason || generation !== gatewayAdmissionGeneration) {
       await releaseGatewaySession(session, { kind: 'host-detached', reason: 'admission-closed' });
       throw new Error('Gateway session admission closed while acquiring lease');
@@ -848,6 +885,7 @@ export async function adoptRunningSessions(): Promise<{ adopted: number; stopped
         groupName: agentGroup.name,
         containerName: handle.name,
         capabilities: driver.capabilities(),
+        credentialScope: await credentialScopeFor(agentGroup, session),
       });
       await driver.reconcileNetworkAccess?.(gatewaySession.lease.contribution.networkAccess);
     } catch (err) {
@@ -1357,6 +1395,16 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
     ...(contribution.env ?? {}),
     ...(gateway.env ?? {}),
   };
+  // Modules' settings for this group (src/container-env.ts) join the lane
+  // last, and only add: one that would override a key composed above, or the
+  // HOME set below, refuses the spawn rather than silently winning.
+  Object.assign(
+    contributedEnv,
+    composeContainerEnv(
+      { agentGroupId: agentGroup.id, capabilities: new Set(containerConfig.capabilities) },
+      new Set(['HOME', ...Object.keys(env), ...Object.keys(contributedEnv)]),
+    ),
+  );
 
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();

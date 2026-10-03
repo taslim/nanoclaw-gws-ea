@@ -125,16 +125,17 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 # checksums.txt), so a rebuild can never pick up a different build. Bump the
 # version and both checksums together.
 #
-# gog never holds a credential: GOG_ACCESS_TOKEN is a placeholder the OneCLI
-# gateway replaces with the assistant's current Google token, which the host
-# keeps fresh, and with no stored account gog has nothing to refresh itself.
-# GOG_ENABLE_COMMANDS lists the Google services this release exposes; it must
-# match EXPOSED_GOOGLE_SERVICES in src/modules/gws-ea-google/grant.ts. JSON
-# output with untrusted-content markers keeps other people's event text
-# visibly apart from instructions.
-ARG GOGCLI_VERSION=0.42.0
-ARG GOGCLI_SHA256_AMD64=1967a962a57d689958c408dd0abc784792c3712da9d0a90650bb76ab7e3de388
-ARG GOGCLI_SHA256_ARM64=84ce3002acea162596068c8b25e364aade634d204ae6122b714e686ca783b028
+# The image sets none of gog's settings, so on its own gog has no token and
+# reaches no account. Each agent group gets them at spawn from the Google
+# capabilities it holds (src/modules/gws-ea-google/index.ts): a placeholder
+# token the gateway replaces with the assistant's current Google token, which
+# the host keeps fresh; exactly the commands those capabilities allow; Gmail
+# sending off; and JSON output with untrusted-content markers, which keep other
+# people's text visibly apart from instructions. A group holding no Google
+# capability gets none of them.
+ARG GOGCLI_VERSION=0.43.0
+ARG GOGCLI_SHA256_AMD64=a16d4b8b917e36b96b09b30ecb7a5049d06ff1e88b856a101eec12b86b33fe05
+ARG GOGCLI_SHA256_ARM64=f66e3c9ab7664b7633d57d2d5303e0db75deb4045e1b32c3493c0d8ba68a70f7
 ARG TARGETARCH
 RUN case "$TARGETARCH" in \
         amd64) sha="$GOGCLI_SHA256_AMD64" ;; \
@@ -147,10 +148,6 @@ RUN case "$TARGETARCH" in \
     tar -xzf /tmp/gogcli.tar.gz -C /tmp ./gog && \
     install -m 0755 /tmp/gog /usr/local/bin/gog && \
     rm -f /tmp/gogcli.tar.gz /tmp/gog
-ENV GOG_ACCESS_TOKEN=gateway-managed \
-    GOG_ENABLE_COMMANDS=calendar \
-    GOG_JSON=1 \
-    GOG_WRAP_UNTRUSTED=1
 
 # ---- ncl CLI wrapper ----------------------------------------------------------
 # Actual script lives in the mounted source at /app/src/cli/ncl.ts.

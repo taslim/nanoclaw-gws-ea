@@ -18,7 +18,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { ChannelRegistration, InboundEvent } from '../channels/adapter.js';
 import type { GatewayApprovalRequest, GatewaySessionInput } from '../gateway-providers/gateway-provider-registry.js';
-import { EXPOSED_GOOGLE_SERVICES } from '../modules/gws-ea-google/grant.js';
 import { deriveWorkspaceAddOnIdentity } from './gcp-identity.js';
 import { CONTROL_PLANE_ROOT } from './paths.js';
 
@@ -185,6 +184,7 @@ describe('recorded divergence: the installed OneCLI adapter', () => {
     groupName: 'main',
     containerName: 'agent',
     capabilities: {} as GatewaySessionInput['capabilities'],
+    credentialScope: { kind: 'all' },
   });
 
   it('never creates a OneCLI agent when adopting a surviving session', async () => {
@@ -198,6 +198,73 @@ describe('recorded divergence: the installed OneCLI adapter', () => {
 
     await provider.sessions.ensure(session('create'), lease.signal);
     expect(servers.createdAgents).toEqual([{ name: 'main', identifier: 'owned-group' }]);
+  });
+
+  it("narrows a restricted agent to exactly its capabilities' secrets and the model's before it can run", async () => {
+    const provider = await installedProvider();
+    expect(provider.sessions.enforcesCredentialScope).toBe(true);
+    expect(typeof provider.credentials?.connection).toBe('function');
+
+    const calls: string[] = [];
+    let assigned: string[] = ['secret-calendar'];
+    let mode = 'all';
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      const method = init?.method ?? 'GET';
+      const call = `${method} ${url.origin === gatewayUrl ? 'gateway' : 'onecli'}${url.pathname}`;
+      calls.push(call);
+      const body = () => JSON.parse(String(init?.body)) as Record<string, unknown>;
+      switch (call) {
+        case 'GET onecli/v1/agents':
+          return Response.json([{ id: 'agent-1', identifier: 'owned-group', secretMode: mode }]);
+        case 'GET onecli/v1/secrets':
+          return Response.json([
+            { id: 'secret-mail', name: 'google-gmail-read', hostPattern: 'gmail.googleapis.com' },
+            { id: 'secret-calendar', name: 'google-calendar', hostPattern: 'www.googleapis.com' },
+            { id: 'secret-model', name: 'Anthropic', hostPattern: 'api.anthropic.com' },
+          ]);
+        case 'GET onecli/v1/agents/agent-1/secrets':
+          return Response.json(assigned);
+        case 'PUT onecli/v1/agents/agent-1/secrets':
+          assigned = body().secretIds as string[];
+          return Response.json({ success: true });
+        case 'PATCH onecli/v1/agents/agent-1/secret-mode':
+          mode = body().mode as string;
+          return Response.json({ success: true });
+        case 'POST gateway/v1/cache/invalidate':
+          return Response.json({});
+        case 'GET onecli/v1/container-config':
+          return Response.json({
+            env: { HTTPS_PROXY: 'http://host.docker.internal:10255' },
+            caCertificate: '-----BEGIN CERTIFICATE-----\nguard\n-----END CERTIFICATE-----\n',
+            caCertificateContainerPath: '/tmp/onecli-ca.pem',
+          });
+        default:
+          return new Response('not found', { status: 404 });
+      }
+    });
+    const lease = new AbortController();
+    cleanups.push(async () => lease.abort());
+
+    await provider.sessions.ensure(
+      {
+        ...session('adopt'),
+        credentialScope: { kind: 'only', credentials: ['google-gmail-read'], modelDomains: ['anthropic.com'] },
+      },
+      lease.signal,
+    );
+
+    expect([...assigned].sort()).toEqual(['secret-mail', 'secret-model']);
+    expect(mode).toBe('selective');
+    const configRead = calls.indexOf('GET onecli/v1/container-config');
+    for (const write of [
+      'PUT onecli/v1/agents/agent-1/secrets',
+      'PATCH onecli/v1/agents/agent-1/secret-mode',
+      'POST gateway/v1/cache/invalidate',
+    ]) {
+      expect(calls.indexOf(write)).toBeGreaterThanOrEqual(0);
+      expect(calls.indexOf(write)).toBeLessThan(configRead);
+    }
   });
 
   const approval = (id: string, group: string) => ({
@@ -504,6 +571,39 @@ describe('recorded divergence: each agent group has a capability list', () => {
     ).toEqual([]);
   });
 
+  it("names each key's gateway credentials, and core refuses a restricted agent behind a gateway that cannot narrow them", async () => {
+    await freshInstall();
+    const capabilities = await import('../capabilities.js');
+    const registry = await import('../gateway-providers/gateway-provider-registry.js');
+    await import('../modules/gws-ea-google/index.js');
+    const runner = await readFile(path.join(originalCwd, 'src/container-runner.ts'), 'utf8');
+
+    expect(capabilities.credentialsWithinCapabilities(new Set(['google-mail-read']))).toEqual(['google-gmail-read']);
+    expect(capabilities.credentialsWithinCapabilities(new Set(capabilities.resolveCapabilities('all', 'x')))).toEqual(
+      expect.arrayContaining(['google-calendar', 'google-gmail-read', 'google-directory']),
+    );
+    const input = (credentialScope: GatewaySessionInput['credentialScope']): GatewaySessionInput => ({
+      key: { installSlug: 'install', agentGroupId: 'g', sessionId: 's' },
+      runtimeIdentity: 'install/g/s',
+      groupName: 'g',
+      containerName: 'agent',
+      capabilities: {} as GatewaySessionInput['capabilities'],
+      credentialScope,
+    });
+    const unscoped = {
+      kind: 'unscoped',
+      agentSkills: [],
+      sessions: { ensure: vi.fn() },
+      approvals: { subscribe: vi.fn() },
+    } as unknown as Parameters<typeof registry.assertCredentialScopeEnforced>[0];
+    expect(() =>
+      registry.assertCredentialScopeEnforced(unscoped, input({ kind: 'only', credentials: [], modelDomains: [] })),
+    ).toThrow(/does not enforce credential scopes/);
+    expect(() => registry.assertCredentialScopeEnforced(unscoped, input({ kind: 'all' }))).not.toThrow();
+    expect(runner).toContain('assertCredentialScopeEnforced(');
+    expect(runner.split('credentialScope: await credentialScopeFor(').length - 1).toBe(3);
+  });
+
   it('builds the runner, tool server, cross-session context, and mounts from that list', async () => {
     const read = (file: string) => readFile(path.join(originalCwd, file), 'utf8');
     const provider = await read('container/agent-runner/src/providers/claude.ts');
@@ -566,13 +666,14 @@ describe('recorded divergence: the agent image carries the pinned Google tool', 
     return source.replace(/\\\n\s*/g, ' ').split('\n');
   }
 
-  it('installs gog at an exact version, checked against a pinned SHA-256 for each architecture', async () => {
+  it("installs gog v0.43.0, checked against the release's SHA-256 for each architecture", async () => {
     const instructions = await dockerfileInstructions();
     const arg = (name: string) => instructions.find((line) => line.startsWith(`ARG ${name}=`))?.split('=')[1];
 
-    expect(arg('GOGCLI_VERSION')).toMatch(/^\d+\.\d+\.\d+$/);
-    expect(arg('GOGCLI_SHA256_AMD64')).toMatch(/^[0-9a-f]{64}$/);
-    expect(arg('GOGCLI_SHA256_ARM64')).toMatch(/^[0-9a-f]{64}$/);
+    expect(arg('GOGCLI_VERSION')).toBe('0.43.0');
+    // From v0.43.0's checksums.txt, equal to the GitHub release's asset digests.
+    expect(arg('GOGCLI_SHA256_AMD64')).toBe('a16d4b8b917e36b96b09b30ecb7a5049d06ff1e88b856a101eec12b86b33fe05');
+    expect(arg('GOGCLI_SHA256_ARM64')).toBe('f66e3c9ab7664b7633d57d2d5303e0db75deb4045e1b32c3493c0d8ba68a70f7');
     const install = instructions.find((line) => line.startsWith('RUN') && line.includes('gogcli'));
     expect(install).toContain(
       'releases/download/v${GOGCLI_VERSION}/gogcli_${GOGCLI_VERSION}_linux_${TARGETARCH}.tar.gz',
@@ -580,17 +681,43 @@ describe('recorded divergence: the agent image carries the pinned Google tool', 
     expect(install).toMatch(/sha256sum -c - && .*install -m 0755 \/tmp\/gog \/usr\/local\/bin\/gog/);
   });
 
-  it('gives gog a placeholder token and exactly the Google services the release exposes', async () => {
-    const env = new Map(
-      (await dockerfileInstructions())
-        .filter((line) => line.startsWith('ENV GOG_'))
-        .flatMap((line) => line.slice('ENV '.length).trim().split(/\s+/))
-        .map((pair) => pair.split('=') as [string, string]),
-    );
+  it("sets none of gog's settings in the image; each spawn gives main its exact commands, with Gmail sending off", async () => {
+    expect((await dockerfileInstructions()).filter((line) => /^ENV\b.*\bGOG_/u.test(line))).toEqual([]);
 
-    expect(env.get('GOG_ACCESS_TOKEN')).toBe('gateway-managed');
-    expect(env.get('GOG_ENABLE_COMMANDS')).toBe(EXPOSED_GOOGLE_SERVICES.join(','));
-    expect(env.get('GOG_JSON')).toBe('1');
-    expect(env.get('GOG_WRAP_UNTRUSTED')).toBe('1');
+    await freshInstall();
+    const { resolveCapabilities } = await import('../capabilities.js');
+    await import('../modules/gws-ea-google/index.js');
+    const { composeSessionSpec } = await import('../container-runner.js');
+    const spawnEnv = (capabilities: readonly string[]) =>
+      composeSessionSpec({
+        agentGroup: { id: 'ag-main', name: 'main', folder: 'main', agent_provider: null, created_at: '' },
+        session: { id: 'session-1', agent_group_id: 'ag-main' } as never,
+        containerName: 'nanoclaw-v2-main-1700000000000',
+        mounts: [],
+        containerConfig: { capabilities: [...capabilities] } as never,
+        mailboxEnvironment: {},
+        contribution: {},
+        gateway: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' } } },
+      }).containers[0].contributedEnv ?? {};
+
+    const main = spawnEnv(resolveCapabilities('all', 'main'));
+    const commands = main.GOG_ENABLE_COMMANDS_EXACT?.split(',');
+    expect(commands).toEqual(
+      expect.arrayContaining([
+        'calendar.events',
+        'calendar.create',
+        'calendar.update',
+        'calendar.delete',
+        'calendar.respond',
+        'gmail.search',
+        'gmail.thread.get',
+        'people.search',
+      ]),
+    );
+    for (const off of ['calendar.conflicts', 'gmail.send', 'gmail.thread.modify', 'gmail.drafts.create']) {
+      expect(commands).not.toContain(off);
+    }
+    expect(main).toMatchObject({ GOG_ACCESS_TOKEN: 'gateway-managed', GOG_GMAIL_NO_SEND: '1' });
+    expect(Object.keys(spawnEnv(['reply', 'shell'])).filter((key) => key.startsWith('GOG_'))).toEqual([]);
   });
 });

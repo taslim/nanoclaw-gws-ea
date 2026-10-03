@@ -7,20 +7,30 @@
  */
 import { canonicalTimestamp, hasControlCharacters, isRecord } from '../../gws-ea/validation.js';
 
-/** A Google service the release can expose to agents, each through its own OneCLI secret. */
-export interface GoogleService {
-  /** The OneCLI secret its access token is injected from. */
-  readonly secretName: string;
-  /** The host OneCLI injects it on. */
-  readonly hostPattern: string;
-  /** What its access token is limited to. */
+/** What a Google service's access token is limited to. */
+export interface GoogleServiceScopes {
   readonly scopes: readonly string[];
+}
+
+/**
+ * A Google service whose token reaches agents (KTD6): the host publishes it
+ * as one gateway credential, which only the agent groups holding the
+ * service's capability may use.
+ */
+export interface AgentGoogleService extends GoogleServiceScopes {
+  /** The capability key (src/capabilities.ts) that grants the service. */
+  readonly capability: string;
+  /** The gateway credential its access token is published as. */
+  readonly secretName: string;
+  /** The one host the gateway injects it on. */
+  readonly hostPattern: string;
   /** The container skill (`container/skills/<skill>/`) that teaches agents to use it. */
   readonly skill: string;
 }
 
-export const GOOGLE_SERVICES = {
+export const AGENT_GOOGLE_SERVICES = {
   calendar: {
+    capability: 'google-calendar',
     secretName: 'google-calendar',
     hostPattern: 'www.googleapis.com',
     scopes: [
@@ -30,32 +40,53 @@ export const GOOGLE_SERVICES = {
     ],
     skill: 'gcalendar',
   },
-  gmail: {
-    secretName: 'google-gmail',
+  'gmail-read': {
+    capability: 'google-mail-read',
+    secretName: 'google-gmail-read',
     hostPattern: 'gmail.googleapis.com',
-    scopes: ['https://www.googleapis.com/auth/gmail.modify'],
+    scopes: ['https://www.googleapis.com/auth/gmail.readonly'],
     skill: 'gmail',
   },
-} as const satisfies Record<string, GoogleService>;
-
-export type GoogleServiceId = keyof typeof GOOGLE_SERVICES;
-
-/** The services whose tokens reach agents in this release. Gmail is consented but not exposed until Checkpoint 4. */
-export const EXPOSED_GOOGLE_SERVICES: readonly GoogleServiceId[] = ['calendar'];
+  directory: {
+    capability: 'google-directory',
+    secretName: 'google-directory',
+    hostPattern: 'people.googleapis.com',
+    scopes: ['https://www.googleapis.com/auth/directory.readonly'],
+    skill: 'gpeople',
+  },
+} as const satisfies Record<string, AgentGoogleService>;
 
 /**
- * The skills of the exposed services. A service's skill rides with the
- * service: every agent group that can reach the service gets its skill, and a
- * service not yet exposed contributes none.
+ * Google services only the host uses (KTD6): their tokens are minted on
+ * demand, held in host memory, and never become a gateway credential. Gmail's
+ * modify scope reads and sends the assistant's own inbox.
  */
-export const EXPOSED_GOOGLE_SKILLS: readonly string[] = EXPOSED_GOOGLE_SERVICES.map((id) => GOOGLE_SERVICES[id].skill);
+export const HOST_GOOGLE_SERVICES = {
+  gmail: { scopes: ['https://www.googleapis.com/auth/gmail.modify'] },
+} as const satisfies Record<string, GoogleServiceScopes>;
 
-/** What the sign-in asks for: the account's identity, and every service the slice uses. */
+export type AgentGoogleServiceId = keyof typeof AGENT_GOOGLE_SERVICES;
+export type HostGoogleServiceId = keyof typeof HOST_GOOGLE_SERVICES;
+export type GoogleServiceId = AgentGoogleServiceId | HostGoogleServiceId;
+
+export const GOOGLE_SERVICES: Readonly<Record<GoogleServiceId, GoogleServiceScopes>> = {
+  ...AGENT_GOOGLE_SERVICES,
+  ...HOST_GOOGLE_SERVICES,
+};
+
+/** The services whose tokens reach agents, each to the groups holding its capability. */
+export const EXPOSED_GOOGLE_SERVICES: readonly AgentGoogleServiceId[] = ['calendar', 'gmail-read', 'directory'];
+
+/** The skills of the exposed services; each reaches only a group holding its service's capability. */
+export const EXPOSED_GOOGLE_SKILLS: readonly string[] = EXPOSED_GOOGLE_SERVICES.map(
+  (id) => AGENT_GOOGLE_SERVICES[id].skill,
+);
+
+/** What the sign-in asks for: the account's identity, and every service, agent-facing and host-only. */
 export const GOOGLE_SIGN_IN_SCOPES: readonly string[] = [
   'openid',
   'email',
-  ...GOOGLE_SERVICES.calendar.scopes,
-  ...GOOGLE_SERVICES.gmail.scopes,
+  ...Object.values(GOOGLE_SERVICES).flatMap((service) => service.scopes),
 ];
 
 /** The scopes a grant must hold: the identity scopes Google reports in full form, and every service's. */
