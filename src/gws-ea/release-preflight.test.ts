@@ -149,10 +149,12 @@ async function releaseFixture(): Promise<string> {
   await write(root, 'src/modules/gws-ea-people/index.ts', 'export {};\n');
   await write(root, 'src/modules/gws-ea-people/migration.ts', 'export {};\n');
   await write(root, 'src/modules/gws-ea-notices/index.ts', 'export {};\n');
+  await write(root, 'src/modules/capabilities/index.ts', 'export {};\n');
+  await write(root, 'src/modules/capabilities/migration.ts', 'export {};\n');
   await write(
     root,
     'src/modules/index.ts',
-    "import './gws-ea-google/index.js';\nimport './gws-ea-main/index.js';\nimport './gws-ea-profile/index.js';\nimport './gws-ea-preferences/index.js';\nimport './gws-ea-people/index.js';\nimport './gws-ea-notices/index.js';\n",
+    "import './capabilities/index.js';\nimport './gws-ea-google/index.js';\nimport './gws-ea-main/index.js';\nimport './gws-ea-profile/index.js';\nimport './gws-ea-preferences/index.js';\nimport './gws-ea-people/index.js';\nimport './gws-ea-notices/index.js';\n",
   );
   await write(root, 'src/provider-contracts/claude.ts', "export const provider = 'claude';\n");
   await write(root, 'src/provider-contracts/index.ts', "import './claude.js';\n");
@@ -276,6 +278,7 @@ describe('release preflight', () => {
     ['GWS-EA preferences migration', 'src/modules/gws-ea-preferences/migration.ts', 'incomplete_release'],
     ['GWS-EA people migration', 'src/modules/gws-ea-people/migration.ts', 'incomplete_release'],
     ['GWS-EA failure notices', 'src/modules/gws-ea-notices/index.ts', 'incomplete_release'],
+    ['per-group capabilities migration', 'src/modules/capabilities/migration.ts', 'incomplete_release'],
     ['OneCLI gateway adapter', 'src/gateway-providers/onecli.ts', 'gateway_not_composed'],
     ['OneCLI agent instructions', 'container/skills/onecli-gateway/SKILL.md', 'gateway_not_composed'],
     ['provider host contract', 'src/provider-contracts/claude.ts', 'provider_not_composed'],

@@ -71,7 +71,9 @@ describe('gateway provider registry', () => {
 
     expect(activeCalls).toEqual(['ensure:test/g1/s1:false', 'ensure:test/g1/s1:false', 'subscribe:active']);
     expect(inactiveCalls).toEqual([]);
-    expect(gateway.selectGatewayAgentSkills(['welcome', 'inactive-skill'])).toEqual(['welcome', 'active-skill']);
+    expect(gateway.selectGatewayAgentSkills(['welcome', 'inactive-skill'], true)).toEqual(['welcome', 'active-skill']);
+    // An agent with no way to use the gateway is taught none.
+    expect(gateway.selectGatewayAgentSkills(['welcome', 'inactive-skill', 'active-skill'], false)).toEqual(['welcome']);
   });
 
   it('fails closed when the selected registration is missing', async () => {

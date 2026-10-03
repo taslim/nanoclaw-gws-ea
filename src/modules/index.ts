@@ -15,6 +15,9 @@
  * exception: skills replace mailbox/compose.ts and leave this import intact.
  */
 import '../mailbox/compose.js';
+// Per-group capabilities: its migration adds the column the host reads to
+// decide each group's tools, so it loads before anything spawns a group.
+import './capabilities/index.js';
 
 // Approvals (default tier) must load before self-mod (optional) so the
 // registerApprovalHandler / requestApproval symbols are bound when self-mod

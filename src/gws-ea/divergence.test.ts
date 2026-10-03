@@ -483,8 +483,40 @@ describe('recorded divergence: delivery consults outbound guards and reports fai
 
     expect(pollLoop).toContain("action: 'turn_failed'");
     expect(pollLoop).not.toContain('Something went wrong');
-    expect(tools).toContain("import './time.js';");
-    expect(tools).toContain("import './schedule-stats.js';");
+    expect(tools).toContain("await loadToolModule('time', () => import('./time.js'));");
+    expect(tools).toContain("await loadToolModule('schedule-stats', () => import('./schedule-stats.js'));");
+  });
+});
+
+describe('recorded divergence: each agent group has a capability list', () => {
+  it("grants every built-in key to `all`, and nothing for a list it can't read", async () => {
+    await freshInstall();
+    const capabilities = await import('../capabilities.js');
+
+    expect(capabilities.resolveCapabilities('all', 'divergence')).toEqual(
+      expect.arrayContaining(['reply', 'files-send', 'files-read', 'files-write', 'shell', 'web', 'subagents']),
+    );
+    expect(
+      capabilities.resolveCapabilities(capabilities.parseStoredCapabilities('{x', 'divergence'), 'divergence'),
+    ).toEqual([]);
+  });
+
+  it('builds the runner, tool server, cross-session context, and mounts from that list', async () => {
+    const read = (file: string) => readFile(path.join(originalCwd, file), 'utf8');
+    const provider = await read('container/agent-runner/src/providers/claude.ts');
+    const server = await read('container/agent-runner/src/mcp-tools/server.ts');
+    const core = await read('container/agent-runner/src/mcp-tools/core.ts');
+    const fan = await read('src/modules/cross-session-context/fan.ts');
+    const backfill = await read('src/modules/cross-session-context/backfill.ts');
+    const runner = await read('src/container-runner.ts');
+
+    expect(provider).toContain('export function createPreToolUseHook(policy: ClaudeCapabilityPolicy)');
+    expect(provider).toContain('strictMcpConfig');
+    expect(server).toContain('export async function loadToolModule');
+    expect(core).toContain("registerTools([sendMessage], 'reply');");
+    expect(core).toContain('outboxFilename(');
+    for (const module of [fan, backfill]) expect(module).toContain('CONVERSATION_CONTEXT_CAPABILITY');
+    expect(runner).toContain('isRestricted(');
   });
 });
 

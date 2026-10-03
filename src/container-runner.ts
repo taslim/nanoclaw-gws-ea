@@ -24,6 +24,7 @@ import {
   INSTALL_SLUG,
   TIMEZONE,
 } from './config.js';
+import { isRestricted, skillsWithinCapabilities, teachesGateway } from './capabilities.js';
 import { CONTAINER_PLUGINS_DIR, materializeContainerJson } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { updateContainerConfigScalars } from './db/container-configs.js';
@@ -64,7 +65,7 @@ import { validateAdditionalMounts } from './modules/mount-security/index.js';
 // Provider contracts use a separate barrel so update-skills identity detection
 // remains tied to src/providers/index.ts.
 import './provider-contracts/index.js';
-import { getProviderHostContract } from './provider-contracts/registry.js';
+import { getProviderHostContract, type ProviderHostContract } from './provider-contracts/registry.js';
 import { resolveProviderName } from './providers/provider-name.js';
 import {
   providerStateVolumePath,
@@ -1040,6 +1041,7 @@ export async function buildMounts(
 
   const mounts: VolumeMount[] = [];
   const scope = agentGroup.id;
+  const restricted = isRestricted(new Set(containerConfig.capabilities));
 
   // Session workspace: mailbox-selected state plus outbox and heartbeat files.
   mounts.push({ hostPath: sessDir, containerPath: '/workspace', readonly: false, mountClass: 'group-state', scope });
@@ -1131,7 +1133,7 @@ export async function buildMounts(
       const mount = {
         hostPath,
         containerPath: view.containerPath,
-        readonly: view.mode === 'ro',
+        readonly: view.mode === 'ro' || restricted,
         mountClass: view.mountClass,
         scope,
       } satisfies VolumeMount;
@@ -1202,6 +1204,93 @@ export async function buildMounts(
     mounts.push(...providerContribution.mounts.map((m) => ({ ...m, mountClass: 'allowlisted-extra' as const, scope })));
   }
 
+  // Last, so each read-only layer lands over the writable mount it sits in.
+  if (restricted) {
+    mounts.push(
+      ...restrictedSurfaceMounts({
+        contract,
+        skillBackingPaths,
+        claudeDir: defaultSurfaces ? claudeDir : undefined,
+        groupDir,
+        claudeProject: defaultSurfaces || projectDocument?.fileName === DEFAULT_PROJECT_DOC.fileName,
+        scope,
+      }),
+    );
+  }
+
+  return mounts;
+}
+
+/** Claude Code's project-scope directory under the agent's cwd: project settings, skills, agents, commands. */
+const CLAUDE_PROJECT_DIR = '.claude';
+
+/**
+ * Read-only layers for a group without a shell (`isRestricted` in
+ * src/capabilities.ts). Its skills, and Claude's project settings directory,
+ * are mounted read-only over the writable directories they live in, so
+ * nothing written there is ever loaded. Its composed project document and
+ * container.json (which carries its MCP config) are read-only for every group.
+ */
+function restrictedSurfaceMounts(input: {
+  contract: ProviderHostContract | undefined;
+  skillBackingPaths: ReadonlyMap<string, string>;
+  /** The legacy Claude state directory, when the provider declares no contract. */
+  claudeDir: string | undefined;
+  groupDir: string;
+  /** Whether the provider reads a Claude project (CLAUDE.md under /workspace/agent). */
+  claudeProject: boolean;
+  scope: string;
+}): VolumeMount[] {
+  const { contract, skillBackingPaths, claudeDir, groupDir, claudeProject, scope } = input;
+  const mounts: VolumeMount[] = [];
+  if (claudeDir) {
+    mounts.push({
+      hostPath: path.join(claudeDir, 'skills'),
+      containerPath: '/home/node/.claude/skills',
+      readonly: true,
+      mountClass: 'group-state',
+      scope,
+    });
+  }
+  for (const backing of contract?.skillBackings ?? []) {
+    const backingRoot = skillBackingPaths.get(backing.id);
+    if (!backingRoot) throw new Error(`skill backing '${backing.id}' was not realized`);
+    const location = backing.location;
+    let containerPath: string;
+    let mountClass: VolumeMount['mountClass'];
+    if (location.kind === 'state-volume') {
+      const volume = contract?.stateVolumes.find((candidate) => candidate.id === location.volumeId);
+      if (!volume) throw new Error(`skill backing '${backing.id}' references unknown volume '${location.volumeId}'`);
+      containerPath = path.posix.join(volume.containerPath, location.subdirectory, backing.skillsSubdirectory);
+      mountClass = volume.mountClass;
+    } else {
+      containerPath = path.posix.join(
+        '/workspace/agent',
+        location.directory,
+        location.subdirectory,
+        backing.skillsSubdirectory,
+      );
+      mountClass = 'group-state';
+    }
+    mounts.push({
+      hostPath: path.join(backingRoot, backing.skillsSubdirectory),
+      containerPath,
+      readonly: true,
+      mountClass,
+      scope,
+    });
+  }
+  if (claudeProject) {
+    const projectDir = path.join(groupDir, CLAUDE_PROJECT_DIR);
+    fs.mkdirSync(projectDir, { recursive: true });
+    mounts.push({
+      hostPath: projectDir,
+      containerPath: path.posix.join('/workspace/agent', CLAUDE_PROJECT_DIR),
+      readonly: true,
+      mountClass: 'group-state',
+      scope,
+    });
+  }
   return mounts;
 }
 
@@ -1428,7 +1517,10 @@ function selectedSkillNames(containerConfig: import('./container-config.js').Con
       })
     : [];
   const selected = containerConfig.skills === 'all' ? available : containerConfig.skills;
-  return selectGatewayAgentSkills(selected);
+  // Capabilities bound the selection: a group is never handed a skill for a
+  // tool it does not hold, nor the gateway's skill without a way to use it.
+  const grants = new Set(containerConfig.capabilities);
+  return selectGatewayAgentSkills(skillsWithinCapabilities(selected, grants), teachesGateway(grants));
 }
 
 const execAsync = promisify(exec);

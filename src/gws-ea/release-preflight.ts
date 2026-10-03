@@ -298,6 +298,8 @@ async function validateComposition(
     'src/modules/gws-ea-people/index.ts',
     'src/modules/gws-ea-people/migration.ts',
     'src/modules/gws-ea-notices/index.ts',
+    'src/modules/capabilities/index.ts',
+    'src/modules/capabilities/migration.ts',
     'src/modules/index.ts',
   ];
   const gatewayFiles = [
@@ -334,6 +336,7 @@ async function validateComposition(
       { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-preferences/index', code: 'incomplete_release' },
       { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-people/index', code: 'incomplete_release' },
       { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-notices/index', code: 'incomplete_release' },
+      { barrel: 'src/modules/index.ts', moduleName: 'capabilities/index', code: 'incomplete_release' },
       { barrel: 'src/gateway-providers/index.ts', moduleName: 'installed', code: 'gateway_not_composed' },
       { barrel: 'src/gateway-providers/installed.ts', moduleName: 'onecli', code: 'gateway_not_composed' },
       ...[
