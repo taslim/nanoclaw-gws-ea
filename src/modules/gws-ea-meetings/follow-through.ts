@@ -33,6 +33,7 @@ import {
   findLiveMeetingOnThread,
   getMeeting,
   listHolds,
+  listLiveReplyJobs,
   listMeetingsWithDeadlines,
   listOpenBookings,
   listRoomsAwaitingHandover,
@@ -81,6 +82,8 @@ export interface FollowThroughDeps {
   readonly releaseHolds: (meeting: Meeting) => Promise<void>;
   /** Hold the time a booked move freed for the meeting it was made for. */
   readonly handOverRoom: (room: Room) => Promise<void>;
+  /** Finish a reply job whose ending was cut short, or leave one still at work. */
+  readonly finishCutShortReply: (meeting: Meeting) => Promise<void>;
 }
 
 /** Whether a poll that began at or after `deadline` has read the inbox, and it is healthy. */
@@ -187,6 +190,12 @@ export function createFollowThrough(deps: FollowThroughDeps) {
     }
   }
 
+  async function finishCutShortReplies(): Promise<void> {
+    for (const meeting of await listLiveReplyJobs()) {
+      await step('finish a reply', meeting.id, () => deps.finishCutShortReply(meeting));
+    }
+  }
+
   /** One pass, as the host's timer runs it each minute. Never throws. */
   async function tick(): Promise<void> {
     const now = Date.now();
@@ -195,6 +204,7 @@ export function createFollowThrough(deps: FollowThroughDeps) {
       ['close passed meetings', () => closePassedBookings(now)],
       ['hand over rooms', finishRooms],
       ['release leftover holds', releaseLeftoverHolds],
+      ['finish cut-short replies', finishCutShortReplies],
     ] as const) {
       /* eslint-disable no-catch-all/no-catch-all -- the timer never stops: each pass logs what failed and the next retries */
       try {

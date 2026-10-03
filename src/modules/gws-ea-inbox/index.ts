@@ -288,6 +288,7 @@ export {
   openThreadSession,
   releaseHeldMail,
   threadAddress,
+  vouchThreadPeople,
   type AuthorizeThreadInput,
   type ThreadView,
 } from './threads.js';

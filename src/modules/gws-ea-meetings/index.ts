@@ -103,6 +103,7 @@ const followThrough = createFollowThrough({
   closeBooked: (meeting) => handoff.endMeeting(meeting, 'booked', true),
   releaseHolds: (meeting) => actions.releaseHolds(meeting, 'all'),
   handOverRoom: room.handOver,
+  finishCutShortReply: handoff.finishCutShortReply,
 });
 
 /** Every request is answered, a refusal included, so the calling tool never waits it out. */

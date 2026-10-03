@@ -76,7 +76,13 @@ import { formatLocalTime } from '../../timezone.js';
 import type { Session } from '../../types.js';
 import { isPrincipalCalendar, recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import { authenticateSender } from '../gws-ea-inbox/authentication.js';
-import { getPrincipalMessage, isSettled, listPrincipalCalendars, threadMessageIds } from '../gws-ea-inbox/db.js';
+import {
+  getPrincipalMessage,
+  hasSentInThreadSince,
+  isSettled,
+  listPrincipalCalendars,
+  threadMessageIds,
+} from '../gws-ea-inbox/db.js';
 import {
   addThreadPeople,
   arrangeThreadPeople,
@@ -91,6 +97,7 @@ import {
   openThreadSession,
   releaseHeldMail,
   sendPrincipalReply,
+  vouchThreadPeople,
   type ThreadOrigin,
   type ThreadPeople,
   type ThreadView,
@@ -892,6 +899,11 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         const onThread = new Set(everyoneOn(thread.people));
         const added = meeting.counterparts.map((c) => c.address).filter((address) => !onThread.has(address));
         if (added.length > 0) await addThreadPeople(meeting.thread_key, added, 'to');
+        // Everyone the meeting carries a record for is vouched for: the thread keeps it for any later job.
+        await vouchThreadPeople(
+          meeting.thread_key,
+          meeting.counterparts.filter((c) => c.person_id !== null).map((c) => c.address),
+        );
         setting = await heldSetting(meeting, thread.origin);
       }
       ({ session } = await openThreadSession(meeting.thread_key));
@@ -1882,7 +1894,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
    * external-email reports its one reply written. The reply's delivery ends
    * the job (`replyDelivered`), so the report changes nothing: it is answered
    * whether it comes before the reply has gone or after. A job whose ending a
-   * restart cut short, after its reply was delivered, is finished here.
+   * stop cut short, after Gmail took its reply, is finished here.
    */
   async function responded(meeting: Meeting): Promise<Answer> {
     const answer = (message: string): Answer => ({
@@ -1891,8 +1903,8 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     });
     if (meeting.state === 'responded') return answer(RESPONDED_REPLY);
     if (meeting.state !== 'active') throw refused(`Meeting ${meeting.id} takes no outcome now (${meeting.state})`);
-    if (meeting.replied_at === null) return answer(RESPONDED_PENDING_REPLY);
-    await finishReply(meeting);
+    if (!(await replyWentOut(meeting))) return answer(RESPONDED_PENDING_REPLY);
+    await endAfterReply(meeting);
     return answer(RESPONDED_REPLY);
   }
 
@@ -1953,14 +1965,28 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     );
   }
 
+  /**
+   * Whether a reply job's one reply has gone: delivery recorded it, or Gmail
+   * took an email in its thread since the job began, which the inbox records
+   * before delivery hears of it.
+   */
+  async function replyWentOut(meeting: Meeting): Promise<boolean> {
+    return meeting.replied_at !== null || (await hasSentInThreadSince(meeting.thread_key, meeting.created_at));
+  }
+
+  /** The reply has gone: recorded first, so an ending cut short can be finished later; then the job ends. */
+  async function endAfterReply(meeting: Meeting): Promise<void> {
+    if (meeting.replied_at === null) {
+      const at = new Date().toISOString();
+      await updateMeeting(meeting.id, { replied_at: at }, at);
+    }
+    await finishReply(meeting);
+  }
+
   /** Delivery recorded a message from a reply's conversation in its thread: the reply has gone, and the job ends. */
   async function replyDelivered(msg: OutboundMessage, session: Session): Promise<void> {
     const meeting = await replyJobFor(msg, session);
-    if (!meeting) return;
-    const at = new Date().toISOString();
-    // Recorded first: if the ending is cut short, the conversation's own report finishes it.
-    if (meeting.replied_at === null) await updateMeeting(meeting.id, { replied_at: at }, at);
-    await finishReply(meeting);
+    if (meeting) await endAfterReply(meeting);
   }
 
   /**
@@ -1976,17 +2002,41 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     }
   }
 
+  /** A reply's email could not be sent: the job ends unsent, and main hears why. */
+  function replyFailed(meeting: Meeting): Promise<void> {
+    return endUnsentReply(meeting, 'could not be sent: email delivery kept failing');
+  }
+
   /**
-   * A reply's email could not be sent: the job ends, its thread goes back to
-   * main, and main hears it, so it can respond again or tell the principal.
+   * A reply job whose ending was cut short. Delivery tells the host of a
+   * reply's sending or failure once, so a stop or a failed note can leave
+   * the job live part-way through ending. Each follow-through pass runs this:
+   * a job whose reply Gmail took ends as responded; one whose thread already
+   * went back to main, its reply never sent, ends unsent so main can respond
+   * again. A job still at work is left alone. Safe to repeat.
    */
-  async function replyFailed(meeting: Meeting): Promise<void> {
+  async function finishCutShortReply(meeting: Meeting): Promise<void> {
+    if (isScheduling(meeting) || meeting.state !== 'active') return;
+    if (await replyWentOut(meeting)) {
+      await endAfterReply(meeting);
+      return;
+    }
+    if ((await getThreadParticipants(meeting.thread_key))?.state === 'awaiting-arrange') {
+      await endUnsentReply(meeting, 'was not sent: its job stopped before the reply went out');
+    }
+  }
+
+  /**
+   * A reply job ends with its reply unsent: its thread goes back to main, and
+   * main hears `why`, so it can respond again or tell the principal.
+   */
+  async function endUnsentReply(meeting: Meeting, why: string): Promise<void> {
     const at = new Date().toISOString();
     await handBack(meeting, 'gave-up', false, () =>
       writeOutcomeNote(
         replyNote(meeting, 'gave-up'),
-        `external-email's reply in thread ${meeting.thread_key}, to ${who(meeting)} (meeting ${meeting.id}), could not be sent: ` +
-          `email delivery kept failing. It was to "${meeting.purpose}". The thread waits for you again: try again with ` +
+        `external-email's reply in thread ${meeting.thread_key}, to ${who(meeting)} (meeting ${meeting.id}), ${why}. ` +
+          `It was to "${meeting.purpose}". The thread waits for you again: try again with ` +
           `respond and thread_key ${meeting.thread_key}, or tell the principal in one line.`,
         at,
       ),
@@ -2442,6 +2492,8 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     recipients,
     /** A delivered message may be a reply's own email: it finishes the reply once reported. */
     replyDelivered,
+    /** A reply job whose ending a stop or a failed note cut short: follow-through finishes it. */
+    finishCutShortReply,
     /** Delivery gave up on messages: each email a meeting's conversation wrote among them reaches main. */
     sendsFailed,
     /** A meeting's conversation was given up on messages after their retries: main hears of each. */

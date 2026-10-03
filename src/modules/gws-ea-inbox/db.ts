@@ -500,6 +500,18 @@ export async function insertPendingSend(
   });
 }
 
+/** Whether Gmail took an email the assistant sent in the thread at or after `since`: the durable record of a reply gone. */
+export async function hasSentInThreadSince(threadKey: string, since: string): Promise<boolean> {
+  const row = await getDb().get<{ found: number }>(
+    `SELECT 1 AS found FROM gws_ea_inbox_sends
+      WHERE thread_key = ? AND state = 'sent' AND created_at >= ?
+      LIMIT 1`,
+    threadKey,
+    since,
+  );
+  return row !== undefined;
+}
+
 export async function markSendSent(id: string, gmailMessageId: string, at: string): Promise<void> {
   await getDb().run(
     "UPDATE gws_ea_inbox_sends SET state = 'sent', gmail_message_id = ?, updated_at = ? WHERE id = ?",

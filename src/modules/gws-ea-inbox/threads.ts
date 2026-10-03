@@ -319,6 +319,17 @@ export async function addThreadPeople(
   return view({ ...thread, people, vouched });
 }
 
+/** Record that `main` vouched for people already on the thread, their places unchanged: their records apply. */
+export async function vouchThreadPeople(threadKey: string, addresses: readonly string[]): Promise<void> {
+  if (addresses.length === 0) return;
+  const thread = await requireLiveThread(threadKey);
+  const assistant = await assistantAddresses();
+  const vouched = uniqueAddresses([...thread.vouched, ...addresses.map((value) => requireAddress(value, assistant))]);
+  if (vouched.length !== thread.vouched.length) {
+    await updateThread(threadKey, { vouched }, new Date().toISOString());
+  }
+}
+
 /**
  * Return a thread held for `main` to waiting for it, its people kept: after a
  * takeover failed, or after `respond` answered while `main` waits on the

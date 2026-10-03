@@ -462,6 +462,14 @@ export async function listOpenBookings(): Promise<Array<{ readonly meeting: Meet
   );
 }
 
+/** Every reply job still at work, oldest first. */
+export async function listLiveReplyJobs(): Promise<Meeting[]> {
+  const rows = await getDb().all<MeetingRow>(
+    "SELECT * FROM gws_ea_meetings WHERE kind = 'respond' AND state = 'active' ORDER BY created_at",
+  );
+  return Promise.all(rows.map((row) => attachCounterparts(row)));
+}
+
 /** Every meeting that is no longer being arranged but still has holds recorded: a release that failed. */
 export async function listSettledMeetingsWithHolds(): Promise<Meeting[]> {
   const rows = await getDb().all<MeetingRow>(

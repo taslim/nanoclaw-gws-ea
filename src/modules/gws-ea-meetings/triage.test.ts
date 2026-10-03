@@ -47,13 +47,14 @@ import Database from 'better-sqlite3';
 
 import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
-import { deliverSessionMessages, getDeliveryAction } from '../../delivery.js';
+import { deliverSessionMessages, getDeliveryAction, getDeliveryAdapter } from '../../delivery.js';
 import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { reconcileSession } from '../../reconcile-session.js';
 import type { Session } from '../../types.js';
 import { addPerson } from '../gws-ea-people/db.js';
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
-import { getThreadParticipants, GoogleApiError, INBOX_PLATFORM_ID } from '../gws-ea-inbox/index.js';
+import { getThreadParticipants, GoogleApiError, handBackHeldThread, INBOX_PLATFORM_ID } from '../gws-ea-inbox/index.js';
+import { runFollowThrough } from './index.js';
 import { header, type IncomingMail, type SentMail } from './testing/fake-gmail.js';
 import {
   ADDRESSES,
@@ -271,6 +272,8 @@ describe('AE10: Sam, who has a record, emails the assistant for time', () => {
       { address: ADDRESSES.sam, person_id: scheduling.people.sam.id, name: 'Sam Kay', level: 'active' },
     ]);
     expect(withRecord.level).toBe('active');
+    // The thread remembers that main vouched for him, for any later job on it.
+    expect((await getThreadParticipants(named.threadKey))?.vouched).toContain(ADDRESSES.sam);
   });
 
   it('refuses a thread key that is not a thread waiting for main, naming no copy-in key', async () => {
@@ -738,6 +741,65 @@ describe('a step in a meeting’s conversation that failed', () => {
 // ---------------------------------------------------------------------------
 
 describe('respond', () => {
+  /** Gmail takes an email in the thread, as delivery would, but delivery never records it: the host stopped first. */
+  async function sentWithoutDelivery(threadKey: string, text: string): Promise<void> {
+    const adapter = getDeliveryAdapter();
+    if (!adapter) throw new Error('no delivery adapter');
+    await adapter.deliver('email', INBOX_PLATFORM_ID, threadKey, 'chat', JSON.stringify({ text }));
+  }
+
+  it('finishes a reply whose ending a stop cut short, once Gmail took it, and leaves one still at work alone', async () => {
+    const { threadKey } = await deeAsks();
+    const answer = data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
+    const meetingId = String(answer.meeting_id);
+
+    await runFollowThrough();
+    expect((await meeting(meetingId)).state).toBe('active');
+    expect(outcomeNotes('responded')).toEqual([]);
+
+    await sentWithoutDelivery(threadKey, 'Thank you for thinking of Alex. Sadly she is not speaking this autumn.');
+    expect(scheduling.gmail.sent).toHaveLength(1);
+    expect((await meeting(meetingId)).state).toBe('active');
+
+    await runFollowThrough();
+    await runFollowThrough();
+    expect((await meeting(meetingId)).state).toBe('responded');
+    expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'awaiting-arrange' });
+    expect(outcomeNotes('responded')).toHaveLength(1);
+    expect(scheduling.gmail.sent).toHaveLength(1);
+    data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
+  });
+
+  it('finishes the reply when external-email reports it after Gmail took it, though delivery never recorded it', async () => {
+    const { threadKey } = await deeAsks();
+    const answer = data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
+    const session = await meetingSession(answer.meeting_id);
+    await sentWithoutDelivery(threadKey, 'Thank you for thinking of Alex. Sadly she is not speaking this autumn.');
+
+    data(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'responded' }));
+    expect((await meeting(answer.meeting_id)).state).toBe('responded');
+    expect(outcomeNotes('responded')).toHaveLength(1);
+  });
+
+  it('ends a reply whose hand-back stopped before main heard, and tells main once', async () => {
+    const { threadKey } = await deeAsks();
+    const answer = data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
+    const meetingId = String(answer.meeting_id);
+    // The thread went back to main, then writing main's note failed: the job is still live.
+    await handBackHeldThread(threadKey);
+
+    await runFollowThrough();
+    await runFollowThrough();
+    expect((await meeting(meetingId)).state).toBe('gave-up');
+    const [note, ...more] = outcomeNotes('gave-up');
+    expect(more).toEqual([]);
+    expect(note.note).toMatchObject({ meeting_id: meetingId, thread_key: threadKey });
+    expect(note.text).toMatch(/was not sent/);
+    expect(note.text).toContain(`thread_key ${threadKey}`);
+    expect(scheduling.gmail.sent).toEqual([]);
+    data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
+  });
+
   it('sends one checked reply to everyone on the thread, hands the thread back to main, and a later arrange works', async () => {
     const { threadKey } = await deeAsks();
     const answer = data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
