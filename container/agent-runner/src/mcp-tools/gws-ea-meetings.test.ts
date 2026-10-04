@@ -272,6 +272,10 @@ describe('a request the host is slow to answer', () => {
     const status = await requestStatus.handler({ request_id: row.id });
     expect(status.isError).not.toBe(true);
     expect(status.content).toEqual([{ type: 'text', text: 'Handed to external-email as meeting mtg-1.' }]);
+
+    // The host files the answer as completed once it was read; asking again still finds it.
+    getInboundDb().prepare("UPDATE messages_in SET status = 'completed' WHERE id = ?").run(`action-resp-${row.id}`);
+    expect((await requestStatus.handler({ request_id: row.id })).content).toEqual(status.content);
   });
 
   it('says a request that is safe to repeat may be made again', async () => {
@@ -279,7 +283,7 @@ describe('a request the host is slow to answer', () => {
     expect(text(result)).toMatch(/or make the same call again: a repeat changes nothing twice/);
   });
 
-  it('reads back a late refusal as an error, and refuses an id no request carried', async () => {
+  it('reads back a late refusal as an error, and refuses a request id in the wrong form', async () => {
     const result = await timedOut(cancel, { meeting_id: 'mtg-1' });
     expect(result.isError).toBe(true);
     const [row] = getUndeliveredMessages();

@@ -237,6 +237,16 @@ export function refused(message: string): MeetingRequestError {
   return new MeetingRequestError('forbidden', message);
 }
 
+/** A meeting external-email still works on: a called-off one waits only for its closing line. */
+export function assertWorking(meeting: Meeting): void {
+  if (meeting.state === 'closing') {
+    throw refused(`Meeting ${meeting.id} is called off: send your one closing line, and nothing more.`);
+  }
+  if ((meeting.state !== 'active' && meeting.state !== 'booked') || meeting.ended_at !== null) {
+    throw refused(`Meeting ${meeting.id} has ended (${meeting.state}): send nothing more in this conversation.`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // The request's fields, checked here before anything acts on them
 // ---------------------------------------------------------------------------
@@ -1962,9 +1972,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     if (meeting.session_id !== session.id) throw refused("That meeting is not this conversation's");
     const about = ASK_TOPICS.find((topic) => topic === content.about);
     if (about === undefined) throw invalid(`about must be one of ${ASK_TOPICS.join(', ')}`);
-    if ((meeting.state !== 'active' && meeting.state !== 'booked') || meeting.ended_at !== null) {
-      throw refused(`Meeting ${meeting.id} has ended (${meeting.state}): send nothing more in this conversation.`);
-    }
+    assertWorking(meeting);
     if (meeting.ask_about !== null) {
       throw refused(
         `You already asked main about ${ASK_WORDS[meeting.ask_about]}: send nothing in this thread until the host writes to you.`,

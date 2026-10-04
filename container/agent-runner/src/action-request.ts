@@ -5,17 +5,16 @@
  * The request is a `system` message in the outbound mailbox whose
  * `requestId` is the id of that same message, so the host keys its side
  * effects on it and a replayed delivery returns the first answer. The tool
- * then polls the inbound mailbox for the answer carrying its `requestId`,
- * the same lookup `ncl` uses (the mailbox's `findCliResponse`, named for the
- * CLI bridge that first used it), and marks it completed. An answer that
+ * then polls the inbound mailbox for the answer, which the host files under
+ * an id made from the `requestId`, and marks it completed. An answer that
  * comes after the tool stopped waiting stays in the mailbox, unseen by the
- * poll loop, until `request_status` reads it.
+ * poll loop, and `request_status` reads it, as often as asked.
  */
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { findCliResponse, markCompleted } from './db/messages-in.js';
+import { getMessageIn, markCompleted } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
 
 /** The host's answer: mirrors `ResponseFrame` in src/cli/frame.ts. */
@@ -69,11 +68,13 @@ function frameOf(content: string, requestId: string): ActionResponseFrame {
 
 /**
  * The host's answer to one of this session's requests, once it has come; it
- * is marked completed as it is read. A session's mailbox holds only its own
- * requests' answers.
+ * is marked completed as it is read. It is found by its id
+ * (`writeActionResponse` in src/cli/delivery-action.ts), whatever its
+ * status, so a second read still finds an answer the host has since filed
+ * as completed. A session's mailbox holds only its own requests' answers.
  */
 export function readAnswer(requestId: string): ActionResponseFrame | undefined {
-  const answer = findCliResponse(requestId);
+  const answer = getMessageIn(`action-resp-${requestId}`);
   if (!answer) return undefined;
   markCompleted([answer.id]);
   return frameOf(answer.content, requestId);

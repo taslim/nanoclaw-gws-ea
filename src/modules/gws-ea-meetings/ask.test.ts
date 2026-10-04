@@ -198,7 +198,7 @@ describe('a curveball goes to main, and nothing goes to the other side', () => {
     expect((await meeting(stored.id)).nudge_at).toBe('2026-10-07T08:00:00.000Z');
   });
 
-  it('refuses a second question while one is open, and one about a meeting that has ended', async () => {
+  it('refuses a second question while one is open, and one about a meeting called off', async () => {
     const { stored, session } = await offeredToAcme();
     data(await ask(session, 'meeting_ask_main', { meeting_id: stored.id, about: 'place' }));
     expect(refusal(await ask(session, 'meeting_ask_main', { meeting_id: stored.id, about: 'time' }))).toMatch(
@@ -206,9 +206,30 @@ describe('a curveball goes to main, and nothing goes to the other side', () => {
     );
     expect(asks(stored.id)).toHaveLength(1);
 
+    // Acme was waiting on the offer, so the meeting closes with one line, which a question must not stop.
     data(await ask(scheduling.main, 'meeting_cancel', { meeting_id: stored.id }));
+    expect((await meeting(stored.id)).state).toBe('closing');
     expect(refusal(await ask(session, 'meeting_ask_main', { meeting_id: stored.id, about: 'time' }))).toMatch(
-      /has ended/,
+      /is called off: send your one closing line, and nothing more/,
+    );
+  });
+
+  it('refuses a question about a meeting that has ended', async () => {
+    const answer = data(
+      await ask(scheduling.main, 'meeting_arrange', {
+        people: [{ person_id: scheduling.people.acme.id }],
+        calendar_id: PRINCIPAL,
+        length_minutes: 30,
+        ...WEEK,
+        purpose: 'Partnership intro',
+      }),
+    );
+    const session = await meetingSession(answer.meeting_id);
+    // Nobody was written to yet, so calling it off ends it at once.
+    data(await ask(scheduling.main, 'meeting_cancel', { meeting_id: answer.meeting_id }));
+    expect((await meeting(answer.meeting_id)).state).toBe('cancelled');
+    expect(refusal(await ask(session, 'meeting_ask_main', { meeting_id: answer.meeting_id, about: 'time' }))).toMatch(
+      /has ended \(cancelled\): send nothing more/,
     );
   });
 

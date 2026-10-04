@@ -85,6 +85,7 @@ import {
 import { deadlinesFrom } from './follow-through.js';
 import {
   addressBook,
+  assertWorking,
   invalid,
   invitationOf,
   meetingIdOf,
@@ -689,12 +690,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
    */
   async function ownLiveMeeting(content: Record<string, unknown>, session: Session): Promise<SchedulingMeeting> {
     const meeting = await ownMeeting(content, session);
-    if (meeting.state === 'closing') {
-      throw refused(`Meeting ${meeting.id} is called off: send your one closing line, and nothing more.`);
-    }
-    if ((meeting.state !== 'active' && meeting.state !== 'booked') || meeting.ended_at !== null) {
-      throw refused(`Meeting ${meeting.id} has ended (${meeting.state}): send nothing more in this conversation.`);
-    }
+    assertWorking(meeting);
     return meeting;
   }
 
