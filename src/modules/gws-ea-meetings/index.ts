@@ -38,7 +38,6 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { registerCapability } from '../../capabilities.js';
 import { writeActionResponse } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
-import { registerMigration } from '../../db/migrations/index.js';
 import { registerDeliveryAction, registerDeliveryFailedHook, registerPostDeliveryHook } from '../../delivery.js';
 import type { DeliveryGuardSpec } from '../../delivery-guard.js';
 import type { GuardedAction } from '../../guard/index.js';
@@ -61,16 +60,9 @@ import {
   meetingRequestAction,
 } from './guard.js';
 import { answering, createMeetingHandoff, requestIdOf, type Handle } from './handoff.js';
-import {
-  gwsEaMeetingsCalendarActionsMigration,
-  gwsEaMeetingsMigration,
-  gwsEaMeetingsRoomsMigration,
-} from './migration.js';
 import { createRoom } from './room.js';
 
-registerMigration(gwsEaMeetingsMigration);
-registerMigration(gwsEaMeetingsCalendarActionsMigration);
-registerMigration(gwsEaMeetingsRoomsMigration);
+// The inbox registers this module's migrations, before its own email channel's (KTD10).
 
 /** How often follow-through runs. */
 const FOLLOW_THROUGH_INTERVAL_MS = 60_000;

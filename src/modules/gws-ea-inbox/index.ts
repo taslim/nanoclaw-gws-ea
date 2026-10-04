@@ -34,18 +34,30 @@ import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
 import { identityMatchKey } from '../../gws-ea/validation.js';
 import { registerPersonForgetHook } from '../gws-ea-people/index.js';
+import {
+  gwsEaMeetingsCalendarActionsMigration,
+  gwsEaMeetingsMigration,
+  gwsEaMeetingsRoomsMigration,
+} from '../gws-ea-meetings/migration.js';
 import { registerRecipientResolver } from '../gws-ea-privacy/index.js';
 import { registerRoleGrantPolicy } from '../permissions/db/user-roles.js';
 import { createInbox, EMAIL_CHANNEL_DEFAULTS, type Inbox } from './adapter.js';
 import { createCalendarListApi } from './calendar-notifications.js';
 import { deleteSends } from './db.js';
 import { createGmailApi } from './gmail-api.js';
+import { gwsEaInboxEmailChannelMigration } from './migration-email-channel.js';
 import { gwsEaInboxMigration } from './migration.js';
 import { contentHash, replyText, resolveRecipients } from './outbound.js';
 import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from './runtime.js';
 import { ensureInbox } from './wiring-policy.js';
 
+// The inbox registers the meetings store too, unchanged, so the email channel's
+// migration runs after every inbox and meetings table exists (KTD10).
 registerMigration(gwsEaInboxMigration);
+registerMigration(gwsEaMeetingsMigration);
+registerMigration(gwsEaMeetingsCalendarActionsMigration);
+registerMigration(gwsEaMeetingsRoomsMigration);
+registerMigration(gwsEaInboxEmailChannelMigration);
 
 /** How often the inbox polls Gmail. */
 const POLL_INTERVAL_MS = 60_000;
