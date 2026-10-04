@@ -8,21 +8,24 @@ import { PERSON_LEVELS, type PersonLevel } from '../gws-ea-people/db.js';
 
 /**
  * What `main` handed over: a meeting to arrange, move, or ask an organizer
- * to move, or one reply to write in a thread waiting for it (`respond`),
- * which has no length or window.
+ * to move, or a conversation in a thread waiting for it (`respond`), which
+ * has no length or window.
  */
 export const MEETING_KINDS = ['arrange', 'reschedule', 'ask_organizer', 'respond'] as const;
 export type MeetingKind = (typeof MEETING_KINDS)[number];
 /** The kinds that find a time. */
 export type SchedulingKind = Exclude<MeetingKind, 'respond'>;
 
-/** A live meeting holds its thread; every other state has ended it. */
-export const LIVE_STATES = ['opening', 'active', 'booked'] as const;
+/**
+ * A live meeting holds its thread; every other state has ended it. A
+ * `closing` meeting was called off and still owes the other side one line.
+ */
+export const LIVE_STATES = ['opening', 'active', 'booked', 'closing'] as const;
 export type MeetingState =
   | (typeof LIVE_STATES)[number]
   | 'settled'
   | 'not-scheduling'
-  | 'responded'
+  | 'done'
   | 'gave-up'
   | 'cancelled'
   | 'stopped'
@@ -42,7 +45,7 @@ export function lowestLevel(levels: readonly MeetingLevel[]): MeetingLevel {
   );
 }
 
-export const OUTCOMES = ['booked', 'settled', 'not-scheduling', 'gave-up', 'responded'] as const;
+export const OUTCOMES = ['booked', 'settled', 'not-scheduling', 'gave-up', 'done'] as const;
 export type Outcome = (typeof OUTCOMES)[number];
 
 /** What `external-email` can ask main about, never in its own words (KTD5). */
@@ -81,7 +84,7 @@ interface MeetingFields {
   /** Follow-through deadlines (KTD12): the nudge, then the release and gave-up. */
   readonly nudge_at: string | null;
   readonly give_up_at: string | null;
-  /** When a reply's email was delivered in its thread; null until then, and for every other kind. */
+  /** When delivery recorded the first email the job's conversation wrote in its thread; null until then. */
   readonly replied_at: string | null;
   /** The question `external-email` put to main and is waiting on, and when; both null while none is open. */
   readonly ask_about: AskTopic | null;
@@ -387,12 +390,17 @@ export async function clearDeadlines(id: string, at: string): Promise<void> {
 // Follow-through (KTD12)
 // ---------------------------------------------------------------------------
 
+/** When the one nudge is due, if the job has one (a conversation has none), and when it is given up. */
 export interface Deadlines {
-  readonly nudge_at: string;
+  readonly nudge_at: string | null;
   readonly give_up_at: string;
 }
 
-/** Start an active meeting's deadlines, unless some are already running: a later hold never pushes them out. */
+/**
+ * Start an active meeting's deadlines, unless some are already running: a
+ * later email or hold never pushes them out, and a nudge's own email never
+ * restarts the count it belongs to.
+ */
 export async function startDeadlines(id: string, deadlines: Deadlines, at: string): Promise<void> {
   await getDb().run(
     `UPDATE gws_ea_meetings SET nudge_at = ?, give_up_at = ?, updated_at = ?
@@ -404,10 +412,11 @@ export async function startDeadlines(id: string, deadlines: Deadlines, at: strin
   );
 }
 
-/** Start an active meeting's deadlines again, from a reply. */
+/** Start an active meeting's deadlines again, from the other side's email, unless main has a question open. */
 export async function restartDeadlines(id: string, deadlines: Deadlines, at: string): Promise<void> {
   await getDb().run(
-    `UPDATE gws_ea_meetings SET nudge_at = ?, give_up_at = ?, updated_at = ? WHERE id = ? AND state = 'active'`,
+    `UPDATE gws_ea_meetings SET nudge_at = ?, give_up_at = ?, updated_at = ?
+      WHERE id = ? AND state = 'active' AND asked_at IS NULL`,
     deadlines.nudge_at,
     deadlines.give_up_at,
     at,
@@ -461,13 +470,15 @@ export async function releaseGiveUp(id: string, giveUpAt: string, at: string): P
 }
 
 /**
- * Every live meeting with a deadline running (one being arranged, or a
- * booked one waiting on main), and every give-up claimed but not yet finished.
+ * Every live meeting with a deadline running (one being arranged, a booked
+ * one waiting on main, or one owing its closing line), and every give-up
+ * claimed but not yet finished.
  */
 export async function listMeetingsWithDeadlines(): Promise<Meeting[]> {
   const rows = await getDb().all<MeetingRow>(
     `SELECT * FROM gws_ea_meetings
-      WHERE (state IN ('active', 'booked') AND ended_at IS NULL AND (nudge_at IS NOT NULL OR give_up_at IS NOT NULL))
+      WHERE (state IN ('active', 'booked', 'closing') AND ended_at IS NULL
+             AND (nudge_at IS NOT NULL OR give_up_at IS NOT NULL))
          OR (state = 'gave-up' AND give_up_at IS NOT NULL)
       ORDER BY created_at`,
   );
@@ -506,7 +517,7 @@ export async function listOpenBookings(): Promise<Array<{ readonly meeting: Meet
   );
 }
 
-/** Every reply job still at work, oldest first. */
+/** Every conversation still at work, oldest first. */
 export async function listLiveReplyJobs(): Promise<Meeting[]> {
   const rows = await getDb().all<MeetingRow>(
     "SELECT * FROM gws_ea_meetings WHERE kind = 'respond' AND state = 'active' ORDER BY created_at",

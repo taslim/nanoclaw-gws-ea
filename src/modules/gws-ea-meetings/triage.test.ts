@@ -747,37 +747,46 @@ describe('respond', () => {
     await adapter.deliver('email', INBOX_PLATFORM_ID, threadKey, 'chat', JSON.stringify({ text }));
   }
 
-  it('finishes a reply whose ending a stop cut short, once Gmail took it, and leaves one still at work alone', async () => {
+  it('starts the quiet count of a conversation whose first email Gmail took though delivery never heard, and leaves one still at work alone', async () => {
     const { threadKey } = await deeAsks();
     const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
     const meetingId = String(answer.meeting_id);
 
     await runFollowThrough();
-    expect((await meeting(meetingId)).state).toBe('active');
-    expect(outcomeNotes('responded')).toEqual([]);
+    expect(await meeting(meetingId)).toMatchObject({ state: 'active', replied_at: null, give_up_at: null });
 
     await sentWithoutDelivery(threadKey, 'Thank you for thinking of Alex. Sadly she is not speaking this autumn.');
     expect(scheduling.gmail.sent).toHaveLength(1);
-    expect((await meeting(meetingId)).state).toBe('active');
-
     await runFollowThrough();
-    await runFollowThrough();
-    expect((await meeting(meetingId)).state).toBe('responded');
-    expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'awaiting-arrange' });
-    expect(outcomeNotes('responded')).toHaveLength(1);
-    expect(scheduling.gmail.sent).toHaveLength(1);
-    data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
+    // Monday 08:00, before working hours: it ends quietly four working days from Monday 09:00.
+    expect(await meeting(meetingId)).toMatchObject({
+      state: 'active',
+      replied_at: NOW,
+      nudge_at: null,
+      give_up_at: '2026-10-09T08:00:00.000Z',
+    });
+    expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'open' });
   });
 
-  it('finishes the reply when external-email reports it after Gmail took it, though delivery never recorded it', async () => {
+  it('ends a conversation external-email reports done: its thread waits for main, and main hears without waking', async () => {
     const { threadKey } = await deeAsks();
     const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
     const session = await meetingSession(answer.meeting_id);
     await sentWithoutDelivery(threadKey, 'Thank you for thinking of Alex. Sadly she is not speaking this autumn.');
 
-    data(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'responded' }));
-    expect((await meeting(answer.meeting_id)).state).toBe('responded');
-    expect(outcomeNotes('responded')).toHaveLength(1);
+    expect(
+      data(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'done' })).message,
+    ).toMatch(/closed/);
+    expect((await meeting(answer.meeting_id)).state).toBe('done');
+    expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'awaiting-arrange' });
+    expect((await getSession(session.id))?.status).toBe('closed');
+    const [note, ...more] = outcomeNotes('done');
+    expect(more).toEqual([]);
+    expect(note.row.trigger).toBe(0);
+    expect(note.text).toContain(`thread ${threadKey}`);
+    // A report again is answered, and changes nothing.
+    data(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'done' }));
+    expect(outcomeNotes('done')).toHaveLength(1);
   });
 
   it('ends a reply whose hand-back stopped before main heard, and tells main once', async () => {
@@ -799,7 +808,7 @@ describe('respond', () => {
     data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
   });
 
-  it('sends one checked reply to everyone on the thread, hands the thread back to main, and a later arrange works', async () => {
+  it('answers everyone on the thread and stays for their follow-ups; done hands the thread back, and a later arrange works', async () => {
     const { threadKey } = await deeAsks();
     const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
     const stored = await meeting(answer.meeting_id);
@@ -810,7 +819,8 @@ describe('respond', () => {
     expect(more).toEqual([]);
     expect(brief.sender).toBe('system');
     expect(brief.brief).toMatchObject({ meeting_id: stored.id, kind: 'respond' });
-    expect(brief.text).toContain('Write one reply in this thread: Decline kindly');
+    expect(brief.text).toContain('Answer in this thread: Decline kindly');
+    expect(brief.text).toMatch(/report done with meeting_outcome/);
     expect(brief.text).toContain(DEE);
     expect(brief.text).toContain(KIM);
     expect(brief.text).not.toMatch(/Window:|Length:/);
@@ -821,20 +831,26 @@ describe('respond', () => {
     expect(sent.threadId).toBe('g-dee');
     expect(recipientsOf(sent)).toEqual({ to: DEE, cc: KIM, bcc: undefined });
 
-    // The reply's delivery ends the job: the thread is main's again at once.
-    expect((await meeting(stored.id)).state).toBe('responded');
-    expect((await getSession(session.id))?.status).toBe('closed');
-    expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'awaiting-arrange' });
-    const [note] = outcomeNotes('responded');
-    expect(note.note).toMatchObject({ meeting_id: stored.id, thread_key: threadKey });
-    expect(note.text).toContain(threadKey);
+    // The conversation stays open: Dee's follow-up reaches it, not main.
+    expect(await meeting(stored.id)).toMatchObject({ state: 'active', nudge_at: null });
+    expect((await getSession(session.id))?.status).toBe('active');
+    expect(outcomeNotes('done')).toEqual([]);
+    scheduling.gmail.receive({
+      threadId: 'g-dee',
+      from: `Dee <${DEE}>`,
+      to: [ROBIN],
+      subject: 'Re: Speaking at our meetup',
+      body: 'Thanks anyway! Could she record a short video instead?',
+    });
+    await scheduling.inbox.tick();
+    expect(contents(session).some((c) => c.text?.includes('record a short video'))).toBe(true);
+    expect(await heldCount(threadKey)).toBe(0);
+    expect(notes(scheduling.main, 'gws-ea-inbox.held-mail')).toEqual([]);
 
-    // external-email's report afterwards is answered, and changes nothing.
-    expect(
-      data(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'responded' })).message,
-    ).toMatch(/closed/);
-    expect(outcomeNotes('responded')).toHaveLength(1);
-    expect(scheduling.gmail.sent).toHaveLength(1);
+    await reply(session, threadKey, 'A short video should be possible: I will check with Alex and come back to you.');
+    data(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'done' }));
+    expect((await meeting(stored.id)).state).toBe('done');
+    expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'awaiting-arrange' });
 
     // Dee writes again: main hears of it, and the thread can be arranged.
     scheduling.gmail.receive({
@@ -860,27 +876,32 @@ describe('respond', () => {
     expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'open' });
   });
 
-  it('holds mail that arrives right after the reply has gone for main, never for the closed conversation', async () => {
+  it('ends a conversation that goes quiet without a word to anyone, and later mail reaches main', async () => {
     const { threadKey } = await deeAsks();
     const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
     const session = await meetingSession(answer.meeting_id);
     await reply(session, threadKey, 'Thank you for thinking of Alex. Sadly she is not speaking this autumn.');
-    const seen = contents(session).length;
+    expect((await meeting(answer.meeting_id)).give_up_at).toBe('2026-10-09T08:00:00.000Z');
+
+    vi.setSystemTime(new Date('2026-10-09T08:01:00.000Z'));
+    await scheduling.inbox.tick();
+    await runFollowThrough();
+    expect((await meeting(answer.meeting_id)).state).toBe('done');
+    expect(scheduling.gmail.sent).toHaveLength(1);
+    const [note] = outcomeNotes('done');
+    expect(note.text).toMatch(/went quiet/);
+    expect(note.row.trigger).toBe(0);
 
     scheduling.gmail.receive({
       threadId: 'g-dee',
       from: `Dee <${DEE}>`,
       to: [ROBIN],
       subject: 'Re: Speaking at our meetup',
-      body: 'Thanks anyway! One more thing: could she record a short video?',
+      body: 'One more thing: could she record a short video?',
     });
     await scheduling.inbox.tick();
-
-    expect(contents(session)).toHaveLength(seen);
-    expect(await heldCount(threadKey)).toBe(1);
     const [held] = notes(scheduling.main, 'gws-ea-inbox.held-mail');
     expect(held.note).toMatchObject({ thread_key: threadKey, sender: DEE });
-    expect(held.text).toContain('record a short video');
   });
 
   it('tells main a reply delivery gave up on, and hands the thread back so main can try again', async () => {
@@ -912,26 +933,6 @@ describe('respond', () => {
     vi.mocked(scheduling.gmail.send).mockRestore();
     const again = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
     expect((await meeting(again.meeting_id)).state).toBe('active');
-  });
-
-  it('hands the thread back only once its reply has gone, when the report comes first', async () => {
-    const { threadKey } = await deeAsks();
-    const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
-    const session = await meetingSession(answer.meeting_id);
-
-    expect(
-      data(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'responded' })).message,
-    ).toMatch(/not gone/);
-    expect((await meeting(answer.meeting_id)).state).toBe('active');
-    expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'open' });
-    expect(outcomeNotes('responded')).toHaveLength(0);
-
-    await reply(session, threadKey, 'Thank you for thinking of Alex. Sadly she is not speaking this autumn.');
-    expect(scheduling.gmail.sent).toHaveLength(1);
-    expect((await meeting(answer.meeting_id)).state).toBe('responded');
-    expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'awaiting-arrange' });
-    expect((await getSession(session.id))?.status).toBe('closed');
-    expect(outcomeNotes('responded')).toHaveLength(1);
   });
 
   it('refuses a purpose carrying a private detail, before external-email sees it', async () => {

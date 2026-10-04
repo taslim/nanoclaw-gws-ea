@@ -36,7 +36,7 @@ const EXTERNAL_CAPABILITY = 'gws-ea-meetings-external';
 /** How long a tool waits for the host; a request may still go through after that. */
 export const MEETING_REQUEST_TIMEOUT_MS = 120_000;
 
-const OUTCOMES = ['booked', 'settled', 'not-scheduling', 'gave-up', 'responded'] as const;
+const OUTCOMES = ['booked', 'settled', 'not-scheduling', 'gave-up', 'done'] as const;
 const ASK_TOPICS = ['time', 'length', 'people', 'place', 'other'] as const;
 
 function err(text: string): CallToolResult {
@@ -290,14 +290,19 @@ export const reschedule = requestTool({
 export const cancel = requestTool({
   name: 'meeting_cancel',
   description:
-    'Call something off. Give meeting_id for a meeting you handed to external-email: the host releases its held times and deletes the event it booked, and Google sends the guests its cancellation. Or give calendar_id and event_id for an event the principal organizes with others: the host deletes it, and Google sends its guests the cancellation. For an event someone else organizes, decline it or have meeting_reschedule ask its organizer instead.',
+    'Call something off in one step. Give meeting_id for a job you handed to external-email: the host releases its held times and deletes an event it booked, and Google sends the guests its cancellation. The other side gets one gracious line from external-email only when you give a note or they were waiting on its offer. A conversation is called off with nothing sent. Or give calendar_id and event_id for an event the principal organizes with others: the host deletes it, and Google sends its guests the cancellation. For an event someone else organizes, decline it or have meeting_reschedule ask its organizer instead.',
   properties: {
     meeting_id: { type: 'string', description: 'The meeting’s id, such as mtg-….' },
+    note: {
+      type: 'string',
+      description:
+        'With meeting_id: what external-email should tell them, such as a reason or another time to try. They read what it leads to, so write only what they may know. Up to 500 characters.',
+    },
     calendar_id: { type: 'string', description: 'The calendar the event is on, instead of meeting_id.' },
     event_id: { type: 'string', description: 'The event’s id on that calendar, with calendar_id.' },
   },
   required: {},
-  optional: { meeting_id: 'string', calendar_id: 'string', event_id: 'string' },
+  optional: { meeting_id: 'string', note: 'string', calendar_id: 'string', event_id: 'string' },
   repeatable: false,
   check: (args) => {
     if (args.meeting_id !== undefined) {
@@ -347,7 +352,7 @@ export const amend = requestTool({
 export const respond = requestTool({
   name: 'email_respond',
   description:
-    'Have external-email answer an email thread that is waiting for you, to everyone on it, such as declining with an alternative or routing the request. Say in purpose what the answer must do; external-email writes it. For a scheduling request, use meeting_arrange with the thread_key instead.',
+    'Have external-email answer an email thread that is waiting for you, to everyone on it, such as declining with an alternative or routing the request. Say in purpose what the answer must do; external-email writes it, and stays with the conversation for their follow-ups until it is done or goes quiet. For a scheduling request, use meeting_arrange with the thread_key instead.',
   properties: {
     thread_key: THREAD_KEY,
     purpose: {
@@ -490,7 +495,7 @@ export const askMain = requestTool({
 export const outcome = requestTool({
   name: 'meeting_outcome',
   description:
-    "Report how this conversation's meeting ended, once. booked: after meeting_book succeeded. settled: the organizer moved their invitation. not-scheduling: the thread is not about arranging a meeting. gave-up: no time could be agreed. responded: the answer a respond brief asked for is written. The host fills in the details for the principal.",
+    "Report how this conversation's meeting ended, once. booked: after meeting_book succeeded. settled: the organizer moved their invitation. not-scheduling: the thread is not about arranging a meeting. gave-up: no time could be agreed. done: a conversation needs nothing more from you, once your last email has gone. The host fills in the details for main.",
   properties: {
     meeting_id: MEETING_ID,
     outcome: { type: 'string', enum: [...OUTCOMES], description: 'How the meeting ended.' },

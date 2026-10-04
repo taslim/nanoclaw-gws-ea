@@ -9,7 +9,8 @@
  *   moved, and a room that could not be held.
  * - To a meeting's own `external-email` session: host-only messages from
  *   sender `system`, which no email can be, in the meeting's thread. The
- *   nudge for a quiet thread, and the time room was made for (KTD12).
+ *   nudge for a quiet thread, the time room was made for (KTD12), and the
+ *   one closing line a called-off meeting owes (KTD6).
  *
  * A note's id derives from what it reports, so writing it again is a no-op.
  */
@@ -38,6 +39,8 @@ export const STALLED_NOTE_TYPE = 'gws-ea-meetings.stalled';
 export const NUDGE_NOTE_TYPE = 'gws-ea-meetings.nudge';
 /** To a meeting's session: room was made, and its time is held for the meeting. */
 export const ROOM_NOTE_TYPE = 'gws-ea-meetings.room';
+/** To a meeting's session: main called it off; tell them in one line, then nothing more. */
+export const CLOSING_NOTE_TYPE = 'gws-ea-meetings.closing';
 
 export interface NoteCounterpart {
   readonly name: string | null;
@@ -83,9 +86,9 @@ export interface OutcomeNote {
   };
   /** On a gave-up outcome the host reported itself: nobody answered after a nudge. */
   readonly unanswered?: true;
-  /** On a gave-up outcome for a reply: delivery gave up on its email, so it was never sent. */
+  /** On a gave-up outcome for a conversation: delivery gave up on its email, so it was never sent. */
   readonly undelivered?: true;
-  /** On a responded or not-scheduling outcome: the thread, waiting for main again, to arrange, respond, or dismiss. */
+  /** On a done or not-scheduling outcome: the thread, waiting for main again, to arrange, respond, or dismiss. */
   readonly thread_key?: string;
 }
 
@@ -144,11 +147,10 @@ export async function writeMainNote<Note extends { readonly type: string; readon
 
 /**
  * Write how a meeting ended into main's shared session, once per meeting and
- * outcome; with `report`, the request that carried it, once per report.
+ * outcome, waking main unless `wake` is false.
  */
-export async function writeOutcomeNote(note: OutcomeNote, text: string, at: string, report?: string): Promise<void> {
-  const id = `meeting-${note.outcome}-${note.meeting_id}`;
-  await writeMainNote(report === undefined ? id : `${id}-${report}`, note, text, at);
+export async function writeOutcomeNote(note: OutcomeNote, text: string, at: string, wake = true): Promise<void> {
+  await writeMainNote(`meeting-${note.outcome}-${note.meeting_id}`, note, text, at, wake);
 }
 
 /**

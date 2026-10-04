@@ -177,9 +177,9 @@ for (const [action, handle, guardAction] of REQUESTS) {
 registerPersonForgetHook('gws-ea-meetings:purge', (person) => handoff.forgetPerson(person));
 registerThreadStoppedHook('gws-ea-meetings:close', (thread) => handoff.threadStopped(thread));
 registerThreadReplyHook('gws-ea-meetings:follow-through', (threadKey) => followThrough.replied(threadKey));
-// A reply's thread goes back to main the moment its email is delivered. main hears of every email
-// a meeting's conversation wrote that delivery gave up on: the principal asked for nothing there.
-registerPostDeliveryHook((msg, session) => handoff.replyDelivered(msg, session));
+// A delivered email starts its job's quiet count, and a called-off meeting's closing line ends it.
+// main hears of every email a meeting's conversation wrote that delivery gave up on.
+registerPostDeliveryHook((msg, session) => handoff.emailDelivered(msg, session));
 registerDeliveryFailedHook((failed, session) => handoff.sendsFailed(failed, session));
 // Nor does an email to a meeting's conversation it could not process, or a turn of it that failed.
 registerInboundFailedHook((failed, session) => handoff.inboundFailed(failed, session));

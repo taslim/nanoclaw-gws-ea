@@ -10,10 +10,11 @@ import type { ModuleMigration } from '../../db/migrations/index.js';
  *   ask_organizer is about); its length, window, purpose and constraints;
  *   its state; the thread and session it is bound to; its brief's version;
  *   its follow-through deadlines; and the question `external-email` put to
- *   main and is waiting on, if any (`ask_about`, `asked_at`). A `respond` job writes one reply in a
- *   thread waiting for main: it has no length or window, and records when
- *   its reply was delivered. At most one live meeting holds a thread at a
- *   time.
+ *   main and is waiting on, if any (`ask_about`, `asked_at`). A `respond`
+ *   job is a conversation in a thread waiting for main: it has no length or
+ *   window. Each job records when its first email was delivered. A meeting
+ *   called off while it owes the other side one line is `closing` until
+ *   that line has gone. At most one live meeting holds a thread at a time.
  * - `gws_ea_meeting_counterparts`: who the meeting is with: each address the
  *   host took from a person's record, from Google, from the mail of a thread
  *   held for main, or from main, with that person's name and level as the
@@ -22,8 +23,8 @@ import type { ModuleMigration } from '../../db/migrations/index.js';
  *   session and the outbound message that carried it, so a replay returns
  *   the first answer.
  * - `gws_ea_meeting_outcomes`: each outcome a meeting reported, once. A
- *   reply's `responded` is recorded when delivery records its email, and its
- *   `gave-up` when delivery gives up on it.
+ *   conversation's `done` is recorded when it ends, and its `gave-up` when
+ *   delivery gives up on its email.
  * - `gws_ea_meeting_slots`: the candidate times the host offered for a
  *   meeting, by slot id (written by the calendar actions).
  * - `gws_ea_meeting_bookings`: the event the host's own `book` created or
@@ -41,8 +42,8 @@ export const gwsEaMeetingsMigration: ModuleMigration = {
         requested_by_session  TEXT NOT NULL,
         request_id            TEXT NOT NULL,
         state                 TEXT NOT NULL CHECK (state IN (
-                                'opening', 'active', 'booked', 'settled', 'not-scheduling', 'responded', 'gave-up',
-                                'cancelled', 'stopped', 'superseded', 'failed'
+                                'opening', 'active', 'booked', 'closing', 'settled', 'not-scheduling', 'done',
+                                'gave-up', 'cancelled', 'stopped', 'superseded', 'failed'
                               )),
         level                 TEXT NOT NULL CHECK (level IN ('inner-circle', 'close', 'active', 'known', 'unknown')),
         booking_calendar_id   TEXT CHECK (booking_calendar_id <> ''),
@@ -70,11 +71,10 @@ export const gwsEaMeetingsMigration: ModuleMigration = {
         CHECK (kind IN ('arrange', 'respond') OR (event_calendar_id IS NOT NULL AND event_id IS NOT NULL)),
         CHECK ((kind = 'respond') = (length_minutes IS NULL)),
         CHECK ((length_minutes IS NULL) = (window_start IS NULL) AND (window_start IS NULL) = (window_end IS NULL)),
-        CHECK (kind = 'respond' OR replied_at IS NULL),
         CHECK ((ask_about IS NULL) = (asked_at IS NULL))
       );
       CREATE UNIQUE INDEX idx_gws_ea_meetings_live_thread
-        ON gws_ea_meetings (thread_key) WHERE state IN ('opening', 'active', 'booked');
+        ON gws_ea_meetings (thread_key) WHERE state IN ('opening', 'active', 'booked', 'closing');
       CREATE INDEX idx_gws_ea_meetings_session ON gws_ea_meetings (session_id);
       CREATE INDEX idx_gws_ea_meetings_event ON gws_ea_meetings (event_calendar_id, event_id);
 
@@ -103,7 +103,7 @@ export const gwsEaMeetingsMigration: ModuleMigration = {
       CREATE TABLE gws_ea_meeting_outcomes (
         meeting_id   TEXT NOT NULL REFERENCES gws_ea_meetings(id) ON DELETE CASCADE,
         outcome      TEXT NOT NULL CHECK (outcome IN (
-                       'booked', 'settled', 'not-scheduling', 'gave-up', 'responded'
+                       'booked', 'settled', 'not-scheduling', 'gave-up', 'done'
                      )),
         response     TEXT NOT NULL,
         recorded_at  TEXT NOT NULL,

@@ -75,7 +75,7 @@ import { ensureInbox, getThreadParticipants, GoogleApiError, type Inbox } from '
 import { consumeOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import { getMeeting } from './index.js';
 import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
-import { FakeGmail, header } from './testing/fake-gmail.js';
+import { FakeGmail } from './testing/fake-gmail.js';
 import {
   ask,
   contents,
@@ -906,63 +906,116 @@ describe('reschedule', () => {
 // ---------------------------------------------------------------------------
 
 describe('cancel', () => {
-  it('releases the meeting, closes its session, sends the counterparts one checked line, and leaves no deadline', async () => {
+  it('has the conversation write one closing line while times are on offer, then ends it, and later mail reaches main', async () => {
     const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
     const stored = await meeting(answer.meeting_id);
     const session = await meetingSession(answer.meeting_id);
+    const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
+    data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [slot.slot_id] }));
     await reply(session, stored.thread_key, 'Hello Sam, I am Robin, Pat Doe’s assistant. Would Tuesday at 10:00 work?');
     expect(gmail.sent).toHaveLength(1);
-    await getDb().run(
-      'UPDATE gws_ea_meetings SET nudge_at = ?, give_up_at = ? WHERE id = ?',
-      inDays(2),
-      inDays(4),
-      stored.id,
-    );
 
     const cancelled = data(await ask(main, 'meeting_cancel', { meeting_id: stored.id }));
-    expect(cancelled).toMatchObject({ state: 'cancelled', counterparts_told: true });
+    expect(cancelled.state).toBe('closing');
+    expect(String(cancelled.message)).toMatch(/tells Sam Lee \(sam@acme.example\) in one line/);
+    // Nothing is written by the host itself: external-email writes the line.
+    expect(gmail.sent).toHaveLength(1);
+    expect(calendar.live(PRINCIPAL).filter((event) => event.tags?.gwsEaRole === 'hold')).toEqual([]);
+    const closing = await meeting(stored.id);
+    expect(closing).toMatchObject({ state: 'closing', nudge_at: null });
+    expect(closing.give_up_at).not.toBeNull();
+    const [note] = contents(session).filter((c) => c.note?.type === 'gws-ea-meetings.closing');
+    expect(note.sender).toBe('system');
+    expect(note.text).toMatch(/one short, gracious line/);
+    expect((await getSession(session.id))?.status).toBe('active');
+    // A called-off meeting offers nothing more.
+    expect(refusal(await ask(session, 'meeting_free_time', { meeting_id: stored.id }))).toMatch(/called off/);
 
+    await reply(
+      session,
+      stored.thread_key,
+      'Pat no longer needs this meeting after all. Thank you, Sam, and sorry for the trouble.',
+    );
     expect(gmail.sent).toHaveLength(2);
-    const line = gmail.sent[1];
-    expect(line.threadId).toBe(gmail.sent[0].threadId);
-    expect(header(line.headers, 'To')).toBe(SAM);
-    expect(line.text.split('\n').filter((l) => l.trim() !== '').length).toBeLessThanOrEqual(2);
-
-    const after = await meeting(stored.id);
-    expect(after).toMatchObject({ state: 'cancelled', nudge_at: null, give_up_at: null });
+    expect(gmail.sent[1].threadId).toBe(gmail.sent[0].threadId);
+    expect(await meeting(stored.id)).toMatchObject({ state: 'cancelled', nudge_at: null, give_up_at: null });
     expect((await getSession(session.id))?.status).toBe('closed');
-    expect(vi.mocked(killContainer)).toHaveBeenCalledWith(session.id, expect.any(String));
     expect(await getThreadParticipants(stored.thread_key)).toMatchObject({ state: 'closed' });
     expect(
       await getDb().all('SELECT thread_id FROM gws_ea_privacy_threads WHERE thread_id = ?', stored.thread_key),
     ).toEqual([]);
-
     // A cancelled meeting takes no more outcomes.
     refusal(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'gave-up' }));
+
+    gmail.receive({
+      threadId: gmail.sent[0].threadId,
+      from: `Sam Lee <${SAM}>`,
+      to: [ROBIN],
+      subject: 'Re: Partnership intro',
+      body: 'No problem at all. Another time next month?',
+    });
+    await inbox.tick();
+    expect(contents(main).some((c) => c.note?.type === 'gws-ea-inbox.inbound' && c.text?.includes(SAM))).toBe(true);
   });
 
-  it('checks the line like every send, so a line carrying a private detail is not sent', async () => {
-    await addPrivateValue({ label: 'Full name', kind: 'other', value: 'Pat Doe' });
+  it("deletes a booked meeting's event with Google's notice, and passes main's note on in the closing line", async () => {
     const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
     const stored = await meeting(answer.meeting_id);
     const session = await meetingSession(answer.meeting_id);
-    await reply(session, stored.thread_key, 'Hello Sam, I am Robin. Would Tuesday at 10:00 work?');
-    expect(gmail.sent).toHaveLength(1);
+    const booking = await bookFirstTime(session, stored.id);
+    data(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'booked' }));
 
-    expect(data(await ask(main, 'meeting_cancel', { meeting_id: stored.id }))).toMatchObject({
-      state: 'cancelled',
-      counterparts_told: false,
+    const cancelled = data(
+      await ask(main, 'meeting_cancel', {
+        meeting_id: stored.id,
+        note: 'Pat has to travel that week; she will be in touch.',
+      }),
+    );
+    expect(cancelled.state).toBe('closing');
+    expect(calendar.writes.at(-1)).toMatchObject({
+      op: 'delete',
+      calendarId: booking.calendar_id,
+      eventId: booking.event_id,
+      sendUpdates: 'all',
     });
-    expect(gmail.sent).toHaveLength(1);
+    expect(calendar.event(booking.calendar_id, booking.event_id)?.status).toBe('cancelled');
+    const [note] = contents(session).filter((c) => c.note?.type === 'gws-ea-meetings.closing');
+    expect(note.text).toContain('Google sent them its cancellation');
+    expect(note.text).toContain("main's words: Pat has to travel that week; she will be in touch.");
+  });
+
+  it("ends a booked meeting at once with no note: Google's cancellation is the one message", async () => {
+    const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
+    const stored = await meeting(answer.meeting_id);
+    const session = await meetingSession(answer.meeting_id);
+    const booking = await bookFirstTime(session, stored.id);
+    data(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'booked' }));
+
+    expect(data(await ask(main, 'meeting_cancel', { meeting_id: stored.id })).state).toBe('cancelled');
+    expect(calendar.event(booking.calendar_id, booking.event_id)?.status).toBe('cancelled');
+    expect(gmail.sent).toHaveLength(0);
     expect((await getSession(session.id))?.status).toBe('closed');
+    expect(vi.mocked(killContainer)).toHaveBeenCalledWith(session.id, expect.any(String));
   });
 
   it('sends no line to people the assistant has not written to yet', async () => {
     const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
-    expect(data(await ask(main, 'meeting_cancel', { meeting_id: answer.meeting_id }))).toMatchObject({
-      counterparts_told: false,
-    });
+    expect(data(await ask(main, 'meeting_cancel', { meeting_id: answer.meeting_id })).state).toBe('cancelled');
     expect(gmail.sent).toHaveLength(0);
+  });
+
+  it('refuses a note carrying a private detail, before anything changes', async () => {
+    await addPrivateValue({ label: 'Home', kind: 'address', value: '12 Elm Road, Springfield' });
+    const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
+    expect(
+      refusal(
+        await ask(main, 'meeting_cancel', {
+          meeting_id: answer.meeting_id,
+          note: 'Pat is at 12 Elm Road, Springfield.',
+        }),
+      ),
+    ).toMatch(/not passed on/);
+    expect((await meeting(answer.meeting_id)).state).toBe('active');
   });
 });
 
@@ -1027,7 +1080,8 @@ describe('cancel for an event the principal organizes (R8)', () => {
     expect((await meeting(stored.id)).state).toBe('cancelled');
     expect((await getSession(session.id))?.status).toBe('closed');
     expect(await getThreadParticipants(stored.thread_key)).toMatchObject({ state: 'closed' });
-    expect(gmail.sent).toHaveLength(2);
+    // Booked, so nobody was waiting on an offer: Google's notice is the one message.
+    expect(gmail.sent).toHaveLength(1);
   });
 });
 

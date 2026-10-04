@@ -61,7 +61,6 @@ import {
   getMeeting,
   getOfferedSlot,
   getRoomMadeBy,
-  LIVE_STATES,
   listHolds,
   recordBooking,
   recordHold,
@@ -566,10 +565,17 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
   // The requests
   // -------------------------------------------------------------------------
 
-  /** The meeting this conversation runs, still live: a booked one only until its event has passed. */
+  /**
+   * The meeting this conversation runs, still being arranged or booked: a
+   * booked one only until its event has passed. A called-off meeting owes
+   * one line and offers nothing.
+   */
   async function ownLiveMeeting(content: Record<string, unknown>, session: Session): Promise<SchedulingMeeting> {
     const meeting = await ownMeeting(content, session);
-    if (!LIVE_STATES.some((state) => state === meeting.state) || meeting.ended_at !== null) {
+    if (meeting.state === 'closing') {
+      throw refused(`Meeting ${meeting.id} is called off: send your one closing line, and nothing more.`);
+    }
+    if ((meeting.state !== 'active' && meeting.state !== 'booked') || meeting.ended_at !== null) {
       throw refused(`Meeting ${meeting.id} has ended (${meeting.state}): send nothing more in this conversation.`);
     }
     return meeting;

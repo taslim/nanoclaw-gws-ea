@@ -135,6 +135,23 @@ async function offered(person: Person, extra: Record<string, unknown> = {}): Pro
   return { stored, session, slots };
 }
 
+/** An invitation Acme organizes on the principal's calendar, on Wednesday morning. */
+function calendarInvitation(): void {
+  scheduling.calendar.put({
+    calendarId: PRINCIPAL,
+    id: 'evt-invite',
+    iCalUID: 'evt-invite@google.com',
+    status: 'confirmed',
+    organizer: { email: ADDRESSES.acme },
+    attendees: [
+      { email: ADDRESSES.acme, organizer: true, responseStatus: 'accepted' },
+      { email: PRINCIPAL, responseStatus: 'needsAction' },
+    ],
+    start: { dateTime: '2026-10-07T09:00:00Z' },
+    end: { dateTime: '2026-10-07T10:00:00Z' },
+  });
+}
+
 /** A counterpart writes in the thread of an email the assistant sent, the first by default. */
 async function theyWrite(from: string, body: string, inThreadOf = scheduling.gmail.sent[0]): Promise<void> {
   scheduling.gmail.receive({
@@ -244,7 +261,7 @@ describe('deadlines', () => {
     });
   });
 
-  it('a reply clears them; while times are still held, the quiet count starts again from the reply', async () => {
+  it('a reply starts the quiet count again from the reply, whether or not times are held', async () => {
     const { stored, session } = await offered(scheduling.people.acme);
     vi.setSystemTime(new Date('2026-10-06T11:00:00.000Z'));
     await theyWrite(`Acme Sales <${ADDRESSES.acme}>`, 'Thanks, let me check with the team and come back to you.');
@@ -260,10 +277,51 @@ describe('deadlines', () => {
     await reach('2026-10-08T11:01:00.000Z');
     expect(notes(session, NUDGE)).toHaveLength(1);
 
-    // With nothing held, a reply leaves no deadline behind.
+    // With nothing held, a reply still starts the count again: the conversation is what goes quiet.
     data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [] }));
     await theyWrite(`Acme Sales <${ADDRESSES.acme}>`, 'None of those work, sorry.');
-    expect(await meeting(stored.id)).toMatchObject({ nudge_at: null, give_up_at: null });
+    expect(await meeting(stored.id)).toMatchObject({
+      nudge_at: '2026-10-12T11:01:00.000Z',
+      give_up_at: '2026-10-14T11:01:00.000Z',
+    });
+  });
+
+  it('start at the first email delivered for a job that holds nothing, and its nudge never restarts them', async () => {
+    calendarInvitation();
+    const asked = data(
+      await ask(scheduling.main, 'meeting_reschedule', {
+        calendar_id: PRINCIPAL,
+        event_id: 'evt-invite',
+        ...WINDOW,
+        purpose: 'Your Wednesday invitation',
+      }),
+    );
+    const stored = await meeting(asked.meeting_id);
+    const session = await meetingSession(asked.meeting_id);
+    expect(stored).toMatchObject({ kind: 'ask_organizer', nudge_at: null, give_up_at: null });
+    await reply(session, stored.thread_key, 'Hello, could your Wednesday invitation move to Thursday at 10?');
+    expect(await meeting(stored.id)).toMatchObject({
+      nudge_at: '2026-10-07T08:00:00.000Z',
+      give_up_at: '2026-10-09T08:00:00.000Z',
+    });
+
+    await reach('2026-10-07T08:01:00.000Z');
+    expect(notes(session, NUDGE)).toHaveLength(1);
+    await reply(session, stored.thread_key, 'Just checking whether Thursday at 10 could work?');
+    // The nudge's own email leaves the give-up where the nudge set it.
+    expect(await meeting(stored.id)).toMatchObject({ nudge_at: null, give_up_at: '2026-10-09T08:01:00.000Z' });
+  });
+
+  it('end a called-off meeting without its closing line when the line never goes', async () => {
+    const { stored, session } = await offered(scheduling.people.acme);
+    expect(data(await ask(scheduling.main, 'meeting_cancel', { meeting_id: stored.id })).state).toBe('closing');
+    await reach('2026-10-05T07:59:00.000Z');
+    expect((await meeting(stored.id)).state).toBe('closing');
+    await reach('2026-10-05T08:01:00.000Z');
+    expect((await meeting(stored.id)).state).toBe('cancelled');
+    expect((await getSession(session.id))?.status).toBe('closed');
+    expect(await getThreadParticipants(stored.thread_key)).toMatchObject({ state: 'closed' });
+    expect(scheduling.gmail.sent).toHaveLength(1);
   });
 
   it("are not touched by the principal's own message in the thread", async () => {

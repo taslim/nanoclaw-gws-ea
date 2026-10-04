@@ -192,6 +192,10 @@ describe('a curveball goes to main, and nothing goes to the other side', () => {
     for (const slot of offered) expect(slot.start >= '2026-10-11T23:00:00.000Z').toBe(true);
     // The old holds no longer fit the new window: they went with the amend.
     expect(scheduling.calendar.live(PRINCIPAL).filter((event) => event.tags?.gwsEaRole === 'hold')).toEqual([]);
+
+    // Its next email starts the count again, on the other side.
+    await reply(session, stored.thread_key, 'The week after works: Monday 12 or Tuesday 13?');
+    expect((await meeting(stored.id)).nudge_at).toBe('2026-10-07T08:00:00.000Z');
   });
 
   it('refuses a second question while one is open, and one about a meeting that has ended', async () => {

@@ -152,7 +152,8 @@ describe('the meeting tools', () => {
         'email_recipients',
         { meeting_id: 'mtg-1', to: ['sales@acme.example'], cc: [], bcc: ['alex@principal.example'] },
       ],
-      [outcome, 'meeting_outcome', { meeting_id: 'mtg-1', outcome: 'responded' }],
+      [outcome, 'meeting_outcome', { meeting_id: 'mtg-1', outcome: 'done' }],
+      [cancel, 'meeting_cancel', { meeting_id: 'mtg-1', note: 'Alex has to travel that week.' }],
     ];
     for (const [tool, action, args] of cases) {
       const { request } = await call(tool, args, (id) => ({ id, ok: true, data: { message: 'ok' } }));
@@ -177,7 +178,7 @@ describe('the meeting tools', () => {
       [cancel, {}],
       [cancel, { calendar_id: 'c' }],
       [cancel, { meeting_id: 'mtg-1', calendar_id: 'c', event_id: 'e' }],
-      [outcome, { meeting_id: 'mtg-1', outcome: 'done' }],
+      [outcome, { meeting_id: 'mtg-1', outcome: 'responded' }],
       [amend, { meeting_id: 'mtg-1', length_minutes: '60' }],
       [freeTime, {}],
       [freeTime, { meeting_id: 'mtg-1', time: '15:00' }],
