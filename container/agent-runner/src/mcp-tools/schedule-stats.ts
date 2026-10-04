@@ -4,10 +4,11 @@
  * A preference learned from the principal's calendar has to come from
  * counting, not from a model reading a long list of events. This tool does the
  * counting over the JSON that `gog calendar events ... --all-pages` saved for
- * a bounded window, read through calendar-facts' file reader, so every event
- * is one Google returned and none was copied by hand. It returns the usual
- * start and end of the working day for each weekday, the most common meeting
- * lengths, and the usual gaps between meetings, on the principal's clocks.
+ * a bounded window, read through calendar-events.ts's shared reader, so every
+ * event is one Google returned and none was copied by hand. It returns the
+ * usual start and end of the working day for each weekday, the most common
+ * meeting lengths, and the usual gaps between meetings, on the principal's
+ * clocks.
  *
  * Only meetings with at least one other person are counted, and a meeting on
  * several of the principal's calendars counts once. Every other event lands in
@@ -35,11 +36,18 @@ import {
   readEvents,
   readFiles,
   type CalendarEvent,
-} from './calendar-facts.js';
+} from './calendar-events.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 type ValidDateTime = DateTime<true>;
+
+/**
+ * The key that grants schedule_stats. Named here, not left to the barrel's
+ * load, so a test that imports this module directly still attributes the
+ * tool correctly.
+ */
+const SCHEDULE_STATS_CAPABILITY = 'schedule-stats';
 
 export const MAX_WINDOW_DAYS = 60;
 /** A gap of more than this between two meetings is free time, not a buffer. */
@@ -465,4 +473,4 @@ export const scheduleStats: McpToolDefinition = {
   },
 };
 
-registerTools([scheduleStats]);
+registerTools([scheduleStats], SCHEDULE_STATS_CAPABILITY);
