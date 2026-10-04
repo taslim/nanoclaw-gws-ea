@@ -153,7 +153,7 @@ describe('the contract other units build on', () => {
     expect(EXTERNAL_EMAIL_MEETINGS_CAPABILITY).toBe('gws-ea-meetings-external');
     expect(listCapabilityKeys()).toContain(EXTERNAL_EMAIL_MEETINGS_CAPABILITY);
     expect(resolveCapabilities('all', 'any')).not.toContain(EXTERNAL_EMAIL_MEETINGS_CAPABILITY);
-    expect(EXTERNAL_EMAIL_CAPABILITIES).toEqual(['reply', 'request-status', 'gws-ea-meetings-external']);
+    expect(EXTERNAL_EMAIL_CAPABILITIES).toEqual(['reply', 'time', 'request-status', 'gws-ea-meetings-external']);
   });
 
   it('reads no pointer before the host creates the group', async () => {
@@ -170,6 +170,7 @@ describe('external-email at host start', () => {
     const config = await getContainerConfig(ee.id);
     expect(resolveCapabilities(parseStoredCapabilities(config?.capabilities, ee.name), ee.name)).toEqual([
       'reply',
+      'time',
       'request-status',
       'gws-ea-meetings-external',
     ]);
@@ -229,6 +230,7 @@ describe("external-email's project document", () => {
       '# NanoClaw Runtime Contract',
       '# NanoClaw Module: core',
       '# NanoClaw Module: gws-ea-meetings-external',
+      '# NanoClaw Module: time',
     ]);
     expect(composed.get('# Assistant Identity')).toBe(
       'Aya is the assistant. Taslim is the principal. They are separate people: act and communicate as Aya, support Taslim, and never present the assistant as the principal.',

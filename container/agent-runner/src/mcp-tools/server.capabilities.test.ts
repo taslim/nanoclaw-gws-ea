@@ -13,7 +13,7 @@ import { closeSessionDb, initTestSessionDb } from '../mailbox/sqlite/connection.
 import './index.js';
 import { createMcpServer, loadToolModule, registerTools } from './server.js';
 
-const TIME_TOOLS = ['time_convert', 'time_diff', 'time_now', 'time_range', 'time_resolve'];
+const TIME_TOOLS = ['time_convert', 'time_diff', 'time_now', 'time_resolve'];
 
 /** Every key a host grants a group stored as `all`. */
 const ALL = [

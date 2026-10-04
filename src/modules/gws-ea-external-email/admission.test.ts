@@ -112,8 +112,20 @@ function fakeHandle(agentGroupId: string): { handle: SupervisedHandle; stopped: 
 const DRIFTS: ReadonlyArray<readonly [string, (group: AgentGroup) => Promise<void>, RegExp]> = [
   ['a list of every key', (g) => updateContainerConfigJson(g.id, 'capabilities', 'all'), /capabilities/],
   [
-    'a key added to its pair',
-    (g) => updateContainerConfigJson(g.id, 'capabilities', ['reply', 'web', 'gws-ea-meetings-external']),
+    'a key added to its list',
+    (g) =>
+      updateContainerConfigJson(g.id, 'capabilities', [
+        'reply',
+        'web',
+        'time',
+        'request-status',
+        'gws-ea-meetings-external',
+      ]),
+    /capabilities/,
+  ],
+  [
+    'a key missing from its list',
+    (g) => updateContainerConfigJson(g.id, 'capabilities', ['reply', 'request-status', 'gws-ea-meetings-external']),
     /capabilities/,
   ],
   [
