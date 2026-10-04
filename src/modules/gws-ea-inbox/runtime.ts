@@ -1,7 +1,7 @@
 /**
  * The running inbox: its Gmail client and the host's inbound side of the
- * channel, which the thread functions U11 calls need to release held mail.
- * Set when the host sets the channel adapter up; cleared on teardown.
+ * channel. Set when the host sets the channel adapter up; cleared on
+ * teardown.
  */
 import type { ChannelSetup } from '../../channels/adapter.js';
 import { getDb } from '../../db/connection.js';
@@ -10,8 +10,10 @@ import type { GmailApi } from './gmail-api.js';
 
 /** The channel type of the inbox, and so of every user it names (`email:<address>`). */
 export const EMAIL_CHANNEL_TYPE = 'email';
-/** The inbox's one messaging group's platform ID. */
+/** The platform ID of the inbox's messaging group: every thread anyone but the principal can read. */
 export const INBOX_PLATFORM_ID = 'email:inbox';
+/** The platform ID of the principal's own email conversation with `main`. */
+export const PRINCIPAL_PLATFORM_ID = 'email:principal';
 
 export interface InboxRuntime {
   readonly gmail: GmailApi;

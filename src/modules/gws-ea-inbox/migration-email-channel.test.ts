@@ -70,6 +70,22 @@ describe('the email channel migration', () => {
       for (const table of THREAD_TABLES) expect(await db.hasTable(table), table).toBe(true);
     });
 
+    it('gives a thread no booking calendar until main names one', async () => {
+      const db = getDb();
+      const at = '2026-10-04T12:00:00.000Z';
+      await db.run(
+        'INSERT INTO gws_ea_threads (thread_key, gmail_thread_id, created_at) VALUES (?, NULL, ?)',
+        'mail-a',
+        at,
+      );
+      expect(await db.get('SELECT booking_calendar_id FROM gws_ea_threads WHERE thread_key = ?', 'mail-a')).toEqual({
+        booking_calendar_id: null,
+      });
+      await expect(
+        db.run("UPDATE gws_ea_threads SET booking_calendar_id = '' WHERE thread_key = ?", 'mail-a'),
+      ).rejects.toThrow(/CHECK/i);
+    });
+
     it('keeps a hold recorded while its thread is: the record is how its event is released', async () => {
       const db = getDb();
       const at = '2026-10-04T12:00:00.000Z';

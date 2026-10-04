@@ -49,7 +49,8 @@ import { GoogleApiError } from './gmail-api.js';
 import { parseGmailMessage } from './mime.js';
 import { noticeSetAside } from './notices.js';
 import { arranged, everyone, requireAddress, withAdded, type Placement } from './recipients.js';
-import { deliverToSession, loadRoutingContext } from './routing.js';
+import { loadRoutingContext } from './route-mail.js';
+import { deliverToSession } from './routing.js';
 import { activeInbox, assistantAddresses, EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from './runtime.js';
 
 const THREAD_KEY = /^mail-[A-Za-z0-9-]{1,80}$/u;

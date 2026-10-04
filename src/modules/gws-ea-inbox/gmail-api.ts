@@ -83,6 +83,8 @@ export interface GmailApi {
   }): Promise<GmailMessageRef[]>;
   /** The thread's messages with their reconciliation headers; undefined when it no longer exists. */
   getThread(id: string): Promise<GmailMessage[] | undefined>;
+  /** One file a message carries, base64url, as Gmail stores it; undefined when it no longer exists. */
+  getAttachment(messageId: string, attachmentId: string): Promise<string | undefined>;
   send(input: {
     readonly raw: string;
     readonly threadId?: string;
@@ -290,6 +292,17 @@ export function createGmailApi(options: GoogleClientOptions): GmailApi {
       if (payload === undefined) return undefined;
       if (!isRecord(payload)) throw unreadable('thread');
       return Array.isArray(payload.messages) ? payload.messages.map(toMessage) : [];
+    },
+
+    async getAttachment(messageId, attachmentId) {
+      const payload = await googleJson(
+        options,
+        `${GMAIL}/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(attachmentId)}`,
+        { allowNotFound: true },
+      );
+      if (payload === undefined) return undefined;
+      if (!isRecord(payload) || typeof payload.data !== 'string') throw unreadable('attachment');
+      return payload.data;
     },
 
     async send(input) {

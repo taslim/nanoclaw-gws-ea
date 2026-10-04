@@ -119,7 +119,7 @@ import {
   type ThreadView,
 } from '../gws-ea-inbox/index.js';
 import { normalizeAddress } from '../gws-ea-inbox/mime.js';
-import { loadRoutingContext } from '../gws-ea-inbox/routing.js';
+import { loadRoutingContext } from '../gws-ea-inbox/route-mail.js';
 import { activeInbox, assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
 import { findPeople, getPerson } from '../gws-ea-people/db.js';

@@ -2,15 +2,21 @@ import type { DbDriver } from '../../db/driver.js';
 import type { ModuleMigration } from '../../db/migrations/index.js';
 
 /**
- * The email channel's records (KTD2, KTD7, KTD9, KTD10). The inbox registers
- * this after its own store and the meetings store, so it runs once every
- * earlier inbox and meetings table exists.
+ * The email channel's records (KTD1, KTD2, KTD7, KTD9, KTD10). The inbox
+ * registers this after its own store and the meetings store, so it runs once
+ * every earlier inbox and meetings table exists.
+ *
+ * The inbox's state gains `principal_messaging_group_id`: the principal's own
+ * email conversation with `main` (`email:principal`), which the wiring and
+ * destination policies pin by this stored id, as they pin the inbox by
+ * `messaging_group_id`.
  *
  * Every table is keyed to the thread map, under names no earlier table or
  * index uses:
  *
  * - `gws_ea_threads`: each thread's stable `mail-…` key and its Gmail thread,
- *   which a thread `main` hands over gains on its first send.
+ *   which a thread `main` hands over gains on its first send, and the
+ *   calendar its bookings go on when `main` named one.
  * - `gws_ea_thread_messages`: each message in the thread, in the order the
  *   thread learned of it, with its side (`principal` when only the principal
  *   and the assistant can read it, `outside` otherwise), its Gmail id, and
@@ -32,6 +38,10 @@ export const gwsEaInboxEmailChannelMigration: ModuleMigration = {
   version: 2,
   name: 'module:gws-ea-inbox:email-channel',
   async up(db) {
+    await db.exec(`
+      ALTER TABLE gws_ea_inbox_state
+        ADD COLUMN principal_messaging_group_id TEXT REFERENCES messaging_groups(id) ON DELETE SET NULL
+    `);
     await createThreadTables(db);
   },
 };
@@ -41,6 +51,7 @@ async function createThreadTables(db: DbDriver): Promise<void> {
     CREATE TABLE gws_ea_threads (
       thread_key       TEXT PRIMARY KEY CHECK (thread_key LIKE 'mail-%'),
       gmail_thread_id  TEXT UNIQUE CHECK (gmail_thread_id <> ''),
+      booking_calendar_id  TEXT CHECK (booking_calendar_id <> ''),
       created_at       TEXT NOT NULL
     );
 

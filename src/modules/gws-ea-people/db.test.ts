@@ -66,12 +66,12 @@ async function createUser(id: string): Promise<void> {
 async function setUpInstance(): Promise<void> {
   await createAgentGroup(MAIN);
   await reconcileGwsEaProfile({
-    assistantDisplayName: 'Robin',
-    assistantWorkspaceEmail: 'robin@example.test',
-    principalDisplayName: 'Taslim',
+    assistantDisplayName: 'Juno',
+    assistantWorkspaceEmail: 'juno@example.test',
+    principalDisplayName: 'Morgan',
     principalTimezone: 'Africa/Lagos',
     mainAgentGroupId: MAIN.id,
-    principalEmails: ['taslim@example.test', 'taslim.okunola@gmail.com'],
+    principalEmails: ['morgan@example.test', 'morgan.fixture@gmail.com'],
   });
   await createUser('gchat:users/principal');
   await bindVerifiedPrincipalUser('gchat:users/principal', NOW);
@@ -309,11 +309,11 @@ describe('GWS-EA people store', () => {
   });
 
   it.each([
-    ['a principal address', 'email:Taslim@Example.test', /principal's own/i],
-    ['a Gmail spelling of a principal address', 'email:Taslim.Okunola+news@gmail.com', /principal's own/i],
-    ['another Gmail spelling', 't.a.s.l.i.m.okunola@googlemail.com', /principal's own/i],
+    ['a principal address', 'email:Morgan@Example.test', /principal's own/i],
+    ['a Gmail spelling of a principal address', 'email:Morgan.Fixture+news@gmail.com', /principal's own/i],
+    ['another Gmail spelling', 'm.o.r.g.a.n.fixture@googlemail.com', /principal's own/i],
     ["the principal's verified chat identity", 'gchat:users/principal', /principal's own/i],
-    ["the assistant's address", 'email:Robin@example.test', /assistant's own/i],
+    ["the assistant's address", 'email:Juno@example.test', /assistant's own/i],
     ["a plus-addressed form of the assistant's address", 'robin+calendar@example.test', /assistant's own/i],
   ])('refuses %s as a person identity', async (_case, identity, message) => {
     await expect(addPerson(pat({ identity }))).rejects.toThrow(message);
@@ -531,7 +531,14 @@ describe('forgetting a person', () => {
       expect(await rowCount(table), table).toBe(0);
     }
     const users = (await getDb().all<{ id: string }>('SELECT id FROM users ORDER BY id')).map((user) => user.id);
-    expect(users).toEqual(['email:other@example.test', 'gchat:users/pat', 'gchat:users/principal']);
+    // The principal's own email identities stay: they are main's members, never a person's.
+    expect(users).toEqual([
+      'email:other@example.test',
+      'email:morgan.fixture@gmail.com',
+      'email:morgan@example.test',
+      'gchat:users/pat',
+      'gchat:users/principal',
+    ]);
     expect(await getDb().all('SELECT user_id FROM unregistered_senders')).toEqual([
       { user_id: 'email:other@example.test' },
     ]);

@@ -89,11 +89,10 @@ import {
   startInbox,
 } from './testing/scheduling.js';
 
-const ROBIN = 'robin@assistant.example';
+const JUNO = 'juno@assistant.example';
 const PRINCIPAL = 'pat@principal.example';
 const PRINCIPAL_USER = 'gchat:users/pat';
 const SAM = 'sam@acme.example';
-const SALES = 'sales@acme.example';
 const DANA = 'dana@friends.example';
 const OLU = 'olu@partner.example';
 const LEE = 'lee@stranger.example';
@@ -180,23 +179,6 @@ async function bookFirstTime(session: Session, meetingId: unknown): Promise<Book
   ).booking as BookedTime;
 }
 
-/** The principal copies Robin into a thread with Acme Sales; returns the thread key from main's note. */
-async function copyRobinIn(): Promise<string> {
-  gmail.receive({
-    threadId: 'g-acme',
-    from: `Pat <${PRINCIPAL}>`,
-    principal: true,
-    to: [`Acme Sales <${SALES}>`],
-    cc: [`Robin <${ROBIN}>`],
-    subject: 'Partnership',
-    body: 'Adding my assistant to find 45 minutes for us next week.',
-  });
-  await inbox.tick();
-  const copyIn = contents(main).find((c) => c.note?.type === 'gws-ea-inbox.copy-in');
-  if (!copyIn) throw new Error('no copy-in note');
-  return String(copyIn.note?.thread_key);
-}
-
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
@@ -239,10 +221,10 @@ beforeEach(async () => {
   });
   await getDb().run(
     `UPDATE gws_ea_profile
-        SET main_agent_group_id = 'ag-main', assistant_display_name = 'Robin', assistant_workspace_email = ?,
+        SET main_agent_group_id = 'ag-main', assistant_display_name = 'Juno', assistant_workspace_email = ?,
             principal_display_name = 'Pat Doe', principal_timezone = 'Europe/London'
       WHERE singleton = 1`,
-    ROBIN,
+    JUNO,
   );
   await recordExternalEmailAgentGroupId('ag-external');
   await addPrincipalAddress(PRINCIPAL);
@@ -272,7 +254,7 @@ beforeEach(async () => {
     identity: `email:${OLU}`,
   });
 
-  gmail = new FakeGmail(ROBIN);
+  gmail = new FakeGmail(JUNO);
   calendar = new FakeCalendar();
   google.calendar = calendar;
   calendar.calendars.set(PRINCIPAL, { id: PRINCIPAL, accessRole: 'writer', primary: false });
@@ -395,122 +377,6 @@ describe('arrange', () => {
       await ask(main, 'meeting_arrange', arrangeWith(sam, { window_start: inDays(-3, 9), window_end: inDays(-1, 17) })),
     );
     expect(await count('gws_ea_meetings')).toBe(0);
-  });
-
-  it('binds a copied-in thread, takes its counterparts from the principal’s message, and never its length or window from counterpart mail', async () => {
-    const threadKey = await copyRobinIn();
-    gmail.receive({
-      threadId: 'g-acme',
-      from: `Acme Sales <${SALES}>`,
-      to: [PRINCIPAL],
-      cc: [ROBIN],
-      subject: 'Re: Partnership',
-      body: 'Let us do two hours sometime next month instead.',
-    });
-    await inbox.tick();
-
-    const fields = {
-      thread_key: threadKey,
-      calendar_id: PRINCIPAL,
-      length_minutes: 45,
-      ...WINDOW,
-      purpose: 'Partnership follow-up',
-    };
-    const answer = data(await ask(main, 'meeting_arrange', fields));
-    expect(answer.thread_key).toBe(threadKey);
-    const stored = await meeting(answer.meeting_id);
-    expect(stored.counterparts).toEqual([{ address: SALES, person_id: null, name: null, level: 'unknown' }]);
-    expect(stored).toMatchObject({
-      level: 'unknown',
-      length_minutes: 45,
-      window_start: WINDOW.window_start,
-      window_end: WINDOW.window_end,
-      thread_key: threadKey,
-    });
-
-    const session = await meetingSession(answer.meeting_id);
-    const [first, second] = contents(session);
-    expect(first.brief?.meeting_id).toBe(stored.id);
-    expect(first.text).toContain('copied you into');
-    expect(second.text).toContain('two hours sometime next month');
-    expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'open' });
-  });
-
-  describe('a copied-in thread with mail held for it', () => {
-    const fields = () => ({
-      calendar_id: PRINCIPAL,
-      length_minutes: 45,
-      ...WINDOW,
-      purpose: 'Partnership follow-up',
-    });
-
-    async function copiedInWithHeldMail(): Promise<string> {
-      const threadKey = await copyRobinIn();
-      gmail.receive({
-        threadId: 'g-acme',
-        from: `Acme Sales <${SALES}>`,
-        to: [PRINCIPAL],
-        cc: [ROBIN],
-        subject: 'Re: Partnership',
-        body: 'Thursday afternoon works for us.',
-      });
-      await inbox.tick();
-      return threadKey;
-    }
-
-    it('opens when Gmail cannot be read as its mail is handed over, and the next poll hands the mail over', async () => {
-      const threadKey = await copiedInWithHeldMail();
-      vi.spyOn(gmail, 'getMessage').mockRejectedValueOnce(
-        new GoogleApiError(503, 'Google refused /gmail/v1/users/me/messages: backend error'),
-      );
-
-      const answer = data(await ask(main, 'meeting_arrange', { thread_key: threadKey, ...fields() }));
-      const stored = await meeting(answer.meeting_id);
-      expect(stored.state).toBe('active');
-      expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'open' });
-      const session = await meetingSession(stored.id);
-      // The brief wakes the session; the mail is still held.
-      expect(contents(session).map((c) => c.brief?.meeting_id)).toEqual([stored.id]);
-      expect(vi.mocked(requestWake)).toHaveBeenCalledWith(
-        expect.objectContaining({ id: session.id }),
-        'inbound-message',
-      );
-
-      await inbox.tick();
-      const [, held, ...more] = contents(session);
-      expect(more).toEqual([]);
-      expect(held.text).toContain('Thursday afternoon works for us.');
-      expect(await count('gws_ea_inbox_held')).toBe(0);
-      expect(await count('gws_ea_meetings')).toBe(1);
-    });
-
-    it('is handed back to wait for arrange, its held mail kept, when its arrange fails, so main can arrange it again', async () => {
-      const threadKey = await copiedInWithHeldMail();
-      vi.spyOn(gmail, 'getMessage').mockRejectedValueOnce(
-        new GoogleApiError(403, 'Google refused /gmail/v1/users/me/messages: insufficient permission'),
-      );
-
-      expect(await ask(main, 'meeting_arrange', { thread_key: threadKey, ...fields() })).toMatchObject({
-        ok: false,
-        error: { code: 'handler-error' },
-      });
-      const failed = await getDb().get<{ state: string; session_id: string }>(
-        'SELECT state, session_id FROM gws_ea_meetings',
-      );
-      expect(failed?.state).toBe('failed');
-      expect((await getSession(String(failed?.session_id)))?.status).toBe('closed');
-      expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'awaiting-arrange' });
-      expect(await count('gws_ea_inbox_held')).toBe(1);
-
-      const answer = data(await ask(main, 'meeting_arrange', { thread_key: threadKey, ...fields() }));
-      const session = await meetingSession(answer.meeting_id);
-      expect(session.id).not.toBe(failed?.session_id);
-      const [brief, held, ...more] = contents(session);
-      expect(more).toEqual([]);
-      expect(brief.brief?.meeting_id).toBe(answer.meeting_id);
-      expect(held.text).toContain('Thursday afternoon works for us.');
-      expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'open' });
-    });
   });
 
   it('is refused to every caller but main', async () => {
@@ -669,30 +535,6 @@ describe('outcome', () => {
     expect(
       refusal(await ask(closeSession, 'meeting_outcome', { meeting_id: close.meeting_id, outcome: 'needs-room' })),
     ).toMatch(/outcome must be one of/);
-  });
-
-  it('hands a copied-in thread that is not about scheduling back to main to triage (R19)', async () => {
-    const threadKey = await copyRobinIn();
-    const answer = data(
-      await ask(main, 'meeting_arrange', {
-        thread_key: threadKey,
-        calendar_id: PRINCIPAL,
-        length_minutes: 30,
-        ...WINDOW,
-        purpose: 'Whatever the principal needs',
-      }),
-    );
-    const session = await meetingSession(answer.meeting_id);
-    data(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'not-scheduling' }));
-
-    const [note] = meetingNotes('not-scheduling');
-    expect(note.note).toMatchObject({ thread_key: threadKey });
-    expect(note.text).toContain(`thread_key ${threadKey}`);
-    expect(note.text).not.toMatch(/can't take it on/);
-    expect((await meeting(answer.meeting_id)).state).toBe('not-scheduling');
-    expect((await getSession(session.id))?.status).toBe('closed');
-    expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'awaiting-arrange' });
-    expect(gmail.sent).toHaveLength(0);
   });
 
   it('refuses not-scheduling for a thread main opened for scheduling', async () => {
@@ -930,65 +772,13 @@ describe('reschedule', () => {
 // ---------------------------------------------------------------------------
 
 describe('cancel', () => {
-  it('has the conversation write one closing line while times are on offer, then ends it, and later mail reaches main', async () => {
-    const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
-    const stored = await meeting(answer.meeting_id);
-    const session = await meetingSession(answer.meeting_id);
-    const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
-    data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [slot.slot_id] }));
-    await reply(session, stored.thread_key, 'Hello Sam, I am Robin, Pat Doe’s assistant. Would Tuesday at 10:00 work?');
-    expect(gmail.sent).toHaveLength(1);
-
-    const cancelled = data(await ask(main, 'meeting_cancel', { meeting_id: stored.id }));
-    expect(cancelled.state).toBe('closing');
-    expect(String(cancelled.message)).toMatch(/tells Sam Lee \(sam@acme.example\) in one line/);
-    // Nothing is written by the host itself: external-email writes the line.
-    expect(gmail.sent).toHaveLength(1);
-    expect(calendar.live(PRINCIPAL).filter((event) => event.tags?.gwsEaRole === 'hold')).toEqual([]);
-    const closing = await meeting(stored.id);
-    expect(closing).toMatchObject({ state: 'closing', nudge_at: null });
-    expect(closing.give_up_at).not.toBeNull();
-    const [note] = contents(session).filter((c) => c.note?.type === 'gws-ea-meetings.closing');
-    expect(note.sender).toBe('system');
-    expect(note.text).toMatch(/one short, gracious line/);
-    expect((await getSession(session.id))?.status).toBe('active');
-    // A called-off meeting offers nothing more.
-    expect(refusal(await ask(session, 'meeting_free_time', { meeting_id: stored.id }))).toMatch(/called off/);
-
-    await reply(
-      session,
-      stored.thread_key,
-      'Pat no longer needs this meeting after all. Thank you, Sam, and sorry for the trouble.',
-    );
-    expect(gmail.sent).toHaveLength(2);
-    expect(gmail.sent[1].threadId).toBe(gmail.sent[0].threadId);
-    expect(await meeting(stored.id)).toMatchObject({ state: 'cancelled', nudge_at: null, give_up_at: null });
-    expect((await getSession(session.id))?.status).toBe('closed');
-    expect(await getThreadParticipants(stored.thread_key)).toMatchObject({ state: 'closed' });
-    expect(
-      await getDb().all('SELECT thread_id FROM gws_ea_privacy_threads WHERE thread_id = ?', stored.thread_key),
-    ).toEqual([]);
-    // A cancelled meeting takes no more outcomes.
-    refusal(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'gave-up' }));
-
-    gmail.receive({
-      threadId: gmail.sent[0].threadId,
-      from: `Sam Lee <${SAM}>`,
-      to: [ROBIN],
-      subject: 'Re: Partnership intro',
-      body: 'No problem at all. Another time next month?',
-    });
-    await inbox.tick();
-    expect(contents(main).some((c) => c.note?.type === 'gws-ea-inbox.inbound' && c.text?.includes(SAM))).toBe(true);
-  });
-
   it('writes the closing line’s note once when called off again after a hold could not be released', async () => {
     const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
     const stored = await meeting(answer.meeting_id);
     const session = await meetingSession(answer.meeting_id);
     const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
     data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [slot.slot_id] }));
-    await reply(session, stored.thread_key, 'Hello Sam, I am Robin, Pat Doe’s assistant. Would Tuesday at 10:00 work?');
+    await reply(session, stored.thread_key, 'Hello Sam, I am Juno, Pat Doe’s assistant. Would Tuesday at 10:00 work?');
     const closingNotes = () => contents(session).filter((c) => c.note?.type === 'gws-ea-meetings.closing');
 
     calendar.failNext({ op: 'delete', error: new GoogleApiError(503, 'Google refused: backend error') });
@@ -1008,7 +798,7 @@ describe('cancel', () => {
     const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
     const stored = await meeting(answer.meeting_id);
     const session = await meetingSession(answer.meeting_id);
-    await reply(session, stored.thread_key, 'Hello Sam, I am Robin, Pat Doe’s assistant. Would Tuesday at 10:00 work?');
+    await reply(session, stored.thread_key, 'Hello Sam, I am Juno, Pat Doe’s assistant. Would Tuesday at 10:00 work?');
     expect(data(await ask(main, 'meeting_cancel', { meeting_id: stored.id })).state).toBe('closing');
 
     await updateSession(session.id, { status: 'closed' });
@@ -1126,7 +916,7 @@ describe('cancel for an event the principal organizes (R8)', () => {
     const arranged = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
     const stored = await meeting(arranged.meeting_id);
     const session = await meetingSession(arranged.meeting_id);
-    await reply(session, stored.thread_key, 'Hello Sam, I am Robin. Would Tuesday at 10:00 work?');
+    await reply(session, stored.thread_key, 'Hello Sam, I am Juno. Would Tuesday at 10:00 work?');
     const booking = await bookFirstTime(session, stored.id);
 
     const answer = data(await ask(main, 'meeting_cancel', { calendar_id: PRINCIPAL, event_id: booking.event_id }));

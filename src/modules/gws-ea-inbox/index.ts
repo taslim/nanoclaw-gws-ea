@@ -1,21 +1,23 @@
 /**
- * GWS-EA's inbox: the assistant's Gmail as an `email` channel (KTD4), and
- * Google Calendar's notification emails as calendar news (KTD9).
+ * GWS-EA's inbox: the assistant's Gmail as an `email` channel with two
+ * messaging groups (KTD1), and Google Calendar's notification emails as
+ * calendar news.
  *
- * - Inbound mail is routed per message (routing.ts): `main` hears principal
- *   mail, calendar changes, and every other email as typed notes, and
- *   triages each thread the host holds for it; `external-email` hears only
- *   threads `main` handed over, one session per thread.
- * - Replies leave through ordinary delivery to everyone on the thread, as
- *   placed in To, Cc, and Bcc, which the audience check resolves through the
- *   same people (outbound.ts, recipients.ts). The principal's own email is
- *   answered to them alone (`sendPrincipalReply`).
+ * - Inbound mail is routed per message to the part allowed to write to its
+ *   readers (route-mail.ts): what only the principal and the assistant can
+ *   read reaches `main` in the principal's own email conversation
+ *   (`email:principal`); everything else reaches `external-email`'s session
+ *   for its thread (`email:inbox`).
+ * - `main`'s replies leave through ordinary delivery to the principal alone,
+ *   which the audience check resolves to the same address
+ *   (principal-reply.ts). A thread's replies go to everyone on it
+ *   (outbound.ts, recipients.ts).
  * - Mail is the principal's only when Gmail verified that the domain of one
  *   of their addresses sent it (authentication.ts).
  *
- * The host starts the inbox after `external-email` exists: it creates the
- * inbox's messaging group and wiring when absent, then polls each minute.
- * The handoff (U11) drives threads through threads.ts.
+ * The host starts the inbox after `external-email` exists: it creates both
+ * messaging groups and their wirings when absent, brings `main`'s members in
+ * step with the principal's addresses, then polls each minute.
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -40,6 +42,7 @@ import {
   gwsEaMeetingsRoomsMigration,
 } from '../gws-ea-meetings/migration.js';
 import { registerRecipientResolver } from '../gws-ea-privacy/index.js';
+import { getMainAgentGroupId, syncPrincipalMembers } from '../gws-ea-profile/db.js';
 import { registerRoleGrantPolicy } from '../permissions/db/user-roles.js';
 import { createInbox, EMAIL_CHANNEL_DEFAULTS, type Inbox } from './adapter.js';
 import { createCalendarListApi } from './calendar-notifications.js';
@@ -47,9 +50,12 @@ import { deleteSends } from './db.js';
 import { createGmailApi } from './gmail-api.js';
 import { gwsEaInboxEmailChannelMigration } from './migration-email-channel.js';
 import { gwsEaInboxMigration } from './migration.js';
-import { contentHash, replyText, resolveRecipients } from './outbound.js';
-import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from './runtime.js';
-import { ensureInbox } from './wiring-policy.js';
+import { resolveRecipients } from './outbound.js';
+import { principalRecipients } from './principal-reply.js';
+import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID } from './runtime.js';
+import { contentHash, replyText } from './send.js';
+import { deleteSends as deleteThreadSends } from './thread-map.js';
+import { ensureInbox, ensurePrincipalConversation } from './wiring-policy.js';
 
 // The inbox registers the meetings store too, unchanged, so the email channel's
 // migration runs after every inbox and meetings table exists (KTD10).
@@ -81,7 +87,9 @@ registerChannelAdapter(EMAIL_CHANNEL_TYPE, {
   defaults: EMAIL_CHANNEL_DEFAULTS,
 });
 
-registerRecipientResolver(EMAIL_CHANNEL_TYPE, resolveRecipients);
+registerRecipientResolver(EMAIL_CHANNEL_TYPE, (send) =>
+  send.platformId === PRINCIPAL_PLATFORM_ID ? principalRecipients(send) : resolveRecipients(send),
+);
 
 // A mail sender is only as trustworthy as the domain behind it, so no email
 // identity may hold a privilege: commands and approvals stay with chat users
@@ -90,32 +98,37 @@ registerRoleGrantPolicy('gws-ea-inbox:no-email-privilege', (grant) =>
   grant.user_id.startsWith(`${EMAIL_CHANNEL_TYPE}:`) ? 'an email identity never holds owner or admin' : undefined,
 );
 
-/** The reply's text, when the row is one of the inbox's thread replies. */
-function inboxReply(msg: OutboundMessage): { readonly threadKey: string; readonly hash: string } | undefined {
-  if (msg.channelType !== EMAIL_CHANNEL_TYPE || msg.platformId !== INBOX_PLATFORM_ID || msg.threadId === null) {
-    return undefined;
-  }
+/** The send record of a row the channel sent: a thread's reply, or `main`'s reply to the principal. */
+function emailSend(
+  msg: OutboundMessage,
+): { readonly to: 'inbox' | 'principal'; readonly threadKey: string; readonly hash: string } | undefined {
+  if (msg.channelType !== EMAIL_CHANNEL_TYPE || msg.threadId === null) return undefined;
+  const to =
+    msg.platformId === INBOX_PLATFORM_ID ? 'inbox' : msg.platformId === PRINCIPAL_PLATFORM_ID ? 'principal' : undefined;
+  if (to === undefined) return undefined;
   /* eslint-disable no-catch-all/no-catch-all -- a row the inbox could never have sent has no send record */
   try {
-    return { threadKey: msg.threadId, hash: contentHash(msg.threadId, replyText(JSON.parse(msg.content))) };
+    return { to, threadKey: msg.threadId, hash: contentHash(msg.threadId, replyText(JSON.parse(msg.content))) };
   } catch {
     return undefined;
   }
   /* eslint-enable no-catch-all/no-catch-all */
 }
 
-// Delivery recorded the reply: its send record has done its job.
-registerPostDeliveryHook(async (msg) => {
-  const reply = inboxReply(msg);
-  if (reply) await deleteSends(reply.threadKey, reply.hash, 'sent');
-});
-
-// Delivery gave up on the reply: the same words sent later are a new send.
-registerDeliveryFailedHook(async (failed) => {
-  for (const msg of failed) {
-    const reply = inboxReply(msg);
-    if (reply) await deleteSends(reply.threadKey, reply.hash, 'pending');
+async function forgetSend(msg: OutboundMessage, state: 'pending' | 'sent'): Promise<void> {
+  const send = emailSend(msg);
+  if (send?.to === 'inbox') await deleteSends(send.threadKey, send.hash, state);
+  if (send?.to === 'principal') {
+    await deleteThreadSends({ threadKey: send.threadKey, side: 'principal' }, send.hash, state);
   }
+}
+
+// Delivery recorded the email: its send record has done its job.
+registerPostDeliveryHook((msg) => forgetSend(msg, 'sent'));
+
+// Delivery gave up on the email: the same words sent later are a new send.
+registerDeliveryFailedHook(async (failed) => {
+  for (const msg of failed) await forgetSend(msg, 'pending');
 });
 
 // A forgotten person leaves no held mail, rate count, or place on a thread behind.
@@ -180,6 +193,9 @@ onHostStart(async ({ signal }) => {
   const externalEmail = await getExternalEmailAgentGroupId();
   if (externalEmail === null) return;
   await ensureInbox(externalEmail);
+  const main = await getMainAgentGroupId();
+  if (main !== null) await ensurePrincipalConversation(main);
+  await syncPrincipalMembers();
   const inbox = live;
   if (!inbox?.adapter.isConnected()) {
     log.warn('The inbox is not polling: its channel did not start');
@@ -206,15 +222,15 @@ export {
   type GmailApi,
   type GmailHistoryRecord,
   type GmailMessage,
+  type GmailMessagePart,
   type GmailMessageRef,
 } from './gmail-api.js';
 export type { ThreadOrigin, ThreadPeople, ThreadState } from './db.js';
 export { getInboxHealth, type InboxHealth } from './health.js';
-export type { HeldMailFields, InboxNote } from './notes.js';
 export { sendPrincipalReply, type PrincipalReply } from './outbound.js';
 export type { Placement } from './recipients.js';
 export { registerThreadReplyHook, type ThreadReplyHook } from './routing.js';
-export { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from './runtime.js';
+export { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID } from './runtime.js';
 export {
   addThreadPeople,
   arrangeThreadPeople,
@@ -230,4 +246,4 @@ export {
   type AuthorizeThreadInput,
   type ThreadView,
 } from './threads.js';
-export { ensureInbox, getInboxMessagingGroupId } from './wiring-policy.js';
+export { ensureInbox, ensurePrincipalConversation, getInboxMessagingGroupId } from './wiring-policy.js';

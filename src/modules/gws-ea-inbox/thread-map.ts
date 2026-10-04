@@ -218,6 +218,16 @@ export async function anchorMessage(
   return row ? toMessage(row) : undefined;
 }
 
+/** A side's messages in the thread, oldest first. */
+export async function threadMessages(threadKey: string, side: ThreadSide): Promise<ThreadMessage[]> {
+  const rows = await getDb().all<MessageRow>(
+    `SELECT ${MESSAGE_COLUMNS} FROM gws_ea_thread_messages WHERE thread_key = ? AND side = ? ORDER BY position`,
+    threadKey,
+    side,
+  );
+  return rows.map(toMessage);
+}
+
 /** The Message-IDs of a side's messages in the thread, oldest first: all a reply on that side may reference. */
 export async function visibleMessageIds(threadKey: string, side: ThreadSide): Promise<string[]> {
   const rows = await getDb().all<{ rfc_message_id: string }>(

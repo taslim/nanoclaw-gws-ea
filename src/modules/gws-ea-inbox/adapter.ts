@@ -1,10 +1,16 @@
 /**
- * The assistant's inbox as a NanoClaw channel adapter (KTD4). Inbound, it polls
- * Gmail's history each minute for messages added to INBOX and routes each one
- * (routing.ts); outbound, `deliver` sends a thread's reply (outbound.ts).
+ * The assistant's inbox as a NanoClaw channel adapter (KTD1). Inbound, it
+ * polls Gmail's history each minute for messages added to INBOX and routes
+ * each one to the part allowed to write to its readers (route-mail.ts).
+ * Outbound, `deliver` sends `main`'s reply to the principal on
+ * `email:principal` (principal-reply.ts), and a thread's reply on
+ * `email:inbox` (outbound.ts).
  *
  * The poll is exactly-once and never stalls:
  * - a Gmail message ID routes once: each is recorded as settled;
+ * - a known message not yet settled routes first, before new history, and
+ *   without counting its sender again: a retry, or mail an update left to
+ *   route (KTD10);
  * - the history cursor advances only when every message up to it settled;
  * - a message that keeps failing is set aside after `MAX_ROUTING_ATTEMPTS`
  *   polls, the cursor moves past it, and the principal hears one sentence;
@@ -14,7 +20,7 @@
  *   the settled record keeps from routing twice.
  *
  * Each poll also keeps calendar notifications on for the principal's
- * calendars (KTD9), and hands over held mail a release left behind.
+ * calendars.
  */
 import type { ChannelAdapter, ChannelContextDefaults, ChannelDefaults, ChannelSetup } from '../../channels/adapter.js';
 import { log } from '../../log.js';
@@ -22,12 +28,11 @@ import { syncCalendarNotifications, type CalendarListApi, type CalendarNotice } 
 import {
   getInboxState,
   isSettled,
-  openThreadsWithHeldMail,
-  prunePrincipalMessages,
   pruneSenderCounts,
   pruneSettledMessages,
   recordFailedAttempt,
   settleMessage,
+  unsettledMessages,
   updateInboxState,
 } from './db.js';
 import { GoogleApiError, type GmailApi, type GmailHistoryRecord } from './gmail-api.js';
@@ -35,9 +40,16 @@ import { recordPollFailure, recordPollSuccess } from './health.js';
 import { parseGmailMessage } from './mime.js';
 import { noticeSetAside } from './notices.js';
 import { sendReply } from './outbound.js';
-import { loadRoutingContext, routeMail, writeCalendarNote, type RoutingContext } from './routing.js';
-import { deliverHeldMail } from './threads.js';
-import { assistantAddresses, activeInbox, EMAIL_CHANNEL_TYPE, setActiveInbox, type InboxRuntime } from './runtime.js';
+import { sendToPrincipal } from './principal-reply.js';
+import { loadRoutingContext, routeMail, writeCalendarNote, type RoutingContext } from './route-mail.js';
+import {
+  activeInbox,
+  assistantAddresses,
+  EMAIL_CHANNEL_TYPE,
+  PRINCIPAL_PLATFORM_ID,
+  setActiveInbox,
+  type InboxRuntime,
+} from './runtime.js';
 
 /** Failed polls a message may fail routing in before it is set aside. */
 export const MAX_ROUTING_ATTEMPTS = 5;
@@ -47,14 +59,13 @@ const MAX_HISTORY_PAGES = 10;
 const RESYNC_LIMIT = 100;
 /** How long a settled message is remembered, and so how far back a resync reaches. */
 const SETTLED_RETENTION_MS = 30 * 24 * 3_600_000;
-/** How long the principal's messages can be answered by email. */
-const PRINCIPAL_MESSAGE_RETENTION_MS = SETTLED_RETENTION_MS;
 const SENDER_COUNT_RETENTION_MS = 24 * 3_600_000;
 
 /**
- * Every conversation is an email thread with its own session; no one mentions
- * the assistant; and anyone may write, because routing, not the sender
- * policy, decides what reaches an agent.
+ * Every conversation is an email thread; no one mentions the assistant; and
+ * anyone may write to the inbox, because routing, not the sender policy,
+ * decides what reaches an agent. The host creates both of the channel's
+ * groups and pins their wirings (wiring-policy.ts).
  */
 const EMAIL_CONTEXT: ChannelContextDefaults = {
   engageMode: 'pattern',
@@ -75,7 +86,7 @@ export interface InboxDeps {
 
 export interface Inbox {
   readonly adapter: ChannelAdapter;
-  /** One poll: calendar notification settings, new mail, and any release left to finish. Never throws. */
+  /** One poll: calendar notification settings, then mail. Never throws. */
   tick(): Promise<void>;
 }
 
@@ -115,8 +126,11 @@ export function createInbox(deps: InboxDeps): Inbox {
     sleep,
   };
 
-  /** Route messages in order; true when every one settled or was set aside. */
-  async function routeBatch(ids: readonly string[], context: RoutingContext): Promise<boolean> {
+  /**
+   * Route messages in order; true when every one settled or was set aside.
+   * `limited` counts each sender against the hourly limit.
+   */
+  async function routeBatch(ids: readonly string[], context: RoutingContext, limited: boolean): Promise<boolean> {
     const at = context.at.toISOString();
     const calendar: { gmailMessageId: string; notice: CalendarNotice }[] = [];
     let complete = true;
@@ -147,7 +161,7 @@ export function createInbox(deps: InboxDeps): Inbox {
         continue;
       }
       try {
-        const routed = await routeMail(mail, runtime, context);
+        const routed = await routeMail(mail, runtime, context, { limited });
         if (routed.kind === 'calendar') calendar.push({ gmailMessageId: id, notice: routed.notice });
         else await settleMessage(id, routed.outcome, at);
       } catch (error) {
@@ -180,7 +194,7 @@ export function createInbox(deps: InboxDeps): Inbox {
     const after = Math.floor((context.at.getTime() - SETTLED_RETENTION_MS) / 1_000);
     const refs = await deps.gmail.listMessages({ labelIds: ['INBOX'], q: `after:${after}`, maxResults: RESYNC_LIMIT });
     log.warn("The inbox's history cursor expired; resyncing from the newest INBOX mail", { messages: refs.length });
-    if (await routeBatch(refs.map((ref) => ref.id).reverse(), context))
+    if (await routeBatch(refs.map((ref) => ref.id).reverse(), context, true))
       await updateInboxState({ history_id: historyId });
   }
 
@@ -193,6 +207,8 @@ export function createInbox(deps: InboxDeps): Inbox {
       await updateInboxState({ history_id: profile.historyId });
       return;
     }
+    // A retry goes before new mail, so a thread's messages arrive in order; its sender was counted the first time.
+    if (!(await routeBatch(await unsettledMessages(), context, false))) return;
     const records: GmailHistoryRecord[] = [];
     let latest = cursor;
     let pageToken: string | undefined;
@@ -217,15 +233,7 @@ export function createInbox(deps: InboxDeps): Inbox {
       throw error;
     }
     const next = pageToken === undefined ? latest : (records[records.length - 1]?.id ?? cursor);
-    if (await routeBatch(inboxAdditions(records), context)) await updateInboxState({ history_id: next });
-  }
-
-  async function finishReleases(): Promise<void> {
-    let setAside = 0;
-    for (const threadKey of await openThreadsWithHeldMail()) {
-      setAside += (await deliverHeldMail(threadKey)).setAside;
-    }
-    if (setAside > 0) await noticeSetAside();
+    if (await routeBatch(inboxAdditions(records), context, true)) await updateInboxState({ history_id: next });
   }
 
   async function tick(): Promise<void> {
@@ -245,9 +253,7 @@ export function createInbox(deps: InboxDeps): Inbox {
         await recordPollFailure(reasonOf(error), at.toISOString());
         return;
       }
-      await finishReleases();
       await pruneSettledMessages(new Date(at.getTime() - SETTLED_RETENTION_MS).toISOString());
-      await prunePrincipalMessages(new Date(at.getTime() - PRINCIPAL_MESSAGE_RETENTION_MS).toISOString());
       await pruneSenderCounts(new Date(at.getTime() - SENDER_COUNT_RETENTION_MS).toISOString());
     } catch (error) {
       log.error('The inbox poll could not finish', { reason: reasonOf(error) });
@@ -269,7 +275,10 @@ export function createInbox(deps: InboxDeps): Inbox {
       if (activeInbox() === runtime) setActiveInbox(undefined);
     },
     isConnected: () => setup !== undefined,
-    deliver: (platformId, threadId, message) => sendReply(runtime, platformId, threadId, message),
+    deliver: (platformId, threadId, message) =>
+      platformId === PRINCIPAL_PLATFORM_ID
+        ? sendToPrincipal(runtime, threadId, message)
+        : sendReply(runtime, platformId, threadId, message),
   };
 
   return { adapter, tick };

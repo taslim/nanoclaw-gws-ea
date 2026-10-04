@@ -88,7 +88,10 @@ export function uniqueAddresses(values: Iterable<string>): string[] {
 // ---------------------------------------------------------------------------
 
 export interface InboxState {
+  /** The inbox's messaging group (`email:inbox`), wired to `external-email`. */
   readonly messaging_group_id: string | null;
+  /** The principal's own email conversation (`email:principal`), wired to `main`. */
+  readonly principal_messaging_group_id: string | null;
   readonly history_id: string | null;
   readonly health: 'healthy' | 'unhealthy';
   readonly health_reason: string | null;
@@ -104,6 +107,16 @@ export async function getInboxState(): Promise<InboxState> {
   const row = await getDb().get<InboxState>('SELECT * FROM gws_ea_inbox_state WHERE singleton = 1');
   if (!row) throw new Error('The inbox state row is missing');
   return row;
+}
+
+/** The email channel's two messaging groups, as the host stored them; null until it creates each, or without an inbox. */
+export async function emailMessagingGroupIds(): Promise<{
+  readonly inbox: string | null;
+  readonly principal: string | null;
+}> {
+  if (!(await getDb().hasTable('gws_ea_inbox_state'))) return { inbox: null, principal: null };
+  const state = await getInboxState();
+  return { inbox: state.messaging_group_id, principal: state.principal_messaging_group_id };
 }
 
 export async function updateInboxState(updates: Partial<InboxState>): Promise<void> {
@@ -128,6 +141,18 @@ export async function isSettled(gmailMessageId: string): Promise<boolean> {
   return row?.settled_at !== undefined && row.settled_at !== null;
 }
 
+/**
+ * Known messages routing has not settled: each failed an attempt, or an
+ * update left it to route again. Oldest first.
+ */
+export async function unsettledMessages(): Promise<string[]> {
+  const rows = await getDb().all<{ gmail_message_id: string }>(
+    `SELECT gmail_message_id FROM gws_ea_inbox_messages
+      WHERE settled_at IS NULL ORDER BY first_seen_at, gmail_message_id`,
+  );
+  return rows.map((row) => row.gmail_message_id);
+}
+
 /** Where routing left a message, as its settled record names it. */
 export type RouteOutcome =
   | 'own'
@@ -136,11 +161,8 @@ export type RouteOutcome =
   | 'calendar-own-change'
   | 'forged-calendar-notification'
   | 'automated'
-  | 'principal-note'
-  | 'copy-in'
-  | 'thread'
-  | 'held'
-  | 'inbound'
+  | 'principal'
+  | 'outside'
   | 'rate-limited'
   | 'gone'
   | 'not-in-inbox'
@@ -198,20 +220,6 @@ export async function findThreadByGmailId(gmailThreadId: string): Promise<InboxT
   const row = await getDb().get<ThreadRow>(
     'SELECT * FROM gws_ea_inbox_threads WHERE gmail_thread_id = ?',
     gmailThreadId,
-  );
-  return row ? toThread(row) : undefined;
-}
-
-/** The thread one of these Message-IDs belongs to, preferring the latest-known match. */
-export async function findThreadByMessageIds(ids: readonly string[]): Promise<InboxThread | undefined> {
-  if (ids.length === 0) return undefined;
-  const row = await getDb().get<ThreadRow>(
-    `SELECT t.* FROM gws_ea_inbox_thread_messages m
-       JOIN gws_ea_inbox_threads t ON t.thread_key = m.thread_key
-      WHERE m.rfc_message_id IN (${ids.map(() => '?').join(', ')})
-      ORDER BY m.added_at DESC, m.position DESC
-      LIMIT 1`,
-    ...ids,
   );
   return row ? toThread(row) : undefined;
 }
@@ -304,22 +312,6 @@ export async function threadMessageIds(threadKey: string): Promise<string[]> {
 // Held mail
 // ---------------------------------------------------------------------------
 
-export async function holdMessage(
-  gmailMessageId: string,
-  threadKey: string,
-  sender: string | undefined,
-  at: string,
-): Promise<void> {
-  await getDb().run(
-    `INSERT INTO gws_ea_inbox_held (gmail_message_id, thread_key, sender, held_at) VALUES (?, ?, ?, ?)
-       ON CONFLICT (gmail_message_id) DO NOTHING`,
-    gmailMessageId,
-    threadKey,
-    sender ?? null,
-    at,
-  );
-}
-
 export async function heldMessages(threadKey: string): Promise<string[]> {
   const rows = await getDb().all<{ gmail_message_id: string }>(
     'SELECT gmail_message_id FROM gws_ea_inbox_held WHERE thread_key = ? ORDER BY held_at, gmail_message_id',
@@ -330,16 +322,6 @@ export async function heldMessages(threadKey: string): Promise<string[]> {
 
 export async function dropHeldMessage(gmailMessageId: string): Promise<void> {
   await getDb().run('DELETE FROM gws_ea_inbox_held WHERE gmail_message_id = ?', gmailMessageId);
-}
-
-/** Open threads that still hold mail: a release the poll finishes. */
-export async function openThreadsWithHeldMail(): Promise<string[]> {
-  const rows = await getDb().all<{ thread_key: string }>(
-    `SELECT DISTINCT h.thread_key FROM gws_ea_inbox_held h
-       JOIN gws_ea_inbox_threads t ON t.thread_key = h.thread_key
-      WHERE t.state = 'open'`,
-  );
-  return rows.map((row) => row.thread_key);
 }
 
 // ---------------------------------------------------------------------------
@@ -369,23 +351,6 @@ interface PrincipalMessageRow {
   received_at: string;
 }
 
-/** Record a message as the principal's; recording it again changes nothing. */
-export async function recordPrincipalMessage(message: PrincipalMessage): Promise<void> {
-  await getDb().run(
-    `INSERT INTO gws_ea_inbox_principal_messages
-       (gmail_message_id, address, gmail_thread_id, rfc_message_id, reference_ids, subject, received_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT (gmail_message_id) DO NOTHING`,
-    message.gmailMessageId,
-    message.address,
-    message.gmailThreadId,
-    message.rfcMessageId,
-    JSON.stringify(message.referenceIds),
-    message.subject,
-    message.receivedAt,
-  );
-}
-
 export async function getPrincipalMessage(gmailMessageId: string): Promise<PrincipalMessage | undefined> {
   const row = await getDb().get<PrincipalMessageRow>(
     'SELECT * FROM gws_ea_inbox_principal_messages WHERE gmail_message_id = ?',
@@ -402,19 +367,6 @@ export async function getPrincipalMessage(gmailMessageId: string): Promise<Princ
         receivedAt: row.received_at,
       }
     : undefined;
-}
-
-/** Forget the principal's messages received before `before`, and the replies in flight to them. */
-export async function prunePrincipalMessages(before: string): Promise<void> {
-  const db = getDb();
-  await db.transaction(async () => {
-    await db.run(
-      `DELETE FROM gws_ea_inbox_sends WHERE principal_message_id IN
-         (SELECT gmail_message_id FROM gws_ea_inbox_principal_messages WHERE received_at < ?)`,
-      before,
-    );
-    await db.run('DELETE FROM gws_ea_inbox_principal_messages WHERE received_at < ?', before);
-  });
 }
 
 // ---------------------------------------------------------------------------

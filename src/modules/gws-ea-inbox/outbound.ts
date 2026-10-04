@@ -19,7 +19,7 @@
  *
  * Gmail errors back off a few seconds within one attempt, checking Gmail for
  * the message before each retry; anything longer goes back to delivery's own
- * retries.
+ * retries (send.ts).
  */
 import { createHash, randomUUID } from 'node:crypto';
 
@@ -27,7 +27,7 @@ import type { OutboundMessage } from '../../channels/adapter.js';
 import { OutboundRefusedError, type OutboundSend } from '../../delivery.js';
 import { log } from '../../log.js';
 import { audienceForAddresses, checkOutbound } from '../gws-ea-privacy/index.js';
-import { getGwsEaProfile, listPrincipalAddresses } from '../gws-ea-profile/db.js';
+import { listPrincipalAddresses } from '../gws-ea-profile/db.js';
 import {
   addThreadMessageIds,
   findSend,
@@ -41,38 +41,19 @@ import {
   type InboxThread,
   type SendRecord,
 } from './db.js';
-import { GoogleApiError, RECONCILIATION_HEADERS, type GmailApi } from './gmail-api.js';
-import {
-  buildOutboundMime,
-  domainOf,
-  encodeRaw,
-  headerValues,
-  messageIdsOf,
-  newMessageId,
-  type Mailbox,
-} from './mime.js';
+import type { GmailApi } from './gmail-api.js';
+import { buildOutboundMime, domainOf, encodeRaw, newMessageId } from './mime.js';
 import { everyone, recipientsForThread, sendPeople } from './recipients.js';
 import { activeInbox, assistantAddresses, INBOX_PLATFORM_ID, type InboxRuntime } from './runtime.js';
-
-/** How long to wait before each retry of a Gmail send that failed on Gmail's side. */
-export const SEND_BACKOFF_MS: readonly number[] = [1_000, 3_000];
-/** The most Message-IDs a reply's References names. */
-const MAX_REFERENCES = 20;
-/** Recently sent messages checked when Gmail search cannot find a pre-allocated ID. */
-const RECENT_SENT_CHECKED = 10;
-
-/** The text of a reply as the agent wrote it; anything else is not something email can carry. */
-export function replyText(content: unknown): string {
-  if (typeof content === 'string') return content;
-  if (typeof content === 'object' && content !== null && typeof (content as { text?: unknown }).text === 'string') {
-    return (content as { text: string }).text;
-  }
-  throw new Error('The email channel sends text replies only');
-}
-
-export function contentHash(threadKey: string, text: string): string {
-  return createHash('sha256').update(threadKey).update('\u0000').update(text).digest('hex');
-}
+import {
+  assistantMailbox,
+  contentHash,
+  findSent,
+  MAX_REFERENCES,
+  readBackMessageIds,
+  replyText,
+  sendWithBackoff,
+} from './send.js';
 
 // ---------------------------------------------------------------------------
 // The audience check and the send read one list
@@ -112,64 +93,6 @@ function sameList(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && [...a].sort().every((address, index) => address === [...b].sort()[index]);
 }
 
-// ---------------------------------------------------------------------------
-// Finding a send Gmail may already hold
-// ---------------------------------------------------------------------------
-
-function holdsId(headers: readonly { name: string; value: string }[], rfcMessageId: string): boolean {
-  return RECONCILIATION_HEADERS.some((name) =>
-    headerValues(headers, name).some((value) => messageIdsOf(value).includes(rfcMessageId)),
-  );
-}
-
-/** The sent message carrying `rfcMessageId`, under either header, or undefined. */
-async function findSent(
-  gmail: GmailApi,
-  rfcMessageId: string,
-  gmailThreadId: string | null,
-): Promise<{ readonly id: string; readonly threadId: string } | undefined> {
-  if (gmailThreadId !== null) {
-    const inThread = (await gmail.getThread(gmailThreadId)) ?? [];
-    const found = inThread.find((message) => holdsId(message.payload?.headers ?? [], rfcMessageId));
-    if (found) return { id: found.id, threadId: found.threadId };
-  }
-  const bare = rfcMessageId.slice(1, -1);
-  const candidates = [
-    ...(await gmail.listMessages({ q: `rfc822msgid:${bare}`, maxResults: 5 })),
-    ...(await gmail.listMessages({ labelIds: ['SENT'], maxResults: RECENT_SENT_CHECKED })),
-  ];
-  const checked = new Set<string>();
-  for (const candidate of candidates) {
-    if (checked.has(candidate.id)) continue;
-    checked.add(candidate.id);
-    const message = await gmail.getMessage(candidate.id, 'metadata');
-    if (message && holdsId(message.payload?.headers ?? [], rfcMessageId)) {
-      return { id: message.id, threadId: message.threadId };
-    }
-  }
-  return undefined;
-}
-
-async function sendWithBackoff(
-  runtime: InboxRuntime,
-  raw: string,
-  record: SendRecord,
-  gmailThreadId: string | null,
-): Promise<{ readonly id: string; readonly threadId: string }> {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      return await runtime.gmail.send({ raw, ...(gmailThreadId === null ? {} : { threadId: gmailThreadId }) });
-    } catch (error) {
-      const delay = SEND_BACKOFF_MS[attempt];
-      if (!(error instanceof GoogleApiError) || !error.retryable || delay === undefined) throw error;
-      log.warn('Gmail did not take a reply; checking for it, then retrying', { status: error.status, attempt });
-      await runtime.sleep(delay);
-      const found = await findSent(runtime.gmail, record.rfcMessageId, gmailThreadId);
-      if (found) return found;
-    }
-  }
-}
-
 /** Record what Gmail holds for a send: the IDs replies will answer, and the thread it joined. */
 async function completeSend(
   gmail: GmailApi,
@@ -179,14 +102,7 @@ async function completeSend(
   at: string,
 ): Promise<string> {
   await markSendSent(record.id, sent.id, at);
-  const copy = await gmail.getMessage(sent.id, 'metadata').catch((error: unknown) => {
-    log.warn('Could not read back a sent reply to learn its Message-ID', { error });
-    return undefined;
-  });
-  const ids = RECONCILIATION_HEADERS.flatMap((name) =>
-    headerValues(copy?.payload?.headers ?? [], name).flatMap((value) => messageIdsOf(value)),
-  );
-  await addThreadMessageIds(thread.threadKey, ids, at);
+  await addThreadMessageIds(thread.threadKey, await readBackMessageIds(gmail, sent.id), at);
   if (thread.gmailThreadId === null && (await findThreadByGmailId(sent.threadId)) === undefined) {
     await updateThread(thread.threadKey, { gmailThreadId: sent.threadId }, at);
   }
@@ -196,15 +112,6 @@ async function completeSend(
 
 function replySubject(subject: string): string {
   return subject === '' || /^re:/iu.test(subject) ? subject : `Re: ${subject}`;
-}
-
-/** The assistant as every email it sends names it. */
-async function assistantMailbox(runtime: InboxRuntime): Promise<Mailbox> {
-  const profile = await getGwsEaProfile();
-  return {
-    address: await runtime.gmailAddress(),
-    ...(profile.assistant_display_name ? { displayName: profile.assistant_display_name } : {}),
-  };
 }
 
 /** The channel adapter's `deliver`: send one reply in its thread, exactly once. */
@@ -268,7 +175,7 @@ export async function sendReply(
       date: runtime.now(),
     }),
   );
-  const sent = await sendWithBackoff(runtime, raw, record, thread.gmailThreadId);
+  const sent = await sendWithBackoff(runtime, raw, record.rfcMessageId, thread.gmailThreadId);
   return completeSend(runtime.gmail, record, sent, thread, at);
 }
 
@@ -342,7 +249,7 @@ export async function sendPrincipalReply(input: PrincipalReply): Promise<string>
       date: runtime.now(),
     }),
   );
-  const sent = await sendWithBackoff(runtime, raw, record, message.gmailThreadId);
+  const sent = await sendWithBackoff(runtime, raw, record.rfcMessageId, message.gmailThreadId);
   await markSendSent(record.id, sent.id, at);
   log.info("Replied to the principal's email", { gmailMessageId: message.gmailMessageId, replyId: sent.id });
   return sent.id;

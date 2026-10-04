@@ -5,6 +5,8 @@ import { EMAIL_PATTERN, hasControlCharacters, normalizePrincipalEmail } from '..
 import { isValidTimezone } from '../../timezone.js';
 import type { MessagingGroup } from '../../types.js';
 import { removeMatchingIdentities } from '../gws-ea-people/db.js';
+import { addMember, getMembers, removeMember } from '../permissions/db/agent-group-members.js';
+import { upsertUser } from '../permissions/db/users.js';
 
 export interface GwsEaProfile {
   readonly assistant_display_name: string | null;
@@ -174,6 +176,13 @@ export async function getGwsEaProfile(): Promise<GwsEaProfile> {
   return { ...profile, principal_emails: (await listPrincipalAddresses()).map((address) => address.email) };
 }
 
+/** Mail from an address speaks as the identity `email:<address>`, as the inbox names every sender. */
+const EMAIL_IDENTITY = 'email:';
+
+function emailIdentity(email: string): string {
+  return `${EMAIL_IDENTITY}${email}`;
+}
+
 /**
  * Hold `email` as one of the principal's addresses; holding it already
  * changes nothing. What is the principal's is no person's (KTD8), so a
@@ -187,8 +196,32 @@ async function holdPrincipalAddress(email: string, addedAt: string): Promise<boo
     email,
     addedAt,
   );
-  await removeMatchingIdentities(`email:${email}`);
+  await removeMatchingIdentities(emailIdentity(email));
   return result.changes > 0;
+}
+
+/**
+ * Keep `main`'s members in step with the principal's addresses (KTD1): each
+ * address's email identity is a member, so the principal's own email reaches
+ * `main`, and an email identity no longer theirs is not. A member only, never
+ * an owner or admin: no email identity holds a privilege. Safe to repeat;
+ * nothing to do until `main` exists.
+ */
+export async function syncPrincipalMembers(): Promise<void> {
+  const mainAgentGroupId = await getMainAgentGroupId();
+  if (mainAgentGroupId === null) return;
+  const at = new Date().toISOString();
+  const db = getDb();
+  await db.transaction(async () => {
+    const wanted = new Set((await listPrincipalAddresses()).map(({ email }) => emailIdentity(email)));
+    for (const userId of wanted) {
+      await upsertUser({ id: userId, kind: 'email', display_name: null, created_at: at });
+      await addMember({ user_id: userId, agent_group_id: mainAgentGroupId, added_by: null, added_at: at });
+    }
+    for (const { user_id: userId } of await getMembers(mainAgentGroupId)) {
+      if (userId.startsWith(EMAIL_IDENTITY) && !wanted.has(userId)) await removeMember(userId, mainAgentGroupId);
+    }
+  });
 }
 
 /** Make the profile hold exactly `emails`, keeping when each one it already held was added. */
@@ -232,6 +265,7 @@ export async function reconcileGwsEaProfile(input: ReconcileGwsEaProfileInput): 
       now,
     );
     if (validated.principalEmails) await replacePrincipalAddresses(validated.principalEmails, now);
+    await syncPrincipalMembers();
   });
   return getGwsEaProfile();
 }
@@ -306,7 +340,9 @@ export async function addPrincipalAddress(value: string): Promise<{ readonly ema
   const db = getDb();
   return db.transaction(async () => {
     assertNotAssistant(email, await assistantWorkspaceEmail());
-    return { email, added: await holdPrincipalAddress(email, new Date().toISOString()) };
+    const added = await holdPrincipalAddress(email, new Date().toISOString());
+    await syncPrincipalMembers();
+    return { email, added };
   });
 }
 
@@ -323,6 +359,7 @@ export async function removePrincipalAddress(
       throw new Error(`${email} is the principal's last address; add another before removing it`);
     }
     await db.run('DELETE FROM gws_ea_principal_addresses WHERE email = ?', email);
+    await syncPrincipalMembers();
     return { email, removed: true };
   });
 }

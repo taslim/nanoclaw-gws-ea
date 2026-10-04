@@ -120,6 +120,11 @@ export class FakeGmail implements GmailApi {
     return messages.length > 0 ? messages : undefined;
   }
 
+  /** Mail here carries no files. */
+  async getAttachment(): Promise<string | undefined> {
+    return undefined;
+  }
+
   async send(input: { raw: string; threadId?: string }) {
     const id = `s${this.nextId++}`;
     const threadId = input.threadId ?? `t${this.nextId++}`;

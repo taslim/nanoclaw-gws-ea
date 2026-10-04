@@ -2,8 +2,8 @@
  * Mail on the wire: reading the messages Gmail returns, and writing email in
  * their thread.
  *
- * Inbound, only headers and readable text are taken; attachments are counted,
- * never fetched. Outbound, an email is its rendered HTML and the plain text it
+ * Inbound, headers, readable text, and a description of each file are taken;
+ * the router fetches the files' bytes itself (KTD9). Outbound, an email is its rendered HTML and the plain text it
  * was written in (KTD6), quoted-printable, with any files after them. It is
  * addressed to exactly the To, Cc, and Bcc it is given, and no value can add a
  * header, because every header value is reduced to one line.
@@ -30,6 +30,19 @@ export interface Mailbox {
   readonly displayName?: string;
 }
 
+/** A file a message carries, as Gmail describes it: its bytes inline, or an id to fetch them by. */
+export interface MailAttachment {
+  /** As the sender named it; empty when they named it nothing. */
+  readonly filename: string;
+  readonly mimeType: string;
+  /** Its size in bytes, as Gmail reports it. */
+  readonly size: number;
+  /** What Gmail fetches it by, when its bytes are not inline. */
+  readonly attachmentId?: string;
+  /** Its bytes, base64url, when Gmail sent them inline. */
+  readonly data?: string;
+}
+
 /** A Gmail message reduced to what routing reads. */
 export interface ParsedMail {
   readonly id: string;
@@ -45,11 +58,14 @@ export interface ParsedMail {
   readonly rfcMessageId: string | undefined;
   readonly inReplyTo: readonly string[];
   readonly references: readonly string[];
-  /** The readable text: the plain-text part, or the HTML part's text when there is none. */
+  /**
+   * The readable text: the plain-text part, or the HTML part's text when there
+   * is none, with what the HTML quotes marked `> ` so it stays apart.
+   */
   readonly text: string;
   /** The HTML part as sent, for reading links; never shown to an agent. */
   readonly html: string | undefined;
-  readonly attachmentCount: number;
+  readonly attachments: readonly MailAttachment[];
   /** When Gmail received it, from `internalDate`; undefined when Gmail gave none. */
   readonly receivedAt: Date | undefined;
 }
@@ -255,6 +271,34 @@ export function htmlToText(html: string): string {
     .trim();
 }
 
+/**
+ * Where an HTML body starts quoting: Gmail's quote, a blockquote (Apple Mail,
+ * Gmail), or Outlook's reply-and-forward header.
+ */
+const HTML_QUOTE = /<div\b[^>]*\bclass="[^"]*\bgmail_quote\b|<blockquote\b|<div\b[^>]*\bid="divRplyFwdMsg"/iu;
+
+/** An HTML-only body's text, with everything from its quote on marked `> `, as a plain-text part would quote it. */
+function htmlBodyText(html: string): string {
+  const start = html.search(HTML_QUOTE);
+  if (start < 0) return htmlToText(html);
+  const quoted = htmlToText(html.slice(start))
+    .split('\n')
+    .map((line) => (line === '' ? '>' : `> ${line}`))
+    .join('\n');
+  return `${htmlToText(html.slice(0, start))}\n\n${quoted}`;
+}
+
+function attachmentOf(part: GmailMessagePart): MailAttachment {
+  const { attachmentId, data } = part.body ?? {};
+  return {
+    filename: part.filename ?? '',
+    mimeType: (part.mimeType ?? 'application/octet-stream').toLowerCase(),
+    size: part.body?.size ?? 0,
+    ...(attachmentId === undefined ? {} : { attachmentId }),
+    ...(attachmentId === undefined && data !== undefined ? { data } : {}),
+  };
+}
+
 function receivedAt(internalDate: string | undefined): Date | undefined {
   if (internalDate === undefined || !/^\d{1,15}$/u.test(internalDate)) return undefined;
   const date = new Date(Number(internalDate));
@@ -267,10 +311,10 @@ export function parseGmailMessage(message: GmailMessage): ParsedMail {
   const headers = payload.headers ?? [];
   let plain: string | undefined;
   let html: string | undefined;
-  let attachmentCount = 0;
+  const attachments: MailAttachment[] = [];
   walk(payload, (part) => {
     if (isAttachment(part)) {
-      attachmentCount += 1;
+      attachments.push(attachmentOf(part));
       return;
     }
     const type = (part.mimeType ?? '').toLowerCase();
@@ -294,9 +338,9 @@ export function parseGmailMessage(message: GmailMessage): ParsedMail {
     rfcMessageId: messageIdsOf(headerValue(headers, 'Message-ID'))[0],
     inReplyTo: messageIdsOf(headerValue(headers, 'In-Reply-To')),
     references: messageIdsOf(headerValue(headers, 'References')),
-    text: (plain ?? (html === undefined ? '' : htmlToText(html))).trim(),
+    text: (plain ?? (html === undefined ? '' : htmlBodyText(html))).trim(),
     html,
-    attachmentCount,
+    attachments,
     receivedAt: receivedAt(message.internalDate),
   };
 }
@@ -307,21 +351,46 @@ const QUOTE_START = [
   /^-{2,}\s*Forwarded message\s*-{2,}/iu,
   /^-{3,}\s*Original Message\s*-{3,}/iu,
   /^_{10,}\s*$/u,
+  // Apple Mail, on a Mac and an iPhone.
+  /^Begin forwarded message:\s*$/iu,
 ];
+
+/** Outlook's bare header block: a From line, then Sent or Date, and To or Subject, within the next lines. */
+function startsHeaderBlock(lines: readonly string[], index: number): boolean {
+  if (!/^\*?From:\*?\s*\S/u.test(lines[index] ?? '')) return false;
+  const next = lines.slice(index + 1, index + 5);
+  return (
+    next.some((line) => /^\*?(?:Sent|Date):\*?\s*\S/u.test(line)) &&
+    next.some((line) => /^\*?(?:To|Subject):\*?/u.test(line))
+  );
+}
+
+/** A forward's subject: `Fwd:` or `Fw:`, in any case, after any `Re:`. */
+const FORWARD_SUBJECT = /^\s*(?:re:\s*)*fwd?:/iu;
 
 /**
  * The writer's own words, and everything quoted or forwarded below them.
- * Quoted text is someone else's, so it is never read as the writer's.
+ * Quoted text is someone else's, so it is never read as the writer's. A
+ * forward whose client left no marker this knows (its `subject` says `Fwd:`)
+ * keeps only its first paragraph as the writer's.
  */
-export function splitQuoted(text: string): { readonly own: string; readonly quoted: string } {
+export function splitQuoted(text: string, subject = ''): { readonly own: string; readonly quoted: string } {
   const lines = text.replace(/\r\n?/gu, '\n').split('\n');
-  const start = lines.findIndex((line, index) => {
+  const trimmed = lines.map((line) => line.trimStart());
+  const start = trimmed.findIndex((line, index) => {
     if (QUOTE_START.some((pattern) => pattern.test(line))) return true;
     // "On <date>, <name>" wrapped onto a second line ending in "wrote:".
-    return /^On\b/u.test(line) && /\bwrote:\s*$/u.test(lines[index + 1] ?? '');
+    if (/^On\b/u.test(line) && /\bwrote:\s*$/u.test(trimmed[index + 1] ?? '')) return true;
+    return startsHeaderBlock(trimmed, index);
   });
-  if (start < 0) return { own: text.trim(), quoted: '' };
-  return { own: lines.slice(0, start).join('\n').trim(), quoted: lines.slice(start).join('\n').trim() };
+  if (start >= 0) {
+    return { own: lines.slice(0, start).join('\n').trim(), quoted: lines.slice(start).join('\n').trim() };
+  }
+  if (FORWARD_SUBJECT.test(subject)) {
+    const [first = '', ...rest] = text.trim().split(/\n[ \t]*\n/u);
+    return { own: first.trim(), quoted: rest.join('\n\n').trim() };
+  }
+  return { own: text.trim(), quoted: '' };
 }
 
 // ---------------------------------------------------------------------------

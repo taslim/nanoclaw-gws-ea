@@ -1,6 +1,17 @@
+/**
+ * The canonical `main` serves the principal alone, so it is wired only to
+ * conversations no one else can read: a direct message mapped to a verified
+ * principal owner, and the principal's own email conversation, which the
+ * host created and stored (KTD1). Either way it is one shared session that
+ * admits known senders only. The inbox's own policy pins the rest of the
+ * email conversation's wiring.
+ */
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { registerWiringAdmissionPolicy } from '../../db/wiring-admission.js';
+// The inbox's store alone: its module entry points load external-email, whose
+// registrations must follow this module's.
+import { emailMessagingGroupIds } from '../gws-ea-inbox/db.js';
 
 registerWiringAdmissionPolicy('gws-ea-profile:canonical-main', async ({ proposed }) => {
   const db = getDb();
@@ -15,9 +26,11 @@ registerWiringAdmissionPolicy('gws-ea-profile:canonical-main', async ({ proposed
   };
   const mg = await getMessagingGroup(proposed.messaging_group_id);
   if (!mg) throw new Error('Canonical main wiring rejected: messaging group does not exist');
-  if (mg.is_group !== 0) reject('only direct messages are allowed');
+  const principalEmail = (await emailMessagingGroupIds()).principal === mg.id;
+  if (!principalEmail && mg.is_group !== 0) reject('only direct messages are allowed');
   if (proposed.sender_scope !== 'known') reject("sender_scope must be 'known'");
   if (proposed.session_mode !== 'agent-shared') reject("session_mode must be 'agent-shared'");
+  if (principalEmail) return;
 
   const verifiedMapping = await db.get<{ present: number }>(
     `SELECT 1 AS present
