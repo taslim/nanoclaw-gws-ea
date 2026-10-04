@@ -129,22 +129,24 @@ export function createFollowThrough(deps: FollowThroughDeps) {
     const meeting = await getMeeting(meetingId);
     if ((meeting?.state !== 'active' && meeting?.state !== 'booked') || meeting.nudge_at !== nudgeAt) return;
     const at = new Date(now).toISOString();
-    const session = meeting.session_id === null ? undefined : await getSession(meeting.session_id);
     if (meeting.asked_at !== null) {
       await deps.remindMain(meeting, nudgeAt);
-    } else if (session?.status === 'active') {
-      await writeMeetingNote(
-        session,
-        meeting,
-        `meeting-nudge-${meeting.id}-${Date.parse(nudgeAt)}`,
-        { type: NUDGE_NOTE_TYPE },
-        `Note for meeting ${meeting.id}, from the host: no one has replied in this thread since you offered times. ` +
-          'Send them one short, friendly nudge in this thread, and nothing more. If no one answers within two ' +
-          'working days, the host releases the held times and tells the principal.',
-        at,
-      );
     } else {
-      log.warn('A meeting due a nudge has no open conversation to nudge from', { meetingId: meeting.id });
+      const session = meeting.session_id === null ? undefined : await getSession(meeting.session_id);
+      if (session?.status === 'active') {
+        await writeMeetingNote(
+          session,
+          meeting,
+          `meeting-nudge-${meeting.id}-${Date.parse(nudgeAt)}`,
+          { type: NUDGE_NOTE_TYPE },
+          `Note for meeting ${meeting.id}, from the host: no one has replied in this thread since you offered times. ` +
+            'Send them one short, friendly nudge in this thread, and nothing more. If no one answers within two ' +
+            'working days, the host releases the held times and tells main.',
+          at,
+        );
+      } else {
+        log.warn('A meeting due a nudge has no open conversation to nudge from', { meetingId: meeting.id });
+      }
     }
     const giveUpAt = new Date(await afterWorkingDays(now, GIVE_UP_AFTER_WORKING_DAYS)).toISOString();
     await recordNudged(meeting.id, nudgeAt, giveUpAt, at);

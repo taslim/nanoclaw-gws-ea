@@ -53,7 +53,7 @@ After settled, done, not-scheduling, or gave-up, the conversation is closed: sen
 ## Following up
 
 When the host's note says no one has replied, send one short, friendly nudge in the thread.
-Send only that one nudge: if they stay quiet, the host releases the times and tells the principal.
+Send only that one nudge: if they stay quiet, the host releases the times and tells main.
 When the host makes room for your meeting, offer the time it holds for you, and book it when they agree.
 When someone asks to move a booked meeting, find new times with `meeting_free_time` and move it with `meeting_book`.
 

@@ -702,7 +702,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     const meeting = await getMeeting(meetingIdOf(content));
     if (!meeting || meeting.session_id !== session.id) throw refused("That meeting is not this conversation's");
     if (!isScheduling(meeting)) {
-      throw refused('This conversation writes one reply: it has no times to offer, hold, or book.');
+      throw refused('This conversation answers a thread: it has no times to offer, hold, or book.');
     }
     return meeting;
   }
@@ -1052,9 +1052,11 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     }
     const conference = await conferenceOf(booking, invitation);
     const at = new Date().toISOString();
-    // main hears before the meeting counts as booked, so a repeat after any failure still tells it, once.
-    await writeBookedNote(meeting, booking, conference, at);
-    if (meeting.state !== 'booked') await updateMeeting(meeting.id, { state: 'booked' }, at);
+    if (meeting.state !== 'booked') {
+      // main hears before the meeting counts as booked, so a repeat after any failure still tells it, once.
+      await writeBookedNote(meeting, booking, conference, at);
+      await updateMeeting(meeting.id, { state: 'booked' }, at);
+    }
     // A question main has not answered keeps its own count; nothing else waits once the meeting is booked.
     if (meeting.asked_at === null) await clearDeadlines(meeting.id, at);
     let holdsLeft = '';

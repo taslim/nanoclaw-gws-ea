@@ -103,7 +103,7 @@ export interface OutcomeNote {
   readonly unanswered?: true;
   /** On a gave-up outcome for a conversation: delivery gave up on its email, so it was never sent. */
   readonly undelivered?: true;
-  /** On a done or not-scheduling outcome: the thread, waiting for main again, to arrange, respond, or dismiss. */
+  /** On a done or not-scheduling outcome: the thread, waiting for main again, to `meeting_arrange`, `email_respond`, or `email_dismiss`. */
   readonly thread_key?: string;
 }
 

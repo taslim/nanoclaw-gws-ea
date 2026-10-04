@@ -309,7 +309,7 @@ export function schedulingRules(values: SchedulingPreferenceValues, meetingKind:
 // Open times
 // ---------------------------------------------------------------------------
 
-/** The inner circle and close: they may meet outside working hours, and only they report needs-room. */
+/** The inner circle and close: they may meet outside working hours, and room is made only for them. */
 export function usesPersonalHours(level: MeetingLevel): boolean {
   return level === 'inner-circle' || level === 'close';
 }

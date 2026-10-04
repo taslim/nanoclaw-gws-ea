@@ -13,7 +13,7 @@
  * - It sits in the window, and moving it frees a time that fits: the best
  *   such time is reserved for the meeting that needs room.
  *
- * `main` picks one and sends `reschedule` with `making_room_for`. While the
+ * `main` picks one and sends `meeting_reschedule` with `making_room_for`. While the
  * move is arranged, the reserved time is busy for it; once the move is
  * booked, the host holds the reserved time for the meeting that needed it
  * and tells its conversation, which offers it (`handOver`). When that time

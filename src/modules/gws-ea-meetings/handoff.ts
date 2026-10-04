@@ -1,58 +1,65 @@
 /**
  * The typed handoff between `main` and `external-email` (KTD5, KTD16).
  *
- * `main` sends requests; `external-email` reports one outcome and may place
- * the people on its thread. Each arrives as a guarded delivery action (see
- * `guard.ts`), and each gets exactly one answer, errors included, through
- * `writeActionResponse`. An answer is recorded against the request id the
- * runner set, the id of the outbound message that carried it, so a request
- * replayed after a host restart gets the first answer and causes nothing
- * twice.
+ * `main` sends requests; `external-email` asks `main` about a curveball,
+ * reports how a job ended, and may place the people on its thread. Each
+ * arrives as a guarded delivery action (see `guard.ts`), and each gets
+ * exactly one answer, errors included, through `writeActionResponse`. An
+ * answer is recorded against the request id the runner set, the id of the
+ * outbound message that carried it, so a request replayed after a host
+ * restart gets the first answer and causes nothing twice.
  *
- * - `arrange` opens a new email thread to the people `main` names, copying
- *   the principal only when asked, or takes over a thread the host holds for
- *   `main` (one the principal copied the assistant into, or one anyone else
- *   started), taking its people from its mail, with anyone `main` adds.
- *   `reschedule` moves an event the principal organizes; `ask_organizer`
- *   asks an invitation's organizer, record or not (R16), to move it.
- * - `respond` takes over a held thread for one reply, from a brief; the
- *   moment delivery records the reply, the thread is held for `main` again.
- *   `dismiss` closes a held thread with nothing sent.
- * - Nothing in a meeting's conversation stalls silently. When delivery gives
- *   up on an email it wrote, when an email to it is given up after its
- *   retries, or when one of its turns fails, `main` hears of it: a reply's
- *   job ends and its thread is held again; any other meeting goes on, for
- *   `main` to amend, reschedule, or cancel.
- *   `reply_to_principal` answers the principal's own email, to them alone.
- * - Every meeting is bound to one `external-email` session. Its first message
- *   is the brief: a host-only message from sender `system`, which no email
- *   can be, carrying the counterparts' names and addresses, who its replies
- *   go to, the meeting's level, its length, window, purpose and constraints,
- *   and nothing else from the people store. Mail held for the thread follows
- *   it.
- * - The purpose and constraints are length-capped and pass the audience
- *   check before `external-email` sees them.
+ * - `meeting_arrange` opens a new email thread to the people `main` names,
+ *   copying the principal only when asked, or takes over a thread the host
+ *   holds for `main` (one the principal copied the assistant into, or one
+ *   anyone else started), or an open conversation's, taking its people from
+ *   its mail, with anyone `main` adds. `meeting_reschedule` moves an event
+ *   the principal organizes, or asks the organizer of someone else's, record
+ *   or not (R16), to move it.
+ * - `email_respond` hands a held thread to a conversation, from a brief: it
+ *   stays with the thread for the other side's follow-ups until it reports
+ *   done, goes quiet, or is called off or taken over (KTD4); then the thread
+ *   is held for `main` again. `email_dismiss` closes a held thread with
+ *   nothing sent. `email_reply_to_principal` answers the principal's own
+ *   email, to them alone.
+ * - Nothing in a job's conversation stalls silently. When delivery gives up
+ *   on an email it wrote, when an email to it is given up after its retries,
+ *   or when one of its turns fails, `main` hears of it: a conversation ends
+ *   and its thread is held again; any other meeting goes on, for `main` to
+ *   amend, reschedule, or cancel.
+ * - Every job is bound to one `external-email` session. Its first message is
+ *   the brief: a host-only message from sender `system`, which no email can
+ *   be, carrying the counterparts' names and addresses, who its replies go
+ *   to, the meeting's level, its length, window, purpose, constraints and
+ *   invitation wishes, and nothing else from the people store. Mail held for
+ *   the thread follows it.
+ * - Everything `main` writes for the other side is length-capped and passes
+ *   the audience check before `external-email` sees it.
  * - Replies go to everyone on the thread (R40). `external-email` may place
- *   those people in To, Cc, and Bcc or leave someone off (`recipients`);
- *   only `main` adds someone, with `arrange` or `amend`.
- * - `arrange` with colleagues alone whose free/busy Google shows books the
- *   time directly, with no email and no session (R11).
- * - `cancel` ends a meeting, closes its session, and tells the people the
- *   assistant wrote to in one checked line; a reply not yet sent is simply
- *   called off. Given an event the principal organizes with others instead,
- *   it deletes the event with Google's own cancellation notice to them (R8).
- *   `amend` writes a new brief.
- * - An outcome becomes a typed note in `main`'s shared session. Booked comes
- *   only after the host's own booking; settled only after the invitation is
- *   re-read and found moved to an offered time or clear of conflicts;
- *   needs-room only for someone in the inner circle or close, and its note
- *   lists the meetings that could move to make room (R14, `room.ts`);
- *   not-scheduling hands the thread back to `main` to triage.
- * - `reschedule` with `making_room_for` moves one of those, and reserves the
- *   time it frees for the meeting that needs it (R23). That meeting's
- *   booking note names the meeting that moved.
- * - Follow-through ends a meeting nobody answered, and closes a booked one
- *   once its event has passed (`follow-through.ts`).
+ *   those people in To, Cc, and Bcc or leave someone off
+ *   (`email_recipients`); only `main` adds someone, with `meeting_arrange`
+ *   or `meeting_amend`.
+ * - `meeting_arrange` with colleagues alone whose free/busy Google shows
+ *   books the time directly, with no email and no session (R11).
+ * - `meeting_ask_main` brings a curveball to `main` as a typed question, with
+ *   no words of `external-email`'s own (KTD2); `meeting_amend` answers it, or
+ *   changes a job: new terms, people, or invitation, and for a booked
+ *   meeting its event (KTD3).
+ * - `meeting_cancel` calls a job off in one step (KTD6): a booked event is
+ *   deleted with Google's notice, holds go, and the other side gets one line
+ *   from `external-email` only when `main` has something to say or they were
+ *   waiting on an offer. Given an event the principal organizes with others
+ *   instead, it deletes the event with Google's own cancellation (R8).
+ * - An outcome becomes a typed note in `main`'s shared session: settled only
+ *   after the invitation is re-read and found moved to an offered time or
+ *   clear of conflicts, not-scheduling handing the thread back to `main` to
+ *   triage. A booking is reported by `meeting_book` itself (KTD8).
+ * - `meeting_reschedule` with `making_room_for` moves a meeting the host
+ *   lists as a candidate, and reserves the time it frees for the meeting
+ *   that needs it (R14, R23, `room.ts`).
+ * - Follow-through ends a job nobody answered, closes a booked one once its
+ *   event has passed, and reminds `main` of a question it left open
+ *   (`follow-through.ts`).
  */
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
@@ -246,7 +253,7 @@ const DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[
 const GMAIL_MESSAGE_ID = /^[A-Za-z0-9_-]{1,128}$/u;
 /** A meeting's purpose is a new thread's subject, so it stays short. */
 const PURPOSE_MAX = 120;
-/** A reply's purpose says what the one reply must do: decline, route, acknowledge, or hold. */
+/** A conversation's purpose says what its answer must do, such as decline with an alternative or route. */
 const REPLY_PURPOSE_MAX = 500;
 const CONSTRAINTS_MAX = 500;
 /** main's answer to what external-email asked: a few sentences at most. */
@@ -1130,8 +1137,8 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         message: isScheduling(meeting)
           ? `external-email has meeting ${meeting.id} ${KIND_WORDS[meeting.kind]}, with ${who(meeting)}; its level is ${meeting.level}. ` +
             'You will get a note when it is booked or ends.'
-          : `external-email is writing one reply in thread ${meeting.thread_key}, to ${who(meeting)} (meeting ${meeting.id}). ` +
-            'You will get a note once it has gone.',
+          : `external-email is answering thread ${meeting.thread_key}, to ${who(meeting)} (meeting ${meeting.id}), and stays ` +
+            'with the conversation for their follow-ups. You will get a note when it ends.',
       },
     };
   }
@@ -1509,10 +1516,10 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   }
 
   /**
-   * One reply in a thread waiting for main (KTD16): to decline with an
-   * alternative, route, acknowledge, or send a holding line. The reply goes
-   * to everyone on the thread, and once it has been delivered the thread is
-   * held for main again.
+   * A conversation in a thread waiting for main (KTD16): external-email
+   * answers it for main, to decline with an alternative, route, or answer,
+   * writing to everyone on the thread, and stays with it for their follow-ups
+   * until it is done, goes quiet, or main takes it over.
    */
   async function respond(content: Record<string, unknown>, session: Session, requestId: string): Promise<Answer> {
     const existing = await findMeetingByRequest(session.id, requestId);
@@ -1573,7 +1580,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     const body = bodyText(content.text, 'text', PRINCIPAL_REPLY_MAX);
     if (!(await getPrincipalMessage(gmailMessageId))) {
       throw refused(
-        `Gmail message ${gmailMessageId} is not one Gmail verified the principal sent you: reply_to_principal answers only the principal's own email`,
+        `Gmail message ${gmailMessageId} is not one Gmail verified the principal sent you: email_reply_to_principal answers only the principal's own email`,
       );
     }
     // Unique per request, so a replay sends nothing twice and two answers to one email both go.
@@ -2839,7 +2846,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     recipients,
     /** A delivered email of a job's conversation: a closing line ends its meeting, and any other starts the quiet count. */
     emailDelivered,
-    /** A reply job whose ending a stop or a failed note cut short: follow-through finishes it. */
+    /** A conversation whose ending a stop or a failed note cut short: follow-through finishes it. */
     finishCutShortReply,
     /** Delivery gave up on messages: each email a meeting's conversation wrote among them reaches main. */
     sendsFailed,

@@ -1,7 +1,7 @@
 /**
  * GWS-EA's meetings (KTD5, KTD11, KTD12, KTD16): the store of every job
- * `main` hands to `external-email`, a meeting to schedule or one reply to
- * write, and the typed requests that carry them.
+ * `main` hands to `external-email`, a meeting to schedule or a conversation
+ * to hold, and the typed requests that carry them.
  *
  *   - `main` → host: `meeting_arrange`, `meeting_reschedule`,
  *     `meeting_cancel`, `meeting_amend`, `email_respond`, `email_dismiss`,
@@ -20,16 +20,18 @@
  * default; `external-email`'s side is `gws-ea-meetings-external`.
  *
  * A forgotten person's meetings, threads, and sessions are purged, and a
- * thread the audience check stops ends its meeting at once. A reply's
- * thread goes back to `main` the moment delivery records the reply, and
- * `main` hears of any email in a meeting's thread delivery gave up on, any
- * email to it given up after its retries, and any turn of it that failed.
+ * thread the audience check stops ends its meeting at once. A delivered
+ * email starts its job's quiet count, and a called-off meeting's closing
+ * line ends it. `main` hears of any email in a job's thread delivery gave up
+ * on, any email to it given up after its retries, and any turn of it that
+ * failed.
  *
  * Follow-through (KTD12, `follow-through.ts`) runs on a module timer each
- * minute: a quiet thread's nudge and give-up, closing a booked meeting's
- * conversation once its event has passed, and holds or rooms left to
- * finish. The inbox tells it when a counterpart replies. Making room (R14,
- * `room.ts`) lists the meetings that could move for a needs-room outcome.
+ * minute: a quiet thread's nudge and give-up, a reminder to `main` of a
+ * question it left open, closing a booked meeting's conversation once its
+ * event has passed, and holds or rooms left to finish. The inbox tells it
+ * when a counterpart replies. Making room (R14, `room.ts`) lists the
+ * meetings that could move for someone inner circle or close.
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
