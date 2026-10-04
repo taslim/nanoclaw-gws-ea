@@ -1,7 +1,7 @@
 /**
- * Covers R20 for the provider's own state: each external-email session gets
- * its own Claude home, so one thread's transcript never reaches another's
- * container.
+ * Covers R20 and R65 for what a session keeps: each external-email session
+ * gets its own Claude home and its own inbox, so one thread's transcript and
+ * files never reach another thread's container.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -20,12 +20,14 @@ vi.mock('../../log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
 
+import { parseStoredCapabilities, resolveCapabilities } from '../../capabilities.js';
 import { configFromDb } from '../../container-config.js';
 import { buildMounts } from '../../container-runner.js';
 import { getContainerConfig } from '../../db/container-configs.js';
 import { closeDb, getAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { getHostStartCallbacks } from '../../host-lifecycle.js';
+import { writeSessionMessage } from '../../session-manager.js';
 import type { VolumeMount } from '../../providers/provider-container-registry.js';
 import type { AgentGroup, Session } from '../../types.js';
 import { getExternalEmailAgentGroupId } from './index.js';
@@ -54,6 +56,22 @@ function home(mounts: readonly VolumeMount[]): VolumeMount {
   return found;
 }
 
+/** Every file under `dir`, at any depth. */
+function filesUnder(dir: string): string[] {
+  if (!fs.existsSync(dir)) return [];
+  return fs
+    .readdirSync(dir, { withFileTypes: true, recursive: true })
+    .flatMap((entry) => (entry.isFile() ? [path.join(entry.parentPath, entry.name)] : []));
+}
+
+async function externalEmail(): Promise<AgentGroup> {
+  await startHost();
+  const id = await getExternalEmailAgentGroupId();
+  const ee = id === null ? undefined : await getAgentGroup(id);
+  if (!ee) throw new Error('external-email was not created');
+  return ee;
+}
+
 function under(target: string, root: string): boolean {
   const relative = path.relative(root, target);
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
@@ -72,10 +90,7 @@ afterEach(async () => {
 
 describe("external-email's Claude home", () => {
   it("is each session's own: session A cannot read session B's transcript", async () => {
-    await startHost();
-    const id = await getExternalEmailAgentGroupId();
-    const ee = id === null ? undefined : await getAgentGroup(id);
-    if (!ee) throw new Error('external-email was not created');
+    const ee = await externalEmail();
 
     const a = await mountsFor(ee, 'sess-a');
     const b = await mountsFor(ee, 'sess-b');
@@ -111,5 +126,43 @@ describe("external-email's Claude home", () => {
     }
     const order = b.map((mount) => mount.containerPath);
     expect(order.indexOf('/workspace/.claude-shared/skills')).toBeGreaterThan(order.indexOf('/workspace'));
+  });
+});
+
+describe("external-email's files", () => {
+  it("leave thread B's file tools nothing of thread A's: A's attachments stay in A's own session folder", async () => {
+    const ee = await externalEmail();
+    const a = await mountsFor(ee, 'sess-a');
+    const b = await mountsFor(ee, 'sess-b');
+
+    // An attachment reaches thread A, staged the way core stages every inbound file.
+    await writeSessionMessage(ee.id, 'sess-a', {
+      id: 'mail-a-1',
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      content: JSON.stringify({
+        text: 'The contract is attached.',
+        attachments: [{ name: 'contract-a.pdf', type: 'file', data: Buffer.from('thread A only').toString('base64') }],
+      }),
+    });
+    const staged = path.join(DATA_DIR, 'v2-sessions', ee.id, 'sess-a', 'inbox', 'mail-a-1', 'contract-a.pdf');
+    expect(fs.readFileSync(staged, 'utf8')).toBe('thread A only');
+
+    // Nothing B mounts reaches it, and the folder every session shares holds no copy of it.
+    for (const mount of b) expect(under(staged, mount.hostPath), mount.containerPath).toBe(false);
+    const shared = b.find((mount) => mount.containerPath === '/workspace/agent');
+    expect(shared?.hostPath).toBe(a.find((mount) => mount.containerPath === '/workspace/agent')?.hostPath);
+    const copies = filesUnder(shared?.hostPath ?? '').filter((file) =>
+      fs.readFileSync(file, 'utf8').includes('thread A only'),
+    );
+    expect(copies).toEqual([]);
+
+    // Nor can A put one there: it reads files, and holds no write tool, shell, or shared memory.
+    const held = resolveCapabilities(
+      parseStoredCapabilities((await getContainerConfig(ee.id))?.capabilities, ee.name),
+      ee.name,
+    );
+    expect(held).toContain('files-read');
+    for (const key of ['files-write', 'shell', 'conversation-context', 'mcp-servers']) expect(held).not.toContain(key);
   });
 });
