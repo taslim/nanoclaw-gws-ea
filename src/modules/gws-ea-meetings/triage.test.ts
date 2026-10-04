@@ -202,9 +202,14 @@ describe('AE10: Sam, who has a record, emails the assistant for time', () => {
     expect(await getThreadParticipants(threadKey)).toMatchObject({ origin: 'inbound', state: 'open' });
 
     const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
-    data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: slot.slot_id }));
+    data(
+      await ask(session, 'meeting_book', {
+        meeting_id: stored.id,
+        slot_id: slot.slot_id,
+        invitation: { title: 'Catch up' },
+      }),
+    );
     await reply(session, threadKey, 'Hello Sam, I am Robin, Alex Doe’s assistant. You are booked for Tuesday.');
-    data(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'booked' }));
 
     const [sent] = scheduling.gmail.sent;
     expect(sent.threadId).toBe('g-sam');
@@ -407,7 +412,7 @@ describe("external-email's recipients", () => {
     });
 
     const answer = data(
-      await ask(session, 'meeting_recipients', { meeting_id: meetingId, to: [ADDRESSES.acme], bcc: [PRINCIPAL] }),
+      await ask(session, 'email_recipients', { meeting_id: meetingId, to: [ADDRESSES.acme], bcc: [PRINCIPAL] }),
     );
     expect(answer).toMatchObject({ to: [ADDRESSES.acme], cc: [], bcc: [PRINCIPAL] });
     await reply(session, threadKey, 'Thank you, Alex: moving you to Bcc to spare your inbox.');
@@ -417,7 +422,7 @@ describe("external-email's recipients", () => {
   it('refuses anyone not already on the thread, and leaves the people as they were', async () => {
     const { session, meetingId, threadKey } = await copiedIn();
     const message = refusal(
-      await ask(session, 'meeting_recipients', { meeting_id: meetingId, to: [ADDRESSES.acme, JANE] }),
+      await ask(session, 'email_recipients', { meeting_id: meetingId, to: [ADDRESSES.acme, JANE] }),
     );
     expect(message).toContain(JANE);
     expect(message).toMatch(/cannot add/i);
@@ -441,7 +446,7 @@ describe("external-email's recipients", () => {
     await scheduling.inbox.tick();
 
     const refused = refusal(
-      await ask(session, 'meeting_recipients', { meeting_id: meetingId, to: [ADDRESSES.acme, JANE] }),
+      await ask(session, 'email_recipients', { meeting_id: meetingId, to: [ADDRESSES.acme, JANE] }),
     );
     expect(refused).toContain(JANE);
     expect(refused).toContain(ARI);
@@ -450,8 +455,7 @@ describe("external-email's recipients", () => {
     expect(hostText(refused)).toContain(`the principal <${PRINCIPAL}>`);
 
     const placed = String(
-      data(await ask(session, 'meeting_recipients', { meeting_id: meetingId, to: [ADDRESSES.acme], cc: [ARI] }))
-        .message,
+      data(await ask(session, 'email_recipients', { meeting_id: meetingId, to: [ADDRESSES.acme], cc: [ARI] })).message,
     );
     expect(placed).toContain(ARI);
     expect(hostText(placed)).not.toContain(ARI);
@@ -461,7 +465,7 @@ describe("external-email's recipients", () => {
   it('is refused to main and to a conversation bound to another meeting', async () => {
     const { session, meetingId } = await copiedIn();
     expect(
-      refusal(await ask(scheduling.main, 'meeting_recipients', { meeting_id: meetingId, to: [ADDRESSES.acme] })),
+      refusal(await ask(scheduling.main, 'email_recipients', { meeting_id: meetingId, to: [ADDRESSES.acme] })),
     ).toMatch(/Only external-email/);
     const other = data(
       await ask(scheduling.main, 'meeting_arrange', {
@@ -475,7 +479,7 @@ describe("external-email's recipients", () => {
     const otherSession = await meetingSession(other.meeting_id);
     expect(otherSession.id).not.toBe(session.id);
     expect(
-      refusal(await ask(otherSession, 'meeting_recipients', { meeting_id: meetingId, to: [ADDRESSES.acme] })),
+      refusal(await ask(otherSession, 'email_recipients', { meeting_id: meetingId, to: [ADDRESSES.acme] })),
     ).toMatch(/not this conversation's/);
   });
 });
@@ -719,9 +723,40 @@ describe('a step in a meeting’s conversation that failed', () => {
     expect(notes(scheduling.main, STALLED)).toHaveLength(2);
   });
 
+  it('tells main a called-off meeting ends without its closing line when that line or its turn fails, and asks nothing of main', async () => {
+    const { meetingId, threadKey, session } = await samsMeeting();
+    const cancelled = await ask(scheduling.main, 'meeting_cancel', {
+      meeting_id: meetingId,
+      note: 'Alex has to travel that week.',
+    });
+    expect(data(cancelled).state).toBe('closing');
+
+    turnFailed(session, threadKey);
+    await deliverSessionMessages(session);
+    const [stalled] = notes(scheduling.main, STALLED);
+    expect(stalled.text).toMatch(/is called off, and its closing line has not gone/);
+
+    vi.spyOn(scheduling.gmail, 'send').mockRejectedValue(
+      new GoogleApiError(400, 'Google refused /gmail/v1/users/me/messages/send: bad request'),
+    );
+    await reply(session, threadKey, 'Alex has to travel that week, so we will leave it for now. Thank you, Sam.');
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    const [unsent] = notes(scheduling.main, UNSENT);
+    expect(unsent.text).toMatch(/is called off, and its closing line did not go/);
+
+    for (const note of [stalled, unsent]) {
+      expect(note.text).toMatch(
+        /ends without it within 60 minutes of being called off\. Nothing more is needed from you\./,
+      );
+      expect(note.text).not.toMatch(/amend|still (open|being arranged)/);
+    }
+    expect((await meeting(meetingId)).state).toBe('closing');
+  });
+
   it('ends a reply whose turn failed and hands its thread back, so main can respond again', async () => {
     const { threadKey } = await deeAsks();
-    const answer = data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
+    const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
     const session = await meetingSession(answer.meeting_id);
 
     turnFailed(session, threadKey);
@@ -732,7 +767,7 @@ describe('a step in a meeting’s conversation that failed', () => {
     const [note] = notes(scheduling.main, STALLED);
     expect(note.text).toMatch(/respond/);
     expect(scheduling.chat).toEqual([]);
-    data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
+    data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
   });
 });
 
@@ -748,42 +783,51 @@ describe('respond', () => {
     await adapter.deliver('email', INBOX_PLATFORM_ID, threadKey, 'chat', JSON.stringify({ text }));
   }
 
-  it('finishes a reply whose ending a stop cut short, once Gmail took it, and leaves one still at work alone', async () => {
+  it('starts the quiet count of a conversation whose first email Gmail took though delivery never heard, and leaves one still at work alone', async () => {
     const { threadKey } = await deeAsks();
-    const answer = data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
+    const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
     const meetingId = String(answer.meeting_id);
 
     await runFollowThrough();
-    expect((await meeting(meetingId)).state).toBe('active');
-    expect(outcomeNotes('responded')).toEqual([]);
+    expect(await meeting(meetingId)).toMatchObject({ state: 'active', replied_at: null, give_up_at: null });
 
     await sentWithoutDelivery(threadKey, 'Thank you for thinking of Alex. Sadly she is not speaking this autumn.');
     expect(scheduling.gmail.sent).toHaveLength(1);
-    expect((await meeting(meetingId)).state).toBe('active');
-
     await runFollowThrough();
-    await runFollowThrough();
-    expect((await meeting(meetingId)).state).toBe('responded');
-    expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'awaiting-arrange' });
-    expect(outcomeNotes('responded')).toHaveLength(1);
-    expect(scheduling.gmail.sent).toHaveLength(1);
-    data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
+    // Monday 08:00, before working hours: it ends quietly four working days from Monday 09:00.
+    expect(await meeting(meetingId)).toMatchObject({
+      state: 'active',
+      replied_at: NOW,
+      nudge_at: null,
+      give_up_at: '2026-10-09T08:00:00.000Z',
+    });
+    expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'open' });
   });
 
-  it('finishes the reply when external-email reports it after Gmail took it, though delivery never recorded it', async () => {
+  it('ends a conversation external-email reports done: its thread waits for main, and main hears without waking', async () => {
     const { threadKey } = await deeAsks();
-    const answer = data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
+    const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
     const session = await meetingSession(answer.meeting_id);
     await sentWithoutDelivery(threadKey, 'Thank you for thinking of Alex. Sadly she is not speaking this autumn.');
 
-    data(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'responded' }));
-    expect((await meeting(answer.meeting_id)).state).toBe('responded');
-    expect(outcomeNotes('responded')).toHaveLength(1);
+    expect(
+      data(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'done' })).message,
+    ).toMatch(/closed/);
+    expect((await meeting(answer.meeting_id)).state).toBe('done');
+    expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'awaiting-arrange' });
+    expect((await getSession(session.id))?.status).toBe('closed');
+    const [note, ...more] = outcomeNotes('done');
+    expect(more).toEqual([]);
+    expect(note.row.trigger).toBe(0);
+    expect(note.text).toContain(`thread ${threadKey}`);
+    // A report again is answered, and changes nothing.
+    data(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'done' }));
+    expect(outcomeNotes('done')).toHaveLength(1);
   });
 
   it('ends a reply whose hand-back stopped before main heard, and tells main once', async () => {
     const { threadKey } = await deeAsks();
-    const answer = data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
+    const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
     const meetingId = String(answer.meeting_id);
     // The thread went back to main, then writing main's note failed: the job is still live.
     await handBackHeldThread(threadKey);
@@ -797,12 +841,12 @@ describe('respond', () => {
     expect(note.text).toMatch(/was not sent/);
     expect(note.text).toContain(`thread_key ${threadKey}`);
     expect(scheduling.gmail.sent).toEqual([]);
-    data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
+    data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
   });
 
-  it('sends one checked reply to everyone on the thread, hands the thread back to main, and a later arrange works', async () => {
+  it('answers everyone on the thread and stays for their follow-ups; done hands the thread back, and a later arrange works', async () => {
     const { threadKey } = await deeAsks();
-    const answer = data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
+    const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
     const stored = await meeting(answer.meeting_id);
     expect(stored).toMatchObject({ kind: 'respond', state: 'active', thread_key: threadKey, length_minutes: null });
 
@@ -811,7 +855,8 @@ describe('respond', () => {
     expect(more).toEqual([]);
     expect(brief.sender).toBe('system');
     expect(brief.brief).toMatchObject({ meeting_id: stored.id, kind: 'respond' });
-    expect(brief.text).toContain('Write one reply in this thread: Decline kindly');
+    expect(brief.text).toContain('Answer in this thread: Decline kindly');
+    expect(brief.text).toMatch(/report done with meeting_outcome/);
     expect(brief.text).toContain(DEE);
     expect(brief.text).toContain(KIM);
     expect(brief.text).not.toMatch(/Window:|Length:/);
@@ -822,20 +867,26 @@ describe('respond', () => {
     expect(sent.threadId).toBe('g-dee');
     expect(recipientsOf(sent)).toEqual({ to: DEE, cc: KIM, bcc: undefined });
 
-    // The reply's delivery ends the job: the thread is main's again at once.
-    expect((await meeting(stored.id)).state).toBe('responded');
-    expect((await getSession(session.id))?.status).toBe('closed');
-    expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'awaiting-arrange' });
-    const [note] = outcomeNotes('responded');
-    expect(note.note).toMatchObject({ meeting_id: stored.id, thread_key: threadKey });
-    expect(note.text).toContain(threadKey);
+    // The conversation stays open: Dee's follow-up reaches it, not main.
+    expect(await meeting(stored.id)).toMatchObject({ state: 'active', nudge_at: null });
+    expect((await getSession(session.id))?.status).toBe('active');
+    expect(outcomeNotes('done')).toEqual([]);
+    scheduling.gmail.receive({
+      threadId: 'g-dee',
+      from: `Dee <${DEE}>`,
+      to: [ROBIN],
+      subject: 'Re: Speaking at our meetup',
+      body: 'Thanks anyway! Could she record a short video instead?',
+    });
+    await scheduling.inbox.tick();
+    expect(contents(session).some((c) => c.text?.includes('record a short video'))).toBe(true);
+    expect(await heldCount(threadKey)).toBe(0);
+    expect(notes(scheduling.main, 'gws-ea-inbox.held-mail')).toEqual([]);
 
-    // external-email's report afterwards is answered, and changes nothing.
-    expect(
-      data(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'responded' })).message,
-    ).toMatch(/closed/);
-    expect(outcomeNotes('responded')).toHaveLength(1);
-    expect(scheduling.gmail.sent).toHaveLength(1);
+    await reply(session, threadKey, 'A short video should be possible: I will check with Alex and come back to you.');
+    data(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'done' }));
+    expect((await meeting(stored.id)).state).toBe('done');
+    expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'awaiting-arrange' });
 
     // Dee writes again: main hears of it, and the thread can be arranged.
     scheduling.gmail.receive({
@@ -861,32 +912,66 @@ describe('respond', () => {
     expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'open' });
   });
 
-  it('holds mail that arrives right after the reply has gone for main, never for the closed conversation', async () => {
+  it('counts quiet again from their reply, with nobody nudged', async () => {
     const { threadKey } = await deeAsks();
-    const answer = data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
+    const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
     const session = await meetingSession(answer.meeting_id);
     await reply(session, threadKey, 'Thank you for thinking of Alex. Sadly she is not speaking this autumn.');
-    const seen = contents(session).length;
+    expect(await meeting(answer.meeting_id)).toMatchObject({ nudge_at: null, give_up_at: '2026-10-09T08:00:00.000Z' });
+
+    // Tuesday, 11:00 in London: Dee writes back, and the count starts again from then.
+    vi.setSystemTime(new Date('2026-10-06T10:00:00.000Z'));
+    scheduling.gmail.receive({
+      threadId: 'g-dee',
+      from: `Dee <${DEE}>`,
+      to: [ROBIN],
+      subject: 'Re: Speaking at our meetup',
+      body: 'Understood, thank you. Might she be free in the spring?',
+    });
+    await scheduling.inbox.tick();
+    expect(await meeting(answer.meeting_id)).toMatchObject({ nudge_at: null, give_up_at: '2026-10-12T10:00:00.000Z' });
+  });
+
+  it('takes no note when main calls it off: anything more to say goes through meeting_amend', async () => {
+    const { threadKey } = await deeAsks();
+    const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
+    expect(
+      refusal(await ask(scheduling.main, 'meeting_cancel', { meeting_id: answer.meeting_id, note: 'Alex is sorry.' })),
+    ).toMatch(/called off with nothing more sent: to say something, use meeting_amend with answer/);
+    expect((await meeting(answer.meeting_id)).state).toBe('active');
+  });
+
+  it('ends a conversation that goes quiet without a word to anyone, and later mail reaches main', async () => {
+    const { threadKey } = await deeAsks();
+    const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
+    const session = await meetingSession(answer.meeting_id);
+    await reply(session, threadKey, 'Thank you for thinking of Alex. Sadly she is not speaking this autumn.');
+    expect((await meeting(answer.meeting_id)).give_up_at).toBe('2026-10-09T08:00:00.000Z');
+
+    vi.setSystemTime(new Date('2026-10-09T08:01:00.000Z'));
+    await scheduling.inbox.tick();
+    await runFollowThrough();
+    expect((await meeting(answer.meeting_id)).state).toBe('done');
+    expect(scheduling.gmail.sent).toHaveLength(1);
+    const [note] = outcomeNotes('done');
+    expect(note.text).toMatch(/went quiet/);
+    expect(note.row.trigger).toBe(0);
 
     scheduling.gmail.receive({
       threadId: 'g-dee',
       from: `Dee <${DEE}>`,
       to: [ROBIN],
       subject: 'Re: Speaking at our meetup',
-      body: 'Thanks anyway! One more thing: could she record a short video?',
+      body: 'One more thing: could she record a short video?',
     });
     await scheduling.inbox.tick();
-
-    expect(contents(session)).toHaveLength(seen);
-    expect(await heldCount(threadKey)).toBe(1);
     const [held] = notes(scheduling.main, 'gws-ea-inbox.held-mail');
     expect(held.note).toMatchObject({ thread_key: threadKey, sender: DEE });
-    expect(held.text).toContain('record a short video');
   });
 
   it('tells main a reply delivery gave up on, and hands the thread back so main can try again', async () => {
     const { threadKey } = await deeAsks();
-    const answer = data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
+    const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
     const session = await meetingSession(answer.meeting_id);
     vi.spyOn(scheduling.gmail, 'send').mockRejectedValue(
       new GoogleApiError(400, 'Google refused /gmail/v1/users/me/messages/send: bad request'),
@@ -911,28 +996,75 @@ describe('respond', () => {
 
     // main can try again in the same thread.
     vi.mocked(scheduling.gmail.send).mockRestore();
-    const again = data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
+    const again = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
     expect((await meeting(again.meeting_id)).state).toBe('active');
   });
 
-  it('hands the thread back only once its reply has gone, when the report comes first', async () => {
-    const { threadKey } = await deeAsks();
-    const answer = data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
-    const session = await meetingSession(answer.meeting_id);
+  describe('reported done while its last email has not gone', () => {
+    const badRequest = () => new GoogleApiError(400, 'Google refused /gmail/v1/users/me/messages/send: bad request');
 
-    expect(
-      data(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'responded' })).message,
-    ).toMatch(/not gone/);
-    expect((await meeting(answer.meeting_id)).state).toBe('active');
-    expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'open' });
-    expect(outcomeNotes('responded')).toHaveLength(0);
+    /** Dee's conversation writes its last email, whose first send fails, and reports done. */
+    async function doneBeforeItsEmailWent(): Promise<{ readonly meetingId: string; readonly session: Session }> {
+      const { threadKey } = await deeAsks();
+      const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
+      const meetingId = String(answer.meeting_id);
+      const session = await meetingSession(meetingId);
+      await reply(session, threadKey, 'Thank you for thinking of Alex. Sadly she is not speaking this autumn.');
+      expect(scheduling.gmail.sent).toEqual([]);
 
-    await reply(session, threadKey, 'Thank you for thinking of Alex. Sadly she is not speaking this autumn.');
-    expect(scheduling.gmail.sent).toHaveLength(1);
-    expect((await meeting(answer.meeting_id)).state).toBe('responded');
-    expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'awaiting-arrange' });
-    expect((await getSession(session.id))?.status).toBe('closed');
-    expect(outcomeNotes('responded')).toHaveLength(1);
+      const reported = data(await ask(session, 'meeting_outcome', { meeting_id: meetingId, outcome: 'done' }));
+      expect(reported.message).toMatch(/has not gone yet: the host closes this conversation once it has/);
+      expect((await meeting(meetingId)).state).toBe('active');
+      expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'open' });
+      expect((await getSession(session.id))?.status).toBe('active');
+      expect(notes(scheduling.main, OUTCOME)).toEqual([]);
+      return { meetingId, session };
+    }
+
+    it('ends once delivery sends it, and main hears without waking', async () => {
+      vi.spyOn(scheduling.gmail, 'send').mockRejectedValueOnce(badRequest());
+      const { meetingId, session } = await doneBeforeItsEmailWent();
+
+      await deliverSessionMessages(session);
+      expect(scheduling.gmail.sent).toHaveLength(1);
+      expect((await meeting(meetingId)).state).toBe('done');
+      expect((await getSession(session.id))?.status).toBe('closed');
+      const [note, ...more] = notes(scheduling.main, OUTCOME);
+      expect(more).toEqual([]);
+      expect(note.note).toMatchObject({ meeting_id: meetingId, outcome: 'done' });
+      expect(note.row.trigger).toBe(0);
+    });
+
+    it('ends on a later follow-through pass when its email went but the host stopped before ending it', async () => {
+      vi.spyOn(scheduling.gmail, 'send').mockRejectedValueOnce(badRequest());
+      const { meetingId, session } = await doneBeforeItsEmailWent();
+      // Delivery recorded the email, and the host stopped before it ended the conversation.
+      const outbound = new Database(outboundDbPath(session.agent_group_id, session.id), { readonly: true });
+      const { id } = outbound.prepare("SELECT id FROM messages_out WHERE kind = 'chat'").get() as { id: string };
+      outbound.close();
+      const inbound = new Database(inboundDbPath(session.agent_group_id, session.id));
+      inbound
+        .prepare("INSERT INTO delivered (message_out_id, status, delivered_at) VALUES (?, 'delivered', ?)")
+        .run(id, new Date().toISOString());
+      inbound.close();
+
+      await runFollowThrough();
+      expect((await meeting(meetingId)).state).toBe('done');
+      expect(outcomeNotes('done')).toHaveLength(1);
+    });
+
+    it('tells main when delivery gives up on it', async () => {
+      vi.spyOn(scheduling.gmail, 'send').mockRejectedValue(badRequest());
+      const { meetingId, session } = await doneBeforeItsEmailWent();
+
+      await deliverSessionMessages(session);
+      await deliverSessionMessages(session);
+      expect((await meeting(meetingId)).state).toBe('gave-up');
+      expect(outcomeNotes('done')).toEqual([]);
+      const [note] = outcomeNotes('gave-up');
+      expect(note.text).toMatch(/could not be sent/);
+      expect(note.row.trigger).toBe(1);
+    });
   });
 
   it('refuses a purpose carrying a private detail, before external-email sees it', async () => {
@@ -941,7 +1073,7 @@ describe('respond', () => {
     const message = refusal(
       await ask(
         scheduling.main,
-        'meeting_respond',
+        'email_respond',
         respondFields(threadKey, { purpose: 'Tell her to come to 12 Elm Rd Springfield.' }),
       ),
     );
@@ -951,14 +1083,18 @@ describe('respond', () => {
     expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'awaiting-arrange' });
   });
 
-  it('takes no outcome but responded, and is the only meeting that does', async () => {
+  it('ends only done, and is the only meeting that does', async () => {
     const { threadKey } = await deeAsks();
-    const answer = data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
+    const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
     const session = await meetingSession(answer.meeting_id);
-    for (const outcome of ['booked', 'gave-up', 'not-scheduling']) {
-      refusal(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome }));
+    for (const outcome of ['settled', 'gave-up', 'not-scheduling']) {
+      expect(refusal(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome }))).toMatch(
+        /This conversation ends done/,
+      );
     }
-    refusal(await ask(session, 'meeting_free_time', { meeting_id: answer.meeting_id }));
+    expect(refusal(await ask(session, 'meeting_free_time', { meeting_id: answer.meeting_id }))).toMatch(
+      /no times to offer, hold, or book/,
+    );
 
     const arranged = data(
       await ask(scheduling.main, 'meeting_arrange', {
@@ -970,20 +1106,33 @@ describe('respond', () => {
       }),
     );
     const arrangeSession = await meetingSession(arranged.meeting_id);
-    refusal(await ask(arrangeSession, 'meeting_outcome', { meeting_id: arranged.meeting_id, outcome: 'responded' }));
+    expect(
+      refusal(await ask(arrangeSession, 'meeting_outcome', { meeting_id: arranged.meeting_id, outcome: 'done' })),
+    ).toMatch(/Only a conversation reports done/);
+    expect((await meeting(arranged.meeting_id)).state).toBe('active');
   });
 
-  it('has nothing to amend: main cancels it and responds again, and the brief stays as it was', async () => {
+  it('takes only main’s answer as an amend, in a new brief', async () => {
     const { threadKey } = await deeAsks();
-    const answer = data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
+    const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
     const session = await meetingSession(answer.meeting_id);
     expect(
       refusal(
         await ask(scheduling.main, 'meeting_amend', { meeting_id: answer.meeting_id, constraints: 'Keep it short.' }),
       ),
-    ).toMatch(/nothing to amend/);
+    ).toMatch(/takes only your answer/);
     expect(contents(session).filter((c) => c.brief !== undefined)).toHaveLength(1);
     expect((await meeting(answer.meeting_id)).constraints).toBeNull();
+
+    data(
+      await ask(scheduling.main, 'meeting_amend', {
+        meeting_id: answer.meeting_id,
+        answer: 'Alex would happily record a short video for the meetup instead.',
+      }),
+    );
+    const briefs = contents(session).filter((c) => c.brief !== undefined);
+    expect(briefs).toHaveLength(2);
+    expect(briefs[1].text).toContain("main's answer: Alex would happily record a short video for the meetup instead.");
   });
 
   it('is refused for a thread main started, and for a thread with a meeting in progress', async () => {
@@ -996,16 +1145,16 @@ describe('respond', () => {
         purpose: 'Coffee',
       }),
     );
-    refusal(await ask(scheduling.main, 'meeting_respond', respondFields(String(started.thread_key))));
+    refusal(await ask(scheduling.main, 'email_respond', respondFields(String(started.thread_key))));
 
     const { threadKey } = await deeAsks();
-    data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
-    expect(refusal(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)))).toMatch(/already has/);
+    data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
+    expect(refusal(await ask(scheduling.main, 'email_respond', respondFields(threadKey)))).toMatch(/already has/);
   });
 
   it('is called off by cancel: nothing is sent, and the thread waits for main again', async () => {
     const { threadKey } = await deeAsks();
-    const answer = data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
+    const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
     const session = await meetingSession(answer.meeting_id);
     data(await ask(scheduling.main, 'meeting_cancel', { meeting_id: answer.meeting_id }));
     expect(scheduling.gmail.sent).toHaveLength(0);
@@ -1032,7 +1181,7 @@ describe('not-scheduling on a thread that came to the inbox', () => {
     expect(note.text).not.toMatch(/can't take it on/);
     expect(scheduling.gmail.sent).toHaveLength(0);
 
-    data(await ask(scheduling.main, 'meeting_dismiss', { thread_key: threadKey }));
+    data(await ask(scheduling.main, 'email_dismiss', { thread_key: threadKey }));
     expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'closed' });
   });
 });
@@ -1041,21 +1190,21 @@ describe('dismiss', () => {
   it('closes a thread waiting for main with nothing sent, and answers a replay and a repeat the same way', async () => {
     const { threadKey } = await deeAsks();
     expect(await heldCount(threadKey)).toBe(1);
-    const first = await ask(scheduling.main, 'meeting_dismiss', { thread_key: threadKey }, 'req-dismiss');
+    const first = await ask(scheduling.main, 'email_dismiss', { thread_key: threadKey }, 'req-dismiss');
     expect(data(first)).toMatchObject({ thread_key: threadKey, state: 'closed' });
     expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'closed' });
     expect(await heldCount(threadKey)).toBe(0);
     expect(scheduling.gmail.sent).toHaveLength(0);
 
-    await getDeliveryAction('meeting_dismiss')?.(
-      { action: 'meeting_dismiss', requestId: 'req-dismiss', thread_key: threadKey },
+    await getDeliveryAction('email_dismiss')?.(
+      { action: 'email_dismiss', requestId: 'req-dismiss', thread_key: threadKey },
       scheduling.main,
     );
     const answers = contents(scheduling.main).filter(
       (c) => c.type === 'action_response' && c.requestId === 'req-dismiss',
     );
     expect(answers.map((c) => c.frame)).toEqual([first]);
-    expect(data(await ask(scheduling.main, 'meeting_dismiss', { thread_key: threadKey }))).toMatchObject({
+    expect(data(await ask(scheduling.main, 'email_dismiss', { thread_key: threadKey }))).toMatchObject({
       state: 'closed',
     });
 
@@ -1068,7 +1217,7 @@ describe('dismiss', () => {
   it('is refused for a thread with a meeting in progress, and for a thread main started', async () => {
     const { threadKey } = await deeAsks();
     data(await ask(scheduling.main, 'meeting_arrange', arrangeOn(threadKey)));
-    expect(refusal(await ask(scheduling.main, 'meeting_dismiss', { thread_key: threadKey }))).toMatch(/cancel/);
+    expect(refusal(await ask(scheduling.main, 'email_dismiss', { thread_key: threadKey }))).toMatch(/cancel/);
 
     const started = data(
       await ask(scheduling.main, 'meeting_arrange', {
@@ -1079,7 +1228,7 @@ describe('dismiss', () => {
         purpose: 'Coffee',
       }),
     );
-    refusal(await ask(scheduling.main, 'meeting_dismiss', { thread_key: String(started.thread_key) }));
+    refusal(await ask(scheduling.main, 'email_dismiss', { thread_key: String(started.thread_key) }));
     expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'open' });
   });
 });
@@ -1106,10 +1255,10 @@ describe('reply_to_principal', () => {
   it('sends one reply to the principal alone, in their thread, however often it is replayed', async () => {
     const gmailMessageId = await principalEmails();
     const fields = { gmail_message_id: gmailMessageId, text: 'Done: your 3pm is now at 4pm.' };
-    const first = await ask(scheduling.main, 'meeting_reply_to_principal', fields, 'req-answer');
+    const first = await ask(scheduling.main, 'email_reply_to_principal', fields, 'req-answer');
     expect(first.ok).toBe(true);
-    await getDeliveryAction('meeting_reply_to_principal')?.(
-      { action: 'meeting_reply_to_principal', requestId: 'req-answer', ...fields },
+    await getDeliveryAction('email_reply_to_principal')?.(
+      { action: 'email_reply_to_principal', requestId: 'req-answer', ...fields },
       scheduling.main,
     );
 
@@ -1124,16 +1273,14 @@ describe('reply_to_principal', () => {
   it('is refused from external-email, and for a message the principal did not send', async () => {
     const gmailMessageId = await principalEmails();
     const { threadKey, gmailId: deeMessage } = await deeAsks();
-    const answer = data(await ask(scheduling.main, 'meeting_respond', respondFields(threadKey)));
+    const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
     const session = await meetingSession(answer.meeting_id);
 
     expect(
-      refusal(await ask(session, 'meeting_reply_to_principal', { gmail_message_id: gmailMessageId, text: 'Done.' })),
+      refusal(await ask(session, 'email_reply_to_principal', { gmail_message_id: gmailMessageId, text: 'Done.' })),
     ).toMatch(/main/);
     expect(
-      refusal(
-        await ask(scheduling.main, 'meeting_reply_to_principal', { gmail_message_id: deeMessage, text: 'Done.' }),
-      ),
+      refusal(await ask(scheduling.main, 'email_reply_to_principal', { gmail_message_id: deeMessage, text: 'Done.' })),
     ).toMatch(/principal/);
     expect(scheduling.gmail.sent).toHaveLength(0);
   });

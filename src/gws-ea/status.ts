@@ -143,8 +143,6 @@ export interface InboxFacts {
   /** When a poll last succeeded. */
   readonly last_success_at: string | null;
   readonly calendar_notifications: CalendarNotificationsView | null;
-  /** The principal's domains with no pinned DKIM selector: no mail from them counts as the principal's. */
-  readonly domains_without_selector: readonly string[] | null;
 }
 export interface ConnectorFacts {
   readonly drift: string | null;
@@ -175,9 +173,8 @@ export interface AssistantProbes {
    */
   readonly external_email: ProbeResult & ExternalEmailFacts;
   /**
-   * The assistant's inbox as the host reports it: polling healthy, calendar
-   * notifications on for the principal's calendars, and a DKIM selector pinned
-   * for each of the principal's domains.
+   * The assistant's inbox as the host reports it: polling healthy, and
+   * calendar notifications on for the principal's calendars.
    */
   readonly inbox: ProbeResult & InboxFacts;
   /** The assistant's own Google sign-in, accepted by Google, with Calendar access in OneCLI for agents. */
@@ -778,13 +775,12 @@ interface InboxHealthReport {
   readonly since: string | null;
   readonly lastSuccessAt: string | null;
   readonly calendarNotifications: CalendarNotificationsView;
-  readonly principalDomainsWithoutSelector: readonly string[];
 }
 
 function parseInboxHealth(value: unknown): InboxHealthReport {
   const invalid = () => new GwsEaError('invalid_child_output', 'ncl returned an invalid inbox report');
   if (!isRecord(value) || !isRecord(value.calendarNotifications)) throw invalid();
-  const { state, reason, since, lastSuccessAt, principalDomainsWithoutSelector: domains } = value;
+  const { state, reason, since, lastSuccessAt } = value;
   const calendar = value.calendarNotifications;
   if (
     !oneOf(INBOX_STATES, state) ||
@@ -792,9 +788,7 @@ function parseInboxHealth(value: unknown): InboxHealthReport {
     !nullableString(since) ||
     !nullableString(lastSuccessAt) ||
     !oneOf(CALENDAR_NOTIFICATION_STATES, calendar.state) ||
-    !nullableString(calendar.reason) ||
-    !Array.isArray(domains) ||
-    !domains.every((domain): domain is string => typeof domain === 'string')
+    !nullableString(calendar.reason)
   ) {
     throw invalid();
   }
@@ -804,7 +798,6 @@ function parseInboxHealth(value: unknown): InboxHealthReport {
     since,
     lastSuccessAt,
     calendarNotifications: { state: calendar.state, reason: calendar.reason },
-    principalDomainsWithoutSelector: domains,
   };
 }
 
@@ -815,10 +808,7 @@ function because(clause: string, reason: string | null): string {
 
 /**
  * The assistant's inbox as the running host reports it: polling Gmail without
- * failing, calendar notifications on for the principal's calendars, and a
- * DKIM selector pinned for each of the principal's domains. Until one is
- * pinned for a domain, no mail from it counts as the principal's, so the
- * operator is told how to pin it.
+ * failing, and calendar notifications on for the principal's calendars.
  */
 async function inboxProbe(subject: Subject): Promise<ProbeResult & InboxFacts> {
   const runtime = requireRuntime(subject.runtime);
@@ -828,7 +818,6 @@ async function inboxProbe(subject: Subject): Promise<ProbeResult & InboxFacts> {
     since: health.since,
     last_success_at: health.lastSuccessAt,
     calendar_notifications: health.calendarNotifications,
-    domains_without_selector: health.principalDomainsWithoutSelector,
   };
   const problems: string[] = [];
   if (health.state === 'unhealthy') problems.push(because('the inbox is unhealthy', health.reason));
@@ -839,13 +828,6 @@ async function inboxProbe(subject: Subject): Promise<ProbeResult & InboxFacts> {
     );
   } else if (calendar.state === 'unknown') {
     problems.push(because("calendar notifications for the principal's calendars are not on yet", calendar.reason));
-  }
-  for (const domain of health.principalDomainsWithoutSelector) {
-    problems.push(
-      `no DKIM selector is pinned for ${domain}, so no mail from it counts as the principal's; ` +
-        `pin one with gws-ea ncl --id ${subject.reservation.instance_id} -- dkim-selectors pin --domain ${domain} --selector <s>, ` +
-        `where <s> is the s= of Gmail's dkim=pass result on mail the principal sent the assistant`,
-    );
   }
   if (problems.length > 0) return { status: 'degraded', reason: problems.map(sentence).join(' '), ...facts };
   return { ...OK, ...facts };
@@ -1145,7 +1127,6 @@ export async function observeAssistantStatus(
       since: null,
       last_success_at: null,
       calendar_notifications: null,
-      domains_without_selector: null,
     }),
     probe<WorkspaceFacts>(() => workspaceProbe(subject), { account: null }),
     probe(() => principalProbe(subject), {}),
@@ -1436,7 +1417,7 @@ export const STATUS_USAGE: readonly string[] = [
   '       templates (customized: surface, name, change changed|deleted|added; reason), schema',
   '       (central_fingerprint, session_fingerprint, latest_migration),',
   '       probes: checkout, service, host, onecli, main_identity, external_email, inbox (state, since, last_success_at,',
-  '       calendar_notifications, domains_without_selector), workspace (account), principal, route, connector (managed',
+  '       calendar_notifications), workspace (account), principal, route, connector (managed',
   '       Cloudflare only, with drift), delivery; each probe has status ok|degraded|unknown and a reason.',
   '       list and status exit 0 once they observed, whatever the health; status exits 1 for an unknown ID.',
 ];

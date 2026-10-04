@@ -7,6 +7,7 @@ import {
   createCalendarFactTools,
   type Conflict,
   type FindConflictsResult,
+  type HeldTime,
   type PeopleStatsResult,
   type PersonStats,
 } from './calendar-facts.js';
@@ -55,6 +56,7 @@ interface GogEvent {
   organizer?: { email?: string; displayName?: string; self?: boolean };
   recurringEventId?: string;
   originalStartTime?: GogTime;
+  extendedProperties?: { private?: Record<string, unknown>; shared?: Record<string, unknown> };
   CalendarID?: string;
 }
 
@@ -144,6 +146,13 @@ function writeEvents(calendarId: string, events: GogEvent[]): string {
   );
 }
 
+/** The file, as though gog had saved it `minutes` ago. */
+function savedMinutesAgo(file: string, minutes: number): string {
+  const then = new Date(Date.now() - minutes * 60_000);
+  fs.utimesSync(file, then, then);
+  return file;
+}
+
 /** What `gog calendar events <id> --all-pages` prints: one calendar, no calendar on each event. */
 function writeSingleCalendar(events: GogEvent[]): string {
   return writeRaw(JSON.stringify({ events, nextPageToken: '' }));
@@ -159,8 +168,15 @@ async function call(
   return { isError: result.isError === true, text: block.text };
 }
 
+/** find_conflicts over files fetched for exactly the candidate's time, unless `from` and `to` say otherwise. */
 async function conflicts(args: Record<string, unknown>): Promise<FindConflictsResult> {
-  const outcome = await call(findConflicts, { timezone: ZONE, principal_addresses: [WORK, HOME], ...args });
+  const outcome = await call(findConflicts, {
+    timezone: ZONE,
+    principal_addresses: [WORK, HOME],
+    from: args.start,
+    to: args.end,
+    ...args,
+  });
   if (outcome.isError) throw new Error(`find_conflicts failed: ${outcome.text}`);
   return JSON.parse(outcome.text) as FindConflictsResult;
 }
@@ -181,6 +197,8 @@ async function refusal(tool: McpToolDefinition, args: Record<string, unknown>): 
     timezone: ZONE,
     principal_addresses: [WORK],
     assistant_address: ROBIN,
+    from: at('09:00'),
+    to: at('12:00'),
     start: at('10:00'),
     end: at('11:00'),
     ...args,
@@ -240,6 +258,7 @@ describe('find_conflicts', () => {
       organizer: WORK,
     } satisfies Conflict);
     expect(result.window).toEqual({ start: at('10:00'), end: at('11:00') });
+    expect(result.holds).toEqual([]);
     expect(result.events).toEqual({
       received: 3,
       candidate_copies: 1,
@@ -248,6 +267,7 @@ describe('find_conflicts', () => {
       free: 0,
       outside_window: 1,
       conflicting: 1,
+      holds: 0,
     });
   });
 
@@ -316,7 +336,108 @@ describe('find_conflicts', () => {
       free: 2,
       outside_window: 0,
       conflicting: 3,
+      holds: 0,
     });
+  });
+
+  it('lists holds the assistant placed as able to give way, earliest first, and a real event as a conflict', async () => {
+    const file = writeEvents(WORK, [
+      // A hold the assistant placed: busy, private, no guests, and its private marks name its meeting.
+      timed(at('10:00'), at('10:30'), {
+        id: 'hold',
+        summary: gogWrapped('Intro with Sam'),
+        transparency: 'opaque',
+        extendedProperties: { private: { gwsEaMeeting: 'mtg-1', gwsEaRole: 'hold', gwsEaSlot: 'slot-0123456789ab' } },
+      }),
+      // A meeting the assistant booked is a real meeting.
+      timed(at('10:30'), at('11:00'), {
+        id: 'booking',
+        organizer: { email: WORK, self: true },
+        attendees: [own(WORK), guest(ALICE)],
+        extendedProperties: { private: { gwsEaMeeting: 'mtg-2', gwsEaRole: 'booking' } },
+      }),
+      // Only both private marks make a hold: shared properties are anyone's to set.
+      timed(at('10:00'), at('10:45'), {
+        id: 'shared-marks',
+        organizer: { email: STRANGER },
+        attendees: [guest(STRANGER), own(WORK)],
+        extendedProperties: { shared: { gwsEaMeeting: 'mtg-3', gwsEaRole: 'hold' } },
+      }),
+      timed(at('10:15'), at('10:45'), { id: 'role-only', extendedProperties: { private: { gwsEaRole: 'hold' } } }),
+      // A hold outside the candidate's time is left out like any other event.
+      timed(at('11:00'), at('11:30'), {
+        id: 'later-hold',
+        extendedProperties: { private: { gwsEaMeeting: 'mtg-4', gwsEaRole: 'hold' } },
+      }),
+      // A hold that starts earlier, though it comes last in the file.
+      timed(at('09:45'), at('10:15'), {
+        id: 'earlier-hold',
+        extendedProperties: { private: { gwsEaMeeting: 'mtg-5', gwsEaRole: 'hold' } },
+      }),
+    ]);
+
+    const result = await conflicts({ files: [file], start: at('10:00'), end: at('11:00') });
+
+    expect(result.holds).toEqual([
+      {
+        meeting_id: 'mtg-5',
+        calendars: [WORK],
+        event_id: 'earlier-hold',
+        start: at('09:45'),
+        end: at('10:15'),
+        overlap_minutes: 15,
+      } satisfies HeldTime,
+      {
+        meeting_id: 'mtg-1',
+        calendars: [WORK],
+        event_id: 'hold',
+        start: at('10:00'),
+        end: at('10:30'),
+        overlap_minutes: 30,
+      } satisfies HeldTime,
+    ]);
+    expect(result.holds_not_listed).toBe(0);
+    expect(ids(result)).toEqual(['shared-marks', 'role-only', 'booking']);
+    expect(result.events).toEqual({
+      received: 6,
+      candidate_copies: 0,
+      cancelled: 0,
+      declined: 0,
+      free: 0,
+      outside_window: 1,
+      conflicting: 3,
+      holds: 2,
+    });
+  });
+
+  it('refuses a candidate outside the range the files were fetched for, saying to fetch again', async () => {
+    const file = writeEvents(WORK, []);
+    const fetched = { files: [file], from: at('10:00'), to: at('11:00') };
+
+    for (const [start, end] of [
+      [at('09:30'), at('10:30')],
+      [at('10:30'), at('11:30')],
+      [at('08:00'), at('09:00')],
+    ]) {
+      const text = await refusal(findConflicts, { ...fetched, start, end });
+      expect(text).toContain('outside the range the files were fetched for');
+      expect(text).toContain('Fetch again');
+    }
+    // A candidate that fills the fetched range is inside it.
+    expect((await conflicts({ ...fetched, start: at('10:00'), end: at('11:00') })).conflicts).toEqual([]);
+  });
+
+  it('refuses a file saved more than fifteen minutes ago, naming it, and says to fetch again', async () => {
+    const stale = savedMinutesAgo(writeEvents(WORK, []), 16);
+    const text = await refusal(findConflicts, { files: [stale] });
+    expect(text).toContain(stale);
+    expect(text).toContain('Fetch again');
+
+    const recent = savedMinutesAgo(writeEvents(WORK, []), 14);
+    expect((await conflicts({ files: [recent], start: at('10:00'), end: at('11:00') })).conflicts).toEqual([]);
+
+    // A count over history needs no fresh fetch.
+    expect((await stats({ files: [stale] })).people).toEqual([]);
   });
 
   it('counts a meeting the principal declined from one address but accepted from another', async () => {
@@ -373,11 +494,16 @@ describe('find_conflicts', () => {
     ).toEqual([['second-0130', '2026-10-25T01:30:00+00:00', 15]]);
   });
 
-  it('refuses a window that is not two times with offsets, in order', async () => {
+  it('refuses a window or a fetched range that is not two times with offsets, in order', async () => {
     const file = writeEvents(WORK, []);
     expect(await refusal(findConflicts, { files: [file], start: '2026-10-06T10:00:00' })).toContain('start');
     expect(await refusal(findConflicts, { files: [file], start: at('11:00'), end: at('10:00') })).toContain(
       'end must be after start',
+    );
+    expect(await refusal(findConflicts, { files: [file], from: undefined })).toContain('from must be');
+    expect(await refusal(findConflicts, { files: [file], to: '2026-10-06' })).toContain('to must be');
+    expect(await refusal(findConflicts, { files: [file], from: at('12:00'), to: at('09:00') })).toContain(
+      'to must be after from',
     );
   });
 });
@@ -611,7 +737,8 @@ describe('reading gog files', () => {
       expect(await refusal(tool, { files: [secret] })).toContain(secret);
       expect(await refusal(tool, { files: [link] })).toContain(link);
       expect(await refusal(tool, { files: ['../escape.json'] })).toContain('../escape.json');
-      expect(await refusal(tool, { files: [path.join(root, 'missing.json')] })).toContain('missing.json');
+      const missing = path.join(root, 'missing.json');
+      expect(await refusal(tool, { files: [missing] })).toContain(`${missing}: there is no such file`);
       expect(await refusal(tool, { files: [] })).toContain('files');
     }
   });
@@ -646,6 +773,26 @@ describe('reading gog files', () => {
         ),
         'events[0].attendees',
       ],
+      [
+        writeRaw(
+          JSON.stringify({
+            events: [
+              timed(at('10:00'), at('11:00'), {
+                extendedProperties: 'held' as unknown as GogEvent['extendedProperties'],
+              }),
+            ],
+          }),
+        ),
+        'events[0].extendedProperties must be an object',
+      ],
+      [
+        writeRaw(
+          JSON.stringify({
+            events: [timed(at('10:00'), at('11:00'), { extendedProperties: { private: { gwsEaRole: 7 } } })],
+          }),
+        ),
+        'events[0].extendedProperties.private.gwsEaRole must be text',
+      ],
     ];
 
     for (const [file, reason] of malformed) {
@@ -657,5 +804,18 @@ describe('reading gog files', () => {
     const statsRefusal = await refusal(peopleStats, { files: [firstPage] });
     expect(statsRefusal).toContain(firstPage);
     expect(statsRefusal).toContain('--all-pages');
+  });
+
+  it('reads up to 20,000 events across its files, and refuses any more', async () => {
+    const full = writeEvents(
+      WORK,
+      Array.from({ length: 20_000 }, () => timed(at('10:00'), at('10:30'))),
+    );
+    const oneMore = writeEvents(WORK, [timed(at('11:00'), at('11:30'))]);
+
+    expect((await stats({ files: [full] })).events.received).toBe(20_000);
+    expect(await refusal(peopleStats, { files: [full, oneMore] })).toBe(
+      'Error: The files hold more than 20000 events. Use a shorter window.',
+    );
   });
 });

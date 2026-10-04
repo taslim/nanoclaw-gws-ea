@@ -10,22 +10,22 @@
  * header with anything but Gmail's trace headers above it is never trusted.
  *
  * - The principal: one of their addresses as the single From mailbox, a
- *   `dkim=pass` for exactly that domain with a selector the operator pinned,
- *   `dmarc=pass` (never `bestguesspass`), no differing Sender, and no List-Id.
- *   A principal address that fails this is unauthenticated, never an ordinary
+ *   `dkim=pass` from exactly that address's domain, `dmarc=pass` (never
+ *   `bestguesspass`), no differing Sender, and no List-Id: Gmail verified
+ *   that the address's own domain sent it, whichever provider that is. A
+ *   principal address that fails this is unauthenticated, never an ordinary
  *   sender, so it can neither instruct nor be mistaken for a counterpart.
+ *   Anything the domain lets sign for it counts, a sending service included
+ *   (accepted 2026-10-03 over per-domain selector pins the operator kept).
  * - Google Calendar's notifications: the same rule for `google.com`.
  * - Anyone else: `dmarc=pass` for the From domain, or a `dkim=pass` whose
- *   domain is aligned to it. A domain with pinned selectors needs a pinned
- *   one, so a service signing for the principal's domain proves nothing.
+ *   domain is aligned to it.
  */
 import { domainOf, headerValues, parseAddressList, type MailHeader, type Mailbox } from './mime.js';
 
 export interface AuthContext {
   /** The principal's addresses, lowercased. */
   readonly principalAddresses: ReadonlySet<string>;
-  /** DKIM selectors the operator pinned, by lowercased domain. */
-  readonly pinnedSelectors: ReadonlyMap<string, ReadonlySet<string>>;
 }
 
 export type SenderVerdict =
@@ -182,36 +182,23 @@ export function authenticateSender(headers: readonly MailHeader[], context: Auth
     'dmarc',
     (result) => result.properties.get('header.from')?.toLowerCase() === domain,
   );
-  const pins = (forDomain: string) => context.pinnedSelectors.get(forDomain);
-  const pinnedDkimPass = (forDomain: string, required: boolean) =>
-    passed(results, 'dkim', (result) => {
-      if (dkimDomain(result) !== forDomain) return false;
-      const pinned = pins(forDomain);
-      if (pinned === undefined) return !required;
-      const selector = result.properties.get('header.s');
-      return selector !== undefined && pinned.has(selector);
-    });
+  const ownDkimPass = (forDomain: string) => passed(results, 'dkim', (result) => dkimDomain(result) === forDomain);
 
   if (context.principalAddresses.has(from.address)) {
     if (!soleSender) return unauthenticated('a Sender differs from From');
     if (hasListId) return unauthenticated('sent through a mailing list');
-    if (!pinnedDkimPass(domain, true)) return unauthenticated('no DKIM pass with a pinned selector');
+    if (!ownDkimPass(domain)) return unauthenticated('no DKIM pass from its own domain');
     if (!dmarcPass) return unauthenticated('no DMARC pass');
     return { kind: 'principal', address: from.address, ...named(from) };
   }
 
   if (from.address === CALENDAR_NOTIFICATION_SENDER) {
-    if (soleSender && !hasListId && pinnedDkimPass(GOOGLE_DOMAIN, false) && dmarcPass) {
+    if (soleSender && !hasListId && ownDkimPass(GOOGLE_DOMAIN) && dmarcPass) {
       return { kind: 'calendar-notification' };
     }
     return unauthenticated('a calendar notification Google did not sign');
   }
 
-  if (pins(domain) !== undefined) {
-    return pinnedDkimPass(domain, true)
-      ? { kind: 'authenticated', address: from.address, ...named(from) }
-      : unauthenticated('no DKIM pass with a pinned selector');
-  }
   const alignedDkimPass = passed(results, 'dkim', (result) => {
     const signer = dkimDomain(result);
     return signer !== undefined && signer.includes('.') && (domain === signer || domain.endsWith(`.${signer}`));

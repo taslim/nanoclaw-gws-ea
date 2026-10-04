@@ -122,7 +122,7 @@ const STOPPED_REASON =
 function stoppedSignalText(kind: PrivateValueKind, refusals: number): string {
   return (
     `The host stopped a conversation with someone other than the principal: the assistant tried ${refusals} times to send them the principal's private ${KIND_NOUNS[kind]}. ` +
-    'Every attempt was refused, so nothing private was sent, and nothing more will be sent in that conversation. Tell the principal in one plain sentence.'
+    'Every attempt was refused, so nothing private was sent, and nothing more will be sent in that conversation.'
   );
 }
 

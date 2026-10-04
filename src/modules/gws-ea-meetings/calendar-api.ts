@@ -7,10 +7,11 @@
  * cancellations. No client library: each call is one `fetch` with the token
  * in its header, so it never reaches a container or an argument list.
  *
- * Every event read asks Google for its timing, status, people and the
- * assistant's own private tags only, and every write asks for nothing back
- * but the id, so no title, description or location is ever fetched (R20).
- * Tests use a fake with the same interface.
+ * Every event read asks Google for its timing, status, people, the
+ * assistant's own private tags, and the Meet link the host asked Google to
+ * create, and every write asks for nothing back but the id, so no title,
+ * description or location is ever fetched (R20). Tests use a fake with the
+ * same interface.
  */
 import { isRecord } from '../../gws-ea/validation.js';
 import type { CalendarListEntry } from '../gws-ea-inbox/calendar-notifications.js';
@@ -31,6 +32,16 @@ export interface EventAttendee {
   readonly organizer?: boolean;
 }
 
+/**
+ * A Google Meet link on an event. Google creates one the host asks for
+ * asynchronously: pending, then success or failure.
+ */
+export interface EventConference {
+  readonly status: 'pending' | 'success' | 'failure';
+  /** The link people join by, once there is one. */
+  readonly uri?: string;
+}
+
 /** An event as the host reads it: no title, description or location. */
 export interface CalendarEvent {
   readonly id: string;
@@ -43,6 +54,8 @@ export interface CalendarEvent {
   readonly end?: EventTime;
   /** The private extended properties the assistant tagged its own events with. */
   readonly tags?: Readonly<Record<string, string>>;
+  /** Its Meet link, when it has one or Google is creating one. */
+  readonly conference?: EventConference;
 }
 
 /**
@@ -58,6 +71,10 @@ export type SendUpdates = 'all' | 'none';
 export interface EventWrite {
   readonly summary?: string;
   readonly description?: string;
+  /** Where people meet: an address, a phone number, or a link of the other side's own. */
+  readonly location?: string;
+  /** Ask Google to create a Meet link, under a request id it ignores when repeated. */
+  readonly conference?: { readonly requestId: string };
   readonly start?: string;
   readonly end?: string;
   /** The zone the event's times display in. */
@@ -110,7 +127,9 @@ export interface MeetingsCalendarApi {
 
 const CALENDAR_API = 'https://www.googleapis.com/calendar/v3';
 const EVENT_FIELDS =
-  'id,iCalUID,status,transparency,organizer(email),attendees(email,responseStatus,resource,organizer),start(dateTime,date),end(dateTime,date),extendedProperties(private)';
+  'id,iCalUID,status,transparency,organizer(email),attendees(email,responseStatus,resource,organizer),start(dateTime,date),end(dateTime,date),extendedProperties(private),conferenceData(createRequest(status(statusCode)),entryPoints(entryPointType,uri))';
+/** The conference type Google Meet is in a calendar's allowed conference types and a create request. */
+const GOOGLE_MEET = 'hangoutsMeet';
 const MAX_PAGES = 10;
 
 function optionalString(value: unknown): string | undefined {
@@ -147,6 +166,24 @@ function toTags(value: unknown): Record<string, string> | undefined {
   return Object.keys(tags).length === 0 ? undefined : tags;
 }
 
+/** An event's Meet link as Google reports it: what it is creating, or what it has. */
+function toConference(value: unknown): EventConference | undefined {
+  if (!isRecord(value)) return undefined;
+  const status =
+    isRecord(value.createRequest) && isRecord(value.createRequest.status)
+      ? optionalString(value.createRequest.status.statusCode)
+      : undefined;
+  const uri = Array.isArray(value.entryPoints)
+    ? value.entryPoints
+        .filter((entry): entry is Record<string, unknown> => isRecord(entry) && entry.entryPointType === 'video')
+        .map((entry) => optionalString(entry.uri))
+        .find((entry) => entry !== undefined)
+    : undefined;
+  if (status === 'pending' || status === 'failure') return { status };
+  if (status === 'success' || uri !== undefined) return { status: 'success', ...(uri === undefined ? {} : { uri }) };
+  return undefined;
+}
+
 function toListedEvent(value: unknown): ListedEvent {
   if (!isRecord(value)) throw new GoogleApiError(502, 'Google Calendar returned an unreadable event');
   const id = optionalString(value.id);
@@ -157,6 +194,7 @@ function toListedEvent(value: unknown): ListedEvent {
   const status = optionalString(value.status);
   const transparency = optionalString(value.transparency);
   const tags = toTags(value.extendedProperties);
+  const conference = toConference(value.conferenceData);
   return {
     ...(id === undefined ? {} : { id }),
     ...(iCalUID === undefined ? {} : { iCalUID }),
@@ -169,6 +207,7 @@ function toListedEvent(value: unknown): ListedEvent {
     ...(start === undefined ? {} : { start }),
     ...(end === undefined ? {} : { end }),
     ...(tags === undefined ? {} : { tags }),
+    ...(conference === undefined ? {} : { conference }),
   };
 }
 
@@ -190,6 +229,14 @@ function eventBody(event: EventWrite, id?: string): Record<string, unknown> {
     ...(event.status === undefined ? {} : { status: event.status }),
     ...(event.summary === undefined ? {} : { summary: event.summary }),
     ...(event.description === undefined ? {} : { description: event.description }),
+    ...(event.location === undefined ? {} : { location: event.location }),
+    ...(event.conference === undefined
+      ? {}
+      : {
+          conferenceData: {
+            createRequest: { requestId: event.conference.requestId, conferenceSolutionKey: { type: GOOGLE_MEET } },
+          },
+        }),
     ...(event.start === undefined ? {} : { start: eventTime(event.start, event.timeZone) }),
     ...(event.end === undefined ? {} : { end: eventTime(event.end, event.timeZone) }),
     ...(event.attendees === undefined ? {} : { attendees: event.attendees.map((email) => ({ email })) }),
@@ -226,13 +273,34 @@ function toCalendarEntry(value: unknown): CalendarListEntry {
   }
   const accessRole = optionalString(value.accessRole);
   const dataOwner = optionalString(value.dataOwner);
+  const allowed =
+    isRecord(value.conferenceProperties) && Array.isArray(value.conferenceProperties.allowedConferenceSolutionTypes)
+      ? value.conferenceProperties.allowedConferenceSolutionTypes.filter(
+          (type): type is string => typeof type === 'string',
+        )
+      : undefined;
   return {
     id: value.id,
     ...(accessRole === undefined ? {} : { accessRole }),
     ...(typeof value.primary === 'boolean' ? { primary: value.primary } : {}),
     ...(dataOwner === undefined ? {} : { dataOwner }),
     ...(typeof value.deleted === 'boolean' ? { deleted: value.deleted } : {}),
+    ...(allowed === undefined ? {} : { conferenceTypes: allowed }),
   };
+}
+
+/** Whether a calendar lets its events carry a Google Meet link. */
+export function allowsMeet(entry: CalendarListEntry): boolean {
+  return entry.conferenceTypes?.includes(GOOGLE_MEET) === true;
+}
+
+/** The query a write sends: its notification choice, an id-only answer, and conference support when it asks for a link. */
+function writeParams(event: EventWrite, sendUpdates: SendUpdates): URLSearchParams {
+  return new URLSearchParams({
+    sendUpdates,
+    fields: 'id',
+    ...(event.conference === undefined ? {} : { conferenceDataVersion: '1' }),
+  });
 }
 
 /** The real client, over the Calendar API. */
@@ -282,7 +350,7 @@ export function createMeetingsCalendarApi(options: GoogleClientOptions): Meeting
     },
 
     async insertEvent(calendarId, eventId, event, sendUpdates) {
-      const params = new URLSearchParams({ sendUpdates, fields: 'id' });
+      const params = writeParams(event, sendUpdates);
       try {
         await googleJson(options, `${eventUrl(calendarId)}?${params.toString()}`, {
           method: 'POST',
@@ -296,7 +364,7 @@ export function createMeetingsCalendarApi(options: GoogleClientOptions): Meeting
     },
 
     async patchEvent(calendarId, eventId, event, sendUpdates) {
-      const params = new URLSearchParams({ sendUpdates, fields: 'id' });
+      const params = writeParams(event, sendUpdates);
       await googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, {
         method: 'PATCH',
         body: eventBody(event),

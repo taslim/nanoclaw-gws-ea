@@ -22,7 +22,6 @@ import type { ModuleMigration } from '../../db/migrations/index.js';
  * - `gws_ea_inbox_sender_counts`: messages per sender per hour.
  * - `gws_ea_inbox_calendars`: the principal's calendars in the assistant's
  *   calendar list, whose notifications the host turned on.
- * - `gws_ea_inbox_dkim_selectors`: the selectors the operator pinned.
  */
 export const gwsEaInboxMigration: ModuleMigration = {
   version: 1,
@@ -122,13 +121,6 @@ export const gwsEaInboxMigration: ModuleMigration = {
       CREATE TABLE gws_ea_inbox_calendars (
         calendar_id  TEXT PRIMARY KEY,
         applied_at   TEXT NOT NULL
-      );
-
-      CREATE TABLE gws_ea_inbox_dkim_selectors (
-        domain     TEXT NOT NULL,
-        selector   TEXT NOT NULL,
-        pinned_at  TEXT NOT NULL,
-        PRIMARY KEY (domain, selector)
       );
     `);
   },

@@ -47,11 +47,10 @@ vi.mock('./calendar-api.js', async (importOriginal) => {
 
 import { teardownChannelAdapters } from '../../channels/channel-registry.js';
 import type { ResponseFrame } from '../../cli/frame.js';
-import { dispatch } from '../../cli/dispatch.js';
 import { killContainer } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
-import { getSession } from '../../db/sessions.js';
+import { getSession, updateSession } from '../../db/sessions.js';
 import { deliverSessionMessages, getDeliveryAction } from '../../delivery.js';
 import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { requestWake } from '../../request-wake.js';
@@ -76,7 +75,7 @@ import { ensureInbox, getThreadParticipants, GoogleApiError, type Inbox } from '
 import { consumeOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import { getMeeting } from './index.js';
 import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
-import { FakeGmail, header } from './testing/fake-gmail.js';
+import { FakeGmail } from './testing/fake-gmail.js';
 import {
   ask,
   contents,
@@ -172,8 +171,13 @@ interface BookedTime {
 /** external-email books the first time free_time offers, with its own tools. */
 async function bookFirstTime(session: Session, meetingId: unknown): Promise<BookedTime> {
   const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: meetingId }));
-  return data(await ask(session, 'meeting_book', { meeting_id: meetingId, slot_id: slot.slot_id }))
-    .booking as BookedTime;
+  return data(
+    await ask(session, 'meeting_book', {
+      meeting_id: meetingId,
+      slot_id: slot.slot_id,
+      invitation: { title: 'Partnership intro' },
+    }),
+  ).booking as BookedTime;
 }
 
 /** The principal copies Robin into a thread with Acme Sales; returns the thread key from main's note. */
@@ -242,11 +246,6 @@ beforeEach(async () => {
   );
   await recordExternalEmailAgentGroupId('ag-external');
   await addPrincipalAddress(PRINCIPAL);
-  const pinned = await dispatch(
-    { id: 'pin', command: 'dkim-selectors-pin', args: { domain: 'principal.example', selector: 'google' } },
-    { caller: 'host' },
-  );
-  expect(pinned.ok).toBe(true);
 
   sam = await addPerson({
     name: 'Sam Lee',
@@ -366,6 +365,28 @@ describe('arrange', () => {
     expect(message).not.toContain('Elm');
     expect(await count('gws_ea_meetings')).toBe(0);
     expect(await count('gws_ea_inbox_threads')).toBe(0);
+  });
+
+  it("carries main's wishes for the invitation in the brief, checked for private details first", async () => {
+    await addPrivateValue({ label: 'Home', kind: 'address', value: '12 Elm Road, Springfield' });
+    const message = refusal(
+      await ask(main, 'meeting_arrange', arrangeWith(sam, { invitation: { location: '12 Elm Rd Springfield' } })),
+    );
+    expect(message).toContain('address');
+    expect(message).not.toContain('Elm');
+    expect(await count('gws_ea_meetings')).toBe(0);
+
+    const answer = data(
+      await ask(
+        main,
+        'meeting_arrange',
+        arrangeWith(sam, { invitation: { video_call: true, title: 'Acme and Alex: partnership intro' } }),
+      ),
+    );
+    const [brief] = contents(await meetingSession(answer.meeting_id));
+    expect(brief.text).toContain(
+      'Invitation, as main wishes it: a Google Meet link; title "Acme and Alex: partnership intro".',
+    );
   });
 
   it('refuses a person with no record and a window that has already ended', async () => {
@@ -519,17 +540,13 @@ describe('a request replayed after a host restart', () => {
     expect(briefs(session)).toHaveLength(1);
 
     const meetingId = String(data(arranged).meeting_id);
-    await bookFirstTime(session, meetingId);
-    const booked = await ask(session, 'meeting_outcome', { meeting_id: meetingId, outcome: 'booked' }, 'req-booked');
-    await getDeliveryAction('meeting_outcome')?.(
-      { action: 'meeting_outcome', requestId: 'req-booked', meeting_id: meetingId, outcome: 'booked' },
-      session,
-    );
-    expect(responses(session, 'req-booked')).toEqual([booked]);
-    // The same outcome sent again as a new request is recorded once too.
-    expect(data(await ask(session, 'meeting_outcome', { meeting_id: meetingId, outcome: 'booked' }))).toEqual(
-      data(booked),
-    );
+    const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: meetingId }));
+    const fields = { meeting_id: meetingId, slot_id: slot.slot_id, invitation: { title: 'Partnership intro' } };
+    const booked = await ask(session, 'meeting_book', fields, 'req-book');
+    await getDeliveryAction('meeting_book')?.({ action: 'meeting_book', requestId: 'req-book', ...fields }, session);
+    expect(responses(session, 'req-book')).toEqual([booked]);
+    // The same booking sent again as a new request changes nothing, and main hears of it once.
+    data(await ask(session, 'meeting_book', fields));
     expect(meetingNotes('booked')).toHaveLength(1);
   });
 
@@ -544,7 +561,7 @@ describe('a request replayed after a host restart', () => {
         { calendar_id: PRINCIPAL, event_id: 'evt-review', ...WINDOW, purpose: 'Moving the review' },
       ],
       [
-        'meeting_ask_organizer',
+        'meeting_reschedule',
         'req-ask',
         { calendar_id: PRINCIPAL, event_id: 'evt-invite', ...WINDOW, purpose: 'Your Tuesday invitation' },
       ],
@@ -623,18 +640,13 @@ describe('outcome', () => {
     expect(meetingNotes()).toHaveLength(0);
   });
 
-  it('accepts booked only after the host’s own booking, and tells main in a note it turns into one line (R26)', async () => {
+  it('tells main the moment the host books, from the booking itself (R26, R47)', async () => {
     const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
     const session = await meetingSession(answer.meeting_id);
-
-    expect(
-      refusal(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'booked' })),
-    ).toMatch(/book/);
     expect(meetingNotes()).toHaveLength(0);
 
-    const booking = await bookFirstTime(session, answer.meeting_id);
     vi.mocked(requestWake).mockClear();
-    data(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'booked' }));
+    const booking = await bookFirstTime(session, answer.meeting_id);
 
     const stored = await meeting(answer.meeting_id);
     expect(stored.state).toBe('booked');
@@ -645,26 +657,18 @@ describe('outcome', () => {
       booking: { calendar_id: PRINCIPAL, event_id: booking.event_id, start: booking.start, end: booking.end },
     });
     expect(note.text).toContain('Sam Lee');
-    expect(note.text).toContain('one line');
     expect(note.row.trigger).toBe(1);
     expect(vi.mocked(requestWake)).toHaveBeenCalledWith(expect.objectContaining({ id: main.id }), 'inbound-message');
     // The session stays open after booking, so a later "can we move it?" lands there.
     expect((await getSession(session.id))?.status).toBe('active');
   });
 
-  it('refuses needs-room for an active or known meeting, and accepts it for a close one', async () => {
-    for (const person of [sam, olu]) {
-      const answer = data(await ask(main, 'meeting_arrange', arrangeWith(person)));
-      const session = await meetingSession(answer.meeting_id);
-      expect(
-        refusal(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'needs-room' })),
-      ).toMatch(/close/);
-    }
+  it('takes no needs-room: a meeting with nothing open asks main about time instead', async () => {
     const close = data(await ask(main, 'meeting_arrange', arrangeWith(dana)));
     const closeSession = await meetingSession(close.meeting_id);
-    data(await ask(closeSession, 'meeting_outcome', { meeting_id: close.meeting_id, outcome: 'needs-room' }));
-    expect(meetingNotes('needs-room')).toHaveLength(1);
-    expect((await meeting(close.meeting_id)).state).toBe('active');
+    expect(
+      refusal(await ask(closeSession, 'meeting_outcome', { meeting_id: close.meeting_id, outcome: 'needs-room' })),
+    ).toMatch(/outcome must be one of/);
   });
 
   it('hands a copied-in thread that is not about scheduling back to main to triage (R19)', async () => {
@@ -746,17 +750,18 @@ function principalEvent(id: string, attendee: string, startHour = 10, endHour = 
   };
 }
 
-describe('ask_organizer', () => {
-  it('addresses the organizer Google reports, for the length of their invitation', async () => {
+describe('rescheduling an invitation someone else organizes', () => {
+  it('asks the organizer Google reports, for the length of their invitation, and says so', async () => {
     calendar.put(invitation('evt-invite', OLU, 10, 11));
     const answer = data(
-      await ask(main, 'meeting_ask_organizer', {
+      await ask(main, 'meeting_reschedule', {
         calendar_id: PRINCIPAL,
         event_id: 'evt-invite',
         ...WINDOW,
         purpose: 'Your Thursday invitation',
       }),
     );
+    expect(answer.message).toMatch(/to ask its organizer about/);
     const stored = await meeting(answer.meeting_id);
     expect(stored).toMatchObject({
       kind: 'ask_organizer',
@@ -776,7 +781,7 @@ describe('ask_organizer', () => {
   it('writes to an organizer without a record, who is judged like anyone else (R16)', async () => {
     calendar.put(invitation('evt-stranger', LEE));
     const answer = data(
-      await ask(main, 'meeting_ask_organizer', {
+      await ask(main, 'meeting_reschedule', {
         calendar_id: PRINCIPAL,
         event_id: 'evt-stranger',
         ...WINDOW,
@@ -796,7 +801,7 @@ describe('ask_organizer', () => {
     calendar.put(invitation('evt-invite', OLU, 10, 11));
     calendar.put(principalEvent('evt-standup', SAM, 10, 11));
     const answer = data(
-      await ask(main, 'meeting_ask_organizer', {
+      await ask(main, 'meeting_reschedule', {
         calendar_id: PRINCIPAL,
         event_id: 'evt-invite',
         ...WINDOW,
@@ -827,11 +832,28 @@ describe('ask_organizer', () => {
     expect((await getSession(session.id))?.status).toBe('closed');
   });
 
+  it('refuses to make room with it or change its length: both are its organizer’s', async () => {
+    calendar.put(invitation('evt-invite', OLU, 10, 11));
+    const request = { calendar_id: PRINCIPAL, event_id: 'evt-invite', ...WINDOW, purpose: 'Your invitation' };
+    expect(
+      refusal(
+        await ask(main, 'meeting_reschedule', {
+          ...request,
+          making_room_for: `mtg-${'0'.repeat(8)}-0000-0000-0000-${'0'.repeat(12)}`,
+        }),
+      ),
+    ).toMatch(/never moves to make room/);
+    expect(refusal(await ask(main, 'meeting_reschedule', { ...request, length_minutes: 30 }))).toMatch(
+      /length is theirs to change/,
+    );
+    expect(await count('gws_ea_meetings')).toBe(0);
+  });
+
   it('accepts settled when the conflicting event is gone', async () => {
     calendar.put(invitation('evt-invite', OLU, 10, 11));
     calendar.put(principalEvent('evt-standup', SAM, 10, 11));
     const answer = data(
-      await ask(main, 'meeting_ask_organizer', {
+      await ask(main, 'meeting_reschedule', {
         calendar_id: PRINCIPAL,
         event_id: 'evt-invite',
         ...WINDOW,
@@ -869,27 +891,20 @@ describe('reschedule', () => {
       event_id: 'evt-review',
     });
     expect(stored.counterparts.map((c) => c.address)).toEqual([SAM]);
-  });
 
-  it('is refused for a meeting someone else organizes (R8)', async () => {
-    calendar.put(invitation('evt-theirs', OLU));
-    const message = refusal(
-      await ask(main, 'meeting_reschedule', {
-        calendar_id: PRINCIPAL,
-        event_id: 'evt-theirs',
-        ...WINDOW,
-        purpose: 'Moving it',
-      }),
-    );
-    expect(message).toMatch(/ask_organizer/);
-    expect(await count('gws_ea_meetings')).toBe(0);
+    // The event's own guests and invitation stay as they are.
+    for (const change of [{ people: [{ email: 'jane@partner.example' }] }, { invitation: { location: 'Room 4' } }]) {
+      expect(refusal(await ask(main, 'meeting_amend', { meeting_id: stored.id, ...change }))).toMatch(
+        /Only a meeting handed over with meeting_arrange takes new people or invitation fields/,
+      );
+    }
+    expect((await meeting(stored.id)).counterparts.map((c) => c.address)).toEqual([SAM]);
   });
 
   it('continues in the thread of a meeting the assistant booked, which it takes over', async () => {
     const arranged = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
     const session = await meetingSession(arranged.meeting_id);
     const booking = await bookFirstTime(session, arranged.meeting_id);
-    data(await ask(session, 'meeting_outcome', { meeting_id: arranged.meeting_id, outcome: 'booked' }));
 
     const moved = data(
       await ask(main, 'meeting_reschedule', {
@@ -915,63 +930,148 @@ describe('reschedule', () => {
 // ---------------------------------------------------------------------------
 
 describe('cancel', () => {
-  it('releases the meeting, closes its session, sends the counterparts one checked line, and leaves no deadline', async () => {
+  it('has the conversation write one closing line while times are on offer, then ends it, and later mail reaches main', async () => {
     const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
     const stored = await meeting(answer.meeting_id);
     const session = await meetingSession(answer.meeting_id);
+    const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
+    data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [slot.slot_id] }));
     await reply(session, stored.thread_key, 'Hello Sam, I am Robin, Pat Doe’s assistant. Would Tuesday at 10:00 work?');
     expect(gmail.sent).toHaveLength(1);
-    await getDb().run(
-      'UPDATE gws_ea_meetings SET nudge_at = ?, give_up_at = ? WHERE id = ?',
-      inDays(2),
-      inDays(4),
-      stored.id,
-    );
 
     const cancelled = data(await ask(main, 'meeting_cancel', { meeting_id: stored.id }));
-    expect(cancelled).toMatchObject({ state: 'cancelled', counterparts_told: true });
+    expect(cancelled.state).toBe('closing');
+    expect(String(cancelled.message)).toMatch(/tells Sam Lee \(sam@acme.example\) in one line/);
+    // Nothing is written by the host itself: external-email writes the line.
+    expect(gmail.sent).toHaveLength(1);
+    expect(calendar.live(PRINCIPAL).filter((event) => event.tags?.gwsEaRole === 'hold')).toEqual([]);
+    const closing = await meeting(stored.id);
+    expect(closing).toMatchObject({ state: 'closing', nudge_at: null });
+    expect(closing.give_up_at).not.toBeNull();
+    const [note] = contents(session).filter((c) => c.note?.type === 'gws-ea-meetings.closing');
+    expect(note.sender).toBe('system');
+    expect(note.text).toMatch(/one short, gracious line/);
+    expect((await getSession(session.id))?.status).toBe('active');
+    // A called-off meeting offers nothing more.
+    expect(refusal(await ask(session, 'meeting_free_time', { meeting_id: stored.id }))).toMatch(/called off/);
 
+    await reply(
+      session,
+      stored.thread_key,
+      'Pat no longer needs this meeting after all. Thank you, Sam, and sorry for the trouble.',
+    );
     expect(gmail.sent).toHaveLength(2);
-    const line = gmail.sent[1];
-    expect(line.threadId).toBe(gmail.sent[0].threadId);
-    expect(header(line.headers, 'To')).toBe(SAM);
-    expect(line.text.split('\n').filter((l) => l.trim() !== '').length).toBeLessThanOrEqual(2);
-
-    const after = await meeting(stored.id);
-    expect(after).toMatchObject({ state: 'cancelled', nudge_at: null, give_up_at: null });
+    expect(gmail.sent[1].threadId).toBe(gmail.sent[0].threadId);
+    expect(await meeting(stored.id)).toMatchObject({ state: 'cancelled', nudge_at: null, give_up_at: null });
     expect((await getSession(session.id))?.status).toBe('closed');
-    expect(vi.mocked(killContainer)).toHaveBeenCalledWith(session.id, expect.any(String));
     expect(await getThreadParticipants(stored.thread_key)).toMatchObject({ state: 'closed' });
     expect(
       await getDb().all('SELECT thread_id FROM gws_ea_privacy_threads WHERE thread_id = ?', stored.thread_key),
     ).toEqual([]);
-
     // A cancelled meeting takes no more outcomes.
     refusal(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'gave-up' }));
+
+    gmail.receive({
+      threadId: gmail.sent[0].threadId,
+      from: `Sam Lee <${SAM}>`,
+      to: [ROBIN],
+      subject: 'Re: Partnership intro',
+      body: 'No problem at all. Another time next month?',
+    });
+    await inbox.tick();
+    expect(contents(main).some((c) => c.note?.type === 'gws-ea-inbox.inbound' && c.text?.includes(SAM))).toBe(true);
   });
 
-  it('checks the line like every send, so a line carrying a private detail is not sent', async () => {
-    await addPrivateValue({ label: 'Full name', kind: 'other', value: 'Pat Doe' });
+  it('writes the closing line’s note once when called off again after a hold could not be released', async () => {
     const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
     const stored = await meeting(answer.meeting_id);
     const session = await meetingSession(answer.meeting_id);
-    await reply(session, stored.thread_key, 'Hello Sam, I am Robin. Would Tuesday at 10:00 work?');
-    expect(gmail.sent).toHaveLength(1);
+    const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
+    data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [slot.slot_id] }));
+    await reply(session, stored.thread_key, 'Hello Sam, I am Robin, Pat Doe’s assistant. Would Tuesday at 10:00 work?');
+    const closingNotes = () => contents(session).filter((c) => c.note?.type === 'gws-ea-meetings.closing');
 
-    expect(data(await ask(main, 'meeting_cancel', { meeting_id: stored.id }))).toMatchObject({
-      state: 'cancelled',
-      counterparts_told: false,
+    calendar.failNext({ op: 'delete', error: new GoogleApiError(503, 'Google refused: backend error') });
+    expect(refusal(await ask(main, 'meeting_cancel', { meeting_id: stored.id }))).toMatch(/could not be released/);
+    expect((await meeting(stored.id)).state).toBe('closing');
+    expect(closingNotes()).toEqual([]);
+
+    expect(data(await ask(main, 'meeting_cancel', { meeting_id: stored.id })).state).toBe('closing');
+    expect(data(await ask(main, 'meeting_cancel', { meeting_id: stored.id })).state).toBe('closing');
+    const [note, ...more] = closingNotes();
+    expect(more).toEqual([]);
+    expect(note.text).toMatch(/one short, gracious line/);
+    expect(calendar.live(PRINCIPAL).filter((event) => event.tags?.gwsEaRole === 'hold')).toEqual([]);
+  });
+
+  it('ends a called-off meeting at once when called off again after its conversation is gone', async () => {
+    const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
+    const stored = await meeting(answer.meeting_id);
+    const session = await meetingSession(answer.meeting_id);
+    await reply(session, stored.thread_key, 'Hello Sam, I am Robin, Pat Doe’s assistant. Would Tuesday at 10:00 work?');
+    expect(data(await ask(main, 'meeting_cancel', { meeting_id: stored.id })).state).toBe('closing');
+
+    await updateSession(session.id, { status: 'closed' });
+    expect(data(await ask(main, 'meeting_cancel', { meeting_id: stored.id })).state).toBe('cancelled');
+    expect((await meeting(stored.id)).state).toBe('cancelled');
+  });
+
+  it("deletes a booked meeting's event with Google's notice, and passes main's note on in the closing line", async () => {
+    const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
+    const stored = await meeting(answer.meeting_id);
+    const session = await meetingSession(answer.meeting_id);
+    const booking = await bookFirstTime(session, stored.id);
+
+    const cancelled = data(
+      await ask(main, 'meeting_cancel', {
+        meeting_id: stored.id,
+        note: 'Pat has to travel that week; she will be in touch.',
+      }),
+    );
+    expect(cancelled.state).toBe('closing');
+    expect(calendar.writes.at(-1)).toMatchObject({
+      op: 'delete',
+      calendarId: booking.calendar_id,
+      eventId: booking.event_id,
+      sendUpdates: 'all',
     });
-    expect(gmail.sent).toHaveLength(1);
+    expect(calendar.event(booking.calendar_id, booking.event_id)?.status).toBe('cancelled');
+    const [note] = contents(session).filter((c) => c.note?.type === 'gws-ea-meetings.closing');
+    expect(note.text).toContain('Google sent them its cancellation');
+    expect(note.text).toContain("main's words: Pat has to travel that week; she will be in touch.");
+  });
+
+  it("ends a booked meeting at once with no note: Google's cancellation is the one message", async () => {
+    const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
+    const stored = await meeting(answer.meeting_id);
+    const session = await meetingSession(answer.meeting_id);
+    const booking = await bookFirstTime(session, stored.id);
+
+    expect(data(await ask(main, 'meeting_cancel', { meeting_id: stored.id })).state).toBe('cancelled');
+    expect(calendar.event(booking.calendar_id, booking.event_id)?.status).toBe('cancelled');
+    expect(gmail.sent).toHaveLength(0);
     expect((await getSession(session.id))?.status).toBe('closed');
+    expect(vi.mocked(killContainer)).toHaveBeenCalledWith(session.id, expect.any(String));
   });
 
   it('sends no line to people the assistant has not written to yet', async () => {
     const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
-    expect(data(await ask(main, 'meeting_cancel', { meeting_id: answer.meeting_id }))).toMatchObject({
-      counterparts_told: false,
-    });
+    expect(data(await ask(main, 'meeting_cancel', { meeting_id: answer.meeting_id })).state).toBe('cancelled');
     expect(gmail.sent).toHaveLength(0);
+  });
+
+  it('refuses a note carrying a private detail, before anything changes', async () => {
+    await addPrivateValue({ label: 'Home', kind: 'address', value: '12 Elm Road, Springfield' });
+    const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
+    expect(
+      refusal(
+        await ask(main, 'meeting_cancel', {
+          meeting_id: answer.meeting_id,
+          note: 'Pat is at 12 Elm Road, Springfield.',
+        }),
+      ),
+    ).toMatch(/not passed on/);
+    expect((await meeting(answer.meeting_id)).state).toBe('active');
   });
 });
 
@@ -994,7 +1094,7 @@ describe('cancel for an event the principal organizes (R8)', () => {
   it('refuses an event someone else organizes: ask its organizer instead', async () => {
     calendar.put(invitation('evt-theirs', OLU));
     const message = refusal(await ask(main, 'meeting_cancel', { calendar_id: PRINCIPAL, event_id: 'evt-theirs' }));
-    expect(message).toMatch(/ask_organizer/);
+    expect(message).toMatch(/have meeting_reschedule ask its organizer/);
     expect(calendar.writes).toEqual([]);
     expect(calendar.event(PRINCIPAL, 'evt-theirs')?.status).toBe('confirmed');
   });
@@ -1028,7 +1128,6 @@ describe('cancel for an event the principal organizes (R8)', () => {
     const session = await meetingSession(arranged.meeting_id);
     await reply(session, stored.thread_key, 'Hello Sam, I am Robin. Would Tuesday at 10:00 work?');
     const booking = await bookFirstTime(session, stored.id);
-    data(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'booked' }));
 
     const answer = data(await ask(main, 'meeting_cancel', { calendar_id: PRINCIPAL, event_id: booking.event_id }));
     expect(answer).toMatchObject({ state: 'cancelled', meeting_id: stored.id });
@@ -1036,7 +1135,8 @@ describe('cancel for an event the principal organizes (R8)', () => {
     expect((await meeting(stored.id)).state).toBe('cancelled');
     expect((await getSession(session.id))?.status).toBe('closed');
     expect(await getThreadParticipants(stored.thread_key)).toMatchObject({ state: 'closed' });
-    expect(gmail.sent).toHaveLength(2);
+    // Booked, so nobody was waiting on an offer: Google's notice is the one message.
+    expect(gmail.sent).toHaveLength(1);
   });
 });
 

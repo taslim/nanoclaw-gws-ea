@@ -31,6 +31,7 @@ const BUILT_IN = [
   'time',
   'schedule-stats',
   'calendar-facts',
+  'request-status',
 ];
 
 // A key a module adds for one product agent: never part of `all`.

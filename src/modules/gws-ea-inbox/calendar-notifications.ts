@@ -41,6 +41,8 @@ export interface CalendarListEntry {
   readonly dataOwner?: string;
   readonly deleted?: boolean;
   readonly notificationSettings?: { readonly notifications?: readonly CalendarNotification[] };
+  /** The conference types its events may carry, such as `hangoutsMeet`, when Google reports them. */
+  readonly conferenceTypes?: readonly string[];
 }
 
 export interface CalendarListApi {

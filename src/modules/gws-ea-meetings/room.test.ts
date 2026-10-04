@@ -49,6 +49,7 @@ import { getDeliveryAction } from '../../delivery.js';
 import { requestWake } from '../../request-wake.js';
 import type { Session } from '../../types.js';
 import type { Person } from '../gws-ea-people/db.js';
+import { getRoomMadeBy } from './db.js';
 import { getBooking, type Meeting } from './index.js';
 import type { StoredEvent } from './testing/fake-calendar.js';
 import {
@@ -72,6 +73,7 @@ const NOW = '2026-10-05T07:00:00.000Z';
 const WEEK = { window_start: '2026-10-06T00:00:00+01:00', window_end: '2026-10-10T00:00:00+01:00' };
 
 const OUTCOME = 'gws-ea-meetings.outcome';
+const ASK = 'gws-ea-meetings.ask';
 
 let scheduling: Scheduling;
 
@@ -111,8 +113,13 @@ async function bookedAt(
   );
   const session = await meetingSession(answer.meeting_id);
   const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: answer.meeting_id, date, time }));
-  data(await ask(session, 'meeting_book', { meeting_id: answer.meeting_id, slot_id: slot.slot_id }));
-  data(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'booked' }));
+  data(
+    await ask(session, 'meeting_book', {
+      meeting_id: answer.meeting_id,
+      slot_id: slot.slot_id,
+      invitation: { title: purpose },
+    }),
+  );
   const booking = await getBooking(String(answer.meeting_id));
   if (!booking) throw new Error('not booked');
   expect(booking.start_at.slice(0, 16)).toBe(new Date(`${date}T${time}:00+01:00`).toISOString().slice(0, 16));
@@ -137,6 +144,15 @@ function own(id: string, start: string, end: string, attendees: readonly string[
   };
 }
 
+/** external-email finds nothing open and asks main about when to meet; main's note about it. */
+async function askedAboutTime(session: Session, meetingId: unknown, requestId?: string) {
+  const offered = data(await ask(session, 'meeting_free_time', { meeting_id: meetingId }));
+  expect(offered.slots).toEqual([]);
+  expect(String(offered.message)).toMatch(/meeting_ask_main/);
+  data(await ask(session, 'meeting_ask_main', { meeting_id: meetingId, about: 'time' }, requestId));
+  return notes(scheduling.main, ASK).filter((c) => c.note?.meeting_id === meetingId);
+}
+
 /** Dana, who is close, needs half an hour on Thursday morning, London. */
 async function danaNeedsRoom(windowEnd = '2026-10-08T12:00:00+01:00', lengthMinutes = 30) {
   const answer = data(
@@ -150,12 +166,9 @@ async function danaNeedsRoom(windowEnd = '2026-10-08T12:00:00+01:00', lengthMinu
     }),
   );
   const session = await meetingSession(answer.meeting_id);
-  const offered = data(await ask(session, 'meeting_free_time', { meeting_id: answer.meeting_id }));
-  expect(offered.slots).toEqual([]);
-  expect(String(offered.message)).toMatch(/needs-room/);
-  data(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'needs-room' }));
-  const [note, ...more] = notes(scheduling.main, OUTCOME).filter((c) => c.note?.outcome === 'needs-room');
+  const [note, ...more] = await askedAboutTime(session, answer.meeting_id);
   expect(more).toEqual([]);
+  expect(note.text).toContain('Nothing in its window is open now.');
   return { stored: await meeting(answer.meeting_id), session, note };
 }
 
@@ -229,11 +242,14 @@ describe('AE3: making room for someone close', () => {
       'inbound-message',
     );
 
-    data(await ask(patSession, 'meeting_outcome', { meeting_id: moving.meeting_id, outcome: 'booked' }));
-
     // Dana agrees: the booking note names the meeting that moved for her.
-    data(await ask(dana.session, 'meeting_book', { meeting_id: dana.stored.id, slot_id: slotId }));
-    data(await ask(dana.session, 'meeting_outcome', { meeting_id: dana.stored.id, outcome: 'booked' }));
+    data(
+      await ask(dana.session, 'meeting_book', {
+        meeting_id: dana.stored.id,
+        slot_id: slotId,
+        invitation: { title: 'Catch-up with Dana' },
+      }),
+    );
     const danaEvent = scheduling.calendar
       .live(PRINCIPAL)
       .find((event) => event.tags?.gwsEaRole === 'booking' && event.tags.gwsEaMeeting === dana.stored.id);
@@ -258,8 +274,7 @@ describe('making room', () => {
 
     const dana = await danaNeedsRoom();
     expect(dana.note.note?.candidates).toEqual([]);
-    expect(dana.note.text).toMatch(/move nothing/i);
-    expect(dana.note.text).toMatch(/one recommendation/);
+    expect(dana.note.text).toMatch(/No meeting the assistant arranged with someone who matters less can move/);
 
     const message = refusal(
       await ask(scheduling.main, 'meeting_reschedule', {
@@ -305,7 +320,7 @@ describe('making room', () => {
     expect((await meeting(withLee.stored.id)).state).toBe('booked');
   });
 
-  it('lists the meetings that could move again when an amended meeting still needs room, once per report', async () => {
+  it('lists the meetings that could move again when an amended meeting still needs room, once per question', async () => {
     const { people } = scheduling;
     const coffee = await bookedAt([people.pat], '2026-10-08', '10:00', 30, 'Coffee');
     const tea = await bookedAt([people.pat], '2026-10-09', '10:00', 30, 'Tea');
@@ -317,30 +332,85 @@ describe('making room', () => {
     const dana = await danaNeedsRoom();
     expect((dana.note.note?.candidates as Candidate[]).map((c) => c.meeting_id)).toEqual([coffee.stored.id]);
 
-    // main moves the meeting to Friday morning, where nothing is open either: it still needs room.
+    // main answers with Friday morning, where nothing is open either: external-email asks again.
     data(
       await ask(scheduling.main, 'meeting_amend', {
         meeting_id: dana.stored.id,
         window_start: '2026-10-09T09:00:00+01:00',
         window_end: '2026-10-09T12:00:00+01:00',
+        answer: 'Friday morning instead.',
       }),
     );
-    expect(data(await ask(dana.session, 'meeting_free_time', { meeting_id: dana.stored.id })).slots).toEqual([]);
-    const report = { meeting_id: dana.stored.id, outcome: 'needs-room' };
-    data(await ask(dana.session, 'meeting_outcome', report, 'req-needs-room-again'));
-
-    const needsRoom = () => notes(scheduling.main, OUTCOME).filter((c) => c.note?.outcome === 'needs-room');
-    expect(needsRoom()).toHaveLength(2);
+    const asked = await askedAboutTime(dana.session, dana.stored.id, 'req-ask-again');
+    expect(asked).toHaveLength(2);
     // main hears of it again, with what could move in the new window.
-    expect((needsRoom()[1].note?.candidates as Candidate[]).map((c) => c.meeting_id)).toEqual([tea.stored.id]);
+    expect((asked[1].note?.candidates as Candidate[]).map((c) => c.meeting_id)).toEqual([tea.stored.id]);
 
-    // The host stopped after the note but before it recorded the answer: the replay writes no third note.
-    await getDb().run('DELETE FROM gws_ea_meeting_requests WHERE request_id = ?', 'req-needs-room-again');
-    await getDeliveryAction('meeting_outcome')?.(
-      { action: 'meeting_outcome', requestId: 'req-needs-room-again', ...report },
+    // The host stopped after the note but before it recorded the question or its answer:
+    // the replay records the question and writes no third note.
+    await getDb().run('DELETE FROM gws_ea_meeting_requests WHERE request_id = ?', 'req-ask-again');
+    await getDb().run(
+      'UPDATE gws_ea_meetings SET ask_about = NULL, asked_at = NULL, nudge_at = NULL, give_up_at = NULL WHERE id = ?',
+      dana.stored.id,
+    );
+    await getDeliveryAction('meeting_ask_main')?.(
+      { action: 'meeting_ask_main', requestId: 'req-ask-again', meeting_id: dana.stored.id, about: 'time' },
       dana.session,
     );
-    expect(needsRoom()).toHaveLength(2);
-    expect((await meeting(dana.stored.id)).state).toBe('active');
+    expect(notes(scheduling.main, ASK).filter((c) => c.note?.meeting_id === dana.stored.id)).toHaveLength(2);
+    expect(await meeting(dana.stored.id)).toMatchObject({ state: 'active', ask_about: 'time' });
+  });
+
+  it('makes room for a meeting whose question main has already answered', async () => {
+    const { people } = scheduling;
+    const coffee = await bookedAt([people.pat], '2026-10-08', '10:00', 30, 'Coffee');
+    scheduling.calendar.put(own('evt-early', '2026-10-08T08:00:00Z', '2026-10-08T09:00:00Z'));
+    scheduling.calendar.put(own('evt-late', '2026-10-08T09:30:00Z', '2026-10-08T11:00:00Z'));
+    const dana = await danaNeedsRoom();
+    data(
+      await ask(scheduling.main, 'meeting_amend', { meeting_id: dana.stored.id, answer: 'Making room on Thursday.' }),
+    );
+    expect((await meeting(dana.stored.id)).ask_about).toBeNull();
+
+    const moving = data(
+      await ask(scheduling.main, 'meeting_reschedule', {
+        calendar_id: PRINCIPAL,
+        event_id: coffee.eventId,
+        window_start: '2026-10-08T00:00:00+01:00',
+        window_end: '2026-10-10T00:00:00+01:00',
+        purpose: 'Moving our coffee',
+        making_room_for: dana.stored.id,
+      }),
+    );
+    expect(await getRoomMadeBy(String(moving.meeting_id))).toMatchObject({
+      for_meeting_id: dana.stored.id,
+      moved_meeting_id: coffee.stored.id,
+      state: 'reserved',
+    });
+  });
+
+  it('makes room only for a meeting with someone inner circle or close', async () => {
+    const { people } = scheduling;
+    const tea = await bookedAt([people.pat], '2026-10-09', '10:00', 30, 'Tea');
+    const withAcme = data(
+      await ask(scheduling.main, 'meeting_arrange', {
+        people: [{ person_id: people.acme.id }],
+        calendar_id: PRINCIPAL,
+        length_minutes: 30,
+        ...WEEK,
+        purpose: 'Intro',
+      }),
+    );
+    expect(
+      refusal(
+        await ask(scheduling.main, 'meeting_reschedule', {
+          calendar_id: PRINCIPAL,
+          event_id: tea.eventId,
+          ...WEEK,
+          purpose: 'Making room',
+          making_room_for: withAcme.meeting_id,
+        }),
+      ),
+    ).toMatch(/inner circle or close/);
   });
 });

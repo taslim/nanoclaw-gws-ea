@@ -1,28 +1,119 @@
-import { describe, expect, it } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 import { scheduleStats, type ScheduleStatsResult } from './schedule-stats.js';
 
 const ZONE = 'Africa/Lagos';
 const PRINCIPAL = 'principal@example.test';
+const HOME = 'principal.home@gmail.com';
 const COLLEAGUE = 'colleague@example.test';
+const ROOM = 'c_1882@resource.calendar.google.com';
 /** Mon 10 Aug 2026 to Sun 4 Oct 2026: eight of every weekday. */
 const WINDOW = { from: '2026-08-10', to: '2026-10-04' };
 
-interface EventArg {
-  start: string;
-  end: string;
-  attendee_count: number;
-  organizer?: string;
+interface GogTime {
+  date?: string;
+  dateTime?: string;
 }
+
+interface GogParty {
+  email: string;
+  self?: boolean;
+  organizer?: boolean;
+  resource?: boolean;
+  responseStatus: string;
+}
+
+interface GogEvent {
+  id: string;
+  iCalUID: string;
+  status: string;
+  start: GogTime;
+  end: GogTime;
+  organizer?: { email: string; self?: boolean };
+  attendees?: GogParty[];
+  attendeesOmitted?: boolean;
+}
+
+let root: string;
+let counter = 0;
+let fileCounter = 0;
+
+beforeAll(() => {
+  // The temp directory is one of the two places schedule_stats reads from.
+  root = fs.mkdtempSync(path.join(os.tmpdir(), 'schedule-stats-'));
+});
+
+afterAll(() => {
+  fs.rmSync(root, { recursive: true, force: true });
+});
 
 function addDays(date: string, days: number): string {
   const [year, month, day] = date.split('-').map(Number);
   return new Date(Date.UTC(year, month - 1, day + days)).toISOString().slice(0, 10);
 }
 
+/**
+ * A timed event as gog prints it, with `people` invited in all: the
+ * principal's own entry, the organizer's, and guests. An event nobody is
+ * invited to has no attendees, the way Google lists a block.
+ */
+function timed(start: string, end: string, people: number, organizer = COLLEAGUE): GogEvent {
+  counter++;
+  const byPrincipal = organizer === PRINCIPAL;
+  const invited: GogParty[] = [
+    { email: PRINCIPAL, self: true, responseStatus: 'accepted' },
+    ...(byPrincipal ? [] : [{ email: organizer, organizer: true, responseStatus: 'accepted' }]),
+    ...Array.from({ length: people }, (_, index) => ({
+      email: `guest${index}@example.test`,
+      responseStatus: 'accepted',
+    })),
+  ];
+  return {
+    id: `event${counter}`,
+    iCalUID: `event${counter}@google.com`,
+    status: 'confirmed',
+    start: { dateTime: start },
+    end: { dateTime: end },
+    organizer: byPrincipal ? { email: PRINCIPAL, self: true } : { email: organizer },
+    ...(people === 0 ? {} : { attendees: invited.slice(0, people) }),
+  };
+}
+
 /** An event on `date` in Lagos (UTC+01:00 all year). */
-function event(date: string, start: string, end: string, attendees: number, organizer = COLLEAGUE): EventArg {
-  return { start: `${date}T${start}:00+01:00`, end: `${date}T${end}:00+01:00`, attendee_count: attendees, organizer };
+function event(date: string, start: string, end: string, people: number, organizer = COLLEAGUE): GogEvent {
+  return timed(`${date}T${start}:00+01:00`, `${date}T${end}:00+01:00`, people, organizer);
+}
+
+function allDay(first: string, next: string, people: number): GogEvent {
+  const days = timed(`${first}T00:00:00+01:00`, `${next}T00:00:00+01:00`, people);
+  return { ...days, start: { date: first }, end: { date: next } };
+}
+
+/** The event with the principal's answer on it changed. */
+function answered(gogEvent: GogEvent, response: string): GogEvent {
+  return {
+    ...gogEvent,
+    attendees: gogEvent.attendees?.map((party) => (party.self ? { ...party, responseStatus: response } : party)),
+  };
+}
+
+function writeRaw(text: string): string {
+  const file = path.join(root, `file${++fileCounter}.json`);
+  fs.writeFileSync(file, text);
+  return file;
+}
+
+/** What `gog calendar events --calendars <id> --all-pages` saves. */
+function writeEvents(events: GogEvent[], calendarId = PRINCIPAL): string {
+  return writeRaw(
+    JSON.stringify({
+      events: events.map((gogEvent) => ({ ...gogEvent, CalendarID: calendarId })),
+      nextPageTokens: [],
+    }),
+  );
 }
 
 /**
@@ -30,8 +121,8 @@ function event(date: string, start: string, end: string, attendees: number, orga
  * early 07:00 start; Wednesdays have meetings in seven of the eight weeks;
  * Saturdays hold only a block with no guests; Sundays are empty.
  */
-function eightWeeks(): EventArg[] {
-  const events: EventArg[] = [];
+function eightWeeks(): GogEvent[] {
+  const events: GogEvent[] = [];
   for (let week = 0; week < 8; week++) {
     const day = (weekday: number) => addDays(WINDOW.from, week * 7 + weekday);
     events.push(
@@ -60,14 +151,15 @@ async function call(args: Record<string, unknown>): Promise<{ isError: boolean; 
   return { isError: result.isError === true, text: block.text };
 }
 
-async function stats(args: Record<string, unknown>): Promise<ScheduleStatsResult> {
-  const outcome = await call({ timezone: ZONE, ...WINDOW, ...args });
+/** schedule_stats over one saved file of `events`, unless `args` names other files. */
+async function stats(events: GogEvent[], args: Record<string, unknown> = {}): Promise<ScheduleStatsResult> {
+  const outcome = await call({ timezone: ZONE, ...WINDOW, files: [writeEvents(events)], ...args });
   if (outcome.isError) throw new Error(`schedule_stats failed: ${outcome.text}`);
   return JSON.parse(outcome.text) as ScheduleStatsResult;
 }
 
 async function refusal(args: Record<string, unknown>): Promise<string> {
-  const outcome = await call({ timezone: ZONE, ...WINDOW, events: [], ...args });
+  const outcome = await call({ timezone: ZONE, ...WINDOW, files: [writeEvents([])], ...args });
   expect(outcome.isError).toBe(true);
   return outcome.text;
 }
@@ -80,9 +172,21 @@ const NO_MEETINGS = {
   latest_end: null,
 };
 
-describe('schedule_stats over eight weeks', () => {
+const NOTHING_SET_ASIDE = {
+  duplicate_copies: 0,
+  cancelled: 0,
+  declined: 0,
+  solo_blocks: 0,
+  all_day: 0,
+  zero_length: 0,
+  crosses_midnight: 0,
+  attendees_omitted: 0,
+  outside_window: 0,
+};
+
+describe('schedule_stats over eight weeks of saved gog output', () => {
   it('returns the usual start and end of the working day for each weekday', async () => {
-    const result = await stats({ events: eightWeeks() });
+    const result = await stats(eightWeeks());
     expect(result.window).toEqual({ ...WINDOW, days: 56 });
     expect(result.working_hours).toEqual({
       mon: {
@@ -131,14 +235,18 @@ describe('schedule_stats over eight weeks', () => {
   });
 
   it('returns the most common meeting lengths, overall, by size, and for meetings the principal organized', async () => {
-    const result = await stats({ events: eightWeeks(), principal_addresses: ['Principal@Example.TEST'] });
+    // The principal set this one up from their home address: Google does not mark it as their own.
+    const fromHome = event(addDays(WINDOW.from, 2), '13:00', '13:45', 4, HOME);
+    const result = await stats([...eightWeeks(), fromHome], {
+      principal_addresses: ['Principal@Example.TEST', 'Principal.Home@Gmail.COM'],
+    });
     expect(result.meeting_lengths).toEqual({
       all: {
-        count: 95,
+        count: 96,
         most_common: [
           { minutes: 30, count: 49 },
           { minutes: 60, count: 31 },
-          { minutes: 45, count: 8 },
+          { minutes: 45, count: 9 },
         ],
       },
       one_on_one: {
@@ -149,24 +257,25 @@ describe('schedule_stats over eight weeks', () => {
         ],
       },
       group: {
-        count: 39,
+        count: 40,
         most_common: [
           { minutes: 60, count: 31 },
-          { minutes: 45, count: 8 },
+          { minutes: 45, count: 9 },
         ],
       },
       organized_by_principal: {
-        count: 48,
+        count: 49,
         most_common: [
           { minutes: 30, count: 41 },
           { minutes: 25, count: 7 },
+          { minutes: 45, count: 1 },
         ],
       },
     });
   });
 
   it('returns the usual gaps between meetings, setting aside free time of more than an hour', async () => {
-    const result = await stats({ events: eightWeeks() });
+    const result = await stats(eightWeeks());
     expect(result.gaps).toEqual({
       count: 23,
       back_to_back: 8,
@@ -181,42 +290,50 @@ describe('schedule_stats over eight weeks', () => {
   });
 
   it('counts every event in exactly one group', async () => {
-    const result = await stats({ events: eightWeeks() });
-    expect(result.events).toEqual({
-      received: 103,
-      meetings: 95,
-      solo_blocks: 8,
-      all_day: 0,
-      zero_length: 0,
-      crosses_midnight: 0,
-      outside_window: 0,
-    });
+    const result = await stats(eightWeeks());
+    expect(result.events).toEqual({ ...NOTHING_SET_ASIDE, received: 103, meetings: 95, solo_blocks: 8 });
     expect(result.notes).toEqual([]);
   });
 
   it('gives the same answer whatever order the events arrive in', async () => {
-    const forward = await stats({ events: eightWeeks() });
-    expect(await stats({ events: eightWeeks().reverse() })).toEqual(forward);
+    const forward = await stats(eightWeeks());
+    expect(await stats(eightWeeks().reverse())).toEqual(forward);
   });
 
   it('reports no organizer split when the principal addresses are not given', async () => {
-    const result = await stats({ events: eightWeeks() });
+    const result = await stats(eightWeeks());
     expect(result.meeting_lengths.organized_by_principal).toBeNull();
+  });
+
+  it('sizes a meeting by its people: the principal counts once, however many of their addresses are invited', async () => {
+    const date = addDays(WINDOW.from, 2);
+    // Set up from home with the work address invited: with one guest it is a one-on-one, with none a block.
+    const withGuest = event(date, '13:00', '13:30', 3, HOME);
+    const block = event(date, '15:00', '16:00', 2, HOME);
+    const result = await stats([withGuest, block], { principal_addresses: [PRINCIPAL, HOME] });
+    expect(result.events).toMatchObject({ meetings: 1, solo_blocks: 1 });
+    expect(result.meeting_lengths.one_on_one).toEqual({ count: 1, most_common: [{ minutes: 30, count: 1 }] });
+  });
+
+  it('counts a file saved a while ago, since history needs no fresh fetch', async () => {
+    // Older than a conflict check accepts.
+    const file = writeEvents(eightWeeks());
+    const then = new Date(Date.now() - 16 * 60_000);
+    fs.utimesSync(file, then, then);
+    expect((await stats([], { files: [file] })).events.meetings).toBe(95);
   });
 });
 
 describe('schedule_stats reads times on the principal clocks', () => {
   it('keeps a 9am meeting at 09:00 across a clock change, whatever offset the event carries', async () => {
     // New York leaves daylight time on Sun 1 Nov 2026.
-    const result = await stats({
-      timezone: 'America/New_York',
-      from: '2026-10-26',
-      to: '2026-11-08',
-      events: [
-        { start: '2026-10-26T09:00:00-04:00', end: '2026-10-26T09:30:00-04:00', attendee_count: 2 },
-        { start: '2026-11-02T14:00:00Z', end: '2026-11-02T14:30:00Z', attendee_count: 2 },
+    const result = await stats(
+      [
+        timed('2026-10-26T09:00:00-04:00', '2026-10-26T09:30:00-04:00', 2),
+        timed('2026-11-02T14:00:00Z', '2026-11-02T14:30:00Z', 2),
       ],
-    });
+      { timezone: 'America/New_York', from: '2026-10-26', to: '2026-11-08' },
+    );
     expect(result.working_hours.mon).toEqual({
       days_in_window: 2,
       days_with_meetings: 2,
@@ -230,23 +347,19 @@ describe('schedule_stats reads times on the principal clocks', () => {
 
   it('files an event under its local date, not its UTC date', async () => {
     // 23:30 UTC on Sunday 4 October is 00:30 on Monday 5 October in Lagos, after the window.
-    const result = await stats({
-      events: [{ start: '2026-10-04T23:30:00Z', end: '2026-10-05T00:00:00Z', attendee_count: 2 }],
-    });
+    const result = await stats([timed('2026-10-04T23:30:00Z', '2026-10-05T00:00:00Z', 2)]);
     expect(result.events.outside_window).toBe(1);
     expect(result.events.meetings).toBe(0);
   });
 
   it('takes the earlier middle start and the later middle end when the days split evenly', async () => {
     const mondays = [0, 7, 14, 21].map((offset) => addDays(WINDOW.from, offset));
-    const result = await stats({
-      events: [
-        event(mondays[0], '08:00', '15:00', 2),
-        event(mondays[1], '09:00', '16:00', 2),
-        event(mondays[2], '10:00', '17:00', 2),
-        event(mondays[3], '11:00', '18:00', 2),
-      ],
-    });
+    const result = await stats([
+      event(mondays[0], '08:00', '15:00', 2),
+      event(mondays[1], '09:00', '16:00', 2),
+      event(mondays[2], '10:00', '17:00', 2),
+      event(mondays[3], '11:00', '18:00', 2),
+    ]);
     expect(result.working_hours.mon.usual_start).toBe('09:00');
     expect(result.working_hours.mon.usual_end).toBe('17:00');
   });
@@ -254,7 +367,7 @@ describe('schedule_stats reads times on the principal clocks', () => {
 
 describe('schedule_stats sets aside what is not a meeting', () => {
   it('answers empty input with counts of zero and no values', async () => {
-    const result = await stats({ events: [] });
+    const result = await stats([]);
     expect(result.events.received).toBe(0);
     expect(result.working_hours.mon).toEqual({ days_in_window: 8, ...NO_MEETINGS });
     expect(result.meeting_lengths.all).toEqual({ count: 0, most_common: [] });
@@ -272,60 +385,103 @@ describe('schedule_stats sets aside what is not a meeting', () => {
   });
 
   it('counts all-day events without using them', async () => {
-    const result = await stats({
-      events: [
-        { start: '2026-08-10', end: '2026-08-11', attendee_count: 0 },
-        { start: '2026-08-11', end: '2026-08-14', attendee_count: 12, organizer: COLLEAGUE },
-        event('2026-08-10', '11:00', '11:30', 2),
-      ],
-    });
+    const result = await stats([
+      allDay('2026-08-10', '2026-08-11', 0),
+      allDay('2026-08-11', '2026-08-14', 12),
+      event('2026-08-10', '11:00', '11:30', 2),
+    ]);
     expect(result.events).toEqual(expect.objectContaining({ received: 3, all_day: 2, meetings: 1 }));
     expect(result.working_hours.mon.usual_start).toBe('11:00');
     expect(result.working_hours.tue.days_with_meetings).toBe(0);
   });
 
   it('counts blocks with no other attendee, zero-length events, and events crossing midnight without using them', async () => {
-    const result = await stats({
-      events: [
-        event('2026-08-10', '07:00', '08:00', 0),
-        event('2026-08-10', '06:00', '06:30', 1),
-        event('2026-08-10', '12:00', '12:00', 3),
-        { start: '2026-08-10T23:00:00+01:00', end: '2026-08-11T00:30:00+01:00', attendee_count: 2 },
-        event('2026-08-10', '10:00', '11:00', 2),
-      ],
-    });
+    const result = await stats([
+      event('2026-08-10', '07:00', '08:00', 0),
+      event('2026-08-10', '06:00', '06:30', 1),
+      event('2026-08-10', '12:00', '12:00', 3),
+      timed('2026-08-10T23:00:00+01:00', '2026-08-11T00:30:00+01:00', 2),
+      event('2026-08-10', '10:00', '11:00', 2),
+    ]);
     expect(result.events).toEqual({
+      ...NOTHING_SET_ASIDE,
       received: 5,
       meetings: 1,
       solo_blocks: 2,
-      all_day: 0,
       zero_length: 1,
       crosses_midnight: 1,
-      outside_window: 0,
     });
     expect(result.working_hours.mon.usual_start).toBe('10:00');
     expect(result.working_hours.mon.usual_end).toBe('11:00');
   });
 
-  it('keeps a meeting that ends exactly at midnight, ending at 24:00', async () => {
-    const result = await stats({
-      events: [{ start: '2026-08-10T23:00:00+01:00', end: '2026-08-11T00:00:00+01:00', attendee_count: 2 }],
+  it('sets aside cancelled events, invitations the principal declined, and events whose guests Google left out', async () => {
+    const result = await stats([
+      { ...event('2026-08-10', '08:00', '08:30', 2), status: 'cancelled' },
+      answered(event('2026-08-10', '09:00', '10:00', 3), 'declined'),
+      { ...event('2026-08-10', '10:00', '10:30', 1), attendeesOmitted: true },
+      // An invitation the principal has not declined is time they may give.
+      answered(event('2026-08-10', '11:00', '11:30', 2), 'needsAction'),
+      answered(event('2026-08-10', '12:00', '12:30', 2), 'tentative'),
+    ]);
+    expect(result.events).toEqual({
+      ...NOTHING_SET_ASIDE,
+      received: 5,
+      meetings: 2,
+      cancelled: 1,
+      declined: 1,
+      attendees_omitted: 1,
     });
+    expect(result.working_hours.mon.usual_start).toBe('11:00');
+    expect(result.working_hours.mon.usual_end).toBe('12:30');
+  });
+
+  it('counts a meeting on two of the principal calendars once, and never counts a room as a person', async () => {
+    const review = event('2026-08-10', '09:00', '10:00', 2);
+    const focus = event('2026-08-10', '11:00', '11:30', 1, PRINCIPAL);
+    const roomBooked: GogEvent = {
+      ...focus,
+      attendees: [...(focus.attendees ?? []), { email: ROOM, resource: true, responseStatus: 'accepted' }],
+    };
+
+    const result = await stats([], { files: [writeEvents([review, roomBooked]), writeEvents([review], HOME)] });
+
+    expect(result.events).toEqual({
+      ...NOTHING_SET_ASIDE,
+      received: 3,
+      meetings: 1,
+      duplicate_copies: 1,
+      solo_blocks: 1,
+    });
+    expect(result.meeting_lengths.all).toEqual({ count: 1, most_common: [{ minutes: 60, count: 1 }] });
+  });
+
+  it('counts a meeting the principal declined on one calendar but accepted on another', async () => {
+    const review = event('2026-08-10', '09:00', '10:00', 2);
+
+    const result = await stats([], {
+      files: [writeEvents([answered(review, 'declined')], HOME), writeEvents([review])],
+    });
+
+    expect(result.events).toEqual({ ...NOTHING_SET_ASIDE, received: 2, meetings: 1, duplicate_copies: 1 });
+    expect(result.meeting_lengths.all).toEqual({ count: 1, most_common: [{ minutes: 60, count: 1 }] });
+  });
+
+  it('keeps a meeting that ends exactly at midnight, ending at 24:00', async () => {
+    const result = await stats([timed('2026-08-10T23:00:00+01:00', '2026-08-11T00:00:00+01:00', 2)]);
     expect(result.events.meetings).toBe(1);
     expect(result.working_hours.mon.usual_end).toBe('24:00');
     expect(result.meeting_lengths.all.most_common).toEqual([{ minutes: 60, count: 1 }]);
   });
 
   it('merges overlapping meetings for gaps, and still counts each one for lengths and hours', async () => {
-    const result = await stats({
-      events: [
-        event('2026-08-10', '09:00', '12:00', 4),
-        event('2026-08-10', '10:00', '10:30', 2),
-        event('2026-08-10', '11:30', '12:30', 3),
-        event('2026-08-10', '12:30', '13:00', 2),
-        event('2026-08-10', '13:15', '13:45', 2),
-      ],
-    });
+    const result = await stats([
+      event('2026-08-10', '09:00', '12:00', 4),
+      event('2026-08-10', '10:00', '10:30', 2),
+      event('2026-08-10', '11:30', '12:30', 3),
+      event('2026-08-10', '12:30', '13:00', 2),
+      event('2026-08-10', '13:15', '13:45', 2),
+    ]);
     // One block 09:00-12:30, then 0 minutes to 12:30, then 15 minutes to 13:15; never a negative gap.
     expect(result.gaps).toEqual({
       count: 2,
@@ -349,7 +505,7 @@ describe('schedule_stats refuses what it cannot count exactly', () => {
     expect(await refusal({ from: '2026-08-01', to: '2026-10-14' })).toBe(
       'Error: The window covers 75 days; the limit is 60 days (about eight weeks). Use a shorter window.',
     );
-    const sixty = await stats({ from: '2026-08-01', to: '2026-09-29', events: [] });
+    const sixty = await stats([], { from: '2026-08-01', to: '2026-09-29' });
     expect(sixty.window.days).toBe(60);
   });
 
@@ -370,51 +526,38 @@ describe('schedule_stats refuses what it cannot count exactly', () => {
     expect(await refusal({ timezone: undefined })).toBe('Error: timezone is required.');
   });
 
-  it('refuses the whole call when any timestamp is invalid, naming each bad event', async () => {
+  it('refuses the whole call when any event in a file is invalid, naming the file and each bad event', async () => {
     const good = event('2026-08-10', '09:00', '09:30', 2);
-    const text = await refusal({
-      events: [
-        good,
-        { ...good, start: '2026-08-10T09:00:00' },
-        { ...good, end: 'half past nine' },
-        { ...good, start: '2026-08-10T25:00:00+01:00' },
-        { ...good, end: '2026-08-10T08:00:00+01:00' },
-        { ...good, start: '2026-08-10' },
-        { start: '2026-08-12', end: '2026-08-11', attendee_count: 0 },
-      ],
-    });
-    expect(text).toBe(
-      'Error: Invalid events: 6 of 7, so nothing was counted. ' +
-        'events[1].start must be a date-time with its UTC offset, such as 2026-10-05T09:00:00+01:00, or a date (2026-10-05) for an all-day event. ' +
-        'events[2].end must be a date-time with its UTC offset, such as 2026-10-05T09:00:00+01:00, or a date (2026-10-05) for an all-day event. ' +
-        'events[3].start must be a date-time with its UTC offset, such as 2026-10-05T09:00:00+01:00, or a date (2026-10-05) for an all-day event. ' +
-        'events[4] ends before it starts. ' +
-        'events[5] mixes a date and a date-time; an all-day event gives both as dates. ' +
-        '1 more invalid event is not listed.',
+    const file = writeEvents([
+      good,
+      { ...good, start: { dateTime: '2026-08-10T09:00:00' } },
+      { ...good, end: { dateTime: '2026-08-10T08:00:00+01:00' } },
+    ]);
+    expect(await refusal({ files: [file] })).toBe(
+      `Error: Refused ${file}: 2 of 3 events are invalid, so nothing was counted. ` +
+        'events[1].start must have a dateTime with its UTC offset, such as 2026-10-06T10:00:00+01:00, or a date. ' +
+        'events[2] ends before it starts.',
     );
   });
 
-  it('refuses events that are not shaped as events', async () => {
-    const good = event('2026-08-10', '09:00', '09:30', 2);
-    expect(await refusal({ events: 'all of them' })).toBe('Error: events must be a list of events.');
-    for (const [bad, message] of [
-      [null, 'events[0] must be an object with start, end, and attendee_count.'],
-      [{ ...good, attendee_count: -1 }, 'events[0].attendee_count must be a whole number, 0 or more.'],
-      [{ ...good, attendee_count: 1.5 }, 'events[0].attendee_count must be a whole number, 0 or more.'],
-      [{ ...good, attendee_count: '2' }, 'events[0].attendee_count must be a whole number, 0 or more.'],
-      [{ ...good, organizer: 7 }, 'events[0].organizer must be an email address.'],
-    ] as const) {
-      expect(await refusal({ events: [bad] })).toBe(
-        `Error: Invalid events: 1 of 1, so nothing was counted. ${message}`,
-      );
+  it('refuses a partial file, or one outside the folders it reads, naming it', async () => {
+    // The reader's other refusals are pinned in calendar-facts.test.ts.
+    for (const [file, reason] of [
+      [writeRaw('{"events": [], "nextPageTokens": [{"calendarId": "x", "nextPageToken": "abc"}]}'), '--all-pages'],
+      ['/etc/gog-events.json', 'outside'],
+    ]) {
+      const text = await refusal({ files: [file] });
+      expect(text).toContain(file);
+      expect(text).toContain(reason);
     }
+  });
+
+  it('refuses inputs that are not shaped as files and addresses', async () => {
+    expect(await refusal({ files: 'events.json' })).toBe(
+      'Error: files must list from 1 to 10 paths to saved gog calendar events output.',
+    );
     expect(await refusal({ principal_addresses: 'principal@example.test' })).toBe(
       'Error: principal_addresses must be a list of email addresses.',
     );
-  });
-
-  it('refuses more than 2000 events and names the limit', async () => {
-    const events = Array.from({ length: 2001 }, () => event('2026-08-10', '09:00', '09:30', 2));
-    expect(await refusal({ events })).toBe('Error: Too many events: 2001. The limit is 2000; use a shorter window.');
   });
 });

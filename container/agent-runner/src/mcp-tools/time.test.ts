@@ -5,7 +5,6 @@ import {
   type TimeConvertResult,
   type TimeDiffResult,
   type TimeNowResult,
-  type TimeRangeResult,
   type TimeResolveResult,
 } from './time.js';
 
@@ -17,7 +16,6 @@ interface ResultOf {
   time_resolve: TimeResolveResult;
   time_convert: TimeConvertResult;
   time_diff: TimeDiffResult;
-  time_range: TimeRangeResult;
 }
 type ToolName = keyof ResultOf;
 
@@ -47,13 +45,12 @@ async function failure(zone: string, name: ToolName, args: Record<string, unknow
 }
 
 describe('the tool set', () => {
-  it("keeps Soji's five tools", () => {
+  it('offers the four calculators, and no slot builder: slots come only from the host', () => {
     expect(createTimeTools('UTC').map((definition) => definition.tool.name)).toEqual([
       'time_now',
       'time_resolve',
       'time_convert',
       'time_diff',
-      'time_range',
     ]);
   });
 
@@ -423,122 +420,5 @@ describe('time_diff', () => {
     const text = await failure('America/New_York', 'time_diff', { from: '2026-10-01', to: '2026-11-01T01:30' });
     expect(text).toContain('to: 1:30 AM on Sun, Nov 1 2026 happens twice');
     expect(text).toContain('2026-11-01T01:30:00-04:00 or 2026-11-01T01:30:00-05:00');
-  });
-});
-
-describe('time_range', () => {
-  it('refuses a range over 60 days and names the limit', async () => {
-    expect(await failure('Africa/Lagos', 'time_range', { from: '2026-10-01', to: '2026-12-15' })).toBe(
-      'Error: Range too large: it covers 76 days. The maximum is 60 days.',
-    );
-    const sixty = await ok('Africa/Lagos', 'time_range', { from: '2026-10-01', to: '2026-11-29' });
-    expect(sixty.count).toBe(60);
-  });
-
-  it('lists weekday slots on a fixed grid, including the whole last day', async () => {
-    const body = await ok('Africa/Lagos', 'time_range', {
-      from: '2026-10-05',
-      to: '2026-10-11',
-      time_start: '09:00',
-      time_end: '11:00',
-      weekdays_only: true,
-    });
-    expect(body.count).toBe(10);
-    expect(body.slots[0]).toEqual({
-      date: 'Mon, Oct 5',
-      day: 'Monday',
-      time: '9:00 AM',
-      iso: '2026-10-05T09:00:00+01:00',
-    });
-    expect(body.slots.at(-1)?.iso).toBe('2026-10-09T10:00:00+01:00');
-    expect(body.time_window).toBe('09:00–11:00');
-    expect(body.interval_minutes).toBe(60);
-  });
-
-  it('keeps the grid when the range starts between slots', async () => {
-    const body = await ok('Africa/Lagos', 'time_range', {
-      from: '2026-10-05T10:17',
-      to: '2026-10-05',
-      time_start: '09:00',
-      time_end: '12:00',
-    });
-    expect(body.slots.map((slot) => slot.time)).toEqual(['11:00 AM']);
-  });
-
-  it('lists whole days when no daily window is given', async () => {
-    const body = await ok('Africa/Lagos', 'time_range', { from: '2026-10-09', to: '2026-10-12' });
-    expect(body.slots).toEqual([
-      { date: 'Fri, Oct 9 2026', day: 'Friday', iso: '2026-10-09T00:00:00+01:00' },
-      { date: 'Sat, Oct 10 2026', day: 'Saturday', iso: '2026-10-10T00:00:00+01:00' },
-      { date: 'Sun, Oct 11 2026', day: 'Sunday', iso: '2026-10-11T00:00:00+01:00' },
-      { date: 'Mon, Oct 12 2026', day: 'Monday', iso: '2026-10-12T00:00:00+01:00' },
-    ]);
-  });
-
-  it('skips a slot the clocks jump over and marks one that happens twice', async () => {
-    const spring = await ok('America/New_York', 'time_range', {
-      from: '2026-03-08',
-      to: '2026-03-08',
-      time_start: '00:00',
-      time_end: '04:00',
-    });
-    expect(spring.slots.map((slot) => slot.iso)).toEqual([
-      '2026-03-08T00:00:00-05:00',
-      '2026-03-08T01:00:00-05:00',
-      '2026-03-08T03:00:00-04:00',
-    ]);
-    expect(spring.skipped).toEqual(['2:00 AM on Sun, Mar 8 2026 does not exist in America/New_York.']);
-
-    const fall = await ok('America/New_York', 'time_range', {
-      from: '2026-11-01',
-      to: '2026-11-01',
-      time_start: '00:00',
-      time_end: '03:00',
-    });
-    expect(fall.slots.map((slot) => slot.iso)).toEqual([
-      '2026-11-01T00:00:00-04:00',
-      '2026-11-01T01:00:00-04:00',
-      '2026-11-01T02:00:00-05:00',
-    ]);
-    expect(fall.slots[1].second_occurrence_iso).toBe('2026-11-01T01:00:00-05:00');
-    expect(fall.skipped).toBeUndefined();
-  });
-
-  it('refuses bad windows and intervals', async () => {
-    const range = { from: '2026-10-05', to: '2026-10-06' };
-    expect(await failure('Africa/Lagos', 'time_range', { ...range, time_start: '09:00' })).toBe(
-      'Error: time_start and time_end go together; give both or neither.',
-    );
-    expect(await failure('Africa/Lagos', 'time_range', { ...range, time_start: '17:00', time_end: '09:00' })).toContain(
-      'time_end must be after time_start',
-    );
-    expect(await failure('Africa/Lagos', 'time_range', { ...range, time_start: '9am', time_end: '17:00' })).toContain(
-      'Invalid time_start "9am"',
-    );
-    for (const interval of [0, -15, 1.5, 1441]) {
-      expect(
-        await failure('Africa/Lagos', 'time_range', {
-          ...range,
-          time_start: '09:00',
-          time_end: '17:00',
-          interval_minutes: interval,
-        }),
-      ).toBe('Error: interval_minutes must be a whole number from 1 to 1440.');
-    }
-    expect(await failure('Africa/Lagos', 'time_range', { from: '2026-10-06', to: '2026-10-05' })).toBe(
-      'Error: "to" must be after "from".',
-    );
-  });
-
-  it('refuses more than 1000 slots', async () => {
-    expect(
-      await failure('Africa/Lagos', 'time_range', {
-        from: '2026-10-01',
-        to: '2026-10-30',
-        time_start: '00:00',
-        time_end: '23:59',
-        interval_minutes: 15,
-      }),
-    ).toContain('Too many slots (more than 1000)');
   });
 });

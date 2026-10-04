@@ -8,11 +8,14 @@ import type { ModuleMigration } from '../../db/migrations/index.js';
  *   the request that created it; its level, booking calendar, and the event
  *   it concerns (the event a reschedule moves, the invitation an
  *   ask_organizer is about); its length, window, purpose and constraints;
+ *   what main wishes its invitation to carry;
  *   its state; the thread and session it is bound to; its brief's version;
- *   and its follow-through deadlines. A `respond` job writes one reply in a
- *   thread waiting for main: it has no length or window, and records when
- *   its reply was delivered. At most one live meeting holds a thread at a
- *   time.
+ *   its follow-through deadlines; and the question `external-email` put to
+ *   main and is waiting on, if any (`ask_about`, `asked_at`). A `respond`
+ *   job is a conversation in a thread waiting for main: it has no length or
+ *   window. Each job records when its first email was delivered. A meeting
+ *   called off while it owes the other side one line is `closing` until
+ *   that line has gone. At most one live meeting holds a thread at a time.
  * - `gws_ea_meeting_counterparts`: who the meeting is with: each address the
  *   host took from a person's record, from Google, from the mail of a thread
  *   held for main, or from main, with that person's name and level as the
@@ -21,13 +24,14 @@ import type { ModuleMigration } from '../../db/migrations/index.js';
  *   session and the outbound message that carried it, so a replay returns
  *   the first answer.
  * - `gws_ea_meeting_outcomes`: each outcome a meeting reported, once. A
- *   reply's `responded` is recorded when delivery records its email, and its
- *   `gave-up` when delivery gives up on it.
+ *   conversation's `done` is recorded when it ends, or when it reports done
+ *   while its last email has yet to go, and its `gave-up` when delivery
+ *   gives up on its email.
  * - `gws_ea_meeting_slots`: the candidate times the host offered for a
  *   meeting, by slot id (written by the calendar actions).
  * - `gws_ea_meeting_bookings`: the event the host's own `book` created or
- *   moved for a meeting (written by the calendar actions). A booked outcome
- *   is accepted only with one.
+ *   moved for a meeting (written by the calendar actions), with what its
+ *   invitation carries when the assistant wrote it.
  */
 export const gwsEaMeetingsMigration: ModuleMigration = {
   version: 1,
@@ -40,8 +44,8 @@ export const gwsEaMeetingsMigration: ModuleMigration = {
         requested_by_session  TEXT NOT NULL,
         request_id            TEXT NOT NULL,
         state                 TEXT NOT NULL CHECK (state IN (
-                                'opening', 'active', 'booked', 'settled', 'not-scheduling', 'responded', 'gave-up',
-                                'cancelled', 'stopped', 'superseded', 'failed'
+                                'opening', 'active', 'booked', 'closing', 'settled', 'not-scheduling', 'done',
+                                'gave-up', 'cancelled', 'stopped', 'superseded', 'failed'
                               )),
         level                 TEXT NOT NULL CHECK (level IN ('inner-circle', 'close', 'active', 'known', 'unknown')),
         booking_calendar_id   TEXT CHECK (booking_calendar_id <> ''),
@@ -52,6 +56,7 @@ export const gwsEaMeetingsMigration: ModuleMigration = {
         window_end            TEXT,
         purpose               TEXT NOT NULL CHECK (purpose <> ''),
         constraints           TEXT CHECK (constraints <> ''),
+        invitation            TEXT,
         thread_key            TEXT NOT NULL CHECK (thread_key LIKE 'mail-%'),
         session_id            TEXT,
         brief_version         INTEGER NOT NULL CHECK (brief_version >= 0),
@@ -59,6 +64,8 @@ export const gwsEaMeetingsMigration: ModuleMigration = {
         nudge_at              TEXT,
         give_up_at            TEXT,
         replied_at            TEXT,
+        ask_about             TEXT CHECK (ask_about IN ('time', 'length', 'people', 'place', 'other')),
+        asked_at              TEXT,
         created_at            TEXT NOT NULL,
         updated_at            TEXT NOT NULL,
         ended_at              TEXT,
@@ -67,10 +74,10 @@ export const gwsEaMeetingsMigration: ModuleMigration = {
         CHECK (kind IN ('arrange', 'respond') OR (event_calendar_id IS NOT NULL AND event_id IS NOT NULL)),
         CHECK ((kind = 'respond') = (length_minutes IS NULL)),
         CHECK ((length_minutes IS NULL) = (window_start IS NULL) AND (window_start IS NULL) = (window_end IS NULL)),
-        CHECK (kind = 'respond' OR replied_at IS NULL)
+        CHECK ((ask_about IS NULL) = (asked_at IS NULL))
       );
       CREATE UNIQUE INDEX idx_gws_ea_meetings_live_thread
-        ON gws_ea_meetings (thread_key) WHERE state IN ('opening', 'active', 'booked');
+        ON gws_ea_meetings (thread_key) WHERE state IN ('opening', 'active', 'booked', 'closing');
       CREATE INDEX idx_gws_ea_meetings_session ON gws_ea_meetings (session_id);
       CREATE INDEX idx_gws_ea_meetings_event ON gws_ea_meetings (event_calendar_id, event_id);
 
@@ -99,7 +106,7 @@ export const gwsEaMeetingsMigration: ModuleMigration = {
       CREATE TABLE gws_ea_meeting_outcomes (
         meeting_id   TEXT NOT NULL REFERENCES gws_ea_meetings(id) ON DELETE CASCADE,
         outcome      TEXT NOT NULL CHECK (outcome IN (
-                       'booked', 'settled', 'needs-room', 'not-scheduling', 'gave-up', 'responded'
+                       'settled', 'not-scheduling', 'gave-up', 'done'
                      )),
         response     TEXT NOT NULL,
         recorded_at  TEXT NOT NULL,
@@ -121,7 +128,8 @@ export const gwsEaMeetingsMigration: ModuleMigration = {
         event_id     TEXT NOT NULL CHECK (event_id <> ''),
         start_at     TEXT NOT NULL,
         end_at       TEXT NOT NULL,
-        booked_at    TEXT NOT NULL
+        booked_at    TEXT NOT NULL,
+        invitation   TEXT
       );
       CREATE INDEX idx_gws_ea_meeting_bookings_event ON gws_ea_meeting_bookings (calendar_id, event_id);
     `);

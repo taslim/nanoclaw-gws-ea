@@ -1,15 +1,16 @@
 /**
  * GWS-EA's meetings (KTD5, KTD11, KTD12, KTD16): the store of every job
- * `main` hands to `external-email`, a meeting to schedule or one reply to
- * write, and the typed requests that carry them.
+ * `main` hands to `external-email`, a meeting to schedule or a conversation
+ * to hold, and the typed requests that carry them.
  *
  *   - `main` → host: `meeting_arrange`, `meeting_reschedule`,
- *     `meeting_ask_organizer`, `meeting_cancel`, `meeting_amend`,
- *     `meeting_respond`, `meeting_dismiss`, and
- *     `meeting_reply_to_principal`.
+ *     `meeting_cancel`, `meeting_amend`, `email_respond`, `email_dismiss`,
+ *     and `email_reply_to_principal`.
  *   - `external-email` → host: `meeting_free_time`, `meeting_hold`,
- *     `meeting_release_holds`, `meeting_book` (`calendar-actions.ts`),
- *     `meeting_recipients`, and `meeting_outcome`.
+ *     `meeting_book` (`calendar-actions.ts`), `meeting_ask_main`,
+ *     `email_recipients`, and `meeting_outcome`.
+ *
+ * Each runner tool is named after the action it sends (`MEETING_ACTIONS`).
  *
  * Each is a delivery action with a guard (`guard.ts`) that binds the caller
  * to the profile's agent pointers, and external-email's to its meeting's
@@ -19,16 +20,18 @@
  * default; `external-email`'s side is `gws-ea-meetings-external`.
  *
  * A forgotten person's meetings, threads, and sessions are purged, and a
- * thread the audience check stops ends its meeting at once. A reply's
- * thread goes back to `main` the moment delivery records the reply, and
- * `main` hears of any email in a meeting's thread delivery gave up on, any
+ * thread the audience check stops ends its meeting at once. A delivered
+ * email starts its job's quiet count; a called-off meeting's closing line
+ * ends it, as a conversation's last email does once it reported done.
+ * `main` hears of any email in a job's thread delivery gave up on, any
  * email to it given up after its retries, and any turn of it that failed.
  *
  * Follow-through (KTD12, `follow-through.ts`) runs on a module timer each
- * minute: a quiet thread's nudge and give-up, closing a booked meeting's
- * conversation once its event has passed, and holds or rooms left to
- * finish. The inbox tells it when a counterpart replies. Making room (R14,
- * `room.ts`) lists the meetings that could move for a needs-room outcome.
+ * minute: a quiet thread's nudge and give-up, a reminder to `main` of a
+ * question it left open, closing a booked meeting's conversation once its
+ * event has passed, and holds or rooms left to finish. The inbox tells it
+ * when a counterpart replies. Making room (R14, `room.ts`) lists the
+ * meetings that could move for someone inner circle or close.
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -50,7 +53,13 @@ import { registerThreadStoppedHook } from '../gws-ea-privacy/index.js';
 import { createMeetingsCalendarApi, type MeetingsCalendarApi } from './calendar-api.js';
 import { createCalendarActions, FREE_TIME_ACTION } from './calendar-actions.js';
 import { createFollowThrough } from './follow-through.js';
-import { meetingCalendarAction, meetingOutcomeAction, meetingRecipientsAction, meetingRequestAction } from './guard.js';
+import {
+  meetingAskAction,
+  meetingCalendarAction,
+  meetingOutcomeAction,
+  meetingRecipientsAction,
+  meetingRequestAction,
+} from './guard.js';
 import { answering, createMeetingHandoff, requestIdOf, type Handle } from './handoff.js';
 import {
   gwsEaMeetingsCalendarActionsMigration,
@@ -71,7 +80,7 @@ const MEETINGS_CAPABILITY = 'gws-ea-meetings';
 
 registerCapability(MEETINGS_CAPABILITY, {
   description:
-    'arrange, reschedule, ask_organizer, cancel, amend, respond, dismiss, reply_to_principal: hand scheduling jobs and replies to external-email, which carries them out by email, close threads, and answer the principal by email',
+    'meeting_arrange, meeting_reschedule, meeting_cancel, meeting_amend, email_respond, email_dismiss, email_reply_to_principal: hand scheduling jobs and answers to external-email, which carries them out by email, close threads, and answer the principal by email',
   default: 'on',
   instructions: [MEETINGS_CAPABILITY],
 });
@@ -95,10 +104,13 @@ const handoff = createMeetingHandoff({
   bookDirectly: actions.bookDirectly,
   roomCandidates: room.candidates,
   roomCandidate: room.candidate,
+  hasOpenTime: actions.hasOpenTime,
+  updateBooking: actions.updateBooking,
 });
 const followThrough = createFollowThrough({
   calendar: calendarApi,
   inboxHealth: getInboxHealth,
+  remindMain: handoff.remindMain,
   giveUp: handoff.giveUpUnanswered,
   closeBooked: (meeting) => handoff.endMeeting(meeting, 'booked', true),
   releaseHolds: (meeting) => actions.releaseHolds(meeting, 'all'),
@@ -135,25 +147,30 @@ function guardSpec(guardAction: GuardedAction): DeliveryGuardSpec {
   };
 }
 
-/** Every request, by action name, with its guard; each is answered once (`answering`). */
+/**
+ * Every request, by action name, with its guard; each is answered once
+ * (`answering`). The runner's tool for each carries the same name.
+ */
 const REQUESTS: ReadonlyArray<readonly [string, Handle, GuardedAction]> = [
   // main's
   ['meeting_arrange', handoff.arrange, meetingRequestAction],
   ['meeting_reschedule', handoff.reschedule, meetingRequestAction],
-  ['meeting_ask_organizer', handoff.askOrganizer, meetingRequestAction],
   ['meeting_cancel', handoff.cancel, meetingRequestAction],
   ['meeting_amend', handoff.amend, meetingRequestAction],
-  ['meeting_respond', handoff.respond, meetingRequestAction],
-  ['meeting_dismiss', handoff.dismiss, meetingRequestAction],
-  ['meeting_reply_to_principal', handoff.replyToPrincipal, meetingRequestAction],
-  // external-email's outcome, its recipients, and its calendar tools
+  ['email_respond', handoff.respond, meetingRequestAction],
+  ['email_dismiss', handoff.dismiss, meetingRequestAction],
+  ['email_reply_to_principal', handoff.replyToPrincipal, meetingRequestAction],
+  // external-email's question, its outcome, its recipients, and its calendar tools
+  ['meeting_ask_main', handoff.askMain, meetingAskAction],
   ['meeting_outcome', handoff.outcome, meetingOutcomeAction],
-  ['meeting_recipients', handoff.recipients, meetingRecipientsAction],
+  ['email_recipients', handoff.recipients, meetingRecipientsAction],
   [FREE_TIME_ACTION, actions.freeTime, meetingCalendarAction],
   ['meeting_hold', actions.hold, meetingCalendarAction],
-  ['meeting_release_holds', actions.releaseHoldsRequest, meetingCalendarAction],
   ['meeting_book', actions.book, meetingCalendarAction],
 ];
+
+/** The action names the meetings module answers, which the runner's tools send. */
+export const MEETING_ACTIONS: readonly string[] = REQUESTS.map(([action]) => action);
 
 for (const [action, handle, guardAction] of REQUESTS) {
   registerDeliveryAction(action, answering(action, handle), guardSpec(guardAction));
@@ -162,9 +179,10 @@ for (const [action, handle, guardAction] of REQUESTS) {
 registerPersonForgetHook('gws-ea-meetings:purge', (person) => handoff.forgetPerson(person));
 registerThreadStoppedHook('gws-ea-meetings:close', (thread) => handoff.threadStopped(thread));
 registerThreadReplyHook('gws-ea-meetings:follow-through', (threadKey) => followThrough.replied(threadKey));
-// A reply's thread goes back to main the moment its email is delivered. main hears of every email
-// a meeting's conversation wrote that delivery gave up on: the principal asked for nothing there.
-registerPostDeliveryHook((msg, session) => handoff.replyDelivered(msg, session));
+// A delivered email starts its job's quiet count; a called-off meeting's closing line ends it, as a
+// conversation's last email does once it reported done.
+// main hears of every email a meeting's conversation wrote that delivery gave up on.
+registerPostDeliveryHook((msg, session) => handoff.emailDelivered(msg, session));
 registerDeliveryFailedHook((failed, session) => handoff.sendsFailed(failed, session));
 // Nor does an email to a meeting's conversation it could not process, or a turn of it that failed.
 registerInboundFailedHook((failed, session) => handoff.inboundFailed(failed, session));

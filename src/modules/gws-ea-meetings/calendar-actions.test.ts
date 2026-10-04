@@ -1,6 +1,6 @@
 /**
  * external-email's calendar actions (KTD11; R4, R5, R6, R11, R20, R24):
- * `free_time`, `hold`, `release_holds` and `book`, and the colleague path
+ * `meeting_free_time`, `meeting_hold` and `meeting_book`, and the colleague path
  * where `arrange` books directly.
  *
  * Drives the real delivery actions, guards, meeting store, handoff, people
@@ -67,9 +67,20 @@ import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import '../gws-ea-external-email/index.js';
 import { consumeOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import { ensureInbox, GoogleApiError } from '../gws-ea-inbox/index.js';
+import { slotLabel } from './calendar-actions.js';
 import { getBooking, listOfferedSlots } from './index.js';
 import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
-import { ask, data, meeting, meetingSession, refusal, slotsOf, type OfferedSlot } from './testing/scheduling.js';
+import {
+  ask,
+  contents,
+  data,
+  meeting,
+  meetingSession,
+  notes,
+  refusal,
+  slotsOf,
+  type OfferedSlot,
+} from './testing/scheduling.js';
 
 const ROBIN = 'robin@northwind.example';
 const PRINCIPAL = 'pat@northwind.example';
@@ -250,7 +261,13 @@ describe('AE1: three offered times become holds, and the one picked becomes the 
       expect(consumeOwnCalendarChange(PRINCIPAL, hold.id, new Date())).toBe(true);
     }
 
-    const booked = data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: wednesday.slot_id }));
+    const booked = data(
+      await ask(session, 'meeting_book', {
+        meeting_id: stored.id,
+        slot_id: wednesday.slot_id,
+        invitation: { title: 'Partnership intro' },
+      }),
+    );
     expect(booked).toMatchObject({ booking: { start: WEDNESDAY_10AM } });
 
     expect(holds()).toEqual([]);
@@ -273,7 +290,6 @@ describe('AE1: three offered times become holds, and the one picked becomes the 
       event_id: event.id,
       start_at: WEDNESDAY_10AM,
     });
-    data(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'booked' }));
     expect((await meeting(stored.id)).state).toBe('booked');
   });
 });
@@ -328,7 +344,9 @@ describe('free_time', () => {
     );
     expect(String(late.message)).toMatch(/not open/i);
     for (const slot of late.slots as OfferedSlot[]) expect(slot.start.startsWith('2026-10-07')).toBe(true);
-    expect(String(late.message)).toContain('America/New_York');
+    // Each time is also shown on their clock, the way people write it.
+    expect(String(late.message)).toMatch(/; for them, Wednesday 7 Oct, \d\d:\d\d–\d\d:\d\d EDT/);
+    expect(String(late.message)).not.toContain('America/New_York');
 
     // 05:00 in New York is 10:00 in London: open.
     const early = data(
@@ -342,6 +360,47 @@ describe('free_time', () => {
     expect((early.slots as OfferedSlot[]).map((slot) => slot.start)).toEqual([WEDNESDAY_10AM]);
   });
 
+  it('offers nothing today unless the window ends today, yet checks a time today they propose', async () => {
+    const week = await arranged(acme, { window_start: NOW.toISOString(), window_end: '2026-10-10T00:00:00+01:00' });
+    const offered = slotsOf(await ask(week.session, 'meeting_free_time', { meeting_id: week.meeting.id }));
+    expect(offered.length).toBeGreaterThan(0);
+    for (const slot of offered) expect(slot.start >= '2026-10-05T23:00:00.000Z').toBe(true);
+    const proposed = data(
+      await ask(week.session, 'meeting_free_time', {
+        meeting_id: week.meeting.id,
+        date: '2026-10-05',
+        time: '14:00',
+        timezone: LONDON,
+      }),
+    );
+    expect(proposed.slots).toEqual([expect.objectContaining({ start: '2026-10-05T13:00:00.000Z' })]);
+
+    const today = await arranged(sam, { window_start: NOW.toISOString(), window_end: '2026-10-05T18:00:00+01:00' });
+    const todays = slotsOf(await ask(today.session, 'meeting_free_time', { meeting_id: today.meeting.id }));
+    expect(todays.length).toBeGreaterThan(0);
+    for (const slot of todays) expect(slot.start.startsWith('2026-10-05')).toBe(true);
+  });
+
+  it('narrows to the part of the day they ask for, on their clock', async () => {
+    const { meeting: stored, session } = await arranged(acme);
+    // After 10:00 in New York is after 15:00 in London.
+    const later = slotsOf(
+      await ask(session, 'meeting_free_time', { meeting_id: stored.id, after: '10:00', timezone: 'America/New_York' }),
+    );
+    expect(later.length).toBeGreaterThan(0);
+    for (const slot of later) {
+      const theirs = new Date(slot.start).toLocaleTimeString('en-GB', {
+        timeZone: 'America/New_York',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+      expect(theirs >= '10:00').toBe(true);
+    }
+    expect(
+      refusal(await ask(session, 'meeting_free_time', { meeting_id: stored.id, after: '15:00', before: '14:00' })),
+    ).toMatch(/before must come after after/);
+  });
+
   it('is refused from main, and from a conversation bound to another meeting', async () => {
     const first = await arranged(acme);
     const second = await arranged(sam);
@@ -353,12 +412,21 @@ describe('free_time', () => {
   });
 });
 
+describe('a slot as people write it', () => {
+  it('names its day, its times and its zone the way people do, never an IANA name', () => {
+    const span = { start: Date.parse('2026-10-06T09:00:00Z'), end: Date.parse('2026-10-06T09:30:00Z') };
+    expect(slotLabel(span, LONDON)).toBe('Tuesday 6 Oct, 10:00–10:30 BST');
+    expect(slotLabel(span, 'America/New_York')).toBe('Tuesday 6 Oct, 05:00–05:30 EDT');
+    expect(slotLabel(span, 'Africa/Lagos')).toBe('Tuesday 6 Oct, 10:00–10:30 GMT+1');
+  });
+});
+
 // ---------------------------------------------------------------------------
-// hold and release_holds
+// hold
 // ---------------------------------------------------------------------------
 
 describe('hold', () => {
-  it('refuses a slot that was not offered, one no longer free, and a fourth hold', async () => {
+  it('refuses a slot that was not offered, one no longer free, and more than three', async () => {
     const { meeting: stored, session } = await arranged(acme);
     const offered = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
 
@@ -378,19 +446,44 @@ describe('hold', () => {
     ).toMatch(/no longer open/);
     expect(holds()).toEqual([]);
 
-    data(
-      await ask(session, 'meeting_hold', {
-        meeting_id: stored.id,
-        slot_ids: [offered[1].slot_id, offered[2].slot_id, offered[3].slot_id],
-      }),
-    );
+    const three = [offered[1].slot_id, offered[2].slot_id, offered[3].slot_id];
+    data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: three }));
     expect(
-      refusal(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [offered[4].slot_id] })),
-    ).toMatch(/three/);
+      refusal(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [...three, offered[4].slot_id] })),
+    ).toMatch(/up to 3/);
     expect(holds()).toHaveLength(3);
-    // Holding a time already held changes nothing.
-    data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [offered[1].slot_id] }));
+    // Holding the times already held changes nothing.
+    data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: three }));
     expect(holds()).toHaveLength(3);
+    expect(calendar.writes.filter((write) => write.op === 'insert')).toHaveLength(3);
+  });
+
+  it('holds exactly the times named: the others go, and an empty list releases them all', async () => {
+    const { meeting: stored, session } = await arranged(acme);
+    const [a, b, c, d] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
+    data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [a.slot_id, b.slot_id, c.slot_id] }));
+    const held = data(
+      await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [b.slot_id, c.slot_id, d.slot_id] }),
+    );
+    expect(held.message).toMatch(/Any other time it held is released/);
+    expect(
+      holds()
+        .map((hold) => hold.start?.dateTime)
+        .sort(),
+    ).toEqual([b.start, c.start, d.start].sort());
+
+    // A time no longer open refuses the whole call, and every hold stays.
+    calendar.put(busy('evt-new', a.start, a.end));
+    expect(refusal(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [a.slot_id] }))).toMatch(
+      /no longer open/,
+    );
+    expect(holds()).toHaveLength(3);
+
+    expect(data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [] })).message).toMatch(
+      /holds no times now/,
+    );
+    expect(holds()).toEqual([]);
+    expect(await getDb().all('SELECT slot_id FROM gws_ea_meeting_holds WHERE meeting_id = ?', stored.id)).toEqual([]);
   });
 
   it('creates no duplicate when retried after Google applied it but the answer was lost', async () => {
@@ -417,7 +510,7 @@ describe('hold', () => {
       ],
     });
     const asked = data(
-      await ask(main, 'meeting_ask_organizer', {
+      await ask(main, 'meeting_reschedule', {
         calendar_id: PRINCIPAL,
         event_id: 'evt-invite',
         ...WINDOW,
@@ -435,7 +528,7 @@ describe('hold', () => {
   });
 });
 
-describe('release_holds', () => {
+describe('releasing holds', () => {
   it("touches only that meeting's holds that the assistant created", async () => {
     const first = await arranged(acme);
     const second = await arranged(sam);
@@ -453,7 +546,7 @@ describe('release_holds', () => {
     const [retagged] = holds().filter((hold) => hold.start?.dateTime === a2.start);
     calendar.put({ ...retagged, tags: { gwsEaMeeting: 'mtg-someone-else', gwsEaRole: 'hold' } });
 
-    data(await ask(first.session, 'meeting_release_holds', { meeting_id: first.meeting.id }));
+    data(await ask(first.session, 'meeting_hold', { meeting_id: first.meeting.id, slot_ids: [] }));
     expect(
       holds()
         .map((hold) => hold.tags?.gwsEaMeeting)
@@ -465,14 +558,6 @@ describe('release_holds', () => {
       await getDb().all('SELECT slot_id FROM gws_ea_meeting_holds WHERE meeting_id = ?', first.meeting.id),
     ).toEqual([]);
   });
-
-  it('releases only the slots named, when some are', async () => {
-    const { meeting: stored, session } = await arranged(acme);
-    const [s1, s2] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
-    data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [s1.slot_id, s2.slot_id] }));
-    data(await ask(session, 'meeting_release_holds', { meeting_id: stored.id, slot_ids: [s1.slot_id] }));
-    expect(holds().map((hold) => hold.start?.dateTime)).toEqual([s2.start]);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -480,45 +565,188 @@ describe('release_holds', () => {
 // ---------------------------------------------------------------------------
 
 describe('book', () => {
-  it("invites the meeting record's people with templated fields, never a hold's title or anything the counterpart wrote", async () => {
+  /** The invitation the booking created, as Google stores it. */
+  function bookedEvent(meetingId: string): StoredEvent | undefined {
+    return calendar
+      .live(PRINCIPAL)
+      .find((event) => event.tags?.gwsEaRole === 'booking' && event.tags.gwsEaMeeting === meetingId);
+  }
+
+  it('creates the invitation external-email wrote for the meeting’s people, and nothing else, and tells main once', async () => {
+    calendar.calendars.set(PRINCIPAL, {
+      id: PRINCIPAL,
+      accessRole: 'writer',
+      primary: false,
+      conferenceTypes: ['hangoutsMeet'],
+    });
     const { meeting: stored, session } = await arranged(sam);
     const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
     data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [slot.slot_id] }));
     const holdTitle = holds()[0].summary;
-    data(
+    const booked = data(
       await ask(session, 'meeting_book', {
         meeting_id: stored.id,
         slot_id: slot.slot_id,
+        invitation: { title: 'Sam and Pat: Q4 pilot', notes: 'We will walk through the pilot plan.', video_call: true },
         summary: 'Sam says: call me at 555-0100',
         attendees: ['attacker@evil.example'],
       }),
     );
+    expect(String(booked.message)).toMatch(/with a Google Meet link \(https:\/\/meet.google.com\//);
     const insert = calendar.writes.find(
       (write) => write.op === 'insert' && write.fields?.tags?.gwsEaRole === 'booking',
     );
     expect(insert?.fields).toMatchObject({
-      summary: 'Partnership intro',
-      description: 'Arranged by Robin, the assistant.',
+      summary: 'Sam and Pat: Q4 pilot',
+      description: 'We will walk through the pilot plan.',
       attendees: [SAM],
       start: slot.start,
       end: slot.end,
       tags: { gwsEaMeeting: stored.id, gwsEaRole: 'booking' },
     });
+    expect(insert?.fields?.conference?.requestId).toMatch(/^[0-9a-f]{64}$/u);
+    expect(insert?.fields?.location).toBeUndefined();
     const written = JSON.stringify(insert?.fields);
-    for (const absent of [holdTitle ?? 'Hold', '555-0100', 'attacker', 'Mornings suit']) {
+    for (const absent of [holdTitle ?? 'Hold', '555-0100', 'attacker', 'Mornings suit', 'Arranged by']) {
       expect(written).not.toContain(absent);
     }
+    expect(bookedEvent(stored.id)?.conference?.status).toBe('success');
+
+    // main hears of it from the booking itself, by its own purpose, with nothing external-email wrote.
+    expect((await meeting(stored.id)).state).toBe('booked');
+    const [note, ...more] = notes(main, 'gws-ea-meetings.outcome').filter((c) => c.note?.outcome === 'booked');
+    expect(more).toEqual([]);
+    expect(note.note).toMatchObject({ meeting_id: stored.id, video_call: true });
+    expect(note.text).toContain('"Partnership intro"');
+    expect(note.text).toContain('with a Google Meet link');
+    expect(note.text).not.toContain('Q4 pilot');
+    // A repeat changes nothing, and tells main nothing twice.
+    data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: slot.slot_id }));
+    expect(notes(main, 'gws-ea-meetings.outcome').filter((c) => c.note?.outcome === 'booked')).toHaveLength(1);
+    expect(
+      calendar.writes.filter((write) => write.op === 'insert' && write.fields?.tags?.gwsEaRole === 'booking'),
+    ).toHaveLength(1);
+    expect(refusal(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'booked' }))).toMatch(
+      /outcome must be one of/,
+    );
   });
 
-  it('refuses a booking whose fields would carry a private value', async () => {
-    const { meeting: stored, session } = await arranged(sam, { purpose: 'Planning at Rosewood Lodge' });
+  it("puts the other side's own link in the place, with the join details in the notes, and adds no Meet link", async () => {
+    const { meeting: stored, session } = await arranged(sam);
+    const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
+    const booked = data(
+      await ask(session, 'meeting_book', {
+        meeting_id: stored.id,
+        slot_id: slot.slot_id,
+        invitation: {
+          title: 'Sam and Pat: Q4 pilot',
+          location: 'https://acme.zoom.us/j/8812345678',
+          notes: 'Zoom passcode 4411.',
+        },
+      }),
+    );
+    expect(String(booked.message)).not.toMatch(/Meet/);
+    expect(bookedEvent(stored.id)).toMatchObject({
+      location: 'https://acme.zoom.us/j/8812345678',
+      description: 'Zoom passcode 4411.',
+    });
+    expect(bookedEvent(stored.id)?.conference).toBeUndefined();
+  });
+
+  it('refuses an invitation carrying a private value, a missing title, and a Meet link the calendar does not allow, before any write', async () => {
+    const { meeting: stored, session } = await arranged(sam);
     const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
     await addPrivateValue({ label: 'Holiday home', kind: 'address', value: 'Rosewood Lodge' });
-    const message = refusal(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: slot.slot_id }));
+    const message = refusal(
+      await ask(session, 'meeting_book', {
+        meeting_id: stored.id,
+        slot_id: slot.slot_id,
+        invitation: { title: 'Planning', location: 'Rosewood Lodge' },
+      }),
+    );
     expect(message).toContain('address');
     expect(message).not.toContain('Rosewood');
+    expect(refusal(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: slot.slot_id }))).toMatch(
+      /title/,
+    );
+    expect(
+      refusal(
+        await ask(session, 'meeting_book', {
+          meeting_id: stored.id,
+          slot_id: slot.slot_id,
+          invitation: { title: 'Planning', video_call: true },
+        }),
+      ),
+    ).toMatch(/does not allow Google Meet/);
     expect(calendar.writes.filter((write) => write.op === 'insert')).toEqual([]);
     expect(await getBooking(stored.id)).toBeUndefined();
+  });
+
+  it('says when Google is still creating the Meet link, and when it could not', async () => {
+    calendar.calendars.set(PRINCIPAL, {
+      id: PRINCIPAL,
+      accessRole: 'writer',
+      primary: false,
+      conferenceTypes: ['hangoutsMeet'],
+    });
+    calendar.meetCreation = 'pending';
+    const first = await arranged(sam);
+    const [slot] = slotsOf(await ask(first.session, 'meeting_free_time', { meeting_id: first.meeting.id }));
+    const pending = data(
+      await ask(first.session, 'meeting_book', {
+        meeting_id: first.meeting.id,
+        slot_id: slot.slot_id,
+        invitation: { title: 'Q4 pilot', video_call: true },
+      }),
+    );
+    expect(String(pending.message)).toMatch(/still creating its Meet link/);
+
+    calendar.meetCreation = 'failure';
+    const second = await arranged(acme);
+    const [other] = slotsOf(await ask(second.session, 'meeting_free_time', { meeting_id: second.meeting.id }));
+    const failed = data(
+      await ask(second.session, 'meeting_book', {
+        meeting_id: second.meeting.id,
+        slot_id: other.slot_id,
+        invitation: { title: 'Intro', video_call: true },
+      }),
+    );
+    expect(String(failed.message)).toMatch(/could not create a Meet link, so ask main about the place/);
+  });
+
+  it('still books when the Meet link cannot be read back afterward, reading it as still being created', async () => {
+    calendar.calendars.set(PRINCIPAL, {
+      id: PRINCIPAL,
+      accessRole: 'writer',
+      primary: false,
+      conferenceTypes: ['hangoutsMeet'],
+    });
+    const { meeting: stored, session } = await arranged(sam);
+    const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
+    // The event is created and Google has emailed the guests; only the read-back that learns the
+    // Meet link's status fails, once.
+    vi.spyOn(calendar, 'getEvent').mockImplementationOnce(() => {
+      throw new GoogleApiError(0, 'Google could not be reached');
+    });
+
+    const booked = data(
+      await ask(session, 'meeting_book', {
+        meeting_id: stored.id,
+        slot_id: slot.slot_id,
+        invitation: { title: 'Sam and Pat: Q4 pilot', video_call: true },
+      }),
+    );
+    expect(String(booked.message)).toMatch(/still creating its Meet link/);
+    expect((await meeting(stored.id)).state).toBe('booked');
+    const booking = [...calendar.live(PRINCIPAL)].find((event) => event.tags?.gwsEaRole === 'booking');
+    expect(booking).toBeDefined();
+    expect(notes(main, 'gws-ea-meetings.outcome').filter((note) => note.note?.outcome === 'booked')).toHaveLength(1);
+
+    // A repeat, now that the read-back works, creates no second event and writes no second note.
+    const insertsBefore = calendar.writes.filter((write) => write.op === 'insert').length;
+    data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: slot.slot_id }));
+    expect(calendar.writes.filter((write) => write.op === 'insert')).toHaveLength(insertsBefore);
+    expect(notes(main, 'gws-ea-meetings.outcome').filter((note) => note.note?.outcome === 'booked')).toHaveLength(1);
   });
 
   it('creates no duplicate when retried after Google applied it but the answer was lost, and a repeat is a no-op', async () => {
@@ -529,22 +757,34 @@ describe('book', () => {
       error: new GoogleApiError(0, 'Google could not be reached'),
       afterApplying: true,
     });
-    expect((await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: slot.slot_id })).ok).toBe(false);
-    data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: slot.slot_id }));
-    data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: slot.slot_id }));
+    const booking = { meeting_id: stored.id, slot_id: slot.slot_id, invitation: { title: 'Partnership intro' } };
+    expect((await ask(session, 'meeting_book', booking)).ok).toBe(false);
+    data(await ask(session, 'meeting_book', booking));
+    data(await ask(session, 'meeting_book', booking));
     const bookings = calendar.live(PRINCIPAL).filter((event) => event.tags?.gwsEaRole === 'booking');
     expect(bookings).toHaveLength(1);
     // One invitation went out: no second insert, and no update that would email the attendees again.
     expect(calendar.writes.filter((write) => write.sendUpdates === 'all')).toHaveLength(1);
   });
 
-  it('refuses a different time once the meeting has a booking', async () => {
+  it('refuses another time while a booking an earlier attempt left is still unfinished', async () => {
     const { meeting: stored, session } = await arranged(sam);
     const [first, second] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
-    data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: first.slot_id }));
-    expect(refusal(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: second.slot_id }))).toMatch(
-      /already booked/,
+    data(
+      await ask(session, 'meeting_book', {
+        meeting_id: stored.id,
+        slot_id: first.slot_id,
+        invitation: { title: 'Partnership intro' },
+      }),
     );
+    // The host stopped after recording the booking but before the meeting counted as booked.
+    await getDb().run("UPDATE gws_ea_meetings SET state = 'active' WHERE id = ?", stored.id);
+    const writes = calendar.writes.length;
+    expect(refusal(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: second.slot_id }))).toMatch(
+      /is already booked for/,
+    );
+    expect(calendar.writes).toHaveLength(writes);
+    expect(await getBooking(stored.id)).toMatchObject({ start_at: first.start });
   });
 });
 
@@ -569,6 +809,16 @@ describe('AE3: book for a reschedule moves the original event', () => {
     const session = await meetingSession(moved.meeting_id);
     const eventsBefore = calendar.events.length;
     const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: moved.meeting_id }));
+    // Its title, place and notes are the principal's own: a move takes no invitation.
+    expect(
+      refusal(
+        await ask(session, 'meeting_book', {
+          meeting_id: moved.meeting_id,
+          slot_id: slot.slot_id,
+          invitation: { title: 'Coffee, moved' },
+        }),
+      ),
+    ).toMatch(/principal's own event/);
     data(await ask(session, 'meeting_book', { meeting_id: moved.meeting_id, slot_id: slot.slot_id }));
 
     expect(calendar.events).toHaveLength(eventsBefore);
@@ -588,7 +838,6 @@ describe('AE3: book for a reschedule moves the original event', () => {
       end: { dateTime: slot.end },
     });
     expect(await getBooking(String(moved.meeting_id))).toMatchObject({ event_id: 'evt-coffee', start_at: slot.start });
-    data(await ask(session, 'meeting_outcome', { meeting_id: moved.meeting_id, outcome: 'booked' }));
   });
 });
 
@@ -613,6 +862,28 @@ describe('a colleague (R11)', () => {
     expect(event.start?.dateTime).toBe(WEDNESDAY_10AM);
     expect(calendar.writes.find((write) => write.eventId === event.id)?.sendUpdates).toBe('all');
     expect(await getBooking(stored.id)).toMatchObject({ event_id: event.id, start_at: WEDNESDAY_10AM });
+  });
+
+  it("is booked with the invitation main gives, and main's purpose as its title when it gives none", async () => {
+    calendar.calendars.set(PRINCIPAL, {
+      id: PRINCIPAL,
+      accessRole: 'writer',
+      primary: false,
+      conferenceTypes: ['hangoutsMeet'],
+    });
+    calendar.sharedFreeBusy.set(KIM, []);
+    const answer = data(
+      await ask(
+        main,
+        'meeting_arrange',
+        arrangeWith(kim, { invitation: { video_call: true, notes: 'Bring the Q4 numbers.' } }),
+      ),
+    );
+    expect(answer.state).toBe('booked');
+    const [event] = calendar.live(PRINCIPAL).filter((e) => e.tags?.gwsEaRole === 'booking');
+    expect(event).toMatchObject({ summary: 'Partnership intro', description: 'Bring the Q4 numbers.' });
+    expect(event.conference?.status).toBe('success');
+    expect((await meeting(answer.meeting_id)).invitation).toEqual({ video_call: true, notes: 'Bring the Q4 numbers.' });
   });
 
   it('whose free/busy is hidden is arranged by email, as anyone else', async () => {
@@ -685,5 +956,26 @@ describe("a meeting's holds", () => {
     expect(holds()).toHaveLength(2);
     data(await ask(main, 'meeting_amend', { meeting_id: stored.id, length_minutes: 60 }));
     expect(holds()).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The host/container action-response id contract
+// ---------------------------------------------------------------------------
+
+describe('the typed-request answer id', () => {
+  it("is filed by the host's writeActionResponse under exactly the id the runner's action-request.ts reads back", async () => {
+    const { meeting: stored, session } = await arranged(acme);
+    const requestId = 'contract-check-1';
+    await ask(session, 'meeting_free_time', { meeting_id: stored.id }, requestId);
+    const written = contents(session).find((content) => content.requestId === requestId);
+    expect(written).toBeDefined();
+
+    // The container cannot import the host: cross-check the literal template each side uses.
+    const runnerSource = fs.readFileSync(path.join('container', 'agent-runner', 'src', 'action-request.ts'), 'utf8');
+    const [, template] = runnerSource.match(/getMessageIn\(`([^`]+)`\)/u) ?? [];
+    expect(template).toBeDefined();
+    const expectedId = (template ?? '').replace('${requestId}', requestId);
+    expect(written?.row.id).toBe(expectedId);
   });
 });
