@@ -46,11 +46,15 @@ export const SDK_DISALLOWED_TOOLS = [
   'ReportFindings',
 ];
 
-// Tool allowlist for NanoClaw agent containers. MCP-tool entries are derived
-// from the registered `mcpServers` map so that any server added via
-// `add_mcp_server` (or wired in container.json directly) is reachable to the
-// agent — without this, the SDK's allowedTools filter silently drops every
-// MCP namespace not listed here.
+// The built-in half of the SDK's `allowedTools`; `resolveClaudeMcpServers`
+// appends one `mcp__<server>__*` pattern per registered MCP server. These are
+// permission allow rules: they pre-approve calls, which `bypassPermissions`
+// approves anyway, so a built-in missing here (such as the `subagents` key's
+// Agent, ListAgents and Workflow) is still offered. What an agent is offered
+// comes from `tools` and `disallowedTools`, which `resolveClaudeToolOptions`
+// sets from its capabilities. Two entries do widen the pinned Claude Code's
+// default set: Glob or Grep adds both, and TodoWrite adds TaskCreate,
+// TaskGet, TaskList and TaskUpdate.
 export const TOOL_ALLOWLIST = [
   'Bash',
   'Read',
@@ -69,6 +73,122 @@ export const TOOL_ALLOWLIST = [
   'Skill',
   'NotebookEdit',
 ];
+
+/**
+ * The runner half of the capability contract for Claude: which built-in tools
+ * each capability key grants. The host owns the keys and resolves a group's
+ * list; tool names are a Claude concept, so the mapping lives here. A tool
+ * listed under several keys is granted by any of them (Claude Code adds
+ * TaskStop beside Bash, to stop a background shell).
+ */
+export const CAPABILITY_BUILTIN_TOOLS: Readonly<Record<string, readonly string[]>> = {
+  'files-read': ['Read', 'Glob', 'Grep'],
+  'files-write': ['Write', 'Edit', 'NotebookEdit'],
+  shell: ['Bash', 'TaskStop'],
+  web: ['WebSearch', 'WebFetch'],
+  subagents: ['Task', 'Agent', 'TaskStop', 'TeamCreate', 'TeamDelete', 'ListAgents', 'Workflow'],
+};
+
+/** Built-ins every agent holding any key keeps: loading its selected skills and keeping its own task list. */
+export const BASE_BUILTIN_TOOLS: readonly string[] = [
+  'Skill',
+  'TaskCreate',
+  'TaskGet',
+  'TaskList',
+  'TaskUpdate',
+  'TodoWrite',
+  'ToolSearch',
+];
+
+/** The key that grants MCP servers other than NanoClaw's own: configured, plugin, and claude.ai connectors. */
+export const MCP_SERVERS_CAPABILITY = 'mcp-servers';
+
+/** NanoClaw's own tool server, which serves only the tool modules the group holds. */
+export const NANOCLAW_MCP_SERVER = 'nanoclaw';
+
+/**
+ * What a group's capabilities allow of Claude's own surfaces.
+ *
+ * `tools` is undefined when every built-in key is held: the SDK then offers
+ * its full default set, exactly as before capabilities existed. Otherwise it
+ * is the explicit allowlist, and a built-in no held key names is never offered.
+ */
+export interface ClaudeCapabilityPolicy {
+  tools?: readonly string[];
+  /** Built-ins of keys the group does not hold, disallowed outright. */
+  withheldTools: readonly string[];
+  /** Whether MCP servers other than NanoClaw's own are reachable. */
+  externalMcpServers: boolean;
+}
+
+export function resolveClaudeCapabilityPolicy(grants: ReadonlySet<string>): ClaudeCapabilityPolicy {
+  const granted = new Set<string>();
+  const named = new Set<string>();
+  for (const [key, tools] of Object.entries(CAPABILITY_BUILTIN_TOOLS)) {
+    for (const tool of tools) {
+      named.add(tool);
+      if (grants.has(key)) granted.add(tool);
+    }
+  }
+  const withheldTools = [...named].filter((tool) => !granted.has(tool));
+  // An agent that holds no key at all (a missing or corrupt list) is offered nothing.
+  const base = grants.size === 0 ? [] : BASE_BUILTIN_TOOLS;
+  return {
+    tools: withheldTools.length === 0 ? undefined : [...base, ...granted],
+    withheldTools,
+    externalMcpServers: grants.has(MCP_SERVERS_CAPABILITY),
+  };
+}
+
+/** Whether a policy lets the agent call a built-in (non-MCP) tool. */
+export function allowsBuiltinTool(policy: ClaudeCapabilityPolicy, toolName: string): boolean {
+  if (policy.withheldTools.includes(toolName)) return false;
+  return policy.tools === undefined || policy.tools.includes(toolName);
+}
+
+/** Whether a policy lets the agent call an `mcp__<server>__<tool>` tool. */
+export function allowsMcpTool(policy: ClaudeCapabilityPolicy, toolName: string): boolean {
+  return policy.externalMcpServers || toolName.startsWith(`mcp__${NANOCLAW_MCP_SERVER}__`);
+}
+
+/** The tool-shaping query options a policy produces. */
+export interface ClaudeToolOptions {
+  tools?: string[];
+  allowedTools: string[];
+  disallowedTools: string[];
+  mcpServers: Record<string, McpServerConfig>;
+  /** Ignore every MCP config file, so only the servers passed here can start. */
+  strictMcpConfig?: true;
+  env: Record<string, string>;
+}
+
+/**
+ * Shape the SDK query's tool options to a policy. A policy that withholds
+ * nothing returns today's options unchanged. Without `mcp-servers` only
+ * NanoClaw's own server is passed, MCP config files are ignored, and claude.ai
+ * connectors are switched off, so no other server's command ever starts.
+ */
+export function resolveClaudeToolOptions(
+  policy: ClaudeCapabilityPolicy,
+  mcp: { mcpServers: Record<string, McpServerConfig>; allowedTools: readonly string[] },
+  disallowedTools: readonly string[],
+): ClaudeToolOptions {
+  const mcpServers = policy.externalMcpServers
+    ? mcp.mcpServers
+    : Object.fromEntries(Object.entries(mcp.mcpServers).filter(([name]) => name === NANOCLAW_MCP_SERVER));
+  const allowedTools = mcp.allowedTools.filter((tool) =>
+    tool.startsWith('mcp__') ? allowsMcpTool(policy, tool) : allowsBuiltinTool(policy, tool),
+  );
+  return {
+    ...(policy.tools ? { tools: [...policy.tools] } : {}),
+    allowedTools,
+    disallowedTools: [...disallowedTools, ...policy.withheldTools],
+    mcpServers,
+    ...(policy.externalMcpServers ? {} : { strictMcpConfig: true as const }),
+    // The pinned CLI reads this switch beside its disableClaudeAiConnectors setting.
+    env: policy.externalMcpServers ? {} : { ENABLE_CLAUDEAI_MCP_SERVERS: 'false' },
+  };
+}
 
 // MCP server names are sanitized by the SDK when forming tool prefixes:
 // any character outside [A-Za-z0-9_-] becomes '_'. Mirror that here so our

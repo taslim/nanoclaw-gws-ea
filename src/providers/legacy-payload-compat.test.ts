@@ -12,6 +12,7 @@ vi.mock('../config.js', async (importOriginal) => ({
 
 import { resolveProviderContribution } from '../container-runner.js';
 import { getProviderHostContract } from '../provider-contracts/registry.js';
+import { resolveCapabilities } from '../capabilities.js';
 import type { ContainerConfig } from '../container-config.js';
 import type { AgentGroup, Session } from '../types.js';
 import { listProviderContainerConfigNames } from './provider-container-registry.js';
@@ -58,6 +59,7 @@ describeLegacy('pre-contract OpenCode payload on new host core', () => {
       packages: { apt: [], npm: [] },
       additionalMounts: [],
       skills: [],
+      capabilities: resolveCapabilities('all', 'legacy-opencode'),
     };
     const opencodeDir = path.join(TEST_ROOT, 'data/v2-sessions/group-1/session-1/opencode-xdg');
     const mkdir = vi.spyOn(fs, 'mkdirSync');

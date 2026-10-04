@@ -12,6 +12,7 @@ import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { resolveCapabilities } from './capabilities.js';
 import { CONTAINER_CPU_LIMIT, CONTAINER_MEMORY_LIMIT } from './config.js';
 import type { ContainerConfig } from './container-config.js';
 import {
@@ -85,6 +86,7 @@ const containerConfig: ContainerConfig = {
   packages: { apt: [], npm: [] },
   additionalMounts: [],
   skills: [],
+  capabilities: resolveCapabilities('all', 'container-runner-test'),
 } as unknown as ContainerConfig;
 
 const mounts: VolumeMount[] = [

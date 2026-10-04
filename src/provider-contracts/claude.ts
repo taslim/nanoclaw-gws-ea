@@ -21,6 +21,8 @@ export const CLAUDE_COMPATIBLE_HOST_SURFACES = {
       directory: '.claude-shared',
       containerPath: '/home/node/.claude',
       scope: 'group',
+      // Transcripts, settings, and session state: a sealed group's sessions each get their own.
+      sealedScope: 'session',
       mode: 'rw',
       mountClass: 'group-state',
     },

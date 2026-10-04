@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { MEMORY_SESSION_HOOK } from '../memory/session-hook.js';
+import { MEMORY_SESSION_HOOK, SEALED_MEMORY_SESSION_HOOK } from '../memory/session-hook.js';
 import './index.js';
 import '../provider-contracts/index.js';
 import { registerProviderMemorySessionHook } from '../provider-contracts/realize.js';
@@ -63,6 +63,36 @@ describe('Claude memory SessionStart registration', () => {
         hooks: [{ type: 'command', command: 'bun /app/src/memory/hook.ts', timeout: 10 }],
       },
     ]);
+  });
+
+  it('installs no memory hook for a sealed session, and removes one an earlier registration installed', () => {
+    const settingsFile = path.join(configDir, 'settings.json');
+    fs.writeFileSync(
+      settingsFile,
+      JSON.stringify({
+        hooks: {
+          SessionStart: [
+            { matcher: 'resume', hooks: [{ type: 'command', command: 'custom-resume' }] },
+            {
+              matcher: 'startup|clear|compact',
+              hooks: [{ type: 'command', command: 'bun /app/src/memory/hook.ts', timeout: 10 }],
+            },
+          ],
+        },
+      }),
+    );
+
+    const provider = createProvider('claude');
+    registerProviderMemorySessionHook('claude', provider, SEALED_MEMORY_SESSION_HOOK);
+
+    const settings = JSON.parse(fs.readFileSync(settingsFile, 'utf-8'));
+    expect(settings.hooks.SessionStart).toEqual([
+      { matcher: 'resume', hooks: [{ type: 'command', command: 'custom-resume' }] },
+    ]);
+
+    fs.writeFileSync(settingsFile, JSON.stringify({}));
+    registerProviderMemorySessionHook('claude', provider, SEALED_MEMORY_SESSION_HOOK);
+    expect(JSON.parse(fs.readFileSync(settingsFile, 'utf-8')).hooks).toEqual({});
   });
 
   it.each([undefined, 'Explanatory', 'My chat style'])('seeds tone without replacing %j', (outputStyle) => {

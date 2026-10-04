@@ -15,6 +15,9 @@
  * exception: skills replace mailbox/compose.ts and leave this import intact.
  */
 import '../mailbox/compose.js';
+// Per-group capabilities: its migration adds the column the host reads to
+// decide each group's tools, so it loads before anything spawns a group.
+import './capabilities/index.js';
 
 // Approvals (default tier) must load before self-mod (optional) so the
 // registerApprovalHandler / requestApproval symbols are bound when self-mod
@@ -28,4 +31,10 @@ import './gws-ea-google/index.js';
 import './gws-ea-main/index.js';
 import './gws-ea-profile/index.js';
 import './gws-ea-preferences/index.js';
+import './gws-ea-people/index.js';
+import './gws-ea-notices/index.js';
+import './gws-ea-privacy/index.js';
+import './gws-ea-external-email/index.js';
+import './gws-ea-inbox/index.js';
+import './gws-ea-meetings/index.js';
 import './community-portal/index.js';

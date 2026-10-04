@@ -42,6 +42,12 @@ export interface ContainerConfigRow {
    * and `SELECT *` rows surface it here. Absent means the default tier.
    */
   runtime_tier?: string | null;
+  /**
+   * JSON: '"all"' | '["reply","time"]' — see src/capabilities.ts. Optional on
+   * the TS type because the column arrives with the capabilities module's
+   * migration; absent means every group holds `all`.
+   */
+  capabilities?: string;
   updated_at: string;
 }
 

@@ -47,10 +47,14 @@ export function getGatewayProvider(): GatewayProviderDefinition {
   return selected;
 }
 
-/** Expose only the active gateway's agent skills; drop any other gateway's. */
-export function selectGatewayAgentSkills(skills: readonly string[]): string[] {
+/**
+ * Expose only the active gateway's agent skills; drop any other gateway's.
+ * An agent whose capabilities give it no way to use the gateway
+ * (`teachesGateway` in src/capabilities.ts) gets no gateway skill at all.
+ */
+export function selectGatewayAgentSkills(skills: readonly string[], teachesGateway: boolean): string[] {
   const gatewaySkills = new Set(listGatewayProviderRegistrations().flatMap((entry) => entry.agentSkills));
-  const required = getGatewayProvider().agentSkills;
+  const required = teachesGateway ? getGatewayProvider().agentSkills : [];
   return [...new Set([...skills.filter((skill) => !gatewaySkills.has(skill)), ...required])];
 }
 

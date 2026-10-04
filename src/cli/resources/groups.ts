@@ -1,6 +1,7 @@
 import { connectGatewayAccount } from '../../gateway-connections.js';
 import { randomUUID } from 'crypto';
 
+import { parseCapabilitiesArg, parseStoredCapabilities, type CapabilitySelection } from '../../capabilities.js';
 import {
   mcpServerPluginOwner,
   parseMcpServerConfig,
@@ -35,6 +36,7 @@ import {
 import { isValidTimezone } from '../../timezone.js';
 import type { AgentGroup, ContainerConfigRow } from '../../types.js';
 import { registerResource } from '../crud.js';
+import type { CallerContext } from '../frame.js';
 import { localizeIsoTimestamps } from '../format.js';
 
 /**
@@ -88,8 +90,30 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     additional_mounts: JSON.parse(row.additional_mounts),
     cli_scope: row.cli_scope,
     timezone: row.timezone,
+    capabilities: parseStoredCapabilities(row.capabilities, row.agent_group_id),
     updated_at: row.updated_at,
   };
+}
+
+/**
+ * Parse `--capabilities` for `config update`. An agent may change only its
+ * own list (and the command is held for approval); another group's list is
+ * its operator's alone. Unknown keys are refused here, the only writer.
+ */
+function parseCapabilitiesFlag(
+  value: unknown,
+  id: string,
+  row: ContainerConfigRow,
+  ctx: CallerContext,
+): CapabilitySelection | undefined {
+  if (value === undefined) return undefined;
+  if (ctx.caller === 'agent' && id !== ctx.agentGroupId) {
+    throw new Error("an agent can change only its own capabilities; another group's are set by its operator");
+  }
+  if (row.capabilities === undefined) {
+    throw new Error('--capabilities needs the capabilities module, whose migration adds the column');
+  }
+  return parseCapabilitiesArg(String(value));
 }
 
 registerResource({
@@ -400,14 +424,16 @@ registerResource({
       access: 'approval',
       description:
         'Update container config scalar fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
-        'Use --id <group-id> and any of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, ' +
+        'Use --id <group-id> and any of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --capabilities, ' +
+        '--capabilities is "all" or comma-separated keys and decides the agent\'s tools and reach (an agent may change only its own, with approval). ' +
         '--speed must be one of the speed tiers the group\'s provider declares (Claude: "standard", "fast"), or "" to follow the install default; a provider that declares none accepts only "". ' +
         '--timezone (IANA id like "Europe/Lisbon"; "" clears back to the install default; scheduled-task times follow it immediately, message display after restart).',
-      handler: async (args) => {
+      handler: async (args, ctx) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
         const row = await getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
+        const capabilities = parseCapabilitiesFlag(args.capabilities, id, row, ctx);
 
         const updates: Partial<
           Pick<
@@ -448,13 +474,14 @@ registerResource({
           updates.cli_scope = scope;
         }
 
-        if (Object.keys(updates).length === 0) {
+        if (Object.keys(updates).length === 0 && capabilities === undefined) {
           throw new Error(
-            'Nothing to update — provide at least one of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --timezone',
+            'Nothing to update — provide at least one of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --timezone, --capabilities',
           );
         }
 
         await updateContainerConfigScalars(id, updates);
+        if (capabilities !== undefined) await updateContainerConfigJson(id, 'capabilities', capabilities);
 
         const updated = (await getContainerConfig(id))!;
         return presentConfig(updated);

@@ -1,5 +1,6 @@
 /**
  * Core MCP tools: send_message, send_file, edit_message, add_reaction.
+ * `send_message` is the `reply` capability; the other three are `files-send`.
  *
  * All outbound tools resolve destinations via the local destination map
  * (see destinations.ts). Agents reference destinations by name; the map
@@ -30,6 +31,15 @@ function ok(text: string) {
 
 function err(text: string) {
   return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true };
+}
+
+/**
+ * The name a file is staged under in its outbox directory: a basename only,
+ * so a `filename` like `../../x` can never place it anywhere else.
+ */
+function outboxFilename(requested: string | undefined, sourcePath: string): string {
+  const name = requested ? path.basename(requested) : '';
+  return name && name !== '.' && name !== '..' ? name : path.basename(sourcePath);
 }
 
 function destinationList(): string {
@@ -132,7 +142,7 @@ export const sendFile: McpToolDefinition = {
     if (!fs.existsSync(resolvedPath)) return err(`File not found: ${filePath}`);
 
     const id = generateId();
-    const filename = (args.filename as string) || path.basename(resolvedPath);
+    const filename = outboxFilename(typeof args.filename === 'string' ? args.filename : undefined, resolvedPath);
 
     const outboxDir = path.join('/workspace/outbox', id);
     fs.mkdirSync(outboxDir, { recursive: true });
@@ -235,4 +245,5 @@ export const addReaction: McpToolDefinition = {
   },
 };
 
-registerTools([sendMessage, sendFile, editMessage, addReaction]);
+registerTools([sendMessage], 'reply');
+registerTools([sendFile, editMessage, addReaction], 'files-send');

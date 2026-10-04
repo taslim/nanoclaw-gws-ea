@@ -36,15 +36,22 @@
  */
 import type { AgentDestination } from '../../../types.js';
 import { getDb } from '../../../db/connection.js';
+import { assertDestinationAdmitted } from '../../../db/wiring-admission.js';
 import { deletePoliciesTouching, removeMessagePolicy } from './agent-message-policies.js';
 
 /**
+ * Write one destination, once every registered destination admission policy
+ * admits it (`src/db/wiring-admission.ts`); a refusal throws and writes
+ * nothing. Every writer goes through here: `ncl destinations add`, a
+ * wiring's companion row, and `create_agent`.
+ *
  * ⚠️  Caller responsibility: after this returns, call
  * `writeDestinations(row.agent_group_id, <sessionId>)` for each active
  * session of that agent group so the change propagates to the running
  * container's inbound.db. See the top-of-file invariant.
  */
 export async function createDestination(row: AgentDestination): Promise<void> {
+  await assertDestinationAdmitted({ proposed: row });
   await getDb().run(
     `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
      VALUES (@agent_group_id, @local_name, @target_type, @target_id, @created_at)`,

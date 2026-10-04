@@ -10,7 +10,6 @@ import type { AgentProvider, ProviderEvent, ProviderExchange } from './providers
 
 const CONTRACT = { textDelivery: 'mid-turn-complete', commands: { formatting: 'xml' } } as const;
 const DIAGNOSTIC = 'Private native provider diagnostic';
-const NOTICE = "Something went wrong on my side and I couldn't finish that. Please send it again.";
 
 function insertMessage(id: string, threadId: string, kind = 'chat', text = id): void {
   getInboundDb()
@@ -24,6 +23,22 @@ function insertMessage(id: string, threadId: string, kind = 'chat', text = id): 
 
 function visibleRows() {
   return getUndeliveredMessages().filter((row) => row.kind === 'chat');
+}
+
+/** The thread of each failed turn the runner reported to the host, in order. */
+function failedTurnThreads(): Array<string | null> {
+  return getUndeliveredMessages()
+    .filter((row) => row.kind === 'system')
+    .map((row) => {
+      const report = JSON.parse(row.content) as {
+        action: string;
+        channelType: string;
+        platformId: string;
+        threadId: string | null;
+      };
+      expect(report).toMatchObject({ action: 'turn_failed', channelType: 'slack', platformId: 'channel-1' });
+      return report.threadId;
+    });
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
@@ -92,7 +107,7 @@ async function runFailure(
 }
 
 describe('provider throws with active or queued turns', () => {
-  it('notifies the unfinished follow-up at its own route, leaving the completed opening turn alone', async () => {
+  it('reports the unfinished follow-up at its own route, leaving the completed opening turn alone', async () => {
     await runFailure(async function* (pushes) {
       yield { type: 'text', text: '<message to="main">Answered A</message>' };
       yield { type: 'result', text: '' };
@@ -103,11 +118,11 @@ describe('provider throws with active or queued turns', () => {
     });
     expect(visibleRows().map((row) => [JSON.parse(row.content).text, row.thread_id, row.in_reply_to])).toEqual([
       ['Answered A', 'thread-a', 'request-a'],
-      [NOTICE, 'thread-b', 'request-b'],
     ]);
+    expect(failedTurnThreads()).toEqual(['thread-b']);
   });
 
-  it('preserves a partial answer and notifies every abandoned route once, including still-queued turns', async () => {
+  it('preserves a partial answer and reports every abandoned route once, including still-queued turns', async () => {
     await runFailure(async function* (pushes) {
       yield { type: 'text', text: '<message to="main">Partial A</message>' };
       for (const [index, [id, thread]] of [
@@ -123,13 +138,11 @@ describe('provider throws with active or queued turns', () => {
     });
     expect(visibleRows().map((row) => [JSON.parse(row.content).text, row.thread_id])).toEqual([
       ['Partial A', 'thread-a'],
-      [NOTICE, 'thread-a'],
-      [NOTICE, 'thread-b'],
-      [NOTICE, 'thread-d'],
     ]);
+    expect(failedTurnThreads()).toEqual(['thread-a', 'thread-b', 'thread-d']);
   });
 
-  it('adds no failure notice after both turns completed', async () => {
+  it('reports no failed turn after both turns completed', async () => {
     await runFailure(async function* (pushes) {
       yield { type: 'text', text: '<message to="main">Answered A</message>' };
       yield { type: 'result', text: '' };
@@ -140,13 +153,15 @@ describe('provider throws with active or queued turns', () => {
       throw new Error(DIAGNOSTIC);
     });
     expect(visibleRows().map((row) => JSON.parse(row.content).text)).toEqual(['Answered A', 'Answered B']);
+    expect(failedTurnThreads()).toEqual([]);
   });
 
   it('masks an initial provider throw before any result', async () => {
     await runFailure(async function* () {
       throw new Error(DIAGNOSTIC);
     });
-    expect(visibleRows().map((row) => JSON.parse(row.content).text)).toEqual([NOTICE]);
+    expect(visibleRows()).toEqual([]);
+    expect(failedTurnThreads()).toEqual(['thread-a']);
   });
 
   it('does not turn a task-session throw into unsolicited chat', async () => {
@@ -154,14 +169,16 @@ describe('provider throws with active or queued turns', () => {
       throw new Error(DIAGNOSTIC);
     }, 'task');
     expect(visibleRows()).toEqual([]);
+    expect(failedTurnThreads()).toEqual([]);
   });
 
-  it('does not send a failure notice when the active query was explicitly cancelled', async () => {
+  it('reports no failed turn when the active query was explicitly cancelled', async () => {
     await runFailure(async function* (_pushes, controller) {
       controller.abort();
       throw new Error(DIAGNOSTIC);
     });
     expect(visibleRows()).toEqual([]);
+    expect(failedTurnThreads()).toEqual([]);
   });
 });
 
@@ -206,12 +223,13 @@ it('does not report slash-command cancellation as a provider failure', async () 
   expect(visibleRows().map((row) => [JSON.parse(row.content).text, row.thread_id])).toEqual([
     ['Session cleared.', 'thread-b'],
   ]);
+  expect(failedTurnThreads()).toEqual([]);
 });
 
-it('preserves the provider error for recovery when one notice write rejects, and still notices the next route', async () => {
+it('preserves the provider error for recovery when one report write rejects, and still reports the next route', async () => {
   const failure = new Error(DIAGNOSTIC);
   const write = spyOn(getAgentMailbox().operations, 'writeMessageOut').mockRejectedValueOnce(
-    new Error('Mailbox notice write rejected'),
+    new Error('Mailbox report write rejected'),
   );
   try {
     const recovered = await runFailure(async function* (pushes) {
@@ -221,7 +239,8 @@ it('preserves the provider error for recovery when one notice write rejects, and
     });
     expect(recovered).toBe(failure);
     expect(write).toHaveBeenCalledTimes(2);
-    expect(visibleRows().map((row) => [JSON.parse(row.content).text, row.thread_id])).toEqual([[NOTICE, 'thread-b']]);
+    expect(visibleRows()).toEqual([]);
+    expect(failedTurnThreads()).toEqual(['thread-b']);
   } finally {
     write.mockRestore();
   }

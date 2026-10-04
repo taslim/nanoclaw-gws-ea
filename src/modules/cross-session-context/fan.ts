@@ -29,11 +29,15 @@
  * writes deliberately bypass writeSessionMessage so ambient traffic never
  * makes an idle thread look busy.
  *
+ * Capability: only a group holding `conversation-context` hears its other
+ * sessions. Without it every session is sealed: nothing fans in or out.
+ *
  * Cost: the fan is off the message's critical path (callers fire it after
  * the wake, unawaited), does one bounded central read, and writes its ≤ K+1
  * targets concurrently through the lean path (existing mailbox only — no
  * provisioning, no last_active bump, no reconcile enqueue). Never throws.
  */
+import { CONVERSATION_CONTEXT_CAPABILITY, getGroupCapabilities } from '../../capabilities.js';
 import {
   getMessagingGroup,
   getMessagingGroupByPlatform,
@@ -247,6 +251,7 @@ async function writeEcho(input: EchoFanInput, targetSessionId: string, content: 
 
 async function fanEcho(input: EchoFanInput): Promise<number> {
   if (input.sourceMessagingGroupId === null) return 0;
+  if (!(await getGroupCapabilities(input.agentGroupId)).has(CONVERSATION_CONTEXT_CAPABILITY)) return 0;
   const candidates = await loadHotCandidates(input.agentGroupId, input.sourceMessagingGroupId);
   const targets = selectEchoTargets(candidates, input.sourceSessionId, input.sourceMessagingGroupId);
   if (targets.length === 0) return 0;

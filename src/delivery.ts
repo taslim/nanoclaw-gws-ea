@@ -13,6 +13,7 @@
 import {
   getRunningSessions,
   getActiveSessions,
+  getSession,
   createPendingQuestion,
   isTaskThread,
   TASKS_SYSTEM_THREAD_ID,
@@ -25,14 +26,15 @@ import {
   getMessagingGroupByPlatform,
   getMessagingGroupForOwnDestination,
 } from './db/messaging-groups.js';
-import { clearDeliveryAttempt, recordDeliveryAttempt } from './db/coordination.js';
+import { clearDeliveryAttempt, listExhaustedDeliveryAttempts, recordDeliveryAttempt } from './db/coordination.js';
 import { runGuarded, type DeliveryGuardSpec, type GuardedDeliveryHandler } from './delivery-guard.js';
 import { isUnguarded, type Unguarded } from './guard/index.js';
 import { mapConcurrent } from './concurrency.js';
 import { fanOutboundMessage } from './modules/cross-session-context/index.js';
 import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
-import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './session-manager.js';
+import { requestWake } from './request-wake.js';
+import { clearOutbox, readOutboxFiles, withExistingMailboxSession, writeSessionMessage } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { PendingApproval, Session } from './types.js';
@@ -41,15 +43,6 @@ import type { OutboundMessage } from './mailbox/index.js';
 const ACTIVE_POLL_MS = 1000;
 const SWEEP_POLL_MS = 60_000;
 const MAX_DELIVERY_ATTEMPTS = 3;
-
-/**
- * The one plain sentence the principal sees whenever the assistant could not
- * finish what they asked. The agent-runner sends the same sentence for a
- * failed run (container/agent-runner/src/poll-loop.ts); the two runtimes share
- * no modules, so the text is written in both places.
- */
-const FAILURE_NOTICE_TEXT = "Something went wrong on my side and I couldn't finish that. Please send it again.";
-
 /**
  * Sessions drained in parallel per poll tick. A visit is one mailbox round
  * trip (read the queue) plus the channel sends; serially, a tick scaled as
@@ -91,6 +84,18 @@ async function recordAttemptRow(messageId: string, sessionId: string, err: unkno
   /* eslint-enable no-catch-all/no-catch-all */
 }
 
+/** Messages given up on whose failure is not recorded yet; none when the bookkeeping cannot be read. */
+async function exhaustedAttempts(sessionId: string): Promise<Set<string>> {
+  /* eslint-disable no-catch-all/no-catch-all -- attempt bookkeeping must never break delivery */
+  try {
+    return await listExhaustedDeliveryAttempts(sessionId, MAX_DELIVERY_ATTEMPTS);
+  } catch (err) {
+    log.error('Failed to read spent delivery attempts — retrying them as usual this poll', { sessionId, err });
+    return new Set();
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+}
+
 async function clearAttemptRow(messageId: string): Promise<void> {
   /* eslint-disable no-catch-all/no-catch-all -- attempt bookkeeping must never break delivery */
   try {
@@ -102,7 +107,8 @@ async function clearAttemptRow(messageId: string): Promise<void> {
 }
 
 /**
- * Sessions whose outbound queue is currently being drained.
+ * Sessions whose outbound queue is currently being drained, each with the
+ * pass's completion, so a stop can wait for it (`stopDeliveryPolls`).
  *
  * The active poll (1s, running sessions) and the sweep poll (60s, all
  * active sessions) both call deliverSessionMessages, and a running session
@@ -114,7 +120,10 @@ async function clearAttemptRow(messageId: string): Promise<void> {
  * Skipping (vs. queueing) is correct: any message left over when the
  * second caller skips will be picked up on the next poll tick (~1s).
  */
-const inflightDeliveries = new Set<string>();
+const inflightDeliveries = new Map<string, Promise<void>>();
+
+/** How long a stop waits for delivery passes under way, so one is not cut between a send and its record. */
+const STOP_WAIT_MS = 10_000;
 
 export interface ChannelDeliveryAdapter {
   deliver(
@@ -138,6 +147,90 @@ export interface ChannelDeliveryAdapter {
   ): Promise<void>;
 }
 
+/**
+ * Outbound guards.
+ *
+ * Every send through the delivery adapter (an agent's reply, an approval
+ * card, a host notice) passes each registered guard, in registration order,
+ * before the channel sees it. The check lives in the adapter that
+ * setDeliveryAdapter installs, so a module sending through
+ * getDeliveryAdapter() cannot route around it.
+ *
+ * A guard allows the send or refuses it with a reason the sender may read.
+ * A refusal throws OutboundRefusedError and nothing reaches the channel; the
+ * delivery poll closes such a row as a third outcome beside delivered and
+ * failed (see closeRefused). A guard that throws fails closed: the send
+ * fails into the caller's normal failure path and the error is logged. With
+ * no guard registered, every send goes straight to the adapter.
+ */
+export interface OutboundSend {
+  readonly channelType: string;
+  readonly platformId: string;
+  readonly threadId: string | null;
+  /** Delivering adapter instance; undefined means the channel type's default. */
+  readonly instance: string | undefined;
+  readonly kind: string;
+  /** The serialized message, exactly as the adapter receives it. */
+  readonly content: string;
+  readonly files: readonly OutboundFile[] | undefined;
+}
+
+export type OutboundGuardDecision =
+  | { readonly effect: 'allow' }
+  | {
+      readonly effect: 'refuse';
+      /** Shown to the sender. Says why without repeating what was refused. */
+      readonly reason: string;
+    };
+
+export type OutboundGuard = (send: OutboundSend) => OutboundGuardDecision | Promise<OutboundGuardDecision>;
+
+/** A guard refused the send; nothing reached the channel. */
+export class OutboundRefusedError extends Error {
+  constructor(
+    readonly guardId: string,
+    readonly reason: string,
+  ) {
+    super(`Outbound send refused by ${guardId}`);
+    this.name = 'OutboundRefusedError';
+  }
+}
+
+const outboundGuards = new Map<string, OutboundGuard>();
+const OUTBOUND_GUARD_ID = /^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/u;
+
+/** Register a check every outbound send must pass. IDs take the `module:name` form. */
+export function registerOutboundGuard(id: string, guard: OutboundGuard): void {
+  if (!OUTBOUND_GUARD_ID.test(id)) throw new Error(`Invalid outbound guard ID: ${id}`);
+  if (outboundGuards.has(id)) throw new Error(`Outbound guard already registered: ${id}`);
+  outboundGuards.set(id, guard);
+}
+
+/** Only an explicit allow from every guard lets a send through. */
+async function assertOutboundAllowed(send: OutboundSend): Promise<void> {
+  for (const [id, guard] of outboundGuards) {
+    let decision: OutboundGuardDecision;
+    try {
+      decision = await guard(send);
+    } catch (err) {
+      log.error('Outbound guard threw — the send fails closed', { guardId: id, channelType: send.channelType, err });
+      throw new Error(`Outbound guard ${id} failed; nothing was sent`, { cause: err });
+    }
+    if (decision.effect === 'allow') continue;
+    throw new OutboundRefusedError(id, decision.reason);
+  }
+}
+
+function guardAdapter(adapter: ChannelDeliveryAdapter): ChannelDeliveryAdapter {
+  return {
+    async deliver(channelType, platformId, threadId, kind, content, files, instance) {
+      await assertOutboundAllowed({ channelType, platformId, threadId, instance, kind, content, files });
+      return adapter.deliver(channelType, platformId, threadId, kind, content, files, instance);
+    },
+    ...(adapter.setTyping && { setTyping: adapter.setTyping.bind(adapter) }),
+  };
+}
+
 let deliveryAdapter: ChannelDeliveryAdapter | null = null;
 let activePolling = false;
 let sweepPolling = false;
@@ -154,7 +247,8 @@ const adapterReadyCallbacks: AdapterReadyCallback[] = [];
 
 /** Current delivery adapter or null if not yet set. Modules use this in live
  *  message-flow handlers where the adapter is guaranteed to be set. For
- *  boot-time setup (before the adapter is ready), use onDeliveryAdapterReady. */
+ *  boot-time setup (before the adapter is ready), use onDeliveryAdapterReady.
+ *  Its sends pass the outbound guards. */
 export function getDeliveryAdapter(): ChannelDeliveryAdapter | null {
   return deliveryAdapter;
 }
@@ -169,16 +263,22 @@ export function onDeliveryAdapterReady(cb: AdapterReadyCallback): void {
   }
 }
 
-export function setDeliveryAdapter(adapter: ChannelDeliveryAdapter): void {
-  deliveryAdapter = adapter;
+/**
+ * Install the channel adapter and return its guarded form, which every host
+ * caller should use so its sends pass the registered outbound guards too.
+ */
+export function setDeliveryAdapter(adapter: ChannelDeliveryAdapter): ChannelDeliveryAdapter {
+  const guarded = guardAdapter(adapter);
+  deliveryAdapter = guarded;
   // Forward to the typing module so it can fire setTyping on its own
   // interval. Direct call, not a registry — typing is a default module.
   setTypingAdapter(adapter);
   for (const cb of adapterReadyCallbacks) {
     void Promise.resolve()
-      .then(() => cb(adapter))
+      .then(() => cb(guarded))
       .catch((err) => log.error('onDeliveryAdapterReady callback threw', { err }));
   }
+  return guarded;
 }
 
 /** Start the active container poll loop (~1s). */
@@ -252,12 +352,19 @@ export async function deliverSessionMessages(session: Session): Promise<void> {
   // Reject re-entry from a concurrent poll on the same session — see the
   // comment on inflightDeliveries above.
   if (inflightDeliveries.has(session.id)) return;
-  inflightDeliveries.add(session.id);
+  let finished: () => void = () => undefined;
+  inflightDeliveries.set(
+    session.id,
+    new Promise<void>((resolve) => {
+      finished = resolve;
+    }),
+  );
 
   try {
     await drainSession(session);
   } finally {
     inflightDeliveries.delete(session.id);
+    finished();
   }
 }
 
@@ -303,8 +410,14 @@ async function drainSession(session: Session): Promise<void> {
     }
   }
 
-  let failureNoticeSent = false;
+  // Rows given up on before a stop cut their report short: reported below, never sent again.
+  const exhausted = pending.length > 0 ? await exhaustedAttempts(session.id) : new Set<string>();
+  const givenUp: OutboundMessage[] = [];
   for (const msg of pending) {
+    if (exhausted.has(msg.id)) {
+      givenUp.push(msg);
+      continue;
+    }
     try {
       const platformMsgId = await deliverMessage(msg, session);
       await withExistingMailboxSession(agentGroup.id, session.id, (mailbox) =>
@@ -340,6 +453,10 @@ async function drainSession(session: Session): Promise<void> {
         }
       }
     } catch (err) {
+      if (err instanceof OutboundRefusedError) {
+        await closeRefused(msg, session, agentGroup.id, err);
+        continue;
+      }
       const attempts = await recordAttemptRow(msg.id, session.id, err);
       if (attempts !== null && attempts >= MAX_DELIVERY_ATTEMPTS) {
         log.error('Message delivery failed permanently, giving up', {
@@ -348,21 +465,7 @@ async function drainSession(session: Session): Promise<void> {
           attempts,
           err,
         });
-        try {
-          await withExistingMailboxSession(agentGroup.id, session.id, (mailbox) => mailbox.markDeliveryFailed(msg.id));
-          await clearAttemptRow(msg.id);
-          // One notice per pass, however many replies failed with it.
-          if (!failureNoticeSent && isUserFacingPost(msg)) {
-            failureNoticeSent = true;
-            await sendFailureNotice(session, msg);
-          }
-        } catch (markErr) {
-          log.error('Failed to record permanent delivery failure', {
-            messageId: msg.id,
-            sessionId: session.id,
-            err: markErr,
-          });
-        }
+        givenUp.push(msg);
       } else {
         log.warn('Message delivery failed, will retry', {
           messageId: msg.id,
@@ -375,6 +478,83 @@ async function drainSession(session: Session): Promise<void> {
       }
     }
   }
+
+  // Once per pass, after it: one report however many rows gave up together.
+  // The report comes before the failure is recorded: a stop between them
+  // leaves the rows pending with their attempts spent, and the next pass
+  // reports them again instead of losing the report.
+  if (givenUp.length > 0) {
+    for (const hook of deliveryFailedHooks) {
+      /* eslint-disable no-catch-all/no-catch-all -- a failing hook must never affect the recorded failure or other hooks */
+      try {
+        await hook(givenUp, session);
+      } catch (err) {
+        log.warn('Delivery-failed hook failed', { sessionId: session.id, err });
+      }
+      /* eslint-enable no-catch-all/no-catch-all */
+    }
+    for (const msg of givenUp) {
+      try {
+        await withExistingMailboxSession(agentGroup.id, session.id, (mailbox) => mailbox.markDeliveryFailed(msg.id));
+        await clearAttemptRow(msg.id);
+      } catch (markErr) {
+        log.error('Failed to record permanent delivery failure', {
+          messageId: msg.id,
+          sessionId: session.id,
+          err: markErr,
+        });
+      }
+    }
+  }
+}
+
+/**
+ * Close a row a guard refused. It is recorded as not delivered (the
+ * mailbox's terminal `failed` status), so it is never retried, and the agent
+ * that wrote it is told why. Nothing else follows: no cross-session copy and
+ * no post-delivery or delivery-failed hook, because nothing was sent and
+ * nothing failed. A row that cannot be recorded stays queued; the guard
+ * judges it again on the next poll, and the agent is told then.
+ */
+async function closeRefused(
+  msg: OutboundMessage,
+  session: Session,
+  agentGroupId: string,
+  refusal: OutboundRefusedError,
+): Promise<void> {
+  log.warn('Outbound message refused', { messageId: msg.id, sessionId: session.id, guardId: refusal.guardId });
+  /* eslint-disable no-catch-all/no-catch-all -- a refusal's bookkeeping must never break delivery of the rows after it */
+  try {
+    await withExistingMailboxSession(agentGroupId, session.id, (mailbox) => mailbox.markDeliveryFailed(msg.id));
+  } catch (err) {
+    log.error('Failed to record a refused delivery — it is judged again next poll', {
+      messageId: msg.id,
+      sessionId: session.id,
+      err,
+    });
+    return;
+  }
+  await clearAttemptRow(msg.id);
+  try {
+    await writeSessionMessage(session.agent_group_id, session.id, {
+      id: `refused-${msg.id}`,
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: session.agent_group_id,
+      channelType: 'agent',
+      threadId: null,
+      content: JSON.stringify({
+        text: `Your message was not sent: ${refusal.reason}`,
+        sender: 'system',
+        senderId: 'system',
+      }),
+    });
+    const fresh = await getSession(session.id);
+    if (fresh) await requestWake(fresh, 'inbound-message');
+  } catch (err) {
+    log.error('Could not tell the agent its message was refused', { messageId: msg.id, sessionId: session.id, err });
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
 }
 
 async function deliverMessage(
@@ -572,72 +752,6 @@ async function deliverMessage(
 }
 
 /**
- * A row the principal would have seen as a message. System actions, task run
- * logs, and agent-to-agent traffic are not; neither is a reaction the agent
- * placed, which is decoration rather than a reply.
- */
-function isUserFacingPost(msg: OutboundMessage): boolean {
-  if (msg.kind === 'system' || msg.kind === 'task_log' || msg.channelType === 'agent') return false;
-  if (!msg.channelType || !msg.platformId) return false;
-  let content: unknown;
-  /* eslint-disable no-catch-all/no-catch-all -- an unreadable row was still meant for the channel */
-  try {
-    content = JSON.parse(msg.content);
-  } catch {
-    return true;
-  }
-  /* eslint-enable no-catch-all/no-catch-all */
-  return (content as { operation?: unknown } | null)?.operation !== 'reaction';
-}
-
-/**
- * Tell the session's conversation, in the one fixed sentence, that the
- * assistant could not finish. Used for a reply that failed permanently and
- * for an inbound message that failed after its last retry
- * (src/reconcile-session.ts). The reason goes to the host log only.
- *
- * The notice goes to the chat the session serves, in the failed reply's
- * thread when that reply was bound for the same chat. It is one direct send
- * through the channel adapter, never queued or retried, so a channel that is
- * itself failing cannot turn one notice into a stream of them. A session with
- * no chat (a task session) or whose chat the bot has left has no one to tell.
- */
-export async function sendFailureNotice(
-  session: Session,
-  failed?: { channelType: string | null; platformId: string | null; threadId: string | null },
-  options: { readonly onlyToThatChat?: boolean } = {},
-): Promise<void> {
-  const adapter = deliveryAdapter;
-  const messagingGroupId = session.messaging_group_id;
-  if (!adapter || !messagingGroupId) return;
-  // Best effort from the lookup on: a caller's own work must never fail
-  // because the notice could not be sent, so every failure is logged, never
-  // retried, and never thrown.
-  /* eslint-disable no-catch-all/no-catch-all -- the notice is best effort; its failure is logged, never retried */
-  try {
-    const mg = await getMessagingGroup(messagingGroupId);
-    if (!mg || mg.detached_at) return;
-    const sameChat = failed?.channelType === mg.channel_type && failed.platformId === mg.platform_id;
-    // A failure is reported only to the chat it came from when the caller asks.
-    if (options.onlyToThatChat && !sameChat) return;
-    const threadId = sameChat ? failed.threadId : session.thread_id;
-    await adapter.deliver(
-      mg.channel_type,
-      mg.platform_id,
-      threadId,
-      'chat',
-      JSON.stringify({ text: FAILURE_NOTICE_TEXT }),
-      undefined,
-      mg.instance,
-    );
-    log.info('Failure notice delivered', { sessionId: session.id, channelType: mg.channel_type });
-  } catch (err) {
-    log.error('Failure notice could not be delivered', { sessionId: session.id, err });
-  }
-  /* eslint-enable no-catch-all/no-catch-all */
-}
-
-/**
  * Post-delivery hooks.
  *
  * Registered modules observe each successfully delivered user-facing
@@ -666,6 +780,30 @@ const postDeliveryHooks: PostDeliveryHook[] = [];
 
 export function registerPostDeliveryHook(hook: PostDeliveryHook): void {
   postDeliveryHooks.push(hook);
+}
+
+/**
+ * Delivery-failed hooks.
+ *
+ * Registered modules hear, once per delivery pass, about every row that pass
+ * gave up on after MAX_DELIVERY_ATTEMPTS, of any kind, so the hook decides
+ * which failures matter and who hears about them. A refused row never
+ * reaches them: a refusal is an outcome the sending agent is told about, not
+ * a failure.
+ *
+ * They hear before the failure is recorded, so a stop in between never loses
+ * the report: the next pass reports those rows again. A hook may therefore
+ * hear a row more than once, and must be safe to repeat.
+ *
+ * Like post-delivery hooks, each invocation is isolated: a failing hook can
+ * never affect delivery, the recorded failure, or the hooks after it.
+ */
+export type DeliveryFailedHook = (failed: readonly OutboundMessage[], session: Session) => void | Promise<void>;
+
+const deliveryFailedHooks: DeliveryFailedHook[] = [];
+
+export function registerDeliveryFailedHook(hook: DeliveryFailedHook): void {
+  deliveryFailedHooks.push(hook);
 }
 
 /**
@@ -788,7 +926,22 @@ async function handleSystemAction(content: Record<string, unknown>, session: Ses
   log.warn('Unknown system action', { action });
 }
 
-export function stopDeliveryPolls(): void {
+/**
+ * Stop both polls, then wait up to `maxWaitMs` for delivery passes already
+ * under way: the host closes the DB next, and a pass cut short would lose
+ * what it was about to record.
+ */
+export async function stopDeliveryPolls(maxWaitMs = STOP_WAIT_MS): Promise<void> {
   activePolling = false;
   sweepPolling = false;
+  const running = [...inflightDeliveries.values()];
+  if (running.length === 0) return;
+  let bound: NodeJS.Timeout | undefined;
+  await Promise.race([
+    Promise.all(running),
+    new Promise<void>((resolve) => {
+      bound = setTimeout(resolve, maxWaitMs);
+    }),
+  ]);
+  clearTimeout(bound);
 }

@@ -26,8 +26,7 @@ import { fileURLToPath } from 'url';
 import { loadConfig } from './config.js';
 import { buildSystemPromptAddendum } from './destinations.js';
 import { getTaskSeriesId } from './db/session-routing.js';
-import { ensureMemoryScaffold } from './memory/scaffold.js';
-import { MEMORY_SESSION_HOOK } from './memory/session-hook.js';
+import { prepareSessionMemory, sessionsSealed } from './memory/sealed.js';
 // Module barrel — loads registration modules, including the singular mailbox slot.
 import './modules/index.js';
 import { getAgentMailbox, readMailboxContext } from './mailbox/index.js';
@@ -60,8 +59,11 @@ async function main(): Promise<void> {
   log(`Starting v2 agent-runner (provider: ${providerName})`);
 
   // Every provider shares one persistent memory tree. Legacy imports are an
-  // operator-run migration and never happen in this normal startup path.
-  ensureMemoryScaffold();
+  // operator-run migration and never happen in this normal startup path. A
+  // sealed session (one whose group lacks conversation-context) keeps no
+  // group memory and archives no conversation: see memory/sealed.ts.
+  const sealed = sessionsSealed(config.capabilities);
+  const memoryHook = prepareSessionMemory(sealed);
 
   // Runtime-generated system-prompt addendum: agent identity (name) plus
   // the live destinations map. Everything else (capabilities, per-module
@@ -123,7 +125,10 @@ async function main(): Promise<void> {
     effort: config.effort,
     speed: config.speed,
   });
-  registerProviderMemorySessionHook(providerName, provider, MEMORY_SESSION_HOOK);
+  registerProviderMemorySessionHook(providerName, provider, memoryHook);
+  // A provider that persists each exchange into the group's conversations/
+  // archives nothing for a sealed session.
+  if (sealed) delete provider.onExchangeComplete;
 
   try {
     await runPollLoop({

@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 
 import { getDb } from '../../db/connection.js';
-import { hasControlCharacters } from '../../gws-ea/validation.js';
+import { parseLine, parseOptionalLine } from '../../gws-ea/validation.js';
 
 export const WEEKDAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] as const;
 export type Weekday = (typeof WEEKDAYS)[number];
@@ -241,16 +241,8 @@ function parseSource(value: string): PreferenceSource {
   return source;
 }
 
-function parseLine(value: string, label: string, maxLength: number): string {
-  const text = value.trim();
-  if (!text || text.length > maxLength || hasControlCharacters(text)) {
-    throw new Error(`${label} must be one line of 1 to ${maxLength} characters`);
-  }
-  return text;
-}
-
 function parseReason(value: string | undefined): string | null {
-  return value === undefined || value.trim() === '' ? null : parseLine(value, 'Reason', REASON_MAX_LENGTH);
+  return value === undefined ? null : parseOptionalLine(value, 'Reason', REASON_MAX_LENGTH);
 }
 
 /**

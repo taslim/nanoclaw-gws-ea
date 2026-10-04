@@ -23,6 +23,9 @@ afterEach(() => {
 // after a mid-turn delivery must not trigger the unwrapped-nudge. Providers
 // without the capability keep the single result-door delivery path.
 
+/** The failed turn as the runner reports it to the host: a typed action carrying the turn's route. */
+const TURN_FAILED = { action: 'turn_failed', channelType: 'discord', platformId: 'chan-1', threadId: null };
+
 const CHAT_ROUTING = {
   platformId: 'chan-1',
   channelType: 'discord',
@@ -257,7 +260,7 @@ describe('mid-turn <message> block delivery', () => {
     expect(pushes.filter((p) => p.includes('was not delivered'))).toHaveLength(1);
   });
 
-  it('delivers a safe failure notice after a mid-turn delivery in the same turn', async () => {
+  it('reports the failed turn after a mid-turn delivery in the same turn', async () => {
     seedDest();
     const errText = 'Spending limit reached. Add your own key at https://example.com/keys';
     async function* events(): AsyncGenerator<ProviderEvent> {
@@ -270,11 +273,9 @@ describe('mid-turn <message> block delivery', () => {
     await processQuery(query, CHAT_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, true);
 
     const out = getUndeliveredMessages();
-    expect(out).toHaveLength(2);
+    expect(out.map((row) => row.kind)).toEqual(['chat', 'system']);
     expect(JSON.parse(out[0].content).text).toBe('Started on it.');
-    expect(JSON.parse(out[1].content).text).toBe(
-      "Something went wrong on my side and I couldn't finish that. Please send it again.",
-    );
+    expect(JSON.parse(out[1].content)).toEqual(TURN_FAILED);
     expect(pushes).toHaveLength(0);
   });
 
@@ -290,9 +291,9 @@ describe('mid-turn <message> block delivery', () => {
 
     await processQuery(query, CHAT_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, true);
 
-    expect(getUndeliveredMessages().map((row) => JSON.parse(row.content).text)).toEqual([
-      'Partial progress report.',
-      "Something went wrong on my side and I couldn't finish that. Please send it again.",
+    expect(getUndeliveredMessages().map((row) => JSON.parse(row.content) as unknown)).toEqual([
+      { text: 'Partial progress report.' },
+      TURN_FAILED,
     ]);
     expect(pushes).toHaveLength(0);
   });

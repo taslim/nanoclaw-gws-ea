@@ -36,6 +36,50 @@ export function normalizePrincipalEmail(value: string): string | undefined {
   return valid ? email : undefined;
 }
 
+const GMAIL_DOMAINS = new Set(['gmail.com', 'googlemail.com']);
+
+/**
+ * One identity in every spelling that reaches the same mailbox: an email
+ * handle lowercased, without its `+tag`, and, at Gmail, without the dots
+ * Gmail ignores. Other handles are already canonical. Used only to widen a
+ * protection (a fingerprint, a refusal, a release to the principal), never
+ * to grant a level to a different handle.
+ *
+ * The agent runner applies the same rule to bare addresses (`mailboxKey` in
+ * container/agent-runner/src/mcp-tools/calendar-facts.ts). The two runtimes
+ * share no code, so a change to one is made to both.
+ */
+export function identityMatchKey(handle: string): string {
+  if (!handle.toLowerCase().startsWith('email:')) return handle;
+  const address = handle.slice('email:'.length).toLowerCase();
+  const at = address.lastIndexOf('@');
+  if (at <= 0) return `email:${address}`;
+  let local = address.slice(0, at);
+  let domain = address.slice(at + 1);
+  const plus = local.indexOf('+');
+  if (plus > 0) local = local.slice(0, plus);
+  if (GMAIL_DOMAINS.has(domain)) {
+    const undotted = local.replaceAll('.', '');
+    if (undotted) local = undotted;
+    domain = 'gmail.com';
+  }
+  return `email:${local}@${domain}`;
+}
+
+/** `value` trimmed, refused unless it is one line of 1 to `maxLength` characters; `label` names it in the refusal. */
+export function parseLine(value: string, label: string, maxLength: number): string {
+  const text = value.trim();
+  if (!text || text.length > maxLength || hasControlCharacters(text)) {
+    throw new Error(`${label} must be one line of 1 to ${maxLength} characters`);
+  }
+  return text;
+}
+
+/** As `parseLine`, but a blank value is null: it clears the field. */
+export function parseOptionalLine(value: string, label: string, maxLength: number): string | null {
+  return value.trim() === '' ? null : parseLine(value, label, maxLength);
+}
+
 /** Parse JSON text; malformed text raises `code`. */
 export function parseJson(source: string, label: string, code: string): unknown {
   try {

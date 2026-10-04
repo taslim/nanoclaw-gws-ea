@@ -57,7 +57,7 @@ async function writeRequest(mailbox: AgentMailbox, req: RequestFrame): Promise<v
 }
 
 /**
- * Poll the mailbox for a cli_response matching our requestId.
+ * Poll the mailbox for the action_response matching our requestId.
  */
 async function pollResponse(mailbox: AgentMailbox, requestId: string, timeoutMs: number): Promise<ResponseFrame | null> {
   const deadline = Date.now() + timeoutMs;

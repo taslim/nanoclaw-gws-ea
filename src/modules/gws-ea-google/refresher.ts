@@ -1,16 +1,41 @@
 /**
- * Keeps OneCLI's Google secrets holding a live token for each exposed service
- * (KTD2). Each tick renews a token close to expiry, so the first tick after
- * the host starts, or after the machine wakes, puts a fresh one in place. A
- * revoked sign-in is reported once and not retried until a new grant is
+ * The host's Google tokens (KTD6). Each tick publishes a live token for
+ * every agent-facing service through the selected gateway's credential
+ * connection, renewing one close to expiry, so the first tick after the host
+ * starts, or after the machine wakes, puts a fresh one in place. The host is
+ * the only writer of these credentials. Tokens for host-only services are
+ * minted on demand and held in this process's memory alone.
+ *
+ * A revoked sign-in is reported once and not retried until a new grant is
  * written; any other failure is retried on the next tick.
  */
-import { EXPOSED_GOOGLE_SERVICES, GOOGLE_SERVICES, type GoogleGrant, type GoogleServiceId } from './grant.js';
-import { upsertBearerSecret, type OnecliApi } from './onecli-secrets.js';
-import { GoogleGrantRevokedError, mintServiceToken } from './tokens.js';
+import type {
+  GatewayCredentialTarget,
+  GatewayRuntimeCredentialConnection,
+} from '../../gateway-providers/credential-connection.js';
+import {
+  AGENT_GOOGLE_SERVICES,
+  EXPOSED_GOOGLE_SERVICES,
+  type AgentGoogleServiceId,
+  type GoogleGrant,
+  type HostGoogleServiceId,
+} from './grant.js';
+import { GoogleGrantRevokedError, mintServiceToken, type ServiceToken, type TokenOptions } from './tokens.js';
 
 /** Renew a token this long before Google expires it. */
 export const RENEW_BEFORE_EXPIRY_MS = 15 * 60_000;
+
+/** What agents' tools send in place of a token; the gateway replaces it on the service's host. */
+export const GATEWAY_TOKEN_PLACEHOLDER = 'gateway-managed';
+
+/** The secret an earlier release published Gmail's modify scope under. No agent may hold it, so the host removes it. */
+export const STALE_GMAIL_SECRET = { name: 'google-gmail', host: 'gmail.googleapis.com' } as const;
+
+const BEARER = { headerName: 'Authorization', valueFormat: 'Bearer {value}' } as const;
+
+function bearerTarget(name: string, host: string): GatewayCredentialTarget {
+  return { kind: 'api-key', name, host, proxyValue: GATEWAY_TOKEN_PLACEHOLDER, injection: { ...BEARER } };
+}
 
 export interface RefresherLog {
   info(message: string, fields?: Record<string, unknown>): void;
@@ -21,8 +46,8 @@ export interface RefresherLog {
 export interface RefresherOptions {
   /** The current grant, or undefined before the assistant has signed in. */
   readonly readGrant: () => Promise<GoogleGrant | undefined>;
-  readonly onecli: OnecliApi;
-  readonly services?: readonly GoogleServiceId[];
+  /** The selected gateway's connection for one credential: the only way a token is stored. */
+  readonly connection: (target: GatewayCredentialTarget) => GatewayRuntimeCredentialConnection;
   readonly fetch?: typeof globalThis.fetch;
   readonly now?: () => number;
   readonly log: RefresherLog;
@@ -30,6 +55,8 @@ export interface RefresherOptions {
 
 export interface GoogleTokenRefresher {
   tick(): Promise<void>;
+  /** A live token for a host-only service, held only in this process's memory. */
+  hostAccessToken(service: HostGoogleServiceId): Promise<string>;
 }
 
 /** A grant is identified by its sign-in, so a new sign-in clears a revoked one. */
@@ -37,23 +64,72 @@ function grantIdentity(grant: GoogleGrant): string {
   return `${grant.account}\0${grant.granted_at}`;
 }
 
+function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export function createGoogleTokenRefresher(options: RefresherOptions): GoogleTokenRefresher {
-  const services = options.services ?? EXPOSED_GOOGLE_SERVICES;
   const now = options.now ?? Date.now;
-  const expiresAt = new Map<GoogleServiceId, number>();
+  const tokenOptions: TokenOptions = { ...(options.fetch ? { fetch: options.fetch } : {}), now };
+  const expiresAt = new Map<AgentGoogleServiceId, number>();
+  const hostTokens = new Map<HostGoogleServiceId, { identity: string; token: ServiceToken }>();
+  const minting = new Map<HostGoogleServiceId, Promise<string>>();
   let revoked: string | undefined;
   let current: string | undefined;
+  let staleRemoved = false;
+  let staleReported = false;
+
+  /** Remove the stale Gmail secret once; until that succeeds, retry each tick and report it once. */
+  async function removeStaleSecret(): Promise<void> {
+    if (staleRemoved) return;
+    try {
+      const connection = options.connection(bearerTarget(STALE_GMAIL_SECRET.name, STALE_GMAIL_SECRET.host));
+      if (await connection.find()) {
+        await connection.remove();
+        options.log.info('Removed the stale Gmail secret no agent may hold', { secret: STALE_GMAIL_SECRET.name });
+      }
+      staleRemoved = true;
+      /* eslint-disable-next-line no-catch-all/no-catch-all -- A background loop: the failure is reported and the next tick retries. */
+    } catch (error) {
+      if (staleReported) return;
+      staleReported = true;
+      options.log.error('Could not remove the stale Gmail secret; status reports it until it is gone', {
+        secret: STALE_GMAIL_SECRET.name,
+        error: message(error),
+      });
+    }
+  }
+
+  async function mintHostToken(service: HostGoogleServiceId): Promise<string> {
+    const grant = await options.readGrant();
+    if (!grant) throw new Error('The assistant is not signed in to Google yet');
+    const identity = grantIdentity(grant);
+    if (revoked === identity) {
+      throw new GoogleGrantRevokedError("Google no longer accepts the assistant's sign-in; sign in again");
+    }
+    const held = hostTokens.get(service);
+    if (held && held.identity === identity && held.token.expiresAt - now() > RENEW_BEFORE_EXPIRY_MS) {
+      return held.token.accessToken;
+    }
+    try {
+      const token = await mintServiceToken(grant, service, tokenOptions);
+      hostTokens.set(service, { identity, token });
+      return token.accessToken;
+    } catch (error) {
+      if (error instanceof GoogleGrantRevokedError) revoked = identity;
+      throw error;
+    }
+  }
 
   return {
     async tick() {
+      await removeStaleSecret();
       let grant: GoogleGrant | undefined;
       try {
         grant = await options.readGrant();
         /* eslint-disable-next-line no-catch-all/no-catch-all -- A background loop: any failure is logged and the next tick retries. */
       } catch (error) {
-        options.log.error("Could not read the assistant's Google sign-in", {
-          error: error instanceof Error ? error.message : String(error),
-        });
+        options.log.error("Could not read the assistant's Google sign-in", { error: message(error) });
         return;
       }
       if (!grant) return;
@@ -65,19 +141,14 @@ export function createGoogleTokenRefresher(options: RefresherOptions): GoogleTok
       }
       if (revoked === identity) return;
 
-      for (const id of services) {
-        const service = GOOGLE_SERVICES[id];
+      for (const id of EXPOSED_GOOGLE_SERVICES) {
+        const service = AGENT_GOOGLE_SERVICES[id];
         if ((expiresAt.get(id) ?? 0) - now() > RENEW_BEFORE_EXPIRY_MS) continue;
         try {
-          const token = await mintServiceToken(grant, service, {
-            ...(options.fetch ? { fetch: options.fetch } : {}),
-            now,
-          });
-          await upsertBearerSecret(options.onecli, {
-            name: service.secretName,
-            hostPattern: service.hostPattern,
-            value: token.accessToken,
-          });
+          const token = await mintServiceToken(grant, id, tokenOptions);
+          const connection = options.connection(bearerTarget(service.secretName, service.hostPattern));
+          await connection.find();
+          await connection.save(token.accessToken);
           expiresAt.set(id, token.expiresAt);
           options.log.info('Renewed Google access for agents', {
             service: id,
@@ -92,10 +163,19 @@ export function createGoogleTokenRefresher(options: RefresherOptions): GoogleTok
           }
           options.log.warn('Could not renew Google access for agents; retrying', {
             service: id,
-            error: error instanceof Error ? error.message : String(error),
+            error: message(error),
           });
         }
       }
+    },
+
+    hostAccessToken(service) {
+      // Callers asking at once share one mint.
+      const pending = minting.get(service);
+      if (pending) return pending;
+      const minted = mintHostToken(service).finally(() => minting.delete(service));
+      minting.set(service, minted);
+      return minted;
     },
   };
 }

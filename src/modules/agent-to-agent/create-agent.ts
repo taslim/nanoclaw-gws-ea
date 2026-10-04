@@ -25,7 +25,8 @@ import { groupFolderExistsOnDisk } from '../../group-folder.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
-import type { AgentGroup, Session } from '../../types.js';
+import { destinationRefusal } from '../../db/wiring-admission.js';
+import type { AgentDestination, AgentGroup, Session } from '../../types.js';
 import { requestApproval } from '../approvals/index.js';
 import { createDestination, getDestinationByName, normalizeName } from './db/agent-destinations.js';
 import { writeDestinations } from './write-destinations.js';
@@ -149,6 +150,35 @@ async function performCreateAgent(
   const agentGroupId = `ag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const now = new Date().toISOString();
 
+  // The two destinations below are judged before anything is written, so a
+  // refused one never leaves a group behind without them.
+  const toChild: AgentDestination = {
+    agent_group_id: sourceGroup.id,
+    local_name: localName,
+    target_type: 'agent',
+    target_id: agentGroupId,
+    created_at: now,
+  };
+  const toParent: AgentDestination = {
+    agent_group_id: agentGroupId,
+    local_name: 'parent',
+    target_type: 'agent',
+    target_id: sourceGroup.id,
+    created_at: now,
+  };
+  for (const proposed of [toChild, toParent]) {
+    const refusal = await destinationRefusal({ proposed });
+    if (refusal) {
+      await notify(`Cannot create agent "${name}": ${refusal.reason}`);
+      log.warn('create_agent refused by destination admission', {
+        policy: refusal.policyId,
+        name,
+        parent: sourceGroup.id,
+      });
+      return;
+    }
+  }
+
   const newGroup: AgentGroup = {
     id: agentGroupId,
     name,
@@ -169,13 +199,7 @@ async function performCreateAgent(
 
   // Insert bidirectional destination rows (= ACL grants).
   // Creator refers to child by the name it chose; child refers to creator as "parent".
-  await createDestination({
-    agent_group_id: sourceGroup.id,
-    local_name: localName,
-    target_type: 'agent',
-    target_id: agentGroupId,
-    created_at: now,
-  });
+  await createDestination(toChild);
   // Handle the unlikely case where the child already has a "parent" destination
   // (shouldn't happen for a brand-new agent, but be safe).
   let parentName = 'parent';
@@ -184,13 +208,7 @@ async function performCreateAgent(
     parentName = `parent-${parentSuffix}`;
     parentSuffix++;
   }
-  await createDestination({
-    agent_group_id: agentGroupId,
-    local_name: parentName,
-    target_type: 'agent',
-    target_id: sourceGroup.id,
-    created_at: now,
-  });
+  await createDestination({ ...toParent, local_name: parentName });
 
   // REQUIRED: project the new destination into the running container's
   // inbound.db. See the top-of-file invariant in db/agent-destinations.ts

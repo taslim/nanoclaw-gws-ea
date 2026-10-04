@@ -18,6 +18,12 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   },
 }));
 
+// The group's keys: Bash needs one that grants it, while the hook passes
+// NanoClaw's own tools whatever the group holds (its tool server gates them).
+const GRANTS: ReadonlySet<string> = new Set(['shell']);
+const actualConfig = await import('../config.js');
+mock.module('../config.js', () => ({ ...actualConfig, runnerCapabilities: () => GRANTS }));
+
 await import('./index.js');
 await import('../provider-contracts/index.js');
 const { createProvider } = await import('./factory.js');

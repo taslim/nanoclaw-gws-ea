@@ -16,15 +16,21 @@
  * satisfies a hold but NEVER a deny, an approval issued while the install
  * ran on Docker cannot execute after a switch to a driver without
  * imageBuild. add_mcp_server needs no rebuild and carries no gate.
+ *
+ * A protected agent group (src/cli/guard.ts) is the host's alone, so a
+ * self-modification request from one is DENIED, never carded.
  */
+import { protectedGroupReason } from '../../cli/guard.js';
 import { getSessionDriver } from '../../drivers/index.js';
 import { DENY, HOLD, defineGuardedAction, type GuardInput } from '../../guard/index.js';
 
 function selfModDecide(label: string) {
-  return (input: GuardInput) => {
+  return async (input: GuardInput) => {
     if (input.actor.kind !== 'agent') {
       return DENY(`${label} is a container-originated action.`);
     }
+    const protectedReason = await protectedGroupReason(input.actor.agentGroupId);
+    if (protectedReason !== undefined) return DENY(`${label} is not allowed: ${protectedReason}`);
     return HOLD(`${label} always requires admin approval from the container path`);
   };
 }

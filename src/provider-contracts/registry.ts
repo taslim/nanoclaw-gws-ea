@@ -48,6 +48,15 @@ export interface ProviderStateVolume {
   directory: string;
   containerPath: string;
   scope: 'group' | 'session';
+  /**
+   * Where a `group` volume lives for a group whose sessions are sealed, one
+   * without the `conversation-context` capability. `session` declares that
+   * the volume holds conversation state, such as the provider's transcripts,
+   * that one session must never read from another: such a group realizes it
+   * per session, seeded from its declared files and its skill backings'
+   * template copies (see `sealedSessionContract`).
+   */
+  sealedScope?: 'session';
   mode: 'ro' | 'rw';
   /** Current effective admission class; declarations do not repair it. */
   mountClass: 'group-state' | 'allowlisted-extra';
@@ -154,6 +163,32 @@ export function registerProviderHostContract(name: string, contract: ProviderHos
 
 export function getProviderHostContract(name: string | null | undefined): ProviderHostContract | undefined {
   return name ? registry.get(name.toLowerCase()) : undefined;
+}
+
+/**
+ * The contract a sealed session realizes: each group volume that declares
+ * `sealedScope` moves to session scope. A skill backing on such a volume
+ * copies the group's template skills in, since templates stamp them into the
+ * group-scoped volume. A group-init file on it is seeded per session by the
+ * spawn (container-runner.ts), because realization prepares such files only
+ * at group init.
+ */
+export function sealedSessionContract(contract: ProviderHostContract): ProviderHostContract {
+  const sealed = new Set(
+    contract.stateVolumes.filter((volume) => volume.sealedScope === 'session').map((volume) => volume.id),
+  );
+  if (sealed.size === 0) return contract;
+  return {
+    ...contract,
+    stateVolumes: contract.stateVolumes.map(({ sealedScope: _sealed, ...volume }) =>
+      sealed.has(volume.id) ? { ...volume, scope: 'session' as const } : volume,
+    ),
+    skillBackings: contract.skillBackings.map((backing) =>
+      backing.location.kind === 'state-volume' && sealed.has(backing.location.volumeId)
+        ? { ...backing, templateCopies: 'copy' as const }
+        : backing,
+    ),
+  };
 }
 
 export function getProviderModelEndpoint(name: string, kind: 'api' | 'subscription' | 'token'): string {
@@ -340,6 +375,12 @@ export function assertProviderHostContractShape(provider: string, contract: Prov
     assertFileName(volume.directory, `${provider}.stateVolumes.${volume.id}.directory`);
     assertContainerPath(volume.containerPath, `${provider}.stateVolumes.${volume.id}.containerPath`);
     assertAllowed(volume.scope, ['group', 'session'], `${provider}.stateVolumes.${volume.id}.scope`);
+    if (volume.sealedScope !== undefined) {
+      assertAllowed(volume.sealedScope, ['session'], `${provider}.stateVolumes.${volume.id}.sealedScope`);
+      if (volume.scope !== 'group') {
+        throw new Error(`${provider}.stateVolumes.${volume.id}.sealedScope applies only to a group volume`);
+      }
+    }
     assertAllowed(volume.mode, ['ro', 'rw'], `${provider}.stateVolumes.${volume.id}.mode`);
     assertAllowed(
       volume.mountClass,

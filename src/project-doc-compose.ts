@@ -19,6 +19,13 @@ import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+import {
+  grantsInstructions,
+  MCP_SERVERS_CAPABILITY,
+  parseStoredCapabilities,
+  resolveCapabilities,
+  skillsWithinCapabilities,
+} from './capabilities.js';
 import { parseSkillSelection, sanitizeStoredMcpServers } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { readGroupPersona } from './group-persona.js';
@@ -89,9 +96,11 @@ export const BASE_INSTRUCTIONS_PATH = path.join('container', 'CLAUDE.md');
 export const MEMORY_NOTE_PLACEHOLDER = '{{provider-memory-note}}';
 
 /**
- * Render the canonical base instructions with the provider's memory note
- * substituted (or the placeholder stripped without a trace). The no-facts
- * render is byte-identical to the template minus the placeholder paragraph.
+ * Render canonical instructions with the provider's memory note substituted
+ * (or the placeholder stripped without a trace). The no-facts render is
+ * byte-identical to the template minus the placeholder paragraph. The
+ * placeholder lives in the `memory` instructions, which only a group holding
+ * `conversation-context` is taught.
  */
 export function renderBaseInstructions(template: string, facts?: ProviderInstructionFacts): string {
   const files = facts?.nativeOverrideFiles ?? [];
@@ -162,7 +171,9 @@ const SKILLS_HOST_SUBPATH = path.join('container', 'skills');
 
 /**
  * Regenerate `groups/<folder>/<spec.fileName>` from every instruction source
- * the group has switched on. Deterministic: same inputs, same file.
+ * the group has switched on. Deterministic: same inputs, same file. The
+ * group's capabilities decide which module instructions, skills and MCP
+ * server instructions it is taught, so it is never taught a tool it lacks.
  *
  * Reads nothing the agent can author except `instructions.prepend.md`, which
  * `readGroupPersona` opens with O_NOFOLLOW.
@@ -176,9 +187,12 @@ export async function composeGroupProjectDoc(
   if (!fs.existsSync(groupDir)) fs.mkdirSync(groupDir, { recursive: true });
 
   const configRow = await getContainerConfig(group.id);
+  const grants = new Set(resolveCapabilities(parseStoredCapabilities(configRow?.capabilities, group.name), group.name));
   // Re-validated rather than cast: these `instructions` strings are the only
   // stored, agent-influenced text copied verbatim into the system prompt.
-  const mcpServers = sanitizeStoredMcpServers(configRow ? JSON.parse(configRow.mcp_servers) : {}, group.name);
+  const mcpServers = grants.has(MCP_SERVERS_CAPABILITY)
+    ? sanitizeStoredMcpServers(configRow ? JSON.parse(configRow.mcp_servers) : {}, group.name)
+    : {};
   const selectedSkills = runtimeSkills ?? parseSkillSelection(configRow?.skills, group.name);
 
   const sections: ProjectDocSection[] = [];
@@ -228,18 +242,22 @@ export async function composeGroupProjectDoc(
       if (!match) continue;
       const moduleName = match[1];
       if (cliDisabled && NCL_DEPENDENT_MODULES.has(moduleName)) continue;
-      push(`NanoClaw Module: ${moduleName}`, fs.readFileSync(path.join(mcpToolsHostDir, entry), 'utf-8'), true);
+      if (!grantsInstructions(moduleName, grants)) continue;
+      const instructions = fs.readFileSync(path.join(mcpToolsHostDir, entry), 'utf-8');
+      push(`NanoClaw Module: ${moduleName}`, renderBaseInstructions(instructions, spec.instructions), true);
     }
   }
 
   // Resident skill prose. A skill's `SKILL.md` is loaded on demand by skill
   // discovery; its `instructions.md` has to be in context before the agent
   // knows it needs it, because a prohibition cannot be lazily loaded. Same
-  // selection as the links the runner plants — one parse, see above.
+  // selection as the links the runner plants — one parse, see above — and
+  // the same capability bound.
   const skillsHostDir = path.join(process.cwd(), SKILLS_HOST_SUBPATH);
   if (fs.existsSync(skillsHostDir)) {
     for (const skillName of fs.readdirSync(skillsHostDir).sort()) {
       if (selectedSkills !== 'all' && !selectedSkills.includes(skillName)) continue;
+      if (skillsWithinCapabilities([skillName], grants).length === 0) continue;
       const hostFragment = path.join(skillsHostDir, skillName, 'instructions.md');
       if (!fs.existsSync(hostFragment)) continue;
       push(`NanoClaw Skill: ${skillName}`, fs.readFileSync(hostFragment, 'utf-8'), true);

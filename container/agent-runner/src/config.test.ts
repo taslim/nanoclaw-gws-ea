@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { runnerConfigFromRaw } from './config.js';
+import { runnerCapabilities, runnerConfigFromRaw } from './config.js';
 
 describe('runner config speed', () => {
   it('reads speed from a host that writes it', () => {
@@ -20,5 +20,23 @@ describe('runner config speed', () => {
     expect(runnerConfigFromRaw({ speed: 'turbo' }).speed).toBe('turbo');
     expect(runnerConfigFromRaw({ speed: '' }).speed).toBeUndefined();
     expect(runnerConfigFromRaw({ speed: 7 }).speed).toBeUndefined();
+  });
+});
+
+describe('runner config capabilities', () => {
+  it('reads the explicit list the host wrote', () => {
+    expect([...runnerConfigFromRaw({ capabilities: ['reply', 'time'] }).capabilities]).toEqual(['reply', 'time']);
+    expect(runnerConfigFromRaw({ capabilities: [] }).capabilities.size).toBe(0);
+  });
+
+  it('grants nothing for a missing or malformed list', () => {
+    expect(runnerConfigFromRaw({}).capabilities.size).toBe(0);
+    expect(runnerConfigFromRaw({ capabilities: 'all' }).capabilities.size).toBe(0);
+    expect(runnerConfigFromRaw({ capabilities: ['reply', 7] }).capabilities.size).toBe(0);
+    expect(runnerConfigFromRaw({ capabilities: { reply: true } }).capabilities.size).toBe(0);
+  });
+
+  it('grants nothing before a config is loaded', () => {
+    expect(runnerCapabilities().size).toBe(0);
   });
 });

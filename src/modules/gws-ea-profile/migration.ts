@@ -25,6 +25,21 @@ export const gwsEaProfileMigration: ModuleMigration = {
   },
 };
 
+/**
+ * `external-email`'s agent group, beside main's. The host creates the group
+ * once and records it here (src/modules/gws-ea-external-email). An assistant
+ * from before it gains an empty pointer, which its next start fills.
+ */
+export const gwsEaExternalEmailPointerMigration: ModuleMigration = {
+  version: 3,
+  name: 'module:gws-ea-profile:external-email-pointer',
+  async up(db) {
+    await db.exec(
+      'ALTER TABLE gws_ea_profile ADD COLUMN external_email_agent_group_id TEXT REFERENCES agent_groups(id);',
+    );
+  },
+};
+
 /** The principal's email addresses: one row each, stored lowercased, so each address is held once. */
 export const gwsEaPrincipalAddressesMigration: ModuleMigration = {
   version: 2,

@@ -72,6 +72,7 @@ const ONECLI_CLI = '/usr/local/bin/onecli';
 const PINS = { gateway: '1.41.3', cli: '2.2.4' } as const;
 const CREDENTIAL = { name: 'Anthropic', type: 'anthropic', hostPattern: 'api.anthropic.com', headerName: 'x-api-key' };
 const MAIN = 'ag-main';
+const EXTERNAL_EMAIL = 'ag-external-email';
 const SESSION = 'sess-principal';
 const LISTENER = '6f1c2b1e-8d4a-4c1e-9b7a-2f3e4d5c6b7a';
 const NOW = new Date('2026-09-28T14:30:00.000Z');
@@ -435,6 +436,10 @@ function ncl(state: World): StatusObservers['ncl'] {
     switch (args.join(' ')) {
       case 'gws-ea-profile get':
         return { main_agent_group_id: MAIN, assistant_display_name: 'Aya' };
+      case 'gws-ea-external-email health':
+        return { agent_group_id: EXTERNAL_EMAIL, problems: [] };
+      case 'gws-ea-inbox health':
+        return HEALTHY_INBOX;
       case `groups get --id ${MAIN}`:
         return { id: MAIN, name: 'main' };
       case `groups config get --id ${MAIN}`:
@@ -447,10 +452,31 @@ function ncl(state: World): StatusObservers['ncl'] {
   };
 }
 
-const onecliAdmin: StatusObservers['onecliAdmin'] = async (_runtime, args) => {
-  if (args.join(' ') !== 'agents list --max 0') throw new Error(`unexpected onecli ${args.join(' ')}`);
-  return { data: [{ id: 'agent-main', identifier: MAIN, name: 'main', secretMode: 'all' }] };
-};
+/** The inbox as the host's `getInboxHealth` reports a working one. */
+const HEALTHY_INBOX = {
+  state: 'healthy',
+  reason: null,
+  since: null,
+  lastSuccessAt: '2026-09-28T14:29:00.000Z',
+  consecutiveFailures: 0,
+  calendarNotifications: { state: 'ok', reason: null },
+  principalDomainsWithoutSelector: [],
+} as const;
+
+/** OneCLI's agents: main granted every secret, external-email in selective mode. */
+const ONECLI_AGENTS = [
+  { id: 'agent-main', identifier: MAIN, name: 'main', secretMode: 'all' },
+  { id: 'agent-ee', identifier: EXTERNAL_EMAIL, name: 'external-email', secretMode: 'selective' },
+];
+
+function onecliAgents(agents: readonly Record<string, unknown>[]): StatusObservers['onecliAdmin'] {
+  return async (_runtime, args) => {
+    if (args.join(' ') !== 'agents list --max 0') throw new Error(`unexpected onecli ${args.join(' ')}`);
+    return { data: agents };
+  };
+}
+
+const onecliAdmin = onecliAgents(ONECLI_AGENTS);
 
 const MANIFEST: SnapshotManifest = {
   central_migrations: ['initial-v2-schema', 'host-coordination'],
@@ -557,6 +583,15 @@ describe('status', () => {
     expect(status.probes.checkout).toMatchObject({ commit: host.release });
     expect(status.probes.service).toMatchObject({ state: 'running' });
     expect(status.probes.main_identity).toMatchObject({ agent_group_id: MAIN });
+    expect(status.probes.inbox).toEqual({
+      status: 'ok',
+      reason: null,
+      state: 'healthy',
+      since: null,
+      last_success_at: HEALTHY_INBOX.lastSuccessAt,
+      calendar_notifications: { state: 'ok', reason: null },
+      domains_without_selector: [],
+    });
     // A shared connector's drift is reported, never counted against this assistant (KTD11).
     expect(status.probes.connector).toEqual({ status: 'ok', reason: null, drift: CONNECTOR_DRIFT });
     expect(status.probes.delivery).toMatchObject({
@@ -665,6 +700,146 @@ describe('status', () => {
     for (const name of Object.keys(status.probes).filter((probe) => probe !== 'onecli')) {
       expect(status.probes[name], name).toMatchObject({ status: 'ok' });
     }
+  });
+
+  it('reports external-email as the host reports it, and its OneCLI agent unless it is selective', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    await bound(host.paths, reservation.instance_id);
+    const state = world(reservation);
+    const healthy = healthyObservers(state);
+    const reporting =
+      (health: unknown): StatusObservers['ncl'] =>
+      async (runtime, args) =>
+        args.join(' ') === 'gws-ea-external-email health' ? health : healthy.ncl(runtime, args);
+
+    const ok = await statusJson(host, state, reservation.instance_id);
+    expect(ok.status.probes.external_email).toEqual({ status: 'ok', reason: null, agent_group_id: EXTERNAL_EMAIL });
+
+    // Before its first session OneCLI has no agent for it, which is not a fault.
+    const unspawned = await statusJson(host, state, reservation.instance_id, {
+      ...healthy,
+      onecliAdmin: onecliAgents(ONECLI_AGENTS.filter((agent) => agent.identifier !== EXTERNAL_EMAIL)),
+    });
+    expect(unspawned.status.probes.external_email).toMatchObject({ status: 'ok' });
+
+    const drifted = await statusJson(host, state, reservation.instance_id, {
+      ...healthy,
+      ncl: reporting({
+        agent_group_id: EXTERNAL_EMAIL,
+        problems: ['its configuration carries packages', 'destination main -> helper joins main and external-email'],
+      }),
+    });
+    expect(drifted.status.probes.external_email).toEqual({
+      status: 'degraded',
+      reason: 'Its configuration carries packages. Destination main -> helper joins main and external-email.',
+      agent_group_id: EXTERNAL_EMAIL,
+    });
+
+    const unscoped = await statusJson(host, state, reservation.instance_id, {
+      ...healthy,
+      onecliAdmin: onecliAgents(
+        ONECLI_AGENTS.map((agent) => (agent.identifier === EXTERNAL_EMAIL ? { ...agent, secretMode: 'all' } : agent)),
+      ),
+    });
+    expect(unscoped.status.probes.external_email).toEqual({
+      status: 'degraded',
+      reason: "External-email's OneCLI agent is granted all secrets, not only the model provider's.",
+      agent_group_id: EXTERNAL_EMAIL,
+    });
+
+    const missing = await statusJson(host, state, reservation.instance_id, {
+      ...healthy,
+      ncl: reporting({ agent_group_id: null, problems: ['external-email has not been created'] }),
+    });
+    expect(missing.status.probes.external_email).toEqual({
+      status: 'degraded',
+      reason: 'External-email has not been created.',
+      agent_group_id: null,
+    });
+    for (const name of Object.keys(missing.status.probes).filter((probe) => probe !== 'external_email')) {
+      expect(missing.status.probes[name], name).toMatchObject({ status: 'ok' });
+    }
+  });
+
+  it('reports the inbox as the host reports it, degraded while it fails, calendar news is off, or a domain has no selector', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    await bound(host.paths, reservation.instance_id);
+    const state = world(reservation);
+    const healthy = healthyObservers(state);
+    const reporting = (health: unknown) => ({
+      ...healthy,
+      ncl: (async (runtime, args) =>
+        args.join(' ') === 'gws-ea-inbox health'
+          ? health
+          : healthy.ncl(runtime, args)) satisfies StatusObservers['ncl'],
+    });
+
+    const ok = command(host, state);
+    await runStatusCommand(ok.runtime, { instanceId: reservation.instance_id, json: false });
+    expect(ok.output.stdout).toContainEqual(expect.stringMatching(/^ {2}ok {8}inbox {11}last polled /u));
+
+    const unhealthySince = '2026-09-28T13:00:00.000Z';
+    const failing = await statusJson(
+      host,
+      state,
+      reservation.instance_id,
+      reporting({
+        ...HEALTHY_INBOX,
+        state: 'unhealthy',
+        reason: 'Gmail answered 401',
+        since: unhealthySince,
+        calendarNotifications: { state: 'failing', reason: 'the calendar list refused the change' },
+        principalDomainsWithoutSelector: ['example.com'],
+      }),
+    );
+    expect(failing.status.probes.inbox).toEqual({
+      status: 'degraded',
+      reason:
+        'The inbox is unhealthy: Gmail answered 401. ' +
+        "Calendar notifications for the principal's calendars could not be turned on: the calendar list refused the change. " +
+        "No DKIM selector is pinned for example.com, so no mail from it counts as the principal's; " +
+        `pin one with gws-ea ncl --id ${reservation.instance_id} -- dkim-selectors pin --domain example.com --selector <s>, ` +
+        "where <s> is the s= of Gmail's dkim=pass result on mail the principal sent the assistant.",
+      state: 'unhealthy',
+      since: unhealthySince,
+      last_success_at: HEALTHY_INBOX.lastSuccessAt,
+      calendar_notifications: { state: 'failing', reason: 'the calendar list refused the change' },
+      domains_without_selector: ['example.com'],
+    });
+    for (const name of Object.keys(failing.status.probes).filter((probe) => probe !== 'inbox')) {
+      expect(failing.status.probes[name], name).toMatchObject({ status: 'ok' });
+    }
+
+    // Before the host first turns calendar notifications on, the inbox is not yet whole.
+    const calendarPending = await statusJson(
+      host,
+      state,
+      reservation.instance_id,
+      reporting({ ...HEALTHY_INBOX, calendarNotifications: { state: 'unknown', reason: null } }),
+    );
+    expect(calendarPending.status.probes.inbox).toMatchObject({
+      status: 'degraded',
+      reason: "Calendar notifications for the principal's calendars are not on yet.",
+      state: 'healthy',
+    });
+
+    const invalid = await statusJson(
+      host,
+      state,
+      reservation.instance_id,
+      reporting({ ...HEALTHY_INBOX, principalDomainsWithoutSelector: 'example.com' }),
+    );
+    expect(invalid.status.probes.inbox).toEqual({
+      status: 'degraded',
+      reason: 'ncl returned an invalid inbox report',
+      state: null,
+      since: null,
+      last_success_at: null,
+      calendar_notifications: null,
+      domains_without_selector: null,
+    });
   });
 
   it("reports an assistant behind the tool's release with both commits", async () => {
@@ -1202,6 +1377,9 @@ describe('help', () => {
       'schema_moved',
       'customized',
       'drift',
+      'last_success_at',
+      'calendar_notifications',
+      'domains_without_selector',
     ]) {
       expect(help, field).toContain(field);
     }

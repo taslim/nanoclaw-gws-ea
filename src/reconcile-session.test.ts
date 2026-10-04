@@ -1,8 +1,8 @@
 /**
- * An inbound message the host gives up on after its last retry reaches the
- * principal as one plain sentence in their chat. Drives the real reconcile
- * against a real central DB and real session DBs; only the container runner
- * and the wake are mocked.
+ * Inbound-failed hooks: the reconcile tells registered modules about the
+ * inbound messages it gave up on after their last retry. Drives the real
+ * reconcile against a real central DB and real session DBs; only the
+ * container runner and the wake are mocked.
  */
 import fs from 'fs';
 import Database from 'better-sqlite3';
@@ -29,25 +29,17 @@ vi.mock('./request-wake.js', () => ({ requestWake: vi.fn().mockResolvedValue(tru
 import { isContainerRunning, killContainer } from './container-runner.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from './db/index.js';
 import { setDeliveryAdapter } from './delivery.js';
+import { log } from './log.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
-import { reconcileSession } from './reconcile-session.js';
-import { resolveSession, resolveTaskSession } from './session-manager.js';
+import type { MessageRetry } from './mailbox/index.js';
+import { reconcileSession, registerInboundFailedHook } from './reconcile-session.js';
+import { resolveSession, withExistingMailboxSession } from './session-manager.js';
 import type { Session } from './types.js';
 
 const TEST_DIR = '/tmp/nanoclaw-test-reconcile-session';
-const FAILURE_NOTICE = "Something went wrong on my side and I couldn't finish that. Please send it again.";
 const MAX_TRIES = 5;
 
-interface Sent {
-  channelType: string;
-  platformId: string;
-  threadId: string | null;
-  kind: string;
-  content: string;
-  instance: string | undefined;
-}
-
-let sent: Sent[];
+let sent: string[];
 
 function now(): string {
   return new Date().toISOString();
@@ -126,6 +118,25 @@ function inboundStatus(session: Session, id: string): { status: string; tries: n
   return row;
 }
 
+/** Each pass's report for one session, as the hook heard it. */
+function listen(session: Session): Array<Array<Omit<MessageRetry, 'processAfter'>>> {
+  const heard: Array<Array<Omit<MessageRetry, 'processAfter'>>> = [];
+  registerInboundFailedHook((failed, s) => {
+    if (s.id !== session.id) return;
+    heard.push(
+      failed.map(({ id, tries, kind, channelType, platformId, threadId }) => ({
+        id,
+        tries,
+        kind,
+        channelType,
+        platformId,
+        threadId,
+      })),
+    );
+  });
+  return heard;
+}
+
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
@@ -135,9 +146,9 @@ beforeEach(async () => {
   vi.mocked(killContainer).mockReset();
   sent = [];
   setDeliveryAdapter({
-    async deliver(channelType, platformId, threadId, kind, content, _files, instance) {
-      sent.push({ channelType, platformId, threadId, kind, content, instance });
-      return 'spaces/dm/messages/notice';
+    async deliver(_channelType, _platformId, _threadId, _kind, content) {
+      sent.push(content);
+      return 'spaces/dm/messages/sent';
     },
   });
 });
@@ -147,54 +158,12 @@ afterEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
-describe('an inbound message failed after its last retry', () => {
-  it('produces the fixed sentence in the principal’s chat once', async () => {
+describe('inbound-failed hooks', () => {
+  it('hear once per pass about every message given up on, with where each came from', async () => {
     const session = await seedChatSession();
-    seedClaimedMessage(session, 'in-1', 2, MAX_TRIES);
-
-    await reconcileSession(session.id);
-    await reconcileSession(session.id);
-
-    expect(inboundStatus(session, 'in-1').status).toBe('failed');
-    expect(sent).toEqual([
-      {
-        channelType: 'gchat',
-        platformId: 'gchat:spaces/dm',
-        threadId: null,
-        kind: 'chat',
-        content: JSON.stringify({ text: FAILURE_NOTICE }),
-        instance: 'gchat',
-      },
-    ]);
-  });
-
-  it('produces one sentence when several messages fail in the same pass', async () => {
-    const session = await seedChatSession();
-    seedClaimedMessage(session, 'in-1', 2, MAX_TRIES);
-    seedClaimedMessage(session, 'in-2', 4, MAX_TRIES);
-
-    await reconcileSession(session.id);
-
-    expect(inboundStatus(session, 'in-1').status).toBe('failed');
-    expect(inboundStatus(session, 'in-2').status).toBe('failed');
-    expect(sent).toHaveLength(1);
-  });
-
-  it('produces the sentence when a running container is killed on its last retry', async () => {
-    const session = await seedChatSession();
-    vi.mocked(isContainerRunning).mockReturnValue(true);
-    seedClaimedMessage(session, 'in-1', 2, MAX_TRIES, 2 * 60 * 1000);
-
-    await reconcileSession(session.id);
-
-    expect(killContainer).toHaveBeenCalledWith(session.id, 'claim-stuck');
-    expect(inboundStatus(session, 'in-1').status).toBe('failed');
-    expect(sent.map((notice) => JSON.parse(notice.content) as unknown)).toEqual([{ text: FAILURE_NOTICE }]);
-  });
-
-  it('says nothing when the failed message came from the host, not the principal', async () => {
-    const session = await seedChatSession();
-    seedClaimedMessage(session, 'in-note', 2, MAX_TRIES, 0, {
+    const heard = listen(session);
+    seedClaimedMessage(session, 'in-1', 2, MAX_TRIES, 0, { ...PRINCIPAL_CHAT, threadId: 'spaces/dm/threads/t1' });
+    seedClaimedMessage(session, 'in-note', 4, MAX_TRIES, 0, {
       kind: 'chat',
       channelType: 'agent',
       platformId: 'ag-1',
@@ -202,38 +171,90 @@ describe('an inbound message failed after its last retry', () => {
     });
 
     await reconcileSession(session.id);
+    await reconcileSession(session.id);
 
+    expect(inboundStatus(session, 'in-1').status).toBe('failed');
     expect(inboundStatus(session, 'in-note').status).toBe('failed');
-    expect(sent).toEqual([]);
+    expect(heard).toEqual([
+      [
+        {
+          id: 'in-1',
+          tries: MAX_TRIES,
+          kind: 'chat-sdk',
+          channelType: 'gchat',
+          platformId: 'gchat:spaces/dm',
+          threadId: 'spaces/dm/threads/t1',
+        },
+        { id: 'in-note', tries: MAX_TRIES, kind: 'chat', channelType: 'agent', platformId: 'ag-1', threadId: null },
+      ],
+    ]);
   });
 
-  it('answers in the thread the failed message came from', async () => {
+  it('hear about a message given up when a running container is killed on its last retry', async () => {
     const session = await seedChatSession();
-    seedClaimedMessage(session, 'in-thread', 2, MAX_TRIES, 0, { ...PRINCIPAL_CHAT, threadId: 'spaces/dm/threads/t1' });
+    const heard = listen(session);
+    vi.mocked(isContainerRunning).mockReturnValue(true);
+    seedClaimedMessage(session, 'in-1', 2, MAX_TRIES, 2 * 60 * 1000);
 
     await reconcileSession(session.id);
 
-    expect(sent.map((notice) => notice.threadId)).toEqual(['spaces/dm/threads/t1']);
+    expect(killContainer).toHaveBeenCalledWith(session.id, 'claim-stuck');
+    expect(heard.map((pass) => pass.map((message) => message.id))).toEqual([['in-1']]);
   });
 
-  it('says nothing while the message still has retries left', async () => {
+  it('hear nothing while the message still has retries left', async () => {
     const session = await seedChatSession();
+    const heard = listen(session);
     seedClaimedMessage(session, 'in-1', 2, MAX_TRIES - 1);
 
     await reconcileSession(session.id);
 
     expect(inboundStatus(session, 'in-1')).toEqual({ status: 'pending', tries: MAX_TRIES });
-    expect(sent).toEqual([]);
+    expect(heard).toEqual([]);
   });
 
-  it('says nothing for a task session, which has no chat', async () => {
-    await seedChatSession();
-    const { session } = await resolveTaskSession('ag-1', 'daily-digest-a1b2');
-    seedClaimedMessage(session, 'in-task', 2, MAX_TRIES);
+  it('run outside the mailbox session, once its work has committed', async () => {
+    const session = await seedChatSession();
+    const seenStatus: string[] = [];
+    registerInboundFailedHook(async (failed, s) => {
+      if (s.id !== session.id) return;
+      // Opening the same session from inside it throws (a serialized mailbox would deadlock).
+      await withExistingMailboxSession(s.agent_group_id, s.id, (mailbox) => mailbox.countDueMessages());
+      for (const message of failed) seenStatus.push(inboundStatus(s, message.id).status);
+    });
+    seedClaimedMessage(session, 'in-1', 2, MAX_TRIES);
 
     await reconcileSession(session.id);
 
-    expect(inboundStatus(session, 'in-task').status).toBe('failed');
+    expect(seenStatus).toEqual(['failed']);
+  });
+
+  it('a throwing hook never breaks the reconcile or the hooks after it', async () => {
+    const session = await seedChatSession();
+    registerInboundFailedHook((_failed, s) => {
+      if (s.id === session.id) throw new Error('hook exploded');
+    });
+    const heard = listen(session);
+    const warned = vi.spyOn(log, 'warn');
+    seedClaimedMessage(session, 'in-1', 2, MAX_TRIES);
+
+    await expect(reconcileSession(session.id)).resolves.toBeUndefined();
+
+    expect(heard.map((pass) => pass.map((message) => message.id))).toEqual([['in-1']]);
+    expect(warned).toHaveBeenCalledWith(
+      'Inbound-failed hook failed',
+      expect.objectContaining({ sessionId: session.id }),
+    );
+    warned.mockRestore();
+  });
+
+  it('sends nothing on its own: giving up is upstream behavior until a hook acts on it', async () => {
+    const session = await seedChatSession();
+    seedClaimedMessage(session, 'in-1', 2, MAX_TRIES);
+
+    await reconcileSession(session.id);
+
+    expect(inboundStatus(session, 'in-1').status).toBe('failed');
     expect(sent).toEqual([]);
   });
 });

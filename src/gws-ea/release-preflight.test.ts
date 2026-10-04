@@ -113,6 +113,42 @@ async function releaseFixture(): Promise<string> {
       2,
     ) + '\n',
   );
+  await write(
+    root,
+    'templates/gws-ea/external-email/plugin.json',
+    JSON.stringify(
+      {
+        $schema: 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json',
+        name: 'gws-ea-external-email',
+        version: '1.0.0',
+        description: 'fixture',
+        extensions: { 'ai.nanoco.nanoclaw': { agentName: 'external-email' } },
+      },
+      null,
+      2,
+    ) + '\n',
+  );
+  for (const file of ['index.ts', 'group.ts', 'destination-policy.ts']) {
+    await write(root, `src/modules/gws-ea-external-email/${file}`, 'export {};\n');
+  }
+  await write(root, 'src/modules/gws-ea-external-email/guidance.md', '# external-email\n');
+  await write(root, 'src/modules/gws-ea-inbox/index.ts', 'export {};\n');
+  await write(root, 'src/modules/gws-ea-inbox/migration.ts', 'export {};\n');
+  for (const file of [
+    'src/modules/gws-ea-meetings/index.ts',
+    'src/modules/gws-ea-meetings/migration.ts',
+    'container/agent-runner/src/action-request.ts',
+    'container/agent-runner/src/mcp-tools/gws-ea-meetings.ts',
+  ]) {
+    await write(root, file, 'export {};\n');
+  }
+  for (const doc of ['gws-ea-meetings', 'gws-ea-meetings-external']) {
+    await write(root, `container/agent-runner/src/mcp-tools/${doc}.instructions.md`, `# ${doc}\n`);
+  }
+  await write(root, 'container/agent-runner/src/mcp-tools/files-send.instructions.md', '# files-send\n');
+  await write(root, 'container/agent-runner/src/mcp-tools/connect.instructions.md', '# connect\n');
+  await write(root, 'container/agent-runner/src/mcp-tools/memory.instructions.md', '# memory\n');
+  await write(root, 'container/agent-runner/src/memory/sealed.ts', 'export {};\n');
   await write(root, 'templates/gws-ea/main/skills/welcome/SKILL.md', '# Welcome\n');
   await write(root, 'bin/ncl', '#!/usr/bin/env bash\nexit 0\n');
   await write(root, 'bin/gws-ea', '#!/usr/bin/env bash\nexit 0\n');
@@ -132,10 +168,14 @@ async function releaseFixture(): Promise<string> {
   await write(root, 'src/gateway-providers/installed.ts', "import './onecli.js';\n");
   await write(root, 'src/gateway-providers/onecli.ts', 'export {};\n');
   await write(root, 'src/gateway-providers/onecli-files.ts', 'export {};\n');
+  await write(root, 'src/gateway-providers/onecli-credentials.ts', 'export {};\n');
   await write(root, 'container/skills/onecli-gateway/SKILL.md', '# OneCLI gateway\n');
   await write(root, 'container/skills/onecli-gateway/instructions.md', '# OneCLI instructions\n');
   await write(root, 'container/skills/gcalendar/SKILL.md', '# gcalendar\n');
   await write(root, 'container/skills/gcalendar/instructions.md', '# gcalendar rules\n');
+  await write(root, 'container/skills/gmail/SKILL.md', '# gmail\n');
+  await write(root, 'container/skills/gpeople/SKILL.md', '# gpeople\n');
+  await write(root, 'src/container-env.ts', 'export {};\n');
   await write(root, 'src/gws-ea/process.ts', 'export {};\n');
   await write(root, 'src/gws-ea/cloudflare-connector.ts', 'export {};\n');
   await write(root, 'scripts/init-first-agent.ts', 'export {};\n');
@@ -146,10 +186,17 @@ async function releaseFixture(): Promise<string> {
   await write(root, 'src/modules/gws-ea-main/guidance.md', '# Guidance\n');
   await write(root, 'src/modules/gws-ea-preferences/index.ts', 'export {};\n');
   await write(root, 'src/modules/gws-ea-preferences/migration.ts', 'export {};\n');
+  await write(root, 'src/modules/gws-ea-people/index.ts', 'export {};\n');
+  await write(root, 'src/modules/gws-ea-people/migration.ts', 'export {};\n');
+  await write(root, 'src/modules/gws-ea-notices/index.ts', 'export {};\n');
+  await write(root, 'src/modules/gws-ea-privacy/index.ts', 'export {};\n');
+  await write(root, 'src/modules/gws-ea-privacy/migration.ts', 'export {};\n');
+  await write(root, 'src/modules/capabilities/index.ts', 'export {};\n');
+  await write(root, 'src/modules/capabilities/migration.ts', 'export {};\n');
   await write(
     root,
     'src/modules/index.ts',
-    "import './gws-ea-google/index.js';\nimport './gws-ea-main/index.js';\nimport './gws-ea-profile/index.js';\nimport './gws-ea-preferences/index.js';\n",
+    "import './capabilities/index.js';\nimport './gws-ea-google/index.js';\nimport './gws-ea-main/index.js';\nimport './gws-ea-profile/index.js';\nimport './gws-ea-preferences/index.js';\nimport './gws-ea-people/index.js';\nimport './gws-ea-notices/index.js';\nimport './gws-ea-privacy/index.js';\nimport './gws-ea-external-email/index.js';\nimport './gws-ea-inbox/index.js';\nimport './gws-ea-meetings/index.js';\n",
   );
   await write(root, 'src/provider-contracts/claude.ts', "export const provider = 'claude';\n");
   await write(root, 'src/provider-contracts/index.ts', "import './claude.js';\n");
@@ -262,16 +309,38 @@ describe('release preflight', () => {
 
   it.each([
     ['template', 'templates/gws-ea/main/plugin.json', 'incomplete_release'],
+    ['external-email template', 'templates/gws-ea/external-email/plugin.json', 'incomplete_release'],
+    ['external-email guidance', 'src/modules/gws-ea-external-email/guidance.md', 'incomplete_release'],
+    ['GWS-EA inbox', 'src/modules/gws-ea-inbox/index.ts', 'incomplete_release'],
+    ['GWS-EA inbox migration', 'src/modules/gws-ea-inbox/migration.ts', 'incomplete_release'],
+    ['GWS-EA meetings', 'src/modules/gws-ea-meetings/index.ts', 'incomplete_release'],
+    ['GWS-EA meeting tools', 'container/agent-runner/src/mcp-tools/gws-ea-meetings.ts', 'incomplete_release'],
+    [
+      'account-connection instructions',
+      'container/agent-runner/src/mcp-tools/connect.instructions.md',
+      'incomplete_release',
+    ],
+    ['memory instructions', 'container/agent-runner/src/mcp-tools/memory.instructions.md', 'incomplete_release'],
+    ['sealed-session runner rule', 'container/agent-runner/src/memory/sealed.ts', 'incomplete_release'],
     ['GWS-EA welcome', 'templates/gws-ea/main/skills/welcome/SKILL.md', 'incomplete_release'],
     ['GWS-EA guidance', 'src/modules/gws-ea-main/guidance.md', 'incomplete_release'],
     ['GWS-EA Google access', 'src/modules/gws-ea-google/index.ts', 'incomplete_release'],
     ['Google Calendar rules', 'container/skills/gcalendar/instructions.md', 'incomplete_release'],
+    ['Gmail skill', 'container/skills/gmail/SKILL.md', 'incomplete_release'],
+    ['Workspace directory skill', 'container/skills/gpeople/SKILL.md', 'incomplete_release'],
+    ['module container env seam', 'src/container-env.ts', 'incomplete_release'],
     ['Google Chat adapter', 'src/channels/gchat.ts', 'incomplete_release'],
     ['GWS-EA interactive launcher', 'setup/gws-ea-input.ts', 'incomplete_release'],
     ['GWS-EA service launcher', 'src/gws-ea/process.ts', 'incomplete_release'],
     ['GWS-EA profile migration', 'src/modules/gws-ea-profile/migration.ts', 'incomplete_release'],
     ['GWS-EA preferences migration', 'src/modules/gws-ea-preferences/migration.ts', 'incomplete_release'],
+    ['GWS-EA people migration', 'src/modules/gws-ea-people/migration.ts', 'incomplete_release'],
+    ['GWS-EA failure notices', 'src/modules/gws-ea-notices/index.ts', 'incomplete_release'],
+    ['GWS-EA private values', 'src/modules/gws-ea-privacy/index.ts', 'incomplete_release'],
+    ['GWS-EA private values migration', 'src/modules/gws-ea-privacy/migration.ts', 'incomplete_release'],
+    ['per-group capabilities migration', 'src/modules/capabilities/migration.ts', 'incomplete_release'],
     ['OneCLI gateway adapter', 'src/gateway-providers/onecli.ts', 'gateway_not_composed'],
+    ['OneCLI credential connection', 'src/gateway-providers/onecli-credentials.ts', 'gateway_not_composed'],
     ['OneCLI agent instructions', 'container/skills/onecli-gateway/SKILL.md', 'gateway_not_composed'],
     ['provider host contract', 'src/provider-contracts/claude.ts', 'provider_not_composed'],
     ['provider runtime', 'container/agent-runner/src/providers/claude.ts', 'provider_not_composed'],

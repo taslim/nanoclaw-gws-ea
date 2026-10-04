@@ -63,6 +63,13 @@ vi.mock('../../db/sessions.js', () => ({
   isTaskThread: (t: string | null) => typeof t === 'string' && t.startsWith('system:tasks'),
 }));
 
+/** The keys the group holds; every test but the capability ones runs with conversation-context. */
+let groupCapabilities = new Set(['conversation-context']);
+vi.mock('../../capabilities.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../capabilities.js')>()),
+  getGroupCapabilities: async () => groupCapabilities,
+}));
+
 const { backfillSession, BACKFILL_LIMIT } = await import('./backfill.js');
 const { ECHO_MAX_AGE_MS, HOT_SESSION_LIMIT } = await import('./config.js');
 
@@ -105,6 +112,7 @@ const COLD_SESSION = {
 } as never;
 
 beforeEach(() => {
+  groupCapabilities = new Set(['conversation-context']);
   written.length = 0;
   opened.length = 0;
   inboundSql.length = 0;
@@ -294,5 +302,19 @@ describe('backfillSession — existing session', () => {
     const ids = written.map((w) => w.id as string);
     expect(new Set(ids).size).toBe(ids.length);
     expect(ids[0]).toMatch(/^sess-cold:backfill:.+:0$/);
+  });
+});
+
+describe('backfillSession — conversation-context', () => {
+  // R20: one thread's session never learns another's content in a group
+  // without conversation-context.
+  it('seeds nothing, and opens no sibling mailbox, for a group without it', async () => {
+    groupCapabilities = new Set(['reply']);
+
+    await backfillSession(AG, NEW_SESSION, DM_MG, { created: true, now: NOW });
+    await backfillSession(AG, COLD_SESSION, DM_MG, { created: false, now: NOW });
+
+    expect(written).toEqual([]);
+    expect(opened).toEqual([]);
   });
 });

@@ -13,7 +13,9 @@ vi.mock('../../config.js', async () => {
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-cross-session-fan' };
 });
 
-import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { ensureContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
+import { capabilitiesMigration } from '../capabilities/migration.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { createSession, getSession, updateSession } from '../../db/sessions.js';
 import { createDestination } from '../agent-to-agent/db/agent-destinations.js';
@@ -670,5 +672,59 @@ describe('label + truncation helpers', () => {
 
   it('truncateEchoText leaves short text untouched', async () => {
     expect(truncateEchoText('short')).toBe('short');
+  });
+});
+
+describe('conversation-context capability', () => {
+  const agentGroup = { id: AG, name: 'Pixel', folder: 'pixel', agent_provider: null, created_at: NOW };
+
+  beforeEach(async () => {
+    await runMigrations(getDb(), [capabilitiesMigration]);
+    await ensureContainerConfig(AG);
+  });
+
+  it('fans as before for a group stored as all', async () => {
+    const written = await fanInboundMessage({
+      session: SRC_DM,
+      mg: DM_MG,
+      messageId: 'msg-all:ag-1',
+      kind: 'chat',
+      channelType: 'slack',
+      content: chatContent('shared note'),
+      timestamp: NOW,
+    });
+
+    expect(written).toBe(1);
+    expect(readEchoRows('s-dm-t2')).toHaveLength(1);
+  });
+
+  // R20: a group without conversation-context keeps each thread's session
+  // sealed — nothing said or sent in one ever lands in a sibling's.
+  it('fans neither inbound nor delivered content into a sibling thread without it', async () => {
+    await updateContainerConfigJson(AG, 'capabilities', ['reply']);
+
+    const inbound = await fanInboundMessage({
+      session: SRC_DM,
+      mg: DM_MG,
+      messageId: 'msg-sealed:ag-1',
+      kind: 'chat',
+      channelType: 'slack',
+      content: chatContent('thread one only'),
+      timestamp: NOW,
+    });
+    const outbound = await fanOutboundMessage(
+      {
+        id: 'out-sealed',
+        kind: 'chat',
+        platform_id: 'D456',
+        channel_type: 'slack',
+        content: JSON.stringify({ text: 'reply in thread one' }),
+      },
+      SRC_DM,
+      agentGroup,
+    );
+
+    expect([inbound, outbound]).toEqual([0, 0]);
+    expect(readEchoRows('s-dm-t2')).toHaveLength(0);
   });
 });

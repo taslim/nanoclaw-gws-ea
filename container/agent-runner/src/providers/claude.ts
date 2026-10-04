@@ -1,6 +1,8 @@
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
+import { runnerCapabilities } from '../config.js';
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
+import { sessionsSealed } from '../memory/sealed.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import type { ResolvedRuntimeConfiguration } from '../provider-contracts/registry.js';
 // The execution-policy, inference, MCP, and memory derivations live in
@@ -9,7 +11,12 @@ import type { ResolvedRuntimeConfiguration } from '../provider-contracts/registr
 // constructor and registerMemorySessionHook. This module never imports the
 // contract — registration is two-step so it compiles on a core without one.
 import {
+  allowsBuiltinTool,
+  allowsMcpTool,
+  resolveClaudeCapabilityPolicy,
+  resolveClaudeToolOptions,
   SDK_DISALLOWED_TOOLS,
+  type ClaudeCapabilityPolicy,
   type resolveClaudeExecutionPolicy,
   type resolveClaudeInference,
   type resolveClaudeMcpServers,
@@ -122,44 +129,64 @@ const SUBAGENT_DENIED_TOOLS: ReadonlySet<string> = new Set(
 );
 
 /**
- * PreToolUse hook: record the current tool + its declared timeout so the host
- * sweep can widen its stuck tolerance while Bash is running a long-declared
- * script. Defense-in-depth: if SDK_DISALLOWED_TOOLS slips through somehow,
- * block the call here instead of letting the agent hang.
+ * PreToolUse hook factory — the one place every tool deny is decided, built
+ * per provider because the group's capabilities shape it:
+ *   - a built-in that NanoClaw replaces (SDK_DISALLOWED_TOOLS) is blocked if
+ *     it slips through, instead of letting the agent hang;
+ *   - a tool outside the group's capabilities is denied: a built-in no held
+ *     key grants, or an MCP server other than NanoClaw's own without
+ *     `mcp-servers` (the SDK's `tools` option does not govern MCP servers);
+ *   - a subagent never puts anything in front of a person.
+ * Anything allowed is recorded as in flight, with its declared timeout, so
+ * the host sweep can widen its stuck tolerance while Bash runs a long script.
  */
-const preToolUseHook: HookCallback = async (input) => {
-  const i = input as { tool_name?: string; tool_input?: Record<string, unknown>; agent_id?: string };
-  const toolName = i.tool_name ?? '';
-  if (SDK_DISALLOWED_TOOLS.includes(toolName)) {
-    return {
-      decision: 'block',
-      stopReason: `Tool '${toolName}' is not available in this environment — use the nanoclaw equivalent.`,
-    } as unknown as ReturnType<HookCallback>;
-  }
-  // The SDK sets agent_id only on calls made inside a subagent. A subagent
-  // works for the agent that started it and reports back through its result;
-  // only the agent itself speaks in the conversation.
-  if (i.agent_id !== undefined && SUBAGENT_DENIED_TOOLS.has(toolName)) {
-    return {
-      hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        permissionDecision: 'deny',
-        permissionDecisionReason:
-          'A subagent does not message anyone. Return what you found as your result; the agent that started you decides what to send.',
-      },
-    };
-  }
-  // Bash exposes its timeout via the tool_input.timeout field (ms). Any other
-  // tool: no declared timeout.
-  const declaredTimeoutMs =
-    toolName === 'Bash' && typeof i.tool_input?.timeout === 'number' ? (i.tool_input.timeout as number) : null;
-  try {
-    setContainerToolInFlight(toolName, declaredTimeoutMs);
-  } catch (err) {
-    log(`PreToolUse: failed to record container_state: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  return { continue: true };
-};
+export function createPreToolUseHook(policy: ClaudeCapabilityPolicy): HookCallback {
+  return async (input) => {
+    const i = input as { tool_name?: string; tool_input?: Record<string, unknown>; agent_id?: string };
+    const toolName = i.tool_name ?? '';
+    if (SDK_DISALLOWED_TOOLS.includes(toolName)) {
+      return {
+        decision: 'block',
+        stopReason: `Tool '${toolName}' is not available in this environment — use the nanoclaw equivalent.`,
+      } as unknown as ReturnType<HookCallback>;
+    }
+    const granted = toolName.startsWith('mcp__')
+      ? allowsMcpTool(policy, toolName)
+      : allowsBuiltinTool(policy, toolName);
+    if (!granted) {
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason: `Tool '${toolName}' is not available to this agent. Work with the tools you have.`,
+        },
+      };
+    }
+    // The SDK sets agent_id only on calls made inside a subagent. A subagent
+    // works for the agent that started it and reports back through its result;
+    // only the agent itself speaks in the conversation.
+    if (i.agent_id !== undefined && SUBAGENT_DENIED_TOOLS.has(toolName)) {
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason:
+            'A subagent does not message anyone. Return what you found as your result; the agent that started you decides what to send.',
+        },
+      };
+    }
+    // Bash exposes its timeout via the tool_input.timeout field (ms). Any other
+    // tool: no declared timeout.
+    const declaredTimeoutMs =
+      toolName === 'Bash' && typeof i.tool_input?.timeout === 'number' ? (i.tool_input.timeout as number) : null;
+    try {
+      setContainerToolInFlight(toolName, declaredTimeoutMs);
+    } catch (err) {
+      log(`PreToolUse: failed to record container_state: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return { continue: true };
+  };
+}
 
 /** Clear in-flight tool on PostToolUse / PostToolUseFailure. */
 const postToolUseHook: HookCallback = async () => {
@@ -219,6 +246,10 @@ export class ClaudeProvider implements AgentProvider {
   private env: Record<string, string | undefined>;
   private additionalDirectories?: string[];
   private memorySessionHook?: MemorySessionHookRegistration;
+  private capabilities: ClaudeCapabilityPolicy;
+  private preToolUseHook: HookCallback;
+  /** A sealed session archives no transcript into the group's conversations/ (memory/sealed.ts). */
+  private sealed: boolean;
 
   /**
    * `configuration` is the contract's configuration as resolved by core
@@ -235,6 +266,11 @@ export class ClaudeProvider implements AgentProvider {
       ...(options.env ?? {}),
       CLAUDE_CODE_AUTO_COMPACT_WINDOW,
     };
+    // The group's capabilities, as the host resolved them into container.json.
+    // Fixed for the life of the container, so the policy and hook are built once.
+    this.capabilities = resolveClaudeCapabilityPolicy(runnerCapabilities());
+    this.preToolUseHook = createPreToolUseHook(this.capabilities);
+    this.sealed = sessionsSealed(runnerCapabilities());
   }
 
   /**
@@ -260,7 +296,10 @@ export class ClaudeProvider implements AgentProvider {
    * cold-resume within the host's idle ceiling (see claude-history.ts).
    */
   maybeRotateContinuation(continuation: string, _cwd: string): string | null {
-    return rotateClaudeContinuation({ continuation, assistantName: this.assistantName, log }, REAL_CLOCK);
+    return rotateClaudeContinuation(
+      { continuation, assistantName: this.assistantName, archive: !this.sealed, log },
+      REAL_CLOCK,
+    );
   }
 
   query(input: QueryInput): AgentQuery {
@@ -269,6 +308,7 @@ export class ClaudeProvider implements AgentProvider {
     stream.push(input.prompt);
 
     const instructions = input.systemContext?.instructions;
+    const toolOptions = resolveClaudeToolOptions(this.capabilities, this.mcp, this.executionPolicy.disallowedTools);
 
     const sdkResult = sdkQuery({
       prompt: stream,
@@ -285,9 +325,10 @@ export class ClaudeProvider implements AgentProvider {
         systemPrompt: instructions
           ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions, snapshot: false }
           : undefined,
-        allowedTools: [...this.mcp.allowedTools],
-        disallowedTools: [...this.executionPolicy.disallowedTools],
-        env: this.env,
+        ...(toolOptions.tools ? { tools: toolOptions.tools } : {}),
+        allowedTools: toolOptions.allowedTools,
+        disallowedTools: toolOptions.disallowedTools,
+        env: { ...this.env, ...toolOptions.env },
         model: this.inference.model,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         effort: this.inference.effort as any,
@@ -299,12 +340,13 @@ export class ClaudeProvider implements AgentProvider {
         // input can never override them. Both are Settings members rather
         // than query options, which is why they ride `settings`.
         settings: { ...this.inference.settings, ...this.executionPolicy.settings },
-        mcpServers: this.mcp.mcpServers,
+        mcpServers: toolOptions.mcpServers,
+        ...(toolOptions.strictMcpConfig ? { strictMcpConfig: true } : {}),
         hooks: {
-          PreToolUse: [{ hooks: [preToolUseHook] }],
+          PreToolUse: [{ hooks: [this.preToolUseHook] }],
           PostToolUse: [{ hooks: [postToolUseHook] }],
           PostToolUseFailure: [{ hooks: [postToolUseHook] }],
-          PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
+          ...(this.sealed ? {} : { PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }] }),
         },
       },
     });

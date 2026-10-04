@@ -1,6 +1,7 @@
 import { getDb, hasTable } from '../../db/connection.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import { log } from '../../log.js';
+import { createDestination } from '../../modules/agent-to-agent/db/agent-destinations.js';
 import { registerResource } from '../crud.js';
 
 /**
@@ -98,23 +99,22 @@ registerResource({
       handler: async (args) => {
         const agentGroupId = args.agent_group_id as string;
         const localName = args.local_name as string;
-        const targetType = args.target_type as string;
+        const targetType = args.target_type;
         const targetId = args.target_id as string;
         if (!agentGroupId) throw new Error('--agent-group-id is required');
         if (!localName) throw new Error('--local-name is required');
-        if (!targetType || !['channel', 'agent'].includes(targetType)) {
+        if (targetType !== 'channel' && targetType !== 'agent') {
           throw new Error('--target-type must be channel or agent');
         }
         if (!targetId) throw new Error('--target-id is required');
-        await getDb().run(
-          `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
-           VALUES (?, ?, ?, ?, ?)`,
-          agentGroupId,
-          localName,
-          targetType,
-          targetId,
-          new Date().toISOString(),
-        );
+        // The module's writer, so the destination admission policies judge the row first.
+        await createDestination({
+          agent_group_id: agentGroupId,
+          local_name: localName,
+          target_type: targetType,
+          target_id: targetId,
+          created_at: new Date().toISOString(),
+        });
         await projectDestinationsToSessions(agentGroupId);
         return { agent_group_id: agentGroupId, local_name: localName, target_type: targetType, target_id: targetId };
       },

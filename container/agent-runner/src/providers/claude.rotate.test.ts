@@ -1,11 +1,19 @@
-import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from 'bun:test';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import './index.js';
-import '../provider-contracts/index.js';
-import { createProvider } from './factory.js';
+// A group holding conversation-context, whose rotated transcripts are
+// archived; a sealed session's are not (claude.sealed.test.ts).
+const actualConfig = await import('../config.js');
+mock.module('../config.js', () => ({
+  ...actualConfig,
+  runnerCapabilities: () => new Set(['conversation-context']),
+}));
+
+await import('./index.js');
+await import('../provider-contracts/index.js');
+const { createProvider } = await import('./factory.js');
 
 // maybeRotateContinuation guards the cold-resume failure mode: a long-lived
 // session whose on-disk transcript has grown so large (or old) that the SDK

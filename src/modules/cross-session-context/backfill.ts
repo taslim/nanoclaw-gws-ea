@@ -20,7 +20,9 @@
  * than ECHO_MAX_AGE_DAYS; the newest BACKFILL_LIMIT survive, written in ONE
  * mailbox session as trigger=0 session-echo rows BEFORE the trigger (lower
  * seq → the formatter renders them first, as ambient context). Never throws.
+ * Only a group holding `conversation-context` is backfilled.
  */
+import { CONVERSATION_CONTEXT_CAPABILITY, getGroupCapabilities } from '../../capabilities.js';
 import { isTaskThread } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
@@ -129,6 +131,7 @@ export async function backfillSession(
 ): Promise<void> {
   try {
     if (session.thread_id !== null && isTaskThread(session.thread_id)) return;
+    if (!(await getGroupCapabilities(agentGroup.id)).has(CONVERSATION_CONTEXT_CAPABILITY)) return;
     const now = options.now ?? Date.now();
 
     const candidates = await loadHotCandidates(agentGroup.id, mg.id, now);

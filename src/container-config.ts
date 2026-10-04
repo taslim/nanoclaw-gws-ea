@@ -11,6 +11,7 @@
 import fs from 'fs';
 import path from 'path';
 
+import { MCP_SERVERS_CAPABILITY, parseStoredCapabilities, resolveCapabilities } from './capabilities.js';
 import { DEFAULT_MODEL, FAST_MODE, GROUPS_DIR, TIMEZONE } from './config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -259,6 +260,11 @@ export interface ContainerConfig {
   timezone?: string;
   /** Session isolation tier for the group's containers; absent = the composer's default ('container'). */
   runtimeTier?: 'container' | 'vm';
+  /**
+   * The capability keys the group holds, resolved to an explicit list (see
+   * src/capabilities.ts). The runner grants nothing that is not listed here.
+   */
+  capabilities: string[];
 }
 
 /**
@@ -361,8 +367,13 @@ export function parseSkillSelection(raw: string | undefined, groupName: string):
 
 /** Build a `ContainerConfig` from a DB row + agent group identity. */
 export function configFromDb(row: ContainerConfigRow, group: AgentGroup): ContainerConfig {
+  const capabilities = resolveCapabilities(parseStoredCapabilities(row.capabilities, group.name), group.name);
   return {
-    mcpServers: sanitizeStoredMcpServers(JSON.parse(row.mcp_servers), group.name),
+    // Without `mcp-servers` a configured server never reaches the container,
+    // so its command can never start there.
+    mcpServers: capabilities.includes(MCP_SERVERS_CAPABILITY)
+      ? sanitizeStoredMcpServers(JSON.parse(row.mcp_servers), group.name)
+      : {},
     packages: {
       apt: JSON.parse(row.packages_apt) as string[],
       npm: JSON.parse(row.packages_npm) as string[],
@@ -383,6 +394,7 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     ...speedFields(parseContainerSpeed(row.speed) ?? (FAST_MODE ? 'fast' : undefined)),
     timezone: row.timezone && isValidTimezone(row.timezone) ? row.timezone : undefined,
     runtimeTier: parseRuntimeTier(row.runtime_tier, group.name),
+    capabilities,
   };
 }
 

@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { GOOGLE_SERVICES, type GoogleGrant } from './grant.js';
-import { createGoogleTokenRefresher, RENEW_BEFORE_EXPIRY_MS } from './refresher.js';
+import type {
+  GatewayCredentialTarget,
+  GatewayRuntimeCredentialConnection,
+} from '../../gateway-providers/credential-connection.js';
+import { AGENT_GOOGLE_SERVICES, GOOGLE_SIGN_IN_SCOPES, type GoogleGrant } from './grant.js';
+import { createGoogleTokenRefresher, RENEW_BEFORE_EXPIRY_MS, STALE_GMAIL_SECRET } from './refresher.js';
 import { GOOGLE_TOKEN_ENDPOINT } from './tokens.js';
 
 const GRANT: GoogleGrant = {
@@ -10,86 +14,95 @@ const GRANT: GoogleGrant = {
   client_id: 'client.apps.googleusercontent.com',
   client_secret: 'GOCSPX-client-secret',
   refresh_token: '1//refresh-token',
-  scopes: ['openid', ...GOOGLE_SERVICES.calendar.scopes, ...GOOGLE_SERVICES.gmail.scopes],
+  scopes: [...GOOGLE_SIGN_IN_SCOPES],
   granted_at: '2026-09-30T10:00:00.000Z',
 };
 
-interface Fake {
-  readonly fetch: typeof globalThis.fetch;
-  readonly minted: URLSearchParams[];
-  readonly secrets: Map<string, { id: string; hostPattern: string; value: string; injectionConfig: unknown }>;
-  readonly writes: string[];
+const MODIFY = 'https://www.googleapis.com/auth/gmail.modify';
+const AGENT_SECRETS = ['google-calendar', 'google-gmail-read', 'google-directory'];
+
+interface Stored {
+  readonly host: string;
+  readonly value: string;
+  readonly target: GatewayCredentialTarget;
 }
 
-/** Google's token endpoint and OneCLI's secret API, in memory. */
-function fake(google: { error?: string; scope?: (asked: string) => string } = {}): Fake {
+/** Google's token endpoint, and the selected gateway's credential connection, in memory. */
+function world(google: { error?: string; scope?: (asked: string) => string } = {}) {
   const minted: URLSearchParams[] = [];
-  const secrets: Fake['secrets'] = new Map();
+  const vault = new Map<string, Stored>();
   const writes: string[] = [];
+  let failNextFind: string | undefined;
   let tokens = 0;
-  const json = (status: number, body: unknown): Response =>
-    new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  const json = (status: number, body: unknown): Response => new Response(JSON.stringify(body), { status });
   const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-    const url = String(input);
-    if (url === GOOGLE_TOKEN_ENDPOINT) {
-      const form = new URLSearchParams(String(init?.body));
-      minted.push(form);
-      if (google.error) return json(400, { error: google.error });
-      tokens += 1;
-      const asked = form.get('scope') ?? '';
-      return json(200, {
-        access_token: `ya29.token-${tokens}`,
-        expires_in: 3599,
-        scope: google.scope ? google.scope(asked) : asked,
-        token_type: 'Bearer',
-      });
-    }
-    const route = new URL(url).pathname;
-    const headers = new Headers(init?.headers);
-    if (headers.get('authorization') !== 'Bearer oc_instance_key') return json(401, { error: 'unauthorized' });
-    if (init?.method === 'GET' && route === '/v1/secrets') {
-      return json(
-        200,
-        [...secrets].map(([name, secret]) => ({
-          id: secret.id,
-          name,
-          hostPattern: secret.hostPattern,
-          type: 'generic',
-        })),
-      );
-    }
-    const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
-    if (init?.method === 'POST' && route === '/v1/secrets') {
-      secrets.set(String(body.name), {
-        id: `sec-${secrets.size + 1}`,
-        hostPattern: String(body.hostPattern),
-        value: String(body.value),
-        injectionConfig: body.injectionConfig,
-      });
-      writes.push(`create ${String(body.name)}`);
-      return json(201, {});
-    }
-    if (init?.method === 'PATCH' && route.startsWith('/v1/secrets/')) {
-      const id = decodeURIComponent(route.slice('/v1/secrets/'.length));
-      const entry = [...secrets].find(([, secret]) => secret.id === id);
-      if (!entry) return json(404, {});
-      secrets.set(entry[0], { ...entry[1], value: String(body.value), hostPattern: String(body.hostPattern) });
-      writes.push(`update ${entry[0]}`);
-      return json(200, { success: true });
-    }
-    return json(404, {});
+    expect(String(input)).toBe(GOOGLE_TOKEN_ENDPOINT);
+    const form = new URLSearchParams(String(init?.body));
+    minted.push(form);
+    if (google.error) return json(400, { error: google.error });
+    tokens += 1;
+    const asked = form.get('scope') ?? '';
+    return json(200, {
+      access_token: `ya29.token-${tokens}`,
+      expires_in: 3599,
+      scope: google.scope ? google.scope(asked) : asked,
+    });
   }) as unknown as typeof globalThis.fetch;
-  return { fetch, minted, secrets, writes };
+
+  /** The contract: `find` first, then `save`, `keep`, or `remove` act on what it observed. */
+  const connection = vi.fn((target: GatewayCredentialTarget): GatewayRuntimeCredentialConnection => {
+    let observed: boolean | undefined;
+    const require = (): boolean => {
+      if (observed === undefined) throw new Error('find first');
+      return observed;
+    };
+    return {
+      async find() {
+        if (failNextFind === target.name) {
+          failNextFind = undefined;
+          throw new Error(`Multiple ${target.name} credentials exist.`);
+        }
+        observed = vault.has(target.name);
+        return observed ? { reusable: true } : null;
+      },
+      async save(value) {
+        const existed = require();
+        if (typeof value !== 'string') throw new Error('api-key only');
+        vault.set(target.name, { host: target.host, value, target });
+        writes.push(`${existed ? 'update' : 'create'} ${target.name}`);
+        observed = true;
+      },
+      async keep() {
+        require();
+      },
+      async remove() {
+        if (!require()) return;
+        vault.delete(target.name);
+        writes.push(`remove ${target.name}`);
+        observed = false;
+      },
+    };
+  });
+  return {
+    fetch,
+    minted,
+    vault,
+    writes,
+    connection,
+    failFindOnce(name: string) {
+      failNextFind = name;
+    },
+  };
 }
 
-function refresher(f: Fake, grant: () => GoogleGrant | undefined, clock: { now: number }) {
+function refresher(w: ReturnType<typeof world>, grant: () => GoogleGrant | undefined, clock: { now: number }) {
   const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
   return {
     log,
     refresher: createGoogleTokenRefresher({
       readGrant: async () => grant(),
-      onecli: { url: 'http://127.0.0.1:31002', apiKey: 'oc_instance_key', fetch: f.fetch },
-      fetch: f.fetch,
+      connection: w.connection,
+      fetch: w.fetch,
       now: () => clock.now,
       log,
     }),
@@ -97,85 +110,160 @@ function refresher(f: Fake, grant: () => GoogleGrant | undefined, clock: { now: 
 }
 
 describe('the Google token refresher', () => {
-  it('puts a Calendar-only token into OneCLI as a bearer secret on the first tick', async () => {
-    const f = fake();
-    const clock = { now: Date.parse('2026-09-30T12:00:00.000Z') };
-    await refresher(f, () => GRANT, clock).refresher.tick();
+  it("publishes each agent-facing service's token through the gateway's connection on the first tick", async () => {
+    const w = world();
+    await refresher(w, () => GRANT, { now: Date.parse('2026-09-30T12:00:00.000Z') }).refresher.tick();
 
-    expect(f.minted.map((form) => form.get('scope'))).toEqual([GOOGLE_SERVICES.calendar.scopes.join(' ')]);
-    expect(f.minted[0]?.get('grant_type')).toBe('refresh_token');
-    expect(f.secrets.get('google-calendar')).toEqual({
-      id: 'sec-1',
-      hostPattern: 'www.googleapis.com',
-      value: 'ya29.token-1',
-      injectionConfig: { headerName: 'Authorization', valueFormat: 'Bearer {value}' },
+    expect(w.minted.map((form) => form.get('scope'))).toEqual([
+      AGENT_GOOGLE_SERVICES.calendar.scopes.join(' '),
+      'https://www.googleapis.com/auth/gmail.readonly',
+      'https://www.googleapis.com/auth/directory.readonly',
+    ]);
+    expect(w.minted.map((form) => form.get('scope')).join(' ')).not.toContain(MODIFY);
+    expect(w.minted[0]?.get('grant_type')).toBe('refresh_token');
+    expect([...w.vault.keys()]).toEqual(AGENT_SECRETS);
+    expect(w.vault.get('google-gmail-read')).toEqual({
+      host: 'gmail.googleapis.com',
+      value: 'ya29.token-2',
+      target: {
+        kind: 'api-key',
+        name: 'google-gmail-read',
+        host: 'gmail.googleapis.com',
+        proxyValue: 'gateway-managed',
+        injection: { headerName: 'Authorization', valueFormat: 'Bearer {value}' },
+      },
     });
-    expect(f.secrets.has('google-gmail')).toBe(false);
+    expect(w.vault.get('google-directory')?.host).toBe('people.googleapis.com');
   });
 
-  it('renews only when the token is close to expiring, as after the machine wakes', async () => {
-    const f = fake();
+  it('removes the stale gmail.modify secret an earlier release left, once', async () => {
+    const w = world();
+    const stale: GatewayCredentialTarget = {
+      kind: 'api-key',
+      name: STALE_GMAIL_SECRET.name,
+      host: STALE_GMAIL_SECRET.host,
+      proxyValue: 'gateway-managed',
+      injection: { headerName: 'Authorization', valueFormat: 'Bearer {value}' },
+    };
+    w.vault.set(STALE_GMAIL_SECRET.name, { host: 'gmail.googleapis.com', value: 'ya29.modify', target: stale });
+    const { refresher: r } = refresher(w, () => undefined, { now: 0 });
+
+    await r.tick();
+    await r.tick();
+
+    expect(STALE_GMAIL_SECRET).toEqual({ name: 'google-gmail', host: 'gmail.googleapis.com' });
+    expect(w.vault.has('google-gmail')).toBe(false);
+    expect(w.writes).toEqual(['remove google-gmail']);
+    expect(w.connection.mock.calls.filter(([target]) => target.name === 'google-gmail')).toHaveLength(1);
+  });
+
+  it('retries removing the stale secret on a later tick when the gateway refuses, reporting it once', async () => {
+    const w = world();
+    w.failFindOnce(STALE_GMAIL_SECRET.name);
+    const { refresher: r, log } = refresher(w, () => undefined, { now: 0 });
+
+    await r.tick();
+    await r.tick();
+
+    expect(log.error).toHaveBeenCalledTimes(1);
+    expect(w.connection.mock.calls.filter(([target]) => target.name === 'google-gmail')).toHaveLength(2);
+  });
+
+  it('renews only when a token is close to expiring, as after the machine wakes', async () => {
+    const w = world();
     const clock = { now: Date.parse('2026-09-30T12:00:00.000Z') };
-    const { refresher: r } = refresher(f, () => GRANT, clock);
+    const { refresher: r } = refresher(w, () => GRANT, clock);
 
     await r.tick();
     clock.now += 30 * 60_000;
     await r.tick();
-    expect(f.writes).toEqual(['create google-calendar']);
+    expect(w.writes).toEqual(AGENT_SECRETS.map((name) => `create ${name}`));
 
     clock.now += 3_599_000 - 30 * 60_000 - RENEW_BEFORE_EXPIRY_MS + 1;
     await r.tick();
-    expect(f.writes).toEqual(['create google-calendar', 'update google-calendar']);
-    expect(f.secrets.get('google-calendar')?.value).toBe('ya29.token-2');
+    expect(w.writes.slice(3)).toEqual(AGENT_SECRETS.map((name) => `update ${name}`));
+    expect(w.vault.get('google-calendar')?.value).toBe('ya29.token-4');
 
     // Asleep for hours: the first tick after waking renews.
     clock.now += 5 * 3_600_000;
     await r.tick();
-    expect(f.secrets.get('google-calendar')?.value).toBe('ya29.token-3');
+    expect(w.vault.get('google-calendar')?.value).toBe('ya29.token-7');
   });
 
   it('waits quietly while there is no sign-in yet', async () => {
-    const f = fake();
-    const { refresher: r, log } = refresher(f, () => undefined, { now: 0 });
+    const w = world();
+    const { refresher: r, log } = refresher(w, () => undefined, { now: 0 });
 
     await r.tick();
 
-    expect(f.minted).toEqual([]);
+    expect(w.minted).toEqual([]);
     expect(log.error).not.toHaveBeenCalled();
   });
 
   it('stops asking Google after a revoked sign-in until a new one is written', async () => {
-    const f = fake({ error: 'invalid_grant' });
+    const w = world({ error: 'invalid_grant' });
     let grant = GRANT;
-    const { refresher: r, log } = refresher(f, () => grant, { now: 0 });
+    const { refresher: r, log } = refresher(w, () => grant, { now: 0 });
 
     await r.tick();
     await r.tick();
-    expect(f.minted).toHaveLength(1);
+    expect(w.minted).toHaveLength(1);
     expect(log.error).toHaveBeenCalledTimes(1);
 
     grant = { ...GRANT, refresh_token: '1//new-refresh-token', granted_at: '2026-09-30T13:00:00.000Z' };
     await r.tick();
-    expect(f.minted).toHaveLength(2);
+    expect(w.minted).toHaveLength(2);
   });
 
-  it('never injects a token Google did not limit to Calendar', async () => {
-    const f = fake({ scope: () => [...GOOGLE_SERVICES.calendar.scopes, ...GOOGLE_SERVICES.gmail.scopes].join(' ') });
-    const { refresher: r, log } = refresher(f, () => GRANT, { now: 0 });
+  it('never publishes a token Google did not limit to its service', async () => {
+    const w = world({
+      scope: (asked) => (asked.includes('gmail.readonly') ? `${asked} ${MODIFY}` : asked),
+    });
+    const { refresher: r, log } = refresher(w, () => GRANT, { now: 0 });
 
     await r.tick();
 
-    expect(f.secrets.size).toBe(0);
-    expect(log.warn).toHaveBeenCalled();
+    expect(w.vault.has('google-gmail-read')).toBe(false);
+    expect([...w.vault.keys()]).toEqual(['google-calendar', 'google-directory']);
+    expect(log.warn).toHaveBeenCalledWith(
+      'Could not renew Google access for agents; retrying',
+      expect.objectContaining({ service: 'gmail-read' }),
+    );
+  });
+
+  it("holds the host's Gmail token in memory only, renewing it near expiry", async () => {
+    const w = world();
+    const clock = { now: 0 };
+    const { refresher: r } = refresher(w, () => GRANT, clock);
+
+    const first = await r.hostAccessToken('gmail');
+    expect(await r.hostAccessToken('gmail')).toBe(first);
+    expect(w.minted.map((form) => form.get('scope'))).toEqual([MODIFY]);
+    expect(w.connection).not.toHaveBeenCalled();
+
+    clock.now += 3_599_000 - RENEW_BEFORE_EXPIRY_MS + 1;
+    expect(await r.hostAccessToken('gmail')).not.toBe(first);
+    await r.tick();
+    expect([...w.vault.values()].map((stored) => stored.value)).not.toContain(first);
+    expect(w.writes.some((write) => write.includes('gmail.modify') || write.endsWith(' google-gmail'))).toBe(false);
+  });
+
+  it('mints one host token for callers that ask at once, and refuses before the assistant signs in', async () => {
+    const w = world();
+    const { refresher: r } = refresher(w, () => GRANT, { now: 0 });
+    const [a, b] = await Promise.all([r.hostAccessToken('gmail'), r.hostAccessToken('gmail')]);
+    expect(a).toBe(b);
+    expect(w.minted).toHaveLength(1);
+
+    const unsigned = refresher(world(), () => undefined, { now: 0 }).refresher;
+    await expect(unsigned.hostAccessToken('gmail')).rejects.toThrow(/not signed in/);
   });
 
   it('never writes a token, the refresh token, or the client secret into a log line', async () => {
     // Every line the refresher logs: a renewal, a token Google did not narrow, and a revoked sign-in.
-    const renewed = refresher(fake(), () => GRANT, { now: 0 });
-    const unnarrowed = refresher(fake({ scope: () => 'https://www.googleapis.com/auth/gmail.modify' }), () => GRANT, {
-      now: 0,
-    });
-    const revoked = refresher(fake({ error: 'invalid_grant' }), () => GRANT, { now: 0 });
+    const renewed = refresher(world(), () => GRANT, { now: 0 });
+    const unnarrowed = refresher(world({ scope: () => MODIFY }), () => GRANT, { now: 0 });
+    const revoked = refresher(world({ error: 'invalid_grant' }), () => GRANT, { now: 0 });
     for (const run of [renewed, unnarrowed, revoked]) await run.refresher.tick();
 
     expect(renewed.log.info).toHaveBeenCalledWith('Renewed Google access for agents', expect.anything());

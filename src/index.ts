@@ -104,8 +104,10 @@ async function main(): Promise<void> {
   // 2. Channel adapters
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
     return {
+      // Resolves once the message is routed and rejects when routing fails,
+      // so an adapter that keeps its own cursor retries rather than skips.
       onInbound(platformId, threadId, message) {
-        inboundReady
+        return inboundReady
           .then(() =>
             routeInbound({
               channelType: adapter.channelType,
@@ -125,8 +127,9 @@ async function main(): Promise<void> {
               },
             }),
           )
-          .catch((err) => {
+          .catch((err: unknown) => {
             log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
+            throw err;
           });
       },
       onInboundEvent(event) {
@@ -181,11 +184,13 @@ async function main(): Promise<void> {
   // offline adapter is never rerouted through a sibling bot. See
   // createChannelDeliveryAdapter in channels/channel-registry.ts.
   const deliveryAdapter = createChannelDeliveryAdapter();
-  setDeliveryAdapter(deliveryAdapter);
+  // Every host caller gets the guarded adapter, so approval cards and module
+  // sends pass the outbound guards that channel replies pass.
+  const guardedDelivery = setDeliveryAdapter(deliveryAdapter);
 
   // 4. Core starts the selected gateway's normalized approval subscription
   // only after persistence and delivery are ready.
-  await startGatewayApprovalCoordinator(gatewayProvider, deliveryAdapter, stopGatewaySessionsForUnavailability, {
+  await startGatewayApprovalCoordinator(gatewayProvider, guardedDelivery, stopGatewaySessionsForUnavailability, {
     onAvailable: resumeGatewaySessionAdmission,
     waitUntilReady: true,
   });
@@ -199,7 +204,7 @@ async function main(): Promise<void> {
 
   // 6. Start registered host modules. Imports only registered callbacks; the
   // actual work begins here, after DB + delivery are ready and before polls.
-  await startHostModules({ db, deliveryAdapter, signal: hostAbortController.signal });
+  await startHostModules({ db, deliveryAdapter: guardedDelivery, signal: hostAbortController.signal });
 
   // 6. Start delivery polls
   startActiveDeliveryPoll();
@@ -226,7 +231,7 @@ async function shutdown(signal: string): Promise<void> {
   await stopHostModules();
   // Stamp the durable stop before the DB closes below.
   await stopHostInstanceLease();
-  stopDeliveryPolls();
+  await stopDeliveryPolls();
   stopHostSweep();
   await stopCliServer();
   try {

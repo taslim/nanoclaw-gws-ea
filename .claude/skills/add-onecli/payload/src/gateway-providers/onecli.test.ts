@@ -3,39 +3,23 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import type { GatewayCredentialScope } from './gateway-provider-registry.js';
 import type { GatewayApprovalRequest, GatewaySessionInput } from './gateway-provider-registry.js';
 
 const sdk = vi.hoisted(() => ({
+  order: [] as string[],
   ensureAgent: vi.fn(async () => ({ created: false })),
   getContainerConfig: vi.fn(async () => ({
     env: { HTTPS_PROXY: 'http://host.docker.internal:15001' },
     caCertificate: 'fixture-ca',
     caCertificateContainerPath: '/tmp/onecli-ca.pem',
   })),
-  startApproval: vi.fn(),
-  manualApproval: undefined as undefined | ((request: Record<string, unknown>) => Promise<'approve' | 'deny'>),
-  stopApproval: vi.fn(),
 }));
 
 vi.mock('@onecli-sh/sdk', () => ({
   OneCLI: class {
     ensureAgent = sdk.ensureAgent;
     getContainerConfig = sdk.getContainerConfig;
-  },
-  ApprovalClient: class {
-    resolve?: () => void;
-    start(callback: (request: Record<string, unknown>) => Promise<'approve' | 'deny'>) {
-      sdk.manualApproval = callback;
-      const running = sdk.startApproval(callback);
-      if (running) return running;
-      return new Promise<void>((resolve) => {
-        this.resolve = resolve;
-      });
-    }
-    stop() {
-      sdk.stopApproval();
-      this.resolve?.();
-    }
   },
 }));
 vi.mock('../config.js', async (original) => ({
@@ -50,6 +34,7 @@ vi.mock('../env.js', () => ({
   readEnvFile: () => ({
     ONECLI_URL: 'http://localhost:1',
     ONECLI_API_KEY: 'unused',
+    ONECLI_PROJECT_ID: 'project-fixture',
     ANTHROPIC_BASE_URL: 'https://anthropic.example.com',
   }),
 }));
@@ -61,41 +46,58 @@ const provider = getGatewayProviderRegistration('onecli')!;
 const scope = { ownsAgentGroup: vi.fn(async (id: string) => id === 'g1') };
 const subscribe = (decide: Parameters<typeof provider.approvals.subscribe>[0], signal: AbortSignal) =>
   provider.approvals.subscribe(decide, signal, undefined, scope);
-const input = (sessionId: string): GatewaySessionInput => ({
+const input = (sessionId: string, credentialScope: GatewayCredentialScope = { kind: 'all' }): GatewaySessionInput => ({
   key: { installSlug: 'install', agentGroupId: 'g1', sessionId },
   runtimeIdentity: `install/g1/${sessionId}`,
   groupName: 'Group One',
   containerName: 'fixture-agent',
   capabilities: {} as never,
+  credentialScope,
 });
 
 beforeEach(() => {
   vi.clearAllMocks();
-  sdk.manualApproval = undefined;
+  sdk.order.length = 0;
+  sdk.getContainerConfig.mockImplementation(async () => {
+    sdk.order.push('container-config');
+    return {
+      env: { HTTPS_PROXY: 'http://host.docker.internal:15001' },
+      caCertificate: 'fixture-ca',
+      caCertificateContainerPath: '/tmp/onecli-ca.pem',
+    };
+  });
 });
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   fs.rmSync('/tmp/nanoclaw-onecli-adapter-review', { recursive: true, force: true });
 });
 
-describe('OneCLI gateway package', () => {
-  it.each(['copy-a', 'copy-b'])('leaves foreign requests untouched by the real SDK poller: %s', async (owned) => {
-    const { ApprovalClient } = await vi.importActual<typeof import('@onecli-sh/sdk')>('@onecli-sh/sdk');
-    const controller = new AbortController();
-    let client: InstanceType<typeof ApprovalClient>;
-    let callbacksSettled = 0;
-    sdk.startApproval.mockImplementationOnce((callback) => {
-      client = new ApprovalClient('http://fixture.test', '', 'http://fixture.test', null);
-      return client.start(async (request) => {
-        try {
-          return await callback(request);
-        } finally {
-          callbacksSettled++;
-        }
-      });
+function mockApprovalPoll(requests: Record<string, unknown>[]) {
+  const decisions: Array<{ id: string; decision: string }> = [];
+  let polled = false;
+  const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, options) => {
+    const endpoint = new URL(String(url));
+    if (endpoint.pathname === '/v1/gateway-url') return Response.json({ url: 'http://gateway.test' });
+    if (endpoint.pathname.endsWith('/decision')) {
+      decisions.push({ id: endpoint.pathname.split('/')[3], ...JSON.parse(String(options?.body)) });
+      return new Response('{}');
+    }
+    if (!polled) {
+      polled = true;
+      return Response.json({ requests, timeoutSeconds: 30 });
+    }
+    return new Promise<Response>((_resolve, reject) => {
+      options!.signal!.addEventListener('abort', () => reject(new Error('stopped')), { once: true });
     });
-    sdk.stopApproval.mockImplementationOnce(() => client.stop());
+  });
+  return { decisions, fetchMock };
+}
+
+describe('OneCLI gateway package', () => {
+  it.each(['copy-a', 'copy-b'])('leaves foreign requests untouched by the native poller: %s', async (owned) => {
+    const controller = new AbortController();
     const requests = ['copy-a', 'copy-b'].flatMap((group) =>
       [false, true].map((stale) => ({
         id: `${group}-${stale ? 'stale' : 'fresh'}`,
@@ -107,29 +109,13 @@ describe('OneCLI gateway package', () => {
         agent: { name: group, externalId: group },
       })),
     );
-    let polled = false;
-    const decisions: Array<{ id: string; decision: string }> = [];
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, options) => {
-      const endpoint = new URL(String(url));
-      if (endpoint.pathname.endsWith('/decision')) {
-        decisions.push({ id: endpoint.pathname.split('/')[3], ...JSON.parse(String(options?.body)) });
-        return new Response('{}');
-      }
-      if (!polled) {
-        polled = true;
-        return Response.json({ requests, timeoutSeconds: 30 });
-      }
-      return new Promise<Response>((_resolve, reject) => {
-        options!.signal!.addEventListener('abort', () => reject(new Error('stopped')), { once: true });
-      });
-    });
+    const { decisions, fetchMock } = mockApprovalPoll(requests);
     const decide = vi.fn(async () => 'approve' as const);
     const running = provider.approvals.subscribe(decide, controller.signal, undefined, {
       ownsAgentGroup: async (id: string) => id === owned,
     });
     try {
       await vi.waitFor(() => expect(decisions.length).toBeGreaterThanOrEqual(2));
-      await vi.waitFor(() => expect(callbacksSettled).toBe(requests.length));
       expect(decisions.sort((a, b) => a.id.localeCompare(b.id))).toEqual([
         { id: `${owned}-fresh`, decision: 'approve' },
         { id: `${owned}-stale`, decision: 'deny' },
@@ -145,20 +131,25 @@ describe('OneCLI gateway package', () => {
   it('submits no decision if installation ownership cannot be read', async () => {
     const controller = new AbortController();
     const decide = vi.fn(async () => 'approve' as const);
+    const { decisions } = mockApprovalPoll([
+      {
+        id: 'foreign',
+        createdAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 30_000).toISOString(),
+        method: 'POST',
+        host: 'api.example.test',
+        path: '/resource',
+        agent: { name: 'other', externalId: 'other' },
+      },
+    ]);
     const running = provider.approvals.subscribe(decide, controller.signal, undefined, {
       ownsAgentGroup: async () => {
         throw new Error('ownership unavailable');
       },
     });
     try {
-      await vi.waitFor(() => expect(sdk.manualApproval).toBeTypeOf('function'));
-      await expect(
-        sdk.manualApproval!({
-          id: 'foreign',
-          createdAt: new Date(0).toISOString(),
-          agent: { name: 'other', externalId: 'other' },
-        }),
-      ).rejects.toThrow('ownership unavailable');
+      await vi.waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(3));
+      expect(decisions).toEqual([]);
       expect(decide).not.toHaveBeenCalled();
     } finally {
       controller.abort();
@@ -195,30 +186,46 @@ describe('OneCLI gateway package', () => {
     }
   });
 
-  it('propagates approval startup failure so core can reconnect', async () => {
-    sdk.startApproval.mockImplementationOnce(() => {
-      throw new Error('gateway URL unavailable');
-    });
-    await expect(subscribe(async () => 'deny', new AbortController().signal)).rejects.toThrow(
-      'gateway URL unavailable',
-    );
-    expect(sdk.stopApproval).toHaveBeenCalled();
-  });
-
-  it('exposes the pinned SDK gateway discovery rejection through the provider subscription', async () => {
-    const { ApprovalClient } = await vi.importActual<typeof import('@onecli-sh/sdk')>('@onecli-sh/sdk');
+  it('exposes gateway discovery rejection through the provider subscription', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('', { status: 503 }));
-    sdk.startApproval.mockImplementationOnce((callback) =>
-      new ApprovalClient('http://localhost:1', 'fixture', null, null).start(callback),
-    );
     try {
       await expect(subscribe(async () => 'deny', new AbortController().signal)).rejects.toThrow(
         'Failed to resolve gateway URL',
       );
-      expect(fetchMock).toHaveBeenCalledWith('http://localhost:1/v1/gateway-url', expect.anything());
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.objectContaining({ pathname: '/v1/gateway-url' }),
+        expect.anything(),
+      );
     } finally {
       fetchMock.mockRestore();
     }
+  });
+
+  it('rejects the subscription when polling returns 503', async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(async (url) =>
+        new URL(String(url)).pathname === '/v1/gateway-url'
+          ? Response.json({ url: 'http://gateway.test' })
+          : new Response('', { status: 503 }),
+      );
+    await expect(
+      provider.approvals.subscribe(async () => 'deny', new AbortController().signal, undefined, scope),
+    ).rejects.toThrow('approval poll failed (503)');
+    fetchMock.mockRestore();
+  });
+
+  it('ends the subscription if a later approval poll fails', async () => {
+    let polls = 0;
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+      if (new URL(String(url)).pathname === '/v1/gateway-url') return Response.json({ url: 'http://gateway.test' });
+      polls++;
+      return polls === 1 ? Response.json({ requests: [] }) : new Response('', { status: 503 });
+    });
+    await expect(
+      provider.approvals.subscribe(async () => 'deny', new AbortController().signal, undefined, scope),
+    ).rejects.toThrow('approval poll failed (503)');
+    fetchMock.mockRestore();
   });
 
   it('owns endpoint configuration and returns a typed session contribution', async () => {
@@ -240,6 +247,15 @@ describe('OneCLI gateway package', () => {
     });
     expect(withProviderEnv({}, '')).toEqual({});
     controller.abort();
+  });
+
+  it('adopts only an existing OneCLI agent and never recreates a deleted identity', async () => {
+    sdk.getContainerConfig.mockRejectedValueOnce(new Error('agent not found'));
+    await expect(
+      provider.sessions.ensure({ ...input('survivor'), disposition: 'adopt' }, new AbortController().signal),
+    ).rejects.toThrow('agent not found');
+    expect(sdk.ensureAgent).not.toHaveBeenCalled();
+    expect(sdk.getContainerConfig).toHaveBeenCalledWith({ agent: 'g1' });
   });
 
   it('shares one health monitor across live leases and reports failure to each session', async () => {
@@ -267,22 +283,29 @@ describe('OneCLI gateway package', () => {
   it('translates native approvals once and stops the subscription on cancellation', async () => {
     const decide = vi.fn(async (_request: GatewayApprovalRequest) => 'approve' as const);
     const controller = new AbortController();
-    const subscription = subscribe(decide, controller.signal);
-    await vi.waitFor(() => expect(sdk.manualApproval).toBeTypeOf('function'));
     const createdAt = new Date(Date.now() + 1_000).toISOString();
-
-    await expect(
-      sdk.manualApproval!({
+    const { decisions } = mockApprovalPoll([
+      {
         id: 'native-1',
         createdAt,
         expiresAt: new Date(Date.now() + 30_000).toISOString(),
         method: 'POST',
         host: 'api.example.test',
-        path: '/resource',
+        path: '/resource?token=secret#fragment',
         bodyPreview: '{"safe":"preview","mention":"<@U123>"}',
         agent: { name: 'Group <@U123>', externalId: 'g1' },
-      }),
-    ).resolves.toBe('approve');
+      },
+      {
+        id: 'stale',
+        createdAt: new Date(0).toISOString(),
+        method: 'GET',
+        host: 'api.example.test',
+        path: '/',
+        agent: { name: 'Group One', externalId: 'g1' },
+      },
+    ]);
+    const subscription = subscribe(decide, controller.signal);
+    await vi.waitFor(() => expect(decisions).toHaveLength(2));
     expect(decide).toHaveBeenCalledWith(
       expect.objectContaining({
         id: 'native-1',
@@ -295,22 +318,18 @@ describe('OneCLI gateway package', () => {
       }),
     );
     expect(decide.mock.calls[0][0].question).not.toContain('<@U123>');
+    expect(JSON.stringify(decide.mock.calls[0][0])).not.toContain('secret');
 
-    await expect(
-      sdk.manualApproval!({
-        id: 'stale',
-        createdAt: new Date(0).toISOString(),
-        method: 'GET',
-        host: 'api.example.test',
-        path: '/',
-        agent: { name: 'Group One', externalId: 'g1' },
-      }),
-    ).resolves.toBe('deny');
+    expect(decisions).toEqual(
+      expect.arrayContaining([
+        { id: 'native-1', decision: 'approve' },
+        { id: 'stale', decision: 'deny' },
+      ]),
+    );
     expect(decide).toHaveBeenCalledTimes(1);
 
     controller.abort();
     await subscription;
-    expect(sdk.stopApproval).toHaveBeenCalledOnce();
   });
 });
 
@@ -323,16 +342,18 @@ const compatibilityFixtures = JSON.parse(fs.readFileSync('gateway-compat/onecli-
 it.each(compatibilityFixtures)('preserves native OneCLI approval content: $name', async (fixture) => {
   const decide = vi.fn(async (_request: GatewayApprovalRequest) => 'deny' as const);
   const controller = new AbortController();
+  const { decisions } = mockApprovalPoll([
+    {
+      id: 'native-fixture',
+      createdAt: new Date(Date.now() + 1000).toISOString(),
+      expiresAt: new Date(Date.now() + 30000).toISOString(),
+      ...fixture.request,
+      summary: fixture.summary,
+      agent: { name: 'Nano', externalId: 'g1' },
+    },
+  ]);
   const subscription = subscribe(decide, controller.signal);
-  await vi.waitFor(() => expect(sdk.manualApproval).toBeTypeOf('function'));
-  await sdk.manualApproval!({
-    id: 'native-fixture',
-    createdAt: new Date(Date.now() + 1000).toISOString(),
-    expiresAt: new Date(Date.now() + 30000).toISOString(),
-    ...fixture.request,
-    summary: fixture.summary,
-    agent: { name: 'Nano', externalId: 'g1' },
-  });
+  await vi.waitFor(() => expect(decisions).toHaveLength(1));
   expect(decide.mock.calls[0][0].summary).toEqual({
     agent: 'Nano',
     action: fixture.summary.action,
@@ -342,4 +363,238 @@ it.each(compatibilityFixtures)('preserves native OneCLI approval content: $name'
   });
   controller.abort();
   await subscription;
+});
+
+interface VaultAgent {
+  id: string;
+  identifier: string | null;
+  name: string;
+  secretMode: string;
+}
+
+/**
+ * OneCLI's management API behind `fetch`: agents, their secret mode and
+ * assigned secrets, and the vault's secret metadata. Every request is
+ * recorded, and the adapter's agent writes land in `sdk.order` beside its
+ * container-config read, so a test sees what ran before the agent could.
+ */
+function mockManagement(
+  vault: { agents: VaultAgent[]; secrets: { id: string; name: string; hostPattern: string }[] },
+  options: { failPut?: string; ignoreModeChange?: boolean; failFlush?: boolean } = {},
+) {
+  const assigned = new Map<string, string[]>();
+  const requests: { method: string; path: string; init: RequestInit }[] = [];
+  const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init = {}) => {
+    const route = new URL(String(url));
+    const method = init.method ?? 'GET';
+    requests.push({ method, path: route.pathname, init });
+    const agentRoute = route.pathname.match(/^\/v1\/agents\/([^/]+)\/(secrets|secret-mode)$/);
+    if (method === 'GET' && route.pathname === '/v1/gateway-url') return Response.json({ url: 'http://gateway.test' });
+    if (method === 'POST' && route.origin === 'http://gateway.test' && route.pathname === '/v1/cache/invalidate') {
+      sdk.order.push('flush');
+      return options.failFlush ? new Response('', { status: 401 }) : Response.json({ invalidated: true });
+    }
+    if (method === 'GET' && route.pathname === '/v1/agents') return Response.json(vault.agents);
+    if (method === 'GET' && route.pathname === '/v1/secrets') return Response.json(vault.secrets);
+    if (agentRoute) {
+      const id = decodeURIComponent(agentRoute[1]!);
+      const agent = vault.agents.find((entry) => entry.id === id);
+      if (!agent) return new Response('', { status: 404 });
+      if (method === 'GET' && agentRoute[2] === 'secrets') return Response.json(assigned.get(id) ?? []);
+      const body = JSON.parse(String(init.body)) as { secretIds?: string[]; mode?: string };
+      sdk.order.push(`${method} ${agentRoute[2]}`);
+      if (method === 'PUT' && agentRoute[2] === 'secrets') {
+        if (options.failPut) return new Response(options.failPut, { status: 500 });
+        assigned.set(id, body.secretIds ?? []);
+        return Response.json({ status: 'updated' });
+      }
+      if (method === 'PATCH' && agentRoute[2] === 'secret-mode') {
+        if (!options.ignoreModeChange) agent.secretMode = body.mode ?? agent.secretMode;
+        return Response.json({ status: 'updated' });
+      }
+    }
+    return new Response('', { status: 404 });
+  });
+  return { assigned, requests, fetchMock };
+}
+
+const VAULT_SECRETS = [
+  { id: 'sec-calendar', name: 'google-calendar', hostPattern: 'www.googleapis.com' },
+  { id: 'sec-gmail-read', name: 'google-gmail-read', hostPattern: 'gmail.googleapis.com' },
+  { id: 'sec-directory', name: 'google-directory', hostPattern: 'people.googleapis.com' },
+  { id: 'sec-anthropic', name: 'Anthropic', hostPattern: 'api.anthropic.com' },
+  { id: 'sec-github', name: 'github', hostPattern: 'api.github.com' },
+];
+
+const restricted: GatewayCredentialScope = {
+  kind: 'only',
+  credentials: ['google-gmail-read'],
+  modelDomains: ['anthropic.com'],
+};
+
+describe("OneCLI applies each agent's credential scope", () => {
+  it('declares that it enforces credential scopes', () => {
+    expect(provider.sessions.enforcesCredentialScope).toBe(true);
+  });
+
+  it('keeps an `all` group, such as main, in its own mode without touching its agent', async () => {
+    const { requests, fetchMock } = mockManagement({
+      agents: [{ id: 'oc-g1', identifier: 'g1', name: 'main', secretMode: 'all' }],
+      secrets: VAULT_SECRETS,
+    });
+    const controller = new AbortController();
+    try {
+      await provider.sessions.ensure(input('s1'), controller.signal);
+      expect(requests).toEqual([]);
+    } finally {
+      controller.abort();
+      fetchMock.mockRestore();
+    }
+  });
+
+  it('corrects an identity OneCLI recreated in its default mode to exactly the scoped and model secrets, before the agent runs', async () => {
+    const agent: VaultAgent = { id: 'oc-g1', identifier: 'g1', name: 'Group One', secretMode: 'all' };
+    const { assigned, requests, fetchMock } = mockManagement({ agents: [agent], secrets: VAULT_SECRETS });
+    const controller = new AbortController();
+    try {
+      await provider.sessions.ensure(input('s1', restricted), controller.signal);
+
+      expect(agent.secretMode).toBe('selective');
+      expect([...(assigned.get('oc-g1') ?? [])].sort()).toEqual(['sec-anthropic', 'sec-gmail-read']);
+      expect(sdk.order).toEqual(['PUT secrets', 'PATCH secret-mode', 'flush', 'container-config']);
+      for (const { init } of requests) {
+        expect(init.redirect).toBe('error');
+        expect(new Headers(init.headers).get('authorization')).toBe('Bearer unused');
+        expect(new Headers(init.headers).get('x-project-id')).toBe('project-fixture');
+      }
+    } finally {
+      controller.abort();
+      fetchMock.mockRestore();
+    }
+  });
+
+  it('applies the scope when adopting a surviving session too, without creating an agent', async () => {
+    const agent: VaultAgent = { id: 'oc-g1', identifier: 'g1', name: 'Group One', secretMode: 'all' };
+    const { assigned, fetchMock } = mockManagement({ agents: [agent], secrets: VAULT_SECRETS });
+    const controller = new AbortController();
+    try {
+      await provider.sessions.ensure({ ...input('survivor', restricted), disposition: 'adopt' }, controller.signal);
+      expect(sdk.ensureAgent).not.toHaveBeenCalled();
+      expect(agent.secretMode).toBe('selective');
+      expect(assigned.get('oc-g1')?.length).toBe(2);
+    } finally {
+      controller.abort();
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("changes nothing on an agent that already holds exactly its scope, still flushing the gateway's cache", async () => {
+    const agent: VaultAgent = { id: 'oc-g1', identifier: 'g1', name: 'Group One', secretMode: 'selective' };
+    const { assigned, fetchMock } = mockManagement({ agents: [agent], secrets: VAULT_SECRETS });
+    assigned.set('oc-g1', ['sec-gmail-read', 'sec-anthropic']);
+    const controller = new AbortController();
+    try {
+      await provider.sessions.ensure(input('s1', restricted), controller.signal);
+      expect(sdk.order).toEqual(['flush', 'container-config']);
+    } finally {
+      controller.abort();
+      fetchMock.mockRestore();
+    }
+  });
+
+  it.each([
+    ['the gateway refuses the assignment', { failPut: 'oc_secret_preview' }, /failed \(500\)/],
+    ['the mode does not take', { ignoreModeChange: true }, /did not take/],
+    ["the gateway's cached decisions cannot be flushed", { failFlush: true }, /did not flush .*\(401\)/],
+  ])('refuses the spawn when %s, without echoing a response', async (_label, options, error) => {
+    const { fetchMock } = mockManagement(
+      { agents: [{ id: 'oc-g1', identifier: 'g1', name: 'Group One', secretMode: 'all' }], secrets: VAULT_SECRETS },
+      options,
+    );
+    try {
+      const failure = await provider.sessions
+        .ensure(input('s1', restricted), new AbortController().signal)
+        .catch((caught: unknown) => caught);
+      expect(String(failure)).toMatch(error);
+      expect(String(failure)).not.toContain('oc_secret_preview');
+      expect(sdk.order).not.toContain('container-config');
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it.each([
+    [
+      'two secrets carry a scoped name',
+      [{ id: 'oc-g1', identifier: 'g1', name: 'g', secretMode: 'all' }],
+      [...VAULT_SECRETS, { id: 'sec-gmail-read-2', name: 'google-gmail-read', hostPattern: 'gmail.googleapis.com' }],
+      /2 secrets named google-gmail-read/,
+    ],
+    ['no OneCLI agent is the group', [], VAULT_SECRETS, /no agent for g1/],
+    [
+      'several OneCLI agents claim the group',
+      [
+        { id: 'oc-a', identifier: 'g1', name: 'g', secretMode: 'all' },
+        { id: 'oc-b', identifier: 'g1', name: 'g', secretMode: 'all' },
+      ],
+      VAULT_SECRETS,
+      /2 agents claim g1/,
+    ],
+  ])('refuses the spawn when %s', async (_label, agents, secrets, error) => {
+    const { fetchMock } = mockManagement({ agents, secrets });
+    try {
+      await expect(provider.sessions.ensure(input('s1', restricted), new AbortController().signal)).rejects.toThrow(
+        error,
+      );
+      expect(sdk.order).toEqual([]);
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it('stores caller-described credentials for the host through the same native connection', async () => {
+    const posted: { url: string; init: RequestInit }[] = [];
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init = {}) => {
+      if ((init.method ?? 'GET') === 'GET') return Response.json([]);
+      posted.push({ url: String(url), init });
+      return Response.json({ id: 'sec-new', value: 'ya29.preview' }, { status: 201 });
+    });
+    try {
+      const connection = provider.credentials!.connection({
+        kind: 'api-key',
+        name: 'google-directory',
+        host: 'people.googleapis.com',
+        proxyValue: 'gateway-managed',
+        injection: { headerName: 'Authorization', valueFormat: 'Bearer {value}' },
+      });
+      expect(await connection.find()).toBeNull();
+      await connection.save('ya29.directory');
+
+      expect(posted).toHaveLength(1);
+      expect(posted[0]!.url).toBe('http://localhost:1/v1/secrets');
+      expect(new Headers(posted[0]!.init.headers).get('x-project-id')).toBe('project-fixture');
+      expect(JSON.parse(String(posted[0]!.init.body))).toMatchObject({
+        name: 'google-directory',
+        type: 'generic',
+        hostPattern: 'people.googleapis.com',
+        value: 'ya29.directory',
+        injectionConfig: { headerName: 'Authorization', valueFormat: 'Bearer {value}' },
+      });
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+});
+
+it('is the add-onecli payload, file for file, so reapplying the skill changes nothing', () => {
+  const payload = '.claude/skills/add-onecli/payload/src/gateway-providers';
+  const files = fs.readdirSync(payload).sort();
+  expect(files).toEqual(
+    expect.arrayContaining(['onecli.ts', 'onecli.test.ts', 'onecli-credentials.ts', 'onecli-credentials.test.ts']),
+  );
+  for (const file of files) {
+    expect(fs.readFileSync(path.join('src/gateway-providers', file), 'utf8'), file).toBe(
+      fs.readFileSync(path.join(payload, file), 'utf8'),
+    );
+  }
 });

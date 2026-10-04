@@ -26,6 +26,12 @@ vi.mock('../../container-restart.js', () => ({
   restartAgentGroupContainers: vi.fn().mockResolvedValue(0),
 }));
 
+const approvals = vi.hoisted(() => ({ requestApproval: vi.fn() }));
+vi.mock('../../modules/approvals/index.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../modules/approvals/index.js')>()),
+  requestApproval: approvals.requestApproval,
+}));
+
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-cli-groups' };
@@ -34,6 +40,11 @@ vi.mock('../../config.js', async () => {
 const TEST_DIR = '/tmp/nanoclaw-test-cli-groups';
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
+import { getRegisteredMigrations } from '../../db/migrations/index.js';
+import { capabilitiesMigration } from '../../modules/capabilities/migration.js';
+import { updateContainerConfigScalars } from '../../db/container-configs.js';
+import { lookup } from '../registry.js';
+import type { CallerContext } from '../frame.js';
 import { createSession } from '../../db/sessions.js';
 import { dispatch } from '../dispatch.js';
 import { ensureContainerConfig, getContainerConfig } from '../../db/container-configs.js';
@@ -436,5 +447,96 @@ describe('groups config (host-only)', () => {
       expect((await getContainerConfig(GID))!.provider).toBe(TURBO_PROVIDER);
       expect(await speedOf()).toBe('turbo');
     });
+  });
+});
+
+describe('groups config --capabilities', () => {
+  const GID = 'ag-caps';
+  const OTHER = 'ag-caps-other';
+  const SID = 'sess-caps';
+  const agent = (agentGroupId: string): CallerContext => ({
+    caller: 'agent',
+    agentGroupId,
+    sessionId: SID,
+    messagingGroupId: 'mg-caps',
+  });
+  const stored = async (id = GID): Promise<unknown> => JSON.parse((await getContainerConfig(id))!.capabilities!);
+  const update = (args: Record<string, unknown>, ctx: CallerContext = { caller: 'host' }) =>
+    dispatch({ id: 'caps', command: 'groups-config-update', args: { id: GID, ...args } }, ctx);
+
+  beforeEach(async () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    await runMigrations(await initTestDb(), [...getRegisteredMigrations(), capabilitiesMigration]);
+    approvals.requestApproval.mockClear();
+    for (const id of [GID, OTHER]) {
+      await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: now() });
+      await ensureContainerConfig(id);
+    }
+    await createSession({
+      id: SID,
+      agent_group_id: GID,
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: now(),
+    });
+  });
+  afterEach(async () => {
+    await closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('starts every group at all and shows it in config get', async () => {
+    const shown = await dispatch({ id: 'get', command: 'groups-config-get', args: { id: GID } }, { caller: 'host' });
+    expect(shown).toMatchObject({ ok: true, data: { capabilities: 'all' } });
+  });
+
+  it('stores a host-set list in registry order, and all again on request', async () => {
+    expect((await update({ capabilities: 'time, reply' })).ok).toBe(true);
+    expect(await stored()).toEqual(['reply', 'time']);
+
+    expect((await update({ capabilities: 'all' })).ok).toBe(true);
+    expect(await stored()).toBe('all');
+  });
+
+  it('refuses an unknown key and writes nothing', async () => {
+    const refused = await update({ capabilities: 'reply,teleport' });
+
+    expect(refused.ok).toBe(false);
+    expect(errorMessage(refused)).toMatch(/unknown capability "teleport"/);
+    expect(await stored()).toBe('all');
+  });
+
+  it("holds an agent's change to its own list for approval", async () => {
+    const held = await update({ capabilities: 'reply' }, agent(GID));
+
+    expect(held).toMatchObject({ ok: false, error: { code: 'approval-pending' } });
+    expect(approvals.requestApproval).toHaveBeenCalledTimes(1);
+    expect(await stored()).toBe('all');
+  });
+
+  it("denies a group-scoped agent changing another group's list, without a card", async () => {
+    const denied = await dispatch(
+      { id: 'caps', command: 'groups-config-update', args: { id: OTHER, capabilities: 'reply' } },
+      agent(GID),
+    );
+
+    expect(denied).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+    expect(approvals.requestApproval).not.toHaveBeenCalled();
+    expect(await stored(OTHER)).toBe('all');
+  });
+
+  it("refuses another group's list for an agent of any scope, even once approved", async () => {
+    await updateContainerConfigScalars(GID, { cli_scope: 'global' });
+    const handler = lookup('groups-config-update')!.handler;
+
+    await expect(handler({ id: OTHER, capabilities: 'reply' }, agent(GID))).rejects.toThrow(
+      /only its own capabilities/,
+    );
+    expect(await stored(OTHER)).toBe('all');
   });
 });
