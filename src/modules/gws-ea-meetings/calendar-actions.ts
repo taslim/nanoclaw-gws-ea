@@ -673,10 +673,28 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     }
   }
 
-  /** The event's Meet link as Google reports it now, when the invitation asked for one. */
+  /**
+   * The event's Meet link as Google reports it now, when the invitation
+   * asked for one. The booking already stands (the event is created or
+   * moved, and Google has emailed the guests), so a failed read-back is not
+   * fatal: it is logged and read as `pending`, which is honest, since the
+   * create request went through and Google creates the link asynchronously.
+   */
   async function conferenceOf(booking: Booking, invitation: Invitation): Promise<EventConference | undefined> {
     if (invitation.video_call !== true) return undefined;
-    return (await calendar().getEvent(booking.calendar_id, booking.event_id))?.conference ?? { status: 'pending' };
+    /* eslint-disable no-catch-all/no-catch-all -- the booking stands regardless; only this read-back is forgiven */
+    try {
+      return (await calendar().getEvent(booking.calendar_id, booking.event_id))?.conference ?? { status: 'pending' };
+    } catch (err) {
+      log.warn('Could not read back a booked event’s Meet status; reading it as still being created', {
+        meetingId: booking.meeting_id,
+        calendarId: booking.calendar_id,
+        eventId: booking.event_id,
+        err,
+      });
+      return { status: 'pending' };
+    }
+    /* eslint-enable no-catch-all/no-catch-all */
   }
 
   // -------------------------------------------------------------------------

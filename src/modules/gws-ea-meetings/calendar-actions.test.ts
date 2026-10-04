@@ -70,7 +70,17 @@ import { ensureInbox, GoogleApiError } from '../gws-ea-inbox/index.js';
 import { slotLabel } from './calendar-actions.js';
 import { getBooking, listOfferedSlots } from './index.js';
 import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
-import { ask, data, meeting, meetingSession, notes, refusal, slotsOf, type OfferedSlot } from './testing/scheduling.js';
+import {
+  ask,
+  contents,
+  data,
+  meeting,
+  meetingSession,
+  notes,
+  refusal,
+  slotsOf,
+  type OfferedSlot,
+} from './testing/scheduling.js';
 
 const ROBIN = 'robin@northwind.example';
 const PRINCIPAL = 'pat@northwind.example';
@@ -704,6 +714,41 @@ describe('book', () => {
     expect(String(failed.message)).toMatch(/could not create a Meet link, so ask main about the place/);
   });
 
+  it('still books when the Meet link cannot be read back afterward, reading it as still being created', async () => {
+    calendar.calendars.set(PRINCIPAL, {
+      id: PRINCIPAL,
+      accessRole: 'writer',
+      primary: false,
+      conferenceTypes: ['hangoutsMeet'],
+    });
+    const { meeting: stored, session } = await arranged(sam);
+    const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
+    // The event is created and Google has emailed the guests; only the read-back that learns the
+    // Meet link's status fails, once.
+    vi.spyOn(calendar, 'getEvent').mockImplementationOnce(() => {
+      throw new GoogleApiError(0, 'Google could not be reached');
+    });
+
+    const booked = data(
+      await ask(session, 'meeting_book', {
+        meeting_id: stored.id,
+        slot_id: slot.slot_id,
+        invitation: { title: 'Sam and Pat: Q4 pilot', video_call: true },
+      }),
+    );
+    expect(String(booked.message)).toMatch(/still creating its Meet link/);
+    expect((await meeting(stored.id)).state).toBe('booked');
+    const booking = [...calendar.live(PRINCIPAL)].find((event) => event.tags?.gwsEaRole === 'booking');
+    expect(booking).toBeDefined();
+    expect(notes(main, 'gws-ea-meetings.outcome').filter((note) => note.note?.outcome === 'booked')).toHaveLength(1);
+
+    // A repeat, now that the read-back works, creates no second event and writes no second note.
+    const insertsBefore = calendar.writes.filter((write) => write.op === 'insert').length;
+    data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: slot.slot_id }));
+    expect(calendar.writes.filter((write) => write.op === 'insert')).toHaveLength(insertsBefore);
+    expect(notes(main, 'gws-ea-meetings.outcome').filter((note) => note.note?.outcome === 'booked')).toHaveLength(1);
+  });
+
   it('creates no duplicate when retried after Google applied it but the answer was lost, and a repeat is a no-op', async () => {
     const { meeting: stored, session } = await arranged(sam);
     const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
@@ -911,5 +956,26 @@ describe("a meeting's holds", () => {
     expect(holds()).toHaveLength(2);
     data(await ask(main, 'meeting_amend', { meeting_id: stored.id, length_minutes: 60 }));
     expect(holds()).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The host/container action-response id contract
+// ---------------------------------------------------------------------------
+
+describe('the typed-request answer id', () => {
+  it("is filed by the host's writeActionResponse under exactly the id the runner's action-request.ts reads back", async () => {
+    const { meeting: stored, session } = await arranged(acme);
+    const requestId = 'contract-check-1';
+    await ask(session, 'meeting_free_time', { meeting_id: stored.id }, requestId);
+    const written = contents(session).find((content) => content.requestId === requestId);
+    expect(written).toBeDefined();
+
+    // The container cannot import the host: cross-check the literal template each side uses.
+    const runnerSource = fs.readFileSync(path.join('container', 'agent-runner', 'src', 'action-request.ts'), 'utf8');
+    const [, template] = runnerSource.match(/getMessageIn\(`([^`]+)`\)/u) ?? [];
+    expect(template).toBeDefined();
+    const expectedId = (template ?? '').replace('${requestId}', requestId);
+    expect(written?.row.id).toBe(expectedId);
   });
 });
