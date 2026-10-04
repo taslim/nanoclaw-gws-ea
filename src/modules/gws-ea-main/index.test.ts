@@ -254,6 +254,9 @@ describe("GWS-EA's guidance for main", () => {
     expect(document).toContain('# NanoClaw Module: gws-ea-email\n');
     expect(document).toContain('# NanoClaw Module: reminders\n');
     expect(document).not.toContain('# NanoClaw Module: gws-ea-email-external');
+    // Slice 2's meeting handoff is gone, its instructions with it.
+    expect(document).not.toContain('# NanoClaw Module: gws-ea-meetings');
+    for (const retired of RETIRED_GUIDANCE) expect(document, retired).not.toContain(retired);
   });
 });
 

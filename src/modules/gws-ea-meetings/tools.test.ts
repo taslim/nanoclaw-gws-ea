@@ -10,6 +10,7 @@
  * weekdays are known.
  */
 import fs from 'fs';
+import path from 'path';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -65,8 +66,13 @@ import '../gws-ea-preferences/index.js';
 import { setSchedulingPreference } from '../gws-ea-preferences/db.js';
 import '../gws-ea-privacy/index.js';
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
+import '../gws-ea-people/index.js';
+import { addPerson, forgetPerson } from '../gws-ea-people/db.js';
+import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
+import { getSession } from '../../db/sessions.js';
+import '../gws-ea-inbox/index.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
-import { createThread, recordThreadAddresses } from '../gws-ea-inbox/thread-map.js';
+import { createThread, recordThreadAddresses, threadAddresses } from '../gws-ea-inbox/thread-map.js';
 import { BOOKING_FACT_TYPE, releaseExpiredHolds, SCHEDULING_ACTIONS } from './index.js';
 import { FITS } from './slots.js';
 import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
@@ -724,5 +730,66 @@ describe('a booking moves and is cancelled only by its own thread (AE67)', () =>
     expect(refusal(await send(sessionA, 'cancel_booking', { booking: booked.booking }))).toMatch(
       /This thread has no booking/u,
     );
+  });
+});
+
+describe('forgetting a person', () => {
+  /** The privacy check's record of a thread, as a refusal leaves it. */
+  async function privacyRecord(threadKey: string): Promise<void> {
+    await getDb().run(
+      `INSERT INTO gws_ea_privacy_threads (channel_type, platform_id, thread_id, recent, refusals, stopped_at, updated_at)
+       VALUES ('email', 'email:inbox', ?, '[]', 1, NULL, ?)`,
+      threadKey,
+      now(),
+    );
+  }
+
+  async function privacyRecords(): Promise<string[]> {
+    const rows = await getDb().all<{ thread_id: string }>(
+      'SELECT thread_id FROM gws_ea_privacy_threads ORDER BY thread_id',
+    );
+    return rows.map((row) => row.thread_id);
+  }
+
+  async function addressesOf(threadKey: string): Promise<string[]> {
+    return (await threadAddresses(threadKey)).map((entry) => entry.address).sort();
+  }
+
+  it("releases their threads' holds first, then purges those threads' sessions and privacy records, then their addresses", async () => {
+    const secrets = path.join(TEST_DIR, 'secrets');
+    fs.mkdirSync(secrets, { mode: 0o700 });
+    vi.stubEnv(GOOGLE_GRANT_FILE_ENV, path.join(secrets, 'google-grant.json'));
+    data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM, WEDNESDAY_10AM], minutes: 30 }));
+    data(await send(sessionB, 'hold', { starts: [THURSDAY_10AM], minutes: 30 }));
+    await privacyRecord(threadA);
+    await privacyRecord(threadB);
+    const remy = await addPerson({
+      name: 'Remy',
+      level: 'close',
+      source: 'principal',
+      basis: 'a friend',
+      identity: `email:${REMY}`,
+    });
+
+    // Holds go first: one that cannot go yet stops the forget, and nothing of theirs has gone.
+    calendar.failure = new GoogleApiError(503, 'Calendar is unavailable');
+    await expect(forgetPerson({ id: remy.id, source: 'principal' })).rejects.toThrow(/could not be released/u);
+    calendar.failure = undefined;
+    expect(await listThreadHolds(threadA)).toHaveLength(2);
+    expect(await getSession(sessionA.id)).toBeDefined();
+    expect(await privacyRecords()).toEqual([threadA, threadB].sort());
+    expect(await addressesOf(threadA)).toContain(REMY);
+
+    await forgetPerson({ id: remy.id, source: 'principal' });
+
+    expect(await listThreadHolds(threadA)).toEqual([]);
+    expect(live('hold').map((event) => event.start?.dateTime)).toEqual([THURSDAY_10AM]);
+    expect(await getSession(sessionA.id)).toBeUndefined();
+    expect(fs.existsSync(path.dirname(inboundDbPath(sessionA.agent_group_id, sessionA.id)))).toBe(false);
+    expect(await getSession(sessionB.id)).toBeDefined();
+    expect(await privacyRecords()).toEqual([threadB]);
+    expect(await addressesOf(threadA)).toEqual([JANE, PRINCIPAL, JUNO].sort());
+    expect(await addressesOf(threadB)).toEqual([JANE]);
+    vi.unstubAllEnvs();
   });
 });

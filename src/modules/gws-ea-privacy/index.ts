@@ -234,7 +234,6 @@ async function judgeSend(send: OutboundSend): Promise<OutboundGuardDecision> {
     case 'refused':
       if (!verdict.stopped) return { effect: 'refuse', reason: refusalReason(verdict.kind) };
       await signalThreadStopped(key, verdict.kind, verdict.refusals);
-      await runThreadStoppedHooks(key);
       return { effect: 'refuse', reason: stoppingReason(verdict.kind) };
     default: {
       const unreachable: never = verdict;
@@ -290,32 +289,6 @@ export async function resumeThread(key: ThreadKey): Promise<boolean> {
   const resumed = await resumeThreadRecord(key, new Date().toISOString());
   if (resumed) log.info('Privacy stop lifted for a new handoff', { channelType: key.channelType });
   return resumed;
-}
-
-/** What another module does when one of its threads stops, such as closing the session behind it. */
-export type ThreadStoppedHook = (thread: ThreadKey) => Promise<void>;
-
-const threadStoppedHooks = new Map<string, ThreadStoppedHook>();
-const HOOK_ID = /^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/u;
-
-/** Register a module's reaction to a stopped thread. IDs take the `module:name` form. */
-export function registerThreadStoppedHook(id: string, hook: ThreadStoppedHook): void {
-  if (!HOOK_ID.test(id)) throw new Error(`Thread-stopped hook "${id}" must use "<module-id>:<hook-id>"`);
-  if (threadStoppedHooks.has(id)) throw new Error(`Thread-stopped hook "${id}" is already registered`);
-  threadStoppedHooks.set(id, hook);
-}
-
-/** The stop already holds, so each hook is isolated: a failure is logged and never stops the others. */
-async function runThreadStoppedHooks(key: ThreadKey): Promise<void> {
-  for (const [id, hook] of threadStoppedHooks) {
-    /* eslint-disable no-catch-all/no-catch-all -- the stop holds either way; a hook failure is logged */
-    try {
-      await hook(key);
-    } catch (err) {
-      log.error('Thread-stopped hook failed', { hookId: id, channelType: key.channelType, err });
-    }
-    /* eslint-enable no-catch-all/no-catch-all */
-  }
 }
 
 registerOutboundGuard(PRIVACY_GUARD_ID, judgeSend);

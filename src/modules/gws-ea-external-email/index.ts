@@ -28,7 +28,6 @@ import path from 'node:path';
 import '../capabilities/index.js';
 import '../gws-ea-profile/index.js';
 
-import { registerCapability } from '../../capabilities.js';
 import { registerProtectedGroupPolicy } from '../../cli/guard.js';
 import { register } from '../../cli/registry.js';
 import { registerSessionAdmissionPolicy } from '../../container-runner.js';
@@ -42,22 +41,14 @@ import type { AgentGroup } from '../../types.js';
 import { getExternalEmailAgentGroupId as readExternalEmailPointer } from '../gws-ea-profile/db.js';
 import { BRIDGE_ACTIONS } from './bridge.js';
 import { destinationViolations } from './destination-policy.js';
-import { EXTERNAL_EMAIL_MEETINGS_CAPABILITY, ensureExternalEmailGroup, externalEmailDrift } from './group.js';
+import { ensureExternalEmailGroup, externalEmailDrift } from './group.js';
 
 export {
   EXTERNAL_EMAIL_CAPABILITIES,
-  EXTERNAL_EMAIL_MEETINGS_CAPABILITY,
   EXTERNAL_EMAIL_NAME,
   EXTERNAL_EMAIL_PLUGIN,
   EXTERNAL_EMAIL_TEMPLATE,
 } from './group.js';
-
-registerCapability(EXTERNAL_EMAIL_MEETINGS_CAPABILITY, {
-  description:
-    "meeting_free_time, meeting_hold, meeting_book, meeting_ask_main, email_recipients, meeting_outcome: external-email's meeting tools: the principal's free time, holds, and bookings through the host, a question for main it then waits on, who its replies go to among the people on its thread, and the meeting's outcome",
-  default: 'off',
-  instructions: [EXTERNAL_EMAIL_MEETINGS_CAPABILITY],
-});
 
 /** `external-email`'s agent group, as the profile records it, or null until the host creates it. */
 export async function getExternalEmailAgentGroupId(): Promise<string | null> {

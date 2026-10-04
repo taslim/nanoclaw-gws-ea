@@ -36,7 +36,6 @@ const ALL = [
   'schedule-stats',
   'calendar-facts',
   'request-status',
-  'gws-ea-meetings',
   'gws-ea-email',
   'gws-ea-reminders',
 ];
@@ -50,16 +49,6 @@ const EXTERNAL_EMAIL_TOOLS = ['book', 'cancel_booking', 'email_send', 'free_time
 /** main's email tools, which `gws-ea-email` grants. */
 const MAIN_EMAIL_TOOLS = ['email_handoff', 'email_principal'];
 const REMINDER_TOOLS = ['clear_reminder', 'remind_me'];
-
-/** main's meeting tools, which `gws-ea-meetings` grants. */
-const MAIN_MEETING_TOOLS = [
-  'email_dismiss',
-  'email_respond',
-  'meeting_amend',
-  'meeting_arrange',
-  'meeting_cancel',
-  'meeting_reschedule',
-];
 
 /** Every tool of the default-on keys. */
 const DEFAULT_ON_TOOLS = [
@@ -76,7 +65,6 @@ const DEFAULT_ON_TOOLS = [
   'send_card',
   'send_file',
   'send_message',
-  ...MAIN_MEETING_TOOLS,
   ...MAIN_EMAIL_TOOLS,
   ...REMINDER_TOOLS,
   ...TIME_TOOLS,
@@ -120,12 +108,6 @@ describe('NanoClaw tool server capabilities', () => {
     ['reply and time', ['reply', 'time'], ['send_message', ...TIME_TOOLS].sort()],
     ['files-send', ['files-send'], ['add_reaction', 'edit_message', 'send_file']],
     ['calendar-facts', ['calendar-facts'], ['find_conflicts', 'people_stats']],
-    ['gws-ea-meetings', ['gws-ea-meetings'], MAIN_MEETING_TOOLS],
-    [
-      'gws-ea-meetings-external',
-      ['gws-ea-meetings-external'],
-      ['email_recipients', 'meeting_ask_main', 'meeting_book', 'meeting_free_time', 'meeting_hold', 'meeting_outcome'],
-    ],
     ['request-status', ['request-status'], ['request_status']],
     ['gws-ea-email', ['gws-ea-email'], MAIN_EMAIL_TOOLS],
     ['gws-ea-email-external', ['gws-ea-email-external'], EXTERNAL_EMAIL_TOOLS],

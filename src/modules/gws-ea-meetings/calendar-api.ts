@@ -1,11 +1,11 @@
 /**
- * The Google Calendar calls the meeting handoff and the calendar actions make
- * with the host's own Calendar token (KTD6, KTD11): whether a calendar is one
- * the principal owns and the assistant can write to, and its name; an event's
- * organizer, attendees, time and the assistant's own tags, the events in an interval,
- * colleagues' free/busy, and the writes behind holds, bookings, moves and
- * cancellations. No client library: each call is one `fetch` with the token
- * in its header, so it never reaches a container or an argument list.
+ * The Google Calendar calls the scheduling tools and the handoff make with
+ * the host's own Calendar token (KTD7): whether a calendar is one the
+ * principal owns and the assistant can write to, and its name; an event's
+ * organizer, attendees, time and the assistant's own tags, the events in an
+ * interval, and the writes behind holds, bookings, moves and cancellations.
+ * No client library: each call is one `fetch` with the token in its header,
+ * so it never reaches a container or an argument list.
  *
  * Every event read asks Google for its timing, status, people, the
  * assistant's own private tags, and the Meet link the host asked Google to
@@ -98,12 +98,6 @@ export interface EventWrite {
 /** A new event: a write with its times. */
 export type NewEvent = EventWrite & { readonly start: string; readonly end: string };
 
-/** One calendar's free/busy: its busy times, when Google lets the assistant see them. */
-export interface FreeBusyCalendar {
-  readonly visible: boolean;
-  readonly busy: readonly { readonly start: string; readonly end: string }[];
-}
-
 export interface MeetingsCalendarApi {
   /** The assistant's calendar-list entry for a calendar, or undefined when it has none. */
   getCalendar(calendarId: string): Promise<CalendarEntry | undefined>;
@@ -122,12 +116,6 @@ export interface MeetingsCalendarApi {
   patchEvent(calendarId: string, eventId: string, event: EventWrite, sendUpdates: SendUpdates): Promise<void>;
   /** Delete an event; `gone` when it was already deleted or never existed. */
   deleteEvent(calendarId: string, eventId: string, sendUpdates: SendUpdates): Promise<'deleted' | 'gone'>;
-  /** Each calendar's busy times in the interval, keyed by its id in lower case. */
-  freeBusy(
-    calendarIds: readonly string[],
-    timeMin: string,
-    timeMax: string,
-  ): Promise<ReadonlyMap<string, FreeBusyCalendar>>;
 }
 
 const CALENDAR_API = 'https://www.googleapis.com/calendar/v3';
@@ -259,19 +247,6 @@ function eventUrl(calendarId: string, eventId?: string): string {
   return eventId === undefined ? events : `${events}/${encodeURIComponent(eventId)}`;
 }
 
-function toFreeBusy(value: unknown): FreeBusyCalendar {
-  if (!isRecord(value)) return { visible: false, busy: [] };
-  const errors = Array.isArray(value.errors) ? value.errors : [];
-  const busy = Array.isArray(value.busy)
-    ? value.busy.flatMap((interval) =>
-        isRecord(interval) && typeof interval.start === 'string' && typeof interval.end === 'string'
-          ? [{ start: interval.start, end: interval.end }]
-          : [],
-      )
-    : [];
-  return errors.length > 0 ? { visible: false, busy: [] } : { visible: true, busy };
-}
-
 function toCalendarEntry(value: unknown): CalendarEntry {
   if (!isRecord(value) || typeof value.id !== 'string') {
     throw new GoogleApiError(502, 'Google Calendar returned an unreadable calendar list entry');
@@ -387,17 +362,6 @@ export function createMeetingsCalendarApi(options: GoogleClientOptions): Meeting
         if (error instanceof GoogleApiError && (error.status === 404 || error.status === 410)) return 'gone';
         throw error;
       }
-    },
-
-    async freeBusy(calendarIds, timeMin, timeMax) {
-      const payload = await googleJson(options, `${CALENDAR_API}/freeBusy`, {
-        method: 'POST',
-        body: { timeMin, timeMax, items: calendarIds.map((id) => ({ id })) },
-      });
-      if (!isRecord(payload)) throw new GoogleApiError(502, 'Google Calendar returned an unreadable free/busy answer');
-      const calendars = isRecord(payload.calendars) ? payload.calendars : {};
-      const byId = new Map(Object.entries(calendars).map(([id, value]) => [id.toLowerCase(), value] as const));
-      return new Map(calendarIds.map((id) => [id.toLowerCase(), toFreeBusy(byId.get(id.toLowerCase()))] as const));
     },
   };
 }

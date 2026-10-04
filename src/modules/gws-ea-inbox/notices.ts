@@ -6,7 +6,7 @@ import { sendPrincipalNotice } from '../gws-ea-notices/index.js';
 
 const SET_ASIDE_NOTICE = "I couldn't process an email in my inbox, so I set it aside and kept going with the rest.";
 
-const UNHEALTHY_NOTICE = "I can't reach my email inbox right now, so scheduling by email is paused until it's back.";
+const UNHEALTHY_NOTICE = "I can't reach my email inbox right now, so new email waits until it's back.";
 
 /** One notice for however many messages one pass set aside. */
 export async function noticeSetAside(): Promise<void> {

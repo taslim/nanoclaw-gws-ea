@@ -313,7 +313,7 @@ async function principalView(): Promise<Principal> {
   const addresses = await listPrincipalAddresses();
   return {
     timezone: profile.principal_timezone ?? TIMEZONE,
-    rules: schedulingRules(await getSchedulingPreferenceValues(), null),
+    rules: schedulingRules(await getSchedulingPreferenceValues()),
     addresses: new Set(addresses.map((address) => address.email)),
     addressesByAge: [...addresses]
       .sort((a, b) => a.added_at.localeCompare(b.added_at) || a.email.localeCompare(b.email))

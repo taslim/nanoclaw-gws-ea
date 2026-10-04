@@ -66,8 +66,24 @@ import {
   PRINCIPAL_PLATFORM_ID,
   type InboxRuntime,
 } from './runtime.js';
-import { assistantMailbox, emailWords, MAX_REFERENCES, sendExactlyOnce, sendKey, type EmailWords } from './send.js';
-import { findThreadFile, getThread, threadAddresses, threadMessages, visibleMessageIds } from './thread-map.js';
+import type { GmailMessage } from './gmail-api.js';
+import {
+  assistantMailbox,
+  carriesMessageId,
+  emailWords,
+  MAX_REFERENCES,
+  sendExactlyOnce,
+  sendKey,
+  type EmailWords,
+} from './send.js';
+import {
+  findThreadFile,
+  getThread,
+  threadAddresses,
+  threadMessages,
+  visibleMessageIds,
+  type ThreadMessage,
+} from './thread-map.js';
 
 const REFUSED_BY = 'gws-ea-inbox:outside-email';
 const SUBJECT_MAX = 200;
@@ -134,11 +150,26 @@ interface Plan {
   readonly recipients: Recipients;
 }
 
-/** The latest message on the thread's outside side that Gmail still holds. */
+/**
+ * The latest message on the thread's outside side that Gmail still holds. A
+ * message the thread knows only by its Message-ID is found by it in the
+ * thread's Gmail thread.
+ */
 async function outsideAnchor(runtime: InboxRuntime, threadKey: string): Promise<ParsedMail | undefined> {
+  let inGmailThread: readonly GmailMessage[] | undefined;
+  const gmailIdOf = async ({ gmailMessageId, rfcMessageId }: ThreadMessage): Promise<string | undefined> => {
+    if (gmailMessageId !== null) return gmailMessageId;
+    if (rfcMessageId === null) return undefined;
+    if (inGmailThread === undefined) {
+      const gmailThreadId = (await getThread(threadKey))?.gmailThreadId ?? null;
+      inGmailThread = gmailThreadId === null ? [] : ((await runtime.gmail.getThread(gmailThreadId)) ?? []);
+    }
+    return inGmailThread.find((held) => carriesMessageId(held.payload?.headers ?? [], rfcMessageId))?.id;
+  };
   for (const message of (await threadMessages(threadKey, 'outside')).reverse()) {
-    if (message.gmailMessageId === null) continue;
-    const found = await runtime.gmail.getMessage(message.gmailMessageId, 'full');
+    const gmailMessageId = await gmailIdOf(message);
+    if (gmailMessageId === undefined) continue;
+    const found = await runtime.gmail.getMessage(gmailMessageId, 'full');
     if (found) return parseGmailMessage(found);
   }
   return undefined;

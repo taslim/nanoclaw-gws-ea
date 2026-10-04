@@ -621,10 +621,13 @@ describe('recorded divergence: a module can hold an inbound message until a time
   });
 });
 
-describe("recorded divergence: the runner's tool barrel loads the meeting tools", () => {
-  it("loads the runner's meeting tools, which name their own capability keys", async () => {
+describe("recorded divergence: the runner's tool barrel loads GWS-EA's tools", () => {
+  it("loads the runner's email, reminder and request-status tools, which name their own capability keys", async () => {
     const tools = await readFile(path.join(originalCwd, 'container/agent-runner/src/mcp-tools/index.ts'), 'utf8');
-    expect(tools).toContain("await import('./gws-ea-meetings.js');");
+    for (const module of ['gws-ea-email', 'reminders', 'request-status']) {
+      expect(tools).toContain(`await import('./${module}.js');`);
+    }
+    expect(tools).not.toContain('gws-ea-meetings');
   });
 });
 

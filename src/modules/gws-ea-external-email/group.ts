@@ -27,9 +27,6 @@ import type { ContainerConfigRow } from '../../types.js';
 import { getExternalEmailAgentGroupId, recordExternalEmailAgentGroupId } from '../gws-ea-profile/db.js';
 import { REMINDERS_CAPABILITY } from '../gws-ea-reminders/index.js';
 
-/** The meeting tools an earlier release gave `external-email`; it no longer holds them. */
-export const EXTERNAL_EMAIL_MEETINGS_CAPABILITY = 'gws-ea-meetings-external';
-
 /**
  * The email channel's tool keys, one for each part (KTD4), registered
  * together so each tool's grant is found in one place. The actions they send

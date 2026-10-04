@@ -128,21 +128,36 @@ async function releaseFixture(): Promise<string> {
       2,
     ) + '\n',
   );
-  for (const file of ['index.ts', 'group.ts', 'destination-policy.ts']) {
+  for (const file of ['index.ts', 'group.ts', 'destination-policy.ts', 'bridge.ts']) {
     await write(root, `src/modules/gws-ea-external-email/${file}`, 'export {};\n');
   }
   await write(root, 'src/modules/gws-ea-external-email/guidance.md', '# external-email\n');
-  await write(root, 'src/modules/gws-ea-inbox/index.ts', 'export {};\n');
-  await write(root, 'src/modules/gws-ea-inbox/migration.ts', 'export {};\n');
+  for (const file of [
+    'index.ts',
+    'migration.ts',
+    'migration-email-channel.ts',
+    'thread-map.ts',
+    'route-mail.ts',
+    'pace.ts',
+    'principal-reply.ts',
+    'send.ts',
+    'render.ts',
+  ]) {
+    await write(root, `src/modules/gws-ea-inbox/${file}`, 'export {};\n');
+  }
   for (const file of [
     'src/modules/gws-ea-meetings/index.ts',
     'src/modules/gws-ea-meetings/migration.ts',
+    'src/modules/gws-ea-meetings/tools.ts',
+    'src/modules/gws-ea-meetings/thread-calendar.ts',
+    'src/modules/gws-ea-reminders/index.ts',
     'container/agent-runner/src/action-request.ts',
-    'container/agent-runner/src/mcp-tools/gws-ea-meetings.ts',
+    'container/agent-runner/src/mcp-tools/gws-ea-email.ts',
+    'container/agent-runner/src/mcp-tools/reminders.ts',
   ]) {
     await write(root, file, 'export {};\n');
   }
-  for (const doc of ['gws-ea-meetings', 'gws-ea-meetings-external']) {
+  for (const doc of ['gws-ea-email', 'gws-ea-email-external', 'reminders']) {
     await write(root, `container/agent-runner/src/mcp-tools/${doc}.instructions.md`, `# ${doc}\n`);
   }
   await write(root, 'container/agent-runner/src/mcp-tools/files-send.instructions.md', '# files-send\n');
@@ -196,7 +211,7 @@ async function releaseFixture(): Promise<string> {
   await write(
     root,
     'src/modules/index.ts',
-    "import './capabilities/index.js';\nimport './gws-ea-google/index.js';\nimport './gws-ea-main/index.js';\nimport './gws-ea-profile/index.js';\nimport './gws-ea-preferences/index.js';\nimport './gws-ea-people/index.js';\nimport './gws-ea-notices/index.js';\nimport './gws-ea-privacy/index.js';\nimport './gws-ea-external-email/index.js';\nimport './gws-ea-inbox/index.js';\nimport './gws-ea-meetings/index.js';\n",
+    "import './capabilities/index.js';\nimport './gws-ea-google/index.js';\nimport './gws-ea-main/index.js';\nimport './gws-ea-profile/index.js';\nimport './gws-ea-preferences/index.js';\nimport './gws-ea-people/index.js';\nimport './gws-ea-notices/index.js';\nimport './gws-ea-privacy/index.js';\nimport './gws-ea-external-email/index.js';\nimport './gws-ea-inbox/index.js';\nimport './gws-ea-meetings/index.js';\nimport './gws-ea-reminders/index.js';\n",
   );
   await write(root, 'src/provider-contracts/claude.ts', "export const provider = 'claude';\n");
   await write(root, 'src/provider-contracts/index.ts', "import './claude.js';\n");
@@ -313,8 +328,19 @@ describe('release preflight', () => {
     ['external-email guidance', 'src/modules/gws-ea-external-email/guidance.md', 'incomplete_release'],
     ['GWS-EA inbox', 'src/modules/gws-ea-inbox/index.ts', 'incomplete_release'],
     ['GWS-EA inbox migration', 'src/modules/gws-ea-inbox/migration.ts', 'incomplete_release'],
-    ['GWS-EA meetings', 'src/modules/gws-ea-meetings/index.ts', 'incomplete_release'],
-    ['GWS-EA meeting tools', 'container/agent-runner/src/mcp-tools/gws-ea-meetings.ts', 'incomplete_release'],
+    ['GWS-EA email channel migration', 'src/modules/gws-ea-inbox/migration-email-channel.ts', 'incomplete_release'],
+    ['GWS-EA thread map', 'src/modules/gws-ea-inbox/thread-map.ts', 'incomplete_release'],
+    ['GWS-EA bridge', 'src/modules/gws-ea-external-email/bridge.ts', 'incomplete_release'],
+    ['GWS-EA scheduling', 'src/modules/gws-ea-meetings/index.ts', 'incomplete_release'],
+    ['GWS-EA scheduling tools', 'src/modules/gws-ea-meetings/tools.ts', 'incomplete_release'],
+    ['GWS-EA reminders', 'src/modules/gws-ea-reminders/index.ts', 'incomplete_release'],
+    ['GWS-EA email tools', 'container/agent-runner/src/mcp-tools/gws-ea-email.ts', 'incomplete_release'],
+    [
+      'external-email tool instructions',
+      'container/agent-runner/src/mcp-tools/gws-ea-email-external.instructions.md',
+      'incomplete_release',
+    ],
+    ['GWS-EA reminder tools', 'container/agent-runner/src/mcp-tools/reminders.ts', 'incomplete_release'],
     [
       'account-connection instructions',
       'container/agent-runner/src/mcp-tools/connect.instructions.md',

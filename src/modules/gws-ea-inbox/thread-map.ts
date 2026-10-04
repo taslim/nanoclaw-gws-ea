@@ -16,7 +16,8 @@
  *   loses the outsiders to a note written after it (`anchorMessage`,
  *   `visibleMessageIds`).
  * - A thread's addresses are those its messages carried and those `main`
- *   named (`recordThreadAddresses`).
+ *   named (`recordThreadAddresses`). A forgotten person's go from every
+ *   thread (`deleteThreadAddresses`).
  * - A file goes out in a thread only when `main` handed it over for it, by
  *   its SHA-256 (`recordThreadFile`, `findThreadFile`).
  * - A send never happens twice. Before Gmail is called, a pending record
@@ -299,6 +300,29 @@ export async function threadAddresses(threadKey: string): Promise<ThreadAddress[
       WHERE thread_key = ? ORDER BY recorded_at, address, source`,
     threadKey,
   );
+}
+
+/**
+ * The threads an address `matches` is on, and those addresses, each once:
+ * what forgetting a person reaches.
+ */
+export async function threadsWithAddresses(
+  matches: (address: string) => boolean,
+): Promise<{ readonly threadKeys: readonly string[]; readonly addresses: readonly string[] }> {
+  const rows = await getDb().all<{ thread_key: string; address: string }>(
+    'SELECT DISTINCT thread_key, address FROM gws_ea_thread_addresses ORDER BY thread_key, address',
+  );
+  const found = rows.filter((row) => matches(row.address));
+  return {
+    threadKeys: [...new Set(found.map((row) => row.thread_key))],
+    addresses: [...new Set(found.map((row) => row.address))],
+  };
+}
+
+/** Delete these addresses from every thread, however each came. */
+export async function deleteThreadAddresses(addresses: readonly string[]): Promise<void> {
+  const db = getDb();
+  for (const address of addresses) await db.run('DELETE FROM gws_ea_thread_addresses WHERE address = ?', address);
 }
 
 // ---------------------------------------------------------------------------

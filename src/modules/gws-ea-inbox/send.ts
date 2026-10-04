@@ -62,7 +62,8 @@ export async function assistantMailbox(runtime: InboxRuntime): Promise<Mailbox> 
   };
 }
 
-function holdsId(headers: readonly { name: string; value: string }[], rfcMessageId: string): boolean {
+/** Whether a message's headers carry `rfcMessageId`, as its Message-ID or the one Gmail replaced. */
+export function carriesMessageId(headers: readonly { name: string; value: string }[], rfcMessageId: string): boolean {
   return RECONCILIATION_HEADERS.some((name) =>
     headerValues(headers, name).some((value) => messageIdsOf(value).includes(rfcMessageId)),
   );
@@ -76,7 +77,7 @@ async function findSent(
 ): Promise<{ readonly id: string; readonly threadId: string } | undefined> {
   if (gmailThreadId !== null) {
     const inThread = (await gmail.getThread(gmailThreadId)) ?? [];
-    const found = inThread.find((message) => holdsId(message.payload?.headers ?? [], rfcMessageId));
+    const found = inThread.find((message) => carriesMessageId(message.payload?.headers ?? [], rfcMessageId));
     if (found) return { id: found.id, threadId: found.threadId };
   }
   const bare = rfcMessageId.slice(1, -1);
@@ -89,7 +90,7 @@ async function findSent(
     if (checked.has(candidate.id)) continue;
     checked.add(candidate.id);
     const message = await gmail.getMessage(candidate.id, 'metadata');
-    if (message && holdsId(message.payload?.headers ?? [], rfcMessageId)) {
+    if (message && carriesMessageId(message.payload?.headers ?? [], rfcMessageId)) {
       return { id: message.id, threadId: message.threadId };
     }
   }

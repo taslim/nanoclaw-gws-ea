@@ -79,16 +79,13 @@ import { addPerson } from '../gws-ea-people/db.js';
 import '../gws-ea-privacy/index.js';
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import {
-  authorizeThread,
   createInbox,
   EMAIL_CHANNEL_DEFAULTS,
   ensureInbox,
   ensurePrincipalConversation,
   getInboxHealth,
-  getThreadParticipants,
   GoogleApiError,
   INBOX_PLATFORM_ID,
-  mintThreadKey,
   PRINCIPAL_PLATFORM_ID,
   recordOwnCalendarChange,
   type CalendarListApi,
@@ -1254,40 +1251,6 @@ describe('polling', () => {
     gmail.receive({ from: 'third@else.example', subject: 'After' });
     await inbox.tick();
     expect(await outsideMail()).toHaveLength(3);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Slice 2's handed-over threads, until their conversion replaces them
-// ---------------------------------------------------------------------------
-
-describe('a handed-over thread', () => {
-  it('copies the principal on a thread the assistant starts only when asked, from their first address', async () => {
-    await getDb().run(
-      'UPDATE gws_ea_principal_addresses SET added_at = ? WHERE email = ?',
-      '2099-01-01T00:00:00.000Z',
-      PRINCIPAL_HOME,
-    );
-    const copied = mintThreadKey();
-    const view = await authorizeThread({
-      kind: 'new',
-      threadKey: copied,
-      opener: 'arrange',
-      subject: 'Introduction',
-      counterparts: [SAM],
-      copyPrincipal: true,
-    });
-    expect(view.people).toEqual({ to: [SAM], cc: [PRINCIPAL], bcc: [] });
-    expect((await getThreadParticipants(copied))?.people).toEqual({ to: [SAM], cc: [PRINCIPAL], bcc: [] });
-    await expect(
-      authorizeThread({
-        kind: 'new',
-        threadKey: mintThreadKey(),
-        opener: 'arrange',
-        subject: 'x',
-        counterparts: [PRINCIPAL_HOME],
-      }),
-    ).rejects.toThrow(/copyPrincipal/);
   });
 });
 

@@ -21,29 +21,34 @@
  * messaging groups and their wirings when absent, brings `main`'s members in
  * step with the principal's addresses, then polls each minute.
  */
+import fs from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { registerChannelAdapter } from '../../channels/channel-registry.js';
 import { register } from '../../cli/registry.js';
+import { isContainerRunning, killContainer } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
+import { deleteSession, getSessionsByAgentGroup, updateSession } from '../../db/sessions.js';
 import { registerDeliveryAction, registerDeliveryFailedHook, registerPostDeliveryHook } from '../../delivery.js';
 import { readEnvFile } from '../../env.js';
 import { onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
 import type { OutboundMessage } from '../../mailbox/index.js';
+import { destroySessionMailbox, sessionDir } from '../../session-manager.js';
 import { getExternalEmailAgentGroupId } from '../gws-ea-external-email/index.js';
 import { getInboxHealth } from './health.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
 import { identityMatchKey } from '../../gws-ea/validation.js';
 import { registerPersonForgetHook } from '../gws-ea-people/index.js';
+import { releaseThreadHolds } from '../gws-ea-meetings/index.js';
 import {
   gwsEaMeetingsCalendarActionsMigration,
   gwsEaMeetingsMigration,
   gwsEaMeetingsRoomsMigration,
 } from '../gws-ea-meetings/migration.js';
-import { registerRecipientResolver } from '../gws-ea-privacy/index.js';
+import { deleteThreadRecord, registerRecipientResolver } from '../gws-ea-privacy/index.js';
 import { getMainAgentGroupId, syncPrincipalMembers } from '../gws-ea-profile/db.js';
 import { registerRoleGrantPolicy } from '../permissions/db/user-roles.js';
 import { registerInboundDelay } from '../../router.js';
@@ -57,11 +62,12 @@ import { paceDeadline } from './pace.js';
 import { principalRecipients } from './principal-reply.js';
 import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID } from './runtime.js';
 import { emailWords, sendKey } from './send.js';
-import { deleteSends, type SendScope } from './thread-map.js';
+import { deleteSends, deleteThreadAddresses, threadsWithAddresses, type SendScope } from './thread-map.js';
 import { ensureInbox, ensurePrincipalConversation } from './wiring-policy.js';
 
 // The inbox registers the meetings store too, unchanged, so the email channel's
-// migration runs after every inbox and meetings table exists (KTD10).
+// migration, which moves an earlier release's threads and holds into its own
+// records, runs after every inbox and meetings table exists (KTD10).
 registerMigration(gwsEaInboxMigration);
 registerMigration(gwsEaMeetingsMigration);
 registerMigration(gwsEaMeetingsCalendarActionsMigration);
@@ -143,46 +149,61 @@ registerDeliveryFailedHook(async (failed) => {
   for (const msg of failed) await forgetSend(msg, 'pending');
 });
 
-// A forgotten person leaves no held mail, rate count, or place on a thread behind.
+/** Remove a session and everything it holds, once its container is gone. */
+async function purgeSession(sessionId: string, agentGroupId: string): Promise<void> {
+  await updateSession(sessionId, { status: 'closed' });
+  if (isContainerRunning(sessionId)) {
+    await new Promise<void>((resolve) => {
+      const bound = setTimeout(resolve, 30_000);
+      killContainer(sessionId, 'a person in its thread was forgotten', () => {
+        clearTimeout(bound);
+        resolve();
+      });
+    });
+  }
+  await destroySessionMailbox(agentGroupId, sessionId);
+  fs.rmSync(sessionDir(agentGroupId, sessionId), { recursive: true, force: true });
+  await deleteSession(sessionId);
+}
+
+/** Remove the `external-email` sessions of these threads, and the privacy check's record of each. */
+async function purgeThreadSessions(threadKeys: readonly string[]): Promise<void> {
+  const externalEmail = await getExternalEmailAgentGroupId();
+  const threads = new Set(threadKeys);
+  if (externalEmail !== null) {
+    for (const session of await getSessionsByAgentGroup(externalEmail)) {
+      if (session.thread_id !== null && threads.has(session.thread_id)) await purgeSession(session.id, externalEmail);
+    }
+  }
+  for (const threadKey of threadKeys) {
+    await deleteThreadRecord({ channelType: EMAIL_CHANNEL_TYPE, platformId: INBOX_PLATFORM_ID, threadId: threadKey });
+  }
+}
+
+// A forgotten person leaves nothing of theirs on the threads they were on, in this order: the threads'
+// holds first, while their records still find each event, so one that cannot go yet stops the forget
+// to be tried again; then those threads' external-email sessions and privacy records; then the person's
+// addresses on every thread, and their hourly counts.
 registerPersonForgetHook('gws-ea-inbox:purge', async ({ handles }) => {
   const db = getDb();
-  if (!(await db.hasTable('gws_ea_inbox_threads'))) return;
+  if (!(await db.hasTable('gws_ea_threads'))) return;
   const forgotten = new Set(
     handles.filter((handle) => handle.toLowerCase().startsWith('email:')).map((handle) => identityMatchKey(handle)),
   );
   if (forgotten.size === 0) return;
-  const isForgotten = (address: string | null) =>
-    address !== null && forgotten.has(identityMatchKey(`email:${address}`));
+  const isForgotten = (address: string) => forgotten.has(identityMatchKey(`email:${address}`));
+  const { threadKeys, addresses } = await threadsWithAddresses(isForgotten);
+  for (const threadKey of threadKeys) await releaseThreadHolds(threadKey);
+  await purgeThreadSessions(threadKeys);
   await db.transaction(async () => {
-    for (const row of await db.all<{ gmail_message_id: string; sender: string | null }>(
-      'SELECT gmail_message_id, sender FROM gws_ea_inbox_held',
-    )) {
-      if (isForgotten(row.sender))
-        await db.run('DELETE FROM gws_ea_inbox_held WHERE gmail_message_id = ?', row.gmail_message_id);
-    }
+    await deleteThreadAddresses(addresses);
     for (const row of await db.all<{ sender: string }>('SELECT DISTINCT sender FROM gws_ea_inbox_sender_counts')) {
       if (isForgotten(row.sender)) await db.run('DELETE FROM gws_ea_inbox_sender_counts WHERE sender = ?', row.sender);
-    }
-    const columns = ['people_to', 'people_cc', 'people_bcc', 'vouched_people'] as const;
-    for (const row of await db.all<Record<(typeof columns)[number] | 'thread_key', string>>(
-      'SELECT thread_key, people_to, people_cc, people_bcc, vouched_people FROM gws_ea_inbox_threads',
-    )) {
-      for (const column of columns) {
-        const addresses = JSON.parse(row[column]) as readonly string[];
-        const kept = addresses.filter((address) => !isForgotten(address));
-        if (kept.length !== addresses.length) {
-          await db.run(
-            `UPDATE gws_ea_inbox_threads SET ${column} = ? WHERE thread_key = ?`,
-            JSON.stringify(kept),
-            row.thread_key,
-          );
-        }
-      }
     }
   });
 });
 
-// What status reads, from the host only: `getInboxHealth()` exactly as follow-through reads it.
+// What status reads, from the host only: `getInboxHealth()`, in the shape status reads.
 register({
   name: 'gws-ea-inbox-health',
   description: "Report the inbox's health and its calendar notifications.",
@@ -237,25 +258,7 @@ export {
   type GmailMessagePart,
   type GmailMessageRef,
 } from './gmail-api.js';
-export type { ThreadOrigin, ThreadPeople, ThreadState } from './db.js';
 export { getInboxHealth, type InboxHealth } from './health.js';
 export { EMAIL_SEND_ACTION } from './outbound.js';
-export { registerThreadReplyHook, type ThreadReplyHook } from './routing.js';
 export { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID } from './runtime.js';
-export {
-  addThreadPeople,
-  arrangeThreadPeople,
-  authorizeThread,
-  closeThread,
-  getThreadParticipants,
-  handBackHeldThread,
-  mintThreadKey,
-  openThreadSession,
-  releaseHeldMail,
-  threadAddress,
-  vouchThreadPeople,
-  type AuthorizeThreadInput,
-  type Placement,
-  type ThreadView,
-} from './threads.js';
 export { ensureInbox, ensurePrincipalConversation, getInboxMessagingGroupId } from './wiring-policy.js';
