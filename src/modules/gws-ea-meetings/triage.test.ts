@@ -723,6 +723,37 @@ describe('a step in a meeting’s conversation that failed', () => {
     expect(notes(scheduling.main, STALLED)).toHaveLength(2);
   });
 
+  it('tells main a called-off meeting ends without its closing line when that line or its turn fails, and asks nothing of main', async () => {
+    const { meetingId, threadKey, session } = await samsMeeting();
+    const cancelled = await ask(scheduling.main, 'meeting_cancel', {
+      meeting_id: meetingId,
+      note: 'Alex has to travel that week.',
+    });
+    expect(data(cancelled).state).toBe('closing');
+
+    turnFailed(session, threadKey);
+    await deliverSessionMessages(session);
+    const [stalled] = notes(scheduling.main, STALLED);
+    expect(stalled.text).toMatch(/is called off, and its closing line has not gone/);
+
+    vi.spyOn(scheduling.gmail, 'send').mockRejectedValue(
+      new GoogleApiError(400, 'Google refused /gmail/v1/users/me/messages/send: bad request'),
+    );
+    await reply(session, threadKey, 'Alex has to travel that week, so we will leave it for now. Thank you, Sam.');
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    const [unsent] = notes(scheduling.main, UNSENT);
+    expect(unsent.text).toMatch(/is called off, and its closing line did not go/);
+
+    for (const note of [stalled, unsent]) {
+      expect(note.text).toMatch(
+        /ends without it within 60 minutes of being called off\. Nothing more is needed from you\./,
+      );
+      expect(note.text).not.toMatch(/amend|still (open|being arranged)/);
+    }
+    expect((await meeting(meetingId)).state).toBe('closing');
+  });
+
   it('ends a reply whose turn failed and hands its thread back, so main can respond again', async () => {
     const { threadKey } = await deeAsks();
     const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
@@ -967,6 +998,73 @@ describe('respond', () => {
     vi.mocked(scheduling.gmail.send).mockRestore();
     const again = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
     expect((await meeting(again.meeting_id)).state).toBe('active');
+  });
+
+  describe('reported done while its last email has not gone', () => {
+    const badRequest = () => new GoogleApiError(400, 'Google refused /gmail/v1/users/me/messages/send: bad request');
+
+    /** Dee's conversation writes its last email, whose first send fails, and reports done. */
+    async function doneBeforeItsEmailWent(): Promise<{ readonly meetingId: string; readonly session: Session }> {
+      const { threadKey } = await deeAsks();
+      const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
+      const meetingId = String(answer.meeting_id);
+      const session = await meetingSession(meetingId);
+      await reply(session, threadKey, 'Thank you for thinking of Alex. Sadly she is not speaking this autumn.');
+      expect(scheduling.gmail.sent).toEqual([]);
+
+      const reported = data(await ask(session, 'meeting_outcome', { meeting_id: meetingId, outcome: 'done' }));
+      expect(reported.message).toMatch(/has not gone yet: the host closes this conversation once it has/);
+      expect((await meeting(meetingId)).state).toBe('active');
+      expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'open' });
+      expect((await getSession(session.id))?.status).toBe('active');
+      expect(notes(scheduling.main, OUTCOME)).toEqual([]);
+      return { meetingId, session };
+    }
+
+    it('ends once delivery sends it, and main hears without waking', async () => {
+      vi.spyOn(scheduling.gmail, 'send').mockRejectedValueOnce(badRequest());
+      const { meetingId, session } = await doneBeforeItsEmailWent();
+
+      await deliverSessionMessages(session);
+      expect(scheduling.gmail.sent).toHaveLength(1);
+      expect((await meeting(meetingId)).state).toBe('done');
+      expect((await getSession(session.id))?.status).toBe('closed');
+      const [note, ...more] = notes(scheduling.main, OUTCOME);
+      expect(more).toEqual([]);
+      expect(note.note).toMatchObject({ meeting_id: meetingId, outcome: 'done' });
+      expect(note.row.trigger).toBe(0);
+    });
+
+    it('ends on a later follow-through pass when its email went but the host stopped before ending it', async () => {
+      vi.spyOn(scheduling.gmail, 'send').mockRejectedValueOnce(badRequest());
+      const { meetingId, session } = await doneBeforeItsEmailWent();
+      // Delivery recorded the email, and the host stopped before it ended the conversation.
+      const outbound = new Database(outboundDbPath(session.agent_group_id, session.id), { readonly: true });
+      const { id } = outbound.prepare("SELECT id FROM messages_out WHERE kind = 'chat'").get() as { id: string };
+      outbound.close();
+      const inbound = new Database(inboundDbPath(session.agent_group_id, session.id));
+      inbound
+        .prepare("INSERT INTO delivered (message_out_id, status, delivered_at) VALUES (?, 'delivered', ?)")
+        .run(id, new Date().toISOString());
+      inbound.close();
+
+      await runFollowThrough();
+      expect((await meeting(meetingId)).state).toBe('done');
+      expect(outcomeNotes('done')).toHaveLength(1);
+    });
+
+    it('tells main when delivery gives up on it', async () => {
+      vi.spyOn(scheduling.gmail, 'send').mockRejectedValue(badRequest());
+      const { meetingId, session } = await doneBeforeItsEmailWent();
+
+      await deliverSessionMessages(session);
+      await deliverSessionMessages(session);
+      expect((await meeting(meetingId)).state).toBe('gave-up');
+      expect(outcomeNotes('done')).toEqual([]);
+      const [note] = outcomeNotes('gave-up');
+      expect(note.text).toMatch(/could not be sent/);
+      expect(note.row.trigger).toBe(1);
+    });
   });
 
   it('refuses a purpose carrying a private detail, before external-email sees it', async () => {

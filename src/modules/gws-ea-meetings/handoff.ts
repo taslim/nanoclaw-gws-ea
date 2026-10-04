@@ -18,10 +18,11 @@
  *   or not (R16), to move it.
  * - `email_respond` hands a held thread to a conversation, from a brief: it
  *   stays with the thread for the other side's follow-ups until it reports
- *   done, goes quiet, or is called off or taken over (KTD4); then the thread
- *   is held for `main` again. `email_dismiss` closes a held thread with
- *   nothing sent. `email_reply_to_principal` answers the principal's own
- *   email, to them alone.
+ *   done (and its last email has gone), goes quiet, or is called off or
+ *   taken over (KTD4); then the thread is held for `main` again.
+ *   `email_dismiss` closes a held thread with nothing sent.
+ *   `email_reply_to_principal` answers the principal's own email, to them
+ *   alone.
  * - Nothing in a job's conversation stalls silently. When delivery gives up
  *   on an email it wrote, when an email to it is given up after its retries,
  *   or when one of its turns fails, `main` hears of it: a conversation ends
@@ -1628,41 +1629,47 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
    * side hears from the assistant only when main has something to say, or
    * when they were waiting on its offer: the conversation then writes one
    * gracious line, and ends once it has gone (`closing`). Otherwise the
-   * meeting ends at once. Calling it off again changes nothing.
+   * meeting ends at once. Calling a closing meeting off again decides
+   * nothing anew: it finishes what a call cut short began, and its line's
+   * note, under a fixed id, is written once.
    */
   async function callOff(meeting: SchedulingMeeting, note: string | undefined): Promise<'closing' | 'ended'> {
-    if (meeting.state === 'closing') return 'closing';
     if (meeting.state === 'cancelled') return 'ended';
     const at = new Date().toISOString();
-    await closeAsk(meeting.id, at);
-    const booking = meeting.state === 'booked' ? await getBooking(meeting.id) : undefined;
-    if (booking) {
-      await calendar().deleteEvent(booking.calendar_id, booking.event_id, 'all');
-      recordOwnCalendarChange(booking.calendar_id, booking.event_id);
-    }
-    const waiting = meeting.state === 'active' && (await wroteInThread(meeting));
     const session = meeting.session_id === null ? undefined : await getSession(meeting.session_id);
-    if ((note === undefined && !waiting) || session?.status !== 'active') {
-      await endMeeting(meeting, 'cancelled', true);
-      return 'ended';
+    if (meeting.state !== 'closing') {
+      await closeAsk(meeting.id, at);
+      const booking = meeting.state === 'booked' ? await getBooking(meeting.id) : undefined;
+      if (booking) {
+        await calendar().deleteEvent(booking.calendar_id, booking.event_id, 'all');
+        recordOwnCalendarChange(booking.calendar_id, booking.event_id);
+      }
+      const waiting = meeting.state === 'active' && (await wroteInThread(meeting));
+      if ((note === undefined && !waiting) || session?.status !== 'active') {
+        await endMeeting(meeting, 'cancelled', true);
+        return 'ended';
+      }
+      await updateMeeting(
+        meeting.id,
+        {
+          state: 'closing',
+          nudge_at: null,
+          give_up_at: new Date(Date.parse(at) + CLOSING_GRACE_MINUTES * MINUTE).toISOString(),
+        },
+        at,
+      );
     }
-    await updateMeeting(
-      meeting.id,
-      {
-        state: 'closing',
-        nudge_at: null,
-        give_up_at: new Date(Date.parse(at) + CLOSING_GRACE_MINUTES * MINUTE).toISOString(),
-      },
-      at,
-    );
+    if (!session) throw new Error(`Meeting ${meeting.id} is closing with no conversation to write its line`);
     await deps.releaseHolds(meeting);
+    // A booking stays recorded once its event is deleted, so a call that finishes another's says the same.
+    const booked = (await getBooking(meeting.id)) !== undefined;
     await writeMeetingNote(
       session,
       meeting,
       `meeting-closing-${meeting.id}`,
       { type: CLOSING_NOTE_TYPE, ...(note === undefined ? {} : { note }) },
       `Note for meeting ${meeting.id}, from the host: main called this meeting off.` +
-        (booking ? ' Its event is deleted, and Google sent them its cancellation.' : '') +
+        (booked ? ' Its event is deleted, and Google sent them its cancellation.' : '') +
         ' Tell them in one short, gracious line in this thread' +
         (note === undefined ? '.' : `, with main's words: ${note}`) +
         ' Then send nothing more: the conversation closes once that line has gone.',
@@ -2118,6 +2125,9 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   };
 
   const DONE_REPLY = 'Recorded: done. This conversation is now closed: send nothing more in it.';
+  const DONE_PENDING_REPLY =
+    'Recorded: done. Your last email in this thread has not gone yet: the host closes this conversation once it has. ' +
+    'Send nothing more in it.';
 
   /** Whether the invitation now sits at an offered time, or clear of everything else on the principal's calendars. */
   async function assertSettled(meeting: Meeting): Promise<void> {
@@ -2238,16 +2248,27 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   // A conversation, and the emails a job's conversation sends
   // -------------------------------------------------------------------------
 
-  /** external-email reports a conversation done: it ends, and its thread waits for main again. Safe to repeat. */
+  /**
+   * external-email reports a conversation done: it ends, and its thread
+   * waits for main again. While an email it wrote in the thread has yet to
+   * go, the report is recorded and the conversation stays open for delivery
+   * to send it: it ends once it has gone (`endOnceSent`), and if delivery
+   * gives up on it, main hears so (`sendsFailed`). Safe to repeat.
+   */
   async function done(meeting: Meeting): Promise<Answer> {
-    const answer: Answer = {
+    const answer = (message: string): Answer => ({
       meetingId: meeting.id,
-      data: { meeting_id: meeting.id, outcome: 'done', message: DONE_REPLY },
-    };
-    if (meeting.state === 'done') return answer;
+      data: { meeting_id: meeting.id, outcome: 'done', message },
+    });
+    if (meeting.state === 'done') return answer(DONE_REPLY);
     if (meeting.state !== 'active') throw refused(`Meeting ${meeting.id} takes no outcome now (${meeting.state})`);
+    if (await emailPending(meeting)) {
+      const pending = answer(DONE_PENDING_REPLY);
+      await recordOutcome(meeting.id, 'done', JSON.stringify(pending.data), new Date().toISOString());
+      return pending;
+    }
     await endConversation(meeting, 'done', false);
-    return answer;
+    return answer(DONE_REPLY);
   }
 
   /**
@@ -2323,6 +2344,38 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     return meeting.replied_at !== null || (await hasSentInThreadSince(meeting.thread_key, meeting.created_at));
   }
 
+  /**
+   * Whether an email the job's conversation wrote in its thread has yet to
+   * go: its message waits in the session's outbound mailbox, neither
+   * delivered nor given up on, so delivery still tries it.
+   */
+  async function emailPending(meeting: Meeting): Promise<boolean> {
+    const session = meeting.session_id === null ? undefined : await getSession(meeting.session_id);
+    if (!session) return false;
+    const pending = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox
+        .getDueMessages(mailbox.getDeliveredIds())
+        .some(
+          (msg) =>
+            msg.channelType === EMAIL_CHANNEL_TYPE &&
+            msg.platformId === INBOX_PLATFORM_ID &&
+            msg.threadId === meeting.thread_key,
+        ),
+    );
+    return pending ?? false;
+  }
+
+  /**
+   * A conversation external-email reported done while its last email had yet
+   * to go ends once nothing it wrote is left to go; true when it ended.
+   */
+  async function endOnceSent(meeting: Meeting): Promise<boolean> {
+    if (isScheduling(meeting) || meeting.state !== 'active') return false;
+    if ((await getRecordedOutcome(meeting.id, 'done')) === undefined || (await emailPending(meeting))) return false;
+    await endConversation(meeting, 'done', false);
+    return true;
+  }
+
   /** The job's conversation wrote in its thread: its first email is recorded once, and its quiet count starts. */
   async function wrote(meeting: Meeting): Promise<void> {
     const at = new Date();
@@ -2334,12 +2387,13 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   /**
    * Delivery recorded an email from a job's conversation in its thread. A
    * closing meeting's one line has gone, so it ends and its thread closes;
-   * any other job's quiet count starts if none is running (KTD5).
+   * a conversation reported done ends once its last email has gone; any
+   * other job's quiet count starts if none is running (KTD5).
    */
   async function emailDelivered(msg: OutboundMessage, session: Session): Promise<void> {
     const meeting = await meetingInThread(msg, session);
     if (meeting?.state === 'closing') await endMeeting(meeting, 'cancelled', false);
-    else if (meeting?.state === 'active') await wrote(meeting);
+    else if (meeting?.state === 'active' && !(await endOnceSent(meeting))) await wrote(meeting);
   }
 
   /**
@@ -2364,12 +2418,14 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
    * A conversation a stop cut short. Delivery tells the host of an email's
    * sending once, and an ending hands the thread back before it ends the
    * job, so either can be left part-way. Each follow-through pass runs this:
-   * one whose thread already went back to main finishes ending, as unsent
-   * when its reply never went; one whose first email Gmail took without
-   * delivery hearing of it starts its quiet count. Safe to repeat.
+   * one reported done ends once its last email has gone; one whose thread
+   * already went back to main finishes ending, as unsent when its reply
+   * never went; one whose first email Gmail took without delivery hearing of
+   * it starts its quiet count. Safe to repeat.
    */
   async function finishCutShortReply(meeting: Meeting): Promise<void> {
     if (isScheduling(meeting) || meeting.state !== 'active') return;
+    if (await endOnceSent(meeting)) return;
     const wentOut = await wroteInThread(meeting);
     if ((await getThreadParticipants(meeting.thread_key))?.state === 'awaiting-arrange') {
       if (wentOut) await endConversation(meeting, 'ended', false);
@@ -2402,11 +2458,15 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     );
   }
 
+  /** How a called-off meeting ends when its closing line does not go: it needs nothing from main. */
+  const CLOSING_WITHOUT_LINE = `the meeting ends without it within ${CLOSING_GRACE_MINUTES} minutes of being called off. Nothing more is needed from you.`;
+
   /**
    * An email in a scheduling meeting's thread could not be sent. The meeting
    * and its conversation go on, but nothing may come of them: with no times
    * held, no follow-through deadline runs. So main hears of it, once per
-   * email, to amend, cancel, or tell the principal.
+   * email, to amend, cancel, or tell the principal. A called-off meeting's
+   * line is what did not go, and it ends without it.
    */
   async function sendFailed(meeting: SchedulingMeeting, msg: OutboundMessage): Promise<void> {
     const thread = await getThreadParticipants(meeting.thread_key);
@@ -2427,7 +2487,9 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         `("${meeting.purpose}", thread_key ${meeting.thread_key}). It was to ${to}. ` +
         (meeting.state === 'booked'
           ? 'The meeting stays booked as it is.'
-          : 'The meeting is still being arranged, but nothing will come of it on its own: meeting_amend briefs external-email again, or meeting_cancel calls it off.'),
+          : meeting.state === 'closing'
+            ? `The meeting is called off, and its closing line did not go: ${CLOSING_WITHOUT_LINE}`
+            : 'The meeting is still being arranged, but nothing will come of it on its own: meeting_amend briefs external-email again, or meeting_cancel calls it off.'),
       new Date().toISOString(),
     );
   }
@@ -2444,10 +2506,17 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     if (!isScheduling(meeting)) {
       return `Its reply was not sent, and the thread waits for you again: email_respond again with thread_key ${meeting.thread_key}.`;
     }
-    return meeting.state === 'booked'
-      ? 'The meeting stays booked: meeting_reschedule moves it if they asked to, and meeting_cancel calls it off.'
-      : 'The meeting is still open, but nothing will come of it on its own: meeting_amend briefs external-email again, ' +
-          'and meeting_cancel calls it off.';
+    switch (meeting.state) {
+      case 'booked':
+        return 'The meeting stays booked: meeting_reschedule moves it if they asked to, and meeting_cancel calls it off.';
+      case 'closing':
+        return `The meeting is called off, and its closing line has not gone: unless it goes first, ${CLOSING_WITHOUT_LINE}`;
+      default:
+        return (
+          'The meeting is still open, but nothing will come of it on its own: meeting_amend briefs external-email again, ' +
+          'and meeting_cancel calls it off.'
+        );
+    }
   }
 
   /**
@@ -2704,16 +2773,19 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
 
   /**
    * Give up on a meeting nobody answered (KTD12, R9), once it claims the
-   * deadline `giveUpAt` it came due on: a reply read first started the count
-   * again, and wins. The host reports gave-up to main itself, ends the
-   * meeting and its conversation, and releases its holds, with no agent turn.
+   * deadline `giveUpAt` it came due on: the meeting is read again, so a reply
+   * or a takeover since `listed` was read wins. The host reports gave-up to
+   * main itself, ends the meeting and its conversation, and releases its
+   * holds, with no agent turn.
    * Safe to repeat: a claimed give-up keeps its deadline until the meeting is
    * stopped, and one main could not be told of is released; the note is
    * written once, and a release of holds that fails leaves them for a later pass.
    */
-  async function giveUpUnanswered(meeting: Meeting, giveUpAt: string): Promise<void> {
+  async function giveUpUnanswered(listed: Meeting, giveUpAt: string): Promise<void> {
     const at = new Date().toISOString();
-    if (meeting.give_up_at !== giveUpAt) return;
+    const meeting = await getMeeting(listed.id);
+    // Still live, or a give-up claimed and not yet finished, with the deadline it came due on.
+    if (meeting?.give_up_at !== giveUpAt || (!isLive(meeting.state) && meeting.state !== 'gave-up')) return;
     switch (meeting.state) {
       case 'booked':
         // Only a question main left unanswered counts down on a booked meeting: it lapses, and the meeting stands.
@@ -2852,7 +2924,10 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     askMain,
     outcome,
     recipients,
-    /** A delivered email of a job's conversation: a closing line ends its meeting, and any other starts the quiet count. */
+    /**
+     * A delivered email of a job's conversation: a closing line ends its meeting, a conversation reported done
+     * ends once nothing is left to go, and any other starts the quiet count.
+     */
     emailDelivered,
     /** A conversation whose ending a stop or a failed note cut short: follow-through finishes it. */
     finishCutShortReply,

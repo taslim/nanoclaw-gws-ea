@@ -982,6 +982,28 @@ describe('cancel', () => {
     expect(contents(main).some((c) => c.note?.type === 'gws-ea-inbox.inbound' && c.text?.includes(SAM))).toBe(true);
   });
 
+  it('writes the closing line’s note once when called off again after a hold could not be released', async () => {
+    const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
+    const stored = await meeting(answer.meeting_id);
+    const session = await meetingSession(answer.meeting_id);
+    const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
+    data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [slot.slot_id] }));
+    await reply(session, stored.thread_key, 'Hello Sam, I am Robin, Pat Doe’s assistant. Would Tuesday at 10:00 work?');
+    const closingNotes = () => contents(session).filter((c) => c.note?.type === 'gws-ea-meetings.closing');
+
+    calendar.failNext({ op: 'delete', error: new GoogleApiError(503, 'Google refused: backend error') });
+    expect(refusal(await ask(main, 'meeting_cancel', { meeting_id: stored.id }))).toMatch(/could not be released/);
+    expect((await meeting(stored.id)).state).toBe('closing');
+    expect(closingNotes()).toEqual([]);
+
+    expect(data(await ask(main, 'meeting_cancel', { meeting_id: stored.id })).state).toBe('closing');
+    expect(data(await ask(main, 'meeting_cancel', { meeting_id: stored.id })).state).toBe('closing');
+    const [note, ...more] = closingNotes();
+    expect(more).toEqual([]);
+    expect(note.text).toMatch(/one short, gracious line/);
+    expect(calendar.live(PRINCIPAL).filter((event) => event.tags?.gwsEaRole === 'hold')).toEqual([]);
+  });
+
   it("deletes a booked meeting's event with Google's notice, and passes main's note on in the closing line", async () => {
     const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
     const stored = await meeting(answer.meeting_id);

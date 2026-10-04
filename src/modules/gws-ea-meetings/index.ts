@@ -21,10 +21,10 @@
  *
  * A forgotten person's meetings, threads, and sessions are purged, and a
  * thread the audience check stops ends its meeting at once. A delivered
- * email starts its job's quiet count, and a called-off meeting's closing
- * line ends it. `main` hears of any email in a job's thread delivery gave up
- * on, any email to it given up after its retries, and any turn of it that
- * failed.
+ * email starts its job's quiet count; a called-off meeting's closing line
+ * ends it, as a conversation's last email does once it reported done.
+ * `main` hears of any email in a job's thread delivery gave up on, any
+ * email to it given up after its retries, and any turn of it that failed.
  *
  * Follow-through (KTD12, `follow-through.ts`) runs on a module timer each
  * minute: a quiet thread's nudge and give-up, a reminder to `main` of a
@@ -179,7 +179,8 @@ for (const [action, handle, guardAction] of REQUESTS) {
 registerPersonForgetHook('gws-ea-meetings:purge', (person) => handoff.forgetPerson(person));
 registerThreadStoppedHook('gws-ea-meetings:close', (thread) => handoff.threadStopped(thread));
 registerThreadReplyHook('gws-ea-meetings:follow-through', (threadKey) => followThrough.replied(threadKey));
-// A delivered email starts its job's quiet count, and a called-off meeting's closing line ends it.
+// A delivered email starts its job's quiet count; a called-off meeting's closing line ends it, as a
+// conversation's last email does once it reported done.
 // main hears of every email a meeting's conversation wrote that delivery gave up on.
 registerPostDeliveryHook((msg, session) => handoff.emailDelivered(msg, session));
 registerDeliveryFailedHook((failed, session) => handoff.sendsFailed(failed, session));

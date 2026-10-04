@@ -242,6 +242,20 @@ describe('a curveball goes to main, and nothing goes to the other side', () => {
     expect(refusal(await ask(scheduling.main, 'meeting_ask_main', { meeting_id: stored.id, about: 'time' }))).toMatch(
       /Only external-email asks main about a meeting/,
     );
+    // external-email's conversation for another meeting is refused by the guard itself, before the request runs.
+    const other = data(
+      await ask(scheduling.main, 'meeting_arrange', {
+        people: [{ person_id: scheduling.people.pat.id }],
+        calendar_id: PRINCIPAL,
+        length_minutes: 30,
+        ...WEEK,
+        purpose: 'Coffee',
+      }),
+    );
+    const otherSession = await meetingSession(other.meeting_id);
+    expect(refusal(await ask(otherSession, 'meeting_ask_main', { meeting_id: stored.id, about: 'time' }))).toMatch(
+      /That meeting is not this conversation's\. Use only the meeting your brief names\./,
+    );
     expect(asks(stored.id)).toEqual([]);
     expect((await meeting(stored.id)).ask_about).toBeNull();
   });

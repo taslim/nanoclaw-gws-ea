@@ -430,6 +430,51 @@ describe('deadlines', () => {
       expect(notes(scheduling.main, OUTCOME).map((note) => note.note?.meeting_id)).toEqual([acme.stored.id]);
     });
 
+    it('so a takeover after the pass began keeps the conversation it superseded, and their session, from ending', async () => {
+      const acme = await offered(scheduling.people.acme);
+      // Dee writes to the assistant at 08:30, and a conversation answers her: it goes quiet on Friday at 09:00.
+      vi.setSystemTime(new Date('2026-10-05T07:30:00.000Z'));
+      const gmailId = scheduling.gmail.receive({
+        threadId: 'g-dee',
+        from: `Dee <dee@else.example>`,
+        to: [ROBIN],
+        subject: 'Speaking at our meetup',
+        body: 'Could Alex speak at our meetup in November?',
+      });
+      await scheduling.inbox.tick();
+      const triage = notes(scheduling.main, 'gws-ea-inbox.inbound').find((n) => n.note?.gmail_message_id === gmailId);
+      const threadKey = String(triage?.note?.thread_key);
+      const responded = data(
+        await ask(scheduling.main, 'email_respond', { thread_key: threadKey, purpose: 'Decline kindly.' }),
+      );
+      const session = await meetingSession(responded.meeting_id);
+      await reply(session, threadKey, 'Thank you for thinking of Alex. Sadly she is not speaking this autumn.');
+      expect(await meeting(responded.meeting_id)).toMatchObject({ give_up_at: '2026-10-09T08:00:00.000Z' });
+      await reach('2026-10-07T08:01:00.000Z');
+
+      // Friday's pass reads both, and gives up on Acme's first; main takes the conversation's thread over meanwhile.
+      let arranged: Record<string, unknown> = {};
+      duringFirstRelease(async () => {
+        arranged = data(
+          await ask(scheduling.main, 'meeting_arrange', {
+            thread_key: threadKey,
+            calendar_id: PRINCIPAL,
+            length_minutes: 30,
+            ...WINDOW,
+            purpose: 'Short call',
+          }),
+        );
+      });
+      await reach('2026-10-09T08:02:00.000Z');
+
+      expect((await meeting(acme.stored.id)).state).toBe('gave-up');
+      expect((await meeting(responded.meeting_id)).state).toBe('superseded');
+      expect(await meeting(arranged.meeting_id)).toMatchObject({ state: 'active', session_id: session.id });
+      expect((await getSession(session.id))?.status).toBe('active');
+      expect(vi.mocked(killContainer)).not.toHaveBeenCalledWith(session.id, expect.anything());
+      expect(notes(scheduling.main, OUTCOME).map((note) => note.note?.meeting_id)).toEqual([acme.stored.id]);
+    });
+
     it('so a reply read after the pass began stops its nudge', async () => {
       const acme = await offered(scheduling.people.acme);
       await reach('2026-10-07T08:01:00.000Z');

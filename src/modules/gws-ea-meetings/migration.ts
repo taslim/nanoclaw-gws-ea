@@ -24,8 +24,9 @@ import type { ModuleMigration } from '../../db/migrations/index.js';
  *   session and the outbound message that carried it, so a replay returns
  *   the first answer.
  * - `gws_ea_meeting_outcomes`: each outcome a meeting reported, once. A
- *   conversation's `done` is recorded when it ends, and its `gave-up` when
- *   delivery gives up on its email.
+ *   conversation's `done` is recorded when it ends, or when it reports done
+ *   while its last email has yet to go, and its `gave-up` when delivery
+ *   gives up on its email.
  * - `gws_ea_meeting_slots`: the candidate times the host offered for a
  *   meeting, by slot id (written by the calendar actions).
  * - `gws_ea_meeting_bookings`: the event the host's own `book` created or
