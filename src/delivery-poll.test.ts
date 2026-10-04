@@ -96,7 +96,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  stopDeliveryPolls();
+  await stopDeliveryPolls();
   vi.useRealTimers();
   vi.restoreAllMocks();
   await closeDb();

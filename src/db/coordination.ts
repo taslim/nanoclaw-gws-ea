@@ -253,6 +253,20 @@ export async function getDeliveryAttempt(messageId: string): Promise<DeliveryAtt
   return getDb().get<DeliveryAttemptRow>('SELECT * FROM delivery_attempts WHERE message_id = ?', messageId);
 }
 
+/**
+ * The messages of a session whose attempts reached `max`: given up, but not
+ * yet recorded as failed, since delivery records a failure only after
+ * reporting it.
+ */
+export async function listExhaustedDeliveryAttempts(sessionId: string, max: number): Promise<Set<string>> {
+  const rows = await getDb().all<{ message_id: string }>(
+    'SELECT message_id FROM delivery_attempts WHERE session_id = ? AND attempts >= ?',
+    sessionId,
+    max,
+  );
+  return new Set(rows.map((row) => row.message_id));
+}
+
 /** Delivered or terminally failed — the row's job is done. */
 export async function clearDeliveryAttempt(messageId: string): Promise<void> {
   await getDb().run('DELETE FROM delivery_attempts WHERE message_id = ?', messageId);

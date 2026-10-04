@@ -32,6 +32,7 @@ vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn().mockResolvedValue
 
 import { isContainerRunning, killContainer } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
+import { recordDeliveryAttempt } from '../../db/coordination.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { setMessagingGroupDetachedAt } from '../../db/messaging-groups.js';
 import { deliverSessionMessages, registerDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
@@ -248,6 +249,26 @@ describe('a reply that fails permanently', () => {
     expect(notices()).toEqual([noticeInDm('spaces/dm/threads/t7')]);
     // Each failed reply was still tried exactly MAX_DELIVERY_ATTEMPTS times.
     expect(sent.filter((send) => !isNotice(send))).toHaveLength(6);
+  });
+
+  it('tells the principal once when delivery reports the same failed reply again after a stop', async () => {
+    const { main } = await seedAssistant();
+    queue(main, { id: 'out-again', content: { text: 'A' } });
+    channel((send) => !isNotice(send));
+    await drain(main, 3);
+    expect(notices()).toHaveLength(1);
+
+    // The host stopped after the report and before recording the failure: the next pass reports it again.
+    const inbound = new Database(inboundDbPath(main.agent_group_id, main.id));
+    inbound.prepare('DELETE FROM delivered WHERE message_out_id = ?').run('out-again');
+    inbound.close();
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await recordDeliveryAttempt({ messageId: 'out-again', sessionId: main.id, now: now(), nextAttemptAt: null });
+    }
+
+    await drain(main, 1);
+    expect(notices()).toHaveLength(1);
+    expect(sent.filter((send) => !isNotice(send))).toHaveLength(3);
   });
 
   it('sends nothing for an email external-email could not send: the principal asked for nothing there', async () => {

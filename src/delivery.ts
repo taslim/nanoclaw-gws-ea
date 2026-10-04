@@ -26,7 +26,7 @@ import {
   getMessagingGroupByPlatform,
   getMessagingGroupForOwnDestination,
 } from './db/messaging-groups.js';
-import { clearDeliveryAttempt, recordDeliveryAttempt } from './db/coordination.js';
+import { clearDeliveryAttempt, listExhaustedDeliveryAttempts, recordDeliveryAttempt } from './db/coordination.js';
 import { runGuarded, type DeliveryGuardSpec, type GuardedDeliveryHandler } from './delivery-guard.js';
 import { isUnguarded, type Unguarded } from './guard/index.js';
 import { mapConcurrent } from './concurrency.js';
@@ -84,6 +84,18 @@ async function recordAttemptRow(messageId: string, sessionId: string, err: unkno
   /* eslint-enable no-catch-all/no-catch-all */
 }
 
+/** Messages given up on whose failure is not recorded yet; none when the bookkeeping cannot be read. */
+async function exhaustedAttempts(sessionId: string): Promise<Set<string>> {
+  /* eslint-disable no-catch-all/no-catch-all -- attempt bookkeeping must never break delivery */
+  try {
+    return await listExhaustedDeliveryAttempts(sessionId, MAX_DELIVERY_ATTEMPTS);
+  } catch (err) {
+    log.error('Failed to read spent delivery attempts — retrying them as usual this poll', { sessionId, err });
+    return new Set();
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+}
+
 async function clearAttemptRow(messageId: string): Promise<void> {
   /* eslint-disable no-catch-all/no-catch-all -- attempt bookkeeping must never break delivery */
   try {
@@ -95,7 +107,8 @@ async function clearAttemptRow(messageId: string): Promise<void> {
 }
 
 /**
- * Sessions whose outbound queue is currently being drained.
+ * Sessions whose outbound queue is currently being drained, each with the
+ * pass's completion, so a stop can wait for it (`stopDeliveryPolls`).
  *
  * The active poll (1s, running sessions) and the sweep poll (60s, all
  * active sessions) both call deliverSessionMessages, and a running session
@@ -107,7 +120,10 @@ async function clearAttemptRow(messageId: string): Promise<void> {
  * Skipping (vs. queueing) is correct: any message left over when the
  * second caller skips will be picked up on the next poll tick (~1s).
  */
-const inflightDeliveries = new Set<string>();
+const inflightDeliveries = new Map<string, Promise<void>>();
+
+/** How long a stop waits for delivery passes under way, so one is not cut between a send and its record. */
+const STOP_WAIT_MS = 10_000;
 
 export interface ChannelDeliveryAdapter {
   deliver(
@@ -336,12 +352,19 @@ export async function deliverSessionMessages(session: Session): Promise<void> {
   // Reject re-entry from a concurrent poll on the same session — see the
   // comment on inflightDeliveries above.
   if (inflightDeliveries.has(session.id)) return;
-  inflightDeliveries.add(session.id);
+  let finished: () => void = () => undefined;
+  inflightDeliveries.set(
+    session.id,
+    new Promise<void>((resolve) => {
+      finished = resolve;
+    }),
+  );
 
   try {
     await drainSession(session);
   } finally {
     inflightDeliveries.delete(session.id);
+    finished();
   }
 }
 
@@ -387,8 +410,14 @@ async function drainSession(session: Session): Promise<void> {
     }
   }
 
+  // Rows given up on before a stop cut their report short: reported below, never sent again.
+  const exhausted = pending.length > 0 ? await exhaustedAttempts(session.id) : new Set<string>();
   const givenUp: OutboundMessage[] = [];
   for (const msg of pending) {
+    if (exhausted.has(msg.id)) {
+      givenUp.push(msg);
+      continue;
+    }
     try {
       const platformMsgId = await deliverMessage(msg, session);
       await withExistingMailboxSession(agentGroup.id, session.id, (mailbox) =>
@@ -436,17 +465,7 @@ async function drainSession(session: Session): Promise<void> {
           attempts,
           err,
         });
-        try {
-          await withExistingMailboxSession(agentGroup.id, session.id, (mailbox) => mailbox.markDeliveryFailed(msg.id));
-          await clearAttemptRow(msg.id);
-          givenUp.push(msg);
-        } catch (markErr) {
-          log.error('Failed to record permanent delivery failure', {
-            messageId: msg.id,
-            sessionId: session.id,
-            err: markErr,
-          });
-        }
+        givenUp.push(msg);
       } else {
         log.warn('Message delivery failed, will retry', {
           messageId: msg.id,
@@ -461,6 +480,9 @@ async function drainSession(session: Session): Promise<void> {
   }
 
   // Once per pass, after it: one report however many rows gave up together.
+  // The report comes before the failure is recorded: a stop between them
+  // leaves the rows pending with their attempts spent, and the next pass
+  // reports them again instead of losing the report.
   if (givenUp.length > 0) {
     for (const hook of deliveryFailedHooks) {
       /* eslint-disable no-catch-all/no-catch-all -- a failing hook must never affect the recorded failure or other hooks */
@@ -470,6 +492,18 @@ async function drainSession(session: Session): Promise<void> {
         log.warn('Delivery-failed hook failed', { sessionId: session.id, err });
       }
       /* eslint-enable no-catch-all/no-catch-all */
+    }
+    for (const msg of givenUp) {
+      try {
+        await withExistingMailboxSession(agentGroup.id, session.id, (mailbox) => mailbox.markDeliveryFailed(msg.id));
+        await clearAttemptRow(msg.id);
+      } catch (markErr) {
+        log.error('Failed to record permanent delivery failure', {
+          messageId: msg.id,
+          sessionId: session.id,
+          err: markErr,
+        });
+      }
     }
   }
 }
@@ -757,6 +791,10 @@ export function registerPostDeliveryHook(hook: PostDeliveryHook): void {
  * reaches them: a refusal is an outcome the sending agent is told about, not
  * a failure.
  *
+ * They hear before the failure is recorded, so a stop in between never loses
+ * the report: the next pass reports those rows again. A hook may therefore
+ * hear a row more than once, and must be safe to repeat.
+ *
  * Like post-delivery hooks, each invocation is isolated: a failing hook can
  * never affect delivery, the recorded failure, or the hooks after it.
  */
@@ -888,7 +926,22 @@ async function handleSystemAction(content: Record<string, unknown>, session: Ses
   log.warn('Unknown system action', { action });
 }
 
-export function stopDeliveryPolls(): void {
+/**
+ * Stop both polls, then wait up to `maxWaitMs` for delivery passes already
+ * under way: the host closes the DB next, and a pass cut short would lose
+ * what it was about to record.
+ */
+export async function stopDeliveryPolls(maxWaitMs = STOP_WAIT_MS): Promise<void> {
   activePolling = false;
   sweepPolling = false;
+  const running = [...inflightDeliveries.values()];
+  if (running.length === 0) return;
+  let bound: NodeJS.Timeout | undefined;
+  await Promise.race([
+    Promise.all(running),
+    new Promise<void>((resolve) => {
+      bound = setTimeout(resolve, maxWaitMs);
+    }),
+  ]);
+  clearTimeout(bound);
 }

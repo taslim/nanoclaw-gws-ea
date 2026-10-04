@@ -33,6 +33,7 @@ vi.mock('./modules/cross-session-context/index.js', async (importOriginal) => {
 const TEST_DIR = '/tmp/nanoclaw-test-delivery';
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
+import { getDeliveryAttempt, recordDeliveryAttempt } from './db/coordination.js';
 import { getDeliveredIds } from './mailbox/sqlite/session-db.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import { resolveSession, resolveTaskSession, withMailboxSession } from './session-manager.js';
@@ -46,6 +47,7 @@ import {
   registerOutboundGuard,
   registerPostDeliveryHook,
   setDeliveryAdapter,
+  stopDeliveryPolls,
   type OutboundGuardDecision,
   type OutboundSend,
 } from './delivery.js';
@@ -856,6 +858,97 @@ describe('deliverSessionMessages — delivery-failed hooks', () => {
 
     expect(deliveryStatus('ag-1', session.id, 'df-throws')).toBe('failed');
     expect(after).toEqual(['df-throws']);
+  });
+
+  it('run before the failure is recorded, so a stop between them leaves the give-up to report', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'df-order');
+    const statusWhenHeard: Array<string | undefined> = [];
+    registerDeliveryFailedHook((failed, s) => {
+      if (s.id === session.id) statusWhenHeard.push(deliveryStatus('ag-1', session.id, failed[0].id));
+    });
+    setDeliveryAdapter({
+      async deliver() {
+        throw new Error('network timeout');
+      },
+    });
+
+    for (let attempt = 0; attempt < 3; attempt++) await deliverSessionMessages(session);
+
+    expect(statusWhenHeard).toEqual([undefined]);
+    expect(deliveryStatus('ag-1', session.id, 'df-order')).toBe('failed');
+    expect(await getDeliveryAttempt('df-order')).toBeUndefined();
+  });
+
+  it('report a give-up a stop cut short on the next pass, without sending it again', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'df-cut');
+    // The pass recorded the last attempt, then the host stopped before reporting or recording the give-up.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await recordDeliveryAttempt({ messageId: 'df-cut', sessionId: session.id, now: now(), nextAttemptAt: null });
+    }
+    let sends = 0;
+    setDeliveryAdapter({
+      async deliver() {
+        sends += 1;
+        throw new Error('network timeout');
+      },
+    });
+    const heard: string[][] = [];
+    registerDeliveryFailedHook((failed, s) => {
+      if (s.id === session.id) heard.push(failed.map((m) => m.id));
+    });
+
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+
+    expect(sends).toBe(0);
+    expect(heard).toEqual([['df-cut']]);
+    expect(deliveryStatus('ag-1', session.id, 'df-cut')).toBe('failed');
+    expect(await getDeliveryAttempt('df-cut')).toBeUndefined();
+  });
+});
+
+describe('stopDeliveryPolls', () => {
+  it('waits for a delivery pass already under way, and no longer than its bound', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'stop-1');
+    let release: () => void = () => undefined;
+    const sending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    setDeliveryAdapter({
+      async deliver() {
+        await sending;
+        return 'pm-stop';
+      },
+    });
+
+    const pass = deliverSessionMessages(session);
+    let stopped = false;
+    const stopping = stopDeliveryPolls(5_000).then(() => {
+      stopped = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(stopped).toBe(false);
+
+    release();
+    await stopping;
+    await pass;
+    expect(deliveryStatus('ag-1', session.id, 'stop-1')).toBe('delivered');
+
+    // A pass that never ends holds shutdown only as long as the bound.
+    insertOutbound('ag-1', session.id, 'stop-2');
+    setDeliveryAdapter({
+      deliver: () => new Promise<string>(() => undefined),
+    });
+    void deliverSessionMessages(session);
+    const started = Date.now();
+    await stopDeliveryPolls(100);
+    expect(Date.now() - started).toBeLessThan(2_000);
   });
 });
 

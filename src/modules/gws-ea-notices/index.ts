@@ -31,6 +31,8 @@
  * cannot turn one notice into a stream of them. Why the failure happened goes
  * to the host log only.
  */
+import { getDb } from '../../db/connection.js';
+import { registerMigration } from '../../db/migrations/index.js';
 import { getDeliveryAdapter, registerDeliveryAction, registerDeliveryFailedHook } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { log } from '../../log.js';
@@ -38,6 +40,9 @@ import type { OutboundMessage } from '../../mailbox/index.js';
 import { registerInboundFailedHook } from '../../reconcile-session.js';
 import type { Session } from '../../types.js';
 import { getMainAgentGroupId, principalContact } from '../gws-ea-profile/db.js';
+import { gwsEaNoticesMigration } from './migration.js';
+
+registerMigration(gwsEaNoticesMigration);
 
 /** The one plain sentence the principal sees whenever the assistant could not finish. */
 const FAILURE_NOTICE_TEXT = "Something went wrong on my side and I couldn't finish that. Please send it again.";
@@ -137,9 +142,36 @@ function isPersonFacingPost(msg: OutboundMessage): boolean {
   return (content as { operation?: unknown } | null)?.operation !== 'reaction';
 }
 
+/** The failed replies among `ids` the principal has not been told of. */
+async function unreported(ids: readonly string[]): Promise<Set<string>> {
+  const rows = await getDb().all<{ message_id: string }>(
+    `SELECT message_id FROM gws_ea_notices_reported WHERE message_id IN (${ids.map(() => '?').join(', ')})`,
+    ...ids,
+  );
+  const reported = new Set(rows.map((row) => row.message_id));
+  return new Set(ids.filter((id) => !reported.has(id)));
+}
+
+async function recordReported(ids: readonly string[]): Promise<void> {
+  const at = new Date().toISOString();
+  for (const id of ids) {
+    await getDb().run(
+      'INSERT INTO gws_ea_notices_reported (message_id, reported_at) VALUES (?, ?) ON CONFLICT (message_id) DO NOTHING',
+      id,
+      at,
+    );
+  }
+}
+
+// Delivery may report a give-up again after a stop: the principal hears of each failed reply once.
 registerDeliveryFailedHook(async (failed, session) => {
-  const reply = failed.find(isPersonFacingPost);
-  if (reply && (await isPrincipalConversation(session))) await tellPrincipal('delivery-failed', session, reply);
+  const replies = failed.filter(isPersonFacingPost);
+  if (replies.length === 0 || !(await isPrincipalConversation(session))) return;
+  const fresh = await unreported(replies.map((reply) => reply.id));
+  const reply = replies.find((candidate) => fresh.has(candidate.id));
+  if (!reply) return;
+  await tellPrincipal('delivery-failed', session, reply);
+  await recordReported([...fresh]);
 });
 
 registerInboundFailedHook(async (failed, session) => {
