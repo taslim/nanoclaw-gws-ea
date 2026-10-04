@@ -1,27 +1,43 @@
+import { getAgentGroup } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { registerMigration } from '../../db/migrations/index.js';
+import { getSession } from '../../db/sessions.js';
+import { ALLOW, DENY, defineGuardedAction, guard, HOLD, type GuardActor } from '../../guard/index.js';
 import { registerRequiredProjectDocSection } from '../../project-doc-sections.js';
 import { registerResource } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
 import { register } from '../../cli/registry.js';
 import type { AgentGroup } from '../../types.js';
+import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
+// The inbox's store alone: its module entry points load external-email, whose
+// registrations must follow this module's.
+import { getInboxState } from '../gws-ea-inbox/db.js';
 import { rememberAuthenticatedUserDm } from '../permissions/user-dm.js';
 import {
   addPrincipalAddress,
   bindVerifiedPrincipalUser,
   getGwsEaProfile,
   getMainAgentGroupId,
+  isVerifiedPrincipalUser,
   listPrincipalAddresses,
+  principalApproverUserId,
+  projectDocAudience,
+  proposedPrincipalAddress,
   reconcileGwsEaProfile,
   removePrincipalAddress,
   validateGwsEaProfileInput,
 } from './db.js';
-import { gwsEaPrincipalAddressesMigration, gwsEaProfileMigration } from './migration.js';
+import {
+  gwsEaExternalEmailPointerMigration,
+  gwsEaPrincipalAddressesMigration,
+  gwsEaProfileMigration,
+} from './migration.js';
 import './wiring-policy.js';
 
 registerMigration(gwsEaProfileMigration);
 registerMigration(gwsEaPrincipalAddressesMigration);
+registerMigration(gwsEaExternalEmailPointerMigration);
 
 function escapeMarkdownInline(value: string): string {
   const special = new Set(['\\', '`', '*', '_', '{', '}', '[', ']', '<', '>', '#']);
@@ -52,23 +68,31 @@ function assistantAddressSentence(assistant: string, email: string | null): stri
  * it adds one.
  */
 export const MAIN_PRINCIPAL_ADDRESSES_POINTER =
-  " The principal's email addresses decide which calendars are theirs. Read them with `ncl principal-addresses list` before you decide whose a calendar is: the list is the only current copy, and an address may have been added or removed since you last read it.";
+  " The principal's email addresses decide which calendars are theirs. Read them with `ncl principal-addresses list` before you decide whose a calendar is: the list is the only current copy, and an address may have been added or removed since you last read it. Once the assistant has its own inbox, mail from these addresses carries the principal's authority, so a new one waits for the principal to confirm it on a card; the command says when it does, and you are told the result.";
 
+/**
+ * Who the assistant and the principal are, for each audience (KTD14). Main
+ * reads the principal's addresses live. `external-email` writes to people
+ * other than the principal, so it gets the two names and no address of
+ * either. Any other group gets the addresses as of its container's start:
+ * the default `group` CLI scope leaves the live list out of its reach.
+ */
 async function identitySection(group: AgentGroup): Promise<{ name: string; body: string } | undefined> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return undefined;
   const profile = await getGwsEaProfile();
   if (profile.assistant_display_name === null || profile.principal_display_name === null) return undefined;
   const assistant = escapeMarkdownInline(profile.assistant_display_name);
   const principal = escapeMarkdownInline(profile.principal_display_name);
-  // The default `group` CLI scope leaves the list out of reach of other groups,
-  // so they get the addresses as of their container's start.
+  const names = `${assistant} is the assistant. ${principal} is the principal. They are separate people: act and communicate as ${assistant}, support ${principal}, and never present the assistant as the principal.`;
+  const audience = await projectDocAudience(group.id);
+  if (audience === 'external-email') return { name: 'Assistant Identity', body: names };
   const addresses =
-    group.id === profile.main_agent_group_id
+    audience === 'main'
       ? MAIN_PRINCIPAL_ADDRESSES_POINTER
       : principalAddressesSentence(principal, profile.principal_emails);
   return {
     name: 'Assistant Identity',
-    body: `${assistant} is the assistant. ${principal} is the principal. They are separate people: act and communicate as ${assistant}, support ${principal}, and never present the assistant as the principal.${assistantAddressSentence(assistant, profile.assistant_workspace_email)}${addresses}`,
+    body: `${names}${assistantAddressSentence(assistant, profile.assistant_workspace_email)}${addresses}`,
   };
 }
 
@@ -191,6 +215,125 @@ function emailArgument(args: Record<string, unknown>): string {
   return email;
 }
 
+// ---------------------------------------------------------------------------
+// Adding an address: held for the principal's card once the inbox exists.
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether the assistant's inbox exists (`getInboxMessagingGroupId`). From
+ * then on, mail from a principal address authenticates as the principal and
+ * carries their authority, so a new address widens who speaks for them.
+ */
+async function inboxExists(): Promise<boolean> {
+  if (!(await getDb().hasTable('gws_ea_inbox_state'))) return false;
+  return (await getInboxState()).messaging_group_id !== null;
+}
+
+/** The `pending_approvals.action` an address card resolves through. */
+const ADD_ADDRESS_APPROVAL = 'principal_address_add';
+
+/** The card's payload, exactly as `requestApproval` stores it, so a grant binds to one address. */
+function addAddressPayload(email: string): { readonly email: string } {
+  return { email };
+}
+
+const addPrincipalAddressAction = defineGuardedAction({
+  action: 'profile.add_principal_address',
+  grantActionName: ADD_ADDRESS_APPROVAL,
+  grantCoversRequest: (grant, input) =>
+    typeof input.payload.email === 'string' && grant.payload === JSON.stringify(addAddressPayload(input.payload.email)),
+  decide: async ({ actor }) => {
+    if (actor.kind === 'host') return ALLOW('host caller (trusted socket)');
+    const mainAgentGroupId = await getMainAgentGroupId();
+    if (actor.kind !== 'agent' || mainAgentGroupId === null || actor.agentGroupId !== mainAgentGroupId) {
+      return DENY("Only main changes the principal's addresses, on the principal's word.");
+    }
+    if (!(await inboxExists())) return ALLOW('no inbox yet: an address decides only whose calendars are theirs');
+    const approver = await principalApproverUserId();
+    if (approver === undefined) return DENY('No verified principal can confirm a new address yet.');
+    return HOLD("mail from the principal's addresses carries their authority, so the principal confirms it", approver);
+  },
+});
+
+function actorOf(ctx: CallerContext): GuardActor {
+  return ctx.caller === 'host'
+    ? { kind: 'host' }
+    : { kind: 'agent', agentGroupId: ctx.agentGroupId, sessionId: ctx.sessionId };
+}
+
+async function requestAddAddressCard(ctx: CallerContext, email: string, approverUserId: string | undefined) {
+  if (ctx.caller !== 'agent' || approverUserId === undefined) {
+    throw new Error("Only an agent's new address is held for the principal");
+  }
+  const session = await getSession(ctx.sessionId);
+  if (!session) throw new Error('Session not found');
+  const agentName = (await getAgentGroup(ctx.agentGroupId))?.name ?? ctx.agentGroupId;
+  await requestApproval({
+    session,
+    agentName,
+    action: ADD_ADDRESS_APPROVAL,
+    payload: addAddressPayload(email),
+    title: 'Add one of your email addresses?',
+    question: `${agentName} asks to record ${email} as one of your email addresses. Mail the assistant receives from your addresses is treated as yours, with your authority, so approve only if this address is yours.`,
+    approverUserId,
+  });
+  return {
+    email,
+    status: 'awaiting-principal',
+    message:
+      'The principal was asked to confirm on a card, because mail from their addresses carries their authority. You will be told the result; until then the address is not theirs.',
+  } as const;
+}
+
+registerApprovalHandler(ADD_ADDRESS_APPROVAL, async ({ session, payload, approval, userId, notify }) => {
+  const email = typeof payload.email === 'string' ? payload.email : '';
+  // The card names its approver; this re-check holds even if the principal
+  // identity changed after the card went out.
+  if (!(await isVerifiedPrincipalUser(userId))) {
+    await notify(`${email} was not added: only the principal can confirm one of their addresses.`);
+    return;
+  }
+  const decision = await guard(addPrincipalAddressAction, {
+    actor: { kind: 'agent', agentGroupId: session.agent_group_id, sessionId: session.id },
+    payload: addAddressPayload(email),
+    grant: approval,
+  });
+  if (decision.effect !== 'allow') {
+    await notify(`${email} was not added: ${decision.reason}`);
+    return;
+  }
+  const { added } = await addPrincipalAddress(email);
+  await notify(
+    added
+      ? `The principal confirmed. ${email} is now one of their addresses.`
+      : `The principal confirmed. ${email} was already one of their addresses.`,
+  );
+});
+
+/**
+ * Add an address: directly for the operator, and for main until the inbox
+ * exists; after that, main's new address waits for the principal's card.
+ * One the profile already holds changes nothing, so it needs no card.
+ */
+async function addAddress(args: Record<string, unknown>, ctx: CallerContext) {
+  await assertMayChangePrincipalAddresses(ctx);
+  const { email, held } = await proposedPrincipalAddress(emailArgument(args));
+  if (held) return { email, added: false };
+  const decision = await guard(addPrincipalAddressAction, { actor: actorOf(ctx), payload: addAddressPayload(email) });
+  switch (decision.effect) {
+    case 'allow':
+      return addPrincipalAddress(email);
+    case 'hold':
+      return requestAddAddressCard(ctx, email, decision.approverUserId);
+    case 'deny':
+      throw new Error(decision.reason);
+    default: {
+      const unreachable: never = decision;
+      throw new Error(`Unknown guard decision: ${JSON.stringify(unreachable)}`);
+    }
+  }
+}
+
 const EMAIL_ARGUMENT = {
   name: 'email',
   type: 'string',
@@ -219,13 +362,10 @@ registerResource({
     add: {
       access: 'open',
       description:
-        "Add one of the principal's email addresses, when the principal says it is theirs. Adding one already held changes nothing.",
+        "Add one of the principal's email addresses, when the principal says it is theirs. Adding one already held changes nothing. Once the assistant has its own inbox, mail from these addresses carries the principal's authority, so a new one waits for the principal to confirm it on a card: the result says so, and you are told when they decide.",
       args: [EMAIL_ARGUMENT],
       examples: ['ncl principal-addresses add --email name@example.com'],
-      handler: async (args, ctx) => {
-        await assertMayChangePrincipalAddresses(ctx);
-        return addPrincipalAddress(emailArgument(args));
-      },
+      handler: addAddress,
     },
     remove: {
       access: 'open',

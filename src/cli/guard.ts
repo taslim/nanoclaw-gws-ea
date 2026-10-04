@@ -11,16 +11,71 @@
  *   cli_scope 'disabled' → deny; 'group' → resource allowlist, cross-group
  *   arg denial, cli_scope-change denial;
  *   access 'approval' for agent callers → hold for the group's admin chain.
+ * One registration seam on top: a protected agent group (registered by the
+ * module that owns it) is the host's alone, so any agent caller's command
+ * that names one is denied, whatever its CLI scope or an approval.
  *
  * Arg auto-fill, the sessions-get existence oracle, and post-handler row
  * filtering stay in dispatch.ts — mechanics, not policy.
  */
 import { getContainerConfig } from '../db/container-configs.js';
+import { getMessagingGroupAgent } from '../db/messaging-groups.js';
+import { getSession } from '../db/sessions.js';
 import { ALLOW, DENY, HOLD, type GuardedActionSpec, type GuardInput } from '../guard/index.js';
 import { GROUP_SCOPE_RESOURCES, type CommandDef } from './registry.js';
 
 const GROUP_WIRING_COMMANDS = new Set(['wirings-get', 'wirings-update']);
 const GROUP_WIRING_UPDATE_ARGS = new Set(['id', 'agent_group_id', 'group', 'help', 'engage_mode', 'engage_pattern']);
+
+/**
+ * Says why an agent group is the host's alone, or undefined when it is not.
+ * A module registers one for a group whose configuration and reach no agent
+ * may change, not even with an admin's approval.
+ */
+export type ProtectedGroupPolicy = (agentGroupId: string) => string | undefined | Promise<string | undefined>;
+
+const protectedGroupPolicies = new Map<string, ProtectedGroupPolicy>();
+const PROTECTED_GROUP_POLICY_ID = /^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/u;
+
+/**
+ * Register a protected-group policy. Every agent caller's `ncl` command that
+ * names a protected group is denied, and so is any self-modification request
+ * from one (src/modules/self-mod/guard.ts). The host caller is unaffected.
+ */
+export function registerProtectedGroupPolicy(id: string, policy: ProtectedGroupPolicy): void {
+  if (!PROTECTED_GROUP_POLICY_ID.test(id)) throw new Error(`Invalid protected group policy ID: ${id}`);
+  if (protectedGroupPolicies.has(id)) throw new Error(`Protected group policy already registered: ${id}`);
+  protectedGroupPolicies.set(id, policy);
+}
+
+/** Why `agentGroupId` is protected, or undefined when no registered policy protects it. */
+export async function protectedGroupReason(agentGroupId: string): Promise<string | undefined> {
+  for (const policy of protectedGroupPolicies.values()) {
+    const reason = await policy(agentGroupId);
+    if (reason !== undefined) return reason;
+  }
+  return undefined;
+}
+
+/**
+ * The agent groups a command names: its group arguments, `--id` where it is
+ * the group (groups, destinations) or names a row of one (a wiring, a
+ * session), and both ends of an agent message policy.
+ */
+async function namedGroups(cmd: CommandDef, args: Record<string, unknown>): Promise<string[]> {
+  const named = new Set<string>();
+  const add = (value: unknown): void => {
+    if (typeof value === 'string' && value.length > 0) named.add(value);
+  };
+  for (const key of ['agent_group_id', 'agent-group-id', 'group']) add(args[key]);
+  if (cmd.resource === 'policies') for (const key of ['from', 'to']) add(args[key]);
+  if (typeof args.id === 'string') {
+    if (cmd.resource === 'groups' || cmd.resource === 'destinations') add(args.id);
+    else if (cmd.resource === 'wirings') add((await getMessagingGroupAgent(args.id))?.agent_group_id);
+    else if (cmd.resource === 'sessions') add((await getSession(args.id))?.agent_group_id);
+  }
+  return [...named];
+}
 
 /** Dotted catalog action name for a command. */
 export function commandGuardAction(cmd: Pick<CommandDef, 'name' | 'action'>): string {
@@ -56,6 +111,13 @@ async function commandDecide(cmd: CommandDef, input: GuardInput) {
   // agent must never alter it — not even with admin approval.
   if (cmd.hostOnly) {
     return DENY(`"${cmd.name}" is operator-only and cannot be run from inside a container.`);
+  }
+
+  if (protectedGroupPolicies.size > 0) {
+    for (const agentGroupId of await namedGroups(cmd, input.payload)) {
+      const reason = await protectedGroupReason(agentGroupId);
+      if (reason !== undefined) return DENY(`"${cmd.name}" may not address agent group ${agentGroupId}: ${reason}`);
+    }
   }
 
   const args = input.payload;

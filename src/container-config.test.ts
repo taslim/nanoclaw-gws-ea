@@ -10,10 +10,12 @@ import fs from 'fs';
 import path from 'path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
-import { TIMEZONE } from './config.js';
+import { listCapabilityKeys } from './capabilities.js';
+import { DEFAULT_MODEL, FAST_MODE, TIMEZONE } from './config.js';
 import {
   CONTAINER_PLUGINS_DIR,
   configFromDb,
+  type ContainerConfig,
   parseMcpServerConfig,
   resolveGroupTimezone,
   sanitizeStoredMcpServers,
@@ -21,8 +23,14 @@ import {
 } from './container-config.js';
 import { createAgentGroup } from './db/agent-groups.js';
 import { closeDb, initTestDb } from './db/connection.js';
-import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
-import { runMigrations } from './db/migrations/index.js';
+import {
+  ensureContainerConfig,
+  getContainerConfig,
+  updateContainerConfigJson,
+  updateContainerConfigScalars,
+} from './db/container-configs.js';
+import { getRegisteredMigrations, runMigrations } from './db/migrations/index.js';
+import { capabilitiesMigration } from './modules/capabilities/migration.js';
 import type { AgentGroup } from './types.js';
 
 const GROUP: AgentGroup = {
@@ -265,5 +273,64 @@ describe('host/container validation parity', () => {
       expect(literal(host), name).toBeDefined();
       expect(literal(container), name).toBe(literal(host));
     }
+  });
+});
+
+describe('configFromDb capabilities', () => {
+  const SERVERS = { search: { command: 'search-mcp', args: [], env: {} } };
+
+  beforeEach(async () => {
+    await runMigrations(await initTestDb(), [...getRegisteredMigrations(), capabilitiesMigration]);
+    await createAgentGroup(GROUP);
+    await ensureContainerConfig(GROUP.id);
+    await updateContainerConfigJson(GROUP.id, 'mcp_servers', SERVERS);
+  });
+  afterEach(async () => {
+    await closeDb();
+  });
+
+  async function shipped(capabilities?: string): Promise<ContainerConfig> {
+    const row = (await getContainerConfig(GROUP.id))!;
+    return configFromDb(capabilities === undefined ? row : { ...row, capabilities }, GROUP);
+  }
+
+  it('ships an existing group every key, beside the fields it shipped before', async () => {
+    expect(await shipped()).toEqual({
+      mcpServers: SERVERS,
+      packages: { apt: [], npm: [] },
+      imageTag: undefined,
+      additionalMounts: [],
+      skills: 'all',
+      provider: undefined,
+      groupName: GROUP.name,
+      assistantName: GROUP.name,
+      agentGroupId: GROUP.id,
+      maxMessagesPerPrompt: undefined,
+      model: DEFAULT_MODEL || undefined,
+      effort: undefined,
+      ...(FAST_MODE ? { fastMode: true, speed: 'fast' } : {}),
+      timezone: undefined,
+      runtimeTier: undefined,
+      capabilities: listCapabilityKeys(),
+    });
+  });
+
+  it('treats a database without the capabilities column as all', async () => {
+    const { capabilities: _absent, ...row } = (await getContainerConfig(GROUP.id))!;
+    expect(configFromDb(row, GROUP).capabilities).toEqual(listCapabilityKeys());
+  });
+
+  it('ships a group exactly its list, and no configured MCP server without mcp-servers', async () => {
+    const config = await shipped('["time","reply"]');
+    expect(config.capabilities).toEqual(['reply', 'time']);
+    expect(config.mcpServers).toEqual({});
+
+    expect((await shipped('["reply","mcp-servers"]')).mcpServers).toEqual(SERVERS);
+  });
+
+  it('never grants an unknown stored key, and grants nothing for an unreadable value', async () => {
+    expect((await shipped('["reply","teleport"]')).capabilities).toEqual(['reply']);
+    expect((await shipped('{not json')).capabilities).toEqual([]);
+    expect((await shipped('"some"')).capabilities).toEqual([]);
   });
 });

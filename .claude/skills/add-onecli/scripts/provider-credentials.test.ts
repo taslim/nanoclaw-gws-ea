@@ -230,7 +230,7 @@ describe('OpenCode vault management', () => {
         'key-fixture',
         'existing-key',
       ),
-    ).rejects.toThrow('changed during setup');
+    ).rejects.toThrow('changed since it was looked up');
     expect(transport).toHaveBeenCalledTimes(1);
   });
 
@@ -315,7 +315,7 @@ describe('OpenCode credential host migration', () => {
     else if (change === 'host') current.hostPattern = 'another.example';
     else current.scope = 'organization';
     await expect(vault.save('replacement-fixture', id)).rejects.toThrow(
-      change === 'identity' ? 'changed during setup' : 'unexpected metadata',
+      change === 'identity' ? 'changed since it was looked up' : 'unexpected metadata',
     );
     expect(transport).toHaveBeenCalledTimes(2);
   });
@@ -388,7 +388,7 @@ describe('gateway seam adapter', () => {
     );
     const connection = createProviderCredentialConnection(key());
     expect(await connection.find()).toBeNull();
-    await expect(connection.keep()).rejects.toThrow('No stored OpenCode credential');
+    await expect(connection.keep()).rejects.toThrow(`No stored ${google.name} credential`);
     await connection.save('google-fixture');
     expect(writes).toEqual([expect.objectContaining({ name: google.name, type: 'generic', value: 'google-fixture' })]);
   });

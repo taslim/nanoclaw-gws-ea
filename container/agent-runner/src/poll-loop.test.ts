@@ -447,34 +447,38 @@ it('does not push accumulated-only follow-ups into an active query', async () =>
   expect(getPendingMessages().map((m) => m.id)).toEqual(['m1']);
 });
 
+/** The failed turn as the runner reports it to the host: a typed action carrying the turn's route. */
+const TURN_FAILED = { action: 'turn_failed', channelType: 'discord', platformId: 'chan-1', threadId: null };
+
+/** Each queued row as the host reads it: a chat row's text, or a system action's payload. */
+function outbound(): unknown[] {
+  return getUndeliveredMessages().map((row) =>
+    row.kind === 'chat' ? (JSON.parse(row.content) as { text: string }).text : (JSON.parse(row.content) as unknown),
+  );
+}
+
 describe('error result with no <message> envelope', () => {
-  it('delivers a safe failure notice to the triggering channel and does not nudge', async () => {
+  it('reports the failed turn to the host, writes nothing for the channel, and does not nudge', async () => {
     const budgetText = 'Spending limit reached. Add your own key at https://example.com/keys';
     const { query, pushes } = makeResultQuery({ type: 'result', text: budgetText, isError: true });
 
     await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
 
     const out = getUndeliveredMessages();
-    expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0].content).text).toBe(
-      "Something went wrong on my side and I couldn't finish that. Please send it again.",
-    );
-    expect(out[0].platform_id).toBe('chan-1');
-    expect(out[0].channel_type).toBe('discord');
+    expect(out.map((row) => row.kind)).toEqual(['system']);
+    expect(JSON.parse(out[0].content)).toEqual(TURN_FAILED);
     // No re-wrap nudge — an error result must not re-hammer the gateway.
     expect(pushes).toHaveLength(0);
   });
 
-  it("sends the fixed sentence in place of the provider's error, which goes only to the log", async () => {
+  it("reports the failed turn in place of the provider's error, which goes only to the log", async () => {
     const providerError = '403 billing_error: Spending limit reached. Update your billing settings to continue.';
     const { query, pushes } = makeResultQuery({ type: 'result', text: '', error: providerError, isError: true });
     const logged = spyOn(console, 'error').mockImplementation(() => {});
     try {
       await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
 
-      expect(getUndeliveredMessages().map((row) => row.content)).toEqual([
-        JSON.stringify({ text: "Something went wrong on my side and I couldn't finish that. Please send it again." }),
-      ]);
+      expect(getUndeliveredMessages().map((row) => row.content)).toEqual([JSON.stringify(TURN_FAILED)]);
       expect(logged.mock.calls.map(([line]) => String(line)).some((line) => line.includes(providerError))).toBe(true);
       expect(pushes).toHaveLength(0);
     } finally {
@@ -490,9 +494,7 @@ describe('error result with no <message> envelope', () => {
     const { query, pushes } = makeResultQuery({ type: 'result', text, isError: true });
     const exchanges: ProviderExchange[] = [];
     await processQuery(query, ERR_ROUTING, ['m1'], 'mock', (exchange) => exchanges.push(exchange), 'prompt', undefined);
-    expect(getUndeliveredMessages().map((row) => JSON.parse(row.content).text)).toEqual([
-      "Something went wrong on my side and I couldn't finish that. Please send it again.",
-    ]);
+    expect(getUndeliveredMessages().map((row) => row.content)).toEqual([JSON.stringify(TURN_FAILED)]);
     expect(exchanges).toHaveLength(1);
     expect(exchanges[0].status).toBe('error');
     expect(exchanges[0].result).toBe(text);
@@ -526,10 +528,7 @@ it('delivers completed wrapped text while recording the failed turn exactly once
 
   await processQuery(query, ERR_ROUTING, ['m1'], 'mock', (exchange) => exchanges.push(exchange), 'prompt', undefined);
 
-  expect(getUndeliveredMessages().map((row) => JSON.parse(row.content).text)).toEqual([
-    'Completed before failure.',
-    "Something went wrong on my side and I couldn't finish that. Please send it again.",
-  ]);
+  expect(outbound()).toEqual(['Completed before failure.', TURN_FAILED]);
   expect(exchanges).toEqual([{ prompt: 'prompt', result: text, continuation: 'sess-1', status: 'error' }]);
   expect(pushes).toHaveLength(0);
 });

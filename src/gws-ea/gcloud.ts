@@ -46,7 +46,11 @@ const PROJECT_LABEL_INSTANCE = 'gws-ea-instance';
 const PROJECT_LABEL_MANAGED = 'gws-ea-managed';
 const REQUIRED_APIS = ['chat.googleapis.com', 'iam.googleapis.com', 'orgpolicy.googleapis.com'] as const;
 /** The Workspace APIs the assistant's own Google sign-in calls (KTD2); enabled by the Google connection. */
-export const GOOGLE_WORKSPACE_APIS = ['calendar-json.googleapis.com', 'gmail.googleapis.com'] as const;
+export const GOOGLE_WORKSPACE_APIS = [
+  'calendar-json.googleapis.com',
+  'gmail.googleapis.com',
+  'people.googleapis.com',
+] as const;
 /** The legacy and managed constraints that can block service-account key creation. */
 const KEY_CREATION_CONSTRAINTS = [
   'iam.disableServiceAccountKeyCreation',

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "gws-ea-external-email",
+  "version": "1.0.0",
+  "description": "The GWS-EA agent that writes every email to someone other than the principal.",
+  "extensions": {
+    "ai.nanoco.nanoclaw": {
+      "agentName": "external-email"
+    }
+  }
+}

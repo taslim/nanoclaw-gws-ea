@@ -31,6 +31,7 @@ vi.mock('./modules/mount-security/index.js', () => ({
   ),
 }));
 
+import { resolveCapabilities } from './capabilities.js';
 import { buildMounts, resolveProviderContribution } from './container-runner.js';
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from './db/index.js';
 import { ensureContainerConfig } from './db/container-configs.js';
@@ -131,7 +132,13 @@ function session(id: string, agentGroupId: string): Session {
 }
 
 function containerConfig(): ContainerConfig {
-  return { mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: [] };
+  return {
+    mcpServers: {},
+    packages: { apt: [], npm: [] },
+    additionalMounts: [],
+    skills: [],
+    capabilities: resolveCapabilities('all', 'surfaces-test'),
+  };
 }
 
 beforeEach(async () => {

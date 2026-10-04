@@ -11,10 +11,25 @@ import { lookup } from '../../cli/registry.js';
 import { composeGroupProjectDoc } from '../../project-doc-compose.js';
 import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
 import type { AgentGroup, User } from '../../types.js';
-import { bindVerifiedPrincipalUser, getGwsEaProfile, listVerifiedPrincipalUsers, reconcileGwsEaProfile } from './db.js';
+import { registerMigration } from '../../db/migrations/index.js';
+import { addPerson, getPerson, updatePerson } from '../gws-ea-people/db.js';
+import { gwsEaPeopleMigration } from '../gws-ea-people/migration.js';
+import {
+  bindVerifiedPrincipalUser,
+  getExternalEmailAgentGroupId,
+  getGwsEaProfile,
+  listVerifiedPrincipalUsers,
+  projectDocAudience,
+  reconcileGwsEaProfile,
+  recordExternalEmailAgentGroupId,
+} from './db.js';
 import { MAIN_PRINCIPAL_ADDRESSES_POINTER } from './index.js';
 
 const TEST_ROOT = '/tmp/nanoclaw-gws-ea-profile-test';
+
+// The people store's tables alone, so an address made the principal's can be
+// seen leaving a person's record; its document section stays out of these tests.
+registerMigration(gwsEaPeopleMigration);
 
 function group(id: string, name = 'main'): AgentGroup {
   return { id, name, folder: id, agent_provider: null, created_at: '2026-09-18T00:00:00.000Z' };
@@ -52,6 +67,7 @@ describe('GWS-EA profile module', () => {
       principal_display_name: null,
       principal_timezone: null,
       main_agent_group_id: null,
+      external_email_agent_group_id: null,
       updated_at: null,
       principal_emails: [],
     });
@@ -365,6 +381,36 @@ describe("the principal's email addresses", () => {
     ]);
   });
 
+  it("releases a person's identity that matches an address made the principal's, and keeps the person", async () => {
+    const sam = await addPerson({
+      name: 'Sam O',
+      level: 'known',
+      source: 'learned',
+      basis: 'On two invitations.',
+      identity: 'email:sam.o@gmail.com',
+      identitySource: 'calendar',
+    });
+    await updatePerson({ id: sam.id, source: 'principal', addIdentity: 'email:sam@shared.example.test' });
+
+    expect(await run('principal-addresses-add', { email: 'SamO+home@gmail.com' }, agent(main.id))).toMatchObject({
+      ok: true,
+      data: { email: 'samo+home@gmail.com', added: true },
+    });
+    expect((await getPerson(sam.id))?.identities.map((identity) => identity.handle)).toEqual([
+      'email:sam@shared.example.test',
+    ]);
+
+    await reconcileGwsEaProfile({
+      assistantDisplayName: 'Aya',
+      assistantWorkspaceEmail: 'aya@example.test',
+      principalDisplayName: 'Taslim',
+      principalTimezone: 'Africa/Lagos',
+      mainAgentGroupId: main.id,
+      principalEmails: ['taslim@example.test', 'sam@shared.example.test'],
+    });
+    expect(await getPerson(sam.id)).toMatchObject({ name: 'Sam O', identities: [] });
+  });
+
   it('refuses to add a malformed address or the assistant’s own', async () => {
     for (const email of ['not-an-email', 'AYA@example.test']) {
       expect(await run('principal-addresses-add', { email }), email).toMatchObject({ ok: false });
@@ -453,5 +499,54 @@ describe("the principal's email addresses", () => {
   it("names the assistant's own Google address, so the principal knows where to share calendars", async () => {
     const [section] = await getRequiredProjectDocSections(main);
     expect(section?.body).toContain("Aya's own Google Workspace address is `aya@example.test`.");
+  });
+});
+
+describe("external-email's pointer and audience", () => {
+  const main = group('ag-main');
+  const research = group('ag-research', 'research');
+  const ee = group('ag-external-email', 'external-email');
+
+  beforeEach(async () => {
+    for (const candidate of [main, research, ee]) await createGroup(candidate);
+    await reconcileGwsEaProfile({
+      assistantDisplayName: 'Aya',
+      assistantWorkspaceEmail: 'aya@example.test',
+      principalDisplayName: 'Taslim',
+      principalTimezone: 'Africa/Lagos',
+      mainAgentGroupId: main.id,
+      principalEmails: ['taslim@example.test'],
+    });
+  });
+
+  it('records the pointer beside main, once, and never moves it', async () => {
+    expect(await getExternalEmailAgentGroupId()).toBeNull();
+    await expect(recordExternalEmailAgentGroupId('ag-missing')).rejects.toThrow(/FOREIGN KEY/i);
+    expect(await getExternalEmailAgentGroupId()).toBeNull();
+    await recordExternalEmailAgentGroupId(ee.id);
+    await recordExternalEmailAgentGroupId(ee.id);
+
+    expect(await getGwsEaProfile()).toMatchObject({
+      main_agent_group_id: main.id,
+      external_email_agent_group_id: ee.id,
+    });
+    await expect(recordExternalEmailAgentGroupId(research.id)).rejects.toThrow(/already bound/);
+  });
+
+  it('writes each document for its audience: external-email gets the two names and no address', async () => {
+    await recordExternalEmailAgentGroupId(ee.id);
+
+    expect(await projectDocAudience(main.id)).toBe('main');
+    expect(await projectDocAudience(ee.id)).toBe('external-email');
+    expect(await projectDocAudience(research.id)).toBe('other');
+
+    const [section] = await getRequiredProjectDocSections(ee);
+    expect(section).toEqual({
+      name: 'Assistant Identity',
+      body: 'Aya is the assistant. Taslim is the principal. They are separate people: act and communicate as Aya, support Taslim, and never present the assistant as the principal.',
+    });
+    const [other] = await getRequiredProjectDocSections(research);
+    expect(other?.body).toContain('`taslim@example.test`');
+    expect(other?.body).toContain('`aya@example.test`');
   });
 });

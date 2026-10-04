@@ -39,13 +39,6 @@ const ACTIVE_POLL_INTERVAL_MS = 500;
 /** Consecutive driver-classified failures before a fresh runner is required. */
 const MAILBOX_FAILURE_STREAK_EXIT = 10;
 
-/**
- * The one plain sentence the principal sees when a run fails. The host sends
- * the same sentence for its own failure paths (src/delivery.ts); the two
- * runtimes share no modules, so the text is written in both places.
- */
-const FAILURE_NOTICE_TEXT = "Something went wrong on my side and I couldn't finish that. Please send it again.";
-
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
 }
@@ -641,12 +634,12 @@ export async function processQuery(
           const archivedResult = [resultText, failed ? event.error : undefined].filter(Boolean).join('\n');
           if (routing.taskRun && !taskBlockNudged) await autoAppendTaskLog(archivedResult);
           if (failed && !routing.taskRun) {
-            // A failed turn needs a visible notice even after a partial reply.
-            // The provider's error, unwrapped model output, and raw
-            // diagnostics are private: the error goes to the log, which the
-            // host records, and the channel gets the fixed sentence.
+            // A failed turn is reported even after a partial reply. The
+            // provider's error, unwrapped model output, and raw diagnostics
+            // are private: the error goes to the log, which the host records,
+            // and the host decides who hears that the turn failed.
             if (event.error) log(`Provider error: ${event.error}`);
-            await deliverFailureNotice(routing);
+            await reportTurnFailed(routing);
           }
           // An unwrapped final text only warrants the wrap-nudge when NOTHING
           // was delivered this turn — hasUnwrapped already folds in the
@@ -713,7 +706,7 @@ export async function processQuery(
       // Completed turns are no longer answering or queued. Preserve partial
       // output from unfinished turns and report that the run did not finish.
       // Retrying the same route or several queued turns in one thread needs
-      // only one notice. Task and agent wakes have no human chat endpoint.
+      // only one report. Task and agent wakes have no human chat endpoint.
       const failedRoutes = [...(answering ? [routing] : []), ...queuedTurns.map((turn) => turn.routing)];
       const noticed: RoutingContext[] = [];
       for (const target of failedRoutes) {
@@ -729,16 +722,16 @@ export async function processQuery(
           continue;
         noticed.push(target);
         try {
-          await deliverFailureNotice(target);
-        } catch (noticeError) {
+          await reportTurnFailed(target);
+        } catch (reportError) {
           log(
-            `Failed to deliver query error notice: ${noticeError instanceof Error ? noticeError.message : String(noticeError)}`,
+            `Failed to report the failed turn: ${reportError instanceof Error ? reportError.message : String(reportError)}`,
           );
         }
       }
     }
     // Continuation recovery receives the original error; diagnostics remain
-    // in the exchange archive and runner log, never in the channel notice.
+    // in the exchange archive and runner log, never in the failure report.
     throw err;
   } finally {
     done = true;
@@ -779,17 +772,22 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
   }
 }
 
-/** Tell the conversation, in the one fixed sentence, that the run failed. */
-async function deliverFailureNotice(routing: RoutingContext): Promise<void> {
-  log('Failed run — delivering the failure notice to the channel');
+/**
+ * Report a failed turn to the host as a typed `turn_failed` system action
+ * carrying the turn's route. The host decides who hears about it and in what
+ * words; nothing is written for the conversation itself.
+ */
+async function reportTurnFailed(routing: RoutingContext): Promise<void> {
+  log('Failed run — reporting turn_failed to the host');
   await writeMessageOut({
     id: generateId(),
-    in_reply_to: routing.inReplyTo,
-    kind: 'chat',
-    platform_id: routing.platformId,
-    channel_type: routing.channelType,
-    thread_id: routing.threadId,
-    content: JSON.stringify({ text: FAILURE_NOTICE_TEXT }),
+    kind: 'system',
+    content: JSON.stringify({
+      action: 'turn_failed',
+      channelType: routing.channelType,
+      platformId: routing.platformId,
+      threadId: routing.threadId,
+    }),
   });
 }
 

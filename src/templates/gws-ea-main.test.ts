@@ -39,6 +39,8 @@ const REQUIRED_WELCOME_CONTRACT = [
   'two or three concrete things',
   'End on that question rather than "How can I help?"',
   'Follow the Executive Assistant section throughout.',
+  'scheduling preferences and their people',
+  'settle two overlapping meetings by moving one of them with the people in it',
 ];
 const EXPECTED_FILES = ['README.md', 'plugin.json', 'skills/welcome/SKILL.md'];
 

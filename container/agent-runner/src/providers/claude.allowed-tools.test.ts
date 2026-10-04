@@ -11,6 +11,10 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   },
 }));
 
+// The group holds `mcp-servers`, so its configured server stays reachable.
+const actualConfig = await import('../config.js');
+mock.module('../config.js', () => ({ ...actualConfig, runnerCapabilities: () => new Set(['reply', 'mcp-servers']) }));
+
 const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
 await import('./index.js');
 await import('../provider-contracts/index.js');

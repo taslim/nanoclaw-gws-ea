@@ -51,7 +51,9 @@ describe('agent mailbox registry', () => {
     const read = (relative: string) => Bun.file(new URL(relative, import.meta.url)).text();
     expect(await read('../modules/index.ts')).toContain("import '../mailbox/compose.js';");
     expect(await read('../index.ts')).toContain("import './modules/index.js';");
-    expect(await read('../mcp-tools/index.ts')).toContain("import '../modules/index.js';");
+    // The tool barrel loads the module barrel after its capability-keyed tool modules, so the
+    // import is dynamic there.
+    expect(await read('../mcp-tools/index.ts')).toContain("await import('../modules/index.js');");
     expect(await read('../cli/ncl.ts')).toContain("import '../modules/index.js';");
     expect(await read('../../bunfig.toml')).toContain('preload = ["./src/modules/index.ts"]');
   });

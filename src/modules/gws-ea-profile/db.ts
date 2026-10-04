@@ -1,6 +1,10 @@
+import type { CallerContext } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
+import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { EMAIL_PATTERN, hasControlCharacters, normalizePrincipalEmail } from '../../gws-ea/validation.js';
 import { isValidTimezone } from '../../timezone.js';
+import type { MessagingGroup } from '../../types.js';
+import { removeMatchingIdentities } from '../gws-ea-people/db.js';
 
 export interface GwsEaProfile {
   readonly assistant_display_name: string | null;
@@ -8,10 +12,19 @@ export interface GwsEaProfile {
   readonly principal_display_name: string | null;
   readonly principal_timezone: string | null;
   readonly main_agent_group_id: string | null;
+  /** The agent group the host created for `external-email`, or null until it has. */
+  readonly external_email_agent_group_id: string | null;
   readonly updated_at: string | null;
   /** The principal's email addresses, sorted. */
   readonly principal_emails: readonly string[];
 }
+
+/**
+ * Who a project document is written for (KTD14): `main` reads live pointers,
+ * `external-email` gets nothing but names and its guidance, and any other
+ * group what its capabilities allow.
+ */
+export type ProjectDocAudience = 'main' | 'external-email' | 'other';
 
 export interface ReconcileGwsEaProfileInput {
   readonly assistantDisplayName: string;
@@ -103,15 +116,79 @@ export async function getMainAgentGroupId(): Promise<string | null> {
   return row?.main_agent_group_id ?? null;
 }
 
+/**
+ * Refuse every caller but the host and the canonical main. A resource's
+ * guard admits any agent whose CLI scope reaches it, so a resource that is
+ * main's alone checks here; `resource` names it in the refusal.
+ */
+export async function assertMainCaller(ctx: CallerContext, resource: string): Promise<void> {
+  if (ctx.caller === 'host') return;
+  const mainAgentGroupId = await getMainAgentGroupId();
+  if (mainAgentGroupId === null || ctx.agentGroupId !== mainAgentGroupId) {
+    throw new Error(`The principal's ${resource} are available only to main`);
+  }
+}
+
+/** `external-email`'s agent group, or null until the host creates it. */
+export async function getExternalEmailAgentGroupId(): Promise<string | null> {
+  const row = await getDb().get<{ external_email_agent_group_id: string | null }>(
+    'SELECT external_email_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
+  );
+  return row?.external_email_agent_group_id ?? null;
+}
+
+/**
+ * Record the agent group the host created for `external-email`. Recording the
+ * same group again changes nothing; the pointer never moves to another one.
+ */
+export async function recordExternalEmailAgentGroupId(agentGroupId: string): Promise<void> {
+  identifier(agentGroupId, 'external-email agent group ID');
+  const db = getDb();
+  await db.transaction(async () => {
+    const current = await getExternalEmailAgentGroupId();
+    if (current === agentGroupId) return;
+    if (current !== null) throw new Error(`external-email is already bound to ${current}`);
+    await db.run('UPDATE gws_ea_profile SET external_email_agent_group_id = ? WHERE singleton = 1', agentGroupId);
+  });
+}
+
+/** Whom `agentGroupId`'s project document is written for. Without a profile every group is `other`. */
+export async function projectDocAudience(agentGroupId: string): Promise<ProjectDocAudience> {
+  if (!(await getDb().hasTable('gws_ea_profile'))) return 'other';
+  const row = await getDb().get<{ main_agent_group_id: string | null; external_email_agent_group_id: string | null }>(
+    'SELECT main_agent_group_id, external_email_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
+  );
+  if (row?.main_agent_group_id === agentGroupId) return 'main';
+  if (row?.external_email_agent_group_id === agentGroupId) return 'external-email';
+  return 'other';
+}
+
 export async function getGwsEaProfile(): Promise<GwsEaProfile> {
   const profile = await getDb().get<Omit<GwsEaProfile, 'principal_emails'>>(
     `SELECT assistant_display_name, assistant_workspace_email, principal_display_name,
-            principal_timezone, main_agent_group_id, updated_at
+            principal_timezone, main_agent_group_id, external_email_agent_group_id, updated_at
        FROM gws_ea_profile
       WHERE singleton = 1`,
   );
   if (!profile) throw new Error('GWS-EA profile singleton is missing');
   return { ...profile, principal_emails: (await listPrincipalAddresses()).map((address) => address.email) };
+}
+
+/**
+ * Hold `email` as one of the principal's addresses; holding it already
+ * changes nothing. What is the principal's is no person's (KTD8), so a
+ * person identity matching the address in any spelling leaves its record in
+ * the same transaction. True when the address is new.
+ */
+async function holdPrincipalAddress(email: string, addedAt: string): Promise<boolean> {
+  const db = getDb();
+  const result = await db.run(
+    'INSERT INTO gws_ea_principal_addresses (email, added_at) VALUES (?, ?) ON CONFLICT(email) DO NOTHING',
+    email,
+    addedAt,
+  );
+  await removeMatchingIdentities(`email:${email}`);
+  return result.changes > 0;
 }
 
 /** Make the profile hold exactly `emails`, keeping when each one it already held was added. */
@@ -121,13 +198,7 @@ async function replacePrincipalAddresses(emails: readonly string[], addedAt: str
   for (const { email } of await listPrincipalAddresses()) {
     if (!wanted.has(email)) await db.run('DELETE FROM gws_ea_principal_addresses WHERE email = ?', email);
   }
-  for (const email of emails) {
-    await db.run(
-      'INSERT INTO gws_ea_principal_addresses (email, added_at) VALUES (?, ?) ON CONFLICT(email) DO NOTHING',
-      email,
-      addedAt,
-    );
-  }
+  for (const email of emails) await holdPrincipalAddress(email, addedAt);
 }
 
 export async function reconcileGwsEaProfile(input: ReconcileGwsEaProfileInput): Promise<GwsEaProfile> {
@@ -172,18 +243,70 @@ async function assistantWorkspaceEmail(): Promise<string | null> {
   return profile?.assistant_workspace_email ?? null;
 }
 
+/**
+ * `value` as the profile would hold it, refused when it is malformed or the
+ * assistant's own address; `held` says whether the profile holds it already.
+ */
+export async function proposedPrincipalAddress(
+  value: string,
+): Promise<{ readonly email: string; readonly held: boolean }> {
+  const email = principalEmail(value);
+  assertNotAssistant(email, await assistantWorkspaceEmail());
+  const row = await getDb().get<{ present: number }>(
+    'SELECT 1 AS present FROM gws_ea_principal_addresses WHERE email = ?',
+    email,
+  );
+  return { email, held: row !== undefined };
+}
+
+/** A verified principal identity and its direct message with the assistant. */
+export interface PrincipalContact {
+  readonly userId: string;
+  readonly directMessage: MessagingGroup;
+}
+
+/**
+ * Where the principal is reached: the most recently verified principal
+ * identity whose direct message the assistant is still in. While every such
+ * message is detached, the most recent one, so a note for main keeps its
+ * route; whoever sends to it checks `detached_at` first. Undefined until a
+ * principal is bound with a direct message.
+ */
+export async function principalContact(): Promise<PrincipalContact | undefined> {
+  const db = getDb();
+  if (!(await db.hasTable('gws_ea_principal_users'))) return undefined;
+  const row = await db.get<{ user_id: string; messaging_group_id: string }>(
+    `SELECT principal.user_id, dm.messaging_group_id
+       FROM gws_ea_principal_users principal
+       JOIN user_dms dm ON dm.user_id = principal.user_id
+       JOIN messaging_groups direct ON direct.id = dm.messaging_group_id
+      ORDER BY CASE WHEN direct.detached_at IS NULL OR direct.detached_at = '' THEN 0 ELSE 1 END,
+               principal.verified_at DESC, dm.resolved_at DESC
+      LIMIT 1`,
+  );
+  if (!row) return undefined;
+  const directMessage = await getMessagingGroup(row.messaging_group_id);
+  return directMessage ? { userId: row.user_id, directMessage } : undefined;
+}
+
+/**
+ * The verified principal user who confirms a change on a card: the one
+ * `principalContact` names, while the card can reach their direct message.
+ * Undefined until a principal is bound, or while every direct message of
+ * theirs is detached.
+ */
+export async function principalApproverUserId(): Promise<string | undefined> {
+  const contact = await principalContact();
+  return contact && !contact.directMessage.detached_at ? contact.userId : undefined;
+}
+
 /** Add one of the principal's addresses; adding one the profile already holds changes nothing. */
 export async function addPrincipalAddress(value: string): Promise<{ readonly email: string; readonly added: boolean }> {
   const email = principalEmail(value);
   const db = getDb();
   return db.transaction(async () => {
     assertNotAssistant(email, await assistantWorkspaceEmail());
-    const result = await db.run(
-      'INSERT INTO gws_ea_principal_addresses (email, added_at) VALUES (?, ?) ON CONFLICT(email) DO NOTHING',
-      email,
-      new Date().toISOString(),
-    );
-    return { email, added: result.changes > 0 };
+    return { email, added: await holdPrincipalAddress(email, new Date().toISOString()) };
   });
 }
 

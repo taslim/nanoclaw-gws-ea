@@ -47,10 +47,8 @@ afterEach(() => {
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-const FAILURE_NOTICE = "Something went wrong on my side and I couldn't finish that. Please send it again.";
-
 it.each([false, true])(
-  'answers a Claude SDK billing error with the fixed sentence once, with prior reply=%s',
+  'reports a Claude SDK billing error to the host once, with prior reply=%s',
   async (partialReply) => {
     sdkMessages.push({ type: 'system', subtype: 'init', session_id: 'billing-session' });
     if (partialReply) {
@@ -78,10 +76,11 @@ it.each([false, true])(
       claudeRuntimeContract.textDelivery === 'mid-turn-complete',
     );
 
-    // The billing error stays in the exchange archive and the log; the chat gets the fixed sentence.
-    expect(getUndeliveredMessages().map((row) => JSON.parse(row.content).text)).toEqual([
-      ...(partialReply ? ['Finished the first step.'] : []),
-      FAILURE_NOTICE,
+    // The billing error stays in the exchange archive and the log; the host hears a typed report and
+    // decides who is told, so nothing is written to the chat.
+    expect(getUndeliveredMessages().map((row) => JSON.parse(row.content))).toEqual([
+      ...(partialReply ? [{ text: 'Finished the first step.' }] : []),
+      { action: 'turn_failed', channelType: 'discord', platformId: 'chan-1', threadId: null },
     ]);
     expect(exchanges).toEqual([
       { prompt: 'continue', result: BILLING_ERROR, continuation: 'billing-session', status: 'error' },

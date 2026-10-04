@@ -281,8 +281,28 @@ async function validateComposition(
     'src/provider-credential.ts',
     'templates/gws-ea/main/plugin.json',
     'templates/gws-ea/main/skills/welcome/SKILL.md',
+    'templates/gws-ea/external-email/plugin.json',
+    'src/modules/gws-ea-external-email/index.ts',
+    'src/modules/gws-ea-external-email/group.ts',
+    'src/modules/gws-ea-external-email/destination-policy.ts',
+    'src/modules/gws-ea-external-email/guidance.md',
+    'src/modules/gws-ea-inbox/index.ts',
+    'src/modules/gws-ea-inbox/migration.ts',
+    'src/modules/gws-ea-meetings/index.ts',
+    'src/modules/gws-ea-meetings/migration.ts',
+    'container/agent-runner/src/action-request.ts',
+    'container/agent-runner/src/mcp-tools/gws-ea-meetings.ts',
+    'container/agent-runner/src/mcp-tools/gws-ea-meetings.instructions.md',
+    'container/agent-runner/src/mcp-tools/gws-ea-meetings-external.instructions.md',
+    'container/agent-runner/src/mcp-tools/files-send.instructions.md',
+    'container/agent-runner/src/mcp-tools/connect.instructions.md',
+    'container/agent-runner/src/mcp-tools/memory.instructions.md',
+    'container/agent-runner/src/memory/sealed.ts',
     'container/skills/gcalendar/SKILL.md',
     'container/skills/gcalendar/instructions.md',
+    'container/skills/gmail/SKILL.md',
+    'container/skills/gpeople/SKILL.md',
+    'src/container-env.ts',
     'src/channels/gchat.ts',
     'src/channels/index.ts',
     'src/gws-ea/process.ts',
@@ -295,6 +315,13 @@ async function validateComposition(
     'src/modules/gws-ea-profile/migration.ts',
     'src/modules/gws-ea-preferences/index.ts',
     'src/modules/gws-ea-preferences/migration.ts',
+    'src/modules/gws-ea-people/index.ts',
+    'src/modules/gws-ea-people/migration.ts',
+    'src/modules/gws-ea-notices/index.ts',
+    'src/modules/gws-ea-privacy/index.ts',
+    'src/modules/gws-ea-privacy/migration.ts',
+    'src/modules/capabilities/index.ts',
+    'src/modules/capabilities/migration.ts',
     'src/modules/index.ts',
   ];
   const gatewayFiles = [
@@ -302,6 +329,7 @@ async function validateComposition(
     'src/gateway-providers/installed.ts',
     'src/gateway-providers/onecli.ts',
     'src/gateway-providers/onecli-files.ts',
+    'src/gateway-providers/onecli-credentials.ts',
     'container/skills/onecli-gateway/SKILL.md',
     'container/skills/onecli-gateway/instructions.md',
   ];
@@ -329,6 +357,13 @@ async function validateComposition(
       { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-main/index', code: 'incomplete_release' },
       { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-profile/index', code: 'incomplete_release' },
       { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-preferences/index', code: 'incomplete_release' },
+      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-people/index', code: 'incomplete_release' },
+      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-notices/index', code: 'incomplete_release' },
+      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-privacy/index', code: 'incomplete_release' },
+      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-external-email/index', code: 'incomplete_release' },
+      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-inbox/index', code: 'incomplete_release' },
+      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-meetings/index', code: 'incomplete_release' },
+      { barrel: 'src/modules/index.ts', moduleName: 'capabilities/index', code: 'incomplete_release' },
       { barrel: 'src/gateway-providers/index.ts', moduleName: 'installed', code: 'gateway_not_composed' },
       { barrel: 'src/gateway-providers/installed.ts', moduleName: 'onecli', code: 'gateway_not_composed' },
       ...[
@@ -356,11 +391,18 @@ async function validateComposition(
     throw error;
   }
 
-  const template = await readJson(path.join(checkoutRoot, 'templates/gws-ea/main/plugin.json'), 'gws-ea/main template');
-  const extensions = requireRecord(template.extensions, 'gws-ea/main extensions', INCOMPLETE);
-  const nanoclaw = requireRecord(extensions['ai.nanoco.nanoclaw'], 'gws-ea/main NanoClaw extension', INCOMPLETE);
-  if (template.name !== 'gws-ea-main' || nanoclaw.agentName !== 'main') {
-    throw new GwsEaError('incomplete_release', 'Committed gws-ea/main template is not the canonical main assistant');
+  await assertProductTemplate(checkoutRoot, 'main');
+  await assertProductTemplate(checkoutRoot, 'external-email');
+}
+
+/** A product agent's committed template must stamp exactly that agent. */
+async function assertProductTemplate(checkoutRoot: string, agentName: 'main' | 'external-email'): Promise<void> {
+  const label = `gws-ea/${agentName}`;
+  const template = await readJson(path.join(checkoutRoot, `templates/${label}/plugin.json`), `${label} template`);
+  const extensions = requireRecord(template.extensions, `${label} extensions`, INCOMPLETE);
+  const nanoclaw = requireRecord(extensions['ai.nanoco.nanoclaw'], `${label} NanoClaw extension`, INCOMPLETE);
+  if (template.name !== `gws-ea-${agentName}` || nanoclaw.agentName !== agentName) {
+    throw new GwsEaError('incomplete_release', `Committed ${label} template is not the canonical ${agentName} agent`);
   }
 }
 

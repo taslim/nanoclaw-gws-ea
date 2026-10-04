@@ -13,7 +13,6 @@ import { register } from '../../cli/registry.js';
 import { parseSkillSelection } from '../../container-config.js';
 import { getDb } from '../../db/connection.js';
 import { getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
-import { onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
 import { registerRequiredProjectDocSection } from '../../project-doc-sections.js';
 import type { AgentGroup } from '../../types.js';
@@ -25,9 +24,10 @@ export const GUIDANCE_PATH = path.join('src', 'modules', 'gws-ea-main', 'guidanc
 
 /**
  * The shared skills (`container/skills/`) `main` loads: web research and the
- * skill of every Google service the release exposes, which every agent group
- * gets (`gws-ea-google`). NanoClaw adds the gateway's own skill, and the
- * template supplies `welcome`.
+ * skill of every Google capability (`gws-ea-google`). Main's capabilities
+ * bound the list, so it is handed a Google skill only while it holds that
+ * service's key. NanoClaw adds the gateway's own skill, and the template
+ * supplies `welcome`.
  */
 export const MAIN_SHARED_SKILLS: readonly string[] = ['agent-browser', ...EXPOSED_GOOGLE_SKILLS];
 
@@ -74,6 +74,8 @@ async function reconcileMainSkills(agentGroupId: string): Promise<MainSkills> {
   return { agent_group_id: agentGroupId, skills: parseSkillSelection(updated?.skills, agentGroupId) };
 }
 
+// The lifecycle commands (create, update) set the list through this command;
+// the host never rewrites it at start.
 register({
   name: 'gws-ea-main-reconcile',
   description: "Set canonical main's NanoClaw shared skills to the release's list.",
@@ -87,17 +89,4 @@ register({
     return agentGroupId;
   },
   handler: async (agentGroupId) => reconcileMainSkills(agentGroupId),
-});
-
-// A release can change main's list, so every start applies the running
-// release's list to the main an earlier release created.
-onHostStart(async () => {
-  const main = await mainAgentGroupId();
-  if (main === null) return;
-  if (!(await getContainerConfig(main))) {
-    log.warn('Canonical main has no container config; its skills were not reconciled', { agentGroupId: main });
-    return;
-  }
-  const { skills } = await reconcileMainSkills(main);
-  log.info("Reconciled canonical main's skills", { agentGroupId: main, skills });
 });

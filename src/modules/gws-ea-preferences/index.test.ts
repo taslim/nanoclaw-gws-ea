@@ -288,6 +288,30 @@ describe('GWS-EA preferences ncl resource', () => {
 });
 
 describe('GWS-EA preferences project-doc section', () => {
+  it("gives external-email no preference value: it learns the principal's time only from the host", async () => {
+    const externalEmail = group('ag-external-email', 'external-email');
+    await createAgentGroup(externalEmail);
+    await ensureContainerConfig(externalEmail.id);
+    await getDb().run(
+      'UPDATE gws_ea_profile SET external_email_agent_group_id = ? WHERE singleton = 1',
+      externalEmail.id,
+    );
+    await setSchedulingPreference({
+      kind: 'working-hours',
+      weekday: 'mon',
+      hours: { start: '09:00', end: '17:00' },
+      source: 'principal',
+      basis: 'Works nine to five.',
+    });
+
+    expect((await getRequiredProjectDocSections(externalEmail)).map((section) => section.name)).not.toContain(
+      'Scheduling Preferences',
+    );
+    expect((await getRequiredProjectDocSections(other)).map((section) => section.name)).toContain(
+      'Scheduling Preferences',
+    );
+  });
+
   it('adds no section to another group until a preference is stored', async () => {
     expect((await getRequiredProjectDocSections(other)).map((section) => section.name)).not.toContain(
       'Scheduling Preferences',

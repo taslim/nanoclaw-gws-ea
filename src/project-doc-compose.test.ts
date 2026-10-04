@@ -15,6 +15,8 @@ import {
   updateContainerConfigJson,
 } from './db/container-configs.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
+import { getRegisteredMigrations } from './db/migrations/index.js';
+import { capabilitiesMigration } from './modules/capabilities/migration.js';
 import { PERSONA_PREPEND_FILE } from './group-persona.js';
 import { log } from './log.js';
 import { registerRequiredProjectDocSection } from './project-doc-sections.js';
@@ -69,7 +71,7 @@ beforeEach(async () => {
     fs.symlinkSync(path.join(REPO_ROOT, 'container', entry), path.join(sourceRoot, 'container', entry));
   }
   process.chdir(sourceRoot);
-  await runMigrations(await initTestDb());
+  await runMigrations(await initTestDb(), [...getRegisteredMigrations(), capabilitiesMigration]);
 });
 
 afterEach(async () => {
@@ -113,6 +115,10 @@ describe('composeGroupProjectDoc delivery', () => {
     expect(doc).toContain(read('container', 'skills', 'fixture-gateway', 'instructions.md'));
     expect(doc).toContain(read('container', 'agent-runner', 'src', 'mcp-tools', 'cli.instructions.md'));
     expect(doc).toContain(read('container', 'agent-runner', 'src', 'mcp-tools', 'core.instructions.md'));
+    expect(doc).toContain(read('container', 'agent-runner', 'src', 'mcp-tools', 'connect.instructions.md'));
+    expect(doc).toContain(
+      renderBaseInstructions(read('container', 'agent-runner', 'src', 'mcp-tools', 'memory.instructions.md')),
+    );
   });
 
   it('inlines MCP server instructions from the container config', async () => {
@@ -313,11 +319,18 @@ describe('composeGroupProjectDoc spec', () => {
   // rendered base must be byte-identical to the template minus its placeholder
   // paragraph, so the Claude document never changes when facts are added for
   // other providers.
-  it('renders the canonical base byte-identically when no provider facts are declared', () => {
-    const template = fs.readFileSync(path.join(process.cwd(), BASE_INSTRUCTIONS_PATH), 'utf-8');
-    expect(template.split(MEMORY_NOTE_PLACEHOLDER)).toHaveLength(2);
-    expect(renderBaseInstructions(template)).toBe(template.replace(`\n\n${MEMORY_NOTE_PLACEHOLDER}`, ''));
-    expect(renderBaseInstructions(template)).not.toContain(MEMORY_NOTE_PLACEHOLDER);
+  it('renders the canonical instructions byte-identically when no provider facts are declared', () => {
+    const base = fs.readFileSync(path.join(process.cwd(), BASE_INSTRUCTIONS_PATH), 'utf-8');
+    // The memory note lives with the memory instructions, which follow `conversation-context`.
+    expect(base).not.toContain(MEMORY_NOTE_PLACEHOLDER);
+    expect(renderBaseInstructions(base)).toBe(base);
+    const memory = fs.readFileSync(
+      path.join(process.cwd(), 'container', 'agent-runner', 'src', 'mcp-tools', 'memory.instructions.md'),
+      'utf-8',
+    );
+    expect(memory.split(MEMORY_NOTE_PLACEHOLDER)).toHaveLength(2);
+    expect(renderBaseInstructions(memory)).toBe(memory.replace(`\n\n${MEMORY_NOTE_PLACEHOLDER}`, ''));
+    expect(renderBaseInstructions(memory)).not.toContain(MEMORY_NOTE_PLACEHOLDER);
   });
 
   it('renders provider facts as canonical prose in the declared slots', async () => {
@@ -466,5 +479,105 @@ describe('composeGroupProjectDoc size cap', () => {
     expect(doc).not.toContain('# Omitted for size');
     expect(log.warn).toHaveBeenCalled();
     expect(log.error).not.toHaveBeenCalled();
+  });
+});
+
+describe('composeGroupProjectDoc capabilities', () => {
+  // Section headings only: instruction bodies carry `# ` comment lines inside code blocks.
+  const headings = (doc: string): string[] =>
+    doc.split('\n').filter((line) => /^# (NanoClaw |MCP Server: |Persona$)/.test(line));
+
+  async function seedWithServer(id: string, folder: string): Promise<AgentGroup> {
+    const ag = await seed(id, folder);
+    await updateContainerConfigJson(ag.id, 'mcp_servers', {
+      tooling: { command: 'x', args: [], instructions: 'use the tooling server for builds' },
+    });
+    return ag;
+  }
+
+  // Characterization, recorded before capabilities existed: every section a
+  // default group composed then, in order. Since then three passages moved
+  // into documents a key names, with their text unchanged: the file and
+  // reaction tools (`files-send`), connecting accounts (`connect`, by
+  // `shell`), and memory with the conversation archive (`memory`, by
+  // `conversation-context`).
+  it('composes a group holding every key exactly as before capabilities', async () => {
+    const ag = await seedWithServer('ag-caps-all', 'caps-all-group');
+
+    expect(headings(await compose(ag))).toEqual([
+      '# NanoClaw Runtime Contract',
+      '# NanoClaw Module: agents',
+      '# NanoClaw Module: calendar-facts',
+      '# NanoClaw Module: cli',
+      '# NanoClaw Module: connect',
+      '# NanoClaw Module: core',
+      '# NanoClaw Module: files-send',
+      '# NanoClaw Module: interactive',
+      '# NanoClaw Module: memory',
+      '# NanoClaw Module: schedule-stats',
+      '# NanoClaw Module: scheduling',
+      '# NanoClaw Module: self-mod',
+      '# NanoClaw Module: time',
+      '# NanoClaw Skill: fixture-gateway',
+      '# MCP Server: tooling',
+    ]);
+  });
+
+  it('composes the same document for a stored "all" as for a database without the column', async () => {
+    const ag = await seedWithServer('ag-caps-same', 'caps-same-group');
+    const withColumn = await compose(ag);
+
+    await getDb().exec('ALTER TABLE container_configs DROP COLUMN capabilities');
+
+    expect(await compose(ag)).toBe(withColumn);
+  });
+
+  it('teaches a group holding reply and time only what those keys grant', async () => {
+    const ag = await seedWithServer('ag-caps-narrow', 'caps-narrow-group');
+    await updateContainerConfigJson(ag.id, 'capabilities', ['reply', 'time']);
+
+    const doc = await compose(ag);
+    expect(headings(doc)).toEqual([
+      '# NanoClaw Runtime Contract',
+      '# NanoClaw Module: core',
+      '# NanoClaw Module: time',
+    ]);
+    // Without a shell nothing teaches `ncl` or connecting an account, and with
+    // sealed sessions nothing teaches group memory or the conversation archive.
+    // (The composed-at-spawn header is an operator's marker, not instruction.)
+    const taught = doc.slice(doc.indexOf('\n'));
+    expect(taught).not.toMatch(/\bncl\b/u);
+    expect(taught).not.toMatch(/connect/iu);
+    expect(taught).not.toContain('memory/');
+    expect(taught).not.toContain('conversations/');
+  });
+
+  it('teaches connecting accounts with a shell, and memory with conversation-context', async () => {
+    const ag = await seedWithServer('ag-caps-parts', 'caps-parts-group');
+
+    await updateContainerConfigJson(ag.id, 'capabilities', ['reply', 'shell']);
+    expect(headings(await compose(ag))).toContain('# NanoClaw Module: connect');
+    expect(headings(await compose(ag))).not.toContain('# NanoClaw Module: memory');
+
+    await updateContainerConfigJson(ag.id, 'capabilities', ['reply', 'conversation-context']);
+    expect(headings(await compose(ag))).toContain('# NanoClaw Module: memory');
+    expect(headings(await compose(ag))).not.toContain('# NanoClaw Module: connect');
+  });
+
+  it('bounds the skill selection: a skill no key names needs shell', async () => {
+    const ag = await seed('ag-caps-skill', 'caps-skill-group');
+    await updateContainerConfigJson(ag.id, 'capabilities', ['reply', 'files-read', 'web']);
+
+    expect(await compose(ag)).not.toContain('# NanoClaw Skill: fixture-gateway');
+
+    await updateContainerConfigJson(ag.id, 'capabilities', ['reply', 'shell']);
+    expect(await compose(ag)).toContain('# NanoClaw Skill: fixture-gateway');
+  });
+
+  it('inlines MCP server instructions only for a group holding mcp-servers', async () => {
+    const ag = await seedWithServer('ag-caps-mcp', 'caps-mcp-group');
+    await updateContainerConfigJson(ag.id, 'capabilities', ['reply', 'mcp-servers']);
+
+    expect(await compose(ag)).toContain('# MCP Server: tooling');
   });
 });

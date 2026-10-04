@@ -1,5 +1,4 @@
 import { registerResource, type ColumnDef } from '../../cli/crud.js';
-import type { CallerContext } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { optionalString } from '../../gws-ea/validation.js';
@@ -20,7 +19,7 @@ import {
   type SetPreferenceInput,
   type Weekday,
 } from './db.js';
-import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { assertMainCaller, projectDocAudience } from '../gws-ea-profile/db.js';
 import { gwsEaPreferencesMigration } from './migration.js';
 
 registerMigration(gwsEaPreferencesMigration);
@@ -92,15 +91,17 @@ function summarizeSchedulingPreferences(values: SchedulingPreferenceValues): str
 export const MAIN_PREFERENCES_POINTER =
   "The principal's scheduling preferences (working hours, protected times, default meeting lengths, buffers, and preferred times) live in their typed store. Read them with `ncl preferences get` before you schedule anything or describe them: the store is the only current copy, and a value from earlier in the conversation may have changed since.";
 
-async function isCanonicalMain(group: AgentGroup): Promise<boolean> {
-  return (await getDb().hasTable('gws_ea_profile')) && group.id === (await getMainAgentGroupId());
-}
-
+/**
+ * The preferences each audience is given (KTD14). `external-email` gets
+ * none: it learns the principal's time only as free slots from the host.
+ * Other groups cannot read the store, so they get the values as of their
+ * container's start, never a basis or a reason.
+ */
 async function preferencesSection(group: AgentGroup): Promise<RequiredProjectDocSection | undefined> {
   if (!(await getDb().hasTable('gws_ea_pref_working_hours'))) return undefined;
-  if (await isCanonicalMain(group)) return { name: 'Scheduling Preferences', body: MAIN_PREFERENCES_POINTER };
-  // Other groups cannot read the store, so they get the values as of their
-  // container's start, never a basis or a reason.
+  const audience = await projectDocAudience(group.id);
+  if (audience === 'main') return { name: 'Scheduling Preferences', body: MAIN_PREFERENCES_POINTER };
+  if (audience === 'external-email') return undefined;
   const body = summarizeSchedulingPreferences(await getSchedulingPreferenceValues());
   return body === undefined ? undefined : { name: 'Scheduling Preferences', body };
 }
@@ -242,19 +243,6 @@ function removeTarget(args: Record<string, unknown>): PreferenceTarget {
   }
 }
 
-/**
- * The guard admits the host and any agent whose CLI scope reaches this
- * resource; the preferences, with their main-only basis and reason, belong to
- * the canonical main alone.
- */
-async function assertMainCaller(ctx: CallerContext): Promise<void> {
-  if (ctx.caller === 'host') return;
-  const mainAgentGroupId = await getMainAgentGroupId();
-  if (mainAgentGroupId === null || ctx.agentGroupId !== mainAgentGroupId) {
-    throw new Error("The principal's scheduling preferences are available only to main");
-  }
-}
-
 const SOURCE_ARG: ColumnDef = {
   name: 'source',
   type: 'string',
@@ -309,7 +297,7 @@ registerResource({
         'Read every stored preference with its source, basis, and update time, and each protected window with its reason and ID.',
       args: [],
       handler: async (_args, ctx) => {
-        await assertMainCaller(ctx);
+        await assertMainCaller(ctx, 'scheduling preferences');
         return getSchedulingPreferences();
       },
     },
@@ -349,7 +337,7 @@ registerResource({
         'ncl preferences set --kind meeting-length --meeting-kind one-on-one --minutes 30 --source learned --basis "Most common one-on-one length over eight weeks"',
       ],
       handler: async (args, ctx) => {
-        await assertMainCaller(ctx);
+        await assertMainCaller(ctx, 'scheduling preferences');
         return setSchedulingPreference(setInput(args));
       },
     },
@@ -365,7 +353,7 @@ registerResource({
         'ncl preferences remove --kind protected-window --id w-1a2b3c4d --source principal',
       ],
       handler: async (args, ctx) => {
-        await assertMainCaller(ctx);
+        await assertMainCaller(ctx, 'scheduling preferences');
         return { removed: await removeSchedulingPreference(removeTarget(args)) };
       },
     },

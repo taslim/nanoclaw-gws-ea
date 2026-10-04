@@ -30,6 +30,8 @@ export interface ClaudeArchiveInput {
 export interface ClaudeContinuationRotationInput {
   continuation: string;
   assistantName?: string;
+  /** Whether a rotated transcript is archived first; a sealed session's never is. Defaults to true. */
+  archive?: boolean;
   log(message: string): void;
 }
 
@@ -234,15 +236,17 @@ export function rotateClaudeContinuation(
     const decision = decideContinuationRotation({ size, firstLine }, fx);
     if (!decision?.reason) return null;
 
-    archiveClaudeTranscript(
-      {
-        transcriptPath,
-        sessionId: input.continuation,
-        assistantName: input.assistantName,
-        log: input.log,
-      },
-      fx,
-    );
+    if (input.archive !== false) {
+      archiveClaudeTranscript(
+        {
+          transcriptPath,
+          sessionId: input.continuation,
+          assistantName: input.assistantName,
+          log: input.log,
+        },
+        fx,
+      );
+    }
     try {
       fs.renameSync(transcriptPath, `${transcriptPath}.rotated-${fx.now()}`);
     } catch (error) {

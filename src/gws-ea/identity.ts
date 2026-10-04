@@ -227,8 +227,9 @@ export async function reconcileMainIdentity(
     throw new GwsEaError('main_group_mismatch', 'Canonical main provider and timezone reconciliation did not persist');
   }
 
-  // Main's shared skills are the release's own list (KTD13); the host
-  // re-applies it on every start, so only an explicit list is checked here.
+  // Main's shared skills are the release's own list (KTD13), and this
+  // reconcile on create and update is the only place it is set: the host
+  // never rewrites it at start. Only an explicit list is checked here.
   const skills = unwrapData(await runNcl(config, ['gws-ea-main', 'reconcile', '--agent-group-id', group.id]));
   if (
     !isRecord(skills) ||

@@ -8,6 +8,11 @@
  * Default when only `core.ts` is imported: the core `send_message` /
  * `send_file` / `edit_message` / `add_reaction` tools are available.
  *
+ * Every tool is granted by one capability key: `registerTools` takes it, and
+ * `loadToolModule` attributes a whole module's tools to one key while it
+ * loads. The runner's server serves only the tools of the keys its group
+ * holds; a tool registered without a key is never served to a group.
+ *
  * Installed feature modules can additively extend an already-registered
  * tool via `extendTool()` instead of editing the base tool's source —
  * see the doc comment on `extendTool` below. With no extensions
@@ -27,8 +32,12 @@ function log(msg: string): void {
 
 const allTools: McpToolDefinition[] = [];
 const toolMap = new Map<string, McpToolDefinition>();
+/** Tool name → the capability key that grants it. */
+const toolCapabilities = new Map<string, string>();
+/** The key `loadToolModule` is attributing registrations to, while one loads. */
+let loadingCapability: string | undefined;
 
-export function registerTools(tools: McpToolDefinition[]): void {
+export function registerTools(tools: McpToolDefinition[], capability: string | undefined = loadingCapability): void {
   for (const t of tools) {
     if (toolMap.has(t.tool.name)) {
       log(`Warning: tool "${t.tool.name}" already registered, skipping duplicate`);
@@ -36,7 +45,37 @@ export function registerTools(tools: McpToolDefinition[]): void {
     }
     allTools.push(t);
     toolMap.set(t.tool.name, t);
+    if (capability !== undefined) toolCapabilities.set(t.tool.name, capability);
   }
+}
+
+/**
+ * Import a tool module whose tools one capability key grants. Every tool the
+ * module registers while it loads is attributed to `capability`, so a module
+ * needs no knowledge of capabilities. Loads must not overlap: attribution is
+ * by load window, and a second load inside the first would mislabel tools.
+ */
+export async function loadToolModule(capability: string, load: () => Promise<unknown>): Promise<void> {
+  if (loadingCapability !== undefined) {
+    throw new Error(`loadToolModule("${capability}") overlaps the load of "${loadingCapability}"`);
+  }
+  loadingCapability = capability;
+  try {
+    await load();
+  } finally {
+    loadingCapability = undefined;
+  }
+}
+
+/**
+ * The tools a group's capability keys grant. Without `grants` every
+ * registered tool is served — a test exercising a tool directly; the runner's
+ * server always passes its group's keys.
+ */
+function isServed(name: string, grants: ReadonlySet<string> | undefined): boolean {
+  if (!grants) return true;
+  const capability = toolCapabilities.get(name);
+  return capability !== undefined && grants.has(capability);
 }
 
 /** Additive extension of an already-registered tool. All fields optional. */
@@ -124,17 +163,18 @@ export function extendTool(name: string, extension: ToolExtension): void {
 
 export function createMcpServer(
   run: <T>(action: () => T | Promise<T>) => Promise<T> = async (action) => action(),
+  grants?: ReadonlySet<string>,
 ): Server {
   const server = new Server({ name: 'nanoclaw', version: '2.0.0' }, { capabilities: { tools: {} } });
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: allTools.map((t) => t.tool),
+    tools: allTools.filter((t) => isServed(t.tool.name, grants)).map((t) => t.tool),
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request, context) => {
     const { name, arguments: args } = request.params;
     const tool = toolMap.get(name);
-    if (!tool) {
+    if (!tool || !isServed(name, grants)) {
       return { content: [{ type: 'text', text: `Unknown tool: ${name}` }] };
     }
     return run(() => tool.handler(args ?? {}, { signal: context.signal }));
@@ -143,10 +183,16 @@ export function createMcpServer(
 }
 
 export async function startMcpServer(
-  run: <T>(action: () => T | Promise<T>) => Promise<T> = async (action) => action(),
+  run: <T>(action: () => T | Promise<T>) => Promise<T>,
+  grants: ReadonlySet<string>,
 ): Promise<void> {
-  const server = createMcpServer(run);
+  const server = createMcpServer(run, grants);
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  log(`MCP server started with ${allTools.length} tools: ${allTools.map((t) => t.tool.name).join(', ')}`);
+  const served = allTools.filter((t) => isServed(t.tool.name, grants)).map((t) => t.tool.name);
+  log(`MCP server started with ${served.length} tools: ${served.join(', ')}`);
+  const unattributed = allTools.map((t) => t.tool.name).filter((name) => !toolCapabilities.has(name));
+  if (unattributed.length > 0) {
+    log(`Warning: tools registered without a capability key are never served: ${unattributed.join(', ')}`);
+  }
 }
