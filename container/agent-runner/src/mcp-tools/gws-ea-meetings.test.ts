@@ -117,6 +117,7 @@ describe('the meeting tools', () => {
         'meeting_free_time',
         { meeting_id: 'mtg-1', date: '2026-10-14', time: '15:00', timezone: 'America/New_York' },
       ],
+      [freeTime, 'meeting_free_time', { meeting_id: 'mtg-1', after: '14:00', timezone: 'America/New_York' }],
       [hold, 'meeting_hold', { meeting_id: 'mtg-1', slot_ids: ['slot-3fa9c2e1b7d0', 'slot-0b1c2d3e4f5a'] }],
       [hold, 'meeting_hold', { meeting_id: 'mtg-1', slot_ids: [] }],
       [book, 'meeting_book', { meeting_id: 'mtg-1', slot_id: 'slot-3fa9c2e1b7d0' }],

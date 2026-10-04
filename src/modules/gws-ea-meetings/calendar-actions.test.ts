@@ -67,6 +67,7 @@ import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import '../gws-ea-external-email/index.js';
 import { consumeOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import { ensureInbox, GoogleApiError } from '../gws-ea-inbox/index.js';
+import { slotLabel } from './calendar-actions.js';
 import { getBooking, listOfferedSlots } from './index.js';
 import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
 import { ask, data, meeting, meetingSession, notes, refusal, slotsOf, type OfferedSlot } from './testing/scheduling.js';
@@ -333,7 +334,9 @@ describe('free_time', () => {
     );
     expect(String(late.message)).toMatch(/not open/i);
     for (const slot of late.slots as OfferedSlot[]) expect(slot.start.startsWith('2026-10-07')).toBe(true);
-    expect(String(late.message)).toContain('America/New_York');
+    // Each time is also shown on their clock, the way people write it.
+    expect(String(late.message)).toMatch(/; for them, Wednesday 7 Oct, \d\d:\d\d–\d\d:\d\d EDT/);
+    expect(String(late.message)).not.toContain('America/New_York');
 
     // 05:00 in New York is 10:00 in London: open.
     const early = data(
@@ -347,6 +350,47 @@ describe('free_time', () => {
     expect((early.slots as OfferedSlot[]).map((slot) => slot.start)).toEqual([WEDNESDAY_10AM]);
   });
 
+  it('offers nothing today unless the window ends today, yet checks a time today they propose', async () => {
+    const week = await arranged(acme, { window_start: NOW.toISOString(), window_end: '2026-10-10T00:00:00+01:00' });
+    const offered = slotsOf(await ask(week.session, 'meeting_free_time', { meeting_id: week.meeting.id }));
+    expect(offered.length).toBeGreaterThan(0);
+    for (const slot of offered) expect(slot.start >= '2026-10-05T23:00:00.000Z').toBe(true);
+    const proposed = data(
+      await ask(week.session, 'meeting_free_time', {
+        meeting_id: week.meeting.id,
+        date: '2026-10-05',
+        time: '14:00',
+        timezone: LONDON,
+      }),
+    );
+    expect(proposed.slots).toEqual([expect.objectContaining({ start: '2026-10-05T13:00:00.000Z' })]);
+
+    const today = await arranged(sam, { window_start: NOW.toISOString(), window_end: '2026-10-05T18:00:00+01:00' });
+    const todays = slotsOf(await ask(today.session, 'meeting_free_time', { meeting_id: today.meeting.id }));
+    expect(todays.length).toBeGreaterThan(0);
+    for (const slot of todays) expect(slot.start.startsWith('2026-10-05')).toBe(true);
+  });
+
+  it('narrows to the part of the day they ask for, on their clock', async () => {
+    const { meeting: stored, session } = await arranged(acme);
+    // After 10:00 in New York is after 15:00 in London.
+    const later = slotsOf(
+      await ask(session, 'meeting_free_time', { meeting_id: stored.id, after: '10:00', timezone: 'America/New_York' }),
+    );
+    expect(later.length).toBeGreaterThan(0);
+    for (const slot of later) {
+      const theirs = new Date(slot.start).toLocaleTimeString('en-GB', {
+        timeZone: 'America/New_York',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+      expect(theirs >= '10:00').toBe(true);
+    }
+    expect(
+      refusal(await ask(session, 'meeting_free_time', { meeting_id: stored.id, after: '15:00', before: '14:00' })),
+    ).toMatch(/before must come after after/);
+  });
+
   it('is refused from main, and from a conversation bound to another meeting', async () => {
     const first = await arranged(acme);
     const second = await arranged(sam);
@@ -355,6 +399,15 @@ describe('free_time', () => {
       /Use only the meeting your brief names/,
     );
     expect(await listOfferedSlots(first.meeting.id)).toEqual([]);
+  });
+});
+
+describe('a slot as people write it', () => {
+  it('names its day, its times and its zone the way people do, never an IANA name', () => {
+    const span = { start: Date.parse('2026-10-06T09:00:00Z'), end: Date.parse('2026-10-06T09:30:00Z') };
+    expect(slotLabel(span, LONDON)).toBe('Tuesday 6 Oct, 10:00–10:30 BST');
+    expect(slotLabel(span, 'America/New_York')).toBe('Tuesday 6 Oct, 05:00–05:30 EDT');
+    expect(slotLabel(span, 'Africa/Lagos')).toBe('Tuesday 6 Oct, 10:00–10:30 GMT+1');
   });
 });
 

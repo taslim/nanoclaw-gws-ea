@@ -99,10 +99,12 @@ import { MOVED_NOTE_TYPE, mainTimezone, noteCounterparts, who, writeBookedNote, 
 import {
   bestSlots,
   blocksTime,
+  earliestOffer,
   eventSpan,
   isOpen,
   iso,
   localDaySpan,
+  localTime,
   openSlots,
   parseClock,
   parseLocalDate,
@@ -190,16 +192,35 @@ function fitsMeeting(slot: OfferedSlot | Hold, meeting: SchedulingMeeting): bool
   );
 }
 
-/** A slot as the agent reads it: its weekday, date and local start and end, in `timezone`. */
+/**
+ * A slot as people write it, in `timezone`: "Tuesday 6 Oct, 10:00–10:30
+ * BST", its zone by the short name people know rather than its IANA name.
+ */
 export function slotLabel(span: Span, timezone: string): string {
-  const weekday = new Date(span.start).toLocaleDateString('en-US', { timeZone: timezone, weekday: 'long' });
-  const end = new Date(span.end).toLocaleTimeString('en-US', {
+  const day = new Date(span.start).toLocaleDateString('en-GB', {
     timeZone: timezone,
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true,
+    weekday: 'long',
+    day: 'numeric',
+    month: 'short',
   });
-  return `${weekday}, ${formatLocalTime(iso(span.start), timezone)} to ${end} (${timezone})`;
+  const clock = (instant: number): string =>
+    new Date(instant).toLocaleTimeString('en-GB', { timeZone: timezone, hour: '2-digit', minute: '2-digit' });
+  return `${day.replace(',', '')}, ${clock(span.start)}–${clock(span.end)} ${zoneName(span.start, timezone)}`;
+}
+
+/**
+ * A zone's short name at an instant, as people know it: each locale names
+ * only its own region's zones (BST in British English, EDT in American), so
+ * the first that names it wins, and an offset such as GMT+1 stands in when none does.
+ */
+function zoneName(instant: number, timezone: string): string {
+  const names = ['en-GB', 'en-US'].map(
+    (locale) =>
+      new Intl.DateTimeFormat(locale, { timeZone: timezone, timeZoneName: 'short' })
+        .formatToParts(new Date(instant))
+        .find((part) => part.type === 'timeZoneName')?.value ?? timezone,
+  );
+  return names.find((name) => !/^(GMT|UTC)[+-]/u.test(name)) ?? names[0];
 }
 
 function slotIdsOf(value: unknown, max: number): string[] {
@@ -226,30 +247,51 @@ interface Narrowing {
   readonly date?: LocalDate;
   /** Minutes of the day, with `date`. */
   readonly time?: number;
-  /** The zone `date` and `time` are in, and the extra zone each time is shown in; undefined for the principal's. */
+  /** Minutes of the day an offer starts at or after, and ends at or before. */
+  readonly after?: number;
+  readonly before?: number;
+  /** The zone the narrowing is read in, and the extra zone each time is shown in; undefined for the principal's. */
   readonly timezone?: string;
 }
 
+/** A 24-hour `HH:MM` the request gave as `label`, as minutes of the day; undefined when absent. */
+function clockOf(value: unknown, label: string): number | undefined {
+  if (value === undefined) return undefined;
+  const minutes = typeof value === 'string' ? parseClock(value) : undefined;
+  if (minutes === undefined || minutes >= 24 * 60)
+    throw invalid(`${label} must be a 24-hour time as HH:MM, such as 15:30`);
+  return minutes;
+}
+
 function narrowingOf(content: Record<string, unknown>): Narrowing {
-  const { date, time, timezone } = content;
+  const { date, timezone } = content;
   if (timezone !== undefined && (typeof timezone !== 'string' || !isValidTimezone(timezone))) {
     throw invalid('timezone must be an IANA timezone, such as America/New_York');
   }
-  if (date === undefined) {
-    if (time !== undefined) throw invalid('Give the date a proposed time is on');
-    return timezone === undefined ? {} : { timezone };
-  }
-  const day = typeof date === 'string' ? parseLocalDate(date) : undefined;
-  if (day === undefined) throw invalid('date must be a day as YYYY-MM-DD');
-  const minutes = typeof time === 'string' ? parseClock(time) : undefined;
-  if (time !== undefined && (minutes === undefined || minutes >= 24 * 60)) {
-    throw invalid('time must be a 24-hour time as HH:MM, such as 15:30');
-  }
+  const time = clockOf(content.time, 'time');
+  const after = clockOf(content.after, 'after');
+  const before = clockOf(content.before, 'before');
+  if (after !== undefined && before !== undefined && before <= after) throw invalid('before must come after after');
+  if (time !== undefined && date === undefined) throw invalid('Give the date a proposed time is on');
+  const day = date === undefined ? undefined : typeof date === 'string' ? parseLocalDate(date) : undefined;
+  if (date !== undefined && day === undefined) throw invalid('date must be a day as YYYY-MM-DD');
   return {
-    date: day,
-    ...(minutes === undefined ? {} : { time: minutes }),
-    ...(timezone === undefined ? {} : { timezone }),
+    ...(day === undefined ? {} : { date: day }),
+    ...(time === undefined ? {} : { time }),
+    ...(after === undefined ? {} : { after }),
+    ...(before === undefined ? {} : { before }),
+    ...(typeof timezone === 'string' ? { timezone } : {}),
   };
+}
+
+/** Whether a time lies inside the part of the day the narrowing asks for, on that zone's clock. */
+function inPartOfDay(span: Span, narrowing: Narrowing, zone: string): boolean {
+  const start = localTime(span.start, zone).minuteOfDay;
+  const end = start + (span.end - span.start) / MINUTE;
+  return (
+    (narrowing.after === undefined || start >= narrowing.after) &&
+    (narrowing.before === undefined || end <= narrowing.before)
+  );
 }
 
 /** What every action needs to know about a meeting's calendar. */
@@ -328,6 +370,7 @@ function freeTimeHeading(
   proposedOpen: boolean | undefined,
   found: boolean,
   oneDay: boolean,
+  narrowed: boolean,
 ): string {
   if (proposedOpen === true) return 'That time is open:';
   if (proposedOpen === false) {
@@ -337,6 +380,8 @@ function freeTimeHeading(
   }
   if (found) return `Open times for meeting ${meeting.id}, best first:`;
   if (oneDay) return 'Nothing is open that day: call meeting_free_time without a date for other days.';
+  if (narrowed)
+    return 'Nothing in that part of the day is open: call meeting_free_time without after or before for other times.';
   return "Nothing in the meeting's window is open: ask main about time with meeting_ask_main, and offer nothing meanwhile.";
 }
 
@@ -710,8 +755,12 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     const narrowing = narrowingOf(content);
     const view = await viewOf(meeting);
     const now = Date.now();
-    const earliest = now + MIN_NOTICE_MINUTES * MINUTE;
     const window = meetingWindow(meeting);
+    // A day or a time the other side names is theirs to ask for, from an hour on; offers of the host's own start the next day.
+    const earliest =
+      narrowing.date === undefined
+        ? earliestOffer(now, window, view.timezone, MIN_NOTICE_MINUTES)
+        : now + MIN_NOTICE_MINUTES * MINUTE;
     const zone = narrowing.timezone ?? view.timezone;
     const day = narrowing.date === undefined ? undefined : localDaySpan(narrowing.date, zone);
     if (day && (day.end <= window.start || day.start >= window.end)) {
@@ -733,7 +782,8 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
         ? [{ start, end: start + meeting.length_minutes * MINUTE }]
         : bestSlots(query, openSlots(query, day), MAX_OFFERED, now);
     } else {
-      chosen = bestSlots(query, openSlots(query, day), MAX_OFFERED, now);
+      const open = openSlots(query, day).filter((span) => inPartOfDay(span, narrowing, zone));
+      chosen = bestSlots(query, open, MAX_OFFERED, now);
     }
 
     const offered: OfferedSlot[] = chosen.map((span) => ({
@@ -760,7 +810,13 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
         (held.has(slot.slot_id) ? ' (held)' : '')
       );
     });
-    const heading = freeTimeHeading(meeting, proposedOpen, offered.length > 0, day !== undefined);
+    const heading = freeTimeHeading(
+      meeting,
+      proposedOpen,
+      offered.length > 0,
+      day !== undefined,
+      narrowing.after !== undefined || narrowing.before !== undefined,
+    );
     const footer =
       offered.length > 0
         ? 'Offer two or three of them, on different days where you can, and hold each one you offer. '
@@ -1061,8 +1117,8 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     const view = await viewOf(meeting);
     if (view.colleagues.length === 0 || view.colleagues.length !== meeting.counterparts.length) return undefined;
     const now = Date.now();
-    const earliest = now + MIN_NOTICE_MINUTES * MINUTE;
     const window = meetingWindow(meeting);
+    const earliest = earliestOffer(now, window, view.timezone, MIN_NOTICE_MINUTES);
     const range = { start: Math.max(window.start, earliest), end: window.end };
     if (range.start >= range.end) return undefined;
     const { busy, hidden } = await busyIn(meeting, view, range);
@@ -1137,7 +1193,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
   async function openTimes(meeting: SchedulingMeeting, range: Span, ignore: readonly EventRef[]): Promise<Span[]> {
     const view = await viewOf(meeting);
     const now = Date.now();
-    const earliest = now + MIN_NOTICE_MINUTES * MINUTE;
+    const earliest = earliestOffer(now, meetingWindow(meeting), view.timezone, MIN_NOTICE_MINUTES);
     const { busy } = await busyIn(meeting, view, range, ignore);
     const query = queryFor(meeting, view, busy, earliest);
     return bestSlots(query, openSlots(query, range), MAX_OFFERED, now);

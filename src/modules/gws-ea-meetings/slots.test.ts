@@ -10,6 +10,7 @@ import type { CalendarEvent } from './calendar-api.js';
 import {
   bestSlots,
   blocksTime,
+  earliestOffer,
   eventSpan,
   isOpen,
   openSlots,
@@ -275,7 +276,7 @@ describe('choosing which times to offer', () => {
     }
   });
 
-  it('spreads a known or unknown counterpart’s times across the window, with no other preference', () => {
+  it("puts the principal's preferred times first for everyone, and spreads the rest across days and times of day", () => {
     const preferring = schedulingRules(
       {
         working_hours: workingDays('09:00', '17:00'),
@@ -289,10 +290,30 @@ describe('choosing which times to offer', () => {
     for (const level of ['known', 'unknown'] as const) {
       const q = query({ window: WEEK, level, earliest, rules: preferring });
       const best = bestSlots(q, openSlots(q), 5, now);
-      expect(best.map((slot) => weekday(slot.start))).toEqual(['Mon', 'Tue', 'Wed', 'Thu', 'Fri']);
-      expect(clock(best[0].start)).toBe('10:00');
-      expect(clock(best[3].start)).toBe('09:00');
+      expect([weekday(best[0].start), clock(best[0].start)]).toEqual(['Thu', '15:00']);
+      // Never "Tuesday 9:00, Wednesday 9:00, Thursday 9:00": a new day and a new hour each time, either side of noon.
+      expect(best.map((slot) => `${weekday(slot.start)} ${clock(slot.start)}`)).toEqual([
+        'Thu 15:00',
+        'Mon 10:00',
+        'Tue 12:00',
+        'Wed 09:00',
+        'Fri 13:00',
+      ]);
     }
+  });
+
+  it('offers the inner circle and close working hours before the evenings and weekends they may use', () => {
+    const q = query({ window: WEEK, level: 'close', earliest });
+    const best = bestSlots(q, openSlots(q), 3, now);
+    for (const slot of best) {
+      expect(['Sat', 'Sun']).not.toContain(weekday(slot.start));
+      expect(clock(slot.start) >= '09:00' && clock(slot.end) <= '17:00').toBe(true);
+    }
+  });
+
+  it('offers fewer times when a narrow window holds fewer', () => {
+    const q = query({ window: span('2026-10-06T08:00:00Z', '2026-10-06T09:00:00Z'), earliest });
+    expect(bestSlots(q, openSlots(q), 5, now)).toHaveLength(2);
   });
 
   it("puts the principal's preferred times for the meeting's kind first for someone close", () => {
@@ -327,6 +348,15 @@ describe('choosing which times to offer', () => {
     expect(slotIdFor('mtg-a', slot)).toBe(slotIdFor('mtg-a', slot));
     expect(slotIdFor('mtg-a', slot)).not.toBe(slotIdFor('mtg-b', slot));
     expect(slotIdFor('mtg-a', slot)).toMatch(/^slot-[0-9a-f]{12}$/);
+  });
+});
+
+describe('the earliest time to offer', () => {
+  it('is the next day, unless the window ends today, and never sooner than the notice', () => {
+    const thisWeek = span('2026-10-05T07:00:00Z', '2026-10-09T23:00:00Z');
+    expect(iso(earliestOffer(MONDAY_NINE, thisWeek, LONDON, 60))).toBe('2026-10-05T23:00:00.000Z');
+    const today = span('2026-10-05T07:00:00Z', '2026-10-05T17:00:00Z');
+    expect(iso(earliestOffer(MONDAY_NINE, today, LONDON, 60))).toBe(iso(MONDAY_NINE + HOUR));
   });
 });
 

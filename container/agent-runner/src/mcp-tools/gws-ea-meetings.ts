@@ -452,7 +452,7 @@ const MEETING_ID = { type: 'string', description: 'The meeting id from your brie
 export const freeTime = requestTool({
   name: 'meeting_free_time',
   description:
-    "Get open times for this conversation's meeting, best first, each with a slot id and its day and local time. The host works them out from the principal's calendar and preferences: you never see the calendar itself. With date (and time), it looks at that day only (and checks that exact start), read in timezone when you give one. Answers are capped per meeting.",
+    "Get open times for this conversation's meeting, best first, each with a slot id and its day and time as people write them. The host works them out from the principal's calendar and preferences, spread across days and times of day: you never see the calendar itself. With date (and time), it looks at that day only (and checks that exact start); with after or before, only that part of the day. All are read in timezone when you give one. Answers are capped per meeting.",
   properties: {
     meeting_id: MEETING_ID,
     date: {
@@ -463,6 +463,14 @@ export const freeTime = requestTool({
       type: 'string',
       description: 'With date: check this exact start, as 24-hour HH:MM, such as a time the other side proposed.',
     },
+    after: {
+      type: 'string',
+      description: 'Only times starting at or after this, as 24-hour HH:MM, such as 14:00 for "after 2".',
+    },
+    before: {
+      type: 'string',
+      description: 'Only times ending at or before this, as 24-hour HH:MM, such as 12:00 for "a morning".',
+    },
     timezone: {
       type: 'string',
       description:
@@ -470,7 +478,7 @@ export const freeTime = requestTool({
     },
   },
   required: { meeting_id: 'string' },
-  optional: { date: 'string', time: 'string', timezone: 'string' },
+  optional: { date: 'string', time: 'string', after: 'string', before: 'string', timezone: 'string' },
   repeatable: true,
   check: (args) => (args.time !== undefined && args.date === undefined ? 'Give the date the time is on.' : undefined),
 });
