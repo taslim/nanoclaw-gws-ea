@@ -3,33 +3,47 @@
  *
  * A preference learned from the principal's calendar has to come from
  * counting, not from a model reading a long list of events. This tool does the
- * counting. Given a bounded window of events and the principal's timezone, it
- * returns the usual start and end of the working day for each weekday, the
- * most common meeting lengths, and the usual gaps between meetings.
+ * counting over the JSON that `gog calendar events ... --all-pages` saved for
+ * a bounded window, read through calendar-facts' file reader, so every event
+ * is one Google returned and none was copied by hand. It returns the usual
+ * start and end of the working day for each weekday, the most common meeting
+ * lengths, and the usual gaps between meetings, on the principal's clocks.
  *
- * Only meetings with at least one other attendee are counted. Every other
- * event lands in exactly one group that is counted and set aside: all-day
- * events, events outside the window, zero-length events, events that cross
- * midnight, and blocks with no other attendee. A timed event must carry its
- * UTC offset, so no local time is guessed at a clock change. A single invalid
- * event refuses the whole call and is named, because a preference learned from
- * mangled input would be wrong without anyone knowing.
+ * Only meetings with at least one other person are counted, and a meeting on
+ * several of the principal's calendars counts once. Every other event lands in
+ * exactly one group that is counted and set aside: cancelled events, events
+ * the principal declined, all-day events, events outside the window,
+ * zero-length events, events that cross midnight, events whose guest list
+ * Google left out, and blocks with no other person. A file that is not
+ * complete gog output, or holds one invalid event, refuses the whole call and
+ * is named, because a preference learned from mangled input would be wrong
+ * without anyone knowing.
  */
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { DateTime, type DateTimeMaybeValid } from 'luxon';
 
 import { isValidTimezone } from '../timezone.js';
+import {
+  FILES_SCHEMA,
+  FILE_ROOTS,
+  Mailboxes,
+  answer,
+  fail,
+  isRoom,
+  principalResponse,
+  readAddressList,
+  readEvents,
+  readFiles,
+  type CalendarEvent,
+} from './calendar-facts.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 type ValidDateTime = DateTime<true>;
 
 export const MAX_WINDOW_DAYS = 60;
-export const MAX_EVENTS = 2000;
 /** A gap of more than this between two meetings is free time, not a buffer. */
 export const BUFFER_GAP_LIMIT_MINUTES = 60;
 const MOST_COMMON_LIMIT = 3;
-const MAX_LISTED_PROBLEMS = 5;
 const MINUTE_MS = 60_000;
 
 /** The preference store's weekday keys, Monday first. */
@@ -37,9 +51,6 @@ const WEEKDAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] as const;
 type Weekday = (typeof WEEKDAYS)[number];
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
-const DATE_TIME_WITH_OFFSET = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})$/i;
-const TIMESTAMP_SHAPE =
-  'a date-time with its UTC offset, such as 2026-10-05T09:00:00+01:00, or a date (2026-10-05) for an all-day event';
 const DATE_SHAPE = 'a date written as YYYY-MM-DD, such as 2026-08-10';
 
 export interface Frequency {
@@ -66,14 +77,19 @@ export interface WeekdayHours {
 export interface ScheduleStatsResult {
   timezone: string;
   window: { from: string; to: string; days: number };
-  /** Every received event is in exactly one of the other counts. */
+  /** Every received event copy is in exactly one of the other counts. */
   events: {
     received: number;
     meetings: number;
+    /** Further copies of a meeting on several of the principal's calendars. */
+    duplicate_copies: number;
+    cancelled: number;
+    declined: number;
     solo_blocks: number;
     all_day: number;
     zero_length: number;
     crosses_midnight: number;
+    attendees_omitted: number;
     outside_window: number;
   };
   working_hours: Record<Weekday, WeekdayHours>;
@@ -97,21 +113,10 @@ export interface ScheduleStatsResult {
   notes: string[];
 }
 
-/** A problem with the tool input, returned to the agent as an error result. */
-class StatsInputError extends Error {}
-
-function fail(message: string): never {
-  throw new StatsInputError(message);
-}
-
 function valid(dt: DateTimeMaybeValid): ValidDateTime {
   if (!dt.isValid) fail('A date is out of range.');
   return dt;
 }
-
-type ParsedEvent =
-  | { kind: 'all_day' }
-  | { kind: 'timed'; start: ValidDateTime; end: ValidDateTime; attendeeCount: number; organizer: string | null };
 
 interface Meeting {
   /** The local date the meeting starts on, YYYY-MM-DD. */
@@ -124,27 +129,23 @@ interface Meeting {
   /** Minutes after local midnight; 1440 when the meeting ends at midnight. */
   endMinute: number;
   lengthMinutes: number;
+  /** Everyone invited but rooms, the principal included. */
   attendeeCount: number;
-  organizer: string | null;
+  organizedByPrincipal: boolean;
 }
 
-type SetAside = 'all_day' | 'outside_window' | 'zero_length' | 'crosses_midnight' | 'solo_blocks';
+type SetAside = Exclude<keyof ScheduleStatsResult['events'], 'received' | 'meetings' | 'duplicate_copies'>;
 
 interface StatsInput {
   zone: string;
   from: ValidDateTime;
   to: ValidDateTime;
   days: number;
-  events: ParsedEvent[];
-  principalAddresses: ReadonlySet<string> | null;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function normalizeAddress(address: string): string {
-  return address.trim().toLowerCase();
+  /** On the principal's clocks. */
+  events: readonly CalendarEvent[];
+  principal: Mailboxes;
+  /** Whether principal addresses were given, so the meetings they organized are reported apart. */
+  principalNamed: boolean;
 }
 
 function perWeekday<T>(make: (weekday: Weekday) => T): Record<Weekday, T> {
@@ -200,90 +201,6 @@ function readDate(args: Record<string, unknown>, key: 'from' | 'to'): ValidDateT
   return date;
 }
 
-function readAddresses(args: Record<string, unknown>): ReadonlySet<string> | null {
-  const value: unknown = args.principal_addresses;
-  if (value === undefined || value === null) return null;
-  if (!Array.isArray(value)) fail('principal_addresses must be a list of email addresses.');
-  const items: unknown[] = value;
-  if (!items.every((item): item is string => typeof item === 'string')) {
-    fail('principal_addresses must be a list of email addresses.');
-  }
-  const addresses = items.map(normalizeAddress).filter((address) => address !== '');
-  return addresses.length === 0 ? null : new Set(addresses);
-}
-
-type Timestamp = { kind: 'date' | 'date_time'; at: ValidDateTime };
-
-function readTimestamp(value: unknown): Timestamp | null {
-  if (typeof value !== 'string') return null;
-  const text = value.trim();
-  if (ISO_DATE.test(text)) {
-    const at = DateTime.fromISO(text, { zone: 'utc' });
-    return at.isValid ? { kind: 'date', at } : null;
-  }
-  if (DATE_TIME_WITH_OFFSET.test(text)) {
-    const at = DateTime.fromISO(text.toUpperCase(), { setZone: true });
-    return at.isValid ? { kind: 'date_time', at } : null;
-  }
-  return null;
-}
-
-/** An event, or the sentence saying what is wrong with it. */
-function parseEvent(value: unknown, index: number): ParsedEvent | string {
-  const label = `events[${index}]`;
-  if (!isRecord(value)) return `${label} must be an object with start, end, and attendee_count.`;
-  const start = readTimestamp(value.start);
-  if (start === null) return `${label}.start must be ${TIMESTAMP_SHAPE}.`;
-  const end = readTimestamp(value.end);
-  if (end === null) return `${label}.end must be ${TIMESTAMP_SHAPE}.`;
-  const attendeeCount = value.attendee_count;
-  if (typeof attendeeCount !== 'number' || !Number.isInteger(attendeeCount) || attendeeCount < 0) {
-    return `${label}.attendee_count must be a whole number, 0 or more.`;
-  }
-  const organizer = value.organizer;
-  if (organizer !== undefined && organizer !== null && typeof organizer !== 'string') {
-    return `${label}.organizer must be an email address.`;
-  }
-  if (start.kind !== end.kind) return `${label} mixes a date and a date-time; an all-day event gives both as dates.`;
-  if (end.at.toMillis() < start.at.toMillis()) return `${label} ends before it starts.`;
-  if (start.kind === 'date') return { kind: 'all_day' };
-  return {
-    kind: 'timed',
-    start: start.at,
-    end: end.at,
-    attendeeCount,
-    organizer: typeof organizer === 'string' ? normalizeAddress(organizer) : null,
-  };
-}
-
-function readEvents(args: Record<string, unknown>): ParsedEvent[] {
-  const value: unknown = args.events;
-  if (!Array.isArray(value)) fail('events must be a list of events.');
-  const items: unknown[] = value;
-  if (items.length > MAX_EVENTS) {
-    fail(`Too many events: ${items.length}. The limit is ${MAX_EVENTS}; use a shorter window.`);
-  }
-  const events: ParsedEvent[] = [];
-  const problems: string[] = [];
-  items.forEach((item, index) => {
-    const parsed = parseEvent(item, index);
-    if (typeof parsed === 'string') problems.push(parsed);
-    else events.push(parsed);
-  });
-  if (problems.length > 0) {
-    const listed = problems.slice(0, MAX_LISTED_PROBLEMS);
-    const unlisted = problems.length - listed.length;
-    fail(
-      [
-        `Invalid events: ${problems.length} of ${items.length}, so nothing was counted.`,
-        ...listed,
-        ...(unlisted > 0 ? [`${unlisted} more invalid event${unlisted === 1 ? ' is' : 's are'} not listed.`] : []),
-      ].join(' '),
-    );
-  }
-  return events;
-}
-
 function readInput(args: Record<string, unknown>): StatsInput {
   const zone = readTimezone(args);
   const from = readDate(args, 'from');
@@ -295,8 +212,17 @@ function readInput(args: Record<string, unknown>): StatsInput {
       `The window covers ${days} days; the limit is ${MAX_WINDOW_DAYS} days (about eight weeks). Use a shorter window.`,
     );
   }
-  const principalAddresses = readAddresses(args);
-  return { zone, from, to, days, events: readEvents(args), principalAddresses };
+  const principalAddresses = readAddressList(args, 'principal_addresses', false);
+  const files = readFiles(args);
+  return {
+    zone,
+    from,
+    to,
+    days,
+    events: readEvents(files, FILE_ROOTS, zone),
+    principal: new Mailboxes(principalAddresses),
+    principalNamed: principalAddresses.length > 0,
+  };
 }
 
 /**
@@ -310,16 +236,20 @@ function endMinuteOnStartDay(start: ValidDateTime, end: ValidDateTime): number |
   return isoDate(end) === nextDate && atMidnight ? 24 * 60 : null;
 }
 
-function classify(event: ParsedEvent, input: StatsInput): Meeting | SetAside {
-  if (event.kind === 'all_day') return 'all_day';
-  const start = valid(event.start.setZone(input.zone));
-  const end = valid(event.end.setZone(input.zone));
+function classify(event: CalendarEvent, input: StatsInput): Meeting | SetAside {
+  if (event.status === 'cancelled') return 'cancelled';
+  if (principalResponse(event, input.principal) === 'declined') return 'declined';
+  if (event.allDay) return 'all_day';
+  const { start, end } = event;
   const date = isoDate(start);
   if (date < isoDate(input.from) || date > isoDate(input.to)) return 'outside_window';
   if (end.toMillis() === start.toMillis()) return 'zero_length';
   const endMinute = endMinuteOnStartDay(start, end);
   if (endMinute === null) return 'crosses_midnight';
-  if (event.attendeeCount < 2) return 'solo_blocks';
+  // Its size is unknown, so it is neither a block nor a meeting of any size.
+  if (event.attendeesOmitted) return 'attendees_omitted';
+  const attendeeCount = event.attendees.filter((party) => !isRoom(party)).length;
+  if (attendeeCount < 2) return 'solo_blocks';
   return {
     date,
     weekday: weekdayOf(start),
@@ -328,8 +258,9 @@ function classify(event: ParsedEvent, input: StatsInput): Meeting | SetAside {
     startMinute: minuteOfDay(start),
     endMinute,
     lengthMinutes: Math.round((end.toMillis() - start.toMillis()) / MINUTE_MS),
-    attendeeCount: event.attendeeCount,
-    organizer: event.organizer,
+    attendeeCount,
+    organizedByPrincipal:
+      event.organizer !== null && (event.organizer.self || input.principal.has(event.organizer.email)),
   };
 }
 
@@ -400,18 +331,33 @@ function gapStats(days: Iterable<readonly Meeting[]>): ScheduleStatsResult['gaps
 }
 
 export function computeScheduleStats(input: StatsInput): ScheduleStatsResult {
-  const counts = {
+  const counts: ScheduleStatsResult['events'] = {
     received: input.events.length,
     meetings: 0,
+    duplicate_copies: 0,
+    cancelled: 0,
+    declined: 0,
     solo_blocks: 0,
     all_day: 0,
     zero_length: 0,
     crosses_midnight: 0,
+    attendees_omitted: 0,
     outside_window: 0,
   };
-  const meetings: Meeting[] = [];
+  // One meeting per key: the first copy that is a meeting stands for it, else the first copy.
+  const kept = new Map<string, Meeting | SetAside>();
   for (const event of input.events) {
     const classified = classify(event, input);
+    const seen = kept.get(event.meetingKey);
+    if (seen === undefined) {
+      kept.set(event.meetingKey, classified);
+      continue;
+    }
+    counts.duplicate_copies++;
+    if (typeof seen === 'string' && typeof classified !== 'string') kept.set(event.meetingKey, classified);
+  }
+  const meetings: Meeting[] = [];
+  for (const classified of kept.values()) {
     if (typeof classified === 'string') {
       counts[classified]++;
     } else {
@@ -439,7 +385,6 @@ export function computeScheduleStats(input: StatsInput): ScheduleStatsResult {
     lastEnds[weekday].push(Math.max(...day.map((meeting) => meeting.endMinute)));
   }
 
-  const addresses = input.principalAddresses;
   return {
     timezone: input.zone,
     window: { from: isoDate(input.from), to: isoDate(input.to), days: input.days },
@@ -472,10 +417,9 @@ export function computeScheduleStats(input: StatsInput): ScheduleStatsResult {
       all: lengthStats(meetings),
       one_on_one: lengthStats(meetings.filter((meeting) => meeting.attendeeCount === 2)),
       group: lengthStats(meetings.filter((meeting) => meeting.attendeeCount >= 3)),
-      organized_by_principal:
-        addresses === null
-          ? null
-          : lengthStats(meetings.filter((meeting) => meeting.organizer !== null && addresses.has(meeting.organizer))),
+      organized_by_principal: input.principalNamed
+        ? lengthStats(meetings.filter((meeting) => meeting.organizedByPrincipal))
+        : null,
     },
     gaps: gapStats(byDate.values()),
     notes:
@@ -485,42 +429,19 @@ export function computeScheduleStats(input: StatsInput): ScheduleStatsResult {
   };
 }
 
-function json(value: unknown): CallToolResult {
-  return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] };
-}
-
 export const scheduleStats: McpToolDefinition = {
   tool: {
     name: 'schedule_stats',
-    description: `Count the principal's calendar history into candidate scheduling preferences: the usual start and end of the working day for each weekday, the most common meeting lengths, and the usual gaps between meetings. Give every event from a window of at most ${MAX_WINDOW_DAYS} days (about eight weeks), leaving out cancelled events and ones the principal declined; times are read on the principal's clocks in \`timezone\`. Only meetings with at least one other attendee are counted. All-day events, blocks with no other attendee, zero-length events, events that cross midnight, and events outside the window are counted and set aside. Overlapping meetings are merged before gaps are measured, and a gap of more than ${BUFFER_GAP_LIMIT_MINUTES} minutes is free time, not a gap between meetings. A usual start is the middle of each day's first start (the earlier middle when the days split evenly); a usual end is the middle of each day's last end (the later middle). One invalid event refuses the whole call and is named.`,
+    description: `Count the principal's calendar history into candidate scheduling preferences: the usual start and end of the working day for each weekday, the most common meeting lengths, and the usual gaps between meetings. Reads saved gog calendar events output for a window of at most ${MAX_WINDOW_DAYS} days (about eight weeks); times are read on the principal's clocks in \`timezone\`. Only meetings with at least one other person are counted, and a meeting on several of the principal's calendars counts once. Cancelled events, events the principal declined, all-day events, blocks with no other person (rooms are not people), zero-length events, events that cross midnight, events whose guest list Google left out, and events outside the window are counted and set aside. Overlapping meetings are merged before gaps are measured, and a gap of more than ${BUFFER_GAP_LIMIT_MINUTES} minutes is free time, not a gap between meetings. A usual start is the middle of each day's first start (the earlier middle when the days split evenly); a usual end is the middle of each day's last end (the later middle). A file that is malformed, incomplete, or outside the workspace and temp directory, or that holds one invalid event, refuses the whole call and is named.`,
     inputSchema: {
       type: 'object' as const,
       properties: {
+        files: FILES_SCHEMA,
         timezone: { type: 'string', description: 'The principal\'s IANA timezone, such as "Africa/Lagos".' },
         from: { type: 'string', description: 'First day of the window, YYYY-MM-DD.' },
         to: {
           type: 'string',
           description: `Last day of the window, YYYY-MM-DD, included. The window is at most ${MAX_WINDOW_DAYS} days.`,
-        },
-        events: {
-          type: 'array',
-          maxItems: MAX_EVENTS,
-          description: 'Every event in the window, each once.',
-          items: {
-            type: 'object',
-            properties: {
-              start: { type: 'string', description: `Start: ${TIMESTAMP_SHAPE}.` },
-              end: { type: 'string', description: `End: ${TIMESTAMP_SHAPE}. All-day events end on the day after.` },
-              attendee_count: {
-                type: 'integer',
-                minimum: 0,
-                description:
-                  'Everyone invited, including the principal and the organizer; 0 when the event has no guests.',
-              },
-              organizer: { type: 'string', description: "The organizer's email address." },
-            },
-            required: ['start', 'end', 'attendee_count'],
-          },
         },
         principal_addresses: {
           type: 'array',
@@ -529,18 +450,11 @@ export const scheduleStats: McpToolDefinition = {
             "The principal's email addresses. When given, lengths of the meetings the principal organized are reported separately.",
         },
       },
-      required: ['timezone', 'from', 'to', 'events'],
+      required: ['files', 'timezone', 'from', 'to'],
     },
   },
   async handler(args) {
-    try {
-      return json(computeScheduleStats(readInput(args)));
-    } catch (error) {
-      if (error instanceof StatsInputError) {
-        return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
-      }
-      throw error;
-    }
+    return answer(() => computeScheduleStats(readInput(args)));
   },
 };
 
