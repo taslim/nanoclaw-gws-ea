@@ -619,11 +619,6 @@ beforeEach(async () => {
   );
   await addPrincipalAddress(PRINCIPAL);
   await addPrincipalAddress(PRINCIPAL_HOME);
-  const pinned = await dispatch(
-    { id: 'pin', command: 'dkim-selectors-pin', args: { domain: 'principal.example', selector: 'google' } },
-    { caller: 'host' },
-  );
-  expect(pinned.ok).toBe(true);
 
   gmail = new FakeGmail();
   calendar = new FakeCalendar();
@@ -663,14 +658,12 @@ describe('the inbox', () => {
     });
   });
 
-  it('lets only the host pin a DKIM selector', async () => {
-    const agent = await dispatch(
-      { id: 'x', command: 'dkim-selectors-pin', args: { domain: 'principal.example', selector: 'evil' } },
-      { caller: 'agent', agentGroupId: 'ag-main', sessionId: main.id, messagingGroupId: 'mg-dm' },
-    );
-    expect(agent).toMatchObject({ ok: false, error: { code: 'forbidden' } });
-    const list = await dispatch({ id: 'y', command: 'dkim-selectors-list', args: {} }, { caller: 'host' });
-    expect(list).toMatchObject({ ok: true, data: [{ domain: 'principal.example', selector: 'google' }] });
+  it("takes the principal's verified mail from any of their addresses as theirs, with nothing for the operator to set up", async () => {
+    gmail.receive({ from: `Pat <${PRINCIPAL_HOME}>`, auth: 'principal', body: 'Robin, move my 3pm to Friday.' });
+    await inbox.tick();
+    const [note] = notes('gws-ea-inbox.principal-mail');
+    expect(note.note).toMatchObject({ type: 'gws-ea-inbox.principal-mail', from: PRINCIPAL_HOME });
+    expect(note.text).toContain('Robin, move my 3pm to Friday.');
   });
 });
 
@@ -867,7 +860,10 @@ describe('inbound triage (U17)', () => {
     expect(note.text).toMatch(/<<<EXTERNAL_UNTRUSTED_CONTENT[^]*Can we find 30 minutes with Pat[^]*END_EXTERNAL/);
     expect(note.text).toContain('close');
     const threadKey = String(note.note?.thread_key);
-    expect(note.text).toContain(threadKey);
+    expect(note.text).toContain(`meeting_arrange with thread_key ${threadKey}`);
+    expect(note.text).toMatch(/\bemail_respond\b[^]*\bemail_dismiss\b/u);
+    // What reaches the principal is main's judgment, not the note's.
+    expect(note.text).not.toMatch(/tell the principal/iu);
     expect(await getThreadParticipants(threadKey)).toMatchObject({
       origin: 'inbound',
       state: 'awaiting-arrange',
@@ -1018,7 +1014,7 @@ describe('inbound triage (U17)', () => {
       from: PRINCIPAL,
     });
     expect(note.text).toContain('Robin, please find 30 minutes for us.');
-    expect(note.text).toContain(`arrange with thread_key ${threadKey}`);
+    expect(note.text).toContain(`meeting_arrange with thread_key ${threadKey}`);
     expect(notes('gws-ea-inbox.copy-in')).toEqual([]);
 
     const { session, released } = await takeOver(threadKey);
@@ -1114,6 +1110,7 @@ describe('inbound triage (U17)', () => {
       people: [SAM, LEE],
     });
     expect(held.text).toMatch(/<<<EXTERNAL_UNTRUSTED_CONTENT[^]*Adding Lee[^]*END_EXTERNAL/);
+    expect(held.text).toMatch(/\bmeeting_arrange\b[^]*\bemail_respond\b[^]*\bemail_dismiss\b/u);
     expect((await getThreadParticipants(threadKey))?.people).toEqual({ to: [SAM], cc: [LEE], bcc: [] });
 
     const { session, released } = await takeOver(threadKey);
@@ -1215,8 +1212,8 @@ describe('a thread the principal copies Robin into (F1)', () => {
     expect(copyIn.text).toContain('Adding my assistant to find time for us.');
     expect(copyIn.note).toMatchObject({ participants: [SALES] });
     const threadKey = String(copyIn.note?.thread_key);
-    expect(copyIn.text).toContain(`arrange with thread_key ${threadKey}`);
-    expect(copyIn.text).toMatch(/respond[^]*dismiss/);
+    expect(copyIn.text).toContain(`meeting_arrange with thread_key ${threadKey}`);
+    expect(copyIn.text).toMatch(/\bemail_respond\b[^]*\bemail_dismiss\b/u);
     expect(copyIn.text).not.toMatch(/can't take it on/);
 
     gmail.receive({
@@ -1674,7 +1671,7 @@ describe("the principal's email answered by email (U19)", () => {
       gmail_thread_id: 'g-pat',
       from: PRINCIPAL,
     });
-    expect(note.text).toContain(`reply_to_principal`);
+    expect(note.text).toContain('email_reply_to_principal');
     expect(note.text).toContain(id);
 
     const sentId = await sendPrincipalReply({
@@ -1752,11 +1749,6 @@ describe('health', () => {
     expect(chatSends).toHaveLength(1);
   });
 
-  it('names a principal domain that has no pinned selector', async () => {
-    await addPrincipalAddress('pat@unpinned.example');
-    expect((await getInboxHealth()).principalDomainsWithoutSelector).toEqual(['home.example', 'unpinned.example']);
-  });
-
   it('reaches status through a hidden host-only command, in the shape status reads', async () => {
     gmail.historyFailures = 5;
     for (let i = 0; i < 5; i += 1) await inbox.tick();
@@ -1770,7 +1762,6 @@ describe('health', () => {
         since: expect.any(String),
         lastSuccessAt: expect.any(String),
         calendarNotifications: { state: 'ok', reason: null },
-        principalDomainsWithoutSelector: ['home.example'],
       },
     });
 

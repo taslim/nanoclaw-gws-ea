@@ -14,10 +14,14 @@
  *   close may meet outside working hours, within `PERSONAL_HOURS`; everyone
  *   else only within working hours (R13). Protected time applies to everyone.
  * - Candidates start on a half-hour grid of the principal's clock. The best
- *   ones are ranked by level: the principal's preferred times first for the
- *   inner circle and close, the next two working days first for active, and
- *   plain open time for known and unknown. They are spread across days,
- *   never overlap, and are capped.
+ *   ones are ranked as a person would pick them (KTD9): the principal's
+ *   preferred times first for everyone, working hours before the evenings
+ *   and weekends the inner circle and close may use, and for someone active
+ *   the next two working days first (R13). They are spread across days and
+ *   times of day, never overlap, and are capped; a narrow window gives the
+ *   fewer times it holds.
+ * - Offers start the next day, unless the window ends today: an email read
+ *   later in the day should not find its times gone.
  */
 import { createHash } from 'node:crypto';
 
@@ -96,6 +100,8 @@ export const DEFAULT_MEETING_KIND = 'default';
 const SAME_DAY_SPACING_MINUTES = 120;
 /** Active counterparts' times come from this many working days first (R13). */
 const ACTIVE_WORKING_DAYS = 2;
+/** Noon on the principal's clock: offers alternate either side of it where they can. */
+const NOON = 12 * 60;
 
 const MINUTE = 60_000;
 const DAY_MS = 24 * 60 * MINUTE;
@@ -303,7 +309,7 @@ export function schedulingRules(values: SchedulingPreferenceValues, meetingKind:
 // Open times
 // ---------------------------------------------------------------------------
 
-/** The inner circle and close: they may meet outside working hours, and only they report needs-room. */
+/** The inner circle and close: they may meet outside working hours, and room is made only for them. */
 export function usesPersonalHours(level: MeetingLevel): boolean {
   return level === 'inner-circle' || level === 'close';
 }
@@ -374,44 +380,83 @@ function insidePreferred(slot: Span, query: SlotQuery): boolean {
   });
 }
 
+/** Whether a slot lies inside the principal's working hours that day. */
+function insideWorkingHours(slot: Span, query: SlotQuery): boolean {
+  const local = localTime(slot.start, query.timezone);
+  const hours = query.rules.workingHours.get(local.weekday);
+  if (!hours) return false;
+  const day = onDay(local, hours, query.timezone);
+  return slot.start >= day.start && slot.end <= day.end;
+}
+
 /**
- * Rank open times by the level's rule (R13) and choose up to `limit` to
- * offer: within each rank, first one per day, then a second per day at least
- * two hours apart, then any time left that overlaps none already chosen.
+ * Rank open times as a person would pick them (KTD9, R13) and choose up to
+ * `limit` to offer. The rank: the principal's preferred times first, then
+ * working hours before personal hours, and for someone active the next two
+ * working days first. Within each rank, one per day at a new hour of the
+ * day, alternating either side of noon where the open times allow; then one
+ * per day at a new hour; then one per day; then a second per day at least
+ * two hours apart; then any time left that overlaps none already chosen.
  */
 export function bestSlots(query: SlotQuery, open: readonly Span[], limit: number, now: number): Candidate[] {
   const horizon =
     query.level === 'active' ? workingDayEnd(now, ACTIVE_WORKING_DAYS, query.rules, query.timezone) : undefined;
-  const tierOf = (slot: Span): number => {
-    if (usesPersonalHours(query.level)) return insidePreferred(slot, query) ? 0 : 1;
-    if (query.level === 'active') return horizon !== undefined && slot.end <= horizon ? 0 : 1;
-    return 0;
-  };
+  const tierOf = (slot: Span): number =>
+    (insidePreferred(slot, query) ? 0 : 4) +
+    (insideWorkingHours(slot, query) ? 0 : 2) +
+    (horizon !== undefined && slot.end > horizon ? 1 : 0);
   const ranked: Candidate[] = open
     .map((slot) => ({ ...slot, day: dateKey(localTime(slot.start, query.timezone)), tier: tierOf(slot) }))
     .sort((a, b) => a.tier - b.tier || a.start - b.start);
 
   const chosen: Candidate[] = [];
   const spacing = SAME_DAY_SPACING_MINUTES * MINUTE;
+  const minuteOf = (slot: Span): number => localTime(slot.start, query.timezone).minuteOfDay;
+  const hourOf = (slot: Span): number => Math.floor(minuteOf(slot) / 60);
   const fits = (candidate: Candidate, perDay: number | undefined): boolean => {
     if (chosen.some((taken) => overlaps(taken, candidate))) return false;
     if (perDay === undefined) return true;
     const sameDay = chosen.filter((taken) => taken.day === candidate.day);
     return sameDay.length < perDay && sameDay.every((taken) => Math.abs(taken.start - candidate.start) >= spacing);
   };
-  const take = (candidates: readonly Candidate[], perDay: number | undefined): void => {
+  /** Whether a time adds variety: a new hour of the day, and with `alternate` the other side of noon from the last one. */
+  const varied = (candidate: Candidate, alternate: boolean): boolean => {
+    if (chosen.some((taken) => hourOf(taken) === hourOf(candidate))) return false;
+    const last = chosen.at(-1);
+    return !alternate || last === undefined || minuteOf(last) < NOON !== minuteOf(candidate) < NOON;
+  };
+  const take = (
+    candidates: readonly Candidate[],
+    perDay: number | undefined,
+    variety: 'alternate' | 'new-hour' | 'any',
+  ): void => {
     for (const candidate of candidates) {
       if (chosen.length >= limit) return;
-      if (!chosen.includes(candidate) && fits(candidate, perDay)) chosen.push(candidate);
+      if (chosen.includes(candidate) || !fits(candidate, perDay)) continue;
+      if (variety !== 'any' && !varied(candidate, variety === 'alternate')) continue;
+      chosen.push(candidate);
     }
   };
   for (const tier of [...new Set(ranked.map((candidate) => candidate.tier))]) {
     const inTier = ranked.filter((candidate) => candidate.tier === tier);
-    take(inTier, 1);
-    take(inTier, 2);
+    take(inTier, 1, 'alternate');
+    take(inTier, 1, 'new-hour');
+    take(inTier, 1, 'any');
+    take(inTier, 2, 'any');
   }
-  take(ranked, undefined);
+  take(ranked, undefined, 'any');
   return chosen;
+}
+
+/**
+ * The earliest start to offer from `now`: the next day, unless the window
+ * ends today, and never sooner than the notice. An email is read later, so
+ * a time later today is offered only when the meeting must be today.
+ */
+export function earliestOffer(now: number, window: Span, timezone: string, noticeMinutes: number): number {
+  const notice = now + noticeMinutes * MINUTE;
+  const tomorrow = zonedInstant(nextDate(localTime(now, timezone)), 0, timezone);
+  return window.end <= tomorrow ? notice : Math.max(notice, tomorrow);
 }
 
 /**

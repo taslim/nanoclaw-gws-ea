@@ -35,11 +35,18 @@ export const EXTERNAL_EMAIL_PLUGIN = 'gws-ea-external-email';
 export const EXTERNAL_EMAIL_NAME = 'external-email';
 
 /**
- * Exactly what the group holds: `send_message`, and its meeting tools. No
- * shell, files, web, subagents, MCP servers, or `conversation-context`, so
- * each of its sessions is sealed from every other.
+ * Exactly what the group holds: `send_message`, its meeting tools,
+ * `request_status` for a meeting request the host was slow to answer, and
+ * the `time_*` calculators, which compute over the container's clock and
+ * reveal nothing. No shell, files, web, subagents, MCP servers, or
+ * `conversation-context`, so each of its sessions is sealed from every other.
  */
-export const EXTERNAL_EMAIL_CAPABILITIES: readonly string[] = ['reply', EXTERNAL_EMAIL_MEETINGS_CAPABILITY];
+export const EXTERNAL_EMAIL_CAPABILITIES: readonly string[] = [
+  'reply',
+  'time',
+  'request-status',
+  EXTERNAL_EMAIL_MEETINGS_CAPABILITY,
+];
 
 /**
  * Create the group when the profile names none, and return its ID. The

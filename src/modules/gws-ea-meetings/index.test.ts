@@ -2,7 +2,9 @@
  * What the meetings module teaches: main's side of the handoff to every
  * default group, external-email's side only to a group that holds it, and
  * each side only its own tools. Each side's capability names every tool it
- * grants, so an operator choosing capabilities sees them all.
+ * grants, so an operator choosing capabilities sees them all. The runner's
+ * tools and the host's actions share one set of names: the container cannot
+ * import the host, so the runner's copy is pinned here.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -34,7 +36,7 @@ import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/i
 import { composeGroupProjectDoc, DEFAULT_PROJECT_DOC } from '../../project-doc-compose.js';
 import type { AgentGroup } from '../../types.js';
 import { EXTERNAL_EMAIL_MEETINGS_CAPABILITY } from '../gws-ea-external-email/index.js';
-import './index.js';
+import { MEETING_ACTIONS } from './index.js';
 
 const MODULES = path.join('container', 'agent-runner', 'src', 'mcp-tools');
 
@@ -74,26 +76,43 @@ describe('the meetings module', () => {
     const external = await composed('ag-external', ['reply', EXTERNAL_EMAIL_MEETINGS_CAPABILITY]);
     expect(external).toContain(moduleDoc(EXTERNAL_EMAIL_MEETINGS_CAPABILITY));
     expect(external).not.toContain('# NanoClaw Module: gws-ea-meetings\n');
-    expect(external).not.toContain('ask_organizer');
+    expect(external).not.toContain('meeting_arrange');
   });
 
   it("names every tool each side's capability grants", () => {
     const tools: Readonly<Record<string, readonly string[]>> = {
       'gws-ea-meetings': [
-        'arrange',
-        'reschedule',
-        'ask_organizer',
-        'cancel',
-        'amend',
-        'respond',
-        'dismiss',
-        'reply_to_principal',
+        'meeting_arrange',
+        'meeting_reschedule',
+        'meeting_cancel',
+        'meeting_amend',
+        'email_respond',
+        'email_dismiss',
+        'email_reply_to_principal',
       ],
-      [EXTERNAL_EMAIL_MEETINGS_CAPABILITY]: ['free_time', 'hold', 'release_holds', 'book', 'recipients', 'outcome'],
+      [EXTERNAL_EMAIL_MEETINGS_CAPABILITY]: [
+        'meeting_free_time',
+        'meeting_hold',
+        'meeting_book',
+        'meeting_ask_main',
+        'email_recipients',
+        'meeting_outcome',
+      ],
     };
+    // Every action the host answers is granted to one side or the other.
+    expect(Object.values(tools).flat().sort()).toEqual([...MEETING_ACTIONS].sort());
     for (const [key, names] of Object.entries(tools)) {
       const description = registered.get(key)?.description ?? '';
       for (const name of names) expect(description, `${key} names ${name}`).toContain(name);
     }
+  });
+});
+
+describe("the runner's meeting tools", () => {
+  it('each send the host action of their own name, and every action has its tool', () => {
+    const runner = fs.readFileSync(path.join(MODULES, 'gws-ea-meetings.ts'), 'utf8');
+    const names = [...runner.matchAll(/requestTool\(\{\s*name: '([a-z_]+)'/gu)].map((match) => match[1]);
+    expect(new Set(names).size).toBe(names.length);
+    expect([...names].sort()).toEqual([...MEETING_ACTIONS].sort());
   });
 });

@@ -8,21 +8,24 @@ import { PERSON_LEVELS, type PersonLevel } from '../gws-ea-people/db.js';
 
 /**
  * What `main` handed over: a meeting to arrange, move, or ask an organizer
- * to move, or one reply to write in a thread waiting for it (`respond`),
- * which has no length or window.
+ * to move, or a conversation in a thread waiting for it (`respond`), which
+ * has no length or window.
  */
 export const MEETING_KINDS = ['arrange', 'reschedule', 'ask_organizer', 'respond'] as const;
 export type MeetingKind = (typeof MEETING_KINDS)[number];
 /** The kinds that find a time. */
 export type SchedulingKind = Exclude<MeetingKind, 'respond'>;
 
-/** A live meeting holds its thread; every other state has ended it. */
-export const LIVE_STATES = ['opening', 'active', 'booked'] as const;
+/**
+ * A live meeting holds its thread; every other state has ended it. A
+ * `closing` meeting was called off and still owes the other side one line.
+ */
+export const LIVE_STATES = ['opening', 'active', 'booked', 'closing'] as const;
 export type MeetingState =
   | (typeof LIVE_STATES)[number]
   | 'settled'
   | 'not-scheduling'
-  | 'responded'
+  | 'done'
   | 'gave-up'
   | 'cancelled'
   | 'stopped'
@@ -42,8 +45,40 @@ export function lowestLevel(levels: readonly MeetingLevel[]): MeetingLevel {
   );
 }
 
-export const OUTCOMES = ['booked', 'settled', 'needs-room', 'not-scheduling', 'gave-up', 'responded'] as const;
+/** The endings `external-email` reports; a booking is reported by `meeting_book` itself (KTD8). */
+export const OUTCOMES = ['settled', 'not-scheduling', 'gave-up', 'done'] as const;
 export type Outcome = (typeof OUTCOMES)[number];
+
+/**
+ * What an invitation the assistant creates carries beyond its time and
+ * people, each set by judgment (KTD7): a title, notes that help the
+ * attendees, a place, and whether it has a Google Meet link.
+ */
+export interface Invitation {
+  readonly title?: string;
+  readonly notes?: string;
+  readonly location?: string;
+  readonly video_call?: boolean;
+}
+
+/** An invitation as the store keeps it, read back; anything else reads as none. */
+function parseInvitation(raw: string | null): Invitation | null {
+  if (raw === null) return null;
+  const parsed: unknown = JSON.parse(raw);
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+  const record = parsed as Record<string, unknown>;
+  const text = (key: string) => (typeof record[key] === 'string' ? { [key]: record[key] as string } : {});
+  return {
+    ...text('title'),
+    ...text('notes'),
+    ...text('location'),
+    ...(typeof record.video_call === 'boolean' ? { video_call: record.video_call } : {}),
+  };
+}
+
+/** What `external-email` can ask main about, never in its own words (KTD5). */
+export const ASK_TOPICS = ['time', 'length', 'people', 'place', 'other'] as const;
+export type AskTopic = (typeof ASK_TOPICS)[number];
 
 export interface MeetingCounterpart {
   /** The address the host took from a record, from Google, from mail, or from `main`. */
@@ -67,6 +102,8 @@ interface MeetingFields {
   readonly event_id: string | null;
   readonly purpose: string;
   readonly constraints: string | null;
+  /** What main wishes the invitation to carry; null when main said nothing about it. */
+  readonly invitation: Invitation | null;
   /** The kind of meeting whose buffer and preferred times apply; null for the principal's defaults. */
   readonly meeting_kind: string | null;
   readonly thread_key: string;
@@ -77,8 +114,11 @@ interface MeetingFields {
   /** Follow-through deadlines (KTD12): the nudge, then the release and gave-up. */
   readonly nudge_at: string | null;
   readonly give_up_at: string | null;
-  /** When a reply's email was delivered in its thread; null until then, and for every other kind. */
+  /** When delivery recorded the first email the job's conversation wrote in its thread; null until then. */
   readonly replied_at: string | null;
+  /** The question `external-email` put to main and is waiting on, and when; both null while none is open. */
+  readonly ask_about: AskTopic | null;
+  readonly asked_at: string | null;
   readonly created_at: string;
   readonly updated_at: string;
   readonly ended_at: string | null;
@@ -100,6 +140,9 @@ export type MeetingTerms =
     };
 
 type MeetingRow = MeetingFields & MeetingTerms;
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+/** A meeting row as SQL returns it: its invitation still JSON. */
+type StoredMeeting = DistributiveOmit<MeetingRow, 'invitation'> & { readonly invitation: string | null };
 
 export type Meeting = MeetingRow & { readonly counterparts: readonly MeetingCounterpart[] };
 /** A meeting that finds a time: every kind but `respond`. */
@@ -109,8 +152,6 @@ export function isScheduling(meeting: Meeting): meeting is SchedulingMeeting {
   return meeting.kind !== 'respond';
 }
 
-type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
-
 export type NewMeeting = DistributiveOmit<
   MeetingRow,
   | 'state'
@@ -119,6 +160,8 @@ export type NewMeeting = DistributiveOmit<
   | 'nudge_at'
   | 'give_up_at'
   | 'replied_at'
+  | 'ask_about'
+  | 'asked_at'
   | 'created_at'
   | 'updated_at'
   | 'ended_at'
@@ -155,27 +198,27 @@ const PATCHABLE: readonly (keyof MeetingPatch)[] = [
 
 const LIVE = LIVE_STATES.map((state) => `'${state}'`).join(', ');
 
-async function attachCounterparts(row: MeetingRow): Promise<Meeting> {
+async function attachCounterparts(row: StoredMeeting): Promise<Meeting> {
   const counterparts = await getDb().all<MeetingCounterpart>(
     `SELECT address, person_id, name, level FROM gws_ea_meeting_counterparts
       WHERE meeting_id = ? ORDER BY position`,
     row.id,
   );
-  return { ...row, counterparts };
+  return { ...row, invitation: parseInvitation(row.invitation), counterparts };
 }
 
-async function withCounterparts(row: MeetingRow | undefined): Promise<Meeting | undefined> {
+async function withCounterparts(row: StoredMeeting | undefined): Promise<Meeting | undefined> {
   return row ? attachCounterparts(row) : undefined;
 }
 
 export async function getMeeting(id: string): Promise<Meeting | undefined> {
-  return withCounterparts(await getDb().get<MeetingRow>('SELECT * FROM gws_ea_meetings WHERE id = ?', id));
+  return withCounterparts(await getDb().get<StoredMeeting>('SELECT * FROM gws_ea_meetings WHERE id = ?', id));
 }
 
 /** The meeting a request created, found again when the same request is replayed. */
 export async function findMeetingByRequest(sessionId: string, requestId: string): Promise<Meeting | undefined> {
   return withCounterparts(
-    await getDb().get<MeetingRow>(
+    await getDb().get<StoredMeeting>(
       'SELECT * FROM gws_ea_meetings WHERE requested_by_session = ? AND request_id = ?',
       sessionId,
       requestId,
@@ -186,7 +229,7 @@ export async function findMeetingByRequest(sessionId: string, requestId: string)
 /** The live meeting that holds a thread, if any: a booked one only until its event has passed. */
 export async function findLiveMeetingOnThread(threadKey: string): Promise<Meeting | undefined> {
   return withCounterparts(
-    await getDb().get<MeetingRow>(
+    await getDb().get<StoredMeeting>(
       `SELECT * FROM gws_ea_meetings WHERE thread_key = ? AND state IN (${LIVE}) AND ended_at IS NULL`,
       threadKey,
     ),
@@ -196,7 +239,7 @@ export async function findLiveMeetingOnThread(threadKey: string): Promise<Meetin
 /** The live meeting about an existing event (a reschedule or an ask_organizer), if any. */
 export async function findLiveMeetingForEvent(calendarId: string, eventId: string): Promise<Meeting | undefined> {
   return withCounterparts(
-    await getDb().get<MeetingRow>(
+    await getDb().get<StoredMeeting>(
       `SELECT * FROM gws_ea_meetings
         WHERE event_calendar_id = ? AND event_id = ? AND state IN ('opening', 'active')
         ORDER BY created_at DESC LIMIT 1`,
@@ -209,7 +252,7 @@ export async function findLiveMeetingForEvent(calendarId: string, eventId: strin
 /** The booked meeting whose own booking is this event, if any, until the event has passed. */
 export async function findBookedMeetingForEvent(calendarId: string, eventId: string): Promise<Meeting | undefined> {
   return withCounterparts(
-    await getDb().get<MeetingRow>(
+    await getDb().get<StoredMeeting>(
       `SELECT m.* FROM gws_ea_meetings m
          JOIN gws_ea_meeting_bookings b ON b.meeting_id = m.id
         WHERE b.calendar_id = ? AND b.event_id = ? AND m.state = 'booked' AND m.ended_at IS NULL
@@ -230,9 +273,9 @@ export async function insertMeeting(
     await db.run(
       `INSERT INTO gws_ea_meetings
          (id, kind, requested_by_session, request_id, state, level, booking_calendar_id, event_calendar_id,
-          event_id, length_minutes, window_start, window_end, purpose, constraints, meeting_kind, thread_key,
+          event_id, length_minutes, window_start, window_end, purpose, constraints, invitation, meeting_kind, thread_key,
           session_id, brief_version, replaces_meeting_id, nudge_at, give_up_at, created_at, updated_at, ended_at)
-       VALUES (?, ?, ?, ?, 'opening', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, NULL, NULL, ?, ?, NULL)`,
+       VALUES (?, ?, ?, ?, 'opening', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, NULL, NULL, ?, ?, NULL)`,
       meeting.id,
       meeting.kind,
       meeting.requested_by_session,
@@ -246,6 +289,7 @@ export async function insertMeeting(
       meeting.window_end,
       meeting.purpose,
       meeting.constraints,
+      meeting.invitation === null ? null : JSON.stringify(meeting.invitation),
       meeting.meeting_kind,
       meeting.thread_key,
       meeting.replaces_meeting_id,
@@ -333,6 +377,48 @@ export async function hadEarlierMeetingOnThread(threadKey: string, meetingId: st
   return row !== undefined;
 }
 
+/**
+ * Record the question `external-email` put to main, once: false when one is
+ * already open, or the meeting is no longer being arranged or booked. While
+ * it is open, the follow-through count waits on main, from `deadlines`.
+ */
+export async function openAsk(id: string, about: AskTopic, deadlines: Deadlines, at: string): Promise<boolean> {
+  const result = await getDb().run(
+    `UPDATE gws_ea_meetings SET ask_about = ?, asked_at = ?, nudge_at = ?, give_up_at = ?, updated_at = ?
+      WHERE id = ? AND asked_at IS NULL AND state IN ('active', 'booked') AND ended_at IS NULL`,
+    about,
+    at,
+    deadlines.nudge_at,
+    deadlines.give_up_at,
+    at,
+    id,
+  );
+  return result.changes > 0;
+}
+
+/**
+ * Close a meeting's open question, with the count that waited on main: the
+ * conversation's next email starts its own. Changes nothing when none is open.
+ */
+export async function closeAsk(id: string, at: string): Promise<void> {
+  await getDb().run(
+    `UPDATE gws_ea_meetings SET ask_about = NULL, asked_at = NULL, nudge_at = NULL, give_up_at = NULL, updated_at = ?
+      WHERE id = ? AND asked_at IS NOT NULL`,
+    at,
+    id,
+  );
+}
+
+/** Record what main now wishes the meeting's invitation to carry. */
+export async function setMeetingInvitation(id: string, invitation: Invitation, at: string): Promise<void> {
+  await getDb().run(
+    'UPDATE gws_ea_meetings SET invitation = ?, updated_at = ? WHERE id = ?',
+    JSON.stringify(invitation),
+    at,
+    id,
+  );
+}
+
 /** Clear a meeting's deadlines: no nudge and no give-up follows. */
 export async function clearDeadlines(id: string, at: string): Promise<void> {
   await getDb().run(
@@ -346,12 +432,17 @@ export async function clearDeadlines(id: string, at: string): Promise<void> {
 // Follow-through (KTD12)
 // ---------------------------------------------------------------------------
 
+/** When the one nudge is due, if the job has one (a conversation has none), and when it is given up. */
 export interface Deadlines {
-  readonly nudge_at: string;
+  readonly nudge_at: string | null;
   readonly give_up_at: string;
 }
 
-/** Start an active meeting's deadlines, unless some are already running: a later hold never pushes them out. */
+/**
+ * Start an active meeting's deadlines, unless some are already running: a
+ * later email or hold never pushes them out, and a nudge's own email never
+ * restarts the count it belongs to.
+ */
 export async function startDeadlines(id: string, deadlines: Deadlines, at: string): Promise<void> {
   await getDb().run(
     `UPDATE gws_ea_meetings SET nudge_at = ?, give_up_at = ?, updated_at = ?
@@ -363,10 +454,11 @@ export async function startDeadlines(id: string, deadlines: Deadlines, at: strin
   );
 }
 
-/** Start an active meeting's deadlines again, from a reply. */
+/** Start an active meeting's deadlines again, from the other side's email, unless main has a question open. */
 export async function restartDeadlines(id: string, deadlines: Deadlines, at: string): Promise<void> {
   await getDb().run(
-    `UPDATE gws_ea_meetings SET nudge_at = ?, give_up_at = ?, updated_at = ? WHERE id = ? AND state = 'active'`,
+    `UPDATE gws_ea_meetings SET nudge_at = ?, give_up_at = ?, updated_at = ?
+      WHERE id = ? AND state = 'active' AND asked_at IS NULL`,
     deadlines.nudge_at,
     deadlines.give_up_at,
     at,
@@ -419,11 +511,16 @@ export async function releaseGiveUp(id: string, giveUpAt: string, at: string): P
   );
 }
 
-/** Every meeting still being arranged that has a deadline running, and every give-up claimed but not yet finished. */
+/**
+ * Every live meeting with a deadline running (one being arranged, a booked
+ * one waiting on main, or one owing its closing line), and every give-up
+ * claimed but not yet finished.
+ */
 export async function listMeetingsWithDeadlines(): Promise<Meeting[]> {
-  const rows = await getDb().all<MeetingRow>(
+  const rows = await getDb().all<StoredMeeting>(
     `SELECT * FROM gws_ea_meetings
-      WHERE (state = 'active' AND (nudge_at IS NOT NULL OR give_up_at IS NOT NULL))
+      WHERE (state IN ('active', 'booked', 'closing') AND ended_at IS NULL
+             AND (nudge_at IS NOT NULL OR give_up_at IS NOT NULL))
          OR (state = 'gave-up' AND give_up_at IS NOT NULL)
       ORDER BY created_at`,
   );
@@ -440,7 +537,7 @@ interface BookingColumns {
 
 /** Every booked meeting whose conversation is still open, with its booking, earliest first. */
 export async function listOpenBookings(): Promise<Array<{ readonly meeting: Meeting; readonly booking: Booking }>> {
-  const rows = await getDb().all<MeetingRow & BookingColumns>(
+  const rows = await getDb().all<StoredMeeting & BookingColumns>(
     `SELECT m.*, b.calendar_id AS b_calendar_id, b.event_id AS b_event_id, b.start_at AS b_start_at,
             b.end_at AS b_end_at, b.booked_at AS b_booked_at
        FROM gws_ea_meetings m JOIN gws_ea_meeting_bookings b ON b.meeting_id = m.id
@@ -462,9 +559,9 @@ export async function listOpenBookings(): Promise<Array<{ readonly meeting: Meet
   );
 }
 
-/** Every reply job still at work, oldest first. */
+/** Every conversation still at work, oldest first. */
 export async function listLiveReplyJobs(): Promise<Meeting[]> {
-  const rows = await getDb().all<MeetingRow>(
+  const rows = await getDb().all<StoredMeeting>(
     "SELECT * FROM gws_ea_meetings WHERE kind = 'respond' AND state = 'active' ORDER BY created_at",
   );
   return Promise.all(rows.map((row) => attachCounterparts(row)));
@@ -472,7 +569,7 @@ export async function listLiveReplyJobs(): Promise<Meeting[]> {
 
 /** Every meeting that is no longer being arranged but still has holds recorded: a release that failed. */
 export async function listSettledMeetingsWithHolds(): Promise<Meeting[]> {
-  const rows = await getDb().all<MeetingRow>(
+  const rows = await getDb().all<StoredMeeting>(
     `SELECT * FROM gws_ea_meetings m
       WHERE m.state NOT IN ('opening', 'active')
         AND EXISTS (SELECT 1 FROM gws_ea_meeting_holds h WHERE h.meeting_id = m.id)`,
@@ -553,7 +650,10 @@ export interface Booking {
 
 /** The event the host's own `book` created or moved for the meeting, if it has booked one. */
 export async function getBooking(meetingId: string): Promise<Booking | undefined> {
-  return getDb().get<Booking>('SELECT * FROM gws_ea_meeting_bookings WHERE meeting_id = ?', meetingId);
+  return getDb().get<Booking>(
+    'SELECT meeting_id, calendar_id, event_id, start_at, end_at, booked_at FROM gws_ea_meeting_bookings WHERE meeting_id = ?',
+    meetingId,
+  );
 }
 
 export interface OfferedSlot {
@@ -608,11 +708,14 @@ export async function updateBookingTime(meetingId: string, startAt: string, endA
   );
 }
 
-/** Record the event `book` created or moved. The first booking stands. */
-export async function recordBooking(booking: Booking): Promise<void> {
+/**
+ * Record the event `book` created or moved, with what its invitation carries
+ * when the assistant wrote it; none for a move. The first booking stands.
+ */
+export async function recordBooking(booking: Booking, invitation?: Invitation): Promise<void> {
   await getDb().run(
-    `INSERT INTO gws_ea_meeting_bookings (meeting_id, calendar_id, event_id, start_at, end_at, booked_at)
-     VALUES (?, ?, ?, ?, ?, ?)
+    `INSERT INTO gws_ea_meeting_bookings (meeting_id, calendar_id, event_id, start_at, end_at, booked_at, invitation)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (meeting_id) DO NOTHING`,
     booking.meeting_id,
     booking.calendar_id,
@@ -620,6 +723,25 @@ export async function recordBooking(booking: Booking): Promise<void> {
     booking.start_at,
     booking.end_at,
     booking.booked_at,
+    invitation === undefined ? null : JSON.stringify(invitation),
+  );
+}
+
+/** What the booked event's invitation carries, as the assistant last wrote it; none for a move or a meeting not booked. */
+export async function getBookedInvitation(meetingId: string): Promise<Invitation | undefined> {
+  const row = await getDb().get<{ readonly invitation: string | null }>(
+    'SELECT invitation FROM gws_ea_meeting_bookings WHERE meeting_id = ?',
+    meetingId,
+  );
+  return parseInvitation(row?.invitation ?? null) ?? undefined;
+}
+
+/** Record what the booked event's invitation carries after main changed it. */
+export async function setBookedInvitation(meetingId: string, invitation: Invitation): Promise<void> {
+  await getDb().run(
+    'UPDATE gws_ea_meeting_bookings SET invitation = ? WHERE meeting_id = ?',
+    JSON.stringify(invitation),
+    meetingId,
   );
 }
 

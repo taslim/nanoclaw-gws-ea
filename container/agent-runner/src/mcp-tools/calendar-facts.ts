@@ -1,10 +1,10 @@
 /**
  * find_conflicts and people_stats: exact calendar facts, counted from gog's
- * own output.
+ * own output, read through the shared reader in calendar-events.ts.
  *
  * A model that copies events out of a calendar listing drops some, misreads
- * times, and cannot be checked. These tools read the JSON that
- * `gog calendar events ... --all-pages` saved to a file and do the counting:
+ * times, and cannot be checked. These tools do the counting over events the
+ * reader already parsed and validated:
  *
  * - find_conflicts lists every event on the principal's calendars that
  *   overlaps a candidate time. Unlike `gog calendar conflicts`, which compares
@@ -13,53 +13,67 @@
  *   principal declined, and free (transparent) events do not count; all-day
  *   busy events and free/busy-only blocks do. Times are compared as instants,
  *   and an all-day event runs from midnight to midnight on the principal's
- *   clocks, so a day with a clock change is 23 or 25 hours long.
+ *   clocks, so a day with a clock change is 23 or 25 hours long. A hold the
+ *   assistant placed for a meeting it is arranging is listed apart, as time
+ *   that can give way. The answer is only as good as the files, so the call
+ *   names the range they were fetched for, and a candidate outside it or a
+ *   file saved more than fifteen minutes ago is refused.
  * - people_stats counts, for each person, the meetings the principal organized
  *   or accepted with them. A stranger's unanswered or declined invitations
  *   never build a record. The principal, the assistant, rooms, and meetings of
  *   more than eight people are left out, and a meeting that sits on several of
  *   the principal's calendars counts once.
  *
- * Both read files only inside the agent's workspace or the container's temp
- * directory, refuse a file that is not complete gog events output, and name
- * the file they refuse. Names and titles come back capped and wrapped as
- * untrusted text, the way gog marks them, because other people wrote them.
+ * Names and titles come back capped and wrapped as untrusted text, the way
+ * gog marks them, because other people wrote them.
  */
 import { randomBytes } from 'crypto';
-import fs from 'fs';
-import os from 'os';
 import path from 'path';
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { DateTime } from 'luxon';
 
 import { TIMEZONE, isValidTimezone } from '../timezone.js';
+import {
+  DATE_TIME_WITH_OFFSET,
+  FILES_SCHEMA,
+  FILE_ROOTS,
+  Mailboxes,
+  answer,
+  fail,
+  isPrincipalParty,
+  isRoom,
+  normalizeEmail,
+  principalResponse,
+  readAddressList,
+  readEvents,
+  readFiles,
+  strongestResponse,
+  type CalendarEvent,
+} from './calendar-events.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 type ValidDateTime = DateTime<true>;
 
-export const WORKSPACE_DIR = '/workspace/agent';
-export const MAX_FILES = 10;
-export const MAX_FILE_BYTES = 16 * 1024 * 1024;
-export const MAX_EVENTS = 20_000;
+/**
+ * The key that grants find_conflicts and people_stats. Named here, not left
+ * to the barrel's load, so a test that imports this module directly still
+ * attributes the tools correctly.
+ */
+const CALENDAR_FACTS_CAPABILITY = 'calendar-facts';
+
 export const MAX_WINDOW_DAYS = 14;
+/** A conflict check reads only events fetched this recently: one turn of fetching and checking. */
+export const MAX_FILE_AGE_MINUTES = 15;
 /** A meeting with more people than this says little about any one of them. */
 export const MAX_MEETING_SIZE = 8;
 export const MAX_LISTED_CONFLICTS = 50;
 export const MAX_LISTED_PEOPLE = 100;
 export const MAX_NAME_CHARS = 64;
 export const MAX_TITLE_CHARS = 100;
-const MAX_LISTED_PROBLEMS = 5;
 const MINUTE_MS = 60_000;
 const DAY_MS = 86_400_000;
 
-const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
-const DATE_TIME_WITH_OFFSET = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})$/i;
 const DATE_TIME_SHAPE = 'a date-time with its UTC offset, such as 2026-10-06T10:00:00+01:00';
-const EMAIL = /^[^\s@]+@[^\s@]+$/;
-const GMAIL_DOMAINS = new Set(['gmail.com', 'googlemail.com']);
-const GOG_EVENTS_COMMAND =
-  'gog calendar events --calendars <calendarId>,<calendarId> --from <start> --to <end> --all-pages';
 
 /** How gog wraps text other people wrote (internal/outfmt/untrusted.go). */
 const UNTRUSTED_SOURCE = 'google_api';
@@ -92,9 +106,6 @@ const SPECIAL_TOKENS = [
 const RESERVED_SPECIAL_TOKEN = /<\|reserved_special_token_\d+\|>/g;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/g;
 
-/** The principal's own answer to an invitation; a stronger answer wins across copies. */
-const RESPONSE_RANK: Record<string, number> = { accepted: 3, tentative: 2, needsAction: 1, declined: 0 };
-
 export interface Conflict {
   /** Every principal calendar the counted copies sit on; empty when the file named none. */
   calendars: string[];
@@ -110,12 +121,27 @@ export interface Conflict {
   organizer: string | null;
 }
 
+/** Time the assistant holds for a meeting it is arranging: it can give way. */
+export interface HeldTime {
+  /** The meeting the time is held for, such as mtg-…. */
+  meeting_id: string;
+  /** Every principal calendar the hold sits on; empty when the file named none. */
+  calendars: string[];
+  event_id: string | null;
+  start: string;
+  end: string;
+  overlap_minutes: number;
+}
+
 export interface FindConflictsResult {
   timezone: string;
   window: { start: string; end: string };
   /** Earliest first. */
   conflicts: Conflict[];
   conflicts_not_listed: number;
+  /** Earliest first. */
+  holds: HeldTime[];
+  holds_not_listed: number;
   /** Every event copy read is in exactly one of the other counts. */
   events: {
     received: number;
@@ -125,6 +151,7 @@ export interface FindConflictsResult {
     free: number;
     outside_window: number;
     conflicting: number;
+    holds: number;
   };
 }
 
@@ -166,71 +193,6 @@ export interface CalendarFactsOptions {
   defaultTimezone: string;
 }
 
-/** A problem with the tool input, returned to the agent as an error result. */
-class CalendarFactsError extends Error {}
-
-function fail(message: string): never {
-  throw new CalendarFactsError(message);
-}
-
-/** A problem with one event, collected so a refusal can name several. */
-class EventProblem extends Error {}
-
-function problem(message: string): never {
-  throw new EventProblem(message);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function isErrno(error: unknown, code: string): boolean {
-  return error instanceof Error && (error as NodeJS.ErrnoException).code === code;
-}
-
-// ---- Identities -------------------------------------------------------------
-
-function normalizeEmail(value: string): string | null {
-  const email = value.trim().toLowerCase();
-  return EMAIL.test(email) ? email : null;
-}
-
-/**
- * Every spelling that reaches the same mailbox: lowercased, without a `+tag`,
- * and without the dots Gmail ignores. The people store keys identities the
- * same way. Used only to recognise the principal and the assistant, so a
- * variant spelling can never give either of them a record.
- *
- * The host holds the same rule as `identityMatchKey` in
- * `src/gws-ea/validation.ts`; change both together.
- */
-function mailboxKey(email: string): string {
-  const at = email.lastIndexOf('@');
-  if (at <= 0) return email;
-  let local = email.slice(0, at);
-  let domain = email.slice(at + 1);
-  const plus = local.indexOf('+');
-  if (plus > 0) local = local.slice(0, plus);
-  if (GMAIL_DOMAINS.has(domain)) {
-    const undotted = local.replaceAll('.', '');
-    if (undotted) local = undotted;
-    domain = 'gmail.com';
-  }
-  return `${local}@${domain}`;
-}
-
-class Mailboxes {
-  private readonly keys: ReadonlySet<string>;
-
-  constructor(emails: readonly string[]) {
-    this.keys = new Set(emails.map(mailboxKey));
-  }
-
-  has(email: string | null): boolean {
-    return email !== null && this.keys.has(mailboxKey(email));
-  }
-}
-
 // ---- Untrusted text ---------------------------------------------------------
 
 function sanitizeUntrusted(text: string): string {
@@ -262,247 +224,6 @@ function untrustedText(raw: string | null, limit: number): string | null {
   return `<<<EXTERNAL_UNTRUSTED_CONTENT id="${id}">>>\nSource: ${UNTRUSTED_SOURCE}\n---\n${capped}\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id="${id}">>>`;
 }
 
-// ---- Reading gog's output ---------------------------------------------------
-
-interface Party {
-  email: string | null;
-  displayName: string | null;
-  /** The entry for the calendar this copy sits on. */
-  self: boolean;
-  resource: boolean;
-  responseStatus: string | null;
-}
-
-interface CalendarEvent {
-  calendarId: string | null;
-  id: string | null;
-  iCalUID: string | null;
-  status: string | null;
-  summary: string | null;
-  transparent: boolean;
-  allDay: boolean;
-  /** On the principal's clocks. */
-  start: ValidDateTime;
-  end: ValidDateTime;
-  attendees: Party[];
-  attendeesOmitted: boolean;
-  organizer: { email: string | null; self: boolean } | null;
-  recurringEventId: string | null;
-  /** The same on every copy of one meeting, whichever calendar it sits on. */
-  meetingKey: string;
-}
-
-type EventTime = { kind: 'date'; date: string } | { kind: 'date_time'; at: ValidDateTime };
-
-function optionalString(record: Record<string, unknown>, key: string, label: string): string | null {
-  const value = record[key];
-  if (value === undefined || value === null || value === '') return null;
-  if (typeof value !== 'string') problem(`${label}.${key} must be text.`);
-  return value;
-}
-
-function optionalBoolean(record: Record<string, unknown>, key: string, label: string): boolean {
-  const value = record[key];
-  if (value === undefined || value === null) return false;
-  if (typeof value !== 'boolean') problem(`${label}.${key} must be true or false.`);
-  return value;
-}
-
-function readEventTime(value: unknown, label: string): EventTime {
-  const shape = `${label} must have a dateTime with its UTC offset, such as 2026-10-06T10:00:00+01:00, or a date`;
-  if (!isRecord(value)) problem(`${shape}.`);
-  const dateTime = optionalString(value, 'dateTime', label);
-  if (dateTime !== null) {
-    const text = dateTime.trim().toUpperCase();
-    const at = DateTime.fromISO(text, { setZone: true });
-    if (!DATE_TIME_WITH_OFFSET.test(text) || !at.isValid) problem(`${shape}.`);
-    return { kind: 'date_time', at };
-  }
-  const date = optionalString(value, 'date', label);
-  if (date !== null && ISO_DATE.test(date.trim()) && DateTime.fromISO(date.trim(), { zone: 'utc' }).isValid) {
-    return { kind: 'date', date: date.trim() };
-  }
-  problem(`${shape}.`);
-}
-
-function onClocks(time: EventTime, zone: string, label: string): ValidDateTime {
-  const local =
-    time.kind === 'date_time' ? time.at.setZone(zone) : DateTime.fromISO(time.date, { zone }).startOf('day');
-  if (!local.isValid) problem(`${label} is out of range.`);
-  return local;
-}
-
-function timeKey(time: EventTime): string {
-  return time.kind === 'date' ? time.date : String(time.at.toMillis());
-}
-
-function readParty(value: unknown, label: string): Party {
-  if (!isRecord(value)) problem(`${label} must be an object.`);
-  const email = optionalString(value, 'email', label);
-  return {
-    email: email === null ? null : normalizeEmail(email),
-    displayName: optionalString(value, 'displayName', label),
-    self: optionalBoolean(value, 'self', label),
-    resource: optionalBoolean(value, 'resource', label),
-    responseStatus: optionalString(value, 'responseStatus', label),
-  };
-}
-
-function parseEvent(value: unknown, label: string, fallbackKey: string, zone: string): CalendarEvent {
-  if (!isRecord(value)) problem(`${label} must be an object.`);
-  const start = readEventTime(value.start, `${label}.start`);
-  const end = readEventTime(value.end, `${label}.end`);
-  if (start.kind !== end.kind) problem(`${label} mixes a date and a date-time; an all-day event gives both as dates.`);
-  const localStart = onClocks(start, zone, `${label}.start`);
-  const localEnd = onClocks(end, zone, `${label}.end`);
-  if (localEnd.toMillis() < localStart.toMillis()) problem(`${label} ends before it starts.`);
-
-  const rawAttendees = value.attendees;
-  if (rawAttendees !== undefined && rawAttendees !== null && !Array.isArray(rawAttendees)) {
-    problem(`${label}.attendees must be a list.`);
-  }
-  const attendeeItems: unknown[] = Array.isArray(rawAttendees) ? rawAttendees : [];
-  const attendees = attendeeItems.map((item, index) => readParty(item, `${label}.attendees[${index}]`));
-
-  const rawOrganizer = value.organizer;
-  let organizer: CalendarEvent['organizer'] = null;
-  if (rawOrganizer !== undefined && rawOrganizer !== null) {
-    const party = readParty(rawOrganizer, `${label}.organizer`);
-    organizer = { email: party.email, self: party.self };
-  }
-
-  const original =
-    value.originalStartTime === undefined || value.originalStartTime === null
-      ? null
-      : readEventTime(value.originalStartTime, `${label}.originalStartTime`);
-  const id = optionalString(value, 'id', label);
-  const iCalUID = optionalString(value, 'iCalUID', label);
-  return {
-    calendarId: optionalString(value, 'CalendarID', label),
-    id,
-    iCalUID,
-    status: optionalString(value, 'status', label),
-    summary: optionalString(value, 'summary', label),
-    transparent: optionalString(value, 'transparency', label) === 'transparent',
-    allDay: start.kind === 'date',
-    start: localStart,
-    end: localEnd,
-    attendees,
-    attendeesOmitted: optionalBoolean(value, 'attendeesOmitted', label),
-    organizer,
-    recurringEventId: optionalString(value, 'recurringEventId', label),
-    // An occurrence of a series keeps its original start on every copy, even after it moves.
-    meetingKey: `${iCalUID ?? id ?? fallbackKey}|${timeKey(original ?? start)}`,
-  };
-}
-
-/** gog prints a page token only when the listing stopped early. */
-function hasMorePages(output: Record<string, unknown>): boolean {
-  const single = output.nextPageToken;
-  const multiple = output.nextPageTokens;
-  const singleMore = single !== undefined && single !== null && single !== '';
-  const multipleMore =
-    multiple !== undefined && multiple !== null && !(Array.isArray(multiple) && multiple.length === 0);
-  return singleMore || multipleMore;
-}
-
-function isWithin(directory: string, target: string): boolean {
-  const relative = path.relative(directory, target);
-  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
-}
-
-/** A root as the filesystem resolves it; a root that does not exist yet stays as written. */
-function realRoot(root: string): string {
-  try {
-    return fs.realpathSync(root);
-  } catch (error) {
-    if (isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR')) return path.resolve(root);
-    throw error;
-  }
-}
-
-function readJsonFile(input: string, roots: readonly string[]): unknown {
-  const where = `the agent workspace or the temp directory (${roots.join(', ')})`;
-  const absolute = path.resolve(roots[0], input);
-  if (!roots.some((root) => isWithin(path.resolve(root), absolute))) {
-    fail(`Refused ${input}: it is outside ${where}. Save gog's output there.`);
-  }
-  let real: string;
-  try {
-    real = fs.realpathSync(absolute);
-  } catch (error) {
-    if (isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR')) fail(`Refused ${input}: there is no such file.`);
-    throw error;
-  }
-  if (!roots.some((root) => isWithin(realRoot(root), real))) {
-    fail(`Refused ${input}: it leads outside ${where}.`);
-  }
-  const stat = fs.statSync(real);
-  if (!stat.isFile()) fail(`Refused ${input}: it is not a file.`);
-  if (stat.size > MAX_FILE_BYTES) {
-    fail(`Refused ${input}: it is over ${MAX_FILE_BYTES / (1024 * 1024)} MB. Use a shorter window.`);
-  }
-  try {
-    return JSON.parse(fs.readFileSync(real, 'utf8')) as unknown;
-  } catch (error) {
-    if (error instanceof SyntaxError) fail(`Refused ${input}: it is not valid JSON. Save gog's output unchanged.`);
-    throw error;
-  }
-}
-
-function readEventsFile(input: string, roots: readonly string[], zone: string): CalendarEvent[] {
-  const output = readJsonFile(input, roots);
-  if (!isRecord(output) || !Array.isArray(output.events)) {
-    fail(`Refused ${input}: it is not what gog calendar events prints, an object with an "events" list.`);
-  }
-  if (hasMorePages(output)) {
-    fail(`Refused ${input}: it holds only the first page of events. Run gog calendar events again with --all-pages.`);
-  }
-  const items: unknown[] = output.events;
-  const events: CalendarEvent[] = [];
-  const problems: string[] = [];
-  items.forEach((item, index) => {
-    try {
-      events.push(parseEvent(item, `events[${index}]`, `${input}#${index}`, zone));
-    } catch (error) {
-      if (!(error instanceof EventProblem)) throw error;
-      problems.push(error.message);
-    }
-  });
-  if (problems.length > 0) {
-    const listed = problems.slice(0, MAX_LISTED_PROBLEMS);
-    const unlisted = problems.length - listed.length;
-    fail(
-      [
-        `Refused ${input}: ${problems.length} of ${items.length} events are invalid, so nothing was counted.`,
-        ...listed,
-        ...(unlisted > 0 ? [`${unlisted} more invalid event${unlisted === 1 ? ' is' : 's are'} not listed.`] : []),
-      ].join(' '),
-    );
-  }
-  return events;
-}
-
-function readEvents(files: readonly string[], roots: readonly string[], zone: string): CalendarEvent[] {
-  const events: CalendarEvent[] = [];
-  for (const file of files) {
-    events.push(...readEventsFile(file, roots, zone));
-    if (events.length > MAX_EVENTS) fail(`The files hold more than ${MAX_EVENTS} events. Use a shorter window.`);
-  }
-  return events;
-}
-
-// ---- Arguments --------------------------------------------------------------
-
-function readFiles(args: Record<string, unknown>): string[] {
-  const value: unknown = args.files;
-  const shape = `files must list from 1 to ${MAX_FILES} paths to saved gog calendar events output.`;
-  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_FILES) fail(shape);
-  const items: unknown[] = value;
-  if (!items.every((item): item is string => typeof item === 'string' && item.trim() !== '')) fail(shape);
-  return items.map((item) => item.trim());
-}
-
 function readTimezone(args: Record<string, unknown>, fallback: string): string {
   const value = args.timezone;
   if (value === undefined || value === null || value === '') return fallback;
@@ -512,7 +233,7 @@ function readTimezone(args: Record<string, unknown>, fallback: string): string {
   return value;
 }
 
-function readInstant(args: Record<string, unknown>, key: 'start' | 'end', zone: string): ValidDateTime {
+function readInstant(args: Record<string, unknown>, key: 'start' | 'end' | 'from' | 'to', zone: string): ValidDateTime {
   const value = args[key];
   if (typeof value !== 'string' || !DATE_TIME_WITH_OFFSET.test(value.trim())) {
     fail(`${key} must be ${DATE_TIME_SHAPE}.`);
@@ -522,75 +243,30 @@ function readInstant(args: Record<string, unknown>, key: 'start' | 'end', zone: 
   return at;
 }
 
-function readAddressList(args: Record<string, unknown>, key: string, required: boolean): string[] {
-  const value: unknown = args[key];
-  if (value === undefined || value === null) {
-    if (required) fail(`${key} must list at least one email address.`);
-    return [];
-  }
-  if (!Array.isArray(value)) fail(`${key} must be a list of email addresses.`);
-  const items: unknown[] = value;
-  const addresses: string[] = [];
-  for (const item of items) {
-    const email = typeof item === 'string' ? normalizeEmail(item) : null;
-    if (email === null) fail(`${key} must be a list of email addresses; "${String(item)}" is not one.`);
-    addresses.push(email);
-  }
-  if (required && addresses.length === 0) fail(`${key} must list at least one email address.`);
-  return addresses;
-}
-
 function iso(at: ValidDateTime): string {
   return at.toISO({ suppressMilliseconds: true });
 }
 
-function json(value: unknown): CallToolResult {
-  return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] };
-}
-
-async function answer(compute: () => unknown): Promise<CallToolResult> {
-  try {
-    return json(compute());
-  } catch (error) {
-    if (error instanceof CalendarFactsError) {
-      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
-    }
-    throw error;
-  }
-}
-
-function strongestResponse(responses: ReadonlyArray<string | null>): string | null {
-  let strongest: string | null = null;
-  for (const response of responses) {
-    if (response === null) continue;
-    if (strongest === null || (RESPONSE_RANK[response] ?? -1) > (RESPONSE_RANK[strongest] ?? -1)) strongest = response;
-  }
-  return strongest;
-}
-
-/** The entry that speaks for the principal on this copy: the calendar's own, else the principal's addresses. */
-function isPrincipalParty(party: Party, principal: Mailboxes): boolean {
-  return party.self || principal.has(party.email);
-}
-
 // ---- find_conflicts ---------------------------------------------------------
 
-type ConflictOutcome = Exclude<keyof FindConflictsResult['events'], 'received'>;
-
-/**
- * The principal's answer on this copy. The calendar's own entry decides when
- * there is one; otherwise the principal's strongest answer from any address.
- */
-function principalResponse(event: CalendarEvent, principal: Mailboxes): string | null {
-  const own = event.attendees.find((party) => party.self);
-  if (own) return own.responseStatus;
-  return strongestResponse(
-    event.attendees.filter((party) => principal.has(party.email)).map((party) => party.responseStatus),
-  );
-}
+/** Where a copy lands before an overlap is split into a conflict or a hold. */
+type ConflictOutcome = Exclude<keyof FindConflictsResult['events'], 'received' | 'conflicting' | 'holds'> | 'overlaps';
 
 function overlapMs(event: CalendarEvent, start: ValidDateTime, end: ValidDateTime): number {
   return Math.min(event.end.toMillis(), end.toMillis()) - Math.max(event.start.toMillis(), start.toMillis());
+}
+
+/** Earliest first, comparing two meetings by one copy of each. */
+function earliestFirst(a: CalendarEvent, b: CalendarEvent): number {
+  return (
+    a.start.toMillis() - b.start.toMillis() ||
+    a.end.toMillis() - b.end.toMillis() ||
+    a.meetingKey.localeCompare(b.meetingKey)
+  );
+}
+
+function calendarsOf(copies: readonly CalendarEvent[]): string[] {
+  return [...new Set(copies.map((copy) => copy.calendarId).filter((id) => id !== null))].sort();
 }
 
 function computeConflicts(input: {
@@ -609,37 +285,58 @@ function computeConflicts(input: {
     free: 0,
     outside_window: 0,
     conflicting: 0,
+    holds: 0,
   };
-  const meetings = new Map<string, CalendarEvent[]>();
+  // The copies of each meeting, by meeting; a hold also keeps the meeting it holds time for.
+  const conflicting = new Map<string, CalendarEvent[]>();
+  const held = new Map<string, { meetingId: string; copies: CalendarEvent[] }>();
   for (const event of input.events) {
     const outcome = classifyConflict(event, input);
-    counts[outcome]++;
-    if (outcome !== 'conflicting') continue;
-    const copies = meetings.get(event.meetingKey);
-    if (copies) copies.push(event);
-    else meetings.set(event.meetingKey, [event]);
+    if (outcome !== 'overlaps') {
+      counts[outcome]++;
+    } else if (event.heldFor === null) {
+      counts.conflicting++;
+      const copies = conflicting.get(event.meetingKey);
+      if (copies) copies.push(event);
+      else conflicting.set(event.meetingKey, [event]);
+    } else {
+      counts.holds++;
+      const hold = held.get(event.meetingKey);
+      if (hold) hold.copies.push(event);
+      else held.set(event.meetingKey, { meetingId: event.heldFor, copies: [event] });
+    }
   }
 
-  const conflicts = [...meetings.values()]
-    .sort(
-      ([a], [b]) =>
-        a.start.toMillis() - b.start.toMillis() ||
-        a.end.toMillis() - b.end.toMillis() ||
-        a.meetingKey.localeCompare(b.meetingKey),
-    )
+  const overlapMinutes = (event: CalendarEvent): number =>
+    Math.round(overlapMs(event, input.start, input.end) / MINUTE_MS);
+  const conflicts = [...conflicting.values()]
+    .sort(([a], [b]) => earliestFirst(a, b))
     .map((copies): Conflict => {
       const [first] = copies;
       return {
-        calendars: [...new Set(copies.map((copy) => copy.calendarId).filter((id) => id !== null))].sort(),
+        calendars: calendarsOf(copies),
         event_id: first.id,
         ical_uid: first.iCalUID,
         title: untrustedText(copies.find((copy) => copy.summary !== null)?.summary ?? null, MAX_TITLE_CHARS),
         start: iso(first.start),
         end: iso(first.end),
         all_day: first.allDay,
-        overlap_minutes: Math.round(overlapMs(first, input.start, input.end) / MINUTE_MS),
+        overlap_minutes: overlapMinutes(first),
         principal_response: strongestResponse(copies.map((copy) => principalResponse(copy, input.principal))),
         organizer: copies.find((copy) => copy.organizer?.email)?.organizer?.email ?? null,
+      };
+    });
+  const holds = [...held.values()]
+    .sort(({ copies: [a] }, { copies: [b] }) => earliestFirst(a, b))
+    .map(({ meetingId, copies }): HeldTime => {
+      const [first] = copies;
+      return {
+        meeting_id: meetingId,
+        calendars: calendarsOf(copies),
+        event_id: first.id,
+        start: iso(first.start),
+        end: iso(first.end),
+        overlap_minutes: overlapMinutes(first),
       };
     });
 
@@ -648,6 +345,8 @@ function computeConflicts(input: {
     window: { start: iso(input.start), end: iso(input.end) },
     conflicts: conflicts.slice(0, MAX_LISTED_CONFLICTS),
     conflicts_not_listed: Math.max(0, conflicts.length - MAX_LISTED_CONFLICTS),
+    holds: holds.slice(0, MAX_LISTED_CONFLICTS),
+    holds_not_listed: Math.max(0, holds.length - MAX_LISTED_CONFLICTS),
     events: counts,
   };
 }
@@ -661,7 +360,7 @@ function classifyConflict(
   if (principalResponse(event, input.principal) === 'declined') return 'declined';
   if (event.transparent) return 'free';
   // Touching ends are not an overlap, and a zero-length event blocks no time.
-  return overlapMs(event, input.start, input.end) > 0 ? 'conflicting' : 'outside_window';
+  return overlapMs(event, input.start, input.end) > 0 ? 'overlaps' : 'outside_window';
 }
 
 // ---- people_stats -----------------------------------------------------------
@@ -675,10 +374,6 @@ interface PeopleInput {
   /** Lowercased addresses to report on; null reports everyone. */
   only: readonly string[] | null;
   events: readonly CalendarEvent[];
-}
-
-function isRoom(party: Party): boolean {
-  return party.resource || (party.email?.endsWith('@resource.calendar.google.com') ?? false);
 }
 
 function classifyForPeople(event: CalendarEvent, principal: Mailboxes): PeopleOutcome {
@@ -736,7 +431,7 @@ function computePeopleStats(input: PeopleInput): PeopleStatsResult {
 
   const tallies = new Map<string, Tally>();
   for (const event of counted) {
-    const others = new Map<string, Party>();
+    const others = new Map<string, CalendarEvent['attendees'][number]>();
     for (const party of event.attendees) {
       if (party.email === null || isRoom(party) || isPrincipalParty(party, input.principal)) continue;
       if (input.assistant.has(party.email) || others.has(party.email)) continue;
@@ -795,13 +490,6 @@ function computePeopleStats(input: PeopleInput): PeopleStatsResult {
 
 // ---- Tools ------------------------------------------------------------------
 
-const FILES_SCHEMA = {
-  type: 'array',
-  minItems: 1,
-  maxItems: MAX_FILES,
-  items: { type: 'string' },
-  description: `Paths to JSON files saved from \`${GOG_EVENTS_COMMAND}\`, inside /workspace/agent (relative paths start there) or the temp directory. Every file must be complete: pass --all-pages.`,
-};
 const TIMEZONE_SCHEMA = {
   type: 'string',
   description: 'The principal\'s IANA timezone, such as "Africa/Lagos". Defaults to the principal\'s timezone.',
@@ -817,11 +505,19 @@ export function createCalendarFactTools(options: CalendarFactsOptions): {
   const findConflicts: McpToolDefinition = {
     tool: {
       name: 'find_conflicts',
-      description: `List every event on the principal's calendars that overlaps a candidate time, counted from saved gog calendar events output. It finds overlaps on one calendar as well as across calendars. Left out: the candidate's own copies on any calendar (matched by candidate_ical_uid), cancelled events, events the principal declined, and free (transparent) events. All-day busy events and free/busy-only blocks count. A meeting on several of the principal's calendars is listed once with each calendar. Times are compared as instants; an all-day event runs midnight to midnight on the principal's clocks, so clock changes are handled. The window is at most ${MAX_WINDOW_DAYS} days. Titles come back wrapped as untrusted text. A file that is malformed, incomplete, or outside the workspace and temp directory is refused and named.`,
+      description: `List every event on the principal's calendars that overlaps a candidate time, counted from gog calendar events output saved for a range that covers it. It finds overlaps on one calendar as well as across calendars. Left out: the candidate's own copies on any calendar (matched by candidate_ical_uid), cancelled events, events the principal declined, and free (transparent) events. All-day busy events and free/busy-only blocks count. A time the assistant holds for a meeting it is arranging is listed under holds with its meeting_id, as time that can give way, not as a conflict; a meeting the assistant booked is a conflict like any other. A meeting on several of the principal's calendars is listed once with each calendar. Times are compared as instants; an all-day event runs midnight to midnight on the principal's clocks, so clock changes are handled. The window is at most ${MAX_WINDOW_DAYS} days. Titles come back wrapped as untrusted text. Refused, so you fetch again: a candidate outside the from-to range the files were fetched for, and a file saved more than ${MAX_FILE_AGE_MINUTES} minutes ago. A file that is malformed, incomplete, or outside the workspace and temp directory is refused and named.`,
       inputSchema: {
         type: 'object' as const,
         properties: {
           files: FILES_SCHEMA,
+          from: {
+            type: 'string',
+            description: `The start of the range the files were fetched for, as given to gog's --from: ${DATE_TIME_SHAPE}.`,
+          },
+          to: {
+            type: 'string',
+            description: `The end of that range, as given to gog's --to: ${DATE_TIME_SHAPE}.`,
+          },
           start: { type: 'string', description: `Candidate start: ${DATE_TIME_SHAPE}.` },
           end: { type: 'string', description: `Candidate end: ${DATE_TIME_SHAPE}. Must be after start.` },
           candidate_ical_uid: {
@@ -837,7 +533,7 @@ export function createCalendarFactTools(options: CalendarFactsOptions): {
           },
           timezone: TIMEZONE_SCHEMA,
         },
-        required: ['files', 'start', 'end'],
+        required: ['files', 'from', 'to', 'start', 'end'],
       },
     },
     async handler(args) {
@@ -848,6 +544,14 @@ export function createCalendarFactTools(options: CalendarFactsOptions): {
         if (end.toMillis() <= start.toMillis()) fail('end must be after start.');
         if (end.toMillis() - start.toMillis() > MAX_WINDOW_DAYS * DAY_MS) {
           fail(`The window is longer than ${MAX_WINDOW_DAYS} days. Check one candidate time at a time.`);
+        }
+        const from = readInstant(args, 'from', zone);
+        const to = readInstant(args, 'to', zone);
+        if (to.toMillis() <= from.toMillis()) fail('to must be after from.');
+        if (start.toMillis() < from.toMillis() || end.toMillis() > to.toMillis()) {
+          fail(
+            `The candidate time is outside the range the files were fetched for, ${iso(from)} to ${iso(to)}, so events around it are missing. Fetch again with gog calendar events over a range that covers it, then call again.`,
+          );
         }
         const candidate = args.candidate_ical_uid;
         if (candidate !== undefined && candidate !== null && typeof candidate !== 'string') {
@@ -861,7 +565,7 @@ export function createCalendarFactTools(options: CalendarFactsOptions): {
           end,
           candidate: typeof candidate === 'string' && candidate.trim() !== '' ? candidate.trim() : null,
           principal,
-          events: readEvents(files, roots, zone),
+          events: readEvents(files, roots, zone, MAX_FILE_AGE_MINUTES),
         });
       });
     },
@@ -916,8 +620,8 @@ export function createCalendarFactTools(options: CalendarFactsOptions): {
 }
 
 export const { findConflicts, peopleStats } = createCalendarFactTools({
-  allowedRoots: [WORKSPACE_DIR, os.tmpdir()],
+  allowedRoots: FILE_ROOTS,
   defaultTimezone: TIMEZONE,
 });
 
-registerTools([findConflicts, peopleStats]);
+registerTools([findConflicts, peopleStats], CALENDAR_FACTS_CAPABILITY);

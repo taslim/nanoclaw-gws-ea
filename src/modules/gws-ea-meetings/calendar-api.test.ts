@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { createMeetingsCalendarApi } from './calendar-api.js';
+import { allowsMeet, createMeetingsCalendarApi } from './calendar-api.js';
 
 interface Recorded {
   readonly method: string;
@@ -34,7 +34,7 @@ function stubGoogle(reply: (request: Recorded) => { status: number; body?: unkno
 
 const WRITE = {
   summary: 'Partnership intro',
-  description: 'Arranged by Robin, the assistant.',
+  description: 'We will walk through the pilot plan.',
   start: '2026-10-07T09:00:00.000Z',
   end: '2026-10-07T09:30:00.000Z',
   timeZone: 'Europe/London',
@@ -56,13 +56,74 @@ describe('the Calendar client', () => {
     expect(request.body).toEqual({
       id: 'abc123',
       summary: 'Partnership intro',
-      description: 'Arranged by Robin, the assistant.',
+      description: 'We will walk through the pilot plan.',
       start: { dateTime: '2026-10-07T09:00:00.000Z', timeZone: 'Europe/London' },
       end: { dateTime: '2026-10-07T09:30:00.000Z', timeZone: 'Europe/London' },
       attendees: [{ email: 'sam@acme.example' }],
       reminders: { useDefault: true },
       extendedProperties: { private: { gwsEaMeeting: 'mtg-1', gwsEaRole: 'booking' } },
     });
+  });
+
+  it('asks Google for a Meet link under its request id, with conference support, and writes a place as given', async () => {
+    const { api, requests } = stubGoogle(() => ({ status: 200, body: { id: 'abc123' } }));
+    await api.insertEvent(
+      'pat@principal.example',
+      'abc123',
+      { ...WRITE, location: 'Acme HQ, 1 Main Street', conference: { requestId: 'meet-mtg-1' } },
+      'all',
+    );
+    await api.patchEvent('pat@principal.example', 'abc123', { location: 'Their office' }, 'all');
+    const [insert, patch] = requests;
+    expect(insert.url.searchParams.get('conferenceDataVersion')).toBe('1');
+    expect(insert.body).toMatchObject({
+      location: 'Acme HQ, 1 Main Street',
+      conferenceData: { createRequest: { requestId: 'meet-mtg-1', conferenceSolutionKey: { type: 'hangoutsMeet' } } },
+    });
+    // A write that asks for no link leaves the event's conference as it is.
+    expect(patch.url.searchParams.has('conferenceDataVersion')).toBe(false);
+    expect(patch.body).toEqual({ location: 'Their office' });
+  });
+
+  it("reads an event's Meet link as Google reports it, and a calendar's allowed conference types", async () => {
+    const { api, requests } = stubGoogle((request) =>
+      request.url.pathname.includes('/calendarList/')
+        ? {
+            status: 200,
+            body: {
+              id: 'pat@principal.example',
+              accessRole: 'owner',
+              conferenceProperties: { allowedConferenceSolutionTypes: ['hangoutsMeet'] },
+            },
+          }
+        : {
+            status: 200,
+            body: {
+              id: request.url.pathname.endsWith('/pending') ? 'pending' : 'ready',
+              conferenceData: request.url.pathname.endsWith('/pending')
+                ? { createRequest: { status: { statusCode: 'pending' } } }
+                : {
+                    createRequest: { status: { statusCode: 'success' } },
+                    entryPoints: [
+                      { entryPointType: 'phone', uri: 'tel:+44-20-0000-0000' },
+                      { entryPointType: 'video', uri: 'https://meet.google.com/abc-defg-hij' },
+                    ],
+                  },
+            },
+          },
+    );
+    expect((await api.getEvent('pat@principal.example', 'ready'))?.conference).toEqual({
+      status: 'success',
+      uri: 'https://meet.google.com/abc-defg-hij',
+    });
+    expect((await api.getEvent('pat@principal.example', 'pending'))?.conference).toEqual({ status: 'pending' });
+    // Google returns only the fields asked for: the link and its status among them.
+    expect(requests[0].url.searchParams.get('fields')).toContain(
+      'conferenceData(createRequest(status(statusCode)),entryPoints(entryPointType,uri))',
+    );
+    const entry = await api.getCalendar('pat@principal.example');
+    expect(entry && allowsMeet(entry)).toBe(true);
+    expect(allowsMeet({ id: 'family@group.calendar.google.com' })).toBe(false);
   });
 
   it('reads an id Google already holds as an event that exists', async () => {

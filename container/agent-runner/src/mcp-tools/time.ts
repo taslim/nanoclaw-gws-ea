@@ -1,9 +1,9 @@
 /**
- * Time MCP tools: time_now, time_resolve, time_convert, time_diff, time_range.
+ * Time MCP tools: time_now, time_resolve, time_convert, time_diff.
  *
  * Models get dates, weekdays, and offsets wrong when they work them out
  * themselves; these tools make that work deterministic. The interface is
- * Soji's — the same five tools, the same inputs, and the same
+ * Soji's — the same tools, the same inputs, and the same
  * `{ iso, formatted, day, zone }` shape — and everything is computed in the
  * container's timezone, which is the principal's, unless time_convert names
  * others.
@@ -31,14 +31,9 @@ import type { McpToolDefinition } from './types.js';
 
 type ValidDateTime = DateTime<true>;
 
-const MAX_RANGE_DAYS = 60;
-const MAX_SLOTS = 1000;
-const DEFAULT_INTERVAL_MINUTES = 60;
-const MINUTES_PER_DAY = 24 * 60;
 const MINUTE_MS = 60_000;
 const DAY_MS = 86_400_000;
 
-const HH_MM = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const ISO_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const ISO_DATE_TIME = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?<offset>Z|[+-]\d{2}(?::?\d{2})?)?$/i;
 
@@ -106,27 +101,6 @@ export interface TimeDiffResult {
   business_days: number;
   human: string;
   breakdown: { years: number; months: number; weeks: number; days: number; hours: number; minutes: number };
-  notes?: string[];
-}
-
-export interface TimeSlot {
-  date: string;
-  day: string;
-  time?: string;
-  iso: string;
-  second_occurrence_iso?: string;
-}
-
-export interface TimeRangeResult {
-  from: FormattedDt;
-  to: FormattedDt;
-  days: number;
-  weekdays_only: boolean;
-  time_window: string | null;
-  interval_minutes: number | null;
-  count: number;
-  slots: TimeSlot[];
-  skipped?: string[];
   notes?: string[];
 }
 
@@ -548,28 +522,6 @@ function optionalZones(args: Record<string, unknown>, key: string): string[] | u
   return value.length === 0 ? undefined : value;
 }
 
-function optionalBoolean(args: Record<string, unknown>, key: string): boolean | undefined {
-  const value = args[key];
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== 'boolean') fail(`${key} must be true or false.`);
-  return value;
-}
-
-function optionalInterval(args: Record<string, unknown>): number | undefined {
-  const value = args.interval_minutes;
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > MINUTES_PER_DAY) {
-    fail(`interval_minutes must be a whole number from 1 to ${MINUTES_PER_DAY}.`);
-  }
-  return value;
-}
-
-function minutesOfDay(hhmm: string, key: string): number {
-  const match = HH_MM.exec(hhmm);
-  if (!match) fail(`Invalid ${key} "${hhmm}". Use HH:mm, such as "09:00".`);
-  return Number(match[1]) * 60 + Number(match[2]);
-}
-
 function json(value: unknown): CallToolResult {
   return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] };
 }
@@ -789,125 +741,7 @@ export function createTimeTools(zone: string, now: () => number = Date.now): Mcp
     },
   };
 
-  const timeRange: McpToolDefinition = {
-    tool: {
-      name: 'time_range',
-      description: `List dates, or time slots within a daily window, in the principal's timezone (${zone}); e.g. "weekdays next week 9-5 hourly". A date given without a time covers that whole day. At most ${MAX_RANGE_DAYS} days and ${MAX_SLOTS} slots. A slot time the clocks skip is left out and listed under skipped; one that happens twice carries second_occurrence_iso.`,
-      inputSchema: {
-        type: 'object' as const,
-        properties: {
-          from: { type: 'string', description: 'Start: ISO or natural language' },
-          to: { type: 'string', description: 'End: ISO or natural language (a date alone includes that day)' },
-          time_start: {
-            type: 'string',
-            description: 'Daily start time in HH:mm (e.g. "09:00"). If omitted, returns whole days.',
-          },
-          time_end: {
-            type: 'string',
-            description: 'Daily end time in HH:mm (e.g. "17:00"), after time_start. Required with time_start.',
-          },
-          interval_minutes: {
-            type: 'integer',
-            minimum: 1,
-            maximum: MINUTES_PER_DAY,
-            description: `Minutes between slot starts (default ${DEFAULT_INTERVAL_MINUTES}). Only used with time_start/time_end.`,
-          },
-          weekdays_only: { type: 'boolean', description: 'If true, exclude Saturdays and Sundays (default false)' },
-        },
-        required: ['from', 'to'],
-      },
-    },
-    async handler(args) {
-      return run((): TimeRangeResult => {
-        const fromInput = requiredString(args, 'from');
-        const toInput = requiredString(args, 'to');
-        const timeStart = optionalString(args, 'time_start');
-        const timeEnd = optionalString(args, 'time_end');
-        const interval = optionalInterval(args) ?? DEFAULT_INTERVAL_MINUTES;
-        const weekdaysOnly = optionalBoolean(args, 'weekdays_only') ?? false;
-
-        if ((timeStart === undefined) !== (timeEnd === undefined)) {
-          fail('time_start and time_end go together; give both or neither.');
-        }
-        const window =
-          timeStart !== undefined && timeEnd !== undefined
-            ? { start: minutesOfDay(timeStart, 'time_start'), end: minutesOfDay(timeEnd, 'time_end') }
-            : null;
-        if (window !== null && window.end <= window.start) {
-          fail('time_end must be after time_start; a daily window cannot cross midnight.');
-        }
-
-        const current = nowIn(zone, now);
-        const fromReading = readInput(fromInput, zone, current);
-        const toReading = readInput(toInput, zone, current);
-        const start = fromReading.timeStated ? exactly(fromReading, 'from', zone) : startOfDay(fromReading.wall, zone);
-        const end = toReading.timeStated
-          ? exactly(toReading, 'to', zone)
-          : startOfDay(wallClockOf(floating(dateOnly(toReading.wall)).plus({ days: 1 })), zone);
-        if (end <= start) fail('"to" must be after "from".');
-
-        const firstDay = floating(dateOnly(wallClockOf(valid(start.setZone(zone)))));
-        const lastDay = floating(dateOnly(wallClockOf(valid(end.minus({ milliseconds: 1 }).setZone(zone)))));
-        const days = dayNumber(wallClockOf(lastDay)) - dayNumber(wallClockOf(firstDay)) + 1;
-        if (days > MAX_RANGE_DAYS) {
-          fail(`Range too large: it covers ${days} days. The maximum is ${MAX_RANGE_DAYS} days.`);
-        }
-
-        const slots: TimeSlot[] = [];
-        const skipped: string[] = [];
-        for (let index = 0; index < days; index++) {
-          const day = firstDay.plus({ days: index }).setLocale('en-US');
-          if (weekdaysOnly && day.weekday > 5) continue;
-          if (window === null) {
-            slots.push({
-              date: day.toFormat(DATE_FORMAT),
-              day: day.toFormat('EEEE'),
-              iso: isoOf(startOfDay(wallClockOf(day), zone)),
-            });
-          } else {
-            for (let minute = window.start; minute < window.end; minute += interval) {
-              const wall = wallClockOf(day.plus({ minutes: minute }));
-              const everyInstant = instantsAt(wall, zone);
-              const [first, second] = everyInstant.filter((at) => at >= start && at < end);
-              if (first === undefined) {
-                if (everyInstant.length === 0) skipped.push(`${describeLocalTime(wall)} does not exist in ${zone}.`);
-                continue;
-              }
-              const local = first.setLocale('en-US');
-              slots.push({
-                date: local.toFormat('EEE, MMM d'),
-                day: local.toFormat('EEEE'),
-                time: local.toFormat(TIME_FORMAT),
-                iso: isoOf(first),
-                ...(second === undefined ? {} : { second_occurrence_iso: isoOf(second) }),
-              });
-            }
-          }
-          if (slots.length > MAX_SLOTS) {
-            fail(
-              `Too many slots (more than ${MAX_SLOTS}). Narrow the range, lengthen the interval, or use weekdays_only.`,
-            );
-          }
-        }
-
-        const notes = [...prefixed('from', fromReading.notes), ...prefixed('to', toReading.notes)];
-        return {
-          from: formatDt(valid(start.setZone(zone))),
-          to: formatDt(valid(end.setZone(zone))),
-          days,
-          weekdays_only: weekdaysOnly,
-          time_window: window === null ? null : `${timeStart}–${timeEnd}`,
-          interval_minutes: window === null ? null : interval,
-          count: slots.length,
-          slots,
-          ...(skipped.length > 0 ? { skipped } : {}),
-          ...(notes.length > 0 ? { notes } : {}),
-        };
-      });
-    },
-  };
-
-  return [timeNow, timeResolve, timeConvert, timeDiff, timeRange];
+  return [timeNow, timeResolve, timeConvert, timeDiff];
 }
 
 registerTools(createTimeTools(TIMEZONE));

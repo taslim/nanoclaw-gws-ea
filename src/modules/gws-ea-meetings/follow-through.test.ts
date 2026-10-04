@@ -135,6 +135,23 @@ async function offered(person: Person, extra: Record<string, unknown> = {}): Pro
   return { stored, session, slots };
 }
 
+/** An invitation Acme organizes on the principal's calendar, on Wednesday morning. */
+function calendarInvitation(): void {
+  scheduling.calendar.put({
+    calendarId: PRINCIPAL,
+    id: 'evt-invite',
+    iCalUID: 'evt-invite@google.com',
+    status: 'confirmed',
+    organizer: { email: ADDRESSES.acme },
+    attendees: [
+      { email: ADDRESSES.acme, organizer: true, responseStatus: 'accepted' },
+      { email: PRINCIPAL, responseStatus: 'needsAction' },
+    ],
+    start: { dateTime: '2026-10-07T09:00:00Z' },
+    end: { dateTime: '2026-10-07T10:00:00Z' },
+  });
+}
+
 /** A counterpart writes in the thread of an email the assistant sent, the first by default. */
 async function theyWrite(from: string, body: string, inThreadOf = scheduling.gmail.sent[0]): Promise<void> {
   scheduling.gmail.receive({
@@ -152,7 +169,7 @@ async function theyWrite(from: string, body: string, inThreadOf = scheduling.gma
 // ---------------------------------------------------------------------------
 
 describe('AE2: a quiet thread', () => {
-  it('gets one nudge after two working days, and two working days later its holds go and main hears one line', async () => {
+  it('gets one nudge after two working days, and two working days later its holds go and main hears of it', async () => {
     const { stored, session } = await offered(scheduling.people.acme);
     // Held before Monday's working day began: it counts from 09:00, so two working days later is Wednesday 09:00.
     expect(await meeting(stored.id)).toMatchObject({
@@ -189,7 +206,7 @@ describe('AE2: a quiet thread', () => {
     expect(vi.mocked(killContainer)).toHaveBeenCalledWith(session.id, expect.any(String));
     expect(await getThreadParticipants(stored.thread_key)).toMatchObject({ state: 'closed' });
 
-    // The host reported it: external-email took no turn, and main tells the principal in one line.
+    // The host reported it: external-email took no turn, and main judges whether the principal hears of it.
     expect(contents(session)).toHaveLength(before);
     expect(vi.mocked(requestWake)).not.toHaveBeenCalledWith(
       expect.objectContaining({ id: session.id }),
@@ -199,8 +216,9 @@ describe('AE2: a quiet thread', () => {
     expect(again).toEqual([]);
     expect(gaveUp.note).toMatchObject({ meeting_id: stored.id, outcome: 'gave-up' });
     expect(gaveUp.text).toContain('Acme Sales');
-    expect(gaveUp.text).toMatch(/one line/);
-    expect(gaveUp.text).toMatch(/suggestion/);
+    // The note states what happened; what reaches the principal is main's to judge (R51).
+    expect(gaveUp.text).toMatch(/held times were released and its thread closed/);
+    expect(gaveUp.text).not.toMatch(/tell the principal|in one line/iu);
     expect(vi.mocked(requestWake)).toHaveBeenCalledWith(
       expect.objectContaining({ id: scheduling.main.id }),
       'inbound-message',
@@ -244,7 +262,7 @@ describe('deadlines', () => {
     });
   });
 
-  it('a reply clears them; while times are still held, the quiet count starts again from the reply', async () => {
+  it('a reply starts the quiet count again from the reply, whether or not times are held', async () => {
     const { stored, session } = await offered(scheduling.people.acme);
     vi.setSystemTime(new Date('2026-10-06T11:00:00.000Z'));
     await theyWrite(`Acme Sales <${ADDRESSES.acme}>`, 'Thanks, let me check with the team and come back to you.');
@@ -260,10 +278,51 @@ describe('deadlines', () => {
     await reach('2026-10-08T11:01:00.000Z');
     expect(notes(session, NUDGE)).toHaveLength(1);
 
-    // With nothing held, a reply leaves no deadline behind.
-    data(await ask(session, 'meeting_release_holds', { meeting_id: stored.id }));
+    // With nothing held, a reply still starts the count again: the conversation is what goes quiet.
+    data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [] }));
     await theyWrite(`Acme Sales <${ADDRESSES.acme}>`, 'None of those work, sorry.');
-    expect(await meeting(stored.id)).toMatchObject({ nudge_at: null, give_up_at: null });
+    expect(await meeting(stored.id)).toMatchObject({
+      nudge_at: '2026-10-12T11:01:00.000Z',
+      give_up_at: '2026-10-14T11:01:00.000Z',
+    });
+  });
+
+  it('start at the first email delivered for a job that holds nothing, and its nudge never restarts them', async () => {
+    calendarInvitation();
+    const asked = data(
+      await ask(scheduling.main, 'meeting_reschedule', {
+        calendar_id: PRINCIPAL,
+        event_id: 'evt-invite',
+        ...WINDOW,
+        purpose: 'Your Wednesday invitation',
+      }),
+    );
+    const stored = await meeting(asked.meeting_id);
+    const session = await meetingSession(asked.meeting_id);
+    expect(stored).toMatchObject({ kind: 'ask_organizer', nudge_at: null, give_up_at: null });
+    await reply(session, stored.thread_key, 'Hello, could your Wednesday invitation move to Thursday at 10?');
+    expect(await meeting(stored.id)).toMatchObject({
+      nudge_at: '2026-10-07T08:00:00.000Z',
+      give_up_at: '2026-10-09T08:00:00.000Z',
+    });
+
+    await reach('2026-10-07T08:01:00.000Z');
+    expect(notes(session, NUDGE)).toHaveLength(1);
+    await reply(session, stored.thread_key, 'Just checking whether Thursday at 10 could work?');
+    // The nudge's own email leaves the give-up where the nudge set it.
+    expect(await meeting(stored.id)).toMatchObject({ nudge_at: null, give_up_at: '2026-10-09T08:01:00.000Z' });
+  });
+
+  it('end a called-off meeting without its closing line when the line never goes', async () => {
+    const { stored, session } = await offered(scheduling.people.acme);
+    expect(data(await ask(scheduling.main, 'meeting_cancel', { meeting_id: stored.id })).state).toBe('closing');
+    await reach('2026-10-05T07:59:00.000Z');
+    expect((await meeting(stored.id)).state).toBe('closing');
+    await reach('2026-10-05T08:01:00.000Z');
+    expect((await meeting(stored.id)).state).toBe('cancelled');
+    expect((await getSession(session.id))?.status).toBe('closed');
+    expect(await getThreadParticipants(stored.thread_key)).toMatchObject({ state: 'closed' });
+    expect(scheduling.gmail.sent).toHaveLength(1);
   });
 
   it("are not touched by the principal's own message in the thread", async () => {
@@ -284,12 +343,18 @@ describe('deadlines', () => {
 
   it('a booking clears them', async () => {
     const { stored, session, slots } = await offered(scheduling.people.acme);
-    data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: slots[0].slot_id }));
+    data(
+      await ask(session, 'meeting_book', {
+        meeting_id: stored.id,
+        slot_id: slots[0].slot_id,
+        invitation: { title: 'Partnership intro' },
+      }),
+    );
     expect(await meeting(stored.id)).toMatchObject({ nudge_at: null, give_up_at: null });
     await reach('2026-10-07T08:01:00.000Z');
     await reach('2026-10-09T08:02:00.000Z');
     expect(notes(session, NUDGE)).toHaveLength(0);
-    expect(notes(scheduling.main, OUTCOME)).toHaveLength(0);
+    expect(notes(scheduling.main, OUTCOME).map((c) => c.note?.outcome)).toEqual(['booked']);
   });
 
   it('that came due while the host was down fire once it is back, exactly once', async () => {
@@ -362,6 +427,51 @@ describe('deadlines', () => {
       expect((await getSession(pat.session.id))?.status).toBe('active');
       expect(vi.mocked(killContainer)).not.toHaveBeenCalledWith(pat.session.id, expect.anything());
       expect(holds().filter((event) => event.tags?.gwsEaMeeting === pat.stored.id)).toHaveLength(3);
+      expect(notes(scheduling.main, OUTCOME).map((note) => note.note?.meeting_id)).toEqual([acme.stored.id]);
+    });
+
+    it('so a takeover after the pass began keeps the conversation it superseded, and their session, from ending', async () => {
+      const acme = await offered(scheduling.people.acme);
+      // Dee writes to the assistant at 08:30, and a conversation answers her: it goes quiet on Friday at 09:00.
+      vi.setSystemTime(new Date('2026-10-05T07:30:00.000Z'));
+      const gmailId = scheduling.gmail.receive({
+        threadId: 'g-dee',
+        from: `Dee <dee@else.example>`,
+        to: [ROBIN],
+        subject: 'Speaking at our meetup',
+        body: 'Could Alex speak at our meetup in November?',
+      });
+      await scheduling.inbox.tick();
+      const triage = notes(scheduling.main, 'gws-ea-inbox.inbound').find((n) => n.note?.gmail_message_id === gmailId);
+      const threadKey = String(triage?.note?.thread_key);
+      const responded = data(
+        await ask(scheduling.main, 'email_respond', { thread_key: threadKey, purpose: 'Decline kindly.' }),
+      );
+      const session = await meetingSession(responded.meeting_id);
+      await reply(session, threadKey, 'Thank you for thinking of Alex. Sadly she is not speaking this autumn.');
+      expect(await meeting(responded.meeting_id)).toMatchObject({ give_up_at: '2026-10-09T08:00:00.000Z' });
+      await reach('2026-10-07T08:01:00.000Z');
+
+      // Friday's pass reads both, and gives up on Acme's first; main takes the conversation's thread over meanwhile.
+      let arranged: Record<string, unknown> = {};
+      duringFirstRelease(async () => {
+        arranged = data(
+          await ask(scheduling.main, 'meeting_arrange', {
+            thread_key: threadKey,
+            calendar_id: PRINCIPAL,
+            length_minutes: 30,
+            ...WINDOW,
+            purpose: 'Short call',
+          }),
+        );
+      });
+      await reach('2026-10-09T08:02:00.000Z');
+
+      expect((await meeting(acme.stored.id)).state).toBe('gave-up');
+      expect((await meeting(responded.meeting_id)).state).toBe('superseded');
+      expect(await meeting(arranged.meeting_id)).toMatchObject({ state: 'active', session_id: session.id });
+      expect((await getSession(session.id))?.status).toBe('active');
+      expect(vi.mocked(killContainer)).not.toHaveBeenCalledWith(session.id, expect.anything());
       expect(notes(scheduling.main, OUTCOME).map((note) => note.note?.meeting_id)).toEqual([acme.stored.id]);
     });
 
@@ -443,8 +553,13 @@ describe('deadlines', () => {
 
 async function booked(person: Person): Promise<Offered> {
   const held = await offered(person);
-  data(await ask(held.session, 'meeting_book', { meeting_id: held.stored.id, slot_id: held.slots[0].slot_id }));
-  data(await ask(held.session, 'meeting_outcome', { meeting_id: held.stored.id, outcome: 'booked' }));
+  data(
+    await ask(held.session, 'meeting_book', {
+      meeting_id: held.stored.id,
+      slot_id: held.slots[0].slot_id,
+      invitation: { title: 'Partnership intro' },
+    }),
+  );
   return { ...held, stored: await meeting(held.stored.id) };
 }
 
@@ -485,7 +600,7 @@ describe('a booked meeting', () => {
     expect(refusal(await ask(scheduling.main, 'meeting_cancel', { meeting_id: stored.id }))).toMatch(/ended/);
   });
 
-  it('is moved in place when the counterpart asks, once, and main hears it in one line', async () => {
+  it('is moved in place when the counterpart asks, once, and main hears of it once', async () => {
     const { stored, session } = await booked(scheduling.people.acme);
     const before = await getBooking(stored.id);
     if (!before) throw new Error('no booking');
@@ -516,7 +631,7 @@ describe('a booked meeting', () => {
     expect(more).toEqual([]);
     expect(note.note).toMatchObject({ meeting_id: stored.id, booking: { start: wednesday.start } });
     expect(note.text).toContain('Acme Sales');
-    expect(note.text).toMatch(/one line/);
+    expect(note.text).not.toMatch(/tell the principal|in one line/iu);
 
     // A repeat moves nothing and tells no one again.
     data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: wednesday.slot_id }));

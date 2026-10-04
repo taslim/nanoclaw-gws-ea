@@ -29,6 +29,7 @@ import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars
 import { closeDb, createAgentGroup, getAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { getHostStartCallbacks } from '../../host-lifecycle.js';
 import { composeGroupProjectDoc, DEFAULT_PROJECT_DOC } from '../../project-doc-compose.js';
+import { unknownToolNames } from '../../test-utils/runner-tools.js';
 import type { AgentGroup } from '../../types.js';
 import { setSchedulingPreference } from '../gws-ea-preferences/db.js';
 import { reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
@@ -48,15 +49,13 @@ const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
 /** What the guidance must keep saying; each line is a rule R5, R19, R22, R23, R24, R25, R26, or R40 relies on. */
 const REQUIRED_GUIDANCE = [
   'Offer two or three times at once, so the other person can choose in one reply.',
-  'Offer only times `free_time` returned, and hold or book each one by its slot id.',
-  'Report how each meeting ends through `outcome`, once.',
-  'Report `needs-room` again only when `free_time` tells you to.',
-  'Report booked only after `book` succeeded, never for a time someone only agreed to.',
-  'Report needs-room only when nothing in the window fits someone in the inner circle or close; for anyone else, offer the open times there are, or report gave-up.',
+  'Offer only times `meeting_free_time` returned, and hold or book each one by its slot id.',
+  'Report how each meeting ends through `meeting_outcome`, once.',
+  'Book only a time someone agreed to: `meeting_book` itself tells main.',
   "When you are asked to arrange a meeting in a thread that isn't about scheduling, send nothing in it and report not-scheduling.",
-  'A `respond` brief asks for one reply',
-  'then report `responded` with `outcome`',
-  'After settled, responded, not-scheduling, or gave-up, the conversation is closed: send nothing more in it.',
+  'A conversation brief asks you to answer a thread: answer it from the brief, and stay with it for their follow-ups within the brief.',
+  'Report `done` once it needs nothing more from you, after your last email has gone.',
+  'After settled, done, not-scheduling, or gave-up, the conversation is closed: send nothing more in it.',
   'You are `external-email`, the part of the assistant that writes to people other than the principal.',
   'Write every email as the assistant, under the name the Assistant Identity section gives you.',
   'Never write as the principal, and never sign with their name.',
@@ -64,7 +63,7 @@ const REQUIRED_GUIDANCE = [
   'Write as a gracious human assistant would: warm, brief, and specific',
   // Reply-all (R40).
   'Reply to everyone on the thread by default, as people expect.',
-  'Use `recipients` to leave someone off or move them to Bcc when that spares them or keeps the thread focused',
+  'Use `email_recipients` to leave someone off or move them to Bcc when that spares them or keeps the thread focused',
   'such as moving the principal to Bcc once they have introduced you',
   'When you move someone, say so in one line',
   'You cannot add anyone.',
@@ -78,11 +77,32 @@ const REQUIRED_GUIDANCE = [
   "When the host's note says no one has replied, send one short, friendly nudge in the thread.",
   'Send only that one nudge',
   'When the host makes room for your meeting, offer the time it holds for you, and book it when they agree.',
-  'When someone asks to move a booked meeting, find new times with `free_time` and move it with `book`.',
+  'When someone asks to move a booked meeting, find new times with `meeting_free_time` and move it with `meeting_book`.',
+  // Asking main, and no acknowledging emails (R42, R43, R50).
+  'ask main with `meeting_ask_main`, and wait.',
+  'Never send an email that only acknowledges, stalls, or says you are checking',
+  'Until the host writes to you again, send nothing in the thread, even when they write meanwhile.',
+  'A turn that sends nothing ends with nothing outside `<internal>…</internal>`',
+  'Work out any day, date or zone with the time tools, never in your head.',
+  // Invitations by judgment (R46).
+  'write the invitation a thoughtful assistant would',
+  'a Meet link when a video call suits and nobody named one',
+  'Follow what your brief says main wants for it.',
+  // Calling off (R48).
+  'tell them in one short, gracious line, and send nothing after it.',
 ];
 
-/** Rules an earlier release held that inbox triage replaced: a copied-in thread can now take a `respond` brief (R19). */
-const RETIRED_GUIDANCE = ["When the principal copies you into a thread that isn't about scheduling"];
+/** Rules an earlier release held that inbox triage replaced: a copied-in thread can now take a `email_respond` brief (R19). */
+const RETIRED_GUIDANCE = [
+  "When the principal copies you into a thread that isn't about scheduling",
+  // Replaced by asking main (R42) and by conversations that stay open (R44).
+  'needs-room',
+  'report `responded`',
+  'asks for one reply',
+];
+
+/** Backticked words the guidance uses that are not tools: an outcome it reports. */
+const NOT_TOOLS = ['done'];
 
 function group(id: string, name = 'main'): AgentGroup {
   return { id, name, folder: id, agent_provider: null, created_at: '2026-10-03T00:00:00.000Z' };
@@ -149,11 +169,11 @@ afterEach(async () => {
 });
 
 describe('the contract other units build on', () => {
-  it('registers its meeting key off for every group on all, and names the pair the group holds', () => {
+  it('registers its meeting key off for every group on all, and names the keys the group holds', () => {
     expect(EXTERNAL_EMAIL_MEETINGS_CAPABILITY).toBe('gws-ea-meetings-external');
     expect(listCapabilityKeys()).toContain(EXTERNAL_EMAIL_MEETINGS_CAPABILITY);
     expect(resolveCapabilities('all', 'any')).not.toContain(EXTERNAL_EMAIL_MEETINGS_CAPABILITY);
-    expect(EXTERNAL_EMAIL_CAPABILITIES).toEqual(['reply', 'gws-ea-meetings-external']);
+    expect(EXTERNAL_EMAIL_CAPABILITIES).toEqual(['reply', 'time', 'request-status', 'gws-ea-meetings-external']);
   });
 
   it('reads no pointer before the host creates the group', async () => {
@@ -170,6 +190,8 @@ describe('external-email at host start', () => {
     const config = await getContainerConfig(ee.id);
     expect(resolveCapabilities(parseStoredCapabilities(config?.capabilities, ee.name), ee.name)).toEqual([
       'reply',
+      'time',
+      'request-status',
       'gws-ea-meetings-external',
     ]);
     expect(config).toMatchObject({
@@ -228,6 +250,7 @@ describe("external-email's project document", () => {
       '# NanoClaw Runtime Contract',
       '# NanoClaw Module: core',
       '# NanoClaw Module: gws-ea-meetings-external',
+      '# NanoClaw Module: time',
     ]);
     expect(composed.get('# Assistant Identity')).toBe(
       'Aya is the assistant. Taslim is the principal. They are separate people: act and communicate as Aya, support Taslim, and never present the assistant as the principal.',
@@ -259,6 +282,10 @@ describe("external-email's project document", () => {
   it('no longer holds a rule a later release replaced', () => {
     const guidance = fs.readFileSync(path.resolve(GUIDANCE_PATH), 'utf8');
     for (const line of RETIRED_GUIDANCE) expect(guidance, line).not.toContain(line);
+  });
+
+  it('names no tool the agent does not have', () => {
+    expect(unknownToolNames(fs.readFileSync(path.resolve(GUIDANCE_PATH), 'utf8'), NOT_TOOLS)).toEqual([]);
   });
 });
 
@@ -307,8 +334,7 @@ describe("changes to external-email's configuration", () => {
     }
     expect(await getAgentGroup(ee.id)).toBeDefined();
     expect(parseStoredCapabilities((await getContainerConfig(ee.id))?.capabilities, ee.name)).toEqual([
-      'reply',
-      'gws-ea-meetings-external',
+      ...EXTERNAL_EMAIL_CAPABILITIES,
     ]);
 
     const host = await dispatch(

@@ -6,9 +6,7 @@
  */
 import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
-import { listPrincipalAddresses } from '../gws-ea-profile/db.js';
-import { getInboxState, listPinnedSelectors, updateInboxState } from './db.js';
-import { domainOf } from './mime.js';
+import { getInboxState, updateInboxState } from './db.js';
 import { noticeUnhealthy } from './notices.js';
 
 /** Consecutive failed polls, a minute apart, before the inbox counts as unhealthy. */
@@ -23,17 +21,11 @@ export interface InboxHealth {
   readonly consecutiveFailures: number;
   /** Turning on calendar notifications for the principal's calendars. */
   readonly calendarNotifications: { readonly state: 'unknown' | 'ok' | 'failing'; readonly reason: string | null };
-  /** The principal's domains with no pinned DKIM selector: mail from them can never be the principal's. */
-  readonly principalDomainsWithoutSelector: readonly string[];
 }
 
 /** The inbox's health, for follow-through deadlines and status. */
 export async function getInboxHealth(): Promise<InboxHealth> {
   const state = await getInboxState();
-  const pinned = new Set((await listPinnedSelectors()).map((pin) => pin.domain));
-  const domains = (await getDb().hasTable('gws_ea_principal_addresses'))
-    ? [...new Set((await listPrincipalAddresses()).map((address) => domainOf(address.email)))]
-    : [];
   return {
     state: state.health,
     reason: state.health_reason,
@@ -41,7 +33,6 @@ export async function getInboxHealth(): Promise<InboxHealth> {
     lastSuccessAt: state.last_success_at,
     consecutiveFailures: state.consecutive_failures,
     calendarNotifications: { state: state.calendar_sync, reason: state.calendar_sync_reason },
-    principalDomainsWithoutSelector: domains.filter((domain) => !pinned.has(domain)).sort(),
   };
 }
 
