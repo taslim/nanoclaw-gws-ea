@@ -36,7 +36,7 @@ const EXTERNAL_CAPABILITY = 'gws-ea-meetings-external';
 /** How long a tool waits for the host; a request may still go through after that. */
 export const MEETING_REQUEST_TIMEOUT_MS = 120_000;
 
-const OUTCOMES = ['booked', 'settled', 'not-scheduling', 'gave-up', 'done'] as const;
+const OUTCOMES = ['settled', 'not-scheduling', 'gave-up', 'done'] as const;
 const ASK_TOPICS = ['time', 'length', 'people', 'place', 'other'] as const;
 
 function err(text: string): CallToolResult {
@@ -44,7 +44,7 @@ function err(text: string): CallToolResult {
 }
 
 /** A field's shape, checked before anything is sent; the host checks its meaning. */
-type Field = 'string' | 'integer' | 'boolean' | 'people' | 'ids' | 'addresses';
+type Field = 'string' | 'integer' | 'boolean' | 'people' | 'ids' | 'addresses' | 'invitation';
 
 /** `{ person_id, email? }` for someone with a record, or `{ email }` for someone without one. */
 function isPersonRef(value: unknown): boolean {
@@ -52,6 +52,20 @@ function isPersonRef(value: unknown): boolean {
   const { person_id: personId, email } = value as Record<string, unknown>;
   if (personId === undefined) return typeof email === 'string' && email.trim() !== '';
   return typeof personId === 'string' && (email === undefined || typeof email === 'string');
+}
+
+/** `{ title?, notes?, location?, video_call? }`: the texts as text, video_call true or false. */
+function isInvitation(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const { title, notes, location, video_call: videoCall, ...rest } = value as Record<string, unknown>;
+  const text = (item: unknown) => item === undefined || (typeof item === 'string' && item.trim() !== '');
+  return (
+    Object.keys(rest).length === 0 &&
+    text(title) &&
+    text(notes) &&
+    text(location) &&
+    (videoCall === undefined || typeof videoCall === 'boolean')
+  );
 }
 
 function fieldProblem(name: string, value: unknown, field: Field): string | undefined {
@@ -74,6 +88,10 @@ function fieldProblem(name: string, value: unknown, field: Field): string | unde
       return Array.isArray(value) && value.every((item) => typeof item === 'string' && item.trim() !== '')
         ? undefined
         : `${name} must list email addresses`;
+    case 'invitation':
+      return isInvitation(value)
+        ? undefined
+        : `${name} must be { title?, notes?, location?, video_call? }, with text for each text and video_call true or false`;
     default: {
       const unreachable: never = field;
       throw new Error(`Unknown field shape ${String(unreachable)}`);
@@ -182,6 +200,23 @@ const CONSTRAINTS = {
     'Anything external-email must respect, such as "mornings only" or "video call". Write only what the other side may read. Up to 500 characters.',
 } as const;
 
+/** What an invitation carries beyond its time and people, each by judgment. */
+const INVITATION_PROPERTIES = {
+  title: { type: 'string', description: 'What the attendees see on their calendars.' },
+  notes: {
+    type: 'string',
+    description: 'Only what helps the attendees, such as an agenda, or how to join a call that is not on Google Meet.',
+  },
+  location: {
+    type: 'string',
+    description: "Where they meet: an address, a phone number, or a video link of the other side's own.",
+  },
+  video_call: {
+    type: 'boolean',
+    description: "true for a Google Meet link the host creates on the principal's calendar.",
+  },
+} as const;
+
 const MEETING_KIND = {
   type: 'string',
   description:
@@ -234,6 +269,12 @@ export const arrange = requestTool({
     purpose: PURPOSE,
     constraints: CONSTRAINTS,
     meeting_kind: MEETING_KIND,
+    invitation: {
+      type: 'object',
+      description:
+        'Anything you or the principal want the invitation to carry, such as a video call or a place; external-email decides the rest by judgment. A colleague booking uses it as given, with the purpose as its title when you give none.',
+      properties: INVITATION_PROPERTIES,
+    },
   },
   required: {
     calendar_id: 'string',
@@ -248,6 +289,7 @@ export const arrange = requestTool({
     copy_principal: 'boolean',
     constraints: 'string',
     meeting_kind: 'string',
+    invitation: 'invitation',
   },
   repeatable: false,
   check: (args) =>
@@ -336,6 +378,12 @@ export const amend = requestTool({
         'People to add, each by their people-record id, with email when the record holds more than one address; someone with no record by { email }.',
       items: PEOPLE_ITEMS,
     },
+    invitation: {
+      type: 'object',
+      description:
+        "For a meeting you handed over with meeting_arrange: what its invitation should carry. A booked event changes at once, with Google's update to its guests.",
+      properties: INVITATION_PROPERTIES,
+    },
   },
   required: { meeting_id: 'string' },
   optional: {
@@ -345,6 +393,7 @@ export const amend = requestTool({
     window_end: 'string',
     constraints: 'string',
     people: 'people',
+    invitation: 'invitation',
   },
   repeatable: false,
 });
@@ -441,12 +490,19 @@ export const hold = requestTool({
 export const book = requestTool({
   name: 'meeting_book',
   description:
-    "Book the time the other side picked, by its slot id. The host creates the meeting on the principal's calendar, invites the people in your brief, and releases the other holds; for a meeting being moved, it moves the existing event. Once the meeting is booked, a newly offered slot moves the booked event there instead.",
+    "Book the time the other side picked, by its slot id. The host creates the meeting on the principal's calendar with your invitation, invites the people in your brief, releases the other holds, and tells main; for a meeting being moved, it moves the existing event. Once the meeting is booked, a newly offered slot moves the booked event there instead. After booking, the invitation changes only through main: meeting_ask_main about it.",
   properties: {
     meeting_id: MEETING_ID,
     slot_id: { type: 'string', description: 'The slot id of the time they picked.' },
+    invitation: {
+      type: 'object',
+      description:
+        'For a new meeting: the invitation, as a thoughtful assistant would write it from the conversation and your brief. A title is required; add notes, a place, or a Google Meet link only when they help. A meeting being moved keeps its own, so leave it out.',
+      properties: INVITATION_PROPERTIES,
+    },
   },
   required: { meeting_id: 'string', slot_id: 'string' },
+  optional: { invitation: 'invitation' },
   repeatable: true,
 });
 
@@ -495,7 +551,7 @@ export const askMain = requestTool({
 export const outcome = requestTool({
   name: 'meeting_outcome',
   description:
-    "Report how this conversation's meeting ended, once. booked: after meeting_book succeeded. settled: the organizer moved their invitation. not-scheduling: the thread is not about arranging a meeting. gave-up: no time could be agreed. done: a conversation needs nothing more from you, once your last email has gone. The host fills in the details for main.",
+    "Report how this conversation's meeting ended, once. A booking reports itself. settled: the organizer moved their invitation. not-scheduling: the thread is not about arranging a meeting. gave-up: no time could be agreed. done: a conversation needs nothing more from you, once your last email has gone. The host fills in the details for main.",
   properties: {
     meeting_id: MEETING_ID,
     outcome: { type: 'string', enum: [...OUTCOMES], description: 'How the meeting ended.' },

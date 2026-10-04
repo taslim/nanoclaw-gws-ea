@@ -121,6 +121,16 @@ describe('the meeting tools', () => {
       [hold, 'meeting_hold', { meeting_id: 'mtg-1', slot_ids: [] }],
       [book, 'meeting_book', { meeting_id: 'mtg-1', slot_id: 'slot-3fa9c2e1b7d0' }],
       [
+        book,
+        'meeting_book',
+        {
+          meeting_id: 'mtg-1',
+          slot_id: 'slot-3fa9c2e1b7d0',
+          invitation: { title: 'Q4 pilot', notes: 'Agenda: the pilot.', video_call: true },
+        },
+      ],
+      [amend, 'meeting_amend', { meeting_id: 'mtg-1', invitation: { location: 'Acme HQ, 1 Main St' } }],
+      [
         arrange,
         'meeting_arrange',
         {
@@ -187,6 +197,8 @@ describe('the meeting tools', () => {
       [hold, { meeting_id: 'mtg-1' }],
       [book, { meeting_id: 'mtg-1' }],
       [askMain, { meeting_id: 'mtg-1' }],
+      [book, { meeting_id: 'mtg-1', slot_id: 'slot-3fa9c2e1b7d0', invitation: { title: 'Q4', video_call: 'yes' } }],
+      [book, { meeting_id: 'mtg-1', slot_id: 'slot-3fa9c2e1b7d0', invitation: { title: 'Q4', attendees: ['x@y.z'] } }],
       [askMain, { meeting_id: 'mtg-1', about: 'the week after' }],
       [reschedule, { calendar_id: 'c', event_id: 'e', ...WINDOW, purpose: 'Making room', making_room_for: 7 }],
       [arrange, { calendar_id: 'c', length_minutes: 30, ...WINDOW, purpose: 'Intro', people: [{ name: 'Sam' }] }],

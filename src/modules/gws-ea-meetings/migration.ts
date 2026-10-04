@@ -8,6 +8,7 @@ import type { ModuleMigration } from '../../db/migrations/index.js';
  *   the request that created it; its level, booking calendar, and the event
  *   it concerns (the event a reschedule moves, the invitation an
  *   ask_organizer is about); its length, window, purpose and constraints;
+ *   what main wishes its invitation to carry;
  *   its state; the thread and session it is bound to; its brief's version;
  *   its follow-through deadlines; and the question `external-email` put to
  *   main and is waiting on, if any (`ask_about`, `asked_at`). A `respond`
@@ -28,8 +29,8 @@ import type { ModuleMigration } from '../../db/migrations/index.js';
  * - `gws_ea_meeting_slots`: the candidate times the host offered for a
  *   meeting, by slot id (written by the calendar actions).
  * - `gws_ea_meeting_bookings`: the event the host's own `book` created or
- *   moved for a meeting (written by the calendar actions). A booked outcome
- *   is accepted only with one.
+ *   moved for a meeting (written by the calendar actions), with what its
+ *   invitation carries when the assistant wrote it.
  */
 export const gwsEaMeetingsMigration: ModuleMigration = {
   version: 1,
@@ -54,6 +55,7 @@ export const gwsEaMeetingsMigration: ModuleMigration = {
         window_end            TEXT,
         purpose               TEXT NOT NULL CHECK (purpose <> ''),
         constraints           TEXT CHECK (constraints <> ''),
+        invitation            TEXT,
         thread_key            TEXT NOT NULL CHECK (thread_key LIKE 'mail-%'),
         session_id            TEXT,
         brief_version         INTEGER NOT NULL CHECK (brief_version >= 0),
@@ -103,7 +105,7 @@ export const gwsEaMeetingsMigration: ModuleMigration = {
       CREATE TABLE gws_ea_meeting_outcomes (
         meeting_id   TEXT NOT NULL REFERENCES gws_ea_meetings(id) ON DELETE CASCADE,
         outcome      TEXT NOT NULL CHECK (outcome IN (
-                       'booked', 'settled', 'not-scheduling', 'gave-up', 'done'
+                       'settled', 'not-scheduling', 'gave-up', 'done'
                      )),
         response     TEXT NOT NULL,
         recorded_at  TEXT NOT NULL,
@@ -125,7 +127,8 @@ export const gwsEaMeetingsMigration: ModuleMigration = {
         event_id     TEXT NOT NULL CHECK (event_id <> ''),
         start_at     TEXT NOT NULL,
         end_at       TEXT NOT NULL,
-        booked_at    TEXT NOT NULL
+        booked_at    TEXT NOT NULL,
+        invitation   TEXT
       );
       CREATE INDEX idx_gws_ea_meeting_bookings_event ON gws_ea_meeting_bookings (calendar_id, event_id);
     `);

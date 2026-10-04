@@ -50,7 +50,7 @@ const REQUIRED_GUIDANCE = [
   'Offer two or three times at once, so the other person can choose in one reply.',
   'Offer only times `meeting_free_time` returned, and hold or book each one by its slot id.',
   'Report how each meeting ends through `meeting_outcome`, once.',
-  'Report booked only after `meeting_book` succeeded, never for a time someone only agreed to.',
+  'Book only a time someone agreed to: `meeting_book` itself tells main.',
   "When you are asked to arrange a meeting in a thread that isn't about scheduling, send nothing in it and report not-scheduling.",
   'A conversation brief asks you to answer a thread',
   'Report `done` once it needs nothing more from you, after your last email has gone.',

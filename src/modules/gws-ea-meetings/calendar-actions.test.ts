@@ -69,7 +69,7 @@ import { consumeOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications
 import { ensureInbox, GoogleApiError } from '../gws-ea-inbox/index.js';
 import { getBooking, listOfferedSlots } from './index.js';
 import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
-import { ask, data, meeting, meetingSession, refusal, slotsOf, type OfferedSlot } from './testing/scheduling.js';
+import { ask, data, meeting, meetingSession, notes, refusal, slotsOf, type OfferedSlot } from './testing/scheduling.js';
 
 const ROBIN = 'robin@northwind.example';
 const PRINCIPAL = 'pat@northwind.example';
@@ -250,7 +250,13 @@ describe('AE1: three offered times become holds, and the one picked becomes the 
       expect(consumeOwnCalendarChange(PRINCIPAL, hold.id, new Date())).toBe(true);
     }
 
-    const booked = data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: wednesday.slot_id }));
+    const booked = data(
+      await ask(session, 'meeting_book', {
+        meeting_id: stored.id,
+        slot_id: wednesday.slot_id,
+        invitation: { title: 'Partnership intro' },
+      }),
+    );
     expect(booked).toMatchObject({ booking: { start: WEDNESDAY_10AM } });
 
     expect(holds()).toEqual([]);
@@ -273,7 +279,6 @@ describe('AE1: three offered times become holds, and the one picked becomes the 
       event_id: event.id,
       start_at: WEDNESDAY_10AM,
     });
-    data(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'booked' }));
     expect((await meeting(stored.id)).state).toBe('booked');
   });
 });
@@ -497,45 +502,153 @@ describe('releasing holds', () => {
 // ---------------------------------------------------------------------------
 
 describe('book', () => {
-  it("invites the meeting record's people with templated fields, never a hold's title or anything the counterpart wrote", async () => {
+  /** The invitation the booking created, as Google stores it. */
+  function bookedEvent(meetingId: string): StoredEvent | undefined {
+    return calendar
+      .live(PRINCIPAL)
+      .find((event) => event.tags?.gwsEaRole === 'booking' && event.tags.gwsEaMeeting === meetingId);
+  }
+
+  it('creates the invitation external-email wrote for the meeting’s people, and nothing else, and tells main once', async () => {
+    calendar.calendars.set(PRINCIPAL, {
+      id: PRINCIPAL,
+      accessRole: 'writer',
+      primary: false,
+      conferenceTypes: ['hangoutsMeet'],
+    });
     const { meeting: stored, session } = await arranged(sam);
     const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
     data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [slot.slot_id] }));
     const holdTitle = holds()[0].summary;
-    data(
+    const booked = data(
       await ask(session, 'meeting_book', {
         meeting_id: stored.id,
         slot_id: slot.slot_id,
+        invitation: { title: 'Sam and Pat: Q4 pilot', notes: 'We will walk through the pilot plan.', video_call: true },
         summary: 'Sam says: call me at 555-0100',
         attendees: ['attacker@evil.example'],
       }),
     );
+    expect(String(booked.message)).toMatch(/with a Google Meet link \(https:\/\/meet.google.com\//);
     const insert = calendar.writes.find(
       (write) => write.op === 'insert' && write.fields?.tags?.gwsEaRole === 'booking',
     );
     expect(insert?.fields).toMatchObject({
-      summary: 'Partnership intro',
-      description: 'Arranged by Robin, the assistant.',
+      summary: 'Sam and Pat: Q4 pilot',
+      description: 'We will walk through the pilot plan.',
       attendees: [SAM],
       start: slot.start,
       end: slot.end,
       tags: { gwsEaMeeting: stored.id, gwsEaRole: 'booking' },
     });
+    expect(insert?.fields?.conference?.requestId).toMatch(/^[0-9a-f]{64}$/u);
+    expect(insert?.fields?.location).toBeUndefined();
     const written = JSON.stringify(insert?.fields);
-    for (const absent of [holdTitle ?? 'Hold', '555-0100', 'attacker', 'Mornings suit']) {
+    for (const absent of [holdTitle ?? 'Hold', '555-0100', 'attacker', 'Mornings suit', 'Arranged by']) {
       expect(written).not.toContain(absent);
     }
+    expect(bookedEvent(stored.id)?.conference?.status).toBe('success');
+
+    // main hears of it from the booking itself, by its own purpose, with nothing external-email wrote.
+    expect((await meeting(stored.id)).state).toBe('booked');
+    const [note, ...more] = notes(main, 'gws-ea-meetings.outcome').filter((c) => c.note?.outcome === 'booked');
+    expect(more).toEqual([]);
+    expect(note.note).toMatchObject({ meeting_id: stored.id, video_call: true });
+    expect(note.text).toContain('"Partnership intro"');
+    expect(note.text).toContain('with a Google Meet link');
+    expect(note.text).not.toContain('Q4 pilot');
+    // A repeat changes nothing, and tells main nothing twice.
+    data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: slot.slot_id }));
+    expect(notes(main, 'gws-ea-meetings.outcome').filter((c) => c.note?.outcome === 'booked')).toHaveLength(1);
+    expect(
+      calendar.writes.filter((write) => write.op === 'insert' && write.fields?.tags?.gwsEaRole === 'booking'),
+    ).toHaveLength(1);
+    expect(refusal(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'booked' }))).toMatch(
+      /outcome must be one of/,
+    );
   });
 
-  it('refuses a booking whose fields would carry a private value', async () => {
-    const { meeting: stored, session } = await arranged(sam, { purpose: 'Planning at Rosewood Lodge' });
+  it("puts the other side's own link in the place, with the join details in the notes, and adds no Meet link", async () => {
+    const { meeting: stored, session } = await arranged(sam);
+    const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
+    const booked = data(
+      await ask(session, 'meeting_book', {
+        meeting_id: stored.id,
+        slot_id: slot.slot_id,
+        invitation: {
+          title: 'Sam and Pat: Q4 pilot',
+          location: 'https://acme.zoom.us/j/8812345678',
+          notes: 'Zoom passcode 4411.',
+        },
+      }),
+    );
+    expect(String(booked.message)).not.toMatch(/Meet/);
+    expect(bookedEvent(stored.id)).toMatchObject({
+      location: 'https://acme.zoom.us/j/8812345678',
+      description: 'Zoom passcode 4411.',
+    });
+    expect(bookedEvent(stored.id)?.conference).toBeUndefined();
+  });
+
+  it('refuses an invitation carrying a private value, a missing title, and a Meet link the calendar does not allow, before any write', async () => {
+    const { meeting: stored, session } = await arranged(sam);
     const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
     await addPrivateValue({ label: 'Holiday home', kind: 'address', value: 'Rosewood Lodge' });
-    const message = refusal(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: slot.slot_id }));
+    const message = refusal(
+      await ask(session, 'meeting_book', {
+        meeting_id: stored.id,
+        slot_id: slot.slot_id,
+        invitation: { title: 'Planning', location: 'Rosewood Lodge' },
+      }),
+    );
     expect(message).toContain('address');
     expect(message).not.toContain('Rosewood');
+    expect(refusal(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: slot.slot_id }))).toMatch(
+      /title/,
+    );
+    expect(
+      refusal(
+        await ask(session, 'meeting_book', {
+          meeting_id: stored.id,
+          slot_id: slot.slot_id,
+          invitation: { title: 'Planning', video_call: true },
+        }),
+      ),
+    ).toMatch(/does not allow Google Meet/);
     expect(calendar.writes.filter((write) => write.op === 'insert')).toEqual([]);
     expect(await getBooking(stored.id)).toBeUndefined();
+  });
+
+  it('says when Google is still creating the Meet link, and when it could not', async () => {
+    calendar.calendars.set(PRINCIPAL, {
+      id: PRINCIPAL,
+      accessRole: 'writer',
+      primary: false,
+      conferenceTypes: ['hangoutsMeet'],
+    });
+    calendar.meetCreation = 'pending';
+    const first = await arranged(sam);
+    const [slot] = slotsOf(await ask(first.session, 'meeting_free_time', { meeting_id: first.meeting.id }));
+    const pending = data(
+      await ask(first.session, 'meeting_book', {
+        meeting_id: first.meeting.id,
+        slot_id: slot.slot_id,
+        invitation: { title: 'Q4 pilot', video_call: true },
+      }),
+    );
+    expect(String(pending.message)).toMatch(/still creating its Meet link/);
+
+    calendar.meetCreation = 'failure';
+    const second = await arranged(acme);
+    const [other] = slotsOf(await ask(second.session, 'meeting_free_time', { meeting_id: second.meeting.id }));
+    const failed = data(
+      await ask(second.session, 'meeting_book', {
+        meeting_id: second.meeting.id,
+        slot_id: other.slot_id,
+        invitation: { title: 'Intro', video_call: true },
+      }),
+    );
+    expect(String(failed.message)).toMatch(/could not create a Meet link, so ask main about the place/);
   });
 
   it('creates no duplicate when retried after Google applied it but the answer was lost, and a repeat is a no-op', async () => {
@@ -546,22 +659,33 @@ describe('book', () => {
       error: new GoogleApiError(0, 'Google could not be reached'),
       afterApplying: true,
     });
-    expect((await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: slot.slot_id })).ok).toBe(false);
-    data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: slot.slot_id }));
-    data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: slot.slot_id }));
+    const booking = { meeting_id: stored.id, slot_id: slot.slot_id, invitation: { title: 'Partnership intro' } };
+    expect((await ask(session, 'meeting_book', booking)).ok).toBe(false);
+    data(await ask(session, 'meeting_book', booking));
+    data(await ask(session, 'meeting_book', booking));
     const bookings = calendar.live(PRINCIPAL).filter((event) => event.tags?.gwsEaRole === 'booking');
     expect(bookings).toHaveLength(1);
     // One invitation went out: no second insert, and no update that would email the attendees again.
     expect(calendar.writes.filter((write) => write.sendUpdates === 'all')).toHaveLength(1);
   });
 
-  it('refuses a different time once the meeting has a booking', async () => {
+  it('moves the booked event in place for a newly offered time, once booked', async () => {
     const { meeting: stored, session } = await arranged(sam);
     const [first, second] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
-    data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: first.slot_id }));
-    expect(refusal(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: second.slot_id }))).toMatch(
-      /already booked/,
+    data(
+      await ask(session, 'meeting_book', {
+        meeting_id: stored.id,
+        slot_id: first.slot_id,
+        invitation: { title: 'Partnership intro' },
+      }),
     );
+    expect(
+      data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: second.slot_id })).message,
+    ).toMatch(/^Moved:/);
+    expect(await getBooking(stored.id)).toMatchObject({ start_at: second.start });
+    expect(
+      calendar.writes.filter((write) => write.op === 'insert' && write.fields?.tags?.gwsEaRole === 'booking'),
+    ).toHaveLength(1);
   });
 });
 
@@ -586,6 +710,16 @@ describe('AE3: book for a reschedule moves the original event', () => {
     const session = await meetingSession(moved.meeting_id);
     const eventsBefore = calendar.events.length;
     const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: moved.meeting_id }));
+    // Its title, place and notes are the principal's own: a move takes no invitation.
+    expect(
+      refusal(
+        await ask(session, 'meeting_book', {
+          meeting_id: moved.meeting_id,
+          slot_id: slot.slot_id,
+          invitation: { title: 'Coffee, moved' },
+        }),
+      ),
+    ).toMatch(/principal's own event/);
     data(await ask(session, 'meeting_book', { meeting_id: moved.meeting_id, slot_id: slot.slot_id }));
 
     expect(calendar.events).toHaveLength(eventsBefore);
@@ -605,7 +739,6 @@ describe('AE3: book for a reschedule moves the original event', () => {
       end: { dateTime: slot.end },
     });
     expect(await getBooking(String(moved.meeting_id))).toMatchObject({ event_id: 'evt-coffee', start_at: slot.start });
-    data(await ask(session, 'meeting_outcome', { meeting_id: moved.meeting_id, outcome: 'booked' }));
   });
 });
 
@@ -630,6 +763,28 @@ describe('a colleague (R11)', () => {
     expect(event.start?.dateTime).toBe(WEDNESDAY_10AM);
     expect(calendar.writes.find((write) => write.eventId === event.id)?.sendUpdates).toBe('all');
     expect(await getBooking(stored.id)).toMatchObject({ event_id: event.id, start_at: WEDNESDAY_10AM });
+  });
+
+  it("is booked with the invitation main gives, and main's purpose as its title when it gives none", async () => {
+    calendar.calendars.set(PRINCIPAL, {
+      id: PRINCIPAL,
+      accessRole: 'writer',
+      primary: false,
+      conferenceTypes: ['hangoutsMeet'],
+    });
+    calendar.sharedFreeBusy.set(KIM, []);
+    const answer = data(
+      await ask(
+        main,
+        'meeting_arrange',
+        arrangeWith(kim, { invitation: { video_call: true, notes: 'Bring the Q4 numbers.' } }),
+      ),
+    );
+    expect(answer.state).toBe('booked');
+    const [event] = calendar.live(PRINCIPAL).filter((e) => e.tags?.gwsEaRole === 'booking');
+    expect(event).toMatchObject({ summary: 'Partnership intro', description: 'Bring the Q4 numbers.' });
+    expect(event.conference?.status).toBe('success');
+    expect((await meeting(answer.meeting_id)).invitation).toEqual({ video_call: true, notes: 'Bring the Q4 numbers.' });
   });
 
   it('whose free/busy is hidden is arranged by email, as anyone else', async () => {

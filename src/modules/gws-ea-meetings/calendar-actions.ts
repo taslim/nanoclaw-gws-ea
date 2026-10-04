@@ -14,14 +14,16 @@
  *   a private, busy, silent event on the meeting's booking calendar for
  *   each, under an id derived from the meeting and the slot, and any other
  *   hold of the meeting released. An empty list releases them all.
- * - `meeting_book` creates the one meeting event from the meeting record: its
- *   people as attendees, its purpose as the title, and a fixed line, with
- *   Google's invitations sent; for a reschedule it moves the original event
- *   instead, keeping its id. The id is derived from the meeting, so a retry
- *   after a partial failure finds the event it made. It then releases every
+ * - `meeting_book` creates the one meeting event: the meeting's people as
+ *   attendees, and the invitation `external-email` wrote by judgment (KTD7),
+ *   a title, any notes and place, and a Google Meet link when the calendar
+ *   allows one, with Google's invitations sent; for a reschedule it moves
+ *   the original event instead, keeping its id, title, place and notes. The
+ *   id is derived from the meeting, so a retry after a partial failure finds
+ *   the event it made. It tells main at once (KTD8), then releases every
  *   hold. Once the meeting is booked, `book` with a newly offered slot moves
  *   the booked event there in place, when the counterpart asks, and main
- *   hears of it in a note.
+ *   hears of it in a note; the invitation changes only through main.
  * - The first hold starts the meeting's follow-through deadlines (KTD12);
  *   a booking clears them. A reschedule making room for another meeting
  *   treats the time it frees as taken, and once it is booked that time goes
@@ -45,18 +47,21 @@ import { recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.
 import { listPrincipalCalendars } from '../gws-ea-inbox/db.js';
 import { audienceForAddresses, checkOutbound } from '../gws-ea-privacy/index.js';
 import { getGwsEaProfile } from '../gws-ea-profile/db.js';
-import type {
-  CalendarEvent,
-  EventWrite,
-  ListedEvent,
-  MeetingsCalendarApi,
-  NewEvent,
-  SendUpdates,
+import {
+  allowsMeet,
+  type CalendarEvent,
+  type EventConference,
+  type EventWrite,
+  type ListedEvent,
+  type MeetingsCalendarApi,
+  type NewEvent,
+  type SendUpdates,
 } from './calendar-api.js';
 import {
   clearDeadlines,
   countAnswers,
   deleteHold,
+  getBookedInvitation,
   getBooking,
   getMeeting,
   getOfferedSlot,
@@ -65,10 +70,13 @@ import {
   recordBooking,
   recordHold,
   recordOfferedSlots,
+  setBookedInvitation,
   startDeadlines,
   updateBookingTime,
+  updateMeeting,
   type Booking,
   type Hold,
+  type Invitation,
   isScheduling,
   type Meeting,
   type SchedulingMeeting,
@@ -78,6 +86,7 @@ import { deadlinesFrom } from './follow-through.js';
 import {
   addressBook,
   invalid,
+  invitationOf,
   meetingIdOf,
   principalPreferences,
   principalTimezone,
@@ -86,7 +95,7 @@ import {
   type Answer,
   type Handle,
 } from './handoff.js';
-import { MOVED_NOTE_TYPE, mainTimezone, noteCounterparts, who, writeMainNote } from './notes.js';
+import { MOVED_NOTE_TYPE, mainTimezone, noteCounterparts, who, writeBookedNote, writeMainNote } from './notes.js';
 import {
   bestSlots,
   blocksTime,
@@ -276,13 +285,41 @@ function holdFields(meeting: SchedulingMeeting, view: View): Pick<EventWrite, 's
   };
 }
 
-function bookingFields(meeting: SchedulingMeeting, view: View): Pick<EventWrite, 'summary' | 'description'> {
+/** The Meet request's id for a meeting: the same on every attempt, so Google creates one link. */
+function meetRequestId(meetingId: string): string {
+  return eventIdFor('meet', meetingId);
+}
+
+/** What an invitation writes on the event: its title, or main's purpose when it gave none, and only what it carries. */
+function invitationFields(
+  meeting: SchedulingMeeting,
+  invitation: Invitation,
+): Pick<EventWrite, 'summary' | 'description' | 'location' | 'conference'> {
   return {
-    summary: meeting.purpose,
-    description: view.assistantName
-      ? `Arranged by ${view.assistantName}, the assistant.`
-      : 'Arranged by the assistant.',
+    summary: invitation.title ?? meeting.purpose,
+    ...(invitation.notes === undefined ? {} : { description: invitation.notes }),
+    ...(invitation.location === undefined ? {} : { location: invitation.location }),
+    ...(invitation.video_call === true ? { conference: { requestId: meetRequestId(meeting.id) } } : {}),
   };
+}
+
+/** What a Meet link on a booking means for the one who booked it. */
+function conferenceWords(conference: EventConference | undefined): string {
+  if (conference === undefined) return '';
+  switch (conference.status) {
+    case 'success':
+      return conference.uri === undefined
+        ? ', with a Google Meet link'
+        : `, with a Google Meet link (${conference.uri})`;
+    case 'pending':
+      return '; Google is still creating its Meet link, which appears on the invitation shortly';
+    case 'failure':
+      return '; Google could not create a Meet link, so ask main about the place with meeting_ask_main';
+    default: {
+      const unreachable: never = conference.status;
+      throw new Error(`Unknown conference status ${String(unreachable)}`);
+    }
+  }
 }
 
 /** What a free_time answer opens with: what was found, and what to do when nothing was. */
@@ -429,7 +466,18 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
         throw new Error(`Event ${eventId} on ${calendarId} is not meeting ${meetingId}'s`);
       }
       if (deleted || !alreadyWritten(current, event)) {
-        await calendar().patchEvent(calendarId, eventId, { ...event, status: 'confirmed' }, sendUpdates);
+        // A conference is created only when the event has none: never a second link.
+        const { conference, ...fields } = event;
+        await calendar().patchEvent(
+          calendarId,
+          eventId,
+          {
+            ...fields,
+            ...(conference === undefined || current.conference !== undefined ? {} : { conference }),
+            status: 'confirmed',
+          },
+          sendUpdates,
+        );
       }
     }
     recordOwnCalendarChange(calendarId, eventId);
@@ -497,8 +545,16 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     await removeHolds(meeting.id, which === 'all' ? holds : holds.filter(stale));
   }
 
-  /** Create the meeting's event, or move the event a reschedule is about; returns the booking to record. */
-  async function placeBooking(meeting: SchedulingMeeting, view: View, slot: OfferedSlot): Promise<Booking> {
+  /**
+   * Create the meeting's event with `invitation`, or move the event a
+   * reschedule is about, keeping its own fields; returns the booking to record.
+   */
+  async function placeBooking(
+    meeting: SchedulingMeeting,
+    view: View,
+    slot: OfferedSlot,
+    invitation: Invitation,
+  ): Promise<Booking> {
     const bookedAt = new Date().toISOString();
     if (meeting.kind === 'reschedule') {
       if (meeting.event_calendar_id === null || meeting.event_id === null) {
@@ -524,7 +580,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
       meeting.booking_calendar_id,
       eventId,
       {
-        ...bookingFields(meeting, view),
+        ...invitationFields(meeting, invitation),
         start: slot.start_at,
         end: slot.end_at,
         timeZone: view.timezone,
@@ -549,16 +605,32 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
    * The booking's text reaches everyone it invites, so nothing private
    * passes (R24); `refusal` says what was not done. A move writes no text.
    */
-  async function assertBookable(meeting: SchedulingMeeting, view: View, refusal: string): Promise<void> {
+  async function assertBookable(meeting: SchedulingMeeting, invitation: Invitation, refusal: string): Promise<void> {
     if (meeting.kind === 'reschedule') return;
-    const fields = bookingFields(meeting, view);
+    const fields = invitationFields(meeting, invitation);
     const check = await checkOutbound(
-      [fields.summary ?? '', fields.description ?? ''],
+      [fields.summary ?? '', fields.description ?? '', fields.location ?? ''],
       await audienceForAddresses(meeting.counterparts.map((counterpart) => counterpart.address)),
     );
     if (!check.allowed) {
-      throw refused(`${refusal}: the meeting's title carries one of the principal's private details (${check.kind}).`);
+      throw refused(`${refusal}: the invitation carries one of the principal's private details (${check.kind}).`);
     }
+  }
+
+  /** A calendar that lets its events carry a Google Meet link; refused, saying so, when it does not. */
+  async function assertMeetAllowed(calendarId: string): Promise<void> {
+    const entry = await calendar().getCalendar(calendarId);
+    if (!entry || !allowsMeet(entry)) {
+      throw refused(
+        `Calendar ${calendarId} does not allow Google Meet links: give the place another way, such as their own link in location.`,
+      );
+    }
+  }
+
+  /** The event's Meet link as Google reports it now, when the invitation asked for one. */
+  async function conferenceOf(booking: Booking, invitation: Invitation): Promise<EventConference | undefined> {
+    if (invitation.video_call !== true) return undefined;
+    return (await calendar().getEvent(booking.calendar_id, booking.event_id))?.conference ?? { status: 'pending' };
   }
 
   // -------------------------------------------------------------------------
@@ -876,39 +948,62 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     };
   }
 
+  /**
+   * Book the time the other side picked (KTD7, KTD8): an arranged meeting's
+   * event is created with the invitation `external-email` wrote, a
+   * reschedule's event moves and keeps its own fields. main hears of it at
+   * once, from here, and the meeting is booked; a repeat finishes what an
+   * earlier attempt left and never rewrites the invitation, which changes
+   * only through main.
+   */
   const book: Handle = async (content, session) => {
     const meeting = await ownLiveMeeting(content, session);
     assertBooks(meeting);
     const slotId = slotIdOf(content.slot_id);
+    const given = invitationOf(content.invitation);
+    if (given !== undefined && meeting.kind !== 'arrange') {
+      throw refused(
+        "This meeting moves the principal's own event: its title, place and notes stay as they are. Book again without invitation.",
+      );
+    }
     const [slot] = await offeredSlots(meeting, [slotId]);
     const view = await viewOf(meeting);
     const display = await resolveGroupTimezone(session.agent_group_id);
     const existing = await getBooking(meeting.id);
     let booking: Booking;
+    let invitation: Invitation;
     if (existing) {
       if (existing.start_at !== slot.start_at || existing.end_at !== slot.end_at) {
         if (meeting.state === 'booked') return moveBooking(meeting, existing, slot, view, display);
-        throw refused(
-          `Meeting ${meeting.id} is already booked for ${slotLabel(slotSpan(existing), display)}. Report booked with meeting_outcome if you have not.`,
-        );
+        throw refused(`Meeting ${meeting.id} is already booked for ${slotLabel(slotSpan(existing), display)}.`);
       }
       // A repeat: the event already says this, so nobody is emailed again; it finishes what an earlier attempt left.
-      await placeBooking(meeting, view, slot);
+      invitation = (await getBookedInvitation(meeting.id)) ?? {};
+      await placeBooking(meeting, view, slot, invitation);
       booking = existing;
     } else {
+      if (meeting.kind === 'arrange' && given?.title === undefined) {
+        throw invalid('Give the invitation a title: it is what the attendees see on their calendars.');
+      }
+      invitation = given ?? {};
       const closed = await closedSlots(meeting, view, [slot]);
-      if (closed.length > 0)
+      if (closed.length > 0) {
         throw refused(`${slotId} is no longer open: call meeting_free_time again for times to offer instead.`);
-      await assertBookable(
-        meeting,
-        view,
-        'The booking was not made; report gave-up with meeting_outcome, so main can arrange it again under another purpose',
-      );
-      booking = await placeBooking(meeting, view, slot);
-      await recordBooking(booking);
+      }
+      await assertBookable(meeting, invitation, 'The booking was not made; write the invitation without it');
+      if (invitation.video_call === true && meeting.booking_calendar_id !== null) {
+        await assertMeetAllowed(meeting.booking_calendar_id);
+      }
+      booking = await placeBooking(meeting, view, slot, invitation);
+      await recordBooking(booking, meeting.kind === 'arrange' ? invitation : undefined);
     }
+    const conference = await conferenceOf(booking, invitation);
+    const at = new Date().toISOString();
+    // main hears before the meeting counts as booked, so a repeat after any failure still tells it, once.
+    await writeBookedNote(meeting, booking, conference, at);
+    if (meeting.state !== 'booked') await updateMeeting(meeting.id, { state: 'booked' }, at);
     // A question main has not answered keeps its own count; nothing else waits once the meeting is booked.
-    if (meeting.asked_at === null) await clearDeadlines(meeting.id, new Date().toISOString());
+    if (meeting.asked_at === null) await clearDeadlines(meeting.id, at);
     let holdsLeft = '';
     /* eslint-disable no-catch-all/no-catch-all -- the booking stands; holds left over go on a repeat of book, or follow-through releases them */
     try {
@@ -923,17 +1018,20 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
       log.warn('What follows a booking did not finish; follow-through finishes it', { meetingId: meeting.id, err });
     }
     /* eslint-enable no-catch-all/no-catch-all */
+    const data = {
+      meeting_id: meeting.id,
+      booking: {
+        calendar_id: booking.calendar_id,
+        event_id: booking.event_id,
+        start: booking.start_at,
+        end: booking.end_at,
+      },
+    };
     if (meeting.state === 'booked') {
       return {
         meetingId: meeting.id,
         data: {
-          meeting_id: meeting.id,
-          booking: {
-            calendar_id: booking.calendar_id,
-            event_id: booking.event_id,
-            start: booking.start_at,
-            end: booking.end_at,
-          },
+          ...data,
           message: `Meeting ${meeting.id} is booked for ${slotLabel(slotSpan(booking), display)}: nothing changed.${holdsLeft}`,
         },
       };
@@ -942,17 +1040,12 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     return {
       meetingId: meeting.id,
       data: {
-        meeting_id: meeting.id,
-        booking: {
-          calendar_id: booking.calendar_id,
-          event_id: booking.event_id,
-          start: booking.start_at,
-          end: booking.end_at,
-        },
+        ...data,
         message:
           `${moved ? 'Moved' : 'Booked'}: ${slotLabel(slotSpan(slot), display)}. ` +
-          `Google sends ${meeting.counterparts.map((c) => c.address).join(', ')} the ${moved ? 'update' : 'invitation'} from the principal's calendar, ` +
-          `and the other holds are released.${holdsLeft} Now report booked with meeting_outcome.`,
+          `Google sends ${meeting.counterparts.map((c) => c.address).join(', ')} the ${moved ? 'update' : 'invitation'} from the principal's calendar` +
+          `${conferenceWords(conference)}, and the other holds are released.${holdsLeft} main hears of it from the host. ` +
+          'Stay with the conversation for any change they ask for.',
       },
     };
   };
@@ -977,7 +1070,9 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     const query = queryFor(meeting, view, busy, earliest);
     const [best] = bestSlots(query, openSlots(query), 1, now);
     if (!best) return undefined;
-    await assertBookable(meeting, view, 'The meeting was not booked');
+    const invitation = meeting.invitation ?? {};
+    await assertBookable(meeting, invitation, 'The meeting was not booked');
+    if (invitation.video_call === true) await assertMeetAllowed(meeting.booking_calendar_id);
     const slot: OfferedSlot = {
       slot_id: slotIdFor(meeting.id, best),
       start_at: iso(best.start),
@@ -985,8 +1080,8 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     };
     await recordOfferedSlots(meeting.id, [slot], new Date().toISOString());
     try {
-      const booking = await placeBooking(meeting, view, slot);
-      await recordBooking(booking);
+      const booking = await placeBooking(meeting, view, slot, invitation);
+      await recordBooking(booking, invitation);
       return booking;
     } catch (error) {
       // The meeting fails and main may ask again: no invitation is left behind for a meeting that does not exist.
@@ -1002,21 +1097,32 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
   }
 
   /**
-   * Bring a booked meeting's event in line with the meeting after main added
-   * people (KTD3): every one of them invited, with Google's update. Its text
-   * is checked against them all first, so a refusal writes nothing.
+   * Bring a booked meeting's event in line with the meeting after main
+   * changed it (KTD3, KTD7): every one of its people invited, and what
+   * `invitation` changes, with Google's update. Its whole invitation is
+   * checked against them all first, so a refusal writes nothing. A Meet link
+   * can be added, never a second one.
    */
-  async function updateBooking(meeting: SchedulingMeeting): Promise<void> {
+  async function updateBooking(meeting: SchedulingMeeting, invitation?: Invitation): Promise<void> {
     const booking = await getBooking(meeting.id);
     if (!booking) throw refused(`Meeting ${meeting.id} has no booking to update`);
-    await assertBookable(meeting, await viewOf(meeting), 'Nobody was added');
+    const written = (await getBookedInvitation(meeting.id)) ?? {};
+    const next = invitation === undefined ? written : { ...written, ...invitation };
+    if (invitation?.video_call === false && written.video_call === true) {
+      throw refused('The booked event keeps its Google Meet link: tell them the place in its notes instead.');
+    }
+    await assertBookable(meeting, next, 'Nothing was changed');
+    const addsMeet = invitation?.video_call === true && written.video_call !== true;
+    if (addsMeet) await assertMeetAllowed(booking.calendar_id);
+    const fields = invitation === undefined ? {} : invitationFields(meeting, { ...next, video_call: addsMeet });
     await calendar().patchEvent(
       booking.calendar_id,
       booking.event_id,
-      { attendees: meeting.counterparts.map((counterpart) => counterpart.address) },
+      { ...fields, attendees: meeting.counterparts.map((counterpart) => counterpart.address) },
       'all',
     );
     recordOwnCalendarChange(booking.calendar_id, booking.event_id);
+    if (invitation !== undefined) await setBookedInvitation(meeting.id, next);
   }
 
   /** Whether anything in the meeting's window is open now, as meeting_free_time would offer it. */

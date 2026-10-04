@@ -202,9 +202,14 @@ describe('AE10: Sam, who has a record, emails the assistant for time', () => {
     expect(await getThreadParticipants(threadKey)).toMatchObject({ origin: 'inbound', state: 'open' });
 
     const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
-    data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: slot.slot_id }));
+    data(
+      await ask(session, 'meeting_book', {
+        meeting_id: stored.id,
+        slot_id: slot.slot_id,
+        invitation: { title: 'Catch up' },
+      }),
+    );
     await reply(session, threadKey, 'Hello Sam, I am Robin, Alex Doe’s assistant. You are booked for Tuesday.');
-    data(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'booked' }));
 
     const [sent] = scheduling.gmail.sent;
     expect(sent.threadId).toBe('g-sam');

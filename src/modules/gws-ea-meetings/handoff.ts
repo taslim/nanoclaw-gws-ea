@@ -135,7 +135,6 @@ import {
   getMeeting,
   getRecordedOutcome,
   getRecordedResponse,
-  getRoomGivenTo,
   getRoomMadeBy,
   hadEarlierMeetingOnThread,
   insertMeeting,
@@ -150,10 +149,12 @@ import {
   recordOutcome,
   recordResponse,
   releaseGiveUp,
+  setMeetingInvitation,
   startDeadlines,
   updateMeeting,
   type AskTopic,
   type Booking,
+  type Invitation,
   type Meeting,
   type MeetingCounterpart,
   type MeetingState,
@@ -203,10 +204,11 @@ export interface MeetingHandoffDeps {
   readonly hasOpenTime: (meeting: SchedulingMeeting) => Promise<boolean>;
   /**
    * Bring a booked meeting's event in line with the meeting after main
-   * changed it: its people as attendees, with Google's update to them.
-   * Refused before any write when its text may not reach them all.
+   * changed it: its people as attendees, and what `invitation` changes, with
+   * Google's update to them. Refused before any write when its text may not
+   * reach them all.
    */
-  readonly updateBooking: (meeting: SchedulingMeeting) => Promise<void>;
+  readonly updateBooking: (meeting: SchedulingMeeting, invitation?: Invitation) => Promise<void>;
 }
 
 /** A request the host refuses as asked: the caller reads why and can ask differently. */
@@ -335,6 +337,45 @@ function bodyText(value: unknown, label: string, max: number): string {
     throw invalid(`${label} must be text of 1 to ${max} characters`);
   }
   return body;
+}
+
+/** An invitation's title, as attendees see it on their calendars. */
+const TITLE_MAX = 120;
+/** Notes that help the attendees: a few paragraphs at most. */
+const NOTES_MAX = 2_000;
+/** A place: an address, a phone number, or a link. */
+const LOCATION_MAX = 500;
+const INVITATION_FIELDS: readonly string[] = ['title', 'notes', 'location', 'video_call'];
+
+/** An invitation's fields as given (KTD7); undefined when it is absent. */
+export function invitationOf(value: unknown): Invitation | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw invalid('invitation must be { title?, notes?, location?, video_call? }');
+  }
+  const record = value as Record<string, unknown>;
+  const other = Object.keys(record).find((key) => !INVITATION_FIELDS.includes(key));
+  if (other !== undefined) throw invalid(`invitation takes title, notes, location and video_call, not ${other}`);
+  if (record.video_call !== undefined && typeof record.video_call !== 'boolean') {
+    throw invalid('invitation.video_call must be true or false');
+  }
+  const title = optionalText(record.title, 'invitation.title', TITLE_MAX);
+  const notes =
+    record.notes === undefined || record.notes === null
+      ? undefined
+      : bodyText(record.notes, 'invitation.notes', NOTES_MAX);
+  const location = optionalText(record.location, 'invitation.location', LOCATION_MAX);
+  return {
+    ...(title === undefined ? {} : { title }),
+    ...(notes === undefined ? {} : { notes }),
+    ...(location === undefined ? {} : { location }),
+    ...(record.video_call === undefined ? {} : { video_call: record.video_call }),
+  };
+}
+
+/** An invitation's text, for the private-details check. */
+export function invitationText(invitation: Invitation | undefined): (string | undefined)[] {
+  return [invitation?.title, invitation?.notes, invitation?.location];
 }
 
 /** A list of addresses as given, each normalized; an empty list when it is absent and not required. */
@@ -839,7 +880,20 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       `Window: from ${formatLocalTime(meeting.window_start, timezone)} to ${formatLocalTime(meeting.window_end, timezone)} (${timezone}).`,
       `Purpose: ${meeting.purpose}`,
       `Constraints: ${meeting.constraints ?? 'none.'}`,
+      ...(meeting.invitation === null ? [] : [`Invitation, as main wishes it: ${invitationWords(meeting.invitation)}`]),
     ];
+  }
+
+  /** An invitation's fields, as a line of a brief. */
+  function invitationWords(invitation: Invitation): string {
+    const parts = [
+      ...(invitation.video_call === true ? ['a Google Meet link'] : []),
+      ...(invitation.video_call === false ? ['no video call'] : []),
+      ...(invitation.title === undefined ? [] : [`title "${invitation.title}"`]),
+      ...(invitation.location === undefined ? [] : [`place: ${invitation.location}`]),
+      ...(invitation.notes === undefined ? [] : [`notes: ${invitation.notes}`]),
+    ];
+    return parts.length === 0 ? 'nothing in particular.' : `${parts.join('; ')}.`;
   }
 
   /** What changed with a later brief: the people `main` added, and its answer. */
@@ -1173,6 +1227,8 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     readonly event: { readonly calendarId: string; readonly eventId: string } | null;
     readonly purpose: string;
     readonly constraints: string | undefined;
+    /** What main wishes the invitation to carry. */
+    readonly invitation?: Invitation;
     readonly meetingKind: string | undefined;
     readonly threadKey: string;
     /** A booked meeting whose thread and session this one takes over. */
@@ -1210,6 +1266,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
             event_id: creation.event?.eventId ?? null,
             purpose: creation.purpose,
             constraints: creation.constraints ?? null,
+            invitation: creation.invitation ?? null,
             meeting_kind: creation.meetingKind ?? null,
             thread_key: creation.threadKey,
             replaces_meeting_id: creation.replaces?.id ?? null,
@@ -1255,6 +1312,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     const window = checkedWindow(windowOf(content), lengthMinutes, at);
     const purpose = text(content.purpose, 'purpose', PURPOSE_MAX);
     const constraints = optionalText(content.constraints, 'constraints', CONSTRAINTS_MAX);
+    const invitation = invitationOf(content.invitation);
     const meetingKind = meetingKindOf(content);
     const book = await addressBook();
     const named = await Promise.all((people ?? []).map((ref) => counterpartFor(ref, book)));
@@ -1291,7 +1349,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       opening = { kind: 'new', opener: 'arrange', copyPrincipal };
     }
     const bookingCalendarId = await requireWritableCalendar(calendarId);
-    await assertShareable(purpose, constraints);
+    await assertShareable(purpose, constraints, ...invitationText(invitation));
     const meeting = await createMeeting({
       terms: scheduling('arrange', lengthMinutes, window),
       session,
@@ -1301,6 +1359,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       event: null,
       purpose,
       constraints,
+      ...(invitation === undefined ? {} : { invitation }),
       meetingKind,
       threadKey: threadKey ?? mintThreadKey(),
       ...(replaces ? { replaces } : {}),
@@ -1690,7 +1749,15 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   }
 
   /** What `meeting_amend` may change. */
-  const AMENDABLE = ['answer', 'length_minutes', 'window_start', 'window_end', 'constraints', 'people'] as const;
+  const AMENDABLE = [
+    'answer',
+    'length_minutes',
+    'window_start',
+    'window_end',
+    'constraints',
+    'people',
+    'invitation',
+  ] as const;
 
   /**
    * main changes a job, answers the question it is waiting on, or both
@@ -1727,9 +1794,10 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     }
     const answer = optionalText(content.answer, 'answer', ANSWER_MAX);
     const people = peopleOf(content.people);
-    if (people !== undefined && meeting.kind !== 'arrange') {
+    const invitation = invitationOf(content.invitation);
+    if ((people !== undefined || invitation !== undefined) && meeting.kind !== 'arrange') {
       throw refused(
-        "Only a meeting handed over with meeting_arrange takes new people: moving an event, or asking its organizer, reaches the event's own guests.",
+        "Only a meeting handed over with meeting_arrange takes new people or invitation fields: moving an event, or asking its organizer, reaches the event's own guests, and its invitation stays theirs.",
       );
     }
     const constraints =
@@ -1740,12 +1808,12 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     const book = await addressBook();
     const named = distinct(await Promise.all((people ?? []).map((ref) => counterpartFor(ref, book))));
     const added = named.filter((person) => !meeting.counterparts.some((c) => c.address === person.address));
-    await assertShareable(constraints, answer);
+    await assertShareable(constraints, answer, ...invitationText(invitation));
     const session = meeting.session_id === null ? undefined : await getSession(meeting.session_id);
     if (!session) throw refused(`Meeting ${meeting.id} has no conversation to brief`);
-    // A booked event's text reaches everyone it invites: it is checked against them all before anyone joins.
-    if (booked && isScheduling(meeting) && added.length > 0) {
-      await deps.updateBooking({ ...meeting, counterparts: [...meeting.counterparts, ...added] });
+    // A booked event's text reaches everyone it invites: it is checked against them all before it changes.
+    if (booked && isScheduling(meeting) && (added.length > 0 || invitation !== undefined)) {
+      await deps.updateBooking({ ...meeting, counterparts: [...meeting.counterparts, ...added] }, invitation);
     }
 
     const version = meeting.brief_version + 1;
@@ -1764,6 +1832,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       { ...terms, ...(constraints === undefined ? {} : { constraints }), brief_version: version },
       at,
     );
+    if (invitation !== undefined) await setMeetingInvitation(meeting.id, { ...meeting.invitation, ...invitation }, at);
     await closeAsk(meeting.id, at);
     const amended = await requireMeeting(meeting.id);
     await writeBrief(amended, session, version, 'continuing', { added, ...(answer === undefined ? {} : { answer }) });
@@ -1786,7 +1855,9 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         message:
           `Meeting ${meeting.id} has a new brief (version ${version}); external-email works from it now.` +
           (added.length === 0 ? '' : ` ${added.map(personText).join(', ')} joined the thread and the meeting.`) +
-          (booked && added.length > 0 ? ' Google sent the booked event’s guests its update.' : ''),
+          (booked && (added.length > 0 || invitation !== undefined)
+            ? ' Google sent the booked event’s guests its update.'
+            : ''),
       },
     };
   }
@@ -1942,15 +2013,13 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
 
   /** The state each outcome leaves its meeting in. */
   const OUTCOME_STATES: Readonly<Record<SchedulingOutcome, MeetingState>> = {
-    booked: 'booked',
     settled: 'settled',
     'not-scheduling': 'not-scheduling',
     'gave-up': 'gave-up',
   };
 
-  /** What a note adds about room: the meeting that moved for this one, or the one a failed move was for. */
+  /** What a note adds about room: the meeting a move that ended without it was making room for. */
   interface RoomContext {
-    readonly madeRoomBy?: NonNullable<OutcomeNote['made_room_by']>;
     /** The meeting a reschedule was making room for, while that room is still unmade. */
     readonly roomFor?: Meeting;
   }
@@ -1978,27 +2047,8 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     ].join('\n');
   }
 
-  function outcomeText(
-    meeting: Meeting,
-    outcome: SchedulingOutcome,
-    booking: Booking | undefined,
-    timezone: string,
-    room: RoomContext,
-  ): string {
+  function outcomeText(meeting: Meeting, outcome: SchedulingOutcome, room: RoomContext): string {
     switch (outcome) {
-      case 'booked': {
-        if (!booking) throw new Error('A booked note needs its booking');
-        const moved = meeting.kind === 'reschedule' ? 'moved to' : 'booked for';
-        const minutes = Math.round((Date.parse(booking.end_at) - Date.parse(booking.start_at)) / MINUTE);
-        const madeRoom = room.madeRoomBy
-          ? ` To make room for it, "${room.madeRoomBy.purpose}" with ${who(room.madeRoomBy)} moved` +
-            (room.madeRoomBy.moved_to ? ` to ${formatLocalTime(room.madeRoomBy.moved_to.start, timezone)}.` : '.')
-          : '';
-        return (
-          `Meeting ${meeting.id} is ${moved} ${formatLocalTime(booking.start_at, timezone)} (${minutes} minutes): ` +
-          `"${meeting.purpose}" with ${who(meeting)}, on calendar ${booking.calendar_id}.${madeRoom} Tell the principal in one line.`
-        );
-      }
       case 'settled':
         return (
           `${who(meeting)} moved their invitation, so it no longer conflicts (meeting ${meeting.id}, "${meeting.purpose}"). ` +
@@ -2034,20 +2084,6 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   /** What a note about this outcome says about room. */
   async function roomContext(meeting: SchedulingMeeting, outcome: SchedulingOutcome): Promise<RoomContext> {
     switch (outcome) {
-      case 'booked': {
-        const given = await getRoomGivenTo(meeting.id);
-        const moved = given ? await getMeeting(given.moved_meeting_id) : undefined;
-        if (!given || !moved) return {};
-        const movedTo = await getBooking(given.by_meeting_id);
-        return {
-          madeRoomBy: {
-            meeting_id: moved.id,
-            purpose: moved.purpose,
-            counterparts: noteCounterparts(moved),
-            moved_to: movedTo ? { start: movedTo.start_at, end: movedTo.end_at } : null,
-          },
-        };
-      }
       case 'gave-up': {
         const making = await getRoomMadeBy(meeting.id);
         const roomFor = making?.state === 'reserved' ? await getMeeting(making.for_meeting_id) : undefined;
@@ -2064,8 +2100,6 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   }
 
   const OUTCOME_REPLIES: Readonly<Record<SchedulingOutcome, string>> = {
-    booked:
-      'Recorded: booked. The principal hears it from main. Stay ready in this thread for any change they ask for.',
     settled: 'Recorded: settled. This conversation is now closed: send nothing more in it.',
     'not-scheduling': 'Recorded: not-scheduling. This conversation is now closed: send nothing more in it.',
     'gave-up': 'Recorded: gave-up. This conversation is now closed: send nothing more in it.',
@@ -2127,7 +2161,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       return done(meeting);
     }
     if (kind === 'done') {
-      throw refused('Only a conversation reports done: a meeting ends booked, settled, not-scheduling, or gave-up.');
+      throw refused('Only a conversation reports done: a meeting ends settled, not-scheduling, or gave-up.');
     }
     // Every outcome is reported once.
     const recorded = await getRecordedOutcome(meeting.id, kind);
@@ -2137,16 +2171,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       throw refused(`Meeting ${meeting.id} takes no outcome now (${meeting.state})`);
     }
 
-    let booking: Booking | undefined;
     switch (kind) {
-      case 'booked':
-        if (meeting.kind === 'ask_organizer')
-          throw refused(
-            'A meeting that asks an organizer to move their invitation ends settled or gave-up, never booked',
-          );
-        booking = await getBooking(meeting.id);
-        if (!booking) throw refused('Report booked only after meeting_book succeeded: this meeting has no booking yet');
-        break;
       case 'settled':
         if (meeting.kind !== 'ask_organizer') throw refused('Only an ask_organizer meeting ends settled');
         await assertSettled(meeting);
@@ -2178,17 +2203,6 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       purpose: meeting.purpose,
       level: meeting.level,
       counterparts: noteCounterparts(meeting),
-      ...(room.madeRoomBy ? { made_room_by: room.madeRoomBy } : {}),
-      ...(booking
-        ? {
-            booking: {
-              calendar_id: booking.calendar_id,
-              event_id: booking.event_id,
-              start: booking.start_at,
-              end: booking.end_at,
-            },
-          }
-        : {}),
       ...(kind === 'settled' && meeting.event_calendar_id !== null && meeting.event_id !== null
         ? { invitation: { calendar_id: meeting.event_calendar_id, event_id: meeting.event_id } }
         : {}),
@@ -2196,11 +2210,8 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     };
     // The note's id is fixed per meeting and outcome, so it is written once however often this runs;
     // the state changes after it are safe to repeat.
-    await writeOutcomeNote(note, outcomeText(meeting, kind, booking, await mainTimezone(), room), at);
-    if (kind === 'booked') {
-      await updateMeeting(meeting.id, { state: 'booked' }, at);
-      await clearDeadlines(meeting.id, at);
-    } else if (kind === 'not-scheduling') {
+    await writeOutcomeNote(note, outcomeText(meeting, kind, room), at);
+    if (kind === 'not-scheduling') {
       // The thread is main's to triage again: respond in it, or dismiss it.
       await handBack(meeting, 'not-scheduling', false);
     } else {

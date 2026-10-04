@@ -1,13 +1,15 @@
 /**
  * An in-memory Google Calendar, as the assistant's host token sees it, for
  * the meetings module's tests. It keeps what Google keeps: a deleted event
- * stays under its id as `cancelled`, an id is never issued twice, and a
- * calendar whose free/busy is not shared reads as not visible.
+ * stays under its id as `cancelled`, an id is never issued twice, a
+ * calendar whose free/busy is not shared reads as not visible, and a Meet
+ * link is created once per request id, as `meetCreation` says it goes.
  */
 import type { CalendarListEntry } from '../../gws-ea-inbox/calendar-notifications.js';
 import { GoogleApiError } from '../../gws-ea-inbox/gmail-api.js';
 import type {
   CalendarEvent,
+  EventConference,
   EventWrite,
   FreeBusyCalendar,
   MeetingsCalendarApi,
@@ -20,6 +22,7 @@ export interface StoredEvent extends CalendarEvent {
   readonly calendarId: string;
   readonly summary?: string;
   readonly description?: string;
+  readonly location?: string;
   readonly visibility?: string;
   readonly reminders?: 'default' | 'none';
 }
@@ -50,12 +53,21 @@ function overlapsInterval(event: CalendarEvent, min: number, max: number): boole
   return Date.parse(start) - slack < max && Date.parse(end) + slack > min;
 }
 
-function apply(event: StoredEvent, fields: EventWrite): StoredEvent {
+function apply(event: StoredEvent, fields: EventWrite, meet: EventConference['status']): StoredEvent {
+  const conference: EventConference | undefined =
+    event.conference ??
+    (fields.conference === undefined
+      ? undefined
+      : meet === 'success'
+        ? { status: 'success', uri: `https://meet.google.com/${fields.conference.requestId.slice(0, 10)}` }
+        : { status: meet });
   return {
     ...event,
     ...(fields.status === undefined ? {} : { status: fields.status }),
     ...(fields.summary === undefined ? {} : { summary: fields.summary }),
     ...(fields.description === undefined ? {} : { description: fields.description }),
+    ...(fields.location === undefined ? {} : { location: fields.location }),
+    ...(conference === undefined ? {} : { conference }),
     ...(fields.start === undefined ? {} : { start: { dateTime: fields.start } }),
     ...(fields.end === undefined ? {} : { end: { dateTime: fields.end } }),
     ...(fields.attendees === undefined
@@ -76,6 +88,8 @@ export class FakeCalendar implements MeetingsCalendarApi {
   readonly sharedFreeBusy = new Map<string, Array<{ start: string; end: string }>>();
   calls = 0;
   failure: Error | undefined;
+  /** How Google's creation of a Meet link a write asks for goes. */
+  meetCreation: EventConference['status'] = 'success';
   private injected: InjectedFailure[] = [];
 
   private call(): void {
@@ -155,6 +169,7 @@ export class FakeCalendar implements MeetingsCalendarApi {
           organizer: { email: calendarId },
         },
         event,
+        this.meetCreation,
       ),
     );
     this.writes.push({ op: 'insert', calendarId, eventId, sendUpdates, fields: event });
@@ -169,7 +184,7 @@ export class FakeCalendar implements MeetingsCalendarApi {
     const index = this.find(calendarId, eventId);
     if (index < 0)
       throw new GoogleApiError(404, `Google refused /calendars/${calendarId}/events/${eventId}: Not Found`);
-    this.events.splice(index, 1, apply(this.events[index], event));
+    this.events.splice(index, 1, apply(this.events[index], event, this.meetCreation));
     this.writes.push({ op: 'patch', calendarId, eventId, sendUpdates, fields: event });
     if (failure) throw failure.error;
   }

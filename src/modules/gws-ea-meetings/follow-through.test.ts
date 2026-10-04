@@ -342,12 +342,18 @@ describe('deadlines', () => {
 
   it('a booking clears them', async () => {
     const { stored, session, slots } = await offered(scheduling.people.acme);
-    data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: slots[0].slot_id }));
+    data(
+      await ask(session, 'meeting_book', {
+        meeting_id: stored.id,
+        slot_id: slots[0].slot_id,
+        invitation: { title: 'Partnership intro' },
+      }),
+    );
     expect(await meeting(stored.id)).toMatchObject({ nudge_at: null, give_up_at: null });
     await reach('2026-10-07T08:01:00.000Z');
     await reach('2026-10-09T08:02:00.000Z');
     expect(notes(session, NUDGE)).toHaveLength(0);
-    expect(notes(scheduling.main, OUTCOME)).toHaveLength(0);
+    expect(notes(scheduling.main, OUTCOME).map((c) => c.note?.outcome)).toEqual(['booked']);
   });
 
   it('that came due while the host was down fire once it is back, exactly once', async () => {
@@ -501,8 +507,13 @@ describe('deadlines', () => {
 
 async function booked(person: Person): Promise<Offered> {
   const held = await offered(person);
-  data(await ask(held.session, 'meeting_book', { meeting_id: held.stored.id, slot_id: held.slots[0].slot_id }));
-  data(await ask(held.session, 'meeting_outcome', { meeting_id: held.stored.id, outcome: 'booked' }));
+  data(
+    await ask(held.session, 'meeting_book', {
+      meeting_id: held.stored.id,
+      slot_id: held.slots[0].slot_id,
+      invitation: { title: 'Partnership intro' },
+    }),
+  );
   return { ...held, stored: await meeting(held.stored.id) };
 }
 

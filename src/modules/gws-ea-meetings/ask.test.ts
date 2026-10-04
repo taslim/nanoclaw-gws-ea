@@ -250,8 +250,13 @@ describe('main answers a booked meeting', () => {
   async function bookedWithAcme(): Promise<Offered> {
     const { stored, session } = await offeredToAcme(WEEK_AFTER);
     const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
-    data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: slot.slot_id }));
-    data(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'booked' }));
+    data(
+      await ask(session, 'meeting_book', {
+        meeting_id: stored.id,
+        slot_id: slot.slot_id,
+        invitation: { title: 'Partnership intro' },
+      }),
+    );
     return { stored: await meeting(stored.id), session };
   }
 
@@ -280,6 +285,34 @@ describe('main answers a booked meeting', () => {
     expect(refusal(await ask(scheduling.main, 'meeting_amend', { meeting_id: stored.id, length_minutes: 60 }))).toMatch(
       /meeting_reschedule/,
     );
+  });
+
+  it('changes its invitation at main’s word, checked against everyone it reaches before anything is written', async () => {
+    const { stored, session } = await bookedWithAcme();
+    data(await ask(session, 'meeting_ask_main', { meeting_id: stored.id, about: 'place' }));
+    data(
+      await ask(scheduling.main, 'meeting_amend', {
+        meeting_id: stored.id,
+        invitation: { location: 'Acme HQ, 1 Main Street' },
+        answer: 'Alex will come to Acme.',
+      }),
+    );
+    const booking = await getBooking(stored.id);
+    if (!booking) throw new Error('not booked');
+    expect(scheduling.calendar.event(booking.calendar_id, booking.event_id)).toMatchObject({
+      summary: 'Partnership intro',
+      location: 'Acme HQ, 1 Main Street',
+    });
+    expect(scheduling.calendar.writes.at(-1)).toMatchObject({ op: 'patch', sendUpdates: 'all' });
+
+    // The invitation already says something the principal has since made private: nobody new may read it.
+    await addPrivateValue({ label: 'Office', kind: 'address', value: 'Acme HQ, 1 Main Street' });
+    const writes = scheduling.calendar.writes.length;
+    expect(
+      refusal(await ask(scheduling.main, 'meeting_amend', { meeting_id: stored.id, people: [{ email: JANE }] })),
+    ).toMatch(/Nothing was changed: the invitation carries one of the principal.s private details/);
+    expect(scheduling.calendar.writes).toHaveLength(writes);
+    expect((await meeting(stored.id)).counterparts.map((c) => c.address)).toEqual([ADDRESSES.acme]);
   });
 
   it('lets a question main leaves open lapse, and the booked meeting stands', async () => {

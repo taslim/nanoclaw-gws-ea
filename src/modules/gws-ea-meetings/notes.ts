@@ -18,11 +18,23 @@ import { resolveGroupTimezone } from '../../container-config.js';
 import { log } from '../../log.js';
 import { requestWake } from '../../request-wake.js';
 import { writeSessionMessage } from '../../session-manager.js';
+import { formatLocalTime } from '../../timezone.js';
 import type { Session } from '../../types.js';
 import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from '../gws-ea-inbox/index.js';
 import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { isDuplicateNote, writeNoteForMain } from '../gws-ea-profile/main-note.js';
-import type { Meeting, MeetingKind, MeetingLevel, Outcome } from './db.js';
+import type { EventConference } from './calendar-api.js';
+import {
+  getBooking,
+  getMeeting,
+  getRoomGivenTo,
+  type Booking,
+  type Meeting,
+  type MeetingKind,
+  type MeetingLevel,
+  type Outcome,
+  type SchedulingMeeting,
+} from './db.js';
 
 export const OUTCOME_NOTE_TYPE = 'gws-ea-meetings.outcome';
 /** To main: `external-email` asks about a meeting, and waits for the answer (KTD2). */
@@ -63,7 +75,8 @@ export interface RoomCandidate {
 export interface OutcomeNote {
   readonly type: typeof OUTCOME_NOTE_TYPE;
   readonly meeting_id: string;
-  readonly outcome: Outcome;
+  /** How it ended, or `booked`, which `meeting_book` reports itself (KTD8). */
+  readonly outcome: Outcome | 'booked';
   readonly kind: MeetingKind;
   readonly purpose: string;
   readonly level: MeetingLevel;
@@ -75,6 +88,8 @@ export interface OutcomeNote {
     readonly start: string;
     readonly end: string;
   };
+  /** Whether the booked event has a Google Meet link, or Google is creating one: only on a booked outcome. */
+  readonly video_call?: boolean;
   /** The invitation the organizer moved: only on a settled outcome. */
   readonly invitation?: { readonly calendar_id: string; readonly event_id: string };
   /** On a booked outcome: the meeting that moved to make room for this one. */
@@ -188,4 +203,61 @@ export async function writeMeetingNote(
   }
   await requestWake(session, 'inbound-message');
   return true;
+}
+
+/**
+ * Tell main a meeting is booked or moved, the moment it is (KTD8, R47):
+ * written once per meeting, however often a booking is repeated. It names
+ * the meeting by main's own purpose and carries nothing `external-email`
+ * wrote; main reads the event when it needs its title or place.
+ */
+export async function writeBookedNote(
+  meeting: SchedulingMeeting,
+  booking: Booking,
+  conference: EventConference | undefined,
+  at: string,
+): Promise<void> {
+  const timezone = await mainTimezone();
+  const given = await getRoomGivenTo(meeting.id);
+  const moved = given ? await getMeeting(given.moved_meeting_id) : undefined;
+  const movedTo = given ? await getBooking(given.by_meeting_id) : undefined;
+  const madeRoomBy =
+    moved === undefined
+      ? undefined
+      : {
+          meeting_id: moved.id,
+          purpose: moved.purpose,
+          counterparts: noteCounterparts(moved),
+          moved_to: movedTo ? { start: movedTo.start_at, end: movedTo.end_at } : null,
+        };
+  const videoCall = conference !== undefined && conference.status !== 'failure';
+  const minutes = Math.round((Date.parse(booking.end_at) - Date.parse(booking.start_at)) / 60_000);
+  const note: OutcomeNote = {
+    type: OUTCOME_NOTE_TYPE,
+    meeting_id: meeting.id,
+    outcome: 'booked',
+    kind: meeting.kind,
+    purpose: meeting.purpose,
+    level: meeting.level,
+    counterparts: noteCounterparts(meeting),
+    booking: {
+      calendar_id: booking.calendar_id,
+      event_id: booking.event_id,
+      start: booking.start_at,
+      end: booking.end_at,
+    },
+    ...(videoCall ? { video_call: true } : {}),
+    ...(madeRoomBy ? { made_room_by: madeRoomBy } : {}),
+  };
+  const madeRoom = madeRoomBy
+    ? ` To make room for it, "${madeRoomBy.purpose}" with ${who(madeRoomBy)} moved` +
+      (madeRoomBy.moved_to ? ` to ${formatLocalTime(madeRoomBy.moved_to.start, timezone)}.` : '.')
+    : '';
+  await writeOutcomeNote(
+    note,
+    `Meeting ${meeting.id} is ${meeting.kind === 'reschedule' ? 'moved to' : 'booked for'} ` +
+      `${formatLocalTime(booking.start_at, timezone)} (${minutes} minutes): "${meeting.purpose}" with ${who(meeting)}, ` +
+      `on calendar ${booking.calendar_id}${videoCall ? ', with a Google Meet link' : ''}.${madeRoom}`,
+    at,
+  );
 }

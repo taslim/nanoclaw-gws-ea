@@ -171,8 +171,13 @@ interface BookedTime {
 /** external-email books the first time free_time offers, with its own tools. */
 async function bookFirstTime(session: Session, meetingId: unknown): Promise<BookedTime> {
   const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: meetingId }));
-  return data(await ask(session, 'meeting_book', { meeting_id: meetingId, slot_id: slot.slot_id }))
-    .booking as BookedTime;
+  return data(
+    await ask(session, 'meeting_book', {
+      meeting_id: meetingId,
+      slot_id: slot.slot_id,
+      invitation: { title: 'Partnership intro' },
+    }),
+  ).booking as BookedTime;
 }
 
 /** The principal copies Robin into a thread with Acme Sales; returns the thread key from main's note. */
@@ -513,17 +518,13 @@ describe('a request replayed after a host restart', () => {
     expect(briefs(session)).toHaveLength(1);
 
     const meetingId = String(data(arranged).meeting_id);
-    await bookFirstTime(session, meetingId);
-    const booked = await ask(session, 'meeting_outcome', { meeting_id: meetingId, outcome: 'booked' }, 'req-booked');
-    await getDeliveryAction('meeting_outcome')?.(
-      { action: 'meeting_outcome', requestId: 'req-booked', meeting_id: meetingId, outcome: 'booked' },
-      session,
-    );
-    expect(responses(session, 'req-booked')).toEqual([booked]);
-    // The same outcome sent again as a new request is recorded once too.
-    expect(data(await ask(session, 'meeting_outcome', { meeting_id: meetingId, outcome: 'booked' }))).toEqual(
-      data(booked),
-    );
+    const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: meetingId }));
+    const fields = { meeting_id: meetingId, slot_id: slot.slot_id, invitation: { title: 'Partnership intro' } };
+    const booked = await ask(session, 'meeting_book', fields, 'req-book');
+    await getDeliveryAction('meeting_book')?.({ action: 'meeting_book', requestId: 'req-book', ...fields }, session);
+    expect(responses(session, 'req-book')).toEqual([booked]);
+    // The same booking sent again as a new request changes nothing, and main hears of it once.
+    data(await ask(session, 'meeting_book', fields));
     expect(meetingNotes('booked')).toHaveLength(1);
   });
 
@@ -617,18 +618,13 @@ describe('outcome', () => {
     expect(meetingNotes()).toHaveLength(0);
   });
 
-  it('accepts booked only after the host’s own booking, and tells main in a note it turns into one line (R26)', async () => {
+  it('tells main the moment the host books, from the booking itself (R26, R47)', async () => {
     const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
     const session = await meetingSession(answer.meeting_id);
-
-    expect(
-      refusal(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'booked' })),
-    ).toMatch(/book/);
     expect(meetingNotes()).toHaveLength(0);
 
-    const booking = await bookFirstTime(session, answer.meeting_id);
     vi.mocked(requestWake).mockClear();
-    data(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'booked' }));
+    const booking = await bookFirstTime(session, answer.meeting_id);
 
     const stored = await meeting(answer.meeting_id);
     expect(stored.state).toBe('booked');
@@ -639,7 +635,6 @@ describe('outcome', () => {
       booking: { calendar_id: PRINCIPAL, event_id: booking.event_id, start: booking.start, end: booking.end },
     });
     expect(note.text).toContain('Sam Lee');
-    expect(note.text).toContain('one line');
     expect(note.row.trigger).toBe(1);
     expect(vi.mocked(requestWake)).toHaveBeenCalledWith(expect.objectContaining({ id: main.id }), 'inbound-message');
     // The session stays open after booking, so a later "can we move it?" lands there.
@@ -880,7 +875,6 @@ describe('reschedule', () => {
     const arranged = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
     const session = await meetingSession(arranged.meeting_id);
     const booking = await bookFirstTime(session, arranged.meeting_id);
-    data(await ask(session, 'meeting_outcome', { meeting_id: arranged.meeting_id, outcome: 'booked' }));
 
     const moved = data(
       await ask(main, 'meeting_reschedule', {
@@ -963,7 +957,6 @@ describe('cancel', () => {
     const stored = await meeting(answer.meeting_id);
     const session = await meetingSession(answer.meeting_id);
     const booking = await bookFirstTime(session, stored.id);
-    data(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'booked' }));
 
     const cancelled = data(
       await ask(main, 'meeting_cancel', {
@@ -989,7 +982,6 @@ describe('cancel', () => {
     const stored = await meeting(answer.meeting_id);
     const session = await meetingSession(answer.meeting_id);
     const booking = await bookFirstTime(session, stored.id);
-    data(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'booked' }));
 
     expect(data(await ask(main, 'meeting_cancel', { meeting_id: stored.id })).state).toBe('cancelled');
     expect(calendar.event(booking.calendar_id, booking.event_id)?.status).toBe('cancelled');
@@ -1072,7 +1064,6 @@ describe('cancel for an event the principal organizes (R8)', () => {
     const session = await meetingSession(arranged.meeting_id);
     await reply(session, stored.thread_key, 'Hello Sam, I am Robin. Would Tuesday at 10:00 work?');
     const booking = await bookFirstTime(session, stored.id);
-    data(await ask(session, 'meeting_outcome', { meeting_id: stored.id, outcome: 'booked' }));
 
     const answer = data(await ask(main, 'meeting_cancel', { calendar_id: PRINCIPAL, event_id: booking.event_id }));
     expect(answer).toMatchObject({ state: 'cancelled', meeting_id: stored.id });

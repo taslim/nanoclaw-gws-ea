@@ -112,8 +112,13 @@ async function bookedAt(
   );
   const session = await meetingSession(answer.meeting_id);
   const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: answer.meeting_id, date, time }));
-  data(await ask(session, 'meeting_book', { meeting_id: answer.meeting_id, slot_id: slot.slot_id }));
-  data(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'booked' }));
+  data(
+    await ask(session, 'meeting_book', {
+      meeting_id: answer.meeting_id,
+      slot_id: slot.slot_id,
+      invitation: { title: purpose },
+    }),
+  );
   const booking = await getBooking(String(answer.meeting_id));
   if (!booking) throw new Error('not booked');
   expect(booking.start_at.slice(0, 16)).toBe(new Date(`${date}T${time}:00+01:00`).toISOString().slice(0, 16));
@@ -236,11 +241,14 @@ describe('AE3: making room for someone close', () => {
       'inbound-message',
     );
 
-    data(await ask(patSession, 'meeting_outcome', { meeting_id: moving.meeting_id, outcome: 'booked' }));
-
     // Dana agrees: the booking note names the meeting that moved for her.
-    data(await ask(dana.session, 'meeting_book', { meeting_id: dana.stored.id, slot_id: slotId }));
-    data(await ask(dana.session, 'meeting_outcome', { meeting_id: dana.stored.id, outcome: 'booked' }));
+    data(
+      await ask(dana.session, 'meeting_book', {
+        meeting_id: dana.stored.id,
+        slot_id: slotId,
+        invitation: { title: 'Catch-up with Dana' },
+      }),
+    );
     const danaEvent = scheduling.calendar
       .live(PRINCIPAL)
       .find((event) => event.tags?.gwsEaRole === 'booking' && event.tags.gwsEaMeeting === dana.stored.id);

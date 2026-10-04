@@ -30,7 +30,7 @@ Those are the only times known to be free and within the principal's preferences
 ## How a meeting ends
 
 Report how each meeting ends through `meeting_outcome`, once.
-Report booked only after `meeting_book` succeeded, never for a time someone only agreed to.
+Book only a time someone agreed to: `meeting_book` itself tells main.
 When you are asked to arrange a meeting in a thread that isn't about scheduling, send nothing in it and report not-scheduling.
 A conversation brief asks you to answer a thread: answer it from the brief, and stay with it for their follow-ups within the brief. Report `done` once it needs nothing more from you, after your last email has gone.
 After settled, done, not-scheduling, or gave-up, the conversation is closed: send nothing more in it.
