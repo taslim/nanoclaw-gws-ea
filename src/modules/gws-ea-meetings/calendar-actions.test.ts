@@ -722,7 +722,7 @@ describe('book', () => {
     expect(calendar.writes.filter((write) => write.sendUpdates === 'all')).toHaveLength(1);
   });
 
-  it('moves the booked event in place for a newly offered time, once booked', async () => {
+  it('refuses another time while a booking an earlier attempt left is still unfinished', async () => {
     const { meeting: stored, session } = await arranged(sam);
     const [first, second] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
     data(
@@ -732,13 +732,14 @@ describe('book', () => {
         invitation: { title: 'Partnership intro' },
       }),
     );
-    expect(
-      data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: second.slot_id })).message,
-    ).toMatch(/^Moved:/);
-    expect(await getBooking(stored.id)).toMatchObject({ start_at: second.start });
-    expect(
-      calendar.writes.filter((write) => write.op === 'insert' && write.fields?.tags?.gwsEaRole === 'booking'),
-    ).toHaveLength(1);
+    // The host stopped after recording the booking but before the meeting counted as booked.
+    await getDb().run("UPDATE gws_ea_meetings SET state = 'active' WHERE id = ?", stored.id);
+    const writes = calendar.writes.length;
+    expect(refusal(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: second.slot_id }))).toMatch(
+      /is already booked for/,
+    );
+    expect(calendar.writes).toHaveLength(writes);
+    expect(await getBooking(stored.id)).toMatchObject({ start_at: first.start });
   });
 });
 

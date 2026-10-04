@@ -367,6 +367,28 @@ describe('arrange', () => {
     expect(await count('gws_ea_inbox_threads')).toBe(0);
   });
 
+  it("carries main's wishes for the invitation in the brief, checked for private details first", async () => {
+    await addPrivateValue({ label: 'Home', kind: 'address', value: '12 Elm Road, Springfield' });
+    const message = refusal(
+      await ask(main, 'meeting_arrange', arrangeWith(sam, { invitation: { location: '12 Elm Rd Springfield' } })),
+    );
+    expect(message).toContain('address');
+    expect(message).not.toContain('Elm');
+    expect(await count('gws_ea_meetings')).toBe(0);
+
+    const answer = data(
+      await ask(
+        main,
+        'meeting_arrange',
+        arrangeWith(sam, { invitation: { video_call: true, title: 'Acme and Alex: partnership intro' } }),
+      ),
+    );
+    const [brief] = contents(await meetingSession(answer.meeting_id));
+    expect(brief.text).toContain(
+      'Invitation, as main wishes it: a Google Meet link; title "Acme and Alex: partnership intro".',
+    );
+  });
+
   it('refuses a person with no record and a window that has already ended', async () => {
     refusal(await ask(main, 'meeting_arrange', arrangeWith(sam, { people: [{ person_id: 'p-000000000000' }] })));
     refusal(
@@ -869,6 +891,14 @@ describe('reschedule', () => {
       event_id: 'evt-review',
     });
     expect(stored.counterparts.map((c) => c.address)).toEqual([SAM]);
+
+    // The event's own guests and invitation stay as they are.
+    for (const change of [{ people: [{ email: 'jane@partner.example' }] }, { invitation: { location: 'Room 4' } }]) {
+      expect(refusal(await ask(main, 'meeting_amend', { meeting_id: stored.id, ...change }))).toMatch(
+        /Only a meeting handed over with meeting_arrange takes new people or invitation fields/,
+      );
+    }
+    expect((await meeting(stored.id)).counterparts.map((c) => c.address)).toEqual([SAM]);
   });
 
   it('continues in the thread of a meeting the assistant booked, which it takes over', async () => {

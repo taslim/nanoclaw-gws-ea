@@ -206,7 +206,7 @@ describe('AE2: a quiet thread', () => {
     expect(vi.mocked(killContainer)).toHaveBeenCalledWith(session.id, expect.any(String));
     expect(await getThreadParticipants(stored.thread_key)).toMatchObject({ state: 'closed' });
 
-    // The host reported it: external-email took no turn, and main tells the principal in one line.
+    // The host reported it: external-email took no turn, and main judges whether the principal hears of it.
     expect(contents(session)).toHaveLength(before);
     expect(vi.mocked(requestWake)).not.toHaveBeenCalledWith(
       expect.objectContaining({ id: session.id }),
@@ -218,7 +218,7 @@ describe('AE2: a quiet thread', () => {
     expect(gaveUp.text).toContain('Acme Sales');
     // The note states what happened; what reaches the principal is main's to judge (R51).
     expect(gaveUp.text).toMatch(/held times were released and its thread closed/);
-    expect(gaveUp.text).not.toMatch(/Tell the principal/);
+    expect(gaveUp.text).not.toMatch(/tell the principal|in one line/iu);
     expect(vi.mocked(requestWake)).toHaveBeenCalledWith(
       expect.objectContaining({ id: scheduling.main.id }),
       'inbound-message',
@@ -586,7 +586,7 @@ describe('a booked meeting', () => {
     expect(more).toEqual([]);
     expect(note.note).toMatchObject({ meeting_id: stored.id, booking: { start: wednesday.start } });
     expect(note.text).toContain('Acme Sales');
-    expect(note.text).not.toMatch(/Tell the principal/);
+    expect(note.text).not.toMatch(/tell the principal|in one line/iu);
 
     // A repeat moves nothing and tells no one again.
     data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: wednesday.slot_id }));

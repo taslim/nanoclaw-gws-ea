@@ -86,7 +86,7 @@ describe('the Calendar client', () => {
   });
 
   it("reads an event's Meet link as Google reports it, and a calendar's allowed conference types", async () => {
-    const { api } = stubGoogle((request) =>
+    const { api, requests } = stubGoogle((request) =>
       request.url.pathname.includes('/calendarList/')
         ? {
             status: 200,
@@ -117,6 +117,10 @@ describe('the Calendar client', () => {
       uri: 'https://meet.google.com/abc-defg-hij',
     });
     expect((await api.getEvent('pat@principal.example', 'pending'))?.conference).toEqual({ status: 'pending' });
+    // Google returns only the fields asked for: the link and its status among them.
+    expect(requests[0].url.searchParams.get('fields')).toContain(
+      'conferenceData(createRequest(status(statusCode)),entryPoints(entryPointType,uri))',
+    );
     const entry = await api.getCalendar('pat@principal.example');
     expect(entry && allowsMeet(entry)).toBe(true);
     expect(allowsMeet({ id: 'family@group.calendar.google.com' })).toBe(false);

@@ -152,14 +152,17 @@ describe('a curveball goes to main, and nothing goes to the other side', () => {
     await acmeWrites('Thanks Robin. This week is hard for us; could we do the week after?');
     const sentBefore = scheduling.gmail.sent.length;
 
+    // Tuesday, 11:00 in London.
+    const askedAt = '2026-10-06T10:00:00.000Z';
+    vi.setSystemTime(new Date(askedAt));
     const asked = data(await ask(session, 'meeting_ask_main', { meeting_id: stored.id, about: 'time' }));
     expect(asked.message).toMatch(/Send nothing in this thread until the host writes to you/);
     expect(asked.message).toMatch(/nothing outside <internal>/);
     expect(await meeting(stored.id)).toMatchObject({
       ask_about: 'time',
-      asked_at: NOW,
-      // The count now waits on main: two working days from the start of today's working hours.
-      nudge_at: '2026-10-07T08:00:00.000Z',
+      asked_at: askedAt,
+      // The count now waits on main: two working days from the question, Thursday at 11:00.
+      nudge_at: '2026-10-08T10:00:00.000Z',
     });
     expect(scheduling.gmail.sent).toHaveLength(sentBefore);
 
@@ -193,9 +196,10 @@ describe('a curveball goes to main, and nothing goes to the other side', () => {
     // The old holds no longer fit the new window: they went with the amend.
     expect(scheduling.calendar.live(PRINCIPAL).filter((event) => event.tags?.gwsEaRole === 'hold')).toEqual([]);
 
-    // Its next email starts the count again, on the other side.
+    // Its next email, that afternoon at 15:00, starts the count again, on the other side.
+    vi.setSystemTime(new Date('2026-10-06T14:00:00.000Z'));
     await reply(session, stored.thread_key, 'The week after works: Monday 12 or Tuesday 13?');
-    expect((await meeting(stored.id)).nudge_at).toBe('2026-10-07T08:00:00.000Z');
+    expect((await meeting(stored.id)).nudge_at).toBe('2026-10-08T14:00:00.000Z');
   });
 
   it('refuses a second question while one is open, and one about a meeting called off', async () => {
@@ -231,6 +235,15 @@ describe('a curveball goes to main, and nothing goes to the other side', () => {
     expect(refusal(await ask(session, 'meeting_ask_main', { meeting_id: answer.meeting_id, about: 'time' }))).toMatch(
       /has ended \(cancelled\): send nothing more/,
     );
+  });
+
+  it('is asked only by external-email, from the meeting’s own conversation', async () => {
+    const { stored } = await offeredToAcme();
+    expect(refusal(await ask(scheduling.main, 'meeting_ask_main', { meeting_id: stored.id, about: 'time' }))).toMatch(
+      /Only external-email asks main about a meeting/,
+    );
+    expect(asks(stored.id)).toEqual([]);
+    expect((await meeting(stored.id)).ask_about).toBeNull();
   });
 
   it('reaches main only wrapped when the email tries to instruct it, and external-email has no field to add to it', async () => {
@@ -336,6 +349,36 @@ describe('main answers a booked meeting', () => {
     expect((await meeting(stored.id)).counterparts.map((c) => c.address)).toEqual([ADDRESSES.acme]);
   });
 
+  it('adds a Meet link to its event at main’s word, and never takes one away', async () => {
+    scheduling.calendar.calendars.set(PRINCIPAL, {
+      id: PRINCIPAL,
+      accessRole: 'writer',
+      primary: false,
+      conferenceTypes: ['hangoutsMeet'],
+    });
+    const { stored, session } = await bookedWithAcme();
+    data(await ask(session, 'meeting_ask_main', { meeting_id: stored.id, about: 'place' }));
+    data(
+      await ask(scheduling.main, 'meeting_amend', {
+        meeting_id: stored.id,
+        invitation: { video_call: true },
+        answer: 'A video call suits Alex best.',
+      }),
+    );
+    const booking = await getBooking(stored.id);
+    if (!booking) throw new Error('not booked');
+    expect(scheduling.calendar.event(booking.calendar_id, booking.event_id)?.conference?.status).toBe('success');
+    expect(scheduling.calendar.writes.at(-1)).toMatchObject({ op: 'patch', sendUpdates: 'all' });
+
+    const writes = scheduling.calendar.writes.length;
+    expect(
+      refusal(
+        await ask(scheduling.main, 'meeting_amend', { meeting_id: stored.id, invitation: { video_call: false } }),
+      ),
+    ).toMatch(/keeps its Google Meet link/);
+    expect(scheduling.calendar.writes).toHaveLength(writes);
+  });
+
   it('lets a question main leaves open lapse, and the booked meeting stands', async () => {
     const { stored, session } = await bookedWithAcme();
     data(await ask(session, 'meeting_ask_main', { meeting_id: stored.id, about: 'place' }));
@@ -353,7 +396,8 @@ describe('a question main leaves open', () => {
     const { stored, session } = await offeredToAcme();
     await acmeWrites('Could we meet in person instead?');
     data(await ask(session, 'meeting_ask_main', { meeting_id: stored.id, about: 'place' }));
-    // Acme chasing does not restart the count: it waits on main.
+    // Acme chasing the next morning does not restart the count: it waits on main.
+    vi.setSystemTime(new Date('2026-10-06T10:00:00.000Z'));
     await acmeWrites('Any news?');
     expect((await meeting(stored.id)).nudge_at).toBe('2026-10-07T08:00:00.000Z');
 
@@ -369,6 +413,40 @@ describe('a question main leaves open', () => {
     const [gaveUp] = notes(scheduling.main, 'gws-ea-meetings.outcome').filter((c) => c.note?.outcome === 'gave-up');
     expect(gaveUp.text).toMatch(/waited four working days for your answer about where or how to meet/);
     expect(scheduling.calendar.live(PRINCIPAL).filter((event) => event.tags?.gwsEaRole === 'hold')).toEqual([]);
+  });
+});
+
+describe('a conversation whose question main leaves open', () => {
+  it('reminds main once, then ends without a word to anyone, and wakes no one', async () => {
+    const gmailId = scheduling.gmail.receive({
+      threadId: 'g-dee',
+      from: 'Dee <dee@else.example>',
+      to: [ROBIN],
+      subject: 'Speaking at our meetup',
+      body: 'Could Alex speak at our meetup in November?',
+    });
+    await scheduling.inbox.tick();
+    const triage = notes(scheduling.main, 'gws-ea-inbox.inbound').find((n) => n.note?.gmail_message_id === gmailId);
+    const conversation = data(
+      await ask(scheduling.main, 'email_respond', {
+        thread_key: String(triage?.note?.thread_key),
+        purpose: 'Decline kindly: Alex is not speaking this autumn.',
+      }),
+    );
+    const session = await meetingSession(conversation.meeting_id);
+    data(await ask(session, 'meeting_ask_main', { meeting_id: conversation.meeting_id, about: 'other' }));
+
+    await reach('2026-10-07T08:01:00.000Z');
+    expect(asks(String(conversation.meeting_id)).filter((c) => c.note?.reminder === true)).toHaveLength(1);
+
+    await reach('2026-10-09T08:02:00.000Z');
+    expect((await meeting(conversation.meeting_id)).state).toBe('done');
+    const [ended] = notes(scheduling.main, 'gws-ea-meetings.outcome').filter(
+      (c) => c.note?.meeting_id === conversation.meeting_id,
+    );
+    expect(ended.text).toMatch(/waited four working days for your answer, and ended without a word to anyone/);
+    expect(ended.row.trigger).toBe(0);
+    expect(scheduling.gmail.sent).toEqual([]);
   });
 });
 

@@ -94,10 +94,13 @@ describe('the meetings module', () => {
         'meeting_free_time',
         'meeting_hold',
         'meeting_book',
+        'meeting_ask_main',
         'email_recipients',
         'meeting_outcome',
       ],
     };
+    // Every action the host answers is granted to one side or the other.
+    expect(Object.values(tools).flat().sort()).toEqual([...MEETING_ACTIONS].sort());
     for (const [key, names] of Object.entries(tools)) {
       const description = registered.get(key)?.description ?? '';
       for (const name of names) expect(description, `${key} names ${name}`).toContain(name);

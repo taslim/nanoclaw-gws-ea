@@ -881,6 +881,35 @@ describe('respond', () => {
     expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'open' });
   });
 
+  it('counts quiet again from their reply, with nobody nudged', async () => {
+    const { threadKey } = await deeAsks();
+    const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
+    const session = await meetingSession(answer.meeting_id);
+    await reply(session, threadKey, 'Thank you for thinking of Alex. Sadly she is not speaking this autumn.');
+    expect(await meeting(answer.meeting_id)).toMatchObject({ nudge_at: null, give_up_at: '2026-10-09T08:00:00.000Z' });
+
+    // Tuesday, 11:00 in London: Dee writes back, and the count starts again from then.
+    vi.setSystemTime(new Date('2026-10-06T10:00:00.000Z'));
+    scheduling.gmail.receive({
+      threadId: 'g-dee',
+      from: `Dee <${DEE}>`,
+      to: [ROBIN],
+      subject: 'Re: Speaking at our meetup',
+      body: 'Understood, thank you. Might she be free in the spring?',
+    });
+    await scheduling.inbox.tick();
+    expect(await meeting(answer.meeting_id)).toMatchObject({ nudge_at: null, give_up_at: '2026-10-12T10:00:00.000Z' });
+  });
+
+  it('takes no note when main calls it off: anything more to say goes through meeting_amend', async () => {
+    const { threadKey } = await deeAsks();
+    const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
+    expect(
+      refusal(await ask(scheduling.main, 'meeting_cancel', { meeting_id: answer.meeting_id, note: 'Alex is sorry.' })),
+    ).toMatch(/called off with nothing more sent: to say something, use meeting_amend with answer/);
+    expect((await meeting(answer.meeting_id)).state).toBe('active');
+  });
+
   it('ends a conversation that goes quiet without a word to anyone, and later mail reaches main', async () => {
     const { threadKey } = await deeAsks();
     const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
@@ -956,14 +985,18 @@ describe('respond', () => {
     expect(await getThreadParticipants(threadKey)).toMatchObject({ state: 'awaiting-arrange' });
   });
 
-  it('takes no outcome but responded, and is the only meeting that does', async () => {
+  it('ends only done, and is the only meeting that does', async () => {
     const { threadKey } = await deeAsks();
     const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
     const session = await meetingSession(answer.meeting_id);
-    for (const outcome of ['booked', 'gave-up', 'not-scheduling']) {
-      refusal(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome }));
+    for (const outcome of ['settled', 'gave-up', 'not-scheduling']) {
+      expect(refusal(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome }))).toMatch(
+        /This conversation ends done/,
+      );
     }
-    refusal(await ask(session, 'meeting_free_time', { meeting_id: answer.meeting_id }));
+    expect(refusal(await ask(session, 'meeting_free_time', { meeting_id: answer.meeting_id }))).toMatch(
+      /no times to offer, hold, or book/,
+    );
 
     const arranged = data(
       await ask(scheduling.main, 'meeting_arrange', {
@@ -975,7 +1008,10 @@ describe('respond', () => {
       }),
     );
     const arrangeSession = await meetingSession(arranged.meeting_id);
-    refusal(await ask(arrangeSession, 'meeting_outcome', { meeting_id: arranged.meeting_id, outcome: 'responded' }));
+    expect(
+      refusal(await ask(arrangeSession, 'meeting_outcome', { meeting_id: arranged.meeting_id, outcome: 'done' })),
+    ).toMatch(/Only a conversation reports done/);
+    expect((await meeting(arranged.meeting_id)).state).toBe('active');
   });
 
   it('takes only main’s answer as an amend, in a new brief', async () => {

@@ -49,6 +49,7 @@ import { getDeliveryAction } from '../../delivery.js';
 import { requestWake } from '../../request-wake.js';
 import type { Session } from '../../types.js';
 import type { Person } from '../gws-ea-people/db.js';
+import { getRoomMadeBy } from './db.js';
 import { getBooking, type Meeting } from './index.js';
 import type { StoredEvent } from './testing/fake-calendar.js';
 import {
@@ -345,17 +346,22 @@ describe('making room', () => {
     // main hears of it again, with what could move in the new window.
     expect((asked[1].note?.candidates as Candidate[]).map((c) => c.meeting_id)).toEqual([tea.stored.id]);
 
-    // The host stopped after the note but before it recorded the answer: the replay writes no third note.
+    // The host stopped after the note but before it recorded the question or its answer:
+    // the replay records the question and writes no third note.
     await getDb().run('DELETE FROM gws_ea_meeting_requests WHERE request_id = ?', 'req-ask-again');
+    await getDb().run(
+      'UPDATE gws_ea_meetings SET ask_about = NULL, asked_at = NULL, nudge_at = NULL, give_up_at = NULL WHERE id = ?',
+      dana.stored.id,
+    );
     await getDeliveryAction('meeting_ask_main')?.(
       { action: 'meeting_ask_main', requestId: 'req-ask-again', meeting_id: dana.stored.id, about: 'time' },
       dana.session,
     );
     expect(notes(scheduling.main, ASK).filter((c) => c.note?.meeting_id === dana.stored.id)).toHaveLength(2);
-    expect((await meeting(dana.stored.id)).state).toBe('active');
+    expect(await meeting(dana.stored.id)).toMatchObject({ state: 'active', ask_about: 'time' });
   });
 
-  it('makes room whether main answers the question before it moves a meeting or after', async () => {
+  it('makes room for a meeting whose question main has already answered', async () => {
     const { people } = scheduling;
     const coffee = await bookedAt([people.pat], '2026-10-08', '10:00', 30, 'Coffee');
     scheduling.calendar.put(own('evt-early', '2026-10-08T08:00:00Z', '2026-10-08T09:00:00Z'));
@@ -366,7 +372,7 @@ describe('making room', () => {
     );
     expect((await meeting(dana.stored.id)).ask_about).toBeNull();
 
-    data(
+    const moving = data(
       await ask(scheduling.main, 'meeting_reschedule', {
         calendar_id: PRINCIPAL,
         event_id: coffee.eventId,
@@ -376,7 +382,15 @@ describe('making room', () => {
         making_room_for: dana.stored.id,
       }),
     );
-    // Room is made only for someone inner circle or close.
+    expect(await getRoomMadeBy(String(moving.meeting_id))).toMatchObject({
+      for_meeting_id: dana.stored.id,
+      moved_meeting_id: coffee.stored.id,
+      state: 'reserved',
+    });
+  });
+
+  it('makes room only for a meeting with someone inner circle or close', async () => {
+    const { people } = scheduling;
     const tea = await bookedAt([people.pat], '2026-10-09', '10:00', 30, 'Tea');
     const withAcme = data(
       await ask(scheduling.main, 'meeting_arrange', {

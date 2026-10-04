@@ -357,6 +357,9 @@ describe('the earliest time to offer', () => {
     expect(iso(earliestOffer(MONDAY_NINE, thisWeek, LONDON, 60))).toBe('2026-10-05T23:00:00.000Z');
     const today = span('2026-10-05T07:00:00Z', '2026-10-05T17:00:00Z');
     expect(iso(earliestOffer(MONDAY_NINE, today, LONDON, 60))).toBe(iso(MONDAY_NINE + HOUR));
+    // At 23:30 on Monday in London, an hour's notice reaches past midnight.
+    const lateMonday = Date.parse('2026-10-05T22:30:00Z');
+    expect(iso(earliestOffer(lateMonday, thisWeek, LONDON, 60))).toBe('2026-10-05T23:30:00.000Z');
   });
 });
 
