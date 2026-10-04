@@ -29,9 +29,8 @@ Those are the only times known to be free and within the principal's preferences
 
 ## How a meeting ends
 
-Report how each meeting ends through `meeting_outcome`, once. Report `needs-room` again only when `meeting_free_time` tells you to.
+Report how each meeting ends through `meeting_outcome`, once.
 Report booked only after `meeting_book` succeeded, never for a time someone only agreed to.
-Report needs-room only when nothing in the window fits someone in the inner circle or close; for anyone else, offer the open times there are, or report gave-up.
 When you are asked to arrange a meeting in a thread that isn't about scheduling, send nothing in it and report not-scheduling.
 A `email_respond` brief asks for one reply: write it from the brief, then report `responded` with `meeting_outcome`.
 After settled, responded, not-scheduling, or gave-up, the conversation is closed: send nothing more in it.

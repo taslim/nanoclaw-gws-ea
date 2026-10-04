@@ -71,6 +71,8 @@ export interface FollowThroughDeps {
   /** The host's own Calendar client. */
   readonly calendar: () => MeetingsCalendarApi;
   readonly inboxHealth: () => Promise<InboxHealth>;
+  /** Remind main, once, that a meeting has waited on its answer since `nudgeAt` came due. */
+  readonly remindMain: (meeting: Meeting, nudgeAt: string) => Promise<void>;
   /**
    * Report gave-up for a meeting nobody answered, end it, and release its
    * holds (throws when a hold stays), unless the deadline `giveUpAt` no longer stands.
@@ -108,16 +110,20 @@ async function step(what: string, meetingId: string, action: () => Promise<void>
 
 export function createFollowThrough(deps: FollowThroughDeps) {
   /**
-   * Wake the meeting's session to nudge once, and count two working days on
-   * to giving up; nothing when the deadline `nudgeAt` no longer stands.
+   * Follow up once with whoever the meeting waits on: main, while a question
+   * to it is open, or else the other side, through the meeting's own session.
+   * Then count two working days on to giving up; nothing when the deadline
+   * `nudgeAt` no longer stands.
    */
   async function nudge(meetingId: string, nudgeAt: string, now: number): Promise<void> {
     // Read again: a reply since the pass listed the meeting started its count again.
     const meeting = await getMeeting(meetingId);
-    if (meeting?.state !== 'active' || meeting.nudge_at !== nudgeAt) return;
+    if ((meeting?.state !== 'active' && meeting?.state !== 'booked') || meeting.nudge_at !== nudgeAt) return;
     const at = new Date(now).toISOString();
     const session = meeting.session_id === null ? undefined : await getSession(meeting.session_id);
-    if (session?.status === 'active') {
+    if (meeting.asked_at !== null) {
+      await deps.remindMain(meeting, nudgeAt);
+    } else if (session?.status === 'active') {
       await writeMeetingNote(
         session,
         meeting,
@@ -222,7 +228,8 @@ export function createFollowThrough(deps: FollowThroughDeps) {
    */
   async function replied(threadKey: string): Promise<void> {
     const meeting = await findLiveMeetingOnThread(threadKey);
-    if (!meeting || meeting.state !== 'active') return;
+    // While main has a question open, the count waits on main, whatever the other side writes.
+    if (!meeting || meeting.state !== 'active' || meeting.asked_at !== null) return;
     const now = new Date();
     if ((await listHolds(meeting.id)).length > 0) {
       await restartDeadlines(meeting.id, await deadlinesFrom(now.getTime()), now.toISOString());

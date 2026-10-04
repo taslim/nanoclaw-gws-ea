@@ -50,7 +50,7 @@ export {
 
 registerCapability(EXTERNAL_EMAIL_MEETINGS_CAPABILITY, {
   description:
-    "meeting_free_time, meeting_hold, meeting_book, email_recipients, meeting_outcome: external-email's meeting tools: the principal's free time, holds, and bookings through the host, who its replies go to among the people on its thread, and the meeting's outcome",
+    "meeting_free_time, meeting_hold, meeting_book, meeting_ask_main, email_recipients, meeting_outcome: external-email's meeting tools: the principal's free time, holds, and bookings through the host, a question for main it then waits on, who its replies go to among the people on its thread, and the meeting's outcome",
   default: 'off',
   instructions: [EXTERNAL_EMAIL_MEETINGS_CAPABILITY],
 });

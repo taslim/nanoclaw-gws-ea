@@ -108,7 +108,7 @@ describe('NanoClaw tool server capabilities', () => {
     [
       'gws-ea-meetings-external',
       ['gws-ea-meetings-external'],
-      ['email_recipients', 'meeting_book', 'meeting_free_time', 'meeting_hold', 'meeting_outcome'],
+      ['email_recipients', 'meeting_ask_main', 'meeting_book', 'meeting_free_time', 'meeting_hold', 'meeting_outcome'],
     ],
     ['request-status', ['request-status'], ['request_status']],
     ['no keys', [], []],

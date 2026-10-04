@@ -646,19 +646,12 @@ describe('outcome', () => {
     expect((await getSession(session.id))?.status).toBe('active');
   });
 
-  it('refuses needs-room for an active or known meeting, and accepts it for a close one', async () => {
-    for (const person of [sam, olu]) {
-      const answer = data(await ask(main, 'meeting_arrange', arrangeWith(person)));
-      const session = await meetingSession(answer.meeting_id);
-      expect(
-        refusal(await ask(session, 'meeting_outcome', { meeting_id: answer.meeting_id, outcome: 'needs-room' })),
-      ).toMatch(/close/);
-    }
+  it('takes no needs-room: a meeting with nothing open asks main about time instead', async () => {
     const close = data(await ask(main, 'meeting_arrange', arrangeWith(dana)));
     const closeSession = await meetingSession(close.meeting_id);
-    data(await ask(closeSession, 'meeting_outcome', { meeting_id: close.meeting_id, outcome: 'needs-room' }));
-    expect(meetingNotes('needs-room')).toHaveLength(1);
-    expect((await meeting(close.meeting_id)).state).toBe('active');
+    expect(
+      refusal(await ask(closeSession, 'meeting_outcome', { meeting_id: close.meeting_id, outcome: 'needs-room' })),
+    ).toMatch(/outcome must be one of/);
   });
 
   it('hands a copied-in thread that is not about scheduling back to main to triage (R19)', async () => {

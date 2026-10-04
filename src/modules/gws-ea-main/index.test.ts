@@ -131,7 +131,7 @@ const REQUIRED_GUIDANCE = [
   "For anything else of the principal's, ask them in one line.",
   // Follow-through and making room (R9, R14, R23, KTD12).
   'When a meeting is given up because nobody answered, tell the principal in one line, with a suggestion',
-  'When a meeting needs room, weigh the meetings the note lists.',
+  'When external-email asks you about time for someone inner circle or close, weigh the meetings its note lists.',
   '`meeting_reschedule` it with `making_room_for`',
   'When none should move, move nothing and give the principal one recommendation in one line.',
   'When a booking note names a meeting that moved to make room, say so in the same line.',

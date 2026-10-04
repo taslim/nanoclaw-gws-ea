@@ -5,8 +5,9 @@
  *
  * - `main` alone hands meetings and replies over, changes or cancels them,
  *   dismisses a thread waiting for it, and answers the principal by email;
- * - `external-email` alone reports an outcome, uses a meeting's calendar
- *   tools, or places the people its replies go to, and only for the meeting
+ * - `external-email` alone reports an outcome, asks main about a meeting,
+ *   uses a meeting's calendar tools, or places the people its replies go
+ *   to, and only for the meeting
  *   bound to the very session it calls from, so one thread can never act on
  *   another's meeting.
  *
@@ -55,6 +56,15 @@ export const meetingOutcomeAction = defineGuardedAction({
   action: 'gws_ea_meetings.outcome',
   decide: async ({ actor, payload }) => {
     const refusal = await fromOwnMeetingSession(actor, payload, "Only external-email reports a meeting's outcome.");
+    return refusal === undefined ? ALLOW("external-email, from the meeting's own session") : DENY(refusal);
+  },
+});
+
+/** meeting_ask_main: external-email asks main about its own meeting, and no other. */
+export const meetingAskAction = defineGuardedAction({
+  action: 'gws_ea_meetings.ask',
+  decide: async ({ actor, payload }) => {
+    const refusal = await fromOwnMeetingSession(actor, payload, 'Only external-email asks main about a meeting.');
     return refusal === undefined ? ALLOW("external-email, from the meeting's own session") : DENY(refusal);
   },
 });

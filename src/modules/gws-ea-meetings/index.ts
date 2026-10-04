@@ -7,8 +7,8 @@
  *     `meeting_cancel`, `meeting_amend`, `email_respond`, `email_dismiss`,
  *     and `email_reply_to_principal`.
  *   - `external-email` → host: `meeting_free_time`, `meeting_hold`,
- *     `meeting_book` (`calendar-actions.ts`), `email_recipients`, and
- *     `meeting_outcome`.
+ *     `meeting_book` (`calendar-actions.ts`), `meeting_ask_main`,
+ *     `email_recipients`, and `meeting_outcome`.
  *
  * Each runner tool is named after the action it sends (`MEETING_ACTIONS`).
  *
@@ -51,7 +51,13 @@ import { registerThreadStoppedHook } from '../gws-ea-privacy/index.js';
 import { createMeetingsCalendarApi, type MeetingsCalendarApi } from './calendar-api.js';
 import { createCalendarActions, FREE_TIME_ACTION } from './calendar-actions.js';
 import { createFollowThrough } from './follow-through.js';
-import { meetingCalendarAction, meetingOutcomeAction, meetingRecipientsAction, meetingRequestAction } from './guard.js';
+import {
+  meetingAskAction,
+  meetingCalendarAction,
+  meetingOutcomeAction,
+  meetingRecipientsAction,
+  meetingRequestAction,
+} from './guard.js';
 import { answering, createMeetingHandoff, requestIdOf, type Handle } from './handoff.js';
 import {
   gwsEaMeetingsCalendarActionsMigration,
@@ -96,10 +102,13 @@ const handoff = createMeetingHandoff({
   bookDirectly: actions.bookDirectly,
   roomCandidates: room.candidates,
   roomCandidate: room.candidate,
+  hasOpenTime: actions.hasOpenTime,
+  updateBooking: actions.updateBooking,
 });
 const followThrough = createFollowThrough({
   calendar: calendarApi,
   inboxHealth: getInboxHealth,
+  remindMain: handoff.remindMain,
   giveUp: handoff.giveUpUnanswered,
   closeBooked: (meeting) => handoff.endMeeting(meeting, 'booked', true),
   releaseHolds: (meeting) => actions.releaseHolds(meeting, 'all'),
@@ -149,7 +158,8 @@ const REQUESTS: ReadonlyArray<readonly [string, Handle, GuardedAction]> = [
   ['email_respond', handoff.respond, meetingRequestAction],
   ['email_dismiss', handoff.dismiss, meetingRequestAction],
   ['email_reply_to_principal', handoff.replyToPrincipal, meetingRequestAction],
-  // external-email's outcome, its recipients, and its calendar tools
+  // external-email's question, its outcome, its recipients, and its calendar tools
+  ['meeting_ask_main', handoff.askMain, meetingAskAction],
   ['meeting_outcome', handoff.outcome, meetingOutcomeAction],
   ['email_recipients', handoff.recipients, meetingRecipientsAction],
   [FREE_TIME_ACTION, actions.freeTime, meetingCalendarAction],

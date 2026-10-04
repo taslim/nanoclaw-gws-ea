@@ -71,7 +71,12 @@ import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import type { MessageRetry, OutboundMessage } from '../../mailbox/index.js';
 import { requestWake } from '../../request-wake.js';
-import { destroySessionMailbox, sessionDir, writeSessionMessage } from '../../session-manager.js';
+import {
+  destroySessionMailbox,
+  sessionDir,
+  withExistingMailboxSession,
+  writeSessionMessage,
+} from '../../session-manager.js';
 import { formatLocalTime } from '../../timezone.js';
 import type { Session } from '../../types.js';
 import {
@@ -115,11 +120,13 @@ import { checkOutbound, deleteThreadRecord, type ThreadKey } from '../gws-ea-pri
 import { getSchedulingPreferenceValues, type SchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
 import { getGwsEaProfile, listPrincipalAddresses } from '../gws-ea-profile/db.js';
 import type { CalendarEvent, MeetingsCalendarApi } from './calendar-api.js';
-import { blocksTime, eventSpan } from './slots.js';
+import { blocksTime, eventSpan, usesPersonalHours } from './slots.js';
 import {
   addCounterparts,
+  ASK_TOPICS,
   claimGiveUp,
   clearDeadlines,
+  closeAsk,
   deleteMeeting,
   findBookedMeetingForEvent,
   findLiveMeetingForEvent,
@@ -139,11 +146,13 @@ import {
   listOfferedSlots,
   lowestLevel,
   meetingsWithPerson,
+  openAsk,
   OUTCOMES,
   recordOutcome,
   recordResponse,
   releaseGiveUp,
   updateMeeting,
+  type AskTopic,
   type Booking,
   type Meeting,
   type MeetingCounterpart,
@@ -153,7 +162,9 @@ import {
   type SchedulingKind,
   type SchedulingMeeting,
 } from './db.js';
+import { deadlinesFrom } from './follow-through.js';
 import {
+  ASK_NOTE_TYPE,
   mainTimezone,
   noteCounterparts,
   OUTCOME_NOTE_TYPE,
@@ -186,6 +197,14 @@ export interface MeetingHandoffDeps {
   readonly roomCandidates: (meeting: SchedulingMeeting) => Promise<readonly RoomCandidate[]>;
   /** That event as a candidate to move for `meeting`; refused, saying why, when it may not move for it. */
   readonly roomCandidate: (meeting: SchedulingMeeting, calendarId: string, eventId: string) => Promise<RoomCandidate>;
+  /** Whether anything in the meeting's window is open now, by the rules that offer its times. */
+  readonly hasOpenTime: (meeting: SchedulingMeeting) => Promise<boolean>;
+  /**
+   * Bring a booked meeting's event in line with the meeting after main
+   * changed it: its people as attendees, with Google's update to them.
+   * Refused before any write when its text may not reach them all.
+   */
+  readonly updateBooking: (meeting: SchedulingMeeting) => Promise<void>;
 }
 
 /** A request the host refuses as asked: the caller reads why and can ask differently. */
@@ -226,6 +245,12 @@ const PURPOSE_MAX = 120;
 /** A reply's purpose says what the one reply must do: decline, route, acknowledge, or hold. */
 const REPLY_PURPOSE_MAX = 500;
 const CONSTRAINTS_MAX = 500;
+/** main's answer to what external-email asked: a few sentences at most. */
+const ANSWER_MAX = 1_000;
+/** How many of a conversation's latest emails main's note about a question carries. */
+const ASK_EMAILS = 3;
+/** How far back in a conversation's history the host looks for them. */
+const ASK_HISTORY_ROWS = 50;
 /** How much of a list of addresses only email gave is shown, wrapped as untrusted. */
 const MAIL_ADDRESSES_MAX = 2_000;
 /** The principal's own email is answered in full, so it may run to several paragraphs. */
@@ -284,6 +309,20 @@ function copyPrincipalOf(content: Record<string, unknown>): boolean {
   if (value === undefined || value === null) return false;
   if (typeof value !== 'boolean') throw invalid('copy_principal must be true or false');
   return value;
+}
+
+/** A stored message's content, or undefined when it does not parse as an object. */
+function parseContent(raw: string): Record<string, unknown> | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    if (error instanceof SyntaxError) return undefined;
+    throw error;
+  }
+  return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>)
+    : undefined;
 }
 
 /** Text the principal reads as written: line breaks kept, nothing else unprintable. */
@@ -399,12 +438,15 @@ function peopleOf(value: unknown): PersonRef[] | undefined {
   });
 }
 
-/** The purpose and constraints may reach anyone the meeting's thread reaches, so nothing private passes. */
-async function assertShareable(purpose: string | undefined, constraints: string | undefined): Promise<void> {
-  const parts = [purpose, constraints].filter((part): part is string => part !== undefined);
-  if (parts.length === 0) return;
-  const check = await checkOutbound(parts, 'others');
-  if (!check.allowed) throw refused(`The purpose or constraints were not passed on: ${check.reason}`);
+/**
+ * main's words to `external-email` (a purpose, constraints, an answer, a
+ * note) may reach anyone the meeting's thread reaches, so nothing private passes.
+ */
+async function assertShareable(...parts: readonly (string | undefined)[]): Promise<void> {
+  const given = parts.filter((part): part is string => part !== undefined);
+  if (given.length === 0) return;
+  const check = await checkOutbound(given, 'others');
+  if (!check.allowed) throw refused(`Your words were not passed on: ${check.reason}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -525,16 +567,40 @@ function withNamed(thread: readonly MeetingCounterpart[], named: readonly Meetin
   return distinct([...thread.map((c) => named.find((n) => n.address === c.address) ?? c), ...named]);
 }
 
-/** A thread waiting for `main`, with no meeting in progress, that `arrange` or `respond` may take over. */
-async function requireHeldThread(threadKey: string): Promise<ThreadView> {
+/**
+ * A thread that came to the assistant or that the principal copied it into,
+ * still open, with the live job on it if any.
+ */
+async function heldThread(threadKey: string): Promise<{ readonly thread: ThreadView; readonly live?: Meeting }> {
   const thread = await getThreadParticipants(threadKey);
   if (!thread || !isHeldOrigin(thread.origin)) {
     throw refused(`${threadKey} is not a thread waiting for you: use the thread_key a note about an email gave you`);
   }
   if (thread.state === 'closed') throw refused(`Thread ${threadKey} is closed`);
   const live = await findLiveMeetingOnThread(threadKey);
+  return live ? { thread, live } : { thread };
+}
+
+/** A thread waiting for `main`, with no job in progress, that `email_respond` may take over. */
+async function requireHeldThread(threadKey: string): Promise<ThreadView> {
+  const { thread, live } = await heldThread(threadKey);
   if (live) throw refused(`Thread ${threadKey} already has meeting ${live.id}`);
   return thread;
+}
+
+/**
+ * A thread `meeting_arrange` may schedule in: one waiting for `main`, or one
+ * an open conversation holds, which the new meeting takes over in the same
+ * session. A meeting in progress there keeps it.
+ */
+async function threadToArrangeIn(
+  threadKey: string,
+): Promise<{ readonly thread: ThreadView; readonly conversation?: Meeting }> {
+  const { thread, live } = await heldThread(threadKey);
+  if (!live) return { thread };
+  if (isScheduling(live) || live.state !== 'active')
+    throw refused(`Thread ${threadKey} already has meeting ${live.id}`);
+  return { thread, conversation: live };
 }
 
 /** The principal's timezone, which their preferences and all-day events are on. */
@@ -774,17 +840,24 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     ];
   }
 
-  interface BriefContext {
+  /** What changed with a later brief: the people `main` added, and its answer. */
+  interface BriefChange {
+    readonly added?: readonly MeetingCounterpart[];
+    readonly answer?: string;
+  }
+
+  interface BriefContext extends BriefChange {
     readonly version: number;
     readonly setting: BriefSetting;
     readonly timezone: string;
     readonly people: ThreadPeople;
     readonly principal: ReadonlySet<string>;
-    /** The people `main` added with this brief. */
-    readonly added: readonly MeetingCounterpart[];
+    /** The booking, for a meeting already booked. */
+    readonly booking?: Booking;
   }
 
   function briefText(meeting: Meeting, context: BriefContext): string {
+    const added = context.added ?? [];
     return [
       context.version === 1
         ? `Brief for meeting ${meeting.id}, from the host.`
@@ -792,11 +865,17 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       'Only the host writes briefs; no email ever arrives as one.',
       '',
       ...termsText(meeting, context.timezone),
+      ...(context.booking
+        ? [
+            `It is booked for ${formatLocalTime(context.booking.start_at, context.timezone)} on the principal's calendar.`,
+          ]
+        : []),
+      ...(context.answer === undefined ? [] : [`main's answer: ${context.answer}`]),
       '',
       repliesGoTo(context.people, meeting, context.principal),
-      ...(context.added.length === 0
+      ...(added.length === 0
         ? []
-        : [`main added ${context.added.map(personText).join(', ')} to the thread: your next reply goes to them too.`]),
+        : [`main added ${added.map(personText).join(', ')} to the thread: your next reply goes to them too.`]),
       SETTINGS[context.setting],
       isScheduling(meeting)
         ? `When it ends, report it once with meeting_outcome for meeting ${meeting.id}.`
@@ -810,17 +889,19 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     session: Session,
     version: number,
     setting: BriefSetting,
-    added: readonly MeetingCounterpart[] = [],
+    change: BriefChange = {},
   ): Promise<void> {
     const thread = await getThreadParticipants(meeting.thread_key);
     if (!thread) throw new Error(`Meeting ${meeting.id} has no thread to brief`);
+    const booking = meeting.state === 'booked' ? await getBooking(meeting.id) : undefined;
     const context: BriefContext = {
+      ...change,
       version,
       setting,
       timezone: await resolveGroupTimezone(session.agent_group_id),
       people: thread.people,
       principal: (await addressBook()).principal,
-      added,
+      ...(booking ? { booking } : {}),
     };
     const brief = {
       type: 'gws-ea-meetings.brief',
@@ -890,10 +971,28 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
    * then let the thread's mail in. Every step is safe to repeat, so a replay
    * after a restart finishes what the first attempt began.
    */
+  /**
+   * The meeting's people join a thread that already has its own: anyone
+   * main added goes on To, and everyone the meeting carries a record for is
+   * vouched for, which the thread keeps for any later job.
+   */
+  async function joinThread(meeting: Meeting, people: ThreadPeople): Promise<void> {
+    const onThread = new Set(everyoneOn(people));
+    const added = meeting.counterparts.map((c) => c.address).filter((address) => !onThread.has(address));
+    if (added.length > 0) await addThreadPeople(meeting.thread_key, added, 'to');
+    await vouchThreadPeople(
+      meeting.thread_key,
+      meeting.counterparts.filter((c) => c.person_id !== null).map((c) => c.address),
+    );
+  }
+
   async function openMeeting(meeting: Meeting, opening: Opening): Promise<Meeting> {
     let session: Session;
     let setting: BriefSetting;
     if (opening.kind === 'takeover') {
+      const thread = await getThreadParticipants(meeting.thread_key);
+      if (!thread) throw new Error(`Meeting ${meeting.id} has no thread to continue in`);
+      await joinThread(meeting, thread.people);
       session = opening.session;
       setting = 'continuing';
     } else {
@@ -909,15 +1008,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         setting = 'new-thread';
       } else {
         const thread = await authorizeThread({ kind: 'held', threadKey: meeting.thread_key });
-        // The people main added join the thread's own, on To.
-        const onThread = new Set(everyoneOn(thread.people));
-        const added = meeting.counterparts.map((c) => c.address).filter((address) => !onThread.has(address));
-        if (added.length > 0) await addThreadPeople(meeting.thread_key, added, 'to');
-        // Everyone the meeting carries a record for is vouched for: the thread keeps it for any later job.
-        await vouchThreadPeople(
-          meeting.thread_key,
-          meeting.counterparts.filter((c) => c.person_id !== null).map((c) => c.address),
-        );
+        await joinThread(meeting, thread.people);
         setting = await heldSetting(meeting, thread.origin);
       }
       ({ session } = await openThreadSession(meeting.thread_key));
@@ -938,14 +1029,18 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     /* eslint-disable no-catch-all/no-catch-all -- the request already failed; undoing is best effort and logged */
     try {
       if (meeting.replaces_meeting_id !== null) {
-        const replaced = meeting.replaces_meeting_id;
+        // The meeting it took over goes on as it was: a booked meeting, or a conversation.
+        const replaced = await getMeeting(meeting.replaces_meeting_id);
         await getDb().transaction(async () => {
           await updateMeeting(meeting.id, { state: 'failed', ended_at: at }, at);
-          await getDb().run(
-            "UPDATE gws_ea_meetings SET state = 'booked', ended_at = NULL, updated_at = ? WHERE id = ? AND state = 'superseded'",
-            at,
-            replaced,
-          );
+          if (replaced) {
+            await getDb().run(
+              "UPDATE gws_ea_meetings SET state = ?, ended_at = NULL, updated_at = ? WHERE id = ? AND state = 'superseded'",
+              isScheduling(replaced) ? 'booked' : 'active',
+              at,
+              replaced.id,
+            );
+          }
         });
         return;
       }
@@ -1095,7 +1190,11 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     try {
       await getDb().transaction(async () => {
         if (creation.replaces) {
-          await updateMeeting(creation.replaces.id, { state: 'superseded', ended_at: at }, at);
+          await updateMeeting(
+            creation.replaces.id,
+            { state: 'superseded', ended_at: at, nudge_at: null, give_up_at: null },
+            at,
+          );
         }
         await insertMeeting(
           {
@@ -1160,6 +1259,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
 
     let counterparts: MeetingCounterpart[];
     let opening: Opening;
+    let replaces: Meeting | undefined;
     if (threadKey !== undefined) {
       if (copyPrincipal) {
         throw invalid(
@@ -1167,9 +1267,20 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         );
       }
       // The thread's own people, from its mail, and anyone main adds.
-      counterparts = withNamed(await threadCounterparts(await requireHeldThread(threadKey), book), named);
+      const { thread, conversation } = await threadToArrangeIn(threadKey);
+      counterparts = withNamed(await threadCounterparts(thread, book), named);
       if (counterparts.length === 0) throw refused('Nobody but the principal is on that thread');
-      opening = { kind: 'held' };
+      if (conversation) {
+        // The conversation's own session goes on, now arranging the meeting.
+        const continuing = conversation.session_id === null ? undefined : await getSession(conversation.session_id);
+        if (continuing?.status !== 'active') {
+          throw refused(`The conversation in thread ${threadKey} has no session to continue in: try again shortly`);
+        }
+        opening = { kind: 'takeover', session: continuing };
+        replaces = conversation;
+      } else {
+        opening = { kind: 'held' };
+      }
     } else {
       if (people === undefined) {
         throw invalid('Name the people to meet, or the thread_key the note about an email gave you');
@@ -1190,6 +1301,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       constraints,
       meetingKind,
       threadKey: threadKey ?? mintThreadKey(),
+      ...(replaces ? { replaces } : {}),
     });
     return openArranged(meeting, opening);
   }
@@ -1278,9 +1390,9 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   }
 
   /**
-   * The room a reschedule makes (R14, R23): only for a meeting still waiting
-   * for room after it reported needs-room, and only by moving a meeting the
-   * host lists as a candidate for it now.
+   * The room a reschedule makes (R14, R23): only for a meeting with someone
+   * inner circle or close that is still being arranged, and only by moving a
+   * meeting the host lists as a candidate for it now.
    */
   async function roomFor(
     forMeetingId: string,
@@ -1288,12 +1400,15 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     eventId: string,
   ): Promise<{ readonly forMeetingId: string; readonly candidate: RoomCandidate }> {
     const forMeeting = await requireMeeting(forMeetingId);
-    const waiting =
-      forMeeting.state === 'active' &&
-      forMeeting.ended_at === null &&
-      (await getRecordedOutcome(forMeeting.id, 'needs-room')) !== undefined;
-    if (!waiting || !isScheduling(forMeeting)) {
-      throw refused(`Meeting ${forMeeting.id} is not waiting for room: make room only for a meeting that needs it`);
+    if (
+      !isScheduling(forMeeting) ||
+      forMeeting.state !== 'active' ||
+      forMeeting.ended_at !== null ||
+      !usesPersonalHours(forMeeting.level)
+    ) {
+      throw refused(
+        `Meeting ${forMeeting.id} is not one to make room for: room is made only for a meeting with someone inner circle or close that is still being arranged`,
+      );
     }
     return { forMeetingId, candidate: await deps.roomCandidate(forMeeting, calendarId, eventId) };
   }
@@ -1520,49 +1635,64 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     };
   }
 
+  /** What `meeting_amend` may change. */
+  const AMENDABLE = ['answer', 'length_minutes', 'window_start', 'window_end', 'constraints', 'people'] as const;
+
+  /**
+   * main changes a job, answers the question it is waiting on, or both
+   * (KTD3). A meeting still being arranged takes new terms and people; a
+   * booked one takes people, who join its event, and new constraints; a
+   * conversation takes main's answer alone. Any amend closes the open
+   * question, and the conversation gets a new brief carrying what changed.
+   */
   async function amend(content: Record<string, unknown>): Promise<Answer> {
     const meeting = await requireMeeting(meetingIdOf(content));
-    if (meeting.state !== 'active') {
-      throw refused(`Meeting ${meeting.id} is ${meeting.state}: only a meeting still being arranged can be amended`);
-    }
-    if (!isScheduling(meeting)) {
+    const booked = meeting.state === 'booked' && meeting.ended_at === null;
+    if (meeting.state !== 'active' && !booked) {
       throw refused(
-        `Meeting ${meeting.id} writes one reply and has nothing to amend: meeting_cancel it and email_respond again`,
+        `Meeting ${meeting.id} is ${meeting.state}: only a meeting being arranged or booked, or an open conversation, can be amended`,
       );
     }
-    const changes = ['length_minutes', 'window_start', 'window_end', 'constraints', 'people'].filter(
-      (key) => content[key] !== undefined,
-    );
-    if (changes.length === 0) {
-      throw invalid('Give a new length_minutes, window_start, window_end, or constraints, or people to add');
+    const given = AMENDABLE.filter((key) => content[key] !== undefined);
+    if (given.length === 0) {
+      throw invalid('Give an answer, a new length_minutes, window_start, window_end, or constraints, or people to add');
     }
+    if (!isScheduling(meeting)) {
+      if (given.some((key) => key !== 'answer')) {
+        throw refused(
+          `Meeting ${meeting.id} is a conversation: it takes only your answer. To arrange a meeting in its thread, use meeting_arrange with thread_key ${meeting.thread_key}.`,
+        );
+      }
+    } else if (
+      booked &&
+      given.some((key) => key === 'length_minutes' || key === 'window_start' || key === 'window_end')
+    ) {
+      throw refused(
+        `Meeting ${meeting.id} is booked: move it with meeting_reschedule, which takes a new length or window`,
+      );
+    }
+    const answer = optionalText(content.answer, 'answer', ANSWER_MAX);
     const people = peopleOf(content.people);
     if (people !== undefined && meeting.kind !== 'arrange') {
       throw refused(
-        "Only a meeting handed over with arrange takes new people: moving an event, or asking its organizer, reaches the event's own guests.",
+        "Only a meeting handed over with meeting_arrange takes new people: moving an event, or asking its organizer, reaches the event's own guests.",
       );
     }
-    const lengthMinutes =
-      content.length_minutes === undefined ? meeting.length_minutes : lengthOf(content.length_minutes);
-    const window = checkedWindow(
-      {
-        start:
-          content.window_start === undefined ? meeting.window_start : instantOf(content.window_start, 'window_start'),
-        end: content.window_end === undefined ? meeting.window_end : instantOf(content.window_end, 'window_end'),
-      },
-      lengthMinutes,
-      new Date(),
-    );
     const constraints =
       content.constraints === undefined
         ? (meeting.constraints ?? undefined)
         : text(content.constraints, 'constraints', CONSTRAINTS_MAX);
+    const terms = isScheduling(meeting) && !booked ? amendedTerms(meeting, content) : undefined;
     const book = await addressBook();
     const named = distinct(await Promise.all((people ?? []).map((ref) => counterpartFor(ref, book))));
     const added = named.filter((person) => !meeting.counterparts.some((c) => c.address === person.address));
-    await assertShareable(undefined, constraints);
+    await assertShareable(constraints, answer);
     const session = meeting.session_id === null ? undefined : await getSession(meeting.session_id);
     if (!session) throw refused(`Meeting ${meeting.id} has no conversation to brief`);
+    // A booked event's text reaches everyone it invites: it is checked against them all before anyone joins.
+    if (booked && isScheduling(meeting) && added.length > 0) {
+      await deps.updateBooking({ ...meeting, counterparts: [...meeting.counterparts, ...added] });
+    }
 
     const version = meeting.brief_version + 1;
     const at = new Date().toISOString();
@@ -1577,25 +1707,22 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     }
     await updateMeeting(
       meeting.id,
-      {
-        length_minutes: lengthMinutes,
-        window_start: window.start,
-        window_end: window.end,
-        ...(constraints === undefined ? {} : { constraints }),
-        brief_version: version,
-      },
+      { ...terms, ...(constraints === undefined ? {} : { constraints }), brief_version: version },
       at,
     );
+    await closeAsk(meeting.id, at);
     const amended = await requireMeeting(meeting.id);
-    await writeBrief(amended, session, version, 'continuing', added);
+    await writeBrief(amended, session, version, 'continuing', { added, ...(answer === undefined ? {} : { answer }) });
     await requestWake(session, 'inbound-message');
-    /* eslint-disable no-catch-all/no-catch-all -- the brief stands; a hold that no longer fits cannot be booked, and is released when the meeting ends */
-    try {
-      await deps.releaseHolds(amended, 'stale');
-    } catch (err) {
-      log.warn('Holds that no longer fit an amended meeting were not all released', { meetingId: meeting.id, err });
+    if (terms) {
+      /* eslint-disable no-catch-all/no-catch-all -- the brief stands; a hold that no longer fits cannot be booked, and is released when the meeting ends */
+      try {
+        await deps.releaseHolds(amended, 'stale');
+      } catch (err) {
+        log.warn('Holds that no longer fit an amended meeting were not all released', { meetingId: meeting.id, err });
+      }
+      /* eslint-enable no-catch-all/no-catch-all */
     }
-    /* eslint-enable no-catch-all/no-catch-all */
     return {
       meetingId: meeting.id,
       data: {
@@ -1604,9 +1731,152 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         level: amended.level,
         message:
           `Meeting ${meeting.id} has a new brief (version ${version}); external-email works from it now.` +
-          (added.length === 0 ? '' : ` ${added.map(personText).join(', ')} joined the thread and the meeting.`),
+          (added.length === 0 ? '' : ` ${added.map(personText).join(', ')} joined the thread and the meeting.`) +
+          (booked && added.length > 0 ? ' Google sent the booked event’s guests its update.' : ''),
       },
     };
+  }
+
+  /** A meeting's length and window as an amend changes them, checked like new ones. */
+  function amendedTerms(
+    meeting: SchedulingMeeting,
+    content: Record<string, unknown>,
+  ): { readonly length_minutes: number; readonly window_start: string; readonly window_end: string } {
+    const lengthMinutes =
+      content.length_minutes === undefined ? meeting.length_minutes : lengthOf(content.length_minutes);
+    const window = checkedWindow(
+      {
+        start:
+          content.window_start === undefined ? meeting.window_start : instantOf(content.window_start, 'window_start'),
+        end: content.window_end === undefined ? meeting.window_end : instantOf(content.window_end, 'window_end'),
+      },
+      lengthMinutes,
+      new Date(),
+    );
+    return { length_minutes: lengthMinutes, window_start: window.start, window_end: window.end };
+  }
+
+  // -------------------------------------------------------------------------
+  // external-email asks main
+  // -------------------------------------------------------------------------
+
+  /** What external-email asks about, in main's words. */
+  const ASK_WORDS: Readonly<Record<AskTopic, string>> = {
+    time: 'when to meet',
+    length: 'how long to meet',
+    people: 'who is in the meeting',
+    place: 'where or how to meet',
+    other: 'something only you or the principal can answer',
+  };
+
+  const ASKED_REPLY =
+    'main has your question. Send nothing in this thread until the host writes to you: email allows the wait. ' +
+    'End this turn with nothing outside <internal>…</internal>.';
+
+  /**
+   * The emails that came into a conversation since its latest brief, at most
+   * `ASK_EMAILS`, oldest first: each as the host wrote it in, its sender's
+   * verification said and their words wrapped as untrusted.
+   */
+  async function emailsSinceBrief(session: Session): Promise<string[]> {
+    const history =
+      (await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+        mailbox.getInboundHistory(ASK_HISTORY_ROWS),
+      )) ?? [];
+    const emails: string[] = [];
+    for (const row of history) {
+      const content = parseContent(row.content);
+      if (content === undefined) continue;
+      if (content.brief !== undefined) break;
+      // Only the inbox writes an email, and it marks each with `email`.
+      if (content.email !== undefined && typeof content.text === 'string') emails.push(content.text);
+      if (emails.length === ASK_EMAILS) break;
+    }
+    return emails.reverse();
+  }
+
+  /**
+   * What a question needs main to see besides the emails: the job as it
+   * stands, and for a question about when to meet someone inner circle or
+   * close, the meetings that could move to make room (R14).
+   */
+  async function askContext(
+    meeting: Meeting,
+    about: AskTopic,
+    timezone: string,
+  ): Promise<{ readonly lines: readonly string[]; readonly candidates?: readonly RoomCandidate[] }> {
+    if (!isScheduling(meeting)) return { lines: [`It is a conversation, to "${meeting.purpose}".`] };
+    const booking = meeting.state === 'booked' ? await getBooking(meeting.id) : undefined;
+    if (booking) return { lines: [`It is booked for ${formatLocalTime(booking.start_at, timezone)}.`] };
+    const terms = `It is ${meeting.length_minutes} minutes, between ${formatLocalTime(meeting.window_start, timezone)} and ${formatLocalTime(meeting.window_end, timezone)}.`;
+    if (about !== 'time') return { lines: [terms] };
+    const open = (await deps.hasOpenTime(meeting))
+      ? 'Its window still has open times.'
+      : 'Nothing in its window is open now.';
+    if (!usesPersonalHours(meeting.level)) return { lines: [terms, open] };
+    const candidates = await deps.roomCandidates(meeting);
+    return { lines: [terms, open, roomText(meeting, candidates, timezone)], candidates };
+  }
+
+  /**
+   * external-email brings a curveball to main and waits (KTD2): no text of
+   * its own passes, only what it asks about. main's note carries the
+   * meeting, the latest emails as the host wrote them in, and the calls that
+   * answer it. While the question is open, the follow-through count waits
+   * on main, not on the other side.
+   */
+  async function askMain(content: Record<string, unknown>, session: Session, requestId: string): Promise<Answer> {
+    const meeting = await requireMeeting(meetingIdOf(content));
+    if (meeting.session_id !== session.id) throw refused("That meeting is not this conversation's");
+    const about = ASK_TOPICS.find((topic) => topic === content.about);
+    if (about === undefined) throw invalid(`about must be one of ${ASK_TOPICS.join(', ')}`);
+    if ((meeting.state !== 'active' && meeting.state !== 'booked') || meeting.ended_at !== null) {
+      throw refused(`Meeting ${meeting.id} has ended (${meeting.state}): send nothing more in this conversation.`);
+    }
+    if (meeting.ask_about !== null) {
+      throw refused(
+        `You already asked main about ${ASK_WORDS[meeting.ask_about]}: send nothing in this thread until the host writes to you.`,
+      );
+    }
+    const at = new Date().toISOString();
+    const timezone = await mainTimezone();
+    const emails = await emailsSinceBrief(session);
+    const context = await askContext(meeting, about, timezone);
+    const text = [
+      `external-email asks you about ${ASK_WORDS[about]} for meeting ${meeting.id}, "${meeting.purpose}" with ${who(meeting)} (${meeting.level}), in thread ${meeting.thread_key}. ` +
+        'It sends nothing there until you answer.',
+      ...context.lines,
+      emails.length === 0
+        ? 'No email has come in the thread since its brief.'
+        : `What came in the thread since its brief:\n${emails.join('\n\n')}`,
+      'Answer with meeting_amend: answer carries your words to external-email, with any new terms or people.' +
+        (isScheduling(meeting)
+          ? ''
+          : ` To arrange a meeting in its thread, use meeting_arrange with thread_key ${meeting.thread_key}.`) +
+        ' meeting_cancel calls it off.',
+    ].join('\n');
+    // Written before the question is recorded, under this request's id: a replay finishes it, and tells main once.
+    await writeMainNote(
+      `meeting-ask-${meeting.id}-${requestId}`,
+      {
+        type: ASK_NOTE_TYPE,
+        meeting_id: meeting.id,
+        about,
+        thread_key: meeting.thread_key,
+        kind: meeting.kind,
+        level: meeting.level,
+        counterparts: noteCounterparts(meeting),
+        ...(context.candidates ? { candidates: context.candidates } : {}),
+      },
+      text,
+      at,
+    );
+    if (!(await openAsk(meeting.id, about, await deadlinesFrom(Date.parse(at)), at))) {
+      throw refused(
+        `Meeting ${meeting.id} has changed meanwhile: read the host's latest message before you do anything.`,
+      );
+    }
+    return { meetingId: meeting.id, data: { meeting_id: meeting.id, about, message: ASKED_REPLY } };
   }
 
   // -------------------------------------------------------------------------
@@ -1620,14 +1890,12 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   const OUTCOME_STATES: Readonly<Record<SchedulingOutcome, MeetingState>> = {
     booked: 'booked',
     settled: 'settled',
-    'needs-room': 'active',
     'not-scheduling': 'not-scheduling',
     'gave-up': 'gave-up',
   };
 
   /** What a note adds about room: the meeting that moved for this one, or the one a failed move was for. */
   interface RoomContext {
-    readonly candidates?: readonly RoomCandidate[];
     readonly madeRoomBy?: NonNullable<OutcomeNote['made_room_by']>;
     /** The meeting a reschedule was making room for, while that room is still unmade. */
     readonly roomFor?: Meeting;
@@ -1641,20 +1909,18 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     );
   }
 
-  function needsRoomText(meeting: Meeting, candidates: readonly RoomCandidate[], timezone: string): string {
-    const opening = `Meeting ${meeting.id} with ${who(meeting)} (${meeting.level}) needs room: nothing open in its window fits.`;
+  /** The meetings that could move to make room for `meeting`, as main weighs them (R14). */
+  function roomText(meeting: Meeting, candidates: readonly RoomCandidate[], timezone: string): string {
     if (candidates.length === 0) {
       return (
-        `${opening} No meeting the assistant arranged with someone who matters less can move to make it, and the principal's own ` +
-        'events and invitations from others never move for it. Move nothing: give the principal one recommendation in one line, ' +
-        'such as which of their own plans could give way, or a later window.'
+        'No meeting the assistant arranged with someone who matters less can move to make room, and the principal’s own ' +
+        'events and invitations from others never move for it.'
       );
     }
     return [
-      `${opening} The assistant arranged these meetings with people who matter less, and moving one frees a time that fits:`,
+      'Moving one of these meetings the assistant arranged with people who matter less frees a time that fits:',
       ...candidates.map((candidate) => candidateLine(candidate, timezone)),
-      `To move one, meeting_reschedule it with making_room_for ${meeting.id}: the time it frees goes to this meeting. ` +
-        'If none should move, move nothing and give the principal one recommendation in one line.',
+      `To move one, use meeting_reschedule with making_room_for ${meeting.id}: the time it frees goes to this meeting.`,
     ].join('\n');
   }
 
@@ -1684,8 +1950,6 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
           `${who(meeting)} moved their invitation, so it no longer conflicts (meeting ${meeting.id}, "${meeting.purpose}"). ` +
           'Tell the principal in one line.'
         );
-      case 'needs-room':
-        return needsRoomText(meeting, room.candidates ?? [], timezone);
       case 'not-scheduling':
         return (
           `Thread ${meeting.thread_key} with ${who(meeting)} is not about scheduling, so external-email sent nothing in it (meeting ${meeting.id}). ` +
@@ -1716,8 +1980,6 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   /** What a note about this outcome says about room. */
   async function roomContext(meeting: SchedulingMeeting, outcome: SchedulingOutcome): Promise<RoomContext> {
     switch (outcome) {
-      case 'needs-room':
-        return { candidates: await deps.roomCandidates(meeting) };
       case 'booked': {
         const given = await getRoomGivenTo(meeting.id);
         const moved = given ? await getMeeting(given.moved_meeting_id) : undefined;
@@ -1751,8 +2013,6 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     booked:
       'Recorded: booked. The principal hears it from main. Stay ready in this thread for any change they ask for.',
     settled: 'Recorded: settled. This conversation is now closed: send nothing more in it.',
-    'needs-room':
-      'Recorded: needs-room. main decides whether to make room; wait for a message from the host before offering anything else.',
     'not-scheduling': 'Recorded: not-scheduling. This conversation is now closed: send nothing more in it.',
     'gave-up': 'Recorded: gave-up. This conversation is now closed: send nothing more in it.',
   };
@@ -1804,7 +2064,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     }
   }
 
-  async function outcome(content: Record<string, unknown>, session: Session, requestId: string): Promise<Answer> {
+  async function outcome(content: Record<string, unknown>, session: Session): Promise<Answer> {
     const meeting = await requireMeeting(meetingIdOf(content));
     const kind = OUTCOMES.find((value) => value === content.outcome);
     if (kind === undefined) throw invalid(`outcome must be one of ${OUTCOMES.join(', ')}`);
@@ -1818,10 +2078,8 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     if (kind === 'responded') {
       throw refused('Only a conversation briefed to write one reply reports responded.');
     }
-    // needs-room leaves the meeting being arranged, and comes again when an amended window or a
-    // turned-down room still leaves no time: each report is new. Every other outcome is reported once.
-    const repeatable = kind === 'needs-room';
-    const recorded = repeatable ? undefined : await getRecordedOutcome(meeting.id, kind);
+    // Every outcome is reported once.
+    const recorded = await getRecordedOutcome(meeting.id, kind);
     if (recorded !== undefined) return { meetingId: meeting.id, data: JSON.parse(recorded) as Record<string, unknown> };
     // A replay that stopped between the state change and the record finishes here.
     if (meeting.state !== 'active' && meeting.state !== OUTCOME_STATES[kind]) {
@@ -1841,13 +2099,6 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       case 'settled':
         if (meeting.kind !== 'ask_organizer') throw refused('Only an ask_organizer meeting ends settled');
         await assertSettled(meeting);
-        break;
-      case 'needs-room':
-        if (meeting.level !== 'inner-circle' && meeting.level !== 'close') {
-          throw refused(
-            `needs-room is only for someone in the inner circle or close; this meeting's level is ${meeting.level}. Offer the open times there are, or report gave-up.`,
-          );
-        }
         break;
       case 'not-scheduling': {
         const thread = await getThreadParticipants(meeting.thread_key);
@@ -1876,7 +2127,6 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       purpose: meeting.purpose,
       level: meeting.level,
       counterparts: noteCounterparts(meeting),
-      ...(room.candidates ? { candidates: room.candidates } : {}),
       ...(room.madeRoomBy ? { made_room_by: room.madeRoomBy } : {}),
       ...(booking
         ? {
@@ -1893,21 +2143,16 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         : {}),
       ...(kind === 'not-scheduling' ? { thread_key: meeting.thread_key } : {}),
     };
-    // The note's id is fixed per meeting and outcome, or per needs-room report, so it is written
-    // once however often this runs; the state changes after it are safe to repeat.
-    await writeOutcomeNote(
-      note,
-      outcomeText(meeting, kind, booking, await mainTimezone(), room),
-      at,
-      repeatable ? requestId : undefined,
-    );
+    // The note's id is fixed per meeting and outcome, so it is written once however often this runs;
+    // the state changes after it are safe to repeat.
+    await writeOutcomeNote(note, outcomeText(meeting, kind, booking, await mainTimezone(), room), at);
     if (kind === 'booked') {
       await updateMeeting(meeting.id, { state: 'booked' }, at);
       await clearDeadlines(meeting.id, at);
     } else if (kind === 'not-scheduling') {
       // The thread is main's to triage again: respond in it, or dismiss it.
       await handBack(meeting, 'not-scheduling', false);
-    } else if (kind !== 'needs-room') {
+    } else {
       await endMeeting(meeting, OUTCOME_STATES[kind], false);
     }
     const data = { meeting_id: meeting.id, outcome: kind, message: OUTCOME_REPLIES[kind] };
@@ -2424,6 +2669,11 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
    */
   async function giveUpUnanswered(meeting: Meeting, giveUpAt: string): Promise<void> {
     const at = new Date().toISOString();
+    if (meeting.state === 'booked') {
+      // Only a question main left unanswered counts down on a booked meeting: it lapses, and the meeting stands.
+      if (meeting.give_up_at === giveUpAt) await closeAsk(meeting.id, at);
+      return;
+    }
     if (!(await claimGiveUp(meeting.id, giveUpAt, at))) return;
     const current = await requireMeeting(meeting.id);
     try {
@@ -2433,6 +2683,34 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       throw error;
     }
     await endMeeting(current, 'gave-up', true);
+  }
+
+  /**
+   * Remind main, once per deadline, that a meeting has waited two working
+   * days on its answer; two more and the meeting is given up, or for a booked
+   * one the question lapses.
+   */
+  async function remindMain(meeting: Meeting, nudgeAt: string): Promise<void> {
+    if (meeting.ask_about === null) return;
+    await writeMainNote(
+      `meeting-ask-reminder-${meeting.id}-${Date.parse(nudgeAt)}`,
+      {
+        type: ASK_NOTE_TYPE,
+        meeting_id: meeting.id,
+        about: meeting.ask_about,
+        thread_key: meeting.thread_key,
+        kind: meeting.kind,
+        level: meeting.level,
+        counterparts: noteCounterparts(meeting),
+        reminder: true,
+      },
+      `Meeting ${meeting.id}, "${meeting.purpose}" with ${who(meeting)}, has waited two working days for your answer about ` +
+        `${ASK_WORDS[meeting.ask_about]}, and they have heard nothing meanwhile. Answer with meeting_amend, or meeting_cancel it. ` +
+        (meeting.state === 'booked'
+          ? 'In two more working days the question lapses, and the booked meeting stands.'
+          : 'In two more working days it is given up.'),
+      new Date().toISOString(),
+    );
   }
 
   /** Tell main nobody answered the meeting, and record the outcome. */
@@ -2448,9 +2726,12 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       counterparts: noteCounterparts(meeting),
       unanswered: true,
     };
+    const waited =
+      meeting.ask_about === null
+        ? `Nobody answered meeting ${meeting.id}, "${meeting.purpose}" with ${who(meeting)}, in the two working days after a nudge`
+        : `Meeting ${meeting.id}, "${meeting.purpose}" with ${who(meeting)}, waited four working days for your answer about ${ASK_WORDS[meeting.ask_about]}`;
     const text =
-      `Nobody answered meeting ${meeting.id}, "${meeting.purpose}" with ${who(meeting)}, in the two working days after a nudge, ` +
-      'so its held times were released and its thread closed. Tell the principal in one line, with a suggestion, ' +
+      `${waited}, so its held times were released and its thread closed. Tell the principal in one line, with a suggestion, ` +
       'such as another way to reach them or a later window.' +
       roomStillNeeded(room);
     await writeOutcomeNote(note, text, at);
@@ -2516,6 +2797,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     respond,
     dismiss,
     replyToPrincipal,
+    askMain,
     outcome,
     recipients,
     /** A delivered message may be a reply's own email: it finishes the reply once reported. */
@@ -2531,6 +2813,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     /** End a meeting from the host (a booked event passes). */
     endMeeting,
     giveUpUnanswered,
+    remindMain,
     threadStopped,
     forgetPerson,
   };

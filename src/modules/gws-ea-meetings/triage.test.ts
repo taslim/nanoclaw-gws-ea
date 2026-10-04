@@ -972,7 +972,7 @@ describe('respond', () => {
     refusal(await ask(arrangeSession, 'meeting_outcome', { meeting_id: arranged.meeting_id, outcome: 'responded' }));
   });
 
-  it('has nothing to amend: main cancels it and responds again, and the brief stays as it was', async () => {
+  it('takes only main’s answer as an amend, in a new brief', async () => {
     const { threadKey } = await deeAsks();
     const answer = data(await ask(scheduling.main, 'email_respond', respondFields(threadKey)));
     const session = await meetingSession(answer.meeting_id);
@@ -980,9 +980,19 @@ describe('respond', () => {
       refusal(
         await ask(scheduling.main, 'meeting_amend', { meeting_id: answer.meeting_id, constraints: 'Keep it short.' }),
       ),
-    ).toMatch(/nothing to amend/);
+    ).toMatch(/takes only your answer/);
     expect(contents(session).filter((c) => c.brief !== undefined)).toHaveLength(1);
     expect((await meeting(answer.meeting_id)).constraints).toBeNull();
+
+    data(
+      await ask(scheduling.main, 'meeting_amend', {
+        meeting_id: answer.meeting_id,
+        answer: 'Alex would happily record a short video for the meetup instead.',
+      }),
+    );
+    const briefs = contents(session).filter((c) => c.brief !== undefined);
+    expect(briefs).toHaveLength(2);
+    expect(briefs[1].text).toContain("main's answer: Alex would happily record a short video for the meetup instead.");
   });
 
   it('is refused for a thread main started, and for a thread with a meeting in progress', async () => {

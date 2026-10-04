@@ -101,7 +101,6 @@ import {
   READ_MARGIN_MS,
   schedulingRules,
   slotIdFor,
-  usesPersonalHours,
   zonedInstant,
   type LocalDate,
   type SchedulingRules,
@@ -302,9 +301,7 @@ function freeTimeHeading(
   }
   if (found) return `Open times for meeting ${meeting.id}, best first:`;
   if (oneDay) return 'Nothing is open that day: call meeting_free_time without a date for other days.';
-  return usesPersonalHours(meeting.level)
-    ? "Nothing in the meeting's window is open. Report needs-room with meeting_outcome."
-    : "Nothing in the meeting's window is open: report gave-up with meeting_outcome, so main can tell the principal.";
+  return "Nothing in the meeting's window is open: ask main about time with meeting_ask_main, and offer nothing meanwhile.";
 }
 
 export function createCalendarActions(deps: CalendarActionsDeps) {
@@ -549,8 +546,11 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     };
   }
 
-  /** The booking's text may reach its attendees, so nothing private passes (R24). A move writes no text. */
-  async function assertBookable(meeting: SchedulingMeeting, view: View): Promise<void> {
+  /**
+   * The booking's text reaches everyone it invites, so nothing private
+   * passes (R24); `refusal` says what was not done. A move writes no text.
+   */
+  async function assertBookable(meeting: SchedulingMeeting, view: View, refusal: string): Promise<void> {
     if (meeting.kind === 'reschedule') return;
     const fields = bookingFields(meeting, view);
     const check = await checkOutbound(
@@ -558,10 +558,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
       await audienceForAddresses(meeting.counterparts.map((counterpart) => counterpart.address)),
     );
     if (!check.allowed) {
-      throw refused(
-        `The booking was not made: the meeting's title carries one of the principal's private details (${check.kind}). ` +
-          'Report gave-up with meeting_outcome, so main can arrange it again under another purpose.',
-      );
+      throw refused(`${refusal}: the meeting's title carries one of the principal's private details (${check.kind}).`);
     }
   }
 
@@ -896,11 +893,16 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
       const closed = await closedSlots(meeting, view, [slot]);
       if (closed.length > 0)
         throw refused(`${slotId} is no longer open: call meeting_free_time again for times to offer instead.`);
-      await assertBookable(meeting, view);
+      await assertBookable(
+        meeting,
+        view,
+        'The booking was not made; report gave-up with meeting_outcome, so main can arrange it again under another purpose',
+      );
       booking = await placeBooking(meeting, view, slot);
       await recordBooking(booking);
     }
-    await clearDeadlines(meeting.id, new Date().toISOString());
+    // A question main has not answered keeps its own count; nothing else waits once the meeting is booked.
+    if (meeting.asked_at === null) await clearDeadlines(meeting.id, new Date().toISOString());
     let holdsLeft = '';
     /* eslint-disable no-catch-all/no-catch-all -- the booking stands; holds left over go on a repeat of book, or follow-through releases them */
     try {
@@ -969,7 +971,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     const query = queryFor(meeting, view, busy, earliest);
     const [best] = bestSlots(query, openSlots(query), 1, now);
     if (!best) return undefined;
-    await assertBookable(meeting, view);
+    await assertBookable(meeting, view, 'The meeting was not booked');
     const slot: OfferedSlot = {
       slot_id: slotIdFor(meeting.id, best),
       start_at: iso(best.start),
@@ -994,6 +996,29 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
   }
 
   /**
+   * Bring a booked meeting's event in line with the meeting after main added
+   * people (KTD3): every one of them invited, with Google's update. Its text
+   * is checked against them all first, so a refusal writes nothing.
+   */
+  async function updateBooking(meeting: SchedulingMeeting): Promise<void> {
+    const booking = await getBooking(meeting.id);
+    if (!booking) throw refused(`Meeting ${meeting.id} has no booking to update`);
+    await assertBookable(meeting, await viewOf(meeting), 'Nobody was added');
+    await calendar().patchEvent(
+      booking.calendar_id,
+      booking.event_id,
+      { attendees: meeting.counterparts.map((counterpart) => counterpart.address) },
+      'all',
+    );
+    recordOwnCalendarChange(booking.calendar_id, booking.event_id);
+  }
+
+  /** Whether anything in the meeting's window is open now, as meeting_free_time would offer it. */
+  async function hasOpenTime(meeting: SchedulingMeeting): Promise<boolean> {
+    return (await openTimes(meeting, meetingWindow(meeting), [])).length > 0;
+  }
+
+  /**
    * Open times for a meeting inside `range`, best first, as if the events in
    * `ignore` were not on the calendar: what moving them would free (R14).
    */
@@ -1014,6 +1039,8 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     bookDirectly,
     holdSlots,
     openTimes,
+    hasOpenTime,
+    updateBooking,
   };
 }
 

@@ -42,8 +42,12 @@ export function lowestLevel(levels: readonly MeetingLevel[]): MeetingLevel {
   );
 }
 
-export const OUTCOMES = ['booked', 'settled', 'needs-room', 'not-scheduling', 'gave-up', 'responded'] as const;
+export const OUTCOMES = ['booked', 'settled', 'not-scheduling', 'gave-up', 'responded'] as const;
 export type Outcome = (typeof OUTCOMES)[number];
+
+/** What `external-email` can ask main about, never in its own words (KTD5). */
+export const ASK_TOPICS = ['time', 'length', 'people', 'place', 'other'] as const;
+export type AskTopic = (typeof ASK_TOPICS)[number];
 
 export interface MeetingCounterpart {
   /** The address the host took from a record, from Google, from mail, or from `main`. */
@@ -79,6 +83,9 @@ interface MeetingFields {
   readonly give_up_at: string | null;
   /** When a reply's email was delivered in its thread; null until then, and for every other kind. */
   readonly replied_at: string | null;
+  /** The question `external-email` put to main and is waiting on, and when; both null while none is open. */
+  readonly ask_about: AskTopic | null;
+  readonly asked_at: string | null;
   readonly created_at: string;
   readonly updated_at: string;
   readonly ended_at: string | null;
@@ -119,6 +126,8 @@ export type NewMeeting = DistributiveOmit<
   | 'nudge_at'
   | 'give_up_at'
   | 'replied_at'
+  | 'ask_about'
+  | 'asked_at'
   | 'created_at'
   | 'updated_at'
   | 'ended_at'
@@ -333,6 +342,38 @@ export async function hadEarlierMeetingOnThread(threadKey: string, meetingId: st
   return row !== undefined;
 }
 
+/**
+ * Record the question `external-email` put to main, once: false when one is
+ * already open, or the meeting is no longer being arranged or booked. While
+ * it is open, the follow-through count waits on main, from `deadlines`.
+ */
+export async function openAsk(id: string, about: AskTopic, deadlines: Deadlines, at: string): Promise<boolean> {
+  const result = await getDb().run(
+    `UPDATE gws_ea_meetings SET ask_about = ?, asked_at = ?, nudge_at = ?, give_up_at = ?, updated_at = ?
+      WHERE id = ? AND asked_at IS NULL AND state IN ('active', 'booked') AND ended_at IS NULL`,
+    about,
+    at,
+    deadlines.nudge_at,
+    deadlines.give_up_at,
+    at,
+    id,
+  );
+  return result.changes > 0;
+}
+
+/**
+ * Close a meeting's open question, with the count that waited on main: the
+ * conversation's next email starts its own. Changes nothing when none is open.
+ */
+export async function closeAsk(id: string, at: string): Promise<void> {
+  await getDb().run(
+    `UPDATE gws_ea_meetings SET ask_about = NULL, asked_at = NULL, nudge_at = NULL, give_up_at = NULL, updated_at = ?
+      WHERE id = ? AND asked_at IS NOT NULL`,
+    at,
+    id,
+  );
+}
+
 /** Clear a meeting's deadlines: no nudge and no give-up follows. */
 export async function clearDeadlines(id: string, at: string): Promise<void> {
   await getDb().run(
@@ -419,11 +460,14 @@ export async function releaseGiveUp(id: string, giveUpAt: string, at: string): P
   );
 }
 
-/** Every meeting still being arranged that has a deadline running, and every give-up claimed but not yet finished. */
+/**
+ * Every live meeting with a deadline running (one being arranged, or a
+ * booked one waiting on main), and every give-up claimed but not yet finished.
+ */
 export async function listMeetingsWithDeadlines(): Promise<Meeting[]> {
   const rows = await getDb().all<MeetingRow>(
     `SELECT * FROM gws_ea_meetings
-      WHERE (state = 'active' AND (nudge_at IS NOT NULL OR give_up_at IS NOT NULL))
+      WHERE (state IN ('active', 'booked') AND ended_at IS NULL AND (nudge_at IS NOT NULL OR give_up_at IS NOT NULL))
          OR (state = 'gave-up' AND give_up_at IS NOT NULL)
       ORDER BY created_at`,
   );

@@ -36,7 +36,8 @@ const EXTERNAL_CAPABILITY = 'gws-ea-meetings-external';
 /** How long a tool waits for the host; a request may still go through after that. */
 export const MEETING_REQUEST_TIMEOUT_MS = 120_000;
 
-const OUTCOMES = ['booked', 'settled', 'needs-room', 'not-scheduling', 'gave-up', 'responded'] as const;
+const OUTCOMES = ['booked', 'settled', 'not-scheduling', 'gave-up', 'responded'] as const;
+const ASK_TOPICS = ['time', 'length', 'people', 'place', 'other'] as const;
 
 function err(text: string): CallToolResult {
   return { content: [{ type: 'text', text: `Error: ${text}` }], isError: true };
@@ -275,7 +276,13 @@ export const reschedule = requestTool({
       description: 'The id of a meeting with someone inner circle or close that this move makes room for.',
     },
   },
-  required: { calendar_id: 'string', event_id: 'string', window_start: 'string', window_end: 'string', purpose: 'string' },
+  required: {
+    calendar_id: 'string',
+    event_id: 'string',
+    window_start: 'string',
+    window_end: 'string',
+    purpose: 'string',
+  },
   optional: { length_minutes: 'integer', constraints: 'string', meeting_kind: 'string', making_room_for: 'string' },
   repeatable: false,
 });
@@ -283,7 +290,7 @@ export const reschedule = requestTool({
 export const cancel = requestTool({
   name: 'meeting_cancel',
   description:
-    "Call something off. Give meeting_id for a meeting you handed to external-email: the host releases its held times and deletes the event it booked, and Google sends the guests its cancellation. Or give calendar_id and event_id for an event the principal organizes with others: the host deletes it, and Google sends its guests the cancellation. For an event someone else organizes, decline it or have meeting_reschedule ask its organizer instead.",
+    'Call something off. Give meeting_id for a meeting you handed to external-email: the host releases its held times and deletes the event it booked, and Google sends the guests its cancellation. Or give calendar_id and event_id for an event the principal organizes with others: the host deletes it, and Google sends its guests the cancellation. For an event someone else organizes, decline it or have meeting_reschedule ask its organizer instead.',
   properties: {
     meeting_id: { type: 'string', description: 'The meeting’s id, such as mtg-….' },
     calendar_id: { type: 'string', description: 'The calendar the event is on, instead of meeting_id.' },
@@ -307,9 +314,14 @@ export const cancel = requestTool({
 export const amend = requestTool({
   name: 'meeting_amend',
   description:
-    "Change a meeting external-email is still arranging: its length, window, or constraints, or people to add to a meeting you handed over with meeting_arrange. Someone added joins the meeting and its email thread, and external-email's next reply goes to them too. external-email gets the new brief at once.",
+    "Answer what external-email asked you, change a job it holds, or both; it gets a new brief at once, and the question closes. A meeting still being arranged takes a new length, window or constraints, and people to add when you handed it over with meeting_arrange. A booked one takes people to add, who join its event with Google's update, and new constraints; move it with meeting_reschedule. A conversation takes only your answer. Someone added joins the email thread, and external-email's next reply goes to them too.",
   properties: {
     meeting_id: { type: 'string', description: 'The meeting’s id.' },
+    answer: {
+      type: 'string',
+      description:
+        'Your words to external-email: the answer to what it asked, or what to tell them. The other side may read what it leads to, so write only what they may know. Up to 1,000 characters.',
+    },
     length_minutes: { type: 'integer', description: 'The new length in minutes.' },
     ...WINDOW_PROPERTIES,
     constraints: CONSTRAINTS,
@@ -322,6 +334,7 @@ export const amend = requestTool({
   },
   required: { meeting_id: 'string' },
   optional: {
+    answer: 'string',
     length_minutes: 'integer',
     window_start: 'string',
     window_end: 'string',
@@ -411,7 +424,7 @@ export const freeTime = requestTool({
 export const hold = requestTool({
   name: 'meeting_hold',
   description:
-    "Hold exactly the times you offer, by their slot ids from meeting_free_time, so nothing else takes them while the other side chooses. Any other time held for the meeting is released; an empty list releases them all. At most three. A time that is no longer open is refused, and then nothing changes.",
+    'Hold exactly the times you offer, by their slot ids from meeting_free_time, so nothing else takes them while the other side chooses. Any other time held for the meeting is released; an empty list releases them all. At most three. A time that is no longer open is refused, and then nothing changes.',
   properties: {
     meeting_id: MEETING_ID,
     slot_ids: { type: 'array', items: { type: 'string' }, description: 'The slot ids of the times you offer now.' },
@@ -460,10 +473,24 @@ export const recipients = requestTool({
   check: (args) => (Array.isArray(args.to) && args.to.length === 0 ? 'Put at least one address on to.' : undefined),
 });
 
+export const askMain = requestTool({
+  name: 'meeting_ask_main',
+  description:
+    'Ask main about something your brief does not cover, and wait: another window, another length, someone to add, another place, or anything only the principal can answer. You name only what it is about; main reads their emails itself, and its answer comes as a new brief. One question at a time.',
+  properties: {
+    meeting_id: MEETING_ID,
+    about: { type: 'string', enum: [...ASK_TOPICS], description: 'What they asked for that main must answer.' },
+  },
+  required: { meeting_id: 'string', about: 'string' },
+  repeatable: false,
+  check: (args) =>
+    ASK_TOPICS.some((topic) => topic === args.about) ? undefined : `about must be one of ${ASK_TOPICS.join(', ')}`,
+});
+
 export const outcome = requestTool({
   name: 'meeting_outcome',
   description:
-    "Report how this conversation's meeting ended, once. booked: after meeting_book succeeded. settled: the organizer moved their invitation. needs-room: nothing in the window fits, for someone in the inner circle or close. not-scheduling: the thread is not about arranging a meeting. gave-up: no time could be agreed. responded: the answer a respond brief asked for is written. The host fills in the details for the principal.",
+    "Report how this conversation's meeting ended, once. booked: after meeting_book succeeded. settled: the organizer moved their invitation. not-scheduling: the thread is not about arranging a meeting. gave-up: no time could be agreed. responded: the answer a respond brief asked for is written. The host fills in the details for the principal.",
   properties: {
     meeting_id: MEETING_ID,
     outcome: { type: 'string', enum: [...OUTCOMES], description: 'How the meeting ended.' },
@@ -475,4 +502,4 @@ export const outcome = requestTool({
 });
 
 registerTools([arrange, reschedule, cancel, amend, respond, dismiss, replyToPrincipal], MAIN_CAPABILITY);
-registerTools([freeTime, hold, book, recipients, outcome], EXTERNAL_CAPABILITY);
+registerTools([freeTime, hold, book, askMain, recipients, outcome], EXTERNAL_CAPABILITY);

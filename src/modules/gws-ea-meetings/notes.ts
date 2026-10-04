@@ -3,9 +3,10 @@
  *
  * - To `main`: in its shared session, routed to the principal's direct
  *   message, so main's one line reaches the principal (R26). How a meeting
- *   ended or a reply went out, an email in a meeting's thread that could not
- *   be sent, a step in its conversation that failed, a booked meeting the
- *   counterpart moved, and a room that could not be held.
+ *   ended or a reply went out, a question `external-email` is waiting on
+ *   main to answer, an email in a meeting's thread that could not be sent, a
+ *   step in its conversation that failed, a booked meeting the counterpart
+ *   moved, and a room that could not be held.
  * - To a meeting's own `external-email` session: host-only messages from
  *   sender `system`, which no email can be, in the meeting's thread. The
  *   nudge for a quiet thread, and the time room was made for (KTD12).
@@ -23,6 +24,8 @@ import { isDuplicateNote, writeNoteForMain } from '../gws-ea-profile/main-note.j
 import type { Meeting, MeetingKind, MeetingLevel, Outcome } from './db.js';
 
 export const OUTCOME_NOTE_TYPE = 'gws-ea-meetings.outcome';
+/** To main: `external-email` asks about a meeting, and waits for the answer (KTD2). */
+export const ASK_NOTE_TYPE = 'gws-ea-meetings.ask';
 /** A booked meeting moved at the counterpart's request. */
 export const MOVED_NOTE_TYPE = 'gws-ea-meetings.moved';
 /** The time freed to make room was taken before it could be held. */
@@ -71,8 +74,6 @@ export interface OutcomeNote {
   };
   /** The invitation the organizer moved: only on a settled outcome. */
   readonly invitation?: { readonly calendar_id: string; readonly event_id: string };
-  /** On a needs-room outcome: what could move to make room, earliest first; empty when nothing may. */
-  readonly candidates?: readonly RoomCandidate[];
   /** On a booked outcome: the meeting that moved to make room for this one. */
   readonly made_room_by?: {
     readonly meeting_id: string;
@@ -111,14 +112,19 @@ export async function mainTimezone(): Promise<string> {
   return resolveGroupTimezone(await requireMainAgentGroupId());
 }
 
-/** Write a note into main's shared session and wake it. Throws when there is no main or no principal to reach. */
+/**
+ * Write a note into main's shared session, waking it unless `wake` is false:
+ * a fact main need not act on waits for its next turn. Throws when there is
+ * no main or no principal to reach.
+ */
 export async function writeMainNote<Note extends { readonly type: string; readonly meeting_id: string }>(
   id: string,
   note: Note,
   text: string,
   at: string,
+  wake = true,
 ): Promise<void> {
-  const result = await writeNoteForMain({ id, timestamp: at, text, fields: { note }, wake: true });
+  const result = await writeNoteForMain({ id, timestamp: at, text, fields: { note }, wake });
   switch (result) {
     case 'no-main':
       throw new Error('There is no main agent to report the meeting to');

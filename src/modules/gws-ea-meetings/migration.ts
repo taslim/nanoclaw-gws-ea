@@ -9,7 +9,8 @@ import type { ModuleMigration } from '../../db/migrations/index.js';
  *   it concerns (the event a reschedule moves, the invitation an
  *   ask_organizer is about); its length, window, purpose and constraints;
  *   its state; the thread and session it is bound to; its brief's version;
- *   and its follow-through deadlines. A `respond` job writes one reply in a
+ *   its follow-through deadlines; and the question `external-email` put to
+ *   main and is waiting on, if any (`ask_about`, `asked_at`). A `respond` job writes one reply in a
  *   thread waiting for main: it has no length or window, and records when
  *   its reply was delivered. At most one live meeting holds a thread at a
  *   time.
@@ -59,6 +60,8 @@ export const gwsEaMeetingsMigration: ModuleMigration = {
         nudge_at              TEXT,
         give_up_at            TEXT,
         replied_at            TEXT,
+        ask_about             TEXT CHECK (ask_about IN ('time', 'length', 'people', 'place', 'other')),
+        asked_at              TEXT,
         created_at            TEXT NOT NULL,
         updated_at            TEXT NOT NULL,
         ended_at              TEXT,
@@ -67,7 +70,8 @@ export const gwsEaMeetingsMigration: ModuleMigration = {
         CHECK (kind IN ('arrange', 'respond') OR (event_calendar_id IS NOT NULL AND event_id IS NOT NULL)),
         CHECK ((kind = 'respond') = (length_minutes IS NULL)),
         CHECK ((length_minutes IS NULL) = (window_start IS NULL) AND (window_start IS NULL) = (window_end IS NULL)),
-        CHECK (kind = 'respond' OR replied_at IS NULL)
+        CHECK (kind = 'respond' OR replied_at IS NULL),
+        CHECK ((ask_about IS NULL) = (asked_at IS NULL))
       );
       CREATE UNIQUE INDEX idx_gws_ea_meetings_live_thread
         ON gws_ea_meetings (thread_key) WHERE state IN ('opening', 'active', 'booked');
@@ -99,7 +103,7 @@ export const gwsEaMeetingsMigration: ModuleMigration = {
       CREATE TABLE gws_ea_meeting_outcomes (
         meeting_id   TEXT NOT NULL REFERENCES gws_ea_meetings(id) ON DELETE CASCADE,
         outcome      TEXT NOT NULL CHECK (outcome IN (
-                       'booked', 'settled', 'needs-room', 'not-scheduling', 'gave-up', 'responded'
+                       'booked', 'settled', 'not-scheduling', 'gave-up', 'responded'
                      )),
         response     TEXT NOT NULL,
         recorded_at  TEXT NOT NULL,
