@@ -33,7 +33,9 @@ export const requestStatus: McpToolDefinition = {
     const requestId = args.request_id;
     if (typeof requestId !== 'string' || !REQUEST_ID.test(requestId)) {
       return {
-        content: [{ type: 'text', text: 'Error: request_id must be the request id a timeout gave you, such as act-….' }],
+        content: [
+          { type: 'text', text: 'Error: request_id must be the request id a timeout gave you, such as act-….' },
+        ],
         isError: true,
       };
     }
