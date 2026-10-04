@@ -760,7 +760,7 @@ describe('status', () => {
     }
   });
 
-  it('reports the inbox as the host reports it, degraded while it fails, calendar news is off, or a domain has no selector', async () => {
+  it('reports the inbox as the host reports it, degraded while it fails, while calendar news is not on yet, or when its report is invalid', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
     await bound(host.paths, reservation.instance_id);

@@ -29,6 +29,7 @@ import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars
 import { closeDb, createAgentGroup, getAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { getHostStartCallbacks } from '../../host-lifecycle.js';
 import { composeGroupProjectDoc, DEFAULT_PROJECT_DOC } from '../../project-doc-compose.js';
+import { unknownToolNames } from '../../test-utils/runner-tools.js';
 import type { AgentGroup } from '../../types.js';
 import { setSchedulingPreference } from '../gws-ea-preferences/db.js';
 import { reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
@@ -52,7 +53,7 @@ const REQUIRED_GUIDANCE = [
   'Report how each meeting ends through `meeting_outcome`, once.',
   'Book only a time someone agreed to: `meeting_book` itself tells main.',
   "When you are asked to arrange a meeting in a thread that isn't about scheduling, send nothing in it and report not-scheduling.",
-  'A conversation brief asks you to answer a thread',
+  'A conversation brief asks you to answer a thread: answer it from the brief, and stay with it for their follow-ups within the brief.',
   'Report `done` once it needs nothing more from you, after your last email has gone.',
   'After settled, done, not-scheduling, or gave-up, the conversation is closed: send nothing more in it.',
   'You are `external-email`, the part of the assistant that writes to people other than the principal.',
@@ -86,6 +87,7 @@ const REQUIRED_GUIDANCE = [
   // Invitations by judgment (R46).
   'write the invitation a thoughtful assistant would',
   'a Meet link when a video call suits and nobody named one',
+  'Follow what your brief says main wants for it.',
   // Calling off (R48).
   'tell them in one short, gracious line, and send nothing after it.',
 ];
@@ -98,6 +100,9 @@ const RETIRED_GUIDANCE = [
   'report `responded`',
   'asks for one reply',
 ];
+
+/** Backticked words the guidance uses that are not tools: an outcome it reports. */
+const NOT_TOOLS = ['done'];
 
 function group(id: string, name = 'main'): AgentGroup {
   return { id, name, folder: id, agent_provider: null, created_at: '2026-10-03T00:00:00.000Z' };
@@ -277,6 +282,10 @@ describe("external-email's project document", () => {
   it('no longer holds a rule a later release replaced', () => {
     const guidance = fs.readFileSync(path.resolve(GUIDANCE_PATH), 'utf8');
     for (const line of RETIRED_GUIDANCE) expect(guidance, line).not.toContain(line);
+  });
+
+  it('names no tool the agent does not have', () => {
+    expect(unknownToolNames(fs.readFileSync(path.resolve(GUIDANCE_PATH), 'utf8'), NOT_TOOLS)).toEqual([]);
   });
 });
 

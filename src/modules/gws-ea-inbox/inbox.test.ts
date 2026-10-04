@@ -860,7 +860,10 @@ describe('inbound triage (U17)', () => {
     expect(note.text).toMatch(/<<<EXTERNAL_UNTRUSTED_CONTENT[^]*Can we find 30 minutes with Pat[^]*END_EXTERNAL/);
     expect(note.text).toContain('close');
     const threadKey = String(note.note?.thread_key);
-    expect(note.text).toContain(threadKey);
+    expect(note.text).toContain(`meeting_arrange with thread_key ${threadKey}`);
+    expect(note.text).toMatch(/\bemail_respond\b[^]*\bemail_dismiss\b/u);
+    // What reaches the principal is main's judgment, not the note's.
+    expect(note.text).not.toMatch(/tell the principal/iu);
     expect(await getThreadParticipants(threadKey)).toMatchObject({
       origin: 'inbound',
       state: 'awaiting-arrange',
@@ -1011,7 +1014,7 @@ describe('inbound triage (U17)', () => {
       from: PRINCIPAL,
     });
     expect(note.text).toContain('Robin, please find 30 minutes for us.');
-    expect(note.text).toContain(`arrange with thread_key ${threadKey}`);
+    expect(note.text).toContain(`meeting_arrange with thread_key ${threadKey}`);
     expect(notes('gws-ea-inbox.copy-in')).toEqual([]);
 
     const { session, released } = await takeOver(threadKey);
@@ -1107,6 +1110,7 @@ describe('inbound triage (U17)', () => {
       people: [SAM, LEE],
     });
     expect(held.text).toMatch(/<<<EXTERNAL_UNTRUSTED_CONTENT[^]*Adding Lee[^]*END_EXTERNAL/);
+    expect(held.text).toMatch(/\bmeeting_arrange\b[^]*\bemail_respond\b[^]*\bemail_dismiss\b/u);
     expect((await getThreadParticipants(threadKey))?.people).toEqual({ to: [SAM], cc: [LEE], bcc: [] });
 
     const { session, released } = await takeOver(threadKey);
@@ -1208,8 +1212,8 @@ describe('a thread the principal copies Robin into (F1)', () => {
     expect(copyIn.text).toContain('Adding my assistant to find time for us.');
     expect(copyIn.note).toMatchObject({ participants: [SALES] });
     const threadKey = String(copyIn.note?.thread_key);
-    expect(copyIn.text).toContain(`arrange with thread_key ${threadKey}`);
-    expect(copyIn.text).toMatch(/respond[^]*dismiss/);
+    expect(copyIn.text).toContain(`meeting_arrange with thread_key ${threadKey}`);
+    expect(copyIn.text).toMatch(/\bemail_respond\b[^]*\bemail_dismiss\b/u);
     expect(copyIn.text).not.toMatch(/can't take it on/);
 
     gmail.receive({
@@ -1667,7 +1671,7 @@ describe("the principal's email answered by email (U19)", () => {
       gmail_thread_id: 'g-pat',
       from: PRINCIPAL,
     });
-    expect(note.text).toContain(`reply_to_principal`);
+    expect(note.text).toContain('email_reply_to_principal');
     expect(note.text).toContain(id);
 
     const sentId = await sendPrincipalReply({

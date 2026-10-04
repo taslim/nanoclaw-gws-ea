@@ -116,11 +116,20 @@ describe('the principal', () => {
         ),
       },
     ],
+    [
+      'a DMARC pass whose only DKIM pass is a subdomain’s',
+      {
+        results: results('principal.example', 'google').replace(
+          'header.i=@principal.example',
+          'header.i=@news.principal.example',
+        ),
+      },
+    ],
     ['a differing Sender', { extra: [{ name: 'Sender', value: 'Bulk <bulk@principal.example>' }] }],
     ['a List-Id', { extra: [{ name: 'List-Id', value: '<team.principal.example>' }] }],
     ['two From mailboxes', { from: `${PRINCIPAL}, other@principal.example` }],
-  ])('is not recognized from %s', (_label, options) => {
-    expect(authenticateSender(message(options), CONTEXT).kind).not.toBe('principal');
+  ])('is unauthenticated, never an ordinary sender, with %s', (_label, options) => {
+    expect(authenticateSender(message(options), CONTEXT).kind).toBe('unauthenticated');
   });
 
   it.each([
@@ -135,16 +144,10 @@ describe('the principal', () => {
     });
   });
 
-  it('is never taken for anyone else when it cannot be verified', () => {
-    expect(
-      authenticateSender(message({ results: results('principal.example', 'google', 'fail', 'fail') }), CONTEXT),
-    ).toMatchObject({ kind: 'unauthenticated', address: PRINCIPAL });
-  });
-
-  it('is not recognized when a non-Gmail header sits above the topmost result', () => {
+  it('is unauthenticated when a non-Gmail header sits above the topmost result', () => {
     const headers = message();
     headers.unshift({ name: 'X-Injected', value: 'yes' });
-    expect(authenticateSender(headers, CONTEXT).kind).not.toBe('principal');
+    expect(authenticateSender(headers, CONTEXT).kind).toBe('unauthenticated');
   });
 });
 
@@ -163,9 +166,13 @@ describe('Google Calendar notifications', () => {
   it.each<[string, MessageOptions]>([
     ['no DMARC pass', { results: results('google.com', '20230601', 'fail') }],
     ['a pass for another domain', { results: results('evil.example', 's1') }],
+    [
+      'a DMARC pass whose only DKIM pass is another domain’s',
+      { results: results('google.com', '20230601').replace('header.i=@google.com', 'header.i=@mailer.example') },
+    ],
     ['a differing Sender', { extra: [{ name: 'Sender', value: 'someone@google.com' }] }],
-  ])('are not recognized with %s', (_label, options) => {
-    expect(authenticateSender(notification(options), CONTEXT).kind).not.toBe('calendar-notification');
+  ])('are unauthenticated, never an ordinary sender, with %s', (_label, options) => {
+    expect(authenticateSender(notification(options), CONTEXT).kind).toBe('unauthenticated');
   });
 });
 

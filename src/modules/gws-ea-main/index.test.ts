@@ -9,6 +9,7 @@ import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../
 import { getHostStartCallbacks } from '../../host-lifecycle.js';
 import { composeGroupProjectDoc } from '../../project-doc-compose.js';
 import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
+import { unknownToolNames } from '../../test-utils/runner-tools.js';
 import type { AgentGroup } from '../../types.js';
 import { reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import { GUIDANCE_PATH, MAIN_SHARED_SKILLS } from './index.js';
@@ -50,6 +51,7 @@ const REQUIRED_GUIDANCE = [
   'When the principal asks about patterns or habits in their schedule, run the schedule statistics tool before you answer.',
   'Sound like a trusted colleague: warm and professional, confident without hedging',
   'Learn scheduling preferences with the schedule statistics tool',
+  'A weekday with no meetings is no proof of a day off, so ask before recording one.',
   'Scheduling preferences (working hours, protected windows, meeting lengths, buffers, preferred times) go in their typed store',
   'Other standing instructions (how to address the principal, how to handle a kind of request, what to always or never do) go in your persona file',
   'Send the principal a link only when all of these hold:',
@@ -125,6 +127,7 @@ const REQUIRED_GUIDANCE = [
   'Email allows a wait.',
   'never just to acknowledge or to say you are checking',
   '`external-email` stays with a conversation for the other side',
+  'The note that it ended needs nothing from you.',
   'with `email_dismiss`: an open thread keeps holding its later mail for you.',
   // Invitations (R7, R16, Key Decisions).
   'When a note reports a new or changed event, read the event from the calendar before you act.',
@@ -140,6 +143,7 @@ const REQUIRED_GUIDANCE = [
   'weigh which commitment matters more to the principal, and settle it yourself',
   'When the invitation matters less, decline it, and tell the principal what you declined and why.',
   'A time the assistant holds while it arranges a meeting gives way to a real invitation.',
+  'When the conflict check lists only such holds, the invitation conflicts with nothing, and the host keeps the holds: never move or delete one yourself.',
   'ask its organizer for one with `meeting_reschedule`',
   'To settle a conflict, move or remove only an event you created that no one else attends.',
   "For anything else of the principal's, ask them.",
@@ -174,6 +178,9 @@ const RETIRED_GUIDANCE = [
   'tell the principal in one line, without the back-and-forth',
   'When the host reports that a reply went out',
 ];
+
+/** Backticked words the guidance uses that are not tools: main's own name, request fields, and a preference's sources. */
+const NOT_TOOLS = ['main', 'copy_principal', 'invitation', 'answer', 'making_room_for', 'note', 'principal', 'learned'];
 
 function group(id: string, name = 'main'): AgentGroup {
   return { id, name, folder: id, agent_provider: null, created_at: '2026-09-30T00:00:00.000Z' };
@@ -266,6 +273,10 @@ describe("GWS-EA's guidance for main", () => {
     expect(GUIDANCE).not.toMatch(/https?:\/\//i);
     expect(GUIDANCE).not.toMatch(/\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/);
     expect(GUIDANCE).not.toMatch(/[\u{1F300}-\u{1FAFF}]/u);
+  });
+
+  it('names no tool the agent does not have', () => {
+    expect(unknownToolNames(GUIDANCE, NOT_TOOLS)).toEqual([]);
   });
 
   it('no longer forbids answering invitations or scheduling with other people', () => {
