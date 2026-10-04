@@ -4,7 +4,7 @@
  * says about itself:
  *
  * - `main` alone hands meetings and replies over, changes or cancels them,
- *   dismisses a thread waiting for it, and answers the principal by email;
+ *   and dismisses a thread waiting for it;
  * - `external-email` alone reports an outcome, asks main about a meeting,
  *   uses a meeting's calendar tools, or places the people its replies go
  *   to, and only for the meeting
@@ -28,9 +28,7 @@ export const meetingRequestAction = defineGuardedAction({
   decide: async ({ actor }) => {
     const mainAgentGroupId = await getMainAgentGroupId();
     if (actor.kind !== 'agent' || mainAgentGroupId === null || actor.agentGroupId !== mainAgentGroupId) {
-      return DENY(
-        'Only main hands work to external-email, changes or cancels it, dismisses a thread, or answers the principal by email.',
-      );
+      return DENY('Only main hands work to external-email, changes or cancels it, or dismisses a thread.');
     }
     return ALLOW("main, by the profile's pointer");
   },

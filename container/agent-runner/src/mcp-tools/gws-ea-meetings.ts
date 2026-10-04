@@ -9,8 +9,7 @@
  *   event someone else organizes), and changes one with `meeting_amend` or
  *   `meeting_cancel`; `meeting_cancel` also calls off an event the principal
  *   organizes with others. It answers a thread waiting for it with
- *   `email_respond`, closes one with `email_dismiss`, and answers the
- *   principal's own email with `email_reply_to_principal`.
+ *   `email_respond`, and closes one with `email_dismiss`.
  * - `external-email` (capability `gws-ea-meetings-external`) offers the
  *   principal's times with `meeting_free_time`, holds exactly the times it
  *   offers with `meeting_hold`, books the one agreed with `meeting_book`
@@ -425,24 +424,6 @@ export const dismiss = requestTool({
   repeatable: true,
 });
 
-export const replyToPrincipal = requestTool({
-  name: 'email_reply_to_principal',
-  description:
-    "Answer an email the principal sent you, by email, in their thread. It goes to the principal alone, from the assistant's address.",
-  properties: {
-    gmail_message_id: {
-      type: 'string',
-      description: 'The Gmail message id from the note about the principal’s email.',
-    },
-    text: {
-      type: 'string',
-      description: 'Your answer, as plain text, written to the principal. Line breaks are kept.',
-    },
-  },
-  required: { gmail_message_id: 'string', text: 'string' },
-  repeatable: false,
-});
-
 // ---------------------------------------------------------------------------
 // external-email's calendar tools
 // ---------------------------------------------------------------------------
@@ -570,5 +551,5 @@ export const outcome = requestTool({
     OUTCOMES.some((value) => value === args.outcome) ? undefined : `outcome must be one of ${OUTCOMES.join(', ')}`,
 });
 
-registerTools([arrange, reschedule, cancel, amend, respond, dismiss, replyToPrincipal], MAIN_CAPABILITY);
+registerTools([arrange, reschedule, cancel, amend, respond, dismiss], MAIN_CAPABILITY);
 registerTools([freeTime, hold, book, askMain, recipients, outcome], EXTERNAL_CAPABILITY);

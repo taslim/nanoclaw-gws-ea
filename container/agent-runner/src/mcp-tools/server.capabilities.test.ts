@@ -39,7 +39,6 @@ const ALL = [
 /** main's meeting tools, which `gws-ea-meetings` grants. */
 const MAIN_MEETING_TOOLS = [
   'email_dismiss',
-  'email_reply_to_principal',
   'email_respond',
   'meeting_amend',
   'meeting_arrange',

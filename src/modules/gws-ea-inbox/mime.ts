@@ -422,11 +422,6 @@ export interface OutgoingMail {
 /** What every email's headers say about who it is from and to, and where it sits in its thread. */
 type Addressing = Omit<OutgoingMail, 'text' | 'html' | 'attachments'>;
 
-/** Slice 2's plain-text reply, which outbound sends until it sends rendered email through `buildMime`. */
-export interface OutboundMime extends Addressing {
-  readonly text: string;
-}
-
 /** The longest line written: RFC 2045 holds encoded lines to 76 characters, and headers fold to the same. */
 const MAX_LINE = 76;
 /** UTF-8 bytes per RFC 2047 encoded word, so a header's name and its first word fit on one line. */
@@ -643,21 +638,6 @@ export function buildMime(mail: OutgoingMail): string {
   const files = mail.attachments ?? [];
   const root = files.length === 0 ? body : multipart('mixed', [body, ...files.map(attachmentEntity)]);
   return serialize({ headers: [...headers, ...root.headers], body: root.body });
-}
-
-/** A plain-text message, as the RFC 822 text `users.messages.send` takes (before base64url). */
-export function buildOutboundMime(input: OutboundMime): string {
-  const body = Buffer.from(input.text.replace(/\r\n?/gu, '\n').replace(/\n/gu, '\r\n'), 'utf8')
-    .toString('base64')
-    .replace(/.{1,76}/gu, (line) => `${line}\r\n`);
-  return serialize({
-    headers: [
-      ...addressingHeaders(input),
-      'Content-Type: text/plain; charset=UTF-8',
-      'Content-Transfer-Encoding: base64',
-    ],
-    body,
-  });
 }
 
 /** The `raw` field `users.messages.send` takes. */

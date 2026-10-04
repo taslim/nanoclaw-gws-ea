@@ -4,8 +4,8 @@
  * to hold, and the typed requests that carry them.
  *
  *   - `main` → host: `meeting_arrange`, `meeting_reschedule`,
- *     `meeting_cancel`, `meeting_amend`, `email_respond`, `email_dismiss`,
- *     and `email_reply_to_principal`.
+ *     `meeting_cancel`, `meeting_amend`, `email_respond`, and
+ *     `email_dismiss`.
  *   - `external-email` → host: `meeting_free_time`, `meeting_hold`,
  *     `meeting_book` (`calendar-actions.ts`), `meeting_ask_main`,
  *     `email_recipients`, and `meeting_outcome`.
@@ -80,7 +80,7 @@ const MEETINGS_CAPABILITY = 'gws-ea-meetings';
 
 registerCapability(MEETINGS_CAPABILITY, {
   description:
-    'meeting_arrange, meeting_reschedule, meeting_cancel, meeting_amend, email_respond, email_dismiss, email_reply_to_principal: hand scheduling jobs and answers to external-email, which carries them out by email, close threads, and answer the principal by email',
+    'meeting_arrange, meeting_reschedule, meeting_cancel, meeting_amend, email_respond, email_dismiss: hand scheduling jobs and answers to external-email, which carries them out by email, and close threads',
   default: 'on',
   instructions: [MEETINGS_CAPABILITY],
 });
@@ -160,7 +160,6 @@ const REQUESTS: ReadonlyArray<readonly [string, Handle, GuardedAction]> = [
   ['meeting_amend', handoff.amend, meetingRequestAction],
   ['email_respond', handoff.respond, meetingRequestAction],
   ['email_dismiss', handoff.dismiss, meetingRequestAction],
-  ['email_reply_to_principal', handoff.replyToPrincipal, meetingRequestAction],
   // external-email's question, its outcome, its recipients, and its calendar tools
   ['meeting_ask_main', handoff.askMain, meetingAskAction],
   ['meeting_outcome', handoff.outcome, meetingOutcomeAction],

@@ -1,43 +1,56 @@
 /**
  * The exactly-once send every email from the assistant shares (KTD5).
  *
- * Before Gmail is called, the caller stores a pending send with a
- * Message-ID allocated for it (`newMessageId`). A retry of the same send
- * finds that record, and asks Gmail whether it already holds the message
- * (`findSent`): under that Message-ID, or under X-Google-Original-Message-ID
- * when Gmail replaced it. Gmail errors back off a few seconds within one
- * attempt, checking Gmail for the message before each retry
- * (`sendWithBackoff`); anything longer goes back to delivery's own retries.
- * Once Gmail holds it, the IDs replies will answer are read back from Gmail
- * (`readBackMessageIds`).
+ * `sendExactlyOnce` stores a pending send with a Message-ID allocated for it
+ * (`newMessageId`) before Gmail is called, on the thread's side of the send
+ * ledger (thread-map.ts). A retry of the same send finds that record, and
+ * asks Gmail whether it already holds the message (`findSent`): under that
+ * Message-ID, or under X-Google-Original-Message-ID when Gmail replaced it.
+ * Gmail errors back off a few seconds within one attempt, checking Gmail for
+ * the message before each retry (`sendWithBackoff`); anything longer goes
+ * back to the caller's own retries. Once Gmail holds it, the Message-ID
+ * replies will answer is read back from Gmail and the send becomes the
+ * thread's message (`completeSend`).
+ *
+ * Two sends are the same send when they are the same words on the same side
+ * of a thread, or the same `email_send` request (`sendKey`).
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { log } from '../../log.js';
 import { getGwsEaProfile } from '../gws-ea-profile/db.js';
 import { GoogleApiError, RECONCILIATION_HEADERS, type GmailApi } from './gmail-api.js';
-import { headerValues, messageIdsOf, type Mailbox } from './mime.js';
+import { domainOf, headerValues, messageIdsOf, newMessageId, type Mailbox } from './mime.js';
 import type { InboxRuntime } from './runtime.js';
+import { findSend, insertPendingSend, recordSent, type NewSend, type SendScope } from './thread-map.js';
 
 /** How long to wait before each retry of a Gmail send that failed on Gmail's side. */
-export const SEND_BACKOFF_MS: readonly number[] = [1_000, 3_000];
+const SEND_BACKOFF_MS: readonly number[] = [1_000, 3_000];
 /** The most Message-IDs an email's References names. */
 export const MAX_REFERENCES = 20;
 /** Recently sent messages checked when Gmail search cannot find a pre-allocated ID. */
 const RECENT_SENT_CHECKED = 10;
 
-/** The text of an email as the agent wrote it; anything else is not something email can carry. */
-export function replyText(content: unknown): string {
-  if (typeof content === 'string') return content;
-  if (typeof content === 'object' && content !== null && typeof (content as { text?: unknown }).text === 'string') {
-    return (content as { text: string }).text;
-  }
-  throw new Error('The email channel sends text replies only');
+/** What an email says: an agent's words, and the `email_send` request that asked for it, if one did. */
+export interface EmailWords {
+  readonly text: string;
+  /** The request's id: each request is its own send, whatever its words. */
+  readonly request?: string;
 }
 
-/** What makes two sends in one thread the same send: their words. */
-export function contentHash(threadKey: string, text: string): string {
-  return createHash('sha256').update(threadKey).update('\u0000').update(text).digest('hex');
+/** The words of an email as a row carries them; undefined for anything email cannot carry. */
+export function emailWords(content: unknown): EmailWords | undefined {
+  if (typeof content !== 'object' || content === null) return undefined;
+  const { text, request } = content as { text?: unknown; request?: unknown };
+  if (typeof text !== 'string' || (request !== undefined && typeof request !== 'string')) return undefined;
+  return request === undefined ? { text } : { text, request };
+}
+
+/** What makes two sends on one side of a thread the same send: their words, or the request that asked for them. */
+export function sendKey(threadKey: string, words: EmailWords): string {
+  const hash = createHash('sha256').update(threadKey).update('\u0000').update(words.text);
+  if (words.request !== undefined) hash.update('\u0000').update(words.request);
+  return hash.digest('hex');
 }
 
 /** The assistant as every email it sends names it. */
@@ -56,7 +69,7 @@ function holdsId(headers: readonly { name: string; value: string }[], rfcMessage
 }
 
 /** The sent message carrying `rfcMessageId`, under either header, or undefined. */
-export async function findSent(
+async function findSent(
   gmail: GmailApi,
   rfcMessageId: string,
   gmailThreadId: string | null,
@@ -84,7 +97,7 @@ export async function findSent(
 }
 
 /** Send `raw`, retrying Gmail's own failures briefly, and never twice once Gmail holds it. */
-export async function sendWithBackoff(
+async function sendWithBackoff(
   runtime: InboxRuntime,
   raw: string,
   rfcMessageId: string,
@@ -108,12 +121,74 @@ export async function sendWithBackoff(
  * The Message-IDs Gmail holds for a sent message, its Message-ID first: the
  * ones replies will answer. Empty when Gmail cannot be read back now.
  */
-export async function readBackMessageIds(gmail: GmailApi, gmailMessageId: string): Promise<string[]> {
+async function readBackMessageIds(gmail: GmailApi, gmailMessageId: string): Promise<string[]> {
   const copy = await gmail.getMessage(gmailMessageId, 'metadata').catch((error: unknown) => {
     log.warn('Could not read back a sent email to learn its Message-ID', { error });
     return undefined;
   });
   return RECONCILIATION_HEADERS.flatMap((name) =>
     headerValues(copy?.payload?.headers ?? [], name).flatMap((value) => messageIdsOf(value)),
+  );
+}
+
+/** Gmail holds the send: record it as the thread's on its side, by the Message-ID replies will answer. */
+async function completeSend(
+  runtime: InboxRuntime,
+  send: NewSend,
+  sent: { readonly id: string; readonly threadId: string },
+  at: string,
+): Promise<string> {
+  const [held] = await readBackMessageIds(runtime.gmail, sent.id);
+  await recordSent(
+    send,
+    { gmailMessageId: sent.id, gmailThreadId: sent.threadId, rfcMessageId: held ?? send.rfcMessageId },
+    at,
+  );
+  log.info('Email sent', { threadKey: send.scope.threadKey, side: send.scope.side, gmailMessageId: sent.id });
+  return sent.id;
+}
+
+/** An email ready to go: the Gmail thread it joins, and its raw form under the Message-ID it is sent with. */
+export interface PreparedSend {
+  readonly gmailThreadId: string | null;
+  raw(rfcMessageId: string): Promise<string>;
+}
+
+/**
+ * Send one email on one side of a thread, exactly once; returns Gmail's id
+ * for it. `prepare` checks and builds it, and runs only when Gmail does not
+ * already hold it as this send; whatever it throws, nothing is sent.
+ */
+export async function sendExactlyOnce(
+  runtime: InboxRuntime,
+  scope: SendScope,
+  key: string,
+  prepare: () => Promise<PreparedSend>,
+): Promise<string> {
+  const existing = await findSend(scope, key);
+  // Gmail took this send, but its delivery was never recorded: answer from the record.
+  if (existing?.state === 'sent') return existing.gmailMessageId;
+  const prepared = await prepare();
+  const at = runtime.now().toISOString();
+  let send: NewSend;
+  if (existing === undefined) {
+    send = {
+      id: randomUUID(),
+      scope,
+      contentHash: key,
+      rfcMessageId: newMessageId(domainOf(await runtime.gmailAddress())),
+    };
+    await insertPendingSend(send, at);
+  } else {
+    const found = await findSent(runtime.gmail, existing.rfcMessageId, prepared.gmailThreadId);
+    if (found) return completeSend(runtime, existing, found, at);
+    send = existing;
+  }
+  const raw = await prepared.raw(send.rfcMessageId);
+  return completeSend(
+    runtime,
+    send,
+    await sendWithBackoff(runtime, raw, send.rfcMessageId, prepared.gmailThreadId),
+    at,
   );
 }

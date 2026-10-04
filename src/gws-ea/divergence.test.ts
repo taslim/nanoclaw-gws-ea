@@ -468,11 +468,11 @@ describe('recorded divergence: Google Chat gives the agent the message a princip
       hook?.({
         chat: {
           messagePayload: {
-            message: { quotedMessageMetadata: { quotedMessageSnapshot: { sender: 'Robin', text: 'Lunch at 1?' } } },
+            message: { quotedMessageMetadata: { quotedMessageSnapshot: { sender: 'Juno', text: 'Lunch at 1?' } } },
           },
         },
       }),
-    ).toEqual({ sender: 'Robin', text: 'Lunch at 1?' });
+    ).toEqual({ sender: 'Juno', text: 'Lunch at 1?' });
   });
 });
 
@@ -557,6 +557,67 @@ describe('recorded divergence: an adapter learns whether its inbound message was
     expect(body).toContain('return inboundReady');
     expect(body).toContain("log.error('Failed to route inbound message'");
     expect(body).toMatch(/log\.error\('Failed to route inbound message'[^;]*;\s*throw err;/);
+  });
+});
+
+describe('recorded divergence: a module can hold an inbound message until a time it names', () => {
+  it("writes the time as the row's process_after, leaves its wake to the sweep, and reads back what waits", async () => {
+    await freshInstall();
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    const createdAt = new Date().toISOString();
+    await db.createAgentGroup({
+      id: 'ag-1',
+      name: 'Main',
+      folder: 'main',
+      agent_provider: null,
+      created_at: createdAt,
+    });
+    await db.createMessagingGroup({
+      id: 'mg-1',
+      channel_type: 'gchat',
+      platform_id: 'gchat:spaces/dm',
+      name: 'Principal',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: createdAt,
+    });
+    await db.createMessagingGroupAgent({
+      id: 'mga-1',
+      messaging_group_id: 'mg-1',
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: createdAt,
+    });
+    await import('../mailbox/compose.js');
+    const router = await import('../router.js');
+    const { findSessionForAgent } = await import('../db/sessions.js');
+    const { withExistingMailboxSession } = await import('../session-manager.js');
+    const until = new Date(Date.now() + 4 * 60_000).toISOString();
+    router.registerInboundDelay((event) => (event.message.id === 'held' ? until : null));
+    const inbound = (id: string): InboundEvent => ({
+      channelType: 'gchat',
+      platformId: 'gchat:spaces/dm',
+      threadId: null,
+      message: { id, kind: 'chat', content: '{"text":"hello"}', timestamp: createdAt, isMention: true, isGroup: false },
+    });
+    external.requestWake.mockClear();
+
+    await router.routeInbound(inbound('held'));
+    expect(external.requestWake).not.toHaveBeenCalled();
+    await router.routeInbound(inbound('due'));
+    expect(external.requestWake).toHaveBeenCalledOnce();
+
+    const session = await findSessionForAgent('ag-1', 'mg-1', null);
+    expect(
+      await withExistingMailboxSession('ag-1', session?.id ?? '', (mailbox) => mailbox.getWaitingMessages()),
+    ).toEqual([{ id: 'held:ag-1', tries: 0, processAfter: until }]);
   });
 });
 

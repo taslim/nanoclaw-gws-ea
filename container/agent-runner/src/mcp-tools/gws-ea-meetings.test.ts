@@ -20,7 +20,6 @@ import {
   MEETING_REQUEST_TIMEOUT_MS,
   outcome,
   recipients,
-  replyToPrincipal,
   reschedule,
   respond,
 } from './gws-ea-meetings.js';
@@ -168,7 +167,6 @@ describe('the meeting tools', () => {
         { thread_key: 'mail-inbound-1', purpose: 'Route to the press team', constraints: 'Keep it short.' },
       ],
       [dismiss, 'email_dismiss', { thread_key: 'mail-inbound-1' }],
-      [replyToPrincipal, 'email_reply_to_principal', { gmail_message_id: '18c2f0a1b2', text: 'Done.\nIt is at 4.' }],
       [recipients, 'email_recipients', { meeting_id: 'mtg-1', to: ['sales@acme.example'] }],
       [
         recipients,
@@ -243,8 +241,6 @@ describe('the meeting tools', () => {
       [respond, { thread_key: 'mail-inbound-1' }, /purpose is required/],
       [respond, { purpose: 'Decline kindly' }, /thread_key is required/],
       [dismiss, {}, /thread_key is required/],
-      [replyToPrincipal, { gmail_message_id: '18c2f0a1b2' }, /text is required/],
-      [replyToPrincipal, { text: 'Done.' }, /gmail_message_id is required/],
       [recipients, { meeting_id: 'mtg-1' }, /to is required/],
       [recipients, { meeting_id: 'mtg-1', to: [] }, /Put at least one address on to/],
       [
@@ -321,7 +317,6 @@ describe('a request the host is slow to answer', () => {
 
   it('says not to repeat a request that would send an email or call a meeting off twice', async () => {
     for (const [tool, args] of [
-      [replyToPrincipal, { gmail_message_id: '18c2f0a1b2', text: 'Done.' }],
       [respond, { thread_key: 'mail-inbound-1', purpose: 'Decline kindly' }],
       [cancel, { meeting_id: 'mtg-1' }],
     ] as const) {

@@ -5,7 +5,6 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildMime,
-  buildOutboundMime,
   decodeEncodedWords,
   parseAddressList,
   parseGmailMessage,
@@ -215,81 +214,6 @@ describe('a Gmail message', () => {
       },
     });
     expect(mail.text).toBe('Hi\nthere & you');
-  });
-});
-
-describe('a reply', () => {
-  const base = {
-    from: { address: 'juno@assistant.example', displayName: 'Juno' },
-    subject: 'Re: Café plans',
-    messageId: '<gws-ea.1@assistant.example>',
-    inReplyTo: '<a@acme.example>',
-    references: ['<c@acme.example>', '<a@acme.example>'],
-    text: 'Tuesday at 10:00 works.\nSee you then.',
-    date: new Date('2026-10-07T17:00:00.000Z'),
-  };
-
-  function headerNames(raw: string): string[] {
-    return raw
-      .slice(0, raw.indexOf('\r\n\r\n'))
-      .split('\r\n')
-      .filter((line) => !/^[ \t]/.test(line))
-      .map((line) => line.slice(0, line.indexOf(':')));
-  }
-
-  it('is plain text in its thread, with no quote, and no Cc or Bcc when nobody is placed there', () => {
-    const raw = buildOutboundMime({ ...base, to: ['sam@acme.example', 'pat@principal.example'], cc: [], bcc: [] });
-    expect(raw).toContain('From: Juno <juno@assistant.example>\r\n');
-    expect(raw).toContain('To: sam@acme.example, pat@principal.example\r\n');
-    expect(raw).toContain('Subject: =?UTF-8?B?');
-    expect(raw).toContain('Message-ID: <gws-ea.1@assistant.example>\r\n');
-    expect(raw).toContain('In-Reply-To: <a@acme.example>\r\n');
-    expect(raw).toContain('References: <c@acme.example> <a@acme.example>\r\n');
-    expect(raw).toContain('Content-Type: text/plain; charset=UTF-8\r\n');
-    expect(raw).not.toMatch(/^(Cc|Bcc):/im);
-    const body = raw.slice(raw.indexOf('\r\n\r\n') + 4);
-    expect(Buffer.from(body.replace(/\r\n/g, ''), 'base64').toString('utf8')).toBe(
-      'Tuesday at 10:00 works.\r\nSee you then.',
-    );
-  });
-
-  it('writes To, Cc, and Bcc with the other addressing headers, before the MIME headers Gmail stops reading at', () => {
-    const raw = buildOutboundMime({
-      ...base,
-      to: ['sam@acme.example'],
-      cc: ['ari@acme.example', 'lee@acme.example'],
-      bcc: ['pat@principal.example'],
-    });
-    expect(raw).toContain('To: sam@acme.example\r\n');
-    expect(raw).toContain('Cc: ari@acme.example, lee@acme.example\r\n');
-    expect(raw).toContain('Bcc: pat@principal.example\r\n');
-    const names = headerNames(raw);
-    expect(names.indexOf('Bcc')).toBeLessThan(names.indexOf('MIME-Version'));
-    expect(names.indexOf('Cc')).toBeLessThan(names.indexOf('Content-Type'));
-  });
-
-  it('can go to Cc alone, never to no one, and never to something that is not an address', () => {
-    expect(buildOutboundMime({ ...base, to: [], cc: ['ari@acme.example'], bcc: [] })).not.toMatch(/^To:/im);
-    expect(() => buildOutboundMime({ ...base, to: [], cc: [], bcc: [] })).toThrow(/at least one recipient/);
-    expect(() =>
-      buildOutboundMime({ ...base, to: ['sam@acme.example'], cc: [], bcc: ['x>, eve@evil.example'] }),
-    ).toThrow(/Not an email address/);
-  });
-
-  it('cannot be given extra headers through a value', () => {
-    const raw = buildOutboundMime({
-      from: { address: 'juno@assistant.example' },
-      to: ['sam@acme.example'],
-      cc: [],
-      bcc: [],
-      subject: 'Hi\r\nBcc: eve@evil.example',
-      messageId: '<x@assistant.example>',
-      references: [],
-      text: 'Hi',
-      date: new Date(),
-    });
-    expect(raw).not.toMatch(/^Bcc:/im);
-    expect(raw).toContain('Subject: Hi Bcc: eve@evil.example\r\n');
   });
 });
 

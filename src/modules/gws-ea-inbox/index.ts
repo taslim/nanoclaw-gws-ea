@@ -10,8 +10,10 @@
  *   for its thread (`email:inbox`).
  * - `main`'s replies leave through ordinary delivery to the principal alone,
  *   which the audience check resolves to the same address
- *   (principal-reply.ts). A thread's replies go to everyone on it
- *   (outbound.ts, recipients.ts).
+ *   (principal-reply.ts). `external-email`'s go to everyone on its thread,
+ *   or to whom it names among the thread's addresses (outbound.ts,
+ *   recipients.ts). `email_send` lets either write in a thread at any time,
+ *   each by its own rules.
  * - Mail is the principal's only when Gmail verified that the domain of one
  *   of their addresses sent it (authentication.ts).
  *
@@ -25,7 +27,7 @@ import { registerChannelAdapter } from '../../channels/channel-registry.js';
 import { register } from '../../cli/registry.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
-import { registerDeliveryFailedHook, registerPostDeliveryHook } from '../../delivery.js';
+import { registerDeliveryAction, registerDeliveryFailedHook, registerPostDeliveryHook } from '../../delivery.js';
 import { readEnvFile } from '../../env.js';
 import { onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
@@ -44,17 +46,18 @@ import {
 import { registerRecipientResolver } from '../gws-ea-privacy/index.js';
 import { getMainAgentGroupId, syncPrincipalMembers } from '../gws-ea-profile/db.js';
 import { registerRoleGrantPolicy } from '../permissions/db/user-roles.js';
+import { registerInboundDelay } from '../../router.js';
 import { createInbox, EMAIL_CHANNEL_DEFAULTS, type Inbox } from './adapter.js';
 import { createCalendarListApi } from './calendar-notifications.js';
-import { deleteSends } from './db.js';
 import { createGmailApi } from './gmail-api.js';
 import { gwsEaInboxEmailChannelMigration } from './migration-email-channel.js';
 import { gwsEaInboxMigration } from './migration.js';
-import { resolveRecipients } from './outbound.js';
+import { EMAIL_SEND_ACTION, EMAIL_SEND_GUARD, emailSendHandler, outsideRecipients } from './outbound.js';
+import { paceDeadline } from './pace.js';
 import { principalRecipients } from './principal-reply.js';
 import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID } from './runtime.js';
-import { contentHash, replyText } from './send.js';
-import { deleteSends as deleteThreadSends } from './thread-map.js';
+import { emailWords, sendKey } from './send.js';
+import { deleteSends, type SendScope } from './thread-map.js';
 import { ensureInbox, ensurePrincipalConversation } from './wiring-policy.js';
 
 // The inbox registers the meetings store too, unchanged, so the email channel's
@@ -88,8 +91,10 @@ registerChannelAdapter(EMAIL_CHANNEL_TYPE, {
 });
 
 registerRecipientResolver(EMAIL_CHANNEL_TYPE, (send) =>
-  send.platformId === PRINCIPAL_PLATFORM_ID ? principalRecipients(send) : resolveRecipients(send),
+  send.platformId === PRINCIPAL_PLATFORM_ID ? principalRecipients(send) : outsideRecipients(send),
 );
+
+registerDeliveryAction(EMAIL_SEND_ACTION, emailSendHandler, EMAIL_SEND_GUARD);
 
 // A mail sender is only as trustworthy as the domain behind it, so no email
 // identity may hold a privilege: commands and approvals stay with chat users
@@ -98,29 +103,36 @@ registerRoleGrantPolicy('gws-ea-inbox:no-email-privilege', (grant) =>
   grant.user_id.startsWith(`${EMAIL_CHANNEL_TYPE}:`) ? 'an email identity never holds owner or admin' : undefined,
 );
 
-/** The send record of a row the channel sent: a thread's reply, or `main`'s reply to the principal. */
-function emailSend(
-  msg: OutboundMessage,
-): { readonly to: 'inbox' | 'principal'; readonly threadKey: string; readonly hash: string } | undefined {
+// An outside thread is worked at a human pace: what reaches its session waits for the thread's next turn (KTD3).
+registerInboundDelay((_event, session) => paceDeadline(session));
+
+/** The send record of a row the channel sent: an agent's email on one side of its thread. */
+function emailSend(msg: OutboundMessage): { readonly scope: SendScope; readonly key: string } | undefined {
   if (msg.channelType !== EMAIL_CHANNEL_TYPE || msg.threadId === null) return undefined;
-  const to =
-    msg.platformId === INBOX_PLATFORM_ID ? 'inbox' : msg.platformId === PRINCIPAL_PLATFORM_ID ? 'principal' : undefined;
-  if (to === undefined) return undefined;
+  const side =
+    msg.platformId === INBOX_PLATFORM_ID
+      ? 'outside'
+      : msg.platformId === PRINCIPAL_PLATFORM_ID
+        ? 'principal'
+        : undefined;
+  if (side === undefined) return undefined;
   /* eslint-disable no-catch-all/no-catch-all -- a row the inbox could never have sent has no send record */
+  let content: unknown;
   try {
-    return { to, threadKey: msg.threadId, hash: contentHash(msg.threadId, replyText(JSON.parse(msg.content))) };
+    content = JSON.parse(msg.content);
   } catch {
     return undefined;
   }
   /* eslint-enable no-catch-all/no-catch-all */
+  const words = emailWords(content);
+  return words === undefined
+    ? undefined
+    : { scope: { threadKey: msg.threadId, side }, key: sendKey(msg.threadId, words) };
 }
 
 async function forgetSend(msg: OutboundMessage, state: 'pending' | 'sent'): Promise<void> {
   const send = emailSend(msg);
-  if (send?.to === 'inbox') await deleteSends(send.threadKey, send.hash, state);
-  if (send?.to === 'principal') {
-    await deleteThreadSends({ threadKey: send.threadKey, side: 'principal' }, send.hash, state);
-  }
+  if (send !== undefined) await deleteSends(send.scope, send.key, state);
 }
 
 // Delivery recorded the email: its send record has done its job.
@@ -227,8 +239,7 @@ export {
 } from './gmail-api.js';
 export type { ThreadOrigin, ThreadPeople, ThreadState } from './db.js';
 export { getInboxHealth, type InboxHealth } from './health.js';
-export { sendPrincipalReply, type PrincipalReply } from './outbound.js';
-export type { Placement } from './recipients.js';
+export { EMAIL_SEND_ACTION } from './outbound.js';
 export { registerThreadReplyHook, type ThreadReplyHook } from './routing.js';
 export { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID } from './runtime.js';
 export {
@@ -244,6 +255,7 @@ export {
   threadAddress,
   vouchThreadPeople,
   type AuthorizeThreadInput,
+  type Placement,
   type ThreadView,
 } from './threads.js';
 export { ensureInbox, ensurePrincipalConversation, getInboxMessagingGroupId } from './wiring-policy.js';

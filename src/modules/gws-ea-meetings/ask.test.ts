@@ -56,7 +56,6 @@ import {
   PRINCIPAL,
   refusal,
   reply,
-  JUNO,
   setUpScheduling,
   slotsOf,
   tearDownScheduling,
@@ -121,40 +120,11 @@ async function offeredToAcme(window: typeof WEEK = WEEK): Promise<Offered> {
   return { stored, session };
 }
 
-/** Acme writes back in the thread. */
-async function acmeWrites(body: string): Promise<void> {
-  const [first] = scheduling.gmail.sent;
-  scheduling.gmail.receive({
-    threadId: first.threadId,
-    from: `Acme Sales <${ADDRESSES.acme}>`,
-    to: [JUNO],
-    subject: 'Re: Partnership intro',
-    body,
-  });
-  await scheduling.inbox.tick();
-}
-
 function asks(meetingId: string) {
   return notes(scheduling.main, ASK).filter((c) => c.note?.meeting_id === meetingId);
 }
 
 describe('a curveball goes to main, and nothing goes to the other side', () => {
-  it('refuses a second question while one is open, and one about a meeting called off', async () => {
-    const { stored, session } = await offeredToAcme();
-    data(await ask(session, 'meeting_ask_main', { meeting_id: stored.id, about: 'place' }));
-    expect(refusal(await ask(session, 'meeting_ask_main', { meeting_id: stored.id, about: 'time' }))).toMatch(
-      /already asked main about where or how to meet/,
-    );
-    expect(asks(stored.id)).toHaveLength(1);
-
-    // Acme was waiting on the offer, so the meeting closes with one line, which a question must not stop.
-    data(await ask(scheduling.main, 'meeting_cancel', { meeting_id: stored.id }));
-    expect((await meeting(stored.id)).state).toBe('closing');
-    expect(refusal(await ask(session, 'meeting_ask_main', { meeting_id: stored.id, about: 'time' }))).toMatch(
-      /is called off: send your one closing line, and nothing more/,
-    );
-  });
-
   it('refuses a question about a meeting that has ended', async () => {
     const answer = data(
       await ask(scheduling.main, 'meeting_arrange', {
@@ -322,30 +292,5 @@ describe('main answers a booked meeting', () => {
     expect(reminder.text).toMatch(/the booked meeting stands/);
     await reach('2026-10-09T08:02:00.000Z');
     expect(await meeting(stored.id)).toMatchObject({ state: 'booked', ask_about: null, give_up_at: null });
-  });
-});
-
-describe('a question main leaves open', () => {
-  it('reminds main once after two working days, and gives the meeting up two working days later', async () => {
-    const { stored, session } = await offeredToAcme();
-    await acmeWrites('Could we meet in person instead?');
-    data(await ask(session, 'meeting_ask_main', { meeting_id: stored.id, about: 'place' }));
-    // Acme chasing the next morning does not restart the count: it waits on main.
-    vi.setSystemTime(new Date('2026-10-06T10:00:00.000Z'));
-    await acmeWrites('Any news?');
-    expect((await meeting(stored.id)).nudge_at).toBe('2026-10-07T08:00:00.000Z');
-
-    await reach('2026-10-07T08:01:00.000Z');
-    const reminders = asks(stored.id).filter((c) => c.note?.reminder === true);
-    expect(reminders).toHaveLength(1);
-    expect(reminders[0].row.trigger).toBe(1);
-    // Nobody nudges Acme: the assistant is the one who owes an answer.
-    expect(notes(session, 'gws-ea-meetings.nudge')).toEqual([]);
-
-    await reach('2026-10-09T08:02:00.000Z');
-    expect((await meeting(stored.id)).state).toBe('gave-up');
-    const [gaveUp] = notes(scheduling.main, 'gws-ea-meetings.outcome').filter((c) => c.note?.outcome === 'gave-up');
-    expect(gaveUp.text).toMatch(/waited four working days for your answer about where or how to meet/);
-    expect(scheduling.calendar.live(PRINCIPAL).filter((event) => event.tags?.gwsEaRole === 'hold')).toEqual([]);
   });
 });

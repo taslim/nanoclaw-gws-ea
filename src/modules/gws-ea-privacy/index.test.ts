@@ -53,6 +53,7 @@ import {
   listPrivateValues,
   MAX_REFUSALS_PER_THREAD,
   registerRecipientResolver,
+  resumeThread,
   THREAD_STOPPED_SIGNAL,
 } from './index.js';
 
@@ -450,6 +451,36 @@ describe('the audience check on delivery', () => {
     expect(texts()).toEqual(['Is Thursday still good?']);
   });
 
+  it("lets main's next handoff resume a stopped thread, its refusals counted afresh (R76)", async () => {
+    await addHome();
+    const key = { ...THREAD, threadId: 'mail-1' };
+    for (let attempt = 1; attempt <= MAX_REFUSALS_PER_THREAD; attempt++) {
+      queue(external, {
+        id: `leak-${attempt}`,
+        route: THREAD,
+        threadId: key.threadId,
+        content: { text: '123 Main St' },
+      });
+      await deliverSessionMessages(external);
+    }
+    const [signal] = inbound(main).filter((row) => row.content.includes(THREAD_STOPPED_SIGNAL));
+    expect((JSON.parse(signal.content) as { text: string }).text).toMatch(/thread mail-1 .* until your next handoff/u);
+
+    expect(await resumeThread(key)).toBe(true);
+    expect(await resumeThread(key)).toBe(false);
+    queue(external, {
+      id: 'after-resume',
+      route: THREAD,
+      threadId: key.threadId,
+      content: { text: 'Is Thursday good?' },
+    });
+    queue(external, { id: 'leak-again', route: THREAD, threadId: key.threadId, content: { text: '123 Main St' } });
+    queue(external, { id: 'still-going', route: THREAD, threadId: key.threadId, content: { text: 'Or Friday?' } });
+    await deliverSessionMessages(external);
+    expect(texts()).toEqual(['Is Thursday good?', 'Or Friday?']);
+    expect(await resumeThread({ ...THREAD, threadId: 'mail-never-stopped' })).toBe(false);
+  });
+
   it('judges a retried send without its own earlier attempt', async () => {
     await addHome();
     let failures = 1;
@@ -501,6 +532,18 @@ describe('the shared check', () => {
   ])('refuses a private value in %s', async (_label, fields) => {
     await addHome();
     expect(await checkOutbound(fields, 'others')).toMatchObject({ allowed: false, kind: 'address' });
+  });
+
+  it('reads the target of every link as a mail client opens it', async () => {
+    await addHome();
+    const hidden = '[directions](https://maps.example/?q=123&#32;Main&#32;Street)';
+    expect(await checkOutbound(`Here are ${hidden}.`, 'others')).toMatchObject({ allowed: false, kind: 'address' });
+    expect(await checkOutbound('Here are [directions](https://maps.example/?q=Cafe&#32;Rosa).', 'others')).toEqual({
+      allowed: true,
+    });
+    queue(external, { id: 'link-1', route: THREAD, content: { text: `Meet me there: ${hidden}` } });
+    await deliverSessionMessages(external);
+    expect(sent).toEqual([]);
   });
 
   it('names each kind and never the value or its label', async () => {

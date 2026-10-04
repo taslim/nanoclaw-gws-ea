@@ -10,9 +10,13 @@
  *     thread's earlier outbound text, so a value split across sends is found.
  *     After `MAX_REFUSALS_PER_THREAD` refusals the thread stops: nothing more
  *     is sent in it, and main's shared session gets a typed signal, routed to
- *     the principal's direct message;
+ *     the principal's direct message. main's next handoff to the thread
+ *     resumes it (`resumeThread`);
  *   - `checkOutbound`, the same check for the host's calendar writes and
  *     main's handoff text, which never pass through a channel.
+ *
+ * Both read what the assistant wrote, and the target of every link in it as
+ * a reader's mail client opens it (`readableParts`).
  *
  * A refusal names only the value's fixed kind, never the value or its label.
  * Removing a value switches its check off, so an agent's removal waits for
@@ -20,6 +24,9 @@
  */
 import { randomUUID } from 'node:crypto';
 import { isUtf8 } from 'node:buffer';
+
+import { micromark } from 'micromark';
+import { gfm, gfmHtml } from 'micromark-extension-gfm';
 
 import { registerResource, type ColumnDef } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
@@ -45,6 +52,7 @@ import {
   judgeThreadSend,
   listPrivateValues,
   removePrivateValue,
+  resumeThreadRecord,
   type PrivateValue,
   type ThreadKey,
 } from './db.js';
@@ -119,10 +127,12 @@ function stoppingReason(kind: PrivateValueKind): string {
 const STOPPED_REASON =
   "this conversation is stopped after repeated attempts to send the principal's private details. Send nothing more in it; the principal will be told.";
 
-function stoppedSignalText(kind: PrivateValueKind, refusals: number): string {
+function stoppedSignalText(key: ThreadKey, kind: PrivateValueKind, refusals: number): string {
   return (
-    `The host stopped a conversation with someone other than the principal: the assistant tried ${refusals} times to send them the principal's private ${KIND_NOUNS[kind]}. ` +
-    'Every attempt was refused, so nothing private was sent, and nothing more will be sent in that conversation.'
+    `The host stopped ${key.threadId === null ? 'a conversation' : `thread ${key.threadId}`} with someone other than the principal: ` +
+    `the assistant tried ${refusals} times to send them the principal's private ${KIND_NOUNS[kind]}. ` +
+    'Every attempt was refused, so nothing private was sent, and nothing more will be sent in that conversation' +
+    (key.threadId === null ? '.' : ' until your next handoff to it.')
   );
 }
 
@@ -135,6 +145,26 @@ async function compiledValues(): Promise<CompiledPrivateValue[]> {
   return (await listPrivateValues()).map((value) => compilePrivateValue(value.kind, value.value));
 }
 
+const LINK_TARGET = /<a href="([^"]*)"/gu;
+const ATTRIBUTE_ESCAPES: Readonly<Record<string, string>> = { '&amp;': '&', '&quot;': '"', '&lt;': '<', '&gt;': '>' };
+
+/**
+ * The targets of a text's links, as a reader's mail client opens them:
+ * markdown's character references resolved, as its renderer resolves them.
+ * Their percent-encoding is decoded by the matcher, like every text's.
+ */
+function linkTargets(text: string): string[] {
+  const html = micromark(text, { extensions: [gfm()], htmlExtensions: [gfmHtml()] });
+  return [...html.matchAll(LINK_TARGET)]
+    .map((match) => (match[1] ?? '').replace(/&(?:amp|quot|lt|gt);/gu, (escape) => ATTRIBUTE_ESCAPES[escape] ?? escape))
+    .filter((target) => target !== '');
+}
+
+/** What readers receive of these texts: each as written, followed by its link targets. */
+function readableParts(parts: readonly string[]): string[] {
+  return parts.flatMap((part) => [part, ...linkTargets(part)]);
+}
+
 /**
  * Check text bound for `audience`: the principal may receive anything, and
  * anyone else no private value. `content` is one text, or the fields of one
@@ -144,7 +174,7 @@ async function compiledValues(): Promise<CompiledPrivateValue[]> {
 export async function checkOutbound(content: string | readonly string[], audience: Audience): Promise<OutboundCheck> {
   if (audience === 'principal') return { allowed: true };
   const parts = typeof content === 'string' ? [content] : content;
-  const match = findPrivateValue(await compiledValues(), streamOf(parts));
+  const match = findPrivateValue(await compiledValues(), streamOf(readableParts(parts)));
   return match ? { allowed: false, kind: match.kind, reason: refusalReason(match.kind) } : { allowed: true };
 }
 
@@ -169,8 +199,9 @@ function parsedContent(content: string): unknown {
 
 /**
  * The text a send carries: every field of its message, each file's name, and
- * each file that is text. A binary file is a form of encoding the check
- * cannot read, a known residual alongside spelled-out values.
+ * each file that is text, with their link targets. A binary file is a form
+ * of encoding the check cannot read, a known residual alongside spelled-out
+ * values.
  */
 function sendText(send: OutboundSend): string[] {
   const parts: string[] = [];
@@ -179,7 +210,7 @@ function sendText(send: OutboundSend): string[] {
     parts.push(file.filename);
     if (isUtf8(file.data)) parts.push(file.data.toString('utf8'));
   }
-  return parts;
+  return readableParts(parts);
 }
 
 /** The outbound guard: refuses a send to anyone but the principal that gives a private value away. */
@@ -233,7 +264,7 @@ async function signalThreadStopped(key: ThreadKey, kind: PrivateValueKind, refus
     const result = await writeNoteForMain({
       id: `privacy-stop-${randomUUID()}`,
       timestamp: stoppedAt,
-      text: stoppedSignalText(kind, refusals),
+      text: stoppedSignalText(key, kind, refusals),
       fields: { signal },
       wake: true,
     });
@@ -248,6 +279,17 @@ async function signalThreadStopped(key: ThreadKey, kind: PrivateValueKind, refus
     log.error('Privacy stop could not be signalled to main', { channelType: key.channelType, err });
   }
   /* eslint-enable no-catch-all/no-catch-all */
+}
+
+/**
+ * Let a stopped thread send again: main's next handoff to it (R76). Its
+ * refusals start over. True when it was stopped.
+ */
+export async function resumeThread(key: ThreadKey): Promise<boolean> {
+  if (!(await getDb().hasTable('gws_ea_privacy_threads'))) return false;
+  const resumed = await resumeThreadRecord(key, new Date().toISOString());
+  if (resumed) log.info('Privacy stop lifted for a new handoff', { channelType: key.channelType });
+  return resumed;
 }
 
 /** What another module does when one of its threads stops, such as closing the session behind it. */

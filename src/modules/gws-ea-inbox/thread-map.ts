@@ -17,12 +17,15 @@
  *   `visibleMessageIds`).
  * - A thread's addresses are those its messages carried and those `main`
  *   named (`recordThreadAddresses`).
+ * - A file goes out in a thread only when `main` handed it over for it, by
+ *   its SHA-256 (`findThreadFile`).
  * - A send never happens twice. Before Gmail is called, a pending record
- *   holds its pre-allocated Message-ID, so a retry of the same words on the
+ *   holds its pre-allocated Message-ID, so a retry of the same send on the
  *   same side finds it, and a reply to it already resolves. Once Gmail holds
- *   it, `recordSent` makes it the thread's message. Delivery deletes the
- *   record once it recorded the send or gave up on it, so the same words
- *   sent later are a new send.
+ *   it, `recordSent` makes it the thread's message. Delivery deletes a
+ *   reply's record once it recorded the send or gave up on it, so the same
+ *   words sent later are a new send; an `email_send` request's record stays,
+ *   so a replay of that request never sends again.
  *
  * Every timestamp is passed in as an ISO string; SQL never reads the clock.
  */
@@ -288,6 +291,26 @@ export async function threadAddresses(threadKey: string): Promise<ThreadAddress[
       WHERE thread_key = ? ORDER BY recorded_at, address, source`,
     threadKey,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Handed files
+// ---------------------------------------------------------------------------
+
+/** A file `main` handed over for a thread: its name, and where the host keeps its copy. */
+export interface ThreadFile {
+  readonly fileName: string;
+  readonly hostPath: string;
+}
+
+/** The file with this SHA-256 that `main` handed over for the thread, or undefined. */
+export async function findThreadFile(threadKey: string, sha256: string): Promise<ThreadFile | undefined> {
+  const row = await getDb().get<{ file_name: string; host_path: string }>(
+    'SELECT file_name, host_path FROM gws_ea_thread_files WHERE thread_key = ? AND sha256 = ?',
+    threadKey,
+    sha256,
+  );
+  return row ? { fileName: row.file_name, hostPath: row.host_path } : undefined;
 }
 
 // ---------------------------------------------------------------------------

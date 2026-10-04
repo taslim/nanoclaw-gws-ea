@@ -81,7 +81,7 @@ const REQUIRED_GUIDANCE = [
   '`external-email`, the part of this assistant that writes to other people',
   'The host watches your inbox and sends you a note about each email that needs you.',
   'When a note is not enough, read your inbox with the gmail skill',
-  'answer by email with `email_reply_to_principal`',
+  'answer by replying: your reply goes to them by email, in their thread.',
   "Don't repeat that answer here.",
   // Delegation (R8, R19, R20, R26, R40).
   'Scheduling with anyone but the principal belongs to `external-email`, colleagues included.',
@@ -102,7 +102,7 @@ const REQUIRED_GUIDANCE = [
   '- a decision that is theirs;',
   '- anything going wrong.',
   'When several come together, send one message, without the back-and-forth.',
-  'When the request came by email, tell them its outcome by email, in their thread, with `email_reply_to_principal`.',
+  'When the request came by email, tell them its outcome by email, in its thread.',
   // Curveballs, invitations, conversations (R42–R48).
   'Answer as the principal would want, within their preferences, with `meeting_amend` and its `answer`.',
   'Ask the principal first only when the answer is theirs to give.',
@@ -195,7 +195,7 @@ async function publishMain(main: AgentGroup): Promise<void> {
   await reconcileGwsEaProfile({
     assistantDisplayName: 'Aya',
     assistantWorkspaceEmail: 'aya@example.test',
-    principalDisplayName: 'Taslim',
+    principalDisplayName: 'Morgan',
     principalTimezone: 'America/Los_Angeles',
     mainAgentGroupId: main.id,
   });

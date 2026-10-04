@@ -2,8 +2,8 @@
  * The assistant's inbox as a NanoClaw channel adapter (KTD1). Inbound, it
  * polls Gmail's history each minute for messages added to INBOX and routes
  * each one to the part allowed to write to its readers (route-mail.ts).
- * Outbound, `deliver` sends `main`'s reply to the principal on
- * `email:principal` (principal-reply.ts), and a thread's reply on
+ * Outbound, `deliver` sends `main`'s email to the principal on
+ * `email:principal` (principal-reply.ts), and `external-email`'s on
  * `email:inbox` (outbound.ts).
  *
  * The poll is exactly-once and never stalls:
@@ -39,7 +39,7 @@ import { GoogleApiError, type GmailApi, type GmailHistoryRecord } from './gmail-
 import { recordPollFailure, recordPollSuccess } from './health.js';
 import { parseGmailMessage } from './mime.js';
 import { noticeSetAside } from './notices.js';
-import { sendReply } from './outbound.js';
+import { sendToOutside } from './outbound.js';
 import { sendToPrincipal } from './principal-reply.js';
 import { loadRoutingContext, routeMail, writeCalendarNote, type RoutingContext } from './route-mail.js';
 import {
@@ -278,7 +278,7 @@ export function createInbox(deps: InboxDeps): Inbox {
     deliver: (platformId, threadId, message) =>
       platformId === PRINCIPAL_PLATFORM_ID
         ? sendToPrincipal(runtime, threadId, message)
-        : sendReply(runtime, platformId, threadId, message),
+        : sendToOutside(runtime, platformId, threadId, message),
   };
 
   return { adapter, tick };

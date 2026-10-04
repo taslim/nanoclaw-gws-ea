@@ -18,7 +18,7 @@
  *
  * `getThreadParticipants` reads a thread. `arrangeThreadPeople` places its
  * people for the next replies, and `addThreadPeople` adds someone `main`
- * names (recipients.ts). `handBackHeldThread` returns a held thread to
+ * names. `handBackHeldThread` returns a held thread to
  * waiting for `main`, its later mail held again; `closeThread` ends a thread,
  * after which its mail starts a new one held for `main`.
  */
@@ -46,15 +46,68 @@ import {
   type ThreadState,
 } from './db.js';
 import { GoogleApiError } from './gmail-api.js';
-import { parseGmailMessage } from './mime.js';
+import { normalizeAddress, parseGmailMessage } from './mime.js';
 import { noticeSetAside } from './notices.js';
-import { arranged, everyone, requireAddress, withAdded, type Placement } from './recipients.js';
 import { loadRoutingContext } from './route-mail.js';
 import { deliverToSession } from './routing.js';
 import { activeInbox, assistantAddresses, EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from './runtime.js';
 
 const THREAD_KEY = /^mail-[A-Za-z0-9-]{1,80}$/u;
 const SUBJECT_MAX_LENGTH = 200;
+
+export type Placement = 'to' | 'cc';
+
+/** Everyone a send to these people reaches, Bcc included, each once. */
+function everyone(people: ThreadPeople): string[] {
+  return uniqueAddresses([...people.to, ...people.cc, ...people.bcc]);
+}
+
+/** An address as given, normalized; throws for anything that is not one or is the assistant's. */
+function requireAddress(value: string, assistant: ReadonlySet<string>): string {
+  const address = normalizeAddress(value);
+  if (address === undefined) throw new Error(`Not an email address: ${JSON.stringify(value)}`);
+  if (assistant.has(address)) throw new Error('The assistant is never one of its own recipients');
+  return address;
+}
+
+/**
+ * The thread's people as `wanted` places them. Only people already on the
+ * thread may be placed, each once, and someone must be on To; anyone left out
+ * is off the thread until a message or `main` puts them back.
+ */
+function arranged(current: ThreadPeople, wanted: ThreadPeople, assistant: ReadonlySet<string>): ThreadPeople {
+  const onThread = new Set(everyone(current));
+  const seen = new Set<string>();
+  const place = (values: readonly string[]): string[] =>
+    values.map((value) => {
+      const address = requireAddress(value, assistant);
+      if (!onThread.has(address)) throw new Error(`${address} is not on the thread: only main adds someone new`);
+      if (seen.has(address)) throw new Error(`${address} can be placed only once`);
+      seen.add(address);
+      return address;
+    });
+  const people = { to: place(wanted.to), cc: place(wanted.cc), bcc: place(wanted.bcc) };
+  if (people.to.length === 0) throw new Error('A reply needs someone on To');
+  return people;
+}
+
+/** The thread's people with `addresses` placed in `placement`; someone already there moves to it. */
+function withAdded(
+  current: ThreadPeople,
+  addresses: readonly string[],
+  placement: Placement,
+  assistant: ReadonlySet<string>,
+): ThreadPeople {
+  const added = uniqueAddresses(addresses.map((value) => requireAddress(value, assistant)));
+  if (added.length === 0) throw new Error('Name at least one address to add');
+  const moved = new Set(added);
+  const kept = (values: readonly string[]) => values.filter((address) => !moved.has(address));
+  return {
+    to: placement === 'to' ? [...kept(current.to), ...added] : kept(current.to),
+    cc: placement === 'cc' ? [...kept(current.cc), ...added] : kept(current.cc),
+    bcc: kept(current.bcc),
+  };
+}
 
 /** What a thread looks like to the handoff. */
 export interface ThreadView {

@@ -51,10 +51,9 @@ import { getThreadParticipants, GoogleApiError } from '../gws-ea-inbox/index.js'
 import { setSchedulingPreference } from '../gws-ea-preferences/db.js';
 import type { Person } from '../gws-ea-people/db.js';
 import { claimGiveUp } from './db.js';
-import { getBooking, runFollowThrough, type Meeting } from './index.js';
+import { runFollowThrough, type Meeting } from './index.js';
 import type { StoredEvent } from './testing/fake-calendar.js';
 import {
-  ADDRESSES,
   ask,
   contents,
   data,
@@ -63,7 +62,6 @@ import {
   notes,
   PRINCIPAL,
   reply,
-  JUNO,
   setUpScheduling,
   slotsOf,
   tearDownScheduling,
@@ -132,35 +130,6 @@ async function offered(person: Person, extra: Record<string, unknown> = {}): Pro
   const stored = await meeting(answer.meeting_id);
   await reply(session, stored.thread_key, 'Hello, I am Juno, Alex Doe’s assistant. Would one of these times suit?');
   return { stored, session, slots };
-}
-
-/** An invitation Acme organizes on the principal's calendar, on Wednesday morning. */
-function calendarInvitation(): void {
-  scheduling.calendar.put({
-    calendarId: PRINCIPAL,
-    id: 'evt-invite',
-    iCalUID: 'evt-invite@google.com',
-    status: 'confirmed',
-    organizer: { email: ADDRESSES.acme },
-    attendees: [
-      { email: ADDRESSES.acme, organizer: true, responseStatus: 'accepted' },
-      { email: PRINCIPAL, responseStatus: 'needsAction' },
-    ],
-    start: { dateTime: '2026-10-07T09:00:00Z' },
-    end: { dateTime: '2026-10-07T10:00:00Z' },
-  });
-}
-
-/** A counterpart writes in the thread of an email the assistant sent, the first by default. */
-async function theyWrite(from: string, body: string, inThreadOf = scheduling.gmail.sent[0]): Promise<void> {
-  scheduling.gmail.receive({
-    threadId: inThreadOf.threadId,
-    from,
-    to: [JUNO],
-    subject: 'Re: Partnership intro',
-    body,
-  });
-  await scheduling.inbox.tick();
 }
 
 // ---------------------------------------------------------------------------
@@ -259,60 +228,6 @@ describe('deadlines', () => {
       nudge_at: '2026-10-14T14:00:00.000Z',
       give_up_at: '2026-10-19T14:00:00.000Z',
     });
-  });
-
-  it('start at the first email delivered for a job that holds nothing, and its nudge never restarts them', async () => {
-    calendarInvitation();
-    const asked = data(
-      await ask(scheduling.main, 'meeting_reschedule', {
-        calendar_id: PRINCIPAL,
-        event_id: 'evt-invite',
-        ...WINDOW,
-        purpose: 'Your Wednesday invitation',
-      }),
-    );
-    const stored = await meeting(asked.meeting_id);
-    const session = await meetingSession(asked.meeting_id);
-    expect(stored).toMatchObject({ kind: 'ask_organizer', nudge_at: null, give_up_at: null });
-    await reply(session, stored.thread_key, 'Hello, could your Wednesday invitation move to Thursday at 10?');
-    expect(await meeting(stored.id)).toMatchObject({
-      nudge_at: '2026-10-07T08:00:00.000Z',
-      give_up_at: '2026-10-09T08:00:00.000Z',
-    });
-
-    await reach('2026-10-07T08:01:00.000Z');
-    expect(notes(session, NUDGE)).toHaveLength(1);
-    await reply(session, stored.thread_key, 'Just checking whether Thursday at 10 could work?');
-    // The nudge's own email leaves the give-up where the nudge set it.
-    expect(await meeting(stored.id)).toMatchObject({ nudge_at: null, give_up_at: '2026-10-09T08:01:00.000Z' });
-  });
-
-  it('end a called-off meeting without its closing line when the line never goes', async () => {
-    const { stored, session } = await offered(scheduling.people.acme);
-    expect(data(await ask(scheduling.main, 'meeting_cancel', { meeting_id: stored.id })).state).toBe('closing');
-    await reach('2026-10-05T07:59:00.000Z');
-    expect((await meeting(stored.id)).state).toBe('closing');
-    await reach('2026-10-05T08:01:00.000Z');
-    expect((await meeting(stored.id)).state).toBe('cancelled');
-    expect((await getSession(session.id))?.status).toBe('closed');
-    expect(await getThreadParticipants(stored.thread_key)).toMatchObject({ state: 'closed' });
-    expect(scheduling.gmail.sent).toHaveLength(1);
-  });
-
-  it("are not touched by the principal's own message in the thread", async () => {
-    const { stored } = await offered(scheduling.people.acme);
-    const [first] = scheduling.gmail.sent;
-    scheduling.gmail.receive({
-      threadId: first.threadId,
-      from: `Alex <${PRINCIPAL}>`,
-      principal: true,
-      to: [ADDRESSES.acme],
-      cc: [JUNO],
-      subject: 'Re: Partnership intro',
-      body: 'Any of these is fine for me.',
-    });
-    await scheduling.inbox.tick();
-    expect(await meeting(stored.id)).toMatchObject({ nudge_at: '2026-10-07T08:00:00.000Z' });
   });
 
   it('a booking clears them', async () => {
@@ -415,62 +330,5 @@ describe('deadlines', () => {
     expect(holds()).toEqual([]);
     expect(await getDb().all('SELECT slot_id FROM gws_ea_meeting_holds WHERE meeting_id = ?', stored.id)).toEqual([]);
     expect(notes(scheduling.main, OUTCOME)).toHaveLength(1);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// A booked meeting
-// ---------------------------------------------------------------------------
-
-async function booked(person: Person): Promise<Offered> {
-  const held = await offered(person);
-  data(
-    await ask(held.session, 'meeting_book', {
-      meeting_id: held.stored.id,
-      slot_id: held.slots[0].slot_id,
-      invitation: { title: 'Partnership intro' },
-    }),
-  );
-  return { ...held, stored: await meeting(held.stored.id) };
-}
-
-describe('a booked meeting', () => {
-  it('is moved in place when the counterpart asks, once, and main hears of it once', async () => {
-    const { stored, session } = await booked(scheduling.people.acme);
-    const before = await getBooking(stored.id);
-    if (!before) throw new Error('no booking');
-    await theyWrite(`Acme Sales <${ADDRESSES.acme}>`, 'Something came up: could we do Wednesday at 10:00 instead?');
-
-    const [wednesday] = slotsOf(
-      await ask(session, 'meeting_free_time', { meeting_id: stored.id, date: '2026-10-07', time: '10:00' }),
-    );
-    expect(wednesday.start).toBe('2026-10-07T09:00:00.000Z');
-    const writesBefore = scheduling.calendar.writes.length;
-    const moved = data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: wednesday.slot_id }));
-    expect(String(moved.message)).toMatch(/Moved/);
-
-    expect(scheduling.calendar.writes.slice(writesBefore)).toEqual([
-      {
-        op: 'patch',
-        calendarId: PRINCIPAL,
-        eventId: before.event_id,
-        sendUpdates: 'all',
-        fields: { start: wednesday.start, end: wednesday.end },
-      },
-    ]);
-    expect(scheduling.calendar.live(PRINCIPAL).filter((event) => event.tags?.gwsEaRole === 'booking')).toHaveLength(1);
-    expect(await getBooking(stored.id)).toMatchObject({ event_id: before.event_id, start_at: wednesday.start });
-    expect((await meeting(stored.id)).state).toBe('booked');
-
-    const [note, ...more] = notes(scheduling.main, 'gws-ea-meetings.moved');
-    expect(more).toEqual([]);
-    expect(note.note).toMatchObject({ meeting_id: stored.id, booking: { start: wednesday.start } });
-    expect(note.text).toContain('Acme Sales');
-    expect(note.text).not.toMatch(/tell the principal|in one line/iu);
-
-    // A repeat moves nothing and tells no one again.
-    data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: wednesday.slot_id }));
-    expect(scheduling.calendar.writes).toHaveLength(writesBefore + 1);
-    expect(notes(scheduling.main, 'gws-ea-meetings.moved')).toHaveLength(1);
   });
 });

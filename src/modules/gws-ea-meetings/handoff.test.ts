@@ -50,7 +50,7 @@ import type { ResponseFrame } from '../../cli/frame.js';
 import { killContainer } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
-import { getSession, updateSession } from '../../db/sessions.js';
+import { getSession } from '../../db/sessions.js';
 import { deliverSessionMessages, getDeliveryAction } from '../../delivery.js';
 import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { requestWake } from '../../request-wake.js';
@@ -772,40 +772,6 @@ describe('reschedule', () => {
 // ---------------------------------------------------------------------------
 
 describe('cancel', () => {
-  it('writes the closing line’s note once when called off again after a hold could not be released', async () => {
-    const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
-    const stored = await meeting(answer.meeting_id);
-    const session = await meetingSession(answer.meeting_id);
-    const [slot] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
-    data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [slot.slot_id] }));
-    await reply(session, stored.thread_key, 'Hello Sam, I am Juno, Pat Doe’s assistant. Would Tuesday at 10:00 work?');
-    const closingNotes = () => contents(session).filter((c) => c.note?.type === 'gws-ea-meetings.closing');
-
-    calendar.failNext({ op: 'delete', error: new GoogleApiError(503, 'Google refused: backend error') });
-    expect(refusal(await ask(main, 'meeting_cancel', { meeting_id: stored.id }))).toMatch(/could not be released/);
-    expect((await meeting(stored.id)).state).toBe('closing');
-    expect(closingNotes()).toEqual([]);
-
-    expect(data(await ask(main, 'meeting_cancel', { meeting_id: stored.id })).state).toBe('closing');
-    expect(data(await ask(main, 'meeting_cancel', { meeting_id: stored.id })).state).toBe('closing');
-    const [note, ...more] = closingNotes();
-    expect(more).toEqual([]);
-    expect(note.text).toMatch(/one short, gracious line/);
-    expect(calendar.live(PRINCIPAL).filter((event) => event.tags?.gwsEaRole === 'hold')).toEqual([]);
-  });
-
-  it('ends a called-off meeting at once when called off again after its conversation is gone', async () => {
-    const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
-    const stored = await meeting(answer.meeting_id);
-    const session = await meetingSession(answer.meeting_id);
-    await reply(session, stored.thread_key, 'Hello Sam, I am Juno, Pat Doe’s assistant. Would Tuesday at 10:00 work?');
-    expect(data(await ask(main, 'meeting_cancel', { meeting_id: stored.id })).state).toBe('closing');
-
-    await updateSession(session.id, { status: 'closed' });
-    expect(data(await ask(main, 'meeting_cancel', { meeting_id: stored.id })).state).toBe('cancelled');
-    expect((await meeting(stored.id)).state).toBe('cancelled');
-  });
-
   it("deletes a booked meeting's event with Google's notice, and passes main's note on in the closing line", async () => {
     const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
     const stored = await meeting(answer.meeting_id);
@@ -910,23 +876,6 @@ describe('cancel for an event the principal organizes (R8)', () => {
     // Asked again as a new request, it is already cancelled.
     expect(data(await ask(main, 'meeting_cancel', fields))).toMatchObject({ state: 'cancelled' });
     expect(calendar.writes.filter((write) => write.op === 'delete')).toHaveLength(1);
-  });
-
-  it('ends a meeting the assistant booked as that event, as cancelling the meeting does', async () => {
-    const arranged = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
-    const stored = await meeting(arranged.meeting_id);
-    const session = await meetingSession(arranged.meeting_id);
-    await reply(session, stored.thread_key, 'Hello Sam, I am Juno. Would Tuesday at 10:00 work?');
-    const booking = await bookFirstTime(session, stored.id);
-
-    const answer = data(await ask(main, 'meeting_cancel', { calendar_id: PRINCIPAL, event_id: booking.event_id }));
-    expect(answer).toMatchObject({ state: 'cancelled', meeting_id: stored.id });
-    expect(calendar.event(PRINCIPAL, booking.event_id)?.status).toBe('cancelled');
-    expect((await meeting(stored.id)).state).toBe('cancelled');
-    expect((await getSession(session.id))?.status).toBe('closed');
-    expect(await getThreadParticipants(stored.thread_key)).toMatchObject({ state: 'closed' });
-    // Booked, so nobody was waiting on an offer: Google's notice is the one message.
-    expect(gmail.sent).toHaveLength(1);
   });
 });
 

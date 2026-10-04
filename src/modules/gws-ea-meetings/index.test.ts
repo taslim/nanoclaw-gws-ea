@@ -88,7 +88,6 @@ describe('the meetings module', () => {
         'meeting_amend',
         'email_respond',
         'email_dismiss',
-        'email_reply_to_principal',
       ],
       [EXTERNAL_EMAIL_MEETINGS_CAPABILITY]: [
         'meeting_free_time',

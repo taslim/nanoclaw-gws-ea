@@ -13,44 +13,18 @@
  * The audience check resolves the same address (`principalRecipients`), so a
  * send clears the private-values check only because every recipient is one
  * of the principal's addresses. It is sent exactly once (send.ts), on the
- * thread's principal side of the send ledger.
+ * thread's principal side of the send ledger. `main`'s `email_send` writes
+ * here too, by thread key, so the same rules hold for it (outbound.ts).
  */
-import { randomUUID } from 'node:crypto';
-
 import type { OutboundMessage } from '../../channels/adapter.js';
 import { OutboundRefusedError, type OutboundSend } from '../../delivery.js';
-import { log } from '../../log.js';
 import { getGwsEaProfile, listPrincipalAddresses } from '../gws-ea-profile/db.js';
 import { authenticateSender } from './authentication.js';
-import {
-  buildMime,
-  domainOf,
-  encodeRaw,
-  newMessageId,
-  parseGmailMessage,
-  type Mailbox,
-  type ParsedMail,
-} from './mime.js';
+import { buildMime, encodeRaw, parseGmailMessage, type Mailbox, type ParsedMail } from './mime.js';
 import { emailSignature, renderEmail } from './render.js';
 import { activeInbox, assistantAddresses, type InboxRuntime } from './runtime.js';
-import {
-  assistantMailbox,
-  contentHash,
-  findSent,
-  MAX_REFERENCES,
-  readBackMessageIds,
-  replyText,
-  sendWithBackoff,
-} from './send.js';
-import {
-  findSend,
-  insertPendingSend,
-  recordSent,
-  threadMessages,
-  visibleMessageIds,
-  type NewSend,
-  type SendScope,
-} from './thread-map.js';
+import { assistantMailbox, emailWords, MAX_REFERENCES, sendExactlyOnce, sendKey } from './send.js';
+import { threadMessages, visibleMessageIds } from './thread-map.js';
 
 const REFUSED_BY = 'gws-ea-inbox:principal-thread';
 
@@ -89,23 +63,6 @@ export async function principalRecipients(send: OutboundSend): Promise<readonly 
   return anchor === undefined ? [] : [anchor.from.address];
 }
 
-/** Gmail holds the send: record it as the thread's, by the Message-ID replies will answer. */
-async function recordDelivered(
-  runtime: InboxRuntime,
-  send: NewSend,
-  sent: { readonly id: string; readonly threadId: string },
-  at: string,
-): Promise<string> {
-  const [held] = await readBackMessageIds(runtime.gmail, sent.id);
-  await recordSent(
-    send,
-    { gmailMessageId: sent.id, gmailThreadId: sent.threadId, rfcMessageId: held ?? send.rfcMessageId },
-    at,
-  );
-  log.info('Emailed the principal in their thread', { threadKey: send.scope.threadKey, gmailMessageId: sent.id });
-  return sent.id;
-}
-
 /** The channel adapter's `deliver` for `email:principal`: send `main`'s reply, exactly once. */
 export async function sendToPrincipal(
   runtime: InboxRuntime,
@@ -124,53 +81,37 @@ export async function sendToPrincipal(
       'An email to the principal carries no files; send them in chat instead.',
     );
   }
-  const text = replyText(message.content);
-  const scope: SendScope = { threadKey, side: 'principal' };
-  const hash = contentHash(threadKey, text);
-  const existing = await findSend(scope, hash);
-  // Gmail took this reply, but its delivery was never recorded: answer from the record.
-  if (existing?.state === 'sent') return existing.gmailMessageId;
-
-  const anchor = await principalAnchor(runtime, threadKey);
-  if (anchor === undefined) {
-    throw new OutboundRefusedError(REFUSED_BY, `Thread ${threadKey} has no email from the principal to answer.`);
-  }
-  const at = runtime.now().toISOString();
-  let send: NewSend;
-  if (existing === undefined) {
-    send = {
-      id: randomUUID(),
-      scope,
-      contentHash: hash,
-      rfcMessageId: newMessageId(domainOf(await runtime.gmailAddress())),
+  const words = emailWords(message.content);
+  if (words === undefined) throw new OutboundRefusedError(REFUSED_BY, 'An email to the principal carries text only.');
+  return sendExactlyOnce(runtime, { threadKey, side: 'principal' }, sendKey(threadKey, words), async () => {
+    const anchor = await principalAnchor(runtime, threadKey);
+    if (anchor === undefined) {
+      throw new OutboundRefusedError(REFUSED_BY, `Thread ${threadKey} has no email from the principal to answer.`);
+    }
+    const body = renderEmail({
+      markdown: words.text,
+      signature: emailSignature(await getGwsEaProfile()),
+      quote: { from: anchor.from, sentAt: anchor.mail.receivedAt ?? runtime.now(), text: anchor.mail.text },
+    });
+    const from = await assistantMailbox(runtime);
+    const visible = await visibleMessageIds(threadKey, 'principal');
+    return {
+      gmailThreadId: anchor.mail.threadId,
+      raw: async (rfcMessageId) =>
+        encodeRaw(
+          buildMime({
+            from,
+            to: [anchor.from.address],
+            cc: [],
+            bcc: [],
+            subject: anchor.mail.subject,
+            messageId: rfcMessageId,
+            ...(anchor.mail.rfcMessageId === undefined ? {} : { inReplyTo: anchor.mail.rfcMessageId }),
+            references: visible.filter((id) => id !== rfcMessageId).slice(-MAX_REFERENCES),
+            ...body,
+            date: runtime.now(),
+          }),
+        ),
     };
-    await insertPendingSend(send, at);
-  } else {
-    const found = await findSent(runtime.gmail, existing.rfcMessageId, anchor.mail.threadId);
-    if (found) return recordDelivered(runtime, existing, found, at);
-    send = existing;
-  }
-
-  const references = (await visibleMessageIds(threadKey, 'principal')).filter((id) => id !== send.rfcMessageId);
-  const body = renderEmail({
-    markdown: text,
-    signature: emailSignature(await getGwsEaProfile()),
-    quote: { from: anchor.from, sentAt: anchor.mail.receivedAt ?? runtime.now(), text: anchor.mail.text },
   });
-  const raw = encodeRaw(
-    buildMime({
-      from: await assistantMailbox(runtime),
-      to: [anchor.from.address],
-      cc: [],
-      bcc: [],
-      subject: anchor.mail.subject,
-      messageId: send.rfcMessageId,
-      ...(anchor.mail.rfcMessageId === undefined ? {} : { inReplyTo: anchor.mail.rfcMessageId }),
-      references: references.slice(-MAX_REFERENCES),
-      ...body,
-      date: runtime.now(),
-    }),
-  );
-  const sent = await sendWithBackoff(runtime, raw, send.rfcMessageId, anchor.mail.threadId);
-  return recordDelivered(runtime, send, sent, at);
 }

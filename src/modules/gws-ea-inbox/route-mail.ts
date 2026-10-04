@@ -141,15 +141,29 @@ function isPrincipalOnly(mail: ParsedMail, verdict: SenderVerdict, context: Rout
   );
 }
 
+/** An email address as people write one in a sentence. */
+const WRITTEN_ADDRESS = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/gu;
+
+/**
+ * Addresses a sender wrote in their own words, never in what they quoted: how
+ * a participant loops someone in (R68), since they could forward the thread
+ * to that person anyway.
+ */
+function writtenAddresses(mail: ParsedMail): string[] {
+  const { own } = splitQuoted(mail.text, mail.subject);
+  return [...own.matchAll(WRITTEN_ADDRESS)].map(([address]) => address.toLowerCase());
+}
+
 /**
  * Record the message in its thread, a new one when it belongs to none: its
- * side, and the addresses it carried. Safe to repeat. Returns the thread key.
+ * side, the addresses it carried, and for an outside message the addresses
+ * its sender wrote. Safe to repeat. Returns the thread key.
  */
 async function recordInThread(mail: ParsedMail, side: ThreadSide, context: RoutingContext): Promise<string> {
   const at = context.at.toISOString();
-  const addresses = [...(mail.from ? [mail.from] : []), ...mail.to, ...mail.cc]
-    .map(({ address }) => address)
-    .filter((address) => !context.assistant.has(address));
+  const carried = [...(mail.from ? [mail.from] : []), ...mail.to, ...mail.cc].map(({ address }) => address);
+  const written = side === 'outside' ? writtenAddresses(mail) : [];
+  const addresses = [...new Set([...carried, ...written])].filter((address) => !context.assistant.has(address));
   const db = getDb();
   return db.transaction(async () => {
     const thread =

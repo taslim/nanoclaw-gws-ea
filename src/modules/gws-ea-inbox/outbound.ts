@@ -1,256 +1,452 @@
 /**
- * Replies leave through ordinary delivery (KTD4). The channel adapter's
- * `deliver` sends one plain-text message in the thread's Gmail thread to the
- * thread's people, in To, Cc, and Bcc as placed: every one of them is an
- * address the audience check resolved (KTD7, KTD16).
+ * Email to anyone but the principal (KTD5, KTD9; R61, R68, R75, R76), and
+ * `email_send` for both agents.
  *
- * The principal's own email is answered apart from any thread
- * (`sendPrincipalReply`, R41): to the principal's verified address that
- * wrote it, alone, in its Gmail thread.
+ * Ordinary delivery hands the channel adapter every send on `email:inbox`
+ * (`sendToOutside`): `external-email`'s final text, and its `email_send`
+ * requests. Each goes out exactly once (send.ts), on the thread's outside
+ * side of the send ledger:
  *
- * A send never happens twice. Before Gmail is called, the host stores a
- * pending send with a pre-allocated Message-ID. A retry of the same reply
- * (same thread, same text) finds that record: if Gmail already holds a
- * message with that Message-ID, or holds it under X-Google-Original-Message-ID
- * because it replaced the ID, the send is recorded and not repeated. A reply
- * Gmail accepted whose delivery was not yet recorded is answered from the
- * record. The record is deleted once delivery records the reply, so the same
- * words sent again later are a new send.
+ * - A reply answers the latest message on the thread's outside side that
+ *   Gmail still holds, the assistant's own included: to everyone it placed
+ *   (recipients.ts), quoting it, under its subject, in its Gmail thread, and
+ *   referencing only Message-IDs the outside side has seen. A principal-only
+ *   note in the same Gmail thread is never quoted, referenced, or addressed.
+ * - `email_send` may name who it goes to, carry files, and write a thread's
+ *   first email, which takes a subject and goes to everyone `main` named
+ *   unless it names others. Final text in a thread with no message yet is
+ *   refused with a reason that names `email_send`.
+ * - Every recipient passes the recipient guard (recipients.ts).
+ * - A file goes only when `main` handed it over for this thread: its SHA-256
+ *   must be recorded with the thread, and the host's copy is what is sent.
  *
- * Gmail errors back off a few seconds within one attempt, checking Gmail for
- * the message before each retry; anything longer goes back to delivery's own
- * retries (send.ts).
+ * The private-values guard reads every send before the adapter does, for
+ * every address it reaches (`outsideRecipients`), and checks what the
+ * assistant wrote: its words, subject, and link targets. The send then goes
+ * to the people that check saw. The quote is added after the check, because
+ * it shows only a message its readers already received.
+ *
+ * For `main`, `email_send` writes to the principal in the thread it names,
+ * by the rules of its replies there (principal-reply.ts): only to the address
+ * Gmail verified wrote the thread's latest principal-only message, and never
+ * in a thread that has none.
+ *
+ * Each request is answered once, a refusal or failure included:
+ *
+ *   email_send (external-email) { text, subject?, to?, cc?, files? } → { thread_key, message }
+ *   email_send (main)           { thread_key, text }                  → { thread_key, message }
+ *
+ * `files` names the files the tool staged in the request's outbox. A replay
+ * of a request sends nothing twice: its send is keyed by the request.
  */
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 
-import type { OutboundMessage } from '../../channels/adapter.js';
-import { OutboundRefusedError, type OutboundSend } from '../../delivery.js';
+import type { OutboundFile, OutboundMessage } from '../../channels/adapter.js';
+import { writeActionResponse } from '../../cli/delivery-action.js';
+import type { ResponseFrame } from '../../cli/frame.js';
+import { getSession } from '../../db/sessions.js';
+import type { DeliveryGuardSpec, GuardedDeliveryHandler } from '../../delivery-guard.js';
+import { getDeliveryAdapter, OutboundRefusedError, type OutboundSend } from '../../delivery.js';
+import { hasControlCharacters } from '../../gws-ea/validation.js';
+import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { log } from '../../log.js';
-import { audienceForAddresses, checkOutbound } from '../gws-ea-privacy/index.js';
-import { listPrincipalAddresses } from '../gws-ea-profile/db.js';
+import { clearOutbox, readOutboxFiles } from '../../session-manager.js';
+import type { Session } from '../../types.js';
+import { getExternalEmailAgentGroupId } from '../gws-ea-external-email/index.js';
+import { getGwsEaProfile, getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { buildMime, encodeRaw, normalizeAddress, parseGmailMessage, type ParsedMail } from './mime.js';
+import { replyAll, threadRecipients, type Recipients } from './recipients.js';
+import { emailSignature, renderEmail } from './render.js';
 import {
-  addThreadMessageIds,
-  findSend,
-  findThreadByGmailId,
-  getPrincipalMessage,
-  getThread,
-  insertPendingSend,
-  markSendSent,
-  threadMessageIds,
-  updateThread,
-  type InboxThread,
-  type SendRecord,
-} from './db.js';
-import type { GmailApi } from './gmail-api.js';
-import { buildOutboundMime, domainOf, encodeRaw, newMessageId } from './mime.js';
-import { everyone, recipientsForThread, sendPeople } from './recipients.js';
-import { activeInbox, assistantAddresses, INBOX_PLATFORM_ID, type InboxRuntime } from './runtime.js';
-import {
-  assistantMailbox,
-  contentHash,
-  findSent,
-  MAX_REFERENCES,
-  readBackMessageIds,
-  replyText,
-  sendWithBackoff,
-} from './send.js';
+  activeInbox,
+  assistantAddresses,
+  EMAIL_CHANNEL_TYPE,
+  INBOX_PLATFORM_ID,
+  PRINCIPAL_PLATFORM_ID,
+  type InboxRuntime,
+} from './runtime.js';
+import { assistantMailbox, emailWords, MAX_REFERENCES, sendExactlyOnce, sendKey, type EmailWords } from './send.js';
+import { findThreadFile, getThread, threadAddresses, threadMessages, visibleMessageIds } from './thread-map.js';
 
-// ---------------------------------------------------------------------------
-// The audience check and the send read one list
-// ---------------------------------------------------------------------------
+const REFUSED_BY = 'gws-ea-inbox:outside-email';
+const SUBJECT_MAX = 200;
 
-const resolvedLists = new Map<string, readonly string[]>();
-const MAX_RESOLVED = 200;
-
-function listKey(threadKey: string, hash: string): string {
-  return `${threadKey}\u0000${hash}`;
+function refused(reason: string): OutboundRefusedError {
+  return new OutboundRefusedError(REFUSED_BY, reason);
 }
+
+// ---------------------------------------------------------------------------
+// What a send asks for
+// ---------------------------------------------------------------------------
+
+/** An email to a thread's outside side, as a reply or `email_send` asks for it. */
+interface OutsideEmail extends EmailWords {
+  /** A thread's first email's; a reply keeps its thread's. */
+  readonly subject?: string;
+  /** Who it goes to, when it names them rather than replying to all. */
+  readonly to?: readonly string[];
+  readonly cc?: readonly string[];
+}
+
+function addressesOf(value: unknown, field: 'to' | 'cc'): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw refused(`${field} must list email addresses.`);
+  return value.map((entry: unknown) => {
+    const address = typeof entry === 'string' ? normalizeAddress(entry) : undefined;
+    if (address === undefined) {
+      throw refused(`${field} must list email addresses; ${JSON.stringify(entry)} is not one.`);
+    }
+    return address;
+  });
+}
+
+/** The email a send's content asks for; refuses anything email cannot carry. */
+function outsideEmailOf(content: unknown): OutsideEmail {
+  const words = emailWords(content);
+  if (words === undefined || words.text.trim() === '') throw refused('An email carries words, as text.');
+  const fields = content as { subject?: unknown; to?: unknown; cc?: unknown };
+  const subject = typeof fields.subject === 'string' ? fields.subject.replace(/\s+/gu, ' ').trim() : fields.subject;
+  if (
+    subject !== undefined &&
+    (typeof subject !== 'string' || subject === '' || subject.length > SUBJECT_MAX || hasControlCharacters(subject))
+  ) {
+    throw refused(`A subject is one line of 1 to ${SUBJECT_MAX} characters.`);
+  }
+  const to = addressesOf(fields.to, 'to');
+  const cc = addressesOf(fields.cc, 'cc');
+  return {
+    ...words,
+    ...(subject === undefined ? {} : { subject }),
+    ...(to === undefined ? {} : { to }),
+    ...(cc === undefined ? {} : { cc }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Who it reaches, as the private-values check sees it
+// ---------------------------------------------------------------------------
+
+/** What a send answers, and who it reaches. */
+interface Plan {
+  /** The message it answers; undefined for a thread's first email. */
+  readonly anchor: ParsedMail | undefined;
+  readonly recipients: Recipients;
+}
+
+/** The latest message on the thread's outside side that Gmail still holds. */
+async function outsideAnchor(runtime: InboxRuntime, threadKey: string): Promise<ParsedMail | undefined> {
+  for (const message of (await threadMessages(threadKey, 'outside')).reverse()) {
+    if (message.gmailMessageId === null) continue;
+    const found = await runtime.gmail.getMessage(message.gmailMessageId, 'full');
+    if (found) return parseGmailMessage(found);
+  }
+  return undefined;
+}
+
+async function planSend(runtime: InboxRuntime, threadKey: string, email: OutsideEmail): Promise<Plan> {
+  // The assistant's own Gmail address is never one of the people a reply goes to.
+  await runtime.gmailAddress();
+  const anchor = await outsideAnchor(runtime, threadKey);
+  if (email.to !== undefined || email.cc !== undefined) {
+    return { anchor, recipients: { to: email.to ?? [], cc: email.cc ?? [] } };
+  }
+  if (anchor !== undefined) return { anchor, recipients: replyAll(anchor, await assistantAddresses()) };
+  const named = (await threadAddresses(threadKey)).filter((entry) => entry.source === 'main');
+  return { anchor, recipients: { to: [...new Set(named.map((entry) => entry.address))], cc: [] } };
+}
+
+/** The plans the private-values check saw, by send, for the send that follows each check. */
+const checkedPlans = new Map<string, Plan>();
+const MAX_CHECKED_PLANS = 200;
 
 /**
- * The recipient resolver the audience check uses for every email send: every
- * address the send reaches, Bcc included. The list is kept for the send that
- * follows, which refuses to go out if the thread's recipients changed in
- * between.
+ * The audience check's recipients for a send on `email:inbox`: everyone it
+ * reaches. The send that follows goes to exactly these people.
  */
-export async function resolveRecipients(send: OutboundSend): Promise<readonly string[]> {
-  if (send.platformId !== INBOX_PLATFORM_ID || send.threadId === null) return [];
-  const people = await recipientsForThread(send.threadId, await assistantAddresses());
-  const list = people === undefined ? [] : everyone(people);
-  let text: string;
+export async function outsideRecipients(send: OutboundSend): Promise<readonly string[]> {
+  const runtime = activeInbox();
+  if (!runtime || send.platformId !== INBOX_PLATFORM_ID || send.threadId === null) return [];
+  let email: OutsideEmail;
   /* eslint-disable no-catch-all/no-catch-all -- content the send cannot carry still resolves; the send itself refuses it */
   try {
-    text = replyText(JSON.parse(send.content));
+    email = outsideEmailOf(JSON.parse(send.content));
   } catch {
-    return list;
+    return [];
   }
   /* eslint-enable no-catch-all/no-catch-all */
-  if (resolvedLists.size >= MAX_RESOLVED) resolvedLists.delete(resolvedLists.keys().next().value ?? '');
-  resolvedLists.set(listKey(send.threadId, contentHash(send.threadId, text)), list);
-  return list;
+  const plan = await planSend(runtime, send.threadId, email);
+  if (checkedPlans.size >= MAX_CHECKED_PLANS) checkedPlans.delete(checkedPlans.keys().next().value ?? '');
+  checkedPlans.set(sendKey(send.threadId, email), plan);
+  return [...plan.recipients.to, ...plan.recipients.cc];
 }
 
-function sameList(a: readonly string[], b: readonly string[]): boolean {
-  return a.length === b.length && [...a].sort().every((address, index) => address === [...b].sort()[index]);
+// ---------------------------------------------------------------------------
+// The send
+// ---------------------------------------------------------------------------
+
+function sha256(data: Buffer): string {
+  return createHash('sha256').update(data).digest('hex');
 }
 
-/** Record what Gmail holds for a send: the IDs replies will answer, and the thread it joined. */
-async function completeSend(
-  gmail: GmailApi,
-  record: SendRecord,
-  sent: { readonly id: string; readonly threadId: string },
-  thread: InboxThread,
-  at: string,
-): Promise<string> {
-  await markSendSent(record.id, sent.id, at);
-  await addThreadMessageIds(thread.threadKey, await readBackMessageIds(gmail, sent.id), at);
-  if (thread.gmailThreadId === null && (await findThreadByGmailId(sent.threadId)) === undefined) {
-    await updateThread(thread.threadKey, { gmailThreadId: sent.threadId }, at);
+/** The host's copy of each file, each of which `main` must have handed over for this thread. */
+async function handedFiles(threadKey: string, files: readonly OutboundFile[]): Promise<OutboundFile[]> {
+  const attachments: OutboundFile[] = [];
+  for (const file of files) {
+    const hash = sha256(file.data);
+    const handed = await findThreadFile(threadKey, hash);
+    if (handed === undefined) {
+      throw refused(`${file.filename} is not a file main handed over for this thread, so it cannot go out.`);
+    }
+    const copy = await readFile(handed.hostPath);
+    if (sha256(copy) !== hash) {
+      throw new Error(`The host's copy of ${handed.fileName} changed after main handed it over`);
+    }
+    attachments.push({ filename: handed.fileName, data: copy });
   }
-  log.info('Reply sent from the inbox', { threadKey: thread.threadKey, gmailMessageId: sent.id });
-  return sent.id;
+  return attachments;
 }
 
-function replySubject(subject: string): string {
-  return subject === '' || /^re:/iu.test(subject) ? subject : `Re: ${subject}`;
-}
-
-/** The channel adapter's `deliver`: send one reply in its thread, exactly once. */
-export async function sendReply(
+/** The channel adapter's `deliver` for `email:inbox`: send one email in its thread, exactly once. */
+export async function sendToOutside(
   runtime: InboxRuntime,
   platformId: string,
   threadKey: string | null,
   message: OutboundMessage,
-): Promise<string | undefined> {
-  if (platformId !== INBOX_PLATFORM_ID || threadKey === null) {
-    throw new Error('The email channel sends only within an inbox thread');
+): Promise<string> {
+  if (platformId !== INBOX_PLATFORM_ID || threadKey === null || (await getThread(threadKey)) === undefined) {
+    throw refused("An email to anyone but the principal goes in one of the inbox's threads, and this named none.");
   }
-  if ((message.files?.length ?? 0) > 0) throw new Error('The email channel sends no files');
-  const text = replyText(message.content);
-  const thread = await getThread(threadKey);
-  if (!thread || (thread.state !== 'authorized' && thread.state !== 'open')) {
-    throw new Error(`Thread ${threadKey} is not open for replies`);
-  }
-  const hash = contentHash(threadKey, text);
-  const checked = resolvedLists.get(listKey(threadKey, hash));
-  resolvedLists.delete(listKey(threadKey, hash));
-  let record = await findSend({ threadKey }, hash);
-  // Gmail took this reply, but its delivery was never recorded: answer from the record.
-  if (record?.state === 'sent') return record.gmailMessageId ?? undefined;
-
-  const people = sendPeople(thread.people, await assistantAddresses());
-  const recipients = everyone(people);
-  if (checked !== undefined && !sameList(checked, recipients)) {
-    throw new Error("The thread's recipients changed after the reply was checked; it is checked and sent again");
-  }
-  if (recipients.length === 0) throw new Error(`Thread ${threadKey} has no one its reply may go to`);
-  const subjectCheck = await checkOutbound(thread.subject, await audienceForAddresses(recipients));
-  if (!subjectCheck.allowed) throw new OutboundRefusedError('gws-ea-inbox:subject', subjectCheck.reason);
-
-  const at = runtime.now().toISOString();
-  if (record?.state === 'pending') {
-    const found = await findSent(runtime.gmail, record.rfcMessageId, thread.gmailThreadId);
-    if (found) return completeSend(runtime.gmail, record, found, thread, at);
-  } else {
-    record = {
-      id: randomUUID(),
-      scope: { threadKey },
-      contentHash: hash,
-      rfcMessageId: newMessageId(domainOf(await runtime.gmailAddress())),
-      state: 'pending',
-      gmailMessageId: null,
-    };
-    await insertPendingSend(record, at);
-  }
-
-  const prior = (await threadMessageIds(threadKey)).filter((id) => id !== record.rfcMessageId);
-  const raw = encodeRaw(
-    buildOutboundMime({
-      from: await assistantMailbox(runtime),
-      ...people,
-      subject: prior.length === 0 ? thread.subject : replySubject(thread.subject),
-      messageId: record.rfcMessageId,
-      ...(prior.length === 0 ? {} : { inReplyTo: prior[prior.length - 1] }),
-      references: prior.slice(-MAX_REFERENCES),
-      text,
-      date: runtime.now(),
-    }),
-  );
-  const sent = await sendWithBackoff(runtime, raw, record.rfcMessageId, thread.gmailThreadId);
-  return completeSend(runtime.gmail, record, sent, thread, at);
-}
-
-// ---------------------------------------------------------------------------
-// The principal's email, answered by email (R41)
-// ---------------------------------------------------------------------------
-
-export interface PrincipalReply {
-  /** The principal's message being answered, by its Gmail message id, as their note gave it. */
-  readonly gmailMessageId: string;
-  /** Plain text, sent as written. */
-  readonly text: string;
-  /** The request this answers: a replay of it sends nothing again. */
-  readonly requestId: string;
-}
-
-/**
- * Answer one of the principal's messages by email: only to the principal's
- * address that wrote it, as Gmail verified it, in its Gmail thread, from the
- * assistant, in plain text. A replay of the same request returns the message
- * Gmail already holds. Throws for a message the inbox did not record as the
- * principal's, or whose address is no longer theirs. Returns Gmail's id for
- * the reply.
- */
-export async function sendPrincipalReply(input: PrincipalReply): Promise<string> {
-  const runtime = activeInbox();
-  if (!runtime) throw new Error('The inbox is not running, so no email can be sent');
-  const message = await getPrincipalMessage(input.gmailMessageId);
-  if (!message) throw new Error(`Gmail message ${input.gmailMessageId} is not an email from the principal`);
-  const principal = new Set((await listPrincipalAddresses()).map((address) => address.email));
-  if (!principal.has(message.address)) {
-    throw new Error(`${message.address} is no longer one of the principal's addresses`);
-  }
-  if (input.text.trim() === '') throw new Error('A reply needs text');
-
-  const scope = { principalMessageId: message.gmailMessageId };
-  const hash = createHash('sha256').update('principal-reply').update('\u0000').update(input.requestId).digest('hex');
-  let record = await findSend(scope, hash);
-  if (record?.state === 'sent' && record.gmailMessageId !== null) return record.gmailMessageId;
-  const at = runtime.now().toISOString();
-  if (record?.state === 'pending') {
-    const found = await findSent(runtime.gmail, record.rfcMessageId, message.gmailThreadId);
-    if (found) {
-      await markSendSent(record.id, found.id, at);
-      return found.id;
+  const email = outsideEmailOf(message.content);
+  const key = sendKey(threadKey, email);
+  const checked = checkedPlans.get(key);
+  checkedPlans.delete(key);
+  return sendExactlyOnce(runtime, { threadKey, side: 'outside' }, key, async () => {
+    const { anchor, recipients } = checked ?? (await planSend(runtime, threadKey, email));
+    if (anchor === undefined && email.subject === undefined) {
+      throw refused(
+        `Thread ${threadKey} has no email yet, so there is nothing to reply to: write its first email with email_send, giving it a subject.`,
+      );
     }
-  } else {
-    record = {
-      id: randomUUID(),
-      scope,
-      contentHash: hash,
-      rfcMessageId: newMessageId(domainOf(await runtime.gmailAddress())),
-      state: 'pending',
-      gmailMessageId: null,
+    if (anchor !== undefined && email.subject !== undefined) {
+      throw refused("A reply keeps its thread's subject: only a thread's first email takes one.");
+    }
+    const placed = await threadRecipients(threadKey, recipients, await assistantAddresses());
+    const attachments = await handedFiles(threadKey, message.files ?? []);
+    const body = renderEmail({
+      markdown: email.text,
+      signature: emailSignature(await getGwsEaProfile()),
+      ...(anchor?.from === undefined
+        ? {}
+        : { quote: { from: anchor.from, sentAt: anchor.receivedAt ?? runtime.now(), text: anchor.text } }),
+    });
+    const from = await assistantMailbox(runtime);
+    const visible = anchor === undefined ? [] : await visibleMessageIds(threadKey, 'outside');
+    return {
+      gmailThreadId: anchor?.threadId ?? null,
+      raw: async (rfcMessageId) =>
+        encodeRaw(
+          buildMime({
+            from,
+            ...placed,
+            bcc: [],
+            subject: anchor?.subject ?? email.subject ?? '',
+            messageId: rfcMessageId,
+            ...(anchor?.rfcMessageId === undefined ? {} : { inReplyTo: anchor.rfcMessageId }),
+            references: visible.filter((id) => id !== rfcMessageId).slice(-MAX_REFERENCES),
+            ...body,
+            attachments,
+            date: runtime.now(),
+          }),
+        ),
     };
-    await insertPendingSend(record, at);
-  }
-
-  const answered = message.rfcMessageId === null ? [] : [message.rfcMessageId];
-  const raw = encodeRaw(
-    buildOutboundMime({
-      from: await assistantMailbox(runtime),
-      to: [message.address],
-      cc: [],
-      bcc: [],
-      subject: replySubject(message.subject),
-      messageId: record.rfcMessageId,
-      ...(message.rfcMessageId === null ? {} : { inReplyTo: message.rfcMessageId }),
-      references: [...message.referenceIds, ...answered].slice(-MAX_REFERENCES),
-      text: input.text,
-      date: runtime.now(),
-    }),
-  );
-  const sent = await sendWithBackoff(runtime, raw, record.rfcMessageId, message.gmailThreadId);
-  await markSendSent(record.id, sent.id, at);
-  log.info("Replied to the principal's email", { gmailMessageId: message.gmailMessageId, replyId: sent.id });
-  return sent.id;
+  });
 }
+
+// ---------------------------------------------------------------------------
+// email_send
+// ---------------------------------------------------------------------------
+
+/** The delivery action both agents send email with; the runner's tool of the same name sends it. */
+export const EMAIL_SEND_ACTION = 'email_send';
+
+const REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/u;
+const THREAD_KEY = /^mail-[A-Za-z0-9-]{1,80}$/u;
+const MAX_FILES = 10;
+
+/** A request the host refuses as asked: the agent reads why and can ask differently. */
+class EmailSendRefusal extends Error {
+  constructor(
+    readonly code: 'invalid-args' | 'forbidden',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'EmailSendRefusal';
+  }
+}
+
+function invalid(message: string): EmailSendRefusal {
+  return new EmailSendRefusal('invalid-args', message);
+}
+
+/** The request id the runner set: the id of the outbound message that carried the request. */
+function requestIdOf(content: Record<string, unknown>): string | undefined {
+  const id = content.requestId;
+  return typeof id === 'string' && REQUEST_ID.test(id) ? id : undefined;
+}
+
+/** `main`, to the principal; and `external-email`, from the session of one email thread, in that thread alone. */
+export const emailSendAction = defineGuardedAction({
+  action: 'gws_ea_inbox.email_send',
+  decide: async ({ actor }) => {
+    if (actor.kind !== 'agent') return DENY('Only main and external-email send email.');
+    if (actor.agentGroupId === (await getMainAgentGroupId())) return ALLOW("main, by the profile's pointer");
+    if (actor.agentGroupId !== (await getExternalEmailAgentGroupId()) || actor.sessionId === undefined) {
+      return DENY('Only main and external-email send email.');
+    }
+    const session = await getSession(actor.sessionId);
+    const threadKey = session?.agent_group_id === actor.agentGroupId ? session.thread_id : null;
+    if (threadKey === null || (await getThread(threadKey)) === undefined) {
+      return DENY('This conversation is not an email thread, so it has no one to email.');
+    }
+    return ALLOW("external-email, from its email thread's own session");
+  },
+});
+
+/** Hand an email to delivery, past every outbound guard, as any send on the channel goes. */
+async function deliverEmail(
+  platformId: string,
+  threadKey: string,
+  email: EmailWords,
+  files: OutboundFile[] | undefined,
+): Promise<void> {
+  const delivery = getDeliveryAdapter();
+  if (!delivery) throw new Error('Delivery is not running yet');
+  await delivery.deliver(EMAIL_CHANNEL_TYPE, platformId, threadKey, 'chat', JSON.stringify(email), files);
+}
+
+function fileNamesOf(value: unknown): string[] {
+  if (value === undefined) return [];
+  if (Array.isArray(value) && value.length <= MAX_FILES) {
+    const names = value.filter((name: unknown): name is string => typeof name === 'string');
+    if (names.length === value.length) return names;
+  }
+  throw invalid(`files must name up to ${MAX_FILES} files you staged with this request`);
+}
+
+/** `main` writes to the principal in one of their threads, as its replies there go. */
+async function toPrincipal(content: Record<string, unknown>, requestId: string): Promise<Record<string, unknown>> {
+  const threadKey = content.thread_key;
+  if (typeof threadKey !== 'string' || !THREAD_KEY.test(threadKey)) {
+    throw invalid('thread_key must be the mail-… key of the principal’s thread, as its note gave it');
+  }
+  for (const field of ['subject', 'to', 'cc', 'files'] as const) {
+    if (content[field] !== undefined) {
+      throw invalid(`An email to the principal goes to them alone, in their thread: leave out ${field}.`);
+    }
+  }
+  const words = emailWords({ text: content.text, request: requestId });
+  if (words === undefined || words.text.trim() === '') throw invalid('text must be the words of your email');
+  await deliverEmail(PRINCIPAL_PLATFORM_ID, threadKey, words, undefined);
+  return {
+    thread_key: threadKey,
+    message: 'Your email went to the principal, in their thread. Do not repeat it here.',
+  };
+}
+
+/** `external-email` writes in its own thread: a first email, a reply to whom it names, or one with files. */
+async function inThread(
+  content: Record<string, unknown>,
+  session: Session,
+  requestId: string,
+): Promise<Record<string, unknown>> {
+  if (content.thread_key !== undefined) {
+    throw new EmailSendRefusal('forbidden', 'You write only in your own thread: leave out thread_key.');
+  }
+  const threadKey = session.thread_id;
+  if (threadKey === null) throw new Error(`Session ${session.id} has no thread`);
+  const names = fileNamesOf(content.files);
+  let email: OutsideEmail;
+  try {
+    email = outsideEmailOf({
+      text: content.text,
+      subject: content.subject,
+      to: content.to,
+      cc: content.cc,
+      request: requestId,
+    });
+  } catch (error) {
+    throw error instanceof OutboundRefusedError ? invalid(error.reason) : error;
+  }
+  const files = names.length === 0 ? undefined : readOutboxFiles(session.agent_group_id, session.id, requestId, names);
+  try {
+    if (files !== undefined && files.length !== names.length) {
+      throw invalid('files must name files you staged with this request; some were not found');
+    }
+    await deliverEmail(INBOX_PLATFORM_ID, threadKey, email, files);
+  } finally {
+    if (names.length > 0) clearOutbox(session.agent_group_id, session.id, requestId);
+  }
+  return { thread_key: threadKey, message: 'Your email is sent.' };
+}
+
+function errorFrame(requestId: string, error: unknown): ResponseFrame {
+  if (error instanceof EmailSendRefusal) {
+    return { id: requestId, ok: false, error: { code: error.code, message: error.message } };
+  }
+  if (error instanceof OutboundRefusedError) {
+    return {
+      id: requestId,
+      ok: false,
+      error: { code: 'forbidden', message: `Your email was not sent: ${error.reason}` },
+    };
+  }
+  const reason = error instanceof Error ? error.message : String(error);
+  return {
+    id: requestId,
+    ok: false,
+    error: { code: 'handler-error', message: `The host could not send it: ${reason}` },
+  };
+}
+
+/** `email_send`, answering each request once, a refusal or failure included. */
+export const emailSendHandler: GuardedDeliveryHandler = async (content, session) => {
+  const requestId = requestIdOf(content);
+  if (requestId === undefined) return;
+  let frame: ResponseFrame;
+  /* eslint-disable no-catch-all/no-catch-all -- every request is answered, a failure included; nothing is rethrown into a retry */
+  try {
+    const data =
+      session.agent_group_id === (await getMainAgentGroupId())
+        ? await toPrincipal(content, requestId)
+        : await inThread(content, session, requestId);
+    frame = { id: requestId, ok: true, data };
+  } catch (error) {
+    if (error instanceof EmailSendRefusal || error instanceof OutboundRefusedError) {
+      log.info('Email request refused', { requestId, sessionId: session.id });
+    } else {
+      log.error('Email request failed', { requestId, sessionId: session.id, err: error });
+    }
+    frame = errorFrame(requestId, error);
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+  await writeActionResponse(session, requestId, frame);
+};
+
+async function answerRefusal(content: Record<string, unknown>, session: Session, message: string): Promise<void> {
+  const requestId = requestIdOf(content) ?? '';
+  await writeActionResponse(session, requestId, { id: requestId, ok: false, error: { code: 'forbidden', message } });
+}
+
+/** The guard `email_send` passes; a refusal is answered, so the calling tool never waits it out. */
+export const EMAIL_SEND_GUARD: DeliveryGuardSpec = {
+  guardAction: emailSendAction,
+  precheck: (content, session) => {
+    if (requestIdOf(content) !== undefined) return true;
+    log.warn('Email request without a request id: nothing to answer', { sessionId: session.id });
+    return false;
+  },
+  // This guard never holds; a hold would be a decision this action cannot honor.
+  requestHold: (content, session) => answerRefusal(content, session, 'This request cannot wait for an approval.'),
+  onDeny: (content, session, reason) => answerRefusal(content, session, reason),
+};

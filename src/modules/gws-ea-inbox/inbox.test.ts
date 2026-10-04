@@ -65,7 +65,7 @@ import { deliverSessionMessages, setDeliveryAdapter } from '../../delivery.js';
 import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { requestWake } from '../../request-wake.js';
 import { routeInbound } from '../../router.js';
-import { resolveSession, sessionDir, writeSessionMessage } from '../../session-manager.js';
+import { resolveSession, sessionDir } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import '../permissions/index.js';
 import { getMembers } from '../permissions/db/agent-group-members.js';
@@ -79,7 +79,6 @@ import { addPerson } from '../gws-ea-people/db.js';
 import '../gws-ea-privacy/index.js';
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import {
-  addThreadPeople,
   authorizeThread,
   createInbox,
   EMAIL_CHANNEL_DEFAULTS,
@@ -90,10 +89,8 @@ import {
   GoogleApiError,
   INBOX_PLATFORM_ID,
   mintThreadKey,
-  openThreadSession,
   PRINCIPAL_PLATFORM_ID,
   recordOwnCalendarChange,
-  releaseHeldMail,
   type CalendarListApi,
   type CalendarListEntry,
   type CalendarNotification,
@@ -107,7 +104,7 @@ import {
 import { MAX_ROUTING_ATTEMPTS } from './adapter.js';
 import { emailMessagingGroupIds, recordFailedAttempt } from './db.js';
 import { MAX_ATTACHMENT_BYTES, MESSAGES_PER_SENDER_PER_HOUR } from './route-mail.js';
-import { threadMessages } from './thread-map.js';
+import { threadAddresses, threadMessages } from './thread-map.js';
 
 const JUNO = 'juno@assistant.example';
 const PRINCIPAL = 'pat@principal.example';
@@ -587,27 +584,6 @@ async function mainReplies(threadKey: string, text: string, id = `out-${Math.ran
   return id;
 }
 
-/** An open arrange thread with Sam, as Slice 2's `arrange` leaves it. */
-async function arrangeWithSam(subject = 'Finding 30 minutes'): Promise<{ threadKey: string; session: Session }> {
-  const threadKey = mintThreadKey();
-  await authorizeThread({ kind: 'new', threadKey, opener: 'arrange', subject, counterparts: [SAM] });
-  const { session } = await openThreadSession(threadKey);
-  await writeSessionMessage(session.agent_group_id, session.id, {
-    id: `brief-${threadKey}`,
-    kind: 'chat',
-    timestamp: now(),
-    content: JSON.stringify({ text: 'brief' }),
-  });
-  await releaseHeldMail(threadKey);
-  return { threadKey, session };
-}
-
-async function reply(session: Session, threadKey: string, text: string, id = `out-${Math.random()}`): Promise<string> {
-  queueReply(session, id, INBOX_PLATFORM_ID, threadKey, text);
-  await deliverSessionMessages(session);
-  return id;
-}
-
 /** An address line as every recipient sees it; empty when the header is absent. */
 function line(mail: SentMail, name: 'To' | 'Cc' | 'Bcc'): string[] {
   const value = header(mail.delivered, name);
@@ -932,12 +908,33 @@ describe('routing by audience', () => {
     expect(started.row.trigger).toBe(0);
     expect(hostText(started.text)).toContain(`Gmail verified it is from ${SAM}, whose level is close.`);
     expect(hostText(started.text)).not.toContain('Coffee?');
-    expect(requestWake).toHaveBeenCalledTimes(1);
+    // Neither wakes now: main's note waits for its next turn, and the thread for its human pace (pace.ts).
+    expect(requestWake).not.toHaveBeenCalled();
 
     gmail.receive({ threadId: 'g-sam', from: `Sam <${SAM}>`, subject: 'Re: Coffee?', body: 'Any news?' });
     await inbox.tick();
     expect((await outsideMail()).map((row) => row.email?.thread_key)).toEqual([threadKey, threadKey]);
     expect(notes('gws-ea-inbox.thread-started')).toHaveLength(1);
+  });
+
+  it('lets a participant loop someone in by writing their address, but not by quoting it (R68)', async () => {
+    gmail.receive({
+      threadId: 'g-loop',
+      from: `Sam <${SAM}>`,
+      subject: 'Coffee?',
+      body: [
+        'Please loop in my colleague jane.doe@acme.example, she runs my calendar.',
+        '',
+        'On Mon, Oct 5, 2026 at 9:00 AM Lee <lee@elsewhere.example> wrote:',
+        '> Reach me at mallory@elsewhere.example instead.',
+      ].join('\n'),
+    });
+    await inbox.tick();
+
+    const [email] = await outsideMail();
+    const addresses = (await threadAddresses(email.email?.thread_key ?? '')).map(({ address }) => address);
+    expect(addresses).toContain('jane.doe@acme.example');
+    expect(addresses).not.toContain('mallory@elsewhere.example');
   });
 
   it('never marks a display name as the principal: only Gmail verifying a principal address does', async () => {
@@ -1261,72 +1258,10 @@ describe('polling', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Slice 2's thread replies, until the outbound rewrite replaces them
+// Slice 2's handed-over threads, until their conversion replaces them
 // ---------------------------------------------------------------------------
 
-describe("a handed-over thread's replies", () => {
-  it('reconciles a send Gmail accepted before the host crashed, with no second email', async () => {
-    const { threadKey, session } = await arrangeWithSam();
-    gmail.sendFailures.push({ status: 0, accepted: true, crash: true });
-    const id = await reply(session, threadKey, 'Hello Sam');
-    expect(gmail.sent).toHaveLength(1);
-    expect(deliveryStatus(session, id)).toBeUndefined();
-
-    await startInbox(); // the host restarts
-    await deliverSessionMessages(session);
-    expect(gmail.sent).toHaveLength(1);
-    expect(deliveryStatus(session, id)).toBe('delivered');
-  });
-
-  it('answers a retry from its record when delivery never recorded a reply Gmail took', async () => {
-    const { threadKey } = await arrangeWithSam();
-    const message = { kind: 'chat', content: { text: 'Hello Sam' } };
-    const first = await inbox.adapter.deliver(INBOX_PLATFORM_ID, threadKey, message);
-    const again = await inbox.adapter.deliver(INBOX_PLATFORM_ID, threadKey, message);
-    expect(again).toBe(first);
-    expect(gmail.sent).toHaveLength(1);
-  });
-
-  it('reconciles by X-Google-Original-Message-ID when Gmail replaced the Message-ID', async () => {
-    gmail.rewritesMessageId = true;
-    const { threadKey, session } = await arrangeWithSam();
-    gmail.sendFailures.push({ status: 0, accepted: true, crash: true });
-    await reply(session, threadKey, 'Hello Sam');
-    await startInbox();
-    await deliverSessionMessages(session);
-    expect(gmail.sent).toHaveLength(1);
-  });
-
-  it('refuses a reply containing a private value before any Gmail call', async () => {
-    await addPrivateValue({ label: 'Home', kind: 'address', value: '12 Elm Road, Springfield' });
-    const { threadKey, session } = await arrangeWithSam();
-    const id = await reply(session, threadKey, 'Come by 12 Elm Road, Springfield at noon.');
-    expect(gmail.sent).toHaveLength(0);
-    expect(deliveryStatus(session, id)).toBe('failed');
-  });
-
-  it.each([
-    ['after Gmail kept the message', true],
-    ['before Gmail kept the message', false],
-  ])('backs off on a 5xx %s and sends exactly once', async (_label, accepted) => {
-    const { threadKey, session } = await arrangeWithSam();
-    gmail.sendFailures.push({ status: 503, accepted });
-    const id = await reply(session, threadKey, 'Hello Sam');
-    expect(gmail.sent).toHaveLength(1);
-    expect(deliveryStatus(session, id)).toBe('delivered');
-  });
-
-  it('adds someone main names, so the next reply includes them, and never the assistant', async () => {
-    const { threadKey, session } = await arrangeWithSam();
-    await reply(session, threadKey, 'Hello Sam');
-    const added = await addThreadPeople(threadKey, [JANE], 'cc');
-    expect(added.people).toEqual({ to: [SAM], cc: [JANE], bcc: [] });
-    await reply(session, threadKey, 'Copying Jane, who will join us.');
-    expect(line(gmail.sent[1], 'To')).toEqual([SAM]);
-    expect(line(gmail.sent[1], 'Cc')).toEqual([JANE]);
-    await expect(addThreadPeople(threadKey, [JUNO], 'cc')).rejects.toThrow(/assistant/);
-  });
-
+describe('a handed-over thread', () => {
   it('copies the principal on a thread the assistant starts only when asked, from their first address', async () => {
     await getDb().run(
       'UPDATE gws_ea_principal_addresses SET added_at = ? WHERE email = ?',

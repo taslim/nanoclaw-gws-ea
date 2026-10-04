@@ -21,8 +21,6 @@
  *   done (and its last email has gone), goes quiet, or is called off or
  *   taken over (KTD4); then the thread is held for `main` again.
  *   `email_dismiss` closes a held thread with nothing sent.
- *   `email_reply_to_principal` answers the principal's own email, to them
- *   alone.
  * - Nothing in a job's conversation stalls silently. When delivery gives up
  *   on an email it wrote, when an email to it is given up after its retries,
  *   or when one of its turns fails, `main` hears of it: a conversation ends
@@ -92,13 +90,7 @@ import {
   type CalendarListEntry,
 } from '../gws-ea-inbox/calendar-notifications.js';
 import { authenticateSender } from '../gws-ea-inbox/authentication.js';
-import {
-  getPrincipalMessage,
-  hasSentInThreadSince,
-  isSettled,
-  listPrincipalCalendars,
-  threadMessageIds,
-} from '../gws-ea-inbox/db.js';
+import { hasSentInThreadSince, isSettled, listPrincipalCalendars, threadMessageIds } from '../gws-ea-inbox/db.js';
 import {
   addThreadPeople,
   arrangeThreadPeople,
@@ -112,7 +104,6 @@ import {
   mintThreadKey,
   openThreadSession,
   releaseHeldMail,
-  sendPrincipalReply,
   vouchThreadPeople,
   type ThreadOrigin,
   type ThreadPeople,
@@ -261,7 +252,6 @@ const PERSON_ID = /^p-[0-9a-f]{12}$/u;
 const MEETING_KIND = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const MEETING_KIND_MAX = 40;
 const DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})$/iu;
-const GMAIL_MESSAGE_ID = /^[A-Za-z0-9_-]{1,128}$/u;
 /** A meeting's purpose is a new thread's subject, so it stays short. */
 const PURPOSE_MAX = 120;
 /** A conversation's purpose says what its answer must do, such as decline with an alternative or route. */
@@ -275,8 +265,6 @@ const ASK_EMAILS = 3;
 const ASK_HISTORY_ROWS = 50;
 /** How much of a list of addresses only email gave is shown, wrapped as untrusted. */
 const MAIL_ADDRESSES_MAX = 2_000;
-/** The principal's own email is answered in full, so it may run to several paragraphs. */
-const PRINCIPAL_REPLY_MAX = 20_000;
 const MIN_LENGTH = 5;
 const MAX_LENGTH = 480;
 const MAX_WINDOW_DAYS = 60;
@@ -1574,34 +1562,6 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         thread_key: threadKey,
         state: 'closed',
         message: `Thread ${threadKey} is closed and nothing was sent. Mail in it from now on reaches you as a new email.`,
-      },
-    };
-  }
-
-  /** Answer the principal's own email by email, to them alone, in its Gmail thread (R41). */
-  async function replyToPrincipal(
-    content: Record<string, unknown>,
-    session: Session,
-    requestId: string,
-  ): Promise<Answer> {
-    const gmailMessageId = content.gmail_message_id;
-    if (typeof gmailMessageId !== 'string' || !GMAIL_MESSAGE_ID.test(gmailMessageId)) {
-      throw invalid('gmail_message_id must be the Gmail message id the note about the principal’s email gave you');
-    }
-    const body = bodyText(content.text, 'text', PRINCIPAL_REPLY_MAX);
-    if (!(await getPrincipalMessage(gmailMessageId))) {
-      throw refused(
-        `Gmail message ${gmailMessageId} is not one Gmail verified the principal sent you: email_reply_to_principal answers only the principal's own email`,
-      );
-    }
-    // Unique per request, so a replay sends nothing twice and two answers to one email both go.
-    const replyId = await sendPrincipalReply({ gmailMessageId, text: body, requestId: `${session.id}:${requestId}` });
-    return {
-      meetingId: null,
-      data: {
-        gmail_message_id: gmailMessageId,
-        reply_id: replyId,
-        message: 'Your reply went to the principal by email, in their thread. Do not repeat it here.',
       },
     };
   }
@@ -2924,7 +2884,6 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     amend,
     respond,
     dismiss,
-    replyToPrincipal,
     askMain,
     outcome,
     recipients,
