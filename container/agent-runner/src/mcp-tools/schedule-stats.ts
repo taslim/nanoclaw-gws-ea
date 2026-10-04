@@ -28,6 +28,7 @@ import {
   Mailboxes,
   answer,
   fail,
+  isPrincipalParty,
   isRoom,
   principalResponse,
   readAddressList,
@@ -95,9 +96,9 @@ export interface ScheduleStatsResult {
   working_hours: Record<Weekday, WeekdayHours>;
   meeting_lengths: {
     all: LengthStats;
-    /** Exactly two attendees. */
+    /** The principal and one other person. */
     one_on_one: LengthStats;
-    /** Three or more attendees. */
+    /** The principal and two or more others. */
     group: LengthStats;
     /** Null when no principal addresses were given. */
     organized_by_principal: LengthStats | null;
@@ -129,7 +130,7 @@ interface Meeting {
   /** Minutes after local midnight; 1440 when the meeting ends at midnight. */
   endMinute: number;
   lengthMinutes: number;
-  /** Everyone invited but rooms, the principal included. */
+  /** The people in it: the principal, and everyone else invited but rooms. */
   attendeeCount: number;
   organizedByPrincipal: boolean;
 }
@@ -248,7 +249,13 @@ function classify(event: CalendarEvent, input: StatsInput): Meeting | SetAside {
   if (endMinute === null) return 'crosses_midnight';
   // Its size is unknown, so it is neither a block nor a meeting of any size.
   if (event.attendeesOmitted) return 'attendees_omitted';
-  const attendeeCount = event.attendees.filter((party) => !isRoom(party)).length;
+  // Its people: the principal once, however many of their addresses are invited, and everyone else but rooms.
+  const others = new Set(
+    event.attendees
+      .filter((party) => !isRoom(party) && !isPrincipalParty(party, input.principal))
+      .map((party) => party.email),
+  );
+  const attendeeCount = others.size + 1;
   if (attendeeCount < 2) return 'solo_blocks';
   return {
     date,
@@ -447,7 +454,7 @@ export const scheduleStats: McpToolDefinition = {
           type: 'array',
           items: { type: 'string' },
           description:
-            "The principal's email addresses. When given, lengths of the meetings the principal organized are reported separately.",
+            "The principal's email addresses. When given, lengths of the meetings the principal organized are reported separately, and the principal counts as one person in a meeting however many of these addresses it invites.",
         },
       },
       required: ['files', 'timezone', 'from', 'to'],

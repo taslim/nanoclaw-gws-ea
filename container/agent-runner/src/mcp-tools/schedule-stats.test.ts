@@ -305,6 +305,16 @@ describe('schedule_stats over eight weeks of saved gog output', () => {
     expect(result.meeting_lengths.organized_by_principal).toBeNull();
   });
 
+  it('sizes a meeting by its people: the principal counts once, however many of their addresses are invited', async () => {
+    const date = addDays(WINDOW.from, 2);
+    // Set up from home with the work address invited: with one guest it is a one-on-one, with none a block.
+    const withGuest = event(date, '13:00', '13:30', 3, HOME);
+    const block = event(date, '15:00', '16:00', 2, HOME);
+    const result = await stats([withGuest, block], { principal_addresses: [PRINCIPAL, HOME] });
+    expect(result.events).toMatchObject({ meetings: 1, solo_blocks: 1 });
+    expect(result.meeting_lengths.one_on_one).toEqual({ count: 1, most_common: [{ minutes: 30, count: 1 }] });
+  });
+
   it('counts a file saved a while ago, since history needs no fresh fetch', async () => {
     // Older than a conflict check accepts.
     const file = writeEvents(eightWeeks());

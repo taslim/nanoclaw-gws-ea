@@ -653,7 +653,7 @@ function strongestResponse(responses: ReadonlyArray<string | null>): string | nu
 }
 
 /** The entry that speaks for the principal on this copy: the calendar's own, else the principal's addresses. */
-function isPrincipalParty(party: Party, principal: Mailboxes): boolean {
+export function isPrincipalParty(party: Party, principal: Mailboxes): boolean {
   return party.self || principal.has(party.email);
 }
 
