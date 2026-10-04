@@ -1,19 +1,21 @@
 /**
- * Mail as text (KTD4): reading the messages Gmail returns, and writing
- * plain-text replies in their thread.
+ * Mail on the wire: reading the messages Gmail returns, and writing email in
+ * their thread.
  *
  * Inbound, only headers and readable text are taken; attachments are counted,
- * never fetched. Outbound, a reply is one `text/plain` part with no quote and
- * no signature, addressed to exactly the To, Cc, and Bcc it is given, and no
- * value can add a header, because every header value is reduced to one line.
+ * never fetched. Outbound, an email is its rendered HTML and the plain text it
+ * was written in (KTD6), quoted-printable, with any files after them. It is
+ * addressed to exactly the To, Cc, and Bcc it is given, and no value can add a
+ * header, because every header value is reduced to one line.
  *
  * Bcc goes in a header because that is the only way `users.messages.send`
  * takes recipients: Gmail sends to the To, Cc, and Bcc headers of the raw
  * message, and removes Bcc from the copies it delivers. Gmail reads those
  * headers only above the MIME headers, so they come first.
  */
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 
+import type { OutboundFile } from '../../channels/adapter.js';
 import { EMAIL_PATTERN } from '../../gws-ea/validation.js';
 import type { GmailMessage, GmailMessagePart } from './gmail-api.js';
 
@@ -326,20 +328,40 @@ export function splitQuoted(text: string): { readonly own: string; readonly quot
 // Outbound
 // ---------------------------------------------------------------------------
 
-export interface OutboundMime {
+/** An email as `buildMime` writes it. */
+export interface OutgoingMail {
   readonly from: Mailbox;
   /** The recipients, exactly as placed; together they are what the audience check saw. */
   readonly to: readonly string[];
   readonly cc: readonly string[];
   /** Delivered to, never shown to anyone else. */
   readonly bcc: readonly string[];
+  /** The thread's subject; a reply's gains "Re:" once. */
   readonly subject: string;
   readonly messageId: string;
+  /** The message this answers, which makes it a reply. */
   readonly inReplyTo?: string;
   readonly references: readonly string[];
+  /** The body as `renderEmail` made it: the plain text it was written in, and its HTML. */
   readonly text: string;
+  readonly html: string;
+  /** Files sent after the body. */
+  readonly attachments?: readonly OutboundFile[];
   readonly date: Date;
 }
+
+/** What every email's headers say about who it is from and to, and where it sits in its thread. */
+type Addressing = Omit<OutgoingMail, 'text' | 'html' | 'attachments'>;
+
+/** Slice 2's plain-text reply, which outbound sends until it sends rendered email through `buildMime`. */
+export interface OutboundMime extends Addressing {
+  readonly text: string;
+}
+
+/** The longest line written: RFC 2045 holds encoded lines to 76 characters, and headers fold to the same. */
+const MAX_LINE = 76;
+/** UTF-8 bytes per RFC 2047 encoded word, so a header's name and its first word fit on one line. */
+const ENCODED_WORD_BYTES = 39;
 
 function isControl(character: string): boolean {
   const code = character.codePointAt(0) ?? 0;
@@ -347,7 +369,7 @@ function isControl(character: string): boolean {
 }
 
 /** One line, with no control character that could end a header early. */
-function oneLine(value: string): string {
+export function oneLine(value: string): string {
   return Array.from(value, (character) => (isControl(character) ? ' ' : character))
     .join('')
     .replace(/\s+/gu, ' ')
@@ -358,22 +380,52 @@ function isPlainAscii(value: string): boolean {
   return /^[\x20-\x7e]*$/u.test(value);
 }
 
-function encodeWord(value: string): string {
-  return `=?UTF-8?B?${Buffer.from(value, 'utf8').toString('base64')}?=`;
+/** RFC 2047 encoded words, each of whole characters, separated by spaces a header folds at. */
+function encodeWords(value: string): string {
+  const word = (chunk: string) => `=?UTF-8?B?${Buffer.from(chunk, 'utf8').toString('base64')}?=`;
+  const words: string[] = [];
+  let chunk = '';
+  for (const character of value) {
+    if (chunk !== '' && Buffer.byteLength(chunk + character, 'utf8') > ENCODED_WORD_BYTES) {
+      words.push(word(chunk));
+      chunk = '';
+    }
+    chunk += character;
+  }
+  if (chunk !== '') words.push(word(chunk));
+  return words.join(' ');
 }
 
 function headerText(value: string): string {
   const line = oneLine(value);
-  return isPlainAscii(line) ? line : encodeWord(line);
+  return isPlainAscii(line) ? line : encodeWords(line);
 }
 
 function mailboxText(mailbox: Mailbox): string {
   const name = mailbox.displayName === undefined ? '' : oneLine(mailbox.displayName);
   if (name === '') return mailbox.address;
-  if (!isPlainAscii(name)) return `${encodeWord(name)} <${mailbox.address}>`;
+  if (!isPlainAscii(name)) return `${encodeWords(name)} <${mailbox.address}>`;
   return /^[A-Za-z0-9!#$%&'*+\-/=?^_`{|}~ ]+$/u.test(name)
     ? `${name} <${mailbox.address}>`
     : `"${name.replace(/(["\\])/gu, '\\$1')}" <${mailbox.address}>`;
+}
+
+/** `Name: value`, folded at spaces so each line stays within 76 characters wherever a space allows. */
+function headerLine(name: string, value: string): string {
+  const [first, ...rest] = value.split(' ');
+  const lines: string[] = [];
+  let line = `${name}: ${first}`;
+  for (const word of rest) {
+    if (line.length + 1 + word.length > MAX_LINE) {
+      lines.push(line);
+      line = ` ${word}`;
+    } else line += ` ${word}`;
+  }
+  return [...lines, line].join('\r\n');
+}
+
+function replySubject(subject: string): string {
+  return subject === '' || /^re:/iu.test(subject) ? subject : `Re: ${subject}`;
 }
 
 function messageIdToken(value: string): string {
@@ -393,20 +445,6 @@ function mailDate(date: Date): string {
   );
 }
 
-/** Long lists of message IDs folded onto continuation lines. */
-function foldIds(ids: readonly string[]): string {
-  const lines: string[] = [];
-  let current = '';
-  for (const id of ids) {
-    if (current !== '' && current.length + id.length + 1 > 900) {
-      lines.push(current);
-      current = id;
-    } else current = current === '' ? id : `${current} ${id}`;
-  }
-  if (current !== '') lines.push(current);
-  return lines.join('\r\n ');
-}
-
 function addressLine(name: 'To' | 'Cc' | 'Bcc', addresses: readonly string[]): string[] {
   if (addresses.length === 0) return [];
   const checked = addresses.map((address) => {
@@ -414,33 +452,143 @@ function addressLine(name: 'To' | 'Cc' | 'Bcc', addresses: readonly string[]): s
     if (normalized === undefined) throw new Error(`Not an email address: ${JSON.stringify(address)}`);
     return normalized;
   });
-  return [`${name}: ${checked.join(', ')}`];
+  return [headerLine(name, checked.join(', '))];
+}
+
+/** The headers above the MIME ones, Bcc among them, in the order Gmail reads them. */
+function addressingHeaders(mail: Addressing): string[] {
+  if (mail.to.length + mail.cc.length + mail.bcc.length === 0) {
+    throw new Error('A message needs at least one recipient');
+  }
+  const subject = oneLine(mail.subject);
+  const references = mail.references.map(messageIdToken);
+  return [
+    headerLine('From', mailboxText(mail.from)),
+    ...addressLine('To', mail.to),
+    ...addressLine('Cc', mail.cc),
+    ...addressLine('Bcc', mail.bcc),
+    headerLine('Subject', headerText(mail.inReplyTo === undefined ? subject : replySubject(subject))),
+    `Date: ${mailDate(mail.date)}`,
+    `Message-ID: ${messageIdToken(mail.messageId)}`,
+    ...(mail.inReplyTo === undefined ? [] : [`In-Reply-To: ${messageIdToken(mail.inReplyTo)}`]),
+    ...(references.length === 0 ? [] : [headerLine('References', references.join(' '))]),
+    'MIME-Version: 1.0',
+  ];
+}
+
+/** A MIME entity: its own headers, and its body as it goes on the wire. */
+interface Entity {
+  readonly headers: readonly string[];
+  readonly body: string;
+}
+
+function serialize(entity: Entity): string {
+  return `${entity.headers.join('\r\n')}\r\n\r\n${entity.body}`;
+}
+
+/** One line of text, quoted-printable (RFC 2045 §6.7), soft-broken so no encoded line passes 76 characters. */
+function quotedPrintableLine(line: string): string {
+  const bytes = Buffer.from(line, 'utf8');
+  const lines: string[] = [];
+  let current = '';
+  bytes.forEach((byte, index) => {
+    const blank = byte === 0x20 || byte === 0x09;
+    const literal = (byte >= 0x21 && byte <= 0x7e && byte !== 0x3d) || (blank && index < bytes.length - 1);
+    const token = literal ? String.fromCharCode(byte) : `=${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+    if (current.length + token.length > MAX_LINE - 1) {
+      lines.push(`${current}=`);
+      current = '';
+    }
+    current += token;
+  });
+  return [...lines, current].join('\r\n');
+}
+
+function textEntity(subtype: 'plain' | 'html', content: string): Entity {
+  return {
+    headers: [`Content-Type: text/${subtype}; charset=UTF-8`, 'Content-Transfer-Encoding: quoted-printable'],
+    body: content
+      .split(/\r\n|\r|\n/u)
+      .map(quotedPrintableLine)
+      .join('\r\n'),
+  };
+}
+
+/** The types of the files people send most; any other goes as bytes, which mail clients name by extension. */
+const ATTACHMENT_TYPES: Readonly<Record<string, string>> = {
+  pdf: 'application/pdf',
+  ics: 'text/calendar',
+  txt: 'text/plain',
+  csv: 'text/csv',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  zip: 'application/zip',
+};
+
+/** A file's name as a parameter: quoted when it is plain ASCII, RFC 2231 encoded when it is not. */
+function fileParameter(name: 'name' | 'filename', filename: string): string {
+  const value = oneLine(filename);
+  if (isPlainAscii(value)) return `${name}="${value.replace(/(["\\])/gu, '\\$1')}"`;
+  const encoded = encodeURIComponent(value).replace(
+    /['()*]/gu,
+    (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+  return `${name}*=UTF-8''${encoded}`;
+}
+
+function attachmentEntity(file: OutboundFile): Entity {
+  const extension = /\.([A-Za-z0-9]+)$/u.exec(file.filename)?.[1]?.toLowerCase() ?? '';
+  const type = ATTACHMENT_TYPES[extension] ?? 'application/octet-stream';
+  return {
+    headers: [
+      headerLine('Content-Type', `${type}; ${fileParameter('name', file.filename)}`),
+      headerLine('Content-Disposition', `attachment; ${fileParameter('filename', file.filename)}`),
+      'Content-Transfer-Encoding: base64',
+    ],
+    body: (file.data.toString('base64').match(/.{1,76}/gu) ?? []).join('\r\n'),
+  };
+}
+
+/** Parts under a fresh random boundary, which no part can contain by chance. */
+function multipart(subtype: 'alternative' | 'mixed', parts: readonly Entity[]): Entity {
+  const boundary = `=_${randomBytes(12).toString('hex')}`;
+  return {
+    headers: [headerLine('Content-Type', `multipart/${subtype}; boundary="${boundary}"`)],
+    body: `${parts.map((part) => `--${boundary}\r\n${serialize(part)}\r\n`).join('')}--${boundary}--`,
+  };
+}
+
+/**
+ * An email, as the RFC 822 text `users.messages.send` takes (before
+ * base64url): `multipart/alternative` with the plain text first, inside
+ * `multipart/mixed` when files go with it.
+ */
+export function buildMime(mail: OutgoingMail): string {
+  const headers = addressingHeaders(mail);
+  const body = multipart('alternative', [textEntity('plain', mail.text), textEntity('html', mail.html)]);
+  const files = mail.attachments ?? [];
+  const root = files.length === 0 ? body : multipart('mixed', [body, ...files.map(attachmentEntity)]);
+  return serialize({ headers: [...headers, ...root.headers], body: root.body });
 }
 
 /** A plain-text message, as the RFC 822 text `users.messages.send` takes (before base64url). */
 export function buildOutboundMime(input: OutboundMime): string {
-  if (input.to.length + input.cc.length + input.bcc.length === 0) {
-    throw new Error('A message needs at least one recipient');
-  }
-  const references = input.references.map(messageIdToken);
-  const headers = [
-    `From: ${mailboxText(input.from)}`,
-    ...addressLine('To', input.to),
-    ...addressLine('Cc', input.cc),
-    ...addressLine('Bcc', input.bcc),
-    `Subject: ${headerText(input.subject)}`,
-    `Date: ${mailDate(input.date)}`,
-    `Message-ID: ${messageIdToken(input.messageId)}`,
-    ...(input.inReplyTo === undefined ? [] : [`In-Reply-To: ${messageIdToken(input.inReplyTo)}`]),
-    ...(references.length === 0 ? [] : [`References: ${foldIds(references)}`]),
-    'MIME-Version: 1.0',
-    'Content-Type: text/plain; charset=UTF-8',
-    'Content-Transfer-Encoding: base64',
-  ];
   const body = Buffer.from(input.text.replace(/\r\n?/gu, '\n').replace(/\n/gu, '\r\n'), 'utf8')
     .toString('base64')
     .replace(/.{1,76}/gu, (line) => `${line}\r\n`);
-  return `${headers.join('\r\n')}\r\n\r\n${body}`;
+  return serialize({
+    headers: [
+      ...addressingHeaders(input),
+      'Content-Type: text/plain; charset=UTF-8',
+      'Content-Transfer-Encoding: base64',
+    ],
+    body,
+  });
 }
 
 /** The `raw` field `users.messages.send` takes. */

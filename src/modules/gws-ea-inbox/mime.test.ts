@@ -1,9 +1,17 @@
 /**
- * Reading Gmail's messages and writing plain-text replies (KTD4).
+ * Reading Gmail's messages, and writing email (KTD6).
  */
 import { describe, expect, it } from 'vitest';
 
-import { buildOutboundMime, parseAddressList, parseGmailMessage, splitQuoted } from './mime.js';
+import {
+  buildMime,
+  buildOutboundMime,
+  decodeEncodedWords,
+  parseAddressList,
+  parseGmailMessage,
+  splitQuoted,
+  type OutgoingMail,
+} from './mime.js';
 
 function data(text: string): string {
   return Buffer.from(text, 'utf8').toString('base64url');
@@ -61,7 +69,7 @@ describe('a Gmail message', () => {
         mimeType: 'multipart/mixed',
         headers: [
           { name: 'From', value: 'Sam <sam@acme.example>' },
-          { name: 'To', value: 'robin@assistant.example' },
+          { name: 'To', value: 'juno@assistant.example' },
           { name: 'Cc', value: 'Pat <pat@principal.example>' },
           { name: 'Subject', value: 'Meeting' },
           { name: 'Message-ID', value: '<a@acme.example>' },
@@ -88,7 +96,7 @@ describe('a Gmail message', () => {
       id: 'm1',
       threadId: 't1',
       from: { address: 'sam@acme.example', displayName: 'Sam' },
-      to: [{ address: 'robin@assistant.example' }],
+      to: [{ address: 'juno@assistant.example' }],
       cc: [{ address: 'pat@principal.example', displayName: 'Pat' }],
       subject: 'Meeting',
       rfcMessageId: '<a@acme.example>',
@@ -115,7 +123,7 @@ describe('a Gmail message', () => {
 
 describe('a reply', () => {
   const base = {
-    from: { address: 'robin@assistant.example', displayName: 'Robin' },
+    from: { address: 'juno@assistant.example', displayName: 'Juno' },
     subject: 'Re: Café plans',
     messageId: '<gws-ea.1@assistant.example>',
     inReplyTo: '<a@acme.example>',
@@ -134,7 +142,7 @@ describe('a reply', () => {
 
   it('is plain text in its thread, with no quote, and no Cc or Bcc when nobody is placed there', () => {
     const raw = buildOutboundMime({ ...base, to: ['sam@acme.example', 'pat@principal.example'], cc: [], bcc: [] });
-    expect(raw).toContain('From: Robin <robin@assistant.example>\r\n');
+    expect(raw).toContain('From: Juno <juno@assistant.example>\r\n');
     expect(raw).toContain('To: sam@acme.example, pat@principal.example\r\n');
     expect(raw).toContain('Subject: =?UTF-8?B?');
     expect(raw).toContain('Message-ID: <gws-ea.1@assistant.example>\r\n');
@@ -173,7 +181,7 @@ describe('a reply', () => {
 
   it('cannot be given extra headers through a value', () => {
     const raw = buildOutboundMime({
-      from: { address: 'robin@assistant.example' },
+      from: { address: 'juno@assistant.example' },
       to: ['sam@acme.example'],
       cc: [],
       bcc: [],
@@ -185,5 +193,177 @@ describe('a reply', () => {
     });
     expect(raw).not.toMatch(/^Bcc:/im);
     expect(raw).toContain('Subject: Hi Bcc: eve@evil.example\r\n');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Email as it goes on the wire
+// ---------------------------------------------------------------------------
+
+interface Entity {
+  readonly headers: string;
+  readonly body: string;
+}
+
+/** Headers unfolded, and the body as sent. */
+function entityOf(source: string): Entity {
+  const split = source.indexOf('\r\n\r\n');
+  return { headers: source.slice(0, split).replace(/\r\n[ \t]/gu, ' '), body: source.slice(split + 4) };
+}
+
+function field(entity: Entity, name: string): string | undefined {
+  return new RegExp(`^${name}: (.*)$`, 'imu').exec(entity.headers)?.[1];
+}
+
+/** A multipart entity's parts, in order. */
+function partsOf(entity: Entity): Entity[] {
+  const boundary = /boundary="([^"]+)"/u.exec(field(entity, 'Content-Type') ?? '')?.[1];
+  if (boundary === undefined) throw new Error('Not a multipart entity');
+  const sections = entity.body.split(`--${boundary}`);
+  expect(sections[sections.length - 1]).toBe('--');
+  return sections.slice(1, -1).map((section) => entityOf(section.replace(/^\r\n/u, '').replace(/\r\n$/u, '')));
+}
+
+function decodeQuotedPrintable(body: string): string {
+  const joined = body.replace(/=\r\n/gu, '');
+  const bytes: number[] = [];
+  for (let index = 0; index < joined.length; index += 1) {
+    if (joined[index] === '=') {
+      bytes.push(parseInt(joined.slice(index + 1, index + 3), 16));
+      index += 2;
+    } else bytes.push(joined.charCodeAt(index));
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
+
+describe('an email', () => {
+  const mail: OutgoingMail = {
+    from: { address: 'juno@assistant.example', displayName: 'Juno Hale' },
+    to: ['sam@acme.example'],
+    cc: [],
+    bcc: [],
+    subject: 'Café plans',
+    messageId: '<gws-ea.2@assistant.example>',
+    references: [],
+    text: 'Tuesday works.\n\nBest,\nJuno\n\n-- \nJuno Hale',
+    html: '<div dir="ltr">\n<p>Tuesday works.</p>\n<p>Juno Hale</p>\n</div>',
+    date: new Date('2026-10-07T17:00:00.000Z'),
+  };
+
+  it('is HTML with a faithful plain-text part, both quoted-printable', () => {
+    const message = entityOf(buildMime(mail));
+    expect(field(message, 'MIME-Version')).toBe('1.0');
+    expect(field(message, 'Content-Type')).toMatch(/^multipart\/alternative; boundary="/u);
+    const [text, html, ...rest] = partsOf(message);
+    expect(rest).toEqual([]);
+    expect(field(text, 'Content-Type')).toBe('text/plain; charset=UTF-8');
+    expect(field(text, 'Content-Transfer-Encoding')).toBe('quoted-printable');
+    expect(decodeQuotedPrintable(text.body)).toBe(mail.text.replace(/\n/gu, '\r\n'));
+    expect(text.body).toContain('--=20\r\n');
+    expect(field(html, 'Content-Type')).toBe('text/html; charset=UTF-8');
+    expect(field(html, 'Content-Transfer-Encoding')).toBe('quoted-printable');
+    expect(decodeQuotedPrintable(html.body)).toBe(mail.html.replace(/\n/gu, '\r\n'));
+    expect(html.body).toContain('<div dir=3D"ltr">');
+  });
+
+  it('encodes a non-ASCII subject, keeps a new thread\'s subject as chosen, and adds "Re:" to a reply once', () => {
+    const subject = (raw: string) => decodeEncodedWords(field(entityOf(raw), 'Subject') ?? '');
+    const started = buildMime(mail);
+    expect(field(entityOf(started), 'Subject')).toMatch(/^=\?UTF-8\?B\?/u);
+    expect(subject(started)).toBe('Café plans');
+    expect(started).not.toMatch(/^In-Reply-To:/imu);
+
+    const reply = { ...mail, inReplyTo: '<a@acme.example>', references: ['<a@acme.example>'] };
+    expect(subject(buildMime(reply))).toBe('Re: Café plans');
+    expect(subject(buildMime({ ...reply, subject: 'Re: Café plans' }))).toBe('Re: Café plans');
+    expect(subject(buildMime({ ...reply, subject: 'RE: Lunch' }))).toBe('RE: Lunch');
+    expect(buildMime(reply)).toContain('In-Reply-To: <a@acme.example>\r\n');
+  });
+
+  it('keeps every line on the wire within 76 characters, however long the paragraph or subject', () => {
+    const paragraph = Array.from({ length: 400 }, (_, index) => (index % 7 === 0 ? 'café' : 'time')).join(' ');
+    expect(paragraph.length).toBeGreaterThanOrEqual(1_999);
+    const long = {
+      ...mail,
+      subject: `Réunion ${'très importante '.repeat(12)}`.trim(),
+      references: Array.from({ length: 8 }, (_, index) => `<CAKx${index}aaaaaaaaaaaaaaaaaaaaaaaa@mail.gmail.com>`),
+      inReplyTo: '<CAKx7aaaaaaaaaaaaaaaaaaaaaaaa@mail.gmail.com>',
+      text: paragraph,
+      html: `<div dir="ltr">\n<p>${paragraph}</p>\n</div>`,
+    };
+    const raw = buildMime(long);
+    for (const line of raw.split('\r\n')) expect(line.length).toBeLessThanOrEqual(76);
+
+    const message = entityOf(raw);
+    const [text, html] = partsOf(message);
+    expect(decodeQuotedPrintable(text.body)).toBe(paragraph);
+    expect(decodeQuotedPrintable(html.body)).toBe(long.html.replace(/\n/gu, '\r\n'));
+    expect(decodeEncodedWords(field(message, 'Subject') ?? '')).toBe(`Re: ${long.subject}`);
+    expect(field(message, 'References')).toBe(long.references.join(' '));
+  });
+
+  it('sends attachments in multipart/mixed, after the alternative part', () => {
+    const agenda = Buffer.from('%PDF-1.7 agenda'.repeat(20), 'utf8');
+    const menu = Buffer.from('Soup\nSalad\n', 'utf8');
+    const message = entityOf(
+      buildMime({
+        ...mail,
+        attachments: [
+          { filename: 'agenda.pdf', data: agenda },
+          { filename: 'Café "menu".txt', data: menu },
+        ],
+      }),
+    );
+    expect(field(message, 'Content-Type')).toMatch(/^multipart\/mixed; boundary="/u);
+    const [alternative, pdf, txt, ...rest] = partsOf(message);
+    expect(rest).toEqual([]);
+    expect(field(alternative, 'Content-Type')).toMatch(/^multipart\/alternative; boundary="/u);
+    expect(partsOf(alternative).map((part) => field(part, 'Content-Type'))).toEqual([
+      'text/plain; charset=UTF-8',
+      'text/html; charset=UTF-8',
+    ]);
+
+    expect(field(pdf, 'Content-Type')).toBe('application/pdf; name="agenda.pdf"');
+    expect(field(pdf, 'Content-Disposition')).toBe('attachment; filename="agenda.pdf"');
+    expect(field(pdf, 'Content-Transfer-Encoding')).toBe('base64');
+    expect(Buffer.from(pdf.body.replace(/\r\n/gu, ''), 'base64').equals(agenda)).toBe(true);
+
+    expect(field(txt, 'Content-Type')).toBe("text/plain; name*=UTF-8''Caf%C3%A9%20%22menu%22.txt");
+    expect(field(txt, 'Content-Disposition')).toBe("attachment; filename*=UTF-8''Caf%C3%A9%20%22menu%22.txt");
+    expect(Buffer.from(txt.body.replace(/\r\n/gu, ''), 'base64').equals(menu)).toBe(true);
+  });
+
+  it('writes To, Cc, and Bcc with the other addressing headers, before the MIME headers Gmail stops reading at', () => {
+    const raw = buildMime({
+      ...mail,
+      to: ['sam@acme.example'],
+      cc: ['ari@acme.example', 'lee@acme.example'],
+      bcc: ['pat@principal.example'],
+    });
+    const message = entityOf(raw);
+    expect(field(message, 'From')).toBe('Juno Hale <juno@assistant.example>');
+    expect(field(message, 'To')).toBe('sam@acme.example');
+    expect(field(message, 'Cc')).toBe('ari@acme.example, lee@acme.example');
+    expect(field(message, 'Bcc')).toBe('pat@principal.example');
+    const names = message.headers.split('\r\n').map((line) => line.slice(0, line.indexOf(':')));
+    expect(names.indexOf('Bcc')).toBeLessThan(names.indexOf('MIME-Version'));
+    expect(names.indexOf('Cc')).toBeLessThan(names.indexOf('Content-Type'));
+  });
+
+  it('can go to Cc alone, never to no one, and never to something that is not an address', () => {
+    expect(buildMime({ ...mail, to: [], cc: ['ari@acme.example'] })).not.toMatch(/^To:/imu);
+    expect(() => buildMime({ ...mail, to: [], cc: [], bcc: [] })).toThrow(/at least one recipient/u);
+    expect(() => buildMime({ ...mail, bcc: ['x>, eve@evil.example'] })).toThrow(/Not an email address/u);
+  });
+
+  it('cannot be given extra headers through a value', () => {
+    const raw = buildMime({
+      ...mail,
+      from: { address: 'juno@assistant.example', displayName: 'Juno\r\nBcc: eve@evil.example' },
+      subject: 'Hi\r\nBcc: eve@evil.example',
+      attachments: [{ filename: 'a.txt\r\nBcc: eve@evil.example', data: Buffer.from('a') }],
+    });
+    expect(raw).not.toMatch(/^Bcc:/imu);
+    expect(field(entityOf(raw), 'Subject')).toBe('Hi Bcc: eve@evil.example');
   });
 });
