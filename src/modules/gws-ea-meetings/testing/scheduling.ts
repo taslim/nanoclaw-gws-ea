@@ -21,7 +21,6 @@ import {
   teardownChannelAdapters,
 } from '../../../channels/channel-registry.js';
 import type { ResponseFrame } from '../../../cli/frame.js';
-import { dispatch } from '../../../cli/dispatch.js';
 import { getDb } from '../../../db/connection.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../../db/index.js';
 import { getSession } from '../../../db/sessions.js';
@@ -174,11 +173,6 @@ export async function setUpScheduling(testDir: string, google: { calendar: unkno
   );
   await recordExternalEmailAgentGroupId('ag-external');
   await addPrincipalAddress(PRINCIPAL);
-  const pinned = await dispatch(
-    { id: 'pin', command: 'dkim-selectors-pin', args: { domain: 'principal.example', selector: 'google' } },
-    { caller: 'host' },
-  );
-  expect(pinned.ok).toBe(true);
 
   const person = (name: string, level: 'inner-circle' | 'close' | 'active' | 'known', address: string) =>
     addPerson({ name, level, source: 'principal', basis: 'a contact', identity: `email:${address}` });

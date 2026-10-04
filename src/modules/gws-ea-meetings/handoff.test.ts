@@ -47,7 +47,6 @@ vi.mock('./calendar-api.js', async (importOriginal) => {
 
 import { teardownChannelAdapters } from '../../channels/channel-registry.js';
 import type { ResponseFrame } from '../../cli/frame.js';
-import { dispatch } from '../../cli/dispatch.js';
 import { killContainer } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
@@ -242,11 +241,6 @@ beforeEach(async () => {
   );
   await recordExternalEmailAgentGroupId('ag-external');
   await addPrincipalAddress(PRINCIPAL);
-  const pinned = await dispatch(
-    { id: 'pin', command: 'dkim-selectors-pin', args: { domain: 'principal.example', selector: 'google' } },
-    { caller: 'host' },
-  );
-  expect(pinned.ok).toBe(true);
 
   sam = await addPerson({
     name: 'Sam Lee',

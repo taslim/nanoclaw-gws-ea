@@ -581,39 +581,3 @@ export async function replacePrincipalCalendars(calendarIds: readonly string[], 
     }
   });
 }
-
-// ---------------------------------------------------------------------------
-// Pinned DKIM selectors
-// ---------------------------------------------------------------------------
-
-export interface PinnedSelector {
-  readonly domain: string;
-  readonly selector: string;
-  readonly pinned_at: string;
-}
-
-export async function listPinnedSelectors(): Promise<PinnedSelector[]> {
-  return getDb().all<PinnedSelector>(
-    'SELECT domain, selector, pinned_at FROM gws_ea_inbox_dkim_selectors ORDER BY domain, selector',
-  );
-}
-
-export async function pinSelector(domain: string, selector: string, at: string): Promise<boolean> {
-  const result = await getDb().run(
-    `INSERT INTO gws_ea_inbox_dkim_selectors (domain, selector, pinned_at) VALUES (?, ?, ?)
-       ON CONFLICT (domain, selector) DO NOTHING`,
-    domain,
-    selector,
-    at,
-  );
-  return result.changes > 0;
-}
-
-export async function unpinSelector(domain: string, selector: string): Promise<boolean> {
-  const result = await getDb().run(
-    'DELETE FROM gws_ea_inbox_dkim_selectors WHERE domain = ? AND selector = ?',
-    domain,
-    selector,
-  );
-  return result.changes > 0;
-}

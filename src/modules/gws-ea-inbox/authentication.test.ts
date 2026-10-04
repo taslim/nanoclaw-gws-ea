@@ -9,8 +9,7 @@ import type { MailHeader } from './mime.js';
 
 const PRINCIPAL = 'pat@principal.example';
 const CONTEXT: AuthContext = {
-  principalAddresses: new Set([PRINCIPAL, 'pat@home.example']),
-  pinnedSelectors: new Map([['principal.example', new Set(['google'])]]),
+  principalAddresses: new Set([PRINCIPAL, 'pat@home.example', 'pat.principal@gmail.com', 'pat@outlook.com']),
 };
 
 interface MessageOptions {
@@ -60,12 +59,24 @@ function message(options: MessageOptions = {}): MailHeader[] {
 }
 
 describe('the principal', () => {
-  it("is recognized only from Gmail's topmost result with a pinned-selector DKIM pass and a DMARC pass", () => {
+  it("is recognized from Gmail's topmost result with a DKIM pass from their address's own domain and a DMARC pass", () => {
     expect(authenticateSender(message(), CONTEXT)).toEqual({
       kind: 'principal',
       address: PRINCIPAL,
       displayName: 'Pat Principal',
     });
+  });
+
+  it.each([
+    ['a Google Workspace domain', 'pat@home.example', 'google'],
+    ['Gmail', 'pat.principal@gmail.com', '20230601'],
+    ['Outlook', 'pat@outlook.com', 'selector1'],
+    ['Microsoft 365 on its own domain', 'pat@home.example', 'selector2'],
+  ])('is recognized on %s, whatever selector the domain signs with', (_label, address, selector) => {
+    const domain = address.slice(address.indexOf('@') + 1);
+    expect(
+      authenticateSender(message({ from: `Pat <${address}>`, results: results(domain, selector) }), CONTEXT),
+    ).toMatchObject({ kind: 'principal', address });
   });
 
   it('accepts a Sender equal to From', () => {
@@ -96,7 +107,15 @@ describe('the principal', () => {
     ['dmarc=bestguesspass', { results: results('principal.example', 'google', 'bestguesspass') }],
     ['dmarc=fail', { results: results('principal.example', 'google', 'fail') }],
     ['a failed DKIM signature', { results: results('principal.example', 'google', 'pass', 'fail') }],
-    ['a selector nobody pinned', { results: results('principal.example', 'marketing') }],
+    [
+      'a DMARC pass whose only DKIM pass is another domain’s',
+      {
+        results: results('principal.example', 'google').replace(
+          'header.i=@principal.example',
+          'header.i=@mailer.example',
+        ),
+      },
+    ],
     ['a differing Sender', { extra: [{ name: 'Sender', value: 'Bulk <bulk@principal.example>' }] }],
     ['a List-Id', { extra: [{ name: 'List-Id', value: '<team.principal.example>' }] }],
     ['two From mailboxes', { from: `${PRINCIPAL}, other@principal.example` }],
@@ -116,9 +135,10 @@ describe('the principal', () => {
     });
   });
 
-  it('is never recognized while no selector is pinned for its domain, nor taken for anyone else', () => {
-    const unpinned: AuthContext = { ...CONTEXT, pinnedSelectors: new Map() };
-    expect(authenticateSender(message(), unpinned)).toMatchObject({ kind: 'unauthenticated', address: PRINCIPAL });
+  it('is never taken for anyone else when it cannot be verified', () => {
+    expect(
+      authenticateSender(message({ results: results('principal.example', 'google', 'fail', 'fail') }), CONTEXT),
+    ).toMatchObject({ kind: 'unauthenticated', address: PRINCIPAL });
   });
 
   it('is not recognized when a non-Gmail header sits above the topmost result', () => {

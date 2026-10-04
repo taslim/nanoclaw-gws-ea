@@ -45,7 +45,6 @@ import {
   getThread,
   holdMessage,
   insertThread,
-  listPinnedSelectors,
   listPrincipalCalendars,
   recordPrincipalMessage,
   uniqueAddresses,
@@ -75,16 +74,12 @@ export interface RoutingContext {
 }
 
 export async function loadRoutingContext(assistant: ReadonlySet<string>, at: Date): Promise<RoutingContext> {
-  const pinned = new Map<string, Set<string>>();
-  for (const pin of await listPinnedSelectors()) {
-    pinned.set(pin.domain, (pinned.get(pin.domain) ?? new Set()).add(pin.selector));
-  }
   const principal = (await getDb().hasTable('gws_ea_principal_addresses'))
     ? (await listPrincipalAddresses()).map((address) => address.email)
     : [];
   return {
     assistant,
-    auth: { principalAddresses: new Set(principal), pinnedSelectors: pinned },
+    auth: { principalAddresses: new Set(principal) },
     principalCalendars: new Set(await listPrincipalCalendars()),
     at,
   };

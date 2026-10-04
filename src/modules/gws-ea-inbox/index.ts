@@ -10,9 +10,8 @@
  *   placed in To, Cc, and Bcc, which the audience check resolves through the
  *   same people (outbound.ts, recipients.ts). The principal's own email is
  *   answered to them alone (`sendPrincipalReply`).
- * - The operator pins the DKIM selectors the principal's mail must be signed
- *   with (`ncl dkim-selectors`); until one is pinned for a domain, no mail
- *   from it is the principal's.
+ * - Mail is the principal's only when Gmail verified that the domain of one
+ *   of their addresses sent it (authentication.ts).
  *
  * The host starts the inbox after `external-email` exists: it creates the
  * inbox's messaging group and wiring when absent, then polls each minute.
@@ -21,7 +20,6 @@
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { registerChannelAdapter } from '../../channels/channel-registry.js';
-import { registerResource, type ColumnDef } from '../../cli/crud.js';
 import { register } from '../../cli/registry.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
@@ -40,7 +38,7 @@ import { registerRecipientResolver } from '../gws-ea-privacy/index.js';
 import { registerRoleGrantPolicy } from '../permissions/db/user-roles.js';
 import { createInbox, EMAIL_CHANNEL_DEFAULTS, type Inbox } from './adapter.js';
 import { createCalendarListApi } from './calendar-notifications.js';
-import { deleteSends, listPinnedSelectors, pinSelector, unpinSelector } from './db.js';
+import { deleteSends } from './db.js';
 import { createGmailApi } from './gmail-api.js';
 import { gwsEaInboxMigration } from './migration.js';
 import { contentHash, replyText, resolveRecipients } from './outbound.js';
@@ -147,82 +145,10 @@ registerPersonForgetHook('gws-ea-inbox:purge', async ({ handles }) => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// `ncl dkim-selectors` — the operator's pins, from the host only.
-// ---------------------------------------------------------------------------
-
-const DOMAIN = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/u;
-const SELECTOR = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62})$/u;
-
-function pinArgs(args: Record<string, unknown>): { readonly domain: string; readonly selector: string } {
-  const domain = typeof args.domain === 'string' ? args.domain.trim().toLowerCase() : '';
-  const selector = typeof args.selector === 'string' ? args.selector.trim() : '';
-  if (!DOMAIN.test(domain)) throw new Error('--domain must be a domain name, such as example.com');
-  if (!SELECTOR.test(selector)) throw new Error('--selector must be a DKIM selector, such as google');
-  return { domain, selector };
-}
-
-const PIN_ARGS: ColumnDef[] = [
-  { name: 'domain', type: 'string', required: true, description: "The signing domain, such as the principal's." },
-  {
-    name: 'selector',
-    type: 'string',
-    required: true,
-    description: 'The DKIM selector (the s= tag) its mail is signed with.',
-  },
-];
-
-registerResource({
-  name: 'dkim selector',
-  plural: 'dkim-selectors',
-  table: 'gws_ea_inbox_dkim_selectors',
-  idColumn: 'domain',
-  description:
-    "DKIM selectors the operator pinned per domain. Mail from the principal's address counts as theirs only when Gmail verified a DKIM signature from its domain with a pinned selector.",
-  columns: [
-    { name: 'domain', type: 'string', description: 'The signing domain.' },
-    { name: 'selector', type: 'string', description: 'The pinned selector.' },
-    { name: 'pinned_at', type: 'string', description: 'When it was pinned.', generated: true },
-  ],
-  operations: {},
-  customOperations: {
-    list: {
-      access: 'open',
-      hostOnly: true,
-      description: 'List the pinned DKIM selectors.',
-      args: [],
-      handler: async () => listPinnedSelectors(),
-    },
-    pin: {
-      access: 'open',
-      hostOnly: true,
-      description:
-        "Pin a DKIM selector for a domain. Read it from the s= tag of Gmail's dkim=pass result on a message the principal sent the assistant.",
-      args: PIN_ARGS,
-      examples: ['ncl dkim-selectors pin --domain example.com --selector google'],
-      handler: async (args) => {
-        const { domain, selector } = pinArgs(args);
-        return { domain, selector, pinned: await pinSelector(domain, selector, new Date().toISOString()) };
-      },
-    },
-    unpin: {
-      access: 'open',
-      hostOnly: true,
-      description: 'Unpin a DKIM selector. With none left for a domain, no mail from it is the principal’s.',
-      args: PIN_ARGS,
-      handler: async (args) => {
-        const { domain, selector } = pinArgs(args);
-        return { domain, selector, unpinned: await unpinSelector(domain, selector) };
-      },
-    },
-  },
-});
-
 // What status reads, from the host only: `getInboxHealth()` exactly as follow-through reads it.
 register({
   name: 'gws-ea-inbox-health',
-  description:
-    "Report the inbox's health, calendar notifications, and the principal's domains with no pinned DKIM selector.",
+  description: "Report the inbox's health and its calendar notifications.",
   access: 'hidden',
   hostOnly: true,
   parseArgs(raw) {
