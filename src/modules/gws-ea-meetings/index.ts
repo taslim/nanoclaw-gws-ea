@@ -32,6 +32,11 @@
  * event has passed, and holds or rooms left to finish. The inbox tells it
  * when a counterpart replies. Making room (R14, `room.ts`) lists the
  * meetings that could move for someone inner circle or close.
+ *
+ * The email channel's scheduling tools (KTD7, `tools.ts`) are bound to the
+ * calling thread instead of a meeting: `free_time`, `hold`, `book`,
+ * `move_booking` and `cancel_booking` (`SCHEDULING_ACTIONS`). A module
+ * timer releases each thread's holds once they lapse.
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -61,11 +66,14 @@ import {
 } from './guard.js';
 import { answering, createMeetingHandoff, requestIdOf, type Handle } from './handoff.js';
 import { createRoom } from './room.js';
+import { answerOnce, createSchedulingTools, SCHEDULING_GUARD, type SchedulingHandle } from './tools.js';
 
 // The inbox registers this module's migrations, before its own email channel's (KTD10).
 
 /** How often follow-through runs. */
 const FOLLOW_THROUGH_INTERVAL_MS = 60_000;
+/** How often lapsed holds are released. */
+const HOLD_SWEEP_INTERVAL_MS = 60_000;
 
 /** main's side of the handoff: its requests. */
 const MEETINGS_CAPABILITY = 'gws-ea-meetings';
@@ -99,6 +107,7 @@ const handoff = createMeetingHandoff({
   hasOpenTime: actions.hasOpenTime,
   updateBooking: actions.updateBooking,
 });
+const scheduling = createSchedulingTools({ calendar: calendarApi });
 const followThrough = createFollowThrough({
   calendar: calendarApi,
   inboxHealth: getInboxHealth,
@@ -168,6 +177,22 @@ for (const [action, handle, guardAction] of REQUESTS) {
   registerDeliveryAction(action, answering(action, handle), guardSpec(guardAction));
 }
 
+/** external-email's scheduling tools, by action name; each acts on the calling thread alone. */
+const SCHEDULING_REQUESTS: ReadonlyArray<readonly [string, SchedulingHandle]> = [
+  ['free_time', scheduling.freeTime],
+  ['hold', scheduling.hold],
+  ['book', scheduling.book],
+  ['move_booking', scheduling.moveBooking],
+  ['cancel_booking', scheduling.cancelBooking],
+];
+
+/** The scheduling tools' action names, which the runner's tools of the same names send. */
+export const SCHEDULING_ACTIONS: readonly string[] = SCHEDULING_REQUESTS.map(([action]) => action);
+
+for (const [action, handle] of SCHEDULING_REQUESTS) {
+  registerDeliveryAction(action, answerOnce(action, handle), SCHEDULING_GUARD);
+}
+
 registerPersonForgetHook('gws-ea-meetings:purge', (person) => handoff.forgetPerson(person));
 registerThreadStoppedHook('gws-ea-meetings:close', (thread) => handoff.threadStopped(thread));
 registerThreadReplyHook('gws-ea-meetings:follow-through', (threadKey) => followThrough.replied(threadKey));
@@ -185,6 +210,16 @@ export function runFollowThrough(): Promise<void> {
   return followThrough.tick();
 }
 
+/** Release every hold that lapsed, as the host's timer does each minute. Never throws. */
+export function releaseExpiredHolds(): Promise<void> {
+  return scheduling.releaseExpiredHolds();
+}
+
+/** Release every hold a thread placed; throws, with each hold left still recorded, when one could not go yet. */
+export function releaseThreadHolds(threadKey: string): Promise<void> {
+  return scheduling.releaseThreadHolds(threadKey);
+}
+
 onHostStart(async ({ signal }) => {
   if (!(await getDb().hasTable('gws_ea_meetings'))) return;
   // Started, not awaited: host startup never waits on Google. The first pass runs at once,
@@ -193,6 +228,18 @@ onHostStart(async ({ signal }) => {
     while (!signal.aborted) {
       await followThrough.tick();
       await delay(FOLLOW_THROUGH_INTERVAL_MS, undefined, { signal }).catch(() => undefined);
+    }
+  })();
+});
+
+onHostStart(async ({ signal }) => {
+  if (!(await getDb().hasTable('gws_ea_thread_holds'))) return;
+  // Started, not awaited: host startup never waits on Google. The first pass runs at once,
+  // so a hold that lapsed while the host was down goes as soon as it starts.
+  void (async () => {
+    while (!signal.aborted) {
+      await scheduling.releaseExpiredHolds();
+      await delay(HOLD_SWEEP_INTERVAL_MS, undefined, { signal }).catch(() => undefined);
     }
   })();
 });
@@ -222,3 +269,4 @@ export {
   type OutcomeNote,
   type RoomCandidate,
 } from './notes.js';
+export { BOOKING_FACT_TYPE, TAG_THREAD } from './tools.js';

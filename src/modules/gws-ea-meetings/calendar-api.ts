@@ -1,8 +1,8 @@
 /**
  * The Google Calendar calls the meeting handoff and the calendar actions make
  * with the host's own Calendar token (KTD6, KTD11): whether a calendar is one
- * the principal owns and the assistant can write to, an event's organizer,
- * attendees, time and the assistant's own tags, the events in an interval,
+ * the principal owns and the assistant can write to, and its name; an event's
+ * organizer, attendees, time and the assistant's own tags, the events in an interval,
  * colleagues' free/busy, and the writes behind holds, bookings, moves and
  * cancellations. No client library: each call is one `fetch` with the token
  * in its header, so it never reaches a container or an argument list.
@@ -67,6 +67,11 @@ export type ListedEvent = Omit<CalendarEvent, 'id'> & { readonly id?: string };
 /** Whether Google emails the attendees about a write. */
 export type SendUpdates = 'all' | 'none';
 
+/** A calendar-list entry with the calendar's own name, which the invitations of events on it show. */
+export interface CalendarEntry extends CalendarListEntry {
+  readonly summary?: string;
+}
+
 /** The fields a write sets; times are instants. */
 export interface EventWrite {
   readonly summary?: string;
@@ -101,7 +106,7 @@ export interface FreeBusyCalendar {
 
 export interface MeetingsCalendarApi {
   /** The assistant's calendar-list entry for a calendar, or undefined when it has none. */
-  getCalendar(calendarId: string): Promise<CalendarListEntry | undefined>;
+  getCalendar(calendarId: string): Promise<CalendarEntry | undefined>;
   /** One event, or undefined when it does not exist. A deleted event reads as `cancelled`. */
   getEvent(calendarId: string, eventId: string): Promise<CalendarEvent | undefined>;
   /** Every live event that overlaps the interval, recurring events expanded. */
@@ -267,12 +272,13 @@ function toFreeBusy(value: unknown): FreeBusyCalendar {
   return errors.length > 0 ? { visible: false, busy: [] } : { visible: true, busy };
 }
 
-function toCalendarEntry(value: unknown): CalendarListEntry {
+function toCalendarEntry(value: unknown): CalendarEntry {
   if (!isRecord(value) || typeof value.id !== 'string') {
     throw new GoogleApiError(502, 'Google Calendar returned an unreadable calendar list entry');
   }
   const accessRole = optionalString(value.accessRole);
   const dataOwner = optionalString(value.dataOwner);
+  const summary = optionalString(value.summary);
   const allowed =
     isRecord(value.conferenceProperties) && Array.isArray(value.conferenceProperties.allowedConferenceSolutionTypes)
       ? value.conferenceProperties.allowedConferenceSolutionTypes.filter(
@@ -286,6 +292,7 @@ function toCalendarEntry(value: unknown): CalendarListEntry {
     ...(dataOwner === undefined ? {} : { dataOwner }),
     ...(typeof value.deleted === 'boolean' ? { deleted: value.deleted } : {}),
     ...(allowed === undefined ? {} : { conferenceTypes: allowed }),
+    ...(summary === undefined ? {} : { summary }),
   };
 }
 

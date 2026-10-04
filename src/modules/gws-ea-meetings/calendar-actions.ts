@@ -156,10 +156,108 @@ export interface EventRef {
 }
 
 /** A Google event id from its parts: lowercase hex, which Google's id alphabet allows. */
-function eventIdFor(...parts: readonly string[]): string {
+export function eventIdFor(...parts: readonly string[]): string {
   return createHash('sha256')
     .update(['gws-ea', ...parts].join('|'))
     .digest('hex');
+}
+
+/** The private tag that marks an event as one the assistant placed for its owner: a meeting, or a thread. */
+export interface OwnerTag {
+  readonly key: string;
+  readonly value: string;
+}
+
+/** Whether the event Google holds already says what the write would. */
+function alreadyWritten(current: CalendarEvent, event: NewEvent): boolean {
+  const startsTogether =
+    current.start?.dateTime !== undefined && Date.parse(current.start.dateTime) === Date.parse(event.start);
+  const endsTogether =
+    current.end?.dateTime !== undefined && Date.parse(current.end.dateTime) === Date.parse(event.end);
+  const invited = new Set((current.attendees ?? []).flatMap((attendee) => attendee.email ?? []));
+  return startsTogether && endsTogether && (event.attendees ?? []).every((address) => invited.has(address));
+}
+
+/**
+ * Create the event under its own id, or find the one an earlier attempt
+ * made: restored if it was deleted, corrected if its time or people differ,
+ * left alone (and nobody emailed again) if it already says the same. An
+ * event under that id that does not carry `owner`'s tag is never touched.
+ */
+export async function ensureEvent(
+  api: MeetingsCalendarApi,
+  calendarId: string,
+  eventId: string,
+  event: NewEvent,
+  sendUpdates: SendUpdates,
+  owner: OwnerTag,
+): Promise<void> {
+  if ((await api.insertEvent(calendarId, eventId, event, sendUpdates)) === 'exists') {
+    const current = await api.getEvent(calendarId, eventId);
+    if (!current) throw new Error(`Google holds event ${eventId} on ${calendarId} but returns nothing for it`);
+    const deleted = current.status === 'cancelled';
+    if (!deleted && current.tags?.[owner.key] !== owner.value) {
+      throw new Error(`Event ${eventId} on ${calendarId} is not ${owner.value}'s`);
+    }
+    if (deleted || !alreadyWritten(current, event)) {
+      // A conference is created only when the event has none: never a second link.
+      const { conference, ...fields } = event;
+      await api.patchEvent(
+        calendarId,
+        eventId,
+        {
+          ...fields,
+          ...(conference === undefined || current.conference !== undefined ? {} : { conference }),
+          status: 'confirmed',
+        },
+        sendUpdates,
+      );
+    }
+  }
+  recordOwnCalendarChange(calendarId, eventId);
+}
+
+/**
+ * Move a live event to `to`, in place, unless it is there already. Only the
+ * time changes: its title, place and notes stay as they are, and Google
+ * sends the attendees the update.
+ */
+export async function moveEventTo(
+  api: MeetingsCalendarApi,
+  calendarId: string,
+  current: CalendarEvent,
+  to: { readonly start_at: string; readonly end_at: string },
+  timezone: string,
+): Promise<void> {
+  const span = eventSpan(current, timezone);
+  if (!span || span.start !== Date.parse(to.start_at) || span.end !== Date.parse(to.end_at)) {
+    await api.patchEvent(calendarId, current.id, { start: to.start_at, end: to.end_at }, 'all');
+    recordOwnCalendarChange(calendarId, current.id);
+  }
+}
+
+/**
+ * A booked event's Meet link as Google reports it now. The booking already
+ * stands, so a read that fails counts the link as still being created:
+ * Google makes it after the request.
+ */
+export async function readConference(
+  api: MeetingsCalendarApi,
+  calendarId: string,
+  eventId: string,
+): Promise<EventConference> {
+  /* eslint-disable no-catch-all/no-catch-all -- the booking stands regardless; only this read-back is forgiven */
+  try {
+    return (await api.getEvent(calendarId, eventId))?.conference ?? { status: 'pending' };
+  } catch (err) {
+    log.warn('Could not read back a booked event’s Meet status; reading it as still being created', {
+      calendarId,
+      eventId,
+      err,
+    });
+    return { status: 'pending' };
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
 }
 
 /** The hold's event id: the same for the same meeting and slot on every attempt. */
@@ -482,67 +580,25 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
   // The assistant's own events
   // -------------------------------------------------------------------------
 
-  /** Whether the event Google holds already says what the write would. */
-  function alreadyWritten(current: CalendarEvent, event: NewEvent): boolean {
-    const startsTogether =
-      current.start?.dateTime !== undefined && Date.parse(current.start.dateTime) === Date.parse(event.start);
-    const endsTogether =
-      current.end?.dateTime !== undefined && Date.parse(current.end.dateTime) === Date.parse(event.end);
-    const invited = new Set((current.attendees ?? []).flatMap((attendee) => attendee.email ?? []));
-    return startsTogether && endsTogether && (event.attendees ?? []).every((address) => invited.has(address));
-  }
-
-  /**
-   * Create the event under its own id, or find the one an earlier attempt
-   * made: restored if it was deleted, corrected if its time or people differ,
-   * left alone (and nobody emailed again) if it already says the same.
-   */
-  async function ensureEvent(
+  /** Create or find a meeting's own event (`ensureEvent`), tagged as that meeting's. */
+  async function ensureMeetingEvent(
     calendarId: string,
     eventId: string,
     event: NewEvent,
     sendUpdates: SendUpdates,
     meetingId: string,
   ): Promise<void> {
-    if ((await calendar().insertEvent(calendarId, eventId, event, sendUpdates)) === 'exists') {
-      const current = await calendar().getEvent(calendarId, eventId);
-      if (!current) throw new Error(`Google holds event ${eventId} on ${calendarId} but returns nothing for it`);
-      const deleted = current.status === 'cancelled';
-      if (!deleted && current.tags?.[TAG_MEETING] !== meetingId) {
-        throw new Error(`Event ${eventId} on ${calendarId} is not meeting ${meetingId}'s`);
-      }
-      if (deleted || !alreadyWritten(current, event)) {
-        // A conference is created only when the event has none: never a second link.
-        const { conference, ...fields } = event;
-        await calendar().patchEvent(
-          calendarId,
-          eventId,
-          {
-            ...fields,
-            ...(conference === undefined || current.conference !== undefined ? {} : { conference }),
-            status: 'confirmed',
-          },
-          sendUpdates,
-        );
-      }
-    }
-    recordOwnCalendarChange(calendarId, eventId);
+    await ensureEvent(calendar(), calendarId, eventId, event, sendUpdates, { key: TAG_MEETING, value: meetingId });
   }
 
   /**
-   * Move an existing event to the slot's time, in place, unless it is there
-   * already. Only the time changes: the principal's own title, place and
-   * notes stay as they are, and Google sends the attendees the update. False
-   * when the event is no longer on the calendar.
+   * Move an existing event to the slot's time (`moveEventTo`). False when
+   * the event is no longer on the calendar.
    */
   async function moveEvent(calendarId: string, eventId: string, slot: OfferedSlot, timezone: string): Promise<boolean> {
     const current = await calendar().getEvent(calendarId, eventId);
     if (!current || current.status === 'cancelled') return false;
-    const span = eventSpan(current, timezone);
-    if (!span || span.start !== Date.parse(slot.start_at) || span.end !== Date.parse(slot.end_at)) {
-      await calendar().patchEvent(calendarId, eventId, { start: slot.start_at, end: slot.end_at }, 'all');
-      recordOwnCalendarChange(calendarId, eventId);
-    }
+    await moveEventTo(calendar(), calendarId, current, slot, timezone);
     return true;
   }
 
@@ -622,7 +678,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     }
     if (meeting.booking_calendar_id === null) throw new Error(`Meeting ${meeting.id} has no booking calendar`);
     const eventId = bookingEventId(meeting.id);
-    await ensureEvent(
+    await ensureMeetingEvent(
       meeting.booking_calendar_id,
       eventId,
       {
@@ -673,26 +729,10 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     }
   }
 
-  /**
-   * The event's Meet link as Google reports it now, when the invitation
-   * asked for one. The booking already stands, so a read that fails counts
-   * the link as still being created: Google makes it after the request.
-   */
+  /** The event's Meet link as Google reports it now (`readConference`), when the invitation asked for one. */
   async function conferenceOf(booking: Booking, invitation: Invitation): Promise<EventConference | undefined> {
     if (invitation.video_call !== true) return undefined;
-    /* eslint-disable no-catch-all/no-catch-all -- the booking stands regardless; only this read-back is forgiven */
-    try {
-      return (await calendar().getEvent(booking.calendar_id, booking.event_id))?.conference ?? { status: 'pending' };
-    } catch (err) {
-      log.warn('Could not read back a booked event’s Meet status; reading it as still being created', {
-        meetingId: booking.meeting_id,
-        calendarId: booking.calendar_id,
-        eventId: booking.event_id,
-        err,
-      });
-      return { status: 'pending' };
-    }
-    /* eslint-enable no-catch-all/no-catch-all */
+    return readConference(calendar(), booking.calendar_id, booking.event_id);
   }
 
   // -------------------------------------------------------------------------
@@ -903,7 +943,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
         end_at: slot.end_at,
         held_at: new Date().toISOString(),
       });
-      await ensureEvent(
+      await ensureMeetingEvent(
         calendarId,
         eventId,
         {

@@ -5,9 +5,9 @@
  * calendar whose free/busy is not shared reads as not visible, and a Meet
  * link is created once per request id, as `meetCreation` says it goes.
  */
-import type { CalendarListEntry } from '../../gws-ea-inbox/calendar-notifications.js';
 import { GoogleApiError } from '../../gws-ea-inbox/gmail-api.js';
 import type {
+  CalendarEntry,
   CalendarEvent,
   EventConference,
   EventWrite,
@@ -81,7 +81,7 @@ function apply(event: StoredEvent, fields: EventWrite, meet: EventConference['st
 }
 
 export class FakeCalendar implements MeetingsCalendarApi {
-  readonly calendars = new Map<string, CalendarListEntry>();
+  readonly calendars = new Map<string, CalendarEntry>();
   readonly events: StoredEvent[] = [];
   readonly writes: CalendarWriteRecord[] = [];
   /** Colleagues' shared free/busy, by address; an address absent here is hidden from the assistant. */
