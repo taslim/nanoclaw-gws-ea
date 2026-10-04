@@ -261,7 +261,7 @@ describe('deadlines', () => {
     expect(notes(session, NUDGE)).toHaveLength(1);
 
     // With nothing held, a reply leaves no deadline behind.
-    data(await ask(session, 'meeting_release_holds', { meeting_id: stored.id }));
+    data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [] }));
     await theyWrite(`Acme Sales <${ADDRESSES.acme}>`, 'None of those work, sorry.');
     expect(await meeting(stored.id)).toMatchObject({ nudge_at: null, give_up_at: null });
   });

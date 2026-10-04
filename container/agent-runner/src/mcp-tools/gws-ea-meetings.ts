@@ -2,28 +2,31 @@
  * The meeting handoff's tools (KTD5, KTD16): typed requests the host carries
  * between `main` and `external-email`. No free text passes between the two.
  *
+ * Each tool is named after the host action it sends, by what it acts on:
+ *
  * - `main` (capability `gws-ea-meetings`) hands a scheduling job over with
- *   `arrange`, `reschedule` or `ask_organizer`, and changes one with
- *   `amend` or `cancel`; `cancel` also calls off an event the principal
- *   organizes with others. It answers a thread waiting for it once with
- *   `respond`, closes one with `dismiss`, and answers the principal's own
- *   email with `reply_to_principal`.
+ *   `meeting_arrange` or `meeting_reschedule` (which asks the organizer of an
+ *   event someone else organizes), and changes one with `meeting_amend` or
+ *   `meeting_cancel`; `meeting_cancel` also calls off an event the principal
+ *   organizes with others. It answers a thread waiting for it with
+ *   `email_respond`, closes one with `email_dismiss`, and answers the
+ *   principal's own email with `email_reply_to_principal`.
  * - `external-email` (capability `gws-ea-meetings-external`) offers the
- *   principal's times with `free_time`, holds them with `hold`, frees them
- *   with `release_holds`, books the one agreed with `book` (and moves a
- *   booked meeting with it), all by slot id (KTD11), places the people its
- *   replies go to with `recipients`, and reports how the meeting ended with
- *   `outcome`.
- * - `reschedule` with `making_room_for` moves a meeting a needs-room note
- *   listed, and the time it frees goes to the meeting that needs it (R14).
+ *   principal's times with `meeting_free_time`, holds exactly the times it
+ *   offers with `meeting_hold`, books the one agreed with `meeting_book`
+ *   (and moves a booked meeting with it), all by slot id (KTD11), places the
+ *   people its replies go to with `email_recipients`, and reports how the
+ *   meeting ended with `meeting_outcome`.
  *
  * Each tool writes one request and waits for the host's answer. The host
  * checks every request against the caller and the meeting, so these
- * handlers only shape the call.
+ * handlers only shape the call. A request the host is slow to answer can be
+ * checked with `request_status`; each tool's timeout says whether a repeat
+ * is safe.
  */
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { requestAction } from '../action-request.js';
+import { answerResult, requestAction } from '../action-request.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -35,16 +38,12 @@ export const MEETING_REQUEST_TIMEOUT_MS = 120_000;
 
 const OUTCOMES = ['booked', 'settled', 'needs-room', 'not-scheduling', 'gave-up', 'responded'] as const;
 
-function ok(text: string): CallToolResult {
-  return { content: [{ type: 'text', text }] };
-}
-
 function err(text: string): CallToolResult {
   return { content: [{ type: 'text', text: `Error: ${text}` }], isError: true };
 }
 
 /** A field's shape, checked before anything is sent; the host checks its meaning. */
-type Field = 'string' | 'integer' | 'boolean' | 'people' | 'strings' | 'addresses';
+type Field = 'string' | 'integer' | 'boolean' | 'people' | 'ids' | 'addresses';
 
 /** `{ person_id, email? }` for someone with a record, or `{ email }` for someone without one. */
 function isPersonRef(value: unknown): boolean {
@@ -66,12 +65,10 @@ function fieldProblem(name: string, value: unknown, field: Field): string | unde
       return Array.isArray(value) && value.length > 0 && value.every(isPersonRef)
         ? undefined
         : `${name} must list people as { person_id, email? }, or { email } for someone without a record`;
-    case 'strings':
-      return Array.isArray(value) &&
-        value.length > 0 &&
-        value.every((item) => typeof item === 'string' && item.trim() !== '')
+    case 'ids':
+      return Array.isArray(value) && value.every((item) => typeof item === 'string' && item.trim() !== '')
         ? undefined
-        : `${name} must list one or more ids`;
+        : `${name} must list ids`;
     case 'addresses':
       return Array.isArray(value) && value.every((item) => typeof item === 'string' && item.trim() !== '')
         ? undefined
@@ -87,7 +84,7 @@ function fieldProblem(name: string, value: unknown, field: Field): string | unde
 function fieldsOf(
   args: Record<string, unknown>,
   required: Readonly<Record<string, Field>>,
-  optional: Readonly<Record<string, Field>> = {},
+  optional: Readonly<Record<string, Field>>,
 ): Record<string, unknown> | string {
   const fields: Record<string, unknown> = {};
   for (const [name, field] of Object.entries(required)) {
@@ -104,35 +101,60 @@ function fieldsOf(
   return fields;
 }
 
-async function send(
-  action: string,
-  fields: Record<string, unknown> | string,
-  signal: AbortSignal | undefined,
-): Promise<CallToolResult> {
-  if (typeof fields === 'string') return err(fields);
-  const result = await requestAction(action, fields, { timeoutMs: MEETING_REQUEST_TIMEOUT_MS, signal });
-  switch (result.status) {
-    case 'cancelled':
-      return err('The request was cancelled before the host answered.');
-    case 'timeout':
-      return err(
-        'The host did not answer within two minutes. The request may still go through, so do not send it again; check again later.',
-      );
-    case 'answered': {
-      const { frame } = result;
-      if (!frame.ok) return err(frame.error.message);
-      const data = frame.data;
-      const message =
-        typeof data === 'object' && data !== null && typeof (data as Record<string, unknown>).message === 'string'
-          ? String((data as Record<string, unknown>).message)
-          : JSON.stringify(data);
-      return ok(message);
-    }
-    default: {
-      const unreachable: never = result;
-      throw new Error(`Unknown request result ${JSON.stringify(unreachable)}`);
-    }
-  }
+/** What a timeout tells the agent: the request may still go through, and whether to repeat it. */
+function timeoutText(requestId: string, repeatable: boolean): string {
+  return (
+    `The host has not answered request ${requestId} yet, and it may still go through. ` +
+    (repeatable
+      ? 'Check it with request_status, or make the same call again: a repeat changes nothing twice.'
+      : 'Check it with request_status before you do anything else, and do not send it again.')
+  );
+}
+
+interface RequestTool {
+  /** The tool's name, which is also the host action it sends. */
+  readonly name: string;
+  readonly description: string;
+  readonly properties: Record<string, object>;
+  readonly required: Readonly<Record<string, Field>>;
+  readonly optional?: Readonly<Record<string, Field>>;
+  /** Whether sending the same request again is safe: the host does nothing twice. */
+  readonly repeatable: boolean;
+  /** A problem with the call's shape the fields alone cannot show. */
+  readonly check?: (args: Record<string, unknown>) => string | undefined;
+}
+
+/** A tool that sends one typed request named after itself, and returns the host's answer. */
+function requestTool(spec: RequestTool): McpToolDefinition {
+  return {
+    tool: {
+      name: spec.name,
+      description: spec.description,
+      inputSchema: { type: 'object' as const, properties: spec.properties, required: Object.keys(spec.required) },
+    },
+    async handler(args, context) {
+      const problem = spec.check?.(args);
+      if (problem) return err(problem);
+      const fields = fieldsOf(args, spec.required, spec.optional ?? {});
+      if (typeof fields === 'string') return err(fields);
+      const result = await requestAction(spec.name, fields, {
+        timeoutMs: MEETING_REQUEST_TIMEOUT_MS,
+        signal: context?.signal,
+      });
+      switch (result.status) {
+        case 'cancelled':
+          return err('The request was cancelled before the host answered.');
+        case 'timeout':
+          return err(timeoutText(result.requestId, spec.repeatable));
+        case 'answered':
+          return answerResult(result.frame);
+        default: {
+          const unreachable: never = result;
+          throw new Error(`Unknown request result ${JSON.stringify(unreachable)}`);
+        }
+      }
+    },
+  };
 }
 
 const WINDOW_PROPERTIES = {
@@ -186,278 +208,173 @@ const THREAD_KEY = {
   description: 'The thread_key from the note about an email: one someone sent you, or the principal copied you into.',
 } as const;
 
-export const arrange: McpToolDefinition = {
-  tool: {
-    name: 'arrange',
-    description:
-      "Hand a meeting to external-email, which emails the other people, finds a time, and books it on the principal's calendar. Use it once you know who, how long, and roughly when. For a scheduling request in an email that reached you, pass that thread's thread_key: the meeting is arranged in that thread, with the people on it. Otherwise name the people, and a new thread starts. You get a note when the meeting is booked or ends. When everyone is a colleague in the assistant's organization whose calendar Google shows, the host books the first time free for all at once and its answer is the booking: nobody is emailed.",
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        people: {
-          type: 'array',
-          description:
-            "Who to meet, each by their people-record id, with email when the record holds more than one address; someone with no record by { email }. With thread_key, the thread's own people come already: list only anyone to add.",
-          items: PEOPLE_ITEMS,
-        },
-        thread_key: THREAD_KEY,
-        copy_principal: {
-          type: 'boolean',
-          description:
-            'For a new thread only: copy the principal on it, when their presence helps, such as a warm introduction, or when they asked to be copied. Left out, they are not copied.',
-        },
-        calendar_id: {
-          type: 'string',
-          description: "The principal's calendar to book on: one of theirs that you can write to.",
-        },
-        length_minutes: { type: 'integer', description: 'How long the meeting is, in minutes (5 to 480).' },
-        ...WINDOW_PROPERTIES,
-        purpose: PURPOSE,
-        constraints: CONSTRAINTS,
-        meeting_kind: MEETING_KIND,
-      },
-      required: ['calendar_id', 'length_minutes', 'window_start', 'window_end', 'purpose'],
+export const arrange = requestTool({
+  name: 'meeting_arrange',
+  description:
+    "Hand a meeting to external-email, which emails the other people, finds a time, and books it on the principal's calendar. For a scheduling request in an email that reached you, pass that thread's thread_key: the meeting is arranged in that thread, with the people on it. Otherwise name the people, and a new thread starts. When everyone is a colleague in the assistant's organization whose calendar Google shows, the host books the best time free for all at once, and its answer is the booking: nobody is emailed.",
+  properties: {
+    people: {
+      type: 'array',
+      description:
+        "Who to meet, each by their people-record id, with email when the record holds more than one address; someone with no record by { email }. With thread_key, the thread's own people come already: list only anyone to add.",
+      items: PEOPLE_ITEMS,
     },
+    thread_key: THREAD_KEY,
+    copy_principal: {
+      type: 'boolean',
+      description: 'For a new thread only: copy the principal on it. Left out, they are not copied.',
+    },
+    calendar_id: {
+      type: 'string',
+      description: "The principal's calendar to book on: one of theirs that you can write to.",
+    },
+    length_minutes: { type: 'integer', description: 'How long the meeting is, in minutes (5 to 480).' },
+    ...WINDOW_PROPERTIES,
+    purpose: PURPOSE,
+    constraints: CONSTRAINTS,
+    meeting_kind: MEETING_KIND,
   },
-  async handler(args, context) {
-    if (args.people === undefined && args.thread_key === undefined) {
-      return err('Name the people to meet, or the thread_key the note about an email gave you.');
-    }
-    return send(
-      'meeting_arrange',
-      fieldsOf(
-        args,
-        {
-          calendar_id: 'string',
-          length_minutes: 'integer',
-          window_start: 'string',
-          window_end: 'string',
-          purpose: 'string',
-        },
-        {
-          people: 'people',
-          thread_key: 'string',
-          copy_principal: 'boolean',
-          constraints: 'string',
-          meeting_kind: 'string',
-        },
-      ),
-      context?.signal,
-    );
+  required: {
+    calendar_id: 'string',
+    length_minutes: 'integer',
+    window_start: 'string',
+    window_end: 'string',
+    purpose: 'string',
   },
-};
+  optional: {
+    people: 'people',
+    thread_key: 'string',
+    copy_principal: 'boolean',
+    constraints: 'string',
+    meeting_kind: 'string',
+  },
+  repeatable: false,
+  check: (args) =>
+    args.people === undefined && args.thread_key === undefined
+      ? 'Name the people to meet, or the thread_key the note about an email gave you.'
+      : undefined,
+});
 
-export const reschedule: McpToolDefinition = {
-  tool: {
-    name: 'reschedule',
-    description:
-      "Have external-email move a meeting the principal organizes to a new time, writing to the other attendees and moving the event once they agree. Use it for an event on the principal's calendar that the principal (or the assistant for them) organized. For an event someone else organized, use ask_organizer. To make room for a meeting that needs it, pass making_room_for with one of the meetings its note lists: the time the move frees goes to that meeting.",
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        calendar_id: { type: 'string', description: 'The calendar the event is on.' },
-        event_id: { type: 'string', description: 'The event’s id on that calendar.' },
-        length_minutes: {
-          type: 'integer',
-          description: 'A new length in minutes, when it changes; otherwise the event keeps its length.',
-        },
-        ...WINDOW_PROPERTIES,
-        purpose: PURPOSE,
-        constraints: CONSTRAINTS,
-        meeting_kind: MEETING_KIND,
-        making_room_for: {
-          type: 'string',
-          description:
-            'The id of a meeting whose note says it needs room, when this move makes room for it. Only an event that note lists can move for it.',
-        },
-      },
-      required: ['calendar_id', 'event_id', 'window_start', 'window_end', 'purpose'],
+export const reschedule = requestTool({
+  name: 'meeting_reschedule',
+  description:
+    "Have external-email move an event on the principal's calendar to a time in a new window. When the principal organizes it, external-email writes to its guests and the host moves the event once they agree. When someone else organizes it, external-email asks that organizer to move it, and the answer says so. To make room for a meeting with someone inner circle or close, pass making_room_for with that meeting's id: only a meeting the assistant booked with people who matter less can move for it, and the time the move frees goes to that meeting.",
+  properties: {
+    calendar_id: { type: 'string', description: 'The calendar the event is on.' },
+    event_id: { type: 'string', description: 'The event’s id on that calendar.' },
+    length_minutes: {
+      type: 'integer',
+      description: 'A new length in minutes, for an event the principal organizes; otherwise it keeps its length.',
+    },
+    ...WINDOW_PROPERTIES,
+    purpose: PURPOSE,
+    constraints: CONSTRAINTS,
+    meeting_kind: MEETING_KIND,
+    making_room_for: {
+      type: 'string',
+      description: 'The id of a meeting with someone inner circle or close that this move makes room for.',
     },
   },
-  async handler(args, context) {
-    return send(
-      'meeting_reschedule',
-      fieldsOf(
-        args,
-        { calendar_id: 'string', event_id: 'string', window_start: 'string', window_end: 'string', purpose: 'string' },
-        { length_minutes: 'integer', constraints: 'string', meeting_kind: 'string', making_room_for: 'string' },
-      ),
-      context?.signal,
-    );
-  },
-};
+  required: { calendar_id: 'string', event_id: 'string', window_start: 'string', window_end: 'string', purpose: 'string' },
+  optional: { length_minutes: 'integer', constraints: 'string', meeting_kind: 'string', making_room_for: 'string' },
+  repeatable: false,
+});
 
-export const askOrganizer: McpToolDefinition = {
-  tool: {
-    name: 'ask_organizer',
-    description:
-      'Have external-email ask the organizer of an invitation to the principal to move it to another time, when it conflicts with something that matters more.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        calendar_id: { type: 'string', description: "The principal's calendar the invitation is on." },
-        event_id: { type: 'string', description: 'The invitation’s event id on that calendar.' },
-        ...WINDOW_PROPERTIES,
-        purpose: PURPOSE,
-        constraints: CONSTRAINTS,
-      },
-      required: ['calendar_id', 'event_id', 'window_start', 'window_end', 'purpose'],
-    },
+export const cancel = requestTool({
+  name: 'meeting_cancel',
+  description:
+    "Call something off. Give meeting_id for a meeting you handed to external-email: the host releases its held times and deletes the event it booked, and Google sends the guests its cancellation. Or give calendar_id and event_id for an event the principal organizes with others: the host deletes it, and Google sends its guests the cancellation. For an event someone else organizes, decline it or have meeting_reschedule ask its organizer instead.",
+  properties: {
+    meeting_id: { type: 'string', description: 'The meeting’s id, such as mtg-….' },
+    calendar_id: { type: 'string', description: 'The calendar the event is on, instead of meeting_id.' },
+    event_id: { type: 'string', description: 'The event’s id on that calendar, with calendar_id.' },
   },
-  async handler(args, context) {
-    return send(
-      'meeting_ask_organizer',
-      fieldsOf(
-        args,
-        { calendar_id: 'string', event_id: 'string', window_start: 'string', window_end: 'string', purpose: 'string' },
-        { constraints: 'string' },
-      ),
-      context?.signal,
-    );
-  },
-};
-
-export const cancel: McpToolDefinition = {
-  tool: {
-    name: 'cancel',
-    description:
-      'Call something off when the principal asks. Give meeting_id for a meeting you handed to external-email: its email thread is closed and the people it wrote to get one short line saying the meeting is off; an event it already booked stays until you cancel that too. Or give calendar_id and event_id for an event the principal organizes with others, on a calendar you can change: the host deletes it and Google sends its guests the cancellation. For an event someone else organizes, use ask_organizer or decline it instead.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        meeting_id: { type: 'string', description: 'The meeting’s id, such as mtg-….' },
-        calendar_id: { type: 'string', description: 'The calendar the event is on, instead of meeting_id.' },
-        event_id: { type: 'string', description: 'The event’s id on that calendar, with calendar_id.' },
-      },
-    },
-  },
-  async handler(args, context) {
+  required: {},
+  optional: { meeting_id: 'string', calendar_id: 'string', event_id: 'string' },
+  repeatable: false,
+  check: (args) => {
     if (args.meeting_id !== undefined) {
-      if (args.calendar_id !== undefined || args.event_id !== undefined) {
-        return err('Give either meeting_id, or calendar_id with event_id, not both.');
-      }
-      return send('meeting_cancel', fieldsOf(args, { meeting_id: 'string' }), context?.signal);
+      return args.calendar_id !== undefined || args.event_id !== undefined
+        ? 'Give either meeting_id, or calendar_id with event_id, not both.'
+        : undefined;
     }
-    if (args.calendar_id === undefined && args.event_id === undefined) {
-      return err('Give the meeting_id of a meeting you handed over, or the calendar_id and event_id of an event.');
-    }
-    return send('meeting_cancel', fieldsOf(args, { calendar_id: 'string', event_id: 'string' }), context?.signal);
+    return args.calendar_id === undefined || args.event_id === undefined
+      ? 'Give the meeting_id of a meeting you handed over, or the calendar_id and event_id of an event.'
+      : undefined;
   },
-};
+});
 
-export const amend: McpToolDefinition = {
-  tool: {
-    name: 'amend',
-    description:
-      "Change a meeting external-email is still arranging: its length, window, or constraints when the principal changes their mind, or people to add to a meeting you handed over with arrange. Someone added joins the meeting and its email thread, and external-email's next reply goes to them too. external-email gets the new brief at once.",
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        meeting_id: { type: 'string', description: 'The meeting’s id.' },
-        length_minutes: { type: 'integer', description: 'The new length in minutes.' },
-        ...WINDOW_PROPERTIES,
-        constraints: CONSTRAINTS,
-        people: {
-          type: 'array',
-          description:
-            'People to add, each by their people-record id, with email when the record holds more than one address; someone with no record by { email }.',
-          items: PEOPLE_ITEMS,
-        },
-      },
-      required: ['meeting_id'],
+export const amend = requestTool({
+  name: 'meeting_amend',
+  description:
+    "Change a meeting external-email is still arranging: its length, window, or constraints, or people to add to a meeting you handed over with meeting_arrange. Someone added joins the meeting and its email thread, and external-email's next reply goes to them too. external-email gets the new brief at once.",
+  properties: {
+    meeting_id: { type: 'string', description: 'The meeting’s id.' },
+    length_minutes: { type: 'integer', description: 'The new length in minutes.' },
+    ...WINDOW_PROPERTIES,
+    constraints: CONSTRAINTS,
+    people: {
+      type: 'array',
+      description:
+        'People to add, each by their people-record id, with email when the record holds more than one address; someone with no record by { email }.',
+      items: PEOPLE_ITEMS,
     },
   },
-  async handler(args, context) {
-    return send(
-      'meeting_amend',
-      fieldsOf(
-        args,
-        { meeting_id: 'string' },
-        {
-          length_minutes: 'integer',
-          window_start: 'string',
-          window_end: 'string',
-          constraints: 'string',
-          people: 'people',
-        },
-      ),
-      context?.signal,
-    );
+  required: { meeting_id: 'string' },
+  optional: {
+    length_minutes: 'integer',
+    window_start: 'string',
+    window_end: 'string',
+    constraints: 'string',
+    people: 'people',
   },
-};
+  repeatable: false,
+});
 
-export const respond: McpToolDefinition = {
-  tool: {
-    name: 'respond',
-    description:
-      'Have external-email write one reply in an email thread that is waiting for you, to everyone on it: to decline with an alternative, route, acknowledge, or send a holding line. Say in purpose what the reply must do; external-email writes it. You get a note once it has gone, or if it could not be sent, and the thread then waits for you again, so you can arrange, respond, or dismiss it later. For a scheduling request, use arrange with the thread_key instead.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        thread_key: THREAD_KEY,
-        purpose: {
-          type: 'string',
-          description:
-            'What the one reply must do, such as "Decline kindly: the principal is not taking speaking slots this autumn; suggest asking again in January". Everyone on the thread may read what it leads to, so write only what they may know. Up to 500 characters.',
-        },
-        constraints: CONSTRAINTS,
-      },
-      required: ['thread_key', 'purpose'],
+export const respond = requestTool({
+  name: 'email_respond',
+  description:
+    'Have external-email answer an email thread that is waiting for you, to everyone on it, such as declining with an alternative or routing the request. Say in purpose what the answer must do; external-email writes it. For a scheduling request, use meeting_arrange with the thread_key instead.',
+  properties: {
+    thread_key: THREAD_KEY,
+    purpose: {
+      type: 'string',
+      description:
+        'What the answer must do, such as "Decline kindly: the principal is not taking speaking slots this autumn; suggest asking again in January". Everyone on the thread may read what it leads to, so write only what they may know. Up to 500 characters.',
+    },
+    constraints: CONSTRAINTS,
+  },
+  required: { thread_key: 'string', purpose: 'string' },
+  optional: { constraints: 'string' },
+  repeatable: false,
+});
+
+export const dismiss = requestTool({
+  name: 'email_dismiss',
+  description:
+    'Close an email thread that is waiting for you, sending nothing. Later mail in it reaches you as a new email. A thread with a meeting in progress is closed by cancelling the meeting instead.',
+  properties: { thread_key: THREAD_KEY },
+  required: { thread_key: 'string' },
+  repeatable: true,
+});
+
+export const replyToPrincipal = requestTool({
+  name: 'email_reply_to_principal',
+  description:
+    "Answer an email the principal sent you, by email, in their thread. It goes to the principal alone, from the assistant's address.",
+  properties: {
+    gmail_message_id: {
+      type: 'string',
+      description: 'The Gmail message id from the note about the principal’s email.',
+    },
+    text: {
+      type: 'string',
+      description: 'Your answer, as plain text, written to the principal. Line breaks are kept.',
     },
   },
-  async handler(args, context) {
-    return send(
-      'meeting_respond',
-      fieldsOf(args, { thread_key: 'string', purpose: 'string' }, { constraints: 'string' }),
-      context?.signal,
-    );
-  },
-};
-
-export const dismiss: McpToolDefinition = {
-  tool: {
-    name: 'dismiss',
-    description:
-      'Close an email thread that is waiting for you, sending nothing: for a thread that needs no reply, such as a thank-you. Later mail in it reaches you as a new email. A thread with a meeting in progress is closed by cancelling the meeting instead.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: { thread_key: THREAD_KEY },
-      required: ['thread_key'],
-    },
-  },
-  async handler(args, context) {
-    return send('meeting_dismiss', fieldsOf(args, { thread_key: 'string' }), context?.signal);
-  },
-};
-
-export const replyToPrincipal: McpToolDefinition = {
-  tool: {
-    name: 'reply_to_principal',
-    description:
-      "Answer an email the principal sent you, by email, in their thread. It goes to the principal alone, from the assistant's address. Use it whenever the principal emails you, and don't repeat the answer in chat.",
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        gmail_message_id: {
-          type: 'string',
-          description: 'The Gmail message id from the note about the principal’s email.',
-        },
-        text: {
-          type: 'string',
-          description: 'Your answer, as plain text, written to the principal. Line breaks are kept.',
-        },
-      },
-      required: ['gmail_message_id', 'text'],
-    },
-  },
-  async handler(args, context) {
-    return send(
-      'meeting_reply_to_principal',
-      fieldsOf(args, { gmail_message_id: 'string', text: 'string' }),
-      context?.signal,
-    );
-  },
-};
+  required: { gmail_message_id: 'string', text: 'string' },
+  repeatable: false,
+});
 
 // ---------------------------------------------------------------------------
 // external-email's calendar tools
@@ -465,162 +382,97 @@ export const replyToPrincipal: McpToolDefinition = {
 
 const MEETING_ID = { type: 'string', description: 'The meeting id from your brief.' } as const;
 
-export const freeTime: McpToolDefinition = {
-  tool: {
-    name: 'free_time',
-    description:
-      "Get open times for this conversation's meeting, best first, each with a slot id and its day and local time. The host works them out from the principal's calendar and preferences: you never see the calendar itself. With date (and time), it looks at that day only (and checks that exact start), in timezone when you give one. Calls are capped per meeting.",
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        meeting_id: MEETING_ID,
-        date: {
-          type: 'string',
-          description: 'Only this day, as YYYY-MM-DD, such as a day the other side asked about.',
-        },
-        time: {
-          type: 'string',
-          description: 'With date: check this exact start, as 24-hour HH:MM, such as a time the other side proposed.',
-        },
-        timezone: {
-          type: 'string',
-          description:
-            "The other side's timezone, such as America/New_York, when you know it: date and time are read in it, and each time is also shown in it.",
-        },
-      },
-      required: ['meeting_id'],
+export const freeTime = requestTool({
+  name: 'meeting_free_time',
+  description:
+    "Get open times for this conversation's meeting, best first, each with a slot id and its day and local time. The host works them out from the principal's calendar and preferences: you never see the calendar itself. With date (and time), it looks at that day only (and checks that exact start), read in timezone when you give one. Answers are capped per meeting.",
+  properties: {
+    meeting_id: MEETING_ID,
+    date: {
+      type: 'string',
+      description: 'Only this day, as YYYY-MM-DD, such as a day the other side asked about.',
+    },
+    time: {
+      type: 'string',
+      description: 'With date: check this exact start, as 24-hour HH:MM, such as a time the other side proposed.',
+    },
+    timezone: {
+      type: 'string',
+      description:
+        "The other side's timezone, such as America/New_York, when you know it: date and time are read in it, and each time is also shown in it.",
     },
   },
-  async handler(args, context) {
-    if (args.time !== undefined && args.date === undefined) return err('Give the date the time is on.');
-    return send(
-      'meeting_free_time',
-      fieldsOf(args, { meeting_id: 'string' }, { date: 'string', time: 'string', timezone: 'string' }),
-      context?.signal,
-    );
-  },
-};
+  required: { meeting_id: 'string' },
+  optional: { date: 'string', time: 'string', timezone: 'string' },
+  repeatable: true,
+  check: (args) => (args.time !== undefined && args.date === undefined ? 'Give the date the time is on.' : undefined),
+});
 
-export const hold: McpToolDefinition = {
-  tool: {
-    name: 'hold',
-    description:
-      "Hold the times you offer on the principal's calendar, by their slot ids from free_time, so nothing else takes them while the other side chooses. At most three per meeting. A time that is no longer open is refused.",
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        meeting_id: MEETING_ID,
-        slot_ids: { type: 'array', items: { type: 'string' }, description: 'The slot ids of the times you offer.' },
-      },
-      required: ['meeting_id', 'slot_ids'],
-    },
+export const hold = requestTool({
+  name: 'meeting_hold',
+  description:
+    "Hold exactly the times you offer, by their slot ids from meeting_free_time, so nothing else takes them while the other side chooses. Any other time held for the meeting is released; an empty list releases them all. At most three. A time that is no longer open is refused, and then nothing changes.",
+  properties: {
+    meeting_id: MEETING_ID,
+    slot_ids: { type: 'array', items: { type: 'string' }, description: 'The slot ids of the times you offer now.' },
   },
-  async handler(args, context) {
-    return send('meeting_hold', fieldsOf(args, { meeting_id: 'string', slot_ids: 'strings' }), context?.signal);
-  },
-};
+  required: { meeting_id: 'string', slot_ids: 'ids' },
+  repeatable: true,
+});
 
-export const releaseHolds: McpToolDefinition = {
-  tool: {
-    name: 'release_holds',
-    description:
-      'Release the times you held for this meeting when the other side turns them down: the slot ids given, or every hold when you give none. Booking releases the other holds by itself.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        meeting_id: MEETING_ID,
-        slot_ids: { type: 'array', items: { type: 'string' }, description: 'The held slot ids to release.' },
-      },
-      required: ['meeting_id'],
-    },
+export const book = requestTool({
+  name: 'meeting_book',
+  description:
+    "Book the time the other side picked, by its slot id. The host creates the meeting on the principal's calendar, invites the people in your brief, and releases the other holds; for a meeting being moved, it moves the existing event. Once the meeting is booked, a newly offered slot moves the booked event there instead.",
+  properties: {
+    meeting_id: MEETING_ID,
+    slot_id: { type: 'string', description: 'The slot id of the time they picked.' },
   },
-  async handler(args, context) {
-    return send(
-      'meeting_release_holds',
-      fieldsOf(args, { meeting_id: 'string' }, { slot_ids: 'strings' }),
-      context?.signal,
-    );
-  },
-};
-
-export const book: McpToolDefinition = {
-  tool: {
-    name: 'book',
-    description:
-      "Book the time the other side picked, by its slot id. The host creates the meeting on the principal's calendar from your brief, invites the people in it, and releases the other holds; for a meeting being moved, it moves the existing event. Then report booked with outcome. Once the meeting is booked, a newly offered slot moves the booked event there instead, and main hears of it.",
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        meeting_id: MEETING_ID,
-        slot_id: { type: 'string', description: 'The slot id of the time they picked.' },
-      },
-      required: ['meeting_id', 'slot_id'],
-    },
-  },
-  async handler(args, context) {
-    return send('meeting_book', fieldsOf(args, { meeting_id: 'string', slot_id: 'string' }), context?.signal);
-  },
-};
+  required: { meeting_id: 'string', slot_id: 'string' },
+  repeatable: true,
+});
 
 // ---------------------------------------------------------------------------
 // external-email's recipients and report
 // ---------------------------------------------------------------------------
 
-export const recipients: McpToolDefinition = {
-  tool: {
-    name: 'recipients',
-    description:
-      "Choose where the people already on this conversation's email thread go in your next replies: To, Cc, or Bcc, or left off by not listing them. You cannot add anyone: to include someone new, invite the people on the thread to copy them in. Without this, every reply goes to everyone on the thread as the latest email placed them. A choice holds until the next email in the thread changes who is on it.",
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        meeting_id: MEETING_ID,
-        to: {
-          type: 'array',
-          items: { type: 'string' },
-          description: 'The addresses on To: at least one, each already on the thread.',
-        },
-        cc: { type: 'array', items: { type: 'string' }, description: 'The addresses on Cc.' },
-        bcc: {
-          type: 'array',
-          items: { type: 'string' },
-          description: 'The addresses on Bcc: they get your replies, and the others do not see them.',
-        },
-      },
-      required: ['meeting_id', 'to'],
+export const recipients = requestTool({
+  name: 'email_recipients',
+  description:
+    "Choose where the people already on this conversation's email thread go in your next replies: To, Cc, or Bcc, or left off by not listing them. You cannot add anyone. Without this, every reply goes to everyone on the thread as the latest email placed them. A choice holds until the next email in the thread changes who is on it.",
+  properties: {
+    meeting_id: MEETING_ID,
+    to: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'The addresses on To: at least one, each already on the thread.',
+    },
+    cc: { type: 'array', items: { type: 'string' }, description: 'The addresses on Cc.' },
+    bcc: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'The addresses on Bcc: they get your replies, and the others do not see them.',
     },
   },
-  async handler(args, context) {
-    if (Array.isArray(args.to) && args.to.length === 0) return err('Put at least one address on to.');
-    return send(
-      'meeting_recipients',
-      fieldsOf(args, { meeting_id: 'string', to: 'addresses' }, { cc: 'addresses', bcc: 'addresses' }),
-      context?.signal,
-    );
-  },
-};
+  required: { meeting_id: 'string', to: 'addresses' },
+  optional: { cc: 'addresses', bcc: 'addresses' },
+  repeatable: true,
+  check: (args) => (Array.isArray(args.to) && args.to.length === 0 ? 'Put at least one address on to.' : undefined),
+});
 
-export const outcome: McpToolDefinition = {
-  tool: {
-    name: 'outcome',
-    description:
-      "Report how this conversation's meeting ended. Report each ending once, except needs-room, which you report again whenever free_time says so. booked: after book succeeded. settled: the organizer moved their invitation. needs-room: nothing in the window fits, for someone in the inner circle or close. not-scheduling: the thread is not about arranging a meeting. gave-up: no time could be agreed. responded: the one reply a respond brief asked for is written. The host fills in the details for the principal.",
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        meeting_id: { type: 'string', description: 'The meeting id from your brief.' },
-        outcome: { type: 'string', enum: [...OUTCOMES], description: 'How the meeting ended.' },
-      },
-      required: ['meeting_id', 'outcome'],
-    },
+export const outcome = requestTool({
+  name: 'meeting_outcome',
+  description:
+    "Report how this conversation's meeting ended, once. booked: after meeting_book succeeded. settled: the organizer moved their invitation. needs-room: nothing in the window fits, for someone in the inner circle or close. not-scheduling: the thread is not about arranging a meeting. gave-up: no time could be agreed. responded: the answer a respond brief asked for is written. The host fills in the details for the principal.",
+  properties: {
+    meeting_id: MEETING_ID,
+    outcome: { type: 'string', enum: [...OUTCOMES], description: 'How the meeting ended.' },
   },
-  async handler(args, context) {
-    if (!OUTCOMES.some((value) => value === args.outcome)) {
-      return err(`outcome must be one of ${OUTCOMES.join(', ')}`);
-    }
-    return send('meeting_outcome', fieldsOf(args, { meeting_id: 'string', outcome: 'string' }), context?.signal);
-  },
-};
+  required: { meeting_id: 'string', outcome: 'string' },
+  repeatable: true,
+  check: (args) =>
+    OUTCOMES.some((value) => value === args.outcome) ? undefined : `outcome must be one of ${OUTCOMES.join(', ')}`,
+});
 
-registerTools([arrange, reschedule, askOrganizer, cancel, amend, respond, dismiss, replyToPrincipal], MAIN_CAPABILITY);
-registerTools([freeTime, hold, releaseHolds, book, recipients, outcome], EXTERNAL_CAPABILITY);
+registerTools([arrange, reschedule, cancel, amend, respond, dismiss, replyToPrincipal], MAIN_CAPABILITY);
+registerTools([freeTime, hold, book, recipients, outcome], EXTERNAL_CAPABILITY);

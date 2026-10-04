@@ -74,7 +74,11 @@ import { requestWake } from '../../request-wake.js';
 import { destroySessionMailbox, sessionDir, writeSessionMessage } from '../../session-manager.js';
 import { formatLocalTime } from '../../timezone.js';
 import type { Session } from '../../types.js';
-import { isPrincipalCalendar, recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
+import {
+  isPrincipalCalendar,
+  recordOwnCalendarChange,
+  type CalendarListEntry,
+} from '../gws-ea-inbox/calendar-notifications.js';
 import { authenticateSender } from '../gws-ea-inbox/authentication.js';
 import {
   getPrincipalMessage,
@@ -632,19 +636,29 @@ export function answering(action: string, handle: Handle): GuardedDeliveryHandle
 export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   const calendar = () => deps.calendar();
 
-  /** A calendar of the principal's in the assistant's list; with `write`, one it can change. */
-  async function requirePrincipalCalendar(calendarId: string, write: boolean): Promise<string> {
+  /** A calendar of the principal's in the assistant's list. */
+  async function principalCalendarEntry(calendarId: string): Promise<CalendarListEntry> {
     const entry = await calendar().getCalendar(calendarId);
     const { principal } = await addressBook();
     if (!entry || !isPrincipalCalendar(entry, principal)) {
       throw refused(`Calendar ${calendarId} is not one of the principal's calendars the assistant can see`);
     }
-    if (write && entry.accessRole !== 'writer' && entry.accessRole !== 'owner') {
+    return entry;
+  }
+
+  /** That calendar's id, when the assistant can change it. */
+  function assertWritable(entry: CalendarListEntry): string {
+    if (entry.accessRole !== 'writer' && entry.accessRole !== 'owner') {
       throw refused(
-        `The assistant cannot change calendar ${calendarId}: choose one of the principal's calendars it can write to`,
+        `The assistant cannot change calendar ${entry.id}: choose one of the principal's calendars it can write to`,
       );
     }
     return entry.id;
+  }
+
+  /** A calendar of the principal's the assistant can change. */
+  async function requireWritableCalendar(calendarId: string): Promise<string> {
+    return assertWritable(await principalCalendarEntry(calendarId));
   }
 
   /** A timed, live event, with its span and length in minutes. */
@@ -785,8 +799,8 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         : [`main added ${context.added.map(personText).join(', ')} to the thread: your next reply goes to them too.`]),
       SETTINGS[context.setting],
       isScheduling(meeting)
-        ? `When it ends, report it once with outcome for meeting ${meeting.id}.`
-        : `Send that one reply, then report responded with outcome for meeting ${meeting.id}.`,
+        ? `When it ends, report it once with meeting_outcome for meeting ${meeting.id}.`
+        : `Send that one reply, then report responded with meeting_outcome for meeting ${meeting.id}.`,
     ].join('\n');
   }
 
@@ -1163,7 +1177,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       counterparts = distinct(named);
       opening = { kind: 'new', opener: 'arrange', copyPrincipal };
     }
-    const bookingCalendarId = await requirePrincipalCalendar(calendarId, true);
+    const bookingCalendarId = await requireWritableCalendar(calendarId);
     await assertShareable(purpose, constraints);
     const meeting = await createMeeting({
       terms: scheduling('arrange', lengthMinutes, window),
@@ -1180,6 +1194,11 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     return openArranged(meeting, opening);
   }
 
+  /**
+   * Move an event on the principal's calendar to a time in a new window. Who
+   * organizes it decides how: the principal's own event moves once its
+   * guests agree; someone else's is asked of its organizer, record or not (R16).
+   */
   async function reschedule(content: Record<string, unknown>, session: Session, requestId: string): Promise<Answer> {
     const existing = await findMeetingByRequest(session.id, requestId);
     if (existing) return resume(existing);
@@ -1196,14 +1215,31 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         ? undefined
         : meetingIdOf(content, 'making_room_for');
 
-    const bookingCalendarId = await requirePrincipalCalendar(calendarId, true);
-    const { event, minutes } = await requireTimedEvent(bookingCalendarId, eventId);
+    const entry = await principalCalendarEntry(calendarId);
+    const { event, minutes } = await requireTimedEvent(entry.id, eventId);
     const book = await addressBook();
-    if (!organizedByPrincipal(event, bookingCalendarId, book)) {
-      throw refused(
-        'Someone else organizes that event, so it cannot be moved from here: use ask_organizer to ask its organizer instead.',
-      );
+    const terms: Omit<Creation, 'terms' | 'counterparts' | 'bookingCalendarId' | 'threadKey'> = {
+      session,
+      requestId,
+      event: { calendarId: entry.id, eventId },
+      purpose,
+      constraints,
+      meetingKind,
+    };
+    if (!organizedByPrincipal(event, entry.id, book)) {
+      if (roomForId !== undefined) {
+        throw refused(
+          'Someone else organizes that event, so it never moves to make room: pick a meeting the assistant booked.',
+        );
+      }
+      if (askedLength !== undefined) {
+        throw refused(
+          'Someone else organizes that event, so its length is theirs to change: leave length_minutes out.',
+        );
+      }
+      return askOrganizer(terms, event, minutes, window, at, book);
     }
+    const bookingCalendarId = assertWritable(entry);
     const addresses = guestsOf(event, book);
     if (addresses.length === 0) throw refused('Nobody else is invited to that event: move it on the calendar yourself');
     const lengthMinutes = askedLength ?? minutes;
@@ -1215,19 +1251,17 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     checkedWindow(window, lengthMinutes, at);
     await assertShareable(purpose, constraints);
     const live = await findLiveMeetingForEvent(bookingCalendarId, eventId);
-    if (live) throw refused(`Meeting ${live.id} is already working on that event: amend or cancel it instead`);
+    if (live)
+      throw refused(
+        `Meeting ${live.id} is already working on that event: use meeting_amend or meeting_cancel on it instead`,
+      );
     const room = roomForId === undefined ? undefined : await roomFor(roomForId, bookingCalendarId, eventId);
     const counterparts = await Promise.all(addresses.map((address) => counterpartForAddress(address)));
     const creation: Omit<Creation, 'threadKey' | 'replaces'> = {
+      ...terms,
       terms: scheduling('reschedule', lengthMinutes, window),
-      session,
-      requestId,
       counterparts,
       bookingCalendarId,
-      event: { calendarId: bookingCalendarId, eventId },
-      purpose,
-      constraints,
-      meetingKind,
       ...(room ? { room } : {}),
     };
 
@@ -1264,24 +1298,17 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     return { forMeetingId, candidate: await deps.roomCandidate(forMeeting, calendarId, eventId) };
   }
 
-  async function askOrganizer(content: Record<string, unknown>, session: Session, requestId: string): Promise<Answer> {
-    const existing = await findMeetingByRequest(session.id, requestId);
-    if (existing) return resume(existing);
-    const at = new Date();
-    const calendarId = calendarIdOf(content);
-    const eventId = eventIdOf(content);
-    const window = windowOf(content);
-    const purpose = text(content.purpose, 'purpose', PURPOSE_MAX);
-    const constraints = optionalText(content.constraints, 'constraints', CONSTRAINTS_MAX);
-
-    const principalCalendar = await requirePrincipalCalendar(calendarId, false);
-    const { event, minutes } = await requireTimedEvent(principalCalendar, eventId);
-    const book = await addressBook();
+  /** Ask the organizer of an invitation to the principal to move it to a time in the window. */
+  async function askOrganizer(
+    terms: Omit<Creation, 'terms' | 'counterparts' | 'bookingCalendarId' | 'threadKey'>,
+    event: CalendarEvent,
+    minutes: number,
+    window: Window,
+    at: Date,
+    book: AddressBook,
+  ): Promise<Answer> {
     const organizer = normalizeAddress(event.organizer?.email ?? '');
     if (organizer === undefined) throw refused('Google reports no organizer for that invitation');
-    if (book.principal.has(organizer) || organizer === principalCalendar.toLowerCase()) {
-      throw refused('The principal organizes that event: use reschedule to move it');
-    }
     if (book.assistant.has(organizer)) throw refused('The assistant organizes that event');
     // An organizer without a record is judged like anyone else (R16): main decided to ask them.
     const counterpart = await counterpartForAddress(organizer);
@@ -1289,19 +1316,17 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       throw refused(`That invitation lasts ${minutes} minutes, which is too long to move this way`);
     }
     checkedWindow(window, minutes, at);
-    await assertShareable(purpose, constraints);
-    const live = await findLiveMeetingForEvent(principalCalendar, eventId);
+    await assertShareable(terms.purpose, terms.constraints);
+    const { calendarId, eventId } = terms.event ?? {};
+    if (calendarId === undefined || eventId === undefined)
+      throw new Error('An invitation to ask about names its event');
+    const live = await findLiveMeetingForEvent(calendarId, eventId);
     if (live) throw refused(`Meeting ${live.id} is already asking about that invitation`);
     const meeting = await createMeeting({
+      ...terms,
       terms: scheduling('ask_organizer', minutes, window),
-      session,
-      requestId,
       counterparts: [counterpart],
       bookingCalendarId: null,
-      event: { calendarId: principalCalendar, eventId },
-      purpose,
-      constraints,
-      meetingKind: undefined,
       threadKey: mintThreadKey(),
     });
     return openOrAbandon(meeting, { kind: 'new', opener: 'ask_organizer', copyPrincipal: false });
@@ -1345,7 +1370,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       throw refused(`${threadKey} is not a thread waiting for you: use the thread_key a note about an email gave you`);
     }
     const live = await findLiveMeetingOnThread(threadKey);
-    if (live) throw refused(`Thread ${threadKey} has meeting ${live.id} in progress: cancel it instead`);
+    if (live) throw refused(`Thread ${threadKey} has meeting ${live.id} in progress: meeting_cancel it instead`);
     if (thread.state !== 'closed') await closeThread(threadKey);
     await deleteThreadRecord({ channelType: EMAIL_CHANNEL_TYPE, platformId: INBOX_PLATFORM_ID, threadId: threadKey });
     if (thread.sessionId !== null) await closeSession(thread.sessionId, false);
@@ -1452,14 +1477,14 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
    * ends as a cancelled meeting does.
    */
   async function cancelEvent(requestedCalendarId: string, eventId: string): Promise<Answer> {
-    const calendarId = await requirePrincipalCalendar(requestedCalendarId, true);
+    const calendarId = await requireWritableCalendar(requestedCalendarId);
     const event = await calendar().getEvent(calendarId, eventId);
     if (!event) throw refused(`There is no event ${eventId} on calendar ${calendarId}`);
     const book = await addressBook();
     const alreadyCancelled = event.status === 'cancelled';
     if (!alreadyCancelled && !organizedByPrincipal(event, calendarId, book)) {
       throw refused(
-        'Someone else organizes that event, so it cannot be cancelled from here: use ask_organizer to ask its organizer, or decline it.',
+        'Someone else organizes that event, so it cannot be cancelled from here: decline it, or have meeting_reschedule ask its organizer to move it.',
       );
     }
     const guests = guestsOf(event, book);
@@ -1501,7 +1526,9 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       throw refused(`Meeting ${meeting.id} is ${meeting.state}: only a meeting still being arranged can be amended`);
     }
     if (!isScheduling(meeting)) {
-      throw refused(`Meeting ${meeting.id} writes one reply and has nothing to amend: cancel it and respond again`);
+      throw refused(
+        `Meeting ${meeting.id} writes one reply and has nothing to amend: meeting_cancel it and email_respond again`,
+      );
     }
     const changes = ['length_minutes', 'window_start', 'window_end', 'constraints', 'people'].filter(
       (key) => content[key] !== undefined,
@@ -1626,7 +1653,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     return [
       `${opening} The assistant arranged these meetings with people who matter less, and moving one frees a time that fits:`,
       ...candidates.map((candidate) => candidateLine(candidate, timezone)),
-      `To move one, reschedule it with making_room_for ${meeting.id}: the time it frees goes to this meeting. ` +
+      `To move one, meeting_reschedule it with making_room_for ${meeting.id}: the time it frees goes to this meeting. ` +
         'If none should move, move nothing and give the principal one recommendation in one line.',
     ].join('\n');
   }
@@ -1662,8 +1689,8 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       case 'not-scheduling':
         return (
           `Thread ${meeting.thread_key} with ${who(meeting)} is not about scheduling, so external-email sent nothing in it (meeting ${meeting.id}). ` +
-          `It waits for you again: triage it like any other email. Answer it with respond, with thread_key ${meeting.thread_key}, ` +
-          'or close it with dismiss, and tell the principal only if it needs them.'
+          `It waits for you again: triage it like any other email. Answer it with email_respond, with thread_key ${meeting.thread_key}, ` +
+          'or close it with email_dismiss, and tell the principal only if it needs them.'
         );
       case 'gave-up':
         return (
@@ -1784,7 +1811,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     if (meeting.session_id !== session.id) throw refused("That meeting is not this conversation's");
     if (!isScheduling(meeting)) {
       if (kind !== 'responded') {
-        throw refused('This conversation writes one reply: send it, then report responded with outcome.');
+        throw refused('This conversation writes one reply: send it, then report responded with meeting_outcome.');
       }
       return responded(meeting);
     }
@@ -1805,9 +1832,11 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     switch (kind) {
       case 'booked':
         if (meeting.kind === 'ask_organizer')
-          throw refused('An ask_organizer meeting ends settled or gave-up, never booked');
+          throw refused(
+            'A meeting that asks an organizer to move their invitation ends settled or gave-up, never booked',
+          );
         booking = await getBooking(meeting.id);
-        if (!booking) throw refused('Report booked only after book succeeded: this meeting has no booking yet');
+        if (!booking) throw refused('Report booked only after meeting_book succeeded: this meeting has no booking yet');
         break;
       case 'settled':
         if (meeting.kind !== 'ask_organizer') throw refused('Only an ask_organizer meeting ends settled');
@@ -1953,7 +1982,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         replyNote(meeting, 'responded'),
         `external-email's reply went out in thread ${meeting.thread_key}, to ${who(meeting)} (meeting ${meeting.id}): ` +
           `"${meeting.purpose}". The thread waits for you again: if they write back, you will hear of it, and you can ` +
-          `arrange, respond, or dismiss with thread_key ${meeting.thread_key}. Tell the principal only if it matters to them.`,
+          `meeting_arrange, email_respond, or email_dismiss with thread_key ${meeting.thread_key}. Tell the principal only if it matters to them.`,
         at,
       ),
     );
@@ -2037,7 +2066,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         replyNote(meeting, 'gave-up'),
         `external-email's reply in thread ${meeting.thread_key}, to ${who(meeting)} (meeting ${meeting.id}), ${why}. ` +
           `It was to "${meeting.purpose}". The thread waits for you again: try again with ` +
-          `respond and thread_key ${meeting.thread_key}, or tell the principal in one line.`,
+          `email_respond and thread_key ${meeting.thread_key}, or tell the principal in one line.`,
         at,
       ),
     );
@@ -2073,8 +2102,8 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       `An email external-email wrote in meeting ${meeting.id}'s thread could not be sent: email delivery kept failing ` +
         `("${meeting.purpose}", thread_key ${meeting.thread_key}). It was to ${to}. ` +
         (meeting.state === 'booked'
-          ? 'The meeting stays booked as it is: cancel it, or tell the principal in one line if it matters.'
-          : 'The meeting is still being arranged, but nothing will come of it on its own: amend it, cancel it, or tell the principal in one line.'),
+          ? 'The meeting stays booked as it is: meeting_cancel it, or tell the principal in one line if it matters.'
+          : 'The meeting is still being arranged, but nothing will come of it on its own: meeting_amend it, meeting_cancel it, or tell the principal in one line.'),
       new Date().toISOString(),
     );
   }
@@ -2090,14 +2119,14 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   function stallNextStep(meeting: Meeting): string {
     if (!isScheduling(meeting)) {
       return (
-        `Its reply was not sent, and the thread waits for you again: respond again with thread_key ${meeting.thread_key}, ` +
+        `Its reply was not sent, and the thread waits for you again: email_respond again with thread_key ${meeting.thread_key}, ` +
         'or tell the principal in one line.'
       );
     }
     return meeting.state === 'booked'
-      ? 'The meeting stays booked: reschedule it if they asked to move it, cancel it, or tell the principal in one line.'
-      : 'The meeting is still open, but nothing will come of it on its own: amend it to brief external-email again, ' +
-          'cancel it, or tell the principal in one line.';
+      ? 'The meeting stays booked: meeting_reschedule it if they asked to move it, meeting_cancel it, or tell the principal in one line.'
+      : 'The meeting is still open, but nothing will come of it on its own: meeting_amend it to brief external-email again, ' +
+          'meeting_cancel it, or tell the principal in one line.';
   }
 
   /**
@@ -2482,7 +2511,6 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
     // The requests, each registered under its action name and answered once (`index.ts`).
     arrange,
     reschedule,
-    askOrganizer,
     cancel,
     amend,
     respond,

@@ -3,17 +3,18 @@
  * host tools that take slot ids, never free text, and reveal nothing of the
  * principal's calendar but candidate start times.
  *
- * - `free_time` offers a capped list of start times of the meeting's length,
- *   each with an opaque slot id, inside the meeting's window, from the
- *   principal's calendars and visible colleagues' free/busy, the principal's
- *   preferences, and R13's rule for the meeting's level (`slots.ts`). It
- *   can narrow to one day and check one proposed time, in the counterpart's
- *   timezone, so no date arithmetic is left to the agent. Its answers per
- *   meeting are capped.
- * - `hold` places a private, busy, silent event on the meeting's booking
- *   calendar for each offered slot that is still open, at most three per
- *   meeting, under an id derived from the meeting and the slot.
- * - `book` creates the one meeting event from the meeting record: its
+ * - `meeting_free_time` offers a capped list of start times of the
+ *   meeting's length, each with an opaque slot id, inside the meeting's
+ *   window, from the principal's calendars and visible colleagues'
+ *   free/busy, the principal's preferences, and R13's rule for the meeting's
+ *   level (`slots.ts`). It can narrow to one day and check one proposed
+ *   time, in the counterpart's timezone, so no date arithmetic is left to
+ *   the agent. Its answers per meeting are capped.
+ * - `meeting_hold` holds exactly the offered slots it names, at most three:
+ *   a private, busy, silent event on the meeting's booking calendar for
+ *   each, under an id derived from the meeting and the slot, and any other
+ *   hold of the meeting released. An empty list releases them all.
+ * - `meeting_book` creates the one meeting event from the meeting record: its
  *   people as attendees, its purpose as the title, and a fixed line, with
  *   Google's invitations sent; for a reschedule it moves the original event
  *   instead, keeping its id. The id is derived from the meeting, so a retry
@@ -25,7 +26,7 @@
  *   a booking clears them. A reschedule making room for another meeting
  *   treats the time it frees as taken, and once it is booked that time goes
  *   to the meeting it was for (`room.ts`).
- * - `release_holds` deletes only the meeting's holds the assistant recorded
+ * - A release deletes only the meeting's holds the assistant recorded
  *   placing, and only while the event still carries that meeting's tag.
  *
  * The calendar is re-read at every offer, hold and booking: the store keeps
@@ -195,12 +196,12 @@ export function slotLabel(span: Span, timezone: string): string {
 }
 
 function slotIdsOf(value: unknown, max: number): string[] {
-  if (!Array.isArray(value) || value.length === 0 || value.length > max) {
-    throw invalid(`slot_ids must list 1 to ${max} slot ids from free_time`);
+  if (!Array.isArray(value) || value.length > max) {
+    throw invalid(`slot_ids must list up to ${max} slot ids from meeting_free_time`);
   }
   const ids = value.map((id: unknown) => {
     if (typeof id !== 'string' || !SLOT_ID.test(id)) {
-      throw invalid('Each slot id must be one free_time gave, such as slot-3fa9c2e1b7d0');
+      throw invalid('Each slot id must be one meeting_free_time gave, such as slot-3fa9c2e1b7d0');
     }
     return id;
   });
@@ -209,7 +210,7 @@ function slotIdsOf(value: unknown, max: number): string[] {
 
 function slotIdOf(value: unknown): string {
   if (typeof value !== 'string' || !SLOT_ID.test(value)) {
-    throw invalid('slot_id must be one free_time gave, such as slot-3fa9c2e1b7d0');
+    throw invalid('slot_id must be one meeting_free_time gave, such as slot-3fa9c2e1b7d0');
   }
   return value;
 }
@@ -300,10 +301,10 @@ function freeTimeHeading(
       : 'That time is not open, and nothing else is open that day.';
   }
   if (found) return `Open times for meeting ${meeting.id}, best first:`;
-  if (oneDay) return 'Nothing is open that day: call free_time without a date for other days.';
+  if (oneDay) return 'Nothing is open that day: call meeting_free_time without a date for other days.';
   return usesPersonalHours(meeting.level)
-    ? "Nothing in the meeting's window is open. Report needs-room with outcome."
-    : "Nothing in the meeting's window is open: report gave-up with outcome, so main can tell the principal.";
+    ? "Nothing in the meeting's window is open. Report needs-room with meeting_outcome."
+    : "Nothing in the meeting's window is open: report gave-up with meeting_outcome, so main can tell the principal.";
 }
 
 export function createCalendarActions(deps: CalendarActionsDeps) {
@@ -508,7 +509,9 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
         throw new Error(`Reschedule ${meeting.id} names no event`);
       }
       if (!(await moveEvent(meeting.event_calendar_id, meeting.event_id, slot, view.timezone))) {
-        throw refused('The event this meeting moves is no longer on the calendar: report gave-up with outcome.');
+        throw refused(
+          'The event this meeting moves is no longer on the calendar: report gave-up with meeting_outcome.',
+        );
       }
       return {
         meeting_id: meeting.id,
@@ -557,7 +560,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     if (!check.allowed) {
       throw refused(
         `The booking was not made: the meeting's title carries one of the principal's private details (${check.kind}). ` +
-          'Report gave-up with outcome, so main can arrange it again under another purpose.',
+          'Report gave-up with meeting_outcome, so main can arrange it again under another purpose.',
       );
     }
   }
@@ -588,7 +591,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
   function assertBooks(meeting: SchedulingMeeting): void {
     if (meeting.kind === 'ask_organizer') {
       throw refused(
-        'This meeting asks the organizer of an invitation to move it: offer times from free_time, hold and book nothing, and report settled once they have moved it.',
+        'This meeting asks the organizer of an invitation to move it: offer times from meeting_free_time, hold and book nothing, and report settled once they have moved it.',
       );
     }
   }
@@ -598,10 +601,10 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     const slots: OfferedSlot[] = [];
     for (const slotId of slotIds) {
       const slot = await getOfferedSlot(meeting.id, slotId);
-      if (!slot) throw refused(`${slotId} was not offered for this meeting: use a slot id free_time gave you`);
+      if (!slot) throw refused(`${slotId} was not offered for this meeting: use a slot id meeting_free_time gave you`);
       if (!fitsMeeting(slot, meeting)) {
         throw refused(
-          `${slotId} was offered under an earlier brief and no longer fits the meeting's length or window: call free_time again`,
+          `${slotId} was offered under an earlier brief and no longer fits the meeting's length or window: call meeting_free_time again`,
         );
       }
       slots.push(slot);
@@ -626,7 +629,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     const answered = await countAnswers(meeting.id, FREE_TIME_ACTION);
     if (answered >= MAX_FREE_TIME_ANSWERS) {
       throw refused(
-        `free_time has answered ${MAX_FREE_TIME_ANSWERS} times for this meeting already: offer from the times you have, or report gave-up with outcome.`,
+        `meeting_free_time has answered ${MAX_FREE_TIME_ANSWERS} times for this meeting already: offer from the times you have, or report gave-up with meeting_outcome.`,
       );
     }
     const narrowing = narrowingOf(content);
@@ -695,7 +698,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
         message: [
           heading,
           ...lines,
-          `${footer}free_time has answered ${answered + 1} of ${MAX_FREE_TIME_ANSWERS} times for this meeting.`,
+          `${footer}meeting_free_time has answered ${answered + 1} of ${MAX_FREE_TIME_ANSWERS} times for this meeting.`,
         ].join('\n'),
       },
     };
@@ -704,10 +707,17 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
   /**
    * Hold offered slots on the meeting's booking calendar, each only while it
    * is still open, and start its follow-through deadlines. Holding a slot
-   * held already changes nothing. The meeting's own `hold`, and the host
-   * when it hands a freed time to the meeting that needed room.
+   * held already changes nothing. With `exact`, the meeting then holds those
+   * slots and no others: every other hold is released once the named ones
+   * are known to be open, so a refusal changes nothing. The meeting's own
+   * `meeting_hold` holds exactly; the host adds to them when it hands a
+   * freed time to the meeting that needed room.
    */
-  async function holdSlots(meeting: SchedulingMeeting, slotIds: readonly string[]): Promise<OfferedSlot[]> {
+  async function holdSlots(
+    meeting: SchedulingMeeting,
+    slotIds: readonly string[],
+    exact = false,
+  ): Promise<OfferedSlot[]> {
     assertBooks(meeting);
     if (meeting.state === 'booked' || (await getBooking(meeting.id)) !== undefined) {
       throw refused(`Meeting ${meeting.id} is booked: there is nothing more to hold.`);
@@ -717,24 +727,30 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     const existing = await listHolds(meeting.id);
     const heldIds = new Set(existing.map((held) => held.slot_id));
     const fresh = slotIds.filter((slotId) => !heldIds.has(slotId));
-    if (existing.length + fresh.length > MAX_HOLDS) {
+    const kept = exact ? existing.filter((held) => slotIds.includes(held.slot_id)) : existing;
+    if (kept.length + fresh.length > MAX_HOLDS) {
       throw refused(
-        `A meeting holds at most three times, and this one holds ${existing.length}: release_holds the times they turned down first.`,
+        `A meeting holds at most three times, and this one holds ${existing.length}: hold only the times you offer now.`,
       );
     }
     const slots = await offeredSlots(meeting, slotIds);
     const view = await viewOf(meeting);
-    const closed = await closedSlots(meeting, view, slots);
+    const closed = slots.length === 0 ? [] : await closedSlots(meeting, view, slots);
     if (closed.length > 0) {
-      throw refused(`${closed.join(', ')} is no longer open: call free_time again for times to offer instead.`);
+      throw refused(`${closed.join(', ')} is no longer open: call meeting_free_time again for times to offer instead.`);
     }
     const fields = holdFields(meeting, view);
     const check = await checkOutbound([fields.summary ?? '', fields.description ?? ''], await audienceForAddresses([]));
     if (!check.allowed) {
       throw refused(
-        `The hold was not placed: the meeting's title carries one of the principal's private details (${check.kind}). Report gave-up with outcome.`,
+        `The hold was not placed: the meeting's title carries one of the principal's private details (${check.kind}). Report gave-up with meeting_outcome.`,
       );
     }
+    if (exact)
+      await removeHolds(
+        meeting.id,
+        existing.filter((held) => !slotIds.includes(held.slot_id)),
+      );
     for (const slot of slots) {
       const eventId = holdEventId(meeting.id, slot.slot_id);
       // Recorded first, so a release finds it whatever happens to the write.
@@ -765,47 +781,31 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
         meeting.id,
       );
     }
-    const at = new Date();
-    await startDeadlines(meeting.id, await deadlinesFrom(at.getTime()), at.toISOString());
+    if (slots.length > 0) {
+      const at = new Date();
+      await startDeadlines(meeting.id, await deadlinesFrom(at.getTime()), at.toISOString());
+    }
     return slots;
   }
 
   const hold: Handle = async (content, session) => {
     const meeting = await ownLiveMeeting(content, session);
     assertBooks(meeting);
-    const slots = await holdSlots(meeting, slotIdsOf(content.slot_ids, MAX_HOLDS));
+    const slots = await holdSlots(meeting, slotIdsOf(content.slot_ids, MAX_HOLDS), true);
     const display = await resolveGroupTimezone(session.agent_group_id);
     return {
       meetingId: meeting.id,
       data: {
         meeting_id: meeting.id,
         held: slots.map((slot) => ({ slot_id: slot.slot_id, start: slot.start_at, end: slot.end_at })),
-        message: [
-          `Held for meeting ${meeting.id}:`,
-          ...slots.map((slot) => `- ${slot.slot_id}: ${slotLabel(slotSpan(slot), display)}`),
-          'When they pick one, book it. If they turn these down, release_holds them before you offer others.',
-        ].join('\n'),
-      },
-    };
-  };
-
-  const releaseHoldsRequest: Handle = async (content, session) => {
-    const meeting = await ownMeeting(content, session);
-    const holds = await listHolds(meeting.id);
-    const named = content.slot_ids === undefined ? undefined : slotIdsOf(content.slot_ids, MAX_HOLDS);
-    const targets = named === undefined ? holds : holds.filter((held) => named.includes(held.slot_id));
-    const notHeld = named === undefined ? [] : named.filter((slotId) => !holds.some((held) => held.slot_id === slotId));
-    await removeHolds(meeting.id, targets);
-    return {
-      meetingId: meeting.id,
-      data: {
-        meeting_id: meeting.id,
-        released: targets.map((held) => held.slot_id),
         message:
-          (targets.length === 0
-            ? `Meeting ${meeting.id} had no holds to release.`
-            : `Released ${targets.length} hold${targets.length === 1 ? '' : 's'} for meeting ${meeting.id}.`) +
-          (notHeld.length > 0 ? ` Not held: ${notHeld.join(', ')}.` : ''),
+          slots.length === 0
+            ? `Meeting ${meeting.id} holds no times now.`
+            : [
+                `Meeting ${meeting.id} now holds:`,
+                ...slots.map((slot) => `- ${slot.slot_id}: ${slotLabel(slotSpan(slot), display)}`),
+                'Any other time it held is released.',
+              ].join('\n'),
       },
     };
   };
@@ -826,7 +826,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
   ): Promise<Answer> {
     const closed = await closedSlots(meeting, view, [slot]);
     if (closed.length > 0) {
-      throw refused(`${slot.slot_id} is no longer open: call free_time again for times to offer instead.`);
+      throw refused(`${slot.slot_id} is no longer open: call meeting_free_time again for times to offer instead.`);
     }
     if (!(await moveEvent(existing.calendar_id, existing.event_id, slot, view.timezone))) {
       throw refused(
@@ -886,7 +886,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
       if (existing.start_at !== slot.start_at || existing.end_at !== slot.end_at) {
         if (meeting.state === 'booked') return moveBooking(meeting, existing, slot, view, display);
         throw refused(
-          `Meeting ${meeting.id} is already booked for ${slotLabel(slotSpan(existing), display)}. Report booked with outcome if you have not.`,
+          `Meeting ${meeting.id} is already booked for ${slotLabel(slotSpan(existing), display)}. Report booked with meeting_outcome if you have not.`,
         );
       }
       // A repeat: the event already says this, so nobody is emailed again; it finishes what an earlier attempt left.
@@ -895,7 +895,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
     } else {
       const closed = await closedSlots(meeting, view, [slot]);
       if (closed.length > 0)
-        throw refused(`${slotId} is no longer open: call free_time again for times to offer instead.`);
+        throw refused(`${slotId} is no longer open: call meeting_free_time again for times to offer instead.`);
       await assertBookable(meeting, view);
       booking = await placeBooking(meeting, view, slot);
       await recordBooking(booking);
@@ -907,7 +907,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
       await releaseHolds(meeting, 'all');
     } catch (err) {
       log.warn('A booked meeting’s holds were not all released', { meetingId: meeting.id, err });
-      holdsLeft = ' Some holds could not be released yet: call book again with the same slot to finish.';
+      holdsLeft = ' Some holds could not be released yet: call meeting_book again with the same slot to finish.';
     }
     try {
       await deps.afterBooking(meeting);
@@ -944,7 +944,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
         message:
           `${moved ? 'Moved' : 'Booked'}: ${slotLabel(slotSpan(slot), display)}. ` +
           `Google sends ${meeting.counterparts.map((c) => c.address).join(', ')} the ${moved ? 'update' : 'invitation'} from the principal's calendar, ` +
-          `and the other holds are released.${holdsLeft} Now report booked with outcome.`,
+          `and the other holds are released.${holdsLeft} Now report booked with meeting_outcome.`,
       },
     };
   };
@@ -1009,7 +1009,6 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
   return {
     freeTime,
     hold,
-    releaseHoldsRequest,
     book,
     releaseHolds,
     bookDirectly,

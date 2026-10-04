@@ -4,12 +4,13 @@
  * write, and the typed requests that carry them.
  *
  *   - `main` → host: `meeting_arrange`, `meeting_reschedule`,
- *     `meeting_ask_organizer`, `meeting_cancel`, `meeting_amend`,
- *     `meeting_respond`, `meeting_dismiss`, and
- *     `meeting_reply_to_principal`.
+ *     `meeting_cancel`, `meeting_amend`, `email_respond`, `email_dismiss`,
+ *     and `email_reply_to_principal`.
  *   - `external-email` → host: `meeting_free_time`, `meeting_hold`,
- *     `meeting_release_holds`, `meeting_book` (`calendar-actions.ts`),
- *     `meeting_recipients`, and `meeting_outcome`.
+ *     `meeting_book` (`calendar-actions.ts`), `email_recipients`, and
+ *     `meeting_outcome`.
+ *
+ * Each runner tool is named after the action it sends (`MEETING_ACTIONS`).
  *
  * Each is a delivery action with a guard (`guard.ts`) that binds the caller
  * to the profile's agent pointers, and external-email's to its meeting's
@@ -71,7 +72,7 @@ const MEETINGS_CAPABILITY = 'gws-ea-meetings';
 
 registerCapability(MEETINGS_CAPABILITY, {
   description:
-    'arrange, reschedule, ask_organizer, cancel, amend, respond, dismiss, reply_to_principal: hand scheduling jobs and replies to external-email, which carries them out by email, close threads, and answer the principal by email',
+    'meeting_arrange, meeting_reschedule, meeting_cancel, meeting_amend, email_respond, email_dismiss, email_reply_to_principal: hand scheduling jobs and answers to external-email, which carries them out by email, close threads, and answer the principal by email',
   default: 'on',
   instructions: [MEETINGS_CAPABILITY],
 });
@@ -135,25 +136,29 @@ function guardSpec(guardAction: GuardedAction): DeliveryGuardSpec {
   };
 }
 
-/** Every request, by action name, with its guard; each is answered once (`answering`). */
+/**
+ * Every request, by action name, with its guard; each is answered once
+ * (`answering`). The runner's tool for each carries the same name.
+ */
 const REQUESTS: ReadonlyArray<readonly [string, Handle, GuardedAction]> = [
   // main's
   ['meeting_arrange', handoff.arrange, meetingRequestAction],
   ['meeting_reschedule', handoff.reschedule, meetingRequestAction],
-  ['meeting_ask_organizer', handoff.askOrganizer, meetingRequestAction],
   ['meeting_cancel', handoff.cancel, meetingRequestAction],
   ['meeting_amend', handoff.amend, meetingRequestAction],
-  ['meeting_respond', handoff.respond, meetingRequestAction],
-  ['meeting_dismiss', handoff.dismiss, meetingRequestAction],
-  ['meeting_reply_to_principal', handoff.replyToPrincipal, meetingRequestAction],
+  ['email_respond', handoff.respond, meetingRequestAction],
+  ['email_dismiss', handoff.dismiss, meetingRequestAction],
+  ['email_reply_to_principal', handoff.replyToPrincipal, meetingRequestAction],
   // external-email's outcome, its recipients, and its calendar tools
   ['meeting_outcome', handoff.outcome, meetingOutcomeAction],
-  ['meeting_recipients', handoff.recipients, meetingRecipientsAction],
+  ['email_recipients', handoff.recipients, meetingRecipientsAction],
   [FREE_TIME_ACTION, actions.freeTime, meetingCalendarAction],
   ['meeting_hold', actions.hold, meetingCalendarAction],
-  ['meeting_release_holds', actions.releaseHoldsRequest, meetingCalendarAction],
   ['meeting_book', actions.book, meetingCalendarAction],
 ];
+
+/** The action names the meetings module answers, which the runner's tools send. */
+export const MEETING_ACTIONS: readonly string[] = REQUESTS.map(([action]) => action);
 
 for (const [action, handle, guardAction] of REQUESTS) {
   registerDeliveryAction(action, answering(action, handle), guardSpec(guardAction));

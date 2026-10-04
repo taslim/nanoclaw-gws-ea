@@ -1,6 +1,6 @@
 /**
  * external-email's calendar actions (KTD11; R4, R5, R6, R11, R20, R24):
- * `free_time`, `hold`, `release_holds` and `book`, and the colleague path
+ * `meeting_free_time`, `meeting_hold` and `meeting_book`, and the colleague path
  * where `arrange` books directly.
  *
  * Drives the real delivery actions, guards, meeting store, handoff, people
@@ -354,11 +354,11 @@ describe('free_time', () => {
 });
 
 // ---------------------------------------------------------------------------
-// hold and release_holds
+// hold
 // ---------------------------------------------------------------------------
 
 describe('hold', () => {
-  it('refuses a slot that was not offered, one no longer free, and a fourth hold', async () => {
+  it('refuses a slot that was not offered, one no longer free, and more than three', async () => {
     const { meeting: stored, session } = await arranged(acme);
     const offered = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
 
@@ -378,19 +378,44 @@ describe('hold', () => {
     ).toMatch(/no longer open/);
     expect(holds()).toEqual([]);
 
-    data(
-      await ask(session, 'meeting_hold', {
-        meeting_id: stored.id,
-        slot_ids: [offered[1].slot_id, offered[2].slot_id, offered[3].slot_id],
-      }),
-    );
+    const three = [offered[1].slot_id, offered[2].slot_id, offered[3].slot_id];
+    data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: three }));
     expect(
-      refusal(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [offered[4].slot_id] })),
-    ).toMatch(/three/);
+      refusal(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [...three, offered[4].slot_id] })),
+    ).toMatch(/up to 3/);
     expect(holds()).toHaveLength(3);
-    // Holding a time already held changes nothing.
-    data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [offered[1].slot_id] }));
+    // Holding the times already held changes nothing.
+    data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: three }));
     expect(holds()).toHaveLength(3);
+    expect(calendar.writes.filter((write) => write.op === 'insert')).toHaveLength(3);
+  });
+
+  it('holds exactly the times named: the others go, and an empty list releases them all', async () => {
+    const { meeting: stored, session } = await arranged(acme);
+    const [a, b, c, d] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
+    data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [a.slot_id, b.slot_id, c.slot_id] }));
+    const held = data(
+      await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [b.slot_id, c.slot_id, d.slot_id] }),
+    );
+    expect(held.message).toMatch(/Any other time it held is released/);
+    expect(
+      holds()
+        .map((hold) => hold.start?.dateTime)
+        .sort(),
+    ).toEqual([b.start, c.start, d.start].sort());
+
+    // A time no longer open refuses the whole call, and every hold stays.
+    calendar.put(busy('evt-new', a.start, a.end));
+    expect(refusal(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [a.slot_id] }))).toMatch(
+      /no longer open/,
+    );
+    expect(holds()).toHaveLength(3);
+
+    expect(data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [] })).message).toMatch(
+      /holds no times now/,
+    );
+    expect(holds()).toEqual([]);
+    expect(await getDb().all('SELECT slot_id FROM gws_ea_meeting_holds WHERE meeting_id = ?', stored.id)).toEqual([]);
   });
 
   it('creates no duplicate when retried after Google applied it but the answer was lost', async () => {
@@ -417,7 +442,7 @@ describe('hold', () => {
       ],
     });
     const asked = data(
-      await ask(main, 'meeting_ask_organizer', {
+      await ask(main, 'meeting_reschedule', {
         calendar_id: PRINCIPAL,
         event_id: 'evt-invite',
         ...WINDOW,
@@ -435,7 +460,7 @@ describe('hold', () => {
   });
 });
 
-describe('release_holds', () => {
+describe('releasing holds', () => {
   it("touches only that meeting's holds that the assistant created", async () => {
     const first = await arranged(acme);
     const second = await arranged(sam);
@@ -453,7 +478,7 @@ describe('release_holds', () => {
     const [retagged] = holds().filter((hold) => hold.start?.dateTime === a2.start);
     calendar.put({ ...retagged, tags: { gwsEaMeeting: 'mtg-someone-else', gwsEaRole: 'hold' } });
 
-    data(await ask(first.session, 'meeting_release_holds', { meeting_id: first.meeting.id }));
+    data(await ask(first.session, 'meeting_hold', { meeting_id: first.meeting.id, slot_ids: [] }));
     expect(
       holds()
         .map((hold) => hold.tags?.gwsEaMeeting)
@@ -464,14 +489,6 @@ describe('release_holds', () => {
     expect(
       await getDb().all('SELECT slot_id FROM gws_ea_meeting_holds WHERE meeting_id = ?', first.meeting.id),
     ).toEqual([]);
-  });
-
-  it('releases only the slots named, when some are', async () => {
-    const { meeting: stored, session } = await arranged(acme);
-    const [s1, s2] = slotsOf(await ask(session, 'meeting_free_time', { meeting_id: stored.id }));
-    data(await ask(session, 'meeting_hold', { meeting_id: stored.id, slot_ids: [s1.slot_id, s2.slot_id] }));
-    data(await ask(session, 'meeting_release_holds', { meeting_id: stored.id, slot_ids: [s1.slot_id] }));
-    expect(holds().map((hold) => hold.start?.dateTime)).toEqual([s2.start]);
   });
 });
 

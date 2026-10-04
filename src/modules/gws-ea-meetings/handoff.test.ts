@@ -538,7 +538,7 @@ describe('a request replayed after a host restart', () => {
         { calendar_id: PRINCIPAL, event_id: 'evt-review', ...WINDOW, purpose: 'Moving the review' },
       ],
       [
-        'meeting_ask_organizer',
+        'meeting_reschedule',
         'req-ask',
         { calendar_id: PRINCIPAL, event_id: 'evt-invite', ...WINDOW, purpose: 'Your Tuesday invitation' },
       ],
@@ -740,17 +740,18 @@ function principalEvent(id: string, attendee: string, startHour = 10, endHour = 
   };
 }
 
-describe('ask_organizer', () => {
-  it('addresses the organizer Google reports, for the length of their invitation', async () => {
+describe('rescheduling an invitation someone else organizes', () => {
+  it('asks the organizer Google reports, for the length of their invitation, and says so', async () => {
     calendar.put(invitation('evt-invite', OLU, 10, 11));
     const answer = data(
-      await ask(main, 'meeting_ask_organizer', {
+      await ask(main, 'meeting_reschedule', {
         calendar_id: PRINCIPAL,
         event_id: 'evt-invite',
         ...WINDOW,
         purpose: 'Your Thursday invitation',
       }),
     );
+    expect(answer.message).toMatch(/to ask its organizer about/);
     const stored = await meeting(answer.meeting_id);
     expect(stored).toMatchObject({
       kind: 'ask_organizer',
@@ -770,7 +771,7 @@ describe('ask_organizer', () => {
   it('writes to an organizer without a record, who is judged like anyone else (R16)', async () => {
     calendar.put(invitation('evt-stranger', LEE));
     const answer = data(
-      await ask(main, 'meeting_ask_organizer', {
+      await ask(main, 'meeting_reschedule', {
         calendar_id: PRINCIPAL,
         event_id: 'evt-stranger',
         ...WINDOW,
@@ -790,7 +791,7 @@ describe('ask_organizer', () => {
     calendar.put(invitation('evt-invite', OLU, 10, 11));
     calendar.put(principalEvent('evt-standup', SAM, 10, 11));
     const answer = data(
-      await ask(main, 'meeting_ask_organizer', {
+      await ask(main, 'meeting_reschedule', {
         calendar_id: PRINCIPAL,
         event_id: 'evt-invite',
         ...WINDOW,
@@ -821,11 +822,28 @@ describe('ask_organizer', () => {
     expect((await getSession(session.id))?.status).toBe('closed');
   });
 
+  it('refuses to make room with it or change its length: both are its organizer’s', async () => {
+    calendar.put(invitation('evt-invite', OLU, 10, 11));
+    const request = { calendar_id: PRINCIPAL, event_id: 'evt-invite', ...WINDOW, purpose: 'Your invitation' };
+    expect(
+      refusal(
+        await ask(main, 'meeting_reschedule', {
+          ...request,
+          making_room_for: `mtg-${'0'.repeat(8)}-0000-0000-0000-${'0'.repeat(12)}`,
+        }),
+      ),
+    ).toMatch(/never moves to make room/);
+    expect(refusal(await ask(main, 'meeting_reschedule', { ...request, length_minutes: 30 }))).toMatch(
+      /length is theirs to change/,
+    );
+    expect(await count('gws_ea_meetings')).toBe(0);
+  });
+
   it('accepts settled when the conflicting event is gone', async () => {
     calendar.put(invitation('evt-invite', OLU, 10, 11));
     calendar.put(principalEvent('evt-standup', SAM, 10, 11));
     const answer = data(
-      await ask(main, 'meeting_ask_organizer', {
+      await ask(main, 'meeting_reschedule', {
         calendar_id: PRINCIPAL,
         event_id: 'evt-invite',
         ...WINDOW,
@@ -863,20 +881,6 @@ describe('reschedule', () => {
       event_id: 'evt-review',
     });
     expect(stored.counterparts.map((c) => c.address)).toEqual([SAM]);
-  });
-
-  it('is refused for a meeting someone else organizes (R8)', async () => {
-    calendar.put(invitation('evt-theirs', OLU));
-    const message = refusal(
-      await ask(main, 'meeting_reschedule', {
-        calendar_id: PRINCIPAL,
-        event_id: 'evt-theirs',
-        ...WINDOW,
-        purpose: 'Moving it',
-      }),
-    );
-    expect(message).toMatch(/ask_organizer/);
-    expect(await count('gws_ea_meetings')).toBe(0);
   });
 
   it('continues in the thread of a meeting the assistant booked, which it takes over', async () => {
@@ -988,7 +992,7 @@ describe('cancel for an event the principal organizes (R8)', () => {
   it('refuses an event someone else organizes: ask its organizer instead', async () => {
     calendar.put(invitation('evt-theirs', OLU));
     const message = refusal(await ask(main, 'meeting_cancel', { calendar_id: PRINCIPAL, event_id: 'evt-theirs' }));
-    expect(message).toMatch(/ask_organizer/);
+    expect(message).toMatch(/have meeting_reschedule ask its organizer/);
     expect(calendar.writes).toEqual([]);
     expect(calendar.event(PRINCIPAL, 'evt-theirs')?.status).toBe('confirmed');
   });

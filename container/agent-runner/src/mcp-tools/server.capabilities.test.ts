@@ -32,6 +32,19 @@ const ALL = [
   'time',
   'schedule-stats',
   'calendar-facts',
+  'request-status',
+  'gws-ea-meetings',
+];
+
+/** main's meeting tools, which `gws-ea-meetings` grants. */
+const MAIN_MEETING_TOOLS = [
+  'email_dismiss',
+  'email_reply_to_principal',
+  'email_respond',
+  'meeting_amend',
+  'meeting_arrange',
+  'meeting_cancel',
+  'meeting_reschedule',
 ];
 
 /** Every tool of the default-on keys. */
@@ -44,10 +57,12 @@ const DEFAULT_ON_TOOLS = [
   'find_conflicts',
   'install_packages',
   'people_stats',
+  'request_status',
   'schedule_stats',
   'send_card',
   'send_file',
   'send_message',
+  ...MAIN_MEETING_TOOLS,
   ...TIME_TOOLS,
 ].sort();
 
@@ -89,16 +104,13 @@ describe('NanoClaw tool server capabilities', () => {
     ['reply and time', ['reply', 'time'], ['send_message', ...TIME_TOOLS].sort()],
     ['files-send', ['files-send'], ['add_reaction', 'edit_message', 'send_file']],
     ['calendar-facts', ['calendar-facts'], ['find_conflicts', 'people_stats']],
-    [
-      'gws-ea-meetings',
-      ['gws-ea-meetings'],
-      ['amend', 'arrange', 'ask_organizer', 'cancel', 'dismiss', 'reply_to_principal', 'reschedule', 'respond'],
-    ],
+    ['gws-ea-meetings', ['gws-ea-meetings'], MAIN_MEETING_TOOLS],
     [
       'gws-ea-meetings-external',
       ['gws-ea-meetings-external'],
-      ['book', 'free_time', 'hold', 'outcome', 'recipients', 'release_holds'],
+      ['email_recipients', 'meeting_book', 'meeting_free_time', 'meeting_hold', 'meeting_outcome'],
     ],
+    ['request-status', ['request-status'], ['request_status']],
     ['no keys', [], []],
   ])('serves a group holding %s exactly the tools of its keys', async (_holding, grants, tools) => {
     expect(await served(grants)).toEqual(tools);

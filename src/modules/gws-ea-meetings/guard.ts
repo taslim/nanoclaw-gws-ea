@@ -59,7 +59,7 @@ export const meetingOutcomeAction = defineGuardedAction({
   },
 });
 
-/** free_time, hold, release_holds and book: external-email's calendar tools, for its own meeting only. */
+/** meeting_free_time, meeting_hold and meeting_book: external-email's calendar tools, for its own meeting only. */
 export const meetingCalendarAction = defineGuardedAction({
   action: 'gws_ea_meetings.calendar',
   decide: async ({ actor, payload }) => {
@@ -72,7 +72,7 @@ export const meetingCalendarAction = defineGuardedAction({
   },
 });
 
-/** recipients: external-email places the people on its own meeting's thread, and no other. */
+/** email_recipients: external-email places the people on its own meeting's thread, and no other. */
 export const meetingRecipientsAction = defineGuardedAction({
   action: 'gws_ea_meetings.recipients',
   decide: async ({ actor, payload }) => {

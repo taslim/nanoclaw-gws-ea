@@ -11,19 +11,19 @@ import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqli
 import {
   amend,
   arrange,
-  askOrganizer,
   book,
   cancel,
   dismiss,
   freeTime,
   hold,
+  MEETING_REQUEST_TIMEOUT_MS,
   outcome,
   recipients,
-  releaseHolds,
   replyToPrincipal,
   reschedule,
   respond,
 } from './gws-ea-meetings.js';
+import { requestStatus } from './request-status.js';
 import type { McpToolDefinition } from './types.js';
 
 beforeEach(() => initTestSessionDb());
@@ -92,7 +92,6 @@ describe('the meeting tools', () => {
         'meeting_reschedule',
         { calendar_id: 'c', event_id: 'e', ...WINDOW, purpose: 'Making room', making_room_for: 'mtg-1' },
       ],
-      [askOrganizer, 'meeting_ask_organizer', { calendar_id: 'c', event_id: 'e', ...WINDOW, purpose: 'Your invite' }],
       [amend, 'meeting_amend', { meeting_id: 'mtg-1', length_minutes: 60 }],
       [outcome, 'meeting_outcome', { meeting_id: 'mtg-1', outcome: 'gave-up' }],
       [cancel, 'meeting_cancel', { meeting_id: 'mtg-1' }],
@@ -116,8 +115,7 @@ describe('the meeting tools', () => {
         { meeting_id: 'mtg-1', date: '2026-10-14', time: '15:00', timezone: 'America/New_York' },
       ],
       [hold, 'meeting_hold', { meeting_id: 'mtg-1', slot_ids: ['slot-3fa9c2e1b7d0', 'slot-0b1c2d3e4f5a'] }],
-      [releaseHolds, 'meeting_release_holds', { meeting_id: 'mtg-1' }],
-      [releaseHolds, 'meeting_release_holds', { meeting_id: 'mtg-1', slot_ids: ['slot-3fa9c2e1b7d0'] }],
+      [hold, 'meeting_hold', { meeting_id: 'mtg-1', slot_ids: [] }],
       [book, 'meeting_book', { meeting_id: 'mtg-1', slot_id: 'slot-3fa9c2e1b7d0' }],
       [
         arrange,
@@ -137,18 +135,18 @@ describe('the meeting tools', () => {
         { thread_key: 'mail-inbound-1', calendar_id: 'c', length_minutes: 30, ...WINDOW, purpose: 'Catch up' },
       ],
       [amend, 'meeting_amend', { meeting_id: 'mtg-1', people: [{ person_id: 'p-0123456789ab' }] }],
-      [respond, 'meeting_respond', { thread_key: 'mail-inbound-1', purpose: 'Decline kindly' }],
+      [respond, 'email_respond', { thread_key: 'mail-inbound-1', purpose: 'Decline kindly' }],
       [
         respond,
-        'meeting_respond',
-        { thread_key: 'mail-inbound-1', purpose: 'Holding line', constraints: 'Say a week at most.' },
+        'email_respond',
+        { thread_key: 'mail-inbound-1', purpose: 'Route to the press team', constraints: 'Keep it short.' },
       ],
-      [dismiss, 'meeting_dismiss', { thread_key: 'mail-inbound-1' }],
-      [replyToPrincipal, 'meeting_reply_to_principal', { gmail_message_id: '18c2f0a1b2', text: 'Done.\nIt is at 4.' }],
-      [recipients, 'meeting_recipients', { meeting_id: 'mtg-1', to: ['sales@acme.example'] }],
+      [dismiss, 'email_dismiss', { thread_key: 'mail-inbound-1' }],
+      [replyToPrincipal, 'email_reply_to_principal', { gmail_message_id: '18c2f0a1b2', text: 'Done.\nIt is at 4.' }],
+      [recipients, 'email_recipients', { meeting_id: 'mtg-1', to: ['sales@acme.example'] }],
       [
         recipients,
-        'meeting_recipients',
+        'email_recipients',
         { meeting_id: 'mtg-1', to: ['sales@acme.example'], cc: [], bcc: ['alex@principal.example'] },
       ],
       [outcome, 'meeting_outcome', { meeting_id: 'mtg-1', outcome: 'responded' }],
@@ -172,9 +170,9 @@ describe('the meeting tools', () => {
       [freeTime, {}],
       [freeTime, { meeting_id: 'mtg-1', time: '15:00' }],
       [hold, { meeting_id: 'mtg-1', slot_ids: 'slot-3fa9c2e1b7d0' }],
-      [hold, { meeting_id: 'mtg-1', slot_ids: [] }],
+      [hold, { meeting_id: 'mtg-1', slot_ids: [3] }],
+      [hold, { meeting_id: 'mtg-1' }],
       [book, { meeting_id: 'mtg-1' }],
-      [releaseHolds, { meeting_id: 'mtg-1', slot_ids: [3] }],
       [reschedule, { calendar_id: 'c', event_id: 'e', ...WINDOW, purpose: 'Making room', making_room_for: 7 }],
       [arrange, { calendar_id: 'c', length_minutes: 30, ...WINDOW, purpose: 'Intro', people: [{ name: 'Sam' }] }],
       [
@@ -198,11 +196,78 @@ describe('the meeting tools', () => {
   });
 });
 
+describe('a request the host is slow to answer', () => {
+  /** The host's answer, written the way delivery writes it, to a request already sent. */
+  function answer(requestId: string, frame: unknown): void {
+    getInboundDb()
+      .prepare('INSERT INTO messages_in (id, kind, timestamp, content, trigger) VALUES (?, ?, ?, ?, 0)')
+      .run(
+        `action-resp-${requestId}`,
+        'system',
+        new Date().toISOString(),
+        JSON.stringify({ type: 'action_response', requestId, frame }),
+      );
+  }
+
+  /** Run `tool` with each reading of the clock a whole timeout later, so it stops waiting at once. */
+  async function timedOut(tool: McpToolDefinition, args: Record<string, unknown>) {
+    const realNow = Date.now;
+    const start = realNow();
+    let calls = 0;
+    Date.now = () => start + calls++ * MEETING_REQUEST_TIMEOUT_MS;
+    try {
+      return await tool.handler(args);
+    } finally {
+      Date.now = realNow;
+    }
+  }
+
+  function text(result: { readonly content: readonly unknown[] }): string {
+    return (result.content[0] as { readonly text: string }).text;
+  }
+
+  it('names the request, says not to repeat one that is not safe to, and request_status reads the late answer', async () => {
+    const result = await timedOut(arrange, {
+      people: [{ person_id: 'p-0123456789ab' }],
+      calendar_id: 'c',
+      length_minutes: 30,
+      ...WINDOW,
+      purpose: 'Intro',
+    });
+    expect(result.isError).toBe(true);
+    const [row] = getUndeliveredMessages();
+    expect(text(result)).toContain(`request ${row.id}`);
+    expect(text(result)).toMatch(/request_status before you do anything else, and do not send it again/);
+
+    expect(text(await requestStatus.handler({ request_id: row.id }))).toMatch(/has not answered request .* yet/);
+    answer(row.id, { id: row.id, ok: true, data: { message: 'Handed to external-email as meeting mtg-1.' } });
+    const status = await requestStatus.handler({ request_id: row.id });
+    expect(status.isError).not.toBe(true);
+    expect(status.content).toEqual([{ type: 'text', text: 'Handed to external-email as meeting mtg-1.' }]);
+  });
+
+  it('says a request that is safe to repeat may be made again', async () => {
+    const result = await timedOut(freeTime, { meeting_id: 'mtg-1' });
+    expect(text(result)).toMatch(/or make the same call again: a repeat changes nothing twice/);
+  });
+
+  it('reads back a late refusal as an error, and refuses an id no request carried', async () => {
+    const result = await timedOut(cancel, { meeting_id: 'mtg-1' });
+    expect(result.isError).toBe(true);
+    const [row] = getUndeliveredMessages();
+    answer(row.id, { id: row.id, ok: false, error: { code: 'forbidden', message: 'Meeting mtg-1 has ended.' } });
+    expect(await requestStatus.handler({ request_id: row.id })).toEqual({
+      content: [{ type: 'text', text: 'Error: Meeting mtg-1 has ended.' }],
+      isError: true,
+    });
+    expect((await requestStatus.handler({ request_id: 'mtg-1' })).isError).toBe(true);
+  });
+});
+
 describe('requestAction', () => {
   it('gives up after its timeout, and stops at once when cancelled', async () => {
-    expect(await requestAction('meeting_cancel', { meeting_id: 'mtg-1' }, { timeoutMs: 20, pollMs: 5 })).toEqual({
-      status: 'timeout',
-    });
+    const timedOut = await requestAction('meeting_cancel', { meeting_id: 'mtg-1' }, { timeoutMs: 20, pollMs: 5 });
+    expect(timedOut).toEqual({ status: 'timeout', requestId: getUndeliveredMessages()[0].id });
     const controller = new AbortController();
     const waiting = requestAction(
       'meeting_cancel',

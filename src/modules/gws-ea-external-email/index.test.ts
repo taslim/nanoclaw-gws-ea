@@ -48,14 +48,14 @@ const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
 /** What the guidance must keep saying; each line is a rule R5, R19, R22, R23, R24, R25, R26, or R40 relies on. */
 const REQUIRED_GUIDANCE = [
   'Offer two or three times at once, so the other person can choose in one reply.',
-  'Offer only times `free_time` returned, and hold or book each one by its slot id.',
-  'Report how each meeting ends through `outcome`, once.',
-  'Report `needs-room` again only when `free_time` tells you to.',
-  'Report booked only after `book` succeeded, never for a time someone only agreed to.',
+  'Offer only times `meeting_free_time` returned, and hold or book each one by its slot id.',
+  'Report how each meeting ends through `meeting_outcome`, once.',
+  'Report `needs-room` again only when `meeting_free_time` tells you to.',
+  'Report booked only after `meeting_book` succeeded, never for a time someone only agreed to.',
   'Report needs-room only when nothing in the window fits someone in the inner circle or close; for anyone else, offer the open times there are, or report gave-up.',
   "When you are asked to arrange a meeting in a thread that isn't about scheduling, send nothing in it and report not-scheduling.",
-  'A `respond` brief asks for one reply',
-  'then report `responded` with `outcome`',
+  'A `email_respond` brief asks for one reply',
+  'then report `responded` with `meeting_outcome`',
   'After settled, responded, not-scheduling, or gave-up, the conversation is closed: send nothing more in it.',
   'You are `external-email`, the part of the assistant that writes to people other than the principal.',
   'Write every email as the assistant, under the name the Assistant Identity section gives you.',
@@ -64,7 +64,7 @@ const REQUIRED_GUIDANCE = [
   'Write as a gracious human assistant would: warm, brief, and specific',
   // Reply-all (R40).
   'Reply to everyone on the thread by default, as people expect.',
-  'Use `recipients` to leave someone off or move them to Bcc when that spares them or keeps the thread focused',
+  'Use `email_recipients` to leave someone off or move them to Bcc when that spares them or keeps the thread focused',
   'such as moving the principal to Bcc once they have introduced you',
   'When you move someone, say so in one line',
   'You cannot add anyone.',
@@ -78,10 +78,10 @@ const REQUIRED_GUIDANCE = [
   "When the host's note says no one has replied, send one short, friendly nudge in the thread.",
   'Send only that one nudge',
   'When the host makes room for your meeting, offer the time it holds for you, and book it when they agree.',
-  'When someone asks to move a booked meeting, find new times with `free_time` and move it with `book`.',
+  'When someone asks to move a booked meeting, find new times with `meeting_free_time` and move it with `meeting_book`.',
 ];
 
-/** Rules an earlier release held that inbox triage replaced: a copied-in thread can now take a `respond` brief (R19). */
+/** Rules an earlier release held that inbox triage replaced: a copied-in thread can now take a `email_respond` brief (R19). */
 const RETIRED_GUIDANCE = ["When the principal copies you into a thread that isn't about scheduling"];
 
 function group(id: string, name = 'main'): AgentGroup {
@@ -149,11 +149,11 @@ afterEach(async () => {
 });
 
 describe('the contract other units build on', () => {
-  it('registers its meeting key off for every group on all, and names the pair the group holds', () => {
+  it('registers its meeting key off for every group on all, and names the keys the group holds', () => {
     expect(EXTERNAL_EMAIL_MEETINGS_CAPABILITY).toBe('gws-ea-meetings-external');
     expect(listCapabilityKeys()).toContain(EXTERNAL_EMAIL_MEETINGS_CAPABILITY);
     expect(resolveCapabilities('all', 'any')).not.toContain(EXTERNAL_EMAIL_MEETINGS_CAPABILITY);
-    expect(EXTERNAL_EMAIL_CAPABILITIES).toEqual(['reply', 'gws-ea-meetings-external']);
+    expect(EXTERNAL_EMAIL_CAPABILITIES).toEqual(['reply', 'request-status', 'gws-ea-meetings-external']);
   });
 
   it('reads no pointer before the host creates the group', async () => {
@@ -170,6 +170,7 @@ describe('external-email at host start', () => {
     const config = await getContainerConfig(ee.id);
     expect(resolveCapabilities(parseStoredCapabilities(config?.capabilities, ee.name), ee.name)).toEqual([
       'reply',
+      'request-status',
       'gws-ea-meetings-external',
     ]);
     expect(config).toMatchObject({
@@ -307,8 +308,7 @@ describe("changes to external-email's configuration", () => {
     }
     expect(await getAgentGroup(ee.id)).toBeDefined();
     expect(parseStoredCapabilities((await getContainerConfig(ee.id))?.capabilities, ee.name)).toEqual([
-      'reply',
-      'gws-ea-meetings-external',
+      ...EXTERNAL_EMAIL_CAPABILITIES,
     ]);
 
     const host = await dispatch(
