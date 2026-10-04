@@ -169,7 +169,7 @@ async function theyWrite(from: string, body: string, inThreadOf = scheduling.gma
 // ---------------------------------------------------------------------------
 
 describe('AE2: a quiet thread', () => {
-  it('gets one nudge after two working days, and two working days later its holds go and main hears one line', async () => {
+  it('gets one nudge after two working days, and two working days later its holds go and main hears of it', async () => {
     const { stored, session } = await offered(scheduling.people.acme);
     // Held before Monday's working day began: it counts from 09:00, so two working days later is Wednesday 09:00.
     expect(await meeting(stored.id)).toMatchObject({
@@ -216,8 +216,9 @@ describe('AE2: a quiet thread', () => {
     expect(again).toEqual([]);
     expect(gaveUp.note).toMatchObject({ meeting_id: stored.id, outcome: 'gave-up' });
     expect(gaveUp.text).toContain('Acme Sales');
-    expect(gaveUp.text).toMatch(/one line/);
-    expect(gaveUp.text).toMatch(/suggestion/);
+    // The note states what happened; what reaches the principal is main's to judge (R51).
+    expect(gaveUp.text).toMatch(/held times were released and its thread closed/);
+    expect(gaveUp.text).not.toMatch(/Tell the principal/);
     expect(vi.mocked(requestWake)).toHaveBeenCalledWith(
       expect.objectContaining({ id: scheduling.main.id }),
       'inbound-message',
@@ -554,7 +555,7 @@ describe('a booked meeting', () => {
     expect(refusal(await ask(scheduling.main, 'meeting_cancel', { meeting_id: stored.id }))).toMatch(/ended/);
   });
 
-  it('is moved in place when the counterpart asks, once, and main hears it in one line', async () => {
+  it('is moved in place when the counterpart asks, once, and main hears of it once', async () => {
     const { stored, session } = await booked(scheduling.people.acme);
     const before = await getBooking(stored.id);
     if (!before) throw new Error('no booking');
@@ -585,7 +586,7 @@ describe('a booked meeting', () => {
     expect(more).toEqual([]);
     expect(note.note).toMatchObject({ meeting_id: stored.id, booking: { start: wednesday.start } });
     expect(note.text).toContain('Acme Sales');
-    expect(note.text).toMatch(/one line/);
+    expect(note.text).not.toMatch(/Tell the principal/);
 
     // A repeat moves nothing and tells no one again.
     data(await ask(session, 'meeting_book', { meeting_id: stored.id, slot_id: wednesday.slot_id }));

@@ -1161,7 +1161,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         message:
           `Booked directly: "${meeting.purpose}" with ${who(meeting)}, ${formatLocalTime(booking.start_at, timezone)} ` +
           `(${minutes} minutes), on calendar ${booking.calendar_id}. Their calendars showed the time free, so Google's ` +
-          'invitation went to them and nobody was emailed. Tell the principal in one line.',
+          'invitation went to them and nobody was emailed.',
       },
     };
   }
@@ -2050,20 +2050,17 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   function outcomeText(meeting: Meeting, outcome: SchedulingOutcome, room: RoomContext): string {
     switch (outcome) {
       case 'settled':
-        return (
-          `${who(meeting)} moved their invitation, so it no longer conflicts (meeting ${meeting.id}, "${meeting.purpose}"). ` +
-          'Tell the principal in one line.'
-        );
+        return `${who(meeting)} moved their invitation, so it no longer conflicts (meeting ${meeting.id}, "${meeting.purpose}").`;
       case 'not-scheduling':
         return (
           `Thread ${meeting.thread_key} with ${who(meeting)} is not about scheduling, so external-email sent nothing in it (meeting ${meeting.id}). ` +
           `It waits for you again: triage it like any other email. Answer it with email_respond, with thread_key ${meeting.thread_key}, ` +
-          'or close it with email_dismiss, and tell the principal only if it needs them.'
+          'or close it with email_dismiss.'
         );
       case 'gave-up':
         return (
-          `external-email gave up on meeting ${meeting.id}, "${meeting.purpose}" with ${who(meeting)}: no time was agreed. ` +
-          'Tell the principal in one line, with a suggestion.' +
+          `external-email gave up on meeting ${meeting.id}, "${meeting.purpose}" with ${who(meeting)}: no time was agreed, ` +
+          'so its held times were released and its thread closed.' +
           roomStillNeeded(room)
         );
       default: {
@@ -2077,7 +2074,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   function roomStillNeeded(room: RoomContext): string {
     return room.roomFor
       ? ` It was moving to make room for meeting ${room.roomFor.id} with ${who(room.roomFor)}, which still needs room: ` +
-          'move another meeting the needs-room note listed, or tell the principal in one line with your recommendation.'
+          `another meeting can move for it with meeting_reschedule and making_room_for ${room.roomFor.id}.`
       : '';
   }
 
@@ -2378,7 +2375,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         conversationNote(meeting, 'gave-up'),
         `external-email's reply in thread ${meeting.thread_key}, to ${who(meeting)} (meeting ${meeting.id}), ${why}. ` +
           `It was to "${meeting.purpose}". The thread waits for you again: try again with ` +
-          `email_respond and thread_key ${meeting.thread_key}, or tell the principal in one line.`,
+          `email_respond and thread_key ${meeting.thread_key}.`,
         at,
       ),
     );
@@ -2414,8 +2411,8 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       `An email external-email wrote in meeting ${meeting.id}'s thread could not be sent: email delivery kept failing ` +
         `("${meeting.purpose}", thread_key ${meeting.thread_key}). It was to ${to}. ` +
         (meeting.state === 'booked'
-          ? 'The meeting stays booked as it is: meeting_cancel it, or tell the principal in one line if it matters.'
-          : 'The meeting is still being arranged, but nothing will come of it on its own: meeting_amend it, meeting_cancel it, or tell the principal in one line.'),
+          ? 'The meeting stays booked as it is.'
+          : 'The meeting is still being arranged, but nothing will come of it on its own: meeting_amend briefs external-email again, or meeting_cancel calls it off.'),
       new Date().toISOString(),
     );
   }
@@ -2430,15 +2427,12 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
   /** What main can do about a meeting that stalled, as its state allows. */
   function stallNextStep(meeting: Meeting): string {
     if (!isScheduling(meeting)) {
-      return (
-        `Its reply was not sent, and the thread waits for you again: email_respond again with thread_key ${meeting.thread_key}, ` +
-        'or tell the principal in one line.'
-      );
+      return `Its reply was not sent, and the thread waits for you again: email_respond again with thread_key ${meeting.thread_key}.`;
     }
     return meeting.state === 'booked'
-      ? 'The meeting stays booked: meeting_reschedule it if they asked to move it, meeting_cancel it, or tell the principal in one line.'
-      : 'The meeting is still open, but nothing will come of it on its own: meeting_amend it to brief external-email again, ' +
-          'meeting_cancel it, or tell the principal in one line.';
+      ? 'The meeting stays booked: meeting_reschedule moves it if they asked to, and meeting_cancel calls it off.'
+      : 'The meeting is still open, but nothing will come of it on its own: meeting_amend briefs external-email again, ' +
+          'and meeting_cancel calls it off.';
   }
 
   /**
@@ -2776,10 +2770,7 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
       meeting.ask_about === null
         ? `Nobody answered meeting ${meeting.id}, "${meeting.purpose}" with ${who(meeting)}, in the two working days after a nudge`
         : `Meeting ${meeting.id}, "${meeting.purpose}" with ${who(meeting)}, waited four working days for your answer about ${ASK_WORDS[meeting.ask_about]}`;
-    const text =
-      `${waited}, so its held times were released and its thread closed. Tell the principal in one line, with a suggestion, ` +
-      'such as another way to reach them or a later window.' +
-      roomStillNeeded(room);
+    const text = `${waited}, so its held times were released and its thread closed.` + roomStillNeeded(room);
     await writeOutcomeNote(note, text, at);
     const data = { meeting_id: meeting.id, outcome: 'gave-up', message: OUTCOME_REPLIES['gave-up'] };
     await recordOutcome(meeting.id, 'gave-up', JSON.stringify(data), at);

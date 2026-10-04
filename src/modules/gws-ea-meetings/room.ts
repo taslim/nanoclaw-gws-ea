@@ -225,8 +225,8 @@ export function createRoom(deps: RoomDeps) {
       `meeting-room-lost-${target.id}-${room.by_meeting_id}`,
       { type: ROOM_LOST_NOTE_TYPE, meeting_id: target.id, moved_meeting_id: room.moved_meeting_id },
       `A meeting moved to make room for meeting ${target.id} with ${who(target)}, but the time it freed, ` +
-        `${formatLocalTime(room.start_at, timezone)}, was taken before it could be held. That meeting still needs room: ` +
-        'move another meeting the needs-room note listed, or tell the principal in one line with your recommendation.',
+        `${formatLocalTime(room.start_at, timezone)}, was taken before it could be held, so that meeting still needs room. ` +
+        `Another meeting can move for it with meeting_reschedule and making_room_for ${target.id}, or meeting_amend can widen its window.`,
       at,
     );
   }

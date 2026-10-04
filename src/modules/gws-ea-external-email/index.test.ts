@@ -77,10 +77,27 @@ const REQUIRED_GUIDANCE = [
   'Send only that one nudge',
   'When the host makes room for your meeting, offer the time it holds for you, and book it when they agree.',
   'When someone asks to move a booked meeting, find new times with `meeting_free_time` and move it with `meeting_book`.',
+  // Asking main, and no acknowledging emails (R42, R43, R50).
+  'ask main with `meeting_ask_main`, and wait.',
+  'Never send an email that only acknowledges, stalls, or says you are checking',
+  'Until the host writes to you again, send nothing in the thread, even when they write meanwhile.',
+  'A turn that sends nothing ends with nothing outside `<internal>…</internal>`',
+  'Work out any day, date or zone with the time tools, never in your head.',
+  // Invitations by judgment (R46).
+  'write the invitation a thoughtful assistant would',
+  'a Meet link when a video call suits and nobody named one',
+  // Calling off (R48).
+  'tell them in one short, gracious line, and send nothing after it.',
 ];
 
 /** Rules an earlier release held that inbox triage replaced: a copied-in thread can now take a `email_respond` brief (R19). */
-const RETIRED_GUIDANCE = ["When the principal copies you into a thread that isn't about scheduling"];
+const RETIRED_GUIDANCE = [
+  "When the principal copies you into a thread that isn't about scheduling",
+  // Replaced by asking main (R42) and by conversations that stay open (R44).
+  'needs-room',
+  'report `responded`',
+  'asks for one reply',
+];
 
 function group(id: string, name = 'main'): AgentGroup {
   return { id, name, folder: id, agent_provider: null, created_at: '2026-10-03T00:00:00.000Z' };

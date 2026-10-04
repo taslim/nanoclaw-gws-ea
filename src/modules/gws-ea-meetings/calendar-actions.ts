@@ -817,10 +817,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
       day !== undefined,
       narrowing.after !== undefined || narrowing.before !== undefined,
     );
-    const footer =
-      offered.length > 0
-        ? 'Offer two or three of them, on different days where you can, and hold each one you offer. '
-        : '';
+    const footer = offered.length > 0 ? 'Hold the ones you offer. ' : '';
     return {
       meetingId: meeting.id,
       data: {
@@ -983,7 +980,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
       },
       `At their request, meeting ${meeting.id}, "${meeting.purpose}" with ${who(meeting)}, moved from ` +
         `${formatLocalTime(existing.start_at, timezone)} to ${formatLocalTime(slot.start_at, timezone)} (${minutes} minutes), ` +
-        `on calendar ${existing.calendar_id}. Google sent them the update. Tell the principal in one line.`,
+        `on calendar ${existing.calendar_id}. Google sent them the update.`,
       new Date().toISOString(),
     );
     await updateBookingTime(meeting.id, slot.start_at, slot.end_at);
@@ -999,7 +996,7 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
         },
         message:
           `Moved: ${slotLabel(slotSpan(slot), display)}. Google sends ${meeting.counterparts.map((c) => c.address).join(', ')} ` +
-          "the update from the principal's calendar, and main tells the principal. There is no outcome to report.",
+          "the update from the principal's calendar, and main hears of it from the host.",
       },
     };
   }
