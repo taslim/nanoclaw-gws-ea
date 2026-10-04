@@ -675,10 +675,8 @@ export function createCalendarActions(deps: CalendarActionsDeps) {
 
   /**
    * The event's Meet link as Google reports it now, when the invitation
-   * asked for one. The booking already stands (the event is created or
-   * moved, and Google has emailed the guests), so a failed read-back is not
-   * fatal: it is logged and read as `pending`, which is honest, since the
-   * create request went through and Google creates the link asynchronously.
+   * asked for one. The booking already stands, so a read that fails counts
+   * the link as still being created: Google makes it after the request.
    */
   async function conferenceOf(booking: Booking, invitation: Invitation): Promise<EventConference | undefined> {
     if (invitation.video_call !== true) return undefined;

@@ -1659,7 +1659,11 @@ export function createMeetingHandoff(deps: MeetingHandoffDeps) {
         at,
       );
     }
-    if (!session) throw new Error(`Meeting ${meeting.id} is closing with no conversation to write its line`);
+    if (session?.status !== 'active') {
+      // Its conversation is gone, so no line can go: the meeting ends without one.
+      await endMeeting(meeting, 'cancelled', true);
+      return 'ended';
+    }
     await deps.releaseHolds(meeting);
     // A booking stays recorded once its event is deleted, so a call that finishes another's says the same.
     const booked = (await getBooking(meeting.id)) !== undefined;

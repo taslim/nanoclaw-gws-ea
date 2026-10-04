@@ -50,7 +50,7 @@ import type { ResponseFrame } from '../../cli/frame.js';
 import { killContainer } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
-import { getSession } from '../../db/sessions.js';
+import { getSession, updateSession } from '../../db/sessions.js';
 import { deliverSessionMessages, getDeliveryAction } from '../../delivery.js';
 import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { requestWake } from '../../request-wake.js';
@@ -1002,6 +1002,18 @@ describe('cancel', () => {
     expect(more).toEqual([]);
     expect(note.text).toMatch(/one short, gracious line/);
     expect(calendar.live(PRINCIPAL).filter((event) => event.tags?.gwsEaRole === 'hold')).toEqual([]);
+  });
+
+  it('ends a called-off meeting at once when called off again after its conversation is gone', async () => {
+    const answer = data(await ask(main, 'meeting_arrange', arrangeWith(sam)));
+    const stored = await meeting(answer.meeting_id);
+    const session = await meetingSession(answer.meeting_id);
+    await reply(session, stored.thread_key, 'Hello Sam, I am Robin, Pat Doe’s assistant. Would Tuesday at 10:00 work?');
+    expect(data(await ask(main, 'meeting_cancel', { meeting_id: stored.id })).state).toBe('closing');
+
+    await updateSession(session.id, { status: 'closed' });
+    expect(data(await ask(main, 'meeting_cancel', { meeting_id: stored.id })).state).toBe('cancelled');
+    expect((await meeting(stored.id)).state).toBe('cancelled');
   });
 
   it("deletes a booked meeting's event with Google's notice, and passes main's note on in the closing line", async () => {
