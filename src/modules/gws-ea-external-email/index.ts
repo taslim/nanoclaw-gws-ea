@@ -12,7 +12,9 @@
  *     stamped plugins, provider, or gateway scope differ from what the host
  *     stamped.
  *   - A destination admission policy keeps it apart from main and from every
- *     other group (`./destination-policy.ts`).
+ *     other group (`./destination-policy.ts`). The two work together only
+ *     through the host: main's `email_handoff` and its own `tell_main`
+ *     (`./bridge.ts`).
  *   - Its project document holds its guidance, read from the release, and the
  *     two display names: the profile and preferences sections leave it
  *     everything else out.
@@ -32,11 +34,13 @@ import { register } from '../../cli/registry.js';
 import { registerSessionAdmissionPolicy } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
+import { registerDeliveryAction } from '../../delivery.js';
 import { onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
 import { registerRequiredProjectDocSection } from '../../project-doc-sections.js';
 import type { AgentGroup } from '../../types.js';
 import { getExternalEmailAgentGroupId as readExternalEmailPointer } from '../gws-ea-profile/db.js';
+import { BRIDGE_ACTIONS } from './bridge.js';
 import { destinationViolations } from './destination-policy.js';
 import { EXTERNAL_EMAIL_MEETINGS_CAPABILITY, ensureExternalEmailGroup, externalEmailDrift } from './group.js';
 
@@ -67,6 +71,8 @@ onHostStart(async () => {
   if (!(await getDb().hasTable('gws_ea_profile'))) return;
   await ensureExternalEmailGroup();
 });
+
+for (const [action, handler, guard] of BRIDGE_ACTIONS) registerDeliveryAction(action, handler, guard);
 
 registerProtectedGroupPolicy('gws-ea-external-email:host-owned', async (agentGroupId) =>
   agentGroupId === (await getExternalEmailAgentGroupId()) ? 'external-email is configured only by the host' : undefined,

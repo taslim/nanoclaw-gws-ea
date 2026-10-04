@@ -18,7 +18,7 @@
  * - A thread's addresses are those its messages carried and those `main`
  *   named (`recordThreadAddresses`).
  * - A file goes out in a thread only when `main` handed it over for it, by
- *   its SHA-256 (`findThreadFile`).
+ *   its SHA-256 (`recordThreadFile`, `findThreadFile`).
  * - A send never happens twice. Before Gmail is called, a pending record
  *   holds its pre-allocated Message-ID, so a retry of the same send on the
  *   same side finds it, and a reply to it already resolves. Once Gmail holds
@@ -56,9 +56,17 @@ function toThread(row: ThreadRow): Thread {
   return { threadKey: row.thread_key, gmailThreadId: row.gmail_thread_id, createdAt: row.created_at };
 }
 
-/** A new thread: for a message that starts one, or one `main` hands over before Gmail has it. */
-export async function createThread(gmailThreadId: string | null, at: string): Promise<Thread> {
-  const thread: Thread = { threadKey: `mail-${randomUUID()}`, gmailThreadId, createdAt: at };
+/**
+ * A new thread: for a message that starts one, or one `main` hands over
+ * before Gmail has it. A handoff gives the key it derived from its request,
+ * so a replay of the request finds the thread it began.
+ */
+export async function createThread(
+  gmailThreadId: string | null,
+  at: string,
+  threadKey = `mail-${randomUUID()}`,
+): Promise<Thread> {
+  const thread: Thread = { threadKey, gmailThreadId, createdAt: at };
   await getDb().run(
     'INSERT INTO gws_ea_threads (thread_key, gmail_thread_id, created_at) VALUES (?, ?, ?)',
     thread.threadKey,
@@ -301,6 +309,27 @@ export async function threadAddresses(threadKey: string): Promise<ThreadAddress[
 export interface ThreadFile {
   readonly fileName: string;
   readonly hostPath: string;
+}
+
+/**
+ * Record a file `main` handed over for the thread, by its SHA-256. The same
+ * bytes handed over again point the record at the newer copy.
+ */
+export async function recordThreadFile(
+  threadKey: string,
+  file: ThreadFile & { readonly sha256: string },
+  at: string,
+): Promise<void> {
+  await getDb().run(
+    `INSERT INTO gws_ea_thread_files (thread_key, sha256, file_name, host_path, handed_at) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (thread_key, sha256)
+       DO UPDATE SET file_name = excluded.file_name, host_path = excluded.host_path, handed_at = excluded.handed_at`,
+    threadKey,
+    file.sha256,
+    file.fileName,
+    file.hostPath,
+    at,
+  );
 }
 
 /** The file with this SHA-256 that `main` handed over for the thread, or undefined. */

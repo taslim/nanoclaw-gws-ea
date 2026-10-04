@@ -294,7 +294,7 @@ function placesSentence(mail: ParsedMail, verdict: Sender, context: RoutingConte
 }
 
 /** The principal's name and time zone, and today's date there. */
-function principalSentence(context: RoutingContext): string {
+export function principalSentence(context: RoutingContext): string {
   const timezone = resolveTimezone(context.principal.timezone);
   const today = new Intl.DateTimeFormat('en-US', {
     timeZone: timezone,
