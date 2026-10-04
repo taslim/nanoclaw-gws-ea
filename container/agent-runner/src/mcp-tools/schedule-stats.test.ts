@@ -235,14 +235,18 @@ describe('schedule_stats over eight weeks of saved gog output', () => {
   });
 
   it('returns the most common meeting lengths, overall, by size, and for meetings the principal organized', async () => {
-    const result = await stats(eightWeeks(), { principal_addresses: ['Principal@Example.TEST'] });
+    // The principal set this one up from their home address: Google does not mark it as their own.
+    const fromHome = event(addDays(WINDOW.from, 2), '13:00', '13:45', 4, HOME);
+    const result = await stats([...eightWeeks(), fromHome], {
+      principal_addresses: ['Principal@Example.TEST', 'Principal.Home@Gmail.COM'],
+    });
     expect(result.meeting_lengths).toEqual({
       all: {
-        count: 95,
+        count: 96,
         most_common: [
           { minutes: 30, count: 49 },
           { minutes: 60, count: 31 },
-          { minutes: 45, count: 8 },
+          { minutes: 45, count: 9 },
         ],
       },
       one_on_one: {
@@ -253,17 +257,18 @@ describe('schedule_stats over eight weeks of saved gog output', () => {
         ],
       },
       group: {
-        count: 39,
+        count: 40,
         most_common: [
           { minutes: 60, count: 31 },
-          { minutes: 45, count: 8 },
+          { minutes: 45, count: 9 },
         ],
       },
       organized_by_principal: {
-        count: 48,
+        count: 49,
         most_common: [
           { minutes: 30, count: 41 },
           { minutes: 25, count: 7 },
+          { minutes: 45, count: 1 },
         ],
       },
     });
@@ -298,6 +303,14 @@ describe('schedule_stats over eight weeks of saved gog output', () => {
   it('reports no organizer split when the principal addresses are not given', async () => {
     const result = await stats(eightWeeks());
     expect(result.meeting_lengths.organized_by_principal).toBeNull();
+  });
+
+  it('counts a file saved a while ago, since history needs no fresh fetch', async () => {
+    // Older than a conflict check accepts.
+    const file = writeEvents(eightWeeks());
+    const then = new Date(Date.now() - 16 * 60_000);
+    fs.utimesSync(file, then, then);
+    expect((await stats([], { files: [file] })).events.meetings).toBe(95);
   });
 });
 
@@ -433,6 +446,17 @@ describe('schedule_stats sets aside what is not a meeting', () => {
     expect(result.meeting_lengths.all).toEqual({ count: 1, most_common: [{ minutes: 60, count: 1 }] });
   });
 
+  it('counts a meeting the principal declined on one calendar but accepted on another', async () => {
+    const review = event('2026-08-10', '09:00', '10:00', 2);
+
+    const result = await stats([], {
+      files: [writeEvents([answered(review, 'declined')], HOME), writeEvents([review])],
+    });
+
+    expect(result.events).toEqual({ ...NOTHING_SET_ASIDE, received: 2, meetings: 1, duplicate_copies: 1 });
+    expect(result.meeting_lengths.all).toEqual({ count: 1, most_common: [{ minutes: 60, count: 1 }] });
+  });
+
   it('keeps a meeting that ends exactly at midnight, ending at 24:00', async () => {
     const result = await stats([timed('2026-08-10T23:00:00+01:00', '2026-08-11T00:00:00+01:00', 2)]);
     expect(result.events.meetings).toBe(1);
@@ -506,13 +530,11 @@ describe('schedule_stats refuses what it cannot count exactly', () => {
     );
   });
 
-  it('refuses a malformed or partial file, naming it', async () => {
+  it('refuses a partial file, or one outside the folders it reads, naming it', async () => {
+    // The reader's other refusals are pinned in calendar-facts.test.ts.
     for (const [file, reason] of [
-      [writeRaw('{"events": ['), 'not valid JSON'],
-      [writeRaw('{"items": []}'), 'gog calendar events'],
       [writeRaw('{"events": [], "nextPageTokens": [{"calendarId": "x", "nextPageToken": "abc"}]}'), '--all-pages'],
       ['/etc/gog-events.json', 'outside'],
-      [path.join(root, 'missing.json'), 'no such file'],
     ]) {
       const text = await refusal({ files: [file] });
       expect(text).toContain(file);

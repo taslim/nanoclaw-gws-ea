@@ -340,7 +340,7 @@ describe('find_conflicts', () => {
     });
   });
 
-  it('lists a hold the assistant placed as able to give way, and a real event as a conflict', async () => {
+  it('lists holds the assistant placed as able to give way, earliest first, and a real event as a conflict', async () => {
     const file = writeEvents(WORK, [
       // A hold the assistant placed: busy, private, no guests, and its private marks name its meeting.
       timed(at('10:00'), at('10:30'), {
@@ -369,11 +369,24 @@ describe('find_conflicts', () => {
         id: 'later-hold',
         extendedProperties: { private: { gwsEaMeeting: 'mtg-4', gwsEaRole: 'hold' } },
       }),
+      // A hold that starts earlier, though it comes last in the file.
+      timed(at('09:45'), at('10:15'), {
+        id: 'earlier-hold',
+        extendedProperties: { private: { gwsEaMeeting: 'mtg-5', gwsEaRole: 'hold' } },
+      }),
     ]);
 
     const result = await conflicts({ files: [file], start: at('10:00'), end: at('11:00') });
 
     expect(result.holds).toEqual([
+      {
+        meeting_id: 'mtg-5',
+        calendars: [WORK],
+        event_id: 'earlier-hold',
+        start: at('09:45'),
+        end: at('10:15'),
+        overlap_minutes: 15,
+      } satisfies HeldTime,
       {
         meeting_id: 'mtg-1',
         calendars: [WORK],
@@ -386,14 +399,14 @@ describe('find_conflicts', () => {
     expect(result.holds_not_listed).toBe(0);
     expect(ids(result)).toEqual(['shared-marks', 'role-only', 'booking']);
     expect(result.events).toEqual({
-      received: 5,
+      received: 6,
       candidate_copies: 0,
       cancelled: 0,
       declined: 0,
       free: 0,
       outside_window: 1,
       conflicting: 3,
-      holds: 1,
+      holds: 2,
     });
   });
 
@@ -724,7 +737,8 @@ describe('reading gog files', () => {
       expect(await refusal(tool, { files: [secret] })).toContain(secret);
       expect(await refusal(tool, { files: [link] })).toContain(link);
       expect(await refusal(tool, { files: ['../escape.json'] })).toContain('../escape.json');
-      expect(await refusal(tool, { files: [path.join(root, 'missing.json')] })).toContain('missing.json');
+      const missing = path.join(root, 'missing.json');
+      expect(await refusal(tool, { files: [missing] })).toContain(`${missing}: there is no such file`);
       expect(await refusal(tool, { files: [] })).toContain('files');
     }
   });
@@ -790,5 +804,18 @@ describe('reading gog files', () => {
     const statsRefusal = await refusal(peopleStats, { files: [firstPage] });
     expect(statsRefusal).toContain(firstPage);
     expect(statsRefusal).toContain('--all-pages');
+  });
+
+  it('reads up to 20,000 events across its files, and refuses any more', async () => {
+    const full = writeEvents(
+      WORK,
+      Array.from({ length: 20_000 }, () => timed(at('10:00'), at('10:30'))),
+    );
+    const oneMore = writeEvents(WORK, [timed(at('11:00'), at('11:30'))]);
+
+    expect((await stats({ files: [full] })).events.received).toBe(20_000);
+    expect(await refusal(peopleStats, { files: [full, oneMore] })).toBe(
+      'Error: The files hold more than 20000 events. Use a shorter window.',
+    );
   });
 });
