@@ -458,7 +458,9 @@ describe('busy time on the principal’s other calendars', () => {
       expect(overlaps({ start: Date.parse(time.start), end: Date.parse(time.end) }, taken), time.start).toBe(false);
     }
     expect(
-      refusal(await send(sessionA, 'book', { start: WEDNESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] })),
+      refusal(
+        await send(sessionA, 'book', { start: WEDNESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] }),
+      ),
     ).toMatch(/no longer free/u);
     expect(live('booking')).toEqual([]);
     expect(calendar.live(TEAM)).toEqual([]);
@@ -747,9 +749,9 @@ describe('book', () => {
     calendar.put(busy('evt-wed', WEDNESDAY_10AM, '2026-10-07T10:00:00.000Z'));
 
     for (const start of [TUESDAY_10AM, WEDNESDAY_10AM]) {
-      expect(refusal(await send(sessionA, 'book', { start, minutes: 30, title: 'Catch-up', invitees: [REMY] }))).toMatch(
-        /no longer free/u,
-      );
+      expect(
+        refusal(await send(sessionA, 'book', { start, minutes: 30, title: 'Catch-up', invitees: [REMY] })),
+      ).toMatch(/no longer free/u);
     }
     expect(live('booking')).toEqual([]);
   });
@@ -871,7 +873,9 @@ describe('book', () => {
     });
     await setThreadBookingCalendar(threadA, 'shared@group.calendar.google.com');
     expect(
-      refusal(await send(sessionA, 'book', { start: WEDNESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] })),
+      refusal(
+        await send(sessionA, 'book', { start: WEDNESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] }),
+      ),
     ).toMatch(/cannot write to the calendar main named/u);
   });
 

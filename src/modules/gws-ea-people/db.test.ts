@@ -315,7 +315,7 @@ describe('GWS-EA people store', () => {
     ['another Gmail spelling', 'm.o.r.g.a.n.fixture@googlemail.com', /principal's own/i],
     ["the principal's verified chat identity", 'gchat:users/principal', /principal's own/i],
     ["the assistant's address", 'email:Juno@example.test', /assistant's own/i],
-    ["a plus-addressed form of the assistant's address", 'robin+calendar@example.test', /assistant's own/i],
+    ["a plus-addressed form of the assistant's address", 'juno+calendar@example.test', /assistant's own/i],
   ])('refuses %s as a person identity', async (_case, identity, message) => {
     await expect(addPerson(pat({ identity }))).rejects.toThrow(message);
     const { id } = await addPerson(pat({ identity: undefined }));
@@ -534,9 +534,9 @@ describe('forgetting a person', () => {
     const users = (await getDb().all<{ id: string }>('SELECT id FROM users ORDER BY id')).map((user) => user.id);
     // The principal's own email identities stay: they are main's members, never a person's.
     expect(users).toEqual([
-      'email:other@example.test',
       'email:morgan.fixture@gmail.com',
       'email:morgan@example.test',
+      'email:other@example.test',
       'gchat:users/pat',
       'gchat:users/principal',
     ]);

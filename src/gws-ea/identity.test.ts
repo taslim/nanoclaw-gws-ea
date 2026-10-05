@@ -160,7 +160,7 @@ function harness(
 const input = {
   assistantDisplayName: 'Aya',
   assistantWorkspaceEmail: 'aya@example.test',
-  principalDisplayName: 'Taslim',
+  principalDisplayName: 'Morgan',
   principalTimezone: 'America/Los_Angeles',
 };
 
@@ -311,14 +311,14 @@ describe('main identity reconciliation', () => {
 
     await reconcileMainIdentity(
       runtimeConfig(),
-      { ...input, principalEmails: ['Taslim@Example.test', 'taslim@work.example.test', 'taslim@example.test'] },
+      { ...input, principalEmails: ['Morgan@Example.test', 'morgan@work.example.test', 'morgan@example.test'] },
       dependencies,
     );
 
     expect(flagValue(state.profileWriteArgs[0]!, '--principal-emails')).toBe(
-      JSON.stringify(['taslim@example.test', 'taslim@work.example.test']),
+      JSON.stringify(['morgan@example.test', 'morgan@work.example.test']),
     );
-    expect(state.principalEmails).toEqual(['taslim@example.test', 'taslim@work.example.test']);
+    expect(state.principalEmails).toEqual(['morgan@example.test', 'morgan@work.example.test']);
   });
 
   it("leaves the principal's addresses to the profile when a reconcile declares none", async () => {
@@ -332,9 +332,9 @@ describe('main identity reconciliation', () => {
   });
 
   it.each([
-    ['a malformed address', ['taslim@example.test', 'not-an-email']],
+    ['a malformed address', ['morgan@example.test', 'not-an-email']],
     ['no address', []],
-    ["the assistant's own address", ['taslim@example.test', 'AYA@example.test']],
+    ["the assistant's own address", ['morgan@example.test', 'AYA@example.test']],
   ])('rejects principal addresses with %s before mutating NanoClaw or OneCLI', async (_case, principalEmails) => {
     const { state, dependencies } = harness();
 
@@ -356,7 +356,7 @@ describe('main identity reconciliation', () => {
     };
 
     await expect(
-      reconcileMainIdentity(runtimeConfig(), { ...input, principalEmails: ['taslim@example.test'] }, forgetful),
+      reconcileMainIdentity(runtimeConfig(), { ...input, principalEmails: ['morgan@example.test'] }, forgetful),
     ).rejects.toMatchObject({ code: 'profile_mismatch' });
   });
 });

@@ -27,7 +27,7 @@ import { GwsEaError } from './types.js';
 
 const ROOT = '/tmp/nanoclaw-gws-ea-google-connection-test';
 const SECRETS = path.join(ROOT, 'secrets');
-const ACCOUNT = 'robin@example.test';
+const ACCOUNT = 'juno@example.test';
 const CLIENT = { client_id: '123-abc.apps.googleusercontent.com', client_secret: 'GOCSPX-desktop-secret' };
 
 function runtime(): InstanceRuntimeConfig {
@@ -47,7 +47,7 @@ function runtime(): InstanceRuntimeConfig {
     onecli_gateway_container: 'gws-ea-x-gateway-1',
     onecli_cli_path: '/opt/onecli',
     selected_provider: 'claude',
-    endpoint_url: 'https://robin.example.test/webhook/gchat',
+    endpoint_url: 'https://juno.example.test/webhook/gchat',
     docker_endpoint: 'unix:///var/run/docker.sock',
     secret_files: {
       gchat_credentials: path.join(SECRETS, 'gchat-service-account.json'),
@@ -59,9 +59,9 @@ function runtime(): InstanceRuntimeConfig {
 
 const GCP: GcpProjectInput = {
   instanceId: '11111111-1111-4111-8111-111111111111',
-  projectId: 'gws-ea-robin-test',
+  projectId: 'gws-ea-juno-test',
   account: 'operator@example.test',
-  serviceAccountEmail: deriveGchatServiceAccountEmail('gws-ea-robin-test'),
+  serviceAccountEmail: deriveGchatServiceAccountEmail('gws-ea-juno-test'),
   credentialFile: path.join(SECRETS, 'gchat-service-account.json'),
   cwd: ROOT,
 };
@@ -299,14 +299,14 @@ describe("connecting the assistant's Google account", () => {
     const resources = resourcesFor(world);
     fs.writeFileSync(
       path.join(SECRETS, 'google-grant.json'),
-      JSON.stringify(grant({ account: 'taslim@example.test' })),
+      JSON.stringify(grant({ account: 'morgan@example.test' })),
       { mode: 0o600 },
     );
 
     const observed = await resources[2]!.observe(context(signIn));
     expect(observed).toEqual({
       status: 'absent',
-      reason: `Google is signed in as taslim@example.test, not the assistant's account ${ACCOUNT}`,
+      reason: `Google is signed in as morgan@example.test, not the assistant's account ${ACCOUNT}`,
     });
     await expect(connect(resources, context(signIn))).resolves.toBeUndefined();
     expect(signIn).toHaveBeenCalledWith(expect.objectContaining({ client: CLIENT }));
