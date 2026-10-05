@@ -1,7 +1,8 @@
 /**
  * The `external-email` agent group: created once at host start from the
  * release's template, with a fixed capability list, and a project document
- * that holds its guidance and two names and nothing else of GWS-EA's.
+ * that holds its guidance, two names and the principal's time zone, and
+ * nothing else of GWS-EA's.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -250,7 +251,7 @@ describe('external-email at host start', () => {
 });
 
 describe("external-email's project document", () => {
-  it('holds its guidance and both display names, and nothing else of GWS-EA', async () => {
+  it("holds its guidance, both display names and the principal's time zone, and nothing else of GWS-EA", async () => {
     const main = group('ag-main');
     await createGroup(main);
     await publishMain(main);
@@ -271,6 +272,7 @@ describe("external-email's project document", () => {
 
     expect([...composed.keys()]).toEqual([
       '# Assistant Identity',
+      '# Principal',
       '# External Email',
       '# NanoClaw Runtime Contract',
       '# NanoClaw Module: gws-ea-email-external',
@@ -280,6 +282,8 @@ describe("external-email's project document", () => {
     expect(composed.get('# Assistant Identity')).toBe(
       'Aya is the assistant. Morgan is the principal. They are separate people: act and communicate as Aya, support Morgan, and never present the assistant as the principal.',
     );
+    // Said once here, so no email it reads repeats it.
+    expect(composed.get('# Principal')).toBe('You work for Morgan, whose time zone is America/Los_Angeles.');
     expect(composed.get('# External Email')).toBe(fs.readFileSync(path.resolve(GUIDANCE_PATH), 'utf8').trim());
     expect(doc).not.toContain('morgan@example.test');
     expect(doc).not.toContain('aya@example.test');

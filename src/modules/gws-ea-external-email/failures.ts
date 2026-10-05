@@ -14,8 +14,9 @@
  *     (registerInboundFailedHook);
  *   - its work on the thread failing (the notices module's turn-failed hook).
  *
- * Each report is one fact in main's session, which wakes it: the thread's
- * key and what failed, never what anyone wrote. Its id is derived from what
+ * Each report is one fact in main's session, which wakes it: what failed,
+ * in the conversation with whom, then the thread's key; never what anyone
+ * wrote. Its id is derived from what
  * failed, so a report heard again writes nothing twice: delivery reports a
  * give-up again after a stop, and a failed turn's report may be delivered
  * again. A failed turn names no message, so it is told once for each newest
@@ -28,6 +29,7 @@ import { log } from '../../log.js';
 import { registerInboundFailedHook } from '../../reconcile-session.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
+import { conversationPeople } from '../gws-ea-inbox/runtime.js';
 import { isPersonFacingPost, registerTurnFailedHook } from '../gws-ea-notices/index.js';
 import { getExternalEmailAgentGroupId } from '../gws-ea-profile/db.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
@@ -40,14 +42,18 @@ async function threadOf(session: Session): Promise<string | undefined> {
   return session.agent_group_id === (await getExternalEmailAgentGroupId()) ? session.thread_id : undefined;
 }
 
-function whatFailed(cause: Cause, threadKey: string): string {
+const LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
+
+function whatFailed(cause: Cause, threadKey: string, people: readonly string[]): string {
+  const conversation = people.length === 0 ? 'an email conversation' : `the conversation with ${LIST.format(people)}`;
+  const thread = `(thread ${threadKey})`;
   switch (cause) {
     case 'delivery-failed':
-      return `What external-email wrote in email thread ${threadKey} could not be sent, even after retrying.`;
+      return `An email external-email wrote in ${conversation} didn't go out, even after retrying. ${thread}`;
     case 'inbound-failed':
-      return `What arrived in email thread ${threadKey} could not be processed, even after retrying, so external-email has not answered it.`;
+      return `external-email hasn't answered something that arrived in ${conversation}: it couldn't be processed, even after retrying. ${thread}`;
     case 'turn-failed':
-      return `external-email's work in email thread ${threadKey} failed before it finished, so the thread may be left unanswered.`;
+      return `${conversation.charAt(0).toUpperCase()}${conversation.slice(1)} may be left unanswered: external-email's work on it failed before it finished. ${thread}`;
     default: {
       const unreachable: never = cause;
       throw new Error(`Unknown failure: ${String(unreachable)}`);
@@ -64,7 +70,7 @@ async function tellMain(cause: Cause, threadKey: string, failed: readonly string
   const result = await writeNoteForMain({
     id: `external-email-${cause}-${digest}`,
     timestamp: new Date().toISOString(),
-    text: whatFailed(cause, threadKey),
+    text: whatFailed(cause, threadKey, await conversationPeople(threadKey)),
     wake: true,
   });
   if (result === 'no-main' || result === 'no-principal') {

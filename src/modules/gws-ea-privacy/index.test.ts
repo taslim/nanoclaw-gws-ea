@@ -18,7 +18,8 @@ vi.mock('../../config.js', async () => {
   };
 });
 
-vi.mock('../../container-runner.js', () => ({
+vi.mock('../../container-runner.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../container-runner.js')>()),
   getContainerStartedAtMs: vi.fn(() => Date.now()),
   isContainerRunning: vi.fn(() => false),
   killContainer: vi.fn(),
@@ -47,6 +48,8 @@ import { addPrincipalAddress, bindVerifiedPrincipalUser } from '../gws-ea-profil
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
 import '../gws-ea-profile/index.js';
+import '../gws-ea-inbox/index.js';
+import { createThread, recordThreadAddresses } from '../gws-ea-inbox/thread-map.js';
 import {
   audienceForAddresses,
   checkOutbound,
@@ -63,6 +66,8 @@ const DM = { channelType: 'gchat', platformId: 'gchat:spaces/dm' } as const;
 const THREAD = { channelType: 'email', platformId: 'email:thread-1' } as const;
 const OTHER_THREAD = { channelType: 'email', platformId: 'email:thread-2' } as const;
 const HOME = '123 Main Street, Springfield';
+const JUNO = 'juno@example.com';
+const SAM = 'sam@acme.test';
 const HOME_LABEL = 'Home';
 
 interface Sent {
@@ -201,7 +206,13 @@ beforeEach(async () => {
   await upsertUser({ id: PRINCIPAL, kind: 'gchat', display_name: 'Pat', created_at: now() });
   await bindVerifiedPrincipalUser(PRINCIPAL, now());
   await upsertUserDm({ user_id: PRINCIPAL, channel_type: 'gchat', messaging_group_id: 'mg-dm', resolved_at: now() });
-  await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', 'ag-main');
+  await getDb().run(
+    `UPDATE gws_ea_profile
+        SET main_agent_group_id = ?, principal_display_name = 'Pat Doe', assistant_workspace_email = ?
+      WHERE singleton = 1`,
+    'ag-main',
+    JUNO,
+  );
   await addPrincipalAddress('pat@example.com');
 
   main = (await resolveSession('ag-main', 'mg-dm', null, 'agent-shared')).session;
@@ -441,7 +452,10 @@ describe('the audience check on delivery', () => {
     expect(signals[0]).toMatchObject({ channel_type: DM.channelType, platform_id: DM.platformId });
     const signal = JSON.parse(signals[0].content) as { text: string; signal: Record<string, unknown> };
     expect(signal.signal).toMatchObject({ kind: 'address', refusals: MAX_REFUSALS_PER_THREAD });
-    expect(signal.text).not.toMatch(/main st|springfield|home/i);
+    // A conversation with no thread cannot be handed to again, so main reads that it stays stopped.
+    expect(signal.text).toBe(
+      "Nothing more will be sent in a conversation with someone other than Pat Doe: three times an email in it would have shared Pat Doe's private address, and each was stopped, so nothing private went out.",
+    );
 
     queue(external, { id: 'clean-after-stop', route: THREAD, content: { text: 'Is Thursday still good?' } });
     await deliverSessionMessages(external);
@@ -458,7 +472,11 @@ describe('the audience check on delivery', () => {
 
   it("lets main's next handoff resume a stopped thread, its refusals counted afresh (R76)", async () => {
     await addHome();
-    const key = { ...THREAD, threadId: 'mail-1' };
+    const { threadKey } = await createThread(null, now());
+    // Sam wrote to the principal and the assistant, and mentioned someone not in the conversation.
+    await recordThreadAddresses(threadKey, [SAM, 'pat@example.com', JUNO], 'message', now());
+    await recordThreadAddresses(threadKey, ['lee@acme.test'], 'written', now());
+    const key = { ...THREAD, threadId: threadKey };
     for (let attempt = 1; attempt <= MAX_REFUSALS_PER_THREAD; attempt++) {
       queue(external, {
         id: `leak-${attempt}`,
@@ -469,7 +487,10 @@ describe('the audience check on delivery', () => {
       await deliverSessionMessages(external);
     }
     const [signal] = inbound(main).filter((row) => row.content.includes(THREAD_STOPPED_SIGNAL));
-    expect((JSON.parse(signal.content) as { text: string }).text).toMatch(/thread mail-1 .* until your next handoff/u);
+    expect((JSON.parse(signal.content) as { text: string }).text).toBe(
+      `Sending is paused in the conversation with ${SAM}: three times an email in it would have shared Pat Doe's private address, ` +
+        `and each was stopped, so nothing private went out. Your next handoff to it resumes it. (thread ${threadKey})`,
+    );
 
     expect(await resumeThread(key)).toBe(true);
     expect(await resumeThread(key)).toBe(false);

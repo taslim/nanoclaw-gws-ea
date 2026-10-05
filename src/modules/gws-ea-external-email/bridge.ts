@@ -57,7 +57,7 @@ import { isPrincipalCalendar } from '../gws-ea-inbox/calendar-notifications.js';
 import { emailMessagingGroupIds } from '../gws-ea-inbox/db.js';
 import { normalizeAddress } from '../gws-ea-inbox/mime.js';
 import { pendingDeadline } from '../gws-ea-inbox/pace.js';
-import { loadRoutingContext, principalSentence, type RoutingContext } from '../gws-ea-inbox/route-mail.js';
+import { listed, loadRoutingContext, type RoutingContext } from '../gws-ea-inbox/route-mail.js';
 import { assistantAddresses, EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from '../gws-ea-inbox/runtime.js';
 import {
   createThread,
@@ -274,28 +274,25 @@ function sha256(data: Buffer): string {
   return createHash('sha256').update(data).digest('hex');
 }
 
-/** What `external-email` reads: the host's words on the thread, then `main`'s. */
-function handoffText(
-  threadKey: string,
-  target: Target,
-  message: string,
-  files: readonly OutboundFile[],
-  context: RoutingContext,
-): string {
-  const named =
-    target.people.length === 0
-      ? ''
-      : ` main named: ${target.people.map((address) => marked(address, context)).join(', ')}.`;
-  return [
+/**
+ * What `external-email` reads: who the conversation is with, or whom it may
+ * now write to, and the files it may send, then `main`'s words. It works in
+ * this one conversation, so no thread key.
+ */
+function handoffText(target: Target, message: string, files: readonly OutboundFile[], context: RoutingContext): string {
+  const people = listed(target.people.map((address) => marked(address, context)));
+  const sendable = files.length === 0 ? [] : [`You may send ${listed(files.map((file) => file.filename))} in it.`];
+  return (
     target.kind === 'new'
-      ? `main hands you a new email thread, ${threadKey}: nothing has been sent in it yet.${named}`
-      : `main writes to you about email thread ${threadKey}.${named}`,
-    ...(files.length === 0
-      ? []
-      : [`With it come files you may send in this thread: ${files.map((file) => file.filename).join(', ')}.`]),
-    principalSentence(context),
-    `main's words:\n${message}`,
-  ].join('\n');
+      ? [`From main: a new conversation with ${people} — nothing has been sent yet.`, ...sendable, "main's words:"]
+      : [
+          ...(target.people.length === 0 ? [] : [`You may now write to ${people} here.`]),
+          ...sendable,
+          'From main, about this conversation:',
+        ]
+  )
+    .concat(message)
+    .join('\n');
 }
 
 /** A handoff every check admitted, before anything is written. */
@@ -358,7 +355,7 @@ async function writeHandoff(
   const { target, message, files, context } = handoff;
   const id = `handoff-${requestId}`;
   const content = JSON.stringify({
-    text: handoffText(threadKey, target, message, files, context),
+    text: handoffText(target, message, files, context),
     sender: 'main',
     ...(files.length === 0
       ? {}

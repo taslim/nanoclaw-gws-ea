@@ -31,7 +31,7 @@ function count(haystack: string, needle: string): number {
 }
 
 describe('the body', () => {
-  it('renders a paragraph, a short list, and a link as minimal HTML, and keeps the words in the text part', () => {
+  it('renders a paragraph, a short list, and a link as minimal HTML, and the same words as plain text', () => {
     const markdown =
       'Hi Remy,\n\nMorgan asked me to find 30 minutes with you. Would either of these work?\n\n' +
       '- Tuesday at 10:00\n- Wednesday at 14:00\n\nThe [agenda](https://example.com/agenda?week=41&day=2) is attached.';
@@ -43,7 +43,57 @@ describe('the body', () => {
     expect(email.html).toContain('<a href="https://example.com/agenda?week=41&amp;day=2">agenda</a>');
     expect([...tags(email.html)].sort()).toEqual(['a', 'br', 'div', 'li', 'p', 'ul']);
     expect([...attributes(email.html)].sort()).toEqual(['dir', 'href']);
-    expect(email.text.startsWith(`${markdown}\n`)).toBe(true);
+    expect(email.text.slice(0, email.text.indexOf('\n\n-- \n'))).toBe(
+      'Hi Remy,\n\nMorgan asked me to find 30 minutes with you. Would either of these work?\n\n' +
+        '- Tuesday at 10:00\n- Wednesday at 14:00\n\n' +
+        'The agenda (https://example.com/agenda?week=41&day=2) is attached.',
+    );
+  });
+
+  it('writes the text part as a person types an email: no markdown left, links spelled out, bullets and breaks kept', () => {
+    const email = renderEmail({
+      markdown: [
+        '# Next week',
+        '',
+        'Would **Tuesday at 3pm** or _Thursday_ work? Use the room code `B-12`.',
+        'The details are [on the invite](https://cal.example/e?id=7&t=1), or at <https://cal.example/e>; ask juno@cal.example.',
+        '',
+        '1. Bring the deck',
+        '2. Bring the budget',
+        '   - last year’s too',
+        '',
+        '> Pat said: keep it short.',
+        '',
+        'Best,  ',
+        'Juno',
+      ].join('\n'),
+      signature,
+    });
+
+    expect(email.text).toBe(
+      [
+        'Next week',
+        '',
+        'Would Tuesday at 3pm or Thursday work? Use the room code B-12.',
+        'The details are on the invite (https://cal.example/e?id=7&t=1), or at https://cal.example/e; ask juno@cal.example.',
+        '',
+        '1. Bring the deck',
+        '2. Bring the budget',
+        '   - last year’s too',
+        '',
+        '> Pat said: keep it short.',
+        '',
+        'Best,',
+        'Juno',
+        '',
+        '-- ',
+        'Juno Hale',
+        'Assistant to Morgan Ellery',
+      ].join('\n'),
+    );
+    // The HTML part is markdown's, as before.
+    expect(email.html).toContain('<h1>Next week</h1>');
+    expect(email.html).toContain('<strong>Tuesday at 3pm</strong> or <em>Thursday</em>');
   });
 
   it('keeps a line break the writer made, as in a closing', () => {

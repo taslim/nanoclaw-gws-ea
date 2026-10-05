@@ -130,6 +130,28 @@ function zoneOffset(instant: number, timezone: string): number {
   return asUtc - Math.floor(instant / 1000) * 1000;
 }
 
+const pad = (value: number, width = 2): string => String(value).padStart(width, '0');
+
+/**
+ * An instant as ISO-8601 on `timezone`'s clock with its UTC offset, such as
+ * 2026-10-06T07:00-04:00: how an agent reads a time and gives it back to a
+ * tool. Seconds appear only when the instant has them.
+ */
+export function zonedIso(instant: number, timezone: string): string {
+  const wall = wallClock(instant, timezone);
+  const offset = Math.round(zoneOffset(instant, timezone) / MINUTE);
+  const milliseconds = ((instant % 1000) + 1000) % 1000;
+  const seconds =
+    wall.second === 0 && milliseconds === 0
+      ? ''
+      : `:${pad(wall.second)}${milliseconds === 0 ? '' : `.${pad(milliseconds, 3)}`}`;
+  const sign = offset < 0 ? '-' : '+';
+  return (
+    `${pad(wall.year, 4)}-${pad(wall.month)}-${pad(wall.day)}T${pad(wall.hour)}:${pad(wall.minute)}${seconds}` +
+    `${sign}${pad(Math.floor(Math.abs(offset) / 60))}:${pad(Math.abs(offset) % 60)}`
+  );
+}
+
 /**
  * The instant a wall-clock time names in `timezone`. A time the clocks repeat
  * takes its later occurrence; a time they skip lands just after the change.

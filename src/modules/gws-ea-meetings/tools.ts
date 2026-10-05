@@ -80,6 +80,7 @@ import {
   schedulingRules,
   type SchedulingRules,
   type Span,
+  zonedIso,
 } from './slots.js';
 import {
   deleteThreadBooking,
@@ -116,6 +117,9 @@ const LOCATION_MAX = 500;
 const MAX_INVITEES = 20;
 const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;
+
+/** People named in prose: "a, b, and c". */
+const LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
 
 const DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/iu;
 /** A booking's id, as `book` answered with it: its event's id, lowercase hex. */
@@ -431,7 +435,12 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
 
   /** What happened to a booking, with what main needs to read of it. */
   type BookingChange =
-    | { readonly kind: 'booked'; readonly title: string }
+    | {
+        readonly kind: 'booked';
+        readonly title: string;
+        /** Whether it has, or is getting, a Google Meet link. */
+        readonly videoCall: boolean;
+      }
     | {
         readonly kind: 'changed';
         /** The request that changed it, so a replay tells main nothing twice. */
@@ -456,13 +465,14 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
 
   /**
    * Tell main of a booking the thread made, changed or cancelled, once: the
-   * note's id derives from the change. The booking stands whatever happens
-   * here, so a failure is logged, never thrown into a retry that would book
-   * again. A title, which external-email wrote from the thread, is framed as
-   * untrusted.
+   * note's id derives from the change. The note leads with what happened and
+   * to whom, in main's time zone, and ends with the ids main acts on. The
+   * booking stands whatever happens here, so a failure is logged, never
+   * thrown into a retry that would book again. A title, which external-email
+   * wrote from the thread, is framed as untrusted.
    */
   async function tellMain(fact: BookingFact): Promise<void> {
-    const { threadKey, booking, span, change } = fact;
+    const { threadKey, booking, span, invitees, change } = fact;
     /* eslint-disable no-catch-all/no-catch-all -- the calendar change already stands; main's note is reported, never retried into a second change */
     try {
       const mainAgentGroupId = await getMainAgentGroupId();
@@ -471,30 +481,37 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
         return;
       }
       const timezone = await resolveGroupTimezone(mainAgentGroupId);
-      const at = (time: Span): string =>
-        `${formatLocalTime(iso(time.start), timezone)} (${Math.round((time.end - time.start) / MINUTE)} minutes)`;
-      const event = `event ${booking.eventId} on calendar ${booking.calendarId}`;
-      const people = fact.invitees.join(', ') || 'nobody';
-      const framedTitle = (label: string, title: string | undefined): string =>
-        title === undefined ? '' : ` ${label}, as written in the thread:\n${untrustedLine(title, TITLE_MAX)}`;
+      const when = (time: Span): string => slotLabel(time, timezone);
+      const lasting = (time: Span): string => `${when(time)} (${Math.round((time.end - time.start) / MINUTE)} minutes)`;
+      const withWhom = invitees.length === 0 ? '' : ` with ${LIST.format(invitees)}`;
+      const googleSent = (what: string): string => (invitees.length === 0 ? '' : ` Google sent them the ${what}.`);
+      const ids = `(thread ${threadKey}; event ${booking.eventId} on calendar ${booking.calendarId})`;
+      const endingWith = (label: string, title: string | undefined): string =>
+        title === undefined
+          ? ` ${ids}`
+          : ` ${label}, as written in the thread:\n${untrustedLine(title, TITLE_MAX)}\n${ids}`;
       let id: string;
       let text: string;
       switch (change.kind) {
         case 'booked':
           id = `gws-ea-booking-booked-${booking.eventId}`;
-          text = `Thread ${threadKey} booked ${at(span)} with ${people}: ${event}.${framedTitle('Its title', change.title)}`;
-          break;
-        case 'changed':
-          id = `gws-ea-booking-changed-${booking.eventId}-${change.requestId}`;
           text =
-            `Thread ${threadKey} changed its booking, ${event}: now ${at(span)}` +
-            (change.was === undefined ? '' : `, was ${at(change.was)}`) +
-            (change.fresh.length === 0 ? '' : `; new: ${change.fresh.join(', ')}`) +
-            `. Google sent ${people} the update.${framedTitle('Its new title', change.title)}`;
+            `Booked a meeting${withWhom} for ${lasting(span)}${change.videoCall ? ', by video call' : ''}.` +
+            `${googleSent('invitation')}${endingWith('Its title', change.title)}`;
           break;
+        case 'changed': {
+          id = `gws-ea-booking-changed-${booking.eventId}-${change.requestId}`;
+          const fresh = change.fresh.length === 0 ? '' : `a new ${LIST.format(change.fresh)}`;
+          const lead =
+            change.was === undefined
+              ? `Changed the meeting${withWhom} on ${when(span)}: ${fresh}`
+              : `Rescheduled the meeting${withWhom} to ${lasting(span)}, from ${when(change.was)}${fresh === '' ? '' : `, with ${fresh}`}`;
+          text = `${lead}.${googleSent('update')}${endingWith('Its new title', change.title)}`;
+          break;
+        }
         case 'cancelled':
           id = `gws-ea-booking-cancelled-${booking.eventId}`;
-          text = `Thread ${threadKey} cancelled its booking for ${formatLocalTime(iso(span.start), timezone)}, ${event}. Google sent ${people} the cancellation.`;
+          text = `Cancelled the meeting${withWhom} on ${when(span)}.${googleSent('cancellation')} ${ids}`;
           break;
         default: {
           const unreachable: never = change;
@@ -563,9 +580,10 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
       fit: time.fit,
       held: holds.some((hold) => Date.parse(hold.startAt) === time.start && Date.parse(hold.endAt) === time.end),
     }));
+    // Each line leads with the start as the tools take it back: on the principal's clock, with its offset.
     const lines = times.map(
       (time) =>
-        `- ${time.start}: ${time.principal_time}` +
+        `- ${zonedIso(Date.parse(time.start), timezone)}: ${time.principal_time}` +
         (time.their_time === undefined ? '' : `; for them, ${time.their_time}`) +
         ` (${time.fit}${time.held ? ', held' : ''})`,
     );
@@ -650,7 +668,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
       })),
       message: [
         'This thread now holds:',
-        ...spans.map((span) => `- ${iso(span.start)}: ${slotLabel(span, timezone)}`),
+        ...spans.map((span) => `- ${zonedIso(span.start, timezone)}: ${slotLabel(span, timezone)}`),
         `They lapse on ${formatLocalTime(expiresAt, timezone)} unless you hold them again. Any other time it held is released.`,
       ].join('\n'),
     };
@@ -825,14 +843,20 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
       holdsLeft = ' Some of its holds could not be released yet; they lapse on their own.';
     }
     /* eslint-enable no-catch-all/no-catch-all */
-    await tellMain({ threadKey: view.threadKey, booking, span, invitees, change: { kind: 'booked', title } });
+    await tellMain({
+      threadKey: view.threadKey,
+      booking,
+      span,
+      invitees,
+      change: { kind: 'booked', title, videoCall: conference !== undefined && conference.status !== 'failure' },
+    });
     return {
       booking: eventId,
       start: iso(span.start),
       end: iso(span.end),
       message:
         `Booked: ${slotLabel(span, timezone)}. Google sends ${invitees.join(', ')} the invitation from the principal's calendar` +
-        `${conferenceWords(conference)}. This thread's holds are released.${holdsLeft} main hears of it from the host. ` +
+        `${conferenceWords(conference)}. This thread's holds are released.${holdsLeft} main hears of it. ` +
         `To change or cancel it, give booking ${eventId}.`,
     };
   };
@@ -968,7 +992,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
       end: iso(span.end),
       message:
         `Changed: ${slotLabel(span, timezone)}${conferenceWords(conference)}. ` +
-        `Google sends the invitees the update, and main hears of it from the host.${holdsLeft}`,
+        `Google sends the invitees the update, and main hears of it.${holdsLeft}`,
     };
   };
 
@@ -983,7 +1007,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     await deleteThreadBooking(booking.calendarId, booking.eventId);
     return {
       booking: booking.eventId,
-      message: `Cancelled: ${slotLabel(span, timezone)}. Google sends the invitees the cancellation, and main hears of it from the host.`,
+      message: `Cancelled: ${slotLabel(span, timezone)}. Google sends the invitees the cancellation, and main hears of it.`,
     };
   };
 

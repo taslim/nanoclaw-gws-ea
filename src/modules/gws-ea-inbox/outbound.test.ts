@@ -599,6 +599,8 @@ describe("external-email's reply", () => {
     expect(header(sent.headers, 'In-Reply-To')).toBe('<j1@partner.example>');
     expect(header(sent.headers, 'References')).toBe('<s1@acme.example> <j1@partner.example>');
     expect(sent.text).toMatch(/Jane <jane@partner\.example> wrote:\n\n> Adding our sales lead\./u);
+    // The plain part reads as typed; only the HTML part is formatted.
+    expect(sent.text.slice(0, sent.text.indexOf('\n\n-- \n'))).toBe('Thursday at 10 works for Pat.\n\nBest,\nJuno');
     expect(sent.html).toContain('<strong>10</strong>');
     expect(sent.text.match(/-- \nJuno\nAssistant to Pat/gu)).toHaveLength(1);
     for (const part of [sent.text, sent.html, ...sent.headers.map((h) => h.value)]) {
@@ -859,7 +861,9 @@ describe("main's email_send", () => {
 
   it('is refused for an outside thread, and takes no subject or recipients', async () => {
     const { key } = await arrives({ threadId: 'g-sam', from: SAM, body: 'Hello' });
-    expect(refusalOf(await emailSend(main, { thread_key: key, text: 'Hello Sam' }))).toMatch(/principal/u);
+    expect(refusalOf(await emailSend(main, { thread_key: key, text: 'Hello Sam' }))).toBe(
+      `Your email was not sent: there is no email from Pat in that thread for you to answer. (thread ${key})`,
+    );
     gmail.receive({ threadId: 'g-pat', from: `Pat <${PRINCIPAL}>`, principal: true, body: 'Ping' });
     await inbox.tick();
     const own = await threadOf('g-pat');

@@ -37,7 +37,7 @@ import {
 } from './db.js';
 import { GoogleApiError, type GmailApi, type GmailHistoryRecord } from './gmail-api.js';
 import { recordPollFailure, recordPollSuccess } from './health.js';
-import { parseGmailMessage } from './mime.js';
+import { parseGmailMessage, type ParsedMail } from './mime.js';
 import { noticeSetAside } from './notices.js';
 import { sendToOutside } from './outbound.js';
 import { sendToPrincipal } from './principal-reply.js';
@@ -134,9 +134,14 @@ export function createInbox(deps: InboxDeps): Inbox {
     const at = context.at.toISOString();
     const calendar: { gmailMessageId: string; notice: CalendarNotice }[] = [];
     let complete = true;
-    let setAside = 0;
+    // Each message set aside, as it was read; a calendar notification's is not kept.
+    const setAside: (ParsedMail | undefined)[] = [];
 
-    const failed = async (gmailMessageId: string, error: unknown): Promise<'retry' | 'set-aside'> => {
+    const failed = async (
+      gmailMessageId: string,
+      error: unknown,
+      mail?: ParsedMail,
+    ): Promise<'retry' | 'set-aside'> => {
       const attempts = await recordFailedAttempt(gmailMessageId, at);
       if (attempts < MAX_ROUTING_ATTEMPTS) {
         log.warn('An inbox message could not be routed; retrying next poll', { gmailMessageId, attempts, error });
@@ -144,7 +149,7 @@ export function createInbox(deps: InboxDeps): Inbox {
       }
       log.error('An inbox message kept failing to route; set aside', { gmailMessageId, attempts, error });
       await settleMessage(gmailMessageId, 'set-aside', at);
-      setAside += 1;
+      setAside.push(mail);
       return 'set-aside';
     };
 
@@ -166,7 +171,7 @@ export function createInbox(deps: InboxDeps): Inbox {
         else await settleMessage(id, routed.outcome, at);
       } catch (error) {
         if (error instanceof GoogleApiError) throw error;
-        if ((await failed(id, error)) === 'retry') {
+        if ((await failed(id, error, mail)) === 'retry') {
           complete = false;
           break;
         }
@@ -185,7 +190,7 @@ export function createInbox(deps: InboxDeps): Inbox {
       }
       /* eslint-enable no-catch-all/no-catch-all */
     }
-    if (setAside > 0) await noticeSetAside();
+    if (setAside.length > 0) await noticeSetAside(setAside);
     return complete;
   }
 

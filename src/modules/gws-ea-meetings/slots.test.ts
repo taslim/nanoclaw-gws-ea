@@ -16,6 +16,7 @@ import {
   inProtectedTime,
   schedulingRules,
   zonedInstant,
+  zonedIso,
   type FreeTimeQuery,
   type SchedulingRules,
   type Span,
@@ -78,6 +79,25 @@ describe('wall-clock times', () => {
     expect(iso(zonedInstant({ year: 2026, month: 3, day: 29 }, 90, LONDON))).toBe('2026-03-29T01:30:00.000Z');
     // 24:00 ends the day at the next midnight.
     expect(iso(zonedInstant({ year: 2026, month: 10, day: 25 }, 24 * 60, LONDON))).toBe('2026-10-26T00:00:00.000Z');
+  });
+
+  it("read as ISO times on the zone's clock with its offset, the hour the clocks repeat told apart", () => {
+    const cases: ReadonlyArray<readonly [string, string, string]> = [
+      ['2026-10-06T11:00:00.000Z', NEW_YORK, '2026-10-06T07:00-04:00'],
+      ['2026-10-06T11:00:00.000Z', LONDON, '2026-10-06T12:00+01:00'],
+      ['2026-12-01T11:00:00.000Z', LONDON, '2026-12-01T11:00+00:00'],
+      ['2026-10-06T02:00:00.000Z', LOS_ANGELES, '2026-10-05T19:00-07:00'],
+      ['2026-10-06T04:00:00.000Z', 'Asia/Kolkata', '2026-10-06T09:30+05:30'],
+      ['2026-10-06T12:00:00.000Z', 'America/St_Johns', '2026-10-06T09:30-02:30'],
+      // New York's clocks go back at 02:00 on 1 November: 01:30 comes twice, an hour apart.
+      ['2026-11-01T05:30:00.000Z', NEW_YORK, '2026-11-01T01:30-04:00'],
+      ['2026-11-01T06:30:00.000Z', NEW_YORK, '2026-11-01T01:30-05:00'],
+      ['2026-10-06T11:00:30.250Z', NEW_YORK, '2026-10-06T07:00:30.250-04:00'],
+    ];
+    for (const [instant, timezone, expected] of cases) {
+      expect(zonedIso(at(instant), timezone), `${instant} in ${timezone}`).toBe(expected);
+      expect(iso(Date.parse(expected))).toBe(instant);
+    }
   });
 });
 

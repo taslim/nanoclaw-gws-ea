@@ -47,14 +47,13 @@ vi.mock('./calendar-api.js', async (importOriginal) => {
 });
 
 import type { ResponseFrame } from '../../cli/frame.js';
-import { TIMEZONE } from '../../config.js';
 import { getDb } from '../../db/connection.js';
+import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { sqliteRaw } from '../../db/drivers/sqlite.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { getDeliveryAction } from '../../delivery.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSession } from '../../session-manager.js';
-import { formatLocalTime } from '../../timezone.js';
 import type { Session } from '../../types.js';
 import '../permissions/index.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
@@ -92,6 +91,8 @@ const REMY = 'remy@friends.example';
 const JANE = 'jane@friends.example';
 const STRANGER = 'someone@else.example';
 const LONDON = 'Europe/London';
+/** main's own zone, an hour ahead of the principal's: main reads its booking facts in it. */
+const PARIS = 'Europe/Paris';
 const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
 
@@ -166,11 +167,6 @@ function mainHeard(): string[] {
   return rows.map((row) => (JSON.parse(row.content) as { text: string }).text);
 }
 
-/** A time as main reads it, in its own zone. */
-function mainTime(instant: string): string {
-  return formatLocalTime(instant, TIMEZONE);
-}
-
 function live(role: 'hold' | 'booking'): StoredEvent[] {
   return calendar.live(PRINCIPAL).filter((event) => event.tags?.gwsEaRole === role);
 }
@@ -212,6 +208,8 @@ beforeEach(async () => {
   ] as const) {
     await createAgentGroup({ id, name, folder: name, agent_provider: null, created_at: now() });
   }
+  await ensureContainerConfig('ag-main');
+  await updateContainerConfigScalars('ag-main', { timezone: PARIS });
   await createMessagingGroup({
     id: 'mg-dm',
     channel_type: 'gchat',
@@ -335,9 +333,15 @@ describe('free_time', () => {
       their_time: 'Tuesday 6 Oct, 07:00–07:30 EDT',
       fit: 'acceptable',
     });
+    // Each line leads with its start on the principal's clock, with its offset, which the tools take back.
     expect(message.split('\n').slice(0, 2)).toEqual([
       'Free times:',
-      '- 2026-10-06T11:00:00.000Z: Tuesday 6 Oct, 12:00–12:30 BST; for them, Tuesday 6 Oct, 07:00–07:30 EDT (acceptable)',
+      '- 2026-10-06T12:00+01:00: Tuesday 6 Oct, 12:00–12:30 BST; for them, Tuesday 6 Oct, 07:00–07:30 EDT (acceptable)',
+    ]);
+    const [, firstLine] = message.split('\n');
+    const firstOffered = firstLine.slice('- '.length, firstLine.indexOf(': '));
+    expect(data(await send(sessionA, 'hold', { starts: [firstOffered], minutes: 30 })).held).toEqual([
+      { start: times[0].start, end: times[0].end, principal_time: times[0].principal_time },
     ]);
 
     // Free/busy only: neither the principal's event nor their preferences' words reach the thread.
@@ -465,6 +469,11 @@ describe('hold', () => {
   it('holds times as private busy events that lapse in three days, and holding new times releases the old', async () => {
     const held = data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM, WEDNESDAY_10AM], minutes: 30 }));
     expect(held.held).toHaveLength(2);
+    expect(String(held.message).split('\n').slice(0, 3)).toEqual([
+      'This thread now holds:',
+      '- 2026-10-06T10:00+01:00: Tuesday 6 Oct, 10:00–10:30 BST',
+      '- 2026-10-07T10:00+01:00: Wednesday 7 Oct, 10:00–10:30 BST',
+    ]);
     expect(
       live('hold')
         .map((event) => event.start?.dateTime)
@@ -657,6 +666,12 @@ describe('book', () => {
     expect(event.attendees?.map((attendee) => attendee.email)).toEqual([REMY]);
     expect(event.conference?.status).toBe('success');
     expect(booked.booking).toBe(event.id);
+    expect(booked.message).toMatch(
+      new RegExp(
+        `This thread's holds are released\\. main hears of it\\. To change or cancel it, give booking ${event.id}\\.$`,
+        'u',
+      ),
+    );
     expect(calendar.writes.find((write) => write.eventId === event.id)?.sendUpdates).toBe('all');
     expect(live('hold')).toEqual([]);
     expect(await listThreadHolds(threadA)).toEqual([]);
@@ -664,13 +679,19 @@ describe('book', () => {
     const [fact] = mainHeard();
     expect(
       fact.startsWith(
-        `Thread ${threadA} booked ${mainTime(TUESDAY_10AM)} (30 minutes) with ${REMY}: event ${event.id} on calendar ${PRINCIPAL}. ` +
-          'Its title, as written in the thread:\n<<<EXTERNAL_UNTRUSTED_CONTENT',
+        `Booked a meeting with ${REMY} for Tuesday 6 Oct, 11:00–11:30 CEST (30 minutes), by video call. ` +
+          'Google sent them the invitation. Its title, as written in the thread:\n<<<EXTERNAL_UNTRUSTED_CONTENT',
       ),
       fact,
     ).toBe(true);
-    // The title external-email wrote reaches main only inside the untrusted frame.
+    // The title external-email wrote reaches main only inside the untrusted frame; the ids main acts on come last.
     expect(fact.indexOf('Coffee: Pat and Remy')).toBeGreaterThan(fact.indexOf('<<<EXTERNAL_UNTRUSTED_CONTENT'));
+    expect(fact).toMatch(
+      new RegExp(
+        `\\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id="[0-9a-f]+">>>\\n\\(thread ${threadA}; event ${event.id} on calendar ${PRINCIPAL}\\)$`,
+        'u',
+      ),
+    );
   });
 
   it('invites everyone on the thread but the principal and the assistant when it names nobody', async () => {
@@ -680,6 +701,13 @@ describe('book', () => {
         .attendees?.map((attendee) => attendee.email)
         .sort(),
     ).toEqual([JANE, REMY]);
+    // Without a Meet link, main hears of no video call.
+    expect(mainHeard()[0]).toMatch(
+      new RegExp(
+        `^Booked a meeting with ${JANE} and ${REMY} for Tuesday 6 Oct, 11:00–11:30 CEST \\(30 minutes\\)\\. Google sent them the invitation\\. Its title`,
+        'u',
+      ),
+    );
   });
 
   it('invites, when it names nobody, only the people in the conversation, not someone a sender only wrote about', async () => {
@@ -875,7 +903,7 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
     const moved = data(await send(sessionA, 'change_booking', { booking: first.booking, start: THURSDAY_2PM }));
     expect(moved).toMatchObject({ booking: first.booking, start: THURSDAY_2PM, end: '2026-10-08T13:45:00.000Z' });
     expect(moved.message).toBe(
-      'Changed: Thursday 8 Oct, 14:00–14:45 BST. Google sends the invitees the update, and main hears of it from the host.',
+      'Changed: Thursday 8 Oct, 14:00–14:45 BST. Google sends the invitees the update, and main hears of it.',
     );
     expect(calendar.event(PRINCIPAL, String(first.booking))).toMatchObject({
       start: { dateTime: THURSDAY_2PM },
@@ -884,8 +912,8 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
     });
     expect(calendar.writes.at(-1)).toMatchObject({ op: 'patch', eventId: first.booking, sendUpdates: 'all' });
     expect(mainHeard().at(-1)).toBe(
-      `Thread ${threadA} changed its booking, event ${String(first.booking)} on calendar ${PRINCIPAL}: ` +
-        `now ${mainTime(THURSDAY_2PM)} (45 minutes), was ${mainTime(TUESDAY_10AM)} (45 minutes). Google sent ${REMY} the update.`,
+      `Rescheduled the meeting with ${REMY} to Thursday 8 Oct, 15:00–15:45 CEST (45 minutes), from Tuesday 6 Oct, 11:00–11:45 CEST. ` +
+        `Google sent them the update. (thread ${threadA}; event ${String(first.booking)} on calendar ${PRINCIPAL})`,
     );
 
     vi.setSystemTime(new Date(NOW.getTime() + 21 * DAY));
@@ -935,13 +963,15 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
     const fact = mainHeard().at(-1) ?? '';
     expect(
       fact.startsWith(
-        `Thread ${threadA} changed its booking, event ${String(booked.booking)} on calendar ${PRINCIPAL}: ` +
-          `now ${mainTime(TUESDAY_10AM)} (30 minutes); new: title, place, notes, Google Meet link. Google sent ${REMY} the update. ` +
-          'Its new title, as written in the thread:\n<<<EXTERNAL_UNTRUSTED_CONTENT',
+        `Changed the meeting with ${REMY} on Tuesday 6 Oct, 11:00–11:30 CEST: a new title, place, notes, and Google Meet link. ` +
+          'Google sent them the update. Its new title, as written in the thread:\n<<<EXTERNAL_UNTRUSTED_CONTENT',
       ),
       fact,
     ).toBe(true);
     expect(fact.indexOf('Intro: Pat and Remy')).toBeGreaterThan(fact.indexOf('<<<EXTERNAL_UNTRUSTED_CONTENT'));
+    expect(fact.endsWith(`>>>\n(thread ${threadA}; event ${String(booked.booking)} on calendar ${PRINCIPAL})`)).toBe(
+      true,
+    );
   });
 
   it('refuses new text carrying a private value, as the invitees would see it, and a Meet link the calendar does not allow, writing nothing', async () => {
@@ -1079,13 +1109,15 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
       await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Intro', invitees: [REMY] }),
     );
 
-    data(await send(sessionA, 'cancel_booking', { booking: booked.booking }));
+    expect(data(await send(sessionA, 'cancel_booking', { booking: booked.booking })).message).toBe(
+      'Cancelled: Tuesday 6 Oct, 10:00–10:30 BST. Google sends the invitees the cancellation, and main hears of it.',
+    );
     expect(calendar.event(PRINCIPAL, String(booked.booking))?.status).toBe('cancelled');
     expect(calendar.writes.at(-1)).toMatchObject({ op: 'delete', sendUpdates: 'all' });
     expect(mainHeard()).toEqual([
-      expect.stringMatching(new RegExp(`^Thread ${threadA} booked `, 'u')),
-      `Thread ${threadA} cancelled its booking for ${mainTime(TUESDAY_10AM)}, event ${String(booked.booking)} on calendar ${PRINCIPAL}. ` +
-        `Google sent ${REMY} the cancellation.`,
+      expect.stringMatching(/^Booked a meeting /u),
+      `Cancelled the meeting with ${REMY} on Tuesday 6 Oct, 11:00–11:30 CEST. Google sent them the cancellation. ` +
+        `(thread ${threadA}; event ${String(booked.booking)} on calendar ${PRINCIPAL})`,
     ]);
     expect(refusal(await send(sessionA, 'cancel_booking', { booking: booked.booking }))).toMatch(
       /This thread has no booking/u,

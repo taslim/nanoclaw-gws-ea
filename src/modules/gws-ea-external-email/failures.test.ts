@@ -2,7 +2,8 @@
  * external-email's failures reach main (R38: quiet never hides a problem).
  * When delivery gives up on an email it wrote, the host gives up on what
  * arrived in its thread, or its work on a thread fails, main hears one fact
- * naming the thread, and decides what the principal needs to hear.
+ * naming who the conversation is with and the thread, and decides what the
+ * principal needs to hear.
  *
  * Drives the real core paths that report a failure (delivery, reconcile, and
  * the runner's `turn_failed` action) against a real central DB and real
@@ -48,13 +49,23 @@ import '../permissions/index.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
 import '../gws-ea-profile/index.js';
-import { bindVerifiedPrincipalUser, recordExternalEmailAgentGroupId } from '../gws-ea-profile/db.js';
+import {
+  addPrincipalAddress,
+  bindVerifiedPrincipalUser,
+  recordExternalEmailAgentGroupId,
+} from '../gws-ea-profile/db.js';
 import { ensureInbox, ensurePrincipalConversation } from '../gws-ea-inbox/index.js';
 import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID } from '../gws-ea-inbox/runtime.js';
-import { createThread } from '../gws-ea-inbox/thread-map.js';
+import { createThread, recordThreadAddresses } from '../gws-ea-inbox/thread-map.js';
 import './index.js';
 
 const PRINCIPAL_USER = 'gchat:users/pat';
+const PAT = 'pat@northwind.example';
+const JUNO = 'juno@northwind.example';
+const DANA = 'dana@acme.example';
+const NOEL = 'noel@acme.example';
+/** Someone Dana only wrote about: not in the conversation. */
+const SAM = 'sam@acme.example';
 const MAX_TRIES = 5;
 const EMAIL_WORDS = 'Does Tuesday at 3 work for you?';
 
@@ -92,9 +103,20 @@ function mainWakes(): number {
     .mock.calls.filter(([session, reason]) => session.id === main.id && reason === 'inbound-message').length;
 }
 
-/** A thread external-email works, and the session the router opened for it. */
-async function emailThread(): Promise<{ key: string; session: Session }> {
+/**
+ * A thread external-email works, and the session the router opened for it:
+ * by default Dana and Noel wrote with the principal and the assistant, and
+ * Dana mentioned Sam.
+ */
+async function emailThread(people: readonly string[] = [DANA, NOEL, PAT, JUNO]): Promise<{
+  key: string;
+  session: Session;
+}> {
   const { threadKey } = await createThread(`gmail-thread-${++gmailThreads}`, now());
+  if (people.length > 0) {
+    await recordThreadAddresses(threadKey, people, 'message', now());
+    await recordThreadAddresses(threadKey, [SAM], 'written', now());
+  }
   const { session } = await resolveSession('ag-external', inbox, threadKey, 'per-thread');
   return { key: threadKey, session };
 }
@@ -242,8 +264,12 @@ beforeEach(async () => {
     messaging_group_id: 'mg-dm',
     resolved_at: now(),
   });
-  await getDb().run("UPDATE gws_ea_profile SET main_agent_group_id = 'ag-main' WHERE singleton = 1");
+  await getDb().run(
+    "UPDATE gws_ea_profile SET main_agent_group_id = 'ag-main', assistant_workspace_email = ? WHERE singleton = 1",
+    JUNO,
+  );
   await recordExternalEmailAgentGroupId('ag-external');
+  await addPrincipalAddress(PAT);
 
   inbox = await ensureInbox('ag-external');
   main = (await resolveSession('ag-main', 'mg-dm', null, 'agent-shared')).session;
@@ -255,7 +281,7 @@ afterEach(async () => {
 });
 
 describe('an email external-email wrote that delivery gave up on', () => {
-  it('tells main which thread, once, and wakes it, with none of the email', async () => {
+  it('tells main who the email was for and which thread, once, and wakes it, with none of the email', async () => {
     const { key, session } = await emailThread();
     queue(session, { id: 'out-email', content: { text: EMAIL_WORDS }, route: threadRoute(session) });
 
@@ -265,9 +291,9 @@ describe('an email external-email wrote that delivery gave up on', () => {
     expect(others).toEqual([]);
     // Its words are all main reads: nothing typed rides beside them.
     expect(Object.keys(fact).sort()).toEqual(['id', 'sender', 'senderId', 'text']);
-    expect(fact.text).toContain(`email thread ${key}`);
-    expect(fact.text).toMatch(/could not be sent/u);
-    expect(fact.text).not.toContain('Tuesday');
+    expect(fact.text).toBe(
+      `An email external-email wrote in the conversation with ${DANA} and ${NOEL} didn't go out, even after retrying. (thread ${key})`,
+    );
     expect(mainWakes()).toBe(1);
   });
 
@@ -309,7 +335,7 @@ describe('an email external-email wrote that delivery gave up on', () => {
 });
 
 describe('what arrived in a thread, given up after its last retry', () => {
-  it('tells main which thread, once, and wakes it; a replayed report adds nothing', async () => {
+  it('tells main whose conversation went unanswered and which thread, once, and wakes it; a replayed report adds nothing', async () => {
     const { key, session } = await emailThread();
     seedClaimed(session, 'in-email', 2, threadRoute(session));
 
@@ -317,9 +343,10 @@ describe('what arrived in a thread, given up after its last retry', () => {
 
     const [fact, ...others] = facts();
     expect(others).toEqual([]);
-    expect(fact.text).toContain(`email thread ${key}`);
-    expect(fact.text).toMatch(/could not be processed/u);
-    expect(fact.text).not.toContain('Tuesday');
+    expect(fact.text).toBe(
+      `external-email hasn't answered something that arrived in the conversation with ${DANA} and ${NOEL}: ` +
+        `it couldn't be processed, even after retrying. (thread ${key})`,
+    );
     expect(mainWakes()).toBe(1);
 
     reclaim(session, 'in-email');
@@ -331,7 +358,7 @@ describe('what arrived in a thread, given up after its last retry', () => {
 });
 
 describe('a failed turn in a thread', () => {
-  it('tells main which thread, once, and wakes it; a replayed report adds nothing', async () => {
+  it('tells main whose conversation may go unanswered and which thread, once, and wakes it; a replayed report adds nothing', async () => {
     const { key, session } = await emailThread();
     await arrive(session, 'in-email');
     queueTurnFailed(session, 'turn-1', threadRoute(session));
@@ -340,9 +367,10 @@ describe('a failed turn in a thread', () => {
 
     const [fact, ...others] = facts();
     expect(others).toEqual([]);
-    expect(fact.text).toContain(`email thread ${key}`);
-    expect(fact.text).toMatch(/failed before it finished/u);
-    expect(fact.text).not.toContain('Tuesday');
+    expect(fact.text).toBe(
+      `The conversation with ${DANA} and ${NOEL} may be left unanswered: ` +
+        `external-email's work on it failed before it finished. (thread ${key})`,
+    );
     expect(mainWakes()).toBe(1);
 
     await forgetOutcome(session, 'turn-1', 0);
@@ -364,6 +392,18 @@ describe('a failed turn in a thread', () => {
 
     expect(facts()).toHaveLength(2);
     expect(mainWakes()).toBe(2);
+  });
+
+  it('names the thread by its key alone while nobody else is on it', async () => {
+    const { key, session } = await emailThread([]);
+    await arrive(session, 'in-email');
+    queueTurnFailed(session, 'turn-1', threadRoute(session));
+
+    await drain(session, 1);
+
+    expect(facts().map((fact) => fact.text)).toEqual([
+      `An email conversation may be left unanswered: external-email's work on it failed before it finished. (thread ${key})`,
+    ]);
   });
 });
 

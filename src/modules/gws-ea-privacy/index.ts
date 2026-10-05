@@ -39,8 +39,10 @@ import { registerOutboundGuard, type OutboundGuardDecision, type OutboundSend } 
 import { ALLOW, DENY, defineGuardedAction, guard, HOLD, type GuardActor } from '../../guard/index.js';
 import { log } from '../../log.js';
 import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
+import { conversationPeople, EMAIL_CHANNEL_TYPE } from '../gws-ea-inbox/runtime.js';
 import {
   assertMainCaller,
+  getGwsEaProfile,
   getMainAgentGroupId,
   isVerifiedPrincipalUser,
   principalApproverUserId,
@@ -129,13 +131,34 @@ function stoppingReason(kind: PrivateValueKind): string {
 const STOPPED_REASON =
   "this conversation is stopped after repeated attempts to send the principal's private details. Send nothing more in it; main has been told.";
 
-function stoppedSignalText(key: ThreadKey, kind: PrivateValueKind, refusals: number): string {
-  return (
-    `The host stopped ${key.threadId === null ? 'a conversation' : `thread ${key.threadId}`} with someone other than the principal: ` +
-    `the assistant tried ${refusals} times to send them the principal's private ${KIND_NOUNS[kind]}. ` +
-    'Every attempt was refused, so nothing private was sent, and nothing more will be sent in that conversation' +
-    (key.threadId === null ? '.' : ' until your next handoff to it.')
-  );
+const LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
+
+function timesOver(count: number): string {
+  return ['once', 'twice', 'three times'][count - 1] ?? `${count} times`;
+}
+
+/** Who a stopped email thread's conversation is with; empty for any other conversation. */
+async function stoppedPeople(key: ThreadKey): Promise<string[]> {
+  if (key.channelType !== EMAIL_CHANNEL_TYPE || key.threadId === null) return [];
+  if (!(await getDb().hasTable('gws_ea_thread_addresses'))) return [];
+  return conversationPeople(key.threadId);
+}
+
+/** main's note of a stop: who the conversation is with, what was kept back, how it resumes, then the thread. */
+async function stoppedSignalText(key: ThreadKey, kind: PrivateValueKind, refusals: number): Promise<string> {
+  const principal = (await getGwsEaProfile()).principal_display_name ?? 'the principal';
+  const people = await stoppedPeople(key);
+  const conversation =
+    people.length === 0
+      ? `a conversation with someone other than ${principal}`
+      : `the conversation with ${LIST.format(people)}`;
+  const sent = key.channelType === EMAIL_CHANNEL_TYPE ? 'an email' : 'a message';
+  const kept =
+    `${timesOver(refusals)} ${sent} in it would have shared ${principal}'s private ${KIND_NOUNS[kind]}, ` +
+    'and each was stopped, so nothing private went out.';
+  return key.threadId === null
+    ? `Nothing more will be sent in ${conversation}: ${kept}`
+    : `Sending is paused in ${conversation}: ${kept} Your next handoff to it resumes it. (thread ${key.threadId})`;
 }
 
 // ---------------------------------------------------------------------------
@@ -304,7 +327,7 @@ async function signalThreadStopped(key: ThreadKey, kind: PrivateValueKind, refus
     const result = await writeNoteForMain({
       id: `privacy-stop-${randomUUID()}`,
       timestamp: stoppedAt,
-      text: stoppedSignalText(key, kind, refusals),
+      text: await stoppedSignalText(key, kind, refusals),
       fields: { signal },
       wake: true,
     });

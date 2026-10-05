@@ -18,9 +18,10 @@
  *   - When an email it wrote cannot be sent, what arrived in its thread cannot
  *     be processed, or its work on a thread fails, main hears of it
  *     (`./failures.ts`).
- *   - Its project document holds its guidance, read from the release, and the
- *     two display names: the profile and preferences sections leave it
- *     everything else out.
+ *   - Its project document holds its guidance, read from the release, the
+ *     two display names, and the principal's time zone, read from the profile
+ *     at each spawn so that no email it reads repeats them; the profile and
+ *     preferences sections leave it everything else out.
  *   - Status reads all of this through a hidden host-only command.
  */
 import path from 'node:path';
@@ -32,12 +33,15 @@ import '../gws-ea-profile/index.js';
 
 import { registerProtectedGroupPolicy } from '../../cli/guard.js';
 import { register } from '../../cli/registry.js';
+import { TIMEZONE } from '../../config.js';
 import { registerSessionAdmissionPolicy } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { onHostStart } from '../../host-lifecycle.js';
-import { getExternalEmailAgentGroupId as readExternalEmailPointer } from '../gws-ea-profile/db.js';
+import { registerRequiredProjectDocSection } from '../../project-doc-sections.js';
+import { resolveTimezone } from '../../timezone.js';
+import { getGwsEaProfile, getExternalEmailAgentGroupId as readExternalEmailPointer } from '../gws-ea-profile/db.js';
 import { registerGuidance } from '../gws-ea-profile/guidance.js';
 import { BRIDGE_ACTIONS } from './bridge.js';
 import { destinationViolations } from './destination-policy.js';
@@ -79,6 +83,18 @@ registerSessionAdmissionPolicy('gws-ea-external-email:stamped-reach', async ({ k
     credentialScope,
   });
   if (problems.length > 0) throw new Error(`external-email may not start: ${problems.join('; ')}`);
+});
+
+// Whom it works for, once, rather than on every email it reads: the
+// principal's name and time zone, never their addresses.
+registerRequiredProjectDocSection('gws-ea-external-email:principal', async (group) => {
+  if (group.id !== (await getExternalEmailAgentGroupId())) return undefined;
+  const profile = await getGwsEaProfile();
+  const timezone = resolveTimezone(profile.principal_timezone ?? TIMEZONE);
+  return {
+    name: 'Principal',
+    body: `You work for ${profile.principal_display_name ?? 'the principal'}, whose time zone is ${timezone}.`,
+  };
 });
 
 /** The guidance, relative to the checkout the host runs from, as NanoClaw reads its other instruction files. */

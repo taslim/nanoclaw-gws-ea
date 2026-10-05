@@ -81,12 +81,17 @@ export async function sendToPrincipal(
     throw new OutboundRefusedError(REFUSED_BY, 'An email to the principal carries words, as text.');
   return sendExactlyOnce(runtime, { threadKey, side: 'principal' }, sendKey(threadKey, words), async () => {
     const anchor = await principalAnchor(runtime, threadKey);
+    const profile = await getGwsEaProfile();
     if (anchor === undefined) {
-      throw new OutboundRefusedError(REFUSED_BY, `Thread ${threadKey} has no email from the principal to answer.`);
+      const principal = profile.principal_display_name ?? 'the principal';
+      throw new OutboundRefusedError(
+        REFUSED_BY,
+        `there is no email from ${principal} in that thread for you to answer. (thread ${threadKey})`,
+      );
     }
     const body = renderEmail({
       markdown: words.text,
-      signature: emailSignature(await getGwsEaProfile()),
+      signature: emailSignature(profile),
       quote: { from: anchor.from, sentAt: anchor.mail.receivedAt ?? runtime.now(), text: anchor.mail.text },
     });
     const from = await assistantMailbox(runtime);

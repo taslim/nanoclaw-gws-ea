@@ -325,13 +325,14 @@ describe('email_handoff', () => {
     expect(others).toEqual([]);
     expect(row).toMatchObject({ platform_id: INBOX_PLATFORM_ID, channel_type: 'email', thread_id: key });
     expect(row.content.sender).toBe('main');
-    const text = row.content.text ?? '';
-    expect(text).toContain(key);
-    expect(text).toContain('Pat forwarded Remy’s lunch invitation and said to reply: yes to Thursday, and ask where.');
-    expect(text).toContain(`main named: ${REMY}, ${PRINCIPAL} (the principal's).`);
-    expect(text).not.toMatch(/\b(?:to|cc) (?:remy|pat)@/u);
-    expect(text).toContain('The principal is Pat Doe');
-    expect(text).toContain('America/New_York');
+    // Who it is with, then main's words: external-email works in this one
+    // thread, so neither its key nor the principal's time zone (its project
+    // document holds that) is repeated here.
+    expect(row.content.text).toBe(
+      `From main: a new conversation with ${REMY} and ${PRINCIPAL} (the principal's) — nothing has been sent yet.\n` +
+        "main's words:\n" +
+        'Pat forwarded Remy’s lunch invitation and said to reply: yes to Thursday, and ask where.',
+    );
     // No mail waits in a new thread, so main's words are due now, and wake its session.
     expect(row.process_after).toBeNull();
     expect(vi.mocked(requestWake).mock.calls.map(([woken]) => woken.id)).toEqual([session.id]);
@@ -367,7 +368,7 @@ describe('email_handoff', () => {
 
     expect(data(frame).thread_key).toBe(key);
     expect(await externalEmailSessions()).toBe(1);
-    expect(texts(session)).toEqual([expect.stringContaining('Pat is glad to meet Jane; offer next week.')]);
+    expect(texts(session)).toEqual(['From main, about this conversation:\nPat is glad to meet Jane; offer next week.']);
     // Nothing waits in the thread's session, so main's words are due now.
     expect(rows(session)[0]).toMatchObject({ platform_id: INBOX_PLATFORM_ID, thread_id: key, process_after: null });
     expect(vi.mocked(requestWake).mock.calls.map(([woken]) => woken.id)).toEqual([session.id]);
@@ -408,7 +409,9 @@ describe('email_handoff', () => {
       to: [JANE],
       cc: [REMY],
     });
-    expect(texts(session).join('\n')).toContain(`main named: ${REMY}.`);
+    expect(texts(session)).toEqual([
+      `You may now write to ${REMY} here.\nFrom main, about this conversation:\nPat wants Remy on this one too.`,
+    ]);
   });
 
   it('refuses a thread it cannot hand over: one that does not exist, or one only the principal and the assistant are on', async () => {
@@ -481,6 +484,11 @@ describe('email_handoff', () => {
     const session = await requireThreadSession(key);
     const attachments = rows(session)[0].content.attachments as Array<{ name: string; localPath: string }>;
     expect(attachments.map((file) => file.name)).toEqual(['agenda.pdf', 'notes.txt']);
+    expect(rows(session)[0].content.text).toBe(
+      `From main: a new conversation with ${REMY} — nothing has been sent yet.\n` +
+        'You may send agenda.pdf and notes.txt in it.\n' +
+        "main's words:\nSend Remy the agenda and notes.",
+    );
     for (const [name, bytes] of [
       ['agenda.pdf', agenda],
       ['notes.txt', notes],
