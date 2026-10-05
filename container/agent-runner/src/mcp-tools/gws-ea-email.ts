@@ -170,7 +170,7 @@ export const freeTime = requestTool({
     timezone: {
       type: 'string',
       description:
-        "The other side's time zone, such as Africa/Lagos, when you know it: times in their night are left out.",
+        "The other side's time zone, such as Europe/Berlin, when you know it: times in their night are left out.",
     },
   },
   required: ['from', 'to', 'minutes'],

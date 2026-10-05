@@ -114,7 +114,7 @@ describe('the email tools', () => {
           from: '2026-10-12T09:00:00-07:00',
           to: '2026-10-16T17:00:00-07:00',
           minutes: 30,
-          timezone: 'Africa/Lagos',
+          timezone: 'Europe/Berlin',
         },
       ],
       [hold, 'hold', { starts: ['2026-10-12T11:00:00-07:00', '2026-10-13T12:30:00-07:00'], minutes: 30 }],

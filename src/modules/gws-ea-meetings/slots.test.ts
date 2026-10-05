@@ -25,7 +25,7 @@ import {
 const LONDON = 'Europe/London';
 const NEW_YORK = 'America/New_York';
 const LOS_ANGELES = 'America/Los_Angeles';
-const LAGOS = 'Africa/Lagos';
+const BERLIN = 'Europe/Berlin';
 const PRINCIPAL = new Set(['pat@principal.example']);
 const HOUR = 3_600_000;
 
@@ -203,19 +203,19 @@ describe('free time', () => {
     expect(offered.map((time) => clock(time.start))).toEqual(['07:00', '08:00', '09:00', '10:00']);
   });
 
-  it("offers only times inside the counterpart's waking day too: for a Pacific principal and Lagos, the shared mornings", () => {
-    // Lagos is eight hours ahead of Los Angeles in October: 07:00 to 14:00 there is 15:00 to 22:00 here.
+  it("offers only times inside the counterpart's waking day too: for a Pacific principal and Berlin, the shared mornings", () => {
+    // Berlin is nine hours ahead of Los Angeles in early October: 07:00 to 13:00 in Los Angeles is 16:00 to 22:00 in Berlin.
     const tuesday = span('2026-10-06T07:00:00Z', '2026-10-07T07:00:00Z');
     const both = freeTimes(
-      query({ timezone: LOS_ANGELES, counterpartTimezone: LAGOS, window: tuesday }),
+      query({ timezone: LOS_ANGELES, counterpartTimezone: BERLIN, window: tuesday }),
       EVERY_TIME,
     ).sort((a, b) => a.start - b.start);
     const morning = Array.from(
-      { length: 14 },
+      { length: 12 },
       (_, i) => `${String(7 + Math.floor(i / 2)).padStart(2, '0')}:${i % 2 ? '30' : '00'}`,
     );
     expect(both.map((time) => clock(time.start, LOS_ANGELES))).toEqual(morning);
-    expect(both.map((time) => clock(time.end, LAGOS)).at(-1)).toBe('22:00');
+    expect(both.map((time) => clock(time.end, BERLIN)).at(-1)).toBe('22:00');
   });
 
   it('offers fewer times when a narrow window holds fewer', () => {

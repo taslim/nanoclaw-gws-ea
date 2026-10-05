@@ -351,26 +351,27 @@ describe('free_time', () => {
     }
   });
 
-  it('offers a Pacific principal and a counterpart in Lagos the mornings they share', async () => {
+  it('offers a Pacific principal and a counterpart in Berlin the mornings they share', async () => {
     await getDb().run("UPDATE gws_ea_profile SET principal_timezone = 'America/Los_Angeles' WHERE singleton = 1");
     const times = data(
       await send(sessionA, 'free_time', {
         from: '2026-10-05T00:00:00-07:00',
         to: '2026-10-13T00:00:00-07:00',
         minutes: 30,
-        timezone: 'Africa/Lagos',
+        timezone: 'Europe/Berlin',
       }),
     ).times as Offered[];
-    // Lagos is eight hours ahead: its waking day ends at 14:00 in Los Angeles.
+    // Berlin is nine hours ahead: its waking day ends at 13:00 in Los Angeles, so Sunday has no new hour left
+    // and Monday's next free half-hours fill the last two places.
     expect(times.map((time) => [time.principal_time, time.their_time])).toEqual([
-      ['Monday 5 Oct, 07:00–07:30 PDT', 'Monday 5 Oct, 15:00–15:30 GMT+1'],
-      ['Monday 5 Oct, 07:30–08:00 PDT', 'Monday 5 Oct, 15:30–16:00 GMT+1'],
-      ['Tuesday 6 Oct, 08:00–08:30 PDT', 'Tuesday 6 Oct, 16:00–16:30 GMT+1'],
-      ['Wednesday 7 Oct, 09:00–09:30 PDT', 'Wednesday 7 Oct, 17:00–17:30 GMT+1'],
-      ['Thursday 8 Oct, 10:00–10:30 PDT', 'Thursday 8 Oct, 18:00–18:30 GMT+1'],
-      ['Friday 9 Oct, 11:00–11:30 PDT', 'Friday 9 Oct, 19:00–19:30 GMT+1'],
-      ['Saturday 10 Oct, 12:00–12:30 PDT', 'Saturday 10 Oct, 20:00–20:30 GMT+1'],
-      ['Sunday 11 Oct, 13:00–13:30 PDT', 'Sunday 11 Oct, 21:00–21:30 GMT+1'],
+      ['Monday 5 Oct, 07:00–07:30 PDT', 'Monday 5 Oct, 16:00–16:30 CEST'],
+      ['Monday 5 Oct, 07:30–08:00 PDT', 'Monday 5 Oct, 16:30–17:00 CEST'],
+      ['Monday 5 Oct, 08:00–08:30 PDT', 'Monday 5 Oct, 17:00–17:30 CEST'],
+      ['Tuesday 6 Oct, 08:00–08:30 PDT', 'Tuesday 6 Oct, 17:00–17:30 CEST'],
+      ['Wednesday 7 Oct, 09:00–09:30 PDT', 'Wednesday 7 Oct, 18:00–18:30 CEST'],
+      ['Thursday 8 Oct, 10:00–10:30 PDT', 'Thursday 8 Oct, 19:00–19:30 CEST'],
+      ['Friday 9 Oct, 11:00–11:30 PDT', 'Friday 9 Oct, 20:00–20:30 CEST'],
+      ['Saturday 10 Oct, 12:00–12:30 PDT', 'Saturday 10 Oct, 21:00–21:30 CEST'],
     ]);
   });
 
