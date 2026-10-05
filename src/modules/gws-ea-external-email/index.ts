@@ -15,6 +15,9 @@
  *     other group (`./destination-policy.ts`). The two work together only
  *     through the host: main's `email_handoff` and its own `tell_main`
  *     (`./bridge.ts`).
+ *   - When an email it wrote cannot be sent, what arrived in its thread cannot
+ *     be processed, or its work on a thread fails, main hears of it
+ *     (`./failures.ts`).
  *   - Its project document holds its guidance, read from the release, and the
  *     two display names: the profile and preferences sections leave it
  *     everything else out.
@@ -42,6 +45,7 @@ import { getExternalEmailAgentGroupId as readExternalEmailPointer } from '../gws
 import { BRIDGE_ACTIONS } from './bridge.js';
 import { destinationViolations } from './destination-policy.js';
 import { ensureExternalEmailGroup, externalEmailDrift } from './group.js';
+import './failures.js';
 
 export {
   EXTERNAL_EMAIL_CAPABILITIES,

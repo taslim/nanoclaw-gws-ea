@@ -287,6 +287,7 @@ async function validateComposition(
     'src/modules/gws-ea-external-email/destination-policy.ts',
     'src/modules/gws-ea-external-email/guidance.md',
     'src/modules/gws-ea-external-email/bridge.ts',
+    'src/modules/gws-ea-external-email/failures.ts',
     'src/modules/gws-ea-inbox/index.ts',
     'src/modules/gws-ea-inbox/migration.ts',
     'src/modules/gws-ea-inbox/migration-email-channel.ts',

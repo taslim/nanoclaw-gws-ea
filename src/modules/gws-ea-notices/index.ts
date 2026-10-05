@@ -19,11 +19,12 @@
  * profile's pointer, with a person. Host notes and agent-to-agent traffic
  * ride the `agent` channel, and a task session serves no conversation. A
  * failure in `external-email`'s sessions is never the principal's to hear
- * this way: they asked for nothing there. A failed turn is reported only
- * through this module's `turn_failed` action, so a failed turn in any other
- * conversation goes to the owners registered with `registerTurnFailedHook`.
- * A failure in the principal's direct message keeps its thread there; any
- * other goes to the top of the direct message.
+ * this way: they asked for nothing there, so the external-email module tells
+ * main of it (`gws-ea-external-email/failures.ts`). A failed turn is
+ * reported only through this module's `turn_failed` action, so a failed turn
+ * in any other conversation goes to the owners registered with
+ * `registerTurnFailedHook`. A failure in the principal's direct message keeps
+ * its thread there; any other goes to the top of the direct message.
  *
  * The notice is one direct send through the delivery adapter, so it passes
  * the outbound guard. It is never queued or retried, so a failing channel
@@ -128,7 +129,7 @@ export async function sendPrincipalNotice(text: string, cause: string): Promise<
 }
 
 /** A row a person would have seen as a message; a reaction the agent placed is decoration, not a reply. */
-function isPersonFacingPost(msg: OutboundMessage): boolean {
+export function isPersonFacingPost(msg: OutboundMessage): boolean {
   if (msg.kind === 'system' || msg.kind === 'task_log' || !isPersonRoute(msg)) return false;
   let content: unknown;
   /* eslint-disable no-catch-all/no-catch-all -- an unreadable row was still meant for the channel */
