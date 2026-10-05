@@ -24,7 +24,7 @@ const FILES: ReadonlyArray<readonly [name: string, notTools: readonly string[]]>
   ['schedule-stats', ['from', 'to']],
   ['time', ['reference_date']],
   ['reminders', []],
-  ['gws-ea-email', ['to', 'cc']],
+  ['gws-ea-email', []],
   ['gws-ea-email-external', []],
 ];
 
