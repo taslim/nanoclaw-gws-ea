@@ -10,6 +10,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
 
 import { requestAction } from '../action-request.js';
+import * as messagesOut from '../db/messages-out.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
 import {
@@ -359,6 +360,21 @@ describe('files that go with a request', () => {
     expect(made).toHaveLength(1);
     expect(removed).toEqual(made);
     expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('send nothing, say why, and clear what was staged when the request cannot be written for the host', async () => {
+    // The outbound mailbox refuses the write, so the request never reaches the host.
+    spies.push(spyOn(messagesOut, 'writeMessageOut').mockRejectedValue(new Error('disk full')));
+    const result = await emailSend.handler(
+      { text: 'Here is the deck.', files: [path.join(dir, 'deck.pdf')] },
+      { signal: AbortSignal.timeout(100) },
+    );
+    expect(result).toEqual({
+      content: [{ type: 'text', text: 'Error: The request could not be sent: disk full' }],
+      isError: true,
+    });
+    expect(made).toHaveLength(1);
+    expect(removed).toEqual(made);
   });
 
   it('named by a relative path are found under /workspace/agent', async () => {

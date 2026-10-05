@@ -34,7 +34,10 @@ export type ActionRequestResult =
   | { readonly status: 'answered'; readonly frame: ActionResponseFrame }
   /** No answer yet: the request may still go through, and `requestId` finds its answer later (`readAnswer`). */
   | { readonly status: 'timeout'; readonly requestId: string }
-  | { readonly status: 'cancelled' };
+  /** Sent, then the wait was cancelled: the request may still go through. */
+  | { readonly status: 'cancelled' }
+  /** Never written to the outbox, so the host will never see it or answer it. */
+  | { readonly status: 'not-sent'; readonly reason: string };
 
 export interface ActionRequestOptions {
   /** How long to wait for the host's answer. */
@@ -135,14 +138,21 @@ export async function requestAction(
   options: ActionRequestOptions,
 ): Promise<ActionRequestResult> {
   const { signal } = options;
-  if (signal?.aborted) return { status: 'cancelled' };
+  if (signal?.aborted) return { status: 'not-sent', reason: 'The request was cancelled before it was sent.' };
   const requestId = options.requestId ?? newRequestId();
-  await writeMessageOut({
-    id: requestId,
-    kind: 'system',
-    // An unmarked request carries no `delivers` at all: JSON leaves out an undefined value.
-    content: JSON.stringify({ ...fields, action, requestId, delivers: options.delivers === true || undefined }),
-  });
+  try {
+    await writeMessageOut({
+      id: requestId,
+      kind: 'system',
+      // An unmarked request carries no `delivers` at all: JSON leaves out an undefined value.
+      content: JSON.stringify({ ...fields, action, requestId, delivers: options.delivers === true || undefined }),
+    });
+  } catch (error) {
+    return {
+      status: 'not-sent',
+      reason: `The request could not be sent: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
 
   const deadline = Date.now() + options.timeoutMs;
   for (;;) {
@@ -247,6 +257,10 @@ export function requestTool(spec: RequestToolSpec): McpToolDefinition {
         delivers: spec.delivers,
       });
       switch (result.status) {
+        case 'not-sent':
+          // Nothing reached the host, so no answer will come to clear what was staged.
+          fs.rmSync(requestOutbox(requestId), { recursive: true, force: true });
+          return errorResult(result.reason);
         case 'cancelled':
           return errorResult('The request was cancelled before the host answered.');
         case 'timeout':
