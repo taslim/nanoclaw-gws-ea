@@ -26,11 +26,11 @@ registerWiringAdmissionPolicy('gws-ea-profile:canonical-main', async ({ proposed
   };
   const mg = await getMessagingGroup(proposed.messaging_group_id);
   if (!mg) throw new Error('Canonical main wiring rejected: messaging group does not exist');
-  const principalEmail = (await emailMessagingGroupIds()).principal === mg.id;
-  if (!principalEmail && mg.is_group !== 0) reject('only direct messages are allowed');
+  const isPrincipalEmail = (await emailMessagingGroupIds()).principal === mg.id;
+  if (!isPrincipalEmail && mg.is_group !== 0) reject('only direct messages are allowed');
   if (proposed.sender_scope !== 'known') reject("sender_scope must be 'known'");
   if (proposed.session_mode !== 'agent-shared') reject("session_mode must be 'agent-shared'");
-  if (principalEmail) return;
+  if (isPrincipalEmail) return;
 
   const verifiedMapping = await db.get<{ present: number }>(
     `SELECT 1 AS present

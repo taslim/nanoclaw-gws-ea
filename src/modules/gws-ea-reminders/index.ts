@@ -28,14 +28,12 @@
  * reminder, which keeps its own time, from any other row waiting to be due.
  */
 import { registerCapability } from '../../capabilities.js';
-import { writeActionResponse } from '../../cli/delivery-action.js';
-import type { ResponseFrame } from '../../cli/frame.js';
+import { ActionRefusal, answeringAction, type ActionAnswer } from '../../cli/delivery-action.js';
 import { resolveGroupTimezone } from '../../container-config.js';
 import { isTaskThread } from '../../db/sessions.js';
-import { registerDeliveryAction, type DeliveryActionHandler } from '../../delivery.js';
+import { registerDeliveryAction } from '../../delivery.js';
 import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { unguarded } from '../../guard/index.js';
-import { log } from '../../log.js';
 import { parseIsoTimestamp } from '../../mailbox/model.js';
 import { withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
 import { formatLocalTime } from '../../timezone.js';
@@ -66,24 +64,10 @@ export function isReminderId(id: string): boolean {
 const REMINDER_SENDER = 'your reminder';
 const MAX_AHEAD_MS = 30 * 24 * 60 * 60 * 1000;
 const NOTE_MAX = 1_000;
-const REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/u;
 const REMINDER_ID = /^reminder-[A-Za-z0-9._:-]{1,128}$/u;
 const DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/iu;
 
-/** A request the host refuses as asked: the agent reads why and can ask differently. */
-class ReminderRefusal extends Error {
-  constructor(
-    readonly code: 'invalid-args' | 'forbidden',
-    message: string,
-  ) {
-    super(message);
-    this.name = 'ReminderRefusal';
-  }
-}
-
-function invalid(message: string): ReminderRefusal {
-  return new ReminderRefusal('invalid-args', message);
-}
+const invalid = (message: string): ActionRefusal => new ActionRefusal('invalid-args', message);
 
 /** The time a reminder comes back, in UTC. */
 function dueAt(value: unknown, now: number): string {
@@ -105,19 +89,13 @@ function noteOf(value: unknown): string {
   return note;
 }
 
-type Handle = (
-  content: Record<string, unknown>,
-  session: Session,
-  requestId: string,
-) => Promise<Record<string, unknown>>;
-
 async function remindMe(
   content: Record<string, unknown>,
   session: Session,
   requestId: string,
 ): Promise<Record<string, unknown>> {
   if (isTaskThread(session.thread_id)) {
-    throw new ReminderRefusal('forbidden', 'A scheduled task run has no conversation to come back to.');
+    throw new ActionRefusal('forbidden', 'A scheduled task run has no conversation to come back to.');
   }
   const now = Date.now();
   const at = dueAt(content.at, now);
@@ -176,51 +154,15 @@ async function clearReminder(content: Record<string, unknown>, session: Session)
   }
 }
 
-function errorFrame(requestId: string, error: unknown): ResponseFrame {
-  if (error instanceof ReminderRefusal) {
-    return { id: requestId, ok: false, error: { code: error.code, message: error.message } };
-  }
-  const reason = error instanceof Error ? error.message : String(error);
-  return { id: requestId, ok: false, error: { code: 'handler-error', message: `The host could not do it: ${reason}` } };
-}
-
-/** A delivery action that answers its request once, a refusal or failure included. */
-function answering(action: string, handle: Handle): DeliveryActionHandler {
-  return async (content, session) => {
-    const requestId = typeof content.requestId === 'string' ? content.requestId : '';
-    if (!REQUEST_ID.test(requestId)) {
-      log.warn('Reminder request without a request id: nothing to answer', { action, sessionId: session.id });
-      return;
-    }
-    let frame: ResponseFrame;
-    /* eslint-disable no-catch-all/no-catch-all -- every request is answered, a failure included; nothing is rethrown into a retry */
-    try {
-      frame = { id: requestId, ok: true, data: await handle(content, session, requestId) };
-    } catch (error) {
-      if (error instanceof ReminderRefusal) {
-        log.info('Reminder request refused', { action, requestId, sessionId: session.id, reason: error.message });
-      } else {
-        log.error('Reminder request failed', { action, requestId, sessionId: session.id, err: error });
-      }
-      frame = errorFrame(requestId, error);
-    }
-    /* eslint-enable no-catch-all/no-catch-all */
-    await writeActionResponse(session, requestId, frame);
-  };
-}
-
-const REQUESTS: ReadonlyArray<readonly [string, Handle]> = [
+const REQUESTS: ReadonlyArray<readonly [string, ActionAnswer]> = [
   ['remind_me', remindMe],
   ['clear_reminder', clearReminder],
 ];
 
-/** The action names reminders answer, which the runner's tools of the same names send. */
-export const REMINDER_ACTIONS: readonly string[] = REQUESTS.map(([action]) => action);
-
-for (const [action, handle] of REQUESTS) {
+for (const [action, answer] of REQUESTS) {
   registerDeliveryAction(
     action,
-    answering(action, handle),
+    answeringAction(action, answer),
     unguarded("acts only on the calling session's own mailbox, which the delivery names; no argument reaches another"),
   );
 }

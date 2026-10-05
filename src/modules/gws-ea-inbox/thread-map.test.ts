@@ -9,7 +9,6 @@ import { closeDb, initTestDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import './index.js';
 import {
-  anchorMessage,
   attachGmailThread,
   createThread,
   deleteSends,
@@ -21,6 +20,7 @@ import {
   recordThreadAddresses,
   recordThreadMessage,
   threadAddresses,
+  threadMessages,
   visibleMessageIds,
   type SendScope,
 } from './thread-map.js';
@@ -122,12 +122,9 @@ describe('a thread main hands over', () => {
     expect((await findThreadFor({ gmailThreadId: 'g-first', inReplyTo: [], references: [] }))?.threadKey).toBe(
       thread.threadKey,
     );
-    expect(await anchorMessage(thread.threadKey, 'outside')).toEqual({
-      threadKey: thread.threadKey,
-      side: 'outside',
-      gmailMessageId: 'gm-a1',
-      rfcMessageId: '<a1@juno.test>',
-    });
+    expect(await threadMessages(thread.threadKey, 'outside')).toEqual([
+      { threadKey: thread.threadKey, side: 'outside', gmailMessageId: 'gm-a1', rfcMessageId: '<a1@juno.test>' },
+    ]);
   });
 
   it('keeps the Gmail thread it has, and never takes one another thread holds', async () => {
@@ -163,7 +160,10 @@ describe('a thread main hands over', () => {
       { threadKey: thread.threadKey, side: 'outside', gmailMessageId: 'gm-t1', rfcMessageId: '<t1@friend.test>' },
       AT,
     );
-    expect((await anchorMessage(thread.threadKey, 'outside'))?.gmailMessageId).toBe('gm-t1');
+    expect((await threadMessages(thread.threadKey, 'outside')).map((message) => message.gmailMessageId)).toEqual([
+      'gm-a1',
+      'gm-t1',
+    ]);
 
     // The assistant answers in Remy's Gmail thread.
     await insertPendingSend({ id: 'send-2', scope, contentHash: 'hash-2', rfcMessageId: '<a2@juno.test>' }, LATER);
@@ -187,27 +187,25 @@ describe('a thread main hands over', () => {
   });
 });
 
-describe("each side's anchor", () => {
-  it("ignores messages the other side's readers cannot see", async () => {
+describe("each side's messages", () => {
+  it("leave out messages the other side's readers cannot see", async () => {
     const { threadKey } = await createThread('g-acme', AT);
     const record = (side: 'principal' | 'outside', id: string) =>
       recordThreadMessage({ threadKey, side, gmailMessageId: id, rfcMessageId: `<${id}@mail.test>` }, AT);
+    const ids = async (side: 'principal' | 'outside') =>
+      (await threadMessages(threadKey, side)).map((message) => message.gmailMessageId);
 
-    expect(await anchorMessage(threadKey, 'outside')).toBeUndefined();
+    expect(await ids('outside')).toEqual([]);
     await record('outside', 'acme-1');
     // The principal writes to the assistant alone, in Acme's Gmail thread.
     await record('principal', 'note-1');
 
-    expect((await anchorMessage(threadKey, 'outside'))?.gmailMessageId).toBe('acme-1');
-    expect((await anchorMessage(threadKey, 'principal'))?.gmailMessageId).toBe('note-1');
+    expect(await ids('outside')).toEqual(['acme-1']);
+    expect(await ids('principal')).toEqual(['note-1']);
 
     await record('outside', 'acme-2');
-    expect((await anchorMessage(threadKey, 'outside'))?.gmailMessageId).toBe('acme-2');
-    expect((await anchorMessage(threadKey, 'principal'))?.gmailMessageId).toBe('note-1');
-    // main answers only the principal's own message.
-    expect((await anchorMessage(threadKey, 'principal', 'note-1'))?.gmailMessageId).toBe('note-1');
-    expect(await anchorMessage(threadKey, 'principal', 'acme-2')).toBeUndefined();
-    expect(await anchorMessage(threadKey, 'outside', 'note-1')).toBeUndefined();
+    expect(await ids('outside')).toEqual(['acme-1', 'acme-2']);
+    expect(await ids('principal')).toEqual(['note-1']);
 
     expect(await visibleMessageIds(threadKey, 'outside')).toEqual(['<acme-1@mail.test>', '<acme-2@mail.test>']);
     expect(await visibleMessageIds(threadKey, 'principal')).toEqual(['<note-1@mail.test>']);

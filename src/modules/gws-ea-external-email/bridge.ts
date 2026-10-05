@@ -36,14 +36,12 @@ import path from 'node:path';
 
 import { inboxFolderName } from '../../attachment-safety.js';
 import type { OutboundFile } from '../../channels/adapter.js';
-import { writeActionResponse } from '../../cli/delivery-action.js';
-import type { ResponseFrame } from '../../cli/frame.js';
+import { ActionRefusal, answeredGuard, answeringAction, type ActionAnswer } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import type { DeliveryGuardSpec, GuardedDeliveryHandler } from '../../delivery-guard.js';
 import { hasControlCharacters } from '../../gws-ea/validation.js';
-import { ALLOW, DENY, defineGuardedAction, type GuardedAction } from '../../guard/index.js';
-import { log } from '../../log.js';
+import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import {
   clearOutbox,
   readOutboxFiles,
@@ -81,7 +79,6 @@ export const TELL_MAIN_ACTION = 'tell_main';
 /** The `note.type` of what `external-email` tells `main`. */
 export const TELL_MAIN_NOTE_TYPE = 'gws-ea-external-email.tell-main';
 
-const REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/u;
 const THREAD_KEY = /^mail-[A-Za-z0-9-]{1,80}$/u;
 const MESSAGE_MAX = 8_000;
 const MAX_RECIPIENTS = 20;
@@ -89,90 +86,8 @@ const MAX_FILES = 10;
 /** Google's longest calendar id is an address. */
 const CALENDAR_ID_MAX = 254;
 
-// ---------------------------------------------------------------------------
-// Refusals, and answering each request once
-// ---------------------------------------------------------------------------
-
-/** A request the host refuses as asked: the agent reads why and can ask differently. */
-class BridgeRefusal extends Error {
-  constructor(
-    readonly code: 'invalid-args' | 'forbidden',
-    message: string,
-  ) {
-    super(message);
-    this.name = 'BridgeRefusal';
-  }
-}
-
-function invalid(message: string): BridgeRefusal {
-  return new BridgeRefusal('invalid-args', message);
-}
-
-function refused(message: string): BridgeRefusal {
-  return new BridgeRefusal('forbidden', message);
-}
-
-/** The request id the runner set: the id of the outbound message that carried the request. */
-function requestIdOf(content: Record<string, unknown>): string | undefined {
-  const id = content.requestId;
-  return typeof id === 'string' && REQUEST_ID.test(id) ? id : undefined;
-}
-
-type Handle = (
-  content: Record<string, unknown>,
-  session: Session,
-  requestId: string,
-) => Promise<Record<string, unknown>>;
-
-function errorFrame(requestId: string, error: unknown): ResponseFrame {
-  if (error instanceof BridgeRefusal) {
-    return { id: requestId, ok: false, error: { code: error.code, message: error.message } };
-  }
-  const reason = error instanceof Error ? error.message : String(error);
-  return { id: requestId, ok: false, error: { code: 'handler-error', message: `The host could not do it: ${reason}` } };
-}
-
-/** A delivery action that answers its request once, a refusal or failure included. */
-function answering(action: string, handle: Handle): GuardedDeliveryHandler {
-  return async (content, session) => {
-    const requestId = requestIdOf(content);
-    if (requestId === undefined) return;
-    let frame: ResponseFrame;
-    /* eslint-disable no-catch-all/no-catch-all -- every request is answered, a failure included; nothing is rethrown into a retry */
-    try {
-      frame = { id: requestId, ok: true, data: await handle(content, session, requestId) };
-    } catch (error) {
-      if (error instanceof BridgeRefusal) {
-        log.info('Bridge request refused', { action, requestId, sessionId: session.id, reason: error.message });
-      } else {
-        log.error('Bridge request failed', { action, requestId, sessionId: session.id, err: error });
-      }
-      frame = errorFrame(requestId, error);
-    }
-    /* eslint-enable no-catch-all/no-catch-all */
-    await writeActionResponse(session, requestId, frame);
-  };
-}
-
-async function answerRefusal(content: Record<string, unknown>, session: Session, message: string): Promise<void> {
-  const requestId = requestIdOf(content) ?? '';
-  await writeActionResponse(session, requestId, { id: requestId, ok: false, error: { code: 'forbidden', message } });
-}
-
-/** A guard whose refusal is answered, so the calling tool never waits it out. */
-function guardSpec(guardAction: GuardedAction): DeliveryGuardSpec {
-  return {
-    guardAction,
-    precheck: (content, session) => {
-      if (requestIdOf(content) !== undefined) return true;
-      log.warn('Bridge request without a request id: nothing to answer', { sessionId: session.id });
-      return false;
-    },
-    // These guards never hold; a hold would be a decision these actions cannot honor.
-    requestHold: (content, session) => answerRefusal(content, session, 'This request cannot wait for an approval.'),
-    onDeny: (content, session, reason) => answerRefusal(content, session, reason),
-  };
-}
+const invalid = (message: string): ActionRefusal => new ActionRefusal('invalid-args', message);
+const refused = (message: string): ActionRefusal => new ActionRefusal('forbidden', message);
 
 // ---------------------------------------------------------------------------
 // Who may call
@@ -487,7 +402,7 @@ async function writeHandoff(
   }
 }
 
-const handOver: Handle = async (content, session, requestId) => {
+const handOver: ActionAnswer = async (content, session, requestId) => {
   try {
     const [externalEmail, { inbox }] = await Promise.all([getExternalEmailAgentGroupId(), emailMessagingGroupIds()]);
     if (externalEmail === null || inbox === null) throw new Error('external-email and its inbox do not exist yet');
@@ -528,7 +443,7 @@ const handOver: Handle = async (content, session, requestId) => {
 // tell_main
 // ---------------------------------------------------------------------------
 
-const tellMain: Handle = async (content, session, requestId) => {
+const tellMain: ActionAnswer = async (content, session, requestId) => {
   const message = messageOf(content.message);
   const threadKey = session.thread_id;
   if (threadKey === null) throw new Error(`Session ${session.id} has no thread`);
@@ -553,6 +468,6 @@ const tellMain: Handle = async (content, session, requestId) => {
 
 /** Each action, with its handler and its guard, as the module registers them. */
 export const BRIDGE_ACTIONS: ReadonlyArray<readonly [string, GuardedDeliveryHandler, DeliveryGuardSpec]> = [
-  [EMAIL_HANDOFF_ACTION, answering(EMAIL_HANDOFF_ACTION, handOver), guardSpec(emailHandoffAction)],
-  [TELL_MAIN_ACTION, answering(TELL_MAIN_ACTION, tellMain), guardSpec(tellMainAction)],
+  [EMAIL_HANDOFF_ACTION, answeringAction(EMAIL_HANDOFF_ACTION, handOver), answeredGuard(emailHandoffAction)],
+  [TELL_MAIN_ACTION, answeringAction(TELL_MAIN_ACTION, tellMain), answeredGuard(tellMainAction)],
 ];

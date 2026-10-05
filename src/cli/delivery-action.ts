@@ -9,16 +9,19 @@
  * Any other delivery action that answers its calling tool does the same
  * through `writeActionResponse`: one `action_response` per request, keyed on
  * the request id the runner set (the id of the outbound message that carried
- * it), which the runner's tool polls for.
+ * it), which the runner's tool polls for. `answeringAction` and
+ * `answeredGuard` make such an action of a function that returns its answer
+ * or throws: the host's twin of the runner's `requestTool`.
  */
 import { isUniqueViolation } from '../db/errors.js';
+import type { DeliveryGuardSpec, GuardedDeliveryHandler } from '../delivery-guard.js';
 import { registerDeliveryAction } from '../delivery.js';
-import { unguarded } from '../guard/index.js';
+import { unguarded, type GuardedAction } from '../guard/index.js';
 import { log } from '../log.js';
 import { writeSessionMessage } from '../session-manager.js';
 import type { Session } from '../types.js';
 import { dispatch } from './dispatch.js';
-import type { RequestFrame, ResponseFrame } from './frame.js';
+import type { ErrorCode, RequestFrame, ResponseFrame } from './frame.js';
 
 /**
  * Answer a request in the calling session's inbound mailbox, without waking
@@ -40,6 +43,95 @@ export async function writeActionResponse(session: Session, requestId: string, f
     if (!isUniqueViolation(err)) throw err;
     log.info('Action already answered; keeping the first answer', { requestId, sessionId: session.id });
   }
+}
+
+/** A request refused as asked: the agent reads why and can ask differently. */
+export class ActionRefusal extends Error {
+  constructor(
+    readonly code: Extract<ErrorCode, 'invalid-args' | 'forbidden'>,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ActionRefusal';
+  }
+}
+
+const REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/u;
+
+/** The request id the runner set: the id of the outbound message that carried the request. */
+export function requestIdOf(content: Record<string, unknown>): string | undefined {
+  const id = content.requestId;
+  return typeof id === 'string' && REQUEST_ID.test(id) ? id : undefined;
+}
+
+/** What an answering action does with a request: the answer's data, or an `ActionRefusal` or failure thrown. */
+export type ActionAnswer = (
+  content: Record<string, unknown>,
+  session: Session,
+  requestId: string,
+) => Promise<Record<string, unknown>>;
+
+function errorFrame(requestId: string, error: unknown): ResponseFrame {
+  if (error instanceof ActionRefusal) {
+    return { id: requestId, ok: false, error: { code: error.code, message: error.message } };
+  }
+  const reason = error instanceof Error ? error.message : String(error);
+  return { id: requestId, ok: false, error: { code: 'handler-error', message: `The host could not do it: ${reason}` } };
+}
+
+/**
+ * A delivery action that answers each request once, a refusal or failure
+ * included. A request without a request id has no tool waiting on it, so
+ * nothing answers it.
+ */
+export function answeringAction(action: string, answer: ActionAnswer): GuardedDeliveryHandler {
+  return async (content, session) => {
+    const requestId = requestIdOf(content);
+    if (requestId === undefined) {
+      log.warn('Action request without a request id: nothing to answer', { action, sessionId: session.id });
+      return;
+    }
+    let frame: ResponseFrame;
+    /* eslint-disable no-catch-all/no-catch-all -- every request is answered, a failure included; nothing is rethrown into a retry */
+    try {
+      frame = { id: requestId, ok: true, data: await answer(content, session, requestId) };
+    } catch (error) {
+      if (error instanceof ActionRefusal) {
+        log.info('Action request refused', { action, requestId, sessionId: session.id, reason: error.message });
+      } else {
+        log.error('Action request failed', { action, requestId, sessionId: session.id, err: error });
+      }
+      frame = errorFrame(requestId, error);
+    }
+    /* eslint-enable no-catch-all/no-catch-all */
+    await writeActionResponse(session, requestId, frame);
+  };
+}
+
+async function refuse(content: Record<string, unknown>, session: Session, message: string): Promise<void> {
+  const requestId = requestIdOf(content) ?? '';
+  await writeActionResponse(session, requestId, { id: requestId, ok: false, error: { code: 'forbidden', message } });
+}
+
+/**
+ * The guard of an answering action: a denial is answered as a refusal, so
+ * the calling tool never waits it out. Such an action never waits for an
+ * approval, so a hold is refused too.
+ */
+export function answeredGuard(guardAction: GuardedAction): DeliveryGuardSpec {
+  return {
+    guardAction,
+    precheck: (content, session) => {
+      if (requestIdOf(content) !== undefined) return true;
+      log.warn('Action request without a request id: nothing to answer', {
+        guard: guardAction.action,
+        sessionId: session.id,
+      });
+      return false;
+    },
+    requestHold: (content, session) => refuse(content, session, 'This request cannot wait for an approval.'),
+    onDeny: (content, session, reason) => refuse(content, session, reason),
+  };
 }
 
 registerDeliveryAction(

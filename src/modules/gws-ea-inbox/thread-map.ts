@@ -13,7 +13,7 @@
  *   principal and the assistant can read it, `outside` otherwise. A side
  *   replies against, and references, only its own messages, so a
  *   principal-only note never reaches a reply-all, and a reply-all never
- *   loses the outsiders to a note written after it (`anchorMessage`,
+ *   loses the outsiders to a note written after it (`threadMessages`,
  *   `visibleMessageIds`).
  * - A thread's addresses are those its messages carried and those `main`
  *   named (`recordThreadAddresses`). A forgotten person's go from every
@@ -197,37 +197,6 @@ export async function recordThreadMessage(message: NewThreadMessage, at: string)
     at,
     message.threadKey,
   );
-}
-
-/**
- * The message a side's reply answers, never one that side's readers cannot
- * see: the side's latest, which for `outside` is the last message its
- * session received or sent. `main` names the message it answers instead
- * (`answering`, a Gmail message id), which must be one of the side's own in
- * this thread. Undefined when there is no such message.
- */
-export async function anchorMessage(
-  threadKey: string,
-  side: ThreadSide,
-  answering?: string,
-): Promise<ThreadMessage | undefined> {
-  const db = getDb();
-  const row =
-    answering === undefined
-      ? await db.get<MessageRow>(
-          `SELECT ${MESSAGE_COLUMNS} FROM gws_ea_thread_messages
-            WHERE thread_key = ? AND side = ? ORDER BY position DESC LIMIT 1`,
-          threadKey,
-          side,
-        )
-      : await db.get<MessageRow>(
-          `SELECT ${MESSAGE_COLUMNS} FROM gws_ea_thread_messages
-            WHERE thread_key = ? AND side = ? AND gmail_message_id = ?`,
-          threadKey,
-          side,
-          answering,
-        );
-  return row ? toMessage(row) : undefined;
 }
 
 /** A side's messages in the thread, oldest first. */

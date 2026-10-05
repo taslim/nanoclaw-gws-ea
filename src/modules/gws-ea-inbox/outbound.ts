@@ -43,14 +43,11 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
 import type { OutboundFile, OutboundMessage } from '../../channels/adapter.js';
-import { writeActionResponse } from '../../cli/delivery-action.js';
-import type { ResponseFrame } from '../../cli/frame.js';
+import { ActionRefusal, answeredGuard, answeringAction, type ActionAnswer } from '../../cli/delivery-action.js';
 import { getSession } from '../../db/sessions.js';
-import type { DeliveryGuardSpec, GuardedDeliveryHandler } from '../../delivery-guard.js';
 import { getDeliveryAdapter, OutboundRefusedError, type OutboundSend } from '../../delivery.js';
 import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
-import { log } from '../../log.js';
 import { clearOutbox, readOutboxFiles } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { getExternalEmailAgentGroupId } from '../gws-ea-external-email/index.js';
@@ -301,33 +298,13 @@ export async function sendToOutside(
 /** The delivery action both agents send email with; the runner's tool of the same name sends it. */
 export const EMAIL_SEND_ACTION = 'email_send';
 
-const REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/u;
 const THREAD_KEY = /^mail-[A-Za-z0-9-]{1,80}$/u;
 const MAX_FILES = 10;
 
-/** A request the host refuses as asked: the agent reads why and can ask differently. */
-class EmailSendRefusal extends Error {
-  constructor(
-    readonly code: 'invalid-args' | 'forbidden',
-    message: string,
-  ) {
-    super(message);
-    this.name = 'EmailSendRefusal';
-  }
-}
-
-function invalid(message: string): EmailSendRefusal {
-  return new EmailSendRefusal('invalid-args', message);
-}
-
-/** The request id the runner set: the id of the outbound message that carried the request. */
-function requestIdOf(content: Record<string, unknown>): string | undefined {
-  const id = content.requestId;
-  return typeof id === 'string' && REQUEST_ID.test(id) ? id : undefined;
-}
+const invalid = (message: string): ActionRefusal => new ActionRefusal('invalid-args', message);
 
 /** `main`, to the principal; and `external-email`, from the session of one email thread, in that thread alone. */
-export const emailSendAction = defineGuardedAction({
+const emailSendAction = defineGuardedAction({
   action: 'gws_ea_inbox.email_send',
   decide: async ({ actor }) => {
     if (actor.kind !== 'agent') return DENY('Only main and external-email send email.');
@@ -392,7 +369,7 @@ async function inThread(
   requestId: string,
 ): Promise<Record<string, unknown>> {
   if (content.thread_key !== undefined) {
-    throw new EmailSendRefusal('forbidden', 'You write only in your own thread: leave out thread_key.');
+    throw new ActionRefusal('forbidden', 'You write only in your own thread: leave out thread_key.');
   }
   const threadKey = session.thread_id;
   if (threadKey === null) throw new Error(`Session ${session.id} has no thread`);
@@ -421,63 +398,21 @@ async function inThread(
   return { thread_key: threadKey, message: 'Your email is sent.' };
 }
 
-function errorFrame(requestId: string, error: unknown): ResponseFrame {
-  if (error instanceof EmailSendRefusal) {
-    return { id: requestId, ok: false, error: { code: error.code, message: error.message } };
-  }
-  if (error instanceof OutboundRefusedError) {
-    return {
-      id: requestId,
-      ok: false,
-      error: { code: 'forbidden', message: `Your email was not sent: ${error.reason}` },
-    };
-  }
-  const reason = error instanceof Error ? error.message : String(error);
-  return {
-    id: requestId,
-    ok: false,
-    error: { code: 'handler-error', message: `The host could not send it: ${reason}` },
-  };
-}
-
-/** `email_send`, answering each request once, a refusal or failure included. */
-export const emailSendHandler: GuardedDeliveryHandler = async (content, session) => {
-  const requestId = requestIdOf(content);
-  if (requestId === undefined) return;
-  let frame: ResponseFrame;
-  /* eslint-disable no-catch-all/no-catch-all -- every request is answered, a failure included; nothing is rethrown into a retry */
+/** `email_send`, from `main` to the principal or from `external-email` in its own thread. */
+const emailSend: ActionAnswer = async (content, session, requestId) => {
   try {
-    const data =
-      session.agent_group_id === (await getMainAgentGroupId())
-        ? await toPrincipal(content, requestId)
-        : await inThread(content, session, requestId);
-    frame = { id: requestId, ok: true, data };
+    return session.agent_group_id === (await getMainAgentGroupId())
+      ? await toPrincipal(content, requestId)
+      : await inThread(content, session, requestId);
   } catch (error) {
-    if (error instanceof EmailSendRefusal || error instanceof OutboundRefusedError) {
-      log.info('Email request refused', { requestId, sessionId: session.id });
-    } else {
-      log.error('Email request failed', { requestId, sessionId: session.id, err: error });
-    }
-    frame = errorFrame(requestId, error);
+    // An outbound guard refused the email as written.
+    throw error instanceof OutboundRefusedError
+      ? new ActionRefusal('forbidden', `Your email was not sent: ${error.reason}`)
+      : error;
   }
-  /* eslint-enable no-catch-all/no-catch-all */
-  await writeActionResponse(session, requestId, frame);
 };
 
-async function answerRefusal(content: Record<string, unknown>, session: Session, message: string): Promise<void> {
-  const requestId = requestIdOf(content) ?? '';
-  await writeActionResponse(session, requestId, { id: requestId, ok: false, error: { code: 'forbidden', message } });
-}
+export const emailSendHandler = answeringAction(EMAIL_SEND_ACTION, emailSend);
 
-/** The guard `email_send` passes; a refusal is answered, so the calling tool never waits it out. */
-export const EMAIL_SEND_GUARD: DeliveryGuardSpec = {
-  guardAction: emailSendAction,
-  precheck: (content, session) => {
-    if (requestIdOf(content) !== undefined) return true;
-    log.warn('Email request without a request id: nothing to answer', { sessionId: session.id });
-    return false;
-  },
-  // This guard never holds; a hold would be a decision this action cannot honor.
-  requestHold: (content, session) => answerRefusal(content, session, 'This request cannot wait for an approval.'),
-  onDeny: (content, session, reason) => answerRefusal(content, session, reason),
-};
+/** The guard `email_send` passes. */
+export const EMAIL_SEND_GUARD = answeredGuard(emailSendAction);

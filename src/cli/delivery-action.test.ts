@@ -18,7 +18,9 @@ import { getDeliveryAction } from '../delivery.js';
 import { inboundDbPath } from '../mailbox/sqlite/paths.js';
 import { resolveSession } from '../session-manager.js';
 import type { Session } from '../types.js';
-import { writeActionResponse } from './delivery-action.js';
+import { runGuarded } from '../delivery-guard.js';
+import { ALLOW, DENY, defineGuardedAction, HOLD } from '../guard/index.js';
+import { ActionRefusal, answeredGuard, answeringAction, writeActionResponse } from './delivery-action.js';
 
 let session: Session;
 
@@ -88,5 +90,61 @@ describe('action_response', () => {
       requestId: 'cli-1',
       frame: { id: 'cli-1', ok: false, error: { code: 'unknown-command' } },
     });
+  });
+});
+
+describe('an answering action', () => {
+  const frameOf = (requestId: string): unknown => answers(requestId).map((row) => row.content.frame);
+
+  it('answers with what it returns, once, however often its request is delivered', async () => {
+    let runs = 0;
+    const handler = answeringAction('fixture', async (_content, _session, requestId) => ({ requestId, runs: ++runs }));
+    await handler({ requestId: 'ok-1' }, session);
+    await handler({ requestId: 'ok-1' }, session);
+    expect(frameOf('ok-1')).toEqual([{ id: 'ok-1', ok: true, data: { requestId: 'ok-1', runs: 1 } }]);
+  });
+
+  it('answers a refusal with its code and words, and a failure as the host’s', async () => {
+    const refusing = answeringAction('fixture', async () => {
+      throw new ActionRefusal('invalid-args', 'when must be a time');
+    });
+    const failing = answeringAction('fixture', async () => {
+      throw new Error('Calendar unreachable');
+    });
+    await refusing({ requestId: 'no-1' }, session);
+    await failing({ requestId: 'no-2' }, session);
+    expect(frameOf('no-1')).toEqual([
+      { id: 'no-1', ok: false, error: { code: 'invalid-args', message: 'when must be a time' } },
+    ]);
+    expect(frameOf('no-2')).toEqual([
+      {
+        id: 'no-2',
+        ok: false,
+        error: { code: 'handler-error', message: 'The host could not do it: Calendar unreachable' },
+      },
+    ]);
+  });
+
+  it('does nothing for a request no tool waits on', async () => {
+    const answer = vi.fn(async () => ({}));
+    await answeringAction('fixture', answer)({ requestId: 'not an id' }, session);
+    expect(answer).not.toHaveBeenCalled();
+  });
+
+  it('answers a denial or a hold as a refusal, so the calling tool never waits it out', async () => {
+    const answer = vi.fn(async () => ({}));
+    const handler = answeringAction('fixture', answer);
+    const denied = answeredGuard(defineGuardedAction({ action: 'fixture.denied', decide: () => DENY('Not yours.') }));
+    const held = answeredGuard(defineGuardedAction({ action: 'fixture.held', decide: () => HOLD('Ask first.') }));
+    const allowed = answeredGuard(defineGuardedAction({ action: 'fixture.allowed', decide: () => ALLOW('yours') }));
+
+    await runGuarded('fixture', denied, handler, { requestId: 'g-1' }, session, null);
+    await runGuarded('fixture', held, handler, { requestId: 'g-2' }, session, null);
+    await runGuarded('fixture', allowed, handler, { requestId: 'not an id' }, session, null);
+    expect(answer).not.toHaveBeenCalled();
+    expect(frameOf('g-1')).toEqual([{ id: 'g-1', ok: false, error: { code: 'forbidden', message: 'Not yours.' } }]);
+    expect(frameOf('g-2')).toEqual([
+      { id: 'g-2', ok: false, error: { code: 'forbidden', message: 'This request cannot wait for an approval.' } },
+    ]);
   });
 });

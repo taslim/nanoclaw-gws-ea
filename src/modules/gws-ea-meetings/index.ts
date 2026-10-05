@@ -17,12 +17,14 @@
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
+import { answeredGuard, answeringAction, type ActionAnswer } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { onHostStart } from '../../host-lifecycle.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { createMeetingsCalendarApi, type MeetingsCalendarApi } from './calendar-api.js';
-import { answerOnce, createSchedulingTools, SCHEDULING_GUARD, type SchedulingHandle } from './tools.js';
+import { threadCalendarAction } from './guard.js';
+import { createSchedulingTools } from './tools.js';
 
 /** How often lapsed holds are released. */
 const HOLD_SWEEP_INTERVAL_MS = 60_000;
@@ -35,7 +37,7 @@ const calendarApi = (): MeetingsCalendarApi =>
 const scheduling = createSchedulingTools({ calendar: calendarApi });
 
 /** external-email's scheduling tools, by action name; each acts on the calling thread alone. */
-const SCHEDULING_REQUESTS: ReadonlyArray<readonly [string, SchedulingHandle]> = [
+const SCHEDULING_REQUESTS: ReadonlyArray<readonly [string, ActionAnswer]> = [
   ['free_time', scheduling.freeTime],
   ['hold', scheduling.hold],
   ['book', scheduling.book],
@@ -46,8 +48,8 @@ const SCHEDULING_REQUESTS: ReadonlyArray<readonly [string, SchedulingHandle]> = 
 /** The scheduling tools' action names, which the runner's tools of the same names send. */
 export const SCHEDULING_ACTIONS: readonly string[] = SCHEDULING_REQUESTS.map(([action]) => action);
 
-for (const [action, handle] of SCHEDULING_REQUESTS) {
-  registerDeliveryAction(action, answerOnce(action, handle), SCHEDULING_GUARD);
+for (const [action, answer] of SCHEDULING_REQUESTS) {
+  registerDeliveryAction(action, answeringAction(action, answer), answeredGuard(threadCalendarAction));
 }
 
 /** Release every hold that lapsed, as the host's timer does each minute. Never throws. */

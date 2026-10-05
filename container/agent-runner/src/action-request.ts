@@ -123,16 +123,16 @@ export async function requestAction(
   }
 }
 
+function errorResult(text: string): CallToolResult {
+  return { content: [{ type: 'text', text: `Error: ${text}` }], isError: true };
+}
+
 /** An answer as a tool returns it: its `message` when it carries one, a refusal as an error. */
 export function answerResult(frame: ActionResponseFrame): CallToolResult {
-  if (!frame.ok) return { content: [{ type: 'text', text: `Error: ${frame.error.message}` }], isError: true };
+  if (!frame.ok) return errorResult(frame.error.message);
   const data = frame.data;
   const message = isRecord(data) && typeof data.message === 'string' ? data.message : JSON.stringify(data);
   return { content: [{ type: 'text', text: message }] };
-}
-
-function errorResult(text: string): CallToolResult {
-  return { content: [{ type: 'text', text: `Error: ${text}` }], isError: true };
 }
 
 /** A tool that sends one host action, by default the one of its own name. */

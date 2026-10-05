@@ -41,10 +41,8 @@
  * and its time, and a booking's from the request that made it.
  */
 import { TIMEZONE } from '../../config.js';
-import { writeActionResponse } from '../../cli/delivery-action.js';
-import type { ResponseFrame } from '../../cli/frame.js';
+import { ActionRefusal, type ActionAnswer } from '../../cli/delivery-action.js';
 import { resolveGroupTimezone } from '../../container-config.js';
-import type { DeliveryGuardSpec, GuardedDeliveryHandler } from '../../delivery-guard.js';
 import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import { formatLocalTime, isValidTimezone } from '../../timezone.js';
@@ -61,7 +59,6 @@ import { getGwsEaProfile, getMainAgentGroupId, listPrincipalAddresses } from '..
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { allowsMeet, type CalendarEntry, type EventConference, type MeetingsCalendarApi } from './calendar-api.js';
 import { ensureEvent, eventIdFor, moveEventTo, readConference, slotLabel, TAG_ROLE } from './calendar-actions.js';
-import { threadCalendarAction } from './guard.js';
 import {
   blocksTime,
   eventSpan,
@@ -114,102 +111,12 @@ const MAX_INVITEES = 20;
 const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;
 
-const REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/u;
 const DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/iu;
 /** A booking's id, as `book` answered with it: its event's id, lowercase hex. */
 const BOOKING_ID = /^[0-9a-f]{64}$/u;
 
-// ---------------------------------------------------------------------------
-// Refusals, and answering each request once
-// ---------------------------------------------------------------------------
-
-/** A request the host refuses as asked: the agent reads why and can ask differently. */
-class SchedulingRefusal extends Error {
-  constructor(
-    readonly code: 'invalid-args' | 'forbidden',
-    message: string,
-  ) {
-    super(message);
-    this.name = 'SchedulingRefusal';
-  }
-}
-
-function invalid(message: string): SchedulingRefusal {
-  return new SchedulingRefusal('invalid-args', message);
-}
-
-function refused(message: string): SchedulingRefusal {
-  return new SchedulingRefusal('forbidden', message);
-}
-
-/** The request id the runner set: the id of the outbound message that carried the request. */
-function requestIdOf(content: Record<string, unknown>): string | undefined {
-  const id = content.requestId;
-  return typeof id === 'string' && REQUEST_ID.test(id) ? id : undefined;
-}
-
-export type SchedulingHandle = (
-  content: Record<string, unknown>,
-  session: Session,
-  requestId: string,
-) => Promise<Record<string, unknown>>;
-
-function errorFrame(requestId: string, error: unknown): ResponseFrame {
-  if (error instanceof SchedulingRefusal) {
-    return { id: requestId, ok: false, error: { code: error.code, message: error.message } };
-  }
-  const reason = error instanceof Error ? error.message : String(error);
-  return { id: requestId, ok: false, error: { code: 'handler-error', message: `The host could not do it: ${reason}` } };
-}
-
-/** A delivery action that answers its request once, a refusal or failure included. */
-export function answerOnce(action: string, handle: SchedulingHandle): GuardedDeliveryHandler {
-  return async (content, session) => {
-    const requestId = requestIdOf(content);
-    if (requestId === undefined) return;
-    let frame: ResponseFrame;
-    /* eslint-disable no-catch-all/no-catch-all -- every request is answered, a failure included; nothing is rethrown into a retry */
-    try {
-      frame = { id: requestId, ok: true, data: await handle(content, session, requestId) };
-    } catch (error) {
-      if (error instanceof SchedulingRefusal) {
-        log.info('Scheduling request refused', { action, requestId, sessionId: session.id, reason: error.message });
-      } else {
-        log.error('Scheduling request failed', { action, requestId, sessionId: session.id, err: error });
-      }
-      frame = errorFrame(requestId, error);
-    }
-    /* eslint-enable no-catch-all/no-catch-all */
-    await writeActionResponse(session, requestId, frame);
-  };
-}
-
-/** The guard every scheduling tool passes; a refusal is answered, so the calling tool never waits it out. */
-export const SCHEDULING_GUARD: DeliveryGuardSpec = {
-  guardAction: threadCalendarAction,
-  precheck: (content, session) => {
-    if (requestIdOf(content) !== undefined) return true;
-    log.warn('Scheduling request without a request id: nothing to answer', { sessionId: session.id });
-    return false;
-  },
-  // This guard never holds; a hold would be a decision these actions cannot honor.
-  requestHold: async (content, session) => {
-    const requestId = requestIdOf(content) ?? '';
-    await writeActionResponse(session, requestId, {
-      id: requestId,
-      ok: false,
-      error: { code: 'forbidden', message: 'This request cannot wait for an approval.' },
-    });
-  },
-  onDeny: async (content, session, reason) => {
-    const requestId = requestIdOf(content) ?? '';
-    await writeActionResponse(session, requestId, {
-      id: requestId,
-      ok: false,
-      error: { code: 'forbidden', message: reason },
-    });
-  },
-};
+const invalid = (message: string): ActionRefusal => new ActionRefusal('invalid-args', message);
+const refused = (message: string): ActionRefusal => new ActionRefusal('forbidden', message);
 
 // ---------------------------------------------------------------------------
 // The request's fields
@@ -588,7 +495,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
   // The tools
   // -------------------------------------------------------------------------
 
-  const freeTime: SchedulingHandle = async (content, session) => {
+  const freeTime: ActionAnswer = async (content, session) => {
     const from = instantOf(content.from, 'from');
     const to = instantOf(content.to, 'to');
     const minutes = minutesOf(content.minutes);
@@ -635,7 +542,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
    * so a refusal changes nothing. Holding a time held already only resets
    * when it lapses.
    */
-  const hold: SchedulingHandle = async (content, session) => {
+  const hold: ActionAnswer = async (content, session) => {
     if (!Array.isArray(content.starts) || content.starts.length > MAX_HOLDS) {
       throw invalid(`starts must list up to ${MAX_HOLDS} start times, or none to release every hold`);
     }
@@ -827,7 +734,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
    * The thread's holds then go, and main hears. A replay of a request
    * already booked only finishes what follows.
    */
-  const book: SchedulingHandle = async (content, session, requestId) => {
+  const book: ActionAnswer = async (content, session, requestId) => {
     const start = instantOf(content.start, 'start');
     const minutes = minutesOf(content.minutes);
     const title = lineOf(content.title, 'title', TITLE_MAX);
@@ -904,7 +811,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
   }
 
   /** Move a booking this thread made to a new start, keeping its length, when the time is free and not protected. */
-  const moveBooking: SchedulingHandle = async (content, session) => {
+  const moveBooking: ActionAnswer = async (content, session) => {
     const start = instantOf(content.start, 'start');
     const view = await viewOf(session);
     const { timezone } = view.principal;
@@ -952,7 +859,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
   };
 
   /** Cancel a booking this thread made: its event is deleted with Google's notice to the invitees. */
-  const cancelBooking: SchedulingHandle = async (content, session) => {
+  const cancelBooking: ActionAnswer = async (content, session) => {
     const view = await viewOf(session);
     const { timezone } = view.principal;
     const { booking, span, invitees } = await ownBooking(content, view);
