@@ -10,6 +10,7 @@ import { closeDb, createAgentGroup, getDb, initDb, initTestDb, runMigrations } f
 import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
 import { bindVerifiedPrincipalUser, reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
+import { getMembers } from '../permissions/db/agent-group-members.js';
 import {
   addPerson,
   addPersonInstruction,
@@ -538,6 +539,10 @@ describe('forgetting a person', () => {
       'email:morgan@example.test',
       'gchat:users/pat',
       'gchat:users/principal',
+    ]);
+    expect((await getMembers(MAIN.id)).map((member) => member.user_id).sort()).toEqual([
+      'email:morgan.fixture@gmail.com',
+      'email:morgan@example.test',
     ]);
     expect(await getDb().all('SELECT user_id FROM unregistered_senders')).toEqual([
       { user_id: 'email:other@example.test' },

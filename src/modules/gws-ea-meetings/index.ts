@@ -4,7 +4,7 @@
  * it (`tools.ts`), and the timer that releases each thread's holds once they
  * lapse.
  *
- *   free_time, hold, book, move_booking, cancel_booking (`SCHEDULING_ACTIONS`)
+ *   free_time, hold, book, move_booking, cancel_booking
  *
  * Each is a delivery action with a guard (`guard.ts`) that admits only
  * `external-email`, from one email thread's session, and each request gets
@@ -44,9 +44,6 @@ const SCHEDULING_REQUESTS: ReadonlyArray<readonly [string, ActionAnswer]> = [
   ['move_booking', scheduling.moveBooking],
   ['cancel_booking', scheduling.cancelBooking],
 ];
-
-/** The scheduling tools' action names, which the runner's tools of the same names send. */
-export const SCHEDULING_ACTIONS: readonly string[] = SCHEDULING_REQUESTS.map(([action]) => action);
 
 for (const [action, answer] of SCHEDULING_REQUESTS) {
   registerDeliveryAction(action, answeringAction(action, answer), answeredGuard(threadCalendarAction));

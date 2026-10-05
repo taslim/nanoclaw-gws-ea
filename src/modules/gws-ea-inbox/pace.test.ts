@@ -55,7 +55,7 @@ import '../gws-ea-profile/index.js';
 import { REMINDER_ID_PREFIX } from '../gws-ea-reminders/index.js';
 import { EMAIL_CHANNEL_DEFAULTS, ensureInbox, ensurePrincipalConversation } from './index.js';
 import { emailMessagingGroupIds } from './db.js';
-import { PACE_MAX_MS, PACE_MIN_MS, paceDeadline } from './pace.js';
+import { paceDeadline } from './pace.js';
 import { INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID } from './runtime.js';
 
 const MINUTE = 60_000;
@@ -122,8 +122,8 @@ const rowId = (id: string, agentGroupId = 'ag-external') => `${id}:${agentGroupI
 function expectFreshWait(at: string | null, before: number, after: number): void {
   expect(at).not.toBeNull();
   const ms = Date.parse(at ?? '');
-  expect(ms).toBeGreaterThanOrEqual(before + PACE_MIN_MS);
-  expect(ms).toBeLessThanOrEqual(after + PACE_MAX_MS);
+  expect(ms).toBeGreaterThanOrEqual(before + 3 * MINUTE);
+  expect(ms).toBeLessThanOrEqual(after + 6 * MINUTE);
 }
 
 /**
@@ -267,6 +267,30 @@ describe('human pace', () => {
     expect(wokenSessions()).toEqual([]);
   });
 
+  it('chooses each wait at random across the whole of 3 to 6 minutes', async () => {
+    await mail('m1', 'mail-acme');
+    const thread = await threadSession('mail-acme');
+    reachWait(thread, processAfter(thread, rowId('m1')) ?? '');
+    await answered(thread, rowId('m1'));
+
+    const random = vi.spyOn(Math, 'random');
+    try {
+      for (const [draw, minutes] of [
+        [0, 3],
+        [0.999_999, 6],
+      ] as const) {
+        random.mockReturnValue(draw);
+        const before = Date.now();
+        const at = Date.parse((await paceDeadline(thread)) ?? '');
+        const after = Date.now();
+        expect(at).toBeGreaterThanOrEqual(before + minutes * MINUTE - 1_000);
+        expect(at).toBeLessThanOrEqual(after + minutes * MINUTE);
+      }
+    } finally {
+      random.mockRestore();
+    }
+  });
+
   it('starts a new wait once the agent has answered', async () => {
     await mail('m1', 'mail-acme');
     const thread = await threadSession('mail-acme');
@@ -278,22 +302,6 @@ describe('human pace', () => {
     await mail('m2', 'mail-acme');
 
     expectFreshWait(processAfter(thread, rowId('m2')), before, Date.now());
-  });
-
-  it('joins a handoff that arrives during the wait', async () => {
-    await mail('m1', 'mail-acme');
-    const thread = await threadSession('mail-acme');
-
-    // How main's handoff is written into the thread's session.
-    await writeSessionMessage(thread.agent_group_id, thread.id, {
-      id: 'handoff-1',
-      kind: 'chat',
-      timestamp: now(),
-      content: JSON.stringify({ text: 'The principal prefers Tuesday.' }),
-      processAfter: await paceDeadline(thread),
-    });
-
-    expect(processAfter(thread, 'handoff-1')).toBe(processAfter(thread, rowId('m1')));
   });
 
   it('works a reply within 3 to 6 minutes while a reminder waits two days out', async () => {

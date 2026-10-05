@@ -191,12 +191,15 @@ describe('registerInboundDelay', () => {
     const sooner = inMinutes(3);
     const later = inMinutes(5);
     answers.set('both', [later, sooner]);
+    answers.set('reversed', [sooner, later]);
     answers.set('second', [null, sooner]);
 
     await inbound('both');
+    await inbound('reversed', 'testchat:C1:3');
     await inbound('second', 'testchat:C1:2');
 
     expect(await processAfterOf('both')).toBe(later);
+    expect(await processAfterOf('reversed', 'testchat:C1:3')).toBe(later);
     expect(await processAfterOf('second', 'testchat:C1:2')).toBe(sooner);
   });
 

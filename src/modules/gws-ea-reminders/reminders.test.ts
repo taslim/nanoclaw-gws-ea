@@ -265,6 +265,8 @@ describe('remind_me', () => {
     const request = { requestId: 'act-replayed', at: inFuture(HOUR), note: 'Check the deck went out.' };
 
     const first = await replay(main, 'remind_me', request);
+    // The host stopped before it answered, so the replay's own answer is the one read.
+    inbound(main).prepare('DELETE FROM messages_in WHERE id = ?').run(`action-resp-${request.requestId}`);
     const second = await replay(main, 'remind_me', request);
 
     expect(second).toEqual(first);

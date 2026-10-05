@@ -72,14 +72,18 @@ import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
 import { getSession } from '../../db/sessions.js';
 import '../gws-ea-inbox/index.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
+import { replacePrincipalCalendars } from '../gws-ea-inbox/db.js';
 import { createThread, recordThreadAddresses, threadAddresses } from '../gws-ea-inbox/thread-map.js';
-import { BOOKING_FACT_TYPE, releaseExpiredHolds, SCHEDULING_ACTIONS } from './index.js';
+import { BOOKING_FACT_TYPE, releaseExpiredHolds } from './index.js';
 import { FITS } from './slots.js';
 import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
 import { listThreadHolds, setThreadBookingCalendar } from './thread-calendar.js';
 
 const JUNO = 'juno@northwind.example';
 const PRINCIPAL = 'pat@northwind.example';
+/** Another of the principal's calendars, which the assistant reads but never books on. */
+const PERSONAL = 'pat.personal@northwind.example';
+const TEAM = 'team@group.calendar.google.com';
 const PRINCIPAL_USER = 'gchat:users/pat';
 const REMY = 'remy@friends.example';
 const JANE = 'jane@friends.example';
@@ -280,10 +284,6 @@ afterEach(async () => {
 });
 
 describe('the scheduling tools', () => {
-  it('are the five actions the runner pins', () => {
-    expect(SCHEDULING_ACTIONS).toEqual(['free_time', 'hold', 'book', 'move_booking', 'cancel_booking']);
-  });
-
   it('answer only external-email, from an email thread’s own session', async () => {
     const fromMain = await send(main, 'free_time', { ...RANGE, minutes: 30 });
     expect(fromMain.ok).toBe(false);
@@ -364,6 +364,52 @@ describe('free_time', () => {
       expect(hour).toBeLessThan(22);
     }
   });
+
+  it('offers nothing that starts within the next hour', async () => {
+    const times = data(
+      await send(sessionA, 'free_time', { from: NOW.toISOString(), to: '2026-10-05T10:00:00+01:00', minutes: 30 }),
+    ).times as Offered[];
+    expect(times.map((time) => time.start).sort()).toEqual(['2026-10-05T08:00:00.000Z', '2026-10-05T08:30:00.000Z']);
+  });
+
+  it('offers this thread’s own held time back, marked held, while another thread’s hold stays busy', async () => {
+    data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM], minutes: 30 }));
+    const range = { from: '2026-10-06T10:00:00+01:00', to: '2026-10-06T10:30:00+01:00', minutes: 30 };
+
+    const fromA = data(await send(sessionA, 'free_time', range)).times as Offered[];
+    expect(fromA.map((time) => [time.start, time.held])).toEqual([[TUESDAY_10AM, true]]);
+    expect(data(await send(sessionB, 'free_time', range)).times).toEqual([]);
+  });
+});
+
+describe('busy time on the principal’s other calendars', () => {
+  it.each([
+    { on: 'their primary calendar', bookingCalendar: null },
+    { on: 'a calendar main named', bookingCalendar: TEAM },
+  ])('is neither offered nor booked when the thread books on $on', async ({ bookingCalendar }) => {
+    calendar.calendars.set(TEAM, { id: TEAM, accessRole: 'owner', dataOwner: PRINCIPAL, summary: 'Pat – work' });
+    await setThreadBookingCalendar(threadA, bookingCalendar);
+    await replacePrincipalCalendars([PRINCIPAL, PERSONAL], now());
+    calendar.put({ ...busy('evt-personal', WEDNESDAY_10AM, '2026-10-07T09:30:00.000Z'), calendarId: PERSONAL });
+    const taken = { start: Date.parse(WEDNESDAY_10AM), end: Date.parse('2026-10-07T09:30:00.000Z') };
+
+    const times = data(
+      await send(sessionA, 'free_time', {
+        from: '2026-10-07T09:00:00+01:00',
+        to: '2026-10-07T12:00:00+01:00',
+        minutes: 30,
+      }),
+    ).times as Offered[];
+    expect(times.length).toBeGreaterThan(0);
+    for (const time of times) {
+      expect(overlaps({ start: Date.parse(time.start), end: Date.parse(time.end) }, taken), time.start).toBe(false);
+    }
+    expect(
+      refusal(await send(sessionA, 'book', { start: WEDNESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] })),
+    ).toMatch(/no longer free/u);
+    expect(live('booking')).toEqual([]);
+    expect(calendar.live(TEAM)).toEqual([]);
+  });
 });
 
 describe('hold', () => {
@@ -406,9 +452,12 @@ describe('hold', () => {
     expect(live('hold').map((event) => event.start?.dateTime)).toEqual([TUESDAY_10AM]);
     expect((await listThreadHolds(threadA)).map((hold) => hold.startAt)).toEqual([TUESDAY_10AM]);
 
-    // Holding its own time again is not a conflict with itself.
+    // Holding its own time again is not a conflict with itself, and never lets the time go free on the way.
+    const [held] = live('hold');
+    const writes = calendar.writes.length;
     data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM], minutes: 30 }));
-    expect(live('hold')).toHaveLength(1);
+    expect(live('hold').map((event) => event.id)).toEqual([held.id]);
+    expect(calendar.writes.slice(writes).filter((write) => write.op === 'delete')).toEqual([]);
   });
 
   it('refuses a protected time, and more than three', async () => {
@@ -583,21 +632,33 @@ describe('book', () => {
     expect(live('booking')).toEqual([]);
   });
 
-  it('refuses an invitation that carries a private value, writing nothing', async () => {
-    await addPrivateValue({ label: 'Home', kind: 'address', value: '12 Rosewood Lane' });
-    const answer = refusal(
-      await send(sessionA, 'book', {
-        start: TUESDAY_10AM,
-        minutes: 30,
-        title: 'Catch-up',
-        location: '12 Rosewood Lane',
-        invitees: [REMY],
-      }),
-    );
-    expect(answer).toMatch(/private details \(address\)/u);
-    expect(answer).not.toContain('Rosewood');
-    expect(calendar.writes).toEqual([]);
-  });
+  it.each([
+    { carrier: 'title', fields: { title: 'Catch-up at 12 Rosewood Lane' } },
+    { carrier: 'notes', fields: { notes: 'Come round to 12 Rosewood Lane.' } },
+    { carrier: 'place', fields: { location: '12 Rosewood Lane' } },
+    { carrier: 'calendar name', fields: {}, calendarName: 'Pat – 12 Rosewood Lane' },
+  ])(
+    'refuses an invitation whose $carrier carries a private value, writing nothing',
+    async ({ fields, calendarName }) => {
+      await addPrivateValue({ label: 'Home', kind: 'address', value: '12 Rosewood Lane' });
+      // Invitees see the name of the calendar the event is on.
+      if (calendarName !== undefined) {
+        calendar.calendars.set(PRINCIPAL, { id: PRINCIPAL, accessRole: 'writer', summary: calendarName });
+      }
+      const answer = refusal(
+        await send(sessionA, 'book', {
+          start: TUESDAY_10AM,
+          minutes: 30,
+          title: 'Catch-up',
+          invitees: [REMY],
+          ...fields,
+        }),
+      );
+      expect(answer).toMatch(/private details \(address\)/u);
+      expect(answer).not.toContain('Rosewood');
+      expect(calendar.writes).toEqual([]);
+    },
+  );
 
   it('leaves no half-made event when Google fails, and the agent sees the failure', async () => {
     calendar.failNext({ op: 'insert', error: new GoogleApiError(503, 'Backend Error'), afterApplying: true });
@@ -615,26 +676,24 @@ describe('book', () => {
     expect(bookingFacts()).toEqual([]);
   });
 
-  it('books once when the same request is delivered again', async () => {
+  it('books once when the same request is delivered again, answering the replay as it did the first', async () => {
     const request = { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] };
     const first = data(await send(sessionA, 'book', request, 'act-replayed'));
-    const handler = getDeliveryAction('book');
-    await handler?.({ ...request, action: 'book', requestId: 'act-replayed' }, sessionA);
+    // The host keeps a request's first answer, so the replay's own is read only once that one is gone.
+    const inbound = new Database(inboundDbPath(sessionA.agent_group_id, sessionA.id));
+    inbound.prepare('DELETE FROM messages_in WHERE id = ?').run('action-resp-act-replayed');
+    inbound.close();
 
+    expect(data(await send(sessionA, 'book', request, 'act-replayed'))).toEqual(first);
     expect(live('booking').map((event) => event.id)).toEqual([first.booking]);
     expect(bookingFacts()).toHaveLength(1);
   });
 
   it('goes on the calendar main named for the thread, and refuses one the assistant cannot write to', async () => {
-    calendar.calendars.set('team@group.calendar.google.com', {
-      id: 'team@group.calendar.google.com',
-      accessRole: 'owner',
-      dataOwner: PRINCIPAL,
-      summary: 'Pat – work',
-    });
-    await setThreadBookingCalendar(threadA, 'team@group.calendar.google.com');
+    calendar.calendars.set(TEAM, { id: TEAM, accessRole: 'owner', dataOwner: PRINCIPAL, summary: 'Pat – work' });
+    await setThreadBookingCalendar(threadA, TEAM);
     data(await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] }));
-    expect(calendar.live('team@group.calendar.google.com')).toHaveLength(1);
+    expect(calendar.live(TEAM)).toHaveLength(1);
 
     calendar.calendars.set('shared@group.calendar.google.com', {
       id: 'shared@group.calendar.google.com',
@@ -703,6 +762,40 @@ describe('a booking moves and is cancelled only by its own thread (AE67)', () =>
     });
   });
 
+  it('refuses an event that lost its booking tag, for a move and for a cancellation', async () => {
+    const booked = data(
+      await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Intro', invitees: [REMY] }),
+    );
+    const [event] = live('booking');
+    calendar.put({ ...event, tags: { gwsEaThread: threadA } });
+    const writes = calendar.writes.length;
+
+    for (const [action, fields] of [
+      ['move_booking', { booking: booked.booking, start: THURSDAY_2PM }],
+      ['cancel_booking', { booking: booked.booking }],
+    ] as const) {
+      expect(refusal(await send(sessionA, action, fields))).toMatch(/no longer a booking this thread may change/u);
+    }
+    expect(calendar.writes).toHaveLength(writes);
+    expect(calendar.event(PRINCIPAL, event.id)).toMatchObject({
+      status: 'confirmed',
+      start: { dateTime: TUESDAY_10AM },
+    });
+  });
+
+  it('forgets a booking whose event was deleted from the calendar, refusing to move it', async () => {
+    const booked = data(
+      await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Intro', invitees: [REMY] }),
+    );
+    const [event] = live('booking');
+    calendar.put({ ...event, status: 'cancelled' });
+
+    expect(refusal(await send(sessionA, 'move_booking', { booking: booked.booking, start: THURSDAY_2PM }))).toMatch(
+      /no longer on the principal/u,
+    );
+    expect(await getDb().get('SELECT 1 FROM gws_ea_thread_bookings')).toBeUndefined();
+  });
+
   it('refuses to move into protected or busy time', async () => {
     const booked = data(
       await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Intro', invitees: [REMY] }),
@@ -730,6 +823,20 @@ describe('a booking moves and is cancelled only by its own thread (AE67)', () =>
     expect(refusal(await send(sessionA, 'cancel_booking', { booking: booked.booking }))).toMatch(
       /This thread has no booking/u,
     );
+  });
+
+  it('books the same time again, after a cancellation, as a new event', async () => {
+    const request = { start: TUESDAY_10AM, minutes: 30, title: 'Intro', invitees: [REMY] };
+    const first = data(await send(sessionA, 'book', request));
+    data(await send(sessionA, 'cancel_booking', { booking: first.booking }));
+
+    const second = data(await send(sessionA, 'book', request));
+    // Google keeps the cancelled event under its id: the new booking must not bring it back.
+    expect(second.booking).not.toBe(first.booking);
+    expect(calendar.events.map((event) => [event.id, event.status])).toEqual([
+      [first.booking, 'cancelled'],
+      [second.booking, 'confirmed'],
+    ]);
   });
 });
 

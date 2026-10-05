@@ -85,7 +85,7 @@ describe('the Calendar client', () => {
     expect(patch.body).toEqual({ location: 'Their office' });
   });
 
-  it("reads an event's Meet link as Google reports it, and a calendar's allowed conference types", async () => {
+  it("reads an event's Meet link as Google reports it, and a calendar's name and allowed conference types", async () => {
     const { api, requests } = stubGoogle((request) =>
       request.url.pathname.includes('/calendarList/')
         ? {
@@ -93,6 +93,7 @@ describe('the Calendar client', () => {
             body: {
               id: 'pat@principal.example',
               accessRole: 'owner',
+              summary: 'Pat – family',
               conferenceProperties: { allowedConferenceSolutionTypes: ['hangoutsMeet'] },
             },
           }
@@ -123,6 +124,8 @@ describe('the Calendar client', () => {
     );
     const entry = await api.getCalendar('pat@principal.example');
     expect(entry && allowsMeet(entry)).toBe(true);
+    // The privacy check reads the name invitees see on the invitation.
+    expect(entry?.summary).toBe('Pat – family');
     expect(allowsMeet({ id: 'family@group.calendar.google.com' })).toBe(false);
   });
 

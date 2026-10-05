@@ -230,8 +230,7 @@ describe("GWS-EA's guidance for main", () => {
     for (const tool of EXTERNAL_ONLY_TOOLS) expect(GUIDANCE).not.toContain(`\`${tool}\``);
   });
 
-  it("holds none of Slice 2's choreography, triage or fit-by-level rules, and no rule about being an AI", () => {
-    for (const rule of RETIRED_GUIDANCE) expect(GUIDANCE).not.toContain(rule);
+  it('holds no rule against answering invitations, and no rule about being an AI', () => {
     expect(GUIDANCE).not.toMatch(
       /\b(?:do not|don't|never)\s+(?:answer|respond to|accept or decline)\s+(?:an?\s+|any\s+)?invitations?\b/iu,
     );
@@ -242,7 +241,7 @@ describe("GWS-EA's guidance for main", () => {
     expect(GUIDANCE.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(1_800);
   });
 
-  it("teaches main its email and reminder tools, and none of external-email's", async () => {
+  it("teaches main its email and reminder tools, none of external-email's, and none of Slice 2's rules", async () => {
     const main = group('ag-main');
     await createGroup(main);
     await publishMain(main);
@@ -256,6 +255,7 @@ describe("GWS-EA's guidance for main", () => {
     expect(document).not.toContain('# NanoClaw Module: gws-ea-email-external');
     // Slice 2's meeting handoff is gone, its instructions with it.
     expect(document).not.toContain('# NanoClaw Module: gws-ea-meetings');
+    // Nor any rule of Slice 2's, in the guidance the document holds word for word or anywhere else in it.
     for (const retired of RETIRED_GUIDANCE) expect(document, retired).not.toContain(retired);
   });
 });

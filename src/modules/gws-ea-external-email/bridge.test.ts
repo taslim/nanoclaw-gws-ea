@@ -53,9 +53,8 @@ import { findSessionForAgent } from '../../db/sessions.js';
 import { getDeliveryAction } from '../../delivery.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { requestWake } from '../../request-wake.js';
-import { resolveSession, sessionDir } from '../../session-manager.js';
+import { resolveSession, sessionDir, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
-import { createDestination } from '../agent-to-agent/db/agent-destinations.js';
 import '../permissions/index.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
@@ -70,7 +69,6 @@ import { addPrivateValue, judgeThreadSend, type ThreadKey } from '../gws-ea-priv
 import { streamOf } from '../gws-ea-privacy/match.js';
 import { ensureInbox, ensurePrincipalConversation, INBOX_PLATFORM_ID } from '../gws-ea-inbox/index.js';
 import { emailMessagingGroupIds } from '../gws-ea-inbox/db.js';
-import { PACE_MAX_MS, PACE_MIN_MS } from '../gws-ea-inbox/pace.js';
 import { threadRecipients } from '../gws-ea-inbox/recipients.js';
 import {
   createThread,
@@ -93,6 +91,8 @@ const HOME = '12 Elm Road, Springfield';
 const PERSONAL_EMAIL = 'pat.home@personal.example';
 const TEAM_CALENDAR = 'team@group.calendar.google.com';
 const SHARED_CALENDAR = 'family@group.calendar.google.com';
+/** Jane's team calendar, which the assistant can write to and is not the principal's. */
+const PARTNER_CALENDAR = 'partner-team@group.calendar.google.com';
 
 let main: Session;
 let calendar: FakeCalendar;
@@ -170,6 +170,13 @@ function rows(session: Session): Row[] {
     .all() as Array<Omit<Row, 'content'> & { content: string }>;
   db.close();
   return found.map((row) => ({ ...row, content: JSON.parse(row.content) as Row['content'] }));
+}
+
+/** Lose a request's answer: the host stopped after doing the work and before it answered. */
+function dropAnswer(session: Session, requestId: string): void {
+  const db = new Database(inboundDbPath(session.agent_group_id, session.id));
+  db.prepare('DELETE FROM messages_in WHERE id = ?').run(`action-resp-${requestId}`);
+  db.close();
 }
 
 /** What a session's agent reads: every row but the host's answers to its requests. */
@@ -278,6 +285,7 @@ beforeEach(async () => {
   calendar.calendars.set(PRINCIPAL, { id: PRINCIPAL, accessRole: 'owner', summary: PRINCIPAL });
   calendar.calendars.set(TEAM_CALENDAR, { id: TEAM_CALENDAR, accessRole: 'writer', dataOwner: PRINCIPAL });
   calendar.calendars.set(SHARED_CALENDAR, { id: SHARED_CALENDAR, accessRole: 'reader', dataOwner: PRINCIPAL });
+  calendar.calendars.set(PARTNER_CALENDAR, { id: PARTNER_CALENDAR, accessRole: 'writer', dataOwner: JANE });
 });
 
 afterEach(async () => {
@@ -329,8 +337,8 @@ describe('email_handoff', () => {
     expect(text).toContain('America/New_York');
     // Worked at a human pace, like everything else that reaches the thread.
     const due = Date.parse(row.process_after ?? '');
-    expect(due).toBeGreaterThanOrEqual(before + PACE_MIN_MS);
-    expect(due).toBeLessThanOrEqual(after + PACE_MAX_MS);
+    expect(due).toBeGreaterThanOrEqual(before + 3 * 60_000);
+    expect(due).toBeLessThanOrEqual(after + 6 * 60_000);
     expect(data(frame).message).toContain(key);
   });
 
@@ -366,6 +374,24 @@ describe('email_handoff', () => {
     expect(rows(session)[0]).toMatchObject({ platform_id: INBOX_PLATFORM_ID, thread_id: key });
   });
 
+  it("joins main's words to the wait the thread's mail already set, so both are worked together", async () => {
+    const { key, session } = await inboundThread('g-coffee', JANE);
+    // Jane's email, routed a minute ago, waits out the thread's pace.
+    await writeSessionMessage(session.agent_group_id, session.id, {
+      id: 'jane-1',
+      kind: 'chat',
+      timestamp: now(),
+      content: JSON.stringify({ text: 'Is Tuesday good for Pat?' }),
+      processAfter: new Date(Date.now() + 4 * 60_000).toISOString(),
+      trigger: true,
+    });
+
+    data(await handoff({ thread_key: key, message: 'Pat prefers Tuesday.' }, undefined, 'act-joined'));
+
+    const waits = new Map(rows(session).map((row) => [row.id, row.process_after]));
+    expect(waits.get('handoff-act-joined')).toBe(waits.get('jane-1'));
+  });
+
   it('lets main name someone for a thread that exists, whom external-email may then include', async () => {
     const { key, session } = await inboundThread('g-coffee', JANE);
     await expect(threadRecipients(key, { to: [JANE], cc: [REMY] }, new Set([JUNO]))).rejects.toMatchObject({
@@ -395,7 +421,7 @@ describe('email_handoff', () => {
     expect(await externalEmailSessions()).toBe(0);
   });
 
-  it('refuses a private value in the message, a recipient, or a text file, tells main why, and hands nothing over', async () => {
+  it('refuses a private value in the message, a recipient, a text file, or a file’s name, tells main why, and hands nothing over', async () => {
     await addPrivateValue({ label: 'Personal email', kind: 'email', value: PERSONAL_EMAIL });
 
     const inMessage = await handoff({ to: [REMY], message: `Send the card to ${HOME}.` });
@@ -404,11 +430,19 @@ describe('email_handoff', () => {
       { to: [REMY], message: 'The notes are attached.', files: ['notes.txt'] },
       { 'notes.txt': Buffer.from(`Home: ${HOME}`) },
     );
+    // A file that is not text carries the value in its name alone.
+    const inFileName = await handoff(
+      { to: [REMY], message: 'The map is attached.', files: [`${HOME}.pdf`] },
+      { [`${HOME}.pdf`]: Buffer.from([0x25, 0x50, 0x44, 0x46, 0xff, 0x00, 0x9c]) },
+    );
 
     expect(refusal(inMessage)).toMatch(/private address/u);
     expect(refusal(inRecipient)).toMatch(/private email address/u);
     expect(refusal(inFile)).toMatch(/private address/u);
-    for (const answer of [inMessage, inRecipient, inFile]) expect(refusal(answer)).not.toMatch(/Elm|personal/u);
+    expect(refusal(inFileName)).toMatch(/private address/u);
+    for (const answer of [inMessage, inRecipient, inFile, inFileName]) {
+      expect(refusal(answer)).not.toMatch(/Elm|personal/u);
+    }
 
     expect(await count('gws_ea_threads')).toBe(0);
     expect(await count('gws_ea_thread_files')).toBe(0);
@@ -484,7 +518,7 @@ describe('email_handoff', () => {
     const key = keyOf(await handoff({ to: [REMY], message: 'Book the team sync.', calendar: TEAM_CALENDAR }));
     expect(await getThreadBookingCalendar(key)).toBe(TEAM_CALENDAR);
 
-    for (const calendarId of [SHARED_CALENDAR, 'someone@else.example']) {
+    for (const calendarId of [SHARED_CALENDAR, PARTNER_CALENDAR, 'someone@else.example']) {
       expect(refusal(await handoff({ to: [JANE], message: 'Book it.', calendar: calendarId }))).toMatch(
         /principal's calendars the assistant can write to/u,
       );
@@ -493,13 +527,17 @@ describe('email_handoff', () => {
   });
 
   it('writes nothing twice when a request is replayed', async () => {
-    const fields = { to: [REMY], message: 'Find 30 minutes with Remy.' };
-    const first = await handoff(fields, {}, 'act-replayed');
-    // The host stopped before delivery recorded the request, so it comes round again.
-    const replayed = await handoff(fields, {}, 'act-replayed');
+    const fields = { to: [REMY], message: 'Find 30 minutes with Remy.', files: ['notes.txt'] };
+    const staged = { 'notes.txt': Buffer.from('Agenda: the lease, then lunch.') };
+    const first = await handoff(fields, staged, 'act-replayed');
+    // The host stopped before it answered, its files still staged, so the
+    // request comes round again and the replay's own answer is the one read.
+    dropAnswer(main, 'act-replayed');
+    const replayed = await handoff(fields, staged, 'act-replayed');
 
     expect(replayed).toEqual(first);
     expect(await count('gws_ea_threads')).toBe(1);
+    expect(await count('gws_ea_thread_files')).toBe(1);
     expect(await externalEmailSessions()).toBe(1);
     expect(texts(await requireThreadSession(keyOf(first)))).toHaveLength(1);
   });
@@ -551,6 +589,23 @@ describe('tell_main', () => {
     expect(framed).toMatch(/asks whether Pat eats fish\.\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id="[0-9a-f]+">>>$/u);
     expect(vi.mocked(requestWake).mock.calls.map(([woken]) => woken.id)).toEqual([main.id]);
   });
+
+  it('writes one note and wakes main once when a request is replayed', async () => {
+    const { session } = await inboundThread('g-lunch', REMY);
+    const fields = { message: 'Remy asks whether Pat eats fish.' };
+
+    const first = await request(session, 'tell_main', fields, {}, 'act-told');
+    // The host stopped before it answered, so the request comes round again.
+    dropAnswer(session, 'act-told');
+    const replayed = await request(session, 'tell_main', fields, {}, 'act-told');
+
+    expect(replayed).toEqual(first);
+    const notes = rows(main).filter(
+      (row) => (row.content.note as { type?: string } | undefined)?.type === 'gws-ea-external-email.tell-main',
+    );
+    expect(notes).toHaveLength(1);
+    expect(vi.mocked(requestWake).mock.calls.map(([woken]) => woken.id)).toEqual([main.id]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -560,32 +615,28 @@ describe('tell_main', () => {
 describe('the bridge', () => {
   it('takes handoffs only from main, and word back only from external-email’s own thread sessions', async () => {
     const { session } = await inboundThread('g-coffee', JANE);
+    await createAgentGroup({
+      id: 'ag-research',
+      name: 'research',
+      folder: 'research',
+      agent_provider: null,
+      created_at: now(),
+    });
+    const { session: research } = await resolveSession('ag-research', null, null, 'agent-shared');
 
-    expect(refusal(await request(session, 'email_handoff', { to: [REMY], message: 'Write to Remy.' }))).toMatch(
-      /Only main/u,
-    );
-    expect(refusal(await request(main, 'tell_main', { message: 'Hello.' }))).toMatch(/Only external-email/u);
+    for (const caller of [session, research]) {
+      expect(refusal(await request(caller, 'email_handoff', { to: [REMY], message: 'Write to Remy.' }))).toMatch(
+        /Only main/u,
+      );
+    }
+    for (const caller of [main, research]) {
+      expect(refusal(await request(caller, 'tell_main', { message: 'Hello.' }))).toMatch(/Only external-email/u);
+    }
     const { session: noThread } = await resolveSession('ag-external', inbox, 'mail-not-a-thread', 'per-thread');
     expect(refusal(await request(noThread, 'tell_main', { message: 'Hello.' }))).toMatch(/not an email thread/u);
 
+    expect(await count('gws_ea_threads')).toBe(1);
     expect(await count('gws_ea_thread_addresses')).toBe(1);
     expect(texts(main)).toEqual([]);
-  });
-
-  it('still refuses raw destinations between main and external-email', async () => {
-    for (const [owner, target] of [
-      ['ag-main', 'ag-external'],
-      ['ag-external', 'ag-main'],
-    ] as const) {
-      await expect(
-        createDestination({
-          agent_group_id: owner,
-          local_name: 'other-half',
-          target_type: 'agent',
-          target_id: target,
-          created_at: now(),
-        }),
-      ).rejects.toThrow(/joins main and external-email/u);
-    }
   });
 });

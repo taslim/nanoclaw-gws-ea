@@ -23,9 +23,9 @@ import { isReminderId } from '../gws-ea-reminders/index.js';
 import { emailMessagingGroupIds } from './db.js';
 
 /** The shortest wait for an outside thread's first unanswered message. */
-export const PACE_MIN_MS = 3 * 60_000;
+const PACE_MIN_MS = 3 * 60_000;
 /** The longest. */
-export const PACE_MAX_MS = 6 * 60_000;
+const PACE_MAX_MS = 6 * 60_000;
 
 /**
  * When a row written now into `session` is to be read: the outside thread's

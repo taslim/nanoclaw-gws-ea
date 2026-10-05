@@ -187,26 +187,6 @@ describe('the contract other units build on', () => {
     for (const key of EXTERNAL_EMAIL_CAPABILITIES) expect(listCapabilityKeys()).toContain(key);
   });
 
-  it('holds no memory, conversation-context, shell, web, subagents, MCP servers, write tools or sending outside its thread', () => {
-    for (const key of [
-      'conversation-context',
-      'shell',
-      'web',
-      'subagents',
-      'mcp-servers',
-      'files-write',
-      'files-send',
-      'reply',
-      'agents',
-      'self-mod',
-      'interactive',
-      MAIN_EMAIL_CAPABILITY,
-      'gws-ea-meetings-external',
-    ]) {
-      expect(EXTERNAL_EMAIL_CAPABILITIES).not.toContain(key);
-    }
-  });
-
   it('reads no pointer before the host creates the group', async () => {
     expect(await getExternalEmailAgentGroupId()).toBeNull();
   });

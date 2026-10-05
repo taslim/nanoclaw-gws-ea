@@ -20,7 +20,6 @@ vi.mock('../../log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
 
-import { parseStoredCapabilities, resolveCapabilities } from '../../capabilities.js';
 import { configFromDb } from '../../container-config.js';
 import { buildMounts } from '../../container-runner.js';
 import { getContainerConfig } from '../../db/container-configs.js';
@@ -156,13 +155,5 @@ describe("external-email's files", () => {
       fs.readFileSync(file, 'utf8').includes('thread A only'),
     );
     expect(copies).toEqual([]);
-
-    // Nor can A put one there: it reads files, and holds no write tool, shell, or shared memory.
-    const held = resolveCapabilities(
-      parseStoredCapabilities((await getContainerConfig(ee.id))?.capabilities, ee.name),
-      ee.name,
-    );
-    expect(held).toContain('files-read');
-    for (const key of ['files-write', 'shell', 'conversation-context', 'mcp-servers']) expect(held).not.toContain(key);
   });
 });

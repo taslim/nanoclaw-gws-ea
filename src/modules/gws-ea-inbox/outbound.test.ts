@@ -482,8 +482,8 @@ function refusalOf(frame: ResponseFrame): string {
   return frame.error.message;
 }
 
-/** Hand a file over for a thread, as main's handoff records it: the host's copy, by its SHA-256. */
-async function handFile(threadKey: string, name: string, data: Buffer): Promise<void> {
+/** Hand a file over for a thread, as main's handoff records it: the host's copy, by its SHA-256; returns its path. */
+async function handFile(threadKey: string, name: string, data: Buffer): Promise<string> {
   const hostPath = path.join(TEST_DIR, 'handed', threadKey, name);
   fs.mkdirSync(path.dirname(hostPath), { recursive: true });
   fs.writeFileSync(hostPath, data);
@@ -495,6 +495,7 @@ async function handFile(threadKey: string, name: string, data: Buffer): Promise<
     hostPath,
     now(),
   );
+  return hostPath;
 }
 
 beforeEach(async () => {
@@ -627,6 +628,14 @@ describe("external-email's reply", () => {
     });
   });
 
+  it('quotes the message it answers whole, a private value its writer put there included', async () => {
+    const { key, session } = await arrives({ threadId: 'g-1', from: SAM, body: `Is Pat still at ${HOME}?` });
+    // The check reads what the assistant wrote; the quote shows its readers only what they already received.
+    const id = await reply(session, key, 'Pat will be in touch about that.');
+    expect(deliveryStatus(session, id)).toBe('delivered');
+    expect(gmail.sent[0].text).toContain(`> Is Pat still at ${HOME}?`);
+  });
+
   it('goes exactly once when Gmail took it before the host stopped', async () => {
     const { key, session } = await arrives({ threadId: 'g-1', from: SAM, body: 'Next week?' });
     gmail.sendFailures.push({ accepted: true });
@@ -722,6 +731,9 @@ describe('email_send from external-email', () => {
     expect(stranger).toContain(STRANGER);
     expect(stranger).toMatch(/main/u);
     expect(refusalOf(await emailSend(session, { to: [JUNO], text: 'A note to myself.' }))).toMatch(/assistant/u);
+    expect(refusalOf(await emailSend(session, { to: [], cc: [JANE], text: 'Jane, Pat is free Tuesday.' }))).toMatch(
+      /someone on To/u,
+    );
     expect(refusalOf(await emailSend(session, { thread_key: key, text: 'Hello.' }))).toMatch(/own thread/u);
     expect(gmail.sent).toHaveLength(2);
   });
@@ -741,7 +753,7 @@ describe('email_send from external-email', () => {
   it('attaches only a file main handed over for this thread, as the host holds it (KTD9)', async () => {
     const { key, session } = await handedOver([REMY]);
     const quote = Buffer.from('%PDF-1.4 the quote');
-    await handFile(key, 'Acme quote.pdf', quote);
+    const hostCopy = await handFile(key, 'Acme quote.pdf', quote);
     const elsewhere = await handedOver([REMY]);
     await handFile(elsewhere.key, 'Other.pdf', Buffer.from('another thread'));
 
@@ -755,6 +767,12 @@ describe('email_send from external-email', () => {
         /not a file main handed over/u,
       );
     }
+
+    // The checks read the bytes main handed over, so a host copy changed since then never goes.
+    fs.writeFileSync(hostCopy, 'a different file');
+    expect(refusalOf(await emailSend(session, { text: 'Attached again.' }, { 'quote.pdf': quote }))).toMatch(
+      /changed after main handed it over/u,
+    );
     expect(gmail.sent).toHaveLength(1);
   });
 
@@ -907,6 +925,27 @@ describe('every email to outsiders', () => {
     await send(thread, { text: 'Tuesday at 10 works.' });
     expect(gmail.sent).toHaveLength(1);
     expect([...gmail.sent[0].to, ...gmail.sent[0].cc].sort()).toEqual([JANE, SAM].sort());
+  });
+
+  it('counts everyone on Cc in the private-values check, when the principal alone is on To', async () => {
+    const { key, session } = await arrives({
+      threadId: 'g-1',
+      from: `Pat <${PRINCIPAL}>`,
+      principal: true,
+      cc: [SAM],
+      body: 'Juno, please find Sam and me a time.',
+    });
+
+    await reply(session, key, `Come by ${HOME} at noon.`);
+    expect(refusals(session)).toEqual([expect.stringMatching(/private address/u)]);
+    expect(refusalOf(await emailSend(session, { to: [PRINCIPAL], cc: [SAM], text: `Come by ${HOME}.` }))).toMatch(
+      /private address/u,
+    );
+    expect(gmail.sent).toEqual([]);
+
+    // Replying to all put the principal alone on To, and Sam on Cc.
+    await reply(session, key, 'Tuesday at 10 works.');
+    expect(gmail.sent.map((sent) => [sent.to, sent.cc])).toEqual([[[PRINCIPAL], [SAM]]]);
   });
 
   it('starting a thread passes both guards too', async () => {

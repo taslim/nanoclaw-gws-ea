@@ -82,6 +82,13 @@ describe('resolving a message to its thread', () => {
       references: ['<old@acme.test>', '<new@acme.test>'],
     });
     expect(found?.threadKey).toBe(newer.threadKey);
+    // With no In-Reply-To, References count from the newest back.
+    const byReferences = await findThreadFor({
+      gmailThreadId: 'g-split',
+      inReplyTo: [],
+      references: ['<old@acme.test>', '<new@acme.test>'],
+    });
+    expect(byReferences?.threadKey).toBe(newer.threadKey);
   });
 
   it('records a message once, however often it is recorded', async () => {

@@ -221,19 +221,6 @@ describe('the email tools', () => {
       expect(words, tool.tool.name).toBeLessThan(60);
     }
   });
-
-  it("gives main email_principal, which names the principal's thread, and external-email email_send for its own", () => {
-    expect(emailToPrincipal.tool.name).toBe('email_principal');
-    expect(emailSend.tool.name).toBe('email_send');
-    expect(Object.keys(emailToPrincipal.tool.inputSchema.properties ?? {}).sort()).toEqual(['text', 'thread_key']);
-    expect(Object.keys(emailSend.tool.inputSchema.properties ?? {}).sort()).toEqual([
-      'cc',
-      'files',
-      'subject',
-      'text',
-      'to',
-    ]);
-  });
 });
 
 describe('files that go with a request', () => {
@@ -241,6 +228,8 @@ describe('files that go with a request', () => {
   // writes there are recorded, and the files named are real ones.
   let dir: string;
   let copies: Array<[string, string]>;
+  /** How many requests had been sent as each file was copied. */
+  let sentAtCopy: number[];
   let made: string[];
   let spies: Array<{ mockRestore(): void }>;
 
@@ -251,6 +240,7 @@ describe('files that go with a request', () => {
     fs.writeFileSync(path.join(dir, 'other', 'deck.pdf'), 'another deck');
     fs.writeFileSync(path.join(dir, 'notes.txt'), 'notes');
     copies = [];
+    sentAtCopy = [];
     made = [];
     spies = [
       spyOn(fs, 'mkdirSync').mockImplementation(((target: fs.PathLike) => {
@@ -259,6 +249,7 @@ describe('files that go with a request', () => {
       }) as typeof fs.mkdirSync),
       spyOn(fs, 'copyFileSync').mockImplementation((src, dest) => {
         copies.push([String(src), String(dest)]);
+        sentAtCopy.push(getUndeliveredMessages().length);
       }),
     ];
   });
@@ -281,19 +272,43 @@ describe('files that go with a request', () => {
       [path.join(dir, 'deck.pdf'), path.join(outbox, 'deck.pdf')],
       [path.join(dir, 'notes.txt'), path.join(outbox, 'notes.txt')],
     ]);
+    expect(sentAtCopy).toEqual([0, 0]);
 
     closeSessionDb();
     initTestSessionDb();
     copies = [];
+    sentAtCopy = [];
     const sent = await call(emailSend, { text: 'Here is the deck.', files: [path.join(dir, 'deck.pdf')] });
     expect(sent.request.files).toEqual(['deck.pdf']);
     expect(copies).toEqual([
       [path.join(dir, 'deck.pdf'), path.join('/workspace/outbox', String(sent.request.requestId), 'deck.pdf')],
     ]);
+    expect(sentAtCopy).toEqual([0]);
   });
 
-  it('stage nothing and send nothing when a file is missing, is not a file, or shares another’s name', async () => {
+  it('named by a relative path are found under /workspace/agent', async () => {
+    // /workspace/agent too exists only in a container, so its files are looked up in dir.
+    const statSync = fs.statSync;
+    const workspace = '/workspace/agent/';
+    spies.push(
+      spyOn(fs, 'statSync').mockImplementation(((target: fs.PathLike) => {
+        const file = String(target);
+        const local = file.startsWith(workspace) ? path.join(dir, file.slice(workspace.length)) : file;
+        return statSync(local, { throwIfNoEntry: false });
+      }) as typeof fs.statSync),
+    );
+
+    await emailSend.handler({ text: 'Here is the deck.', files: ['deck.pdf'] }, { signal: AbortSignal.timeout(100) });
+    expect(copies.map(([source]) => source)).toEqual(['/workspace/agent/deck.pdf']);
+    expect(getUndeliveredMessages()).toHaveLength(1);
+  });
+
+  it('stage nothing and send nothing when there are over 10 files, or a file is missing, is not a file, or shares another’s name', async () => {
+    // Eleven real files, so only their number can refuse them.
+    const eleven = Array.from({ length: 11 }, (_, index) => path.join(dir, `page-${index + 1}.pdf`));
+    for (const file of eleven) fs.writeFileSync(file, 'page');
     const cases: Array<[McpToolDefinition, Record<string, unknown>, RegExp]> = [
+      [emailSend, { text: 'Pages attached.', files: eleven }, /files must list up to 10 file paths/],
       [emailSend, { text: 'Deck attached.', files: [path.join(dir, 'missing.pdf')] }, /No file at .*missing\.pdf/],
       [emailSend, { text: 'Deck attached.', files: [path.join(dir, 'other')] }, /No file at .*other/],
       [

@@ -152,6 +152,10 @@ describe('a forward, as each mail client writes it', () => {
 });
 
 describe('a Gmail message', () => {
+  it("decodes a header's encoded words, Q or B, in the charset each names, joining adjacent ones", () => {
+    expect(decodeEncodedWords('=?ISO-8859-1?Q?Caf=E9_cr=E8me?= =?UTF-8?B?IMOg?=')).toBe('Café crème à');
+  });
+
   it('reads its headers, addresses, plain text, and the files it carries', () => {
     const mail = parseGmailMessage({
       id: 'm1',
@@ -290,7 +294,7 @@ describe('an email', () => {
   it('encodes a non-ASCII subject, keeps a new thread\'s subject as chosen, and adds "Re:" to a reply once', () => {
     const subject = (raw: string) => decodeEncodedWords(field(entityOf(raw), 'Subject') ?? '');
     const started = buildMime(mail);
-    expect(field(entityOf(started), 'Subject')).toMatch(/^=\?UTF-8\?B\?/u);
+    expect(field(entityOf(started), 'Subject')).toBe('=?UTF-8?B?Q2Fmw6kgcGxhbnM=?=');
     expect(subject(started)).toBe('Café plans');
     expect(started).not.toMatch(/^In-Reply-To:/imu);
 
@@ -314,10 +318,13 @@ describe('an email', () => {
     };
     const raw = buildMime(long);
     for (const line of raw.split('\r\n')) expect(line.length).toBeLessThanOrEqual(76);
+    // Seven-bit on the wire: every other byte travels encoded.
+    expect(raw).toMatch(/^[\t\r\n\x20-\x7e]*$/u);
 
     const message = entityOf(raw);
     const [text, html] = partsOf(message);
     expect(decodeQuotedPrintable(text.body)).toBe(paragraph);
+    expect(text.body).toContain('caf=C3=A9');
     expect(decodeQuotedPrintable(html.body)).toBe(long.html.replace(/\n/gu, '\r\n'));
     expect(decodeEncodedWords(field(message, 'Subject') ?? '')).toBe(`Re: ${long.subject}`);
     expect(field(message, 'References')).toBe(long.references.join(' '));
