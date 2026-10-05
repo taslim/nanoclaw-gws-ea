@@ -75,7 +75,7 @@ import { gwsEaInboxEmailChannelMigration, MOVED_EXTERNAL_EMAIL_CAPABILITIES } fr
 import { sendToOutside } from './outbound.js';
 import type { InboxRuntime } from './runtime.js';
 import { sendExactlyOnce, sendKey } from './send.js';
-import { findThreadFor } from './thread-map.js';
+import { findThreadFor, threadMessages } from './thread-map.js';
 
 /** The banned constructs of `src/db/migrations/portability.test.ts`, which covers built-in migrations only. */
 const BANNED_PORTABLE_SQL = [
@@ -145,6 +145,7 @@ const MOVED = 'mail-reschedule-r';
 const GONE = 'mail-gone-g';
 const INBOUND = 'mail-inbound-c';
 const COPY_IN = 'mail-copy-d';
+const TAKEN = 'mail-copy-taken-e';
 
 // ---------------------------------------------------------------------------
 // A database the earlier release wrote
@@ -274,9 +275,9 @@ const PENDING_WORDS = { text: 'Shall I send an invitation?' };
 /**
  * An earlier release's in-flight work: a thread offering held times, a booked
  * one, a reschedule of the principal's own event, holds for a thread its
- * inbox no longer has, an inbound thread with mail held for `main`, and a
+ * inbox no longer has, an inbound thread with mail held for `main`, a
  * thread the principal copied the assistant into that `main` has not taken
- * over yet.
+ * over yet, and one it has.
  */
 async function seedEarlierWork(): Promise<void> {
   await earlierThread(OFFERED, {
@@ -398,6 +399,31 @@ async function seedEarlierWork(): Promise<void> {
     attempts: 0,
     first_seen_at: '2026-10-04T21:00:00.000Z',
     settled_at: '2026-10-04T21:00:00.000Z',
+  });
+
+  // A copy-in main already took over: the principal's message there was handled, and stays settled.
+  await earlierThread(TAKEN, {
+    origin: 'copy-in',
+    state: 'open',
+    gmailThreadId: 'gt-e',
+    to: [' Remy@Friends.example '],
+    cc: [PRINCIPAL],
+  });
+  await insert('gws_ea_inbox_principal_messages', {
+    gmail_message_id: 'g-e1',
+    address: PRINCIPAL,
+    gmail_thread_id: 'gt-e',
+    rfc_message_id: '<e1@northwind.example>',
+    reference_ids: '[]',
+    subject: 'Remy, meet Juno',
+    received_at: '2026-10-03T21:00:00.000Z',
+  });
+  await insert('gws_ea_inbox_messages', {
+    gmail_message_id: 'g-e1',
+    outcome: 'copy-in',
+    attempts: 0,
+    first_seen_at: '2026-10-03T21:00:00.000Z',
+    settled_at: '2026-10-03T21:00:00.000Z',
   });
 }
 
@@ -593,6 +619,7 @@ describe("moving an earlier release's work", () => {
     ).toEqual([
       { thread_key: BOOKED, gmail_thread_id: 'gt-b', booking_calendar_id: PRINCIPAL },
       { thread_key: COPY_IN, gmail_thread_id: 'gt-d', booking_calendar_id: null },
+      { thread_key: TAKEN, gmail_thread_id: 'gt-e', booking_calendar_id: null },
       // Holds whose thread the earlier inbox no longer had keep a bare thread, so the sweep still finds them.
       { thread_key: GONE, gmail_thread_id: null, booking_calendar_id: PRINCIPAL },
       { thread_key: INBOUND, gmail_thread_id: 'gt-c', booking_calendar_id: null },
@@ -610,7 +637,7 @@ describe("moving an earlier release's work", () => {
       { position: 2, side: 'outside', gmail_message_id: null, rfc_message_id: '<a2@friends.example>' },
       // The assistant's email Gmail took keeps Gmail's id, so a reply can answer it.
       { position: 3, side: 'outside', gmail_message_id: 'g-a3', rfc_message_id: '<a3@northwind.example>' },
-      { position: 4, side: 'outside', gmail_message_id: null, rfc_message_id: '<a4@northwind.example>' },
+      // The send still in flight is known by its send's record alone, as a new send is.
     ]);
     // main named the people of a thread it started; everyone else came on a message.
     expect(
@@ -619,6 +646,9 @@ describe("moving an earlier release's work", () => {
       { thread_key: BOOKED, address: REMY, source: 'main' },
       { thread_key: COPY_IN, address: PRINCIPAL, source: 'message' },
       { thread_key: COPY_IN, address: REMY, source: 'message' },
+      // An address as the earlier inbox stored it, written once in the form every check compares.
+      { thread_key: TAKEN, address: PRINCIPAL, source: 'message' },
+      { thread_key: TAKEN, address: REMY, source: 'message' },
       { thread_key: INBOUND, address: SAM, source: 'message' },
       { thread_key: OFFERED, address: PRINCIPAL, source: 'main' },
       { thread_key: OFFERED, address: REMY, source: 'main' },
@@ -732,6 +762,11 @@ describe("moving an earlier release's work", () => {
       (await findThreadFor({ gmailThreadId: 'gt-new', inReplyTo: ['<a3@northwind.example>'], references: [] }))
         ?.threadKey,
     ).toBe(OFFERED);
+    // A reply to the send still in flight resolves by the send's record.
+    expect(
+      (await findThreadFor({ gmailThreadId: 'gt-new', inReplyTo: ['<a4@northwind.example>'], references: [] }))
+        ?.threadKey,
+    ).toBe(OFFERED);
     const { session, created } = await resolveSession('ag-external', 'mg-inbox', OFFERED, 'per-thread');
     expect({ id: session.id, created }).toEqual({ id: offered.id, created: false });
   });
@@ -774,6 +809,12 @@ describe("moving an earlier release's work", () => {
     expect(prepare).not.toHaveBeenCalled();
     expect(await sendExactlyOnce(runtime, scope, sendKey(OFFERED, PENDING_WORDS), prepare)).toBe('g-a4');
     expect(sent).toEqual([]);
+    // Recorded once, now that Gmail holds it.
+    expect(
+      (await threadMessages(OFFERED, 'outside')).filter((message) => message.rfcMessageId === '<a4@northwind.example>'),
+    ).toEqual([
+      { threadKey: OFFERED, side: 'outside', gmailMessageId: 'g-a4', rfcMessageId: '<a4@northwind.example>' },
+    ]);
   });
 
   it('answers a converted thread’s latest message, known only by its Message-ID, in its Gmail thread', async () => {
@@ -882,26 +923,79 @@ describe("the conversion's guards", () => {
     ]);
   });
 
-  it('throws on a row it cannot carry over, and changes nothing', async () => {
+  it.each<[string, string, Record<string, unknown>, RegExp]>([
+    [
+      'a message',
+      'gws_ea_inbox_thread_messages',
+      {
+        rfc_message_id: '<orphan@acme.example>',
+        thread_key: 'mail-vanished',
+        position: 1,
+        added_at: '2026-10-02T12:00:00.000Z',
+      },
+      /thread messages/u,
+    ],
+    [
+      'a hold',
+      'gws_ea_meeting_holds',
+      {
+        meeting_id: 'mtg-vanished',
+        slot_id: 'slot-00000000000f',
+        calendar_id: PRINCIPAL,
+        event_id: 'hold-vanished',
+        start_at: HELD_START,
+        end_at: HELD_END,
+        held_at: '2026-10-02T09:00:00.000Z',
+      },
+      /holds/u,
+    ],
+    [
+      'a booking',
+      'gws_ea_meeting_bookings',
+      {
+        meeting_id: 'mtg-vanished',
+        calendar_id: PRINCIPAL,
+        event_id: 'booked-vanished',
+        start_at: '2026-10-09T09:00:00.000Z',
+        end_at: '2026-10-09T09:30:00.000Z',
+        booked_at: '2026-10-03T09:00:00.000Z',
+        invitation: null,
+      },
+      /bookings/u,
+    ],
+    [
+      'a send in flight',
+      'gws_ea_inbox_sends',
+      {
+        id: 'send-vanished',
+        thread_key: 'mail-vanished',
+        principal_message_id: null,
+        content_hash: 'vanished-hash',
+        rfc_message_id: '<vanished@northwind.example>',
+        state: 'pending',
+        gmail_message_id: null,
+        created_at: '2026-10-04T09:00:00.000Z',
+        updated_at: '2026-10-04T09:00:00.000Z',
+      },
+      /sends in flight/u,
+    ],
+  ])('throws on %s it cannot carry over, and changes nothing', async (_what, table, orphan, reason) => {
     await seedEarlierWork();
-    // A message whose thread is gone: a live database can carry such an orphan.
+    // A row whose thread or meeting is gone: a live database can carry such an orphan.
     const raw = sqliteRaw(getDb());
     raw.pragma('foreign_keys = OFF');
-    await insert('gws_ea_inbox_thread_messages', {
-      rfc_message_id: '<orphan@acme.example>',
-      thread_key: 'mail-vanished',
-      position: 1,
-      added_at: '2026-10-02T12:00:00.000Z',
-    });
+    await insert(table, orphan);
     raw.pragma('foreign_keys = ON');
 
-    await expect(runMigrations(getDb())).rejects.toThrow(/thread messages/u);
+    await expect(runMigrations(getDb())).rejects.toThrow(reason);
 
     const db = getDb();
     expect(await db.get('SELECT name FROM schema_version WHERE name = ?', EMAIL_CHANNEL)).toBeUndefined();
     for (const table of THREAD_TABLES) expect(await db.hasTable(table), table).toBe(false);
     for (const table of EARLIER_TABLES) expect(await db.hasTable(table), table).toBe(true);
-    expect(await db.get('SELECT COUNT(*) AS count FROM gws_ea_inbox_sends')).toEqual({ count: 3 });
+    expect(await db.get('SELECT COUNT(*) AS count FROM gws_ea_inbox_sends')).toEqual({
+      count: table === 'gws_ea_inbox_sends' ? 4 : 3,
+    });
     expect(JSON.parse((await getContainerConfig('ag-external'))?.capabilities ?? 'null')).toEqual([
       'reply',
       'time',

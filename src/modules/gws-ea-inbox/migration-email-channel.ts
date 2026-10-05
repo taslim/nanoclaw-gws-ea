@@ -211,7 +211,12 @@ async function bookingCalendars(db: DbDriver): Promise<Map<string, string>> {
   );
 }
 
-/** Each thread, with its Message-IDs, its people, and the calendar `main` named for it. */
+/**
+ * Each thread, with its Message-IDs, its people, and the calendar `main`
+ * named for it. A send still in flight keeps its Message-ID in its send's
+ * record alone, as a new send does, so delivery records its message once,
+ * when Gmail holds it.
+ */
 async function convertThreads(db: DbDriver, calendars: ReadonlyMap<string, string>): Promise<void> {
   const threads = await db.all<EarlierThread>(
     `SELECT thread_key, origin, gmail_thread_id, people_to, people_cc, people_bcc, vouched_people, created_at
@@ -252,6 +257,13 @@ async function convertThreads(db: DbDriver, calendars: ReadonlyMap<string, strin
       )
     ).map((row) => [`${row.thread_key}\u0000${row.rfc_message_id}`, row.gmail_message_id]),
   );
+  const inFlight = new Set(
+    (
+      await db.all<{ thread_key: string; rfc_message_id: string }>(
+        `SELECT thread_key, rfc_message_id FROM gws_ea_inbox_sends WHERE thread_key IS NOT NULL AND state = 'pending'`,
+      )
+    ).map((row) => `${row.thread_key}\u0000${row.rfc_message_id}`),
+  );
   const converted = new Set(threads.map((thread) => thread.thread_key));
   const positions = new Map<string, number>();
   for (const message of await db.all<{ thread_key: string; rfc_message_id: string; added_at: string }>(
@@ -259,6 +271,7 @@ async function convertThreads(db: DbDriver, calendars: ReadonlyMap<string, strin
       ORDER BY thread_key, position, added_at, rfc_message_id`,
   )) {
     if (!converted.has(message.thread_key)) continue;
+    if (inFlight.has(`${message.thread_key}\u0000${message.rfc_message_id}`)) continue;
     const position = (positions.get(message.thread_key) ?? 0) + 1;
     positions.set(message.thread_key, position);
     await db.run(
@@ -424,6 +437,14 @@ async function moveExternalEmailCapabilities(db: DbDriver, at: Date): Promise<vo
   );
 }
 
+/** An earlier thread message that is a send in flight, which only the send's record carries over. */
+const IN_FLIGHT_MESSAGE = `WHERE EXISTS (
+  SELECT 1 FROM gws_ea_inbox_sends s
+   WHERE s.thread_key = gws_ea_inbox_thread_messages.thread_key
+     AND s.rfc_message_id = gws_ea_inbox_thread_messages.rfc_message_id
+     AND s.state = 'pending'
+)`;
+
 async function count(db: DbDriver, table: string, where = ''): Promise<number> {
   return (await db.get<{ count: number }>(`SELECT COUNT(*) AS count FROM ${table} ${where}`))?.count ?? 0;
 }
@@ -437,7 +458,12 @@ async function count(db: DbDriver, table: string, where = ''): Promise<number> {
 async function checkCounts(db: DbDriver, bareThreads: number): Promise<void> {
   const checks: ReadonlyArray<readonly [string, number, number]> = [
     ['threads', await count(db, 'gws_ea_threads'), (await count(db, 'gws_ea_inbox_threads')) + bareThreads],
-    ['thread messages', await count(db, 'gws_ea_thread_messages'), await count(db, 'gws_ea_inbox_thread_messages')],
+    [
+      'thread messages',
+      await count(db, 'gws_ea_thread_messages'),
+      (await count(db, 'gws_ea_inbox_thread_messages')) -
+        (await count(db, 'gws_ea_inbox_thread_messages', IN_FLIGHT_MESSAGE)),
+    ],
     ['holds', await count(db, 'gws_ea_thread_holds'), await count(db, 'gws_ea_meeting_holds')],
     [
       'bookings',
