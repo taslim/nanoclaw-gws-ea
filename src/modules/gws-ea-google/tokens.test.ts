@@ -5,7 +5,7 @@ import { GOOGLE_TOKEN_ENDPOINT, GoogleGrantRevokedError, GoogleTokenError, mintS
 
 const GRANT: GoogleGrant = {
   schema_version: 1,
-  account: 'robin@example.test',
+  account: 'juno@example.test',
   client_id: 'client.apps.googleusercontent.com',
   client_secret: 'GOCSPX-client-secret',
   refresh_token: '1//refresh-token',

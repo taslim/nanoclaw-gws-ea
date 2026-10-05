@@ -1,7 +1,7 @@
 /**
  * Failure notices reach only the principal, in their direct message (R38),
  * and only for main's own conversations: a failure in external-email's is
- * the meetings module's to report to main.
+ * the external-email module's to report to main.
  *
  * Drives the real core paths that report a failure (delivery, reconcile, and
  * the runner's `turn_failed` action) with this module registered on their

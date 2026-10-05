@@ -111,7 +111,7 @@ function google(answer: { email?: string; verified?: boolean; scope?: string; re
     }
     if (url === GOOGLE_USERINFO_ENDPOINT) {
       expect(new Headers(init?.headers).get('authorization')).toBe('Bearer ya29.sign-in');
-      return json({ email: answer.email ?? 'Robin@Example.test', email_verified: answer.verified ?? true });
+      return json({ email: answer.email ?? 'Juno@Example.test', email_verified: answer.verified ?? true });
     }
     return json({}, 404);
   }) as unknown as typeof globalThis.fetch;
@@ -138,7 +138,7 @@ describe('signing in as the assistant', () => {
 
     const grant = await signInAsAssistant({
       client: CLIENT,
-      account: 'robin@example.test',
+      account: 'juno@example.test',
       present: b.present,
       fetch: g.fetch,
       now: () => Date.parse('2026-09-30T12:00:00.000Z'),
@@ -151,7 +151,7 @@ describe('signing in as the assistant', () => {
     expect(auth.searchParams.get('scope')).toBe(GOOGLE_SIGN_IN_SCOPES.join(' '));
     expect(auth.searchParams.get('access_type')).toBe('offline');
     expect(auth.searchParams.get('prompt')).toBe('consent');
-    expect(auth.searchParams.get('login_hint')).toBe('robin@example.test');
+    expect(auth.searchParams.get('login_hint')).toBe('juno@example.test');
     expect(auth.searchParams.get('code_challenge_method')).toBe('S256');
     expect(auth.toString()).not.toContain(CLIENT.client_secret);
 
@@ -167,7 +167,7 @@ describe('signing in as the assistant', () => {
 
     expect(parseGoogleGrant(grant)).toEqual({
       schema_version: 1,
-      account: 'robin@example.test',
+      account: 'juno@example.test',
       client_id: CLIENT.client_id,
       client_secret: CLIENT.client_secret,
       refresh_token: '1//refresh',
@@ -178,14 +178,14 @@ describe('signing in as the assistant', () => {
   });
 
   it('refuses another account, naming both, and keeps nothing', async () => {
-    const g = google({ email: 'taslim@example.test' });
+    const g = google({ email: 'morgan@example.test' });
     const b = browser((url) => ({ code: 'auth-code', state: url.searchParams.get('state') ?? '' }));
 
     await expect(
-      signInAsAssistant({ client: CLIENT, account: 'robin@example.test', present: b.present, fetch: g.fetch }),
+      signInAsAssistant({ client: CLIENT, account: 'juno@example.test', present: b.present, fetch: g.fetch }),
     ).rejects.toMatchObject({
       code: 'google_account_mismatch',
-      message: expect.stringMatching(/taslim@example\.test.*robin@example\.test/) as unknown,
+      message: expect.stringMatching(/morgan@example\.test.*juno@example\.test/) as unknown,
     });
   });
 
@@ -193,7 +193,7 @@ describe('signing in as the assistant', () => {
     const g = google({ verified: false });
     const b = browser((url) => ({ code: 'auth-code', state: url.searchParams.get('state') ?? '' }));
     await expect(
-      signInAsAssistant({ client: CLIENT, account: 'robin@example.test', present: b.present, fetch: g.fetch }),
+      signInAsAssistant({ client: CLIENT, account: 'juno@example.test', present: b.present, fetch: g.fetch }),
     ).rejects.toMatchObject({ code: 'google_account_mismatch' });
   });
 
@@ -201,7 +201,7 @@ describe('signing in as the assistant', () => {
     const g = google({ scope: 'openid https://www.googleapis.com/auth/userinfo.email' });
     const b = browser((url) => ({ code: 'auth-code', state: url.searchParams.get('state') ?? '' }));
     await expect(
-      signInAsAssistant({ client: CLIENT, account: 'robin@example.test', present: b.present, fetch: g.fetch }),
+      signInAsAssistant({ client: CLIENT, account: 'juno@example.test', present: b.present, fetch: g.fetch }),
     ).rejects.toMatchObject({
       code: 'google_scope_missing',
       message: expect.stringContaining('calendar.events') as unknown,
@@ -212,7 +212,7 @@ describe('signing in as the assistant', () => {
     const g = google({ refresh: false });
     const b = browser((url) => ({ code: 'auth-code', state: url.searchParams.get('state') ?? '' }));
     await expect(
-      signInAsAssistant({ client: CLIENT, account: 'robin@example.test', present: b.present, fetch: g.fetch }),
+      signInAsAssistant({ client: CLIENT, account: 'juno@example.test', present: b.present, fetch: g.fetch }),
     ).rejects.toMatchObject({ code: 'google_sign_in_failed' });
   });
 
@@ -232,11 +232,11 @@ describe('signing in as the assistant', () => {
       );
     });
 
-    const grant = await signInAsAssistant({ client: CLIENT, account: 'robin@example.test', present, fetch: g.fetch });
+    const grant = await signInAsAssistant({ client: CLIENT, account: 'juno@example.test', present, fetch: g.fetch });
 
     expect(refused).toEqual([400]);
     expect(g.exchanges.map((exchange) => exchange.get('code'))).toEqual(['auth-code']);
-    expect(grant.account).toBe('robin@example.test');
+    expect(grant.account).toBe('juno@example.test');
   });
 
   it('never exchanges a code that arrives with another state', async () => {
@@ -245,7 +245,7 @@ describe('signing in as the assistant', () => {
     await expect(
       signInAsAssistant({
         client: CLIENT,
-        account: 'robin@example.test',
+        account: 'juno@example.test',
         present: b.present,
         fetch: g.fetch,
         timeoutMs: 300,
@@ -258,7 +258,7 @@ describe('signing in as the assistant', () => {
     const g = google();
     const b = browser((url) => ({ error: 'access_denied', state: url.searchParams.get('state') ?? '' }));
     await expect(
-      signInAsAssistant({ client: CLIENT, account: 'robin@example.test', present: b.present, fetch: g.fetch }),
+      signInAsAssistant({ client: CLIENT, account: 'juno@example.test', present: b.present, fetch: g.fetch }),
     ).rejects.toMatchObject({ code: 'google_sign_in_failed', message: expect.stringMatching(/declined/) as unknown });
   });
 
@@ -267,7 +267,7 @@ describe('signing in as the assistant', () => {
     await expect(
       signInAsAssistant({
         client: CLIENT,
-        account: 'robin@example.test',
+        account: 'juno@example.test',
         present: async () => {
           throw new Error('no browser');
         },
@@ -283,7 +283,7 @@ describe('signing in as the assistant', () => {
     let authUrl: URL | undefined;
     const grant = signInAsAssistant({
       client: CLIENT,
-      account: 'robin@example.test',
+      account: 'juno@example.test',
       present: async (url) => {
         authUrl = new URL(url);
         // The operator takes longer to get ready than the whole wait allows.
@@ -298,7 +298,7 @@ describe('signing in as the assistant', () => {
     redirect.searchParams.set('state', authUrl?.searchParams.get('state') ?? '');
     void fetch(redirect).catch(() => undefined);
 
-    await expect(grant).resolves.toMatchObject({ account: 'robin@example.test' });
+    await expect(grant).resolves.toMatchObject({ account: 'juno@example.test' });
   });
 
   it('gives up when nobody finishes signing in', async () => {
@@ -306,7 +306,7 @@ describe('signing in as the assistant', () => {
     await expect(
       signInAsAssistant({
         client: CLIENT,
-        account: 'robin@example.test',
+        account: 'juno@example.test',
         present: async () => undefined,
         fetch: g.fetch,
         timeoutMs: 50,
@@ -320,7 +320,7 @@ describe('the grant file', () => {
     const file = path.join(ROOT, 'secrets', 'google-grant.json');
     const grant = parseGoogleGrant({
       schema_version: 1,
-      account: 'robin@example.test',
+      account: 'juno@example.test',
       ...CLIENT,
       refresh_token: '1//refresh',
       scopes: ['openid'],

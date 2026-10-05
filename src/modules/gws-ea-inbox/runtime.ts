@@ -1,17 +1,20 @@
 /**
  * The running inbox: its Gmail client and the host's inbound side of the
- * channel, which the thread functions U11 calls need to release held mail.
- * Set when the host sets the channel adapter up; cleared on teardown.
+ * channel. Set when the host sets the channel adapter up; cleared on
+ * teardown.
  */
 import type { ChannelSetup } from '../../channels/adapter.js';
 import { getDb } from '../../db/connection.js';
-import { getGwsEaProfile } from '../gws-ea-profile/db.js';
+import { getGwsEaProfile, listPrincipalAddresses } from '../gws-ea-profile/db.js';
 import type { GmailApi } from './gmail-api.js';
+import { threadAddresses } from './thread-map.js';
 
 /** The channel type of the inbox, and so of every user it names (`email:<address>`). */
 export const EMAIL_CHANNEL_TYPE = 'email';
-/** The inbox's one messaging group's platform ID. */
+/** The platform ID of the inbox's messaging group: every thread anyone but the principal can read. */
 export const INBOX_PLATFORM_ID = 'email:inbox';
+/** The platform ID of the principal's own email conversation with `main`. */
+export const PRINCIPAL_PLATFORM_ID = 'email:principal';
 
 export interface InboxRuntime {
   readonly gmail: GmailApi;
@@ -46,4 +49,18 @@ export async function assistantAddresses(): Promise<ReadonlySet<string>> {
   const known = active?.knownGmailAddress();
   if (known) addresses.add(known.toLowerCase());
   return addresses;
+}
+
+/**
+ * Who a thread's conversation is with: everyone its messages carried and
+ * everyone main named, never the principal, the assistant, or someone only
+ * written about in it.
+ */
+export async function conversationPeople(threadKey: string): Promise<string[]> {
+  const principal = new Set((await listPrincipalAddresses()).map((address) => address.email));
+  const assistant = await assistantAddresses();
+  const people = (await threadAddresses(threadKey)).flatMap((entry) =>
+    entry.source === 'written' ? [] : [entry.address],
+  );
+  return [...new Set(people)].filter((address) => !principal.has(address) && !assistant.has(address));
 }

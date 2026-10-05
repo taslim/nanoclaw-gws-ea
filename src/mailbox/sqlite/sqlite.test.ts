@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { parseIsoTimestamp } from '../model.js';
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
 import { wrapSqliteInbound, wrapSqliteOutbound } from './index.js';
 
@@ -170,6 +171,44 @@ describe('SQLite mailbox canonical serialization', () => {
     });
     expect(wrapSqliteOutbound(outboundDb).getTopLevelOutbound(10)).toEqual([
       { timestamp: '2026-01-01T00:00:04.000Z', content: '{"text":"top level"}' },
+    ]);
+  });
+
+  it('lists the pending messages still waiting for their time, soonest first, with their tries', async () => {
+    const inboundDb = new Database(':memory:');
+    databases.push(inboundDb);
+    inboundDb.exec(INBOUND_SCHEMA);
+    const inbound = wrapSqliteInbound(inboundDb);
+    const at = (ms: number) => new Date(Date.now() + ms).toISOString();
+    const write = (id: string, processAfter: string | null = null) =>
+      inbound.insertMessage({
+        id,
+        kind: 'chat',
+        timestamp: at(0),
+        platformId: null,
+        channelType: null,
+        threadId: null,
+        content: '{}',
+        processAfter,
+        recurrence: null,
+      });
+    const later = at(2 * 60 * 60 * 1000);
+    const soon = at(5 * 60 * 1000);
+    await write('now');
+    await write('due', at(-1000));
+    await write('later', later);
+    await write('soon', soon);
+    await write('handled', at(60 * 60 * 1000));
+    inbound.applyProcessingAcks([
+      { messageId: 'handled', status: 'completed', statusChanged: parseIsoTimestamp(at(0)) },
+    ]);
+    await write('retried');
+    inbound.retryWithBackoff('retried', 30);
+
+    expect(inbound.getWaitingMessages()).toEqual([
+      { id: 'retried', tries: 1, processAfter: expect.any(String) },
+      { id: 'soon', tries: 0, processAfter: soon },
+      { id: 'later', tries: 0, processAfter: later },
     ]);
   });
 });

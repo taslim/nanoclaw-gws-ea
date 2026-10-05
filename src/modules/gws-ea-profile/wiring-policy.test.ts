@@ -16,6 +16,9 @@ import {
   updateMessagingGroupAgent,
 } from '../../db/messaging-groups.js';
 import { runMigrations } from '../../db/migrations/index.js';
+import { updateInboxState } from '../gws-ea-inbox/db.js';
+// The inbox's store and its wiring policy, which pins the principal's email conversation.
+import '../gws-ea-inbox/index.js';
 import { addMember } from '../permissions/db/agent-group-members.js';
 import { createPendingChannelApproval } from '../permissions/db/pending-channel-approvals.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
@@ -134,6 +137,40 @@ describe('canonical main wiring policy', () => {
     expect(await getMessagingGroupAgentByPair('mg-principal-1', 'ag-main')).toMatchObject({
       sender_scope: 'known',
       session_mode: 'agent-shared',
+    });
+  });
+
+  describe("the principal's email conversation", () => {
+    beforeEach(async () => {
+      for (const id of ['mg-principal-email', 'mg-other-email']) {
+        await createMessagingGroup({
+          id,
+          channel_type: 'email',
+          platform_id: id === 'mg-principal-email' ? 'email:principal' : 'pat@example.test',
+          instance: 'email',
+          name: null,
+          is_group: 0,
+          unknown_sender_policy: 'strict',
+          created_at: now(),
+        });
+      }
+      await updateInboxState({ principal_messaging_group_id: 'mg-principal-email' });
+    });
+
+    it('admits main on the conversation the host stored, known senders in its shared session', async () => {
+      await expect(
+        createMessagingGroupAgent(wiring('mga-email', 'mg-principal-email', { threads: 1 })),
+      ).resolves.toBeUndefined();
+    });
+
+    it.each([
+      ['another email conversation', 'mg-other-email', {}],
+      ['a broad sender scope', 'mg-principal-email', { sender_scope: 'all' as const, threads: 1 }],
+      ['a separate session', 'mg-principal-email', { session_mode: 'per-thread' as const, threads: 1 }],
+    ])('refuses main on %s', async (label, mgId, overrides) => {
+      await expect(createMessagingGroupAgent(wiring(`mga-${label}`, mgId, overrides))).rejects.toThrow(
+        /canonical main/i,
+      );
     });
   });
 

@@ -16,7 +16,7 @@ import type { McpToolDefinition } from './types.js';
 const ZONE = 'Europe/London';
 const WORK = 'pat@work.example';
 const HOME = 'pat.lee@gmail.com';
-const ROBIN = 'robin@work.example';
+const JUNO = 'juno@work.example';
 const STRANGER = 'sam@elsewhere.example';
 const ALICE = 'alice@partner.example';
 const BOB = 'bob@partner.example';
@@ -185,7 +185,7 @@ async function stats(args: Record<string, unknown>): Promise<PeopleStatsResult> 
   const outcome = await call(peopleStats, {
     timezone: ZONE,
     principal_addresses: [WORK, HOME],
-    assistant_address: ROBIN,
+    assistant_address: JUNO,
     ...args,
   });
   if (outcome.isError) throw new Error(`people_stats failed: ${outcome.text}`);
@@ -196,7 +196,7 @@ async function refusal(tool: McpToolDefinition, args: Record<string, unknown>): 
   const outcome = await call(tool, {
     timezone: ZONE,
     principal_addresses: [WORK],
-    assistant_address: ROBIN,
+    assistant_address: JUNO,
     from: at('09:00'),
     to: at('12:00'),
     start: at('10:00'),
@@ -342,37 +342,37 @@ describe('find_conflicts', () => {
 
   it('lists holds the assistant placed as able to give way, earliest first, and a real event as a conflict', async () => {
     const file = writeEvents(WORK, [
-      // A hold the assistant placed: busy, private, no guests, and its private marks name its meeting.
+      // A hold the assistant placed: busy, private, no guests, and its private marks name its thread.
       timed(at('10:00'), at('10:30'), {
         id: 'hold',
         summary: gogWrapped('Intro with Sam'),
         transparency: 'opaque',
-        extendedProperties: { private: { gwsEaMeeting: 'mtg-1', gwsEaRole: 'hold', gwsEaSlot: 'slot-0123456789ab' } },
+        extendedProperties: { private: { gwsEaThread: 'mail-1', gwsEaRole: 'hold' } },
       }),
       // A meeting the assistant booked is a real meeting.
       timed(at('10:30'), at('11:00'), {
         id: 'booking',
         organizer: { email: WORK, self: true },
         attendees: [own(WORK), guest(ALICE)],
-        extendedProperties: { private: { gwsEaMeeting: 'mtg-2', gwsEaRole: 'booking' } },
+        extendedProperties: { private: { gwsEaThread: 'mail-2', gwsEaRole: 'booking' } },
       }),
       // Only both private marks make a hold: shared properties are anyone's to set.
       timed(at('10:00'), at('10:45'), {
         id: 'shared-marks',
         organizer: { email: STRANGER },
         attendees: [guest(STRANGER), own(WORK)],
-        extendedProperties: { shared: { gwsEaMeeting: 'mtg-3', gwsEaRole: 'hold' } },
+        extendedProperties: { shared: { gwsEaThread: 'mail-3', gwsEaRole: 'hold' } },
       }),
       timed(at('10:15'), at('10:45'), { id: 'role-only', extendedProperties: { private: { gwsEaRole: 'hold' } } }),
       // A hold outside the candidate's time is left out like any other event.
       timed(at('11:00'), at('11:30'), {
         id: 'later-hold',
-        extendedProperties: { private: { gwsEaMeeting: 'mtg-4', gwsEaRole: 'hold' } },
+        extendedProperties: { private: { gwsEaThread: 'mail-4', gwsEaRole: 'hold' } },
       }),
       // A hold that starts earlier, though it comes last in the file.
       timed(at('09:45'), at('10:15'), {
         id: 'earlier-hold',
-        extendedProperties: { private: { gwsEaMeeting: 'mtg-5', gwsEaRole: 'hold' } },
+        extendedProperties: { private: { gwsEaThread: 'mail-5', gwsEaRole: 'hold' } },
       }),
     ]);
 
@@ -380,7 +380,7 @@ describe('find_conflicts', () => {
 
     expect(result.holds).toEqual([
       {
-        meeting_id: 'mtg-5',
+        thread_key: 'mail-5',
         calendars: [WORK],
         event_id: 'earlier-hold',
         start: at('09:45'),
@@ -388,7 +388,7 @@ describe('find_conflicts', () => {
         overlap_minutes: 15,
       } satisfies HeldTime,
       {
-        meeting_id: 'mtg-1',
+        thread_key: 'mail-1',
         calendars: [WORK],
         event_id: 'hold',
         start: at('10:00'),
@@ -524,12 +524,12 @@ describe('people_stats', () => {
       ...weekly,
       timed('2026-09-10T14:00:00+01:00', '2026-09-10T15:00:00+01:00', {
         organizer: { email: BOB },
-        attendees: [guest(BOB, 'accepted', gogWrapped('Bob Ode')), guest(ALICE), own(WORK), guest(ROBIN)],
+        attendees: [guest(BOB, 'accepted', gogWrapped('Bob Ode')), guest(ALICE), own(WORK), guest(JUNO)],
       }),
-      // The principal organized this one; Bob hasn't answered, and Robin's presence doesn't make it a group.
+      // The principal organized this one; Bob hasn't answered, and Juno's presence doesn't make it a group.
       timed('2026-09-20T09:00:00+01:00', '2026-09-20T09:30:00+01:00', {
         organizer: { email: WORK, self: true },
-        attendees: [own(WORK), guest(BOB, 'needsAction'), guest(ROBIN)],
+        attendees: [own(WORK), guest(BOB, 'needsAction'), guest(JUNO)],
       }),
     ]);
 
@@ -558,7 +558,7 @@ describe('people_stats', () => {
     expect(result.events.counted).toBe(5);
   });
 
-  it('skips the principal, Robin, resources, and meetings of more than eight, and counts copies across calendars once', async () => {
+  it('skips the principal, Juno, resources, and meetings of more than eight, and counts copies across calendars once', async () => {
     const review = (calendar: string): GogEvent =>
       timed('2026-09-02T11:00:00+01:00', '2026-09-02T12:00:00+01:00', {
         id: 'carol-review',
@@ -571,7 +571,7 @@ describe('people_stats', () => {
           // Another spelling of the principal's Gmail address reaches the same mailbox.
           guest('Pat.Lee+calendar@googlemail.com'),
           { email: ROOM, resource: true, responseStatus: 'accepted', displayName: 'Room 4' },
-          guest(ROBIN),
+          guest(JUNO),
         ],
       });
     const nine = Array.from({ length: 8 }, (_, index) => guest(`person${index}@big.example`));

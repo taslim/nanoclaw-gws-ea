@@ -63,7 +63,7 @@ function row(overrides: Record<string, unknown> = {}): Record<string, unknown> {
     platform_id: 'gchat:spaces/dm-1',
     instance: 'gchat-assistant',
     user_id: 'gchat:users/1',
-    sender_name: 'Taslim',
+    sender_name: 'Morgan',
     sender_authenticated: 1,
     sender_kind: 'human',
     is_group: 0,
@@ -90,7 +90,7 @@ function harness(
     if (operation === 'gws-ea-profile get') {
       return {
         main_agent_group_id: mainAgentGroupId,
-        principal_display_name: 'Taslim',
+        principal_display_name: 'Morgan',
       };
     }
     if (operation === 'dropped-messages list') return rows;
@@ -269,7 +269,7 @@ describe('verified principal first-DM reconciliation', () => {
           '--platform-id',
           'gchat:spaces/dm-1',
           '--display-name',
-          'Taslim',
+          'Morgan',
           '--agent-group-id',
           'ag-main',
           '--role',
@@ -340,7 +340,7 @@ describe('verified principal first-DM reconciliation', () => {
       messagingGroupId: 'mg-1',
       platformId: 'gchat:spaces/dm-1',
       userId: 'gchat:users/1',
-      senderName: 'Taslim',
+      senderName: 'Morgan',
       authenticatedMessageId: 'spaces/dm-1/messages/1',
       authenticatedMessageAt: '2026-09-18T18:01:00.000Z',
     };

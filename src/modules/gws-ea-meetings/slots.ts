@@ -1,30 +1,23 @@
 /**
- * The host's slot arithmetic (R4, R5, R13, KTD11). Pure functions: no store,
- * no Google, no clock of their own.
+ * The host's free-time arithmetic (KTD7; R69). Pure functions: no store, no
+ * Google, no clock of their own.
  *
  * - Wall-clock times become instants through the principal's timezone, so a
- *   day with a clock change is 23 or 25 hours long and every slot is its real
+ *   day with a clock change is 23 or 25 hours long and every time is its real
  *   length. A wall time the clocks skip lands just after the change.
  * - An event blocks time unless it is cancelled, free (transparent), or an
  *   invitation the principal declined; an all-day event covers the
  *   principal's whole local days (the rules `find_conflicts` uses).
- * - A start is open when the meeting fits inside its window, after the
- *   earliest allowed start, inside the day's hours for its level, clear of
- *   protected time, and clear of busy time by the buffer. The inner circle and
- *   close may meet outside working hours, within `PERSONAL_HOURS`; everyone
- *   else only within working hours (R13). Protected time applies to everyone.
- * - Candidates start on a half-hour grid of the principal's clock. The best
- *   ones are ranked as a person would pick them (KTD9): the principal's
- *   preferred times first for everyone, working hours before the evenings
- *   and weekends the inner circle and close may use, and for someone active
- *   the next two working days first (R13). They are spread across days and
- *   times of day, never overlap, and are capped; a narrow window gives the
- *   fewer times it holds.
- * - Offers start the next day, unless the window ends today: an email read
- *   later in the day should not find its times gone.
+ * - Free time is offered from the principal's waking day, widened by working
+ *   hours that reach past it, on a half-hour grid of their clock, clear of
+ *   protected time and of busy time by the buffer (`freeTimes`), and inside
+ *   the counterpart's waking day when their zone is known. Each time carries
+ *   a fit note from a fixed vocabulary on how it sits against the principal's
+ *   preferences (`fitOf`). The times are spread across days and hours of the
+ *   day as a person offers them, and listed in date order. Only protected
+ *   time is hard (`inProtectedTime`), so a time someone proposes is checked
+ *   against it too.
  */
-import { createHash } from 'node:crypto';
-
 import {
   type PreferenceValue,
   type PreferredTimePreference,
@@ -32,7 +25,6 @@ import {
   type Weekday,
 } from '../gws-ea-preferences/db.js';
 import type { ListedEvent } from './calendar-api.js';
-import type { MeetingLevel } from './db.js';
 
 /** An interval of instants, in milliseconds since the epoch; `end` is exclusive. */
 export interface Span {
@@ -57,7 +49,7 @@ export interface WeeklyRange extends ClockRange {
   readonly weekdays: ReadonlySet<Weekday>;
 }
 
-/** The principal's preferences, as slot arithmetic needs them for one kind of meeting. */
+/** The principal's preferences, as free-time arithmetic needs them. */
 export interface SchedulingRules {
   /** Hours per weekday; a weekday without hours is not a working day. */
   readonly workingHours: ReadonlyMap<Weekday, ClockRange>;
@@ -66,42 +58,16 @@ export interface SchedulingRules {
   readonly bufferMinutes: number;
 }
 
-export interface SlotQuery {
-  readonly timezone: string;
-  readonly level: MeetingLevel;
-  readonly lengthMinutes: number;
-  /** The meeting's window: a slot lies wholly inside it. */
-  readonly window: Span;
-  /** No slot starts before this. */
-  readonly earliest: number;
-  /** Time already taken on the principal's calendars and visible colleagues'. */
-  readonly busy: readonly Span[];
-  readonly rules: SchedulingRules;
-}
-
-export interface Candidate extends Span {
-  /** The local date it starts on, `YYYY-MM-DD`. */
-  readonly day: string;
-  /** Its rank group: lower is better. */
-  readonly tier: number;
-}
-
 /** Candidates start on this grid of the principal's clock. */
-export const SLOT_GRID_MINUTES = 30;
-/** The day the inner circle and close may use outside working hours: never the night. */
-export const PERSONAL_HOURS: ClockRange = { start: 7 * 60, end: 22 * 60 };
+const SLOT_GRID_MINUTES = 30;
+/** The waking day, 07:00 to 22:00, which free time offers from on either side's clock: never the night. */
+const WAKING_HOURS: ClockRange = { start: 7 * 60, end: 22 * 60 };
 /** Working hours until the principal has any: Monday to Friday, 09:00 to 17:00. */
-export const DEFAULT_WORKING_HOURS: ReadonlyMap<Weekday, ClockRange> = new Map(
+const DEFAULT_WORKING_HOURS: ReadonlyMap<Weekday, ClockRange> = new Map(
   (['mon', 'tue', 'wed', 'thu', 'fri'] as const).map((day) => [day, { start: 9 * 60, end: 17 * 60 }]),
 );
-/** The kind of meeting whose preferences apply when a meeting's own kind has none. */
-export const DEFAULT_MEETING_KIND = 'default';
-/** Two times offered on one day start at least this far apart. */
-const SAME_DAY_SPACING_MINUTES = 120;
-/** Active counterparts' times come from this many working days first (R13). */
-const ACTIVE_WORKING_DAYS = 2;
-/** Noon on the principal's clock: offers alternate either side of it where they can. */
-const NOON = 12 * 60;
+/** The kind of meeting whose preferred times and buffer free time keeps to. */
+const DEFAULT_MEETING_KIND = 'default';
 
 const MINUTE = 60_000;
 const DAY_MS = 24 * 60 * MINUTE;
@@ -164,6 +130,28 @@ function zoneOffset(instant: number, timezone: string): number {
   return asUtc - Math.floor(instant / 1000) * 1000;
 }
 
+const pad = (value: number, width = 2): string => String(value).padStart(width, '0');
+
+/**
+ * An instant as ISO-8601 on `timezone`'s clock with its UTC offset, such as
+ * 2026-10-06T07:00-04:00: how an agent reads a time and gives it back to a
+ * tool. Seconds appear only when the instant has them.
+ */
+export function zonedIso(instant: number, timezone: string): string {
+  const wall = wallClock(instant, timezone);
+  const offset = Math.round(zoneOffset(instant, timezone) / MINUTE);
+  const milliseconds = ((instant % 1000) + 1000) % 1000;
+  const seconds =
+    wall.second === 0 && milliseconds === 0
+      ? ''
+      : `:${pad(wall.second)}${milliseconds === 0 ? '' : `.${pad(milliseconds, 3)}`}`;
+  const sign = offset < 0 ? '-' : '+';
+  return (
+    `${pad(wall.year, 4)}-${pad(wall.month)}-${pad(wall.day)}T${pad(wall.hour)}:${pad(wall.minute)}${seconds}` +
+    `${sign}${pad(Math.floor(Math.abs(offset) / 60))}:${pad(Math.abs(offset) % 60)}`
+  );
+}
+
 /**
  * The instant a wall-clock time names in `timezone`. A time the clocks repeat
  * takes its later occurrence; a time they skip lands just after the change.
@@ -181,7 +169,7 @@ export function zonedInstant(date: LocalDate, minuteOfDay: number, timezone: str
 }
 
 /** The local date an instant falls on, with its weekday and minute of the day. */
-export function localTime(
+function localTime(
   instant: number,
   timezone: string,
 ): LocalDate & { readonly weekday: Weekday; readonly minuteOfDay: number } {
@@ -216,7 +204,7 @@ const DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/u;
 const CLOCK_PATTERN = /^(\d{2}):(\d{2})$/u;
 
 /** A `YYYY-MM-DD` date that exists, or undefined. */
-export function parseLocalDate(value: string): LocalDate | undefined {
+function parseLocalDate(value: string): LocalDate | undefined {
   const match = DATE_PATTERN.exec(value);
   if (!match) return undefined;
   const date = { year: Number(match[1]), month: Number(match[2]), day: Number(match[3]) };
@@ -229,7 +217,7 @@ export function parseLocalDate(value: string): LocalDate | undefined {
 }
 
 /** A 24-hour `HH:MM` as minutes of the day (`24:00` is 1440), or undefined. */
-export function parseClock(value: string): number | undefined {
+function parseClock(value: string): number | undefined {
   const match = CLOCK_PATTERN.exec(value);
   if (!match) return undefined;
   const minutes = Number(match[1]) * 60 + Number(match[2]);
@@ -282,42 +270,28 @@ function weekly(value: {
   return range && { ...range, weekdays: new Set(value.weekdays) };
 }
 
-/** A kind's own values, or the default kind's when it has none. */
-function forKind<T extends { readonly meeting_kind: string }>(values: readonly T[], kind: string | null): T[] {
-  const own = kind === null ? [] : values.filter((value) => value.meeting_kind === kind);
-  return own.length > 0 ? own : values.filter((value) => value.meeting_kind === DEFAULT_MEETING_KIND);
-}
-
-/** The rules for one kind of meeting, from the values the store holds. */
-export function schedulingRules(values: SchedulingPreferenceValues, meetingKind: string | null): SchedulingRules {
+/** The rules free time keeps to, from the values the store holds: the default kind's preferred times and buffer. */
+export function schedulingRules(values: SchedulingPreferenceValues): SchedulingRules {
   const workingHours = new Map<Weekday, ClockRange>();
   for (const day of values.working_hours) {
     if (day.off) continue;
     const range = clockRange(day.start, day.end);
     if (range) workingHours.set(day.weekday, range);
   }
-  const preferred: readonly PreferenceValue<PreferredTimePreference>[] = forKind(values.preferred_times, meetingKind);
+  const preferred: readonly PreferenceValue<PreferredTimePreference>[] = values.preferred_times.filter(
+    (value) => value.meeting_kind === DEFAULT_MEETING_KIND,
+  );
   return {
     workingHours: values.working_hours.length === 0 ? DEFAULT_WORKING_HOURS : workingHours,
     protectedWindows: values.protected_windows.flatMap((value) => weekly(value) ?? []),
     preferredTimes: preferred.flatMap((value) => weekly(value) ?? []),
-    bufferMinutes: forKind(values.buffers, meetingKind)[0]?.minutes ?? 0,
+    bufferMinutes: values.buffers.find((value) => value.meeting_kind === DEFAULT_MEETING_KIND)?.minutes ?? 0,
   };
 }
 
 // ---------------------------------------------------------------------------
-// Open times
+// Protected and busy time
 // ---------------------------------------------------------------------------
-
-/** The inner circle and close: they may meet outside working hours, and room is made only for them. */
-export function usesPersonalHours(level: MeetingLevel): boolean {
-  return level === 'inner-circle' || level === 'close';
-}
-
-/** The hours a level may meet on a weekday, or undefined when it may not meet that day. */
-function dayHours(query: SlotQuery, weekday: Weekday): ClockRange | undefined {
-  return usesPersonalHours(query.level) ? PERSONAL_HOURS : query.rules.workingHours.get(weekday);
-}
 
 function overlaps(a: Span, b: Span): boolean {
   return a.start < b.end && a.end > b.start;
@@ -327,195 +301,145 @@ function onDay(date: LocalDate, range: ClockRange, timezone: string): Span {
   return { start: zonedInstant(date, range.start, timezone), end: zonedInstant(date, range.end, timezone) };
 }
 
-/** Whether a meeting may start at `start`: inside the window and the day's hours, clear of protected and busy time. */
-export function isOpen(start: number, query: SlotQuery): boolean {
-  const slot = { start, end: start + query.lengthMinutes * MINUTE };
-  if (slot.start < query.window.start || slot.end > query.window.end || slot.start < query.earliest) return false;
-  const local = localTime(start, query.timezone);
-  const hours = dayHours(query, local.weekday);
-  if (!hours) return false;
-  const day = onDay(local, hours, query.timezone);
-  if (slot.start < day.start || slot.end > day.end) return false;
-  for (const window of query.rules.protectedWindows) {
-    if (window.weekdays.has(local.weekday) && overlaps(slot, onDay(local, window, query.timezone))) return false;
-  }
-  const buffer = query.rules.bufferMinutes * MINUTE;
-  const padded = { start: slot.start - buffer, end: slot.end + buffer };
-  return !query.busy.some((busy) => overlaps(padded, busy));
-}
-
-/** Every open start on the half-hour grid, earliest first, optionally only inside `range`. */
-export function openSlots(query: SlotQuery, range?: Span): Span[] {
-  const from = Math.max(query.window.start, query.earliest, range?.start ?? -Infinity);
-  const to = Math.min(query.window.end, range?.end ?? Infinity);
-  if (from >= to) return [];
-  const length = query.lengthMinutes * MINUTE;
-  const grid = SLOT_GRID_MINUTES * MINUTE;
-  const open: Span[] = [];
-  const last = localTime(to, query.timezone);
-  for (let date: LocalDate = localTime(from, query.timezone); compareDates(date, last) <= 0; date = nextDate(date)) {
-    const hours = dayHours(query, weekdayOf(date));
-    if (!hours) continue;
-    const firstStart = Math.ceil(hours.start / SLOT_GRID_MINUTES) * SLOT_GRID_MINUTES;
-    const day = onDay(date, { start: firstStart, end: hours.end }, query.timezone);
-    // Real minutes from the day's first grid start: a clock change keeps the grid on the hour.
-    for (let start = day.start; start + length <= day.end; start += grid) {
-      if (start < from || start + length > to) continue;
-      if (isOpen(start, query)) open.push({ start, end: start + length });
+/** Whether any part of a span falls inside one of the principal's protected windows, on every local day it touches. */
+export function inProtectedTime(span: Span, rules: SchedulingRules, timezone: string): boolean {
+  const last = localTime(span.end - 1, timezone);
+  for (let date: LocalDate = localTime(span.start, timezone); compareDates(date, last) <= 0; date = nextDate(date)) {
+    const weekday = weekdayOf(date);
+    for (const window of rules.protectedWindows) {
+      if (window.weekdays.has(weekday) && overlaps(span, onDay(date, window, timezone))) return true;
     }
   }
-  return open;
+  return false;
+}
+
+/** Whether a span is clear of every busy time, by `bufferMinutes` either side. */
+export function isClear(span: Span, busy: readonly Span[], bufferMinutes = 0): boolean {
+  const buffer = bufferMinutes * MINUTE;
+  const padded = { start: span.start - buffer, end: span.end + buffer };
+  return !busy.some((taken) => overlaps(padded, taken));
 }
 
 // ---------------------------------------------------------------------------
-// The best ones to offer
+// How a time fits
 // ---------------------------------------------------------------------------
 
-function insidePreferred(slot: Span, query: SlotQuery): boolean {
-  const local = localTime(slot.start, query.timezone);
-  return query.rules.preferredTimes.some((window) => {
+function insidePreferred(slot: Span, rules: SchedulingRules, timezone: string): boolean {
+  const local = localTime(slot.start, timezone);
+  return rules.preferredTimes.some((window) => {
     if (!window.weekdays.has(local.weekday)) return false;
-    const preferred = onDay(local, window, query.timezone);
+    const preferred = onDay(local, window, timezone);
     return slot.start >= preferred.start && slot.end <= preferred.end;
   });
 }
 
 /** Whether a slot lies inside the principal's working hours that day. */
-function insideWorkingHours(slot: Span, query: SlotQuery): boolean {
-  const local = localTime(slot.start, query.timezone);
-  const hours = query.rules.workingHours.get(local.weekday);
+function insideWorkingHours(slot: Span, rules: SchedulingRules, timezone: string): boolean {
+  const local = localTime(slot.start, timezone);
+  const hours = rules.workingHours.get(local.weekday);
   if (!hours) return false;
-  const day = onDay(local, hours, query.timezone);
+  const day = onDay(local, hours, timezone);
   return slot.start >= day.start && slot.end <= day.end;
 }
 
-/**
- * Rank open times as a person would pick them (KTD9, R13) and choose up to
- * `limit` to offer. The rank: the principal's preferred times first, then
- * working hours before personal hours, and for someone active the next two
- * working days first. Within each rank, one per day at a new hour of the
- * day, alternating either side of noon where the open times allow; then one
- * per day at a new hour; then one per day; then a second per day at least
- * two hours apart; then any time left that overlaps none already chosen.
- */
-export function bestSlots(query: SlotQuery, open: readonly Span[], limit: number, now: number): Candidate[] {
-  const horizon =
-    query.level === 'active' ? workingDayEnd(now, ACTIVE_WORKING_DAYS, query.rules, query.timezone) : undefined;
-  const tierOf = (slot: Span): number =>
-    (insidePreferred(slot, query) ? 0 : 4) +
-    (insideWorkingHours(slot, query) ? 0 : 2) +
-    (horizon !== undefined && slot.end > horizon ? 1 : 0);
-  const ranked: Candidate[] = open
-    .map((slot) => ({ ...slot, day: dateKey(localTime(slot.start, query.timezone)), tier: tierOf(slot) }))
-    .sort((a, b) => a.tier - b.tier || a.start - b.start);
+// ---------------------------------------------------------------------------
+// Free time, as external-email asks for it (KTD7)
+// ---------------------------------------------------------------------------
 
-  const chosen: Candidate[] = [];
-  const spacing = SAME_DAY_SPACING_MINUTES * MINUTE;
-  const minuteOf = (slot: Span): number => localTime(slot.start, query.timezone).minuteOfDay;
-  const hourOf = (slot: Span): number => Math.floor(minuteOf(slot) / 60);
-  const fits = (candidate: Candidate, perDay: number | undefined): boolean => {
-    if (chosen.some((taken) => overlaps(taken, candidate))) return false;
-    if (perDay === undefined) return true;
-    const sameDay = chosen.filter((taken) => taken.day === candidate.day);
-    return sameDay.length < perDay && sameDay.every((taken) => Math.abs(taken.start - candidate.start) >= spacing);
-  };
-  /** Whether a time adds variety: a new hour of the day, and with `alternate` the other side of noon from the last one. */
-  const varied = (candidate: Candidate, alternate: boolean): boolean => {
-    if (chosen.some((taken) => hourOf(taken) === hourOf(candidate))) return false;
-    const last = chosen.at(-1);
-    return !alternate || last === undefined || minuteOf(last) < NOON !== minuteOf(candidate) < NOON;
-  };
-  const take = (
-    candidates: readonly Candidate[],
-    perDay: number | undefined,
-    variety: 'alternate' | 'new-hour' | 'any',
-  ): void => {
-    for (const candidate of candidates) {
-      if (chosen.length >= limit) return;
-      if (chosen.includes(candidate) || !fits(candidate, perDay)) continue;
-      if (variety !== 'any' && !varied(candidate, variety === 'alternate')) continue;
-      chosen.push(candidate);
-    }
-  };
-  for (const tier of [...new Set(ranked.map((candidate) => candidate.tier))]) {
-    const inTier = ranked.filter((candidate) => candidate.tier === tier);
-    take(inTier, 1, 'alternate');
-    take(inTier, 1, 'new-hour');
-    take(inTier, 1, 'any');
-    take(inTier, 2, 'any');
+/** How a time sits against the principal's preferences, best first: the only words free time says of them. */
+export const FITS = ['preferred', 'acceptable', 'outside usual hours'] as const;
+export type Fit = (typeof FITS)[number];
+
+/** Preferred when inside a preferred time, acceptable inside working hours, and otherwise outside usual hours. */
+export function fitOf(span: Span, rules: SchedulingRules, timezone: string): Fit {
+  if (insidePreferred(span, rules, timezone)) return 'preferred';
+  return insideWorkingHours(span, rules, timezone) ? 'acceptable' : 'outside usual hours';
+}
+
+export interface FreeTimeQuery {
+  readonly timezone: string;
+  /** The counterpart's zone, when known: every time offered falls inside their waking day too. */
+  readonly counterpartTimezone?: string;
+  readonly lengthMinutes: number;
+  /** Every time offered lies wholly inside it. */
+  readonly window: Span;
+  /** Time already taken on the principal's calendars. */
+  readonly busy: readonly Span[];
+  readonly rules: SchedulingRules;
+}
+
+export interface FreeTime extends Span {
+  readonly fit: Fit;
+}
+
+/** An open time, with the principal's local day and hour of the day it starts in. */
+interface OpenTime extends FreeTime {
+  readonly day: string;
+  readonly hour: number;
+}
+
+/** The hours free time offers from on a weekday: the waking day, widened by working hours that reach past it. */
+function offerHours(rules: SchedulingRules, weekday: Weekday): ClockRange {
+  const working = rules.workingHours.get(weekday);
+  return working
+    ? { start: Math.min(working.start, WAKING_HOURS.start), end: Math.max(working.end, WAKING_HOURS.end) }
+    : WAKING_HOURS;
+}
+
+/** Whether a span lies wholly inside the waking day on `timezone`'s clock. */
+function insideWakingDay(span: Span, timezone: string): boolean {
+  const day = onDay(localTime(span.start, timezone), WAKING_HOURS, timezone);
+  return span.start >= day.start && span.end <= day.end;
+}
+
+/**
+ * Up to `limit` open times, chosen from the earliest as a person offers
+ * them: first the earliest time each day at an hour of the day not offered
+ * yet, then the earliest left that overlaps none already chosen.
+ */
+function spread(open: readonly OpenTime[], limit: number): OpenTime[] {
+  const chosen: OpenTime[] = [];
+  for (const time of open) {
+    if (chosen.length >= limit) return chosen;
+    if (!chosen.some((taken) => taken.day === time.day || taken.hour === time.hour)) chosen.push(time);
   }
-  take(ranked, undefined, 'any');
+  for (const time of open) {
+    if (chosen.length >= limit) return chosen;
+    if (!chosen.some((taken) => overlaps(taken, time))) chosen.push(time);
+  }
   return chosen;
 }
 
 /**
- * The earliest start to offer from `now`: the next day, unless the window
- * ends today, and never sooner than the notice. An email is read later, so
- * a time later today is offered only when the meeting must be today.
+ * Up to `limit` open times in the window, spread as a person offers them and
+ * listed in date order: on the half-hour grid of the principal's clock,
+ * within the hours free time offers from and the counterpart's waking day,
+ * starting no earlier than the window, and clear of protected time and of
+ * busy time by the buffer.
  */
-export function earliestOffer(now: number, window: Span, timezone: string, noticeMinutes: number): number {
-  const notice = now + noticeMinutes * MINUTE;
-  const tomorrow = zonedInstant(nextDate(localTime(now, timezone)), 0, timezone);
-  return window.end <= tomorrow ? notice : Math.max(notice, tomorrow);
-}
-
-/**
- * The end of the `count`th working day that ends after `from`, on the
- * principal's working hours and clock; undefined when the principal works no
- * days at all.
- */
-function workingDayEnd(from: number, count: number, rules: SchedulingRules, timezone: string): number | undefined {
-  if (rules.workingHours.size === 0) return undefined;
-  let counted = 0;
-  let date: LocalDate = localTime(from, timezone);
-  for (let days = 0; days < 7 * (count + 1); days += 1, date = nextDate(date)) {
-    const hours = rules.workingHours.get(weekdayOf(date));
-    if (!hours) continue;
-    const end = zonedInstant(date, hours.end, timezone);
-    if (end <= from) continue;
-    counted += 1;
-    if (counted === count) return end;
-  }
-  return undefined;
-}
-
-/**
- * The instant `count` working days after `from`, on the principal's working
- * hours and clock: the same time of day on the `count`th working day after
- * the one `from` falls in, never past that day's close. A `from` outside
- * working hours counts from the start of the next working day, so the
- * weekend and days off never count. Without any working day it assumes
- * Monday to Friday, 09:00 to 17:00. Follow-through deadlines use it (KTD12).
- */
-export function workingDaysLater(from: number, count: number, rules: SchedulingRules, timezone: string): number {
-  const hours = rules.workingHours.size > 0 ? rules.workingHours : DEFAULT_WORKING_HOURS;
-  /** The first working day after `date`, with its hours. */
-  const nextWorkingDay = (date: LocalDate): { readonly date: LocalDate; readonly hours: ClockRange } => {
-    for (let next = nextDate(date); ; next = nextDate(next)) {
-      const range = hours.get(weekdayOf(next));
-      if (range) return { date: next, hours: range };
+export function freeTimes(query: FreeTimeQuery, limit: number): FreeTime[] {
+  const { timezone, counterpartTimezone, rules, window } = query;
+  const length = query.lengthMinutes * MINUTE;
+  const grid = SLOT_GRID_MINUTES * MINUTE;
+  const open: OpenTime[] = [];
+  const last = localTime(window.end, timezone);
+  for (let date: LocalDate = localTime(window.start, timezone); compareDates(date, last) <= 0; date = nextDate(date)) {
+    const hours = offerHours(rules, weekdayOf(date));
+    const firstStart = Math.ceil(hours.start / SLOT_GRID_MINUTES) * SLOT_GRID_MINUTES;
+    const day = onDay(date, { start: firstStart, end: hours.end }, timezone);
+    // Real minutes from the day's first grid start: a clock change keeps the grid on the hour.
+    for (let start = day.start; start + length <= day.end; start += grid) {
+      const span = { start, end: start + length };
+      if (span.start < window.start || span.end > window.end) continue;
+      if (counterpartTimezone !== undefined && !insideWakingDay(span, counterpartTimezone)) continue;
+      if (inProtectedTime(span, rules, timezone) || !isClear(span, query.busy, rules.bufferMinutes)) continue;
+      const hour = Math.floor(localTime(span.start, timezone).minuteOfDay / 60);
+      open.push({ ...span, fit: fitOf(span, rules, timezone), day: dateKey(date), hour });
     }
-  };
-  const local = localTime(from, timezone);
-  const today = hours.get(local.weekday);
-  const duringToday = today !== undefined && local.minuteOfDay < today.end;
-  let day = duringToday ? { date: local, hours: today } : nextWorkingDay(local);
-  const minute = duringToday ? Math.max(local.minuteOfDay, today.start) : day.hours.start;
-  for (let counted = 0; counted < count; counted += 1) day = nextWorkingDay(day.date);
-  return zonedInstant(day.date, Math.min(Math.max(minute, day.hours.start), day.hours.end), timezone);
-}
-
-/** A slot's id: opaque, and the same for the same meeting and time on every call. */
-export function slotIdFor(meetingId: string, slot: Span): string {
-  const digest = createHash('sha256')
-    .update(`${meetingId}|${new Date(slot.start).toISOString()}|${new Date(slot.end).toISOString()}`)
-    .digest('hex');
-  return `slot-${digest.slice(0, 12)}`;
-}
-
-/** The local day containing `date` in `timezone`, as an interval. */
-export function localDaySpan(date: LocalDate, timezone: string): Span {
-  return { start: zonedInstant(date, 0, timezone), end: zonedInstant(nextDate(date), 0, timezone) };
+  }
+  return spread(open, limit)
+    .sort((a, b) => a.start - b.start)
+    .map(({ start, end, fit }) => ({ start, end, fit }));
 }
 
 /** One day, in milliseconds: how far calendar reads widen so all-day events are seen whole. */

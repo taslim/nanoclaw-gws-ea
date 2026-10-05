@@ -41,4 +41,5 @@ export type {
   TaskRecord,
   TaskStats,
   TaskUpdate,
+  WaitingMessage,
 } from './types.js';

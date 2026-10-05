@@ -12,7 +12,7 @@ import {
 
 const VALID = {
   schema_version: 1,
-  account: 'Robin@Example.test',
+  account: 'Juno@Example.test',
   client_id: 'client.apps.googleusercontent.com',
   client_secret: 'GOCSPX-client-secret',
   refresh_token: '1//refresh-token',
@@ -22,7 +22,7 @@ const VALID = {
 
 describe("the assistant's Google grant", () => {
   it('reads a grant, lowercasing the account', () => {
-    expect(parseGoogleGrant(VALID)).toEqual({ ...VALID, account: 'robin@example.test' });
+    expect(parseGoogleGrant(VALID)).toEqual({ ...VALID, account: 'juno@example.test' });
   });
 
   it.each([

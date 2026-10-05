@@ -18,8 +18,8 @@ export interface NoteForMain {
   readonly timestamp: string;
   /** The one plain explanation main reads. */
   readonly text: string;
-  /** The typed fields written beside the text: a `note`, or the privacy check's `signal`. */
-  readonly fields: { readonly note: unknown } | { readonly signal: unknown };
+  /** The privacy check's `signal`, written beside the text; every other note is its text alone. */
+  readonly fields?: { readonly signal: unknown };
   /** Whether main takes a turn now; otherwise the note waits for its next one. */
   readonly wake: boolean;
 }

@@ -52,6 +52,14 @@ export interface MessageRetry {
   threadId: string | null;
 }
 
+/** A pending inbound message that waits for its `process_after`. */
+export interface WaitingMessage {
+  id: string;
+  /** Attempts so far: a retried message waits out its backoff. */
+  tries: number;
+  processAfter: string;
+}
+
 export interface ProcessingClaim {
   messageId: string;
   statusChanged: string;
@@ -103,6 +111,10 @@ export interface InboundMailbox {
   markMessageFailed(messageId: string): void;
   retryWithBackoff(messageId: string, backoffSec: number): void;
   getMessageForRetry(messageId: string, status: 'pending' | 'processing'): MessageRetry | undefined;
+  /** Pending messages whose `process_after` is still ahead, soonest first. */
+  getWaitingMessages(): WaitingMessage[];
+  /** Whether the mailbox holds a message with this id, whatever its status. */
+  hasMessage(messageId: string): boolean;
   applyProcessingAcks(acks: ProcessingAck[]): void;
   getDeliveredIds(): Set<string>;
   markDelivered(messageOutId: string, platformMessageId: string | null): void;

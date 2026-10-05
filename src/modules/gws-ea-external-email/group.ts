@@ -7,7 +7,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { parseStoredCapabilities, resolveCapabilities } from '../../capabilities.js';
+import { parseStoredCapabilities, registerCapability, resolveCapabilities } from '../../capabilities.js';
 import { GROUPS_DIR } from '../../config.js';
 import { parseSkillSelection } from '../../container-config.js';
 import { credentialScopeFor } from '../../container-runner.js';
@@ -25,9 +25,31 @@ import { resolveProviderName } from '../../providers/provider-name.js';
 import { createAgentFromTemplate, groupSkillsOverlayDir } from '../../templates/create-agent.js';
 import type { ContainerConfigRow } from '../../types.js';
 import { getExternalEmailAgentGroupId, recordExternalEmailAgentGroupId } from '../gws-ea-profile/db.js';
+import { REMINDERS_CAPABILITY } from '../gws-ea-reminders/index.js';
 
-/** The meeting tools only `external-email` holds; the scheduling units register its tools. */
-export const EXTERNAL_EMAIL_MEETINGS_CAPABILITY = 'gws-ea-meetings-external';
+/**
+ * The email channel's tool keys, one for each part (KTD4), registered
+ * together so each tool's grant is found in one place. The actions they send
+ * belong to the modules that answer them: the bridge (`email_handoff`,
+ * `tell_main`), the inbox (`email_send`, by each caller's own rules) and the
+ * meetings module (the five scheduling tools). Each key brings its tools'
+ * instructions, in the runner's `<key>.instructions.md`.
+ */
+export const MAIN_EMAIL_CAPABILITY = 'gws-ea-email';
+export const EXTERNAL_EMAIL_TOOLS_CAPABILITY = 'gws-ea-email-external';
+
+registerCapability(MAIN_EMAIL_CAPABILITY, {
+  description:
+    'email_handoff, email_principal: hand external-email work in an email thread, and email the principal in one of theirs',
+  default: 'on',
+  instructions: [MAIN_EMAIL_CAPABILITY],
+});
+registerCapability(EXTERNAL_EMAIL_TOOLS_CAPABILITY, {
+  description:
+    "email_send, tell_main, free_time, hold, book, change_booking, cancel_booking: external-email's email and scheduling in its own thread, and word to main",
+  default: 'off',
+  instructions: [EXTERNAL_EMAIL_TOOLS_CAPABILITY],
+});
 
 /** The release template the host stamps the group from, and the plugin that stamp leaves in its folder. */
 export const EXTERNAL_EMAIL_TEMPLATE = 'gws-ea/external-email';
@@ -35,17 +57,20 @@ export const EXTERNAL_EMAIL_PLUGIN = 'gws-ea-external-email';
 export const EXTERNAL_EMAIL_NAME = 'external-email';
 
 /**
- * Exactly what the group holds: `send_message`, its meeting tools,
- * `request_status` for a meeting request the host was slow to answer, and
- * the `time_*` calculators, which compute over the container's clock and
- * reveal nothing. No shell, files, web, subagents, MCP servers, or
- * `conversation-context`, so each of its sessions is sealed from every other.
+ * Exactly what the group holds: its thread's tools, its reminders,
+ * `request_status` for a request the host was slow to answer, the `time_*`
+ * calculators, which compute over the container's clock and reveal nothing,
+ * and `files-read`, for the files that reached its thread (KTD9). No write
+ * tools, shell, web, subagents, MCP servers, messages to destinations, or
+ * `conversation-context`: each of its sessions is sealed from every other,
+ * and nothing of one thread lands in the folder its sessions share.
  */
 export const EXTERNAL_EMAIL_CAPABILITIES: readonly string[] = [
-  'reply',
+  'files-read',
   'time',
   'request-status',
-  EXTERNAL_EMAIL_MEETINGS_CAPABILITY,
+  REMINDERS_CAPABILITY,
+  EXTERNAL_EMAIL_TOOLS_CAPABILITY,
 ];
 
 /**

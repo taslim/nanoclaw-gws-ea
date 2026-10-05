@@ -201,6 +201,33 @@ function dispatchSessionCreated(event: SessionCreatedEvent): void {
   }
 }
 
+/**
+ * Inbound-delay hook. Runs as the router writes a message into the session
+ * it resolved for an agent, after the command gate.
+ *
+ * A module returns the time before which the session must not read the
+ * message (the row's `process_after`), or null to leave it due now. With
+ * several registered, the message waits for the latest time any names. A
+ * delayed message does not wake the container: the host sweep wakes the
+ * session once the message is due, and a running container reads it then.
+ */
+export type InboundDelayFn = (event: InboundEvent, session: Session) => string | null | Promise<string | null>;
+
+const inboundDelays: InboundDelayFn[] = [];
+
+export function registerInboundDelay(fn: InboundDelayFn): void {
+  inboundDelays.push(fn);
+}
+
+async function inboundDelay(event: InboundEvent, session: Session): Promise<string | null> {
+  let latest: string | null = null;
+  for (const delay of inboundDelays) {
+    const until = await delay(event, session);
+    if (until !== null && (latest === null || Date.parse(until) > Date.parse(latest))) latest = until;
+  }
+  return latest;
+}
+
 function safeParseContent(raw: string): { text?: string; sender?: string; senderId?: string } {
   try {
     return JSON.parse(raw);
@@ -598,6 +625,7 @@ async function deliverToAgent(
   }
 
   const messageId = messageIdForAgent(event.message.id, agent.agent_group_id);
+  const processAfter = await inboundDelay(event, session);
   try {
     await writeSessionMessage(session.agent_group_id, session.id, {
       id: messageId,
@@ -607,6 +635,7 @@ async function deliverToAgent(
       channelType: deliveryAddr.channelType,
       threadId: deliveryAddr.threadId,
       content: event.message.content,
+      processAfter,
       trigger: wake,
     });
   } catch (error) {
@@ -640,12 +669,14 @@ async function deliverToAgent(
     userId,
     wake,
     created,
+    ...(processAfter === null ? {} : { processAfter }),
     agentGroupName: agentGroup.name,
   });
 
-  if (wake) {
+  if (wake && processAfter === null) {
     // Typing indicator + wake are only for the engaged branch; accumulated
-    // messages sit silently until a real trigger fires.
+    // messages sit silently until a real trigger fires, and a delayed one
+    // until the host sweep wakes the session once it is due.
     // Typing fires via the adapter instance that owns this chat's row.
     startTypingRefresh(
       session.id,
@@ -663,7 +694,9 @@ async function deliverToAgent(
       // started so it doesn't leak; the inbound row stays pending.
       if (!woke) stopTypingRefresh(freshSession.id);
     }
+  }
 
+  if (wake) {
     // Cross-session context: fan the triggering message into the
     // conversation's recently active sibling sessions as trigger=0
     // 'session-echo' rows. Only the engaged branch fans — the accumulate

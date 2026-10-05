@@ -12,13 +12,18 @@
  *     stamped plugins, provider, or gateway scope differ from what the host
  *     stamped.
  *   - A destination admission policy keeps it apart from main and from every
- *     other group (`./destination-policy.ts`).
- *   - Its project document holds its guidance, read from the release, and the
- *     two display names: the profile and preferences sections leave it
- *     everything else out.
+ *     other group (`./destination-policy.ts`). The two work together only
+ *     through the host: main's `email_handoff` and its own `tell_main`
+ *     (`./bridge.ts`).
+ *   - When an email it wrote cannot be sent, what arrived in its thread cannot
+ *     be processed, or its work on a thread fails, main hears of it
+ *     (`./failures.ts`).
+ *   - Its project document holds its guidance, read from the release, the
+ *     two display names, and the principal's time zone, read from the profile
+ *     at each spawn so that no email it reads repeats them; the profile and
+ *     preferences sections leave it everything else out.
  *   - Status reads all of this through a hidden host-only command.
  */
-import fs from 'node:fs';
 import path from 'node:path';
 
 // Their migrations add the columns this module writes: each group's
@@ -26,34 +31,29 @@ import path from 'node:path';
 import '../capabilities/index.js';
 import '../gws-ea-profile/index.js';
 
-import { registerCapability } from '../../capabilities.js';
 import { registerProtectedGroupPolicy } from '../../cli/guard.js';
 import { register } from '../../cli/registry.js';
+import { TIMEZONE } from '../../config.js';
 import { registerSessionAdmissionPolicy } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
+import { registerDeliveryAction } from '../../delivery.js';
 import { onHostStart } from '../../host-lifecycle.js';
-import { log } from '../../log.js';
 import { registerRequiredProjectDocSection } from '../../project-doc-sections.js';
-import type { AgentGroup } from '../../types.js';
-import { getExternalEmailAgentGroupId as readExternalEmailPointer } from '../gws-ea-profile/db.js';
+import { resolveTimezone } from '../../timezone.js';
+import { getGwsEaProfile, getExternalEmailAgentGroupId as readExternalEmailPointer } from '../gws-ea-profile/db.js';
+import { registerGuidance } from '../gws-ea-profile/guidance.js';
+import { BRIDGE_ACTIONS } from './bridge.js';
 import { destinationViolations } from './destination-policy.js';
-import { EXTERNAL_EMAIL_MEETINGS_CAPABILITY, ensureExternalEmailGroup, externalEmailDrift } from './group.js';
+import { ensureExternalEmailGroup, externalEmailDrift } from './group.js';
+import './failures.js';
 
 export {
   EXTERNAL_EMAIL_CAPABILITIES,
-  EXTERNAL_EMAIL_MEETINGS_CAPABILITY,
   EXTERNAL_EMAIL_NAME,
   EXTERNAL_EMAIL_PLUGIN,
   EXTERNAL_EMAIL_TEMPLATE,
 } from './group.js';
-
-registerCapability(EXTERNAL_EMAIL_MEETINGS_CAPABILITY, {
-  description:
-    "meeting_free_time, meeting_hold, meeting_book, meeting_ask_main, email_recipients, meeting_outcome: external-email's meeting tools: the principal's free time, holds, and bookings through the host, a question for main it then waits on, who its replies go to among the people on its thread, and the meeting's outcome",
-  default: 'off',
-  instructions: [EXTERNAL_EMAIL_MEETINGS_CAPABILITY],
-});
 
 /** `external-email`'s agent group, as the profile records it, or null until the host creates it. */
 export async function getExternalEmailAgentGroupId(): Promise<string | null> {
@@ -67,6 +67,8 @@ onHostStart(async () => {
   if (!(await getDb().hasTable('gws_ea_profile'))) return;
   await ensureExternalEmailGroup();
 });
+
+for (const [action, handler, guard] of BRIDGE_ACTIONS) registerDeliveryAction(action, handler, guard);
 
 registerProtectedGroupPolicy('gws-ea-external-email:host-owned', async (agentGroupId) =>
   agentGroupId === (await getExternalEmailAgentGroupId()) ? 'external-email is configured only by the host' : undefined,
@@ -83,27 +85,27 @@ registerSessionAdmissionPolicy('gws-ea-external-email:stamped-reach', async ({ k
   if (problems.length > 0) throw new Error(`external-email may not start: ${problems.join('; ')}`);
 });
 
+// Whom it works for, once, rather than on every email it reads: the
+// principal's name and time zone, never their addresses.
+registerRequiredProjectDocSection('gws-ea-external-email:principal', async (group) => {
+  if (group.id !== (await getExternalEmailAgentGroupId())) return undefined;
+  const profile = await getGwsEaProfile();
+  const timezone = resolveTimezone(profile.principal_timezone ?? TIMEZONE);
+  return {
+    name: 'Principal',
+    body: `You work for ${profile.principal_display_name ?? 'the principal'}, whose time zone is ${timezone}.`,
+  };
+});
+
 /** The guidance, relative to the checkout the host runs from, as NanoClaw reads its other instruction files. */
 export const GUIDANCE_PATH = path.join('src', 'modules', 'gws-ea-external-email', 'guidance.md');
 
-async function guidanceSection(group: AgentGroup): Promise<{ name: string; body: string } | undefined> {
-  if (group.id !== (await getExternalEmailAgentGroupId())) return undefined;
-  const file = path.resolve(process.cwd(), GUIDANCE_PATH);
-  if (!fs.existsSync(file)) {
-    // Tolerated but never silent, like main's guidance: throwing here would
-    // fail every spawn. The release preflight refuses a release without it.
-    log.error('external-email guidance is missing; it starts without it', { file });
-    return undefined;
-  }
-  const body = fs.readFileSync(file, 'utf8');
-  if (!body.trim()) {
-    log.error('external-email guidance is empty; it starts without it', { file });
-    return undefined;
-  }
-  return { name: 'External Email', body };
-}
-
-registerRequiredProjectDocSection('gws-ea-external-email:guidance', guidanceSection);
+registerGuidance('gws-ea-external-email:guidance', {
+  agent: 'external-email',
+  heading: 'External Email',
+  file: GUIDANCE_PATH,
+  agentGroupId: readExternalEmailPointer,
+});
 
 export interface ExternalEmailHealth {
   /** The group the profile records, or null when the host has not created it. */

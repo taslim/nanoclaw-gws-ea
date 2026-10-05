@@ -32,6 +32,12 @@ importers:
       kleur:
         specifier: ^4.1.5
         version: 4.1.5
+      micromark:
+        specifier: 4.0.2
+        version: 4.0.2
+      micromark-extension-gfm:
+        specifier: 3.0.0
+        version: 3.0.0
       yaml:
         specifier: ^2.9.0
         version: 2.9.0

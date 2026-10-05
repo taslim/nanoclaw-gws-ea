@@ -55,10 +55,10 @@ describe('GWS-EA interactive create input', () => {
       .fn()
       .mockResolvedValueOnce('Ada')
       .mockResolvedValueOnce('Lovelace')
-      .mockResolvedValueOnce('Taslim')
+      .mockResolvedValueOnce('Morgan')
       .mockResolvedValueOnce('')
       .mockResolvedValueOnce('America/Los_Angeles')
-      .mockResolvedValueOnce(' Taslim@Example.test, t@other.test ,taslim@example.test');
+      .mockResolvedValueOnce(' Morgan@Example.test, t@other.test ,morgan@example.test');
     const select = vi.fn();
     const discoverZones = vi.fn();
 
@@ -125,9 +125,9 @@ describe('GWS-EA interactive create input', () => {
         },
         identity: {
           assistant_display_name: 'Ada Lovelace',
-          principal_display_name: 'Taslim',
+          principal_display_name: 'Morgan',
           principal_timezone: 'America/Los_Angeles',
-          principal_emails: ['taslim@example.test', 't@other.test'],
+          principal_emails: ['morgan@example.test', 't@other.test'],
         },
         selected_messaging_group_id: null,
       },
@@ -141,8 +141,8 @@ describe('GWS-EA interactive create input', () => {
       .fn()
       .mockResolvedValueOnce('Aya')
       .mockResolvedValueOnce('')
-      .mockResolvedValueOnce('Taslim')
-      .mockResolvedValueOnce('Khan')
+      .mockResolvedValueOnce('Morgan')
+      .mockResolvedValueOnce('Ellery')
       .mockResolvedValueOnce('UTC');
     const select = vi.fn(async () => 'codex');
 
@@ -151,7 +151,7 @@ describe('GWS-EA interactive create input', () => {
         instanceId: '11111111-1111-4111-8111-111111111111',
         prerequisites,
         sourceRemote: 'https://example.test/nanoclaw.git',
-        providedPrincipalEmails: ['taslim@example.test'],
+        providedPrincipalEmails: ['morgan@example.test'],
         secrets: NO_SECRETS,
         track: 'prod',
         provided: {
@@ -183,12 +183,12 @@ describe('GWS-EA interactive create input', () => {
       ],
     });
     expect(result.bootstrapManifest.provider.id).toBe('codex');
-    expect(result.bootstrapManifest.identity.principal_display_name).toBe('Taslim Khan');
+    expect(result.bootstrapManifest.identity.principal_display_name).toBe('Morgan Ellery');
   });
 
   it('attaches focused validation to prompted timezone, email, and endpoint fields', async () => {
     const validators = new Map<string, (value: string | undefined) => string | undefined>();
-    const answers = ['Aya', '', 'Taslim', '', 'UTC', 'aya@example.test', 'https://example.test/webhook/gchat'];
+    const answers = ['Aya', '', 'Morgan', '', 'UTC', 'aya@example.test', 'https://example.test/webhook/gchat'];
     const prompts = {
       note: vi.fn(),
       text: vi.fn(
@@ -209,7 +209,7 @@ describe('GWS-EA interactive create input', () => {
         instanceId: '11111111-1111-4111-8111-111111111111',
         prerequisites,
         sourceRemote: 'https://example.test/nanoclaw.git',
-        providedPrincipalEmails: ['taslim@example.test'],
+        providedPrincipalEmails: ['morgan@example.test'],
         secrets: NO_SECRETS,
         track: 'prod',
         provided: {},
@@ -247,7 +247,7 @@ describe('GWS-EA interactive create input', () => {
       .fn()
       .mockResolvedValueOnce('Aya')
       .mockResolvedValueOnce('')
-      .mockResolvedValueOnce('Taslim')
+      .mockResolvedValueOnce('Morgan')
       .mockResolvedValueOnce('')
       .mockResolvedValueOnce('UTC')
       .mockResolvedValueOnce('aya');
@@ -261,7 +261,7 @@ describe('GWS-EA interactive create input', () => {
         instanceId: '11111111-1111-4111-8111-111111111111',
         prerequisites,
         sourceRemote: 'https://example.test/nanoclaw.git',
-        providedPrincipalEmails: ['taslim@example.test'],
+        providedPrincipalEmails: ['morgan@example.test'],
         secrets: NO_SECRETS,
         track: 'prod',
         provided: {
@@ -327,7 +327,7 @@ describe('GWS-EA interactive create input', () => {
       .fn()
       .mockResolvedValueOnce('Aya')
       .mockResolvedValueOnce('')
-      .mockResolvedValueOnce('Taslim')
+      .mockResolvedValueOnce('Morgan')
       .mockResolvedValueOnce('')
       .mockResolvedValueOnce('UTC')
       .mockResolvedValueOnce('aya');
@@ -337,7 +337,7 @@ describe('GWS-EA interactive create input', () => {
         instanceId: '11111111-1111-4111-8111-111111111111',
         prerequisites,
         sourceRemote: 'https://example.test/nanoclaw.git',
-        providedPrincipalEmails: ['taslim@example.test'],
+        providedPrincipalEmails: ['morgan@example.test'],
         secrets: NO_SECRETS,
         track: 'prod',
         provided: {
@@ -390,7 +390,7 @@ describe('GWS-EA interactive create input', () => {
 
   it('does not retain Cloudflare authority when hostname confirmation is declined', async () => {
     const retainAccountToken = vi.fn();
-    const answers = ['Aya', '', 'Taslim', '', 'UTC', 'aya'];
+    const answers = ['Aya', '', 'Morgan', '', 'UTC', 'aya'];
 
     await expect(
       collectGwsEaCreateInput(
@@ -398,7 +398,7 @@ describe('GWS-EA interactive create input', () => {
           instanceId: '11111111-1111-4111-8111-111111111111',
           prerequisites,
           sourceRemote: 'https://example.test/nanoclaw.git',
-          providedPrincipalEmails: ['taslim@example.test'],
+          providedPrincipalEmails: ['morgan@example.test'],
           secrets: NO_SECRETS,
           track: 'prod',
           provided: {
@@ -475,8 +475,8 @@ describe('GWS-EA unattended create input', () => {
   };
   const FLAGS = {
     'assistant-first-name': 'Aya',
-    'principal-first-name': 'Taslim',
-    'principal-last-name': 'Khan',
+    'principal-first-name': 'Morgan',
+    'principal-last-name': 'Ellery',
     'principal-timezone': 'America/Los_Angeles',
     'workspace-email': 'aya@example.test',
     endpoint: 'https://aya.example.test/webhook/gchat',
@@ -486,7 +486,7 @@ describe('GWS-EA unattended create input', () => {
     provided: Record<string, string>,
     secrets: SecretSource = NO_SECRETS,
     extra = {},
-    providedPrincipalEmails: readonly string[] = ['taslim@example.test'],
+    providedPrincipalEmails: readonly string[] = ['morgan@example.test'],
   ) {
     return collectGwsEaCreateInput(
       {
@@ -515,9 +515,9 @@ describe('GWS-EA unattended create input', () => {
     expect(result.ingress).toEqual({ mode: 'existing', endpointUrl: 'https://aya.example.test/webhook/gchat' });
     expect(result.bootstrapManifest.identity).toEqual({
       assistant_display_name: 'Aya',
-      principal_display_name: 'Taslim Khan',
+      principal_display_name: 'Morgan Ellery',
       principal_timezone: 'America/Los_Angeles',
-      principal_emails: ['taslim@example.test'],
+      principal_emails: ['morgan@example.test'],
     });
     expect(unattendedPrompts.text).not.toHaveBeenCalled();
   });
@@ -689,7 +689,7 @@ describe('GWS-EA unattended create input', () => {
       instanceId: '11111111-1111-4111-8111-111111111111',
       prerequisites,
       sourceRemote: 'https://example.test/nanoclaw.git',
-      providedPrincipalEmails: ['taslim@example.test'],
+      providedPrincipalEmails: ['morgan@example.test'],
       secrets: NO_SECRETS,
       track: 'dogfood',
     };
@@ -717,7 +717,7 @@ describe('GWS-EA unattended create input', () => {
           '/srv/git/nanoclaw.git',
           ...Object.entries(FLAGS).flatMap(([flag, value]) => [`--${flag}`, value]),
           '--principal-email',
-          'taslim@example.test',
+          'morgan@example.test',
         ],
         {
           paths,

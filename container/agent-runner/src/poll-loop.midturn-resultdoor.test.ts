@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
+import { emailSend, hold } from './mcp-tools/gws-ea-email.js';
+import type { McpToolDefinition } from './mcp-tools/types.js';
 import { processQuery } from './poll-loop.js';
 import type { AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
 
@@ -534,6 +536,51 @@ describe('DB-visible sends gate the nudge', () => {
 
     expect(deliveredTexts()).toEqual(['sent via tool']);
     expect(nudges(pushes)).toHaveLength(0);
+  });
+
+  /** Call a request tool mid-turn while the host answers its request, ok or refused. */
+  async function requestAnswered(tool: McpToolDefinition, args: Record<string, unknown>, ok: boolean): Promise<void> {
+    const answering = (async () => {
+      while (getUndeliveredMessages().length === 0) await Bun.sleep(1);
+      const [{ id: requestId }] = getUndeliveredMessages();
+      const frame = ok
+        ? { id: requestId, ok: true, data: { message: 'Done.' } }
+        : { id: requestId, ok: false, error: { code: 'forbidden', message: 'Refused.' } };
+      getInboundDb()
+        .prepare('INSERT INTO messages_in (id, kind, timestamp, content, trigger) VALUES (?, ?, ?, ?, 0)')
+        .run(
+          `action-resp-${requestId}`,
+          'system',
+          new Date().toISOString(),
+          JSON.stringify({ type: 'action_response', requestId, frame }),
+        );
+    })();
+    await Promise.all([tool.handler(args), answering]);
+  }
+
+  /** A turn that makes one request, then ends on a stray unwrapped line. */
+  async function strayLineAfter(tool: McpToolDefinition, args: Record<string, unknown>, ok = true): Promise<string[]> {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      await requestAnswered(tool, args, ok);
+      yield { type: 'result', text: 'Done — that is handled.' };
+    }
+    const { query, pushes } = makeStubQuery(events());
+    await processQuery(query, CHAT_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, true);
+    return nudges(pushes);
+  }
+
+  it('an email_send the host sent this turn is the reply: a stray line after it draws no nudge', async () => {
+    expect(await strayLineAfter(emailSend, { text: 'Hi Remy, does Tuesday at 12:30 suit you?' })).toHaveLength(0);
+    expect(deliveredTexts()).toEqual([]);
+  });
+
+  it.each<[string, McpToolDefinition, Record<string, unknown>, boolean]>([
+    ['a request that sends nothing (hold)', hold, { starts: [] }, true],
+    ['an email_send the host refused', emailSend, { text: 'Hi Remy.' }, false],
+  ])('a stray line after only %s is still nudged', async (_label, tool, args, ok) => {
+    expect(await strayLineAfter(tool, args, ok)).toHaveLength(1);
   });
 });
 

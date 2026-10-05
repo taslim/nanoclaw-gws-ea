@@ -53,7 +53,7 @@ import {
 import { resetGatewayProvider } from '../../gateway-providers/index.js';
 import { getHostStartCallbacks } from '../../host-lifecycle.js';
 import type { AgentGroup } from '../../types.js';
-import { externalEmailHealth, getExternalEmailAgentGroupId } from './index.js';
+import { EXTERNAL_EMAIL_CAPABILITIES, externalEmailHealth, getExternalEmailAgentGroupId } from './index.js';
 import '../gws-ea-profile/index.js';
 
 const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
@@ -114,12 +114,35 @@ const DRIFTS: ReadonlyArray<readonly [string, (group: AgentGroup) => Promise<voi
   [
     'another key in place of one of its own',
     (g) =>
-      updateContainerConfigJson(g.id, 'capabilities', ['reply', 'web', 'request-status', 'gws-ea-meetings-external']),
+      updateContainerConfigJson(g.id, 'capabilities', [
+        'files-write',
+        'time',
+        'request-status',
+        'gws-ea-reminders',
+        'gws-ea-email-external',
+      ]),
     /capabilities/,
   ],
   [
     'a key missing from its list',
-    (g) => updateContainerConfigJson(g.id, 'capabilities', ['reply', 'request-status', 'gws-ea-meetings-external']),
+    (g) =>
+      updateContainerConfigJson(g.id, 'capabilities', [
+        'time',
+        'request-status',
+        'gws-ea-reminders',
+        'gws-ea-email-external',
+      ]),
+    /capabilities/,
+  ],
+  [
+    'conversation-context beside its list',
+    (g) => updateContainerConfigJson(g.id, 'capabilities', [...EXTERNAL_EMAIL_CAPABILITIES, 'conversation-context']),
+    /capabilities/,
+  ],
+  [
+    'the list an earlier release stamped',
+    (g) =>
+      updateContainerConfigJson(g.id, 'capabilities', ['reply', 'time', 'request-status', 'gws-ea-meetings-external']),
     /capabilities/,
   ],
   [

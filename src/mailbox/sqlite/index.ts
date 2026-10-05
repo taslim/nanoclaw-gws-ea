@@ -61,6 +61,7 @@ import type {
   ProcessingAck,
   TaskRecord,
   TaskStats,
+  WaitingMessage,
 } from '../types.js';
 
 const SQLITE_TIMESTAMP = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?$/;
@@ -210,6 +211,17 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
         }
       );
     },
+    getWaitingMessages: () =>
+      (
+        db
+          .prepare(
+            `SELECT id, tries, process_after AS processAfter FROM messages_in
+              WHERE status = 'pending' AND datetime(process_after) > datetime('now')
+              ORDER BY datetime(process_after) ASC, seq ASC`,
+          )
+          .all() as WaitingMessage[]
+      ).map((row) => ({ ...row, processAfter: sqliteTimestamp(row.processAfter) })),
+    hasMessage: (messageId) => db.prepare('SELECT 1 FROM messages_in WHERE id = ?').get(messageId) !== undefined,
     applyProcessingAcks: (acks) => applyProcessingAcks(db, acks),
     getDeliveredIds: () => getDeliveredIds(db),
     markDelivered: (messageOutId, platformMessageId) => markDelivered(db, messageOutId, platformMessageId),

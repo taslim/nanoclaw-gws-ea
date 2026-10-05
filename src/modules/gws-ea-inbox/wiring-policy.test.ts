@@ -1,7 +1,8 @@
 /**
- * The inbox's one wiring is pinned where wirings are written (KTD3, KTD4):
- * the inbox reaches only external-email, external-email only the inbox, and
- * only per thread.
+ * The email channel's two wirings are pinned where wirings are written
+ * (KTD1): the inbox reaches only external-email, external-email only the
+ * inbox, and only per thread; the principal's email conversation reaches only
+ * main, in its shared session, from known senders.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -20,7 +21,9 @@ import {
 } from '../../db/messaging-groups.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import type { MessagingGroupAgent } from '../../types.js';
-import { ensureInbox } from './index.js';
+import '../gws-ea-profile/index.js';
+import { reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
+import { ensureInbox, ensurePrincipalConversation } from './index.js';
 
 const now = () => new Date().toISOString();
 
@@ -41,15 +44,25 @@ function wiring(
 }
 
 let inbox: string;
+let principalEmail: string;
 
 beforeEach(async () => {
   await runMigrations(await initTestDb());
   for (const [id, name] of [
     ['ag-external', 'external-email'],
     ['ag-other', 'research'],
+    ['ag-main', 'main'],
   ] as const) {
     await createAgentGroup({ id, name, folder: name, agent_provider: null, created_at: now() });
   }
+  await reconcileGwsEaProfile({
+    assistantDisplayName: 'Aya',
+    assistantWorkspaceEmail: 'aya@example.test',
+    principalDisplayName: 'Pat',
+    principalTimezone: 'UTC',
+    mainAgentGroupId: 'ag-main',
+    principalEmails: ['pat@example.test'],
+  });
   await createMessagingGroup({
     id: 'mg-other',
     channel_type: 'gchat',
@@ -60,6 +73,7 @@ beforeEach(async () => {
     created_at: now(),
   });
   inbox = await ensureInbox('ag-external');
+  principalEmail = await ensurePrincipalConversation('ag-main');
 });
 
 afterEach(async () => {
@@ -91,12 +105,62 @@ describe('the inbox wiring', () => {
     );
   });
 
+  it('refuses main on the inbox', async () => {
+    await expect(
+      createMessagingGroupAgent(
+        wiring({
+          id: 'w-main',
+          messaging_group_id: inbox,
+          agent_group_id: 'ag-main',
+          sender_scope: 'known',
+          session_mode: 'agent-shared',
+        }),
+      ),
+    ).rejects.toThrow(/wiring rejected/);
+  });
+
   it('leaves every other wiring alone', async () => {
     await expect(
       createMessagingGroupAgent(
         wiring({ id: 'w3', messaging_group_id: 'mg-other', agent_group_id: 'ag-other', session_mode: 'shared' }),
       ),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("the principal's email conversation", () => {
+  it('is created once, wired to main alone', async () => {
+    expect(await ensurePrincipalConversation('ag-main')).toBe(principalEmail);
+    expect(await getMessagingGroupAgentByPair(principalEmail, 'ag-main')).toMatchObject({
+      session_mode: 'agent-shared',
+      sender_scope: 'known',
+      threads: 1,
+    });
+  });
+
+  it.each(['ag-other', 'ag-external'])('refuses %s on it', async (agentGroupId) => {
+    await expect(
+      createMessagingGroupAgent(
+        wiring({
+          id: `w-${agentGroupId}`,
+          messaging_group_id: principalEmail,
+          agent_group_id: agentGroupId,
+          sender_scope: 'known',
+          session_mode: 'agent-shared',
+        }),
+      ),
+    ).rejects.toThrow(/wired only to main|external-email is wired only to the inbox/);
+  });
+
+  it.each<[keyof MessagingGroupAgent, unknown]>([
+    ['engage_mode', 'mention'],
+    ['threads', 0],
+    ['ignored_message_policy', 'accumulate'],
+  ])('refuses changing %s', async (column, value) => {
+    const current = await getMessagingGroupAgentByPair(principalEmail, 'ag-main');
+    await expect(updateMessagingGroupAgent(current?.id ?? '', { [column]: value })).rejects.toThrow(
+      new RegExp(`${column} must be`),
+    );
   });
 });
 

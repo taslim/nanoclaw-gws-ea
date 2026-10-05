@@ -1,8 +1,7 @@
 /**
- * Whether the inbox is working (KTD4, KTD12). Polling that keeps failing
- * makes it unhealthy: the principal hears one plain sentence, follow-through
- * deadlines read `getInboxHealth()` and pause, and status shows it. The first
- * good poll makes it healthy again.
+ * Whether the inbox is working. Polling that keeps failing makes it
+ * unhealthy: the principal hears one plain sentence, and status shows it
+ * through `gws-ea-inbox health`. The first good poll makes it healthy again.
  */
 import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
@@ -23,7 +22,7 @@ export interface InboxHealth {
   readonly calendarNotifications: { readonly state: 'unknown' | 'ok' | 'failing'; readonly reason: string | null };
 }
 
-/** The inbox's health, for follow-through deadlines and status. */
+/** The inbox's health, as status reads it. */
 export async function getInboxHealth(): Promise<InboxHealth> {
   const state = await getInboxState();
   return {
