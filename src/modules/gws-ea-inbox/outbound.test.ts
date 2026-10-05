@@ -67,6 +67,7 @@ import {
   ensurePrincipalConversation,
   GoogleApiError,
   INBOX_PLATFORM_ID,
+  PRINCIPAL_PLATFORM_ID,
   type GmailApi,
   type GmailHistoryRecord,
   type GmailMessage,
@@ -347,7 +348,6 @@ interface Row {
   /** Absent from the host's answers to a request. */
   readonly text?: string;
   readonly signal?: { readonly type: string; readonly thread_id: string | null };
-  readonly email?: { readonly thread_key: string };
 }
 
 function rows(session: Session): Row[] {
@@ -857,7 +857,7 @@ describe("main's email_send", () => {
     ]);
   });
 
-  it('is refused for an outside thread, and takes no subject, recipients, or files', async () => {
+  it('is refused for an outside thread, and takes no subject or recipients', async () => {
     const { key } = await arrives({ threadId: 'g-sam', from: SAM, body: 'Hello' });
     expect(refusalOf(await emailSend(main, { thread_key: key, text: 'Hello Sam' }))).toMatch(/principal/u);
     gmail.receive({ threadId: 'g-pat', from: `Pat <${PRINCIPAL}>`, principal: true, body: 'Ping' });
@@ -870,6 +870,33 @@ describe("main's email_send", () => {
       });
     }
     expect(gmail.sent).toEqual([]);
+  });
+
+  it('carries the files main staged to the principal, by request or in a reply, and refuses one it never staged', async () => {
+    gmail.receive({ threadId: 'g-pat', from: `Pat <${PRINCIPAL}>`, principal: true, body: 'Send me the deck.' });
+    await inbox.tick();
+    const own = await threadOf('g-pat');
+    const deck = Buffer.from('%PDF-1.4 the board deck');
+    const notes = Buffer.from('Notes from the board meeting.');
+
+    expect(await emailSend(main, { thread_key: own, text: 'Here it is.' }, { 'deck.pdf': deck })).toMatchObject({
+      ok: true,
+    });
+    await queue(main, {
+      platformId: PRINCIPAL_PLATFORM_ID,
+      threadKey: own,
+      content: { text: 'And the notes.', files: ['notes.txt'] },
+      files: { 'notes.txt': notes },
+    });
+    expect(gmail.sent.map((sent) => [sent.to, sent.files])).toEqual([
+      [[PRINCIPAL], [{ name: 'deck.pdf', data: deck }]],
+      [[PRINCIPAL], [{ name: 'notes.txt', data: notes }]],
+    ]);
+
+    expect(
+      refusalOf(await emailSend(main, { thread_key: own, text: 'And the minutes.', files: ['minutes.pdf'] })),
+    ).toMatch(/staged with this request/u);
+    expect(gmail.sent).toHaveLength(2);
   });
 });
 

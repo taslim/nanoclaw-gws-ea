@@ -32,9 +32,6 @@ import { isPersonFacingPost, registerTurnFailedHook } from '../gws-ea-notices/in
 import { getExternalEmailAgentGroupId } from '../gws-ea-profile/db.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 
-/** The `note.type` of the fact main reads. */
-export const FAILED_NOTE_TYPE = 'gws-ea-external-email.failed';
-
 type Cause = 'delivery-failed' | 'inbound-failed' | 'turn-failed';
 
 /** The email thread a session of external-email works; undefined for every other session. */
@@ -68,7 +65,6 @@ async function tellMain(cause: Cause, threadKey: string, failed: readonly string
     id: `external-email-${cause}-${digest}`,
     timestamp: new Date().toISOString(),
     text: whatFailed(cause, threadKey),
-    fields: { note: { type: FAILED_NOTE_TYPE, thread_key: threadKey, cause } },
     wake: true,
   });
   if (result === 'no-main' || result === 'no-principal') {

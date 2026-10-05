@@ -16,7 +16,7 @@ export const REMINDER_REQUEST_TIMEOUT_MS = 30_000;
 export const remindMe = requestTool({
   name: 'remind_me',
   description:
-    'Come back to this conversation at a time you choose, at most 30 days ahead: your note arrives here then, as a message from your reminder. Answers with the reminder id.',
+    'Come back to this conversation at a time you choose, up to a year ahead: your note arrives here then, as a message from your reminder. Answers with the reminder id.',
   properties: {
     at: {
       type: 'string',

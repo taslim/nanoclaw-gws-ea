@@ -44,7 +44,15 @@ const ALL = [
 const EXTERNAL_EMAIL = ['files-read', 'time', 'request-status', 'gws-ea-reminders', 'gws-ea-email-external'];
 
 /** external-email's thread tools, which `gws-ea-email-external` grants. */
-const EXTERNAL_EMAIL_TOOLS = ['book', 'cancel_booking', 'email_send', 'free_time', 'hold', 'move_booking', 'tell_main'];
+const EXTERNAL_EMAIL_TOOLS = [
+  'book',
+  'cancel_booking',
+  'change_booking',
+  'email_send',
+  'free_time',
+  'hold',
+  'tell_main',
+];
 
 /** main's email tools, which `gws-ea-email` grants. */
 const MAIN_EMAIL_TOOLS = ['email_handoff', 'email_principal'];
@@ -124,7 +132,7 @@ describe('NanoClaw tool server capabilities', () => {
 
   it('gives main neither tell_main nor the scheduling tools', async () => {
     const tools = await served(ALL);
-    for (const tool of ['tell_main', 'free_time', 'hold', 'book', 'move_booking', 'cancel_booking']) {
+    for (const tool of ['tell_main', 'free_time', 'hold', 'book', 'change_booking', 'cancel_booking']) {
       expect(tools).not.toContain(tool);
     }
   });
@@ -140,7 +148,7 @@ describe('NanoClaw tool server capabilities', () => {
         await close();
       }
     }
-    expect(await fieldsOf(ALL, 'email_principal')).toEqual(['text', 'thread_key']);
+    expect(await fieldsOf(ALL, 'email_principal')).toEqual(['files', 'text', 'thread_key']);
     expect(await fieldsOf(ALL, 'email_send')).toBeUndefined();
     expect(await fieldsOf(EXTERNAL_EMAIL, 'email_send')).toEqual(['cc', 'files', 'subject', 'text', 'to']);
     expect(await fieldsOf(EXTERNAL_EMAIL, 'email_principal')).toBeUndefined();

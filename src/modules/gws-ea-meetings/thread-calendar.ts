@@ -1,6 +1,6 @@
 /**
  * What each email thread placed on the principal's calendar (KTD7): its
- * holds, each with when it lapses, and its bookings, which it alone may move
+ * holds, each with when it lapses, and its bookings, which it alone may change
  * or cancel; and the calendar its bookings go on when `main` named one. The
  * tables are described in gws-ea-inbox/migration-email-channel.ts.
  *
@@ -72,9 +72,21 @@ export async function recordThreadHold(hold: ThreadHold): Promise<void> {
   );
 }
 
-/** Forget a hold once its event is gone. */
-export async function deleteThreadHold(calendarId: string, eventId: string): Promise<void> {
-  await getDb().run('DELETE FROM gws_ea_thread_holds WHERE calendar_id = ? AND event_id = ?', calendarId, eventId);
+/**
+ * Forget a hold once its event is gone. Given `expiredBy`, only while it is
+ * still lapsed by then: a hold its thread held again meanwhile stays.
+ */
+export async function deleteThreadHold(calendarId: string, eventId: string, expiredBy?: string): Promise<void> {
+  if (expiredBy === undefined) {
+    await getDb().run('DELETE FROM gws_ea_thread_holds WHERE calendar_id = ? AND event_id = ?', calendarId, eventId);
+    return;
+  }
+  await getDb().run(
+    'DELETE FROM gws_ea_thread_holds WHERE calendar_id = ? AND event_id = ? AND expires_at <= ?',
+    calendarId,
+    eventId,
+    expiredBy,
+  );
 }
 
 export interface ThreadBooking {

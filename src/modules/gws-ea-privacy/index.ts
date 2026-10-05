@@ -15,8 +15,9 @@
  *   - `checkOutbound`, the same check for the host's calendar writes and
  *     main's handoff text, which never pass through a channel.
  *
- * Both read what the assistant wrote, and the target of every link in it as
- * a reader's mail client opens it (`readableParts`).
+ * Both read what the assistant wrote three ways, as its readers receive it:
+ * as written, as a mail client renders it, and the targets of its links
+ * (`readingsOf`).
  *
  * A refusal names only the value's fixed kind, never the value or its label.
  * Removing a value switches its check off, so an agent's removal waits for
@@ -63,6 +64,7 @@ import {
   streamOf,
   type CompiledPrivateValue,
   type PrivateValueKind,
+  type TextStream,
 } from './match.js';
 import { gwsEaPrivacyMigration } from './migration.js';
 
@@ -121,11 +123,11 @@ function refusalReason(kind: PrivateValueKind): string {
 }
 
 function stoppingReason(kind: PrivateValueKind): string {
-  return `it contains the principal's private ${KIND_NOUNS[kind]}, and this conversation is now stopped after repeated attempts. Send nothing more in it; the principal will be told.`;
+  return `it contains the principal's private ${KIND_NOUNS[kind]}, and this conversation is now stopped after repeated attempts. Send nothing more in it; main has been told.`;
 }
 
 const STOPPED_REASON =
-  "this conversation is stopped after repeated attempts to send the principal's private details. Send nothing more in it; the principal will be told.";
+  "this conversation is stopped after repeated attempts to send the principal's private details. Send nothing more in it; main has been told.";
 
 function stoppedSignalText(key: ThreadKey, kind: PrivateValueKind, refusals: number): string {
   return (
@@ -145,37 +147,75 @@ async function compiledValues(): Promise<CompiledPrivateValue[]> {
   return (await listPrivateValues()).map((value) => compilePrivateValue(value.kind, value.value));
 }
 
+const IMAGE = /<img src="[^"]*" alt="([^"]*)"[^>]*>/gu;
 const LINK_TARGET = /<a href="([^"]*)"/gu;
-const ATTRIBUTE_ESCAPES: Readonly<Record<string, string>> = { '&amp;': '&', '&quot;': '"', '&lt;': '<', '&gt;': '>' };
+const TAG = /<[^>]*>/gu;
+const CHARACTER_REFERENCE = /&(?:amp|quot|lt|gt);/gu;
+const REFERENCED: Readonly<Record<string, string>> = { '&amp;': '&', '&quot;': '"', '&lt;': '<', '&gt;': '>' };
 
-/**
- * The targets of a text's links, as a reader's mail client opens them:
- * markdown's character references resolved, as its renderer resolves them.
- * Their percent-encoding is decoded by the matcher, like every text's.
- */
-function linkTargets(text: string): string[] {
-  const html = micromark(text, { extensions: [gfm()], htmlExtensions: [gfmHtml()] });
-  return [...html.matchAll(LINK_TARGET)]
-    .map((match) => (match[1] ?? '').replace(/&(?:amp|quot|lt|gt);/gu, (escape) => ATTRIBUTE_ESCAPES[escape] ?? escape))
-    .filter((target) => target !== '');
+/** micromark's HTML as text: it writes these four character references and no other. */
+function unescapeHtml(html: string): string {
+  return html.replace(CHARACTER_REFERENCE, (reference) => REFERENCED[reference] ?? reference);
 }
 
-/** What readers receive of these texts: each as written, followed by its link targets. */
-function readableParts(parts: readonly string[]): string[] {
-  return parts.flatMap((part) => [part, ...linkTargets(part)]);
+/**
+ * A markdown text as a reader's mail client renders it (as the email
+ * renderer in src/modules/gws-ea-inbox/render.ts writes it): its words, with
+ * an image read as its words and the markup gone, and the targets of its
+ * links. micromark resolves the markdown's character references, so
+ * `1&#50;3` reads as the `123` a reader sees. Percent-encoding is decoded by
+ * the matcher, like every text's.
+ */
+function rendered(text: string): { readonly words: string; readonly targets: readonly string[] } {
+  const html = micromark(text, { extensions: [gfm()], htmlExtensions: [gfmHtml()] });
+  return {
+    words: unescapeHtml(html.replace(IMAGE, '$1').replace(TAG, '')),
+    targets: [...html.matchAll(LINK_TARGET)]
+      .map((match) => unescapeHtml(match[1] ?? ''))
+      .filter((target) => target !== ''),
+  };
+}
+
+/**
+ * These texts as their readers receive them, each reading its own stream:
+ * as written (an email's plain-text part, a calendar's fields), as a mail
+ * client renders them, and the targets of their links. Within a reading the
+ * texts run on, so a value split across them is found; apart, the end of one
+ * reading never runs into the start of the next.
+ */
+function readingsOf(parts: readonly string[]): readonly [written: TextStream, ...others: TextStream[]] {
+  const renders = parts.map(rendered);
+  return [
+    streamOf(parts),
+    streamOf(renders.map((render) => render.words)),
+    streamOf(renders.flatMap((render) => render.targets)),
+  ];
+}
+
+/** The kind of the first value any reading gives away, read after the thread's earlier text. */
+function kindGivenAway(
+  values: readonly CompiledPrivateValue[],
+  readings: readonly TextStream[],
+  history?: TextStream,
+): PrivateValueKind | undefined {
+  for (const reading of readings) {
+    const match = findPrivateValue(values, reading, history);
+    if (match) return match.kind;
+  }
+  return undefined;
 }
 
 /**
  * Check text bound for `audience`: the principal may receive anything, and
  * anyone else no private value. `content` is one text, or the fields of one
  * write (a calendar event's title, location, description, and comments),
- * read in order as one stream so a value split across fields is found too.
+ * read in order so a value split across fields is found too.
  */
 export async function checkOutbound(content: string | readonly string[], audience: Audience): Promise<OutboundCheck> {
   if (audience === 'principal') return { allowed: true };
   const parts = typeof content === 'string' ? [content] : content;
-  const match = findPrivateValue(await compiledValues(), streamOf(readableParts(parts)));
-  return match ? { allowed: false, kind: match.kind, reason: refusalReason(match.kind) } : { allowed: true };
+  const kind = kindGivenAway(await compiledValues(), readingsOf(parts));
+  return kind ? { allowed: false, kind, reason: refusalReason(kind) } : { allowed: true };
 }
 
 /** Every string and number in the serialized message, in order, whatever its shape. */
@@ -199,9 +239,8 @@ function parsedContent(content: string): unknown {
 
 /**
  * The text a send carries: every field of its message, each file's name, and
- * each file that is text, with their link targets. A binary file is a form
- * of encoding the check cannot read, a known residual alongside spelled-out
- * values.
+ * each file that is text. A binary file is a form of encoding the check
+ * cannot read, a known residual alongside spelled-out values.
  */
 function sendText(send: OutboundSend): string[] {
   const parts: string[] = [];
@@ -210,7 +249,7 @@ function sendText(send: OutboundSend): string[] {
     parts.push(file.filename);
     if (isUtf8(file.data)) parts.push(file.data.toString('utf8'));
   }
-  return readableParts(parts);
+  return parts;
 }
 
 /** The outbound guard: refuses a send to anyone but the principal that gives a private value away. */
@@ -219,11 +258,13 @@ async function judgeSend(send: OutboundSend): Promise<OutboundGuardDecision> {
   if ((await resolveAudience(send)) === 'principal') return { effect: 'allow' };
   const values = await compiledValues();
   const key: ThreadKey = { channelType: send.channelType, platformId: send.platformId, threadId: send.threadId };
-  const current = streamOf(sendText(send));
+  const readings = readingsOf(sendText(send));
+  // The thread remembers each send as written, the reading every reader receives in some form.
+  const [written] = readings;
   const verdict = await judgeThreadSend(
     key,
-    current,
-    (history) => findPrivateValue(values, current, history)?.kind,
+    written,
+    (history) => kindGivenAway(values, readings, history),
     MAX_REFUSALS_PER_THREAD,
   );
   switch (verdict.outcome) {

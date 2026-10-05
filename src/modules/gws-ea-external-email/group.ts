@@ -46,7 +46,7 @@ registerCapability(MAIN_EMAIL_CAPABILITY, {
 });
 registerCapability(EXTERNAL_EMAIL_TOOLS_CAPABILITY, {
   description:
-    "email_send, tell_main, free_time, hold, book, move_booking, cancel_booking: external-email's email and scheduling in its own thread, and word to main",
+    "email_send, tell_main, free_time, hold, book, change_booking, cancel_booking: external-email's email and scheduling in its own thread, and word to main",
   default: 'off',
   instructions: [EXTERNAL_EMAIL_TOOLS_CAPABILITY],
 });

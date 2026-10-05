@@ -12,7 +12,11 @@
  *
  * `requestTool` makes a tool of one such request: the tool is named after
  * the action it sends, and its answer, or its timeout, is what the agent reads.
+ * A request that sends a message is marked as one, so the poll loop counts
+ * its success as the turn's reply (`deliveredByRequest`).
  */
+import fs from 'node:fs';
+import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
@@ -35,6 +39,8 @@ export type ActionRequestResult =
 export interface ActionRequestOptions {
   /** How long to wait for the host's answer. */
   readonly timeoutMs: number;
+  /** The request sends a message when the host answers it ok (`deliveredByRequest`). */
+  readonly delivers?: boolean;
   /** How often to look for it; 500 ms by default. */
   readonly pollMs?: number;
   readonly signal?: AbortSignal;
@@ -47,6 +53,16 @@ export interface ActionRequestOptions {
 
 export function newRequestId(): string {
   return `act-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+const OUTBOX = '/workspace/outbox';
+
+/**
+ * Where a request's files are staged, under its id: the host reads them from
+ * there alone, and clears it once it has answered the request.
+ */
+export function requestOutbox(requestId: string): string {
+  return path.join(OUTBOX, requestId);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -90,8 +106,28 @@ export function readAnswer(requestId: string): ActionResponseFrame | undefined {
 }
 
 /**
+ * Whether an outbound row is a request that sends a message and the host
+ * answered it ok: the message went out, as surely as a chat row does. Reads
+ * the answer without marking it completed, so the tool that waits for it, or
+ * `request_status`, still finds it.
+ */
+export function deliveredByRequest(row: { readonly kind: string; readonly content: string }): boolean {
+  if (row.kind !== 'system') return false;
+  let request: unknown;
+  try {
+    request = JSON.parse(row.content);
+  } catch {
+    return false;
+  }
+  if (!isRecord(request) || request.delivers !== true || typeof request.requestId !== 'string') return false;
+  const answer = getMessageIn(`action-resp-${request.requestId}`);
+  return answer !== undefined && frameOf(answer.content, request.requestId).ok;
+}
+
+/**
  * Send `action` with `fields` to the host and wait for its answer. The action
- * name and request id are set here and never taken from `fields`.
+ * name, the request id and the mark of a request that sends a message are set
+ * here and never taken from `fields`.
  */
 export async function requestAction(
   action: string,
@@ -104,7 +140,8 @@ export async function requestAction(
   await writeMessageOut({
     id: requestId,
     kind: 'system',
-    content: JSON.stringify({ ...fields, action, requestId }),
+    // An unmarked request carries no `delivers` at all: JSON leaves out an undefined value.
+    content: JSON.stringify({ ...fields, action, requestId, delivers: options.delivers === true || undefined }),
   });
 
   const deadline = Date.now() + options.timeoutMs;
@@ -149,8 +186,14 @@ export interface RequestToolSpec {
   readonly repeatable: boolean;
   readonly timeoutMs: number;
   /**
-   * The request's fields made ready under its id, such as files staged in the
-   * outbox, or why the call cannot go as asked. Runs before anything is sent.
+   * The action sends a message when the host answers it ok, so its success
+   * is the turn's reply and draws no nudge to re-send one.
+   */
+  readonly delivers?: true;
+  /**
+   * The request's fields made ready under its id, such as files staged in its
+   * outbox (`requestOutbox`), or why the call cannot go as asked. Runs before
+   * anything is sent.
    */
   readonly prepare?: (fields: Record<string, unknown>, requestId: string) => Record<string, unknown> | string;
 }
@@ -186,12 +229,22 @@ export function requestTool(spec: RequestToolSpec): McpToolDefinition {
         Object.keys(spec.properties).flatMap((field) => (args[field] === undefined ? [] : [[field, args[field]]])),
       );
       const requestId = newRequestId();
-      const fields = spec.prepare ? spec.prepare(given, requestId) : given;
+      let fields: Record<string, unknown> | string;
+      try {
+        fields = spec.prepare ? spec.prepare(given, requestId) : given;
+      } catch (error) {
+        // Nothing was sent, so no answer will come to clear what was staged.
+        fs.rmSync(requestOutbox(requestId), { recursive: true, force: true });
+        return errorResult(
+          `The request could not be made ready: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
       if (typeof fields === 'string') return errorResult(fields);
       const result = await requestAction(spec.action ?? spec.name, fields, {
         timeoutMs: spec.timeoutMs,
         signal,
         requestId,
+        delivers: spec.delivers,
       });
       switch (result.status) {
         case 'cancelled':

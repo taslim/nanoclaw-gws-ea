@@ -30,12 +30,13 @@
  * For `main`, `email_send` writes to the principal in the thread it names,
  * by the rules of its replies there (principal-reply.ts): only to the address
  * Gmail verified wrote the thread's latest principal-only message, and never
- * in a thread that has none.
+ * in a thread that has none. It may carry any file `main` staged: the
+ * principal may receive anything.
  *
  * Each request is answered once, a refusal or failure included:
  *
  *   email_send (external-email) { text, subject?, to?, cc?, files? } → { thread_key, message }
- *   email_send (main)           { thread_key, text }                  → { thread_key, message }
+ *   email_send (main)           { thread_key, text, files? }          → { thread_key, message }
  *
  * `files` names the files the tool staged in the request's outbox. A replay
  * of a request sends nothing twice: its send is keyed by the request.
@@ -360,29 +361,40 @@ async function deliverEmail(
   await delivery.deliver(EMAIL_CHANNEL_TYPE, platformId, threadKey, 'chat', JSON.stringify(email), files);
 }
 
-function fileNamesOf(value: unknown): string[] {
-  if (value === undefined) return [];
-  if (Array.isArray(value) && value.length <= MAX_FILES) {
-    const names = value.filter((name: unknown): name is string => typeof name === 'string');
-    if (names.length === value.length) return names;
+/** The files a request names, read from its own outbox; refused unless each one is there. */
+function stagedFiles(session: Session, requestId: string, value: unknown): OutboundFile[] | undefined {
+  if (value === undefined) return undefined;
+  const names = Array.isArray(value) ? value.filter((name: unknown): name is string => typeof name === 'string') : [];
+  if (!Array.isArray(value) || value.length > MAX_FILES || names.length !== value.length) {
+    throw invalidArgs(`files must name up to ${MAX_FILES} files you staged with this request`);
   }
-  throw invalidArgs(`files must name up to ${MAX_FILES} files you staged with this request`);
+  if (names.length === 0) return undefined;
+  const files = readOutboxFiles(session.agent_group_id, session.id, requestId, names);
+  if (files?.length !== names.length) {
+    throw invalidArgs('files must name files you staged with this request; some were not found');
+  }
+  return files;
 }
 
-/** `main` writes to the principal in one of their threads, as its replies there go. */
-async function toPrincipal(content: Record<string, unknown>, requestId: string): Promise<Record<string, unknown>> {
+/** `main` writes to the principal in one of their threads, as its replies there go, with any files it staged. */
+async function toPrincipal(
+  content: Record<string, unknown>,
+  session: Session,
+  requestId: string,
+): Promise<Record<string, unknown>> {
   const threadKey = content.thread_key;
   if (typeof threadKey !== 'string' || !THREAD_KEY.test(threadKey)) {
     throw invalidArgs('thread_key must be the mail-… key of the principal’s thread, as its note gave it');
   }
-  for (const field of ['subject', 'to', 'cc', 'files'] as const) {
+  for (const field of ['subject', 'to', 'cc'] as const) {
     if (content[field] !== undefined) {
       throw invalidArgs(`An email to the principal goes to them alone, in their thread: leave out ${field}.`);
     }
   }
+  const files = stagedFiles(session, requestId, content.files);
   const words = emailWords({ text: content.text, request: requestId });
   if (words === undefined || words.text.trim() === '') throw invalidArgs('text must be the words of your email');
-  await deliverEmail(PRINCIPAL_PLATFORM_ID, threadKey, words, undefined);
+  await deliverEmail(PRINCIPAL_PLATFORM_ID, threadKey, words, files);
   return {
     thread_key: threadKey,
     message: 'Your email went to the principal, in their thread. Do not repeat it here.',
@@ -400,7 +412,6 @@ async function inThread(
   }
   const threadKey = session.thread_id;
   if (threadKey === null) throw new Error(`Session ${session.id} has no thread`);
-  const names = fileNamesOf(content.files);
   let email: OutsideEmail;
   try {
     email = outsideEmailOf({
@@ -413,10 +424,7 @@ async function inThread(
   } catch (error) {
     throw error instanceof OutboundRefusedError ? invalidArgs(error.reason) : error;
   }
-  const files = names.length === 0 ? undefined : readOutboxFiles(session.agent_group_id, session.id, requestId, names);
-  if (names.length > 0 && files?.length !== names.length) {
-    throw invalidArgs('files must name files you staged with this request; some were not found');
-  }
+  const files = stagedFiles(session, requestId, content.files);
   await deliverEmail(INBOX_PLATFORM_ID, threadKey, email, files);
   return { thread_key: threadKey, message: 'Your email is sent.' };
 }
@@ -425,7 +433,7 @@ async function inThread(
 const emailSend: ActionAnswer = async (content, session, requestId) => {
   try {
     return session.agent_group_id === (await getMainAgentGroupId())
-      ? await toPrincipal(content, requestId)
+      ? await toPrincipal(content, session, requestId)
       : await inThread(content, session, requestId);
   } catch (error) {
     // An outbound guard refused the email as written.

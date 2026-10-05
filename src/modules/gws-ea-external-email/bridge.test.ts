@@ -298,14 +298,11 @@ afterEach(async () => {
 // ---------------------------------------------------------------------------
 
 describe('email_handoff', () => {
-  it('starts a thread to the people main names, who may then be written to, with main’s words in its session (AE64)', async () => {
-    const before = Date.now();
+  it('starts a thread with the people main names, who may then be written to, with main’s words in its session (AE64)', async () => {
     const frame = await handoff({
-      to: [REMY],
-      cc: [PRINCIPAL],
+      people: [REMY, PRINCIPAL],
       message: 'Pat forwarded Remy’s lunch invitation and said to reply: yes to Thursday, and ask where.',
     });
-    const after = Date.now();
     const key = keyOf(frame);
 
     expect(key).toMatch(/^mail-[A-Za-z0-9-]+$/u);
@@ -331,20 +328,20 @@ describe('email_handoff', () => {
     const text = row.content.text ?? '';
     expect(text).toContain(key);
     expect(text).toContain('Pat forwarded Remy’s lunch invitation and said to reply: yes to Thursday, and ask where.');
-    expect(text).toContain(`to ${REMY}`);
-    expect(text).toContain(`cc ${PRINCIPAL} (the principal's)`);
+    expect(text).toContain(`main named: ${REMY}, ${PRINCIPAL} (the principal's).`);
+    expect(text).not.toMatch(/\b(?:to|cc) (?:remy|pat)@/u);
     expect(text).toContain('The principal is Pat Doe');
     expect(text).toContain('America/New_York');
-    // Worked at a human pace, like everything else that reaches the thread.
-    const due = Date.parse(row.process_after ?? '');
-    expect(due).toBeGreaterThanOrEqual(before + 3 * 60_000);
-    expect(due).toBeLessThanOrEqual(after + 6 * 60_000);
+    // No mail waits in a new thread, so main's words are due now, and wake its session.
+    expect(row.process_after).toBeNull();
+    expect(vi.mocked(requestWake).mock.calls.map(([woken]) => woken.id)).toEqual([session.id]);
     expect(data(frame).message).toContain(key);
+    expect(data(frame).message).toContain(`with ${REMY}, ${PRINCIPAL}`);
   });
 
   it('lands each handoff in its own thread’s session, with two concurrent threads to the same person', async () => {
-    const first = keyOf(await handoff({ to: [REMY], message: 'Find 30 minutes with Remy next week.' }));
-    const second = keyOf(await handoff({ to: [REMY], message: 'Ask Remy for the signed lease.' }));
+    const first = keyOf(await handoff({ people: [REMY], message: 'Find 30 minutes with Remy next week.' }));
+    const second = keyOf(await handoff({ people: [REMY], message: 'Ask Remy for the signed lease.' }));
     expect(first).not.toBe(second);
 
     expect(data(await handoff({ thread_key: first, message: 'Pat prefers mornings.' })).thread_key).toBe(first);
@@ -371,7 +368,9 @@ describe('email_handoff', () => {
     expect(data(frame).thread_key).toBe(key);
     expect(await externalEmailSessions()).toBe(1);
     expect(texts(session)).toEqual([expect.stringContaining('Pat is glad to meet Jane; offer next week.')]);
-    expect(rows(session)[0]).toMatchObject({ platform_id: INBOX_PLATFORM_ID, thread_id: key });
+    // Nothing waits in the thread's session, so main's words are due now.
+    expect(rows(session)[0]).toMatchObject({ platform_id: INBOX_PLATFORM_ID, thread_id: key, process_after: null });
+    expect(vi.mocked(requestWake).mock.calls.map(([woken]) => woken.id)).toEqual([session.id]);
   });
 
   it("joins main's words to the wait the thread's mail already set, so both are worked together", async () => {
@@ -390,6 +389,8 @@ describe('email_handoff', () => {
 
     const waits = new Map(rows(session).map((row) => [row.id, row.process_after]));
     expect(waits.get('handoff-act-joined')).toBe(waits.get('jane-1'));
+    // The sweep wakes the session when the wait is over, not the handoff.
+    expect(requestWake).not.toHaveBeenCalled();
   });
 
   it('lets main name someone for a thread that exists, whom external-email may then include', async () => {
@@ -398,15 +399,16 @@ describe('email_handoff', () => {
       reason: expect.stringMatching(/only main brings someone new in/u),
     });
 
-    const frame = await handoff({ thread_key: key, cc: [REMY], message: 'Pat wants Remy on this one too.' });
+    const frame = await handoff({ thread_key: key, people: [REMY], message: 'Pat wants Remy on this one too.' });
 
     expect(data(frame).thread_key).toBe(key);
+    expect(data(frame).message).toContain(`It may write to ${REMY} there.`);
     expect(await threadAddresses(key)).toContainEqual({ address: REMY, source: 'main' });
     await expect(threadRecipients(key, { to: [JANE], cc: [REMY] }, new Set([JUNO]))).resolves.toEqual({
       to: [JANE],
       cc: [REMY],
     });
-    expect(texts(session).join('\n')).toContain(`cc ${REMY}`);
+    expect(texts(session).join('\n')).toContain(`main named: ${REMY}.`);
   });
 
   it('refuses a thread it cannot hand over: one that does not exist, or one only the principal and the assistant are on', async () => {
@@ -416,7 +418,7 @@ describe('email_handoff', () => {
     await recordThreadMessage({ threadKey: principalOnly, side: 'principal', gmailMessageId: 'p1' }, now());
     await recordThreadAddresses(principalOnly, [PRINCIPAL], 'message', now());
     expect(refusal(await handoff({ thread_key: principalOnly, message: 'Reply to them.' }))).toMatch(
-      /only the principal.*name them in to/u,
+      /only the principal.*name them in people without thread_key/u,
     );
     expect(await externalEmailSessions()).toBe(0);
   });
@@ -424,15 +426,15 @@ describe('email_handoff', () => {
   it('refuses a private value in the message, a recipient, a text file, or a file’s name, tells main why, and hands nothing over', async () => {
     await addPrivateValue({ label: 'Personal email', kind: 'email', value: PERSONAL_EMAIL });
 
-    const inMessage = await handoff({ to: [REMY], message: `Send the card to ${HOME}.` });
-    const inRecipient = await handoff({ to: [REMY], cc: [PERSONAL_EMAIL], message: 'Loop Pat in.' });
+    const inMessage = await handoff({ people: [REMY], message: `Send the card to ${HOME}.` });
+    const inRecipient = await handoff({ people: [REMY, PERSONAL_EMAIL], message: 'Loop Pat in.' });
     const inFile = await handoff(
-      { to: [REMY], message: 'The notes are attached.', files: ['notes.txt'] },
+      { people: [REMY], message: 'The notes are attached.', files: ['notes.txt'] },
       { 'notes.txt': Buffer.from(`Home: ${HOME}`) },
     );
     // A file that is not text carries the value in its name alone.
     const inFileName = await handoff(
-      { to: [REMY], message: 'The map is attached.', files: [`${HOME}.pdf`] },
+      { people: [REMY], message: 'The map is attached.', files: [`${HOME}.pdf`] },
       { [`${HOME}.pdf`]: Buffer.from([0x25, 0x50, 0x44, 0x46, 0xff, 0x00, 0x9c]) },
     );
 
@@ -453,11 +455,11 @@ describe('email_handoff', () => {
     const secret = path.join(TEST_DIR, 'secret.txt');
     fs.writeFileSync(secret, 'the board deck');
     const linked = await handoff(
-      { to: [REMY], message: 'Attached.', files: ['deck.txt'] },
+      { people: [REMY], message: 'Attached.', files: ['deck.txt'] },
       { 'deck.txt': { linkTo: secret } },
     );
-    const escaping = await handoff({ to: [REMY], message: 'Attached.', files: ['../secret.txt'] });
-    const absolute = await handoff({ to: [REMY], message: 'Attached.', files: [secret] });
+    const escaping = await handoff({ people: [REMY], message: 'Attached.', files: ['../secret.txt'] });
+    const absolute = await handoff({ people: [REMY], message: 'Attached.', files: [secret] });
 
     for (const answer of [linked, escaping, absolute]) expect(refusal(answer)).toMatch(/staged with this request/u);
     expect(await count('gws_ea_threads')).toBe(0);
@@ -470,7 +472,7 @@ describe('email_handoff', () => {
     const notes = Buffer.from('Agenda: the lease, then lunch.');
     const requestId = 'act-files';
     const frame = await handoff(
-      { to: [REMY], message: 'Send Remy the agenda and notes.', files: ['agenda.pdf', 'notes.txt'] },
+      { people: [REMY], message: 'Send Remy the agenda and notes.', files: ['agenda.pdf', 'notes.txt'] },
       { 'agenda.pdf': agenda, 'notes.txt': notes },
       requestId,
     );
@@ -492,7 +494,7 @@ describe('email_handoff', () => {
       ).toEqual(bytes);
     }
     // Recorded for this thread alone.
-    const other = keyOf(await handoff({ to: [JANE], message: 'Say hello to Jane.' }));
+    const other = keyOf(await handoff({ people: [JANE], message: 'Say hello to Jane.' }));
     expect(await findThreadFile(other, sha256(notes))).toBeUndefined();
     // main's staged copies are gone once handed over.
     expect(fs.existsSync(path.join(sessionDir(main.agent_group_id, main.id), 'outbox', requestId))).toBe(false);
@@ -515,11 +517,11 @@ describe('email_handoff', () => {
   });
 
   it('records the calendar main names for the thread’s bookings, when the principal’s and writable', async () => {
-    const key = keyOf(await handoff({ to: [REMY], message: 'Book the team sync.', calendar: TEAM_CALENDAR }));
+    const key = keyOf(await handoff({ people: [REMY], message: 'Book the team sync.', calendar: TEAM_CALENDAR }));
     expect(await getThreadBookingCalendar(key)).toBe(TEAM_CALENDAR);
 
     for (const calendarId of [SHARED_CALENDAR, PARTNER_CALENDAR, 'someone@else.example']) {
-      expect(refusal(await handoff({ to: [JANE], message: 'Book it.', calendar: calendarId }))).toMatch(
+      expect(refusal(await handoff({ people: [JANE], message: 'Book it.', calendar: calendarId }))).toMatch(
         /principal's calendars the assistant can write to/u,
       );
     }
@@ -527,7 +529,7 @@ describe('email_handoff', () => {
   });
 
   it('writes nothing twice when a request is replayed', async () => {
-    const fields = { to: [REMY], message: 'Find 30 minutes with Remy.', files: ['notes.txt'] };
+    const fields = { people: [REMY], message: 'Find 30 minutes with Remy.', files: ['notes.txt'] };
     const staged = { 'notes.txt': Buffer.from('Agenda: the lease, then lunch.') };
     const first = await handoff(fields, staged, 'act-replayed');
     // The host stopped before it answered, its files still staged, so the
@@ -545,12 +547,12 @@ describe('email_handoff', () => {
   it('names a thread or new people, and never the assistant or the principal alone', async () => {
     await inboundThread('g-coffee', JANE);
     for (const [fields, reason] of [
-      [{ message: 'Hello.' }, /thread_key or to/u],
-      [{ cc: [REMY], message: 'Hello.' }, /thread_key or to/u],
-      [{ to: [JUNO], message: 'Hello.' }, /never one of its own recipients/u],
-      [{ to: [PRINCIPAL], message: 'Hello.' }, /someone besides the principal/u],
-      [{ to: ['not an address'], message: 'Hello.' }, /email addresses/u],
-      [{ to: [REMY], message: '  ' }, /message/u],
+      [{ message: 'Hello.' }, /thread_key or people/u],
+      [{ people: [], message: 'Hello.' }, /thread_key or people/u],
+      [{ people: [JUNO], message: 'Hello.' }, /never one of its own recipients/u],
+      [{ people: [PRINCIPAL], message: 'Hello.' }, /someone besides the principal/u],
+      [{ people: ['not an address'], message: 'Hello.' }, /email addresses/u],
+      [{ people: [REMY], message: '  ' }, /message/u],
     ] as const) {
       expect(refusal(await handoff(fields))).toMatch(reason);
     }
@@ -572,12 +574,12 @@ describe('tell_main', () => {
     });
 
     expect(typeof data(frame).message).toBe('string');
-    const note = rows(main).find(
-      (row) => (row.content.note as { type?: string } | undefined)?.type === 'gws-ea-external-email.tell-main',
-    );
-    expect(note?.content.note).toEqual({ type: 'gws-ea-external-email.tell-main', thread_key: key });
-    expect(note?.content.sender).toBe('system');
-    const text = note?.content.text ?? '';
+    const [note, ...others] = rows(main);
+    expect(others).toEqual([]);
+    // Its words are all main reads: nothing typed rides beside them.
+    expect(Object.keys(note.content).sort()).toEqual(['sender', 'senderId', 'text']);
+    expect(note.content.sender).toBe('system');
+    const text = note.content.text ?? '';
     const opening = text.indexOf('<<<EXTERNAL_UNTRUSTED_CONTENT');
     const host = text.slice(0, opening);
     const framed = text.slice(opening);
@@ -600,10 +602,7 @@ describe('tell_main', () => {
     const replayed = await request(session, 'tell_main', fields, {}, 'act-told');
 
     expect(replayed).toEqual(first);
-    const notes = rows(main).filter(
-      (row) => (row.content.note as { type?: string } | undefined)?.type === 'gws-ea-external-email.tell-main',
-    );
-    expect(notes).toHaveLength(1);
+    expect(texts(main)).toHaveLength(1);
     expect(vi.mocked(requestWake).mock.calls.map(([woken]) => woken.id)).toEqual([main.id]);
   });
 });
@@ -625,7 +624,7 @@ describe('the bridge', () => {
     const { session: research } = await resolveSession('ag-research', null, null, 'agent-shared');
 
     for (const caller of [session, research]) {
-      expect(refusal(await request(caller, 'email_handoff', { to: [REMY], message: 'Write to Remy.' }))).toMatch(
+      expect(refusal(await request(caller, 'email_handoff', { people: [REMY], message: 'Write to Remy.' }))).toMatch(
         /Only main/u,
       );
     }

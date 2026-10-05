@@ -11,11 +11,12 @@
  * - `external-email` (capability `gws-ea-email-external`) writes in its own
  *   thread with `email_send`, tells main what main should know with
  *   `tell_main`, and schedules on the principal's calendar with `free_time`,
- *   `hold`, `book`, `move_booking` and `cancel_booking`, each bound by the
+ *   `hold`, `book`, `change_booking` and `cancel_booking`, each bound by the
  *   host to the thread whose session calls it.
  *
  * Both send the host's one `email_send` action, which answers each caller by
  * its own rules; each agent's tool has only the fields and limits that are its.
+ * A sent email is the turn's reply, so both mark the request as delivering.
  *
  * A file goes with a request the way `send_file` sends one: copied into the
  * session's outbox under the request's id before the request is written, and
@@ -24,7 +25,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { requestTool } from '../action-request.js';
+import { requestOutbox, requestTool } from '../action-request.js';
 import { registerTools } from './server.js';
 
 const MAIN_CAPABILITY = 'gws-ea-email';
@@ -34,7 +35,6 @@ const EXTERNAL_CAPABILITY = 'gws-ea-email-external';
 export const EMAIL_REQUEST_TIMEOUT_MS = 120_000;
 
 const WORKSPACE = '/workspace/agent';
-const OUTBOX = '/workspace/outbox';
 const MAX_FILES = 10;
 
 /**
@@ -58,7 +58,7 @@ function stageFiles(fields: Record<string, unknown>, requestId: string): Record<
   const repeated = names.find((name, index) => names.indexOf(name) !== index);
   if (repeated !== undefined) return `Two of the files are named ${repeated}: send them in separate requests.`;
   if (sources.length > 0) {
-    const outbox = path.join(OUTBOX, requestId);
+    const outbox = requestOutbox(requestId);
     fs.mkdirSync(outbox, { recursive: true });
     sources.forEach((source, index) => fs.copyFileSync(source, path.join(outbox, names[index])));
   }
@@ -85,11 +85,14 @@ export const emailHandoff = requestTool({
   ...common,
   name: 'email_handoff',
   description:
-    "Hand external-email work in one email thread: an existing one by thread_key, where to and cc bring people in, or a new one to the addresses in to and cc. It reads your message and writes the emails. The host refuses a message or text file carrying one of the principal's private details. Answers with the thread_key.",
+    "Hand external-email work in one email thread: an existing one by thread_key, or a new one with the people you name. It reads your message, decides who each email goes to and who is copied, and writes the emails. The host refuses a message or text file carrying one of the principal's private details. Answers with the thread_key.",
   properties: {
     thread_key: { type: 'string', description: 'The mail-… key of an existing thread, as a message about it gave it.' },
-    to: { ...ADDRESSES, description: 'Who a new thread goes to, or who joins an existing one on To.' },
-    cc: { ...ADDRESSES, description: 'Who is copied on a new thread, or joins an existing one on Cc.' },
+    people: {
+      ...ADDRESSES,
+      description:
+        'Email addresses of the people a new thread is with (1 to 20), or of anyone to bring into an existing one. Say in your message if someone should only be copied.',
+    },
     message: {
       type: 'string',
       description:
@@ -103,10 +106,7 @@ export const emailHandoff = requestTool({
   },
   required: ['message'],
   repeatable: false,
-  prepare: (fields, requestId) =>
-    fields.thread_key === undefined && fields.to === undefined
-      ? 'Name the thread by thread_key, or start one with to.'
-      : stageFiles(fields, requestId),
+  prepare: stageFiles,
 });
 
 export const emailToPrincipal = requestTool({
@@ -118,9 +118,12 @@ export const emailToPrincipal = requestTool({
   properties: {
     thread_key: { type: 'string', description: 'The mail-… key of the principal’s thread.' },
     text: { type: 'string', description: 'Your email, in markdown.' },
+    files: { ...FILES, description: `${FILES.description} The principal may receive any file.` },
   },
   required: ['thread_key', 'text'],
   repeatable: false,
+  delivers: true,
+  prepare: stageFiles,
 });
 
 // ---------------------------------------------------------------------------
@@ -141,6 +144,7 @@ export const emailSend = requestTool({
   },
   required: ['text'],
   repeatable: false,
+  delivers: true,
   prepare: stageFiles,
 });
 
@@ -158,12 +162,16 @@ export const freeTime = requestTool({
   ...common,
   name: 'free_time',
   description:
-    "The principal's free start times between from and to for a meeting of minutes: up to eight, best fit first, spread out, never in protected time. Each shows the principal's time, the other side's when you give timezone, and how it fits the principal's preferences. Their calendar itself stays hidden.",
+    "The principal's free start times between from and to for a meeting of minutes: up to eight, spread out, in date order, never in protected time. Each shows the principal's time, the other side's when you give timezone, and how it fits the principal's preferences. Their calendar itself stays hidden.",
   properties: {
     from: { type: 'string', description: `The earliest start. ${DATE_TIME}` },
     to: { type: 'string', description: `When the meeting must be over. ${DATE_TIME}` },
     minutes: MINUTES,
-    timezone: { type: 'string', description: "The other side's time zone, such as Africa/Lagos, when you know it." },
+    timezone: {
+      type: 'string',
+      description:
+        "The other side's time zone, such as Africa/Lagos, when you know it: times in their night are left out.",
+    },
   },
   required: ['from', 'to', 'minutes'],
   repeatable: true,
@@ -203,13 +211,21 @@ export const book = requestTool({
   repeatable: false,
 });
 
-export const moveBooking = requestTool({
+export const changeBooking = requestTool({
   ...common,
-  name: 'move_booking',
+  name: 'change_booking',
   description:
-    'Move a booking this thread made to a new start, keeping its length. A time that is protected or no longer free is refused. Google sends the invitees the update, and main hears.',
-  properties: { booking: BOOKING, start: { type: 'string', description: `The new start. ${DATE_TIME}` } },
-  required: ['booking', 'start'],
+    'Change a booking this thread made: its time, length, title, location, notes, or a Google Meet link. Give only what changes. A new time that is protected or no longer free is refused. Google sends the invitees the update, and main hears.',
+  properties: {
+    booking: BOOKING,
+    start: { type: 'string', description: `The new start. ${DATE_TIME}` },
+    minutes: { ...MINUTES, description: 'The new length, in minutes (5 to 480).' },
+    title: { type: 'string', description: 'The new title the invitees see.' },
+    location: { type: 'string', description: 'The new place: an address, a phone number, or their own link.' },
+    notes: { type: 'string', description: 'The new notes the invitees read in the invitation.' },
+    video_call: { type: 'boolean', description: 'true to add a Google Meet link.' },
+  },
+  required: ['booking'],
   repeatable: true,
 });
 
@@ -223,4 +239,4 @@ export const cancelBooking = requestTool({
 });
 
 registerTools([emailHandoff, emailToPrincipal], MAIN_CAPABILITY);
-registerTools([emailSend, tellMain, freeTime, hold, book, moveBooking, cancelBooking], EXTERNAL_CAPABILITY);
+registerTools([emailSend, tellMain, freeTime, hold, book, changeBooking, cancelBooking], EXTERNAL_CAPABILITY);

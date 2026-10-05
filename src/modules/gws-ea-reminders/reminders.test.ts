@@ -222,12 +222,12 @@ describe('remind_me', () => {
     expect(content.sender).not.toBe('system');
   });
 
-  it('refuses a time more than 30 days ahead, one already past, or one without its offset', async () => {
+  it('refuses a time more than a year ahead, one already past, or one without its offset', async () => {
     const main = await mainSession();
 
-    expect(await remind(main, inFuture(30 * DAY + HOUR), 'Too far.')).toMatchObject({
+    expect(await remind(main, inFuture(365 * DAY + HOUR), 'Too far.')).toMatchObject({
       ok: false,
-      error: { code: 'invalid-args', message: expect.stringContaining('30 days') },
+      error: { code: 'invalid-args', message: expect.stringContaining('a year ahead') },
     });
     expect(await remind(main, inFuture(-HOUR), 'Too late.')).toMatchObject({
       ok: false,
@@ -239,7 +239,7 @@ describe('remind_me', () => {
     });
     expect(reminderIds(main)).toEqual([]);
 
-    expect(await remind(main, inFuture(30 * DAY - HOUR), 'Just in range.')).toMatchObject({ ok: true });
+    expect(await remind(main, inFuture(365 * DAY - HOUR), 'Just in range.')).toMatchObject({ ok: true });
     expect(reminderIds(main)).toHaveLength(1);
   });
 

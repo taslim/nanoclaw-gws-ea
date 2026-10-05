@@ -17,7 +17,7 @@
  *   clear_reminder  { reminder_id } → { reminder_id, message }
  *
  * `at` is a date and time with its UTC offset, as `time_resolve` gives it,
- * in the future and at most 30 days ahead; the answer's `at` is that time in
+ * in the future and at most a year ahead; the answer's `at` is that time in
  * UTC. `note` is what the agent wants to read when it comes back. A refusal
  * answers `invalid-args` or `forbidden`, with why.
  *
@@ -44,7 +44,7 @@ import { isDuplicateNote } from '../gws-ea-profile/main-note.js';
 export const REMINDERS_CAPABILITY = 'gws-ea-reminders';
 
 registerCapability(REMINDERS_CAPABILITY, {
-  description: 'remind_me, clear_reminder: come back to this conversation at a chosen time, up to 30 days ahead',
+  description: 'remind_me, clear_reminder: come back to this conversation at a chosen time, up to a year ahead',
   default: 'on',
   instructions: ['reminders'],
 });
@@ -62,7 +62,7 @@ export function isReminderId(id: string): boolean {
 
 /** How a reminder reads to the agent when it comes back: its own, and nobody else's. */
 const REMINDER_SENDER = 'your reminder';
-const MAX_AHEAD_MS = 30 * 24 * 60 * 60 * 1000;
+const MAX_AHEAD_MS = 365 * 24 * 60 * 60 * 1000;
 const NOTE_MAX = 1_000;
 const REMINDER_ID = /^reminder-[A-Za-z0-9._:-]{1,128}$/u;
 const DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/iu;
@@ -75,7 +75,7 @@ function dueAt(value: unknown, now: number): string {
   const due = Date.parse(value);
   if (!Number.isFinite(due)) throw invalidArgs(`at is not a real date and time: ${value}`);
   if (due <= now) throw invalidArgs('at must be in the future');
-  if (due - now > MAX_AHEAD_MS) throw invalidArgs('at must be at most 30 days ahead');
+  if (due - now > MAX_AHEAD_MS) throw invalidArgs('at must be at most a year ahead');
   return new Date(due).toISOString();
 }
 

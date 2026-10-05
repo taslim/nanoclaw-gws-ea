@@ -7,8 +7,9 @@
  * that the principal wrote, which Gmail must still verify as theirs now. It
  * goes to that message's From address alone, never to its Reply-To, To, or
  * Cc, nor to the principal's other addresses, in that message's Gmail
- * thread, quoting it, and signed by the host (render.ts). A thread with no
- * such message refuses it.
+ * thread, quoting it, and signed by the host (render.ts), with any files
+ * `main` sent: the principal may receive anything. A thread with no such
+ * message refuses it.
  *
  * The audience check resolves the same address (`principalRecipients`), so a
  * send clears the private-values check only because every recipient is one
@@ -75,14 +76,9 @@ export async function sendToPrincipal(
       'An email to the principal goes in one of their threads, and this named none.',
     );
   }
-  if ((message.files?.length ?? 0) > 0) {
-    throw new OutboundRefusedError(
-      REFUSED_BY,
-      'An email to the principal carries no files; send them in chat instead.',
-    );
-  }
   const words = emailWords(message.content);
-  if (words === undefined) throw new OutboundRefusedError(REFUSED_BY, 'An email to the principal carries text only.');
+  if (words === undefined)
+    throw new OutboundRefusedError(REFUSED_BY, 'An email to the principal carries words, as text.');
   return sendExactlyOnce(runtime, { threadKey, side: 'principal' }, sendKey(threadKey, words), async () => {
     const anchor = await principalAnchor(runtime, threadKey);
     if (anchor === undefined) {
@@ -109,6 +105,7 @@ export async function sendToPrincipal(
             ...(anchor.mail.rfcMessageId === undefined ? {} : { inReplyTo: anchor.mail.rfcMessageId }),
             references: visible.filter((id) => id !== rfcMessageId).slice(-MAX_REFERENCES),
             ...body,
+            attachments: message.files ?? [],
             date: runtime.now(),
           }),
         ),

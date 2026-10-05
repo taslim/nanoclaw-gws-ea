@@ -10,11 +10,13 @@
  *   principal's whole local days (the rules `find_conflicts` uses).
  * - Free time is offered from the principal's waking day, widened by working
  *   hours that reach past it, on a half-hour grid of their clock, clear of
- *   protected time and of busy time by the buffer (`freeTimes`). Each time
- *   carries a fit note from a fixed vocabulary on how it sits against their
- *   preferences (`fitOf`), and the times are spread across days and times of
- *   day as a person offers them. Only protected time is hard
- *   (`inProtectedTime`), so a time someone proposes is checked against it too.
+ *   protected time and of busy time by the buffer (`freeTimes`), and inside
+ *   the counterpart's waking day when their zone is known. Each time carries
+ *   a fit note from a fixed vocabulary on how it sits against the principal's
+ *   preferences (`fitOf`). The times are spread across days and hours of the
+ *   day as a person offers them, and listed in date order. Only protected
+ *   time is hard (`inProtectedTime`), so a time someone proposes is checked
+ *   against it too.
  */
 import {
   type PreferenceValue,
@@ -56,16 +58,9 @@ export interface SchedulingRules {
   readonly bufferMinutes: number;
 }
 
-interface Candidate extends Span {
-  /** The local date it starts on, `YYYY-MM-DD`. */
-  readonly day: string;
-  /** Its rank group: lower is better. */
-  readonly tier: number;
-}
-
 /** Candidates start on this grid of the principal's clock. */
 const SLOT_GRID_MINUTES = 30;
-/** The principal's waking day, which free time offers from beside their working hours: never the night. */
+/** The waking day, 07:00 to 22:00, which free time offers from on either side's clock: never the night. */
 const WAKING_HOURS: ClockRange = { start: 7 * 60, end: 22 * 60 };
 /** Working hours until the principal has any: Monday to Friday, 09:00 to 17:00. */
 const DEFAULT_WORKING_HOURS: ReadonlyMap<Weekday, ClockRange> = new Map(
@@ -73,10 +68,6 @@ const DEFAULT_WORKING_HOURS: ReadonlyMap<Weekday, ClockRange> = new Map(
 );
 /** The kind of meeting whose preferred times and buffer free time keeps to. */
 const DEFAULT_MEETING_KIND = 'default';
-/** Two times offered on one day start at least this far apart. */
-const SAME_DAY_SPACING_MINUTES = 120;
-/** Noon on the principal's clock: offers alternate either side of it where they can. */
-const NOON = 12 * 60;
 
 const MINUTE = 60_000;
 const DAY_MS = 24 * 60 * MINUTE;
@@ -308,7 +299,7 @@ export function isClear(span: Span, busy: readonly Span[], bufferMinutes = 0): b
 }
 
 // ---------------------------------------------------------------------------
-// How a time fits, and spreading the times offered
+// How a time fits
 // ---------------------------------------------------------------------------
 
 function insidePreferred(slot: Span, rules: SchedulingRules, timezone: string): boolean {
@@ -329,53 +320,6 @@ function insideWorkingHours(slot: Span, rules: SchedulingRules, timezone: string
   return slot.start >= day.start && slot.end <= day.end;
 }
 
-/**
- * Up to `limit` of the ranked candidates, best rank first, spread as a
- * person offers times. Within each rank, one per day at a new hour of the
- * day, alternating either side of noon where the open times allow; then one
- * per day at a new hour; then one per day; then a second per day at least
- * two hours apart; then any time left that overlaps none already chosen.
- */
-function spread<C extends Candidate>(ranked: readonly C[], limit: number, timezone: string): C[] {
-  const chosen: C[] = [];
-  const spacing = SAME_DAY_SPACING_MINUTES * MINUTE;
-  const minuteOf = (slot: Span): number => localTime(slot.start, timezone).minuteOfDay;
-  const hourOf = (slot: Span): number => Math.floor(minuteOf(slot) / 60);
-  const fits = (candidate: C, perDay: number | undefined): boolean => {
-    if (chosen.some((taken) => overlaps(taken, candidate))) return false;
-    if (perDay === undefined) return true;
-    const sameDay = chosen.filter((taken) => taken.day === candidate.day);
-    return sameDay.length < perDay && sameDay.every((taken) => Math.abs(taken.start - candidate.start) >= spacing);
-  };
-  /** Whether a time adds variety: a new hour of the day, and with `alternate` the other side of noon from the last one. */
-  const varied = (candidate: Candidate, alternate: boolean): boolean => {
-    if (chosen.some((taken) => hourOf(taken) === hourOf(candidate))) return false;
-    const last = chosen.at(-1);
-    return !alternate || last === undefined || minuteOf(last) < NOON !== minuteOf(candidate) < NOON;
-  };
-  const take = (
-    candidates: readonly C[],
-    perDay: number | undefined,
-    variety: 'alternate' | 'new-hour' | 'any',
-  ): void => {
-    for (const candidate of candidates) {
-      if (chosen.length >= limit) return;
-      if (chosen.includes(candidate) || !fits(candidate, perDay)) continue;
-      if (variety !== 'any' && !varied(candidate, variety === 'alternate')) continue;
-      chosen.push(candidate);
-    }
-  };
-  for (const tier of [...new Set(ranked.map((candidate) => candidate.tier))]) {
-    const inTier = ranked.filter((candidate) => candidate.tier === tier);
-    take(inTier, 1, 'alternate');
-    take(inTier, 1, 'new-hour');
-    take(inTier, 1, 'any');
-    take(inTier, 2, 'any');
-  }
-  take(ranked, undefined, 'any');
-  return chosen;
-}
-
 // ---------------------------------------------------------------------------
 // Free time, as external-email asks for it (KTD7)
 // ---------------------------------------------------------------------------
@@ -392,6 +336,8 @@ export function fitOf(span: Span, rules: SchedulingRules, timezone: string): Fit
 
 export interface FreeTimeQuery {
   readonly timezone: string;
+  /** The counterpart's zone, when known: every time offered falls inside their waking day too. */
+  readonly counterpartTimezone?: string;
   readonly lengthMinutes: number;
   /** Every time offered lies wholly inside it. */
   readonly window: Span;
@@ -404,6 +350,12 @@ export interface FreeTime extends Span {
   readonly fit: Fit;
 }
 
+/** An open time, with the principal's local day and hour of the day it starts in. */
+interface OpenTime extends FreeTime {
+  readonly day: string;
+  readonly hour: number;
+}
+
 /** The hours free time offers from on a weekday: the waking day, widened by working hours that reach past it. */
 function offerHours(rules: SchedulingRules, weekday: Weekday): ClockRange {
   const working = rules.workingHours.get(weekday);
@@ -412,17 +364,42 @@ function offerHours(rules: SchedulingRules, weekday: Weekday): ClockRange {
     : WAKING_HOURS;
 }
 
+/** Whether a span lies wholly inside the waking day on `timezone`'s clock. */
+function insideWakingDay(span: Span, timezone: string): boolean {
+  const day = onDay(localTime(span.start, timezone), WAKING_HOURS, timezone);
+  return span.start >= day.start && span.end <= day.end;
+}
+
+/**
+ * Up to `limit` open times, chosen from the earliest as a person offers
+ * them: first the earliest time each day at an hour of the day not offered
+ * yet, then the earliest left that overlaps none already chosen.
+ */
+function spread(open: readonly OpenTime[], limit: number): OpenTime[] {
+  const chosen: OpenTime[] = [];
+  for (const time of open) {
+    if (chosen.length >= limit) return chosen;
+    if (!chosen.some((taken) => taken.day === time.day || taken.hour === time.hour)) chosen.push(time);
+  }
+  for (const time of open) {
+    if (chosen.length >= limit) return chosen;
+    if (!chosen.some((taken) => overlaps(taken, time))) chosen.push(time);
+  }
+  return chosen;
+}
+
 /**
  * Up to `limit` open times in the window, spread as a person offers them and
- * listed best fit first, then by time: on the half-hour grid of the principal's clock,
- * within the hours free time offers from, and clear of protected time and of
+ * listed in date order: on the half-hour grid of the principal's clock,
+ * within the hours free time offers from and the counterpart's waking day,
+ * starting no earlier than the window, and clear of protected time and of
  * busy time by the buffer.
  */
 export function freeTimes(query: FreeTimeQuery, limit: number): FreeTime[] {
-  const { timezone, rules, window } = query;
+  const { timezone, counterpartTimezone, rules, window } = query;
   const length = query.lengthMinutes * MINUTE;
   const grid = SLOT_GRID_MINUTES * MINUTE;
-  const open: Array<Candidate & FreeTime> = [];
+  const open: OpenTime[] = [];
   const last = localTime(window.end, timezone);
   for (let date: LocalDate = localTime(window.start, timezone); compareDates(date, last) <= 0; date = nextDate(date)) {
     const hours = offerHours(rules, weekdayOf(date));
@@ -432,14 +409,14 @@ export function freeTimes(query: FreeTimeQuery, limit: number): FreeTime[] {
     for (let start = day.start; start + length <= day.end; start += grid) {
       const span = { start, end: start + length };
       if (span.start < window.start || span.end > window.end) continue;
+      if (counterpartTimezone !== undefined && !insideWakingDay(span, counterpartTimezone)) continue;
       if (inProtectedTime(span, rules, timezone) || !isClear(span, query.busy, rules.bufferMinutes)) continue;
-      const fit = fitOf(span, rules, timezone);
-      open.push({ ...span, day: dateKey(date), tier: FITS.indexOf(fit), fit });
+      const hour = Math.floor(localTime(span.start, timezone).minuteOfDay / 60);
+      open.push({ ...span, fit: fitOf(span, rules, timezone), day: dateKey(date), hour });
     }
   }
-  const byFit = (a: Candidate, b: Candidate): number => a.tier - b.tier || a.start - b.start;
-  return spread(open.sort(byFit), limit, timezone)
-    .sort(byFit)
+  return spread(open, limit)
+    .sort((a, b) => a.start - b.start)
     .map(({ start, end, fit }) => ({ start, end, fit }));
 }
 

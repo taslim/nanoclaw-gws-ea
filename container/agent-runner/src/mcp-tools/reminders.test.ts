@@ -89,4 +89,8 @@ describe('the reminder tools', () => {
       expect(words, tool.tool.name).toBeLessThan(60);
     }
   });
+
+  it('tell the agent how far ahead a reminder may be: a year, as the host allows', () => {
+    expect(remindMe.tool.description).toContain('up to a year ahead');
+  });
 });

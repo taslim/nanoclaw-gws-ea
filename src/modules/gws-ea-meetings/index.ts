@@ -2,9 +2,9 @@
  * GWS-EA's scheduling (KTD7): `external-email`'s five tools on the
  * principal's calendar, each bound to the email thread whose session calls
  * it (`tools.ts`), and the timer that releases each thread's holds once they
- * lapse.
+ * lapse, taking its turn with the tools' calendar writes.
  *
- *   free_time, hold, book, move_booking, cancel_booking
+ *   free_time, hold, book, change_booking, cancel_booking
  *
  * Each is a delivery action with a guard (`guard.ts`) that admits only
  * `external-email`, from one email thread's session, and each request gets
@@ -41,7 +41,7 @@ const SCHEDULING_REQUESTS: ReadonlyArray<readonly [string, ActionAnswer]> = [
   ['free_time', scheduling.freeTime],
   ['hold', scheduling.hold],
   ['book', scheduling.book],
-  ['move_booking', scheduling.moveBooking],
+  ['change_booking', scheduling.changeBooking],
   ['cancel_booking', scheduling.cancelBooking],
 ];
 
@@ -72,4 +72,4 @@ onHostStart(async ({ signal }) => {
 });
 
 export { createMeetingsCalendarApi, type CalendarEvent, type MeetingsCalendarApi } from './calendar-api.js';
-export { BOOKING_FACT_TYPE, TAG_THREAD } from './tools.js';
+export { TAG_THREAD } from './tools.js';

@@ -1,7 +1,8 @@
 /**
  * The host's free-time arithmetic (KTD7; R69): wall-clock times across clock
  * changes, which events block time, and which times free time offers from
- * the principal's preferences, spread as a person offers them.
+ * the principal's preferences and both sides' waking days, spread as a person
+ * offers them and listed in date order.
  */
 import { describe, expect, it } from 'vitest';
 
@@ -22,6 +23,8 @@ import {
 
 const LONDON = 'Europe/London';
 const NEW_YORK = 'America/New_York';
+const LOS_ANGELES = 'America/Los_Angeles';
+const LAGOS = 'Africa/Lagos';
 const PRINCIPAL = new Set(['pat@principal.example']);
 const HOUR = 3_600_000;
 
@@ -136,7 +139,7 @@ describe('free time', () => {
     expect(wednesday).toContain('11:30');
   });
 
-  it('notes how each time fits, best fit first, in a fixed vocabulary', () => {
+  it('notes how each time fits in a fixed vocabulary, listing the times in date order whatever their fit', () => {
     const rules = schedulingRules({
       ...NONE,
       working_hours: workingDays('09:00', '17:00'),
@@ -150,20 +153,49 @@ describe('free time', () => {
     // Only the default kind's preferred times count: no meeting kind reaches free time.
     expect(fitOf(span('2026-10-10T07:00:00Z', '2026-10-10T07:30:00Z'), rules, LONDON)).toBe('outside usual hours');
 
-    const offered = freeTimes(query({ window: WEEK, rules }), 6);
-    expect([weekday(offered[0].start), clock(offered[0].start), offered[0].fit]).toEqual(['Thu', '15:00', 'preferred']);
-    const order = ['preferred', 'acceptable', 'outside usual hours'];
-    const ranks = offered.map((time) => order.indexOf(time.fit));
-    expect(ranks).toEqual([...ranks].sort((a, b) => a - b));
+    // Thursday's preferred 15:00 is the best fit, yet it is listed in its place in the week, not first.
+    const offered = freeTimes(query({ window: span('2026-10-07T23:00:00Z', '2026-10-09T23:00:00Z'), rules }), 2);
+    expect(offered.map((time) => [weekday(time.start), clock(time.start), time.fit])).toEqual([
+      ['Thu', '07:00', 'outside usual hours'],
+      ['Fri', '08:00', 'outside usual hours'],
+    ]);
   });
 
-  it('spreads the times across days and hours of the day, never overlapping, and caps the list', () => {
-    const offered = freeTimes(query({ window: WEEK }), 5);
-    expect(offered).toHaveLength(5);
-    expect(new Set(offered.map((time) => weekday(time.start))).size).toBe(5);
-    expect(new Set(offered.map((time) => clock(time.start).slice(0, 2))).size).toBe(5);
-    const sorted = [...offered].sort((a, b) => a.start - b.start);
-    for (let i = 1; i < sorted.length; i++) expect(sorted[i].start).toBeGreaterThanOrEqual(sorted[i - 1].end);
+  it('offers the earliest time each day at a new hour of the day, then the earliest left, in date order', () => {
+    const offered = freeTimes(query({ window: WEEK }), 8);
+    expect(offered.map((time) => `${weekday(time.start)} ${clock(time.start)}`)).toEqual([
+      'Mon 07:00',
+      'Mon 07:30',
+      'Tue 08:00',
+      'Wed 09:00',
+      'Thu 10:00',
+      'Fri 11:00',
+      'Sat 12:00',
+      'Sun 13:00',
+    ]);
+  });
+
+  it('never offers two times that overlap', () => {
+    const offered = freeTimes(
+      query({ window: span('2026-10-05T06:00:00Z', '2026-10-05T10:00:00Z'), lengthMinutes: 60 }),
+      8,
+    );
+    expect(offered.map((time) => clock(time.start))).toEqual(['07:00', '08:00', '09:00', '10:00']);
+  });
+
+  it("offers only times inside the counterpart's waking day too: for a Pacific principal and Lagos, the shared mornings", () => {
+    // Lagos is eight hours ahead of Los Angeles in October: 07:00 to 14:00 there is 15:00 to 22:00 here.
+    const tuesday = span('2026-10-06T07:00:00Z', '2026-10-07T07:00:00Z');
+    const both = freeTimes(
+      query({ timezone: LOS_ANGELES, counterpartTimezone: LAGOS, window: tuesday }),
+      EVERY_TIME,
+    ).sort((a, b) => a.start - b.start);
+    const morning = Array.from(
+      { length: 14 },
+      (_, i) => `${String(7 + Math.floor(i / 2)).padStart(2, '0')}:${i % 2 ? '30' : '00'}`,
+    );
+    expect(both.map((time) => clock(time.start, LOS_ANGELES))).toEqual(morning);
+    expect(both.map((time) => clock(time.end, LAGOS)).at(-1)).toBe('22:00');
   });
 
   it('offers fewer times when a narrow window holds fewer', () => {

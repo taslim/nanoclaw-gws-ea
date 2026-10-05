@@ -52,7 +52,6 @@ import { bindVerifiedPrincipalUser, recordExternalEmailAgentGroupId } from '../g
 import { ensureInbox, ensurePrincipalConversation } from '../gws-ea-inbox/index.js';
 import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID } from '../gws-ea-inbox/runtime.js';
 import { createThread } from '../gws-ea-inbox/thread-map.js';
-import { FAILED_NOTE_TYPE } from './failures.js';
 import './index.js';
 
 const PRINCIPAL_USER = 'gchat:users/pat';
@@ -70,10 +69,10 @@ function now(): string {
 interface Fact {
   readonly id: string;
   readonly text: string;
-  readonly note: { readonly type: string; readonly thread_key: string; readonly cause: string };
+  readonly sender?: string;
 }
 
-/** The failure facts in main's session, oldest first. */
+/** What the host wrote in main's session, oldest first: here, only failure facts. */
 function facts(): Fact[] {
   const db = new Database(inboundDbPath(main.agent_group_id, main.id), { readonly: true });
   const rows = db.prepare('SELECT id, content FROM messages_in ORDER BY seq').all() as Array<{
@@ -83,7 +82,7 @@ function facts(): Fact[] {
   db.close();
   return rows
     .map((row) => ({ id: row.id, ...(JSON.parse(row.content) as Omit<Fact, 'id'>) }))
-    .filter((row) => row.note?.type === FAILED_NOTE_TYPE);
+    .filter((row) => row.sender === 'system');
 }
 
 /** How often main was woken for something written into its session. */
@@ -264,7 +263,8 @@ describe('an email external-email wrote that delivery gave up on', () => {
 
     const [fact, ...others] = facts();
     expect(others).toEqual([]);
-    expect(fact.note).toEqual({ type: FAILED_NOTE_TYPE, thread_key: key, cause: 'delivery-failed' });
+    // Its words are all main reads: nothing typed rides beside them.
+    expect(Object.keys(fact).sort()).toEqual(['id', 'sender', 'senderId', 'text']);
     expect(fact.text).toContain(`email thread ${key}`);
     expect(fact.text).toMatch(/could not be sent/u);
     expect(fact.text).not.toContain('Tuesday');
@@ -317,7 +317,6 @@ describe('what arrived in a thread, given up after its last retry', () => {
 
     const [fact, ...others] = facts();
     expect(others).toEqual([]);
-    expect(fact.note).toEqual({ type: FAILED_NOTE_TYPE, thread_key: key, cause: 'inbound-failed' });
     expect(fact.text).toContain(`email thread ${key}`);
     expect(fact.text).toMatch(/could not be processed/u);
     expect(fact.text).not.toContain('Tuesday');
@@ -341,9 +340,8 @@ describe('a failed turn in a thread', () => {
 
     const [fact, ...others] = facts();
     expect(others).toEqual([]);
-    expect(fact.note).toEqual({ type: FAILED_NOTE_TYPE, thread_key: key, cause: 'turn-failed' });
     expect(fact.text).toContain(`email thread ${key}`);
-    expect(fact.text).toMatch(/failed/u);
+    expect(fact.text).toMatch(/failed before it finished/u);
     expect(fact.text).not.toContain('Tuesday');
     expect(mainWakes()).toBe(1);
 

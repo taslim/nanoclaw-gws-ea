@@ -15,13 +15,13 @@ import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqli
 import {
   book,
   cancelBooking,
+  changeBooking,
   EMAIL_REQUEST_TIMEOUT_MS,
   emailHandoff,
   emailSend,
   emailToPrincipal,
   freeTime,
   hold,
-  moveBooking,
   tellMain,
 } from './gws-ea-email.js';
 import { requestStatus } from './request-status.js';
@@ -35,7 +35,7 @@ const ALL_TOOLS = [
   freeTime,
   hold,
   book,
-  moveBooking,
+  changeBooking,
   cancelBooking,
 ];
 
@@ -83,7 +83,7 @@ describe('the email tools', () => {
         emailHandoff,
         'email_handoff',
         {
-          to: ['remy@friend.example'],
+          people: ['remy@friend.example'],
           message: 'Remy is a close friend of Morgan’s from university. Find 30 minutes this week.',
           calendar: 'morgan@principal.example',
         },
@@ -92,17 +92,15 @@ describe('the email tools', () => {
       [
         emailHandoff,
         'email_handoff',
-        { thread_key: 'mail-inbound-1', cc: ['jane@acme.example'], message: 'Morgan asked to loop Jane in.' },
+        { thread_key: 'mail-inbound-1', people: ['jane@acme.example'], message: 'Morgan asked to copy Jane in.' },
       ],
       [
         emailHandoff,
         'email_handoff',
-        { thread_key: 'mail-inbound-1', to: ['pat@acme.example'], message: 'Pat takes over from Dana.' },
-      ],
-      [
-        emailHandoff,
-        'email_handoff',
-        { to: ['sales@acme.example'], cc: ['ops@acme.example'], message: 'Ask for their quote.' },
+        {
+          people: ['sales@acme.example', 'ops@acme.example'],
+          message: 'Ask sales for their quote, copying ops.',
+        },
       ],
       [emailToPrincipal, 'email_send', { thread_key: 'mail-inbound-2', text: 'Booked: Tuesday at 12:30.' }],
       [emailSend, 'email_send', { text: 'Hi Remy, …', subject: 'Morgan and Remy — 30 minutes this week?' }],
@@ -133,16 +131,31 @@ describe('the email tools', () => {
           invitees: ['remy@friend.example'],
         },
       ],
-      [moveBooking, 'move_booking', { booking: 'a'.repeat(64), start: '2026-10-14T09:30:00-07:00' }],
+      [
+        changeBooking,
+        'change_booking',
+        {
+          booking: 'a'.repeat(64),
+          start: '2026-10-14T09:30:00-07:00',
+          minutes: 45,
+          title: 'Morgan / Remy',
+          location: 'Cafe Rosa',
+          notes: 'Moved to Wednesday.',
+          video_call: true,
+        },
+      ],
+      [changeBooking, 'change_booking', { booking: 'a'.repeat(64), title: 'Morgan / Remy: catching up' }],
       [cancelBooking, 'cancel_booking', { booking: 'a'.repeat(64) }],
     ];
     for (const [tool, action, args] of cases) {
       const { result, request } = await call(tool, args);
       const fields = Object.fromEntries(
-        Object.entries(request).filter(([key]) => !['action', 'requestId', 'messageId'].includes(key)),
+        Object.entries(request).filter(([key]) => !['action', 'requestId', 'delivers', 'messageId'].includes(key)),
       );
       expect(request.action, tool.tool.name).toBe(action);
       expect(request.requestId, tool.tool.name).toBe(request.messageId);
+      // Only a sent email is the turn's reply, so only email_send's requests are marked as delivering.
+      expect(request.delivers, tool.tool.name).toBe(action === 'email_send' ? true : undefined);
       expect(fields, tool.tool.name).toEqual(args);
       expect(result.isError, tool.tool.name).not.toBe(true);
       expect(text(result)).toBe(`${tool.tool.name} done`);
@@ -162,13 +175,32 @@ describe('the email tools', () => {
       text: 'Hello',
       action: 'email_send',
       requestId: request.messageId,
+      delivers: true,
       messageId: request.messageId,
     });
 
     closeSessionDb();
     initTestSessionDb();
-    const toMain = await call(tellMain, { message: 'Looped in.', to: ['someone@else.example'] });
+    const toMain = await call(tellMain, { message: 'Looped in.', to: ['someone@else.example'], delivers: true });
     expect(Object.keys(toMain.request).sort()).toEqual(['action', 'message', 'messageId', 'requestId']);
+
+    // main names people; who each email goes to and who is copied is external-email's to place.
+    closeSessionDb();
+    initTestSessionDb();
+    const handoff = await call(emailHandoff, {
+      people: ['dana@acme.example'],
+      to: ['dana@acme.example'],
+      cc: ['jane@acme.example'],
+      message: 'Find Dana 30 minutes.',
+    });
+    expect(Object.keys(handoff.request).sort()).toEqual(['action', 'message', 'messageId', 'people', 'requestId']);
+  });
+
+  it('leave a handoff that names no thread and no one for the host to judge', async () => {
+    await emailHandoff.handler({ message: 'Find Remy 30 minutes.' }, { signal: AbortSignal.timeout(50) });
+    expect(getUndeliveredMessages().map((row) => JSON.parse(row.content) as unknown)).toMatchObject([
+      { action: 'email_handoff', message: 'Find Remy 30 minutes.' },
+    ]);
   });
 
   it('return a refusal as an error the agent can read', async () => {
@@ -193,16 +225,14 @@ describe('the email tools', () => {
 
   it('refuse a call missing what it needs without sending anything, saying what is missing', async () => {
     const cases: Array<[McpToolDefinition, Record<string, unknown>, RegExp]> = [
-      [emailHandoff, { to: ['remy@friend.example'] }, /message is required/],
-      [emailHandoff, { message: 'Find time.' }, /Name the thread by thread_key, or start one with to/],
-      [emailHandoff, { cc: ['x@y.example'], message: 'Hi' }, /Name the thread by thread_key, or start one with to/],
+      [emailHandoff, { people: ['remy@friend.example'] }, /message is required/],
       [emailToPrincipal, { text: 'Booked.' }, /thread_key is required/],
       [emailSend, { subject: 'Hello' }, /text is required/],
       [tellMain, {}, /message is required/],
       [freeTime, { from: '2026-10-12T09:00:00-07:00', to: '2026-10-16T17:00:00-07:00' }, /minutes is required/],
       [hold, {}, /starts is required/],
       [book, { start: '2026-10-13T12:30:00-07:00', minutes: 30 }, /title is required/],
-      [moveBooking, { booking: 'a'.repeat(64) }, /start is required/],
+      [changeBooking, { start: '2026-10-14T09:30:00-07:00' }, /booking is required/],
       [cancelBooking, {}, /booking is required/],
     ];
     for (const [tool, args, problem] of cases) {
@@ -221,6 +251,11 @@ describe('the email tools', () => {
       expect(words, tool.tool.name).toBeLessThan(60);
     }
   });
+
+  it("describe free_time's times in the date order the host lists them", () => {
+    expect(freeTime.tool.description).toContain('in date order');
+    expect(freeTime.tool.description).not.toMatch(/best fit/);
+  });
 });
 
 describe('files that go with a request', () => {
@@ -231,6 +266,7 @@ describe('files that go with a request', () => {
   /** How many requests had been sent as each file was copied. */
   let sentAtCopy: number[];
   let made: string[];
+  let removed: string[];
   let spies: Array<{ mockRestore(): void }>;
 
   beforeEach(() => {
@@ -242,12 +278,18 @@ describe('files that go with a request', () => {
     copies = [];
     sentAtCopy = [];
     made = [];
+    removed = [];
     spies = [
       spyOn(fs, 'mkdirSync').mockImplementation(((target: fs.PathLike) => {
         made.push(String(target));
         return undefined;
       }) as typeof fs.mkdirSync),
+      spyOn(fs, 'rmSync').mockImplementation((target) => {
+        removed.push(String(target));
+      }),
       spyOn(fs, 'copyFileSync').mockImplementation((src, dest) => {
+        // A file the container may see but not read, so copying it fails part way through staging.
+        if (path.basename(String(src)) === 'unreadable.pdf') throw new Error('EACCES: permission denied, copyfile');
         copies.push([String(src), String(dest)]);
         sentAtCopy.push(getUndeliveredMessages().length);
       }),
@@ -261,7 +303,7 @@ describe('files that go with a request', () => {
 
   it("are staged in the outbox under the request's own id before it is sent, and named by their file names", async () => {
     const { request } = await call(emailHandoff, {
-      to: ['dana@acme.example'],
+      people: ['dana@acme.example'],
       message: 'Send Dana the deck.',
       files: [path.join(dir, 'deck.pdf'), path.join(dir, 'notes.txt')],
     });
@@ -284,6 +326,39 @@ describe('files that go with a request', () => {
       [path.join(dir, 'deck.pdf'), path.join('/workspace/outbox', String(sent.request.requestId), 'deck.pdf')],
     ]);
     expect(sentAtCopy).toEqual([0]);
+
+    closeSessionDb();
+    initTestSessionDb();
+    copies = [];
+    sentAtCopy = [];
+    const toPrincipal = await call(emailToPrincipal, {
+      thread_key: 'mail-inbound-2',
+      text: 'The signed contract is attached.',
+      files: [path.join(dir, 'notes.txt')],
+    });
+    expect(toPrincipal.request.files).toEqual(['notes.txt']);
+    expect(copies).toEqual([
+      [path.join(dir, 'notes.txt'), path.join('/workspace/outbox', String(toPrincipal.request.requestId), 'notes.txt')],
+    ]);
+    expect(sentAtCopy).toEqual([0]);
+  });
+
+  it('send nothing, say why, and clear what was staged when staging fails part way', async () => {
+    fs.writeFileSync(path.join(dir, 'unreadable.pdf'), 'locked');
+    const result = await emailSend.handler(
+      { text: 'Both attached.', files: [path.join(dir, 'deck.pdf'), path.join(dir, 'unreadable.pdf')] },
+      { signal: AbortSignal.timeout(100) },
+    );
+    expect(result).toEqual({
+      content: [
+        { type: 'text', text: 'Error: The request could not be made ready: EACCES: permission denied, copyfile' },
+      ],
+      isError: true,
+    });
+    expect(copies.map(([source]) => path.basename(source))).toEqual(['deck.pdf']);
+    expect(made).toHaveLength(1);
+    expect(removed).toEqual(made);
+    expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
   it('named by a relative path are found under /workspace/agent', async () => {
@@ -388,7 +463,7 @@ describe('a request the host is slow to answer', () => {
     for (const [tool, args] of [
       [freeTime, { from: '2026-10-12T09:00:00-07:00', to: '2026-10-16T17:00:00-07:00', minutes: 30 }],
       [hold, { starts: [] }],
-      [moveBooking, { booking: 'a'.repeat(64), start: '2026-10-14T09:30:00-07:00' }],
+      [changeBooking, { booking: 'a'.repeat(64), start: '2026-10-14T09:30:00-07:00' }],
       [cancelBooking, { booking: 'a'.repeat(64) }],
     ] as const) {
       expect(text(await timedOut(tool, args)), tool.tool.name).toMatch(

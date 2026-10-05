@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 import { log } from '../../log.js';
 import { recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import type { CalendarEvent, EventConference, MeetingsCalendarApi, NewEvent, SendUpdates } from './calendar-api.js';
-import { eventSpan, type Span } from './slots.js';
+import type { Span } from './slots.js';
 
 /** The private tag naming an event's role, `hold` or `booking`, on the events the assistant places. */
 export const TAG_ROLE = 'gwsEaRole';
@@ -82,25 +82,6 @@ export async function ensureEvent(
     }
   }
   recordOwnCalendarChange(calendarId, eventId);
-}
-
-/**
- * Move a live event to `to`, in place, unless it is there already. Only the
- * time changes: its title, place and notes stay as they are, and Google
- * sends the attendees the update.
- */
-export async function moveEventTo(
-  api: MeetingsCalendarApi,
-  calendarId: string,
-  current: CalendarEvent,
-  to: { readonly start_at: string; readonly end_at: string },
-  timezone: string,
-): Promise<void> {
-  const span = eventSpan(current, timezone);
-  if (!span || span.start !== Date.parse(to.start_at) || span.end !== Date.parse(to.end_at)) {
-    await api.patchEvent(calendarId, current.id, { start: to.start_at, end: to.end_at }, 'all');
-    recordOwnCalendarChange(calendarId, current.id);
-  }
 }
 
 /**
