@@ -20,9 +20,11 @@ await loadToolModule('self-mod', () => import('./self-mod.js'));
 await loadToolModule('time', () => import('./time.js'));
 await loadToolModule('schedule-stats', () => import('./schedule-stats.js'));
 await loadToolModule('calendar-facts', () => import('./calendar-facts.js'));
-// The meeting handoff names its own two keys, one for each side of it, and
-// request_status its own: the meeting tools' tests load it beside them.
-await import('./gws-ea-meetings.js');
+// The email tools name their own two keys, one for each agent, and
+// request_status and the reminders their own: their tests load them ahead of
+// this barrel.
+await import('./gws-ea-email.js');
+await import('./reminders.js');
 await import('./request-status.js');
 // Module barrel — loads registration modules, including the singular mailbox
 // slot. A module registering tools passes its own capability key.

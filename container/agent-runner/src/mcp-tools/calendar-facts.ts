@@ -14,8 +14,8 @@
  *   busy events and free/busy-only blocks do. Times are compared as instants,
  *   and an all-day event runs from midnight to midnight on the principal's
  *   clocks, so a day with a clock change is 23 or 25 hours long. A hold the
- *   assistant placed for a meeting it is arranging is listed apart, as time
- *   that can give way. The answer is only as good as the files, so the call
+ *   assistant placed while an email thread arranges a meeting is listed
+ *   apart, as time that can give way. The answer is only as good as the files, so the call
  *   names the range they were fetched for, and a candidate outside it or a
  *   file saved more than fifteen minutes ago is refused.
  * - people_stats counts, for each person, the meetings the principal organized
@@ -121,10 +121,10 @@ export interface Conflict {
   organizer: string | null;
 }
 
-/** Time the assistant holds for a meeting it is arranging: it can give way. */
+/** Time the assistant holds while an email thread arranges a meeting: it can give way. */
 export interface HeldTime {
-  /** The meeting the time is held for, such as mtg-…. */
-  meeting_id: string;
+  /** The email thread the time is held for, such as mail-…. */
+  thread_key: string;
   /** Every principal calendar the hold sits on; empty when the file named none. */
   calendars: string[];
   event_id: string | null;
@@ -287,9 +287,9 @@ function computeConflicts(input: {
     conflicting: 0,
     holds: 0,
   };
-  // The copies of each meeting, by meeting; a hold also keeps the meeting it holds time for.
+  // The copies of each meeting, by meeting; a hold also keeps the thread it holds time for.
   const conflicting = new Map<string, CalendarEvent[]>();
-  const held = new Map<string, { meetingId: string; copies: CalendarEvent[] }>();
+  const held = new Map<string, { threadKey: string; copies: CalendarEvent[] }>();
   for (const event of input.events) {
     const outcome = classifyConflict(event, input);
     if (outcome !== 'overlaps') {
@@ -303,7 +303,7 @@ function computeConflicts(input: {
       counts.holds++;
       const hold = held.get(event.meetingKey);
       if (hold) hold.copies.push(event);
-      else held.set(event.meetingKey, { meetingId: event.heldFor, copies: [event] });
+      else held.set(event.meetingKey, { threadKey: event.heldFor, copies: [event] });
     }
   }
 
@@ -328,10 +328,10 @@ function computeConflicts(input: {
     });
   const holds = [...held.values()]
     .sort(({ copies: [a] }, { copies: [b] }) => earliestFirst(a, b))
-    .map(({ meetingId, copies }): HeldTime => {
+    .map(({ threadKey, copies }): HeldTime => {
       const [first] = copies;
       return {
-        meeting_id: meetingId,
+        thread_key: threadKey,
         calendars: calendarsOf(copies),
         event_id: first.id,
         start: iso(first.start),
@@ -505,7 +505,7 @@ export function createCalendarFactTools(options: CalendarFactsOptions): {
   const findConflicts: McpToolDefinition = {
     tool: {
       name: 'find_conflicts',
-      description: `List every event on the principal's calendars that overlaps a candidate time, counted from gog calendar events output saved for a range that covers it. It finds overlaps on one calendar as well as across calendars. Left out: the candidate's own copies on any calendar (matched by candidate_ical_uid), cancelled events, events the principal declined, and free (transparent) events. All-day busy events and free/busy-only blocks count. A time the assistant holds for a meeting it is arranging is listed under holds with its meeting_id, as time that can give way, not as a conflict; a meeting the assistant booked is a conflict like any other. A meeting on several of the principal's calendars is listed once with each calendar. Times are compared as instants; an all-day event runs midnight to midnight on the principal's clocks, so clock changes are handled. The window is at most ${MAX_WINDOW_DAYS} days. Titles come back wrapped as untrusted text. Refused, so you fetch again: a candidate outside the from-to range the files were fetched for, and a file saved more than ${MAX_FILE_AGE_MINUTES} minutes ago. A file that is malformed, incomplete, or outside the workspace and temp directory is refused and named.`,
+      description: `List every event on the principal's calendars that overlaps a candidate time, counted from gog calendar events output saved for a range that covers it. It finds overlaps on one calendar as well as across calendars. Left out: the candidate's own copies on any calendar (matched by candidate_ical_uid), cancelled events, events the principal declined, and free (transparent) events. All-day busy events and free/busy-only blocks count. A time the assistant holds while an email thread arranges a meeting is listed under holds with its thread_key, as time that can give way, not as a conflict; a meeting the assistant booked is a conflict like any other. A meeting on several of the principal's calendars is listed once with each calendar. Times are compared as instants; an all-day event runs midnight to midnight on the principal's clocks, so clock changes are handled. The window is at most ${MAX_WINDOW_DAYS} days. Titles come back wrapped as untrusted text. Refused, so you fetch again: a candidate outside the from-to range the files were fetched for, and a file saved more than ${MAX_FILE_AGE_MINUTES} minutes ago. A file that is malformed, incomplete, or outside the workspace and temp directory is refused and named.`,
       inputSchema: {
         type: 'object' as const,
         properties: {

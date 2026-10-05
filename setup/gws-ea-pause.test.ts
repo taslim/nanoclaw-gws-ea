@@ -40,7 +40,7 @@ function pause(overrides: Partial<ProvisionHumanPause> = {}): ProvisionHumanPaus
     phase: 'bind_principal',
     code: 'principal_dm_required',
     message: 'Ask the principal to send a direct message to the configured Google Chat app.',
-    details: ['Principal: Taslim Okunola (not bound yet)'],
+    details: ['Principal: Morgan Ellery (not bound yet)'],
     ...overrides,
   };
 }
@@ -48,7 +48,7 @@ function pause(overrides: Partial<ProvisionHumanPause> = {}): ProvisionHumanPaus
 const PRINCIPAL_CHOICE = pause({
   code: 'principal_selection_required',
   choices: [
-    { id: 'mg-1', label: 'Taslim Okunola (gchat:users/1)' },
+    { id: 'mg-1', label: 'Morgan Ellery (gchat:users/1)' },
     { id: 'mg-2', label: 'Someone Else (gchat:users/2)' },
   ],
 });
@@ -57,7 +57,7 @@ const CHAT_CONFIGURATION = pause({
   phase: 'configure_channel',
   code: 'chat_configuration_required',
   message: "Finish this assistant's Google Chat app configuration, then confirm it.",
-  details: ['App name: Soji'],
+  details: ['App name: Juno'],
   actionUrl: 'https://console.cloud.google.com/apis/api/chat.googleapis.com/hangouts-chat',
   resumeFlag: '--chat-configured',
 });
@@ -67,7 +67,7 @@ const GOOGLE_CLIENT = pause({
   code: 'google_client_required',
   message: "Create the assistant's Google sign-in client, then continue with its file.",
   details: ['Under Clients, create an OAuth client of type Desktop app and download its JSON.'],
-  actionUrl: 'https://console.cloud.google.com/auth/clients?project=gws-ea-robin',
+  actionUrl: 'https://console.cloud.google.com/auth/clients?project=gws-ea-juno',
   resumeFlag: '--google-client-file <file>',
 });
 
@@ -104,7 +104,7 @@ describe('attending a pause at the terminal', () => {
       },
     );
     expect(terminal.note).toHaveBeenCalledWith(
-      expect.stringContaining('App name: Soji\nOpen: https://console.cloud.google.com/'),
+      expect.stringContaining('App name: Juno\nOpen: https://console.cloud.google.com/'),
       'Google Chat app',
     );
 

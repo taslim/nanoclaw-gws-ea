@@ -277,10 +277,10 @@ describe('Google Chat quoted messages', () => {
         event({
           name: 'spaces/dm/messages/old',
           quoteType: 'REPLY',
-          quotedMessageSnapshot: { sender: 'Robin', text: 'Thursday runs 9 to 5 with no break.' },
+          quotedMessageSnapshot: { sender: 'Juno', text: 'Thursday runs 9 to 5 with no break.' },
         }),
       ),
-    ).toEqual({ sender: 'Robin', text: 'Thursday runs 9 to 5 with no break.' });
+    ).toEqual({ sender: 'Juno', text: 'Thursday runs 9 to 5 with no break.' });
   });
 
   it('gives nothing for a message that quotes nothing, or a quote with no text', async () => {

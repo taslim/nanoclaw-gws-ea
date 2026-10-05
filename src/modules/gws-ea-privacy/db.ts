@@ -207,6 +207,22 @@ export async function deleteThreadRecord(key: ThreadKey): Promise<void> {
 }
 
 /**
+ * Let a stopped thread send again: its refusals start over, and what it sent
+ * stays in its record. True when it was stopped.
+ */
+export async function resumeThreadRecord(key: ThreadKey, at: string): Promise<boolean> {
+  const { changes } = await getDb().run(
+    `UPDATE gws_ea_privacy_threads SET refusals = 0, stopped_at = NULL, updated_at = ?
+      WHERE channel_type = ? AND platform_id = ? AND thread_id = ? AND stopped_at IS NOT NULL`,
+    at,
+    key.channelType,
+    key.platformId,
+    key.threadId ?? '',
+  );
+  return changes > 0;
+}
+
+/**
  * Judge one send to anyone but the principal against its thread, and record
  * the outcome in the same transaction.
  *

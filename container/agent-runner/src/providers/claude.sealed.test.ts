@@ -40,7 +40,7 @@ const { MEMORY_SESSION_HOOK, SEALED_MEMORY_SESSION_HOOK } = await import('../mem
 /** What a group on `all` holds, conversation-context among it. */
 const ALL = ['reply', 'files-read', 'files-write', 'shell', 'conversation-context'];
 /** external-email's list: no conversation-context, so its sessions are sealed. */
-const SEALED = ['reply', 'gws-ea-meetings-external'];
+const SEALED = ['files-read', 'time', 'request-status', 'gws-ea-reminders', 'gws-ea-email-external'];
 
 let tmp: string;
 const saved: Record<string, string | undefined> = {};

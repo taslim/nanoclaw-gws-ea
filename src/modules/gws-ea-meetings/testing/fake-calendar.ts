@@ -1,17 +1,15 @@
 /**
  * An in-memory Google Calendar, as the assistant's host token sees it, for
- * the meetings module's tests. It keeps what Google keeps: a deleted event
- * stays under its id as `cancelled`, an id is never issued twice, a
- * calendar whose free/busy is not shared reads as not visible, and a Meet
- * link is created once per request id, as `meetCreation` says it goes.
+ * the scheduling tools' tests. It keeps what Google keeps: a deleted event
+ * stays under its id as `cancelled`, an id is never issued twice, and a
+ * Meet link is created once per request id, as `meetCreation` says it goes.
  */
-import type { CalendarListEntry } from '../../gws-ea-inbox/calendar-notifications.js';
 import { GoogleApiError } from '../../gws-ea-inbox/gmail-api.js';
 import type {
+  CalendarEntry,
   CalendarEvent,
   EventConference,
   EventWrite,
-  FreeBusyCalendar,
   MeetingsCalendarApi,
   NewEvent,
   SendUpdates,
@@ -81,11 +79,9 @@ function apply(event: StoredEvent, fields: EventWrite, meet: EventConference['st
 }
 
 export class FakeCalendar implements MeetingsCalendarApi {
-  readonly calendars = new Map<string, CalendarListEntry>();
+  readonly calendars = new Map<string, CalendarEntry>();
   readonly events: StoredEvent[] = [];
   readonly writes: CalendarWriteRecord[] = [];
-  /** Colleagues' shared free/busy, by address; an address absent here is hidden from the assistant. */
-  readonly sharedFreeBusy = new Map<string, Array<{ start: string; end: string }>>();
   calls = 0;
   failure: Error | undefined;
   /** How Google's creation of a Meet link a write asks for goes. */
@@ -203,26 +199,6 @@ export class FakeCalendar implements MeetingsCalendarApi {
     if (failure) throw failure.error;
     return 'deleted' as const;
   }
-
-  async freeBusy(calendarIds: readonly string[], timeMin: string, timeMax: string) {
-    this.call();
-    const min = Date.parse(timeMin);
-    const max = Date.parse(timeMax);
-    return new Map<string, FreeBusyCalendar>(
-      calendarIds.map((id) => {
-        const shared = this.sharedFreeBusy.get(id.toLowerCase());
-        return [
-          id.toLowerCase(),
-          shared === undefined
-            ? { visible: false, busy: [] }
-            : {
-                visible: true,
-                busy: shared.filter((busy) => Date.parse(busy.start) < max && Date.parse(busy.end) > min),
-              },
-        ];
-      }),
-    );
-  }
 }
 
 /** A client that forwards every call to whichever calendar `current` returns now. */
@@ -236,6 +212,5 @@ export function delegatingCalendarApi(current: () => MeetingsCalendarApi): Meeti
     patchEvent: (calendarId, eventId, event, sendUpdates) =>
       current().patchEvent(calendarId, eventId, event, sendUpdates),
     deleteEvent: (calendarId, eventId, sendUpdates) => current().deleteEvent(calendarId, eventId, sendUpdates),
-    freeBusy: (calendarIds, timeMin, timeMax) => current().freeBusy(calendarIds, timeMin, timeMax),
   };
 }

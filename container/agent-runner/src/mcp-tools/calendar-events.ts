@@ -43,13 +43,13 @@ const GOG_EVENTS_COMMAND =
   'gog calendar events --calendars <calendarId>,<calendarId> --from <start> --to <end> --all-pages';
 
 /**
- * The private marks the assistant puts on the events it places. A private
- * property belongs to one calendar's copy of an event, so only someone who can
- * write that calendar sets it: an invitation's organizer cannot. The host
- * writes them in `src/modules/gws-ea-meetings/calendar-actions.ts`; keep the
- * two in step.
+ * The private marks the assistant puts on the events it places: its role and
+ * the email thread it was placed for. A private property belongs to one
+ * calendar's copy of an event, so only someone who can write that calendar
+ * sets it: an invitation's organizer cannot. The host writes them in
+ * `src/modules/gws-ea-meetings/tools.ts`; keep the two in step.
  */
-const TAG_MEETING = 'gwsEaMeeting';
+const TAG_THREAD = 'gwsEaThread';
 const TAG_ROLE = 'gwsEaRole';
 
 /** The principal's own answer to an invitation; a stronger answer wins across copies. */
@@ -146,7 +146,7 @@ export interface CalendarEvent {
   attendeesOmitted: boolean;
   organizer: { email: string | null; self: boolean } | null;
   recurringEventId: string | null;
-  /** The meeting this copy holds time for, when it is a hold the assistant placed; null for any other event. */
+  /** The email thread this copy holds time for, when it is a hold the assistant placed; null for any other event. */
   heldFor: string | null;
   /** The same on every copy of one meeting, whichever calendar it sits on. */
   meetingKey: string;
@@ -209,9 +209,9 @@ function readParty(value: unknown, label: string): Party {
 }
 
 /**
- * The meeting a copy holds time for, read from the assistant's private marks
- * on it. Both marks make a hold; anything else, a booking included, is a real
- * event.
+ * The email thread a copy holds time for, read from the assistant's private
+ * marks on it. Both marks make a hold; anything else, a booking included, is
+ * a real event.
  */
 function readHeldFor(value: unknown, label: string): string | null {
   if (value === undefined || value === null) return null;
@@ -220,8 +220,8 @@ function readHeldFor(value: unknown, label: string): string | null {
   if (marks === undefined || marks === null) return null;
   if (!isRecord(marks)) problem(`${label}.private must be an object.`);
   const role = optionalString(marks, TAG_ROLE, `${label}.private`);
-  const meeting = optionalString(marks, TAG_MEETING, `${label}.private`);
-  return role === 'hold' ? meeting : null;
+  const thread = optionalString(marks, TAG_THREAD, `${label}.private`);
+  return role === 'hold' ? thread : null;
 }
 
 function parseEvent(value: unknown, label: string, fallbackKey: string, zone: string): CalendarEvent {

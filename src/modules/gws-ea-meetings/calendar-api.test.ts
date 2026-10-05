@@ -1,8 +1,8 @@
 /**
  * The host's Calendar client: each call is one request with the token in
  * its header, asks for no event text back, and reads Google's answers the
- * way the calendar actions rely on (a duplicate id, a deleted event, a
- * calendar whose free/busy is hidden).
+ * way the scheduling tools rely on (a duplicate id, a deleted event, a busy
+ * block listed without an id).
  */
 import { describe, expect, it } from 'vitest';
 
@@ -39,7 +39,7 @@ const WRITE = {
   end: '2026-10-07T09:30:00.000Z',
   timeZone: 'Europe/London',
   attendees: ['sam@acme.example'],
-  tags: { gwsEaMeeting: 'mtg-1', gwsEaRole: 'booking' },
+  tags: { gwsEaThread: 'mail-1', gwsEaRole: 'booking' },
   reminders: 'default' as const,
 };
 
@@ -61,7 +61,7 @@ describe('the Calendar client', () => {
       end: { dateTime: '2026-10-07T09:30:00.000Z', timeZone: 'Europe/London' },
       attendees: [{ email: 'sam@acme.example' }],
       reminders: { useDefault: true },
-      extendedProperties: { private: { gwsEaMeeting: 'mtg-1', gwsEaRole: 'booking' } },
+      extendedProperties: { private: { gwsEaThread: 'mail-1', gwsEaRole: 'booking' } },
     });
   });
 
@@ -70,7 +70,7 @@ describe('the Calendar client', () => {
     await api.insertEvent(
       'pat@principal.example',
       'abc123',
-      { ...WRITE, location: 'Acme HQ, 1 Main Street', conference: { requestId: 'meet-mtg-1' } },
+      { ...WRITE, location: 'Acme HQ, 1 Main Street', conference: { requestId: 'meet-mail-1' } },
       'all',
     );
     await api.patchEvent('pat@principal.example', 'abc123', { location: 'Their office' }, 'all');
@@ -78,14 +78,14 @@ describe('the Calendar client', () => {
     expect(insert.url.searchParams.get('conferenceDataVersion')).toBe('1');
     expect(insert.body).toMatchObject({
       location: 'Acme HQ, 1 Main Street',
-      conferenceData: { createRequest: { requestId: 'meet-mtg-1', conferenceSolutionKey: { type: 'hangoutsMeet' } } },
+      conferenceData: { createRequest: { requestId: 'meet-mail-1', conferenceSolutionKey: { type: 'hangoutsMeet' } } },
     });
     // A write that asks for no link leaves the event's conference as it is.
     expect(patch.url.searchParams.has('conferenceDataVersion')).toBe(false);
     expect(patch.body).toEqual({ location: 'Their office' });
   });
 
-  it("reads an event's Meet link as Google reports it, and a calendar's allowed conference types", async () => {
+  it("reads an event's Meet link as Google reports it, and a calendar's name and allowed conference types", async () => {
     const { api, requests } = stubGoogle((request) =>
       request.url.pathname.includes('/calendarList/')
         ? {
@@ -93,6 +93,7 @@ describe('the Calendar client', () => {
             body: {
               id: 'pat@principal.example',
               accessRole: 'owner',
+              summary: 'Pat – family',
               conferenceProperties: { allowedConferenceSolutionTypes: ['hangoutsMeet'] },
             },
           }
@@ -123,6 +124,8 @@ describe('the Calendar client', () => {
     );
     const entry = await api.getCalendar('pat@principal.example');
     expect(entry && allowsMeet(entry)).toBe(true);
+    // The privacy check reads the name invitees see on the invitation.
+    expect(entry?.summary).toBe('Pat – family');
     expect(allowsMeet({ id: 'family@group.calendar.google.com' })).toBe(false);
   });
 
@@ -183,36 +186,6 @@ describe('the Calendar client', () => {
     ]);
   });
 
-  it('reads free/busy per calendar, and a calendar Google hides as not visible', async () => {
-    const { api, requests } = stubGoogle(() => ({
-      status: 200,
-      body: {
-        calendars: {
-          'kim@principal.example': { busy: [{ start: '2026-10-07T09:00:00Z', end: '2026-10-07T10:00:00Z' }] },
-          'lee@principal.example': { busy: [], errors: [{ domain: 'global', reason: 'notFound' }] },
-        },
-      },
-    }));
-    const result = await api.freeBusy(
-      ['Kim@principal.example', 'lee@principal.example', 'max@principal.example'],
-      '2026-10-05T00:00:00.000Z',
-      '2026-10-10T00:00:00.000Z',
-    );
-    expect(requests[0].method).toBe('POST');
-    expect(requests[0].url.pathname).toBe('/calendar/v3/freeBusy');
-    expect(requests[0].body).toEqual({
-      timeMin: '2026-10-05T00:00:00.000Z',
-      timeMax: '2026-10-10T00:00:00.000Z',
-      items: [{ id: 'Kim@principal.example' }, { id: 'lee@principal.example' }, { id: 'max@principal.example' }],
-    });
-    expect(result.get('kim@principal.example')).toEqual({
-      visible: true,
-      busy: [{ start: '2026-10-07T09:00:00Z', end: '2026-10-07T10:00:00Z' }],
-    });
-    expect(result.get('lee@principal.example')).toEqual({ visible: false, busy: [] });
-    expect(result.get('max@principal.example')).toEqual({ visible: false, busy: [] });
-  });
-
   it('lists a busy block a free/busy-only calendar gives without an id, so it still counts', async () => {
     const { api } = stubGoogle(() => ({
       status: 200,
@@ -239,11 +212,11 @@ describe('the Calendar client', () => {
         status: 'confirmed',
         start: { dateTime: '2026-10-07T09:00:00Z' },
         end: { dateTime: '2026-10-07T09:30:00Z' },
-        extendedProperties: { private: { gwsEaMeeting: 'mtg-1', gwsEaRole: 'hold' } },
+        extendedProperties: { private: { gwsEaThread: 'mail-1', gwsEaRole: 'hold' } },
       },
     }));
     const event = await api.getEvent('pat@principal.example', 'h1');
-    expect(event?.tags).toEqual({ gwsEaMeeting: 'mtg-1', gwsEaRole: 'hold' });
+    expect(event?.tags).toEqual({ gwsEaThread: 'mail-1', gwsEaRole: 'hold' });
     const fields = requests[0].url.searchParams.get('fields') ?? '';
     expect(fields).toContain('extendedProperties');
     for (const hidden of ['summary', 'description', 'location']) expect(fields).not.toContain(hidden);

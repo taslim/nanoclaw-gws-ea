@@ -1,3 +1,4 @@
+import { deliveredByRequest } from './action-request.js';
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import {
   getPendingMessages,
@@ -616,12 +617,13 @@ export async function processQuery(
             // the nudge decision — see turnDelivered.
             suppressDelivery: midTurnCompleteDelivery,
             // "Did anything user-visible go out this turn?" — door
-            // deliveries (midTurnSent) plus any chat row written since the
-            // turn boundary (which also sees MCP send_message calls the
+            // deliveries (midTurnSent) plus any chat row or answered
+            // message-sending request written since the turn boundary
+            // (which also sees MCP send_message and email_send calls the
             // frame-local count can't). When false and the result still
             // carries content, the wrap-nudge fires so the model re-sends
             // and the retry streams through the mid-turn door.
-            turnDelivered: midTurnCompleteDelivery ? midTurnSent > 0 || chatRowWrittenSince(turnStartSeq) : undefined,
+            turnDelivered: midTurnCompleteDelivery ? midTurnSent > 0 || deliveredSince(turnStartSeq) : undefined,
           });
           // Completed partial output remains deliverable, but an explicit
           // provider failure must keep its status and never trigger a retry.
@@ -828,9 +830,10 @@ export interface ResultDispatchOptions {
   suppressDelivery?: boolean;
   /**
    * Did anything user-visible go out this turn? True when the mid-turn door
-   * delivered (midTurnSent > 0) OR any chat row landed in outbound.db since
-   * the turn boundary (covers MCP send_message calls the frame-local count
-   * cannot see). Only meaningful with `suppressDelivery`. When false and the
+   * delivered (midTurnSent > 0) OR any chat row, or any message-sending
+   * request the host answered ok, landed in outbound.db since the turn
+   * boundary (covers MCP send_message and email_send calls the frame-local
+   * count cannot see). Only meaningful with `suppressDelivery`. When false and the
    * result carries content — wrapped blocks or unwrapped prose — the turn
    * counts as undelivered and the wrap-nudge fires, so the model re-sends
    * and the retry streams through the mid-turn door. This is the deliberate
@@ -997,19 +1000,23 @@ function maxOutboundSeq(): number {
 }
 
 /**
- * Has ANY chat row been written to outbound.db after `afterSeq`? Feeds the
- * result door's nudge decision: unlike the frame-local midTurnSent count,
- * this also sees MCP send_message / send_file deliveries made this turn, so
- * an agent that already replied via tools is not nudged into repeating
- * itself. Fail-open to false: if the lookup breaks, the nudge may fire
- * spuriously (a repeat coax), never silently swallow an undelivered turn.
+ * Has anything been delivered through outbound.db after `afterSeq`: a chat
+ * row, or a request that sends a message (email_send) the host answered ok?
+ * Feeds the result door's nudge decision: unlike the frame-local midTurnSent
+ * count, this also sees MCP send_message / send_file / email_send deliveries
+ * made this turn, so an agent that already replied via tools is not nudged
+ * into repeating itself. Fail-open to false: if the lookup breaks, the nudge
+ * may fire spuriously (a repeat coax), never silently swallow an undelivered
+ * turn.
  */
-function chatRowWrittenSince(afterSeq: number): boolean {
+function deliveredSince(afterSeq: number): boolean {
   try {
     // ponytail: reuse the existing semantic read; add a cursor operation only if history scans show up in profiles.
-    return getUndeliveredMessages().some((message) => (message.seq ?? 0) > afterSeq && message.kind === 'chat');
+    return getUndeliveredMessages().some(
+      (message) => (message.seq ?? 0) > afterSeq && (message.kind === 'chat' || deliveredByRequest(message)),
+    );
   } catch (err) {
-    log(`chatRowWrittenSince failed: ${err instanceof Error ? err.message : String(err)}`);
+    log(`deliveredSince failed: ${err instanceof Error ? err.message : String(err)}`);
     return false;
   }
 }

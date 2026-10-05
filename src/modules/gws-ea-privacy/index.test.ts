@@ -18,7 +18,8 @@ vi.mock('../../config.js', async () => {
   };
 });
 
-vi.mock('../../container-runner.js', () => ({
+vi.mock('../../container-runner.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../container-runner.js')>()),
   getContainerStartedAtMs: vi.fn(() => Date.now()),
   isContainerRunning: vi.fn(() => false),
   killContainer: vi.fn(),
@@ -47,12 +48,15 @@ import { addPrincipalAddress, bindVerifiedPrincipalUser } from '../gws-ea-profil
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
 import '../gws-ea-profile/index.js';
+import '../gws-ea-inbox/index.js';
+import { createThread, recordThreadAddresses } from '../gws-ea-inbox/thread-map.js';
 import {
   audienceForAddresses,
   checkOutbound,
   listPrivateValues,
   MAX_REFUSALS_PER_THREAD,
   registerRecipientResolver,
+  resumeThread,
   THREAD_STOPPED_SIGNAL,
 } from './index.js';
 
@@ -62,6 +66,8 @@ const DM = { channelType: 'gchat', platformId: 'gchat:spaces/dm' } as const;
 const THREAD = { channelType: 'email', platformId: 'email:thread-1' } as const;
 const OTHER_THREAD = { channelType: 'email', platformId: 'email:thread-2' } as const;
 const HOME = '123 Main Street, Springfield';
+const JUNO = 'juno@example.com';
+const SAM = 'sam@acme.test';
 const HOME_LABEL = 'Home';
 
 interface Sent {
@@ -200,7 +206,13 @@ beforeEach(async () => {
   await upsertUser({ id: PRINCIPAL, kind: 'gchat', display_name: 'Pat', created_at: now() });
   await bindVerifiedPrincipalUser(PRINCIPAL, now());
   await upsertUserDm({ user_id: PRINCIPAL, channel_type: 'gchat', messaging_group_id: 'mg-dm', resolved_at: now() });
-  await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', 'ag-main');
+  await getDb().run(
+    `UPDATE gws_ea_profile
+        SET main_agent_group_id = ?, principal_display_name = 'Pat Doe', assistant_workspace_email = ?
+      WHERE singleton = 1`,
+    'ag-main',
+    JUNO,
+  );
   await addPrincipalAddress('pat@example.com');
 
   main = (await resolveSession('ag-main', 'mg-dm', null, 'agent-shared')).session;
@@ -419,7 +431,7 @@ describe('the audience check on delivery', () => {
     expect(sent).toEqual([]);
   });
 
-  it('stops a thread after repeated refusals, signals main once, and leaves other threads alone', async () => {
+  it('stops a thread after repeated refusals, signals main once, says main was told, and leaves other threads alone', async () => {
     await addHome();
     for (let attempt = 1; attempt <= MAX_REFUSALS_PER_THREAD; attempt++) {
       queue(external, { id: `leak-${attempt}`, route: THREAD, content: { text: `Try ${attempt}: 123 Main St` } });
@@ -428,7 +440,10 @@ describe('the audience check on delivery', () => {
     expect(sent).toEqual([]);
     const refusals = notes(external);
     expect(refusals).toHaveLength(MAX_REFUSALS_PER_THREAD);
-    expect(refusals.at(-1)).toMatch(/stopped/);
+    // The signal goes to main, so the sender is told main knows, not the principal.
+    expect(refusals.at(-1)).toMatch(
+      /now stopped after repeated attempts\. Send nothing more in it; main has been told\.$/,
+    );
 
     const signals = inbound(main).filter(
       (row) => (JSON.parse(row.content) as { signal?: { type?: string } }).signal?.type === THREAD_STOPPED_SIGNAL,
@@ -437,17 +452,59 @@ describe('the audience check on delivery', () => {
     expect(signals[0]).toMatchObject({ channel_type: DM.channelType, platform_id: DM.platformId });
     const signal = JSON.parse(signals[0].content) as { text: string; signal: Record<string, unknown> };
     expect(signal.signal).toMatchObject({ kind: 'address', refusals: MAX_REFUSALS_PER_THREAD });
-    expect(signal.text).not.toMatch(/main st|springfield|home/i);
+    // A conversation with no thread cannot be handed to again, so main reads that it stays stopped.
+    expect(signal.text).toBe(
+      "Nothing more will be sent in a conversation with someone other than Pat Doe: three times an email in it would have shared Pat Doe's private address, and each was stopped, so nothing private went out.",
+    );
 
     queue(external, { id: 'clean-after-stop', route: THREAD, content: { text: 'Is Thursday still good?' } });
     await deliverSessionMessages(external);
     expect(sent).toEqual([]);
-    expect(notes(external).at(-1)).toMatch(/^Your message was not sent: this conversation is stopped/);
+    expect(notes(external).at(-1)).toMatch(
+      /^Your message was not sent: this conversation is stopped .*Send nothing more in it; main has been told\.$/,
+    );
     expect(inbound(main).filter((row) => row.content.includes(THREAD_STOPPED_SIGNAL))).toHaveLength(1);
 
     queue(externalOther, { id: 'elsewhere', route: OTHER_THREAD, content: { text: 'Is Thursday still good?' } });
     await deliverSessionMessages(externalOther);
     expect(texts()).toEqual(['Is Thursday still good?']);
+  });
+
+  it("lets main's next handoff resume a stopped thread, its refusals counted afresh (R76)", async () => {
+    await addHome();
+    const { threadKey } = await createThread(null, now());
+    // Sam wrote to the principal and the assistant, and mentioned someone not in the conversation.
+    await recordThreadAddresses(threadKey, [SAM, 'pat@example.com', JUNO], 'message', now());
+    await recordThreadAddresses(threadKey, ['lee@acme.test'], 'written', now());
+    const key = { ...THREAD, threadId: threadKey };
+    for (let attempt = 1; attempt <= MAX_REFUSALS_PER_THREAD; attempt++) {
+      queue(external, {
+        id: `leak-${attempt}`,
+        route: THREAD,
+        threadId: key.threadId,
+        content: { text: '123 Main St' },
+      });
+      await deliverSessionMessages(external);
+    }
+    const [signal] = inbound(main).filter((row) => row.content.includes(THREAD_STOPPED_SIGNAL));
+    expect((JSON.parse(signal.content) as { text: string }).text).toBe(
+      `Sending is paused in the conversation with ${SAM}: three times an email in it would have shared Pat Doe's private address, ` +
+        `and each was stopped, so nothing private went out. Your next handoff to it resumes it. (thread ${threadKey})`,
+    );
+
+    expect(await resumeThread(key)).toBe(true);
+    expect(await resumeThread(key)).toBe(false);
+    queue(external, {
+      id: 'after-resume',
+      route: THREAD,
+      threadId: key.threadId,
+      content: { text: 'Is Thursday good?' },
+    });
+    queue(external, { id: 'leak-again', route: THREAD, threadId: key.threadId, content: { text: '123 Main St' } });
+    queue(external, { id: 'still-going', route: THREAD, threadId: key.threadId, content: { text: 'Or Friday?' } });
+    await deliverSessionMessages(external);
+    expect(texts()).toEqual(['Is Thursday good?', 'Or Friday?']);
+    expect(await resumeThread({ ...THREAD, threadId: 'mail-never-stopped' })).toBe(false);
   });
 
   it('judges a retried send without its own earlier attempt', async () => {
@@ -503,6 +560,32 @@ describe('the shared check', () => {
     expect(await checkOutbound(fields, 'others')).toMatchObject({ allowed: false, kind: 'address' });
   });
 
+  it('reads the target of every link as a mail client opens it', async () => {
+    await addHome();
+    const hidden = '[directions](https://maps.example/?q=123&#32;Main&#32;Street)';
+    expect(await checkOutbound(`Here are ${hidden}.`, 'others')).toMatchObject({ allowed: false, kind: 'address' });
+    expect(await checkOutbound('Here are [directions](https://maps.example/?q=Cafe&#32;Rosa).', 'others')).toEqual({
+      allowed: true,
+    });
+    queue(external, { id: 'link-1', route: THREAD, content: { text: `Meet me there: ${hidden}` } });
+    await deliverSessionMessages(external);
+    expect(sent).toEqual([]);
+  });
+
+  it('reads the text as a mail client renders it: character references resolved, an image read as its words', async () => {
+    await addHome();
+    for (const hidden of [
+      'Meet at 1&#50;3 Main St.',
+      'Meet at &#x31;23 Main St.',
+      '![1&#50;3 Main St](https://maps.example/map.png)',
+    ]) {
+      expect(await checkOutbound(hidden, 'others'), hidden).toMatchObject({ allowed: false, kind: 'address' });
+    }
+    queue(external, { id: 'rendered-1', route: THREAD, content: { text: 'Happy to meet at 1&#50;3 Main St.' } });
+    await deliverSessionMessages(external);
+    expect(sent).toEqual([]);
+  });
+
   it('names each kind and never the value or its label', async () => {
     await run('private-values-add', { label: 'Cell', kind: 'phone', value: '+1 415 555 0134' }, agent(main));
     await run('private-values-add', { label: 'Gmail', kind: 'email', value: 'pat.home@gmail.com' }, agent(main));
@@ -526,6 +609,8 @@ describe('the shared check', () => {
     await addHome();
     expect(await checkOutbound('123 Main Street', 'principal')).toEqual({ allowed: true });
     expect(await checkOutbound(['Lunch', 'Cafe Rosa', 'Bring the slides'], 'others')).toEqual({ allowed: true });
+    // Its end run into its own start would spell the street line: each reading of a text is read apart.
+    expect(await checkOutbound('Main Street is shut, so use gate 123', 'others')).toEqual({ allowed: true });
   });
 
   it("counts only the principal's own addresses as the principal", async () => {

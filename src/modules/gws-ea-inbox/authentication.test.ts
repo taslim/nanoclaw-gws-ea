@@ -32,7 +32,7 @@ function results(domain: string, selector: string, dmarc = 'pass', dkim = 'pass'
 
 function message(options: MessageOptions = {}): MailHeader[] {
   const gmail: MailHeader[] = [
-    { name: 'Delivered-To', value: 'robin@assistant.example' },
+    { name: 'Delivered-To', value: 'juno@assistant.example' },
     { name: 'Received', value: 'by 2002:a05:6a10:1234 with SMTP id abc; Wed, 7 Oct 2026 10:00:00 -0700' },
     { name: 'X-Received', value: 'by 2002:a17:90a:1 with SMTP id def; Wed, 7 Oct 2026 10:00:00 -0700' },
     { name: 'ARC-Seal', value: 'i=1; a=rsa-sha256; t=1; cv=none; d=google.com; s=arc-20240605; b=xyz' },
@@ -51,7 +51,7 @@ function message(options: MessageOptions = {}): MailHeader[] {
     ...(options.senderHeaders ?? []),
     { name: 'DKIM-Signature', value: 'v=1; a=rsa-sha256; d=principal.example; s=google; b=abc' },
     { name: 'From', value: options.from ?? `Pat Principal <${PRINCIPAL}>` },
-    { name: 'To', value: 'Robin <robin@assistant.example>' },
+    { name: 'To', value: 'Juno <juno@assistant.example>' },
     { name: 'Subject', value: 'Hello' },
     { name: 'Message-ID', value: '<one@principal.example>' },
     ...(options.extra ?? []),

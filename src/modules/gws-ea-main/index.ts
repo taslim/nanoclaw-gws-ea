@@ -6,18 +6,15 @@
  * standing instructions (the persona file) never collide with a product
  * update.
  */
-import fs from 'node:fs';
 import path from 'node:path';
 
 import { register } from '../../cli/registry.js';
 import { parseSkillSelection } from '../../container-config.js';
 import { getDb } from '../../db/connection.js';
 import { getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
-import { log } from '../../log.js';
-import { registerRequiredProjectDocSection } from '../../project-doc-sections.js';
-import type { AgentGroup } from '../../types.js';
 import { EXPOSED_GOOGLE_SKILLS } from '../gws-ea-google/grant.js';
 import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { registerGuidance } from '../gws-ea-profile/guidance.js';
 
 /** The guidance, relative to the checkout the host runs from, as NanoClaw reads its other instruction files. */
 export const GUIDANCE_PATH = path.join('src', 'modules', 'gws-ea-main', 'guidance.md');
@@ -36,25 +33,12 @@ async function mainAgentGroupId(): Promise<string | null> {
   return getMainAgentGroupId();
 }
 
-async function guidanceSection(group: AgentGroup): Promise<{ name: string; body: string } | undefined> {
-  if (group.id !== (await mainAgentGroupId())) return undefined;
-  const file = path.resolve(process.cwd(), GUIDANCE_PATH);
-  if (!fs.existsSync(file)) {
-    // Tolerated but never silent, like a missing base document
-    // (src/project-doc-compose.ts): throwing here would fail every spawn.
-    // The release preflight refuses a release without this file.
-    log.error('GWS-EA guidance is missing; main starts without it', { file });
-    return undefined;
-  }
-  const body = fs.readFileSync(file, 'utf8');
-  if (!body.trim()) {
-    log.error('GWS-EA guidance is empty; main starts without it', { file });
-    return undefined;
-  }
-  return { name: 'Executive Assistant', body };
-}
-
-registerRequiredProjectDocSection('gws-ea-main:guidance', guidanceSection);
+registerGuidance('gws-ea-main:guidance', {
+  agent: 'main',
+  heading: 'Executive Assistant',
+  file: GUIDANCE_PATH,
+  agentGroupId: mainAgentGroupId,
+});
 
 interface MainSkills {
   readonly agent_group_id: string;

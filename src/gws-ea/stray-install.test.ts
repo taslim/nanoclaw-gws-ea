@@ -271,11 +271,11 @@ describe('removeStrayInstall', () => {
     await w.write('.env', 'ANTHROPIC_API_KEY=stray');
     const repository = w.names.containerImageBase;
     w.docker
-      .image('sha256:shared', `${repository}:latest`, 'nanoclaw-agent-v2-f2201907:latest')
+      .image('sha256:shared', `${repository}:latest`, 'nanoclaw-agent-v2-5e0d8c41:latest')
       .image('sha256:group', `${repository}:ag-main`)
       .container('agent', 'sha256:group', w.slug)
       .container('exited', 'sha256:shared', w.slug)
-      .container('soji-agent', 'sha256:shared', 'f2201907');
+      .container('other-agent', 'sha256:shared', '5e0d8c41');
     await mkdir(path.join(w.home, '.local', 'bin'), { recursive: true });
     await symlink(path.join(w.root, 'bin', 'ncl'), path.join(w.home, '.local', 'bin', 'ncl'));
     return w;
@@ -300,10 +300,10 @@ describe('removeStrayInstall', () => {
     ]);
     expect(w.serviceHelpers.stopService).toHaveBeenCalledOnce();
     expect(await present(w.plist)).toBe(false);
-    expect(w.docker.containers.map(({ id }) => id)).toEqual(['soji-agent']);
+    expect(w.docker.containers.map(({ id }) => id)).toEqual(['other-agent']);
     expect(w.docker.tags(w.names.containerImageBase)).toEqual([]);
     // The image another install tags survives with that tag.
-    expect([...(w.docker.images.get('sha256:shared') ?? [])]).toEqual(['nanoclaw-agent-v2-f2201907:latest']);
+    expect([...(w.docker.images.get('sha256:shared') ?? [])]).toEqual(['nanoclaw-agent-v2-5e0d8c41:latest']);
     for (const gone of ['data', 'groups', 'store', '.env', 'logs/nanoclaw.log', 'logs/setup-steps']) {
       expect(await present(path.join(w.root, gone))).toBe(false);
     }
@@ -359,7 +359,7 @@ describe('removeStrayInstall', () => {
     const w = await strayWorld();
     const link = path.join(w.home, '.local', 'bin', 'ncl');
     await rm(link);
-    await symlink(path.join(w.base, 'sojiclaw', 'bin', 'ncl'), link);
+    await symlink(path.join(w.base, 'otherclaw', 'bin', 'ncl'), link);
 
     const removed = await removeStrayInstall(w.checkout, await detectStrayInstall(w.checkout, w.paths), w.launcher);
 
@@ -394,7 +394,7 @@ describe('removeStrayInstall', () => {
     ).rejects.toMatchObject({ code: 'nanoclaw_removal_incomplete', message: expect.stringContaining('data/ncl.sock') });
     // The teardown never ran beside a host that could still start containers.
     expect(w.serviceHelpers.stopService).not.toHaveBeenCalled();
-    expect(w.docker.containers.map(({ id }) => id)).toEqual(['agent', 'exited', 'soji-agent']);
+    expect(w.docker.containers.map(({ id }) => id)).toEqual(['agent', 'exited', 'other-agent']);
     expect(w.docker.tags(w.names.containerImageBase)).toHaveLength(2);
     await expectStateKept(w);
   });

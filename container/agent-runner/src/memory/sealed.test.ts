@@ -12,7 +12,7 @@ function tempBase(): string {
 
 describe('sealed sessions', () => {
   it('are those of a group without conversation-context, including one with no list at all', () => {
-    expect(sessionsSealed(new Set(['reply', 'gws-ea-meetings-external']))).toBe(true);
+    expect(sessionsSealed(new Set(['files-read', 'gws-ea-email-external']))).toBe(true);
     expect(sessionsSealed(new Set())).toBe(true);
     expect(sessionsSealed(new Set(['reply', 'conversation-context']))).toBe(false);
   });

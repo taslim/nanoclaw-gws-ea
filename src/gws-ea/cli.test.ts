@@ -1153,15 +1153,15 @@ describe("gws-ea create and the principal's email addresses", () => {
   it('hands create inputs every --principal-email, lowercased and each once', async () => {
     const contexts = await contextsOf([
       '--principal-email',
-      'Taslim@Example.test',
+      'Morgan@Example.test',
       '--principal-email',
-      'taslim@work.example.test',
+      'morgan@work.example.test',
       '--principal-email',
-      'TASLIM@example.test',
+      'MORGAN@example.test',
     ]);
 
     expect(contexts.map((context) => context.providedPrincipalEmails)).toEqual([
-      ['taslim@example.test', 'taslim@work.example.test'],
+      ['morgan@example.test', 'morgan@work.example.test'],
     ]);
   });
 
@@ -1181,7 +1181,7 @@ describe("gws-ea create and the principal's email addresses", () => {
     const io = lines();
 
     expect(
-      await runCli(['create', '--track', 'dogfood', '--principal-email', 'taslim@example.test', ...extra], {
+      await runCli(['create', '--track', 'dogfood', '--principal-email', 'morgan@example.test', ...extra], {
         paths,
         ...io.runtime,
         ...createRuntime(),

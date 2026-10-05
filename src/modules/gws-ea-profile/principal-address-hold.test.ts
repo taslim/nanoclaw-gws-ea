@@ -56,7 +56,7 @@ registerMigration(gwsEaInboxMigration);
 const TEST_DIR = '/tmp/nanoclaw-test-gws-ea-profile-hold';
 const PRINCIPAL = 'gchat:users/principal';
 const DM = { channelType: 'gchat', platformId: 'gchat:spaces/dm' } as const;
-const NEW_ADDRESS = 'taslim@new.example.test';
+const NEW_ADDRESS = 'morgan@new.example.test';
 
 interface Sent {
   readonly channelType: string;
@@ -167,12 +167,12 @@ beforeEach(async () => {
   await reconcileGwsEaProfile({
     assistantDisplayName: 'Aya',
     assistantWorkspaceEmail: 'aya@example.test',
-    principalDisplayName: 'Taslim',
+    principalDisplayName: 'Morgan',
     principalTimezone: 'Africa/Lagos',
     mainAgentGroupId: 'ag-main',
-    principalEmails: ['taslim@example.test', 'taslim@work.example.test'],
+    principalEmails: ['morgan@example.test', 'morgan@work.example.test'],
   });
-  await upsertUser({ id: PRINCIPAL, kind: 'gchat', display_name: 'Taslim', created_at: now() });
+  await upsertUser({ id: PRINCIPAL, kind: 'gchat', display_name: 'Morgan', created_at: now() });
   await bindVerifiedPrincipalUser(PRINCIPAL, now());
   await upsertUserDm({ user_id: PRINCIPAL, channel_type: 'gchat', messaging_group_id: 'mg-dm', resolved_at: now() });
 
@@ -200,7 +200,7 @@ describe('a new principal address once the inbox exists', () => {
   beforeEach(createInbox);
 
   it("holds main's address for the principal's card, ignores anyone else's click, and adds it once the principal approves", async () => {
-    const response = await run('principal-addresses-add', { email: 'Taslim@New.Example.test' }, agent(main));
+    const response = await run('principal-addresses-add', { email: 'Morgan@New.Example.test' }, agent(main));
     expect(response).toMatchObject({ ok: true, data: { email: NEW_ADDRESS, status: 'awaiting-principal' } });
     expect(await addresses()).not.toContain(NEW_ADDRESS);
 
@@ -224,7 +224,7 @@ describe('a new principal address once the inbox exists', () => {
     expect(await pendingApprovals()).toHaveLength(1);
 
     await click(approval!, 'approve');
-    expect(await addresses()).toEqual(['taslim@example.test', NEW_ADDRESS, 'taslim@work.example.test']);
+    expect(await addresses()).toEqual(['morgan@example.test', NEW_ADDRESS, 'morgan@work.example.test']);
     expect(await pendingApprovals()).toEqual([]);
     expect(notes(main).at(-1)).toBe(`The principal confirmed. ${NEW_ADDRESS} is now one of their addresses.`);
   });
@@ -249,18 +249,18 @@ describe('a new principal address once the inbox exists', () => {
   });
 
   it('removes an address on main’s word, since removing one only narrows who speaks for the principal', async () => {
-    expect(await run('principal-addresses-remove', { email: 'taslim@work.example.test' }, agent(main))).toMatchObject({
+    expect(await run('principal-addresses-remove', { email: 'morgan@work.example.test' }, agent(main))).toMatchObject({
       ok: true,
-      data: { email: 'taslim@work.example.test', removed: true },
+      data: { email: 'morgan@work.example.test', removed: true },
     });
-    expect(await addresses()).toEqual(['taslim@example.test']);
+    expect(await addresses()).toEqual(['morgan@example.test']);
     expect(await pendingApprovals()).toEqual([]);
   });
 
   it('sends no card for an address already held, or one refused before it could be added', async () => {
-    expect(await run('principal-addresses-add', { email: 'Taslim@Example.test' }, agent(main))).toMatchObject({
+    expect(await run('principal-addresses-add', { email: 'Morgan@Example.test' }, agent(main))).toMatchObject({
       ok: true,
-      data: { email: 'taslim@example.test', added: false },
+      data: { email: 'morgan@example.test', added: false },
     });
     for (const email of ['not-an-email', 'AYA@example.test']) {
       expect(await run('principal-addresses-add', { email }, agent(main)), email).toMatchObject({ ok: false });
@@ -295,7 +295,7 @@ describe('a new principal address once the inbox exists', () => {
       unknown_sender_policy: 'strict',
       created_at: now(),
     });
-    await upsertUser({ id: later, kind: 'gchat', display_name: 'Taslim', created_at: now() });
+    await upsertUser({ id: later, kind: 'gchat', display_name: 'Morgan', created_at: now() });
     await bindVerifiedPrincipalUser(later, new Date(Date.now() + 60_000).toISOString());
     await upsertUserDm({
       user_id: later,

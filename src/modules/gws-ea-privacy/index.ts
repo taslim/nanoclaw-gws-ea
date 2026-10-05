@@ -10,9 +10,14 @@
  *     thread's earlier outbound text, so a value split across sends is found.
  *     After `MAX_REFUSALS_PER_THREAD` refusals the thread stops: nothing more
  *     is sent in it, and main's shared session gets a typed signal, routed to
- *     the principal's direct message;
+ *     the principal's direct message. main's next handoff to the thread
+ *     resumes it (`resumeThread`);
  *   - `checkOutbound`, the same check for the host's calendar writes and
  *     main's handoff text, which never pass through a channel.
+ *
+ * Both read what the assistant wrote three ways, as its readers receive it:
+ * as written, as a mail client renders it, and the targets of its links
+ * (`readingsOf`).
  *
  * A refusal names only the value's fixed kind, never the value or its label.
  * Removing a value switches its check off, so an agent's removal waits for
@@ -20,6 +25,9 @@
  */
 import { randomUUID } from 'node:crypto';
 import { isUtf8 } from 'node:buffer';
+
+import { micromark } from 'micromark';
+import { gfm, gfmHtml } from 'micromark-extension-gfm';
 
 import { registerResource, type ColumnDef } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
@@ -31,8 +39,10 @@ import { registerOutboundGuard, type OutboundGuardDecision, type OutboundSend } 
 import { ALLOW, DENY, defineGuardedAction, guard, HOLD, type GuardActor } from '../../guard/index.js';
 import { log } from '../../log.js';
 import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
+import { conversationPeople, EMAIL_CHANNEL_TYPE } from '../gws-ea-inbox/runtime.js';
 import {
   assertMainCaller,
+  getGwsEaProfile,
   getMainAgentGroupId,
   isVerifiedPrincipalUser,
   principalApproverUserId,
@@ -45,6 +55,7 @@ import {
   judgeThreadSend,
   listPrivateValues,
   removePrivateValue,
+  resumeThreadRecord,
   type PrivateValue,
   type ThreadKey,
 } from './db.js';
@@ -55,6 +66,7 @@ import {
   streamOf,
   type CompiledPrivateValue,
   type PrivateValueKind,
+  type TextStream,
 } from './match.js';
 import { gwsEaPrivacyMigration } from './migration.js';
 
@@ -113,17 +125,40 @@ function refusalReason(kind: PrivateValueKind): string {
 }
 
 function stoppingReason(kind: PrivateValueKind): string {
-  return `it contains the principal's private ${KIND_NOUNS[kind]}, and this conversation is now stopped after repeated attempts. Send nothing more in it; the principal will be told.`;
+  return `it contains the principal's private ${KIND_NOUNS[kind]}, and this conversation is now stopped after repeated attempts. Send nothing more in it; main has been told.`;
 }
 
 const STOPPED_REASON =
-  "this conversation is stopped after repeated attempts to send the principal's private details. Send nothing more in it; the principal will be told.";
+  "this conversation is stopped after repeated attempts to send the principal's private details. Send nothing more in it; main has been told.";
 
-function stoppedSignalText(kind: PrivateValueKind, refusals: number): string {
-  return (
-    `The host stopped a conversation with someone other than the principal: the assistant tried ${refusals} times to send them the principal's private ${KIND_NOUNS[kind]}. ` +
-    'Every attempt was refused, so nothing private was sent, and nothing more will be sent in that conversation.'
-  );
+const LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
+
+function timesOver(count: number): string {
+  return ['once', 'twice', 'three times'][count - 1] ?? `${count} times`;
+}
+
+/** Who a stopped email thread's conversation is with; empty for any other conversation. */
+async function stoppedPeople(key: ThreadKey): Promise<string[]> {
+  if (key.channelType !== EMAIL_CHANNEL_TYPE || key.threadId === null) return [];
+  if (!(await getDb().hasTable('gws_ea_thread_addresses'))) return [];
+  return conversationPeople(key.threadId);
+}
+
+/** main's note of a stop: who the conversation is with, what was kept back, how it resumes, then the thread. */
+async function stoppedSignalText(key: ThreadKey, kind: PrivateValueKind, refusals: number): Promise<string> {
+  const principal = (await getGwsEaProfile()).principal_display_name ?? 'the principal';
+  const people = await stoppedPeople(key);
+  const conversation =
+    people.length === 0
+      ? `a conversation with someone other than ${principal}`
+      : `the conversation with ${LIST.format(people)}`;
+  const sent = key.channelType === EMAIL_CHANNEL_TYPE ? 'an email' : 'a message';
+  const kept =
+    `${timesOver(refusals)} ${sent} in it would have shared ${principal}'s private ${KIND_NOUNS[kind]}, ` +
+    'and each was stopped, so nothing private went out.';
+  return key.threadId === null
+    ? `Nothing more will be sent in ${conversation}: ${kept}`
+    : `Sending is paused in ${conversation}: ${kept} Your next handoff to it resumes it. (thread ${key.threadId})`;
 }
 
 // ---------------------------------------------------------------------------
@@ -135,17 +170,75 @@ async function compiledValues(): Promise<CompiledPrivateValue[]> {
   return (await listPrivateValues()).map((value) => compilePrivateValue(value.kind, value.value));
 }
 
+const IMAGE = /<img src="[^"]*" alt="([^"]*)"[^>]*>/gu;
+const LINK_TARGET = /<a href="([^"]*)"/gu;
+const TAG = /<[^>]*>/gu;
+const CHARACTER_REFERENCE = /&(?:amp|quot|lt|gt);/gu;
+const REFERENCED: Readonly<Record<string, string>> = { '&amp;': '&', '&quot;': '"', '&lt;': '<', '&gt;': '>' };
+
+/** micromark's HTML as text: it writes these four character references and no other. */
+function unescapeHtml(html: string): string {
+  return html.replace(CHARACTER_REFERENCE, (reference) => REFERENCED[reference] ?? reference);
+}
+
+/**
+ * A markdown text as a reader's mail client renders it (as the email
+ * renderer in src/modules/gws-ea-inbox/render.ts writes it): its words, with
+ * an image read as its words and the markup gone, and the targets of its
+ * links. micromark resolves the markdown's character references, so
+ * `1&#50;3` reads as the `123` a reader sees. Percent-encoding is decoded by
+ * the matcher, like every text's.
+ */
+function rendered(text: string): { readonly words: string; readonly targets: readonly string[] } {
+  const html = micromark(text, { extensions: [gfm()], htmlExtensions: [gfmHtml()] });
+  return {
+    words: unescapeHtml(html.replace(IMAGE, '$1').replace(TAG, '')),
+    targets: [...html.matchAll(LINK_TARGET)]
+      .map((match) => unescapeHtml(match[1] ?? ''))
+      .filter((target) => target !== ''),
+  };
+}
+
+/**
+ * These texts as their readers receive them, each reading its own stream:
+ * as written (an email's plain-text part, a calendar's fields), as a mail
+ * client renders them, and the targets of their links. Within a reading the
+ * texts run on, so a value split across them is found; apart, the end of one
+ * reading never runs into the start of the next.
+ */
+function readingsOf(parts: readonly string[]): readonly [written: TextStream, ...others: TextStream[]] {
+  const renders = parts.map(rendered);
+  return [
+    streamOf(parts),
+    streamOf(renders.map((render) => render.words)),
+    streamOf(renders.flatMap((render) => render.targets)),
+  ];
+}
+
+/** The kind of the first value any reading gives away, read after the thread's earlier text. */
+function kindGivenAway(
+  values: readonly CompiledPrivateValue[],
+  readings: readonly TextStream[],
+  history?: TextStream,
+): PrivateValueKind | undefined {
+  for (const reading of readings) {
+    const match = findPrivateValue(values, reading, history);
+    if (match) return match.kind;
+  }
+  return undefined;
+}
+
 /**
  * Check text bound for `audience`: the principal may receive anything, and
  * anyone else no private value. `content` is one text, or the fields of one
  * write (a calendar event's title, location, description, and comments),
- * read in order as one stream so a value split across fields is found too.
+ * read in order so a value split across fields is found too.
  */
 export async function checkOutbound(content: string | readonly string[], audience: Audience): Promise<OutboundCheck> {
   if (audience === 'principal') return { allowed: true };
   const parts = typeof content === 'string' ? [content] : content;
-  const match = findPrivateValue(await compiledValues(), streamOf(parts));
-  return match ? { allowed: false, kind: match.kind, reason: refusalReason(match.kind) } : { allowed: true };
+  const kind = kindGivenAway(await compiledValues(), readingsOf(parts));
+  return kind ? { allowed: false, kind, reason: refusalReason(kind) } : { allowed: true };
 }
 
 /** Every string and number in the serialized message, in order, whatever its shape. */
@@ -188,11 +281,13 @@ async function judgeSend(send: OutboundSend): Promise<OutboundGuardDecision> {
   if ((await resolveAudience(send)) === 'principal') return { effect: 'allow' };
   const values = await compiledValues();
   const key: ThreadKey = { channelType: send.channelType, platformId: send.platformId, threadId: send.threadId };
-  const current = streamOf(sendText(send));
+  const readings = readingsOf(sendText(send));
+  // The thread remembers each send as written, the reading every reader receives in some form.
+  const [written] = readings;
   const verdict = await judgeThreadSend(
     key,
-    current,
-    (history) => findPrivateValue(values, current, history)?.kind,
+    written,
+    (history) => kindGivenAway(values, readings, history),
     MAX_REFUSALS_PER_THREAD,
   );
   switch (verdict.outcome) {
@@ -203,7 +298,6 @@ async function judgeSend(send: OutboundSend): Promise<OutboundGuardDecision> {
     case 'refused':
       if (!verdict.stopped) return { effect: 'refuse', reason: refusalReason(verdict.kind) };
       await signalThreadStopped(key, verdict.kind, verdict.refusals);
-      await runThreadStoppedHooks(key);
       return { effect: 'refuse', reason: stoppingReason(verdict.kind) };
     default: {
       const unreachable: never = verdict;
@@ -233,7 +327,7 @@ async function signalThreadStopped(key: ThreadKey, kind: PrivateValueKind, refus
     const result = await writeNoteForMain({
       id: `privacy-stop-${randomUUID()}`,
       timestamp: stoppedAt,
-      text: stoppedSignalText(kind, refusals),
+      text: await stoppedSignalText(key, kind, refusals),
       fields: { signal },
       wake: true,
     });
@@ -250,30 +344,15 @@ async function signalThreadStopped(key: ThreadKey, kind: PrivateValueKind, refus
   /* eslint-enable no-catch-all/no-catch-all */
 }
 
-/** What another module does when one of its threads stops, such as closing the session behind it. */
-export type ThreadStoppedHook = (thread: ThreadKey) => Promise<void>;
-
-const threadStoppedHooks = new Map<string, ThreadStoppedHook>();
-const HOOK_ID = /^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/u;
-
-/** Register a module's reaction to a stopped thread. IDs take the `module:name` form. */
-export function registerThreadStoppedHook(id: string, hook: ThreadStoppedHook): void {
-  if (!HOOK_ID.test(id)) throw new Error(`Thread-stopped hook "${id}" must use "<module-id>:<hook-id>"`);
-  if (threadStoppedHooks.has(id)) throw new Error(`Thread-stopped hook "${id}" is already registered`);
-  threadStoppedHooks.set(id, hook);
-}
-
-/** The stop already holds, so each hook is isolated: a failure is logged and never stops the others. */
-async function runThreadStoppedHooks(key: ThreadKey): Promise<void> {
-  for (const [id, hook] of threadStoppedHooks) {
-    /* eslint-disable no-catch-all/no-catch-all -- the stop holds either way; a hook failure is logged */
-    try {
-      await hook(key);
-    } catch (err) {
-      log.error('Thread-stopped hook failed', { hookId: id, channelType: key.channelType, err });
-    }
-    /* eslint-enable no-catch-all/no-catch-all */
-  }
+/**
+ * Let a stopped thread send again: main's next handoff to it (R76). Its
+ * refusals start over. True when it was stopped.
+ */
+export async function resumeThread(key: ThreadKey): Promise<boolean> {
+  if (!(await getDb().hasTable('gws_ea_privacy_threads'))) return false;
+  const resumed = await resumeThreadRecord(key, new Date().toISOString());
+  if (resumed) log.info('Privacy stop lifted for a new handoff', { channelType: key.channelType });
+  return resumed;
 }
 
 registerOutboundGuard(PRIVACY_GUARD_ID, judgeSend);

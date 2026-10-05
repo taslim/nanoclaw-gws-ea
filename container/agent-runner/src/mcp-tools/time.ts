@@ -2,8 +2,8 @@
  * Time MCP tools: time_now, time_resolve, time_convert, time_diff.
  *
  * Models get dates, weekdays, and offsets wrong when they work them out
- * themselves; these tools make that work deterministic. The interface is
- * Soji's — the same tools, the same inputs, and the same
+ * themselves; these tools make that work deterministic. The interface is a
+ * proven one, adopted unchanged — the same tools, the same inputs, and the same
  * `{ iso, formatted, day, zone }` shape — and everything is computed in the
  * container's timezone, which is the principal's, unless time_convert names
  * others.

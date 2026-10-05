@@ -77,21 +77,21 @@ describe('GWS-EA profile module', () => {
     await reconcileGwsEaProfile({
       assistantDisplayName: 'Aya',
       assistantWorkspaceEmail: 'aya@example.test',
-      principalDisplayName: 'Taslim',
+      principalDisplayName: 'Morgan',
       principalTimezone: 'America/Los_Angeles',
       mainAgentGroupId: main.id,
     });
     await reconcileGwsEaProfile({
       assistantDisplayName: 'Aya Renamed',
       assistantWorkspaceEmail: 'aya@example.test',
-      principalDisplayName: 'Taslim',
+      principalDisplayName: 'Morgan',
       principalTimezone: 'America/Los_Angeles',
       mainAgentGroupId: main.id,
     });
 
     const users: User[] = [
-      { id: 'gchat:users/one', kind: 'gchat', display_name: 'Taslim', created_at: '2026-09-18T01:00:00.000Z' },
-      { id: 'slack:U123', kind: 'slack', display_name: 'Taslim', created_at: '2026-09-18T02:00:00.000Z' },
+      { id: 'gchat:users/one', kind: 'gchat', display_name: 'Morgan', created_at: '2026-09-18T01:00:00.000Z' },
+      { id: 'slack:U123', kind: 'slack', display_name: 'Morgan', created_at: '2026-09-18T02:00:00.000Z' },
     ];
     for (const user of users) await createUser(user);
     await bindVerifiedPrincipalUser(users[0]!.id, '2026-09-18T03:00:00.000Z');
@@ -101,7 +101,7 @@ describe('GWS-EA profile module', () => {
     expect(await getGwsEaProfile()).toMatchObject({
       assistant_display_name: 'Aya Renamed',
       assistant_workspace_email: 'aya@example.test',
-      principal_display_name: 'Taslim',
+      principal_display_name: 'Morgan',
       principal_timezone: 'America/Los_Angeles',
       main_agent_group_id: main.id,
     });
@@ -120,7 +120,7 @@ describe('GWS-EA profile module', () => {
     await reconcileGwsEaProfile({
       assistantDisplayName: 'Aya',
       assistantWorkspaceEmail: 'aya@example.test',
-      principalDisplayName: 'Taslim',
+      principalDisplayName: 'Morgan',
       principalTimezone: 'America/Los_Angeles',
       mainAgentGroupId: main.id,
     });
@@ -129,7 +129,7 @@ describe('GWS-EA profile module', () => {
       const sections = await getRequiredProjectDocSections(candidate);
       expect(sections).toHaveLength(1);
       expect(sections[0]?.body).toContain('Aya');
-      expect(sections[0]?.body).toContain('Taslim');
+      expect(sections[0]?.body).toContain('Morgan');
       expect(sections[0]?.body).toContain('separate people');
       expect(sections[0]?.body).not.toMatch(
         /google chat|slack|credential|oauth|provider|book|chapter|source material/i,
@@ -151,7 +151,7 @@ describe('GWS-EA profile module', () => {
     await reconcileGwsEaProfile({
       assistantDisplayName: 'Aya',
       assistantWorkspaceEmail: 'aya@example.test',
-      principalDisplayName: 'Taslim',
+      principalDisplayName: 'Morgan',
       principalTimezone: 'UTC',
       mainAgentGroupId: first.id,
     });
@@ -160,7 +160,7 @@ describe('GWS-EA profile module', () => {
       reconcileGwsEaProfile({
         assistantDisplayName: 'Aya',
         assistantWorkspaceEmail: 'aya@example.test',
-        principalDisplayName: 'Taslim',
+        principalDisplayName: 'Morgan',
         principalTimezone: 'UTC',
         mainAgentGroupId: second.id,
       }),
@@ -180,7 +180,7 @@ describe('GWS-EA profile module', () => {
         args: {
           'assistant-display-name': 'Aya',
           'assistant-workspace-email': 'aya@example.test',
-          'principal-display-name': 'Taslim',
+          'principal-display-name': 'Morgan',
           'principal-timezone': 'America/Los_Angeles',
           'main-agent-group-id': main.id,
         },
@@ -192,7 +192,7 @@ describe('GWS-EA profile module', () => {
       ok: true,
       data: {
         assistant_display_name: 'Aya',
-        principal_display_name: 'Taslim',
+        principal_display_name: 'Morgan',
         main_agent_group_id: main.id,
       },
     });
@@ -202,7 +202,7 @@ describe('GWS-EA profile module', () => {
     const user: User = {
       id: 'gchat:users/principal',
       kind: 'gchat',
-      display_name: 'Taslim',
+      display_name: 'Morgan',
       created_at: '2026-09-18T01:00:00.000Z',
     };
     await createUser(user);
@@ -264,7 +264,7 @@ describe('GWS-EA profile module', () => {
     const user: User = {
       id: 'gchat:users/canonical-time',
       kind: 'gchat',
-      display_name: 'Taslim',
+      display_name: 'Morgan',
       created_at: '2026-09-18T01:00:00.000Z',
     };
     await createUser(user);
@@ -281,7 +281,7 @@ describe("the principal's email addresses", () => {
   const identity = {
     'assistant-display-name': 'Aya',
     'assistant-workspace-email': 'aya@example.test',
-    'principal-display-name': 'Taslim',
+    'principal-display-name': 'Morgan',
     'principal-timezone': 'Africa/Lagos',
     'main-agent-group-id': main.id,
   };
@@ -307,10 +307,10 @@ describe("the principal's email addresses", () => {
     await reconcileGwsEaProfile({
       assistantDisplayName: 'Aya',
       assistantWorkspaceEmail: 'aya@example.test',
-      principalDisplayName: 'Taslim',
+      principalDisplayName: 'Morgan',
       principalTimezone: 'Africa/Lagos',
       mainAgentGroupId: main.id,
-      principalEmails: ['taslim@example.test', 'taslim@work.example.test'],
+      principalEmails: ['morgan@example.test', 'morgan@work.example.test'],
     });
   });
 
@@ -331,11 +331,11 @@ describe("the principal's email addresses", () => {
     expect(await run('principal-addresses-add', { email: 'third@example.test' })).toMatchObject({ ok: true });
 
     expect(await run('gws-ea-profile-reconcile', identity)).toMatchObject({ ok: true });
-    expect(await addresses()).toEqual(['taslim@example.test', 'taslim@work.example.test', 'third@example.test']);
+    expect(await addresses()).toEqual(['morgan@example.test', 'morgan@work.example.test', 'third@example.test']);
   });
 
   it.each([
-    ['a malformed address', ['taslim@example.test', 'not-an-email'], /email address is invalid/i],
+    ['a malformed address', ['morgan@example.test', 'not-an-email'], /email address is invalid/i],
     ['no address', [], /at least one/i],
     ["the assistant's own address", ['Aya@Example.test'], /assistant's own/i],
   ])('refuses a reconcile that declares %s, changing nothing', async (_case, principalEmails, message) => {
@@ -347,8 +347,8 @@ describe("the principal's email addresses", () => {
 
     expect(response).toMatchObject({ ok: false, error: { message: expect.stringMatching(message) } });
     expect(await getGwsEaProfile()).toMatchObject({
-      principal_display_name: 'Taslim',
-      principal_emails: ['taslim@example.test', 'taslim@work.example.test'],
+      principal_display_name: 'Morgan',
+      principal_emails: ['morgan@example.test', 'morgan@work.example.test'],
     });
   });
 
@@ -356,7 +356,7 @@ describe("the principal's email addresses", () => {
     await expect(
       getDb().run(
         'INSERT INTO gws_ea_principal_addresses (email, added_at) VALUES (?, ?)',
-        'taslim@example.test',
+        'morgan@example.test',
         new Date().toISOString(),
       ),
     ).rejects.toThrow(/unique|primary key/i);
@@ -375,8 +375,8 @@ describe("the principal's email addresses", () => {
     const listed = await run('principal-addresses-list');
     expect(listed).toMatchObject({ ok: true });
     expect(listed.ok && (listed.data as Array<{ email: string }>).map((row) => row.email)).toEqual([
-      'taslim@example.test',
-      'taslim@work.example.test',
+      'morgan@example.test',
+      'morgan@work.example.test',
       'third@example.test',
     ]);
   });
@@ -403,10 +403,10 @@ describe("the principal's email addresses", () => {
     await reconcileGwsEaProfile({
       assistantDisplayName: 'Aya',
       assistantWorkspaceEmail: 'aya@example.test',
-      principalDisplayName: 'Taslim',
+      principalDisplayName: 'Morgan',
       principalTimezone: 'Africa/Lagos',
       mainAgentGroupId: main.id,
-      principalEmails: ['taslim@example.test', 'sam@shared.example.test'],
+      principalEmails: ['morgan@example.test', 'sam@shared.example.test'],
     });
     expect(await getPerson(sam.id)).toMatchObject({ name: 'Sam O', identities: [] });
   });
@@ -415,7 +415,7 @@ describe("the principal's email addresses", () => {
     for (const email of ['not-an-email', 'AYA@example.test']) {
       expect(await run('principal-addresses-add', { email }), email).toMatchObject({ ok: false });
     }
-    expect(await addresses()).toEqual(['taslim@example.test', 'taslim@work.example.test']);
+    expect(await addresses()).toEqual(['morgan@example.test', 'morgan@work.example.test']);
   });
 
   it('reports an address it does not hold on remove, and refuses to remove the last one', async () => {
@@ -424,15 +424,15 @@ describe("the principal's email addresses", () => {
       error: { message: expect.stringContaining('nobody@example.test') },
     });
 
-    expect(await run('principal-addresses-remove', { email: 'Taslim@Work.example.test' })).toMatchObject({
+    expect(await run('principal-addresses-remove', { email: 'Morgan@Work.example.test' })).toMatchObject({
       ok: true,
-      data: { email: 'taslim@work.example.test', removed: true },
+      data: { email: 'morgan@work.example.test', removed: true },
     });
-    expect(await run('principal-addresses-remove', { email: 'taslim@example.test' })).toMatchObject({
+    expect(await run('principal-addresses-remove', { email: 'morgan@example.test' })).toMatchObject({
       ok: false,
       error: { message: expect.stringMatching(/last/i) },
     });
-    expect(await addresses()).toEqual(['taslim@example.test']);
+    expect(await addresses()).toEqual(['morgan@example.test']);
   });
 
   it("lets canonical main change the addresses on the principal's word, and refuses a group without the principal wiring", async () => {
@@ -447,7 +447,7 @@ describe("the principal's email addresses", () => {
 
     for (const [command, email] of [
       ['principal-addresses-add', 'fourth@example.test'],
-      ['principal-addresses-remove', 'taslim@work.example.test'],
+      ['principal-addresses-remove', 'morgan@work.example.test'],
     ] as const) {
       expect(await run(command, { email }, agent(research.id)), command).toMatchObject({
         ok: false,
@@ -461,7 +461,7 @@ describe("the principal's email addresses", () => {
       ok: false,
       error: { code: 'forbidden' },
     });
-    expect(await addresses()).toEqual(['taslim@example.test', 'taslim@work.example.test']);
+    expect(await addresses()).toEqual(['morgan@example.test', 'morgan@work.example.test']);
   });
 
   it('registers the principal-addresses resource for main and the operator, beside the hidden control-plane commands', () => {
@@ -477,23 +477,23 @@ describe("the principal's email addresses", () => {
     const [section] = await getRequiredProjectDocSections(main);
 
     expect(section?.body).toContain(MAIN_PRINCIPAL_ADDRESSES_POINTER);
-    expect(section?.body).not.toMatch(/taslim@(work\.)?example\.test/u);
+    expect(section?.body).not.toMatch(/morgan@(work\.)?example\.test/u);
   });
 
   it("lists every current address in another group's identity section", async () => {
     await run('principal-addresses-add', { email: 'first_last@example.test' });
-    await run('principal-addresses-remove', { email: 'taslim@work.example.test' });
+    await run('principal-addresses-remove', { email: 'morgan@work.example.test' });
 
     const [section] = await getRequiredProjectDocSections(research);
     expect(section?.body).toContain(
-      "Taslim's email addresses are `first_last@example.test` and `taslim@example.test`.",
+      "Morgan's email addresses are `first_last@example.test` and `morgan@example.test`.",
     );
-    expect(section?.body).not.toContain('taslim@work.example.test');
+    expect(section?.body).not.toContain('morgan@work.example.test');
     expect(section?.body).not.toContain('ncl principal-addresses');
 
     await run('principal-addresses-remove', { email: 'first_last@example.test' });
     const [single] = await getRequiredProjectDocSections(research);
-    expect(single?.body).toContain("Taslim's email address is `taslim@example.test`.");
+    expect(single?.body).toContain("Morgan's email address is `morgan@example.test`.");
   });
 
   it("names the assistant's own Google address, so the principal knows where to share calendars", async () => {
@@ -512,10 +512,10 @@ describe("external-email's pointer and audience", () => {
     await reconcileGwsEaProfile({
       assistantDisplayName: 'Aya',
       assistantWorkspaceEmail: 'aya@example.test',
-      principalDisplayName: 'Taslim',
+      principalDisplayName: 'Morgan',
       principalTimezone: 'Africa/Lagos',
       mainAgentGroupId: main.id,
-      principalEmails: ['taslim@example.test'],
+      principalEmails: ['morgan@example.test'],
     });
   });
 
@@ -543,10 +543,10 @@ describe("external-email's pointer and audience", () => {
     const [section] = await getRequiredProjectDocSections(ee);
     expect(section).toEqual({
       name: 'Assistant Identity',
-      body: 'Aya is the assistant. Taslim is the principal. They are separate people: act and communicate as Aya, support Taslim, and never present the assistant as the principal.',
+      body: 'Aya is the assistant. Morgan is the principal. They are separate people: act and communicate as Aya, support Morgan, and never present the assistant as the principal.',
     });
     const [other] = await getRequiredProjectDocSections(research);
-    expect(other?.body).toContain('`taslim@example.test`');
+    expect(other?.body).toContain('`morgan@example.test`');
     expect(other?.body).toContain('`aya@example.test`');
   });
 });

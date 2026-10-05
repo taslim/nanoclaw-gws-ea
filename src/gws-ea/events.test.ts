@@ -304,13 +304,13 @@ describe('Interaction port', () => {
     const assistant = await interaction
       .signInAssistantToGoogle({
         client: { client_id: '123-abc.apps.googleusercontent.com', client_secret: 'GOCSPX-desktop-secret' },
-        account: 'robin@example.test',
+        account: 'juno@example.test',
         resumeCommand: 'gws-ea resume --id 11111111-1111-4111-8111-111111111111',
       })
       .catch((error: unknown) => error);
     expect(assistant).toBeInstanceOf(PauseRequired);
     expect(assistant).toMatchObject({ code: 'google_sign_in_required' });
-    expect((assistant as PauseRequired).message).toContain('robin@example.test');
+    expect((assistant as PauseRequired).message).toContain('juno@example.test');
     expect((assistant as PauseRequired).instructions.join('\n')).toContain(
       'gws-ea resume --id 11111111-1111-4111-8111-111111111111',
     );

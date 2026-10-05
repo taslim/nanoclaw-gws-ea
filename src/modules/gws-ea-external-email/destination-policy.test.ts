@@ -1,8 +1,10 @@
 /**
- * KTD5's destination admission: no raw destination joins main and
- * external-email, external-email addresses nothing but its inbox, and no
- * other group addresses the inbox. Each write path refuses one, and status
- * reports a row that got in behind the check.
+ * KTD5's destination admission, pinned to the email groups the host created
+ * (KTD1): no raw destination joins main and external-email, external-email
+ * addresses nothing but its inbox, only main addresses the principal's email
+ * conversation, and no other group addresses either, or any other email
+ * conversation. Each write path refuses one, and status reports a row that
+ * got in behind the check.
  */
 import fs from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -41,12 +43,19 @@ import { getHostStartCallbacks } from '../../host-lifecycle.js';
 import { initSessionFolder } from '../../session-manager.js';
 import type { AgentGroup, Session } from '../../types.js';
 import { createAgent } from '../agent-to-agent/create-agent.js';
+import { emailMessagingGroupIds } from '../gws-ea-inbox/db.js';
 import { reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import { externalEmailHealth, getExternalEmailAgentGroupId } from './index.js';
 import '../gws-ea-profile/index.js';
+// The inbox's host start creates both email conversations, once external-email exists.
+import '../gws-ea-inbox/index.js';
 
-const INBOX = 'mg-inbox';
 const CHAT = 'mg-chat';
+/** An email conversation the host did not create. */
+const OTHER_EMAIL = 'mg-other-email';
+
+let inbox: string;
+let principalEmail: string;
 
 let main: AgentGroup;
 let research: AgentGroup;
@@ -73,12 +82,12 @@ async function addDestination(owner: string, targetType: 'agent' | 'channel', ta
   );
 }
 
-async function wire(agentGroupId: string) {
+async function wire(messagingGroupId: string, agentGroupId: string) {
   return dispatch(
     {
       id: 'wire',
       command: 'wirings-create',
-      args: { messaging_group_id: INBOX, agent_group_id: agentGroupId },
+      args: { messaging_group_id: messagingGroupId, agent_group_id: agentGroupId },
     },
     { caller: 'host' },
   );
@@ -118,7 +127,7 @@ beforeEach(async () => {
   await reconcileGwsEaProfile({
     assistantDisplayName: 'Aya',
     assistantWorkspaceEmail: 'aya@example.test',
-    principalDisplayName: 'Taslim',
+    principalDisplayName: 'Morgan',
     principalTimezone: 'America/Los_Angeles',
     mainAgentGroupId: main.id,
   });
@@ -126,8 +135,12 @@ beforeEach(async () => {
   const id = await getExternalEmailAgentGroupId();
   if (id === null) throw new Error('external-email was not created');
   ee = id;
+  const email = await emailMessagingGroupIds();
+  if (email.inbox === null || email.principal === null) throw new Error('the email conversations were not created');
+  inbox = email.inbox;
+  principalEmail = email.principal;
   for (const [id, channel] of [
-    [INBOX, 'email'],
+    [OTHER_EMAIL, 'email'],
     [CHAT, 'gchat'],
   ] as const) {
     await createMessagingGroup({
@@ -153,14 +166,19 @@ describe('ncl destinations add', () => {
     ['external-email to main', () => [ee, 'agent', main.id] as const],
     ['another group to external-email', () => [research.id, 'agent', ee] as const],
     ['external-email to any other chat', () => [ee, 'channel', CHAT] as const],
-    ['another group to the inbox', () => [research.id, 'channel', INBOX] as const],
+    ["external-email to the principal's email conversation", () => [ee, 'channel', principalEmail] as const],
+    ['another group to the inbox', () => [research.id, 'channel', inbox] as const],
+    ['main to the inbox', () => [main.id, 'channel', inbox] as const],
+    ["another group to the principal's email conversation", () => [research.id, 'channel', principalEmail] as const],
+    ['main to an email conversation the host did not create', () => [main.id, 'channel', OTHER_EMAIL] as const],
   ])('refuses %s', async (_label, row) => {
     const [owner, type, target] = row();
+    const before = await destinations();
 
     const response = await addDestination(owner, type, target);
 
     expect(response).toMatchObject({ ok: false, error: { message: expect.stringMatching(/refused/) } });
-    expect(await destinations()).toEqual([]);
+    expect(await destinations()).toEqual(before);
   });
 
   it('admits a destination that touches neither', async () => {
@@ -170,26 +188,41 @@ describe('ncl destinations add', () => {
 });
 
 describe('wiring companion rows', () => {
-  it("gives external-email its inbox wiring's destination, and refuses another group's wiring to the inbox", async () => {
-    expect(await wire(ee)).toMatchObject({ ok: true });
-    expect(await destinations()).toEqual([{ agent_group_id: ee, target_type: 'channel', target_id: INBOX }]);
+  it("gives external-email its inbox wiring's destination and main its email conversation's, and refuses any other group's", async () => {
+    const companions = [
+      { agent_group_id: main.id, target_type: 'channel', target_id: principalEmail },
+      { agent_group_id: ee, target_type: 'channel', target_id: inbox },
+    ].sort((a, b) => a.agent_group_id.localeCompare(b.agent_group_id));
+    expect(await destinations()).toEqual(companions);
 
-    expect(await wire(research.id)).toMatchObject({ ok: false });
+    for (const target of [inbox, principalEmail]) {
+      expect(await wire(target, research.id)).toMatchObject({ ok: false });
+    }
+    expect(await wire(principalEmail, ee)).toMatchObject({ ok: false });
+    expect(await wire(inbox, main.id)).toMatchObject({ ok: false });
     expect(
-      await getDb().all('SELECT agent_group_id FROM messaging_group_agents WHERE messaging_group_id = ?', INBOX),
-    ).toEqual([{ agent_group_id: ee }]);
-    expect(await destinations()).toEqual([{ agent_group_id: ee, target_type: 'channel', target_id: INBOX }]);
+      await getDb().all(
+        'SELECT messaging_group_id, agent_group_id FROM messaging_group_agents ORDER BY agent_group_id',
+      ),
+    ).toEqual(
+      [
+        { messaging_group_id: principalEmail, agent_group_id: main.id },
+        { messaging_group_id: inbox, agent_group_id: ee },
+      ].sort((a, b) => a.agent_group_id.localeCompare(b.agent_group_id)),
+    );
+    expect(await destinations()).toEqual(companions);
   });
 });
 
 describe('create_agent', () => {
   it('refuses a child of external-email before any group or destination exists', async () => {
     const before = (await getAllAgentGroups()).map((value) => value.id).sort();
+    const destinationsBefore = await destinations();
 
     await createAgent({ name: 'helper' }, await sessionOf(ee));
 
     expect((await getAllAgentGroups()).map((value) => value.id).sort()).toEqual(before);
-    expect(await destinations()).toEqual([]);
+    expect(await destinations()).toEqual(destinationsBefore);
   });
 
   it('still creates a child of main, with both destinations', async () => {
@@ -211,7 +244,7 @@ describe('status', () => {
     const now = new Date().toISOString();
     for (const [owner, name, type, target] of [
       [main.id, 'helper', 'agent', ee],
-      [research.id, 'inbox', 'channel', INBOX],
+      [research.id, 'inbox', 'channel', inbox],
     ] as const) {
       await getDb().run(
         'INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at) VALUES (?, ?, ?, ?, ?)',
