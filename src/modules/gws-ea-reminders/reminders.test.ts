@@ -206,7 +206,7 @@ describe('remind_me', () => {
 
   it('writes no sender identity, principal mark or route', async () => {
     const main = await mainSession();
-    const reminder = row(main, reminderIdOf(await remind(main, inFuture(HOUR), 'Ask about the Lagos trip.')));
+    const reminder = row(main, reminderIdOf(await remind(main, inFuture(HOUR), 'Ask about the Lisbon trip.')));
 
     expect(reminder).toMatchObject({
       kind: 'chat',
@@ -303,19 +303,19 @@ describe('remind_me', () => {
 describe('clear_reminder', () => {
   it("keeps several in main's session, and clearing one leaves the others to fire", async () => {
     const main = await mainSession();
-    const lagos = reminderIdOf(await remind(main, inFuture(HOUR), 'Ask about the Lagos trip.'));
+    const trip = reminderIdOf(await remind(main, inFuture(HOUR), 'Ask about the Lisbon trip.'));
     const deck = reminderIdOf(await remind(main, inFuture(2 * HOUR), 'Check the deck went out.'));
     const visa = reminderIdOf(await remind(main, inFuture(3 * HOUR), 'Chase the visa letter.'));
 
     expect(await send(main, 'clear_reminder', { reminder_id: deck })).toMatchObject({ ok: true });
-    for (const id of [lagos, deck, visa]) reach(main, id);
+    for (const id of [trip, deck, visa]) reach(main, id);
 
     expect(await dueCount(main)).toBe(2);
     expect(row(main, deck).status).not.toBe('pending');
     await reconcileSession(main.id);
     expect(wokenSessions()).toEqual([`${main.id}:due-message`]);
     // One that has come due is the agent's to read, not to clear.
-    expect(await send(main, 'clear_reminder', { reminder_id: lagos })).toMatchObject({
+    expect(await send(main, 'clear_reminder', { reminder_id: trip })).toMatchObject({
       ok: false,
       error: { code: 'invalid-args', message: expect.stringContaining('come due') },
     });
