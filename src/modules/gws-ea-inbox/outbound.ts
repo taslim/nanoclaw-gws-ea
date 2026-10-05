@@ -24,7 +24,8 @@
  * every address it reaches (`outsideRecipients`), and checks what the
  * assistant wrote: its words, subject, and link targets. The send then goes
  * to the people that check saw. The quote is added after the check, because
- * it shows only a message its readers already received.
+ * it shows its readers a message they received; anyone named who did not
+ * receive it sees the quote only when it carries no private value for them.
  *
  * For `main`, `email_send` writes to the principal in the thread it names,
  * by the rules of its replies there (principal-reply.ts): only to the address
@@ -43,18 +44,25 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
 import type { OutboundFile, OutboundMessage } from '../../channels/adapter.js';
-import { ActionRefusal, answeredGuard, answeringAction, type ActionAnswer } from '../../cli/delivery-action.js';
+import {
+  answeredGuard,
+  answeringAction,
+  forbidden,
+  invalidArgs,
+  type ActionAnswer,
+} from '../../cli/delivery-action.js';
 import { getSession } from '../../db/sessions.js';
 import { getDeliveryAdapter, OutboundRefusedError, type OutboundSend } from '../../delivery.js';
 import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
-import { clearOutbox, readOutboxFiles } from '../../session-manager.js';
+import { readOutboxFiles } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { getExternalEmailAgentGroupId } from '../gws-ea-external-email/index.js';
+import { audienceForAddresses, checkOutbound } from '../gws-ea-privacy/index.js';
 import { getGwsEaProfile, getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { buildMime, encodeRaw, normalizeAddress, parseGmailMessage, type ParsedMail } from './mime.js';
 import { replyAll, threadRecipients, type Recipients } from './recipients.js';
-import { emailSignature, renderEmail } from './render.js';
+import { emailSignature, renderEmail, type QuotedMessage } from './render.js';
 import {
   activeInbox,
   assistantAddresses,
@@ -235,6 +243,28 @@ async function handedFiles(threadKey: string, files: readonly OutboundFile[]): P
   return attachments;
 }
 
+/**
+ * The quote of the message a reply answers. It shows that message to the
+ * people it reached; anyone else the reply reaches sees it only when it holds
+ * no private value for them, and otherwise the reply goes without it, still in
+ * its thread.
+ */
+async function quoteFor(
+  anchor: ParsedMail,
+  placed: Recipients,
+  runtime: InboxRuntime,
+): Promise<QuotedMessage | undefined> {
+  if (anchor.from === undefined) return undefined;
+  const readers = new Set(
+    [anchor.from, ...anchor.to, ...anchor.cc].flatMap(({ address }) => normalizeAddress(address) ?? []),
+  );
+  const newcomers = [...placed.to, ...placed.cc].filter((address) => !readers.has(address));
+  if (newcomers.length > 0 && !(await checkOutbound(anchor.text, await audienceForAddresses(newcomers))).allowed) {
+    return undefined;
+  }
+  return { from: anchor.from, sentAt: anchor.receivedAt ?? runtime.now(), text: anchor.text };
+}
+
 /** The channel adapter's `deliver` for `email:inbox`: send one email in its thread, exactly once. */
 export async function sendToOutside(
   runtime: InboxRuntime,
@@ -261,12 +291,11 @@ export async function sendToOutside(
     }
     const placed = await threadRecipients(threadKey, recipients, await assistantAddresses());
     const attachments = await handedFiles(threadKey, message.files ?? []);
+    const quote = anchor === undefined ? undefined : await quoteFor(anchor, placed, runtime);
     const body = renderEmail({
       markdown: email.text,
       signature: emailSignature(await getGwsEaProfile()),
-      ...(anchor?.from === undefined
-        ? {}
-        : { quote: { from: anchor.from, sentAt: anchor.receivedAt ?? runtime.now(), text: anchor.text } }),
+      ...(quote === undefined ? {} : { quote }),
     });
     const from = await assistantMailbox(runtime);
     const visible = anchor === undefined ? [] : await visibleMessageIds(threadKey, 'outside');
@@ -300,8 +329,6 @@ export const EMAIL_SEND_ACTION = 'email_send';
 
 const THREAD_KEY = /^mail-[A-Za-z0-9-]{1,80}$/u;
 const MAX_FILES = 10;
-
-const invalid = (message: string): ActionRefusal => new ActionRefusal('invalid-args', message);
 
 /** `main`, to the principal; and `external-email`, from the session of one email thread, in that thread alone. */
 const emailSendAction = defineGuardedAction({
@@ -339,22 +366,22 @@ function fileNamesOf(value: unknown): string[] {
     const names = value.filter((name: unknown): name is string => typeof name === 'string');
     if (names.length === value.length) return names;
   }
-  throw invalid(`files must name up to ${MAX_FILES} files you staged with this request`);
+  throw invalidArgs(`files must name up to ${MAX_FILES} files you staged with this request`);
 }
 
 /** `main` writes to the principal in one of their threads, as its replies there go. */
 async function toPrincipal(content: Record<string, unknown>, requestId: string): Promise<Record<string, unknown>> {
   const threadKey = content.thread_key;
   if (typeof threadKey !== 'string' || !THREAD_KEY.test(threadKey)) {
-    throw invalid('thread_key must be the mail-… key of the principal’s thread, as its note gave it');
+    throw invalidArgs('thread_key must be the mail-… key of the principal’s thread, as its note gave it');
   }
   for (const field of ['subject', 'to', 'cc', 'files'] as const) {
     if (content[field] !== undefined) {
-      throw invalid(`An email to the principal goes to them alone, in their thread: leave out ${field}.`);
+      throw invalidArgs(`An email to the principal goes to them alone, in their thread: leave out ${field}.`);
     }
   }
   const words = emailWords({ text: content.text, request: requestId });
-  if (words === undefined || words.text.trim() === '') throw invalid('text must be the words of your email');
+  if (words === undefined || words.text.trim() === '') throw invalidArgs('text must be the words of your email');
   await deliverEmail(PRINCIPAL_PLATFORM_ID, threadKey, words, undefined);
   return {
     thread_key: threadKey,
@@ -369,7 +396,7 @@ async function inThread(
   requestId: string,
 ): Promise<Record<string, unknown>> {
   if (content.thread_key !== undefined) {
-    throw new ActionRefusal('forbidden', 'You write only in your own thread: leave out thread_key.');
+    throw forbidden('You write only in your own thread: leave out thread_key.');
   }
   const threadKey = session.thread_id;
   if (threadKey === null) throw new Error(`Session ${session.id} has no thread`);
@@ -384,17 +411,13 @@ async function inThread(
       request: requestId,
     });
   } catch (error) {
-    throw error instanceof OutboundRefusedError ? invalid(error.reason) : error;
+    throw error instanceof OutboundRefusedError ? invalidArgs(error.reason) : error;
   }
   const files = names.length === 0 ? undefined : readOutboxFiles(session.agent_group_id, session.id, requestId, names);
-  try {
-    if (files !== undefined && files.length !== names.length) {
-      throw invalid('files must name files you staged with this request; some were not found');
-    }
-    await deliverEmail(INBOX_PLATFORM_ID, threadKey, email, files);
-  } finally {
-    if (names.length > 0) clearOutbox(session.agent_group_id, session.id, requestId);
+  if (names.length > 0 && files?.length !== names.length) {
+    throw invalidArgs('files must name files you staged with this request; some were not found');
   }
+  await deliverEmail(INBOX_PLATFORM_ID, threadKey, email, files);
   return { thread_key: threadKey, message: 'Your email is sent.' };
 }
 
@@ -406,9 +429,7 @@ const emailSend: ActionAnswer = async (content, session, requestId) => {
       : await inThread(content, session, requestId);
   } catch (error) {
     // An outbound guard refused the email as written.
-    throw error instanceof OutboundRefusedError
-      ? new ActionRefusal('forbidden', `Your email was not sent: ${error.reason}`)
-      : error;
+    throw error instanceof OutboundRefusedError ? forbidden(`Your email was not sent: ${error.reason}`) : error;
   }
 };
 

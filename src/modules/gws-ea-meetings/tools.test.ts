@@ -48,6 +48,7 @@ vi.mock('./calendar-api.js', async (importOriginal) => {
 
 import type { ResponseFrame } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
+import { sqliteRaw } from '../../db/drivers/sqlite.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { getDeliveryAction } from '../../delivery.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
@@ -592,6 +593,24 @@ describe('book', () => {
     ).toEqual([JANE, REMY]);
   });
 
+  it('invites, when it names nobody, only the people in the conversation, not someone a sender only wrote about', async () => {
+    const mentioned = 'sam@acme.example';
+    const { key, session } = await thread([REMY]);
+    await recordThreadAddresses(key, [mentioned], 'written', now());
+
+    const unnamed = data(await send(session, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up' }));
+    expect(calendar.event(PRINCIPAL, String(unnamed.booking))?.attendees?.map((attendee) => attendee.email)).toEqual([
+      REMY,
+    ]);
+    // Someone written about is still on the thread: the agent may invite them by name.
+    const named = data(
+      await send(session, 'book', { start: WEDNESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [mentioned] }),
+    );
+    expect(calendar.event(PRINCIPAL, String(named.booking))?.attendees?.map((attendee) => attendee.email)).toEqual([
+      mentioned,
+    ]);
+  });
+
   it('refuses an invitee who is not on the thread', async () => {
     expect(
       refusal(
@@ -674,6 +693,39 @@ describe('book', () => {
     expect(live('booking')).toEqual([]);
     expect(await getDb().get('SELECT 1 FROM gws_ea_thread_bookings')).toBeUndefined();
     expect(bookingFacts()).toEqual([]);
+  });
+
+  it('withdraws a booking whose record cannot be written, so no event is left that its thread cannot change', async () => {
+    const raw = sqliteRaw(getDb());
+    raw.exec(
+      `CREATE TEMP TRIGGER no_booking_record BEFORE INSERT ON gws_ea_thread_bookings
+       BEGIN SELECT RAISE(ABORT, 'database is locked'); END`,
+    );
+    const frame = await send(sessionA, 'book', {
+      start: TUESDAY_10AM,
+      minutes: 30,
+      title: 'Catch-up',
+      invitees: [REMY],
+    });
+    raw.exec('DROP TRIGGER no_booking_record');
+
+    expect(frame).toMatchObject({ ok: false, error: { code: 'handler-error' } });
+    expect(refusal(frame)).toMatch(/database is locked/u);
+    expect(live('booking')).toEqual([]);
+    expect(bookingFacts()).toEqual([]);
+  });
+
+  it('books a time once when two threads ask for it at the same moment', async () => {
+    const answers = await Promise.all([
+      send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] }),
+      send(sessionB, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [JANE] }),
+    ]);
+
+    expect(answers.filter((frame) => frame.ok)).toHaveLength(1);
+    const refused = answers.flatMap((frame) => (frame.ok ? [] : [frame.error.message]));
+    expect(refused).toHaveLength(1);
+    expect(refused[0]).toMatch(/no longer free/u);
+    expect(calendar.live(PRINCIPAL).filter((event) => event.start?.dateTime === TUESDAY_10AM)).toHaveLength(1);
   });
 
   it('books once when the same request is delivered again, answering the replay as it did the first', async () => {

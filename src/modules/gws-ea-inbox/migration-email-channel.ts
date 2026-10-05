@@ -44,7 +44,8 @@ const LIVE_MEETING_STATES = "('opening', 'active', 'booked', 'closing')";
  *   and the assistant can read it, `outside` otherwise), its Gmail id, and
  *   its Message-ID. A message known only by its Message-ID has no Gmail id.
  * - `gws_ea_thread_addresses`: each address the thread's messages carried,
- *   and each one `main` named, recorded once for each way it came.
+ *   each one an outside sender wrote in their own words, and each one `main`
+ *   named, recorded once for each way it came.
  * - `gws_ea_thread_files`: each file `main` handed over for the thread, by
  *   its SHA-256, with its name and the host's staged copy.
  * - `gws_ea_thread_sends`: a send between allocating its Message-ID and
@@ -126,7 +127,7 @@ async function createThreadTables(db: DbDriver): Promise<void> {
     CREATE TABLE gws_ea_thread_addresses (
       thread_key   TEXT NOT NULL REFERENCES gws_ea_threads(thread_key) ON DELETE CASCADE,
       address      TEXT NOT NULL CHECK (address <> '' AND address = lower(address)),
-      source       TEXT NOT NULL CHECK (source IN ('message', 'main')),
+      source       TEXT NOT NULL CHECK (source IN ('message', 'written', 'main')),
       recorded_at  TEXT NOT NULL,
       PRIMARY KEY (thread_key, address, source)
     );

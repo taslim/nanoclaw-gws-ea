@@ -333,6 +333,20 @@ describe('files that go with a request', () => {
     expect(copies).toEqual([]);
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
+
+  it('stage nothing and send nothing for a call cancelled before it starts', async () => {
+    const result = await emailSend.handler(
+      { text: 'Here is the deck.', files: [path.join(dir, 'deck.pdf')] },
+      { signal: AbortSignal.abort() },
+    );
+    expect(result).toEqual({
+      content: [{ type: 'text', text: 'Error: The request was cancelled before the host answered.' }],
+      isError: true,
+    });
+    expect(made).toEqual([]);
+    expect(copies).toEqual([]);
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
 });
 
 describe('a request the host is slow to answer', () => {

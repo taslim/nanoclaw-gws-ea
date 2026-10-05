@@ -243,6 +243,21 @@ describe('remind_me', () => {
     expect(reminderIds(main)).toHaveLength(1);
   });
 
+  it('refuses an empty note, one over 1,000 characters, or one with a control character', async () => {
+    const main = await mainSession();
+
+    for (const note of ['', 'x'.repeat(1_001), 'Nudge Remy\u001b[2J once.']) {
+      expect(await remind(main, inFuture(HOUR), note), JSON.stringify(note).slice(0, 30)).toMatchObject({
+        ok: false,
+        error: { code: 'invalid-args', message: expect.stringMatching(/note must be text/u) },
+      });
+    }
+    expect(reminderIds(main)).toEqual([]);
+
+    expect(await remind(main, inFuture(HOUR), 'x'.repeat(1_000))).toMatchObject({ ok: true });
+    expect(reminderIds(main)).toHaveLength(1);
+  });
+
   it('survives the session going idle in between', async () => {
     const thread = await threadSession('mail-remy');
     vi.mocked(isContainerRunning).mockReturnValue(true);

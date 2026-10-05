@@ -636,13 +636,10 @@ describe("external-email's reply", () => {
     expect(gmail.sent[0].text).toContain(`> Is Pat still at ${HOME}?`);
   });
 
-  it('goes exactly once when Gmail took it before the host stopped', async () => {
+  it('goes exactly once when Gmail took it but the call failed: the host finds it in Gmail', async () => {
     const { key, session } = await arrives({ threadId: 'g-1', from: SAM, body: 'Next week?' });
     gmail.sendFailures.push({ accepted: true });
     const id = await reply(session, key, 'Tuesday works.');
-    expect(deliveryStatus(session, id)).toBeUndefined();
-    await startInbox(); // the host restarts
-    await deliverSessionMessages(session);
     expect(gmail.sent).toHaveLength(1);
     expect(deliveryStatus(session, id)).toBe('delivered');
 
@@ -660,11 +657,19 @@ describe("external-email's reply", () => {
   });
 
   it.each([
-    ['after Gmail kept it', true],
-    ['before Gmail kept it', false],
-  ])('backs off when Gmail fails %s, and goes exactly once', async (_when, accepted) => {
+    ['after Gmail kept it', [{ status: 503, accepted: true }]],
+    ['before Gmail kept it', [{ status: 503, accepted: false }]],
+    [
+      'every try, Gmail keeping the last',
+      [
+        { status: 503, accepted: false },
+        { status: 503, accepted: false },
+        { status: 503, accepted: true },
+      ],
+    ],
+  ])('backs off when Gmail fails %s, and goes exactly once', async (_when, failures) => {
     const { key, session } = await arrives({ threadId: 'g-1', from: SAM, body: 'Next week?' });
-    gmail.sendFailures.push({ status: 503, accepted });
+    gmail.sendFailures.push(...failures);
     const id = await reply(session, key, 'Tuesday works.');
     expect(gmail.sent).toHaveLength(1);
     expect(deliveryStatus(session, id)).toBe('delivered');
@@ -750,6 +755,19 @@ describe('email_send from external-email', () => {
     expect(gmail.sent).toEqual([]);
   });
 
+  it('leaves out the quote for someone the quoted message never reached when it holds a private value for them', async () => {
+    await arrives({ threadId: 'g-1', from: SAM, cc: [JANE], body: 'Looping in Jane.' });
+    // Sam writes on to the assistant alone.
+    const { session } = await arrives({ threadId: 'g-1', from: SAM, body: `Is Pat still at ${HOME}?` });
+
+    expect(await emailSend(session, { to: [SAM], cc: [JANE], text: 'Jane, Pat is free Tuesday.' })).toMatchObject({
+      ok: true,
+    });
+    expect(gmail.sent[0]).toMatchObject({ to: [SAM], cc: [JANE], threadId: 'g-1' });
+    expect(gmail.sent[0].text).toContain('Jane, Pat is free Tuesday.');
+    expect(gmail.sent[0].text).not.toMatch(/Elm Road/u);
+  });
+
   it('attaches only a file main handed over for this thread, as the host holds it (KTD9)', async () => {
     const { key, session } = await handedOver([REMY]);
     const quote = Buffer.from('%PDF-1.4 the quote');
@@ -774,6 +792,14 @@ describe('email_send from external-email', () => {
       /changed after main handed it over/u,
     );
     expect(gmail.sent).toHaveLength(1);
+  });
+
+  it('refuses a file it names but never staged, rather than sending without it', async () => {
+    const { session } = await handedOver([REMY]);
+    expect(
+      refusalOf(await emailSend(session, { subject: 'Your quote', text: 'Attached.', files: ['quote.pdf'] })),
+    ).toMatch(/staged with this request/u);
+    expect(gmail.sent).toEqual([]);
   });
 
   it('sends nothing twice when a request is replayed after Gmail took it', async () => {

@@ -808,7 +808,7 @@ describe('routing by audience', () => {
     expect(gmail.sent[0].envelope).toEqual([PRINCIPAL]);
   });
 
-  it("sends once when Gmail took the reply and the host crashed, and threads the principal's answer by the ID Gmail gave it", async () => {
+  it("sends once when Gmail took the reply but the call failed, and threads the principal's answer by the ID Gmail gave it", async () => {
     gmail.rewritesMessageId = true;
     gmail.receive({
       threadId: 'g-pat',
@@ -821,9 +821,6 @@ describe('routing by audience', () => {
     const threadKey = principalMail()[0].email?.thread_key ?? '';
     gmail.sendFailures.push({ status: 0, accepted: true, crash: true });
     const id = await mainReplies(threadKey, 'Booked.');
-    expect(deliveryStatus(main, id)).toBeUndefined();
-    await startInbox(); // the host restarts
-    await deliverSessionMessages(main);
     expect(gmail.sent).toHaveLength(1);
     expect(deliveryStatus(main, id)).toBe('delivered');
 
@@ -960,8 +957,12 @@ describe('routing by audience', () => {
     await inbox.tick();
 
     const [email] = await outsideMail();
-    const addresses = (await threadAddresses(email.email?.thread_key ?? '')).map(({ address }) => address);
-    expect(addresses).toContain('jane.doe@acme.example');
+    const recorded = await threadAddresses(email.email?.thread_key ?? '');
+    const addresses = recorded.map(({ address }) => address);
+    // Written in, not carried: on the thread, but not yet someone a booking invites unnamed.
+    expect(recorded.filter(({ address }) => address === 'jane.doe@acme.example')).toEqual([
+      { address: 'jane.doe@acme.example', source: 'written' },
+    ]);
     expect(addresses).not.toContain('mallory@elsewhere.example');
     expect(addresses).not.toContain('lee@elsewhere.example');
   });

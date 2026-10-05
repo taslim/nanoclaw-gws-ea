@@ -221,6 +221,7 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
           )
           .all() as WaitingMessage[]
       ).map((row) => ({ ...row, processAfter: sqliteTimestamp(row.processAfter) })),
+    hasMessage: (messageId) => db.prepare('SELECT 1 FROM messages_in WHERE id = ?').get(messageId) !== undefined,
     applyProcessingAcks: (acks) => applyProcessingAcks(db, acks),
     getDeliveredIds: () => getDeliveredIds(db),
     markDelivered: (messageOutId, platformMessageId) => markDelivered(db, messageOutId, platformMessageId),

@@ -161,9 +161,13 @@ function writtenAddresses(mail: ParsedMail): string[] {
  */
 async function recordInThread(mail: ParsedMail, side: ThreadSide, context: RoutingContext): Promise<string> {
   const at = context.at.toISOString();
-  const carried = [...(mail.from ? [mail.from] : []), ...mail.to, ...mail.cc].map(({ address }) => address);
-  const written = side === 'outside' ? writtenAddresses(mail) : [];
-  const addresses = [...new Set([...carried, ...written])].filter((address) => !context.assistant.has(address));
+  const ours = (address: string): boolean => context.assistant.has(address);
+  const carried = [...(mail.from ? [mail.from] : []), ...mail.to, ...mail.cc]
+    .map(({ address }) => address)
+    .filter((address) => !ours(address));
+  const written = (side === 'outside' ? writtenAddresses(mail) : []).filter(
+    (address) => !ours(address) && !carried.includes(address),
+  );
   const db = getDb();
   return db.transaction(async () => {
     const thread =
@@ -178,7 +182,8 @@ async function recordInThread(mail: ParsedMail, side: ThreadSide, context: Routi
       },
       at,
     );
-    await recordThreadAddresses(thread.threadKey, addresses, 'message', at);
+    await recordThreadAddresses(thread.threadKey, carried, 'message', at);
+    if (written.length > 0) await recordThreadAddresses(thread.threadKey, written, 'written', at);
     return thread.threadKey;
   });
 }

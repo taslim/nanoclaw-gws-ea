@@ -186,7 +186,7 @@ export const book = requestTool({
   ...common,
   name: 'book',
   description:
-    "Book an agreed time as a new event on the principal's calendar, inviting everyone on the thread but the principal, or the invitees you name from it. Google sends the invitation; this thread's holds are released, and main hears. A time that is protected or no longer free is refused. Answers with the booking id.",
+    "Book an agreed time as a new event on the principal's calendar, inviting everyone in the conversation but the principal, or the invitees you name from the thread. Google sends the invitation; this thread's holds are released, and main hears. A time that is protected or no longer free is refused. Answers with the booking id.",
   properties: {
     start: { type: 'string', description: `When it starts. ${DATE_TIME}` },
     minutes: MINUTES,
@@ -194,7 +194,10 @@ export const book = requestTool({
     notes: { type: 'string', description: 'What the invitees read in the invitation.' },
     location: { type: 'string', description: 'Where they meet: an address, a phone number, or their own link.' },
     video_call: { type: 'boolean', description: 'true to add a Google Meet link.' },
-    invitees: { ...ADDRESSES, description: 'Who to invite, each on the thread, in place of everyone on it.' },
+    invitees: {
+      ...ADDRESSES,
+      description: 'Who to invite, each on the thread, in place of everyone in the conversation.',
+    },
   },
   required: ['start', 'minutes', 'title'],
   repeatable: false,

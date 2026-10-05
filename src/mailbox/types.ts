@@ -113,6 +113,8 @@ export interface InboundMailbox {
   getMessageForRetry(messageId: string, status: 'pending' | 'processing'): MessageRetry | undefined;
   /** Pending messages whose `process_after` is still ahead, soonest first. */
   getWaitingMessages(): WaitingMessage[];
+  /** Whether the mailbox holds a message with this id, whatever its status. */
+  hasMessage(messageId: string): boolean;
   applyProcessingAcks(acks: ProcessingAck[]): void;
   getDeliveredIds(): Set<string>;
   markDelivered(messageOutId: string, platformMessageId: string | null): void;

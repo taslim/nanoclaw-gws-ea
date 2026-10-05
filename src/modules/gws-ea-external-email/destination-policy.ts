@@ -27,8 +27,6 @@ import { emailMessagingGroupIds } from '../gws-ea-inbox/db.js';
 import { EMAIL_CHANNEL_TYPE } from '../gws-ea-inbox/runtime.js';
 import { getExternalEmailAgentGroupId, getMainAgentGroupId } from '../gws-ea-profile/db.js';
 
-/** The channel type of the assistant's email conversations (KTD1). */
-
 const JOINS_THE_AGENTS = 'it joins main and external-email, which exchange work only through the host';
 
 async function isEmail(messagingGroupId: string): Promise<boolean> {

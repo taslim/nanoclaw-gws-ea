@@ -224,8 +224,11 @@ export async function visibleMessageIds(threadKey: string, side: ThreadSide): Pr
 // Addresses
 // ---------------------------------------------------------------------------
 
-/** How a thread came to have an address: a message carried it, or `main` named it. */
-export type AddressSource = 'message' | 'main';
+/**
+ * How a thread came to have an address: a message carried it, an outside
+ * sender wrote it in their own words, or `main` named it.
+ */
+export type AddressSource = 'message' | 'written' | 'main';
 
 export interface ThreadAddress {
   readonly address: string;

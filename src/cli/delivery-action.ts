@@ -18,7 +18,7 @@ import type { DeliveryGuardSpec, GuardedDeliveryHandler } from '../delivery-guar
 import { registerDeliveryAction } from '../delivery.js';
 import { unguarded, type GuardedAction } from '../guard/index.js';
 import { log } from '../log.js';
-import { writeSessionMessage } from '../session-manager.js';
+import { clearOutbox, withExistingMailboxSession, writeSessionMessage } from '../session-manager.js';
 import type { Session } from '../types.js';
 import { dispatch } from './dispatch.js';
 import type { ErrorCode, RequestFrame, ResponseFrame } from './frame.js';
@@ -33,7 +33,7 @@ import type { ErrorCode, RequestFrame, ResponseFrame } from './frame.js';
 export async function writeActionResponse(session: Session, requestId: string, frame: ResponseFrame): Promise<void> {
   try {
     await writeSessionMessage(session.agent_group_id, session.id, {
-      id: `action-resp-${requestId}`,
+      id: answerId(requestId),
       kind: 'system',
       timestamp: new Date().toISOString(),
       content: JSON.stringify({ type: 'action_response', requestId, frame }),
@@ -45,6 +45,11 @@ export async function writeActionResponse(session: Session, requestId: string, f
   }
 }
 
+/** The id of a request's answer in the calling session's inbound mailbox. */
+function answerId(requestId: string): string {
+  return `action-resp-${requestId}`;
+}
+
 /** A request refused as asked: the agent reads why and can ask differently. */
 export class ActionRefusal extends Error {
   constructor(
@@ -54,6 +59,16 @@ export class ActionRefusal extends Error {
     super(message);
     this.name = 'ActionRefusal';
   }
+}
+
+/** A refusal of a request whose fields are not as the action takes them. */
+export function invalidArgs(message: string): ActionRefusal {
+  return new ActionRefusal('invalid-args', message);
+}
+
+/** A refusal of a request the action will not do as asked. */
+export function forbidden(message: string): ActionRefusal {
+  return new ActionRefusal('forbidden', message);
 }
 
 const REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/u;
@@ -80,15 +95,33 @@ function errorFrame(requestId: string, error: unknown): ResponseFrame {
 }
 
 /**
+ * Answer a request, then let go of the files it staged in its outbox: until
+ * then a replay finds them where the first run did.
+ */
+async function writeAnswer(session: Session, requestId: string, frame: ResponseFrame): Promise<void> {
+  await writeActionResponse(session, requestId, frame);
+  clearOutbox(session.agent_group_id, session.id, requestId);
+}
+
+/**
  * A delivery action that answers each request once, a refusal or failure
- * included. A request without a request id has no tool waiting on it, so
- * nothing answers it.
+ * included. A request already answered is a replay of work already done,
+ * whatever its answer, so it is not done again. A request without a request
+ * id has no tool waiting on it, so nothing answers it.
  */
 export function answeringAction(action: string, answer: ActionAnswer): GuardedDeliveryHandler {
   return async (content, session) => {
     const requestId = requestIdOf(content);
     if (requestId === undefined) {
       log.warn('Action request without a request id: nothing to answer', { action, sessionId: session.id });
+      return;
+    }
+    const answered = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox.hasMessage(answerId(requestId)),
+    );
+    if (answered === true) {
+      log.info('Action request already answered; not done again', { action, requestId, sessionId: session.id });
+      clearOutbox(session.agent_group_id, session.id, requestId);
       return;
     }
     let frame: ResponseFrame;
@@ -104,13 +137,13 @@ export function answeringAction(action: string, answer: ActionAnswer): GuardedDe
       frame = errorFrame(requestId, error);
     }
     /* eslint-enable no-catch-all/no-catch-all */
-    await writeActionResponse(session, requestId, frame);
+    await writeAnswer(session, requestId, frame);
   };
 }
 
 async function refuse(content: Record<string, unknown>, session: Session, message: string): Promise<void> {
   const requestId = requestIdOf(content) ?? '';
-  await writeActionResponse(session, requestId, { id: requestId, ok: false, error: { code: 'forbidden', message } });
+  await writeAnswer(session, requestId, { id: requestId, ok: false, error: { code: 'forbidden', message } });
 }
 
 /**

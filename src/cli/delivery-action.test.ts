@@ -3,6 +3,7 @@
  * calling tool writes its answer, `cli_request` included.
  */
 import fs from 'fs';
+import path from 'path';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -16,7 +17,7 @@ vi.mock('../config.js', async () => {
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../db/index.js';
 import { getDeliveryAction } from '../delivery.js';
 import { inboundDbPath } from '../mailbox/sqlite/paths.js';
-import { resolveSession } from '../session-manager.js';
+import { resolveSession, sessionDir } from '../session-manager.js';
 import type { Session } from '../types.js';
 import { runGuarded } from '../delivery-guard.js';
 import { ALLOW, DENY, defineGuardedAction, HOLD } from '../guard/index.js';
@@ -123,6 +124,35 @@ describe('an answering action', () => {
         error: { code: 'handler-error', message: 'The host could not do it: Calendar unreachable' },
       },
     ]);
+  });
+
+  it('does nothing for a request it answered already', async () => {
+    const answer = vi.fn(async () => ({ done: true }));
+    const handler = answeringAction('fixture', answer);
+    await handler({ requestId: 'again-1' }, session);
+    await handler({ requestId: 'again-1' }, session);
+    expect(answer).toHaveBeenCalledTimes(1);
+    expect(frameOf('again-1')).toEqual([{ id: 'again-1', ok: true, data: { done: true } }]);
+  });
+
+  it('lets go of the files a request staged once it answers it, a refusal included', async () => {
+    const stage = (requestId: string): string => {
+      const dir = path.join(sessionDir(session.agent_group_id, session.id), 'outbox', requestId);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'agenda.pdf'), 'agenda');
+      return dir;
+    };
+    const handler = answeringAction('fixture', async () => ({}));
+    const refusing = answeredGuard(
+      defineGuardedAction({ action: 'fixture.refusing', decide: () => DENY('Not yours.') }),
+    );
+    const answered = stage('files-1');
+    const refused = stage('files-2');
+
+    await handler({ requestId: 'files-1' }, session);
+    await runGuarded('fixture', refusing, handler, { requestId: 'files-2' }, session, null);
+    expect(fs.existsSync(answered)).toBe(false);
+    expect(fs.existsSync(refused)).toBe(false);
   });
 
   it('does nothing for a request no tool waits on', async () => {

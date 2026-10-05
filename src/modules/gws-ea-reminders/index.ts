@@ -28,7 +28,7 @@
  * reminder, which keeps its own time, from any other row waiting to be due.
  */
 import { registerCapability } from '../../capabilities.js';
-import { ActionRefusal, answeringAction, type ActionAnswer } from '../../cli/delivery-action.js';
+import { answeringAction, forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-action.js';
 import { resolveGroupTimezone } from '../../container-config.js';
 import { isTaskThread } from '../../db/sessions.js';
 import { registerDeliveryAction } from '../../delivery.js';
@@ -67,24 +67,22 @@ const NOTE_MAX = 1_000;
 const REMINDER_ID = /^reminder-[A-Za-z0-9._:-]{1,128}$/u;
 const DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/iu;
 
-const invalid = (message: string): ActionRefusal => new ActionRefusal('invalid-args', message);
-
 /** The time a reminder comes back, in UTC. */
 function dueAt(value: unknown, now: number): string {
   if (typeof value !== 'string' || !DATE_TIME.test(value)) {
-    throw invalid('at must be a date and time with its UTC offset, such as 2026-10-07T09:00:00-04:00');
+    throw invalidArgs('at must be a date and time with its UTC offset, such as 2026-10-07T09:00:00-04:00');
   }
   const due = Date.parse(value);
-  if (!Number.isFinite(due)) throw invalid(`at is not a real date and time: ${value}`);
-  if (due <= now) throw invalid('at must be in the future');
-  if (due - now > MAX_AHEAD_MS) throw invalid('at must be at most 30 days ahead');
+  if (!Number.isFinite(due)) throw invalidArgs(`at is not a real date and time: ${value}`);
+  if (due <= now) throw invalidArgs('at must be in the future');
+  if (due - now > MAX_AHEAD_MS) throw invalidArgs('at must be at most 30 days ahead');
   return new Date(due).toISOString();
 }
 
 function noteOf(value: unknown): string {
   const note = typeof value === 'string' ? value.replace(/\s+/gu, ' ').trim() : '';
   if (note === '' || note.length > NOTE_MAX || hasControlCharacters(note)) {
-    throw invalid(`note must be text of 1 to ${NOTE_MAX} characters`);
+    throw invalidArgs(`note must be text of 1 to ${NOTE_MAX} characters`);
   }
   return note;
 }
@@ -95,7 +93,7 @@ async function remindMe(
   requestId: string,
 ): Promise<Record<string, unknown>> {
   if (isTaskThread(session.thread_id)) {
-    throw new ActionRefusal('forbidden', 'A scheduled task run has no conversation to come back to.');
+    throw forbidden('A scheduled task run has no conversation to come back to.');
   }
   const now = Date.now();
   const at = dueAt(content.at, now);
@@ -125,7 +123,7 @@ async function remindMe(
 async function clearReminder(content: Record<string, unknown>, session: Session): Promise<Record<string, unknown>> {
   const id = content.reminder_id;
   if (typeof id !== 'string' || !REMINDER_ID.test(id)) {
-    throw invalid('reminder_id must be the id remind_me answered with, such as reminder-…');
+    throw invalidArgs('reminder_id must be the id remind_me answered with, such as reminder-…');
   }
   const outcome = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
     const waiting = mailbox.getMessageForRetry(id, 'pending');
@@ -143,10 +141,10 @@ async function clearReminder(content: Record<string, unknown>, session: Session)
     case 'cleared':
       return { reminder_id: id, message: `Reminder ${id} is cleared.` };
     case 'due':
-      throw invalid(`Reminder ${id} has already come due.`);
+      throw invalidArgs(`Reminder ${id} has already come due.`);
     case 'missing':
     case undefined:
-      throw invalid(`There is no waiting reminder ${id} in this conversation.`);
+      throw invalidArgs(`There is no waiting reminder ${id} in this conversation.`);
     default: {
       const unreachable: never = outcome;
       throw new Error(`Unknown outcome: ${String(unreachable)}`);

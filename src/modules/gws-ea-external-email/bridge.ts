@@ -36,19 +36,19 @@ import path from 'node:path';
 
 import { inboxFolderName } from '../../attachment-safety.js';
 import type { OutboundFile } from '../../channels/adapter.js';
-import { ActionRefusal, answeredGuard, answeringAction, type ActionAnswer } from '../../cli/delivery-action.js';
+import {
+  answeredGuard,
+  answeringAction,
+  forbidden,
+  invalidArgs,
+  type ActionAnswer,
+} from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import type { DeliveryGuardSpec, GuardedDeliveryHandler } from '../../delivery-guard.js';
 import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
-import {
-  clearOutbox,
-  readOutboxFiles,
-  resolveSession,
-  sessionDir,
-  writeSessionMessage,
-} from '../../session-manager.js';
+import { readOutboxFiles, resolveSession, sessionDir, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { isPrincipalCalendar } from '../gws-ea-inbox/calendar-notifications.js';
@@ -85,9 +85,6 @@ const MAX_RECIPIENTS = 20;
 const MAX_FILES = 10;
 /** Google's longest calendar id is an address. */
 const CALENDAR_ID_MAX = 254;
-
-const invalid = (message: string): ActionRefusal => new ActionRefusal('invalid-args', message);
-const refused = (message: string): ActionRefusal => new ActionRefusal('forbidden', message);
 
 // ---------------------------------------------------------------------------
 // Who may call
@@ -135,7 +132,7 @@ const tellMainAction = defineGuardedAction({
 function messageOf(value: unknown): string {
   const message = typeof value === 'string' ? value.replace(/\r\n?/gu, '\n').trim() : '';
   if (message === '' || message.length > MESSAGE_MAX || hasControlCharacters(message.replace(/[\n\t]/gu, ' '))) {
-    throw invalid(`message must be text of 1 to ${MESSAGE_MAX} characters`);
+    throw invalidArgs(`message must be text of 1 to ${MESSAGE_MAX} characters`);
   }
   return message;
 }
@@ -145,14 +142,14 @@ function addressesOf(value: unknown, field: 'to' | 'cc'): string[] {
   if (value === undefined && field === 'cc') return [];
   const fewest = field === 'to' ? 1 : 0;
   if (!Array.isArray(value) || value.length < fewest || value.length > MAX_RECIPIENTS) {
-    throw invalid(`${field} must list ${fewest} to ${MAX_RECIPIENTS} email addresses`);
+    throw invalidArgs(`${field} must list ${fewest} to ${MAX_RECIPIENTS} email addresses`);
   }
   return [
     ...new Set(
       value.map((entry: unknown) => {
         const address = typeof entry === 'string' ? normalizeAddress(entry) : undefined;
         if (address === undefined)
-          throw invalid(`${field} must list email addresses; ${JSON.stringify(entry)} is not one`);
+          throw invalidArgs(`${field} must list email addresses; ${JSON.stringify(entry)} is not one`);
         return address;
       }),
     ),
@@ -165,14 +162,14 @@ function fileNamesOf(value: unknown): string[] {
     const names = value.filter((name: unknown): name is string => typeof name === 'string');
     if (names.length === value.length && new Set(names).size === names.length) return names;
   }
-  throw invalid(`files must name up to ${MAX_FILES} different files you staged with this request`);
+  throw invalidArgs(`files must name up to ${MAX_FILES} different files you staged with this request`);
 }
 
 function calendarIdOf(value: unknown): string | undefined {
   if (value === undefined) return undefined;
   const calendarId = typeof value === 'string' ? value.trim() : '';
   if (calendarId === '' || calendarId.length > CALENDAR_ID_MAX || hasControlCharacters(calendarId)) {
-    throw invalid("calendar must be the id of one of the principal's calendars");
+    throw invalidArgs("calendar must be the id of one of the principal's calendars");
   }
   return calendarId;
 }
@@ -192,7 +189,7 @@ async function hasOutsideSide(threadKey: string): Promise<boolean> {
 async function targetOf(content: Record<string, unknown>, context: RoutingContext): Promise<Target> {
   const { thread_key: threadKey, to, cc } = content;
   if (threadKey === undefined && to === undefined) {
-    throw invalid(
+    throw invalidArgs(
       'A handoff names thread_key or to: thread_key for a thread that exists, with any people to bring into it, or to, with any cc, for a new one.',
     );
   }
@@ -200,21 +197,23 @@ async function targetOf(content: Record<string, unknown>, context: RoutingContex
   const ccList = addressesOf(cc, 'cc').filter((address) => !toList.includes(address));
   const everyone = [...toList, ...ccList];
   if (everyone.some((address) => context.assistant.has(address))) {
-    throw invalid('The assistant is never one of its own recipients: leave its address out.');
+    throw invalidArgs('The assistant is never one of its own recipients: leave its address out.');
   }
   if (threadKey !== undefined) {
     if (typeof threadKey !== 'string' || !THREAD_KEY.test(threadKey) || (await getThread(threadKey)) === undefined) {
-      throw invalid(`There is no email thread ${JSON.stringify(threadKey)}: name one by the mail-… key the host gave.`);
+      throw invalidArgs(
+        `There is no email thread ${JSON.stringify(threadKey)}: name one by the mail-… key the host gave.`,
+      );
     }
     if (!(await hasOutsideSide(threadKey))) {
-      throw invalid(
+      throw invalidArgs(
         `Thread ${threadKey} has only the principal and you on it: to write to someone, name them in to, which starts a thread with them.`,
       );
     }
     return { kind: 'thread', threadKey, to: toList, cc: ccList };
   }
   if (everyone.every((address) => context.auth.principalAddresses.has(address))) {
-    throw invalid('A new thread needs someone besides the principal on it.');
+    throw invalidArgs('A new thread needs someone besides the principal on it.');
   }
   return { kind: 'new', to: toList, cc: ccList };
 }
@@ -229,7 +228,7 @@ function stagedFiles(session: Session, requestId: string, names: readonly string
   const found = readOutboxFiles(session.agent_group_id, session.id, requestId, [...names]) ?? [];
   const missing = names.filter((name) => !found.some((file) => file.filename === name));
   if (missing.length > 0) {
-    throw invalid(
+    throw invalidArgs(
       `Nothing was handed over: files must name files you staged with this request, and ${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} not among them.`,
     );
   }
@@ -253,7 +252,7 @@ async function bookingCalendarOf(calendarId: string, context: RoutingContext): P
     !isPrincipalCalendar(entry, context.auth.principalAddresses) ||
     (entry.accessRole !== 'writer' && entry.accessRole !== 'owner')
   ) {
-    throw invalid(
+    throw invalidArgs(
       `calendar must be one of the principal's calendars the assistant can write to, and ${calendarId} is not.`,
     );
   }
@@ -331,7 +330,7 @@ async function admit(content: Record<string, unknown>, session: Session, request
     ],
     'others',
   );
-  if (!check.allowed) throw refused(`Nothing was handed over: ${check.reason}`);
+  if (!check.allowed) throw forbidden(`Nothing was handed over: ${check.reason}`);
   const bookingCalendar = calendarId === undefined ? undefined : await bookingCalendarOf(calendarId, context);
   return { target, message, files, bookingCalendar, context };
 }
@@ -375,6 +374,15 @@ async function writeHandoff(
           })),
         }),
   });
+  // Each file is the thread's before main's words arrive, so the words never come without them.
+  const inbox = path.join(sessionDir(thread.agent_group_id, thread.id), 'inbox', inboxFolderName(id));
+  for (const file of files) {
+    await recordThreadFile(
+      threadKey,
+      { sha256: sha256(file.data), fileName: file.filename, hostPath: path.join(inbox, file.filename) },
+      at,
+    );
+  }
   const processAfter = await paceDeadline(thread);
   try {
     await writeSessionMessage(thread.agent_group_id, thread.id, {
@@ -392,51 +400,38 @@ async function writeHandoff(
     // A replayed request: its handoff is already there.
     if (!isDuplicateNote(error)) throw error;
   }
-  const inbox = path.join(sessionDir(thread.agent_group_id, thread.id), 'inbox', inboxFolderName(id));
-  for (const file of files) {
-    await recordThreadFile(
-      threadKey,
-      { sha256: sha256(file.data), fileName: file.filename, hostPath: path.join(inbox, file.filename) },
-      at,
-    );
-  }
 }
 
 const handOver: ActionAnswer = async (content, session, requestId) => {
-  try {
-    const [externalEmail, { inbox }] = await Promise.all([getExternalEmailAgentGroupId(), emailMessagingGroupIds()]);
-    if (externalEmail === null || inbox === null) throw new Error('external-email and its inbox do not exist yet');
-    const handoff = await admit(content, session, requestId);
-    const { target, files, bookingCalendar } = handoff;
-    const at = handoff.context.at.toISOString();
-    const threadKey = target.kind === 'thread' ? target.threadKey : newThreadKey(session, requestId);
-    await recordHandoff(threadKey, handoff, at);
-    const resumed = await resumeThread({
-      channelType: EMAIL_CHANNEL_TYPE,
-      platformId: INBOX_PLATFORM_ID,
-      threadId: threadKey,
-    });
-    const { session: thread } = await resolveSession(externalEmail, inbox, threadKey, 'per-thread');
-    await writeHandoff(thread, threadKey, handoff, requestId, at);
-    return {
-      thread_key: threadKey,
-      message: [
-        target.kind === 'new'
-          ? `external-email has a new thread, ${threadKey}, to ${[...target.to, ...target.cc].join(', ')}, and takes it up within a few minutes; name thread_key ${threadKey} to hand it more.`
-          : `external-email has your words for thread ${threadKey} and takes them up within a few minutes.${
-              target.to.length + target.cc.length === 0
-                ? ''
-                : ` It may bring ${[...target.to, ...target.cc].join(', ')} into it.`
-            }`,
-        ...(resumed ? ['The thread, stopped after repeated attempts to send private details, may send again.'] : []),
-        ...(files.length === 0 ? [] : [`It may send ${files.map((file) => file.filename).join(', ')} in that thread.`]),
-        ...(bookingCalendar === undefined ? [] : [`Its holds and bookings go on calendar ${bookingCalendar}.`]),
-      ].join(' '),
-    };
-  } finally {
-    // The files were staged for this request alone.
-    clearOutbox(session.agent_group_id, session.id, requestId);
-  }
+  const [externalEmail, { inbox }] = await Promise.all([getExternalEmailAgentGroupId(), emailMessagingGroupIds()]);
+  if (externalEmail === null || inbox === null) throw new Error('external-email and its inbox do not exist yet');
+  const handoff = await admit(content, session, requestId);
+  const { target, files, bookingCalendar } = handoff;
+  const at = handoff.context.at.toISOString();
+  const threadKey = target.kind === 'thread' ? target.threadKey : newThreadKey(session, requestId);
+  await recordHandoff(threadKey, handoff, at);
+  const resumed = await resumeThread({
+    channelType: EMAIL_CHANNEL_TYPE,
+    platformId: INBOX_PLATFORM_ID,
+    threadId: threadKey,
+  });
+  const { session: thread } = await resolveSession(externalEmail, inbox, threadKey, 'per-thread');
+  await writeHandoff(thread, threadKey, handoff, requestId, at);
+  return {
+    thread_key: threadKey,
+    message: [
+      target.kind === 'new'
+        ? `external-email has a new thread, ${threadKey}, to ${[...target.to, ...target.cc].join(', ')}, and takes it up within a few minutes; name thread_key ${threadKey} to hand it more.`
+        : `external-email has your words for thread ${threadKey} and takes them up within a few minutes.${
+            target.to.length + target.cc.length === 0
+              ? ''
+              : ` It may bring ${[...target.to, ...target.cc].join(', ')} into it.`
+          }`,
+      ...(resumed ? ['The thread, stopped after repeated attempts to send private details, may send again.'] : []),
+      ...(files.length === 0 ? [] : [`It may send ${files.map((file) => file.filename).join(', ')} in that thread.`]),
+      ...(bookingCalendar === undefined ? [] : [`Its holds and bookings go on calendar ${bookingCalendar}.`]),
+    ].join(' '),
+  };
 };
 
 // ---------------------------------------------------------------------------

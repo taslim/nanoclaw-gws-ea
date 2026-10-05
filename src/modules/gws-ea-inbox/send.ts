@@ -97,7 +97,12 @@ async function findSent(
   return undefined;
 }
 
-/** Send `raw`, retrying Gmail's own failures briefly, and never twice once Gmail holds it. */
+/**
+ * Send `raw`, retrying Gmail's own failures briefly, and never twice once
+ * Gmail holds it. Only Gmail refusing the email says it was not sent; after
+ * any other failure, the last included, Gmail is checked for it before the
+ * send counts as failed.
+ */
 async function sendWithBackoff(
   runtime: InboxRuntime,
   raw: string,
@@ -108,12 +113,16 @@ async function sendWithBackoff(
     try {
       return await runtime.gmail.send({ raw, ...(gmailThreadId === null ? {} : { threadId: gmailThreadId }) });
     } catch (error) {
+      if (error instanceof GoogleApiError && !error.retryable) throw error;
       const delay = SEND_BACKOFF_MS[attempt];
-      if (!(error instanceof GoogleApiError) || !error.retryable || delay === undefined) throw error;
-      log.warn('Gmail did not take an email; checking for it, then retrying', { status: error.status, attempt });
-      await runtime.sleep(delay);
+      log.warn('Gmail may not have taken an email; checking for it', {
+        ...(error instanceof GoogleApiError ? { status: error.status } : {}),
+        attempt,
+      });
+      if (delay !== undefined) await runtime.sleep(delay);
       const found = await findSent(runtime.gmail, rfcMessageId, gmailThreadId);
       if (found) return found;
+      if (!(error instanceof GoogleApiError) || delay === undefined) throw error;
     }
   }
 }

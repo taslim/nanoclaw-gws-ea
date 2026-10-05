@@ -41,7 +41,7 @@
  * and its time, and a booking's from the request that made it.
  */
 import { TIMEZONE } from '../../config.js';
-import { ActionRefusal, type ActionAnswer } from '../../cli/delivery-action.js';
+import { forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-action.js';
 import { resolveGroupTimezone } from '../../container-config.js';
 import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
@@ -115,25 +115,22 @@ const DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[
 /** A booking's id, as `book` answered with it: its event's id, lowercase hex. */
 const BOOKING_ID = /^[0-9a-f]{64}$/u;
 
-const invalid = (message: string): ActionRefusal => new ActionRefusal('invalid-args', message);
-const refused = (message: string): ActionRefusal => new ActionRefusal('forbidden', message);
-
 // ---------------------------------------------------------------------------
 // The request's fields
 // ---------------------------------------------------------------------------
 
 function instantOf(value: unknown, label: string): number {
   if (typeof value !== 'string' || !DATE_TIME.test(value)) {
-    throw invalid(`${label} must be a date and time with its UTC offset, such as 2026-10-07T09:00:00-04:00`);
+    throw invalidArgs(`${label} must be a date and time with its UTC offset, such as 2026-10-07T09:00:00-04:00`);
   }
   const at = Date.parse(value);
-  if (!Number.isFinite(at)) throw invalid(`${label} is not a real date and time: ${value}`);
+  if (!Number.isFinite(at)) throw invalidArgs(`${label} is not a real date and time: ${value}`);
   return at;
 }
 
 function minutesOf(value: unknown): number {
   if (typeof value !== 'number' || !Number.isInteger(value) || value < MIN_MINUTES || value > MAX_MINUTES) {
-    throw invalid(`minutes must be a whole number from ${MIN_MINUTES} to ${MAX_MINUTES}`);
+    throw invalidArgs(`minutes must be a whole number from ${MIN_MINUTES} to ${MAX_MINUTES}`);
   }
   return value;
 }
@@ -141,7 +138,7 @@ function minutesOf(value: unknown): number {
 function timezoneOf(value: unknown): string | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value !== 'string' || !isValidTimezone(value)) {
-    throw invalid('timezone must be an IANA time zone, such as America/New_York');
+    throw invalidArgs('timezone must be an IANA time zone, such as America/New_York');
   }
   return value;
 }
@@ -151,7 +148,7 @@ function lineOf(value: unknown, label: string, max: number): string | undefined 
   if (value === undefined || value === null) return undefined;
   const line = typeof value === 'string' ? value.replace(/\s+/gu, ' ').trim() : '';
   if (line === '' || line.length > max || hasControlCharacters(line)) {
-    throw invalid(`${label} must be text of 1 to ${max} characters`);
+    throw invalidArgs(`${label} must be text of 1 to ${max} characters`);
   }
   return line;
 }
@@ -161,20 +158,20 @@ function notesOf(value: unknown): string | undefined {
   if (value === undefined || value === null) return undefined;
   const notes = typeof value === 'string' ? value.replace(/\r\n?/gu, '\n').trim() : '';
   if (notes === '' || notes.length > NOTES_MAX || hasControlCharacters(notes.replace(/[\n\t]/gu, ' '))) {
-    throw invalid(`notes must be text of 1 to ${NOTES_MAX} characters`);
+    throw invalidArgs(`notes must be text of 1 to ${NOTES_MAX} characters`);
   }
   return notes;
 }
 
 function videoCallOf(value: unknown): boolean {
   if (value === undefined || value === null) return false;
-  if (typeof value !== 'boolean') throw invalid('video_call must be true or false');
+  if (typeof value !== 'boolean') throw invalidArgs('video_call must be true or false');
   return value;
 }
 
 function bookingIdOf(value: unknown): string {
   if (typeof value !== 'string' || !BOOKING_ID.test(value)) {
-    throw invalid('booking must be the booking id book answered with');
+    throw invalidArgs('booking must be the booking id book answered with');
   }
   return value;
 }
@@ -183,14 +180,14 @@ function bookingIdOf(value: unknown): string {
 function addressesOf(value: unknown): string[] | undefined {
   if (value === undefined || value === null) return undefined;
   if (!Array.isArray(value) || value.length === 0 || value.length > MAX_INVITEES) {
-    throw invalid(`invitees must list 1 to ${MAX_INVITEES} email addresses`);
+    throw invalidArgs(`invitees must list 1 to ${MAX_INVITEES} email addresses`);
   }
   return [
     ...new Set(
       value.map((entry: unknown) => {
         const address = typeof entry === 'string' ? normalizeAddress(entry) : undefined;
         if (address === undefined)
-          throw invalid(`invitees must list email addresses; ${JSON.stringify(entry)} is not one`);
+          throw invalidArgs(`invitees must list email addresses; ${JSON.stringify(entry)} is not one`);
         return address;
       }),
     ),
@@ -270,7 +267,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
         return entry;
       }
     }
-    throw refused(
+    throw forbidden(
       named === null
         ? "The assistant cannot write to the principal's primary calendar, so it can hold and book nothing: tell main with tell_main."
         : 'The assistant cannot write to the calendar main named for this thread, so it can hold and book nothing: tell main with tell_main.',
@@ -320,10 +317,10 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     const now = Date.now();
     const label = (span: Span): string => slotLabel(span, timezone);
     const passed = spans.filter((span) => span.start <= now);
-    if (passed.length > 0) throw refused(`${passed.map(label).join('; ')}: that time has passed.`);
+    if (passed.length > 0) throw forbidden(`${passed.map(label).join('; ')}: that time has passed.`);
     const protectedTime = spans.filter((span) => inProtectedTime(span, rules, timezone));
     if (protectedTime.length > 0) {
-      throw refused(
+      throw forbidden(
         `${protectedTime.map(label).join('; ')}: the principal keeps that time protected, whoever asks for it. Offer times from free_time instead.`,
       );
     }
@@ -334,7 +331,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     const busy = await busyIn(view, calendarId, covering, ignore);
     const taken = spans.filter((span) => !isClear(span, busy));
     if (taken.length > 0) {
-      throw refused(`${taken.map(label).join('; ')}: no longer free. Call free_time for times to offer instead.`);
+      throw forbidden(`${taken.map(label).join('; ')}: no longer free. Call free_time for times to offer instead.`);
     }
   }
 
@@ -500,9 +497,9 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     const to = instantOf(content.to, 'to');
     const minutes = minutesOf(content.minutes);
     const theirs = timezoneOf(content.timezone);
-    if (to <= from) throw invalid('to must come after from');
-    if (to - from > MAX_RANGE_DAYS * DAY) throw invalid(`The range may span at most ${MAX_RANGE_DAYS} days`);
-    if (to <= Date.now()) throw invalid('That range has already passed: ask for one in the future.');
+    if (to <= from) throw invalidArgs('to must come after from');
+    if (to - from > MAX_RANGE_DAYS * DAY) throw invalidArgs(`The range may span at most ${MAX_RANGE_DAYS} days`);
+    if (to <= Date.now()) throw invalidArgs('That range has already passed: ask for one in the future.');
     const view = await viewOf(session);
     const { timezone, rules } = view.principal;
     const bookingCalendar = await bookingCalendarOf(view);
@@ -544,7 +541,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
    */
   const hold: ActionAnswer = async (content, session) => {
     if (!Array.isArray(content.starts) || content.starts.length > MAX_HOLDS) {
-      throw invalid(`starts must list up to ${MAX_HOLDS} start times, or none to release every hold`);
+      throw invalidArgs(`starts must list up to ${MAX_HOLDS} start times, or none to release every hold`);
     }
     const starts = [...new Set(content.starts.map((start: unknown) => instantOf(start, 'Each start')))].sort(
       (a, b) => a - b,
@@ -558,7 +555,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     const minutes = minutesOf(content.minutes);
     const spans = starts.map((start) => spanAt(start, minutes));
     if (spans.some((span, index) => index > 0 && span.start < spans[index - 1].end)) {
-      throw invalid('The times overlap: hold times that do not.');
+      throw invalidArgs('The times overlap: hold times that do not.');
     }
     const { timezone } = view.principal;
     const bookingCalendar = await bookingCalendarOf(view);
@@ -620,19 +617,23 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
    * assistant, whose calendar the event is on.
    */
   async function inviteesOf(value: unknown, view: ThreadView): Promise<string[]> {
-    const onThread = new Set((await threadAddresses(view.threadKey)).map((entry) => entry.address));
+    const addresses = await threadAddresses(view.threadKey);
+    const onThread = new Set(addresses.map((entry) => entry.address));
+    // Unnamed, the invitees are the people in the conversation: not someone only mentioned in it.
+    const inConversation = new Set(addresses.flatMap((entry) => (entry.source === 'written' ? [] : [entry.address])));
     const assistant = await assistantAddresses();
     const named = addressesOf(value);
     const stranger = named?.find((address) => !onThread.has(address));
     if (stranger !== undefined) {
-      throw refused(
+      throw forbidden(
         `${stranger} is not on this thread: invite only people who wrote or were written to in it, or whom main named.`,
       );
     }
-    const invitees = (named ?? [...onThread]).filter(
+    const invitees = (named ?? [...inConversation]).filter(
       (address) => !view.principal.addresses.has(address) && !assistant.has(address),
     );
-    if (invitees.length === 0) throw invalid('Name someone on the thread to invite: the booking invites nobody else.');
+    if (invitees.length === 0)
+      throw invalidArgs('Name someone on the thread to invite: the booking invites nobody else.');
     return invitees;
   }
 
@@ -664,8 +665,8 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
 
   /**
    * Create the booking's event and record it. Every check runs first, so a
-   * refusal writes nothing; a Calendar failure takes back whatever the
-   * write left, and the agent sees the failure.
+   * refusal writes nothing; a failure to create or record it takes back
+   * whatever the write left, and the agent sees the failure.
    */
   async function placeBooking(view: ThreadView, wanted: NewBooking): Promise<ThreadBooking> {
     const { threadKey } = view;
@@ -682,13 +683,13 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
       await audienceForAddresses(wanted.invitees),
     );
     if (!check.allowed) {
-      throw refused(
+      throw forbidden(
         `The booking was not made: as the invitees would see it, its title, notes, place or calendar name carries one of the principal's private details (${check.kind}). ` +
           "Write it without that detail, and do not hint at, spell out, or encode it. If it is the calendar's name, tell main with tell_main.",
       );
     }
     if (wanted.videoCall && !allowsMeet(bookingCalendar)) {
-      throw refused(
+      throw forbidden(
         'The calendar this thread books on does not allow Google Meet links: give the place another way, such as their own link in location.',
       );
     }
@@ -712,18 +713,18 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
         'all',
         { key: TAG_THREAD, value: threadKey },
       );
+      const booking: ThreadBooking = {
+        threadKey,
+        calendarId: bookingCalendar.id,
+        eventId: wanted.eventId,
+        bookedAt: new Date().toISOString(),
+      };
+      await recordThreadBooking(booking);
+      return booking;
     } catch (error) {
       await withdraw(bookingCalendar.id, wanted.eventId, threadKey);
       throw error;
     }
-    const booking: ThreadBooking = {
-      threadKey,
-      calendarId: bookingCalendar.id,
-      eventId: wanted.eventId,
-      bookedAt: new Date().toISOString(),
-    };
-    await recordThreadBooking(booking);
-    return booking;
   }
 
   /**
@@ -738,7 +739,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     const start = instantOf(content.start, 'start');
     const minutes = minutesOf(content.minutes);
     const title = lineOf(content.title, 'title', TITLE_MAX);
-    if (title === undefined) throw invalid('title is required: it is what the invitees see on their calendars');
+    if (title === undefined) throw invalidArgs('title is required: it is what the invitees see on their calendars');
     const notes = notesOf(content.notes);
     const location = lineOf(content.location, 'location', LOCATION_MAX);
     const videoCall = videoCallOf(content.video_call);
@@ -793,17 +794,17 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
   async function ownBooking(content: Record<string, unknown>, view: ThreadView) {
     const eventId = bookingIdOf(content.booking);
     const booking = await getThreadBooking(view.threadKey, eventId);
-    if (!booking) throw refused(`This thread has no booking ${eventId}: use a booking id book gave you here.`);
+    if (!booking) throw forbidden(`This thread has no booking ${eventId}: use a booking id book gave you here.`);
     const event = await calendar().getEvent(booking.calendarId, eventId);
     if (!event || event.status === 'cancelled') {
       await deleteThreadBooking(booking.calendarId, eventId);
-      throw refused('That booking is no longer on the principal’s calendar, so there is nothing to change.');
+      throw forbidden('That booking is no longer on the principal’s calendar, so there is nothing to change.');
     }
     if (event.tags?.[TAG_ROLE] !== 'booking') {
-      throw refused('That event is no longer a booking this thread may change: tell main with tell_main.');
+      throw forbidden('That event is no longer a booking this thread may change: tell main with tell_main.');
     }
     const span = eventSpan(event, view.principal.timezone);
-    if (!span) throw refused('Google reports no readable time for that booking: tell main with tell_main.');
+    if (!span) throw forbidden('Google reports no readable time for that booking: tell main with tell_main.');
     const invitees = (event.attendees ?? []).flatMap((attendee) =>
       attendee.resource === true || attendee.email === undefined ? [] : [attendee.email],
     );
@@ -882,12 +883,28 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     };
   };
 
+  /**
+   * The calendar writes take turns across every thread: each looks at what is
+   * free and writes before the next looks, so two threads never take one time.
+   */
+  let turn: Promise<unknown> = Promise.resolve();
+  function inTurn(answer: ActionAnswer): ActionAnswer {
+    return (content, session, requestId) => {
+      const answered = turn.then(() => answer(content, session, requestId));
+      turn = answered.then(
+        () => undefined,
+        () => undefined,
+      );
+      return answered;
+    };
+  }
+
   return {
     freeTime,
-    hold,
-    book,
-    moveBooking,
-    cancelBooking,
+    hold: inTurn(hold),
+    book: inTurn(book),
+    moveBooking: inTurn(moveBooking),
+    cancelBooking: inTurn(cancelBooking),
     releaseThreadHolds,
     releaseExpiredHolds,
   };
