@@ -23,7 +23,6 @@
  *     everything else out.
  *   - Status reads all of this through a hidden host-only command.
  */
-import fs from 'node:fs';
 import path from 'node:path';
 
 // Their migrations add the columns this module writes: each group's
@@ -38,10 +37,8 @@ import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { onHostStart } from '../../host-lifecycle.js';
-import { log } from '../../log.js';
-import { registerRequiredProjectDocSection } from '../../project-doc-sections.js';
-import type { AgentGroup } from '../../types.js';
 import { getExternalEmailAgentGroupId as readExternalEmailPointer } from '../gws-ea-profile/db.js';
+import { registerGuidance } from '../gws-ea-profile/guidance.js';
 import { BRIDGE_ACTIONS } from './bridge.js';
 import { destinationViolations } from './destination-policy.js';
 import { ensureExternalEmailGroup, externalEmailDrift } from './group.js';
@@ -87,24 +84,12 @@ registerSessionAdmissionPolicy('gws-ea-external-email:stamped-reach', async ({ k
 /** The guidance, relative to the checkout the host runs from, as NanoClaw reads its other instruction files. */
 export const GUIDANCE_PATH = path.join('src', 'modules', 'gws-ea-external-email', 'guidance.md');
 
-async function guidanceSection(group: AgentGroup): Promise<{ name: string; body: string } | undefined> {
-  if (group.id !== (await getExternalEmailAgentGroupId())) return undefined;
-  const file = path.resolve(process.cwd(), GUIDANCE_PATH);
-  if (!fs.existsSync(file)) {
-    // Tolerated but never silent, like main's guidance: throwing here would
-    // fail every spawn. The release preflight refuses a release without it.
-    log.error('external-email guidance is missing; it starts without it', { file });
-    return undefined;
-  }
-  const body = fs.readFileSync(file, 'utf8');
-  if (!body.trim()) {
-    log.error('external-email guidance is empty; it starts without it', { file });
-    return undefined;
-  }
-  return { name: 'External Email', body };
-}
-
-registerRequiredProjectDocSection('gws-ea-external-email:guidance', guidanceSection);
+registerGuidance('gws-ea-external-email:guidance', {
+  agent: 'external-email',
+  heading: 'External Email',
+  file: GUIDANCE_PATH,
+  agentGroupId: readExternalEmailPointer,
+});
 
 export interface ExternalEmailHealth {
   /** The group the profile records, or null when the host has not created it. */

@@ -673,30 +673,30 @@ async function deliverToAgent(
     agentGroupName: agentGroup.name,
   });
 
-  if (wake) {
+  if (wake && processAfter === null) {
     // Typing indicator + wake are only for the engaged branch; accumulated
     // messages sit silently until a real trigger fires, and a delayed one
     // until the host sweep wakes the session once it is due.
     // Typing fires via the adapter instance that owns this chat's row.
-    if (processAfter === null) {
-      startTypingRefresh(
-        session.id,
-        session.agent_group_id,
-        event.channelType,
-        event.platformId,
-        effectiveThreadId,
-        mg.instance,
-      );
-      const freshSession = await getSession(session.id);
-      if (freshSession) {
-        const woke = await requestWake(freshSession, 'inbound-message');
-        // requestWake never throws — it returns false on transient spawn
-        // failure (host-sweep retries). Stop the typing indicator we just
-        // started so it doesn't leak; the inbound row stays pending.
-        if (!woke) stopTypingRefresh(freshSession.id);
-      }
+    startTypingRefresh(
+      session.id,
+      session.agent_group_id,
+      event.channelType,
+      event.platformId,
+      effectiveThreadId,
+      mg.instance,
+    );
+    const freshSession = await getSession(session.id);
+    if (freshSession) {
+      const woke = await requestWake(freshSession, 'inbound-message');
+      // requestWake never throws — it returns false on transient spawn
+      // failure (host-sweep retries). Stop the typing indicator we just
+      // started so it doesn't leak; the inbound row stays pending.
+      if (!woke) stopTypingRefresh(freshSession.id);
     }
+  }
 
+  if (wake) {
     // Cross-session context: fan the triggering message into the
     // conversation's recently active sibling sessions as trigger=0
     // 'session-echo' rows. Only the engaged branch fans — the accumulate
