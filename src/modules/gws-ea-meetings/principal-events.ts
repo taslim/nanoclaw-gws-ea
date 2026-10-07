@@ -25,10 +25,10 @@
 import { TIMEZONE } from '../../config.js';
 import { forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-action.js';
 import { hasControlCharacters } from '../../gws-ea/validation.js';
-import { isPrincipalCalendar, recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
+import { EVENT_ID, isPrincipalCalendar, recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import { getGwsEaProfile, listPrincipalAddresses } from '../gws-ea-profile/db.js';
 import { allowsMeet, type CalendarEntry, type GuestRecord, type MeetingsCalendarApi } from './calendar-api.js';
-import { conferenceWords, eventIdFor, guestsOn, readConference, slotLabel } from './calendar-actions.js';
+import { conferenceWords, dayLabel, eventIdFor, guestsOn, readConference, slotLabel } from './calendar-actions.js';
 import { addressesOf, flagOf, instantOf, lineOf, notesOf, timezoneOf } from './fields.js';
 
 const TITLE_MAX = 200;
@@ -44,8 +44,6 @@ const CALENDAR_ID_MAX = 254;
 const DAY = 24 * 60 * 60 * 1000;
 
 const DATE = /^\d{4}-\d{2}-\d{2}$/u;
-/** Google's event ids: base32hex, with an occurrence's suffix after an underscore. */
-const EVENT_ID = /^[A-Za-z0-9_-]{1,1024}$/u;
 const RECURRENCE_LINE = /^(?:RRULE|EXRULE|RDATE|EXDATE)[:;]\S+$/u;
 
 /** People named in prose: "a, b, and c". */
@@ -107,13 +105,9 @@ function are(addresses: readonly string[]): string {
   return `${LIST.format(addresses)} ${addresses.length === 1 ? 'is' : 'are'}`;
 }
 
-/** An all-day span as people say it: "Monday 12 Oct", or "Monday 12 Oct to Tuesday 13 Oct". */
+/** An all-day span, its days at UTC midnight, as people say it: "Monday 12 Oct", or "Monday 12 Oct to Tuesday 13 Oct". */
 function daysLabel(first: number, last: number): string {
-  const day = (at: number): string =>
-    new Date(at)
-      .toLocaleDateString('en-GB', { timeZone: 'UTC', weekday: 'long', day: 'numeric', month: 'short' })
-      .replace(',', '');
-  return first === last ? day(first) : `${day(first)} to ${day(last)}`;
+  return first === last ? dayLabel(first, 'UTC') : `${dayLabel(first, 'UTC')} to ${dayLabel(last, 'UTC')}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -130,8 +124,8 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
 
   /** The calendar named, refused unless it is the principal's and Google lets the assistant change it. */
   async function principalCalendarOf(calendarId: string): Promise<CalendarEntry> {
-    const entry = await calendar().getCalendar(calendarId);
-    const principal = new Set((await listPrincipalAddresses()).map((address) => address.email.toLowerCase()));
+    const [entry, addresses] = await Promise.all([calendar().getCalendar(calendarId), listPrincipalAddresses()]);
+    const principal = new Set(addresses.map((address) => address.email.toLowerCase()));
     if (entry === undefined || !isPrincipalCalendar(entry, principal)) {
       throw forbidden(
         `${calendarId} is not one of the principal's calendars in your list: put their events on one of theirs.`,

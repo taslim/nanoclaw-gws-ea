@@ -167,15 +167,16 @@ export function conferenceWords(conference: EventConference | undefined): string
  * BST", its zone by the short name people know rather than its IANA name.
  */
 export function slotLabel(span: Span, timezone: string): string {
-  const day = new Date(span.start).toLocaleDateString('en-GB', {
-    timeZone: timezone,
-    weekday: 'long',
-    day: 'numeric',
-    month: 'short',
-  });
   const clock = (instant: number): string =>
     new Date(instant).toLocaleTimeString('en-GB', { timeZone: timezone, hour: '2-digit', minute: '2-digit' });
-  return `${day.replace(',', '')}, ${clock(span.start)}–${clock(span.end)} ${zoneName(span.start, timezone)}`;
+  return `${dayLabel(span.start, timezone)}, ${clock(span.start)}–${clock(span.end)} ${zoneName(span.start, timezone)}`;
+}
+
+/** The day an instant falls on in `timezone`, as people write it: "Tuesday 6 Oct". */
+export function dayLabel(instant: number, timezone: string): string {
+  return new Date(instant)
+    .toLocaleDateString('en-GB', { timeZone: timezone, weekday: 'long', day: 'numeric', month: 'short' })
+    .replace(',', '');
 }
 
 /**
