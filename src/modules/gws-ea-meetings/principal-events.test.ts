@@ -2,7 +2,8 @@
  * main's tools on the principal's own events: `create_event` puts an event
  * on one of their calendars and `change_guests` changes who an event of
  * theirs invites. On every event either writes, the principal is a guest,
- * accepted, as the organizer of an event they made themselves.
+ * accepted, as the organizer of an event they made themselves, unless they
+ * answered it otherwise themselves.
  *
  * Drives the real delivery actions, guard, capabilities and session DBs
  * against an in-memory Google Calendar. Only the container runtime and its
@@ -271,11 +272,27 @@ describe('create_event', () => {
     expect(calendar.live(PRINCIPAL)).toHaveLength(1);
   });
 
+  it('adds nothing when the event a request made was deleted before the host answered it', async () => {
+    const first = data(await send(main, 'create_event', FOCUS, 'act-replayed'));
+    // Someone deletes the event before the answer reaches the agent, and the request runs again.
+    await calendar.deleteEvent(PRINCIPAL, String(first.event), 'none');
+    const inbound = new Database(inboundDbPath(main.agent_group_id, main.id));
+    inbound.prepare('DELETE FROM messages_in WHERE id = ?').run('action-resp-act-replayed');
+    inbound.close();
+
+    expect(refusal(await send(main, 'create_event', FOCUS, 'act-replayed'))).toMatch(
+      /has since been deleted from that calendar/u,
+    );
+    expect(calendar.live(PRINCIPAL)).toEqual([]);
+    expect(calendar.writes.map((write) => write.op)).toEqual(['insert', 'delete']);
+  });
+
   it('refuses a calendar that is not the principal’s, one it may only read, and one not in its list, writing nothing', async () => {
     for (const [calendarId, problem] of [
       [COLLEAGUE_CALENDAR, /not one of the principal's calendars/u],
       ['nobody@northwind.example', /not one of the principal's calendars/u],
       [READ_ONLY, /lets you see that calendar but not change it/u],
+      ['not a calendar', /calendar must be a calendar ID/u],
     ] as const) {
       expect(refusal(await send(main, 'create_event', { ...FOCUS, calendar: calendarId })), calendarId).toMatch(
         problem,
@@ -291,6 +308,13 @@ describe('create_event', () => {
       [{ end: '2026-10-08T08:00:00-07:00' }, /end must come after start/u],
       [{ all_day: true, start: '2026-10-12', end: '2026-10-11' }, /end, the last day, must not come before start/u],
       [{ all_day: true, start: '2026-02-30', end: '2026-03-01' }, /start must be a date such as 2026-10-12/u],
+      // 367 days: a year and a day too long, timed or all day.
+      [{ end: '2027-10-10T09:00:00-07:00' }, /may last at most 366 days/u],
+      [{ all_day: true, start: '2026-10-12', end: '2027-10-13' }, /may last at most 366 days/u],
+      [
+        { guests: Array.from({ length: 51 }, (_, index) => `guest${index}@friends.example`) },
+        /guests must list 1 to 50 email addresses/u,
+      ],
       [{ recurrence: ['every Thursday'] }, /recurrence must list RRULE, EXRULE, RDATE or EXDATE lines/u],
       [{ title: undefined }, /title must be text/u],
       [{ video_call: true }, /does not allow Google Meet links/u],
@@ -354,6 +378,61 @@ describe('change_guests', () => {
     expect(calendar.event(PRINCIPAL, 'teamsync01')?.attendees?.[0]).toEqual(PRINCIPAL_GUEST);
   });
 
+  it('keeps the answer the principal gave an event of theirs, declined or maybe, and says what it is', async () => {
+    for (const [answer, words] of [
+      ['declined', 'who declined it'],
+      ['tentative', 'who answered maybe'],
+    ] as const) {
+      calendar.writes.length = 0;
+      const principal = { email: PRINCIPAL, responseStatus: answer, organizer: true, self: true };
+      calendar.put(teamSync([principal, { email: REMY, responseStatus: 'accepted' }]));
+
+      const changed = data(
+        await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [NOEL] }),
+      );
+      expect(calendar.writes, answer).toEqual([
+        expect.objectContaining({
+          op: 'guests',
+          guests: [principal, { email: REMY, responseStatus: 'accepted' }, { email: NOEL }],
+        }),
+      ]);
+      expect(changed.message, answer).toBe(
+        `Its guests now: ${REMY} and ${NOEL}, and the principal, ${words}. Google emailed no one.`,
+      );
+
+      // With nothing else to change, their answer is no reason to write.
+      calendar.writes.length = 0;
+      const unchanged = data(
+        await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [REMY] }),
+      );
+      expect(calendar.writes, answer).toEqual([]);
+      expect(unchanged.message, answer).toBe(
+        `Nothing changed: ${REMY} is already invited; the principal is already on it.`,
+      );
+    }
+  });
+
+  it('leaves a room booked on the event as it is, and never names it as a guest', async () => {
+    const room = {
+      email: 'boardroom@resource.northwind.example',
+      displayName: 'Boardroom',
+      responseStatus: 'accepted',
+      resource: true,
+    };
+    calendar.put(teamSync([{ email: PRINCIPAL, responseStatus: 'accepted', organizer: true }, room]));
+
+    const changed = data(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [NOEL] }));
+
+    expect(calendar.writes).toEqual([
+      expect.objectContaining({
+        op: 'guests',
+        guests: [{ email: PRINCIPAL, responseStatus: 'accepted', organizer: true }, room, { email: NOEL }],
+      }),
+    ]);
+    expect(changed.guests).toEqual([NOEL]);
+    expect(changed.message).toBe(`Its guests now: ${NOEL}, and the principal, accepted. Google emailed no one.`);
+  });
+
   it('writes nothing when the list already says it', async () => {
     calendar.put(teamSync([{ email: PRINCIPAL, responseStatus: 'accepted', organizer: true }]));
     const unchanged = data(
@@ -366,6 +445,47 @@ describe('change_guests', () => {
     );
     expect(calendar.writes).toEqual([]);
     expect(unchanged.message).toBe(`Nothing changed: ${NOEL} is not invited; the principal is already on it.`);
+  });
+
+  it('keeps a guest’s own answer and note that land between its read of the list and its write', async () => {
+    const principal = { email: PRINCIPAL, responseStatus: 'accepted', organizer: true, self: true };
+    calendar.put(teamSync([principal, { email: REMY, responseStatus: 'needsAction' }]));
+    // Remy accepts just after the first read, then adds a note just after the second.
+    calendar.changeAfterNextGuestRead(() =>
+      calendar.put(teamSync([principal, { email: REMY, responseStatus: 'accepted' }])),
+    );
+    calendar.changeAfterNextGuestRead(() =>
+      calendar.put(teamSync([principal, { email: REMY, responseStatus: 'accepted', comment: 'Bringing the deck' }])),
+    );
+
+    const changed = data(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [NOEL] }));
+
+    expect(calendar.writes).toEqual([
+      expect.objectContaining({
+        op: 'guests',
+        guests: [principal, { email: REMY, responseStatus: 'accepted', comment: 'Bringing the deck' }, { email: NOEL }],
+      }),
+    ]);
+    expect(changed.guests).toEqual([REMY, NOEL]);
+  });
+
+  it('refuses, writing nothing, when the list keeps changing under it', async () => {
+    const principal = { email: PRINCIPAL, responseStatus: 'accepted', organizer: true };
+    calendar.put(teamSync([principal, { email: REMY, responseStatus: 'needsAction' }]));
+    for (const answer of ['accepted', 'tentative', 'declined']) {
+      calendar.changeAfterNextGuestRead(() =>
+        calendar.put(teamSync([principal, { email: REMY, responseStatus: answer }])),
+      );
+    }
+
+    expect(refusal(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [NOEL] }))).toBe(
+      "The event's guests kept changing while this ran: try again in a moment.",
+    );
+    expect(calendar.writes).toEqual([]);
+    expect(calendar.event(PRINCIPAL, 'teamsync01')?.attendees).toEqual([
+      principal,
+      { email: REMY, responseStatus: 'declined' },
+    ]);
   });
 
   it('refuses an event someone else organizes, the principal’s own removal, and an event that is not there', async () => {

@@ -11,8 +11,9 @@
  * assistant's own private tags, and the Meet link the host asked Google to
  * create, and every write asks for nothing back but the id, so no title,
  * description or location is ever fetched (R20). A guest-list change reads
- * each guest whole, only to write them back as they were; none of it reaches
- * an agent. Tests use a fake with the same interface.
+ * each guest whole, only to write them back as they were, and writes over
+ * only the version of the event it read; none of it reaches an agent. Tests
+ * use a fake with the same interface.
  */
 import { isRecord } from '../../gws-ea/validation.js';
 import type { CalendarListEntry } from '../gws-ea-inbox/calendar-notifications.js';
@@ -91,6 +92,12 @@ export type GuestRecord = Readonly<Record<string, unknown>>;
 
 /** An event's guest list as Google holds it, with what says who may change it. */
 export interface EventGuests {
+  /**
+   * The version of the event this list was read from. Google gives the
+   * event a new one on every change, a guest's answer included, so a list
+   * written back over it cannot undo a change made since.
+   */
+  readonly etag?: string;
   readonly status?: string;
   /** The organizer's address, lowercased: the calendar the event belongs to. */
   readonly organizer?: string;
@@ -144,15 +151,20 @@ export interface MeetingsCalendarApi {
   ): Promise<'created' | 'exists'>;
   /** Change the fields given. */
   patchEvent(calendarId: string, eventId: string, event: EventWrite, sendUpdates: SendUpdates): Promise<void>;
-  /** An event's guests as Google holds them, or undefined when it does not exist. */
+  /** An event's guests as Google holds them, with the event's version, or undefined when it does not exist. */
   getGuests(calendarId: string, eventId: string): Promise<EventGuests | undefined>;
-  /** Replace an event's guests with these, each as given. */
+  /**
+   * Replace an event's guests with these, each as given. With `etag`, only
+   * while the event is still that version: `changed`, and nothing written,
+   * when it has changed since.
+   */
   setGuests(
     calendarId: string,
     eventId: string,
     guests: readonly GuestRecord[],
     sendUpdates: SendUpdates,
-  ): Promise<void>;
+    etag?: string,
+  ): Promise<'set' | 'changed'>;
   /** Delete an event; `gone` when it was already deleted or never existed. */
   deleteEvent(calendarId: string, eventId: string, sendUpdates: SendUpdates): Promise<'deleted' | 'gone'>;
 }
@@ -401,27 +413,37 @@ export function createMeetingsCalendarApi(options: GoogleClientOptions): Meeting
     },
 
     async getGuests(calendarId, eventId) {
-      const params = new URLSearchParams({ fields: 'status,organizer(email),attendees' });
+      const params = new URLSearchParams({ fields: 'etag,status,organizer(email),attendees' });
       const payload = await googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, {
         allowNotFound: true,
       });
       if (payload === undefined) return undefined;
       if (!isRecord(payload)) throw new GoogleApiError(502, 'Google Calendar returned an unreadable event');
+      const etag = optionalString(payload.etag);
       const status = optionalString(payload.status);
       const organizer = isRecord(payload.organizer) ? optionalString(payload.organizer.email) : undefined;
       return {
+        ...(etag === undefined ? {} : { etag }),
         ...(status === undefined ? {} : { status }),
         ...(organizer === undefined ? {} : { organizer: organizer.toLowerCase() }),
         guests: Array.isArray(payload.attendees) ? payload.attendees.filter(isRecord) : [],
       };
     },
 
-    async setGuests(calendarId, eventId, guests, sendUpdates) {
+    async setGuests(calendarId, eventId, guests, sendUpdates, etag) {
       const params = new URLSearchParams({ sendUpdates, fields: 'id' });
-      await googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, {
-        method: 'PATCH',
-        body: { attendees: guests },
-      });
+      try {
+        await googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, {
+          method: 'PATCH',
+          body: { attendees: guests },
+          ...(etag === undefined ? {} : { ifMatch: etag }),
+        });
+        return 'set';
+      } catch (error) {
+        // 412 Precondition Failed: the event is no longer the version the list was read from.
+        if (error instanceof GoogleApiError && error.status === 412) return 'changed';
+        throw error;
+      }
     },
 
     async deleteEvent(calendarId, eventId, sendUpdates) {

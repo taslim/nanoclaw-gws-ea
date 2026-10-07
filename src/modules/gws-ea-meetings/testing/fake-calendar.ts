@@ -4,7 +4,9 @@
  * stays under its id as `cancelled`, an id is never issued twice, and a
  * Meet link is created once per request id, as `meetCreation` says it goes.
  * A guest a write gives no answer awaits one, and the calendar's own owner is
- * the organizer, as the live Calendar showed (2026-10-07).
+ * the organizer, as the live Calendar showed (2026-10-07). Every change to
+ * an event gives it a new etag, and a guest-list write over an older one
+ * is refused, as Google refuses it with 412.
  */
 import { GoogleApiError } from '../../gws-ea-inbox/gmail-api.js';
 import type {
@@ -31,6 +33,8 @@ export interface StoredEvent extends CalendarEvent {
   readonly recurrence?: readonly string[];
   /** Each guest whole, as Google holds them, once a test or a guest-list write sets more than `attendees` keeps. */
   readonly guests?: readonly GuestRecord[];
+  /** Its version: every change to it, a test's own `put` included, gives it a new one. */
+  readonly etag?: string;
 }
 
 export interface CalendarWriteRecord {
@@ -133,6 +137,8 @@ export class FakeCalendar implements MeetingsCalendarApi {
   /** How Google's creation of a Meet link a write asks for goes. */
   meetCreation: EventConference['status'] = 'success';
   private injected: InjectedFailure[] = [];
+  private afterGuestReads: (() => void)[] = [];
+  private revision = 0;
 
   private call(): void {
     this.calls += 1;
@@ -147,6 +153,21 @@ export class FakeCalendar implements MeetingsCalendarApi {
   private injectedFor(op: WriteOp): InjectedFailure | undefined {
     const index = this.injected.findIndex((failure) => failure.op === op);
     return index < 0 ? undefined : this.injected.splice(index, 1)[0];
+  }
+
+  /**
+   * Run `change` once, right after the next guest-list read takes its copy:
+   * someone else changing the event between that read and the write that
+   * follows it.
+   */
+  changeAfterNextGuestRead(change: () => void): void {
+    this.afterGuestReads.push(change);
+  }
+
+  /** The event at a new version. */
+  private revised(event: StoredEvent): StoredEvent {
+    this.revision += 1;
+    return { ...event, etag: `"${this.revision}"` };
   }
 
   private find(calendarId: string, eventId: string): number {
@@ -167,8 +188,8 @@ export class FakeCalendar implements MeetingsCalendarApi {
 
   put(event: StoredEvent): void {
     const index = this.find(event.calendarId, event.id);
-    if (index >= 0) this.events.splice(index, 1, event);
-    else this.events.push(event);
+    if (index >= 0) this.events.splice(index, 1, this.revised(event));
+    else this.events.push(this.revised(event));
   }
 
   remove(calendarId: string, eventId: string): void {
@@ -202,16 +223,18 @@ export class FakeCalendar implements MeetingsCalendarApi {
       return 'exists' as const;
     }
     this.events.push(
-      apply(
-        {
-          calendarId,
-          id: eventId,
-          iCalUID: `${eventId}@google.com`,
-          status: 'confirmed',
-          organizer: { email: calendarId },
-        },
-        event,
-        this.meetCreation,
+      this.revised(
+        apply(
+          {
+            calendarId,
+            id: eventId,
+            iCalUID: `${eventId}@google.com`,
+            status: 'confirmed',
+            organizer: { email: calendarId },
+          },
+          event,
+          this.meetCreation,
+        ),
       ),
     );
     this.writes.push({ op: 'insert', calendarId, eventId, sendUpdates, fields: event });
@@ -226,7 +249,7 @@ export class FakeCalendar implements MeetingsCalendarApi {
     const index = this.find(calendarId, eventId);
     if (index < 0)
       throw new GoogleApiError(404, `Google refused /calendars/${calendarId}/events/${eventId}: Not Found`);
-    this.events.splice(index, 1, apply(this.events[index], event, this.meetCreation));
+    this.events.splice(index, 1, this.revised(apply(this.events[index], event, this.meetCreation)));
     this.writes.push({ op: 'patch', calendarId, eventId, sendUpdates, fields: event });
     if (failure) throw failure.error;
   }
@@ -235,23 +258,37 @@ export class FakeCalendar implements MeetingsCalendarApi {
     this.call();
     const event = this.event(calendarId, eventId);
     if (!event) return undefined;
-    return {
+    const read: EventGuests = {
+      ...(event.etag === undefined ? {} : { etag: event.etag }),
       ...(event.status === undefined ? {} : { status: event.status }),
       ...(event.organizer?.email === undefined ? {} : { organizer: event.organizer.email.toLowerCase() }),
       guests: event.guests ?? (event.attendees ?? []).map((guest) => ({ ...guest })),
     };
+    this.afterGuestReads.shift()?.();
+    return read;
   }
 
-  async setGuests(calendarId: string, eventId: string, guests: readonly GuestRecord[], sendUpdates: SendUpdates) {
+  async setGuests(
+    calendarId: string,
+    eventId: string,
+    guests: readonly GuestRecord[],
+    sendUpdates: SendUpdates,
+    etag?: string,
+  ) {
     this.call();
     const failure = this.injectedFor('guests');
     if (failure && !failure.afterApplying) throw failure.error;
     const index = this.find(calendarId, eventId);
     if (index < 0)
       throw new GoogleApiError(404, `Google refused /calendars/${calendarId}/events/${eventId}: Not Found`);
-    this.events.splice(index, 1, withGuests(this.events[index], guests));
+    if (etag !== undefined && etag !== this.events[index].etag) {
+      if (failure) throw failure.error;
+      return 'changed' as const;
+    }
+    this.events.splice(index, 1, this.revised(withGuests(this.events[index], guests)));
     this.writes.push({ op: 'guests', calendarId, eventId, sendUpdates, guests });
     if (failure) throw failure.error;
+    return 'set' as const;
   }
 
   async deleteEvent(calendarId: string, eventId: string, sendUpdates: SendUpdates) {
@@ -263,7 +300,7 @@ export class FakeCalendar implements MeetingsCalendarApi {
       if (failure) throw failure.error;
       return 'gone' as const;
     }
-    this.events.splice(index, 1, { ...this.events[index], status: 'cancelled' });
+    this.events.splice(index, 1, this.revised({ ...this.events[index], status: 'cancelled' }));
     this.writes.push({ op: 'delete', calendarId, eventId, sendUpdates });
     if (failure) throw failure.error;
     return 'deleted' as const;
@@ -281,8 +318,8 @@ export function delegatingCalendarApi(current: () => MeetingsCalendarApi): Meeti
     patchEvent: (calendarId, eventId, event, sendUpdates) =>
       current().patchEvent(calendarId, eventId, event, sendUpdates),
     getGuests: (calendarId, eventId) => current().getGuests(calendarId, eventId),
-    setGuests: (calendarId, eventId, guests, sendUpdates) =>
-      current().setGuests(calendarId, eventId, guests, sendUpdates),
+    setGuests: (calendarId, eventId, guests, sendUpdates, etag) =>
+      current().setGuests(calendarId, eventId, guests, sendUpdates, etag),
     deleteEvent: (calendarId, eventId, sendUpdates) => current().deleteEvent(calendarId, eventId, sendUpdates),
   };
 }

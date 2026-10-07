@@ -13,14 +13,17 @@
  *   assistant change, and `change_guests` only to an event that calendar
  *   organizes: what someone else organizes changes through them.
  * - On every event either writes, the principal is a guest, accepted, as
- *   Google lists the organizer of an event they made themselves; they never
- *   come off it.
+ *   Google lists the organizer of an event they made themselves, unless
+ *   they have answered it otherwise themselves; they never come off it.
  * - `change_guests` writes each guest it keeps back exactly as Google holds
- *   them, so nobody else's answer or note changes.
+ *   them, so nobody else's answer or note changes, and only over the version
+ *   of the event it read: a change that lands in between is read again and
+ *   kept. A room booked on the event stays on it, and is never named a guest.
  * - Neither emails anyone, as `gog` emails no one unless told to.
  *
  * Each request is answered once. A replayed `create_event` finds the event
- * it made, whose id derives from the request.
+ * it made, whose id derives from the request, and adds nothing when that
+ * event has since been deleted.
  */
 import { TIMEZONE } from '../../config.js';
 import { forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-action.js';
@@ -41,6 +44,8 @@ const RECURRENCE_LINE_MAX = 500;
 const MAX_EVENT_DAYS = 366;
 /** Google's longest calendar id is an address. */
 const CALENDAR_ID_MAX = 254;
+/** How many times `change_guests` reads and writes a guest list that keeps changing under it before it gives up. */
+const GUEST_WRITE_ATTEMPTS = 3;
 const DAY = 24 * 60 * 60 * 1000;
 
 const DATE = /^\d{4}-\d{2}-\d{2}$/u;
@@ -108,6 +113,79 @@ function are(addresses: readonly string[]): string {
 /** An all-day span, its days at UTC midnight, as people say it: "Monday 12 Oct", or "Monday 12 Oct to Tuesday 13 Oct". */
 function daysLabel(first: number, last: number): string {
   return first === last ? dayLabel(first, 'UTC') : `${dayLabel(first, 'UTC')} to ${dayLabel(last, 'UTC')}`;
+}
+
+/** An answer a guest gave an event; `needsAction`, or none, is no answer yet. */
+type Answer = 'accepted' | 'declined' | 'tentative';
+
+function answerOf(guest: GuestRecord | undefined): Answer | undefined {
+  const status = guest?.responseStatus;
+  return status === 'accepted' || status === 'declined' || status === 'tentative' ? status : undefined;
+}
+
+/** The principal on an event's guest list, as the end of a sentence naming its other guests. */
+const PRINCIPAL_WORDS: Readonly<Record<Answer, string>> = {
+  accepted: 'and the principal, accepted',
+  declined: 'and the principal, who declined it',
+  tentative: 'and the principal, who answered maybe',
+};
+
+/** What `change_guests` makes of an event's guest list as Google holds it. */
+interface GuestChange {
+  /** The list to write back, or undefined when it already says what was asked. */
+  readonly next: readonly GuestRecord[] | undefined;
+  /** Who the event invites afterwards: neither the principal nor a room. */
+  readonly invited: readonly string[];
+  /** The principal's answer afterwards. */
+  readonly answer: Answer;
+  /** Addresses to take off that the list does not have. */
+  readonly absent: readonly string[];
+  /** Addresses to invite that it already has. */
+  readonly already: readonly string[];
+}
+
+/**
+ * The guest list `change_guests` writes on an event of the principal's
+ * calendar `calendarId`, worked out afresh from each read of it: everyone
+ * kept exactly as Google holds them, those named in `remove` taken off
+ * (never the principal, refused before this), those in `add` appended, and
+ * the principal on it. Whatever the principal answered stays theirs; only
+ * when they have no answer yet do they count as accepted, as the organizer
+ * of an event they made themselves.
+ */
+function guestChange(
+  calendarId: string,
+  guests: readonly GuestRecord[],
+  add: readonly string[],
+  remove: readonly string[],
+): GuestChange {
+  const owner = calendarId.toLowerCase();
+  const isOwner = (guest: GuestRecord): boolean => emailOf(guest) === owner;
+  const listed = new Set(guests.flatMap((guest) => emailOf(guest) ?? []));
+  const adding = add.filter((address) => address !== owner && !listed.has(address));
+  const ownerEntry = guests.find(isOwner);
+  const answered = answerOf(ownerEntry);
+
+  const kept = guests
+    .filter((guest) => !remove.includes(emailOf(guest) ?? ''))
+    .map((guest) => (isOwner(guest) && answered === undefined ? { ...guest, responseStatus: 'accepted' } : guest));
+  const next: GuestRecord[] = [
+    ...(ownerEntry === undefined ? [{ email: calendarId, responseStatus: 'accepted' }] : []),
+    ...kept,
+    ...adding.map((email) => ({ email })),
+  ];
+  const unchanged = adding.length === 0 && kept.length === guests.length && answered !== undefined;
+  return {
+    next: unchanged ? undefined : next,
+    // A room booked on the event stays on it as it is, but is no one invited.
+    invited: next.flatMap((guest) => {
+      const email = emailOf(guest);
+      return email === undefined || email === owner || guest.resource === true ? [] : [email];
+    }),
+    answer: answered ?? 'accepted',
+    absent: remove.filter((address) => !listed.has(address)),
+    already: add.filter((address) => address !== owner && listed.has(address)),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -178,7 +256,7 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       throw forbidden('That calendar does not allow Google Meet links: give the place in location instead.');
     }
     const eventId = eventIdFor('event', requestId);
-    await calendar().insertEvent(
+    const inserted = await calendar().insertEvent(
       entry.id,
       eventId,
       {
@@ -197,6 +275,16 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       },
       'none',
     );
+    if (inserted === 'exists') {
+      // A replay: this request made the event before. It stands unless someone has deleted it since,
+      // and an event deleted is not put back.
+      const made = await calendar().getEvent(entry.id, eventId);
+      if (made === undefined || made.status === 'cancelled') {
+        throw forbidden(
+          'The event this request made earlier has since been deleted from that calendar, so nothing was added.',
+        );
+      }
+    }
     recordOwnCalendarChange(entry.id, eventId);
     const conference = videoCall ? await readConference(calendar(), entry.id, eventId) : undefined;
     const invited = guests.filter((address) => address !== entry.id.toLowerCase());
@@ -227,57 +315,44 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
     const owner = entry.id.toLowerCase();
     if (remove.includes(owner)) throw forbidden('The principal stays on their own events: they organize them.');
 
-    const current = await calendar().getGuests(entry.id, eventId);
-    if (current === undefined || current.status === 'cancelled') {
-      throw forbidden(`No event ${eventId} on that calendar.`);
-    }
-    if (current.organizer !== owner) {
-      throw forbidden(
-        `${current.organizer ?? 'Someone else'} organizes that event: only they change who it invites. Ask them, through external-email when they are outside.`,
-      );
-    }
+    // The list is written back only over the version of the event it was
+    // read from, so a guest's answer, or anyone's change, that lands in
+    // between is read again and kept rather than undone.
+    for (let attempt = 0; attempt < GUEST_WRITE_ATTEMPTS; attempt += 1) {
+      const current = await calendar().getGuests(entry.id, eventId);
+      if (current === undefined || current.status === 'cancelled') {
+        throw forbidden(`No event ${eventId} on that calendar.`);
+      }
+      if (current.organizer !== owner) {
+        throw forbidden(
+          `${current.organizer ?? 'Someone else'} organizes that event: only they change who it invites. Ask them, through external-email when they are outside.`,
+        );
+      }
 
-    const isOwner = (guest: GuestRecord): boolean => emailOf(guest) === owner;
-    const listed = new Set(current.guests.flatMap((guest) => emailOf(guest) ?? []));
-    const absent = remove.filter((address) => !listed.has(address));
-    const already = add.filter((address) => address !== owner && listed.has(address));
-    const adding = add.filter((address) => address !== owner && !listed.has(address));
-    const ownerEntry = current.guests.find(isOwner);
-    const ownerAccepted = ownerEntry !== undefined && ownerEntry.responseStatus === 'accepted';
-
-    const kept = current.guests
-      .filter((guest) => !remove.includes(emailOf(guest) ?? ''))
-      .map((guest) => (isOwner(guest) && !ownerAccepted ? { ...guest, responseStatus: 'accepted' } : guest));
-    const next: GuestRecord[] = [
-      ...(ownerEntry === undefined ? [{ email: entry.id, responseStatus: 'accepted' }] : []),
-      ...kept,
-      ...adding.map((email) => ({ email })),
-    ];
-    const invited = next.flatMap((guest) => {
-      const email = emailOf(guest);
-      return email === undefined || email === owner ? [] : [email];
-    });
-
-    if (next.length === current.guests.length && ownerAccepted && adding.length === 0) {
-      return {
-        calendar: entry.id,
-        event: eventId,
-        guests: invited,
-        message: `Nothing changed: ${[
-          ...(absent.length === 0 ? [] : [`${are(absent)} not invited`]),
-          ...(already.length === 0 ? [] : [`${are(already)} already invited`]),
-          'the principal is already on it',
-        ].join('; ')}.`,
-      };
+      const { next, invited, answer, absent, already } = guestChange(entry.id, current.guests, add, remove);
+      if (next === undefined) {
+        return {
+          calendar: entry.id,
+          event: eventId,
+          guests: invited,
+          message: `Nothing changed: ${[
+            ...(absent.length === 0 ? [] : [`${are(absent)} not invited`]),
+            ...(already.length === 0 ? [] : [`${are(already)} already invited`]),
+            'the principal is already on it',
+          ].join('; ')}.`,
+        };
+      }
+      if ((await calendar().setGuests(entry.id, eventId, next, 'none', current.etag)) === 'set') {
+        recordOwnCalendarChange(entry.id, eventId);
+        return {
+          calendar: entry.id,
+          event: eventId,
+          guests: invited,
+          message: `Its guests now: ${invited.length === 0 ? 'nobody else' : LIST.format(invited)}, ${PRINCIPAL_WORDS[answer]}. Google emailed no one.`,
+        };
+      }
     }
-    await calendar().setGuests(entry.id, eventId, next, 'none');
-    recordOwnCalendarChange(entry.id, eventId);
-    return {
-      calendar: entry.id,
-      event: eventId,
-      guests: invited,
-      message: `Its guests now: ${invited.length === 0 ? 'nobody else' : LIST.format(invited)}, and the principal, accepted. Google emailed no one.`,
-    };
+    throw forbidden("The event's guests kept changing while this ran: try again in a moment.");
   };
 
   return { createEvent, changeGuests };

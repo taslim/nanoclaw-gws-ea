@@ -244,7 +244,7 @@ describe('the Calendar client', () => {
     });
   });
 
-  it("reads an event's guests whole with its organizer, and writes a guest list back as given", async () => {
+  it("reads an event's guests whole with its organizer and version, and writes a guest list back as given over that version", async () => {
     const guests = [
       { email: 'pat@principal.example', responseStatus: 'accepted', organizer: true, self: true },
       { email: 'sam@acme.example', responseStatus: 'accepted', comment: 'Running late', optional: true },
@@ -253,24 +253,57 @@ describe('the Calendar client', () => {
       request.method === 'GET'
         ? {
             status: 200,
-            body: { status: 'confirmed', organizer: { email: 'Pat@Principal.example' }, attendees: guests },
+            body: {
+              etag: '"3462538740420000"',
+              status: 'confirmed',
+              organizer: { email: 'Pat@Principal.example' },
+              attendees: guests,
+            },
           }
         : { status: 200, body: { id: 'evt-1' } },
     );
     expect(await api.getGuests('pat@principal.example', 'evt-1')).toEqual({
+      etag: '"3462538740420000"',
       status: 'confirmed',
       organizer: 'pat@principal.example',
       guests,
     });
-    expect(requests[0].url.searchParams.get('fields')).toBe('status,organizer(email),attendees');
+    expect(requests[0].url.searchParams.get('fields')).toBe('etag,status,organizer(email),attendees');
 
-    await api.setGuests('pat@principal.example', 'evt-1', [...guests, { email: 'kim@acme.example' }], 'none');
+    expect(
+      await api.setGuests(
+        'pat@principal.example',
+        'evt-1',
+        [...guests, { email: 'kim@acme.example' }],
+        'none',
+        '"3462538740420000"',
+      ),
+    ).toBe('set');
     expect(requests[1]).toMatchObject({
       method: 'PATCH',
       body: { attendees: [...guests, { email: 'kim@acme.example' }] },
     });
+    expect(requests[1].headers['if-match']).toBe('"3462538740420000"');
     expect(requests[1].url.pathname).toBe('/calendar/v3/calendars/pat%40principal.example/events/evt-1');
     expect(Object.fromEntries(requests[1].url.searchParams)).toEqual({ sendUpdates: 'none', fields: 'id' });
+  });
+
+  it('reads a guest-list write Google refuses because the event changed since its version as changed, and throws any other refusal', async () => {
+    const statuses = [412, 403];
+    const { api, requests } = stubGoogle(() => ({
+      status: statuses.shift() ?? 500,
+      body: { error: { message: 'Precondition Failed' } },
+    }));
+    const guests = [{ email: 'pat@principal.example', responseStatus: 'accepted' }];
+    expect(await api.setGuests('pat@principal.example', 'evt-1', guests, 'none', '"1"')).toBe('changed');
+    await expect(api.setGuests('pat@principal.example', 'evt-1', guests, 'none', '"1"')).rejects.toMatchObject({
+      status: 403,
+    });
+    // A write given no version asks for none.
+    await expect(api.setGuests('pat@principal.example', 'evt-1', guests, 'none')).rejects.toMatchObject({
+      status: 500,
+    });
+    expect(requests[2].headers).not.toHaveProperty('if-match');
   });
 
   it('reads an event that is not there as undefined when its guests are asked for', async () => {

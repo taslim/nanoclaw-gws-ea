@@ -52,7 +52,7 @@ export const createEvent = requestTool({
 export const changeGuests = requestTool({
   name: 'change_guests',
   description:
-    "Invite people to an event the principal organizes, or take them off it. Everyone else's answer stays as it was, and the principal stays on it, accepted. Google emails no one.",
+    "Invite people to an event the principal organizes, or take them off it. Everyone's answer stays as it was, and the principal stays on it: accepted, unless they answered otherwise. Google emails no one.",
   properties: {
     calendar: CALENDAR,
     event: {
