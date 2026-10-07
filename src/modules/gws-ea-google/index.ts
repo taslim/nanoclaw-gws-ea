@@ -33,7 +33,8 @@ import { createGoogleTokenRefresher, GATEWAY_TOKEN_PLACEHOLDER, type GoogleToken
 const TICK_MS = 60_000;
 
 const CAPABILITY_DESCRIPTIONS: Readonly<Record<AgentGoogleServiceId, string>> = {
-  calendar: "Google Calendar as the assistant: the gcalendar skill and the assistant's Calendar token",
+  calendar:
+    "Google Calendar as the assistant: the gcalendar skill, the assistant's Calendar token, and create_event and change_guests",
   'gmail-read': "the assistant's Gmail, read-only: the gmail skill and a gmail.readonly token",
   directory: 'the Workspace directory, read-only: the gpeople skill and a directory.readonly token',
 };
@@ -45,7 +46,8 @@ const CAPABILITY_DESCRIPTIONS: Readonly<Record<AgentGoogleServiceId, string>> = 
  * principal's calendars and answers their invitations itself (Key
  * Decisions), reads mail without changing it, and only searches the
  * directory. Overlaps go through `find_conflicts`, so `calendar.conflicts` is
- * off.
+ * off. gog cannot list the principal as an accepted guest, so events are
+ * created through the host's `create_event` and `calendar.create` is off.
  */
 const GOG_COMMANDS: Readonly<Record<AgentGoogleServiceId, readonly string[]>> = {
   calendar: [
@@ -55,7 +57,6 @@ const GOG_COMMANDS: Readonly<Record<AgentGoogleServiceId, readonly string[]>> = 
     'calendar.events',
     'calendar.event',
     'calendar.freebusy',
-    'calendar.create',
     'calendar.update',
     'calendar.delete',
     'calendar.respond',
