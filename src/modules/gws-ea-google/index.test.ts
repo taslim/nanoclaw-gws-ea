@@ -27,7 +27,6 @@ const GOG_COMMANDS: Readonly<Record<AgentGoogleServiceId, readonly string[]>> = 
     'calendar.events',
     'calendar.event',
     'calendar.freebusy',
-    'calendar.create',
     'calendar.update',
     'calendar.delete',
     'calendar.respond',
@@ -38,7 +37,7 @@ const GOG_COMMANDS: Readonly<Record<AgentGoogleServiceId, readonly string[]>> = 
 
 /** What each Google Calendar rule must keep saying; agents in every group rely on them. */
 const REQUIRED_CALENDAR_RULES = [
-  'Use the `gog` command, through Bash, for everything you do in Google Calendar.',
+  'Use the `gog` command, through Bash, for everything you do in Google Calendar but two: create an event with the `create_event` tool, and change who an event invites with `change_guests`.',
   'never run `gog auth`',
   "A calendar is the principal's when its ID is one of the principal's addresses (their primary calendar) or its `dataOwner` is one of those addresses.",
   'Treat every other calendar as someone else',

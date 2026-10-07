@@ -224,7 +224,8 @@ export function expandCalendarRef(reference: string): string {
   return `${reference.slice(0, at)}@${CALENDAR_DOMAIN_SHORTHAND[domain] ?? domain}`.toLowerCase();
 }
 
-const EVENT_ID = /^[A-Za-z0-9_-]{1,1024}$/u;
+/** Google's event ids: base32hex, with an occurrence's suffix after an underscore. */
+export const EVENT_ID = /^[A-Za-z0-9_-]{1,1024}$/u;
 
 function decodeEid(eid: string): { readonly eventId: string; readonly calendarId: string } | undefined {
   const decoded = Buffer.from(eid, 'base64url').toString('utf8');

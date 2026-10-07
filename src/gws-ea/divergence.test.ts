@@ -822,7 +822,6 @@ describe('recorded divergence: the agent image carries the pinned Google tool', 
     expect(commands).toEqual(
       expect.arrayContaining([
         'calendar.events',
-        'calendar.create',
         'calendar.update',
         'calendar.delete',
         'calendar.respond',
@@ -831,7 +830,13 @@ describe('recorded divergence: the agent image carries the pinned Google tool', 
         'people.search',
       ]),
     );
-    for (const off of ['calendar.conflicts', 'gmail.send', 'gmail.thread.modify', 'gmail.drafts.create']) {
+    for (const off of [
+      'calendar.conflicts',
+      'calendar.create',
+      'gmail.send',
+      'gmail.thread.modify',
+      'gmail.drafts.create',
+    ]) {
       expect(commands).not.toContain(off);
     }
     expect(main).toMatchObject({ GOG_ACCESS_TOKEN: 'gateway-managed', GOG_GMAIL_NO_SEND: '1' });

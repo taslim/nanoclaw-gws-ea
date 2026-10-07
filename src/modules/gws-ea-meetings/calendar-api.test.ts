@@ -38,13 +38,13 @@ const WRITE = {
   start: '2026-10-07T09:00:00.000Z',
   end: '2026-10-07T09:30:00.000Z',
   timeZone: 'Europe/London',
-  attendees: ['sam@acme.example'],
+  attendees: [{ email: 'pat@principal.example', responseStatus: 'accepted' as const }, { email: 'sam@acme.example' }],
   tags: { gwsEaThread: 'mail-1', gwsEaRole: 'booking' },
   reminders: 'default' as const,
 };
 
 describe('the Calendar client', () => {
-  it('creates an event with its own id, its tags, and the invitations asked for, asking for nothing back but the id', async () => {
+  it('creates an event with its own id, its tags, and its guests with the answers given, asking for nothing back but the id', async () => {
     const { api, requests } = stubGoogle(() => ({ status: 200, body: { id: 'abc123' } }));
     expect(await api.insertEvent('pat@principal.example', 'abc123', WRITE, 'all')).toBe('created');
     const [request] = requests;
@@ -59,7 +59,7 @@ describe('the Calendar client', () => {
       description: 'We will walk through the pilot plan.',
       start: { dateTime: '2026-10-07T09:00:00.000Z', timeZone: 'Europe/London' },
       end: { dateTime: '2026-10-07T09:30:00.000Z', timeZone: 'Europe/London' },
-      attendees: [{ email: 'sam@acme.example' }],
+      attendees: [{ email: 'pat@principal.example', responseStatus: 'accepted' }, { email: 'sam@acme.example' }],
       reminders: { useDefault: true },
       extendedProperties: { private: { gwsEaThread: 'mail-1', gwsEaRole: 'booking' } },
     });
@@ -220,5 +220,94 @@ describe('the Calendar client', () => {
     const fields = requests[0].url.searchParams.get('fields') ?? '';
     expect(fields).toContain('extendedProperties');
     for (const hidden of ['summary', 'description', 'location']) expect(fields).not.toContain(hidden);
+  });
+
+  it('writes an all-day event as dates, and its repetition as given', async () => {
+    const { api, requests } = stubGoogle(() => ({ status: 200, body: { id: 'off1' } }));
+    await api.insertEvent(
+      'pat@principal.example',
+      'off1',
+      {
+        summary: 'Offsite',
+        start: '2026-10-12',
+        end: '2026-10-14',
+        allDay: true,
+        recurrence: ['RRULE:FREQ=YEARLY'],
+        attendees: [{ email: 'pat@principal.example', responseStatus: 'accepted' }],
+      },
+      'none',
+    );
+    expect(requests[0].body).toMatchObject({
+      start: { date: '2026-10-12' },
+      end: { date: '2026-10-14' },
+      recurrence: ['RRULE:FREQ=YEARLY'],
+    });
+  });
+
+  it("reads an event's guests whole with its organizer and version, and writes a guest list back as given over that version", async () => {
+    const guests = [
+      { email: 'pat@principal.example', responseStatus: 'accepted', organizer: true, self: true },
+      { email: 'sam@acme.example', responseStatus: 'accepted', comment: 'Running late', optional: true },
+    ];
+    const { api, requests } = stubGoogle((request) =>
+      request.method === 'GET'
+        ? {
+            status: 200,
+            body: {
+              etag: '"3462538740420000"',
+              status: 'confirmed',
+              organizer: { email: 'Pat@Principal.example' },
+              attendees: guests,
+            },
+          }
+        : { status: 200, body: { id: 'evt-1' } },
+    );
+    expect(await api.getGuests('pat@principal.example', 'evt-1')).toEqual({
+      etag: '"3462538740420000"',
+      status: 'confirmed',
+      organizer: 'pat@principal.example',
+      guests,
+    });
+    expect(requests[0].url.searchParams.get('fields')).toBe('etag,status,organizer(email),attendees');
+
+    expect(
+      await api.setGuests(
+        'pat@principal.example',
+        'evt-1',
+        [...guests, { email: 'kim@acme.example' }],
+        'none',
+        '"3462538740420000"',
+      ),
+    ).toBe('set');
+    expect(requests[1]).toMatchObject({
+      method: 'PATCH',
+      body: { attendees: [...guests, { email: 'kim@acme.example' }] },
+    });
+    expect(requests[1].headers['if-match']).toBe('"3462538740420000"');
+    expect(requests[1].url.pathname).toBe('/calendar/v3/calendars/pat%40principal.example/events/evt-1');
+    expect(Object.fromEntries(requests[1].url.searchParams)).toEqual({ sendUpdates: 'none', fields: 'id' });
+  });
+
+  it('reads a guest-list write Google refuses because the event changed since its version as changed, and throws any other refusal', async () => {
+    const statuses = [412, 403];
+    const { api, requests } = stubGoogle(() => ({
+      status: statuses.shift() ?? 500,
+      body: { error: { message: 'Precondition Failed' } },
+    }));
+    const guests = [{ email: 'pat@principal.example', responseStatus: 'accepted' }];
+    expect(await api.setGuests('pat@principal.example', 'evt-1', guests, 'none', '"1"')).toBe('changed');
+    await expect(api.setGuests('pat@principal.example', 'evt-1', guests, 'none', '"1"')).rejects.toMatchObject({
+      status: 403,
+    });
+    // A write given no version asks for none.
+    await expect(api.setGuests('pat@principal.example', 'evt-1', guests, 'none')).rejects.toMatchObject({
+      status: 500,
+    });
+    expect(requests[2].headers).not.toHaveProperty('if-match');
+  });
+
+  it('reads an event that is not there as undefined when its guests are asked for', async () => {
+    const { api } = stubGoogle(() => ({ status: 404, body: { error: { message: 'Not Found' } } }));
+    expect(await api.getGuests('pat@principal.example', 'missing')).toBeUndefined();
   });
 });

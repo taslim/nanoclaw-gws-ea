@@ -30,6 +30,8 @@
  *   what it writes.
  * - `hold`, `book` and `change_booking` refuse a time inside protected time,
  *   so a counterpart's proposal never gets round it.
+ * - Every hold and booking lists the principal as an accepted guest, its
+ *   organizer (`guestsOn`); who a booking invites never counts them.
  * - `main` hears in one fact when a booking is made, changed or cancelled.
  *
  * Holds and bookings go on the calendar `main` named for the thread, else on
@@ -47,13 +49,11 @@
 import { TIMEZONE } from '../../config.js';
 import { forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-action.js';
 import { resolveGroupTimezone } from '../../container-config.js';
-import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
-import { formatLocalTime, isValidTimezone } from '../../timezone.js';
+import { formatLocalTime } from '../../timezone.js';
 import type { Session } from '../../types.js';
 import { isPrincipalCalendar, recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import { listPrincipalCalendars } from '../gws-ea-inbox/db.js';
-import { normalizeAddress } from '../gws-ea-inbox/mime.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { threadAddresses } from '../gws-ea-inbox/thread-map.js';
 import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
@@ -61,14 +61,17 @@ import { getSchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
 import { audienceForAddresses, checkOutbound } from '../gws-ea-privacy/index.js';
 import { getGwsEaProfile, getMainAgentGroupId, listPrincipalAddresses } from '../gws-ea-profile/db.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
+import { allowsMeet, type CalendarEntry, type EventWrite, type MeetingsCalendarApi } from './calendar-api.js';
 import {
-  allowsMeet,
-  type CalendarEntry,
-  type EventConference,
-  type EventWrite,
-  type MeetingsCalendarApi,
-} from './calendar-api.js';
-import { ensureEvent, eventIdFor, readConference, slotLabel, TAG_ROLE } from './calendar-actions.js';
+  conferenceWords,
+  ensureEvent,
+  eventIdFor,
+  guestsOn,
+  readConference,
+  slotLabel,
+  TAG_ROLE,
+} from './calendar-actions.js';
+import { addressesOf, flagOf, instantOf, lineOf, notesOf, timezoneOf } from './fields.js';
 import {
   blocksTime,
   eventSpan,
@@ -121,22 +124,12 @@ const DAY = 24 * 60 * MINUTE;
 /** People named in prose: "a, b, and c". */
 const LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
 
-const DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/iu;
 /** A booking's id, as `book` answered with it: its event's id, lowercase hex. */
 const BOOKING_ID = /^[0-9a-f]{64}$/u;
 
 // ---------------------------------------------------------------------------
 // The request's fields
 // ---------------------------------------------------------------------------
-
-function instantOf(value: unknown, label: string): number {
-  if (typeof value !== 'string' || !DATE_TIME.test(value)) {
-    throw invalidArgs(`${label} must be a date and time with its UTC offset, such as 2026-10-07T09:00:00-04:00`);
-  }
-  const at = Date.parse(value);
-  if (!Number.isFinite(at)) throw invalidArgs(`${label} is not a real date and time: ${value}`);
-  return at;
-}
 
 function minutesOf(value: unknown): number {
   if (typeof value !== 'number' || !Number.isInteger(value) || value < MIN_MINUTES || value > MAX_MINUTES) {
@@ -145,63 +138,11 @@ function minutesOf(value: unknown): number {
   return value;
 }
 
-function timezoneOf(value: unknown): string | undefined {
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== 'string' || !isValidTimezone(value)) {
-    throw invalidArgs('timezone must be an IANA time zone, such as America/New_York');
-  }
-  return value;
-}
-
-/** One line of text, its whitespace collapsed; undefined when absent and not required. */
-function lineOf(value: unknown, label: string, max: number): string | undefined {
-  if (value === undefined || value === null) return undefined;
-  const line = typeof value === 'string' ? value.replace(/\s+/gu, ' ').trim() : '';
-  if (line === '' || line.length > max || hasControlCharacters(line)) {
-    throw invalidArgs(`${label} must be text of 1 to ${max} characters`);
-  }
-  return line;
-}
-
-/** Notes as written: line breaks kept, nothing else unprintable. */
-function notesOf(value: unknown): string | undefined {
-  if (value === undefined || value === null) return undefined;
-  const notes = typeof value === 'string' ? value.replace(/\r\n?/gu, '\n').trim() : '';
-  if (notes === '' || notes.length > NOTES_MAX || hasControlCharacters(notes.replace(/[\n\t]/gu, ' '))) {
-    throw invalidArgs(`notes must be text of 1 to ${NOTES_MAX} characters`);
-  }
-  return notes;
-}
-
-function videoCallOf(value: unknown): boolean {
-  if (value === undefined || value === null) return false;
-  if (typeof value !== 'boolean') throw invalidArgs('video_call must be true or false');
-  return value;
-}
-
 function bookingIdOf(value: unknown): string {
   if (typeof value !== 'string' || !BOOKING_ID.test(value)) {
     throw invalidArgs('booking must be the booking id book answered with');
   }
   return value;
-}
-
-/** The addresses given, each normalized; undefined when absent. */
-function addressesOf(value: unknown): string[] | undefined {
-  if (value === undefined || value === null) return undefined;
-  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_INVITEES) {
-    throw invalidArgs(`invitees must list 1 to ${MAX_INVITEES} email addresses`);
-  }
-  return [
-    ...new Set(
-      value.map((entry: unknown) => {
-        const address = typeof entry === 'string' ? normalizeAddress(entry) : undefined;
-        if (address === undefined)
-          throw invalidArgs(`invitees must list email addresses; ${JSON.stringify(entry)} is not one`);
-        return address;
-      }),
-    ),
-  ];
 }
 
 function spanAt(start: number, minutes: number): Span {
@@ -528,25 +469,6 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     /* eslint-enable no-catch-all/no-catch-all */
   }
 
-  /** What a Meet link on a booking means for the one who booked it. */
-  function conferenceWords(conference: EventConference | undefined): string {
-    if (conference === undefined) return '';
-    switch (conference.status) {
-      case 'success':
-        return conference.uri === undefined
-          ? ', with a Google Meet link'
-          : `, with a Google Meet link (${conference.uri})`;
-      case 'pending':
-        return '; Google is still creating its Meet link, which appears on the invitation shortly';
-      case 'failure':
-        return '; Google could not create a Meet link, so tell them the place another way';
-      default: {
-        const unreachable: never = conference.status;
-        throw new Error(`Unknown conference status ${String(unreachable)}`);
-      }
-    }
-  }
-
   // -------------------------------------------------------------------------
   // The tools
   // -------------------------------------------------------------------------
@@ -650,7 +572,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
           start: iso(span.start),
           end: iso(span.end),
           timeZone: timezone,
-          attendees: [],
+          attendees: guestsOn(bookingCalendar.id, []),
           visibility: 'private',
           transparency: 'opaque',
           reminders: 'none',
@@ -685,7 +607,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     // Unnamed, the invitees are the people in the conversation: not someone only mentioned in it.
     const inConversation = new Set(addresses.flatMap((entry) => (entry.source === 'written' ? [] : [entry.address])));
     const assistant = await assistantAddresses();
-    const named = addressesOf(value);
+    const named = addressesOf(value, 'invitees', MAX_INVITEES);
     const stranger = named?.find((address) => !onThread.has(address));
     if (stranger !== undefined) {
       throw forbidden(
@@ -788,7 +710,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
           start: iso(wanted.span.start),
           end: iso(wanted.span.end),
           timeZone: view.principal.timezone,
-          attendees: wanted.invitees,
+          attendees: guestsOn(bookingCalendar.id, wanted.invitees),
           reminders: 'default',
           tags: { [TAG_ROLE]: 'booking', [TAG_THREAD]: threadKey },
         },
@@ -822,9 +744,9 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     const minutes = minutesOf(content.minutes);
     const title = lineOf(content.title, 'title', TITLE_MAX);
     if (title === undefined) throw invalidArgs('title is required: it is what the invitees see on their calendars');
-    const notes = notesOf(content.notes);
+    const notes = notesOf(content.notes, NOTES_MAX);
     const location = lineOf(content.location, 'location', LOCATION_MAX);
-    const videoCall = videoCallOf(content.video_call);
+    const videoCall = flagOf(content.video_call, 'video_call');
     const view = await viewOf(session);
     const { timezone } = view.principal;
     const span = spanAt(start, minutes);
@@ -881,8 +803,9 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     }
     const span = eventSpan(event, view.principal.timezone);
     if (!span) throw forbidden('Google reports no readable time for that booking: tell main with tell_main.');
+    // Who it invites: neither a room nor the principal, whose calendar organizes it.
     const invitees = (event.attendees ?? []).flatMap((attendee) =>
-      attendee.resource === true || attendee.email === undefined ? [] : [attendee.email],
+      attendee.resource === true || attendee.organizer === true || attendee.email === undefined ? [] : [attendee.email],
     );
     return { booking, event, span, invitees };
   }
@@ -899,9 +822,9 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     const start = content.start === undefined || content.start === null ? undefined : instantOf(content.start, 'start');
     const minutes = content.minutes === undefined || content.minutes === null ? undefined : minutesOf(content.minutes);
     const title = lineOf(content.title, 'title', TITLE_MAX);
-    const notes = notesOf(content.notes);
+    const notes = notesOf(content.notes, NOTES_MAX);
     const location = lineOf(content.location, 'location', LOCATION_MAX);
-    const videoCall = videoCallOf(content.video_call);
+    const videoCall = flagOf(content.video_call, 'video_call');
     if ([start, minutes, title, notes, location].every((value) => value === undefined) && !videoCall) {
       throw invalidArgs('Give at least one change: start, minutes, title, location, notes, or video_call: true.');
     }
