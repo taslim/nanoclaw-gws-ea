@@ -243,6 +243,18 @@ describe('create_event', () => {
     expect(created.message).toMatch(/with a Google Meet link \(https:\/\/meet\.google\.com\//u);
   });
 
+  it('names both days of a timed event that ends on a later day', async () => {
+    const created = data(
+      await send(main, 'create_event', {
+        calendar: PRINCIPAL,
+        title: 'Board offsite',
+        start: '2026-10-08T09:00:00-07:00',
+        end: '2026-10-10T17:00:00-07:00',
+      }),
+    );
+    expect(created.message).toMatch(/: Thursday 8 Oct, 09:00 PDT to Saturday 10 Oct, 17:00 PDT\./u);
+  });
+
   it('makes an all-day event from its first day to its last', async () => {
     const created = data(
       await send(main, 'create_event', {

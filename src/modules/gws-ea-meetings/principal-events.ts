@@ -31,7 +31,15 @@ import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { EVENT_ID, isPrincipalCalendar, recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import { getGwsEaProfile, listPrincipalAddresses } from '../gws-ea-profile/db.js';
 import { allowsMeet, type CalendarEntry, type GuestRecord, type MeetingsCalendarApi } from './calendar-api.js';
-import { conferenceWords, dayLabel, eventIdFor, guestsOn, readConference, slotLabel } from './calendar-actions.js';
+import {
+  conferenceWords,
+  dayLabel,
+  eventIdFor,
+  guestsOn,
+  momentLabel,
+  readConference,
+  slotLabel,
+} from './calendar-actions.js';
 import { addressesOf, flagOf, instantOf, lineOf, notesOf, timezoneOf } from './fields.js';
 
 const TITLE_MAX = 200;
@@ -248,7 +256,11 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       if (to - from > MAX_EVENT_DAYS * DAY) throw invalidArgs(`An event may last at most ${MAX_EVENT_DAYS} days`);
       start = new Date(from).toISOString();
       end = new Date(to).toISOString();
-      when = slotLabel({ start: from, end: to }, timezone);
+      // An event that ends on a later day names both days, not only the one it starts on.
+      when =
+        dayLabel(from, timezone) === dayLabel(to - 1, timezone)
+          ? slotLabel({ start: from, end: to }, timezone)
+          : `${momentLabel(from, timezone)} to ${momentLabel(to, timezone)}`;
     }
 
     const entry = await principalCalendarOf(calendarId);
