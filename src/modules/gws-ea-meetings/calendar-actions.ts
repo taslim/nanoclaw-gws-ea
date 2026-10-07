@@ -143,6 +143,25 @@ export async function readConference(
   /* eslint-enable no-catch-all/no-catch-all */
 }
 
+/** What a Meet link on an event means for the agent that asked for it, as words that follow its time. */
+export function conferenceWords(conference: EventConference | undefined): string {
+  if (conference === undefined) return '';
+  switch (conference.status) {
+    case 'success':
+      return conference.uri === undefined
+        ? ', with a Google Meet link'
+        : `, with a Google Meet link (${conference.uri})`;
+    case 'pending':
+      return '; Google is still creating its Meet link, which appears on the invitation shortly';
+    case 'failure':
+      return '; Google could not create a Meet link, so tell them the place another way';
+    default: {
+      const unreachable: never = conference.status;
+      throw new Error(`Unknown conference status ${String(unreachable)}`);
+    }
+  }
+}
+
 /**
  * A slot as people write it, in `timezone`: "Tuesday 6 Oct, 10:00–10:30
  * BST", its zone by the short name people know rather than its IANA name.

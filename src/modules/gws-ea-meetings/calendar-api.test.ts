@@ -221,4 +221,60 @@ describe('the Calendar client', () => {
     expect(fields).toContain('extendedProperties');
     for (const hidden of ['summary', 'description', 'location']) expect(fields).not.toContain(hidden);
   });
+
+  it('writes an all-day event as dates, and its repetition as given', async () => {
+    const { api, requests } = stubGoogle(() => ({ status: 200, body: { id: 'off1' } }));
+    await api.insertEvent(
+      'pat@principal.example',
+      'off1',
+      {
+        summary: 'Offsite',
+        start: '2026-10-12',
+        end: '2026-10-14',
+        allDay: true,
+        recurrence: ['RRULE:FREQ=YEARLY'],
+        attendees: [{ email: 'pat@principal.example', responseStatus: 'accepted' }],
+      },
+      'none',
+    );
+    expect(requests[0].body).toMatchObject({
+      start: { date: '2026-10-12' },
+      end: { date: '2026-10-14' },
+      recurrence: ['RRULE:FREQ=YEARLY'],
+    });
+  });
+
+  it("reads an event's guests whole with its organizer, and writes a guest list back as given", async () => {
+    const guests = [
+      { email: 'pat@principal.example', responseStatus: 'accepted', organizer: true, self: true },
+      { email: 'sam@acme.example', responseStatus: 'accepted', comment: 'Running late', optional: true },
+    ];
+    const { api, requests } = stubGoogle((request) =>
+      request.method === 'GET'
+        ? {
+            status: 200,
+            body: { status: 'confirmed', organizer: { email: 'Pat@Principal.example' }, attendees: guests },
+          }
+        : { status: 200, body: { id: 'evt-1' } },
+    );
+    expect(await api.getGuests('pat@principal.example', 'evt-1')).toEqual({
+      status: 'confirmed',
+      organizer: 'pat@principal.example',
+      guests,
+    });
+    expect(requests[0].url.searchParams.get('fields')).toBe('status,organizer(email),attendees');
+
+    await api.setGuests('pat@principal.example', 'evt-1', [...guests, { email: 'kim@acme.example' }], 'none');
+    expect(requests[1]).toMatchObject({
+      method: 'PATCH',
+      body: { attendees: [...guests, { email: 'kim@acme.example' }] },
+    });
+    expect(requests[1].url.pathname).toBe('/calendar/v3/calendars/pat%40principal.example/events/evt-1');
+    expect(Object.fromEntries(requests[1].url.searchParams)).toEqual({ sendUpdates: 'none', fields: 'id' });
+  });
+
+  it('reads an event that is not there as undefined when its guests are asked for', async () => {
+    const { api } = stubGoogle(() => ({ status: 404, body: { error: { message: 'Not Found' } } }));
+    expect(await api.getGuests('pat@principal.example', 'missing')).toBeUndefined();
+  });
 });

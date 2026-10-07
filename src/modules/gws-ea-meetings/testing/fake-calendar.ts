@@ -3,6 +3,8 @@
  * the scheduling tools' tests. It keeps what Google keeps: a deleted event
  * stays under its id as `cancelled`, an id is never issued twice, and a
  * Meet link is created once per request id, as `meetCreation` says it goes.
+ * A guest a write gives no answer awaits one, and the calendar's own owner is
+ * the organizer, as the live Calendar showed (2026-10-07).
  */
 import { GoogleApiError } from '../../gws-ea-inbox/gmail-api.js';
 import type {
@@ -10,7 +12,9 @@ import type {
   CalendarEvent,
   EventAttendee,
   EventConference,
+  EventGuests,
   EventWrite,
+  GuestRecord,
   MeetingsCalendarApi,
   NewEvent,
   SendUpdates,
@@ -24,14 +28,19 @@ export interface StoredEvent extends CalendarEvent {
   readonly location?: string;
   readonly visibility?: string;
   readonly reminders?: 'default' | 'none';
+  readonly recurrence?: readonly string[];
+  /** Each guest whole, as Google holds them, once a test or a guest-list write sets more than `attendees` keeps. */
+  readonly guests?: readonly GuestRecord[];
 }
 
 export interface CalendarWriteRecord {
-  readonly op: 'insert' | 'patch' | 'delete';
+  readonly op: 'insert' | 'patch' | 'guests' | 'delete';
   readonly calendarId: string;
   readonly eventId: string;
   readonly sendUpdates: SendUpdates;
   readonly fields?: EventWrite;
+  /** A guest-list write's guests, as the host sent them. */
+  readonly guests?: readonly GuestRecord[];
 }
 
 type WriteOp = CalendarWriteRecord['op'];
@@ -52,23 +61,41 @@ function overlapsInterval(event: CalendarEvent, min: number, max: number): boole
   return Date.parse(start) - slack < max && Date.parse(end) + slack > min;
 }
 
-/**
- * The guests as Google stores a write's list: each address lowercased, a
- * guest the write gives no answer awaiting one, and the calendar's own owner
- * marked the organizer.
- */
-function guests(calendarId: string, attendees: NonNullable<EventWrite['attendees']>): EventAttendee[] {
-  return attendees.map((guest) => {
-    const email = guest.email.toLowerCase();
-    return {
-      email,
-      responseStatus: guest.responseStatus ?? 'needsAction',
-      ...(email === calendarId.toLowerCase() ? { organizer: true } : {}),
-    };
-  });
+/** A guest as Google stores one a write lists: awaiting an answer unless given one, the calendar's owner its organizer. */
+function stored(calendarId: string, guest: GuestRecord): GuestRecord {
+  const email = typeof guest.email === 'string' ? guest.email.toLowerCase() : undefined;
+  return {
+    ...guest,
+    ...(email === undefined ? {} : { email }),
+    ...(typeof guest.responseStatus === 'string' ? {} : { responseStatus: 'needsAction' }),
+    ...(email === calendarId.toLowerCase() ? { organizer: true } : {}),
+  };
 }
 
-function apply(event: StoredEvent, fields: EventWrite, meet: EventConference['status']): StoredEvent {
+/** A stored guest as an event read shows them. */
+function attendee(guest: GuestRecord): EventAttendee {
+  return {
+    ...(typeof guest.email === 'string' ? { email: guest.email } : {}),
+    ...(typeof guest.responseStatus === 'string' ? { responseStatus: guest.responseStatus } : {}),
+    ...(guest.resource === true ? { resource: true } : {}),
+    ...(guest.organizer === true ? { organizer: true } : {}),
+  };
+}
+
+/** An event with these guests, stored as Google stores them. */
+function withGuests(event: StoredEvent, guests: readonly GuestRecord[]): StoredEvent {
+  const kept = guests.map((guest) => stored(event.calendarId, guest));
+  return { ...event, guests: kept, attendees: kept.map(attendee) };
+}
+
+function apply(written: StoredEvent, fields: EventWrite, meet: EventConference['status']): StoredEvent {
+  const event =
+    fields.attendees === undefined
+      ? written
+      : withGuests(
+          written,
+          fields.attendees.map((guest) => ({ ...guest })),
+        );
   const conference: EventConference | undefined =
     event.conference ??
     (fields.conference === undefined
@@ -83,9 +110,13 @@ function apply(event: StoredEvent, fields: EventWrite, meet: EventConference['st
     ...(fields.description === undefined ? {} : { description: fields.description }),
     ...(fields.location === undefined ? {} : { location: fields.location }),
     ...(conference === undefined ? {} : { conference }),
-    ...(fields.start === undefined ? {} : { start: { dateTime: fields.start } }),
-    ...(fields.end === undefined ? {} : { end: { dateTime: fields.end } }),
-    ...(fields.attendees === undefined ? {} : { attendees: guests(event.calendarId, fields.attendees) }),
+    ...(fields.start === undefined
+      ? {}
+      : { start: fields.allDay === true ? { date: fields.start } : { dateTime: fields.start } }),
+    ...(fields.end === undefined
+      ? {}
+      : { end: fields.allDay === true ? { date: fields.end } : { dateTime: fields.end } }),
+    ...(fields.recurrence === undefined ? {} : { recurrence: [...fields.recurrence] }),
     ...(fields.visibility === undefined ? {} : { visibility: fields.visibility }),
     ...(fields.transparency === undefined ? {} : { transparency: fields.transparency }),
     ...(fields.reminders === undefined ? {} : { reminders: fields.reminders }),
@@ -200,6 +231,29 @@ export class FakeCalendar implements MeetingsCalendarApi {
     if (failure) throw failure.error;
   }
 
+  async getGuests(calendarId: string, eventId: string): Promise<EventGuests | undefined> {
+    this.call();
+    const event = this.event(calendarId, eventId);
+    if (!event) return undefined;
+    return {
+      ...(event.status === undefined ? {} : { status: event.status }),
+      ...(event.organizer?.email === undefined ? {} : { organizer: event.organizer.email.toLowerCase() }),
+      guests: event.guests ?? (event.attendees ?? []).map((guest) => ({ ...guest })),
+    };
+  }
+
+  async setGuests(calendarId: string, eventId: string, guests: readonly GuestRecord[], sendUpdates: SendUpdates) {
+    this.call();
+    const failure = this.injectedFor('guests');
+    if (failure && !failure.afterApplying) throw failure.error;
+    const index = this.find(calendarId, eventId);
+    if (index < 0)
+      throw new GoogleApiError(404, `Google refused /calendars/${calendarId}/events/${eventId}: Not Found`);
+    this.events.splice(index, 1, withGuests(this.events[index], guests));
+    this.writes.push({ op: 'guests', calendarId, eventId, sendUpdates, guests });
+    if (failure) throw failure.error;
+  }
+
   async deleteEvent(calendarId: string, eventId: string, sendUpdates: SendUpdates) {
     this.call();
     const failure = this.injectedFor('delete');
@@ -226,6 +280,9 @@ export function delegatingCalendarApi(current: () => MeetingsCalendarApi): Meeti
       current().insertEvent(calendarId, eventId, event, sendUpdates),
     patchEvent: (calendarId, eventId, event, sendUpdates) =>
       current().patchEvent(calendarId, eventId, event, sendUpdates),
+    getGuests: (calendarId, eventId) => current().getGuests(calendarId, eventId),
+    setGuests: (calendarId, eventId, guests, sendUpdates) =>
+      current().setGuests(calendarId, eventId, guests, sendUpdates),
     deleteEvent: (calendarId, eventId, sendUpdates) => current().deleteEvent(calendarId, eventId, sendUpdates),
   };
 }
