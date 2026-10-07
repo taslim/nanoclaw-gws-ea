@@ -260,8 +260,12 @@ describe('create_event', () => {
     expect(created.message).toMatch(/: Monday 12 Oct to Tuesday 13 Oct, all day\./u);
   });
 
-  it('creates one event for one request, whatever replays it', async () => {
+  it('creates one event for one request, when the host stopped before answering it', async () => {
     const first = data(await send(main, 'create_event', FOCUS, 'act-replayed'));
+    // The event stands on the calendar, but the answer never reached the agent: the request runs again.
+    const inbound = new Database(inboundDbPath(main.agent_group_id, main.id));
+    inbound.prepare('DELETE FROM messages_in WHERE id = ?').run('action-resp-act-replayed');
+    inbound.close();
     const replay = data(await send(main, 'create_event', FOCUS, 'act-replayed'));
     expect(replay.event).toBe(first.event);
     expect(calendar.live(PRINCIPAL)).toHaveLength(1);
