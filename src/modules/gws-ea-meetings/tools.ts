@@ -30,6 +30,8 @@
  *   what it writes.
  * - `hold`, `book` and `change_booking` refuse a time inside protected time,
  *   so a counterpart's proposal never gets round it.
+ * - Every hold and booking lists the principal as an accepted guest, its
+ *   organizer (`guestsOn`); who a booking invites never counts them.
  * - `main` hears in one fact when a booking is made, changed or cancelled.
  *
  * Holds and bookings go on the calendar `main` named for the thread, else on
@@ -68,7 +70,7 @@ import {
   type EventWrite,
   type MeetingsCalendarApi,
 } from './calendar-api.js';
-import { ensureEvent, eventIdFor, readConference, slotLabel, TAG_ROLE } from './calendar-actions.js';
+import { ensureEvent, eventIdFor, guestsOn, readConference, slotLabel, TAG_ROLE } from './calendar-actions.js';
 import {
   blocksTime,
   eventSpan,
@@ -650,7 +652,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
           start: iso(span.start),
           end: iso(span.end),
           timeZone: timezone,
-          attendees: [],
+          attendees: guestsOn(bookingCalendar.id, []),
           visibility: 'private',
           transparency: 'opaque',
           reminders: 'none',
@@ -788,7 +790,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
           start: iso(wanted.span.start),
           end: iso(wanted.span.end),
           timeZone: view.principal.timezone,
-          attendees: wanted.invitees,
+          attendees: guestsOn(bookingCalendar.id, wanted.invitees),
           reminders: 'default',
           tags: { [TAG_ROLE]: 'booking', [TAG_THREAD]: threadKey },
         },
@@ -881,8 +883,9 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     }
     const span = eventSpan(event, view.principal.timezone);
     if (!span) throw forbidden('Google reports no readable time for that booking: tell main with tell_main.');
+    // Who it invites: neither a room nor the principal, whose calendar organizes it.
     const invitees = (event.attendees ?? []).flatMap((attendee) =>
-      attendee.resource === true || attendee.email === undefined ? [] : [attendee.email],
+      attendee.resource === true || attendee.organizer === true || attendee.email === undefined ? [] : [attendee.email],
     );
     return { booking, event, span, invitees };
   }

@@ -38,13 +38,13 @@ const WRITE = {
   start: '2026-10-07T09:00:00.000Z',
   end: '2026-10-07T09:30:00.000Z',
   timeZone: 'Europe/London',
-  attendees: ['sam@acme.example'],
+  attendees: [{ email: 'pat@principal.example', responseStatus: 'accepted' as const }, { email: 'sam@acme.example' }],
   tags: { gwsEaThread: 'mail-1', gwsEaRole: 'booking' },
   reminders: 'default' as const,
 };
 
 describe('the Calendar client', () => {
-  it('creates an event with its own id, its tags, and the invitations asked for, asking for nothing back but the id', async () => {
+  it('creates an event with its own id, its tags, and its guests with the answers given, asking for nothing back but the id', async () => {
     const { api, requests } = stubGoogle(() => ({ status: 200, body: { id: 'abc123' } }));
     expect(await api.insertEvent('pat@principal.example', 'abc123', WRITE, 'all')).toBe('created');
     const [request] = requests;
@@ -59,7 +59,7 @@ describe('the Calendar client', () => {
       description: 'We will walk through the pilot plan.',
       start: { dateTime: '2026-10-07T09:00:00.000Z', timeZone: 'Europe/London' },
       end: { dateTime: '2026-10-07T09:30:00.000Z', timeZone: 'Europe/London' },
-      attendees: [{ email: 'sam@acme.example' }],
+      attendees: [{ email: 'pat@principal.example', responseStatus: 'accepted' }, { email: 'sam@acme.example' }],
       reminders: { useDefault: true },
       extendedProperties: { private: { gwsEaThread: 'mail-1', gwsEaRole: 'booking' } },
     });

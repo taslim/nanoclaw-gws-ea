@@ -8,6 +8,7 @@ import { GoogleApiError } from '../../gws-ea-inbox/gmail-api.js';
 import type {
   CalendarEntry,
   CalendarEvent,
+  EventAttendee,
   EventConference,
   EventWrite,
   MeetingsCalendarApi,
@@ -51,6 +52,22 @@ function overlapsInterval(event: CalendarEvent, min: number, max: number): boole
   return Date.parse(start) - slack < max && Date.parse(end) + slack > min;
 }
 
+/**
+ * The guests as Google stores a write's list: each address lowercased, a
+ * guest the write gives no answer awaiting one, and the calendar's own owner
+ * marked the organizer.
+ */
+function guests(calendarId: string, attendees: NonNullable<EventWrite['attendees']>): EventAttendee[] {
+  return attendees.map((guest) => {
+    const email = guest.email.toLowerCase();
+    return {
+      email,
+      responseStatus: guest.responseStatus ?? 'needsAction',
+      ...(email === calendarId.toLowerCase() ? { organizer: true } : {}),
+    };
+  });
+}
+
 function apply(event: StoredEvent, fields: EventWrite, meet: EventConference['status']): StoredEvent {
   const conference: EventConference | undefined =
     event.conference ??
@@ -68,9 +85,7 @@ function apply(event: StoredEvent, fields: EventWrite, meet: EventConference['st
     ...(conference === undefined ? {} : { conference }),
     ...(fields.start === undefined ? {} : { start: { dateTime: fields.start } }),
     ...(fields.end === undefined ? {} : { end: { dateTime: fields.end } }),
-    ...(fields.attendees === undefined
-      ? {}
-      : { attendees: fields.attendees.map((email) => ({ email, responseStatus: 'needsAction' })) }),
+    ...(fields.attendees === undefined ? {} : { attendees: guests(event.calendarId, fields.attendees) }),
     ...(fields.visibility === undefined ? {} : { visibility: fields.visibility }),
     ...(fields.transparency === undefined ? {} : { transparency: fields.transparency }),
     ...(fields.reminders === undefined ? {} : { reminders: fields.reminders }),

@@ -72,6 +72,16 @@ export interface CalendarEntry extends CalendarListEntry {
   readonly summary?: string;
 }
 
+/**
+ * A guest a write lists, with the answer it starts with. Google starts a
+ * guest it is given no answer for at `needsAction`, the calendar's own owner
+ * included.
+ */
+export interface GuestWrite {
+  readonly email: string;
+  readonly responseStatus?: 'accepted';
+}
+
 /** The fields a write sets; times are instants. */
 export interface EventWrite {
   readonly summary?: string;
@@ -84,7 +94,8 @@ export interface EventWrite {
   readonly end?: string;
   /** The zone the event's times display in. */
   readonly timeZone?: string;
-  readonly attendees?: readonly string[];
+  /** Every guest, the event's own calendar owner among them; a write with them replaces the list. */
+  readonly attendees?: readonly GuestWrite[];
   readonly visibility?: 'default' | 'private';
   readonly transparency?: 'opaque' | 'transparent';
   /** `none` turns every reminder off; `default` keeps the calendar's own. */
@@ -232,7 +243,14 @@ function eventBody(event: EventWrite, id?: string): Record<string, unknown> {
         }),
     ...(event.start === undefined ? {} : { start: eventTime(event.start, event.timeZone) }),
     ...(event.end === undefined ? {} : { end: eventTime(event.end, event.timeZone) }),
-    ...(event.attendees === undefined ? {} : { attendees: event.attendees.map((email) => ({ email })) }),
+    ...(event.attendees === undefined
+      ? {}
+      : {
+          attendees: event.attendees.map((guest) => ({
+            email: guest.email,
+            ...(guest.responseStatus === undefined ? {} : { responseStatus: guest.responseStatus }),
+          })),
+        }),
     ...(event.visibility === undefined ? {} : { visibility: event.visibility }),
     ...(event.transparency === undefined ? {} : { transparency: event.transparency }),
     ...(event.reminders === undefined
