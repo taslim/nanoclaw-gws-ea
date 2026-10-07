@@ -171,6 +171,16 @@ function live(role: 'hold' | 'booking'): StoredEvent[] {
   return calendar.live(PRINCIPAL).filter((event) => event.tags?.gwsEaRole === role);
 }
 
+/** The principal on an event of theirs, as Google lists the organizer of an event they made themselves. */
+const PRINCIPAL_GUEST = { email: PRINCIPAL, responseStatus: 'accepted', organizer: true };
+
+/** Who an event invites: every guest but its organizer, the principal. */
+function invited(event: StoredEvent | undefined): string[] | undefined {
+  return event?.attendees?.flatMap((attendee) =>
+    attendee.organizer === true || attendee.email === undefined ? [] : [attendee.email],
+  );
+}
+
 /** The principal's own meeting, with text the other side must never see. */
 function busy(id: string, start: string, end: string): StoredEvent {
   return {
@@ -484,7 +494,8 @@ describe('hold', () => {
     ).toEqual([TUESDAY_10AM, WEDNESDAY_10AM]);
     for (const event of live('hold')) {
       expect(event).toMatchObject({ visibility: 'private', transparency: 'opaque', reminders: 'none' });
-      expect(event.attendees ?? []).toEqual([]);
+      // The principal alone, accepted: Google lists them as the hold's organizer.
+      expect(event.attendees).toEqual([PRINCIPAL_GUEST]);
       expect(event.tags).toEqual({ gwsEaRole: 'hold', gwsEaThread: threadA });
     }
     expect((await listThreadHolds(threadA)).map((hold) => hold.expiresAt)).toEqual([
@@ -502,6 +513,24 @@ describe('hold', () => {
     data(await send(sessionA, 'hold', { starts: [] }));
     expect(live('hold')).toEqual([]);
     expect(await listThreadHolds(threadA)).toEqual([]);
+  });
+
+  it('holds a time again without rewriting it, but lists the principal, accepted, on a hold that lacks them', async () => {
+    data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM], minutes: 30 }));
+    const [first] = live('hold');
+    data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM], minutes: 30 }));
+    expect(calendar.writes.filter((write) => write.op === 'patch')).toEqual([]);
+
+    // A hold an earlier release placed lists nobody: holding its time again adds the principal.
+    calendar.put({ ...first, attendees: undefined });
+    data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM], minutes: 30 }));
+    expect(calendar.event(PRINCIPAL, first.id)?.attendees).toEqual([PRINCIPAL_GUEST]);
+    expect(calendar.writes.at(-1)).toMatchObject({ op: 'patch', eventId: first.id, sendUpdates: 'none' });
+
+    // One that lists them awaiting an answer gets theirs, accepted.
+    calendar.put({ ...first, attendees: [{ ...PRINCIPAL_GUEST, responseStatus: 'needsAction' }] });
+    data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM], minutes: 30 }));
+    expect(calendar.event(PRINCIPAL, first.id)?.attendees).toEqual([PRINCIPAL_GUEST]);
   });
 
   it('refuses a time that just became busy, or that another thread holds, and the refusal changes nothing', async () => {
@@ -666,7 +695,8 @@ describe('book', () => {
       end: { dateTime: '2026-10-06T09:30:00.000Z' },
       tags: { gwsEaRole: 'booking', gwsEaThread: threadA },
     });
-    expect(event.attendees?.map((attendee) => attendee.email)).toEqual([REMY]);
+    // The principal first, accepted, as its organizer; the invitee awaits their own answer.
+    expect(event.attendees).toEqual([PRINCIPAL_GUEST, { email: REMY, responseStatus: 'needsAction' }]);
     expect(event.conference?.status).toBe('success');
     expect(booked.booking).toBe(event.id);
     expect(booked.message).toMatch(
@@ -699,11 +729,7 @@ describe('book', () => {
 
   it('invites everyone on the thread but the principal and the assistant when it names nobody', async () => {
     data(await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up' }));
-    expect(
-      live('booking')[0]
-        .attendees?.map((attendee) => attendee.email)
-        .sort(),
-    ).toEqual([JANE, REMY]);
+    expect(invited(live('booking')[0])?.sort()).toEqual([JANE, REMY]);
     // Without a Meet link, main hears of no video call.
     expect(mainHeard()[0]).toMatch(
       new RegExp(
@@ -719,16 +745,12 @@ describe('book', () => {
     await recordThreadAddresses(key, [mentioned], 'written', now());
 
     const unnamed = data(await send(session, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up' }));
-    expect(calendar.event(PRINCIPAL, String(unnamed.booking))?.attendees?.map((attendee) => attendee.email)).toEqual([
-      REMY,
-    ]);
+    expect(invited(calendar.event(PRINCIPAL, String(unnamed.booking)))).toEqual([REMY]);
     // Someone written about is still on the thread: the agent may invite them by name.
     const named = data(
       await send(session, 'book', { start: WEDNESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [mentioned] }),
     );
-    expect(calendar.event(PRINCIPAL, String(named.booking))?.attendees?.map((attendee) => attendee.email)).toEqual([
-      mentioned,
-    ]);
+    expect(invited(calendar.event(PRINCIPAL, String(named.booking)))).toEqual([mentioned]);
   });
 
   it('refuses an invitee who is not on the thread', async () => {
@@ -916,6 +938,11 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
       summary: 'Intro',
     });
     expect(calendar.writes.at(-1)).toMatchObject({ op: 'patch', eventId: first.booking, sendUpdates: 'all' });
+    // The principal stays on it, accepted; main hears of the invitee alone.
+    expect(calendar.event(PRINCIPAL, String(first.booking))?.attendees).toEqual([
+      PRINCIPAL_GUEST,
+      { email: REMY, responseStatus: 'needsAction' },
+    ]);
     expect(mainHeard().at(-1)).toBe(
       `Rescheduled the meeting with ${REMY} to Thursday 8 Oct, 15:00–15:45 CEST (45 minutes), from Tuesday 6 Oct, 11:00–11:45 CEST. ` +
         `Google sent them the update. (thread ${threadA}; event ${String(first.booking)} on calendar ${PRINCIPAL})`,

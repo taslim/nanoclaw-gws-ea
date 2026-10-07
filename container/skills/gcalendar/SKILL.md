@@ -1,6 +1,6 @@
 ---
 name: gcalendar
-description: How to work in Google Calendar with the `gog` command. It covers finding the principal's calendars, reading events and free/busy, creating, moving, or cancelling events, including one occurrence of a recurring event, and answering the principal's invitations. Use it before any calendar task, such as checking availability, finding a time, blocking or protecting time, answering an invitation, preparing for a meeting, or saying what's on the principal's schedule, even when the request doesn't mention the calendar.
+description: How to work in Google Calendar with the `gog` command and the `create_event` and `change_guests` tools. It covers finding the principal's calendars, reading events and free/busy, creating, moving, or cancelling events, including one occurrence of a recurring event, changing who an event invites, and answering the principal's invitations. Use it before any calendar task, such as checking availability, finding a time, blocking or protecting time, answering an invitation, preparing for a meeting, or saying what's on the principal's schedule, even when the request doesn't mention the calendar.
 allowed-tools: Bash(gog:*)
 ---
 
@@ -45,17 +45,16 @@ For one occurrence of a recurring invitation, pass that occurrence's own `id`. `
 
 ## Change
 
-- Create: `gog calendar create <calendarId> --summary "<title>" --from <start> --to <end> --timezone <the principal's IANA timezone>`. Add `--transparency free` for a block that shouldn't make the principal look busy, and `--visibility private` when its title is no one else's business.
+- Create: the `create_event` tool, never gog. It puts the principal on the event's guest list, accepted, as on an event they made themselves, which gog can't. Pass `free: true` for a block that shouldn't make the principal look busy, and `private: true` when its title is no one else's business.
 - Move or edit: `gog calendar update <calendarId> <eventId> --from <start> --to <end>`, plus any other field to change. Fields you don't pass stay as they are.
+- Invite people or take them off: the `change_guests` tool, which leaves everyone else's answer as it was and keeps the principal on the event. gog's `--attendees` replaces the whole guest list, dropping the principal, so change guests with the tool alone.
 - Cancel: `gog calendar delete <calendarId> <eventId> --force`.
 - One occurrence of a recurring event: pass that occurrence's own `id` from `events`, because the series ID changes or cancels every occurrence. For one occurrence and all after it, pass the series ID with `--scope future --original-start <the occurrence's originalStartTime.dateTime, exactly as events printed it>`.
 
-Adding attendees (`--attendees` on `create`, `--add-attendee` on `update`) invites other people. Moving an event they attend changes their plans. When you have `arrange`, do neither yourself: hand the meeting over with `arrange` or `reschedule` instead. Otherwise, before you add attendees by name, turn each name into an address: from the people store first when you have one (`ncl people find`), then from the directory with the gpeople skill. Never guess an address.
+Inviting people adds the event to their calendars, and moving an event they attend changes their plans. Before you invite anyone by name, turn each name into an address: from the people store first when you have one (`ncl people find`), then from the directory with the gpeople skill. Never guess an address.
 
 To tell whether you created an event, compare its `creator.email` with your own address.
 
-Create focus time as an ordinary event, without `--event-type`. Google's focus-time events decline other people's invitations by default, which would answer people on the principal's behalf.
-
-gog sends Google's notifications only when you pass `--send-updates`. Leave it unset.
+Neither gog nor the two tools email anyone: gog sends Google's notifications only when you pass `--send-updates`, so leave it unset.
 
 After any change or answer, read the event back with `gog calendar event` and check its time, calendar, and status (`cancelled` after a delete, the principal's `responseStatus` after an answer) before you report it done.

@@ -104,12 +104,19 @@ const REQUEST_TIMEOUT_MS = 30_000;
 
 /**
  * One JSON call to a Google API. With `allowNotFound`, a 404 returns
- * undefined; every other failure throws a `GoogleApiError`.
+ * undefined; every other failure throws a `GoogleApiError`. With `ifMatch`,
+ * a write applies only to the version of the resource that etag names, and
+ * Google refuses it with 412 when the resource has changed since.
  */
 export async function googleJson(
   options: GoogleClientOptions,
   url: string,
-  init: { readonly method?: string; readonly body?: unknown; readonly allowNotFound?: boolean } = {},
+  init: {
+    readonly method?: string;
+    readonly body?: unknown;
+    readonly allowNotFound?: boolean;
+    readonly ifMatch?: string;
+  } = {},
 ): Promise<unknown> {
   const fetchImpl = options.fetch ?? globalThis.fetch;
   const token = await options.token();
@@ -120,6 +127,7 @@ export async function googleJson(
       headers: {
         authorization: `Bearer ${token}`,
         ...(init.body === undefined ? {} : { 'content-type': 'application/json' }),
+        ...(init.ifMatch === undefined ? {} : { 'if-match': init.ifMatch }),
       },
       ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),

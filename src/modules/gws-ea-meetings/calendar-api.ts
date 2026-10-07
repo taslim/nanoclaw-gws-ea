@@ -10,8 +10,10 @@
  * Every event read asks Google for its timing, status, people, the
  * assistant's own private tags, and the Meet link the host asked Google to
  * create, and every write asks for nothing back but the id, so no title,
- * description or location is ever fetched (R20). Tests use a fake with the
- * same interface.
+ * description or location is ever fetched (R20). A guest-list change reads
+ * each guest whole, only to write them back as they were, and writes over
+ * only the version of the event it read; none of it reaches an agent. Tests
+ * use a fake with the same interface.
  */
 import { isRecord } from '../../gws-ea/validation.js';
 import type { CalendarListEntry } from '../gws-ea-inbox/calendar-notifications.js';
@@ -72,7 +74,37 @@ export interface CalendarEntry extends CalendarListEntry {
   readonly summary?: string;
 }
 
-/** The fields a write sets; times are instants. */
+/**
+ * A guest a write lists, with the answer it starts with. Google starts a
+ * guest it is given no answer for at `needsAction`, the calendar's own owner
+ * included.
+ */
+export interface GuestWrite {
+  readonly email: string;
+  readonly responseStatus?: 'accepted';
+}
+
+/**
+ * A guest exactly as Google holds it, every field kept, so a guest list
+ * written back changes nobody else's answer, note, or flags.
+ */
+export type GuestRecord = Readonly<Record<string, unknown>>;
+
+/** An event's guest list as Google holds it, with what says who may change it. */
+export interface EventGuests {
+  /**
+   * The version of the event this list was read from. Google gives the
+   * event a new one on every change, a guest's answer included, so a list
+   * written back over it cannot undo a change made since.
+   */
+  readonly etag?: string;
+  readonly status?: string;
+  /** The organizer's address, lowercased: the calendar the event belongs to. */
+  readonly organizer?: string;
+  readonly guests: readonly GuestRecord[];
+}
+
+/** The fields a write sets; times are instants, or dates for an all-day event. */
 export interface EventWrite {
   readonly summary?: string;
   readonly description?: string;
@@ -84,7 +116,12 @@ export interface EventWrite {
   readonly end?: string;
   /** The zone the event's times display in. */
   readonly timeZone?: string;
-  readonly attendees?: readonly string[];
+  /** Its times are dates, `YYYY-MM-DD`, the end the day after its last: an all-day event. */
+  readonly allDay?: boolean;
+  /** Its repetition, as RRULE, EXRULE, RDATE and EXDATE lines. */
+  readonly recurrence?: readonly string[];
+  /** Every guest, the event's own calendar owner among them; a write with them replaces the list. */
+  readonly attendees?: readonly GuestWrite[];
   readonly visibility?: 'default' | 'private';
   readonly transparency?: 'opaque' | 'transparent';
   /** `none` turns every reminder off; `default` keeps the calendar's own. */
@@ -114,6 +151,20 @@ export interface MeetingsCalendarApi {
   ): Promise<'created' | 'exists'>;
   /** Change the fields given. */
   patchEvent(calendarId: string, eventId: string, event: EventWrite, sendUpdates: SendUpdates): Promise<void>;
+  /** An event's guests as Google holds them, with the event's version, or undefined when it does not exist. */
+  getGuests(calendarId: string, eventId: string): Promise<EventGuests | undefined>;
+  /**
+   * Replace an event's guests with these, each as given. With `etag`, only
+   * while the event is still that version: `changed`, and nothing written,
+   * when it has changed since.
+   */
+  setGuests(
+    calendarId: string,
+    eventId: string,
+    guests: readonly GuestRecord[],
+    sendUpdates: SendUpdates,
+    etag?: string,
+  ): Promise<'set' | 'changed'>;
   /** Delete an event; `gone` when it was already deleted or never existed. */
   deleteEvent(calendarId: string, eventId: string, sendUpdates: SendUpdates): Promise<'deleted' | 'gone'>;
 }
@@ -211,8 +262,8 @@ function toEvent(value: unknown): CalendarEvent {
   return { ...event, id: event.id };
 }
 
-function eventTime(instant: string, timeZone: string | undefined): Record<string, string> {
-  return { dateTime: instant, ...(timeZone === undefined ? {} : { timeZone }) };
+function eventTime(at: string, timeZone: string | undefined, allDay: boolean | undefined): Record<string, string> {
+  return { ...(allDay === true ? { date: at } : { dateTime: at }), ...(timeZone === undefined ? {} : { timeZone }) };
 }
 
 /** The request body for a write: only the fields it sets. */
@@ -230,9 +281,17 @@ function eventBody(event: EventWrite, id?: string): Record<string, unknown> {
             createRequest: { requestId: event.conference.requestId, conferenceSolutionKey: { type: GOOGLE_MEET } },
           },
         }),
-    ...(event.start === undefined ? {} : { start: eventTime(event.start, event.timeZone) }),
-    ...(event.end === undefined ? {} : { end: eventTime(event.end, event.timeZone) }),
-    ...(event.attendees === undefined ? {} : { attendees: event.attendees.map((email) => ({ email })) }),
+    ...(event.start === undefined ? {} : { start: eventTime(event.start, event.timeZone, event.allDay) }),
+    ...(event.end === undefined ? {} : { end: eventTime(event.end, event.timeZone, event.allDay) }),
+    ...(event.recurrence === undefined ? {} : { recurrence: [...event.recurrence] }),
+    ...(event.attendees === undefined
+      ? {}
+      : {
+          attendees: event.attendees.map((guest) => ({
+            email: guest.email,
+            ...(guest.responseStatus === undefined ? {} : { responseStatus: guest.responseStatus }),
+          })),
+        }),
     ...(event.visibility === undefined ? {} : { visibility: event.visibility }),
     ...(event.transparency === undefined ? {} : { transparency: event.transparency }),
     ...(event.reminders === undefined
@@ -351,6 +410,40 @@ export function createMeetingsCalendarApi(options: GoogleClientOptions): Meeting
         method: 'PATCH',
         body: eventBody(event),
       });
+    },
+
+    async getGuests(calendarId, eventId) {
+      const params = new URLSearchParams({ fields: 'etag,status,organizer(email),attendees' });
+      const payload = await googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, {
+        allowNotFound: true,
+      });
+      if (payload === undefined) return undefined;
+      if (!isRecord(payload)) throw new GoogleApiError(502, 'Google Calendar returned an unreadable event');
+      const etag = optionalString(payload.etag);
+      const status = optionalString(payload.status);
+      const organizer = isRecord(payload.organizer) ? optionalString(payload.organizer.email) : undefined;
+      return {
+        ...(etag === undefined ? {} : { etag }),
+        ...(status === undefined ? {} : { status }),
+        ...(organizer === undefined ? {} : { organizer: organizer.toLowerCase() }),
+        guests: Array.isArray(payload.attendees) ? payload.attendees.filter(isRecord) : [],
+      };
+    },
+
+    async setGuests(calendarId, eventId, guests, sendUpdates, etag) {
+      const params = new URLSearchParams({ sendUpdates, fields: 'id' });
+      try {
+        await googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, {
+          method: 'PATCH',
+          body: { attendees: guests },
+          ...(etag === undefined ? {} : { ifMatch: etag }),
+        });
+        return 'set';
+      } catch (error) {
+        // 412 Precondition Failed: the event is no longer the version the list was read from.
+        if (error instanceof GoogleApiError && error.status === 412) return 'changed';
+        throw error;
+      }
     },
 
     async deleteEvent(calendarId, eventId, sendUpdates) {

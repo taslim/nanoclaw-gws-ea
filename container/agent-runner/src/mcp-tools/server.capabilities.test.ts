@@ -38,6 +38,9 @@ const ALL = [
   'request-status',
   'gws-ea-email',
   'gws-ea-reminders',
+  'google-calendar',
+  'google-mail-read',
+  'google-directory',
 ];
 
 /** Exactly the keys the host stamps external-email with (src/modules/gws-ea-external-email/group.ts). */
@@ -57,6 +60,8 @@ const EXTERNAL_EMAIL_TOOLS = [
 /** main's email tools, which `gws-ea-email` grants. */
 const MAIN_EMAIL_TOOLS = ['email_handoff', 'email_principal'];
 const REMINDER_TOOLS = ['clear_reminder', 'remind_me'];
+/** main's writes on the principal's events, which Google Calendar's key grants with gog's calendar commands. */
+const CALENDAR_WRITE_TOOLS = ['change_guests', 'create_event'];
 
 /** Every tool of the default-on keys. */
 const DEFAULT_ON_TOOLS = [
@@ -75,6 +80,7 @@ const DEFAULT_ON_TOOLS = [
   'send_message',
   ...MAIN_EMAIL_TOOLS,
   ...REMINDER_TOOLS,
+  ...CALENDAR_WRITE_TOOLS,
   ...TIME_TOOLS,
 ].sort();
 
@@ -120,6 +126,7 @@ describe('NanoClaw tool server capabilities', () => {
     ['gws-ea-email', ['gws-ea-email'], MAIN_EMAIL_TOOLS],
     ['gws-ea-email-external', ['gws-ea-email-external'], EXTERNAL_EMAIL_TOOLS],
     ['gws-ea-reminders', ['gws-ea-reminders'], REMINDER_TOOLS],
+    ['google-calendar', ['google-calendar'], CALENDAR_WRITE_TOOLS],
     [
       "external-email's keys",
       EXTERNAL_EMAIL,

@@ -3,6 +3,9 @@
  * scheduling tools write them so a retry never writes one twice, and how a
  * time reads in an email.
  *
+ * - Every event lists the owner of its calendar, the principal, as its first
+ *   guest, accepted (`guestsOn`): Google then shows them on the guest list
+ *   as its organizer, as it does for an event they made themselves.
  * - An event's id derives from what it is for (`eventIdFor`), so a retry
  *   after a partial failure finds the event it made (`ensureEvent`), and an
  *   event under that id that is not the assistant's is never touched.
@@ -16,7 +19,14 @@ import { createHash } from 'node:crypto';
 
 import { log } from '../../log.js';
 import { recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
-import type { CalendarEvent, EventConference, MeetingsCalendarApi, NewEvent, SendUpdates } from './calendar-api.js';
+import type {
+  CalendarEvent,
+  EventConference,
+  GuestWrite,
+  MeetingsCalendarApi,
+  NewEvent,
+  SendUpdates,
+} from './calendar-api.js';
 import type { Span } from './slots.js';
 
 /** The private tag naming an event's role, `hold` or `booking`, on the events the assistant places. */
@@ -35,14 +45,39 @@ export interface OwnerTag {
   readonly value: string;
 }
 
-/** Whether the event Google holds already says what the write would. */
+/**
+ * The guests of an event the assistant writes on `calendarId`: the
+ * calendar's owner first, accepted, then everyone `invitees` names. Google
+ * gives the owner no answer of their own (`needsAction`) unless the write
+ * does, and lists them as the event's organizer.
+ */
+export function guestsOn(calendarId: string, invitees: readonly string[]): GuestWrite[] {
+  const owner = calendarId.toLowerCase();
+  return [
+    { email: calendarId, responseStatus: 'accepted' },
+    ...invitees.filter((address) => address.toLowerCase() !== owner).map((email) => ({ email })),
+  ];
+}
+
+/** Whether the event Google holds already says what the write would: its time, and each guest with any answer it gives them. */
 function alreadyWritten(current: CalendarEvent, event: NewEvent): boolean {
   const startsTogether =
     current.start?.dateTime !== undefined && Date.parse(current.start.dateTime) === Date.parse(event.start);
   const endsTogether =
     current.end?.dateTime !== undefined && Date.parse(current.end.dateTime) === Date.parse(event.end);
-  const invited = new Set((current.attendees ?? []).flatMap((attendee) => attendee.email ?? []));
-  return startsTogether && endsTogether && (event.attendees ?? []).every((address) => invited.has(address));
+  const answers = new Map(
+    (current.attendees ?? []).flatMap((attendee) =>
+      attendee.email === undefined ? [] : [[attendee.email, attendee.responseStatus] as const],
+    ),
+  );
+  return (
+    startsTogether &&
+    endsTogether &&
+    (event.attendees ?? []).every((guest) => {
+      const email = guest.email.toLowerCase();
+      return answers.has(email) && (guest.responseStatus === undefined || answers.get(email) === guest.responseStatus);
+    })
+  );
 }
 
 /**
@@ -108,20 +143,47 @@ export async function readConference(
   /* eslint-enable no-catch-all/no-catch-all */
 }
 
+/** What a Meet link on an event means for the agent that asked for it, as words that follow its time. */
+export function conferenceWords(conference: EventConference | undefined): string {
+  if (conference === undefined) return '';
+  switch (conference.status) {
+    case 'success':
+      return conference.uri === undefined
+        ? ', with a Google Meet link'
+        : `, with a Google Meet link (${conference.uri})`;
+    case 'pending':
+      return '; Google is still creating its Meet link, which appears on the invitation shortly';
+    case 'failure':
+      return '; Google could not create a Meet link, so tell them the place another way';
+    default: {
+      const unreachable: never = conference.status;
+      throw new Error(`Unknown conference status ${String(unreachable)}`);
+    }
+  }
+}
+
 /**
  * A slot as people write it, in `timezone`: "Tuesday 6 Oct, 10:00–10:30
  * BST", its zone by the short name people know rather than its IANA name.
  */
 export function slotLabel(span: Span, timezone: string): string {
-  const day = new Date(span.start).toLocaleDateString('en-GB', {
-    timeZone: timezone,
-    weekday: 'long',
-    day: 'numeric',
-    month: 'short',
-  });
-  const clock = (instant: number): string =>
-    new Date(instant).toLocaleTimeString('en-GB', { timeZone: timezone, hour: '2-digit', minute: '2-digit' });
-  return `${day.replace(',', '')}, ${clock(span.start)}–${clock(span.end)} ${zoneName(span.start, timezone)}`;
+  return `${dayLabel(span.start, timezone)}, ${clockLabel(span.start, timezone)}–${clockLabel(span.end, timezone)} ${zoneName(span.start, timezone)}`;
+}
+
+/** One instant as people write it, in `timezone`: "Thursday 8 Oct, 09:00 PDT". */
+export function momentLabel(instant: number, timezone: string): string {
+  return `${dayLabel(instant, timezone)}, ${clockLabel(instant, timezone)} ${zoneName(instant, timezone)}`;
+}
+
+function clockLabel(instant: number, timezone: string): string {
+  return new Date(instant).toLocaleTimeString('en-GB', { timeZone: timezone, hour: '2-digit', minute: '2-digit' });
+}
+
+/** The day an instant falls on in `timezone`, as people write it: "Tuesday 6 Oct". */
+export function dayLabel(instant: number, timezone: string): string {
+  return new Date(instant)
+    .toLocaleDateString('en-GB', { timeZone: timezone, weekday: 'long', day: 'numeric', month: 'short' })
+    .replace(',', '');
 }
 
 /**
