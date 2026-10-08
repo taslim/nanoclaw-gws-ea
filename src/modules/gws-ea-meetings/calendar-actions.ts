@@ -170,6 +170,17 @@ export function slotLabel(span: Span, timezone: string): string {
   return `${dayLabel(span.start, timezone)}, ${clockLabel(span.start, timezone)}–${clockLabel(span.end, timezone)} ${zoneName(span.start, timezone)}`;
 }
 
+/**
+ * A span as people write it, in `timezone`: a slot when it starts and ends
+ * on one day, and both days otherwise, "Thursday 8 Oct, 09:00 PDT to
+ * Saturday 10 Oct, 17:00 PDT". Ending at midnight stays the same day.
+ */
+export function spanLabel(span: Span, timezone: string): string {
+  return dayLabel(span.start, timezone) === dayLabel(span.end - 1, timezone)
+    ? slotLabel(span, timezone)
+    : `${momentLabel(span.start, timezone)} to ${momentLabel(span.end, timezone)}`;
+}
+
 /** One instant as people write it, in `timezone`: "Thursday 8 Oct, 09:00 PDT". */
 export function momentLabel(instant: number, timezone: string): string {
   return `${dayLabel(instant, timezone)}, ${clockLabel(instant, timezone)} ${zoneName(instant, timezone)}`;
@@ -179,10 +190,27 @@ function clockLabel(instant: number, timezone: string): string {
   return new Date(instant).toLocaleTimeString('en-GB', { timeZone: timezone, hour: '2-digit', minute: '2-digit' });
 }
 
-/** The day an instant falls on in `timezone`, as people write it: "Tuesday 6 Oct". */
+/**
+ * How far from now a day is written without its year: the reading the
+ * outgoing weekday check takes of a date written without one
+ * (`gws-ea-dates`), so a label copied into a message never reads as another
+ * year's.
+ */
+const YEARLESS_PAST_MS = 120 * 24 * 60 * 60 * 1000;
+const YEARLESS_AHEAD_MS = 300 * 24 * 60 * 60 * 1000;
+
+/** The day an instant falls on in `timezone`, as people write it: "Tuesday 6 Oct", with its year when far from now. */
 export function dayLabel(instant: number, timezone: string): string {
+  const now = Date.now();
+  const near = instant >= now - YEARLESS_PAST_MS && instant < now + YEARLESS_AHEAD_MS;
   return new Date(instant)
-    .toLocaleDateString('en-GB', { timeZone: timezone, weekday: 'long', day: 'numeric', month: 'short' })
+    .toLocaleDateString('en-GB', {
+      timeZone: timezone,
+      weekday: 'long',
+      day: 'numeric',
+      month: 'short',
+      ...(near ? {} : { year: 'numeric' }),
+    })
     .replace(',', '');
 }
 

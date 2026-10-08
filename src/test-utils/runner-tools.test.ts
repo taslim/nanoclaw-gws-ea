@@ -1,6 +1,6 @@
 /**
  * `unknownToolNames` against the instruction files for the runner's
- * calendar-facts, schedule-stats, time and reminder tools, and each agent's
+ * time and reminder tools, and each agent's
  * email tools:
  * each should name only a tool the runner actually exports, or a word this
  * file's own not-tools list explicitly carves out as something else (a
@@ -20,8 +20,6 @@ function instructions(name: string): string {
 
 /** Each instruction file this branch touched, with the backticked words in it that are not tool names. */
 const FILES: ReadonlyArray<readonly [name: string, notTools: readonly string[]]> = [
-  ['calendar-facts', ['from', 'to', 'start', 'end', 'candidate_ical_uid', 'assistant_address', 'people']],
-  ['schedule-stats', ['from', 'to']],
   ['time', ['reference_date']],
   ['reminders', []],
   ['gws-ea-email', []],

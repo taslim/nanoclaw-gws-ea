@@ -4,20 +4,23 @@
  * (`threadCalendarAction` in `guard.ts`). No argument names a thread, so a
  * call never reaches another thread's holds or bookings.
  *
- *   free_time       { from, to, minutes, timezone? } → { times, message }
+ *   free_time       { from, to, minutes, timezone? } → { windows, windows_not_listed, message }
  *   hold            { starts, minutes }              → { held, message }
- *   book            { start, minutes, title, notes?, location?, video_call?, invitees? }
+ *   book            { start, minutes, title, notes?, location?, video_call?, invitees?, timezone? }
  *                                                     → { booking, start, end, message }
- *   change_booking  { booking, start?, minutes?, title?, location?, notes?, video_call? }
+ *   change_booking  { booking, start?, minutes?, title?, location?, notes?, video_call?, timezone? }
  *                                                     → { booking, start, end, message }
- *   cancel_booking  { booking }                      → { booking, message }
+ *   cancel_booking  { booking, timezone? }           → { booking, message }
  *
- * - `free_time` offers up to eight start times from now on, from the
- *   principal's free/busy alone, never inside protected time, spread across
- *   the range and listed in date order (`freeTimes` in `slots.ts`). Each is
- *   labeled in the principal's time zone and, when given, the counterpart's,
- *   inside whose waking day it falls, with a fit note from a fixed
- *   vocabulary that never echoes a preference.
+ * Every time an answer gives is ready to write, in the principal's zone and,
+ * when a call gives `timezone`, the other side's.
+ *
+ * - `free_time` lists the free windows in the range from now on, from the
+ *   principal's free/busy alone, never inside protected time, in date order
+ *   (`freeWindows` in `slots.ts`). The agent picks the times; each window is
+ *   labeled, ready to write, in the principal's time zone and, when given,
+ *   the counterpart's, inside whose waking day it falls, with a fit note from
+ *   a fixed vocabulary that never echoes a preference.
  * - `hold` replaces the thread's holds with at most three private, busy
  *   events, each lapsing three days after it was last held. A timer releases
  *   what lapsed (`releaseExpiredHolds`).
@@ -58,6 +61,7 @@ import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { threadAddresses } from '../gws-ea-inbox/thread-map.js';
 import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
 import { getSchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
+import { weekdayRefusal } from '../gws-ea-dates/refusal.js';
 import { audienceForAddresses, checkOutbound } from '../gws-ea-privacy/index.js';
 import { getGwsEaProfile, getMainAgentGroupId, listPrincipalAddresses } from '../gws-ea-profile/db.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
@@ -75,7 +79,7 @@ import { addressesOf, flagOf, instantOf, lineOf, notesOf, timezoneOf } from './f
 import {
   blocksTime,
   eventSpan,
-  freeTimes,
+  freeWindows,
   inProtectedTime,
   isClear,
   iso,
@@ -101,8 +105,8 @@ import {
 /** The private tag naming the thread an event was placed for. */
 export const TAG_THREAD = 'gwsEaThread';
 
-/** How many times one `free_time` answer offers. */
-const MAX_OFFERED = 8;
+/** How many windows one `free_time` answer lists: about a week of days. */
+const MAX_WINDOWS = 24;
 /** How many times one thread holds at once. */
 const MAX_HOLDS = 3;
 /** A hold lapses this long after it was last held. */
@@ -147,6 +151,11 @@ function bookingIdOf(value: unknown): string {
 
 function spanAt(start: number, minutes: number): Span {
   return { start, end: start + minutes * MINUTE };
+}
+
+/** A time ready to write: in the principal's zone and, when known, the other side's. */
+function bothZones(span: Span, timezone: string, theirs: string | undefined): string {
+  return `${slotLabel(span, timezone)}${theirs === undefined ? '' : `; for them, ${slotLabel(span, theirs)}`}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -485,36 +494,36 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     const { timezone, rules } = view.principal;
     const bookingCalendar = await bookingCalendarOf(view);
     const window = { start: Math.max(from, Date.now()), end: to };
-    const holds = await listThreadHolds(view.threadKey);
-    const busy =
-      window.start < window.end
-        ? await busyIn(view, bookingCalendar.id, window, new Set(holds.map((hold) => hold.eventId)))
-        : [];
-    const found = freeTimes(
-      { timezone, counterpartTimezone: theirs, lengthMinutes: minutes, window, busy, rules },
-      MAX_OFFERED,
-    );
-    const times = found.map((time) => ({
-      start: iso(time.start),
-      end: iso(time.end),
-      principal_time: slotLabel(time, timezone),
-      ...(theirs === undefined ? {} : { their_time: slotLabel(time, theirs) }),
-      fit: time.fit,
-      held: holds.some((hold) => Date.parse(hold.startAt) === time.start && Date.parse(hold.endAt) === time.end),
+    const busy = window.start < window.end ? await busyIn(view, bookingCalendar.id, window, new Set()) : [];
+    const found = freeWindows({ timezone, counterpartTimezone: theirs, lengthMinutes: minutes, window, busy, rules });
+    const windows = found.slice(0, MAX_WINDOWS).map((free) => ({
+      start: iso(free.start),
+      end: iso(free.end),
+      principal_time: slotLabel(free, timezone),
+      ...(theirs === undefined ? {} : { their_time: slotLabel(free, theirs) }),
+      fit: free.fit,
     }));
-    // Each line leads with the start as the tools take it back: on the principal's clock, with its offset.
-    const lines = times.map(
-      (time) =>
-        `- ${zonedIso(Date.parse(time.start), timezone)}: ${time.principal_time}` +
-        (time.their_time === undefined ? '' : `; for them, ${time.their_time}`) +
-        ` (${time.fit}${time.held ? ', held' : ''})`,
-    );
+    const unlisted = found.length - windows.length;
+    // Each line leads with the window on the principal's clock, with its offset, as the tools take a start back.
+    const lines = found
+      .slice(0, MAX_WINDOWS)
+      .map(
+        (free, index) =>
+          `- ${zonedIso(free.start, timezone)} to ${zonedIso(free.end, timezone)}: ${windows[index].principal_time}` +
+          (theirs === undefined ? '' : `; for them, ${windows[index].their_time}`) +
+          ` (${free.fit})`,
+      );
     return {
-      times,
+      windows,
+      windows_not_listed: unlisted,
       message:
-        times.length === 0
-          ? `Nothing in that range is free outside protected time${theirs === undefined ? '' : ' and inside their waking day'}: ask for another range, or tell main with tell_main.`
-          : ['Free times:', ...lines].join('\n'),
+        windows.length === 0
+          ? `Nothing in that range is free for ${minutes} minutes outside protected time${theirs === undefined ? '' : ' and inside their waking day'}: ask for another range, or tell main with tell_main.`
+          : [
+              `Free for ${minutes} minutes: any start that ends by a window's end.`,
+              ...lines,
+              ...(unlisted > 0 ? [`${unlisted} later windows are not listed: ask from the last one on for more.`] : []),
+            ].join('\n'),
     };
   };
 
@@ -624,8 +633,9 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
 
   /**
    * Refuse, writing nothing, an invitation whose text carries one of the
-   * principal's private values as its invitees would see it: what it says,
-   * and the name of the calendar it is on.
+   * principal's private values as its invitees would see it (what it says,
+   * and the name of the calendar it is on), or a weekday beside a date it
+   * does not fall on.
    */
   async function assertInvitationShareable(
     texts: readonly (string | undefined)[],
@@ -633,6 +643,8 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     invitees: readonly string[],
     refused: string,
   ): Promise<void> {
+    const misdated = await weekdayRefusal(texts.map((text) => text ?? ''));
+    if (misdated !== undefined) throw invalidArgs(`${refused}: ${misdated}`);
     const check = await checkOutbound(
       [...texts.map((text) => text ?? ''), calendarName ?? ''],
       await audienceForAddresses(invitees),
@@ -747,6 +759,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     const notes = notesOf(content.notes, NOTES_MAX);
     const location = lineOf(content.location, 'location', LOCATION_MAX);
     const videoCall = flagOf(content.video_call, 'video_call');
+    const theirs = timezoneOf(content.timezone);
     const view = await viewOf(session);
     const { timezone } = view.principal;
     const span = spanAt(start, minutes);
@@ -777,7 +790,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
       start: iso(span.start),
       end: iso(span.end),
       message:
-        `Booked: ${slotLabel(span, timezone)}. Google sends ${invitees.join(', ')} the invitation from the principal's calendar` +
+        `Booked: ${bothZones(span, timezone, theirs)}. Google sends ${invitees.join(', ')} the invitation from the principal's calendar` +
         `${conferenceWords(conference)}. This thread's holds are released.${holdsLeft} main hears of it. ` +
         `To change or cancel it, give booking ${eventId}.`,
     };
@@ -825,6 +838,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     const notes = notesOf(content.notes, NOTES_MAX);
     const location = lineOf(content.location, 'location', LOCATION_MAX);
     const videoCall = flagOf(content.video_call, 'video_call');
+    const theirs = timezoneOf(content.timezone);
     if ([start, minutes, title, notes, location].every((value) => value === undefined) && !videoCall) {
       throw invalidArgs('Give at least one change: start, minutes, title, location, notes, or video_call: true.');
     }
@@ -871,7 +885,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
         booking: booking.eventId,
         start: iso(span.start),
         end: iso(span.end),
-        message: `The booking already stands at ${slotLabel(span, timezone)}${videoCall ? conferenceWords(event.conference) : ''}: nothing changed.`,
+        message: `The booking already stands at ${bothZones(span, timezone, theirs)}${videoCall ? conferenceWords(event.conference) : ''}: nothing changed.`,
       };
     }
     await calendar().patchEvent(booking.calendarId, booking.eventId, fields, 'all');
@@ -914,13 +928,14 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
       start: iso(span.start),
       end: iso(span.end),
       message:
-        `Changed: ${slotLabel(span, timezone)}${conferenceWords(conference)}. ` +
+        `Changed: ${bothZones(span, timezone, theirs)}${conferenceWords(conference)}. ` +
         `Google sends the invitees the update, and main hears of it.${holdsLeft}`,
     };
   };
 
   /** Cancel a booking this thread made: its event is deleted with Google's notice to the invitees. */
   const cancelBooking: ActionAnswer = async (content, session) => {
+    const theirs = timezoneOf(content.timezone);
     const view = await viewOf(session);
     const { timezone } = view.principal;
     const { booking, span, invitees } = await ownBooking(content, view);
@@ -930,7 +945,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     await deleteThreadBooking(booking.calendarId, booking.eventId);
     return {
       booking: booking.eventId,
-      message: `Cancelled: ${slotLabel(span, timezone)}. Google sends the invitees the cancellation, and main hears of it.`,
+      message: `Cancelled: ${bothZones(span, timezone, theirs)}. Google sends the invitees the cancellation, and main hears of it.`,
     };
   };
 

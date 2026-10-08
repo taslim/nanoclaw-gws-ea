@@ -112,16 +112,6 @@ registerCapability('self-mod', {
   instructions: ['self-mod'],
 });
 registerCapability('time', { description: 'the time_* tools', default: 'on', instructions: ['time'] });
-registerCapability('schedule-stats', {
-  description: 'schedule_stats',
-  default: 'on',
-  instructions: ['schedule-stats'],
-});
-registerCapability('calendar-facts', {
-  description: 'find_conflicts, people_stats',
-  default: 'on',
-  instructions: ['calendar-facts'],
-});
 registerCapability('request-status', {
   description: 'request_status: the answer to a request the host was slow to answer, from the session’s own mailbox',
   default: 'on',

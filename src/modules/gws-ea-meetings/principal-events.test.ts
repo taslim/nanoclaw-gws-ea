@@ -243,6 +243,16 @@ describe('create_event', () => {
     expect(created.message).toMatch(/with a Google Meet link \(https:\/\/meet\.google\.com\//u);
   });
 
+  it('refuses text whose weekday and date disagree, adding nothing', async () => {
+    const refused = refusal(
+      await send(main, 'create_event', { ...FOCUS, notes: 'Prep for the board on Friday 10 October 2026.' }),
+    );
+    expect(refused).toMatch(
+      /^The event was not added: it says "Friday 10 October 2026", but 10 October 2026 is a Saturday\./u,
+    );
+    expect(calendar.writes).toEqual([]);
+  });
+
   it('names both days of a timed event that ends on a later day', async () => {
     const created = data(
       await send(main, 'create_event', {

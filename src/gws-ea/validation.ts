@@ -44,10 +44,6 @@ const GMAIL_DOMAINS = new Set(['gmail.com', 'googlemail.com']);
  * Gmail ignores. Other handles are already canonical. Used only to widen a
  * protection (a fingerprint, a refusal, a release to the principal), never
  * to grant a level to a different handle.
- *
- * The agent runner applies the same rule to bare addresses (`mailboxKey` in
- * container/agent-runner/src/mcp-tools/calendar-facts.ts). The two runtimes
- * share no code, so a change to one is made to both.
  */
 export function identityMatchKey(handle: string): string {
   if (!handle.toLowerCase().startsWith('email:')) return handle;

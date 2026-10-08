@@ -158,20 +158,22 @@ export const tellMain = requestTool({
   repeatable: false,
 });
 
+/** The other side's zone: an answer then gives each time in it too, ready to write. */
+const THEIR_ZONE = {
+  type: 'string',
+  description: "The other side's time zone, such as Europe/Berlin, when you know it: the answer gives times in it too.",
+} as const;
+
 export const freeTime = requestTool({
   ...common,
   name: 'free_time',
   description:
-    "The principal's free start times between from and to for a meeting of minutes: up to eight, spread out, in date order, never in protected time. Each shows the principal's time, the other side's when you give timezone, and how it fits the principal's preferences. Their calendar itself stays hidden.",
+    "The principal's free windows between from and to for a meeting of minutes, in date order, never in protected time: any start that ends by a window's end is free. Each shows the principal's time, the other side's when you give timezone (their night left out), and how it fits the principal's preferences. You pick the times.",
   properties: {
     from: { type: 'string', description: `The earliest start. ${DATE_TIME}` },
     to: { type: 'string', description: `When the meeting must be over. ${DATE_TIME}` },
     minutes: MINUTES,
-    timezone: {
-      type: 'string',
-      description:
-        "The other side's time zone, such as Europe/Berlin, when you know it: times in their night are left out.",
-    },
+    timezone: THEIR_ZONE,
   },
   required: ['from', 'to', 'minutes'],
   repeatable: true,
@@ -206,6 +208,7 @@ export const book = requestTool({
       ...ADDRESSES,
       description: 'Who to invite, each on the thread, in place of everyone in the conversation.',
     },
+    timezone: THEIR_ZONE,
   },
   required: ['start', 'minutes', 'title'],
   repeatable: false,
@@ -224,6 +227,7 @@ export const changeBooking = requestTool({
     location: { type: 'string', description: 'The new place: an address, a phone number, or their own link.' },
     notes: { type: 'string', description: 'The new notes the invitees read in the invitation.' },
     video_call: { type: 'boolean', description: 'true to add a Google Meet link.' },
+    timezone: THEIR_ZONE,
   },
   required: ['booking'],
   repeatable: true,
@@ -233,7 +237,7 @@ export const cancelBooking = requestTool({
   ...common,
   name: 'cancel_booking',
   description: 'Cancel a booking this thread made. Google sends the invitees the cancellation, and main hears.',
-  properties: { booking: BOOKING },
+  properties: { booking: BOOKING, timezone: THEIR_ZONE },
   required: ['booking'],
   repeatable: true,
 });

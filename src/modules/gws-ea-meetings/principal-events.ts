@@ -28,18 +28,11 @@
 import { TIMEZONE } from '../../config.js';
 import { forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-action.js';
 import { hasControlCharacters } from '../../gws-ea/validation.js';
+import { weekdayRefusal } from '../gws-ea-dates/refusal.js';
 import { EVENT_ID, isPrincipalCalendar, recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import { getGwsEaProfile, listPrincipalAddresses } from '../gws-ea-profile/db.js';
 import { allowsMeet, type CalendarEntry, type GuestRecord, type MeetingsCalendarApi } from './calendar-api.js';
-import {
-  conferenceWords,
-  dayLabel,
-  eventIdFor,
-  guestsOn,
-  momentLabel,
-  readConference,
-  slotLabel,
-} from './calendar-actions.js';
+import { conferenceWords, dayLabel, eventIdFor, guestsOn, readConference, spanLabel } from './calendar-actions.js';
 import { addressesOf, flagOf, instantOf, lineOf, notesOf, timezoneOf } from './fields.js';
 
 const TITLE_MAX = 200;
@@ -236,6 +229,8 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
     const recurrence = recurrenceOf(content.recurrence);
     const videoCall = flagOf(content.video_call, 'video_call');
     const timezone = timezoneOf(content.timezone) ?? (await getGwsEaProfile()).principal_timezone ?? TIMEZONE;
+    const misdated = await weekdayRefusal([title, notes ?? '', location ?? '']);
+    if (misdated !== undefined) throw invalidArgs(`The event was not added: ${misdated}`);
 
     let start: string;
     let end: string;
@@ -257,10 +252,7 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       start = new Date(from).toISOString();
       end = new Date(to).toISOString();
       // An event that ends on a later day names both days, not only the one it starts on.
-      when =
-        dayLabel(from, timezone) === dayLabel(to - 1, timezone)
-          ? slotLabel({ start: from, end: to }, timezone)
-          : `${momentLabel(from, timezone)} to ${momentLabel(to, timezone)}`;
+      when = spanLabel({ start: from, end: to }, timezone);
     }
 
     const entry = await principalCalendarOf(calendarId);

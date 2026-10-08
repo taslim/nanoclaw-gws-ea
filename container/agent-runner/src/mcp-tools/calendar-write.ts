@@ -1,10 +1,12 @@
 /**
- * main's two writes on the principal's own events, through the host. gog
- * cannot list the principal as an accepted guest, so creating an event and
- * changing who an event invites go to the host, which keeps the principal on
- * every event it writes (src/modules/gws-ea-meetings/principal-events.ts).
- * Everything else on the calendar stays with gog, as the gcalendar skill
- * teaches.
+ * main's calendar tools that go through the host. gog cannot list the
+ * principal as an accepted guest, so creating an event and changing who an
+ * event invites go to the host, which keeps the principal on every event it
+ * writes (src/modules/gws-ea-meetings/principal-events.ts). Whether a time is
+ * free and who the principal meets are counted by the host from every page
+ * of their calendars (src/modules/gws-ea-meetings/calendar-facts.ts), so no
+ * model copies events to count them. Everything else on the calendar stays
+ * with gog, as the gcalendar skill teaches.
  */
 import { requestTool } from '../action-request.js';
 import { registerTools } from './server.js';
@@ -67,4 +69,33 @@ export const changeGuests = requestTool({
   timeoutMs: CALENDAR_REQUEST_TIMEOUT_MS,
 });
 
-registerTools([createEvent, changeGuests], CALENDAR_CAPABILITY);
+export const findConflicts = requestTool({
+  name: 'find_conflicts',
+  description:
+    "Every meeting on the principal's calendars that overlaps a time, read from all their calendars by the host: overlaps on one calendar too, all-day events and free/busy-only blocks included; cancelled and free events and ones they declined left out. Pass candidate_ical_uid to leave out the invitation or event being checked. Each comes with a label ready to write; titles come wrapped as untrusted text.",
+  properties: {
+    start: { type: 'string', description: `The time's start: ${DATE_TIME}.` },
+    end: { type: 'string', description: `Its end: ${DATE_TIME}. At most 14 days after start.` },
+    candidate_ical_uid: {
+      type: 'string',
+      description: 'The iCalUID of the invitation or event being checked, when it is already on a calendar.',
+    },
+  },
+  required: ['start', 'end'],
+  repeatable: true,
+  timeoutMs: CALENDAR_REQUEST_TIMEOUT_MS,
+});
+
+export const peopleStats = requestTool({
+  name: 'people_stats',
+  description:
+    'Who the principal has met over the last six months, counted by the host from meetings they organized or accepted: meetings, one-on-ones, recurring series, and the first and last day met, for the people met most or the people you name. Names come wrapped as untrusted text.',
+  properties: {
+    people: { ...ADDRESSES, description: 'Email addresses to report on, each listed even with no meetings.' },
+  },
+  required: [],
+  repeatable: true,
+  timeoutMs: CALENDAR_REQUEST_TIMEOUT_MS,
+});
+
+registerTools([createEvent, changeGuests, findConflicts, peopleStats], CALENDAR_CAPABILITY);

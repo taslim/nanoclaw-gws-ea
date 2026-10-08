@@ -5,8 +5,9 @@
  *
  * - the scheduling tools (KTD7): only `external-email`, from the session of
  *   one email thread; every call acts on that thread alone;
- * - `create_event` and `change_guests`: a group holding Google Calendar, as
- *   `gog`'s calendar commands are, which `main` does.
+ * - `create_event`, `change_guests`, `find_conflicts` and `people_stats`: a
+ *   group holding Google Calendar, as `gog`'s calendar commands are, which
+ *   `main` does and external-email never does.
  *
  * No decision here ever holds for approval: these are structural checks.
  */
@@ -45,9 +46,9 @@ export const threadCalendarAction = defineGuardedAction({
 });
 
 /**
- * create_event and change_guests: a group holding Google Calendar, the key
- * that hands `gog` the principal's calendars. Which calendar and which event
- * each call may write is the tool's own check.
+ * main's calendar tools: a group holding Google Calendar, the key that hands
+ * `gog` the principal's calendars. Which calendar and which event each call
+ * may write is the tool's own check.
  */
 export const principalEventAction = defineGuardedAction({
   action: 'gws_ea_meetings.principal_events',
@@ -56,7 +57,7 @@ export const principalEventAction = defineGuardedAction({
       actor.kind !== 'agent' ||
       !(await getGroupCapabilities(actor.agentGroupId)).has(AGENT_GOOGLE_SERVICES.calendar.capability)
     ) {
-      return DENY('Adding events and changing who they invite needs Google Calendar, which this group does not hold.');
+      return DENY("The principal's calendar needs Google Calendar, which this group does not hold.");
     }
     return ALLOW('a group holding Google Calendar');
   },

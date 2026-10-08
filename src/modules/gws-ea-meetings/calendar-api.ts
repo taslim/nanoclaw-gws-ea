@@ -7,13 +7,15 @@
  * No client library: each call is one `fetch` with the token in its header,
  * so it never reaches a container or an argument list.
  *
- * Every event read asks Google for its timing, status, people, the
- * assistant's own private tags, and the Meet link the host asked Google to
- * create, and every write asks for nothing back but the id, so no title,
- * description or location is ever fetched (R20). A guest-list change reads
- * each guest whole, only to write them back as they were, and writes over
- * only the version of the event it read; none of it reaches an agent. Tests
- * use a fake with the same interface.
+ * Every event read for scheduling asks Google for its timing, status,
+ * people, the assistant's own private tags, and the Meet link the host asked
+ * Google to create, and every write asks for nothing back but the id, so no
+ * title, description or location is ever fetched for external-email (R20).
+ * main's calendar facts alone read titles and names (`listEventDetails`), and
+ * never for external-email. A guest-list change reads each guest whole, only
+ * to write them back as they were, and writes over only the version of the
+ * event it read; none of it reaches an agent. Tests use a fake with the same
+ * interface.
  */
 import { isRecord } from '../../gws-ea/validation.js';
 import type { CalendarListEntry } from '../gws-ea-inbox/calendar-notifications.js';
@@ -32,6 +34,8 @@ export interface EventAttendee {
   /** A room or other resource, never a person. */
   readonly resource?: boolean;
   readonly organizer?: boolean;
+  /** The entry for the calendar this copy sits on: on a principal calendar, the principal's own answer. */
+  readonly self?: boolean;
 }
 
 /**
@@ -65,6 +69,33 @@ export interface CalendarEvent {
  * free/busy only may list a busy block without an id, and it still counts.
  */
 export type ListedEvent = Omit<CalendarEvent, 'id'> & { readonly id?: string };
+
+/** A person on an event as main's calendar facts read them, with the name they go by. */
+export interface DetailedAttendee extends EventAttendee {
+  readonly displayName?: string;
+}
+
+/**
+ * An event as main's calendar facts read it: its timing, status and people,
+ * with its title, each person's name, and the series it belongs to. Never
+ * read for external-email.
+ */
+export interface DetailedEvent {
+  readonly id?: string;
+  readonly iCalUID?: string;
+  readonly status?: string;
+  readonly transparency?: string;
+  readonly summary?: string;
+  readonly organizer?: { readonly email?: string; readonly self?: boolean };
+  readonly attendees?: readonly DetailedAttendee[];
+  /** Google left the guest list out: too many guests to list. */
+  readonly attendeesOmitted?: boolean;
+  readonly recurringEventId?: string;
+  /** An occurrence's start before it moved, the same on every copy of it. */
+  readonly originalStartTime?: EventTime;
+  readonly start?: EventTime;
+  readonly end?: EventTime;
+}
 
 /** Whether Google emails the attendees about a write. */
 export type SendUpdates = 'all' | 'none';
@@ -138,10 +169,14 @@ export type NewEvent = EventWrite & { readonly start: string; readonly end: stri
 export interface MeetingsCalendarApi {
   /** The assistant's calendar-list entry for a calendar, or undefined when it has none. */
   getCalendar(calendarId: string): Promise<CalendarEntry | undefined>;
+  /** Every entry of the assistant's calendar list. */
+  listCalendars(): Promise<CalendarEntry[]>;
   /** One event, or undefined when it does not exist. A deleted event reads as `cancelled`. */
   getEvent(calendarId: string, eventId: string): Promise<CalendarEvent | undefined>;
   /** Every live event that overlaps the interval, recurring events expanded. */
   listEvents(calendarId: string, timeMin: string, timeMax: string): Promise<ListedEvent[]>;
+  /** As `listEvents`, with titles, names and series: for main's calendar facts alone. */
+  listEventDetails(calendarId: string, timeMin: string, timeMax: string): Promise<DetailedEvent[]>;
   /** Create an event under the id given; `exists` when Google already holds that id, deleted or not. */
   insertEvent(
     calendarId: string,
@@ -171,7 +206,10 @@ export interface MeetingsCalendarApi {
 
 const CALENDAR_API = 'https://www.googleapis.com/calendar/v3';
 const EVENT_FIELDS =
-  'id,iCalUID,status,transparency,organizer(email),attendees(email,responseStatus,resource,organizer),start(dateTime,date),end(dateTime,date),extendedProperties(private),conferenceData(createRequest(status(statusCode)),entryPoints(entryPointType,uri))';
+  'id,iCalUID,status,transparency,organizer(email),attendees(email,responseStatus,resource,organizer,self),start(dateTime,date),end(dateTime,date),extendedProperties(private),conferenceData(createRequest(status(statusCode)),entryPoints(entryPointType,uri))';
+/** What main's calendar facts read of an event: never written into anything external-email receives. */
+const DETAIL_FIELDS =
+  'id,iCalUID,status,transparency,summary,organizer(email,self),attendees(email,displayName,responseStatus,resource,self),attendeesOmitted,recurringEventId,originalStartTime(dateTime,date),start(dateTime,date),end(dateTime,date)';
 /** The conference type Google Meet is in a calendar's allowed conference types and a create request. */
 const GOOGLE_MEET = 'hangoutsMeet';
 const MAX_PAGES = 10;
@@ -199,7 +237,39 @@ function toAttendee(value: unknown): EventAttendee | undefined {
     ...(responseStatus === undefined ? {} : { responseStatus }),
     ...(value.resource === true ? { resource: true } : {}),
     ...(value.organizer === true ? { organizer: true } : {}),
+    ...(value.self === true ? { self: true } : {}),
   };
+}
+
+/** An event as main's calendar facts read it. */
+function toDetailedEvent(value: unknown): DetailedEvent {
+  if (!isRecord(value)) throw new GoogleApiError(502, 'Google Calendar returned an unreadable event');
+  const fields: Record<string, unknown> = {};
+  for (const key of ['id', 'iCalUID', 'status', 'transparency', 'summary', 'recurringEventId'] as const) {
+    const text = optionalString(value[key]);
+    if (text !== undefined) fields[key] = text;
+  }
+  if (isRecord(value.organizer)) {
+    const email = optionalString(value.organizer.email);
+    fields.organizer = {
+      ...(email === undefined ? {} : { email: email.toLowerCase() }),
+      ...(value.organizer.self === true ? { self: true } : {}),
+    };
+  }
+  if (Array.isArray(value.attendees)) {
+    fields.attendees = value.attendees.flatMap((entry): DetailedAttendee[] => {
+      const attendee = toAttendee(entry);
+      if (attendee === undefined || !isRecord(entry)) return [];
+      const displayName = optionalString(entry.displayName);
+      return [{ ...attendee, ...(displayName === undefined ? {} : { displayName }) }];
+    });
+  }
+  if (value.attendeesOmitted === true) fields.attendeesOmitted = true;
+  for (const key of ['start', 'end', 'originalStartTime'] as const) {
+    const time = toTime(value[key]);
+    if (time !== undefined) fields[key] = time;
+  }
+  return fields as DetailedEvent;
 }
 
 function toTags(value: unknown): Record<string, string> | undefined {
@@ -346,6 +416,41 @@ function writeParams(event: EventWrite, sendUpdates: SendUpdates): URLSearchPara
 
 /** The real client, over the Calendar API. */
 export function createMeetingsCalendarApi(options: GoogleClientOptions): MeetingsCalendarApi {
+  /**
+   * Every page of a calendar's events in the interval, recurring events
+   * expanded; a listing too long to read whole fails rather than coming back
+   * short, because a missing event looks exactly like free time.
+   */
+  async function listPages<T>(
+    calendarId: string,
+    timeMin: string,
+    timeMax: string,
+    fields: string,
+    toItem: (value: unknown) => T,
+  ): Promise<T[]> {
+    const events: T[] = [];
+    let pageToken: string | undefined;
+    for (let page = 0; page < MAX_PAGES; page += 1) {
+      const params = new URLSearchParams({
+        timeMin,
+        timeMax,
+        singleEvents: 'true',
+        maxResults: '250',
+        fields: `items(${fields}),nextPageToken`,
+      });
+      if (pageToken !== undefined) params.set('pageToken', pageToken);
+      const payload = await googleJson(
+        options,
+        `${CALENDAR_API}/calendars/${encodeURIComponent(calendarId)}/events?${params.toString()}`,
+      );
+      if (!isRecord(payload)) throw new GoogleApiError(502, 'Google Calendar returned an unreadable event list');
+      if (Array.isArray(payload.items)) events.push(...payload.items.map(toItem));
+      pageToken = optionalString(payload.nextPageToken);
+      if (pageToken === undefined) return events;
+    }
+    throw new GoogleApiError(502, 'Google Calendar returned an event list too long to read');
+  }
+
   return {
     async getCalendar(calendarId) {
       const payload = await googleJson(
@@ -366,29 +471,25 @@ export function createMeetingsCalendarApi(options: GoogleClientOptions): Meeting
       return payload === undefined ? undefined : toEvent(payload);
     },
 
-    async listEvents(calendarId, timeMin, timeMax) {
-      const events: ListedEvent[] = [];
+    async listCalendars() {
+      const entries: CalendarEntry[] = [];
       let pageToken: string | undefined;
       for (let page = 0; page < MAX_PAGES; page += 1) {
-        const params = new URLSearchParams({
-          timeMin,
-          timeMax,
-          singleEvents: 'true',
-          maxResults: '250',
-          fields: `items(${EVENT_FIELDS}),nextPageToken`,
-        });
+        const params = new URLSearchParams({ maxResults: '250' });
         if (pageToken !== undefined) params.set('pageToken', pageToken);
-        const payload = await googleJson(
-          options,
-          `${CALENDAR_API}/calendars/${encodeURIComponent(calendarId)}/events?${params.toString()}`,
-        );
-        if (!isRecord(payload)) throw new GoogleApiError(502, 'Google Calendar returned an unreadable event list');
-        if (Array.isArray(payload.items)) events.push(...payload.items.map(toListedEvent));
+        const payload = await googleJson(options, `${CALENDAR_API}/users/me/calendarList?${params.toString()}`);
+        if (!isRecord(payload)) throw new GoogleApiError(502, 'Google Calendar returned an unreadable calendar list');
+        if (Array.isArray(payload.items)) entries.push(...payload.items.map(toCalendarEntry));
         pageToken = optionalString(payload.nextPageToken);
-        if (pageToken === undefined) return events;
+        if (pageToken === undefined) return entries;
       }
-      throw new GoogleApiError(502, 'Google Calendar returned an event list too long to read');
+      throw new GoogleApiError(502, 'Google Calendar returned a calendar list too long to read');
     },
+
+    listEvents: (calendarId, timeMin, timeMax) => listPages(calendarId, timeMin, timeMax, EVENT_FIELDS, toListedEvent),
+
+    listEventDetails: (calendarId, timeMin, timeMax) =>
+      listPages(calendarId, timeMin, timeMax, DETAIL_FIELDS, toDetailedEvent),
 
     async insertEvent(calendarId, eventId, event, sendUpdates) {
       const params = writeParams(event, sendUpdates);

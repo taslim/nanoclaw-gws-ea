@@ -6,17 +6,18 @@
  *   day with a clock change is 23 or 25 hours long and every time is its real
  *   length. A wall time the clocks skip lands just after the change.
  * - An event blocks time unless it is cancelled, free (transparent), or an
- *   invitation the principal declined; an all-day event covers the
- *   principal's whole local days (the rules `find_conflicts` uses).
- * - Free time is offered from the principal's waking day, widened by working
- *   hours that reach past it, on a half-hour grid of their clock, clear of
- *   protected time and of busy time by the buffer (`freeTimes`), and inside
- *   the counterpart's waking day when their zone is known. Each time carries
- *   a fit note from a fixed vocabulary on how it sits against the principal's
- *   preferences (`fitOf`). The times are spread across days and hours of the
- *   day as a person offers them, and listed in date order. Only protected
- *   time is hard (`inProtectedTime`), so a time someone proposes is checked
- *   against it too.
+ *   invitation the principal declined on that calendar; an all-day event
+ *   covers the principal's whole local days. `free_time`, `book` and main's
+ *   `find_conflicts` all read time through this one rule.
+ * - Free time is every free window in the principal's waking day, widened
+ *   by working hours that reach past it, clear of protected time and of busy
+ *   time by the buffer, inside the counterpart's waking day when their zone
+ *   is known, and long enough for the meeting (`freeWindows`). Its edges sit
+ *   on the quarter hour. Each window carries a fit note from a fixed
+ *   vocabulary that every meeting inside it meets (`fitOf`), so a window is
+ *   split where the fit changes. The agent picks the times; the host only
+ *   says which are free. Only protected time is hard (`inProtectedTime`), so
+ *   a time someone proposes is checked against it too.
  */
 import {
   type PreferenceValue,
@@ -24,7 +25,8 @@ import {
   type SchedulingPreferenceValues,
   type Weekday,
 } from '../gws-ea-preferences/db.js';
-import type { ListedEvent } from './calendar-api.js';
+import { identityMatchKey } from '../../gws-ea/validation.js';
+import type { EventAttendee, ListedEvent } from './calendar-api.js';
 
 /** An interval of instants, in milliseconds since the epoch; `end` is exclusive. */
 export interface Span {
@@ -58,8 +60,8 @@ export interface SchedulingRules {
   readonly bufferMinutes: number;
 }
 
-/** Candidates start on this grid of the principal's clock. */
-const SLOT_GRID_MINUTES = 30;
+/** Free windows start and end on the quarter hour. */
+const EDGE_MINUTES = 15;
 /** The waking day, 07:00 to 22:00, which free time offers from on either side's clock: never the night. */
 const WAKING_HOURS: ClockRange = { start: 7 * 60, end: 22 * 60 };
 /** Working hours until the principal has any: Monday to Friday, 09:00 to 17:00. */
@@ -192,10 +194,6 @@ function nextDate(date: LocalDate): LocalDate {
   return { year: next.getUTCFullYear(), month: next.getUTCMonth() + 1, day: next.getUTCDate() };
 }
 
-function dateKey(date: LocalDate): string {
-  return `${date.year}-${String(date.month).padStart(2, '0')}-${String(date.day).padStart(2, '0')}`;
-}
-
 function compareDates(a: LocalDate, b: LocalDate): number {
   return a.year - b.year || a.month - b.month || a.day - b.day;
 }
@@ -230,7 +228,7 @@ function parseClock(value: string): number | undefined {
 // ---------------------------------------------------------------------------
 
 /** An event's span: a timed event's instants, an all-day event's whole local days. */
-export function eventSpan(event: ListedEvent, timezone: string): Span | undefined {
+export function eventSpan(event: Pick<ListedEvent, 'start' | 'end'>, timezone: string): Span | undefined {
   const { start, end } = event;
   if (start?.dateTime !== undefined && end?.dateTime !== undefined) {
     const span = { start: Date.parse(start.dateTime), end: Date.parse(end.dateTime) };
@@ -242,13 +240,58 @@ export function eventSpan(event: ListedEvent, timezone: string): Span | undefine
   return { start: zonedInstant(startDate, 0, timezone), end: zonedInstant(endDate, 0, timezone) };
 }
 
-/** Whether an event takes the principal's time: not cancelled, not free, not declined by them. */
-export function blocksTime(event: ListedEvent, principal: ReadonlySet<string>): boolean {
-  if (event.status === 'cancelled' || event.transparency === 'transparent') return false;
-  return !(event.attendees ?? []).some(
-    (attendee) =>
-      attendee.email !== undefined && principal.has(attendee.email) && attendee.responseStatus === 'declined',
+/** How strongly an answer commits the principal; the strongest across their addresses stands. */
+const ANSWER_RANK: Readonly<Record<string, number>> = { accepted: 3, tentative: 2, needsAction: 1, declined: 0 };
+
+/** Whether an address reaches one of the principal's mailboxes, in any spelling Gmail delivers to them. */
+export function isPrincipalAddress(email: string | undefined, principal: ReadonlySet<string>): boolean {
+  if (email === undefined) return false;
+  const key = identityMatchKey(`email:${email}`);
+  for (const address of principal) if (identityMatchKey(`email:${address}`) === key) return true;
+  return false;
+}
+
+/** Whether a guest-list entry speaks for the principal on this copy: the calendar's own entry, or one of their addresses. */
+export function isPrincipalAttendee(attendee: EventAttendee, principal: ReadonlySet<string>): boolean {
+  return attendee.self === true || isPrincipalAddress(attendee.email, principal);
+}
+
+/**
+ * The principal's answer on one copy of an event: the entry for the
+ * calendar it sits on decides when there is one; otherwise their strongest
+ * answer from any of their addresses.
+ */
+export function principalAnswer(
+  event: { readonly attendees?: readonly EventAttendee[] },
+  principal: ReadonlySet<string>,
+): string | undefined {
+  const attendees = event.attendees ?? [];
+  const own = attendees.find((attendee) => attendee.self === true);
+  if (own) return own.responseStatus;
+  return strongestAnswer(
+    attendees
+      .filter((attendee) => isPrincipalAddress(attendee.email, principal))
+      .map((attendee) => attendee.responseStatus),
   );
+}
+
+/** The answer that commits the principal most, of several. */
+export function strongestAnswer(answers: readonly (string | undefined)[]): string | undefined {
+  let strongest: string | undefined;
+  for (const answer of answers) {
+    if (answer === undefined) continue;
+    if (strongest === undefined || (ANSWER_RANK[answer] ?? -1) > (ANSWER_RANK[strongest] ?? -1)) strongest = answer;
+  }
+  return strongest;
+}
+
+/** Whether an event takes the principal's time: not cancelled, not free, not declined by them on its calendar. */
+export function blocksTime(
+  event: Pick<ListedEvent, 'status' | 'transparency' | 'attendees'>,
+  principal: ReadonlySet<string>,
+): boolean {
+  if (event.status === 'cancelled' || event.transparency === 'transparent') return false;
+  return principalAnswer(event, principal) !== 'declined';
 }
 
 // ---------------------------------------------------------------------------
@@ -358,24 +401,19 @@ export function fitOf(span: Span, rules: SchedulingRules, timezone: string): Fit
 
 export interface FreeTimeQuery {
   readonly timezone: string;
-  /** The counterpart's zone, when known: every time offered falls inside their waking day too. */
+  /** The counterpart's zone, when known: every window falls inside their waking day too. */
   readonly counterpartTimezone?: string;
   readonly lengthMinutes: number;
-  /** Every time offered lies wholly inside it. */
+  /** Every window lies wholly inside it. */
   readonly window: Span;
   /** Time already taken on the principal's calendars. */
   readonly busy: readonly Span[];
   readonly rules: SchedulingRules;
 }
 
-export interface FreeTime extends Span {
+/** A free window: every meeting of the asked length inside it is free, and fits at least as `fit` says. */
+export interface FreeWindow extends Span {
   readonly fit: Fit;
-}
-
-/** An open time, with the principal's local day and hour of the day it starts in. */
-interface OpenTime extends FreeTime {
-  readonly day: string;
-  readonly hour: number;
 }
 
 /** The hours free time offers from on a weekday: the waking day, widened by working hours that reach past it. */
@@ -386,60 +424,131 @@ function offerHours(rules: SchedulingRules, weekday: Weekday): ClockRange {
     : WAKING_HOURS;
 }
 
-/** Whether a span lies wholly inside the waking day on `timezone`'s clock. */
-function insideWakingDay(span: Span, timezone: string): boolean {
-  const day = onDay(localTime(span.start, timezone), WAKING_HOURS, timezone);
-  return span.start >= day.start && span.end <= day.end;
+/** `spans` with every part inside one of `cuts` removed. */
+function without(spans: readonly Span[], cuts: readonly Span[]): Span[] {
+  let left = [...spans];
+  for (const cut of cuts) {
+    left = left.flatMap((span) =>
+      overlaps(span, cut)
+        ? [
+            ...(span.start < cut.start ? [{ start: span.start, end: cut.start }] : []),
+            ...(cut.end < span.end ? [{ start: cut.end, end: span.end }] : []),
+          ]
+        : [span],
+    );
+  }
+  return left;
+}
+
+/** The parts of `spans` inside one of `keep`. */
+function within(spans: readonly Span[], keep: readonly Span[]): Span[] {
+  return spans.flatMap((span) =>
+    keep.flatMap((kept) =>
+      overlaps(span, kept) ? [{ start: Math.max(span.start, kept.start), end: Math.min(span.end, kept.end) }] : [],
+    ),
+  );
+}
+
+/** The waking days on `timezone`'s clock that meet `span`. */
+function wakingDays(span: Span, timezone: string): Span[] {
+  const days: Span[] = [];
+  const last = localTime(span.end, timezone);
+  for (let date: LocalDate = localTime(span.start, timezone); compareDates(date, last) <= 0; date = nextDate(date)) {
+    days.push(onDay(date, WAKING_HOURS, timezone));
+  }
+  return days;
+}
+
+/** A free run with its edges moved inward to the quarter hour; every zone in use keeps quarter hours on its clock. */
+function onQuarterHours(span: Span): Span {
+  const quarter = EDGE_MINUTES * MINUTE;
+  return { start: Math.ceil(span.start / quarter) * quarter, end: Math.floor(span.end / quarter) * quarter };
 }
 
 /**
- * Up to `limit` open times, chosen from the earliest as a person offers
- * them: first the earliest time each day at an hour of the day not offered
- * yet, then the earliest left that overlaps none already chosen.
+ * A free run split where its fit changes, at the day's working hours and
+ * preferred times. A piece too short for the meeting cannot hold one at its
+ * own fit, so it joins a neighbour whose fit the joining leaves as it was,
+ * the better fitting one first, and goes when no neighbour takes it; then
+ * neighbours that fit alike as one become one. Every window is labeled with
+ * the fit of the window as a whole, which every meeting inside it meets.
  */
-function spread(open: readonly OpenTime[], limit: number): OpenTime[] {
-  const chosen: OpenTime[] = [];
-  for (const time of open) {
-    if (chosen.length >= limit) return chosen;
-    if (!chosen.some((taken) => taken.day === time.day || taken.hour === time.hour)) chosen.push(time);
+function byFit(run: Span, date: LocalDate, rules: SchedulingRules, timezone: string, length: number): FreeWindow[] {
+  const weekday = weekdayOf(date);
+  const hours = rules.workingHours.get(weekday);
+  const ranges: ClockRange[] = [
+    ...(hours === undefined ? [] : [hours]),
+    ...rules.preferredTimes.filter((window) => window.weekdays.has(weekday)),
+  ];
+  const cuts = new Set<number>();
+  for (const range of ranges) {
+    const { start, end } = onDay(date, range, timezone);
+    for (const cut of [start, end]) if (cut > run.start && cut < run.end) cuts.add(cut);
   }
-  for (const time of open) {
-    if (chosen.length >= limit) return chosen;
-    if (!chosen.some((taken) => overlaps(taken, time))) chosen.push(time);
+  const points = [run.start, ...[...cuts].sort((a, b) => a - b), run.end];
+  const fitted = (span: Span): FreeWindow => ({ ...span, fit: fitOf(span, rules, timezone) });
+  const rank = (fit: Fit): number => FITS.indexOf(fit);
+  /** `pieces[first]` and the one after it as one window, when that leaves `keep`'s fit as it was. */
+  const join = (pieces: readonly FreeWindow[], first: number, keep: FreeWindow): FreeWindow | undefined => {
+    const joined = fitted({ start: pieces[first].start, end: pieces[first + 1].end });
+    return joined.fit === keep.fit ? joined : undefined;
+  };
+
+  let pieces = points.slice(1).map((end, index) => fitted({ start: points[index], end }));
+  for (;;) {
+    const short = pieces.findIndex((piece) => piece.end - piece.start < length);
+    if (short < 0) break;
+    const [best] = [short - 1, short + 1]
+      .filter((index) => index >= 0 && index < pieces.length)
+      .flatMap((index) => {
+        const first = Math.min(index, short);
+        const window = join(pieces, first, pieces[index]);
+        return window === undefined ? [] : [{ first, window }];
+      })
+      .sort((a, b) => rank(a.window.fit) - rank(b.window.fit));
+    pieces =
+      best === undefined
+        ? pieces.filter((_, index) => index !== short)
+        : [...pieces.slice(0, best.first), best.window, ...pieces.slice(best.first + 2)];
   }
-  return chosen;
+  const merged: FreeWindow[] = [];
+  for (const piece of pieces) {
+    const last = merged.at(-1);
+    const joined = last !== undefined && last.end === piece.start ? join([last, piece], 0, piece) : undefined;
+    if (joined !== undefined && joined.fit === last?.fit) merged[merged.length - 1] = joined;
+    else merged.push(piece);
+  }
+  return merged;
 }
 
 /**
- * Up to `limit` open times in the window, spread as a person offers them and
- * listed in date order: on the half-hour grid of the principal's clock,
- * within the hours free time offers from and the counterpart's waking day,
- * starting no earlier than the window, and clear of protected time and of
- * busy time by the buffer.
+ * Every free window in the range: in the hours free time offers from, inside
+ * the counterpart's waking day when their zone is known, from the range's
+ * start on, clear of protected time and of busy time by the buffer, on the
+ * quarter hour, long enough for the meeting, and split where the fit
+ * changes. Listed in date order.
  */
-export function freeTimes(query: FreeTimeQuery, limit: number): FreeTime[] {
+export function freeWindows(query: FreeTimeQuery): FreeWindow[] {
   const { timezone, counterpartTimezone, rules, window } = query;
   const length = query.lengthMinutes * MINUTE;
-  const grid = SLOT_GRID_MINUTES * MINUTE;
-  const open: OpenTime[] = [];
+  const buffer = rules.bufferMinutes * MINUTE;
+  const taken = query.busy.map((span) => ({ start: span.start - buffer, end: span.end + buffer }));
+  const windows: FreeWindow[] = [];
   const last = localTime(window.end, timezone);
   for (let date: LocalDate = localTime(window.start, timezone); compareDates(date, last) <= 0; date = nextDate(date)) {
-    const hours = offerHours(rules, weekdayOf(date));
-    const firstStart = Math.ceil(hours.start / SLOT_GRID_MINUTES) * SLOT_GRID_MINUTES;
-    const day = onDay(date, { start: firstStart, end: hours.end }, timezone);
-    // Real minutes from the day's first grid start: a clock change keeps the grid on the hour.
-    for (let start = day.start; start + length <= day.end; start += grid) {
-      const span = { start, end: start + length };
-      if (span.start < window.start || span.end > window.end) continue;
-      if (counterpartTimezone !== undefined && !insideWakingDay(span, counterpartTimezone)) continue;
-      if (inProtectedTime(span, rules, timezone) || !isClear(span, query.busy, rules.bufferMinutes)) continue;
-      const hour = Math.floor(localTime(span.start, timezone).minuteOfDay / 60);
-      open.push({ ...span, fit: fitOf(span, rules, timezone), day: dateKey(date), hour });
+    const weekday = weekdayOf(date);
+    let open = within([onDay(date, offerHours(rules, weekday), timezone)], [window]);
+    if (counterpartTimezone !== undefined) {
+      open = open.flatMap((span) => within([span], wakingDays(span, counterpartTimezone)));
+    }
+    const protectedTime = rules.protectedWindows
+      .filter((protectedWindow) => protectedWindow.weekdays.has(weekday))
+      .map((protectedWindow) => onDay(date, protectedWindow, timezone));
+    for (const run of without(without(open, protectedTime), taken).map(onQuarterHours)) {
+      if (run.end - run.start >= length) windows.push(...byFit(run, date, rules, timezone, length));
     }
   }
-  return spread(open, limit)
-    .sort((a, b) => a.start - b.start)
-    .map(({ start, end, fit }) => ({ start, end, fit }));
+  return windows.sort((a, b) => a.start - b.start);
 }
 
 /** One day, in milliseconds: how far calendar reads widen so all-day events are seen whole. */

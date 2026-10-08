@@ -8,9 +8,10 @@
  *
  * Beside them, `main`'s two writes on the principal's own events, which list
  * the principal as an accepted guest as `gog` cannot (`principal-events.ts`),
- * for a group holding Google Calendar:
+ * and its two calendar facts, counted from Google's own answer
+ * (`calendar-facts.ts`), for a group holding Google Calendar:
  *
- *   create_event, change_guests
+ *   create_event, change_guests, find_conflicts, people_stats
  *
  * Each is a delivery action with a guard (`guard.ts`) that admits only
  * `external-email`, from one email thread's session, and each request gets
@@ -29,6 +30,7 @@ import { registerDeliveryAction } from '../../delivery.js';
 import { onHostStart } from '../../host-lifecycle.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { createMeetingsCalendarApi, type MeetingsCalendarApi } from './calendar-api.js';
+import { createCalendarFactTools } from './calendar-facts.js';
 import { principalEventAction, threadCalendarAction } from './guard.js';
 import { createPrincipalEventTools } from './principal-events.js';
 import { createSchedulingTools } from './tools.js';
@@ -57,10 +59,13 @@ for (const [action, answer] of SCHEDULING_REQUESTS) {
 }
 
 const principalEvents = createPrincipalEventTools({ calendar: calendarApi });
+const facts = createCalendarFactTools({ calendar: calendarApi });
 
 for (const [action, answer] of [
   ['create_event', principalEvents.createEvent],
   ['change_guests', principalEvents.changeGuests],
+  ['find_conflicts', facts.findConflicts],
+  ['people_stats', facts.peopleStats],
 ] as const) {
   registerDeliveryAction(action, answeringAction(action, answer), answeredGuard(principalEventAction));
 }

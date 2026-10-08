@@ -150,13 +150,12 @@ function refusal(frame: ResponseFrame): string {
   return frame.error.message;
 }
 
-interface Offered {
+interface Free {
   readonly start: string;
   readonly end: string;
   readonly principal_time: string;
   readonly their_time?: string;
   readonly fit: string;
-  readonly held: boolean;
 }
 
 /** What main heard, in order: here, only the facts of bookings. */
@@ -310,49 +309,45 @@ describe('the scheduling tools', () => {
 });
 
 describe('free_time', () => {
-  it("offers spread free times in date order, inside both sides' waking day, labeled in both zones with a fixed fit note", async () => {
+  it("lists free windows in date order, inside both sides' waking day, labeled in both zones with a fixed fit note", async () => {
     // The principal is busy Wednesday 12:00 to 14:00 London.
     const taken = { start: Date.parse('2026-10-07T11:00:00Z'), end: Date.parse('2026-10-07T13:00:00Z') };
     calendar.put(busy('evt-wed', '2026-10-07T11:00:00Z', '2026-10-07T13:00:00Z'));
 
     const frame = await send(sessionA, 'free_time', { ...RANGE, minutes: 30, timezone: 'America/New_York' });
-    const { times, message } = data(frame) as { times: Offered[]; message: string };
+    const { windows, windows_not_listed, message } = data(frame) as {
+      windows: Free[];
+      windows_not_listed: number;
+      message: string;
+    };
 
-    // New York wakes at 12:00 London: the earliest each day at a new hour, then the earliest left.
-    expect(times.map((time) => time.start)).toEqual([
-      '2026-10-06T11:00:00.000Z',
-      '2026-10-06T11:30:00.000Z',
-      '2026-10-06T12:00:00.000Z',
-      '2026-10-06T12:30:00.000Z',
-      '2026-10-06T13:00:00.000Z',
-      '2026-10-06T13:30:00.000Z',
-      '2026-10-07T13:00:00.000Z',
-      '2026-10-08T12:00:00.000Z',
+    // New York wakes at 12:00 London, and Tuesday's protected afternoon and Wednesday's meeting are gone.
+    expect(windows.map((free) => [free.principal_time, free.their_time, free.fit])).toEqual([
+      ['Tuesday 6 Oct, 12:00–15:00 BST', 'Tuesday 6 Oct, 07:00–10:00 EDT', 'acceptable'],
+      ['Tuesday 6 Oct, 17:00–22:00 BST', 'Tuesday 6 Oct, 12:00–17:00 EDT', 'outside usual hours'],
+      ['Wednesday 7 Oct, 14:00–17:00 BST', 'Wednesday 7 Oct, 09:00–12:00 EDT', 'acceptable'],
+      ['Wednesday 7 Oct, 17:00–22:00 BST', 'Wednesday 7 Oct, 12:00–17:00 EDT', 'outside usual hours'],
+      ['Thursday 8 Oct, 12:00–17:00 BST', 'Thursday 8 Oct, 07:00–12:00 EDT', 'acceptable'],
+      ['Thursday 8 Oct, 17:00–22:00 BST', 'Thursday 8 Oct, 12:00–17:00 EDT', 'outside usual hours'],
     ]);
-    for (const time of times) {
-      const span = { start: Date.parse(time.start), end: Date.parse(time.end) };
-      expect(span.end - span.start).toBe(30 * 60_000);
-      expect(overlaps(span, PROTECTED), time.start).toBe(false);
-      expect(overlaps(span, taken), time.start).toBe(false);
-      expect(FITS).toContain(time.fit);
-      expect(time.principal_time).toMatch(/ BST$/u);
-      expect(time.their_time).toMatch(/ EDT$/u);
+    expect(windows_not_listed).toBe(0);
+    for (const free of windows) {
+      const span = { start: Date.parse(free.start), end: Date.parse(free.end) };
+      expect(overlaps(span, PROTECTED), free.start).toBe(false);
+      expect(overlaps(span, taken), free.start).toBe(false);
+      expect(FITS).toContain(free.fit);
     }
-    expect(times[0]).toMatchObject({
-      principal_time: 'Tuesday 6 Oct, 12:00–12:30 BST',
-      their_time: 'Tuesday 6 Oct, 07:00–07:30 EDT',
-      fit: 'acceptable',
-    });
-    // Each line leads with its start on the principal's clock, with its offset, which the tools take back.
+    // Each line leads with the window on the principal's clock, with its offset, which the tools take back.
     expect(message.split('\n').slice(0, 2)).toEqual([
-      'Free times:',
-      '- 2026-10-06T12:00+01:00: Tuesday 6 Oct, 12:00–12:30 BST; for them, Tuesday 6 Oct, 07:00–07:30 EDT (acceptable)',
+      "Free for 30 minutes: any start that ends by a window's end.",
+      '- 2026-10-06T12:00+01:00 to 2026-10-06T15:00+01:00: Tuesday 6 Oct, 12:00–15:00 BST; for them, Tuesday 6 Oct, 07:00–10:00 EDT (acceptable)',
     ]);
     const [, firstLine] = message.split('\n');
-    const firstOffered = firstLine.slice('- '.length, firstLine.indexOf(': '));
-    expect(data(await send(sessionA, 'hold', { starts: [firstOffered], minutes: 30 })).held).toEqual([
-      { start: times[0].start, end: times[0].end, principal_time: times[0].principal_time },
-    ]);
+    const firstStart = firstLine.slice('- '.length, firstLine.indexOf(' to '));
+    const booked = data(
+      await send(sessionA, 'book', { start: firstStart, minutes: 30, title: 'Catch-up', invitees: [REMY] }),
+    );
+    expect(booked.start).toBe(windows[0].start);
 
     // Free/busy only: neither the principal's event nor their preferences' words reach the thread.
     const answer = JSON.stringify(frame);
@@ -361,88 +356,92 @@ describe('free_time', () => {
     }
   });
 
-  it('offers a Pacific principal and a counterpart in Berlin the mornings they share', async () => {
+  it('lists a Pacific principal and a counterpart in Berlin the mornings they share', async () => {
     await getDb().run("UPDATE gws_ea_profile SET principal_timezone = 'America/Los_Angeles' WHERE singleton = 1");
-    const times = data(
+    const { windows, windows_not_listed } = data(
       await send(sessionA, 'free_time', {
         from: '2026-10-05T00:00:00-07:00',
         to: '2026-10-13T00:00:00-07:00',
         minutes: 30,
         timezone: 'Europe/Berlin',
       }),
-    ).times as Offered[];
-    // Berlin is nine hours ahead: its waking day ends at 13:00 in Los Angeles, so Sunday has no new hour left
-    // and Monday's next free half-hours fill the last two places.
-    expect(times.map((time) => [time.principal_time, time.their_time])).toEqual([
-      ['Monday 5 Oct, 07:00–07:30 PDT', 'Monday 5 Oct, 16:00–16:30 CEST'],
-      ['Monday 5 Oct, 07:30–08:00 PDT', 'Monday 5 Oct, 16:30–17:00 CEST'],
-      ['Monday 5 Oct, 08:00–08:30 PDT', 'Monday 5 Oct, 17:00–17:30 CEST'],
-      ['Tuesday 6 Oct, 08:00–08:30 PDT', 'Tuesday 6 Oct, 17:00–17:30 CEST'],
-      ['Wednesday 7 Oct, 09:00–09:30 PDT', 'Wednesday 7 Oct, 18:00–18:30 CEST'],
-      ['Thursday 8 Oct, 10:00–10:30 PDT', 'Thursday 8 Oct, 19:00–19:30 CEST'],
-      ['Friday 9 Oct, 11:00–11:30 PDT', 'Friday 9 Oct, 20:00–20:30 CEST'],
-      ['Saturday 10 Oct, 12:00–12:30 PDT', 'Saturday 10 Oct, 21:00–21:30 CEST'],
+    ) as { windows: Free[]; windows_not_listed: number };
+    // Berlin is nine hours ahead: its waking day ends at 13:00 in Los Angeles.
+    const shown = windows.map((free) => [free.principal_time, free.their_time, free.fit]);
+    expect(shown.slice(0, 3)).toEqual([
+      ['Monday 5 Oct, 07:00–09:00 PDT', 'Monday 5 Oct, 16:00–18:00 CEST', 'outside usual hours'],
+      ['Monday 5 Oct, 09:00–12:00 PDT', 'Monday 5 Oct, 18:00–21:00 CEST', 'preferred'],
+      ['Monday 5 Oct, 12:00–13:00 PDT', 'Monday 5 Oct, 21:00–22:00 CEST', 'acceptable'],
     ]);
+    expect(shown).toContainEqual([
+      'Saturday 10 Oct, 07:00–13:00 PDT',
+      'Saturday 10 Oct, 16:00–22:00 CEST',
+      'outside usual hours',
+    ]);
+    expect(windows).toHaveLength(20);
+    expect(windows_not_listed).toBe(0);
   });
 
-  it('offers nothing inside protected time, even when the range asks only for that afternoon', async () => {
-    const times = data(
+  it('lists nothing inside protected time, even when the range asks only for that afternoon', async () => {
+    const { windows } = data(
       await send(sessionA, 'free_time', {
         from: '2026-10-06T14:00:00+01:00',
         to: '2026-10-06T18:00:00+01:00',
         minutes: 30,
       }),
-    ).times as Offered[];
-    expect(times.map((time) => [time.start, time.fit])).toEqual([
-      ['2026-10-06T13:00:00.000Z', 'acceptable'],
-      ['2026-10-06T13:30:00.000Z', 'acceptable'],
-      ['2026-10-06T16:00:00.000Z', 'outside usual hours'],
-      ['2026-10-06T16:30:00.000Z', 'outside usual hours'],
+    ) as { windows: Free[] };
+    expect(windows.map((free) => [free.principal_time, free.fit])).toEqual([
+      ['Tuesday 6 Oct, 14:00–15:00 BST', 'acceptable'],
+      ['Tuesday 6 Oct, 17:00–18:00 BST', 'outside usual hours'],
     ]);
   });
 
-  it('says a weekend time is outside usual hours, and offers nothing at night', async () => {
-    const times = data(
+  it('says a weekend day is outside usual hours, and lists nothing at night', async () => {
+    const { windows } = data(
       await send(sessionA, 'free_time', {
         from: '2026-10-10T00:00:00+01:00',
         to: '2026-10-11T00:00:00+01:00',
         minutes: 60,
       }),
-    ).times as Offered[];
-    expect(times.length).toBeGreaterThan(0);
-    for (const time of times) {
-      expect(time.fit).toBe('outside usual hours');
-      expect(time.their_time).toBeUndefined();
-      const hour = Number(time.principal_time.match(/, (\d{2}):/u)?.[1]);
-      expect(hour).toBeGreaterThanOrEqual(7);
-      expect(hour).toBeLessThan(22);
-    }
+    ) as { windows: Free[] };
+    expect(windows).toEqual([
+      {
+        start: '2026-10-10T06:00:00.000Z',
+        end: '2026-10-10T21:00:00.000Z',
+        principal_time: 'Saturday 10 Oct, 07:00–22:00 BST',
+        fit: 'outside usual hours',
+      },
+    ]);
   });
 
-  it('offers times from now on, none already past and no notice asked beyond that', async () => {
-    const times = data(
+  it('lists time from now on, none already past and no notice asked beyond that', async () => {
+    const { windows } = data(
       await send(sessionA, 'free_time', {
         from: '2026-10-05T00:00:00+01:00',
         to: '2026-10-05T10:00:00+01:00',
         minutes: 30,
       }),
-    ).times as Offered[];
-    // It is 08:00 in London: 07:00 and 07:30 have passed, and 08:00 is offered.
-    expect(times.map((time) => time.start)).toEqual([
-      '2026-10-05T07:00:00.000Z',
-      '2026-10-05T07:30:00.000Z',
-      '2026-10-05T08:00:00.000Z',
-      '2026-10-05T08:30:00.000Z',
+    ) as { windows: Free[] };
+    // It is 08:00 in London: 07:00 has passed.
+    expect(windows.map((free) => [free.principal_time, free.fit])).toEqual([
+      ['Monday 5 Oct, 08:00–09:00 BST', 'outside usual hours'],
+      ['Monday 5 Oct, 09:00–10:00 BST', 'preferred'],
     ]);
   });
 
-  it('offers this thread’s own held time back, marked held, while another thread’s hold stays busy', async () => {
-    data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM], minutes: 30 }));
-    const range = { from: '2026-10-06T10:00:00+01:00', to: '2026-10-06T10:30:00+01:00', minutes: 30 };
-
-    const fromA = data(await send(sessionA, 'free_time', range)).times as Offered[];
-    expect(fromA.map((time) => [time.start, time.held])).toEqual([[TUESDAY_10AM, true]]);
-    expect(data(await send(sessionB, 'free_time', range)).times).toEqual([]);
+  it('lists about a week of windows from a long range, and says how many more there are', async () => {
+    const { windows, windows_not_listed, message } = data(
+      await send(sessionA, 'free_time', {
+        from: '2026-10-06T00:00:00+01:00',
+        to: '2026-11-05T00:00:00Z',
+        minutes: 30,
+      }),
+    ) as { windows: Free[]; windows_not_listed: number; message: string };
+    expect(windows).toHaveLength(24);
+    expect(windows_not_listed).toBeGreaterThan(0);
+    expect(message.split('\n').at(-1)).toBe(
+      `${windows_not_listed} later windows are not listed: ask from the last one on for more.`,
+    );
   });
 });
 
@@ -457,16 +456,19 @@ describe('busy time on the principal’s other calendars', () => {
     calendar.put({ ...busy('evt-personal', WEDNESDAY_10AM, '2026-10-07T09:30:00.000Z'), calendarId: PERSONAL });
     const taken = { start: Date.parse(WEDNESDAY_10AM), end: Date.parse('2026-10-07T09:30:00.000Z') };
 
-    const times = data(
+    const { windows } = data(
       await send(sessionA, 'free_time', {
         from: '2026-10-07T09:00:00+01:00',
         to: '2026-10-07T12:00:00+01:00',
         minutes: 30,
       }),
-    ).times as Offered[];
-    expect(times.length).toBeGreaterThan(0);
-    for (const time of times) {
-      expect(overlaps({ start: Date.parse(time.start), end: Date.parse(time.end) }, taken), time.start).toBe(false);
+    ) as { windows: Free[] };
+    expect(windows.map((free) => free.principal_time)).toEqual([
+      'Wednesday 7 Oct, 09:00–10:00 BST',
+      'Wednesday 7 Oct, 10:30–12:00 BST',
+    ]);
+    for (const free of windows) {
+      expect(overlaps({ start: Date.parse(free.start), end: Date.parse(free.end) }, taken), free.start).toBe(false);
     }
     expect(
       refusal(
@@ -725,6 +727,33 @@ describe('book', () => {
         'u',
       ),
     );
+  });
+
+  it('answers with the time ready to write in both zones, and refuses notes whose weekday and date disagree, writing nothing', async () => {
+    const booked = data(
+      await send(sessionA, 'book', {
+        start: TUESDAY_10AM,
+        minutes: 30,
+        title: 'Catch-up',
+        invitees: [REMY],
+        timezone: 'America/New_York',
+      }),
+    );
+    expect(booked.message).toMatch(
+      /^Booked: Tuesday 6 Oct, 10:00–10:30 BST; for them, Tuesday 6 Oct, 05:00–05:30 EDT\. /u,
+    );
+
+    const misdated = await send(sessionB, 'book', {
+      start: THURSDAY_2PM,
+      minutes: 30,
+      title: 'Catch-up',
+      notes: 'See you Friday 8 October.',
+      invitees: [JANE],
+    });
+    expect(refusal(misdated)).toBe(
+      'The booking was not made: it says "Friday 8 October", but 8 October 2026 is a Thursday. Work the day out with the time tools and write it again; give the year when you mean another one, and put words you quote from someone else in quotation marks.',
+    );
+    expect(live('booking')).toHaveLength(1);
   });
 
   it('invites everyone on the thread but the principal and the assistant when it names nobody', async () => {

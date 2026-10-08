@@ -204,6 +204,54 @@ describe('the Calendar client', () => {
     ]);
   });
 
+  it("reads every page of main's detailed listing, titles and names included, and fails rather than come back short", async () => {
+    const page = (token: string | undefined, id: string) => ({
+      items: [
+        {
+          id,
+          summary: 'Quarterly review',
+          organizer: { email: 'Pat@Principal.example', self: true },
+          attendees: [
+            { email: 'pat@principal.example', self: true, responseStatus: 'accepted' },
+            { email: 'remy@friends.example', displayName: 'Remy Vance', responseStatus: 'needsAction' },
+          ],
+          recurringEventId: 'series1',
+          originalStartTime: { dateTime: '2026-10-07T09:00:00Z' },
+          start: { dateTime: '2026-10-07T09:00:00Z' },
+          end: { dateTime: '2026-10-07T10:00:00Z' },
+        },
+      ],
+      ...(token === undefined ? {} : { nextPageToken: token }),
+    });
+    const { api, requests } = stubGoogle((request) =>
+      request.url.searchParams.get('pageToken') === 'p2'
+        ? { status: 200, body: page(undefined, 'e2') }
+        : { status: 200, body: page('p2', 'e1') },
+    );
+    const events = await api.listEventDetails('pat@principal.example', '2026-10-07T00:00:00Z', '2026-10-08T00:00:00Z');
+    expect(events.map((event) => event.id)).toEqual(['e1', 'e2']);
+    expect(events[0]).toEqual({
+      id: 'e1',
+      summary: 'Quarterly review',
+      recurringEventId: 'series1',
+      organizer: { email: 'pat@principal.example', self: true },
+      attendees: [
+        { email: 'pat@principal.example', self: true, responseStatus: 'accepted' },
+        { email: 'remy@friends.example', displayName: 'Remy Vance', responseStatus: 'needsAction' },
+      ],
+      originalStartTime: { dateTime: '2026-10-07T09:00:00Z' },
+      start: { dateTime: '2026-10-07T09:00:00Z' },
+      end: { dateTime: '2026-10-07T10:00:00Z' },
+    });
+    expect(requests[0].url.searchParams.get('singleEvents')).toBe('true');
+    expect(requests[0].url.searchParams.get('fields')).toContain('summary');
+
+    const endless = stubGoogle(() => ({ status: 200, body: page('more', 'e') }));
+    await expect(
+      endless.api.listEventDetails('pat@principal.example', '2026-01-01T00:00:00Z', '2026-12-31T00:00:00Z'),
+    ).rejects.toThrow(/too long to read/u);
+  });
+
   it("reads an event's own tags, but never its title, description or location", async () => {
     const { api, requests } = stubGoogle(() => ({
       status: 200,

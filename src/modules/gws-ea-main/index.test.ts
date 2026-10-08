@@ -78,7 +78,9 @@ const REQUIRED_GUIDANCE = [
   'Answer invitations awaiting the principal as they would.',
   'An answer they already gave stands.',
   'Holds the assistant placed while arranging meetings give way to real commitments and lapse on their own',
-  'with the schedule statistics and people statistics tools',
+  'count rather than glance: a few weeks seen at a glance is not a pattern.',
+  'count a couple of months of their calendar with a short script',
+  'when one conflicts with something they asked for, point out the conflict rather than undo their request.',
   'refresh what you learned as things change',
   'only the principal sets close or inner circle',
   // What reaches the principal (R51, principle 6).

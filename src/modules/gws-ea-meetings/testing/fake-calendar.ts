@@ -12,7 +12,10 @@ import { GoogleApiError } from '../../gws-ea-inbox/gmail-api.js';
 import type {
   CalendarEntry,
   CalendarEvent,
+  DetailedAttendee,
+  DetailedEvent,
   EventAttendee,
+  EventTime,
   EventConference,
   EventGuests,
   EventWrite,
@@ -23,8 +26,13 @@ import type {
 } from '../calendar-api.js';
 
 /** An event as Google stores it, text included, on one calendar. */
-export interface StoredEvent extends CalendarEvent {
+export interface StoredEvent extends Omit<CalendarEvent, 'organizer' | 'attendees'> {
   readonly calendarId: string;
+  readonly organizer?: { readonly email?: string; readonly self?: boolean };
+  readonly attendees?: readonly DetailedAttendee[];
+  readonly attendeesOmitted?: boolean;
+  readonly recurringEventId?: string;
+  readonly originalStartTime?: EventTime;
   readonly summary?: string;
   readonly description?: string;
   readonly location?: string;
@@ -202,6 +210,11 @@ export class FakeCalendar implements MeetingsCalendarApi {
     return this.calendars.get(calendarId.toLowerCase());
   }
 
+  async listCalendars() {
+    this.call();
+    return [...this.calendars.values()];
+  }
+
   async getEvent(calendarId: string, eventId: string) {
     this.call();
     return this.event(calendarId, eventId);
@@ -212,6 +225,15 @@ export class FakeCalendar implements MeetingsCalendarApi {
     const min = Date.parse(timeMin);
     const max = Date.parse(timeMax);
     return this.live(calendarId).filter((e) => overlapsInterval(e, min, max));
+  }
+
+  /** As Google lists them with titles and names: everything stored but the assistant's tags and the calendar. */
+  async listEventDetails(calendarId: string, timeMin: string, timeMax: string): Promise<DetailedEvent[]> {
+    const listed = await this.listEvents(calendarId, timeMin, timeMax);
+    return listed.map(
+      ({ calendarId: _calendar, tags: _tags, conference: _conference, guests: _guests, etag: _etag, ...event }) =>
+        event,
+    );
   }
 
   async insertEvent(calendarId: string, eventId: string, event: NewEvent, sendUpdates: SendUpdates) {
@@ -311,8 +333,10 @@ export class FakeCalendar implements MeetingsCalendarApi {
 export function delegatingCalendarApi(current: () => MeetingsCalendarApi): MeetingsCalendarApi {
   return {
     getCalendar: (calendarId) => current().getCalendar(calendarId),
+    listCalendars: () => current().listCalendars(),
     getEvent: (calendarId, eventId) => current().getEvent(calendarId, eventId),
     listEvents: (calendarId, timeMin, timeMax) => current().listEvents(calendarId, timeMin, timeMax),
+    listEventDetails: (calendarId, timeMin, timeMax) => current().listEventDetails(calendarId, timeMin, timeMax),
     insertEvent: (calendarId, eventId, event, sendUpdates) =>
       current().insertEvent(calendarId, eventId, event, sendUpdates),
     patchEvent: (calendarId, eventId, event, sendUpdates) =>
