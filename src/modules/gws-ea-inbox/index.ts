@@ -26,7 +26,6 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import { registerChannelAdapter } from '../../channels/channel-registry.js';
 import { register } from '../../cli/registry.js';
-import { isContainerRunning, killContainer } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { deleteSession, getSessionsByAgentGroup, updateSession } from '../../db/sessions.js';
@@ -151,18 +150,13 @@ registerDeliveryFailedHook(async (failed) => {
   for (const msg of failed) await forgetSend(msg, 'pending');
 });
 
-/** Remove a session and everything it holds, once its container is gone. */
+/**
+ * Remove a session and everything it holds. A container still running for it
+ * is the host's orphan sweep to stop (`stopOrphanedSessions`), within a sweep
+ * of the session's row going.
+ */
 async function purgeSession(sessionId: string, agentGroupId: string): Promise<void> {
   await updateSession(sessionId, { status: 'closed' });
-  if (isContainerRunning(sessionId)) {
-    await new Promise<void>((resolve) => {
-      const bound = setTimeout(resolve, 30_000);
-      killContainer(sessionId, 'a person in its thread was forgotten', () => {
-        clearTimeout(bound);
-        resolve();
-      });
-    });
-  }
   await destroySessionMailbox(agentGroupId, sessionId);
   fs.rmSync(sessionDir(agentGroupId, sessionId), { recursive: true, force: true });
   await deleteSession(sessionId);

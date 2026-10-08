@@ -10,7 +10,7 @@ allowed-tools: Bash(gog:*)
 
 gog reaches Google through the gateway, signed in as you, so it needs no account, token, or sign-in from you: never pass one, and never run `gog auth`. Ignore the `Note: Using direct access token …` line it prints on every run.
 
-- When you keep a people store, look the name up there first (`ncl people find <name>`), and search the directory only when the store has no address for them.
+- When you keep a people store, look the name up in the people store, or their memory file, first (`ncl people find <name>`), and search the directory only when neither has an address for them.
 - The directory holds your organization's people only. Someone outside it won't be there.
 - Use an address only when exactly one entry is the person meant. When none or several fit, don't pick one: ask the principal once which address they mean.
 - A directory match is a lookup, not a record. When your instructions include an Executive Assistant section, store a person you found here only as it says, and give the identity `--identity-source directory`.

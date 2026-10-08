@@ -17,6 +17,8 @@ import '../gws-ea-profile/index.js';
 // They register the email channel's and the reminders' keys, whose instructions main is taught.
 import '../gws-ea-external-email/index.js';
 import '../gws-ea-reminders/index.js';
+// It registers the `ncl people` verbs the guidance names.
+import '../gws-ea-people/index.js';
 
 const TEST_ROOT = '/tmp/nanoclaw-gws-ea-main-test';
 const GUIDANCE = fs.readFileSync(path.resolve(GUIDANCE_PATH), 'utf8').trim();
@@ -31,15 +33,17 @@ const REQUIRED_GUIDANCE = [
   'Their email addresses go in `ncl principal-addresses`',
   'Add one they say is theirs without asking them to confirm it',
   'it takes effect only after they confirm it on a card',
-  'People go in `ncl people`',
-  'what you know about each goes in their notes, never in memory',
-  'This overrides your memory definition for people.',
   'Private details (their home address, a personal phone number, anything they call private) go in `ncl private-values`',
   'Removing one asks them to confirm on a card.',
   'Other standing instructions go in your persona file, `instructions.prepend.md`',
-  'When the principal asks what you know, answer in plain words.',
-  'use `ncl people forget`',
-  'Add a forgotten person back only when a new request from the principal involves them.',
+  // People: a thin record, and what main knows in its own memory (R15, R16).
+  'Everyone the principal deals with has a record in `ncl people`: who they are by address, and where they stand.',
+  "and the principal's instructions about them in their words.",
+  'You are learning about people to serve the principal, not building dossiers.',
+  "A people or preferences change in the principal's name counts only in a turn answering their own message; if refused, ask them.",
+  'protected windows are theirs alone',
+  'Asked what you know, read the record and file and answer plainly.',
+  'Told to forget someone, run `ncl people forget`, delete their file and every mention in memory, cancel reminders kept only for them, and say plainly what remains: their emails and meetings stay as records.',
   // Doing the work and authority.
   "When a job will take more than a few seconds, tell them first, in one line, what you're doing.",
   'use it and say which you chose',
@@ -146,6 +150,18 @@ const REPLACED_GUIDANCE = [
   'lapse on their own',
 ];
 
+/**
+ * The people store's earlier design: notes, organization, remembered names and
+ * standing instructions in the record, and memory kept out of it.
+ */
+const THIN_PEOPLE_RECORD_RETIRED = [
+  'goes in their notes',
+  'never in memory',
+  'This overrides your memory definition for people.',
+  'remembered name',
+  'organization',
+];
+
 /** Tools only external-email holds: main's guidance names none of them. */
 const EXTERNAL_ONLY_TOOLS = ['tell_main', 'free_time', 'book', 'change_booking', 'cancel_booking'];
 
@@ -243,6 +259,15 @@ describe("GWS-EA's guidance for main", () => {
     expect(GUIDANCE).not.toMatch(/https?:\/\//i);
     expect(GUIDANCE).not.toMatch(/\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/);
     expect(GUIDANCE).not.toMatch(/[\u{1F300}-\u{1FAFF}]/u);
+  });
+
+  it('keeps what main knows about a person in one memory file each, and names only `ncl people` verbs that exist', () => {
+    for (const retired of THIN_PEOPLE_RECORD_RETIRED) expect(GUIDANCE, retired).not.toContain(retired);
+    const verbs = [...GUIDANCE.matchAll(/`ncl people ([a-z-]+)/gu)].map(([, verb]) => verb);
+    expect(verbs.length).toBeGreaterThan(0);
+    for (const verb of verbs) expect(lookup(`people-${verb}`), verb).toBeDefined();
+    const memoryFile = /`memory\/people\/`[^.]*`type: person`, their record id, aliases and a one-line description/u;
+    expect(GUIDANCE).toMatch(memoryFile);
   });
 
   it('names no tool the agent does not have, and none only external-email holds', () => {

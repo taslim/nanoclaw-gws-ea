@@ -7,13 +7,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { recordDroppedMessage } from '../../db/dropped-messages.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { closeDb, createAgentGroup, getDb, initDb, initTestDb, runMigrations } from '../../db/index.js';
+import { getRegisteredMigrations } from '../../db/migrations/index.js';
 import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
 import { bindVerifiedPrincipalUser, reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
 import { getMembers } from '../permissions/db/agent-group-members.js';
 import {
   addPerson,
-  addPersonInstruction,
   assertPeopleStoreRunning,
   findPeople,
   forgetPerson,
@@ -21,7 +21,6 @@ import {
   getPersonLevel,
   listPeople,
   registerPersonForgetHook,
-  removePersonInstruction,
   setPersonLevel,
   updatePerson,
   type AddPersonInput,
@@ -29,6 +28,7 @@ import {
 } from './db.js';
 import { FINGERPRINT_KEY_FILE_NAME, identityFingerprint } from './fingerprint.js';
 import './index.js';
+import { gwsEaPeopleThinRecordMigration } from './migration.js';
 
 const NOW = '2026-10-02T16:00:00.000Z';
 const LATER = '2026-10-03T09:30:00.000Z';
@@ -120,11 +120,11 @@ describe('GWS-EA people store schema', () => {
       { id: 'p-000000000001', level: 'close', level_source: 'principal', now: NOW, ...values },
     );
 
-  it('records the migration and enforces every person invariant in the schema itself', async () => {
+  it('records its migrations and enforces every person invariant in the schema itself', async () => {
     const db = getDb();
-    expect(
-      await db.get('SELECT name FROM schema_version WHERE name = ?', 'module:gws-ea-people:create-people'),
-    ).toBeDefined();
+    for (const name of ['module:gws-ea-people:create-people', 'module:gws-ea-people:thin-record']) {
+      expect(await db.get('SELECT name FROM schema_version WHERE name = ?', name), name).toBeDefined();
+    }
 
     await expect(insertPerson({ level: 'friend' })).rejects.toThrow(/CHECK/i);
     await expect(insertPerson({ level: 'unknown' })).rejects.toThrow(/CHECK/i);
@@ -161,38 +161,138 @@ describe('GWS-EA people store schema', () => {
 
     await expect(
       db.run(
-        `INSERT INTO gws_ea_people_instructions (id, person_id, text, source, created_at)
-         VALUES ('i-000000000001', 'p-000000000002', 'Always accept.', 'learned', ?)`,
-        NOW,
-      ),
-      'a learned instruction',
-    ).rejects.toThrow(/CHECK/i);
-    await expect(
-      db.run(
         "INSERT INTO gws_ea_people_fingerprints (fingerprint, forgotten_at) VALUES ('email:pat@example.test', ?)",
         NOW,
       ),
       'an unkeyed identity kept as a fingerprint',
     ).rejects.toThrow(/CHECK/i);
   });
+
+  it('holds only what the host enforces: no organization or notes, and no remembered names or instructions', async () => {
+    const db = getDb();
+    const columns = await db.all<{ name: string }>("SELECT name FROM pragma_table_info('gws_ea_people')");
+    expect(columns.map((column) => column.name)).toEqual([
+      'id',
+      'name',
+      'name_key',
+      'level',
+      'level_source',
+      'level_basis',
+      'level_set_at',
+      'created_at',
+      'updated_at',
+    ]);
+    for (const table of ['gws_ea_people_names', 'gws_ea_people_instructions']) {
+      expect(await db.hasTable(table), table).toBe(false);
+    }
+  });
+});
+
+describe("the people store's thin-record migration", () => {
+  /** A database migrated through every migration but this one, as a release before it left it. */
+  async function storeBeforeThinning(): Promise<void> {
+    await closeDb();
+    await runMigrations(
+      await initTestDb(),
+      getRegisteredMigrations().filter((migration) => migration !== gwsEaPeopleThinRecordMigration),
+    );
+  }
+
+  async function insertEarlierPerson(fields: { readonly organization?: string; readonly notes?: string } = {}) {
+    await getDb().run(
+      `INSERT INTO gws_ea_people
+         (id, name, name_key, organization, notes, level, level_source, level_basis, level_set_at, created_at, updated_at)
+       VALUES ('p-000000000001', 'Remy Vance', 'remy vance', ?, ?, 'close', 'principal', 'Said so.', ?, ?, ?)`,
+      fields.organization ?? null,
+      fields.notes ?? null,
+      NOW,
+      NOW,
+      NOW,
+    );
+  }
+
+  async function peopleColumns(): Promise<string[]> {
+    const columns = await getDb().all<{ name: string }>("SELECT name FROM pragma_table_info('gws_ea_people')");
+    return columns.map((column) => column.name);
+  }
+
+  it.each([
+    ['notes on a person', /people with notes: 1/, () => insertEarlierPerson({ notes: 'Prefers mornings.' })],
+    ['an organization', /people with an organization: 1/, () => insertEarlierPerson({ organization: 'Northwind' })],
+    [
+      'a remembered name',
+      /remembered names: 1/,
+      async () => {
+        await insertEarlierPerson();
+        await getDb().run(
+          "INSERT INTO gws_ea_people_names (name_key, name, person_id, added_at) VALUES ('remy', 'Remy', 'p-000000000001', ?)",
+          NOW,
+        );
+      },
+    ],
+    [
+      'a standing instruction',
+      /standing instructions: 1/,
+      async () => {
+        await insertEarlierPerson();
+        await getDb().run(
+          `INSERT INTO gws_ea_people_instructions (id, person_id, text, source, created_at)
+           VALUES ('i-000000000001', 'p-000000000001', 'Always make room for Remy.', 'principal', ?)`,
+          NOW,
+        );
+      },
+    ],
+  ])('refuses, by name and changing nothing, a store holding %s', async (_case, lost, seed) => {
+    await storeBeforeThinning();
+    await seed();
+
+    const refusal = runMigrations(getDb());
+    await expect(refusal).rejects.toThrow(/module:gws-ea-people:thin-record/);
+    await expect(refusal).rejects.toThrow(lost);
+    expect(
+      await getDb().get('SELECT name FROM schema_version WHERE name = ?', gwsEaPeopleThinRecordMigration.name),
+    ).toBeUndefined();
+    expect(await peopleColumns()).toEqual(expect.arrayContaining(['organization', 'notes']));
+    expect(await rowCount('gws_ea_people')).toBe(1);
+  });
+
+  it('thins an empty store', async () => {
+    await storeBeforeThinning();
+    await runMigrations(getDb());
+
+    expect(await peopleColumns()).not.toContain('organization');
+    expect(await peopleColumns()).not.toContain('notes');
+    expect(await getDb().hasTable('gws_ea_people_names')).toBe(false);
+    expect(await getDb().hasTable('gws_ea_people_instructions')).toBe(false);
+  });
+
+  it('keeps the identities and level of a record with nothing to lose', async () => {
+    await storeBeforeThinning();
+    await insertEarlierPerson();
+    await getDb().run(
+      `INSERT INTO gws_ea_people_identities (handle, match_key, person_id, source, added_at)
+       VALUES ('email:remy@example.test', 'email:remy@example.test', 'p-000000000001', 'principal', ?)`,
+      NOW,
+    );
+    await runMigrations(getDb());
+
+    expect(await peopleColumns()).not.toContain('notes');
+    expect(await getPersonLevel('email:remy@example.test')).toBe('close');
+  });
 });
 
 describe('GWS-EA people store', () => {
-  it('adds a person with one level, its source, basis, and time, an identity, and a remembered name', async () => {
-    const person = await addPerson(pat({ organization: 'Acme', notes: 'Prefers mornings.', rememberedName: 'Patty' }));
+  it('adds a person with one level, its source, basis, and time, and an identity with its source', async () => {
+    const person = await addPerson(pat());
 
     const expected = {
       id: expect.stringMatching(/^p-[0-9a-f]{12}$/),
       name: 'Pat Doe',
-      organization: 'Acme',
-      notes: 'Prefers mornings.',
       level: 'close',
       level_source: 'principal',
       level_basis: 'Said Pat is a close friend.',
       level_set_at: NOW,
       identities: [{ handle: 'email:pat@example.test', source: 'principal', added_at: NOW }],
-      remembered_names: ['Patty'],
-      instructions: [],
       created_at: NOW,
       updated_at: NOW,
     };
@@ -208,12 +308,10 @@ describe('GWS-EA people store', () => {
       levelSource: 'learned',
       basis: 'The principal gave their address; no meetings yet.',
       identity: 'sam@example.test',
-      rememberedName: 'Sam',
     });
 
     expect(sam.level_source).toBe('learned');
     expect(sam.identities).toEqual([{ handle: 'email:sam@example.test', source: 'principal', added_at: NOW }]);
-    expect(sam.remembered_names).toEqual(['Sam']);
     // Learning may revise a level that was its own judgment, up to active.
     expect(
       (await setPersonLevel({ id: sam.id, level: 'active', source: 'learned', basis: '3 one-on-ones.' })).level,
@@ -279,36 +377,6 @@ describe('GWS-EA people store', () => {
     expect(await getPerson(id)).toMatchObject({ level: 'close', level_source: 'principal', level_set_at: NOW });
   });
 
-  it("keeps standing instructions the principal's alone: a learned one is refused, and only the principal unsays one", async () => {
-    const { id } = await addPerson(pat());
-
-    await expect(addPersonInstruction({ id, text: 'Always accept Pat.', source: 'learned' })).rejects.toThrow(
-      /only the principal/i,
-    );
-    const instruction = await addPersonInstruction({ id, text: 'Always make room for Pat.', source: 'principal' });
-    expect(instruction).toEqual({
-      id: expect.stringMatching(/^i-[0-9a-f]{12}$/),
-      person_id: id,
-      text: 'Always make room for Pat.',
-      created_at: NOW,
-    });
-    expect((await getPerson(id))?.instructions).toEqual([
-      { id: instruction.id, text: 'Always make room for Pat.', created_at: NOW },
-    ]);
-
-    await expect(removePersonInstruction({ id: instruction.id, source: 'learned' })).rejects.toThrow(
-      /only the principal/i,
-    );
-    expect(await removePersonInstruction({ id: instruction.id, source: 'principal' })).toEqual({
-      id: instruction.id,
-      person_id: id,
-    });
-    expect((await getPerson(id))?.instructions).toEqual([]);
-    await expect(removePersonInstruction({ id: instruction.id, source: 'principal' })).rejects.toThrow(
-      /no instruction/i,
-    );
-  });
-
   it.each([
     ['a principal address', 'email:Morgan@Example.test', /principal's own/i],
     ['a Gmail spelling of a principal address', 'email:Morgan.Fixture+news@gmail.com', /principal's own/i],
@@ -323,52 +391,47 @@ describe('GWS-EA people store', () => {
     expect(await rowCount('gws_ea_people_identities')).toBe(0);
   });
 
-  it('holds each identity on one person and each remembered name for one person', async () => {
-    const first = await addPerson(pat({ rememberedName: 'Patty' }));
+  it('holds each identity on one person', async () => {
+    const first = await addPerson(pat());
 
     await expect(addPerson(pat({ name: 'Pat Two' }))).rejects.toThrow(
       new RegExp(`email:pat@example.test already belongs to Pat Doe \\(${first.id}\\)`),
     );
-    await expect(
-      addPerson(pat({ name: 'Pat Three', identity: 'email:pat3@example.test', rememberedName: 'patty' })),
-    ).rejects.toThrow(/Patty already means Pat Doe/);
     expect(await listPeople()).toHaveLength(1);
   });
 
-  it('updates the name, organization, notes, identities, and remembered names in one change', async () => {
-    const { id } = await addPerson(pat({ organization: 'Acme', notes: 'Prefers mornings.', rememberedName: 'Patty' }));
+  it('updates the name and identities in one change', async () => {
+    const { id } = await addPerson(pat());
 
     vi.setSystemTime(new Date(LATER));
     const updated = await updatePerson({
       id,
       source: 'principal',
       name: 'Patricia Doe',
-      organization: '',
-      notes: 'Prefers afternoons now.',
       addIdentity: 'email:patricia@example.test',
       removeIdentity: 'email:pat@example.test',
-      addRememberedName: 'Trish',
-      removeRememberedName: 'patty',
     });
 
-    expect(updated).toMatchObject({
+    expect(updated).toEqual({
+      id,
       name: 'Patricia Doe',
-      organization: null,
-      notes: 'Prefers afternoons now.',
-      identities: [{ handle: 'email:patricia@example.test', source: 'principal', added_at: LATER }],
-      remembered_names: ['Trish'],
+      level: 'close',
+      level_source: 'principal',
+      level_basis: 'Said Pat is a close friend.',
       level_set_at: NOW,
+      identities: [{ handle: 'email:patricia@example.test', source: 'principal', added_at: LATER }],
+      created_at: NOW,
       updated_at: LATER,
     });
     await expect(updatePerson({ id, source: 'principal' })).rejects.toThrow(/nothing to change/i);
     await expect(
       updatePerson({ id, source: 'principal', removeIdentity: 'email:nobody@example.test' }),
     ).rejects.toThrow(/does not hold/i);
-    await expect(updatePerson({ id: 'p-000000000000', source: 'principal', notes: 'x' })).rejects.toThrow(/no person/i);
+    await expect(updatePerson({ id: 'p-000000000000', source: 'principal', name: 'x' })).rejects.toThrow(/no person/i);
   });
 
   it('lets learning add what it found and keeps what the principal gave out of its reach', async () => {
-    const { id } = await addPerson(pat({ rememberedName: 'Patty' }));
+    const { id } = await addPerson(pat());
 
     expect(
       await updatePerson({
@@ -376,10 +439,8 @@ describe('GWS-EA people store', () => {
         source: 'learned',
         addIdentity: 'email:pat@work.example.test',
         identitySource: 'directory',
-        organization: 'Acme',
       }),
     ).toMatchObject({
-      organization: 'Acme',
       identities: [
         { handle: 'email:pat@example.test', source: 'principal' },
         { handle: 'email:pat@work.example.test', source: 'directory' },
@@ -396,26 +457,19 @@ describe('GWS-EA people store', () => {
     await expect(updatePerson({ id, source: 'learned', removeIdentity: 'email:pat@example.test' })).rejects.toThrow(
       /given by the principal/i,
     );
-    await expect(updatePerson({ id, source: 'learned', addRememberedName: 'P' })).rejects.toThrow(
-      /only the principal/i,
-    );
-    await expect(updatePerson({ id, source: 'learned', removeRememberedName: 'Patty' })).rejects.toThrow(
-      /only the principal/i,
-    );
     expect(await updatePerson({ id, source: 'learned', removeIdentity: 'email:pat@work.example.test' })).toMatchObject({
       identities: [{ handle: 'email:pat@example.test' }],
     });
   });
 
-  it('finds by identity, then exact remembered name, then exact name, then token prefix', async () => {
-    const patDoe = await addPerson(pat({ organization: 'Acme' }));
+  it('finds by identity, then exact name, then token prefix', async () => {
+    const patDoe = await addPerson(pat());
     const samLee = await addPerson({
       name: 'Sam Lee',
       level: 'active',
       source: 'principal',
       basis: 'Weekly one-on-ones.',
       identity: 'email:sam.lee@acme.test',
-      rememberedName: 'Pat',
     });
     const patSmith = await addPerson({
       name: 'Pat Smith',
@@ -424,26 +478,28 @@ describe('GWS-EA people store', () => {
       basis: 'Met once.',
       identity: 'email:pat.smith@example.test',
     });
+    const patty = await addPerson({ name: 'Patty', level: 'known', source: 'principal', basis: 'Met once.' });
     const jose = await addPerson({ name: 'José Ángel Núñez', level: 'known', source: 'principal', basis: 'Met once.' });
     const summary = (person: typeof patDoe) => ({
       id: person.id,
       name: person.name,
-      organization: person.organization,
       level: person.level,
       identities: person.identities.map((identity) => identity.handle),
     });
 
     expect(await findPeople('Sam.Lee@ACME.test')).toEqual({ matched_by: 'identity', people: [summary(samLee)] });
     expect(await findPeople('email:pat@example.test')).toEqual({ matched_by: 'identity', people: [summary(patDoe)] });
-    expect(await findPeople('pat')).toEqual({ matched_by: 'remembered-name', people: [summary(samLee)] });
+    // An address nobody holds matches nobody: it is never read as a name.
+    expect(await findPeople('patty@example.test')).toEqual({ matched_by: null, people: [] });
     expect(await findPeople('  PAT   doe ')).toEqual({ matched_by: 'name', people: [summary(patDoe)] });
+    // An exact name wins over the names it is a prefix of.
+    expect(await findPeople('patty')).toEqual({ matched_by: 'name', people: [summary(patty)] });
     expect(await findPeople('pa s')).toEqual({ matched_by: 'name-prefix', people: [summary(patSmith)] });
     expect(await findPeople('jose nun')).toEqual({ matched_by: 'name-prefix', people: [summary(jose)] });
-    expect(await findPeople('Pa')).toEqual({
+    expect(await findPeople('Pat')).toEqual({
       matched_by: 'name-prefix',
-      people: [summary(patDoe), summary(patSmith), summary(samLee)],
+      people: [summary(patDoe), summary(patSmith), summary(patty)],
     });
-    expect(await findPeople('nobody@example.test')).toEqual({ matched_by: null, people: [] });
     expect(await findPeople('Quinn')).toEqual({ matched_by: null, people: [] });
     await expect(findPeople('   ')).rejects.toThrow(/query/i);
   });
@@ -456,18 +512,13 @@ describe('GWS-EA people store', () => {
 
     expect((await listPeople()).map((person) => person.id)).toEqual([inner.id, close.id, active.id, known.id]);
     expect(await listPeople('close')).toEqual([
-      { id: close.id, name: 'Pat Doe', organization: null, level: 'close', identities: ['email:pat@example.test'] },
+      { id: close.id, name: 'Pat Doe', level: 'close', identities: ['email:pat@example.test'] },
     ]);
     await expect(listPeople('unknown')).rejects.toThrow(/level/i);
   });
 
   it('returns only a level, or unknown, for an identity', async () => {
-    await addPerson(pat({ notes: 'Private note.', rememberedName: 'Patty' }));
-    await addPersonInstruction({
-      id: (await findPeople('Pat Doe')).people[0].id,
-      text: 'Always make room.',
-      source: 'principal',
-    });
+    await addPerson(pat());
 
     expect(await getPersonLevel('email:pat@example.test')).toBe('close');
     expect(await getPersonLevel('email:PAT@Example.test')).toBe('close');
@@ -481,9 +532,8 @@ describe('GWS-EA people store', () => {
 
 describe('forgetting a person', () => {
   async function seedPat(): Promise<string> {
-    const { id } = await addPerson(pat({ rememberedName: 'Patty', notes: 'Met at the conference.' }));
+    const { id } = await addPerson(pat());
     await updatePerson({ id, source: 'principal', addIdentity: 'gchat:users/pat' });
-    await addPersonInstruction({ id, text: 'Always make room for Pat.', source: 'principal' });
     for (const user of ['email:pat@example.test', 'gchat:users/pat', 'email:other@example.test'])
       await createUser(user);
     await createMessagingGroup({
@@ -518,17 +568,16 @@ describe('forgetting a person', () => {
     return id;
   }
 
-  it('deletes the record with its identities, names, and instructions, purges its email users and dropped messages, calls every hook, and keeps only keyed fingerprints (AE9)', async () => {
+  it('deletes the record and its identities, purges its email users and dropped messages, calls every hook, keeps only keyed fingerprints (AE9), and answers with the name and identities to clear from memory', async () => {
     const id = await seedPat();
 
-    expect(await forgetPerson({ id, source: 'principal' })).toEqual({ forgotten: id, identities: 2 });
+    expect(await forgetPerson({ id, source: 'principal' })).toEqual({
+      forgotten: id,
+      name: 'Pat Doe',
+      identities: ['email:pat@example.test', 'gchat:users/pat'],
+    });
 
-    for (const table of [
-      'gws_ea_people',
-      'gws_ea_people_identities',
-      'gws_ea_people_names',
-      'gws_ea_people_instructions',
-    ]) {
+    for (const table of ['gws_ea_people', 'gws_ea_people_identities']) {
       expect(await rowCount(table), table).toBe(0);
     }
     const users = (await getDb().all<{ id: string }>('SELECT id FROM users ORDER BY id')).map((user) => user.id);

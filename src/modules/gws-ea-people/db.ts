@@ -1,13 +1,7 @@
 import { randomBytes } from 'node:crypto';
 
 import { getDb } from '../../db/connection.js';
-import {
-  hasControlCharacters,
-  identityMatchKey,
-  normalizePrincipalEmail,
-  parseLine,
-  parseOptionalLine,
-} from '../../gws-ea/validation.js';
+import { hasControlCharacters, identityMatchKey, normalizePrincipalEmail, parseLine } from '../../gws-ea/validation.js';
 import { getGwsEaProfile, listVerifiedPrincipalUsers } from '../gws-ea-profile/db.js';
 import { createFingerprintKey, fingerprintKeyFile, identityFingerprint, readFingerprintKey } from './fingerprint.js';
 
@@ -33,27 +27,20 @@ export interface PersonIdentity {
   readonly added_at: string;
 }
 
-export interface PersonInstruction {
-  readonly id: string;
-  readonly text: string;
-  readonly created_at: string;
-}
-
+/**
+ * What the host enforces about a person, and nothing else: who they are by
+ * identity, and their one level. What `main` knows of them lives in its own
+ * memory, one file per person that names this record's ID.
+ */
 export interface Person {
   readonly id: string;
   readonly name: string;
-  readonly organization: string | null;
-  readonly notes: string | null;
   readonly level: PersonLevel;
   readonly level_source: ChangeSource;
   /** A short account of why the person has this level. */
   readonly level_basis: string;
   readonly level_set_at: string;
   readonly identities: readonly PersonIdentity[];
-  /** Names the principal taught for this person, each meaning only them. */
-  readonly remembered_names: readonly string[];
-  /** The principal's standing instructions for this person. */
-  readonly instructions: readonly PersonInstruction[];
   readonly created_at: string;
   readonly updated_at: string;
 }
@@ -61,12 +48,11 @@ export interface Person {
 export interface PersonSummary {
   readonly id: string;
   readonly name: string;
-  readonly organization: string | null;
   readonly level: PersonLevel;
   readonly identities: readonly string[];
 }
 
-export type FindMatch = 'identity' | 'remembered-name' | 'name' | 'name-prefix';
+export type FindMatch = 'identity' | 'name' | 'name-prefix';
 
 export interface FindPeopleResult {
   /** How the people were found, or null when nobody matched. */
@@ -87,26 +73,19 @@ export interface AddPersonInput {
    */
   readonly levelSource?: string;
   readonly basis: string;
-  readonly organization?: string;
-  readonly notes?: string;
   readonly identity?: string;
   /** Where the identity came from; `principal` by default on the principal's word, required when learned. */
   readonly identitySource?: string;
-  readonly rememberedName?: string;
 }
 
-/** Unvalidated caller input. An empty organization or notes clears it. */
+/** Unvalidated caller input. */
 export interface UpdatePersonInput {
   readonly id: string;
   readonly source: string;
   readonly name?: string;
-  readonly organization?: string;
-  readonly notes?: string;
   readonly addIdentity?: string;
   readonly identitySource?: string;
   readonly removeIdentity?: string;
-  readonly addRememberedName?: string;
-  readonly removeRememberedName?: string;
 }
 
 export interface SetPersonLevelInput {
@@ -114,19 +93,6 @@ export interface SetPersonLevelInput {
   readonly level: string;
   readonly source: string;
   readonly basis: string;
-}
-
-export interface PersonInstructionInput {
-  /** The person the instruction is for. */
-  readonly id: string;
-  readonly text: string;
-  readonly source: string;
-}
-
-export interface RemoveInstructionInput {
-  /** The instruction's own ID. */
-  readonly id: string;
-  readonly source: string;
 }
 
 export interface ForgetPersonInput {
@@ -143,10 +109,7 @@ export interface ForgottenPerson {
 export type PersonForgetHook = (person: ForgottenPerson) => Promise<void>;
 
 const NAME_MAX_LENGTH = 120;
-const ORGANIZATION_MAX_LENGTH = 120;
 const BASIS_MAX_LENGTH = 280;
-const INSTRUCTION_MAX_LENGTH = 500;
-const NOTES_MAX_LENGTH = 2_000;
 const QUERY_MAX_LENGTH = 320;
 const HANDLE_MAX_LENGTH = 256;
 const CHANNEL_PATTERN = /^[a-z][a-z0-9-]{0,31}$/u;
@@ -166,10 +129,11 @@ const LEVEL_LABELS: Readonly<Record<PersonLevel, string>> = {
 const forgetHooks = new Map<string, PersonForgetHook>();
 
 /**
- * Register a module's purge of its own data for a forgotten person (its
- * meetings, inbox routes, timers, holds, thread sessions). Hooks run in
- * registration order before the record is deleted, so a failed hook leaves
- * the person to be forgotten again; each must therefore be idempotent.
+ * Register a module's purge of its own data for a forgotten person, such as
+ * the inbox's thread sessions and the person's addresses on its threads.
+ * Hooks run in registration order before the record is deleted, so a failed
+ * hook leaves the person to be forgotten again; each must therefore be
+ * idempotent.
  */
 export function registerPersonForgetHook(id: string, hook: PersonForgetHook): void {
   if (!HOOK_ID_PATTERN.test(id)) throw new Error(`Person forget hook "${id}" must use "<module-id>:<hook-id>"`);
@@ -191,19 +155,6 @@ function parseChangeSource(value: string): ChangeSource {
   const source = CHANGE_SOURCES.find((candidate) => candidate === value);
   if (!source) throw new Error(`Source ${JSON.stringify(value)} is invalid: use principal or learned`);
   return source;
-}
-
-/** Notes may run to several lines; any other control character is refused. */
-function parseNotes(value: string): string | null {
-  const text = value.trim();
-  if (text === '') return null;
-  if (
-    text.length > NOTES_MAX_LENGTH ||
-    [...text].some((character) => character !== '\n' && hasControlCharacters(character))
-  ) {
-    throw new Error(`Notes must be text of up to ${NOTES_MAX_LENGTH} characters`);
-  }
-  return text;
 }
 
 /** A name as it is compared: accents dropped, lowercased, whitespace collapsed. */
@@ -286,8 +237,8 @@ function assertLevelWritable(
   }
 }
 
-function newId(prefix: 'p' | 'i'): string {
-  return `${prefix}-${randomBytes(6).toString('hex')}`;
+function newPersonId(): string {
+  return `p-${randomBytes(6).toString('hex')}`;
 }
 
 function noPerson(id: string): Error {
@@ -340,7 +291,7 @@ async function forgetKey(): Promise<Buffer> {
 }
 
 // ---------------------------------------------------------------------------
-// Identities, remembered names, and reads
+// Identities and reads
 // ---------------------------------------------------------------------------
 
 interface IdentityToAdmit {
@@ -431,31 +382,9 @@ export async function removeMatchingIdentities(handle: string): Promise<void> {
   await db.run('DELETE FROM gws_ea_people_identities WHERE match_key = ?', identityMatchKey(handle));
 }
 
-async function rememberName(personId: string, name: string, now: string): Promise<void> {
-  const db = getDb();
-  const key = nameKey(name);
-  const holder = await db.get<{ readonly person_id: string; readonly name: string; readonly person_name: string }>(
-    `SELECT n.person_id, n.name, p.name AS person_name
-       FROM gws_ea_people_names n
-       JOIN gws_ea_people p ON p.id = n.person_id
-      WHERE n.name_key = ?`,
-    key,
-  );
-  if (holder) throw new Error(`${holder.name} already means ${holder.person_name} (${holder.person_id})`);
-  await db.run(
-    'INSERT INTO gws_ea_people_names (name_key, name, person_id, added_at) VALUES (?, ?, ?, ?)',
-    key,
-    name,
-    personId,
-    now,
-  );
-}
-
 interface PersonRow {
   readonly id: string;
   readonly name: string;
-  readonly organization: string | null;
-  readonly notes: string | null;
   readonly level: PersonLevel;
   readonly level_source: ChangeSource;
   readonly level_basis: string;
@@ -467,17 +396,16 @@ interface PersonRow {
 interface SummaryRow {
   readonly id: string;
   readonly name: string;
-  readonly organization: string | null;
   readonly level: PersonLevel;
 }
 
-const SUMMARY_COLUMNS = 'id, name, organization, level';
+const SUMMARY_COLUMNS = 'id, name, level';
 
 /** One person's whole record, for `main` and the host only. */
 export async function getPerson(id: string): Promise<Person | undefined> {
   const db = getDb();
   const row = await db.get<PersonRow>(
-    `SELECT id, name, organization, notes, level, level_source, level_basis, level_set_at, created_at, updated_at
+    `SELECT id, name, level, level_source, level_basis, level_set_at, created_at, updated_at
        FROM gws_ea_people
       WHERE id = ?`,
     id.trim(),
@@ -487,15 +415,7 @@ export async function getPerson(id: string): Promise<Person | undefined> {
     'SELECT handle, source, added_at FROM gws_ea_people_identities WHERE person_id = ? ORDER BY handle',
     row.id,
   );
-  const names = await db.all<{ readonly name: string }>(
-    'SELECT name FROM gws_ea_people_names WHERE person_id = ? ORDER BY name_key',
-    row.id,
-  );
-  const instructions = await db.all<PersonInstruction>(
-    'SELECT id, text, created_at FROM gws_ea_people_instructions WHERE person_id = ? ORDER BY created_at, id',
-    row.id,
-  );
-  return { ...row, identities, remembered_names: names.map((entry) => entry.name), instructions };
+  return { ...row, identities };
 }
 
 async function requirePerson(id: string): Promise<Person> {
@@ -550,9 +470,9 @@ export async function listPeople(level?: string): Promise<PersonSummary[]> {
 }
 
 /**
- * Find people by an identity, or by a name: an exact remembered name first,
- * then an exact name, then names whose words start with every word of the
- * query. The first rule that matches anyone decides.
+ * Find people by an identity, or by a name: an exact name first, then names
+ * whose words start with every word of the query. The first rule that
+ * matches anyone decides.
  */
 export async function findPeople(query: string): Promise<FindPeopleResult> {
   const text = query.trim();
@@ -580,31 +500,21 @@ export async function findPeople(query: string): Promise<FindPeopleResult> {
   }
 
   const key = nameKey(text);
-  const remembered = await db.all<{ readonly person_id: string }>(
-    'SELECT person_id FROM gws_ea_people_names WHERE name_key = ?',
-    key,
-  );
   const named = await db.all<{ readonly id: string }>('SELECT id FROM gws_ea_people WHERE name_key = ?', key);
   const queryTokens = nameTokens(key);
   const prefixed = async (): Promise<string[]> => {
     if (queryTokens.length === 0) return [];
-    const names = await db.all<{ readonly person_id: string; readonly name_key: string }>(
-      `SELECT id AS person_id, name_key FROM gws_ea_people
-       UNION ALL
-       SELECT person_id, name_key FROM gws_ea_people_names`,
+    const names = await db.all<{ readonly id: string; readonly name_key: string }>(
+      'SELECT id, name_key FROM gws_ea_people',
     );
     return names
       .filter((entry) => {
         const tokens = nameTokens(entry.name_key);
         return queryTokens.every((wanted) => tokens.some((token) => token.startsWith(wanted)));
       })
-      .map((entry) => entry.person_id);
+      .map((entry) => entry.id);
   };
   return (
-    (await found(
-      'remembered-name',
-      remembered.map((row) => row.person_id),
-    )) ??
     (await found(
       'name',
       named.map((row) => row.id),
@@ -616,7 +526,7 @@ export async function findPeople(query: string): Promise<FindPeopleResult> {
 /**
  * The level of the person an identity belongs to, or `unknown` when nobody
  * with a record holds it (R13). The only people fact that leaves the store
- * for the host: never a name, a note, or an instruction.
+ * for the host: never a name.
  */
 export async function getPersonLevel(identity: string): Promise<PersonLevel | 'unknown'> {
   const handle = canonicalIdentity(identity);
@@ -643,35 +553,25 @@ export async function addPerson(input: AddPersonInput): Promise<Person> {
   const name = parseLine(input.name, 'Name', NAME_MAX_LENGTH);
   const level = parseLevel(input.level);
   const basis = parseLine(input.basis, 'Basis', BASIS_MAX_LENGTH);
-  const organization =
-    input.organization === undefined
-      ? null
-      : parseOptionalLine(input.organization, 'Organization', ORGANIZATION_MAX_LENGTH);
-  const notes = input.notes === undefined ? null : parseNotes(input.notes);
   if (input.identity === undefined && input.identitySource !== undefined) {
     throw new Error('An identity source applies only with an identity');
   }
   const identity =
     input.identity === undefined ? undefined : identityToAdmit(author, input.identity, input.identitySource);
-  const rememberedName =
-    input.rememberedName === undefined ? undefined : parseLine(input.rememberedName, 'Name', NAME_MAX_LENGTH);
-  if (rememberedName !== undefined) assertPrincipal(author, 'Only the principal teaches a name to remember');
   assertLevelWritable(undefined, levelSource, level);
 
   const key = await loadFingerprintKey();
-  const id = newId('p');
+  const id = newPersonId();
   const now = new Date().toISOString();
   const db = getDb();
   await db.transaction(async () => {
     await db.run(
       `INSERT INTO gws_ea_people
-         (id, name, name_key, organization, notes, level, level_source, level_basis, level_set_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, name, name_key, level, level_source, level_basis, level_set_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id,
       name,
       nameKey(name),
-      organization,
-      notes,
       level,
       levelSource,
       basis,
@@ -680,39 +580,23 @@ export async function addPerson(input: AddPersonInput): Promise<Person> {
       now,
     );
     if (identity !== undefined) await admitIdentity(identity, key, author, id, now);
-    if (rememberedName !== undefined) await rememberName(id, rememberedName, now);
   });
   return requirePerson(id);
 }
 
-/** Change a person's name, organization, notes, identities, or remembered names, in one transaction. */
+/** Change a person's name or identities, in one transaction. */
 export async function updatePerson(input: UpdatePersonInput): Promise<Person> {
   const author = parseChangeSource(input.source);
   const id = input.id.trim();
   const name = input.name === undefined ? undefined : parseLine(input.name, 'Name', NAME_MAX_LENGTH);
-  const organization =
-    input.organization === undefined
-      ? undefined
-      : parseOptionalLine(input.organization, 'Organization', ORGANIZATION_MAX_LENGTH);
-  const notes = input.notes === undefined ? undefined : parseNotes(input.notes);
   if (input.addIdentity === undefined && input.identitySource !== undefined) {
     throw new Error('An identity source applies only with an identity to add');
   }
   const addIdentity =
     input.addIdentity === undefined ? undefined : identityToAdmit(author, input.addIdentity, input.identitySource);
   const removeIdentity = input.removeIdentity === undefined ? undefined : parseIdentity(input.removeIdentity);
-  const addName =
-    input.addRememberedName === undefined ? undefined : parseLine(input.addRememberedName, 'Name', NAME_MAX_LENGTH);
-  const removeName =
-    input.removeRememberedName === undefined
-      ? undefined
-      : parseLine(input.removeRememberedName, 'Name', NAME_MAX_LENGTH);
-  if (addName !== undefined || removeName !== undefined) {
-    assertPrincipal(author, 'Only the principal teaches or takes back a name to remember');
-  }
-  const changes = [name, organization, notes, addIdentity, removeIdentity, addName, removeName];
-  if (changes.every((change) => change === undefined)) {
-    throw new Error('Nothing to change: give a name, organization, notes, an identity, or a remembered name');
+  if (name === undefined && addIdentity === undefined && removeIdentity === undefined) {
+    throw new Error('Nothing to change: give a name, or an identity to add or remove');
   }
 
   const key = await loadFingerprintKey();
@@ -732,25 +616,10 @@ export async function updatePerson(input: UpdatePersonInput): Promise<Person> {
       }
       await db.run('DELETE FROM gws_ea_people_identities WHERE handle = ?', removeIdentity);
     }
-    if (removeName !== undefined) {
-      const removed = await db.run(
-        'DELETE FROM gws_ea_people_names WHERE person_id = ? AND name_key = ?',
-        id,
-        nameKey(removeName),
-      );
-      if (removed.changes === 0) {
-        throw new Error(`${person.name} has no remembered name ${JSON.stringify(removeName)}`);
-      }
-    }
     if (addIdentity !== undefined) await admitIdentity(addIdentity, key, author, id, now);
-    if (addName !== undefined) await rememberName(id, addName, now);
     if (name !== undefined) {
       await db.run('UPDATE gws_ea_people SET name = ?, name_key = ? WHERE id = ?', name, nameKey(name), id);
     }
-    if (organization !== undefined) {
-      await db.run('UPDATE gws_ea_people SET organization = ? WHERE id = ?', organization, id);
-    }
-    if (notes !== undefined) await db.run('UPDATE gws_ea_people SET notes = ? WHERE id = ?', notes, id);
     await db.run('UPDATE gws_ea_people SET updated_at = ? WHERE id = ?', now, id);
   });
   return requirePerson(id);
@@ -782,53 +651,6 @@ export async function setPersonLevel(input: SetPersonLevelInput): Promise<Person
   return requirePerson(id);
 }
 
-/** Keep one of the principal's standing instructions for a person. */
-export async function addPersonInstruction(
-  input: PersonInstructionInput,
-): Promise<PersonInstruction & { readonly person_id: string }> {
-  assertPrincipal(parseChangeSource(input.source), 'Only the principal gives a standing instruction for a person');
-  const text = parseLine(input.text, 'Instruction', INSTRUCTION_MAX_LENGTH);
-  const personId = input.id.trim();
-  await loadFingerprintKey();
-  const id = newId('i');
-  const now = new Date().toISOString();
-  const db = getDb();
-  await db.transaction(async () => {
-    await requirePersonRow(personId);
-    await db.run(
-      `INSERT INTO gws_ea_people_instructions (id, person_id, text, source, created_at)
-       VALUES (?, ?, ?, 'principal', ?)`,
-      id,
-      personId,
-      text,
-      now,
-    );
-    await db.run('UPDATE gws_ea_people SET updated_at = ? WHERE id = ?', now, personId);
-  });
-  return { id, person_id: personId, text, created_at: now };
-}
-
-/** Take back one of the principal's standing instructions. */
-export async function removePersonInstruction(
-  input: RemoveInstructionInput,
-): Promise<{ readonly id: string; readonly person_id: string }> {
-  assertPrincipal(parseChangeSource(input.source), 'Only the principal takes back a standing instruction');
-  const id = input.id.trim();
-  await loadFingerprintKey();
-  const now = new Date().toISOString();
-  const db = getDb();
-  return db.transaction(async () => {
-    const row = await db.get<{ readonly person_id: string }>(
-      'SELECT person_id FROM gws_ea_people_instructions WHERE id = ?',
-      id,
-    );
-    if (!row) throw new Error(`No instruction ${JSON.stringify(id)} exists`);
-    await db.run('DELETE FROM gws_ea_people_instructions WHERE id = ?', id);
-    await db.run('UPDATE gws_ea_people SET updated_at = ? WHERE id = ?', now, row.person_id);
-    return { id, person_id: row.person_id };
-  });
-}
-
 /**
  * An `email:` user that NanoClaw grants access to is the operator's to
  * revoke; forgetting never removes a role or a membership on its own.
@@ -855,15 +677,17 @@ async function assertNoGrantedAccess(userIds: readonly string[]): Promise<void> 
 }
 
 /**
- * Forget a person on the principal's word (R18): every registered hook purges
- * its module's data, then the record, its identities, names, and
- * instructions are deleted with the core `users` and dropped-message rows of
- * its `email:` identities. Only a keyed fingerprint of each identity is kept,
- * so learning cannot bring the person back (KTD8).
+ * Forget a person on the principal's word (R16): every registered hook purges
+ * its module's data, then the record and its identities are deleted with the
+ * core `users` and dropped-message rows of its `email:` identities. Only a
+ * keyed fingerprint of each identity is kept, so learning cannot bring the
+ * person back (KTD8). What `main` knows of them is in its memory, which the
+ * host never reads: the answer names them and their identities so `main`
+ * can clear it.
  */
 export async function forgetPerson(
   input: ForgetPersonInput,
-): Promise<{ readonly forgotten: string; readonly identities: number }> {
+): Promise<{ readonly forgotten: string; readonly name: string; readonly identities: readonly string[] }> {
   assertPrincipal(parseChangeSource(input.source), 'Only the principal can have someone forgotten');
   const id = input.id.trim();
   await loadFingerprintKey();
@@ -876,7 +700,7 @@ export async function forgetPerson(
 
   const db = getDb();
   return db.transaction(async () => {
-    await requirePersonRow(id);
+    const record = await requirePersonRow(id);
     const current = await db.all<{ readonly handle: string }>(
       'SELECT handle FROM gws_ea_people_identities WHERE person_id = ?',
       id,
@@ -891,8 +715,6 @@ export async function forgetPerson(
         now,
       );
     }
-    await db.run('DELETE FROM gws_ea_people_instructions WHERE person_id = ?', id);
-    await db.run('DELETE FROM gws_ea_people_names WHERE person_id = ?', id);
     await db.run('DELETE FROM gws_ea_people_identities WHERE person_id = ?', id);
     await db.run('DELETE FROM gws_ea_people WHERE id = ?', id);
     for (const userId of forgotten.filter((handle) => handle.startsWith('email:'))) {
@@ -900,6 +722,6 @@ export async function forgetPerson(
       await db.run('DELETE FROM unregistered_senders WHERE user_id = ?', userId);
       await db.run('DELETE FROM users WHERE id = ?', userId);
     }
-    return { forgotten: id, identities: forgotten.length };
+    return { forgotten: id, name: record.name, identities: forgotten };
   });
 }

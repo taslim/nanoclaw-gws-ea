@@ -51,6 +51,7 @@ import { getDb } from '../../db/connection.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { sqliteRaw } from '../../db/drivers/sqlite.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
+import { isContainerRunning, killContainer } from '../../container-runner.js';
 import { getDeliveryAction } from '../../delivery.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSession } from '../../session-manager.js';
@@ -1037,7 +1038,7 @@ describe('forgetting a person', () => {
     return (await threadAddresses(threadKey)).map((entry) => entry.address).sort();
   }
 
-  it("purges their threads' sessions, then their addresses, releasing nothing and needing nothing of the calendar", async () => {
+  it("purges their threads' sessions without stopping a container itself, then their addresses, releasing nothing and needing nothing of the calendar", async () => {
     const secrets = path.join(TEST_DIR, 'secrets');
     fs.mkdirSync(secrets, { mode: 0o700 });
     vi.stubEnv(GOOGLE_GRANT_FILE_ENV, path.join(secrets, 'google-grant.json'));
@@ -1049,11 +1050,21 @@ describe('forgetting a person', () => {
       basis: 'a friend',
       identity: `email:${REMY}`,
     });
+    // Thread A's container is up: the forget deletes its session, and the host's orphan sweep stops it.
+    vi.mocked(isContainerRunning).mockImplementation((sessionId) => sessionId === sessionA.id);
+    vi.mocked(killContainer).mockClear();
+    vi.mocked(killContainer).mockImplementation((_sessionId, _reason, onExit) => onExit?.());
 
     // With Google unavailable the forget still goes through: it asks nothing of the calendar.
     calendar.failure = new GoogleApiError(503, 'Calendar is unavailable');
     const calls = calendar.calls;
-    await forgetPerson({ id: remy.id, source: 'principal' });
+    try {
+      await forgetPerson({ id: remy.id, source: 'principal' });
+      expect(killContainer).not.toHaveBeenCalled();
+    } finally {
+      vi.mocked(isContainerRunning).mockImplementation(() => false);
+      vi.mocked(killContainer).mockReset();
+    }
     expect(calendar.calls).toBe(calls);
     calendar.failure = undefined;
 

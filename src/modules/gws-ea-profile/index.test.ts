@@ -13,7 +13,7 @@ import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
 import type { AgentGroup, User } from '../../types.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { addPerson, getPerson, updatePerson } from '../gws-ea-people/db.js';
-import { gwsEaPeopleMigration } from '../gws-ea-people/migration.js';
+import { gwsEaPeopleMigration, gwsEaPeopleThinRecordMigration } from '../gws-ea-people/migration.js';
 import {
   bindVerifiedPrincipalUser,
   getExternalEmailAgentGroupId,
@@ -30,6 +30,7 @@ const TEST_ROOT = '/tmp/nanoclaw-gws-ea-profile-test';
 // The people store's tables alone, so an address made the principal's can be
 // seen leaving a person's record; its document section stays out of these tests.
 registerMigration(gwsEaPeopleMigration);
+registerMigration(gwsEaPeopleThinRecordMigration);
 
 function group(id: string, name = 'main'): AgentGroup {
   return { id, name, folder: id, agent_provider: null, created_at: '2026-09-18T00:00:00.000Z' };

@@ -52,7 +52,7 @@ For one occurrence of a recurring invitation, pass that occurrence's own `id`. `
 - Cancel: `gog calendar delete <calendarId> <eventId> --force`.
 - One occurrence of a recurring event: pass that occurrence's own `id` from `events`, because the series ID changes or cancels every occurrence. For one occurrence and all after it, pass the series ID with `--scope future --original-start <the occurrence's originalStartTime.dateTime, exactly as events printed it>`.
 
-Inviting people adds the event to their calendars, and moving an event they attend changes their plans. Before you invite anyone by name, turn each name into an address: from the people store first when you have one (`ncl people find`), then from the directory with the gpeople skill. Never guess an address.
+Inviting people adds the event to their calendars, and moving an event they attend changes their plans. Before you invite anyone by name, turn each name into an address: from the people store, or their memory file, first when you have them (`ncl people find`), then from the directory with the gpeople skill. Never guess an address.
 
 To tell whether you created an event, compare its `creator.email` with your own address.
 
