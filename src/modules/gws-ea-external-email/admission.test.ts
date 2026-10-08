@@ -1,14 +1,13 @@
 /**
  * external-email cannot drift into more reach: before any session of it
- * starts or is adopted, the host refuses one whose list, configuration, or
- * gateway scope differs from what the host stamped, and status names each.
+ * starts or is adopted, the host refuses one whose list or configuration
+ * differs from what the host stamped, and status names each.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { SupervisedHandle, SupervisedSnapshot } from '../../drivers/session-events.js';
-import type { GatewayCredentialScope } from '../../gateway-providers/index.js';
 
 const TEST_ROOT = '/tmp/nanoclaw-gws-ea-external-email-admission-test';
 
@@ -59,8 +58,6 @@ import '../gws-ea-profile/index.js';
 const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
 const DATA_DIR = path.join(TEST_ROOT, 'data');
 const SESSION = 'sess-ee';
-/** What core asks the gateway for, for a group whose keys name no credential: only the model provider's. */
-const MODEL_ONLY: GatewayCredentialScope = { kind: 'only', credentials: [], modelDomains: ['anthropic.com'] };
 
 const ensure = vi.fn(async () => ({
   contribution: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' as const } } },
@@ -79,11 +76,10 @@ async function externalEmail(): Promise<AgentGroup> {
   return found;
 }
 
-function admit(agentGroupId: string, credentialScope: GatewayCredentialScope = MODEL_ONLY): Promise<void> {
+function admit(agentGroupId: string): Promise<void> {
   return assertSessionAdmitted({
     disposition: 'create',
     key: { installSlug: 'test-install', agentGroupId, sessionId: SESSION },
-    credentialScope,
   });
 }
 
@@ -185,9 +181,9 @@ beforeEach(async () => {
   ensure.mockClear();
   _resetAdoptionRetryStateForTesting();
   resetGatewayProvider({
-    kind: 'scoping-fixture',
+    kind: 'admission-fixture',
     agentSkills: [],
-    sessions: { ensure, enforcesCredentialScope: true },
+    sessions: { ensure },
     approvals: { subscribe: async () => {} },
   });
   await runMigrations(await initTestDb());
@@ -204,7 +200,7 @@ afterEach(async () => {
 });
 
 describe('the session admission external-email registers', () => {
-  it('admits external-email as the host stamped it, with only the model secret', async () => {
+  it('admits external-email as the host stamped it', async () => {
     await expect(admit((await externalEmail()).id)).resolves.toBeUndefined();
     expect((await externalEmailHealth()).problems).toEqual([]);
   });
@@ -219,16 +215,6 @@ describe('the session admission external-email registers', () => {
     expect(health.problems.join('\n')).toMatch(reason);
   });
 
-  it('refuses a gateway identity that is not exactly selective with the model secret', async () => {
-    const ee = await externalEmail();
-
-    await expect(admit(ee.id, { kind: 'all' })).rejects.toThrow(/gateway/);
-    await expect(
-      admit(ee.id, { kind: 'only', credentials: ['google-calendar'], modelDomains: ['anthropic.com'] }),
-    ).rejects.toThrow(/gateway/);
-    await expect(admit(ee.id, { kind: 'only', credentials: [], modelDomains: [] })).rejects.toThrow(/gateway/);
-  });
-
   it('leaves every other group to its own configuration', async () => {
     const other: AgentGroup = {
       id: 'ag-other',
@@ -241,7 +227,7 @@ describe('the session admission external-email registers', () => {
     await ensureContainerConfig(other.id);
     for (const [, drift] of DRIFTS) await drift(other);
 
-    await expect(admit(other.id, { kind: 'all' })).resolves.toBeUndefined();
+    await expect(admit(other.id)).resolves.toBeUndefined();
   });
 
   it('stops a drifted running external-email at adoption without asking the gateway, and adopts one as stamped', async () => {
@@ -271,10 +257,7 @@ describe('the session admission external-email registers', () => {
     snapshots.push({ handle: stamped.handle, phase: 'running' } as SupervisedSnapshot);
 
     expect(await adoptRunningSessions()).toEqual({ adopted: 1, stopped: 0 });
-    expect(ensure).toHaveBeenCalledWith(
-      expect.objectContaining({ credentialScope: MODEL_ONLY, disposition: 'adopt' }),
-      expect.anything(),
-    );
+    expect(ensure).toHaveBeenCalledWith(expect.objectContaining({ disposition: 'adopt' }), expect.anything());
   });
 
   it('reports a missing group as unhealthy', async () => {

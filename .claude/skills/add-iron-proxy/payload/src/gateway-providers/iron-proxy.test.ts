@@ -68,7 +68,6 @@ const input: GatewaySessionInput = {
     auxiliaryContainers: true,
     imageBuild: true,
   },
-  credentialScope: { kind: 'all' },
 };
 
 describe('Iron Proxy provider', () => {

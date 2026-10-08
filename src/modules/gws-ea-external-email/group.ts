@@ -10,7 +10,6 @@ import path from 'node:path';
 import { parseStoredCapabilities, registerCapability, resolveCapabilities } from '../../capabilities.js';
 import { GROUPS_DIR } from '../../config.js';
 import { parseSkillSelection } from '../../container-config.js';
-import { credentialScopeFor } from '../../container-runner.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import {
@@ -18,7 +17,6 @@ import {
   updateContainerConfigJson,
   updateContainerConfigScalars,
 } from '../../db/container-configs.js';
-import type { GatewayCredentialScope } from '../../gateway-providers/index.js';
 import { log } from '../../log.js';
 import { getProviderHostContract } from '../../provider-contracts/index.js';
 import { resolveProviderName } from '../../providers/provider-name.js';
@@ -94,10 +92,9 @@ export async function ensureExternalEmailGroup(): Promise<string> {
   });
 }
 
-/** What a drift check judges beside the stored group: the session's own provider and its gateway scope, when known. */
+/** What a drift check judges beside the stored group: the session's own provider, when known. */
 export interface DriftContext {
   readonly sessionProvider?: string | null;
-  readonly credentialScope?: GatewayCredentialScope;
 }
 
 /**
@@ -120,11 +117,6 @@ export async function externalEmailDrift(agentGroupId: string, context: DriftCon
   ) {
     problems.push(`its provider ${provider} does not give each session its own state`);
   }
-
-  const scope =
-    context.credentialScope ?? (await credentialScopeFor(group, { agent_provider: context.sessionProvider ?? null }));
-  const gateway = gatewayDrift(scope);
-  if (gateway) problems.push(gateway);
   return problems;
 }
 
@@ -164,17 +156,6 @@ function stampedPluginDrift(agentGroupId: string, folder: string): string[] {
   const skills = directoryEntries(groupSkillsOverlayDir(agentGroupId));
   if (skills.length > 0) problems.push(`its stamped plugins brought template skills (${skills.join(', ')})`);
   return problems;
-}
-
-function gatewayDrift(scope: GatewayCredentialScope): string | undefined {
-  if (scope.kind === 'all') {
-    return "its gateway identity would keep the gateway's own policy, not only the model provider's secret";
-  }
-  if (scope.credentials.length > 0) {
-    return `its gateway identity would be granted ${scope.credentials.join(', ')} beside the model provider's secret`;
-  }
-  if (scope.modelDomains.length === 0) return "its gateway identity would be granted no model provider's secret";
-  return undefined;
 }
 
 /** The directories (and links) directly under `dir`; a missing directory holds none. */

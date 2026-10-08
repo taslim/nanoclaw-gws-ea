@@ -1,8 +1,8 @@
 /**
  * GWS-EA's Google access for agents (KTD1, KTD2, KTD6). Each agent-facing
  * Google service is a capability: a group holding the key is handed the
- * service's skill, gog's commands for it, and its gateway credential, and a
- * group without it gets none of them. The keys are on by default, so a group
+ * service's skill and gog's commands for it, and a group without it gets
+ * neither. The keys are on by default, so a group
  * on `all`, `main` among them, holds every one. Nothing here rewrites a
  * group's configuration.
  *
@@ -71,7 +71,6 @@ for (const id of EXPOSED_GOOGLE_SERVICES) {
     description: CAPABILITY_DESCRIPTIONS[id],
     default: 'on',
     skills: [service.skill],
-    credentials: [service.secretName],
   });
 }
 

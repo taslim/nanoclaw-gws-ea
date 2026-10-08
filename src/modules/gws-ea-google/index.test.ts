@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { credentialsWithinCapabilities, resolveCapabilities, skillsWithinCapabilities } from '../../capabilities.js';
+import { resolveCapabilities, skillsWithinCapabilities } from '../../capabilities.js';
 import type { ContainerConfig } from '../../container-config.js';
 import { composeSessionSpec } from '../../container-runner.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
@@ -120,19 +120,6 @@ describe('Google capabilities', () => {
     expect(skillsWithinCapabilities(skills, calendarOnly)).toEqual(['agent-browser', 'gcalendar']);
     expect(skillsWithinCapabilities(skills, new Set(['shell']))).toEqual(['agent-browser']);
     expect(skillsWithinCapabilities(skills, new Set(resolveCapabilities('all', 'main')))).toEqual(skills);
-  });
-
-  it("lets each key's holder use its service's gateway credential, and no other", () => {
-    expect(credentialsWithinCapabilities(new Set(['reply', 'google-mail-read', 'google-directory']))).toEqual([
-      'google-gmail-read',
-      'google-directory',
-    ]);
-    expect(credentialsWithinCapabilities(new Set(['reply', 'time']))).toEqual([]);
-    expect(credentialsWithinCapabilities(new Set(resolveCapabilities('all', 'main')))).toEqual([
-      'google-calendar',
-      'google-gmail-read',
-      'google-directory',
-    ]);
   });
 });
 

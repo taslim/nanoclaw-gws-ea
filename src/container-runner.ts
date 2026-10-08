@@ -26,10 +26,7 @@ import {
 } from './config.js';
 import {
   CONVERSATION_CONTEXT_CAPABILITY,
-  credentialsWithinCapabilities,
   isRestricted,
-  parseStoredCapabilities,
-  resolveCapabilities,
   skillsWithinCapabilities,
   teachesGateway,
 } from './capabilities.js';
@@ -58,12 +55,10 @@ import type { SupervisedHandle, SupervisedSnapshot } from './drivers/session-eve
 import { GROUP_FOLDER_LABEL, labelValueLegal, specInvalid } from './drivers/types.js';
 import type { ContainerSpec, MountSpec, SessionFailure, SessionSpec } from './drivers/types.js';
 import {
-  assertCredentialScopeEnforced,
   gatewayRuntimeIdentity,
   getGatewayProvider,
   selectGatewayAgentSkills,
   type GatewayContribution,
-  type GatewayCredentialScope,
   type GatewaySessionInput,
   type GatewaySessionLease,
 } from './gateway-providers/index.js';
@@ -314,7 +309,6 @@ async function retryPendingAdoption(session: Session): Promise<boolean> {
       groupName: group.name,
       containerName: snapshot.handle.name,
       capabilities: driver.capabilities(),
-      credentialScope: await credentialScopeFor(group, session),
     });
   } catch (err) {
     await releaseClaimQuietly(session.id, claimIncarnation);
@@ -424,7 +418,6 @@ async function spawnContainer(session: Session): Promise<void> {
     groupName: agentGroup.name,
     containerName,
     capabilities: driver.capabilities(),
-    credentialScope: await credentialScopeFor(agentGroup, session),
   });
   const admissionGeneration = gatewayAdmissionGeneration;
   const gateway = gatewaySession.lease.contribution;
@@ -597,36 +590,13 @@ export function watchGatewayAvailability(
 }
 
 /**
- * The stored credentials the group's capabilities let its agent use: the
- * gateway's own policy for a group on `all`, else exactly the credentials its
- * keys name plus its model provider's. Read at every spawn and adoption, as
- * the gateway applies it at each.
- */
-export async function credentialScopeFor(
-  agentGroup: AgentGroup,
-  session: Pick<Session, 'agent_provider'>,
-): Promise<GatewayCredentialScope> {
-  const row = await getContainerConfig(agentGroup.id);
-  const selection = parseStoredCapabilities(row?.capabilities, agentGroup.name);
-  if (selection === 'all') return { kind: 'all' };
-  const provider = resolveProviderName(session.agent_provider, row?.provider);
-  return {
-    kind: 'only',
-    credentials: credentialsWithinCapabilities(new Set(resolveCapabilities(selection, agentGroup.name))),
-    modelDomains: getProviderHostContract(provider)?.modelDomains ?? [],
-  };
-}
-
-/**
  * What a session admission policy judges: a session about to be spawned or
- * adopted, and the credentials the gateway would scope its agent to. Every
- * session start passes here before the gateway is asked and before anything
- * runs, spawned and adopted alike.
+ * adopted. Every session start passes here before the gateway is asked and
+ * before anything runs, spawned and adopted alike.
  */
 export interface SessionAdmissionInput {
   readonly disposition: 'create' | 'adopt';
   readonly key: GatewaySessionInput['key'];
-  readonly credentialScope: GatewayCredentialScope;
 }
 
 /** A module's invariant on the sessions it may start; it refuses one by throwing. */
@@ -654,16 +624,10 @@ async function ensureGatewaySession(input: GatewaySessionInput): Promise<Gateway
   if (gatewayUnavailableReason) {
     throw new Error(`Gateway session admission is closed: ${gatewayUnavailableReason}`);
   }
-  // Before the gateway is asked: a restricted agent never starts behind a
-  // gateway that would ignore its credential scope, and no session starts
-  // that a registered admission policy refuses.
+  // Before the gateway is asked: no session starts that a registered
+  // admission policy refuses.
   const gatewayProvider = getGatewayProvider();
-  assertCredentialScopeEnforced(gatewayProvider, input);
-  await assertSessionAdmitted({
-    disposition: input.disposition ?? 'create',
-    key: input.key,
-    credentialScope: input.credentialScope,
-  });
+  await assertSessionAdmitted({ disposition: input.disposition ?? 'create', key: input.key });
   const controller = new AbortController();
   const generation = gatewayAdmissionGeneration;
   try {
@@ -931,7 +895,6 @@ export async function adoptRunningSessions(): Promise<{ adopted: number; stopped
         groupName: agentGroup.name,
         containerName: handle.name,
         capabilities: driver.capabilities(),
-        credentialScope: await credentialScopeFor(agentGroup, session),
       });
       await driver.reconcileNetworkAccess?.(gatewaySession.lease.contribution.networkAccess);
     } catch (err) {

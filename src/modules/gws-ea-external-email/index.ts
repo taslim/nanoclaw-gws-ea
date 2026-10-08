@@ -9,8 +9,7 @@
  *     whatever an admin approves, and so is any self-modification request
  *     from it. Before any session of it starts or is adopted, a session
  *     admission policy refuses one whose capabilities, configuration,
- *     stamped plugins, provider, or gateway scope differ from what the host
- *     stamped.
+ *     stamped plugins, or provider differ from what the host stamped.
  *   - A destination admission policy keeps it apart from main and from every
  *     other group (`./destination-policy.ts`). The two work together only
  *     through the host: main's `email_handoff` and its own `tell_main`
@@ -74,14 +73,11 @@ registerProtectedGroupPolicy('gws-ea-external-email:host-owned', async (agentGro
   agentGroupId === (await getExternalEmailAgentGroupId()) ? 'external-email is configured only by the host' : undefined,
 );
 
-registerSessionAdmissionPolicy('gws-ea-external-email:stamped-reach', async ({ key, credentialScope }) => {
+registerSessionAdmissionPolicy('gws-ea-external-email:stamped-reach', async ({ key }) => {
   const agentGroupId = await getExternalEmailAgentGroupId();
   if (agentGroupId === null || key.agentGroupId !== agentGroupId) return;
   const session = await getSession(key.sessionId);
-  const problems = await externalEmailDrift(agentGroupId, {
-    sessionProvider: session?.agent_provider ?? null,
-    credentialScope,
-  });
+  const problems = await externalEmailDrift(agentGroupId, { sessionProvider: session?.agent_provider ?? null });
   if (problems.length > 0) throw new Error(`external-email may not start: ${problems.join('; ')}`);
 });
 

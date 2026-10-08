@@ -211,7 +211,6 @@ describe('recorded divergence: the installed OneCLI adapter', () => {
     groupName: 'main',
     containerName: 'agent',
     capabilities: {} as GatewaySessionInput['capabilities'],
-    credentialScope: { kind: 'all' },
   });
 
   it('never creates a OneCLI agent when adopting a surviving session', async () => {
@@ -225,73 +224,6 @@ describe('recorded divergence: the installed OneCLI adapter', () => {
 
     await provider.sessions.ensure(session('create'), lease.signal);
     expect(servers.createdAgents).toEqual([{ name: 'main', identifier: 'owned-group' }]);
-  });
-
-  it("narrows a restricted agent to exactly its capabilities' secrets and the model's before it can run", async () => {
-    const provider = await installedProvider();
-    expect(provider.sessions.enforcesCredentialScope).toBe(true);
-    expect(typeof provider.credentials?.connection).toBe('function');
-
-    const calls: string[] = [];
-    let assigned: string[] = ['secret-calendar'];
-    let mode = 'all';
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
-      const url = new URL(input instanceof Request ? input.url : String(input));
-      const method = init?.method ?? 'GET';
-      const call = `${method} ${url.origin === gatewayUrl ? 'gateway' : 'onecli'}${url.pathname}`;
-      calls.push(call);
-      const body = () => JSON.parse(String(init?.body)) as Record<string, unknown>;
-      switch (call) {
-        case 'GET onecli/v1/agents':
-          return Response.json([{ id: 'agent-1', identifier: 'owned-group', secretMode: mode }]);
-        case 'GET onecli/v1/secrets':
-          return Response.json([
-            { id: 'secret-mail', name: 'google-gmail-read', hostPattern: 'gmail.googleapis.com' },
-            { id: 'secret-calendar', name: 'google-calendar', hostPattern: 'www.googleapis.com' },
-            { id: 'secret-model', name: 'Anthropic', hostPattern: 'api.anthropic.com' },
-          ]);
-        case 'GET onecli/v1/agents/agent-1/secrets':
-          return Response.json(assigned);
-        case 'PUT onecli/v1/agents/agent-1/secrets':
-          assigned = body().secretIds as string[];
-          return Response.json({ success: true });
-        case 'PATCH onecli/v1/agents/agent-1/secret-mode':
-          mode = body().mode as string;
-          return Response.json({ success: true });
-        case 'POST gateway/v1/cache/invalidate':
-          return Response.json({});
-        case 'GET onecli/v1/container-config':
-          return Response.json({
-            env: { HTTPS_PROXY: 'http://host.docker.internal:10255' },
-            caCertificate: '-----BEGIN CERTIFICATE-----\nguard\n-----END CERTIFICATE-----\n',
-            caCertificateContainerPath: '/tmp/onecli-ca.pem',
-          });
-        default:
-          return new Response('not found', { status: 404 });
-      }
-    });
-    const lease = new AbortController();
-    cleanups.push(async () => lease.abort());
-
-    await provider.sessions.ensure(
-      {
-        ...session('adopt'),
-        credentialScope: { kind: 'only', credentials: ['google-gmail-read'], modelDomains: ['anthropic.com'] },
-      },
-      lease.signal,
-    );
-
-    expect([...assigned].sort()).toEqual(['secret-mail', 'secret-model']);
-    expect(mode).toBe('selective');
-    const configRead = calls.indexOf('GET onecli/v1/container-config');
-    for (const write of [
-      'PUT onecli/v1/agents/agent-1/secrets',
-      'PATCH onecli/v1/agents/agent-1/secret-mode',
-      'POST gateway/v1/cache/invalidate',
-    ]) {
-      expect(calls.indexOf(write)).toBeGreaterThanOrEqual(0);
-      expect(calls.indexOf(write)).toBeLessThan(configRead);
-    }
   });
 
   const approval = (id: string, group: string) => ({
@@ -650,33 +582,6 @@ describe("recorded divergence: the runner's tool barrel loads GWS-EA's tools", (
 });
 
 describe('recorded divergence: each agent group has a capability list', () => {
-  it('refuses a restricted agent behind a gateway that cannot narrow its credentials, at every spawn and adoption', async () => {
-    await freshInstall();
-    const registry = await import('../gateway-providers/gateway-provider-registry.js');
-    const runner = await readFile(path.join(originalCwd, 'src/container-runner.ts'), 'utf8');
-
-    const input = (credentialScope: GatewaySessionInput['credentialScope']): GatewaySessionInput => ({
-      key: { installSlug: 'install', agentGroupId: 'g', sessionId: 's' },
-      runtimeIdentity: 'install/g/s',
-      groupName: 'g',
-      containerName: 'agent',
-      capabilities: {} as GatewaySessionInput['capabilities'],
-      credentialScope,
-    });
-    const unscoped = {
-      kind: 'unscoped',
-      agentSkills: [],
-      sessions: { ensure: vi.fn() },
-      approvals: { subscribe: vi.fn() },
-    } as unknown as Parameters<typeof registry.assertCredentialScopeEnforced>[0];
-    expect(() =>
-      registry.assertCredentialScopeEnforced(unscoped, input({ kind: 'only', credentials: [], modelDomains: [] })),
-    ).toThrow(/does not enforce credential scopes/);
-    expect(() => registry.assertCredentialScopeEnforced(unscoped, input({ kind: 'all' }))).not.toThrow();
-    expect(runner).toContain('assertCredentialScopeEnforced(');
-    expect(runner.split('credentialScope: await credentialScopeFor(').length - 1).toBe(3);
-  });
-
   it('keeps send_file staging and cross-session context tied to capabilities in upstream files', async () => {
     const read = (file: string) => readFile(path.join(originalCwd, file), 'utf8');
     const core = await read('container/agent-runner/src/mcp-tools/core.ts');
@@ -888,7 +793,6 @@ describe('recorded divergence: a module can refuse a session before it starts', 
     const session = (agentGroupId: string): Parameters<typeof runner.assertSessionAdmitted>[0] => ({
       disposition: 'adopt',
       key: { installSlug: 'install', agentGroupId, sessionId: 'session-1' },
-      credentialScope: { kind: 'all' },
     });
 
     await expect(runner.assertSessionAdmitted(session('drifted-group'))).rejects.toThrow('its configuration drifted');
