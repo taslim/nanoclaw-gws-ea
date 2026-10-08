@@ -8,8 +8,10 @@
  * no session persistence, and the tool environment minus secret variables;
  * its reply is shown as untrusted text and nothing it suggests is executed.
  *
- * Upstream setup/lib/claude-assist.ts runs Claude with bypassed permissions in
- * the project root, so it is deliberately not reused here.
+ * Upstream setup/lib/claude-assist.ts is deliberately not reused: though its
+ * Claude is now limited to reading (Read, Grep, Glob), it reads unredacted
+ * files wherever the user can, resumes sessions, and hands a suggested command
+ * to setup/run-suggested.sh to run.
  */
 import { mkdir, readFile } from 'node:fs/promises';
 import os from 'node:os';
