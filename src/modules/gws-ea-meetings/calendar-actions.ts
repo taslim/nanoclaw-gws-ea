@@ -10,8 +10,8 @@
  *   after a partial failure finds the event it made (`ensureEvent`), and an
  *   event under that id that is not the assistant's is never touched.
  * - Every event the assistant places carries private tags no one else can
- *   set: its role (`TAG_ROLE`), a hold or a booking, and the thread it was
- *   placed for.
+ *   set: its role (`TAG_ROLE`), which marks it a booking, and the thread it
+ *   was placed for.
  * - Every write is recorded as the assistant's own change, so its
  *   notification produces no note.
  */
@@ -29,7 +29,7 @@ import type {
 } from './calendar-api.js';
 import type { Span } from './slots.js';
 
-/** The private tag naming an event's role, `hold` or `booking`, on the events the assistant places. */
+/** The private tag naming an event's role, `booking`, on the events the assistant places. */
 export const TAG_ROLE = 'gwsEaRole';
 
 /** A Google event id from its parts: lowercase hex, which Google's id alphabet allows. */

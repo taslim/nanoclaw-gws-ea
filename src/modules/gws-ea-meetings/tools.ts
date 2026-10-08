@@ -1,11 +1,10 @@
 /**
- * external-email's scheduling tools (KTD7; R69, R70, R71): five host
+ * external-email's scheduling tools (KTD7; R69, R70, R71): four host
  * actions, each bound to the email thread whose session calls it
  * (`threadCalendarAction` in `guard.ts`). No argument names a thread, so a
- * call never reaches another thread's holds or bookings.
+ * call never reaches another thread's bookings.
  *
  *   free_time       { from, to, minutes, timezone? } → { windows, windows_not_listed, message }
- *   hold            { starts, minutes }              → { held, message }
  *   book            { start, minutes, title, notes?, location?, video_call?, invitees?, timezone? }
  *                                                     → { booking, start, end, message }
  *   change_booking  { booking, start?, minutes?, title?, location?, notes?, video_call?, timezone? }
@@ -21,39 +20,37 @@
  *   labeled, ready to write, in the principal's time zone and, when given,
  *   the counterpart's, inside whose waking day it falls, with a fit note from
  *   a fixed vocabulary that never echoes a preference.
- * - `hold` replaces the thread's holds with at most three private, busy
- *   events, each lapsing three days after it was last held. A timer releases
- *   what lapsed (`releaseExpiredHolds`).
- * - `book` always creates a new event at a time still free or held by this
- *   thread, inviting only people on the thread, with an invitation that
- *   passes the private-values check as its invitees would see it. Then the
- *   thread's holds go.
+ * - Nothing reserves a time before someone agrees to it: a time offered in
+ *   one thread is any thread's until booked, and a booking blocks time as
+ *   any other event of the principal's does (`blocksTime` in `slots.ts`).
+ * - `book` always creates a new event at a time still free, inviting only
+ *   people on the thread, with an invitation that passes the private-values
+ *   check as its invitees would see it.
  * - `change_booking` and `cancel_booking` act only on an event this thread
  *   booked. A change keeps the event's id and is checked as `book` checks
  *   what it writes.
- * - `hold`, `book` and `change_booking` refuse a time inside protected time,
- *   so a counterpart's proposal never gets round it.
- * - Every hold and booking lists the principal as an accepted guest, its
- *   organizer (`guestsOn`); who a booking invites never counts them.
+ * - `book` and `change_booking` refuse a time inside protected time, so a
+ *   counterpart's proposal never gets round it, and refuse a time that has
+ *   gone with word to offer others.
+ * - Every booking lists the principal as an accepted guest, its organizer
+ *   (`guestsOn`); who a booking invites never counts them.
  * - `main` hears in one fact when a booking is made, changed or cancelled.
  *
- * Holds and bookings go on the calendar `main` named for the thread, else on
- * the principal's primary calendar: the calendar of the first address they
+ * Bookings go on the calendar `main` named for the thread, else on the
+ * principal's primary calendar: the calendar of the first address they
  * gave. Either way it must be a principal calendar the assistant can write
  * to; no other calendar stands in for it.
- * An event is the thread's when its record names it and it carries the role
- * tag the host gave it, so a hold converted from an earlier release, tagged
- * by its meeting, releases too.
+ * A booking is the thread's when its record names it and its event still
+ * carries the booking tag the host gave it.
  *
  * Each request is answered once, a refusal or failure included. A replayed
- * request writes nothing twice: a hold's event id derives from the thread
- * and its time, and a booking's from the request that made it.
+ * request writes nothing twice: a booking's event id derives from the
+ * request that made it.
  */
 import { TIMEZONE } from '../../config.js';
 import { forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-action.js';
 import { resolveGroupTimezone } from '../../container-config.js';
 import { log } from '../../log.js';
-import { formatLocalTime } from '../../timezone.js';
 import type { Session } from '../../types.js';
 import { isPrincipalCalendar, recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import { listPrincipalCalendars } from '../gws-ea-inbox/db.js';
@@ -91,15 +88,10 @@ import {
 } from './slots.js';
 import {
   deleteThreadBooking,
-  deleteThreadHold,
   getThreadBooking,
   getThreadBookingCalendar,
-  listExpiredHolds,
-  listThreadHolds,
   recordThreadBooking,
-  recordThreadHold,
   type ThreadBooking,
-  type ThreadHold,
 } from './thread-calendar.js';
 
 /** The private tag naming the thread an event was placed for. */
@@ -107,10 +99,6 @@ export const TAG_THREAD = 'gwsEaThread';
 
 /** How many windows one `free_time` answer lists: about a week of days. */
 const MAX_WINDOWS = 24;
-/** How many times one thread holds at once. */
-const MAX_HOLDS = 3;
-/** A hold lapses this long after it was last held. */
-const HOLD_LIFETIME_DAYS = 3;
 /** The longest range one `free_time` reads. */
 const MAX_RANGE_DAYS = 60;
 const MIN_MINUTES = 5;
@@ -210,10 +198,10 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
   }
 
   /**
-   * The calendar the thread holds and books on: the one main named for it,
-   * else the principal's primary calendar. Either way it must be a principal
-   * calendar the assistant can write to; refused, saying so, when it is not,
-   * rather than placing the meeting on some other calendar of theirs.
+   * The calendar the thread books on: the one main named for it, else the
+   * principal's primary calendar. Either way it must be a principal calendar
+   * the assistant can write to; refused, saying so, when it is not, rather
+   * than placing the meeting on some other calendar of theirs.
    */
   async function bookingCalendarOf(view: ThreadView): Promise<CalendarEntry> {
     const named = await getThreadBookingCalendar(view.threadKey);
@@ -228,15 +216,16 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     }
     throw forbidden(
       named === null
-        ? "The assistant cannot write to the principal's primary calendar, so it can hold and book nothing: tell main with tell_main."
-        : 'The assistant cannot write to the calendar main named for this thread, so it can hold and book nothing: tell main with tell_main.',
+        ? "The assistant cannot write to the principal's primary calendar, so it can book nothing: tell main with tell_main."
+        : 'The assistant cannot write to the calendar main named for this thread, so it can book nothing: tell main with tell_main.',
     );
   }
 
   /**
    * Time taken in `span`, read now from the principal's calendars and the
-   * one the thread books on: every event that blocks their time, apart from
-   * those in `ignore`, the thread's own.
+   * one the thread books on: every event that blocks their time, the
+   * assistant's own included, apart from those in `ignore`: the event a
+   * write is itself moving or retrying.
    */
   async function busyIn(
     view: ThreadView,
@@ -264,7 +253,8 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
 
   /**
    * Refuse, naming each, any time that has passed, falls in protected time,
-   * or is no longer free: what `hold`, `book` and `change_booking` never place.
+   * or is no longer free: what `book` and `change_booking` never place. A
+   * time no longer free is refused with word to offer others.
    */
   async function assertAvailable(
     view: ThreadView,
@@ -295,10 +285,9 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
   }
 
   /**
-   * The calendar writes take turns across every thread and the timer that
-   * releases lapsed holds: each looks at what is free or held and writes
-   * before the next looks, so two threads never take one time and a hold
-   * held again is never released from under its thread.
+   * The calendar writes take turns across every thread: each looks at what
+   * is free and writes before the next looks, so two threads never take one
+   * time, and the second is told it has gone.
    */
   let turn: Promise<unknown> = Promise.resolve();
   function takeTurn<T>(work: () => Promise<T>): Promise<T> {
@@ -311,72 +300,6 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
   }
   function inTurn(answer: ActionAnswer): ActionAnswer {
     return (content, session, requestId) => takeTurn(() => answer(content, session, requestId));
-  }
-
-  // -------------------------------------------------------------------------
-  // Releasing holds
-  // -------------------------------------------------------------------------
-
-  /**
-   * Delete a recorded hold's event while it still carries the hold tag; then
-   * forget the record, when given `expiredBy` only if it is still lapsed by
-   * then.
-   */
-  async function releaseHold(hold: ThreadHold, expiredBy?: string): Promise<void> {
-    const event = await calendar().getEvent(hold.calendarId, hold.eventId);
-    if (event && event.status !== 'cancelled') {
-      if (event.tags?.[TAG_ROLE] === 'hold') {
-        await calendar().deleteEvent(hold.calendarId, hold.eventId, 'none');
-        recordOwnCalendarChange(hold.calendarId, hold.eventId);
-      } else {
-        log.warn('A recorded hold no longer carries the hold tag; it is left on the calendar', {
-          threadKey: hold.threadKey,
-          calendarId: hold.calendarId,
-          eventId: hold.eventId,
-        });
-      }
-    }
-    await deleteThreadHold(hold.calendarId, hold.eventId, expiredBy);
-  }
-
-  /** Release each hold; throw after trying them all if any stays, still recorded for the next attempt. */
-  async function releaseHolds(holds: readonly ThreadHold[], expiredBy?: string): Promise<void> {
-    let failed = 0;
-    for (const hold of holds) {
-      /* eslint-disable no-catch-all/no-catch-all -- one hold that cannot go yet must not keep the others; the count is rethrown */
-      try {
-        await releaseHold(hold, expiredBy);
-      } catch (err) {
-        failed += 1;
-        log.warn('A hold could not be released yet', { threadKey: hold.threadKey, eventId: hold.eventId, err });
-      }
-      /* eslint-enable no-catch-all/no-catch-all */
-    }
-    if (failed > 0) {
-      throw new Error(`${failed} hold(s) could not be released yet; they stay recorded and go on the next attempt`);
-    }
-  }
-
-  /** Release every hold the thread placed. */
-  async function releaseThreadHolds(threadKey: string): Promise<void> {
-    await releaseHolds(await listThreadHolds(threadKey));
-  }
-
-  /**
-   * Release every hold whose time to lapse has come, in its turn with the
-   * calendar writes. Never throws: what stays goes on the next pass.
-   */
-  function releaseExpiredHolds(): Promise<void> {
-    return takeTurn(async () => {
-      /* eslint-disable no-catch-all/no-catch-all -- the timer runs on; a hold left recorded is released on the next pass */
-      try {
-        const at = new Date().toISOString();
-        await releaseHolds(await listExpiredHolds(at), at);
-      } catch (err) {
-        log.warn('Lapsed holds were not all released; the next pass tries again', { err });
-      }
-      /* eslint-enable no-catch-all/no-catch-all */
-    });
   }
 
   // -------------------------------------------------------------------------
@@ -528,84 +451,6 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
   };
 
   /**
-   * Replace the thread's holds with these times, each lapsing three days
-   * from now; an empty list releases them all. Every time is checked first,
-   * so a refusal changes nothing. Holding a time held already only resets
-   * when it lapses.
-   */
-  const hold: ActionAnswer = async (content, session) => {
-    if (!Array.isArray(content.starts) || content.starts.length > MAX_HOLDS) {
-      throw invalidArgs(`starts must list up to ${MAX_HOLDS} start times, or none to release every hold`);
-    }
-    const starts = [...new Set(content.starts.map((start: unknown) => instantOf(start, 'Each start')))].sort(
-      (a, b) => a - b,
-    );
-    const view = await viewOf(session);
-    const existing = await listThreadHolds(view.threadKey);
-    if (starts.length === 0) {
-      await releaseHolds(existing);
-      return { held: [], message: 'This thread holds no times now.' };
-    }
-    const minutes = minutesOf(content.minutes);
-    const spans = starts.map((start) => spanAt(start, minutes));
-    if (spans.some((span, index) => index > 0 && span.start < spans[index - 1].end)) {
-      throw invalidArgs('The times overlap: hold times that do not.');
-    }
-    const { timezone } = view.principal;
-    const bookingCalendar = await bookingCalendarOf(view);
-    await assertAvailable(view, bookingCalendar.id, spans, new Set(existing.map((held) => held.eventId)));
-
-    const eventIdOf = (span: Span): string => eventIdFor('hold', view.threadKey, iso(span.start), iso(span.end));
-    const wanted = new Set(spans.map(eventIdOf));
-    await releaseHolds(existing.filter((held) => held.calendarId !== bookingCalendar.id || !wanted.has(held.eventId)));
-    const expiresAt = iso(Date.now() + HOLD_LIFETIME_DAYS * DAY);
-    const holder = view.principal.assistantName ?? 'The assistant';
-    for (const span of spans) {
-      const eventId = eventIdOf(span);
-      // Recorded first, so a release finds it whatever happens to the write.
-      await recordThreadHold({
-        threadKey: view.threadKey,
-        calendarId: bookingCalendar.id,
-        eventId,
-        startAt: iso(span.start),
-        endAt: iso(span.end),
-        expiresAt,
-      });
-      await ensureEvent(
-        calendar(),
-        bookingCalendar.id,
-        eventId,
-        {
-          summary: 'Hold',
-          description: `${holder} is holding this time while a meeting is agreed by email. It is released on its own.`,
-          start: iso(span.start),
-          end: iso(span.end),
-          timeZone: timezone,
-          attendees: guestsOn(bookingCalendar.id, []),
-          visibility: 'private',
-          transparency: 'opaque',
-          reminders: 'none',
-          tags: { [TAG_ROLE]: 'hold', [TAG_THREAD]: view.threadKey },
-        },
-        'none',
-        { key: TAG_THREAD, value: view.threadKey },
-      );
-    }
-    return {
-      held: spans.map((span) => ({
-        start: iso(span.start),
-        end: iso(span.end),
-        principal_time: slotLabel(span, timezone),
-      })),
-      message: [
-        'This thread now holds:',
-        ...spans.map((span) => `- ${zonedIso(span.start, timezone)}: ${slotLabel(span, timezone)}`),
-        `They lapse on ${formatLocalTime(expiresAt, timezone)} unless you hold them again. Any other time it held is released.`,
-      ].join('\n'),
-    };
-  };
-
-  /**
    * The people a booking invites: those named, each one on the thread, or
    * everyone on it when none are named; never the principal or the
    * assistant, whose calendar the event is on.
@@ -691,13 +536,8 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
   async function placeBooking(view: ThreadView, wanted: NewBooking): Promise<ThreadBooking> {
     const { threadKey } = view;
     const bookingCalendar = await bookingCalendarOf(view);
-    const holds = await listThreadHolds(threadKey);
-    await assertAvailable(
-      view,
-      bookingCalendar.id,
-      [wanted.span],
-      new Set([...holds.map((held) => held.eventId), wanted.eventId]),
-    );
+    // Its own event, which an earlier attempt at this request may have left, never blocks it.
+    await assertAvailable(view, bookingCalendar.id, [wanted.span], new Set([wanted.eventId]));
     await assertInvitationShareable(
       [wanted.title, wanted.notes, wanted.location],
       bookingCalendar.summary,
@@ -745,11 +585,10 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
 
   /**
    * Book a time someone agreed to (R71): always a new event, under an id
-   * derived from this request, at a time still free or held by this thread
-   * and outside protected time. It invites only people on the thread, with
-   * the invitation as they would see it passing the private-values check.
-   * The thread's holds then go, and main hears. A replay of a request
-   * already booked only finishes what follows.
+   * derived from this request, at a time still free and outside protected
+   * time. It invites only people on the thread, with the invitation as they
+   * would see it passing the private-values check, and main hears. A replay
+   * of a request already booked only finishes what follows.
    */
   const book: ActionAnswer = async (content, session, requestId) => {
     const start = instantOf(content.start, 'start');
@@ -769,15 +608,6 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
       (await getThreadBooking(view.threadKey, eventId)) ??
       (await placeBooking(view, { eventId, span, invitees, title, notes, location, videoCall }));
     const conference = videoCall ? await readConference(calendar(), booking.calendarId, eventId) : undefined;
-    let holdsLeft = '';
-    /* eslint-disable no-catch-all/no-catch-all -- the booking stands; a hold left over lapses on its own */
-    try {
-      await releaseThreadHolds(view.threadKey);
-    } catch (err) {
-      log.warn('A booked thread’s holds were not all released', { threadKey: view.threadKey, err });
-      holdsLeft = ' Some of its holds could not be released yet; they lapse on their own.';
-    }
-    /* eslint-enable no-catch-all/no-catch-all */
     await tellMain({
       threadKey: view.threadKey,
       booking,
@@ -791,8 +621,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
       end: iso(span.end),
       message:
         `Booked: ${bothZones(span, timezone, theirs)}. Google sends ${invitees.join(', ')} the invitation from the principal's calendar` +
-        `${conferenceWords(conference)}. This thread's holds are released.${holdsLeft} main hears of it. ` +
-        `To change or cancel it, give booking ${eventId}.`,
+        `${conferenceWords(conference)}. main hears of it. To change or cancel it, give booking ${eventId}.`,
     };
   };
 
@@ -829,7 +658,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
    * checks one; new text passes the private-values check as the invitees
    * would see it, beside the calendar's name; and a Meet link needs a
    * calendar that allows one. Google sends the invitees the update and main
-   * hears. The thread's holds stay, but for any the booking now sits on.
+   * hears.
    */
   const changeBooking: ActionAnswer = async (content, session, requestId) => {
     const start = content.start === undefined || content.start === null ? undefined : instantOf(content.start, 'start');
@@ -847,15 +676,8 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     const { booking, event, span: was, invitees } = await ownBooking(content, view);
     const span = spanAt(start ?? was.start, minutes ?? (was.end - was.start) / MINUTE);
     const retimed = span.start !== was.start || span.end !== was.end;
-    const holds = await listThreadHolds(view.threadKey);
-    if (retimed) {
-      await assertAvailable(
-        view,
-        booking.calendarId,
-        [span],
-        new Set([...holds.map((held) => held.eventId), booking.eventId]),
-      );
-    }
+    // The booking never blocks its own move.
+    if (retimed) await assertAvailable(view, booking.calendarId, [span], new Set([booking.eventId]));
     const texted = title !== undefined || notes !== undefined || location !== undefined;
     // A link is asked for only when the event has none that works: never a second one.
     const linking = videoCall && (event.conference === undefined || event.conference.status === 'failure');
@@ -890,19 +712,6 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     }
     await calendar().patchEvent(booking.calendarId, booking.eventId, fields, 'all');
     recordOwnCalendarChange(booking.calendarId, booking.eventId);
-    let holdsLeft = '';
-    /* eslint-disable no-catch-all/no-catch-all -- the change stands; a hold left under it lapses on its own */
-    try {
-      if (retimed) {
-        await releaseHolds(
-          holds.filter((held) => !isClear(span, [{ start: Date.parse(held.startAt), end: Date.parse(held.endAt) }])),
-        );
-      }
-    } catch (err) {
-      log.warn('A hold under a changed booking was not released', { threadKey: view.threadKey, err });
-      holdsLeft = ' A hold it now sits on could not be released yet; it lapses on its own.';
-    }
-    /* eslint-enable no-catch-all/no-catch-all */
     const conference = linking ? await readConference(calendar(), booking.calendarId, booking.eventId) : undefined;
     const fresh = [
       ...(title === undefined ? [] : ['title']),
@@ -929,7 +738,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
       end: iso(span.end),
       message:
         `Changed: ${bothZones(span, timezone, theirs)}${conferenceWords(conference)}. ` +
-        `Google sends the invitees the update, and main hears of it.${holdsLeft}`,
+        'Google sends the invitees the update, and main hears of it.',
     };
   };
 
@@ -951,11 +760,8 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
 
   return {
     freeTime,
-    hold: inTurn(hold),
     book: inTurn(book),
     changeBooking: inTurn(changeBooking),
     cancelBooking: inTurn(cancelBooking),
-    releaseThreadHolds,
-    releaseExpiredHolds,
   };
 }

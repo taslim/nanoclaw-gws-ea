@@ -45,15 +45,7 @@ const ALL = [
 const EXTERNAL_EMAIL = ['files-read', 'time', 'request-status', 'gws-ea-reminders', 'gws-ea-email-external'];
 
 /** external-email's thread tools, which `gws-ea-email-external` grants. */
-const EXTERNAL_EMAIL_TOOLS = [
-  'book',
-  'cancel_booking',
-  'change_booking',
-  'email_send',
-  'free_time',
-  'hold',
-  'tell_main',
-];
+const EXTERNAL_EMAIL_TOOLS = ['book', 'cancel_booking', 'change_booking', 'email_send', 'free_time', 'tell_main'];
 
 /** main's email tools, which `gws-ea-email` grants. */
 const MAIN_EMAIL_TOOLS = ['email_handoff', 'email_principal'];
@@ -133,9 +125,13 @@ describe('NanoClaw tool server capabilities', () => {
 
   it('gives main neither tell_main nor the scheduling tools', async () => {
     const tools = await served(ALL);
-    for (const tool of ['tell_main', 'free_time', 'hold', 'book', 'change_booking', 'cancel_booking']) {
+    for (const tool of ['tell_main', 'free_time', 'book', 'change_booking', 'cancel_booking']) {
       expect(tools).not.toContain(tool);
     }
+  });
+
+  it('serves no hold tool to any group: nothing reserves the principal’s time before someone agrees', async () => {
+    for (const grants of [ALL, EXTERNAL_EMAIL]) expect(await served(grants)).not.toContain('hold');
   });
 
   it("serves main email_principal for the principal's threads, and external-email email_send for its own", async () => {

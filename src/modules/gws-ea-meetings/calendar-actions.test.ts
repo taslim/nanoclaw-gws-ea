@@ -1,7 +1,7 @@
 /**
  * How a time reads in an email: its day, its times and its zone as people
- * write them. The writes behind holds and bookings are covered with the
- * scheduling tools that make them (tools.test.ts).
+ * write them. The writes behind bookings are covered with the scheduling
+ * tools that make them (tools.test.ts).
  */
 import { describe, expect, it } from 'vitest';
 

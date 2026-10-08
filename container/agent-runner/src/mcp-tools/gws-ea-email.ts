@@ -11,8 +11,8 @@
  * - `external-email` (capability `gws-ea-email-external`) writes in its own
  *   thread with `email_send`, tells main what main should know with
  *   `tell_main`, and schedules on the principal's calendar with `free_time`,
- *   `hold`, `book`, `change_booking` and `cancel_booking`, each bound by the
- *   host to the thread whose session calls it.
+ *   `book`, `change_booking` and `cancel_booking`, each bound by the host to
+ *   the thread whose session calls it.
  *
  * Both send the host's one `email_send` action, which answers each caller by
  * its own rules; each agent's tool has only the fields and limits that are its.
@@ -179,24 +179,11 @@ export const freeTime = requestTool({
   repeatable: true,
 });
 
-export const hold = requestTool({
-  ...common,
-  name: 'hold',
-  description:
-    "Hold up to three start times on the principal's calendar while someone chooses, replacing what this thread held; an empty list releases them all. A hold lapses three days after it was last held. A time that is protected or no longer free is refused, and nothing changes.",
-  properties: {
-    starts: { type: 'array', items: { type: 'string' }, description: `The start times you offer. ${DATE_TIME}` },
-    minutes: MINUTES,
-  },
-  required: ['starts'],
-  repeatable: true,
-});
-
 export const book = requestTool({
   ...common,
   name: 'book',
   description:
-    "Book an agreed time as a new event on the principal's calendar, inviting everyone in the conversation but the principal, or the invitees you name from the thread. Google sends the invitation; this thread's holds are released, and main hears. A time that is protected or no longer free is refused. Answers with the booking id.",
+    "Book an agreed time as a new event on the principal's calendar, inviting everyone in the conversation but the principal, or the invitees you name from the thread. Google sends the invitation, and main hears. A time that is protected or no longer free is refused. Answers with the booking id.",
   properties: {
     start: { type: 'string', description: `When it starts. ${DATE_TIME}` },
     minutes: MINUTES,
@@ -243,4 +230,4 @@ export const cancelBooking = requestTool({
 });
 
 registerTools([emailHandoff, emailToPrincipal], MAIN_CAPABILITY);
-registerTools([emailSend, tellMain, freeTime, hold, book, changeBooking, cancelBooking], EXTERNAL_CAPABILITY);
+registerTools([emailSend, tellMain, freeTime, book, changeBooking, cancelBooking], EXTERNAL_CAPABILITY);

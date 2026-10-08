@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
-import { emailSend, hold } from './mcp-tools/gws-ea-email.js';
+import { emailSend, freeTime } from './mcp-tools/gws-ea-email.js';
 import type { McpToolDefinition } from './mcp-tools/types.js';
 import { processQuery } from './poll-loop.js';
 import type { AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
@@ -638,7 +638,12 @@ describe('DB-visible sends gate the nudge', () => {
   });
 
   it.each<[string, McpToolDefinition, Record<string, unknown>, boolean]>([
-    ['a request that sends nothing (hold)', hold, { starts: [] }, true],
+    [
+      'a request that sends nothing (free_time)',
+      freeTime,
+      { from: '2026-10-12T09:00:00-07:00', to: '2026-10-16T17:00:00-07:00', minutes: 30 },
+      true,
+    ],
     ['an email_send the host refused', emailSend, { text: 'Hi Remy.' }, false],
   ])('a stray line after only %s is still nudged', async (_label, tool, args, ok) => {
     expect(await strayLineAfter(tool, args, ok)).toHaveLength(1);

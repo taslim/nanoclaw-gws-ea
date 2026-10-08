@@ -6,13 +6,12 @@
  * drops every earlier table.
  *
  * The conversion runs on a database the earlier release wrote, then the
- * converted work is driven through the real thread map, send ledger, inbox
- * poll and scheduling tools against an in-memory Gmail and Calendar. Only the
- * container runtime and its wake are mocked.
+ * converted work is driven through the real thread map, send ledger and
+ * inbox poll against an in-memory Gmail and Calendar. Only the container
+ * runtime and its wake are mocked.
  */
 import fs from 'node:fs';
 
-import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const TEST_DIR = '/tmp/nanoclaw-test-gws-ea-email-channel-migration';
@@ -49,15 +48,12 @@ vi.mock('../gws-ea-meetings/calendar-api.js', async (importOriginal) => {
 
 import type { ChannelSetup, InboundMessage } from '../../channels/adapter.js';
 import { dispatch } from '../../cli/dispatch.js';
-import type { ResponseFrame } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
 import { ensureContainerConfig, getContainerConfig } from '../../db/container-configs.js';
 import type { DbDriver } from '../../db/driver.js';
 import { sqliteRaw } from '../../db/drivers/sqlite.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb } from '../../db/index.js';
 import { getRegisteredMigrations, runMigrations } from '../../db/migrations/index.js';
-import { getDeliveryAction } from '../../delivery.js';
-import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import '../index.js';
@@ -771,22 +767,6 @@ describe("moving an earlier release's work", () => {
     expect({ id: session.id, created }).toEqual({ id: offered.id, created: false });
   });
 
-  it('lets the thread book a time the earlier release held for it, and releases its converted holds', async () => {
-    const frame = await request(offered, 'book', {
-      start: HELD_START,
-      minutes: 30,
-      title: 'Coffee: Pat and Remy',
-      invitees: [REMY],
-    });
-    expect(frame.ok, JSON.stringify(frame)).toBe(true);
-    const holds = calendar.live(PRINCIPAL).filter((event) => event.tags?.gwsEaRole === 'hold');
-    expect(holds.map((event) => event.id)).toEqual(['hold-g1']);
-    expect(await getDb().all('SELECT event_id FROM gws_ea_thread_holds WHERE thread_key = ?', OFFERED)).toEqual([]);
-    expect(await getDb().all('SELECT thread_key FROM gws_ea_thread_bookings WHERE thread_key = ?', OFFERED)).toEqual([
-      { thread_key: OFFERED },
-    ]);
-  });
-
   it('reconciles a send Gmail already holds instead of sending it twice', async () => {
     const sent: string[] = [];
     const gmail = fakeGmail({
@@ -1008,23 +988,6 @@ describe("the conversion's guards", () => {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-let requests = 0;
-
-/** Send one request as the runner's tool would, and read the host's one answer. */
-async function request(session: Session, action: string, fields: Record<string, unknown>): Promise<ResponseFrame> {
-  const requestId = `act-migration-${++requests}`;
-  const handler = getDeliveryAction(action);
-  if (!handler) throw new Error(`${action} is not a registered delivery action`);
-  await handler({ ...fields, action, requestId }, session);
-  const db = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
-  const rows = db.prepare('SELECT content FROM messages_in WHERE id = ?').all(`action-resp-${requestId}`) as Array<{
-    content: string;
-  }>;
-  db.close();
-  expect(rows).toHaveLength(1);
-  return (JSON.parse(rows[0]!.content) as { frame: ResponseFrame }).frame;
-}
 
 function b64(text: string): string {
   return Buffer.from(text, 'utf8').toString('base64url');

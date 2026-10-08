@@ -19,10 +19,10 @@ import { AGENT_GOOGLE_SERVICES } from '../gws-ea-google/grant.js';
 import { getExternalEmailAgentGroupId } from '../gws-ea-profile/db.js';
 
 /**
- * free_time, hold, book, change_booking and cancel_booking: external-email,
- * from the session of one email thread, whose key is the session's thread.
- * No argument names a thread, so a call never reaches another thread's
- * holds or bookings.
+ * free_time, book, change_booking and cancel_booking: external-email, from
+ * the session of one email thread, whose key is the session's thread. No
+ * argument names a thread, so a call never reaches another thread's
+ * bookings.
  */
 export const threadCalendarAction = defineGuardedAction({
   action: 'gws_ea_meetings.thread_calendar',
@@ -34,12 +34,12 @@ export const threadCalendarAction = defineGuardedAction({
       actor.agentGroupId !== externalEmailAgentGroupId ||
       actor.sessionId === undefined
     ) {
-      return DENY("Only external-email offers, holds, books, changes or cancels times on the principal's calendar.");
+      return DENY("Only external-email offers, books, changes or cancels times on the principal's calendar.");
     }
     const session = await getSession(actor.sessionId);
     const threadKey = session?.agent_group_id === actor.agentGroupId ? session.thread_id : null;
     if (threadKey === null || (await getThread(threadKey)) === undefined) {
-      return DENY('This conversation is not an email thread, so it has no times to offer, hold or book.');
+      return DENY('This conversation is not an email thread, so it has no times to offer or book.');
     }
     return ALLOW("external-email, from its email thread's own session");
   },

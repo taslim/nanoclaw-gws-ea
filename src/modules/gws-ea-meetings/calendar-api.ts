@@ -3,7 +3,7 @@
  * the host's own Calendar token (KTD7): whether a calendar is one the
  * principal owns and the assistant can write to, and its name; an event's
  * organizer, attendees, time and the assistant's own tags, the events in an
- * interval, and the writes behind holds, bookings, changes and cancellations.
+ * interval, and the writes behind bookings, changes and cancellations.
  * No client library: each call is one `fetch` with the token in its header,
  * so it never reaches a container or an argument list.
  *

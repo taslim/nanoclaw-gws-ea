@@ -492,8 +492,10 @@ describe('email_handoff', () => {
   });
 
   it('records the calendar main names for the thread’s bookings, when the principal’s and writable', async () => {
-    const key = keyOf(await handoff({ people: [REMY], message: 'Book the team sync.', calendar: TEAM_CALENDAR }));
+    const named = await handoff({ people: [REMY], message: 'Book the team sync.', calendar: TEAM_CALENDAR });
+    const key = keyOf(named);
     expect(await getThreadBookingCalendar(key)).toBe(TEAM_CALENDAR);
+    expect(String(data(named).message).endsWith(` Its bookings go on calendar ${TEAM_CALENDAR}.`)).toBe(true);
 
     for (const calendarId of [SHARED_CALENDAR, PARTNER_CALENDAR, 'someone@else.example']) {
       expect(refusal(await handoff({ people: [JANE], message: 'Book it.', calendar: calendarId }))).toMatch(

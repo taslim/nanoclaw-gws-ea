@@ -77,7 +77,8 @@ const REQUIRED_GUIDANCE = [
   "When you can see a colleague's calendar, book them directly",
   'Answer invitations awaiting the principal as they would.',
   'An answer they already gave stands.',
-  'Holds the assistant placed while arranging meetings give way to real commitments and lapse on their own',
+  // Nothing holds a time that is only offered (R5): a time that really matters is booked outright.
+  'Nothing holds a time external-email offers; when one really matters, book it outright with `create_event`.',
   'count rather than glance: a few weeks seen at a glance is not a pattern.',
   'count a couple of months of their calendar with a short script',
   'when one conflicts with something they asked for, point out the conflict rather than undo their request.',
@@ -131,7 +132,8 @@ const RETIRED_GUIDANCE = [
 /**
  * This release's earlier wording that judgment replaced: a calendar-learning
  * routine on a fixed schedule, a name-lookup procedure, a second
- * acknowledgement in the Remy example, and authority for anyone verified.
+ * acknowledgement in the Remy example, authority for anyone verified, and
+ * holds placed while arranging meetings.
  */
 const REPLACED_GUIDANCE = [
   'Once the first offers are out',
@@ -140,10 +142,12 @@ const REPLACED_GUIDANCE = [
   'To turn a name into an address',
   'Only an explicit request from a verified person',
   "tell the principal in one line that you're on it",
+  'Holds the assistant placed',
+  'lapse on their own',
 ];
 
 /** Tools only external-email holds: main's guidance names none of them. */
-const EXTERNAL_ONLY_TOOLS = ['tell_main', 'free_time', 'hold', 'book', 'change_booking', 'cancel_booking'];
+const EXTERNAL_ONLY_TOOLS = ['tell_main', 'free_time', 'book', 'change_booking', 'cancel_booking'];
 
 /** Backticked words the guidance uses that are not tools: main's own name, a preference's sources, and a handoff's field. */
 const NOT_TOOLS = ['main', 'principal', 'learned', 'people'];

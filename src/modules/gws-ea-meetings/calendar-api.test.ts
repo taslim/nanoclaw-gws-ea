@@ -137,7 +137,7 @@ describe('the Calendar client', () => {
     expect(await api.insertEvent('pat@principal.example', 'abc123', WRITE, 'none')).toBe('exists');
   });
 
-  it('marks a hold private, busy and silent', async () => {
+  it('writes an event private, busy and silent when asked', async () => {
     const { api, requests } = stubGoogle(() => ({ status: 200, body: { id: 'h1' } }));
     await api.insertEvent(
       'pat@principal.example',
@@ -260,11 +260,11 @@ describe('the Calendar client', () => {
         status: 'confirmed',
         start: { dateTime: '2026-10-07T09:00:00Z' },
         end: { dateTime: '2026-10-07T09:30:00Z' },
-        extendedProperties: { private: { gwsEaThread: 'mail-1', gwsEaRole: 'hold' } },
+        extendedProperties: { private: { gwsEaThread: 'mail-1', gwsEaRole: 'booking' } },
       },
     }));
     const event = await api.getEvent('pat@principal.example', 'h1');
-    expect(event?.tags).toEqual({ gwsEaThread: 'mail-1', gwsEaRole: 'hold' });
+    expect(event?.tags).toEqual({ gwsEaThread: 'mail-1', gwsEaRole: 'booking' });
     const fields = requests[0].url.searchParams.get('fields') ?? '';
     expect(fields).toContain('extendedProperties');
     for (const hidden of ['summary', 'description', 'location']) expect(fields).not.toContain(hidden);

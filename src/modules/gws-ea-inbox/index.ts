@@ -42,7 +42,6 @@ import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
 import { identityMatchKey } from '../../gws-ea/validation.js';
 import { registerPersonForgetHook } from '../gws-ea-people/index.js';
-import { releaseThreadHolds } from '../gws-ea-meetings/index.js';
 import {
   gwsEaMeetingsCalendarActionsMigration,
   gwsEaMeetingsMigration,
@@ -180,10 +179,8 @@ async function purgeThreadSessions(threadKeys: readonly string[]): Promise<void>
   }
 }
 
-// A forgotten person leaves nothing of theirs on the threads they were on, in this order: the threads'
-// holds first, while their records still find each event, so one that cannot go yet stops the forget
-// to be tried again; then those threads' external-email sessions; then the person's
-// addresses on every thread, and their hourly counts.
+// A forgotten person leaves nothing of theirs on the threads they were on, in this order: those threads'
+// external-email sessions, then the person's addresses on every thread, and their hourly counts.
 registerPersonForgetHook('gws-ea-inbox:purge', async ({ handles }) => {
   const db = getDb();
   if (!(await db.hasTable('gws_ea_threads'))) return;
@@ -193,7 +190,6 @@ registerPersonForgetHook('gws-ea-inbox:purge', async ({ handles }) => {
   if (forgotten.size === 0) return;
   const isForgotten = (address: string) => forgotten.has(identityMatchKey(`email:${address}`));
   const { threadKeys, addresses } = await threadsWithAddresses(isForgotten);
-  for (const threadKey of threadKeys) await releaseThreadHolds(threadKey);
   await purgeThreadSessions(threadKeys);
   await db.transaction(async () => {
     await deleteThreadAddresses(addresses);

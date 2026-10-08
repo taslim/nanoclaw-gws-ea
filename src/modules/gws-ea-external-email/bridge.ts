@@ -18,7 +18,7 @@
  *   session, never from a path `main` names. Core stages them into the
  *   thread session's inbox, and each is recorded for the thread by its
  *   SHA-256, the only way a file goes out (KTD9). A `calendar` names where
- *   the thread's holds and bookings go: one of the principal's calendars the
+ *   the thread's bookings go: one of the principal's calendars the
  *   assistant can write to. `main`'s words join the mail already waiting in
  *   the thread's session, or are due at once when none is (`pendingDeadline`).
  * - `tell_main` writes `external-email`'s words into `main`'s session as
@@ -418,7 +418,7 @@ const handOver: ActionAnswer = async (content, session, requestId) => {
             target.people.length === 0 ? '' : ` It may write to ${target.people.join(', ')} there.`
           }`,
       ...(files.length === 0 ? [] : [`It may send ${files.map((file) => file.filename).join(', ')} in that thread.`]),
-      ...(bookingCalendar === undefined ? [] : [`Its holds and bookings go on calendar ${bookingCalendar}.`]),
+      ...(bookingCalendar === undefined ? [] : [`Its bookings go on calendar ${bookingCalendar}.`]),
     ].join(' '),
   };
 };

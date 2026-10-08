@@ -1,8 +1,8 @@
 /**
- * external-email's scheduling tools (KTD7; R69, R70, R71; AE67, AE68):
- * `free_time`, `hold`, `book`, `change_booking` and `cancel_booking`, each
- * bound to the email thread whose session calls it, and the timer that
- * releases lapsed holds.
+ * external-email's scheduling tools (KTD7; R69, R70, R71; AE67):
+ * `free_time`, `book`, `change_booking` and `cancel_booking`, each bound to
+ * the email thread whose session calls it. Nothing reserves a time before
+ * someone agrees to it, so the calendar writes of every thread take turns.
  *
  * Drives the real delivery actions, guard, thread map, preferences, privacy
  * check and session DBs against an in-memory Google Calendar. Only the
@@ -76,10 +76,10 @@ import '../gws-ea-inbox/index.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import { replacePrincipalCalendars } from '../gws-ea-inbox/db.js';
 import { createThread, recordThreadAddresses, threadAddresses } from '../gws-ea-inbox/thread-map.js';
-import { releaseExpiredHolds } from './index.js';
+import './index.js';
 import { FITS } from './slots.js';
 import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
-import { deleteThreadHold, listThreadHolds, recordThreadHold, setThreadBookingCalendar } from './thread-calendar.js';
+import { setThreadBookingCalendar } from './thread-calendar.js';
 
 const JUNO = 'juno@northwind.example';
 const PRINCIPAL = 'pat@northwind.example';
@@ -102,7 +102,6 @@ const NOW = new Date('2026-10-05T07:00:00.000Z');
 const RANGE = { from: '2026-10-06T00:00:00+01:00', to: '2026-10-09T00:00:00+01:00' };
 const TUESDAY_10AM = '2026-10-06T09:00:00.000Z';
 const WEDNESDAY_10AM = '2026-10-07T09:00:00.000Z';
-const THURSDAY_10AM = '2026-10-08T09:00:00.000Z';
 const THURSDAY_2PM = '2026-10-08T13:00:00.000Z';
 /** Tuesday 15:00 to 17:00 in London, which the principal protects. */
 const PROTECTED = { start: Date.parse('2026-10-06T14:00:00.000Z'), end: Date.parse('2026-10-06T16:00:00.000Z') };
@@ -166,8 +165,14 @@ function mainHeard(): string[] {
   return rows.map((row) => (JSON.parse(row.content) as { text: string }).text);
 }
 
-function live(role: 'hold' | 'booking'): StoredEvent[] {
-  return calendar.live(PRINCIPAL).filter((event) => event.tags?.gwsEaRole === role);
+/** The bookings live on the principal's primary calendar. */
+function bookings(): StoredEvent[] {
+  return calendar.live(PRINCIPAL).filter((event) => event.tags?.gwsEaRole === 'booking');
+}
+
+/** What `book` and `change_booking` answer when a time has gone: word to offer others. */
+function gone(label: string): string {
+  return `${label}: no longer free. Call free_time for times to offer instead.`;
 }
 
 /** The principal on an event of theirs, as Google lists the organizer of an event they made themselves. */
@@ -301,10 +306,14 @@ describe('the scheduling tools', () => {
     expect(refusal(fromMain)).toMatch(/Only external-email/u);
 
     const { session: noThread } = await resolveSession('ag-external', 'mg-inbox', 'mail-not-a-thread', 'per-thread');
-    expect(refusal(await send(noThread, 'hold', { starts: [TUESDAY_10AM], minutes: 30 }))).toMatch(
-      /not an email thread/u,
-    );
-    expect(live('hold')).toEqual([]);
+    expect(
+      refusal(await send(noThread, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] })),
+    ).toBe('This conversation is not an email thread, so it has no times to offer or book.');
+    expect(calendar.writes).toEqual([]);
+  });
+
+  it('hold no time before someone agrees: there is no tool that reserves one', () => {
+    expect(getDeliveryAction('hold')).toBeUndefined();
   });
 });
 
@@ -475,209 +484,13 @@ describe('busy time on the principal’s other calendars', () => {
         await send(sessionA, 'book', { start: WEDNESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] }),
       ),
     ).toMatch(/no longer free/u);
-    expect(live('booking')).toEqual([]);
+    expect(bookings()).toEqual([]);
     expect(calendar.live(TEAM)).toEqual([]);
   });
 });
 
-describe('hold', () => {
-  it('holds times as private busy events that lapse in three days, and holding new times releases the old', async () => {
-    const held = data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM, WEDNESDAY_10AM], minutes: 30 }));
-    expect(held.held).toHaveLength(2);
-    expect(String(held.message).split('\n').slice(0, 3)).toEqual([
-      'This thread now holds:',
-      '- 2026-10-06T10:00+01:00: Tuesday 6 Oct, 10:00–10:30 BST',
-      '- 2026-10-07T10:00+01:00: Wednesday 7 Oct, 10:00–10:30 BST',
-    ]);
-    expect(
-      live('hold')
-        .map((event) => event.start?.dateTime)
-        .sort(),
-    ).toEqual([TUESDAY_10AM, WEDNESDAY_10AM]);
-    for (const event of live('hold')) {
-      expect(event).toMatchObject({ visibility: 'private', transparency: 'opaque', reminders: 'none' });
-      // The principal alone, accepted: Google lists them as the hold's organizer.
-      expect(event.attendees).toEqual([PRINCIPAL_GUEST]);
-      expect(event.tags).toEqual({ gwsEaRole: 'hold', gwsEaThread: threadA });
-    }
-    expect((await listThreadHolds(threadA)).map((hold) => hold.expiresAt)).toEqual([
-      new Date(NOW.getTime() + 3 * DAY).toISOString(),
-      new Date(NOW.getTime() + 3 * DAY).toISOString(),
-    ]);
-    expect(
-      calendar.writes.filter((write) => write.op === 'insert').every((write) => write.sendUpdates === 'none'),
-    ).toBe(true);
-
-    data(await send(sessionA, 'hold', { starts: [THURSDAY_10AM], minutes: 30 }));
-    expect(live('hold').map((event) => event.start?.dateTime)).toEqual([THURSDAY_10AM]);
-    expect((await listThreadHolds(threadA)).map((hold) => hold.startAt)).toEqual([THURSDAY_10AM]);
-
-    data(await send(sessionA, 'hold', { starts: [] }));
-    expect(live('hold')).toEqual([]);
-    expect(await listThreadHolds(threadA)).toEqual([]);
-  });
-
-  it('holds a time again without rewriting it, but lists the principal, accepted, on a hold that lacks them', async () => {
-    data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM], minutes: 30 }));
-    const [first] = live('hold');
-    data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM], minutes: 30 }));
-    expect(calendar.writes.filter((write) => write.op === 'patch')).toEqual([]);
-
-    // A hold an earlier release placed lists nobody: holding its time again adds the principal.
-    calendar.put({ ...first, attendees: undefined });
-    data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM], minutes: 30 }));
-    expect(calendar.event(PRINCIPAL, first.id)?.attendees).toEqual([PRINCIPAL_GUEST]);
-    expect(calendar.writes.at(-1)).toMatchObject({ op: 'patch', eventId: first.id, sendUpdates: 'none' });
-
-    // One that lists them awaiting an answer gets theirs, accepted.
-    calendar.put({ ...first, attendees: [{ ...PRINCIPAL_GUEST, responseStatus: 'needsAction' }] });
-    data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM], minutes: 30 }));
-    expect(calendar.event(PRINCIPAL, first.id)?.attendees).toEqual([PRINCIPAL_GUEST]);
-  });
-
-  it('refuses a time that just became busy, or that another thread holds, and the refusal changes nothing', async () => {
-    data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM], minutes: 30 }));
-    calendar.put(busy('evt-new', WEDNESDAY_10AM, '2026-10-07T10:00:00.000Z'));
-
-    expect(refusal(await send(sessionA, 'hold', { starts: [WEDNESDAY_10AM], minutes: 30 }))).toMatch(/no longer free/u);
-    expect(refusal(await send(sessionB, 'hold', { starts: [TUESDAY_10AM], minutes: 30 }))).toMatch(/no longer free/u);
-    expect(live('hold').map((event) => event.start?.dateTime)).toEqual([TUESDAY_10AM]);
-    expect((await listThreadHolds(threadA)).map((hold) => hold.startAt)).toEqual([TUESDAY_10AM]);
-
-    // Holding its own time again is not a conflict with itself, and never lets the time go free on the way.
-    const [held] = live('hold');
-    const writes = calendar.writes.length;
-    data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM], minutes: 30 }));
-    expect(live('hold').map((event) => event.id)).toEqual([held.id]);
-    expect(calendar.writes.slice(writes).filter((write) => write.op === 'delete')).toEqual([]);
-  });
-
-  it('refuses a protected time, and more than three', async () => {
-    expect(refusal(await send(sessionA, 'hold', { starts: ['2026-10-06T14:30:00.000Z'], minutes: 30 }))).toMatch(
-      /protected/u,
-    );
-    expect(
-      refusal(
-        await send(sessionA, 'hold', {
-          starts: [TUESDAY_10AM, WEDNESDAY_10AM, THURSDAY_10AM, THURSDAY_2PM],
-          minutes: 30,
-        }),
-      ),
-    ).toMatch(/up to 3/u);
-    expect(live('hold')).toEqual([]);
-  });
-});
-
-describe('a hold lapses (AE68)', () => {
-  it('is deleted three days after it was last held, while one held again lasts three days from then', async () => {
-    data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM], minutes: 30 }));
-    data(await send(sessionB, 'hold', { starts: [WEDNESDAY_10AM], minutes: 30 }));
-
-    vi.setSystemTime(new Date(NOW.getTime() + DAY));
-    data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM], minutes: 30 }));
-
-    vi.setSystemTime(new Date(NOW.getTime() + 3 * DAY - 60_000));
-    await releaseExpiredHolds();
-    expect(live('hold')).toHaveLength(2);
-
-    vi.setSystemTime(new Date(NOW.getTime() + 3 * DAY + 60_000));
-    await releaseExpiredHolds();
-    expect(live('hold').map((event) => event.tags?.gwsEaThread)).toEqual([threadA]);
-    expect(await listThreadHolds(threadB)).toEqual([]);
-
-    vi.setSystemTime(new Date(NOW.getTime() + 4 * DAY + 60_000));
-    await releaseExpiredHolds();
-    expect(live('hold')).toEqual([]);
-    expect(await listThreadHolds(threadA)).toEqual([]);
-    expect(
-      calendar.writes.filter((write) => write.op === 'delete').every((write) => write.sendUpdates === 'none'),
-    ).toBe(true);
-  });
-
-  it('takes its turn with the calendar writes, so a hold its thread holds again as it lapses is never released from under it', async () => {
-    const nextMonday = '2026-10-12T09:00:00.000Z';
-    data(await send(sessionA, 'hold', { starts: [nextMonday], minutes: 30 }));
-    vi.setSystemTime(new Date(NOW.getTime() + 3 * DAY + 60_000));
-    // The sweep has read the lapsed hold and is waiting on Google when the thread holds the time again.
-    let arrived = (): void => undefined;
-    let open = (): void => undefined;
-    const atGoogle = new Promise<void>((resolve) => (arrived = resolve));
-    const opened = new Promise<void>((resolve) => (open = resolve));
-    const getEvent = calendar.getEvent.bind(calendar);
-    vi.spyOn(calendar, 'getEvent').mockImplementationOnce(async (calendarId, eventId) => {
-      arrived();
-      await opened;
-      return getEvent(calendarId, eventId);
-    });
-    const sweeping = releaseExpiredHolds();
-    await atGoogle;
-    const holding = send(sessionA, 'hold', { starts: [nextMonday], minutes: 30 });
-    // Time enough for the hold to finish, were it not waiting for the sweep's turn to end.
-    await Promise.race([holding, new Promise((resolve) => setTimeout(resolve, 250))]);
-    open();
-    await sweeping;
-    data(await holding);
-
-    expect(live('hold').map((event) => event.start?.dateTime)).toEqual([nextMonday]);
-    expect((await listThreadHolds(threadA)).map((hold) => hold.expiresAt)).toEqual([
-      new Date(NOW.getTime() + 6 * DAY + 60_000).toISOString(),
-    ]);
-  });
-
-  it('forgets a lapsed hold’s record only while it is still lapsed', async () => {
-    const lapses = '2026-10-08T07:00:00.000Z';
-    await recordThreadHold({
-      threadKey: threadA,
-      calendarId: PRINCIPAL,
-      eventId: 'held-again',
-      startAt: TUESDAY_10AM,
-      endAt: '2026-10-06T09:30:00.000Z',
-      expiresAt: lapses,
-    });
-    await deleteThreadHold(PRINCIPAL, 'held-again', '2026-10-08T06:59:00.000Z');
-    expect((await listThreadHolds(threadA)).map((hold) => hold.eventId)).toEqual(['held-again']);
-    await deleteThreadHold(PRINCIPAL, 'held-again', lapses);
-    expect(await listThreadHolds(threadA)).toEqual([]);
-  });
-
-  it('releases a hold converted from an earlier release by its record and role tag, and leaves an event that lost the tag', async () => {
-    calendar.put({
-      calendarId: PRINCIPAL,
-      id: 'slice2hold',
-      status: 'confirmed',
-      start: { dateTime: TUESDAY_10AM },
-      end: { dateTime: '2026-10-06T09:30:00.000Z' },
-      tags: {
-        gwsEaMeeting: 'mtg-00000000-0000-0000-0000-000000000001',
-        gwsEaRole: 'hold',
-        gwsEaSlot: 'slot-0123456789ab',
-      },
-    });
-    calendar.put(busy('retagged', WEDNESDAY_10AM, '2026-10-07T09:30:00.000Z'));
-    for (const eventId of ['slice2hold', 'retagged']) {
-      await getDb().run(
-        `INSERT INTO gws_ea_thread_holds (thread_key, calendar_id, event_id, start_at, end_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        threadA,
-        PRINCIPAL,
-        eventId,
-        TUESDAY_10AM,
-        '2026-10-06T09:30:00.000Z',
-        new Date(NOW.getTime() - 60_000).toISOString(),
-      );
-    }
-
-    await releaseExpiredHolds();
-    expect(calendar.event(PRINCIPAL, 'slice2hold')?.status).toBe('cancelled');
-    expect(calendar.event(PRINCIPAL, 'retagged')?.status).toBe('confirmed');
-    expect(await listThreadHolds(threadA)).toEqual([]);
-  });
-});
-
 describe('book', () => {
-  it('creates the event inviting only people on the thread, releases the thread’s holds, and tells main', async () => {
-    data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM, WEDNESDAY_10AM], minutes: 30 }));
-
+  it('creates the event inviting only people on the thread, and tells main', async () => {
     const booked = data(
       await send(sessionA, 'book', {
         start: TUESDAY_10AM,
@@ -689,7 +502,7 @@ describe('book', () => {
       }),
     );
 
-    const [event] = live('booking');
+    const [event] = bookings();
     expect(event).toMatchObject({
       summary: 'Coffee: Pat and Remy',
       description: 'At the usual place.',
@@ -701,15 +514,12 @@ describe('book', () => {
     expect(event.attendees).toEqual([PRINCIPAL_GUEST, { email: REMY, responseStatus: 'needsAction' }]);
     expect(event.conference?.status).toBe('success');
     expect(booked.booking).toBe(event.id);
-    expect(booked.message).toMatch(
-      new RegExp(
-        `This thread's holds are released\\. main hears of it\\. To change or cancel it, give booking ${event.id}\\.$`,
-        'u',
-      ),
+    expect(booked.message).toBe(
+      `Booked: Tuesday 6 Oct, 10:00–10:30 BST. Google sends ${REMY} the invitation from the principal's calendar, ` +
+        `with a Google Meet link (${String(event.conference?.uri)}). main hears of it. ` +
+        `To change or cancel it, give booking ${event.id}.`,
     );
     expect(calendar.writes.find((write) => write.eventId === event.id)?.sendUpdates).toBe('all');
-    expect(live('hold')).toEqual([]);
-    expect(await listThreadHolds(threadA)).toEqual([]);
 
     const [fact] = mainHeard();
     expect(
@@ -753,12 +563,12 @@ describe('book', () => {
     expect(refusal(misdated)).toBe(
       'The booking was not made: it says "Friday 8 October", but 8 October 2026 is a Thursday. Work the day out with the time tools and write it again; give the year when you mean another one, and put words you quote from someone else in quotation marks.',
     );
-    expect(live('booking')).toHaveLength(1);
+    expect(bookings()).toHaveLength(1);
   });
 
   it('invites everyone on the thread but the principal and the assistant when it names nobody', async () => {
     data(await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up' }));
-    expect(invited(live('booking')[0])?.sort()).toEqual([JANE, REMY]);
+    expect(invited(bookings()[0])?.sort()).toEqual([JANE, REMY]);
     // Without a Meet link, main hears of no video call.
     expect(mainHeard()[0]).toMatch(
       new RegExp(
@@ -793,19 +603,24 @@ describe('book', () => {
         }),
       ),
     ).toMatch(new RegExp(`${STRANGER} is not on this thread`, 'u'));
-    expect(live('booking')).toEqual([]);
+    expect(bookings()).toEqual([]);
   });
 
-  it('refuses a time neither free nor held by this thread', async () => {
-    data(await send(sessionB, 'hold', { starts: [TUESDAY_10AM], minutes: 30 }));
+  it('gives a time to the first thread that books it, and refuses the next with word to offer others', async () => {
+    const first = data(
+      await send(sessionB, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [JANE] }),
+    );
     calendar.put(busy('evt-wed', WEDNESDAY_10AM, '2026-10-07T10:00:00.000Z'));
 
-    for (const start of [TUESDAY_10AM, WEDNESDAY_10AM]) {
-      expect(
-        refusal(await send(sessionA, 'book', { start, minutes: 30, title: 'Catch-up', invitees: [REMY] })),
-      ).toMatch(/no longer free/u);
-    }
-    expect(live('booking')).toEqual([]);
+    expect(
+      refusal(await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] })),
+    ).toBe(gone('Tuesday 6 Oct, 10:00–10:30 BST'));
+    expect(
+      refusal(
+        await send(sessionA, 'book', { start: WEDNESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] }),
+      ),
+    ).toBe(gone('Wednesday 7 Oct, 10:00–10:30 BST'));
+    expect(bookings().map((event) => [event.id, event.tags?.gwsEaThread])).toEqual([[first.booking, threadB]]);
   });
 
   it('refuses a protected time a counterpart proposed, though free/busy shows it free', async () => {
@@ -819,7 +634,7 @@ describe('book', () => {
         }),
       ),
     ).toMatch(/protected/u);
-    expect(live('booking')).toEqual([]);
+    expect(bookings()).toEqual([]);
   });
 
   it.each([
@@ -861,7 +676,7 @@ describe('book', () => {
     });
     expect(frame).toMatchObject({ ok: false, error: { code: 'handler-error' } });
     expect(refusal(frame)).toMatch(/Backend Error/u);
-    expect(live('booking')).toEqual([]);
+    expect(bookings()).toEqual([]);
     expect(await getDb().get('SELECT 1 FROM gws_ea_thread_bookings')).toBeUndefined();
     expect(mainHeard()).toEqual([]);
   });
@@ -882,7 +697,7 @@ describe('book', () => {
 
     expect(frame).toMatchObject({ ok: false, error: { code: 'handler-error' } });
     expect(refusal(frame)).toMatch(/database is locked/u);
-    expect(live('booking')).toEqual([]);
+    expect(bookings()).toEqual([]);
     expect(mainHeard()).toEqual([]);
   });
 
@@ -892,11 +707,18 @@ describe('book', () => {
       send(sessionB, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [JANE] }),
     ]);
 
-    expect(answers.filter((frame) => frame.ok)).toHaveLength(1);
-    const refused = answers.flatMap((frame) => (frame.ok ? [] : [frame.error.message]));
-    expect(refused).toHaveLength(1);
-    expect(refused[0]).toMatch(/no longer free/u);
-    expect(calendar.live(PRINCIPAL).filter((event) => event.start?.dateTime === TUESDAY_10AM)).toHaveLength(1);
+    // The calendar writes take turns: the first to look books it, and the next is told to offer others.
+    const winners = answers.flatMap((frame, index) => (frame.ok ? [[threadA, threadB][index]] : []));
+    expect(winners).toHaveLength(1);
+    expect(answers.flatMap((frame) => (frame.ok ? [] : [frame.error.message]))).toEqual([
+      gone('Tuesday 6 Oct, 10:00–10:30 BST'),
+    ]);
+    expect(
+      calendar
+        .live(PRINCIPAL)
+        .filter((event) => event.start?.dateTime === TUESDAY_10AM)
+        .map((event) => event.tags?.gwsEaThread),
+    ).toEqual(winners);
   });
 
   it('books once when the same request is delivered again, answering the replay as it did the first', async () => {
@@ -908,7 +730,7 @@ describe('book', () => {
     inbound.close();
 
     expect(data(await send(sessionA, 'book', request, 'act-replayed'))).toEqual(first);
-    expect(live('booking').map((event) => event.id)).toEqual([first.booking]);
+    expect(bookings().map((event) => event.id)).toEqual([first.booking]);
     expect(mainHeard()).toHaveLength(1);
   });
 
@@ -939,11 +761,11 @@ describe('book', () => {
     calendar.calendars.set(PRINCIPAL, { id: PRINCIPAL, accessRole: 'reader', summary: PRINCIPAL });
 
     for (const [action, fields] of [
-      ['hold', { starts: [TUESDAY_10AM], minutes: 30 }],
+      ['free_time', { ...RANGE, minutes: 30 }],
       ['book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] }],
     ] as const) {
-      expect(refusal(await send(sessionA, action, fields))).toMatch(
-        /cannot write to the principal's primary calendar/u,
+      expect(refusal(await send(sessionA, action, fields))).toBe(
+        "The assistant cannot write to the principal's primary calendar, so it can book nothing: tell main with tell_main.",
       );
     }
     expect(calendar.writes).toEqual([]);
@@ -988,7 +810,7 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
     );
     expect(second.booking).not.toBe(first.booking);
     expect(
-      live('booking')
+      bookings()
         .map((event) => event.summary)
         .sort(),
     ).toEqual(['Follow-up', 'Intro']);
@@ -1076,20 +898,30 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
     expect(mainHeard()).toHaveLength(1);
   });
 
-  it('keeps the thread’s holds, but for one the booking now sits on', async () => {
-    const booked = data(
+  it('moves only the first of two threads’ bookings onto one time, and refuses the next with word to offer others', async () => {
+    const ours = data(
       await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Intro', invitees: [REMY] }),
     );
-    data(await send(sessionA, 'hold', { starts: [WEDNESDAY_10AM, THURSDAY_10AM], minutes: 30 }));
+    const theirs = data(
+      await send(sessionB, 'book', { start: WEDNESDAY_10AM, minutes: 30, title: 'Intro', invitees: [JANE] }),
+    );
 
-    data(await send(sessionA, 'change_booking', { booking: booked.booking, start: WEDNESDAY_10AM }));
-    expect(calendar.event(PRINCIPAL, String(booked.booking))?.start).toEqual({ dateTime: WEDNESDAY_10AM });
-    expect(live('hold').map((event) => event.start?.dateTime)).toEqual([THURSDAY_10AM]);
-    expect((await listThreadHolds(threadA)).map((hold) => hold.startAt)).toEqual([THURSDAY_10AM]);
+    const answers = await Promise.all([
+      send(sessionA, 'change_booking', { booking: ours.booking, start: THURSDAY_2PM }),
+      send(sessionB, 'change_booking', { booking: theirs.booking, start: THURSDAY_2PM }),
+    ]);
 
-    // A change that keeps its time leaves every hold where it is.
-    data(await send(sessionA, 'change_booking', { booking: booked.booking, title: 'Intro, moved' }));
-    expect(live('hold').map((event) => event.start?.dateTime)).toEqual([THURSDAY_10AM]);
+    const moved = answers.flatMap((frame, index) => (frame.ok ? [[ours.booking, theirs.booking][index]] : []));
+    expect(moved).toHaveLength(1);
+    expect(answers.flatMap((frame) => (frame.ok ? [] : [frame.error.message]))).toEqual([
+      gone('Thursday 8 Oct, 14:00–14:30 BST'),
+    ]);
+    expect(
+      calendar
+        .live(PRINCIPAL)
+        .filter((event) => event.start?.dateTime === THURSDAY_2PM)
+        .map((event) => event.id),
+    ).toEqual(moved);
   });
 
   it('refuses another thread’s booking, for a change and for a cancellation', async () => {
@@ -1113,7 +945,7 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
     const booked = data(
       await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Intro', invitees: [REMY] }),
     );
-    const [event] = live('booking');
+    const [event] = bookings();
     calendar.put({ ...event, tags: { gwsEaThread: threadA } });
     const writes = calendar.writes.length;
 
@@ -1134,7 +966,7 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
     const booked = data(
       await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Intro', invitees: [REMY] }),
     );
-    const [event] = live('booking');
+    const [event] = bookings();
     calendar.put({ ...event, status: 'cancelled' });
 
     expect(refusal(await send(sessionA, 'change_booking', { booking: booked.booking, start: THURSDAY_2PM }))).toMatch(
@@ -1205,12 +1037,11 @@ describe('forgetting a person', () => {
     return (await threadAddresses(threadKey)).map((entry) => entry.address).sort();
   }
 
-  it("releases their threads' holds first, then purges those threads' sessions, then their addresses", async () => {
+  it("purges their threads' sessions, then their addresses, releasing nothing and needing nothing of the calendar", async () => {
     const secrets = path.join(TEST_DIR, 'secrets');
     fs.mkdirSync(secrets, { mode: 0o700 });
     vi.stubEnv(GOOGLE_GRANT_FILE_ENV, path.join(secrets, 'google-grant.json'));
-    data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM, WEDNESDAY_10AM], minutes: 30 }));
-    data(await send(sessionB, 'hold', { starts: [THURSDAY_10AM], minutes: 30 }));
+    data(await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] }));
     const remy = await addPerson({
       name: 'Remy',
       level: 'close',
@@ -1219,18 +1050,13 @@ describe('forgetting a person', () => {
       identity: `email:${REMY}`,
     });
 
-    // Holds go first: one that cannot go yet stops the forget, and nothing of theirs has gone.
+    // With Google unavailable the forget still goes through: it asks nothing of the calendar.
     calendar.failure = new GoogleApiError(503, 'Calendar is unavailable');
-    await expect(forgetPerson({ id: remy.id, source: 'principal' })).rejects.toThrow(/could not be released/u);
-    calendar.failure = undefined;
-    expect(await listThreadHolds(threadA)).toHaveLength(2);
-    expect(await getSession(sessionA.id)).toBeDefined();
-    expect(await addressesOf(threadA)).toContain(REMY);
-
+    const calls = calendar.calls;
     await forgetPerson({ id: remy.id, source: 'principal' });
+    expect(calendar.calls).toBe(calls);
+    calendar.failure = undefined;
 
-    expect(await listThreadHolds(threadA)).toEqual([]);
-    expect(live('hold').map((event) => event.start?.dateTime)).toEqual([THURSDAY_10AM]);
     expect(await getSession(sessionA.id)).toBeUndefined();
     expect(fs.existsSync(path.dirname(inboundDbPath(sessionA.agent_group_id, sessionA.id)))).toBe(false);
     expect(await getSession(sessionB.id)).toBeDefined();
