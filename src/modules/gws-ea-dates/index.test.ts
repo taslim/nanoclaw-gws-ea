@@ -16,7 +16,7 @@ import {
 import '../gws-ea-profile/index.js';
 import { judgeDates, WEEKDAY_GUARD_ID, weekdayRefusal } from './index.js';
 
-/** Wednesday 7 October 2026, 23:30 in Los Angeles: already Thursday 8 October in Lagos. */
+/** Wednesday 7 October 2026, 23:30 in Los Angeles: already Thursday 8 October in Tokyo. */
 const NOW = new Date('2026-10-08T06:30:00.000Z');
 
 function chat(text: string): OutboundSend {
@@ -69,8 +69,8 @@ describe('the outgoing date check', () => {
     expect(await weekdayRefusal(['Friday 1 January'])).toBeUndefined();
     // It is Wednesday 7 October in Los Angeles: Tuesday 9 June 2026, 120 days back, is still a day just gone.
     expect(await weekdayRefusal(['Tuesday 9 June'])).toBeUndefined();
-    // It is already Thursday 8 October in Lagos: 9 June 2026 is 121 days back, so only next year's is read.
-    await getDb().run("UPDATE gws_ea_profile SET principal_timezone = 'Africa/Lagos' WHERE singleton = 1");
+    // It is already Thursday 8 October in Tokyo: 9 June 2026 is 121 days back, so only next year's is read.
+    await getDb().run("UPDATE gws_ea_profile SET principal_timezone = 'Asia/Tokyo' WHERE singleton = 1");
     expect(await weekdayRefusal(['Tuesday 9 June'])).toMatch(/but 9 June 2027 is a Wednesday\./u);
   });
 
