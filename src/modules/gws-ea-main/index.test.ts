@@ -243,12 +243,12 @@ describe("GWS-EA's guidance for main", () => {
     await publishMain(main);
     const groupDir = path.join(TEST_ROOT, main.folder);
     fs.mkdirSync(groupDir, { recursive: true });
-    fs.writeFileSync(path.join(groupDir, 'instructions.prepend.md'), 'Call me Tas.\n');
+    fs.writeFileSync(path.join(groupDir, 'instructions.prepend.md'), 'Call me Morgan.\n');
 
     await composeGroupProjectDoc(main, groupDir, { fileName: 'CLAUDE.md' });
     const document = fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8');
 
-    expect(document).toContain(`# Persona\n\nCall me Tas.`);
+    expect(document).toContain(`# Persona\n\nCall me Morgan.`);
     expect(document).toContain(`# Executive Assistant\n\n${GUIDANCE}`);
     expect(document.indexOf('# Persona')).toBeLessThan(document.indexOf('# Executive Assistant'));
   });
