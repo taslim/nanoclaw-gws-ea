@@ -56,6 +56,6 @@ Inviting people adds the event to their calendars, and moving an event they atte
 
 To tell whether you created an event, compare its `creator.email` with your own address.
 
-Neither gog nor the two tools email anyone: gog sends Google's notifications only when you pass `--send-updates`, so leave it unset.
+When an event has guests other than the principal, they hear about it from Google, as they would from any assistant: `create_event` sends them the invitation, and `change_guests` sends them Google's update when you invite someone or take someone off. gog emails no one unless you pass `--send-updates all`. Pass it when you move or cancel an event with guests other than the principal, as a good assistant lets people know when a meeting moves or is called off; leave it off for an event that is the principal's alone, with no one else to tell.
 
 After any change or answer, read the event back with `gog calendar event` and check its time, calendar, and status (`cancelled` after a delete, the principal's `responseStatus` after an answer) before you report it done.

@@ -12,10 +12,11 @@
  * Google to create, and every write asks for nothing back but the id, so no
  * title, description or location is ever fetched for external-email (R20).
  * main's calendar facts alone read titles and names (`listEventDetails`), and
- * never for external-email. A guest-list change reads each guest whole, only
- * to write them back as they were, and writes over only the version of the
- * event it read; none of it reaches an agent. Tests use a fake with the same
- * interface.
+ * never for external-email. main's guest-list change reads each guest whole,
+ * only to write them back as they were, and the event's title, notes and
+ * place, only to check them against whoever it invites; it writes over only
+ * the version of the event it read, and none of it reaches an agent. Tests
+ * use a fake with the same interface.
  */
 import { isRecord } from '../../gws-ea/validation.js';
 import type { CalendarListEntry } from '../gws-ea-inbox/calendar-notifications.js';
@@ -133,6 +134,10 @@ export interface EventGuests {
   /** The organizer's address, lowercased: the calendar the event belongs to. */
   readonly organizer?: string;
   readonly guests: readonly GuestRecord[];
+  /** What the event says, which everyone it invites reads: its title, notes and place. */
+  readonly summary?: string;
+  readonly description?: string;
+  readonly location?: string;
 }
 
 /** The fields a write sets; times are instants, or dates for an all-day event. */
@@ -186,7 +191,7 @@ export interface MeetingsCalendarApi {
   ): Promise<'created' | 'exists'>;
   /** Change the fields given. */
   patchEvent(calendarId: string, eventId: string, event: EventWrite, sendUpdates: SendUpdates): Promise<void>;
-  /** An event's guests as Google holds them, with the event's version, or undefined when it does not exist. */
+  /** An event's guests as Google holds them, with the event's version and words, or undefined when it does not exist. */
   getGuests(calendarId: string, eventId: string): Promise<EventGuests | undefined>;
   /**
    * Replace an event's guests with these, each as given. With `etag`, only
@@ -514,7 +519,9 @@ export function createMeetingsCalendarApi(options: GoogleClientOptions): Meeting
     },
 
     async getGuests(calendarId, eventId) {
-      const params = new URLSearchParams({ fields: 'etag,status,organizer(email),attendees' });
+      const params = new URLSearchParams({
+        fields: 'etag,status,organizer(email),attendees,summary,description,location',
+      });
       const payload = await googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, {
         allowNotFound: true,
       });
@@ -523,11 +530,17 @@ export function createMeetingsCalendarApi(options: GoogleClientOptions): Meeting
       const etag = optionalString(payload.etag);
       const status = optionalString(payload.status);
       const organizer = isRecord(payload.organizer) ? optionalString(payload.organizer.email) : undefined;
+      const summary = optionalString(payload.summary);
+      const description = optionalString(payload.description);
+      const location = optionalString(payload.location);
       return {
         ...(etag === undefined ? {} : { etag }),
         ...(status === undefined ? {} : { status }),
         ...(organizer === undefined ? {} : { organizer: organizer.toLowerCase() }),
         guests: Array.isArray(payload.attendees) ? payload.attendees.filter(isRecord) : [],
+        ...(summary === undefined ? {} : { summary }),
+        ...(description === undefined ? {} : { description }),
+        ...(location === undefined ? {} : { location }),
       };
     },
 

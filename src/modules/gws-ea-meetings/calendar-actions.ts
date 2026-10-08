@@ -6,9 +6,13 @@
  * - Every event lists the owner of its calendar, the principal, as its first
  *   guest, accepted (`guestsOn`): Google then shows them on the guest list
  *   as its organizer, as it does for an event they made themselves.
+ * - An invitation shows no one Google sends it to a private detail of the
+ *   principal's, and names no weekday beside a date it does not fall on
+ *   (`assertInvitationShareable`).
  * - An event's id derives from what it is for (`eventIdFor`), so a retry
  *   after a partial failure finds the event it made (`ensureEvent`), and an
- *   event under that id that is not the assistant's is never touched.
+ *   event under that id that is not the assistant's is never touched. Its
+ *   guests hear of it from the first write alone.
  * - Every event the assistant places carries private tags no one else can
  *   set: its role (`TAG_ROLE`), which marks it a booking, and the thread it
  *   was placed for.
@@ -17,8 +21,11 @@
  */
 import { createHash } from 'node:crypto';
 
+import { forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { log } from '../../log.js';
+import { weekdayRefusal } from '../gws-ea-dates/refusal.js';
 import { recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
+import { audienceForAddresses, checkOutbound } from '../gws-ea-privacy/index.js';
 import type {
   CalendarEvent,
   EventConference,
@@ -59,6 +66,46 @@ export function guestsOn(calendarId: string, invitees: readonly string[]): Guest
   ];
 }
 
+/** What an invitation shows the people Google sends it to. */
+export interface Invitation {
+  /** What the write says: its title, notes and place. */
+  readonly texts: readonly (string | undefined)[];
+  /**
+   * What else they see beside it: the name of the calendar it is on and,
+   * unless they have seen them already, the other addresses on its guest
+   * list.
+   */
+  readonly shown: readonly (string | undefined)[];
+  /** Who Google sends it to. The principal may see anything; nobody at all sees nothing. */
+  readonly recipients: readonly string[];
+}
+
+/**
+ * Refuse, writing nothing, an invitation whose words name a weekday beside a
+ * date it does not fall on, or which would show anyone Google sends it to
+ * one of the principal's private details. `refused` leads the refusal and
+ * `advice` ends one for a private detail, saying what to do about it; the
+ * refusal names the detail's kind, never the detail.
+ */
+export async function assertInvitationShareable(
+  invitation: Invitation,
+  refused: string,
+  advice: string,
+): Promise<void> {
+  const misdated = await weekdayRefusal(invitation.texts.map((text) => text ?? ''));
+  if (misdated !== undefined) throw invalidArgs(`${refused}: ${misdated}`);
+  if (invitation.recipients.length === 0) return;
+  const check = await checkOutbound(
+    [...invitation.texts, ...invitation.shown].map((text) => text ?? ''),
+    await audienceForAddresses(invitation.recipients),
+  );
+  if (!check.allowed) {
+    throw forbidden(
+      `${refused}: as its guests would see it, the invitation carries one of the principal's private details (${check.kind}). ${advice}`,
+    );
+  }
+}
+
 /** Whether the event Google holds already says what the write would: its time, and each guest with any answer it gives them. */
 function alreadyWritten(current: CalendarEvent, event: NewEvent): boolean {
   const startsTogether =
@@ -81,10 +128,12 @@ function alreadyWritten(current: CalendarEvent, event: NewEvent): boolean {
 }
 
 /**
- * Create the event under its own id, or find the one an earlier attempt
- * made: restored if it was deleted, corrected if its time or people differ,
- * left alone (and nobody emailed again) if it already says the same. An
- * event under that id that does not carry `owner`'s tag is never touched.
+ * Create the event under its own id, telling its guests as `sendUpdates`
+ * says, or find the one an earlier attempt made: restored if it was
+ * deleted, corrected if its time or people differ, left alone if it already
+ * says the same. Its guests heard of it from that first write, so finding it
+ * emails nobody again, a correction included. An event under that id that
+ * does not carry `owner`'s tag is never touched.
  */
 export async function ensureEvent(
   api: MeetingsCalendarApi,
@@ -112,7 +161,7 @@ export async function ensureEvent(
           ...(conference === undefined || current.conference !== undefined ? {} : { conference }),
           status: 'confirmed',
         },
-        sendUpdates,
+        'none',
       );
     }
   }

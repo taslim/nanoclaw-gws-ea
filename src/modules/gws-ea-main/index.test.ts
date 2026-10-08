@@ -54,7 +54,7 @@ const REQUIRED_GUIDANCE = [
   'Money, terms, and anything else that commits the principal are theirs',
   'bring a quote or agreement nobody authorized to them once, with your recommendation',
   // Email (R64, R67, R74; AE60, AE61, AE64).
-  'You never email anyone but the principal.',
+  'You write email only to the principal; apart from the invitations Google sends when you book someone, everyone else hears from external-email,',
   'Name in `people` everyone the thread is for, the principal too when their presence helps the other side trust it',
   'say in your message who should be copied.',
   'It sees only its thread and what you hand it, never the calendar, the people store, or anything else you know.',

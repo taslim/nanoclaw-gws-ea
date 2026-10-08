@@ -58,12 +58,11 @@ import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { threadAddresses } from '../gws-ea-inbox/thread-map.js';
 import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
 import { getSchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
-import { weekdayRefusal } from '../gws-ea-dates/refusal.js';
-import { audienceForAddresses, checkOutbound } from '../gws-ea-privacy/index.js';
 import { getGwsEaProfile, getMainAgentGroupId, listPrincipalAddresses } from '../gws-ea-profile/db.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { allowsMeet, type CalendarEntry, type EventWrite, type MeetingsCalendarApi } from './calendar-api.js';
 import {
+  assertInvitationShareable,
   conferenceWords,
   ensureEvent,
   eventIdFor,
@@ -118,6 +117,14 @@ const LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
 
 /** A booking's id, as `book` answered with it: its event's id, lowercase hex. */
 const BOOKING_ID = /^[0-9a-f]{64}$/u;
+
+/**
+ * What to do when an invitation would show its invitees a private detail.
+ * Their guest list is never the detail: they are all people of the thread,
+ * who see each other's addresses there.
+ */
+const PRIVATE_DETAIL_ADVICE =
+  "Write it without that detail, and do not hint at, spell out, or encode it. If it is the calendar's name, tell main with tell_main.";
 
 // ---------------------------------------------------------------------------
 // The request's fields
@@ -476,32 +483,6 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     return invitees;
   }
 
-  /**
-   * Refuse, writing nothing, an invitation whose text carries one of the
-   * principal's private values as its invitees would see it (what it says,
-   * and the name of the calendar it is on), or a weekday beside a date it
-   * does not fall on.
-   */
-  async function assertInvitationShareable(
-    texts: readonly (string | undefined)[],
-    calendarName: string | undefined,
-    invitees: readonly string[],
-    refused: string,
-  ): Promise<void> {
-    const misdated = await weekdayRefusal(texts.map((text) => text ?? ''));
-    if (misdated !== undefined) throw invalidArgs(`${refused}: ${misdated}`);
-    const check = await checkOutbound(
-      [...texts.map((text) => text ?? ''), calendarName ?? ''],
-      await audienceForAddresses(invitees),
-    );
-    if (!check.allowed) {
-      throw forbidden(
-        `${refused}: as the invitees would see it, its title, notes, place or calendar name carries one of the principal's private details (${check.kind}). ` +
-          "Write it without that detail, and do not hint at, spell out, or encode it. If it is the calendar's name, tell main with tell_main.",
-      );
-    }
-  }
-
   /** Take back an event a failed booking may have left, if it is this thread's. Best effort, and logged. */
   async function withdraw(calendarId: string, eventId: string, threadKey: string): Promise<void> {
     /* eslint-disable no-catch-all/no-catch-all -- the booking already failed; withdrawing it is best effort and logged */
@@ -539,10 +520,13 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     // Its own event, which an earlier attempt at this request may have left, never blocks it.
     await assertAvailable(view, bookingCalendar.id, [wanted.span], new Set([wanted.eventId]));
     await assertInvitationShareable(
-      [wanted.title, wanted.notes, wanted.location],
-      bookingCalendar.summary,
-      wanted.invitees,
+      {
+        texts: [wanted.title, wanted.notes, wanted.location],
+        shown: [bookingCalendar.summary],
+        recipients: wanted.invitees,
+      },
       'The booking was not made',
+      PRIVATE_DETAIL_ADVICE,
     );
     if (wanted.videoCall && !allowsMeet(bookingCalendar)) {
       throw forbidden(
@@ -684,10 +668,9 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     const entry = texted || linking ? await calendar().getCalendar(booking.calendarId) : undefined;
     if (texted) {
       await assertInvitationShareable(
-        [title, notes, location],
-        entry?.summary,
-        invitees,
+        { texts: [title, notes, location], shown: [entry?.summary], recipients: invitees },
         'The booking was not changed',
+        PRIVATE_DETAIL_ADVICE,
       );
     }
     if (linking && (entry === undefined || !allowsMeet(entry))) {

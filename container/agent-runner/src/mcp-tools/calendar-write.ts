@@ -27,7 +27,7 @@ const DATE_TIME = 'a date and time with its UTC offset, as time_resolve gives it
 export const createEvent = requestTool({
   name: 'create_event',
   description:
-    "Put an event on one of the principal's calendars. The principal is always on its guest list, accepted, as on an event they made themselves; anyone you name in guests is invited too. Google emails no one. Answers with the event's id.",
+    "Put an event on one of the principal's calendars. The principal is always on its guest list, accepted, as on an event they made themselves; anyone you name in guests is invited too, and Google sends them the invitation. Answers with the event's id.",
   properties: {
     calendar: CALENDAR,
     title: { type: 'string', description: 'What the event is called.' },
@@ -54,7 +54,7 @@ export const createEvent = requestTool({
 export const changeGuests = requestTool({
   name: 'change_guests',
   description:
-    "Invite people to an event the principal organizes, or take them off it. Everyone's answer stays as it was, and the principal stays on it: accepted, unless they answered otherwise. Google emails no one.",
+    "Invite people to an event the principal organizes, or take them off it. Everyone's answer stays as it was, and the principal stays on it: accepted, unless they answered otherwise. Google tells the guests when someone other than the principal joins or leaves.",
   properties: {
     calendar: CALENDAR,
     event: {

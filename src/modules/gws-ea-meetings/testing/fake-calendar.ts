@@ -285,6 +285,9 @@ export class FakeCalendar implements MeetingsCalendarApi {
       ...(event.status === undefined ? {} : { status: event.status }),
       ...(event.organizer?.email === undefined ? {} : { organizer: event.organizer.email.toLowerCase() }),
       guests: event.guests ?? (event.attendees ?? []).map((guest) => ({ ...guest })),
+      ...(event.summary === undefined ? {} : { summary: event.summary }),
+      ...(event.description === undefined ? {} : { description: event.description }),
+      ...(event.location === undefined ? {} : { location: event.location }),
     };
     this.afterGuestReads.shift()?.();
     return read;

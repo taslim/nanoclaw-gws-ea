@@ -292,7 +292,7 @@ describe('the Calendar client', () => {
     });
   });
 
-  it("reads an event's guests whole with its organizer and version, and writes a guest list back as given over that version", async () => {
+  it("reads an event's guests whole with its organizer, version and words, and writes a guest list back as given over that version", async () => {
     const guests = [
       { email: 'pat@principal.example', responseStatus: 'accepted', organizer: true, self: true },
       { email: 'sam@acme.example', responseStatus: 'accepted', comment: 'Running late', optional: true },
@@ -306,6 +306,9 @@ describe('the Calendar client', () => {
               status: 'confirmed',
               organizer: { email: 'Pat@Principal.example' },
               attendees: guests,
+              summary: 'Quarterly review',
+              description: 'The numbers, then the plan.',
+              location: 'Boardroom',
             },
           }
         : { status: 200, body: { id: 'evt-1' } },
@@ -315,8 +318,13 @@ describe('the Calendar client', () => {
       status: 'confirmed',
       organizer: 'pat@principal.example',
       guests,
+      summary: 'Quarterly review',
+      description: 'The numbers, then the plan.',
+      location: 'Boardroom',
     });
-    expect(requests[0].url.searchParams.get('fields')).toBe('etag,status,organizer(email),attendees');
+    expect(requests[0].url.searchParams.get('fields')).toBe(
+      'etag,status,organizer(email),attendees,summary,description,location',
+    );
 
     expect(
       await api.setGuests(
