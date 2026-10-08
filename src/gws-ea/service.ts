@@ -2,7 +2,6 @@ import { constants as fsConstants } from 'node:fs';
 import { access, lstat, mkdir, readFile, realpath } from 'node:fs/promises';
 import { userInfo } from 'node:os';
 import path from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
 
 import { isErrno } from '../community-portal/errors.js';
 import { readEnvFile } from '../env.js';
@@ -138,8 +137,12 @@ export interface InstanceServiceDependencies extends ServiceLayoutOptions {
   readonly uid?: number;
   /** Where the user-bus variables are read; absent ones are derived from the UID. */
   readonly ambientEnv?: NodeJS.ProcessEnv;
-  /** Waits between launchd `bootstrap` attempts. */
-  readonly sleep?: (milliseconds: number) => Promise<void>;
+  /**
+   * (Re)starts the installed service the way `gws-ea start`, update, and
+   * rollback do: NanoClaw's own helpers, stopping a running host and waiting
+   * until its manager has let it go before starting it again.
+   */
+  readonly restartService?: (config: InstanceRuntimeConfig) => Promise<unknown>;
 }
 
 /** A (re)started service, with the pid its manager reports when it has one. */
@@ -607,15 +610,6 @@ function servicePid(value: string | undefined): number | undefined {
   return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
 }
 
-/** `launchctl bootout` of a job that is not loaded fails in launchd's own words; nothing needed stopping. */
-function notLoaded(error: unknown): boolean {
-  return (
-    error instanceof GwsEaError &&
-    error.code === 'command_failed' &&
-    /No such process|Could not find/iu.test(String(error.details?.stderrTail ?? ''))
-  );
-}
-
 /**
  * Lingering keeps a user's services running after logout. Enabling it
  * for oneself needs no password where polkit allows it, so it is enabled
@@ -641,17 +635,14 @@ async function ensureLingering(
   });
 }
 
-const BOOTSTRAP_ATTEMPTS = 5;
-const BOOTSTRAP_RETRY_MS = 500;
-
 /**
- * Write the service definition when it is missing, then (re)start it. An
+ * Install the service when its definition is missing, then (re)start it. An
  * existing definition is the release's own, rendered by the create that
- * deployed it, so a later start never renders it again (KTD6). launchd
- * reloads a definition only through `bootout` then `bootstrap`; `kickstart`
- * without `-k` then demand-starts a job launchd left pended, without
- * restarting a running one. systemd user services need lingering to survive
- * logout.
+ * deployed it, so a later start never renders it again (KTD6). systemd is
+ * told about a new unit, enables it, and keeps a user's services running
+ * after logout (lingering). The start itself is the one every other command
+ * uses (`restartService`): a running host is stopped and its job waited out,
+ * so launchd never sees a `bootstrap` while it still removes the old job.
  */
 export async function reconcileInstanceService(
   configInput: InstanceRuntimeConfig,
@@ -659,46 +650,31 @@ export async function reconcileInstanceService(
 ): Promise<InstanceServiceStart> {
   const config = validateRuntimeConfig(configInput);
   const layout = createInstanceServiceLayout(config, dependencies);
+  const { restartService } = dependencies;
+  if (!restartService) {
+    throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
+  }
   await Promise.all([
     assertRegularFile(layout.launcherEntrypoint),
     assertRegularFile(layout.hostEntrypoint),
     assertExecutable(layout.cliPath),
   ]);
-  if (!(await isRegularFile(layout.serviceDefinitionPath))) {
-    await mkdir(path.dirname(layout.serviceDefinitionPath), { recursive: true, mode: 0o700 });
-    await writePrivateTextFile(layout.serviceDefinitionPath, renderInstanceService(config, layout));
-  }
   const run = dependencies.runCommand ?? runSanitizedCommand;
   const environment = serviceManagerEnvironment(config, layout.manager, dependencies);
   const command = async (program: string, args: readonly string[]): Promise<string> =>
     (await run({ command: program, args, cwd: config.checkout_realpath, env: environment, timeoutMs: 30_000 })).stdout;
-  if (layout.manager === 'launchd') {
-    const domain = `gui/${requireUid(dependencies)}`;
-    await command('launchctl', ['bootout', `${domain}/${layout.serviceIdentity}`]).catch((error: unknown) => {
-      if (!notLoaded(error)) throw error;
-    });
-    // launchd can still be removing the job `bootout` unloaded, so `bootstrap` gets a few tries.
-    for (let attempt = 1; ; attempt += 1) {
-      const loaded = await command('launchctl', ['bootstrap', domain, layout.serviceDefinitionPath]).then(
-        () => true,
-        (error: unknown) => {
-          if (attempt === BOOTSTRAP_ATTEMPTS || !(error instanceof GwsEaError) || error.code !== 'command_failed') {
-            throw error;
-          }
-          return false;
-        },
-      );
-      if (loaded) break;
-      await (dependencies.sleep ?? delay)(BOOTSTRAP_RETRY_MS * attempt);
-    }
-    await command('launchctl', ['kickstart', `${domain}/${layout.serviceIdentity}`]);
-  } else {
-    const prefix = layout.manager === 'systemd-user' ? ['--user'] : [];
-    if (layout.manager === 'systemd-user') await ensureLingering(command, dependencies);
-    await command('systemctl', [...prefix, 'daemon-reload']);
-    await command('systemctl', [...prefix, 'enable', layout.serviceIdentity]);
-    await command('systemctl', [...prefix, 'restart', layout.serviceIdentity]);
+  if (layout.manager === 'systemd-user') await ensureLingering(command, dependencies);
+  if (!(await isRegularFile(layout.serviceDefinitionPath))) {
+    await installServiceDefinition(config, layout, renderInstanceService(config, layout), undefined, dependencies);
   }
+  if (layout.manager !== 'launchd') {
+    await command('systemctl', [
+      ...(layout.manager === 'systemd-user' ? ['--user'] : []),
+      'enable',
+      layout.serviceIdentity,
+    ]);
+  }
+  await restartService(config);
   return { layout, pid: await instanceServicePid(config, dependencies) };
 }
 

@@ -224,7 +224,7 @@ describe('GWS-EA instance runtime', () => {
     expect(command?.env).not.toHaveProperty('GCHAT_CREDENTIALS');
   });
 
-  it('keeps an existing launchd definition as written, reloading it with bootout then one bootstrap, and reports its layout and pid', async () => {
+  it('keeps an existing launchd definition as written, restarts it as every command does, and reports its layout and pid', async () => {
     const { config, home } = await fixture();
     await persistInstanceRuntime(config, upsertEnvVars);
     const checkout = config.checkout_realpath;
@@ -250,29 +250,25 @@ describe('GWS-EA instance runtime', () => {
     const calls: SanitizedCommand[] = [];
     const runner = vi.fn(async (command: SanitizedCommand) => {
       calls.push(command);
-      if (command.args[0] === 'bootout') {
-        throw new GwsEaError('command_failed', 'Command failed (exit code 3): launchctl bootout', {
-          details: { exitCode: 3, stderrTail: 'Boot-out failed: 3: No such process' },
-        });
-      }
       return { stdout: command.args[0] === 'print' ? '\tstate = running\n\tpid = 4242\n' : '', stderr: '' };
     });
+    const restarted: string[] = [];
 
     const started = await reconcileInstanceService(config, {
       platform: 'macos',
       homeDirectory: home,
       runCommand: runner,
       uid: 501,
+      restartService: async (runtime) => {
+        restarted.push(runtime.instance_id);
+      },
     });
     const definition = await readFile(layout.serviceDefinitionPath, 'utf8');
 
-    const domain = `gui/501/${layout.serviceIdentity}`;
+    expect(restarted).toEqual([config.instance_id]);
+    // Only the pid is read here; the (re)start is NanoClaw's own, through the helpers every command uses.
     expect(calls.map((call) => [call.command, ...call.args])).toEqual([
-      ['launchctl', 'bootout', domain],
-      ['launchctl', 'bootstrap', 'gui/501', layout.serviceDefinitionPath],
-      // Demand-starts a job launchd left pended; without `-k` it never restarts a running one.
-      ['launchctl', 'kickstart', domain],
-      ['launchctl', 'print', domain],
+      ['launchctl', 'print', `gui/501/${layout.serviceIdentity}`],
     ]);
     expect(started).toEqual({ layout, pid: 4242 });
     // An existing definition is the release's own: starting the service never re-renders it.
@@ -282,39 +278,6 @@ describe('GWS-EA instance runtime', () => {
     expect(cli.command).toBe(path.join(config.checkout_realpath, 'bin', 'ncl'));
     expect(cli.cwd).toBe(config.checkout_realpath);
     expect(cli.env?.HOME).toBe(config.home_directory);
-  });
-
-  it('retries a bootstrap launchd refuses while it removes the old job, and fails when it keeps refusing', async () => {
-    const { config, home } = await fixture();
-    await persistInstanceRuntime(config, upsertEnvVars);
-    const refused = new GwsEaError('command_failed', 'Command failed (exit code 5): launchctl bootstrap', {
-      details: { exitCode: 5, stderrTail: 'Bootstrap failed: 5: Input/output error' },
-    });
-    for (const refusals of [1, Infinity]) {
-      let bootstraps = 0;
-      const runner = vi.fn(async (command: SanitizedCommand) => {
-        if (command.args[0] === 'bootstrap' && ++bootstraps <= refusals) throw refused;
-        return { stdout: '', stderr: '' };
-      });
-      const sleep = vi.fn(async () => undefined);
-      const start = reconcileInstanceService(config, {
-        platform: 'macos',
-        homeDirectory: home,
-        runCommand: runner,
-        uid: 501,
-        sleep,
-      });
-
-      if (refusals === Infinity) {
-        await expect(start).rejects.toBe(refused);
-        expect(bootstraps).toBe(5);
-      } else {
-        await expect(start).resolves.toMatchObject({ layout: { manager: 'launchd' } });
-        expect(bootstraps).toBe(2);
-        expect(runner.mock.calls.at(-2)?.[0].args[0]).toBe('kickstart');
-      }
-      expect(sleep).toHaveBeenCalledTimes(bootstraps - 1);
-    }
   });
 
   it.each([
@@ -341,15 +304,19 @@ describe('GWS-EA instance runtime', () => {
       runCommand: runner,
       uid: 1000,
       ambientEnv: { PATH: '/usr/bin', ...ambient },
+      restartService: async () => {
+        calls.push({ command: 'restart', args: [], cwd: '/', env: {} });
+      },
     });
 
     const unit = started.layout.serviceIdentity;
     expect(calls.map((call) => [call.command, ...call.args])).toEqual([
       ['loginctl', 'show-user', '1000', '--property', 'Linger', '--value'],
       ['loginctl', 'enable-linger'],
+      // A new unit is written, so systemd is told before it is enabled and started.
       ['systemctl', '--user', 'daemon-reload'],
       ['systemctl', '--user', 'enable', unit],
-      ['systemctl', '--user', 'restart', unit],
+      ['restart'],
       ['systemctl', '--user', 'show', unit, '--property', 'MainPID', '--value'],
     ]);
     for (const call of calls.filter((command) => command.command === 'systemctl')) {
@@ -379,6 +346,7 @@ describe('GWS-EA instance runtime', () => {
         runCommand: runner,
         uid: 1000,
         ambientEnv: { USER: 'operator' },
+        restartService: async () => calls.push('restart'),
       }),
     ).rejects.toMatchObject({
       code: 'linger_required',
@@ -403,6 +371,7 @@ describe('GWS-EA instance runtime', () => {
       runCommand: runner,
       uid: 1000,
       ambientEnv: {},
+      restartService: async () => undefined,
     });
 
     expect(calls.filter(([program]) => program === 'loginctl')).toEqual([
@@ -421,6 +390,7 @@ describe('GWS-EA instance runtime', () => {
     for (const platform of ['macos', 'linux'] as const) {
       const { layout } = await reconcileInstanceRuntime(config, {
         upsertEnvVars,
+        restartService: async () => undefined,
         platform,
         homeDirectory: home,
         runningAsRoot: false,
@@ -468,9 +438,13 @@ describe('GWS-EA instance runtime', () => {
       return { stdout: releaseTree(command), stderr: '' };
     });
     const upsert = vi.fn(upsertEnvVars);
+    let restarts = 0;
 
     const { layout } = await reconcileInstanceRuntime(config, {
       upsertEnvVars: upsert,
+      restartService: async () => {
+        restarts += 1;
+      },
       platform: 'macos',
       homeDirectory: home,
       runCommand: runner,
@@ -482,12 +456,8 @@ describe('GWS-EA instance runtime', () => {
     expect(upsert).not.toHaveBeenCalled();
     expect(await readFile(environmentFile, 'utf8')).toBe(environment);
     // The service still restarts from the definition it has.
-    expect(calls.filter(([program]) => program === 'launchctl').map(([, verb]) => verb)).toEqual([
-      'bootout',
-      'bootstrap',
-      'kickstart',
-      'print',
-    ]);
+    expect(restarts).toBe(1);
+    expect(calls.filter(([program]) => program === 'launchctl').map(([, verb]) => verb)).toEqual(['print']);
   });
 
   it.each([
@@ -618,6 +588,7 @@ describe('GWS-EA instance runtime', () => {
     const operatorPath = '/Users/operator/Library/pnpm/bin:/usr/bin:/bin';
     await reconcileInstanceRuntime(config, {
       upsertEnvVars,
+      restartService: async () => undefined,
       platform: 'macos',
       homeDirectory: home,
       runCommand: runner,
@@ -703,8 +674,12 @@ describe('GWS-EA instance runtime', () => {
       return { stdout, stderr: '' };
     });
 
+    let restarts = 0;
     await reconcileInstanceRuntime(config, {
       upsertEnvVars,
+      restartService: async () => {
+        restarts += 1;
+      },
       platform: 'macos',
       homeDirectory: home,
       runCommand: runner,
@@ -721,7 +696,7 @@ describe('GWS-EA instance runtime', () => {
     expect(docker).not.toContain(`image rm ${earlier}`);
     expect(calls.some((call) => call.args.join(' ').includes('--step container'))).toBe(false);
     // The service still starts, on the shared image.
-    expect(calls.some((call) => call.command === 'launchctl' && call.args[0] === 'bootstrap')).toBe(true);
+    expect(restarts).toBe(1);
   });
 });
 

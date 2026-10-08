@@ -351,7 +351,7 @@ describe("an assistant's own service coordinates", () => {
         uid: 501,
         ambientEnv: {},
         runCommand,
-        sleep: async () => undefined,
+        restartService: async () => undefined,
       });
       const definition = await readFile(layout.serviceDefinitionPath, 'utf8');
       const logs = hostLogFiles(runtime.checkout_realpath);

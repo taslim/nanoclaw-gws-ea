@@ -704,13 +704,14 @@ class Cli {
 
   #advance(operation: InstanceOperation, options: AdvanceOptions): Promise<ProvisionResult> {
     if (this.#runtime.advanceProvision) return this.#runtime.advanceProvision(operation, options);
-    const { upsertEnvVars, hostStatus } = this.#runtime;
-    if (!upsertEnvVars || !hostStatus) {
+    const { upsertEnvVars, hostStatus, serviceHelpers } = this.#runtime;
+    if (!upsertEnvVars || !hostStatus || !serviceHelpers) {
       throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
     }
     return runProductionProvision(operation, {
       upsertEnvVars,
       hostStatus,
+      serviceHelpers,
       interaction: options.interaction,
       runtime: options.runtime,
       managedIngress: { setupSession: this.#managedIngressSetup },

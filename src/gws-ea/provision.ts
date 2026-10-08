@@ -57,6 +57,7 @@ import {
   type InstanceRuntimeDependencies,
   type UpsertEnvVars,
 } from './service.js';
+import { createServiceControl, runtimeServiceTarget, type NanoclawServiceHelpers } from './service-control.js';
 import { instanceServicePlatform } from './service-coordinates.js';
 import { runInstanceNclJson } from './ncl.js';
 import { reconcileMainIdentity, type MainIdentityDependencies, type MainIdentityInput } from './identity.js';
@@ -132,6 +133,8 @@ export interface ProductionProvisionOptions {
   readonly upsertEnvVars: UpsertEnvVars;
   /** Upstream's host readiness helpers, injected by the driver. */
   readonly hostStatus: HostStatusHelpers;
+  /** NanoClaw's service helpers, injected by the driver: the host starts as `gws-ea start` starts it. */
+  readonly serviceHelpers: NanoclawServiceHelpers;
   /** Human input: credentials, sign-in, and decisions supplied on re-entry. */
   readonly interaction?: Interaction;
   readonly managedIngress?: {
@@ -1662,6 +1665,8 @@ export async function runProductionProvision(
       bootstrapManifestFile: operation.paths.bootstrapFile(operation.instanceId),
       serviceDependencies: {
         upsertEnvVars: options.upsertEnvVars,
+        restartService: (config) =>
+          createServiceControl(options.serviceHelpers, runtimeServiceTarget(config)).restart(),
         platform: manifest?.platform ?? instanceServicePlatform(),
         homeDirectory: runtime.home_directory,
         runningAsRoot: manifest?.running_as_root ?? process.getuid?.() === 0,

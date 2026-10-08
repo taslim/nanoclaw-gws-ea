@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { NanoclawServiceHelpers } from './service-control.js';
 
 import { PauseRequired, pendingActionOf, SignInRequired, type RunEvent } from './events.js';
 import {
@@ -341,6 +342,13 @@ async function contractOneJournal(engine: Awaited<ReturnType<typeof engineFixtur
     { mode: 0o600 },
   );
 }
+
+/** These provisions stop before the host starts, so NanoClaw's service helpers are never reached. */
+const UNUSED_SERVICE_HELPERS: NanoclawServiceHelpers = new Proxy({} as NanoclawServiceHelpers, {
+  get: () => {
+    throw new Error('The service helpers were reached');
+  },
+});
 
 describe('step engine', () => {
   it('runs only its own steps for an assistant created under contract 1, never the Google sign-in', async () => {
@@ -814,7 +822,11 @@ describe('production bootstrap trust boundary', () => {
 
     await expect(
       withInstanceOperation(paths, reserved.instance_id, (operation) =>
-        runProductionProvision(operation, { upsertEnvVars: recordEnv, hostStatus: servingHost(reserved) }),
+        runProductionProvision(operation, {
+          upsertEnvVars: recordEnv,
+          hostStatus: servingHost(reserved),
+          serviceHelpers: UNUSED_SERVICE_HELPERS,
+        }),
       ),
     ).rejects.toMatchObject({ code: 'bootstrap_required' });
   });
@@ -825,7 +837,11 @@ describe('production bootstrap trust boundary', () => {
     // bootstrap_required is raised only after the receipt was accepted.
     await expect(
       withInstanceOperation(paths, reserved.instance_id, (operation) =>
-        runProductionProvision(operation, { upsertEnvVars: recordEnv, hostStatus: servingHost(reserved) }),
+        runProductionProvision(operation, {
+          upsertEnvVars: recordEnv,
+          hostStatus: servingHost(reserved),
+          serviceHelpers: UNUSED_SERVICE_HELPERS,
+        }),
       ),
     ).rejects.toMatchObject({ code: 'bootstrap_required' });
   });
