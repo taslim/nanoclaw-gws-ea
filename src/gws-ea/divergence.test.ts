@@ -133,6 +133,24 @@ describe('recorded divergence: Google Chat receives the Workspace Add-on identit
 });
 
 describe('recorded divergence: the installed OneCLI adapter', () => {
+  it('is exactly what add-onecli installs: every file it copies equals its payload source', async () => {
+    const skill = path.join(originalCwd, '.claude/skills/add-onecli');
+    const fence = /^```nc:copy\n([\s\S]*?)^```$/mu.exec(await readFile(path.join(skill, 'SKILL.md'), 'utf8'))?.[1];
+    const copies = (fence ?? '')
+      .split('\n')
+      .map((line) => /^(\S+) -> (\S+)$/u.exec(line.trim()))
+      .filter((match) => match !== null);
+
+    expect(copies.map(([, , installed]) => installed)).toEqual(
+      expect.arrayContaining(['src/gateway-providers/onecli.ts', 'src/gateway-providers/onecli-credentials.ts']),
+    );
+    for (const [, source, installed] of copies) {
+      expect(await readFile(path.join(originalCwd, installed!), 'utf8'), installed).toBe(
+        await readFile(path.join(skill, source!), 'utf8'),
+      );
+    }
+  });
+
   const onecliUrl = 'http://onecli.divergence.test';
   const gatewayUrl = 'http://gateway.divergence.test';
 
