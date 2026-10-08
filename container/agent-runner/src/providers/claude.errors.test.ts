@@ -121,26 +121,37 @@ const OWNER_HINT =
   "Whoever runs this NanoClaw needs to fix this outside the chat. Please don't send keys or passwords here.";
 const AUTH_NOTICE = `${AUTH_ERROR}\n${OWNER_HINT}`;
 
-async function resultEvents(): Promise<Array<{ text: string | null; isError?: boolean; error?: string }>> {
+type ResultEvent = { type: string; text: string | null; isError?: boolean; error?: string; failure?: string };
+
+async function resultEvents(): Promise<ResultEvent[]> {
   const provider = createProvider('claude');
   provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
-  const events: Array<{ type: string; text: string | null; isError?: boolean; error?: string }> = [];
+  const events: ResultEvent[] = [];
   for await (const e of provider.query({ prompt: 'ping', cwd: tmp }).events) events.push(e as (typeof events)[0]);
   return events.filter((e) => e.type === 'result');
 }
 
 it.each([
-  ['Not logged in · Please run /login', OWNER_HINT],
-  [`  ${AUTH_ERROR}\n`, OWNER_HINT],
-  ['Invalid auth token · Fix external auth token', OWNER_HINT],
-  ['Credit balance is too low', OWNER_HINT],
-  ['Prompt is too long', 'This conversation got too long. An admin can send /clear to start a new one.'],
-])('uses SDK notice %p plus its chat hint as the error when errors[] is empty', async (result, hint) => {
-  sdkMessages.push({ type: 'result', subtype: 'success', is_error: true, result, errors: [] });
-  expect(await resultEvents()).toEqual([
-    { type: 'result', text: null, isError: true, error: `${result.trim()}\n${hint}` },
-  ]);
-});
+  ['Not logged in · Please run /login', OWNER_HINT, 'credentials'],
+  [`  ${AUTH_ERROR}\n`, OWNER_HINT, 'credentials'],
+  ['Invalid auth token · Fix external auth token', OWNER_HINT, 'credentials'],
+  ['Credit balance is too low', OWNER_HINT, 'billing'],
+  ['Prompt is too long', 'This conversation got too long. An admin can send /clear to start a new one.', undefined],
+])(
+  'uses SDK notice %p plus its chat hint as the error when errors[] is empty, naming the cause it is',
+  async (result, hint, failure) => {
+    sdkMessages.push({ type: 'result', subtype: 'success', is_error: true, result, errors: [] });
+    expect(await resultEvents()).toEqual([
+      {
+        type: 'result',
+        text: null,
+        isError: true,
+        error: `${result.trim()}\n${hint}`,
+        ...(failure ? { failure } : {}),
+      },
+    ]);
+  },
+);
 
 it.each([
   ['an API Error dump', 'API Error: 400 rejected input: <internal>private</internal>'],
@@ -170,7 +181,7 @@ it('leaves a successful result untouched', async () => {
   ]);
 });
 
-it("keeps the SDK's own auth notice out of the channel: the host hears the failed turn, with the notice for its log", async () => {
+it("keeps the SDK's own auth notice out of the channel: the host hears the failed turn, its cause, and the notice for its log", async () => {
   sdkMessages.push({ type: 'result', subtype: 'success', is_error: true, result: AUTH_ERROR, errors: [] });
   const provider = createProvider('claude');
   provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
@@ -190,7 +201,14 @@ it("keeps the SDK's own auth notice out of the channel: the host hears the faile
   expect(getUndeliveredMessages().map((row) => [row.kind, JSON.parse(row.content)])).toEqual([
     [
       'system',
-      { action: 'turn_failed', channelType: 'discord', platformId: 'chan-1', threadId: null, error: AUTH_NOTICE },
+      {
+        action: 'turn_failed',
+        channelType: 'discord',
+        platformId: 'chan-1',
+        threadId: null,
+        error: AUTH_NOTICE,
+        failure: 'credentials',
+      },
     ],
   ]);
   expect(exchanges.map((e) => [e.result, e.status])).toEqual([[AUTH_NOTICE, 'error']]);

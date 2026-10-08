@@ -26,6 +26,10 @@
  * `registerTurnFailedHook`. A failure in the principal's direct message keeps
  * its thread there; any other goes to the top of the direct message.
  *
+ * A failed turn whose provider recognized an outage only whoever runs the
+ * assistant can fix (a rejected credential, a spent balance) gets a sentence
+ * that does not ask for a resend, since every resend fails the same way.
+ *
  * The notice is one direct send through the delivery adapter, so it passes
  * the outbound guard. It is never queued or retried, so a failing channel
  * cannot turn one notice into a stream of them. Why the failure happened goes
@@ -46,6 +50,13 @@ registerMigration(gwsEaNoticesMigration);
 
 /** The one plain sentence the principal sees whenever the assistant could not finish. */
 const FAILURE_NOTICE_TEXT = "Something went wrong on my side and I couldn't finish that. Please send it again.";
+
+/** What the principal sees when the assistant cannot work until whoever runs it fixes something. */
+const OUTAGE_NOTICE_TEXT =
+  "I can't do anything at the moment: something on my side needs fixing first, and it isn't anything you need to do. Please send this again later.";
+
+/** The longest provider error the host log keeps from one report; the container writes the row. */
+const REPORTED_ERROR_LIMIT = 2000;
 
 type Cause = 'delivery-failed' | 'inbound-failed' | 'turn-failed';
 
@@ -111,8 +122,13 @@ async function isPrincipalConversation(session: Session): Promise<boolean> {
   return session.messaging_group_id !== null && session.agent_group_id === (await getMainAgentGroupId());
 }
 
-async function tellPrincipal(cause: Cause, session: Session, route: Route): Promise<void> {
-  await deliverToPrincipal(FAILURE_NOTICE_TEXT, route, {
+async function tellPrincipal(
+  cause: Cause,
+  session: Session,
+  route: Route,
+  text: string = FAILURE_NOTICE_TEXT,
+): Promise<void> {
+  await deliverToPrincipal(text, route, {
     label: 'Failure notice',
     fields: { cause, sessionId: session.id },
   });
@@ -218,13 +234,27 @@ function reportedRoute(content: Record<string, unknown>): Route {
   };
 }
 
+/** A cause the runner's provider recognized as one only whoever runs the assistant can fix. */
+function reportedOutage(content: Record<string, unknown>): 'credentials' | 'billing' | undefined {
+  return content.failure === 'credentials' || content.failure === 'billing' ? content.failure : undefined;
+}
+
 registerDeliveryAction(
   'turn_failed',
   async (content, session) => {
     const route = reportedRoute(content);
+    const outage = reportedOutage(content);
+    log.warn('Agent turn failed', {
+      sessionId: session.id,
+      agentGroupId: session.agent_group_id,
+      channelType: route.channelType,
+      failure: outage,
+      error: typeof content.error === 'string' ? content.error.slice(0, REPORTED_ERROR_LIMIT) : undefined,
+    });
     if (!isPersonRoute(route) || session.messaging_group_id === null) return;
-    if (await isPrincipalConversation(session)) await tellPrincipal('turn-failed', session, route);
-    else await handOnFailedTurn(route, session);
+    if (await isPrincipalConversation(session)) {
+      await tellPrincipal('turn-failed', session, route, outage ? OUTAGE_NOTICE_TEXT : FAILURE_NOTICE_TEXT);
+    } else await handOnFailedTurn(route, session);
   },
   unguarded(
     "reports a failure to the principal or the conversation's owner only; the notice itself passes the outbound guard",

@@ -31,7 +31,7 @@ import {
 } from './formatter.js';
 import { stripHarnessTagArtifacts } from './harness-tag-strip.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
-import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
+import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange, ProviderFailure } from './providers/types.js';
 import type { ProviderRuntimeContract } from './provider-contracts/registry.js';
 
 const POLL_INTERVAL_MS = 1000;
@@ -640,7 +640,7 @@ export async function processQuery(
             // provider's error, unwrapped model output, and raw diagnostics
             // never reach a conversation: the report carries the error to the
             // host's log, and the host decides who hears that the turn failed.
-            if (sendsFailureNotice(routing)) await reportTurnFailed(routing, event.error);
+            if (sendsFailureNotice(routing)) await reportTurnFailed(routing, event.error, event.failure);
             // Keep the reason in the runner log, since the skipped report may
             // be the only place it would have been recorded.
             else log(`Failed turn not reported on this route: ${event.error ?? 'no provider error'}`);
@@ -791,11 +791,15 @@ function sendsFailureNotice(routing: RoutingContext): boolean {
 
 /**
  * Report a failed turn to the host as a typed `turn_failed` system action
- * carrying the turn's route and the provider's error. The host decides who
- * hears about it and in what words, and keeps the error in its log; nothing
- * is written for the conversation itself.
+ * carrying the turn's route, the provider's error, and the cause it
+ * recognized. The host decides who hears about it and in what words, and
+ * keeps the error in its log; nothing is written for the conversation itself.
  */
-async function reportTurnFailed(routing: RoutingContext, error: string | undefined): Promise<void> {
+async function reportTurnFailed(
+  routing: RoutingContext,
+  error: string | undefined,
+  failure?: ProviderFailure,
+): Promise<void> {
   log(`Failed turn — reporting turn_failed to the host${error ? `: ${error}` : ''}`);
   await writeMessageOut({
     id: generateId(),
@@ -806,6 +810,7 @@ async function reportTurnFailed(routing: RoutingContext, error: string | undefin
       platformId: routing.platformId,
       threadId: routing.threadId,
       ...(error ? { error } : {}),
+      ...(failure ? { failure } : {}),
     }),
   });
 }

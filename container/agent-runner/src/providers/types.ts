@@ -153,15 +153,22 @@ export interface AgentQuery {
   abort(): void;
 }
 
+/**
+ * A failure only whoever runs the assistant can fix: its model credential is
+ * missing or rejected, or its model account's balance is spent.
+ */
+export type ProviderFailure = 'credentials' | 'billing';
+
 export type ProviderEvent =
   | { type: 'init'; continuation: string }
   /**
    * A completed turn. `isError` marks a failed turn and prevents retries.
    * `text` is model output; `error` is an optional provider diagnostic
    * (e.g. a billing/quota notice). It is logged and archived, never shown to
-   * the user: every failed turn sends the same plain notice.
+   * the user. `failure` is a cause the provider recognized: the host words
+   * it, since every resend fails the same way until it is fixed.
    */
-  | { type: 'result'; text: string | null; isError?: boolean; error?: string }
+  | { type: 'result'; text: string | null; isError?: boolean; error?: string; failure?: ProviderFailure }
   /**
    * An assistant text segment emitted mid-turn (e.g. between tool calls).
    * The SDK's final `result` carries only the LAST assistant text, so a

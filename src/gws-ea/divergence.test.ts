@@ -491,10 +491,14 @@ describe('recorded divergence: delivery consults outbound guards, and the runner
     expect(sent).toEqual([]);
   });
 
-  it('reports a failed turn from the agent runner as a typed action', async () => {
+  it('reports a failed turn from the agent runner as a typed action, and never as a chat notice', async () => {
     const pollLoop = await readFile(path.join(originalCwd, 'container/agent-runner/src/poll-loop.ts'), 'utf8');
 
     expect(pollLoop).toContain("action: 'turn_failed'");
+    // Upstream's runner writes its failure notice to the turn's route, which for
+    // external-email is the counterpart's email thread (#3908, #3994).
+    expect(pollLoop).not.toContain('deliverErrorResult');
+    expect(pollLoop).not.toContain('FAILURE_NOTICE_FIELD');
   });
 });
 

@@ -463,13 +463,66 @@ describe('a failed turn the runner reports', () => {
   function reportTurnFailed(
     session: Session,
     route: { channelType: string | null; platformId: string | null; threadId: string | null },
+    cause: { error?: string; failure?: string } = {},
   ): void {
     queue(session, {
       id: `turn-${Math.random().toString(36).slice(2)}`,
       kind: 'system',
-      content: { action: 'turn_failed', ...route },
+      content: { action: 'turn_failed', ...route, ...cause },
     });
   }
+
+  const OUTAGE =
+    "I can't do anything at the moment: something on my side needs fixing first, and it isn't anything you need to do. Please send this again later.";
+  const outageInDm = (threadId: string | null): Sent => ({
+    ...noticeInDm(threadId),
+    content: JSON.stringify({ text: OUTAGE }),
+  });
+
+  it.each([
+    ['credentials', 'Not logged in · Please run /login', outageInDm],
+    ['billing', 'Credit balance is too low', outageInDm],
+    ['an unrecognized cause', 'API Error: 529 overloaded', noticeInDm],
+  ] as const)(
+    'for %s, tells the principal what the resend can do, and keeps the provider error in the host log alone',
+    async (failure, error, notice) => {
+      const { main } = await seedAssistant();
+      const warned = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+      try {
+        reportTurnFailed(main, { ...DM, threadId: 'spaces/dm/threads/t1' }, { error, failure });
+
+        await drain(main, 1);
+
+        expect(sent).toEqual([notice('spaces/dm/threads/t1')]);
+        expect(sent.map((send) => send.content).join('\n')).not.toContain(error);
+        expect(warned).toHaveBeenCalledWith(
+          'Agent turn failed',
+          expect.objectContaining({
+            sessionId: main.id,
+            error,
+            failure: failure === 'an unrecognized cause' ? undefined : failure,
+          }),
+        );
+      } finally {
+        warned.mockRestore();
+      }
+    },
+  );
+
+  it('logs at most the bounded head of a long provider error', async () => {
+    const { main } = await seedAssistant();
+    const warned = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+    try {
+      reportTurnFailed(main, { channelType: null, platformId: null, threadId: null }, { error: 'x'.repeat(5000) });
+
+      await drain(main, 1);
+
+      expect(warned).toHaveBeenCalledWith('Agent turn failed', expect.objectContaining({ error: 'x'.repeat(2000) }));
+      expect(sent).toEqual([]);
+    } finally {
+      warned.mockRestore();
+    }
+  });
 
   it('produces the sentence in the thread of main’s own conversation, and hands nothing on', async () => {
     const { main } = await seedAssistant();
