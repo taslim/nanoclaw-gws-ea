@@ -17,7 +17,7 @@ function instructions(name: string): string {
   return fs.readFileSync(path.join(MODULES, `${name}.instructions.md`), 'utf8');
 }
 
-/** Each instruction file this branch touched, with the backticked words in it that are not tool names. */
+/** Each instruction file GWS-EA relies on, with the backticked words in it that are not tool names. */
 const FILES: ReadonlyArray<readonly [name: string, notTools: readonly string[]]> = [
   ['time', ['reference_date']],
   ['reminders', []],

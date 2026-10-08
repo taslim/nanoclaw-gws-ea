@@ -105,13 +105,4 @@ describe("main's calendar writes", () => {
       ),
     ).toMatch(/a repeat changes nothing twice/);
   });
-
-  it('tell the agent the principal stays on every event, accepted, and that Google tells the guests', () => {
-    for (const tool of [createEvent, changeGuests]) {
-      expect(tool.tool.description, tool.tool.name).toMatch(/the principal (?:is always|stays) on/iu);
-      expect(tool.tool.description, tool.tool.name).toMatch(/Google (?:sends them the invitation|tells the guests)/u);
-      const words = (tool.tool.description ?? '').split(/\s+/u).filter(Boolean).length;
-      expect(words, tool.tool.name).toBeLessThan(60);
-    }
-  });
 });

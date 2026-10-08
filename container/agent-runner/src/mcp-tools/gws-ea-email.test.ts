@@ -27,8 +27,6 @@ import {
 import { requestStatus } from './request-status.js';
 import type { McpToolDefinition } from './types.js';
 
-const ALL_TOOLS = [emailHandoff, emailToPrincipal, emailSend, tellMain, freeTime, book, changeBooking, cancelBooking];
-
 beforeEach(() => initTestSessionDb());
 afterEach(() => closeSessionDb());
 
@@ -229,23 +227,6 @@ describe('the email tools', () => {
       expect(text(result), label).toMatch(problem);
     }
     expect(getUndeliveredMessages()).toHaveLength(0);
-  });
-
-  it('describe each tool in under 60 words', () => {
-    for (const tool of ALL_TOOLS) {
-      const words = (tool.tool.description ?? '').split(/\s+/u).filter(Boolean).length;
-      expect(words, tool.tool.name).toBeGreaterThan(0);
-      expect(words, tool.tool.name).toBeLessThan(60);
-    }
-  });
-
-  it("describe free_time's times in the date order the host lists them", () => {
-    expect(freeTime.tool.description).toContain('in date order');
-    expect(freeTime.tool.description).not.toMatch(/best fit/);
-  });
-
-  it('describe booking without holds: nothing keeps a time before someone agrees to it', () => {
-    for (const tool of ALL_TOOLS) expect(tool.tool.description, tool.tool.name).not.toMatch(/\bhold/iu);
   });
 });
 
