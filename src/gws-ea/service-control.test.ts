@@ -151,14 +151,13 @@ describe('start', () => {
 });
 
 describe('stop', () => {
-  it('stops the service without draining its agents, then waits until detection shows it gone', async () => {
-    const { helpers } = nanoclaw(LOADED, LOADED, LOADED, BOOTED_OUT);
+  it("stops the service through NanoClaw's stop, which waits for the host to exit, without draining its agents", async () => {
+    const { helpers, calls } = nanoclaw(LOADED);
 
     await expect(control(helpers).service.stop()).resolves.toBe('stopped');
 
     expect(helpers.stopService).toHaveBeenCalledExactlyOnceWith(LOADED, helpers.detectService.mock.calls[0]![1]);
-    // It returned only once detection no longer found the job running.
-    expect(helpers.detectService).toHaveLastReturnedWith(BOOTED_OUT);
+    expect(calls).toEqual(['detect', 'stop']);
     expect(helpers.drainContainers).not.toHaveBeenCalled();
   });
 
@@ -171,31 +170,30 @@ describe('stop', () => {
     }
   });
 
-  it('fails, naming the service, when the job never leaves', async () => {
+  it("fails, naming the service and keeping NanoClaw's reason, when the host never exits", async () => {
     const { helpers, calls } = nanoclaw(LOADED);
-    const { service, sleep } = control(helpers);
+    const didNotStop = new Error(
+      `NanoClaw service ${LABEL} did not stop (PID 4242). Once it has exited, start it again with: launchctl bootstrap`,
+    );
+    helpers.stopService.mockRejectedValueOnce(didNotStop);
 
-    await expect(service.stop()).rejects.toMatchObject({
+    await expect(control(helpers).service.stop()).rejects.toMatchObject({
       code: 'service_still_running',
-      message: expect.stringContaining(LABEL),
+      message: `NanoClaw's service ${LABEL} did not stop: ${didNotStop.message}`,
+      cause: didNotStop,
     });
-    // Bounded: every wait counted toward a limit well past launchd's own SIGKILL.
-    const waited = sleep.mock.calls.reduce((total, [milliseconds]) => total + milliseconds, 0);
-    expect(waited).toBeGreaterThanOrEqual(20_000);
-    expect(waited).toBeLessThanOrEqual(60_000);
     expect(calls).not.toContain('start');
   });
 });
 
 describe('restart', () => {
-  it('waits for launchd to drop the job before starting it again', async () => {
-    // A restart right after a stop: the job is still going for a few polls.
-    const { helpers, calls } = nanoclaw(LOADED, LOADED, LOADED, LOADED, BOOTED_OUT);
+  it("starts the job again only after NanoClaw's stop has returned", async () => {
+    const { helpers, calls } = nanoclaw(LOADED);
     const { service } = control(helpers);
 
     await expect(service.restart()).resolves.toBe('restarted');
 
-    expect(calls).toEqual(['detect', 'stop', 'detect', 'detect', 'detect', 'detect', 'start']);
+    expect(calls).toEqual(['detect', 'stop', 'start']);
     expect(helpers.startService).toHaveBeenCalledExactlyOnceWith(
       { ...LOADED, active: true },
       TARGET.checkoutRoot,
@@ -218,6 +216,7 @@ describe('restart', () => {
 
   it('never starts a job that did not leave', async () => {
     const { helpers, calls } = nanoclaw(LOADED);
+    helpers.stopService.mockRejectedValueOnce(new Error(`NanoClaw service ${LABEL} did not stop`));
 
     await expect(control(helpers).service.restart()).rejects.toMatchObject({ code: 'service_still_running' });
     expect(calls).not.toContain('start');

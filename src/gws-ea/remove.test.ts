@@ -2250,11 +2250,6 @@ describe('removal safety', () => {
         helpers.stopService.mockRejectedValueOnce(new Error('Boot-out failed: 5: Input/output error')),
       /Input\/output error/u,
     ],
-    [
-      'its launchd job never leaves',
-      (helpers: FakeNanoclawService) => helpers.stopService.mockImplementationOnce(async () => undefined),
-      /still running after it was stopped/u,
-    ],
   ] as const)('stops, keeping the service definition, when %s', async (_why, arrange, reason) => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput(paths), {

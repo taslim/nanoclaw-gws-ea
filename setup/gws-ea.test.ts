@@ -451,6 +451,15 @@ describe("GWS-EA service control through NanoClaw's helpers", () => {
     return { coordinates, target };
   }
 
+  /** `launchctl print` for a job that is not loaded: exit 113, as launchd answers. */
+  function notLoaded(service: string): Error {
+    return Object.assign(new Error(`Command failed: launchctl print ${service}\nCould not find service`), {
+      status: 113,
+      stdout: '',
+      stderr: 'Could not find service',
+    });
+  }
+
   /**
    * launchd at `launchctl`: `bootout` unloads the job, but it lingers for
    * `linger` more `print`s while launchd removes it, and `bootstrap` fails as
@@ -462,6 +471,14 @@ describe("GWS-EA service control through NanoClaw's helpers", () => {
     const runner: NanoclawCommandRunner = {
       run(command, args) {
         calls.push(`${command} ${args.join(' ')}`);
+        if (command === 'launchctl' && args[0] === 'print') {
+          if (state.lingering > 0) {
+            state.lingering -= 1;
+            return '';
+          }
+          if (state.loaded) return '';
+          throw notLoaded(service);
+        }
         if (command === 'launchctl' && args[0] === 'bootout') {
           if (!state.loaded)
             throw new Error(`Command failed: launchctl bootout ${service}\nBoot-out failed: 3: No such process`);
@@ -481,12 +498,7 @@ describe("GWS-EA service control through NanoClaw's helpers", () => {
       },
       tryRun(command, args) {
         calls.push(`${command} ${args.join(' ')}`);
-        if (command !== 'launchctl' || args[0] !== 'print') return { ok: false, stdout: '' };
-        if (state.lingering > 0) {
-          state.lingering -= 1;
-          return { ok: true, stdout: '' };
-        }
-        return { ok: state.loaded, stdout: '' };
+        return { ok: false, stdout: '' };
       },
     };
     return { runner, calls };
@@ -494,18 +506,18 @@ describe("GWS-EA service control through NanoClaw's helpers", () => {
 
   it.each([
     ['macos', 'darwin', (identity: string) => `launchctl print gui/${UID}/${identity}`],
-    ['linux', 'linux', (identity: string) => `systemctl --user is-active --quiet ${identity}`],
+    ['linux', 'linux', (identity: string) => `systemctl --user is-active ${identity}`],
   ] as const)(
     "detects the %s service at the label and definition gws-ea's coordinates produce (drift guard)",
     async (platform, nodePlatform, probe) => {
       const { coordinates, target } = await installed(platform);
       const calls: string[] = [];
       const runner: NanoclawCommandRunner = {
-        run: () => '',
-        tryRun(command, args) {
+        run(command, args) {
           calls.push(`${command} ${args.join(' ')}`);
-          return { ok: true, stdout: '' };
+          return '';
         },
+        tryRun: () => ({ ok: false, stdout: '' }),
       };
       const service = createServiceControl(await wiredHelpers(runner), target, {
         platform: nodePlatform,
@@ -542,7 +554,7 @@ describe("GWS-EA service control through NanoClaw's helpers", () => {
 
   it.each([
     ['a running job', { loaded: true, lingering: 0 }],
-    ['a job a stop has just booted out', { loaded: false, lingering: 2 }],
+    ['a job a stop has just booted out', { loaded: false, lingering: 3 }],
   ] as const)('restarts %s only once launchd has dropped it, so bootstrap never fails', async (_what, initial) => {
     const { coordinates, target } = await installed('macos');
     const { runner, calls } = fakeLaunchd(coordinates.serviceIdentity, { ...initial }, 3);
@@ -581,6 +593,10 @@ describe("GWS-EA service control through NanoClaw's helpers", () => {
     const runner: NanoclawCommandRunner = {
       run(command, args) {
         calls.push(`${command} ${args.join(' ')}`);
+        if (command === 'launchctl' && args[0] === 'print' && loaded.has(args[1]!)) {
+          if (loaded.get(args[1]!)) return '';
+          throw notLoaded(args[1]!);
+        }
         if (command === 'launchctl' && args[0] === 'bootout' && loaded.has(args[1]!)) {
           loaded.set(args[1]!, false);
           return '';
@@ -589,7 +605,7 @@ describe("GWS-EA service control through NanoClaw's helpers", () => {
       },
       tryRun(command, args) {
         calls.push(`${command} ${args.join(' ')}`);
-        return { ok: command === 'launchctl' && args[0] === 'print' && loaded.get(args[1]!) === true, stdout: '' };
+        return { ok: false, stdout: '' };
       },
     };
     const service = createServiceControl(
@@ -607,10 +623,9 @@ describe("GWS-EA service control through NanoClaw's helpers", () => {
     await expect(service.stop()).resolves.toBe('stopped');
 
     // Only A's job is touched, and nothing lists or stops a container.
-    expect(calls).toEqual([
-      `launchctl print gui/${UID}/${a!.serviceIdentity}`,
+    expect(calls.every((call) => call.startsWith('launchctl ') && call.endsWith(`/${a!.serviceIdentity}`))).toBe(true);
+    expect(calls.filter((call) => call.startsWith('launchctl bootout'))).toEqual([
       `launchctl bootout gui/${UID}/${a!.serviceIdentity}`,
-      `launchctl print gui/${UID}/${a!.serviceIdentity}`,
     ]);
     expect(loaded.get(`gui/${UID}/${b!.serviceIdentity}`)).toBe(true);
   });

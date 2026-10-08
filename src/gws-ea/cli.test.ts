@@ -1793,7 +1793,6 @@ describe('gws-ea start, stop, and restart', () => {
     expect(calls).toEqual([
       { helper: 'detect', install: a.install_id, root: a.checkout_realpath },
       { helper: 'stop', install: a.install_id },
-      { helper: 'detect', install: a.install_id, root: a.checkout_realpath },
     ]);
     expect(running).toEqual({ [a.install_id]: false, [b.install_id]: true });
     expect(io.out).toContain(`Assistant ${a.instance_id} stopped.`);
@@ -1814,7 +1813,7 @@ describe('gws-ea start, stop, and restart', () => {
 
   it.each([
     ['start', false, 'started', ['detect', 'start', 'detect', 'health']],
-    ['restart', true, 'restarted', ['detect', 'stop', 'detect', 'start', 'detect', 'health']],
+    ['restart', true, 'restarted', ['detect', 'stop', 'start', 'detect', 'health']],
   ] as const)(
     '%s acts on the named service, then waits until its host answers, never draining its agents',
     async (command, wasRunning, outcome, sequence) => {

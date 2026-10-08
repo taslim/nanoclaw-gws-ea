@@ -31,6 +31,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   assertCarriable,
   assertCheckoutQuiet,
+  CARRIED_ROOTS,
   carryState,
   copyReleaseRecords,
   finishRollbackSwap,
@@ -1093,5 +1094,20 @@ describe("setting a kept release's own state aside", () => {
     const back = await tree(kept);
     for (const [key, value] of own) if (!key.includes('circuit-breaker')) expect(back.get(key)).toBe(value);
     expect(await exists(state)).toBe(false);
+  });
+});
+
+describe('the roots a cutover carries', () => {
+  it("include every root NanoClaw's own update treats as install state", () => {
+    const transaction = readFileSync(path.join(import.meta.dirname, '../../scripts/update/transaction.ts'), 'utf8');
+    const declared = /^const MUTABLE_PATHS = \[([^\]]*)\];$/mu.exec(transaction)?.[1];
+    expect(
+      declared,
+      "scripts/update/transaction.ts no longer declares MUTABLE_PATHS; re-derive CARRIED_ROOTS from NanoClaw's update",
+    ).toBeDefined();
+    const nanoclawRoots = [...(declared ?? '').matchAll(/'([^']+)'/gu)].map((match) => match[1]);
+
+    expect(nanoclawRoots.length).toBeGreaterThan(0);
+    expect(CARRIED_ROOTS).toEqual(expect.arrayContaining(nanoclawRoots));
   });
 });

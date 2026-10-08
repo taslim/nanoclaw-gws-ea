@@ -87,7 +87,7 @@ export function findOneCliCredential(payload: unknown, descriptor: OneCliCredent
   const secret = namedSecret(payload, descriptor.name);
   if (!secret) return null;
   const injection = descriptor.injectionConfig;
-  // Older OpenCode setup used bearer injection for every generic key. Only
+  // An older provider setup used bearer injection for every generic key. Only
   // that known mistake may be repaired; arbitrary rules belong to the operator.
   const knownKeyMapping =
     !injection || sameInjection(secret.injectionConfig, injection) || sameInjection(secret.injectionConfig, BEARER);
@@ -293,7 +293,7 @@ export function createProviderCredentialConnection(
   };
 }
 
-/** OneCLI's `openai` record is the Codex login-file shape; OpenCode's parsed login is re-encoded into it. */
+/** OneCLI's `openai` record has its own login-file shape; a parsed chatgpt OAuth login is re-encoded into it. */
 export function encodeOneCliValue(target: GatewayCredentialTarget, value: string | GatewayOAuthCredential): string {
   if (target.kind === 'api-key') {
     if (typeof value !== 'string') throw new Error('An API-key connection stores a string value.');
@@ -303,7 +303,7 @@ export function encodeOneCliValue(target: GatewayCredentialTarget, value: string
     throw new Error(`This connection stores the ${target.oauth.profile} OAuth profile.`);
   }
   // NanoClaw's pinned OneCLI cannot refresh this record on its own; see
-  // .claude/skills/add-opencode/ONECLI-LEGACY.md for the manual procedure.
+  // .claude/skills/add-onecli/references/chatgpt-oauth-refresh.md for the manual procedure.
   return JSON.stringify({
     tokens: {
       access_token: value.accessToken,

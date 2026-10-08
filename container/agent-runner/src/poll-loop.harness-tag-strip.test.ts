@@ -135,7 +135,7 @@ describe('harness tag artifacts stripped from deliveries (wiring)', () => {
   });
 });
 
-it('keeps the dedicated provider error field and private result text out of the channel', async () => {
+it('keeps the dedicated provider error field and private result text out of the channel; the error goes to the host log', async () => {
   const { query, pushes } = makeResultQuery({
     type: 'result',
     text: 'Private raw transport diagnostic',
@@ -146,8 +146,9 @@ it('keeps the dedicated provider error field and private result text out of the 
   await processQuery(query, ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
 
   const out = getUndeliveredMessages();
-  expect(out.map((row) => [row.kind, JSON.parse(row.content)])).toEqual([['system', TURN_FAILED]]);
-  expect(out[0].content).not.toContain('Please try again later.');
+  expect(out.map((row) => [row.kind, JSON.parse(row.content)])).toEqual([
+    ['system', { ...TURN_FAILED, error: 'Please try again later.\n<invoke name="retry"></parameter>' }],
+  ]);
   expect(out[0].content).not.toContain('Private raw transport diagnostic');
   expect(pushes).toHaveLength(0);
 });

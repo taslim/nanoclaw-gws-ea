@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
-import { getPendingMessages, markCompleted } from './db/messages-in.js';
+import { getPendingMessages, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
-import { formatMessages, extractRouting } from './formatter.js';
+import { formatMessages, extractRouting, isClearCommand, isRunnerCommand } from './formatter.js';
 import { processQuery } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
@@ -419,6 +419,8 @@ const ERR_ROUTING = {
   inReplyTo: 'm1',
 };
 
+const AGENT_ROUTING = { platformId: 'ag-a', channelType: 'agent', threadId: null, inReplyTo: 'm1' };
+
 it('does not push accumulated-only follow-ups into an active query', async () => {
   const pushes: string[] = [];
 
@@ -471,14 +473,16 @@ describe('error result with no <message> envelope', () => {
     expect(pushes).toHaveLength(0);
   });
 
-  it("reports the failed turn in place of the provider's error, which goes only to the log", async () => {
+  it("reports the failed turn with the provider's error for the host's log, and writes nothing for the channel", async () => {
     const providerError = '403 billing_error: Spending limit reached. Update your billing settings to continue.';
     const { query, pushes } = makeResultQuery({ type: 'result', text: '', error: providerError, isError: true });
     const logged = spyOn(console, 'error').mockImplementation(() => {});
     try {
       await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
 
-      expect(getUndeliveredMessages().map((row) => row.content)).toEqual([JSON.stringify(TURN_FAILED)]);
+      expect(getUndeliveredMessages().map((row) => [row.kind, JSON.parse(row.content)])).toEqual([
+        ['system', { ...TURN_FAILED, error: providerError }],
+      ]);
       expect(logged.mock.calls.map(([line]) => String(line)).some((line) => line.includes(providerError))).toBe(true);
       expect(pushes).toHaveLength(0);
     } finally {
@@ -501,6 +505,29 @@ describe('error result with no <message> envelope', () => {
     expect(pushes).toHaveLength(0);
   });
 
+  it.each([
+    ['provider error', 'billing hard-stop', 'billing hard-stop'],
+    ['no provider error', undefined, 'no provider error'],
+  ])(
+    'reports nothing for a turn woken only by failure notices, and logs why once: %s',
+    async (_label, error, expected) => {
+      const { query } = makeResultQuery({ type: 'result', text: '', isError: true, error });
+      const noticeRouting = { ...AGENT_ROUTING, failureNoticeWake: true };
+      const lines: string[] = [];
+      const spy = spyOn(console, 'error').mockImplementation((line) => {
+        lines.push(String(line));
+      });
+      try {
+        await processQuery(query, noticeRouting, ['m1'], 'mock', undefined, 'prompt', undefined);
+      } finally {
+        spy.mockRestore();
+      }
+
+      expect(lines.filter((line) => line.includes(expected))).toHaveLength(1);
+      expect(getUndeliveredMessages()).toHaveLength(0);
+    },
+  );
+
   it('still nudges (and does not deliver) a normal unwrapped result', async () => {
     const { query, pushes } = makeResultQuery({ type: 'result', text: 'bare text, no envelope' });
 
@@ -512,6 +539,135 @@ describe('error result with no <message> envelope', () => {
     // The nudge asks for the reply, never for every line of output to be wrapped.
     expect(pushes[0]).toContain('Please re-send your reply');
     expect(pushes[0]).not.toContain('All output must be wrapped');
+  });
+});
+
+describe('failed turns on agent and route-less wakes (never answer a notice with a notice)', () => {
+  function insertRow(
+    id: string,
+    content: object | string,
+    channelType: string | null,
+    platformId: string | null,
+    opts: { trigger?: 0 | 1; onWake?: 0 | 1 } = {},
+  ): void {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, trigger, on_wake, content)
+         VALUES (?, 'chat', datetime('now'), 'pending', ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        platformId,
+        channelType,
+        opts.trigger ?? 1,
+        opts.onWake ?? 0,
+        typeof content === 'string' ? content : JSON.stringify(content),
+      );
+  }
+
+  /** One failing turn over every pending row, as the poll loop would run it. */
+  async function failTurn(): Promise<void> {
+    const rows = getPendingMessages(true);
+    const { query } = makeResultQuery({ type: 'result', text: '', isError: true, error: 'Incorrect API key' });
+    await processQuery(query, extractRouting(rows), [], 'mock', undefined, 'prompt', undefined);
+    markCompleted(rows.map((m) => m.id));
+  }
+
+  /** The failed turns reported to the host; the runner writes no chat row for a failure. */
+  function reports(): unknown[] {
+    const out = getUndeliveredMessages();
+    expect(out.filter((m) => m.kind !== 'system')).toEqual([]);
+    return out.map((m) => JSON.parse(m.content) as unknown);
+  }
+
+  const failed = (channelType: string | null, platformId: string | null) => ({
+    action: 'turn_failed',
+    channelType,
+    platformId,
+    threadId: null,
+    error: 'Incorrect API key',
+  });
+
+  it("another agent's request that fails is reported on its route, and nothing is sent back to it", async () => {
+    insertRow('a2a-1', { text: 'please summarize the report', sender: 'A' }, 'agent', 'ag-a');
+    await failTurn();
+    expect(reports()).toEqual([failed('agent', 'ag-a')]);
+  });
+
+  it('a self-addressed restart message that fails is reported once, and nothing loops back', async () => {
+    const restart = { text: 'verify the new tool', sender: 'system', senderId: 'system' };
+    insertRow('restart-1', restart, 'agent', 'ag-self', { onWake: 1 });
+    await failTurn();
+    expect(reports()).toEqual([failed('agent', 'ag-self')]);
+  });
+
+  it('a turn woken by a message with no route (a reminder) is reported for the host to place', async () => {
+    insertRow('reminder-1', { text: 'You set this reminder: follow up with Remy', sender: 'reminder' }, null, null);
+    await failTurn();
+    expect(reports()).toEqual([failed(null, null)]);
+  });
+
+  it('a batch mixing a failure notice with a real message is reported on the real route', async () => {
+    insertRow('n1', { text: 'Incorrect API key', failureNotice: true }, 'agent', 'ag-b');
+    insertRow('m2', { text: 'any update?', sender: 'Alice' }, 'discord', 'chan-1');
+    await failTurn();
+    // The requester's conversation is reported, not the agent whose notice came first.
+    expect(reports()).toEqual([failed('discord', 'chan-1')]);
+  });
+
+  it.each([
+    ['accumulated context', { channelType: 'discord', platformId: 'chan-1', trigger: 0 as 0 | 1 }],
+    ['a cross-session echo', { channelType: 'session-echo', platformId: null, trigger: 1 as 0 | 1 }],
+  ])('%s riding along with a failure notice earns no report', async (_label, extra) => {
+    insertRow('c1', { text: 'context', sender: 'Bob' }, extra.channelType, extra.platformId, {
+      trigger: extra.trigger,
+    });
+    insertRow('n1', { text: 'Incorrect API key', failureNotice: true }, 'agent', 'ag-b');
+    await failTurn();
+    expect(reports()).toEqual([]);
+  });
+
+  it('a plain agent route is reported', async () => {
+    const { query } = makeResultQuery({ type: 'result', text: '', isError: true });
+    await processQuery(query, AGENT_ROUTING, ['m1'], 'mock', undefined, 'prompt', undefined);
+    expect(reports()).toEqual([{ action: 'turn_failed', channelType: 'agent', platformId: 'ag-a', threadId: null }]);
+  });
+
+  it('context between a leading notice and the request does not take the route', () => {
+    const row = (id: string, channel: string, platform: string, trigger: number, content: object) =>
+      ({
+        id,
+        kind: 'chat',
+        trigger,
+        channel_type: channel,
+        platform_id: platform,
+        thread_id: null,
+        content: JSON.stringify(content),
+      }) as unknown as MessageInRow;
+    const routing = extractRouting([
+      row('n1', 'agent', 'ag-b', 1, { text: 'Incorrect API key', failureNotice: true }),
+      row('c1', 'discord', 'chan-x', 0, { text: 'context' }),
+      row('m2', 'discord', 'chan-1', 1, { text: 'any update?' }),
+    ]);
+    expect([routing.platformId, routing.inReplyTo, routing.failureNoticeWake]).toEqual(['chan-1', 'm2', false]);
+  });
+
+  it('a failure notice is never a runner command', () => {
+    insertRow('n1', { text: '/clear is required before retrying', failureNotice: true }, 'agent', 'ag-b');
+    insertRow('n2', { text: '/compact failed', failureNotice: true }, 'agent', 'ag-b');
+    const [clearLike, compactLike] = getPendingMessages();
+    expect(isClearCommand(clearLike)).toBe(false);
+    expect(isRunnerCommand(compactLike, 'claude')).toBe(false);
+  });
+
+  it.each([
+    ['{"text":"hi","failureNotice":"true"}', false],
+    ['{"text":"hi","failureNotice":true}', true],
+    ['not json', false],
+    ['null', false],
+  ])('extractRouting reads the marker strictly: %s', (content, expected) => {
+    insertRow('x1', content, 'agent', 'ag-b');
+    expect(extractRouting(getPendingMessages()).failureNoticeWake).toBe(expected);
   });
 });
 
