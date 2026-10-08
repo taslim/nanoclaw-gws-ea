@@ -663,6 +663,15 @@ describe("external-email's reply", () => {
     expect((await threadMessages(key, 'outside')).at(-1)?.gmailMessageId).toBe(gmail.sent[0].id);
   });
 
+  it("finds a thread's first email Gmail took before failing, though the thread has no Gmail thread yet", async () => {
+    const { key, session } = await handedOver([REMY]);
+    gmail.sendFailures.push({ accepted: true, status: 503 });
+    const answer = await emailSend(session, { subject: 'Lunch', text: 'Lunch on Tuesday?' });
+    expect(answer).toMatchObject({ ok: true, data: { thread_key: key } });
+    expect(gmail.sent).toHaveLength(1);
+    expect((await getThread(key))?.gmailThreadId).toBe(gmail.sent[0].threadId);
+  });
+
   it('is answered from its record when Gmail took it but delivery never recorded it', async () => {
     const { key } = await arrives({ threadId: 'g-1', from: SAM, body: 'Next week?' });
     const message = { kind: 'chat', content: { text: 'Tuesday works.' } };
