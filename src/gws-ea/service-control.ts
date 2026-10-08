@@ -178,7 +178,19 @@ export function createServiceControl(
     log: (message) => activeStep()?.write(`${message}\n`),
   };
   const root = target.checkoutRoot;
-  const detect = (): NanoclawServiceHandle => helpers.detectService(root, env);
+  /**
+   * NanoClaw's helpers throw plain errors, which the operator is never shown
+   * (`safeErrorMessage`). Each failure keeps NanoClaw's own reason, which says
+   * what to do, in a gws-ea error, with NanoClaw's error as its cause.
+   */
+  const reasonOf = (cause: unknown): string => (cause instanceof Error ? cause.message : String(cause));
+  const detect = (): NanoclawServiceHandle => {
+    try {
+      return helpers.detectService(root, env);
+    } catch (cause) {
+      throw new GwsEaError('service_unobservable', reasonOf(cause), { cause });
+    }
+  };
 
   /** A host running outside NanoClaw's service is the operator's to stop; no action here takes it over. */
   const managed = (handle: NanoclawServiceHandle): NanoclawServiceHandle => {
@@ -197,29 +209,31 @@ export function createServiceControl(
     );
   };
 
-  /**
-   * NanoClaw's stop returns once the host has exited, and throws when it
-   * cannot stop it; its reason is the operator's, so it is kept in gws-ea's
-   * own error, which the operator is shown.
-   */
+  /** NanoClaw's stop returns once the host has exited, and throws when it cannot stop it. */
   const stopHost = async (handle: NanoclawServiceHandle): Promise<void> => {
     try {
       await helpers.stopService(handle, env);
     } catch (cause) {
-      const reason = cause instanceof Error ? cause.message : String(cause);
       throw new GwsEaError(
         'service_still_running',
-        `NanoClaw's service ${handle.name ?? handle.mode} did not stop: ${reason}`,
-        {
-          cause,
-        },
+        `NanoClaw's service ${handle.name ?? handle.mode} did not stop: ${reasonOf(cause)}`,
+        { cause },
       );
     }
   };
 
   /** Start the way NanoClaw's own transaction does: the service's handle, marked active. */
-  const startHandle = (handle: NanoclawServiceHandle): void =>
-    helpers.startService({ ...handle, active: true }, root, env);
+  const startHandle = (handle: NanoclawServiceHandle): void => {
+    try {
+      helpers.startService({ ...handle, active: true }, root, env);
+    } catch (cause) {
+      throw new GwsEaError(
+        'service_start_failed',
+        `NanoClaw's service ${handle.name ?? handle.mode} did not start: ${reasonOf(cause)}`,
+        { cause },
+      );
+    }
+  };
 
   return {
     detect,

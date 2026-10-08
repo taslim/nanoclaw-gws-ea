@@ -96,7 +96,12 @@ const FAILED = 1;
 /** The Google Chat adapter instance create registers. */
 const ADAPTER_INSTANCE = 'gchat';
 /** Command failures that mean a probe could not run its observation, not that it saw something wrong. */
-const UNOBSERVABLE_CODES: ReadonlySet<string> = new Set(['command_failed', 'command_timeout', 'command_output_limit']);
+const UNOBSERVABLE_CODES: ReadonlySet<string> = new Set([
+  'command_failed',
+  'command_timeout',
+  'command_output_limit',
+  'service_unobservable',
+]);
 
 /** `ok`: observed healthy; `degraded`: observed something wrong; `unknown`: could not observe. */
 export type ProbeStatus = 'ok' | 'degraded' | 'unknown';

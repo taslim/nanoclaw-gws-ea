@@ -223,6 +223,41 @@ describe('restart', () => {
   });
 });
 
+describe("NanoClaw's own reasons", () => {
+  it('keeps what a failed detection says, in an error the operator is shown', async () => {
+    const { helpers } = nanoclaw(LOADED);
+    const unobservable = new Error(
+      `Cannot tell whether NanoClaw is running: \`launchctl print gui/501/${LABEL}\` failed (Could not find domain). Run the update from a login session of this user.`,
+    );
+    helpers.detectService.mockImplementationOnce(() => {
+      throw unobservable;
+    });
+
+    await expect(control(helpers).service.start()).rejects.toMatchObject({
+      name: 'GwsEaError',
+      code: 'service_unobservable',
+      message: unobservable.message,
+      cause: unobservable,
+    });
+    expect(helpers.startService).not.toHaveBeenCalled();
+  });
+
+  it('keeps what a failed start says, naming the service', async () => {
+    const { helpers } = nanoclaw(BOOTED_OUT);
+    const refused = new Error(`Command failed: launchctl bootstrap gui/501\nBootstrap failed: 5: Input/output error`);
+    helpers.startService.mockImplementationOnce(() => {
+      throw refused;
+    });
+
+    await expect(control(helpers).service.start()).rejects.toMatchObject({
+      name: 'GwsEaError',
+      code: 'service_start_failed',
+      message: `NanoClaw's service ${LABEL} did not start: ${refused.message}`,
+      cause: refused,
+    });
+  });
+});
+
 describe('refusals', () => {
   it.each(['start', 'restart'] as const)(
     '%s refuses when no service is installed, naming the command that installs it',

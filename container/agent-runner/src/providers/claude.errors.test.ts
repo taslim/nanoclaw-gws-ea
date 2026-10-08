@@ -48,7 +48,7 @@ afterEach(() => {
 });
 
 it.each([false, true])(
-  'reports a Claude SDK billing error to the host once, with prior reply=%s',
+  'reports a Claude SDK billing error to the host once, as a billing failure, with prior reply=%s',
   async (partialReply) => {
     sdkMessages.push({ type: 'system', subtype: 'init', session_id: 'billing-session' });
     if (partialReply) {
@@ -80,7 +80,14 @@ it.each([false, true])(
     // decides who is told, so nothing is written to the chat.
     expect(getUndeliveredMessages().map((row) => JSON.parse(row.content))).toEqual([
       ...(partialReply ? [{ text: 'Finished the first step.' }] : []),
-      { action: 'turn_failed', channelType: 'discord', platformId: 'chan-1', threadId: null, error: BILLING_ERROR },
+      {
+        action: 'turn_failed',
+        channelType: 'discord',
+        platformId: 'chan-1',
+        threadId: null,
+        error: BILLING_ERROR,
+        failure: 'billing',
+      },
     ]);
     expect(exchanges).toEqual([
       { prompt: 'continue', result: BILLING_ERROR, continuation: 'billing-session', status: 'error' },
@@ -164,9 +171,19 @@ it.each([
   expect(await resultEvents()).toEqual([{ type: 'result', text: result, isError: true, error: undefined }]);
 });
 
-it('keeps errors[] as the error when the SDK provides it', async () => {
+it('keeps errors[] as the error when the SDK provides it, naming a billing failure the API reports there', async () => {
   sdkMessages.push({ type: 'result', subtype: 'success', is_error: true, result: AUTH_ERROR, errors: [BILLING_ERROR] });
-  expect(await resultEvents()).toEqual([{ type: 'result', text: AUTH_ERROR, isError: true, error: BILLING_ERROR }]);
+  expect(await resultEvents()).toEqual([
+    { type: 'result', text: AUTH_ERROR, isError: true, error: BILLING_ERROR, failure: 'billing' },
+  ]);
+});
+
+it.each([
+  ['another API error type', '429 rate_limit_error: Number of requests has exceeded your rate limit'],
+  ['billing named only in the message', '500 api_error: upstream mentioned billing_error in passing'],
+])('names no failure for %s in errors[]', async (_label, error) => {
+  sdkMessages.push({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: [error] });
+  expect(await resultEvents()).toEqual([{ type: 'result', text: null, isError: true, error }]);
 });
 
 it('leaves a successful result untouched', async () => {

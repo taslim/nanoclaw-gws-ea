@@ -225,6 +225,12 @@ const SDK_NOTICES = new Map<string, { hint: string; failure?: ProviderFailure }>
   ['Prompt is too long', { hint: 'This conversation got too long. An admin can send /clear to start a new one.' }],
 ]);
 
+/**
+ * A billing failure the SDK reports in `errors[]` rather than as a fixed
+ * notice: `<status> billing_error: <message>`, the API's own error type.
+ */
+const BILLING_ERROR_ENTRY = /^\d{3} billing_error:/u;
+
 /** The real clock for archive names and rotation stamps; tests hand the history functions a fixed one. */
 const REAL_CLOCK = { now: () => Date.now() };
 
@@ -446,12 +452,15 @@ export class ClaudeProvider implements AgentProvider {
           // Notice first, hint on its own line: setup's ping shows only the first line.
           const notice = SDK_NOTICES.get(candidate);
           const resultAsError = notice ? `${candidate}\n${notice.hint}` : '';
+          const failure: ProviderFailure | undefined =
+            notice?.failure ??
+            (isError && m.errors?.some((entry) => BILLING_ERROR_ENTRY.test(entry.trim())) ? 'billing' : undefined);
           yield {
             type: 'result',
             text: resultAsError ? null : (m.result ?? null),
             isError,
             error: m.errors?.length ? m.errors.join('\n') : resultAsError || undefined,
-            ...(notice?.failure ? { failure: notice.failure } : {}),
+            ...(failure ? { failure } : {}),
           };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };

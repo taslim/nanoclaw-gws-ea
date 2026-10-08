@@ -14,8 +14,8 @@ export interface GoogleServiceScopes {
 
 /**
  * A Google service whose token reaches agents (KTD6): the host publishes it
- * as one gateway credential, which only the agent groups holding the
- * service's capability may use.
+ * as one gateway credential, and the service's capability decides which agent
+ * groups are taught to use it, with its skill and gog's commands for it.
  */
 export interface AgentGoogleService extends GoogleServiceScopes {
   /** The capability key (src/capabilities.ts) that grants the service. */

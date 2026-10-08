@@ -389,7 +389,7 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
       `Nothing to update: no assistant here can move to this tool's release ${short(next.commit)}.`,
       `Skipped ${notInstalled.instance_id}: No NanoClaw service is installed for it; gws-ea resume --id ${notInstalled.instance_id} installs it.`,
       `Skipped ${unmanaged.instance_id}: A NanoClaw host runs from its checkout outside its service (PID 4343). Stop that process and start it with gws-ea start --id ${unmanaged.instance_id}, then update it.`,
-      `Skipped ${unobserved.instance_id}: Its service could not be observed: The observation failed (EPERM).`,
+      `Skipped ${unobserved.instance_id}: Its service could not be observed: launchctl print failed`,
       `Skipped ${unreadable.instance_id}: Its update or rollback record cannot be read: Operation record is not valid JSON`,
     ]);
     expect(await Promise.all(machineFleet.assistants.map((runtime) => footprint(machineFleet, runtime)))).toEqual(
