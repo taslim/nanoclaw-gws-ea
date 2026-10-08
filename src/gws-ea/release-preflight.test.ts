@@ -135,7 +135,6 @@ async function releaseFixture(): Promise<string> {
   for (const file of [
     'index.ts',
     'migration.ts',
-    'migration-email-channel.ts',
     'thread-map.ts',
     'route-mail.ts',
     'pace.ts',
@@ -147,7 +146,6 @@ async function releaseFixture(): Promise<string> {
   }
   for (const file of [
     'src/modules/gws-ea-meetings/index.ts',
-    'src/modules/gws-ea-meetings/migration.ts',
     'src/modules/gws-ea-meetings/tools.ts',
     'src/modules/gws-ea-meetings/thread-calendar.ts',
     'src/modules/gws-ea-reminders/index.ts',
@@ -328,7 +326,6 @@ describe('release preflight', () => {
     ['external-email guidance', 'src/modules/gws-ea-external-email/guidance.md', 'incomplete_release'],
     ['GWS-EA inbox', 'src/modules/gws-ea-inbox/index.ts', 'incomplete_release'],
     ['GWS-EA inbox migration', 'src/modules/gws-ea-inbox/migration.ts', 'incomplete_release'],
-    ['GWS-EA email channel migration', 'src/modules/gws-ea-inbox/migration-email-channel.ts', 'incomplete_release'],
     ['GWS-EA thread map', 'src/modules/gws-ea-inbox/thread-map.ts', 'incomplete_release'],
     ['GWS-EA bridge', 'src/modules/gws-ea-external-email/bridge.ts', 'incomplete_release'],
     ['GWS-EA scheduling', 'src/modules/gws-ea-meetings/index.ts', 'incomplete_release'],

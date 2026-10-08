@@ -2,7 +2,7 @@
  * What each email thread placed on the principal's calendar (KTD7): its
  * bookings, which it alone may change or cancel; and the calendar its
  * bookings go on when `main` named one. The tables are described in
- * gws-ea-inbox/migration-email-channel.ts.
+ * gws-ea-inbox/migration.ts.
  *
  * Every timestamp is passed in as an ISO string; SQL never reads the clock.
  */

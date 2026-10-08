@@ -18,8 +18,8 @@
  * a group holding Google Calendar. Each request gets one `action_response`,
  * refusals included. The runner's tool for each carries the same name.
  *
- * The inbox registers this module's store, before its own email channel's
- * (KTD10).
+ * What a thread booked lives in the inbox's thread map (`thread-calendar.ts`);
+ * this module has no tables of its own.
  */
 import { answeredGuard, answeringAction, type ActionAnswer } from '../../cli/delivery-action.js';
 import { registerDeliveryAction } from '../../delivery.js';
