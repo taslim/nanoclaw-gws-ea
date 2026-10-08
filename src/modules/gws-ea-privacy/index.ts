@@ -185,14 +185,19 @@ function collectText(value: unknown, into: string[]): void {
     for (const item of Object.values(value)) collectText(item, into);
 }
 
-function parsedContent(content: string): unknown {
+/** Every string and number a send's message carries, whatever its shape; content that is not JSON is its own text. */
+export function messageStrings(content: string): string[] {
+  const parts: string[] = [];
+  let value: unknown = content;
   /* eslint-disable no-catch-all/no-catch-all -- content that is not JSON is checked as the plain text it is */
   try {
-    return JSON.parse(content);
+    value = JSON.parse(content);
   } catch {
-    return content;
+    // Plain text: checked as written.
   }
   /* eslint-enable no-catch-all/no-catch-all */
+  collectText(value, parts);
+  return parts;
 }
 
 /**
@@ -201,8 +206,7 @@ function parsedContent(content: string): unknown {
  * cannot read, a known residual alongside spelled-out values.
  */
 function sendText(send: OutboundSend): string[] {
-  const parts: string[] = [];
-  collectText(parsedContent(send.content), parts);
+  const parts = messageStrings(send.content);
   for (const file of send.files ?? []) {
     parts.push(file.filename);
     if (isUtf8(file.data)) parts.push(file.data.toString('utf8'));

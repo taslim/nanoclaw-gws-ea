@@ -17,33 +17,16 @@
  * agent can correct it in one step.
  */
 import { registerOutboundGuard, type OutboundGuardDecision, type OutboundSend } from '../../delivery.js';
+import { messageStrings } from '../gws-ea-privacy/index.js';
 import { weekdayRefusal } from './refusal.js';
 
 export { weekdayRefusal } from './refusal.js';
 
 export const WEEKDAY_GUARD_ID = 'gws-ea-dates:weekday';
 
-/** Every string in the serialized message, in order, whatever its shape. */
-function stringsOf(value: unknown, into: string[]): string[] {
-  if (typeof value === 'string') into.push(value);
-  else if (Array.isArray(value)) for (const item of value) stringsOf(item, into);
-  else if (typeof value === 'object' && value !== null) for (const item of Object.values(value)) stringsOf(item, into);
-  return into;
-}
-
-function parsed(content: string): unknown {
-  /* eslint-disable no-catch-all/no-catch-all -- content that is not JSON is read as the plain text it is */
-  try {
-    return JSON.parse(content);
-  } catch {
-    return content;
-  }
-  /* eslint-enable no-catch-all/no-catch-all */
-}
-
 /** The outbound guard: refuses a send whose words pair a weekday with a date it does not fall on. Files are not read. */
 export async function judgeDates(send: OutboundSend): Promise<OutboundGuardDecision> {
-  const reason = await weekdayRefusal(stringsOf(parsed(send.content), []));
+  const reason = await weekdayRefusal(messageStrings(send.content));
   return reason === undefined ? { effect: 'allow' } : { effect: 'refuse', reason };
 }
 

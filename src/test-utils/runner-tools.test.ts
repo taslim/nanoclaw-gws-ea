@@ -1,10 +1,9 @@
 /**
- * `unknownToolNames` against the instruction files for the runner's
- * time and reminder tools, and each agent's
- * email tools:
- * each should name only a tool the runner actually exports, or a word this
- * file's own not-tools list explicitly carves out as something else (a
- * request field, a sender, an outcome word, and so on).
+ * `unknownToolNames` against the instruction files for the runner's time and
+ * reminder tools, and each agent's email tools: each should name only a tool
+ * the runner actually exports, or a word this file's own not-tools list
+ * explicitly carves out as something else (a request field, a sender, an
+ * outcome word, and so on).
  */
 import fs from 'node:fs';
 import path from 'node:path';

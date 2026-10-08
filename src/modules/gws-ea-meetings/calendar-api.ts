@@ -422,38 +422,47 @@ function writeParams(event: EventWrite, sendUpdates: SendUpdates): URLSearchPara
 /** The real client, over the Calendar API. */
 export function createMeetingsCalendarApi(options: GoogleClientOptions): MeetingsCalendarApi {
   /**
-   * Every page of a calendar's events in the interval, recurring events
-   * expanded; a listing too long to read whole fails rather than coming back
-   * short, because a missing event looks exactly like free time.
+   * Every page of a Google list, read whole: a listing too long to read fails
+   * rather than coming back short, because a missing calendar or event would
+   * look exactly like an empty or free one.
    */
-  async function listPages<T>(
+  async function readAllPages<T>(
+    path: string,
+    params: Record<string, string>,
+    noun: 'event list' | 'calendar list',
+    toItem: (value: unknown) => T,
+  ): Promise<T[]> {
+    const items: T[] = [];
+    let pageToken: string | undefined;
+    for (let page = 0; page < MAX_PAGES; page += 1) {
+      const query = new URLSearchParams({ ...params, maxResults: '250' });
+      if (pageToken !== undefined) query.set('pageToken', pageToken);
+      const payload = await googleJson(options, `${CALENDAR_API}/${path}?${query.toString()}`);
+      if (!isRecord(payload)) throw new GoogleApiError(502, `Google Calendar returned an unreadable ${noun}`);
+      if (Array.isArray(payload.items)) items.push(...payload.items.map(toItem));
+      pageToken = optionalString(payload.nextPageToken);
+      if (pageToken === undefined) return items;
+    }
+    throw new GoogleApiError(
+      502,
+      `Google Calendar returned ${noun === 'event list' ? 'an' : 'a'} ${noun} too long to read`,
+    );
+  }
+
+  /** Every event in the interval, recurring events expanded. */
+  function listPages<T>(
     calendarId: string,
     timeMin: string,
     timeMax: string,
     fields: string,
     toItem: (value: unknown) => T,
   ): Promise<T[]> {
-    const events: T[] = [];
-    let pageToken: string | undefined;
-    for (let page = 0; page < MAX_PAGES; page += 1) {
-      const params = new URLSearchParams({
-        timeMin,
-        timeMax,
-        singleEvents: 'true',
-        maxResults: '250',
-        fields: `items(${fields}),nextPageToken`,
-      });
-      if (pageToken !== undefined) params.set('pageToken', pageToken);
-      const payload = await googleJson(
-        options,
-        `${CALENDAR_API}/calendars/${encodeURIComponent(calendarId)}/events?${params.toString()}`,
-      );
-      if (!isRecord(payload)) throw new GoogleApiError(502, 'Google Calendar returned an unreadable event list');
-      if (Array.isArray(payload.items)) events.push(...payload.items.map(toItem));
-      pageToken = optionalString(payload.nextPageToken);
-      if (pageToken === undefined) return events;
-    }
-    throw new GoogleApiError(502, 'Google Calendar returned an event list too long to read');
+    return readAllPages(
+      `calendars/${encodeURIComponent(calendarId)}/events`,
+      { timeMin, timeMax, singleEvents: 'true', fields: `items(${fields}),nextPageToken` },
+      'event list',
+      toItem,
+    );
   }
 
   return {
@@ -476,20 +485,7 @@ export function createMeetingsCalendarApi(options: GoogleClientOptions): Meeting
       return payload === undefined ? undefined : toEvent(payload);
     },
 
-    async listCalendars() {
-      const entries: CalendarEntry[] = [];
-      let pageToken: string | undefined;
-      for (let page = 0; page < MAX_PAGES; page += 1) {
-        const params = new URLSearchParams({ maxResults: '250' });
-        if (pageToken !== undefined) params.set('pageToken', pageToken);
-        const payload = await googleJson(options, `${CALENDAR_API}/users/me/calendarList?${params.toString()}`);
-        if (!isRecord(payload)) throw new GoogleApiError(502, 'Google Calendar returned an unreadable calendar list');
-        if (Array.isArray(payload.items)) entries.push(...payload.items.map(toCalendarEntry));
-        pageToken = optionalString(payload.nextPageToken);
-        if (pageToken === undefined) return entries;
-      }
-      throw new GoogleApiError(502, 'Google Calendar returned a calendar list too long to read');
-    },
+    listCalendars: () => readAllPages('users/me/calendarList', {}, 'calendar list', toCalendarEntry),
 
     listEvents: (calendarId, timeMin, timeMax) => listPages(calendarId, timeMin, timeMax, EVENT_FIELDS, toListedEvent),
 
