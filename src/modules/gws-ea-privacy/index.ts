@@ -32,13 +32,11 @@ import { gfm, gfmHtml } from 'micromark-extension-gfm';
 
 import { registerResource, type ColumnDef } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
-import { getAgentGroup } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
-import { getSession } from '../../db/sessions.js';
 import { registerOutboundGuard, type OutboundGuardDecision, type OutboundSend } from '../../delivery.js';
-import { ALLOW, DENY, defineGuardedAction, guard, HOLD, type GuardActor } from '../../guard/index.js';
-import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
+import { ALLOW, DENY, defineGuardedAction, guard, HOLD } from '../../guard/index.js';
+import { registerApprovalHandler } from '../approvals/index.js';
 import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from '../gws-ea-inbox/runtime.js';
 import {
   assertMainCaller,
@@ -46,6 +44,7 @@ import {
   isVerifiedPrincipalUser,
   principalApproverUserId,
 } from '../gws-ea-profile/db.js';
+import { guardActor, requestPrincipalConfirmation } from '../gws-ea-profile/principal-confirmation.js';
 import { resolveAudience, type Audience } from './audience.js';
 import { addPrivateValue, getPrivateValue, listPrivateValues, removePrivateValue, type PrivateValue } from './db.js';
 import {
@@ -255,27 +254,12 @@ const removePrivateValueAction = defineGuardedAction({
   },
 });
 
-function actorOf(ctx: CallerContext): GuardActor {
-  return ctx.caller === 'host'
-    ? { kind: 'host' }
-    : { kind: 'agent', agentGroupId: ctx.agentGroupId, sessionId: ctx.sessionId };
-}
-
 async function requestRemovalCard(ctx: CallerContext, value: PrivateValue, approverUserId: string | undefined) {
-  if (ctx.caller !== 'agent' || approverUserId === undefined) {
-    throw new Error('Only an agent removal is held for the principal');
-  }
-  const session = await getSession(ctx.sessionId);
-  if (!session) throw new Error('Session not found');
-  const agentName = (await getAgentGroup(ctx.agentGroupId))?.name ?? ctx.agentGroupId;
-  await requestApproval({
-    session,
-    agentName,
+  await requestPrincipalConfirmation(ctx, approverUserId, {
     action: REMOVAL_APPROVAL,
     payload: removalPayload(value.id),
     title: 'Stop protecting a private detail?',
-    question: `${agentName} asks to stop protecting your private ${KIND_NOUNS[value.kind]} "${value.label}". Once it is removed, the assistant may share it with people other than you.`,
-    approverUserId,
+    asks: `to stop protecting your private ${KIND_NOUNS[value.kind]} "${value.label}". Once it is removed, the assistant may share it with people other than you.`,
   });
   return {
     id: value.id,
@@ -386,7 +370,7 @@ registerResource({
         const id = stringArg(args, 'id');
         const value = await getPrivateValue(id);
         if (!value) throw new Error(`No private value ${JSON.stringify(id)} exists`);
-        const decision = await guard(removePrivateValueAction, { actor: actorOf(ctx), payload: { id } });
+        const decision = await guard(removePrivateValueAction, { actor: guardActor(ctx), payload: { id } });
         switch (decision.effect) {
           case 'allow':
             return { removed: await removePrivateValue(id) };

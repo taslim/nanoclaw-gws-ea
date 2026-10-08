@@ -250,9 +250,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     // Publish the batch's route so MCP tools (send_message, send_file) thread
     // replies into the conversation being answered and stamp in_reply_to for
-    // a2a return-path routing. Re-published at every turn boundary inside
-    // processQuery as later messages are answered.
-    publishReplyRoute(routing);
+    // a2a return-path routing, with the ids of the messages it answers for the
+    // host. Re-published at every turn boundary inside processQuery as later
+    // messages are answered.
+    publishReplyRoute(routing, processingIds);
     // Forward a loop stop to the ACTIVE query. The stream deliberately stays
     // open between turns, so the loop can be parked inside processQuery when
     // config.signal fires; without this, the "stopped" loop's query — and its
@@ -425,9 +426,12 @@ export async function processQuery(
   let answering = initialPrompt !== '';
   type QueuedTurn = {
     routing: RoutingContext;
+    /** The messages the turn answers; a retry answers the same ones as the turn it retries. */
+    messageIds: readonly string[];
     unwrappedNudged: boolean;
     taskBlockNudged: boolean;
   };
+  let turnMessageIds: readonly string[] = initialBatchIds;
   const queuedTurns: QueuedTurn[] = [];
   // A person waiting in a live chat is reminded of after a while if nothing has gone out (acknowledge.ts).
   const awaitAnswer = (): void => {
@@ -436,9 +440,10 @@ export async function processQuery(
   };
   const adoptTurn = (next: QueuedTurn): void => {
     Object.assign(routing, next.routing);
+    turnMessageIds = next.messageIds;
     unwrappedNudged = next.unwrappedNudged;
     taskBlockNudged = next.taskBlockNudged;
-    publishReplyRoute(routing);
+    publishReplyRoute(routing, turnMessageIds);
     answering = true;
     awaitAnswer();
   };
@@ -447,7 +452,7 @@ export async function processQuery(
   // Preserve its original route, prompt and retry guards until it is answered.
   const pushRetry = (prompt: string): void => {
     query.push(prompt);
-    queuedTurns.push({ routing: { ...routing }, unwrappedNudged, taskBlockNudged });
+    queuedTurns.push({ routing: { ...routing }, messageIds: turnMessageIds, unwrappedNudged, taskBlockNudged });
     archivePrompts.push(archivePrompts[0] ?? initialPrompt);
   };
 
@@ -541,6 +546,7 @@ export async function processQuery(
         archivePrompts.push(prompt);
         const next: QueuedTurn = {
           routing: extractRouting(keep),
+          messageIds: keptIds,
           unwrappedNudged: false,
           taskBlockNudged: false,
         };
@@ -1267,8 +1273,11 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
   });
 }
 
-/** Publish `routing` as the reply stamp the MCP tools read (null route clears it). */
-function publishReplyRoute(routing: RoutingContext): void {
+/**
+ * Publish `routing` as the reply stamp the MCP tools read, with the ids of the
+ * messages the turn answers, which the host reads (null route clears it).
+ */
+function publishReplyRoute(routing: RoutingContext, messageIds: readonly string[]): void {
   setCurrentReplyRoute(
     routing.inReplyTo
       ? {
@@ -1276,6 +1285,7 @@ function publishReplyRoute(routing: RoutingContext): void {
           channelType: routing.channelType,
           platformId: routing.platformId,
           threadId: routing.threadId,
+          messageIds,
         }
       : null,
   );

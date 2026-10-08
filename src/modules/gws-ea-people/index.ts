@@ -14,6 +14,7 @@ import { optionalString } from '../../gws-ea/validation.js';
 import { registerRequiredProjectDocSection, type RequiredProjectDocSection } from '../../project-doc-sections.js';
 import type { AgentGroup } from '../../types.js';
 import { assertMainCaller, getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { assertPrincipalProvenance } from '../gws-ea-profile/provenance.js';
 import {
   addPerson,
   addPersonInstruction,
@@ -69,6 +70,14 @@ async function asMain<T>(ctx: CallerContext, work: () => Promise<T>): Promise<T>
   return work();
 }
 
+/** A write, which counts as the principal's only in a turn answering the principal. */
+async function asMainWriting<T>(ctx: CallerContext, args: Record<string, unknown>, work: () => Promise<T>): Promise<T> {
+  return asMain(ctx, async () => {
+    await assertPrincipalProvenance(ctx, args.source);
+    return work();
+  });
+}
+
 function flag(name: string): string {
   return `--${name.replace(/_/g, '-')}`;
 }
@@ -90,7 +99,8 @@ const SOURCE_ARG: ColumnDef = {
   type: 'string',
   required: true,
   enum: [...CHANGE_SOURCES],
-  description: 'Who is making the change: principal for what the principal says, learned for what you derived.',
+  description:
+    'Who is making the change: principal for what the principal tells you in the message you are answering, learned for what you derived.',
 };
 const LEVEL_ARG: ColumnDef = {
   name: 'level',
@@ -221,7 +231,7 @@ registerResource({
         'ncl people add --name "Ann Ito" --level known --source principal --level-source learned --basis "Principal gave her address; no meetings yet" --identity ann@example.com --remembered-name Ann',
       ],
       handler: async (args, ctx) =>
-        asMain(ctx, async () =>
+        asMainWriting(ctx, args, async () =>
           addPerson({
             name: requiredString(args, 'name'),
             level: requiredString(args, 'level'),
@@ -258,7 +268,7 @@ registerResource({
         'ncl people update p-1a2b3c4d5e6f --source principal --add-remembered-name "Patty"',
       ],
       handler: async (args, ctx) =>
-        asMain(ctx, async () =>
+        asMainWriting(ctx, args, async () =>
           updatePerson({
             id: requiredString(args, 'id'),
             source: requiredString(args, 'source'),
@@ -281,7 +291,7 @@ registerResource({
       args: [ID_ARG, { ...LEVEL_ARG, required: true }, SOURCE_ARG, BASIS_ARG],
       examples: ['ncl people set-level p-1a2b3c4d5e6f --level close --source principal --basis "Said Pat is close"'],
       handler: async (args, ctx) =>
-        asMain(ctx, async () =>
+        asMainWriting(ctx, args, async () =>
           setPersonLevel({
             id: requiredString(args, 'id'),
             level: requiredString(args, 'level'),
@@ -301,7 +311,7 @@ registerResource({
       ],
       examples: ['ncl people instruct p-1a2b3c4d5e6f --text "Always make room for Pat" --source principal'],
       handler: async (args, ctx) =>
-        asMain(ctx, async () =>
+        asMainWriting(ctx, args, async () =>
           addPersonInstruction({
             id: requiredString(args, 'id'),
             text: requiredString(args, 'text'),
@@ -315,7 +325,7 @@ registerResource({
       args: [{ ...ID_ARG, description: 'The instruction, by its ID from `get`.' }, SOURCE_ARG],
       examples: ['ncl people unsay i-1a2b3c4d5e6f --source principal'],
       handler: async (args, ctx) =>
-        asMain(ctx, async () =>
+        asMainWriting(ctx, args, async () =>
           removePersonInstruction({ id: requiredString(args, 'id'), source: requiredString(args, 'source') }),
         ),
     },
@@ -326,7 +336,7 @@ registerResource({
       args: [ID_ARG, SOURCE_ARG],
       examples: ['ncl people forget p-1a2b3c4d5e6f --source principal'],
       handler: async (args, ctx) =>
-        asMain(ctx, async () =>
+        asMainWriting(ctx, args, async () =>
           forgetPerson({ id: requiredString(args, 'id'), source: requiredString(args, 'source') }),
         ),
     },

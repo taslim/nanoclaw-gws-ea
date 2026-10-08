@@ -261,6 +261,12 @@ function assertWritable(
   }
 }
 
+/** Protected time is the principal's alone: learning never sets, changes, or removes it. */
+function assertPrincipalProtects(source: PreferenceSource): void {
+  if (source !== 'principal')
+    throw new Error("Protected time is set and removed only on the principal's word: ask the principal.");
+}
+
 function newWindowId(): string {
   return `w-${randomBytes(4).toString('hex')}`;
 }
@@ -441,6 +447,7 @@ export async function setSchedulingPreference(input: SetPreferenceInput): Promis
         : { weekday, off: false, start: formatClock(range.start), end: formatClock(range.end), ...provenance };
     }
     case 'protected-window': {
+      assertPrincipalProtects(source);
       const weekdays = parseWeekdays(input.weekdays);
       const range = parseRange(input);
       const reason = parseReason(input.reason);
@@ -604,6 +611,7 @@ export async function removeSchedulingPreference(target: PreferenceTarget): Prom
       return { kind: target.kind, weekday };
     }
     case 'protected-window': {
+      assertPrincipalProtects(source);
       const id = target.id.trim();
       await removeRow(
         'gws_ea_pref_protected_windows',

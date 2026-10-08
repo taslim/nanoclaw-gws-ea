@@ -398,7 +398,7 @@ describe('GWS-EA scheduling preferences store', () => {
     expect((await getSchedulingPreferences()).working_hours).toEqual([]);
   });
 
-  it('identifies a protected window by its days and hours, so relearning it updates the same window', async () => {
+  it('identifies a protected window by its days and hours, so stating it again updates the same window', async () => {
     const lunch = await setSchedulingPreference({
       kind: 'protected-window',
       weekdays: ['mon', 'tue', 'wed', 'thu', 'fri'],
@@ -410,34 +410,23 @@ describe('GWS-EA scheduling preferences store', () => {
     });
     expect(lunch).toMatchObject({ id: expect.stringMatching(/^w-[0-9a-f]{8}$/), reason: 'Lunch with family.' });
 
-    await expect(
-      setSchedulingPreference({
-        kind: 'protected-window',
-        weekdays: ['fri', 'thu', 'wed', 'tue', 'mon'],
-        start: '12:00',
-        end: '13:00',
-        source: 'learned',
-        basis: 'Recurring lunch block.',
-      }),
-    ).rejects.toThrow(/set by the principal/i);
-
     const focus = await setSchedulingPreference({
       kind: 'protected-window',
       weekdays: ['fri'],
       start: '14:00',
       end: '17:00',
-      source: 'learned',
-      basis: 'Recurring focus block on Fridays.',
+      source: 'principal',
+      basis: 'Asked to keep Friday afternoons for focus.',
     });
-    const relearned = await setSchedulingPreference({
+    const restated = await setSchedulingPreference({
       kind: 'protected-window',
       weekdays: ['fri'],
       start: '14:00',
       end: '17:00',
-      source: 'learned',
-      basis: 'Recurring focus block on Fridays, eight of eight weeks.',
+      source: 'principal',
+      basis: 'Said Friday afternoons stay free.',
     });
-    expect(relearned.id).toBe(focus.id);
+    expect(restated.id).toBe(focus.id);
     expect(focus.reason).toBeNull();
 
     const moved = await setSchedulingPreference({
@@ -468,7 +457,7 @@ describe('GWS-EA scheduling preferences store', () => {
         weekdays: ['mon', 'tue', 'wed', 'thu', 'fri'],
         start: '12:30',
         end: '13:30',
-        source: 'learned',
+        source: 'principal',
         basis: 'Duplicate of lunch.',
       }),
     ).rejects.toThrow(/already protects/i);
@@ -486,6 +475,23 @@ describe('GWS-EA scheduling preferences store', () => {
     expect((await getSchedulingPreferences()).protected_windows.map((window) => window.id).sort()).toEqual(
       [lunch.id, focus.id, everyDay.id].sort(),
     );
+  });
+
+  it('never learns protected time: learning neither adds, changes, nor removes a window', async () => {
+    const window = { kind: 'protected-window', weekdays: ['fri'], start: '14:00', end: '17:00' } as const;
+    await expect(
+      setSchedulingPreference({ ...window, source: 'learned', basis: 'Recurring focus block on Fridays.' }),
+    ).rejects.toThrow("Protected time is set and removed only on the principal's word: ask the principal.");
+    expect((await getSchedulingPreferences()).protected_windows).toEqual([]);
+
+    const focus = await setSchedulingPreference({ ...window, source: 'principal', basis: 'Asked for focus time.' });
+    await expect(
+      setSchedulingPreference({ ...window, id: focus.id, start: '15:00', source: 'learned', basis: 'Starts later.' }),
+    ).rejects.toThrow(/only on the principal's word/);
+    await expect(
+      removeSchedulingPreference({ kind: 'protected-window', id: focus.id, source: 'learned' }),
+    ).rejects.toThrow(/only on the principal's word/);
+    expect((await getSchedulingPreferences()).protected_windows).toEqual([focus]);
   });
 
   it('reads the preference values without the basis and reason fields, which are marked main-only', async () => {

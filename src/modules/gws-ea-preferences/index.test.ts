@@ -1,6 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('../../config.js', async () => {
+  const actual = await vi.importActual<typeof import('../../config.js')>('../../config.js');
+  return { ...actual, DATA_DIR: '/tmp/nanoclaw-gws-ea-preferences-test/data' };
+});
 
 import { dispatch } from '../../cli/dispatch.js';
 import type { CallerContext } from '../../cli/frame.js';
@@ -11,6 +16,7 @@ import { composeGroupProjectDoc } from '../../project-doc-compose.js';
 import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
 import type { AgentGroup } from '../../types.js';
 import '../gws-ea-profile/index.js';
+import { answering, fromPrincipal, principalDmSession } from '../gws-ea-profile/testing/principal-turn.js';
 import { getSchedulingPreferences, setSchedulingPreference } from './db.js';
 import { MAIN_PREFERENCES_POINTER } from './index.js';
 
@@ -62,7 +68,7 @@ describe('GWS-EA preferences ncl resource', () => {
   });
 
   it('lets main set, read, and forget preferences, including their main-only basis and reason', async () => {
-    const caller = agent(main.id);
+    const caller = await answering(await principalDmSession(main.id), fromPrincipal('m-principal'));
 
     const hours = await run(
       'preferences-set',

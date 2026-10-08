@@ -83,13 +83,19 @@ export interface ReplyRoute {
   threadId: string | null;
 }
 
+/** The reply stamp as published: the turn's route, and the ids of every message in the batch it answers. */
+export interface ReplyStamp extends ReplyRoute {
+  messageIds: readonly string[];
+}
+
 /**
  * The reply stamp: the route of the first inbound message in the batch the
  * agent is currently processing. The poll loop publishes it at batch start;
  * MCP tools (`send_message`, `send_file`) read it to thread a reply into the
  * conversation being answered and to stamp `in_reply_to` onto outbound rows so
  * the host's a2a return-path routing can correlate replies back to the
- * originating session.
+ * originating session. The host reads `messageIds` to learn whose messages
+ * started the turn (principal provenance); the tools read only the route.
  *
  * This lives in mailbox state because the MCP server runs as a separate stdio
  * subprocess; module state set by the poll loop is invisible to it.
@@ -101,13 +107,13 @@ export interface ReplyRoute {
  */
 const REPLY_ROUTE_KEY = 'current_reply_route';
 
-export function setCurrentReplyRoute(route: ReplyRoute | null): void {
-  if (route === null) {
+export function setCurrentReplyRoute(stamp: ReplyStamp | null): void {
+  if (stamp === null) {
     clearCurrentReplyRoute();
     return;
   }
-  const { inReplyTo, channelType, platformId, threadId } = route;
-  setValue(REPLY_ROUTE_KEY, JSON.stringify({ inReplyTo, channelType, platformId, threadId }));
+  const { inReplyTo, channelType, platformId, threadId, messageIds } = stamp;
+  setValue(REPLY_ROUTE_KEY, JSON.stringify({ inReplyTo, channelType, platformId, threadId, messageIds }));
 }
 
 export function clearCurrentReplyRoute(): void {
