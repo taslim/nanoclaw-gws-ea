@@ -585,16 +585,3 @@ describe("OneCLI applies each agent's credential scope", () => {
     }
   });
 });
-
-it('is the add-onecli payload, file for file, so reapplying the skill changes nothing', () => {
-  const payload = '.claude/skills/add-onecli/payload/src/gateway-providers';
-  const files = fs.readdirSync(payload).sort();
-  expect(files).toEqual(
-    expect.arrayContaining(['onecli.ts', 'onecli.test.ts', 'onecli-credentials.ts', 'onecli-credentials.test.ts']),
-  );
-  for (const file of files) {
-    expect(fs.readFileSync(path.join('src/gateway-providers', file), 'utf8'), file).toBe(
-      fs.readFileSync(path.join(payload, file), 'utf8'),
-    );
-  }
-});

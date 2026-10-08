@@ -26,9 +26,13 @@ sandbox is outside gws-ea's egress identity.
 
 ## Gateway version
 
-GWS-EA pins its own OneCLI gateway in `src/gws-ea/versions.json`, ahead of the
-`add-onecli` skill's pin. The `1.42.0` pin includes the gateway-side
-host-enforcement fix: never import a real credential into a `1.41.0` runtime.
+GWS-EA pins its own OneCLI gateway in `src/gws-ea/versions.json`, independently
+of the `add-onecli` skill's pin and never older than it: NanoClaw moves that pin
+for security fixes, and `onecli-gateway-image.test.ts` fails if GWS-EA's falls
+behind. Both are `1.42.0`, which includes the gateway-side host-enforcement fix:
+never import a real credential into a `1.41.0` runtime. NanoClaw supports no
+OneCLI from 1.43 on, which removes the agent secret-assignment API; GWS-EA also
+sets main's agent secret mode, so check that API before moving past 1.42.
 Instance provisioning upgrades the gateway itself. Its generated, instance-owned
 runtime verifies the exact image, the health endpoints, the CLI and SDK cohort,
 and the isolated network topology before it accepts a real provider credential,
