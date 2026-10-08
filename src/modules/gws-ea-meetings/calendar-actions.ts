@@ -131,9 +131,10 @@ function alreadyWritten(current: CalendarEvent, event: NewEvent): boolean {
  * Create the event under its own id, telling its guests as `sendUpdates`
  * says, or find the one an earlier attempt made: restored if it was
  * deleted, corrected if its time or people differ, left alone if it already
- * says the same. Its guests heard of it from that first write, so finding it
- * emails nobody again, a correction included. An event under that id that
- * does not carry `owner`'s tag is never touched.
+ * says the same. Its guests heard of it from that first write, so a
+ * correction emails nobody again; a restore tells them as the first write
+ * did, since the last they heard was that it was cancelled. An event under
+ * that id that does not carry `owner`'s tag is never touched.
  */
 export async function ensureEvent(
   api: MeetingsCalendarApi,
@@ -161,7 +162,7 @@ export async function ensureEvent(
           ...(conference === undefined || current.conference !== undefined ? {} : { conference }),
           status: 'confirmed',
         },
-        'none',
+        deleted ? sendUpdates : 'none',
       );
     }
   }

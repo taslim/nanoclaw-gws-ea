@@ -54,4 +54,18 @@ describe('an event the assistant writes', () => {
       end: { dateTime: EVENT.end },
     });
   });
+
+  it('tells its guests again when a retry restores it: the last they heard was that it was cancelled', async () => {
+    const calendar = new FakeCalendar();
+    await ensureEvent(calendar, PRINCIPAL, 'intro01', EVENT, 'all', OWNER);
+    await calendar.deleteEvent(PRINCIPAL, 'intro01', 'all');
+    await ensureEvent(calendar, PRINCIPAL, 'intro01', EVENT, 'all', OWNER);
+
+    expect(calendar.writes.map(({ op, sendUpdates }) => ({ op, sendUpdates }))).toEqual([
+      { op: 'insert', sendUpdates: 'all' },
+      { op: 'delete', sendUpdates: 'all' },
+      { op: 'patch', sendUpdates: 'all' },
+    ]);
+    expect(calendar.event(PRINCIPAL, 'intro01')).toMatchObject({ status: 'confirmed' });
+  });
 });
