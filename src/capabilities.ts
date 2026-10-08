@@ -10,10 +10,9 @@
  * malformed list as no capabilities at all.
  *
  * Each key declares what it brings on the host — the tool-module instructions
- * the project document inlines, the shared skills that need it, and the
- * gateway credentials it lets an agent use — and core code keyed by the
- * exported constants applies its host effects (MCP servers, cross-session
- * context, the gateway skill, read-only surfaces). The runner
+ * the project document inlines and the shared skills that need it — and core
+ * code keyed by the exported constants applies its host effects (MCP servers,
+ * cross-session context, the gateway skill, read-only surfaces). The runner
  * maps the same keys to its own tools: Claude's built-ins in
  * container/agent-runner/src/providers/claude-config.ts and NanoClaw's tool
  * modules in container/agent-runner/src/mcp-tools/index.ts. Modules add keys
@@ -35,12 +34,6 @@ export interface CapabilityDef {
   instructions?: readonly string[];
   /** Shared container skills that need the key. A skill no key names needs `shell`. */
   skills?: readonly string[];
-  /**
-   * The gateway credentials, by connection name, the key lets an agent use.
-   * They bound only a group with an explicit list; a group on `all` keeps
-   * the gateway's own policy.
-   */
-  credentials?: readonly string[];
 }
 
 /** Keys whose host effects core applies directly. */
@@ -235,20 +228,6 @@ export function skillsWithinCapabilities(skills: readonly string[], grants: Read
     const needs = [...registry].filter(([, def]) => def.skills?.includes(skill)).map(([key]) => key);
     return (needs.length > 0 ? needs : [SHELL_CAPABILITY]).every((key) => grants.has(key));
   });
-}
-
-/**
- * The gateway credentials a group's held keys let its agent use: every one
- * a held key names, once each, in registry order. Applied only to a group
- * with an explicit list (see `CapabilityDef.credentials`).
- */
-export function credentialsWithinCapabilities(grants: ReadonlySet<string>): string[] {
-  const credentials = new Set<string>();
-  for (const [key, def] of registry) {
-    if (!grants.has(key)) continue;
-    for (const credential of def.credentials ?? []) credentials.add(credential);
-  }
-  return [...credentials];
 }
 
 /** Whether the agent is taught the selected gateway: credentials reach it only through commands it runs. */

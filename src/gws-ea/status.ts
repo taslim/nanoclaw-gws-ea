@@ -167,10 +167,7 @@ export interface AssistantProbes {
   readonly onecli: ProbeResult;
   /** Main as published, on the assistant's provider, with its OneCLI agent granted every secret. */
   readonly main_identity: ProbeResult & MainIdentityFacts;
-  /**
-   * external-email as the host stamped it, no destination joining it to main
-   * or reaching its inbox, and its OneCLI agent in selective mode.
-   */
+  /** external-email as the host stamped it, no destination joining it to main or reaching its inbox. */
   readonly external_email: ProbeResult & ExternalEmailFacts;
   /**
    * The assistant's inbox as the host reports it: polling healthy, and
@@ -722,15 +719,9 @@ async function mainIdentityProbe(
 
 /**
  * external-email as the running host reports it: as the host stamped it, with
- * no destination joining it to main or reaching its inbox. Its OneCLI agent,
- * which OneCLI creates at its first session, must be in selective mode: core
- * scopes it to the model provider's secret at every start and refuses a start
- * it cannot scope, so selective mode is what status can see of that.
+ * no destination joining it to main or reaching its inbox.
  */
-async function externalEmailProbe(
-  subject: Subject,
-  listAgents: () => Promise<readonly Record<string, unknown>[]>,
-): Promise<ProbeResult & ExternalEmailFacts> {
+async function externalEmailProbe(subject: Subject): Promise<ProbeResult & ExternalEmailFacts> {
   const runtime = requireRuntime(subject.runtime);
   const health = unwrapData(await subject.observers.ncl(runtime, ['gws-ea-external-email', 'health']));
   if (
@@ -748,12 +739,6 @@ async function externalEmailProbe(
   });
   if (health.problems.length > 0) return degraded(health.problems.map(sentence).join(' '));
   if (agentGroupId === null) return degraded('External-email has not been created.');
-  const agent = (await listAgents()).find((candidate) => candidate.identifier === agentGroupId);
-  if (agent && agent.secretMode !== 'selective') {
-    return degraded(
-      `External-email's OneCLI agent is granted ${optionalString(agent.secretMode) ?? 'no'} secrets, not only the model provider's.`,
-    );
-  }
   return { ...OK, agent_group_id: agentGroupId };
 }
 
@@ -1121,7 +1106,7 @@ export async function observeAssistantStatus(
     probe(() => hostProbe(subject), {}),
     probe(() => onecliProbe(subject), {}),
     probe<MainIdentityFacts>(() => mainIdentityProbe(subject, main, agents), { agent_group_id: null }),
-    probe<ExternalEmailFacts>(() => externalEmailProbe(subject, agents), { agent_group_id: null }),
+    probe<ExternalEmailFacts>(() => externalEmailProbe(subject), { agent_group_id: null }),
     probe<InboxFacts>(() => inboxProbe(subject), {
       state: null,
       since: null,

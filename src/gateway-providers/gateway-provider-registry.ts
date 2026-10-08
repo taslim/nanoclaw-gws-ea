@@ -41,32 +41,7 @@ export interface GatewaySessionInput {
    * composes containers checks `auxiliaryContainers` and degrades or refuses.
    */
   capabilities: DriverCapabilities;
-  /** Which stored credentials this session's agent may use, from its group's capabilities. */
-  credentialScope: GatewayCredentialScope;
 }
-
-/**
- * The stored credentials an agent may use, derived by core from the group's
- * capabilities at every spawn and adoption.
- *
- * `all` (a group stored as `all`) adds no restriction: the identity keeps
- * whatever the gateway's own policy grants it, and a provider must neither
- * widen nor narrow it on NanoClaw's behalf.
- *
- * `only` (a group with an explicit list) limits the identity to exactly the
- * named credentials (connection names, as in `GatewayCredentialTarget.name`)
- * plus those injected within the agent provider's model domains, a domain
- * covering its subdomains. A named credential the gateway does not hold is
- * simply not granted. Only a provider that declares
- * `sessions.enforcesCredentialScope` receives an `only` scope; core refuses
- * to start such a session on any other. A declaring provider applies the
- * scope before `ensure` returns, re-applies it on every call because the
- * gateway may have recreated the identity since, and fails `ensure` when it
- * cannot apply or verify it.
- */
-export type GatewayCredentialScope =
-  | { kind: 'all' }
-  | { kind: 'only'; credentials: readonly string[]; modelDomains: readonly string[] };
 
 export function gatewayRuntimeIdentity(key: SessionKey): string {
   return `${key.installSlug}/${key.agentGroupId}/${key.sessionId}`;
@@ -167,8 +142,6 @@ export interface GatewayProviderDefinition {
   sessions: {
     /** Idempotently creates or reconnects whatever this session needs; same call for new and adopted sessions. */
     ensure(input: GatewaySessionInput, signal: AbortSignal): Promise<GatewaySessionLease>;
-    /** Declares that `ensure` applies an `only` credential scope (see `GatewayCredentialScope`). */
-    enforcesCredentialScope?: true;
     /** Called after surviving sessions have been considered for adoption. */
     reapOrphans?(): void | Promise<void>;
   };
@@ -194,19 +167,6 @@ export interface GatewayProviderDefinition {
      */
     credentialScope?(destination: { host: string; method?: string }): Promise<'credential' | 'none'>;
   };
-}
-
-/**
- * Refuse to start a session whose capabilities restrict its credentials on a
- * gateway that does not declare it enforces the restriction: that gateway
- * would ignore the scope and give the agent everything its policy allows.
- */
-export function assertCredentialScopeEnforced(definition: GatewayProviderDefinition, input: GatewaySessionInput): void {
-  if (input.credentialScope.kind === 'all' || definition.sessions.enforcesCredentialScope === true) return;
-  throw new Error(
-    `Gateway '${definition.kind}' does not enforce credential scopes, so agent group ` +
-      `${input.groupName} (${input.key.agentGroupId}), whose capabilities restrict its credentials, cannot start`,
-  );
 }
 
 /** Not a union: installable gateway packages bring their own kinds. */

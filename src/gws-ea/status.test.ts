@@ -700,7 +700,7 @@ describe('status', () => {
     }
   });
 
-  it('reports external-email as the host reports it, and its OneCLI agent unless it is selective', async () => {
+  it('reports external-email as the host reports it', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
     await bound(host.paths, reservation.instance_id);
@@ -714,13 +714,6 @@ describe('status', () => {
     const ok = await statusJson(host, state, reservation.instance_id);
     expect(ok.status.probes.external_email).toEqual({ status: 'ok', reason: null, agent_group_id: EXTERNAL_EMAIL });
 
-    // Before its first session OneCLI has no agent for it, which is not a fault.
-    const unspawned = await statusJson(host, state, reservation.instance_id, {
-      ...healthy,
-      onecliAdmin: onecliAgents(ONECLI_AGENTS.filter((agent) => agent.identifier !== EXTERNAL_EMAIL)),
-    });
-    expect(unspawned.status.probes.external_email).toMatchObject({ status: 'ok' });
-
     const drifted = await statusJson(host, state, reservation.instance_id, {
       ...healthy,
       ncl: reporting({
@@ -731,18 +724,6 @@ describe('status', () => {
     expect(drifted.status.probes.external_email).toEqual({
       status: 'degraded',
       reason: 'Its configuration carries packages. Destination main -> helper joins main and external-email.',
-      agent_group_id: EXTERNAL_EMAIL,
-    });
-
-    const unscoped = await statusJson(host, state, reservation.instance_id, {
-      ...healthy,
-      onecliAdmin: onecliAgents(
-        ONECLI_AGENTS.map((agent) => (agent.identifier === EXTERNAL_EMAIL ? { ...agent, secretMode: 'all' } : agent)),
-      ),
-    });
-    expect(unscoped.status.probes.external_email).toEqual({
-      status: 'degraded',
-      reason: "External-email's OneCLI agent is granted all secrets, not only the model provider's.",
       agent_group_id: EXTERNAL_EMAIL,
     });
 

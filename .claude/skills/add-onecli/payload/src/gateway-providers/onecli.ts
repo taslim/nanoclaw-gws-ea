@@ -14,7 +14,6 @@ import {
   type GatewayApprovalDecision,
   type GatewayApprovalScope,
   type GatewayContribution,
-  type GatewayCredentialScope,
   type GatewaySessionInput,
   type GatewaySessionLease,
 } from './gateway-provider-registry.js';
@@ -131,137 +130,12 @@ function authHeaders(): Record<string, string> {
   };
 }
 
-/**
- * One call to OneCLI's management API. A failure is named by route and status
- * alone: OneCLI responses can preview secrets, and a parse error quotes them.
- */
-async function management(method: 'GET' | 'PUT' | 'PATCH', route: string, body?: unknown): Promise<unknown> {
-  if (!onecliUrl) throw new Error('OneCLI credential scope cannot be applied: ONECLI_URL is not configured');
-  const response = await fetch(`${onecliUrl.replace(/\/+$/, '')}${route}`, {
-    method,
-    headers: { ...authHeaders(), ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    signal: AbortSignal.timeout(15_000),
-    redirect: 'error',
-  }).catch(() => undefined);
-  if (!response) throw new Error(`OneCLI ${method} ${route} did not answer`);
-  if (!response.ok) throw new Error(`OneCLI ${method} ${route} failed (${response.status})`);
-  if (method !== 'GET') return undefined;
-  const read = await response.json().then(
-    (value: unknown) => ({ value }),
-    () => undefined,
-  );
-  if (!read) throw new Error(`OneCLI ${method} ${route} returned unreadable data`);
-  return read.value;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
-/** The one OneCLI agent that is `agentGroupId`, with its secret mode. */
-async function agentFor(agentGroupId: string): Promise<{ id: string; secretMode: string }> {
-  const agents = await management('GET', '/v1/agents');
-  if (!Array.isArray(agents) || !agents.every(isRecord)) throw new Error('OneCLI returned an unreadable agent list');
-  const matches = agents.filter((agent) => agent.identifier === agentGroupId);
-  if (matches.length === 0) throw new Error(`OneCLI has no agent for ${agentGroupId}`);
-  if (matches.length > 1) throw new Error(`${matches.length} agents claim ${agentGroupId} in OneCLI`);
-  const [agent] = matches;
-  if (typeof agent!.id !== 'string' || !agent!.id || typeof agent!.secretMode !== 'string') {
-    throw new Error(`OneCLI returned an unreadable agent for ${agentGroupId}`);
-  }
-  return { id: agent!.id, secretMode: agent!.secretMode };
-}
-
-async function assignedSecrets(agentId: string): Promise<Set<string>> {
-  const ids = await management('GET', `/v1/agents/${encodeURIComponent(agentId)}/secrets`);
-  if (!Array.isArray(ids) || !ids.every((id): id is string => typeof id === 'string')) {
-    throw new Error('OneCLI returned an unreadable secret assignment');
-  }
-  return new Set(ids);
-}
-
-/** Whether a host pattern lies within one of the model provider's domains (a domain covers its subdomains). */
-function withinModelDomains(hostPattern: string, domains: readonly string[]): boolean {
-  const host = hostPattern.startsWith('*.') ? hostPattern.slice(2) : hostPattern;
-  return domains.some((domain) => host === domain || host.endsWith(`.${domain}`));
-}
-
-/**
- * Drop the gateway's cached connect decisions for this project. The gateway
- * caches each agent's resolved injections per host for up to a minute, and
- * OneCLI's agent routes do not flush that cache, so without this a narrowed
- * identity could keep its wider access until the entries expire.
- */
-async function flushGatewayDecisions(signal: AbortSignal): Promise<void> {
-  const headers = authHeaders();
-  const gatewayUrl = await resolveGatewayUrl(headers, signal);
-  const response = await fetch(`${gatewayUrl}/v1/cache/invalidate`, {
-    method: 'POST',
-    headers,
-    signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
-    redirect: 'error',
-  }).catch(() => undefined);
-  if (!response?.ok) {
-    throw new Error(
-      `OneCLI's gateway did not flush its cached credential decisions${response ? ` (${response.status})` : ''}`,
-    );
-  }
-}
-
-/**
- * Restrict the agent to its scope before it runs. An `only` scope puts the
- * agent in selective mode with exactly the named secrets and the model
- * provider's, correcting an identity OneCLI (re)created in its default mode,
- * verifies the result, and flushes the gateway's cached decisions; anything
- * it cannot do fails the spawn. An `all` scope leaves the agent's mode to
- * OneCLI's own policy.
- */
-async function applyCredentialScope(
-  agentGroupId: string,
-  scope: GatewayCredentialScope,
-  signal: AbortSignal,
-): Promise<void> {
-  if (scope.kind === 'all') return;
-  const [agent, vault] = await Promise.all([agentFor(agentGroupId), management('GET', '/v1/secrets')]);
-  if (!Array.isArray(vault) || !vault.every(isRecord)) throw new Error('OneCLI returned unreadable secret metadata');
-  const wanted = new Set<string>();
-  for (const name of scope.credentials) {
-    const named = vault.filter((secret) => secret.name === name);
-    if (named.length > 1) throw new Error(`OneCLI holds ${named.length} secrets named ${name}; refusing to choose`);
-    if (typeof named[0]?.id === 'string') wanted.add(named[0].id);
-    else log.warn('A credential in the agent group scope is not in OneCLI', { agentGroupId, credential: name });
-  }
-  for (const secret of vault) {
-    if (
-      typeof secret.id === 'string' &&
-      typeof secret.hostPattern === 'string' &&
-      withinModelDomains(secret.hostPattern, scope.modelDomains)
-    ) {
-      wanted.add(secret.id);
-    }
-  }
-  const same = (held: ReadonlySet<string>) => held.size === wanted.size && [...wanted].every((id) => held.has(id));
-  const route = `/v1/agents/${encodeURIComponent(agent.id)}`;
-  if (!same(await assignedSecrets(agent.id))) await management('PUT', `${route}/secrets`, { secretIds: [...wanted] });
-  if (agent.secretMode !== 'selective') await management('PATCH', `${route}/secret-mode`, { mode: 'selective' });
-  const verified = await agentFor(agentGroupId);
-  if (verified.id !== agent.id || verified.secretMode !== 'selective' || !same(await assignedSecrets(agent.id))) {
-    throw new Error(`OneCLI credential scope for ${agentGroupId} did not take`);
-  }
-  await flushGatewayDecisions(signal);
-  log.info('OneCLI credential scope applied', { agentGroupId, credentials: scope.credentials, secrets: wanted.size });
-}
-
 async function ensureSession(input: GatewaySessionInput, signal: AbortSignal): Promise<GatewaySessionLease> {
   // The OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
   if (input.disposition !== 'adopt') {
     await onecli.ensureAgent({ name: input.groupName, identifier: input.key.agentGroupId });
   }
-  // Every spawn and adoption, before the agent can run: OneCLI may have
-  // recreated the identity in its default mode since the last one.
-  await applyCredentialScope(input.key.agentGroupId, input.credentialScope, signal);
   const config = await onecli.getContainerConfig({ agent: input.key.agentGroupId });
   log.info('OneCLI gateway applied', { agentGroupId: input.key.agentGroupId, sessionId: input.key.sessionId });
   return {
@@ -471,6 +345,6 @@ registerGatewayProvider({
       createProviderCredentialConnection(target, { url: onecliUrl, apiKey: onecliApiKey, projectId: onecliProjectId }),
   },
   agentSkills: ['onecli-gateway'],
-  sessions: { ensure: ensureSession, enforcesCredentialScope: true },
+  sessions: { ensure: ensureSession },
   approvals: { legacyActions: ['onecli_credential'], subscribe: subscribeApprovals },
 });
