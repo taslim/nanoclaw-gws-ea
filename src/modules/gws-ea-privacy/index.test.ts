@@ -49,25 +49,14 @@ import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
 import '../gws-ea-profile/index.js';
 import '../gws-ea-inbox/index.js';
-import { createThread, recordThreadAddresses } from '../gws-ea-inbox/thread-map.js';
-import {
-  audienceForAddresses,
-  checkOutbound,
-  listPrivateValues,
-  MAX_REFUSALS_PER_THREAD,
-  registerRecipientResolver,
-  resumeThread,
-  THREAD_STOPPED_SIGNAL,
-} from './index.js';
+import { audienceForAddresses, checkOutbound, listPrivateValues, registerRecipientResolver } from './index.js';
 
 const TEST_DIR = '/tmp/nanoclaw-test-gws-ea-privacy';
 const PRINCIPAL = 'gchat:users/principal';
 const DM = { channelType: 'gchat', platformId: 'gchat:spaces/dm' } as const;
 const THREAD = { channelType: 'email', platformId: 'email:thread-1' } as const;
-const OTHER_THREAD = { channelType: 'email', platformId: 'email:thread-2' } as const;
 const HOME = '123 Main Street, Springfield';
 const JUNO = 'juno@example.com';
-const SAM = 'sam@acme.test';
 const HOME_LABEL = 'Home';
 
 interface Sent {
@@ -82,7 +71,6 @@ let sent: Sent[];
 let guarded: ChannelDeliveryAdapter;
 let main: Session;
 let external: Session;
-let externalOther: Session;
 
 function now(): string {
   return new Date().toISOString();
@@ -191,7 +179,6 @@ beforeEach(async () => {
   for (const [id, route, isGroup] of [
     ['mg-dm', DM, 0],
     ['mg-email', THREAD, 0],
-    ['mg-email-2', OTHER_THREAD, 0],
   ] as const) {
     await createMessagingGroup({
       id,
@@ -217,7 +204,6 @@ beforeEach(async () => {
 
   main = (await resolveSession('ag-main', 'mg-dm', null, 'agent-shared')).session;
   external = (await resolveSession('ag-external', 'mg-email', null, 'shared')).session;
-  externalOther = (await resolveSession('ag-external', 'mg-email-2', null, 'shared')).session;
 });
 
 afterEach(async () => {
@@ -407,19 +393,6 @@ describe('the audience check on delivery', () => {
     expect(texts()).toEqual(['They asked to meet at 123 Main St, Springfield.']);
   });
 
-  it('refuses a value split across two messages in one thread, but not across two threads', async () => {
-    await addHome();
-    queue(external, { id: 'part-1', route: THREAD, content: { text: 'We could meet at 123' } });
-    queue(external, { id: 'part-2', route: THREAD, content: { text: 'Main Street if that suits.' } });
-    await deliverSessionMessages(external);
-    expect(texts()).toEqual(['We could meet at 123']);
-    expect(notes(external)).toEqual([expect.stringMatching(/^Your message was not sent: .*address/)]);
-
-    queue(externalOther, { id: 'other-1', route: OTHER_THREAD, content: { text: 'Main Street if that suits.' } });
-    await deliverSessionMessages(externalOther);
-    expect(texts()).toEqual(['We could meet at 123', 'Main Street if that suits.']);
-  });
-
   it('refuses a private value in a subject line', async () => {
     await addHome();
     queue(external, {
@@ -431,92 +404,33 @@ describe('the audience check on delivery', () => {
     expect(sent).toEqual([]);
   });
 
-  it('stops a thread after repeated refusals, signals main once, says main was told, and leaves other threads alone', async () => {
+  it('refuses every send that carries a value and keeps sending the rest: no thread stops, and main hears nothing', async () => {
     await addHome();
-    for (let attempt = 1; attempt <= MAX_REFUSALS_PER_THREAD; attempt++) {
+    for (let attempt = 1; attempt <= 4; attempt++) {
       queue(external, { id: `leak-${attempt}`, route: THREAD, content: { text: `Try ${attempt}: 123 Main St` } });
       await deliverSessionMessages(external);
     }
     expect(sent).toEqual([]);
-    const refusals = notes(external);
-    expect(refusals).toHaveLength(MAX_REFUSALS_PER_THREAD);
-    // The signal goes to main, so the sender is told main knows, not the principal.
-    expect(refusals.at(-1)).toMatch(
-      /now stopped after repeated attempts\. Send nothing more in it; main has been told\.$/,
-    );
+    expect(notes(external)).toEqual(Array(4).fill(expect.stringMatching(/^Your message was not sent: .*address/)));
 
-    const signals = inbound(main).filter(
-      (row) => (JSON.parse(row.content) as { signal?: { type?: string } }).signal?.type === THREAD_STOPPED_SIGNAL,
-    );
-    expect(signals).toHaveLength(1);
-    expect(signals[0]).toMatchObject({ channel_type: DM.channelType, platform_id: DM.platformId });
-    const signal = JSON.parse(signals[0].content) as { text: string; signal: Record<string, unknown> };
-    expect(signal.signal).toMatchObject({ kind: 'address', refusals: MAX_REFUSALS_PER_THREAD });
-    // A conversation with no thread cannot be handed to again, so main reads that it stays stopped.
-    expect(signal.text).toBe(
-      "Nothing more will be sent in a conversation with someone other than Pat Doe: three times an email in it would have shared Pat Doe's private address, and each was stopped, so nothing private went out.",
-    );
-
-    queue(external, { id: 'clean-after-stop', route: THREAD, content: { text: 'Is Thursday still good?' } });
+    queue(external, { id: 'clean', route: THREAD, content: { text: 'Is Thursday still good?' } });
     await deliverSessionMessages(external);
-    expect(sent).toEqual([]);
-    expect(notes(external).at(-1)).toMatch(
-      /^Your message was not sent: this conversation is stopped .*Send nothing more in it; main has been told\.$/,
-    );
-    expect(inbound(main).filter((row) => row.content.includes(THREAD_STOPPED_SIGNAL))).toHaveLength(1);
-
-    queue(externalOther, { id: 'elsewhere', route: OTHER_THREAD, content: { text: 'Is Thursday still good?' } });
-    await deliverSessionMessages(externalOther);
     expect(texts()).toEqual(['Is Thursday still good?']);
+    expect(inbound(main)).toEqual([]);
   });
 
-  it("lets main's next handoff resume a stopped thread, its refusals counted afresh (R76)", async () => {
-    await addHome();
-    const { threadKey } = await createThread(null, now());
-    // Sam wrote to the principal and the assistant, and mentioned someone not in the conversation.
-    await recordThreadAddresses(threadKey, [SAM, 'pat@example.com', JUNO], 'message', now());
-    await recordThreadAddresses(threadKey, ['lee@acme.test'], 'written', now());
-    const key = { ...THREAD, threadId: threadKey };
-    for (let attempt = 1; attempt <= MAX_REFUSALS_PER_THREAD; attempt++) {
-      queue(external, {
-        id: `leak-${attempt}`,
-        route: THREAD,
-        threadId: key.threadId,
-        content: { text: '123 Main St' },
-      });
-      await deliverSessionMessages(external);
-    }
-    const [signal] = inbound(main).filter((row) => row.content.includes(THREAD_STOPPED_SIGNAL));
-    expect((JSON.parse(signal.content) as { text: string }).text).toBe(
-      `Sending is paused in the conversation with ${SAM}: three times an email in it would have shared Pat Doe's private address, ` +
-        `and each was stopped, so nothing private went out. Your next handoff to it resumes it. (thread ${threadKey})`,
-    );
-
-    expect(await resumeThread(key)).toBe(true);
-    expect(await resumeThread(key)).toBe(false);
-    queue(external, {
-      id: 'after-resume',
-      route: THREAD,
-      threadId: key.threadId,
-      content: { text: 'Is Thursday good?' },
-    });
-    queue(external, { id: 'leak-again', route: THREAD, threadId: key.threadId, content: { text: '123 Main St' } });
-    queue(external, { id: 'still-going', route: THREAD, threadId: key.threadId, content: { text: 'Or Friday?' } });
-    await deliverSessionMessages(external);
-    expect(texts()).toEqual(['Is Thursday good?', 'Or Friday?']);
-    expect(await resumeThread({ ...THREAD, threadId: 'mail-never-stopped' })).toBe(false);
-  });
-
-  it('judges a retried send without its own earlier attempt', async () => {
+  // Codex finding 11: a thread history written before the channel took the
+  // send read an email that never went out as one its reader had seen.
+  it('leaves nothing of a send the channel failed to refuse a later one by', async () => {
     await addHome();
     let failures = 1;
     channel(() => failures-- > 0);
-    // Alone it holds no value; read twice in a row it would spell "123 Main St".
-    queue(external, { id: 'retry-1', route: THREAD, content: { text: 'St. Patrick day works; I am near 123 Main' } });
+    queue(external, { id: 'failed-1', route: THREAD, content: { text: 'We could meet at 123' } });
     await deliverSessionMessages(external);
     expect(sent).toEqual([]);
+    queue(external, { id: 'next-1', route: THREAD, content: { text: 'Main Street if that suits.' } });
     await deliverSessionMessages(external);
-    expect(texts()).toEqual(['St. Patrick day works; I am near 123 Main']);
+    expect(texts().sort()).toEqual(['Main Street if that suits.', 'We could meet at 123']);
     expect(notes(external)).toEqual([]);
   });
 

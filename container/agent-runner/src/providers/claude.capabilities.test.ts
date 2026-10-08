@@ -230,6 +230,24 @@ describe('the pinned SDK offers only granted built-in tools', () => {
     expect(offered).toContain('Skill');
   }, 60_000);
 
+  // external-email's exact list (src/modules/gws-ea-external-email/group.ts).
+  // Nothing it is offered writes a file, so nothing it does can place a
+  // settings file, skill or hook that Claude Code would load.
+  it("offers external-email's list only tools that read, plus its own", async () => {
+    const offered = await wireTools(
+      await optionsFor(['files-read', 'time', 'request-status', 'gws-ea-reminders', 'gws-ea-email-external']),
+    );
+
+    expect(offered.filter((tool) => !tool.startsWith('mcp__'))).toEqual(
+      ['Glob', 'Grep', 'Read', 'Skill', 'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'ToolSearch'].filter(
+        (tool) => offered.includes(tool),
+      ),
+    );
+    for (const tool of ['Write', 'Edit', 'NotebookEdit', 'Bash', 'WebFetch', 'WebSearch', 'Agent', 'Task']) {
+      expect(offered).not.toContain(tool);
+    }
+  }, 60_000);
+
   it("offers a group holding every key exactly today's tools", async () => {
     const today = await wireTools(baselineOptions());
 

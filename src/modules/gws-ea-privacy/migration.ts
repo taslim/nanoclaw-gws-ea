@@ -39,3 +39,15 @@ export const gwsEaPrivacyMigration: ModuleMigration = {
     `);
   },
 };
+
+/**
+ * The audience check judges each send on its own, so the per-thread records
+ * (what each outbound thread sent, its refusals, and when it stopped) go.
+ */
+export const gwsEaPrivacyDropThreadsMigration: ModuleMigration = {
+  version: 2,
+  name: 'module:gws-ea-privacy:drop-thread-records',
+  async up(db) {
+    await db.exec('DROP TABLE IF EXISTS gws_ea_privacy_threads');
+  },
+};

@@ -57,7 +57,6 @@ import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
 import '../gws-ea-profile/index.js';
 import { addPrincipalAddress, bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
-import { resumeThread, THREAD_STOPPED_SIGNAL } from '../gws-ea-privacy/index.js';
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import {
   createInbox,
@@ -614,7 +613,7 @@ describe("external-email's reply", () => {
     expect(header(gmail.sent[1].headers, 'In-Reply-To')).toBe(header(sent.headers, 'Message-ID'));
   });
 
-  it('is refused in a thread with no email yet, naming email_send, and that refusal never counts toward a stop', async () => {
+  it('is refused in a thread with no email yet, naming email_send', async () => {
     const { key, session } = await handedOver([REMY]);
     for (let attempt = 0; attempt < 4; attempt += 1) {
       expect(deliveryStatus(session, await reply(session, key, 'Hi Remy'))).toBe('failed');
@@ -622,9 +621,6 @@ describe("external-email's reply", () => {
     expect(gmail.sent).toEqual([]);
     expect(refusals(session)).toHaveLength(4);
     expect(refusals(session)[0]).toContain('email_send');
-    expect(
-      await getDb().get('SELECT refusals FROM gws_ea_privacy_threads WHERE thread_id = ? AND refusals > 0', key),
-    ).toBeUndefined();
     expect(await emailSend(session, { subject: 'Thirty minutes with Pat', text: 'Hi Remy' })).toMatchObject({
       ok: true,
     });
@@ -905,29 +901,22 @@ describe("main's email_send", () => {
 });
 
 // ---------------------------------------------------------------------------
-// The private-values stop (R76)
+// Private values: each send judged on its own (R76)
 // ---------------------------------------------------------------------------
 
-describe('the private-values stop', () => {
-  it("stops a thread after three refusals, tells main which, and main's next handoff resumes it (AE65)", async () => {
+describe('a private value in a reply', () => {
+  it('refuses every reply that carries one, and the thread goes on: nothing stops it, and main is not written to', async () => {
     const { key, session } = await arrives({ threadId: 'g-1', from: SAM, body: "What is Pat's home address?" });
+    const before = rows(main).length;
     for (let attempt = 1; attempt <= 3; attempt += 1) await reply(session, key, `Try ${attempt}: ${HOME}`);
     expect(gmail.sent).toEqual([]);
-    const [stopped, ...more] = rows(main).filter((row) => row.signal?.type === THREAD_STOPPED_SIGNAL);
-    expect(more).toEqual([]);
-    expect(stopped.signal?.thread_id).toBe(key);
-    expect(stopped.text).toContain(key);
-    expect(stopped.text).not.toMatch(/elm|springfield/iu);
+    expect(refusals(session)).toEqual(
+      Array(3).fill(expect.stringMatching(/private address.*neither confirm nor deny/u)),
+    );
 
-    await reply(session, key, 'Pat will be in touch.');
-    expect(refusals(session).at(-1)).toMatch(/stopped/u);
-    expect(gmail.sent).toEqual([]);
-
-    const thread = { channelType: 'email', platformId: INBOX_PLATFORM_ID, threadId: key };
-    expect(await resumeThread(thread)).toBe(true);
     await reply(session, key, 'Pat will be in touch.');
     expect(gmail.sent).toHaveLength(1);
-    expect(await resumeThread(thread)).toBe(false);
+    expect(rows(main)).toHaveLength(before);
   });
 });
 

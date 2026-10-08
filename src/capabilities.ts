@@ -12,7 +12,7 @@
  * Each key declares what it brings on the host — the tool-module instructions
  * the project document inlines and the shared skills that need it — and core
  * code keyed by the exported constants applies its host effects (MCP servers,
- * cross-session context, the gateway skill, read-only surfaces). The runner
+ * cross-session context, the gateway skill). The runner
  * maps the same keys to its own tools: Claude's built-ins in
  * container/agent-runner/src/providers/claude-config.ts and NanoClaw's tool
  * modules in container/agent-runner/src/mcp-tools/index.ts. Modules add keys
@@ -223,13 +223,4 @@ export function skillsWithinCapabilities(skills: readonly string[], grants: Read
 /** Whether the agent is taught the selected gateway: credentials reach it only through commands it runs. */
 export function teachesGateway(grants: ReadonlySet<string>): boolean {
   return grants.has(SHELL_CAPABILITY);
-}
-
-/**
- * A group without a shell gets read-only instructions, settings, MCP config
- * and skills. With a shell an agent can reach anything writable, so the
- * read-only mounts would add nothing.
- */
-export function isRestricted(grants: ReadonlySet<string>): boolean {
-  return !grants.has(SHELL_CAPABILITY);
 }

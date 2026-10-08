@@ -51,6 +51,8 @@ const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
 const REQUIRED_GUIDANCE = [
   'You are `external-email`: the assistant as everyone outside sees it.',
   "the principal's calendar, their people and their private life stay with main.",
+  // The private-values check refuses a value; this keeps a refusal from ever telling anyone which guess was right.
+  "Whether someone's guess is right is private too, so don't repeat, confirm or correct one.",
   // Voice (R61, R78): written to the person, from their side.
   'Write as a great human assistant writes: to the person, from their side, in their register.',
   'Read the whole thread before you write.',

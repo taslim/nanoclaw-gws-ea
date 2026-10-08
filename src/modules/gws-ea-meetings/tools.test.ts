@@ -1201,35 +1201,16 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
 });
 
 describe('forgetting a person', () => {
-  /** The privacy check's record of a thread, as a refusal leaves it. */
-  async function privacyRecord(threadKey: string): Promise<void> {
-    await getDb().run(
-      `INSERT INTO gws_ea_privacy_threads (channel_type, platform_id, thread_id, recent, refusals, stopped_at, updated_at)
-       VALUES ('email', 'email:inbox', ?, '[]', 1, NULL, ?)`,
-      threadKey,
-      now(),
-    );
-  }
-
-  async function privacyRecords(): Promise<string[]> {
-    const rows = await getDb().all<{ thread_id: string }>(
-      'SELECT thread_id FROM gws_ea_privacy_threads ORDER BY thread_id',
-    );
-    return rows.map((row) => row.thread_id);
-  }
-
   async function addressesOf(threadKey: string): Promise<string[]> {
     return (await threadAddresses(threadKey)).map((entry) => entry.address).sort();
   }
 
-  it("releases their threads' holds first, then purges those threads' sessions and privacy records, then their addresses", async () => {
+  it("releases their threads' holds first, then purges those threads' sessions, then their addresses", async () => {
     const secrets = path.join(TEST_DIR, 'secrets');
     fs.mkdirSync(secrets, { mode: 0o700 });
     vi.stubEnv(GOOGLE_GRANT_FILE_ENV, path.join(secrets, 'google-grant.json'));
     data(await send(sessionA, 'hold', { starts: [TUESDAY_10AM, WEDNESDAY_10AM], minutes: 30 }));
     data(await send(sessionB, 'hold', { starts: [THURSDAY_10AM], minutes: 30 }));
-    await privacyRecord(threadA);
-    await privacyRecord(threadB);
     const remy = await addPerson({
       name: 'Remy',
       level: 'close',
@@ -1244,7 +1225,6 @@ describe('forgetting a person', () => {
     calendar.failure = undefined;
     expect(await listThreadHolds(threadA)).toHaveLength(2);
     expect(await getSession(sessionA.id)).toBeDefined();
-    expect(await privacyRecords()).toEqual([threadA, threadB].sort());
     expect(await addressesOf(threadA)).toContain(REMY);
 
     await forgetPerson({ id: remy.id, source: 'principal' });
@@ -1254,7 +1234,6 @@ describe('forgetting a person', () => {
     expect(await getSession(sessionA.id)).toBeUndefined();
     expect(fs.existsSync(path.dirname(inboundDbPath(sessionA.agent_group_id, sessionA.id)))).toBe(false);
     expect(await getSession(sessionB.id)).toBeDefined();
-    expect(await privacyRecords()).toEqual([threadB]);
     expect(await addressesOf(threadA)).toEqual([JANE, PRINCIPAL, JUNO].sort());
     expect(await addressesOf(threadB)).toEqual([JANE]);
     vi.unstubAllEnvs();

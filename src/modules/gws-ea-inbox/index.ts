@@ -48,7 +48,7 @@ import {
   gwsEaMeetingsMigration,
   gwsEaMeetingsRoomsMigration,
 } from '../gws-ea-meetings/migration.js';
-import { deleteThreadRecord, registerRecipientResolver } from '../gws-ea-privacy/index.js';
+import { registerRecipientResolver } from '../gws-ea-privacy/index.js';
 import { getMainAgentGroupId, syncPrincipalMembers } from '../gws-ea-profile/db.js';
 import { registerRoleGrantPolicy } from '../permissions/db/user-roles.js';
 import { registerInboundDelay } from '../../router.js';
@@ -166,7 +166,7 @@ async function purgeSession(sessionId: string, agentGroupId: string): Promise<vo
   await deleteSession(sessionId);
 }
 
-/** Remove the `external-email` sessions of these threads, and the privacy check's record of each. */
+/** Remove the `external-email` sessions of these threads. */
 async function purgeThreadSessions(threadKeys: readonly string[]): Promise<void> {
   const externalEmail = await getExternalEmailAgentGroupId();
   const threads = new Set(threadKeys);
@@ -175,14 +175,11 @@ async function purgeThreadSessions(threadKeys: readonly string[]): Promise<void>
       if (session.thread_id !== null && threads.has(session.thread_id)) await purgeSession(session.id, externalEmail);
     }
   }
-  for (const threadKey of threadKeys) {
-    await deleteThreadRecord({ channelType: EMAIL_CHANNEL_TYPE, platformId: INBOX_PLATFORM_ID, threadId: threadKey });
-  }
 }
 
 // A forgotten person leaves nothing of theirs on the threads they were on, in this order: the threads'
 // holds first, while their records still find each event, so one that cannot go yet stops the forget
-// to be tried again; then those threads' external-email sessions and privacy records; then the person's
+// to be tried again; then those threads' external-email sessions; then the person's
 // addresses on every thread, and their hourly counts.
 registerPersonForgetHook('gws-ea-inbox:purge', async ({ handles }) => {
   const db = getDb();

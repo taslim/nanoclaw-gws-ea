@@ -115,16 +115,6 @@ describe("external-email's Claude home", () => {
       expect(under(transcript, mount.hostPath), mount.containerPath).toBe(false);
       expect(under(mount.hostPath, groupHome), mount.containerPath).toBe(false);
     }
-    // Its skills directory stays read-only over the session's own home, and
-    // over the same directory where the writable session mount reaches it.
-    for (const containerPath of [`${CLAUDE_HOME}/skills`, '/workspace/.claude-shared/skills']) {
-      expect(b.find((mount) => mount.containerPath === containerPath)).toMatchObject({
-        hostPath: path.join(homeB.hostPath, 'skills'),
-        readonly: true,
-      });
-    }
-    const order = b.map((mount) => mount.containerPath);
-    expect(order.indexOf('/workspace/.claude-shared/skills')).toBeGreaterThan(order.indexOf('/workspace'));
   });
 });
 
