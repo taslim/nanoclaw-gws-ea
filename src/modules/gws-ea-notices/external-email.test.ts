@@ -14,14 +14,14 @@ import fs from 'node:fs';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const TEST_DIR = '/tmp/nanoclaw-test-gws-ea-external-email-failures';
+const TEST_DIR = '/tmp/nanoclaw-test-gws-ea-notices-external-email';
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual<typeof import('../../config.js')>('../../config.js');
   return {
     ...actual,
-    DATA_DIR: '/tmp/nanoclaw-test-gws-ea-external-email-failures',
-    GROUPS_DIR: '/tmp/nanoclaw-test-gws-ea-external-email-failures/groups',
+    DATA_DIR: '/tmp/nanoclaw-test-gws-ea-notices-external-email',
+    GROUPS_DIR: '/tmp/nanoclaw-test-gws-ea-notices-external-email/groups',
   };
 });
 

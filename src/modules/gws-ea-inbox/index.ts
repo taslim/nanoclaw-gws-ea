@@ -57,7 +57,7 @@ import { createCalendarListApi } from './calendar-notifications.js';
 import { createGmailApi } from './gmail-api.js';
 import { gwsEaInboxEmailChannelMigration } from './migration-email-channel.js';
 import { gwsEaInboxMigration } from './migration.js';
-import { EMAIL_SEND_ACTION, EMAIL_SEND_GUARD, emailSendHandler, outsideRecipients } from './outbound.js';
+import { EMAIL_SEND_ACTION, EMAIL_SEND_GUARD, emailSendHandler } from './outbound.js';
 import { paceDeadline } from './pace.js';
 import { principalRecipients } from './principal-reply.js';
 import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID } from './runtime.js';
@@ -96,8 +96,11 @@ registerChannelAdapter(EMAIL_CHANNEL_TYPE, {
   defaults: EMAIL_CHANNEL_DEFAULTS,
 });
 
+// Email to the principal is theirs when it goes only to their address. The
+// privacy guard leaves email to the inbox's outside threads to `sendToOutside`,
+// which checks it as it is built; any other email address reaches no one.
 registerRecipientResolver(EMAIL_CHANNEL_TYPE, (send) =>
-  send.platformId === PRINCIPAL_PLATFORM_ID ? principalRecipients(send) : outsideRecipients(send),
+  send.platformId === PRINCIPAL_PLATFORM_ID ? principalRecipients(send) : [],
 );
 
 registerDeliveryAction(EMAIL_SEND_ACTION, emailSendHandler, EMAIL_SEND_GUARD);

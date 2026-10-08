@@ -128,7 +128,7 @@ async function releaseFixture(): Promise<string> {
       2,
     ) + '\n',
   );
-  for (const file of ['index.ts', 'group.ts', 'destination-policy.ts', 'bridge.ts', 'failures.ts']) {
+  for (const file of ['index.ts', 'group.ts', 'destination-policy.ts', 'bridge.ts']) {
     await write(root, `src/modules/gws-ea-external-email/${file}`, 'export {};\n');
   }
   await write(root, 'src/modules/gws-ea-external-email/guidance.md', '# external-email\n');
@@ -331,7 +331,6 @@ describe('release preflight', () => {
     ['GWS-EA email channel migration', 'src/modules/gws-ea-inbox/migration-email-channel.ts', 'incomplete_release'],
     ['GWS-EA thread map', 'src/modules/gws-ea-inbox/thread-map.ts', 'incomplete_release'],
     ['GWS-EA bridge', 'src/modules/gws-ea-external-email/bridge.ts', 'incomplete_release'],
-    ['external-email failures', 'src/modules/gws-ea-external-email/failures.ts', 'incomplete_release'],
     ['GWS-EA scheduling', 'src/modules/gws-ea-meetings/index.ts', 'incomplete_release'],
     ['GWS-EA scheduling tools', 'src/modules/gws-ea-meetings/tools.ts', 'incomplete_release'],
     ['GWS-EA reminders', 'src/modules/gws-ea-reminders/index.ts', 'incomplete_release'],

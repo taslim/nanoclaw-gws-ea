@@ -116,6 +116,42 @@ describe('the body', () => {
     expect(email.html).not.toContain('plan.png');
   });
 
+  it('says in the text part every word the HTML part shows, in order, with no markdown left', () => {
+    const markdown = [
+      'Hi [Remy][r], see the **plan**[^1] and ~~old~~ _new_ times:',
+      '',
+      '| Day | Time |',
+      '| --- | --- |',
+      '| Tue | `10:00` |',
+      '',
+      '1. First',
+      '   - [x] booked',
+      '2. Second',
+      '',
+      '> Quoted *line*',
+      '',
+      '[r]: https://r.example/remy',
+      '[^1]: Notes are at <https://n.example/1>.',
+    ].join('\n');
+    const email = renderEmail({ markdown, signature });
+    const shown = email.html
+      .replace(/<[^>]+>/gu, ' ')
+      .replace(
+        /&(amp|lt|gt|quot);/gu,
+        (_entity, name: string) => ({ amp: '&', lt: '<', gt: '>', quot: '"' })[name] ?? '',
+      )
+      .split(/\s+/u)
+      .filter(Boolean);
+    let at = 0;
+    for (const word of shown) {
+      at = email.text.indexOf(word, at);
+      expect(at, `"${word}" is missing from the text part`).toBeGreaterThanOrEqual(0);
+      at += word.length;
+    }
+    expect(email.text).not.toMatch(/\*|~~|`|\]\(|\[\^|\[r\]/u);
+    expect(email.text).toContain('Hi Remy (https://r.example/remy), see the plan1 and old new times:');
+  });
+
   it('keeps http(s) and mailto links, and drops every other link to its words', () => {
     const email = renderEmail({
       markdown:

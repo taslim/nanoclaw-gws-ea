@@ -7,9 +7,13 @@
  *
  *   - an outbound guard at the delivery adapter, so agent replies, approval
  *     cards, and host notices all pass it. A refused send never reaches the
- *     channel, and its sender is told to write it again without the value;
- *   - `checkOutbound`, the same check for the host's calendar writes and
- *     main's handoff text, which never pass through a channel.
+ *     channel, and its sender is told to write it again without the value.
+ *     Email to the inbox's outside threads is the exception: the guard sees
+ *     only the agent's words, while the inbox builds the email that goes, so
+ *     the inbox runs `checkOutbound` itself, on the final email and its final
+ *     recipients (gws-ea-inbox's `sendToOutside`);
+ *   - `checkOutbound`, the same check for that email, the host's calendar
+ *     writes, and main's handoff text, which never pass through a channel.
  *
  * Each send is judged on its own: external-email never holds a private value
  * (main's handoffs are checked before they cross), so there is nothing for it
@@ -35,6 +39,7 @@ import { getSession } from '../../db/sessions.js';
 import { registerOutboundGuard, type OutboundGuardDecision, type OutboundSend } from '../../delivery.js';
 import { ALLOW, DENY, defineGuardedAction, guard, HOLD, type GuardActor } from '../../guard/index.js';
 import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
+import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from '../gws-ea-inbox/runtime.js';
 import {
   assertMainCaller,
   getMainAgentGroupId,
@@ -206,8 +211,13 @@ function sendText(send: OutboundSend): string[] {
   return parts;
 }
 
-/** The outbound guard: refuses a send to anyone but the principal that gives a private value away. */
+/**
+ * The outbound guard: refuses a send to anyone but the principal that gives a
+ * private value away. Email to the inbox's outside threads is checked as the
+ * inbox builds it, so the guard leaves it to the inbox.
+ */
 async function judgeSend(send: OutboundSend): Promise<OutboundGuardDecision> {
+  if (send.channelType === EMAIL_CHANNEL_TYPE && send.platformId === INBOX_PLATFORM_ID) return { effect: 'allow' };
   const values = await compiledValues();
   if (values.length === 0 || (await resolveAudience(send)) === 'principal') return { effect: 'allow' };
   const kind = kindGivenAway(values, readingsOf(sendText(send)));

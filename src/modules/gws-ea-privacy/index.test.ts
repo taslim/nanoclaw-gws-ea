@@ -443,6 +443,20 @@ describe('the audience check on delivery', () => {
     expect(texts()).toEqual(['Meet at 123 Main St?', 'Tuesday at 3pm in room 12 works.']);
   });
 
+  it("leaves the inbox's email to outsiders to the inbox, which checks the final email, and guards every other send", async () => {
+    await addHome();
+    const content = JSON.stringify({ text: 'Meet at 123 Main St' });
+
+    await guarded.deliver('email', 'email:inbox', 'mail-thread-1', 'chat', content);
+    await expect(guarded.deliver('email', 'email:thread-1', null, 'chat', content)).rejects.toBeInstanceOf(
+      OutboundRefusedError,
+    );
+    await expect(guarded.deliver('gchat', 'email:inbox', null, 'chat', content)).rejects.toBeInstanceOf(
+      OutboundRefusedError,
+    );
+    expect(sent.map((send) => [send.channelType, send.platformId])).toEqual([['email', 'email:inbox']]);
+  });
+
   it('judges a mail channel by its final recipients', async () => {
     await addHome();
     const recipients = new Map<string, readonly string[]>([

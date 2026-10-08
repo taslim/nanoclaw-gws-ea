@@ -173,6 +173,8 @@ export interface RoutingContext {
   taskRun: boolean;
   /** Every non-echo row that woke this turn is a failure notice. */
   failureNoticeWake?: boolean;
+  /** Someone who wrote in a live chat (a Chat SDK channel) waits for the answer (acknowledge.ts); absent is no. */
+  personWaiting?: boolean;
 }
 
 /**
@@ -200,6 +202,7 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
     taskRun: messages.some((m) => m.kind === 'task') && messages.every((m) => m.kind === 'task' || isSessionEcho(m)),
     // Accumulated trigger=0 context rides along but did not wake the turn.
     failureNoticeWake: waking.length > 0 && waking.every(isFailureNotice),
+    personWaiting: waking.some((m) => m.kind === 'chat-sdk'),
   };
 }
 

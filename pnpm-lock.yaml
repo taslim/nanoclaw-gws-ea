@@ -32,12 +32,21 @@ importers:
       kleur:
         specifier: ^4.1.5
         version: 4.1.5
+      mdast-util-from-markdown:
+        specifier: 2.0.3
+        version: 2.0.3
+      mdast-util-gfm:
+        specifier: 3.1.0
+        version: 3.1.0
       micromark:
         specifier: 4.0.2
         version: 4.0.2
       micromark-extension-gfm:
         specifier: 3.0.0
         version: 3.0.0
+      micromark-util-sanitize-uri:
+        specifier: 2.0.1
+        version: 2.0.1
       yaml:
         specifier: ^2.9.0
         version: 2.9.0
@@ -48,6 +57,9 @@ importers:
       '@types/better-sqlite3':
         specifier: ^7.6.12
         version: 7.6.13
+      '@types/mdast':
+        specifier: 4.0.4
+        version: 4.0.4
       '@types/node':
         specifier: ^22.10.0
         version: 22.19.17
