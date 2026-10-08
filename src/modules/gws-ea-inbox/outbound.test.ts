@@ -770,6 +770,27 @@ describe('email_send from external-email', () => {
     expect(gmail.sent).toEqual([]);
   });
 
+  it('refuses a private value in the text of a file it sends, or among the people it names (R8)', async () => {
+    const { key, session } = await handedOver([REMY]);
+    const directions = Buffer.from(`Parking is behind ${HOME}.`);
+    await handFile(key, 'Directions.txt', directions);
+    const filed = refusalOf(
+      await emailSend(session, { subject: 'Lunch', text: 'Directions attached.' }, { 'directions.txt': directions }),
+    );
+    expect(filed).toMatch(/private address/u);
+
+    const personal = 'lena.ford@family.example';
+    await addPrivateValue({ label: 'Lena at home', kind: 'email', value: personal });
+    await recordThreadAddresses(key, [personal], 'main', now());
+    const named = refusalOf(
+      await emailSend(session, { subject: 'Lunch', to: [REMY], cc: [personal], text: 'Lunch on Tuesday?' }),
+    );
+    expect(named).toMatch(/private email address/u);
+
+    for (const reason of [filed, named]) expect(reason).not.toMatch(/elm|springfield|lena\.ford/iu);
+    expect(gmail.sent).toEqual([]);
+  });
+
   it('leaves out the quote for someone the quoted message never reached when it holds a private value for them', async () => {
     await arrives({ threadId: 'g-1', from: SAM, cc: [JANE], body: 'Looping in Jane.' });
     // Sam writes on to the assistant alone.

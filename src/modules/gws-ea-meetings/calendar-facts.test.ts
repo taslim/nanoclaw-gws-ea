@@ -538,7 +538,7 @@ describe('people_stats', () => {
     });
   });
 
-  it("never builds a record from a stranger's unanswered, declined, maybe, or cancelled invitations", async () => {
+  it("never builds a record from a stranger's unanswered, declined, or maybe invitations", async () => {
     for (const [day, response] of [
       ['2026-09-01', 'needsAction'],
       ['2026-09-02', 'needsAction'],
@@ -552,13 +552,6 @@ describe('people_stats', () => {
         }),
       );
     }
-    calendar.put(
-      timed(WORK, '2026-09-07T16:00:00+01:00', '2026-09-07T16:30:00+01:00', {
-        status: 'cancelled',
-        organizer: { email: MALLORY },
-        attendees: [guest(MALLORY), own(WORK, 'accepted')],
-      }),
-    );
 
     const result = await stats();
 

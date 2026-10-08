@@ -67,8 +67,11 @@ describe('the outgoing date check', () => {
   it("reads a date without a year from today on the principal's clock", async () => {
     // 1 January 2027 is a Friday; read as January 2026 it would be a Thursday, a day the check never takes.
     expect(await weekdayRefusal(['Friday 1 January'])).toBeUndefined();
+    // It is Wednesday 7 October in Los Angeles: Tuesday 9 June 2026, 120 days back, is still a day just gone.
+    expect(await weekdayRefusal(['Tuesday 9 June'])).toBeUndefined();
+    // It is already Thursday 8 October in Lagos: 9 June 2026 is 121 days back, so only next year's is read.
     await getDb().run("UPDATE gws_ea_profile SET principal_timezone = 'Africa/Lagos' WHERE singleton = 1");
-    expect(await weekdayRefusal(['Thursday 8 October 2026'])).toBeUndefined();
+    expect(await weekdayRefusal(['Tuesday 9 June'])).toMatch(/but 9 June 2027 is a Wednesday\./u);
   });
 
   it('keeps a refused reply from the channel: the adapter never sees it', async () => {

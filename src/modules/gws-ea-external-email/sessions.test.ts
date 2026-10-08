@@ -1,7 +1,8 @@
 /**
  * Covers R20 and R65 for what a session keeps: each external-email session
  * gets its own Claude home and its own inbox, so one thread's transcript and
- * files never reach another thread's container.
+ * files never reach another thread's container, and nothing it mounts reaches
+ * main's folder, where main keeps what it knows of people (R10, R15).
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -23,7 +24,7 @@ vi.mock('../../log.js', () => ({
 import { configFromDb } from '../../container-config.js';
 import { buildMounts } from '../../container-runner.js';
 import { getContainerConfig } from '../../db/container-configs.js';
-import { closeDb, getAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, getAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { getHostStartCallbacks } from '../../host-lifecycle.js';
 import { writeSessionMessage } from '../../session-manager.js';
@@ -33,6 +34,7 @@ import { getExternalEmailAgentGroupId } from './index.js';
 import '../gws-ea-profile/index.js';
 
 const DATA_DIR = path.join(TEST_ROOT, 'data');
+const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
 const CLAUDE_HOME = '/home/node/.claude';
 
 async function startHost(): Promise<void> {
@@ -145,5 +147,33 @@ describe("external-email's files", () => {
       fs.readFileSync(file, 'utf8').includes('thread A only'),
     );
     expect(copies).toEqual([]);
+  });
+});
+
+describe("external-email's mounts", () => {
+  it("reach nothing in main's folder, where main keeps a file on each person", async () => {
+    const ee = await externalEmail();
+    const main: AgentGroup = {
+      id: 'ag-main',
+      name: 'main',
+      folder: 'main',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    };
+    await createAgentGroup(main);
+    await initGroupFilesystem(main, { provider: 'claude' });
+    const mainFolder = path.join(GROUPS_DIR, main.folder);
+    const person = path.join(mainFolder, 'memory', 'people', 'remy-vance.md');
+    fs.mkdirSync(path.dirname(person), { recursive: true });
+    fs.writeFileSync(person, '---\ntype: person\n---\nRemy Vance prefers mornings.\n');
+
+    const mounts = await mountsFor(ee, 'sess-a');
+    expect(mounts.find((mount) => mount.containerPath === '/workspace/agent')?.hostPath).toBe(
+      path.join(GROUPS_DIR, ee.folder),
+    );
+    for (const mount of mounts) {
+      expect(under(person, mount.hostPath), mount.containerPath).toBe(false);
+      expect(under(mount.hostPath, mainFolder), mount.containerPath).toBe(false);
+    }
   });
 });

@@ -478,6 +478,21 @@ describe('the audience check on delivery', () => {
     expect(sent.map((send) => [send.channelType, send.platformId])).toEqual([['email', 'email:inbox']]);
   });
 
+  it('reads the name of every file a send carries, and the text of each that is text', async () => {
+    await addHome();
+    const content = JSON.stringify({ text: 'The directions are attached.' });
+    const directions = { filename: 'directions.txt', data: Buffer.from('Park behind 123 Main Street.') };
+    const named = { filename: '123 Main St.pdf', data: Buffer.from([0x25, 0x50, 0x44, 0x46, 0xff, 0xfe]) };
+
+    for (const file of [directions, named]) {
+      await expect(
+        guarded.deliver(THREAD.channelType, THREAD.platformId, null, 'chat', content, [file]),
+      ).rejects.toBeInstanceOf(OutboundRefusedError);
+    }
+    await guarded.deliver(DM.channelType, DM.platformId, null, 'chat', content, [directions]);
+    expect(sent.map((send) => send.platformId)).toEqual([DM.platformId]);
+  });
+
   it('judges a mail channel by its final recipients', async () => {
     await addHome();
     const recipients = new Map<string, readonly string[]>([
