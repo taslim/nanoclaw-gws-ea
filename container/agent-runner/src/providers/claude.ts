@@ -26,7 +26,14 @@ import {
 // read the SDK's on-disk .jsonl, which no other provider has.
 import { archiveClaudeTranscript, rotateClaudeContinuation } from './claude-history.js';
 import { registerProvider } from './provider-registry.js';
-import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
+import type {
+  AgentProvider,
+  AgentQuery,
+  ProviderEvent,
+  ProviderFailure,
+  ProviderOptions,
+  QueryInput,
+} from './types.js';
 
 function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
@@ -206,13 +213,16 @@ const STREAM_ACTIVITY_INTERVAL_MS = 1000;
 const OWNER_FIX_HINT =
   "Whoever runs this NanoClaw needs to fix this outside the chat. Please don't send keys or passwords here.";
 
-/** The Claude CLI's own fixed failure notices (exact strings), safe to show in a channel, and the hint added to each. */
-const SDK_NOTICES = new Map([
-  ['Not logged in · Please run /login', OWNER_FIX_HINT],
-  ['Invalid API key · Fix external API key', OWNER_FIX_HINT],
-  ['Invalid auth token · Fix external auth token', OWNER_FIX_HINT],
-  ['Credit balance is too low', OWNER_FIX_HINT],
-  ['Prompt is too long', 'This conversation got too long. An admin can send /clear to start a new one.'],
+/**
+ * The Claude CLI's own fixed failure notices (exact strings), safe to show in
+ * a channel, the hint added to each, and the cause each names.
+ */
+const SDK_NOTICES = new Map<string, { hint: string; failure?: ProviderFailure }>([
+  ['Not logged in · Please run /login', { hint: OWNER_FIX_HINT, failure: 'credentials' }],
+  ['Invalid API key · Fix external API key', { hint: OWNER_FIX_HINT, failure: 'credentials' }],
+  ['Invalid auth token · Fix external auth token', { hint: OWNER_FIX_HINT, failure: 'credentials' }],
+  ['Credit balance is too low', { hint: OWNER_FIX_HINT, failure: 'billing' }],
+  ['Prompt is too long', { hint: 'This conversation got too long. An admin can send /clear to start a new one.' }],
 ]);
 
 /** The real clock for archive names and rotation stamps; tests hand the history functions a fixed one. */
@@ -434,13 +444,14 @@ export class ClaudeProvider implements AgentProvider {
           // bodies, so only exact fixed notices are reused; the rest stay generic.
           const candidate = isError && !m.errors?.length ? (m.result?.trim() ?? '') : '';
           // Notice first, hint on its own line: setup's ping shows only the first line.
-          const hint = SDK_NOTICES.get(candidate);
-          const resultAsError = hint ? `${candidate}\n${hint}` : '';
+          const notice = SDK_NOTICES.get(candidate);
+          const resultAsError = notice ? `${candidate}\n${notice.hint}` : '';
           yield {
             type: 'result',
             text: resultAsError ? null : (m.result ?? null),
             isError,
             error: m.errors?.length ? m.errors.join('\n') : resultAsError || undefined,
+            ...(notice?.failure ? { failure: notice.failure } : {}),
           };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
