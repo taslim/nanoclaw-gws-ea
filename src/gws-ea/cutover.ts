@@ -38,7 +38,6 @@ import Database from 'better-sqlite3';
 
 import { isErrno } from '../community-portal/errors.js';
 import { getInstallScopedNames } from '../install-slug.js';
-import { MUTABLE_PATHS } from '../mutable-paths.js';
 import { moveHoldingImages, releaseImage, taggedImageId, type ImageDocker } from './agent-image.js';
 import { observeLiveCheckout } from './checkout.js';
 import { observeManagedGchatRoute, verifyExistingGchatRoute } from './endpoint.js';
@@ -95,8 +94,13 @@ import { GwsEaError, releaseOf, shortCommit, type InstanceReservation, type Rele
 import { isRecord } from './validation.js';
 import { readDerivedImageGroups } from './verify.js';
 
-/** What a cutover carries from the outgoing checkout into the incoming one: NanoClaw's mutable paths and the host's logs. */
-export const CARRIED_ROOTS = [...MUTABLE_PATHS, 'logs'] as const;
+/**
+ * What a cutover carries from the outgoing checkout into the incoming one:
+ * the roots NanoClaw's own update treats as install state (`MUTABLE_PATHS` in
+ * scripts/update/transaction.ts, which src/ cannot import) and the host's
+ * logs. cutover.test.ts fails if NanoClaw's list gains a root this one lacks.
+ */
+export const CARRIED_ROOTS = ['.env', 'data', 'groups', 'store', 'start-nanoclaw.sh', 'nanoclaw.pid', 'logs'] as const;
 
 /**
  * State under a carried root that stays with its release: its marker and

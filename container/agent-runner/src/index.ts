@@ -23,6 +23,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+import { trustGatewayCaForChromium } from './browser-trust.js';
 import { loadConfig } from './config.js';
 import { buildSystemPromptAddendum } from './destinations.js';
 import { getTaskSeriesId } from './db/session-routing.js';
@@ -64,6 +65,9 @@ async function main(): Promise<void> {
   // group memory and archives no conversation: see memory/sealed.ts.
   const sealed = sessionsSealed(config.capabilities);
   const memoryHook = prepareSessionMemory(sealed);
+
+  // The agent browser trusts only NSS, not the gateway CA env vars.
+  trustGatewayCaForChromium({ log });
 
   // Runtime-generated system-prompt addendum: agent identity (name) plus
   // the live destinations map. Everything else (capabilities, per-module

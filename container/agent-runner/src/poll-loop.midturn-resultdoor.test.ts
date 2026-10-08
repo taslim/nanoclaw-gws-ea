@@ -307,6 +307,67 @@ describe('error and interrupted turns', () => {
     expect(pushes).toHaveLength(0);
   });
 
+  // A turn woken only by failure notices never answers with another notice,
+  // so an a2a failure chain stops after one hop. Other agent routes still
+  // hear that their request failed.
+  const AGENT_ROUTING = {
+    platformId: 'ag-a',
+    channelType: 'agent',
+    threadId: null,
+    inReplyTo: 'm1',
+    taskRun: false,
+  };
+  const NOTICE_WAKE_ROUTING = { ...AGENT_ROUTING, failureNoticeWake: true };
+  // The runner reports a failed turn to the host; it never writes a notice row on the agent route.
+  const agentNotices = () =>
+    turnFailures().filter((r) => (r as { channelType?: string }).channelType === 'agent') as Array<{
+      action: string;
+      error?: string;
+    }>;
+
+  it.each([
+    ['a plain agent route is reported once', AGENT_ROUTING, 1],
+    ['a failure-notice wake is not reported', NOTICE_WAKE_ROUTING, 0],
+  ])('error result keeps partial output: %s', async (_label, routing, expected) => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'text', text: '<message to="discord-main">Progress before failure.</message>' };
+      yield { type: 'result', text: 'Backend failed.', isError: true, error: 'Incorrect API key' };
+    }
+    const { query, pushes } = makeStubQuery(events());
+
+    await processQuery(query, routing, ['m1'], 'claude', undefined, 'prompt', undefined, true);
+
+    const chatTexts = getUndeliveredMessages()
+      .filter((m) => m.channel_type === 'discord')
+      .map((m) => JSON.parse(m.content).text);
+    expect(chatTexts).toEqual(['Progress before failure.']);
+    expect(agentNotices()).toHaveLength(expected);
+    expect(pushes).toHaveLength(0);
+  });
+
+  it.each([
+    ['a plain agent route is reported once', AGENT_ROUTING, 1],
+    ['a failure-notice wake is not reported', NOTICE_WAKE_ROUTING, 0],
+  ])('a stream that throws: %s', async (_label, routing, expected) => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      throw new Error('SDK stream died');
+    }
+    const { query } = makeStubQuery(events());
+
+    await expect(processQuery(query, routing, ['m1'], 'claude', undefined, 'prompt', undefined, true)).rejects.toThrow(
+      'SDK stream died',
+    );
+
+    const out = agentNotices();
+    expect(out).toHaveLength(expected);
+    for (const row of out) expect(row).toMatchObject({ action: 'turn_failed', error: 'SDK stream died' });
+    expect(getUndeliveredMessages().filter((m) => m.channel_type === 'agent')).toEqual([]);
+  });
+
   it('a stream that throws after a mid-turn delivery: the delivered row survives, processQuery rejects', async () => {
     seedDest();
     async function* events(): AsyncGenerator<ProviderEvent> {
@@ -322,7 +383,7 @@ describe('error and interrupted turns', () => {
 
     // The mid-turn write is durable — an interrupted turn cannot claw it back.
     expect(deliveredTexts()).toEqual(['Sent before the crash.']);
-    expect(turnFailures()).toEqual([TURN_FAILED]);
+    expect(turnFailures()).toEqual([{ ...TURN_FAILED, error: 'SDK stream died' }]);
   });
 });
 

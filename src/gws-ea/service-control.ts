@@ -4,8 +4,8 @@
  * drift from NanoClaw's: detection, stop, start, container drain, and health.
  * `src/` cannot import `scripts/`, so the driver supplies the helpers and this
  * module binds them to one instance: its checkout, install, home, and Docker
- * endpoint. What gws-ea adds is only the exact-ID targeting and the waits
- * NanoClaw's own callers do not need.
+ * endpoint. What gws-ea adds is only the exact-ID targeting: NanoClaw's stop
+ * itself waits until the host has exited, so nothing starts it again early.
  *
  * Stop follows NanoClaw: agent containers are left for the next start to
  * adopt, and the stop lasts until the next start, login, or reboot. Only
@@ -13,7 +13,6 @@
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { pollUntil } from './poll.js';
 import { buildToolEnvironment } from './process.js';
 import { activeStep } from './run-log.js';
 import { serviceManagerEnvironment, type InstanceRuntimeConfig } from './service.js';
@@ -29,6 +28,8 @@ export type NanoclawServiceMode = 'launchd' | 'systemd-user' | 'systemd-system' 
 export interface NanoclawServiceHandle {
   readonly mode: NanoclawServiceMode;
   readonly active: boolean;
+  /** A systemd unit activating or deactivating: it still holds the service, but is not serving. */
+  readonly transitional?: boolean;
   readonly name?: string;
   readonly definition?: string;
   readonly pid?: number;
@@ -116,7 +117,7 @@ export interface InstanceServiceControl {
   /** The service as NanoClaw detects it now. */
   detect(): NanoclawServiceHandle;
   start(): Promise<StartOutcome>;
-  /** Stops the host, leaving agent containers for the next start, and returns once detection shows it gone. */
+  /** Stops the host, leaving agent containers for the next start, and returns once it has exited. */
   stop(): Promise<StopOutcome>;
   restart(): Promise<RestartOutcome>;
   /** Stops this assistant's agent containers and waits until none runs; for cutover and removal only. */
@@ -124,14 +125,6 @@ export interface InstanceServiceControl {
   /** Whether the host serves: its service active, its CLI socket up, and `ncl` answering. */
   verifyHealth(timeoutMs?: number): Promise<boolean>;
 }
-
-/**
- * How long a stopped job may take to leave. launchd can still be removing a
- * job `bootout` unloaded, and gives a process that ignores SIGTERM 20 seconds
- * before it kills it; nothing may start the job again until it is gone.
- */
-const STOPPED_POLL_MS = 500;
-const STOPPED_LIMIT_MS = 30_000;
 
 function requireUid(uid: number | undefined): number {
   if (uid === undefined) throw new GwsEaError('unsupported_platform', 'The service manager requires a user ID');
@@ -204,21 +197,22 @@ export function createServiceControl(
     );
   };
 
-  const stopUntilGone = async (handle: NanoclawServiceHandle): Promise<void> => {
-    await helpers.stopService(handle, env);
-    const current = await pollUntil(
-      async () => detect(),
-      (found) => !found.active,
-      {
-        intervalMs: STOPPED_POLL_MS,
-        limitMs: STOPPED_LIMIT_MS,
-        sleep,
-      },
-    );
-    if (current.active) {
+  /**
+   * NanoClaw's stop returns once the host has exited, and throws when it
+   * cannot stop it; its reason is the operator's, so it is kept in gws-ea's
+   * own error, which the operator is shown.
+   */
+  const stopHost = async (handle: NanoclawServiceHandle): Promise<void> => {
+    try {
+      await helpers.stopService(handle, env);
+    } catch (cause) {
+      const reason = cause instanceof Error ? cause.message : String(cause);
       throw new GwsEaError(
         'service_still_running',
-        `NanoClaw's service ${handle.name ?? handle.mode} is still running after it was stopped`,
+        `NanoClaw's service ${handle.name ?? handle.mode} did not stop: ${reason}`,
+        {
+          cause,
+        },
       );
     }
   };
@@ -238,12 +232,12 @@ export function createServiceControl(
     async stop() {
       const handle = managed(detect());
       if (!handle.active) return 'already-stopped';
-      await stopUntilGone(handle);
+      await stopHost(handle);
       return 'stopped';
     },
     async restart() {
       const handle = installed(managed(detect()));
-      if (handle.active) await stopUntilGone(handle);
+      if (handle.active) await stopHost(handle);
       startHandle(handle);
       return handle.active ? 'restarted' : 'started';
     },

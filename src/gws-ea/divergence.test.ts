@@ -1156,7 +1156,10 @@ describe("recorded divergence: NanoClaw's update helpers act on the install they
     await writeFile(path.join(home, 'Library', 'LaunchAgents', `${label}.plist`), '');
     const commands: string[] = [];
     const runner: NanoclawCommandRunner = {
-      run: () => '',
+      run: (command, args) => {
+        commands.push([command, ...args].join(' '));
+        return '';
+      },
       tryRun: (command, args) => {
         commands.push([command, ...args].join(' '));
         return { ok: true, stdout: '' };
@@ -1183,7 +1186,7 @@ describe("recorded divergence: NanoClaw's update helpers act on the install they
     await helpers.drainContainers(path.join(home, 'checkout'), env);
     expect(commands).toEqual([
       `launchctl print gui/501/${label}`,
-      'docker ps -q --filter label=nanoclaw-install=gwsguard',
+      'docker ps --filter label=nanoclaw-install=gwsguard --format {{.ID}}|{{.Label "nanoclaw-session"}}|{{.Label "nanoclaw-role"}}',
     ]);
   });
 
@@ -1198,13 +1201,6 @@ describe("recorded divergence: NanoClaw's update helpers act on the install they
         'process.stdout.write(String(process.env.GWS_EA_DIVERGENCE_GIVEN) + "/" + String(process.env.GWS_EA_DIVERGENCE_AMBIENT))',
       ]),
     ).toBe('given/undefined');
-  });
-
-  it('snapshots the mutable paths NanoClaw declares in src/, the list gws-ea carries at cutover', async () => {
-    const transaction = await readFile(path.join(originalCwd, 'scripts/update/transaction.ts'), 'utf8');
-
-    expect(transaction).toContain("import { MUTABLE_PATHS } from '../../src/mutable-paths.js';");
-    expect(transaction).not.toMatch(/\bconst MUTABLE_PATHS\b/u);
   });
 
   it("names the install's service and image from NANOCLAW_INSTALL_ID in the shell helpers, as the TS helper does", async () => {

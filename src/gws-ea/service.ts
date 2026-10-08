@@ -7,7 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { isErrno } from '../community-portal/errors.js';
 import { readEnvFile } from '../env.js';
 import { getInstallScopedNames } from '../install-slug.js';
-import { renderLaunchdService, renderSystemdService } from '../service-definition.js';
+import { renderLaunchdService, renderSystemdService } from './service-definition.js';
 import { adoptSharedAgentImage, agentImageKey, readAgentImageInputs } from './agent-image.js';
 import type { OnecliRuntimeLayout } from './onecli-compose.js';
 import { preparePrivateDirectory, assertPrivateDirectory, instanceRuntimeFile, isRegularFile } from './paths.js';

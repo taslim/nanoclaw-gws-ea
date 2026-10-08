@@ -473,8 +473,9 @@ describe('poll loop — provider error recovery', () => {
     controller.abort();
 
     const out = getUndeliveredMessages();
-    expect(out.map((row) => [row.kind, JSON.parse(row.content)])).toEqual([['system', TURN_FAILED]]);
-    expect(out[0].content).not.toContain('API rate limit exceeded');
+    expect(out.map((row) => [row.kind, JSON.parse(row.content)])).toEqual([
+      ['system', { ...TURN_FAILED, error: 'API rate limit exceeded' }],
+    ]);
 
     // Input message should be marked completed despite the error
     const pending = getPendingMessages();
@@ -499,10 +500,15 @@ describe('poll loop — stale session recovery', () => {
     await waitFor(() => getUndeliveredMessages().length > 0, 2000);
     controller.abort();
 
-    // The host hears the turn failed; the provider diagnostic stays private.
+    // The host hears the turn failed, with the diagnostic for its log only.
     const out = getUndeliveredMessages();
-    expect(out.map((row) => [row.kind, JSON.parse(row.content)])).toEqual([['system', TURN_FAILED]]);
-    expect(out[0].content).not.toContain('session not found');
+    expect(out.map((row) => [row.kind, (JSON.parse(row.content) as { action: string }).action])).toEqual([
+      ['system', 'turn_failed'],
+    ]);
+    expect(JSON.parse(out[0].content)).toMatchObject({
+      ...TURN_FAILED,
+      error: expect.stringContaining('session not found'),
+    });
 
     // Continuation was cleared (isSessionInvalid returned true)
     expect(getContinuation('mock')).toBeUndefined();

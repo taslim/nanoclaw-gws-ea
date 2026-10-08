@@ -635,13 +635,15 @@ export async function processQuery(
           // second run summary.
           const archivedResult = [resultText, failed ? event.error : undefined].filter(Boolean).join('\n');
           if (routing.taskRun && !taskBlockNudged) await autoAppendTaskLog(archivedResult);
-          if (failed && !routing.taskRun) {
+          if (failed) {
             // A failed turn is reported even after a partial reply. The
             // provider's error, unwrapped model output, and raw diagnostics
-            // are private: the error goes to the log, which the host records,
-            // and the host decides who hears that the turn failed.
-            if (event.error) log(`Provider error: ${event.error}`);
-            await reportTurnFailed(routing);
+            // never reach a conversation: the report carries the error to the
+            // host's log, and the host decides who hears that the turn failed.
+            if (sendsFailureNotice(routing)) await reportTurnFailed(routing, event.error);
+            // Keep the reason in the runner log, since the skipped report may
+            // be the only place it would have been recorded.
+            else log(`Failed turn not reported on this route: ${event.error ?? 'no provider error'}`);
           }
           // An unwrapped final text only warrants the wrap-nudge when NOTHING
           // was delivered this turn — hasUnwrapped already folds in the
@@ -708,23 +710,25 @@ export async function processQuery(
       // Completed turns are no longer answering or queued. Preserve partial
       // output from unfinished turns and report that the run did not finish.
       // Retrying the same route or several queued turns in one thread needs
-      // only one report. Task and agent wakes have no human chat endpoint.
+      // only one report. The host picks an a2a reply's session by in_reply_to,
+      // so agent routes also compare it.
       const failedRoutes = [...(answering ? [routing] : []), ...queuedTurns.map((turn) => turn.routing)];
       const noticed: RoutingContext[] = [];
       for (const target of failedRoutes) {
-        if (target.taskRun || !target.platformId || !target.channelType || target.channelType === 'agent') continue;
+        if (!sendsFailureNotice(target)) continue;
         if (
           noticed.some(
             (prior) =>
               prior.platformId === target.platformId &&
               prior.channelType === target.channelType &&
-              prior.threadId === target.threadId,
+              prior.threadId === target.threadId &&
+              (target.channelType !== 'agent' || prior.inReplyTo === target.inReplyTo),
           )
         )
           continue;
         noticed.push(target);
         try {
-          await reportTurnFailed(target);
+          await reportTurnFailed(target, errMsg);
         } catch (reportError) {
           log(
             `Failed to report the failed turn: ${reportError instanceof Error ? reportError.message : String(reportError)}`,
@@ -733,7 +737,8 @@ export async function processQuery(
       }
     }
     // Continuation recovery receives the original error; diagnostics remain
-    // in the exchange archive and runner log, never in the failure report.
+    // in the exchange archive, the runner log and the host's log, never in a
+    // conversation.
     throw err;
   } finally {
     done = true;
@@ -775,12 +780,23 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
 }
 
 /**
- * Report a failed turn to the host as a typed `turn_failed` system action
- * carrying the turn's route. The host decides who hears about it and in what
- * words; nothing is written for the conversation itself.
+ * Is a failed turn reported to the host? Task runs report through their run
+ * log, and a turn woken only by failure notices reports none, so a failure
+ * chain stops after one hop. Every other turn is reported whatever its route,
+ * a reminder's or a host note's included: the host decides who hears of it.
  */
-async function reportTurnFailed(routing: RoutingContext): Promise<void> {
-  log('Failed run — reporting turn_failed to the host');
+function sendsFailureNotice(routing: RoutingContext): boolean {
+  return !routing.taskRun && !routing.failureNoticeWake;
+}
+
+/**
+ * Report a failed turn to the host as a typed `turn_failed` system action
+ * carrying the turn's route and the provider's error. The host decides who
+ * hears about it and in what words, and keeps the error in its log; nothing
+ * is written for the conversation itself.
+ */
+async function reportTurnFailed(routing: RoutingContext, error: string | undefined): Promise<void> {
+  log(`Failed turn — reporting turn_failed to the host${error ? `: ${error}` : ''}`);
   await writeMessageOut({
     id: generateId(),
     kind: 'system',
@@ -789,6 +805,7 @@ async function reportTurnFailed(routing: RoutingContext): Promise<void> {
       channelType: routing.channelType,
       platformId: routing.platformId,
       threadId: routing.threadId,
+      ...(error ? { error } : {}),
     }),
   });
 }
