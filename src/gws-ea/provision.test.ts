@@ -1051,6 +1051,7 @@ function healthyOnecliDocker(context: ProductionProvisionContext) {
             Labels: {
               'com.docker.compose.project': layout.project,
               'com.docker.compose.service': service,
+              'com.docker.compose.config-hash': `hash-${service}`,
               'dev.gws-ea.instance-id': layout.instanceId,
             },
           },
@@ -1096,6 +1097,9 @@ function healthyOnecliDocker(context: ProductionProvisionContext) {
     }
     // The provenance label the release's gateway build stamped.
     if (kind === 'image' && verb === 'inspect') return { stdout: `${RELEASE_WRAPPER_HASH}\n`, stderr: '' };
+    // `config --hash`: each service's configuration is the one its container was created from.
+    if (kind === 'compose')
+      return { stdout: 'app hash-app\ngateway hash-gateway\npostgres hash-postgres\n', stderr: '' };
     throw new Error(`unexpected docker command: ${command.args.join(' ')}`);
   };
 }

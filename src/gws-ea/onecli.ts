@@ -45,6 +45,8 @@ const INVALID_OUTPUT = 'invalid_onecli_output';
 const INVALID_RUNTIME = 'invalid_onecli_runtime';
 
 const EXPECTED_SERVICES = ['postgres', 'app', 'gateway'] as const;
+/** The hash of the service configuration Compose created a container from, which `up` compares to recreate it. */
+const CONFIG_HASH_LABEL = 'com.docker.compose.config-hash';
 
 /** Pulling runs on its own clock: a slow registry never eats into the health wait. */
 const ONECLI_PULL_TIMEOUT_MS = 20 * 60_000;
@@ -57,37 +59,36 @@ const INSPECT_TIMEOUT_MS = 30_000;
 export type OnecliCommand = SanitizedCommand;
 export type OnecliCommandRunner = SanitizedCommandRunner;
 
-export interface ObservedOnecliContainer {
+interface ObservedOnecliContainer {
+  readonly id: string;
   readonly service: string;
-  readonly image: string;
   readonly instanceId: string | undefined;
   readonly project: string | undefined;
+  readonly configHash: string | undefined;
   readonly running: boolean;
   /** Docker's health status: starting, healthy, or unhealthy; undefined without a healthcheck. */
   readonly health: string | undefined;
   readonly publishedPorts: Readonly<Record<string, readonly { hostIp: string; hostPort: string }[]>>;
-  readonly networks: readonly string[];
-  readonly volumes: readonly { name: string; destination: string }[];
 }
 
-export interface ObservedOnecliNetwork {
+interface ObservedOnecliNetwork {
   readonly name: string;
   readonly instanceId: string | undefined;
   readonly role: string | undefined;
   readonly internal: boolean;
 }
 
-export interface ObservedOnecliVolume {
+interface ObservedOnecliVolume {
   readonly name: string;
   readonly instanceId: string | undefined;
   readonly role: string | undefined;
 }
 
-export interface ObservedOnecliRuntime {
-  readonly containers: readonly ObservedOnecliContainer[];
-  readonly networks: readonly ObservedOnecliNetwork[];
-  readonly volumes: readonly ObservedOnecliVolume[];
-}
+/** What the service containers show; unlike an `Observation`, an absence always says why. */
+type ServicesObservation =
+  | { readonly status: 'present' }
+  | { readonly status: 'absent'; readonly reason: string }
+  | { readonly status: 'unknown'; readonly reason: string; readonly evidence: string };
 
 export interface ImportedCredential {
   readonly id: string;
@@ -305,10 +306,10 @@ export async function prepareReleaseGatewayImage(
  * its cutover (KTD8): that image, which staging built, is made present
  * first, so a failed build leaves the Compose file naming the gateway still
  * running; only then is the file rendered for it and only the gateway
- * recreated. `compose up` keeps every volume, and Postgres and the app run on
- * as they are, since an update never changes their versions (R9). Rendered
- * from this tool's tree, which is the release (R6). Run again after an
- * interruption, it converges.
+ * recreated, and probed when it was (KTD15). `compose up` keeps every volume,
+ * and Postgres and the app run on as they are, since an update never changes
+ * their versions (R9). Rendered from this tool's tree, which is the release
+ * (R6). Run again after an interruption, it converges.
  */
 export async function applyReleaseGateway(
   layout: OnecliRuntimeLayout,
@@ -320,22 +321,7 @@ export async function applyReleaseGateway(
   const { gateway } = await instanceOnecliImages(layout, pins);
   await ensureWrapperGatewayImage(docker, pins, image);
   if (gateway !== image) await writePrivateTextFile(layout.composeFile, renderOnecliCompose(layout, pins, image));
-  await docker.runner({
-    ...buildComposeInvocation(layout, [
-      'up',
-      '--detach',
-      '--wait',
-      '--wait-timeout',
-      String(ONECLI_WAIT_TIMEOUT_SECONDS),
-      '--pull',
-      'never',
-      '--no-deps',
-      'gateway',
-    ]),
-    env: docker.environment,
-    timeoutMs: UP_TIMEOUT_MS,
-    stream: true,
-  });
+  await upGateway(docker, pins);
 }
 
 /**
@@ -344,8 +330,8 @@ export async function applyReleaseGateway(
  * still present, since assistant commands never delete one; only when it is
  * missing and this tool's tree builds the same content is it built again,
  * and otherwise it is refused before the Compose file changes. Only the
- * gateway is recreated, and every volume is kept. Run again after an
- * interruption, it converges.
+ * gateway is recreated, and probed when it was (KTD15), and every volume is
+ * kept. Run again after an interruption, it converges.
  */
 export async function restoreReleaseGateway(
   layout: OnecliRuntimeLayout,
@@ -361,8 +347,19 @@ export async function restoreReleaseGateway(
   await ensureWrapperGatewayImage(docker, pins, gateway);
   if ((await readOwnerOnlyFile(layout.composeFile)) !== compose)
     await writePrivateTextFile(layout.composeFile, compose);
+  await upGateway(docker, pins);
+}
+
+/**
+ * Bring the gateway to its Compose file, which recreates it only when its
+ * configuration changed, and then prove the egress boundary again before
+ * returning (KTD15): a recreated gateway is a new container whose firewall no
+ * probe has seen. Compose gives a container it recreates a new ID.
+ */
+async function upGateway(docker: OnecliDocker, pins: OnecliPins): Promise<void> {
+  const before = new Set(await projectContainerIds(docker));
   await docker.runner({
-    ...buildComposeInvocation(layout, [
+    ...buildComposeInvocation(docker.layout, [
       'up',
       '--detach',
       '--wait',
@@ -377,51 +374,39 @@ export async function restoreReleaseGateway(
     timeoutMs: UP_TIMEOUT_MS,
     stream: true,
   });
+  if ((await projectContainerIds(docker)).some((id) => !before.has(id)))
+    await verifyAgentNetworkIsolation(docker, pins);
 }
 
-function validateObservedOnecliRuntime(
-  layout: OnecliRuntimeLayout,
-  observed: ObservedOnecliRuntime,
-  expected: OnecliServiceImages,
-): void {
-  for (const container of observed.containers) {
-    const expectedNetworks = expectedNetworksForService(layout, container.service);
-    if (!sameSet(container.networks, expectedNetworks)) {
-      throw new GwsEaError('unsafe_onecli_topology', `OneCLI ${container.service} network topology is invalid`);
-    }
-  }
+/**
+ * The networks and volumes, which no service's config hash covers: exactly
+ * the instance's own, each labelled with its owner and role, and only the
+ * agent-egress network internal, so an agent on it reaches nothing but the
+ * gateway.
+ */
+async function assertOnecliNamedResources(docker: OnecliDocker): Promise<void> {
+  const { layout, runner, environment } = docker;
+  const inspect = (kind: 'network' | 'volume', names: readonly string[]) =>
+    runner({
+      command: 'docker',
+      args: [kind, 'inspect', ...names],
+      cwd: path.dirname(layout.rootDirectory),
+      env: environment,
+      timeoutMs: INSPECT_TIMEOUT_MS,
+    });
+  const [networkResult, volumeResult] = await Promise.all([
+    inspect('network', [layout.backendNetwork, layout.agentEgressNetwork]),
+    inspect('volume', [layout.postgresVolume, layout.appVolume]),
+  ]);
+  const networks = parseDockerNetworks(networkResult.stdout);
+  const volumes = parseDockerVolumes(volumeResult.stdout);
 
   assertExactNamedResources(
-    observed.containers.map((container) => container.service),
-    EXPECTED_SERVICES,
-    'OneCLI services',
-  );
-  for (const service of EXPECTED_SERVICES) {
-    const container = observed.containers.find((candidate) => candidate.service === service);
-    if (!container) throw new GwsEaError(INVALID_RUNTIME, `OneCLI ${service} container is missing`);
-    if (container.instanceId !== layout.instanceId || container.project !== layout.project) {
-      throw new GwsEaError('unsafe_onecli_owner', `OneCLI ${service} ownership labels are invalid`);
-    }
-    if (!container.running || container.health !== 'healthy') {
-      throw new GwsEaError('unhealthy_onecli', `OneCLI ${service} container is not healthy`);
-    }
-    const expectedImage = expected[service];
-    if (container.image !== expectedImage) {
-      throw new GwsEaError(
-        'unsafe_onecli_image',
-        `OneCLI ${service} image is not this assistant's pinned ${expectedImage}`,
-      );
-    }
-    validatePublishedPorts(layout, container);
-    validateContainerVolumes(layout, container);
-  }
-
-  assertExactNamedResources(
-    observed.networks.map((network) => network.name),
+    networks.map((network) => network.name),
     [layout.backendNetwork, layout.agentEgressNetwork],
     'OneCLI networks',
   );
-  for (const network of observed.networks) {
+  for (const network of networks) {
     const expectedRole = network.name === layout.backendNetwork ? 'backend' : 'agent-egress';
     const expectedInternal = network.name === layout.agentEgressNetwork;
     if (
@@ -434,11 +419,11 @@ function validateObservedOnecliRuntime(
   }
 
   assertExactNamedResources(
-    observed.volumes.map((volume) => volume.name),
+    volumes.map((volume) => volume.name),
     [layout.postgresVolume, layout.appVolume],
     'OneCLI volumes',
   );
-  for (const volume of observed.volumes) {
+  for (const volume of volumes) {
     const expectedRole = volume.name === layout.postgresVolume ? 'postgres-data' : 'app-data';
     if (volume.instanceId !== layout.instanceId || volume.role !== expectedRole) {
       throw new GwsEaError('unsafe_onecli_owner', `OneCLI volume ${volume.name} ownership labels are invalid`);
@@ -448,12 +433,13 @@ function validateObservedOnecliRuntime(
 
 /**
  * The runtime as liveness sees it. Present when all three services run
- * healthy exactly as the instance's own Compose file names them, the gateway's
- * image carrying the provenance its tag names; a service Docker still reports
- * as starting is unknown, so the engine waits; a missing, stopped, or
- * unhealthy one, or a missing Compose file, is absent, so it is repaired at
- * once. Another instance's container in this project stops the run; Docker
- * failing to answer is unknown.
+ * healthy from the configuration the instance's own Compose file gives now,
+ * its networks and volumes are its own, and the gateway's image carries the
+ * provenance its tag names; a service Docker still reports as starting is
+ * unknown, so the engine waits; a missing, stopped, or unhealthy one, one
+ * created from another configuration, or a missing Compose file, is absent,
+ * so it is repaired at once. Another instance's resource stops the run;
+ * Docker failing to answer is unknown.
  */
 export async function observeOnecliRuntime(
   layout: OnecliRuntimeLayout,
@@ -472,8 +458,9 @@ export async function observeOnecliRuntime(
       if (isErrno(error, 'ENOENT')) return { status: 'absent', reason: 'its Compose file is missing' };
       throw error;
     }
-    validateObservedOnecliRuntime(layout, await inspectOnecliRuntime(docker, containers), expected);
-    await assertWrapperGatewayProvenance(docker, expected);
+    const drift = await configDrift(docker, containers);
+    if (drift.status !== 'present') return drift;
+    await Promise.all([assertOnecliNamedResources(docker), assertWrapperGatewayProvenance(docker, expected)]);
     return PRESENT;
   } catch (error) {
     if (!(error instanceof GwsEaError) || !['command_failed', 'command_timeout'].includes(error.code)) throw error;
@@ -481,7 +468,45 @@ export async function observeOnecliRuntime(
   }
 }
 
-function serviceObservation(layout: OnecliRuntimeLayout, containers: readonly ObservedOnecliContainer[]): Observation {
+/**
+ * Whether each service's container still runs the configuration the
+ * instance's own Compose file gives now, by Compose's own config hash: the
+ * one `up` labelled the container with, against `config --hash` through the
+ * instance's invocation, so it is computed for the same resolved project
+ * (KTD15). A service created from another configuration is absent, and the
+ * repair's `up` recreates it, keeping its volumes. The hash covers each
+ * service's image reference, ports, networks, mounts and labels; it does not
+ * cover the networks and volumes themselves, nor what an image tag holds.
+ */
+async function configDrift(
+  docker: OnecliDocker,
+  containers: readonly ObservedOnecliContainer[],
+): Promise<ServicesObservation> {
+  const { stdout } = await docker.runner({
+    ...buildComposeInvocation(docker.layout, ['config', '--hash', '*']),
+    env: docker.environment,
+    timeoutMs: INSPECT_TIMEOUT_MS,
+  });
+  const hashes = new Map<string, string>();
+  for (const line of stdout.split(/\r?\n/u)) {
+    const [service, hash] = line.trim().split(/\s+/u);
+    if (service && hash) hashes.set(service, hash);
+  }
+  const drifted = EXPECTED_SERVICES.filter((service) => {
+    const created = containers.find((container) => container.service === service)?.configHash;
+    return created === undefined || created !== hashes.get(service);
+  });
+  if (drifted.length === 0) return { status: 'present' };
+  return {
+    status: 'absent',
+    reason: `the ${drifted.join(' and ')} ${drifted.length === 1 ? 'container runs' : 'containers run'} another configuration than its Compose file gives`,
+  };
+}
+
+function serviceObservation(
+  layout: OnecliRuntimeLayout,
+  containers: readonly ObservedOnecliContainer[],
+): ServicesObservation {
   if (containers.length === 0) return { status: 'absent', reason: 'it has not been created' };
   assertOwnedContainers(layout, containers);
   const starting: string[] = [];
@@ -497,7 +522,7 @@ function serviceObservation(layout: OnecliRuntimeLayout, containers: readonly Ob
   if (containers.length !== EXPECTED_SERVICES.length) {
     return { status: 'absent', reason: 'its project has containers outside its three services' };
   }
-  if (starting.length === 0) return PRESENT;
+  if (starting.length === 0) return { status: 'present' };
   return {
     status: 'unknown',
     reason: `OneCLI ${starting.join(' and ')} ${starting.length === 1 ? 'is' : 'are'} starting`,
@@ -506,11 +531,12 @@ function serviceObservation(layout: OnecliRuntimeLayout, containers: readonly Ob
 }
 
 /**
- * The health check. The runtime must run healthy at the images the
- * instance's own Compose file names, whose app is its pinned OneCLI (OneCLI
- * reports no version of its own), and answer on its health endpoints. The
- * receipt carries the local API key, read once, for importing the provider
- * credential and persisting the key files.
+ * The health check. The runtime must run healthy from the configuration the
+ * instance's own Compose file gives now, whose app is its pinned OneCLI
+ * (OneCLI reports no version of its own), on its own networks and volumes,
+ * and answer on its health endpoints. The receipt carries the local API key,
+ * read once, for importing the provider credential and persisting the key
+ * files.
  */
 export async function verifyOnecliRuntime(
   layout: OnecliRuntimeLayout,
@@ -520,8 +546,14 @@ export async function verifyOnecliRuntime(
   const fetchImplementation = dependencies.fetch ?? globalThis.fetch;
   const docker = dockerContext(layout, dependencies);
   const expected = await instanceOnecliImages(layout, pins);
-  validateObservedOnecliRuntime(layout, await inspectOnecliRuntime(docker), expected);
+  const containers = await inspectProjectContainers(docker);
+  const services = serviceObservation(layout, containers);
+  const seen = services.status === 'present' ? await configDrift(docker, containers) : services;
+  if (seen.status !== 'present') {
+    throw new GwsEaError('unhealthy_onecli', `The OneCLI runtime is not serving: ${seen.reason}`);
+  }
   await Promise.all([
+    assertOnecliNamedResources(docker),
     assertWrapperGatewayProvenance(docker, expected),
     assertHealthyEndpoint(fetchImplementation, `${layout.appUrl}/api/health`, 'OneCLI app'),
     assertHealthyEndpoint(fetchImplementation, `${layout.appUrl}/v1/health`, 'OneCLI versioned API'),
@@ -584,8 +616,10 @@ async function writeOrVerifyOwnerOnlySecret(file: string, value: string): Promis
  * Start or repair the runtime its Compose file describes: pull missing images
  * under their own timeout, force-recreate only a service Docker reports
  * unhealthy, then start everything and wait for health within the budget the
- * healthchecks allow. A failed start names a foreign process on an allocated
- * port.
+ * healthchecks allow. That `up` also recreates any service whose config hash
+ * changed, keeping its volumes, and the health check that follows probes
+ * isolation before a receipt is issued. A failed start names a foreign
+ * process on an allocated port.
  */
 export async function reconcileOnecliRuntime(
   layout: OnecliRuntimeLayout,
@@ -792,11 +826,11 @@ function assertOwnedContainers(layout: OnecliRuntimeLayout, containers: readonly
  * Remove owned containers outside the three services, or duplicates of one,
  * and return the containers that remain.
  */
-async function cleanupOnecliDockerOrphans(docker: OnecliDocker): Promise<readonly InspectedOnecliContainer[]> {
+async function cleanupOnecliDockerOrphans(docker: OnecliDocker): Promise<readonly ObservedOnecliContainer[]> {
   const { layout, runner, environment } = docker;
   const containers = await inspectProjectContainers(docker);
   assertOwnedContainers(layout, containers);
-  const kept: InspectedOnecliContainer[] = [];
+  const kept: ObservedOnecliContainer[] = [];
   for (const container of containers) {
     const service = EXPECTED_SERVICES.find((candidate) => candidate === container.service);
     if (service && containers.filter((other) => other.service === service).length === 1) {
@@ -814,40 +848,8 @@ async function cleanupOnecliDockerOrphans(docker: OnecliDocker): Promise<readonl
   return kept;
 }
 
-async function inspectOnecliRuntime(
-  docker: OnecliDocker,
-  inspected?: readonly InspectedOnecliContainer[],
-): Promise<ObservedOnecliRuntime> {
-  const { layout, runner, environment } = docker;
-  const [containers, networkResult, volumeResult] = await Promise.all([
-    inspected ?? inspectProjectContainers(docker),
-    runner({
-      command: 'docker',
-      args: ['network', 'inspect', layout.backendNetwork, layout.agentEgressNetwork],
-      cwd: path.dirname(layout.rootDirectory),
-      env: environment,
-      timeoutMs: INSPECT_TIMEOUT_MS,
-    }),
-    runner({
-      command: 'docker',
-      args: ['volume', 'inspect', layout.postgresVolume, layout.appVolume],
-      cwd: path.dirname(layout.rootDirectory),
-      env: environment,
-      timeoutMs: INSPECT_TIMEOUT_MS,
-    }),
-  ]);
-  return {
-    containers: containers.map(({ id: _id, ...container }) => container),
-    networks: parseDockerNetworks(networkResult.stdout),
-    volumes: parseDockerVolumes(volumeResult.stdout),
-  };
-}
-
-interface InspectedOnecliContainer extends ObservedOnecliContainer {
-  readonly id: string;
-}
-
-async function inspectProjectContainers(docker: OnecliDocker): Promise<readonly InspectedOnecliContainer[]> {
+/** The IDs of every container in the instance's Compose project. */
+async function projectContainerIds(docker: OnecliDocker): Promise<readonly string[]> {
   const { layout, runner, environment } = docker;
   const list = await runner({
     command: 'docker',
@@ -864,10 +866,15 @@ async function inspectProjectContainers(docker: OnecliDocker): Promise<readonly 
     env: environment,
     timeoutMs: INSPECT_TIMEOUT_MS,
   });
-  const ids = list.stdout
+  return list.stdout
     .split(/\r?\n/u)
     .map((id) => id.trim())
     .filter((id) => id.length > 0);
+}
+
+async function inspectProjectContainers(docker: OnecliDocker): Promise<readonly ObservedOnecliContainer[]> {
+  const { layout, runner, environment } = docker;
+  const ids = await projectContainerIds(docker);
   if (ids.length === 0) return [];
   const inspection = await runner({
     command: 'docker',
@@ -961,35 +968,23 @@ async function assertWrapperGatewayProvenance(docker: OnecliDocker, expected: In
   }
 }
 
-function parseDockerContainers(source: string): readonly InspectedOnecliContainer[] {
+function parseDockerContainers(source: string): readonly ObservedOnecliContainer[] {
   const values = parseDockerArray(source, 'Docker container inspection');
   return values.map((value) => {
     const config = requireRecord(value.Config, 'Docker container inspection', INVALID_RUNTIME);
     const labels = requireRecord(config.Labels, 'Docker container labels', INVALID_RUNTIME);
     const state = requireRecord(value.State, 'Docker container state', INVALID_RUNTIME);
     const networkSettings = requireRecord(value.NetworkSettings, 'Docker network settings', INVALID_RUNTIME);
-    const networks = requireRecord(networkSettings.Networks, 'Docker container networks', INVALID_RUNTIME);
-    const mounts = value.Mounts;
-    if (!Array.isArray(mounts) || !mounts.every(isRecord)) {
-      throw new GwsEaError(INVALID_RUNTIME, 'Docker container mounts are invalid');
-    }
     const health = isRecord(state.Health) ? state.Health : undefined;
     return {
       id: stringField(value, 'Id', 'Docker container', INVALID_OUTPUT),
       service: stringField(labels, 'com.docker.compose.service', 'Docker container labels', INVALID_OUTPUT),
-      image: stringField(config, 'Image', 'Docker container config', INVALID_OUTPUT),
       instanceId: optionalString(labels[ONECLI_INSTANCE_LABEL]),
       project: optionalString(labels['com.docker.compose.project']),
+      configHash: optionalString(labels[CONFIG_HASH_LABEL]),
       running: state.Running === true,
       health: optionalString(health?.Status),
       publishedPorts: parseDockerPorts(networkSettings.Ports),
-      networks: Object.keys(networks),
-      volumes: mounts
-        .filter((mount) => mount.Type === 'volume')
-        .map((mount) => ({
-          name: stringField(mount, 'Name', 'Docker container volume', INVALID_OUTPUT),
-          destination: stringField(mount, 'Destination', 'Docker container mount', INVALID_OUTPUT),
-        })),
     };
   });
 }
@@ -1053,46 +1048,6 @@ async function assertHealthyEndpoint(
     throw new GwsEaError('unhealthy_onecli', `${label} health endpoint is unreachable`);
   }
   if (!response.ok) throw new GwsEaError('unhealthy_onecli', `${label} health endpoint is not healthy`);
-}
-
-function expectedNetworksForService(layout: OnecliRuntimeLayout, service: string): readonly string[] {
-  if (service === 'postgres' || service === 'app') return [layout.backendNetwork];
-  if (service === 'gateway') return [layout.backendNetwork, layout.agentEgressNetwork];
-  return [];
-}
-
-function validatePublishedPorts(layout: OnecliRuntimeLayout, container: ObservedOnecliContainer): void {
-  const entries = Object.entries(container.publishedPorts);
-  if (container.service === 'postgres') {
-    if (entries.length !== 0) throw new GwsEaError('unsafe_onecli_port', 'OneCLI database must not publish ports');
-    return;
-  }
-  const containerPort = container.service === 'app' ? '10254/tcp' : '10255/tcp';
-  const hostPort = String(container.service === 'app' ? layout.appPort : layout.gatewayPort);
-  if (
-    entries.length !== 1 ||
-    entries[0]?.[0] !== containerPort ||
-    entries[0][1].length !== 1 ||
-    entries[0][1][0]?.hostIp !== '127.0.0.1' ||
-    entries[0][1][0]?.hostPort !== hostPort
-  ) {
-    throw new GwsEaError('unsafe_onecli_port', `OneCLI ${container.service} port binding is invalid`);
-  }
-}
-
-function validateContainerVolumes(layout: OnecliRuntimeLayout, container: ObservedOnecliContainer): void {
-  const expected =
-    container.service === 'postgres'
-      ? [{ name: layout.postgresVolume, destination: '/var/lib/postgresql' }]
-      : [{ name: layout.appVolume, destination: '/app/data' }];
-  if (
-    container.volumes.length !== expected.length ||
-    container.volumes.some(
-      (volume, index) => volume.name !== expected[index]?.name || volume.destination !== expected[index]?.destination,
-    )
-  ) {
-    throw new GwsEaError('unsafe_onecli_volume', `OneCLI ${container.service} volume mounts are invalid`);
-  }
 }
 
 function assertExactNamedResources(actual: readonly string[], expected: readonly string[], label: string): void {
