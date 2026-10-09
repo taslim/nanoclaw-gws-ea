@@ -36,6 +36,8 @@ administers OneCLI over its REST API alone (`src/gws-ea/onecli-admin.ts`), so
 the pin moves only after `onecli-admin.contract.test.ts` passes against the new
 version, which then becomes the test's recorded verified version.
 Instance provisioning upgrades the gateway itself. Its generated, instance-owned
-runtime verifies the exact image, the health endpoints, and the isolated
-network topology before it accepts a real provider credential, so GWS-EA
-instances never follow the `add-onecli` upgrade guide.
+runtime is re-verified by Compose's own config hash plus the wrapper's
+provenance label, the owner labels and the isolated network topology, and the
+isolation probe runs whenever a service is created or recreated, before a real
+provider credential is accepted, so GWS-EA instances never follow the
+`add-onecli` upgrade guide.
