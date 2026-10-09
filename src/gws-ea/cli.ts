@@ -126,8 +126,8 @@ import {
 } from './update-all.js';
 import {
   GwsEaError,
+  releaseLine,
   sameRelease,
-  shortCommit,
   type AllocatedPorts,
   type GwsEaErrorDetails,
   type InstanceReservationInput,
@@ -1392,17 +1392,13 @@ class Cli {
   }
 }
 
-function releaseName(release: ReleaseCoordinates): string {
-  return `${release.release_track} ${shortCommit(release.deployed_commit)}`;
-}
-
 /** Where an update leaves the assistant: on its release, the one it ran kept to roll back to when it has one. */
 function updatedOutcome(instanceId: string, updated: UpdatedAssistant): Outcome {
   return {
     status: 'ready',
-    message: `Assistant ${instanceId} was updated to ${releaseName(updated.to)}.`,
+    message: `Assistant ${instanceId} was updated to ${releaseLine(updated.to)}.`,
     details: updated.rollbackTarget
-      ? [`Its previous release, ${releaseName(updated.from)}, is kept to roll back to.`]
+      ? [`Its previous release, ${releaseLine(updated.from)}, is kept to roll back to.`]
       : ['It has no previous release to roll back to.'],
   };
 }
@@ -1413,29 +1409,29 @@ function rollbackOutcome(instanceId: string, outcome: RollbackOutcome, timezone:
     case 'rolled_back':
       return {
         status: 'ready',
-        message: `Assistant ${instanceId} was rolled back to ${releaseName(outcome.to)}.`,
+        message: `Assistant ${instanceId} was rolled back to ${releaseLine(outcome.to)}.`,
         details:
           outcome.mode === 'code_only'
             ? ['Only its code went back: every conversation, memory, and setting since the update was kept.']
             : [
                 `Its snapshot from ${formatLocalTime(outcome.snapshotAt, timezone)} was restored.`,
-                `What it recorded since on ${releaseName(outcome.from)} is kept in ${outcome.keptAt ?? 'its quarantine'} until another snapshot restore replaces it, or the assistant is removed.`,
+                `What it recorded since on ${releaseLine(outcome.from)} is kept in ${outcome.keptAt} until another snapshot restore replaces it, or the assistant is removed.`,
               ],
       };
     case 'update_discarded':
       return {
         status: 'ready',
-        message: `The update of assistant ${instanceId} to ${releaseName(outcome.discarded)} was discarded; it runs ${releaseName(outcome.release)} again.`,
+        message: `The update of assistant ${instanceId} to ${releaseLine(outcome.discarded)} was discarded; it runs ${releaseLine(outcome.release)} again.`,
       };
     case 'follow_ups_finished':
       return {
         status: 'ready',
-        message: `Assistant ${instanceId} runs ${releaseName(outcome.release)}; its rollback is finished.`,
+        message: `Assistant ${instanceId} runs ${releaseLine(outcome.release)}; its rollback is finished.`,
       };
     case 'declined':
       return {
         status: 'ready',
-        message: `Rollback cancelled. Assistant ${instanceId} stays on ${releaseName(outcome.release)} as before.`,
+        message: `Rollback cancelled. Assistant ${instanceId} stays on ${releaseLine(outcome.release)} as before.`,
       };
   }
 }
@@ -1444,7 +1440,7 @@ function rollbackOutcome(instanceId: string, outcome: RollbackOutcome, timezone:
 function finishedOutcome(instanceId: string, release: ReleaseCoordinates): Outcome {
   return {
     status: 'ready',
-    message: `Assistant ${instanceId} runs ${releaseName(release)}; its update is finished.`,
+    message: `Assistant ${instanceId} runs ${releaseLine(release)}; its update is finished.`,
   };
 }
 

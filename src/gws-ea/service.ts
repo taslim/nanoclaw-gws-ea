@@ -134,7 +134,6 @@ export interface InstanceServiceLayout {
   readonly cliSocket: string;
   readonly standardOutputPath: string;
   readonly standardErrorPath: string;
-  readonly imageTag: string;
   readonly installLabel: string;
 }
 
@@ -367,8 +366,8 @@ async function persistRuntimeFile(config: InstanceRuntimeConfig): Promise<void> 
  * Write `runtime.json` once, and gws-ea's `.env` keys where the assistant's
  * `.env` does not set them, as NanoClaw reads it. Both are in the physical
  * `state/`, never written through a link. A key it sets is the release's own,
- * written by the create that deployed it, so a later start never rewrites it
- * (KTD6); every other writer's keys are kept.
+ * written by the create that deployed it, so a later start never rewrites it;
+ * every other writer's keys are kept.
  */
 export async function persistInstanceRuntime(
   configInput: InstanceRuntimeConfig,
@@ -501,7 +500,7 @@ export function renderInstanceServiceDefinition(
 
 /**
  * Put back the service definition a kept release ran with, while its service
- * is stopped (KTD6): a switch installs the one the release kept rather than
+ * is stopped (KTD1): a switch installs the one the release kept rather than
  * rendering one. Only when it differs from the one installed, and systemd is
  * then told to reload it. Returns whether it changed.
  */
@@ -639,7 +638,7 @@ async function ensureLingering(
 /**
  * Install the service when its definition is missing, then (re)start it. An
  * existing definition is the release's own, rendered by the create that
- * deployed it, so a later start never renders it again (KTD6). systemd is
+ * deployed it, so a later start never renders it again (KTD1). systemd is
  * told about a new unit, enables it, and keeps a user's services running
  * after logout (lingering). The start itself is the one every other command
  * uses (`restartService`): a running host is stopped and its job waited out,

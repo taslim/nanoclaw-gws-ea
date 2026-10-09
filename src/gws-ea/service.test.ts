@@ -246,7 +246,6 @@ describe('GWS-EA instance runtime', () => {
       cliSocket: path.join(state, 'data', 'ncl.sock'),
       standardOutputPath: path.join(logs, 'nanoclaw.log'),
       standardErrorPath: path.join(logs, 'nanoclaw.error.log'),
-      imageTag: `nanoclaw-agent-v2-${config.install_id}:latest`,
       installLabel: `nanoclaw-install=${config.install_id}`,
     };
     await mkdir(path.dirname(layout.serviceDefinitionPath), { recursive: true });

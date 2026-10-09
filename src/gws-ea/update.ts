@@ -84,6 +84,7 @@ import { safeErrorMessage } from './redact.js';
 import { getInstanceReservation } from './registry.js';
 import { continueConversion, finishConversion, prepareConversion, type ConversionSeams } from './release-convert.js';
 import {
+  exists,
   isReleaseComplete,
   operationName,
   readCurrent,
@@ -103,6 +104,7 @@ import { instanceServicePlatform } from './service-coordinates.js';
 import type { ServiceState } from './status.js';
 import {
   GwsEaError,
+  releaseLine,
   releaseOf,
   sameRelease,
   shortCommit,
@@ -494,16 +496,6 @@ function sameList(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((entry, index) => entry === right[index]);
 }
 
-async function exists(target: string): Promise<boolean> {
-  try {
-    await lstat(target);
-    return true;
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) return false;
-    throw error;
-  }
-}
-
 /**
  * Where the dry run may put its copy: the staged release's own `data/`, as a
  * physical directory. What the migration script resolves from its working
@@ -769,10 +761,6 @@ export async function confirmStagedUpdate(
     manifest: staged.manifest,
     ...(staged.preview.conversion ? { no_rollback_target: true as const } : {}),
   });
-}
-
-function releaseLine(release: ReleaseCoordinates): string {
-  return `${release.release_track} ${shortCommit(release.deployed_commit)}`;
 }
 
 /** The preview, one fact per line. */

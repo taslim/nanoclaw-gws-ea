@@ -567,14 +567,23 @@ function inOwnRoot(paths: ControlPlanePaths, reservation: InstanceReservation): 
   return legacyInstanceRoot(paths, reservation) === undefined;
 }
 
+/** The release the assistant's live link names, read at most once however many observations of it ask. */
+function liveRelease(paths: ControlPlanePaths, instanceId: string): () => Promise<string | undefined> {
+  return once(() => readCurrent(paths.instanceLayout(instanceId)));
+}
+
 /** Where the assistant stands between releases and layouts, read physically, never through the live link. */
-async function observePhase(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<PhaseView> {
+async function observePhase(
+  paths: ControlPlanePaths,
+  reservation: InstanceReservation,
+  current: () => Promise<string | undefined>,
+): Promise<PhaseView> {
   const id = reservation.instance_id;
   const update = `gws-ea update --id ${id}`;
   try {
     if (await isConverting(paths, id)) return { state: 'converting', continue_with: update };
     if (!inOwnRoot(paths, reservation)) return { state: 'legacy', convert_with: update };
-    const live = await readCurrent(paths.instanceLayout(id));
+    const live = await current();
     return live === undefined ? { state: 'fenced' } : { state: 'live', release: live };
     // eslint-disable-next-line no-catch-all/no-catch-all -- A phase that cannot be read is reported, never thrown.
   } catch (error) {
@@ -605,6 +614,8 @@ interface Subject {
   readonly reservation: InstanceReservation;
   readonly inspection: OperationInspection;
   readonly runtime: RuntimeRecord;
+  /** The live release, the one read the phase also reports. */
+  readonly current: () => Promise<string | undefined>;
 }
 
 function fromObservation(seen: Observation): ProbeResult {
@@ -639,14 +650,9 @@ async function checkoutProbe({
 }
 
 /** The live release's own agent image, `<base>:r-<release>`, which its host runs agents on (KTD6). */
-async function imageProbe({
-  context,
-  reservation,
-  runtime: record,
-  observers,
-}: Subject): Promise<ProbeResult & ImageFacts> {
+async function imageProbe({ runtime: record, observers, current }: Subject): Promise<ProbeResult & ImageFacts> {
   const runtime = requireRuntime(record);
-  const live = await readCurrent(context.paths.instanceLayout(reservation.instance_id));
+  const live = await current();
   if (live === undefined) throw new Unobservable('No release is live, so no agent image is in use.');
   const tag = releaseImageTag(getInstallScopedNames(runtime.install_id).containerImageBase, live);
   const docker = {
@@ -1093,8 +1099,9 @@ export async function observeAssistantStatus(
   const observedAt = (context.now ?? (() => new Date()))().toISOString();
   const observers = resolveObservers(context.observers);
   const inspection = await inspect(context.paths, reservation);
+  const current = liveRelease(context.paths, reservation.instance_id);
   const [phase, removal, release] = await Promise.all([
-    observePhase(context.paths, reservation),
+    observePhase(context.paths, reservation, current),
     removalInProgress(context.paths, instanceId),
     observeRelease({ context, reservation, observers }),
   ]);
@@ -1118,7 +1125,7 @@ export async function observeAssistantStatus(
   if (!inOwnRoot(context.paths, reservation)) return record;
 
   const runtime = await readRuntimeRecord(context.paths, reservation);
-  const subject: Subject = { context, observers, reservation, inspection, runtime };
+  const subject: Subject = { context, observers, reservation, inspection, runtime, current };
   const main = once(() => publishedMain(subject));
   const agents = once(() => onecliAgents(subject));
   const live = readSchema(observers, context.paths.instanceLayout(instanceId).state);
@@ -1200,7 +1207,7 @@ export async function listAssistants(context: ObservationContext): Promise<Assis
     reservations.map(async (reservation): Promise<ListedAssistant> => {
       const inspection = await inspect(context.paths, reservation);
       const [phase, removal, release, observed] = await Promise.all([
-        observePhase(context.paths, reservation),
+        observePhase(context.paths, reservation, liveRelease(context.paths, reservation.instance_id)),
         removalInProgress(context.paths, reservation.instance_id),
         observeRelease({ context, reservation, observers }),
         inOwnRoot(context.paths, reservation)

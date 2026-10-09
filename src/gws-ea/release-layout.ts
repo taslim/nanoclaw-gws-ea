@@ -141,7 +141,8 @@ export function operationName(startedAt: string): string {
   return requireOperationName(startedAt.replace(/[-:.]/gu, ''));
 }
 
-async function lstatIfPresent(target: string): Promise<Stats | undefined> {
+/** The entry at `target`, unfollowed, or undefined when there is none. */
+export async function lstatIfPresent(target: string): Promise<Stats | undefined> {
   try {
     return await lstat(target);
   } catch (error) {
@@ -150,7 +151,13 @@ async function lstatIfPresent(target: string): Promise<Stats | undefined> {
   }
 }
 
-async function syncDirectory(directory: string): Promise<void> {
+/** Whether there is an entry at `target`, unfollowed. */
+export async function exists(target: string): Promise<boolean> {
+  return (await lstatIfPresent(target)) !== undefined;
+}
+
+/** Make `directory`'s entries durable: fsync the directory itself. */
+export async function syncDirectory(directory: string): Promise<void> {
   const handle = await open(directory, fsConstants.O_RDONLY);
   try {
     await handle.sync();

@@ -17,7 +17,7 @@
  * shared skills reconciled (KTD16), and the follow-ups a committed release
  * runs.
  */
-import { lstat, readdir, readFile, readlink, rm } from 'node:fs/promises';
+import { readdir, readFile, readlink, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -47,7 +47,15 @@ import { buildToolEnvironment, runSanitizedCommand, type SanitizedCommandRunner 
 import { instanceOnecliLayout } from './provision.js';
 import { redact, safeErrorMessage } from './redact.js';
 import { getInstanceReservation } from './registry.js';
-import { fence, pointCurrent, pruneInstance, readCurrent, releaseName, type InstanceLayout } from './release-layout.js';
+import {
+  exists,
+  fence,
+  pointCurrent,
+  pruneInstance,
+  readCurrent,
+  releaseName,
+  type InstanceLayout,
+} from './release-layout.js';
 import { applyReleaseFiles } from './release-stage.js';
 import {
   loadInstanceRuntimeConfig,
@@ -66,7 +74,7 @@ import {
   type ServiceControlOptions,
 } from './service-control.js';
 import { instanceServicePlatform } from './service-coordinates.js';
-import { GwsEaError, shortCommit, type InstanceReservation, type ReleaseCoordinates } from './types.js';
+import { GwsEaError, releaseLine, type InstanceReservation, type ReleaseCoordinates } from './types.js';
 import { isRecord, unwrapData } from './validation.js';
 import { hostLeaseLive, readDerivedImageGroups } from './verify.js';
 
@@ -264,16 +272,6 @@ function notQuiet(instanceRoot: string, detail: string): GwsEaError {
     'instance_not_quiet',
     `The assistant at ${instanceRoot} is not quiet, so the switch went no further: ${detail}.`,
   );
-}
-
-async function exists(target: string): Promise<boolean> {
-  try {
-    await lstat(target);
-    return true;
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) return false;
-    throw error;
-  }
 }
 
 function abbreviated(args: string): string {
@@ -797,10 +795,6 @@ export function releaseFollowUps(runtime: InstanceRuntimeConfig): OperationFollo
 
 /** At least the host's own bound on building an agent group's image (`src/container-runner.ts`), plus its restart. */
 const GROUP_IMAGE_REBUILD_TIMEOUT_MS = 20 * 60_000;
-
-function releaseLine(release: ReleaseCoordinates): string {
-  return `${release.release_track} ${shortCommit(release.deployed_commit)}`;
-}
 
 function describeFollowUp(followUp: OperationFollowUp): string {
   switch (followUp.kind) {

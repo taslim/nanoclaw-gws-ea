@@ -39,8 +39,7 @@
  * names an instance root.
  */
 import { randomUUID } from 'node:crypto';
-import { constants as fsConstants, type Stats } from 'node:fs';
-import { lstat, mkdir, open, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
@@ -77,7 +76,14 @@ import { buildToolEnvironment, runSanitizedCommand } from './process.js';
 import { instanceOnecliLayout } from './provision.js';
 import { safeErrorMessage } from './redact.js';
 import { getInstanceReservation, readRegistry, withMachineLock } from './registry.js';
-import { createState, releaseName, STATE_ROOTS, type InstanceLayout } from './release-layout.js';
+import {
+  createState,
+  lstatIfPresent,
+  releaseName,
+  STATE_ROOTS,
+  syncDirectory,
+  type InstanceLayout,
+} from './release-layout.js';
 import { assertUpdateKeepsSetup } from './release-preflight.js';
 import type { UpdateReleaseTarget } from './release-target.js';
 import { readOwnerOnlyFile, readOwnerOnlyJson, writePrivateTextFile } from './secrets.js';
@@ -89,7 +95,7 @@ import {
 } from './service.js';
 import { createServiceControl, runtimeServiceTarget, type InstanceServiceControl } from './service-control.js';
 import { instanceServicePlatform } from './service-coordinates.js';
-import { GwsEaError, shortCommit, type InstanceReservation, type ReleaseCoordinates } from './types.js';
+import { GwsEaError, releaseLine, shortCommit, type InstanceReservation, type ReleaseCoordinates } from './types.js';
 import type { CheckedUpdate, StagedUpdate, UpdateDependencies, UpdateIntent } from './update.js';
 import { isRecord, requireCanonicalTimestamp } from './validation.js';
 import { hostLeaseLive, readSchemaManifest } from './verify.js';
@@ -181,24 +187,6 @@ export function legacyLocation(
 /** Whether the assistant's conversion is under way: its progress record is there, from its first rename until it commits. */
 export function isConverting(paths: Pick<ControlPlanePaths, 'instanceRoot'>, instanceId: string): Promise<boolean> {
   return isRegularFile(conversionRecordFile(paths, instanceId));
-}
-
-async function lstatIfPresent(target: string): Promise<Stats | undefined> {
-  try {
-    return await lstat(target);
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) return undefined;
-    throw error;
-  }
-}
-
-async function syncDirectory(directory: string): Promise<void> {
-  const handle = await open(directory, fsConstants.O_RDONLY);
-  try {
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
 }
 
 /** The conversion's progress record in the assistant's short root. */
@@ -313,10 +301,6 @@ async function readLegacyAssistant(
 /** The old host's service: the same launchd job the short root keeps, found from the old checkout. */
 function legacyService(legacy: LegacyAssistant, dependencies: UpdateDependencies): InstanceServiceControl {
   return createServiceControl(dependencies.serviceHelpers, runtimeServiceTarget(legacy.old), dependencies.service);
-}
-
-function releaseLine(release: ReleaseCoordinates): string {
-  return `${release.release_track} ${shortCommit(release.deployed_commit)}`;
 }
 
 /**

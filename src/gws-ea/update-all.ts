@@ -37,7 +37,7 @@ import { assertConverted } from './release-convert.js';
 import { resolveReleaseTarget, type ToolProviderSetup } from './release-target.js';
 import type { NanoclawServiceHelpers } from './service-control.js';
 import { listAssistants, unfinishedOperation, type ListedAssistant } from './status.js';
-import { GwsEaError, releaseOf, sameRelease, shortCommit, type ReleaseCoordinates } from './types.js';
+import { GwsEaError, releaseLine, releaseOf, sameRelease, shortCommit, type ReleaseCoordinates } from './types.js';
 import { resolveUpdateIntent, serviceRefusal, type UpdatedAssistant, type UpdateSeams } from './update.js';
 import { readCentralMigrations } from './verify.js';
 
@@ -91,10 +91,6 @@ export interface UpdateAllSummary {
   readonly details: readonly string[];
 }
 
-function releaseName(release: ReleaseCoordinates): string {
-  return `${release.release_track} ${shortCommit(release.deployed_commit)}`;
-}
-
 /** Why the assistant's update or rollback record keeps it from an update, naming what moves it on, as `status` does. */
 function operationRefusal({ operation }: ListedAssistant): string | undefined {
   switch (operation.state) {
@@ -144,7 +140,7 @@ async function intendedTurn(
     }
     const reservation = await getInstanceReservation(paths, instanceId);
     if (reservation.deployed_commit === intent.target.deployed_commit) {
-      return { kind: 'refused', reason: `It already runs ${releaseName(intent.target)}, this tool's release.` };
+      return { kind: 'refused', reason: `It already runs ${releaseLine(intent.target)}, this tool's release.` };
     }
     await resolveReleaseTarget(
       {
@@ -274,9 +270,9 @@ function migrationsLine(migrations: readonly string[] | undefined): string {
 function turnLine(instanceId: string, turn: PlannedTurn): string {
   switch (turn.kind) {
     case 'update':
-      return `Update ${instanceId}: ${releaseName(turn.from)} → ${releaseName(turn.to)}; database migrations to add: ${migrationsLine(turn.migrations)}`;
+      return `Update ${instanceId}: ${releaseLine(turn.from)} → ${releaseLine(turn.to)}; database migrations to add: ${migrationsLine(turn.migrations)}`;
     case 'follow_ups':
-      return `Finish ${instanceId}'s update to ${releaseName(turn.release)}: only its follow-ups are left`;
+      return `Finish ${instanceId}'s update to ${releaseLine(turn.release)}: only its follow-ups are left`;
   }
 }
 
@@ -294,10 +290,10 @@ function endedLines(ended: ReadonlyMap<string, AssistantUpdate>): Record<Assista
   for (const [id, update] of ended) {
     switch (update.kind) {
       case 'updated':
-        lines.updated.push(`Updated ${id}: ${releaseName(update.updated.from)} → ${releaseName(update.updated.to)}`);
+        lines.updated.push(`Updated ${id}: ${releaseLine(update.updated.from)} → ${releaseLine(update.updated.to)}`);
         break;
       case 'completed':
-        lines.completed.push(`Completed ${id}'s update to ${releaseName(update.release)}: its follow-ups are done`);
+        lines.completed.push(`Completed ${id}'s update to ${releaseLine(update.release)}: its follow-ups are done`);
         break;
     }
   }

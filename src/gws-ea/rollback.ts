@@ -25,7 +25,7 @@
  */
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { lstat, mkdtemp, readdir, readFile, readlink, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, readlink, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -73,6 +73,7 @@ import {
 import { readDeployedSetup } from './provision.js';
 import { safeErrorMessage } from './redact.js';
 import {
+  exists,
   isReleaseComplete,
   operationName,
   readCurrent,
@@ -82,7 +83,7 @@ import {
   snapshotTakenAt,
 } from './release-layout.js';
 import { activeStep } from './run-log.js';
-import { GwsEaError, releaseOf, shortCommit, type ReleaseCoordinates } from './types.js';
+import { GwsEaError, releaseLine, releaseOf, type ReleaseCoordinates } from './types.js';
 import { backupCentralDatabase, printableName, readForgottenFingerprints, readSchemaManifest } from './verify.js';
 
 /** How many IDs and paths a discard summary lists; the counts are always whole. */
@@ -139,36 +140,26 @@ export interface RollbackRequest {
 
 /** Where a rollback left the assistant. */
 export type RollbackOutcome =
-  | {
+  | ({
       readonly kind: 'rolled_back';
       readonly from: ReleaseCoordinates;
       readonly to: ReleaseCoordinates;
-      readonly mode: RollbackMode;
       /** The snapshot restored in snapshot mode; in code-only mode, the one left unused. */
       readonly snapshotAt: string;
-      /** In snapshot mode, where the state it replaced is kept. */
-      readonly keptAt?: string;
-    }
+    } & (
+      | { readonly mode: 'code_only' }
+      | {
+          readonly mode: 'snapshot';
+          /** Where the state it replaced is kept. */
+          readonly keptAt: string;
+        }
+    ))
   /** An update whose release had not started was discarded; `release` runs again. */
   | { readonly kind: 'update_discarded'; readonly release: ReleaseCoordinates; readonly discarded: ReleaseCoordinates }
   /** The follow-ups an earlier rollback left were run. */
   | { readonly kind: 'follow_ups_finished'; readonly release: ReleaseCoordinates }
   /** The snapshot restore was declined; the assistant runs `release` as before. */
   | { readonly kind: 'declined'; readonly release: ReleaseCoordinates };
-
-function releaseLine(release: ReleaseCoordinates): string {
-  return `${release.release_track} ${shortCommit(release.deployed_commit)}`;
-}
-
-async function exists(target: string): Promise<boolean> {
-  try {
-    await lstat(target);
-    return true;
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) return false;
-    throw error;
-  }
-}
 
 /** Which schema moved between two manifests (KTD5): the central migrations, else the session tables and columns. */
 export function sameSchema(left: SnapshotManifest, right: SnapshotManifest): 'same' | SnapshotReason {
@@ -496,7 +487,7 @@ export function describeRollback(outcome: RollbackOutcome, timezone: string): st
     case 'rolled_back':
       return outcome.mode === 'code_only'
         ? `the assistant runs ${releaseLine(outcome.to)} again, with everything it recorded since kept.`
-        : `the assistant runs ${releaseLine(outcome.to)} again on its snapshot from ${formatLocalTime(outcome.snapshotAt, timezone)}; what it recorded since is kept in ${outcome.keptAt ?? 'its quarantine'}.`;
+        : `the assistant runs ${releaseLine(outcome.to)} again on its snapshot from ${formatLocalTime(outcome.snapshotAt, timezone)}; what it recorded since is kept in ${outcome.keptAt}.`;
     case 'update_discarded':
       return `the update to ${releaseLine(outcome.discarded)} was discarded, and the assistant runs ${releaseLine(outcome.release)} again.`;
     case 'follow_ups_finished':
@@ -866,14 +857,11 @@ async function runRollback(rollback: Rollback, start: OperationRecord): Promise<
 
 async function rolledBack(rollback: Rollback, record: OperationRecord): Promise<RollbackOutcome> {
   const mode = record.mode ?? 'code_only';
-  return {
-    kind: 'rolled_back',
-    from: rollback.from,
-    to: rollback.to,
-    mode,
-    snapshotAt: await snapshotTakenAt(rollback.layout, rollback.snapshot),
-    ...(mode === 'snapshot' ? { keptAt: rollback.layout.quarantine(rollback.op) } : {}),
-  };
+  const { from, to } = rollback;
+  const snapshotAt = await snapshotTakenAt(rollback.layout, rollback.snapshot);
+  return mode === 'snapshot'
+    ? { kind: 'rolled_back', from, to, mode, snapshotAt, keptAt: rollback.layout.quarantine(rollback.op) }
+    : { kind: 'rolled_back', from, to, mode, snapshotAt };
 }
 
 /**

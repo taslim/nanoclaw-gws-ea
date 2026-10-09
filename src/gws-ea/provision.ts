@@ -1,7 +1,6 @@
 import Database from 'better-sqlite3';
 import { existsSync } from 'node:fs';
 import { mkdir, rmdir } from 'node:fs/promises';
-import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import {
@@ -68,7 +67,9 @@ import {
 } from './principal.js';
 import { verifyExistingGchatRoute, validateExistingGchatEndpoint } from './endpoint.js';
 import {
+  centralDatabaseFile,
   instanceErrorsSince,
+  openWithoutSideFiles,
   verifyPrincipalBinding,
   verifyTalkableConversation,
   type ConversationVerificationInput,
@@ -1262,10 +1263,10 @@ interface PersistedProfileIdentity {
 }
 
 function readPersistedProfile(runtime: InstanceRuntimeConfig): PersistedProfileIdentity | undefined {
-  const file = path.join(runtime.state_root, 'data', 'v2.db');
+  const file = centralDatabaseFile(runtime.state_root);
   let database: Database.Database;
   try {
-    database = new Database(file, { readonly: true, fileMustExist: true });
+    database = openWithoutSideFiles(file);
   } catch (error) {
     if (!existsSync(file)) return undefined;
     throw error;

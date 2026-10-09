@@ -164,16 +164,21 @@ function isClosedWalDatabase(file: string): boolean {
  * is read in place. So is one a writer opened while it was copied: that
  * writer's `-wal` holds commits the copied main file may lack.
  */
+export function openWithoutSideFiles(file: string): Database.Database {
+  if (isClosedWalDatabase(file)) {
+    const contents = readFileSync(file);
+    if (!existsSync(`${file}-wal`)) {
+      for (const offset of FORMAT_VERSION_OFFSETS) contents[offset] = ROLLBACK_FORMAT;
+      return new Database(contents, { readonly: true });
+    }
+  }
+  return new Database(file, { readonly: true, fileMustExist: true });
+}
+
+/** Instance message state, opened as `openWithoutSideFiles` does; whatever cannot be opened is missing. */
 function openReadonly(file: string): Database.Database {
   try {
-    if (isClosedWalDatabase(file)) {
-      const contents = readFileSync(file);
-      if (!existsSync(`${file}-wal`)) {
-        for (const offset of FORMAT_VERSION_OFFSETS) contents[offset] = ROLLBACK_FORMAT;
-        return new Database(contents, { readonly: true });
-      }
-    }
-    return new Database(file, { readonly: true, fileMustExist: true });
+    return openWithoutSideFiles(file);
   } catch {
     throw new GwsEaError('verification_state_missing', 'Required instance message state is missing');
   }
@@ -435,7 +440,8 @@ export function verifyTalkableConversation(input: ConversationVerificationInput)
   }
 }
 
-function centralDatabaseFile(stateRoot: string): string {
+/** An assistant's central database under its state root. */
+export function centralDatabaseFile(stateRoot: string): string {
   return path.join(path.resolve(stateRoot), 'data', 'v2.db');
 }
 

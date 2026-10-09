@@ -102,6 +102,11 @@ export function shortCommit(commit: string): string {
   return commit.slice(0, 12);
 }
 
+/** A release as messages show it: its track and short commit. */
+export function releaseLine(release: ReleaseCoordinates): string {
+  return `${release.release_track} ${shortCommit(release.deployed_commit)}`;
+}
+
 export function releaseOf(reservation: ReleaseCoordinates): ReleaseCoordinates {
   return {
     source_remote: reservation.source_remote,

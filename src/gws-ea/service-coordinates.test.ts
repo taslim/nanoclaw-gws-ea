@@ -12,7 +12,6 @@ describe('GWS-EA service coordinates', () => {
   const homeDirectory = '/home/operator';
   const installId = '1234567890abcdef1234567890abcdef';
   const shared = {
-    imageTag: `nanoclaw-agent-v2-${installId}:latest`,
     installLabel: `nanoclaw-install=${installId}`,
   } as const;
 
@@ -82,7 +81,6 @@ describe('GWS-EA service coordinates', () => {
       expect(second.manager).toBe(first.manager);
       expect(second.serviceIdentity).not.toBe(first.serviceIdentity);
       expect(second.serviceDefinitionPath).not.toBe(first.serviceDefinitionPath);
-      expect(second.imageTag).not.toBe(first.imageTag);
       expect(second.installLabel).not.toBe(first.installLabel);
     },
   );
