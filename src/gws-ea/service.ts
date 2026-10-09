@@ -7,16 +7,22 @@ import { isErrno } from '../community-portal/errors.js';
 import { readEnvFile } from '../env.js';
 import { getInstallScopedNames } from '../install-slug.js';
 import { renderLaunchdService, renderSystemdService } from './service-definition.js';
-import { adoptSharedAgentImage, agentImageKey, readAgentImageInputs } from './agent-image.js';
+import { createOnecliAdmin, type OnecliAdmin, type OnecliAdminDependencies } from './onecli-admin.js';
 import type { OnecliRuntimeLayout } from './onecli-compose.js';
-import { preparePrivateDirectory, assertPrivateDirectory, instanceRuntimeFile, isRegularFile } from './paths.js';
+import {
+  CONTROL_PLANE_ROOT,
+  assertPrivateDirectory,
+  instanceRuntimeFile,
+  isRegularFile,
+  preparePrivateDirectory,
+  type ControlPlanePaths,
+} from './paths.js';
 import {
   buildHostEnvironment,
   buildToolEnvironment,
   replaceProcess,
   runSanitizedCommand,
   type SanitizedCommand,
-  type SanitizedCommandResult,
   type SanitizedCommandRunner,
 } from './process.js';
 import { activeStep } from './run-log.js';
@@ -29,11 +35,12 @@ import {
 import { validateExistingGchatEndpoint } from './endpoint.js';
 import { deriveWorkspaceAddOnIdentity, parseGcpProjectNumber } from './gcp-identity.js';
 import { assertInstanceId } from './registry.js';
+import { instanceLayout, readCurrent, releaseName } from './release-layout.js';
 import { GOOGLE_GRANT_FILE_ENV, GOOGLE_GRANT_FILE_NAME } from '../modules/gws-ea-google/grant.js';
 import { GwsEaError, ingressEndpointUrl, type AllocatedPorts, type InstanceReservation } from './types.js';
 import { parseJson, requireDockerEndpoint, requirePath, requireRecord, requireString } from './validation.js';
 
-const INSTANCE_RUNTIME_SCHEMA_VERSION = 1 as const;
+const INSTANCE_RUNTIME_SCHEMA_VERSION = 2 as const;
 const PROVIDER_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
 const ONECLI_PROJECT_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/u;
 const SERVICE_PATH = '/usr/local/bin:/usr/bin:/bin';
@@ -49,23 +56,28 @@ export interface InstanceSecretFiles {
  * What `runtime.json` stores: the values nothing else determines, plus the
  * local Docker endpoint create resolved. Everything derivable from
  * them is recomputed on every read, so it can never disagree with them.
+ * It belongs to the assistant, not to a release: create writes it once into
+ * the physical `state/`, and which release runs is the live link (KTD2).
  */
 export interface PersistedInstanceRuntime {
   readonly schema_version: typeof INSTANCE_RUNTIME_SCHEMA_VERSION;
   readonly instance_id: string;
-  readonly deployed_commit: string;
-  readonly checkout_realpath: string;
+  /** The assistant's canonical physical root, `<state root>/<first 8 hex>`. */
+  readonly instance_root: string;
   readonly node_path: string;
   readonly home_directory: string;
   readonly allocated_ports: AllocatedPorts;
   readonly onecli_project: string;
-  readonly onecli_cli_path: string;
   readonly selected_provider: string;
   readonly endpoint_url: string;
   readonly docker_endpoint: string;
 }
 
 export interface InstanceRuntimeConfig extends PersistedInstanceRuntime {
+  /** The live release's link, `<instance root>/nanoclaw`: what the service, `ncl`, and the host's status run from. */
+  readonly checkout_root: string;
+  /** The physical `state/`, which holds NanoClaw's `.env` and `data` whatever release is live, or none. */
+  readonly state_root: string;
   readonly install_id: string;
   readonly agent_egress_network: string;
   readonly onecli_app_url: string;
@@ -122,7 +134,6 @@ export interface InstanceServiceLayout {
   readonly cliSocket: string;
   readonly standardOutputPath: string;
   readonly standardErrorPath: string;
-  readonly imageTag: string;
   readonly installLabel: string;
 }
 
@@ -162,8 +173,8 @@ function assertPort(value: unknown, label: string): number {
   return value;
 }
 
-function expectedSecretFiles(checkout: string): InstanceSecretFiles {
-  const root = path.join(path.dirname(checkout), 'secrets');
+function expectedSecretFiles(instanceRoot: string): InstanceSecretFiles {
+  const root = path.join(instanceRoot, 'secrets');
   return {
     gchat_credentials: path.join(root, 'gchat-service-account.json'),
     onecli_runtime_api_key: path.join(root, 'onecli-runtime-api-key'),
@@ -192,14 +203,17 @@ function installId(instanceId: string): string {
 
 function deriveRuntime(persisted: PersistedInstanceRuntime): InstanceRuntimeConfig {
   const project = persisted.onecli_project;
+  const layout = instanceLayout(persisted.instance_root);
   return {
     ...persisted,
+    checkout_root: layout.current,
+    state_root: layout.state,
     install_id: installId(persisted.instance_id),
     agent_egress_network: `${project}-agent-egress`,
     onecli_app_url: `http://127.0.0.1:${persisted.allocated_ports.onecli_app}`,
     onecli_gateway_url: `http://127.0.0.1:${persisted.allocated_ports.onecli_gateway}`,
     onecli_gateway_container: `${project}-gateway-1`,
-    secret_files: expectedSecretFiles(persisted.checkout_realpath),
+    secret_files: expectedSecretFiles(persisted.instance_root),
   };
 }
 
@@ -207,13 +221,11 @@ function persistedRuntime(config: PersistedInstanceRuntime): PersistedInstanceRu
   return {
     schema_version: config.schema_version,
     instance_id: config.instance_id,
-    deployed_commit: config.deployed_commit,
-    checkout_realpath: config.checkout_realpath,
+    instance_root: config.instance_root,
     node_path: config.node_path,
     home_directory: config.home_directory,
     allocated_ports: config.allocated_ports,
     onecli_project: config.onecli_project,
-    onecli_cli_path: config.onecli_cli_path,
     selected_provider: config.selected_provider,
     endpoint_url: config.endpoint_url,
     docker_endpoint: config.docker_endpoint,
@@ -225,6 +237,7 @@ function runtimeFileContents(config: InstanceRuntimeConfig): string {
 }
 
 export function createInstanceRuntimeConfig(
+  paths: Pick<ControlPlanePaths, 'instanceRoot'>,
   reservation: InstanceReservation,
   onecli: OnecliRuntimeLayout,
   input: InstanceRuntimeInput,
@@ -242,13 +255,11 @@ export function createInstanceRuntimeConfig(
   return validateRuntimeConfig({
     schema_version: INSTANCE_RUNTIME_SCHEMA_VERSION,
     instance_id: reservation.instance_id,
-    deployed_commit: reservation.deployed_commit,
-    checkout_realpath: path.resolve(reservation.checkout_realpath),
+    instance_root: paths.instanceRoot(reservation.instance_id),
     node_path: path.resolve(input.nodePath),
     home_directory: path.resolve(input.homeDirectory),
     allocated_ports: { ...reservation.allocated_ports },
     onecli_project: onecli.project,
-    onecli_cli_path: onecli.cliExecutable,
     selected_provider: input.selectedProvider.toLowerCase(),
     endpoint_url: ingressEndpointUrl(reservation.exclusive_resource_claims.ingress),
     docker_endpoint: input.dockerEndpoint,
@@ -282,18 +293,14 @@ export function validateRuntimeConfig(value: unknown): InstanceRuntimeConfig {
   } catch {
     throw new GwsEaError(INVALID_RUNTIME, 'endpoint_url is invalid');
   }
-  const commit = requireString(raw.deployed_commit, 'deployed_commit', INVALID_RUNTIME);
-  if (!/^[0-9a-f]{40}$/u.test(commit)) throw new GwsEaError(INVALID_RUNTIME, 'deployed_commit is invalid');
   return deriveRuntime({
     schema_version: INSTANCE_RUNTIME_SCHEMA_VERSION,
     instance_id: instanceId,
-    deployed_commit: commit,
-    checkout_realpath: requirePath(raw.checkout_realpath, 'checkout_realpath', INVALID_RUNTIME),
+    instance_root: requirePath(raw.instance_root, 'instance_root', INVALID_RUNTIME),
     node_path: requirePath(raw.node_path, 'node_path', INVALID_RUNTIME),
     home_directory: requirePath(raw.home_directory, 'home_directory', INVALID_RUNTIME),
     allocated_ports: ports,
     onecli_project: project,
-    onecli_cli_path: requirePath(raw.onecli_cli_path, 'onecli_cli_path', INVALID_RUNTIME),
     selected_provider: provider,
     endpoint_url: endpointUrl,
     docker_endpoint: requireDockerEndpoint(raw.docker_endpoint, 'docker_endpoint', INVALID_RUNTIME),
@@ -316,7 +323,8 @@ export const INSTANCE_HOST_ENV_KEYS = [
 
 type InstanceHostEnvKey = (typeof INSTANCE_HOST_ENV_KEYS)[number];
 
-function instanceHostConfiguration(config: InstanceRuntimeConfig): Readonly<Record<InstanceHostEnvKey, string>> {
+/** gws-ea's `.env` keys for the assistant `config` describes, as this tool renders them. */
+export function instanceHostConfiguration(config: InstanceRuntimeConfig): Readonly<Record<InstanceHostEnvKey, string>> {
   return {
     NANOCLAW_INSTALL_ID: config.install_id,
     DEFAULT_AGENT_PROVIDER: config.selected_provider,
@@ -337,7 +345,7 @@ function instanceHostConfiguration(config: InstanceRuntimeConfig): Readonly<Reco
  * refuses when they disagree.
  */
 async function persistRuntimeFile(config: InstanceRuntimeConfig): Promise<void> {
-  const file = instanceRuntimeFile(config.checkout_realpath);
+  const file = instanceRuntimeFile(config.state_root);
   let existing: InstanceRuntimeConfig;
   try {
     existing = await loadInstanceRuntimeConfig(file);
@@ -355,68 +363,42 @@ async function persistRuntimeFile(config: InstanceRuntimeConfig): Promise<void> 
 }
 
 /**
- * Write `runtime.json` once, and gws-ea's `.env` keys where the checkout's
- * `.env` does not set them, as NanoClaw reads it. A key it sets is the
- * release's own, written by the create that deployed it, so a later start
- * never rewrites it (KTD6); every other writer's keys are kept.
+ * Write `runtime.json` once, and gws-ea's `.env` keys where the assistant's
+ * `.env` does not set them, as NanoClaw reads it. Both are in the physical
+ * `state/`, never written through a link. A key it sets is the release's own,
+ * written by the create that deployed it, so a later start never rewrites it;
+ * every other writer's keys are kept.
  */
 export async function persistInstanceRuntime(
   configInput: InstanceRuntimeConfig,
   upsertEnvVars: UpsertEnvVars,
 ): Promise<void> {
   const config = validateRuntimeConfig(configInput);
-  const root = path.join(config.checkout_realpath, 'data', 'gws-ea');
-  await preparePrivateDirectory(root);
+  await preparePrivateDirectory(path.dirname(instanceRuntimeFile(config.state_root)));
   await preparePrivateDirectory(path.dirname(config.secret_files.gchat_credentials));
-  await preparePrivateDirectory(path.join(config.checkout_realpath, 'logs'));
+  await preparePrivateDirectory(instanceLayout(config.instance_root).logs);
   await persistRuntimeFile(config);
   const owned = instanceHostConfiguration(config);
-  const present = readInstanceHostEnvironment(config.checkout_realpath);
+  const present = readInstanceHostEnvironment(config.state_root);
   const missing = Object.entries(owned).filter(([key]) => present[key] === undefined);
   if (missing.length === 0) return;
-  upsertEnvVars(Object.fromEntries(missing), config.checkout_realpath);
+  upsertEnvVars(Object.fromEntries(missing), config.state_root);
   activeStep()?.envFile(
-    path.join(config.checkout_realpath, '.env'),
+    path.join(config.state_root, '.env'),
     missing.map(([key, value]) => `${key}=${value}\n`).join(''),
   );
 }
 
-/** gws-ea's `.env` keys as a checkout's `.env` holds them, as NanoClaw reads it; other writers' keys are not read. */
-export function readInstanceHostEnvironment(checkoutRoot: string): Record<string, string> {
-  return readEnvFile([...INSTANCE_HOST_ENV_KEYS], checkoutRoot);
+/** gws-ea's `.env` keys as the `.env` in `root` holds them, as NanoClaw reads it; other writers' keys are not read. */
+export function readInstanceHostEnvironment(root: string): Record<string, string> {
+  return readEnvFile([...INSTANCE_HOST_ENV_KEYS], root);
 }
 
-/**
- * Write the runtime record and gws-ea's `.env` keys of the release an update
- * deploys into its staged checkout, before the swap makes it live (KTD6,
- * KTD9). Only create and update render them; here they are the release's
- * own, so every gws-ea key is written, replacing the outgoing release's,
- * while every other writer's key the carried `.env` holds is kept.
- */
-export async function writeReleaseRuntime(
-  configInput: InstanceRuntimeConfig,
-  checkoutRoot: string,
-  upsertEnvVars: UpsertEnvVars,
-): Promise<void> {
-  const config = validateRuntimeConfig(configInput);
-  const root = path.join(checkoutRoot, 'data', 'gws-ea');
-  await preparePrivateDirectory(root);
-  await preparePrivateDirectory(path.join(checkoutRoot, 'logs'));
-  await writePrivateTextFile(instanceRuntimeFile(checkoutRoot), runtimeFileContents(config));
-  const owned = instanceHostConfiguration(config);
-  upsertEnvVars({ ...owned }, checkoutRoot);
-  activeStep()?.envFile(
-    path.join(checkoutRoot, '.env'),
-    Object.entries(owned)
-      .map(([key, value]) => `${key}=${value}\n`)
-      .join(''),
-  );
-}
-
+/** Load the runtime record at `file`, which must be where the record itself says it lives: its own `state/`. */
 export async function loadInstanceRuntimeConfig(file: string): Promise<InstanceRuntimeConfig> {
   const config = validateRuntimeConfig(await readOwnerOnlyJson(file, 'Runtime config', INVALID_RUNTIME));
-  if (file !== instanceRuntimeFile(config.checkout_realpath)) {
-    throw new GwsEaError('runtime_mismatch', 'Runtime config path does not match the selected checkout');
+  if (file !== instanceRuntimeFile(config.state_root)) {
+    throw new GwsEaError('runtime_mismatch', "Runtime config path does not match the instance's own state");
   }
   return config;
 }
@@ -427,14 +409,14 @@ export interface HostLogFiles {
 }
 
 /**
- * The log files of the host run from `checkoutRoot`: NanoClaw's
- * `logs/nanoclaw.log` and `logs/nanoclaw.error.log`, the paths the service
- * definition gws-ea renders sends standard output and error to. The service
- * layout below sends standard output and error here, so `logs` reads what the
- * host writes.
+ * The log files of the host of the assistant at `instanceRoot`: NanoClaw's
+ * `logs/nanoclaw.log` and `logs/nanoclaw.error.log`, read in the physical
+ * `logs/` every release links its own to, so they are there while no release
+ * is live. The service definition below sends standard output and error
+ * here, so `logs` reads what the host writes.
  */
-export function hostLogFiles(checkoutRoot: string): HostLogFiles {
-  const logs = path.join(checkoutRoot, 'logs');
+export function hostLogFiles(instanceRoot: string): HostLogFiles {
+  const logs = instanceLayout(instanceRoot).logs;
   return { output: path.join(logs, 'nanoclaw.log'), errors: path.join(logs, 'nanoclaw.error.log') };
 }
 
@@ -452,16 +434,17 @@ function createInstanceServiceLayout(
     platform: options.platform,
     runningAsRoot: options.runningAsRoot ?? process.getuid?.() === 0,
   });
+  const logs = hostLogFiles(config.instance_root);
   return {
     ...coordinates,
-    runtimeConfigFile: instanceRuntimeFile(config.checkout_realpath),
-    environmentFile: path.join(config.checkout_realpath, '.env'),
-    launcherEntrypoint: path.join(config.checkout_realpath, 'dist', 'gws-ea', 'process.js'),
-    hostEntrypoint: path.join(config.checkout_realpath, 'dist', 'index.js'),
-    cliPath: path.join(config.checkout_realpath, 'bin', 'ncl'),
-    cliSocket: path.join(config.checkout_realpath, 'data', 'ncl.sock'),
-    standardOutputPath: hostLogFiles(config.checkout_realpath).output,
-    standardErrorPath: hostLogFiles(config.checkout_realpath).errors,
+    runtimeConfigFile: instanceRuntimeFile(config.state_root),
+    environmentFile: path.join(config.state_root, '.env'),
+    launcherEntrypoint: path.join(config.checkout_root, 'dist', 'gws-ea', 'process.js'),
+    hostEntrypoint: path.join(config.checkout_root, 'dist', 'index.js'),
+    cliPath: path.join(config.checkout_root, 'bin', 'ncl'),
+    cliSocket: path.join(config.state_root, 'data', 'ncl.sock'),
+    standardOutputPath: logs.output,
+    standardErrorPath: logs.errors,
   };
 }
 
@@ -477,10 +460,15 @@ function serviceEnvironment(config: ServiceManagerRuntime): Readonly<Record<stri
   };
 }
 
+/**
+ * The service runs the launcher through the live link, from the live link:
+ * while a switch has removed it, the program does not exist, so the service
+ * manager can start nothing, even after a reboot.
+ */
 function renderInstanceService(config: InstanceRuntimeConfig, layout: InstanceServiceLayout): string {
   const input = {
     programArguments: [config.node_path, layout.launcherEntrypoint, 'launch-host', layout.runtimeConfigFile],
-    workingDirectory: config.checkout_realpath,
+    workingDirectory: config.checkout_root,
     environment: serviceEnvironment(config),
     standardOutputPath: layout.standardOutputPath,
     standardErrorPath: layout.standardErrorPath,
@@ -501,31 +489,20 @@ export function instanceServiceDefinitionFile(
   return createInstanceServiceLayout(configInput, options).serviceDefinitionPath;
 }
 
-/**
- * Write the service definition the release an update deploys renders, while
- * its service is stopped (KTD6): only when it differs from the one installed,
- * and systemd is then told to reload it. launchd reads a definition when the
- * job is bootstrapped, which the next start does. Returns whether it changed.
- */
-export async function writeInstanceServiceDefinition(
+/** The assistant's service definition as this tool renders it, for the service manager `options` name. */
+export function renderInstanceServiceDefinition(
   configInput: InstanceRuntimeConfig,
-  dependencies: InstanceServiceDependencies,
-): Promise<boolean> {
+  options: ServiceLayoutOptions,
+): string {
   const config = validateRuntimeConfig(configInput);
-  const layout = createInstanceServiceLayout(config, dependencies);
-  const rendered = renderInstanceService(config, layout);
-  const installed = await readFile(layout.serviceDefinitionPath, 'utf8').catch((error: unknown) => {
-    if (isErrno(error, 'ENOENT')) return undefined;
-    throw error;
-  });
-  return installServiceDefinition(config, layout, rendered, installed, dependencies);
+  return renderInstanceService(config, createInstanceServiceLayout(config, options));
 }
 
 /**
  * Put back the service definition a kept release ran with, while its service
- * is stopped (KTD6): a rollback restores it rather than rendering one. Only
- * when it differs from the one installed, and systemd is then told to reload
- * it. Returns whether it changed.
+ * is stopped (KTD1): a switch installs the one the release kept rather than
+ * rendering one. Only when it differs from the one installed, and systemd is
+ * then told to reload it. Returns whether it changed.
  */
 export async function restoreInstanceServiceDefinition(
   configInput: InstanceRuntimeConfig,
@@ -551,16 +528,39 @@ async function installServiceDefinition(
   if (installed === definition) return false;
   await mkdir(path.dirname(layout.serviceDefinitionPath), { recursive: true, mode: 0o700 });
   await writePrivateTextFile(layout.serviceDefinitionPath, definition);
-  if (layout.manager !== 'launchd') {
-    await (dependencies.runCommand ?? runSanitizedCommand)({
-      command: 'systemctl',
-      args: [...(layout.manager === 'systemd-user' ? ['--user'] : []), 'daemon-reload'],
-      cwd: config.home_directory,
-      env: serviceManagerEnvironment(config, layout.manager, dependencies),
-      timeoutMs: 30_000,
-    });
-  }
+  await reloadServiceManager(config, layout, dependencies);
   return true;
+}
+
+/** Tell systemd to read the service definitions again; launchd reads one when its job is bootstrapped. */
+async function reloadServiceManager(
+  config: InstanceRuntimeConfig,
+  layout: InstanceServiceLayout,
+  dependencies: InstanceServiceDependencies,
+): Promise<void> {
+  if (layout.manager === 'launchd') return;
+  await (dependencies.runCommand ?? runSanitizedCommand)({
+    command: 'systemctl',
+    args: [...(layout.manager === 'systemd-user' ? ['--user'] : []), 'daemon-reload'],
+    cwd: config.home_directory,
+    env: serviceManagerEnvironment(config, layout.manager, dependencies),
+    timeoutMs: 30_000,
+  });
+}
+
+/**
+ * Have the service manager read the assistant's service definition as it is
+ * now, before a start: systemd is told to reload, so a switch resumed after
+ * the definition was written, which then finds it unchanged, never starts a
+ * unit systemd read before. launchd reads the definition when its job is
+ * bootstrapped, which a start after a stop does.
+ */
+export async function reloadInstanceService(
+  configInput: InstanceRuntimeConfig,
+  dependencies: InstanceServiceDependencies,
+): Promise<void> {
+  const config = validateRuntimeConfig(configInput);
+  await reloadServiceManager(config, createInstanceServiceLayout(config, dependencies), dependencies);
 }
 
 async function assertRegularFile(file: string): Promise<void> {
@@ -638,7 +638,7 @@ async function ensureLingering(
 /**
  * Install the service when its definition is missing, then (re)start it. An
  * existing definition is the release's own, rendered by the create that
- * deployed it, so a later start never renders it again (KTD6). systemd is
+ * deployed it, so a later start never renders it again (KTD1). systemd is
  * told about a new unit, enables it, and keeps a user's services running
  * after logout (lingering). The start itself is the one every other command
  * uses (`restartService`): a running host is stopped and its job waited out,
@@ -662,7 +662,7 @@ export async function reconcileInstanceService(
   const run = dependencies.runCommand ?? runSanitizedCommand;
   const environment = serviceManagerEnvironment(config, layout.manager, dependencies);
   const command = async (program: string, args: readonly string[]): Promise<string> =>
-    (await run({ command: program, args, cwd: config.checkout_realpath, env: environment, timeoutMs: 30_000 })).stdout;
+    (await run({ command: program, args, cwd: config.instance_root, env: environment, timeoutMs: 30_000 })).stdout;
   if (layout.manager === 'systemd-user') await ensureLingering(command, dependencies);
   if (!(await isRegularFile(layout.serviceDefinitionPath))) {
     await installServiceDefinition(config, layout, renderInstanceService(config, layout), undefined, dependencies);
@@ -706,7 +706,7 @@ export async function instanceServicePid(
     ({ stdout } = await run({
       command: layout.manager === 'launchd' ? 'launchctl' : 'systemctl',
       args,
-      cwd: config.checkout_realpath,
+      cwd: config.instance_root,
       env: serviceManagerEnvironment(config, layout.manager, dependencies),
       timeoutMs: 30_000,
     }));
@@ -731,7 +731,7 @@ export function buildInstanceCliCommand(
   return {
     command: layout.cliPath,
     args,
-    cwd: config.checkout_realpath,
+    cwd: config.checkout_root,
     env: buildToolEnvironment(ambient, {
       HOME: config.home_directory,
       NANOCLAW_INSTALL_ID: config.install_id,
@@ -741,7 +741,8 @@ export function buildInstanceCliCommand(
 
 async function buildInstanceHostEnvironment(
   configInput: InstanceRuntimeConfig,
-  ambient: NodeJS.ProcessEnv = process.env,
+  containerImage: string,
+  ambient: NodeJS.ProcessEnv,
 ): Promise<Record<string, string>> {
   const config = validateRuntimeConfig(configInput);
   await assertPrivateDirectory(path.dirname(config.secret_files.gchat_credentials));
@@ -759,6 +760,7 @@ async function buildInstanceHostEnvironment(
     HOME: config.home_directory,
     DOCKER_HOST: config.docker_endpoint,
     ...instanceHostConfiguration(config),
+    CONTAINER_IMAGE: containerImage,
     ONECLI_API_KEY: onecliRuntimeApiKey.trim(),
     GCHAT_CREDENTIALS: gchatCredentials,
     GCHAT_WORKSPACE_ADDON_SERVICE_ACCOUNT_EMAIL: deriveWorkspaceAddOnIdentity(projectNumber),
@@ -767,51 +769,60 @@ async function buildInstanceHostEnvironment(
 }
 
 /** The instance's OneCLI administrative key, from its owner-only secret file; an empty file is refused. */
-export async function readOnecliAdminApiKey(config: InstanceRuntimeConfig): Promise<string> {
+async function readOnecliAdminApiKey(config: InstanceRuntimeConfig): Promise<string> {
   const apiKey = (await readOwnerOnlyFile(config.secret_files.onecli_admin_api_key)).trim();
   if (!apiKey) throw new GwsEaError('invalid_secret', 'The OneCLI administrative credential is empty');
   return apiKey;
 }
 
-export async function runInstanceOnecliAdminCommand(
+/** The instance's OneCLI administration: its own app URL, with the admin key its owner-only file holds. */
+export async function instanceOnecliAdmin(
   configInput: InstanceRuntimeConfig,
-  args: readonly string[],
-  dependencies: { readonly runCommand?: SanitizedCommandRunner; readonly ambientEnv?: NodeJS.ProcessEnv } = {},
-): Promise<SanitizedCommandResult> {
+  dependencies: OnecliAdminDependencies = {},
+): Promise<OnecliAdmin> {
   const config = validateRuntimeConfig(configInput);
-  const apiKey = await readOnecliAdminApiKey(config);
-  await assertExecutable(config.onecli_cli_path);
-  const run = dependencies.runCommand ?? runSanitizedCommand;
-  return run({
-    command: config.onecli_cli_path,
-    args,
-    cwd: config.checkout_realpath,
-    env: buildToolEnvironment(dependencies.ambientEnv, {
-      HOME: path.join(path.dirname(config.checkout_realpath), 'onecli', 'cli-home'),
-      ONECLI_API_HOST: config.onecli_app_url,
-      ONECLI_API_KEY: apiKey,
-    }),
-    timeoutMs: 30_000,
-  });
+  return createOnecliAdmin(config.onecli_app_url, await readOnecliAdminApiKey(config), dependencies);
 }
 
+/**
+ * The service's entry: replace this process with the host of the release it
+ * runs from, which must be the live one. Node resolves the launcher's links,
+ * so `releaseRoot` is the physical release folder the service reached through
+ * the live link; a launcher anywhere else, or one whose release a switch has
+ * since replaced, starts nothing. The host runs from that folder, so NanoClaw
+ * reaches the assistant's state through the release's links, and runs agents
+ * on the release's own image, `<base>:r-<hex8>` (KTD6).
+ */
 export async function launchInstanceHost(
   configFile: string,
   ambient: NodeJS.ProcessEnv = process.env,
   execve: NonNullable<NodeJS.Process['execve']> | undefined = process.execve,
+  releaseRoot: string = CONTROL_PLANE_ROOT,
 ): Promise<never> {
   const config = await loadInstanceRuntimeConfig(path.resolve(configFile));
-  if ((await realpath(config.checkout_realpath)) !== config.checkout_realpath) {
-    throw new GwsEaError('unsafe_runtime', 'The instance checkout is not the persisted physical path');
+  const layout = instanceLayout(config.instance_root);
+  const live = await readCurrent(layout);
+  const liveRoot =
+    live === undefined
+      ? undefined
+      : await realpath(layout.current).catch((error: unknown) => {
+          if (isErrno(error, 'ENOENT')) return undefined;
+          throw error;
+        });
+  if (live === undefined || liveRoot !== releaseRoot) {
+    throw new GwsEaError(
+      'not_live_release',
+      `The launcher at ${releaseRoot} is not the live release of assistant ${config.instance_id}` +
+        (liveRoot === undefined ? ', which has none' : `, which is ${liveRoot}`) +
+        ', so it starts no host.',
+    );
   }
-  const layout = createInstanceServiceLayout(config, {
-    platform: instanceServicePlatform(),
-    homeDirectory: config.home_directory,
-  });
-  await Promise.all([assertExecutable(config.node_path), assertRegularFile(layout.hostEntrypoint)]);
-  const environment = await buildInstanceHostEnvironment(config, ambient);
-  process.chdir(config.checkout_realpath);
-  return replaceProcess(config.node_path, [config.node_path, layout.hostEntrypoint], environment, execve);
+  const hostEntrypoint = path.join(releaseRoot, 'dist', 'index.js');
+  await Promise.all([assertExecutable(config.node_path), assertRegularFile(hostEntrypoint)]);
+  const containerImage = `${getInstallScopedNames(config.install_id).containerImageBase}:r-${live}`;
+  const environment = await buildInstanceHostEnvironment(config, containerImage, ambient);
+  process.chdir(releaseRoot);
+  return replaceProcess(config.node_path, [config.node_path, hostEntrypoint], environment, execve);
 }
 
 /**
@@ -844,58 +855,26 @@ export async function stampUpgradeState(
   });
 }
 
+/**
+ * Persist the runtime, stamp the upgrade tripwire of the release at `commit`
+ * with that release's own script, and install and start the service. The
+ * release's agent image was provided when the release was staged
+ * (`release-stage.ts`), and its host runs that image's tag.
+ */
 export async function reconcileInstanceRuntime(
   configInput: InstanceRuntimeConfig,
+  commit: string,
   dependencies: InstanceRuntimeDependencies,
 ): Promise<InstanceServiceStart> {
   const config = validateRuntimeConfig(configInput);
+  const release = instanceLayout(config.instance_root).release(releaseName(commit));
   await persistInstanceRuntime(config, dependencies.upsertEnvVars);
-  const run = dependencies.runCommand ?? runSanitizedCommand;
-  // The build runs with the operator's tools, as release preflight's commands do; only the service keeps its minimal PATH.
+  // The script runs with the operator's tools, as release preflight's commands do; only the service keeps its minimal PATH.
   const environment = buildToolEnvironment(dependencies.ambientEnv ?? process.env, {
     HOME: config.home_directory,
     DOCKER_HOST: config.docker_endpoint,
     NANOCLAW_INSTALL_ID: config.install_id,
   });
-  await stampUpgradeState(config.checkout_realpath, run, environment);
-  if (!(await adoptReleaseAgentImage(config, run, environment))) {
-    await run({
-      command: 'pnpm',
-      args: ['exec', 'tsx', 'setup/index.ts', '--step', 'container'],
-      cwd: config.checkout_realpath,
-      env: environment,
-      timeoutMs: 15 * 60_000,
-      stream: true,
-    });
-  }
+  await stampUpgradeState(release, dependencies.runCommand ?? runSanitizedCommand, environment);
   return reconcileInstanceService(config, dependencies);
-}
-
-/**
- * Tag the agent image an update already built for this release and these
- * build flags as the new assistant's `:latest`, and say whether there was one
- * (see `agent-image.ts`): its content key is read from the checkout create
- * deployed and its `.env`. Without one, NanoClaw's own container step builds
- * and smoke-tests the image as it always has. That image is not labeled: the
- * step runs `docker build` itself, without the agent-runner lockfile label
- * `container/build.sh` adds, so it is not the image the key names. The
- * assistant's first update moves it onto a shared one.
- */
-async function adoptReleaseAgentImage(
-  config: InstanceRuntimeConfig,
-  run: SanitizedCommandRunner,
-  environment: Readonly<Record<string, string>>,
-): Promise<boolean> {
-  const checkout = config.checkout_realpath;
-  const inputs = await readAgentImageInputs(
-    { repository: checkout, commit: config.deployed_commit, checkout },
-    { runCommand: run },
-  );
-  const names = getInstallScopedNames(config.install_id);
-  return adoptSharedAgentImage(
-    { run, cwd: checkout, env: environment },
-    agentImageKey(inputs),
-    names.containerImageBase,
-    names.defaultContainerImage,
-  );
 }

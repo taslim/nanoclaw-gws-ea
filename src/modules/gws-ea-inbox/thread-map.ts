@@ -31,8 +31,11 @@
  * Every timestamp is passed in as an ISO string; SQL never reads the clock.
  */
 import { randomUUID } from 'node:crypto';
+import path from 'node:path';
 
+import { DATA_DIR } from '../../config.js';
 import { getDb } from '../../db/connection.js';
+import { isPathInside } from '../../inbox-safety.js';
 import { normalizeAddress } from './mime.js';
 
 /** Who can read a message: only the principal and the assistant, or someone besides. */
@@ -310,6 +313,10 @@ export interface ThreadFile {
 /**
  * Record a file `main` handed over for the thread, by its SHA-256. The same
  * bytes handed over again point the record at the newer copy.
+ *
+ * The copy is recorded by its place in the data directory. The host reaches
+ * the data directory through the release folder it runs from, and a later
+ * update prunes that folder, taking any path through it along.
  */
 export async function recordThreadFile(
   threadKey: string,
@@ -323,19 +330,28 @@ export async function recordThreadFile(
     threadKey,
     file.sha256,
     file.fileName,
-    file.hostPath,
+    path.relative(DATA_DIR, file.hostPath),
     at,
   );
 }
 
-/** The file with this SHA-256 that `main` handed over for the thread, or undefined. */
+/**
+ * The file with this SHA-256 that `main` handed over for the thread, or
+ * undefined: its copy as the host reaches the data directory now. Throws for
+ * a copy recorded outside the data directory.
+ */
 export async function findThreadFile(threadKey: string, sha256: string): Promise<ThreadFile | undefined> {
   const row = await getDb().get<{ file_name: string; host_path: string }>(
     'SELECT file_name, host_path FROM gws_ea_thread_files WHERE thread_key = ? AND sha256 = ?',
     threadKey,
     sha256,
   );
-  return row ? { fileName: row.file_name, hostPath: row.host_path } : undefined;
+  if (!row) return undefined;
+  const hostPath = path.resolve(DATA_DIR, row.host_path);
+  if (!isPathInside(DATA_DIR, hostPath)) {
+    throw new Error(`The host's copy of ${row.file_name} is recorded outside the data directory`);
+  }
+  return { fileName: row.file_name, hostPath };
 }
 
 // ---------------------------------------------------------------------------

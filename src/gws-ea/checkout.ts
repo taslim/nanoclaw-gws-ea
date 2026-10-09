@@ -3,31 +3,17 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
-import { writePrivate } from '../community-portal/private-file.js';
 import {
   assertOwnedDestination,
   assertPrivateDirectory,
-  instanceMarkerFile,
   preparePrivateDirectory,
   type ControlPlanePaths,
-  type ReleaseSlot,
 } from './paths.js';
-import {
-  assertCheckoutMarker,
-  assertRegistryMarkerAgreement,
-  getInstanceReservation,
-  readInstanceMarkerFile,
-} from './registry.js';
+import { assertRegistryMarkerAgreement, assertStateMarker, getInstanceReservation } from './registry.js';
 import { buildToolEnvironment, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
+import { readCurrent, releaseName } from './release-layout.js';
 import type { ReleaseSource } from './release-tracks.js';
-import {
-  GwsEaError,
-  INSTANCE_MARKER_SCHEMA_VERSION,
-  sameRelease,
-  shortCommit,
-  type InstanceMarker,
-  type InstanceReservation,
-} from './types.js';
+import { GwsEaError, shortCommit, type InstanceReservation } from './types.js';
 
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 /** A Git object ID, in a SHA-1 or a SHA-256 repository. */
@@ -248,21 +234,6 @@ export async function committedTree(
   });
 }
 
-/**
- * The paths under `directory` where a checkout's working tree differs from
- * its HEAD: tracked changes, and untracked files Git does not ignore.
- */
-export async function workingTreeChanges(
-  root: string,
-  directory: string,
-  runtime: CheckoutRuntime = {},
-): Promise<string[]> {
-  const run = runtime.runCommand ?? runSanitizedCommand;
-  return withScratchEnvironments('gws-ea-tree-', ({ git: environment }) =>
-    statusPaths(root, run, environment, ['--untracked-files=all', '--', directory]),
-  );
-}
-
 /** Where an assistant's deployed commit stands against the tool's own release. */
 export interface ToolReleasePosition {
   /** The tool's own commit: the release an update would deploy. */
@@ -435,53 +406,36 @@ function stagingCheckoutRoot(checkoutRoot: string): string {
   return `${checkoutRoot}.staging`;
 }
 
-async function writeStagingMarker(checkoutRoot: string, reservation: InstanceReservation): Promise<void> {
-  const file = instanceMarkerFile(checkoutRoot);
-  await preparePrivateDirectory(path.dirname(file));
-  await writePrivate(file, {
-    schema_version: INSTANCE_MARKER_SCHEMA_VERSION,
-    instance_id: reservation.instance_id,
-    deployed_commit: reservation.deployed_commit,
-  } satisfies InstanceMarker);
-}
-
-async function assertStagingMarker(checkoutRoot: string, reservation: InstanceReservation): Promise<void> {
-  const marker = await readInstanceMarkerFile(instanceMarkerFile(checkoutRoot));
-  if (marker.instance_id !== reservation.instance_id || marker.deployed_commit !== reservation.deployed_commit) {
-    throw new GwsEaError('marker_mismatch', 'Staging instance marker mismatch; refusing mutation');
-  }
+/** The physical folder of the release at `commit`, `<instance root>/<hex8>`, never reached through a link. */
+function releaseFolder(paths: ControlPlanePaths, instanceId: string, commit: string): string {
+  return paths.instanceLayout(instanceId).release(releaseName(commit));
 }
 
 /**
- * Materialize a reservation's release. Create publishes the registry's
- * reservation at the live checkout, which only ever holds the release the
- * registry records. An update stages its target reservation view (KTD17) in
- * a release `slot` beside it, while the registry still names the release the
- * update moves from.
+ * Materialize a reservation view's release (KTD17) in its own physical
+ * folder, `<instance root>/<hex8>`, which is where it runs: its installed
+ * tools record their absolute paths, so it is never built elsewhere and
+ * moved. Nothing outside the folder is written, the assistant's `state/`
+ * included, and publishing a release does not make it live. A checkout is
+ * published only at the view's commit with a clean tree: its folder and its
+ * Git HEAD are what identify it.
  */
 export async function materializeReleaseCheckout(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
   runtime: CheckoutRuntime = {},
-  slot?: ReleaseSlot,
 ): Promise<InstanceReservation> {
   const instanceId = reservation.instance_id;
-  const recorded = await getInstanceReservation(paths, instanceId);
-  if (!slot && !sameRelease(recorded, reservation)) {
-    throw new GwsEaError('release_mismatch', 'The live checkout holds only the release the registry records');
-  }
-  const destination = slot ? paths.releaseCheckoutRoot(instanceId, slot) : recorded.checkout_realpath;
+  await getInstanceReservation(paths, instanceId);
+  const destination = releaseFolder(paths, instanceId, reservation.deployed_commit);
   await assertCheckoutTargetAbsent(destination);
   await assertOwnedDestination(destination);
   await mkdir(paths.instanceRoot(instanceId), { recursive: true, mode: 0o700 });
   await assertPrivateDirectory(paths.instanceRoot(instanceId));
-  if (slot) await preparePrivateDirectory(paths.releaseRoot(instanceId, slot));
   const environments = await prepareReleaseCommandEnvironments(paths.instanceRoot(instanceId));
   const stagingRoot = stagingCheckoutRoot(destination);
   const run = runtime.runCommand ?? runSanitizedCommand;
   const verifyPublished = async (): Promise<InstanceReservation> => {
-    if (!slot) return assertReleaseCheckoutAgreement(paths, instanceId, runtime);
-    await assertCheckoutMarker(destination, instanceId, [reservation.deployed_commit]);
     await assertCheckoutRoot(destination, reservation.deployed_commit, run, environments.git);
     return reservation;
   };
@@ -495,7 +449,7 @@ export async function materializeReleaseCheckout(
       await promoteStagingCheckout(stagingRoot, destination, reservation, run, environments.git);
       return verifyPublished();
     } catch (error) {
-      if (error instanceof GwsEaError && ['invalid_marker', 'marker_mismatch'].includes(error.code)) throw error;
+      if (error instanceof GwsEaError && ['checkout_exists', 'unsafe_checkout'].includes(error.code)) throw error;
       await rm(stagingRoot, { recursive: true, force: true });
     }
   } catch (error) {
@@ -524,7 +478,6 @@ export async function materializeReleaseCheckout(
       cwd: stagingRoot,
       env: environments.git,
     });
-    await writeStagingMarker(stagingRoot, reservation);
     await promoteStagingCheckout(stagingRoot, destination, reservation, run, environments.git);
     const result = await verifyPublished();
     completed = true;
@@ -535,8 +488,8 @@ export async function materializeReleaseCheckout(
 }
 
 /**
- * Move a staged checkout to `destination` once it carries this instance's
- * marker, sits at the reservation's commit, and nothing occupies the path.
+ * Move a staged checkout to `destination` once it sits at the reservation's
+ * commit with a clean tree and nothing occupies the path.
  */
 async function promoteStagingCheckout(
   stagingRoot: string,
@@ -545,7 +498,6 @@ async function promoteStagingCheckout(
   run: SanitizedCommandRunner,
   environment: Readonly<Record<string, string>>,
 ): Promise<void> {
-  await assertStagingMarker(stagingRoot, reservation);
   await assertCheckoutRoot(stagingRoot, reservation.deployed_commit, run, environment);
   await assertCheckoutTargetAbsent(destination);
   await rename(stagingRoot, destination);
@@ -604,28 +556,33 @@ async function assertDetachedAt(
   if (branch !== 'HEAD') throw new GwsEaError('checkout_not_detached', 'Release checkout HEAD must be detached');
 }
 
-/** The reserved checkout is a physical directory at exactly its reserved real path. */
-async function assertPhysicalCheckout(reservation: InstanceReservation): Promise<void> {
-  const info = await lstat(reservation.checkout_realpath);
+/** A release folder is a physical directory at exactly its own real path: no link on the way to it. */
+async function assertPhysicalRelease(release: string): Promise<void> {
+  const info = await lstat(release);
   if (info.isSymbolicLink() || !info.isDirectory()) {
-    throw new GwsEaError('unsafe_checkout', 'Reserved checkout must be a physical directory');
+    throw new GwsEaError('unsafe_checkout', 'A release must be a physical directory');
   }
-  if ((await realpath(reservation.checkout_realpath)) !== reservation.checkout_realpath) {
-    throw new GwsEaError('unsafe_checkout', 'Checkout real path does not match the immutable reservation');
+  if ((await realpath(release)) !== release) {
+    throw new GwsEaError('unsafe_checkout', 'A release must be at its own real path, not reached through a link');
   }
 }
 
-/** Verify registry, physical checkout, detached HEAD, marker, commit, and clean tree agree. */
+/**
+ * Verify the registry and the assistant's `state/` marker agree, and the
+ * release the registry records is a physical folder whose HEAD is detached at
+ * its commit with a clean tree.
+ */
 export async function assertReleaseCheckoutAgreement(
   paths: ControlPlanePaths,
   instanceId: string,
   runtime: CheckoutRuntime = {},
 ): Promise<InstanceReservation> {
   const reservation = await assertRegistryMarkerAgreement(paths, instanceId);
-  await assertPhysicalCheckout(reservation);
+  const release = releaseFolder(paths, instanceId, reservation.deployed_commit);
+  await assertPhysicalRelease(release);
   const run = runtime.runCommand ?? runSanitizedCommand;
   const environments = await prepareReleaseCommandEnvironments(paths.instanceRoot(instanceId));
-  await assertCheckoutRoot(reservation.checkout_realpath, reservation.deployed_commit, run, environments.git);
+  await assertCheckoutRoot(release, reservation.deployed_commit, run, environments.git);
   return reservation;
 }
 
@@ -643,26 +600,39 @@ async function liveTrackedChanges(root: string, commit: string, run: SanitizedCo
 }
 
 /**
- * The live checkout as a read-only command observes it: its marker at any of
- * `commits` (the registry's, plus any an unfinished update or rollback placed
- * there), a physical directory at its reserved path, HEAD detached at the
- * marker's commit, and no tracked changes, which are refused by name.
- * Returns the commit the checkout holds.
+ * The live release as a read-only command observes it: the release the live
+ * link names, which must be one of `commits` (the registry's, plus any an
+ * unfinished update or rollback placed there), a physical folder with HEAD
+ * detached at that commit, and no tracked changes, which are refused by name.
+ * The assistant's `state/` must carry its marker. Returns the commit.
  */
 export async function observeLiveCheckout(
+  paths: ControlPlanePaths,
   reservation: InstanceReservation,
   commits: readonly string[],
   runtime: CheckoutRuntime = {},
 ): Promise<string> {
-  const root = reservation.checkout_realpath;
-  await assertCheckoutMarker(root, reservation.instance_id, commits);
-  const { deployed_commit: commit } = await readInstanceMarkerFile(instanceMarkerFile(root));
-  await assertPhysicalCheckout(reservation);
+  const instanceId = reservation.instance_id;
+  const layout = paths.instanceLayout(instanceId);
+  await assertStateMarker(layout.state, instanceId);
+  const live = await readCurrent(layout);
+  if (live === undefined) {
+    throw new GwsEaError('release_fenced', `Assistant ${instanceId} has no live release: a switch has fenced it.`);
+  }
+  const commit = commits.find((candidate) => releaseName(candidate) === live);
+  if (commit === undefined) {
+    throw new GwsEaError(
+      'release_mismatch',
+      `Assistant ${instanceId}'s live release ${live} is not one its records name (${commits.map(shortCommit).join(', ')}).`,
+    );
+  }
+  const root = layout.release(live);
+  await assertPhysicalRelease(root);
   const files = await liveTrackedChanges(root, commit, runtime.runCommand ?? runSanitizedCommand);
   if (files.length > 0) {
     throw new GwsEaError(
       'checkout_drift',
-      `Assistant ${reservation.instance_id}'s live checkout ${root} has tracked changes: ${files.join(', ')}.`,
+      `Assistant ${instanceId}'s live release ${root} has tracked changes: ${files.join(', ')}.`,
       { details: { files } },
     );
   }
@@ -670,22 +640,25 @@ export async function observeLiveCheckout(
 }
 
 /**
- * The live checkout an update moves from: its marker and detached HEAD at the
- * release the registry records. A tracked edit would stay behind with the
- * release it edits, so it is refused, naming the files.
+ * The release an update moves from: the registry's, in its physical folder
+ * with HEAD detached at its commit, and the assistant's `state/` carrying its
+ * marker. A tracked edit would stay behind with the release it edits, so it
+ * is refused, naming the files.
  */
 export async function assertDeploymentCheckoutUnmodified(
+  paths: ControlPlanePaths,
   reservation: InstanceReservation,
   runtime: CheckoutRuntime = {},
 ): Promise<void> {
-  const root = reservation.checkout_realpath;
-  await assertCheckoutMarker(root, reservation.instance_id, [reservation.deployed_commit]);
-  await assertPhysicalCheckout(reservation);
+  const instanceId = reservation.instance_id;
+  await assertStateMarker(paths.instanceLayout(instanceId).state, instanceId);
+  const root = releaseFolder(paths, instanceId, reservation.deployed_commit);
+  await assertPhysicalRelease(root);
   const files = await liveTrackedChanges(root, reservation.deployed_commit, runtime.runCommand ?? runSanitizedCommand);
   if (files.length === 0) return;
   throw new GwsEaError(
     'deployment_checkout_modified',
-    `Assistant ${reservation.instance_id}'s checkout ${root} has tracked changes, which an update would leave behind with its release: ${files.join(', ')}. Discard them, then retry.`,
+    `Assistant ${instanceId}'s release ${root} has tracked changes, which an update would leave behind with it: ${files.join(', ')}. Discard them, then retry.`,
     { details: { files } },
   );
 }

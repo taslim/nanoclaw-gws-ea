@@ -5,12 +5,13 @@ import path from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
 
 import { isErrno } from '../community-portal/errors.js';
+import type { ForgottenFingerprint } from '../modules/gws-ea-people/forget-handoff.js';
 import type { SnapshotManifest } from './operation.js';
 import { principalWelcomeEventId, type PrincipalCandidate } from './principal.js';
 import { redact } from './redact.js';
-import type { InstanceRuntimeConfig } from './service.js';
+import { hostLogFiles, type InstanceRuntimeConfig } from './service.js';
 import { GCHAT_CHANNEL_TYPE, GwsEaError } from './types.js';
-import { hasControlCharacters, isRecord, requireCanonicalTimestamp } from './validation.js';
+import { hasControlCharacters, requireCanonicalTimestamp } from './validation.js';
 
 /** How much of the error log's end is read, and how many of its lines are shown. */
 const ERROR_LOG_TAIL_BYTES = 64 * 1024;
@@ -20,7 +21,8 @@ const ERROR_LOG_LINE_CHARACTERS = 300;
 const LOG_STAMP = /^\[(\d{2}):(\d{2}):(\d{2})\.(\d{3})\] /u;
 
 export interface ConversationVerificationInput {
-  readonly checkoutRoot: string;
+  /** The assistant's physical `state/`, which holds NanoClaw's `data`. */
+  readonly stateRoot: string;
   readonly mainAgentGroupId: string;
   readonly messagingGroupId: string;
   readonly principalUserId: string;
@@ -85,7 +87,7 @@ interface PrincipalBindingRow {
 }
 
 export interface PrincipalBindingVerificationInput {
-  readonly runtime: Pick<InstanceRuntimeConfig, 'checkout_realpath' | 'instance_id'>;
+  readonly runtime: Pick<InstanceRuntimeConfig, 'state_root' | 'instance_id'>;
   readonly adapterInstance: string;
   readonly provisioningStartedAt: string;
   readonly selectedMessagingGroupId?: string;
@@ -162,16 +164,21 @@ function isClosedWalDatabase(file: string): boolean {
  * is read in place. So is one a writer opened while it was copied: that
  * writer's `-wal` holds commits the copied main file may lack.
  */
+export function openWithoutSideFiles(file: string): Database.Database {
+  if (isClosedWalDatabase(file)) {
+    const contents = readFileSync(file);
+    if (!existsSync(`${file}-wal`)) {
+      for (const offset of FORMAT_VERSION_OFFSETS) contents[offset] = ROLLBACK_FORMAT;
+      return new Database(contents, { readonly: true });
+    }
+  }
+  return new Database(file, { readonly: true, fileMustExist: true });
+}
+
+/** Instance message state, opened as `openWithoutSideFiles` does; whatever cannot be opened is missing. */
 function openReadonly(file: string): Database.Database {
   try {
-    if (isClosedWalDatabase(file)) {
-      const contents = readFileSync(file);
-      if (!existsSync(`${file}-wal`)) {
-        for (const offset of FORMAT_VERSION_OFFSETS) contents[offset] = ROLLBACK_FORMAT;
-        return new Database(contents, { readonly: true });
-      }
-    }
-    return new Database(file, { readonly: true, fileMustExist: true });
+    return openWithoutSideFiles(file);
   } catch {
     throw new GwsEaError('verification_state_missing', 'Required instance message state is missing');
   }
@@ -194,8 +201,8 @@ export function verifyPrincipalBinding(input: PrincipalBindingVerificationInput)
       'Principal selection does not match the requested conversation',
     );
   }
-  const checkoutRoot = path.resolve(input.runtime.checkout_realpath);
-  const central = openReadonly(path.join(checkoutRoot, 'data', 'v2.db'));
+  const stateRoot = path.resolve(input.runtime.state_root);
+  const central = openReadonly(path.join(stateRoot, 'data', 'v2.db'));
   let row: PrincipalBindingRow | undefined;
   let sessionId: string | undefined;
   try {
@@ -249,7 +256,7 @@ export function verifyPrincipalBinding(input: PrincipalBindingVerificationInput)
   if (!row || !sessionId) return { status: 'absent' };
   const welcomeEventId = principalWelcomeEventId(input.runtime, row.main_agent_group_id, candidate);
   const inbound = openReadonly(
-    path.join(checkoutRoot, 'data', 'v2-sessions', row.main_agent_group_id, sessionId, 'inbound.db'),
+    path.join(stateRoot, 'data', 'v2-sessions', row.main_agent_group_id, sessionId, 'inbound.db'),
   );
   try {
     const welcome = inbound
@@ -325,14 +332,14 @@ function isAuthenticatedPrincipalChatSdkMessage(content: string, principalUserId
  * principal turn need an assistant output marked delivered.
  */
 export function verifyTalkableConversation(input: ConversationVerificationInput): ConversationVerificationResult {
-  const checkoutRoot = path.resolve(input.checkoutRoot);
+  const stateRoot = path.resolve(input.stateRoot);
   const mainAgentGroupId = safeIdentifier(input.mainAgentGroupId, 'main agent group ID');
   const messagingGroupId = safeIdentifier(input.messagingGroupId, 'messaging group ID');
   const principalUserId = safeIdentifier(input.principalUserId, 'principal user ID');
   const adapterInstance = safeIdentifier(input.adapterInstance, 'adapter instance');
   const boundAt = timestamp(input.boundAt, 'binding timestamp');
   const welcomeEventId = safeIdentifier(input.welcomeEventId, 'welcome event ID');
-  const central = openReadonly(path.join(checkoutRoot, 'data', 'v2.db'));
+  const central = openReadonly(path.join(stateRoot, 'data', 'v2.db'));
 
   let sessionId: string;
   let platformId: string;
@@ -375,7 +382,7 @@ export function verifyTalkableConversation(input: ConversationVerificationInput)
     central.close();
   }
 
-  const mailboxRoot = path.join(checkoutRoot, 'data', 'v2-sessions', mainAgentGroupId, sessionId);
+  const mailboxRoot = path.join(stateRoot, 'data', 'v2-sessions', mainAgentGroupId, sessionId);
   const inbound = openReadonly(path.join(mailboxRoot, 'inbound.db'));
   let outbound: Database.Database | undefined;
   try {
@@ -433,16 +440,17 @@ export function verifyTalkableConversation(input: ConversationVerificationInput)
   }
 }
 
-function centralDatabaseFile(checkoutRoot: string): string {
-  return path.join(path.resolve(checkoutRoot), 'data', 'v2.db');
+/** An assistant's central database under its state root. */
+export function centralDatabaseFile(stateRoot: string): string {
+  return path.join(path.resolve(stateRoot), 'data', 'v2.db');
 }
 
 function hasTable(database: Database.Database, name: string): boolean {
   return database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined;
 }
 
-/** Each session database under a checkout, keyed by its mailbox side: `inbound` or `outbound`. */
-function sessionDatabases(checkoutRoot: string): Array<{ readonly side: string; readonly file: string }> {
+/** Each session database under `stateRoot`'s `data`, keyed by its mailbox side: `inbound` or `outbound`. */
+function sessionDatabases(stateRoot: string): Array<{ readonly side: string; readonly file: string }> {
   const directories = (directory: string): string[] => {
     try {
       return readdirSync(directory, { withFileTypes: true })
@@ -454,7 +462,7 @@ function sessionDatabases(checkoutRoot: string): Array<{ readonly side: string; 
     }
   };
   const found: Array<{ side: string; file: string }> = [];
-  for (const group of directories(path.join(path.resolve(checkoutRoot), 'data', 'v2-sessions'))) {
+  for (const group of directories(path.join(path.resolve(stateRoot), 'data', 'v2-sessions'))) {
     for (const session of directories(group)) {
       for (const entry of readdirSync(session, { withFileTypes: true })) {
         const side = entry.isFile() ? /^(inbound|outbound)\.db$/u.exec(entry.name)?.[1] : undefined;
@@ -466,14 +474,14 @@ function sessionDatabases(checkoutRoot: string): Array<{ readonly side: string; 
 }
 
 /**
- * The schema a checkout's databases record (KTD5): the central migrations
+ * The schema the databases under `stateRoot`'s `data` record (KTD5): the central migrations
  * applied, in the order they ran, and every session table with its columns,
  * keyed `<side>.<table>` and merged across sessions. Only read, never changed.
  */
-export function readSchemaManifest(checkoutRoot: string): SnapshotManifest {
-  const migrations = readCentralMigrations(checkoutRoot);
+export function readSchemaManifest(stateRoot: string): SnapshotManifest {
+  const migrations = readCentralMigrations(stateRoot);
   const tables = new Map<string, Set<string>>();
-  for (const { side, file } of sessionDatabases(checkoutRoot)) {
+  for (const { side, file } of sessionDatabases(stateRoot)) {
     const session = openReadonly(file);
     try {
       const names = session
@@ -502,9 +510,9 @@ export function readSchemaManifest(checkoutRoot: string): SnapshotManifest {
   };
 }
 
-/** The central migrations a checkout's database records, in the order they ran. Only read, never changed. */
-export function readCentralMigrations(checkoutRoot: string): string[] {
-  const central = openReadonly(centralDatabaseFile(checkoutRoot));
+/** The central migrations the database under `stateRoot`'s `data` records, in the order they ran. Only read, never changed. */
+export function readCentralMigrations(stateRoot: string): string[] {
+  const central = openReadonly(centralDatabaseFile(stateRoot));
   try {
     if (!hasTable(central, 'schema_version')) {
       throw new GwsEaError('schema_unrecorded', 'The central database records no migrations');
@@ -512,6 +520,43 @@ export function readCentralMigrations(checkoutRoot: string): string[] {
     return (central.prepare('SELECT name FROM schema_version ORDER BY version').all() as Array<{ name: string }>).map(
       (row) => row.name,
     );
+  } finally {
+    central.close();
+  }
+}
+
+/**
+ * Whether a host left the central database under `stateRoot`'s `data` with
+ * its claim lease still live at `now`: a host stopped gracefully marks its row
+ * stopped, and one that was killed leaves it to expire, which delays the next
+ * host's claims. A release without leases has none. Only read.
+ */
+export function hostLeaseLive(stateRoot: string, now: string): boolean {
+  const central = openReadonly(centralDatabaseFile(stateRoot));
+  try {
+    if (!hasTable(central, 'host_instances')) return false;
+    return (
+      central
+        .prepare('SELECT 1 FROM host_instances WHERE stopped_at IS NULL AND lease_expires_at > ? LIMIT 1')
+        .get(now) !== undefined
+    );
+  } finally {
+    central.close();
+  }
+}
+
+/**
+ * The identities forgotten in the central database under `stateRoot`'s
+ * `data`, as `gws_ea_people_fingerprints` keeps them (KTD8); none when it has
+ * no such table. Only read.
+ */
+export function readForgottenFingerprints(stateRoot: string): ForgottenFingerprint[] {
+  const central = openReadonly(centralDatabaseFile(stateRoot));
+  try {
+    if (!hasTable(central, 'gws_ea_people_fingerprints')) return [];
+    return central
+      .prepare('SELECT fingerprint, forgotten_at FROM gws_ea_people_fingerprints ORDER BY fingerprint')
+      .all() as ForgottenFingerprint[];
   } finally {
     central.close();
   }
@@ -527,8 +572,8 @@ export interface DerivedImageGroup {
  * The agent groups running a per-group image (`<imageBase>:<agent group ID>`,
  * NanoClaw's `buildAgentGroupImage` tag), by name. Only read, never changed.
  */
-export function readDerivedImageGroups(checkoutRoot: string, imageBase: string): DerivedImageGroup[] {
-  const central = openReadonly(centralDatabaseFile(checkoutRoot));
+export function readDerivedImageGroups(stateRoot: string, imageBase: string): DerivedImageGroup[] {
+  const central = openReadonly(centralDatabaseFile(stateRoot));
   try {
     if (!hasTable(central, 'container_configs')) return [];
     const rows = central
@@ -545,178 +590,14 @@ export function readDerivedImageGroups(checkoutRoot: string, imageBase: string):
   }
 }
 
-/** Main as the assistant profile publishes it: its agent group, and the folder its files live in. */
-export interface MainGroup {
-  readonly id: string;
-  readonly folder: string;
-}
-
-/** NanoClaw's group folder grammar (`src/group-folder.ts`): one path segment, never a parent. */
-const GROUP_FOLDER = /^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?$/u;
-
-/** Main's agent group and folder, or undefined until the profile names one. Only read, never changed. */
-export function readMainGroup(checkoutRoot: string): MainGroup | undefined {
-  const central = openReadonly(centralDatabaseFile(checkoutRoot));
-  try {
-    if (!hasTable(central, 'gws_ea_profile') || !hasTable(central, 'agent_groups')) return undefined;
-    const main = central
-      .prepare(
-        `SELECT g.id, g.folder FROM gws_ea_profile p JOIN agent_groups g ON g.id = p.main_agent_group_id
-          WHERE p.singleton = 1`,
-      )
-      .get() as MainGroup | undefined;
-    if (main && !GROUP_FOLDER.test(main.folder)) {
-      throw new GwsEaError('invalid_main_group', `Main's group folder ${JSON.stringify(main.folder)} is not a folder`);
-    }
-    return main && { id: main.id, folder: main.folder };
-  } finally {
-    central.close();
-  }
-}
-
-function columnsOf(database: Database.Database, table: string): Set<string> {
-  return new Set(
-    (database.prepare('SELECT name FROM pragma_table_info(?)').all(table) as Array<{ name: string }>).map(
-      (column) => column.name,
-    ),
-  );
-}
-
 /**
- * An agent group's MCP servers that `plugin` owns, by NanoClaw's ownership
- * marker (each server's `plugin` field), as its container config holds them.
- * Only read, never changed.
- */
-export function readPluginMcpServers(
-  checkoutRoot: string,
-  agentGroupId: string,
-  plugin: string,
-): Readonly<Record<string, unknown>> {
-  const central = openReadonly(centralDatabaseFile(checkoutRoot));
-  let stored: string | undefined;
-  try {
-    if (!hasTable(central, 'container_configs') || !columnsOf(central, 'container_configs').has('mcp_servers')) {
-      return {};
-    }
-    stored = (
-      central.prepare('SELECT mcp_servers FROM container_configs WHERE agent_group_id = ?').get(agentGroupId) as
-        | { mcp_servers: string }
-        | undefined
-    )?.mcp_servers;
-  } finally {
-    central.close();
-  }
-  if (stored === undefined) return {};
-  let servers: unknown;
-  try {
-    servers = JSON.parse(stored);
-  } catch (error) {
-    if (!(error instanceof SyntaxError)) throw error;
-    servers = undefined;
-  }
-  if (!isRecord(servers)) {
-    throw new GwsEaError('invalid_container_config', `Agent group ${agentGroupId}'s MCP servers are not a JSON object`);
-  }
-  // fromEntries defines each server as an own field, so a server named `__proto__` stays data.
-  return Object.fromEntries(
-    Object.entries(servers).filter(([, server]) => isRecord(server) && server.plugin === plugin),
-  );
-}
-
-/** A scheduled task series, as the row that runs next holds it. */
-export interface TaskSeries {
-  readonly series_id: string;
-  readonly recurrence: string | null;
-  readonly prompt: string;
-  readonly script: string | null;
-}
-
-/** NanoClaw's task content envelope (`src/modules/scheduling/task-content.ts`); a plain string predates it. */
-function taskContent(raw: string): Pick<TaskSeries, 'prompt' | 'script'> {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (error) {
-    if (!(error instanceof SyntaxError)) throw error;
-    return { prompt: raw, script: null };
-  }
-  return isRecord(parsed)
-    ? {
-        prompt: typeof parsed.prompt === 'string' ? parsed.prompt : '',
-        script: typeof parsed.script === 'string' ? parsed.script : null,
-      }
-    : { prompt: raw, script: null };
-}
-
-const TASK_SLUG = /^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$/u;
-/** Docker's tag grammar, which NanoClaw's agent group IDs fit: one path segment. */
-const AGENT_GROUP_ID = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/u;
-const TASK_COLUMNS = ['kind', 'series_id', 'status', 'recurrence', 'content', 'seq'] as const;
-
-/**
- * An agent group's task series whose IDs carry one of `slugs` (NanoClaw names
- * a named task's series `<slug>-<4 hex>`), across its sessions: each as its
- * live row holds it, or between runs its latest. Whether it is paused is the
- * operator's, so it is left out. Only read, never changed.
- */
-export function readTaskSeries(checkoutRoot: string, agentGroupId: string, slugs: readonly string[]): TaskSeries[] {
-  if (slugs.length === 0) return [];
-  if (!AGENT_GROUP_ID.test(agentGroupId)) throw new GwsEaError('invalid_agent_group', 'The agent group ID is invalid');
-  if (!slugs.every((slug) => TASK_SLUG.test(slug))) {
-    throw new GwsEaError('invalid_task_slug', 'A task slug is not one NanoClaw names a series with');
-  }
-  const series = new RegExp(`^(?:${slugs.join('|')})-[0-9a-f]{4}$`, 'u');
-  const found = new Map<string, { readonly live: boolean; readonly seq: number; readonly task: TaskSeries }>();
-  let sessions: string[];
-  try {
-    sessions = readdirSync(path.join(path.resolve(checkoutRoot), 'data', 'v2-sessions', agentGroupId), {
-      withFileTypes: true,
-    })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => entry.name);
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) return [];
-    throw error;
-  }
-  for (const session of sessions) {
-    const file = path.join(path.resolve(checkoutRoot), 'data', 'v2-sessions', agentGroupId, session, 'inbound.db');
-    if (!existsSync(file)) continue;
-    const inbound = openReadonly(file);
-    try {
-      if (!hasTable(inbound, 'messages_in')) continue;
-      const columns = columnsOf(inbound, 'messages_in');
-      if (!TASK_COLUMNS.every((column) => columns.has(column))) continue;
-      const rows = inbound
-        .prepare(
-          "SELECT series_id, status, recurrence, content, seq FROM messages_in WHERE kind = 'task' AND series_id IS NOT NULL",
-        )
-        .all() as Array<{ series_id: string; status: string; recurrence: string | null; content: string; seq: number }>;
-      for (const row of rows) {
-        if (!series.test(row.series_id)) continue;
-        const live = row.status === 'pending' || row.status === 'paused';
-        const kept = found.get(row.series_id);
-        if (kept && ((kept.live && !live) || (kept.live === live && kept.seq > row.seq))) continue;
-        found.set(row.series_id, {
-          live,
-          seq: row.seq,
-          task: { series_id: row.series_id, recurrence: row.recurrence, ...taskContent(row.content) },
-        });
-      }
-    } finally {
-      inbound.close();
-    }
-  }
-  return [...found.values()].map(({ task }) => task).sort((a, b) => a.series_id.localeCompare(b.series_id));
-}
-
-/**
- * Copy a checkout's central database to `destination` as one consistent
+ * Copy the central database under `stateRoot`'s `data` to `destination` as one consistent
  * snapshot: an online backup whose every page moves in a single step, so a
  * write the running host makes meanwhile restarts the copy rather than
  * mixing into it. The live database is only read. The copy is owner-only.
  */
-export async function backupCentralDatabase(checkoutRoot: string, destination: string): Promise<void> {
-  const central = openReadonly(centralDatabaseFile(checkoutRoot));
+export async function backupCentralDatabase(stateRoot: string, destination: string): Promise<void> {
+  const central = openReadonly(centralDatabaseFile(stateRoot));
   try {
     await central.backup(destination, { progress: () => SINGLE_STEP_PAGES });
   } finally {
@@ -738,8 +619,8 @@ export interface LatestDelivery {
 }
 
 /** Main's latest delivery result, or undefined until main is published. Only read, never changed. */
-export function readLatestDelivery(checkoutRoot: string): LatestDelivery | undefined {
-  const root = path.resolve(checkoutRoot);
+export function readLatestDelivery(stateRoot: string): LatestDelivery | undefined {
+  const root = path.resolve(stateRoot);
   const central = openReadonly(centralDatabaseFile(root));
   let mainAgentGroupId: string;
   let sessionId: string | undefined;
@@ -840,14 +721,15 @@ function printableLogLine(line: string): string {
 }
 
 /**
- * What the instance's host logged as warnings and errors since `since`, from
- * the end of its `logs/nanoclaw.error.log`. NanoClaw stamps each entry with
+ * What the host of the assistant at `instanceRoot` logged as warnings and
+ * errors since `since`, from the end of its physical `logs/nanoclaw.error.log`,
+ * which is there whether or not a release is live. NanoClaw stamps each entry with
  * its local time of day only, so each entry's date is recovered walking back
  * from the file's last write, one day earlier at each rollover; lines without
  * a stamp (stack traces) belong to the entry above them.
  */
-export async function instanceErrorsSince(checkoutRoot: string, since: string): Promise<InstanceErrorLog> {
-  const file = path.join(path.resolve(checkoutRoot), 'logs', 'nanoclaw.error.log');
+export async function instanceErrorsSince(instanceRoot: string, since: string): Promise<InstanceErrorLog> {
+  const file = hostLogFiles(path.resolve(instanceRoot)).errors;
   const sinceMs = new Date(timestamp(since, 'error log start')).getTime();
   let handle: Awaited<ReturnType<typeof open>>;
   try {

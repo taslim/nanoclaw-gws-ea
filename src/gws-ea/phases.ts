@@ -9,8 +9,6 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import { PauseRequired, runStep, withGoogleSignIn, withPendingAction, type StepReporter } from './events.js';
 import {
-  assertContinuable,
-  contractSteps,
   readProvisionJournal,
   recordStepCompleted,
   recordStepFailure,
@@ -19,7 +17,7 @@ import {
   type ProvisionJournal,
 } from './journal.js';
 import { activeStep } from './run-log.js';
-import { GwsEaError, type ProvisionStepId } from './types.js';
+import { GwsEaError, PROVISION_STEPS, type ProvisionStepId } from './types.js';
 
 export interface ProvisionHumanPause {
   readonly kind: 'human-action';
@@ -221,9 +219,6 @@ export async function runProvisionSteps<Context>(
   runtime: ProvisionRuntime = {},
 ): Promise<ProvisionResult> {
   let journal: ProvisionJournal = await readProvisionJournal(operation.paths, operation.instanceId);
-  assertContinuable(journal);
-  // An assistant created under an earlier contract runs only that contract's steps.
-  const order = contractSteps(journal.launcher_contract_version);
   const completed = (id: ProvisionStepId): boolean => journal.steps[id]?.completed_at !== undefined;
   const runner = resourceRunner(context, runtime);
 
@@ -276,12 +271,12 @@ export async function runProvisionSteps<Context>(
     return pause;
   };
 
-  for (const id of order) {
+  for (const id of PROVISION_STEPS) {
     if (!steps[id].liveness || !completed(id)) continue;
     const pause = await checkRuntime(id);
     if (pause) return { status: 'paused', pause };
   }
-  for (const id of order) {
+  for (const id of PROVISION_STEPS) {
     if (completed(id)) continue;
     const pause = await advance(id);
     if (pause) return { status: 'paused', pause: await confirmPause(id, pause) };

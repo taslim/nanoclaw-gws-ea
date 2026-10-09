@@ -9,8 +9,6 @@
  * take the machine lock; the account token is asked for only when a tunnel,
  * route, or DNS change may be needed.
  */
-import { setTimeout as delay } from 'node:timers/promises';
-
 import {
   CloudflareAmbiguousMutationError,
   createCloudflareApi,
@@ -33,7 +31,7 @@ import {
 } from './cloudflare-connector.js';
 import { observeManagedGchatRoute } from './endpoint.js';
 import type { ControlPlanePaths } from './paths.js';
-import { ABSENT, OBSERVATION_WAITS_SECONDS, PRESENT, type StepResource } from './phases.js';
+import { ABSENT, PRESENT, type StepResource } from './phases.js';
 import { activeRemovalInstanceIds, readRegistry, withLockedCloudflareRegistry } from './registry.js';
 import { activeStep } from './run-log.js';
 import {
@@ -49,8 +47,6 @@ const CATCH_ALL_SERVICE = 'http_status:404';
 /** Sends of one rate-limited or unconfirmed idempotent change, each after a re-read shows it absent. */
 const CHANGE_ATTEMPTS = 3;
 
-type Sleep = (milliseconds: number) => Promise<void>;
-
 export interface ManagedCloudflareIngressRule {
   readonly hostname: string;
   readonly path: typeof GCHAT_TUNNEL_PATH;
@@ -63,11 +59,6 @@ export interface ManagedCloudflareCatchAllRule {
 
 export interface ManagedCloudflareConfiguration {
   readonly ingress: readonly (ManagedCloudflareIngressRule | ManagedCloudflareCatchAllRule)[];
-}
-
-export interface ManagedCloudflareReconcileResult {
-  readonly tunnelId: string;
-  readonly configurationVersion: number;
 }
 
 export function cloudflareDnsOwnershipComment(instanceId: string): string {
@@ -181,17 +172,26 @@ export function assertManagedCloudflareConfigurationOwnership(
   return current;
 }
 
-function chooseOwnedTunnel(
+/**
+ * This machine's tunnel among those listed under its name, which only it
+ * uses: none, or exactly one with that name and, once recorded, the recorded
+ * ID. Anything else is refused. A recorded tunnel that is gone is its
+ * caller's to judge.
+ */
+export function chooseOwnedTunnel(
   tunnels: readonly CloudflareTunnel[],
-  expectedName: string,
-  expectedId?: string,
+  name: string,
+  recordedId: string | null,
 ): CloudflareTunnel | undefined {
   if (tunnels.length > 1) {
-    throw new GwsEaError('ambiguous_cloudflare_tunnel', 'More than one Cloudflare tunnel has the reserved owner name');
+    throw new GwsEaError('ambiguous_cloudflare_tunnel', `More than one Cloudflare tunnel is named ${name}`);
   }
   const [tunnel] = tunnels;
-  if (tunnel && (tunnel.name !== expectedName || (expectedId !== undefined && tunnel.id !== expectedId))) {
-    throw new GwsEaError('foreign_cloudflare_tunnel', 'Cloudflare tunnel does not match the reserved managed owner');
+  if (tunnel && (tunnel.name !== name || (recordedId !== null && tunnel.id !== recordedId))) {
+    throw new GwsEaError(
+      'foreign_cloudflare_tunnel',
+      `Cloudflare tunnel ${name} is not the one this machine recorded; refusing to change it`,
+    );
   }
   return tunnel;
 }
@@ -216,7 +216,7 @@ function dnsMatches(record: CloudflareDnsRecord, desired: CloudflareDnsRecordWri
   );
 }
 
-export function chooseOwnedDnsRecord(
+function matchDnsRecord(
   records: readonly CloudflareDnsRecord[],
   desired: CloudflareDnsRecordWrite,
   expectedId: string | null,
@@ -230,6 +230,28 @@ export function chooseOwnedDnsRecord(
     throw new GwsEaError('foreign_cloudflare_dns', `Cloudflare DNS name ${desired.name} changed ownership`);
   }
   return record;
+}
+
+/**
+ * The assistant's own DNS record among the records at its hostname: exactly
+ * the one pointing at `tunnelId`, the machine's tunnel. Records there while
+ * the machine has no tunnel are foreign, since none of its could point
+ * anywhere.
+ */
+export function chooseOwnedDnsRecord(
+  records: readonly CloudflareDnsRecord[],
+  instance: InstanceReservation,
+  tunnelId: string | null,
+): CloudflareDnsRecord | undefined {
+  const claim = managedClaim(instance);
+  if (tunnelId === null) {
+    if (records.length === 0) return undefined;
+    throw new GwsEaError(
+      'foreign_cloudflare_dns',
+      `Cloudflare DNS name ${claim.hostname} has records, but this machine has no tunnel they could point to`,
+    );
+  }
+  return matchDnsRecord(records, desiredDnsRecord(instance, tunnelId), claim.dns_record_id);
 }
 
 /**
@@ -261,14 +283,15 @@ async function change<T>(
   }
 }
 
-/** Replace the whole route set, then read it back; returns the configuration version. */
+/** Replace the whole route set, then read it back. */
 export async function replaceManagedCloudflareConfiguration(
   api: CloudflareApi,
   accountId: string,
   tunnelId: string,
   desired: ManagedCloudflareConfiguration,
   expectedBefore: ManagedCloudflareConfiguration,
-): Promise<number> {
+): Promise<void> {
+  /** The version that holds `desired`; undefined while Cloudflare still holds `expectedBefore`. */
   const reread = async (): Promise<number | undefined> => {
     const observed = await api.getTunnelConfiguration(accountId, tunnelId);
     const current = projectConfiguration(observed.config);
@@ -279,7 +302,7 @@ export async function replaceManagedCloudflareConfiguration(
       'Cloudflare tunnel configuration changed while it was being replaced; refusing to overwrite it',
     );
   };
-  return change(
+  await change(
     async () => {
       await api.replaceTunnelConfiguration(accountId, tunnelId, desired);
       const version = await reread();
@@ -296,11 +319,11 @@ export async function replaceManagedCloudflareConfiguration(
 function createTunnel(api: CloudflareApi, accountId: string, name: string): Promise<CloudflareTunnel> {
   return change(
     async () => {
-      const created = chooseOwnedTunnel([await api.createTunnel(accountId, name)], name);
+      const created = chooseOwnedTunnel([await api.createTunnel(accountId, name)], name, null);
       if (!created) throw new GwsEaError('invalid_cloudflare_response', 'Cloudflare created no tunnel');
       return created;
     },
-    async () => chooseOwnedTunnel(await api.listTunnels(accountId, name), name),
+    async () => chooseOwnedTunnel(await api.listTunnels(accountId, name), name, null),
     { idempotent: false },
   );
 }
@@ -321,7 +344,7 @@ function createDnsRecord(
       }
       return created;
     },
-    async () => chooseOwnedDnsRecord(await api.listDnsRecords(zoneId, desired.name), desired, null),
+    async () => matchDnsRecord(await api.listDnsRecords(zoneId, desired.name), desired, null),
     { idempotent: false },
   );
 }
@@ -344,8 +367,8 @@ export async function reconcileManagedCloudflareIngress(
   paths: ControlPlanePaths,
   api: CloudflareApi,
   options: ManagedIngressReconcileOptions,
-): Promise<ManagedCloudflareReconcileResult> {
-  return withLockedCloudflareRegistry(paths, async (locked) => {
+): Promise<void> {
+  await withLockedCloudflareRegistry(paths, async (locked) => {
     const { registry } = locked;
     const instance = registry.instances[options.instanceId];
     const metadata = registry.shared_infrastructure_metadata.cloudflare;
@@ -369,7 +392,7 @@ export async function reconcileManagedCloudflareIngress(
     const existing = chooseOwnedTunnel(
       await api.listTunnels(metadata.account_id, metadata.tunnel_name),
       metadata.tunnel_name,
-      metadata.tunnel_id ?? undefined,
+      metadata.tunnel_id,
     );
     if (!existing && metadata.tunnel_id !== null) {
       throw new GwsEaError(
@@ -377,13 +400,11 @@ export async function reconcileManagedCloudflareIngress(
         'The recorded Cloudflare tunnel is missing; refusing replacement',
       );
     }
-    const records = await api.listDnsRecords(claim.zone_id, claim.hostname);
-    if (!existing && records.length > 0) {
-      throw new GwsEaError(
-        'foreign_cloudflare_dns',
-        `Cloudflare DNS name ${claim.hostname} already has records before this machine's tunnel exists`,
-      );
-    }
+    const recorded = chooseOwnedDnsRecord(
+      await api.listDnsRecords(claim.zone_id, claim.hostname),
+      instance,
+      existing?.id ?? null,
+    );
     // Recorded first, so a crash after Cloudflare creates the tunnel still leaves a trace removal can follow.
     if (!existing) await locked.recordTunnelCreationStarted();
     // A new tunnel starts empty, so creating it before reading its configuration changes nothing foreign.
@@ -391,44 +412,17 @@ export async function reconcileManagedCloudflareIngress(
     const current = await api.getTunnelConfiguration(metadata.account_id, tunnel.id);
     const universe = renderManagedCloudflareConfiguration(registry, options.originHost);
     const owned = assertManagedCloudflareConfigurationOwnership(current.config, universe);
-    const recorded = chooseOwnedDnsRecord(records, desiredDnsRecord(instance, tunnel.id), claim.dns_record_id);
     if (metadata.tunnel_id === null) await locked.updateCoordinates({ tunnelId: tunnel.id });
     const desired = renderManagedCloudflareConfiguration(registry, options.originHost, removing);
-    const configurationVersion = sameConfiguration(owned, desired)
-      ? current.version
-      : await replaceManagedCloudflareConfiguration(api, metadata.account_id, tunnel.id, desired, owned);
+    if (!sameConfiguration(owned, desired)) {
+      await replaceManagedCloudflareConfiguration(api, metadata.account_id, tunnel.id, desired, owned);
+    }
     const record = recorded ?? (await createDnsRecord(api, claim.zone_id, desiredDnsRecord(instance, tunnel.id)));
     if (claim.dns_record_id !== record.id) {
       await locked.updateCoordinates({ dnsRecordIds: { [options.instanceId]: record.id } });
     }
     await storeConnectorToken(options.connector, await api.getTunnelToken(metadata.account_id, tunnel.id));
-    return { tunnelId: tunnel.id, configurationVersion };
   });
-}
-
-/**
- * Wait, on the observation schedule, until a connected connector reports this
- * configuration version or newer. No connected connector means
- * none runs yet: it loads the latest configuration when it starts. A version
- * that never shows is not a failure; the public callback check decides.
- */
-async function awaitConnectorConfiguration(
-  api: CloudflareApi,
-  accountId: string,
-  { tunnelId, configurationVersion }: ManagedCloudflareReconcileResult,
-  sleep: Sleep,
-): Promise<void> {
-  for (const seconds of [0, ...OBSERVATION_WAITS_SECONDS]) {
-    if (seconds > 0) await sleep(seconds * 1_000);
-    const connections = await api.listTunnelConnections(accountId, tunnelId);
-    if (connections.length === 0) return;
-    if (connections.some(({ configVersion }) => configVersion !== undefined && configVersion >= configurationVersion)) {
-      return;
-    }
-  }
-  activeStep()?.write(
-    `No connector reported configuration version ${configurationVersion}; the callback check decides\n`,
-  );
 }
 
 /** One assistant's managed transport, as its `establish_transport` step sees it. */
@@ -450,7 +444,6 @@ export interface ManagedTransportDependencies {
   readonly connector?: CloudflareConnectorDependencies;
   /** Probes the public callback and the local listener. */
   readonly fetch?: typeof globalThis.fetch;
-  readonly sleep?: Sleep;
 }
 
 async function routeRecorded(transport: ManagedTransport, layout: CloudflareConnectorLayout): Promise<boolean> {
@@ -492,7 +485,6 @@ export function managedTransportResources(
     platform: transport.platform,
   });
   const connector = { dockerEndpoint: transport.dockerEndpoint, ...dependencies.connector };
-  const sleep = dependencies.sleep ?? ((milliseconds: number) => delay(milliseconds));
   const localEndpointUrl = `http://127.0.0.1:${transport.webhookPort}/webhook/gchat`;
   let misrouted: string | undefined;
   let reconciled = false;
@@ -502,12 +494,11 @@ export function managedTransportResources(
     const api = (dependencies.createApi ?? ((token: string) => createCloudflareApi({ accountToken: token })))(
       accountToken,
     );
-    const result = await reconcileManagedCloudflareIngress(paths, api, {
+    await reconcileManagedCloudflareIngress(paths, api, {
       instanceId,
       originHost: connectorNetworking(layout.platform).originHost,
       connector: layout,
     });
-    await awaitConnectorConfiguration(api, claim.account_id, result, sleep);
     reconciled = true;
     return undefined;
   };

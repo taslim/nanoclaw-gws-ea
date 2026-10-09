@@ -6,9 +6,11 @@
  * install on the earlier chain only drops what scheduling no longer uses.
  */
 import fs from 'node:fs';
+import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { DATA_DIR } from '../../config.js';
 import type { DbDriver } from '../../db/driver.js';
 import { sqliteRaw } from '../../db/drivers/sqlite.js';
 import { closeDb, createMessagingGroup, initSqliteTestDb } from '../../db/index.js';
@@ -33,6 +35,7 @@ import {
 const CREATE_INBOX = 'module:gws-ea-inbox:create-inbox';
 const EMAIL_CHANNEL = 'module:gws-ea-inbox:email-channel';
 const DROP_THREAD_HOLDS = 'module:gws-ea-inbox:drop-thread-holds';
+const RELATIVE_FILE_PATHS = 'module:gws-ea-inbox:relative-file-paths';
 
 /** The inbox's tables and its thread map's: the Slice 4 schema, and nothing of Slice 2's. */
 const INBOX_TABLES = [
@@ -165,7 +168,15 @@ async function writeSlice4Work(): Promise<void> {
     AT,
   );
   await recordThreadAddresses(THREAD, ['juno@acme.example'], 'message', AT);
-  await recordThreadFile(THREAD, { sha256: 'a'.repeat(64), fileName: 'agenda.pdf', hostPath: '/files/agenda.pdf' }, AT);
+  await recordThreadFile(
+    THREAD,
+    {
+      sha256: 'a'.repeat(64),
+      fileName: 'agenda.pdf',
+      hostPath: path.join(DATA_DIR, 'v2-sessions', 'ag-external', 'sess-1', 'inbox', 'handoff-1', 'agenda.pdf'),
+    },
+    AT,
+  );
   await insertPendingSend({ id: 'send-1', scope: OUTSIDE, contentHash: 'hash-1', rfcMessageId: '<s1@n.example>' }, AT);
   await recordSent(
     { id: 'send-1', scope: OUTSIDE },
@@ -178,11 +189,11 @@ async function writeSlice4Work(): Promise<void> {
 }
 
 describe('the inbox migrations', () => {
-  it("are the inbox's three, in order, and the meetings store registers none", () => {
+  it("are the inbox's four, in order, and the meetings store registers none", () => {
     const names = getRegisteredMigrations()
       .map((migration) => migration.name)
       .filter((name) => /^module:gws-ea-(inbox|meetings):/u.test(name));
-    expect(names).toEqual([CREATE_INBOX, EMAIL_CHANNEL, DROP_THREAD_HOLDS]);
+    expect(names).toEqual([CREATE_INBOX, EMAIL_CHANNEL, DROP_THREAD_HOLDS, RELATIVE_FILE_PATHS]);
   });
 
   it('are portable: async, and free of every banned construct', () => {
@@ -208,7 +219,7 @@ describe('squashed migrations', () => {
     expect(inboxTables(await install())).toEqual(INBOX_TABLES);
   });
 
-  it('update an install on the earlier chain by dropping the holds alone, keeping every Slice 4 row', async () => {
+  it('update an install on the earlier chain by dropping the holds, keeping every Slice 4 row', async () => {
     const db = await initSqliteTestDb();
     await runMigrations(db, earlierRelease());
     await writeSlice4Work();
@@ -217,11 +228,54 @@ describe('squashed migrations', () => {
 
     await runMigrations(db);
 
-    expect((await appliedNames(db)).slice(earlier.length)).toEqual([DROP_THREAD_HOLDS]);
+    expect((await appliedNames(db)).slice(earlier.length)).toEqual([DROP_THREAD_HOLDS, RELATIVE_FILE_PATHS]);
     for (const table of INBOX_TABLES) expect(before[table], table).not.toEqual([]);
     expect(rowsOf(db)).toEqual(before);
     // A retry still finds its send in flight, and the thread still owns its booking.
     expect(await findSend(OUTSIDE, 'hash-2')).toMatchObject({ id: 'send-2', state: 'pending' });
     expect(await getThreadBooking(THREAD, 'evt-review')).toMatchObject({ calendarId: CALENDAR });
+  });
+});
+
+describe('relative-file-paths', () => {
+  it("keeps each handed file by its place in the data directory, rewriting only an earlier release's absolute path into it", async () => {
+    const db = await initSqliteTestDb();
+    await runMigrations(
+      db,
+      getRegisteredMigrations().filter((migration) => migration.name !== RELATIVE_FILE_PATHS),
+    );
+    await createThread(GMAIL_THREAD, AT, THREAD);
+    const recorded: ReadonlyArray<readonly [before: string, after: string]> = [
+      // Through the checkout an earlier release ran from.
+      [
+        '/Users/operator/gws-ea/nanoclaw/data/v2-sessions/ag-external/sess-1/inbox/handoff-1/agenda.pdf',
+        'v2-sessions/ag-external/sess-1/inbox/handoff-1/agenda.pdf',
+      ],
+      // The data directory is the last one the path passes through.
+      [
+        '/srv/data/v2-sessions/data/v2-sessions/ag-external/sess-2/inbox/handoff-2/notes.txt',
+        'v2-sessions/ag-external/sess-2/inbox/handoff-2/notes.txt',
+      ],
+      ...[
+        'v2-sessions/ag-external/sess-3/inbox/handoff-3/deck.pdf',
+        '/files/agenda.pdf',
+        'copies/data/v2-sessions/ag-external/sess-4/inbox/handoff-4/plan.pdf',
+      ].map((unchanged) => [unchanged, unchanged] as const),
+    ];
+    for (const [index, [hostPath]] of recorded.entries()) {
+      await db.run(
+        'INSERT INTO gws_ea_thread_files (thread_key, sha256, file_name, host_path, handed_at) VALUES (?, ?, ?, ?, ?)',
+        THREAD,
+        String(index).repeat(64),
+        `file-${index}`,
+        hostPath,
+        AT,
+      );
+    }
+
+    await runMigrations(db);
+
+    const rows = await db.all<{ host_path: string }>('SELECT host_path FROM gws_ea_thread_files ORDER BY sha256');
+    expect(rows.map((row) => row.host_path)).toEqual(recorded.map(([, after]) => after));
   });
 });

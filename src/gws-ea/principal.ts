@@ -166,11 +166,11 @@ async function runBootstrap(
     command: config.node_path,
     args: [
       '--import',
-      path.join(config.checkout_realpath, 'node_modules', 'tsx', 'dist', 'loader.mjs'),
-      path.join(config.checkout_realpath, 'scripts', 'init-first-agent.ts'),
+      path.join(config.checkout_root, 'node_modules', 'tsx', 'dist', 'loader.mjs'),
+      path.join(config.checkout_root, 'scripts', 'init-first-agent.ts'),
       ...args,
     ],
-    cwd: config.checkout_realpath,
+    cwd: config.checkout_root,
     env: environment,
     timeoutMs: 120_000,
   });

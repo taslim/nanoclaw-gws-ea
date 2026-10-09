@@ -1,14 +1,8 @@
-import { runInstanceOnecliAdminCommand, validateRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
+import { instanceOnecliAdmin, validateRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
 import { runInstanceNclJson } from './ncl.js';
+import type { OnecliAdmin, OnecliAgent } from './onecli-admin.js';
 import { GwsEaError } from './types.js';
-import {
-  EMAIL_PATTERN,
-  isRecord,
-  normalizePrincipalEmail,
-  parseJson,
-  requireString,
-  unwrapData,
-} from './validation.js';
+import { EMAIL_PATTERN, isRecord, normalizePrincipalEmail, requireString, unwrapData } from './validation.js';
 import { isValidTimezone } from '../timezone.js';
 
 /** The template create stamps main from, the group it names, and the plugin it stamps into main's folder. */
@@ -37,14 +31,8 @@ export interface MainIdentityResult {
 
 export interface MainIdentityDependencies {
   readonly runNcl?: (config: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
-  readonly runOnecliAdmin?: (config: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
-}
-
-interface OnecliAgent {
-  readonly id: string;
-  readonly identifier: string;
-  readonly name: string;
-  readonly secretMode: string;
+  /** The instance's OneCLI administration; its own, with its admin key, by default. */
+  readonly onecliAdmin?: (config: InstanceRuntimeConfig) => Promise<OnecliAdmin>;
 }
 
 function safeString(value: unknown, label: string, maxLength = 256): string {
@@ -76,19 +64,6 @@ function parseGroupResult(value: unknown): { id: string; name: string } {
   return { id, name };
 }
 
-function parseOnecliAgents(value: unknown): OnecliAgent[] {
-  const data = unwrapData(value);
-  if (!Array.isArray(data) || !data.every(isRecord)) {
-    throw new GwsEaError('invalid_child_output', 'OneCLI returned an invalid agent list');
-  }
-  return data.map((agent) => ({
-    id: safeString(agent.id, 'OneCLI agent ID'),
-    identifier: safeString(agent.identifier, 'OneCLI agent identifier'),
-    name: safeString(agent.name, 'OneCLI agent name', 120),
-    secretMode: safeString(agent.secretMode, 'OneCLI agent secret mode', 32),
-  }));
-}
-
 function exactAgent(agents: readonly OnecliAgent[], agentGroupId: string): OnecliAgent | undefined {
   const matches = agents.filter((agent) => agent.identifier === agentGroupId);
   if (matches.length > 1) throw new GwsEaError('onecli_agent_collision', 'Multiple OneCLI agents claim canonical main');
@@ -100,11 +75,6 @@ function exactAgent(agents: readonly OnecliAgent[], agentGroupId: string): Onecl
     throw new GwsEaError('onecli_agent_collision', 'The OneCLI main name has an agent identity collision');
   }
   return match;
-}
-
-async function defaultRunOnecliAdmin(config: InstanceRuntimeConfig, args: readonly string[]): Promise<unknown> {
-  const result = await runInstanceOnecliAdminCommand(config, args);
-  return parseJson(result.stdout, 'OneCLI output', 'invalid_child_output');
 }
 
 function validateInput(input: MainIdentityInput): MainIdentityInput {
@@ -156,26 +126,21 @@ function sameAddresses(held: unknown, declared: readonly string[]): boolean {
   return holding.size === held.length && held.length === declared.length && declared.every((e) => holding.has(e));
 }
 
-async function reconcileAllSecretMode(
-  config: InstanceRuntimeConfig,
-  agentGroupId: string,
-  run: NonNullable<MainIdentityDependencies['runOnecliAdmin']>,
-): Promise<string> {
-  let agents = parseOnecliAgents(await run(config, ['agents', 'list', '--max', '0']));
-  let agent = exactAgent(agents, agentGroupId);
+/**
+ * Main's OneCLI agent, created when missing, in all secret mode. A create
+ * that finds the agent already there (a 409) reads it from the list.
+ */
+async function reconcileAllSecretMode(admin: OnecliAdmin, agentGroupId: string): Promise<string> {
+  let agent = exactAgent(await admin.listAgents(), agentGroupId);
   if (!agent) {
-    await run(config, ['agents', 'create', '--name', MAIN_GROUP_NAME, '--identifier', agentGroupId]);
-    agents = parseOnecliAgents(await run(config, ['agents', 'list', '--max', '0']));
-    agent = exactAgent(agents, agentGroupId);
+    await admin.createAgent({ name: MAIN_GROUP_NAME, identifier: agentGroupId });
+    agent = exactAgent(await admin.listAgents(), agentGroupId);
     if (!agent) throw new GwsEaError('onecli_agent_missing', 'OneCLI did not create canonical main');
   }
 
-  if (agent.secretMode !== 'all') {
-    await run(config, ['agents', 'set-secret-mode', '--id', agent.id, '--mode', 'all']);
-  }
+  if (agent.secretMode !== 'all') await admin.setSecretMode(agent.id, 'all');
 
-  agents = parseOnecliAgents(await run(config, ['agents', 'list', '--max', '0']));
-  const verified = exactAgent(agents, agentGroupId);
+  const verified = exactAgent(await admin.listAgents(), agentGroupId);
   if (!verified || verified.id !== agent.id || verified.secretMode !== 'all') {
     throw new GwsEaError('onecli_secret_mode_mismatch', 'Canonical main does not have verified all secret mode');
   }
@@ -200,7 +165,7 @@ export async function reconcileMainIdentity(
   const config = validateRuntimeConfig(configInput);
   const input = validateInput(inputValue);
   const runNcl = dependencies.runNcl ?? runInstanceNclJson;
-  const runOnecliAdmin = dependencies.runOnecliAdmin ?? defaultRunOnecliAdmin;
+  const onecliAdmin = dependencies.onecliAdmin ?? instanceOnecliAdmin;
 
   const group = parseGroupResult(
     await runNcl(config, ['groups', 'create', '--template', MAIN_TEMPLATE, '--name', MAIN_GROUP_NAME]),
@@ -240,7 +205,7 @@ export async function reconcileMainIdentity(
     throw new GwsEaError('main_group_mismatch', "Canonical main's skills did not reconcile to the release's list");
   }
 
-  const onecliAgentId = await reconcileAllSecretMode(config, group.id, runOnecliAdmin);
+  const onecliAgentId = await reconcileAllSecretMode(await onecliAdmin(config), group.id);
   const profile = unwrapData(
     await runNcl(config, [
       'gws-ea-profile',

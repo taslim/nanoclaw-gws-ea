@@ -17,7 +17,6 @@ import {
   type ServiceControlTarget,
 } from '../src/gws-ea/service-control.js';
 import { createInstanceServiceCoordinates, type InstanceServicePlatform } from '../src/gws-ea/service-coordinates.js';
-import { providerProvisioningCapabilityDigest } from '../src/provider-provisioning-capability.js';
 
 const fixture = vi.hoisted(() => {
   const spinner = {
@@ -214,12 +213,9 @@ describe('GWS-EA driver', () => {
         configRoot: '/config',
         stateRoot: '/state',
         logsRoot: '/state/logs',
-        instancesRoot: '/state/instances',
-        onecliCliFile: (version) => `/state/tools/onecli/${version}/onecli`,
       },
       account: 'reserved@example.com',
       dockerEndpoint: 'unix:///var/run/docker.sock',
-      checkoutRoot: '/state/instances/x/nanoclaw',
     };
     await runtime.checkPrerequisites!(request, interaction);
     expect(fixture.ensurePrerequisites).toHaveBeenCalledWith(request, interaction);
@@ -271,7 +267,6 @@ describe('GWS-EA driver', () => {
 
     const setup = await runtime.toolProviderSetup!();
 
-    expect(setup.capabilityDigest).toBe(await providerProvisioningCapabilityDigest(process.cwd()));
     expect(setup.credentialMetadata('claude')).toEqual({
       name: 'Anthropic',
       type: 'anthropic',

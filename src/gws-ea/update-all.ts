@@ -9,7 +9,7 @@
  * and provider setup), and a running service. One that cannot move is
  * skipped and reported, with the command that moves it; each other one then
  * takes its turn through `update --id`'s own path, which checks everything
- * again under its lock. A recorded update's follow-ups are finished before
+ * again under its lock. A committed update's follow-ups are finished before
  * anything else, as `update --id` finishes them, even at the tool's release;
  * they run through the assistant's host, so a stopped one is skipped first.
  * The tool's commit is read once, as the run begins, and every check and
@@ -33,11 +33,12 @@ import { assertInstanceCreated } from './journal.js';
 import { CONTROL_PLANE_ROOT, type ControlPlanePaths } from './paths.js';
 import { safeErrorMessage } from './redact.js';
 import { getInstanceReservation } from './registry.js';
+import { assertConverted } from './release-convert.js';
 import { resolveReleaseTarget, type ToolProviderSetup } from './release-target.js';
 import type { NanoclawServiceHelpers } from './service-control.js';
 import { listAssistants, unfinishedOperation, type ListedAssistant } from './status.js';
-import { GwsEaError, releaseOf, sameRelease, shortCommit, type ReleaseCoordinates } from './types.js';
-import { resolveUpdateIntent, type UpdatedAssistant, type UpdateSeams } from './update.js';
+import { GwsEaError, releaseLine, releaseOf, sameRelease, shortCommit, type ReleaseCoordinates } from './types.js';
+import { resolveUpdateIntent, serviceRefusal, type UpdatedAssistant, type UpdateSeams } from './update.js';
 import { readCentralMigrations } from './verify.js';
 
 /** What `update --all` checks the assistants with. */
@@ -59,7 +60,7 @@ export type PlannedTurn =
       readonly to: ReleaseCoordinates;
       readonly migrations: readonly string[] | undefined;
     }
-  /** It already runs `release`, recorded by an update whose follow-ups are left. */
+  /** It already runs `release`, committed by an update whose follow-ups are left. */
   | { readonly kind: 'follow_ups'; readonly release: ReleaseCoordinates };
 
 /** One registered assistant: it takes `turn`, or it is skipped for `reason`. */
@@ -78,7 +79,7 @@ export interface UpdateAllPlan {
 export type AssistantUpdate =
   | { readonly kind: 'updated'; readonly updated: UpdatedAssistant }
   /** Its recorded update to the release it would deploy only had follow-ups left, and they finished. */
-  | { readonly kind: 'completed'; readonly release: ReleaseCoordinates; readonly notes: readonly string[] };
+  | { readonly kind: 'completed'; readonly release: ReleaseCoordinates };
 
 /** How one assistant's turn ended: its update's end, a failure, or another command holding it. */
 export type UpdateTurn = AssistantUpdate | { readonly kind: 'failed' } | { readonly kind: 'busy' };
@@ -90,33 +91,14 @@ export interface UpdateAllSummary {
   readonly details: readonly string[];
 }
 
-function releaseName(release: ReleaseCoordinates): string {
-  return `${release.release_track} ${shortCommit(release.deployed_commit)}`;
-}
-
-/** Why an assistant's service keeps it from an update, which proves its release on a running host; none when it runs. */
-function serviceRefusal({ instance_id: id, service }: ListedAssistant): string | undefined {
-  switch (service.state) {
-    case 'running':
-      return undefined;
-    case 'stopped':
-      return `It is stopped, and an update proves its new release on a running assistant; start it with gws-ea start --id ${id}, then update it.`;
-    case 'not_installed':
-      return `No NanoClaw service is installed for it; gws-ea resume --id ${id} installs it.`;
-    case 'unmanaged':
-      return `${service.reason ?? 'Its host runs outside its service.'} Stop that process and start it with gws-ea start --id ${id}, then update it.`;
-    case 'unknown':
-      return `Its service could not be observed: ${service.reason ?? 'unknown'}`;
-  }
-}
-
 /** Why the assistant's update or rollback record keeps it from an update, naming what moves it on, as `status` does. */
 function operationRefusal({ operation }: ListedAssistant): string | undefined {
   switch (operation.state) {
     case 'none':
-    case 'recorded':
+    case 'committed':
       return undefined;
     case 'open':
+    case 'failed':
     case 'unreadable':
       return unfinishedOperation(operation);
   }
@@ -128,8 +110,8 @@ type IntendedTurn =
       readonly kind: 'update';
       readonly from: ReleaseCoordinates;
       readonly to: ReleaseCoordinates;
-      /** Its live checkout, whose central database names the migrations it has applied. */
-      readonly checkout: string;
+      /** Its `state/`, whose central database names the migrations it has applied. */
+      readonly state: string;
     }
   | { readonly kind: 'follow_ups'; readonly release: ReleaseCoordinates }
   | { readonly kind: 'refused'; readonly reason: string };
@@ -148,15 +130,17 @@ async function intendedTurn(
 ): Promise<IntendedTurn> {
   const { paths, seams } = context;
   try {
+    // The one-time conversion runs only through `update --id`, with the owner present.
+    assertConverted(paths, await getInstanceReservation(paths, instanceId));
     await assertInstanceCreated(paths, instanceId);
     const intent = await resolveUpdateIntent(paths, { instanceId, expectedToolCommit: toolCommit }, seams);
-    // `update --id` finishes a recorded operation's follow-ups first, and is done when it recorded this release.
-    if (operation.state === 'recorded' && sameRelease(operation.to, intent.target)) {
+    // `update --id` finishes a committed operation's follow-ups first, and is done when it committed this release.
+    if (operation.state === 'committed' && sameRelease(operation.to, intent.target)) {
       return { kind: 'follow_ups', release: intent.target };
     }
     const reservation = await getInstanceReservation(paths, instanceId);
     if (reservation.deployed_commit === intent.target.deployed_commit) {
-      return { kind: 'refused', reason: `It already runs ${releaseName(intent.target)}, this tool's release.` };
+      return { kind: 'refused', reason: `It already runs ${releaseLine(intent.target)}, this tool's release.` };
     }
     await resolveReleaseTarget(
       {
@@ -169,7 +153,12 @@ async function intendedTurn(
         ...(seams.toolRoot ? { toolRoot: seams.toolRoot } : {}),
       },
     );
-    return { kind: 'update', from: releaseOf(reservation), to: intent.target, checkout: reservation.checkout_realpath };
+    return {
+      kind: 'update',
+      from: releaseOf(reservation),
+      to: intent.target,
+      state: paths.instanceLayout(reservation.instance_id).state,
+    };
   } catch (error) {
     if (error instanceof GwsEaError) return { kind: 'refused', reason: safeErrorMessage(error) };
     // Only its code is shown: an unexpected error's message may carry a secret.
@@ -182,16 +171,16 @@ async function intendedTurn(
 }
 
 /**
- * The release's migrations the central database under `checkout` has not
+ * The release's migrations the central database under `state` has not
  * applied, in the order the release applies them; undefined when that
  * database cannot be read. Only read, never changed: the plan names them,
  * and each turn's dry run on a copy of the database is what its update is
  * held to.
  */
-function unappliedMigrations(checkout: string, release: readonly string[]): readonly string[] | undefined {
+function unappliedMigrations(state: string, release: readonly string[]): readonly string[] | undefined {
   let applied: readonly string[];
   try {
-    applied = readCentralMigrations(checkout);
+    applied = readCentralMigrations(state);
   } catch (error) {
     if (error instanceof GwsEaError || error instanceof Database.SqliteError) return undefined;
     throw error;
@@ -216,11 +205,11 @@ async function classify(
   const intended = await intendedTurn(context, instanceId, listed.operation, toolCommit);
   if (intended.kind === 'refused') return skip(intended.reason);
   // An update proves its release, and a recorded one's follow-ups run, through the assistant's running host.
-  const stopped = serviceRefusal(listed);
-  if (stopped) return skip(stopped);
+  const { state, reason } = listed.service;
+  if (state !== 'running') return skip(serviceRefusal(instanceId, state, reason));
   if (intended.kind === 'follow_ups') return { instanceId, eligible: true, turn: intended };
-  const { from, to, checkout } = intended;
-  const migrations = unappliedMigrations(checkout, await releaseMigrations());
+  const { from, to, state: stateRoot } = intended;
+  const migrations = unappliedMigrations(stateRoot, await releaseMigrations());
   return { instanceId, eligible: true, turn: { kind: 'update', from, to, migrations } };
 }
 
@@ -281,9 +270,9 @@ function migrationsLine(migrations: readonly string[] | undefined): string {
 function turnLine(instanceId: string, turn: PlannedTurn): string {
   switch (turn.kind) {
     case 'update':
-      return `Update ${instanceId}: ${releaseName(turn.from)} → ${releaseName(turn.to)}; database migrations to add: ${migrationsLine(turn.migrations)}`;
+      return `Update ${instanceId}: ${releaseLine(turn.from)} → ${releaseLine(turn.to)}; database migrations to add: ${migrationsLine(turn.migrations)}`;
     case 'follow_ups':
-      return `Finish ${instanceId}'s update to ${releaseName(turn.release)}: only its follow-ups are left`;
+      return `Finish ${instanceId}'s update to ${releaseLine(turn.release)}: only its follow-ups are left`;
   }
 }
 
@@ -301,10 +290,10 @@ function endedLines(ended: ReadonlyMap<string, AssistantUpdate>): Record<Assista
   for (const [id, update] of ended) {
     switch (update.kind) {
       case 'updated':
-        lines.updated.push(`Updated ${id}: ${releaseName(update.updated.from)} → ${releaseName(update.updated.to)}`);
+        lines.updated.push(`Updated ${id}: ${releaseLine(update.updated.from)} → ${releaseLine(update.updated.to)}`);
         break;
       case 'completed':
-        lines.completed.push(`Completed ${id}'s update to ${releaseName(update.release)}: its follow-ups are done`);
+        lines.completed.push(`Completed ${id}'s update to ${releaseLine(update.release)}: its follow-ups are done`);
         break;
     }
   }

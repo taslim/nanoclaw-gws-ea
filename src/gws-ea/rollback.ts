@@ -1,30 +1,34 @@
 /**
- * `rollback` (R13-R15), and the recovery of an update that failed after its
- * swap (R14). A rollback returns an assistant to the release kept in
- * `<instance>/previous/`, restorable only into its own instance. Its mode is
- * decided once the host is stopped and its checkout proven quiet, from the
- * schema as it is then (KTD5): when neither the central migrations nor the
- * session tables moved since the kept release's snapshot, only the code goes
- * back and every message, memory, and setting since is carried to it;
- * otherwise the snapshot is restored, after its time and what it discards are
- * shown and confirmed. Either way the kept release's own state is set aside,
- * never overwritten (a snapshot restore runs on a copy of it), and the
- * release left is kept whole in `outgoing/`, with that set-aside state, until
- * the next update or removal (KTD19).
+ * `rollback` (R3, R5, R10), and the revert of an update that failed once its
+ * release started. A rollback returns an assistant to its rollback point
+ * (KTD4): the release its last update left, and the snapshot that update
+ * took of the state as the release left it. Its mode is decided while the
+ * assistant is fenced, from the schema as it is then (KTD5): when neither the
+ * central migrations nor the session tables moved since the snapshot, only
+ * the code goes back and every message, memory, and setting since is kept;
+ * otherwise the snapshot is restored, once its time and what it discards are
+ * shown and confirmed. A restore renames the state aside whole into
+ * `quarantine/<op>/` and clones the snapshot in its place, and hands the
+ * host every person forgotten since the snapshot, to forget again (KTD8).
+ * The switch itself moves no state.
  *
  * Each phase is recorded as it completes, so a rollback cut short anywhere is
- * continued by the next `rollback --id`; one cut short before its swap moved
- * the live checkout is decided and prepared again, since the release it
- * leaves may have run from the live path since. One that fails once its swap
- * moved the live checkout goes back to the release it left, whole, and says
- * so; after a code-only failure the snapshot is offered instead. One that
- * fails before is given up, and the release it would leave started again. An
- * update not yet swapped is not rolled back but discarded, and its host
- * started again.
+ * continued by the next `rollback --id`. One that fails goes back to the
+ * release it left (KTD5): the state it restored is renamed aside to
+ * `quarantine/<op>-returned/` and the quarantined state put back, and the
+ * release it left is switched to, started, and verified. When that fails
+ * too, the record is closed for fix-forward (KTD9) once the state it
+ * replaced is back; before that it stays open, going back, for the next
+ * `rollback --id` to finish the return. An update whose release
+ * cannot have started is not rolled back: the release it left is served
+ * again and the update discarded. One whose release may have started (from
+ * its switch on) is reverted by the same rules, from the snapshot it took and
+ * committing by its own record; there is nothing to go back to when that
+ * fails, so it is closed for fix-forward.
  */
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { lstat, mkdtemp, readdir, readFile, readlink, rename, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, readlink, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -32,91 +36,64 @@ import Database from 'better-sqlite3';
 
 import { isErrno } from '../community-portal/errors.js';
 import { writePrivate } from '../community-portal/private-file.js';
-import { getInstallScopedNames } from '../install-slug.js';
+import { peopleForgetHandoffFile, writePeopleForgetHandoff } from '../modules/gws-ea-people/forget-handoff.js';
 import { formatLocalTime } from '../timezone.js';
+import { provideReleaseImage, readInstallCjkFonts } from './agent-image-release.js';
+import { committedTree } from './checkout.js';
 import {
-  assertCarriable,
-  assertCheckoutQuiet,
-  carryState,
-  copyReleaseRecords,
-  cutoverDocker,
-  cutoverOnecli,
-  cutoverQuiescence,
-  cutoverServiceDependencies,
-  dockerEnvironment,
+  assistantImageDocker,
+  fenceInstance,
   finishFollowUps,
-  finishRollbackSwap,
-  finishSwap,
-  imageIdOf,
-  moveRecordedImages,
-  keepCutoverHostStopped,
-  leftoverPreviousTag,
-  nextAgentImage,
   openCutoverHost,
-  planFollowUps,
-  quietCheckoutOf,
-  removeUpdateStaging,
-  restoredReleaseRoot,
-  restoreSetAsideState,
-  reverseRollbackSwap,
-  reverseRollbackSwapBeforeLiveMoved,
-  reverseSwap,
-  setAsideState,
-  setAsideStateRoot,
-  settleCheckoutDatabases,
-  stopCutoverHost,
+  reconcileMainSkills,
+  releaseFollowUps,
+  serveLeftRelease,
+  startRelease,
+  switchTo,
   verifyServingRelease,
   type CutoverDependencies,
   type CutoverHost,
-  type RollbackReleases,
 } from './cutover.js';
-import {
-  keepReleaseFiles,
-  keptReleaseFiles,
-  readKeptReleaseManifest,
-  type KeptReleaseManifest,
-} from './kept-release.js';
 import { runStep } from './events.js';
 import { assertInstanceCreated, type InstanceOperation } from './journal.js';
-import { parseOnecliComposeImages, type OnecliPins } from './onecli-compose.js';
 import {
   advanceOperation,
   assertNotCommitted,
   beginOperation,
   beginOperationReturn,
+  closeOperationFailed,
   commitOperationRelease,
-  completeOperationReturn,
   discardOperation,
+  planFollowUps,
   readOperationRecord,
+  readRollbackPoint,
+  recordOperationFacts,
   reservationAt,
-  withdrawRollback,
-  type MovedImage,
-  type OperationFollowUp,
+  targetMayHaveStarted,
   type OperationRecord,
   type RollbackMode,
   type SnapshotManifest,
 } from './operation.js';
-import { instanceMarkerFile, isRegularFile, type ControlPlanePaths } from './paths.js';
 import { readDeployedSetup } from './provision.js';
 import { safeErrorMessage } from './redact.js';
-import { readInstanceMarkerFile } from './registry.js';
-import { activeStep } from './run-log.js';
-import { readOwnerOnlyFile, readOwnerOnlyJson } from './secrets.js';
 import {
-  INSTANCE_HOST_ENV_KEYS,
-  instanceServiceDefinitionFile,
-  readInstanceHostEnvironment,
-  restoreInstanceServiceDefinition,
-  stampUpgradeState,
-} from './service.js';
-import { GwsEaError, releaseOf, shortCommit, type InstanceReservation, type ReleaseCoordinates } from './types.js';
-import { isRecord } from './validation.js';
-import { backupCentralDatabase, printableName, readDerivedImageGroups, readSchemaManifest } from './verify.js';
+  exists,
+  isReleaseComplete,
+  operationName,
+  readCurrent,
+  releaseName,
+  restoreSnapshot,
+  returnQuarantinedState,
+  snapshotTakenAt,
+} from './release-layout.js';
+import { activeStep } from './run-log.js';
+import { GwsEaError, releaseLine, releaseOf, type ReleaseCoordinates } from './types.js';
+import { backupCentralDatabase, printableName, readForgottenFingerprints, readSchemaManifest } from './verify.js';
 
 /** How many IDs and paths a discard summary lists; the counts are always whole. */
 const LISTED = 20;
 
-/** What a snapshot restore discards, diffed from the state as it is now against the snapshot (R13). */
+/** What a snapshot restore discards, diffed from the state as it is now against the snapshot (R3). */
 export interface DiscardSummary {
   /** Inbound messages the snapshot never received: they are lost. */
   readonly inbound: DiscardedRows;
@@ -143,16 +120,16 @@ export interface DiscardedRows {
 /** Why a rollback restores the snapshot rather than only the code. */
 export type SnapshotReason = 'central_schema' | 'session_schema' | 'requested';
 
-/** What the operator sees before a snapshot restore, and confirms (R13). */
+/** What the operator sees before a snapshot restore, and confirms (R3). */
 export interface RollbackPreview {
   readonly instanceId: string;
   readonly from: ReleaseCoordinates;
   readonly to: ReleaseCoordinates;
-  /** When the update being undone stopped the assistant: the snapshot is its state as of then. */
+  /** When the update being undone fenced the assistant: the snapshot is its state as of then. */
   readonly snapshotAt: string;
   readonly reason: SnapshotReason;
   readonly discarded: DiscardSummary;
-  /** Where the discarded state is kept, as the release left, until the next update or removal. */
+  /** Where the discarded state is kept. */
   readonly keptAt: string;
 }
 
@@ -167,158 +144,26 @@ export interface RollbackRequest {
 
 /** Where a rollback left the assistant. */
 export type RollbackOutcome =
-  | {
+  | ({
       readonly kind: 'rolled_back';
       readonly from: ReleaseCoordinates;
       readonly to: ReleaseCoordinates;
-      readonly mode: RollbackMode;
-      /** The snapshot restored in snapshot mode; in code-only mode, the one kept unused. */
+      /** The snapshot restored in snapshot mode; in code-only mode, the one left unused. */
       readonly snapshotAt: string;
-      /** Where the release left is kept, whole. */
-      readonly keptAt: string;
-    }
-  /** An update not yet swapped was discarded; `release` runs again. */
+    } & (
+      | { readonly mode: 'code_only' }
+      | {
+          readonly mode: 'snapshot';
+          /** Where the state it replaced is kept. */
+          readonly keptAt: string;
+        }
+    ))
+  /** An update whose release had not started was discarded; `release` runs again. */
   | { readonly kind: 'update_discarded'; readonly release: ReleaseCoordinates; readonly discarded: ReleaseCoordinates }
   /** The follow-ups an earlier rollback left were run. */
   | { readonly kind: 'follow_ups_finished'; readonly release: ReleaseCoordinates }
-  /** The snapshot restore was declined; the assistant stays on `release` as before. */
+  /** The snapshot restore was declined; the assistant runs `release` as before. */
   | { readonly kind: 'declined'; readonly release: ReleaseCoordinates };
-
-function releaseLine(release: ReleaseCoordinates): string {
-  return `${release.release_track} ${shortCommit(release.deployed_commit)}`;
-}
-
-async function exists(target: string): Promise<boolean> {
-  try {
-    await lstat(target);
-    return true;
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) return false;
-    throw error;
-  }
-}
-
-/** The files a rollback works with, beside the live checkout. */
-interface RollbackPlaces {
-  readonly live: string;
-  readonly previous: string;
-  readonly previousCheckout: string;
-  /** Where the kept release's own state is set aside while another is carried into its checkout. */
-  readonly state: string;
-  readonly outgoing: string;
-  readonly outgoingCheckout: string;
-  /** Where, after the swap, what `previous/` held besides its checkout is kept. */
-  readonly restored: string;
-  /** The failed run's logs, when a rollback goes back. */
-  readonly failedLogs: string;
-  /** The receipt a recorded rollback leaves beside the release it left. */
-  readonly receipt: string;
-}
-
-function rollbackPlaces(host: CutoverHost): RollbackPlaces {
-  const { paths, instanceId } = host.operation;
-  const previous = paths.releaseRoot(instanceId, 'previous');
-  const outgoing = paths.releaseRoot(instanceId, 'outgoing');
-  return {
-    live: host.reservation.checkout_realpath,
-    previous,
-    previousCheckout: paths.releaseCheckoutRoot(instanceId, 'previous'),
-    state: setAsideStateRoot(previous),
-    outgoing,
-    outgoingCheckout: paths.releaseCheckoutRoot(instanceId, 'outgoing'),
-    restored: restoredReleaseRoot(paths, instanceId),
-    failedLogs: path.join(outgoing, 'failed-logs'),
-    receipt: path.join(outgoing, 'rollback.json'),
-  };
-}
-
-/** One rollback, from the release live now to the one kept. */
-interface Rollback extends CutoverHost {
-  readonly from: ReleaseCoordinates;
-  readonly to: ReleaseCoordinates;
-  readonly releases: RollbackReleases;
-  /** The reservation with the restored release overlaid: what must serve once it is live. */
-  readonly restoredView: InstanceReservation;
-  readonly places: RollbackPlaces;
-  readonly request: RollbackRequest;
-  /**
-   * Whether giving the rollback up before its swap starts the live release
-   * again: unless this rollback found it stopped. One continued from an
-   * earlier attempt, which stopped it, always does.
-   */
-  readonly resumeLive: boolean;
-}
-
-function rollbackOf(
-  host: CutoverHost,
-  from: ReleaseCoordinates,
-  to: ReleaseCoordinates,
-  restoreSetAside: boolean,
-  request: RollbackRequest,
-  resumeLive = true,
-): Rollback {
-  return {
-    ...host,
-    from,
-    to,
-    releases: { from: from.deployed_commit, to: to.deployed_commit, restoreSetAside },
-    restoredView: reservationAt(host.reservation, to),
-    places: rollbackPlaces(host),
-    request,
-    resumeLive,
-  };
-}
-
-function rollbackOfRecord(host: CutoverHost, record: OperationRecord, request: RollbackRequest): Rollback {
-  return rollbackOf(host, record.from, record.to, record.commit_point === 'record', request);
-}
-
-const STOP_LABEL = 'Stopping the assistant for the rollback…';
-
-/**
- * The kept previous release (R15): its manifest must name this assistant,
- * and its checkout's marker the same assistant and release, with its receipt
- * beside it. Refuses, naming why, when none is kept. Only reads, so `status`
- * offers a rollback exactly when this would allow one.
- */
-export async function readKeptPreviousRelease(
-  paths: ControlPlanePaths,
-  instanceId: string,
-): Promise<KeptReleaseManifest> {
-  const root = paths.releaseRoot(instanceId, 'previous');
-  const checkout = paths.releaseCheckoutRoot(instanceId, 'previous');
-  const unavailable = (why: string): GwsEaError =>
-    new GwsEaError('rollback_unavailable', `Assistant ${instanceId} ${why}, so there is nothing to roll back to.`);
-  if (!(await exists(checkout))) throw unavailable('keeps no previous release');
-  let manifest: KeptReleaseManifest;
-  try {
-    manifest = await readKeptReleaseManifest(root, instanceId);
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) throw unavailable('keeps a previous release without its manifest');
-    throw error;
-  }
-  const marker = await readInstanceMarkerFile(instanceMarkerFile(checkout));
-  if (marker.instance_id !== instanceId) {
-    throw new GwsEaError(
-      'kept_release_mismatch',
-      `The release kept in ${checkout} belongs to another assistant, so it cannot be restored into ${instanceId}.`,
-    );
-  }
-  if (marker.deployed_commit !== manifest.release.deployed_commit) {
-    throw new GwsEaError(
-      'invalid_kept_release',
-      `The release kept in ${checkout} is at ${shortCommit(marker.deployed_commit)}, not the ${shortCommit(manifest.release.deployed_commit)} its manifest names.`,
-    );
-  }
-  if (!(await isRegularFile(keptReleaseFiles(root).receipt)))
-    throw unavailable('keeps a previous release without its receipt');
-  return manifest;
-}
-
-/** Where the kept release's snapshot is: set aside, or still in its checkout. */
-async function snapshotRoot(rollback: Rollback): Promise<string> {
-  return (await exists(rollback.places.state)) ? rollback.places.state : rollback.places.previousCheckout;
-}
 
 /** Which schema moved between two manifests (KTD5): the central migrations, else the session tables and columns. */
 export function sameSchema(left: SnapshotManifest, right: SnapshotManifest): 'same' | SnapshotReason {
@@ -331,17 +176,6 @@ export function sameSchema(left: SnapshotManifest, right: SnapshotManifest): 'sa
         .sort(([a], [b]) => a.localeCompare(b)),
     );
   return tables(left) === tables(right) ? 'same' : 'session_schema';
-}
-
-/** The rollback's mode (KTD5): snapshot when asked, or when either schema moved since the snapshot; else code only. */
-function decideMode(
-  current: SnapshotManifest,
-  snapshot: SnapshotManifest,
-  requested: boolean,
-): { readonly mode: RollbackMode; readonly reason: SnapshotReason | undefined } {
-  const moved = sameSchema(current, snapshot);
-  if (moved !== 'same') return { mode: 'snapshot', reason: moved };
-  return requested ? { mode: 'snapshot', reason: 'requested' } : { mode: 'code_only', reason: undefined };
 }
 
 /**
@@ -603,7 +437,7 @@ export async function summarizeDiscard(current: string, snapshot: string): Promi
 }
 
 /** Nothing recorded since the snapshot would be lost. */
-export function isLossless(summary: DiscardSummary): boolean {
+function isLossless(summary: DiscardSummary): boolean {
   return (
     summary.inbound.count === 0 &&
     summary.rerun.count === 0 &&
@@ -625,7 +459,7 @@ const REASONS: Readonly<Record<SnapshotReason, string>> = {
   requested: 'it was asked for',
 };
 
-/** A snapshot restore's preview, one fact per line (R13), with times in `timezone`. */
+/** A snapshot restore's preview, one fact per line (R3), with times in `timezone`. */
 export function rollbackPreviewLines(preview: RollbackPreview, timezone: string): string[] {
   const { discarded } = preview;
   const lines = [
@@ -647,7 +481,7 @@ export function rollbackPreviewLines(preview: RollbackPreview, timezone: string)
     `  Central rows added since: ${tables || 'none'}`,
     `  Memory and group files changed since: ${discarded.files.count === 0 ? 'none' : `${discarded.files.count} (${discarded.files.paths.map(printableName).join(', ')}${more})`}`,
     `  OneCLI agents left orphaned with their grants: ${discarded.orphanedAgents.map(printableName).join(', ') || 'none'}`,
-    `The discarded state is kept in ${preview.keptAt} until the next update or removal.`,
+    `The discarded state is kept in ${preview.keptAt} until another snapshot restore replaces it, or the assistant is removed.`,
   ];
 }
 
@@ -659,11 +493,11 @@ export function describeRollback(outcome: RollbackOutcome, timezone: string): st
         ? `the assistant runs ${releaseLine(outcome.to)} again, with everything it recorded since kept.`
         : `the assistant runs ${releaseLine(outcome.to)} again on its snapshot from ${formatLocalTime(outcome.snapshotAt, timezone)}; what it recorded since is kept in ${outcome.keptAt}.`;
     case 'update_discarded':
-      return `the staged ${releaseLine(outcome.discarded)} was discarded, and the assistant runs ${releaseLine(outcome.release)} again.`;
+      return `the update to ${releaseLine(outcome.discarded)} was discarded, and the assistant runs ${releaseLine(outcome.release)} again.`;
     case 'follow_ups_finished':
       return `the assistant runs ${releaseLine(outcome.release)}, and its rollback is finished.`;
     case 'declined':
-      return `the snapshot restore was declined, and the assistant stays on ${releaseLine(outcome.release)} as before.`;
+      return `the snapshot restore was declined, and the assistant runs ${releaseLine(outcome.release)} as before.`;
   }
 }
 
@@ -675,408 +509,189 @@ function confirmationRequired(instanceId: string): GwsEaError {
   );
 }
 
-/** Ask for a snapshot restore, showing what it discards; undefined when nobody can be asked. */
+/** What a rollback returns from and to, and the snapshot it may restore. */
+interface RollbackPlan {
+  readonly from: ReleaseCoordinates;
+  readonly to: ReleaseCoordinates;
+  /** The snapshot it restores in snapshot mode: the rollback point's, or the one the update it reverts took. */
+  readonly snapshot: string;
+  readonly request: RollbackRequest;
+}
+
+/** One rollback under way. */
+interface Rollback extends CutoverHost, RollbackPlan {
+  /** The operation's name: `quarantine/<op>/` keeps the state a restore replaces. */
+  readonly op: string;
+  /** It reverts an update that never committed, and so commits by its own record. */
+  readonly reverting: boolean;
+}
+
+const STOP_LABEL = 'Stopping the assistant for the rollback…';
+
+/**
+ * The rollback `record` is: a revert restores the snapshot its update took,
+ * named as the update was, since it keeps the update's start; any other, the
+ * rollback point's.
+ */
+async function rollbackOf(host: CutoverHost, record: OperationRecord, request: RollbackRequest): Promise<Rollback> {
+  const op = operationName(record.started_at);
+  const reverting = record.commit_point === 'record';
+  const point = reverting ? undefined : await readRollbackPoint(host.operation.paths, host.operation.instanceId);
+  if (!reverting && !point) {
+    throw new GwsEaError('rollback_unavailable', `Assistant ${record.instance_id} has lost its rollback point.`);
+  }
+  return { ...host, from: record.from, to: record.to, op, snapshot: point?.snapshot ?? op, reverting, request };
+}
+
+/** The rollback's mode (KTD5): snapshot when asked, or when either schema moved since the snapshot; else code only. */
+function decideMode(
+  current: SnapshotManifest,
+  snapshot: SnapshotManifest,
+  requested: boolean,
+): { readonly mode: RollbackMode; readonly reason: SnapshotReason | undefined } {
+  const moved = sameSchema(current, snapshot);
+  if (moved !== 'same') return { mode: 'snapshot', reason: moved };
+  return requested ? { mode: 'snapshot', reason: 'requested' } : { mode: 'code_only', reason: undefined };
+}
+
+/** Show what restoring the snapshot over `current` discards, and ask for it; undefined when nobody can be asked. */
 async function confirmSnapshot(
-  rollback: Rollback,
+  host: CutoverHost,
+  plan: RollbackPlan,
   reason: SnapshotReason,
   current: string,
 ): Promise<boolean | undefined> {
-  const { paths, instanceId } = rollback.operation;
-  const manifest = await readKeptReleaseManifest(paths.releaseRoot(instanceId, 'previous'), instanceId);
+  const { layout, operation } = host;
   const preview: RollbackPreview = {
-    instanceId,
-    from: rollback.from,
-    to: rollback.to,
-    snapshotAt: manifest.snapshot_at,
+    instanceId: operation.instanceId,
+    from: plan.from,
+    to: plan.to,
+    snapshotAt: await snapshotTakenAt(layout, plan.snapshot),
     reason,
-    discarded: await summarizeDiscard(current, await snapshotRoot(rollback)),
-    keptAt: rollback.places.outgoing,
+    discarded: await summarizeDiscard(current, layout.snapshot(plan.snapshot)),
+    keptAt: path.join(layout.root, 'quarantine'),
   };
-  rollback.request.present(preview);
-  return rollback.request.confirm ? rollback.request.confirm(preview) : undefined;
+  plan.request.present(preview);
+  return plan.request.confirm ? plan.request.confirm(preview) : undefined;
 }
 
-/** What the stop found: when it happened, whether it was graceful, the schema, and the mode it decides. */
-interface Stopped {
-  readonly at: string;
-  readonly graceful: boolean;
-  readonly manifest: SnapshotManifest;
-  readonly mode: RollbackMode;
+/**
+ * Before anything changes, judge the mode from the state as it is while the
+ * assistant serves: a snapshot restore nobody can confirm is refused here,
+ * showing what it would discard. It is decided again, and confirmed, once
+ * fenced.
+ */
+async function assertConfirmable(host: CutoverHost, plan: RollbackPlan): Promise<void> {
+  if (plan.request.confirm) return;
+  const { layout } = host;
+  const { mode, reason } = decideMode(
+    readSchemaManifest(layout.state),
+    readSchemaManifest(layout.snapshot(plan.snapshot)),
+    plan.request.snapshot === true,
+  );
+  if (mode !== 'snapshot' || !reason) return;
+  await confirmSnapshot(host, plan, reason, layout.state);
+  throw confirmationRequired(host.operation.instanceId);
+}
+
+/**
+ * Write the forget handoff from the state a restore replaced (KTD8): every
+ * identity forgotten there that the restored database does not record, for
+ * the host to forget again before it routes anything. Read-only on both
+ * databases; recomputed whole whenever the restore step runs.
+ */
+async function handOffForgets(rollback: Rollback): Promise<void> {
+  const { layout } = rollback;
+  const restored = new Set(readForgottenFingerprints(layout.state).map((row) => row.fingerprint));
+  const missing = readForgottenFingerprints(layout.quarantine(rollback.op)).filter(
+    (row) => !restored.has(row.fingerprint),
+  );
+  if (missing.length === 0) return;
+  await writePeopleForgetHandoff(peopleForgetHandoffFile(path.join(layout.state, 'data')), { fingerprints: missing });
 }
 
 /** How deciding went: a mode, or a snapshot restore declined or that nobody can confirm. */
-type Decision =
-  | { readonly outcome: 'decided'; readonly stopped: Stopped }
-  | { readonly outcome: 'declined' | 'unconfirmable' };
+type Decision = RollbackMode | 'declined' | 'unconfirmable';
 
 /**
- * Stop the live host and its agents, prove its checkout quiet and settle its
- * databases (KTD18), and decide the mode from the schema as it is now (KTD5).
- * A snapshot restore is shown and confirmed here, with the assistant stopped
- * so what it discards is exact.
+ * `fenced` → `snapshotted`: decide the mode from the schema the fence read
+ * (KTD5), show and confirm a snapshot restore, and restore it, handing off
+ * the people forgotten since (KTD8). A restore that began is finished
+ * without deciding again, since the state is no longer the one decided on.
  */
-async function stopAndDecide(rollback: Rollback): Promise<Decision> {
-  const { places, reporter } = rollback;
-  await stopCutoverHost(rollback, STOP_LABEL);
-  const at = new Date().toISOString();
-  const settled = await runStep(
-    reporter,
-    { id: 'prove_quiet', label: 'Checking nothing still uses its state…' },
-    async () => {
-      await assertCheckoutQuiet(quietCheckoutOf(rollback, places.live), cutoverQuiescence(rollback));
-      const { graceful } = settleCheckoutDatabases(places.live);
-      return { graceful, manifest: readSchemaManifest(places.live) };
-    },
-  );
-  const { mode, reason } = decideMode(
-    settled.manifest,
-    readSchemaManifest(await snapshotRoot(rollback)),
-    rollback.request.snapshot === true,
-  );
-  if (mode === 'snapshot' && reason) {
-    const confirmed = await confirmSnapshot(rollback, reason, places.live);
-    if (confirmed !== true) return { outcome: confirmed === undefined ? 'unconfirmable' : 'declined' };
-  }
-  return { outcome: 'decided', stopped: { at, graceful: settled.graceful, manifest: settled.manifest, mode } };
-}
-
-/** gws-ea's `.env` keys as a kept release holds them. */
-async function keptHostEnvironment(file: string): Promise<Record<string, string>> {
-  const value = await readOwnerOnlyJson(file, 'Kept host environment', 'invalid_kept_release');
-  const owned: readonly string[] = INSTANCE_HOST_ENV_KEYS;
-  if (!isRecord(value)) throw new GwsEaError('invalid_kept_release', `${file} holds no environment`);
-  const environment: Record<string, string> = {};
-  for (const [key, entry] of Object.entries(value)) {
-    if (!owned.includes(key) || typeof entry !== 'string') {
-      throw new GwsEaError('invalid_kept_release', `${file} holds a key gws-ea does not own: ${key}`);
+async function decideAndRestore(rollback: Rollback, record: OperationRecord): Promise<Decision> {
+  const { layout, reporter } = rollback;
+  let mode: RollbackMode = 'snapshot';
+  if (!(await exists(layout.quarantine(rollback.op)))) {
+    const decided = decideMode(
+      record.manifest ?? readSchemaManifest(layout.state),
+      readSchemaManifest(layout.snapshot(rollback.snapshot)),
+      rollback.request.snapshot === true,
+    );
+    mode = decided.mode;
+    if (decided.reason) {
+      const confirmed = await confirmSnapshot(rollback, rollback, decided.reason, layout.state);
+      if (confirmed !== true) return confirmed === undefined ? 'unconfirmable' : 'declined';
     }
-    environment[key] = entry;
   }
-  return environment;
-}
-
-/**
- * Make the kept release ready to take over, with the live one stopped: set
- * its own state aside (KTD19), carry in the live state (code only) or a copy
- * of its own snapshot, put back its own marker and runtime record, re-apply
- * its own `.env` keys, and stamp its tripwire with its own script. Only then
- * are the outgoing release's files kept in `outgoing/`, replacing whatever a
- * release left there before (KTD19). Run again, all of it runs again.
- */
-async function prepareRestored(rollback: Rollback, stopped: Stopped): Promise<void> {
-  const { places, operation, runtime, dependencies, reservation } = rollback;
-  const { paths, instanceId } = operation;
-  await setAsideState(places.previousCheckout, places.state);
-  await carryState(stopped.mode === 'code_only' ? places.live : places.state, places.previousCheckout);
-  await copyReleaseRecords(places.state, places.previousCheckout);
-  const kept = keptReleaseFiles(places.previous);
-  const environment = await keptHostEnvironment(kept.hostEnvironment);
-  if (Object.keys(environment).length > 0) dependencies.upsertEnvVars(environment, places.previousCheckout);
-  await stampUpgradeState(places.previousCheckout, rollback.run, {
-    ...dockerEnvironment(runtime, dependencies),
-    NANOCLAW_INSTALL_ID: runtime.install_id,
-  });
-  const definition = instanceServiceDefinitionFile(runtime, cutoverServiceDependencies(rollback));
-  await keepReleaseFiles(places.outgoing, {
-    manifest: { schema_version: 1, instance_id: instanceId, release: rollback.from, snapshot_at: stopped.at },
-    receipt: paths.releasePreflightFile(instanceId),
-    compose: rollback.onecli.composeFile,
-    serviceDefinition: (await isRegularFile(definition)) ? definition : undefined,
-    hostEnvironment: readInstanceHostEnvironment(reservation.checkout_realpath),
-  });
-}
-
-/**
- * Give up a rollback before its swap, whether its snapshot restore was not
- * confirmed or its preparation failed: the kept release gets its own state
- * back (an earlier attempt may have set it aside), the half-built outgoing
- * files go, the live release is started again unless this rollback found it
- * stopped, and the rollback is withdrawn, giving back the update it replaced.
- */
-async function abandonPreparation(rollback: Rollback): Promise<void> {
-  await restoreSetAsideState(rollback.places.previousCheckout, rollback.places.state);
-  await rm(`${rollback.places.outgoing}.building`, { recursive: true, force: true });
-  if (rollback.resumeLive) await rollback.service.start();
-  await withdrawRollback(rollback.operation);
-}
-
-/**
- * The follow-ups a rollback runs once recorded (KTD2): the images its retag
- * displaced, released by ID; and for a rollback of the recorded release, the
- * per-group images rebuilt on the restored base with those they displace, a
- * previous release an update set aside and never deleted, and in code-only
- * mode the reversal of the update's restamp of main's template, when the kept
- * release records one (KTD12). A snapshot restore brings main's files back
- * with the rest of the snapshot. A rollback reverting an unrecorded update
- * rebuilt nothing and restamped nothing, since that update's follow-ups never
- * ran, and puts its set-aside release back.
- */
-async function rollbackFollowUps(
-  rollback: Rollback,
-  record: OperationRecord,
-  mode: RollbackMode,
-): Promise<OperationFollowUp[]> {
-  const moved = new Set(record.images.map((image) => image.image_id));
-  const displaced: OperationFollowUp[] = record.images
-    .flatMap((image) => (image.displaced_image_id === null ? [] : [image.displaced_image_id]))
-    .filter((id) => !moved.has(id))
-    .map((id) => ({ kind: 'delete_image', image_id: id }));
-  if (rollback.releases.restoreSetAside) return displaced;
-  const { paths, instanceId } = rollback.operation;
-  const base = getInstallScopedNames(rollback.runtime.install_id).containerImageBase;
-  // The groups the restored release runs are those of the central database it takes over.
-  const database = mode === 'code_only' ? rollback.places.live : rollback.places.state;
-  const rebuilds: OperationFollowUp[] = [];
-  for (const group of readDerivedImageGroups(database, base)) {
-    rebuilds.push({ kind: 'rebuild_group_image', agent_group_id: group.id });
-    const id = await imageIdOf(rollback, `${base}:${group.id}`);
-    if (id) displaced.push({ kind: 'delete_image', image_id: id });
-  }
-  const superseded: OperationFollowUp[] = (await exists(paths.releaseRoot(instanceId, 'superseded')))
-    ? [{ kind: 'delete_release', release: 'superseded_previous' }]
-    : [];
-  const restamped =
-    mode === 'code_only' && (await readKeptReleaseManifest(rollback.places.previous, instanceId)).template_restamp;
-  const template: OperationFollowUp[] = restamped ? [{ kind: 'reverse_template_restamp' }] : [];
-  return [...rebuilds, ...template, ...displaced, ...superseded];
-}
-
-/** A rollback given up before its swap: nothing changed, and the release it would have left runs again. */
-function notPrepared(rollback: Rollback, cause: unknown): GwsEaError {
-  return new GwsEaError(
-    'rollback_not_prepared',
-    `${safeErrorMessage(cause)} The rollback to ${releaseLine(rollback.to)} stopped before changing anything, and the assistant stays on ${releaseLine(rollback.from)}.`,
-    { cause, ...(cause instanceof GwsEaError && cause.details ? { details: cause.details } : {}) },
-  );
-}
-
-/**
- * `staged` or `stopped` → `swapping`: stop, decide, and prepare the kept
- * release, then record the mode. Up to the swap nothing the rollback does is
- * lost if it stops: a snapshot restore declined, or nobody there to confirm
- * it, or any failure gives the rollback up (see `abandonPreparation`).
- * Returns undefined when it was declined.
- */
-async function prepareRollback(rollback: Rollback, record: OperationRecord): Promise<OperationRecord | undefined> {
-  let stopped: Stopped;
-  try {
-    await assertCarriable(rollback.places.live);
-    await assertCarriable(rollback.places.previousCheckout);
-    const decision = await stopAndDecide(rollback);
-    if (decision.outcome !== 'decided') {
-      await abandonPreparation(rollback);
-      if (decision.outcome === 'unconfirmable') throw confirmationRequired(rollback.operation.instanceId);
-      return undefined;
-    }
-    stopped = decision.stopped;
-    await advanceOperation(rollback.operation, 'stopped', {
-      stop: { at: stopped.at, graceful: stopped.graceful },
-      manifest: stopped.manifest,
+  if (mode === 'snapshot') {
+    await runStep(reporter, { id: 'restore_snapshot', label: 'Restoring the pre-update snapshot…' }, async () => {
+      await restoreSnapshot(layout, rollback.snapshot, rollback.op);
+      await handOffForgets(rollback);
     });
-    await runStep(
-      rollback.reporter,
-      {
-        id: 'prepare_restored',
-        label:
-          stopped.mode === 'code_only'
-            ? 'Carrying conversations, memory, and settings to the previous release…'
-            : 'Restoring the pre-update snapshot…',
-      },
-      () => prepareRestored(rollback, stopped),
-    );
-  } catch (error) {
-    if (error instanceof GwsEaError && error.code === 'input_required') throw error;
-    await abandonPreparation(rollback);
-    throw notPrepared(rollback, error);
   }
-  // The template reversal depends on the mode, decided again after a code-only attempt went back.
-  const planned = record.follow_ups.filter((followUp) => followUp.kind !== 'reverse_template_restamp');
-  return advanceOperation(rollback.operation, 'swapping', {
-    mode: stopped.mode,
-    follow_ups: planFollowUps(planned, await rollbackFollowUps(rollback, record, stopped.mode)),
-  });
+  return mode;
 }
 
 /**
- * Take a rollback's swap back to `stopped` when it never moved the live
- * checkout, dropping its mode (see `reverseRollbackSwapBeforeLiveMoved`): the
- * release it leaves may have run from the live path since, so the mode is
- * decided, and the kept release prepared, again. Returns the record then, or
- * undefined when the live checkout moved.
- */
-async function unwindSwap(rollback: Rollback): Promise<OperationRecord | undefined> {
-  const { operation, dependencies } = rollback;
-  const reversed = await reverseRollbackSwapBeforeLiveMoved(
-    operation.paths,
-    operation.instanceId,
-    rollback.releases,
-    dependencies.rename ? { rename: dependencies.rename } : {},
-  );
-  return reversed ? advanceOperation(operation, 'stopped') : undefined;
-}
-
-/**
- * `swapping` → `swapped`: with the host stopped (again, in case the OS
- * started one) and the checkout at the live path proven quiet, swap the
- * releases from wherever an interrupted swap left them.
- */
-async function swapRollback(rollback: Rollback): Promise<OperationRecord> {
-  const { places, operation, dependencies } = rollback;
-  await keepCutoverHostStopped(rollback);
-  await runStep(rollback.reporter, { id: 'swap_releases', label: 'Switching to the previous release…' }, async () => {
-    const live = (await exists(places.live)) ? places.live : places.outgoingCheckout;
-    await assertCheckoutQuiet(quietCheckoutOf(rollback, live), cutoverQuiescence(rollback));
-    await finishRollbackSwap(
-      operation.paths,
-      operation.instanceId,
-      rollback.releases,
-      dependencies.rename ? { rename: dependencies.rename } : {},
-    );
-  });
-  return advanceOperation(operation, 'swapped');
-}
-
-/** The OneCLI versions the live receipt records; releases never differ in them (R9). */
-async function livePins(rollback: Rollback, release: ReleaseCoordinates): Promise<OnecliPins> {
-  const view = reservationAt(rollback.reservation, release);
-  const { onecli } = await readDeployedSetup(rollback.operation.paths, view, [release.deployed_commit]);
-  return { gateway: onecli.gateway, cli: onecli.cli };
-}
-
-async function composeGateway(file: string): Promise<string> {
-  return parseOnecliComposeImages(await readOwnerOnlyFile(file)).gateway;
-}
-
-/** Whether the restored release runs another gateway than the one the release left ran (KTD8). */
-async function rollbackChangesGateway(rollback: Rollback): Promise<boolean> {
-  const { places } = rollback;
-  const [left, restored] = await Promise.all([
-    composeGateway(keptReleaseFiles(places.outgoing).compose),
-    composeGateway(keptReleaseFiles(places.restored).compose),
-  ]);
-  return left !== restored;
-}
-
-/** Put a kept release's Compose file and service definition back, recreating the gateway when it differs. */
-async function restoreReleaseFiles(rollback: Rollback, keptRoot: string, release: ReleaseCoordinates): Promise<void> {
-  const kept = keptReleaseFiles(keptRoot);
-  const compose = await readOwnerOnlyFile(kept.compose);
-  if (parseOnecliComposeImages(compose).gateway !== (await composeGateway(rollback.onecli.composeFile))) {
-    await runStep(rollback.reporter, { id: 'restore_gateway', label: 'Recreating the credential gateway…' }, async () =>
-      cutoverOnecli(rollback).restore(rollback.onecli, await livePins(rollback, release), compose),
-    );
-  }
-  if (await isRegularFile(kept.serviceDefinition)) {
-    await restoreInstanceServiceDefinition(
-      rollback.runtime,
-      await readFile(kept.serviceDefinition, 'utf8'),
-      cutoverServiceDependencies(rollback),
-    );
-  }
-}
-
-/**
- * `swapped` → `started`: stop any host the OS started meanwhile; drop an
- * unrecorded update's `:next` tag, then move each agent image tag to the
- * image the restored release ran (recorded by ID before the rollback began),
- * every image the moves name held meanwhile (KTD19); put back its gateway and
- * service definition; start the host.
- */
-async function startRestored(rollback: Rollback, record: OperationRecord): Promise<OperationRecord> {
-  await keepCutoverHostStopped(rollback);
-  await runStep(rollback.reporter, { id: 'move_images', label: "Moving the assistant's images back…" }, () =>
-    moveRecordedImages(rollback, record.images, async () => {
-      const next = nextAgentImage(rollback.runtime);
-      // Held already, so removing the tag never deletes the image the update built: its follow-up releases it.
-      if (rollback.releases.restoreSetAside && (await imageIdOf(rollback, next))) {
-        await cutoverDocker(rollback, ['image', 'rm', next]);
-      }
-      for (const image of record.images) await cutoverDocker(rollback, ['tag', image.image_id, image.tag]);
-    }),
-  );
-  await restoreReleaseFiles(rollback, rollback.places.restored, rollback.to);
-  await runStep(rollback.reporter, { id: 'start_release', label: 'Starting the previous release…' }, () =>
-    rollback.service.start(),
-  );
-  return advanceOperation(rollback.operation, 'started');
-}
-
-/** `started` → `verified`: the restored release serves (see `verifyServingRelease`). */
-async function verifyRestored(rollback: Rollback, record: OperationRecord): Promise<OperationRecord> {
-  await runStep(rollback.reporter, { id: 'verify_release', label: 'Checking the previous release serves…' }, async () =>
-    verifyServingRelease(rollback, {
-      view: rollback.restoredView,
-      pins: await livePins(rollback, rollback.to),
-      leaseHeld: record.stop?.graceful === false,
-      gatewayChanged: await rollbackChangesGateway(rollback),
-      subject: 'The restored release',
-    }),
-  );
-  return advanceOperation(rollback.operation, 'verified');
-}
-
-/**
- * The rollback's receipt, beside the release it left: its mode, stop and
- * snapshot times, both schemas, and in snapshot mode what it discarded, by
- * count and ID. Written just before the commit, from state both releases
- * hold frozen.
+ * The rollback's receipt, kept with the release it returned to: its mode,
+ * fence and snapshot times, both schemas, and in snapshot mode what it
+ * discarded, by count and ID. Written just before the commit.
  */
 async function writeRollbackReceipt(rollback: Rollback, record: OperationRecord): Promise<void> {
-  const { places, operation } = rollback;
-  const snapshot = setAsideStateRoot(places.restored);
-  const manifest = await readKeptReleaseManifest(places.restored, operation.instanceId);
-  await writePrivate(places.receipt, {
+  const { layout, operation } = rollback;
+  const snapshot = layout.snapshot(rollback.snapshot);
+  await writePrivate(path.join(layout.kept(releaseName(rollback.to.deployed_commit)), 'rollback.json'), {
     schema_version: 1,
     instance_id: operation.instanceId,
     from: rollback.from,
     to: rollback.to,
     mode: record.mode,
     stopped_at: record.stop?.at ?? null,
-    snapshot_at: manifest.snapshot_at,
+    snapshot_at: await snapshotTakenAt(layout, rollback.snapshot),
     schema: { left: record.manifest ?? null, restored: readSchemaManifest(snapshot) },
-    discarded: record.mode === 'snapshot' ? await summarizeDiscard(places.outgoingCheckout, snapshot) : null,
+    discarded: record.mode === 'snapshot' ? await summarizeDiscard(layout.quarantine(rollback.op), snapshot) : null,
   });
 }
 
+/** The OneCLI version a release's receipt records. */
+async function pinsOf(rollback: Rollback, release: ReleaseCoordinates): Promise<{ readonly gateway: string }> {
+  const { onecli } = await readDeployedSetup(rollback.operation.paths, reservationAt(rollback.reservation, release));
+  return { gateway: onecli.gateway };
+}
+
 /**
- * Go back to the release a rollback left (KTD19), from whatever it got to:
- * the host stopped, every image tag moved back, the swap undone, the kept
- * release's own state put back (the failed run's logs kept in
- * `outgoing/failed-logs/`), and the left release's gateway and service
- * definition restored, then started again. Every step converges when run
- * again, so a return cut short is finished by the next `rollback --id`.
+ * Go back to the release a rollback left (KTD5), recorded first so a return
+ * cut short is finished by the next `rollback --id`: the assistant fenced
+ * again, the state a restore replaced put back (the state the rollback's
+ * target produced kept in `quarantine/<op>-returned/`), the release it left
+ * switched to, started, and verified, and the rollback discarded. A record
+ * that carried a committed update's follow-ups gives them back.
  */
-async function returnToLeft(rollback: Rollback, record: OperationRecord): Promise<void> {
-  const { places, operation, dependencies } = rollback;
+async function goBack(rollback: Rollback): Promise<void> {
+  const { operation, layout } = rollback;
   await beginOperationReturn(operation);
-  await stopCutoverHost(rollback, STOP_LABEL);
-  await runStep(rollback.reporter, { id: 'return', label: 'Going back to the release it left…' }, async () => {
-    const live = (await exists(places.live)) ? places.live : places.outgoingCheckout;
-    await assertCheckoutQuiet(quietCheckoutOf(rollback, live), cutoverQuiescence(rollback));
-    await moveRecordedImages(rollback, record.images, async () => {
-      for (const image of record.images) {
-        if (image.displaced_image_id !== null) {
-          await cutoverDocker(rollback, ['tag', image.displaced_image_id, image.tag]);
-        }
-      }
-    });
-    await reverseRollbackSwap(
-      operation.paths,
-      operation.instanceId,
-      rollback.releases,
-      dependencies.rename ? { rename: dependencies.rename } : {},
-    );
-    const logs = path.join(places.previousCheckout, 'logs');
-    if ((await exists(places.state)) && (await exists(logs)) && !(await exists(places.failedLogs))) {
-      await rename(logs, places.failedLogs);
-    }
-    await restoreSetAsideState(places.previousCheckout, places.state);
-    await rm(places.receipt, { force: true });
-    await restoreReleaseFiles(rollback, places.outgoing, rollback.from);
-  });
-  await completeOperationReturn(operation);
-  await rollback.service.start();
-  await withdrawRollback(operation);
+  await serveLeftRelease(rollback, rollback, () => returnQuarantinedState(layout, rollback.op));
+  await runStep(rollback.reporter, { id: 'verify_release', label: 'Checking the release it left serves…' }, async () =>
+    verifyServingRelease(rollback, {
+      view: reservationAt(rollback.reservation, rollback.from),
+      pins: await pinsOf(rollback, rollback.from),
+      // The return's fence may have killed the host the rollback started, whose lease then delays this one's.
+      leaseHeld: true,
+      subject: 'The release the rollback left',
+    }),
+  );
+  await discardOperation(operation);
 }
 
 /** A rollback that failed and went back, reported with where the assistant is and what can be done next. */
@@ -1086,134 +701,199 @@ function returned(rollback: Rollback, mode: RollbackMode | undefined, cause: unk
     mode === 'code_only'
       ? ` To restore the pre-update snapshot instead, run gws-ea rollback --id ${id} --snapshot.`
       : '';
-  const where = rollback.releases.restoreSetAside
-    ? `the assistant runs ${releaseLine(rollback.from)} again, which its update left unrecorded; continue the rollback with gws-ea rollback --id ${id}.`
-    : `the assistant runs ${releaseLine(rollback.from)} again.`;
   return new GwsEaError(
     'rollback_failed',
-    `${cause === undefined ? 'An earlier attempt failed.' : safeErrorMessage(cause)} The rollback to ${releaseLine(rollback.to)} went back: ${where} The failed run's logs are in ${rollback.places.failedLogs}.${next}`,
+    `${cause === undefined ? 'An earlier attempt failed.' : safeErrorMessage(cause)} The rollback to ${releaseLine(rollback.to)} went back: the assistant runs ${releaseLine(rollback.from)} again.${next}`,
     { ...(cause === undefined ? {} : { cause }), details: { continueWith: `gws-ea rollback --id ${id}` } },
   );
 }
 
+/** A rollback that could not go back either, or a revert with nothing to go back to: closed for fix-forward (KTD9). */
+async function closedForFixForward(rollback: Rollback, cause: unknown, why: string): Promise<GwsEaError> {
+  await closeOperationFailed(rollback.operation);
+  const id = rollback.operation.instanceId;
+  return new GwsEaError(
+    'rollback_return_failed',
+    `${safeErrorMessage(cause)} ${why} Fix it forward: update it to a newer release with gws-ea update --id ${id}.`,
+    { cause, details: { continueWith: `gws-ea update --id ${id}` } },
+  );
+}
+
 /**
- * Run a rollback whose swap began until it is recorded. A failure once the
- * swap moved the live checkout goes back to the release it left; one before
- * changed nothing live, and gives the rollback up as a failure before its
- * swap does. One the registry already records stands (`assertNotCommitted`).
+ * A rollback whose return failed too: closed for fix-forward once the state
+ * its restore replaced is back, or when it restored none. Until the return
+ * has put that state back, the record stays open and going back, so the next
+ * `rollback --id` finishes the return, rather than a fix-forward building on
+ * the restored snapshot while what the assistant recorded since stays in
+ * quarantine (KTD5).
  */
-async function finishRollback(rollback: Rollback, start: OperationRecord): Promise<void> {
+async function returnFailed(rollback: Rollback, cause: unknown, why: string): Promise<GwsEaError> {
+  if (!(await exists(rollback.layout.quarantine(rollback.op)))) return closedForFixForward(rollback, cause, why);
+  const id = rollback.operation.instanceId;
+  return new GwsEaError(
+    'rollback_return_unfinished',
+    `${safeErrorMessage(cause)} ${why} The state it replaced is not back yet. Continue going back with gws-ea rollback --id ${id}.`,
+    { cause, details: { continueWith: `gws-ea rollback --id ${id}` } },
+  );
+}
+
+/** Refusals a rollback makes on purpose, which never send it back. */
+function deliberate(error: unknown): boolean {
+  return error instanceof GwsEaError && (error.code === 'input_required' || error.code === 'rollback_declined');
+}
+
+/**
+ * Re-establish the fence of a rollback resumed while fenced (KTD1): whatever
+ * started since is stopped and the instance proven quiet again before
+ * anything goes on, and the stop is recorded afresh.
+ */
+async function refence(rollback: Rollback, record: OperationRecord): Promise<OperationRecord> {
+  const { layout } = rollback;
+  // A restore cut short holds the state aside; it is finished first, still fenced, so the state is whole again.
+  if (record.phase === 'fenced' && (await exists(layout.quarantine(rollback.op)))) {
+    await restoreSnapshot(layout, rollback.snapshot, rollback.op);
+  }
+  const stop = await fenceInstance(rollback, 'Making sure the assistant is still stopped…');
+  return recordOperationFacts(rollback.operation, { stop });
+}
+
+/** Fence the assistant for the rollback, reading the schema its host left. */
+async function fenceForRollback(rollback: Rollback): Promise<OperationRecord> {
+  let manifest: SnapshotManifest | undefined;
+  const stop = await fenceInstance(rollback, STOP_LABEL, () => {
+    manifest = readSchemaManifest(rollback.layout.state);
+  });
+  return advanceOperation(rollback.operation, 'fenced', { stop, ...(manifest ? { manifest } : {}) });
+}
+
+/**
+ * Carry a rollback from the phase its record reached until it is committed:
+ * fenced; mode decided, confirmed, and restored; switched to the release it
+ * returns to; started; main's skills reconciled and the release verified;
+ * committed, by the registry or, reverting an update, by its own record. A
+ * resume between the fence and the start fences again first.
+ */
+async function runRollback(rollback: Rollback, start: OperationRecord): Promise<RollbackOutcome> {
+  const { operation, layout, reporter } = rollback;
+  if (start.returning) {
+    try {
+      await goBack(rollback);
+    } catch (error) {
+      throw await returnFailed(
+        rollback,
+        error,
+        `Going back from the rollback to ${releaseLine(rollback.to)} to ${releaseLine(rollback.from)} failed.`,
+      );
+    }
+    throw returned(rollback, start.mode, undefined);
+  }
   let record = start;
+  let definitionChanged = false;
   try {
+    if (record.phase === 'fenced' || record.phase === 'snapshotted' || record.phase === 'switched') {
+      record = await refence(rollback, record);
+    }
     for (;;) {
       switch (record.phase) {
         case 'staged':
-        case 'stopped':
-          throw new GwsEaError('operation_phase', `A rollback at ${record.phase} has not prepared its swap`);
-        case 'swapping':
-          record = await swapRollback(rollback);
+          record = await fenceForRollback(rollback);
           break;
-        case 'swapped':
-          record = await startRestored(rollback, record);
+        case 'fenced': {
+          const decision = await decideAndRestore(rollback, record);
+          if (decision === 'declined' || decision === 'unconfirmable') {
+            if (rollback.reverting) {
+              throw new GwsEaError(
+                decision === 'declined' ? 'rollback_declined' : 'input_required',
+                `The rollback needs its pre-update snapshot restored, which was not confirmed, so it stopped with assistant ${operation.instanceId} stopped. Continue it with gws-ea rollback --id ${operation.instanceId}, confirming the restore or passing --yes.`,
+              );
+            }
+            await goBack(rollback);
+            if (decision === 'unconfirmable') throw confirmationRequired(operation.instanceId);
+            return { kind: 'declined', release: rollback.from };
+          }
+          record = await advanceOperation(operation, 'snapshotted', { mode: decision });
           break;
-        case 'started':
-          record = await verifyRestored(rollback, record);
+        }
+        case 'snapshotted':
+          definitionChanged = await switchTo(rollback, record.to, record.from, 'Switching to the previous release…');
+          record = await advanceOperation(operation, 'switched');
           break;
-        case 'verified':
-          await runStep(rollback.reporter, { id: 'record_release', label: 'Recording the rollback…' }, async () => {
-            await writeRollbackReceipt(rollback, record);
-            await commitOperationRelease(rollback.operation);
+        case 'switched':
+          if ((await readCurrent(layout)) !== releaseName(record.to.deployed_commit)) {
+            definitionChanged = await switchTo(rollback, record.to, record.from, 'Switching to the previous release…');
+          }
+          await startRelease(rollback, definitionChanged, 'Starting the previous release…');
+          record = await advanceOperation(operation, 'started');
+          break;
+        case 'started': {
+          const started = record;
+          await reconcileMainSkills(rollback, started.stop?.graceful === false);
+          await runStep(reporter, { id: 'verify_release', label: 'Checking the previous release serves…' }, async () =>
+            verifyServingRelease(rollback, {
+              view: reservationAt(rollback.reservation, started.to),
+              pins: await pinsOf(rollback, started.to),
+              leaseHeld: started.stop?.graceful === false,
+              subject: 'The restored release',
+            }),
+          );
+          record = await advanceOperation(operation, 'verified', {
+            follow_ups: planFollowUps(record.follow_ups, releaseFollowUps(rollback.runtime)),
           });
-          return;
-        case 'recorded':
-          return;
+          break;
+        }
+        case 'verified': {
+          const verified = record;
+          await runStep(reporter, { id: 'record_release', label: 'Recording the rollback…' }, async () => {
+            await writeRollbackReceipt(rollback, verified);
+            await commitOperationRelease(operation);
+          });
+          return rolledBack(rollback, verified);
+        }
+        case 'committed':
+          return rolledBack(rollback, record);
       }
     }
   } catch (error) {
-    await assertNotCommitted(rollback.operation, error);
-    const failed = (await readOperationRecord(rollback.operation.paths, rollback.operation.instanceId)) ?? record;
-    if (failed.phase === 'recorded') throw error;
-    if (failed.phase === 'swapping' && !failed.returning && (await unwindSwap(rollback))) {
-      await abandonPreparation(rollback);
-      throw notPrepared(rollback, error);
+    if (deliberate(error)) throw error;
+    await assertNotCommitted(operation, error);
+    const failed = (await readOperationRecord(operation.paths, operation.instanceId)) ?? record;
+    if (rollback.reverting) {
+      throw await closedForFixForward(
+        rollback,
+        error,
+        `The rollback to ${releaseLine(rollback.to)} failed, and the update it reverts has no release to go back to.`,
+      );
     }
     try {
-      await returnToLeft(rollback, failed);
+      await goBack(rollback);
     } catch (returnError) {
-      throw new GwsEaError(
-        'rollback_return_failed',
-        `${safeErrorMessage(error)} Going back to ${releaseLine(rollback.from)} did not finish either: ${safeErrorMessage(returnError)} ` +
-          `Continue it with gws-ea rollback --id ${rollback.operation.instanceId}.`,
-        { cause: returnError },
+      throw await returnFailed(
+        rollback,
+        returnError,
+        `The rollback to ${releaseLine(rollback.to)} failed (${safeErrorMessage(error)}), and going back to ${releaseLine(rollback.from)} failed too.`,
       );
     }
     throw returned(rollback, failed.mode, error);
   }
 }
 
-/**
- * Carry a rollback record from its phase to recorded: prepare when it has not
- * swapped, or when an earlier run's swap never moved the live checkout, then
- * finish.
- */
-async function runRollback(rollback: Rollback, start: OperationRecord): Promise<RollbackOutcome> {
-  if (start.returning) {
-    await returnToLeft(rollback, start);
-    throw returned(rollback, start.mode, undefined);
-  }
-  const current = start.phase === 'swapping' ? ((await unwindSwap(rollback)) ?? start) : start;
-  const record =
-    current.phase === 'staged' || current.phase === 'stopped' ? await prepareRollback(rollback, current) : current;
-  if (!record) return { kind: 'declined', release: rollback.from };
-  const { mode } = record;
-  if (!mode) {
-    throw new GwsEaError('invalid_operation', `The rollback record at ${record.phase} names no rollback mode`);
-  }
-  await finishRollback(rollback, record);
-  const { snapshot_at: snapshotAt } = await readKeptReleaseManifest(
-    rollback.places.restored,
-    rollback.operation.instanceId,
-  );
-  return {
-    kind: 'rolled_back',
-    from: rollback.from,
-    to: rollback.to,
-    mode,
-    snapshotAt,
-    keptAt: rollback.places.outgoing,
-  };
+async function rolledBack(rollback: Rollback, record: OperationRecord): Promise<RollbackOutcome> {
+  const mode = record.mode ?? 'code_only';
+  const { from, to } = rollback;
+  const snapshotAt = await snapshotTakenAt(rollback.layout, rollback.snapshot);
+  return mode === 'snapshot'
+    ? { kind: 'rolled_back', from, to, mode, snapshotAt, keptAt: rollback.layout.quarantine(rollback.op) }
+    : { kind: 'rolled_back', from, to, mode, snapshotAt };
 }
 
 /**
- * Discard an update that has not swapped anything: its staging goes, the
- * host it stopped starts again, and only then is its record deleted, so a
- * discard cut short is finished by the next `rollback --id`.
- */
-async function discardUnswappedUpdate(host: CutoverHost, update: OperationRecord): Promise<RollbackOutcome> {
-  const { operation, runtime, dependencies } = host;
-  await runStep(host.reporter, { id: 'discard_staging', label: 'Removing the staged release…' }, () =>
-    removeUpdateStaging(operation.paths, operation.instanceId, runtime, dependencies),
-  );
-  await runStep(host.reporter, { id: 'start', label: 'Starting the assistant…' }, () => host.service.start());
-  await discardOperation(operation);
-  return { kind: 'update_discarded', release: update.from, discarded: update.to };
-}
-
-/** The image moves that undo an update's retag: each tag back to the image it displaced (KTD7). */
-function reversedMoves(update: OperationRecord): MovedImage[] {
-  return update.images.flatMap((image) =>
-    image.displaced_image_id === null || image.displaced_image_id === image.image_id
-      ? []
-      : [{ tag: image.tag, image_id: image.displaced_image_id, displaced_image_id: image.image_id }],
-  );
-}
-
-/**
- * Revert an update that is unfinished (KTD2). Before its renames it is
- * discarded. At `swapping`, a swap that already put the release live is
- * finished, since that release may have run, and one that had not is undone
- * and discarded. From `swapped` on it is rolled back by R13, the rollback
- * replacing the update's record in one write so the gate never lifts.
+ * Revert an update that is unfinished (KTD2). One whose release cannot have
+ * started is discarded: the release it left is served again
+ * (`serveLeftRelease`), its staged release kept. One whose release may have
+ * started (`targetMayHaveStarted`) is rolled back by the rollback rules, from
+ * the snapshot it took, the rollback replacing its record in one write so the
+ * gate never lifts. One with no release to return to is refused: it is fixed
+ * forward.
  */
 async function revertOpenUpdate(
   operation: InstanceOperation,
@@ -1221,95 +901,79 @@ async function revertOpenUpdate(
   dependencies: CutoverDependencies,
   request: RollbackRequest,
 ): Promise<RollbackOutcome> {
-  const host = await openCutoverHost(operation, dependencies);
-  const { paths, instanceId } = operation;
-  let record = update;
-  if (record.phase === 'swapping') {
-    await keepCutoverHostStopped(host);
-    const releases = { from: record.from.deployed_commit, to: record.to.deployed_commit };
-    const live = host.reservation.checkout_realpath;
-    const liveCommit = (await exists(instanceMarkerFile(live)))
-      ? (await readInstanceMarkerFile(instanceMarkerFile(live))).deployed_commit
-      : undefined;
-    const seams = dependencies.rename ? { rename: dependencies.rename } : {};
-    if (liveCommit === record.to.deployed_commit) {
-      await finishSwap(paths, instanceId, releases, seams);
-      record = await advanceOperation(operation, 'swapped');
-    } else {
-      const outgoing = liveCommit === undefined ? paths.releaseCheckoutRoot(instanceId, 'previous') : live;
-      await assertCheckoutQuiet(quietCheckoutOf(host, outgoing), cutoverQuiescence(host));
-      await reverseSwap(paths, instanceId, releases, seams);
-      record = await advanceOperation(operation, 'stopped');
-    }
+  const id = operation.instanceId;
+  if (update.no_rollback_target) {
+    throw new GwsEaError(
+      'rollback_unavailable',
+      `Assistant ${id}'s update to ${releaseLine(update.to)} has no release to roll back to. Continue it with gws-ea update --id ${id}, or fix it forward to a newer release.`,
+    );
   }
-  if (record.phase === 'staged' || record.phase === 'stopped') return discardUnswappedUpdate(host, record);
-  const rollback = rollbackOf(host, record.to, record.from, true, request);
-  const reverting = await beginOperation(operation, {
-    kind: 'rollback',
-    from: record.to,
-    to: record.from,
-    images: reversedMoves(record),
-  });
-  return runRollback(rollback, reverting);
+  const host = await openCutoverHost(operation, dependencies);
+  if (!targetMayHaveStarted(update)) {
+    await serveLeftRelease(host, update);
+    await discardOperation(operation);
+    return { kind: 'update_discarded', release: update.from, discarded: update.to };
+  }
+  const plan = { from: update.to, to: update.from, snapshot: operationName(update.started_at), request };
+  await assertConfirmable(host, plan);
+  const record = await beginOperation(operation, { kind: 'rollback', from: plan.from, to: plan.to });
+  const rollback = await rollbackOf(host, record, request);
+  return runRollback(rollback, record);
 }
 
 /**
- * Roll the recorded release back to the one kept in `previous/` (R13, R15).
- * Every refusal comes before anything changes: no previous release, one of
- * another assistant, or its agent image gone. The mode is first judged while
- * the assistant serves, so a snapshot restore nobody can confirm is refused
- * before the stop; it is decided again, and confirmed, once stopped. A
- * rollback recorded with nothing else to follow up leaves no record, so the
- * `:previous` tag its cleanup had yet to drop is what says it is unfinished.
+ * Roll the committed release back to the rollback point (KTD4). Every
+ * refusal comes before anything changes: no rollback point, its release not
+ * kept whole, the assistant not running the release the registry names, or a
+ * snapshot restore nobody can confirm. The release's agent image is provided
+ * first, rebuilt hermetically when it is gone (KTD6).
  */
-async function rollBackRecorded(
+async function rollBackCommitted(
   operation: InstanceOperation,
   dependencies: CutoverDependencies,
   request: RollbackRequest,
 ): Promise<RollbackOutcome> {
   const host = await openCutoverHost(operation, dependencies);
-  const { instanceId } = operation;
-  if (await leftoverPreviousTag(host)) return { kind: 'follow_ups_finished', release: releaseOf(host.reservation) };
-  const kept = await readKeptPreviousRelease(host.operation.paths, instanceId);
+  const { paths, instanceId } = operation;
+  const { layout, runtime } = host;
+  const point = await readRollbackPoint(paths, instanceId);
   const from = releaseOf(host.reservation);
-  const to = kept.release;
-  const live = await readInstanceMarkerFile(instanceMarkerFile(host.reservation.checkout_realpath));
-  if (live.deployed_commit !== from.deployed_commit || to.deployed_commit === from.deployed_commit) {
-    throw new GwsEaError(
-      'rollback_unavailable',
-      `Assistant ${instanceId} runs ${shortCommit(live.deployed_commit)}, and its kept release is ${shortCommit(to.deployed_commit)}, so there is nothing to roll back to.`,
-    );
+  const unavailable = (why: string): GwsEaError =>
+    new GwsEaError('rollback_unavailable', `Assistant ${instanceId} ${why}, so there is nothing to roll back to.`);
+  if (!point) throw unavailable('keeps no rollback point');
+  const to = point.release;
+  const live = await readCurrent(layout);
+  if (live !== releaseName(from.deployed_commit)) {
+    throw unavailable(`runs ${live ?? 'no release'}, not ${releaseLine(from)} as its record says`);
   }
-  const base = getInstallScopedNames(host.runtime.install_id).containerImageBase;
-  const [ran, previous] = await Promise.all([imageIdOf(host, `${base}:latest`), imageIdOf(host, `${base}:previous`)]);
-  if (!previous || !ran) {
-    throw new GwsEaError(
-      'rollback_unavailable',
-      `Assistant ${instanceId}'s agent image ${previous ? `${base}:latest` : `${base}:previous`} is missing, so ${releaseLine(to)} cannot run again.`,
-    );
-  }
-  const rollback = rollbackOf(host, from, to, false, request, host.service.detect().active);
-  const current = readSchemaManifest(host.reservation.checkout_realpath);
-  const tentative = decideMode(current, readSchemaManifest(await snapshotRoot(rollback)), request.snapshot === true);
-  if (tentative.mode === 'snapshot' && tentative.reason && !request.confirm) {
-    await confirmSnapshot(rollback, tentative.reason, host.reservation.checkout_realpath);
-    throw confirmationRequired(instanceId);
-  }
-  const record = await beginOperation(operation, {
-    kind: 'rollback',
-    from,
-    to,
-    images: ran === previous ? [] : [{ tag: `${base}:latest`, image_id: previous, displaced_image_id: ran }],
-  });
-  return runRollback(rollback, record);
+  const name = releaseName(to.deployed_commit);
+  if (!(await isReleaseComplete(layout, name))) throw unavailable(`no longer keeps ${releaseLine(to)} whole`);
+  await runStep(
+    host.reporter,
+    { id: 'prepare_agent_image', label: "Preparing the previous release's agent image…" },
+    async () =>
+      provideReleaseImage(assistantImageDocker(runtime, dependencies), {
+        layout,
+        release: name,
+        installId: runtime.install_id,
+        inputs: {
+          contextTree: await committedTree(layout.release(name), to.deployed_commit, 'container', {
+            runCommand: host.run,
+          }),
+          installCjkFonts: readInstallCjkFonts(layout.state),
+        },
+      }),
+  );
+  await assertConfirmable(host, { from, to, snapshot: point.snapshot, request });
+  const record = await beginOperation(operation, { kind: 'rollback', from, to });
+  return runRollback(await rollbackOf(host, record, request), record);
 }
 
 /**
- * `rollback --id` (R13-R16): continue whatever this assistant's record says
- * is unfinished, or roll its recorded release back to the one kept. An open
- * update is reverted, an open rollback continued, a recorded rollback's
- * follow-ups left for the caller to run. The caller runs the follow-ups of a
- * recorded rollback (`finishFollowUps`).
+ * `rollback --id`: continue whatever this assistant's record says is
+ * unfinished, or roll its committed release back to its rollback point. An
+ * open update is reverted, an open rollback continued, a committed
+ * rollback's follow-ups left for the caller to run (`finishFollowUps`).
  */
 export async function rollBack(
   operation: InstanceOperation,
@@ -1320,14 +984,14 @@ export async function rollBack(
   const { paths, instanceId } = operation;
   await assertInstanceCreated(paths, instanceId);
   const record = await readOperationRecord(paths, instanceId);
-  if (record?.phase === 'recorded' && record.kind === 'rollback') {
+  if (record?.phase === 'committed' && record.kind === 'rollback') {
     return { kind: 'follow_ups_finished', release: record.to };
   }
-  if (record && record.phase !== 'recorded') {
+  if (record && record.phase !== 'committed') {
     if (record.kind === 'update') return revertOpenUpdate(operation, record, dependencies, request);
-    return runRollback(rollbackOfRecord(await openCutoverHost(operation, dependencies), record, request), record);
+    return runRollback(await rollbackOf(await openCutoverHost(operation, dependencies), record, request), record);
   }
-  return rollBackRecorded(operation, dependencies, request);
+  return rollBackCommitted(operation, dependencies, request);
 }
 
 /** An automatic rollback shows what a snapshot restore discards in its step log; the update's confirmation covers it. */
@@ -1342,10 +1006,10 @@ export function localTimezone(): string {
 }
 
 /**
- * Roll back an update that failed after its swap (R14), by R13's rule, which
- * its own confirmation covers; then run the rollback's follow-ups, whose
- * failure only leaves them for `rollback --id` to retry. Returns where the
- * assistant was left.
+ * Roll back an update that failed once its release started, by the rollback
+ * rules, which its own confirmation covers; then run the rollback's
+ * follow-ups, whose failure only leaves them for `rollback --id` to retry.
+ * Returns where the assistant was left.
  */
 export async function revertUpdate(
   operation: InstanceOperation,

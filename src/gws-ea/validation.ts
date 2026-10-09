@@ -12,6 +12,14 @@ import { GwsEaError } from './types.js';
 /** An email address: a local part, `@`, and a dotted domain, with no whitespace. */
 export const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/u;
 
+/**
+ * A Cloudflare tunnel ID, lowercase: an RFC 9562 UUID of any version from 1
+ * to 8, so a time-ordered v7 ID passes as a v4 one does. It guards both the
+ * request paths that carry the account token and the ID the registry records.
+ */
+export const CLOUDFLARE_TUNNEL_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -85,7 +93,7 @@ export function parseJson(source: string, label: string, code: string): unknown 
   }
 }
 
-/** `ncl` and the OneCLI CLI wrap their result in `{ data }`. */
+/** `ncl` wraps its result in `{ data }`. */
 export function unwrapData(value: unknown): unknown {
   return isRecord(value) && 'data' in value ? value.data : value;
 }

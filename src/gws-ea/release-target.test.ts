@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -9,9 +10,9 @@ import { reserveInstance } from './journal.js';
 import { createOnecliRuntimeLayout, ONECLI_POSTGRES_IMAGE, renderOnecliCompose } from './onecli-compose.js';
 import { wrapperImageTag } from './onecli-gateway-image.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
-import { ONECLI_CLI_VERSION, ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './pins.js';
+import { ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './pins.js';
 import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
-import { allocateInstanceId } from './registry.js';
+
 import { resolveReleaseTarget, type ToolProviderSetup } from './release-target.js';
 import type { ReleaseSource } from './release-tracks.js';
 import { createInstanceRuntimeConfig, persistInstanceRuntime } from './service.js';
@@ -31,9 +32,6 @@ const CREDENTIAL: ProviderCredentialMetadata = {
   hostPattern: 'api.anthropic.com',
   headerName: 'x-api-key',
 };
-const DEPLOYED_DIGEST = 'c'.repeat(64);
-const TOOL_DIGEST = 'd'.repeat(64);
-const ONECLI_CLI_PATH = '/usr/local/bin/onecli';
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -102,7 +100,7 @@ async function controlPlanePaths(): Promise<ControlPlanePaths> {
 }
 
 interface AssistantRecord {
-  readonly onecli?: { readonly gateway: string; readonly cli: string; readonly sdk: string };
+  readonly onecli?: { readonly gateway: string; readonly sdk: string };
   readonly postgresImage?: string;
   readonly providerCredential?: ProviderCredentialMetadata;
 }
@@ -117,10 +115,9 @@ async function deployedAssistant(
   release: ReleaseCoordinates,
   record: AssistantRecord = {},
 ): Promise<InstanceReservation> {
-  const instanceId = allocateInstanceId();
+  const instanceId = randomUUID();
   const reserved = await reserveInstance(paths, {
     instance_id: instanceId,
-    checkout_realpath: paths.checkoutRoot(instanceId),
     ...release,
     allocated_ports: { nanoclaw_webhook: 35_101, onecli_app: 35_102, onecli_gateway: 35_103 },
     exclusive_resource_claims: {
@@ -138,11 +135,10 @@ async function deployedAssistant(
     project: reserved.exclusive_resource_claims.onecli_project,
     appPort: reserved.allocated_ports.onecli_app,
     gatewayPort: reserved.allocated_ports.onecli_gateway,
-    cliExecutable: ONECLI_CLI_PATH,
     dockerEndpoint: 'unix:///var/run/docker.sock',
   });
   await persistInstanceRuntime(
-    createInstanceRuntimeConfig(reserved, onecli, {
+    createInstanceRuntimeConfig(paths, reserved, onecli, {
       nodePath: process.execPath,
       homeDirectory: path.dirname(paths.stateRoot),
       selectedProvider: 'claude',
@@ -150,15 +146,16 @@ async function deployedAssistant(
     }),
     () => undefined,
   );
-  const cohort = record.onecli ?? { gateway: ONECLI_GATEWAY_VERSION, cli: ONECLI_CLI_VERSION, sdk: ONECLI_SDK_VERSION };
+  const cohort = record.onecli ?? { gateway: ONECLI_GATEWAY_VERSION, sdk: ONECLI_SDK_VERSION };
+  const receipt = paths.releasePreflightFile(instanceId, release.deployed_commit);
+  await mkdir(path.dirname(receipt), { recursive: true, mode: 0o700 });
   await writeFile(
-    paths.releasePreflightFile(instanceId),
+    receipt,
     `${JSON.stringify({
       schema_version: 1,
       instance_id: instanceId,
       deployed_commit: release.deployed_commit,
       provider: 'claude',
-      providerCapabilityDigest: DEPLOYED_DIGEST,
       providerCredential: record.providerCredential ?? CREDENTIAL,
       packageManager: 'pnpm@10.34.5',
       onecli: cohort,
@@ -177,7 +174,6 @@ async function deployedAssistant(
 
 function toolProviderSetup(credential: ProviderCredentialMetadata = CREDENTIAL): ToolProviderSetup {
   return {
-    capabilityDigest: TOOL_DIGEST,
     credentialMetadata: (provider) => (provider === 'claude' ? credential : undefined),
   };
 }
@@ -298,13 +294,7 @@ describe('the release an update deploys', () => {
       ),
     ).resolves.toEqual({
       release: { source_remote: dogfood.remote, release_track: 'dogfood', deployed_commit: next },
-      // The tool's setup digest differs from the one create recorded; it is carried forward, never compared.
-      preflight: {
-        provider: 'claude',
-        providerCapabilityDigest: TOOL_DIGEST,
-        providerCredential: CREDENTIAL,
-        onecliCliPath: ONECLI_CLI_PATH,
-      },
+      preflight: { provider: 'claude', providerCredential: CREDENTIAL },
     });
   });
 
@@ -387,7 +377,7 @@ describe('the release an update deploys', () => {
   it.each([
     [
       'OneCLI gateway',
-      { onecli: { gateway: '1.41.0', cli: ONECLI_CLI_VERSION, sdk: ONECLI_SDK_VERSION } },
+      { onecli: { gateway: '1.41.0', sdk: ONECLI_SDK_VERSION } },
       CREDENTIAL,
       'onecli_version_changed',
     ],

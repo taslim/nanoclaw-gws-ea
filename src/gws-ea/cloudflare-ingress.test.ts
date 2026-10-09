@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -30,7 +31,7 @@ import {
 } from './phases.js';
 import { CLOUDFLARED_IMAGE } from './pins.js';
 import type { SanitizedCommand } from './process.js';
-import { allocateInstanceId, readRegistry } from './registry.js';
+import { readRegistry } from './registry.js';
 import { startRunLog, type RunLog } from './run-log.js';
 import { GwsEaError, PROVISION_STEPS, type InstanceReservationInput } from './types.js';
 
@@ -59,12 +60,11 @@ async function testPaths(): Promise<ControlPlanePaths> {
   return resolveControlPlanePaths({ configRoot: path.join(root, 'config'), stateRoot: path.join(root, 'state') });
 }
 
-function managedReservation(paths: ControlPlanePaths, hostname: string, webhookPort: number): InstanceReservationInput {
-  const instanceId = allocateInstanceId();
+function managedReservation(hostname: string, webhookPort: number): InstanceReservationInput {
+  const instanceId = randomUUID();
   const projectId = `gws-ea-${instanceId.replaceAll('-', '').slice(0, 20)}`;
   return {
     instance_id: instanceId,
-    checkout_realpath: paths.checkoutRoot(instanceId),
     release_track: 'dogfood',
     source_remote: 'https://example.test/nanoclaw.git',
     deployed_commit: 'a'.repeat(40),
@@ -132,9 +132,6 @@ class FakeCloudflare {
   readonly tunnels: Json[] = [];
   readonly records: Json[] = [];
   configuration: { config?: Json; version?: number } = {};
-  /** Scripted `/connections` answers; otherwise the running connector reports the current version. */
-  readonly connectionAnswers: unknown[][] = [];
-  connectorRunning = false;
   /** Answers a request instead of Cloudflare; `apply` performs it as Cloudflare would. */
   intercept: ((method: string, route: string, apply: () => Response) => Response | undefined) | undefined;
   #recordCount = 0;
@@ -178,15 +175,6 @@ class FakeCloudflare {
       return envelope(this.readback());
     }
     if (method === 'GET' && route === `${tunnelRoot}/${TUNNEL_ID}/token`) return envelope(`tunnel-token-${TUNNEL_ID}`);
-    if (method === 'GET' && route === `${tunnelRoot}/${TUNNEL_ID}/connections`) {
-      const scripted = this.connectionAnswers.shift();
-      if (scripted) return envelope(scripted);
-      return envelope(
-        this.connectorRunning
-          ? [{ id: '1bedc50d-42b3-473c-b108-ff3d10c0d925', config_version: this.configuration.version ?? 0, conns: [] }]
-          : [],
-      );
-    }
     if (method === 'GET' && route === `/zones/${ZONE_ID}/dns_records`) {
       return listEnvelope(this.records.filter((record) => record.name === url.searchParams.get('name')));
     }
@@ -331,7 +319,6 @@ class FakeDocker {
           ],
         },
       };
-      this.cloud.connectorRunning = true;
       return { stdout: '', stderr: '' };
     }
     throw new Error(`unexpected docker ${args.join(' ')}`);
@@ -339,7 +326,6 @@ class FakeDocker {
 
   stop(): void {
     this.container!.status = 'exited';
-    this.cloud.connectorRunning = false;
   }
 }
 
@@ -385,7 +371,7 @@ async function transportFixture(
   const paths = await testPaths();
   const reserved = await reserveInstance(
     paths,
-    managedReservation(paths, options.hostname ?? 'assistant.example.com', options.webhookPort ?? 31_100),
+    managedReservation(options.hostname ?? 'assistant.example.com', options.webhookPort ?? 31_100),
   );
   const cloud = new FakeCloudflare();
   const docker = new FakeDocker(paths, cloud);
@@ -406,7 +392,7 @@ async function transportFixture(
     events,
     tokenRequests,
     reserve: (hostname: string, webhookPort: number) =>
-      reserveInstance(paths, managedReservation(paths, hostname, webhookPort)),
+      reserveInstance(paths, managedReservation(hostname, webhookPort)),
     run: async (instanceId = reserved.instance_id, log?: RunLog) => {
       const registry = await readRegistry(paths);
       const claim = registry.instances[instanceId]!.exclusive_resource_claims.ingress;
@@ -436,7 +422,6 @@ async function transportFixture(
             createApi: () => cloud.api(sleep),
             connector: { runCommand: docker.run, ambientEnv: { PATH: '/usr/bin:/bin' } },
             fetch: route.fetch,
-            sleep,
           }),
         },
       } as ProvisionSteps<unknown>;
@@ -457,8 +442,8 @@ async function transportFixture(
 describe('managed Cloudflare desired state', () => {
   it('sorts exact routes stably, leaves out assistants under removal, and ends with one catch-all', async () => {
     const paths = await testPaths();
-    const zeta = await reserveInstance(paths, managedReservation(paths, 'zeta.example.com', 31_100));
-    await reserveInstance(paths, managedReservation(paths, 'alpha.example.com', 31_200));
+    const zeta = await reserveInstance(paths, managedReservation('zeta.example.com', 31_100));
+    await reserveInstance(paths, managedReservation('alpha.example.com', 31_200));
     const registry = await readRegistry(paths);
 
     expect(renderManagedCloudflareConfiguration(registry, 'host.docker.internal')).toEqual({
@@ -522,7 +507,7 @@ describe('managed Cloudflare desired state', () => {
 describe('managed Cloudflare reconciliation', () => {
   it('converges a fresh tunnel whose configuration has no config or version, and stores the connector token', async () => {
     const paths = await testPaths();
-    const input = managedReservation(paths, 'assistant.example.com', 31_100);
+    const input = managedReservation('assistant.example.com', 31_100);
     await reserveInstance(paths, input);
     const cloud = new FakeCloudflare();
     const connector = createCloudflareConnectorLayout({ cloudflareRoot: paths.cloudflareRoot, platform: 'linux' });
@@ -533,7 +518,7 @@ describe('managed Cloudflare reconciliation', () => {
         originHost: '127.0.0.1',
         connector,
       }),
-    ).resolves.toEqual({ tunnelId: TUNNEL_ID, configurationVersion: 1 });
+    ).resolves.toBeUndefined();
 
     expect(cloud.configuration.config).toEqual({
       ingress: [
@@ -561,7 +546,7 @@ describe('managed Cloudflare reconciliation', () => {
 
   it('owns its own readback, with per-rule originRequest and extra fields, and writes nothing the second time', async () => {
     const paths = await testPaths();
-    const input = managedReservation(paths, 'assistant.example.com', 31_100);
+    const input = managedReservation('assistant.example.com', 31_100);
     await reserveInstance(paths, input);
     const cloud = new FakeCloudflare();
     const options = {
@@ -576,10 +561,7 @@ describe('managed Cloudflare reconciliation', () => {
     });
     cloud.requests.length = 0;
 
-    await expect(reconcileManagedCloudflareIngress(paths, cloud.api(), options)).resolves.toEqual({
-      tunnelId: TUNNEL_ID,
-      configurationVersion: 1,
-    });
+    await expect(reconcileManagedCloudflareIngress(paths, cloud.api(), options)).resolves.toBeUndefined();
     expect(cloud.requests.filter((request) => request.method !== 'GET')).toEqual([]);
   });
 
@@ -590,7 +572,7 @@ describe('managed Cloudflare reconciliation', () => {
     'waits out a 429 on the route PUT, re-reads, and retries only when the change is absent ($label)',
     async ({ applied, puts }) => {
       const paths = await testPaths();
-      const input = managedReservation(paths, 'assistant.example.com', 31_100);
+      const input = managedReservation('assistant.example.com', 31_100);
       await reserveInstance(paths, input);
       const cloud = new FakeCloudflare();
       let limited = false;
@@ -620,7 +602,7 @@ describe('managed Cloudflare reconciliation', () => {
             connector: createCloudflareConnectorLayout({ cloudflareRoot: paths.cloudflareRoot, platform: 'linux' }),
           },
         ),
-      ).resolves.toMatchObject({ tunnelId: TUNNEL_ID });
+      ).resolves.toBeUndefined();
       expect(sleeps).toEqual([3_000]);
       expect(cloud.count('PUT', '/configurations')).toBe(puts);
       const afterLimit = cloud.requests.findIndex((request) => request.method === 'PUT');
@@ -634,8 +616,8 @@ describe('managed Cloudflare reconciliation', () => {
 
   it('reconciles only its own DNS record, so a hand-edited peer record does not block it', async () => {
     const paths = await testPaths();
-    const peer = managedReservation(paths, 'peer.example.com', 31_200);
-    const target = managedReservation(paths, 'assistant.example.com', 31_100);
+    const peer = managedReservation('peer.example.com', 31_200);
+    const target = managedReservation('assistant.example.com', 31_100);
     await reserveInstance(paths, peer);
     await reserveInstance(paths, target);
     const cloud = new FakeCloudflare();
@@ -655,7 +637,7 @@ describe('managed Cloudflare reconciliation', () => {
         originHost: '127.0.0.1',
         connector,
       }),
-    ).resolves.toMatchObject({ configurationVersion: 1 });
+    ).resolves.toBeUndefined();
     expect(cloud.count('PUT', '/configurations')).toBe(1);
     expect(cloud.requests.filter((request) => request.route.endsWith('/dns_records')).map((r) => r.method)).toEqual([
       'GET',
@@ -673,8 +655,8 @@ describe('managed Cloudflare reconciliation', () => {
 
   it("is not blocked by a peer's stuck removal, whose route leaves the route set", async () => {
     const paths = await testPaths();
-    const removing = managedReservation(paths, 'removing.example.com', 31_200);
-    const target = managedReservation(paths, 'assistant.example.com', 31_100);
+    const removing = managedReservation('removing.example.com', 31_200);
+    const target = managedReservation('assistant.example.com', 31_100);
     await reserveInstance(paths, removing);
     await reserveInstance(paths, target);
     const cloud = new FakeCloudflare();
@@ -698,7 +680,7 @@ describe('managed Cloudflare reconciliation', () => {
         originHost: '127.0.0.1',
         connector,
       }),
-    ).resolves.toMatchObject({ tunnelId: TUNNEL_ID });
+    ).resolves.toBeUndefined();
     expect((cloud.configuration.config?.ingress as Json[]).map((rule) => rule.hostname)).toEqual([
       'assistant.example.com',
       undefined,
@@ -714,9 +696,9 @@ describe('managed Cloudflare reconciliation', () => {
 
   it('keeps an older peer and B when A leaves a three-assistant route set', async () => {
     const paths = await testPaths();
-    const older = managedReservation(paths, 'older.example.com', 31_100);
-    const first = managedReservation(paths, 'first.example.com', 31_200);
-    const second = managedReservation(paths, 'second.example.com', 31_300);
+    const older = managedReservation('older.example.com', 31_100);
+    const first = managedReservation('first.example.com', 31_200);
+    const second = managedReservation('second.example.com', 31_300);
     for (const input of [older, first, second]) await reserveInstance(paths, input);
     const cloud = new FakeCloudflare();
     const connector = createCloudflareConnectorLayout({ cloudflareRoot: paths.cloudflareRoot, platform: 'linux' });
@@ -750,7 +732,7 @@ describe('managed Cloudflare reconciliation', () => {
 
   it.each(['foreign-config', 'foreign-dns'] as const)('refuses %s before changing anything', async (kind) => {
     const paths = await testPaths();
-    const input = managedReservation(paths, 'assistant.example.com', 31_100);
+    const input = managedReservation('assistant.example.com', 31_100);
     await reserveInstance(paths, input);
     const cloud = new FakeCloudflare();
     const connector = createCloudflareConnectorLayout({ cloudflareRoot: paths.cloudflareRoot, platform: 'linux' });
@@ -788,9 +770,40 @@ describe('managed Cloudflare reconciliation', () => {
     expect((await readRegistry(paths)).shared_infrastructure_metadata.cloudflare?.tunnel_id).toBeNull();
   });
 
+  it("refuses DNS records at the hostname before this machine's tunnel exists, creating no tunnel", async () => {
+    const paths = await testPaths();
+    const input = managedReservation('assistant.example.com', 31_100);
+    await reserveInstance(paths, input);
+    const cloud = new FakeCloudflare();
+    cloud.records.push({
+      id: 'd'.repeat(32),
+      type: 'CNAME',
+      name: 'assistant.example.com',
+      content: `${TUNNEL_ID}.cfargotunnel.com`,
+      proxied: true,
+      comment: cloudflareDnsOwnershipComment(input.instance_id),
+    });
+
+    await expect(
+      reconcileManagedCloudflareIngress(paths, cloud.api(), {
+        instanceId: input.instance_id,
+        originHost: '127.0.0.1',
+        connector: createCloudflareConnectorLayout({ cloudflareRoot: paths.cloudflareRoot, platform: 'linux' }),
+      }),
+    ).rejects.toMatchObject({
+      code: 'foreign_cloudflare_dns',
+      message: expect.stringContaining('assistant.example.com'),
+    });
+    expect(cloud.requests.filter((request) => request.method !== 'GET')).toEqual([]);
+    expect((await readRegistry(paths)).shared_infrastructure_metadata.cloudflare).toMatchObject({
+      tunnel_id: null,
+      tunnel_creation_started_at: null,
+    });
+  });
+
   it('adopts a create Cloudflare applied without confirming, and does not send it again', async () => {
     const paths = await testPaths();
-    const input = managedReservation(paths, 'assistant.example.com', 31_100);
+    const input = managedReservation('assistant.example.com', 31_100);
     await reserveInstance(paths, input);
     const cloud = new FakeCloudflare();
     cloud.intercept = (method, _route, apply) => {
@@ -806,7 +819,7 @@ describe('managed Cloudflare reconciliation', () => {
         originHost: '127.0.0.1',
         connector: createCloudflareConnectorLayout({ cloudflareRoot: paths.cloudflareRoot, platform: 'linux' }),
       }),
-    ).resolves.toMatchObject({ tunnelId: TUNNEL_ID });
+    ).resolves.toBeUndefined();
     expect(cloud.count('POST', '/cfd_tunnel')).toBe(1);
     expect(cloud.count('POST', '/dns_records')).toBe(1);
     expect(cloud.tunnels).toHaveLength(1);
@@ -815,7 +828,7 @@ describe('managed Cloudflare reconciliation', () => {
 
   it('records that the tunnel is being created first, so a failure before its ID is recorded leaves a trace', async () => {
     const paths = await testPaths();
-    const input = managedReservation(paths, 'assistant.example.com', 31_100);
+    const input = managedReservation('assistant.example.com', 31_100);
     await reserveInstance(paths, input);
     const cloud = new FakeCloudflare();
     // Cloudflare creates the tunnel, then the run stops before recording its ID.
@@ -842,9 +855,7 @@ describe('managed Cloudflare reconciliation', () => {
 
     // Resuming adopts the tunnel by its reserved name, records its ID, and clears the trace.
     cloud.intercept = undefined;
-    await expect(reconcileManagedCloudflareIngress(paths, cloud.api(), options)).resolves.toMatchObject({
-      tunnelId: TUNNEL_ID,
-    });
+    await expect(reconcileManagedCloudflareIngress(paths, cloud.api(), options)).resolves.toBeUndefined();
     expect(cloud.count('POST', '/cfd_tunnel')).toBe(1);
     expect((await readRegistry(paths)).shared_infrastructure_metadata.cloudflare).toMatchObject({
       tunnel_id: TUNNEL_ID,
@@ -860,7 +871,7 @@ describe('managed Cloudflare reconciliation', () => {
     },
   ])('fails before any change when the token reads $label instead of the claimed zone', async ({ change }) => {
     const paths = await testPaths();
-    const input = managedReservation(paths, 'assistant.example.com', 31_100);
+    const input = managedReservation('assistant.example.com', 31_100);
     await reserveInstance(paths, input);
     const cloud = new FakeCloudflare();
     change(cloud.zones[0]!);
@@ -957,23 +968,6 @@ describe('managed Cloudflare transport step', () => {
     expect(await readFile(path.join(log.directory, stepLog!), 'utf8')).toContain(
       `the Cloudflare connector: it runs ${previous}, not the pinned ${CLOUDFLARED_IMAGE}`,
     );
-  });
-
-  it('waits for a connector that reports no config_version, then a newer one, before checking a new route', async () => {
-    const world = await transportFixture();
-    await world.run();
-    const second = await world.reserve('second.example.com', 31_200);
-    const client = { id: '1bedc50d-42b3-473c-b108-ff3d10c0d925', conns: [] };
-    world.cloud.connectionAnswers.push([client], [{ ...client, config_version: 3 }]);
-    world.cloud.requests.length = 0;
-    world.sleeps.length = 0;
-
-    await expect(world.run(second.instance_id)).resolves.toEqual({ status: 'ready' });
-
-    expect(world.cloud.configuration.version).toBe(2);
-    expect(world.cloud.count('GET', '/connections')).toBe(2);
-    expect(world.sleeps).toEqual([1_000]);
-    expect(world.tokenRequests).toHaveLength(2);
   });
 
   it('waits for a new hostname to resolve, without asking for the token again', async () => {

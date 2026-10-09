@@ -25,21 +25,6 @@ async function controlPlanePaths(): Promise<ControlPlanePaths> {
   return resolveControlPlanePaths({ configRoot: path.join(root, 'config'), stateRoot: path.join(root, 'state') });
 }
 
-async function captures(directory: string): Promise<Array<Record<string, unknown>>> {
-  let names: string[];
-  try {
-    names = await readdir(directory);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
-    throw error;
-  }
-  return Promise.all(
-    names
-      .sort()
-      .map(async (name) => JSON.parse(await readFile(path.join(directory, name), 'utf8')) as Record<string, unknown>),
-  );
-}
-
 describe('GWS-EA run log', () => {
   it('writes a progression log and numbered raw step logs under the instance log root', async () => {
     const paths = await controlPlanePaths();
@@ -188,90 +173,5 @@ describe('GWS-EA run log', () => {
     expect(raw).toContain('.env /instance/nanoclaw/.env: keys ONECLI_URL, GCHAT_ENDPOINT_URL');
     expect(raw).not.toContain('127.0.0.1');
     expect(`${raw}${progression}`).not.toContain(secret);
-  });
-
-  it('captures allowlisted reads to the staging directory only when enabled', async () => {
-    const paths = await controlPlanePaths();
-    const staging = path.join(paths.stateRoot, 'fixture-staging');
-    const listing = JSON.stringify([{ projectId: 'gws-ea-0d8f6f7e3c2b4a1d9e8f' }]);
-    const exercise = async (captureFixturesTo?: string) => {
-      const run = await startRunLog({
-        paths,
-        command: 'create',
-        ...(captureFixturesTo ? { captureFixturesTo } : {}),
-      });
-      await run.step('provision_gcp', async (step) => {
-        step.captureCommand({
-          program: 'gcloud',
-          args: ['projects', 'list', '--format=json'],
-          exitCode: 0,
-          stdout: listing,
-          stderr: '',
-        });
-        step.captureCommand({
-          program: 'gcloud',
-          args: ['auth', 'print-access-token', '--account=a@example.com'],
-          exitCode: 0,
-          stdout: 'ya29.token',
-          stderr: '',
-        });
-        step.captureCommand({
-          program: 'gcloud',
-          args: ['iam', 'service-accounts', 'keys', 'create', 'k.json'],
-          exitCode: 0,
-          stdout: '{}',
-          stderr: '',
-        });
-        step.captureHttp({
-          method: 'GET',
-          url: 'https://api.cloudflare.com/client/v4/zones?page=1',
-          status: 200,
-          body: '{"result":[]}',
-        });
-        step.captureHttp({
-          method: 'GET',
-          url: 'https://api.cloudflare.com/client/v4/accounts/a/cfd_tunnel/t/token',
-          status: 200,
-          body: '{"result":"eyJhIjoiYWNjb3VudCJ9"}',
-        });
-        step.captureHttp({
-          method: 'GET',
-          url: 'https://api.cloudflare.com/client/v4/user/tokens/verify',
-          status: 200,
-          body: '{}',
-        });
-        step.captureHttp({
-          method: 'POST',
-          url: 'https://api.cloudflare.com/client/v4/zones/z/dns_records',
-          status: 200,
-          body: '{}',
-        });
-      });
-      return run;
-    };
-
-    const disabled = await exercise();
-    expect(await captures(staging)).toEqual([]);
-
-    const enabled = await exercise(staging);
-    const staged = await captures(staging);
-    expect(staged).toEqual([
-      expect.objectContaining({
-        kind: 'command',
-        program: 'gcloud',
-        args: ['projects', 'list', '--format=json'],
-        stdout: listing,
-      }),
-      expect.objectContaining({
-        kind: 'http',
-        method: 'GET',
-        url: 'https://api.cloudflare.com/client/v4/zones?page=1',
-        body: '{"result":[]}',
-      }),
-    ]);
-    for (const run of [disabled, enabled]) {
-      const raw = await readFile(path.join(run.directory, 'steps', '01-provision-gcp.log'), 'utf8').catch(() => '');
-      expect(raw).not.toContain('gws-ea-0d8f6f7e3c2b4a1d9e8f');
-    }
   });
 });

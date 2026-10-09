@@ -23,7 +23,6 @@ const READY: Prerequisites = {
   homeDirectory: '/Users/operator',
   runningAsRoot: false,
   nodePath: '/opt/homebrew/bin/node',
-  onecliCliPath: '/Users/operator/.local/share/gws-ea/tools/onecli/2.2.5/onecli',
   dockerEndpoint: 'unix:///Users/operator/.docker/run/docker.sock',
   rootlessDocker: false,
   account: 'operator@example.com',
@@ -35,8 +34,6 @@ const REQUEST: PrerequisiteRequest = {
     configRoot: '/Users/operator/.config/gws-ea',
     stateRoot: '/Users/operator/.local/share/gws-ea',
     logsRoot: '/Users/operator/.local/share/gws-ea/logs',
-    instancesRoot: '/Users/operator/.local/share/gws-ea/instances',
-    onecliCliFile: (version) => `/Users/operator/.local/share/gws-ea/tools/onecli/${version}/onecli`,
   },
 };
 

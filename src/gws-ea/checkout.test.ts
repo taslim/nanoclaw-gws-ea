@@ -1,5 +1,6 @@
+import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -17,8 +18,8 @@ import {
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { TOOL_ENVIRONMENT_KEYS, runSanitizedCommand, type SanitizedCommand } from './process.js';
 import { reserveInstance } from './journal.js';
-import { allocateInstanceId, readInstanceMarkerFile } from './registry.js';
-import type { InstanceReservationInput } from './types.js';
+import { writeInstanceMarker } from './registry.js';
+import type { InstanceReservation, InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
 
@@ -77,15 +78,9 @@ async function controlPlanePaths(): Promise<ControlPlanePaths> {
   });
 }
 
-function reservation(
-  paths: ControlPlanePaths,
-  instanceId: string,
-  sourceRemote: string,
-  deployedCommit: string,
-): InstanceReservationInput {
+function reservation(instanceId: string, sourceRemote: string, deployedCommit: string): InstanceReservationInput {
   return {
     instance_id: instanceId,
-    checkout_realpath: paths.checkoutRoot(instanceId),
     release_track: 'dogfood',
     source_remote: sourceRemote,
     deployed_commit: deployedCommit,
@@ -101,8 +96,25 @@ function reservation(
   };
 }
 
-function stagingRoot(paths: ControlPlanePaths, instanceId: string): string {
-  return `${paths.checkoutRoot(instanceId)}.staging`;
+/** The physical folder create publishes a reservation's release in, `<instance root>/<hex8>`. */
+function releaseFolder(paths: ControlPlanePaths, reservation: InstanceReservation): string {
+  return paths.instanceLayout(reservation.instance_id).release(reservation.deployed_commit.slice(0, 8));
+}
+
+function stagingRoot(paths: ControlPlanePaths, reservation: InstanceReservation): string {
+  return `${releaseFolder(paths, reservation)}.staging`;
+}
+
+/** The reservation's release published, and the assistant's marker in its state, as create's release step makes them. */
+async function publishCreated(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<void> {
+  await writeInstanceMarker(paths, reservation.instance_id);
+  await materializeReleaseCheckout(paths, reservation);
+}
+
+/** Point the live link at the reservation's release, as create does once the release is complete. */
+async function goLive(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<string> {
+  await symlink(reservation.deployed_commit.slice(0, 8), paths.checkoutRoot(reservation.instance_id));
+  return releaseFolder(paths, reservation);
 }
 
 function expectSanitizedEnvironment(
@@ -122,8 +134,8 @@ function expectSanitizedEnvironment(
 }
 
 async function reserved(paths: ControlPlanePaths, sourceRemote: string, deployedCommit: string) {
-  const instanceId = allocateInstanceId();
-  return reserveInstance(paths, reservation(paths, instanceId, sourceRemote, deployedCommit));
+  const instanceId = randomUUID();
+  return reserveInstance(paths, reservation(instanceId, sourceRemote, deployedCommit));
 }
 
 describe('release track history', () => {
@@ -201,28 +213,29 @@ describe('exact release checkout', () => {
     const reservation = await reserved(paths, source.remote, source.firstCommit);
     const instanceId = reservation.instance_id;
 
-    await materializeReleaseCheckout(paths, reservation);
+    await expect(materializeReleaseCheckout(paths, reservation)).resolves.toEqual(reservation);
 
-    expect(git(paths.checkoutRoot(instanceId), 'rev-parse', 'HEAD')).toBe(source.firstCommit);
-    expect(git(paths.checkoutRoot(instanceId), 'branch', '--show-current')).toBe('');
-    expect(git(paths.checkoutRoot(instanceId), 'status', '--porcelain')).toBe('');
-    expect(await assertReleaseCheckoutAgreement(paths, instanceId)).toMatchObject({
-      instance_id: instanceId,
-      deployed_commit: source.firstCommit,
+    expect(git(releaseFolder(paths, reservation), 'rev-parse', 'HEAD')).toBe(source.firstCommit);
+    expect(git(releaseFolder(paths, reservation), 'branch', '--show-current')).toBe('');
+    expect(git(releaseFolder(paths, reservation), 'status', '--porcelain')).toBe('');
+    expect(releaseFolder(paths, reservation)).toBe(
+      path.join(paths.instanceRoot(instanceId), source.firstCommit.slice(0, 8)),
+    );
+    // Nothing outside the release is written: the assistant's state is not even created, and the release holds none.
+    await expect(lstat(paths.instanceLayout(instanceId).state)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(lstat(path.join(releaseFolder(paths, reservation), 'data'))).rejects.toMatchObject({
+      code: 'ENOENT',
     });
-    expect(JSON.parse(await readFile(paths.markerFile(instanceId), 'utf8'))).toEqual({
-      schema_version: 1,
-      instance_id: instanceId,
-      deployed_commit: source.firstCommit,
-    });
+    // Publishing the release does not make it live.
+    await expect(lstat(paths.checkoutRoot(instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it("stages an update's target reservation view in its release slot from the target's source, leaving the live release in place", async () => {
+  it("stages an update's target reservation view in its own folder from the target's source, leaving the live release in place", async () => {
     const dogfood = await sourceFixture();
     const paths = await controlPlanePaths();
     const deployed = await reserved(paths, dogfood.remote, dogfood.firstCommit);
     const instanceId = deployed.instance_id;
-    await materializeReleaseCheckout(paths, deployed);
+    await publishCreated(paths, deployed);
     // A prod repository whose history carries the deployed commit, one commit ahead of it.
     const prodRoot = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-prod-source-'));
     roots.push(prodRoot);
@@ -235,19 +248,14 @@ describe('exact release checkout', () => {
     git(prodRoot, 'clone', '--quiet', '--bare', prodWork, prodRemote);
     const view = { ...deployed, source_remote: prodRemote, release_track: 'prod', deployed_commit: prodCommit };
 
-    await expect(materializeReleaseCheckout(paths, view, {}, 'next')).resolves.toEqual(view);
+    await expect(materializeReleaseCheckout(paths, view)).resolves.toEqual(view);
 
-    const staged = paths.releaseCheckoutRoot(instanceId, 'next');
+    const staged = releaseFolder(paths, view);
     expect(git(staged, 'rev-parse', 'HEAD')).toBe(prodCommit);
     expect(git(staged, 'branch', '--show-current')).toBe('');
     expect(git(staged, 'status', '--porcelain')).toBe('');
-    expect(await readInstanceMarkerFile(path.join(staged, 'data', 'gws-ea', 'instance.json'))).toEqual({
-      schema_version: 1,
-      instance_id: instanceId,
-      deployed_commit: prodCommit,
-    });
     await expect(stat(`${staged}.staging`)).rejects.toMatchObject({ code: 'ENOENT' });
-    expect(git(paths.checkoutRoot(instanceId), 'rev-parse', 'HEAD')).toBe(dogfood.firstCommit);
+    expect(git(releaseFolder(paths, deployed), 'rev-parse', 'HEAD')).toBe(dogfood.firstCommit);
     expect(await assertReleaseCheckoutAgreement(paths, instanceId)).toEqual(deployed);
   });
 
@@ -255,14 +263,13 @@ describe('exact release checkout', () => {
     const source = await sourceFixture();
     const paths = await controlPlanePaths();
     const reservation = await reserved(paths, source.remote, source.firstCommit);
-    const instanceId = reservation.instance_id;
-    await mkdir(paths.checkoutRoot(instanceId), { recursive: true });
-    await write(paths.checkoutRoot(instanceId), 'owner.txt', 'someone else\n');
+    await mkdir(releaseFolder(paths, reservation), { recursive: true, mode: 0o700 });
+    await write(releaseFolder(paths, reservation), 'owner.txt', 'someone else\n');
 
     await expect(materializeReleaseCheckout(paths, reservation)).rejects.toMatchObject({
       code: 'checkout_exists',
     });
-    expect(await readFile(path.join(paths.checkoutRoot(instanceId), 'owner.txt'), 'utf8')).toBe('someone else\n');
+    expect(await readFile(path.join(releaseFolder(paths, reservation), 'owner.txt'), 'utf8')).toBe('someone else\n');
   });
 
   it('rejects a checkout path reached through a symlink', async () => {
@@ -273,42 +280,45 @@ describe('exact release checkout', () => {
     await mkdir(paths.instanceRoot(instanceId), { recursive: true });
     const target = path.join(path.dirname(paths.stateRoot), 'foreign-checkout');
     await mkdir(target);
-    await symlink(target, paths.checkoutRoot(instanceId));
+    await symlink(target, releaseFolder(paths, reservation));
 
     await expect(materializeReleaseCheckout(paths, reservation)).rejects.toMatchObject({
       code: 'unsafe_checkout',
     });
   });
 
-  it('refuses to publish into the live checkout a release the registry does not record', async () => {
+  it("publishes a view at another commit in that commit's own folder, beside the release the registry records", async () => {
     const source = await sourceFixture();
+    await write(source.source, 'release.txt', 'second\n');
+    const second = commit(source.source, 'second release');
+    git(source.source, 'push', 'origin', 'dogfood');
     const paths = await controlPlanePaths();
-    const reservation = await reserved(paths, source.remote, 'f'.repeat(40));
+    const reservation = await reserved(paths, source.remote, source.firstCommit);
+    const view = { ...reservation, deployed_commit: second };
 
-    await expect(
-      materializeReleaseCheckout(paths, { ...reservation, deployed_commit: source.firstCommit }),
-    ).rejects.toMatchObject({ code: 'release_mismatch' });
-    await expect(stat(paths.checkoutRoot(reservation.instance_id))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(materializeReleaseCheckout(paths, view)).resolves.toEqual(view);
+
+    expect(git(releaseFolder(paths, view), 'rev-parse', 'HEAD')).toBe(second);
+    await expect(stat(releaseFolder(paths, reservation))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('removes a newly-created partial checkout when exact-commit fetch fails', async () => {
     const source = await sourceFixture();
     const paths = await controlPlanePaths();
     const reservation = await reserved(paths, source.remote, source.firstCommit);
-    const instanceId = reservation.instance_id;
 
     await expect(
       materializeReleaseCheckout(paths, reservation, {
         runCommand: async (spec) => {
-          if (spec.cwd === stagingRoot(paths, instanceId) && spec.args[0] === 'fetch') {
+          if (spec.cwd === stagingRoot(paths, reservation) && spec.args[0] === 'fetch') {
             throw new Error('fixture fetch failure');
           }
           return runSanitizedCommand(spec);
         },
       }),
     ).rejects.toThrow(/fixture fetch failure/);
-    await expect(stat(paths.checkoutRoot(instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
-    await expect(stat(stagingRoot(paths, instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(releaseFolder(paths, reservation))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(stagingRoot(paths, reservation))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('publishes the checkout atomically only after staging verification', async () => {
@@ -321,24 +331,23 @@ describe('exact release checkout', () => {
     await materializeReleaseCheckout(paths, reservation, {
       runCommand: async (spec) => {
         expectSanitizedEnvironment(spec.env, expectedHome);
-        if (spec.cwd === stagingRoot(paths, instanceId)) {
-          await expect(stat(paths.checkoutRoot(instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
+        if (spec.cwd === stagingRoot(paths, reservation)) {
+          await expect(stat(releaseFolder(paths, reservation))).rejects.toMatchObject({ code: 'ENOENT' });
         }
         return runSanitizedCommand(spec);
       },
     });
 
-    expect(git(paths.checkoutRoot(instanceId), 'rev-parse', 'HEAD')).toBe(source.firstCommit);
-    await expect(stat(stagingRoot(paths, instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(git(releaseFolder(paths, reservation), 'rev-parse', 'HEAD')).toBe(source.firstCommit);
+    await expect(stat(stagingRoot(paths, reservation))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('publishes a complete owned staging checkout after an interrupted rename', async () => {
     const source = await sourceFixture();
     const paths = await controlPlanePaths();
     const reservation = await reserved(paths, source.remote, source.firstCommit);
-    const instanceId = reservation.instance_id;
     await materializeReleaseCheckout(paths, reservation);
-    await rename(paths.checkoutRoot(instanceId), stagingRoot(paths, instanceId));
+    await rename(releaseFolder(paths, reservation), stagingRoot(paths, reservation));
     const commands: string[] = [];
 
     await materializeReleaseCheckout(paths, reservation, {
@@ -351,7 +360,7 @@ describe('exact release checkout', () => {
     expect(commands).not.toContain('init');
     expect(commands).not.toContain('fetch');
     expect(commands).not.toContain('checkout');
-    expect(git(paths.checkoutRoot(instanceId), 'rev-parse', 'HEAD')).toBe(source.firstCommit);
+    expect(git(releaseFolder(paths, reservation), 'rev-parse', 'HEAD')).toBe(source.firstCommit);
   });
 
   it('cleans an owned partial staging checkout before retrying materialization', async () => {
@@ -360,15 +369,15 @@ describe('exact release checkout', () => {
     const reservation = await reserved(paths, source.remote, source.firstCommit);
     const instanceId = reservation.instance_id;
     await mkdir(paths.instanceRoot(instanceId), { recursive: true, mode: 0o700 });
-    await mkdir(stagingRoot(paths, instanceId), { mode: 0o700 });
-    await write(stagingRoot(paths, instanceId), 'partial.txt', 'interrupted\n');
+    await mkdir(stagingRoot(paths, reservation), { mode: 0o700 });
+    await write(stagingRoot(paths, reservation), 'partial.txt', 'interrupted\n');
 
     await materializeReleaseCheckout(paths, reservation);
 
-    await expect(stat(path.join(paths.checkoutRoot(instanceId), 'partial.txt'))).rejects.toMatchObject({
+    await expect(stat(path.join(releaseFolder(paths, reservation), 'partial.txt'))).rejects.toMatchObject({
       code: 'ENOENT',
     });
-    expect(git(paths.checkoutRoot(instanceId), 'rev-parse', 'HEAD')).toBe(source.firstCommit);
+    expect(git(releaseFolder(paths, reservation), 'rev-parse', 'HEAD')).toBe(source.firstCommit);
   });
 
   it('does not clean a staging path that is a symlink', async () => {
@@ -380,7 +389,7 @@ describe('exact release checkout', () => {
     const foreign = path.join(path.dirname(paths.stateRoot), 'foreign-staging');
     await mkdir(foreign);
     await write(foreign, 'owner.txt', 'preserve me\n');
-    await symlink(foreign, stagingRoot(paths, instanceId));
+    await symlink(foreign, stagingRoot(paths, reservation));
 
     await expect(materializeReleaseCheckout(paths, reservation)).rejects.toMatchObject({
       code: 'unsafe_checkout',
@@ -392,22 +401,21 @@ describe('exact release checkout', () => {
     const source = await sourceFixture();
     const paths = await controlPlanePaths();
     const reservation = await reserved(paths, source.remote, source.firstCommit);
-    const instanceId = reservation.instance_id;
 
     await expect(
       materializeReleaseCheckout(paths, reservation, {
         runCommand: async (spec) => {
           const result = await runSanitizedCommand(spec);
-          if (spec.cwd === stagingRoot(paths, instanceId) && spec.args.includes('status')) {
-            await mkdir(paths.checkoutRoot(instanceId), { mode: 0o700 });
-            await write(paths.checkoutRoot(instanceId), 'owner.txt', 'preserve me\n');
+          if (spec.cwd === stagingRoot(paths, reservation) && spec.args.includes('status')) {
+            await mkdir(releaseFolder(paths, reservation), { mode: 0o700 });
+            await write(releaseFolder(paths, reservation), 'owner.txt', 'preserve me\n');
           }
           return result;
         },
       }),
     ).rejects.toMatchObject({ code: 'checkout_exists' });
-    expect(await readFile(path.join(paths.checkoutRoot(instanceId), 'owner.txt'), 'utf8')).toBe('preserve me\n');
-    await expect(stat(stagingRoot(paths, instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await readFile(path.join(releaseFolder(paths, reservation), 'owner.txt'), 'utf8')).toBe('preserve me\n');
+    await expect(stat(stagingRoot(paths, reservation))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });
 
@@ -473,14 +481,14 @@ describe('read-only observation', () => {
     const paths = await controlPlanePaths();
     const reservation = await reserved(paths, source.remote, source.firstCommit);
     const instanceId = reservation.instance_id;
-    const checkout = paths.checkoutRoot(instanceId);
-    await materializeReleaseCheckout(paths, reservation);
+    await publishCreated(paths, reservation);
+    const checkout = await goLive(paths, reservation);
     const helper = path.join(paths.instanceRoot(instanceId), '.release-home');
     await rm(helper, { recursive: true, force: true });
     await staleIndexEntry(checkout, 'release.txt');
     const before = await indexState(checkout);
 
-    await expect(observeLiveCheckout(reservation, [source.firstCommit])).resolves.toBe(source.firstCommit);
+    await expect(observeLiveCheckout(paths, reservation, [source.firstCommit])).resolves.toBe(source.firstCommit);
 
     await expect(stat(helper)).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await indexState(checkout)).toEqual(before);
@@ -489,25 +497,45 @@ describe('read-only observation', () => {
     expect(await indexState(checkout)).not.toEqual(before);
   });
 
+  it('says no release is live while the live link is absent, and checks the release itself physically', async () => {
+    const source = await sourceFixture();
+    const paths = await controlPlanePaths();
+    const reservation = await reserved(paths, source.remote, source.firstCommit);
+    await publishCreated(paths, reservation);
+
+    await expect(observeLiveCheckout(paths, reservation, [source.firstCommit])).rejects.toMatchObject({
+      code: 'release_fenced',
+    });
+    // A release reached through a link is no release: only the live link itself is one.
+    const release = releaseFolder(paths, reservation);
+    const moved = path.join(path.dirname(paths.stateRoot), 'moved-release');
+    await rename(release, moved);
+    await symlink(moved, release);
+    await goLive(paths, reservation);
+    await expect(observeLiveCheckout(paths, reservation, [source.firstCommit])).rejects.toMatchObject({
+      code: 'unsafe_checkout',
+    });
+  });
+
   it('accepts only the commits the live checkout may hold, and refuses a tracked edit by name', async () => {
     const source = await sourceFixture();
     const paths = await controlPlanePaths();
     const reservation = await reserved(paths, source.remote, source.firstCommit);
-    const checkout = paths.checkoutRoot(reservation.instance_id);
-    await materializeReleaseCheckout(paths, reservation);
+    await publishCreated(paths, reservation);
+    const checkout = await goLive(paths, reservation);
     const operationTarget = 'e'.repeat(40);
 
     // An unfinished operation's commits are accepted alongside the registry's.
-    await expect(observeLiveCheckout(reservation, [operationTarget, source.firstCommit])).resolves.toBe(
+    await expect(observeLiveCheckout(paths, reservation, [operationTarget, source.firstCommit])).resolves.toBe(
       source.firstCommit,
     );
-    await expect(observeLiveCheckout(reservation, [operationTarget])).rejects.toMatchObject({
-      code: 'marker_mismatch',
+    await expect(observeLiveCheckout(paths, reservation, [operationTarget])).rejects.toMatchObject({
+      code: 'release_mismatch',
     });
     await write(checkout, 'release.txt', 'edited\n');
     await write(checkout, 'notes.txt', 'untracked\n');
 
-    const refusal = observeLiveCheckout(reservation, [source.firstCommit]);
+    const refusal = observeLiveCheckout(paths, reservation, [source.firstCommit]);
 
     await expect(refusal).rejects.toMatchObject({
       code: 'checkout_drift',
@@ -516,20 +544,20 @@ describe('read-only observation', () => {
     });
   });
 
-  it("refuses a live checkout whose HEAD is not detached at its marker's commit", async () => {
+  it("refuses a live release whose HEAD is not detached at its release's commit", async () => {
     const source = await sourceFixture();
     const paths = await controlPlanePaths();
     const reservation = await reserved(paths, source.remote, source.firstCommit);
-    const checkout = paths.checkoutRoot(reservation.instance_id);
-    await materializeReleaseCheckout(paths, reservation);
+    await publishCreated(paths, reservation);
+    const checkout = await goLive(paths, reservation);
 
     git(checkout, 'checkout', '--quiet', '-b', 'local');
-    await expect(observeLiveCheckout(reservation, [source.firstCommit])).rejects.toMatchObject({
+    await expect(observeLiveCheckout(paths, reservation, [source.firstCommit])).rejects.toMatchObject({
       code: 'checkout_not_detached',
     });
     await write(checkout, 'release.txt', 'moved\n');
     git(checkout, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qam', 'local commit');
-    await expect(observeLiveCheckout(reservation, [source.firstCommit])).rejects.toMatchObject({
+    await expect(observeLiveCheckout(paths, reservation, [source.firstCommit])).rejects.toMatchObject({
       code: 'release_mismatch',
     });
   });
@@ -538,14 +566,14 @@ describe('read-only observation', () => {
     const source = await sourceFixture();
     const paths = await controlPlanePaths();
     const reservation = await reserved(paths, source.remote, source.firstCommit);
-    const checkout = paths.checkoutRoot(reservation.instance_id);
-    await materializeReleaseCheckout(paths, reservation);
+    await publishCreated(paths, reservation);
+    const checkout = await goLive(paths, reservation);
     await write(checkout, 'notes.txt', 'an agent wrote this; it belongs to no release\n');
     await staleIndexEntry(checkout, 'release.txt');
     const before = await indexState(checkout);
 
-    await expect(observeLiveCheckout(reservation, [source.firstCommit])).resolves.toBe(source.firstCommit);
-    await expect(assertDeploymentCheckoutUnmodified(reservation)).resolves.toBeUndefined();
+    await expect(observeLiveCheckout(paths, reservation, [source.firstCommit])).resolves.toBe(source.firstCommit);
+    await expect(assertDeploymentCheckoutUnmodified(paths, reservation)).resolves.toBeUndefined();
 
     expect(await indexState(checkout)).toEqual(before);
   });
@@ -557,13 +585,13 @@ describe('read-only observation', () => {
     git(source.source, 'push', 'origin', 'dogfood');
     const paths = await controlPlanePaths();
     const reservation = await reserved(paths, source.remote, commitWithTwoFiles);
-    const checkout = paths.checkoutRoot(reservation.instance_id);
-    await materializeReleaseCheckout(paths, reservation);
+    await publishCreated(paths, reservation);
+    const checkout = await goLive(paths, reservation);
     await write(checkout, 'release.txt', 'edited\n');
     await rm(path.join(checkout, 'second.txt'));
     await write(checkout, 'notes.txt', 'untracked\n');
 
-    const refusal = assertDeploymentCheckoutUnmodified(reservation);
+    const refusal = assertDeploymentCheckoutUnmodified(paths, reservation);
 
     await expect(refusal).rejects.toMatchObject({
       code: 'deployment_checkout_modified',
@@ -577,11 +605,13 @@ describe('read-only observation', () => {
     const source = await sourceFixture();
     const paths = await controlPlanePaths();
     const reservation = await reserved(paths, source.remote, source.firstCommit);
-    const checkout = paths.checkoutRoot(reservation.instance_id);
-    await materializeReleaseCheckout(paths, reservation);
+    await publishCreated(paths, reservation);
+    const checkout = await goLive(paths, reservation);
     await write(checkout, 'release.txt', 'moved\n');
     git(checkout, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qam', 'local commit');
 
-    await expect(assertDeploymentCheckoutUnmodified(reservation)).rejects.toMatchObject({ code: 'release_mismatch' });
+    await expect(assertDeploymentCheckoutUnmodified(paths, reservation)).rejects.toMatchObject({
+      code: 'release_mismatch',
+    });
   });
 });

@@ -10,9 +10,6 @@
  * <stateRoot>/logs/runs/<run>/ until an instance is reserved. Each run owns
  * an exclusively created directory, so concurrent runs never share a file.
  * Logs are kept after the instance is removed.
- *
- * The flag-gated fixture capture sink also lives here: it stages allowlisted
- * parsed reads for fixture curation and never writes to the run log.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomBytes } from 'node:crypto';
@@ -23,13 +20,10 @@ import { performance } from 'node:perf_hooks';
 
 import { isErrno } from '../community-portal/errors.js';
 import { PauseRequired } from './events.js';
-import { CONTROL_PLANE_ROOT, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
+import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import { envKeyNames, redact, registerSecretDirectory, safeErrorCode } from './redact.js';
 import { assertInstanceId } from './registry.js';
 import { GwsEaError } from './types.js';
-
-/** Gitignored staging directory for fixture captures during live gates. */
-export const FIXTURE_STAGING_DIRECTORY = path.join(CONTROL_PLANE_ROOT, '.gws-ea-fixture-staging');
 
 const PROGRESS_LOG = 'progress.log';
 const STEPS_DIRECTORY = 'steps';
@@ -37,21 +31,6 @@ const MAX_FIELD_CHARACTERS = 300;
 
 export type LogFieldValue = string | number | boolean;
 export type StepStatus = 'success' | 'failed' | 'paused';
-
-export interface CommandCapture {
-  readonly program: string;
-  readonly args: readonly string[];
-  readonly exitCode: number;
-  readonly stdout: string;
-  readonly stderr: string;
-}
-
-export interface HttpCapture {
-  readonly method: string;
-  readonly url: string;
-  readonly status: number;
-  readonly body: string;
-}
 
 export interface StepLog {
   readonly name: string;
@@ -64,8 +43,6 @@ export interface StepLog {
   write(text: string): void;
   /** Record a dotenv file by its key names only. */
   envFile(file: string, contents: string): void;
-  captureCommand(capture: CommandCapture): void;
-  captureHttp(capture: HttpCapture): void;
 }
 
 export interface RunLog {
@@ -92,8 +69,6 @@ export interface StartRunOptions {
   readonly meta?: Readonly<Record<string, LogFieldValue>>;
   /** Directories whose files are registered as secrets before anything is logged. */
   readonly secretDirectories?: readonly string[];
-  /** Enables the fixture capture sink, writing to this directory. Off when absent. */
-  readonly captureFixturesTo?: string;
 }
 
 const activeSteps = new AsyncLocalStorage<StepLog>();
@@ -132,33 +107,6 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function commandWords(args: readonly string[]): string[] {
-  return args.filter((arg) => !arg.startsWith('-'));
-}
-
-/** Allowlisted reads only: never token endpoints or commands that print secrets. */
-function isCapturableCommand(program: string, args: readonly string[]): boolean {
-  const words = commandWords(args);
-  switch (path.basename(program)) {
-    case 'gcloud':
-      return (
-        !words.includes('auth') && !words.includes('config') && (words.includes('describe') || words.includes('list'))
-      );
-    case 'docker':
-      return words.includes('inspect');
-    case 'ncl':
-      return true;
-    default:
-      return false;
-  }
-}
-
-function capturableHttpPath(method: string, url: string): string | undefined {
-  if (method.toUpperCase() !== 'GET' || !URL.canParse(url)) return undefined;
-  const { pathname } = new URL(url);
-  return /\/tokens?(?:\/|$)/u.test(pathname) ? undefined : pathname;
-}
-
 async function createRunDirectory(parent: string): Promise<{ id: string; directory: string }> {
   const stamp = new Date()
     .toISOString()
@@ -181,17 +129,14 @@ class Run implements RunLog {
   #directory: string;
   readonly #paths: ControlPlanePaths;
   readonly #started = performance.now();
-  readonly #captureDirectory: string | undefined;
   readonly #failures = new WeakMap<object, string>();
-  #captureCount = 0;
   #stepCount = 0;
   #lastStep: string | undefined;
 
-  constructor(id: string, directory: string, paths: ControlPlanePaths, captureDirectory: string | undefined) {
+  constructor(id: string, directory: string, paths: ControlPlanePaths) {
     this.id = id;
     this.#directory = directory;
     this.#paths = paths;
-    this.#captureDirectory = captureDirectory;
   }
 
   get directory(): string {
@@ -240,8 +185,6 @@ class Run implements RunLog {
       },
       write,
       envFile: (file, contents) => write(`.env ${file}: keys ${envKeyNames(contents).join(', ')}\n`),
-      captureCommand: (capture) => this.#captureCommand(capture),
-      captureHttp: (capture) => this.#captureHttp(capture),
     };
 
     const startedAt = new Date().toISOString();
@@ -315,42 +258,6 @@ class Run implements RunLog {
     const step = typeof error === 'object' && error !== null ? this.#failures.get(error) : undefined;
     this.append([`## ${new Date().toISOString()} · aborted${step ? ` at ${step}` : ''} (err=${safeErrorCode(error)})`]);
   }
-
-  #stage(label: string, capture: Readonly<Record<string, unknown>>): void {
-    if (this.#captureDirectory === undefined) return;
-    this.#captureCount += 1;
-    const name = `${this.id}-${String(this.#captureCount).padStart(3, '0')}-${slug(label)}.json`;
-    fs.writeFileSync(path.join(this.#captureDirectory, name), `${JSON.stringify(capture, null, 2)}\n`, {
-      mode: 0o600,
-      flag: 'wx',
-    });
-  }
-
-  #captureCommand(capture: CommandCapture): void {
-    if (this.#captureDirectory === undefined || !isCapturableCommand(capture.program, capture.args)) return;
-    const program = path.basename(capture.program);
-    this.#stage([program, ...commandWords(capture.args).slice(0, 4)].join('-'), {
-      kind: 'command',
-      program,
-      args: capture.args.map(redact),
-      exit_code: capture.exitCode,
-      stdout: redact(capture.stdout),
-      stderr: redact(capture.stderr),
-    });
-  }
-
-  #captureHttp(capture: HttpCapture): void {
-    if (this.#captureDirectory === undefined) return;
-    const pathname = capturableHttpPath(capture.method, capture.url);
-    if (pathname === undefined) return;
-    this.#stage(`http-${capture.method}-${pathname}`, {
-      kind: 'http',
-      method: capture.method.toUpperCase(),
-      url: redact(capture.url),
-      status: capture.status,
-      body: redact(capture.body),
-    });
-  }
 }
 
 /** Open a new run: register secrets first, then create its private, exclusive log directory. */
@@ -363,10 +270,9 @@ export async function startRunLog(options: StartRunOptions): Promise<RunLog> {
       : options.paths.instanceLogsRoot(options.instanceId);
   await preparePrivateDirectory(options.paths.logsRoot);
   await preparePrivateDirectory(parent);
-  if (options.captureFixturesTo !== undefined) await preparePrivateDirectory(options.captureFixturesTo);
   const { id, directory } = await createRunDirectory(parent);
   await mkdir(path.join(directory, STEPS_DIRECTORY), { mode: 0o700 });
-  const run = new Run(id, directory, options.paths, options.captureFixturesTo);
+  const run = new Run(id, directory, options.paths);
   run.header(options.command, options.instanceId, options.meta ?? {});
   return run;
 }

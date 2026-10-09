@@ -12,6 +12,7 @@ import {
   assertPrivateDirectory,
   assertPrivateStateFile,
   instanceMarkerFile,
+  instanceRootName,
   preparePrivateDirectory,
   type ControlPlanePaths,
 } from './paths.js';
@@ -32,6 +33,7 @@ import {
   type SharedInfrastructureMetadata,
 } from './types.js';
 import {
+  CLOUDFLARE_TUNNEL_ID_PATTERN,
   EMAIL_PATTERN,
   isRecord,
   parseJson,
@@ -45,7 +47,6 @@ const ONECLI_PROJECT_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 const CLOUDFLARE_ID_PATTERN = /^[0-9a-f]{32}$/;
 const DNS_LABEL = '[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?';
 const DNS_NAME_PATTERN = new RegExp(`^(?:${DNS_LABEL}\\.)+${DNS_LABEL}$`);
-const TUNNEL_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 /** Readers keep every ownership value exact and ignore fields they do not use. */
 function requireString(value: unknown, label: string, maxLength?: number): string {
@@ -56,8 +57,37 @@ export function assertInstanceId(value: string): void {
   if (!INSTANCE_ID_PATTERN.test(value)) throw new GwsEaError('invalid_instance_id', 'Instance ID is invalid');
 }
 
-export function allocateInstanceId(): string {
-  return randomUUID();
+async function pathExists(target: string): Promise<boolean> {
+  try {
+    await lstat(target);
+    return true;
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) return false;
+    throw error;
+  }
+}
+
+/**
+ * A new instance ID whose root, `<state root>/<first 8 hex>`, is free: no
+ * registered assistant, converted or not, has the same first eight hex
+ * digits, and nothing is there yet. The ID is drawn again until one is
+ * (KTD10). Checked under the machine lock; the reservation's claim on the
+ * root then keeps a concurrent create from taking it too.
+ */
+export async function allocateInstanceId(
+  paths: ControlPlanePaths,
+  generate: () => string = randomUUID,
+): Promise<string> {
+  return withMachineLock(paths, async () => {
+    const taken = new Set(Object.keys((await readRegistryFile(paths)).instances).map(instanceRootName));
+    for (;;) {
+      const instanceId = generate();
+      assertInstanceId(instanceId);
+      if (!taken.has(instanceRootName(instanceId)) && !(await pathExists(paths.instanceRoot(instanceId)))) {
+        return instanceId;
+      }
+    }
+  });
 }
 
 function validatePort(value: unknown, label: string): number {
@@ -192,7 +222,7 @@ function validateSharedCloudflare(value: unknown): SharedCloudflareMetadata | nu
   let tunnelId: string | null = null;
   if (value.tunnel_id !== null) {
     tunnelId = requireString(value.tunnel_id, 'Cloudflare tunnel ID', 36).toLowerCase();
-    if (!TUNNEL_ID_PATTERN.test(tunnelId)) {
+    if (!CLOUDFLARE_TUNNEL_ID_PATTERN.test(tunnelId)) {
       throw new GwsEaError('invalid_registry', 'Cloudflare tunnel ID is invalid');
     }
   }
@@ -232,28 +262,26 @@ export function validateReleaseCoordinates(value: unknown): ReleaseCoordinates {
   };
 }
 
-export function validateReservation(value: unknown, paths: ControlPlanePaths): InstanceReservation {
+export function validateReservation(value: unknown): InstanceReservation {
   if (!isRecord(value)) throw new GwsEaError('invalid_state', 'Instance reservation is invalid');
   const instanceId = requireString(value.instance_id, 'instance_id', 36);
   assertInstanceId(instanceId);
-  const checkout = requireString(value.checkout_realpath, 'checkout_realpath');
-  const expectedCheckout = paths.checkoutRoot(instanceId);
-  if (path.resolve(checkout) !== expectedCheckout) {
-    throw new GwsEaError('unsafe_path', 'Checkout path does not match the reserved instance path');
-  }
   const release = validateReleaseCoordinates(value);
+  // The layout before releases recorded its checkout; the field now only marks the entry unconverted.
+  const legacyCheckout =
+    value.checkout_realpath === undefined ? undefined : requireString(value.checkout_realpath, 'checkout_realpath');
   return {
     instance_id: instanceId,
-    checkout_realpath: expectedCheckout,
     release_track: release.release_track,
     source_remote: release.source_remote,
     deployed_commit: release.deployed_commit,
     allocated_ports: validatePorts(value.allocated_ports),
     exclusive_resource_claims: validateClaims(value.exclusive_resource_claims),
+    ...(legacyCheckout === undefined ? {} : { checkout_realpath: legacyCheckout }),
   };
 }
 
-function validateRegistry(value: unknown, paths: ControlPlanePaths): InstanceRegistry {
+function validateRegistry(value: unknown): InstanceRegistry {
   if (!isRecord(value)) throw new GwsEaError('invalid_registry', 'Machine registry is invalid');
   if (value.schema_version !== REGISTRY_SCHEMA_VERSION) {
     throw new GwsEaError('unsupported_registry', 'Machine registry schema version is unsupported');
@@ -262,7 +290,7 @@ function validateRegistry(value: unknown, paths: ControlPlanePaths): InstanceReg
   const instances: Record<string, InstanceReservation> = {};
   for (const [key, raw] of Object.entries(value.instances)) {
     assertInstanceId(key);
-    const parsed = validateReservation(raw, paths);
+    const parsed = validateReservation(raw);
     if (parsed.instance_id !== key) throw new GwsEaError('invalid_registry', 'Registry key and instance ID disagree');
     instances[key] = parsed;
   }
@@ -299,7 +327,7 @@ async function readRegistryFile(paths: ControlPlanePaths): Promise<InstanceRegis
   try {
     await assertPrivateStateFile(paths.registryFile);
     const raw = await readJson<unknown>(paths.registryFile);
-    return validateRegistry(raw, paths);
+    return validateRegistry(raw);
   } catch (error) {
     if (isErrno(error, 'ENOENT')) return emptyRegistry();
     if (error instanceof GwsEaError) throw error;
@@ -343,7 +371,8 @@ export async function readRegistry(paths: ControlPlanePaths): Promise<InstanceRe
 function claimKeys(instance: InstanceReservation): string[] {
   const claims = instance.exclusive_resource_claims;
   const keys = [
-    `checkout:${instance.checkout_realpath}`,
+    // Two assistants never share a root (KTD10).
+    `instance-root:${instanceRootName(instance.instance_id)}`,
     ...Object.values(instance.allocated_ports).map((port) => `port:${port}`),
     `endpoint:${ingressEndpointUrl(claims.ingress)}`,
     `gcp-project:${claims.gcp_project_id}`,
@@ -471,7 +500,7 @@ export async function withLockedCloudflareRegistry<T>(
           throw new GwsEaError('reservation_mismatch', 'Cloudflare tunnel coordinate changed; refusing replacement');
         }
         const tunnelId = update.tunnelId ?? cloudflare.tunnel_id;
-        if (tunnelId === null || !TUNNEL_ID_PATTERN.test(tunnelId)) {
+        if (tunnelId === null || !CLOUDFLARE_TUNNEL_ID_PATTERN.test(tunnelId)) {
           throw new GwsEaError('invalid_claim', 'Cloudflare tunnel ID is invalid');
         }
         const instances = { ...current.instances };
@@ -492,16 +521,13 @@ export async function withLockedCloudflareRegistry<T>(
             },
           };
         }
-        const next = validateRegistry(
-          {
-            schema_version: REGISTRY_SCHEMA_VERSION,
-            instances,
-            shared_infrastructure_metadata: {
-              cloudflare: { ...cloudflare, tunnel_id: tunnelId, tunnel_creation_started_at: null },
-            },
+        const next = validateRegistry({
+          schema_version: REGISTRY_SCHEMA_VERSION,
+          instances,
+          shared_infrastructure_metadata: {
+            cloudflare: { ...cloudflare, tunnel_id: tunnelId, tunnel_creation_started_at: null },
           },
-          paths,
-        );
+        });
         await writePrivate(paths.registryFile, next);
         current = next;
         return current;
@@ -512,15 +538,12 @@ export async function withLockedCloudflareRegistry<T>(
           throw new GwsEaError('cloudflare_state_missing', 'Shared Cloudflare ownership is not reserved');
         }
         if (cloudflare.tunnel_id !== null || cloudflare.tunnel_creation_started_at !== null) return current;
-        const next = validateRegistry(
-          {
-            ...current,
-            shared_infrastructure_metadata: {
-              cloudflare: { ...cloudflare, tunnel_creation_started_at: new Date().toISOString() },
-            },
+        const next = validateRegistry({
+          ...current,
+          shared_infrastructure_metadata: {
+            cloudflare: { ...cloudflare, tunnel_creation_started_at: new Date().toISOString() },
           },
-          paths,
-        );
+        });
         await writePrivate(paths.registryFile, next);
         current = next;
         return current;
@@ -530,15 +553,12 @@ export async function withLockedCloudflareRegistry<T>(
         if (!cloudflare || (cloudflare.tunnel_id === null && cloudflare.tunnel_creation_started_at === null)) {
           return current;
         }
-        const next = validateRegistry(
-          {
-            ...current,
-            shared_infrastructure_metadata: {
-              cloudflare: { ...cloudflare, tunnel_id: null, tunnel_creation_started_at: null },
-            },
+        const next = validateRegistry({
+          ...current,
+          shared_infrastructure_metadata: {
+            cloudflare: { ...cloudflare, tunnel_id: null, tunnel_creation_started_at: null },
           },
-          paths,
-        );
+        });
         await writePrivate(paths.registryFile, next);
         current = next;
         return current;
@@ -619,10 +639,10 @@ export async function swapInstanceRelease(
     if (!sameRelease(stored, expected)) {
       throw new GwsEaError('reservation_mismatch', "The assistant's recorded release changed; refusing to replace it");
     }
-    const moved = validateReservation({ ...stored, ...release }, paths);
+    const moved = validateReservation({ ...stored, ...release });
     await writePrivate(
       paths.registryFile,
-      validateRegistry({ ...registry, instances: { ...registry.instances, [instanceId]: moved } }, paths),
+      validateRegistry({ ...registry, instances: { ...registry.instances, [instanceId]: moved } }),
     );
     return moved;
   });
@@ -632,7 +652,7 @@ export async function releaseInstanceReservation(
   paths: ControlPlanePaths,
   expected: InstanceReservation,
 ): Promise<void> {
-  const validated = validateReservation(expected, paths);
+  const validated = validateReservation(expected);
   const release = await acquireMachineLock(paths);
   try {
     const registry = await readRegistryFile(paths);
@@ -658,6 +678,7 @@ export async function releaseInstanceReservation(
   }
 }
 
+/** Read the marker's instance, ignoring every other field: which release runs is the live link, not the marker. */
 function validateMarker(value: unknown): InstanceMarker {
   if (!isRecord(value)) throw new GwsEaError('invalid_marker', 'Instance marker is invalid');
   if (value.schema_version !== INSTANCE_MARKER_SCHEMA_VERSION) {
@@ -665,14 +686,10 @@ function validateMarker(value: unknown): InstanceMarker {
   }
   const instanceId = requireString(value.instance_id, 'marker instance_id', 36);
   assertInstanceId(instanceId);
-  const deployedCommit = requireString(value.deployed_commit, 'marker deployed_commit', 40).toLowerCase();
-  if (!COMMIT_PATTERN.test(deployedCommit)) {
-    throw new GwsEaError('invalid_marker', 'Instance marker deployed commit is invalid');
-  }
-  return { schema_version: INSTANCE_MARKER_SCHEMA_VERSION, instance_id: instanceId, deployed_commit: deployedCommit };
+  return { schema_version: INSTANCE_MARKER_SCHEMA_VERSION, instance_id: instanceId };
 }
 
-/** Read a checkout's instance marker; a missing file raises `marker_missing`. */
+/** Read an instance marker; a missing file raises `marker_missing`. */
 export async function readInstanceMarkerFile(file: string): Promise<InstanceMarker> {
   try {
     await assertPrivateStateFile(file);
@@ -685,57 +702,49 @@ export async function readInstanceMarkerFile(file: string): Promise<InstanceMark
 }
 
 /**
- * A checkout is a physical directory whose marker names `instanceId` and, unless
- * `commits` is null, one of `commits`.
+ * `stateRoot` is a physical directory whose marker, in a physical
+ * `data/gws-ea`, names `instanceId`. Nothing on the way is a link, so the
+ * check holds while the live link is absent.
  */
-export async function assertCheckoutMarker(
-  checkoutRoot: string,
-  instanceId: string,
-  commits: readonly string[] | null,
-): Promise<void> {
-  await assertOwnedDirectory(checkoutRoot);
-  const marker = await readInstanceMarkerFile(instanceMarkerFile(checkoutRoot));
-  if (marker.instance_id !== instanceId || (commits !== null && !commits.includes(marker.deployed_commit))) {
+export async function assertStateMarker(stateRoot: string, instanceId: string): Promise<void> {
+  await assertOwnedDirectory(stateRoot);
+  const file = instanceMarkerFile(stateRoot);
+  await assertOwnedDirectory(path.dirname(file));
+  const marker = await readInstanceMarkerFile(file);
+  if (marker.instance_id !== instanceId) {
     throw new GwsEaError('marker_mismatch', 'Instance marker mismatch; refusing mutation');
   }
 }
 
+/** The registry's reservation, once the assistant's own `state/` carries its marker. */
 export async function assertRegistryMarkerAgreement(
   paths: ControlPlanePaths,
   instanceId: string,
 ): Promise<InstanceReservation> {
   const reservation = await getInstanceReservation(paths, instanceId);
-  await assertCheckoutMarker(reservation.checkout_realpath, instanceId, [reservation.deployed_commit]);
+  await assertStateMarker(paths.instanceLayout(instanceId).state, instanceId);
   return reservation;
 }
 
 /**
- * A missing checkout without its marker is consistent: it was never
- * materialized, or is already removed. A present checkout must carry this
- * reservation's marker before anything touches it, at one of `commits`: the
- * registry's by default, plus the one an unfinished update or rollback placed
- * there (`liveCheckoutCommits`). Null checks the instance identity alone, for
- * removal when that operation cannot be read.
+ * A missing `state/` is consistent: create never made it, or removal already
+ * did away with it. A present one must carry this reservation's marker before
+ * anything touches it.
  */
-export async function assertCheckoutConsistent(
-  paths: ControlPlanePaths,
-  reservation: InstanceReservation,
-  commits: readonly string[] | null = [reservation.deployed_commit],
-): Promise<void> {
-  try {
-    await lstat(reservation.checkout_realpath);
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) return;
-    throw error;
-  }
-  await assertCheckoutMarker(paths.checkoutRoot(reservation.instance_id), reservation.instance_id, commits);
+export async function assertStateConsistent(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<void> {
+  const state = paths.instanceLayout(reservation.instance_id).state;
+  if (!(await pathExists(state))) return;
+  await assertStateMarker(state, reservation.instance_id);
 }
 
+/** Write the marker into the assistant's physical `state/`, creating it; one naming another assistant is refused. */
 export async function writeInstanceMarker(paths: ControlPlanePaths, instanceId: string): Promise<void> {
-  const reservation = await getInstanceReservation(paths, instanceId);
-  await assertOwnedDirectory(reservation.checkout_realpath);
+  await getInstanceReservation(paths, instanceId);
+  const file = paths.markerFile(instanceId);
+  await preparePrivateDirectory(path.dirname(file));
+  await assertOwnedDirectory(paths.instanceLayout(instanceId).state);
   try {
-    const existing = await readInstanceMarkerFile(paths.markerFile(instanceId));
+    const existing = await readInstanceMarkerFile(file);
     if (existing.instance_id !== instanceId) {
       throw new GwsEaError('marker_mismatch', 'Instance marker mismatch; refusing mutation');
     }
@@ -743,10 +752,8 @@ export async function writeInstanceMarker(paths: ControlPlanePaths, instanceId: 
   } catch (error) {
     if (!(error instanceof GwsEaError) || error.code !== 'marker_missing') throw error;
   }
-  await preparePrivateDirectory(path.dirname(paths.markerFile(instanceId)));
-  await writePrivate(paths.markerFile(instanceId), {
+  await writePrivate(file, {
     schema_version: INSTANCE_MARKER_SCHEMA_VERSION,
     instance_id: instanceId,
-    deployed_commit: reservation.deployed_commit,
   } satisfies InstanceMarker);
 }

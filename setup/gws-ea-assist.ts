@@ -66,8 +66,8 @@ const STEP_SOURCES: Readonly<Record<string, readonly string[]>> = {
   provision: ['src/gws-ea/provision.ts', 'src/gws-ea/phases.ts', 'src/gws-ea/journal.ts'],
   materialize_checkout: ['src/gws-ea/checkout.ts', 'src/gws-ea/release-preflight.ts', 'src/gws-ea/pins.ts'],
   provision_gcp: ['src/gws-ea/gcloud.ts'],
-  start_onecli: ['src/gws-ea/onecli.ts', 'src/gws-ea/onecli-compose.ts'],
-  configure_provider: ['src/gws-ea/onecli.ts'],
+  start_onecli: ['src/gws-ea/onecli.ts', 'src/gws-ea/onecli-compose.ts', 'src/gws-ea/onecli-admin.ts'],
+  configure_provider: ['src/gws-ea/onecli.ts', 'src/gws-ea/onecli-admin.ts'],
   start_nanoclaw: ['src/gws-ea/service.ts'],
   establish_transport: [
     'src/gws-ea/cloudflare-ingress.ts',

@@ -18,8 +18,6 @@ import type { ProviderCredentialMetadata } from '../provider-credential.js';
 
 /** The tool's own provider setup, which the driver reads from `setup/providers`. */
 export interface ToolProviderSetup {
-  /** `providerProvisioningCapabilityDigest` of the tool's checkout. */
-  readonly capabilityDigest: string;
   /** The credential metadata the tool's setup declares for `provider`, or undefined when it does not compose it. */
   readonly credentialMetadata: (provider: string) => ProviderCredentialMetadata | undefined;
 }
@@ -47,11 +45,7 @@ export interface ReleaseTarget {
 }
 
 export interface UpdateReleaseTarget extends ReleaseTarget {
-  /**
-   * The staged release preflight's input, less its checkout: the assistant's
-   * provider, credential, and OneCLI CLI, with the tool's provider setup
-   * digest, which the promoted receipt records and nothing compares (KTD20).
-   */
+  /** The staged release preflight's input, less its checkout: the assistant's provider and credential (KTD20). */
   readonly preflight: Omit<ReleasePreflightInput, 'checkoutRoot'>;
 }
 
@@ -72,16 +66,11 @@ async function keptSetup({
 }: UpdatedAssistant): Promise<UpdateReleaseTarget['preflight']> {
   const deployed = await readDeployedSetup(paths, reservation);
   assertUpdateKeepsSetup(deployed, {
-    onecli: { gateway: LAUNCHER_PINS.onecliGateway, cli: LAUNCHER_PINS.onecliCli, sdk: ONECLI_SDK_VERSION },
+    onecli: { gateway: LAUNCHER_PINS.onecliGateway, sdk: ONECLI_SDK_VERSION },
     postgresImage: ONECLI_POSTGRES_IMAGE,
     providerCredential: providerSetup.credentialMetadata(deployed.provider),
   });
-  return {
-    provider: deployed.provider,
-    providerCapabilityDigest: providerSetup.capabilityDigest,
-    providerCredential: deployed.providerCredential,
-    onecliCliPath: deployed.onecliCliPath,
-  };
+  return { provider: deployed.provider, providerCredential: deployed.providerCredential };
 }
 
 function assertMovesForward(

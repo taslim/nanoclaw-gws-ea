@@ -26,7 +26,6 @@ import type { HostStatusHelpers } from '../src/gws-ea/service.js';
 import type { NanoclawServiceHelpers } from '../src/gws-ea/service-control.js';
 import type { ToolCheckout } from '../src/gws-ea/stray-install.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
-import { providerProvisioningCapabilityDigest } from '../src/provider-provisioning-capability.js';
 import { offerDiagnosis } from './gws-ea-assist.js';
 import { authenticateGwsEaProvider, CLOUDFLARE_API_TOKEN_GUIDANCE, collectGwsEaCreateInput } from './gws-ea-input.js';
 import { attendPause } from './gws-ea-pause.js';
@@ -228,12 +227,10 @@ function retryOffer(command: FailureReport['command']): string {
 
 /**
  * This tool's provider setup, which an update holds the assistant's to: the
- * provisioning capability digest of the checkout it runs from, and the
  * credential metadata each composed provider declares, as create reads them.
  */
 function toolProviderSetup(providers: readonly SetupProviderEntry[]): () => Promise<ToolProviderSetup> {
   return async () => ({
-    capabilityDigest: await providerProvisioningCapabilityDigest(process.cwd()),
     credentialMetadata: (id) =>
       providers
         .find((provider) => provider.value === id)

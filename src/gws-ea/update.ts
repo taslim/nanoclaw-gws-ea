@@ -1,139 +1,121 @@
 /**
- * `update` (R7-R12, R14, R15). Every refusal comes before anything changes.
- * Then, while the assistant keeps serving, the tool's own release is staged
- * beside the live checkout (KTD1): fetched, installed, built, and preflighted
- * in `<instance>/next/nanoclaw` with its receipt under `next/`, its
- * migrations tried on a copy of the live central database (KTD15), its agent
- * image tagged `<base>:next` (KTD7) — the image another assistant already
- * built from the same content when there is one, else built and labeled with
- * its content key (see `agent-image.ts`) — and its gateway image built when
- * the release changes it (KTD8). The preview then says what the cutover will
- * change.
+ * `update` (R1, R2, R10, R11). Every refusal comes before anything changes.
+ * Then, while the assistant serves, the tool's own release is staged in its
+ * own folder as every release is (`stageRelease`, KTD3): materialized,
+ * installed, built and preflighted, its agent image tagged `<base>:r-<hex8>`
+ * (KTD6), its migrations tried on a copy of the live central database in a
+ * scratch `data/` the release holds before its links to the assistant's state
+ * are made, and the files it runs with kept, its receipt last. Staging writes
+ * nothing into `state/`. The gateway image the release names is built when it
+ * differs from the one the assistant runs, and the preview says what the
+ * switch will change.
  *
  * Nothing live changes before the operator confirms. A decline or a staging
- * failure writes no record and removes `next/` and the `:next` image; a
- * staging cut short (Ctrl-C, a kill) leaves them for the next update to remove
- * (KTD2). Confirming records the update at `staged`, and its cutover follows:
- * the host is stopped and its checkout proven quiet, its state carried into
- * the staged checkout, the two swapped, images retagged and the gateway
- * recreated when it changed, and the host started and verified on the
- * release, which is then recorded. Each phase is recorded as it completes, so
- * an update cut short anywhere is continued by the next `update --id`; one
- * that fails before it is recorded is handed to recovery.
+ * failure writes no record, and the staged release is left for the next
+ * update, which reuses it complete or stages it again. Confirming records the
+ * update at `staged`; the serving OneCLI runtime is re-verified (KTD15), and
+ * only then is the assistant offline: fenced, snapshotted, switched to the
+ * release, and started. Main's shared skills are reconciled (KTD16), the
+ * release verified and committed through the registry, and its follow-ups
+ * run. Each phase is recorded as it completes, so an update cut short
+ * anywhere is continued by the next `update --id`; one that fails before it
+ * is committed is handed to recovery.
+ *
+ * An assistant still on the layout before releases is converted by its first
+ * update, one way and with no rollback target (`release-convert.ts`, KTD12).
  */
-import { constants as fsConstants } from 'node:fs';
-import { chmod, copyFile, lstat, mkdir, readdir, readFile, realpath, statfs } from 'node:fs/promises';
+import { lstat, mkdir, readdir, readFile, realpath, rm, statfs } from 'node:fs/promises';
 import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
 import { writePrivate } from '../community-portal/private-file.js';
 import { getInstallScopedNames } from '../install-slug.js';
-import {
-  agentImageKey,
-  findSharedAgentImage,
-  provideSharedAgentImage,
-  readAgentImageInputs,
-  type AgentImageInputs,
-} from './agent-image.js';
+import { readInstallCjkFonts, releaseImageKey, releaseImageTag } from './agent-image-release.js';
+import { findSharedAgentImage } from './agent-image.js';
 import {
   assertDeploymentCheckoutUnmodified,
-  materializeReleaseCheckout,
+  committedTree,
   prepareReleaseCommandEnvironments,
   resolveToolCommit,
-  workingTreeChanges,
   type CheckoutRuntime,
 } from './checkout.js';
 import {
-  assertCarriable,
-  assertCheckoutQuiet,
   assistantImageDocker,
-  BUILDING_AGENT_IMAGE_TAG,
-  buildingAgentImage,
-  carryState,
-  cutoverDocker,
   cutoverOnecli,
-  cutoverQuiescence,
-  cutoverServiceDependencies,
   dockerEnvironment,
+  fenceInstance,
   finishFollowUps,
-  finishSwap,
-  imageIdOf,
-  moveRecordedImages,
-  keepCutoverHostStopped,
-  nextAgentImage,
   openCutoverHost,
-  planFollowUps,
-  quietCheckoutOf,
-  removeUpdateStaging,
-  reverseSwapBeforeLiveMoved,
-  settleCheckoutDatabases,
-  stopCutoverHost,
+  reconcileMainSkills,
+  releaseFollowUps,
+  serveLeftRelease,
+  startRelease,
+  switchTo,
   verifyServingRelease,
   type CutoverDependencies,
   type CutoverHost,
   type CutoverSeams,
-  type SwapReleases,
 } from './cutover.js';
-import { keepReleaseFiles, keptReleaseFiles, stagedKeptFilesRoot } from './kept-release.js';
 import { runStep } from './events.js';
 import { loadCreatedRuntime, type InstanceOperation } from './journal.js';
-import {
-  decideMainTemplate,
-  describeCustomized,
-  mainTemplateRoot,
-  type MainTemplateDecision,
-} from './main-template.js';
 import { prepareReleaseGatewayImage, type GatewayImageChange } from './onecli.js';
-import { parseOnecliComposeImages, type OnecliPins } from './onecli-compose.js';
-import { resolveWrapperGatewayImage } from './onecli-gateway-image.js';
+import type { OnecliRuntimeLayout } from './onecli-compose.js';
 import {
   advanceOperation,
   assertNotCommitted,
   beginOperation,
+  closeOperationFailed,
   commitOperationRelease,
+  discardOperation,
   operationNextSteps,
+  planFollowUps,
   readOperationRecord,
   recordOperationFacts,
   reservationAt,
   revertClause,
-  targetReservationView,
-  type MovedImage,
-  type OperationFollowUp,
+  supersedable,
+  targetMayHaveStarted,
   type OperationRecord,
   type SnapshotManifest,
 } from './operation.js';
-import { CONTROL_PLANE_ROOT, instanceMarkerFile, isRegularFile, type ControlPlanePaths } from './paths.js';
+import { CONTROL_PLANE_ROOT, type ControlPlanePaths } from './paths.js';
 import { LAUNCHER_PINS } from './pins.js';
 import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
-import { instanceOnecliLayout, readDeployedSetup, writeReleasePreflightReceipt } from './provision.js';
-import { redact, safeErrorMessage } from './redact.js';
+import { instanceOnecliLayout, readDeployedSetup } from './provision.js';
+import { safeErrorMessage } from './redact.js';
 import { getInstanceReservation } from './registry.js';
-import { runReleasePreflight } from './release-preflight.js';
+import { continueConversion, finishConversion, prepareConversion, type ConversionSeams } from './release-convert.js';
+import {
+  exists,
+  fenceEnded,
+  isReleaseComplete,
+  operationName,
+  readCurrent,
+  releaseName,
+  STATE_ROOTS,
+  takeSnapshot,
+} from './release-layout.js';
+import type { ReleasePreflightRuntime } from './release-preflight.js';
+import { stageRelease } from './release-stage.js';
 import { resolveReleaseTarget, type ToolProviderSetup, type UpdateReleaseTarget } from './release-target.js';
 import { resolveReleaseSource, type ReleaseSource } from './release-tracks.js';
 import { describeRollback, localTimezone, revertUpdate } from './rollback.js';
-import { readOwnerOnlyFile } from './secrets.js';
-import {
-  createInstanceRuntimeConfig,
-  instanceServiceDefinitionFile,
-  readInstanceHostEnvironment,
-  stampUpgradeState,
-  writeInstanceServiceDefinition,
-  writeReleaseRuntime,
-  type InstanceRuntimeConfig,
-} from './service.js';
+import { readOwnerOnlyJson } from './secrets.js';
+import type { InstanceRuntimeConfig } from './service.js';
 import { createServiceControl, runtimeServiceTarget } from './service-control.js';
+import { instanceServicePlatform } from './service-coordinates.js';
+import type { ServiceState } from './status.js';
 import {
   GwsEaError,
-  INSTANCE_MARKER_SCHEMA_VERSION,
+  releaseLine,
   releaseOf,
   sameRelease,
   shortCommit,
   type GwsEaErrorDetails,
-  type InstanceMarker,
   type InstanceReservation,
   type ReleaseCoordinates,
 } from './types.js';
+import { isRecord } from './validation.js';
 import {
   backupCentralDatabase,
   printableName,
@@ -157,8 +139,9 @@ const SESSION_SCHEMA_SOURCES = [
 /** What the upstream updater keeps free beyond what it copies (`scripts/update/transaction.ts`). */
 const DISK_RESERVE_BYTES = 256 * 1024 * 1024;
 const MIGRATION_TIMEOUT_MS = 5 * 60_000;
-const IMAGE_BUILD_TIMEOUT_MS = 20 * 60_000;
 const DOCKER_TIMEOUT_MS = 60_000;
+/** What a staged release keeps of its migration dry run, beside its receipt. */
+const DRY_RUN_FILE = 'migration-dry-run.json';
 
 export interface UpdateRequest {
   readonly instanceId: string;
@@ -175,10 +158,11 @@ export interface UpdateRequest {
 }
 
 /** Boundary seams; each defaults to the real one. */
-export interface UpdateSeams extends CutoverSeams {
+export interface UpdateSeams extends CutoverSeams, ConversionSeams {
   /** The tool's checkout, whose commit an update deploys; the one this control plane runs from by default. */
   readonly toolRoot?: string;
-  readonly runReleasePreflight?: typeof runReleasePreflight;
+  /** Runs the staged release's frozen install and its build. */
+  readonly runSetupCommand?: ReleasePreflightRuntime['runSetupCommand'];
   /** Bytes free to this user on the filesystem holding `directory`. */
   readonly freeBytes?: (directory: string) => Promise<number>;
 }
@@ -199,7 +183,7 @@ export interface UpdateIntent {
   readonly target: ReleaseCoordinates;
 }
 
-/** What the operator confirms (R8). */
+/** What the operator confirms. */
 export interface UpdatePreview {
   readonly instanceId: string;
   readonly from: ReleaseCoordinates;
@@ -207,37 +191,41 @@ export interface UpdatePreview {
   /** The central migrations the release adds, in the order they ran on the copy. */
   readonly migrations: readonly string[];
   readonly gateway: GatewayImageChange;
-  /** The groups whose own image is rebuilt on the new base once the update is recorded (KTD7). */
+  /** The groups whose own image is rebuilt on the new release's image once it is committed (KTD6). */
   readonly groupImages: readonly DerivedImageGroup[];
   /** Those groups then run the previous agent-runner dependencies until their rebuild finishes. */
   readonly agentRunnerLockChanged: boolean;
   /** The session-schema sources differ, so session columns may change once the new host opens each session. */
   readonly sessionSchemaChanged: boolean;
-  /**
-   * What happens to main's template (R11, KTD12): refreshed once the update
-   * is recorded, unchanged, kept because these files are customized, or not
-   * stamped. Decided here and again right before any restamp.
-   */
-  readonly mainTemplate: MainTemplateDecision;
+  /** The update converts an assistant on the layout before releases (KTD12): the root it leaves, and its short root. */
+  readonly conversion?: { readonly from: string; readonly to: string };
 }
 
 /** A release staged and previewed, not yet recorded. */
 export interface StagedUpdate {
   readonly from: ReleaseCoordinates;
   readonly to: ReleaseCoordinates;
-  /** `<instance>/next/nanoclaw`: installed, built, preflighted, and holding the dry run's database. */
-  readonly checkoutRoot: string;
-  /** The assistant's runtime record: its service, install, and Docker endpoint. */
-  readonly runtime: InstanceRuntimeConfig;
   /** The live schema as staging read it; the dry run left its migrations as they were. */
   readonly manifest: SnapshotManifest;
   readonly preview: UpdatePreview;
 }
 
-interface CheckedUpdate {
+/** Where the release an update leaves runs from, which staging reads and never writes. */
+interface RunningRelease {
+  /** The directory holding its `data/`, whose central database the dry run copies. */
+  readonly state: string;
+  /** Its folder, which the staged release is compared with. */
+  readonly release: string;
+  /** Its OneCLI project, whose Compose file names the gateway it runs. */
+  readonly onecli: OnecliRuntimeLayout;
+}
+
+export interface CheckedUpdate {
   readonly reservation: InstanceReservation;
+  /** The assistant's runtime, which the staged release's kept files are rendered for. */
   readonly runtime: InstanceRuntimeConfig;
   readonly target: UpdateReleaseTarget;
+  readonly serving: RunningRelease;
 }
 
 function checkoutRuntime(seams: UpdateSeams): CheckoutRuntime {
@@ -277,56 +265,31 @@ export async function resolveUpdateIntent(
   };
 }
 
-async function exists(target: string): Promise<boolean> {
-  try {
-    await lstat(target);
-    return true;
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) return false;
-    throw error;
-  }
-}
-
 /**
- * Remove an update's staging: the `:next` image, then `next/`. The image goes
- * first, so a staging whose image could not be removed is still found as
- * abandoned. The staging of an unfinished update is that update's own, so it
- * is never removed here.
+ * Why an assistant's service keeps an update from it, naming what fixes it:
+ * an update proves its new release on a running host, and stops that host
+ * for the switch through its service. `update --id` and `update --all` give
+ * the same reason; `reason` is what was observed of an unmanaged host or an
+ * unobservable service.
  */
-export async function discardUpdateStaging(
-  operation: InstanceOperation,
-  runtime: InstanceRuntimeConfig,
-  seams: UpdateSeams = {},
-): Promise<void> {
-  operation.assertActive();
-  const { paths, instanceId } = operation;
-  const record = await readOperationRecord(paths, instanceId);
-  if (record && record.phase !== 'recorded') {
-    throw new GwsEaError(
-      'staging_in_use',
-      `The staged release belongs to this assistant's unfinished ${record.kind}; continue or revert it instead.`,
-    );
-  }
-  await removeUpdateStaging(paths, instanceId, runtime, seams);
-}
-
-/** Remove what a failed staging left, keeping the failure: what cannot be removed is left for the next update. */
-async function discardAfterFailure(
-  operation: InstanceOperation,
-  runtime: InstanceRuntimeConfig,
-  dependencies: UpdateDependencies,
-): Promise<void> {
-  try {
-    await runStep(dependencies.reporter ?? {}, { id: 'discard_staging' }, () =>
-      discardUpdateStaging(operation, runtime, dependencies),
-    );
-    // eslint-disable-next-line no-catch-all/no-catch-all -- The staging failure is what the operator must see; its step log records this one, and the next update removes what is left.
-  } catch {
-    return;
+export function serviceRefusal(
+  instanceId: string,
+  state: Exclude<ServiceState, 'running'>,
+  reason: string | null,
+): string {
+  switch (state) {
+    case 'stopped':
+      return `It is stopped, and an update proves its new release on a running assistant; start it with gws-ea start --id ${instanceId}, then update it.`;
+    case 'not_installed':
+      return `No NanoClaw service is installed for it; gws-ea resume --id ${instanceId} installs it.`;
+    case 'unmanaged':
+      return `${reason ?? 'Its host runs outside its service.'} Stop that process and start it with gws-ea start --id ${instanceId}, then update it.`;
+    case 'unknown':
+      return `Its service could not be observed: ${reason ?? 'unknown'}`;
   }
 }
 
-/** A stopped assistant cannot prove its new release serves; one outside its service cannot be stopped for the cutover. */
+/** The assistant's service must run its host; `serviceRefusal` says why it does not. */
 function assertHostRunning(runtime: InstanceRuntimeConfig, dependencies: UpdateDependencies): void {
   const id = runtime.instance_id;
   const handle = createServiceControl(
@@ -334,23 +297,28 @@ function assertHostRunning(runtime: InstanceRuntimeConfig, dependencies: UpdateD
     runtimeServiceTarget(runtime),
     dependencies.service,
   ).detect();
+  const refused = (code: string, state: Exclude<ServiceState, 'running'>, reason: string | null = null) =>
+    new GwsEaError(code, `Assistant ${id} cannot be updated. ${serviceRefusal(id, state, reason)}`);
+  if (handle.mode === 'none') throw refused('service_not_installed', 'not_installed');
   if (handle.mode === 'unmanaged') {
-    throw new GwsEaError(
+    throw refused(
       'service_unmanaged',
-      `Assistant ${id}'s host runs from ${runtime.checkout_realpath} outside its service (PID ${handle.name}); stop that process and start the assistant with gws-ea start --id ${id}, then update.`,
+      'unmanaged',
+      `A NanoClaw host runs from ${runtime.checkout_root} outside its service (PID ${handle.pid ?? handle.name ?? 'unknown'}).`,
     );
   }
-  if (!handle.active) {
-    throw new GwsEaError(
-      'host_not_running',
-      `Assistant ${id} is stopped, and an update proves its new release on a running assistant. Start it with gws-ea start --id ${id}, then update.`,
-    );
-  }
+  if (!handle.active) throw refused('host_not_running', 'stopped');
 }
 
 /** Every byte under `root`, each file counted once however many links it has; links are not followed. */
 async function treeBytes(root: string, seen = new Set<string>()): Promise<number> {
-  const info = await lstat(root);
+  let info;
+  try {
+    info = await lstat(root);
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) return 0;
+    throw error;
+  }
   if (info.isFile()) {
     const inode = `${info.dev}:${info.ino}`;
     if (info.nlink > 1 && seen.has(inode)) return 0;
@@ -362,15 +330,6 @@ async function treeBytes(root: string, seen = new Set<string>()): Promise<number
   return sizes.reduce((total, size) => total + size, 0);
 }
 
-async function fileBytes(file: string): Promise<number> {
-  try {
-    return (await lstat(file)).size;
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) return 0;
-    throw error;
-  }
-}
-
 async function freeBytesAt(directory: string): Promise<number> {
   const disk = await statfs(directory);
   return Number(disk.bavail) * Number(disk.bsize);
@@ -380,12 +339,13 @@ function gigabytes(bytes: number): string {
   return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 }
 
-/** The size Docker reports for the agent image the assistant runs. */
+/** The size Docker reports for the agent image the assistant runs, its release's own tag. */
 async function agentImageBytes(
-  paths: ControlPlanePaths,
   runtime: InstanceRuntimeConfig,
+  reservation: InstanceReservation,
   dependencies: UpdateDependencies,
 ): Promise<number> {
+  const base = getInstallScopedNames(runtime.install_id).containerImageBase;
   const { stdout } = await (dependencies.runCommand ?? runSanitizedCommand)({
     command: 'docker',
     args: [
@@ -393,9 +353,9 @@ async function agentImageBytes(
       'inspect',
       '--format',
       '{{.Size}}',
-      getInstallScopedNames(runtime.install_id).defaultContainerImage,
+      releaseImageTag(base, releaseName(reservation.deployed_commit)),
     ],
-    cwd: paths.instanceRoot(runtime.instance_id),
+    cwd: runtime.instance_root,
     env: dockerEnvironment(runtime, dependencies),
     timeoutMs: DOCKER_TIMEOUT_MS,
   });
@@ -410,70 +370,76 @@ async function agentImageBytes(
  * Whether the agent image the release would build for this assistant is
  * already built and shared under its content key, read before anything is
  * staged: from the tool's checkout, which is the release (R6), and the
- * assistant's own `.env` flags, which staging copies to the build.
+ * assistant's own `INSTALL_CJK_FONTS`, which its build is given.
  */
 async function releaseAgentImageShared(
-  paths: ControlPlanePaths,
   runtime: InstanceRuntimeConfig,
   target: UpdateReleaseTarget,
   dependencies: UpdateDependencies,
 ): Promise<boolean> {
-  const inputs = await readAgentImageInputs(
-    {
-      repository: dependencies.toolRoot ?? CONTROL_PLANE_ROOT,
-      commit: target.release.deployed_commit,
-      checkout: runtime.checkout_realpath,
-    },
-    checkoutRuntime(dependencies),
-  );
-  const docker = assistantImageDocker(runtime, dependencies, paths.instanceRoot(runtime.instance_id));
-  return (await findSharedAgentImage(docker, agentImageKey(inputs))) !== undefined;
+  const key = releaseImageKey({
+    contextTree: await committedTree(
+      dependencies.toolRoot ?? CONTROL_PLANE_ROOT,
+      target.release.deployed_commit,
+      'container',
+      checkoutRuntime(dependencies),
+    ),
+    installCjkFonts: readInstallCjkFonts(runtime.state_root),
+  });
+  return (await findSharedAgentImage(assistantImageDocker(runtime, dependencies), key)) !== undefined;
 }
 
 /**
  * Room for what the update adds before it can delete anything, mirroring the
- * upstream updater's check (KTD14). The live checkout's size stands for the
- * staged release's code, dependencies, and build together with the copy of
- * its state the cutover carries across; its central database's size for the
- * dry run's copy; its agent image's size for the new one, unless the release's
- * image is already shared under its content key, which staging then tags
- * without building. The live checkout is kept whole as the previous release,
- * so it frees nothing. Counted against the instance's filesystem, which also
- * holds Docker's disk where Docker runs in a local VM.
+ * upstream updater's check (KTD14), measured on the filesystem holding the
+ * physical `state/`: the snapshot of `state/` the switch takes; the staged
+ * release's install and build, for which the live release's folder stands,
+ * unless it is staged already; the dry run's copy of the central database;
+ * and a new agent image, unless the release's is already shared under its
+ * content key. Where Docker runs in a local VM, its disk is on the same
+ * filesystem.
  */
 async function assertFreeDisk(
   paths: ControlPlanePaths,
-  runtime: InstanceRuntimeConfig,
-  target: UpdateReleaseTarget,
+  { reservation, runtime, target }: CheckedUpdate,
   dependencies: UpdateDependencies,
 ): Promise<void> {
-  const database = path.join(runtime.checkout_realpath, 'data', 'v2.db');
-  const shared = await releaseAgentImageShared(paths, runtime, target, dependencies);
-  const [checkout, central, journal, image] = await Promise.all([
-    treeBytes(runtime.checkout_realpath),
-    fileBytes(database),
-    fileBytes(`${database}-wal`),
-    shared ? 0 : agentImageBytes(paths, runtime, dependencies),
+  const layout = paths.instanceLayout(runtime.instance_id);
+  const staged = await isReleaseComplete(layout, releaseName(target.release.deployed_commit));
+  const shared = await releaseAgentImageShared(runtime, target, dependencies);
+  const database = path.join(layout.state, 'data', 'v2.db');
+  const [state, release, central, journal, image] = await Promise.all([
+    treeBytes(layout.state),
+    staged ? 0 : treeBytes(layout.release(releaseName(reservation.deployed_commit))),
+    treeBytes(database),
+    treeBytes(`${database}-wal`),
+    shared ? 0 : agentImageBytes(runtime, reservation, dependencies),
   ]);
-  const needed = checkout + central + journal + image + DISK_RESERVE_BYTES;
-  const directory = paths.instanceRoot(runtime.instance_id);
-  const free = await (dependencies.freeBytes ?? freeBytesAt)(directory);
+  const needed = state + release + central + journal + image + DISK_RESERVE_BYTES;
+  const free = await (dependencies.freeBytes ?? freeBytesAt)(layout.state);
   if (free >= needed) return;
   const adds = shared
-    ? "the staged release and a copy of its state (the release's agent image is already built)"
-    : 'the staged release, a copy of its state, and a new agent image';
+    ? "the staged release and a snapshot of its state (the release's agent image is already built)"
+    : 'the staged release, a snapshot of its state, and a new agent image';
   throw new GwsEaError(
     'insufficient_disk',
-    `Updating assistant ${runtime.instance_id} needs about ${gigabytes(needed)} free for ${adds}, and ${gigabytes(free)} is free at ${directory}. Free some space, then retry.`,
+    `Updating assistant ${runtime.instance_id} needs about ${gigabytes(needed)} free for ${adds}, and ${gigabytes(free)} is free at ${layout.state}. Free some space, then retry.`,
     { details: { needed, free, agentImageShared: shared } },
   );
 }
 
 /**
- * Every refusal an update makes before it changes anything (R9), under the
- * instance lock. Abandoned staging is removed first, after the gate: nothing
- * else can own it once no update is unfinished.
+ * Whether this update supersedes an operation with no release to return to
+ * (KTD9, `supersedable`): one closed for fix-forward, or an update with no
+ * rollback target, to another release. Such an assistant may be fenced, so
+ * its host is not required to serve, and the release it ran is not checked.
  */
+async function supersedes(paths: ControlPlanePaths, instanceId: string, target: ReleaseCoordinates): Promise<boolean> {
+  const record = await readOperationRecord(paths, instanceId);
+  return record !== undefined && supersedable(record, target);
+}
+
+/** Every refusal an update makes before it changes anything, under the instance lock. */
 async function checkUpdate(
   operation: InstanceOperation,
   intent: UpdateIntent,
@@ -481,9 +447,6 @@ async function checkUpdate(
 ): Promise<CheckedUpdate> {
   const { paths, instanceId } = operation;
   const runtime = await loadCreatedRuntime(paths, instanceId);
-  if (await exists(paths.releaseRoot(instanceId, 'next'))) {
-    await discardUpdateStaging(operation, runtime, dependencies);
-  }
   const reservation = await getInstanceReservation(paths, instanceId);
   const target = await resolveReleaseTarget(
     {
@@ -499,17 +462,32 @@ async function checkUpdate(
       `gws-ea moved from ${shortCommit(intent.target.deployed_commit)} to ${shortCommit(target.release.deployed_commit)} while this update started; retry it.`,
     );
   }
-  assertHostRunning(runtime, dependencies);
-  await assertDeploymentCheckoutUnmodified(reservation, checkoutRuntime(dependencies));
-  await assertFreeDisk(paths, runtime, target, dependencies);
-  return { reservation, runtime, target };
+  if (!(await supersedes(paths, instanceId, target.release))) {
+    assertHostRunning(runtime, dependencies);
+    await assertDeploymentCheckoutUnmodified(paths, reservation, checkoutRuntime(dependencies));
+  }
+  const layout = paths.instanceLayout(instanceId);
+  const checked: CheckedUpdate = {
+    reservation,
+    runtime,
+    target,
+    serving: {
+      state: layout.state,
+      release: layout.release(releaseName(reservation.deployed_commit)),
+      onecli: instanceOnecliLayout(paths, reservation, runtime.docker_endpoint),
+    },
+  };
+  await assertFreeDisk(paths, checked, dependencies);
+  return checked;
 }
 
 export interface MigrationDryRun {
-  readonly liveCheckout: string;
+  /** The assistant's physical `state/`, whose central database is copied. */
+  readonly liveState: string;
   /** The live migrations as staging recorded them; the dry run must leave them so. */
   readonly liveMigrations: readonly string[];
-  readonly stagedCheckout: string;
+  /** The staged release's folder, before its links to the assistant's state are made. */
+  readonly stagedRelease: string;
 }
 
 function sameList(left: readonly string[], right: readonly string[]): boolean {
@@ -517,28 +495,28 @@ function sameList(left: readonly string[], right: readonly string[]): boolean {
 }
 
 /**
- * Where the dry run may put its copy: the staged checkout's own `data/`, as a
+ * Where the dry run may put its copy: the staged release's own `data/`, as a
  * physical directory. What the migration script resolves from its working
  * directory (NanoClaw's `src/config.ts`: `data/v2.db` under it), links
  * followed, must be exactly there, and hold no database yet. Nothing is
  * written before that holds.
  */
-async function dryRunDatabase(workingDirectory: string, stagedCheckout: string): Promise<string> {
-  const expected = path.join(await realpath(path.dirname(stagedCheckout)), path.basename(stagedCheckout), 'data');
+async function dryRunDatabase(workingDirectory: string, stagedRelease: string): Promise<string> {
+  const expected = path.join(await realpath(path.dirname(stagedRelease)), path.basename(stagedRelease), 'data');
   const data = path.join(workingDirectory, 'data');
   const present = await exists(data);
   const database = path.join(present ? await realpath(data) : data, 'v2.db');
   if (path.dirname(database) !== expected) {
     throw new GwsEaError(
       'unsafe_dry_run',
-      `The release's migrations would run against ${database}, outside the staged checkout's ${expected}; nothing was run.`,
+      `The release's migrations would run against ${database}, outside the staged release's ${expected}; nothing was run.`,
     );
   }
   if (!present) await mkdir(data, { mode: 0o700 });
   if (await exists(database)) {
     throw new GwsEaError(
       'unsafe_dry_run',
-      `The staged checkout already holds a database at ${database}; the dry run copies the live one there itself, so nothing was run.`,
+      `The staged release already holds a database at ${database}; the dry run copies the live one there itself, so nothing was run.`,
     );
   }
   return database;
@@ -546,19 +524,25 @@ async function dryRunDatabase(workingDirectory: string, stagedCheckout: string):
 
 /**
  * Try a release's own migrations on a copy of the live central database
- * (KTD15): a single-step online backup into the staged checkout's `data/`,
- * then the release's migration script, run from the staged checkout's real
+ * (KTD15): a single-step online backup into the staged release's scratch
+ * `data/`, then the release's migration script, run from the release's real
  * path. The live migrations must be as staging recorded them afterwards.
- * Returns the migrations the release adds, in the order they ran.
+ * Whatever the run made where the release's links go is then removed, so the
+ * release holds none of it (KTD3). Returns the migrations the release adds,
+ * in the order they ran.
  */
 export async function dryRunReleaseMigrations(
   request: MigrationDryRun,
   run: SanitizedCommandRunner,
   environment: Readonly<Record<string, string>>,
 ): Promise<readonly string[]> {
-  const workingDirectory = await realpath(request.stagedCheckout);
-  const database = await dryRunDatabase(workingDirectory, request.stagedCheckout);
-  await backupCentralDatabase(request.liveCheckout, database);
+  const workingDirectory = await realpath(request.stagedRelease);
+  const scratch = [];
+  for (const root of [...STATE_ROOTS, 'logs']) {
+    if (!(await exists(path.join(workingDirectory, root)))) scratch.push(path.join(workingDirectory, root));
+  }
+  const database = await dryRunDatabase(workingDirectory, request.stagedRelease);
+  await backupCentralDatabase(request.liveState, database);
   let failure: GwsEaError | undefined;
   try {
     await run({
@@ -573,7 +557,9 @@ export async function dryRunReleaseMigrations(
     if (!(error instanceof GwsEaError)) throw error;
     failure = error;
   }
-  const live = readCentralMigrations(request.liveCheckout);
+  const live = readCentralMigrations(request.liveState);
+  const added = readCentralMigrations(workingDirectory).filter((name) => !request.liveMigrations.includes(name));
+  for (const made of scratch) await rm(made, { recursive: true, force: true });
   if (!sameList(live, request.liveMigrations)) {
     throw new GwsEaError(
       'live_schema_changed',
@@ -581,7 +567,6 @@ export async function dryRunReleaseMigrations(
       { ...(failure ? { cause: failure } : {}), details: { staged: request.liveMigrations, live } },
     );
   }
-  const added = readCentralMigrations(workingDirectory).filter((name) => !request.liveMigrations.includes(name));
   if (!failure) return added;
   const applied = added.length > 0 ? `after applying ${added.join(', ')}` : 'before applying any';
   throw new GwsEaError(
@@ -591,23 +576,38 @@ export async function dryRunReleaseMigrations(
   );
 }
 
-/** Copy the instance's `.env` into the staged checkout, owner permissions kept: the image build reads its flags. */
-async function copyInstanceEnvironment(liveCheckout: string, stagedCheckout: string): Promise<void> {
-  const source = path.join(liveCheckout, '.env');
-  let mode: number;
-  try {
-    const info = await lstat(source);
-    if (!info.isFile()) {
-      throw new GwsEaError('unsafe_runtime', `The assistant's environment file ${source} is not a regular file`);
-    }
-    mode = info.mode & 0o777;
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) return;
-    throw error;
+/** What a staged release keeps of its dry run: the live migrations it was tried against, and those it added. */
+interface KeptDryRun {
+  readonly live: readonly string[];
+  readonly added: readonly string[];
+}
+
+function dryRunFile(paths: ControlPlanePaths, instanceId: string, release: string): string {
+  return path.join(paths.instanceLayout(instanceId).kept(release), DRY_RUN_FILE);
+}
+
+function stringList(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'string');
+}
+
+/**
+ * The dry run a release staged earlier kept. The live migrations only change
+ * when a release migrates the state, which prunes this one, so it still
+ * speaks for them; one that does not is refused, naming both.
+ */
+async function keptDryRun(file: string, live: readonly string[]): Promise<readonly string[]> {
+  const kept = await readOwnerOnlyJson(file, 'Kept migration dry run', 'invalid_kept_release');
+  if (!isRecord(kept) || !stringList(kept.live) || !stringList(kept.added)) {
+    throw new GwsEaError('invalid_kept_release', `${file} holds no migration dry run`);
   }
-  const destination = path.join(stagedCheckout, '.env');
-  await copyFile(source, destination, fsConstants.COPYFILE_EXCL);
-  await chmod(destination, mode);
+  if (!sameList(kept.live, live)) {
+    throw new GwsEaError(
+      'live_schema_changed',
+      `The staged release's migrations were tried on ${kept.live.join(', ')}, and the live database now has ${live.join(', ')}.`,
+      { details: { staged: kept.live, live } },
+    );
+  }
+  return kept.added;
 }
 
 async function sameFiles(left: string, right: string, files: readonly string[]): Promise<boolean> {
@@ -627,167 +627,99 @@ async function sameFiles(left: string, right: string, files: readonly string[]):
 }
 
 /**
- * NanoClaw's own `container/build.sh` run on the staged checkout, as the tag
- * `building`, with the flags `inputs` names. Its build context must be the
- * release's `container/` tree exactly, the tree its key names, so a checkout
- * whose `container/` differs from it is refused before anything is built.
+ * Stage the checked release while the assistant serves (`stageRelease`),
+ * with its migration dry run on the release before its links are made, and
+ * the gateway image it names; then preview the switch. A release staged
+ * complete by an earlier update is reused with the dry run it kept.
  */
-async function buildReleaseAgentImage(
-  runtime: InstanceRuntimeConfig,
-  checkoutRoot: string,
-  inputs: AgentImageInputs,
-  dependencies: UpdateDependencies,
-): Promise<void> {
-  const run = dependencies.runCommand ?? runSanitizedCommand;
-  const changed = await workingTreeChanges(checkoutRoot, 'container', checkoutRuntime(dependencies));
-  if (changed.length > 0) {
-    throw new GwsEaError(
-      'checkout_drift',
-      `The staged release's container/ differs from the release, so its agent image would not be the one its content key names: ${changed.join(', ')}.`,
-      { details: { files: changed } },
-    );
-  }
-  await run({
-    command: 'bash',
-    args: [path.join(checkoutRoot, 'container', 'build.sh'), BUILDING_AGENT_IMAGE_TAG],
-    cwd: checkoutRoot,
-    env: {
-      ...dockerEnvironment(runtime, dependencies),
-      NANOCLAW_INSTALL_ID: runtime.install_id,
-      // build.sh prefers its caller's value to `.env`'s, so it builds with exactly the flag the key names.
-      INSTALL_CJK_FONTS: String(inputs.installCjkFonts),
-    },
-    timeoutMs: IMAGE_BUILD_TIMEOUT_MS,
-    stream: true,
-  });
-}
-
-/**
- * Tag the staged release's agent image `:next` (KTD7): the image shared under
- * its content key, the staged checkout's `container/` tree and the build
- * flags of the `.env` staging copied beside it, when another assistant (or
- * this one) already has it; otherwise NanoClaw's own build, labeled with the
- * key (see `provideSharedAgentImage`).
- */
-async function prepareReleaseAgentImage(
+async function stageUpdate(
   operation: InstanceOperation,
-  runtime: InstanceRuntimeConfig,
-  staged: { readonly checkoutRoot: string; readonly commit: string },
-  dependencies: UpdateDependencies,
-): Promise<void> {
-  const { checkoutRoot, commit } = staged;
-  const inputs = await readAgentImageInputs(
-    { repository: checkoutRoot, commit, checkout: checkoutRoot },
-    checkoutRuntime(dependencies),
-  );
-  await provideSharedAgentImage(
-    assistantImageDocker(runtime, dependencies, operation.paths.instanceRoot(operation.instanceId)),
-    {
-      key: agentImageKey(inputs),
-      target: nextAgentImage(runtime),
-      building: buildingAgentImage(runtime),
-      build: () => buildReleaseAgentImage(runtime, checkoutRoot, inputs, dependencies),
-    },
-  );
-}
-
-/** Stage the checked release in `next/` while the assistant serves, and preview the cutover. */
-async function stageRelease(
-  operation: InstanceOperation,
-  { reservation, runtime, target }: CheckedUpdate,
+  { reservation, runtime, target, serving }: CheckedUpdate,
   dependencies: UpdateDependencies,
 ): Promise<StagedUpdate> {
   const { paths, instanceId } = operation;
   const reporter = dependencies.reporter ?? {};
   const run = dependencies.runCommand ?? runSanitizedCommand;
-  const live = reservation.checkout_realpath;
-  const staged = paths.releaseCheckoutRoot(instanceId, 'next');
+  const layout = paths.instanceLayout(instanceId);
   const release = target.release;
+  const name = releaseName(release.deployed_commit);
+  const onecli = instanceOnecliLayout(paths, reservation, runtime.docker_endpoint);
+  const manifest = readSchemaManifest(serving.state);
+  const live = manifest.central_migrations;
 
-  await runStep(
+  const migrations = await runStep(
     reporter,
     { id: 'stage_release', label: 'Preparing the new release beside the running assistant…' },
     async () => {
-      await materializeReleaseCheckout(
-        paths,
-        reservationAt(reservation, release),
-        checkoutRuntime(dependencies),
-        'next',
+      let tried: readonly string[] | undefined;
+      await stageRelease(
+        {
+          paths,
+          view: reservationAt(reservation, release),
+          runtime,
+          state: serving.state,
+          onecli,
+          service: {
+            platform: instanceServicePlatform(dependencies.service?.platform),
+            homeDirectory: runtime.home_directory,
+            runningAsRoot: (dependencies.service?.uid ?? process.getuid?.()) === 0,
+          },
+          provider: target.preflight,
+          beforeLink: async (stagedRelease) => {
+            const added = await dryRunReleaseMigrations(
+              { liveState: serving.state, liveMigrations: live, stagedRelease },
+              run,
+              (await prepareReleaseCommandEnvironments(layout.root)).common,
+            );
+            await writePrivate(dryRunFile(paths, instanceId, name), { live, added } satisfies KeptDryRun);
+            tried = added;
+          },
+        },
+        {
+          ...checkoutRuntime(dependencies),
+          ...(dependencies.runSetupCommand ? { runSetupCommand: dependencies.runSetupCommand } : {}),
+          ...(dependencies.ambientEnv ? { ambientEnv: dependencies.ambientEnv } : {}),
+        },
       );
-      const preflight = await (dependencies.runReleasePreflight ?? runReleasePreflight)(
-        { checkoutRoot: staged, ...target.preflight },
-        { runCommand: run },
-      );
-      await writeReleasePreflightReceipt(
-        paths.releasePreflightFile(instanceId, 'next'),
-        instanceId,
-        release.deployed_commit,
-        preflight,
-      );
+      return tried ?? keptDryRun(dryRunFile(paths, instanceId, name), live);
     },
   );
-
-  const { manifest, migrations } = await runStep(
-    reporter,
-    { id: 'try_migrations', label: "Trying the release's database migrations on a copy…" },
-    async () => {
-      const read = readSchemaManifest(live);
-      const added = await dryRunReleaseMigrations(
-        { liveCheckout: live, liveMigrations: read.central_migrations, stagedCheckout: staged },
-        run,
-        (await prepareReleaseCommandEnvironments(paths.releaseRoot(instanceId, 'next'))).common,
-      );
-      return { manifest: read, migrations: added };
-    },
-  );
-
-  await runStep(reporter, { id: 'build_agent_image', label: 'Preparing the new agent image…' }, async () => {
-    await copyInstanceEnvironment(live, staged);
-    await prepareReleaseAgentImage(
-      operation,
-      runtime,
-      { checkoutRoot: staged, commit: release.deployed_commit },
-      dependencies,
-    );
-  });
 
   const gateway = await runStep(reporter, { id: 'prepare_gateway_image', label: 'Preparing the gateway image…' }, () =>
     prepareReleaseGatewayImage(
-      instanceOnecliLayout(paths, reservation, runtime.onecli_cli_path, runtime.docker_endpoint),
-      { gateway: LAUNCHER_PINS.onecliGateway, cli: LAUNCHER_PINS.onecliCli },
-      { runCommand: run, ...(dependencies.ambientEnv ? { ambientEnv: dependencies.ambientEnv } : {}) },
+      serving.onecli,
+      { gateway: LAUNCHER_PINS.onecliGateway },
+      { dockerCommandRunner: run, ...(dependencies.ambientEnv ? { ambientEnv: dependencies.ambientEnv } : {}) },
     ),
   );
 
-  const [lockUnchanged, sessionSchemaUnchanged, mainTemplate] = await Promise.all([
-    sameFiles(live, staged, [AGENT_RUNNER_LOCKFILE]),
-    sameFiles(live, staged, SESSION_SCHEMA_SOURCES),
-    decideMainTemplate(live, mainTemplateRoot(staged)),
+  const from = releaseOf(reservation);
+  const staged = layout.release(name);
+  const [lockUnchanged, sessionSchemaUnchanged] = await Promise.all([
+    sameFiles(serving.release, staged, [AGENT_RUNNER_LOCKFILE]),
+    sameFiles(serving.release, staged, SESSION_SCHEMA_SOURCES),
   ]);
   return {
-    from: releaseOf(reservation),
+    from,
     to: release,
-    checkoutRoot: staged,
-    runtime,
     manifest,
     preview: {
       instanceId,
-      from: releaseOf(reservation),
+      from,
       to: release,
       migrations,
       gateway,
-      groupImages: readDerivedImageGroups(live, getInstallScopedNames(runtime.install_id).containerImageBase),
+      groupImages: readDerivedImageGroups(serving.state, getInstallScopedNames(runtime.install_id).containerImageBase),
       agentRunnerLockChanged: !lockUnchanged,
       sessionSchemaChanged: !sessionSchemaUnchanged,
-      mainTemplate,
     },
   };
 }
 
 /**
  * Check, stage, and preview an update under its instance lock, the assistant
- * serving throughout. A staging failure removes what it staged before the
- * failure is reported.
+ * serving throughout. An assistant on the layout before releases is converted
+ * by this update, checked and proven as its conversion needs (KTD12).
  */
 export async function prepareUpdate(
   operation: InstanceOperation,
@@ -795,85 +727,41 @@ export async function prepareUpdate(
   dependencies: UpdateDependencies,
 ): Promise<StagedUpdate> {
   operation.assertActive();
+  const conversion = await prepareConversion(operation, intent, dependencies, (checked) =>
+    stageUpdate(operation, checked, dependencies),
+  );
+  if (conversion) return conversion;
   const checked = await runStep(
     dependencies.reporter ?? {},
     { id: 'check_update', label: 'Checking the assistant…' },
     () => checkUpdate(operation, intent, dependencies),
   );
-  try {
-    return await stageRelease(operation, checked, dependencies);
-  } catch (error) {
-    await discardAfterFailure(operation, checked.runtime, dependencies);
-    throw error;
-  }
+  return stageUpdate(operation, checked, dependencies);
 }
 
 /**
- * Record a confirmed update at `staged` (KTD2): from the release the registry
- * names to the staged one, with the live schema staging read, the groups
- * whose image is rebuilt once the release is recorded, and main's template
- * refresh when the preview promised one. One the preview kept is not planned,
- * so a customization undone meanwhile never refreshes what the operator was
- * told is kept.
+ * Ask `confirm` about a staged update, then record it at `staged` (KTD2),
+ * from the release the registry names, with the live schema staging read.
+ * A conversion keeps nothing to return to, so it has no rollback target
+ * (KTD9, KTD12). A decline records nothing; the staged release is left for
+ * the next update. Returns the record, or undefined when declined.
  */
-export function recordStagedUpdate(operation: InstanceOperation, staged: StagedUpdate): Promise<OperationRecord> {
+export async function confirmStagedUpdate(
+  operation: InstanceOperation,
+  staged: StagedUpdate,
+  confirm: (preview: UpdatePreview) => Promise<boolean>,
+): Promise<OperationRecord | undefined> {
+  if (!(await confirm(staged.preview))) return undefined;
   return beginOperation(operation, {
     kind: 'update',
     from: staged.from,
     to: staged.to,
     manifest: staged.manifest,
-    follow_ups: [
-      ...staged.preview.groupImages.map((group) => ({
-        kind: 'rebuild_group_image' as const,
-        agent_group_id: group.id,
-      })),
-      ...(staged.preview.mainTemplate.kind === 'refresh' ? [{ kind: 'refresh_template' as const }] : []),
-    ],
+    ...(staged.preview.conversion ? { no_rollback_target: true as const } : {}),
   });
 }
 
-/**
- * Ask `confirm` about a staged update, then record it at `staged`; a decline
- * removes the staging. So does a failure to ask or to record: nothing is left
- * but a recorded update or no update at all. Returns the record, or undefined
- * when declined.
- */
-export async function confirmStagedUpdate(
-  operation: InstanceOperation,
-  staged: StagedUpdate,
-  dependencies: UpdateDependencies,
-  confirm: (preview: UpdatePreview) => Promise<boolean>,
-): Promise<OperationRecord | undefined> {
-  try {
-    if (await confirm(staged.preview)) return await recordStagedUpdate(operation, staged);
-  } catch (error) {
-    await discardAfterFailure(operation, staged.runtime, dependencies);
-    throw error;
-  }
-  await runStep(dependencies.reporter ?? {}, { id: 'discard_staging', label: 'Removing the staged release…' }, () =>
-    discardUpdateStaging(operation, staged.runtime, dependencies),
-  );
-  return undefined;
-}
-
-function releaseLine(release: ReleaseCoordinates): string {
-  return `${release.release_track} ${shortCommit(release.deployed_commit)}`;
-}
-
-function mainTemplateLine(decision: MainTemplateDecision): string {
-  switch (decision.kind) {
-    case 'refresh':
-      return "Main's template: refreshed from this release once the update is recorded, unless something is customized by then";
-    case 'unchanged':
-      return "Main's template: unchanged in this release";
-    case 'customized':
-      return `Main's template: kept as it is, because these are customized: ${describeCustomized(decision.customized)}`;
-    case 'not_stamped':
-      return `Main's template: not refreshed (${decision.reason})`;
-  }
-}
-
-/** The preview, one fact per line (R8). */
+/** The preview, one fact per line. */
 export function updatePreviewLines(preview: UpdatePreview): string[] {
   const { from, to, gateway, groupImages } = preview;
   const groups = groupImages.map((group) => `${printableName(group.name)} (${group.id})`).join(', ');
@@ -887,102 +775,78 @@ export function updatePreviewLines(preview: UpdatePreview): string[] {
       ? `Gateway image: unchanged (${gateway.current})`
       : `Gateway image: ${gateway.current} → ${gateway.release}`,
     `Agent group images rebuilt after the update: ${groups || 'none'}`,
-    mainTemplateLine(preview.mainTemplate),
     ...(preview.agentRunnerLockChanged && groupImages.length > 0
       ? [
           `Until rebuilt, ${groups} run the previous agent-runner dependencies, so their first turns may fail and retry.`,
         ]
       : []),
-    ...(preview.migrations.length > 0 || preview.sessionSchemaChanged
+    ...(preview.conversion
       ? [
-          `${preview.migrations.length > 0 ? 'This release migrates the database' : "This release changes its session databases' schema"}: a failure after the swap may restore the pre-update snapshot, discarding what the new release recorded before it failed.`,
+          `Layout: its state moves by rename from ${preview.conversion.from} to ${preview.conversion.to}, one way.`,
+          'Rollback: none. No backup is kept and its old rollback point is dropped; a failure after the new release starts is fixed forward with a newer release.',
         ]
-      : []),
+      : preview.migrations.length > 0 || preview.sessionSchemaChanged
+        ? [
+            `${preview.migrations.length > 0 ? 'This release migrates the database' : "This release changes its session databases' schema"}: a failure after it starts may restore the pre-update snapshot, discarding what the new release recorded before it failed.`,
+          ]
+        : []),
   ];
 }
 
-/** An update that failed before its release was recorded (R14), as recovery receives it. */
-export interface FailedCutover {
-  /** The update's record as the failure left it: its phase says how far the cutover got. */
+/** An update that failed before its release was committed, as recovery receives it. */
+interface FailedUpdate {
+  /** The update's record as the failure left it: its phase says how far it got. */
   readonly record: OperationRecord;
   readonly cause: unknown;
-  /** The host the cutover opened, whose service recovery may start again; absent when it failed before that. */
-  readonly host?: CutoverHost;
 }
 
-/** From here on the assistant ran the update's release, so a failure rolls it back (R14). */
-const RENAMED: ReadonlySet<OperationRecord['phase']> = new Set(['swapped', 'started', 'verified']);
-
-/** What recovery did with the host of the release an update never swapped out. */
-type OutgoingHost =
-  | { readonly kind: 'serving' }
-  | { readonly kind: 'stopped'; readonly failure: unknown }
-  | { readonly kind: 'left' };
+/** From here on the update's release was started, so one with no release to return to is closed for fix-forward. */
+const STARTED: ReadonlySet<OperationRecord['phase']> = new Set(['started', 'verified']);
 
 /**
- * Start the old release's host again after a failure before the swap moved
- * the live checkout, so the assistant keeps serving: the live checkout still
- * holds that release whole, and continuing the update stops it, proves it
- * quiet, and carries its state again, so nothing it records meanwhile is lost
- * (KTD2). A swap cut short is first taken back to `stopped`. Once the live
- * checkout moved, only finishing or reverting the swap puts a release there,
- * so the host is left as it is.
+ * Recovery for an update that failed before its release was committed. The
+ * registry is read first: an update it already names was committed, so it
+ * stands, and is reported for `update --id` to finish recording (see
+ * `assertNotCommitted`). Once its release may have started (from `switched`,
+ * `targetMayHaveStarted`), the update is rolled back by the rollback rules,
+ * which its own confirmation covers: code only when neither schema moved,
+ * else the snapshot its fence took. One with no rollback target is closed for
+ * fix-forward instead once its release started (KTD9). Before that the
+ * release it left is served again (`serveLeftRelease`) and the record
+ * discarded, the staged release kept for the next update: a refusal before
+ * the release started. When that return fails too, or the update has no
+ * release to return to, the record stays open and the failure names what
+ * continues it.
  */
-async function resumeOutgoingHost(host: CutoverHost, record: OperationRecord): Promise<OutgoingHost> {
-  const { operation, dependencies } = host;
-  try {
-    if (record.phase === 'swapping') {
-      const reversed = await reverseSwapBeforeLiveMoved(
-        operation.paths,
-        operation.instanceId,
-        { from: record.from.deployed_commit, to: record.to.deployed_commit },
-        dependencies.rename ? { rename: dependencies.rename } : {},
-      );
-      if (!reversed) return { kind: 'left' };
-      await advanceOperation(operation, 'stopped');
-    }
-    await runStep(host.reporter, { id: 'start_outgoing', label: 'Starting the assistant again…' }, () =>
-      host.service.start(),
-    );
-    return { kind: 'serving' };
-    // eslint-disable-next-line no-catch-all/no-catch-all -- NanoClaw's service helpers fail with plain errors; the operator is told the assistant is stopped, and why.
-  } catch (error) {
-    return { kind: 'stopped', failure: error };
-  }
-}
-
-/**
- * Recovery for an update that failed before its release was recorded (R14).
- * The registry is read first: an update it already names was committed, so
- * it stands, and is reported for `update --id` to finish recording (see
- * `assertNotCommitted`). Once its renames ran, the update is rolled back by
- * R13's rule, which its own confirmation covers: code only when neither
- * schema moved, else the snapshot its stop left. Before that nothing ran on
- * the release: the old release's host is started again (see
- * `resumeOutgoingHost`), the record stays open with its staging, and the
- * failure names the commands that continue or revert it. Either way the
- * failure is reported, with where the assistant was left.
- */
-export async function recoverUpdate(
+async function recoverUpdate(
   operation: InstanceOperation,
-  failed: FailedCutover,
+  failed: FailedUpdate,
   dependencies: UpdateDependencies,
 ): Promise<never> {
   operation.assertActive();
   const { record, cause } = failed;
   await assertNotCommitted(operation, cause);
+  const id = record.instance_id;
   const failure = `${safeErrorMessage(cause)} The update to ${releaseLine(record.to)} stopped at ${record.phase}`;
   const details: GwsEaErrorDetails = { ...(cause instanceof GwsEaError ? cause.details : {}), phase: record.phase };
-  if (record.kind === 'update' && RENAMED.has(record.phase)) {
+  const fixForward = `update it to a newer release with gws-ea update --id ${id}`;
+  if (STARTED.has(record.phase) && record.no_rollback_target) {
+    await closeOperationFailed(operation);
+    throw new GwsEaError(
+      'update_failed',
+      `${failure}, and it has no release to return to. Fix it forward: ${fixForward}.`,
+      { cause, details: { ...details, continueWith: `gws-ea update --id ${id}` } },
+    );
+  }
+  if (targetMayHaveStarted(record) && !record.no_rollback_target) {
     let rolledBack: string;
     try {
       rolledBack = describeRollback(await revertUpdate(operation, dependencies), localTimezone());
     } catch (error) {
       throw new GwsEaError(
         'update_recovery_failed',
-        `${failure}, and rolling it back did not finish: ${safeErrorMessage(error)} ` +
-          `Continue the rollback with gws-ea rollback --id ${record.instance_id}.`,
-        { cause, details: { ...details, continueWith: `gws-ea rollback --id ${record.instance_id}` } },
+        `${failure}, and rolling it back failed too: ${safeErrorMessage(error)}`,
+        { cause, details: { ...details, continueWith: `gws-ea update --id ${id}` } },
       );
     }
     throw new GwsEaError('update_rolled_back', `${failure}, so it was rolled back: ${rolledBack}`, {
@@ -992,72 +856,38 @@ export async function recoverUpdate(
   }
   const next = operationNextSteps(record);
   const unfinished = { ...details, continueWith: next.continueWith, revertWith: next.revertWith ?? null };
-  const outgoing: OutgoingHost = failed.host ? await resumeOutgoingHost(failed.host, record) : { kind: 'left' };
-  const from = releaseLine(record.from);
-  switch (outgoing.kind) {
-    case 'serving':
-      throw new GwsEaError(
-        'update_interrupted',
-        `${failure}, before its swap; the assistant runs ${from}, and the update is unfinished: continue it with ${next.continueWith}${revertClause(next)}.`,
-        { cause, details: unfinished },
-      );
-    case 'stopped': {
-      // NanoClaw's service helpers report why they failed as a plain error, so its text is shown, redacted.
-      const reason = outgoing.failure instanceof Error ? outgoing.failure.message : String(outgoing.failure);
-      const discard = next.revertWith ? `, or discard it and start ${from} again with ${next.revertWith}` : '';
-      throw new GwsEaError(
-        'update_interrupted',
-        `${failure}, before its swap, and starting ${from} again failed: ${redact(reason).replace(/\.$/u, '')}. ` +
-          `Assistant ${record.instance_id} is stopped: continue the update with ${next.continueWith}${discard}.`,
-        { cause, details: unfinished },
-      );
-    }
-    case 'left':
-      throw new GwsEaError(
-        'update_interrupted',
-        `${failure} and is unfinished: continue it with ${next.continueWith}${revertClause(next)}.`,
-        { cause, details: unfinished },
-      );
+  if (record.no_rollback_target) {
+    throw new GwsEaError(
+      'update_interrupted',
+      `${failure} and is unfinished: continue it with ${next.continueWith}, or fix it forward to another release with gws-ea update --id ${id}.`,
+      { cause, details: unfinished },
+    );
   }
-}
-
-/** What every update cutover phase works from, read once per run. */
-interface Cutover extends CutoverHost {
-  readonly dependencies: UpdateDependencies;
-  /** The reservation with the update's target overlaid (KTD17). */
-  readonly target: InstanceReservation;
-  /** The runtime record the release the update deploys runs with. */
-  readonly release: InstanceRuntimeConfig;
-  readonly releases: SwapReleases;
-}
-
-async function prepareCutover(
-  operation: InstanceOperation,
-  record: OperationRecord,
-  dependencies: UpdateDependencies,
-): Promise<Cutover> {
-  const host = await openCutoverHost(operation, dependencies);
-  const target = targetReservationView(host.reservation, record);
-  return {
-    ...host,
-    dependencies,
-    target,
-    release: createInstanceRuntimeConfig(target, host.onecli, {
-      nodePath: host.runtime.node_path,
-      homeDirectory: host.runtime.home_directory,
-      selectedProvider: host.runtime.selected_provider,
-      dockerEndpoint: host.runtime.docker_endpoint,
-    }),
-    releases: { from: record.from.deployed_commit, to: record.to.deployed_commit },
-  };
+  try {
+    await serveLeftRelease(await openCutoverHost(operation, dependencies), record);
+    await discardOperation(operation);
+  } catch (error) {
+    throw new GwsEaError(
+      'update_interrupted',
+      `${failure}, before its release started, and serving ${releaseLine(record.from)} again failed too: ${safeErrorMessage(error)} ` +
+        `The update is unfinished: continue it with ${next.continueWith}${revertClause(next)}.`,
+      { cause, details: unfinished },
+    );
+  }
+  throw new GwsEaError(
+    'update_refused',
+    `${failure}, before its release started, so assistant ${id} runs ${releaseLine(record.from)} again. ` +
+      `The staged release is kept: gws-ea update --id ${id} tries it again.`,
+    { cause, details },
+  );
 }
 
 const STOP_LABEL = 'Stopping the assistant for the switch…';
 
 /** The live migrations must still be the ones staging read, or the dry run no longer speaks for them. */
-function assertMigrationsUnchanged(record: OperationRecord, checkoutRoot: string): void {
+function assertMigrationsUnchanged(record: OperationRecord, manifest: SnapshotManifest): void {
   const staged = record.manifest?.central_migrations;
-  const live = readCentralMigrations(checkoutRoot);
+  const live = manifest.central_migrations;
   if (!staged || sameList(live, staged)) return;
   throw new GwsEaError(
     'live_schema_changed',
@@ -1066,285 +896,132 @@ function assertMigrationsUnchanged(record: OperationRecord, checkoutRoot: string
   );
 }
 
-/** The per-group images the rebuilds will displace, deleted once nothing names them (KTD19). */
-async function displacedGroupImages(cutover: Cutover, record: OperationRecord): Promise<OperationFollowUp[]> {
-  const base = getInstallScopedNames(cutover.runtime.install_id).containerImageBase;
-  const displaced: OperationFollowUp[] = [];
-  for (const followUp of record.follow_ups) {
-    if (followUp.kind !== 'rebuild_group_image') continue;
-    const id = await imageIdOf(cutover, `${base}:${followUp.agent_group_id}`);
-    if (id) displaced.push({ kind: 'delete_image', image_id: id });
-  }
-  return displaced;
+/** The OneCLI version a release's receipt records; an update never changes it. */
+async function releasePins(host: CutoverHost, release: ReleaseCoordinates): Promise<{ readonly gateway: string }> {
+  const { onecli } = await readDeployedSetup(host.operation.paths, reservationAt(host.reservation, release));
+  return { gateway: onecli.gateway };
 }
+
+/** Where an operation resumed is fenced, its live link absent or naming a release not yet started. */
+const RESUMED_FENCED: ReadonlySet<OperationRecord['phase']> = new Set(['fenced', 'snapshotted', 'switched']);
 
 /**
- * Write what the release runs with into its staged checkout, the outgoing
- * one's state already carried in: its marker, runtime record, and gws-ea's
- * `.env` keys (KTD9), then its upgrade tripwire, stamped by its own script.
- * The outgoing release's own files are gathered to be kept beside it, with
- * its manifest: the release it is, and when its host stopped.
+ * Re-establish the fence of an update resumed while fenced (KTD1): whatever
+ * started since (a reboot, a login) is stopped and the instance proven quiet
+ * again before anything goes on, and the stop is recorded afresh. Once the
+ * update took its snapshot, a fence in force that ended the release the
+ * update left means that release was served again since (a return that
+ * refused the update and was cut short) and may have recorded more, so the
+ * snapshot is taken again under this fence before the update goes on (KTD4);
+ * one this fence already took is kept. A fence that ended the update's own
+ * release leaves the snapshot as the release it left wrote it.
  */
-async function carryIntoRelease(cutover: Cutover, stoppedAt: string): Promise<void> {
-  const { operation, runtime, release, reservation, dependencies } = cutover;
-  const { paths, instanceId } = operation;
-  const live = reservation.checkout_realpath;
-  const staged = paths.releaseCheckoutRoot(instanceId, 'next');
-  await carryState(live, staged);
-  await writeReleaseRuntime(release, staged, dependencies.upsertEnvVars);
-  await writePrivate(instanceMarkerFile(staged), {
-    schema_version: INSTANCE_MARKER_SCHEMA_VERSION,
-    instance_id: instanceId,
-    deployed_commit: release.deployed_commit,
-  } satisfies InstanceMarker);
-  await stampUpgradeState(staged, cutover.run, {
-    ...dockerEnvironment(runtime, dependencies),
-    NANOCLAW_INSTALL_ID: runtime.install_id,
-  });
-  const definition = instanceServiceDefinitionFile(runtime, cutoverServiceDependencies(cutover));
-  await keepReleaseFiles(stagedKeptFilesRoot(paths, instanceId), {
-    manifest: {
-      schema_version: 1,
-      instance_id: instanceId,
-      release: releaseOf(reservation),
-      snapshot_at: stoppedAt,
-    },
-    receipt: paths.releasePreflightFile(instanceId),
-    compose: cutover.onecli.composeFile,
-    serviceDefinition: (await isRegularFile(definition)) ? definition : undefined,
-    hostEnvironment: readInstanceHostEnvironment(live),
-  });
-}
-
-/**
- * `staged` or `stopped` → `swapping`: stop the host and its agents, prove the
- * checkout quiet and settle its databases (KTD18), and record the stop with
- * the schema as it stood (KTD5); then carry the state into the staged
- * checkout. Run again from `stopped`, all of it runs again, since the OS may
- * have started the old host meanwhile.
- */
-async function stopAndCarry(cutover: Cutover, record: OperationRecord): Promise<OperationRecord> {
-  const { operation, reporter, reservation } = cutover;
-  const { paths, instanceId } = operation;
-  const live = reservation.checkout_realpath;
-  await assertCarriable(live);
-  await stopCutoverHost(cutover, STOP_LABEL);
-  const stoppedAt = new Date().toISOString();
-  const { graceful, manifest } = await runStep(
-    reporter,
-    { id: 'prove_quiet', label: 'Checking nothing still uses its state…' },
-    async () => {
-      await assertCheckoutQuiet(quietCheckoutOf(cutover, live), cutoverQuiescence(cutover));
-      const settled = settleCheckoutDatabases(live);
-      assertMigrationsUnchanged(record, live);
-      return { graceful: settled.graceful, manifest: readSchemaManifest(live) };
-    },
-  );
-  const stopped = await advanceOperation(operation, 'stopped', {
-    stop: { at: stoppedAt, graceful },
-    manifest,
-    follow_ups: planFollowUps(record.follow_ups, await displacedGroupImages(cutover, record)),
-  });
-  await runStep(
-    reporter,
-    { id: 'carry_state', label: 'Carrying conversations, memory, and settings to the new release…' },
-    () => carryIntoRelease(cutover, stoppedAt),
-  );
-  const kept: OperationFollowUp[] = [
-    ...((await exists(paths.releaseRoot(instanceId, 'previous')))
-      ? [{ kind: 'delete_release' as const, release: 'superseded_previous' as const }]
-      : []),
-    ...((await exists(paths.releaseRoot(instanceId, 'outgoing')))
-      ? [{ kind: 'delete_release' as const, release: 'outgoing' as const }]
-      : []),
-  ];
-  return advanceOperation(operation, 'swapping', { follow_ups: planFollowUps(stopped.follow_ups, kept) });
-}
-
-/**
- * `swapping` → `swapped` (KTD1): with the host stopped (again, in case the OS
- * started one) and its checkout proven quiet just before the first rename,
- * swap the releases from wherever an interrupted swap left them.
- */
-async function swapReleases(cutover: Cutover): Promise<OperationRecord> {
-  const { operation, reporter, reservation, dependencies } = cutover;
-  const { paths, instanceId } = operation;
-  await keepCutoverHostStopped(cutover);
-  await runStep(reporter, { id: 'swap_releases', label: 'Switching to the new release…' }, async () => {
-    // Between the two renames the outgoing release is no longer at the live path, but in previous/.
-    const outgoing = (await exists(reservation.checkout_realpath))
-      ? reservation.checkout_realpath
-      : paths.releaseCheckoutRoot(instanceId, 'previous');
-    await assertCheckoutQuiet(quietCheckoutOf(cutover, outgoing), cutoverQuiescence(cutover));
-    await finishSwap(paths, instanceId, cutover.releases, dependencies.rename ? { rename: dependencies.rename } : {});
-  });
-  return advanceOperation(operation, 'swapped');
-}
-
-/**
- * Retag the agent images (KTD7): `:latest` moves to the image staging built
- * and `:previous` to the one the assistant ran. The moves are recorded by ID
- * before they are made, so a retag cut short replays exactly, and every image
- * they name is held meanwhile (KTD19); the image `:previous` named before
- * stays held until it is released once the release is recorded.
- */
-async function moveAgentImages(cutover: Cutover, record: OperationRecord): Promise<OperationRecord> {
-  const base = getInstallScopedNames(cutover.runtime.install_id).containerImageBase;
-  const latestTag = `${base}:latest`;
-  const previousTag = `${base}:previous`;
-  const nextTag = nextAgentImage(cutover.runtime);
-  let current = record;
-  if (current.images.length === 0) {
-    const [ran, kept, built] = await Promise.all([
-      imageIdOf(cutover, latestTag),
-      imageIdOf(cutover, previousTag),
-      imageIdOf(cutover, nextTag),
-    ]);
-    if (!built || !ran) {
-      throw new GwsEaError(
-        'agent_image_missing',
-        `The agent image ${built ? latestTag : nextTag} is missing, so the release's image cannot take its place.`,
-      );
-    }
-    const images: MovedImage[] = [
-      { tag: latestTag, image_id: built, displaced_image_id: ran },
-      { tag: previousTag, image_id: ran, displaced_image_id: kept ?? null },
-    ];
-    const displaced: OperationFollowUp[] =
-      kept && kept !== ran && kept !== built ? [{ kind: 'delete_image', image_id: kept }] : [];
-    current = await recordOperationFacts(cutover.operation, {
-      images,
-      follow_ups: planFollowUps(current.follow_ups, displaced),
-    });
-  }
-  const images = current.images;
-  await moveRecordedImages(cutover, images, async () => {
-    for (const image of images) await cutoverDocker(cutover, ['tag', image.image_id, image.tag]);
-    const latest = images.find((image) => image.tag === latestTag);
-    // `:next` now names the image `:latest` does, so removing it only removes the tag.
-    if (latest && (await imageIdOf(cutover, nextTag)) === latest.image_id) {
-      await cutoverDocker(cutover, ['image', 'rm', nextTag]);
-    }
-  });
-  return current;
-}
-
-/** The OneCLI versions the release's receipt records; an update never changes them (R9). */
-async function releasePins(cutover: Cutover): Promise<OnecliPins> {
-  const { onecli } = await readDeployedSetup(cutover.operation.paths, cutover.target);
-  return { gateway: onecli.gateway, cli: onecli.cli };
-}
-
-/** Whether the release runs another gateway than the one kept with the outgoing release (KTD8). */
-async function gatewayChanged(cutover: Cutover, pins: OnecliPins): Promise<boolean> {
-  const { paths, instanceId } = cutover.operation;
-  const kept = keptReleaseFiles(paths.releaseRoot(instanceId, 'previous'));
-  const { gateway } = parseOnecliComposeImages(await readOwnerOnlyFile(kept.compose));
-  return gateway !== (await resolveWrapperGatewayImage(pins)).image;
-}
-
-/**
- * `swapped` → `started`: stop any host the OS started meanwhile, retag the
- * agent images, recreate the gateway when the release changed it, write the
- * release's service definition, and start the host.
- */
-async function startRelease(cutover: Cutover, record: OperationRecord): Promise<OperationRecord> {
-  const { operation, reporter } = cutover;
-  await keepCutoverHostStopped(cutover);
-  await runStep(reporter, { id: 'move_images', label: "Moving the assistant's images to the new release…" }, () =>
-    moveAgentImages(cutover, record),
-  );
-  const pins = await releasePins(cutover);
-  if (await gatewayChanged(cutover, pins)) {
-    await runStep(reporter, { id: 'recreate_gateway', label: 'Recreating the credential gateway…' }, () =>
-      cutoverOnecli(cutover).apply(cutover.onecli, pins),
+async function refence(host: CutoverHost, record: OperationRecord): Promise<OperationRecord> {
+  const stop = await fenceInstance(host, 'Making sure the assistant is still stopped…');
+  const left = releaseName(record.from.deployed_commit);
+  if (record.phase !== 'fenced' && (await fenceEnded(host.layout)) === left) {
+    await runStep(host.reporter, { id: 'snapshot_state', label: 'Taking a snapshot of its state…' }, () =>
+      takeSnapshot(host.layout, operationName(record.started_at), left),
     );
   }
-  await runStep(reporter, { id: 'start_release', label: 'Starting the new release…' }, async () => {
-    await writeInstanceServiceDefinition(cutover.release, cutoverServiceDependencies(cutover));
-    await cutover.service.start();
-  });
-  return advanceOperation(operation, 'started');
+  return recordOperationFacts(host.operation, { stop });
 }
 
 /**
- * `started` → `verified`: the host serves on the release (see
- * `verifyServingRelease`); after a killed host its claim lease lengthens every
- * wait, and when the release changed the gateway the isolation probe runs.
+ * Run the update from the phase its record reached until its release is
+ * committed. Before the fence the serving OneCLI runtime is re-verified;
+ * then the assistant is fenced, its state snapshotted as the release it
+ * left last wrote it (`snapshots/<op>/`, keyed to the fence), switched to the
+ * release, and started; main's skills are reconciled, the release verified,
+ * its follow-ups planned, and the registry compare-and-swap commits it. A
+ * resume between the fence and the start fences again first, so a switch is
+ * always followed by a start that reads the service definition it installed.
+ * Returns why what a converted assistant's old layout left could not be
+ * removed, for the update to report once committed.
  */
-async function verifyRelease(cutover: Cutover, record: OperationRecord): Promise<OperationRecord> {
-  await runStep(cutover.reporter, { id: 'verify_release', label: 'Checking the new release serves…' }, async () => {
-    const pins = await releasePins(cutover);
-    await verifyServingRelease(cutover, {
-      view: cutover.target,
-      pins,
-      leaseHeld: record.stop?.graceful === false,
-      gatewayChanged: await gatewayChanged(cutover, pins),
-      subject: 'The new release',
-    });
-  });
-  return advanceOperation(cutover.operation, 'verified');
-}
-
-/**
- * Go on with a swap an earlier run left under way (KTD2). One cut short
- * before it moved the live checkout is taken back to `stopped`, since the OS
- * may have started the old host from the live path since: its stop,
- * quiescence proof, and carry run again, unconditionally. One that moved it
- * is finished.
- */
-async function resumeSwap(cutover: Cutover, record: OperationRecord): Promise<OperationRecord> {
-  const { operation, dependencies } = cutover;
-  const reversed = await reverseSwapBeforeLiveMoved(
-    operation.paths,
-    operation.instanceId,
-    cutover.releases,
-    dependencies.rename ? { rename: dependencies.rename } : {},
-  );
-  return reversed ? advanceOperation(operation, 'stopped') : record;
-}
-
-/** Run the cutover from the phase its record reached until the release is recorded. */
-async function runCutover(cutover: Cutover, start: OperationRecord): Promise<void> {
-  let record = start.phase === 'swapping' ? await resumeSwap(cutover, start) : start;
+async function runUpdate(host: CutoverHost, start: OperationRecord): Promise<GwsEaError | undefined> {
+  const { operation, layout, reporter } = host;
+  const name = releaseName(start.to.deployed_commit);
+  let record = RESUMED_FENCED.has(start.phase) ? await refence(host, start) : start;
+  let definitionChanged = false;
   for (;;) {
     switch (record.phase) {
-      case 'staged':
-      case 'stopped':
-        record = await stopAndCarry(cutover, record);
-        break;
-      case 'swapping':
-        record = await swapReleases(cutover);
-        break;
-      case 'swapped':
-        record = await startRelease(cutover, record);
-        break;
-      case 'started':
-        record = await verifyRelease(cutover, record);
-        break;
-      case 'verified':
-        await runStep(cutover.reporter, { id: 'record_release', label: 'Recording the new release…' }, () =>
-          commitOperationRelease(cutover.operation),
+      case 'staged': {
+        const pins = await releasePins(host, record.from);
+        await runStep(reporter, { id: 'verify_gateway', label: 'Checking the credential gateway…' }, () =>
+          cutoverOnecli(host).reverify(host.onecli, pins),
         );
-        return;
-      case 'recorded':
-        return;
+        const staged = record;
+        let manifest: SnapshotManifest | undefined;
+        const stop = await fenceInstance(host, STOP_LABEL, () => {
+          manifest = readSchemaManifest(layout.state);
+          assertMigrationsUnchanged(staged, manifest);
+        });
+        record = await advanceOperation(operation, 'fenced', { stop, ...(manifest ? { manifest } : {}) });
+        break;
+      }
+      case 'fenced':
+        await runStep(reporter, { id: 'snapshot_state', label: 'Taking a snapshot of its state…' }, () =>
+          takeSnapshot(layout, operationName(record.started_at), releaseName(record.from.deployed_commit)),
+        );
+        record = await advanceOperation(operation, 'snapshotted');
+        break;
+      case 'snapshotted':
+        definitionChanged = await switchTo(host, record.to, record.from, 'Switching to the new release…');
+        record = await advanceOperation(operation, 'switched');
+        break;
+      case 'switched':
+        if ((await readCurrent(layout)) !== name) {
+          definitionChanged = await switchTo(host, record.to, record.from, 'Switching to the new release…');
+        }
+        await startRelease(host, definitionChanged, 'Starting the new release…');
+        record = await advanceOperation(operation, 'started');
+        break;
+      case 'started': {
+        const started = record;
+        await reconcileMainSkills(host, started.stop?.graceful === false);
+        await runStep(reporter, { id: 'verify_release', label: 'Checking the new release serves…' }, async () =>
+          verifyServingRelease(host, {
+            view: reservationAt(host.reservation, started.to),
+            pins: await releasePins(host, started.to),
+            leaseHeld: started.stop?.graceful === false,
+            subject: 'The new release',
+          }),
+        );
+        record = await advanceOperation(operation, 'verified', {
+          follow_ups: planFollowUps(record.follow_ups, releaseFollowUps(host.runtime)),
+        });
+        break;
+      }
+      case 'verified': {
+        // A converted assistant's old layout goes once a release here is verified, before the commit, so a run cut
+        // short removes it when this update is continued (KTD12).
+        const leftover = await finishConversion(host);
+        await runStep(reporter, { id: 'record_release', label: 'Recording the new release…' }, () =>
+          commitOperationRelease(operation),
+        );
+        return leftover;
+      }
+      case 'committed':
+        return undefined;
     }
   }
 }
 
-/** Where an update left the assistant: the release it runs, the one kept to roll back to, and what its follow-ups said. */
+/** Where an update left the assistant: the release it runs, and the one it left. */
 export interface UpdatedAssistant {
   readonly from: ReleaseCoordinates;
   readonly to: ReleaseCoordinates;
-  readonly notes: readonly string[];
+  /** The release it left is kept to roll back to: false for an update with no rollback target (KTD9). */
+  readonly rollbackTarget: boolean;
 }
 
 /**
  * Carry a confirmed update from whatever phase its record reached to its
- * recorded release, then run its follow-ups. A failure before the release is
- * recorded goes to recovery; one after never rolls back, and is left for the
- * next `update --id` to retry.
+ * committed release, then run its follow-ups. A failure before the release is
+ * committed goes to recovery; one after never rolls back, and is left for the
+ * next `update --id` to retry. What a converted assistant's old layout left
+ * and could not be removed is reported last.
  */
 export async function continueUpdate(
   operation: InstanceOperation,
@@ -1353,26 +1030,29 @@ export async function continueUpdate(
   operation.assertActive();
   const { paths, instanceId } = operation;
   const record = await readOperationRecord(paths, instanceId);
-  if (!record || record.kind !== 'update') {
+  if (!record || record.kind !== 'update' || record.closed) {
     throw new GwsEaError('operation_missing', `Assistant ${instanceId} has no update under way.`);
   }
-  if (record.phase !== 'recorded') {
-    let cutover: Cutover | undefined;
+  let leftover: GwsEaError | undefined;
+  if (record.phase !== 'committed') {
+    // An assistant on the layout before releases is moved to its short root first; the conversion reports its own
+    // failures, and leaves the update recorded at `snapshotted` (KTD12).
+    await continueConversion(operation, dependencies);
     try {
-      cutover = await prepareCutover(operation, record, dependencies);
-      await runCutover(cutover, record);
+      leftover = await runUpdate(
+        await openCutoverHost(operation, dependencies),
+        (await readOperationRecord(paths, instanceId)) ?? record,
+      );
       // eslint-disable-next-line no-catch-all/no-catch-all -- Every failure before the commit point goes to recovery, which reports it.
     } catch (error) {
       return recoverUpdate(
         operation,
-        {
-          record: (await readOperationRecord(paths, instanceId)) ?? record,
-          cause: error,
-          ...(cutover ? { host: cutover } : {}),
-        },
+        { record: (await readOperationRecord(paths, instanceId)) ?? record, cause: error },
         dependencies,
       );
     }
   }
-  return { from: record.from, to: record.to, notes: await finishFollowUps(operation, dependencies) };
+  await finishFollowUps(operation, dependencies);
+  if (leftover) throw leftover;
+  return { from: record.from, to: record.to, rollbackTarget: record.no_rollback_target !== true };
 }
