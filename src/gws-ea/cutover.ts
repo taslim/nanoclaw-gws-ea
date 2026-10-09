@@ -184,7 +184,8 @@ async function lsofHolders(directory: string, seams: QuiescenceSeams): Promise<O
   const { stdout, stderr } = await (seams.runCommand ?? runSanitizedCommand)({
     command: 'sh',
     args: ['-c', LSOF, 'lsof', '-n', '-P', '-w', '-F', 'pcn', '+D', directory],
-    cwd: directory,
+    // Run from beside it: `lsof +D` reports every process whose working directory is inside, its own included.
+    cwd: path.dirname(directory),
     env: toolEnvironment(seams),
     timeoutMs: PROBE_TIMEOUT_MS,
   });

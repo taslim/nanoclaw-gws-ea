@@ -194,10 +194,21 @@ describe('finding what holds a directory open', () => {
           platform: 'darwin',
         });
 
-        expect(holders).toContainEqual({ pid: holder.pid, command: expect.any(String), file: database });
+        // Only the holder: never the probe's own processes, whose working directory a check from inside would be.
+        expect(holders).toEqual([{ pid: holder.pid, command: expect.any(String), file: database }]);
       } finally {
         holder.kill('SIGKILL');
       }
+    },
+    30_000,
+  );
+
+  it.runIf(process.platform === 'darwin')(
+    "finds nothing holding a quiet directory through the system's lsof",
+    async () => {
+      const target = await quietTarget();
+
+      expect(await openFileHolders(target.state, { runCommand: runSanitizedCommand, platform: 'darwin' })).toEqual([]);
     },
     30_000,
   );
