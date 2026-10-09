@@ -1186,10 +1186,21 @@ describe('OneCLI health check and provider credential', () => {
     const layout = await layoutFixture();
     await writeInstanceCompose(layout);
     const { runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
-    const { fetch, requests } = onecliApp(layout);
-    const receipt = await verifyOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, fetch });
-    const before = await filesBeneath(layout.rootDirectory);
+    const app = onecliApp(layout);
+    const { requests } = app;
     const value = 'sk-ant-api03-provider-real-secret';
+    // The whole instance root is searched again while OneCLI is sent the value, so a file staged for the
+    // request and removed after it is found too.
+    const instanceRoot = path.dirname(layout.rootDirectory);
+    const holdingValue = async (): Promise<string[]> =>
+      [...(await filesBeneath(instanceRoot))].flatMap(([file, contents]) => (contents.includes(value) ? [file] : []));
+    const whileSent: string[][] = [];
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === 'POST') whileSent.push(await holdingValue());
+      return app.fetch(input, init);
+    });
+    const receipt = await verifyOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, fetch });
+    const before = await filesBeneath(instanceRoot);
     requests.length = 0;
 
     const imported = await importProviderCredential(
@@ -1208,7 +1219,8 @@ describe('OneCLI health check and provider credential', () => {
         body: { name: 'Anthropic', type: 'anthropic', value, hostPattern: 'api.anthropic.com' },
       },
     ]);
-    const after = await filesBeneath(layout.rootDirectory);
+    expect(whileSent).toEqual([[]]);
+    const after = await filesBeneath(instanceRoot);
     expect([...after.keys()]).toEqual([...before.keys()]);
     for (const contents of after.values()) expect(contents).not.toContain(value);
   });

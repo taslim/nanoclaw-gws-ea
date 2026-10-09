@@ -247,6 +247,24 @@ describe('a OneCLI failure', () => {
     expectNoBody(error);
   });
 
+  it("reports a new secret's answer without an ID by the call alone, never the value it previews", async () => {
+    const { fetch } = oneCli(() => json({ preview: BODY_SECRET, accessToken: ACCESS_TOKEN }, 201));
+    const error = await createOnecliAdmin(APP_URL, API_KEY, { fetch })
+      .createSecret({
+        name: 'Anthropic',
+        type: 'anthropic',
+        value: 'sk-ant-api03-value',
+        hostPattern: 'api.anthropic.com',
+      })
+      .then(
+        () => undefined,
+        (failure: unknown) => failure,
+      );
+
+    expect(error).toMatchObject({ code: 'invalid_onecli_output' });
+    expectNoBody(error);
+  });
+
   it('reports a refused key request by its status alone', async () => {
     const { fetch } = oneCli(() => new Response(leakyBody, { status: 401 }));
     const error = await fetchOnecliApiKey(APP_URL, { fetch }).then(

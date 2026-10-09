@@ -1,9 +1,10 @@
 /**
  * The product a release is: every GWS-EA host module, the Google Chat channel,
- * the OneCLI gateway, and both product templates are composed into this tree.
- * A release is the tool's own clean commit, so this is a property of the
- * commit, checked here once rather than at every create and update. Derived
- * from the tree, so adding a module needs no list edit.
+ * and the OneCLI gateway are composed into this tree. A release is the tool's
+ * own clean commit, so this is a property of the commit, checked here once
+ * rather than at every create and update. Derived from the tree, so adding a
+ * module needs no list edit. Both product templates, and the agent each
+ * stamps, are the template guard's (`src/templates/gws-ea-main.test.ts`).
  */
 import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -33,14 +34,5 @@ describe('release composition', () => {
     expect(imports(await read('src/channels/index.ts'), 'gchat')).toBe(true);
     expect(imports(await read('src/gateway-providers/index.ts'), 'installed')).toBe(true);
     expect(imports(await read('src/gateway-providers/installed.ts'), 'onecli')).toBe(true);
-  });
-
-  it.each(['main', 'external-email'] as const)('ships the %s template stamping exactly that agent', async (agent) => {
-    const template = JSON.parse(await read(`templates/gws-ea/${agent}/plugin.json`)) as {
-      name?: unknown;
-      extensions?: { 'ai.nanoco.nanoclaw'?: { agentName?: unknown } };
-    };
-    expect(template.name).toBe(`gws-ea-${agent}`);
-    expect(template.extensions?.['ai.nanoco.nanoclaw']?.agentName).toBe(agent);
   });
 });
