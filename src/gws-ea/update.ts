@@ -20,6 +20,9 @@
  * run. Each phase is recorded as it completes, so an update cut short
  * anywhere is continued by the next `update --id`; one that fails before it
  * is committed is handed to recovery.
+ *
+ * An assistant still on the layout before releases is converted by its first
+ * update, one way and with no rollback target (`release-convert.ts`, KTD12).
  */
 import { lstat, mkdir, readdir, readFile, realpath, rm, statfs } from 'node:fs/promises';
 import path from 'node:path';
@@ -56,6 +59,7 @@ import {
 import { runStep } from './events.js';
 import { loadCreatedRuntime, type InstanceOperation } from './journal.js';
 import { prepareReleaseGatewayImage, type GatewayImageChange } from './onecli.js';
+import type { OnecliRuntimeLayout } from './onecli-compose.js';
 import {
   advanceOperation,
   assertNotCommitted,
@@ -78,6 +82,7 @@ import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { instanceOnecliLayout, readDeployedSetup } from './provision.js';
 import { safeErrorMessage } from './redact.js';
 import { getInstanceReservation } from './registry.js';
+import { continueConversion, finishConversion, prepareConversion, type ConversionSeams } from './release-convert.js';
 import {
   isReleaseComplete,
   operationName,
@@ -148,7 +153,7 @@ export interface UpdateRequest {
 }
 
 /** Boundary seams; each defaults to the real one. */
-export interface UpdateSeams extends CutoverSeams {
+export interface UpdateSeams extends CutoverSeams, ConversionSeams {
   /** The tool's checkout, whose commit an update deploys; the one this control plane runs from by default. */
   readonly toolRoot?: string;
   /** Runs the staged release's frozen install and its build. */
@@ -187,6 +192,8 @@ export interface UpdatePreview {
   readonly agentRunnerLockChanged: boolean;
   /** The session-schema sources differ, so session columns may change once the new host opens each session. */
   readonly sessionSchemaChanged: boolean;
+  /** The update converts an assistant on the layout before releases (KTD12): the root it leaves, and its short root. */
+  readonly conversion?: { readonly from: string; readonly to: string };
 }
 
 /** A release staged and previewed, not yet recorded. */
@@ -198,10 +205,22 @@ export interface StagedUpdate {
   readonly preview: UpdatePreview;
 }
 
-interface CheckedUpdate {
+/** Where the release an update leaves runs from, which staging reads and never writes. */
+interface RunningRelease {
+  /** The directory holding its `data/`, whose central database the dry run copies. */
+  readonly state: string;
+  /** Its folder, which the staged release is compared with. */
+  readonly release: string;
+  /** Its OneCLI project, whose Compose file names the gateway it runs. */
+  readonly onecli: OnecliRuntimeLayout;
+}
+
+export interface CheckedUpdate {
   readonly reservation: InstanceReservation;
+  /** The assistant's runtime, which the staged release's kept files are rendered for. */
   readonly runtime: InstanceRuntimeConfig;
   readonly target: UpdateReleaseTarget;
+  readonly serving: RunningRelease;
 }
 
 function checkoutRuntime(seams: UpdateSeams): CheckoutRuntime {
@@ -447,7 +466,17 @@ async function checkUpdate(
     assertHostRunning(runtime, dependencies);
     await assertDeploymentCheckoutUnmodified(paths, reservation, checkoutRuntime(dependencies));
   }
-  const checked = { reservation, runtime, target };
+  const layout = paths.instanceLayout(instanceId);
+  const checked: CheckedUpdate = {
+    reservation,
+    runtime,
+    target,
+    serving: {
+      state: layout.state,
+      release: layout.release(releaseName(reservation.deployed_commit)),
+      onecli: instanceOnecliLayout(paths, reservation, runtime.docker_endpoint),
+    },
+  };
   await assertFreeDisk(paths, checked, dependencies);
   return checked;
 }
@@ -615,7 +644,7 @@ async function sameFiles(left: string, right: string, files: readonly string[]):
  */
 async function stageUpdate(
   operation: InstanceOperation,
-  { reservation, runtime, target }: CheckedUpdate,
+  { reservation, runtime, target, serving }: CheckedUpdate,
   dependencies: UpdateDependencies,
 ): Promise<StagedUpdate> {
   const { paths, instanceId } = operation;
@@ -625,7 +654,7 @@ async function stageUpdate(
   const release = target.release;
   const name = releaseName(release.deployed_commit);
   const onecli = instanceOnecliLayout(paths, reservation, runtime.docker_endpoint);
-  const manifest = readSchemaManifest(layout.state);
+  const manifest = readSchemaManifest(serving.state);
   const live = manifest.central_migrations;
 
   const migrations = await runStep(
@@ -638,6 +667,7 @@ async function stageUpdate(
           paths,
           view: reservationAt(reservation, release),
           runtime,
+          state: serving.state,
           onecli,
           service: {
             platform: instanceServicePlatform(dependencies.service?.platform),
@@ -647,7 +677,7 @@ async function stageUpdate(
           provider: target.preflight,
           beforeLink: async (stagedRelease) => {
             const added = await dryRunReleaseMigrations(
-              { liveState: layout.state, liveMigrations: live, stagedRelease },
+              { liveState: serving.state, liveMigrations: live, stagedRelease },
               run,
               (await prepareReleaseCommandEnvironments(layout.root)).common,
             );
@@ -667,17 +697,17 @@ async function stageUpdate(
 
   const gateway = await runStep(reporter, { id: 'prepare_gateway_image', label: 'Preparing the gateway image…' }, () =>
     prepareReleaseGatewayImage(
-      onecli,
+      serving.onecli,
       { gateway: LAUNCHER_PINS.onecliGateway },
       { dockerCommandRunner: run, ...(dependencies.ambientEnv ? { ambientEnv: dependencies.ambientEnv } : {}) },
     ),
   );
 
   const from = releaseOf(reservation);
-  const [running, staged] = [layout.release(releaseName(from.deployed_commit)), layout.release(name)];
+  const staged = layout.release(name);
   const [lockUnchanged, sessionSchemaUnchanged] = await Promise.all([
-    sameFiles(running, staged, [AGENT_RUNNER_LOCKFILE]),
-    sameFiles(running, staged, SESSION_SCHEMA_SOURCES),
+    sameFiles(serving.release, staged, [AGENT_RUNNER_LOCKFILE]),
+    sameFiles(serving.release, staged, SESSION_SCHEMA_SOURCES),
   ]);
   return {
     from,
@@ -689,20 +719,28 @@ async function stageUpdate(
       to: release,
       migrations,
       gateway,
-      groupImages: readDerivedImageGroups(layout.state, getInstallScopedNames(runtime.install_id).containerImageBase),
+      groupImages: readDerivedImageGroups(serving.state, getInstallScopedNames(runtime.install_id).containerImageBase),
       agentRunnerLockChanged: !lockUnchanged,
       sessionSchemaChanged: !sessionSchemaUnchanged,
     },
   };
 }
 
-/** Check, stage, and preview an update under its instance lock, the assistant serving throughout. */
+/**
+ * Check, stage, and preview an update under its instance lock, the assistant
+ * serving throughout. An assistant on the layout before releases is converted
+ * by this update, checked and proven as its conversion needs (KTD12).
+ */
 export async function prepareUpdate(
   operation: InstanceOperation,
   intent: UpdateIntent,
   dependencies: UpdateDependencies,
 ): Promise<StagedUpdate> {
   operation.assertActive();
+  const conversion = await prepareConversion(operation, intent, dependencies, (checked) =>
+    stageUpdate(operation, checked, dependencies),
+  );
+  if (conversion) return conversion;
   const checked = await runStep(
     dependencies.reporter ?? {},
     { id: 'check_update', label: 'Checking the assistant…' },
@@ -714,8 +752,9 @@ export async function prepareUpdate(
 /**
  * Ask `confirm` about a staged update, then record it at `staged` (KTD2),
  * from the release the registry names, with the live schema staging read.
- * A decline records nothing; the staged release is left for the next update.
- * Returns the record, or undefined when declined.
+ * A conversion keeps nothing to return to, so it has no rollback target
+ * (KTD9, KTD12). A decline records nothing; the staged release is left for
+ * the next update. Returns the record, or undefined when declined.
  */
 export async function confirmStagedUpdate(
   operation: InstanceOperation,
@@ -723,7 +762,13 @@ export async function confirmStagedUpdate(
   confirm: (preview: UpdatePreview) => Promise<boolean>,
 ): Promise<OperationRecord | undefined> {
   if (!(await confirm(staged.preview))) return undefined;
-  return beginOperation(operation, { kind: 'update', from: staged.from, to: staged.to, manifest: staged.manifest });
+  return beginOperation(operation, {
+    kind: 'update',
+    from: staged.from,
+    to: staged.to,
+    manifest: staged.manifest,
+    ...(staged.preview.conversion ? { no_rollback_target: true as const } : {}),
+  });
 }
 
 function releaseLine(release: ReleaseCoordinates): string {
@@ -749,11 +794,16 @@ export function updatePreviewLines(preview: UpdatePreview): string[] {
           `Until rebuilt, ${groups} run the previous agent-runner dependencies, so their first turns may fail and retry.`,
         ]
       : []),
-    ...(preview.migrations.length > 0 || preview.sessionSchemaChanged
+    ...(preview.conversion
       ? [
-          `${preview.migrations.length > 0 ? 'This release migrates the database' : "This release changes its session databases' schema"}: a failure after it starts may restore the pre-update snapshot, discarding what the new release recorded before it failed.`,
+          `Layout: its state moves by rename from ${preview.conversion.from} to ${preview.conversion.to}, one way.`,
+          'Rollback: none. No backup is kept and its old rollback point is dropped; a failure after the new release starts is fixed forward with a newer release.',
         ]
-      : []),
+      : preview.migrations.length > 0 || preview.sessionSchemaChanged
+        ? [
+            `${preview.migrations.length > 0 ? 'This release migrates the database' : "This release changes its session databases' schema"}: a failure after it starts may restore the pre-update snapshot, discarding what the new release recorded before it failed.`,
+          ]
+        : []),
   ];
 }
 
@@ -887,8 +937,10 @@ async function refence(host: CutoverHost): Promise<OperationRecord> {
  * its follow-ups planned, and the registry compare-and-swap commits it. A
  * resume between the fence and the start fences again first, so a switch is
  * always followed by a start that reads the service definition it installed.
+ * Returns why what a converted assistant's old layout left could not be
+ * removed, for the update to report once committed.
  */
-async function runUpdate(host: CutoverHost, start: OperationRecord): Promise<void> {
+async function runUpdate(host: CutoverHost, start: OperationRecord): Promise<GwsEaError | undefined> {
   const { operation, layout, reporter } = host;
   const name = releaseName(start.to.deployed_commit);
   let record = RESUMED_FENCED.has(start.phase) ? await refence(host) : start;
@@ -942,13 +994,17 @@ async function runUpdate(host: CutoverHost, start: OperationRecord): Promise<voi
         });
         break;
       }
-      case 'verified':
+      case 'verified': {
+        // A converted assistant's old layout goes once a release here is verified, before the commit, so a run cut
+        // short removes it when this update is continued (KTD12).
+        const leftover = await finishConversion(host);
         await runStep(reporter, { id: 'record_release', label: 'Recording the new release…' }, () =>
           commitOperationRelease(operation),
         );
-        return;
+        return leftover;
+      }
       case 'committed':
-        return;
+        return undefined;
     }
   }
 }
@@ -965,7 +1021,8 @@ export interface UpdatedAssistant {
  * Carry a confirmed update from whatever phase its record reached to its
  * committed release, then run its follow-ups. A failure before the release is
  * committed goes to recovery; one after never rolls back, and is left for the
- * next `update --id` to retry.
+ * next `update --id` to retry. What a converted assistant's old layout left
+ * and could not be removed is reported last.
  */
 export async function continueUpdate(
   operation: InstanceOperation,
@@ -977,9 +1034,16 @@ export async function continueUpdate(
   if (!record || record.kind !== 'update' || record.closed) {
     throw new GwsEaError('operation_missing', `Assistant ${instanceId} has no update under way.`);
   }
+  let leftover: GwsEaError | undefined;
   if (record.phase !== 'committed') {
+    // An assistant on the layout before releases is moved to its short root first; the conversion reports its own
+    // failures, and leaves the update recorded at `snapshotted` (KTD12).
+    await continueConversion(operation, dependencies);
     try {
-      await runUpdate(await openCutoverHost(operation, dependencies), record);
+      leftover = await runUpdate(
+        await openCutoverHost(operation, dependencies),
+        (await readOperationRecord(paths, instanceId)) ?? record,
+      );
       // eslint-disable-next-line no-catch-all/no-catch-all -- Every failure before the commit point goes to recovery, which reports it.
     } catch (error) {
       return recoverUpdate(
@@ -990,5 +1054,6 @@ export async function continueUpdate(
     }
   }
   await finishFollowUps(operation, dependencies);
+  if (leftover) throw leftover;
   return { from: record.from, to: record.to, rollbackTarget: record.no_rollback_target !== true };
 }

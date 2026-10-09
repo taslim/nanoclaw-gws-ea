@@ -46,6 +46,12 @@ export interface ReleaseStageRequest {
   readonly view: InstanceReservation;
   /** The assistant's runtime, which the release's kept files are rendered for. */
   readonly runtime: InstanceRuntimeConfig;
+  /**
+   * The state the assistant serves from, whose `.env` sets the image's build
+   * flags: its own `state/`, or the old checkout during the one-time
+   * conversion, before that state has moved.
+   */
+  readonly state: string;
   readonly onecli: OnecliRuntimeLayout;
   /** The service manager the release's service definition is rendered for. */
   readonly service: ServiceLayoutOptions;
@@ -105,7 +111,7 @@ export async function stageRelease(request: ReleaseStageRequest, seams: ReleaseS
     installId: runtime.install_id,
     inputs: {
       contextTree: await committedTree(release, view.deployed_commit, 'container', seams),
-      installCjkFonts: readInstallCjkFonts(layout.state),
+      installCjkFonts: readInstallCjkFonts(request.state),
     },
   });
   await request.beforeLink?.(release);

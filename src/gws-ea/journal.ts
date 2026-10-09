@@ -35,7 +35,7 @@ import {
   validateReservation,
   withMachineLock,
 } from './registry.js';
-import { assertConverted } from './release-convert.js';
+import { assertConverted, legacyInstanceRoot } from './release-convert.js';
 import { removePrivateFile } from './secrets.js';
 import { loadInstanceRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
 import {
@@ -426,7 +426,10 @@ export async function acquireInstanceOperation(
     if (intent.command !== 'update') assertConverted(paths, reservation);
     await preparePrivateDirectory(paths.instanceRoot(instanceId));
     await admitInstanceCommand(paths, reservation, intent);
-    if (CONTRACT_BOUND.has(intent.command)) await readProvisionJournal(paths, instanceId);
+    // An unconverted assistant's journal is the conversion's to read, once it has rewritten one from contract 1.
+    if (CONTRACT_BOUND.has(intent.command) && legacyInstanceRoot(paths, reservation) === undefined) {
+      await readProvisionJournal(paths, instanceId);
+    }
   } catch (error) {
     unlock();
     throw error;

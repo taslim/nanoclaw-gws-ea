@@ -393,6 +393,7 @@ export async function assistant(host: Machine, options: AssistantOptions = {}): 
       paths,
       view: reserved,
       runtime,
+      state: layout.state,
       onecli,
       service,
       provider: { provider: 'claude', providerCredential: CREDENTIAL },

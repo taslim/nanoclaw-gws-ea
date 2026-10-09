@@ -33,6 +33,7 @@ import { assertInstanceCreated } from './journal.js';
 import { CONTROL_PLANE_ROOT, type ControlPlanePaths } from './paths.js';
 import { safeErrorMessage } from './redact.js';
 import { getInstanceReservation } from './registry.js';
+import { assertConverted } from './release-convert.js';
 import { resolveReleaseTarget, type ToolProviderSetup } from './release-target.js';
 import type { NanoclawServiceHelpers } from './service-control.js';
 import { listAssistants, unfinishedOperation, type ListedAssistant } from './status.js';
@@ -133,6 +134,8 @@ async function intendedTurn(
 ): Promise<IntendedTurn> {
   const { paths, seams } = context;
   try {
+    // The one-time conversion runs only through `update --id`, with the owner present.
+    assertConverted(paths, await getInstanceReservation(paths, instanceId));
     await assertInstanceCreated(paths, instanceId);
     const intent = await resolveUpdateIntent(paths, { instanceId, expectedToolCommit: toolCommit }, seams);
     // `update --id` finishes a committed operation's follow-ups first, and is done when it committed this release.
