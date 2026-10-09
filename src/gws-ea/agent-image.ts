@@ -33,13 +33,14 @@ const AGENT_IMAGE_KEY_VERSION = 'gws-ea agent image key 1';
 const AGENT_IMAGE_KEY = /^[0-9a-f]{64}$/u;
 const IMAGE_ID = /^sha256:[0-9a-f]{64}$/u;
 /**
- * A tag that names an assistant's agent image itself: `:latest`, `:previous`,
- * or an update's `:next`, in an assistant's repository (`nanoclaw-agent-v2-`
- * and its install slug, `src/install-slug.ts`). An agent group's own image,
+ * A tag that names an assistant's agent image itself: a kept release's
+ * `:r-<release>` (`agent-image-release.ts`), `:latest`, `:previous`, or an
+ * update's `:next`, in an assistant's repository (`nanoclaw-agent-v2-` and its
+ * install slug, `src/install-slug.ts`). An agent group's own image,
  * `:<agentGroupId>`, is built `FROM` the agent image and inherits its labels,
  * the key's included, so only these tags make an image the one a key names.
  */
-const AGENT_IMAGE_TAG = /^nanoclaw-agent-v2-[a-z0-9][a-z0-9_-]{0,31}:(?:latest|previous|next)$/u;
+const AGENT_IMAGE_TAG = /^nanoclaw-agent-v2-[a-z0-9][a-z0-9_-]{0,31}:(?:latest|previous|next|r-[0-9a-f]{8})$/u;
 /** How a hold's tag starts (see `heldImageTag`); an agent group's ID starts `ag-`, so none is taken for one. */
 const HELD_TAG_PREFIX = 'held-';
 const DOCKER_TIMEOUT_MS = 60_000;
@@ -279,6 +280,19 @@ async function releaseHeldImages(context: ImageDocker, base: string): Promise<vo
   for (const hold of holds) await docker(context, ['image', 'rm', hold]);
 }
 
+/**
+ * `docker image rm reference`, Docker deciding what goes: a tag is removed,
+ * and its image with it only when no other tag names it; an image ID deletes
+ * the image with every tag of its one repository. One already gone is removed.
+ */
+export async function removeImage(context: ImageDocker, reference: string): Promise<void> {
+  try {
+    await docker(context, ['image', 'rm', reference]);
+  } catch (error) {
+    if (!noSuchImage(error)) throw error;
+  }
+}
+
 /** What `docker image inspect` says of one image that matters for sharing it. */
 interface InspectedImage {
   readonly id: string;
@@ -288,7 +302,7 @@ interface InspectedImage {
 }
 
 /** One image as `docker image inspect` reports it, or undefined when it is gone. */
-async function inspectImage(context: ImageDocker, imageId: string): Promise<InspectedImage | undefined> {
+export async function inspectImage(context: ImageDocker, imageId: string): Promise<InspectedImage | undefined> {
   let stdout: string;
   try {
     ({ stdout } = await docker(context, ['image', 'inspect', imageId]));

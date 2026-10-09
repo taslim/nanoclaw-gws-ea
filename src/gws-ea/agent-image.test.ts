@@ -239,6 +239,21 @@ describe('the image shared under a key', () => {
     expect(await findSharedAgentImage(docker, key)).toBe(id('1'));
   });
 
+  it("takes up an image a kept release's tag names, and no tag merely shaped like one", async () => {
+    const docker = stubDocker([
+      { id: id('1'), tags: ['nanoclaw-agent-v2-a:r-8774b4dc'], created: '2026-09-28T10:00:00Z', key },
+      // Newer, but under tags no release has.
+      {
+        id: id('2'),
+        tags: ['nanoclaw-agent-v2-b:r-8774B4DC', 'nanoclaw-agent-v2-b:r-8774b4dc0', 'nanoclaw-agent-v2-b:r-'],
+        created: '2026-09-29T00:00:00Z',
+        key,
+      },
+    ]);
+
+    expect(await findSharedAgentImage(docker, key)).toBe(id('1'));
+  });
+
   it('never takes up an image no tag names, or one gone since Docker listed it', async () => {
     const docker = stubDocker([
       { id: id('1'), tags: [], created: '2026-09-28T10:00:00Z', key },
