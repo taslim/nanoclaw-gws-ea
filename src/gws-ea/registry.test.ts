@@ -122,7 +122,6 @@ function createSetupInput() {
     assistantWorkspaceEmail: 'assistant@example.test',
     bootstrapManifest: {
       schema_version: 1,
-      onecli_cli_path: '/usr/local/bin/onecli',
       node_path: process.execPath,
       home_directory: '/Users/operator',
       platform: process.platform === 'darwin' ? 'macos' : 'linux',
@@ -155,7 +154,6 @@ const PREREQUISITES: Prerequisites = {
   homeDirectory: '/Users/operator',
   runningAsRoot: false,
   nodePath: process.execPath,
-  onecliCliPath: '/usr/local/bin/onecli',
   dockerEndpoint: 'unix:///var/run/docker.sock',
   rootlessDocker: false,
   account: 'operator@example.test',

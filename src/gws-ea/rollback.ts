@@ -928,11 +928,11 @@ async function swapRollback(rollback: Rollback): Promise<OperationRecord> {
   return advanceOperation(operation, 'swapped');
 }
 
-/** The OneCLI versions the live receipt records; releases never differ in them (R9). */
+/** The OneCLI version the live receipt records; releases never differ in it (R9). */
 async function livePins(rollback: Rollback, release: ReleaseCoordinates): Promise<OnecliPins> {
   const view = reservationAt(rollback.reservation, release);
   const { onecli } = await readDeployedSetup(rollback.operation.paths, view, [release.deployed_commit]);
-  return { gateway: onecli.gateway, cli: onecli.cli };
+  return { gateway: onecli.gateway };
 }
 
 async function composeGateway(file: string): Promise<string> {

@@ -45,7 +45,6 @@ function runtime(): InstanceRuntimeConfig {
     onecli_app_url: 'http://127.0.0.1:31002',
     onecli_gateway_url: 'http://127.0.0.1:31003',
     onecli_gateway_container: 'gws-ea-x-gateway-1',
-    onecli_cli_path: '/opt/onecli',
     selected_provider: 'claude',
     endpoint_url: 'https://juno.example.test/webhook/gchat',
     docker_endpoint: 'unix:///var/run/docker.sock',

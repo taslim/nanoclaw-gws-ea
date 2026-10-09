@@ -32,6 +32,7 @@ import { MAIN_GROUP_NAME } from './identity.js';
 import { readProvisionJournal } from './journal.js';
 import { runInstanceNclJson } from './ncl.js';
 import { observeOnecliRuntime } from './onecli.js';
+import type { OnecliAgent } from './onecli-admin.js';
 import { observeGoogleConnection, type GoogleConnectionReport } from './google-connection.js';
 import { createOnecliRuntimeLayout, type OnecliPins, type OnecliRuntimeLayout } from './onecli-compose.js';
 import {
@@ -52,8 +53,8 @@ import { redact, safeErrorMessage } from './redact.js';
 import { assertInstanceId, readRegistry } from './registry.js';
 import { readKeptPreviousRelease, sameSchema } from './rollback.js';
 import {
+  instanceOnecliAdmin,
   loadInstanceRuntimeConfig,
-  runInstanceOnecliAdminCommand,
   type HostStatusHelpers,
   type InstanceRuntimeConfig,
 } from './service.js';
@@ -72,7 +73,7 @@ import {
   type InstanceReservation,
   type ReleaseCoordinates,
 } from './types.js';
-import { isRecord, optionalString, parseJson, unwrapData } from './validation.js';
+import { isRecord, optionalString, unwrapData } from './validation.js';
 import {
   readLatestDelivery,
   readSchemaManifest,
@@ -94,6 +95,7 @@ const UNOBSERVABLE_CODES: ReadonlySet<string> = new Set([
   'command_timeout',
   'command_output_limit',
   'service_unobservable',
+  'onecli_request_failed',
 ]);
 
 /** `ok`: observed healthy; `degraded`: observed something wrong; `unknown`: could not observe. */
@@ -291,8 +293,8 @@ export interface StatusObservers {
   readonly fetch?: typeof globalThis.fetch;
   /** `ncl <args> --json` through the assistant's own host. */
   readonly ncl: (runtime: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
-  /** The assistant's OneCLI CLI, with the instance-held admin key. */
-  readonly onecliAdmin: (runtime: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
+  /** The assistant's OneCLI agents, as its OneCLI lists them to the instance-held admin key. */
+  readonly onecliAgents: (runtime: InstanceRuntimeConfig) => Promise<readonly OnecliAgent[]>;
   readonly onecli: (layout: OnecliRuntimeLayout, pins: OnecliPins) => Promise<Observation>;
   readonly connector: (
     layout: CloudflareConnectorLayout,
@@ -371,17 +373,9 @@ function resolveObservers(overrides: Partial<StatusObservers> = {}): StatusObser
     runCommand,
     ...(overrides.fetch ? { fetch: overrides.fetch } : {}),
     ncl: overrides.ncl ?? runInstanceNclJson,
-    onecliAdmin:
-      overrides.onecliAdmin ??
-      (async (runtime, args) =>
-        parseJson(
-          (await runInstanceOnecliAdminCommand(runtime, args, { runCommand })).stdout,
-          'OneCLI output',
-          'invalid_child_output',
-        )),
+    onecliAgents: overrides.onecliAgents ?? (async (runtime) => (await instanceOnecliAdmin(runtime)).listAgents()),
     onecli:
-      overrides.onecli ??
-      ((layout, pins) => observeOnecliRuntime(layout, pins, { dockerCommandRunner: runCommand, runCommand })),
+      overrides.onecli ?? ((layout, pins) => observeOnecliRuntime(layout, pins, { dockerCommandRunner: runCommand })),
     connector:
       overrides.connector ??
       ((layout, dockerEndpoint) => observeCloudflareConnector(layout, { runCommand, dockerEndpoint })),
@@ -637,10 +631,9 @@ async function onecliProbe({
     project: reservation.exclusive_resource_claims.onecli_project,
     appPort: reservation.allocated_ports.onecli_app,
     gatewayPort: reservation.allocated_ports.onecli_gateway,
-    cliExecutable: runtime.onecli_cli_path,
     dockerEndpoint: runtime.docker_endpoint,
   });
-  return fromObservation(await observers.onecli(layout, { gateway: setup.onecli.gateway, cli: setup.onecli.cli }));
+  return fromObservation(await observers.onecli(layout, { gateway: setup.onecli.gateway }));
 }
 
 /** Main's agent group ID, as the profile the running host serves names it. */
@@ -653,19 +646,15 @@ async function publishedMain({ runtime: record, observers }: Subject): Promise<s
 }
 
 /** The assistant's OneCLI agents, as its own OneCLI lists them. */
-async function onecliAgents({ runtime: record, observers }: Subject): Promise<readonly Record<string, unknown>[]> {
-  const agents = unwrapData(await observers.onecliAdmin(requireRuntime(record), ['agents', 'list', '--max', '0']));
-  if (!Array.isArray(agents) || !agents.every(isRecord)) {
-    throw new GwsEaError('invalid_child_output', 'OneCLI returned an invalid agent list');
-  }
-  return agents;
+function onecliAgents({ runtime: record, observers }: Subject): Promise<readonly OnecliAgent[]> {
+  return observers.onecliAgents(requireRuntime(record));
 }
 
 /** Main as published, on the assistant's provider, with its OneCLI agent granted every secret. */
 async function mainIdentityProbe(
   subject: Subject,
   main: () => Promise<string>,
-  listAgents: () => Promise<readonly Record<string, unknown>[]>,
+  listAgents: () => Promise<readonly OnecliAgent[]>,
 ): Promise<ProbeResult & MainIdentityFacts> {
   const runtime = requireRuntime(subject.runtime);
   const { ncl } = subject.observers;
@@ -692,7 +681,7 @@ async function mainIdentityProbe(
   if (matching.length > 1) return degraded('Several OneCLI agents claim main.');
   if (agent.name !== MAIN_GROUP_NAME) return degraded("Main's OneCLI agent is not named main.");
   if (agent.secretMode !== 'all') {
-    return degraded(`Main's OneCLI agent is granted ${optionalString(agent.secretMode) ?? 'no'} secrets, not all.`);
+    return degraded(`Main's OneCLI agent is granted ${agent.secretMode} secrets, not all.`);
   }
   return { ...OK, agent_group_id: agentGroupId };
 }

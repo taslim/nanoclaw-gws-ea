@@ -12,7 +12,6 @@ import type { SetupProviderEntry } from './providers/registry.js';
 import { authenticateGwsEaProvider, collectGwsEaCreateInput } from './gws-ea-input.js';
 
 const prerequisites: Prerequisites = {
-  onecliCliPath: '/opt/homebrew/bin/onecli',
   nodePath: '/opt/homebrew/bin/node',
   homeDirectory: '/Users/principal',
   platform: 'macos',
@@ -103,7 +102,6 @@ describe('GWS-EA interactive create input', () => {
       assistantWorkspaceEmail: 'ada@example.test',
       bootstrapManifest: {
         schema_version: 1,
-        onecli_cli_path: '/opt/homebrew/bin/onecli',
         node_path: '/opt/homebrew/bin/node',
         home_directory: '/Users/principal',
         platform: 'macos',

@@ -362,7 +362,6 @@ describe("an assistant's own service coordinates", () => {
       project: reservation.exclusive_resource_claims.onecli_project,
       appPort: 31_002,
       gatewayPort: 31_003,
-      cliExecutable: '/usr/local/bin/onecli',
       dockerEndpoint: TARGET.dockerEndpoint,
     });
     return createInstanceRuntimeConfig(reservation, onecli, {

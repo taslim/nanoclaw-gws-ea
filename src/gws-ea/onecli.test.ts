@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -26,14 +26,13 @@ import {
   type OnecliRuntimeLayout,
 } from './onecli-compose.js';
 import { computeWrapperImageHash, wrapperImageTag } from './onecli-gateway-image.js';
-import { RECORDED_ONECLI_VERSION } from './fixtures/recordings.js';
 import { GwsEaError } from './types.js';
 
 const INSTANCE_ID = '12345678-1234-4123-8123-123456789abc';
 const ONECLI_API_KEY = `oc_${'a'.repeat(64)}`;
 const DOCKER_ENDPOINT = 'unix:///Users/operator/.docker/run/docker.sock';
 /** The pins this instance's release recorded, deliberately not this launcher's. */
-const PINS: OnecliPins = { gateway: '1.41.3', cli: '2.2.4' };
+const PINS: OnecliPins = { gateway: '1.41.3' };
 /** The content-addressed wrapper gateway image the launcher builds for these pins (real in-tree source). */
 const WRAPPER_HASH = await computeWrapperImageHash(PINS);
 const GATEWAY_IMAGE = wrapperImageTag(WRAPPER_HASH);
@@ -45,7 +44,7 @@ const GATEWAY_IMAGE = wrapperImageTag(WRAPPER_HASH);
 const RELEASE_WRAPPER_HASH = '0123456789abcdef';
 const RELEASE_GATEWAY_IMAGE = wrapperImageTag(RELEASE_WRAPPER_HASH);
 const RELEASE_POSTGRES_IMAGE = 'postgres:17-alpine';
-/** An operator shell that points Docker, Compose, and OneCLI at another runtime. */
+/** An operator shell that points Docker and Compose at another runtime. */
 const HOSTILE_AMBIENT: NodeJS.ProcessEnv = {
   PATH: '/safe/bin',
   HOME: '/host/home',
@@ -75,7 +74,6 @@ async function layoutFixture() {
     project: 'gws-ea-12345678123441238123123456789abc',
     appPort: 31_002,
     gatewayPort: 31_003,
-    cliExecutable: '/opt/onecli/bin/onecli',
     dockerEndpoint: DOCKER_ENDPOINT,
   });
 }
@@ -115,6 +113,26 @@ describe('OneCLI child boundaries', () => {
       false,
     );
   });
+
+  it.each([
+    ['header', { headerName: 'x-api-key' }, { headerName: 'x-api-key', valueFormat: '{value}' }],
+    ['query parameter', { paramName: 'key' }, { paramName: 'key', paramFormat: '{value}' }],
+  ])(
+    'matches a %s secret OneCLI stored with its default format to metadata that names none',
+    (_kind, named, stored) => {
+      const expected = { name: 'Search', type: 'generic', hostPattern: 'api.search.example.test', ...named };
+      const observed = {
+        id: 'search-secret-id',
+        name: 'Search',
+        type: 'generic',
+        hostPattern: 'api.search.example.test',
+        pathPattern: null,
+        injectionConfig: stored,
+      };
+
+      expect(onecliSecretMatchesCredentialMetadata(observed, expected)).toBe(true);
+    },
+  );
 });
 
 describe('OneCLI runtime removal', () => {
@@ -190,7 +208,7 @@ describe('OneCLI runtime removal', () => {
 type Health = 'healthy' | 'unhealthy' | 'starting';
 type ServiceName = 'postgres' | 'app' | 'gateway';
 
-/** An in-memory Docker daemon and OneCLI CLI for one instance's runtime. */
+/** An in-memory Docker daemon for one instance's runtime. */
 interface DockerWorld {
   readonly services: Map<ServiceName, { running: boolean; health: Health }>;
   /** Containers outside the three services, by ID and as Docker inspects them, until `container rm` removes them. */
@@ -199,10 +217,6 @@ interface DockerWorld {
   /** Health a container takes when `up` (re)creates or starts it. */
   startsAs: Health;
   failUp?: GwsEaError;
-  serverVersion: string;
-  cliVersion: string;
-  /** `onecli version` as printed, instead of an answer built from the versions above. */
-  versionOutput?: string;
   /** The image the gateway container runs, instead of the recorded pin. */
   gatewayImage?: string;
   /** The image the postgres container runs, instead of this tool's. */
@@ -267,8 +281,6 @@ function dockerWorld(layout: OnecliRuntimeLayout, initial: Partial<Record<Servic
     strays: new Map(),
     calls: [],
     startsAs: 'healthy',
-    serverVersion: PINS.gateway,
-    cliVersion: PINS.cli,
     provenance: new Map([
       [GATEWAY_IMAGE, WRAPPER_HASH],
       [RELEASE_GATEWAY_IMAGE, RELEASE_WRAPPER_HASH],
@@ -284,19 +296,6 @@ function dockerWorld(layout: OnecliRuntimeLayout, initial: Partial<Record<Servic
     world.calls.push(command);
     const args = command.args;
     const reply = (value: unknown) => ({ stdout: JSON.stringify(value), stderr: '' });
-    if (command.command === layout.cliExecutable) {
-      if (args[0] === 'auth') return reply({ apiKey: ONECLI_API_KEY });
-      if (args[0] === 'version') {
-        return world.versionOutput === undefined
-          ? reply({ version: world.cliVersion, server_version: world.serverVersion })
-          : { stdout: world.versionOutput, stderr: '' };
-      }
-      if (args[0] === 'secrets' && args[1] === 'list') return reply([]);
-      if (args[0] === 'secrets' && args[1] === 'create') {
-        return reply({ id: 'secret-provider', name: args[args.indexOf('--name') + 1] });
-      }
-      throw new Error(`unexpected onecli command: ${args.join(' ')}`);
-    }
     if (command.command !== 'docker') throw new Error(`unexpected program: ${command.command}`);
     if (args[0] === 'container' && args[1] === 'ls') {
       const ids = [...[...world.services.keys()].map((service) => `id-${service}`), ...world.strays.keys()];
@@ -387,7 +386,50 @@ function dockerWorld(layout: OnecliRuntimeLayout, initial: Partial<Record<Servic
   return { world, runner };
 }
 
-const healthyFetch = () => vi.fn(async (_url: string | URL | Request) => new Response('{}', { status: 200 }));
+/** OneCLI's health endpoints, all healthy, and the local API key it hands a keyless caller. */
+const healthyFetch = () =>
+  vi.fn(async (url: string | URL | Request) =>
+    String(url).endsWith('/v1/user/api-key') ? Response.json({ apiKey: ONECLI_API_KEY }) : Response.json({}),
+  );
+
+interface OnecliRequest {
+  readonly method: string;
+  readonly url: string;
+  readonly authorization: string | null;
+  readonly body: Record<string, unknown> | undefined;
+}
+
+/** OneCLI's app behind `fetch`: healthy, handing out one local API key, and holding `secrets`. */
+function onecliApp(layout: OnecliRuntimeLayout, secrets: Record<string, unknown>[] = []) {
+  const requests: OnecliRequest[] = [];
+  const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    const method = init?.method ?? 'GET';
+    const body = typeof init?.body === 'string' ? (JSON.parse(init.body) as Record<string, unknown>) : undefined;
+    requests.push({ method, url, authorization: new Headers(init?.headers).get('authorization'), body });
+    if (url === `${layout.appUrl}/v1/user/api-key`) return Response.json({ apiKey: ONECLI_API_KEY });
+    if (url === `${layout.appUrl}/v1/secrets` && method === 'GET') return Response.json(secrets);
+    if (url === `${layout.appUrl}/v1/secrets` && method === 'POST') {
+      const { value, ...metadata } = body ?? {};
+      secrets.push({ id: 'secret-provider', ...metadata });
+      return Response.json({ id: 'secret-provider', preview: `${String(value).slice(0, 4)}••••` }, { status: 201 });
+    }
+    return Response.json({});
+  });
+  return { fetch, requests };
+}
+
+/** Every file beneath `root`, with its contents. */
+async function filesBeneath(root: string): Promise<ReadonlyMap<string, string>> {
+  const files = new Map<string, string>();
+  for (const entry of await readdir(root, { recursive: true, withFileTypes: true })) {
+    if (entry.isFile()) {
+      const file = path.join(entry.parentPath, entry.name);
+      files.set(file, await readFile(file, 'utf8'));
+    }
+  }
+  return files;
+}
 
 function composeCalls(world: DockerWorld): string[][] {
   return world.calls
@@ -415,7 +457,7 @@ describe('OneCLI runtime observation', () => {
     const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
     world.gatewayImage = RELEASE_GATEWAY_IMAGE;
     world.postgresImage = RELEASE_POSTGRES_IMAGE;
-    const dependencies = { dockerCommandRunner: runner, runCommand: runner, fetch: healthyFetch() };
+    const dependencies = { dockerCommandRunner: runner, fetch: healthyFetch() };
 
     expect(RELEASE_GATEWAY_IMAGE).not.toBe(GATEWAY_IMAGE);
     await expect(observeOnecliRuntime(layout, PINS, dependencies)).resolves.toEqual({ status: 'present' });
@@ -533,7 +575,6 @@ describe('OneCLI runtime start and repair', () => {
 
     await reconcileOnecliRuntime(layout, PINS, {
       dockerCommandRunner: runner,
-      runCommand: runner,
       fetch: healthyFetch(),
       ambientEnv: HOSTILE_AMBIENT,
     });
@@ -612,7 +653,6 @@ describe('OneCLI runtime start and repair', () => {
 
     await reconcileOnecliRuntime(layout, PINS, {
       dockerCommandRunner: runner,
-      runCommand: runner,
       fetch: healthyFetch(),
     });
 
@@ -634,7 +674,7 @@ describe('OneCLI runtime start and repair', () => {
     world.wrapperImageMissing = true;
 
     await expect(
-      reconcileOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, runCommand: runner, fetch: healthyFetch() }),
+      reconcileOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, fetch: healthyFetch() }),
     ).rejects.toMatchObject({
       code: 'onecli_gateway_image_missing',
       message: expect.stringContaining(RELEASE_GATEWAY_IMAGE),
@@ -651,7 +691,6 @@ describe('OneCLI runtime start and repair', () => {
 
     await reconcileOnecliRuntime(layout, PINS, {
       dockerCommandRunner: runner,
-      runCommand: runner,
       fetch: healthyFetch(),
     });
 
@@ -670,7 +709,6 @@ describe('OneCLI runtime start and repair', () => {
 
     await reconcileOnecliRuntime(layout, PINS, {
       dockerCommandRunner: runner,
-      runCommand: runner,
       fetch: healthyFetch(),
     });
 
@@ -695,7 +733,7 @@ describe('OneCLI runtime start and repair', () => {
     world.failBuild = new GwsEaError('command_failed', 'docker build failed');
 
     await expect(
-      reconcileOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, runCommand: runner, fetch: healthyFetch() }),
+      reconcileOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, fetch: healthyFetch() }),
     ).rejects.toMatchObject({ code: 'command_failed' });
     // A failed build must abort before compose brings anything up.
     expect(world.calls.some((call) => call.args.includes('up'))).toBe(false);
@@ -707,7 +745,6 @@ describe('OneCLI runtime start and repair', () => {
 
     await reconcileOnecliRuntime(layout, PINS, {
       dockerCommandRunner: runner,
-      runCommand: runner,
       fetch: healthyFetch(),
     });
 
@@ -721,7 +758,6 @@ describe('OneCLI runtime start and repair', () => {
 
     await reconcileOnecliRuntime(layout, PINS, {
       dockerCommandRunner: runner,
-      runCommand: runner,
       fetch: healthyFetch(),
     });
 
@@ -741,7 +777,7 @@ describe('OneCLI runtime start and repair', () => {
     world.failProbe = new GwsEaError('command_failed', 'own app admin API reachable through gateway');
 
     await expect(
-      reconcileOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, runCommand: runner, fetch: healthyFetch() }),
+      reconcileOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, fetch: healthyFetch() }),
     ).rejects.toMatchObject({ code: 'command_failed' });
   });
 
@@ -752,7 +788,7 @@ describe('OneCLI runtime start and repair', () => {
     world.wrongProvenance = 'stale0000feedface';
 
     await expect(
-      verifyOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, runCommand: runner, fetch: healthyFetch() }),
+      verifyOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, fetch: healthyFetch() }),
     ).rejects.toMatchObject({ code: 'unsafe_onecli_image', message: expect.stringMatching(/provenance label/u) });
   });
 
@@ -762,7 +798,6 @@ describe('OneCLI runtime start and repair', () => {
 
     const receipt = await reconcileOnecliRuntime(layout, PINS, {
       dockerCommandRunner: runner,
-      runCommand: runner,
       fetch: healthyFetch(),
     });
 
@@ -799,7 +834,6 @@ describe('OneCLI runtime start and repair', () => {
 
     const failure = await reconcileOnecliRuntime(layout, PINS, {
       dockerCommandRunner: runner,
-      runCommand: runner,
       fetch: healthyFetch(),
       findPortHolder: async (port) => {
         holders.push(port);
@@ -974,106 +1008,141 @@ describe("an update's gateway image", () => {
   });
 });
 
-describe('OneCLI health and version check', () => {
-  it('accepts the runtime at this instance’s recorded pins and imports the provider credential through a CLI aimed only at it', async () => {
+describe('OneCLI health check and provider credential', () => {
+  it('accepts the runtime at its recorded pins, reading its local API key once, keylessly, from its own app', async () => {
     const layout = await layoutFixture();
-    await mkdir(layout.secretsDirectory, { recursive: true, mode: 0o700 });
     await writeInstanceCompose(layout);
-    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
-    const fetch = healthyFetch();
+    const { runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
+    const { fetch, requests } = onecliApp(layout);
 
     const receipt = await verifyOnecliRuntime(layout, PINS, {
       dockerCommandRunner: runner,
-      runCommand: runner,
       fetch,
       ambientEnv: HOSTILE_AMBIENT,
     });
-    const imported = await importProviderCredential(
-      receipt,
-      { name: 'Anthropic', type: 'anthropic', value: 'provider-real-secret', hostPattern: 'api.anthropic.com' },
-      { runCommand: runner, ambientEnv: HOSTILE_AMBIENT },
-    );
 
-    expect(fetch.mock.calls.map(([url]) => String(url)).sort()).toEqual(
-      [`${layout.appUrl}/api/health`, `${layout.appUrl}/v1/health`, `${layout.gatewayUrl}/healthz`].sort(),
+    expect(requests.map(({ method, url }) => `${method} ${url}`).sort()).toEqual(
+      [
+        `GET ${layout.appUrl}/api/health`,
+        `GET ${layout.appUrl}/v1/health`,
+        `GET ${layout.gatewayUrl}/healthz`,
+        `GET ${layout.appUrl}/v1/user/api-key`,
+      ].sort(),
     );
+    expect(requests.find(({ url }) => url.endsWith('/v1/user/api-key'))?.authorization).toBeNull();
     expect(Object.isFrozen(receipt)).toBe(true);
     expect(Object.keys(receipt)).toEqual([]);
+  });
+
+  it('reads the same key on every check, so the key files the first check wrote are kept', async () => {
+    const layout = await layoutFixture();
+    await writeInstanceCompose(layout);
+    const { runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
+    const { fetch } = onecliApp(layout);
+    const dependencies = { dockerCommandRunner: runner, fetch };
+    await mkdir(layout.secretsDirectory, { recursive: true, mode: 0o700 });
+    const files = {
+      runtime: path.join(layout.secretsDirectory, 'runtime-api-key'),
+      admin: path.join(layout.secretsDirectory, 'admin-api-key'),
+    };
+
+    await persistOnecliApiKeyFiles(await verifyOnecliRuntime(layout, PINS, dependencies), files);
+    await persistOnecliApiKeyFiles(await verifyOnecliRuntime(layout, PINS, dependencies), files);
+
+    expect(await readFile(files.runtime, 'utf8')).toBe(ONECLI_API_KEY);
+    expect(await readFile(files.admin, 'utf8')).toBe(ONECLI_API_KEY);
+  });
+
+  it('imports the provider credential with its value only in the request body, writing no file', async () => {
+    const layout = await layoutFixture();
+    await writeInstanceCompose(layout);
+    const { runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
+    const { fetch, requests } = onecliApp(layout);
+    const receipt = await verifyOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, fetch });
+    const before = await filesBeneath(layout.rootDirectory);
+    const value = 'sk-ant-api03-provider-real-secret';
+    requests.length = 0;
+
+    const imported = await importProviderCredential(
+      receipt,
+      { name: 'Anthropic', type: 'anthropic', value, hostPattern: 'api.anthropic.com' },
+      { fetch },
+    );
+
     expect(imported).toEqual({ id: 'secret-provider', created: true });
-    const cliCalls = world.calls.filter((call) => call.command === layout.cliExecutable);
-    expect(cliCalls.slice(0, 2).map((call) => call.args.join(' '))).toEqual(['auth api-key', 'version']);
-    // Only the key `auth api-key` returned reaches the CLI; the ambient shell's key, host, and targets never do.
-    const [auth, ...keyed] = cliCalls;
-    const keyless = { PATH: '/safe/bin', LANG: 'en_US.UTF-8', HOME: layout.cliHome, ONECLI_API_HOST: layout.appUrl };
-    expect(auth?.env).toEqual(keyless);
-    expect(keyed.map((call) => call.env)).toEqual(keyed.map(() => ({ ...keyless, ONECLI_API_KEY })));
-    const create = world.calls.find((call) => call.args[0] === 'secrets' && call.args[1] === 'create')!;
-    expect(create.args).toContain('--file');
-    expect(create.args).not.toContain('provider-real-secret');
-    expect(await stat(layout.providerStagingFile).catch(() => null)).toBeNull();
+    expect(requests).toEqual([
+      { method: 'GET', url: `${layout.appUrl}/v1/secrets`, authorization: `Bearer ${ONECLI_API_KEY}`, body: undefined },
+      {
+        method: 'POST',
+        url: `${layout.appUrl}/v1/secrets`,
+        authorization: `Bearer ${ONECLI_API_KEY}`,
+        body: { name: 'Anthropic', type: 'anthropic', value, hostPattern: 'api.anthropic.com' },
+      },
+    ]);
+    const after = await filesBeneath(layout.rootDirectory);
+    expect([...after.keys()]).toEqual([...before.keys()]);
+    for (const contents of after.values()) expect(contents).not.toContain(value);
   });
 
   it.each([
-    ['CLI', { cliVersion: '2.2.5' }, 'incompatible_onecli', /CLI 2\.2\.5.*2\.2\.4/u],
-    ['gateway', { serverVersion: '1.42.0' }, 'incompatible_onecli', /gateway 1\.42\.0.*1\.41\.3/u],
     [
-      'gateway image',
-      { gatewayImage: 'ghcr.io/onecli/onecli:1.42.0' },
-      'unsafe_onecli_image',
-      /gateway image.*gws-ea-onecli-gateway/u,
+      'its provider credential',
+      { name: 'Anthropic', type: 'anthropic', hostPattern: 'api.anthropic.com' },
+      { name: 'Anthropic', type: 'anthropic', hostPattern: 'api.anthropic.com', injectionConfig: null },
     ],
-  ] as const)('refuses a %s that differs from the instance’s recorded pin', async (_label, drift, code, message) => {
+    [
+      'a header credential stored with OneCLI’s default format',
+      { name: 'Search', type: 'generic', hostPattern: 'api.search.example.test', headerName: 'x-api-key' },
+      {
+        name: 'Search',
+        type: 'generic',
+        hostPattern: 'api.search.example.test',
+        injectionConfig: { headerName: 'x-api-key', valueFormat: '{value}' },
+      },
+    ],
+  ] as const)('reuses the secret OneCLI already holds for %s, creating none', async (_case, metadata, stored) => {
     const layout = await layoutFixture();
     await writeInstanceCompose(layout);
-    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
-    Object.assign(world, drift);
+    const { runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
+    const { fetch, requests } = onecliApp(layout, [{ id: 'held-secret', pathPattern: null, ...stored }]);
+    const receipt = await verifyOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, fetch });
 
     await expect(
-      verifyOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, runCommand: runner, fetch: healthyFetch() }),
-    ).rejects.toMatchObject({ code, message: expect.stringMatching(message) });
+      importProviderCredential(receipt, { ...metadata, value: 'provider-real-secret' }, { fetch }),
+    ).resolves.toEqual({ id: 'held-secret', created: false });
+    expect(requests.some(({ method }) => method === 'POST')).toBe(false);
   });
 
-  it('reads the recorded `onecli version` answer, whose gateway reports no version', async () => {
+  it('refuses a gateway image that differs from the instance’s recorded pin', async () => {
     const layout = await layoutFixture();
     await writeInstanceCompose(layout);
     const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
-    world.versionOutput = RECORDED_ONECLI_VERSION.stdout;
-    const dependencies = { dockerCommandRunner: runner, runCommand: runner, fetch: healthyFetch() };
+    world.gatewayImage = 'ghcr.io/onecli/onecli:1.42.0';
 
-    await expect(verifyOnecliRuntime(layout, { ...PINS, cli: '2.2.5' }, dependencies)).resolves.toBeDefined();
-    await expect(verifyOnecliRuntime(layout, PINS, dependencies)).rejects.toMatchObject({
-      code: 'incompatible_onecli',
-      message: expect.stringMatching(/CLI 2\.2\.5.*2\.2\.4/u),
+    await expect(
+      verifyOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, fetch: healthyFetch() }),
+    ).rejects.toMatchObject({
+      code: 'unsafe_onecli_image',
+      message: expect.stringMatching(/gateway image.*gws-ea-onecli-gateway/u),
     });
   });
 
-  it('refuses an unhealthy endpoint before asking the CLI for a key', async () => {
+  it('refuses an unhealthy endpoint before asking for a key', async () => {
     const layout = await layoutFixture();
-    await writeInstanceCompose(layout);
-    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
-    const fetch = vi.fn(async (url: string | URL | Request) =>
-      String(url).endsWith('/healthz') ? new Response('', { status: 503 }) : new Response('{}', { status: 200 }),
-    );
-
-    await expect(
-      verifyOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, runCommand: runner, fetch }),
-    ).rejects.toMatchObject({ code: 'unhealthy_onecli', message: expect.stringContaining('gateway') });
-    expect(world.calls.some((call) => call.command === layout.cliExecutable)).toBe(false);
-  });
-
-  it('removes an orphaned plaintext staging file before verifying or importing', async () => {
-    const layout = await layoutFixture();
-    await mkdir(path.dirname(layout.providerStagingFile), { recursive: true });
-    await writeFile(layout.providerStagingFile, 'orphaned-provider-secret', { mode: 0o600 });
     await writeInstanceCompose(layout);
     const { runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
+    const fetch = vi.fn(async (url: string | URL | Request) =>
+      String(url).endsWith('/healthz') ? new Response('', { status: 503 }) : Response.json({ apiKey: ONECLI_API_KEY }),
+    );
 
-    await verifyOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, runCommand: runner, fetch: healthyFetch() });
-
-    expect(await stat(layout.providerStagingFile).catch(() => null)).toBeNull();
+    await expect(verifyOnecliRuntime(layout, PINS, { dockerCommandRunner: runner, fetch })).rejects.toMatchObject({
+      code: 'unhealthy_onecli',
+      message: expect.stringContaining('gateway'),
+    });
+    expect(fetch.mock.calls.some(([url]) => String(url).endsWith('/v1/user/api-key'))).toBe(false);
   });
 
-  it('refuses to import without a passed health and version check', async () => {
+  it('refuses to import without a passed health check', async () => {
     await expect(
       importProviderCredential(Object.freeze({}) as Parameters<typeof importProviderCredential>[0], {
         name: 'Anthropic',

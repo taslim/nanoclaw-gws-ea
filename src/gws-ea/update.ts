@@ -765,9 +765,9 @@ async function stageRelease(
 
   const gateway = await runStep(reporter, { id: 'prepare_gateway_image', label: 'Preparing the gateway image…' }, () =>
     prepareReleaseGatewayImage(
-      instanceOnecliLayout(paths, reservation, runtime.onecli_cli_path, runtime.docker_endpoint),
-      { gateway: LAUNCHER_PINS.onecliGateway, cli: LAUNCHER_PINS.onecliCli },
-      { runCommand: run, ...(dependencies.ambientEnv ? { ambientEnv: dependencies.ambientEnv } : {}) },
+      instanceOnecliLayout(paths, reservation, runtime.docker_endpoint),
+      { gateway: LAUNCHER_PINS.onecliGateway },
+      { dockerCommandRunner: run, ...(dependencies.ambientEnv ? { ambientEnv: dependencies.ambientEnv } : {}) },
     ),
   );
 
@@ -1219,10 +1219,10 @@ async function moveAgentImages(cutover: Cutover, record: OperationRecord): Promi
   return current;
 }
 
-/** The OneCLI versions the release's receipt records; an update never changes them (R9). */
+/** The OneCLI version the release's receipt records; an update never changes it (R9). */
 async function releasePins(cutover: Cutover): Promise<OnecliPins> {
   const { onecli } = await readDeployedSetup(cutover.operation.paths, cutover.target);
-  return { gateway: onecli.gateway, cli: onecli.cli };
+  return { gateway: onecli.gateway };
 }
 
 /** Whether the release runs another gateway than the one kept with the outgoing release (KTD8). */

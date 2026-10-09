@@ -332,7 +332,6 @@ describe('provision journal v3', () => {
       project: reserved.exclusive_resource_claims.onecli_project,
       appPort: reserved.allocated_ports.onecli_app,
       gatewayPort: reserved.allocated_ports.onecli_gateway,
-      cliExecutable: '/usr/local/bin/onecli',
       dockerEndpoint: 'unix:///var/run/docker.sock',
     });
     const runtime = createInstanceRuntimeConfig(reserved, onecli, {

@@ -861,10 +861,7 @@ class Cli {
         const reservation = await getInstanceReservation(this.#paths, instanceId);
         const account = reservation.exclusive_resource_claims.gcp_account;
         const host = await recordedHost(this.#paths, reservation);
-        await this.#checkPrerequisites(
-          { command: 'resume', paths: this.#paths, account, checkoutRoot: reservation.checkout_realpath, ...host },
-          interaction,
-        );
+        await this.#checkPrerequisites({ command: 'resume', paths: this.#paths, account, ...host }, interaction);
       });
       return await this.#provision(reporter, operation, interaction);
     } finally {
@@ -926,13 +923,7 @@ class Cli {
       await runStep(reporter, PREREQUISITES_STEP, async () => {
         const host = await recordedHost(this.#paths, reservation);
         await this.#checkPrerequisites(
-          {
-            command: 'resume',
-            paths: this.#paths,
-            account: claims.gcp_account,
-            checkoutRoot: reservation.checkout_realpath,
-            ...host,
-          },
+          { command: 'resume', paths: this.#paths, account: claims.gcp_account, ...host },
           interaction,
         );
       });

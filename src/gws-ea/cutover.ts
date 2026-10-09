@@ -1248,7 +1248,7 @@ export async function openCutoverHost(
     run: dependencies.runCommand ?? runSanitizedCommand,
     reservation,
     runtime,
-    onecli: instanceOnecliLayout(operation.paths, reservation, runtime.onecli_cli_path, runtime.docker_endpoint),
+    onecli: instanceOnecliLayout(operation.paths, reservation, runtime.docker_endpoint),
     service: createServiceControl(dependencies.serviceHelpers, runtimeServiceTarget(runtime), dependencies.service),
     uid: dependencies.service?.uid ?? process.getuid?.(),
   };
@@ -1293,7 +1293,6 @@ export function cutoverServiceDependencies(host: CutoverHost): InstanceServiceDe
 
 export function cutoverOnecli({ run, dependencies }: CutoverHost): CutoverOnecli {
   const boundaries = {
-    runCommand: run,
     dockerCommandRunner: run,
     ...(dependencies.ambientEnv ? { ambientEnv: dependencies.ambientEnv } : {}),
     ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),

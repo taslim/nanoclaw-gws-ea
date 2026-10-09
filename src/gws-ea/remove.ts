@@ -79,7 +79,6 @@ import {
   buildToolEnvironment,
   checkedRunner,
   commandExitError,
-  resolveExecutable,
   runSanitizedCommandOutcome,
   type SanitizedCommand,
   type SanitizedCommandOutcomeRunner,
@@ -169,7 +168,6 @@ interface RemovalReceipt {
 export interface LocalRuntime {
   readonly homeDirectory: string;
   readonly dockerEndpoint: string;
-  readonly onecliCliPath: string | undefined;
 }
 
 /** The human input removal may need, through the driver's `Interaction` port. */
@@ -417,7 +415,7 @@ async function assertOwnCheckouts(
 }
 
 /**
- * The home directory, Docker endpoint, and OneCLI CLI the instance recorded:
+ * The home directory and Docker endpoint the instance recorded:
  * `runtime.json` once the host started (in the live checkout, or, with an
  * update or rollback cut short, the newest kept release holding one), else
  * the bootstrap manifest create wrote. Only these fields are read, so files
@@ -426,7 +424,7 @@ async function assertOwnCheckouts(
 async function readRecordedRuntime(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
-): Promise<{ readonly homeDirectory?: string; readonly dockerEndpoint?: string; readonly onecliCliPath?: string }> {
+): Promise<{ readonly homeDirectory?: string; readonly dockerEndpoint?: string }> {
   const records = await Promise.all([
     readRecord(instanceRuntimeFile(reservation.checkout_realpath)),
     ...KEPT_RELEASES.map((slot) =>
@@ -447,11 +445,9 @@ async function readRecordedRuntime(
   };
   const homeDirectory = field('home_directory', requirePath);
   const dockerEndpoint = field('docker_endpoint', requireDockerEndpoint);
-  const onecliCliPath = field('onecli_cli_path', requirePath);
   return {
     ...(homeDirectory ? { homeDirectory } : {}),
     ...(dockerEndpoint ? { dockerEndpoint } : {}),
-    ...(onecliCliPath ? { onecliCliPath } : {}),
   };
 }
 
@@ -868,7 +864,7 @@ export async function uninstallNanoclaw(install: NanoclawInstall, teardown: Nano
   for (const imageId of teardown.recordedImages) await releaseImage(images, repository, imageId);
 }
 
-/** OneCLI's Compose project, through the recorded Docker endpoint; the CLI path is the one the instance stored. */
+/** OneCLI's Compose project, through the recorded Docker endpoint. */
 async function removeOnecli(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
@@ -882,7 +878,6 @@ async function removeOnecli(
       project: reservation.exclusive_resource_claims.onecli_project,
       appPort: reservation.allocated_ports.onecli_app,
       gatewayPort: reservation.allocated_ports.onecli_gateway,
-      cliExecutable: runtime.onecliCliPath ?? (await resolveExecutable('onecli')),
       dockerEndpoint: runtime.dockerEndpoint,
     }),
     { dockerCommandRunner: checkedRunner(run) },
@@ -995,7 +990,6 @@ async function removeLocked(
   const localRuntime = async (): Promise<LocalRuntime> => ({
     homeDirectory: recorded.homeDirectory ?? os.homedir(),
     dockerEndpoint: await docker(),
-    onecliCliPath: recorded.onecliCliPath,
   });
   const run = dependencies.runCommand ?? runSanitizedCommandOutcome;
   const serviceHelpers = dependencies.serviceHelpers;

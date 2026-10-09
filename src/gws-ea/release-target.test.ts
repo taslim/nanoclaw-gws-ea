@@ -9,7 +9,7 @@ import { reserveInstance } from './journal.js';
 import { createOnecliRuntimeLayout, ONECLI_POSTGRES_IMAGE, renderOnecliCompose } from './onecli-compose.js';
 import { wrapperImageTag } from './onecli-gateway-image.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
-import { ONECLI_CLI_VERSION, ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './pins.js';
+import { ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './pins.js';
 import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { allocateInstanceId } from './registry.js';
 import { resolveReleaseTarget, type ToolProviderSetup } from './release-target.js';
@@ -31,7 +31,6 @@ const CREDENTIAL: ProviderCredentialMetadata = {
   hostPattern: 'api.anthropic.com',
   headerName: 'x-api-key',
 };
-const ONECLI_CLI_PATH = '/usr/local/bin/onecli';
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -100,7 +99,7 @@ async function controlPlanePaths(): Promise<ControlPlanePaths> {
 }
 
 interface AssistantRecord {
-  readonly onecli?: { readonly gateway: string; readonly cli: string; readonly sdk: string };
+  readonly onecli?: { readonly gateway: string; readonly sdk: string };
   readonly postgresImage?: string;
   readonly providerCredential?: ProviderCredentialMetadata;
 }
@@ -136,7 +135,6 @@ async function deployedAssistant(
     project: reserved.exclusive_resource_claims.onecli_project,
     appPort: reserved.allocated_ports.onecli_app,
     gatewayPort: reserved.allocated_ports.onecli_gateway,
-    cliExecutable: ONECLI_CLI_PATH,
     dockerEndpoint: 'unix:///var/run/docker.sock',
   });
   await persistInstanceRuntime(
@@ -148,7 +146,7 @@ async function deployedAssistant(
     }),
     () => undefined,
   );
-  const cohort = record.onecli ?? { gateway: ONECLI_GATEWAY_VERSION, cli: ONECLI_CLI_VERSION, sdk: ONECLI_SDK_VERSION };
+  const cohort = record.onecli ?? { gateway: ONECLI_GATEWAY_VERSION, sdk: ONECLI_SDK_VERSION };
   await writeFile(
     paths.releasePreflightFile(instanceId),
     `${JSON.stringify({
@@ -377,7 +375,7 @@ describe('the release an update deploys', () => {
   it.each([
     [
       'OneCLI gateway',
-      { onecli: { gateway: '1.41.0', cli: ONECLI_CLI_VERSION, sdk: ONECLI_SDK_VERSION } },
+      { onecli: { gateway: '1.41.0', sdk: ONECLI_SDK_VERSION } },
       CREDENTIAL,
       'onecli_version_changed',
     ],

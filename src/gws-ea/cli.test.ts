@@ -15,7 +15,6 @@ import { acquireInstanceOperation, recordStepCompleted, reserveInstance } from '
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { advanceOperation, beginOperation } from './operation.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
-import { ONECLI_CLI_VERSION } from './pins.js';
 import type { ProvisionHumanPause, StepResource } from './phases.js';
 import {
   checkPrerequisites,
@@ -100,7 +99,6 @@ function setupAnswers() {
     assistantWorkspaceEmail: 'assistant@example.test',
     bootstrapManifest: {
       schema_version: 1,
-      onecli_cli_path: '/usr/local/bin/onecli',
       node_path: process.execPath,
       home_directory: '/Users/operator',
       platform: process.platform === 'darwin' ? 'macos' : 'linux',
@@ -133,7 +131,6 @@ const PREREQUISITES: Prerequisites = {
   homeDirectory: '/Users/operator',
   runningAsRoot: false,
   nodePath: process.execPath,
-  onecliCliPath: '/usr/local/bin/onecli',
   dockerEndpoint: 'unix:///var/run/docker.sock',
   rootlessDocker: false,
   account: 'operator@example.test',
@@ -1231,7 +1228,6 @@ function hostDependencies(
       if (signature === 'docker context inspect') {
         return ok(JSON.stringify([{ Name: 'default', Endpoints: { docker: { Host: dockerHost } } }]));
       }
-      if (signature === 'onecli version') return ok(JSON.stringify({ version: ONECLI_CLI_VERSION }));
       if (signature.startsWith('gcloud auth list ')) return ok(`${active}\n`);
       if (signature.startsWith('gcloud auth print-access-token ')) {
         return [...expired].some((account) => signature.includes(`--account=${account} `))
@@ -1240,9 +1236,7 @@ function hostDependencies(
       }
       return ok();
     },
-    resolvePersisted: async (command) => (path.basename(command) === 'onecli' ? command : process.execPath),
-    // gws-ea's own OneCLI CLI, never downloaded in a test.
-    ensureOnecliCli: async (paths, pin) => paths.onecliCliFile(pin?.version ?? ONECLI_CLI_VERSION),
+    resolvePersisted: async () => process.execPath,
     node: { version: 'v22.20.0', execPath: process.execPath, execve: neverCalled },
     platform: 'linux',
     // Never the operator's real NanoClaw mount allowlist.
@@ -1405,7 +1399,7 @@ describe('gws-ea prerequisites', () => {
     expect(advanceProvision).toHaveBeenCalledOnce();
   });
 
-  it('passes the Docker endpoint and OneCLI CLI create recorded when resume checks prerequisites', async () => {
+  it('passes the Docker endpoint create recorded when resume checks prerequisites', async () => {
     const paths = await testPaths();
     const input = reservation(paths);
     await installProductionBootstrapManifest(paths, input.instance_id, {
@@ -1430,9 +1424,7 @@ describe('gws-ea prerequisites', () => {
         command: 'resume',
         paths,
         account: 'operator@example.test',
-        checkoutRoot: input.checkout_realpath,
         dockerEndpoint: 'unix:///Users/operator/.docker/run/docker.sock',
-        onecliCliPath: '/usr/local/bin/onecli',
       },
     ]);
   });
@@ -1550,7 +1542,6 @@ async function createdAssistant(paths: ControlPlanePaths, port: number): Promise
     project: reserved.exclusive_resource_claims.onecli_project,
     appPort: reserved.allocated_ports.onecli_app,
     gatewayPort: reserved.allocated_ports.onecli_gateway,
-    cliExecutable: '/usr/local/bin/onecli',
     dockerEndpoint: DOCKER_ENDPOINT,
   });
   const runtime = createInstanceRuntimeConfig(reserved, onecli, {

@@ -1,8 +1,8 @@
-import { access, readFile } from 'node:fs/promises';
+import { access } from 'node:fs/promises';
 import path from 'node:path';
-import { createRequire } from 'node:module';
 
 import { isErrno } from '../community-portal/errors.js';
+import { createOnecliAdmin, fetchOnecliApiKey, onecliInjection } from './onecli-admin.js';
 import { isRegularFile, preparePrivateDirectory } from './paths.js';
 import { PRESENT, type Observation } from './phases.js';
 import { findPortHolder, portInUseError, type PortHolder } from './ports.js';
@@ -10,14 +10,11 @@ import {
   buildToolEnvironment,
   runSanitizedCommand,
   type SanitizedCommand,
-  type SanitizedCommandResult,
   type SanitizedCommandRunner,
 } from './process.js';
-import { registerSecret } from './redact.js';
 import {
   ensureRandomOwnerOnlyFile,
   readOwnerOnlyFile,
-  removePrivateFile,
   writeOwnerOnlyFileExclusive,
   writePrivateTextFile,
 } from './secrets.js';
@@ -40,17 +37,8 @@ import {
   wrapperImageHash,
   wrapperImageSourceDir,
 } from './onecli-gateway-image.js';
-import { ONECLI_SDK_VERSION } from './pins.js';
 import { GwsEaError } from './types.js';
-import {
-  hasControlCharacters,
-  isRecord,
-  optionalString,
-  parseJson,
-  requireRecord,
-  stringField,
-  unwrapData,
-} from './validation.js';
+import { hasControlCharacters, isRecord, optionalString, parseJson, requireRecord, stringField } from './validation.js';
 import type { ProviderCredential, ProviderCredentialMetadata } from '../provider-credential.js';
 
 const INVALID_OUTPUT = 'invalid_onecli_output';
@@ -67,7 +55,6 @@ const UP_TIMEOUT_MS = (ONECLI_WAIT_TIMEOUT_SECONDS + 120) * 1_000;
 const INSPECT_TIMEOUT_MS = 30_000;
 
 export type OnecliCommand = SanitizedCommand;
-export type OnecliCommandResult = SanitizedCommandResult;
 export type OnecliCommandRunner = SanitizedCommandRunner;
 
 export interface ObservedOnecliContainer {
@@ -108,17 +95,16 @@ export interface ImportedCredential {
 }
 
 export interface OnecliRuntimeDependencies {
-  /** Runs the OneCLI CLI. */
-  readonly runCommand?: OnecliCommandRunner;
   /** Runs Docker and the port-holder lookup. */
   readonly dockerCommandRunner?: OnecliCommandRunner;
+  /** Reaches the runtime's health endpoints and its admin API. */
   readonly fetch?: typeof globalThis.fetch;
   readonly ambientEnv?: NodeJS.ProcessEnv;
   readonly findPortHolder?: (port: number) => Promise<PortHolder | undefined>;
 }
 
 declare const runtimeReceiptBrand: unique symbol;
-/** Proof that this process checked the runtime's health and versions, carrying its local API key. */
+/** Proof that this process checked the runtime's health and images, carrying its local API key. */
 export interface OnecliRuntimeReceipt {
   readonly [runtimeReceiptBrand]: true;
 }
@@ -138,7 +124,7 @@ const issuedReceipts = new WeakMap<object, VerifiedOnecliRuntime>();
 function verifiedRuntime(receipt: OnecliRuntimeReceipt): VerifiedOnecliRuntime {
   const verified = issuedReceipts.get(receipt);
   if (verified === undefined) {
-    throw new GwsEaError('onecli_unverified', 'The OneCLI runtime must pass its health and version check first');
+    throw new GwsEaError('onecli_unverified', 'The OneCLI runtime must pass its health check first');
   }
   return verified;
 }
@@ -152,11 +138,11 @@ interface OnecliDocker {
 
 function dockerContext(
   layout: OnecliRuntimeLayout,
-  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'runCommand' | 'ambientEnv'>,
+  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv'>,
 ): OnecliDocker {
   return {
     layout,
-    runner: dependencies.dockerCommandRunner ?? dependencies.runCommand ?? runSanitizedCommand,
+    runner: dependencies.dockerCommandRunner ?? runSanitizedCommand,
     environment: buildComposeEnvironment(layout, dependencies.ambientEnv),
   };
 }
@@ -180,18 +166,6 @@ function buildComposeInvocation(layout: OnecliRuntimeLayout, args: readonly stri
   };
 }
 
-function buildOnecliCliEnvironment(
-  layout: OnecliRuntimeLayout,
-  ambient: NodeJS.ProcessEnv = process.env,
-  apiKey?: string,
-): Readonly<Record<string, string>> {
-  const environment = buildToolEnvironment(ambient);
-  environment.HOME = layout.cliHome;
-  environment.ONECLI_API_HOST = layout.appUrl;
-  if (apiKey !== undefined) environment.ONECLI_API_KEY = apiKey;
-  return environment;
-}
-
 /** Docker's environment: the tool allowlist, the operator's HOME, and the instance's recorded endpoint. */
 function buildComposeEnvironment(
   layout: Pick<OnecliRuntimeLayout, 'dockerEndpoint'>,
@@ -210,7 +184,7 @@ function buildComposeEnvironment(
  */
 async function prepareOnecliRuntime(layout: OnecliRuntimeLayout, pins: OnecliPins): Promise<void> {
   await preparePrivateDirectory(layout.rootDirectory);
-  await Promise.all([preparePrivateDirectory(layout.cliHome), preparePrivateDirectory(layout.secretsDirectory)]);
+  await preparePrivateDirectory(layout.secretsDirectory);
 
   await Promise.all([
     ensureRandomOwnerOnlyFile(layout.postgresPasswordFile, 'base64url'),
@@ -318,7 +292,7 @@ export interface GatewayImageChange {
 export async function prepareReleaseGatewayImage(
   layout: OnecliRuntimeLayout,
   pins: OnecliPins,
-  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'runCommand' | 'ambientEnv'> = {},
+  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv'> = {},
 ): Promise<GatewayImageChange> {
   const { gateway: current } = await instanceOnecliImages(layout, pins);
   const { image: release } = await resolveWrapperGatewayImage(pins);
@@ -339,7 +313,7 @@ export async function prepareReleaseGatewayImage(
 export async function applyReleaseGateway(
   layout: OnecliRuntimeLayout,
   pins: OnecliPins,
-  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'runCommand' | 'ambientEnv'> = {},
+  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv'> = {},
 ): Promise<void> {
   const docker = dockerContext(layout, dependencies);
   const { image } = await resolveWrapperGatewayImage(pins);
@@ -377,7 +351,7 @@ export async function restoreReleaseGateway(
   layout: OnecliRuntimeLayout,
   pins: OnecliPins,
   compose: string,
-  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'runCommand' | 'ambientEnv'> = {},
+  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv'> = {},
 ): Promise<void> {
   const docker = dockerContext(layout, dependencies);
   const { gateway } = parseOnecliComposeImages(compose);
@@ -532,20 +506,18 @@ function serviceObservation(layout: OnecliRuntimeLayout, containers: readonly Ob
 }
 
 /**
- * The health and version check. The runtime must run healthy at the images
- * the instance's own Compose file names, answer on its health endpoints, and
- * report this instance's pinned CLI and gateway versions. The receipt carries
- * the local API key for importing the provider credential and persisting the
- * key files.
+ * The health check. The runtime must run healthy at the images the
+ * instance's own Compose file names, whose app is its pinned OneCLI (OneCLI
+ * reports no version of its own), and answer on its health endpoints. The
+ * receipt carries the local API key, read once, for importing the provider
+ * credential and persisting the key files.
  */
 export async function verifyOnecliRuntime(
   layout: OnecliRuntimeLayout,
   pins: OnecliPins,
   dependencies: OnecliRuntimeDependencies = {},
 ): Promise<OnecliRuntimeReceipt> {
-  const runCommand = dependencies.runCommand ?? runSanitizedCommand;
   const fetchImplementation = dependencies.fetch ?? globalThis.fetch;
-  await removePrivateFile(layout.providerStagingFile);
   const docker = dockerContext(layout, dependencies);
   const expected = await instanceOnecliImages(layout, pins);
   validateObservedOnecliRuntime(layout, await inspectOnecliRuntime(docker), expected);
@@ -559,88 +531,31 @@ export async function verifyOnecliRuntime(
   // create and resume alike — so a healthy runtime is never accepted without it.
   await verifyAgentNetworkIsolation(docker, pins);
 
-  const keylessEnvironment = buildOnecliCliEnvironment(layout, dependencies.ambientEnv);
-  const apiKeyResponse = parseRecord(
-    (await runOnecliCommand(layout, runCommand, keylessEnvironment, ['auth', 'api-key'])).stdout,
-    'OneCLI API key',
-  );
-  const apiKey = stringField(apiKeyResponse, 'apiKey', 'OneCLI API key', INVALID_OUTPUT);
-  if (!/^oc_[A-Za-z0-9_-]{20,}$/u.test(apiKey)) {
-    throw new GwsEaError('incompatible_onecli', 'OneCLI returned an invalid local API key');
-  }
-  registerSecret(apiKey);
-  const keyedEnvironment = buildOnecliCliEnvironment(layout, dependencies.ambientEnv, apiKey);
-  const version = parseRecord(
-    (await runOnecliCommand(layout, runCommand, keyedEnvironment, ['version'])).stdout,
-    'OneCLI version',
-  );
-  const cli = optionalString(version.version) ?? '(unknown)';
-  if (cli !== pins.cli) {
-    throw new GwsEaError(
-      'incompatible_onecli',
-      `Installed OneCLI CLI ${cli} does not match this assistant's pinned ${pins.cli}; install OneCLI CLI ${pins.cli}, then retry`,
-    );
-  }
-  // The gateway may not report its version; its image was checked against the pin above.
-  const server = optionalString(version.server_version) ?? 'unknown';
-  if (server !== pins.gateway && server !== 'unknown') {
-    throw new GwsEaError(
-      'incompatible_onecli',
-      `The running OneCLI gateway ${server} does not match this assistant's pinned ${pins.gateway}`,
-    );
-  }
+  const apiKey = await fetchOnecliApiKey(layout.appUrl, { fetch: fetchImplementation });
   const receipt = Object.freeze({}) as OnecliRuntimeReceipt;
   issuedReceipts.set(receipt, Object.freeze({ layout: Object.freeze({ ...layout }), apiKey }));
   return receipt;
 }
 
+/**
+ * Store the provider credential in the verified runtime's vault, its value
+ * only in the request body, unless a secret with its metadata is there
+ * already.
+ */
 export async function importProviderCredential(
   receipt: OnecliRuntimeReceipt,
   input: ProviderCredential,
-  dependencies: Pick<OnecliRuntimeDependencies, 'runCommand' | 'ambientEnv'> = {},
+  dependencies: Pick<OnecliRuntimeDependencies, 'fetch'> = {},
 ): Promise<ImportedCredential> {
   const { layout, apiKey } = verifiedRuntime(receipt);
   assertCredentialMetadata(input);
-  const runCommand = dependencies.runCommand ?? runSanitizedCommand;
-  const environment = buildOnecliCliEnvironment(layout, dependencies.ambientEnv, apiKey);
-  await removePrivateFile(layout.providerStagingFile);
-  const secrets = parseArray(
-    (await runOnecliCommand(layout, runCommand, environment, ['secrets', 'list', '--max', '0'])).stdout,
-    'OneCLI secrets',
-  );
-  const existing = findCredentialSecret(secrets, input, {
+  const admin = createOnecliAdmin(layout.appUrl, apiKey, dependencies.fetch ? { fetch: dependencies.fetch } : {});
+  const existing = findCredentialSecret(await admin.listSecrets(), input, {
     ambiguous: 'More than one OneCLI secret has the requested name',
     conflict: 'An existing OneCLI secret has incompatible metadata',
   });
   if (existing) return { id: stringField(existing, 'id', 'OneCLI secret', INVALID_OUTPUT), created: false };
-
-  try {
-    await writeOwnerOnlyFileExclusive(layout.providerStagingFile, input.value);
-    const args = [
-      'secrets',
-      'create',
-      '--name',
-      input.name,
-      '--type',
-      input.type,
-      '--host-pattern',
-      input.hostPattern,
-      '--file',
-      layout.providerStagingFile,
-    ];
-    if (input.pathPattern !== undefined) args.push('--path-pattern', input.pathPattern);
-    if (input.headerName !== undefined) args.push('--header-name', input.headerName);
-    if (input.valueFormat !== undefined) args.push('--value-format', input.valueFormat);
-    if (input.paramName !== undefined) args.push('--param-name', input.paramName);
-    if (input.paramFormat !== undefined) args.push('--param-format', input.paramFormat);
-    const created = parseRecord(
-      (await runOnecliCommand(layout, runCommand, environment, args)).stdout,
-      'OneCLI secret',
-    );
-    return { id: stringField(created, 'id', 'OneCLI secret', INVALID_OUTPUT), created: true };
-  } finally {
-    await removePrivateFile(layout.providerStagingFile);
-  }
+  return { id: await admin.createSecret(input), created: true };
 }
 
 export async function persistOnecliApiKeyFiles(receipt: OnecliRuntimeReceipt, files: OnecliApiKeyFiles): Promise<void> {
@@ -681,7 +596,6 @@ export async function reconcileOnecliRuntime(
   const { runner, environment } = docker;
   await prepareOnecliRuntime(layout, pins);
   const { gateway: gatewayImage } = await instanceOnecliImages(layout, pins);
-  await removePrivateFile(layout.providerStagingFile);
   const kept = await cleanupOnecliDockerOrphans(docker);
   // Pull only the registry-sourced services; the gateway runs the locally built
   // wrapper tag, which a registry pull would fail to resolve. The `app` image is
@@ -754,7 +668,7 @@ async function foreignPortError(
 
 export async function removeOnecliRuntime(
   layout: OnecliRuntimeLayout,
-  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'runCommand' | 'ambientEnv'> = {},
+  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv'> = {},
 ): Promise<void> {
   const docker = dockerContext(layout, dependencies);
   const { runner, environment } = docker;
@@ -1127,21 +1041,6 @@ function parseDockerArray(source: string, label: string): readonly Record<string
   return value;
 }
 
-async function runOnecliCommand(
-  layout: OnecliRuntimeLayout,
-  runner: OnecliCommandRunner,
-  environment: Readonly<Record<string, string>>,
-  args: readonly string[],
-): Promise<OnecliCommandResult> {
-  return runner({
-    command: layout.cliExecutable,
-    args,
-    cwd: layout.rootDirectory,
-    env: environment,
-    timeoutMs: 30_000,
-  });
-}
-
 async function assertHealthyEndpoint(
   fetchImplementation: typeof globalThis.fetch,
   url: string,
@@ -1208,20 +1107,6 @@ function sameSet(left: readonly string[], right: readonly string[]): boolean {
   );
 }
 
-function parseRecord(source: string, label: string): Record<string, unknown> {
-  const parsed = unwrapData(parseJson(source, label, INVALID_OUTPUT));
-  if (!isRecord(parsed)) throw new GwsEaError(INVALID_OUTPUT, `${label} response is invalid`);
-  return parsed;
-}
-
-function parseArray(source: string, label: string): readonly Record<string, unknown>[] {
-  const parsed = unwrapData(parseJson(source, label, INVALID_OUTPUT));
-  if (!Array.isArray(parsed) || !parsed.every(isRecord)) {
-    throw new GwsEaError(INVALID_OUTPUT, `${label} response is invalid`);
-  }
-  return parsed;
-}
-
 function assertCredentialMetadata(input: ProviderCredential): void {
   for (const [key, value] of Object.entries(input)) {
     if (typeof value !== 'string' || value.length === 0 || (key !== 'value' && hasControlCharacters(value))) {
@@ -1240,18 +1125,12 @@ export function onecliSecretMatchesCredentialMetadata(
   existing: Record<string, unknown>,
   input: ProviderCredentialMetadata,
 ): boolean {
-  const expectedInjection =
-    input.headerName !== undefined
-      ? { headerName: input.headerName, valueFormat: input.valueFormat ?? '' }
-      : input.paramName !== undefined
-        ? { paramName: input.paramName, paramFormat: input.paramFormat ?? '' }
-        : null;
   return (
     optionalString(existing.name) === input.name &&
     optionalString(existing.type) === input.type &&
     optionalString(existing.hostPattern) === input.hostPattern &&
     nullableString(existing.pathPattern) === (input.pathPattern ?? null) &&
-    JSON.stringify(existing.injectionConfig ?? null) === JSON.stringify(expectedInjection)
+    JSON.stringify(existing.injectionConfig ?? null) === JSON.stringify(onecliInjection(input))
   );
 }
 
@@ -1282,16 +1161,4 @@ export function findCredentialSecret(
 
 function nullableString(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
-}
-
-export async function assertInstalledOnecliSdkVersion(expectedVersion = ONECLI_SDK_VERSION): Promise<void> {
-  const require = createRequire(import.meta.url);
-  const entry = require.resolve('@onecli-sh/sdk');
-  const manifest = parseRecord(
-    await readFile(path.resolve(path.dirname(entry), '..', 'package.json'), 'utf8'),
-    'OneCLI SDK manifest',
-  );
-  if (manifest.version !== expectedVersion) {
-    throw new GwsEaError('incompatible_onecli', 'Installed OneCLI SDK does not match the sanctioned version');
-  }
 }

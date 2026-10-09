@@ -37,9 +37,10 @@ import {
   type ProductionProvisionDependencies,
 } from './provision.js';
 import type { MainIdentityDependencies } from './identity.js';
+import { createOnecliAdmin } from './onecli-admin.js';
 import { createOnecliRuntimeLayout, renderOnecliCompose } from './onecli-compose.js';
 import { wrapperImageTag } from './onecli-gateway-image.js';
-import { ONECLI_CLI_VERSION, ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './pins.js';
+import { ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './pins.js';
 import type { OnecliRuntimeReceipt } from './onecli.js';
 import { findPortHolder } from './ports.js';
 import { startRunLog, type RunLog } from './run-log.js';
@@ -150,7 +151,6 @@ function serviceAccount(overrides: Readonly<Record<string, string>> = {}): strin
 function bootstrapManifest(paths: ControlPlanePaths): ProductionBootstrapManifest {
   return {
     schema_version: 1,
-    onecli_cli_path: '/usr/local/bin/onecli',
     node_path: process.execPath,
     home_directory: path.dirname(paths.stateRoot),
     platform: process.platform === 'darwin' ? 'macos' : 'linux',
@@ -733,7 +733,7 @@ describe('production bootstrap trust boundary', () => {
 
   /** A reserved instance whose host started once: runtime and receipt persisted, bootstrap manifest gone. */
   async function startedInstance(
-    receiptCohort: { gateway: string; cli: string; sdk: string },
+    receiptCohort: Readonly<Record<string, string>>,
     olderReceiptFields: Record<string, unknown> = {},
   ) {
     const paths = await testPaths();
@@ -744,7 +744,6 @@ describe('production bootstrap trust boundary', () => {
       project: reserved.exclusive_resource_claims.onecli_project,
       appPort: reserved.allocated_ports.onecli_app,
       gatewayPort: reserved.allocated_ports.onecli_gateway,
-      cliExecutable: '/usr/local/bin/onecli',
       dockerEndpoint: 'unix:///var/run/docker.sock',
     });
     const runtime = createInstanceRuntimeConfig(reserved, onecli, {
@@ -780,11 +779,7 @@ describe('production bootstrap trust boundary', () => {
   }
 
   it('treats a database created before the profile migration as unpublished', async () => {
-    const { paths, reserved } = await startedInstance({
-      gateway: ONECLI_GATEWAY_VERSION,
-      cli: ONECLI_CLI_VERSION,
-      sdk: ONECLI_SDK_VERSION,
-    });
+    const { paths, reserved } = await startedInstance({ gateway: ONECLI_GATEWAY_VERSION, sdk: ONECLI_SDK_VERSION });
 
     await expect(
       withInstanceOperation(paths, reserved.instance_id, (operation) =>
@@ -799,7 +794,7 @@ describe('production bootstrap trust boundary', () => {
 
   it('still parses an old receipt carrying the provider capability digest', async () => {
     const { paths, reserved } = await startedInstance(
-      { gateway: ONECLI_GATEWAY_VERSION, cli: ONECLI_CLI_VERSION, sdk: ONECLI_SDK_VERSION },
+      { gateway: ONECLI_GATEWAY_VERSION, sdk: ONECLI_SDK_VERSION },
       { providerCapabilityDigest: 'c'.repeat(64) },
     );
 
@@ -816,6 +811,7 @@ describe('production bootstrap trust boundary', () => {
   });
 
   it('resumes past a release receipt whose OneCLI cohort differs from this launcher’s pins', async () => {
+    // An earlier release's receipt also records the OneCLI CLI it pinned, which nothing reads any more.
     const { paths, reserved } = await startedInstance({ gateway: '1.41.0', cli: '2.2.4', sdk: '2.2.0' });
 
     // bootstrap_required is raised only after the receipt was accepted.
@@ -838,7 +834,6 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
     project: reserved.exclusive_resource_claims.onecli_project,
     appPort: reserved.allocated_ports.onecli_app,
     gatewayPort: reserved.allocated_ports.onecli_gateway,
-    cliExecutable: '/usr/local/bin/onecli',
     dockerEndpoint: 'unix:///var/run/docker.sock',
   });
   const runtime = createInstanceRuntimeConfig(reserved, onecli, {
@@ -940,7 +935,7 @@ function servingHost(reserved: InstanceReservation): HostStatusHelpers {
 async function writeReleaseReceipt(
   paths: ControlPlanePaths,
   reserved: InstanceReservation,
-  onecli: { gateway: string; cli: string; sdk: string },
+  onecli: { gateway: string; sdk: string },
 ): Promise<void> {
   await writeFile(
     paths.releasePreflightFile(reserved.instance_id),
@@ -963,9 +958,10 @@ async function writeReleaseReceipt(
 }
 
 interface ProbeIdentityState {
-  agents: Array<{ id: string; identifier: string; name: string; secretMode: 'all' | 'selective' }>;
-  readonly onecliCalls: string[][];
-  readonly providerSecretIds: string[];
+  /** The agents OneCLI lists; one without a secret mode is as a OneCLI from 1.43 on lists it. */
+  agents: Array<{ id: string; identifier: string; name: string; secretMode?: 'all' | 'selective' }>;
+  /** Every OneCLI request, as `<method> <path>`. */
+  readonly onecliCalls: string[];
 }
 
 function probeIdentityDependencies(
@@ -989,12 +985,16 @@ function probeIdentityDependencies(
       }
       throw new Error(`Unexpected ncl probe call: ${args.join(' ')}`);
     },
-    runOnecliAdmin: async (_runtime, args) => {
-      state.onecliCalls.push([...args]);
-      if (args[0] === 'agents' && args[1] === 'list') return state.agents;
-      if (args[0] === 'agents' && args[1] === 'secrets') return state.providerSecretIds;
-      throw new Error(`Unexpected OneCLI probe call: ${args.join(' ')}`);
-    },
+    onecliAdmin: async (runtime) =>
+      createOnecliAdmin(runtime.onecli_app_url, `oc_${'a'.repeat(64)}`, {
+        fetch: async (input, init) => {
+          const url = new URL(String(input));
+          const call = `${init?.method ?? 'GET'} ${url.pathname}`;
+          state.onecliCalls.push(call);
+          if (call === 'GET /v1/agents') return new Response(JSON.stringify(state.agents));
+          throw new Error(`Unexpected OneCLI probe call: ${call}`);
+        },
+      }),
   };
 }
 
@@ -1173,7 +1173,6 @@ describe('production provision step composition', () => {
       const state: ProbeIdentityState = {
         agents: [{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'all' }],
         onecliCalls: [],
-        providerSecretIds: ['secret-provider'],
       };
       const context: ProductionProvisionContext = {
         ...base,
@@ -1182,23 +1181,23 @@ describe('production provision step composition', () => {
       const phase = createProductionProvisionSteps(context).start_nanoclaw.resources[1]!;
 
       await expect(phase.observe(context)).resolves.toEqual(PRESENT);
-      expect(state.onecliCalls).toEqual([['agents', 'list', '--max', '0']]);
+      expect(state.onecliCalls).toEqual(['GET /v1/agents']);
+
+      // A OneCLI that no longer lists secret modes leaves main on its default, all.
+      state.agents = [{ id: 'oc-main', identifier: 'ag-main', name: 'main' }];
+      await expect(phase.observe(context)).resolves.toEqual(PRESENT);
 
       state.agents = [{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'selective' }];
       state.onecliCalls.length = 0;
       await expect(phase.observe(context)).resolves.toEqual(ABSENT);
-      expect(state.onecliCalls).toEqual([['agents', 'list', '--max', '0']]);
+      expect(state.onecliCalls).toEqual(['GET /v1/agents']);
     });
   });
 
   it('repairs a completed OneCLI runtime whose container stopped at once, and refuses unsafe drift', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
-    await writeReleaseReceipt(paths, reserved, {
-      gateway: ONECLI_GATEWAY_VERSION,
-      cli: ONECLI_CLI_VERSION,
-      sdk: '2.2.1',
-    });
+    await writeReleaseReceipt(paths, reserved, { gateway: ONECLI_GATEWAY_VERSION, sdk: '2.2.1' });
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
@@ -1246,7 +1245,7 @@ describe('production provision step composition', () => {
   it('runs and checks OneCLI at the pins its release recorded, not this launcher’s', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
-    const recorded = { gateway: '1.41.3', cli: '2.2.4', sdk: '2.2.0' };
+    const recorded = { gateway: '1.41.3', sdk: '2.2.0' };
     await writeReleaseReceipt(paths, reserved, recorded);
     const receipt = Object.freeze({}) as OnecliRuntimeReceipt;
 
@@ -1265,7 +1264,7 @@ describe('production provision step composition', () => {
       context.state.onecliReceipt = undefined;
       await registry.configure_provider.resources[0]!.apply(context);
 
-      const pins = { gateway: recorded.gateway, cli: recorded.cli };
+      const pins = { gateway: recorded.gateway };
       expect(recorded.gateway).not.toBe(ONECLI_GATEWAY_VERSION);
       expect(reconcileOnecliRuntime).toHaveBeenCalledWith(context.input.onecli, pins, undefined);
       // A resumed provider step checks the running vault instead of starting it again.
@@ -1277,11 +1276,7 @@ describe('production provision step composition', () => {
   it('adopts a healthy OneCLI runtime its release created, interrupted before its API keys were persisted', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
-    await writeReleaseReceipt(paths, reserved, {
-      gateway: ONECLI_GATEWAY_VERSION,
-      cli: ONECLI_CLI_VERSION,
-      sdk: '2.2.1',
-    });
+    await writeReleaseReceipt(paths, reserved, { gateway: ONECLI_GATEWAY_VERSION, sdk: '2.2.1' });
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
@@ -1314,11 +1309,7 @@ describe('production provision step composition', () => {
   it('asks for the provider credential and imports it with the OneCLI receipt the run already holds', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
-    await writeReleaseReceipt(paths, reserved, {
-      gateway: ONECLI_GATEWAY_VERSION,
-      cli: ONECLI_CLI_VERSION,
-      sdk: '2.2.1',
-    });
+    await writeReleaseReceipt(paths, reserved, { gateway: ONECLI_GATEWAY_VERSION, sdk: '2.2.1' });
     const collected = {
       name: 'Claude provider',
       type: 'api_key',
@@ -1872,7 +1863,6 @@ describe('production provision step composition', () => {
       const identityState: ProbeIdentityState = {
         agents: [{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'all' }],
         onecliCalls: [],
-        providerSecretIds: [],
       };
       const context: ProductionProvisionContext = {
         ...base,
@@ -2103,7 +2093,7 @@ async function productionHarness(): Promise<ProductionHarness> {
               headerName: 'x-api-key',
             },
             packageManager: 'pnpm@10.0.0',
-            onecli: { gateway: ONECLI_GATEWAY_VERSION, cli: ONECLI_CLI_VERSION, sdk: ONECLI_SDK_VERSION },
+            onecli: { gateway: ONECLI_GATEWAY_VERSION, sdk: ONECLI_SDK_VERSION },
           }),
           googleCloudResources: () => [
             {

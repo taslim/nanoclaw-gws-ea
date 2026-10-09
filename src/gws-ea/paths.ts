@@ -59,8 +59,6 @@ export interface ControlPlanePaths {
   /** The release receipt: the live release's, or with `slot` the one kept beside that release. */
   releasePreflightFile(instanceId: string, slot?: ReleaseSlot): string;
   removalFile(instanceId: string): string;
-  /** gws-ea's own copy of one pinned OneCLI CLI version. */
-  onecliCliFile(version: string): string;
   /** The Cloudflare account token a create keeps until its route is set up. */
   keptCloudflareTokenFile(instanceId: string): string;
 }
@@ -132,7 +130,6 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
     releasePreflightFile: (instanceId, slot) =>
       path.join(slot ? releaseRoot(instanceId, slot) : instanceRoot(instanceId), 'release-preflight.json'),
     removalFile: (instanceId) => path.join(removalRoot, `${instanceId}.json`),
-    onecliCliFile: (version) => path.join(stateRoot, 'tools', 'onecli', version, 'onecli'),
     keptCloudflareTokenFile: (instanceId) => path.join(instanceRoot(instanceId), 'secrets', 'cloudflare-account-token'),
   };
 }

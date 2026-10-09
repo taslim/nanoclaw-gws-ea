@@ -12,11 +12,10 @@ then had) and CLI probes run right after it:
 |---|---|---|
 | `docker-context-inspect.json` | capture record | `docker context inspect` (Docker Desktop, context `desktop-linux`) |
 | `gcloud-auth-print-access-token.reauth-failed.stderr.txt` | probe, stderr; exit code 1 | `gcloud auth print-access-token` for an account whose sign-in had to be renewed |
-| `onecli-version.stdout.json` | probe, stdout | `onecli version` |
 
 Tool versions: Google Cloud SDK 564.0.0 (core 2026.04.03, running on Python
-3.9, which produces the warning at the top of the gcloud stderr), OneCLI CLI
-2.2.5, Docker Desktop with Docker Compose v5.5.1.
+3.9, which produces the warning at the top of the gcloud stderr), Docker
+Desktop with Docker Compose v5.5.1.
 
 The capture record keeps the envelope the capture wrote (`kind`, `program`,
 `args`, `exit_code`, `stdout`, `stderr`). Probe files hold only the recorded
@@ -44,8 +43,8 @@ set:
 - IP addresses become `0.0.0.0` or `::`.
 
 In `docker-context-inspect.json`, the home directory and the context-store hash
-(a SHA-256 of the context name) were replaced. The two probe files contained no
-identifying values and are unchanged.
+(a SHA-256 of the context name) were replaced. The probe file contained no
+identifying values and is unchanged.
 
 `src/gws-ea/fixtures.test.ts` scans this directory and fails on an IP address,
 an email, a UUID, a long hex string, a home path, or a credential prefix

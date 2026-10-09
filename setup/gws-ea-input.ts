@@ -472,7 +472,6 @@ export async function collectGwsEaCreateInput(
     assistantWorkspaceEmail,
     bootstrapManifest: {
       schema_version: 1,
-      onecli_cli_path: host.onecliCliPath,
       node_path: host.nodePath,
       home_directory: host.homeDirectory,
       platform: host.platform,

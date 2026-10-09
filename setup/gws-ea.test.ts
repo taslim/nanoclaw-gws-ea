@@ -214,11 +214,9 @@ describe('GWS-EA driver', () => {
         stateRoot: '/state',
         logsRoot: '/state/logs',
         instancesRoot: '/state/instances',
-        onecliCliFile: (version) => `/state/tools/onecli/${version}/onecli`,
       },
       account: 'reserved@example.com',
       dockerEndpoint: 'unix:///var/run/docker.sock',
-      checkoutRoot: '/state/instances/x/nanoclaw',
     };
     await runtime.checkPrerequisites!(request, interaction);
     expect(fixture.ensurePrerequisites).toHaveBeenCalledWith(request, interaction);

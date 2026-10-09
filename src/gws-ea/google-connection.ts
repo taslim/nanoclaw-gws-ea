@@ -38,12 +38,7 @@ import {
 } from './google-oauth.js';
 import { ABSENT, PRESENT, type Observation, type ProvisionHumanPause, type StepResource } from './phases.js';
 import { removePrivateFile } from './secrets.js';
-import {
-  googleGrantFile,
-  googleOAuthClientFile,
-  readOnecliAdminApiKey,
-  type InstanceRuntimeConfig,
-} from './service.js';
+import { googleGrantFile, googleOAuthClientFile, instanceOnecliAdmin, type InstanceRuntimeConfig } from './service.js';
 import { GwsEaError } from './types.js';
 import { isRecord } from './validation.js';
 
@@ -113,25 +108,16 @@ interface VaultSecret {
 
 /**
  * Every secret OneCLI holds for this instance, by name and host, read with
- * the instance's admin key. A refused answer is reported by its status alone:
- * its body can preview a secret.
+ * the instance's admin key. Not observing the vault is no finding about it:
+ * status reports a failed read as unknown.
  */
 async function listVaultSecrets(
   runtime: InstanceRuntimeConfig,
-  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+  fetchImpl?: typeof globalThis.fetch,
 ): Promise<VaultSecret[]> {
-  const apiKey = await readOnecliAdminApiKey(runtime);
-  const response = await fetchImpl(new URL('/v1/secrets', runtime.onecli_app_url), {
-    headers: { authorization: `Bearer ${apiKey}` },
-    signal: AbortSignal.timeout(15_000),
-    redirect: 'error',
-  });
-  // Not observing the vault is no finding about it: status reports these as unknown.
-  if (!response.ok) throw new Error(`OneCLI's secret list answered HTTP ${response.status}`);
-  const payload = await readJson(response);
-  if (!Array.isArray(payload)) throw new Error('OneCLI returned an unreadable secret list');
-  return payload.map((entry) => {
-    if (!isRecord(entry) || typeof entry.name !== 'string' || typeof entry.hostPattern !== 'string') {
+  const admin = await instanceOnecliAdmin(runtime, fetchImpl ? { fetch: fetchImpl } : {});
+  return (await admin.listSecrets()).map((entry) => {
+    if (typeof entry.name !== 'string' || typeof entry.hostPattern !== 'string') {
       throw new Error('OneCLI returned an unreadable secret');
     }
     return { name: entry.name, hostPattern: entry.hostPattern };

@@ -68,8 +68,7 @@ afterEach(async () => {
 });
 
 const DOCKER = 'unix:///var/run/docker.sock';
-const ONECLI_CLI = '/usr/local/bin/onecli';
-const PINS = { gateway: '1.41.3', cli: '2.2.4' } as const;
+const PINS = { gateway: '1.41.3' } as const;
 const CREDENTIAL = { name: 'Anthropic', type: 'anthropic', hostPattern: 'api.anthropic.com', headerName: 'x-api-key' };
 const MAIN = 'ag-main';
 const EXTERNAL_EMAIL = 'ag-external-email';
@@ -191,7 +190,6 @@ async function assistant(
     project: reserved.exclusive_resource_claims.onecli_project,
     appPort: reserved.allocated_ports.onecli_app,
     gatewayPort: reserved.allocated_ports.onecli_gateway,
-    cliExecutable: ONECLI_CLI,
     dockerEndpoint: DOCKER,
   });
   await persistInstanceRuntime(
@@ -442,19 +440,10 @@ const HEALTHY_INBOX = {
 } as const;
 
 /** OneCLI's agents: main granted every secret, external-email in selective mode. */
-const ONECLI_AGENTS = [
+const onecliAgents: StatusObservers['onecliAgents'] = async () => [
   { id: 'agent-main', identifier: MAIN, name: 'main', secretMode: 'all' },
   { id: 'agent-ee', identifier: EXTERNAL_EMAIL, name: 'external-email', secretMode: 'selective' },
 ];
-
-function onecliAgents(agents: readonly Record<string, unknown>[]): StatusObservers['onecliAdmin'] {
-  return async (_runtime, args) => {
-    if (args.join(' ') !== 'agents list --max 0') throw new Error(`unexpected onecli ${args.join(' ')}`);
-    return { data: agents };
-  };
-}
-
-const onecliAdmin = onecliAgents(ONECLI_AGENTS);
 
 const MANIFEST: SnapshotManifest = {
   central_migrations: ['initial-v2-schema', 'host-coordination'],
@@ -485,7 +474,7 @@ function healthyObservers(state: World): StatusObservers {
     runCommand: recordingRunner(state),
     fetch: callbackFetch(state),
     ncl: ncl(state),
-    onecliAdmin,
+    onecliAgents,
     onecli: async () => PRESENT,
     connector: async () => ({ status: 'present' }),
     principalBinding: (input) => ({
@@ -646,6 +635,24 @@ describe('status', () => {
     for (const name of Object.keys(status.probes).filter((probe) => probe !== 'workspace')) {
       expect(status.probes[name], name).toMatchObject({ status: 'ok' });
     }
+  });
+
+  it("reports main's identity as unknown, not degraded, when OneCLI does not answer for its agents", async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    await bound(host.paths, reservation.instance_id);
+    const state = world(reservation);
+    const refusal = 'OneCLI refused the agent list (HTTP 503)';
+
+    const { exitCode, status } = await statusJson(host, state, reservation.instance_id, {
+      ...healthyObservers(state),
+      onecliAgents: async () => {
+        throw new GwsEaError('onecli_request_failed', refusal);
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(status.probes.main_identity).toMatchObject({ status: 'unknown', reason: refusal });
   });
 
   it("reports a OneCLI unsafe-image refusal as that probe's failure without aborting the others", async () => {
@@ -1225,7 +1232,7 @@ describe('read-only commands', () => {
       runCommand: recordingRunner(state),
       fetch: callbackFetch(state),
       ncl: ncl(state),
-      onecliAdmin,
+      onecliAgents,
     };
     // Stale stat entries make an ordinary `git status` rewrite each index; a read-only one must not.
     const later = new Date(Date.now() + 60_000);

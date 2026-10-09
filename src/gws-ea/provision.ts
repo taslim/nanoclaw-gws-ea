@@ -47,7 +47,7 @@ import {
 } from './onecli-compose.js';
 import {
   reconcileInstanceRuntime,
-  runInstanceOnecliAdminCommand,
+  instanceOnecliAdmin,
   createInstanceRuntimeConfig,
   googleChatProjectNumberFile,
   instanceServicePid,
@@ -61,6 +61,7 @@ import { createServiceControl, runtimeServiceTarget, type NanoclawServiceHelpers
 import { instanceServicePlatform } from './service-coordinates.js';
 import { runInstanceNclJson } from './ncl.js';
 import { reconcileMainIdentity, type MainIdentityDependencies, type MainIdentityInput } from './identity.js';
+import type { OnecliAgent } from './onecli-admin.js';
 import {
   listPrincipalCandidates,
   reconcilePrincipalDm,
@@ -95,7 +96,6 @@ import {
   isRecord,
   normalizePrincipalEmail,
   optionalString,
-  parseJson,
   requireDockerEndpoint,
   requirePath,
   requireRecord,
@@ -282,7 +282,6 @@ function validateReleasePreflightReceipt(
     packageManager: requireString(receipt.packageManager, 'Release preflight packageManager', INVALID_RECEIPT),
     onecli: {
       gateway: requireString(onecli.gateway, 'Release preflight OneCLI gateway', INVALID_RECEIPT),
-      cli: requireString(onecli.cli, 'Release preflight OneCLI CLI', INVALID_RECEIPT),
       sdk: requireString(onecli.sdk, 'Release preflight OneCLI SDK', INVALID_RECEIPT),
     },
   };
@@ -319,10 +318,10 @@ function instanceReleaseReceipt(context: ProductionProvisionContext): Promise<Re
   });
 }
 
-/** The OneCLI versions this instance's release pinned: its runtime runs these, not the launcher's. */
+/** The OneCLI version this instance's release pinned: its runtime runs it, not the launcher's. */
 async function instanceOnecliPins(context: ProductionProvisionContext): Promise<OnecliPins> {
   const { onecli } = await instanceReleaseReceipt(context);
-  return { gateway: onecli.gateway, cli: onecli.cli };
+  return { gateway: onecli.gateway };
 }
 
 /** Record what a release preflight established for `instanceId` at `deployedCommit`, owner-only, at `file`. */
@@ -398,13 +397,9 @@ async function defaultObserveOnecli(context: ProductionProvisionContext): Promis
 async function defaultObserveProvider(context: ProductionProvisionContext): Promise<Observation> {
   const credential = context.input.providerCredentialMetadata;
   try {
-    const result = await runInstanceOnecliAdminCommand(context.input.runtime, ['secrets', 'list', '--max', '0']);
-    const value = unwrapData(parseJson(result.stdout, 'OneCLI output', 'invalid_child_output'));
-    if (!Array.isArray(value) || !value.every(isRecord)) {
-      throw new GwsEaError('invalid_child_output', 'OneCLI returned an invalid secret list');
-    }
+    const secrets = await (await instanceOnecliAdmin(context.input.runtime)).listSecrets();
     if (context.state.providerSecretId) {
-      const match = value.find((candidate) => candidate.id === context.state.providerSecretId);
+      const match = secrets.find((candidate) => candidate.id === context.state.providerSecretId);
       if (!match) return ABSENT;
       if (!credential || !onecliSecretMatchesCredentialMetadata(match, credential)) {
         throw new GwsEaError('onecli_secret_conflict', 'Provider credential metadata does not match');
@@ -412,7 +407,7 @@ async function defaultObserveProvider(context: ProductionProvisionContext): Prom
       return PRESENT;
     }
     if (!credential) return ABSENT;
-    const match = findCredentialSecret(value, credential, {
+    const match = findCredentialSecret(secrets, credential, {
       ambiguous: 'Provider credential is ambiguous',
       conflict: 'Provider credential metadata does not match',
     });
@@ -422,9 +417,7 @@ async function defaultObserveProvider(context: ProductionProvisionContext): Prom
     context.state.providerSecretId = id;
     return PRESENT;
   } catch (error) {
-    if (error instanceof GwsEaError && ['command_failed', 'command_timeout'].includes(error.code)) {
-      return ABSENT;
-    }
+    if (error instanceof GwsEaError && error.code === 'onecli_request_failed') return ABSENT;
     throw error;
   }
 }
@@ -532,11 +525,9 @@ function processAlive(pid: number): boolean {
   }
 }
 
-async function runNanoclawProbeOnecli(context: ProductionProvisionContext, args: readonly string[]): Promise<unknown> {
-  const run = context.input.identityDependencies?.runOnecliAdmin;
-  if (run) return run(context.input.runtime, args);
-  const result = await runInstanceOnecliAdminCommand(context.input.runtime, args);
-  return parseJson(result.stdout, 'OneCLI output', 'invalid_child_output');
+async function listOnecliAgents(context: ProductionProvisionContext): Promise<readonly OnecliAgent[]> {
+  const admin = context.input.identityDependencies?.onecliAdmin ?? instanceOnecliAdmin;
+  return (await admin(context.input.runtime)).listAgents();
 }
 
 /** Main exists as published, and its OneCLI agent injects every matching secret (all mode). */
@@ -566,18 +557,16 @@ async function defaultObserveMainIdentity(context: ProductionProvisionContext): 
     ) {
       return ABSENT;
     }
-    const agents = unwrapData(await runNanoclawProbeOnecli(context, ['agents', 'list', '--max', '0']));
-    if (!Array.isArray(agents) || !agents.every(isRecord)) return ABSENT;
-    const matching = agents.filter((agent) => agent.identifier === mainAgentGroupId);
+    const matching = (await listOnecliAgents(context)).filter((agent) => agent.identifier === mainAgentGroupId);
     const agent = matching[0];
-    const agentId = optionalString(agent?.id);
-    if (matching.length !== 1 || !agentId || agent!.name !== 'main' || agent!.secretMode !== 'all') {
-      return ABSENT;
-    }
+    if (matching.length !== 1 || agent?.name !== 'main' || agent.secretMode !== 'all') return ABSENT;
     context.state.mainAgentGroupId = mainAgentGroupId;
     return PRESENT;
   } catch (error) {
-    if (error instanceof GwsEaError && ['command_failed', 'command_timeout', 'ncl_failed'].includes(error.code)) {
+    if (
+      error instanceof GwsEaError &&
+      ['command_failed', 'command_timeout', 'ncl_failed', 'onecli_request_failed'].includes(error.code)
+    ) {
       return ABSENT;
     }
     throw error;
@@ -1207,7 +1196,6 @@ const BOOTSTRAP_SCHEMA_VERSION = 1 as const;
 
 export interface ProductionBootstrapManifest {
   readonly schema_version: typeof BOOTSTRAP_SCHEMA_VERSION;
-  readonly onecli_cli_path: string;
   readonly node_path: string;
   readonly home_directory: string;
   readonly platform: 'macos' | 'linux';
@@ -1273,7 +1261,6 @@ export function validateProductionBootstrapManifest(value: unknown): ProductionB
   const selected = manifest.selected_messaging_group_id;
   return {
     schema_version: BOOTSTRAP_SCHEMA_VERSION,
-    onecli_cli_path: requirePath(manifest.onecli_cli_path, 'onecli_cli_path', INVALID_BOOTSTRAP),
     node_path: requirePath(manifest.node_path, 'node_path', INVALID_BOOTSTRAP),
     home_directory: requirePath(manifest.home_directory, 'home_directory', INVALID_BOOTSTRAP),
     platform: manifest.platform,
@@ -1477,11 +1464,10 @@ async function readInstanceState(paths: ControlPlanePaths, reservation: Instance
   return { ...(manifest ? { manifest } : {}), ...(runtime ? { runtime } : {}) };
 }
 
-/** The instance's OneCLI layout, run through the CLI and Docker endpoint it records. */
+/** The instance's OneCLI layout, run through the Docker endpoint it records. */
 export function instanceOnecliLayout(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
-  cliExecutable: string,
   dockerEndpoint: string,
 ): OnecliRuntimeLayout {
   return createOnecliRuntimeLayout({
@@ -1490,20 +1476,14 @@ export function instanceOnecliLayout(
     project: reservation.exclusive_resource_claims.onecli_project,
     appPort: reservation.allocated_ports.onecli_app,
     gatewayPort: reservation.allocated_ports.onecli_gateway,
-    cliExecutable,
     dockerEndpoint,
   });
 }
 
-export interface DeployedAssistantSetup extends DeployedSetup {
-  /** The OneCLI CLI the assistant's runtime runs. */
-  readonly onecliCliPath: string;
-}
-
 /**
  * What a created assistant's own record says it runs (KTD6): the provider,
- * credential metadata, and OneCLI cohort its release receipt records, the
- * OneCLI CLI its runtime uses, and the Postgres image its Compose file names.
+ * credential metadata, and OneCLI cohort its release receipt records, and
+ * the Postgres image its Compose file names.
  * An update holds the tool's release to these, never to the tool's own tree.
  * The receipt must be for one of `commits`: the reservation's by default, or
  * mid-update also the release an operation placed live (KTD17).
@@ -1512,21 +1492,20 @@ export async function readDeployedSetup(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
   commits: readonly string[] = [reservation.deployed_commit],
-): Promise<DeployedAssistantSetup> {
+): Promise<DeployedSetup> {
   const runtime = await loadInstanceRuntimeConfig(instanceRuntimeFile(reservation.checkout_realpath));
   const receipt = await loadReleasePreflightReceipt(paths.releasePreflightFile(reservation.instance_id), {
     instanceId: reservation.instance_id,
     deployedCommits: commits,
     provider: runtime.selected_provider,
   });
-  const onecli = instanceOnecliLayout(paths, reservation, runtime.onecli_cli_path, runtime.docker_endpoint);
+  const onecli = instanceOnecliLayout(paths, reservation, runtime.docker_endpoint);
   const images = parseOnecliComposeImages(await readOwnerOnlyFile(onecli.composeFile));
   return {
     onecli: receipt.onecli,
     postgresImage: images.postgres,
     provider: receipt.provider,
     providerCredential: receipt.providerCredential,
-    onecliCliPath: runtime.onecli_cli_path,
   };
 }
 
@@ -1534,16 +1513,15 @@ export async function readDeployedSetup(
  * The host coordinates create recorded for this instance: the runtime's once
  * the host has started, the bootstrap manifest's before. Once recorded,
  * resume probes the Docker endpoint rather than re-resolving the active
- * context, and runs the OneCLI CLI this instance was created with.
+ * context.
  */
 export async function recordedHost(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
-): Promise<{ readonly dockerEndpoint?: string; readonly onecliCliPath?: string }> {
+): Promise<{ readonly dockerEndpoint?: string }> {
   const { manifest, runtime } = await readInstanceState(paths, reservation);
   const dockerEndpoint = runtime?.docker_endpoint ?? manifest?.docker_endpoint;
-  const onecliCliPath = runtime?.onecli_cli_path ?? manifest?.onecli_cli_path;
-  return { ...(dockerEndpoint ? { dockerEndpoint } : {}), ...(onecliCliPath ? { onecliCliPath } : {}) };
+  return dockerEndpoint ? { dockerEndpoint } : {};
 }
 
 /** Build the production context from temporary bootstrap input or authoritative instance state. */
@@ -1572,11 +1550,11 @@ export async function runProductionProvision(
   let onecli: OnecliRuntimeLayout;
   if (persistedRuntime) {
     runtime = persistedRuntime;
-    onecli = instanceOnecliLayout(operation.paths, reservation, runtime.onecli_cli_path, runtime.docker_endpoint);
+    onecli = instanceOnecliLayout(operation.paths, reservation, runtime.docker_endpoint);
   } else {
     if (!manifest) throw new GwsEaError('bootstrap_required', 'The temporary bootstrap manifest is missing');
-    // The runtime records this layout's CLI path and Docker endpoint verbatim, so the layout matches it too.
-    onecli = instanceOnecliLayout(operation.paths, reservation, manifest.onecli_cli_path, manifest.docker_endpoint);
+    // The runtime records this layout's Docker endpoint verbatim, so the layout matches it too.
+    onecli = instanceOnecliLayout(operation.paths, reservation, manifest.docker_endpoint);
     runtime = createInstanceRuntimeConfig(reservation, onecli, {
       nodePath: manifest.node_path,
       homeDirectory: manifest.home_directory,
@@ -1602,7 +1580,6 @@ export async function runProductionProvision(
         checkoutRoot: reservation.checkout_realpath,
         provider: runtime.selected_provider,
         providerCredential: source.providerCredentialMetadata,
-        onecliCliPath: runtime.onecli_cli_path,
       },
       onecli,
       runtime,

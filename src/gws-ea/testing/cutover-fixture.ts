@@ -74,14 +74,13 @@ export const { upsertEnvVars } = (await import(path.join(CONTROL_PLANE_ROOT, 'se
 
 export const TRACK_BRANCH = 'rebuild-v2';
 export const DOCKER = 'unix:///var/run/docker.sock';
-export const ONECLI_CLI = '/usr/local/bin/onecli';
 export const CREDENTIAL = {
   name: 'Anthropic',
   type: 'anthropic',
   hostPattern: 'api.anthropic.com',
   headerName: 'x-api-key',
 };
-export const COHORT = { gateway: LAUNCHER_PINS.onecliGateway, cli: LAUNCHER_PINS.onecliCli, sdk: ONECLI_SDK_VERSION };
+export const COHORT = { gateway: LAUNCHER_PINS.onecliGateway, sdk: ONECLI_SDK_VERSION };
 /** The gateway the assistant's Compose file names: one an earlier release built. */
 export const DEPLOYED_GATEWAY = wrapperImageTag('0'.repeat(16));
 export const RELEASE_GATEWAY = (await resolveWrapperGatewayImage(COHORT)).image;
@@ -308,7 +307,6 @@ export async function assistant(
     project: reserved.exclusive_resource_claims.onecli_project,
     appPort: reserved.allocated_ports.onecli_app,
     gatewayPort: reserved.allocated_ports.onecli_gateway,
-    cliExecutable: ONECLI_CLI,
     dockerEndpoint: DOCKER,
   });
   const runtime = createInstanceRuntimeConfig(reserved, onecli, {
@@ -1020,7 +1018,7 @@ export function status(host: Machine, state: World, next: Release, runtime: Inst
         runCommand: runner(state),
         ...(deps.fetch ? { fetch: deps.fetch } : {}),
         ncl: unserved,
-        onecliAdmin: unserved,
+        onecliAgents: unserved,
         onecli: async () => ({ status: 'present' }),
       },
     },

@@ -21,7 +21,7 @@ import {
   readInstanceHostEnvironment,
   reconcileInstanceRuntime,
   reconcileInstanceService,
-  runInstanceOnecliAdminCommand,
+  instanceOnecliAdmin,
   writeInstanceServiceDefinition,
   writeReleaseRuntime,
   type InstanceRuntimeConfig,
@@ -70,8 +70,6 @@ async function fixture(): Promise<{ config: InstanceRuntimeConfig; home: string 
   await writeFile(path.join(checkout, 'dist', 'gws-ea', 'process.js'), 'launcher');
   await writeFile(path.join(checkout, 'bin', 'ncl'), '#!/bin/sh\n', { mode: 0o700 });
   await writeFile(path.join(checkout, 'package.json'), '{"version":"2.3.0"}\n');
-  const onecliCli = path.join(root, 'onecli');
-  await writeFile(onecliCli, '#!/bin/sh\n', { mode: 0o700 });
   const reservation: InstanceReservation = {
     instance_id: instanceId,
     checkout_realpath: checkout,
@@ -94,7 +92,6 @@ async function fixture(): Promise<{ config: InstanceRuntimeConfig; home: string 
     project: reservation.exclusive_resource_claims.onecli_project,
     appPort: reservation.allocated_ports.onecli_app,
     gatewayPort: reservation.allocated_ports.onecli_gateway,
-    cliExecutable: onecliCli,
     dockerEndpoint: DOCKER_ENDPOINT,
   });
   const home = path.join(root, 'home');
@@ -138,7 +135,6 @@ describe('GWS-EA instance runtime', () => {
       'home_directory',
       'instance_id',
       'node_path',
-      'onecli_cli_path',
       'onecli_project',
       'schema_version',
       'selected_provider',
@@ -189,39 +185,28 @@ describe('GWS-EA instance runtime', () => {
     );
   });
 
-  it('runs OneCLI administration through the pinned binary and admin-only credential file', async () => {
+  it("administers OneCLI at the instance's own app URL with the admin-only credential file", async () => {
     const { config } = await fixture();
     await persistInstanceRuntime(config, upsertEnvVars);
-    await writeOwnerOnlyFileExclusive(config.secret_files.onecli_admin_api_key, 'admin-secret-canary');
-    const calls: SanitizedCommand[] = [];
-    const runner = vi.fn(async (command: SanitizedCommand) => {
-      calls.push(command);
-      return { stdout: '{"data":[]}', stderr: '' };
-    });
+    await writeOwnerOnlyFileExclusive(config.secret_files.onecli_admin_api_key, 'admin-secret-canary\n');
+    const fetch = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => new Response('[]'));
 
-    const result = await runInstanceOnecliAdminCommand(config, ['agents', 'list'], {
-      runCommand: runner,
-      ambientEnv: {
-        PATH: '/attacker/bin',
-        ONECLI_API_HOST: 'https://attacker.invalid',
-        ONECLI_API_KEY: 'ambient-secret',
-        GCHAT_CREDENTIALS: 'ambient-chat-secret',
-      },
-    });
+    await (await instanceOnecliAdmin(config, { fetch })).listAgents();
 
-    expect(result.stdout).toBe('{"data":[]}');
-    expect(runner).toHaveBeenCalledWith(
-      expect.objectContaining({
-        command: config.onecli_cli_path,
-        args: ['agents', 'list'],
-        env: expect.objectContaining({
-          ONECLI_API_HOST: config.onecli_app_url,
-          ONECLI_API_KEY: 'admin-secret-canary',
-        }),
-      }),
-    );
-    const command = calls[0];
-    expect(command?.env).not.toHaveProperty('GCHAT_CREDENTIALS');
+    expect(fetch).toHaveBeenCalledOnce();
+    const [url, init] = fetch.mock.calls[0]!;
+    expect(String(url)).toBe(`${config.onecli_app_url}/v1/agents`);
+    expect(new Headers(init?.headers).get('authorization')).toBe('Bearer admin-secret-canary');
+  });
+
+  it('refuses an empty OneCLI admin credential file before calling OneCLI', async () => {
+    const { config } = await fixture();
+    await persistInstanceRuntime(config, upsertEnvVars);
+    await writeOwnerOnlyFileExclusive(config.secret_files.onecli_admin_api_key, '\n');
+    const fetch = vi.fn(async () => new Response('[]'));
+
+    await expect(instanceOnecliAdmin(config, { fetch })).rejects.toMatchObject({ code: 'invalid_secret' });
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it('keeps an existing launchd definition as written, restarts it as every command does, and reports its layout and pid', async () => {

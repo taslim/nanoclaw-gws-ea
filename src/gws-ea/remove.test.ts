@@ -1279,12 +1279,11 @@ describe('removal after an update or rollback', () => {
     if (docker) await writePrivate(path.join(state, 'runtime.json'), { docker_endpoint: docker });
   }
 
-  /** The runtime record of the release in `checkout`: a home of the test's own, and the recorded endpoint and CLI. */
+  /** The runtime record of the release in `checkout`: a home of the test's own, and the recorded endpoint. */
   async function recordRuntime(paths: ControlPlanePaths, checkout: string): Promise<void> {
     await writePrivate(path.join(checkout, 'data', 'gws-ea', 'runtime.json'), {
       home_directory: path.join(paths.stateRoot, 'home'),
       docker_endpoint: RECORDED_DOCKER,
-      onecli_cli_path: '/opt/onecli/bin/onecli',
     });
   }
 

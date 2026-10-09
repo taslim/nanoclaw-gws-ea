@@ -8,6 +8,7 @@ import { readEnvFile } from '../env.js';
 import { getInstallScopedNames } from '../install-slug.js';
 import { renderLaunchdService, renderSystemdService } from './service-definition.js';
 import { adoptSharedAgentImage, agentImageKey, readAgentImageInputs } from './agent-image.js';
+import { createOnecliAdmin, type OnecliAdmin, type OnecliAdminDependencies } from './onecli-admin.js';
 import type { OnecliRuntimeLayout } from './onecli-compose.js';
 import { preparePrivateDirectory, assertPrivateDirectory, instanceRuntimeFile, isRegularFile } from './paths.js';
 import {
@@ -16,7 +17,6 @@ import {
   replaceProcess,
   runSanitizedCommand,
   type SanitizedCommand,
-  type SanitizedCommandResult,
   type SanitizedCommandRunner,
 } from './process.js';
 import { activeStep } from './run-log.js';
@@ -59,7 +59,6 @@ export interface PersistedInstanceRuntime {
   readonly home_directory: string;
   readonly allocated_ports: AllocatedPorts;
   readonly onecli_project: string;
-  readonly onecli_cli_path: string;
   readonly selected_provider: string;
   readonly endpoint_url: string;
   readonly docker_endpoint: string;
@@ -213,7 +212,6 @@ function persistedRuntime(config: PersistedInstanceRuntime): PersistedInstanceRu
     home_directory: config.home_directory,
     allocated_ports: config.allocated_ports,
     onecli_project: config.onecli_project,
-    onecli_cli_path: config.onecli_cli_path,
     selected_provider: config.selected_provider,
     endpoint_url: config.endpoint_url,
     docker_endpoint: config.docker_endpoint,
@@ -248,7 +246,6 @@ export function createInstanceRuntimeConfig(
     home_directory: path.resolve(input.homeDirectory),
     allocated_ports: { ...reservation.allocated_ports },
     onecli_project: onecli.project,
-    onecli_cli_path: onecli.cliExecutable,
     selected_provider: input.selectedProvider.toLowerCase(),
     endpoint_url: ingressEndpointUrl(reservation.exclusive_resource_claims.ingress),
     docker_endpoint: input.dockerEndpoint,
@@ -293,7 +290,6 @@ export function validateRuntimeConfig(value: unknown): InstanceRuntimeConfig {
     home_directory: requirePath(raw.home_directory, 'home_directory', INVALID_RUNTIME),
     allocated_ports: ports,
     onecli_project: project,
-    onecli_cli_path: requirePath(raw.onecli_cli_path, 'onecli_cli_path', INVALID_RUNTIME),
     selected_provider: provider,
     endpoint_url: endpointUrl,
     docker_endpoint: requireDockerEndpoint(raw.docker_endpoint, 'docker_endpoint', INVALID_RUNTIME),
@@ -767,32 +763,19 @@ async function buildInstanceHostEnvironment(
 }
 
 /** The instance's OneCLI administrative key, from its owner-only secret file; an empty file is refused. */
-export async function readOnecliAdminApiKey(config: InstanceRuntimeConfig): Promise<string> {
+async function readOnecliAdminApiKey(config: InstanceRuntimeConfig): Promise<string> {
   const apiKey = (await readOwnerOnlyFile(config.secret_files.onecli_admin_api_key)).trim();
   if (!apiKey) throw new GwsEaError('invalid_secret', 'The OneCLI administrative credential is empty');
   return apiKey;
 }
 
-export async function runInstanceOnecliAdminCommand(
+/** The instance's OneCLI administration: its own app URL, with the admin key its owner-only file holds. */
+export async function instanceOnecliAdmin(
   configInput: InstanceRuntimeConfig,
-  args: readonly string[],
-  dependencies: { readonly runCommand?: SanitizedCommandRunner; readonly ambientEnv?: NodeJS.ProcessEnv } = {},
-): Promise<SanitizedCommandResult> {
+  dependencies: OnecliAdminDependencies = {},
+): Promise<OnecliAdmin> {
   const config = validateRuntimeConfig(configInput);
-  const apiKey = await readOnecliAdminApiKey(config);
-  await assertExecutable(config.onecli_cli_path);
-  const run = dependencies.runCommand ?? runSanitizedCommand;
-  return run({
-    command: config.onecli_cli_path,
-    args,
-    cwd: config.checkout_realpath,
-    env: buildToolEnvironment(dependencies.ambientEnv, {
-      HOME: path.join(path.dirname(config.checkout_realpath), 'onecli', 'cli-home'),
-      ONECLI_API_HOST: config.onecli_app_url,
-      ONECLI_API_KEY: apiKey,
-    }),
-    timeoutMs: 30_000,
-  });
+  return createOnecliAdmin(config.onecli_app_url, await readOnecliAdminApiKey(config), dependencies);
 }
 
 export async function launchInstanceHost(

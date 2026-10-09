@@ -93,7 +93,7 @@ export function parseJson(source: string, label: string, code: string): unknown 
   }
 }
 
-/** `ncl` and the OneCLI CLI wrap their result in `{ data }`. */
+/** `ncl` wraps its result in `{ data }`. */
 export function unwrapData(value: unknown): unknown {
   return isRecord(value) && 'data' in value ? value.data : value;
 }
