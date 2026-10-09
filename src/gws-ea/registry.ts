@@ -69,7 +69,7 @@ async function pathExists(target: string): Promise<boolean> {
 
 /**
  * A new instance ID whose root, `<state root>/<first 8 hex>`, is free: no
- * registered assistant, converted or not, has the same first eight hex
+ * registered assistant has the same first eight hex
  * digits, and nothing is there yet. The ID is drawn again until one is
  * (KTD10). Checked under the machine lock; the reservation's claim on the
  * root then keeps a concurrent create from taking it too.
@@ -267,9 +267,6 @@ export function validateReservation(value: unknown): InstanceReservation {
   const instanceId = requireString(value.instance_id, 'instance_id', 36);
   assertInstanceId(instanceId);
   const release = validateReleaseCoordinates(value);
-  // The layout before releases recorded its checkout; the field now only marks the entry unconverted.
-  const legacyCheckout =
-    value.checkout_realpath === undefined ? undefined : requireString(value.checkout_realpath, 'checkout_realpath');
   return {
     instance_id: instanceId,
     release_track: release.release_track,
@@ -277,7 +274,6 @@ export function validateReservation(value: unknown): InstanceReservation {
     deployed_commit: release.deployed_commit,
     allocated_ports: validatePorts(value.allocated_ports),
     exclusive_resource_claims: validateClaims(value.exclusive_resource_claims),
-    ...(legacyCheckout === undefined ? {} : { checkout_realpath: legacyCheckout }),
   };
 }
 

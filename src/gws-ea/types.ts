@@ -78,16 +78,7 @@ export interface InstanceReservationInput {
   exclusive_resource_claims: ExclusiveResourceClaims;
 }
 
-export type InstanceReservation = Readonly<
-  InstanceReservationInput & {
-    /**
-     * The checkout an assistant created before releases recorded; its presence
-     * marks the entry unconverted (`release-convert.ts`). Read only by the
-     * legacy locator, never written by a create, and dropped by the conversion.
-     */
-    checkout_realpath?: string;
-  }
->;
+export type InstanceReservation = Readonly<InstanceReservationInput>;
 
 /**
  * Which release a reservation deploys: the only reservation fields an update

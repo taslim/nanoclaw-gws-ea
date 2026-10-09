@@ -646,63 +646,15 @@ describe('instance roots', () => {
     const paths = await testPaths();
     const registered = reservation();
     await reserveInstance(paths, registered);
-    const unconverted = { ...distinctManagedReservation(), checkout_realpath: '/old/layout/nanoclaw' };
-    await reserveInstance(paths, unconverted);
-    // An unconverted assistant still lives under instances/<id>: nothing is at its short root yet.
-    await rm(paths.instanceRoot(unconverted.instance_id), { recursive: true });
     const occupied = randomUUID();
     await mkdir(paths.instanceRoot(occupied), { recursive: true, mode: 0o700 });
     const clash = (id: string): string => `${id.slice(0, 8)}${randomUUID().slice(8)}`;
     const free = randomUUID();
-    const drawn = [clash(registered.instance_id), clash(unconverted.instance_id), clash(occupied), free];
+    const drawn = [clash(registered.instance_id), clash(occupied), free];
     const generate = vi.fn(() => drawn.shift()!);
 
     await expect(allocateInstanceId(paths, generate)).resolves.toBe(free);
-    expect(generate).toHaveBeenCalledTimes(4);
-  });
-
-  it('parses a registry entry an assistant before releases left, and never writes its checkout path for a new one', async () => {
-    const paths = await testPaths();
-    const created = reservation();
-    await reserveInstance(paths, created);
-    const legacy = distinctManagedReservation();
-    const stored = JSON.parse(await readFile(paths.registryFile, 'utf8')) as {
-      instances: Record<string, Record<string, unknown>>;
-    } & Record<string, unknown>;
-    expect(stored.instances[created.instance_id]).not.toHaveProperty('checkout_realpath');
-    const legacyCheckout = path.join(paths.stateRoot, 'instances', legacy.instance_id, 'nanoclaw');
-    await writeFile(
-      paths.registryFile,
-      JSON.stringify({
-        ...stored,
-        instances: { ...stored.instances, [legacy.instance_id]: { ...legacy, checkout_realpath: legacyCheckout } },
-        shared_infrastructure_metadata: {
-          cloudflare: {
-            ownership_id: legacy.instance_id,
-            account_id: 'a'.repeat(32),
-            tunnel_name: `gws-ea-${legacy.instance_id.replaceAll('-', '')}`,
-            tunnel_id: null,
-          },
-        },
-      }),
-      { mode: 0o600 },
-    );
-
-    expect(await getInstanceReservation(paths, legacy.instance_id)).toEqual({
-      ...legacy,
-      checkout_realpath: legacyCheckout,
-    });
-    expect(await getInstanceReservation(paths, created.instance_id)).toEqual(created);
-    // A rewrite keeps the entry unconverted until the conversion drops the field; it adds the field to no other.
-    await swapInstanceRelease(paths, created.instance_id, releaseOf(created), {
-      ...releaseOf(created),
-      deployed_commit: 'c'.repeat(40),
-    });
-    const rewritten = JSON.parse(await readFile(paths.registryFile, 'utf8')) as {
-      instances: Record<string, Record<string, unknown>>;
-    };
-    expect(rewritten.instances[created.instance_id]).not.toHaveProperty('checkout_realpath');
-    expect(rewritten.instances[legacy.instance_id]).toMatchObject({ checkout_realpath: legacyCheckout });
+    expect(generate).toHaveBeenCalledTimes(3);
   });
 });
 

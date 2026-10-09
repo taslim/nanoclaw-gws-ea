@@ -682,7 +682,7 @@ async function foreignPortError(
  * container and named resource in it is proven the instance's own. Compose
  * is given the project's name alone and finds what to remove by its labels,
  * so neither the Compose file nor the paths it names need be where they were
- * written: a conversion moves them (KTD13).
+ * written.
  */
 export async function removeOnecliRuntime(
   layout: OnecliRuntimeLayout,

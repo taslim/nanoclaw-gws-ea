@@ -1,18 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import {
-  chmod,
-  mkdir,
-  mkdtemp,
-  readdir,
-  readFile,
-  realpath,
-  rename,
-  rm,
-  stat,
-  symlink,
-  writeFile,
-} from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -41,7 +29,6 @@ import { redact, REDACTED } from './redact.js';
 import { readRegistry } from './registry.js';
 import { createInstanceRuntimeConfig, persistInstanceRuntime, type InstanceRuntimeConfig } from './service.js';
 import { hostLogFiles, type NanoclawServiceHandle, type NanoclawServiceHelpers } from './service-control.js';
-import { legacyLocation } from './release-convert.js';
 import type { CreateTargetRequest } from './release-target.js';
 import { resolveReleaseSource } from './release-tracks.js';
 import { activeStep } from './run-log.js';
@@ -988,44 +975,6 @@ describe('gws-ea secrets inputs', () => {
       expect(contents, file).not.toContain(cloudflareSecret);
     }
   });
-
-  it("redacts a legacy assistant's secrets from its run log, read from where the layout before releases keeps them", async () => {
-    const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation());
-    const { root, checkout } = legacyLocation(paths, input.instance_id);
-    const registry = JSON.parse(await readFile(paths.registryFile, 'utf8')) as {
-      instances: Record<string, Record<string, unknown>>;
-    };
-    registry.instances[input.instance_id] = { ...registry.instances[input.instance_id], checkout_realpath: checkout };
-    await writeFile(paths.registryFile, JSON.stringify(registry), { mode: 0o600 });
-    // Values no redaction pattern knows: only their files name them secret.
-    const accountToken = `account-token-${randomUUID()}`;
-    const postgresPassword = randomUUID();
-    for (const [file, secret] of [
-      [path.join(root, 'secrets', 'cloudflare-account-token'), accountToken],
-      [path.join(root, 'onecli', 'secrets', 'postgres-password'), postgresPassword],
-    ] as const) {
-      await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-      await writeOwnerFile(file, secret);
-    }
-    const io = lines();
-
-    expect(
-      await runCli(['remove', '--id', input.instance_id, '--yes'], {
-        paths,
-        ...io.runtime,
-        removeAssistant: async () => {
-          activeStep()?.write(`accidentally logged ${accountToken} and ${postgresPassword}\n`);
-          return undefined;
-        },
-      }),
-    ).toBe(0);
-
-    const logged = await Promise.all(
-      (await filesUnder(paths.instanceLogsRoot(input.instance_id))).map((file) => readFile(file, 'utf8')),
-    );
-    expect(logged.join('\n')).toContain(`accidentally logged ${REDACTED} and ${REDACTED}`);
-  });
 });
 
 describe('gws-ea run-scoped Cloudflare authority', () => {
@@ -1064,6 +1013,39 @@ describe('gws-ea run-scoped Cloudflare authority', () => {
       }),
     ).toBe(exitCode);
     expect(session.clearAccountToken).toHaveBeenCalledOnce();
+  });
+
+  it("redacts the secrets in an assistant's root from its run log", async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation());
+    const root = paths.instanceRoot(input.instance_id);
+    // Values no redaction pattern knows: only their files name them secret.
+    const accountToken = `account-token-${randomUUID()}`;
+    const postgresPassword = randomUUID();
+    for (const [file, secret] of [
+      [path.join(root, 'secrets', 'cloudflare-account-token'), accountToken],
+      [path.join(root, 'onecli', 'secrets', 'postgres-password'), postgresPassword],
+    ] as const) {
+      await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+      await writeOwnerFile(file, secret);
+    }
+    const io = lines();
+
+    expect(
+      await runCli(['remove', '--id', input.instance_id, '--yes'], {
+        paths,
+        ...io.runtime,
+        removeAssistant: async () => {
+          activeStep()?.write(`accidentally logged ${accountToken} and ${postgresPassword}\n`);
+          return undefined;
+        },
+      }),
+    ).toBe(0);
+
+    const logged = await Promise.all(
+      (await filesUnder(paths.instanceLogsRoot(input.instance_id))).map((file) => readFile(file, 'utf8')),
+    );
+    expect(logged.join('\n')).toContain(`accidentally logged ${REDACTED} and ${REDACTED}`);
   });
 
   it('is cleared when the run throws', async () => {
@@ -2069,28 +2051,6 @@ describe('gws-ea logs', () => {
 
     expect(logs.errors).toBe(path.join(paths.instanceRoot(a.instance_id), 'logs', 'nanoclaw.error.log'));
     expect(replacement?.args).toEqual(['cat', logs.errors]);
-  });
-
-  it("shows a legacy assistant's host log from its legacy checkout until its conversion moves the logs", async () => {
-    const paths = await testPaths();
-    const a = await createdAssistant(paths, 35_001);
-    const { checkout } = legacyLocation(paths, a.instance_id);
-    const legacy = await writeHostLogs(checkout);
-    await rm(paths.instanceLayout(a.instance_id).logs, { recursive: true, force: true });
-    const registry = JSON.parse(await readFile(paths.registryFile, 'utf8')) as {
-      instances: Record<string, Record<string, unknown>>;
-    };
-    registry.instances[a.instance_id] = { ...registry.instances[a.instance_id], checkout_realpath: checkout };
-    await writeFile(paths.registryFile, JSON.stringify(registry), { mode: 0o600 });
-
-    const before = await runReplacing(['logs', '--id', a.instance_id], { paths, ...lines().runtime });
-    // The conversion moves the checkout's logs into the assistant's root by rename.
-    await rename(path.dirname(legacy.output), paths.instanceLayout(a.instance_id).logs);
-    const after = await runReplacing(['logs', '--id', a.instance_id, '--errors'], { paths, ...lines().runtime });
-
-    expect(legacy.output).toBe(path.join(checkout, 'logs', 'nanoclaw.log'));
-    expect(before.replacement?.args).toEqual(['cat', legacy.output]);
-    expect(after.replacement?.args).toEqual(['cat', hostLogFiles(a.instance_root).errors]);
   });
 
   it('streams the host log as the file holds it', async () => {

@@ -13,10 +13,8 @@
  * observation never hides another. An unfinished update or rollback never
  * stops either command (R16): both show it, with the command that continues
  * or reverts it. Both work in every phase (R9): while a switch has fenced the
- * assistant they read its `state/` and `logs/` physically, and one on the
- * layout before releases, or moving off it, is shown by its record with the
- * update that converts it (KTD11). Both exit 0 once they observed, whatever
- * the health; an unknown assistant ID exits 1.
+ * assistant they read its `state/` and `logs/` physically. Both exit 0 once
+ * they observed, whatever the health; an unknown assistant ID exits 1.
  */
 import { createHash } from 'node:crypto';
 
@@ -58,7 +56,6 @@ import { buildToolEnvironment, runSanitizedCommand, type SanitizedCommandRunner 
 import { readDeployedSetup } from './provision.js';
 import { redact, safeErrorMessage } from './redact.js';
 import { assertInstanceId, readRegistry } from './registry.js';
-import { isConverting, legacyInstanceRoot } from './release-convert.js';
 import { readCurrent } from './release-layout.js';
 import { sameSchema } from './rollback.js';
 import {
@@ -246,17 +243,13 @@ export type OperationView =
   | { readonly state: 'unreadable'; readonly code: string; readonly message: string };
 
 /**
- * Where the assistant stands between releases and layouts (R9): `live` while
- * the live link names a release; `fenced` while a switch has removed it, so
- * nothing can start the host; `converting` while its one-time conversion to
- * the release layout is under way; `legacy` while it is still on the layout
- * before releases; `unknown` when that cannot be read.
+ * Where the assistant stands between releases (R9): `live` while the live
+ * link names a release; `fenced` while a switch has removed it, so nothing
+ * can start the host; `unknown` when that cannot be read.
  */
 export type PhaseView =
   | { readonly state: 'live'; readonly release: string }
   | { readonly state: 'fenced' }
-  | { readonly state: 'converting'; readonly continue_with: string }
-  | { readonly state: 'legacy'; readonly convert_with: string }
   | { readonly state: 'unknown'; readonly reason: string };
 
 export interface ListedAssistant {
@@ -310,12 +303,7 @@ export interface SchemaView {
   readonly reason: string | null;
 }
 
-/**
- * What `status` shows of every assistant. One whose state is not all in its
- * own root yet, on the layout before releases or moving off it, is shown by
- * this alone: none of the observers would find what they read.
- */
-export interface AssistantRecordStatus {
+export interface AssistantStatus {
   readonly instance_id: string;
   readonly observed_at: string;
   readonly phase: PhaseView;
@@ -323,16 +311,10 @@ export interface AssistantRecordStatus {
   readonly operation: OperationView;
   readonly removal_in_progress: boolean;
   readonly release: ReleaseView;
-}
-
-/** An assistant whose state is all in its own root, observed through every probe. */
-export interface ObservedAssistantStatus extends AssistantRecordStatus {
   readonly rollback: RollbackView;
   readonly schema: SchemaView;
   readonly probes: AssistantProbes;
 }
-
-export type AssistantStatus = AssistantRecordStatus | ObservedAssistantStatus;
 
 /** The boundaries `status` observes through; each defaults to the real one. */
 export interface StatusObservers {
@@ -576,32 +558,14 @@ function removalInProgress(paths: ControlPlanePaths, instanceId: string): Promis
   return isRegularFile(paths.removalFile(instanceId));
 }
 
-/** Whether the assistant's state is all in its own root: false on the layout before releases, or moving off it. */
-function inOwnRoot(paths: ControlPlanePaths, reservation: InstanceReservation): boolean {
-  return legacyInstanceRoot(paths, reservation) === undefined;
-}
-
 /** The release the assistant's live link names, read at most once however many observations of it ask. */
 function liveRelease(paths: ControlPlanePaths, instanceId: string): () => Promise<string | undefined> {
   return once(() => readCurrent(paths.instanceLayout(instanceId)));
 }
 
-/** Where the assistant stands between releases and layouts, read physically, never through the live link. */
-async function observePhase(
-  paths: ControlPlanePaths,
-  reservation: InstanceReservation,
-  inspection: OperationInspection,
-  current: () => Promise<string | undefined>,
-): Promise<PhaseView> {
-  const id = reservation.instance_id;
-  const update = `gws-ea update --id ${id}`;
+/** Where the assistant stands between releases, read physically, never through the live link. */
+async function observePhase(current: () => Promise<string | undefined>): Promise<PhaseView> {
   try {
-    // Only its converted release failing verification closes a conversion's update as failed: that release is live,
-    // and the failed operation names the update that fixes it forward (KTD12).
-    if (inspection.state !== 'failed' && (await isConverting(paths, id))) {
-      return { state: 'converting', continue_with: update };
-    }
-    if (!inOwnRoot(paths, reservation)) return { state: 'legacy', convert_with: update };
     const live = await current();
     return live === undefined ? { state: 'fenced' } : { state: 'live', release: live };
     // eslint-disable-next-line no-catch-all/no-catch-all -- A phase that cannot be read is reported, never thrown.
@@ -617,10 +581,6 @@ function phaseDetail(phase: PhaseView): string {
       return `Release ${phase.release} is live.`;
     case 'fenced':
       return 'No release is live: a switch has fenced it, so nothing can start its host.';
-    case 'converting':
-      return `Its conversion to the release layout is unfinished; continue it with ${phase.continue_with}.`;
-    case 'legacy':
-      return `It is on the legacy layout: run ${phase.convert_with} to convert it.`;
     case 'unknown':
       return `Which release is live cannot be read: ${phase.reason}`;
   }
@@ -1120,12 +1080,12 @@ export async function observeAssistantStatus(
   const inspection = await inspect(context.paths, reservation);
   const current = liveRelease(context.paths, reservation.instance_id);
   const [phase, removal, release] = await Promise.all([
-    observePhase(context.paths, reservation, inspection, current),
+    observePhase(current),
     removalInProgress(context.paths, instanceId),
     observeRelease({ context, reservation, observers }),
   ]);
   const ingress = reservation.exclusive_resource_claims.ingress;
-  const record: AssistantRecordStatus = {
+  const record = {
     instance_id: reservation.instance_id,
     observed_at: observedAt,
     phase,
@@ -1141,8 +1101,6 @@ export async function observeAssistantStatus(
     removal_in_progress: removal,
     release,
   };
-  if (!inOwnRoot(context.paths, reservation)) return record;
-
   const runtime = await readRuntimeRecord(context.paths, reservation);
   const subject: Subject = { context, observers, reservation, inspection, runtime, current };
   const main = once(() => publishedMain(subject));
@@ -1210,8 +1168,6 @@ export async function observeAssistantStatus(
 /**
  * Every registered assistant, from local state only (R1): the registry, cheap
  * service detection, and where each stands against the tool's own release.
- * An assistant whose state is not all in its own root yet has no runtime
- * record there to find its service by.
  */
 export async function listAssistants(context: ObservationContext): Promise<AssistantListing> {
   const registry = await readRegistry(context.paths);
@@ -1225,15 +1181,12 @@ export async function listAssistants(context: ObservationContext): Promise<Assis
   const assistants = await Promise.all(
     reservations.map(async (reservation): Promise<ListedAssistant> => {
       const inspection = await inspect(context.paths, reservation);
-      const [phase, removal, release, observed] = await Promise.all([
-        observePhase(context.paths, reservation, inspection, liveRelease(context.paths, reservation.instance_id)),
+      const [phase, removal, release, service] = await Promise.all([
+        observePhase(liveRelease(context.paths, reservation.instance_id)),
         removalInProgress(context.paths, reservation.instance_id),
         observeRelease({ context, reservation, observers }),
-        inOwnRoot(context.paths, reservation)
-          ? readRuntimeRecord(context.paths, reservation).then((runtime) => observeService(context, runtime))
-          : undefined,
+        readRuntimeRecord(context.paths, reservation).then((runtime) => observeService(context, runtime)),
       ]);
-      const service = observed ?? { state: 'unknown' as const, reason: phaseDetail(phase) };
       return {
         instance_id: reservation.instance_id,
         hostname: hostnameOf(reservation.exclusive_resource_claims.ingress),
@@ -1344,13 +1297,11 @@ function renderList(listing: AssistantListing): string[] {
       assistant.removal_in_progress ? 'removing' : operationSummary(assistant.operation),
     ]),
   ];
-  // Beside the table: a conversion to start or finish, or a phase that cannot be read. A fenced assistant's
-  // operation names what moves it on.
+  // Beside the table: a phase that cannot be read. A fenced assistant's operation names what moves it on.
   const details = listing.assistants.flatMap(({ instance_id: id, phase, operation, removal_in_progress: removal }) =>
-    [
-      ...(phase.state === 'live' || phase.state === 'fenced' ? [] : [phaseDetail(phase)]),
-      ...operationDetail(id, operation, removal),
-    ].map((line) => `${id}: ${line}`),
+    [...(phase.state === 'unknown' ? [phaseDetail(phase)] : []), ...operationDetail(id, operation, removal)].map(
+      (line) => `${id}: ${line}`,
+    ),
   );
   return [...table(rows), ...(details.length > 0 ? ['', ...details] : [])];
 }
@@ -1408,10 +1359,13 @@ function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes
 }
 
 function renderStatus(status: AssistantStatus, timezone: string): string[] {
-  const { registry } = status;
+  const { registry, schema } = status;
   const ingress = registry.ingress_mode === 'managed-cloudflare' ? 'managed Cloudflare' : 'operator endpoint';
   const operation = operationDetail(status.instance_id, status.operation, status.removal_in_progress);
-  const observed = 'probes' in status;
+  const schemaLine =
+    schema.central_fingerprint === null || schema.session_fingerprint === null
+      ? `unknown: ${schema.reason ?? ''}`
+      : `latest migration ${schema.latest_migration ?? '(none)'}; central ${schema.central_fingerprint.slice(0, 19)}, sessions ${schema.session_fingerprint.slice(0, 19)}`;
   const lines = [
     `Assistant ${status.instance_id}`,
     `  Hostname:  ${registry.hostname} (${ingress})`,
@@ -1419,23 +1373,17 @@ function renderStatus(status: AssistantStatus, timezone: string): string[] {
     `  Track:     ${registry.track} from ${registry.source_remote}`,
     `  Phase:     ${phaseDetail(status.phase)}`,
     `  Release:   ${releaseLine(status.instance_id, status.release)}`,
-    ...(observed ? [`  Rollback:  ${rollbackLine(status.rollback)}`] : []),
+    `  Rollback:  ${rollbackLine(status.rollback)}`,
     `  Operation: ${operation.length === 0 ? 'none' : operation[0]!}`,
     ...operation.slice(1).map((line) => `             ${line}`),
+    `  Schema:    ${schemaLine}`,
+    'Probes:',
   ];
-  if (observed) {
-    const { schema } = status;
-    const schemaLine =
-      schema.central_fingerprint === null || schema.session_fingerprint === null
-        ? `unknown: ${schema.reason ?? ''}`
-        : `latest migration ${schema.latest_migration ?? '(none)'}; central ${schema.central_fingerprint.slice(0, 19)}, sessions ${schema.session_fingerprint.slice(0, 19)}`;
-    lines.push(`  Schema:    ${schemaLine}`, 'Probes:');
-    for (const name of PROBE_NAMES) {
-      const result = status.probes[name];
-      if (!result) continue;
-      const detail = result.reason ?? probeDetail(name, status.probes, timezone);
-      lines.push(`  ${result.status.padEnd(8)}  ${name.padEnd(14)}  ${detail}`.trimEnd());
-    }
+  for (const name of PROBE_NAMES) {
+    const result = status.probes[name];
+    if (!result) continue;
+    const detail = result.reason ?? probeDetail(name, status.probes, timezone);
+    lines.push(`  ${result.status.padEnd(8)}  ${name.padEnd(14)}  ${detail}`.trimEnd());
   }
   lines.push(`Observed: ${formatLocalTime(status.observed_at, timezone)}`);
   return lines;
@@ -1449,7 +1397,7 @@ export const LIST_USAGE: readonly string[] = [
   'list [--json]',
   "       Every assistant on this machine, from local state only; BEHIND TOOL says whether this gws-ea's",
   '       release is newer. JSON: {"assistants": [...]}, each with instance_id, hostname, track,',
-  '       deployed_commit, phase (state: live with its release|fenced|converting|legacy|unknown), release',
+  '       deployed_commit, phase (state: live with its release|fenced|unknown), release',
   '       (deployed_commit, tool_commit, behind_tool_release: true|false, or null with a reason when',
   '       unknown), service (state: running|stopped|not_installed|unmanaged|unknown, reason), operation',
   '       (state: none|open|failed|committed|unreadable), removal_in_progress.',
@@ -1464,9 +1412,8 @@ export const STATUS_USAGE: readonly string[] = [
   '       probes: checkout, image (tag), service, host, onecli, main_identity, external_email, inbox (state,',
   '       since, last_success_at, calendar_notifications), workspace (account), principal, route, connector',
   '       (managed Cloudflare only, with drift), delivery; each probe has status ok|degraded|unknown and a',
-  '       reason. Until its conversion moves its record, an assistant on the legacy layout has no rollback,',
-  '       schema, or probes. list and status exit 0 once they observed, whatever the health; status exits 1',
-  '       for an unknown ID.',
+  '       reason. list and status exit 0 once they observed, whatever the health; status exits 1 for an',
+  '       unknown ID.',
 ];
 
 function timezoneOf(runtime: ReadOnlyCommandRuntime): string {

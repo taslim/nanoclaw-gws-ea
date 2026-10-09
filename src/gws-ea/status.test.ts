@@ -47,7 +47,6 @@ import { PRESENT } from './phases.js';
 import type { PrincipalCandidate } from './principal.js';
 import { runSanitizedCommand, type SanitizedCommand } from './process.js';
 import { redact } from './redact.js';
-import { conversionRecordFile } from './release-convert.js';
 import { operationName } from './release-layout.js';
 import { writeInstanceMarker } from './registry.js';
 import { createInstanceRuntimeConfig, persistInstanceRuntime, type HostStatusHelpers } from './service.js';
@@ -334,24 +333,6 @@ async function removalStarted(paths: ControlPlanePaths, reservation: InstanceRes
     reservation,
     started_at: NOW.toISOString(),
   });
-}
-
-/**
- * An assistant still on the layout before releases: its registry entry
- * records the checkout that layout kept under `instances/<id>/`, and nothing
- * of it is in a short root.
- */
-async function legacyAssistant(host: Machine, options: AssistantOptions): Promise<InstanceReservation> {
-  const reservation = await assistant(host, options);
-  const id = reservation.instance_id;
-  await rm(host.paths.instanceRoot(id), { recursive: true, force: true });
-  const registry = JSON.parse(await readFile(host.paths.registryFile, 'utf8')) as {
-    instances: Record<string, Record<string, unknown>>;
-  };
-  const checkout = path.join(host.paths.stateRoot, 'instances', id, 'nanoclaw');
-  registry.instances[id] = { ...registry.instances[id], checkout_realpath: checkout };
-  await writePrivate(host.paths.registryFile, registry);
-  return { ...reservation, checkout_realpath: checkout };
 }
 
 /** An update to `to` with no release to return to, whose release started and failed: closed for fix-forward. */
@@ -1097,111 +1078,6 @@ describe('status', () => {
       reason: `Its agent image ${tag} is missing, so no agent can start.`,
       tag,
     });
-  });
-
-  it('shows an assistant on the legacy layout by its record alone, with the update that converts it', async () => {
-    const host = await machine();
-    const reservation = await legacyAssistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
-    const state = world();
-    const id = reservation.instance_id;
-    const legacy = `It is on the legacy layout: run gws-ea update --id ${id} to convert it.`;
-
-    const { exitCode, status } = await statusJson(host, state, id);
-    const text = command(host, state);
-    expect(await runStatusCommand(text.runtime, { instanceId: id, json: false })).toBe(0);
-    const json = command(host, state);
-    expect(await runListCommand(json.runtime, { json: true })).toBe(0);
-    const listed = command(host, state);
-    expect(await runListCommand(listed.runtime, { json: false })).toBe(0);
-
-    expect(exitCode).toBe(0);
-    expect(Object.keys(status)).toEqual(
-      STATUS_FIELDS.filter((field) => !['rollback', 'schema', 'probes'].includes(field)),
-    );
-    expect(status).toMatchObject({
-      phase: { state: 'legacy', convert_with: `gws-ea update --id ${id}` },
-      registry: { deployed_commit: host.release },
-      operation: { state: 'none' },
-      release: { deployed_commit: host.release, behind_tool_release: false },
-    });
-    expect(text.output.stdout).toContain(`  Phase:     ${legacy}`);
-    expect(text.output.stdout).not.toContain('Probes:');
-    const listing = JSON.parse(json.output.stdout.join('\n')) as { assistants: Array<Record<string, unknown>> };
-    expect(listing.assistants).toEqual([
-      expect.objectContaining({
-        phase: { state: 'legacy', convert_with: `gws-ea update --id ${id}` },
-        service: { state: 'unknown', reason: legacy },
-      }),
-    ]);
-    const lines = listed.output.stdout.join('\n');
-    expect(lines).toMatch(
-      new RegExp(`^${id} +\\S+ +dogfood +${host.release.slice(0, 12)} +no +unknown +legacy +-$`, 'mu'),
-    );
-    expect(listed.output.stdout).toContain(`${id}: ${legacy}`);
-    // Nothing of its service or host was asked: only the tool's own history, to place its release.
-    expect(state.serviceEnvironments).toEqual([]);
-    expect(new Set(state.commands.map(({ command: tool }) => tool))).toEqual(new Set(['git']));
-  });
-
-  it('says converting while a conversion is under way, before and after it moves the registry entry', async () => {
-    const host = await machine();
-    const moving = await legacyAssistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
-    const moved = await assistant(host, { label: 'beta', port: 36_011, ingress: 'existing' });
-    for (const { instance_id: id } of [moving, moved]) {
-      await writePrivate(conversionRecordFile(host.paths, id), { step: 'moved', legacy_root: `instances/${id}` });
-    }
-    const state = world(moved);
-
-    const before = await statusJson(host, state, moving.instance_id);
-    const after = await statusJson(host, state, moved.instance_id);
-    const text = command(host, state);
-    expect(await runStatusCommand(text.runtime, { instanceId: moving.instance_id, json: false })).toBe(0);
-    const listed = command(host, state);
-    expect(await runListCommand(listed.runtime, { json: false })).toBe(0);
-
-    for (const [{ status }, { instance_id: id }] of [
-      [before, moving],
-      [after, moved],
-    ] as const) {
-      expect(status.phase).toEqual({ state: 'converting', continue_with: `gws-ea update --id ${id}` });
-    }
-    // Until the registry entry moves, its state is not all in its root, so only its record is shown.
-    expect(before.status).not.toHaveProperty('probes');
-    expect(after.status.probes.service).toMatchObject({ status: 'ok', state: 'running' });
-    const unfinished = (id: string): string =>
-      `Its conversion to the release layout is unfinished; continue it with gws-ea update --id ${id}.`;
-    expect(text.output.stdout).toContain(`  Phase:     ${unfinished(moving.instance_id)}`);
-    for (const { instance_id: id } of [moving, moved]) {
-      expect(listed.output.stdout).toContain(`${id}: ${unfinished(id)}`);
-    }
-  });
-
-  it('shows the converted release live, and the fix-forward update, once it failed verification and closed the conversion', async () => {
-    const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
-    const id = reservation.instance_id;
-    const target: ReleaseCoordinates = { ...releaseOf(reservation), deployed_commit: 'c'.repeat(40) };
-    // The conversion recorded done, and the release it switched to closed its update as failed.
-    await writePrivate(conversionRecordFile(host.paths, id), { step: 'recreated', legacy_root: `instances/${id}` });
-    await updateFailedWithoutReturn(host.paths, reservation, target);
-    const state = world(reservation);
-    const live = host.release.slice(0, 8);
-    const fixForward =
-      `Its update to dogfood ${'c'.repeat(12)} failed and left no release to return to (started); ` +
-      `fix it forward to a newer release with gws-ea update --id ${id}.`;
-
-    const { status } = await statusJson(host, state, id);
-    const text = command(host, state);
-    expect(await runStatusCommand(text.runtime, { instanceId: id, json: false })).toBe(0);
-    const listed = command(host, state);
-    expect(await runListCommand(listed.runtime, { json: false })).toBe(0);
-
-    expect(status.phase).toEqual({ state: 'live', release: live });
-    expect(status.operation).toMatchObject({ state: 'failed', continue_with: `gws-ea update --id ${id}` });
-    expect(text.output.stdout).toContain(`  Phase:     Release ${live} is live.`);
-    expect(text.output.stdout).toContain(`  Operation: ${fixForward}`);
-    expect(listed.output.stdout).toContain(`${id}: ${fixForward}`);
-    expect([...text.output.stdout, ...listed.output.stdout].join('\n')).not.toContain('conversion');
   });
 
   it('names the fix-forward command for an update that failed and left no release to return to', async () => {
