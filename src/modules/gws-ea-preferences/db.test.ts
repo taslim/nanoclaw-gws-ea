@@ -398,16 +398,19 @@ describe('GWS-EA scheduling preferences store', () => {
     });
     expect(lunch).toMatchObject({ id: expect.stringMatching(/^w-[0-9a-f]{8}$/), reason: 'Lunch with family.' });
 
+    // Relearning it without a reason keeps the principal's reason for it.
     const relearnedLunch = await setSchedulingPreference({
       kind: 'protected-window',
       weekdays: ['fri', 'thu', 'wed', 'tue', 'mon'],
       start: '12:00',
       end: '13:00',
-      reason: 'Lunch with family.',
       source: 'learned',
       basis: 'Recurring lunch block.',
     });
-    expect(relearnedLunch).toMatchObject({ id: lunch.id, source: 'learned' });
+    expect(relearnedLunch).toMatchObject({ id: lunch.id, source: 'learned', reason: 'Lunch with family.' });
+    expect((await getSchedulingPreferences()).protected_windows).toContainEqual(
+      expect.objectContaining({ id: lunch.id, reason: 'Lunch with family.' }),
+    );
 
     const focus = await setSchedulingPreference({
       kind: 'protected-window',

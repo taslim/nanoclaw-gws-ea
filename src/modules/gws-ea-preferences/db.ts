@@ -421,25 +421,32 @@ export async function setSchedulingPreference(input: SetPreferenceInput): Promis
     case 'protected-window': {
       const weekdays = parseWeekdays(input.weekdays);
       const range = parseRange(input);
-      const reason = parseReason(input.reason);
-      const id = await db.transaction(async () => {
-        const sameShape = await db.get<{ readonly id: string }>(
-          `SELECT id FROM gws_ea_pref_protected_windows
+      const given = parseReason(input.reason);
+      // A write that gives no reason keeps the window's own: relearning a window never erases why it is protected.
+      const { id, reason } = await db.transaction(async () => {
+        const sameShape = await db.get<{ readonly id: string; readonly reason: string | null }>(
+          `SELECT id, reason FROM gws_ea_pref_protected_windows
             WHERE weekdays = ? AND start_minute = ? AND end_minute = ?`,
           weekdays.join(','),
           range.start,
           range.end,
         );
         let target: string;
+        let kept: string | null;
         if (input.id === undefined) {
           target = sameShape?.id ?? newWindowId();
+          kept = given ?? sameShape?.reason ?? null;
         } else {
           target = input.id.trim();
-          const existing = await db.get('SELECT id FROM gws_ea_pref_protected_windows WHERE id = ?', target);
+          const existing = await db.get<{ readonly reason: string | null }>(
+            'SELECT reason FROM gws_ea_pref_protected_windows WHERE id = ?',
+            target,
+          );
           if (!existing) throw new Error(`No protected window ${JSON.stringify(target)} exists`);
           if (sameShape && sameShape.id !== target) {
             throw new Error(`Protected window ${sameShape.id} already protects those days and hours`);
           }
+          kept = given ?? existing.reason;
         }
         await db.run(
           `INSERT INTO gws_ea_pref_protected_windows
@@ -457,12 +464,12 @@ export async function setSchedulingPreference(input: SetPreferenceInput): Promis
           weekdays.join(','),
           range.start,
           range.end,
-          reason,
+          kept,
           provenance.source,
           provenance.basis,
           provenance.updated_at,
         );
-        return target;
+        return { id: target, reason: kept };
       });
       return {
         id,
