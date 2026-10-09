@@ -306,7 +306,7 @@ registerResource({
       description:
         'Store one preference, replacing the value it names.\n\n' +
         'Use --source principal for what the principal states or corrects, and --source learned for a value derived from calendar history. ' +
-        'A learned value never replaces one the principal set. --basis is a short account of where the value came from.\n\n' +
+        '--basis is a short account of where the value came from. Before a learned value replaces one the principal set, point out the difference to them.\n\n' +
         'Shapes by --kind:\n' +
         '  working-hours     --weekday with --start and --end, or --off for a day the principal does not work\n' +
         '  protected-window  --start and --end, optional --weekdays (every day when omitted) and --reason; --id changes an existing window\n' +
@@ -345,8 +345,7 @@ registerResource({
       access: 'open',
       description:
         'Forget one preference, returning it to unset: --weekday for working-hours, --id for protected-window, --meeting-kind otherwise.\n\n' +
-        'Use --source principal when the principal asks you to forget it, and --source learned when you drop a value on your own inference. ' +
-        'A learned removal never removes a value the principal set.',
+        'Use --source principal when the principal asks you to forget it, and --source learned when you drop a value on your own inference.',
       args: [KIND_ARG, SOURCE_ARG, WEEKDAY_ARG, ID_ARG, MEETING_KIND_ARG],
       examples: [
         'ncl preferences remove --kind working-hours --weekday mon --source principal',

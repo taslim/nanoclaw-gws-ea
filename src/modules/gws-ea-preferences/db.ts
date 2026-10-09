@@ -245,22 +245,6 @@ function parseReason(value: string | undefined): string | null {
   return value === undefined ? null : parseOptionalLine(value, 'Reason', REASON_MAX_LENGTH);
 }
 
-/**
- * A learned value never replaces or removes one the principal set; the
- * principal may change anything. Removing is the same overwrite as replacing,
- * with nothing in its place.
- */
-function assertWritable(
-  existing: { readonly source: PreferenceSource } | undefined,
-  source: PreferenceSource,
-  label: string,
-  change: 'replace' | 'remove' = 'replace',
-) {
-  if (existing?.source === 'principal' && source === 'learned') {
-    throw new Error(`${label}: set by the principal, so a learned value cannot ${change} it`);
-  }
-}
-
 function newWindowId(): string {
   return `w-${randomBytes(4).toString('hex')}`;
 }
@@ -400,7 +384,8 @@ export async function getSchedulingPreferenceValues(): Promise<SchedulingPrefere
 
 /**
  * Store one preference, replacing the value it names. Rejects a value outside
- * its kind's shape, and a learned value over one the principal set.
+ * its kind's shape. Whether a learned value should replace what the principal
+ * said is main's judgment; the source and basis say which it was.
  */
 export function setSchedulingPreference<I extends SetPreferenceInput>(input: I): Promise<PreferenceByKind[I['kind']]>;
 export async function setSchedulingPreference(input: SetPreferenceInput): Promise<SchedulingPreference> {
@@ -413,29 +398,22 @@ export async function setSchedulingPreference(input: SetPreferenceInput): Promis
     case 'working-hours': {
       const weekday = parseWeekday(input.weekday);
       const range = input.hours === 'off' ? null : parseRange(input.hours);
-      await db.transaction(async () => {
-        assertWritable(
-          await db.get<ValueRow>('SELECT source FROM gws_ea_pref_working_hours WHERE weekday = ?', weekday),
-          source,
-          `Working hours for ${WEEKDAY_NAMES[weekday]}`,
-        );
-        await db.run(
-          `INSERT INTO gws_ea_pref_working_hours (weekday, start_minute, end_minute, source, basis, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT (weekday) DO UPDATE
-              SET start_minute = excluded.start_minute,
-                  end_minute = excluded.end_minute,
-                  source = excluded.source,
-                  basis = excluded.basis,
-                  updated_at = excluded.updated_at`,
-          weekday,
-          range?.start ?? null,
-          range?.end ?? null,
-          provenance.source,
-          provenance.basis,
-          provenance.updated_at,
-        );
-      });
+      await db.run(
+        `INSERT INTO gws_ea_pref_working_hours (weekday, start_minute, end_minute, source, basis, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (weekday) DO UPDATE
+            SET start_minute = excluded.start_minute,
+                end_minute = excluded.end_minute,
+                source = excluded.source,
+                basis = excluded.basis,
+                updated_at = excluded.updated_at`,
+        weekday,
+        range?.start ?? null,
+        range?.end ?? null,
+        provenance.source,
+        provenance.basis,
+        provenance.updated_at,
+      );
       return range === null
         ? { weekday, off: true, ...provenance }
         : { weekday, off: false, start: formatClock(range.start), end: formatClock(range.end), ...provenance };
@@ -445,8 +423,8 @@ export async function setSchedulingPreference(input: SetPreferenceInput): Promis
       const range = parseRange(input);
       const reason = parseReason(input.reason);
       const id = await db.transaction(async () => {
-        const sameShape = await db.get<ValueRow & { readonly id: string }>(
-          `SELECT id, source FROM gws_ea_pref_protected_windows
+        const sameShape = await db.get<{ readonly id: string }>(
+          `SELECT id FROM gws_ea_pref_protected_windows
             WHERE weekdays = ? AND start_minute = ? AND end_minute = ?`,
           weekdays.join(','),
           range.start,
@@ -455,18 +433,13 @@ export async function setSchedulingPreference(input: SetPreferenceInput): Promis
         let target: string;
         if (input.id === undefined) {
           target = sameShape?.id ?? newWindowId();
-          assertWritable(sameShape, source, `Protected window ${target}`);
         } else {
           target = input.id.trim();
-          const existing = await db.get<ValueRow>(
-            'SELECT source FROM gws_ea_pref_protected_windows WHERE id = ?',
-            target,
-          );
+          const existing = await db.get('SELECT id FROM gws_ea_pref_protected_windows WHERE id = ?', target);
           if (!existing) throw new Error(`No protected window ${JSON.stringify(target)} exists`);
           if (sameShape && sameShape.id !== target) {
             throw new Error(`Protected window ${sameShape.id} already protects those days and hours`);
           }
-          assertWritable(existing, source, `Protected window ${target}`);
         }
         await db.run(
           `INSERT INTO gws_ea_pref_protected_windows
@@ -502,66 +475,52 @@ export async function setSchedulingPreference(input: SetPreferenceInput): Promis
     }
     case 'meeting-length':
     case 'buffer': {
-      const { table, label } = MEETING_KIND_TABLES[input.kind];
+      const { table } = MEETING_KIND_TABLES[input.kind];
       const meetingKind = parseMeetingKind(input.meetingKind);
       const minutes = parseMinutes(
         input.minutes,
         input.kind === 'meeting-length' ? 1 : 0,
         input.kind === 'meeting-length' ? 'Meeting length' : 'Buffer',
       );
-      await db.transaction(async () => {
-        assertWritable(
-          await db.get<ValueRow>(`SELECT source FROM ${table} WHERE meeting_kind = ?`, meetingKind),
-          source,
-          `The ${label} for ${meetingKind}`,
-        );
-        await db.run(
-          `INSERT INTO ${table} (meeting_kind, minutes, source, basis, updated_at)
-           VALUES (?, ?, ?, ?, ?)
-           ON CONFLICT (meeting_kind) DO UPDATE
-              SET minutes = excluded.minutes,
-                  source = excluded.source,
-                  basis = excluded.basis,
-                  updated_at = excluded.updated_at`,
-          meetingKind,
-          minutes,
-          provenance.source,
-          provenance.basis,
-          provenance.updated_at,
-        );
-      });
+      await db.run(
+        `INSERT INTO ${table} (meeting_kind, minutes, source, basis, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (meeting_kind) DO UPDATE
+            SET minutes = excluded.minutes,
+                source = excluded.source,
+                basis = excluded.basis,
+                updated_at = excluded.updated_at`,
+        meetingKind,
+        minutes,
+        provenance.source,
+        provenance.basis,
+        provenance.updated_at,
+      );
       return { meeting_kind: meetingKind, minutes, ...provenance };
     }
     case 'preferred-time': {
       const meetingKind = parseMeetingKind(input.meetingKind);
       const weekdays = parseWeekdays(input.weekdays);
       const range = parseRange(input);
-      await db.transaction(async () => {
-        assertWritable(
-          await db.get<ValueRow>('SELECT source FROM gws_ea_pref_preferred_times WHERE meeting_kind = ?', meetingKind),
-          source,
-          `The preferred time for ${meetingKind}`,
-        );
-        await db.run(
-          `INSERT INTO gws_ea_pref_preferred_times
-             (meeting_kind, weekdays, start_minute, end_minute, source, basis, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT (meeting_kind) DO UPDATE
-              SET weekdays = excluded.weekdays,
-                  start_minute = excluded.start_minute,
-                  end_minute = excluded.end_minute,
-                  source = excluded.source,
-                  basis = excluded.basis,
-                  updated_at = excluded.updated_at`,
-          meetingKind,
-          weekdays.join(','),
-          range.start,
-          range.end,
-          provenance.source,
-          provenance.basis,
-          provenance.updated_at,
-        );
-      });
+      await db.run(
+        `INSERT INTO gws_ea_pref_preferred_times
+           (meeting_kind, weekdays, start_minute, end_minute, source, basis, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (meeting_kind) DO UPDATE
+            SET weekdays = excluded.weekdays,
+                start_minute = excluded.start_minute,
+                end_minute = excluded.end_minute,
+                source = excluded.source,
+                basis = excluded.basis,
+                updated_at = excluded.updated_at`,
+        meetingKind,
+        weekdays.join(','),
+        range.start,
+        range.end,
+        provenance.source,
+        provenance.basis,
+        provenance.updated_at,
+      );
       return {
         meeting_kind: meetingKind,
         weekdays,
@@ -579,14 +538,12 @@ export async function setSchedulingPreference(input: SetPreferenceInput): Promis
 
 /** Forget one preference, returning it to unset. Rejects a preference that is not set. */
 export async function removeSchedulingPreference(target: PreferenceTarget): Promise<RemovedPreference> {
-  const source = parseSource(target.source);
+  parseSource(target.source);
   const db = getDb();
-  /** Remove the one row `where` names, refusing a learned removal of a value the principal set. */
-  const removeRow = async (table: string, where: string, key: string | number, label: string, missing: string) => {
+  /** Remove the one row `where` names. */
+  const removeRow = async (table: string, where: string, key: string | number, missing: string) => {
     await db.transaction(async () => {
-      const existing = await db.get<ValueRow>(`SELECT source FROM ${table} WHERE ${where} = ?`, key);
-      if (!existing) throw new Error(missing);
-      assertWritable(existing, source, label, 'remove');
+      if (!(await db.get(`SELECT 1 FROM ${table} WHERE ${where} = ?`, key))) throw new Error(missing);
       await db.run(`DELETE FROM ${table} WHERE ${where} = ?`, key);
     });
   };
@@ -594,24 +551,12 @@ export async function removeSchedulingPreference(target: PreferenceTarget): Prom
     case 'working-hours': {
       const weekday = parseWeekday(target.weekday);
       const day = WEEKDAY_NAMES[weekday];
-      await removeRow(
-        'gws_ea_pref_working_hours',
-        'weekday',
-        weekday,
-        `Working hours for ${day}`,
-        `No working hours are set for ${day}`,
-      );
+      await removeRow('gws_ea_pref_working_hours', 'weekday', weekday, `No working hours are set for ${day}`);
       return { kind: target.kind, weekday };
     }
     case 'protected-window': {
       const id = target.id.trim();
-      await removeRow(
-        'gws_ea_pref_protected_windows',
-        'id',
-        id,
-        `Protected window ${JSON.stringify(id)}`,
-        `No protected window ${JSON.stringify(id)} exists`,
-      );
+      await removeRow('gws_ea_pref_protected_windows', 'id', id, `No protected window ${JSON.stringify(id)} exists`);
       return { kind: target.kind, id };
     }
     case 'meeting-length':
@@ -619,13 +564,7 @@ export async function removeSchedulingPreference(target: PreferenceTarget): Prom
     case 'preferred-time': {
       const { table, label } = MEETING_KIND_TABLES[target.kind];
       const meetingKind = parseMeetingKind(target.meetingKind);
-      await removeRow(
-        table,
-        'meeting_kind',
-        meetingKind,
-        `The ${label} for ${meetingKind}`,
-        `No ${label} is set for ${meetingKind}`,
-      );
+      await removeRow(table, 'meeting_kind', meetingKind, `No ${label} is set for ${meetingKind}`);
       return { kind: target.kind, meeting_kind: meetingKind };
     }
     default: {

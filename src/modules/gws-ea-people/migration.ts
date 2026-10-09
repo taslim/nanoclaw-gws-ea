@@ -7,8 +7,6 @@ import type { ModuleMigration } from '../../db/migrations/index.js';
  *
  * - each person has exactly one level from the fixed set, with its source;
  *   anyone without a record is unknown, so `unknown` is never stored;
- * - a learned level stops at active: inner circle and close come only from
- *   the principal;
  * - each identity is a channel-qualified handle (`email:<address>`, in
  *   NanoClaw's user-id form) held by one person, an email handle lowercased;
  * - a forgotten identity survives only as a keyed fingerprint (an HMAC-SHA256
@@ -19,7 +17,8 @@ import type { ModuleMigration } from '../../db/migrations/index.js';
  * every spelling of it.
  *
  * The record also held an organization, notes, remembered names and the
- * principal's standing instructions, which the thin-record migration drops.
+ * principal's standing instructions, and capped a learned level at active;
+ * the thin-record migration drops all of those.
  */
 export const gwsEaPeopleMigration: ModuleMigration = {
   version: 1,
@@ -99,16 +98,23 @@ async function droppedData(db: DbDriver): Promise<string[]> {
 
 /**
  * The record keeps only what the host enforces (KTD10): a person's name,
- * identities, one level, and the forget fingerprints. What `main` knows of a
- * person (organization, notes, the names the principal uses for them, and the
- * principal's instructions about them) lives in `main`'s memory files. The
- * migration carries nothing over: it refuses, naming what it found and
- * changing nothing, while any of that is held, so an update's dry run stops
- * before anything is lost.
+ * identities, one level with who set it, and the forget fingerprints. What
+ * `main` knows of a person (organization, notes, the names the principal uses
+ * for them, and the principal's instructions about them) lives in `main`'s
+ * memory files, and which level fits someone is `main`'s judgment, so the
+ * record no longer caps a learned level. The migration carries nothing over:
+ * it refuses, naming what it found and changing nothing, while any of that is
+ * held, so an update's dry run stops before anything is lost.
+ *
+ * Dropping a table constraint means recreating the table (new, copy, drop,
+ * rename), so it runs with foreign keys off: dropping the old table must not
+ * cascade into the identities that reference it. The runner checks every
+ * foreign key before it commits.
  */
 export const gwsEaPeopleThinRecordMigration: ModuleMigration = {
   version: 2,
   name: THIN_RECORD,
+  disableForeignKeys: true,
   async up(db) {
     const held = await droppedData(db);
     if (held.length > 0) {
@@ -119,8 +125,25 @@ export const gwsEaPeopleThinRecordMigration: ModuleMigration = {
     await db.exec(`
       DROP TABLE gws_ea_people_instructions;
       DROP TABLE gws_ea_people_names;
-      ALTER TABLE gws_ea_people DROP COLUMN organization;
-      ALTER TABLE gws_ea_people DROP COLUMN notes;
+
+      CREATE TABLE gws_ea_people_thin (
+        id            TEXT PRIMARY KEY CHECK (id LIKE 'p-%'),
+        name          TEXT NOT NULL CHECK (name <> ''),
+        name_key      TEXT NOT NULL CHECK (name_key <> ''),
+        level         TEXT NOT NULL CHECK (level IN ('inner-circle', 'close', 'active', 'known')),
+        level_source  TEXT NOT NULL CHECK (level_source IN ('principal', 'learned')),
+        level_basis   TEXT NOT NULL CHECK (level_basis <> ''),
+        level_set_at  TEXT NOT NULL,
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
+      );
+      INSERT INTO gws_ea_people_thin
+             (id, name, name_key, level, level_source, level_basis, level_set_at, created_at, updated_at)
+        SELECT id, name, name_key, level, level_source, level_basis, level_set_at, created_at, updated_at
+          FROM gws_ea_people;
+      DROP TABLE gws_ea_people;
+      ALTER TABLE gws_ea_people_thin RENAME TO gws_ea_people;
+      CREATE INDEX idx_gws_ea_people_name_key ON gws_ea_people (name_key);
     `);
   },
 };

@@ -130,14 +130,9 @@ describe('GWS-EA people store schema', () => {
     await expect(insertPerson({ level: 'unknown' })).rejects.toThrow(/CHECK/i);
     await expect(insertPerson({ level_source: null })).rejects.toThrow(/NOT NULL/i);
     await expect(insertPerson({ level_source: 'calendar' })).rejects.toThrow(/CHECK/i);
-    await expect(insertPerson({ level: 'close', level_source: 'learned' })).rejects.toThrow(/CHECK/i);
-    await expect(insertPerson({ level: 'inner-circle', level_source: 'learned' })).rejects.toThrow(/CHECK/i);
-    await insertPerson({ level: 'active', level_source: 'learned' });
+    // Any level may be learned: which fits someone is main's judgment, and the source says who set it.
+    await insertPerson({ level: 'close', level_source: 'learned' });
     await insertPerson({ id: 'p-000000000002', level: 'inner-circle', level_source: 'principal' });
-    await expect(
-      db.run("UPDATE gws_ea_people SET level = 'close' WHERE id = 'p-000000000001'"),
-      'a learned level raised past active in place',
-    ).rejects.toThrow(/CHECK/i);
 
     const insertIdentity = (handle: string, personId: string, source = 'calendar') =>
       db.run(
@@ -312,17 +307,14 @@ describe('GWS-EA people store', () => {
 
     expect(sam.level_source).toBe('learned');
     expect(sam.identities).toEqual([{ handle: 'email:sam@example.test', source: 'principal', added_at: NOW }]);
-    // Learning may revise a level that was its own judgment, up to active.
+    // Learning may revise a level that was its own judgment.
     expect(
       (await setPersonLevel({ id: sam.id, level: 'active', source: 'learned', basis: '3 one-on-ones.' })).level,
     ).toBe('active');
-    // A learned add cannot claim the principal chose the level, and a judged level still stops at active.
+    // A learned add cannot claim the principal chose the level.
     await expect(
       addPerson(pat({ name: 'Ann', identity: undefined, source: 'learned', levelSource: 'principal', level: 'known' })),
     ).rejects.toThrow(/only the principal/i);
-    await expect(
-      addPerson(pat({ name: 'Ann', identity: undefined, levelSource: 'learned', level: 'close' })),
-    ).rejects.toThrow(/learned level stops at active/i);
   });
 
   it('stores an identity as a channel-qualified handle, qualifying a bare address and lowercasing email', async () => {
@@ -338,17 +330,11 @@ describe('GWS-EA people store', () => {
     }
   });
 
-  it('refuses a learned level over one the principal set, and a learned inner circle or close', async () => {
+  it('records whichever level main judges, learned or the principal’s, with who set it and why', async () => {
     const { id } = await addPerson(pat());
-
-    await expect(
-      setPersonLevel({ id, level: 'known', source: 'learned', basis: 'Few meetings lately.' }),
-    ).rejects.toThrow(/set by the principal/i);
-    await expect(
-      addPerson(
-        pat({ name: 'Sam Lee', identity: 'email:sam@example.test', source: 'learned', identitySource: 'calendar' }),
-      ),
-    ).rejects.toThrow(/only the principal/i);
+    expect(
+      await setPersonLevel({ id, level: 'known', source: 'learned', basis: 'Few meetings lately.' }),
+    ).toMatchObject({ level: 'known', level_source: 'learned', level_basis: 'Few meetings lately.' });
 
     const sam = await addPerson({
       name: 'Sam Lee',
@@ -358,15 +344,11 @@ describe('GWS-EA people store', () => {
       identity: 'email:sam@example.test',
       identitySource: 'calendar',
     });
-    await expect(
-      setPersonLevel({ id: sam.id, level: 'close', source: 'learned', basis: 'Weekly one-on-ones.' }),
-    ).rejects.toThrow(/only the principal/i);
-
     vi.setSystemTime(new Date(LATER));
     expect(
-      await setPersonLevel({ id: sam.id, level: 'active', source: 'learned', basis: 'Weekly one-on-ones.' }),
+      await setPersonLevel({ id: sam.id, level: 'close', source: 'learned', basis: 'Weekly one-on-ones.' }),
     ).toMatchObject({
-      level: 'active',
+      level: 'close',
       level_source: 'learned',
       level_basis: 'Weekly one-on-ones.',
       level_set_at: LATER,
@@ -374,7 +356,6 @@ describe('GWS-EA people store', () => {
     expect(
       await setPersonLevel({ id: sam.id, level: 'inner-circle', source: 'principal', basis: 'Sam is my brother.' }),
     ).toMatchObject({ level: 'inner-circle', level_source: 'principal', level_set_at: LATER });
-    expect(await getPerson(id)).toMatchObject({ level: 'close', level_source: 'principal', level_set_at: NOW });
   });
 
   it.each([

@@ -10,7 +10,6 @@ export const PERSON_LEVELS = ['inner-circle', 'close', 'active', 'known'] as con
 export type PersonLevel = (typeof PERSON_LEVELS)[number];
 
 /** The levels learning may set: a learned level stops at active (R15). */
-export const LEARNED_LEVELS: readonly PersonLevel[] = ['active', 'known'];
 
 /** Who makes a change: the principal, or the assistant on what it learned. */
 export const CHANGE_SOURCES = ['principal', 'learned'] as const;
@@ -115,13 +114,6 @@ const HANDLE_MAX_LENGTH = 256;
 const CHANNEL_PATTERN = /^[a-z][a-z0-9-]{0,31}$/u;
 const HOOK_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/u;
 
-const LEVEL_LABELS: Readonly<Record<PersonLevel, string>> = {
-  'inner-circle': 'the inner circle',
-  close: 'close',
-  active: 'active',
-  known: 'known',
-};
-
 // ---------------------------------------------------------------------------
 // Forget hooks: other modules purge their own data for a forgotten person.
 // ---------------------------------------------------------------------------
@@ -221,20 +213,6 @@ function identitySourceFor(author: ChangeSource, value: string | undefined): Ide
 
 function assertPrincipal(author: ChangeSource, refusal: string): void {
   if (author !== 'principal') throw new Error(refusal);
-}
-
-/** A learned level stops at active, and never replaces one the principal set (R15). */
-function assertLevelWritable(
-  existing: { readonly name: string; readonly level_source: ChangeSource } | undefined,
-  author: ChangeSource,
-  level: PersonLevel,
-): void {
-  if (author === 'learned' && !LEARNED_LEVELS.includes(level)) {
-    throw new Error(`Only the principal places someone in ${LEVEL_LABELS[level]}; a learned level stops at active`);
-  }
-  if (author === 'learned' && existing?.level_source === 'principal') {
-    throw new Error(`${existing.name}'s level was set by the principal, so a learned level cannot replace it`);
-  }
 }
 
 function newPersonId(): string {
@@ -424,11 +402,8 @@ async function requirePerson(id: string): Promise<Person> {
   return person;
 }
 
-async function requirePersonRow(id: string): Promise<{ readonly name: string; readonly level_source: ChangeSource }> {
-  const row = await getDb().get<{ readonly name: string; readonly level_source: ChangeSource }>(
-    'SELECT name, level_source FROM gws_ea_people WHERE id = ?',
-    id,
-  );
+async function requirePersonRow(id: string): Promise<{ readonly name: string }> {
+  const row = await getDb().get<{ readonly name: string }>('SELECT name FROM gws_ea_people WHERE id = ?', id);
   if (!row) throw noPerson(id);
   return row;
 }
@@ -558,7 +533,6 @@ export async function addPerson(input: AddPersonInput): Promise<Person> {
   }
   const identity =
     input.identity === undefined ? undefined : identityToAdmit(author, input.identity, input.identitySource);
-  assertLevelWritable(undefined, levelSource, level);
 
   const key = await loadFingerprintKey();
   const id = newPersonId();
@@ -625,7 +599,7 @@ export async function updatePerson(input: UpdatePersonInput): Promise<Person> {
   return requirePerson(id);
 }
 
-/** Set a person's one level. A learned level stops at active and never replaces the principal's. */
+/** Set a person's one level, with who set it and why; which level fits is main's judgment. */
 export async function setPersonLevel(input: SetPersonLevelInput): Promise<Person> {
   const author = parseChangeSource(input.source);
   const level = parseLevel(input.level);
@@ -635,7 +609,7 @@ export async function setPersonLevel(input: SetPersonLevelInput): Promise<Person
   const now = new Date().toISOString();
   const db = getDb();
   await db.transaction(async () => {
-    assertLevelWritable(await requirePersonRow(id), author, level);
+    await requirePersonRow(id);
     await db.run(
       `UPDATE gws_ea_people
           SET level = ?, level_source = ?, level_basis = ?, level_set_at = ?, updated_at = ?

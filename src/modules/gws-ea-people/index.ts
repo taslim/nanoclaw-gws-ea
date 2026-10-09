@@ -96,7 +96,8 @@ const LEVEL_ARG: ColumnDef = {
   name: 'level',
   type: 'string',
   enum: [...PERSON_LEVELS],
-  description: 'inner-circle and close come only from the principal; a learned level is active or known.',
+  description:
+    'inner-circle and close are usually the principal’s word; a level you judged yourself is --source learned.',
 };
 const BASIS_ARG: ColumnDef = {
   name: 'basis',
@@ -246,8 +247,8 @@ registerResource({
     'set-level': {
       access: 'open',
       description:
-        "Set a person's one level.\n\n" +
-        'A level the principal set changes only on the principal’s word. A learned level is active or known, and never replaces one the principal set.',
+        "Set a person's one level, with who set it and why.\n\n" +
+        'Before a level you judged replaces one the principal set, tell them.',
       args: [ID_ARG, { ...LEVEL_ARG, required: true }, SOURCE_ARG, BASIS_ARG],
       examples: ['ncl people set-level p-1a2b3c4d5e6f --level close --source principal --basis "Said Pat is close"'],
       handler: async (args, ctx) =>

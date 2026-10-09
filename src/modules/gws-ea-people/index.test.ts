@@ -136,7 +136,7 @@ describe('GWS-EA people ncl resource', () => {
     });
   });
 
-  it('refuses a learned level over the principal’s, a learned forget, and what the record no longer holds', async () => {
+  it('refuses a learned forget and what the record no longer holds', async () => {
     const pat = await addPerson({
       name: 'Pat Doe',
       level: 'close',
@@ -146,13 +146,7 @@ describe('GWS-EA people ncl resource', () => {
     });
 
     for (const [command, args, message] of [
-      [
-        'people-set-level',
-        { id: pat.id, level: 'known', source: 'learned', basis: 'Quiet month.' },
-        /set by the principal/i,
-      ],
       ['people-forget', { id: pat.id, source: 'learned' }, /only the principal/i],
-      ['people-add', { name: 'Sam', level: 'close', source: 'learned', basis: 'Weekly.' }, /only the principal/i],
       ['people-add', { name: 'Sam', level: 'friend', source: 'principal', basis: 'b' }, /--level must be one of/],
       ['people-add', { name: 'Sam', level: 'known', basis: 'b' }, /--source is required/],
       ['people-update', { id: pat.id, source: 'principal', notes: 'Prefers mornings.' }, /unknown flag --notes/],
