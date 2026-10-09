@@ -106,7 +106,6 @@ function setupAnswers() {
       platform: process.platform === 'darwin' ? 'macos' : 'linux',
       running_as_root: false,
       docker_endpoint: 'unix:///var/run/docker.sock',
-      provider_capability_digest: 'd'.repeat(64),
       provider: {
         id: 'claude',
         name: 'Anthropic',

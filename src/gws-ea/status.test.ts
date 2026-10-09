@@ -210,7 +210,6 @@ async function assistant(
       instance_id: instanceId,
       deployed_commit: from.commit,
       provider: 'claude',
-      providerCapabilityDigest: 'c'.repeat(64),
       providerCredential: CREDENTIAL,
       packageManager: 'pnpm@10.34.5',
       onecli: { ...PINS, sdk: '0.4.0' },

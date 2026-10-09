@@ -31,8 +31,6 @@ const CREDENTIAL: ProviderCredentialMetadata = {
   hostPattern: 'api.anthropic.com',
   headerName: 'x-api-key',
 };
-const DEPLOYED_DIGEST = 'c'.repeat(64);
-const TOOL_DIGEST = 'd'.repeat(64);
 const ONECLI_CLI_PATH = '/usr/local/bin/onecli';
 
 function git(cwd: string, ...args: string[]): string {
@@ -158,7 +156,6 @@ async function deployedAssistant(
       instance_id: instanceId,
       deployed_commit: release.deployed_commit,
       provider: 'claude',
-      providerCapabilityDigest: DEPLOYED_DIGEST,
       providerCredential: record.providerCredential ?? CREDENTIAL,
       packageManager: 'pnpm@10.34.5',
       onecli: cohort,
@@ -177,7 +174,6 @@ async function deployedAssistant(
 
 function toolProviderSetup(credential: ProviderCredentialMetadata = CREDENTIAL): ToolProviderSetup {
   return {
-    capabilityDigest: TOOL_DIGEST,
     credentialMetadata: (provider) => (provider === 'claude' ? credential : undefined),
   };
 }
@@ -298,13 +294,7 @@ describe('the release an update deploys', () => {
       ),
     ).resolves.toEqual({
       release: { source_remote: dogfood.remote, release_track: 'dogfood', deployed_commit: next },
-      // The tool's setup digest differs from the one create recorded; it is carried forward, never compared.
-      preflight: {
-        provider: 'claude',
-        providerCapabilityDigest: TOOL_DIGEST,
-        providerCredential: CREDENTIAL,
-        onecliCliPath: ONECLI_CLI_PATH,
-      },
+      preflight: { provider: 'claude', providerCredential: CREDENTIAL },
     });
   });
 

@@ -109,7 +109,6 @@ import {
   type ProviderCredential,
   type ProviderCredentialMetadata,
 } from '../provider-credential.js';
-import { assertProviderProvisioningCapabilityDigest } from '../provider-provisioning-capability.js';
 import { googleChatConfigurationUrl } from './chat-configuration.js';
 import { googleSignInPause, type Interaction } from './events.js';
 import { googleConnectionResources, type GoogleConnectionInput } from './google-connection.js';
@@ -246,7 +245,6 @@ interface ReleasePreflightExpectation {
   /** The commits the receipt may name: the reservation's, and mid-update the one an operation placed live. */
   readonly deployedCommits: readonly string[];
   readonly provider: string;
-  readonly providerCapabilityDigest?: string;
   readonly providerCredential?: ProviderCredentialMetadata;
 }
 
@@ -275,18 +273,11 @@ function validateReleasePreflightReceipt(
 ): ReleasePreflightReceipt {
   const receipt = requireRecord(value, 'Release preflight receipt', INVALID_RECEIPT);
   const onecli = requireRecord(receipt.onecli, 'Release preflight OneCLI cohort', INVALID_RECEIPT);
-  let providerCapabilityDigest: string;
-  try {
-    providerCapabilityDigest = assertProviderProvisioningCapabilityDigest(receipt.providerCapabilityDigest);
-  } catch {
-    throw new GwsEaError(INVALID_RECEIPT, 'Release provider capability digest is invalid');
-  }
   const validated: ReleasePreflightReceipt = {
     schema_version: 1,
     instance_id: requireString(receipt.instance_id, 'Release preflight instance_id', INVALID_RECEIPT),
     deployed_commit: requireString(receipt.deployed_commit, 'Release preflight deployed_commit', INVALID_RECEIPT),
     provider: requireString(receipt.provider, 'Release preflight provider', INVALID_RECEIPT),
-    providerCapabilityDigest,
     providerCredential: credentialMetadataRecord(receipt.providerCredential),
     packageManager: requireString(receipt.packageManager, 'Release preflight packageManager', INVALID_RECEIPT),
     onecli: {
@@ -300,8 +291,6 @@ function validateReleasePreflightReceipt(
     validated.instance_id !== expectation.instanceId ||
     !expectation.deployedCommits.includes(validated.deployed_commit) ||
     validated.provider !== expectation.provider ||
-    (expectation.providerCapabilityDigest !== undefined &&
-      providerCapabilityDigest !== expectation.providerCapabilityDigest) ||
     (expectation.providerCredential !== undefined &&
       !sameCredentialMetadata(validated.providerCredential, expectation.providerCredential))
   ) {
@@ -326,7 +315,6 @@ function instanceReleaseReceipt(context: ProductionProvisionContext): Promise<Re
     instanceId: context.operation.instanceId,
     deployedCommits: [context.input.release.commit],
     provider: context.input.releasePreflight.provider,
-    providerCapabilityDigest: context.input.releasePreflight.providerCapabilityDigest,
     providerCredential: context.input.releasePreflight.providerCredential,
   });
 }
@@ -1226,7 +1214,6 @@ export interface ProductionBootstrapManifest {
   readonly running_as_root: boolean;
   /** The local Docker endpoint prerequisites resolved at create. */
   readonly docker_endpoint: string;
-  readonly provider_capability_digest: string;
   readonly provider: {
     readonly id: string;
     readonly name: string;
@@ -1284,12 +1271,6 @@ export function validateProductionBootstrapManifest(value: unknown): ProductionB
     return candidate === null || candidate === undefined ? null : bootstrapString(candidate, `provider ${key}`, 512);
   };
   const selected = manifest.selected_messaging_group_id;
-  let providerCapabilityDigest: string;
-  try {
-    providerCapabilityDigest = assertProviderProvisioningCapabilityDigest(manifest.provider_capability_digest);
-  } catch {
-    throw new GwsEaError(INVALID_BOOTSTRAP, 'provider_capability_digest is invalid');
-  }
   return {
     schema_version: BOOTSTRAP_SCHEMA_VERSION,
     onecli_cli_path: requirePath(manifest.onecli_cli_path, 'onecli_cli_path', INVALID_BOOTSTRAP),
@@ -1298,7 +1279,6 @@ export function validateProductionBootstrapManifest(value: unknown): ProductionB
     platform: manifest.platform,
     running_as_root: manifest.running_as_root,
     docker_endpoint: requireDockerEndpoint(manifest.docker_endpoint, 'docker_endpoint', INVALID_BOOTSTRAP),
-    provider_capability_digest: providerCapabilityDigest,
     provider: {
       id: bootstrapString(provider.id, 'provider id', 64),
       name: bootstrapString(provider.name, 'provider name', 256),
@@ -1424,7 +1404,6 @@ function hydrateMainState(profile: PersistedProfileIdentity | undefined): Produc
  */
 interface ProvisionSource {
   readonly providerCredentialMetadata: ProviderCredentialMetadata;
-  readonly providerCapabilityDigest: string;
   readonly identity: MainIdentityInput;
   /** The messaging group create's bootstrap input selected, if any. */
   readonly bootstrapMessagingGroupId: string | null;
@@ -1442,7 +1421,6 @@ async function resolveProvisionSource(
     const profile = readPersistedProfile(runtime);
     return {
       providerCredentialMetadata: bootstrapProviderCredential(manifest),
-      providerCapabilityDigest: manifest.provider_capability_digest,
       profile,
       identity: {
         assistantDisplayName: manifest.identity.assistant_display_name,
@@ -1468,7 +1446,6 @@ async function resolveProvisionSource(
   }
   return {
     providerCredentialMetadata: preflight.providerCredential,
-    providerCapabilityDigest: preflight.providerCapabilityDigest,
     profile,
     // No principal addresses: once main is published, the profile holds them and the principal and operator change them.
     identity: {
@@ -1624,7 +1601,6 @@ export async function runProductionProvision(
       releasePreflight: {
         checkoutRoot: reservation.checkout_realpath,
         provider: runtime.selected_provider,
-        providerCapabilityDigest: source.providerCapabilityDigest,
         providerCredential: source.providerCredentialMetadata,
         onecliCliPath: runtime.onecli_cli_path,
       },

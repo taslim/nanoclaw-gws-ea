@@ -28,7 +28,6 @@ import type { CreateTargetRequest } from './release-target.js';
 import { GwsEaError, releaseOf, type InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
-const providerCapabilityDigest = 'd'.repeat(64);
 
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
@@ -129,7 +128,6 @@ function createSetupInput() {
       platform: process.platform === 'darwin' ? 'macos' : 'linux',
       running_as_root: false,
       docker_endpoint: 'unix:///var/run/docker.sock',
-      provider_capability_digest: providerCapabilityDigest,
       provider: {
         id: 'claude',
         name: 'Claude provider',

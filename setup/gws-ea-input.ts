@@ -16,7 +16,6 @@ import { registerSecret } from '../src/gws-ea/redact.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
 import { EMAIL_PATTERN } from '../src/gws-ea/validation.js';
 import type { ProviderCredential } from '../src/provider-credential.js';
-import { providerProvisioningCapabilityDigest } from '../src/provider-provisioning-capability.js';
 import { isValidTimezone, resolveTimezone } from '../src/timezone.js';
 import { brightSelect } from './lib/bright-select.js';
 import { listSetupProviders, type SetupProviderEntry, type SetupProviderProvisioning } from './providers/registry.js';
@@ -47,7 +46,6 @@ export interface GwsEaCreateInputDependencies {
   readonly interactive?: boolean;
   readonly providers?: readonly SetupProviderEntry[];
   readonly detectedTimezone?: string;
-  readonly providerCapabilityDigest?: string;
   readonly prompts?: PromptAdapter;
 }
 
@@ -443,8 +441,6 @@ export async function collectGwsEaCreateInput(
   const host = context.prerequisites;
   const detectedTimezone = dependencies.detectedTimezone ?? systemTimezone();
   const providers = dependencies.providers ?? listSetupProviders();
-  const providerCapabilityDigest =
-    dependencies.providerCapabilityDigest ?? (await providerProvisioningCapabilityDigest(process.cwd()));
 
   const source: InputSource = { context, prompts, interactive: dependencies.interactive ?? true };
 
@@ -482,7 +478,6 @@ export async function collectGwsEaCreateInput(
       platform: host.platform,
       running_as_root: host.runningAsRoot,
       docker_endpoint: host.dockerEndpoint,
-      provider_capability_digest: providerCapabilityDigest,
       provider: {
         id: provider.value,
         name: metadata.name,

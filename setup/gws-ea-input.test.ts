@@ -21,7 +21,6 @@ const prerequisites: Prerequisites = {
   rootlessDocker: false,
   account: 'operator@example.test',
 };
-const providerCapabilityDigest = 'a'.repeat(64);
 const NO_SECRETS: SecretSource = { get: () => undefined };
 
 function provider(value: string, label: string): SetupProviderEntry {
@@ -79,7 +78,6 @@ describe('GWS-EA interactive create input', () => {
       {
         providers: [claude],
         detectedTimezone: 'America/Los_Angeles',
-        providerCapabilityDigest,
         prompts: {
           note: vi.fn(),
           text,
@@ -111,7 +109,6 @@ describe('GWS-EA interactive create input', () => {
         platform: 'macos',
         running_as_root: false,
         docker_endpoint: 'unix:///Users/principal/.docker/run/docker.sock',
-        provider_capability_digest: providerCapabilityDigest,
         provider: {
           id: 'claude',
           name: 'Claude credential',
@@ -162,7 +159,6 @@ describe('GWS-EA interactive create input', () => {
       {
         providers: [claude, codex],
         detectedTimezone: 'UTC',
-        providerCapabilityDigest,
         prompts: {
           note: vi.fn(),
           text,
@@ -217,7 +213,6 @@ describe('GWS-EA interactive create input', () => {
       {
         providers: [provider('claude', 'Claude')],
         detectedTimezone: 'UTC',
-        providerCapabilityDigest,
         prompts,
       },
     );
@@ -276,7 +271,6 @@ describe('GWS-EA interactive create input', () => {
       {
         providers: [provider('claude', 'Claude')],
         detectedTimezone: 'UTC',
-        providerCapabilityDigest,
         prompts: {
           note,
           text,
@@ -367,7 +361,6 @@ describe('GWS-EA interactive create input', () => {
       {
         providers: [provider('claude', 'Claude')],
         detectedTimezone: 'UTC',
-        providerCapabilityDigest,
         prompts: {
           note: vi.fn(),
           text,
@@ -421,7 +414,6 @@ describe('GWS-EA interactive create input', () => {
         {
           providers: [provider('claude', 'Claude')],
           detectedTimezone: 'UTC',
-          providerCapabilityDigest,
           prompts: {
             note: vi.fn(),
             text: vi.fn(async () => answers.shift()),
@@ -503,7 +495,6 @@ describe('GWS-EA unattended create input', () => {
         interactive: false,
         providers: [provider('claude', 'Claude')],
         detectedTimezone: 'UTC',
-        providerCapabilityDigest,
         prompts: unattendedPrompts,
       },
     );
@@ -682,7 +673,6 @@ describe('GWS-EA unattended create input', () => {
       interactive: false,
       providers,
       detectedTimezone: 'UTC',
-      providerCapabilityDigest,
       prompts: unattendedPrompts,
     };
     const base = {
@@ -728,7 +718,6 @@ describe('GWS-EA unattended create input', () => {
             collectGwsEaCreateInput(context, {
               interactive: false,
               providers: [provider('claude', 'Claude')],
-              providerCapabilityDigest,
             }),
           checkPrerequisites: async () => ({ ...prerequisites, nodePath: process.execPath }),
           resolveReleaseTarget: async ({ track, source }) => ({

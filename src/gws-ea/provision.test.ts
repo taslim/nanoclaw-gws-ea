@@ -65,7 +65,6 @@ import type { CloudflareZoneChoice } from './create-input.js';
 import type { ConversationNotReadyReason } from './verify.js';
 
 const roots: string[] = [];
-const providerCapabilityDigest = 'c'.repeat(64);
 
 async function testPaths(): Promise<ControlPlanePaths> {
   const root = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-provision-'));
@@ -157,7 +156,6 @@ function bootstrapManifest(paths: ControlPlanePaths): ProductionBootstrapManifes
     platform: process.platform === 'darwin' ? 'macos' : 'linux',
     running_as_root: false,
     docker_endpoint: 'unix:///var/run/docker.sock',
-    provider_capability_digest: providerCapabilityDigest,
     provider: {
       id: 'claude',
       name: 'Claude provider',
@@ -672,7 +670,12 @@ describe('production bootstrap trust boundary', () => {
     const file = path.join(path.dirname(paths.configRoot), 'setup.json');
     await writeFile(
       file,
-      JSON.stringify({ ...bootstrapManifest(paths), provisioning_started_at: '1970-01-01T00:00:00.000Z' }),
+      JSON.stringify({
+        ...bootstrapManifest(paths),
+        provisioning_started_at: '1970-01-01T00:00:00.000Z',
+        // A manifest written by a create from before the provider capability digest was retired.
+        provider_capability_digest: 'c'.repeat(64),
+      }),
       { mode: 0o600 },
     );
 
@@ -729,7 +732,10 @@ describe('production bootstrap trust boundary', () => {
   });
 
   /** A reserved instance whose host started once: runtime and receipt persisted, bootstrap manifest gone. */
-  async function startedInstance(receiptCohort: { gateway: string; cli: string; sdk: string }) {
+  async function startedInstance(
+    receiptCohort: { gateway: string; cli: string; sdk: string },
+    olderReceiptFields: Record<string, unknown> = {},
+  ) {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
     const onecli = createOnecliRuntimeLayout({
@@ -755,7 +761,6 @@ describe('production bootstrap trust boundary', () => {
         instance_id: reserved.instance_id,
         deployed_commit: reserved.deployed_commit,
         provider: 'claude',
-        providerCapabilityDigest,
         providerCredential: {
           name: 'Claude provider',
           type: 'api_key',
@@ -765,6 +770,7 @@ describe('production bootstrap trust boundary', () => {
         packageManager: 'pnpm@10.0.0',
         onecli: receiptCohort,
         recorded_by: 'a launcher with other fields',
+        ...olderReceiptFields,
       })}\n`,
       { mode: 0o600 },
     );
@@ -780,6 +786,24 @@ describe('production bootstrap trust boundary', () => {
       sdk: ONECLI_SDK_VERSION,
     });
 
+    await expect(
+      withInstanceOperation(paths, reserved.instance_id, (operation) =>
+        runProductionProvision(operation, {
+          upsertEnvVars: recordEnv,
+          hostStatus: servingHost(reserved),
+          serviceHelpers: UNUSED_SERVICE_HELPERS,
+        }),
+      ),
+    ).rejects.toMatchObject({ code: 'bootstrap_required' });
+  });
+
+  it('still parses an old receipt carrying the provider capability digest', async () => {
+    const { paths, reserved } = await startedInstance(
+      { gateway: ONECLI_GATEWAY_VERSION, cli: ONECLI_CLI_VERSION, sdk: ONECLI_SDK_VERSION },
+      { providerCapabilityDigest: 'c'.repeat(64) },
+    );
+
+    // bootstrap_required is raised only after the receipt was accepted.
     await expect(
       withInstanceOperation(paths, reserved.instance_id, (operation) =>
         runProductionProvision(operation, {
@@ -835,14 +859,12 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
       releasePreflight: {
         checkoutRoot: reserved.checkout_realpath,
         provider: 'claude',
-        providerCapabilityDigest,
         providerCredential: {
           name: 'Claude provider',
           type: 'api_key',
           hostPattern: 'api.anthropic.com',
           headerName: 'x-api-key',
         },
-        onecliCliPath: '/usr/local/bin/onecli',
       },
       onecli,
       runtime,
@@ -927,7 +949,6 @@ async function writeReleaseReceipt(
       instance_id: reserved.instance_id,
       deployed_commit: reserved.deployed_commit,
       provider: 'claude',
-      providerCapabilityDigest,
       providerCredential: {
         name: 'Claude provider',
         type: 'api_key',
@@ -2075,7 +2096,6 @@ async function productionHarness(): Promise<ProductionHarness> {
           },
           runReleasePreflight: async () => ({
             provider: 'claude',
-            providerCapabilityDigest,
             providerCredential: {
               name: 'Claude provider',
               type: 'api_key',

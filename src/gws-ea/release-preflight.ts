@@ -1,18 +1,13 @@
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 
-import { parse as parseYaml } from 'yaml';
-
 import { prepareReleaseCommandEnvironments, type ReleaseCommandEnvironments } from './checkout.js';
 import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { GwsEaError } from './types.js';
 import { isRecord, parseJson, requireRecord } from './validation.js';
 import { sameCredentialMetadata, type ProviderCredentialMetadata } from '../provider-credential.js';
-import { providerProvisioningCapabilityDigest } from '../provider-provisioning-capability.js';
-import { exactVersion, LAUNCHER_PINS, ONECLI_SDK_VERSION, parsePins, PIN_NAMES, type GwsEaPins } from './pins.js';
-import { assertInstalledOnecliSdkVersion } from './onecli.js';
+import { exactVersion, parsePins, PIN_NAMES } from './pins.js';
 
-const PROVIDER_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const INCOMPLETE = 'incomplete_release';
 /** gws-ea's pins inside a release checkout. */
 const RELEASE_PINS_FILE = 'src/gws-ea/versions.json';
@@ -27,9 +22,7 @@ export interface SetupCommand {
 export interface ReleasePreflightInput {
   checkoutRoot: string;
   provider: string;
-  providerCapabilityDigest: string;
   providerCredential: ProviderCredentialMetadata;
-  onecliCliPath: string;
 }
 
 export interface ReleasePreflightRuntime {
@@ -39,12 +32,10 @@ export interface ReleasePreflightRuntime {
 
 export interface ReleasePreflightResult {
   provider: string;
-  providerCapabilityDigest: string;
   providerCredential: ProviderCredentialMetadata;
   packageManager: string;
   onecli: {
     gateway: string;
-    cli: string;
     sdk: string;
   };
 }
@@ -108,42 +99,6 @@ async function assertDetachedCommit(
   }
 }
 
-async function assertCommittedRegularFiles(
-  checkoutRoot: string,
-  relativePaths: readonly string[],
-  run: SanitizedCommandRunner,
-  environments: ReleaseCommandEnvironments,
-): Promise<void> {
-  const [trackedResult, fileInfo] = await Promise.all([
-    run({
-      command: 'git',
-      args: ['ls-files', '-z', '--', ...relativePaths],
-      cwd: checkoutRoot,
-      env: environments.git,
-    }),
-    Promise.all(
-      relativePaths.map(async (relativePath) => {
-        try {
-          return await lstat(path.join(checkoutRoot, relativePath));
-          /* eslint-disable-next-line no-catch-all/no-catch-all -- Every lstat failure means the required release file is unusable. */
-        } catch {
-          return undefined;
-        }
-      }),
-    ),
-  ]);
-  const tracked = new Set(trackedResult.stdout.split('\0').filter(Boolean));
-  for (const [index, relativePath] of relativePaths.entries()) {
-    const info = fileInfo[index];
-    if (!info || !tracked.has(relativePath)) {
-      throw new GwsEaError('incomplete_release', `Required committed release file is missing: ${relativePath}`);
-    }
-    if (info.isSymbolicLink() || !info.isFile()) {
-      throw new GwsEaError('incomplete_release', `Required release file must be a regular file: ${relativePath}`);
-    }
-  }
-}
-
 async function assertRuntimeArtifacts(checkoutRoot: string): Promise<void> {
   for (const relativePath of ['dist/gws-ea/process.js', 'dist/index.js']) {
     let info;
@@ -162,297 +117,29 @@ async function assertRuntimeArtifacts(checkoutRoot: string): Promise<void> {
   }
 }
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-interface BarrelImportExpectation {
-  readonly barrel: string;
-  readonly moduleName: string;
-  readonly code: string;
-}
-
-async function assertBarrelImports(
+/**
+ * The cohort a release records in its receipt: its package manager, and the
+ * OneCLI gateway and SDK it pins. A release is the tool's own clean commit, so
+ * these are the launcher's own pins by construction, and a frozen install
+ * refuses a lockfile that disagrees with package.json.
+ */
+async function readReleaseCohort(
   checkoutRoot: string,
-  expectations: readonly BarrelImportExpectation[],
-): Promise<void> {
-  const sources = await Promise.all(
-    expectations.map(({ barrel }) => readFile(path.join(checkoutRoot, barrel), 'utf8')),
-  );
-  for (const [index, expectation] of expectations.entries()) {
-    const importPattern = new RegExp(
-      `^\\s*import\\s+['"]\\./${escapeRegExp(expectation.moduleName)}\\.js['"]\\s*;?\\s*$`,
-      'm',
-    );
-    if (!importPattern.test(sources[index]!)) {
-      throw new GwsEaError(expectation.code, `${expectation.moduleName} is not composed in ${expectation.barrel}`);
-    }
-  }
-}
-
-function dependencyMap(manifest: JsonRecord, section: string): Record<string, string> {
-  const value = manifest[section];
-  if (value === undefined) return {};
-  const record = requireRecord(value, `package.json ${section}`, INCOMPLETE);
-  const result: Record<string, string> = {};
-  for (const [name, specifier] of Object.entries(record)) {
-    if (typeof specifier !== 'string') {
-      throw new GwsEaError('inconsistent_lockfile', `package.json ${section}.${name} is invalid`);
-    }
-    result[name] = specifier;
-  }
-  return result;
-}
-
-function lockSpecifier(section: unknown, dependency: string): string | undefined {
-  if (!isRecord(section)) return undefined;
-  const entry = section[dependency];
-  if (typeof entry === 'string') return entry;
-  if (!isRecord(entry)) return undefined;
-  return typeof entry.specifier === 'string' ? entry.specifier : undefined;
-}
-
-async function validatePackageAndPins(
-  checkoutRoot: string,
-): Promise<{ packageManager: string; pins: GwsEaPins; sdk: string }> {
+): Promise<Pick<ReleasePreflightResult, 'packageManager' | 'onecli'>> {
   const manifest = await readJson(path.join(checkoutRoot, 'package.json'), 'package.json');
   const packageManager = typeof manifest.packageManager === 'string' ? manifest.packageManager : '';
-  const packageManagerMatch = /^pnpm@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/.exec(packageManager);
-  if (!packageManagerMatch) {
+  if (!/^pnpm@\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(packageManager)) {
     throw new GwsEaError('invalid_package_manager', 'package.json must declare one exact pnpm version');
   }
-  const scripts = requireRecord(manifest.scripts, 'package.json scripts', INCOMPLETE);
-  if (typeof scripts.build !== 'string' || scripts.build.length === 0) {
-    throw new GwsEaError('incomplete_release', 'package.json must declare a build script');
-  }
-  const sdk = exactVersion(dependencyMap(manifest, 'dependencies')['@onecli-sh/sdk'], 'OneCLI SDK');
-
-  let lockfile: JsonRecord;
-  try {
-    lockfile = requireRecord(
-      parseYaml(await readFile(path.join(checkoutRoot, 'pnpm-lock.yaml'), 'utf8')),
-      'pnpm lockfile',
-      INCOMPLETE,
-    );
-  } catch (error) {
-    if (error instanceof GwsEaError) throw error;
-    throw new GwsEaError('inconsistent_lockfile', 'pnpm lockfile is missing or invalid');
-  }
-  const importers = requireRecord(lockfile.importers, 'pnpm lockfile importers', 'inconsistent_lockfile');
-  const rootImporter = requireRecord(importers['.'], 'pnpm root importer', 'inconsistent_lockfile');
-  for (const section of ['dependencies', 'devDependencies', 'optionalDependencies'] as const) {
-    for (const [dependency, specifier] of Object.entries(dependencyMap(manifest, section))) {
-      if (lockSpecifier(rootImporter[section], dependency) !== specifier) {
-        throw new GwsEaError(
-          'inconsistent_lockfile',
-          `pnpm lockfile does not match package.json for ${section}.${dependency}`,
-        );
-      }
-    }
-  }
-
+  const dependencies = isRecord(manifest.dependencies) ? manifest.dependencies : {};
   const pins = parsePins(
     await readJson(path.join(checkoutRoot, RELEASE_PINS_FILE), RELEASE_PINS_FILE),
     RELEASE_PINS_FILE,
   );
-  if (lockSpecifier(rootImporter.dependencies, '@onecli-sh/sdk') !== sdk) {
-    throw new GwsEaError('inconsistent_lockfile', 'pnpm lockfile does not match the pinned OneCLI SDK');
-  }
-  return { packageManager, pins, sdk };
-}
-
-async function validateComposition(
-  checkoutRoot: string,
-  provider: string,
-  run: SanitizedCommandRunner,
-  environments: ReleaseCommandEnvironments,
-): Promise<void> {
-  if (!PROVIDER_PATTERN.test(provider)) {
-    throw new GwsEaError('provider_not_composed', 'Selected provider name is invalid');
-  }
-  const commonFiles = [
-    'package.json',
-    'pnpm-lock.yaml',
-    RELEASE_PINS_FILE,
-    'bin/gws-ea',
-    'bin/ncl',
-    'setup/gws-ea.ts',
-    'setup/gws-ea-input.ts',
-    'src/provider-credential.ts',
-    'templates/gws-ea/main/plugin.json',
-    'templates/gws-ea/main/skills/welcome/SKILL.md',
-    'templates/gws-ea/external-email/plugin.json',
-    'src/modules/gws-ea-external-email/index.ts',
-    'src/modules/gws-ea-external-email/group.ts',
-    'src/modules/gws-ea-external-email/destination-policy.ts',
-    'src/modules/gws-ea-external-email/guidance.md',
-    'src/modules/gws-ea-external-email/bridge.ts',
-    'src/modules/gws-ea-inbox/index.ts',
-    'src/modules/gws-ea-inbox/migration.ts',
-    'src/modules/gws-ea-inbox/thread-map.ts',
-    'src/modules/gws-ea-inbox/route-mail.ts',
-    'src/modules/gws-ea-inbox/pace.ts',
-    'src/modules/gws-ea-inbox/principal-reply.ts',
-    'src/modules/gws-ea-inbox/send.ts',
-    'src/modules/gws-ea-inbox/render.ts',
-    'src/modules/gws-ea-meetings/index.ts',
-    'src/modules/gws-ea-meetings/tools.ts',
-    'src/modules/gws-ea-meetings/thread-calendar.ts',
-    'src/modules/gws-ea-reminders/index.ts',
-    'container/agent-runner/src/action-request.ts',
-    'container/agent-runner/src/mcp-tools/gws-ea-email.ts',
-    'container/agent-runner/src/mcp-tools/gws-ea-email.instructions.md',
-    'container/agent-runner/src/mcp-tools/gws-ea-email-external.instructions.md',
-    'container/agent-runner/src/mcp-tools/reminders.ts',
-    'container/agent-runner/src/mcp-tools/reminders.instructions.md',
-    'container/agent-runner/src/mcp-tools/files-send.instructions.md',
-    'container/agent-runner/src/mcp-tools/connect.instructions.md',
-    'container/agent-runner/src/mcp-tools/memory.instructions.md',
-    'container/agent-runner/src/memory/sealed.ts',
-    'container/skills/gcalendar/SKILL.md',
-    'container/skills/gcalendar/instructions.md',
-    'container/skills/gmail/SKILL.md',
-    'container/skills/gpeople/SKILL.md',
-    'src/container-env.ts',
-    'src/channels/gchat.ts',
-    'src/channels/index.ts',
-    'src/gws-ea/process.ts',
-    'src/gws-ea/cloudflare-connector.ts',
-    'scripts/init-first-agent.ts',
-    'src/modules/gws-ea-google/index.ts',
-    'src/modules/gws-ea-main/index.ts',
-    'src/modules/gws-ea-main/guidance.md',
-    'src/modules/gws-ea-profile/index.ts',
-    'src/modules/gws-ea-profile/migration.ts',
-    'src/modules/gws-ea-preferences/index.ts',
-    'src/modules/gws-ea-preferences/migration.ts',
-    'src/modules/gws-ea-people/index.ts',
-    'src/modules/gws-ea-people/migration.ts',
-    'src/modules/gws-ea-notices/index.ts',
-    'src/modules/gws-ea-privacy/index.ts',
-    'src/modules/gws-ea-privacy/migration.ts',
-    'src/modules/capabilities/index.ts',
-    'src/modules/capabilities/migration.ts',
-    'src/modules/index.ts',
-  ];
-  const gatewayFiles = [
-    'src/gateway-providers/index.ts',
-    'src/gateway-providers/installed.ts',
-    'src/gateway-providers/onecli.ts',
-    'src/gateway-providers/onecli-files.ts',
-    'src/gateway-providers/onecli-credentials.ts',
-    'container/skills/onecli-gateway/SKILL.md',
-    'container/skills/onecli-gateway/instructions.md',
-  ];
-  const providerFiles = [
-    `src/provider-contracts/${provider}.ts`,
-    'src/provider-contracts/index.ts',
-    `setup/providers/${provider}.ts`,
-    'setup/providers/index.ts',
-    `container/agent-runner/src/providers/${provider}.ts`,
-    'container/agent-runner/src/providers/index.ts',
-    `container/agent-runner/src/provider-contracts/${provider}.ts`,
-    'container/agent-runner/src/provider-contracts/index.ts',
-    `container/agent-runner/src/providers/${provider}.conformance.test.ts`,
-  ];
-  try {
-    await assertCommittedRegularFiles(
-      checkoutRoot,
-      [...commonFiles, ...gatewayFiles, ...providerFiles],
-      run,
-      environments,
-    );
-    await assertBarrelImports(checkoutRoot, [
-      { barrel: 'src/channels/index.ts', moduleName: 'gchat', code: 'incomplete_release' },
-      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-google/index', code: 'incomplete_release' },
-      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-main/index', code: 'incomplete_release' },
-      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-profile/index', code: 'incomplete_release' },
-      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-preferences/index', code: 'incomplete_release' },
-      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-people/index', code: 'incomplete_release' },
-      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-notices/index', code: 'incomplete_release' },
-      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-privacy/index', code: 'incomplete_release' },
-      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-external-email/index', code: 'incomplete_release' },
-      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-inbox/index', code: 'incomplete_release' },
-      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-meetings/index', code: 'incomplete_release' },
-      { barrel: 'src/modules/index.ts', moduleName: 'gws-ea-reminders/index', code: 'incomplete_release' },
-      { barrel: 'src/modules/index.ts', moduleName: 'capabilities/index', code: 'incomplete_release' },
-      { barrel: 'src/gateway-providers/index.ts', moduleName: 'installed', code: 'gateway_not_composed' },
-      { barrel: 'src/gateway-providers/installed.ts', moduleName: 'onecli', code: 'gateway_not_composed' },
-      ...[
-        'src/provider-contracts/index.ts',
-        'setup/providers/index.ts',
-        'container/agent-runner/src/providers/index.ts',
-        'container/agent-runner/src/provider-contracts/index.ts',
-      ].map((barrel) => ({ barrel, moduleName: provider, code: 'provider_not_composed' })),
-    ]);
-  } catch (error) {
-    if (
-      error instanceof GwsEaError &&
-      error.code === 'incomplete_release' &&
-      gatewayFiles.some((file) => error.message.includes(file))
-    ) {
-      throw new GwsEaError('gateway_not_composed', 'The selected release is missing its OneCLI gateway');
-    }
-    if (
-      error instanceof GwsEaError &&
-      error.code === 'incomplete_release' &&
-      providerFiles.some((file) => error.message.includes(file))
-    ) {
-      throw new GwsEaError('provider_not_composed', `Selected provider is not fully composed: ${provider}`);
-    }
-    throw error;
-  }
-
-  await assertProductTemplate(checkoutRoot, 'main');
-  await assertProductTemplate(checkoutRoot, 'external-email');
-}
-
-/** A product agent's committed template must stamp exactly that agent. */
-async function assertProductTemplate(checkoutRoot: string, agentName: 'main' | 'external-email'): Promise<void> {
-  const label = `gws-ea/${agentName}`;
-  const template = await readJson(path.join(checkoutRoot, `templates/${label}/plugin.json`), `${label} template`);
-  const extensions = requireRecord(template.extensions, `${label} extensions`, INCOMPLETE);
-  const nanoclaw = requireRecord(extensions['ai.nanoco.nanoclaw'], `${label} NanoClaw extension`, INCOMPLETE);
-  if (template.name !== `gws-ea-${agentName}` || nanoclaw.agentName !== agentName) {
-    throw new GwsEaError('incomplete_release', `Committed ${label} template is not the canonical ${agentName} agent`);
-  }
-}
-
-/**
- * A release is provisioned only with the cohort this launcher runs: its pins
- * must equal the launcher's. Compared at create only; resume never re-checks.
- */
-function assertLauncherPins(release: GwsEaPins, sdk: string): void {
-  const update = 'update the GWS-EA launcher before provisioning it';
-  for (const key of ['onecliGateway', 'onecliCli'] as const) {
-    if (release[key] !== LAUNCHER_PINS[key]) {
-      throw new GwsEaError(
-        'onecli_release_mismatch',
-        `The selected release pins ${PIN_NAMES[key]} ${release[key]}, but this launcher pins ${LAUNCHER_PINS[key]}; ${update}`,
-        { details: { pin: PIN_NAMES[key], release: release[key], launcher: LAUNCHER_PINS[key] } },
-      );
-    }
-  }
-  if (sdk !== ONECLI_SDK_VERSION) {
-    throw new GwsEaError(
-      'onecli_release_mismatch',
-      `The selected release pins OneCLI SDK ${sdk}, but this launcher pins ${ONECLI_SDK_VERSION}; ${update}`,
-      { details: { pin: 'OneCLI SDK', release: sdk, launcher: ONECLI_SDK_VERSION } },
-    );
-  }
-  if (release.cloudflaredImage !== LAUNCHER_PINS.cloudflaredImage) {
-    throw new GwsEaError(
-      'cloudflared_release_mismatch',
-      `The selected release pins ${PIN_NAMES.cloudflaredImage} ${release.cloudflaredImage}, but this launcher pins ${LAUNCHER_PINS.cloudflaredImage}; ${update}`,
-      {
-        details: {
-          pin: PIN_NAMES.cloudflaredImage,
-          release: release.cloudflaredImage,
-          launcher: LAUNCHER_PINS.cloudflaredImage,
-        },
-      },
-    );
-  }
+  return {
+    packageManager,
+    onecli: { gateway: pins.onecliGateway, sdk: exactVersion(dependencies['@onecli-sh/sdk'], 'OneCLI SDK') },
+  };
 }
 
 /** The OneCLI cohort, Postgres image, and provider setup an assistant runs, as its own record says (KTD6). */
@@ -477,14 +164,12 @@ export interface ReleaseSetup {
 /**
  * An update keeps the assistant's OneCLI and Postgres versions and its
  * provider setup (R9, KTD20): it neither migrates the OneCLI vault nor runs
- * provider setup again. The provider capability digest is not compared; it
- * changes with most releases while no provider code runs during an update.
+ * provider setup again.
  */
 export function assertUpdateKeepsSetup(deployed: DeployedSetup, release: ReleaseSetup): void {
   const retry = 'so run the update from a GWS-EA release that';
   for (const [key, name] of [
     ['gateway', PIN_NAMES.onecliGateway],
-    ['cli', PIN_NAMES.onecliCli],
     ['sdk', 'OneCLI SDK'],
   ] as const) {
     if (release.onecli[key] !== deployed.onecli[key]) {
@@ -518,28 +203,6 @@ export function assertUpdateKeepsSetup(deployed: DeployedSetup, release: Release
   }
 }
 
-/** The OneCLI CLI at `executable` reports exactly `expectedVersion`. */
-export async function assertInstalledOnecliCli(
-  executable: string,
-  expectedVersion: string,
-  checkoutRoot: string,
-  environment: Readonly<Record<string, string>>,
-  run: SanitizedCommandRunner,
-): Promise<void> {
-  if (!path.isAbsolute(executable) || path.resolve(executable) !== executable) {
-    throw new GwsEaError('incompatible_onecli', 'OneCLI CLI path must be absolute and normalized');
-  }
-  const result = await run({ command: executable, args: ['version'], cwd: checkoutRoot, env: environment });
-  const parsed = parseJson(result.stdout, 'Installed OneCLI CLI version information', 'incompatible_onecli');
-  const version = isRecord(parsed) ? parsed.version : undefined;
-  if (version !== expectedVersion) {
-    throw new GwsEaError(
-      'incompatible_onecli',
-      `Installed OneCLI CLI ${typeof version === 'string' ? version : '(unknown version)'} does not match the pinned ${expectedVersion}; install OneCLI CLI ${expectedVersion}, then retry`,
-    );
-  }
-}
-
 async function defaultSetupCommand(command: SetupCommand): Promise<void> {
   await runSanitizedCommand({ ...command, timeoutMs: 20 * 60 * 1000, stream: true });
 }
@@ -557,20 +220,7 @@ export async function runReleasePreflight(
   const runCommand = runtime.runCommand ?? runSanitizedCommand;
   await assertDetachedCommit(checkoutRoot, runCommand, environments);
   await assertClean(checkoutRoot, 'initial preflight', runCommand, environments);
-  const providerCapabilityDigest = await providerProvisioningCapabilityDigest(checkoutRoot);
-  if (providerCapabilityDigest !== input.providerCapabilityDigest) {
-    throw new GwsEaError(
-      'provider_capability_mismatch',
-      'The selected release has a different provider setup capability; update the GWS-EA launcher before provisioning it',
-    );
-  }
-  await validateComposition(checkoutRoot, input.provider, runCommand, environments);
-  const { packageManager, pins, sdk } = await validatePackageAndPins(checkoutRoot);
-  assertLauncherPins(pins, sdk);
-  await Promise.all([
-    assertInstalledOnecliCli(input.onecliCliPath, pins.onecliCli, checkoutRoot, environments.common, runCommand),
-    assertInstalledOnecliSdkVersion(sdk),
-  ]);
+  const cohort = await readReleaseCohort(checkoutRoot);
   const runSetupCommand = runtime.runSetupCommand ?? defaultSetupCommand;
 
   await runSetupCommand({
@@ -584,11 +234,5 @@ export async function runReleasePreflight(
   await assertClean(checkoutRoot, 'release build', runCommand, environments);
   await assertRuntimeArtifacts(checkoutRoot);
 
-  return {
-    provider: input.provider,
-    providerCapabilityDigest,
-    providerCredential: input.providerCredential,
-    packageManager,
-    onecli: { gateway: pins.onecliGateway, cli: pins.onecliCli, sdk },
-  };
+  return { provider: input.provider, providerCredential: input.providerCredential, ...cohort };
 }

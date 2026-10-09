@@ -17,7 +17,6 @@ import {
   type ServiceControlTarget,
 } from '../src/gws-ea/service-control.js';
 import { createInstanceServiceCoordinates, type InstanceServicePlatform } from '../src/gws-ea/service-coordinates.js';
-import { providerProvisioningCapabilityDigest } from '../src/provider-provisioning-capability.js';
 
 const fixture = vi.hoisted(() => {
   const spinner = {
@@ -271,7 +270,6 @@ describe('GWS-EA driver', () => {
 
     const setup = await runtime.toolProviderSetup!();
 
-    expect(setup.capabilityDigest).toBe(await providerProvisioningCapabilityDigest(process.cwd()));
     expect(setup.credentialMetadata('claude')).toEqual({
       name: 'Anthropic',
       type: 'anthropic',

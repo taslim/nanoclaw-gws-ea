@@ -96,7 +96,6 @@ export const SESSION_SCHEMA_SOURCES = [
   'container/agent-runner/src/mailbox/sqlite/connection.ts',
 ] as const;
 export const PROVIDER_SETUP: ToolProviderSetup = {
-  capabilityDigest: 'd'.repeat(64),
   credentialMetadata: (provider) => (provider === 'claude' ? CREDENTIAL : undefined),
 };
 export const SESSION = path.join('data', 'v2-sessions', 'ag-main', 'session-1');
@@ -334,7 +333,6 @@ export async function assistant(
       instance_id: instanceId,
       deployed_commit: host.first,
       provider: 'claude',
-      providerCapabilityDigest: 'c'.repeat(64),
       providerCredential: CREDENTIAL,
       packageManager: 'pnpm@10.34.5',
       onecli: COHORT,
@@ -837,7 +835,6 @@ export function dependencies(state: World, release: Release, runtime: InstanceRu
       state.preflights.push(input);
       return {
         provider: input.provider,
-        providerCapabilityDigest: input.providerCapabilityDigest,
         providerCredential: input.providerCredential,
         packageManager: 'pnpm@10.34.5',
         onecli: COHORT,

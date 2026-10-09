@@ -46,8 +46,6 @@ import {
   MEMORY,
   messages,
   nextRelease,
-  ONECLI_CLI,
-  PROVIDER_SETUP,
   receiptCommit,
   release,
   releaseAgentImageKey,
@@ -189,9 +187,7 @@ describe('staging an update while the assistant serves', GIT_HEAVY, () => {
       {
         checkoutRoot: checkout,
         provider: 'claude',
-        providerCapabilityDigest: PROVIDER_SETUP.capabilityDigest,
         providerCredential: CREDENTIAL,
-        onecliCliPath: ONECLI_CLI,
       },
     ]);
     expect(JSON.parse(await readFile(host.paths.releasePreflightFile(id, 'next'), 'utf8'))).toMatchObject({
