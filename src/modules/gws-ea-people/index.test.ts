@@ -124,7 +124,7 @@ describe('GWS-EA people ncl resource', () => {
       ),
     ).toMatchObject({ level: 'inner-circle', level_basis: 'Pat is family.' });
 
-    expect(await data(run('people-forget', { id: added.id, source: 'principal' }))).toEqual({
+    expect(await data(run('people-forget', { id: added.id }))).toEqual({
       forgotten: added.id,
       name: 'Patricia Doe',
       identities: ['email:pat@example.test', 'email:pat@work.example.test'],
@@ -136,7 +136,7 @@ describe('GWS-EA people ncl resource', () => {
     });
   });
 
-  it('refuses a learned forget and what the record no longer holds', async () => {
+  it('refuses what the record no longer holds', async () => {
     const pat = await addPerson({
       name: 'Pat Doe',
       level: 'close',
@@ -146,7 +146,6 @@ describe('GWS-EA people ncl resource', () => {
     });
 
     for (const [command, args, message] of [
-      ['people-forget', { id: pat.id, source: 'learned' }, /only the principal/i],
       ['people-add', { name: 'Sam', level: 'friend', source: 'principal', basis: 'b' }, /--level must be one of/],
       ['people-add', { name: 'Sam', level: 'known', basis: 'b' }, /--source is required/],
       ['people-update', { id: pat.id, source: 'principal', notes: 'Prefers mornings.' }, /unknown flag --notes/],
@@ -175,7 +174,7 @@ describe('GWS-EA people ncl resource', () => {
       ['add', { name: 'Sam', level: 'known', source: 'learned', basis: 'b' }],
       ['update', { id: pat.id, source: 'principal', name: 'x' }],
       ['set-level', { id: pat.id, level: 'known', source: 'principal', basis: 'b' }],
-      ['forget', { id: pat.id, source: 'principal' }],
+      ['forget', { id: pat.id }],
     ];
     expect(attempts.map(([verb]) => verb)).toEqual([...VERBS]);
 
@@ -212,7 +211,7 @@ describe('GWS-EA people ncl resource', () => {
       identity: 'email:pat@example.test',
     });
     const sam = await addPerson({ name: 'Sam Lee', level: 'active', source: 'principal', basis: 'Weekly.' });
-    expect(await run('people-forget', { id: pat.id, source: 'principal' })).toMatchObject({ ok: true });
+    expect(await run('people-forget', { id: pat.id })).toMatchObject({ ok: true });
     fs.rmSync(path.join(root, FINGERPRINT_KEY_FILE_NAME));
 
     for (const [verb, args] of [
@@ -221,7 +220,7 @@ describe('GWS-EA people ncl resource', () => {
       ['list', {}],
       ['add', { name: 'Quinn', level: 'known', source: 'principal', basis: 'b' }],
       ['set-level', { id: sam.id, level: 'known', source: 'principal', basis: 'b' }],
-      ['forget', { id: sam.id, source: 'principal' }],
+      ['forget', { id: sam.id }],
     ] as const) {
       expect(await run(`people-${verb}`, args), verb).toMatchObject({
         ok: false,

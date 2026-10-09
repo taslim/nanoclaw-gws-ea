@@ -96,7 +96,6 @@ export interface SetPersonLevelInput {
 
 export interface ForgetPersonInput {
   readonly id: string;
-  readonly source: string;
 }
 
 /** What a forget hook learns of the person being forgotten: enough to find its own data, nothing more. */
@@ -662,7 +661,6 @@ async function assertNoGrantedAccess(userIds: readonly string[]): Promise<void> 
 export async function forgetPerson(
   input: ForgetPersonInput,
 ): Promise<{ readonly forgotten: string; readonly name: string; readonly identities: readonly string[] }> {
-  assertPrincipal(parseChangeSource(input.source), 'Only the principal can have someone forgotten');
   const id = input.id.trim();
   await loadFingerprintKey();
   const person = await requirePerson(id);

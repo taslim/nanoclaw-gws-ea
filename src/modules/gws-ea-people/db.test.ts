@@ -552,7 +552,7 @@ describe('forgetting a person', () => {
   it('deletes the record and its identities, purges its email users and dropped messages, calls every hook, keeps only keyed fingerprints (AE9), and answers with the name and identities to clear from memory', async () => {
     const id = await seedPat();
 
-    expect(await forgetPerson({ id, source: 'principal' })).toEqual({
+    expect(await forgetPerson({ id })).toEqual({
       forgotten: id,
       name: 'Pat Doe',
       identities: ['email:pat@example.test', 'gchat:users/pat'],
@@ -599,11 +599,10 @@ describe('forgetting a person', () => {
     expect(await getPersonLevel('email:pat@example.test')).toBe('unknown');
   });
 
-  it('refuses to forget on anything but the principal’s word, or someone who is not there', async () => {
-    const { id } = await addPerson(pat());
+  it('refuses to forget someone who is not there, touching no one else', async () => {
+    await addPerson(pat());
 
-    await expect(forgetPerson({ id, source: 'learned' })).rejects.toThrow(/only the principal/i);
-    await expect(forgetPerson({ id: 'p-000000000000', source: 'principal' })).rejects.toThrow(/no person/i);
+    await expect(forgetPerson({ id: 'p-000000000000' })).rejects.toThrow(/no person/i);
     expect(await getPersonLevel('email:pat@example.test')).toBe('close');
     expect(hookCalls).toEqual([]);
   });
@@ -612,12 +611,12 @@ describe('forgetting a person', () => {
     const id = await seedPat();
     sessionsHookFailure = new Error('session store down');
 
-    await expect(forgetPerson({ id, source: 'principal' })).rejects.toThrow(/session store down/);
+    await expect(forgetPerson({ id })).rejects.toThrow(/session store down/);
     expect(await getPersonLevel('email:pat@example.test')).toBe('close');
     expect(await rowCount('gws_ea_people_identities')).toBe(2);
     expect(await rowCount('gws_ea_people_fingerprints')).toBe(0);
 
-    await forgetPerson({ id, source: 'principal' });
+    await forgetPerson({ id });
     expect(hookCalls.map(([hook]) => hook)).toEqual(['meetings', 'sessions', 'meetings', 'sessions']);
     expect(await getPersonLevel('email:pat@example.test')).toBe('unknown');
   });
@@ -632,14 +631,14 @@ describe('forgetting a person', () => {
       NOW,
     );
 
-    await expect(forgetPerson({ id, source: 'principal' })).rejects.toThrow(/email:pat@example.test.*access/i);
+    await expect(forgetPerson({ id })).rejects.toThrow(/email:pat@example.test.*access/i);
     expect(await getPersonLevel('email:pat@example.test')).toBe('close');
     expect(hookCalls).toEqual([]);
   });
 
   it('refuses a learned add of a forgotten identity in any spelling; the principal adding it back clears the fingerprint', async () => {
     const { id } = await addPerson(pat({ identity: 'email:pat.doe@gmail.com' }));
-    await forgetPerson({ id, source: 'principal' });
+    await forgetPerson({ id });
 
     const learned = {
       name: 'Pat Doe',
@@ -669,7 +668,7 @@ describe('forgetting a person', () => {
 
   it('lets the principal re-add a forgotten identity to an existing person, clearing its fingerprint', async () => {
     const { id } = await addPerson(pat());
-    await forgetPerson({ id, source: 'principal' });
+    await forgetPerson({ id });
     const sam = await addPerson({ name: 'Sam Lee', level: 'active', source: 'principal', basis: 'Weekly.' });
 
     await updatePerson({ id: sam.id, source: 'principal', addIdentity: 'email:Pat+old@example.test' });
@@ -687,16 +686,16 @@ describe('forgetting a person', () => {
       basis: 'Met once.',
       identity: 'email:sam@example.test',
     });
-    await forgetPerson({ id: first.id, source: 'principal' });
+    await forgetPerson({ id: first.id });
     const key = fs.readFileSync(keyFile(), 'utf8');
 
-    await forgetPerson({ id: (await findPeople('Pat Doe')).people[0].id, source: 'principal' });
+    await forgetPerson({ id: (await findPeople('Pat Doe')).people[0].id });
     expect(fs.readFileSync(keyFile(), 'utf8')).toBe(key);
   });
 
   it('stops instead of issuing a new key when the key is missing and fingerprints are present', async () => {
     const { id } = await addPerson(pat());
-    await forgetPerson({ id, source: 'principal' });
+    await forgetPerson({ id });
     fs.rmSync(keyFile());
 
     await expect(assertPeopleStoreRunning()).rejects.toThrow(/stopped/i);
@@ -709,13 +708,13 @@ describe('forgetting a person', () => {
       NOW,
     );
     expect(named.changes).toBe(1);
-    await expect(forgetPerson({ id: 'p-000000000009', source: 'principal' })).rejects.toThrow(/stopped/i);
+    await expect(forgetPerson({ id: 'p-000000000009' })).rejects.toThrow(/stopped/i);
     expect(fs.existsSync(keyFile())).toBe(false);
   });
 
   it('refuses a key that is not owner-only', async () => {
     const { id } = await addPerson(pat());
-    await forgetPerson({ id, source: 'principal' });
+    await forgetPerson({ id });
     fs.chmodSync(keyFile(), 0o644);
 
     await expect(assertPeopleStoreRunning()).rejects.toThrow(/0600/);
@@ -725,7 +724,7 @@ describe('forgetting a person', () => {
     vi.stubEnv(GOOGLE_GRANT_FILE_ENV, '');
     const { id } = await addPerson(pat());
 
-    await expect(forgetPerson({ id, source: 'principal' })).rejects.toThrow(/secrets directory/i);
+    await expect(forgetPerson({ id })).rejects.toThrow(/secrets directory/i);
     expect(await getPersonLevel('email:pat@example.test')).toBe('close');
   });
 
@@ -745,7 +744,7 @@ describe('forgetting a person', () => {
       await runMigrations(await initDb(databaseFile, { role: 'test' }));
       await setUpInstance();
       const { id } = await addPerson(pat());
-      await forgetPerson({ id, source: 'principal' });
+      await forgetPerson({ id });
       await closeDb();
 
       await runMigrations(await initDb(databaseFile, { role: 'test' }));

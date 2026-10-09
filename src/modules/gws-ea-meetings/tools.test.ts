@@ -1066,7 +1066,7 @@ describe('forgetting a person', () => {
     calendar.failure = new GoogleApiError(503, 'Calendar is unavailable');
     const calls = calendar.calls;
     try {
-      await forgetPerson({ id: remy.id, source: 'principal' });
+      await forgetPerson({ id: remy.id });
       expect(killContainer).not.toHaveBeenCalled();
     } finally {
       vi.mocked(isContainerRunning).mockImplementation(() => false);

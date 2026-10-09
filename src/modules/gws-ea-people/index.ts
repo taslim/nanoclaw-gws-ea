@@ -266,12 +266,9 @@ registerResource({
       description:
         'Forget a person, when the principal tells you to: their record, their identities, and the work on their email threads are deleted. Only a one-way fingerprint of each identity remains, so they are unknown from then on and only the principal can add them back.\n\n' +
         'Answers with their name and identities: clear them from your memory, their file and every other mention.',
-      args: [ID_ARG, SOURCE_ARG],
-      examples: ['ncl people forget p-1a2b3c4d5e6f --source principal'],
-      handler: async (args, ctx) =>
-        asMain(ctx, async () =>
-          forgetPerson({ id: requiredString(args, 'id'), source: requiredString(args, 'source') }),
-        ),
+      args: [ID_ARG],
+      examples: ['ncl people forget p-1a2b3c4d5e6f'],
+      handler: async (args, ctx) => asMain(ctx, async () => forgetPerson({ id: requiredString(args, 'id') })),
     },
   },
 });
