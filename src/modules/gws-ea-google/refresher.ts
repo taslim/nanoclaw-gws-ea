@@ -28,9 +28,6 @@ export const RENEW_BEFORE_EXPIRY_MS = 15 * 60_000;
 /** What agents' tools send in place of a token; the gateway replaces it on the service's host. */
 export const GATEWAY_TOKEN_PLACEHOLDER = 'gateway-managed';
 
-/** The secret an earlier release published Gmail's modify scope under. No agent may hold it, so the host removes it. */
-export const STALE_GMAIL_SECRET = { name: 'google-gmail', host: 'gmail.googleapis.com' } as const;
-
 const BEARER = { headerName: 'Authorization', valueFormat: 'Bearer {value}' } as const;
 
 function bearerTarget(name: string, host: string): GatewayCredentialTarget {
@@ -76,29 +73,6 @@ export function createGoogleTokenRefresher(options: RefresherOptions): GoogleTok
   const minting = new Map<HostGoogleServiceId, Promise<string>>();
   let revoked: string | undefined;
   let current: string | undefined;
-  let staleRemoved = false;
-  let staleReported = false;
-
-  /** Remove the stale Gmail secret once; until that succeeds, retry each tick and report it once. */
-  async function removeStaleSecret(): Promise<void> {
-    if (staleRemoved) return;
-    try {
-      const connection = options.connection(bearerTarget(STALE_GMAIL_SECRET.name, STALE_GMAIL_SECRET.host));
-      if (await connection.find()) {
-        await connection.remove();
-        options.log.info('Removed the stale Gmail secret no agent may hold', { secret: STALE_GMAIL_SECRET.name });
-      }
-      staleRemoved = true;
-      /* eslint-disable-next-line no-catch-all/no-catch-all -- A background loop: the failure is reported and the next tick retries. */
-    } catch (error) {
-      if (staleReported) return;
-      staleReported = true;
-      options.log.error('Could not remove the stale Gmail secret; status reports it until it is gone', {
-        secret: STALE_GMAIL_SECRET.name,
-        error: message(error),
-      });
-    }
-  }
 
   async function mintHostToken(service: HostGoogleServiceId): Promise<string> {
     const grant = await options.readGrant();
@@ -123,7 +97,6 @@ export function createGoogleTokenRefresher(options: RefresherOptions): GoogleTok
 
   return {
     async tick() {
-      await removeStaleSecret();
       let grant: GoogleGrant | undefined;
       try {
         grant = await options.readGrant();

@@ -63,7 +63,6 @@ import {
 } from './provision.js';
 import { redact, safeErrorCode, safeErrorMessage } from './redact.js';
 import { allocateInstanceId, getInstanceReservation, validateReservation } from './registry.js';
-import { legacyLocation } from './release-convert.js';
 import {
   resolveReleaseTarget,
   type CreateTargetRequest,
@@ -1315,13 +1314,11 @@ class Cli {
         ...(plan.meta ? { meta: plan.meta } : {}),
         secretDirectories: [
           path.join(paths.cloudflareRoot, 'secrets'),
-          // The assistant's root, and the root the layout before releases kept it in until its conversion moves the
-          // secrets: `legacyLocation` goes with the converter (KTD13), and its root here with it.
           ...(plan.instanceId
-            ? [paths.instanceRoot(plan.instanceId), legacyLocation(paths, plan.instanceId).root].flatMap((root) => [
-                path.join(root, 'secrets'),
-                path.join(root, 'onecli', 'secrets'),
-              ])
+            ? [
+                path.join(paths.instanceRoot(plan.instanceId), 'secrets'),
+                path.join(paths.instanceRoot(plan.instanceId), 'onecli', 'secrets'),
+              ]
             : []),
         ],
       });

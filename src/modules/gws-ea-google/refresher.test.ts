@@ -5,7 +5,7 @@ import type {
   GatewayRuntimeCredentialConnection,
 } from '../../gateway-providers/credential-connection.js';
 import { AGENT_GOOGLE_SERVICES, GOOGLE_SIGN_IN_SCOPES, type GoogleGrant } from './grant.js';
-import { createGoogleTokenRefresher, RENEW_BEFORE_EXPIRY_MS, STALE_GMAIL_SECRET } from './refresher.js';
+import { createGoogleTokenRefresher, RENEW_BEFORE_EXPIRY_MS } from './refresher.js';
 import { GOOGLE_TOKEN_ENDPOINT } from './tokens.js';
 
 const GRANT: GoogleGrant = {
@@ -32,7 +32,6 @@ function world(google: { error?: string; scope?: (asked: string) => string } = {
   const minted: URLSearchParams[] = [];
   const vault = new Map<string, Stored>();
   const writes: string[] = [];
-  let failNextFind: string | undefined;
   let tokens = 0;
   const json = (status: number, body: unknown): Response => new Response(JSON.stringify(body), { status });
   const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -58,10 +57,6 @@ function world(google: { error?: string; scope?: (asked: string) => string } = {
     };
     return {
       async find() {
-        if (failNextFind === target.name) {
-          failNextFind = undefined;
-          throw new Error(`Multiple ${target.name} credentials exist.`);
-        }
         observed = vault.has(target.name);
         return observed ? { reusable: true } : null;
       },
@@ -89,9 +84,6 @@ function world(google: { error?: string; scope?: (asked: string) => string } = {
     vault,
     writes,
     connection,
-    failFindOnce(name: string) {
-      failNextFind = name;
-    },
   };
 }
 
@@ -134,39 +126,6 @@ describe('the Google token refresher', () => {
       },
     });
     expect(w.vault.get('google-directory')?.host).toBe('people.googleapis.com');
-  });
-
-  it('removes the stale gmail.modify secret an earlier release left, once', async () => {
-    const w = world();
-    const stale: GatewayCredentialTarget = {
-      kind: 'api-key',
-      name: STALE_GMAIL_SECRET.name,
-      host: STALE_GMAIL_SECRET.host,
-      proxyValue: 'gateway-managed',
-      injection: { headerName: 'Authorization', valueFormat: 'Bearer {value}' },
-    };
-    w.vault.set(STALE_GMAIL_SECRET.name, { host: 'gmail.googleapis.com', value: 'ya29.modify', target: stale });
-    const { refresher: r } = refresher(w, () => undefined, { now: 0 });
-
-    await r.tick();
-    await r.tick();
-
-    expect(STALE_GMAIL_SECRET).toEqual({ name: 'google-gmail', host: 'gmail.googleapis.com' });
-    expect(w.vault.has('google-gmail')).toBe(false);
-    expect(w.writes).toEqual(['remove google-gmail']);
-    expect(w.connection.mock.calls.filter(([target]) => target.name === 'google-gmail')).toHaveLength(1);
-  });
-
-  it('retries removing the stale secret on a later tick when the gateway refuses, reporting it once', async () => {
-    const w = world();
-    w.failFindOnce(STALE_GMAIL_SECRET.name);
-    const { refresher: r, log } = refresher(w, () => undefined, { now: 0 });
-
-    await r.tick();
-    await r.tick();
-
-    expect(log.error).toHaveBeenCalledTimes(1);
-    expect(w.connection.mock.calls.filter(([target]) => target.name === 'google-gmail')).toHaveLength(2);
   });
 
   it('renews only when a token is close to expiring, as after the machine wakes', async () => {

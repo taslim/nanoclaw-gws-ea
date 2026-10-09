@@ -167,8 +167,8 @@ function publishedAccessProblem(secrets: readonly VaultSecret[]): string | undef
 /**
  * A secret an agent could use to do more in Gmail than read it: any secret
  * injected on Gmail's host other than the read-only one the host publishes.
- * The stale `google-gmail` secret carries `gmail.modify`; any other cannot be
- * told apart from it by metadata, so it is flagged alike.
+ * Metadata cannot tell whether such a secret carries `gmail.modify`, so each
+ * one is flagged.
  */
 function gmailModifyProblem(secrets: readonly VaultSecret[]): string | undefined {
   const readOnly = AGENT_GOOGLE_SERVICES['gmail-read'];

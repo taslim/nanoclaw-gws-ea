@@ -10,7 +10,6 @@
  */
 import path from 'node:path';
 
-import { isErrno } from '../community-portal/errors.js';
 import { provideReleaseImage, readInstallCjkFonts } from './agent-image-release.js';
 import type { ImageDocker } from './agent-image.js';
 import { committedTree, materializeReleaseCheckout, type CheckoutRuntime } from './checkout.js';
@@ -33,7 +32,6 @@ import {
   isReleaseComplete,
   linkReleaseState,
   releaseName,
-  type InstanceLayout,
 } from './release-layout.js';
 import { activeStep } from './run-log.js';
 import { readOwnerOnlyFile } from './secrets.js';
@@ -55,12 +53,6 @@ export interface ReleaseStageRequest {
   readonly view: InstanceReservation;
   /** The assistant's runtime, which the release's kept files are rendered for. */
   readonly runtime: InstanceRuntimeConfig;
-  /**
-   * The state the assistant serves from, whose `.env` sets the image's build
-   * flags: its own `state/`, or the old checkout during the one-time
-   * conversion, before that state has moved.
-   */
-  readonly state: string;
   readonly onecli: OnecliRuntimeLayout;
   /** The service manager the release's service definition is rendered for. */
   readonly service: ServiceLayoutOptions;
@@ -120,7 +112,7 @@ export async function stageRelease(request: ReleaseStageRequest, seams: ReleaseS
     installId: runtime.install_id,
     inputs: {
       contextTree: await committedTree(release, view.deployed_commit, 'container', seams),
-      installCjkFonts: readInstallCjkFonts(request.state),
+      installCjkFonts: readInstallCjkFonts(layout.state),
     },
   });
   await request.beforeLink?.(release);
@@ -179,22 +171,6 @@ export interface ReleaseFilesTarget {
 }
 
 /**
- * The OneCLI Compose file that release `name`, which a switch leaves, ran
- * with: the one kept with it. A release on the layout before releases kept
- * none; the conversion brought the project up from `applied`, the file of the
- * release it switches to, and proved it (`release-convert.ts`), so that is
- * the file it leaves.
- */
-async function leftCompose(layout: InstanceLayout, name: string, applied: string): Promise<string> {
-  try {
-    return await readOwnerOnlyFile(keptReleaseFiles(layout.kept(name)).compose);
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) return applied;
-    throw error;
-  }
-}
-
-/**
  * Apply the files kept with the release `target` names to the assistant,
  * while it is fenced and before the live link names the release: gws-ea's
  * `.env` keys into `state/.env`; its OneCLI Compose file, put back and the
@@ -226,7 +202,10 @@ export async function applyReleaseFiles(
   await restoreReleaseGateway(
     onecli,
     { gateway: receipt.onecli.gateway },
-    { compose: kept.compose, left: await leftCompose(layout, releaseName(target.leaving), kept.compose) },
+    {
+      compose: kept.compose,
+      left: await readOwnerOnlyFile(keptReleaseFiles(layout.kept(releaseName(target.leaving))).compose),
+    },
     onecliDependencies,
   );
   return { definitionChanged: await restoreInstanceServiceDefinition(runtime, kept.serviceDefinition, dependencies) };

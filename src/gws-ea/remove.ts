@@ -14,11 +14,9 @@
  * instance root, and go with it. So does every image the assistant's
  * releases tagged or its rebuilds displaced, while the images assistants
  * share stay (KTD6). Nor does the phase the assistant is in (R9): fenced, it
- * is removed from its physical state, and while the converter exists its
- * legacy root goes too, whether it is unconverted, mid-conversion, or long
- * converted, its records read from whichever root holds them (KTD13).
+ * is removed from its physical state.
  */
-import { access, lstat, rm } from 'node:fs/promises';
+import { access, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -70,13 +68,7 @@ import { readProvisionJournal } from './journal.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { removeOnecliRuntime } from './onecli.js';
 import { readOperationRecord, type OperationRecord } from './operation.js';
-import {
-  CONTROL_PLANE_ROOT,
-  instanceRuntimeFile,
-  isRegularFile,
-  preparePrivateDirectory,
-  type ControlPlanePaths,
-} from './paths.js';
+import { CONTROL_PLANE_ROOT, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import { pollUntil } from './poll.js';
 import { probeRecordedDockerEndpoint, resolveDockerEndpoint } from './prerequisites.js';
 import {
@@ -97,7 +89,6 @@ import {
   validateReservation,
   withLockedCloudflareRegistry,
 } from './registry.js';
-import { isConverting, legacyInstanceRoot, legacyLocation } from './release-convert.js';
 import { activeStep } from './run-log.js';
 import { readOwnerOnlyJson, removePrivateFile } from './secrets.js';
 import { serviceManagerEnvironment } from './service.js';
@@ -320,18 +311,9 @@ interface ProvisioningRecord {
   readonly keyPolicyLifted: boolean;
 }
 
-/**
- * `paths`, reading the journal where it is: in the assistant's root, or in its
- * legacy root until its conversion moves it from there by name (KTD13).
- */
-async function journalPaths(paths: ControlPlanePaths, instanceId: string): Promise<ControlPlanePaths> {
-  const legacy = path.join(legacyLocation(paths, instanceId).root, path.basename(paths.journalFile(instanceId)));
-  return (await isRegularFile(legacy)) ? { ...paths, journalFile: () => legacy } : paths;
-}
-
 async function readProvisioningRecord(paths: ControlPlanePaths, instanceId: string): Promise<ProvisioningRecord> {
   try {
-    const journal = await readProvisionJournal(await journalPaths(paths, instanceId), instanceId);
+    const journal = await readProvisionJournal(paths, instanceId);
     return { started: (step) => journal.steps[step] !== undefined, keyPolicyLifted: journal.key_policy_lifted };
   } catch (error) {
     if (!(error instanceof GwsEaError)) throw error;
@@ -386,8 +368,7 @@ function recordedAgentImages(record: OperationRecord | undefined | null): readon
 /**
  * The home directory and Docker endpoint the instance recorded:
  * `runtime.json` in its `state/` once create wrote it, else the bootstrap
- * manifest create wrote first, else the `runtime.json` its legacy checkout
- * holds until a conversion moves it. Only these fields are read, so files an
+ * manifest create wrote first. Only these fields are read, so files an
  * earlier launcher wrote still remove cleanly.
  */
 async function readRecordedRuntime(
@@ -397,7 +378,6 @@ async function readRecordedRuntime(
   const records = await Promise.all([
     readRecord(paths.runtimeFile(reservation.instance_id)),
     readRecord(paths.bootstrapFile(reservation.instance_id)),
-    readRecord(instanceRuntimeFile(legacyLocation(paths, reservation.instance_id).checkout)),
   ]);
   const field = (key: string, parse: (value: unknown, label: string, code: string) => string): string | undefined => {
     for (const record of records) {
@@ -671,12 +651,11 @@ export interface NanoclawTeardown {
   /** The agent image IDs an unfinished update or rollback recorded. */
   readonly recordedImages: readonly string[];
   /**
-   * An assistant's roots, its legacy one too while the converter exists
-   * (KTD13): its host runs from whichever release folder directly under one
-   * was live when it started, so it is found by the root. Without them, the
-   * host is the one the install's own checkout runs.
+   * The assistant's root: its host runs from whichever release folder directly
+   * under it was live when it started, so it is found by the root. Without it,
+   * the host is the one the install's own checkout runs.
    */
-  readonly instanceRoots?: readonly string[];
+  readonly instanceRoot?: string;
 }
 
 /** `text` as a POSIX extended regular expression that matches only itself. */
@@ -686,14 +665,15 @@ function literalPattern(text: string): string {
 
 /**
  * The command line `pkill -f` and `pgrep -f` find a host by: `dist/index.js`
- * in any release folder directly under one of an assistant's roots, or in
- * the install's own checkout.
+ * in any release folder directly under the assistant's root, or in the
+ * install's own checkout.
  */
-function hostProcessPattern(install: NanoclawInstall, teardown: Pick<NanoclawTeardown, 'instanceRoots'>): string {
-  const folders = teardown.instanceRoots?.map((root) => `${literalPattern(root)}/[^/]+`) ?? [
-    literalPattern(install.checkoutRoot),
-  ];
-  return `(${folders.join('|')})/dist/index\\.js`;
+function hostProcessPattern(install: NanoclawInstall, teardown: Pick<NanoclawTeardown, 'instanceRoot'>): string {
+  const folder =
+    teardown.instanceRoot === undefined
+      ? literalPattern(install.checkoutRoot)
+      : `${literalPattern(teardown.instanceRoot)}/[^/]+`;
+  return `${folder}/dist/index\\.js`;
 }
 
 /**
@@ -835,40 +815,24 @@ export async function uninstallNanoclaw(install: NanoclawInstall, teardown: Nano
   for (const imageId of teardown.recordedImages) await reclaimImage(images, imageId);
 }
 
-/**
- * OneCLI's Compose project, through the recorded Docker endpoint, from the
- * root that holds its folder: the assistant's own, or its legacy root until
- * its conversion moves the folder from there by name (KTD13).
- */
+/** OneCLI's Compose project, through the recorded Docker endpoint. */
 async function removeOnecli(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
   runtime: LocalRuntime,
   run: SanitizedCommandOutcomeRunner,
 ): Promise<void> {
-  const layout = (instanceRoot: string) =>
+  await removeOnecliRuntime(
     createOnecliRuntimeLayout({
       instanceId: reservation.instance_id,
-      instanceRoot,
+      instanceRoot: paths.instanceRoot(reservation.instance_id),
       project: reservation.exclusive_resource_claims.onecli_project,
       appPort: reservation.allocated_ports.onecli_app,
       gatewayPort: reservation.allocated_ports.onecli_gateway,
       dockerEndpoint: runtime.dockerEndpoint,
-    });
-  const legacy = layout(legacyLocation(paths, reservation.instance_id).root);
-  const held = (await present(legacy.rootDirectory)) ? legacy : layout(paths.instanceRoot(reservation.instance_id));
-  await removeOnecliRuntime(held, { dockerCommandRunner: checkedRunner(run) });
-}
-
-/** Whether anything is at `target`, a link included. */
-async function present(target: string): Promise<boolean> {
-  try {
-    await lstat(target);
-    return true;
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) return false;
-    throw error;
-  }
+    }),
+    { dockerCommandRunner: checkedRunner(run) },
+  );
 }
 
 export async function describeRemoval(paths: ControlPlanePaths, instanceId: string): Promise<RemovalPreview> {
@@ -882,10 +846,7 @@ export async function describeRemoval(paths: ControlPlanePaths, instanceId: stri
   const ingress = claims.ingress;
   return {
     instanceId,
-    checkout:
-      legacyInstanceRoot(paths, reservation) === undefined
-        ? paths.checkoutRoot(instanceId)
-        : legacyLocation(paths, instanceId).checkout,
+    checkout: paths.checkoutRoot(instanceId),
     gcpProject: claims.gcp_project_id,
     gcpAccount: claims.gcp_account,
     onecliProject: claims.onecli_project,
@@ -947,9 +908,7 @@ async function removeLocked(
 
   // Everything below reads; nothing changes until the receipt is written.
   const operation = await readUnfinishedOperation(paths, instanceId);
-  // Mid-conversion the state is still moving into the assistant's root, its marker maybe not yet; the root is the
-  // assistant's by its registry claim (KTD10).
-  if (!(await isConverting(paths, instanceId))) await assertStateConsistent(paths, reservation);
+  await assertStateConsistent(paths, reservation);
   const provisioning = await readProvisioningRecord(paths, instanceId);
   const recorded = await readRecordedRuntime(paths, reservation);
   // Released last, so a released reservation left only local files and the receipt behind.
@@ -985,9 +944,6 @@ async function removeLocked(
   });
   const run = dependencies.runCommand ?? runSanitizedCommandOutcome;
   const serviceHelpers = dependencies.serviceHelpers;
-  // Both roots while the converter exists (KTD13): the legacy one holds an unconverted assistant, or what a
-  // conversion leaves behind until its follow-ups delete it.
-  const roots = [paths.instanceRoot(instanceId), legacyLocation(paths, instanceId).root];
   const uninstall =
     dependencies.uninstallNanoclaw ??
     (serviceHelpers
@@ -1005,7 +961,7 @@ async function removeLocked(
               sleep: dependencies.sleep ?? delay,
               serviceHelpers,
               recordedImages: recordedAgentImages(operation),
-              instanceRoots: roots,
+              instanceRoot: paths.instanceRoot(instanceId),
             },
           )
       : undefined);
@@ -1131,7 +1087,7 @@ async function removeLocked(
       return undefined;
     },
     'instance-files': async () => {
-      for (const root of roots) await rm(root, { recursive: true, force: true });
+      await rm(paths.instanceRoot(instanceId), { recursive: true, force: true });
       return undefined;
     },
   };

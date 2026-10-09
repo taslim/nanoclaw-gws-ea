@@ -114,7 +114,6 @@ function stageRequest(target: Assistant, overrides: Partial<ReleaseStageRequest>
     paths: target.paths,
     view: target.reservation,
     runtime: target.runtime,
-    state: target.paths.instanceLayout(target.reservation.instance_id).state,
     onecli: target.onecli,
     service: { platform: 'macos', homeDirectory: target.home, runningAsRoot: false },
     provider: { provider: 'claude', providerCredential: CREDENTIAL },
@@ -192,17 +191,16 @@ describe('staging a release', () => {
     expect(await readFile(path.join(layout.state, '.env'), 'utf8')).toBe('INSTALL_CJK_FONTS=true\n');
   });
 
-  it("builds the release's image with the flags of the state the assistant serves from", async () => {
+  it("builds the release's image with the flags of the assistant's state", async () => {
     const root = await temporaryRoot('gws-ea-stage-');
     const repository = await releaseRepository(root);
     const target = await assistant(root, repository.remote, repository.commit);
-    // The one-time conversion stages before the state moves: the flags are still in the old checkout.
-    const serving = path.join(root, 'old-checkout');
-    await mkdir(serving, { recursive: true });
-    await writeFile(path.join(serving, '.env'), 'INSTALL_CJK_FONTS=true\n');
+    const layout = target.paths.instanceLayout(target.reservation.instance_id);
+    await createState(layout);
+    await writeFile(path.join(layout.state, '.env'), 'INSTALL_CJK_FONTS=true\n');
     const { world, seams } = stagingWorld();
 
-    await stageRelease(stageRequest(target, { state: serving }), seams);
+    await stageRelease(stageRequest(target), seams);
 
     const build = world.faked.find((command) => command.args.some((arg) => arg.endsWith('container/build.sh')));
     expect(build?.env?.INSTALL_CJK_FONTS).toBe('true');

@@ -281,7 +281,6 @@ async function ensureRelease(
     paths,
     view: await getInstanceReservation(paths, instanceId),
     runtime,
-    state: layout.state,
     onecli,
     service: serviceDependencies,
     provider: releasePreflight,
