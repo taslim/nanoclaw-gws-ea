@@ -1,7 +1,7 @@
 /**
  * Notes the host writes for `main`, into its shared session, routed to the
  * principal's direct message so main's answer reaches the principal. The
- * inbox, the meetings, and the privacy check each write theirs through here.
+ * inbox and the meetings each write theirs through here.
  *
  * Side-effect free: importing it loads no module entry point, so it never
  * reorders the registrations a module's `index.ts` makes.
@@ -18,8 +18,6 @@ export interface NoteForMain {
   readonly timestamp: string;
   /** The one plain explanation main reads. */
   readonly text: string;
-  /** The privacy check's `signal`, written beside the text; every other note is its text alone. */
-  readonly fields?: { readonly signal: unknown };
   /** Whether main takes a turn now; otherwise the note waits for its next one. */
   readonly wake: boolean;
 }
@@ -47,7 +45,7 @@ export async function writeNoteForMain(note: NoteForMain): Promise<NoteForMainRe
       platformId: directMessage.platform_id,
       channelType: directMessage.channel_type,
       threadId: null,
-      content: JSON.stringify({ text: note.text, sender: 'system', senderId: 'system', ...note.fields }),
+      content: JSON.stringify({ text: note.text, sender: 'system', senderId: 'system' }),
       trigger: note.wake,
     });
   } catch (error) {

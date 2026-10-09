@@ -140,7 +140,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  stopHostSweep();
+  await stopHostSweep();
   setTimeoutSpy.mockRestore();
   await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });

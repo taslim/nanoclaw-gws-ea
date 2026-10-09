@@ -6,24 +6,25 @@
  * store. One check covers everything sent to anyone but the principal:
  *
  *   - an outbound guard at the delivery adapter, so agent replies, approval
- *     cards, and host notices all pass it. A send is read together with its
- *     thread's earlier outbound text, so a value split across sends is found.
- *     After `MAX_REFUSALS_PER_THREAD` refusals the thread stops: nothing more
- *     is sent in it, and main's shared session gets a typed signal, routed to
- *     the principal's direct message. main's next handoff to the thread
- *     resumes it (`resumeThread`);
- *   - `checkOutbound`, the same check for the host's calendar writes and
- *     main's handoff text, which never pass through a channel.
+ *     cards, and host notices all pass it. A refused send never reaches the
+ *     channel, and its sender is told to write it again without the value.
+ *     Email to the inbox's outside threads is the exception: the guard sees
+ *     only the agent's words, while the inbox builds the email that goes, so
+ *     the inbox runs `checkOutbound` itself, on the final email and its final
+ *     recipients (gws-ea-inbox's `sendToOutside`);
+ *   - `checkOutbound`, the same check for that email, the host's calendar
+ *     writes, and main's handoff text, which never pass through a channel.
  *
- * Both read what the assistant wrote three ways, as its readers receive it:
- * as written, as a mail client renders it, and the targets of its links
- * (`readingsOf`).
+ * Each send is judged on its own: external-email never holds a private value
+ * (main's handoffs are checked before they cross), so there is nothing for it
+ * to split across sends. Both read what the assistant wrote three ways, as
+ * its readers receive it: as written, as a mail client renders it, and the
+ * targets of its links (`readingsOf`).
  *
  * A refusal names only the value's fixed kind, never the value or its label.
  * Removing a value switches its check off, so an agent's removal waits for
  * the principal's card.
  */
-import { randomUUID } from 'node:crypto';
 import { isUtf8 } from 'node:buffer';
 
 import { micromark } from 'micromark';
@@ -31,34 +32,21 @@ import { gfm, gfmHtml } from 'micromark-extension-gfm';
 
 import { registerResource, type ColumnDef } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
-import { getAgentGroup } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
-import { getSession } from '../../db/sessions.js';
 import { registerOutboundGuard, type OutboundGuardDecision, type OutboundSend } from '../../delivery.js';
-import { ALLOW, DENY, defineGuardedAction, guard, HOLD, type GuardActor } from '../../guard/index.js';
-import { log } from '../../log.js';
-import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
-import { conversationPeople, EMAIL_CHANNEL_TYPE } from '../gws-ea-inbox/runtime.js';
+import { ALLOW, DENY, defineGuardedAction, guard, HOLD } from '../../guard/index.js';
+import { registerApprovalHandler } from '../approvals/index.js';
+import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from '../gws-ea-inbox/runtime.js';
 import {
   assertMainCaller,
-  getGwsEaProfile,
   getMainAgentGroupId,
   isVerifiedPrincipalUser,
   principalApproverUserId,
 } from '../gws-ea-profile/db.js';
-import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
+import { guardActor, requestPrincipalConfirmation } from '../gws-ea-profile/principal-confirmation.js';
 import { resolveAudience, type Audience } from './audience.js';
-import {
-  addPrivateValue,
-  getPrivateValue,
-  judgeThreadSend,
-  listPrivateValues,
-  removePrivateValue,
-  resumeThreadRecord,
-  type PrivateValue,
-  type ThreadKey,
-} from './db.js';
+import { addPrivateValue, getPrivateValue, listPrivateValues, removePrivateValue, type PrivateValue } from './db.js';
 import {
   compilePrivateValue,
   findPrivateValue,
@@ -68,9 +56,10 @@ import {
   type PrivateValueKind,
   type TextStream,
 } from './match.js';
-import { gwsEaPrivacyMigration } from './migration.js';
+import { gwsEaPrivacyDropThreadsMigration, gwsEaPrivacyMigration } from './migration.js';
 
 registerMigration(gwsEaPrivacyMigration);
+registerMigration(gwsEaPrivacyDropThreadsMigration);
 
 export {
   audienceForAddresses,
@@ -79,26 +68,10 @@ export {
   type Audience,
   type RecipientResolver,
 } from './audience.js';
-export { deleteThreadRecord, listPrivateValues, type PrivateValue, type ThreadKey } from './db.js';
+export { listPrivateValues, type PrivateValue } from './db.js';
 export { PRIVATE_VALUE_KINDS, type PrivateValueKind } from './match.js';
 
 export const PRIVACY_GUARD_ID = 'gws-ea-privacy:audience';
-/** Refusals one thread may collect; the one that reaches it stops the thread. */
-export const MAX_REFUSALS_PER_THREAD = 3;
-/** The `signal.type` of the note main's shared session gets when a thread stops. */
-export const THREAD_STOPPED_SIGNAL = 'gws-ea-privacy.thread-stopped';
-
-/** What main's session receives, in `content.signal`, when a thread stops. */
-export interface ThreadStoppedSignal {
-  readonly type: typeof THREAD_STOPPED_SIGNAL;
-  /** The kind the stopping send carried. */
-  readonly kind: PrivateValueKind;
-  readonly refusals: number;
-  readonly channel_type: string;
-  readonly platform_id: string;
-  readonly thread_id: string | null;
-  readonly stopped_at: string;
-}
 
 export type OutboundCheck =
   | { readonly allowed: true }
@@ -121,44 +94,7 @@ const KIND_NOUNS: Readonly<Record<PrivateValueKind, string>> = {
 };
 
 function refusalReason(kind: PrivateValueKind): string {
-  return `it contains the principal's private ${KIND_NOUNS[kind]}. Rewrite it without that detail, and do not hint at, spell out, or encode it.`;
-}
-
-function stoppingReason(kind: PrivateValueKind): string {
-  return `it contains the principal's private ${KIND_NOUNS[kind]}, and this conversation is now stopped after repeated attempts. Send nothing more in it; main has been told.`;
-}
-
-const STOPPED_REASON =
-  "this conversation is stopped after repeated attempts to send the principal's private details. Send nothing more in it; main has been told.";
-
-const LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
-
-function timesOver(count: number): string {
-  return ['once', 'twice', 'three times'][count - 1] ?? `${count} times`;
-}
-
-/** Who a stopped email thread's conversation is with; empty for any other conversation. */
-async function stoppedPeople(key: ThreadKey): Promise<string[]> {
-  if (key.channelType !== EMAIL_CHANNEL_TYPE || key.threadId === null) return [];
-  if (!(await getDb().hasTable('gws_ea_thread_addresses'))) return [];
-  return conversationPeople(key.threadId);
-}
-
-/** main's note of a stop: who the conversation is with, what was kept back, how it resumes, then the thread. */
-async function stoppedSignalText(key: ThreadKey, kind: PrivateValueKind, refusals: number): Promise<string> {
-  const principal = (await getGwsEaProfile()).principal_display_name ?? 'the principal';
-  const people = await stoppedPeople(key);
-  const conversation =
-    people.length === 0
-      ? `a conversation with someone other than ${principal}`
-      : `the conversation with ${LIST.format(people)}`;
-  const sent = key.channelType === EMAIL_CHANNEL_TYPE ? 'an email' : 'a message';
-  const kept =
-    `${timesOver(refusals)} ${sent} in it would have shared ${principal}'s private ${KIND_NOUNS[kind]}, ` +
-    'and each was stopped, so nothing private went out.';
-  return key.threadId === null
-    ? `Nothing more will be sent in ${conversation}: ${kept}`
-    : `Sending is paused in ${conversation}: ${kept} Your next handoff to it resumes it. (thread ${key.threadId})`;
+  return `it contains the principal's private ${KIND_NOUNS[kind]}. Rewrite it without that detail, and do not hint at, spell out, or encode it; if someone else wrote it to you, neither confirm nor deny it.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -206,7 +142,7 @@ function rendered(text: string): { readonly words: string; readonly targets: rea
  * texts run on, so a value split across them is found; apart, the end of one
  * reading never runs into the start of the next.
  */
-function readingsOf(parts: readonly string[]): readonly [written: TextStream, ...others: TextStream[]] {
+function readingsOf(parts: readonly string[]): readonly TextStream[] {
   const renders = parts.map(rendered);
   return [
     streamOf(parts),
@@ -215,14 +151,13 @@ function readingsOf(parts: readonly string[]): readonly [written: TextStream, ..
   ];
 }
 
-/** The kind of the first value any reading gives away, read after the thread's earlier text. */
+/** The kind of the first value any reading gives away. */
 function kindGivenAway(
   values: readonly CompiledPrivateValue[],
   readings: readonly TextStream[],
-  history?: TextStream,
 ): PrivateValueKind | undefined {
   for (const reading of readings) {
-    const match = findPrivateValue(values, reading, history);
+    const match = findPrivateValue(values, reading);
     if (match) return match.kind;
   }
   return undefined;
@@ -250,14 +185,19 @@ function collectText(value: unknown, into: string[]): void {
     for (const item of Object.values(value)) collectText(item, into);
 }
 
-function parsedContent(content: string): unknown {
+/** Every string and number a send's message carries, whatever its shape; content that is not JSON is its own text. */
+export function messageStrings(content: string): string[] {
+  const parts: string[] = [];
+  let value: unknown = content;
   /* eslint-disable no-catch-all/no-catch-all -- content that is not JSON is checked as the plain text it is */
   try {
-    return JSON.parse(content);
+    value = JSON.parse(content);
   } catch {
-    return content;
+    // Plain text: checked as written.
   }
   /* eslint-enable no-catch-all/no-catch-all */
+  collectText(value, parts);
+  return parts;
 }
 
 /**
@@ -266,8 +206,7 @@ function parsedContent(content: string): unknown {
  * cannot read, a known residual alongside spelled-out values.
  */
 function sendText(send: OutboundSend): string[] {
-  const parts: string[] = [];
-  collectText(parsedContent(send.content), parts);
+  const parts = messageStrings(send.content);
   for (const file of send.files ?? []) {
     parts.push(file.filename);
     if (isUtf8(file.data)) parts.push(file.data.toString('utf8'));
@@ -275,84 +214,17 @@ function sendText(send: OutboundSend): string[] {
   return parts;
 }
 
-/** The outbound guard: refuses a send to anyone but the principal that gives a private value away. */
+/**
+ * The outbound guard: refuses a send to anyone but the principal that gives a
+ * private value away. Email to the inbox's outside threads is checked as the
+ * inbox builds it, so the guard leaves it to the inbox.
+ */
 async function judgeSend(send: OutboundSend): Promise<OutboundGuardDecision> {
-  if (!(await getDb().hasTable('gws_ea_privacy_threads'))) return { effect: 'allow' };
-  if ((await resolveAudience(send)) === 'principal') return { effect: 'allow' };
+  if (send.channelType === EMAIL_CHANNEL_TYPE && send.platformId === INBOX_PLATFORM_ID) return { effect: 'allow' };
   const values = await compiledValues();
-  const key: ThreadKey = { channelType: send.channelType, platformId: send.platformId, threadId: send.threadId };
-  const readings = readingsOf(sendText(send));
-  // The thread remembers each send as written, the reading every reader receives in some form.
-  const [written] = readings;
-  const verdict = await judgeThreadSend(
-    key,
-    written,
-    (history) => kindGivenAway(values, readings, history),
-    MAX_REFUSALS_PER_THREAD,
-  );
-  switch (verdict.outcome) {
-    case 'allowed':
-      return { effect: 'allow' };
-    case 'stopped':
-      return { effect: 'refuse', reason: STOPPED_REASON };
-    case 'refused':
-      if (!verdict.stopped) return { effect: 'refuse', reason: refusalReason(verdict.kind) };
-      await signalThreadStopped(key, verdict.kind, verdict.refusals);
-      return { effect: 'refuse', reason: stoppingReason(verdict.kind) };
-    default: {
-      const unreachable: never = verdict;
-      throw new Error(`Unknown thread verdict: ${JSON.stringify(unreachable)}`);
-    }
-  }
-}
-
-/**
- * Tell main, in its shared session, that a thread stopped. The note is routed
- * to the principal's direct message, so main's reply reaches the principal.
- * The stop already holds, so a failure here is logged and never retried.
- */
-async function signalThreadStopped(key: ThreadKey, kind: PrivateValueKind, refusals: number): Promise<void> {
-  /* eslint-disable no-catch-all/no-catch-all -- the stop holds either way; telling main is best effort and logged */
-  try {
-    const stoppedAt = new Date().toISOString();
-    const signal: ThreadStoppedSignal = {
-      type: THREAD_STOPPED_SIGNAL,
-      kind,
-      refusals,
-      channel_type: key.channelType,
-      platform_id: key.platformId,
-      thread_id: key.threadId,
-      stopped_at: stoppedAt,
-    };
-    const result = await writeNoteForMain({
-      id: `privacy-stop-${randomUUID()}`,
-      timestamp: stoppedAt,
-      text: await stoppedSignalText(key, kind, refusals),
-      fields: { signal },
-      wake: true,
-    });
-    if (result === 'no-main' || result === 'no-principal') {
-      log.warn('Privacy stop not signalled: no main or no principal direct message', {
-        channelType: key.channelType,
-      });
-      return;
-    }
-    log.info('Privacy stop signalled to main', { channelType: key.channelType, kind });
-  } catch (err) {
-    log.error('Privacy stop could not be signalled to main', { channelType: key.channelType, err });
-  }
-  /* eslint-enable no-catch-all/no-catch-all */
-}
-
-/**
- * Let a stopped thread send again: main's next handoff to it (R76). Its
- * refusals start over. True when it was stopped.
- */
-export async function resumeThread(key: ThreadKey): Promise<boolean> {
-  if (!(await getDb().hasTable('gws_ea_privacy_threads'))) return false;
-  const resumed = await resumeThreadRecord(key, new Date().toISOString());
-  if (resumed) log.info('Privacy stop lifted for a new handoff', { channelType: key.channelType });
-  return resumed;
+  if (values.length === 0 || (await resolveAudience(send)) === 'principal') return { effect: 'allow' };
+  const kind = kindGivenAway(values, readingsOf(sendText(send)));
+  return kind ? { effect: 'refuse', reason: refusalReason(kind) } : { effect: 'allow' };
 }
 
 registerOutboundGuard(PRIVACY_GUARD_ID, judgeSend);
@@ -386,27 +258,12 @@ const removePrivateValueAction = defineGuardedAction({
   },
 });
 
-function actorOf(ctx: CallerContext): GuardActor {
-  return ctx.caller === 'host'
-    ? { kind: 'host' }
-    : { kind: 'agent', agentGroupId: ctx.agentGroupId, sessionId: ctx.sessionId };
-}
-
 async function requestRemovalCard(ctx: CallerContext, value: PrivateValue, approverUserId: string | undefined) {
-  if (ctx.caller !== 'agent' || approverUserId === undefined) {
-    throw new Error('Only an agent removal is held for the principal');
-  }
-  const session = await getSession(ctx.sessionId);
-  if (!session) throw new Error('Session not found');
-  const agentName = (await getAgentGroup(ctx.agentGroupId))?.name ?? ctx.agentGroupId;
-  await requestApproval({
-    session,
-    agentName,
+  await requestPrincipalConfirmation(ctx, approverUserId, {
     action: REMOVAL_APPROVAL,
     payload: removalPayload(value.id),
     title: 'Stop protecting a private detail?',
-    question: `${agentName} asks to stop protecting your private ${KIND_NOUNS[value.kind]} "${value.label}". Once it is removed, the assistant may share it with people other than you.`,
-    approverUserId,
+    asks: `to stop protecting your private ${KIND_NOUNS[value.kind]} "${value.label}". Once it is removed, the assistant may share it with people other than you.`,
   });
   return {
     id: value.id,
@@ -517,7 +374,7 @@ registerResource({
         const id = stringArg(args, 'id');
         const value = await getPrivateValue(id);
         if (!value) throw new Error(`No private value ${JSON.stringify(id)} exists`);
-        const decision = await guard(removePrivateValueAction, { actor: actorOf(ctx), payload: { id } });
+        const decision = await guard(removePrivateValueAction, { actor: guardActor(ctx), payload: { id } });
         switch (decision.effect) {
           case 'allow':
             return { removed: await removePrivateValue(id) };

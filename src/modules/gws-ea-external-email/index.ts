@@ -16,7 +16,7 @@
  *     (`./bridge.ts`).
  *   - When an email it wrote cannot be sent, what arrived in its thread cannot
  *     be processed, or its work on a thread fails, main hears of it
- *     (`./failures.ts`).
+ *     (`../gws-ea-notices`).
  *   - Its project document holds its guidance, read from the release, the
  *     two display names, and the principal's time zone, read from the profile
  *     at each spawn so that no email it reads repeats them; the profile and
@@ -45,7 +45,6 @@ import { registerGuidance } from '../gws-ea-profile/guidance.js';
 import { BRIDGE_ACTIONS } from './bridge.js';
 import { destinationViolations } from './destination-policy.js';
 import { ensureExternalEmailGroup, externalEmailDrift } from './group.js';
-import './failures.js';
 
 export {
   EXTERNAL_EMAIL_CAPABILITIES,

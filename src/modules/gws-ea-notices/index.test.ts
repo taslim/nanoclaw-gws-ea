@@ -1,7 +1,7 @@
 /**
  * Failure notices reach only the principal, in their direct message (R38),
- * and only for main's own conversations: a failure in external-email's is
- * the external-email module's to report to main.
+ * and only for main's own conversations: a failure in external-email's goes
+ * to main instead (external-email.test.ts).
  *
  * Drives the real core paths that report a failure (delivery, reconcile, and
  * the runner's `turn_failed` action) with this module registered on their
@@ -46,7 +46,7 @@ import { bindVerifiedPrincipalUser, recordExternalEmailAgentGroupId } from '../g
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
 import '../gws-ea-profile/index.js';
-import { registerTurnFailedHook } from './index.js';
+import './index.js';
 
 const TEST_DIR = '/tmp/nanoclaw-test-gws-ea-notices';
 const NOTICE = "Something went wrong on my side and I couldn't finish that. Please send it again.";
@@ -65,12 +65,6 @@ interface Sent {
 }
 
 let sent: Sent[];
-
-/** Every failed turn the notices module handed on: another module's to report. */
-const handedOn: Array<{ sessionId: string; threadId: string | null }> = [];
-registerTurnFailedHook('gws-ea-notices-test:record', async (route, session) => {
-  handedOn.push({ sessionId: session.id, threadId: route.threadId });
-});
 
 function now(): string {
   return new Date().toISOString();
@@ -228,7 +222,6 @@ beforeEach(async () => {
   vi.mocked(isContainerRunning).mockReturnValue(false);
   vi.mocked(killContainer).mockReset();
   sent = [];
-  handedOn.length = 0;
   channel();
 });
 
@@ -524,49 +517,22 @@ describe('a failed turn the runner reports', () => {
     }
   });
 
-  it('produces the sentence in the thread of main’s own conversation, and hands nothing on', async () => {
+  it('produces the sentence in the thread of main’s own conversation', async () => {
     const { main } = await seedAssistant();
     reportTurnFailed(main, { ...DM, threadId: 'spaces/dm/threads/t1' });
 
     await drain(main, 1);
 
     expect(sent).toEqual([noticeInDm('spaces/dm/threads/t1')]);
-    expect(handedOn).toEqual([]);
   });
 
-  it('in an external-email thread sends nothing, to the principal or the thread, and hands it to its owner', async () => {
+  it('in an external-email conversation sends nothing, to the principal or the thread (main hears instead)', async () => {
     const { external } = await seedAssistant();
     reportTurnFailed(external, { ...EMAIL_THREAD, threadId: 'm-1' });
 
     await drain(external, 1);
 
     expect(sent).toEqual([]);
-    expect(handedOn).toEqual([{ sessionId: external.id, threadId: 'm-1' }]);
-  });
-
-  it('hands on a failed turn even when one owner’s hook fails', async () => {
-    const { external } = await seedAssistant();
-    const logged = vi.spyOn(log, 'error').mockImplementation(() => undefined);
-    registerTurnFailedHook('gws-ea-notices-test:explodes', async () => {
-      throw new Error('owner failed');
-    });
-    try {
-      reportTurnFailed(external, { ...EMAIL_THREAD, threadId: 'm-2' });
-
-      await drain(external, 1);
-
-      expect(handedOn).toEqual([{ sessionId: external.id, threadId: 'm-2' }]);
-      expect(logged).toHaveBeenCalledWith(
-        'Turn-failed hook failed',
-        expect.objectContaining({ hookId: 'gws-ea-notices-test:explodes' }),
-      );
-    } finally {
-      logged.mockRestore();
-    }
-  });
-
-  it('refuses a second hook under the same id', () => {
-    expect(() => registerTurnFailedHook('gws-ea-notices-test:record', async () => undefined)).toThrow(/already/);
   });
 
   it('says nothing for a turn another agent or the host started', async () => {

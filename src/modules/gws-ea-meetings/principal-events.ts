@@ -19,11 +19,20 @@
  *   them, so nobody else's answer or note changes, and only over the version
  *   of the event it read: a change that lands in between is read again and
  *   kept. A room booked on the event stays on it, and is never named a guest.
- * - Neither emails anyone, as `gog` emails no one unless told to.
+ * - `create_event` sends Google's invitation when it invites anyone but the
+ *   principal, as a human assistant's invitation reaches its guests, and
+ *   emails no one otherwise. `change_guests` sends Google's update when it
+ *   invites or takes off anyone but the principal, and emails no one when
+ *   the change is the principal's alone.
+ * - Before either puts anyone on an event, it passes the private-details
+ *   check as its guests outside the principal would see it: its title,
+ *   notes and place, the calendar's name, and every address on its guest
+ *   list but their own.
  *
  * Each request is answered once. A replayed `create_event` finds the event
- * it made, whose id derives from the request, and adds nothing when that
- * event has since been deleted.
+ * it made, whose id derives from the request, and writes nothing more: its
+ * guests heard of it from the first write, and a change made since stands.
+ * It adds nothing when that event has since been deleted.
  */
 import { TIMEZONE } from '../../config.js';
 import { forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-action.js';
@@ -32,13 +41,13 @@ import { EVENT_ID, isPrincipalCalendar, recordOwnCalendarChange } from '../gws-e
 import { getGwsEaProfile, listPrincipalAddresses } from '../gws-ea-profile/db.js';
 import { allowsMeet, type CalendarEntry, type GuestRecord, type MeetingsCalendarApi } from './calendar-api.js';
 import {
+  assertInvitationShareable,
   conferenceWords,
   dayLabel,
   eventIdFor,
   guestsOn,
-  momentLabel,
   readConference,
-  slotLabel,
+  spanLabel,
 } from './calendar-actions.js';
 import { addressesOf, flagOf, instantOf, lineOf, notesOf, timezoneOf } from './fields.js';
 
@@ -113,6 +122,14 @@ function emailOf(guest: GuestRecord): string | undefined {
   return typeof guest.email === 'string' ? guest.email.toLowerCase() : undefined;
 }
 
+/**
+ * The addresses on a guest list that someone outside the principal sees
+ * beside their own: a guest's own address tells them nothing.
+ */
+function addressesSeen(addresses: readonly string[], outside: readonly string[]): string[] {
+  return addresses.filter((address) => outside.some((guest) => guest !== address));
+}
+
 /** "a is", "a and b are". */
 function are(addresses: readonly string[]): string {
   return `${LIST.format(addresses)} ${addresses.length === 1 ? 'is' : 'are'}`;
@@ -142,6 +159,9 @@ const PRINCIPAL_WORDS: Readonly<Record<Answer, string>> = {
 interface GuestChange {
   /** The list to write back, or undefined when it already says what was asked. */
   readonly next: readonly GuestRecord[] | undefined;
+  /** Addresses the list gains, and those it loses. */
+  readonly added: readonly string[];
+  readonly removed: readonly string[];
   /** Who the event invites afterwards: neither the principal nor a room. */
   readonly invited: readonly string[];
   /** The principal's answer afterwards. */
@@ -185,6 +205,8 @@ function guestChange(
   const unchanged = adding.length === 0 && kept.length === guests.length && answered !== undefined;
   return {
     next: unchanged ? undefined : next,
+    added: adding,
+    removed: remove.filter((address) => listed.has(address)),
     // A room booked on the event stays on it as it is, but is no one invited.
     invited: next.flatMap((guest) => {
       const email = emailOf(guest);
@@ -208,8 +230,13 @@ export interface PrincipalEventToolsDeps {
 export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
   const calendar = () => deps.calendar();
 
-  /** The calendar named, refused unless it is the principal's and Google lets the assistant change it. */
-  async function principalCalendarOf(calendarId: string): Promise<CalendarEntry> {
+  /**
+   * The calendar named, refused unless it is the principal's and Google lets
+   * the assistant change it, with the principal's addresses, lowercased.
+   */
+  async function principalCalendarOf(
+    calendarId: string,
+  ): Promise<{ readonly entry: CalendarEntry; readonly principal: ReadonlySet<string> }> {
     const [entry, addresses] = await Promise.all([calendar().getCalendar(calendarId), listPrincipalAddresses()]);
     const principal = new Set(addresses.map((address) => address.email.toLowerCase()));
     if (entry === undefined || !isPrincipalCalendar(entry, principal)) {
@@ -220,7 +247,7 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
     if (entry.accessRole !== 'writer' && entry.accessRole !== 'owner') {
       throw forbidden('Google lets you see that calendar but not change it.');
     }
-    return entry;
+    return { entry, principal };
   }
 
   const createEvent: ActionAnswer = async (content, _session, requestId) => {
@@ -257,13 +284,30 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       start = new Date(from).toISOString();
       end = new Date(to).toISOString();
       // An event that ends on a later day names both days, not only the one it starts on.
-      when =
-        dayLabel(from, timezone) === dayLabel(to - 1, timezone)
-          ? slotLabel({ start: from, end: to }, timezone)
-          : `${momentLabel(from, timezone)} to ${momentLabel(to, timezone)}`;
+      when = spanLabel({ start: from, end: to }, timezone);
     }
 
-    const entry = await principalCalendarOf(calendarId);
+    const { entry, principal } = await principalCalendarOf(calendarId);
+    const attendees = guestsOn(entry.id, guests);
+    const invited = guests.filter((address) => address !== entry.id.toLowerCase());
+    // Google tells the guests only when one of them is someone other than the principal.
+    const outside = invited.filter((address) => !principal.has(address));
+    const tellsGuests = outside.length > 0;
+    await assertInvitationShareable(
+      {
+        texts: [title, notes, location],
+        shown: [
+          entry.summary,
+          ...addressesSeen(
+            attendees.map((guest) => guest.email.toLowerCase()),
+            outside,
+          ),
+        ],
+        recipients: outside,
+      },
+      'The event was not added',
+      "Write it without that detail, and do not hint at, spell out, or encode it. If it is the calendar's name or a guest's address, ask the principal how they want it done.",
+    );
     if (videoCall && !allowsMeet(entry)) {
       throw forbidden('That calendar does not allow Google Meet links: give the place in location instead.');
     }
@@ -280,16 +324,16 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
         end,
         ...(allDay ? { allDay: true } : { timeZone: timezone }),
         ...(recurrence === undefined ? {} : { recurrence }),
-        attendees: guestsOn(entry.id, guests),
+        attendees,
         transparency: free ? 'transparent' : 'opaque',
         ...(hidden ? { visibility: 'private' as const } : {}),
         reminders: 'default',
       },
-      'none',
+      tellsGuests ? 'all' : 'none',
     );
     if (inserted === 'exists') {
-      // A replay: this request made the event before. It stands unless someone has deleted it since,
-      // and an event deleted is not put back.
+      // A replay: this request made the event before, and its guests heard of it then. It stands
+      // as it is now, unless someone has deleted it since, and an event deleted is not put back.
       const made = await calendar().getEvent(entry.id, eventId);
       if (made === undefined || made.status === 'cancelled') {
         throw forbidden(
@@ -299,7 +343,6 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
     }
     recordOwnCalendarChange(entry.id, eventId);
     const conference = videoCall ? await readConference(calendar(), entry.id, eventId) : undefined;
-    const invited = guests.filter((address) => address !== entry.id.toLowerCase());
     return {
       calendar: entry.id,
       event: eventId,
@@ -308,7 +351,11 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       message: [
         `Added "${title}" to ${entry.summary ?? entry.id}: ${when}${conferenceWords(conference)}.`,
         'As on an event they made themselves, the principal is on its guest list, accepted.',
-        ...(invited.length === 0 ? [] : [`Its guests: ${invited.join(', ')}; Google emailed no one.`]),
+        ...(invited.length === 0
+          ? []
+          : [
+              `Its guests: ${invited.join(', ')}; ${tellsGuests ? 'Google sent them the invitation' : 'Google emailed no one'}.`,
+            ]),
         ...(recurrence === undefined ? [] : ['It repeats.']),
         `Change who it invites with change_guests, event ${eventId}; anything else with gog calendar update.`,
       ].join(' '),
@@ -323,7 +370,7 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
     if (add.length === 0 && remove.length === 0) {
       throw invalidArgs('Give add, remove, or both: the people to invite or to take off.');
     }
-    const entry = await principalCalendarOf(calendarId);
+    const { entry, principal } = await principalCalendarOf(calendarId);
     const owner = entry.id.toLowerCase();
     if (remove.includes(owner)) throw forbidden('The principal stays on their own events: they organize them.');
 
@@ -341,7 +388,12 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
         );
       }
 
-      const { next, invited, answer, absent, already } = guestChange(entry.id, current.guests, add, remove);
+      const { next, added, removed, invited, answer, absent, already } = guestChange(
+        entry.id,
+        current.guests,
+        add,
+        remove,
+      );
       if (next === undefined) {
         return {
           calendar: entry.id,
@@ -354,13 +406,38 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
           ].join('; ')}.`,
         };
       }
-      if ((await calendar().setGuests(entry.id, eventId, next, 'none', current.etag)) === 'set') {
+      if (added.length > 0) {
+        // Whoever it invites reads what the event already says, and everyone else on it sees who joins.
+        const outside = invited.filter((address) => !principal.has(address));
+        await assertInvitationShareable(
+          {
+            texts: [],
+            shown: [
+              current.summary,
+              current.description,
+              current.location,
+              entry.summary,
+              ...addressesSeen(
+                next.flatMap((guest) => emailOf(guest) ?? []),
+                outside,
+              ),
+            ],
+            recipients: outside,
+          },
+          'The guests were not changed',
+          "It is in what the event already says, its calendar's name, or an address on its guest list: ask the principal how they want it done.",
+        );
+      }
+      // Google tells the guests only when someone other than the principal joins or leaves.
+      const tellsGuests = [...added, ...removed].some((address) => !principal.has(address));
+      const sendUpdates = tellsGuests ? 'all' : 'none';
+      if ((await calendar().setGuests(entry.id, eventId, next, sendUpdates, current.etag)) === 'set') {
         recordOwnCalendarChange(entry.id, eventId);
         return {
           calendar: entry.id,
           event: eventId,
           guests: invited,
-          message: `Its guests now: ${invited.length === 0 ? 'nobody else' : LIST.format(invited)}, ${PRINCIPAL_WORDS[answer]}. Google emailed no one.`,
+          message: `Its guests now: ${invited.length === 0 ? 'nobody else' : LIST.format(invited)}, ${PRINCIPAL_WORDS[answer]}. ${tellsGuests ? 'Google sent the guests the update.' : 'Google emailed no one.'}`,
         };
       }
     }

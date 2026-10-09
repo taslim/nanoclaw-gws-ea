@@ -219,6 +219,7 @@ class ClaudeProvider implements AgentProvider {
           PreToolUse: [{ hooks: [preToolUseHook] }],
           PostToolUse: [{ hooks: [postToolUseHook] }],
           PostToolUseFailure: [{ hooks: [postToolUseHook] }],
+          PostToolBatch: [{ hooks: [acknowledgeHook] }],
           PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
         },
       },
@@ -253,6 +254,7 @@ SDK message (so the idle timer stays honest) and maps recognized messages to `Pr
 - `TOOL_ALLOWLIST` (Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch, Task, Skill, …) extended at the call site with a `mcp__<server>__*` pattern per registered MCP server; `SDK_DISALLOWED_TOOLS` blocks SDK builtins that collide with NanoClaw's own scheduling/interaction model (CronCreate/Delete/List, ScheduleWakeup, AskUserQuestion, Enter/ExitPlanMode, Enter/ExitWorktree)
 - **PreToolUse hook** records the current tool + its declared timeout to `container_state` (so the host sweep widens its stuck tolerance while a long Bash runs) and, as defense-in-depth, blocks any `SDK_DISALLOWED_TOOLS` call that slips through. It does **not** sanitize bash env vars — there is no such hook.
 - **PostToolUse / PostToolUseFailure** hooks clear the in-flight tool
+- **PostToolBatch** hook carries the acknowledgement reminder (`acknowledge.ts`): when a turn answers someone in a live chat (a waking `chat-sdk` row, `RoutingContext.personWaiting`) and nothing has gone out 10 seconds after the turn began, the next tool batch tells the agent once to send one line, in its own words, before more tools. The runner never writes to the person itself, and a subagent never gets the reminder. It exists because the channel shows no typing indicator; remove it once a channel offers a typing indicator or a native "working" signal.
 - **PreCompact** hook archives the transcript to `conversations/` before compaction
 - `maybeRotateContinuation` drops an oversized/aged transcript (default caps 12 MB / 14 days, both operator-overridable) so a cold container isn't killed reloading days of `.jsonl` before the host idle ceiling; `isSessionInvalid` clears a continuation whose transcript is gone
 - `additionalDirectories` for multi-directory access

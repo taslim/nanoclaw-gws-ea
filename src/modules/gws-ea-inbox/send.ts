@@ -6,6 +6,8 @@
  * ledger (thread-map.ts). A retry of the same send finds that record, and
  * asks Gmail whether it already holds the message (`findSent`): under that
  * Message-ID, or under X-Google-Original-Message-ID when Gmail replaced it.
+ * It asks before the send is checked and built again, so a check that would
+ * refuse it now never reports an email Gmail took as unsent.
  * Gmail errors back off a few seconds within one attempt, checking Gmail for
  * the message before each retry (`sendWithBackoff`); anything longer goes
  * back to the caller's own retries. Once Gmail holds it, the Message-ID
@@ -22,7 +24,7 @@ import { getGwsEaProfile } from '../gws-ea-profile/db.js';
 import { GoogleApiError, RECONCILIATION_HEADERS, type GmailApi } from './gmail-api.js';
 import { domainOf, headerValues, messageIdsOf, newMessageId, type Mailbox } from './mime.js';
 import type { InboxRuntime } from './runtime.js';
-import { findSend, insertPendingSend, recordSent, type NewSend, type SendScope } from './thread-map.js';
+import { findSend, getThread, insertPendingSend, recordSent, type NewSend, type SendScope } from './thread-map.js';
 
 /** How long to wait before each retry of a Gmail send that failed on Gmail's side. */
 const SEND_BACKOFF_MS: readonly number[] = [1_000, 3_000];
@@ -178,6 +180,12 @@ export async function sendExactlyOnce(
   const existing = await findSend(scope, key);
   // Gmail took this send, but its delivery was never recorded: answer from the record.
   if (existing?.state === 'sent') return existing.gmailMessageId;
+  // A pending send Gmail may hold already, if a stop came between Gmail taking it and its record.
+  if (existing !== undefined) {
+    const gmailThreadId = (await getThread(scope.threadKey))?.gmailThreadId ?? null;
+    const found = await findSent(runtime.gmail, existing.rfcMessageId, gmailThreadId);
+    if (found) return completeSend(runtime, existing, found, runtime.now().toISOString());
+  }
   const prepared = await prepare();
   const at = runtime.now().toISOString();
   let send: NewSend;
@@ -189,11 +197,7 @@ export async function sendExactlyOnce(
       rfcMessageId: newMessageId(domainOf(await runtime.gmailAddress())),
     };
     await insertPendingSend(send, at);
-  } else {
-    const found = await findSent(runtime.gmail, existing.rfcMessageId, prepared.gmailThreadId);
-    if (found) return completeSend(runtime, existing, found, at);
-    send = existing;
-  }
+  } else send = existing;
   const raw = await prepared.raw(send.rfcMessageId);
   return completeSend(
     runtime,

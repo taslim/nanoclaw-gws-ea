@@ -1,15 +1,13 @@
-import { getAgentGroup } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { registerMigration } from '../../db/migrations/index.js';
-import { getSession } from '../../db/sessions.js';
-import { ALLOW, DENY, defineGuardedAction, guard, HOLD, type GuardActor } from '../../guard/index.js';
+import { ALLOW, DENY, defineGuardedAction, guard, HOLD } from '../../guard/index.js';
 import { registerRequiredProjectDocSection } from '../../project-doc-sections.js';
 import { registerResource } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
 import { register } from '../../cli/registry.js';
 import type { AgentGroup } from '../../types.js';
-import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
+import { registerApprovalHandler } from '../approvals/index.js';
 // The inbox's store alone: its module entry points load external-email, whose
 // registrations must follow this module's.
 import { getInboxState } from '../gws-ea-inbox/db.js';
@@ -33,6 +31,7 @@ import {
   gwsEaPrincipalAddressesMigration,
   gwsEaProfileMigration,
 } from './migration.js';
+import { guardActor, requestPrincipalConfirmation } from './principal-confirmation.js';
 import './wiring-policy.js';
 
 registerMigration(gwsEaProfileMigration);
@@ -255,27 +254,12 @@ const addPrincipalAddressAction = defineGuardedAction({
   },
 });
 
-function actorOf(ctx: CallerContext): GuardActor {
-  return ctx.caller === 'host'
-    ? { kind: 'host' }
-    : { kind: 'agent', agentGroupId: ctx.agentGroupId, sessionId: ctx.sessionId };
-}
-
 async function requestAddAddressCard(ctx: CallerContext, email: string, approverUserId: string | undefined) {
-  if (ctx.caller !== 'agent' || approverUserId === undefined) {
-    throw new Error("Only an agent's new address is held for the principal");
-  }
-  const session = await getSession(ctx.sessionId);
-  if (!session) throw new Error('Session not found');
-  const agentName = (await getAgentGroup(ctx.agentGroupId))?.name ?? ctx.agentGroupId;
-  await requestApproval({
-    session,
-    agentName,
+  await requestPrincipalConfirmation(ctx, approverUserId, {
     action: ADD_ADDRESS_APPROVAL,
     payload: addAddressPayload(email),
     title: 'Add one of your email addresses?',
-    question: `${agentName} asks to record ${email} as one of your email addresses. Mail the assistant receives from your addresses is treated as yours, with your authority, so approve only if this address is yours.`,
-    approverUserId,
+    asks: `to record ${email} as one of your email addresses. Mail the assistant receives from your addresses is treated as yours, with your authority, so approve only if this address is yours.`,
   });
   return {
     email,
@@ -319,7 +303,10 @@ async function addAddress(args: Record<string, unknown>, ctx: CallerContext) {
   await assertMayChangePrincipalAddresses(ctx);
   const { email, held } = await proposedPrincipalAddress(emailArgument(args));
   if (held) return { email, added: false };
-  const decision = await guard(addPrincipalAddressAction, { actor: actorOf(ctx), payload: addAddressPayload(email) });
+  const decision = await guard(addPrincipalAddressAction, {
+    actor: guardActor(ctx),
+    payload: addAddressPayload(email),
+  });
   switch (decision.effect) {
     case 'allow':
       return addPrincipalAddress(email);

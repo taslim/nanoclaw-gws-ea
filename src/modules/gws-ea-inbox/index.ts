@@ -26,7 +26,6 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import { registerChannelAdapter } from '../../channels/channel-registry.js';
 import { register } from '../../cli/registry.js';
-import { isContainerRunning, killContainer } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { deleteSession, getSessionsByAgentGroup, updateSession } from '../../db/sessions.js';
@@ -42,22 +41,19 @@ import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
 import { identityMatchKey } from '../../gws-ea/validation.js';
 import { registerPersonForgetHook } from '../gws-ea-people/index.js';
-import { releaseThreadHolds } from '../gws-ea-meetings/index.js';
-import {
-  gwsEaMeetingsCalendarActionsMigration,
-  gwsEaMeetingsMigration,
-  gwsEaMeetingsRoomsMigration,
-} from '../gws-ea-meetings/migration.js';
-import { deleteThreadRecord, registerRecipientResolver } from '../gws-ea-privacy/index.js';
+import { registerRecipientResolver } from '../gws-ea-privacy/index.js';
 import { getMainAgentGroupId, syncPrincipalMembers } from '../gws-ea-profile/db.js';
 import { registerRoleGrantPolicy } from '../permissions/db/user-roles.js';
 import { registerInboundDelay } from '../../router.js';
 import { createInbox, EMAIL_CHANNEL_DEFAULTS, type Inbox } from './adapter.js';
 import { createCalendarListApi } from './calendar-notifications.js';
 import { createGmailApi } from './gmail-api.js';
-import { gwsEaInboxEmailChannelMigration } from './migration-email-channel.js';
-import { gwsEaInboxMigration } from './migration.js';
-import { EMAIL_SEND_ACTION, EMAIL_SEND_GUARD, emailSendHandler, outsideRecipients } from './outbound.js';
+import {
+  gwsEaInboxDropThreadHoldsMigration,
+  gwsEaInboxEmailChannelMigration,
+  gwsEaInboxMigration,
+} from './migration.js';
+import { EMAIL_SEND_ACTION, EMAIL_SEND_GUARD, emailSendHandler } from './outbound.js';
 import { paceDeadline } from './pace.js';
 import { principalRecipients } from './principal-reply.js';
 import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID } from './runtime.js';
@@ -65,14 +61,10 @@ import { emailWords, sendKey } from './send.js';
 import { deleteSends, deleteThreadAddresses, threadsWithAddresses, type SendScope } from './thread-map.js';
 import { ensureInbox, ensurePrincipalConversation } from './wiring-policy.js';
 
-// The inbox registers the meetings store too, unchanged, so the email channel's
-// migration, which moves an earlier release's threads and holds into its own
-// records, runs after every inbox and meetings table exists (KTD10).
+// The inbox's own state, then its thread map (migration.ts).
 registerMigration(gwsEaInboxMigration);
-registerMigration(gwsEaMeetingsMigration);
-registerMigration(gwsEaMeetingsCalendarActionsMigration);
-registerMigration(gwsEaMeetingsRoomsMigration);
 registerMigration(gwsEaInboxEmailChannelMigration);
+registerMigration(gwsEaInboxDropThreadHoldsMigration);
 
 /** How often the inbox polls Gmail. */
 const POLL_INTERVAL_MS = 60_000;
@@ -96,8 +88,11 @@ registerChannelAdapter(EMAIL_CHANNEL_TYPE, {
   defaults: EMAIL_CHANNEL_DEFAULTS,
 });
 
+// Email to the principal is theirs when it goes only to their address. The
+// privacy guard leaves email to the inbox's outside threads to `sendToOutside`,
+// which checks it as it is built; any other email address reaches no one.
 registerRecipientResolver(EMAIL_CHANNEL_TYPE, (send) =>
-  send.platformId === PRINCIPAL_PLATFORM_ID ? principalRecipients(send) : outsideRecipients(send),
+  send.platformId === PRINCIPAL_PLATFORM_ID ? principalRecipients(send) : [],
 );
 
 registerDeliveryAction(EMAIL_SEND_ACTION, emailSendHandler, EMAIL_SEND_GUARD);
@@ -149,24 +144,19 @@ registerDeliveryFailedHook(async (failed) => {
   for (const msg of failed) await forgetSend(msg, 'pending');
 });
 
-/** Remove a session and everything it holds, once its container is gone. */
+/**
+ * Remove a session and everything it holds. A container still running for it
+ * is the host's orphan sweep to stop (`stopOrphanedSessions`), within a sweep
+ * of the session's row going.
+ */
 async function purgeSession(sessionId: string, agentGroupId: string): Promise<void> {
   await updateSession(sessionId, { status: 'closed' });
-  if (isContainerRunning(sessionId)) {
-    await new Promise<void>((resolve) => {
-      const bound = setTimeout(resolve, 30_000);
-      killContainer(sessionId, 'a person in its thread was forgotten', () => {
-        clearTimeout(bound);
-        resolve();
-      });
-    });
-  }
   await destroySessionMailbox(agentGroupId, sessionId);
   fs.rmSync(sessionDir(agentGroupId, sessionId), { recursive: true, force: true });
   await deleteSession(sessionId);
 }
 
-/** Remove the `external-email` sessions of these threads, and the privacy check's record of each. */
+/** Remove the `external-email` sessions of these threads. */
 async function purgeThreadSessions(threadKeys: readonly string[]): Promise<void> {
   const externalEmail = await getExternalEmailAgentGroupId();
   const threads = new Set(threadKeys);
@@ -175,15 +165,10 @@ async function purgeThreadSessions(threadKeys: readonly string[]): Promise<void>
       if (session.thread_id !== null && threads.has(session.thread_id)) await purgeSession(session.id, externalEmail);
     }
   }
-  for (const threadKey of threadKeys) {
-    await deleteThreadRecord({ channelType: EMAIL_CHANNEL_TYPE, platformId: INBOX_PLATFORM_ID, threadId: threadKey });
-  }
 }
 
-// A forgotten person leaves nothing of theirs on the threads they were on, in this order: the threads'
-// holds first, while their records still find each event, so one that cannot go yet stops the forget
-// to be tried again; then those threads' external-email sessions and privacy records; then the person's
-// addresses on every thread, and their hourly counts.
+// A forgotten person leaves nothing of theirs on the threads they were on, in this order: those threads'
+// external-email sessions, then the person's addresses on every thread, and their hourly counts.
 registerPersonForgetHook('gws-ea-inbox:purge', async ({ handles }) => {
   const db = getDb();
   if (!(await db.hasTable('gws_ea_threads'))) return;
@@ -193,7 +178,6 @@ registerPersonForgetHook('gws-ea-inbox:purge', async ({ handles }) => {
   if (forgotten.size === 0) return;
   const isForgotten = (address: string) => forgotten.has(identityMatchKey(`email:${address}`));
   const { threadKeys, addresses } = await threadsWithAddresses(isForgotten);
-  for (const threadKey of threadKeys) await releaseThreadHolds(threadKey);
   await purgeThreadSessions(threadKeys);
   await db.transaction(async () => {
     await deleteThreadAddresses(addresses);

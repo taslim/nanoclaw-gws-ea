@@ -8,10 +8,6 @@
 import { randomBytes } from 'node:crypto';
 
 const SOURCE = 'gmail';
-// The agent runner neutralizes the same markers and tokens in the calendar
-// text it wraps (`sanitizeUntrusted` in
-// container/agent-runner/src/mcp-tools/calendar-facts.ts). The two runtimes
-// share no code, so a token added to one list is added to both.
 const MARKER = /<<<\s*(?:END[\s_]+)?EXTERNAL[\s_]+UNTRUSTED[\s_]+CONTENT(?:\s+[^>]*)?\s*>>>/giu;
 const SPECIAL_TOKENS = [
   '<|im_start|>',
@@ -63,14 +59,14 @@ function cap(text: string, limit: number): string {
         .trimEnd()}…`;
 }
 
-/** `text`, capped at `limit` characters and wrapped in untrusted markers under a fresh id. */
-export function untrusted(text: string, limit: number): string {
+/** `text`, capped at `limit` characters and wrapped in untrusted markers under a fresh id, naming where it came from. */
+export function untrusted(text: string, limit: number, source = SOURCE): string {
   const body = cap(sanitize(text.replace(/\r\n?/gu, '\n')).trim(), limit);
   const id = randomBytes(8).toString('hex');
-  return `<<<EXTERNAL_UNTRUSTED_CONTENT id="${id}">>>\nSource: ${SOURCE}\n---\n${body}\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id="${id}">>>`;
+  return `<<<EXTERNAL_UNTRUSTED_CONTENT id="${id}">>>\nSource: ${source}\n---\n${body}\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id="${id}">>>`;
 }
 
 /** One line of someone else's text (a name, a subject), wrapped the same way. */
-export function untrustedLine(text: string, limit: number): string {
-  return untrusted(text.replace(/\s+/gu, ' '), limit);
+export function untrustedLine(text: string, limit: number, source = SOURCE): string {
+  return untrusted(text.replace(/\s+/gu, ' '), limit, source);
 }

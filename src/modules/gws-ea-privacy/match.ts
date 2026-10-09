@@ -1,25 +1,33 @@
 /**
- * Private-value matching (KTD7).
+ * Private-value matching (KTD7): exact and explainable.
  *
- * Every text is reduced to one canonical stream before it is compared, so a
- * private value matches however it is written:
+ * A text and a value are read the same way, so a value matches however it is
+ * formatted:
  *
- *   - percent-encoding is decoded, twice-encoded text included;
+ *   - percent-encoding is decoded, twice-encoded text included, so a value in
+ *     a link's address is read as its reader's browser reads it;
  *   - Unicode is folded by compatibility (NFKC's mapping, so full-width and
- *     mathematical letters read as plain ones), diacritics are stripped, and
- *     zero-width and other invisible characters are removed;
- *   - lookalike letters from other scripts are folded to the Latin letter
- *     they pass for, and every script's decimal digits to 0-9;
- *   - case, whitespace, and punctuation are ignored: only letters and digits
- *     remain, run together;
+ *     mathematical letters read as plain ones), diacritics are stripped,
+ *     zero-width and other invisible characters are removed, and Latin
+ *     letters that do not decompose (ø, ł, ß, æ) read as their plain
+ *     spellings;
+ *   - every script's decimal digits read as 0-9;
+ *   - case and punctuation are ignored, and the text is read as its words:
+ *     runs of letters or of digits;
  *   - common street-suffix and direction words are equated (Street and St,
- *     North and N), and unit words (Apt, Suite) are dropped;
- *   - a phone number is compared as a digit stream, on its trailing seven
- *     digits, so a country code, trunk prefix, or grouping changes nothing.
+ *     North and N), and unit words (Apt, Suite) are dropped.
  *
- * Matching is a substring test on the canonical stream: a match ignores word
- * boundaries, which errs toward refusing. A value spelled out in words or
- * deliberately encoded some other way remains a known residual.
+ * An address, an email address, or another value matches where its words
+ * appear whole and in order, so "Theo" is found in "Theo's recital" but not
+ * in "the other day", and "12 Elm Rd" not in "112 Elm Rd". A phone number
+ * matches on its trailing seven digits within one phone-like run of digits
+ * and phone punctuation, so a country code, trunk prefix, or grouping changes
+ * nothing, and the digits of a date, a time, or a price never complete it.
+ *
+ * A value spelled out in words, written in another script's lookalike
+ * letters, or deliberately encoded some other way is a known residual: only
+ * an agent holding the value can encode it, and the one that does (main) has
+ * other ways to the web; external-email never holds one.
  */
 import { EMAIL_PATTERN } from '../../gws-ea/validation.js';
 
@@ -28,9 +36,9 @@ export type PrivateValueKind = (typeof PRIVATE_VALUE_KINDS)[number];
 
 /** Raw value length the store accepts. */
 const MAX_VALUE_LENGTH = 200;
-/** Shorter canonical text would match inside ordinary words. */
+/** Shorter canonical text is too common to check reliably. */
 const MIN_PATTERN_LENGTH = 4;
-/** The longest canonical text a value may reduce to; bounds the thread history. */
+/** The longest canonical text a value may reduce to. */
 const MAX_PATTERN_LENGTH = 256;
 /** An address's first line is matched on its own only when it says this much. */
 const MIN_STREET_LINE_LENGTH = 6;
@@ -40,29 +48,22 @@ const PHONE_MAX_DIGITS = 15;
 const PHONE_MATCH_DIGITS = 7;
 const MAX_DECODE_ROUNDS = 3;
 
-/** Earlier text a send is checked with: enough to complete the longest value. */
-export const HISTORY_TEXT_LENGTH = MAX_PATTERN_LENGTH - 1;
-/** Earlier digits a send is checked with: enough to complete a phone number. */
-export const HISTORY_DIGIT_LENGTH = PHONE_MATCH_DIGITS - 1;
-
-/** A send, or a run of sends, reduced for matching. */
+/** A text reduced for matching. */
 export interface TextStream {
-  /** Canonical letters and digits. */
-  readonly text: string;
-  /** The digits of `text`, in order. */
-  readonly digits: string;
+  /** Its canonical words, in order, each followed by a space. */
+  readonly words: string;
+  /** The digits of each phone-like run in it. */
+  readonly phoneRuns: readonly string[];
 }
 
 /** What a stored value matches. */
 export interface CompiledPrivateValue {
   readonly kind: PrivateValueKind;
-  /** Canonical texts; any one of them found in a send matches. */
-  readonly texts: readonly string[];
-  /** For a phone number, the trailing digits found in any format. */
+  /** Canonical word sequences, in the form of `TextStream.words`; any one found whole in a text matches. */
+  readonly words: readonly string[];
+  /** For a phone number, the trailing digits found within one phone-like run. */
   readonly digits: string | null;
 }
-
-const EMPTY_STREAM: TextStream = { text: '', digits: '' };
 
 // ---------------------------------------------------------------------------
 // Character folding
@@ -74,47 +75,34 @@ const PERCENT_RUN = /(?:%[0-9a-f]{2})+/giu;
 const DECIMAL_DIGIT = /\p{Nd}/u;
 const NON_ASCII_DIGIT = /(?![0-9])\p{Nd}/gu;
 const NON_DIGIT = /[^0-9]/gu;
-const TOKEN_SEPARATOR = /[^\p{L}\p{N}]+/u;
+const NOT_WORD = /[^\p{L}\p{N}]+/u;
+/** Where a run of letters meets a run of digits: "12Elm" reads as "12 Elm", as "5B" as "5 B". */
+const LETTER_DIGIT_BOUNDARY = /(?<=\p{N})(?=\p{L})|(?<=\p{L})(?=\p{N})/u;
 const ADDRESS_PART_SEPARATOR = /[,;]/u;
-
-/** Pair each character of `from` with the character of `to` at the same position. */
-function pairs(from: string, to: string): [string, string][] {
-  const sources = [...from];
-  const targets = [...to];
-  if (sources.length !== targets.length) throw new Error('Lookalike table is misaligned');
-  return sources.map((source, index) => [source, targets[index]]);
-}
-
 /**
- * Letters that pass for Latin ones, each with the text it reads as. Letters
- * with a canonical decomposition (accented forms) need no entry: their marks
- * are stripped first.
+ * A run of digits joined only by phone punctuation (dashes, dots, slashes,
+ * brackets, a plus) or by spaces before more digits: one written number,
+ * however it is grouped. A line break, a letter, or a colon ends it.
  */
-const LOOKALIKES: ReadonlyMap<string, string> = new Map([
-  // Cyrillic: А а В в Е е К к М м Н н О о Р р С с Т т У у Х х Ѕ ѕ І і Ј ј
-  // Ԁ ԁ Ԍ ԍ Ԛ ԛ Ԝ ԝ Ӏ ӏ Һ һ Ү ү Ѵ ѵ Ь ь г п
-  ...pairs(
-    'АаВвЕеКкМмНнОоРр' + 'СсТтУуХхЅѕІіЈј' + 'ԀԁԌԍԚԛԜԝӀӏҺһҮүѴѵ' + 'Ььгп',
-    'AaBbEeKkMmHhOoPpCcTtYyXxSsIiJjDdGgQqWwIlHhYyVvbbrn',
-  ),
-  // Greek: Α α Β β Ε ε Ζ Η η Ι ι Κ κ Μ Ν ν Ο ο Ρ ρ Τ τ Υ υ Χ χ γ ϳ
-  ...pairs('ΑαΒβΕεΖΗηΙιΚκΜΝν' + 'ΟοΡρΤτΥυΧχγϳ', 'AaBbEeZHnIiKkMNvOoPpTtYuXxyj'),
-  // Latin letters with a stroke or other shape that does not decompose:
-  // ø Ø đ Đ ł Ł ħ Ħ ı ŧ Ŧ ɑ ɡ ɩ
-  ...pairs('øØđĐłŁħĦıŧŦɑɡɩ', 'oOdDlLhHitTagi'),
-  // ß ẞ æ Æ œ Œ
+const PHONE_RUN = /[+(]*\d(?:[\d()./\u2010-\u2015-]|[ \t]+(?=[+(]*\d))*/gu;
+
+/** Latin letters with no decomposition, as people also write them: Søndergade, Łódź, Straße. */
+const LATIN_VARIANTS: ReadonlyMap<string, string> = new Map([
+  ['ø', 'o'],
+  ['đ', 'd'],
+  ['ł', 'l'],
+  ['ħ', 'h'],
+  ['ı', 'i'],
+  ['ŧ', 't'],
   ['ß', 'ss'],
-  ['ẞ', 'ss'],
   ['æ', 'ae'],
-  ['Æ', 'ae'],
   ['œ', 'oe'],
-  ['Œ', 'oe'],
 ]);
 
-function foldLookalikes(text: string): string {
-  let folded = '';
-  for (const character of text) folded += LOOKALIKES.get(character) ?? character;
-  return folded;
+function plainLatin(text: string): string {
+  let plain = '';
+  for (const character of text) plain += LATIN_VARIANTS.get(character) ?? character;
+  return plain;
 }
 
 const utf8 = new TextDecoder('utf-8');
@@ -162,8 +150,7 @@ function visible(text: string): string {
 
 function foldText(text: string): string {
   const decoded = visible(decodePercentEncoding(visible(text)));
-  const folded = foldLookalikes(foldLookalikes(decoded).toLowerCase().normalize('NFKD').replace(MARK, ''));
-  return folded.replace(NON_ASCII_DIGIT, asciiDigit);
+  return plainLatin(decoded.toLowerCase().normalize('NFKD').replace(MARK, '')).replace(NON_ASCII_DIGIT, asciiDigit);
 }
 
 // ---------------------------------------------------------------------------
@@ -211,19 +198,36 @@ function canonicalWord(word: string): string {
   return DROPPED_WORDS.has(word) ? '' : (STREET_WORDS.get(word) ?? word);
 }
 
-/** `text` reduced to its canonical letters and digits. */
+/** `text`'s canonical words, in order. */
+function canonicalWords(folded: string): string[] {
+  return folded
+    .split(NOT_WORD)
+    .flatMap((word) => word.split(LETTER_DIGIT_BOUNDARY))
+    .map(canonicalWord)
+    .filter((word) => word !== '');
+}
+
+/** `text` reduced to its canonical letters and digits, run together. */
 export function canonicalText(text: string): string {
-  return foldText(text).split(TOKEN_SEPARATOR).map(canonicalWord).join('');
+  return canonicalWords(foldText(text)).join('');
 }
 
-function digitsOf(canonical: string): string {
-  return canonical.replace(NON_DIGIT, '');
+/** Words in the form `TextStream.words` holds them: each followed by a space, so a match never starts or ends inside one. */
+function wordStream(words: readonly string[]): string {
+  return words.map((word) => `${word} `).join('');
 }
 
-/** The parts of one send (or of one set of fields), read in order as a single stream. */
+/**
+ * The parts of one send (or of one set of fields), read in order as one
+ * text: a value split across fields is found, while a phone-like run never
+ * continues from one part into the next.
+ */
 export function streamOf(parts: readonly string[]): TextStream {
-  const text = parts.map(canonicalText).join('');
-  return { text, digits: digitsOf(text) };
+  const folded = parts.map(foldText);
+  return {
+    words: wordStream(folded.flatMap(canonicalWords)),
+    phoneRuns: folded.flatMap((part) => [...part.matchAll(PHONE_RUN)].map((run) => run[0].replace(NON_DIGIT, ''))),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -238,7 +242,7 @@ export function uncheckableReason(kind: PrivateValueKind, value: string): string
   const canonical = canonicalText(value);
   if (canonical.length > MAX_PATTERN_LENGTH) return 'A private value is too long to check';
   if (kind === 'phone') {
-    const count = digitsOf(canonical).length;
+    const count = canonical.replace(NON_DIGIT, '').length;
     return count >= PHONE_MIN_DIGITS && count <= PHONE_MAX_DIGITS
       ? undefined
       : `A phone value needs ${PHONE_MIN_DIGITS} to ${PHONE_MAX_DIGITS} digits`;
@@ -251,21 +255,20 @@ export function uncheckableReason(kind: PrivateValueKind, value: string): string
 
 /** What a stored value matches. Never throws: a stored value is matched however it reads. */
 export function compilePrivateValue(kind: PrivateValueKind, value: string): CompiledPrivateValue {
-  const canonical = canonicalText(value);
+  const words = canonicalWords(foldText(value));
   switch (kind) {
     case 'phone':
-      return { kind, texts: [], digits: digitsOf(canonical).slice(-PHONE_MATCH_DIGITS) };
+      return { kind, words: [], digits: words.join('').replace(NON_DIGIT, '').slice(-PHONE_MATCH_DIGITS) };
     case 'address': {
       // The street line alone gives the address away, so it matches without the town.
       const [firstPart = ''] = value.normalize('NFKD').split(ADDRESS_PART_SEPARATOR);
-      const streetLine = canonicalText(firstPart);
-      const texts =
-        streetLine.length >= MIN_STREET_LINE_LENGTH && streetLine !== canonical ? [canonical, streetLine] : [canonical];
-      return { kind, texts, digits: null };
+      const streetLine = canonicalWords(foldText(firstPart));
+      const alone = streetLine.join('').length >= MIN_STREET_LINE_LENGTH && streetLine.length < words.length;
+      return { kind, words: alone ? [wordStream(words), wordStream(streetLine)] : [wordStream(words)], digits: null };
     }
     case 'email':
     case 'other':
-      return { kind, texts: [canonical], digits: null };
+      return { kind, words: [wordStream(words)], digits: null };
     default: {
       const unreachable: never = kind;
       throw new Error(`Unknown private value kind: ${String(unreachable)}`);
@@ -273,26 +276,14 @@ export function compilePrivateValue(kind: PrivateValueKind, value: string): Comp
   }
 }
 
-/** True when `pattern` occurs in `earlier` followed by `current`, and reaches into `current`. */
-function occursIn(pattern: string, earlier: string, current: string): boolean {
-  if (pattern === '') return false;
-  const carried = earlier.slice(Math.max(0, earlier.length - (pattern.length - 1)));
-  return (carried + current).includes(pattern);
-}
-
-/**
- * The first value `current` gives away, read after `history` (the thread's
- * earlier outbound text), so a value split across sends is found. A value
- * wholly inside `history` is not `current`'s doing and does not match.
- */
+/** The first value `text` gives away. */
 export function findPrivateValue(
   values: readonly CompiledPrivateValue[],
-  current: TextStream,
-  history: TextStream = EMPTY_STREAM,
+  text: TextStream,
 ): CompiledPrivateValue | undefined {
-  return values.find(
-    (value) =>
-      value.texts.some((pattern) => occursIn(pattern, history.text, current.text)) ||
-      (value.digits !== null && occursIn(value.digits, history.digits, current.digits)),
-  );
+  const words = ` ${text.words}`;
+  return values.find(({ words: patterns, digits }) => {
+    if (patterns.some((pattern) => pattern !== '' && words.includes(` ${pattern}`))) return true;
+    return digits !== null && digits !== '' && text.phoneRuns.some((run) => run.includes(digits));
+  });
 }

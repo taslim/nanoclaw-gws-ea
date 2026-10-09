@@ -1,7 +1,7 @@
 /**
  * The thread map (KTD2): every email thread the assistant is part of, by a
  * stable key in the `mail-…` format that exists before Gmail has a thread.
- * Its tables are described in migration-email-channel.ts.
+ * Its tables are described in migration.ts.
  *
  * - A thread maps to its Gmail thread once there is one: the thread of the
  *   message that opened it, or of the first send in a thread `main` handed

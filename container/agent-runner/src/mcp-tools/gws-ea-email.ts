@@ -11,8 +11,8 @@
  * - `external-email` (capability `gws-ea-email-external`) writes in its own
  *   thread with `email_send`, tells main what main should know with
  *   `tell_main`, and schedules on the principal's calendar with `free_time`,
- *   `hold`, `book`, `change_booking` and `cancel_booking`, each bound by the
- *   host to the thread whose session calls it.
+ *   `book`, `change_booking` and `cancel_booking`, each bound by the host to
+ *   the thread whose session calls it.
  *
  * Both send the host's one `email_send` action, which answers each caller by
  * its own rules; each agent's tool has only the fields and limits that are its.
@@ -158,35 +158,24 @@ export const tellMain = requestTool({
   repeatable: false,
 });
 
+/** The other side's zone: an answer then gives each time in it too, ready to write. */
+const THEIR_ZONE = {
+  type: 'string',
+  description: "The other side's time zone, such as Europe/Berlin, when you know it: the answer gives times in it too.",
+} as const;
+
 export const freeTime = requestTool({
   ...common,
   name: 'free_time',
   description:
-    "The principal's free start times between from and to for a meeting of minutes: up to eight, spread out, in date order, never in protected time. Each shows the principal's time, the other side's when you give timezone, and how it fits the principal's preferences. Their calendar itself stays hidden.",
+    "The principal's free windows between from and to for a meeting of minutes, in date order: any start that ends by a window's end is free. Each shows the principal's time, the other side's when you give timezone (their night left out), and how it fits the principal's preferences. You pick the times.",
   properties: {
     from: { type: 'string', description: `The earliest start. ${DATE_TIME}` },
     to: { type: 'string', description: `When the meeting must be over. ${DATE_TIME}` },
     minutes: MINUTES,
-    timezone: {
-      type: 'string',
-      description:
-        "The other side's time zone, such as Europe/Berlin, when you know it: times in their night are left out.",
-    },
+    timezone: THEIR_ZONE,
   },
   required: ['from', 'to', 'minutes'],
-  repeatable: true,
-});
-
-export const hold = requestTool({
-  ...common,
-  name: 'hold',
-  description:
-    "Hold up to three start times on the principal's calendar while someone chooses, replacing what this thread held; an empty list releases them all. A hold lapses three days after it was last held. A time that is protected or no longer free is refused, and nothing changes.",
-  properties: {
-    starts: { type: 'array', items: { type: 'string' }, description: `The start times you offer. ${DATE_TIME}` },
-    minutes: MINUTES,
-  },
-  required: ['starts'],
   repeatable: true,
 });
 
@@ -194,7 +183,7 @@ export const book = requestTool({
   ...common,
   name: 'book',
   description:
-    "Book an agreed time as a new event on the principal's calendar, inviting everyone in the conversation but the principal, or the invitees you name from the thread. Google sends the invitation; this thread's holds are released, and main hears. A time that is protected or no longer free is refused. Answers with the booking id.",
+    "Book an agreed time as a new event on the principal's calendar, inviting everyone in the conversation but the principal, or the invitees you name from the thread. Google sends the invitation, and main hears. A time no longer free is refused. Answers with the booking id.",
   properties: {
     start: { type: 'string', description: `When it starts. ${DATE_TIME}` },
     minutes: MINUTES,
@@ -206,6 +195,7 @@ export const book = requestTool({
       ...ADDRESSES,
       description: 'Who to invite, each on the thread, in place of everyone in the conversation.',
     },
+    timezone: THEIR_ZONE,
   },
   required: ['start', 'minutes', 'title'],
   repeatable: false,
@@ -215,7 +205,7 @@ export const changeBooking = requestTool({
   ...common,
   name: 'change_booking',
   description:
-    'Change a booking this thread made: its time, length, title, location, notes, or a Google Meet link. Give only what changes. A new time that is protected or no longer free is refused. Google sends the invitees the update, and main hears.',
+    'Change a booking this thread made: its time, length, title, location, notes, or a Google Meet link. Give only what changes. A new time no longer free is refused. Google sends the invitees the update, and main hears.',
   properties: {
     booking: BOOKING,
     start: { type: 'string', description: `The new start. ${DATE_TIME}` },
@@ -224,6 +214,7 @@ export const changeBooking = requestTool({
     location: { type: 'string', description: 'The new place: an address, a phone number, or their own link.' },
     notes: { type: 'string', description: 'The new notes the invitees read in the invitation.' },
     video_call: { type: 'boolean', description: 'true to add a Google Meet link.' },
+    timezone: THEIR_ZONE,
   },
   required: ['booking'],
   repeatable: true,
@@ -233,10 +224,10 @@ export const cancelBooking = requestTool({
   ...common,
   name: 'cancel_booking',
   description: 'Cancel a booking this thread made. Google sends the invitees the cancellation, and main hears.',
-  properties: { booking: BOOKING },
+  properties: { booking: BOOKING, timezone: THEIR_ZONE },
   required: ['booking'],
   repeatable: true,
 });
 
 registerTools([emailHandoff, emailToPrincipal], MAIN_CAPABILITY);
-registerTools([emailSend, tellMain, freeTime, hold, book, changeBooking, cancelBooking], EXTERNAL_CAPABILITY);
+registerTools([emailSend, tellMain, freeTime, book, changeBooking, cancelBooking], EXTERNAL_CAPABILITY);

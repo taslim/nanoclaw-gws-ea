@@ -102,7 +102,7 @@ describe("main's template against NanoClaw's own stamp", () => {
 
   it("leaves the persona the principal's instructions go into out of the comparison, so updates keep coming", async () => {
     const main = await stamped();
-    writeFileSync(path.join(main.folder, 'instructions.prepend.md'), 'Call me Tas.\n');
+    writeFileSync(path.join(main.folder, 'instructions.prepend.md'), 'Call me Morgan.\n');
 
     expect(await inspectMainFolder(main.folder, TEMPLATE)).toEqual({ kind: 'stamped', customized: [] });
     appendFileSync(path.join(TEMPLATE, 'skills', 'welcome', 'SKILL.md'), '\nKeep it to one message.\n');
@@ -110,7 +110,7 @@ describe("main's template against NanoClaw's own stamp", () => {
 
     await restampAgentFromTemplate('gws-ea/main', main.id, { apply: true });
 
-    expect(readFileSync(path.join(main.folder, 'instructions.prepend.md'), 'utf8')).toBe('Call me Tas.\n');
+    expect(readFileSync(path.join(main.folder, 'instructions.prepend.md'), 'utf8')).toBe('Call me Morgan.\n');
   });
 
   it('removes the persona and procedure an earlier release stamped, unless they were changed', async () => {

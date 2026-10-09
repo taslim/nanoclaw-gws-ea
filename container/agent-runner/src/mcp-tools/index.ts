@@ -18,10 +18,8 @@ await loadToolModule('interactive', () => import('./interactive.js'));
 await loadToolModule('agents', () => import('./agents.js'));
 await loadToolModule('self-mod', () => import('./self-mod.js'));
 await loadToolModule('time', () => import('./time.js'));
-await loadToolModule('schedule-stats', () => import('./schedule-stats.js'));
-await loadToolModule('calendar-facts', () => import('./calendar-facts.js'));
 // The email tools name their own two keys, one for each agent, and
-// request_status, the reminders and main's calendar writes their own: their
+// request_status, the reminders and main's calendar tools their own: their
 // tests load them ahead of this barrel.
 await import('./gws-ea-email.js');
 await import('./reminders.js');

@@ -34,7 +34,7 @@ const TICK_MS = 60_000;
 
 const CAPABILITY_DESCRIPTIONS: Readonly<Record<AgentGoogleServiceId, string>> = {
   calendar:
-    "Google Calendar as the assistant: the gcalendar skill, the assistant's Calendar token, and create_event and change_guests",
+    "Google Calendar as the assistant: the gcalendar skill, the assistant's Calendar token, create_event and change_guests, and the host's find_conflicts and people_stats",
   'gmail-read': "the assistant's Gmail, read-only: the gmail skill and a gmail.readonly token",
   directory: 'the Workspace directory, read-only: the gpeople skill and a directory.readonly token',
 };
@@ -45,7 +45,7 @@ const CAPABILITY_DESCRIPTIONS: Readonly<Record<AgentGoogleServiceId, string>> = 
  * its children). Its skill teaches these and nothing else. `main` writes the
  * principal's calendars and answers their invitations itself (Key
  * Decisions), reads mail without changing it, and only searches the
- * directory. Overlaps go through `find_conflicts`, so `calendar.conflicts` is
+ * directory. Overlaps go through the host's `find_conflicts`, so `calendar.conflicts` is
  * off. gog cannot list the principal as an accepted guest, so events are
  * created through the host's `create_event` and `calendar.create` is off.
  */

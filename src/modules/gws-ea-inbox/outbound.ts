@@ -20,12 +20,21 @@
  * - A file goes only when `main` handed it over for this thread: its SHA-256
  *   must be recorded with the thread, and the host's copy is what is sent.
  *
- * The private-values guard reads every send before the adapter does, for
- * every address it reaches (`outsideRecipients`), and checks what the
- * assistant wrote: its words, subject, and link targets. The send then goes
- * to the people that check saw. The quote is added after the check, because
- * it shows its readers a message they received; anyone named who did not
- * receive it sees the quote only when it carries no private value for them.
+ * The private-values check runs here, as the email is built, on the email
+ * that goes and the people it goes to; the privacy module's outbound guard
+ * leaves these sends to it. What the assistant wrote is checked for everyone
+ * the email reaches: its words as written and as both parts show them, its
+ * link targets, its subject, the addresses it names, and the host's copies of
+ * the files that go. What a reply carries over from the message it answers
+ * (its subject, its people, and the quote under its attribution) shows its
+ * readers what they already received, so it is checked only for anyone new
+ * to the thread (`carriedOver`): the quote goes without them when it would
+ * show them a private value, and the email does not go at all when its
+ * subject or people would.
+ *
+ * A send Gmail already took is answered from Gmail before anything is
+ * checked again (send.ts), so a check that would refuse it now never reports
+ * a sent email as unsent.
  *
  * For `main`, `email_send` writes to the principal in the thread it names,
  * by the rules of its replies there (principal-reply.ts): only to the address
@@ -41,6 +50,7 @@
  * `files` names the files the tool staged in the request's outbox. A replay
  * of a request sends nothing twice: its send is keyed by the request.
  */
+import { isUtf8 } from 'node:buffer';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
@@ -53,19 +63,18 @@ import {
   type ActionAnswer,
 } from '../../cli/delivery-action.js';
 import { getSession } from '../../db/sessions.js';
-import { getDeliveryAdapter, OutboundRefusedError, type OutboundSend } from '../../delivery.js';
+import { getDeliveryAdapter, OutboundRefusedError } from '../../delivery.js';
 import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { readOutboxFiles } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { getExternalEmailAgentGroupId } from '../gws-ea-external-email/index.js';
-import { audienceForAddresses, checkOutbound } from '../gws-ea-privacy/index.js';
+import { audienceForAddresses, checkOutbound, PRIVACY_GUARD_ID } from '../gws-ea-privacy/index.js';
 import { getGwsEaProfile, getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { buildMime, encodeRaw, normalizeAddress, parseGmailMessage, type ParsedMail } from './mime.js';
 import { replyAll, threadRecipients, type Recipients } from './recipients.js';
-import { emailSignature, renderEmail, type QuotedMessage } from './render.js';
+import { emailSignature, quotedBy, renderEmail, type QuotedMessage } from './render.js';
 import {
-  activeInbox,
   assistantAddresses,
   EMAIL_CHANNEL_TYPE,
   INBOX_PLATFORM_ID,
@@ -146,7 +155,7 @@ function outsideEmailOf(content: unknown): OutsideEmail {
 }
 
 // ---------------------------------------------------------------------------
-// Who it reaches, as the private-values check sees it
+// Who it reaches
 // ---------------------------------------------------------------------------
 
 /** What a send answers, and who it reaches. */
@@ -193,31 +202,6 @@ async function planSend(runtime: InboxRuntime, threadKey: string, email: Outside
   return { anchor, recipients: { to: [...new Set(named.map((entry) => entry.address))], cc: [] } };
 }
 
-/** The plans the private-values check saw, by send, for the send that follows each check. */
-const checkedPlans = new Map<string, Plan>();
-const MAX_CHECKED_PLANS = 200;
-
-/**
- * The audience check's recipients for a send on `email:inbox`: everyone it
- * reaches. The send that follows goes to exactly these people.
- */
-export async function outsideRecipients(send: OutboundSend): Promise<readonly string[]> {
-  const runtime = activeInbox();
-  if (!runtime || send.platformId !== INBOX_PLATFORM_ID || send.threadId === null) return [];
-  let email: OutsideEmail;
-  /* eslint-disable no-catch-all/no-catch-all -- content the send cannot carry still resolves; the send itself refuses it */
-  try {
-    email = outsideEmailOf(JSON.parse(send.content));
-  } catch {
-    return [];
-  }
-  /* eslint-enable no-catch-all/no-catch-all */
-  const plan = await planSend(runtime, send.threadId, email);
-  if (checkedPlans.size >= MAX_CHECKED_PLANS) checkedPlans.delete(checkedPlans.keys().next().value ?? '');
-  checkedPlans.set(sendKey(send.threadId, email), plan);
-  return [...plan.recipients.to, ...plan.recipients.cc];
-}
-
 // ---------------------------------------------------------------------------
 // The send
 // ---------------------------------------------------------------------------
@@ -244,26 +228,44 @@ async function handedFiles(threadKey: string, files: readonly OutboundFile[]): P
   return attachments;
 }
 
+/** The text of the files that go, as the host holds them: each one's name, and its contents when they are text. */
+function filesText(files: readonly OutboundFile[]): string[] {
+  return files.flatMap((file) => [file.filename, ...(isUtf8(file.data) ? [file.data.toString('utf8')] : [])]);
+}
+
 /**
- * The quote of the message a reply answers. It shows that message to the
- * people it reached; anyone else the reply reaches sees it only when it holds
- * no private value for them, and otherwise the reply goes without it, still in
- * its thread.
+ * What a reply carries over from the message it answers: its subject, its
+ * people, and the quote under its attribution. Its readers received them;
+ * anyone new to the thread sees them only when they hold no private value
+ * for them. Otherwise the quote goes without them, and a subject or people
+ * that would show them one refuse the email. Returns the quote that goes.
  */
-async function quoteFor(
+async function carriedOver(
   anchor: ParsedMail,
   placed: Recipients,
   runtime: InboxRuntime,
 ): Promise<QuotedMessage | undefined> {
-  if (anchor.from === undefined) return undefined;
+  const quote: QuotedMessage | undefined =
+    anchor.from === undefined
+      ? undefined
+      : { from: anchor.from, sentAt: anchor.receivedAt ?? runtime.now(), text: anchor.text };
   const readers = new Set(
-    [anchor.from, ...anchor.to, ...anchor.cc].flatMap(({ address }) => normalizeAddress(address) ?? []),
+    [...(anchor.from === undefined ? [] : [anchor.from]), ...anchor.to, ...anchor.cc].flatMap(
+      ({ address }) => normalizeAddress(address) ?? [],
+    ),
   );
-  const newcomers = [...placed.to, ...placed.cc].filter((address) => !readers.has(address));
-  if (newcomers.length > 0 && !(await checkOutbound(anchor.text, await audienceForAddresses(newcomers))).allowed) {
-    return undefined;
+  const people = [...placed.to, ...placed.cc];
+  const newcomers = people.filter((address) => !readers.has(address));
+  if (newcomers.length === 0) return quote;
+  const audience = await audienceForAddresses(newcomers);
+  if (!(await checkOutbound([anchor.subject ?? '', ...people], audience)).allowed) {
+    throw new OutboundRefusedError(
+      PRIVACY_GUARD_ID,
+      "the thread's subject or the people on this email would show someone new to the thread the principal's private details. Send it without the people new to the thread, or tell main.",
+    );
   }
-  return { from: anchor.from, sentAt: anchor.receivedAt ?? runtime.now(), text: anchor.text };
+  if (quote === undefined) return undefined;
+  return (await checkOutbound([quotedBy(quote), quote.text], audience)).allowed ? quote : undefined;
 }
 
 /** The channel adapter's `deliver` for `email:inbox`: send one email in its thread, exactly once. */
@@ -277,11 +279,8 @@ export async function sendToOutside(
     throw refused("An email to anyone but the principal goes in one of the inbox's threads, and this named none.");
   }
   const email = outsideEmailOf(message.content);
-  const key = sendKey(threadKey, email);
-  const checked = checkedPlans.get(key);
-  checkedPlans.delete(key);
-  return sendExactlyOnce(runtime, { threadKey, side: 'outside' }, key, async () => {
-    const { anchor, recipients } = checked ?? (await planSend(runtime, threadKey, email));
+  return sendExactlyOnce(runtime, { threadKey, side: 'outside' }, sendKey(threadKey, email), async () => {
+    const { anchor, recipients } = await planSend(runtime, threadKey, email);
     if (anchor === undefined && email.subject === undefined) {
       throw refused(
         `Thread ${threadKey} has no email yet, so there is nothing to reply to: write its first email with email_send, giving it a subject.`,
@@ -292,7 +291,13 @@ export async function sendToOutside(
     }
     const placed = await threadRecipients(threadKey, recipients, await assistantAddresses());
     const attachments = await handedFiles(threadKey, message.files ?? []);
-    const quote = anchor === undefined ? undefined : await quoteFor(anchor, placed, runtime);
+    // What the assistant wrote, for everyone the email reaches: both parts show only its words and its links.
+    const written = await checkOutbound(
+      [email.subject ?? '', email.text, ...(email.to ?? []), ...(email.cc ?? []), ...filesText(attachments)],
+      await audienceForAddresses([...placed.to, ...placed.cc]),
+    );
+    if (!written.allowed) throw new OutboundRefusedError(PRIVACY_GUARD_ID, written.reason);
+    const quote = anchor === undefined ? undefined : await carriedOver(anchor, placed, runtime);
     const body = renderEmail({
       markdown: email.text,
       signature: emailSignature(await getGwsEaProfile()),

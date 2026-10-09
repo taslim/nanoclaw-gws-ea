@@ -80,8 +80,8 @@ beforeEach(() => {
   }) as typeof setTimeout);
 });
 
-afterEach(() => {
-  stopHostSweep();
+afterEach(async () => {
+  await stopHostSweep();
   setTimeoutSpy.mockRestore();
 });
 
@@ -155,5 +155,45 @@ describe('sweep over the workqueue', () => {
 
     await runSweepTick();
     expect(stopOrphanedSessions).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe('stopping the sweep', () => {
+  it('waits for a reconcile already under way, so what it gave up on is still reported, and no longer than its bound', async () => {
+    let release: () => void = () => undefined;
+    const reconciling = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reported = false;
+    vi.mocked(reconcileSession).mockImplementation(async (id: string) => {
+      if (id !== 's-1') return;
+      await reconciling;
+      reported = true;
+    });
+    startHostSweep();
+    await vi.waitFor(() => {
+      expect(reconcileSession).toHaveBeenCalledWith('s-1');
+    });
+
+    let stopped = false;
+    const stopping = stopHostSweep(5_000).then(() => {
+      stopped = true;
+    });
+    await new Promise((resolve) => realSetTimeout(resolve, 50));
+    expect(stopped).toBe(false);
+
+    release();
+    await stopping;
+    expect(reported).toBe(true);
+
+    // A reconcile that never ends holds the stop only as long as the bound.
+    vi.mocked(reconcileSession).mockImplementation(() => new Promise<void>(() => undefined));
+    startHostSweep();
+    await vi.waitFor(() => {
+      expect(reconcileSession).toHaveBeenCalledTimes(4);
+    });
+    const started = Date.now();
+    await stopHostSweep(100);
+    expect(Date.now() - started).toBeLessThan(2_000);
   });
 });

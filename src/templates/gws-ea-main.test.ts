@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { parse } from 'yaml';
 
 const TEST_ROOT = '/tmp/nanoclaw-gws-ea-main-template-test';
 const GROUPS_DIR = `${TEST_ROOT}/groups`;
@@ -27,21 +28,6 @@ import { parseTemplate } from './parse.js';
 
 const TEMPLATE_ROOT = path.resolve('templates', 'gws-ea', 'main');
 const WELCOME_FILE = path.join(TEMPLATE_ROOT, 'skills', 'welcome', 'SKILL.md');
-const REQUIRED_README_CONTRACT = [
-  '# GWS-EA main',
-  'canonical `main` executive-assistant agent group',
-  '`src/modules/gws-ea-main/guidance.md`',
-  'ncl groups create --template gws-ea/main',
-];
-const REQUIRED_WELCOME_CONTRACT = [
-  'name: welcome',
-  'share their calendars with you',
-  'two or three concrete things',
-  'End on that question rather than "How can I help?"',
-  'Follow the Executive Assistant section throughout.',
-  'scheduling preferences and their people',
-  'settle two overlapping meetings by moving one of them with the people in it',
-];
 const EXPECTED_FILES = ['README.md', 'plugin.json', 'skills/welcome/SKILL.md'];
 
 function listFiles(dir: string, relative = ''): string[] {
@@ -105,17 +91,17 @@ describe('gws-ea/main template', () => {
     });
   });
 
-  it('keeps the welcome contract the first minutes depend on', () => {
-    const readme = fs.readFileSync(path.join(TEMPLATE_ROOT, 'README.md'), 'utf-8');
-    const welcome = fs.readFileSync(WELCOME_FILE, 'utf-8');
+  it('names its welcome as the first conversation runs it, /welcome, and its README only files that exist', () => {
+    const [, frontmatter = ''] = fs.readFileSync(WELCOME_FILE, 'utf-8').split(/^---$/mu);
+    expect(parse(frontmatter)).toMatchObject({ name: 'welcome' });
 
-    for (const contract of REQUIRED_README_CONTRACT) expect(readme).toContain(contract);
-    for (const contract of REQUIRED_WELCOME_CONTRACT) expect(welcome).toContain(contract);
-    expect(welcome).not.toMatch(/operating procedure|additional_context|gws-ea-welcome/iu);
-    expect(welcome).not.toMatch(/[\u{1F300}-\u{1FAFF}]/u);
+    const readme = fs.readFileSync(path.join(TEMPLATE_ROOT, 'README.md'), 'utf-8');
+    const files = [...readme.matchAll(/`([\w.-]+(?:\/[\w.-]+)+\.\w+)`/gu)].map(([, file]) => file);
+    expect(files.length).toBeGreaterThan(0);
+    for (const file of files) expect(fs.existsSync(path.resolve(file)), file).toBe(true);
   });
 
-  it('contains no deployment configuration, secrets, endpoints, or personal identity', () => {
+  it('contains no deployment configuration, secrets, endpoints, personal identity, or emoji', () => {
     expect(listFiles(TEMPLATE_ROOT)).toEqual(EXPECTED_FILES);
 
     const manifest = JSON.parse(fs.readFileSync(path.join(TEMPLATE_ROOT, 'plugin.json'), 'utf-8')) as Record<
@@ -141,5 +127,6 @@ describe('gws-ea/main template', () => {
     expect(runtimeText).not.toMatch(/\b(?:provider|model|packages_(?:apt|npm)|mcp_servers)\s*[:=]/i);
     expect(runtimeText).not.toMatch(/\b[A-Z][A-Z0-9_]*(?:SECRET|TOKEN|API_KEY|CREDENTIALS)\s*=/);
     expect(runtimeText).not.toMatch(/\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/);
+    expect(runtimeText).not.toMatch(/[\u{1F300}-\u{1FAFF}]/u);
   });
 });

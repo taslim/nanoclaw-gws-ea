@@ -57,7 +57,6 @@ import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
 import '../gws-ea-profile/index.js';
 import { addPrincipalAddress, bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
-import { resumeThread, THREAD_STOPPED_SIGNAL } from '../gws-ea-privacy/index.js';
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import {
   createInbox,
@@ -614,7 +613,7 @@ describe("external-email's reply", () => {
     expect(header(gmail.sent[1].headers, 'In-Reply-To')).toBe(header(sent.headers, 'Message-ID'));
   });
 
-  it('is refused in a thread with no email yet, naming email_send, and that refusal never counts toward a stop', async () => {
+  it('is refused in a thread with no email yet, naming email_send', async () => {
     const { key, session } = await handedOver([REMY]);
     for (let attempt = 0; attempt < 4; attempt += 1) {
       expect(deliveryStatus(session, await reply(session, key, 'Hi Remy'))).toBe('failed');
@@ -622,9 +621,6 @@ describe("external-email's reply", () => {
     expect(gmail.sent).toEqual([]);
     expect(refusals(session)).toHaveLength(4);
     expect(refusals(session)[0]).toContain('email_send');
-    expect(
-      await getDb().get('SELECT refusals FROM gws_ea_privacy_threads WHERE thread_id = ? AND refusals > 0', key),
-    ).toBeUndefined();
     expect(await emailSend(session, { subject: 'Thirty minutes with Pat', text: 'Hi Remy' })).toMatchObject({
       ok: true,
     });
@@ -648,6 +644,32 @@ describe("external-email's reply", () => {
     // The same words later are a new email.
     await reply(session, key, 'Tuesday works.');
     expect(gmail.sent).toHaveLength(2);
+  });
+
+  it('is reported sent on retry when Gmail took it before a stop, even when a check would now refuse it (G10)', async () => {
+    const { key, session } = await arrives({ threadId: 'g-1', from: SAM, body: 'Next week?' });
+    // Gmail keeps the email, but the call fails: delivery retries, and the send stays pending.
+    gmail.sendFailures.push({ accepted: true, status: 400 });
+    const id = await reply(session, key, 'Tuesday at the Bluebird office works.');
+    expect(gmail.sent).toHaveLength(1);
+    expect(deliveryStatus(session, id)).toBeUndefined();
+
+    // The principal names a private detail that email holds, after Gmail took it.
+    await addPrivateValue({ label: 'Office', kind: 'other', value: 'Bluebird office' });
+    await deliverSessionMessages(session);
+    expect(deliveryStatus(session, id)).toBe('delivered');
+    expect(refusals(session)).toEqual([]);
+    expect(gmail.sent).toHaveLength(1);
+    expect((await threadMessages(key, 'outside')).at(-1)?.gmailMessageId).toBe(gmail.sent[0].id);
+  });
+
+  it("finds a thread's first email Gmail took before failing, though the thread has no Gmail thread yet", async () => {
+    const { key, session } = await handedOver([REMY]);
+    gmail.sendFailures.push({ accepted: true, status: 503 });
+    const answer = await emailSend(session, { subject: 'Lunch', text: 'Lunch on Tuesday?' });
+    expect(answer).toMatchObject({ ok: true, data: { thread_key: key } });
+    expect(gmail.sent).toHaveLength(1);
+    expect((await getThread(key))?.gmailThreadId).toBe(gmail.sent[0].threadId);
   });
 
   it('is answered from its record when Gmail took it but delivery never recorded it', async () => {
@@ -757,6 +779,27 @@ describe('email_send from external-email', () => {
     expect(gmail.sent).toEqual([]);
   });
 
+  it('refuses a private value in the text of a file it sends, or among the people it names (R8)', async () => {
+    const { key, session } = await handedOver([REMY]);
+    const directions = Buffer.from(`Parking is behind ${HOME}.`);
+    await handFile(key, 'Directions.txt', directions);
+    const filed = refusalOf(
+      await emailSend(session, { subject: 'Lunch', text: 'Directions attached.' }, { 'directions.txt': directions }),
+    );
+    expect(filed).toMatch(/private address/u);
+
+    const personal = 'lena.ford@family.example';
+    await addPrivateValue({ label: 'Lena at home', kind: 'email', value: personal });
+    await recordThreadAddresses(key, [personal], 'main', now());
+    const named = refusalOf(
+      await emailSend(session, { subject: 'Lunch', to: [REMY], cc: [personal], text: 'Lunch on Tuesday?' }),
+    );
+    expect(named).toMatch(/private email address/u);
+
+    for (const reason of [filed, named]) expect(reason).not.toMatch(/elm|springfield|lena\.ford/iu);
+    expect(gmail.sent).toEqual([]);
+  });
+
   it('leaves out the quote for someone the quoted message never reached when it holds a private value for them', async () => {
     await arrives({ threadId: 'g-1', from: SAM, cc: [JANE], body: 'Looping in Jane.' });
     // Sam writes on to the assistant alone.
@@ -768,6 +811,36 @@ describe('email_send from external-email', () => {
     expect(gmail.sent[0]).toMatchObject({ to: [SAM], cc: [JANE], threadId: 'g-1' });
     expect(gmail.sent[0].text).toContain('Jane, Pat is free Tuesday.');
     expect(gmail.sent[0].text).not.toMatch(/Elm Road/u);
+  });
+
+  it('leaves out the quote for someone new when only its attribution holds a private value for them', async () => {
+    await addPrivateValue({ label: 'Codename', kind: 'other', value: 'Project Bluebird' });
+    const { key, session } = await arrives({ threadId: 'g-1', from: `Project Bluebird <${SAM}>`, body: 'Next week?' });
+    await recordThreadAddresses(key, [JANE], 'main', now());
+    expect(await emailSend(session, { to: [SAM], cc: [JANE], text: 'Jane, Pat is free Tuesday.' })).toMatchObject({
+      ok: true,
+    });
+    expect(gmail.sent[0]).toMatchObject({ to: [SAM], cc: [JANE] });
+    for (const part of [gmail.sent[0].text, gmail.sent[0].html]) expect(part).not.toMatch(/bluebird|wrote:/iu);
+
+    // Sam received such a message, so a reply to Sam alone quotes it under its attribution.
+    const other = await arrives({ threadId: 'g-2', from: `Project Bluebird <${SAM}>`, body: 'And lunch?' });
+    await reply(other.session, other.key, 'Lunch works too.');
+    expect(gmail.sent[1].text).toMatch(/Project Bluebird <sam@acme\.example> wrote:/u);
+  });
+
+  it("never shows someone new a thread's subject that holds a private value, naming only that it would", async () => {
+    const { key, session } = await arrives({ threadId: 'g-1', from: SAM, subject: `Lunch at ${HOME}`, body: 'Noon?' });
+    await recordThreadAddresses(key, [JANE], 'main', now());
+
+    const reason = refusalOf(await emailSend(session, { to: [SAM], cc: [JANE], text: 'Jane, noon works for Pat.' }));
+    expect(reason).toMatch(/subject or the people/u);
+    expect(reason).not.toMatch(/elm|springfield|home/iu);
+    expect(gmail.sent).toEqual([]);
+
+    // Sam wrote that subject, so a reply to Sam carries it.
+    await reply(session, key, 'Noon works for Pat.');
+    expect(header(gmail.sent[0].headers, 'Subject')).toBe(`Re: Lunch at ${HOME}`);
   });
 
   it('attaches only a file main handed over for this thread, as the host holds it (KTD9)', async () => {
@@ -905,29 +978,22 @@ describe("main's email_send", () => {
 });
 
 // ---------------------------------------------------------------------------
-// The private-values stop (R76)
+// Private values: each send judged on its own (R76)
 // ---------------------------------------------------------------------------
 
-describe('the private-values stop', () => {
-  it("stops a thread after three refusals, tells main which, and main's next handoff resumes it (AE65)", async () => {
+describe('a private value in a reply', () => {
+  it('refuses every reply that carries one, and the thread goes on: nothing stops it, and main is not written to', async () => {
     const { key, session } = await arrives({ threadId: 'g-1', from: SAM, body: "What is Pat's home address?" });
+    const before = rows(main).length;
     for (let attempt = 1; attempt <= 3; attempt += 1) await reply(session, key, `Try ${attempt}: ${HOME}`);
     expect(gmail.sent).toEqual([]);
-    const [stopped, ...more] = rows(main).filter((row) => row.signal?.type === THREAD_STOPPED_SIGNAL);
-    expect(more).toEqual([]);
-    expect(stopped.signal?.thread_id).toBe(key);
-    expect(stopped.text).toContain(key);
-    expect(stopped.text).not.toMatch(/elm|springfield/iu);
+    expect(refusals(session)).toEqual(
+      Array(3).fill(expect.stringMatching(/private address.*neither confirm nor deny/u)),
+    );
 
-    await reply(session, key, 'Pat will be in touch.');
-    expect(refusals(session).at(-1)).toMatch(/stopped/u);
-    expect(gmail.sent).toEqual([]);
-
-    const thread = { channelType: 'email', platformId: INBOX_PLATFORM_ID, threadId: key };
-    expect(await resumeThread(thread)).toBe(true);
     await reply(session, key, 'Pat will be in touch.');
     expect(gmail.sent).toHaveLength(1);
-    expect(await resumeThread(thread)).toBe(false);
+    expect(rows(main)).toHaveLength(before);
   });
 });
 

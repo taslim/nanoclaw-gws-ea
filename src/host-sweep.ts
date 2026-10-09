@@ -35,6 +35,13 @@ export {
 const SWEEP_INTERVAL_MS = 60_000;
 
 /**
+ * How long a stop waits for reconciles under way. A reconcile records the
+ * inbound messages it gives up on and then reports them through the
+ * inbound-failed hooks, so a stop that did not wait could lose the report.
+ */
+const STOP_WAIT_MS = 10_000;
+
+/**
  * Sessions reconciled in parallel. Each reconcile is one session's mailbox
  * round trip plus a few central reads; on a remote mailbox that is network
  * latency, and serially it made a tick scale as sessions × latency (300
@@ -132,7 +139,8 @@ export function startHostSweep(): void {
   void sweep();
 }
 
-export function stopHostSweep(): void {
+/** Stop the sweep, waiting up to `maxWaitMs` for reconciles already under way. */
+export async function stopHostSweep(maxWaitMs = STOP_WAIT_MS): Promise<void> {
   running = false;
   registerReconcileEnqueue(null);
   const stoppingWatch = runtimeWatch;
@@ -148,7 +156,15 @@ export function stopHostSweep(): void {
   }
   const stopping = queue;
   queue = null;
-  if (stopping) void stopping.shutdown();
+  if (!stopping) return;
+  let bound: NodeJS.Timeout | undefined;
+  await Promise.race([
+    stopping.shutdown(),
+    new Promise<void>((resolve) => {
+      bound = setTimeout(resolve, maxWaitMs);
+    }),
+  ]);
+  clearTimeout(bound);
 }
 
 async function sweep(): Promise<void> {

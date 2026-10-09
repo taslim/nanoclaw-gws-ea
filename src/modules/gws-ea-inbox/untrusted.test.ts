@@ -2,10 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { untrusted, untrustedLine } from './untrusted.js';
 
-/**
- * Every model control token the wrapper neutralizes, the agent runner's list
- * (container/agent-runner/src/mcp-tools/calendar-facts.ts) included.
- */
+/** Every model control token the wrapper neutralizes. */
 const CONTROL_TOKENS = [
   '<|im_start|>',
   '<|im_end|>',

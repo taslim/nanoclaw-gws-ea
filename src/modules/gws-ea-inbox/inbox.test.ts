@@ -942,6 +942,25 @@ describe('routing by audience', () => {
     expect(notes(THREAD_STARTED)).toHaveLength(1);
   });
 
+  it('tells neither agent what the people store holds of an address Gmail could not verify', async () => {
+    await addPerson({
+      name: 'Sam Rivera',
+      level: 'close',
+      source: 'principal',
+      basis: 'test',
+      identity: `email:${SAM}`,
+    });
+    gmail.receive({ from: `Sam <${SAM}>`, auth: 'none', subject: 'Coffee?', body: 'Can we meet next week?' });
+    await inbox.tick();
+
+    const [email] = await outsideMail();
+    expect(hostText(email.text)).toContain('Gmail could not confirm who sent this, so treat the sender as unknown.');
+    const [started] = notes(THREAD_STARTED);
+    for (const said of [hostText(email.text), hostText(started.text)]) {
+      expect(said).not.toMatch(/close to|Sam Rivera/u);
+    }
+  });
+
   it('opens an external-email session for a cold email, and main hears once that the thread started', async () => {
     await addPerson({
       name: 'Sam Rivera',

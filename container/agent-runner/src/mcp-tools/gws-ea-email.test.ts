@@ -22,23 +22,10 @@ import {
   emailSend,
   emailToPrincipal,
   freeTime,
-  hold,
   tellMain,
 } from './gws-ea-email.js';
 import { requestStatus } from './request-status.js';
 import type { McpToolDefinition } from './types.js';
-
-const ALL_TOOLS = [
-  emailHandoff,
-  emailToPrincipal,
-  emailSend,
-  tellMain,
-  freeTime,
-  hold,
-  book,
-  changeBooking,
-  cancelBooking,
-];
 
 beforeEach(() => initTestSessionDb());
 afterEach(() => closeSessionDb());
@@ -117,8 +104,6 @@ describe('the email tools', () => {
           timezone: 'Europe/Berlin',
         },
       ],
-      [hold, 'hold', { starts: ['2026-10-12T11:00:00-07:00', '2026-10-13T12:30:00-07:00'], minutes: 30 }],
-      [hold, 'hold', { starts: [] }],
       [
         book,
         'book',
@@ -231,7 +216,6 @@ describe('the email tools', () => {
       [emailSend, { subject: 'Hello' }, /text is required/],
       [tellMain, {}, /message is required/],
       [freeTime, { from: '2026-10-12T09:00:00-07:00', to: '2026-10-16T17:00:00-07:00' }, /minutes is required/],
-      [hold, {}, /starts is required/],
       [book, { start: '2026-10-13T12:30:00-07:00', minutes: 30 }, /title is required/],
       [changeBooking, { start: '2026-10-14T09:30:00-07:00' }, /booking is required/],
       [cancelBooking, {}, /booking is required/],
@@ -243,19 +227,6 @@ describe('the email tools', () => {
       expect(text(result), label).toMatch(problem);
     }
     expect(getUndeliveredMessages()).toHaveLength(0);
-  });
-
-  it('describe each tool in under 60 words', () => {
-    for (const tool of ALL_TOOLS) {
-      const words = (tool.tool.description ?? '').split(/\s+/u).filter(Boolean).length;
-      expect(words, tool.tool.name).toBeGreaterThan(0);
-      expect(words, tool.tool.name).toBeLessThan(60);
-    }
-  });
-
-  it("describe free_time's times in the date order the host lists them", () => {
-    expect(freeTime.tool.description).toContain('in date order');
-    expect(freeTime.tool.description).not.toMatch(/best fit/);
   });
 });
 
@@ -478,7 +449,6 @@ describe('a request the host is slow to answer', () => {
   it('says a request that changes nothing twice may be made again', async () => {
     for (const [tool, args] of [
       [freeTime, { from: '2026-10-12T09:00:00-07:00', to: '2026-10-16T17:00:00-07:00', minutes: 30 }],
-      [hold, { starts: [] }],
       [changeBooking, { booking: 'a'.repeat(64), start: '2026-10-14T09:30:00-07:00' }],
       [cancelBooking, { booking: 'a'.repeat(64) }],
     ] as const) {

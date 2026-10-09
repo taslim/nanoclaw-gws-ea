@@ -64,9 +64,7 @@ import {
   bindVerifiedPrincipalUser,
   recordExternalEmailAgentGroupId,
 } from '../gws-ea-profile/db.js';
-import { MAX_REFUSALS_PER_THREAD } from '../gws-ea-privacy/index.js';
-import { addPrivateValue, judgeThreadSend, type ThreadKey } from '../gws-ea-privacy/db.js';
-import { streamOf } from '../gws-ea-privacy/match.js';
+import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import { ensureInbox, ensurePrincipalConversation, INBOX_PLATFORM_ID } from '../gws-ea-inbox/index.js';
 import { emailMessagingGroupIds } from '../gws-ea-inbox/db.js';
 import { threadRecipients } from '../gws-ea-inbox/recipients.js';
@@ -214,21 +212,6 @@ async function inboundThread(gmailThreadId: string, from: string): Promise<{ key
   await recordThreadAddresses(threadKey, [from], 'message', now());
   const { session } = await resolveSession('ag-external', inbox, threadKey, 'per-thread');
   return { key: threadKey, session };
-}
-
-function privacyKey(threadKey: string): ThreadKey {
-  return { channelType: 'email', platformId: INBOX_PLATFORM_ID, threadId: threadKey };
-}
-
-/** Whether the privacy check holds the thread stopped: a clean send to it is refused. */
-async function isStopped(threadKey: string): Promise<boolean> {
-  const verdict = await judgeThreadSend(
-    privacyKey(threadKey),
-    streamOf([`check ${Math.random()}`]),
-    () => undefined,
-    MAX_REFUSALS_PER_THREAD,
-  );
-  return verdict.outcome === 'stopped';
 }
 
 function sha256(data: Buffer): string {
@@ -508,25 +491,11 @@ describe('email_handoff', () => {
     expect(fs.existsSync(path.join(sessionDir(main.agent_group_id, main.id), 'outbox', requestId))).toBe(false);
   });
 
-  it('resumes a thread the privacy check stopped', async () => {
-    const { key } = await inboundThread('g-stopped', JANE);
-    for (let attempt = 0; attempt < MAX_REFUSALS_PER_THREAD; attempt++) {
-      await judgeThreadSend(privacyKey(key), streamOf([HOME]), () => 'address', MAX_REFUSALS_PER_THREAD);
-    }
-    expect(await isStopped(key)).toBe(true);
-
-    const frame = await handoff({
-      thread_key: key,
-      message: 'Offer Jane Tuesday instead; nothing about where Pat lives.',
-    });
-
-    expect(data(frame).message).toMatch(/may send again/u);
-    expect(await isStopped(key)).toBe(false);
-  });
-
   it('records the calendar main names for the thread’s bookings, when the principal’s and writable', async () => {
-    const key = keyOf(await handoff({ people: [REMY], message: 'Book the team sync.', calendar: TEAM_CALENDAR }));
+    const named = await handoff({ people: [REMY], message: 'Book the team sync.', calendar: TEAM_CALENDAR });
+    const key = keyOf(named);
     expect(await getThreadBookingCalendar(key)).toBe(TEAM_CALENDAR);
+    expect(String(data(named).message).endsWith(` Its bookings go on calendar ${TEAM_CALENDAR}.`)).toBe(true);
 
     for (const calendarId of [SHARED_CALENDAR, PARTNER_CALENDAR, 'someone@else.example']) {
       expect(refusal(await handoff({ people: [JANE], message: 'Book it.', calendar: calendarId }))).toMatch(

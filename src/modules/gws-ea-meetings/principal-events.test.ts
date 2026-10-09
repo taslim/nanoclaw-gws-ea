@@ -55,6 +55,7 @@ import { resolveSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import '../gws-ea-profile/index.js';
 import { addPrincipalAddress, recordExternalEmailAgentGroupId } from '../gws-ea-profile/db.js';
+import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import '../gws-ea-inbox/index.js';
 import './index.js';
 import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
@@ -67,6 +68,10 @@ const COLLEAGUE_CALENDAR = 'lena@northwind.example';
 const REMY = 'remy@northwind.example';
 const NOEL = 'noel@friends.example';
 const PACIFIC = 'America/Los_Angeles';
+/** The principal's home, which they keep private. */
+const HOME = '12 Rosewood Lane';
+/** The personal address of someone close to the principal, which they keep private. */
+const JUNO_PERSONAL = 'juno.hale@home.example';
 
 /** The principal on an event of theirs, as Google lists the organizer of an event they made themselves. */
 const PRINCIPAL_GUEST = { email: PRINCIPAL, responseStatus: 'accepted', organizer: true };
@@ -117,8 +122,11 @@ const FOCUS = {
   end: '2026-10-08T11:00:00-07:00',
 };
 
-/** An event of the principal's with two guests, each answer and note Google keeps intact. */
-function teamSync(guests: readonly Record<string, unknown>[]): StoredEvent {
+/** An event of the principal's with these guests, each answer and note Google keeps intact, and what it says. */
+function teamSync(
+  guests: readonly Record<string, unknown>[],
+  text: Pick<StoredEvent, 'summary' | 'description' | 'location'> = {},
+): StoredEvent {
   return {
     calendarId: PRINCIPAL,
     id: 'teamsync01',
@@ -126,6 +134,8 @@ function teamSync(guests: readonly Record<string, unknown>[]): StoredEvent {
     organizer: { email: PRINCIPAL },
     start: { dateTime: '2026-10-09T16:00:00.000Z' },
     end: { dateTime: '2026-10-09T16:30:00.000Z' },
+    summary: 'Team sync',
+    ...text,
     guests,
     attendees: guests.map((guest) => ({
       email: String(guest.email),
@@ -238,9 +248,95 @@ describe('create_event', () => {
     expect(event?.attendees).toEqual([PRINCIPAL_GUEST, { email: REMY, responseStatus: 'needsAction' }]);
     expect(event?.recurrence).toEqual(['RRULE:FREQ=WEEKLY;BYDAY=TH;COUNT=10']);
     expect(event?.conference?.status).toBe('success');
-    expect(created.message).toMatch(new RegExp(`Its guests: ${REMY}; Google emailed no one\\.`, 'u'));
+    expect(created.message).toMatch(new RegExp(`Its guests: ${REMY}; Google sent them the invitation\\.`, 'u'));
     expect(created.message).toMatch(/It repeats\./u);
     expect(created.message).toMatch(/with a Google Meet link \(https:\/\/meet\.google\.com\//u);
+  });
+
+  it('sends Google’s invitation when it invites anyone but the principal, and emails no one otherwise', async () => {
+    const invited = data(await send(main, 'create_event', { ...FOCUS, title: 'Weekly sync', guests: [REMY] }));
+    expect(calendar.writes).toEqual([
+      expect.objectContaining({ op: 'insert', eventId: invited.event, sendUpdates: 'all' }),
+    ]);
+
+    // Another of the principal's own addresses is the principal: nobody else to tell.
+    calendar.writes.length = 0;
+    const own = data(await send(main, 'create_event', { ...FOCUS, guests: [READ_ONLY] }));
+    expect(calendar.writes).toEqual([
+      expect.objectContaining({ op: 'insert', eventId: own.event, sendUpdates: 'none' }),
+    ]);
+    expect(own.message).toMatch(new RegExp(`Its guests: ${READ_ONLY}; Google emailed no one\\.`, 'u'));
+  });
+
+  it('tells its guests once: a replayed request writes nothing more, and keeps what changed since', async () => {
+    const request = { ...FOCUS, title: 'Weekly sync', guests: [REMY] };
+    const first = data(await send(main, 'create_event', request, 'act-replayed'));
+    // The principal moves it an hour later before the answer reaches the agent, and the request runs again.
+    const made = calendar.event(PRINCIPAL, String(first.event));
+    if (made === undefined) throw new Error('create_event made no event');
+    const moved = { start: { dateTime: '2026-10-08T17:00:00.000Z' }, end: { dateTime: '2026-10-08T19:00:00.000Z' } };
+    calendar.put({ ...made, ...moved });
+    const inbound = new Database(inboundDbPath(main.agent_group_id, main.id));
+    inbound.prepare('DELETE FROM messages_in WHERE id = ?').run('action-resp-act-replayed');
+    inbound.close();
+
+    expect(data(await send(main, 'create_event', request, 'act-replayed')).event).toBe(first.event);
+    expect(calendar.writes).toEqual([expect.objectContaining({ op: 'insert', sendUpdates: 'all' })]);
+    expect(calendar.event(PRINCIPAL, String(first.event))).toMatchObject(moved);
+  });
+
+  it.each([
+    { carrier: 'title', fields: { title: `Drinks at ${HOME}` } },
+    { carrier: 'notes', fields: { notes: `Come round to ${HOME}.` } },
+    { carrier: 'place', fields: { location: HOME } },
+    { carrier: 'calendar name', fields: {}, calendarName: `Morgan – ${HOME}` },
+    { carrier: 'guest list', fields: { guests: [REMY, JUNO_PERSONAL] } },
+  ])(
+    'refuses, before anything reaches Google, an invitation whose $carrier would show its guests a private detail',
+    async ({ fields, calendarName }) => {
+      await addPrivateValue({ label: 'Home', kind: 'address', value: HOME });
+      await addPrivateValue({ label: 'Juno at home', kind: 'email', value: JUNO_PERSONAL });
+      if (calendarName !== undefined) {
+        calendar.calendars.set(PRINCIPAL, {
+          id: PRINCIPAL,
+          accessRole: 'writer',
+          conferenceTypes: ['hangoutsMeet'],
+          summary: calendarName,
+        });
+      }
+
+      const refused = refusal(await send(main, 'create_event', { ...FOCUS, guests: [REMY], ...fields }));
+
+      expect(refused).toMatch(
+        /^The event was not added: as its guests would see it, the invitation carries one of the principal's private details \((address|email)\)\./u,
+      );
+      expect(refused).not.toContain('Rosewood');
+      expect(refused).not.toContain(JUNO_PERSONAL);
+      expect(calendar.writes).toEqual([]);
+      expect(calendar.events).toEqual([]);
+    },
+  );
+
+  it('adds an event that holds a private detail when only the principal will see it', async () => {
+    await addPrivateValue({ label: 'Home', kind: 'address', value: HOME });
+    data(await send(main, 'create_event', { ...FOCUS, title: `Plumber at ${HOME}`, guests: [READ_ONLY] }));
+    expect(calendar.writes).toEqual([expect.objectContaining({ op: 'insert', sendUpdates: 'none' })]);
+  });
+
+  it('invites someone at their own private address: no one else sees it', async () => {
+    await addPrivateValue({ label: 'Juno at home', kind: 'email', value: JUNO_PERSONAL });
+    data(await send(main, 'create_event', { ...FOCUS, title: 'Anniversary dinner', guests: [JUNO_PERSONAL] }));
+    expect(calendar.writes).toEqual([expect.objectContaining({ op: 'insert', sendUpdates: 'all' })]);
+  });
+
+  it('refuses text whose weekday and date disagree, adding nothing', async () => {
+    const refused = refusal(
+      await send(main, 'create_event', { ...FOCUS, notes: 'Prep for the board on Friday 10 October 2026.' }),
+    );
+    expect(refused).toMatch(
+      /^The event was not added: it says "Friday 10 October 2026", but 10 October 2026 is a Saturday\./u,
+    );
+    expect(calendar.writes).toEqual([]);
   });
 
   it('names both days of a timed event that ends on a later day', async () => {
@@ -362,7 +458,7 @@ describe('change_guests', () => {
       expect.objectContaining({
         op: 'guests',
         eventId: 'teamsync01',
-        sendUpdates: 'none',
+        sendUpdates: 'all',
         guests: [
           { email: PRINCIPAL, responseStatus: 'accepted', organizer: true, self: true },
           { email: REMY, responseStatus: 'accepted', comment: 'Running 5 late', optional: true },
@@ -372,7 +468,7 @@ describe('change_guests', () => {
     ]);
     expect(changed.guests).toEqual([REMY, NOEL]);
     expect(changed.message).toBe(
-      `Its guests now: ${REMY} and ${NOEL}, and the principal, accepted. Google emailed no one.`,
+      `Its guests now: ${REMY} and ${NOEL}, and the principal, accepted. Google sent the guests the update.`,
     );
   });
 
@@ -409,7 +505,7 @@ describe('change_guests', () => {
         }),
       ]);
       expect(changed.message, answer).toBe(
-        `Its guests now: ${REMY} and ${NOEL}, and the principal, ${words}. Google emailed no one.`,
+        `Its guests now: ${REMY} and ${NOEL}, and the principal, ${words}. Google sent the guests the update.`,
       );
 
       // With nothing else to change, their answer is no reason to write.
@@ -442,7 +538,9 @@ describe('change_guests', () => {
       }),
     ]);
     expect(changed.guests).toEqual([NOEL]);
-    expect(changed.message).toBe(`Its guests now: ${NOEL}, and the principal, accepted. Google emailed no one.`);
+    expect(changed.message).toBe(
+      `Its guests now: ${NOEL}, and the principal, accepted. Google sent the guests the update.`,
+    );
   });
 
   it('writes nothing when the list already says it', async () => {
@@ -457,6 +555,99 @@ describe('change_guests', () => {
     );
     expect(calendar.writes).toEqual([]);
     expect(unchanged.message).toBe(`Nothing changed: ${NOEL} is not invited; the principal is already on it.`);
+  });
+
+  it('tells the guests only of a change to who it invites, never of the principal alone', async () => {
+    const principal = { email: PRINCIPAL, responseStatus: 'accepted', organizer: true, self: true };
+    const remy = { email: REMY, responseStatus: 'accepted' };
+    for (const [change, sendUpdates] of [
+      [{ add: [NOEL] }, 'all'],
+      [{ remove: [REMY] }, 'all'],
+      // Another of the principal's own addresses is the principal: nobody else to tell.
+      [{ add: [READ_ONLY] }, 'none'],
+    ] as const) {
+      calendar.writes.length = 0;
+      calendar.put(teamSync([principal, remy]));
+      data(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', ...change }));
+      expect(calendar.writes, JSON.stringify(change)).toEqual([expect.objectContaining({ op: 'guests', sendUpdates })]);
+    }
+
+    // Only the principal's own answer is set: the guests have nothing new to hear.
+    calendar.writes.length = 0;
+    calendar.put(teamSync([{ ...principal, responseStatus: 'needsAction' }, remy]));
+    const answered = data(
+      await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [PRINCIPAL] }),
+    );
+    expect(calendar.writes).toEqual([expect.objectContaining({ op: 'guests', sendUpdates: 'none' })]);
+    expect(answered.message).toBe(`Its guests now: ${REMY}, and the principal, accepted. Google emailed no one.`);
+  });
+
+  it.each([
+    { carrier: 'title', text: { summary: `Drinks at ${HOME}` } },
+    { carrier: 'notes', text: { description: `Come round to ${HOME}.` } },
+    { carrier: 'place', text: { location: HOME } },
+    { carrier: 'calendar name', text: {}, calendarName: `Morgan – ${HOME}` },
+    { carrier: 'guest list', text: {}, guest: JUNO_PERSONAL },
+  ])(
+    'refuses, writing nothing, to invite anyone to an event whose $carrier holds a private detail',
+    async ({ text, calendarName, guest }) => {
+      await addPrivateValue({ label: 'Home', kind: 'address', value: HOME });
+      await addPrivateValue({ label: 'Juno at home', kind: 'email', value: JUNO_PERSONAL });
+      if (calendarName !== undefined) {
+        calendar.calendars.set(PRINCIPAL, { id: PRINCIPAL, accessRole: 'writer', summary: calendarName });
+      }
+      calendar.put(
+        teamSync(
+          [
+            { email: PRINCIPAL, responseStatus: 'accepted', organizer: true, self: true },
+            ...(guest === undefined ? [] : [{ email: guest, responseStatus: 'accepted' }]),
+          ],
+          text,
+        ),
+      );
+
+      const refused = refusal(
+        await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [REMY] }),
+      );
+
+      expect(refused).toMatch(
+        /^The guests were not changed: as its guests would see it, the invitation carries one of the principal's private details \((address|email)\)\./u,
+      );
+      expect(refused).not.toContain('Rosewood');
+      expect(refused).not.toContain(JUNO_PERSONAL);
+      expect(calendar.writes).toEqual([]);
+    },
+  );
+
+  it('invites someone at their own private address, unless another guest would see it beside theirs', async () => {
+    await addPrivateValue({ label: 'Juno at home', kind: 'email', value: JUNO_PERSONAL });
+    const principal = { email: PRINCIPAL, responseStatus: 'accepted', organizer: true, self: true };
+    calendar.put(teamSync([principal], { summary: 'Anniversary dinner' }));
+    data(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [JUNO_PERSONAL] }));
+    expect(calendar.writes).toEqual([expect.objectContaining({ op: 'guests', sendUpdates: 'all' })]);
+
+    calendar.writes.length = 0;
+    calendar.put(teamSync([principal, { email: REMY, responseStatus: 'accepted' }]));
+    expect(
+      refusal(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [JUNO_PERSONAL] })),
+    ).toMatch(/private details \(email\)/u);
+    expect(calendar.writes).toEqual([]);
+  });
+
+  it('takes a guest off an event that holds a private detail: nobody is shown anything new', async () => {
+    await addPrivateValue({ label: 'Home', kind: 'address', value: HOME });
+    calendar.put(
+      teamSync(
+        [
+          { email: PRINCIPAL, responseStatus: 'accepted', organizer: true, self: true },
+          { email: REMY, responseStatus: 'accepted' },
+          { email: NOEL, responseStatus: 'accepted' },
+        ],
+        { description: `Come round to ${HOME}.` },
+      ),
+    );
+    data(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', remove: [NOEL] }));
+    expect(calendar.writes).toEqual([expect.objectContaining({ op: 'guests', sendUpdates: 'all' })]);
   });
 
   it('keeps a guest’s own answer and note that land between its read of the list and its write', async () => {
