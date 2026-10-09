@@ -9,11 +9,12 @@
  * are faked at their boundaries.
  */
 import { randomUUID } from 'node:crypto';
-import { mkdir, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { writePrivate } from '../community-portal/private-file.js';
 import { migrations as builtInMigrations } from '../db/migrations/index.js';
 import { gwsEaProfileMigration } from '../modules/gws-ea-profile/migration.js';
 import {
@@ -249,6 +250,30 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     ]);
     // Nothing of the skipped ones changed: files, run logs, registry entry, and images.
     expect(await Promise.all(skipped.map((runtime) => footprint(machineFleet, runtime)))).toEqual(before);
+  });
+
+  it('skips an assistant on the legacy layout with the command that converts it', async () => {
+    const host = await machine();
+    const legacy = await assistant(host, { port: 37_001 });
+    const next = await nextRelease(host);
+    // The one field only a registry entry from before release folders carries.
+    const registry = JSON.parse(await readFile(host.paths.registryFile, 'utf8')) as {
+      instances: Record<string, Record<string, unknown>>;
+    };
+    registry.instances[legacy.instance_id]!.checkout_realpath = path.join(
+      host.paths.stateRoot,
+      'instances',
+      legacy.instance_id,
+      'nanoclaw',
+    );
+    await writePrivate(host.paths.registryFile, registry);
+    const { run, out } = fleetCli(await fleet(host, next, [legacy]));
+
+    expect(await run(['update', '--all', '--yes'])).toBe(0);
+
+    expect(out).toContain(
+      `Skipped ${legacy.instance_id}: Assistant ${legacy.instance_id} is on the legacy layout: run gws-ea update --id ${legacy.instance_id} to convert it.`,
+    );
   });
 
   it('stops at the first assistant whose update fails, leaving the next one unattempted and untouched', async () => {
