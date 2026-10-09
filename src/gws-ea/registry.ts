@@ -32,6 +32,7 @@ import {
   type SharedInfrastructureMetadata,
 } from './types.js';
 import {
+  CLOUDFLARE_TUNNEL_ID_PATTERN,
   EMAIL_PATTERN,
   isRecord,
   parseJson,
@@ -45,7 +46,6 @@ const ONECLI_PROJECT_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 const CLOUDFLARE_ID_PATTERN = /^[0-9a-f]{32}$/;
 const DNS_LABEL = '[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?';
 const DNS_NAME_PATTERN = new RegExp(`^(?:${DNS_LABEL}\\.)+${DNS_LABEL}$`);
-const TUNNEL_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 /** Readers keep every ownership value exact and ignore fields they do not use. */
 function requireString(value: unknown, label: string, maxLength?: number): string {
@@ -192,7 +192,7 @@ function validateSharedCloudflare(value: unknown): SharedCloudflareMetadata | nu
   let tunnelId: string | null = null;
   if (value.tunnel_id !== null) {
     tunnelId = requireString(value.tunnel_id, 'Cloudflare tunnel ID', 36).toLowerCase();
-    if (!TUNNEL_ID_PATTERN.test(tunnelId)) {
+    if (!CLOUDFLARE_TUNNEL_ID_PATTERN.test(tunnelId)) {
       throw new GwsEaError('invalid_registry', 'Cloudflare tunnel ID is invalid');
     }
   }
@@ -471,7 +471,7 @@ export async function withLockedCloudflareRegistry<T>(
           throw new GwsEaError('reservation_mismatch', 'Cloudflare tunnel coordinate changed; refusing replacement');
         }
         const tunnelId = update.tunnelId ?? cloudflare.tunnel_id;
-        if (tunnelId === null || !TUNNEL_ID_PATTERN.test(tunnelId)) {
+        if (tunnelId === null || !CLOUDFLARE_TUNNEL_ID_PATTERN.test(tunnelId)) {
           throw new GwsEaError('invalid_claim', 'Cloudflare tunnel ID is invalid');
         }
         const instances = { ...current.instances };

@@ -284,6 +284,21 @@ describe('gws-ea usage', () => {
   });
 
   it.each([
+    ['create', '--track', 'dogfood'],
+    ['resume', '--id', allocateInstanceId()],
+    ['remove', '--id', allocateInstanceId()],
+    ['connect-google', '--id', allocateInstanceId()],
+  ])('refuses %s with --capture-fixtures as an unknown option, before anything runs', async (...args) => {
+    const paths = await testPaths();
+    const before = await everythingUnder(paths);
+    const io = lines();
+
+    expect(await runCli([...args, '--capture-fixtures'], { paths, ...io.runtime })).toBe(1);
+    expect(await everythingUnder(paths)).toEqual(before);
+    expect(io.err).toEqual(['Unknown option --capture-fixtures', 'Run gws-ea --help for usage.']);
+  });
+
+  it.each([
     ['--id', allocateInstanceId(), 'Pass either --id or --all, not both.'],
     [
       '--track',
@@ -1688,16 +1703,6 @@ async function interruptUpdate(paths: ControlPlanePaths, instanceId: string): Pr
 }
 
 describe('gws-ea connect-google', () => {
-  it('refuses an assistant whose release predates Google access, naming the update', async () => {
-    const paths = await testPaths();
-    const a = await createdAssistant(paths, 35_001);
-    const io = lines();
-
-    expect(await runCli(['connect-google', '--id', a.instance_id], { paths, ...io.runtime })).toBe(1);
-
-    expect(io.err.join('\n')).toContain(`gws-ea update --id ${a.instance_id}`);
-  });
-
   it('refuses an assistant that is not fully created, naming the resume', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, assistantReservation(paths, 35_021));
@@ -1708,20 +1713,17 @@ describe('gws-ea connect-google', () => {
     expect(io.err.join('\n')).toContain(`gws-ea resume --id ${reserved.instance_id}`);
   });
 
-  /** A created assistant whose release carries Google access. */
-  async function googleReadyAssistant(paths: ControlPlanePaths) {
+  /** A created assistant, by its ID and its own Google account. */
+  async function createdGoogleAssistant(paths: ControlPlanePaths) {
     const runtime = await createdAssistant(paths, 35_001);
     const reservation = (await readRegistry(paths)).instances[runtime.instance_id];
     if (!reservation) throw new Error('The test assistant was not registered');
-    const module = path.join(reservation.checkout_realpath, 'src', 'modules', 'gws-ea-google');
-    await mkdir(module, { recursive: true });
-    await writeFile(path.join(module, 'index.ts'), 'export {};\n');
     return { instanceId: runtime.instance_id, email: reservation.exclusive_resource_claims.workspace_email };
   }
 
   it("runs the step's resources for the assistant's own account and reports it connected", async () => {
     const paths = await testPaths();
-    const { instanceId, email } = await googleReadyAssistant(paths);
+    const { instanceId, email } = await createdGoogleAssistant(paths);
     const accounts: string[] = [];
     googleConnection.resources = [
       {
@@ -1749,7 +1751,7 @@ describe('gws-ea connect-google', () => {
 
   it('stops for the operator with the command that continues it', async () => {
     const paths = await testPaths();
-    const { instanceId } = await googleReadyAssistant(paths);
+    const { instanceId } = await createdGoogleAssistant(paths);
     const pause: ProvisionHumanPause = {
       kind: 'human-action',
       phase: 'connect_google',

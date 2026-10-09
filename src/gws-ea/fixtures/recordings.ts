@@ -11,7 +11,7 @@ function recorded(file: string): string {
   return readFileSync(new URL(file, import.meta.url), 'utf8');
 }
 
-/** `docker context inspect` on Docker Desktop for macOS, from the capture sink. */
+/** `docker context inspect` on Docker Desktop for macOS, from the live gate's capture. */
 export const RECORDED_DOCKER_CONTEXT_INSPECT: SanitizedCommandOutcome = {
   stdout: dockerContextInspect.stdout,
   stderr: dockerContextInspect.stderr,

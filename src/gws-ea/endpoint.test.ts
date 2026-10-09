@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { observeManagedGchatRoute, verifyExistingGchatEndpoint, verifyExistingGchatRoute } from './endpoint.js';
+import { observeManagedGchatRoute, verifyExistingGchatRoute } from './endpoint.js';
 import { publicFetch } from './public-fetch.js';
 
 vi.mock('./public-fetch.js', () => ({ publicFetch: vi.fn<typeof globalThis.fetch>() }));
@@ -8,26 +8,6 @@ vi.mock('./public-fetch.js', () => ({ publicFetch: vi.fn<typeof globalThis.fetch
 const ENDPOINT = 'https://assistant.example.com/webhook/gchat';
 
 describe('existing Google Chat endpoint verification', () => {
-  it('proves the claimed route separately from the audience configuration', async () => {
-    const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response(null, { status: 401 }));
-
-    await expect(verifyExistingGchatRoute({ endpointUrl: ENDPOINT }, { fetch })).resolves.toBe(ENDPOINT);
-    expect(fetch).toHaveBeenCalledOnce();
-    expect(fetch.mock.calls[0]?.[1]).toMatchObject({ method: 'POST', redirect: 'manual' });
-  });
-
-  it('requires the claimed endpoint and authentication audience to be exactly equal', async () => {
-    const fetch = vi.fn<typeof globalThis.fetch>();
-
-    await expect(
-      verifyExistingGchatEndpoint(
-        { endpointUrl: ENDPOINT, audienceUrl: 'https://other.example.com/webhook/gchat' },
-        { fetch },
-      ),
-    ).rejects.toThrow(/audience/i);
-    expect(fetch).not.toHaveBeenCalled();
-  });
-
   it.each([
     'http://assistant.example.com/webhook/gchat',
     'https://user@assistant.example.com/webhook/gchat',
@@ -37,10 +17,7 @@ describe('existing Google Chat endpoint verification', () => {
     'https://assistant.example.com/other',
   ])('rejects an unsafe or inexact callback URL: %s', async (endpointUrl) => {
     await expect(
-      verifyExistingGchatEndpoint(
-        { endpointUrl, audienceUrl: endpointUrl },
-        { fetch: vi.fn<typeof globalThis.fetch>() },
-      ),
+      verifyExistingGchatRoute({ endpointUrl }, { fetch: vi.fn<typeof globalThis.fetch>() }),
     ).rejects.toThrow(/endpoint/i);
   });
 
@@ -51,9 +28,7 @@ describe('existing Google Chat endpoint verification', () => {
       return new Response(null, { status: 401 });
     });
 
-    await expect(
-      verifyExistingGchatEndpoint({ endpointUrl: ENDPOINT, audienceUrl: ENDPOINT }, { fetch }),
-    ).resolves.toEqual({ endpointUrl: ENDPOINT, audienceUrl: ENDPOINT });
+    await expect(verifyExistingGchatRoute({ endpointUrl: ENDPOINT }, { fetch })).resolves.toBe(ENDPOINT);
 
     expect(requests).toHaveLength(1);
     for (const request of requests) {
@@ -68,17 +43,15 @@ describe('existing Google Chat endpoint verification', () => {
       async () => new Response(null, { status, headers: { location: 'https://elsewhere.invalid/webhook/gchat' } }),
     );
 
-    await expect(
-      verifyExistingGchatEndpoint({ endpointUrl: ENDPOINT, audienceUrl: ENDPOINT }, { fetch }),
-    ).rejects.toThrow(/redirect/i);
+    await expect(verifyExistingGchatRoute({ endpointUrl: ENDPOINT }, { fetch })).rejects.toThrow(/redirect/i);
   });
 
   it.each([200, 404, 500])('does not accept a missing, bypassed, or unhealthy route (status %s)', async (status) => {
     const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response(null, { status }));
 
-    await expect(
-      verifyExistingGchatEndpoint({ endpointUrl: ENDPOINT, audienceUrl: ENDPOINT }, { fetch }),
-    ).rejects.toThrow(new RegExp(`401.*answered ${status}`, 'u'));
+    await expect(verifyExistingGchatRoute({ endpointUrl: ENDPOINT }, { fetch })).rejects.toThrow(
+      new RegExp(`401.*answered ${status}`, 'u'),
+    );
   });
 });
 
@@ -228,15 +201,10 @@ describe('default callback probe', () => {
     );
 
     await expect(verifyExistingGchatRoute({ endpointUrl: ENDPOINT })).resolves.toBe(ENDPOINT);
-    await expect(verifyExistingGchatEndpoint({ endpointUrl: ENDPOINT, audienceUrl: ENDPOINT })).resolves.toEqual({
-      endpointUrl: ENDPOINT,
-      audienceUrl: ENDPOINT,
-    });
     await expect(observeManagedGchatRoute({ endpointUrl: ENDPOINT, localEndpointUrl: localEndpoint })).resolves.toEqual(
       { status: 'routed', listenerId },
     );
     expect(vi.mocked(publicFetch).mock.calls.map(([url]) => String(url))).toEqual([
-      ENDPOINT,
       ENDPOINT,
       localEndpoint,
       ENDPOINT,

@@ -27,7 +27,7 @@ import {
   type CloudflareConnectorLayout,
   type CloudflareConnectorObservation,
 } from './cloudflare-connector.js';
-import { observeManagedGchatRoute, verifyExistingGchatEndpoint } from './endpoint.js';
+import { observeManagedGchatRoute, verifyExistingGchatRoute } from './endpoint.js';
 import { MAIN_GROUP_NAME } from './identity.js';
 import { readProvisionJournal } from './journal.js';
 import { runInstanceNclJson } from './ncl.js';
@@ -835,10 +835,7 @@ async function routeProbe({ reservation, observers }: Subject): Promise<ProbeRes
   const ingress = reservation.exclusive_resource_claims.ingress;
   const dependencies = observers.fetch ? { fetch: observers.fetch } : {};
   if (ingress.mode === 'existing') {
-    await verifyExistingGchatEndpoint(
-      { endpointUrl: ingress.endpoint_url, audienceUrl: ingress.endpoint_url },
-      dependencies,
-    );
+    await verifyExistingGchatRoute({ endpointUrl: ingress.endpoint_url }, dependencies);
     return OK;
   }
   const seen = await observeManagedGchatRoute(

@@ -117,6 +117,7 @@ import {
   type InstanceRuntimeConfig,
 } from './service.js';
 import { createServiceControl, runtimeServiceTarget } from './service-control.js';
+import type { ServiceState } from './status.js';
 import {
   GwsEaError,
   INSTANCE_MARKER_SCHEMA_VERSION,
@@ -314,7 +315,31 @@ async function discardAfterFailure(
   }
 }
 
-/** A stopped assistant cannot prove its new release serves; one outside its service cannot be stopped for the cutover. */
+/**
+ * Why an assistant's service keeps an update from it, naming what fixes it:
+ * an update proves its new release on a running host, and stops that host
+ * for the cutover through its service. `update --id` and `update --all` give
+ * the same reason; `reason` is what was observed of an unmanaged host or an
+ * unobservable service.
+ */
+export function serviceRefusal(
+  instanceId: string,
+  state: Exclude<ServiceState, 'running'>,
+  reason: string | null,
+): string {
+  switch (state) {
+    case 'stopped':
+      return `It is stopped, and an update proves its new release on a running assistant; start it with gws-ea start --id ${instanceId}, then update it.`;
+    case 'not_installed':
+      return `No NanoClaw service is installed for it; gws-ea resume --id ${instanceId} installs it.`;
+    case 'unmanaged':
+      return `${reason ?? 'Its host runs outside its service.'} Stop that process and start it with gws-ea start --id ${instanceId}, then update it.`;
+    case 'unknown':
+      return `Its service could not be observed: ${reason ?? 'unknown'}`;
+  }
+}
+
+/** The assistant's service must run its host; `serviceRefusal` says why it does not. */
 function assertHostRunning(runtime: InstanceRuntimeConfig, dependencies: UpdateDependencies): void {
   const id = runtime.instance_id;
   const handle = createServiceControl(
@@ -322,18 +347,17 @@ function assertHostRunning(runtime: InstanceRuntimeConfig, dependencies: UpdateD
     runtimeServiceTarget(runtime),
     dependencies.service,
   ).detect();
+  const refused = (code: string, state: Exclude<ServiceState, 'running'>, reason: string | null = null) =>
+    new GwsEaError(code, `Assistant ${id} cannot be updated. ${serviceRefusal(id, state, reason)}`);
+  if (handle.mode === 'none') throw refused('service_not_installed', 'not_installed');
   if (handle.mode === 'unmanaged') {
-    throw new GwsEaError(
+    throw refused(
       'service_unmanaged',
-      `Assistant ${id}'s host runs from ${runtime.checkout_realpath} outside its service (PID ${handle.name}); stop that process and start the assistant with gws-ea start --id ${id}, then update.`,
+      'unmanaged',
+      `A NanoClaw host runs from ${runtime.checkout_realpath} outside its service (PID ${handle.pid ?? handle.name ?? 'unknown'}).`,
     );
   }
-  if (!handle.active) {
-    throw new GwsEaError(
-      'host_not_running',
-      `Assistant ${id} is stopped, and an update proves its new release on a running assistant. Start it with gws-ea start --id ${id}, then update.`,
-    );
-  }
+  if (!handle.active) throw refused('host_not_running', 'stopped');
 }
 
 /** Every byte under `root`, each file counted once however many links it has; links are not followed. */

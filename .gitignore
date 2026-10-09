@@ -61,5 +61,5 @@ docs/rebuild/
 forks.md
 .worktrees/
 
-# GWS-EA fixture capture staging (flag-gated live-gate captures, curated before commit)
+# GWS-EA fixture capture staging (captures from earlier releases; curate before committing)
 .gws-ea-fixture-staging/

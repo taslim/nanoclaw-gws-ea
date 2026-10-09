@@ -67,7 +67,7 @@ import {
   type PrincipalCandidate,
   type PrincipalDiscoveryDependencies,
 } from './principal.js';
-import { verifyExistingGchatEndpoint, verifyExistingGchatRoute, validateExistingGchatEndpoint } from './endpoint.js';
+import { verifyExistingGchatRoute, validateExistingGchatEndpoint } from './endpoint.js';
 import {
   instanceErrorsSince,
   verifyPrincipalBinding,
@@ -210,7 +210,6 @@ export interface ProductionProvisionDependencies {
   readonly findPortHolder: typeof findPortHolder;
   readonly reconcileMainIdentity: typeof reconcileMainIdentity;
   readonly verifyRoute: typeof verifyExistingGchatRoute;
-  readonly verifyEndpoint: typeof verifyExistingGchatEndpoint;
   readonly verifyPrincipalBinding: (input: PrincipalBindingVerificationInput) => PrincipalBindingVerificationResult;
   readonly reconcilePrincipal: typeof reconcilePrincipalDm;
   readonly verifyConversation: (input: ConversationVerificationInput) => ConversationVerificationResult;
@@ -657,7 +656,6 @@ const defaultProductionDependencies: ProductionProvisionDependencies = {
   findPortHolder,
   reconcileMainIdentity,
   verifyRoute: verifyExistingGchatRoute,
-  verifyEndpoint: verifyExistingGchatEndpoint,
   verifyPrincipalBinding,
   reconcilePrincipal: reconcilePrincipalDm,
   verifyConversation: verifyTalkableConversation,
@@ -1138,10 +1136,7 @@ export function createProductionProvisionSteps(
           observe: async (value) => {
             if (!value.input.chatConfigured) return { status: 'pause', pause: chatConfigurationPause(value.input) };
             try {
-              await dependencies.verifyEndpoint({
-                endpointUrl: input.runtime.endpoint_url,
-                audienceUrl: input.runtime.endpoint_url,
-              });
+              await dependencies.verifyRoute({ endpointUrl: input.runtime.endpoint_url });
               return PRESENT;
               /* eslint-disable-next-line no-catch-all/no-catch-all -- Any auth-probe failure means the external postcondition is absent. */
             } catch {
@@ -1150,10 +1145,7 @@ export function createProductionProvisionSteps(
           },
           apply: async (value) => {
             if (!value.input.chatConfigured) return chatConfigurationPause(value.input);
-            await dependencies.verifyEndpoint({
-              endpointUrl: input.runtime.endpoint_url,
-              audienceUrl: input.runtime.endpoint_url,
-            });
+            await dependencies.verifyRoute({ endpointUrl: input.runtime.endpoint_url });
             return undefined;
           },
         },

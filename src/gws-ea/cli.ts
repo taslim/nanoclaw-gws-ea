@@ -1,4 +1,3 @@
-import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -89,7 +88,7 @@ import {
   type RollbackPreview,
   type RollbackRequest,
 } from './rollback.js';
-import { FIXTURE_STAGING_DIRECTORY, startRunLog, type RunLog } from './run-log.js';
+import { startRunLog, type RunLog } from './run-log.js';
 import { buildInstanceCliCommand, type HostStatusHelpers, type UpsertEnvVars } from './service.js';
 import {
   createServiceControl,
@@ -268,8 +267,7 @@ type UpdateLauncher = Required<
 >;
 
 const COMMON_OPTIONS = ['secrets-file'] as const;
-const COMMON_SWITCHES = ['capture-fixtures'] as const;
-/** The host service commands name the assistant and nothing else: they read no secrets and capture nothing. */
+/** The host service commands name the assistant and nothing else: they read no secrets. */
 const SERVICE_OPTIONS: OptionSpec = { values: ['id'], switches: [] };
 
 /** A command's flags, with the options it takes once per value. */
@@ -288,15 +286,15 @@ interface ParsedOptions {
 const COMMAND_OPTIONS: Readonly<Record<Command, CommandOptionSpec>> = {
   create: {
     values: ['track', 'source-remote', 'google-account', ...CREATE_INPUT_FLAGS, ...COMMON_OPTIONS],
-    switches: COMMON_SWITCHES,
+    switches: [],
     repeatable: [PRINCIPAL_EMAIL_FLAG],
   },
   resume: {
     values: ['id', 'messaging-group-id', 'google-client-file', ...COMMON_OPTIONS],
-    switches: ['chat-configured', ...COMMON_SWITCHES],
+    switches: ['chat-configured'],
   },
-  remove: { values: ['id', 'abandon', ...COMMON_OPTIONS], switches: ['yes', ...COMMON_SWITCHES] },
-  'connect-google': { values: ['id', 'google-client-file', ...COMMON_OPTIONS], switches: COMMON_SWITCHES },
+  remove: { values: ['id', 'abandon', ...COMMON_OPTIONS], switches: ['yes'] },
+  'connect-google': { values: ['id', 'google-client-file', ...COMMON_OPTIONS], switches: [] },
   start: SERVICE_OPTIONS,
   stop: SERVICE_OPTIONS,
   restart: SERVICE_OPTIONS,
@@ -693,7 +691,6 @@ class Cli {
       '--id',
       state.instanceId,
       ...(plan.options['secrets-file'] ? ['--secrets-file', plan.options['secrets-file']] : []),
-      ...(plan.options['capture-fixtures'] ? ['--capture-fixtures'] : []),
     ];
     return () => this.prepare('resume', resumeArgs)();
   }
@@ -916,8 +913,8 @@ class Cli {
   /**
    * Connect a created assistant's own Google account (KTD5): the same
    * resources as create's `connect_google` step, outside the provision
-   * journal, so an assistant created before Google access gains it without
-   * being recreated, and a lost or outdated sign-in is repaired.
+   * journal, so a lost or outdated sign-in is repaired without recreating
+   * the assistant.
    */
   async #connectGoogleWork({ reporter, interaction }: Session, instanceId: string): Promise<Outcome> {
     const operation = await acquireInstanceOperation(this.#paths, instanceId, { command: 'connect-google' });
@@ -926,12 +923,6 @@ class Cli {
       const runtime = await loadCreatedRuntime(this.#paths, instanceId);
       const reservation = await getInstanceReservation(this.#paths, instanceId);
       const claims = reservation.exclusive_resource_claims;
-      if (!existsSync(path.join(reservation.checkout_realpath, 'src', 'modules', 'gws-ea-google', 'index.ts'))) {
-        throw new GwsEaError(
-          'update_required',
-          `This assistant runs a release without Google access. Update it first: gws-ea update --id ${instanceId}`,
-        );
-      }
       await runStep(reporter, PREREQUISITES_STEP, async () => {
         const host = await recordedHost(this.#paths, reservation);
         await this.#checkPrerequisites(
@@ -1331,7 +1322,6 @@ class Cli {
               ]
             : []),
         ],
-        ...(plan.options['capture-fixtures'] ? { captureFixturesTo: FIXTURE_STAGING_DIRECTORY } : {}),
       });
       const emit = (event: RunEvent): void => {
         if (event.type === 'step-started' && event.label) labels.set(event.step, event.label);
@@ -1775,7 +1765,7 @@ function printHelp(output: LineWriter): void {
   output(
     '         Removes a NanoClaw install set up or started in the checkout gws-ea runs from; create and update do this first.',
   );
-  output('  create, resume, remove: [--secrets-file <owner-only file under the config root>] [--capture-fixtures]');
+  output('  create, resume, remove: [--secrets-file <owner-only file under the config root>]');
   output('  Secrets: GWS_EA_PROVIDER_CREDENTIAL, GWS_EA_CLOUDFLARE_API_TOKEN (environment or --secrets-file).');
   output('  Exit codes: 0 ready, 10 paused for a person, 1 failed, 75 busy; ncl and logs exit as their tool does.');
 }

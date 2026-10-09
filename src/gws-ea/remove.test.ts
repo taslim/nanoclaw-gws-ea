@@ -1258,65 +1258,6 @@ describe('removal from any partial state', () => {
     });
     expect((await readRegistry(paths)).instances[stuck.instance_id]).toEqual(stuck);
   });
-
-  it('removes an instance an earlier launcher left mid-removal, from its own state files', async () => {
-    const paths = await testPaths();
-    const instanceId = allocateInstanceId();
-    const ownershipId = allocateInstanceId();
-    const fixtures = path.join(import.meta.dirname, '__fixtures__', 'pre-v3');
-    const values: Record<string, string> = {
-      INSTANCE_ID: instanceId,
-      INSTALL_ID: instanceId.replaceAll('-', ''),
-      GCP_PROJECT: projectFor(instanceId),
-      CHECKOUT: paths.checkoutRoot(instanceId),
-      SECRETS: path.join(paths.instanceRoot(instanceId), 'secrets'),
-      OWNERSHIP_ID: ownershipId,
-      TUNNEL_NAME: `gws-ea-${ownershipId.replaceAll('-', '')}`,
-      TUNNEL_ID,
-      HOME: path.join(paths.stateRoot, 'home'),
-    };
-    const load = async (name: string): Promise<unknown> =>
-      JSON.parse(
-        (await readFile(path.join(fixtures, name), 'utf8')).replaceAll(/__([A-Z_]+)__/gu, (_match, key: string) => {
-          const value = values[key];
-          if (value === undefined) throw new Error(`Unknown fixture value ${key}`);
-          return value;
-        }),
-      );
-    await writePrivate(paths.registryFile, await load('instances.json'));
-    await mkdir(path.join(paths.checkoutRoot(instanceId), 'data', 'gws-ea'), { recursive: true, mode: 0o700 });
-    await writeInstanceMarker(paths, instanceId);
-    await writePrivate(paths.journalFile(instanceId), await load('provision.json'));
-    await writePrivate(
-      path.join(paths.checkoutRoot(instanceId), 'data', 'gws-ea', 'runtime.json'),
-      await load('runtime.json'),
-    );
-    await writePrivate(paths.removalFile(instanceId), await load('removal.json'));
-    await mkdir(paths.cloudflareRoot, { recursive: true, mode: 0o700 });
-    const reservation = (await readRegistry(paths)).instances[instanceId]!;
-    const { dependencies, gcloud, cloudflare, order } = world(reservation);
-    gcloud.owned();
-    cloudflare.tunnels = [{ id: TUNNEL_ID, name: values.TUNNEL_NAME! }];
-    cloudflare.dns = [dnsRecord(reservation)];
-
-    const outcome = await removeAssistant(paths, instanceId, dependencies);
-
-    // An earlier journal is unreadable to this launcher, so every resource is observed.
-    expect(order).toEqual(['dns', 'connector', 'tunnel', 'nanoclaw', 'gcp', 'onecli']);
-    expect(outcome.removed).toEqual(['managed-ingress', 'nanoclaw', 'gcp-project', 'onecli', 'instance-files']);
-    // The earlier runtime recorded no Docker endpoint, so the active one is used; the OneCLI CLI is its own.
-    expect(dependencies.resolveDocker).toHaveBeenCalledWith(undefined);
-    expect(dependencies.removeOnecli).toHaveBeenCalledWith(reservation, {
-      homeDirectory: values.HOME,
-      dockerEndpoint: DOCKER,
-      onecliCliPath: '/opt/onecli/bin/onecli',
-    });
-    await expectGone(paths, reservation);
-    expect(await readRegistry(paths)).toMatchObject({
-      instances: {},
-      shared_infrastructure_metadata: { cloudflare: null },
-    });
-  });
 });
 
 describe('removal after an update or rollback', () => {
@@ -1903,6 +1844,22 @@ describe('removal safety', () => {
     expect(cloudflare.dns).toHaveLength(1);
     expect(await readFile(paths.registryFile, 'utf8')).not.toContain('account-token-canary');
     expect(await readFile(paths.removalFile(input.instance_id), 'utf8')).not.toContain('account-token-canary');
+  });
+
+  it('refuses DNS records at the hostname when this machine has no tunnel they could point to, deleting nothing', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(paths, { managed: true }), {
+      started: ['materialize_checkout', 'establish_transport'],
+    });
+    const { dependencies, cloudflare } = world(input);
+    cloudflare.dns = [dnsRecord(input)];
+
+    await expect(removeAssistant(paths, input.instance_id, dependencies)).rejects.toMatchObject({
+      code: 'foreign_cloudflare_dns',
+      message: expect.stringContaining('target.example.test'),
+    });
+    expect(cloudflare.dns).toHaveLength(1);
+    expect(cloudflare.calls).toEqual([]);
   });
 
   it('keeps existing-endpoint removal free of Cloudflare', async () => {

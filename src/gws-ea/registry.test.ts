@@ -19,6 +19,7 @@ import {
   assertRegistryMarkerAgreement,
   readRegistry,
   swapInstanceRelease,
+  withLockedCloudflareRegistry,
   writeInstanceMarker,
 } from './registry.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
@@ -281,6 +282,16 @@ describe('machine registry', () => {
       tunnel_id: null,
     });
     expect(registry.shared_infrastructure_metadata.cloudflare?.ownership_id).toMatch(/^[0-9a-f-]{36}$/u);
+  });
+
+  it('records and reads back a tunnel whose ID is a version 7 UUID', async () => {
+    const paths = await testPaths();
+    await reserveInstance(paths, managedReservation(paths));
+    const v7 = '01922b7e-8c3a-7d4e-9f12-3456789abcde';
+
+    await withLockedCloudflareRegistry(paths, (locked) => locked.updateCoordinates({ tunnelId: v7 }));
+
+    expect((await readRegistry(paths)).shared_infrastructure_metadata.cloudflare?.tunnel_id).toBe(v7);
   });
 
   it.each([

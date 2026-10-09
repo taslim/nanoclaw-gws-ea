@@ -8,7 +8,6 @@ import type { NanoclawServiceHelpers } from './service-control.js';
 
 import { PauseRequired, pendingActionOf, SignInRequired, type RunEvent } from './events.js';
 import {
-  contractSteps,
   readProvisionJournal,
   recordPrincipalSelection,
   reserveInstance,
@@ -327,22 +326,6 @@ function startedSteps(events: readonly RunEvent[]): string[] {
 
 const FULL_WAIT = OBSERVATION_WAITS_SECONDS.map((seconds) => seconds * 1_000);
 
-/** Rewrite the instance's journal as an earlier launcher left it: contract 1, with `steps` complete. */
-async function contractOneJournal(engine: Awaited<ReturnType<typeof engineFixture>>, steps: readonly string[]) {
-  const file = engine.paths.journalFile(engine.instanceId);
-  const raw = JSON.parse(await readFile(file, 'utf8')) as Record<string, unknown>;
-  const at = new Date().toISOString();
-  await writeFile(
-    file,
-    JSON.stringify({
-      ...raw,
-      launcher_contract_version: 1,
-      steps: Object.fromEntries(steps.map((step) => [step, { started_at: at, completed_at: at }])),
-    }),
-    { mode: 0o600 },
-  );
-}
-
 /** These provisions stop before the host starts, so NanoClaw's service helpers are never reached. */
 const UNUSED_SERVICE_HELPERS: NanoclawServiceHelpers = new Proxy({} as NanoclawServiceHelpers, {
   get: () => {
@@ -351,29 +334,6 @@ const UNUSED_SERVICE_HELPERS: NanoclawServiceHelpers = new Proxy({} as NanoclawS
 });
 
 describe('step engine', () => {
-  it('runs only its own steps for an assistant created under contract 1, never the Google sign-in', async () => {
-    const engine = await engineFixture();
-    await contractOneJournal(engine, contractSteps(1));
-    for (const id of contractSteps(1)) engine.world.present.add(id);
-
-    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
-
-    expect(startedSteps(engine.events)).not.toContain('connect_google');
-    expect(engine.world.applied).toEqual([]);
-    expect((await engine.journal()).steps.connect_google).toBeUndefined();
-  });
-
-  it('refuses to finish a contract 1 setup, naming remove and recreate', async () => {
-    const engine = await engineFixture();
-    await contractOneJournal(engine, ['materialize_checkout', 'provision_gcp']);
-
-    const refusal = await engine.run().catch((error: unknown) => error);
-
-    expect(refusal).toMatchObject({ code: 'incompatible_launcher' });
-    expect(String((refusal as Error).message)).toContain(`gws-ea remove --id ${engine.instanceId}`);
-    expect(engine.world.applied).toEqual([]);
-  });
-
   it('runs a fresh instance in order, recording when each step started and completed', async () => {
     const engine = await engineFixture();
 
@@ -1618,11 +1578,11 @@ describe('production provision step composition', () => {
   it('pauses with the exact project-scoped Chat configuration handoff', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation(paths));
-    const verifyEndpoint = vi.fn();
+    const verifyRoute = vi.fn();
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
-      const phase = createProductionProvisionSteps(context, { verifyEndpoint }).configure_channel.resources[0]!;
+      const phase = createProductionProvisionSteps(context, { verifyRoute }).configure_channel.resources[0]!;
 
       await expect(phase.observe(context)).resolves.toMatchObject({
         status: 'pause',
@@ -1641,7 +1601,7 @@ describe('production provision step composition', () => {
       });
     });
 
-    expect(verifyEndpoint).not.toHaveBeenCalled();
+    expect(verifyRoute).not.toHaveBeenCalled();
   });
 
   it('uses the reserved managed callback byte-for-byte in runtime and Chat configuration', async () => {
@@ -2180,10 +2140,6 @@ async function productionHarness(): Promise<ProductionHarness> {
             if (!harness.routePublished) throw new GwsEaError('endpoint_unreachable', 'Route is not published');
             return endpointUrl;
           },
-          verifyEndpoint: async (endpoint) => ({
-            endpointUrl: endpoint.endpointUrl,
-            audienceUrl: endpoint.audienceUrl,
-          }),
           // Like `verifyPrincipalBinding`, the binding is found only for the candidate it is asked about.
           verifyPrincipalBinding: ({ selectedCandidate }) =>
             principalBound && selectedCandidate?.messagingGroupId === PRINCIPAL.messagingGroupId

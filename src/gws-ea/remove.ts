@@ -40,7 +40,7 @@ import {
 import {
   assertManagedCloudflareConfigurationOwnership,
   chooseOwnedDnsRecord,
-  desiredDnsRecord,
+  chooseOwnedTunnel,
   GCHAT_TUNNEL_PATH,
   renderManagedCloudflareConfiguration,
   replaceManagedCloudflareConfiguration,
@@ -274,10 +274,9 @@ function entries<K extends string, V>(keys: readonly K[], value: unknown, parse:
 }
 
 /**
- * The receipt of a removal already under way. Unknown fields are ignored; a
- * receipt an earlier launcher wrote keeps only its reservation snapshot, so
- * every resource is observed again. A receipt that cannot be read safely is
- * set aside: everything it could say is re-observed.
+ * The receipt of a removal already under way. Unknown fields are ignored. A
+ * receipt that cannot be read safely, or that another schema wrote, is set
+ * aside: everything it could say is re-observed.
  */
 async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promise<RemovalReceipt | undefined> {
   try {
@@ -285,19 +284,24 @@ async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promis
     if (!isRecord(raw) || raw.instance_id !== instanceId) {
       throw new GwsEaError('invalid_removal', 'Removal receipt does not match this instance');
     }
+    if (raw.schema_version !== RECEIPT_SCHEMA_VERSION) {
+      throw new GwsEaError(
+        'invalid_removal',
+        `Removal receipt schema ${String(raw.schema_version)} is not this launcher's`,
+      );
+    }
     const reservation = validateReservation(raw.reservation, paths);
     if (reservation.instance_id !== instanceId) {
       throw new GwsEaError('invalid_removal', 'Removal receipt reservation does not match this instance');
     }
-    const current = raw.schema_version === RECEIPT_SCHEMA_VERSION;
-    const unrestored = current ? evidenceOf(raw.key_policy_unrestored) : undefined;
+    const unrestored = evidenceOf(raw.key_policy_unrestored);
     return {
       schema_version: RECEIPT_SCHEMA_VERSION,
       instance_id: instanceId,
       reservation,
       started_at: canonicalTimestamp(raw.started_at) ?? new Date().toISOString(),
-      completed: current ? entries(REMOVAL_RESOURCES, raw.completed, canonicalTimestamp) : {},
-      abandoned: current ? entries(ABANDONABLE_RESOURCES, raw.abandoned, evidenceOf) : {},
+      completed: entries(REMOVAL_RESOURCES, raw.completed, canonicalTimestamp),
+      abandoned: entries(ABANDONABLE_RESOURCES, raw.abandoned, evidenceOf),
       ...(unrestored ? { key_policy_unrestored: unrestored } : {}),
     };
   } catch (error) {
@@ -498,25 +502,16 @@ async function deleteAndConfirm(send: () => Promise<void>, gone: () => Promise<b
   }
 }
 
-/** This machine's tunnel, by the name only it uses; one with another ID than recorded is refused. */
+/** This machine's tunnel, observed by the name only it uses. */
 async function observeTunnel(
   api: CloudflareApi,
   metadata: SharedCloudflareMetadata,
 ): Promise<CloudflareTunnel | undefined> {
-  const tunnels = await api.listTunnels(metadata.account_id, metadata.tunnel_name);
-  const [tunnel] = tunnels;
-  if (!tunnel) return undefined;
-  if (
-    tunnels.length > 1 ||
-    tunnel.name !== metadata.tunnel_name ||
-    (metadata.tunnel_id !== null && tunnel.id !== metadata.tunnel_id)
-  ) {
-    throw new GwsEaError(
-      'foreign_cloudflare_tunnel',
-      `Cloudflare tunnel ${metadata.tunnel_name} is not the one this machine recorded; refusing to change it`,
-    );
-  }
-  return tunnel;
+  return chooseOwnedTunnel(
+    await api.listTunnels(metadata.account_id, metadata.tunnel_name),
+    metadata.tunnel_name,
+    metadata.tunnel_id,
+  );
 }
 
 function requireCloudflareMetadata(registry: InstanceRegistry): SharedCloudflareMetadata {
@@ -656,17 +651,8 @@ async function removeManagedIngress(removal: ManagedIngressRemoval): Promise<voi
   });
 
   if (removal.ownTransport) {
-    const observe = async (): Promise<CloudflareDnsRecord | undefined> => {
-      const records = await api.listDnsRecords(claim.zone_id, claim.hostname);
-      if (records.length === 0) return undefined;
-      if (tunnelId === null) {
-        throw new GwsEaError(
-          'foreign_cloudflare_dns',
-          `Cloudflare DNS name ${claim.hostname} has records, but this machine has no tunnel they could point to`,
-        );
-      }
-      return chooseOwnedDnsRecord(records, desiredDnsRecord(reservation, tunnelId), claim.dns_record_id);
-    };
+    const observe = async (): Promise<CloudflareDnsRecord | undefined> =>
+      chooseOwnedDnsRecord(await api.listDnsRecords(claim.zone_id, claim.hostname), reservation, tunnelId);
     const record = await observe();
     if (record) {
       await deleteAndConfirm(

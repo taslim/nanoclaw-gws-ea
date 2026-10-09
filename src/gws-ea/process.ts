@@ -507,7 +507,6 @@ export const runSanitizedCommandOutcome: SanitizedCommandOutcomeRunner = async (
     const stderrFact =
       command.stream || !outcome.stderr.trim() ? '' : `\n  stderr:\n${indent(redact(outcome.stderr.trim()))}`;
     step?.write(`  exit ${outcome.exitCode} after ${elapsed}${stdoutFact}${stderrFact}\n`);
-    if (!command.stream) step?.captureCommand({ program: command.command, args: command.args, ...outcome });
     return outcome;
   } catch (error) {
     const tail = error instanceof GwsEaError ? error.details?.stderrTail : undefined;

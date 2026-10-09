@@ -37,7 +37,7 @@ import { resolveReleaseTarget, type ToolProviderSetup } from './release-target.j
 import type { NanoclawServiceHelpers } from './service-control.js';
 import { listAssistants, unfinishedOperation, type ListedAssistant } from './status.js';
 import { GwsEaError, releaseOf, sameRelease, shortCommit, type ReleaseCoordinates } from './types.js';
-import { resolveUpdateIntent, type UpdatedAssistant, type UpdateSeams } from './update.js';
+import { resolveUpdateIntent, serviceRefusal, type UpdatedAssistant, type UpdateSeams } from './update.js';
 import { readCentralMigrations } from './verify.js';
 
 /** What `update --all` checks the assistants with. */
@@ -92,22 +92,6 @@ export interface UpdateAllSummary {
 
 function releaseName(release: ReleaseCoordinates): string {
   return `${release.release_track} ${shortCommit(release.deployed_commit)}`;
-}
-
-/** Why an assistant's service keeps it from an update, which proves its release on a running host; none when it runs. */
-function serviceRefusal({ instance_id: id, service }: ListedAssistant): string | undefined {
-  switch (service.state) {
-    case 'running':
-      return undefined;
-    case 'stopped':
-      return `It is stopped, and an update proves its new release on a running assistant; start it with gws-ea start --id ${id}, then update it.`;
-    case 'not_installed':
-      return `No NanoClaw service is installed for it; gws-ea resume --id ${id} installs it.`;
-    case 'unmanaged':
-      return `${service.reason ?? 'Its host runs outside its service.'} Stop that process and start it with gws-ea start --id ${id}, then update it.`;
-    case 'unknown':
-      return `Its service could not be observed: ${service.reason ?? 'unknown'}`;
-  }
 }
 
 /** Why the assistant's update or rollback record keeps it from an update, naming what moves it on, as `status` does. */
@@ -216,8 +200,8 @@ async function classify(
   const intended = await intendedTurn(context, instanceId, listed.operation, toolCommit);
   if (intended.kind === 'refused') return skip(intended.reason);
   // An update proves its release, and a recorded one's follow-ups run, through the assistant's running host.
-  const stopped = serviceRefusal(listed);
-  if (stopped) return skip(stopped);
+  const { state, reason } = listed.service;
+  if (state !== 'running') return skip(serviceRefusal(instanceId, state, reason));
   if (intended.kind === 'follow_ups') return { instanceId, eligible: true, turn: intended };
   const { from, to, checkout } = intended;
   const migrations = unappliedMigrations(checkout, await releaseMigrations());

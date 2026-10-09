@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -31,9 +31,7 @@ async function temporaryRoot(label: string, parent = os.tmpdir()): Promise<strin
   return root;
 }
 
-async function runLog(
-  options: { secretDirectories?: readonly string[]; captureFixturesTo?: string } = {},
-): Promise<RunLog> {
+async function runLog(options: { secretDirectories?: readonly string[] } = {}): Promise<RunLog> {
   const root = await temporaryRoot('process-run');
   return startRunLog({
     paths: resolveControlPlanePaths({ configRoot: path.join(root, 'config'), stateRoot: path.join(root, 'state') }),
@@ -527,35 +525,6 @@ describe('GWS-EA command runner', () => {
 
     expect((await failure(runSanitizedCommand(command))).code).toBe('command_output_limit');
     await expect(runSanitizedCommand({ ...command, stream: true })).resolves.toMatchObject({ stdout: '' });
-  });
-
-  it('captures an allowlisted read with the stdout the runner parsed when the run enables capture', async () => {
-    const root = await temporaryRoot('capture');
-    const bin = path.join(root, 'bin');
-    const staging = path.join(root, 'staging');
-    await mkdir(bin);
-    await writeFile(path.join(bin, 'gcloud'), '#!/bin/sh\nprintf \'[{"projectId":"gws-ea-fixture"}]\'\n', {
-      mode: 0o755,
-    });
-    const run = await runLog({ captureFixturesTo: staging });
-
-    await run.step('provision_gcp', () =>
-      runSanitizedCommand({
-        command: 'gcloud',
-        args: ['projects', 'list', '--format=json'],
-        cwd: root,
-        env: { PATH: bin },
-      }),
-    );
-
-    const staged = await Promise.all(
-      (await readdir(staging)).map(
-        async (file) => JSON.parse(await readFile(path.join(staging, file), 'utf8')) as unknown,
-      ),
-    );
-    expect(staged).toEqual([
-      expect.objectContaining({ kind: 'command', program: 'gcloud', stdout: '[{"projectId":"gws-ea-fixture"}]' }),
-    ]);
   });
 });
 

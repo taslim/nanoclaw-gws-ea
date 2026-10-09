@@ -7,7 +7,6 @@ import { writePrivate } from '../community-portal/private-file.js';
 import {
   acquireInstanceOperation,
   assertInstanceCreated,
-  contractSteps,
   LAUNCHER_CONTRACT_VERSION,
   loadCreatedRuntime,
   readProvisionJournal,
@@ -116,8 +115,8 @@ describe('provision journal v3', () => {
       'incompatible_launcher',
     ],
     [
-      'a launcher contract older than any this launcher reads',
-      { launcher_contract_version: 0 },
+      'a contract 1 journal, from before the Google sign-in step',
+      { launcher_contract_version: 1 },
       'incompatible_launcher',
     ],
   ] as const)('refuses %s with remove-and-recreate guidance and leaves it untouched', async (_label, change, code) => {
@@ -289,43 +288,15 @@ describe('provision journal v3', () => {
     start?.release();
   });
 
-  it('reads a contract 1 journal, whose steps do not include the Google sign-in', async () => {
-    expect(LAUNCHER_CONTRACT_VERSION).toBe(2);
-    expect(contractSteps(2)).toEqual([...PROVISION_STEPS]);
-    expect(contractSteps(1)).toEqual(PROVISION_STEPS.filter((step) => step !== 'connect_google'));
-    expect(contractSteps(2).indexOf('connect_google')).toBe(contractSteps(2).indexOf('configure_channel') + 1);
-    expect(contractSteps(2).indexOf('connect_google')).toBe(contractSteps(2).indexOf('bind_principal') - 1);
-
+  it('counts an assistant created only once its Google sign-in step is complete', async () => {
     const { paths, input } = await fixture();
     const completedAt = new Date().toISOString();
     const raw = await rawJournal(paths, input.instance_id);
     const steps = Object.fromEntries(
-      contractSteps(1).map((step) => [step, { started_at: completedAt, completed_at: completedAt }]),
-    );
-    await writeFile(
-      paths.journalFile(input.instance_id),
-      JSON.stringify({ ...raw, launcher_contract_version: 1, steps }),
-      { mode: 0o600 },
-    );
-
-    expect(await readProvisionJournal(paths, input.instance_id)).toMatchObject({ launcher_contract_version: 1 });
-    await expect(assertInstanceCreated(paths, input.instance_id)).resolves.toBeUndefined();
-    const target = { ...releaseOf(input), deployed_commit: 'b'.repeat(40) };
-    for (const intent of [{ command: 'update', target }, { command: 'rollback' }, { command: 'start' }] as const) {
-      const operation = await acquireInstanceOperation(paths, input.instance_id, intent);
-      expect(operation).not.toBeNull();
-      operation?.release();
-    }
-  });
-
-  it('counts a contract 2 assistant created only once its Google sign-in step is complete', async () => {
-    const { paths, input } = await fixture();
-    const completedAt = new Date().toISOString();
-    const raw = await rawJournal(paths, input.instance_id);
-    const steps = Object.fromEntries(
-      contractSteps(2)
-        .filter((step) => step !== 'connect_google')
-        .map((step) => [step, { started_at: completedAt, completed_at: completedAt }]),
+      PROVISION_STEPS.filter((step) => step !== 'connect_google').map((step) => [
+        step,
+        { started_at: completedAt, completed_at: completedAt },
+      ]),
     );
     await writeFile(paths.journalFile(input.instance_id), JSON.stringify({ ...raw, steps }), { mode: 0o600 });
 

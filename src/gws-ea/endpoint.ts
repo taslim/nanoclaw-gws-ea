@@ -6,16 +6,6 @@ const CALLBACK_PATH = '/webhook/gchat';
 const MANAGED_WRONG_PATH = '/__gws_ea_wrong_path__';
 const WEBHOOK_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
-export interface ExistingGchatEndpointInput {
-  readonly endpointUrl: string;
-  readonly audienceUrl: string;
-}
-
-export interface VerifiedGchatEndpoint {
-  readonly endpointUrl: string;
-  readonly audienceUrl: string;
-}
-
 export interface ExistingGchatRouteInput {
   readonly endpointUrl: string;
 }
@@ -124,26 +114,11 @@ function validateLocalGchatEndpoint(value: string): string {
 }
 
 /**
- * Verify the operator-owned route without following redirects. A real signed
- * Google Chat event is the authentication proof; a fabricated JWT cannot
- * distinguish signature rejection from audience rejection.
+ * Prove that the operator-owned callback route exists and fails closed,
+ * without following redirects. A real signed Google Chat event is the
+ * authentication proof; a fabricated JWT cannot distinguish signature
+ * rejection from audience rejection.
  */
-export async function verifyExistingGchatEndpoint(
-  input: ExistingGchatEndpointInput,
-  dependencies: EndpointVerificationDependencies = {},
-): Promise<VerifiedGchatEndpoint> {
-  const endpointUrl = validateExistingGchatEndpoint(input.endpointUrl);
-  const audienceUrl = validateExistingGchatEndpoint(input.audienceUrl);
-  if (endpointUrl !== audienceUrl) {
-    throw new GwsEaError('audience_mismatch', 'Google Chat authentication audience must equal the claimed endpoint');
-  }
-  const fetchImplementation = dependencies.fetch ?? publicFetch;
-  const timeoutMs = dependencies.timeoutMs ?? 10_000;
-  await expectUnauthorized(fetchImplementation, endpointUrl, timeoutMs);
-  return { endpointUrl, audienceUrl };
-}
-
-/** Prove that the operator-owned callback route exists and fails closed. */
 export async function verifyExistingGchatRoute(
   input: ExistingGchatRouteInput,
   dependencies: EndpointVerificationDependencies = {},

@@ -79,6 +79,7 @@ import { instanceMarkerFile } from './paths.js';
 import type { SanitizedCommandRunner } from './process.js';
 import { getInstanceReservation, swapInstanceRelease } from './registry.js';
 import type { InstanceRuntimeConfig } from './service.js';
+import type { NanoclawServiceHelpers } from './service-control.js';
 import { GwsEaError, PROVISION_STEPS, releaseOf, type ReleaseCoordinates } from './types.js';
 import {
   confirmStagedUpdate,
@@ -1868,6 +1869,27 @@ describe('gws-ea update', GIT_HEAVY, () => {
     expect(summary).not.toContain('Retry with');
     expect(await exists(host.paths.releaseRoot(runtime.instance_id, 'next'))).toBe(false);
     expect(state.running).toBe(false);
+  });
+
+  it('refuses an assistant whose service is not installed naming gws-ea resume, not start, staging nothing', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    const serviceHelpers: NanoclawServiceHelpers = {
+      ...dependencies(state, next, runtime).serviceHelpers,
+      detectService: () => ({ mode: 'none', active: false }),
+    };
+    const { run, err } = cli(host, state, next, runtime, { serviceHelpers });
+
+    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
+
+    const summary = err.join('\n');
+    expect(summary).toContain('No NanoClaw service is installed for it');
+    expect(summary).toContain(`gws-ea resume --id ${runtime.instance_id}`);
+    expect(summary).not.toContain('gws-ea start');
+    expect(summary).not.toContain('Retry with');
+    expect(await exists(host.paths.releaseRoot(runtime.instance_id, 'next'))).toBe(false);
   });
 
   it('refuses to start another update while one to a different release is unfinished, naming what continues it', async () => {

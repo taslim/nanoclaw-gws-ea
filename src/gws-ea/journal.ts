@@ -4,12 +4,9 @@
  * journal means nothing started, and every later write replaces it atomically
  * under the instance operation lock.
  *
- * Readers ignore unknown fields. A journal from before schema 3, or from a
- * step contract this launcher does not read, is refused with guidance to
- * remove and recreate the assistant: pre-release instances are disposable.
- * An assistant created under an earlier contract this launcher reads stays
- * operable, judged created by its own contract's steps; only an unfinished
- * one cannot be continued (KTD5).
+ * Readers ignore unknown fields. A journal from before schema 3, or from
+ * another step contract, is refused with guidance to remove and recreate the
+ * assistant: pre-release instances are disposable.
  *
  * The instance operation lock is here too, with its gate: a removal under way
  * refuses every command, and an unfinished update or rollback refuses every
@@ -53,29 +50,13 @@ import { hasControlCharacters, isRecord, requireCanonicalTimestamp, requireStrin
 export const PROVISION_JOURNAL_SCHEMA_VERSION = 3 as const;
 
 /**
- * The step contract this launcher provisions under. Bump it when a launcher
- * can no longer continue a journal an earlier launcher started: the steps,
- * their order, or what a completed step promises changed. Contract 2 added
- * the assistant's Google sign-in (`connect_google`) before the welcome.
+ * The step contract this launcher provisions under, `PROVISION_STEPS`. Bump
+ * it when a launcher can no longer read a journal an earlier launcher wrote:
+ * the steps, their order, or what a completed step promises changed. Contract
+ * 2 added the assistant's Google sign-in (`connect_google`) before the
+ * welcome.
  */
 export const LAUNCHER_CONTRACT_VERSION = 2 as const;
-
-/** The contracts whose journals this launcher reads. */
-export type LauncherContract = 1 | 2;
-
-const CONTRACT_STEPS: Readonly<Record<LauncherContract, readonly ProvisionStepId[]>> = {
-  1: PROVISION_STEPS.filter((step) => step !== 'connect_google'),
-  2: PROVISION_STEPS,
-};
-
-/** The steps a contract provisions, in run order. */
-export function contractSteps(contract: LauncherContract): readonly ProvisionStepId[] {
-  return CONTRACT_STEPS[contract];
-}
-
-function isLauncherContract(value: unknown): value is LauncherContract {
-  return value === 1 || value === 2;
-}
 
 export interface JournalStep {
   readonly started_at: string;
@@ -102,7 +83,7 @@ export interface JournalError {
 export interface ProvisionJournal {
   readonly schema_version: typeof PROVISION_JOURNAL_SCHEMA_VERSION;
   readonly instance_id: string;
-  readonly launcher_contract_version: LauncherContract;
+  readonly launcher_contract_version: typeof LAUNCHER_CONTRACT_VERSION;
   /** When provisioning began: only principal messages after it count. */
   readonly started_at: string;
   readonly steps: Readonly<Partial<Record<ProvisionStepId, JournalStep>>>;
@@ -189,7 +170,7 @@ function parseJournal(value: unknown, instanceId: string): ProvisionJournal {
   if (value.instance_id !== instanceId) {
     throw new GwsEaError('journal_mismatch', 'Provision journal and registry instance IDs disagree');
   }
-  if (!isLauncherContract(value.launcher_contract_version)) {
+  if (value.launcher_contract_version !== LAUNCHER_CONTRACT_VERSION) {
     throw new GwsEaError(
       'incompatible_launcher',
       `This assistant was set up by a gws-ea launcher with a different step contract ` +
@@ -200,7 +181,7 @@ function parseJournal(value: unknown, instanceId: string): ProvisionJournal {
   return {
     schema_version: PROVISION_JOURNAL_SCHEMA_VERSION,
     instance_id: instanceId,
-    launcher_contract_version: value.launcher_contract_version,
+    launcher_contract_version: LAUNCHER_CONTRACT_VERSION,
     started_at: timestamp(value.started_at, 'start'),
     steps: parseSteps(value.steps),
     decisions: parseDecisions(value.decisions),
@@ -281,25 +262,9 @@ export async function assertInstanceCreated(paths: ControlPlanePaths, instanceId
   }
 }
 
-/** Whether every step of the journal's own contract is complete. */
-export function journalCreated(journal: ProvisionJournal): boolean {
-  return contractSteps(journal.launcher_contract_version).every(
-    (step) => journal.steps[step]?.completed_at !== undefined,
-  );
-}
-
-/**
- * Provisioning continues only a journal this launcher's contract started, or
- * one already created under its own: an unfinished journal from an earlier
- * contract cannot be finished by these steps.
- */
-export function assertContinuable(journal: ProvisionJournal): void {
-  if (journal.launcher_contract_version === LAUNCHER_CONTRACT_VERSION || journalCreated(journal)) return;
-  throw new GwsEaError(
-    'incompatible_launcher',
-    `This assistant's setup was started by an earlier gws-ea (step contract ${journal.launcher_contract_version}) ` +
-      `and cannot be finished by this one. ${recreate(journal.instance_id)}`,
-  );
+/** Whether every provision step is complete. */
+function journalCreated(journal: ProvisionJournal): boolean {
+  return PROVISION_STEPS.every((step) => journal.steps[step]?.completed_at !== undefined);
 }
 
 /** The runtime record of a fully created assistant, read from its own checkout (R18). */
