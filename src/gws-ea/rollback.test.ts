@@ -35,10 +35,12 @@ import {
   messages,
   NEW_IMAGE,
   nextRelease,
+  reboot,
   release,
   releaseTag,
   removeTemporaryRoots,
   repositoryImages,
+  serviceDefinitionFile,
   SESSION,
   status,
   temporaryRoot,
@@ -48,7 +50,7 @@ import {
   type World,
 } from './testing/cutover-fixture.js';
 import { acquireInstanceOperation } from './journal.js';
-import { readOperationRecord, readRollbackPoint, type OperationPhase } from './operation.js';
+import { readOperationRecord, readRollbackPoint, type OperationPhase, type RollbackMode } from './operation.js';
 import { getInstanceReservation } from './registry.js';
 import { releaseName } from './release-layout.js';
 import { rollBack, rollbackPreviewLines, summarizeDiscard, type RollbackPreview } from './rollback.js';
@@ -113,10 +115,33 @@ async function updatedAssistant(
   return { host, runtime, next, state };
 }
 
-/** Have the release the update deployed migrate the live database and serve a message, as its host does. */
-function migratedByNext(runtime: InstanceRuntimeConfig, ...served: readonly string[]): void {
+/** Have the release the update deployed migrate the live database and serve messages, as its host does. */
+async function migratedByNext(runtime: InstanceRuntimeConfig, ...served: readonly string[]): Promise<void> {
   applying(ADDED_MIGRATION)(path.join(runtime.state_root, 'data', 'v2.db'));
-  if (served.length > 0) void converse(runtime, ...served);
+  if (served.length > 0) await converse(runtime, ...served);
+}
+
+/** A person forgotten: the fingerprint the people module keeps of each identity it forgot. */
+const FORGOTTEN = { fingerprint: 'f'.repeat(64), forgotten_at: '2026-10-08T09:00:00.000Z' };
+
+/** Record the fingerprints of identities forgotten in the central database under `stateRoot`. */
+function forget(stateRoot: string, ...rows: ReadonlyArray<typeof FORGOTTEN>): void {
+  const database = new Database(path.join(stateRoot, 'data', 'v2.db'));
+  try {
+    database.exec(
+      'CREATE TABLE IF NOT EXISTS gws_ea_people_fingerprints (fingerprint TEXT PRIMARY KEY, forgotten_at TEXT NOT NULL)',
+    );
+    for (const row of rows) {
+      database.prepare('INSERT INTO gws_ea_people_fingerprints VALUES (?, ?)').run(row.fingerprint, row.forgotten_at);
+    }
+  } finally {
+    database.close();
+  }
+}
+
+/** The people forgotten since the snapshot that a restore handed the host to forget again, if any. */
+function forgetHandoff(runtime: InstanceRuntimeConfig) {
+  return readPeopleForgetHandoff(peopleForgetHandoffFile(path.join(runtime.state_root, 'data')));
 }
 
 /** The inode of the central database, which a code-only rollback never moves. */
@@ -233,7 +258,7 @@ describe('gws-ea rollback when a schema moved', GIT_HEAVY, () => {
   /** An assistant whose update migrated the database and served `m2` on the new release. */
   async function migrated() {
     const updated = await updatedAssistant();
-    migratedByNext(updated.runtime, 'm2');
+    await migratedByNext(updated.runtime, 'm2');
     return updated;
   }
 
@@ -302,6 +327,26 @@ describe('gws-ea rollback when a schema moved', GIT_HEAVY, () => {
     expect(receipt.discarded.inbound.ids).toEqual(['m2']);
   });
 
+  it("restores the snapshot when only the session databases' schema moved, saying why", async () => {
+    const { host, runtime, next, state } = await updatedAssistant();
+    // The new release served m2, and added a column to the session's inbound database as its host opened it.
+    await converse(runtime, 'm2');
+    const inbound = new Database(path.join(runtime.state_root, SESSION, 'inbound.db'));
+    try {
+      inbound.exec('ALTER TABLE messages_in ADD COLUMN on_wake INTEGER');
+    } finally {
+      inbound.close();
+    }
+    const { run, out } = cli(host, state, next, runtime);
+
+    expect(await run(['rollback', '--id', runtime.instance_id, '--yes'])).toBe(0);
+
+    expect(out.join('\n')).toContain("because the update changed its session databases' schema");
+    await expectRolledBack(host, runtime, next, state);
+    expect(messages(runtime.state_root)).toEqual(['m1']);
+    expect(readCentralMigrations(runtime.state_root)).toEqual([...LIVE_MIGRATIONS]);
+  });
+
   it('goes back to the release it left with the state it had when the restored release fails its checks', async () => {
     const { host, runtime, next, state } = await migrated();
     // The release it returns to never answers on its callback route.
@@ -352,33 +397,15 @@ describe('gws-ea rollback when a schema moved', GIT_HEAVY, () => {
 });
 
 describe('a person forgotten after the snapshot (KTD8)', GIT_HEAVY, () => {
-  const FORGOTTEN = { fingerprint: 'f'.repeat(64), forgotten_at: '2026-10-08T09:00:00.000Z' };
-
-  /** Record the fingerprints of identities forgotten in the central database under `stateRoot`. */
-  function forget(stateRoot: string, ...rows: ReadonlyArray<typeof FORGOTTEN>): void {
-    const database = new Database(path.join(stateRoot, 'data', 'v2.db'));
-    try {
-      database.exec(
-        'CREATE TABLE IF NOT EXISTS gws_ea_people_fingerprints (fingerprint TEXT PRIMARY KEY, forgotten_at TEXT NOT NULL)',
-      );
-      for (const row of rows) {
-        database.prepare('INSERT INTO gws_ea_people_fingerprints VALUES (?, ?)').run(row.fingerprint, row.forgotten_at);
-      }
-    } finally {
-      database.close();
-    }
-  }
-
   it('is handed to the host to forget again when a rollback restores a snapshot from before the forget', async () => {
     const { host, runtime, next, state } = await updatedAssistant();
     // Forgotten after the snapshot, on the new release.
-    migratedByNext(runtime);
+    await migratedByNext(runtime);
     forget(runtime.state_root, FORGOTTEN);
 
     expect(await cli(host, state, next, runtime).run(['rollback', '--id', runtime.instance_id, '--yes'])).toBe(0);
 
-    const handoff = await readPeopleForgetHandoff(peopleForgetHandoffFile(path.join(runtime.state_root, 'data')));
-    expect(handoff).toEqual({ fingerprints: [FORGOTTEN] });
+    expect(await forgetHandoff(runtime)).toEqual({ fingerprints: [FORGOTTEN] });
     const file = await stat(peopleForgetHandoffFile(path.join(runtime.state_root, 'data')));
     expect(file.mode & 0o777).toBe(0o600);
   });
@@ -390,18 +417,16 @@ describe('a person forgotten after the snapshot (KTD8)', GIT_HEAVY, () => {
     const next = await nextRelease(host, NEW_IMAGE);
     const state = world(runtime);
     expect(await cli(host, state, next, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
-    migratedByNext(runtime);
+    await migratedByNext(runtime);
 
     expect(await cli(host, state, next, runtime).run(['rollback', '--id', runtime.instance_id, '--yes'])).toBe(0);
 
-    expect(
-      await readPeopleForgetHandoff(peopleForgetHandoffFile(path.join(runtime.state_root, 'data'))),
-    ).toBeUndefined();
+    expect(await forgetHandoff(runtime)).toBeUndefined();
   });
 
   it('hands nothing over for an identity forgotten after the snapshot and added back by the principal since', async () => {
     const { host, runtime, next, state } = await updatedAssistant();
-    migratedByNext(runtime);
+    await migratedByNext(runtime);
     forget(runtime.state_root, FORGOTTEN);
     // Adding the identity back clears its fingerprint, so the state the restore replaces holds none.
     const database = new Database(path.join(runtime.state_root, 'data', 'v2.db'));
@@ -413,14 +438,12 @@ describe('a person forgotten after the snapshot (KTD8)', GIT_HEAVY, () => {
 
     expect(await cli(host, state, next, runtime).run(['rollback', '--id', runtime.instance_id, '--yes'])).toBe(0);
 
-    expect(
-      await readPeopleForgetHandoff(peopleForgetHandoffFile(path.join(runtime.state_root, 'data'))),
-    ).toBeUndefined();
+    expect(await forgetHandoff(runtime)).toBeUndefined();
   });
 
   it('is handed over again by a rollback resumed after its restore, before the record moved on', async () => {
     const { host, runtime, next, state } = await updatedAssistant();
-    migratedByNext(runtime);
+    await migratedByNext(runtime);
     forget(runtime.state_root, FORGOTTEN);
     const handoff = peopleForgetHandoffFile(path.join(runtime.state_root, 'data'));
     await killRollback(host, runtime, state, next, { before: 'snapshotted' });
@@ -459,8 +482,10 @@ async function killRollback(
   operation.release();
 }
 
-const PHASES: ReadonlyArray<readonly [OperationPhase, 'code_only' | 'snapshot']> = [
+/** Phases a rollback is killed right after recording, and the mode it takes: both at the fence, where it decides. */
+const PHASES: ReadonlyArray<readonly [OperationPhase, RollbackMode]> = [
   ['staged', 'code_only'],
+  ['fenced', 'code_only'],
   ['fenced', 'snapshot'],
   ['snapshotted', 'snapshot'],
   ['switched', 'code_only'],
@@ -471,7 +496,11 @@ const PHASES: ReadonlyArray<readonly [OperationPhase, 'code_only' | 'snapshot']>
 describe('a rollback killed at each phase', GIT_HEAVY, () => {
   it.each(PHASES)('killed once %s is recorded (%s), is finished the same by rollback --id', async (phase, mode) => {
     const { host, runtime, next, state } = await updatedAssistant();
-    if (mode === 'snapshot') migratedByNext(runtime, 'm2');
+    // The new release served m2 and forgot a person; to need the snapshot back, it also migrated the database.
+    if (mode === 'snapshot') await migratedByNext(runtime);
+    await converse(runtime, 'm2');
+    forget(runtime.state_root, FORGOTTEN);
+    const inode = await centralInode(runtime);
     await killRollback(host, runtime, state, next, { after: phase });
     expect((await readOperationRecord(host.paths, runtime.instance_id))?.phase).toBe(phase);
     const { run, err } = cli(host, state, next, runtime);
@@ -481,13 +510,46 @@ describe('a rollback killed at each phase', GIT_HEAVY, () => {
     expect(await run(['rollback', '--id', runtime.instance_id, '--yes'])).toBe(0);
 
     await expectRolledBack(host, runtime, next, state);
-    expect(messages(runtime.state_root)).toEqual(['m1']);
     expect(readCentralMigrations(runtime.state_root)).toEqual([...LIVE_MIGRATIONS]);
+    if (mode === 'code_only') {
+      // Only the code went back: everything since stayed where it was, and nobody needs forgetting again.
+      expect(await centralInode(runtime)).toBe(inode);
+      expect(messages(runtime.state_root)).toEqual(['m1', 'm2']);
+      expect(await forgetHandoff(runtime)).toBeUndefined();
+    } else {
+      // The snapshot came back, and the person forgotten since it is handed to the host to forget again.
+      expect(messages(runtime.state_root)).toEqual(['m1']);
+      expect(await forgetHandoff(runtime)).toEqual({ fingerprints: [FORGOTTEN] });
+    }
+  });
+
+  it('killed once switched after a login loaded the job, starts it from the definition its switch installed', async () => {
+    const host = await machine();
+    const older = '<plist>the definition the release it returns to rendered</plist>\n';
+    const runtime = await assistant(host, { serviceDefinition: older });
+    const next = await nextRelease(host, NEW_IMAGE);
+    const state = world(runtime);
+    expect(await cli(host, state, next, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
+    const updated = await readFile(serviceDefinitionFile(runtime), 'utf8');
+    // A login while fenced loads the job from the definition installed then, before the switch replaces it.
+    state.onStamp = () => reboot(state, runtime);
+    await killRollback(host, runtime, state, next, { after: 'switched' });
+    delete state.onStamp;
+    expect(state.loadedDefinition).toBe(updated);
+    expect(await readFile(serviceDefinitionFile(runtime), 'utf8')).toBe(older);
+    state.events.length = 0;
+
+    expect(await cli(host, state, next, runtime).run(['rollback', '--id', runtime.instance_id, '--yes'])).toBe(0);
+
+    // The resumed rollback fenced again first: its stop booted the job out, so the start read the installed definition.
+    expect(state.events).toEqual(['stop', 'start']);
+    expect(state.loadedDefinition).toBe(older);
+    await expectRolledBack(host, runtime, next, state);
   });
 
   it('killed while going back, finishes going back on the next rollback --id', async () => {
     const { host, runtime, next, state } = await updatedAssistant();
-    migratedByNext(runtime, 'm2');
+    await migratedByNext(runtime, 'm2');
     // The release it returns to never answers on its callback route, so the rollback goes back.
     state.onStart = (root) => {
       state.routeDown = readlinkSync(root) === releaseName(host.first);
@@ -517,6 +579,12 @@ describe('gws-ea rollback of an update that is unfinished', GIT_HEAVY, () => {
     await converse(runtime, 'm1');
     const next = await nextRelease(host, NEW_IMAGE);
     const state = world(runtime);
+    // The new release migrates the live database as its host starts and serves m2, then the update is killed.
+    state.onStart = (root) => {
+      if (readlinkSync(root) !== releaseName(next.commit)) return;
+      applying(ADDED_MIGRATION)(path.join(runtime.state_root, 'data', 'v2.db'));
+      void converse(runtime, 'm2');
+    };
     records.killAfter = 'started';
     records.reached = () => state.reached?.();
     await killDuringUpdate(host, runtime, state, next);
@@ -528,6 +596,7 @@ describe('gws-ea rollback of an update that is unfinished', GIT_HEAVY, () => {
     expect(releaseOf(await getInstanceReservation(host.paths, runtime.instance_id))).toEqual(release(host, host.first));
     expect(await readlink(runtime.checkout_root)).toBe(releaseName(host.first));
     expect(messages(runtime.state_root)).toEqual(['m1']);
+    expect(readCentralMigrations(runtime.state_root)).toEqual([...LIVE_MIGRATIONS]);
     expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();
     expect(state.running).toBe(true);
   });
@@ -541,7 +610,7 @@ describe('gws-ea rollback of an update that is unfinished', GIT_HEAVY, () => {
     expect(await cli(host, state, next, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
     const pending = (await readOperationRecord(host.paths, runtime.instance_id))?.follow_ups;
     expect(pending).toContainEqual({ kind: 'rebuild_group_image', agent_group_id: 'ag-research' });
-    migratedByNext(runtime);
+    await migratedByNext(runtime);
     const { run } = cli(host, state, next, runtime, { confirmRollback: async () => false });
 
     expect(await run(['rollback', '--id', runtime.instance_id])).toBe(0);

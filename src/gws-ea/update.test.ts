@@ -851,14 +851,19 @@ describe('an update that fails once its release started', GIT_HEAVY, () => {
     const host = await machine();
     const runtime = await assistant(host);
     await converse(runtime, 'm1');
-    const next = await nextRelease(host);
     const state = world(runtime, applying(ADDED_MIGRATION));
+    // An earlier update left the first release to roll back to, with the older snapshot it took.
+    const second = await nextRelease(host, NEW_IMAGE);
+    expect(await cli(host, state, second, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
+    const point = await readRollbackPoint(host.paths, runtime.instance_id);
+    await converse(runtime, 'm2');
+    const next = await nextRelease(host);
     // The new release migrates the live database as its host starts, serves one message, and is never reached.
     state.onStart = (root) => {
       state.routeDown = readlinkSync(root) === releaseName(next.commit);
       if (!state.routeDown) return;
       applying(ADDED_MIGRATION)(path.join(runtime.state_root, 'data', 'v2.db'));
-      void converse(runtime, 'm2');
+      void converse(runtime, 'm3');
     };
     const { run, err } = cli(host, state, next, runtime);
 
@@ -866,12 +871,16 @@ describe('an update that fails once its release started', GIT_HEAVY, () => {
 
     expect(err.join('\n')).toContain('so it was rolled back');
     expect(readCentralMigrations(runtime.state_root)).toEqual([...LIVE_MIGRATIONS]);
-    expect(messages(runtime.state_root)).toEqual(['m1']);
+    // The state as the release it left wrote it, not the earlier update's older snapshot.
+    expect(messages(runtime.state_root)).toEqual(['m1', 'm2']);
     const quarantine = path.join(layoutOf(host, runtime).root, 'quarantine');
     const [kept] = await readdir(quarantine);
     expect(readCentralMigrations(path.join(quarantine, kept!))).toEqual([...LIVE_MIGRATIONS, ADDED_MIGRATION]);
-    expect(await readlink(runtime.checkout_root)).toBe(releaseName(host.first));
+    expect(messages(path.join(quarantine, kept!))).toEqual(['m1', 'm2', 'm3']);
+    expect(await readlink(runtime.checkout_root)).toBe(releaseName(second.commit));
     expect(state.running).toBe(true);
+    // The update never committed, so the earlier rollback point stands.
+    expect(await readRollbackPoint(host.paths, runtime.instance_id)).toEqual(point);
   });
 
   it('closes for fix-forward when rolling back fails too, and a newer release supersedes it', async () => {
@@ -887,12 +896,26 @@ describe('an update that fails once its release started', GIT_HEAVY, () => {
     expect(await run(['update', '--id', id, '--yes'])).toBe(1);
 
     expect(err.join('\n')).toContain('rolling it back failed too');
-    expect(await readOperationRecord(host.paths, id)).toMatchObject({ closed: 'failed' });
+    // The revert committed by its own record, so what is closed is the rollback, which went to the first release.
+    expect(await readOperationRecord(host.paths, id)).toMatchObject({ kind: 'rollback', closed: 'failed' });
     expect((await status(host, state, next, runtime)).operation).toMatchObject({ state: 'failed' });
+    err.length = 0;
+    // An update to the release that failed supersedes it with no release to return to: once its release started
+    // and failed again, it is closed for fix-forward rather than rolled back.
+    expect(await run(['update', '--id', id, '--yes'])).toBe(1);
+    expect(err.join('\n')).toContain(
+      `and it has no release to return to. Fix it forward: update it to a newer release with gws-ea update --id ${id}.`,
+    );
+    expect(await readOperationRecord(host.paths, id)).toMatchObject({
+      kind: 'update',
+      to: release(host, next.commit),
+      closed: 'failed',
+      no_rollback_target: true,
+    });
+    expect(await run(['rollback', '--id', id, '--yes'])).toBe(1);
     err.length = 0;
     expect(await run(['update', '--id', id, '--yes'])).toBe(1);
     expect(err.join('\n')).toContain(`Fix it forward: update it to a newer release with gws-ea update --id ${id}`);
-    expect(await run(['rollback', '--id', id, '--yes'])).toBe(1);
     const newer = await nextRelease(host);
     delete state.routeDown;
 

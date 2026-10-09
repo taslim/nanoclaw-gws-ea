@@ -280,27 +280,37 @@ describe('operation record', () => {
 
   it("reverts an update whose release started with a rollback committed by its record, keeping the update's start", async () => {
     const { paths, instanceId } = await fixture();
-    await updateTo(paths, instanceId, 'switched');
+    // An earlier update committed, leaving FROM to roll back to; the next one, to NEWER, is reverted.
+    await updateTo(paths, instanceId, 'committed', []);
+    const point = await readRollbackPoint(paths, instanceId);
+    expect(point?.release).toEqual(FROM);
+    const update = await held(paths, instanceId, { command: 'update', target: NEWER });
+    try {
+      await beginOperation(update, { kind: 'update', from: TO, to: NEWER, manifest: MANIFEST });
+      await drive(update, 'switched', []);
+    } finally {
+      update.release();
+    }
     const early = await held(paths, instanceId, { command: 'rollback' });
     try {
-      await expect(beginOperation(early, { kind: 'rollback', from: TO, to: FROM })).rejects.toMatchObject({
+      await expect(beginOperation(early, { kind: 'rollback', from: NEWER, to: TO })).rejects.toMatchObject({
         code: 'operation_in_progress',
       });
     } finally {
       early.release();
     }
 
-    const update = await held(paths, instanceId, { command: 'update', target: TO });
+    const resumed = await held(paths, instanceId, { command: 'update', target: NEWER });
     try {
-      await advanceOperation(update, 'started');
+      await advanceOperation(resumed, 'started');
     } finally {
-      update.release();
+      resumed.release();
     }
     const started = (await readOperationRecord(paths, instanceId))!.started_at;
     const before = await readFile(paths.registryFile, 'utf8');
     const operation = await held(paths, instanceId, { command: 'rollback' });
     try {
-      expect(await beginOperation(operation, { kind: 'rollback', from: TO, to: FROM })).toMatchObject({
+      expect(await beginOperation(operation, { kind: 'rollback', from: NEWER, to: TO })).toMatchObject({
         kind: 'rollback',
         commit_point: 'record',
         phase: 'staged',
@@ -312,8 +322,8 @@ describe('operation record', () => {
     }
     expect(await readFile(paths.registryFile, 'utf8')).toBe(before);
     expect(await readOperationRecord(paths, instanceId)).toMatchObject({ phase: 'committed', kind: 'rollback' });
-    // The rollback point stays as it was: the update never committed.
-    expect(await readRollbackPoint(paths, instanceId)).toBeUndefined();
+    // The rollback point stays as the earlier update left it: the reverted update never committed.
+    expect(await readRollbackPoint(paths, instanceId)).toEqual(point);
   });
 
   it('carries the follow-ups of a committed update a rollback takes over, and gives them back if it ends uncommitted', async () => {

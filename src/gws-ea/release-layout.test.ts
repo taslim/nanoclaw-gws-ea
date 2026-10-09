@@ -13,7 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import Database from 'better-sqlite3';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { CONTROL_PLANE_ROOT } from './paths.js';
 import {
@@ -35,9 +35,52 @@ import {
   type InstanceLayout,
 } from './release-layout.js';
 
+/**
+ * A run killed partway: the change to the filesystem it dies at, counted
+ * from zero over every link, rename, removal, and write it makes, and never
+ * made. Off while `at` is undefined.
+ */
+const cut = vi.hoisted(() => ({
+  at: undefined as number | undefined,
+  changes: 0,
+  killed: new Error('killed mid-change'),
+}));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  const change = (): void => {
+    if (cut.at !== undefined && cut.changes++ === cut.at) throw cut.killed;
+  };
+  const symlink: typeof actual.symlink = async (...args) => {
+    change();
+    return actual.symlink(...args);
+  };
+  const rename: typeof actual.rename = async (...args) => {
+    change();
+    return actual.rename(...args);
+  };
+  const rm: typeof actual.rm = async (...args) => {
+    change();
+    return actual.rm(...args);
+  };
+  const unlink: typeof actual.unlink = async (...args) => {
+    change();
+    return actual.unlink(...args);
+  };
+  const link: typeof actual.link = async (...args) => {
+    change();
+    return actual.link(...args);
+  };
+  const writeFile: typeof actual.writeFile = async (...args) => {
+    change();
+    return actual.writeFile(...args);
+  };
+  return { ...actual, symlink, rename, rm, unlink, link, writeFile };
+});
+
 const roots: string[] = [];
 
 afterEach(async () => {
+  cut.at = undefined;
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
@@ -162,16 +205,32 @@ describe('switching releases', STAGING, () => {
     }
   });
 
-  it('keeps the live link whole when a switch is cut short, and the next switch finishes', async () => {
+  it('keeps the live link whole wherever a switch is cut short, and the next switch finishes it', async () => {
     const { layout, a, b } = await layoutWithReleases();
     await pointCurrent(layout, a);
-    // Killed after writing the new link, before the rename that makes it live.
-    await symlink(b, `${layout.current}.pending`);
+    let finished = false;
 
-    expect(await readCurrent(layout)).toBe(a);
-    await pointCurrent(layout, b);
-    expect(await readCurrent(layout)).toBe(b);
-    expect(await readdir(layout.root)).not.toContain('nanoclaw.pending');
+    // Killed at each change the switch makes in turn, until one run makes them all.
+    for (let at = 0; at < 20 && !finished; at += 1) {
+      Object.assign(cut, { at, changes: 0 });
+      finished = await pointCurrent(layout, b).then(
+        () => true,
+        (error: unknown) => {
+          if (error !== cut.killed) throw error;
+          return false;
+        },
+      );
+      cut.at = undefined;
+
+      // Whole at its old target or its new one, never absent: the service manager always finds a release.
+      expect([a, b]).toContain(await readCurrent(layout));
+      await pointCurrent(layout, b);
+      expect(await readCurrent(layout)).toBe(b);
+      expect(await readdir(layout.root)).not.toContain('nanoclaw.pending');
+      await pointCurrent(layout, a);
+    }
+
+    expect(finished).toBe(true);
   });
 
   it('starts nothing while a switch has fenced the live link, so no host writes the state meanwhile', async () => {
