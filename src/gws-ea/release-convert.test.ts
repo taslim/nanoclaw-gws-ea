@@ -349,7 +349,10 @@ function legacyWorld(host: Machine, legacy: LegacyAssistant): World {
   return state;
 }
 
-/** What the conversion's own boundaries hold: OneCLI's vault, Docker's bind mount, and the recreated project's probe. */
+/**
+ * What the conversion's own boundaries hold: OneCLI's vault, Docker's bind
+ * mount, the recreated project's probe, and NanoClaw's drain.
+ */
 interface Conversion {
   /** OneCLI answers its REST API. */
   reachable: boolean;
@@ -359,6 +362,8 @@ interface Conversion {
   linkUnresolved?: boolean;
   /** The recreated OneCLI project fails its isolation probe. */
   probeFails?: boolean;
+  /** The drain after a stop: NanoClaw's times out, as when an agent container will not stop, or the run is killed there. */
+  drain?: 'times-out' | 'killed';
   /** The Compose file each recreated project was proven from. */
   readonly recreated: string[];
 }
@@ -413,8 +418,11 @@ function conversionFetch(fallback: typeof globalThis.fetch, legacy: LegacyAssist
   };
 }
 
-/** The service helpers, each stop and drain traced among the filesystem changes. */
-function traced(helpers: NanoclawServiceHelpers): NanoclawServiceHelpers {
+/** NanoClaw's own drain failure: a plain error naming the containers still listed at its timeout. */
+const DRAIN_TIMED_OUT = 'Timed out waiting for NanoClaw containers to stop: 3f2a9c1b7d4e';
+
+/** The service helpers, each stop and drain traced among the filesystem changes, the drain as `world` says. */
+function traced(helpers: NanoclawServiceHelpers, world: Conversion): NanoclawServiceHelpers {
   return {
     ...helpers,
     stopService: async (handle, env) => {
@@ -423,6 +431,11 @@ function traced(helpers: NanoclawServiceHelpers): NanoclawServiceHelpers {
     },
     drainContainers: async (root, env, timeoutMs) => {
       kill.trace.push('drain');
+      if (world.drain === 'times-out') throw new Error(DRAIN_TIMED_OUT);
+      if (world.drain === 'killed') {
+        kill.reached?.();
+        await new Promise(() => undefined);
+      }
       await helpers.drainContainers(root, env, timeoutMs);
     },
   };
@@ -437,7 +450,7 @@ function conversionDependencies(
   const deps = dependencies(state, next, legacy.runtime);
   return {
     ...deps,
-    serviceHelpers: traced(deps.serviceHelpers),
+    serviceHelpers: traced(deps.serviceHelpers, world),
     runCommand: conversionRunner(state, world),
     fetch: conversionFetch(deps.fetch!, legacy, world),
     verifyRecreatedOnecli: async (layout) => {
@@ -1110,6 +1123,67 @@ describe('a conversion refused before anything moves', GIT_HEAVY, () => {
     expect(await run(['update', '--id', legacy.id, '--yes'])).toBe(0);
     await expectConverted(host, legacy, next, state, inodes);
   });
+
+  it("serves the old release again when NanoClaw's drain fails after the stop, saying why, moving nothing", async () => {
+    const host = await machine();
+    const legacy = await legacyAssistant(host);
+    const next = await nextRelease(host);
+    const state = legacyWorld(host, legacy);
+    const inodes = await stateInodes(legacy);
+    const before = await snapshot(legacy.root);
+    const converting: Conversion = { ...conversion(), drain: 'times-out' };
+    const { run, err } = cli(host, state, next, legacy, converting);
+
+    expect(await run(['update', '--id', legacy.id, '--yes'])).toBe(1);
+
+    expect(err.join('\n')).toContain(
+      `NanoClaw did not stop the assistant's agent containers: ${DRAIN_TIMED_OUT}. Nothing was moved, and its old release serves again.`,
+    );
+    expect(state.events).toContain('start');
+    await expectNothingMoved(host, legacy, state, before);
+    delete converting.drain;
+
+    expect(await run(['update', '--id', legacy.id, '--yes'])).toBe(0);
+    await expectConverted(host, legacy, next, state, inodes);
+  });
+
+  it.each([
+    ['past its stop, before recording it', 'drain'],
+    ['right after recording the stop', 'record'],
+  ] as const)(
+    'killed %s, then refused on the rerun before its first rename: the old release serves again, nothing moved',
+    async (_label, point) => {
+      const host = await machine();
+      const legacy = await legacyAssistant(host);
+      const next = await nextRelease(host);
+      const state = legacyWorld(host, legacy);
+      const inodes = await stateInodes(legacy);
+      const before = await snapshot(legacy.root);
+      const converting: Conversion = { ...conversion(), ...(point === 'drain' ? { drain: 'killed' as const } : {}) };
+      await killConversion(
+        host,
+        legacy,
+        state,
+        next,
+        converting,
+        point === 'record' ? conversionAt(host.paths, legacy.id, 'stopped') : undefined,
+      );
+      // The run that stopped the old host is gone, and nothing has started it since.
+      expect(state.running).toBe(false);
+      delete converting.drain;
+      state.openFiles = `p4242\ncsqlite3\nn${path.join(legacy.checkout, 'data', 'v2.db')}\n`;
+      const { run, err } = cli(host, state, next, legacy, converting);
+
+      expect(await run(['update', '--id', legacy.id, '--yes'])).toBe(1);
+
+      expect(err.join('\n')).toContain('Nothing was moved, and its old release serves again');
+      await expectNothingMoved(host, legacy, state, before);
+      state.openFiles = '';
+
+      expect(await run(['update', '--id', legacy.id, '--yes'])).toBe(0);
+      await expectConverted(host, legacy, next, state, inodes);
+    },
+  );
 });
 
 describe('the conversion preview', () => {

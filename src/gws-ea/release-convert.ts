@@ -662,17 +662,22 @@ async function assertConversionQuiet(
 
 function stopStep(reporter: NonNullable<UpdateDependencies['reporter']>, service: InstanceServiceControl) {
   return runStep(reporter, { id: 'stop_host', label: 'Stopping the assistant to move it…' }, async () => {
-    const outcome = await service.stop();
+    await service.stop();
     await service.drain();
-    return outcome;
   });
+}
+
+/** Whether the conversion has made its first rename: `data`, which moves first, has left the old checkout. */
+async function firstRenameMade(legacy: LegacyAssistant, conversion: ConversionRecord): Promise<boolean> {
+  return conversion.step !== 'stopped' || !(await lstatIfPresent(path.join(legacy.checkout, 'data')));
 }
 
 /**
  * Stop the old host and drain its agents, prove both roots quiet, and record
  * the conversion at `stopped`, right before its first rename. A failure here
- * moved nothing: the old release is served again when this run stopped it,
- * and the update is dropped, its staged release kept.
+ * moved nothing: the old release is started again, whichever run stopped it,
+ * this one or one cut short before its first rename, and the update is
+ * dropped, its staged release kept.
  */
 async function stopOldRelease(
   operation: InstanceOperation,
@@ -683,9 +688,8 @@ async function stopOldRelease(
   const reporter = dependencies.reporter ?? {};
   const layout = paths.instanceLayout(instanceId);
   const service = legacyService(legacy, dependencies);
-  const progress = { stopped: false };
   try {
-    progress.stopped = (await stopStep(reporter, service)) === 'stopped';
+    await stopStep(reporter, service);
     const at = new Date().toISOString();
     const record = await readOperationRecord(paths, instanceId);
     await runStep(reporter, { id: 'fence', label: 'Checking nothing still uses its state…' }, async () => {
@@ -711,15 +715,15 @@ async function stopOldRelease(
     return conversion;
   } catch (error) {
     await rm(conversionRecordFile(paths, instanceId), { force: true });
-    let restarted = '';
-    if (progress.stopped) {
-      try {
-        await service.start();
-        restarted = ', and its old release serves again';
-        // eslint-disable-next-line no-catch-all/no-catch-all -- A failed restart is reported with the refusal it follows.
-      } catch (restart) {
-        restarted = `, and starting its old release again failed too: ${safeErrorMessage(restart)}`;
-      }
+    let restarted: string;
+    try {
+      restarted =
+        (await service.start()) === 'started'
+          ? ', and its old release serves again'
+          : ', and its old release still serves';
+      // eslint-disable-next-line no-catch-all/no-catch-all -- A failed restart is reported with the refusal it follows.
+    } catch (restart) {
+      restarted = `, and starting its old release again failed too: ${safeErrorMessage(restart)}`;
     }
     await discardOperation(operation);
     throw new GwsEaError(
@@ -905,12 +909,13 @@ async function recreateOnecli(
 
 /**
  * Carry an unconverted assistant's update through its conversion, up to the
- * switch: from nothing moved yet, or from the step its record names. A resume
- * stops the host, drains its agents, and proves both roots quiet before
- * anything more moves. Once its OneCLI project is recreated, the update is
- * recorded at `snapshotted` with the old host's stop: the conversion keeps no
- * snapshot, and the update switches from there. A no-op for an assistant the
- * release layout holds.
+ * switch: from nothing moved yet, as a first attempt is, or once its first
+ * rename is made, from the step its record names. A resume stops the host,
+ * drains its agents, and proves both roots quiet before anything more moves.
+ * Once its OneCLI project is recreated, the update is recorded at
+ * `snapshotted` with the old host's stop: the conversion keeps no snapshot,
+ * and the update switches from there. A no-op for an assistant the release
+ * layout holds.
  */
 export async function continueConversion(
   operation: InstanceOperation,
@@ -930,13 +935,14 @@ export async function continueConversion(
   const legacy = recorded
     ? legacyAssistant(root, validateRuntimeConfig(recorded.runtime))
     : await readLegacyAssistant(paths, reservation, root);
-  let conversion = recorded ?? (await stopOldRelease(operation, legacy, dependencies));
+  const resumed = recorded && (await firstRenameMade(legacy, recorded)) ? recorded : undefined;
+  let conversion = resumed ?? (await stopOldRelease(operation, legacy, dependencies));
   const advance = async (step: ConversionStep): Promise<void> => {
     conversion = { ...conversion, step };
     await writePrivate(conversionRecordFile(paths, instanceId), conversion);
   };
   try {
-    if (recorded) {
+    if (resumed) {
       await stopStep(reporter, legacyService(legacy, dependencies));
       await runStep(reporter, { id: 'fence', label: 'Checking nothing still uses its state…' }, () =>
         assertConversionQuiet(legacy, layout, dependencies),

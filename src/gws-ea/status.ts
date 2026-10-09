@@ -576,12 +576,17 @@ function liveRelease(paths: ControlPlanePaths, instanceId: string): () => Promis
 async function observePhase(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
+  inspection: OperationInspection,
   current: () => Promise<string | undefined>,
 ): Promise<PhaseView> {
   const id = reservation.instance_id;
   const update = `gws-ea update --id ${id}`;
   try {
-    if (await isConverting(paths, id)) return { state: 'converting', continue_with: update };
+    // Only its converted release failing verification closes a conversion's update as failed: that release is live,
+    // and the failed operation names the update that fixes it forward (KTD12).
+    if (inspection.state !== 'failed' && (await isConverting(paths, id))) {
+      return { state: 'converting', continue_with: update };
+    }
     if (!inOwnRoot(paths, reservation)) return { state: 'legacy', convert_with: update };
     const live = await current();
     return live === undefined ? { state: 'fenced' } : { state: 'live', release: live };
@@ -1101,7 +1106,7 @@ export async function observeAssistantStatus(
   const inspection = await inspect(context.paths, reservation);
   const current = liveRelease(context.paths, reservation.instance_id);
   const [phase, removal, release] = await Promise.all([
-    observePhase(context.paths, reservation, current),
+    observePhase(context.paths, reservation, inspection, current),
     removalInProgress(context.paths, instanceId),
     observeRelease({ context, reservation, observers }),
   ]);
@@ -1207,7 +1212,7 @@ export async function listAssistants(context: ObservationContext): Promise<Assis
     reservations.map(async (reservation): Promise<ListedAssistant> => {
       const inspection = await inspect(context.paths, reservation);
       const [phase, removal, release, observed] = await Promise.all([
-        observePhase(context.paths, reservation, liveRelease(context.paths, reservation.instance_id)),
+        observePhase(context.paths, reservation, inspection, liveRelease(context.paths, reservation.instance_id)),
         removalInProgress(context.paths, reservation.instance_id),
         observeRelease({ context, reservation, observers }),
         inOwnRoot(context.paths, reservation)

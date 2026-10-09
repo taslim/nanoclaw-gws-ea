@@ -22,6 +22,9 @@ import { GwsEaError } from './types.js';
 /** Where a host service sends the host's output and its errors. */
 export { hostLogFiles, type HostLogFiles } from './service.js';
 
+/** A `systemctl` call that a hung user bus would otherwise hold forever, the assistant fenced. */
+const SYSTEMCTL_TIMEOUT_MS = 30_000;
+
 /** NanoClaw's `ServiceMode`: how detection found the service run. */
 export type NanoclawServiceMode = 'launchd' | 'systemd-user' | 'systemd-system' | 'nohup' | 'unmanaged' | 'none';
 
@@ -250,7 +253,9 @@ export function createServiceControl(
   const resetFailed = ({ mode, name }: NanoclawServiceHandle): void => {
     if (name === undefined || (mode !== 'systemd-user' && mode !== 'systemd-system')) return;
     try {
-      env.runner.run('systemctl', [...(mode === 'systemd-user' ? ['--user'] : []), 'reset-failed', name]);
+      env.runner.run('systemctl', [...(mode === 'systemd-user' ? ['--user'] : []), 'reset-failed', name], undefined, {
+        timeoutMs: SYSTEMCTL_TIMEOUT_MS,
+      });
     } catch (cause) {
       if (!/not loaded/u.test(reasonOf(cause))) throw cause;
     }
@@ -296,7 +301,18 @@ export function createServiceControl(
       await startAfresh(handle);
       return handle.active ? 'restarted' : 'started';
     },
-    drain: (timeoutMs) => helpers.drainContainers(root, env, timeoutMs),
+    async drain(timeoutMs) {
+      try {
+        await helpers.drainContainers(root, env, timeoutMs);
+      } catch (cause) {
+        // NanoClaw's reasons (its timeout, a failed `docker ps`) end without a stop.
+        throw new GwsEaError(
+          'containers_still_running',
+          `NanoClaw did not stop the assistant's agent containers: ${reasonOf(cause)}.`,
+          { cause },
+        );
+      }
+    },
     verifyHealth: (timeoutMs) => helpers.verifyServiceHealth({ ...detect(), active: true }, root, env, timeoutMs),
   };
 }

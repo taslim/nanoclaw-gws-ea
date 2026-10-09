@@ -1155,6 +1155,34 @@ describe('status', () => {
     }
   });
 
+  it('shows the converted release live, and the fix-forward update, once it failed verification and closed the conversion', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const id = reservation.instance_id;
+    const target: ReleaseCoordinates = { ...releaseOf(reservation), deployed_commit: 'c'.repeat(40) };
+    // The conversion recorded done, and the release it switched to closed its update as failed.
+    await writePrivate(conversionRecordFile(host.paths, id), { step: 'recreated', legacy_root: `instances/${id}` });
+    await updateFailedWithoutReturn(host.paths, reservation, target);
+    const state = world(reservation);
+    const live = host.release.slice(0, 8);
+    const fixForward =
+      `Its update to dogfood ${'c'.repeat(12)} failed and left no release to return to (started); ` +
+      `fix it forward to a newer release with gws-ea update --id ${id}.`;
+
+    const { status } = await statusJson(host, state, id);
+    const text = command(host, state);
+    expect(await runStatusCommand(text.runtime, { instanceId: id, json: false })).toBe(0);
+    const listed = command(host, state);
+    expect(await runListCommand(listed.runtime, { json: false })).toBe(0);
+
+    expect(status.phase).toEqual({ state: 'live', release: live });
+    expect(status.operation).toMatchObject({ state: 'failed', continue_with: `gws-ea update --id ${id}` });
+    expect(text.output.stdout).toContain(`  Phase:     Release ${live} is live.`);
+    expect(text.output.stdout).toContain(`  Operation: ${fixForward}`);
+    expect(listed.output.stdout).toContain(`${id}: ${fixForward}`);
+    expect([...text.output.stdout, ...listed.output.stdout].join('\n')).not.toContain('conversion');
+  });
+
   it('names the fix-forward command for an update that failed and left no release to return to', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });

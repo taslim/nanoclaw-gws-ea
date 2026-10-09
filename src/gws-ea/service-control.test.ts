@@ -259,7 +259,10 @@ describe('start on systemd', () => {
     expect(helpers.createCommandRunner).toHaveBeenCalledExactlyOnceWith({
       env: expect.objectContaining({ XDG_RUNTIME_DIR: '/run/user/1000' }),
     });
-    expect(runner.run).toHaveBeenCalledWith('systemctl', ['--user', 'reset-failed', UNIT]);
+    // Bounded, as a hung user bus would otherwise hold the start with the assistant fenced.
+    expect(runner.run).toHaveBeenCalledWith('systemctl', ['--user', 'reset-failed', UNIT], undefined, {
+      timeoutMs: 30_000,
+    });
   });
 
   it('starts a unit systemd has not loaded, which has no failed state to reset', async () => {
@@ -432,6 +435,19 @@ describe("NanoClaw's own reasons", () => {
       code: 'service_start_failed',
       message: `NanoClaw's service ${LABEL} did not start: ${refused.message}`,
       cause: refused,
+    });
+  });
+
+  it('keeps what a failed drain says', async () => {
+    const { helpers } = nanoclaw(BOOTED_OUT);
+    const timedOut = new Error('Timed out waiting for NanoClaw containers to stop: 3f2a9c1b7d4e');
+    helpers.drainContainers.mockRejectedValueOnce(timedOut);
+
+    await expect(control(helpers).service.drain()).rejects.toMatchObject({
+      name: 'GwsEaError',
+      code: 'containers_still_running',
+      message: `NanoClaw did not stop the assistant's agent containers: ${timedOut.message}.`,
+      cause: timedOut,
     });
   });
 });

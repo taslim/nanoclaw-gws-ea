@@ -37,7 +37,7 @@ import {
 } from './prerequisites.js';
 import { runSanitizedCommand } from './process.js';
 import { installProductionBootstrapManifest } from './provision.js';
-import { redact } from './redact.js';
+import { redact, REDACTED } from './redact.js';
 import { readRegistry } from './registry.js';
 import { createInstanceRuntimeConfig, persistInstanceRuntime, type InstanceRuntimeConfig } from './service.js';
 import { hostLogFiles, type NanoclawServiceHandle, type NanoclawServiceHelpers } from './service-control.js';
@@ -987,6 +987,44 @@ describe('gws-ea secrets inputs', () => {
       expect(contents, file).not.toContain(providerSecret);
       expect(contents, file).not.toContain(cloudflareSecret);
     }
+  });
+
+  it("redacts a legacy assistant's secrets from its run log, read from where the layout before releases keeps them", async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation());
+    const { root, checkout } = legacyLocation(paths, input.instance_id);
+    const registry = JSON.parse(await readFile(paths.registryFile, 'utf8')) as {
+      instances: Record<string, Record<string, unknown>>;
+    };
+    registry.instances[input.instance_id] = { ...registry.instances[input.instance_id], checkout_realpath: checkout };
+    await writeFile(paths.registryFile, JSON.stringify(registry), { mode: 0o600 });
+    // Values no redaction pattern knows: only their files name them secret.
+    const accountToken = `account-token-${randomUUID()}`;
+    const postgresPassword = randomUUID();
+    for (const [file, secret] of [
+      [path.join(root, 'secrets', 'cloudflare-account-token'), accountToken],
+      [path.join(root, 'onecli', 'secrets', 'postgres-password'), postgresPassword],
+    ] as const) {
+      await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+      await writeOwnerFile(file, secret);
+    }
+    const io = lines();
+
+    expect(
+      await runCli(['remove', '--id', input.instance_id, '--yes'], {
+        paths,
+        ...io.runtime,
+        removeAssistant: async () => {
+          activeStep()?.write(`accidentally logged ${accountToken} and ${postgresPassword}\n`);
+          return undefined;
+        },
+      }),
+    ).toBe(0);
+
+    const logged = await Promise.all(
+      (await filesUnder(paths.instanceLogsRoot(input.instance_id))).map((file) => readFile(file, 'utf8')),
+    );
+    expect(logged.join('\n')).toContain(`accidentally logged ${REDACTED} and ${REDACTED}`);
   });
 });
 
