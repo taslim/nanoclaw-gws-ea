@@ -461,7 +461,7 @@ describe('observing the Google connection for status', () => {
   });
 
   it.each([
-    ['the stale google-gmail secret', { name: 'google-gmail', hostPattern: 'gmail.googleapis.com' }],
+    ['a google-gmail secret', { name: 'google-gmail', hostPattern: 'gmail.googleapis.com' }],
     ['any other secret Gmail would accept', { name: 'mail-helper', hostPattern: '*.googleapis.com' }],
   ])('flags %s, which can carry gmail.modify, ahead of everything else', async (_label, secret) => {
     const world = new World();

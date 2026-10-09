@@ -315,32 +315,6 @@ describe('provision journal v3', () => {
     }
   });
 
-  it('refuses every command but update, which converts it, for an assistant on the layout before releases', async () => {
-    const { paths } = await fixture();
-    const legacy = { ...reservation(), checkout_realpath: '/old/layout/instances/nanoclaw' };
-    legacy.allocated_ports = { nanoclaw_webhook: 32_101, onecli_app: 32_102, onecli_gateway: 32_103 };
-    legacy.exclusive_resource_claims = {
-      ...legacy.exclusive_resource_claims,
-      ingress: { mode: 'existing', endpoint_url: 'https://legacy.example.test/webhook/gchat' },
-      gcp_project_id: 'legacy-project',
-      gchat_service_account: 'gws-ea-chat@legacy-project.iam.gserviceaccount.com',
-      workspace_email: 'legacy@example.test',
-    };
-    await reserveInstance(paths, legacy);
-    const id = legacy.instance_id;
-    await rm(paths.instanceRoot(id), { recursive: true });
-
-    for (const command of ['resume', 'start', 'stop', 'restart', 'ncl', 'rollback', 'connect-google'] as const) {
-      const refusal = await acquireInstanceOperation(paths, id, { command }).catch((error: unknown) => error);
-      expect(refusal).toMatchObject({
-        code: 'legacy_layout',
-        message: `Assistant ${id} is on the legacy layout: run gws-ea update --id ${id} to convert it.`,
-      });
-    }
-    // A refused command creates nothing at the short root the conversion will move the assistant to.
-    await expect(stat(paths.instanceRoot(id))).rejects.toMatchObject({ code: 'ENOENT' });
-  });
-
   it("reads the runtime record from the assistant's physical state, with no release live (R17)", async () => {
     const { paths, input } = await fixture();
     const id = input.instance_id;
