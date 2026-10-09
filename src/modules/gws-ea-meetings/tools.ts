@@ -15,11 +15,11 @@
  * when a call gives `timezone`, the other side's.
  *
  * - `free_time` lists the free windows in the range from now on, from the
- *   principal's free/busy alone, never inside protected time, in date order
- *   (`freeWindows` in `slots.ts`). The agent picks the times; each window is
- *   labeled, ready to write, in the principal's time zone and, when given,
- *   the counterpart's, inside whose waking day it falls, with a fit note from
- *   a fixed vocabulary that never echoes a preference.
+ *   principal's free/busy alone, in date order (`freeWindows` in
+ *   `slots.ts`). The agent picks the times; each window is labeled, ready to
+ *   write, in the principal's time zone and, when given, the counterpart's,
+ *   inside whose waking day it falls, with a fit note from a fixed vocabulary
+ *   that never echoes a preference, protected time included.
  * - Nothing reserves a time before someone agrees to it: a time offered in
  *   one thread is any thread's until booked, and a booking blocks time as
  *   any other event of the principal's does (`blocksTime` in `slots.ts`).
@@ -29,9 +29,9 @@
  * - `change_booking` and `cancel_booking` act only on an event this thread
  *   booked. A change keeps the event's id and is checked as `book` checks
  *   what it writes.
- * - `book` and `change_booking` refuse a time inside protected time, so a
- *   counterpart's proposal never gets round it, and refuse a time that has
- *   gone with word to offer others.
+ * - `book` and `change_booking` refuse a time that has passed or gone, with
+ *   word to offer others. Protected time is the agent's call, as any
+ *   preference is.
  * - Every booking lists the principal as an accepted guest, its organizer
  *   (`guestsOn`); who a booking invites never counts them.
  * - `main` hears in one fact when a booking is made, changed or cancelled.
@@ -76,7 +76,6 @@ import {
   blocksTime,
   eventSpan,
   freeWindows,
-  inProtectedTime,
   isClear,
   iso,
   READ_MARGIN_MS,
@@ -259,9 +258,9 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
   }
 
   /**
-   * Refuse, naming each, any time that has passed, falls in protected time,
-   * or is no longer free: what `book` and `change_booking` never place. A
-   * time no longer free is refused with word to offer others.
+   * Refuse, naming each, any time that has passed or is no longer free:
+   * what `book` and `change_booking` never place. A time no longer free is
+   * refused with word to offer others.
    */
   async function assertAvailable(
     view: ThreadView,
@@ -269,17 +268,11 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     spans: readonly Span[],
     ignore: ReadonlySet<string>,
   ): Promise<void> {
-    const { timezone, rules } = view.principal;
+    const { timezone } = view.principal;
     const now = Date.now();
     const label = (span: Span): string => slotLabel(span, timezone);
     const passed = spans.filter((span) => span.start <= now);
     if (passed.length > 0) throw forbidden(`${passed.map(label).join('; ')}: that time has passed.`);
-    const protectedTime = spans.filter((span) => inProtectedTime(span, rules, timezone));
-    if (protectedTime.length > 0) {
-      throw forbidden(
-        `${protectedTime.map(label).join('; ')}: the principal keeps that time protected, whoever asks for it. Offer times from free_time instead.`,
-      );
-    }
     const covering = {
       start: Math.min(...spans.map((span) => span.start)),
       end: Math.max(...spans.map((span) => span.end)),
@@ -448,7 +441,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
       windows_not_listed: unlisted,
       message:
         windows.length === 0
-          ? `Nothing in that range is free for ${minutes} minutes outside protected time${theirs === undefined ? '' : ' and inside their waking day'}: ask for another range, or tell main with tell_main.`
+          ? `Nothing in that range is free for ${minutes} minutes${theirs === undefined ? '' : ' and inside their waking day'}: ask for another range, or tell main with tell_main.`
           : [
               `Free for ${minutes} minutes: any start that ends by a window's end.`,
               ...lines,
@@ -569,8 +562,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
 
   /**
    * Book a time someone agreed to (R71): always a new event, under an id
-   * derived from this request, at a time still free and outside protected
-   * time. It invites only people on the thread, with the invitation as they
+   * derived from this request, at a time still free. It invites only people on the thread, with the invitation as they
    * would see it passing the private-values check, and main hears. A replay
    * of a request already booked only finishes what follows.
    */

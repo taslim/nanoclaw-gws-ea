@@ -331,9 +331,10 @@ describe('free_time', () => {
       message: string;
     };
 
-    // New York wakes at 12:00 London, and Tuesday's protected afternoon and Wednesday's meeting are gone.
+    // New York wakes at 12:00 London, Wednesday's meeting is gone, and Tuesday's protected afternoon says so.
     expect(windows.map((free) => [free.principal_time, free.their_time, free.fit])).toEqual([
       ['Tuesday 6 Oct, 12:00–15:00 BST', 'Tuesday 6 Oct, 07:00–10:00 EDT', 'acceptable'],
+      ['Tuesday 6 Oct, 15:00–17:00 BST', 'Tuesday 6 Oct, 10:00–12:00 EDT', 'protected time'],
       ['Tuesday 6 Oct, 17:00–22:00 BST', 'Tuesday 6 Oct, 12:00–17:00 EDT', 'outside usual hours'],
       ['Wednesday 7 Oct, 14:00–17:00 BST', 'Wednesday 7 Oct, 09:00–12:00 EDT', 'acceptable'],
       ['Wednesday 7 Oct, 17:00–22:00 BST', 'Wednesday 7 Oct, 12:00–17:00 EDT', 'outside usual hours'],
@@ -343,10 +344,12 @@ describe('free_time', () => {
     expect(windows_not_listed).toBe(0);
     for (const free of windows) {
       const span = { start: Date.parse(free.start), end: Date.parse(free.end) };
-      expect(overlaps(span, PROTECTED), free.start).toBe(false);
+      expect(free.fit === 'protected time', free.start).toBe(overlaps(span, PROTECTED));
       expect(overlaps(span, taken), free.start).toBe(false);
       expect(FITS).toContain(free.fit);
     }
+    // Why the principal protects the time is main's alone.
+    expect(JSON.stringify(data(frame))).not.toContain(PROTECTED_REASON);
     // Each line leads with the window on the principal's clock, with its offset, which the tools take back.
     expect(message.split('\n').slice(0, 2)).toEqual([
       "Free for 30 minutes: any start that ends by a window's end.",
@@ -392,7 +395,7 @@ describe('free_time', () => {
     expect(windows_not_listed).toBe(0);
   });
 
-  it('lists nothing inside protected time, even when the range asks only for that afternoon', async () => {
+  it('says which of an afternoon is protected time, leaving the call to the agent', async () => {
     const { windows } = data(
       await send(sessionA, 'free_time', {
         from: '2026-10-06T14:00:00+01:00',
@@ -402,6 +405,7 @@ describe('free_time', () => {
     ) as { windows: Free[] };
     expect(windows.map((free) => [free.principal_time, free.fit])).toEqual([
       ['Tuesday 6 Oct, 14:00–15:00 BST', 'acceptable'],
+      ['Tuesday 6 Oct, 15:00–17:00 BST', 'protected time'],
       ['Tuesday 6 Oct, 17:00–18:00 BST', 'outside usual hours'],
     ]);
   });
@@ -624,18 +628,18 @@ describe('book', () => {
     expect(bookings().map((event) => [event.id, event.tags?.gwsEaThread])).toEqual([[first.booking, threadB]]);
   });
 
-  it('refuses a protected time a counterpart proposed, though free/busy shows it free', async () => {
-    expect(
-      refusal(
-        await send(sessionA, 'book', {
-          start: '2026-10-06T15:00:00.000Z',
-          minutes: 30,
-          title: 'Catch-up',
-          invitees: [REMY],
-        }),
-      ),
-    ).toMatch(/protected/u);
-    expect(bookings()).toEqual([]);
+  it('books a protected time the agent judged worth it: protected time is a preference, not a wall', async () => {
+    const booked = data(
+      await send(sessionA, 'book', {
+        start: '2026-10-06T15:00:00.000Z',
+        minutes: 30,
+        title: 'Catch-up',
+        invitees: [REMY],
+      }),
+    );
+    expect(calendar.event(PRINCIPAL, String(booked.booking))).toMatchObject({
+      start: { dateTime: '2026-10-06T15:00:00.000Z' },
+    });
   });
 
   it.each([
@@ -976,16 +980,13 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
     expect(await getDb().get('SELECT 1 FROM gws_ea_thread_bookings')).toBeUndefined();
   });
 
-  it('refuses to move or lengthen it into protected or busy time', async () => {
+  it('refuses to move or lengthen it into busy time, and moves it into protected time when asked', async () => {
     const booked = data(
       await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Intro', invitees: [REMY] }),
     );
     calendar.put(busy('evt-thu', THURSDAY_2PM, '2026-10-08T14:00:00.000Z'));
     calendar.put(busy('evt-tue', '2026-10-06T09:45:00.000Z', '2026-10-06T10:15:00.000Z'));
 
-    expect(
-      refusal(await send(sessionA, 'change_booking', { booking: booked.booking, start: '2026-10-06T14:00:00.000Z' })),
-    ).toMatch(/protected/u);
     expect(refusal(await send(sessionA, 'change_booking', { booking: booked.booking, start: THURSDAY_2PM }))).toMatch(
       /no longer free/u,
     );
@@ -995,6 +996,12 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
     expect(calendar.event(PRINCIPAL, String(booked.booking))).toMatchObject({
       start: { dateTime: TUESDAY_10AM },
       end: { dateTime: '2026-10-06T09:30:00.000Z' },
+    });
+
+    await send(sessionA, 'change_booking', { booking: booked.booking, start: '2026-10-06T14:00:00.000Z' });
+    expect(calendar.event(PRINCIPAL, String(booked.booking))).toMatchObject({
+      start: { dateTime: '2026-10-06T14:00:00.000Z' },
+      end: { dateTime: '2026-10-06T14:30:00.000Z' },
     });
   });
 

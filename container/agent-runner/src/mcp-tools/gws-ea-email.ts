@@ -168,7 +168,7 @@ export const freeTime = requestTool({
   ...common,
   name: 'free_time',
   description:
-    "The principal's free windows between from and to for a meeting of minutes, in date order, never in protected time: any start that ends by a window's end is free. Each shows the principal's time, the other side's when you give timezone (their night left out), and how it fits the principal's preferences. You pick the times.",
+    "The principal's free windows between from and to for a meeting of minutes, in date order: any start that ends by a window's end is free. Each shows the principal's time, the other side's when you give timezone (their night left out), and how it fits the principal's preferences. You pick the times.",
   properties: {
     from: { type: 'string', description: `The earliest start. ${DATE_TIME}` },
     to: { type: 'string', description: `When the meeting must be over. ${DATE_TIME}` },
@@ -183,7 +183,7 @@ export const book = requestTool({
   ...common,
   name: 'book',
   description:
-    "Book an agreed time as a new event on the principal's calendar, inviting everyone in the conversation but the principal, or the invitees you name from the thread. Google sends the invitation, and main hears. A time that is protected or no longer free is refused. Answers with the booking id.",
+    "Book an agreed time as a new event on the principal's calendar, inviting everyone in the conversation but the principal, or the invitees you name from the thread. Google sends the invitation, and main hears. A time no longer free is refused. Answers with the booking id.",
   properties: {
     start: { type: 'string', description: `When it starts. ${DATE_TIME}` },
     minutes: MINUTES,
@@ -205,7 +205,7 @@ export const changeBooking = requestTool({
   ...common,
   name: 'change_booking',
   description:
-    'Change a booking this thread made: its time, length, title, location, notes, or a Google Meet link. Give only what changes. A new time that is protected or no longer free is refused. Google sends the invitees the update, and main hears.',
+    'Change a booking this thread made: its time, length, title, location, notes, or a Google Meet link. Give only what changes. A new time no longer free is refused. Google sends the invitees the update, and main hears.',
   properties: {
     booking: BOOKING,
     start: { type: 'string', description: `The new start. ${DATE_TIME}` },

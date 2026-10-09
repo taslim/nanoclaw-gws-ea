@@ -13,7 +13,6 @@ import {
   eventSpan,
   fitOf,
   freeWindows,
-  inProtectedTime,
   schedulingRules,
   zonedInstant,
   zonedIso,
@@ -135,7 +134,7 @@ describe('free time', () => {
     expect(shown(tuesday)).toEqual(['Tue 06:00–23:00 acceptable']);
   });
 
-  it("keeps the principal's protected time out of every window, and finds a proposed time inside it", () => {
+  it("shows the principal's protected time as a window of its own, labeled, for the agent to weigh", () => {
     const rules = schedulingRules({
       ...NONE,
       working_hours: workingDays('09:00', '17:00'),
@@ -144,12 +143,13 @@ describe('free time', () => {
     expect(on('Tue', freeWindows(query({ window: WEEK, rules })))).toEqual([
       'Tue 07:00–09:00 outside usual hours',
       'Tue 09:00–12:00 acceptable',
+      'Tue 12:00–13:00 protected time',
       'Tue 13:00–17:00 acceptable',
       'Tue 17:00–22:00 outside usual hours',
     ]);
-    // Tuesday 12:45 to 13:15 London touches the window: a counterpart's proposal never gets round it.
-    expect(inProtectedTime(span('2026-10-06T11:45:00Z', '2026-10-06T12:15:00Z'), rules, LONDON)).toBe(true);
-    expect(inProtectedTime(span('2026-10-06T12:00:00Z', '2026-10-06T12:30:00Z'), rules, LONDON)).toBe(false);
+    // Tuesday 12:45 to 13:15 London touches the window, so any time someone proposes there says so too.
+    expect(fitOf(span('2026-10-06T11:45:00Z', '2026-10-06T12:15:00Z'), rules, LONDON)).toBe('protected time');
+    expect(fitOf(span('2026-10-06T12:00:00Z', '2026-10-06T12:30:00Z'), rules, LONDON)).toBe('acceptable');
   });
 
   it("keeps the principal's default buffer around busy time, and no other kind's", () => {

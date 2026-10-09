@@ -10,14 +10,14 @@
  *   covers the principal's whole local days. `free_time`, `book` and main's
  *   `find_conflicts` all read time through this one rule.
  * - Free time is every free window in the principal's waking day, widened
- *   by working hours that reach past it, clear of protected time and of busy
- *   time by the buffer, inside the counterpart's waking day when their zone
- *   is known, and long enough for the meeting (`freeWindows`). Its edges sit
- *   on the quarter hour. Each window carries a fit note from a fixed
- *   vocabulary that every meeting inside it meets (`fitOf`), so a window is
- *   split where the fit changes. The agent picks the times; the host only
- *   says which are free. Only protected time is hard (`inProtectedTime`), so
- *   a time someone proposes is checked against it too.
+ *   by working hours that reach past it, clear of busy time by the buffer,
+ *   inside the counterpart's waking day when their zone is known, and long
+ *   enough for the meeting (`freeWindows`). Its edges sit on the quarter
+ *   hour. Each window carries a fit note from a fixed vocabulary that every
+ *   meeting inside it meets (`fitOf`), so a window is split where the fit
+ *   changes. Protected time is one of those notes, not a wall: the agent
+ *   picks the times, and judges who is worth bending a preference for; the
+ *   host only says which are free.
  */
 import {
   type PreferenceValue,
@@ -333,7 +333,7 @@ export function schedulingRules(values: SchedulingPreferenceValues): SchedulingR
 }
 
 // ---------------------------------------------------------------------------
-// Protected and busy time
+// Busy and protected time
 // ---------------------------------------------------------------------------
 
 function overlaps(a: Span, b: Span): boolean {
@@ -345,7 +345,7 @@ function onDay(date: LocalDate, range: ClockRange, timezone: string): Span {
 }
 
 /** Whether any part of a span falls inside one of the principal's protected windows, on every local day it touches. */
-export function inProtectedTime(span: Span, rules: SchedulingRules, timezone: string): boolean {
+function inProtectedTime(span: Span, rules: SchedulingRules, timezone: string): boolean {
   const last = localTime(span.end - 1, timezone);
   for (let date: LocalDate = localTime(span.start, timezone); compareDates(date, last) <= 0; date = nextDate(date)) {
     const weekday = weekdayOf(date);
@@ -390,11 +390,16 @@ function insideWorkingHours(slot: Span, rules: SchedulingRules, timezone: string
 // ---------------------------------------------------------------------------
 
 /** How a time sits against the principal's preferences, best first: the only words free time says of them. */
-export const FITS = ['preferred', 'acceptable', 'outside usual hours'] as const;
+export const FITS = ['preferred', 'acceptable', 'outside usual hours', 'protected time'] as const;
 export type Fit = (typeof FITS)[number];
 
-/** Preferred when inside a preferred time, acceptable inside working hours, and otherwise outside usual hours. */
+/**
+ * Protected time when any of it falls in a protected window; otherwise
+ * preferred inside a preferred time, acceptable inside working hours, and
+ * outside usual hours beyond them.
+ */
 export function fitOf(span: Span, rules: SchedulingRules, timezone: string): Fit {
+  if (inProtectedTime(span, rules, timezone)) return 'protected time';
   if (insidePreferred(span, rules, timezone)) return 'preferred';
   return insideWorkingHours(span, rules, timezone) ? 'acceptable' : 'outside usual hours';
 }
@@ -466,8 +471,8 @@ function onQuarterHours(span: Span): Span {
 }
 
 /**
- * A free run split where its fit changes, at the day's working hours and
- * preferred times. A piece too short for the meeting cannot hold one at its
+ * A free run split where its fit changes, at the day's working hours,
+ * preferred times and protected windows. A piece too short for the meeting cannot hold one at its
  * own fit, so it joins a neighbour whose fit the joining leaves as it was,
  * the better fitting one first, and goes when no neighbour takes it; then
  * neighbours that fit alike as one become one. Every window is labeled with
@@ -479,6 +484,7 @@ function byFit(run: Span, date: LocalDate, rules: SchedulingRules, timezone: str
   const ranges: ClockRange[] = [
     ...(hours === undefined ? [] : [hours]),
     ...rules.preferredTimes.filter((window) => window.weekdays.has(weekday)),
+    ...rules.protectedWindows.filter((window) => window.weekdays.has(weekday)),
   ];
   const cuts = new Set<number>();
   for (const range of ranges) {
@@ -524,9 +530,9 @@ function byFit(run: Span, date: LocalDate, rules: SchedulingRules, timezone: str
 /**
  * Every free window in the range: in the hours free time offers from, inside
  * the counterpart's waking day when their zone is known, from the range's
- * start on, clear of protected time and of busy time by the buffer, on the
- * quarter hour, long enough for the meeting, and split where the fit
- * changes. Listed in date order.
+ * start on, clear of busy time by the buffer, on the quarter hour, long
+ * enough for the meeting, and split where the fit changes. Listed in date
+ * order.
  */
 export function freeWindows(query: FreeTimeQuery): FreeWindow[] {
   const { timezone, counterpartTimezone, rules, window } = query;
@@ -541,10 +547,7 @@ export function freeWindows(query: FreeTimeQuery): FreeWindow[] {
     if (counterpartTimezone !== undefined) {
       open = open.flatMap((span) => within([span], wakingDays(span, counterpartTimezone)));
     }
-    const protectedTime = rules.protectedWindows
-      .filter((protectedWindow) => protectedWindow.weekdays.has(weekday))
-      .map((protectedWindow) => onDay(date, protectedWindow, timezone));
-    for (const run of without(without(open, protectedTime), taken).map(onQuarterHours)) {
+    for (const run of without(open, taken).map(onQuarterHours)) {
       if (run.end - run.start >= length) windows.push(...byFit(run, date, rules, timezone, length));
     }
   }
