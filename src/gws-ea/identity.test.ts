@@ -1,21 +1,24 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { reconcileMainIdentity, type MainIdentityDependencies } from './identity.js';
+import { createOnecliAdmin } from './onecli-admin.js';
 import type { InstanceRuntimeConfig } from './service.js';
 
 const GROUP_ID = 'ag-11111111-1111-4111-8111-111111111111';
+const ADMIN_KEY = `oc_${'a'.repeat(64)}`;
 
 function runtimeConfig(): InstanceRuntimeConfig {
   const instanceId = '11111111-1111-4111-8111-111111111111';
-  const checkout = '/opt/gws-ea/instances/one/nanoclaw';
-  const secrets = '/opt/gws-ea/instances/one/secrets';
+  const root = '/opt/gws-ea/11111111';
+  const secrets = `${root}/secrets`;
   const project = `gws-ea-${instanceId.replaceAll('-', '')}`;
   return {
-    schema_version: 1,
+    schema_version: 2,
     instance_id: instanceId,
     install_id: instanceId.replaceAll('-', ''),
-    deployed_commit: 'a'.repeat(40),
-    checkout_realpath: checkout,
+    instance_root: root,
+    checkout_root: `${root}/nanoclaw`,
+    state_root: `${root}/state`,
     node_path: '/usr/bin/node',
     home_directory: '/Users/operator',
     allocated_ports: { nanoclaw_webhook: 31_001, onecli_app: 31_002, onecli_gateway: 31_003 },
@@ -24,7 +27,6 @@ function runtimeConfig(): InstanceRuntimeConfig {
     onecli_app_url: 'http://127.0.0.1:31002',
     onecli_gateway_url: 'http://127.0.0.1:31003',
     onecli_gateway_container: `${project}-gateway-1`,
-    onecli_cli_path: '/opt/onecli',
     selected_provider: 'claude',
     endpoint_url: 'https://aya.example.test/webhook/gchat',
     docker_endpoint: 'unix:///var/run/docker.sock',
@@ -48,7 +50,8 @@ interface FakeState {
   profileWriteArgs: Array<readonly string[]>;
   /** The principal's addresses as the profile holds them. */
   principalEmails: readonly string[];
-  agents: Array<{ id: string; identifier: string; name: string; secretMode: 'all' | 'selective' }>;
+  /** The agents OneCLI holds; one without a secret mode is as a OneCLI from 1.43 on lists it. */
+  agents: Array<{ id: string; identifier: string; name: string; secretMode?: 'all' | 'selective' }>;
   secretModeWrites: number;
   /** Main's shared skills as its container config holds them. */
   skills: readonly string[] | 'all';
@@ -69,6 +72,8 @@ function harness(
     ignoreTimezone?: boolean;
     /** A release whose main reconcile leaves main on every shared skill. */
     ignoreSkills?: boolean;
+    /** OneCLI's list does not yet show main's agent, which a create then finds there (409). */
+    listLagsCreate?: boolean;
   } = {},
 ): {
   state: FakeState;
@@ -129,17 +134,26 @@ function harness(
     }
     throw new Error(`Unexpected ncl call: ${args.join(' ')}`);
   });
-  const runOnecliAdmin = vi.fn(async (_config: InstanceRuntimeConfig, args: readonly string[]) => {
-    if (args[0] === 'agents' && args[1] === 'list') return state.agents;
-    if (args[0] === 'agents' && args[1] === 'create') {
+  let listed = !options.listLagsCreate;
+  /** The instance's OneCLI app behind `fetch`, administered by the real client. */
+  const onecli = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    const method = init?.method ?? 'GET';
+    const body = typeof init?.body === 'string' ? (JSON.parse(init.body) as Record<string, unknown>) : {};
+    const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
+    if (url.pathname === '/v1/agents' && method === 'GET') {
+      return json(listed ? state.agents : state.agents.filter((agent) => agent.identifier !== GROUP_ID));
+    }
+    if (url.pathname === '/v1/agents' && method === 'POST') {
+      listed = true;
+      if (state.agents.some((agent) => agent.identifier === body.identifier)) {
+        return json({ error: 'An agent with this identifier already exists' }, 409);
+      }
       const agent = { id: 'oc-main', identifier: GROUP_ID, name: 'main', secretMode: 'all' as const };
       state.agents.push(agent);
-      return { id: agent.id };
+      return json(agent, 201);
     }
-    if (args[0] === 'agents' && args[1] === 'set-secret-mode') {
-      if (args[args.indexOf('--id') + 1] !== 'oc-main' || args[args.indexOf('--mode') + 1] !== 'all') {
-        throw new Error(`Unexpected OneCLI secret-mode update: ${args.join(' ')}`);
-      }
+    if (url.pathname === '/v1/agents/oc-main/secret-mode' && method === 'PATCH' && body.mode === 'all') {
       state.secretModeWrites += 1;
       if (!options.neverApplySecretMode) {
         state.agents = state.agents.map((agent) =>
@@ -148,13 +162,15 @@ function harness(
       }
       if (options.failAfterSecretModeOnce && !failed) {
         failed = true;
-        throw new Error('simulated crash after secret-mode side effect');
+        throw new TypeError('fetch failed: connection reset after the secret-mode side effect');
       }
-      return { status: 'updated' };
+      return json({ success: true });
     }
-    throw new Error(`Unexpected OneCLI call: ${args.join(' ')}`);
+    throw new Error(`Unexpected OneCLI call: ${method} ${url.pathname} ${JSON.stringify(body)}`);
   });
-  return { state, dependencies: { runNcl, runOnecliAdmin } };
+  const onecliAdmin = async (config: InstanceRuntimeConfig) =>
+    createOnecliAdmin(config.onecli_app_url, ADMIN_KEY, { fetch: onecli as unknown as typeof globalThis.fetch });
+  return { state, dependencies: { runNcl, onecliAdmin } };
 }
 
 const input = {
@@ -233,9 +249,9 @@ describe('main identity reconciliation', () => {
     state.agents.push({ id: 'oc-main', identifier: GROUP_ID, name: 'main', secretMode: 'selective' });
     state.agents.push({ id: 'oc-other', identifier: 'ag-other', name: 'other', secretMode: 'selective' });
 
-    await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).rejects.toThrow(
-      /secret-mode side effect/i,
-    );
+    await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).rejects.toMatchObject({
+      code: 'onecli_request_failed',
+    });
     await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).resolves.toMatchObject({
       agentGroupId: GROUP_ID,
       onecliAgentId: 'oc-main',
@@ -252,6 +268,29 @@ describe('main identity reconciliation', () => {
       secretMode: 'selective',
     });
     expect(state.secretModeWrites).toBe(1);
+  });
+
+  it("creates main's agent when OneCLI's list does not show it, reading it from the list when the create answers 409", async () => {
+    const { state, dependencies } = harness({ listLagsCreate: true });
+    state.agents.push({ id: 'oc-main', identifier: GROUP_ID, name: 'main', secretMode: 'all' });
+
+    await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).resolves.toEqual({
+      agentGroupId: GROUP_ID,
+      onecliAgentId: 'oc-main',
+    });
+    expect(state.agents).toHaveLength(1);
+    expect(state.profileWrites).toBe(1);
+  });
+
+  it("reads main's agent without a secret mode as all, OneCLI's default, and leaves it", async () => {
+    const { state, dependencies } = harness();
+    state.agents.push({ id: 'oc-main', identifier: GROUP_ID, name: 'main' });
+
+    await expect(reconcileMainIdentity(runtimeConfig(), input, dependencies)).resolves.toMatchObject({
+      onecliAgentId: 'oc-main',
+    });
+    expect(state.secretModeWrites).toBe(0);
+    expect(state.profileWrites).toBe(1);
   });
 
   it('fails closed before publishing canonical main when all secret mode cannot be verified', async () => {

@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
-import { constants as fsConstants } from 'node:fs';
+import { constants as fsConstants, realpathSync } from 'node:fs';
 import { access, realpath, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -507,7 +507,6 @@ export const runSanitizedCommandOutcome: SanitizedCommandOutcomeRunner = async (
     const stderrFact =
       command.stream || !outcome.stderr.trim() ? '' : `\n  stderr:\n${indent(redact(outcome.stderr.trim()))}`;
     step?.write(`  exit ${outcome.exitCode} after ${elapsed}${stdoutFact}${stderrFact}\n`);
-    if (!command.stream) step?.captureCommand({ program: command.command, args: command.args, ...outcome });
     return outcome;
   } catch (error) {
     const tail = error instanceof GwsEaError ? error.details?.stderrTail : undefined;
@@ -587,7 +586,23 @@ async function runLauncherCommand(args: readonly string[]): Promise<void> {
   await launchInstanceHost(args[1]);
 }
 
-const invokedPath = process.argv[1] ? pathToFileURL(process.argv[1]).href : undefined;
+/**
+ * The file this process was started as. The service manager starts the
+ * launcher through the live link, which Node keeps in `argv[1]` but resolves
+ * for `import.meta.url`, so the two are compared as the one file they are. An
+ * argument that names no file (`node -e <code> <arg>`) is not this module.
+ */
+function invokedFile(argument: string | undefined): string | undefined {
+  if (!argument) return undefined;
+  try {
+    return pathToFileURL(realpathSync(argument)).href;
+  } catch (error) {
+    if (isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR')) return undefined;
+    throw error;
+  }
+}
+
+const invokedPath = invokedFile(process.argv[1]);
 if (invokedPath === import.meta.url) {
   runLauncherCommand(process.argv.slice(2)).catch((error: unknown) => {
     const message = error instanceof GwsEaError ? error.message : 'The instance host launcher failed';

@@ -9,10 +9,13 @@
  */
 import { registerResource, type ColumnDef } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
+import { DATA_DIR } from '../../config.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { optionalString } from '../../gws-ea/validation.js';
+import { onHostStart } from '../../host-lifecycle.js';
 import { registerRequiredProjectDocSection, type RequiredProjectDocSection } from '../../project-doc-sections.js';
+import { registerMessageInterceptor } from '../../router.js';
 import type { AgentGroup } from '../../types.js';
 import { assertMainCaller, getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import {
@@ -28,6 +31,8 @@ import {
   setPersonLevel,
   updatePerson,
 } from './db.js';
+import { peopleForgetHandoffFile } from './forget-handoff.js';
+import { sweepForgetHandoff } from './forget-sweep.js';
 import { gwsEaPeopleMigration, gwsEaPeopleThinRecordMigration } from './migration.js';
 
 registerMigration(gwsEaPeopleMigration);
@@ -271,6 +276,31 @@ registerResource({
       handler: async (args, ctx) => asMain(ctx, async () => forgetPerson({ id: requiredString(args, 'id') })),
     },
   },
+});
+
+// ---------------------------------------------------------------------------
+// Forgetting again after a snapshot restore (KTD8)
+// ---------------------------------------------------------------------------
+
+let handoffSweep: Promise<void> | undefined;
+
+/**
+ * The host's one sweep of a forget handoff a snapshot restore left, started
+ * by host start or by the first inbound event, whichever comes first: the
+ * host opens routing before it starts its modules.
+ */
+function forgetHandoffSwept(): Promise<void> {
+  handoffSweep ??= sweepForgetHandoff(peopleForgetHandoffFile(DATA_DIR));
+  return handoffSweep;
+}
+
+onHostStart(() => forgetHandoffSwept());
+
+// Holds every inbound event until the sweep has finished, so none reaches a
+// person the restore brought back, then declines it: routing goes on as usual.
+registerMessageInterceptor(async () => {
+  await forgetHandoffSwept();
+  return false;
 });
 
 export {

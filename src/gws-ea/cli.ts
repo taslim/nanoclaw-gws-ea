@@ -1,4 +1,3 @@
-import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -64,6 +63,7 @@ import {
 } from './provision.js';
 import { redact, safeErrorCode, safeErrorMessage } from './redact.js';
 import { allocateInstanceId, getInstanceReservation, validateReservation } from './registry.js';
+import { legacyLocation } from './release-convert.js';
 import {
   resolveReleaseTarget,
   type CreateTargetRequest,
@@ -89,7 +89,7 @@ import {
   type RollbackPreview,
   type RollbackRequest,
 } from './rollback.js';
-import { FIXTURE_STAGING_DIRECTORY, startRunLog, type RunLog } from './run-log.js';
+import { startRunLog, type RunLog } from './run-log.js';
 import { buildInstanceCliCommand, type HostStatusHelpers, type UpsertEnvVars } from './service.js';
 import {
   createServiceControl,
@@ -127,8 +127,8 @@ import {
 } from './update-all.js';
 import {
   GwsEaError,
+  releaseLine,
   sameRelease,
-  shortCommit,
   type AllocatedPorts,
   type GwsEaErrorDetails,
   type InstanceReservationInput,
@@ -268,8 +268,7 @@ type UpdateLauncher = Required<
 >;
 
 const COMMON_OPTIONS = ['secrets-file'] as const;
-const COMMON_SWITCHES = ['capture-fixtures'] as const;
-/** The host service commands name the assistant and nothing else: they read no secrets and capture nothing. */
+/** The host service commands name the assistant and nothing else: they read no secrets. */
 const SERVICE_OPTIONS: OptionSpec = { values: ['id'], switches: [] };
 
 /** A command's flags, with the options it takes once per value. */
@@ -288,15 +287,15 @@ interface ParsedOptions {
 const COMMAND_OPTIONS: Readonly<Record<Command, CommandOptionSpec>> = {
   create: {
     values: ['track', 'source-remote', 'google-account', ...CREATE_INPUT_FLAGS, ...COMMON_OPTIONS],
-    switches: COMMON_SWITCHES,
+    switches: [],
     repeatable: [PRINCIPAL_EMAIL_FLAG],
   },
   resume: {
     values: ['id', 'messaging-group-id', 'google-client-file', ...COMMON_OPTIONS],
-    switches: ['chat-configured', ...COMMON_SWITCHES],
+    switches: ['chat-configured'],
   },
-  remove: { values: ['id', 'abandon', ...COMMON_OPTIONS], switches: ['yes', ...COMMON_SWITCHES] },
-  'connect-google': { values: ['id', 'google-client-file', ...COMMON_OPTIONS], switches: COMMON_SWITCHES },
+  remove: { values: ['id', 'abandon', ...COMMON_OPTIONS], switches: ['yes'] },
+  'connect-google': { values: ['id', 'google-client-file', ...COMMON_OPTIONS], switches: [] },
   start: SERVICE_OPTIONS,
   stop: SERVICE_OPTIONS,
   restart: SERVICE_OPTIONS,
@@ -693,7 +692,6 @@ class Cli {
       '--id',
       state.instanceId,
       ...(plan.options['secrets-file'] ? ['--secrets-file', plan.options['secrets-file']] : []),
-      ...(plan.options['capture-fixtures'] ? ['--capture-fixtures'] : []),
     ];
     return () => this.prepare('resume', resumeArgs)();
   }
@@ -735,7 +733,7 @@ class Cli {
         interaction,
       ),
     );
-    const instanceId = allocateInstanceId();
+    const instanceId = await allocateInstanceId(paths);
     state.instanceId = instanceId;
     this.#presenter.line(`instance_id: ${instanceId}`);
     // After the ID, which scripts read as the first line.
@@ -797,7 +795,7 @@ class Cli {
     const bootstrapManifest = validateProductionBootstrapManifest(setup.bootstrapManifest);
     const held = await (this.#runtime.holdLoopbackPorts ?? holdLoopbackPorts)();
     try {
-      const input = createReservation(paths, track, sourceRemote, setup, {
+      const input = createReservation(track, sourceRemote, setup, {
         instanceId,
         commit,
         ports: held.ports,
@@ -864,10 +862,7 @@ class Cli {
         const reservation = await getInstanceReservation(this.#paths, instanceId);
         const account = reservation.exclusive_resource_claims.gcp_account;
         const host = await recordedHost(this.#paths, reservation);
-        await this.#checkPrerequisites(
-          { command: 'resume', paths: this.#paths, account, checkoutRoot: reservation.checkout_realpath, ...host },
-          interaction,
-        );
+        await this.#checkPrerequisites({ command: 'resume', paths: this.#paths, account, ...host }, interaction);
       });
       return await this.#provision(reporter, operation, interaction);
     } finally {
@@ -916,8 +911,8 @@ class Cli {
   /**
    * Connect a created assistant's own Google account (KTD5): the same
    * resources as create's `connect_google` step, outside the provision
-   * journal, so an assistant created before Google access gains it without
-   * being recreated, and a lost or outdated sign-in is repaired.
+   * journal, so a lost or outdated sign-in is repaired without recreating
+   * the assistant.
    */
   async #connectGoogleWork({ reporter, interaction }: Session, instanceId: string): Promise<Outcome> {
     const operation = await acquireInstanceOperation(this.#paths, instanceId, { command: 'connect-google' });
@@ -926,22 +921,10 @@ class Cli {
       const runtime = await loadCreatedRuntime(this.#paths, instanceId);
       const reservation = await getInstanceReservation(this.#paths, instanceId);
       const claims = reservation.exclusive_resource_claims;
-      if (!existsSync(path.join(reservation.checkout_realpath, 'src', 'modules', 'gws-ea-google', 'index.ts'))) {
-        throw new GwsEaError(
-          'update_required',
-          `This assistant runs a release without Google access. Update it first: gws-ea update --id ${instanceId}`,
-        );
-      }
       await runStep(reporter, PREREQUISITES_STEP, async () => {
         const host = await recordedHost(this.#paths, reservation);
         await this.#checkPrerequisites(
-          {
-            command: 'resume',
-            paths: this.#paths,
-            account: claims.gcp_account,
-            checkoutRoot: reservation.checkout_realpath,
-            ...host,
-          },
+          { command: 'resume', paths: this.#paths, account: claims.gcp_account, ...host },
           interaction,
         );
       });
@@ -956,7 +939,7 @@ class Cli {
               account: claims.gcp_account,
               serviceAccountEmail: claims.gchat_service_account,
               credentialFile: runtime.secret_files.gchat_credentials,
-              cwd: reservation.checkout_realpath,
+              cwd: runtime.instance_root,
             },
             google: {
               runtime,
@@ -1057,12 +1040,13 @@ class Cli {
   /**
    * One assistant's update, which `update --id` and each turn of `update
    * --all` run: stage this tool's release beside the running assistant, show
-   * what the update changes, and once confirmed carry it through its cutover
-   * to the recorded release (R7, R8, R10, R12). An update already under way
-   * to this release is continued, not staged again, and a recorded one's
+   * what the update changes, and once confirmed carry it through its switch
+   * to the committed release (R1, R2). An update already under way to this
+   * release is continued, not staged again; one with no release to return to
+   * is superseded by an update to another (KTD9); and a committed one's
    * follow-ups are finished before anything else (KTD2), even when this
-   * release is the one already recorded. Undefined when its preview was
-   * declined, which removed the staging.
+   * release is the one already committed. Undefined when its preview was
+   * declined, which left the staging for the next update.
    */
   async #updateAssistant(
     reporter: Session['reporter'],
@@ -1089,14 +1073,21 @@ class Cli {
         reporter,
       };
       const unfinished = await readOperationRecord(this.#paths, request.instanceId);
-      if (unfinished?.phase === 'recorded') {
-        const notes = await finishFollowUps(operation, dependencies);
-        if (sameRelease(unfinished.to, intent.target)) return { kind: 'completed', release: unfinished.to, notes };
+      if (unfinished?.phase === 'committed') {
+        await finishFollowUps(operation, dependencies);
+        if (sameRelease(unfinished.to, intent.target)) return { kind: 'completed', release: unfinished.to };
       }
-      if (!unfinished || unfinished.phase === 'recorded') {
+      // The gate admitted this update: it continues an open update to this release, or supersedes one with no release
+      // to return to (KTD9), which is staged anew.
+      const continuing =
+        unfinished?.phase !== 'committed' &&
+        unfinished?.kind === 'update' &&
+        unfinished.closed === undefined &&
+        sameRelease(unfinished.to, intent.target);
+      if (!continuing) {
         const staged = await prepareUpdate(operation, intent, dependencies);
         for (const line of updatePreviewLines(staged.preview)) this.#presenter.line(line);
-        if (!(await confirmStagedUpdate(operation, staged, dependencies, confirm))) return undefined;
+        if (!(await confirmStagedUpdate(operation, staged, confirm))) return undefined;
       }
       return { kind: 'updated', updated: await continueUpdate(operation, dependencies) };
     } finally {
@@ -1177,11 +1168,11 @@ class Cli {
   }
 
   /**
-   * `rollback`: return the assistant to the release kept in `previous/`, or
-   * settle what its record says is unfinished (R13-R16). A restore of the
-   * pre-update snapshot is shown first and needs confirmation: `--yes`, or a
-   * terminal to be asked on; a code-only rollback loses nothing and is not
-   * asked about. A recorded rollback's follow-ups run last.
+   * `rollback`: return the assistant to its rollback point, or settle what
+   * its record says is unfinished (R3). A restore of the pre-update snapshot
+   * is shown first and needs confirmation: `--yes`, or a terminal to be asked
+   * on; a code-only rollback loses nothing and is not asked about. A
+   * committed rollback's follow-ups run last.
    */
   async #rollbackWork({ reporter }: Session, instanceId: string, options: CommandOptions): Promise<Outcome> {
     const { serviceHelpers, upsertEnvVars, hostStatus, confirmRollback } = this.#runtime;
@@ -1209,11 +1200,10 @@ class Cli {
         reporter,
       };
       const outcome = await rollBack(operation, dependencies, request);
-      const notes =
-        outcome.kind === 'rolled_back' || outcome.kind === 'follow_ups_finished'
-          ? await finishFollowUps(operation, dependencies)
-          : [];
-      return rollbackOutcome(instanceId, outcome, timezone, notes);
+      if (outcome.kind === 'rolled_back' || outcome.kind === 'follow_ups_finished') {
+        await finishFollowUps(operation, dependencies);
+      }
+      return rollbackOutcome(instanceId, outcome, timezone);
     } finally {
       operation.release();
     }
@@ -1325,14 +1315,15 @@ class Cli {
         ...(plan.meta ? { meta: plan.meta } : {}),
         secretDirectories: [
           path.join(paths.cloudflareRoot, 'secrets'),
+          // The assistant's root, and the root the layout before releases kept it in until its conversion moves the
+          // secrets: `legacyLocation` goes with the converter (KTD13), and its root here with it.
           ...(plan.instanceId
-            ? [
-                path.join(paths.instanceRoot(plan.instanceId), 'secrets'),
-                path.join(paths.instanceRoot(plan.instanceId), 'onecli', 'secrets'),
-              ]
+            ? [paths.instanceRoot(plan.instanceId), legacyLocation(paths, plan.instanceId).root].flatMap((root) => [
+                path.join(root, 'secrets'),
+                path.join(root, 'onecli', 'secrets'),
+              ])
             : []),
         ],
-        ...(plan.options['capture-fixtures'] ? { captureFixturesTo: FIXTURE_STAGING_DIRECTORY } : {}),
       });
       const emit = (event: RunEvent): void => {
         if (event.type === 'step-started' && event.label) labels.set(event.step, event.label);
@@ -1404,73 +1395,55 @@ class Cli {
   }
 }
 
-function releaseName(release: ReleaseCoordinates): string {
-  return `${release.release_track} ${shortCommit(release.deployed_commit)}`;
-}
-
-/**
- * Where an update leaves the assistant: on its release, the one it ran kept
- * to roll back to; what its follow-ups said, such as main's template kept,
- * comes first.
- */
+/** Where an update leaves the assistant: on its release, the one it ran kept to roll back to when it has one. */
 function updatedOutcome(instanceId: string, updated: UpdatedAssistant): Outcome {
   return {
     status: 'ready',
-    message: `Assistant ${instanceId} was updated to ${releaseName(updated.to)}.`,
-    details: [...updated.notes, `Its previous release, ${releaseName(updated.from)}, is kept to roll back to.`],
+    message: `Assistant ${instanceId} was updated to ${releaseLine(updated.to)}.`,
+    details: updated.rollbackTarget
+      ? [`Its previous release, ${releaseLine(updated.from)}, is kept to roll back to.`]
+      : ['It has no previous release to roll back to.'],
   };
 }
 
-/** Where a rollback left the assistant, after what its follow-ups said. */
-function rollbackOutcome(
-  instanceId: string,
-  outcome: RollbackOutcome,
-  timezone: string,
-  notes: readonly string[],
-): Outcome {
+/** Where a rollback left the assistant. */
+function rollbackOutcome(instanceId: string, outcome: RollbackOutcome, timezone: string): Outcome {
   switch (outcome.kind) {
     case 'rolled_back':
       return {
         status: 'ready',
-        message: `Assistant ${instanceId} was rolled back to ${releaseName(outcome.to)}.`,
-        details: [
-          ...notes,
-          ...(outcome.mode === 'code_only'
-            ? [
-                'Only its code went back: every conversation, memory, and setting since the update was kept.',
-                `The release it left, ${releaseName(outcome.from)}, is kept in ${outcome.keptAt} until the next update or removal.`,
-              ]
+        message: `Assistant ${instanceId} was rolled back to ${releaseLine(outcome.to)}.`,
+        details:
+          outcome.mode === 'code_only'
+            ? ['Only its code went back: every conversation, memory, and setting since the update was kept.']
             : [
                 `Its snapshot from ${formatLocalTime(outcome.snapshotAt, timezone)} was restored.`,
-                `What it recorded since, with the release it left, ${releaseName(outcome.from)}, is kept in ${outcome.keptAt} until the next update or removal.`,
-              ]),
-        ],
+                `What it recorded since on ${releaseLine(outcome.from)} is kept in ${outcome.keptAt} until another snapshot restore replaces it, or the assistant is removed.`,
+              ],
       };
     case 'update_discarded':
       return {
         status: 'ready',
-        message: `The update of assistant ${instanceId} to ${releaseName(outcome.discarded)} was discarded; it runs ${releaseName(outcome.release)} again.`,
+        message: `The update of assistant ${instanceId} to ${releaseLine(outcome.discarded)} was discarded; it runs ${releaseLine(outcome.release)} again.`,
       };
     case 'follow_ups_finished':
       return {
         status: 'ready',
-        message: `Assistant ${instanceId} runs ${releaseName(outcome.release)}; its rollback is finished.`,
-        ...(notes.length > 0 ? { details: [...notes] } : {}),
+        message: `Assistant ${instanceId} runs ${releaseLine(outcome.release)}; its rollback is finished.`,
       };
     case 'declined':
       return {
         status: 'ready',
-        message: `Rollback cancelled. Assistant ${instanceId} stays on ${releaseName(outcome.release)} as before.`,
+        message: `Rollback cancelled. Assistant ${instanceId} stays on ${releaseLine(outcome.release)} as before.`,
       };
   }
 }
 
-/** An update run that only finished the follow-ups of the release it would deploy, and what they said. */
-function finishedOutcome(instanceId: string, release: ReleaseCoordinates, notes: readonly string[]): Outcome {
+/** An update run that only finished the follow-ups of the release it would deploy. */
+function finishedOutcome(instanceId: string, release: ReleaseCoordinates): Outcome {
   return {
     status: 'ready',
-    message: `Assistant ${instanceId} runs ${releaseName(release)}; its update is finished.`,
-    ...(notes.length > 0 ? { details: [...notes] } : {}),
+    message: `Assistant ${instanceId} runs ${releaseLine(release)}; its update is finished.`,
   };
 }
 
@@ -1481,7 +1454,7 @@ function updateOutcome(instanceId: string, update: AssistantUpdate | undefined):
     case 'updated':
       return updatedOutcome(instanceId, update.updated);
     case 'completed':
-      return finishedOutcome(instanceId, update.release, update.notes);
+      return finishedOutcome(instanceId, update.release);
   }
 }
 
@@ -1652,7 +1625,6 @@ function failureStop(report: FailureReport, error: unknown): StopReport {
 }
 
 function createReservation(
-  paths: ControlPlanePaths,
   track: string,
   sourceRemote: string,
   setup: CreateSetupAnswers,
@@ -1667,7 +1639,6 @@ function createReservation(
   const gcpProjectId = deriveGcpProjectId(instanceId);
   const input: InstanceReservationInput = {
     instance_id: instanceId,
-    checkout_realpath: paths.checkoutRoot(instanceId),
     release_track: track,
     source_remote: sourceRemote,
     deployed_commit: production.commit,
@@ -1692,7 +1663,7 @@ function createReservation(
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },
   };
-  return validateReservation(input, paths);
+  return validateReservation(input);
 }
 
 function removalPreviewLines(preview: RemovalPreview): string[] {
@@ -1789,7 +1760,7 @@ function printHelp(output: LineWriter): void {
   output(
     '         Removes a NanoClaw install set up or started in the checkout gws-ea runs from; create and update do this first.',
   );
-  output('  create, resume, remove: [--secrets-file <owner-only file under the config root>] [--capture-fixtures]');
+  output('  create, resume, remove: [--secrets-file <owner-only file under the config root>]');
   output('  Secrets: GWS_EA_PROVIDER_CREDENTIAL, GWS_EA_CLOUDFLARE_API_TOKEN (environment or --secrets-file).');
   output('  Exit codes: 0 ready, 10 paused for a person, 1 failed, 75 busy; ncl and logs exit as their tool does.');
 }

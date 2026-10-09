@@ -5,28 +5,29 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { isErrno } from '../community-portal/errors.js';
+import { instanceLayout, releaseName, type InstanceLayout } from './release-layout.js';
 import { GwsEaError } from './types.js';
 
-/** The checkout this control plane runs from (`src/gws-ea` and `dist/gws-ea` both sit two levels below it). */
+/**
+ * The checkout this control plane runs from (`src/gws-ea` and `dist/gws-ea` both sit two levels below it). Node
+ * resolves the main module's links, so a launcher started through an assistant's `nanoclaw` link finds the
+ * physical release folder it runs from here.
+ */
 export const CONTROL_PLANE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-/**
- * Releases an instance keeps beside its live checkout, each under
- * `<instance>/<slot>/nanoclaw`: the one an update stages, the one it keeps as
- * the rollback point, the one a rollback leaves, and the rollback point an
- * update set aside at its swap, kept until the update is recorded.
- */
-export const RELEASE_SLOTS = ['next', 'previous', 'outgoing', 'superseded'] as const;
-export type ReleaseSlot = (typeof RELEASE_SLOTS)[number];
-
-/** The instance marker inside a checkout. */
-export function instanceMarkerFile(checkoutRoot: string): string {
-  return path.join(checkoutRoot, 'data', 'gws-ea', 'instance.json');
+/** The name of an instance's root under the state root: the first eight hex digits of its ID (KTD10). */
+export function instanceRootName(instanceId: string): string {
+  return instanceId.slice(0, 8);
 }
 
-/** The runtime record inside a checkout, written once its host first starts. */
-export function instanceRuntimeFile(checkoutRoot: string): string {
-  return path.join(checkoutRoot, 'data', 'gws-ea', 'runtime.json');
+/** The instance marker under `stateRoot`, the directory that holds NanoClaw's `data`. */
+export function instanceMarkerFile(stateRoot: string): string {
+  return path.join(stateRoot, 'data', 'gws-ea', 'instance.json');
+}
+
+/** The runtime record under `stateRoot`, the directory that holds NanoClaw's `data`. */
+export function instanceRuntimeFile(stateRoot: string): string {
+  return path.join(stateRoot, 'data', 'gws-ea', 'runtime.json');
 }
 
 export interface ControlPlanePathOverrides {
@@ -42,25 +43,29 @@ export interface ControlPlanePaths {
   removalRoot: string;
   ingressRoot: string;
   cloudflareRoot: string;
-  instancesRoot: string;
   logsRoot: string;
   preReservationLogsRoot: string;
   instanceLogsRoot(instanceId: string): string;
+  /** `<state root>/<first 8 hex of the ID>`: the assistant's releases, state, and records. */
   instanceRoot(instanceId: string): string;
+  /** The instance root's layout: its live link, its physical `state/` and `logs/`, and its releases. */
+  instanceLayout(instanceId: string): InstanceLayout;
+  /** The live release's link, `<instance root>/nanoclaw`: what the service, `ncl`, and the host's status run from. */
   checkoutRoot(instanceId: string): string;
   journalFile(instanceId: string): string;
   /** The record of an update or rollback under way, beside the provision journal. */
   operationFile(instanceId: string): string;
-  releaseRoot(instanceId: string, slot: ReleaseSlot): string;
-  releaseCheckoutRoot(instanceId: string, slot: ReleaseSlot): string;
+  /** The release a rollback returns to, and the snapshot of the state it left (KTD4). */
+  rollbackPointFile(instanceId: string): string;
   instanceLock(instanceId: string): string;
+  /** The instance marker in the physical `state/`, which names the assistant the state belongs to. */
   markerFile(instanceId: string): string;
+  /** The runtime record in the physical `state/`, written once at create. */
+  runtimeFile(instanceId: string): string;
   bootstrapFile(instanceId: string): string;
-  /** The release receipt: the live release's, or with `slot` the one kept beside that release. */
-  releasePreflightFile(instanceId: string, slot?: ReleaseSlot): string;
+  /** The receipt of the release at `commit`, kept with it in `kept/<hex8>/` and written last. */
+  releasePreflightFile(instanceId: string, commit: string): string;
   removalFile(instanceId: string): string;
-  /** gws-ea's own copy of one pinned OneCLI CLI version. */
-  onecliCliFile(version: string): string;
   /** The Cloudflare account token a create keeps until its route is set up. */
   keptCloudflareTokenFile(instanceId: string): string;
 }
@@ -99,14 +104,12 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
   const stateRoot = canonicalNewPath(
     overrides.stateRoot ?? process.env.GWS_EA_STATE_ROOT ?? path.join(defaultStateBase, 'gws-ea'),
   );
-  const instancesRoot = path.join(stateRoot, 'instances');
   const removalRoot = path.join(configRoot, 'removals');
   const ingressRoot = path.join(stateRoot, 'ingress');
   const cloudflareRoot = path.join(ingressRoot, 'cloudflare');
   const logsRoot = path.join(stateRoot, 'logs');
-  const instanceRoot = (instanceId: string): string => path.join(instancesRoot, instanceId);
-  const checkoutRoot = (instanceId: string): string => path.join(instanceRoot(instanceId), 'nanoclaw');
-  const releaseRoot = (instanceId: string, slot: ReleaseSlot): string => path.join(instanceRoot(instanceId), slot);
+  const instanceRoot = (instanceId: string): string => path.join(stateRoot, instanceRootName(instanceId));
+  const layout = (instanceId: string): InstanceLayout => instanceLayout(instanceRoot(instanceId));
 
   return {
     configRoot,
@@ -116,23 +119,21 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
     removalRoot,
     ingressRoot,
     cloudflareRoot,
-    instancesRoot,
     logsRoot,
     preReservationLogsRoot: path.join(logsRoot, 'runs'),
     instanceLogsRoot: (instanceId) => path.join(logsRoot, instanceId),
     instanceRoot,
-    checkoutRoot,
+    instanceLayout: layout,
+    checkoutRoot: (instanceId) => layout(instanceId).current,
     journalFile: (instanceId) => path.join(instanceRoot(instanceId), 'provision.json'),
     operationFile: (instanceId) => path.join(instanceRoot(instanceId), 'operation.json'),
-    releaseRoot,
-    releaseCheckoutRoot: (instanceId, slot) => path.join(releaseRoot(instanceId, slot), 'nanoclaw'),
+    rollbackPointFile: (instanceId) => path.join(instanceRoot(instanceId), 'rollback-point.json'),
     instanceLock: (instanceId) => path.join(configRoot, 'locks', `${instanceId}.lock`),
-    markerFile: (instanceId) => instanceMarkerFile(checkoutRoot(instanceId)),
+    markerFile: (instanceId) => instanceMarkerFile(layout(instanceId).state),
+    runtimeFile: (instanceId) => instanceRuntimeFile(layout(instanceId).state),
     bootstrapFile: (instanceId) => path.join(instanceRoot(instanceId), 'bootstrap.json'),
-    releasePreflightFile: (instanceId, slot) =>
-      path.join(slot ? releaseRoot(instanceId, slot) : instanceRoot(instanceId), 'release-preflight.json'),
+    releasePreflightFile: (instanceId, commit) => layout(instanceId).receipt(releaseName(commit)),
     removalFile: (instanceId) => path.join(removalRoot, `${instanceId}.json`),
-    onecliCliFile: (version) => path.join(stateRoot, 'tools', 'onecli', version, 'onecli'),
     keptCloudflareTokenFile: (instanceId) => path.join(instanceRoot(instanceId), 'secrets', 'cloudflare-account-token'),
   };
 }

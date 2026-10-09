@@ -5,7 +5,7 @@
  * file. The host, service manager, Docker, OneCLI, and the callback are
  * faked at their boundaries; Git and SQLite are real.
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   lstat,
   mkdir,
@@ -14,8 +14,8 @@ import {
   readFile,
   readlink,
   realpath,
-  rename,
   rm,
+  symlink,
   utimes,
   writeFile,
 } from 'node:fs/promises';
@@ -26,12 +26,15 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { writePrivate } from '../community-portal/private-file.js';
+import { getInstallScopedNames } from '../install-slug.js';
 import { acquireInstanceOperation, recordPrincipalSelection, reserveInstance } from './journal.js';
 import { createOnecliRuntimeLayout, renderOnecliCompose } from './onecli-compose.js';
 import { wrapperImageTag } from './onecli-gateway-image.js';
 import {
   advanceOperation,
   beginOperation,
+  beginOperationReturn,
+  closeOperationFailed,
   commitOperationRelease,
   type OperationFollowUp,
   type OperationIntent,
@@ -44,7 +47,9 @@ import { PRESENT } from './phases.js';
 import type { PrincipalCandidate } from './principal.js';
 import { runSanitizedCommand, type SanitizedCommand } from './process.js';
 import { redact } from './redact.js';
-import { allocateInstanceId, writeInstanceMarker } from './registry.js';
+import { conversionRecordFile } from './release-convert.js';
+import { operationName } from './release-layout.js';
+import { writeInstanceMarker } from './registry.js';
 import { createInstanceRuntimeConfig, persistInstanceRuntime, type HostStatusHelpers } from './service.js';
 import type { NanoclawServiceHelpers } from './service-control.js';
 import {
@@ -68,8 +73,7 @@ afterEach(async () => {
 });
 
 const DOCKER = 'unix:///var/run/docker.sock';
-const ONECLI_CLI = '/usr/local/bin/onecli';
-const PINS = { gateway: '1.41.3', cli: '2.2.4' } as const;
+const PINS = { gateway: '1.41.3' } as const;
 const CREDENTIAL = { name: 'Anthropic', type: 'anthropic', hostPattern: 'api.anthropic.com', headerName: 'x-api-key' };
 const MAIN = 'ag-main';
 const EXTERNAL_EMAIL = 'ag-external-email';
@@ -85,6 +89,7 @@ const LIST_FIELDS = [
   'hostname',
   'track',
   'deployed_commit',
+  'phase',
   'release',
   'service',
   'operation',
@@ -95,12 +100,12 @@ const LIST_FIELDS = [
 const STATUS_FIELDS = [
   'instance_id',
   'observed_at',
+  'phase',
   'registry',
   'operation',
   'removal_in_progress',
   'release',
   'rollback',
-  'templates',
   'schema',
   'probes',
 ] as const;
@@ -147,17 +152,32 @@ interface AssistantOptions {
   readonly from?: { readonly repository: string; readonly commit: string };
 }
 
-/** An assistant create finished: its reservation, checkout, marker, runtime, release receipt, and Compose file. */
+/** Each fixture assistant's machine paths, by instance ID. */
+const machineOf = new Map<string, ControlPlanePaths>();
+
+/** The assistant's live link, which the host's status and `ncl` run through. */
+function liveOf(reservation: InstanceReservation): string {
+  return machineOf.get(reservation.instance_id)!.checkoutRoot(reservation.instance_id);
+}
+
+/** The assistant's physical state, which holds NanoClaw's `data`. */
+function stateOf(reservation: InstanceReservation): string {
+  return machineOf.get(reservation.instance_id)!.instanceLayout(reservation.instance_id).state;
+}
+
+/**
+ * An assistant create finished: its reservation, its release live, its marker and runtime in its state, its
+ * release receipt, and its Compose file.
+ */
 async function assistant(
   host: Machine,
   { label, port, ingress, from = { repository: host.tool, commit: host.release } }: AssistantOptions,
 ): Promise<InstanceReservation> {
   const { paths } = host;
-  const instanceId = allocateInstanceId();
+  const instanceId = randomUUID();
   const callback = `https://${label}.example.test/webhook/gchat`;
   const reserved = await reserveInstance(paths, {
     instance_id: instanceId,
-    checkout_realpath: paths.checkoutRoot(instanceId),
     source_remote: from.repository,
     release_track: 'dogfood',
     deployed_commit: from.commit,
@@ -182,9 +202,12 @@ async function assistant(
       onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
     },
   });
-  const checkout = paths.checkoutRoot(instanceId);
+  machineOf.set(instanceId, paths);
+  const release = from.commit.slice(0, 8);
+  const checkout = paths.instanceLayout(instanceId).release(release);
   git(host.root, 'clone', '--quiet', from.repository, checkout);
   git(checkout, 'checkout', '--quiet', '--detach', from.commit);
+  await symlink(release, paths.checkoutRoot(instanceId));
   await writeInstanceMarker(paths, instanceId);
   const onecli = createOnecliRuntimeLayout({
     instanceId,
@@ -192,11 +215,10 @@ async function assistant(
     project: reserved.exclusive_resource_claims.onecli_project,
     appPort: reserved.allocated_ports.onecli_app,
     gatewayPort: reserved.allocated_ports.onecli_gateway,
-    cliExecutable: ONECLI_CLI,
     dockerEndpoint: DOCKER,
   });
   await persistInstanceRuntime(
-    createInstanceRuntimeConfig(reserved, onecli, {
+    createInstanceRuntimeConfig(paths, reserved, onecli, {
       nodePath: process.execPath,
       homeDirectory: host.root,
       selectedProvider: 'claude',
@@ -204,14 +226,15 @@ async function assistant(
     }),
     () => undefined,
   );
+  const receipt = paths.releasePreflightFile(instanceId, from.commit);
+  await mkdir(path.dirname(receipt), { recursive: true, mode: 0o700 });
   await writeFile(
-    paths.releasePreflightFile(instanceId),
+    receipt,
     `${JSON.stringify({
       schema_version: 1,
       instance_id: instanceId,
       deployed_commit: from.commit,
       provider: 'claude',
-      providerCapabilityDigest: 'c'.repeat(64),
       providerCredential: CREDENTIAL,
       packageManager: 'pnpm@10.34.5',
       onecli: { ...PINS, sdk: '0.4.0' },
@@ -247,23 +270,21 @@ async function bound(paths: ControlPlanePaths, instanceId: string): Promise<void
   }
 }
 
-/** A previous release an update kept: its checkout's marker, its manifest naming this assistant, and its receipt. */
-async function keepPrevious(paths: ControlPlanePaths, reservation: InstanceReservation, commit: string): Promise<void> {
-  const id = reservation.instance_id;
-  const previous = paths.releaseCheckoutRoot(id, 'previous');
-  await writePrivate(path.join(previous, 'data', 'gws-ea', 'instance.json'), {
+/** The rollback point an update left: the release it left, and the snapshot it took, whose schema is `manifest`. */
+async function keepRollbackPoint(
+  paths: ControlPlanePaths,
+  reservation: InstanceReservation,
+  commit: string,
+  manifest: SnapshotManifest = MANIFEST,
+): Promise<void> {
+  await writePrivate(paths.rollbackPointFile(reservation.instance_id), {
     schema_version: 1,
-    instance_id: id,
-    deployed_commit: commit,
-  });
-  const root = paths.releaseRoot(id, 'previous');
-  await writePrivate(path.join(root, 'release-manifest.json'), {
-    schema_version: 1,
-    instance_id: id,
+    instance_id: reservation.instance_id,
     release: { ...releaseOf(reservation), deployed_commit: commit },
-    snapshot_at: NOW.toISOString(),
+    snapshot: operationName(NOW.toISOString()),
+    manifest,
+    taken_at: NOW.toISOString(),
   });
-  await writePrivate(path.join(root, 'release-preflight.json'), { instance_id: id, deployed_commit: commit });
 }
 
 /** The release an update to `to` is moving this assistant towards, unfinished at `phase`. */
@@ -271,7 +292,7 @@ async function updateUnfinishedAt(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
   to: ReleaseCoordinates,
-  phase: OperationPhase = 'stopped',
+  phase: Exclude<OperationPhase, 'committed'> = 'fenced',
 ) {
   const operation = await acquireInstanceOperation(paths, reservation.instance_id, { command: 'update', target: to });
   if (!operation) throw new Error('The test instance operation was busy');
@@ -293,8 +314,13 @@ async function recordedWith(
   const operation = await acquireInstanceOperation(paths, reservation.instance_id, intent);
   if (!operation) throw new Error('The test instance operation was busy');
   try {
-    await beginOperation(operation, { kind, from: releaseOf(reservation), to, follow_ups: [followUp] });
-    await advanceOperation(operation, 'verified', { stop: { at: NOW.toISOString(), graceful: true } });
+    await beginOperation(operation, { kind, from: releaseOf(reservation), to });
+    await advanceOperation(operation, 'verified', {
+      stop: { at: NOW.toISOString(), graceful: true },
+      manifest: MANIFEST,
+      ...(kind === 'rollback' ? { mode: 'code_only' as const } : {}),
+      follow_ups: [followUp],
+    });
     await commitOperationRelease(operation);
   } finally {
     operation.release();
@@ -310,14 +336,69 @@ async function removalStarted(paths: ControlPlanePaths, reservation: InstanceRes
   });
 }
 
-/** The staging an interrupted update left behind: `next/`, with no operation record. */
-async function stagingLeft(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<void> {
-  await mkdir(paths.releaseCheckoutRoot(reservation.instance_id, 'next'), { recursive: true, mode: 0o700 });
+/**
+ * An assistant still on the layout before releases: its registry entry
+ * records the checkout that layout kept under `instances/<id>/`, and nothing
+ * of it is in a short root.
+ */
+async function legacyAssistant(host: Machine, options: AssistantOptions): Promise<InstanceReservation> {
+  const reservation = await assistant(host, options);
+  const id = reservation.instance_id;
+  await rm(host.paths.instanceRoot(id), { recursive: true, force: true });
+  const registry = JSON.parse(await readFile(host.paths.registryFile, 'utf8')) as {
+    instances: Record<string, Record<string, unknown>>;
+  };
+  const checkout = path.join(host.paths.stateRoot, 'instances', id, 'nanoclaw');
+  registry.instances[id] = { ...registry.instances[id], checkout_realpath: checkout };
+  await writePrivate(host.paths.registryFile, registry);
+  return { ...reservation, checkout_realpath: checkout };
+}
+
+/** An update to `to` with no release to return to, whose release started and failed: closed for fix-forward. */
+async function updateFailedWithoutReturn(
+  paths: ControlPlanePaths,
+  reservation: InstanceReservation,
+  to: ReleaseCoordinates,
+): Promise<void> {
+  const operation = await acquireInstanceOperation(paths, reservation.instance_id, { command: 'update', target: to });
+  if (!operation) throw new Error('The test instance operation was busy');
+  try {
+    await beginOperation(operation, { kind: 'update', from: releaseOf(reservation), to, no_rollback_target: true });
+    await advanceOperation(operation, 'started', { stop: { at: NOW.toISOString(), graceful: true } });
+    await closeOperationFailed(operation);
+  } finally {
+    operation.release();
+  }
+}
+
+/** A rollback of the release the registry names whose return to that release failed too. */
+async function rollbackFailedReturning(
+  paths: ControlPlanePaths,
+  reservation: InstanceReservation,
+  to: ReleaseCoordinates,
+): Promise<void> {
+  const operation = await acquireInstanceOperation(paths, reservation.instance_id, { command: 'rollback' });
+  if (!operation) throw new Error('The test instance operation was busy');
+  try {
+    await beginOperation(operation, { kind: 'rollback', from: releaseOf(reservation), to });
+    await advanceOperation(operation, 'fenced', { stop: { at: NOW.toISOString(), graceful: true } });
+    await advanceOperation(operation, 'snapshotted', { mode: 'code_only' });
+    await advanceOperation(operation, 'switched');
+    await beginOperationReturn(operation);
+    await closeOperationFailed(operation);
+  } finally {
+    operation.release();
+  }
 }
 
 /** NanoClaw's install slug for an assistant: its instance ID without dashes. */
 function installOf(reservation: InstanceReservation): string {
   return reservation.instance_id.replaceAll('-', '');
+}
+
+/** The agent image the release an assistant was created on runs, `<base>:r-<release>`. */
+function liveImageOf(reservation: InstanceReservation): string {
+  return `${getInstallScopedNames(installOf(reservation)).containerImageBase}:r-${reservation.deployed_commit.slice(0, 8)}`;
 }
 
 /** What each fake boundary reports, and what reached it. */
@@ -329,19 +410,22 @@ interface World {
   /** Checkouts whose host answers on its socket, its webhook, and `ncl`. */
   readonly serving: Set<string>;
   readonly ports: Map<string, number>;
+  /** The agent image tags Docker holds. */
+  readonly images: Set<string>;
   readonly commands: SanitizedCommand[];
   readonly serviceEnvironments: NodeJS.ProcessEnv[];
 }
 
 function world(...assistants: readonly InstanceReservation[]): World {
-  const checkouts = assistants.map((reservation) => reservation.checkout_realpath);
+  const checkouts = assistants.map(liveOf);
   return {
     installed: new Set(assistants.map(installOf)),
     active: new Set(assistants.map(installOf)),
     serving: new Set(checkouts),
     ports: new Map(
-      assistants.map((reservation) => [reservation.checkout_realpath, reservation.allocated_ports.nanoclaw_webhook]),
+      assistants.map((reservation) => [liveOf(reservation), reservation.allocated_ports.nanoclaw_webhook]),
     ),
+    images: new Set(assistants.map(liveImageOf)),
     commands: [],
     serviceEnvironments: [],
   };
@@ -411,26 +495,9 @@ function callbackFetch(state: World): typeof globalThis.fetch {
   };
 }
 
-/** NanoClaw's restamp plan for main: its persona is left to the file comparison, its task is its own. */
-const RESTAMP_PLAN = {
-  group: { id: MAIN, name: 'main' },
-  plugin: 'gws-ea-main',
-  applied: false,
-  changes: [
-    { surface: 'plugin', name: 'plugins/gws-ea-main', action: 'unchanged' },
-    { surface: 'persona', name: 'instructions.prepend.md', action: 'update', customized: true },
-    { surface: 'task', name: 'Weekly review', action: 'update', customized: true },
-  ],
-  report: [],
-  note: 'Dry run.',
-};
-
-const EDITED_PERSONA = { surface: 'persona', name: 'instructions.prepend.md', change: 'changed' } as const;
-const EDITED_TASK = { surface: 'task', name: 'Weekly review', change: 'changed' } as const;
-
 function ncl(state: World): StatusObservers['ncl'] {
   return async (runtime, args) => {
-    if (!state.serving.has(runtime.checkout_realpath)) {
+    if (!state.serving.has(runtime.checkout_root)) {
       throw new GwsEaError('command_failed', 'ncl exited with code 1', { details: { exitCode: 1 } });
     }
     switch (args.join(' ')) {
@@ -444,8 +511,6 @@ function ncl(state: World): StatusObservers['ncl'] {
         return { id: MAIN, name: 'main' };
       case `groups config get --id ${MAIN}`:
         return { agent_group_id: MAIN, provider: 'claude' };
-      case `groups create --template gws-ea/main --id ${MAIN}`:
-        return RESTAMP_PLAN;
       default:
         throw new Error(`unexpected ncl ${args.join(' ')}`);
     }
@@ -463,19 +528,10 @@ const HEALTHY_INBOX = {
 } as const;
 
 /** OneCLI's agents: main granted every secret, external-email in selective mode. */
-const ONECLI_AGENTS = [
+const onecliAgents: StatusObservers['onecliAgents'] = async () => [
   { id: 'agent-main', identifier: MAIN, name: 'main', secretMode: 'all' },
   { id: 'agent-ee', identifier: EXTERNAL_EMAIL, name: 'external-email', secretMode: 'selective' },
 ];
-
-function onecliAgents(agents: readonly Record<string, unknown>[]): StatusObservers['onecliAdmin'] {
-  return async (_runtime, args) => {
-    if (args.join(' ') !== 'agents list --max 0') throw new Error(`unexpected onecli ${args.join(' ')}`);
-    return { data: agents };
-  };
-}
-
-const onecliAdmin = onecliAgents(ONECLI_AGENTS);
 
 const MANIFEST: SnapshotManifest = {
   central_migrations: ['initial-v2-schema', 'host-coordination'],
@@ -490,11 +546,14 @@ const DELIVERED: LatestDelivery = {
   lastError: undefined,
 };
 
-/** Git for real; Docker answers that nothing runs. Every command is recorded. */
+/** Git for real; Docker answers that nothing runs, and holds the images `state` names. Every command is recorded. */
 function recordingRunner(state: World): StatusObservers['runCommand'] {
   return async (command) => {
     state.commands.push(command);
     if (command.command === 'git') return runSanitizedCommand(command);
+    if (command.command === 'docker' && command.args.slice(0, 2).join(' ') === 'image ls') {
+      return { stdout: state.images.has(command.args.at(-1) ?? '') ? `sha256:${'0'.repeat(64)}\n` : '', stderr: '' };
+    }
     if (command.command === 'docker') return { stdout: '', stderr: '' };
     throw new Error(`unexpected command ${command.command}`);
   };
@@ -506,7 +565,7 @@ function healthyObservers(state: World): StatusObservers {
     runCommand: recordingRunner(state),
     fetch: callbackFetch(state),
     ncl: ncl(state),
-    onecliAdmin,
+    onecliAgents,
     onecli: async () => PRESENT,
     connector: async () => ({ status: 'present' }),
     principalBinding: (input) => ({
@@ -517,7 +576,6 @@ function healthyObservers(state: World): StatusObservers {
     }),
     schema: () => MANIFEST,
     delivery: () => DELIVERED,
-    mainTemplate: async () => ({ kind: 'stamped', customized: [EDITED_PERSONA] }),
     google: async (_runtime, declaredEmail) => ({ status: 'connected', account: declaredEmail }),
   };
 }
@@ -556,19 +614,17 @@ interface StatusShape {
   probes: Record<string, ProbeShape>;
   release: Record<string, unknown>;
   rollback: Record<string, unknown>;
-  templates: Record<string, unknown>;
   operation: Record<string, unknown>;
   schema: Record<string, unknown>;
 }
 
 describe('status', () => {
-  it('reports every probe as ok for a healthy assistant, with its release, rollback, template, and schema facts', async () => {
+  it('reports every probe as ok for a healthy assistant, with its release, rollback, and schema facts', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
     await bound(host.paths, reservation.instance_id);
-    // Beside the healthy host: a removal cut short, staging an interrupted update left, and a drifted shared connector.
+    // Beside the healthy host: a removal cut short, and a drifted shared connector.
     await removalStarted(host.paths, reservation);
-    await stagingLeft(host.paths, reservation);
     const state = world(reservation);
 
     const { exitCode, status } = await statusJson(host, state, reservation.instance_id, {
@@ -580,6 +636,7 @@ describe('status', () => {
     expect(Object.keys(status.probes)).toEqual([...PROBE_NAMES]);
     for (const name of PROBE_NAMES) expect(status.probes[name], name).toMatchObject({ status: 'ok', reason: null });
     expect(status.probes.checkout).toMatchObject({ commit: host.release });
+    expect(status.probes.image).toEqual({ status: 'ok', reason: null, tag: liveImageOf(reservation) });
     expect(status.probes.service).toMatchObject({ state: 'running' });
     expect(status.probes.main_identity).toMatchObject({ agent_group_id: MAIN });
     expect(status.probes.inbox).toEqual({
@@ -599,6 +656,7 @@ describe('status', () => {
     expect(status).toMatchObject({
       instance_id: reservation.instance_id,
       observed_at: NOW.toISOString(),
+      phase: { state: 'live', release: host.release.slice(0, 8) },
       registry: {
         hostname: 'alpha.example.test',
         endpoint_url: 'https://alpha.example.test/webhook/gchat',
@@ -607,16 +665,15 @@ describe('status', () => {
         source_remote: host.tool,
         deployed_commit: host.release,
       },
-      operation: { state: 'none', abandoned_staging: true },
+      operation: { state: 'none' },
       removal_in_progress: true,
       release: { deployed_commit: host.release, tool_commit: host.release, behind_tool_release: false, reason: null },
       rollback: {
         available: false,
         previous_commit: null,
         schema_moved: null,
-        reason: `Assistant ${reservation.instance_id} keeps no previous release, so there is nothing to roll back to.`,
+        reason: `Assistant ${reservation.instance_id} keeps no rollback point, so there is nothing to roll back to.`,
       },
-      templates: { customized: [EDITED_PERSONA, EDITED_TASK], reason: null },
       schema: {
         central_fingerprint: expect.stringMatching(FINGERPRINT),
         session_fingerprint: expect.stringMatching(FINGERPRINT),
@@ -640,18 +697,13 @@ describe('status', () => {
     expect(status.probes.service).toEqual({ status: 'degraded', reason: 'Its service is stopped.', state: 'stopped' });
     expect(status.probes.host).toEqual({
       status: 'degraded',
-      reason: `The host is unreachable: NanoClaw is not running; see ${reservation.checkout_realpath}/logs/nanoclaw.error.log`,
+      reason: `The host is unreachable: NanoClaw is not running; see ${host.paths.instanceRoot(reservation.instance_id)}/logs/nanoclaw.error.log`,
     });
     expect(status.probes.main_identity).toMatchObject({ status: 'unknown', agent_group_id: null });
     expect(status.probes.route).toMatchObject({ status: 'degraded', reason: expect.stringMatching(/local listener/u) });
     for (const name of ['checkout', 'onecli', 'principal', 'connector', 'delivery']) {
       expect(status.probes[name], name).toMatchObject({ status: 'ok' });
     }
-    // Main's files are read without the host; only its skills, MCP servers, and tasks need it.
-    expect(status.templates).toEqual({
-      customized: [EDITED_PERSONA],
-      reason: expect.stringMatching(/^Only its files were compared; its skills, MCP servers, and tasks were not: /u),
-    });
   });
 
   it("reports a Google connection that stopped working as the workspace probe's failure, naming the account", async () => {
@@ -675,6 +727,24 @@ describe('status', () => {
     for (const name of Object.keys(status.probes).filter((probe) => probe !== 'workspace')) {
       expect(status.probes[name], name).toMatchObject({ status: 'ok' });
     }
+  });
+
+  it("reports main's identity as unknown, not degraded, when OneCLI does not answer for its agents", async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    await bound(host.paths, reservation.instance_id);
+    const state = world(reservation);
+    const refusal = 'OneCLI refused the agent list (HTTP 503)';
+
+    const { exitCode, status } = await statusJson(host, state, reservation.instance_id, {
+      ...healthyObservers(state),
+      onecliAgents: async () => {
+        throw new GwsEaError('onecli_request_failed', refusal);
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(status.probes.main_identity).toMatchObject({ status: 'unknown', reason: refusal });
   });
 
   it("reports a OneCLI unsafe-image refusal as that probe's failure without aborting the others", async () => {
@@ -832,17 +902,17 @@ describe('status', () => {
     expect(text).toContain(`gws-ea update --id ${reservation.instance_id}`);
   });
 
-  it('reports the kept previous release, whether either schema moved since it, and a fingerprint of each', async () => {
+  it('reports the rollback point, whether either schema moved since its snapshot, and a fingerprint of each', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
     const previousCommit = 'e'.repeat(40);
-    await keepPrevious(host.paths, reservation, previousCommit);
+    await keepRollbackPoint(host.paths, reservation, previousCommit);
     const state = world(reservation);
-    // The kept release's databases record MANIFEST; each case sets what the live checkout's record.
+    // The rollback point's snapshot records MANIFEST; each case sets what the live state's databases record.
     let live = MANIFEST;
     const observers: Partial<StatusObservers> = {
       ...healthyObservers(state),
-      schema: (root) => (root === reservation.checkout_realpath ? live : MANIFEST),
+      schema: (root) => (root === stateOf(reservation) ? live : MANIFEST),
     };
     const observe = async (manifest: SnapshotManifest): Promise<StatusShape> => {
       live = manifest;
@@ -876,36 +946,28 @@ describe('status', () => {
   });
 
   it.each([
-    ['without its manifest', 'manifest', /keeps a previous release without its manifest/u],
-    ['whose manifest names another assistant', 'other', /belongs to another assistant/u],
-    ['without its receipt', 'receipt', /keeps a previous release without its receipt/u],
-  ] as const)(
-    'offers no rollback for a previous release %s, as rollback would refuse it',
-    async (_label, flaw, why) => {
-      const host = await machine();
-      const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
-      const root = host.paths.releaseRoot(reservation.instance_id, 'previous');
-      await keepPrevious(host.paths, reservation, 'e'.repeat(40));
-      if (flaw === 'manifest') await rm(path.join(root, 'release-manifest.json'));
-      if (flaw === 'receipt') await rm(path.join(root, 'release-preflight.json'));
-      if (flaw === 'other') {
-        const manifest = JSON.parse(await readFile(path.join(root, 'release-manifest.json'), 'utf8')) as object;
-        await writePrivate(path.join(root, 'release-manifest.json'), {
-          ...manifest,
-          instance_id: allocateInstanceId(),
-        });
-      }
+    ['that names another assistant', 'other', /is not its own/u],
+    ['that cannot be read', 'torn', /Rollback point/u],
+  ] as const)('offers no rollback for a rollback point %s', async (_label, flaw, why) => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const file = host.paths.rollbackPointFile(reservation.instance_id);
+    await keepRollbackPoint(host.paths, reservation, 'e'.repeat(40));
+    if (flaw === 'torn') await writeFile(file, '{torn', { mode: 0o600 });
+    else {
+      const point = JSON.parse(await readFile(file, 'utf8')) as object;
+      await writePrivate(file, { ...point, instance_id: randomUUID() });
+    }
 
-      const { status } = await statusJson(host, world(reservation), reservation.instance_id);
+    const { status } = await statusJson(host, world(reservation), reservation.instance_id);
 
-      expect(status.rollback).toEqual({
-        available: false,
-        previous_commit: null,
-        schema_moved: null,
-        reason: expect.stringMatching(why),
-      });
-    },
-  );
+    expect(status.rollback).toEqual({
+      available: false,
+      previous_commit: null,
+      schema_moved: null,
+      reason: expect.stringMatching(why),
+    });
+  });
 
   it('renders its observations as text, with times in the install timezone', async () => {
     const host = await machine();
@@ -927,16 +989,13 @@ describe('status', () => {
     expect(text).toMatch(
       new RegExp(`^ {2}ok +connector +${CONNECTOR_DRIFT}; it is shared, so it is left as it is$`, 'mu'),
     );
-    expect(text).toContain(
-      'Templates: customized, kept by updates: instructions.prepend.md (changed), task Weekly review (changed)',
-    );
     expect(output.stderr).toEqual([]);
   });
 
   it.each([
-    ['update', { kind: 'refresh_template' }],
-    ['rollback', { kind: 'reverse_template_restamp' }],
-  ] as const)("names a recorded %s's own command as the one that retries its follow-ups", async (kind, followUp) => {
+    ['update', { kind: 'rebuild_group_image', agent_group_id: 'ag-research' }],
+    ['rollback', { kind: 'prune' }],
+  ] as const)("names a committed %s's own command as the one that retries its follow-ups", async (kind, followUp) => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
     const to: ReleaseCoordinates = { ...releaseOf(reservation), deployed_commit: 'c'.repeat(40) };
@@ -947,48 +1006,254 @@ describe('status', () => {
 
     // After a rollback, update --id would go on to stage a new update rather than only retry its follow-ups.
     expect(output.stdout).toContain(
-      `  Operation: Its ${kind} to ${'c'.repeat(12)} is recorded, with follow-ups still to run: ${followUp.kind}; ` +
+      `  Operation: Its ${kind} to ${'c'.repeat(12)} is committed, with follow-ups still to run: ${followUp.kind}; ` +
         `the next gws-ea ${kind} --id ${reservation.instance_id} retries them.`,
     );
   });
 
-  it('names what finishes an update mid-switch for a live checkout it moved, and a host never started as such', async () => {
+  it('names a host never started as such', async () => {
     const host = await machine();
-    const switching = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
     const unstarted = await assistant(host, { label: 'beta', port: 36_011, ingress: 'existing' });
-    const target: ReleaseCoordinates = { ...releaseOf(switching), deployed_commit: 'c'.repeat(40) };
-    await updateUnfinishedAt(host.paths, switching, target, 'swapping');
-    // Between the swap's renames: the live checkout is kept in previous/, and the staged one is not yet in its place.
-    const previous = host.paths.releaseCheckoutRoot(switching.instance_id, 'previous');
-    await mkdir(path.dirname(previous), { recursive: true, mode: 0o700 });
-    await rename(switching.checkout_realpath, previous);
-    // The other's host never started, so it has no runtime record.
-    await rm(instanceRuntimeFile(unstarted.checkout_realpath));
-    const state = world(switching, unstarted);
-    const midSwitch = `The assistant is mid-switch; gws-ea update --id ${switching.instance_id} finishes it.`;
+    // Its host never started, so it has no runtime record.
+    await rm(instanceRuntimeFile(stateOf(unstarted)));
+    const state = world(unstarted);
     const neverStarted = 'The assistant has no runtime record: its host has never been started.';
 
-    const switchingStatus = (await statusJson(host, state, switching.instance_id)).status;
-    const unstartedStatus = (await statusJson(host, state, unstarted.instance_id)).status;
+    const { status } = await statusJson(host, state, unstarted.instance_id);
     const listed = command(host, state);
     expect(await runListCommand(listed.runtime, { json: true })).toBe(0);
-    const listing = JSON.parse(listed.output.stdout.join('\n')) as {
-      assistants: Array<{ instance_id: string; service: unknown }>;
+    const listing = JSON.parse(listed.output.stdout.join('\n')) as { assistants: Array<{ service: unknown }> };
+
+    expect(status.probes.service).toEqual({ status: 'unknown', reason: neverStarted, state: 'unknown' });
+    expect(listing.assistants.map(({ service }) => service)).toEqual([{ state: 'unknown', reason: neverStarted }]);
+  });
+
+  it('says an assistant a switch has fenced is fenced, observing its state and service physically', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    await bound(host.paths, reservation.instance_id);
+    // A switch has removed the live link; the runtime record and the databases stay in the assistant's state.
+    await rm(liveOf(reservation));
+    const state = world(reservation);
+    state.active.clear();
+    state.serving.clear();
+    const read: string[] = [];
+    const observers: Partial<StatusObservers> = {
+      ...healthyObservers(state),
+      schema: (root) => {
+        read.push(root);
+        return MANIFEST;
+      },
+      delivery: (root) => {
+        read.push(root);
+        return DELIVERED;
+      },
     };
 
-    expect(switchingStatus.probes.service).toEqual({ status: 'unknown', reason: midSwitch, state: 'unknown' });
-    expect(unstartedStatus.probes.service).toEqual({ status: 'unknown', reason: neverStarted, state: 'unknown' });
-    expect(Object.fromEntries(listing.assistants.map(({ instance_id, service }) => [instance_id, service]))).toEqual({
-      [switching.instance_id]: { state: 'unknown', reason: midSwitch },
-      [unstarted.instance_id]: { state: 'unknown', reason: neverStarted },
+    const { exitCode, status } = await statusJson(host, state, reservation.instance_id, observers);
+    const text = command(host, state, observers);
+    expect(await runStatusCommand(text.runtime, { instanceId: reservation.instance_id, json: false })).toBe(0);
+    const listed = command(host, state, observers);
+    expect(await runListCommand(listed.runtime, { json: false })).toBe(0);
+
+    expect(exitCode).toBe(0);
+    expect(status).toMatchObject({ phase: { state: 'fenced' }, operation: { state: 'none' } });
+    expect(new Set(read)).toEqual(new Set([stateOf(reservation)]));
+    expect(status.probes.service).toEqual({ status: 'degraded', reason: 'Its service is stopped.', state: 'stopped' });
+    expect(status.schema).toMatchObject({ latest_migration: 'host-coordination', reason: null });
+    for (const name of ['onecli', 'principal', 'delivery'])
+      expect(status.probes[name], name).toMatchObject({ status: 'ok' });
+    expect(status.probes.checkout).toMatchObject({
+      status: 'degraded',
+      reason: `Assistant ${reservation.instance_id} has no live release: a switch has fenced it.`,
     });
+    expect(status.probes.image).toEqual({
+      status: 'unknown',
+      reason: 'No release is live, so no agent image is in use.',
+      tag: null,
+    });
+    expect(text.output.stdout).toContain(
+      '  Phase:     No release is live: a switch has fenced it, so nothing can start its host.',
+    );
+    expect(listed.output.stdout.join('\n')).toMatch(
+      new RegExp(
+        `^${reservation.instance_id} +\\S+ +dogfood +${host.release.slice(0, 12)} +no +stopped +fenced +-$`,
+        'mu',
+      ),
+    );
+  });
+
+  it("reports the live release's agent image as degraded when its tag is gone", async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const state = world(reservation);
+    state.images.clear();
+
+    const { status } = await statusJson(host, state, reservation.instance_id);
+
+    const tag = liveImageOf(reservation);
+    expect(status.probes.image).toEqual({
+      status: 'degraded',
+      reason: `Its agent image ${tag} is missing, so no agent can start.`,
+      tag,
+    });
+  });
+
+  it('shows an assistant on the legacy layout by its record alone, with the update that converts it', async () => {
+    const host = await machine();
+    const reservation = await legacyAssistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const state = world();
+    const id = reservation.instance_id;
+    const legacy = `It is on the legacy layout: run gws-ea update --id ${id} to convert it.`;
+
+    const { exitCode, status } = await statusJson(host, state, id);
+    const text = command(host, state);
+    expect(await runStatusCommand(text.runtime, { instanceId: id, json: false })).toBe(0);
+    const json = command(host, state);
+    expect(await runListCommand(json.runtime, { json: true })).toBe(0);
+    const listed = command(host, state);
+    expect(await runListCommand(listed.runtime, { json: false })).toBe(0);
+
+    expect(exitCode).toBe(0);
+    expect(Object.keys(status)).toEqual(
+      STATUS_FIELDS.filter((field) => !['rollback', 'schema', 'probes'].includes(field)),
+    );
+    expect(status).toMatchObject({
+      phase: { state: 'legacy', convert_with: `gws-ea update --id ${id}` },
+      registry: { deployed_commit: host.release },
+      operation: { state: 'none' },
+      release: { deployed_commit: host.release, behind_tool_release: false },
+    });
+    expect(text.output.stdout).toContain(`  Phase:     ${legacy}`);
+    expect(text.output.stdout).not.toContain('Probes:');
+    const listing = JSON.parse(json.output.stdout.join('\n')) as { assistants: Array<Record<string, unknown>> };
+    expect(listing.assistants).toEqual([
+      expect.objectContaining({
+        phase: { state: 'legacy', convert_with: `gws-ea update --id ${id}` },
+        service: { state: 'unknown', reason: legacy },
+      }),
+    ]);
+    const lines = listed.output.stdout.join('\n');
+    expect(lines).toMatch(
+      new RegExp(`^${id} +\\S+ +dogfood +${host.release.slice(0, 12)} +no +unknown +legacy +-$`, 'mu'),
+    );
+    expect(listed.output.stdout).toContain(`${id}: ${legacy}`);
+    // Nothing of its service or host was asked: only the tool's own history, to place its release.
+    expect(state.serviceEnvironments).toEqual([]);
+    expect(new Set(state.commands.map(({ command: tool }) => tool))).toEqual(new Set(['git']));
+  });
+
+  it('says converting while a conversion is under way, before and after it moves the registry entry', async () => {
+    const host = await machine();
+    const moving = await legacyAssistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const moved = await assistant(host, { label: 'beta', port: 36_011, ingress: 'existing' });
+    for (const { instance_id: id } of [moving, moved]) {
+      await writePrivate(conversionRecordFile(host.paths, id), { step: 'moved', legacy_root: `instances/${id}` });
+    }
+    const state = world(moved);
+
+    const before = await statusJson(host, state, moving.instance_id);
+    const after = await statusJson(host, state, moved.instance_id);
+    const text = command(host, state);
+    expect(await runStatusCommand(text.runtime, { instanceId: moving.instance_id, json: false })).toBe(0);
+    const listed = command(host, state);
+    expect(await runListCommand(listed.runtime, { json: false })).toBe(0);
+
+    for (const [{ status }, { instance_id: id }] of [
+      [before, moving],
+      [after, moved],
+    ] as const) {
+      expect(status.phase).toEqual({ state: 'converting', continue_with: `gws-ea update --id ${id}` });
+    }
+    // Until the registry entry moves, its state is not all in its root, so only its record is shown.
+    expect(before.status).not.toHaveProperty('probes');
+    expect(after.status.probes.service).toMatchObject({ status: 'ok', state: 'running' });
+    const unfinished = (id: string): string =>
+      `Its conversion to the release layout is unfinished; continue it with gws-ea update --id ${id}.`;
+    expect(text.output.stdout).toContain(`  Phase:     ${unfinished(moving.instance_id)}`);
+    for (const { instance_id: id } of [moving, moved]) {
+      expect(listed.output.stdout).toContain(`${id}: ${unfinished(id)}`);
+    }
+  });
+
+  it('shows the converted release live, and the fix-forward update, once it failed verification and closed the conversion', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const id = reservation.instance_id;
+    const target: ReleaseCoordinates = { ...releaseOf(reservation), deployed_commit: 'c'.repeat(40) };
+    // The conversion recorded done, and the release it switched to closed its update as failed.
+    await writePrivate(conversionRecordFile(host.paths, id), { step: 'recreated', legacy_root: `instances/${id}` });
+    await updateFailedWithoutReturn(host.paths, reservation, target);
+    const state = world(reservation);
+    const live = host.release.slice(0, 8);
+    const fixForward =
+      `Its update to dogfood ${'c'.repeat(12)} failed and left no release to return to (started); ` +
+      `fix it forward to a newer release with gws-ea update --id ${id}.`;
+
+    const { status } = await statusJson(host, state, id);
+    const text = command(host, state);
+    expect(await runStatusCommand(text.runtime, { instanceId: id, json: false })).toBe(0);
+    const listed = command(host, state);
+    expect(await runListCommand(listed.runtime, { json: false })).toBe(0);
+
+    expect(status.phase).toEqual({ state: 'live', release: live });
+    expect(status.operation).toMatchObject({ state: 'failed', continue_with: `gws-ea update --id ${id}` });
+    expect(text.output.stdout).toContain(`  Phase:     Release ${live} is live.`);
+    expect(text.output.stdout).toContain(`  Operation: ${fixForward}`);
+    expect(listed.output.stdout).toContain(`${id}: ${fixForward}`);
+    expect([...text.output.stdout, ...listed.output.stdout].join('\n')).not.toContain('conversion');
+  });
+
+  it('names the fix-forward command for an update that failed and left no release to return to', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const target: ReleaseCoordinates = { ...releaseOf(reservation), deployed_commit: 'c'.repeat(40) };
+    await updateFailedWithoutReturn(host.paths, reservation, target);
+    const state = world(reservation);
+    const id = reservation.instance_id;
+    const fixForward =
+      `Its update to dogfood ${'c'.repeat(12)} failed and left no release to return to (started); ` +
+      `fix it forward to a newer release with gws-ea update --id ${id}.`;
+
+    const { status } = await statusJson(host, state, id);
+    const text = command(host, state);
+    expect(await runStatusCommand(text.runtime, { instanceId: id, json: false })).toBe(0);
+    const listed = command(host, state);
+    expect(await runListCommand(listed.runtime, { json: false })).toBe(0);
+
+    expect(status.operation).toMatchObject({
+      state: 'failed',
+      kind: 'update',
+      continue_with: `gws-ea update --id ${id}`,
+      revert_with: null,
+    });
+    expect(text.output.stdout).toContain(`  Operation: ${fixForward}`);
+    expect(listed.output.stdout.join('\n')).toMatch(new RegExp(` +update failed$`, 'mu'));
+    expect(listed.output.stdout).toContain(`${id}: ${fixForward}`);
+  });
+
+  it('says a rollback whose return failed too failed going back, and names the fix-forward command', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const target: ReleaseCoordinates = { ...releaseOf(reservation), deployed_commit: 'c'.repeat(40) };
+    await rollbackFailedReturning(host.paths, reservation, target);
+    const state = world(reservation);
+    const id = reservation.instance_id;
+
+    const text = command(host, state);
+    expect(await runStatusCommand(text.runtime, { instanceId: id, json: false })).toBe(0);
+
+    expect(text.output.stdout).toContain(
+      `  Operation: Its rollback to dogfood ${'c'.repeat(12)} failed, and so did returning to the release it left (switched); ` +
+        `fix it forward to a newer release with gws-ea update --id ${id}.`,
+    );
   });
 
   it('refuses an unknown assistant ID with exit code 1', async () => {
     const host = await machine();
     const state = world();
     const { runtime, output } = command(host, state);
-    const unknown = allocateInstanceId();
+    const unknown = randomUUID();
 
     expect(await runStatusCommand(runtime, { instanceId: unknown, json: true })).toBe(1);
     expect(await runStatusCommand(runtime, { instanceId: 'not-an-id', json: false })).toBe(1);
@@ -1000,14 +1265,13 @@ describe('status', () => {
 });
 
 describe('list', () => {
-  it('shows every assistant, the phase of one mid-update, and the removal and staging another left', async () => {
+  it('shows every assistant, the phase of one mid-update, and the removal another left', async () => {
     const host = await machine();
     const alpha = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
     const beta = await assistant(host, { label: 'beta', port: 36_011, ingress: 'existing' });
     const target: ReleaseCoordinates = { ...releaseOf(beta), deployed_commit: 'c'.repeat(40) };
     await updateUnfinishedAt(host.paths, beta, target);
     await removalStarted(host.paths, alpha);
-    await stagingLeft(host.paths, alpha);
     const state = world(alpha, beta);
     state.active.delete(installOf(beta));
 
@@ -1030,9 +1294,10 @@ describe('list', () => {
           hostname: 'alpha.example.test',
           track: 'dogfood',
           deployed_commit: host.release,
+          phase: { state: 'live', release: host.release.slice(0, 8) },
           release: current,
           service: { state: 'running', reason: null },
-          operation: { state: 'none', abandoned_staging: true },
+          operation: { state: 'none' },
           removal_in_progress: true,
         },
         {
@@ -1040,12 +1305,13 @@ describe('list', () => {
           hostname: 'beta.example.test',
           track: 'dogfood',
           deployed_commit: host.release,
+          phase: { state: 'live', release: host.release.slice(0, 8) },
           release: current,
           service: { state: 'stopped', reason: 'Its service is stopped.' },
           operation: {
             state: 'open',
             kind: 'update',
-            phase: 'stopped',
+            phase: 'fenced',
             from: releaseOf(beta),
             to: target,
             started_at: expect.any(String),
@@ -1063,25 +1329,22 @@ describe('list', () => {
     const lines = text.output.stdout.join('\n');
     expect(lines).toMatch(
       new RegExp(
-        `${alpha.instance_id} +alpha\\.example\\.test +dogfood +${host.release.slice(0, 12)} +no +running +removing`,
+        `${alpha.instance_id} +alpha\\.example\\.test +dogfood +${host.release.slice(0, 12)} +no +running +live +removing`,
         'u',
       ),
     );
     expect(lines).toMatch(
       new RegExp(
-        `${beta.instance_id} +beta\\.example\\.test +dogfood +${host.release.slice(0, 12)} +no +stopped +update stopped`,
+        `${beta.instance_id} +beta\\.example\\.test +dogfood +${host.release.slice(0, 12)} +no +stopped +live +update fenced`,
         'u',
       ),
     );
     // Each thing left under way is named beside the table, with the command that settles it.
     expect(text.output.stdout).toContain(
-      `${beta.instance_id}: Its update to dogfood ${'c'.repeat(12)} is unfinished (stopped); ` +
+      `${beta.instance_id}: Its update to dogfood ${'c'.repeat(12)} is unfinished (fenced); ` +
         `continue it with gws-ea update --id ${beta.instance_id}, or revert it with gws-ea rollback --id ${beta.instance_id}.`,
     );
     expect(lines).toMatch(new RegExp(`^${alpha.instance_id}: Removal .*gws-ea remove --id ${alpha.instance_id}`, 'mu'));
-    expect(lines).toMatch(
-      new RegExp(`^${alpha.instance_id}: .*staging .*gws-ea update --id ${alpha.instance_id}`, 'mu'),
-    );
   });
 
   it("says whether each assistant is behind the tool's release, from the tool's own history", async () => {
@@ -1137,7 +1400,7 @@ describe('list', () => {
       },
     });
     const lines = text.output.stdout.join('\n');
-    expect(lines).toMatch(/^INSTANCE ID +HOSTNAME +TRACK +COMMIT +BEHIND TOOL +SERVICE +OPERATION$/mu);
+    expect(lines).toMatch(/^INSTANCE ID +HOSTNAME +TRACK +COMMIT +BEHIND TOOL +SERVICE +PHASE +OPERATION$/mu);
     for (const [reservation, cell] of [
       [behind, 'yes'],
       [current, 'no'],
@@ -1145,7 +1408,7 @@ describe('list', () => {
     ] as const) {
       expect(lines).toMatch(
         new RegExp(
-          `^${reservation.instance_id} +\\S+ +dogfood +${reservation.deployed_commit.slice(0, 12)} +${cell} +running +-$`,
+          `^${reservation.instance_id} +\\S+ +dogfood +${reservation.deployed_commit.slice(0, 12)} +${cell} +running +live +-$`,
           'mu',
         ),
       );
@@ -1211,31 +1474,6 @@ function hostDatabases(checkout: string, migrations: readonly string[]): void {
   }
 }
 
-/**
- * Main stamped from its template, as create leaves it, then customized: its
- * persona edited and a note added beside its operating procedure.
- */
-async function stampedMain(checkout: string): Promise<void> {
-  const central = new Database(path.join(checkout, 'data', 'v2.db'));
-  try {
-    central.exec(`CREATE TABLE agent_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, folder TEXT NOT NULL UNIQUE)`);
-    central.prepare("INSERT INTO agent_groups VALUES (?, 'main', 'main')").run(MAIN);
-  } finally {
-    central.close();
-  }
-  const main = path.join(checkout, 'groups', 'main');
-  const plugin = path.join(main, 'plugins', 'gws-ea-main');
-  const context = path.join(plugin, 'ai.nanoco.nanoclaw', 'context');
-  await mkdir(path.join(context, 'additional_context'), { recursive: true });
-  await writeFile(path.join(plugin, 'plugin.json'), '{"name":"gws-ea-main"}\n');
-  await writeFile(path.join(context, 'instructions.md'), '# Main\n\nStamped instructions.\n');
-  await writeFile(path.join(context, 'additional_context', 'procedure.md'), 'Stamped procedure.\n');
-  await mkdir(path.join(main, 'additional_context'), { recursive: true });
-  await writeFile(path.join(main, 'instructions.prepend.md'), '# Main\n\nMy own instructions.\n');
-  await writeFile(path.join(main, 'additional_context', 'procedure.md'), 'Stamped procedure.\n');
-  await writeFile(path.join(main, 'additional_context', 'notes.md'), 'Notes.\n');
-}
-
 async function sessionMailbox(checkout: string): Promise<void> {
   const directory = path.join(checkout, 'data', 'v2-sessions', MAIN, SESSION);
   await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -1252,7 +1490,7 @@ async function sessionMailbox(checkout: string): Promise<void> {
 
 /** What observing may ask Docker and Git: the read-only verbs the observers use, and nothing that changes state. */
 const READ_ONLY_VERBS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
-  ['docker', new Set(['container ls', 'container inspect', 'image inspect'])],
+  ['docker', new Set(['container ls', 'container inspect', 'image inspect', 'image ls'])],
   ['git', new Set(['rev-parse', 'status', 'cat-file', 'merge-base'])],
 ]);
 
@@ -1267,12 +1505,12 @@ describe('read-only commands', () => {
     const alpha = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
     const beta = await assistant(host, { label: 'beta', port: 36_011, ingress: 'existing' });
     await bound(host.paths, alpha.instance_id);
-    hostDatabases(alpha.checkout_realpath, ['initial-v2-schema', 'host-coordination']);
-    await sessionMailbox(alpha.checkout_realpath);
-    await stampedMain(alpha.checkout_realpath);
-    const previous = host.paths.releaseCheckoutRoot(alpha.instance_id, 'previous');
-    await keepPrevious(host.paths, alpha, 'e'.repeat(40));
-    hostDatabases(previous, ['initial-v2-schema']);
+    hostDatabases(stateOf(alpha), ['initial-v2-schema', 'host-coordination']);
+    await sessionMailbox(stateOf(alpha));
+    await keepRollbackPoint(host.paths, alpha, 'e'.repeat(40), {
+      central_migrations: ['initial-v2-schema'],
+      session_tables: {},
+    });
     const secretsFile = path.join(host.paths.configRoot, 'secrets.env');
     await writeFile(secretsFile, `GWS_EA_PROVIDER_CREDENTIAL=${SENTINEL}\n`, { mode: 0o600 });
     vi.stubEnv('GWS_EA_PROVIDER_CREDENTIAL', SENTINEL);
@@ -1283,15 +1521,15 @@ describe('read-only commands', () => {
       runCommand: recordingRunner(state),
       fetch: callbackFetch(state),
       ncl: ncl(state),
-      onecliAdmin,
+      onecliAgents,
     };
     // Stale stat entries make an ordinary `git status` rewrite each index; a read-only one must not.
     const later = new Date(Date.now() + 60_000);
-    for (const repository of [alpha.checkout_realpath, host.tool]) {
+    for (const repository of [liveOf(alpha), host.tool]) {
       await utimes(path.join(repository, 'release.txt'), later, later);
     }
     const before = await snapshot(host.root);
-    expect([...before.keys()]).not.toContain(path.relative(host.root, `${alpha.checkout_realpath}/data/v2.db-wal`));
+    expect([...before.keys()]).not.toContain(path.relative(host.root, `${stateOf(alpha)}/data/v2.db-wal`));
 
     const outputs: Output[] = [];
     for (const json of [true, false]) {
@@ -1319,14 +1557,6 @@ describe('read-only commands', () => {
     const status = JSON.parse(outputs[1]!.stdout.join('\n')) as StatusShape;
     expect(status.probes.delivery).toMatchObject({ status: 'ok', last: { message_out_id: 'out-welcome' } });
     expect(status.rollback).toMatchObject({ available: true, schema_moved: true });
-    expect(status.templates).toEqual({
-      customized: [
-        { surface: 'context', name: 'additional_context/notes.md', change: 'added' },
-        { surface: 'persona', name: 'instructions.prepend.md', change: 'changed' },
-        EDITED_TASK,
-      ],
-      reason: null,
-    });
     expect(status.probes.checkout).toMatchObject({ status: 'ok', commit: host.release });
     expect(status.probes.onecli).toMatchObject({ status: 'degraded', reason: 'It has not been created.' });
   });
@@ -1343,7 +1573,6 @@ describe('help', () => {
       'behind_tool_release',
       'previous_commit',
       'schema_moved',
-      'customized',
       'drift',
       'last_success_at',
       'calendar_notifications',

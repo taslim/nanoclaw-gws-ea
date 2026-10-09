@@ -10,12 +10,14 @@ import { lstat } from 'node:fs/promises';
 import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
-import { inspectOperation, revertClause, type OperationInspection } from './operation.js';
+import { failedOutcome, inspectOperation, revertClause, type OperationInspection } from './operation.js';
 import type { ControlPlanePaths } from './paths.js';
 import { buildToolEnvironment, type SanitizedCommand } from './process.js';
 import { assertInstanceId, getInstanceReservation } from './registry.js';
+import { legacyInstanceRoot, legacyLocation } from './release-convert.js';
 import type { HostStatusHelpers } from './service.js';
-import { hostLogFiles, type NanoclawServiceHelpers } from './service-control.js';
+import { hostLogFiles, type HostLogFiles, type NanoclawServiceHelpers } from './service-control.js';
+import type { InstanceReservation } from './types.js';
 import { LIST_USAGE, runListCommand, runStatusCommand, STATUS_USAGE, type ReadOnlyCommandRuntime } from './status.js';
 import { detectStrayInstall, strayNote, type ToolCheckout } from './stray-install.js';
 import { GwsEaError } from './types.js';
@@ -157,12 +159,17 @@ export const READ_ONLY_COMMANDS: ReadonlyMap<string, ReadOnlyCommand> = new Map(
 function operationNote(inspection: OperationInspection): string | undefined {
   switch (inspection.state) {
     case 'none':
-    case 'recorded':
+    case 'committed':
       return undefined;
     case 'open': {
       const { record, next } = inspection;
       const subject = record.kind === 'update' ? 'An update' : 'A rollback';
       return `${subject} of this assistant is unfinished (${record.phase}); continue it with ${next.continueWith}${revertClause(next)}.`;
+    }
+    case 'failed': {
+      const { record, next } = inspection;
+      const subject = record.kind === 'update' ? 'An update' : 'A rollback';
+      return `${subject} of this assistant failed${failedOutcome(record)} (${record.phase}); fix it forward with ${next.continueWith} to a newer release.`;
     }
     case 'unreadable':
       return `This assistant's update or rollback record cannot be read: ${inspection.message}`;
@@ -182,17 +189,37 @@ async function assertLogFile(file: string, name: string): Promise<void> {
 }
 
 /**
+ * Where the assistant's host writes its logs: the instance root's physical
+ * `logs/`, there whether or not a release is live; or, on the layout before
+ * releases until its conversion moves them, its legacy checkout's `logs/`,
+ * which held them as an instance root's holds them now (KTD11).
+ */
+async function hostLogs(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<HostLogFiles> {
+  const id = reservation.instance_id;
+  if (legacyInstanceRoot(paths, reservation) === undefined) return hostLogFiles(paths.instanceRoot(id));
+  const moved = await lstat(paths.instanceLayout(id).logs).then(
+    () => true,
+    (error: unknown) => {
+      if (isErrno(error, 'ENOENT')) return false;
+      throw error;
+    },
+  );
+  return hostLogFiles(moved ? paths.instanceRoot(id) : legacyLocation(paths, id).checkout);
+}
+
+/**
  * `logs`: the assistant's host log, or its error log with `--errors`, at the
- * paths its service definition sends them to. The process is handed to
- * `cat`, or to `tail -f` with `--follow`, so the log streams as the file
- * holds it. An unfinished update or rollback is named first, on stderr.
+ * paths its service definition sends them to, read physically, in any phase.
+ * The process is handed to `cat`, or to `tail -f` with `--follow`, so the
+ * log streams as the file holds it. An unfinished update or rollback is
+ * named first, on stderr.
  */
 async function showHostLog(context: ReadOnlyContext, options: CommandOptions): Promise<CommandEnd> {
   const instanceId = targetInstance(options);
   const reservation = await getInstanceReservation(context.paths, instanceId);
   const note = operationNote(await inspectOperation(context.paths, reservation));
   if (note) context.errorOutput(note);
-  const logs = hostLogFiles(reservation.checkout_realpath);
+  const logs = await hostLogs(context.paths, reservation);
   const file = options.errors ? logs.errors : logs.output;
   await assertLogFile(file, options.errors ? 'host error log' : 'host log');
   return {

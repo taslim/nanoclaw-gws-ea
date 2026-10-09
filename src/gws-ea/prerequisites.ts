@@ -6,6 +6,7 @@
  */
 import { request as httpRequest } from 'node:http';
 import os from 'node:os';
+import path from 'node:path';
 
 import { errorCode } from '../community-portal/errors.js';
 import { SignInRequired, withGoogleSignIn, type Interaction } from './events.js';
@@ -16,10 +17,8 @@ import {
   isConsumerGoogleAccount,
   isGoogleAccountAddress,
 } from './gcloud.js';
-import { ensurePinnedOnecliCli, releaseOnecliCliPin } from './onecli-install.js';
-import { ONECLI_CLI_VERSION } from './pins.js';
 import { protectFromAgentMounts } from './mount-allowlist.js';
-import { CONTROL_PLANE_ROOT, isRegularFile, type ControlPlanePaths } from './paths.js';
+import { CONTROL_PLANE_ROOT, canonicalPath, type ControlPlanePaths } from './paths.js';
 import {
   buildToolEnvironment,
   checkedRunner,
@@ -29,7 +28,6 @@ import {
   type SanitizedCommand,
   type SanitizedCommandOutcomeRunner,
 } from './process.js';
-import { assertInstalledOnecliCli } from './release-preflight.js';
 import { instanceServicePlatform } from './service-coordinates.js';
 import { GwsEaError, type GwsEaErrorDetails } from './types.js';
 import { isRecord, parseJson, unixSocketPath } from './validation.js';
@@ -37,11 +35,8 @@ import { isRecord, parseJson, unixSocketPath } from './validation.js';
 const DOCKER_PING_TIMEOUT_MS = 5_000;
 const TOOL_TIMEOUT_MS = 30_000;
 
-/** gws-ea's own roots: executables may not live in its instances, and agent mounts may not reach any of them. */
-export type PrerequisitePaths = Pick<
-  ControlPlanePaths,
-  'configRoot' | 'stateRoot' | 'logsRoot' | 'instancesRoot' | 'onecliCliFile'
->;
+/** gws-ea's own roots: executables may not live in its state, and agent mounts may not reach any of them. */
+export type PrerequisitePaths = Pick<ControlPlanePaths, 'configRoot' | 'stateRoot' | 'logsRoot'>;
 
 export type PrerequisiteRequest =
   /** `account` is `--google-account`; without it the operator confirms the signed-in account. */
@@ -55,9 +50,6 @@ export type PrerequisiteRequest =
       readonly paths: PrerequisitePaths;
       readonly account: string;
       readonly dockerEndpoint?: string;
-      /** The OneCLI CLI create recorded, and the release checkout whose pin can restore gws-ea's copy of it. */
-      readonly onecliCliPath?: string;
-      readonly checkoutRoot: string;
     };
 
 /** What the prerequisites established about this host, as create records it. */
@@ -67,8 +59,6 @@ export interface Prerequisites {
   readonly runningAsRoot: boolean;
   /** Real path of the Node.js running gws-ea, which can replace a process (`process.execve`). */
   readonly nodePath: string;
-  /** Real path of gws-ea's own OneCLI CLI; at create it reports the pinned version. */
-  readonly onecliCliPath: string;
   /** The active Docker context's local `unix://` endpoint, answered by a running daemon. */
   readonly dockerEndpoint: string;
   /**
@@ -83,16 +73,42 @@ export interface Prerequisites {
 export type PrerequisiteInteraction = Pick<Interaction, 'signInToGoogleCloud' | 'confirmGoogleAccount'>;
 
 export interface PrerequisiteDependencies {
-  /** Runs git, pnpm, onecli, docker, and gcloud. */
+  /** Runs git, pnpm, docker, and gcloud. */
   readonly runCommand?: SanitizedCommandOutcomeRunner;
-  /** Resolves an executable the instance service will run (`node`, `onecli`). */
+  /** Resolves an executable the instance service will run (`node`). */
   readonly resolvePersisted?: typeof resolvePersistedExecutable;
   readonly node?: Pick<NodeJS.Process, 'version' | 'execPath' | 'execve'>;
   readonly platform?: NodeJS.Platform;
   /** The shared NanoClaw mount allowlist; its documented location under the home directory by default. */
   readonly mountAllowlistFile?: string;
-  readonly ensureOnecliCli?: typeof ensurePinnedOnecliCli;
-  readonly releaseOnecliCliPin?: typeof releaseOnecliCliPin;
+}
+
+/**
+ * NanoClaw's longest socket under a state root: it binds `data/ncl.sock` and
+ * `data/cli.sock`, as long as each other, in its working directory, which is
+ * a release's physical folder, `<state root>/<8 hex>/<8 hex>` (KTD10).
+ */
+const LONGEST_SOCKET = path.join('12345678', '12345678', 'data', 'ncl.sock');
+
+/** The longest path a Unix socket may have: `sun_path` holds 104 bytes on macOS and 108 on Linux, with the NUL. */
+const SOCKET_PATH_LIMIT: Readonly<Record<Prerequisites['platform'], number>> = { macos: 103, linux: 107 };
+
+/**
+ * A state root under which NanoClaw could not bind its sockets is refused
+ * before anything is created: a host that cannot bind `ncl` never starts. The
+ * root is measured as the kernel sees it, every link resolved, so a root
+ * under `/var` counts as `/private/var` on macOS.
+ */
+function assertSocketPathsFit(stateRoot: string, platform: Prerequisites['platform']): void {
+  const socket = path.join(canonicalPath(stateRoot), LONGEST_SOCKET);
+  const bytes = Buffer.byteLength(socket);
+  const limit = SOCKET_PATH_LIMIT[platform];
+  if (bytes <= limit) return;
+  throw new GwsEaError(
+    'state_root_too_long',
+    `The state root ${stateRoot} is too long: an assistant's NanoClaw socket under it, ${socket}, would be ${bytes} bytes, and ${platform === 'macos' ? 'macOS' : 'Linux'} allows ${limit}. Choose a shorter state root with GWS_EA_STATE_ROOT, then retry.`,
+    { details: { stateRoot, socket, bytes, limit } },
+  );
 }
 
 function toolEnvironment(): Readonly<Record<string, string>> {
@@ -132,22 +148,6 @@ async function assertTools(runner: SanitizedCommandOutcomeRunner): Promise<void>
       'pnpm is required but was not found on PATH. Install it (https://pnpm.io/installation), then retry.',
     ),
   );
-}
-
-/**
- * gws-ea's own OneCLI CLI. Create installs this launcher's pin, if gws-ea has
- * not already. Resume keeps the CLI create recorded; when that was gws-ea's
- * copy and it went missing, it is restored from the assistant's own pin.
- */
-async function pinnedOnecliCli(request: PrerequisiteRequest, dependencies: PrerequisiteDependencies): Promise<string> {
-  const ensure = dependencies.ensureOnecliCli ?? ensurePinnedOnecliCli;
-  const recorded = request.command === 'resume' ? request.onecliCliPath : undefined;
-  if (recorded === undefined || recorded === request.paths.onecliCliFile(ONECLI_CLI_VERSION)) {
-    return ensure(request.paths);
-  }
-  if (request.command !== 'resume' || (await isRegularFile(recorded))) return recorded;
-  const pin = await (dependencies.releaseOnecliCliPin ?? releaseOnecliCliPin)(request.checkoutRoot);
-  return recorded === request.paths.onecliCliFile(pin.version) ? ensure(request.paths, pin) : recorded;
 }
 
 type DockerDaemonState =
@@ -361,10 +361,13 @@ export async function checkPrerequisites(
   const runner = dependencies.runCommand ?? runSanitizedCommandOutcome;
   const resolvePersisted = dependencies.resolvePersisted ?? resolvePersistedExecutable;
   const node = dependencies.node ?? process;
-  const checkoutRoots = [request.paths.instancesRoot];
+  const checkoutRoots = [request.paths.stateRoot];
   const homeDirectory = os.homedir();
 
   const platform = supportedPlatform(dependencies.platform ?? process.platform);
+  if (request.command === 'create') {
+    assertSocketPathsFit(request.paths.stateRoot, platform);
+  }
   assertNodeExecve(node);
   await protectFromAgentMounts(request.paths, {
     homeDirectory,
@@ -372,20 +375,6 @@ export async function checkPrerequisites(
   });
   const nodePath = await resolvePersisted(node.execPath, { checkoutRoots });
   await assertTools(runner);
-  const onecliCliPath = await resolvePersisted(await pinnedOnecliCli(request, dependencies), { checkoutRoots }).catch(
-    (error: unknown) =>
-      missingExecutable(error, 'onecli_required', 'The OneCLI CLI this assistant was created with is missing.'),
-  );
-  // Pins are compared when an assistant is created; a later launcher upgrade must not block its resume.
-  if (request.command === 'create') {
-    await assertInstalledOnecliCli(
-      onecliCliPath,
-      ONECLI_CLI_VERSION,
-      CONTROL_PLANE_ROOT,
-      toolEnvironment(),
-      checkedRunner(runner),
-    );
-  }
   const dockerEndpoint =
     request.command === 'resume' && request.dockerEndpoint !== undefined
       ? await probeRecordedDockerEndpoint(request.dockerEndpoint)
@@ -399,7 +388,6 @@ export async function checkPrerequisites(
     homeDirectory,
     runningAsRoot: process.getuid?.() === 0,
     nodePath,
-    onecliCliPath,
     dockerEndpoint,
     rootlessDocker,
     account,

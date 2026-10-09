@@ -2,7 +2,7 @@
  * The Cloudflare REST seam. Readers tolerate the documented optional
  * and extra fields; ownership is decided by callers on exact values. Every
  * request writes its method, path, and HTTP status to the step's raw log,
- * never a body; non-token reads go to the fixture capture sink when enabled.
+ * never a body.
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -10,7 +10,12 @@ import type { CloudflareZoneChoice, ManagedIngressSetupSession } from './create-
 import { redact, registerSecret } from './redact.js';
 import { activeStep } from './run-log.js';
 import { GwsEaError } from './types.js';
-import { hasControlCharacters, isRecord, requireString as requireText } from './validation.js';
+import {
+  CLOUDFLARE_TUNNEL_ID_PATTERN,
+  hasControlCharacters,
+  isRecord,
+  requireString as requireText,
+} from './validation.js';
 
 const DEFAULT_BASE_URL = 'https://api.cloudflare.com/client/v4';
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -22,7 +27,6 @@ const MAX_BACKOFF_MS = 30_000;
 const MAX_RETRY_AFTER_MS = 300_000;
 const MAX_ERROR_MESSAGE_CHARACTERS = 200;
 const CLOUDFLARE_ID_PATTERN = /^[0-9a-f]{32}$/u;
-const TUNNEL_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const DNS_NAME_PATTERN = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 
 type Fetch = typeof globalThis.fetch;
@@ -50,10 +54,9 @@ export interface CloudflareTunnelConfiguration {
   readonly version: number;
 }
 
-/** One connected connector; `configVersion` is optional in the documented schema. */
+/** One connected connector. */
 export interface CloudflareTunnelConnection {
   readonly id?: string;
-  readonly configVersion?: number;
 }
 
 export interface CloudflareDnsRecord {
@@ -81,7 +84,7 @@ export interface CloudflareApi {
   getTunnelConfiguration(accountId: string, tunnelId: string): Promise<CloudflareTunnelConfiguration>;
   /** Replace the whole configuration; callers confirm it by reading it back. */
   replaceTunnelConfiguration(accountId: string, tunnelId: string, config: unknown): Promise<void>;
-  /** The connector token, registered with the redactor on receipt and never logged or captured. */
+  /** The connector token, registered with the redactor on receipt and never logged. */
   getTunnelToken(accountId: string, tunnelId: string): Promise<string>;
   /** Connector state comes only from here: tunnel objects lose `connections` on 2026-10-05. */
   listTunnelConnections(accountId: string, tunnelId: string): Promise<readonly CloudflareTunnelConnection[]>;
@@ -157,7 +160,7 @@ function accountPath(accountId: string): string {
 }
 
 function tunnelPath(accountId: string, tunnelId: string): string {
-  return `${accountPath(accountId)}/cfd_tunnel/${requestId(tunnelId, 'Cloudflare tunnel ID', TUNNEL_ID_PATTERN)}`;
+  return `${accountPath(accountId)}/cfd_tunnel/${requestId(tunnelId, 'Cloudflare tunnel ID', CLOUDFLARE_TUNNEL_ID_PATTERN)}`;
 }
 
 function zonePath(zoneId: string): string {
@@ -220,7 +223,7 @@ function parseTunnel(value: unknown): CloudflareTunnel {
   const remote = value.config_src === undefined ? value.remote_config === true : value.config_src === 'cloudflare';
   if (!remote) throw new GwsEaError('foreign_cloudflare_tunnel', 'Cloudflare tunnel is not remotely managed');
   return {
-    id: responseId(value.id, 'tunnel ID', TUNNEL_ID_PATTERN),
+    id: responseId(value.id, 'tunnel ID', CLOUDFLARE_TUNNEL_ID_PATTERN),
     name: requireString(value.name, 'tunnel name', 100),
   };
 }
@@ -253,12 +256,7 @@ function parseConfiguration(value: unknown): CloudflareTunnelConfiguration {
 }
 
 function parseConnection(value: unknown): CloudflareTunnelConnection {
-  if (!isRecord(value)) return {};
-  const configVersion = integer(value.config_version);
-  return {
-    ...(typeof value.id === 'string' && value.id ? { id: value.id } : {}),
-    ...(configVersion === undefined ? {} : { configVersion }),
-  };
+  return isRecord(value) && typeof value.id === 'string' && value.id ? { id: value.id } : {};
 }
 
 /** Fields other than the ID are read as found: a record that differs is foreign to its caller, not invalid. */
@@ -305,8 +303,6 @@ function isLastPage(page: number, count: number, info: unknown): boolean {
 interface RequestOptions {
   readonly query?: Readonly<Record<string, string>>;
   readonly body?: unknown;
-  /** The result is a secret: never captured. */
-  readonly secret?: boolean;
 }
 
 interface Answer {
@@ -410,9 +406,6 @@ class CloudflareApiClient implements CloudflareApi {
         throw invalid(`response envelope for ${operation}`);
       }
       if (!response.ok || !parsed.success) throw failure(operation, response.status, parsed.errors);
-      if (reading && !options.secret) {
-        activeStep()?.captureHttp({ method, url: url.toString(), status: response.status, body });
-      }
       return { result: parsed.result, resultInfo: parsed.result_info };
     }
   }
@@ -479,9 +472,6 @@ class CloudflareApiClient implements CloudflareApi {
       'read the connector token',
       'GET',
       `${tunnelPath(accountId, tunnelId)}/token`,
-      {
-        secret: true,
-      },
     );
     const token = requireString(result, 'connector token', 16_384);
     registerSecret(token);

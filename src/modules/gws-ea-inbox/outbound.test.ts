@@ -13,6 +13,8 @@ import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const TEST_DIR = '/tmp/nanoclaw-test-gws-ea-outbound';
+/** Beside the data directory, never in it. */
+const OUTSIDE_DIR = '/tmp/nanoclaw-test-gws-ea-outbound-outside';
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual<typeof import('../../config.js')>('../../config.js');
@@ -481,9 +483,18 @@ function refusalOf(frame: ResponseFrame): string {
   return frame.error.message;
 }
 
-/** Hand a file over for a thread, as main's handoff records it: the host's copy, by its SHA-256; returns its path. */
-async function handFile(threadKey: string, name: string, data: Buffer): Promise<string> {
-  const hostPath = path.join(TEST_DIR, 'handed', threadKey, name);
+/**
+ * Hand a file over for a thread, as main's handoff records it: the host's
+ * copy, by its SHA-256 and its place in the data directory (or wherever
+ * `recorded` says); returns the copy's path.
+ */
+async function handFile(
+  threadKey: string,
+  name: string,
+  data: Buffer,
+  recorded = path.join('handed', threadKey, name),
+): Promise<string> {
+  const hostPath = path.resolve(TEST_DIR, recorded);
   fs.mkdirSync(path.dirname(hostPath), { recursive: true });
   fs.writeFileSync(hostPath, data);
   await getDb().run(
@@ -491,7 +502,7 @@ async function handFile(threadKey: string, name: string, data: Buffer): Promise<
     threadKey,
     createHash('sha256').update(data).digest('hex'),
     name,
-    hostPath,
+    recorded,
     now(),
   );
   return hostPath;
@@ -547,6 +558,7 @@ beforeEach(async () => {
 afterEach(async () => {
   await teardownChannelAdapters();
   await closeDb();
+  fs.rmSync(OUTSIDE_DIR, { recursive: true, force: true });
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
@@ -867,6 +879,20 @@ describe('email_send from external-email', () => {
       /changed after main handed it over/u,
     );
     expect(gmail.sent).toHaveLength(1);
+  });
+
+  it.each([
+    ['a path that climbs out of it', path.relative(TEST_DIR, path.join(OUTSIDE_DIR, 'Acme quote.pdf'))],
+    ['an absolute path elsewhere', path.join(OUTSIDE_DIR, 'Acme quote.pdf')],
+  ])('never sends a host copy recorded outside the data directory: %s', async (_how, recorded) => {
+    const { key, session } = await handedOver([REMY]);
+    const quote = Buffer.from('%PDF-1.4 the quote');
+    await handFile(key, 'Acme quote.pdf', quote, recorded);
+
+    expect(
+      refusalOf(await emailSend(session, { subject: 'Your quote', text: 'Attached.' }, { 'quote.pdf': quote })),
+    ).toMatch(/The host's copy of Acme quote\.pdf is recorded outside the data directory/u);
+    expect(gmail.sent).toEqual([]);
   });
 
   it('refuses a file it names but never staged, rather than sending without it', async () => {

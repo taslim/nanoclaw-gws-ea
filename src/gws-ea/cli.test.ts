@@ -1,5 +1,18 @@
+import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,7 +28,6 @@ import { acquireInstanceOperation, recordStepCompleted, reserveInstance } from '
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { advanceOperation, beginOperation } from './operation.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
-import { ONECLI_CLI_VERSION } from './pins.js';
 import type { ProvisionHumanPause, StepResource } from './phases.js';
 import {
   checkPrerequisites,
@@ -25,10 +37,11 @@ import {
 } from './prerequisites.js';
 import { runSanitizedCommand } from './process.js';
 import { installProductionBootstrapManifest } from './provision.js';
-import { redact } from './redact.js';
-import { allocateInstanceId, readRegistry } from './registry.js';
+import { redact, REDACTED } from './redact.js';
+import { readRegistry } from './registry.js';
 import { createInstanceRuntimeConfig, persistInstanceRuntime, type InstanceRuntimeConfig } from './service.js';
 import { hostLogFiles, type NanoclawServiceHandle, type NanoclawServiceHelpers } from './service-control.js';
+import { legacyLocation } from './release-convert.js';
 import type { CreateTargetRequest } from './release-target.js';
 import { resolveReleaseSource } from './release-tracks.js';
 import { activeStep } from './run-log.js';
@@ -64,8 +77,13 @@ afterEach(async () => {
   await removeToolCheckouts();
 });
 
+/**
+ * Paths under `/tmp`, not the platform's temporary directory: on macOS that
+ * one is too deep for NanoClaw's sockets under the state root, which create's
+ * prerequisites refuse.
+ */
 async function testPaths(): Promise<ControlPlanePaths> {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-cli-'));
+  const root = await mkdtemp(path.join('/tmp', 'gws-ea-cli-'));
   roots.push(root);
   const paths = resolveControlPlanePaths({
     configRoot: path.join(root, 'config'),
@@ -75,10 +93,9 @@ async function testPaths(): Promise<ControlPlanePaths> {
   return paths;
 }
 
-function reservation(paths: ControlPlanePaths, instanceId = allocateInstanceId()): InstanceReservationInput {
+function reservation(instanceId = randomUUID()): InstanceReservationInput {
   return {
     instance_id: instanceId,
-    checkout_realpath: paths.checkoutRoot(instanceId),
     release_track: 'dogfood',
     source_remote: PRIVATE_REMOTE,
     deployed_commit: 'a'.repeat(40),
@@ -100,13 +117,11 @@ function setupAnswers() {
     assistantWorkspaceEmail: 'assistant@example.test',
     bootstrapManifest: {
       schema_version: 1,
-      onecli_cli_path: '/usr/local/bin/onecli',
       node_path: process.execPath,
       home_directory: '/Users/operator',
       platform: process.platform === 'darwin' ? 'macos' : 'linux',
       running_as_root: false,
       docker_endpoint: 'unix:///var/run/docker.sock',
-      provider_capability_digest: 'd'.repeat(64),
       provider: {
         id: 'claude',
         name: 'Anthropic',
@@ -134,7 +149,6 @@ const PREREQUISITES: Prerequisites = {
   homeDirectory: '/Users/operator',
   runningAsRoot: false,
   nodePath: process.execPath,
-  onecliCliPath: '/usr/local/bin/onecli',
   dockerEndpoint: 'unix:///var/run/docker.sock',
   rootlessDocker: false,
   account: 'operator@example.test',
@@ -258,9 +272,7 @@ describe('gws-ea usage', () => {
     const before = await everythingUnder(paths);
     const io = lines();
 
-    expect(
-      await runCli(['rollback', '--id', allocateInstanceId(), '--to', 'a'.repeat(40)], { paths, ...io.runtime }),
-    ).toBe(1);
+    expect(await runCli(['rollback', '--id', randomUUID(), '--to', 'a'.repeat(40)], { paths, ...io.runtime })).toBe(1);
     expect(await runCli(['rollback', '--yes'], { paths, ...io.runtime })).toBe(1);
     expect(await everythingUnder(paths)).toEqual(before);
     expect(io.err).toEqual([
@@ -276,15 +288,28 @@ describe('gws-ea usage', () => {
     const before = await everythingUnder(paths);
     const io = lines();
 
-    expect(
-      await runCli(['update', '--id', allocateInstanceId(), '--to', 'a'.repeat(40)], { paths, ...io.runtime }),
-    ).toBe(1);
+    expect(await runCli(['update', '--id', randomUUID(), '--to', 'a'.repeat(40)], { paths, ...io.runtime })).toBe(1);
     expect(await everythingUnder(paths)).toEqual(before);
     expect(io.err).toEqual(['Unknown option --to', 'Run gws-ea --help for usage.']);
   });
 
   it.each([
-    ['--id', allocateInstanceId(), 'Pass either --id or --all, not both.'],
+    ['create', '--track', 'dogfood'],
+    ['resume', '--id', randomUUID()],
+    ['remove', '--id', randomUUID()],
+    ['connect-google', '--id', randomUUID()],
+  ])('refuses %s with --capture-fixtures as an unknown option, before anything runs', async (...args) => {
+    const paths = await testPaths();
+    const before = await everythingUnder(paths);
+    const io = lines();
+
+    expect(await runCli([...args, '--capture-fixtures'], { paths, ...io.runtime })).toBe(1);
+    expect(await everythingUnder(paths)).toEqual(before);
+    expect(io.err).toEqual(['Unknown option --capture-fixtures', 'Run gws-ea --help for usage.']);
+  });
+
+  it.each([
+    ['--id', randomUUID(), 'Pass either --id or --all, not both.'],
     [
       '--track',
       'dogfood',
@@ -297,7 +322,7 @@ describe('gws-ea usage', () => {
     ],
   ])('refuses update --all with %s before anything runs', async (flag, value, refusal) => {
     const paths = await testPaths();
-    await reserveInstance(paths, reservation(paths));
+    await reserveInstance(paths, reservation());
     const before = await everythingUnder(paths);
     const services = nanoclawServices({});
     const io = lines();
@@ -328,7 +353,7 @@ describe('gws-ea usage', () => {
 describe('gws-ea stop summaries and exit codes', () => {
   it('prints the failing step, cause, next action, log paths, and redacted tail, then exits 1', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     const secret = `sk-ant-api03-${'q'.repeat(24)}`;
     const io = lines();
 
@@ -365,7 +390,7 @@ describe('gws-ea stop summaries and exit codes', () => {
 
   it('exits 10 on a pause, naming the human action and the resume command', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     const io = lines();
 
     expect(
@@ -383,7 +408,7 @@ describe('gws-ea stop summaries and exit codes', () => {
 
   it('attends a pause at a terminal and runs on in the same process with the decision made', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     const io = lines();
     const decided: boolean[] = [];
     const attendPause = vi.fn(
@@ -412,7 +437,7 @@ describe('gws-ea stop summaries and exit codes', () => {
 
   it('reports a pause the person stops at, logged against the step that paused', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     const io = lines();
 
     expect(
@@ -530,7 +555,7 @@ describe('gws-ea stop summaries and exit codes', () => {
 
   it('records a run stopped by Ctrl-C, naming the step it was in', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
 
     const { exitCode, progress } = await interruptWhenReady(
       paths,
@@ -552,7 +577,7 @@ describe('gws-ea stop summaries and exit codes', () => {
 
   it('stops only the wait when Ctrl-C arrives while a pause is attended, and reports the pause', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     const unexpected = `async () => { throw new Error('unexpected question'); }`;
 
     const { exitCode, progress } = await interruptWhenReady(
@@ -585,7 +610,7 @@ describe('gws-ea stop summaries and exit codes', () => {
 
   it('ends the run on a second Ctrl-C when the attended pause cannot be stopped, and records it', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     const unexpected = `async () => { throw new Error('unexpected question'); }`;
 
     const { exitCode, progress } = await interruptWhenReady(
@@ -614,7 +639,7 @@ describe('gws-ea stop summaries and exit codes', () => {
 
   it('exits 75 without advancing while another operation holds the instance lock', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     const held = await acquireInstanceOperation(paths, input.instance_id);
     const advanceProvision = vi.fn();
     const io = lines();
@@ -636,7 +661,7 @@ describe('gws-ea stop summaries and exit codes', () => {
 
   it('still prints a pending human action when a failure blocks it', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     const io = lines();
 
     expect(
@@ -656,7 +681,7 @@ describe('gws-ea stop summaries and exit codes', () => {
 
   it('never prints an unexpected error message, which may carry a secret', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     const io = lines();
 
     expect(
@@ -677,7 +702,7 @@ describe('gws-ea stop summaries and exit codes', () => {
 describe('gws-ea without a TTY', () => {
   it('names the step an input pause stopped at and logs it as paused, not failed', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     const io = lines();
 
     expect(
@@ -708,7 +733,7 @@ describe('gws-ea without a TTY', () => {
 
   it('refuses an instance from an earlier gws-ea before asking for sign-in', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     await writeFile(
       paths.journalFile(input.instance_id),
       JSON.stringify({ schema_version: 1, instance_id: input.instance_id, phases: {} }),
@@ -731,17 +756,17 @@ describe('gws-ea without a TTY', () => {
     expect(advanceProvision).not.toHaveBeenCalled();
   });
 
-  it('refuses to resume mid-update instead of re-cloning the swapped-away checkout, naming what continues or reverts', async () => {
+  it('refuses to resume mid-update instead of staging the release the fence took live away, naming what continues or reverts', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     const target = { ...releaseOf(input), deployed_commit: 'b'.repeat(40) };
     const operation = await acquireInstanceOperation(paths, input.instance_id, { command: 'update', target });
     if (!operation) throw new Error('The test instance operation was busy');
     try {
       await beginOperation(operation, { kind: 'update', from: releaseOf(input), to: target });
-      await advanceOperation(operation, 'stopped', { stop: { at: '2026-09-28T10:00:00.000Z', graceful: true } });
-      await advanceOperation(operation, 'swapping');
-      await advanceOperation(operation, 'swapped');
+      await advanceOperation(operation, 'fenced', { stop: { at: '2026-09-28T10:00:00.000Z', graceful: true } });
+      await advanceOperation(operation, 'snapshotted');
+      await advanceOperation(operation, 'switched');
     } finally {
       operation.release();
     }
@@ -758,7 +783,7 @@ describe('gws-ea without a TTY', () => {
       }),
     ).toBe(1);
     const summary = io.err.join('\n');
-    expect(summary).toContain('is unfinished (swapped)');
+    expect(summary).toContain('is unfinished (switched)');
     expect(summary).toContain(`gws-ea update --id ${input.instance_id}`);
     expect(summary).toContain(`gws-ea rollback --id ${input.instance_id}`);
     expect(summary).not.toContain('Resume with');
@@ -770,7 +795,7 @@ describe('gws-ea without a TTY', () => {
 
   it('refuses removal without --yes, naming the flag', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     const remove = vi.fn();
     const io = lines();
 
@@ -783,7 +808,7 @@ describe('gws-ea without a TTY', () => {
 
   it('refuses update --all without --yes, as update --id does, before any assistant is read or observed, or the tool checkout cleaned', async () => {
     const paths = await testPaths();
-    await reserveInstance(paths, reservation(paths));
+    await reserveInstance(paths, reservation());
     const before = await everythingUnder(paths);
     const services = nanoclawServices({});
     const toolProviderSetup = vi.fn();
@@ -815,7 +840,7 @@ describe('gws-ea without a TTY', () => {
 
   it("hands removal the driver's NanoClaw service helpers, which stop the host", async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     const remove = vi.fn(async () => ({ removed: ['instance-files' as const], abandoned: [] }));
     const serviceHelpers: NanoclawServiceHelpers = {
       createCommandRunner: vi.fn(),
@@ -843,7 +868,7 @@ describe('gws-ea without a TTY', () => {
 
   it('prints durable, deduplicated progress lines', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     const io = lines();
 
     expect(
@@ -873,7 +898,7 @@ describe('gws-ea without a TTY', () => {
 describe('gws-ea secrets inputs', () => {
   it('refuses a secrets file outside the config root', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     const outside = path.join(path.dirname(paths.configRoot), 'secrets.env');
     await writeOwnerFile(outside, 'GWS_EA_PROVIDER_CREDENTIAL=sk-ant-api03-outside\n');
     const advanceProvision = vi.fn();
@@ -892,7 +917,7 @@ describe('gws-ea secrets inputs', () => {
 
   it('refuses a secrets file readable by others', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     const file = path.join(paths.configRoot, 'secrets.env');
     await writeOwnerFile(file, 'GWS_EA_PROVIDER_CREDENTIAL=sk-ant-api03-loose\n', 0o644);
     const io = lines();
@@ -963,6 +988,44 @@ describe('gws-ea secrets inputs', () => {
       expect(contents, file).not.toContain(cloudflareSecret);
     }
   });
+
+  it("redacts a legacy assistant's secrets from its run log, read from where the layout before releases keeps them", async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation());
+    const { root, checkout } = legacyLocation(paths, input.instance_id);
+    const registry = JSON.parse(await readFile(paths.registryFile, 'utf8')) as {
+      instances: Record<string, Record<string, unknown>>;
+    };
+    registry.instances[input.instance_id] = { ...registry.instances[input.instance_id], checkout_realpath: checkout };
+    await writeFile(paths.registryFile, JSON.stringify(registry), { mode: 0o600 });
+    // Values no redaction pattern knows: only their files name them secret.
+    const accountToken = `account-token-${randomUUID()}`;
+    const postgresPassword = randomUUID();
+    for (const [file, secret] of [
+      [path.join(root, 'secrets', 'cloudflare-account-token'), accountToken],
+      [path.join(root, 'onecli', 'secrets', 'postgres-password'), postgresPassword],
+    ] as const) {
+      await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+      await writeOwnerFile(file, secret);
+    }
+    const io = lines();
+
+    expect(
+      await runCli(['remove', '--id', input.instance_id, '--yes'], {
+        paths,
+        ...io.runtime,
+        removeAssistant: async () => {
+          activeStep()?.write(`accidentally logged ${accountToken} and ${postgresPassword}\n`);
+          return undefined;
+        },
+      }),
+    ).toBe(0);
+
+    const logged = await Promise.all(
+      (await filesUnder(paths.instanceLogsRoot(input.instance_id))).map((file) => readFile(file, 'utf8')),
+    );
+    expect(logged.join('\n')).toContain(`accidentally logged ${REDACTED} and ${REDACTED}`);
+  });
 });
 
 describe('gws-ea run-scoped Cloudflare authority', () => {
@@ -982,7 +1045,7 @@ describe('gws-ea run-scoped Cloudflare authority', () => {
   ] as const)('is cleared when %s exits', async (command, exitCode) => {
     const paths = await testPaths();
     const session = managedIngressSetup();
-    const reserved = async (): Promise<string> => (await reserveInstance(paths, reservation(paths))).instance_id;
+    const reserved = async (): Promise<string> => (await reserveInstance(paths, reservation())).instance_id;
     const args =
       command === 'create'
         ? ['create', '--track', 'dogfood', '--source-remote', PRIVATE_REMOTE]
@@ -1005,7 +1068,7 @@ describe('gws-ea run-scoped Cloudflare authority', () => {
 
   it('is cleared when the run throws', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     const session = managedIngressSetup();
     const crash = new Error('the failure loop crashed');
 
@@ -1217,7 +1280,6 @@ function hostDependencies(
       if (signature === 'docker context inspect') {
         return ok(JSON.stringify([{ Name: 'default', Endpoints: { docker: { Host: dockerHost } } }]));
       }
-      if (signature === 'onecli version') return ok(JSON.stringify({ version: ONECLI_CLI_VERSION }));
       if (signature.startsWith('gcloud auth list ')) return ok(`${active}\n`);
       if (signature.startsWith('gcloud auth print-access-token ')) {
         return [...expired].some((account) => signature.includes(`--account=${account} `))
@@ -1226,9 +1288,7 @@ function hostDependencies(
       }
       return ok();
     },
-    resolvePersisted: async (command) => (path.basename(command) === 'onecli' ? command : process.execPath),
-    // gws-ea's own OneCLI CLI, never downloaded in a test.
-    ensureOnecliCli: async (paths, pin) => paths.onecliCliFile(pin?.version ?? ONECLI_CLI_VERSION),
+    resolvePersisted: async () => process.execPath,
     node: { version: 'v22.20.0', execPath: process.execPath, execve: neverCalled },
     platform: 'linux',
     // Never the operator's real NanoClaw mount allowlist.
@@ -1364,7 +1424,7 @@ describe('gws-ea prerequisites', () => {
 
   it('renews an expired sign-in through the browser flow, then continues the same resume', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     const expired = new Set(['operator@example.test']);
     const dockerHost = await runningDocker();
     const googleCloudSignIn = vi.fn(async (account?: string) => void expired.delete(account ?? ''));
@@ -1391,9 +1451,9 @@ describe('gws-ea prerequisites', () => {
     expect(advanceProvision).toHaveBeenCalledOnce();
   });
 
-  it('passes the Docker endpoint and OneCLI CLI create recorded when resume checks prerequisites', async () => {
+  it('passes the Docker endpoint create recorded when resume checks prerequisites', async () => {
     const paths = await testPaths();
-    const input = reservation(paths);
+    const input = reservation();
     await installProductionBootstrapManifest(paths, input.instance_id, {
       ...setupAnswers().bootstrapManifest,
       docker_endpoint: 'unix:///Users/operator/.docker/run/docker.sock',
@@ -1416,9 +1476,7 @@ describe('gws-ea prerequisites', () => {
         command: 'resume',
         paths,
         account: 'operator@example.test',
-        checkoutRoot: input.checkout_realpath,
         dockerEndpoint: 'unix:///Users/operator/.docker/run/docker.sock',
-        onecliCliPath: '/usr/local/bin/onecli',
       },
     ]);
   });
@@ -1427,7 +1485,7 @@ describe('gws-ea prerequisites', () => {
 describe('gws-ea interactive failure loop', () => {
   it('releases the lock before the failure hook, then retries through prerequisites and resume', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     const preflight = vi.fn(async () => PREREQUISITES);
     const reports: FailureReport[] = [];
     let lockFree = false;
@@ -1470,7 +1528,7 @@ describe('gws-ea interactive failure loop', () => {
 
   it('stops with exit 1 when the operator declines the retry', async () => {
     const paths = await testPaths();
-    const input = await reserveInstance(paths, reservation(paths));
+    const input = await reserveInstance(paths, reservation());
     const advanceProvision = vi.fn(async () => {
       throw new GwsEaError('onecli_unhealthy', 'OneCLI did not become healthy');
     });
@@ -1499,10 +1557,10 @@ exit 7
 `;
 
 /** A reservation whose ports and claims differ from those of any other `port`. */
-function assistantReservation(paths: ControlPlanePaths, port: number): InstanceReservationInput {
-  const instanceId = allocateInstanceId();
+function assistantReservation(port: number): InstanceReservationInput {
+  const instanceId = randomUUID();
   return {
-    ...reservation(paths, instanceId),
+    ...reservation(instanceId),
     allocated_ports: { nanoclaw_webhook: port, onecli_app: port + 1, onecli_gateway: port + 2 },
     exclusive_resource_claims: {
       ingress: { mode: 'existing', endpoint_url: `https://a${port}.example.test/webhook/gchat` },
@@ -1516,11 +1574,12 @@ function assistantReservation(paths: ControlPlanePaths, port: number): InstanceR
 }
 
 /**
- * A fully created assistant: every provision step complete, and the runtime
- * record and `bin/ncl` in its checkout that its host was started with.
+ * A fully created assistant: every provision step complete, the runtime
+ * record in its state, and its live release holding the `bin/ncl` its host
+ * was started with.
  */
 async function createdAssistant(paths: ControlPlanePaths, port: number): Promise<InstanceRuntimeConfig> {
-  const reserved = await reserveInstance(paths, assistantReservation(paths, port));
+  const reserved = await reserveInstance(paths, assistantReservation(port));
   const operation = await acquireInstanceOperation(paths, reserved.instance_id);
   if (!operation) throw new Error('The test instance operation was busy');
   try {
@@ -1536,24 +1595,26 @@ async function createdAssistant(paths: ControlPlanePaths, port: number): Promise
     project: reserved.exclusive_resource_claims.onecli_project,
     appPort: reserved.allocated_ports.onecli_app,
     gatewayPort: reserved.allocated_ports.onecli_gateway,
-    cliExecutable: '/usr/local/bin/onecli',
     dockerEndpoint: DOCKER_ENDPOINT,
   });
-  const runtime = createInstanceRuntimeConfig(reserved, onecli, {
+  const runtime = createInstanceRuntimeConfig(paths, reserved, onecli, {
     nodePath: process.execPath,
     homeDirectory: home,
     selectedProvider: 'claude',
     dockerEndpoint: DOCKER_ENDPOINT,
   });
   await persistInstanceRuntime(runtime, () => undefined);
-  await mkdir(path.join(runtime.checkout_realpath, 'bin'), { mode: 0o700 });
-  await writeFile(path.join(runtime.checkout_realpath, 'bin', 'ncl'), NCL_SCRIPT, { mode: 0o700 });
+  const release = reserved.deployed_commit.slice(0, 8);
+  const binaries = path.join(paths.instanceLayout(reserved.instance_id).release(release), 'bin');
+  await mkdir(binaries, { recursive: true, mode: 0o700 });
+  await writeFile(path.join(binaries, 'ncl'), NCL_SCRIPT, { mode: 0o700 });
+  await symlink(release, runtime.checkout_root);
   return runtime;
 }
 
-/** The host's two log files, written where its service definition sends them. */
-async function writeHostLogs(checkout: string): Promise<{ readonly output: string; readonly errors: string }> {
-  const logs = hostLogFiles(checkout);
+/** The host's two log files, written in the assistant's physical logs, where its service definition sends them. */
+async function writeHostLogs(instanceRoot: string): Promise<{ readonly output: string; readonly errors: string }> {
+  const logs = hostLogFiles(instanceRoot);
   await mkdir(path.dirname(logs.output), { recursive: true });
   await writeFile(logs.output, 'host started\nhost ready\n');
   await writeFile(logs.errors, 'host warning\n');
@@ -1673,7 +1734,7 @@ async function runCliInChild(
   return { exitCode, stdout, stderr };
 }
 
-/** Leave an update of the assistant open at `stopped`, as a cutover interrupted after its stop would. */
+/** Leave an update of the assistant open at `fenced`, as an update interrupted after its fence would. */
 async function interruptUpdate(paths: ControlPlanePaths, instanceId: string): Promise<void> {
   const registered = releaseOf((await readRegistry(paths)).instances[instanceId]!);
   const target = { ...registered, deployed_commit: 'b'.repeat(40) };
@@ -1681,26 +1742,16 @@ async function interruptUpdate(paths: ControlPlanePaths, instanceId: string): Pr
   if (!operation) throw new Error('The test instance operation was busy');
   try {
     await beginOperation(operation, { kind: 'update', from: registered, to: target });
-    await advanceOperation(operation, 'stopped', { stop: { at: '2026-09-28T10:00:00.000Z', graceful: true } });
+    await advanceOperation(operation, 'fenced', { stop: { at: '2026-09-28T10:00:00.000Z', graceful: true } });
   } finally {
     operation.release();
   }
 }
 
 describe('gws-ea connect-google', () => {
-  it('refuses an assistant whose release predates Google access, naming the update', async () => {
-    const paths = await testPaths();
-    const a = await createdAssistant(paths, 35_001);
-    const io = lines();
-
-    expect(await runCli(['connect-google', '--id', a.instance_id], { paths, ...io.runtime })).toBe(1);
-
-    expect(io.err.join('\n')).toContain(`gws-ea update --id ${a.instance_id}`);
-  });
-
   it('refuses an assistant that is not fully created, naming the resume', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, assistantReservation(paths, 35_021));
+    const reserved = await reserveInstance(paths, assistantReservation(35_021));
     const io = lines();
 
     expect(await runCli(['connect-google', '--id', reserved.instance_id], { paths, ...io.runtime })).toBe(1);
@@ -1708,20 +1759,17 @@ describe('gws-ea connect-google', () => {
     expect(io.err.join('\n')).toContain(`gws-ea resume --id ${reserved.instance_id}`);
   });
 
-  /** A created assistant whose release carries Google access. */
-  async function googleReadyAssistant(paths: ControlPlanePaths) {
+  /** A created assistant, by its ID and its own Google account. */
+  async function createdGoogleAssistant(paths: ControlPlanePaths) {
     const runtime = await createdAssistant(paths, 35_001);
     const reservation = (await readRegistry(paths)).instances[runtime.instance_id];
     if (!reservation) throw new Error('The test assistant was not registered');
-    const module = path.join(reservation.checkout_realpath, 'src', 'modules', 'gws-ea-google');
-    await mkdir(module, { recursive: true });
-    await writeFile(path.join(module, 'index.ts'), 'export {};\n');
     return { instanceId: runtime.instance_id, email: reservation.exclusive_resource_claims.workspace_email };
   }
 
   it("runs the step's resources for the assistant's own account and reports it connected", async () => {
     const paths = await testPaths();
-    const { instanceId, email } = await googleReadyAssistant(paths);
+    const { instanceId, email } = await createdGoogleAssistant(paths);
     const accounts: string[] = [];
     googleConnection.resources = [
       {
@@ -1749,7 +1797,7 @@ describe('gws-ea connect-google', () => {
 
   it('stops for the operator with the command that continues it', async () => {
     const paths = await testPaths();
-    const { instanceId } = await googleReadyAssistant(paths);
+    const { instanceId } = await createdGoogleAssistant(paths);
     const pause: ProvisionHumanPause = {
       kind: 'human-action',
       phase: 'connect_google',
@@ -1791,7 +1839,7 @@ describe('gws-ea start, stop, and restart', () => {
     expect(await runCli(['stop', '--id', a.instance_id], { paths, ...io.runtime, serviceHelpers: helpers })).toBe(0);
 
     expect(calls).toEqual([
-      { helper: 'detect', install: a.install_id, root: a.checkout_realpath },
+      { helper: 'detect', install: a.install_id, root: a.checkout_root },
       { helper: 'stop', install: a.install_id },
     ]);
     expect(running).toEqual({ [a.install_id]: false, [b.install_id]: true });
@@ -1829,7 +1877,7 @@ describe('gws-ea start, stop, and restart', () => {
       // Every helper acts on the service the runtime record names: its checkout, install, home, and Docker endpoint.
       for (const { install, root } of calls) {
         expect(install).toBe(a.install_id);
-        if (root !== undefined) expect(root).toBe(a.checkout_realpath);
+        if (root !== undefined) expect(root).toBe(a.checkout_root);
       }
       for (const [, env] of helpers.detectService.mock.calls) expect(env.home).toBe(a.home_directory);
       expect(helpers.createCommandRunner).toHaveBeenCalledExactlyOnceWith({
@@ -1931,12 +1979,13 @@ describe('gws-ea ncl', () => {
       },
     );
 
-    const ncl = path.join(a.checkout_realpath, 'bin', 'ncl');
+    const ncl = path.join(a.checkout_root, 'bin', 'ncl');
     expect(replacement).toEqual({
       file: ncl,
       args: [ncl, 'groups', 'list', '--json', '--help', '--', '-h'],
       env: { PATH: '/usr/bin:/bin', LANG: 'C', HOME: a.home_directory, NANOCLAW_INSTALL_ID: a.install_id },
-      cwd: a.checkout_realpath,
+      // It runs in the live release, the folder its live link names.
+      cwd: await realpath(a.checkout_root),
     });
     expect(io.out).toEqual([]);
     expect(io.err).toEqual([]);
@@ -1988,7 +2037,7 @@ describe('gws-ea logs', () => {
   it('shows the host log with cat, or the error log with --errors, and follows with tail -f, at the paths its service definition names', async () => {
     const paths = await testPaths();
     const a = await createdAssistant(paths, 35_001);
-    const logs = await writeHostLogs(a.checkout_realpath);
+    const logs = await writeHostLogs(a.instance_root);
     const environment = { PATH: '/usr/bin:/bin', ANTHROPIC_API_KEY: 'provider-secret-canary' };
 
     const shown = await runReplacing(['logs', '--id', a.instance_id], { paths, ...lines().runtime, environment });
@@ -2006,10 +2055,48 @@ describe('gws-ea logs', () => {
     for (const { replacement } of [shown, followed]) expect(replacement?.env).toEqual({ PATH: '/usr/bin:/bin' });
   });
 
+  it("shows the host log from the assistant's physical logs while no release is live", async () => {
+    const paths = await testPaths();
+    const a = await createdAssistant(paths, 35_001);
+    const logs = await writeHostLogs(a.instance_root);
+    // A switch has removed the live link.
+    await rm(a.checkout_root);
+
+    const { replacement } = await runReplacing(['logs', '--id', a.instance_id, '--errors'], {
+      paths,
+      ...lines().runtime,
+    });
+
+    expect(logs.errors).toBe(path.join(paths.instanceRoot(a.instance_id), 'logs', 'nanoclaw.error.log'));
+    expect(replacement?.args).toEqual(['cat', logs.errors]);
+  });
+
+  it("shows a legacy assistant's host log from its legacy checkout until its conversion moves the logs", async () => {
+    const paths = await testPaths();
+    const a = await createdAssistant(paths, 35_001);
+    const { checkout } = legacyLocation(paths, a.instance_id);
+    const legacy = await writeHostLogs(checkout);
+    await rm(paths.instanceLayout(a.instance_id).logs, { recursive: true, force: true });
+    const registry = JSON.parse(await readFile(paths.registryFile, 'utf8')) as {
+      instances: Record<string, Record<string, unknown>>;
+    };
+    registry.instances[a.instance_id] = { ...registry.instances[a.instance_id], checkout_realpath: checkout };
+    await writeFile(paths.registryFile, JSON.stringify(registry), { mode: 0o600 });
+
+    const before = await runReplacing(['logs', '--id', a.instance_id], { paths, ...lines().runtime });
+    // The conversion moves the checkout's logs into the assistant's root by rename.
+    await rename(path.dirname(legacy.output), paths.instanceLayout(a.instance_id).logs);
+    const after = await runReplacing(['logs', '--id', a.instance_id, '--errors'], { paths, ...lines().runtime });
+
+    expect(legacy.output).toBe(path.join(checkout, 'logs', 'nanoclaw.log'));
+    expect(before.replacement?.args).toEqual(['cat', legacy.output]);
+    expect(after.replacement?.args).toEqual(['cat', hostLogFiles(a.instance_root).errors]);
+  });
+
   it('streams the host log as the file holds it', async () => {
     const paths = await testPaths();
     const a = await createdAssistant(paths, 35_001);
-    await writeHostLogs(a.checkout_realpath);
+    await writeHostLogs(a.instance_root);
 
     const { exitCode, stdout, stderr } = await runCliInChild(paths, ['logs', '--id', a.instance_id]);
 
@@ -2030,7 +2117,7 @@ describe('gws-ea logs', () => {
 
     expect(exitCode).toBe(1);
     expect(replacement).toBeUndefined();
-    expect(io.err.join('\n')).toContain(`${hostLogFiles(a.checkout_realpath).errors} does not exist yet`);
+    expect(io.err.join('\n')).toContain(`${hostLogFiles(a.instance_root).errors} does not exist yet`);
   });
 
   it.each([
@@ -2050,7 +2137,7 @@ describe('gws-ea logs', () => {
   ] as const)('refuses a host log that is %s before any tool opens it', async (_kind, place) => {
     const paths = await testPaths();
     const a = await createdAssistant(paths, 35_001);
-    const log = hostLogFiles(a.checkout_realpath).output;
+    const log = hostLogFiles(a.instance_root).output;
     await mkdir(path.dirname(log), { recursive: true });
     await place(log, path.join(path.dirname(paths.configRoot), 'elsewhere'));
     const io = lines();
@@ -2101,7 +2188,7 @@ describe('gws-ea list and status', () => {
   it('refuses status for an assistant not registered here with exit 1, writing nothing', async () => {
     const paths = await testPaths();
     await createdAssistant(paths, 35_001);
-    const unknown = allocateInstanceId();
+    const unknown = randomUUID();
     const before = await everythingUnder(paths);
     const io = lines();
 
@@ -2116,9 +2203,9 @@ describe('gws-ea list and status', () => {
 describe('gws-ea on an assistant that is not ready to operate', () => {
   it('refuses start, stop, restart, and ncl on an incomplete create, naming resume, while logs still shows the host log', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, assistantReservation(paths, 35_001));
+    const reserved = await reserveInstance(paths, assistantReservation(35_001));
     const id = reserved.instance_id;
-    const logs = await writeHostLogs(reserved.checkout_realpath);
+    const logs = await writeHostLogs(paths.instanceRoot(reserved.instance_id));
     const { helpers } = nanoclawServices({});
 
     for (const command of ['start', 'stop', 'restart', 'ncl']) {
@@ -2145,7 +2232,7 @@ describe('gws-ea on an assistant that is not ready to operate', () => {
   it('refuses start, stop, restart, and ncl mid-update, naming what continues or reverts it, while logs names the update and still shows the host log', async () => {
     const paths = await testPaths();
     const a = await createdAssistant(paths, 35_001);
-    const logs = await writeHostLogs(a.checkout_realpath);
+    const logs = await writeHostLogs(a.instance_root);
     await interruptUpdate(paths, a.instance_id);
     const { helpers } = nanoclawServices({ [a.install_id]: false });
 
@@ -2160,7 +2247,7 @@ describe('gws-ea on an assistant that is not ready to operate', () => {
       expect(exitCode).toBe(1);
       expect(replacement).toBeUndefined();
       const summary = io.err.join('\n');
-      expect(summary).toContain('is unfinished (stopped)');
+      expect(summary).toContain('is unfinished (fenced)');
       expect(summary).toContain(`gws-ea update --id ${a.instance_id}`);
       expect(summary).toContain(`gws-ea rollback --id ${a.instance_id}`);
       expect(summary).not.toContain('Retry with');
@@ -2170,7 +2257,7 @@ describe('gws-ea on an assistant that is not ready to operate', () => {
     const io = lines();
     const { replacement } = await runReplacing(['logs', '--id', a.instance_id], { paths, ...io.runtime });
     expect(replacement?.args).toEqual(['cat', logs.output]);
-    expect(io.err.join('\n')).toContain('is unfinished (stopped)');
+    expect(io.err.join('\n')).toContain('is unfinished (fenced)');
     expect(io.err.join('\n')).toContain(`gws-ea update --id ${a.instance_id}`);
     expect(io.out).toEqual([]);
   });
@@ -2302,7 +2389,7 @@ describe('gws-ea and a stray NanoClaw install in its own checkout', () => {
     const io = lines();
 
     expect(
-      await runCli(['update', '--id', allocateInstanceId(), '--yes'], {
+      await runCli(['update', '--id', randomUUID(), '--yes'], {
         paths,
         ...io.runtime,
         ...launcherStrayHandling(w),
@@ -2408,7 +2495,7 @@ describe('gws-ea and a stray NanoClaw install in its own checkout', () => {
       });
       return { exitCode, ...io };
     };
-    const commands = [['list'], ['list', '--json'], ['status', '--id', allocateInstanceId()]] as const;
+    const commands = [['list'], ['list', '--json'], ['status', '--id', randomUUID()]] as const;
     const without = await Promise.all(commands.map((args) => observe(args)));
     // Only a tag in its image repository is left of it.
     w.docker.image('sha256:a', `${w.names.containerImageBase}:latest`);

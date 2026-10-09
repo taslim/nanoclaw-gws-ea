@@ -27,15 +27,16 @@ const BIND_ORDER = ['user', 'bind', 'role:owner', 'member', 'wiring', 'bootstrap
 
 function runtimeConfig(overrides: Partial<InstanceRuntimeConfig> = {}): InstanceRuntimeConfig {
   const instanceId = '11111111-1111-4111-8111-111111111111';
-  const checkout = '/opt/gws-ea/instances/one/nanoclaw';
-  const secrets = '/opt/gws-ea/instances/one/secrets';
+  const root = '/opt/gws-ea/11111111';
+  const secrets = `${root}/secrets`;
   const project = `gws-ea-${instanceId.replaceAll('-', '')}`;
   return {
-    schema_version: 1,
+    schema_version: 2,
     instance_id: instanceId,
     install_id: instanceId.replaceAll('-', ''),
-    deployed_commit: 'a'.repeat(40),
-    checkout_realpath: checkout,
+    instance_root: root,
+    checkout_root: `${root}/nanoclaw`,
+    state_root: `${root}/state`,
     node_path: '/usr/bin/node',
     home_directory: '/Users/operator',
     allocated_ports: { nanoclaw_webhook: 31_001, onecli_app: 31_002, onecli_gateway: 31_003 },
@@ -44,7 +45,6 @@ function runtimeConfig(overrides: Partial<InstanceRuntimeConfig> = {}): Instance
     onecli_app_url: 'http://127.0.0.1:31002',
     onecli_gateway_url: 'http://127.0.0.1:31003',
     onecli_gateway_container: `${project}-gateway-1`,
-    onecli_cli_path: '/opt/onecli',
     selected_provider: 'claude',
     endpoint_url: 'https://aya.example.test/webhook/gchat',
     docker_endpoint: 'unix:///var/run/docker.sock',
@@ -260,8 +260,8 @@ describe('verified principal first-DM reconciliation', () => {
       expect.objectContaining({
         args: [
           '--import',
-          '/opt/gws-ea/instances/one/nanoclaw/node_modules/tsx/dist/loader.mjs',
-          '/opt/gws-ea/instances/one/nanoclaw/scripts/init-first-agent.ts',
+          '/opt/gws-ea/11111111/nanoclaw/node_modules/tsx/dist/loader.mjs',
+          '/opt/gws-ea/11111111/nanoclaw/scripts/init-first-agent.ts',
           '--channel',
           'gchat',
           '--user-id',
@@ -363,8 +363,8 @@ describe('verified principal first-DM reconciliation', () => {
     expect(h.runCommand).toHaveBeenCalledWith(
       expect.objectContaining({
         command: '/usr/bin/node',
-        cwd: '/opt/gws-ea/instances/one/nanoclaw',
-        args: expect.arrayContaining(['/opt/gws-ea/instances/one/nanoclaw/scripts/init-first-agent.ts', '--event-id']),
+        cwd: '/opt/gws-ea/11111111/nanoclaw',
+        args: expect.arrayContaining(['/opt/gws-ea/11111111/nanoclaw/scripts/init-first-agent.ts', '--event-id']),
         env: expect.objectContaining({ NANOCLAW_INSTALL_ID: runtimeConfig().install_id }),
       }),
     );
@@ -389,11 +389,18 @@ describe('verified principal binding on a real instance', () => {
     process.chdir(originalCwd);
   });
 
-  /** A checkout whose host is running: the host's composition, its CLI socket, and canonical main. */
+  /**
+   * An assistant whose host is running: the host's composition, its CLI
+   * socket, and canonical main. Its release reaches the state through its
+   * `data` link, as every release does.
+   */
   async function runningInstance() {
-    const checkout = await realpath(await mkdtemp(path.join(os.tmpdir(), 'gws-ea-bind-')));
-    cleanups.push(() => rm(checkout, { recursive: true, force: true }));
-    await mkdir(path.join(checkout, 'data'));
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'gws-ea-bind-')));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const checkout = path.join(root, 'nanoclaw');
+    await mkdir(path.join(root, 'state', 'data'), { recursive: true });
+    await mkdir(checkout);
+    await symlink(path.join('..', 'state', 'data'), path.join(checkout, 'data'));
     // The checkout's own script and loader, as `reconcilePrincipalDm` runs them.
     await symlink(path.join(CONTROL_PLANE_ROOT, 'scripts'), path.join(checkout, 'scripts'));
     await symlink(path.join(CONTROL_PLANE_ROOT, 'node_modules'), path.join(checkout, 'node_modules'));
@@ -453,7 +460,9 @@ describe('verified principal binding on a real instance', () => {
     await ensureContainerConfig('ag-main');
 
     const config = runtimeConfig({
-      checkout_realpath: checkout,
+      instance_root: root,
+      checkout_root: checkout,
+      state_root: path.join(root, 'state'),
       node_path: process.execPath,
       home_directory: os.homedir(),
     });

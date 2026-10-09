@@ -15,12 +15,19 @@ import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const TEST_DIR = '/tmp/nanoclaw-test-gws-ea-bridge';
+/** Release folders, each reaching the data directory through its own `data` link, as the host runs from one. */
+const RELEASES = '/tmp/nanoclaw-test-gws-ea-bridge-releases';
+
+/** The data directory as the host reaches it: the directory itself, or through a release folder's link. */
+const dataDir = vi.hoisted(() => ({ path: '/tmp/nanoclaw-test-gws-ea-bridge' }));
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual<typeof import('../../config.js')>('../../config.js');
   return {
     ...actual,
-    DATA_DIR: '/tmp/nanoclaw-test-gws-ea-bridge',
+    get DATA_DIR() {
+      return dataDir.path;
+    },
     GROUPS_DIR: '/tmp/nanoclaw-test-gws-ea-bridge/groups',
   };
 });
@@ -273,6 +280,8 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await closeDb();
+  dataDir.path = TEST_DIR;
+  fs.rmSync(RELEASES, { recursive: true, force: true });
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
@@ -489,6 +498,38 @@ describe('email_handoff', () => {
     expect(await findThreadFile(other, sha256(notes))).toBeUndefined();
     // main's staged copies are gone once handed over.
     expect(fs.existsSync(path.join(sessionDir(main.agent_group_id, main.id), 'outbox', requestId))).toBe(false);
+  });
+
+  it('keeps each file by its place in the data directory, so it outlives the release folder it was handed over under', async () => {
+    const release = (name: string): string => {
+      const link = path.join(RELEASES, name, 'data');
+      fs.mkdirSync(path.dirname(link), { recursive: true });
+      fs.symlinkSync(TEST_DIR, link);
+      return link;
+    };
+    const agenda = Buffer.from('Agenda: the lease, then lunch.');
+    dataDir.path = release('a1b2c3d4');
+    const key = keyOf(
+      await handoff(
+        { people: [REMY], message: 'Send Remy the agenda.', files: ['agenda.txt'] },
+        { 'agenda.txt': agenda },
+        'act-release',
+      ),
+    );
+
+    // An update switches to the next release and prunes the one the file was handed over under.
+    dataDir.path = release('e5f6a7b8');
+    fs.rmSync(path.join(RELEASES, 'a1b2c3d4'), { recursive: true });
+
+    expect(fs.readFileSync((await findThreadFile(key, sha256(agenda)))?.hostPath ?? '')).toEqual(agenda);
+    const session = await requireThreadSession(key);
+    const stored = await getDb().get<{ host_path: string }>(
+      'SELECT host_path FROM gws_ea_thread_files WHERE thread_key = ?',
+      key,
+    );
+    expect(stored?.host_path).toBe(
+      path.join('v2-sessions', session.agent_group_id, session.id, 'inbox', 'handoff-act-release', 'agenda.txt'),
+    );
   });
 
   it('records the calendar main names for the thread’s bookings, when the principal’s and writable', async () => {

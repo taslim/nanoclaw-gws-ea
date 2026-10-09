@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -6,12 +6,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { SignInRequired } from './events.js';
-import {
-  RECORDED_DOCKER_CONTEXT_INSPECT,
-  RECORDED_GCLOUD_REAUTHENTICATION_FAILED,
-  RECORDED_ONECLI_VERSION,
-} from './fixtures/recordings.js';
-import { ONECLI_CLI_ARCHIVE_DIGESTS, ONECLI_CLI_VERSION } from './pins.js';
+import { RECORDED_DOCKER_CONTEXT_INSPECT, RECORDED_GCLOUD_REAUTHENTICATION_FAILED } from './fixtures/recordings.js';
 import {
   checkPrerequisites,
   resolveDockerEndpoint,
@@ -20,7 +15,6 @@ import {
   type PrerequisiteRequest,
 } from './prerequisites.js';
 import type { SanitizedCommandOutcomeRunner } from './process.js';
-import { assertInstalledOnecliCli } from './release-preflight.js';
 import { GwsEaError } from './types.js';
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -72,14 +66,11 @@ interface FakeHost {
   readonly missing: Set<string>;
   dockerContext: string;
   dockerHost: string;
-  onecliVersion: string;
   /** The account gcloud runs as; undefined when nobody is signed in. */
   active: string | undefined;
   /** Accounts whose credentials no longer refresh. */
   readonly expired: Set<string>;
   readonly commands: string[];
-  /** gws-ea's OneCLI CLI copies installed during the check. */
-  readonly installedOnecli: string[];
 }
 
 function fakeHost(dockerHost: string): FakeHost {
@@ -87,18 +78,15 @@ function fakeHost(dockerHost: string): FakeHost {
     missing: new Set(),
     dockerContext: 'desktop-linux',
     dockerHost,
-    onecliVersion: ONECLI_CLI_VERSION,
     active: 'operator@example.com',
     expired: new Set(),
     commands: [],
-    installedOnecli: [],
   };
 }
 
 /** The recorded Docker Desktop context's name and endpoint (fixtures/README.md). */
 const RECORDED_CONTEXT = 'desktop-linux';
 const RECORDED_DOCKER_HOST = 'unix:///home/operator/.docker/run/docker.sock';
-const RECORDED_ONECLI_CLI = '2.2.5';
 
 /** A recording with one exact recorded fragment replaced, every other byte as recorded. */
 function substitute(recording: string, recorded: string, replacement: string): string {
@@ -116,15 +104,6 @@ function dockerContextInspect(host: FakeHost): string {
   return substitute(named, `"Host": "${RECORDED_DOCKER_HOST}"`, `"Host": ${JSON.stringify(host.dockerHost)}`);
 }
 
-/** The recorded `onecli version` answer for this host's OneCLI CLI version. */
-function onecliVersion(host: FakeHost): string {
-  return substitute(
-    RECORDED_ONECLI_VERSION.stdout,
-    `"version": "${RECORDED_ONECLI_CLI}"`,
-    `"version": ${JSON.stringify(host.onecliVersion)}`,
-  );
-}
-
 function notFound(program: string): GwsEaError {
   return new GwsEaError('executable_not_found', `${program} was not found on PATH`, {
     details: { program, searched: ['/usr/bin', '/bin'] },
@@ -140,7 +119,6 @@ function hostRunner(host: FakeHost): SanitizedCommandOutcomeRunner {
     const ok = (stdout = '') => ({ stdout, stderr: '', exitCode: 0 });
     if (signature === 'git --version') return ok('git version 2.50.1\n');
     if (signature === 'pnpm --version') return ok('10.18.0\n');
-    if (signature === 'onecli version') return ok(onecliVersion(host));
     if (signature === 'docker context inspect') return ok(dockerContextInspect(host));
     if (signature === 'gcloud version --format=json') return ok('{"Google Cloud SDK":"540.0.0"}');
     if (signature === 'gcloud auth list --filter=status:ACTIVE --format=value(account)') {
@@ -157,20 +135,7 @@ function hostRunner(host: FakeHost): SanitizedCommandOutcomeRunner {
 function dependencies(host: FakeHost, overrides: Partial<PrerequisiteDependencies> = {}): PrerequisiteDependencies {
   return {
     runCommand: hostRunner(host),
-    resolvePersisted: async (command) => {
-      if (path.basename(command) === 'onecli') {
-        if (host.missing.has(command)) throw notFound(command);
-        return command;
-      }
-      return '/opt/homebrew/Cellar/node/22.20.0/bin/node';
-    },
-    // gws-ea's own copy is always there unless a test removes it; the launcher pin needs no checkout.
-    ensureOnecliCli: async (paths, pin) => {
-      const installed = paths.onecliCliFile(pin?.version ?? ONECLI_CLI_VERSION);
-      host.installedOnecli.push(installed);
-      host.missing.delete(installed);
-      return installed;
-    },
+    resolvePersisted: async () => '/opt/homebrew/Cellar/node/22.20.0/bin/node',
     node: { version: 'v22.20.0', execPath: '/opt/homebrew/bin/node', execve: neverCalled },
     platform: 'darwin',
     // No shared NanoClaw mount allowlist unless a test writes one.
@@ -198,11 +163,7 @@ const PATHS = {
   configRoot: '/Users/operator/.config/gws-ea',
   stateRoot: '/Users/operator/.local/share/gws-ea',
   logsRoot: '/Users/operator/.local/share/gws-ea/logs',
-  instancesRoot: '/Users/operator/.local/share/gws-ea/instances',
-  onecliCliFile: (version: string) => `/Users/operator/.local/share/gws-ea/tools/onecli/${version}/onecli`,
 } as const;
-const PINNED_ONECLI = PATHS.onecliCliFile(ONECLI_CLI_VERSION);
-const CHECKOUT = '/Users/operator/.local/share/gws-ea/instances/1/nanoclaw';
 const CREATE: PrerequisiteRequest = { command: 'create', paths: PATHS };
 
 /** gws-ea's roots under a home directory, as the XDG defaults place them. */
@@ -212,20 +173,12 @@ function rootsUnder(home: string) {
     configRoot: path.join(home, '.config', 'gws-ea'),
     stateRoot,
     logsRoot: path.join(stateRoot, 'logs'),
-    instancesRoot: path.join(stateRoot, 'instances'),
   };
 }
 
-/** Resume names the Docker endpoint and OneCLI CLI create recorded. */
-function resume(dockerEndpoint: string, onecliCliPath = PINNED_ONECLI): PrerequisiteRequest {
-  return {
-    command: 'resume',
-    paths: PATHS,
-    account: 'reserved@example.com',
-    dockerEndpoint,
-    onecliCliPath,
-    checkoutRoot: CHECKOUT,
-  };
+/** Resume names the Docker endpoint create recorded. */
+function resume(dockerEndpoint: string): PrerequisiteRequest {
+  return { command: 'resume', paths: PATHS, account: 'reserved@example.com', dockerEndpoint };
 }
 
 describe('prerequisites', () => {
@@ -239,7 +192,6 @@ describe('prerequisites', () => {
       homeDirectory: os.homedir(),
       runningAsRoot: process.getuid?.() === 0,
       nodePath: '/opt/homebrew/Cellar/node/22.20.0/bin/node',
-      onecliCliPath: PINNED_ONECLI,
       dockerEndpoint: daemon.host,
       rootlessDocker: false,
       account: 'operator@example.com',
@@ -249,7 +201,6 @@ describe('prerequisites', () => {
     expect(host.commands).toEqual([
       'git --version',
       'pnpm --version',
-      'onecli version',
       'docker context inspect',
       'gcloud version --format=json',
       'gcloud auth list --filter=status:ACTIVE --format=value(account)',
@@ -307,46 +258,6 @@ describe('prerequisites', () => {
       details: { program: tool, searched: ['/usr/bin', '/bin'] },
     });
     expect(host.commands.some((command) => command.startsWith('gcloud'))).toBe(false);
-  });
-
-  it("uses gws-ea's own pinned OneCLI CLI, checking its version at create only", async () => {
-    const daemon = await dockerDaemon();
-    const host = fakeHost(daemon.host);
-    host.onecliVersion = '2.0.0';
-
-    await expect(checkPrerequisites(CREATE, operator(host), dependencies(host))).rejects.toMatchObject({
-      code: 'incompatible_onecli',
-      message: expect.stringMatching(new RegExp(`2\\.0\\.0.*${ONECLI_CLI_VERSION.replaceAll('.', '\\.')}`, 'su')),
-    });
-    expect(host.installedOnecli).toEqual([PINNED_ONECLI]);
-
-    host.commands.length = 0;
-    await expect(checkPrerequisites(resume(daemon.host), operator(host), dependencies(host))).resolves.toMatchObject({
-      onecliCliPath: PINNED_ONECLI,
-    });
-    expect(host.commands).not.toContain('onecli version');
-  });
-
-  it("restores gws-ea's copy of an assistant's older CLI from its release pin, and leaves any other CLI alone", async () => {
-    const daemon = await dockerDaemon();
-    const host = fakeHost(daemon.host);
-    const older = PATHS.onecliCliFile('2.1.0');
-    host.missing.add(older);
-    const releaseOnecliCliPin = vi.fn(async () => ({ version: '2.1.0', digests: ONECLI_CLI_ARCHIVE_DIGESTS }));
-
-    await expect(
-      checkPrerequisites(resume(daemon.host, older), operator(host), dependencies(host, { releaseOnecliCliPin })),
-    ).resolves.toMatchObject({ onecliCliPath: older });
-    expect(releaseOnecliCliPin).toHaveBeenCalledWith(CHECKOUT);
-    expect(host.installedOnecli).toEqual([older]);
-
-    // A CLI recorded outside gws-ea's own directory is never replaced; a missing one is named.
-    const shared = '/Users/operator/.local/bin/onecli';
-    host.missing.add(shared);
-    await expect(
-      checkPrerequisites(resume(daemon.host, shared), operator(host), dependencies(host, { releaseOnecliCliPin })),
-    ).rejects.toMatchObject({ code: 'onecli_required' });
-    expect(host.installedOnecli).toEqual([older]);
   });
 
   it('probes the Docker endpoint create recorded on resume, not the active context', async () => {
@@ -581,15 +492,88 @@ describe('Docker endpoint', () => {
   });
 });
 
-describe('OneCLI CLI version', () => {
-  it('reads the recorded `onecli version` answer at create, extra fields and all', async () => {
-    const check = (pinned: string) =>
-      assertInstalledOnecliCli('/usr/local/bin/onecli', pinned, os.tmpdir(), {}, async () => RECORDED_ONECLI_VERSION);
+describe('the state root create accepts', () => {
+  /** What NanoClaw binds under a state root, longest first: `<root>/<instance>/<release>/data/ncl.sock`. */
+  const SOCKET_TAIL = '/12345678/12345678/data/ncl.sock';
 
-    await expect(check(RECORDED_ONECLI_CLI)).resolves.toBeUndefined();
-    await expect(check('2.2.6')).rejects.toMatchObject({
-      code: 'incompatible_onecli',
-      message: expect.stringContaining(`OneCLI CLI ${RECORDED_ONECLI_CLI} does not match the pinned 2.2.6`),
+  /** A state root that does not exist yet, whose socket would be `bytes` long: nothing on its way is a link. */
+  function stateRootOf(bytes: number): string {
+    const base = '/gws-ea-socket-test';
+    return path.join(base, 'r'.repeat(bytes - SOCKET_TAIL.length - base.length - 1));
+  }
+
+  function create(stateRoot: string): PrerequisiteRequest {
+    return { command: 'create', paths: { ...PATHS, stateRoot, logsRoot: path.join(stateRoot, 'logs') } };
+  }
+
+  it.each([
+    ['macOS', 'darwin', 103],
+    ['Linux', 'linux', 107],
+  ] as const)(
+    'refuses on %s a state root whose NanoClaw socket would be one byte too long, naming GWS_EA_STATE_ROOT, before running anything',
+    async (system, platform, limit) => {
+      const host = fakeHost('unix:///var/run/docker.sock');
+      const stateRoot = stateRootOf(limit + 1);
+
+      await expect(
+        checkPrerequisites(create(stateRoot), operator(host), dependencies(host, { platform })),
+      ).rejects.toMatchObject({
+        code: 'state_root_too_long',
+        message: expect.stringMatching(
+          new RegExp(`${limit + 1} bytes, and ${system} allows ${limit}.*GWS_EA_STATE_ROOT`, 'u'),
+        ),
+        details: { stateRoot, socket: `${stateRoot}${SOCKET_TAIL}`, bytes: limit + 1, limit },
+      });
+      expect(host.commands).toEqual([]);
+    },
+  );
+
+  it.each([
+    ['darwin', 103],
+    ['linux', 107],
+  ] as const)('accepts on %s a state root whose socket is exactly as long as allowed', async (platform, limit) => {
+    const daemon = await dockerDaemon();
+    const host = fakeHost(daemon.host);
+
+    await expect(
+      checkPrerequisites(create(stateRootOf(limit)), operator(host), dependencies(host, { platform })),
+    ).resolves.toMatchObject({ dockerEndpoint: daemon.host });
+  });
+
+  it('measures the state root as the kernel sees it, every link on its way resolved', async () => {
+    // Under /tmp: the platform's temporary directory is itself too deep for a socket on macOS.
+    const directory = await realpath(await mkdtemp(path.join('/tmp', 'gws-ea-socket-')));
+    cleanups.push(() => rm(directory, { recursive: true, force: true }));
+    // The written root reaches a deeper folder through a link; resolved, its socket is one byte too long.
+    const deeper = path.join(directory, 'd'.repeat(104 - SOCKET_TAIL.length - directory.length - 1 - '/state'.length));
+    await mkdir(deeper);
+    await symlink(deeper, path.join(directory, 'link'));
+    const written = path.join(directory, 'link', 'state');
+    const host = fakeHost('unix:///var/run/docker.sock');
+
+    expect(Buffer.byteLength(`${written}${SOCKET_TAIL}`)).toBeLessThanOrEqual(103);
+    await expect(
+      checkPrerequisites(create(written), operator(host), dependencies(host, { platform: 'darwin' })),
+    ).rejects.toMatchObject({
+      code: 'state_root_too_long',
+      details: { socket: path.join(deeper, 'state', SOCKET_TAIL), bytes: 104 },
     });
   });
+
+  it.runIf(process.platform === 'darwin' && os.tmpdir().startsWith('/var/'))(
+    'counts a state root under /var as the /private/var it is on macOS',
+    async () => {
+      // As written, its socket fits by one byte to spare; under /private/var it is eight bytes longer.
+      const written = path.join(os.tmpdir(), 'v'.repeat(102 - SOCKET_TAIL.length - os.tmpdir().length - 1));
+      const host = fakeHost('unix:///var/run/docker.sock');
+
+      expect(Buffer.byteLength(`${written}${SOCKET_TAIL}`)).toBe(102);
+      await expect(
+        checkPrerequisites(create(written), operator(host), dependencies(host, { platform: 'darwin' })),
+      ).rejects.toMatchObject({
+        code: 'state_root_too_long',
+        details: { socket: `/private${written}${SOCKET_TAIL}`, bytes: 110 },
+      });
+    },
+  );
 });

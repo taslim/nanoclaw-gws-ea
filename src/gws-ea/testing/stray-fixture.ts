@@ -138,8 +138,7 @@ export async function toolCheckoutWorld(options: { readonly platform?: 'macos' |
     deadlines.push(command.timeoutMs);
     order.push(line);
     if (command.command === 'docker') return docker.run(command.args);
-    // No launchd job is loaded and no host runs from the checkout's dist/.
-    if (command.command === 'launchctl' && command.args[0] === 'print') return { ...failed(''), exitCode: 113 };
+    // No host runs from the checkout's dist/.
     if (command.command === 'pkill' || command.command === 'pgrep') return failed('');
     if (command.command === 'systemctl') return command.args.includes('is-active') ? failed('inactive') : ok();
     throw new Error(`Unexpected command: ${line}`);

@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -6,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { resolveControlPlanePaths } from './paths.js';
-import { allocateInstanceId } from './registry.js';
+
 import { createInstanceRuntimeConfig, reconcileInstanceService, type InstanceRuntimeConfig } from './service.js';
 import {
   createServiceControl,
@@ -40,14 +41,28 @@ const LOADED: NanoclawServiceHandle = {
 const BOOTED_OUT: NanoclawServiceHandle = { ...LOADED, active: false };
 const NOT_INSTALLED: NanoclawServiceHandle = { mode: 'none', active: false };
 const UNMANAGED: NanoclawServiceHandle = { mode: 'unmanaged', active: true, name: '4242' };
+const UNIT = `nanoclaw-v2-${INSTALL_ID}`;
+const SYSTEMD_RUNNING: NanoclawServiceHandle = {
+  mode: 'systemd-user',
+  active: true,
+  name: UNIT,
+  definition: `/home/operator/.config/systemd/user/${UNIT}.service`,
+};
 
 /**
  * NanoClaw's helpers, faked: detection answers from `detections` in turn and
- * then keeps its last answer; every helper call is recorded in order.
+ * then keeps its last answer; every helper call, and every command run
+ * outside them, is recorded in order.
  */
 function nanoclaw(...detections: NanoclawServiceHandle[]) {
   const calls: string[] = [];
-  const runner: NanoclawCommandRunner = { run: () => '', tryRun: () => ({ ok: true, stdout: '' }) };
+  const runner = {
+    run: vi.fn<NanoclawCommandRunner['run']>((command, args) => {
+      calls.push([command, ...args].join(' '));
+      return '';
+    }),
+    tryRun: vi.fn<NanoclawCommandRunner['tryRun']>(() => ({ ok: true, stdout: '' })),
+  } satisfies NanoclawCommandRunner;
   let detected = 0;
   const helpers = {
     createCommandRunner: vi.fn<NanoclawServiceHelpers['createCommandRunner']>(() => runner),
@@ -148,6 +163,136 @@ describe('start', () => {
     await expect(control(helpers).service.start()).resolves.toBe('already-running');
     expect(calls).toEqual(['detect']);
   });
+
+  it.each([
+    ['launchd', LOADED, 'darwin'],
+    ['systemd', SYSTEMD_RUNNING, 'linux'],
+  ] as const)(
+    'verifies a %s host already running after the switch without restarting it',
+    async (_manager, running, platform) => {
+      const { helpers, calls } = nanoclaw(running);
+      const { service } = control(helpers, { platform });
+
+      await expect(service.start({ definitionChanged: false })).resolves.toBe('already-running');
+      await expect(service.verifyHealth()).resolves.toBe(true);
+
+      // No stop, no start, and no command outside NanoClaw's helpers: the serving host is only checked.
+      expect(calls).toEqual(['detect', 'detect', 'health']);
+    },
+  );
+});
+
+describe('start after a changed service definition', () => {
+  it('boots out a job launchd still holds with the stale definition, then bootstraps it from the changed one', async () => {
+    const { helpers, calls } = nanoclaw(LOADED);
+    const { service } = control(helpers);
+
+    await expect(service.start({ definitionChanged: true })).resolves.toBe('started');
+
+    const env = helpers.detectService.mock.calls[0]![1];
+    expect(calls).toEqual(['detect', 'stop', 'start']);
+    expect(helpers.stopService).toHaveBeenCalledExactlyOnceWith(LOADED, env);
+    expect(helpers.startService).toHaveBeenCalledExactlyOnceWith(LOADED, TARGET.checkoutRoot, env);
+  });
+
+  it('bootstraps a booted-out job from the changed definition, with nothing to boot out', async () => {
+    const { helpers, calls } = nanoclaw(BOOTED_OUT);
+
+    await expect(control(helpers).service.start({ definitionChanged: true })).resolves.toBe('started');
+    expect(calls).toEqual(['detect', 'start']);
+  });
+
+  it('never starts a job that did not leave', async () => {
+    const { helpers, calls } = nanoclaw(LOADED);
+    helpers.stopService.mockRejectedValueOnce(new Error(`NanoClaw service ${LABEL} did not stop`));
+
+    await expect(control(helpers).service.start({ definitionChanged: true })).rejects.toMatchObject({
+      code: 'service_still_running',
+    });
+    expect(calls).not.toContain('start');
+  });
+});
+
+describe('start on systemd', () => {
+  /**
+   * systemd holding the unit as start-limit-failed (it failed while an
+   * update's fence hid its paths, after a reboot): `start` is refused until
+   * `reset-failed` clears the failed state.
+   */
+  function startLimitFailed(mode: 'systemd-user' | 'systemd-system') {
+    const fake = nanoclaw({ ...SYSTEMD_RUNNING, mode, active: false });
+    const unit = { failed: true };
+    fake.runner.run.mockImplementation((command, args) => {
+      fake.calls.push([command, ...args].join(' '));
+      if (command === 'systemctl' && args.includes('reset-failed')) unit.failed = false;
+      return '';
+    });
+    fake.helpers.startService.mockImplementation(() => {
+      if (unit.failed) {
+        throw new Error(
+          `Command failed: systemctl start ${UNIT}\nJob for ${UNIT}.service failed because start of the service was attempted too often.`,
+        );
+      }
+      fake.calls.push('start');
+    });
+    return fake;
+  }
+
+  it.each([
+    ['systemd-user', `systemctl --user reset-failed ${UNIT}`],
+    ['systemd-system', `systemctl reset-failed ${UNIT}`],
+  ] as const)('starts a %s unit left start-limit-failed once its failed state is reset', async (mode, reset) => {
+    for (const action of ['start', 'restart'] as const) {
+      const { helpers, calls } = startLimitFailed(mode);
+
+      await expect(control(helpers, { platform: 'linux' }).service[action]()).resolves.toBe('started');
+      expect(calls).toEqual(['detect', reset, 'start']);
+    }
+  });
+
+  it("resets the failed state with the assistant's own command environment", async () => {
+    const { helpers, runner } = startLimitFailed('systemd-user');
+
+    await control(helpers, { platform: 'linux', uid: 1000 }).service.start();
+
+    // The runner NanoClaw's helpers were given, which carries the user bus.
+    expect(helpers.createCommandRunner).toHaveBeenCalledExactlyOnceWith({
+      env: expect.objectContaining({ XDG_RUNTIME_DIR: '/run/user/1000' }),
+    });
+    // Bounded, as a hung user bus would otherwise hold the start with the assistant fenced.
+    expect(runner.run).toHaveBeenCalledWith('systemctl', ['--user', 'reset-failed', UNIT], undefined, {
+      timeoutMs: 30_000,
+    });
+  });
+
+  it('starts a unit systemd has not loaded, which has no failed state to reset', async () => {
+    const { helpers, calls, runner } = nanoclaw({ ...SYSTEMD_RUNNING, active: false });
+    runner.run.mockImplementationOnce(() => {
+      throw new Error(
+        `Command failed: systemctl --user reset-failed ${UNIT}\nFailed to reset failed state of unit ${UNIT}.service: Unit ${UNIT}.service not loaded.`,
+      );
+    });
+
+    await expect(control(helpers, { platform: 'linux' }).service.start()).resolves.toBe('started');
+    expect(calls).toEqual(['detect', 'start']);
+  });
+
+  it("fails the start, keeping systemd's reason, when it cannot reset the failed state", async () => {
+    const { helpers, runner } = nanoclaw({ ...SYSTEMD_RUNNING, active: false });
+    const unreachable = new Error(
+      `Command failed: systemctl --user reset-failed ${UNIT}\nFailed to connect to bus: No such file or directory`,
+    );
+    runner.run.mockImplementationOnce(() => {
+      throw unreachable;
+    });
+
+    await expect(control(helpers, { platform: 'linux' }).service.start()).rejects.toMatchObject({
+      code: 'service_start_failed',
+      message: `NanoClaw's service ${UNIT} did not start: ${unreachable.message}`,
+      cause: unreachable,
+    });
+    expect(helpers.startService).not.toHaveBeenCalled();
+  });
 });
 
 describe('stop', () => {
@@ -183,6 +328,42 @@ describe('stop', () => {
       cause: didNotStop,
     });
     expect(calls).not.toContain('start');
+  });
+});
+
+describe('stop by label', () => {
+  const plist = LOADED.definition!;
+
+  it("stops a launchd job by its label through NanoClaw's stop, though detection, which needs its plist, finds none", async () => {
+    const { helpers, calls, runner } = nanoclaw(NOT_INSTALLED);
+    const { service } = control(helpers);
+
+    await service.stopByLabel(LABEL, plist);
+
+    // The environment every other helper gets: this assistant's home, user, install, and command runner.
+    expect(helpers.stopService).toHaveBeenCalledExactlyOnceWith(
+      { mode: 'launchd', name: LABEL, definition: plist, active: true },
+      expect.objectContaining({
+        platform: 'darwin',
+        home: TARGET.homeDirectory,
+        uid: 501,
+        installSlug: INSTALL_ID,
+        runner,
+      }),
+    );
+    expect(calls).toEqual(['stop']);
+  });
+
+  it("fails, keeping NanoClaw's reason, when the job never leaves", async () => {
+    const { helpers } = nanoclaw(NOT_INSTALLED);
+    const didNotStop = new Error(`NanoClaw service ${LABEL} did not stop (PID 4242).`);
+    helpers.stopService.mockRejectedValueOnce(didNotStop);
+
+    await expect(control(helpers).service.stopByLabel(LABEL, plist)).rejects.toMatchObject({
+      code: 'service_still_running',
+      message: `NanoClaw's service ${LABEL} did not stop: ${didNotStop.message}`,
+      cause: didNotStop,
+    });
   });
 });
 
@@ -254,6 +435,19 @@ describe("NanoClaw's own reasons", () => {
       code: 'service_start_failed',
       message: `NanoClaw's service ${LABEL} did not start: ${refused.message}`,
       cause: refused,
+    });
+  });
+
+  it('keeps what a failed drain says', async () => {
+    const { helpers } = nanoclaw(BOOTED_OUT);
+    const timedOut = new Error('Timed out waiting for NanoClaw containers to stop: 3f2a9c1b7d4e');
+    helpers.drainContainers.mockRejectedValueOnce(timedOut);
+
+    await expect(control(helpers).service.drain()).rejects.toMatchObject({
+      name: 'GwsEaError',
+      code: 'containers_still_running',
+      message: `NanoClaw did not stop the assistant's agent containers: ${timedOut.message}.`,
+      cause: timedOut,
     });
   });
 });
@@ -331,18 +525,18 @@ describe("an assistant's own service coordinates", () => {
       configRoot: path.join(root, 'config'),
       stateRoot: path.join(root, 'state'),
     });
-    const instanceId = allocateInstanceId();
-    const checkout = paths.checkoutRoot(instanceId);
+    const instanceId = randomUUID();
+    const checkout = paths.instanceLayout(instanceId).release('aaaaaaaa');
     await mkdir(path.join(checkout, 'dist', 'gws-ea'), { recursive: true, mode: 0o700 });
     await mkdir(path.join(checkout, 'bin'), { mode: 0o700 });
     await writeFile(path.join(checkout, 'dist', 'index.js'), 'host');
     await writeFile(path.join(checkout, 'dist', 'gws-ea', 'process.js'), 'launcher');
     await writeFile(path.join(checkout, 'bin', 'ncl'), '#!/bin/sh\n', { mode: 0o700 });
+    await symlink('aaaaaaaa', paths.checkoutRoot(instanceId));
     const home = path.join(root, 'home');
     await mkdir(home, { mode: 0o700 });
     const reservation: InstanceReservation = {
       instance_id: instanceId,
-      checkout_realpath: checkout,
       release_track: 'dogfood',
       source_remote: 'https://example.test/nanoclaw.git',
       deployed_commit: 'a'.repeat(40),
@@ -362,10 +556,9 @@ describe("an assistant's own service coordinates", () => {
       project: reservation.exclusive_resource_claims.onecli_project,
       appPort: 31_002,
       gatewayPort: 31_003,
-      cliExecutable: '/usr/local/bin/onecli',
       dockerEndpoint: TARGET.dockerEndpoint,
     });
-    return createInstanceRuntimeConfig(reservation, onecli, {
+    return createInstanceRuntimeConfig(paths, reservation, onecli, {
       nodePath: process.execPath,
       homeDirectory: home,
       selectedProvider: 'claude',
@@ -389,7 +582,7 @@ describe("an assistant's own service coordinates", () => {
         restartService: async () => undefined,
       });
       const definition = await readFile(layout.serviceDefinitionPath, 'utf8');
-      const logs = hostLogFiles(runtime.checkout_realpath);
+      const logs = hostLogFiles(runtime.instance_root);
 
       expect(definition).toContain(logs.output);
       expect(definition).toContain(logs.errors);

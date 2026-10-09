@@ -12,14 +12,19 @@
  * reason; a probe that throws becomes its own result, so one failing
  * observation never hides another. An unfinished update or rollback never
  * stops either command (R16): both show it, with the command that continues
- * or reverts it. Both exit 0 once they observed, whatever the health; an
- * unknown assistant ID exits 1.
+ * or reverts it. Both work in every phase (R9): while a switch has fenced the
+ * assistant they read its `state/` and `logs/` physically, and one on the
+ * layout before releases, or moving off it, is shown by its record with the
+ * update that converts it (KTD11). Both exit 0 once they observed, whatever
+ * the health; an unknown assistant ID exits 1.
  */
 import { createHash } from 'node:crypto';
-import path from 'node:path';
 
 import { errorCode, isErrno } from '../community-portal/errors.js';
+import { getInstallScopedNames } from '../install-slug.js';
 import { formatLocalTime } from '../timezone.js';
+import { taggedImageId } from './agent-image.js';
+import { releaseImageTag } from './agent-image-release.js';
 import { locateAgainstToolRelease, observeLiveCheckout } from './checkout.js';
 import {
   createCloudflareConnectorLayout,
@@ -27,23 +32,19 @@ import {
   type CloudflareConnectorLayout,
   type CloudflareConnectorObservation,
 } from './cloudflare-connector.js';
-import { observeManagedGchatRoute, verifyExistingGchatEndpoint } from './endpoint.js';
+import { observeManagedGchatRoute, verifyExistingGchatRoute } from './endpoint.js';
 import { MAIN_GROUP_NAME } from './identity.js';
 import { readProvisionJournal } from './journal.js';
-import {
-  describeCustomized,
-  inspectMainTemplate,
-  planMainRestamp,
-  type CustomizedTemplateFile,
-  type MainTemplateInspection,
-} from './main-template.js';
 import { runInstanceNclJson } from './ncl.js';
 import { observeOnecliRuntime } from './onecli.js';
+import type { OnecliAgent } from './onecli-admin.js';
 import { observeGoogleConnection, type GoogleConnectionReport } from './google-connection.js';
 import { createOnecliRuntimeLayout, type OnecliPins, type OnecliRuntimeLayout } from './onecli-compose.js';
 import {
+  failedOutcome,
   inspectOperation,
   liveCheckoutCommits,
+  readRollbackPoint,
   type OperationFollowUp,
   type OperationInspection,
   type OperationKind,
@@ -51,16 +52,19 @@ import {
   type OperationRecord,
   type SnapshotManifest,
 } from './operation.js';
-import { CONTROL_PLANE_ROOT, instanceRuntimeFile, isRegularFile, type ControlPlanePaths } from './paths.js';
+import { CONTROL_PLANE_ROOT, isRegularFile, type ControlPlanePaths } from './paths.js';
 import type { Observation } from './phases.js';
-import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
+import { buildToolEnvironment, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { readDeployedSetup } from './provision.js';
 import { redact, safeErrorMessage } from './redact.js';
 import { assertInstanceId, readRegistry } from './registry.js';
-import { readKeptPreviousRelease, sameSchema } from './rollback.js';
+import { isConverting, legacyInstanceRoot } from './release-convert.js';
+import { readCurrent } from './release-layout.js';
+import { sameSchema } from './rollback.js';
 import {
+  hostLogFiles,
+  instanceOnecliAdmin,
   loadInstanceRuntimeConfig,
-  runInstanceOnecliAdminCommand,
   type HostStatusHelpers,
   type InstanceRuntimeConfig,
 } from './service.js';
@@ -79,7 +83,7 @@ import {
   type InstanceReservation,
   type ReleaseCoordinates,
 } from './types.js';
-import { isRecord, optionalString, parseJson, unwrapData } from './validation.js';
+import { isRecord, optionalString, unwrapData } from './validation.js';
 import {
   readLatestDelivery,
   readSchemaManifest,
@@ -101,6 +105,7 @@ const UNOBSERVABLE_CODES: ReadonlySet<string> = new Set([
   'command_timeout',
   'command_output_limit',
   'service_unobservable',
+  'onecli_request_failed',
 ]);
 
 /** `ok`: observed healthy; `degraded`: observed something wrong; `unknown`: could not observe. */
@@ -125,6 +130,10 @@ export interface DeliveryView {
 /** The facts a probe reports beside its status; each is null when it could not observe them. */
 export interface CheckoutFacts {
   readonly commit: string | null;
+}
+export interface ImageFacts {
+  /** The live release's tag, `<base>:r-<release>`. */
+  readonly tag: string | null;
 }
 export interface ServiceFacts {
   readonly state: ServiceState;
@@ -164,6 +173,8 @@ export interface WorkspaceFacts {
 export interface AssistantProbes {
   /** The live checkout agrees with its record: marker, detached commit, no tracked changes. */
   readonly checkout: ProbeResult & CheckoutFacts;
+  /** The live release's own agent image, which its host runs agents on (KTD6). */
+  readonly image: ProbeResult & ImageFacts;
   /** The host's service, as NanoClaw's own service helpers detect it. */
   readonly service: ProbeResult & ServiceFacts;
   /** The host's own status over its CLI socket: webhook open, Google Chat connected. */
@@ -193,6 +204,7 @@ export interface AssistantProbes {
 
 export const PROBE_NAMES = [
   'checkout',
+  'image',
   'service',
   'host',
   'onecli',
@@ -217,22 +229,42 @@ interface OperationRecordFacts {
 
 /** An assistant's update or rollback, as the operation record and the registry show it. */
 export type OperationView =
-  | { readonly state: 'none'; readonly abandoned_staging: boolean }
+  | { readonly state: 'none' }
   | ({ readonly state: 'open' } & OperationRecordFacts & {
         readonly continue_with: string;
         readonly revert_with: string | null;
       })
-  | ({ readonly state: 'recorded' } & OperationRecordFacts & {
+  | ({ readonly state: 'failed' } & OperationRecordFacts & {
+        readonly continue_with: string;
+        readonly revert_with: string | null;
+        /** How it failed, after the word "failed" (`failedOutcome`). */
+        readonly outcome: string;
+      })
+  | ({ readonly state: 'committed' } & OperationRecordFacts & {
         readonly follow_ups: readonly OperationFollowUp[];
-        readonly abandoned_staging: boolean;
       })
   | { readonly state: 'unreadable'; readonly code: string; readonly message: string };
+
+/**
+ * Where the assistant stands between releases and layouts (R9): `live` while
+ * the live link names a release; `fenced` while a switch has removed it, so
+ * nothing can start the host; `converting` while its one-time conversion to
+ * the release layout is under way; `legacy` while it is still on the layout
+ * before releases; `unknown` when that cannot be read.
+ */
+export type PhaseView =
+  | { readonly state: 'live'; readonly release: string }
+  | { readonly state: 'fenced' }
+  | { readonly state: 'converting'; readonly continue_with: string }
+  | { readonly state: 'legacy'; readonly convert_with: string }
+  | { readonly state: 'unknown'; readonly reason: string };
 
 export interface ListedAssistant {
   readonly instance_id: string;
   readonly hostname: string;
   readonly track: string;
   readonly deployed_commit: string;
+  readonly phase: PhaseView;
   /** Whether the tool's release is ahead of it, as `status` reports it. */
   readonly release: ReleaseView;
   readonly service: { readonly state: ServiceState; readonly reason: string | null };
@@ -271,20 +303,6 @@ export interface RollbackView {
   readonly reason: string | null;
 }
 
-export type { CustomizedTemplateFile } from './main-template.js';
-
-export interface TemplatesView {
-  /**
-   * What of main's template is customized, which updates keep (R11): its
-   * files, compared with what the plugin it was stamped from stamps, and the
-   * skills, MCP servers, and tasks NanoClaw's restamp plan flags. Null when
-   * unknown.
-   */
-  readonly customized: readonly CustomizedTemplateFile[] | null;
-  /** Why the list is unknown, or what it leaves out; null when it is whole. */
-  readonly reason: string | null;
-}
-
 export interface SchemaView {
   readonly central_fingerprint: string | null;
   readonly session_fingerprint: string | null;
@@ -292,18 +310,29 @@ export interface SchemaView {
   readonly reason: string | null;
 }
 
-export interface AssistantStatus {
+/**
+ * What `status` shows of every assistant. One whose state is not all in its
+ * own root yet, on the layout before releases or moving off it, is shown by
+ * this alone: none of the observers would find what they read.
+ */
+export interface AssistantRecordStatus {
   readonly instance_id: string;
   readonly observed_at: string;
+  readonly phase: PhaseView;
   readonly registry: RegistryView;
   readonly operation: OperationView;
   readonly removal_in_progress: boolean;
   readonly release: ReleaseView;
+}
+
+/** An assistant whose state is all in its own root, observed through every probe. */
+export interface ObservedAssistantStatus extends AssistantRecordStatus {
   readonly rollback: RollbackView;
-  readonly templates: TemplatesView;
   readonly schema: SchemaView;
   readonly probes: AssistantProbes;
 }
+
+export type AssistantStatus = AssistantRecordStatus | ObservedAssistantStatus;
 
 /** The boundaries `status` observes through; each defaults to the real one. */
 export interface StatusObservers {
@@ -313,19 +342,17 @@ export interface StatusObservers {
   readonly fetch?: typeof globalThis.fetch;
   /** `ncl <args> --json` through the assistant's own host. */
   readonly ncl: (runtime: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
-  /** The assistant's OneCLI CLI, with the instance-held admin key. */
-  readonly onecliAdmin: (runtime: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
+  /** The assistant's OneCLI agents, as its OneCLI lists them to the instance-held admin key. */
+  readonly onecliAgents: (runtime: InstanceRuntimeConfig) => Promise<readonly OnecliAgent[]>;
   readonly onecli: (layout: OnecliRuntimeLayout, pins: OnecliPins) => Promise<Observation>;
   readonly connector: (
     layout: CloudflareConnectorLayout,
     dockerEndpoint: string,
   ) => Promise<CloudflareConnectorObservation>;
   readonly principalBinding: (input: PrincipalBindingVerificationInput) => PrincipalBindingVerificationResult;
-  /** The schema a checkout's databases record. */
-  readonly schema: (checkoutRoot: string) => SnapshotManifest;
-  readonly delivery: (checkoutRoot: string) => LatestDelivery | undefined;
-  /** Main's template files in a checkout, compared with the plugin they were stamped from. */
-  readonly mainTemplate: (checkoutRoot: string) => Promise<MainTemplateInspection>;
+  /** The schema the databases under a `data`-holding root record: the physical `state/`, or a kept release. */
+  readonly schema: (stateRoot: string) => SnapshotManifest;
+  readonly delivery: (stateRoot: string) => LatestDelivery | undefined;
   /** The assistant's Google connection, observed without changing it. */
   readonly google: (runtime: InstanceRuntimeConfig, declaredEmail: string) => Promise<GoogleConnectionReport>;
 }
@@ -395,17 +422,9 @@ function resolveObservers(overrides: Partial<StatusObservers> = {}): StatusObser
     runCommand,
     ...(overrides.fetch ? { fetch: overrides.fetch } : {}),
     ncl: overrides.ncl ?? runInstanceNclJson,
-    onecliAdmin:
-      overrides.onecliAdmin ??
-      (async (runtime, args) =>
-        parseJson(
-          (await runInstanceOnecliAdminCommand(runtime, args, { runCommand })).stdout,
-          'OneCLI output',
-          'invalid_child_output',
-        )),
+    onecliAgents: overrides.onecliAgents ?? (async (runtime) => (await instanceOnecliAdmin(runtime)).listAgents()),
     onecli:
-      overrides.onecli ??
-      ((layout, pins) => observeOnecliRuntime(layout, pins, { dockerCommandRunner: runCommand, runCommand })),
+      overrides.onecli ?? ((layout, pins) => observeOnecliRuntime(layout, pins, { dockerCommandRunner: runCommand })),
     connector:
       overrides.connector ??
       ((layout, dockerEndpoint) => observeCloudflareConnector(layout, { runCommand, dockerEndpoint })),
@@ -416,7 +435,6 @@ function resolveObservers(overrides: Partial<StatusObservers> = {}): StatusObser
         observeGoogleConnection(runtime, declaredEmail, overrides.fetch ? { fetch: overrides.fetch } : {})),
     schema: overrides.schema ?? readSchemaManifest,
     delivery: overrides.delivery ?? readLatestDelivery,
-    mainTemplate: overrides.mainTemplate ?? inspectMainTemplate,
   };
 }
 
@@ -426,33 +444,16 @@ type RuntimeRecord =
   | { readonly state: 'missing'; readonly why: string }
   | { readonly state: 'unreadable'; readonly error: unknown };
 
-/** Where an unfinished update or rollback may have the live checkout moved aside, or not yet in place. */
-const SWITCHING: ReadonlySet<OperationPhase> = new Set(['swapping', 'swapped']);
+/** Why the assistant's `state/` holds no runtime record: its create never got as far as its host. */
+const MISSING_RUNTIME = 'The assistant has no runtime record: its host has never been started.';
 
-/**
- * Why the live checkout holds no runtime record: an update or rollback is
- * switching releases (or a rollback going back is), or the host has never
- * been started.
- */
-function missingRuntime(inspection: OperationInspection): string {
-  if (inspection.state === 'open' && (SWITCHING.has(inspection.record.phase) || inspection.record.returning)) {
-    return `The assistant is mid-switch; ${inspection.next.continueWith} finishes it.`;
-  }
-  return 'The assistant has no runtime record: its host has never been started.';
-}
-
-async function readRuntimeRecord(
-  reservation: InstanceReservation,
-  inspection: OperationInspection,
-): Promise<RuntimeRecord> {
+async function readRuntimeRecord(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<RuntimeRecord> {
   try {
-    const file = instanceRuntimeFile(reservation.checkout_realpath);
+    const file = paths.runtimeFile(reservation.instance_id);
     return { state: 'recorded', config: await loadInstanceRuntimeConfig(file) };
     // eslint-disable-next-line no-catch-all/no-catch-all -- An unreadable runtime is reported by each probe that needs it.
   } catch (error) {
-    return isErrno(error, 'ENOENT')
-      ? { state: 'missing', why: missingRuntime(inspection) }
-      : { state: 'unreadable', error };
+    return isErrno(error, 'ENOENT') ? { state: 'missing', why: MISSING_RUNTIME } : { state: 'unreadable', error };
   }
 }
 
@@ -491,7 +492,7 @@ function operationFacts(record: OperationRecord): OperationRecordFacts {
 function operationView(inspection: OperationInspection): OperationView {
   switch (inspection.state) {
     case 'none':
-      return { state: 'none', abandoned_staging: inspection.abandonedStaging };
+      return { state: 'none' };
     case 'open':
       return {
         state: 'open',
@@ -499,12 +500,19 @@ function operationView(inspection: OperationInspection): OperationView {
         continue_with: inspection.next.continueWith,
         revert_with: inspection.next.revertWith ?? null,
       };
-    case 'recorded':
+    case 'failed':
       return {
-        state: 'recorded',
+        state: 'failed',
+        ...operationFacts(inspection.record),
+        continue_with: inspection.next.continueWith,
+        revert_with: inspection.next.revertWith ?? null,
+        outcome: failedOutcome(inspection.record),
+      };
+    case 'committed':
+      return {
+        state: 'committed',
         ...operationFacts(inspection.record),
         follow_ups: inspection.record.follow_ups,
-        abandoned_staging: inspection.abandonedStaging,
       };
     case 'unreadable':
       return { state: 'unreadable', code: inspection.code, message: redact(inspection.message) };
@@ -568,6 +576,56 @@ function removalInProgress(paths: ControlPlanePaths, instanceId: string): Promis
   return isRegularFile(paths.removalFile(instanceId));
 }
 
+/** Whether the assistant's state is all in its own root: false on the layout before releases, or moving off it. */
+function inOwnRoot(paths: ControlPlanePaths, reservation: InstanceReservation): boolean {
+  return legacyInstanceRoot(paths, reservation) === undefined;
+}
+
+/** The release the assistant's live link names, read at most once however many observations of it ask. */
+function liveRelease(paths: ControlPlanePaths, instanceId: string): () => Promise<string | undefined> {
+  return once(() => readCurrent(paths.instanceLayout(instanceId)));
+}
+
+/** Where the assistant stands between releases and layouts, read physically, never through the live link. */
+async function observePhase(
+  paths: ControlPlanePaths,
+  reservation: InstanceReservation,
+  inspection: OperationInspection,
+  current: () => Promise<string | undefined>,
+): Promise<PhaseView> {
+  const id = reservation.instance_id;
+  const update = `gws-ea update --id ${id}`;
+  try {
+    // Only its converted release failing verification closes a conversion's update as failed: that release is live,
+    // and the failed operation names the update that fixes it forward (KTD12).
+    if (inspection.state !== 'failed' && (await isConverting(paths, id))) {
+      return { state: 'converting', continue_with: update };
+    }
+    if (!inOwnRoot(paths, reservation)) return { state: 'legacy', convert_with: update };
+    const live = await current();
+    return live === undefined ? { state: 'fenced' } : { state: 'live', release: live };
+    // eslint-disable-next-line no-catch-all/no-catch-all -- A phase that cannot be read is reported, never thrown.
+  } catch (error) {
+    return { state: 'unknown', reason: failure(error).reason ?? '' };
+  }
+}
+
+/** What an operator is told of the assistant's phase, naming what moves it on where a command does. */
+function phaseDetail(phase: PhaseView): string {
+  switch (phase.state) {
+    case 'live':
+      return `Release ${phase.release} is live.`;
+    case 'fenced':
+      return 'No release is live: a switch has fenced it, so nothing can start its host.';
+    case 'converting':
+      return `Its conversion to the release layout is unfinished; continue it with ${phase.continue_with}.`;
+    case 'legacy':
+      return `It is on the legacy layout: run ${phase.convert_with} to convert it.`;
+    case 'unknown':
+      return `Which release is live cannot be read: ${phase.reason}`;
+  }
+}
+
 /** Everything one status observation shares, read once. */
 interface Subject {
   readonly context: ObservationContext;
@@ -575,6 +633,8 @@ interface Subject {
   readonly reservation: InstanceReservation;
   readonly inspection: OperationInspection;
   readonly runtime: RuntimeRecord;
+  /** The live release, the one read the phase also reports. */
+  readonly current: () => Promise<string | undefined>;
 }
 
 function fromObservation(seen: Observation): ProbeResult {
@@ -590,10 +650,15 @@ function fromObservation(seen: Observation): ProbeResult {
   }
 }
 
-async function checkoutProbe({ reservation, inspection, observers }: Subject): Promise<ProbeResult & CheckoutFacts> {
-  const record = inspection.state === 'open' ? inspection.record : undefined;
+async function checkoutProbe({
+  context,
+  reservation,
+  inspection,
+  observers,
+}: Subject): Promise<ProbeResult & CheckoutFacts> {
+  const record = inspection.state === 'open' || inspection.state === 'failed' ? inspection.record : undefined;
   try {
-    const commit = await observeLiveCheckout(reservation, liveCheckoutCommits(reservation, record), {
+    const commit = await observeLiveCheckout(context.paths, reservation, liveCheckoutCommits(reservation, record), {
       runCommand: observers.runCommand,
     });
     return { ...OK, commit };
@@ -603,10 +668,27 @@ async function checkoutProbe({ reservation, inspection, observers }: Subject): P
   }
 }
 
-/** Upstream's messages name the checkout-relative error log; point at this assistant's. */
-function hostFailure(error: unknown, checkoutRoot: string): string {
+/** The live release's own agent image, `<base>:r-<release>`, which its host runs agents on (KTD6). */
+async function imageProbe({ runtime: record, observers, current }: Subject): Promise<ProbeResult & ImageFacts> {
+  const runtime = requireRuntime(record);
+  const live = await current();
+  if (live === undefined) throw new Unobservable('No release is live, so no agent image is in use.');
+  const tag = releaseImageTag(getInstallScopedNames(runtime.install_id).containerImageBase, live);
+  const docker = {
+    run: observers.runCommand,
+    cwd: CONTROL_PLANE_ROOT,
+    env: buildToolEnvironment(process.env, { DOCKER_HOST: runtime.docker_endpoint }),
+  };
+  if ((await taggedImageId(docker, tag)) === undefined) {
+    return { status: 'degraded', reason: `Its agent image ${tag} is missing, so no agent can start.`, tag };
+  }
+  return { ...OK, tag };
+}
+
+/** Upstream's messages name the checkout-relative error log; point at this assistant's physical one. */
+function hostFailure(error: unknown, instanceRoot: string): string {
   const message = error instanceof Error ? error.message : String(error);
-  return redact(message.replaceAll('logs/nanoclaw.error.log', path.join(checkoutRoot, 'logs', 'nanoclaw.error.log')));
+  return redact(message.replaceAll('logs/nanoclaw.error.log', hostLogFiles(instanceRoot).errors));
 }
 
 /** The host's own status over its CLI socket, which answers only for this checkout (upstream `queryHost`). */
@@ -614,12 +696,12 @@ async function hostProbe({ context, reservation }: Subject): Promise<ProbeResult
   if (!context.hostStatus) throw new Unobservable(`${LAUNCHER_REQUIRED}'s host status helpers.`);
   let status: unknown;
   try {
-    status = await context.hostStatus.queryHost(reservation.checkout_realpath);
+    status = await context.hostStatus.queryHost(context.paths.checkoutRoot(reservation.instance_id));
     // eslint-disable-next-line no-catch-all/no-catch-all -- Upstream queryHost reports every failure as a plain Error meaning the host is not answering.
   } catch (error) {
     return {
       status: 'degraded',
-      reason: `The host is unreachable: ${hostFailure(error, reservation.checkout_realpath)}`,
+      reason: `The host is unreachable: ${hostFailure(error, context.paths.instanceRoot(reservation.instance_id))}`,
     };
   }
   const webhook = isRecord(status) ? status.webhook : undefined;
@@ -642,30 +724,21 @@ async function hostProbe({ context, reservation }: Subject): Promise<ProbeResult
 }
 
 /**
- * OneCLI at the pins the live release's receipt records and the images its own
- * Compose file names (KTD6); mid-update that receipt may be the release the
- * update placed live (KTD17).
+ * OneCLI at the pins the receipt of the release the registry records holds,
+ * and the images its own Compose file names (KTD6).
  */
-async function onecliProbe({
-  context,
-  reservation,
-  inspection,
-  runtime: record,
-  observers,
-}: Subject): Promise<ProbeResult> {
+async function onecliProbe({ context, reservation, runtime: record, observers }: Subject): Promise<ProbeResult> {
   const runtime = requireRuntime(record);
-  const open = inspection.state === 'open' ? inspection.record : undefined;
-  const setup = await readDeployedSetup(context.paths, reservation, liveCheckoutCommits(reservation, open));
+  const setup = await readDeployedSetup(context.paths, reservation);
   const layout = createOnecliRuntimeLayout({
     instanceId: reservation.instance_id,
     instanceRoot: context.paths.instanceRoot(reservation.instance_id),
     project: reservation.exclusive_resource_claims.onecli_project,
     appPort: reservation.allocated_ports.onecli_app,
     gatewayPort: reservation.allocated_ports.onecli_gateway,
-    cliExecutable: runtime.onecli_cli_path,
     dockerEndpoint: runtime.docker_endpoint,
   });
-  return fromObservation(await observers.onecli(layout, { gateway: setup.onecli.gateway, cli: setup.onecli.cli }));
+  return fromObservation(await observers.onecli(layout, { gateway: setup.onecli.gateway }));
 }
 
 /** Main's agent group ID, as the profile the running host serves names it. */
@@ -678,19 +751,15 @@ async function publishedMain({ runtime: record, observers }: Subject): Promise<s
 }
 
 /** The assistant's OneCLI agents, as its own OneCLI lists them. */
-async function onecliAgents({ runtime: record, observers }: Subject): Promise<readonly Record<string, unknown>[]> {
-  const agents = unwrapData(await observers.onecliAdmin(requireRuntime(record), ['agents', 'list', '--max', '0']));
-  if (!Array.isArray(agents) || !agents.every(isRecord)) {
-    throw new GwsEaError('invalid_child_output', 'OneCLI returned an invalid agent list');
-  }
-  return agents;
+function onecliAgents({ runtime: record, observers }: Subject): Promise<readonly OnecliAgent[]> {
+  return observers.onecliAgents(requireRuntime(record));
 }
 
 /** Main as published, on the assistant's provider, with its OneCLI agent granted every secret. */
 async function mainIdentityProbe(
   subject: Subject,
   main: () => Promise<string>,
-  listAgents: () => Promise<readonly Record<string, unknown>[]>,
+  listAgents: () => Promise<readonly OnecliAgent[]>,
 ): Promise<ProbeResult & MainIdentityFacts> {
   const runtime = requireRuntime(subject.runtime);
   const { ncl } = subject.observers;
@@ -717,7 +786,7 @@ async function mainIdentityProbe(
   if (matching.length > 1) return degraded('Several OneCLI agents claim main.');
   if (agent.name !== MAIN_GROUP_NAME) return degraded("Main's OneCLI agent is not named main.");
   if (agent.secretMode !== 'all') {
-    return degraded(`Main's OneCLI agent is granted ${optionalString(agent.secretMode) ?? 'no'} secrets, not all.`);
+    return degraded(`Main's OneCLI agent is granted ${agent.secretMode} secrets, not all.`);
   }
   return { ...OK, agent_group_id: agentGroupId };
 }
@@ -842,7 +911,10 @@ async function principalProbe({ context, reservation, observers }: Subject): Pro
   const candidate = journal.decisions.principal;
   if (!candidate) return { status: 'degraded', reason: 'No principal conversation is bound yet.' };
   const result = observers.principalBinding({
-    runtime: { checkout_realpath: reservation.checkout_realpath, instance_id: reservation.instance_id },
+    runtime: {
+      state_root: context.paths.instanceLayout(reservation.instance_id).state,
+      instance_id: reservation.instance_id,
+    },
     adapterInstance: ADAPTER_INSTANCE,
     provisioningStartedAt: journal.started_at,
     selectedCandidate: candidate,
@@ -860,10 +932,7 @@ async function routeProbe({ reservation, observers }: Subject): Promise<ProbeRes
   const ingress = reservation.exclusive_resource_claims.ingress;
   const dependencies = observers.fetch ? { fetch: observers.fetch } : {};
   if (ingress.mode === 'existing') {
-    await verifyExistingGchatEndpoint(
-      { endpointUrl: ingress.endpoint_url, audienceUrl: ingress.endpoint_url },
-      dependencies,
-    );
+    await verifyExistingGchatRoute({ endpointUrl: ingress.endpoint_url }, dependencies);
     return OK;
   }
   const seen = await observeManagedGchatRoute(
@@ -888,8 +957,8 @@ async function connectorProbe({ context, runtime: record, observers }: Subject):
 }
 
 /** Main's latest delivery result, and the replies the host is still retrying. */
-async function deliveryProbe({ reservation, observers }: Subject): Promise<ProbeResult & DeliveryFacts> {
-  const seen = observers.delivery(reservation.checkout_realpath);
+async function deliveryProbe({ context, reservation, observers }: Subject): Promise<ProbeResult & DeliveryFacts> {
+  const seen = observers.delivery(context.paths.instanceLayout(reservation.instance_id).state);
   if (!seen) return { status: 'unknown', reason: 'Main is not published yet.', last: null, retrying: null };
   const facts: DeliveryFacts = {
     last: seen.last ? { status: seen.last.status, message_out_id: seen.last.messageOutId, at: seen.last.at } : null,
@@ -951,9 +1020,9 @@ async function observeRelease({
 
 type SchemaRead = { readonly manifest: SnapshotManifest } | { readonly error: unknown };
 
-function readSchema(observers: StatusObservers, checkoutRoot: string): SchemaRead {
+function readSchema(observers: StatusObservers, stateRoot: string): SchemaRead {
   try {
-    return { manifest: observers.schema(checkoutRoot) };
+    return { manifest: observers.schema(stateRoot) };
     // eslint-disable-next-line no-catch-all/no-catch-all -- A schema that cannot be read is reported, never thrown.
   } catch (error) {
     return { error };
@@ -995,67 +1064,36 @@ function schemaView(read: SchemaRead): SchemaView {
 }
 
 /**
- * The kept previous release, and whether either schema moved since it (R13,
- * R15), decided as `rollback` decides it. It is available exactly when
- * `rollback` would take it: kept whole, with its manifest naming this
- * assistant and its marker's release.
+ * The rollback point, and whether either schema moved since its snapshot
+ * (R3), decided as `rollback` decides it, from the schema the rollback point
+ * records. It is available exactly when the assistant has one.
  */
-async function observeRollback({ context, reservation, observers }: Subject, live: SchemaRead): Promise<RollbackView> {
-  const previous = context.paths.releaseCheckoutRoot(reservation.instance_id, 'previous');
-  let commit: string;
+async function observeRollback({ context, reservation }: Subject, live: SchemaRead): Promise<RollbackView> {
+  let point;
   try {
-    commit = (await readKeptPreviousRelease(context.paths, reservation.instance_id)).release.deployed_commit;
-    // eslint-disable-next-line no-catch-all/no-catch-all -- A previous release that cannot be read is reported, never thrown.
+    point = await readRollbackPoint(context.paths, reservation.instance_id);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- A rollback point that cannot be read is reported, never thrown.
   } catch (error) {
     return { available: false, previous_commit: null, schema_moved: null, reason: failure(error).reason };
   }
-  const unknownMove = (error: unknown): RollbackView => ({
-    available: true,
-    previous_commit: commit,
-    schema_moved: null,
-    reason: failure(error).reason,
-  });
-  if ('error' in live) return unknownMove(live.error);
-  const kept = readSchema(observers, previous);
-  if ('error' in kept) return unknownMove(kept.error);
+  if (!point) {
+    return {
+      available: false,
+      previous_commit: null,
+      schema_moved: null,
+      reason: `Assistant ${reservation.instance_id} keeps no rollback point, so there is nothing to roll back to.`,
+    };
+  }
+  const commit = point.release.deployed_commit;
+  if ('error' in live) {
+    return { available: true, previous_commit: commit, schema_moved: null, reason: failure(live.error).reason };
+  }
   return {
     available: true,
     previous_commit: commit,
-    schema_moved: sameSchema(live.manifest, kept.manifest) !== 'same',
+    schema_moved: sameSchema(live.manifest, point.manifest) !== 'same',
     reason: null,
   };
-}
-
-/**
- * What of main's template the operator customized, which updates keep (R11):
- * its files, read from main's folder whether or not the host runs, and the
- * skills, MCP servers, and tasks NanoClaw's restamp plan flags, which only
- * the running host can plan. Planned with the group named and without
- * `--yes`, the restamp only plans: nothing is stamped or changed.
- */
-async function observeTemplates(subject: Subject, main: () => Promise<string>): Promise<TemplatesView> {
-  let files: readonly CustomizedTemplateFile[];
-  try {
-    const inspected = await subject.observers.mainTemplate(subject.reservation.checkout_realpath);
-    if (inspected.kind === 'not_stamped') return { customized: null, reason: sentence(inspected.reason) };
-    files = inspected.customized;
-    // eslint-disable-next-line no-catch-all/no-catch-all -- Customization that cannot be observed is reported, never thrown.
-  } catch (error) {
-    return { customized: null, reason: failure(error).reason };
-  }
-  try {
-    const runtime = requireRuntime(subject.runtime);
-    return {
-      customized: [...files, ...(await planMainRestamp(runtime, await main(), subject.observers.ncl))],
-      reason: null,
-    };
-    // eslint-disable-next-line no-catch-all/no-catch-all -- What the host cannot plan is reported beside the files it read.
-  } catch (error) {
-    return {
-      customized: files,
-      reason: `Only its files were compared; its skills, MCP servers, and tasks were not: ${failure(error).reason ?? 'unknown'}`,
-    };
-  }
 }
 
 /** Run `observe` once, however many probes ask for its result. */
@@ -1080,17 +1118,40 @@ export async function observeAssistantStatus(
   const observedAt = (context.now ?? (() => new Date()))().toISOString();
   const observers = resolveObservers(context.observers);
   const inspection = await inspect(context.paths, reservation);
-  const [runtime, removal] = await Promise.all([
-    readRuntimeRecord(reservation, inspection),
+  const current = liveRelease(context.paths, reservation.instance_id);
+  const [phase, removal, release] = await Promise.all([
+    observePhase(context.paths, reservation, inspection, current),
     removalInProgress(context.paths, instanceId),
+    observeRelease({ context, reservation, observers }),
   ]);
-  const subject: Subject = { context, observers, reservation, inspection, runtime };
+  const ingress = reservation.exclusive_resource_claims.ingress;
+  const record: AssistantRecordStatus = {
+    instance_id: reservation.instance_id,
+    observed_at: observedAt,
+    phase,
+    registry: {
+      hostname: hostnameOf(ingress),
+      endpoint_url: ingressEndpointUrl(ingress),
+      ingress_mode: ingress.mode,
+      track: reservation.release_track,
+      source_remote: reservation.source_remote,
+      deployed_commit: reservation.deployed_commit,
+    },
+    operation: operationView(inspection),
+    removal_in_progress: removal,
+    release,
+  };
+  if (!inOwnRoot(context.paths, reservation)) return record;
+
+  const runtime = await readRuntimeRecord(context.paths, reservation);
+  const subject: Subject = { context, observers, reservation, inspection, runtime, current };
   const main = once(() => publishedMain(subject));
   const agents = once(() => onecliAgents(subject));
-  const live = readSchema(observers, reservation.checkout_realpath);
-  const managed = reservation.exclusive_resource_claims.ingress.mode === 'managed-cloudflare';
+  const live = readSchema(observers, context.paths.instanceLayout(instanceId).state);
+  const managed = ingress.mode === 'managed-cloudflare';
   const [
     checkout,
+    image,
     service,
     host,
     onecli,
@@ -1102,11 +1163,10 @@ export async function observeAssistantStatus(
     route,
     connector,
     delivery,
-    release,
     rollback,
-    templates,
   ] = await Promise.all([
     probe<CheckoutFacts>(() => checkoutProbe(subject), { commit: null }),
+    probe<ImageFacts>(() => imageProbe(subject), { tag: null }),
     observeService(context, runtime),
     probe(() => hostProbe(subject), {}),
     probe(() => onecliProbe(subject), {}),
@@ -1123,30 +1183,15 @@ export async function observeAssistantStatus(
     probe(() => routeProbe(subject), {}),
     managed ? probe<ConnectorFacts>(() => connectorProbe(subject), { drift: null }) : undefined,
     probe<DeliveryFacts>(() => deliveryProbe(subject), { last: null, retrying: null }),
-    observeRelease(subject),
     observeRollback(subject, live),
-    observeTemplates(subject, main),
   ]);
-  const ingress = reservation.exclusive_resource_claims.ingress;
   return {
-    instance_id: reservation.instance_id,
-    observed_at: observedAt,
-    registry: {
-      hostname: hostnameOf(ingress),
-      endpoint_url: ingressEndpointUrl(ingress),
-      ingress_mode: ingress.mode,
-      track: reservation.release_track,
-      source_remote: reservation.source_remote,
-      deployed_commit: reservation.deployed_commit,
-    },
-    operation: operationView(inspection),
-    removal_in_progress: removal,
-    release,
+    ...record,
     rollback,
-    templates,
     schema: schemaView(live),
     probes: {
       checkout,
+      image,
       service,
       host,
       onecli,
@@ -1165,6 +1210,8 @@ export async function observeAssistantStatus(
 /**
  * Every registered assistant, from local state only (R1): the registry, cheap
  * service detection, and where each stands against the tool's own release.
+ * An assistant whose state is not all in its own root yet has no runtime
+ * record there to find its service by.
  */
 export async function listAssistants(context: ObservationContext): Promise<AssistantListing> {
   const registry = await readRegistry(context.paths);
@@ -1178,17 +1225,21 @@ export async function listAssistants(context: ObservationContext): Promise<Assis
   const assistants = await Promise.all(
     reservations.map(async (reservation): Promise<ListedAssistant> => {
       const inspection = await inspect(context.paths, reservation);
-      const [runtime, removal, release] = await Promise.all([
-        readRuntimeRecord(reservation, inspection),
+      const [phase, removal, release, observed] = await Promise.all([
+        observePhase(context.paths, reservation, inspection, liveRelease(context.paths, reservation.instance_id)),
         removalInProgress(context.paths, reservation.instance_id),
         observeRelease({ context, reservation, observers }),
+        inOwnRoot(context.paths, reservation)
+          ? readRuntimeRecord(context.paths, reservation).then((runtime) => observeService(context, runtime))
+          : undefined,
       ]);
-      const service = await observeService(context, runtime);
+      const service = observed ?? { state: 'unknown' as const, reason: phaseDetail(phase) };
       return {
         instance_id: reservation.instance_id,
         hostname: hostnameOf(reservation.exclusive_resource_claims.ingress),
         track: reservation.release_track,
         deployed_commit: reservation.deployed_commit,
+        phase,
         release,
         service: { state: service.state, reason: service.reason },
         operation: operationView(inspection),
@@ -1202,10 +1253,12 @@ export async function listAssistants(context: ObservationContext): Promise<Assis
 function operationSummary(operation: OperationView): string {
   switch (operation.state) {
     case 'none':
-      return operation.abandoned_staging ? 'staging left' : '-';
+      return '-';
     case 'open':
       return `${operation.kind} ${operation.phase}`;
-    case 'recorded':
+    case 'failed':
+      return `${operation.kind} failed`;
+    case 'committed':
       return 'follow-ups';
     case 'unreadable':
       return 'unreadable';
@@ -1214,11 +1267,11 @@ function operationSummary(operation: OperationView): string {
 
 /**
  * What an operator is told of an update or rollback left unfinished, naming
- * what continues or reverts it, or of a record that cannot be read: `status`,
- * `list`, and `update --all` word it alike.
+ * what continues or reverts it, of one closed for fix-forward, or of a record
+ * that cannot be read: `status`, `list`, and `update --all` word it alike.
  */
 export function unfinishedOperation(
-  operation: Extract<OperationView, { readonly state: 'open' | 'unreadable' }>,
+  operation: Extract<OperationView, { readonly state: 'open' | 'failed' | 'unreadable' }>,
 ): string {
   switch (operation.state) {
     case 'open': {
@@ -1228,6 +1281,11 @@ export function unfinishedOperation(
         `(${operation.phase}); continue it with ${operation.continue_with}${revert}.`
       );
     }
+    case 'failed':
+      return (
+        `Its ${operation.kind} to ${operation.to.release_track} ${shortCommit(operation.to.deployed_commit)} failed${operation.outcome} ` +
+        `(${operation.phase}); fix it forward to a newer release with ${operation.continue_with}.`
+      );
     case 'unreadable':
       return `Its update or rollback record cannot be read: ${operation.message}`;
   }
@@ -1239,22 +1297,17 @@ function operationDetail(instanceId: string, operation: OperationView, removal: 
   if (removal) lines.push(`Removal is in progress; finish it with gws-ea remove --id ${instanceId}.`);
   switch (operation.state) {
     case 'none':
-      if (operation.abandoned_staging) {
-        lines.push(`An interrupted update left staging behind; the next gws-ea update --id ${instanceId} removes it.`);
-      }
       break;
     case 'open':
+    case 'failed':
     case 'unreadable':
       lines.push(unfinishedOperation(operation));
       break;
-    case 'recorded':
+    case 'committed':
       lines.push(
-        `Its ${operation.kind} to ${shortCommit(operation.to.deployed_commit)} is recorded, with follow-ups still to run: ` +
+        `Its ${operation.kind} to ${shortCommit(operation.to.deployed_commit)} is committed, with follow-ups still to run: ` +
           `${operation.follow_ups.map((followUp) => followUp.kind).join(', ')}; the next gws-ea ${operation.kind} --id ${instanceId} retries them.`,
       );
-      if (operation.abandoned_staging) {
-        lines.push(`An interrupted update left staging behind; the next gws-ea update --id ${instanceId} removes it.`);
-      }
       break;
   }
   return lines;
@@ -1279,7 +1332,7 @@ function behindCell(release: ReleaseView): string {
 function renderList(listing: AssistantListing): string[] {
   if (listing.assistants.length === 0) return ['No assistants are registered on this machine.'];
   const rows = [
-    ['INSTANCE ID', 'HOSTNAME', 'TRACK', 'COMMIT', 'BEHIND TOOL', 'SERVICE', 'OPERATION'],
+    ['INSTANCE ID', 'HOSTNAME', 'TRACK', 'COMMIT', 'BEHIND TOOL', 'SERVICE', 'PHASE', 'OPERATION'],
     ...listing.assistants.map((assistant) => [
       assistant.instance_id,
       assistant.hostname,
@@ -1287,13 +1340,17 @@ function renderList(listing: AssistantListing): string[] {
       shortCommit(assistant.deployed_commit),
       behindCell(assistant.release),
       assistant.service.state,
+      assistant.phase.state,
       assistant.removal_in_progress ? 'removing' : operationSummary(assistant.operation),
     ]),
   ];
-  const details = listing.assistants.flatMap((assistant) =>
-    operationDetail(assistant.instance_id, assistant.operation, assistant.removal_in_progress).map(
-      (line) => `${assistant.instance_id}: ${line}`,
-    ),
+  // Beside the table: a conversion to start or finish, or a phase that cannot be read. A fenced assistant's
+  // operation names what moves it on.
+  const details = listing.assistants.flatMap(({ instance_id: id, phase, operation, removal_in_progress: removal }) =>
+    [
+      ...(phase.state === 'live' || phase.state === 'fenced' ? [] : [phaseDetail(phase)]),
+      ...operationDetail(id, operation, removal),
+    ].map((line) => `${id}: ${line}`),
   );
   return [...table(rows), ...(details.length > 0 ? ['', ...details] : [])];
 }
@@ -1322,6 +1379,8 @@ function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes
   switch (name) {
     case 'checkout':
       return probes.checkout.commit ? `at ${shortCommit(probes.checkout.commit)}` : '';
+    case 'image':
+      return probes.image.tag ?? '';
     case 'service':
       return probes.service.state;
     case 'main_identity':
@@ -1349,38 +1408,34 @@ function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes
 }
 
 function renderStatus(status: AssistantStatus, timezone: string): string[] {
-  const { registry, templates, schema } = status;
+  const { registry } = status;
   const ingress = registry.ingress_mode === 'managed-cloudflare' ? 'managed Cloudflare' : 'operator endpoint';
   const operation = operationDetail(status.instance_id, status.operation, status.removal_in_progress);
-  const listed =
-    templates.customized === null
-      ? `unknown: ${templates.reason ?? ''}`
-      : templates.customized.length === 0
-        ? 'none customized'
-        : `customized, kept by updates: ${describeCustomized(templates.customized)}`;
-  const customized = templates.customized !== null && templates.reason ? `${listed}. ${templates.reason}` : listed;
-  const schemaLine =
-    schema.central_fingerprint === null || schema.session_fingerprint === null
-      ? `unknown: ${schema.reason ?? ''}`
-      : `latest migration ${schema.latest_migration ?? '(none)'}; central ${schema.central_fingerprint.slice(0, 19)}, sessions ${schema.session_fingerprint.slice(0, 19)}`;
+  const observed = 'probes' in status;
   const lines = [
     `Assistant ${status.instance_id}`,
     `  Hostname:  ${registry.hostname} (${ingress})`,
     `  Endpoint:  ${registry.endpoint_url}`,
     `  Track:     ${registry.track} from ${registry.source_remote}`,
+    `  Phase:     ${phaseDetail(status.phase)}`,
     `  Release:   ${releaseLine(status.instance_id, status.release)}`,
-    `  Rollback:  ${rollbackLine(status.rollback)}`,
+    ...(observed ? [`  Rollback:  ${rollbackLine(status.rollback)}`] : []),
     `  Operation: ${operation.length === 0 ? 'none' : operation[0]!}`,
     ...operation.slice(1).map((line) => `             ${line}`),
-    `  Templates: ${customized}`,
-    `  Schema:    ${schemaLine}`,
-    'Probes:',
   ];
-  for (const name of PROBE_NAMES) {
-    const result = status.probes[name];
-    if (!result) continue;
-    const detail = result.reason ?? probeDetail(name, status.probes, timezone);
-    lines.push(`  ${result.status.padEnd(8)}  ${name.padEnd(14)}  ${detail}`.trimEnd());
+  if (observed) {
+    const { schema } = status;
+    const schemaLine =
+      schema.central_fingerprint === null || schema.session_fingerprint === null
+        ? `unknown: ${schema.reason ?? ''}`
+        : `latest migration ${schema.latest_migration ?? '(none)'}; central ${schema.central_fingerprint.slice(0, 19)}, sessions ${schema.session_fingerprint.slice(0, 19)}`;
+    lines.push(`  Schema:    ${schemaLine}`, 'Probes:');
+    for (const name of PROBE_NAMES) {
+      const result = status.probes[name];
+      if (!result) continue;
+      const detail = result.reason ?? probeDetail(name, status.probes, timezone);
+      lines.push(`  ${result.status.padEnd(8)}  ${name.padEnd(14)}  ${detail}`.trimEnd());
+    }
   }
   lines.push(`Observed: ${formatLocalTime(status.observed_at, timezone)}`);
   return lines;
@@ -1394,22 +1449,24 @@ export const LIST_USAGE: readonly string[] = [
   'list [--json]',
   "       Every assistant on this machine, from local state only; BEHIND TOOL says whether this gws-ea's",
   '       release is newer. JSON: {"assistants": [...]}, each with instance_id, hostname, track,',
-  '       deployed_commit, release (deployed_commit, tool_commit, behind_tool_release: true|false, or null',
-  '       with a reason when unknown), service (state: running|stopped|not_installed|unmanaged|unknown,',
-  '       reason), operation (state: none|open|recorded|unreadable), removal_in_progress.',
+  '       deployed_commit, phase (state: live with its release|fenced|converting|legacy|unknown), release',
+  '       (deployed_commit, tool_commit, behind_tool_release: true|false, or null with a reason when',
+  '       unknown), service (state: running|stopped|not_installed|unmanaged|unknown, reason), operation',
+  '       (state: none|open|failed|committed|unreadable), removal_in_progress.',
 ];
 
 export const STATUS_USAGE: readonly string[] = [
   'status --id <instance_id> [--json]',
   '       One assistant, observed live and read-only; it never repairs. JSON: instance_id, observed_at,',
-  '       registry (the record, not health), operation, removal_in_progress, release (deployed_commit,',
-  '       tool_commit, behind_tool_release), rollback (available, previous_commit, schema_moved),',
-  '       templates (customized: surface, name, change changed|deleted|added; reason), schema',
+  '       phase, registry (the record, not health), operation, removal_in_progress, release (deployed_commit,',
+  '       tool_commit, behind_tool_release), rollback (available, previous_commit, schema_moved), schema',
   '       (central_fingerprint, session_fingerprint, latest_migration),',
-  '       probes: checkout, service, host, onecli, main_identity, external_email, inbox (state, since, last_success_at,',
-  '       calendar_notifications), workspace (account), principal, route, connector (managed',
-  '       Cloudflare only, with drift), delivery; each probe has status ok|degraded|unknown and a reason.',
-  '       list and status exit 0 once they observed, whatever the health; status exits 1 for an unknown ID.',
+  '       probes: checkout, image (tag), service, host, onecli, main_identity, external_email, inbox (state,',
+  '       since, last_success_at, calendar_notifications), workspace (account), principal, route, connector',
+  '       (managed Cloudflare only, with drift), delivery; each probe has status ok|degraded|unknown and a',
+  '       reason. Until its conversion moves its record, an assistant on the legacy layout has no rollback,',
+  '       schema, or probes. list and status exit 0 once they observed, whatever the health; status exits 1',
+  '       for an unknown ID.',
 ];
 
 function timezoneOf(runtime: ReadOnlyCommandRuntime): string {

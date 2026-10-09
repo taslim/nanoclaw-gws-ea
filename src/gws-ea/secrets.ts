@@ -5,6 +5,7 @@ import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
 import { isOwnerOnlyMode, isWithinDirectory } from './paths.js';
+import { syncDirectory } from './release-layout.js';
 import { GwsEaError } from './types.js';
 import { parseJson } from './validation.js';
 
@@ -153,13 +154,4 @@ export async function removePrivateFile(file: string): Promise<void> {
     if (!isErrno(error, 'ENOENT')) throw error;
   }
   if (removed) await syncDirectory(path.dirname(file));
-}
-
-async function syncDirectory(directory: string): Promise<void> {
-  const handle = await open(directory, fsConstants.O_RDONLY);
-  try {
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
 }

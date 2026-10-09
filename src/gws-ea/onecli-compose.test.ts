@@ -7,7 +7,7 @@ import { ONECLI_GATEWAY_VERSION } from './pins.js';
 
 const INSTANCE_ID = '12345678-1234-4123-8123-123456789abc';
 /** The pins the instance's release recorded; a later launcher's own pins never apply to it. */
-const PINS = { gateway: '1.41.3', cli: '2.2.4' } as const;
+const PINS = { gateway: '1.41.3' } as const;
 /** The content-addressed wrapper gateway image the launcher builds and passes in. */
 const WRAPPER_IMAGE = 'gws-ea-onecli-gateway:0123456789abcdef';
 
@@ -26,7 +26,6 @@ describe('instance-owned OneCLI Compose specification', () => {
       project: 'gws-ea-12345678123441238123123456789abc',
       appPort: 31_002,
       gatewayPort: 31_003,
-      cliExecutable: '/opt/onecli/bin/onecli',
       dockerEndpoint: 'unix:///var/run/docker.sock',
     });
 
@@ -77,7 +76,6 @@ describe('instance-owned OneCLI Compose specification', () => {
       project: 'gws-ea-12345678123441238123123456789abc',
       appPort: 31_002,
       gatewayPort: 31_003,
-      cliExecutable: '/opt/onecli/bin/onecli',
       dockerEndpoint: 'unix:///var/run/docker.sock',
     });
     const source = renderOnecliCompose(layout, PINS, WRAPPER_IMAGE);
@@ -101,7 +99,6 @@ describe('instance-owned OneCLI Compose specification', () => {
       project: 'gws-ea-12345678123441238123123456789abc',
       appPort: 31_002,
       gatewayPort: 31_003,
-      cliExecutable: '/opt/onecli/bin/onecli',
       dockerEndpoint: 'unix:///var/run/docker.sock',
     });
     const services = record(record(parseYaml(renderOnecliCompose(layout, PINS, WRAPPER_IMAGE))).services);
@@ -121,7 +118,6 @@ describe('instance-owned OneCLI Compose specification', () => {
       project: 'gws-ea-12345678123441238123123456789abc',
       appPort: 31_002,
       gatewayPort: 31_003,
-      cliExecutable: '/opt/onecli/bin/onecli',
       dockerEndpoint: 'unix:///var/run/docker.sock',
     });
     const second = createOnecliRuntimeLayout({
@@ -130,7 +126,6 @@ describe('instance-owned OneCLI Compose specification', () => {
       project: 'gws-ea-fedcba98765443218765fedcba987654',
       appPort: 32_002,
       gatewayPort: 32_003,
-      cliExecutable: '/opt/onecli/bin/onecli',
       dockerEndpoint: 'unix:///var/run/docker.sock',
     });
 
@@ -138,7 +133,6 @@ describe('instance-owned OneCLI Compose specification', () => {
       'project',
       'rootDirectory',
       'composeFile',
-      'cliHome',
       'secretsDirectory',
       'postgresPasswordFile',
       'encryptionKeyFile',

@@ -32,11 +32,12 @@ const CLIENT = { client_id: '123-abc.apps.googleusercontent.com', client_secret:
 
 function runtime(): InstanceRuntimeConfig {
   return {
-    schema_version: 1,
+    schema_version: 2,
     instance_id: '11111111-1111-4111-8111-111111111111',
     install_id: '11111111111141118111111111111111',
-    deployed_commit: 'a'.repeat(40),
-    checkout_realpath: path.join(ROOT, 'nanoclaw'),
+    instance_root: ROOT,
+    checkout_root: path.join(ROOT, 'nanoclaw'),
+    state_root: path.join(ROOT, 'state'),
     node_path: '/usr/bin/node',
     home_directory: ROOT,
     allocated_ports: { nanoclaw_webhook: 31_001, onecli_app: 31_002, onecli_gateway: 31_003 },
@@ -45,7 +46,6 @@ function runtime(): InstanceRuntimeConfig {
     onecli_app_url: 'http://127.0.0.1:31002',
     onecli_gateway_url: 'http://127.0.0.1:31003',
     onecli_gateway_container: 'gws-ea-x-gateway-1',
-    onecli_cli_path: '/opt/onecli',
     selected_provider: 'claude',
     endpoint_url: 'https://juno.example.test/webhook/gchat',
     docker_endpoint: 'unix:///var/run/docker.sock',

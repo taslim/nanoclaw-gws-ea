@@ -6,8 +6,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { CONTROL_PLANE_ROOT } from './paths.js';
-import { CLOUDFLARED_IMAGE, ONECLI_CLI_VERSION, ONECLI_GATEWAY_VERSION } from './pins.js';
-import { TOOL_ENVIRONMENT_KEYS, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
+import { TOOL_ENVIRONMENT_KEYS, runSanitizedCommand } from './process.js';
 import {
   assertUpdateKeepsSetup,
   runReleasePreflight,
@@ -15,7 +14,6 @@ import {
   type ReleaseSetup,
   type SetupCommand,
 } from './release-preflight.js';
-import { providerProvisioningCapabilityDigest } from '../provider-provisioning-capability.js';
 
 /** gws-ea's pins, which a release carries at the same path as this launcher. */
 const PINS_FILE = 'src/gws-ea/versions.json';
@@ -77,169 +75,22 @@ async function releaseFixture(): Promise<string> {
       2,
     ) + '\n',
   );
-  await write(
-    root,
-    'pnpm-lock.yaml',
-    [
-      "lockfileVersion: '9.0'",
-      'importers:',
-      '  .:',
-      '    dependencies:',
-      "      '@onecli-sh/sdk':",
-      '        specifier: 2.2.1',
-      '        version: 2.2.1',
-      '    devDependencies:',
-      '      typescript:',
-      '        specifier: ^5.7.0',
-      '        version: 5.9.3',
-      '',
-    ].join('\n'),
-  );
-  // Upstream's root pins file carries none of gws-ea's pins.
-  await write(root, 'versions.json', `${JSON.stringify({ 'agent-image': 'example@sha256:0' }, null, 2)}\n`);
   await write(root, PINS_FILE, await readFile(path.join(CONTROL_PLANE_ROOT, PINS_FILE), 'utf8'));
-  await write(
-    root,
-    'templates/gws-ea/main/plugin.json',
-    JSON.stringify(
-      {
-        $schema: 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json',
-        name: 'gws-ea-main',
-        version: '1.0.0',
-        description: 'fixture',
-        extensions: { 'ai.nanoco.nanoclaw': { agentName: 'main' } },
-      },
-      null,
-      2,
-    ) + '\n',
-  );
-  await write(
-    root,
-    'templates/gws-ea/external-email/plugin.json',
-    JSON.stringify(
-      {
-        $schema: 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json',
-        name: 'gws-ea-external-email',
-        version: '1.0.0',
-        description: 'fixture',
-        extensions: { 'ai.nanoco.nanoclaw': { agentName: 'external-email' } },
-      },
-      null,
-      2,
-    ) + '\n',
-  );
-  for (const file of ['index.ts', 'group.ts', 'destination-policy.ts', 'bridge.ts']) {
-    await write(root, `src/modules/gws-ea-external-email/${file}`, 'export {};\n');
-  }
-  await write(root, 'src/modules/gws-ea-external-email/guidance.md', '# external-email\n');
-  for (const file of [
-    'index.ts',
-    'migration.ts',
-    'thread-map.ts',
-    'route-mail.ts',
-    'pace.ts',
-    'principal-reply.ts',
-    'send.ts',
-    'render.ts',
-  ]) {
-    await write(root, `src/modules/gws-ea-inbox/${file}`, 'export {};\n');
-  }
-  for (const file of [
-    'src/modules/gws-ea-meetings/index.ts',
-    'src/modules/gws-ea-meetings/tools.ts',
-    'src/modules/gws-ea-meetings/thread-calendar.ts',
-    'src/modules/gws-ea-reminders/index.ts',
-    'container/agent-runner/src/action-request.ts',
-    'container/agent-runner/src/mcp-tools/gws-ea-email.ts',
-    'container/agent-runner/src/mcp-tools/reminders.ts',
-  ]) {
-    await write(root, file, 'export {};\n');
-  }
-  for (const doc of ['gws-ea-email', 'gws-ea-email-external', 'reminders']) {
-    await write(root, `container/agent-runner/src/mcp-tools/${doc}.instructions.md`, `# ${doc}\n`);
-  }
-  await write(root, 'container/agent-runner/src/mcp-tools/files-send.instructions.md', '# files-send\n');
-  await write(root, 'container/agent-runner/src/mcp-tools/connect.instructions.md', '# connect\n');
-  await write(root, 'container/agent-runner/src/mcp-tools/memory.instructions.md', '# memory\n');
-  await write(root, 'container/agent-runner/src/memory/sealed.ts', 'export {};\n');
-  await write(root, 'templates/gws-ea/main/skills/welcome/SKILL.md', '# Welcome\n');
   await write(root, 'bin/ncl', '#!/usr/bin/env bash\nexit 0\n');
-  await write(root, 'bin/gws-ea', '#!/usr/bin/env bash\nexit 0\n');
   await chmod(path.join(root, 'bin/ncl'), 0o755);
-  await chmod(path.join(root, 'bin/gws-ea'), 0o755);
-  await write(root, 'setup/gws-ea.ts', 'export {};\n');
-  await write(root, 'setup/gws-ea-input.ts', 'export {};\n');
-  await write(root, 'setup/lib/bright-select.ts', 'export {};\n');
-  await write(root, 'setup/lib/captured-token.ts', 'export {};\n');
-  await write(root, 'setup/lib/inherit-script.ts', 'export {};\n');
-  await write(root, '.claude/skills/add-onecli/scripts/install-claude.sh', '#!/bin/sh\n');
-  await write(root, '.claude/skills/add-onecli/scripts/register-claude-token.sh', '#!/bin/sh\n');
-  await write(root, 'src/provider-credential.ts', 'export {};\n');
   await write(root, 'src/channels/gchat.ts', "export const gchat = 'registered';\n");
-  await write(root, 'src/channels/index.ts', "import './cli.js';\nimport './gchat.js';\n");
-  await write(root, 'src/gateway-providers/index.ts', "import './installed.js';\n");
-  await write(root, 'src/gateway-providers/installed.ts', "import './onecli.js';\n");
-  await write(root, 'src/gateway-providers/onecli.ts', 'export {};\n');
-  await write(root, 'src/gateway-providers/onecli-files.ts', 'export {};\n');
-  await write(root, 'src/gateway-providers/onecli-credentials.ts', 'export {};\n');
-  await write(root, 'container/skills/onecli-gateway/SKILL.md', '# OneCLI gateway\n');
-  await write(root, 'container/skills/onecli-gateway/instructions.md', '# OneCLI instructions\n');
-  await write(root, 'container/skills/gcalendar/SKILL.md', '# gcalendar\n');
-  await write(root, 'container/skills/gcalendar/instructions.md', '# gcalendar rules\n');
-  await write(root, 'container/skills/gmail/SKILL.md', '# gmail\n');
-  await write(root, 'container/skills/gpeople/SKILL.md', '# gpeople\n');
-  await write(root, 'src/container-env.ts', 'export {};\n');
-  await write(root, 'src/gws-ea/process.ts', 'export {};\n');
-  await write(root, 'src/gws-ea/cloudflare-connector.ts', 'export {};\n');
-  await write(root, 'scripts/init-first-agent.ts', 'export {};\n');
-  await write(root, 'src/modules/gws-ea-profile/index.ts', 'export {};\n');
-  await write(root, 'src/modules/gws-ea-profile/migration.ts', 'export {};\n');
-  await write(root, 'src/modules/gws-ea-google/index.ts', 'export {};\n');
-  await write(root, 'src/modules/gws-ea-main/index.ts', 'export {};\n');
-  await write(root, 'src/modules/gws-ea-main/guidance.md', '# Guidance\n');
-  await write(root, 'src/modules/gws-ea-preferences/index.ts', 'export {};\n');
-  await write(root, 'src/modules/gws-ea-preferences/migration.ts', 'export {};\n');
-  await write(root, 'src/modules/gws-ea-people/index.ts', 'export {};\n');
-  await write(root, 'src/modules/gws-ea-people/migration.ts', 'export {};\n');
-  await write(root, 'src/modules/gws-ea-notices/index.ts', 'export {};\n');
-  await write(root, 'src/modules/gws-ea-privacy/index.ts', 'export {};\n');
-  await write(root, 'src/modules/gws-ea-privacy/migration.ts', 'export {};\n');
-  await write(root, 'src/modules/capabilities/index.ts', 'export {};\n');
-  await write(root, 'src/modules/capabilities/migration.ts', 'export {};\n');
-  await write(
-    root,
-    'src/modules/index.ts',
-    "import './capabilities/index.js';\nimport './gws-ea-google/index.js';\nimport './gws-ea-main/index.js';\nimport './gws-ea-profile/index.js';\nimport './gws-ea-preferences/index.js';\nimport './gws-ea-people/index.js';\nimport './gws-ea-notices/index.js';\nimport './gws-ea-privacy/index.js';\nimport './gws-ea-external-email/index.js';\nimport './gws-ea-inbox/index.js';\nimport './gws-ea-meetings/index.js';\nimport './gws-ea-reminders/index.js';\n",
-  );
-  await write(root, 'src/provider-contracts/claude.ts', "export const provider = 'claude';\n");
-  await write(root, 'src/provider-contracts/index.ts', "import './claude.js';\n");
-  await write(root, 'setup/providers/claude.ts', "export const provider = 'claude';\n");
-  await write(root, 'setup/providers/index.ts', "import './claude.js';\n");
-  await write(root, 'setup/providers/registry.ts', 'export {};\n');
-  await write(root, 'container/agent-runner/src/providers/claude.ts', "export const provider = 'claude';\n");
-  await write(root, 'container/agent-runner/src/providers/index.ts', "import './claude.js';\n");
-  await write(root, 'container/agent-runner/src/provider-contracts/claude.ts', "export const provider = 'claude';\n");
-  await write(root, 'container/agent-runner/src/provider-contracts/index.ts', "import './claude.js';\n");
-  await write(root, 'container/agent-runner/src/providers/claude.conformance.test.ts', 'export {};\n');
   commit(root, 'complete release');
   git(root, 'checkout', '--detach');
   return realpath(root);
 }
 
-async function preflightInput(root: string) {
+function preflightInput(root: string) {
   return {
     checkoutRoot: root,
     provider: 'claude',
-    providerCapabilityDigest: await providerProvisioningCapabilityDigest(root),
     providerCredential: { name: 'Anthropic', type: 'anthropic', hostPattern: 'api.anthropic.com' },
-    onecliCliPath: '/fixture/bin/onecli',
   } as const;
 }
-
-const fixtureCommandRunner: SanitizedCommandRunner = async (spec) =>
-  spec.command === '/fixture/bin/onecli'
-    ? { stdout: JSON.stringify({ version: '2.2.5', server_version: 'unknown' }), stderr: '' }
-    : runSanitizedCommand(spec);
 
 function recorder(commands: SetupCommand[]): (command: SetupCommand) => Promise<void> {
   return async (command) => {
@@ -259,21 +110,19 @@ function expectCommonEnvironment(environment: Readonly<Record<string, string>>, 
 }
 
 describe('release preflight', () => {
-  it('validates a composed release, installs frozen dependencies, and builds without applying skills', async () => {
+  it("reads the release's cohort, installs frozen dependencies, and builds without applying skills", async () => {
     const root = await releaseFixture();
     const commands: SetupCommand[] = [];
 
-    const result = await runReleasePreflight(await preflightInput(root), {
-      runCommand: fixtureCommandRunner,
+    const result = await runReleasePreflight(preflightInput(root), {
       runSetupCommand: recorder(commands),
     });
 
     expect(result).toEqual({
       provider: 'claude',
-      providerCapabilityDigest: await providerProvisioningCapabilityDigest(root),
       providerCredential: { name: 'Anthropic', type: 'anthropic', hostPattern: 'api.anthropic.com' },
       packageManager: 'pnpm@10.34.5',
-      onecli: { gateway: '1.42.0', cli: '2.2.5', sdk: '2.2.1' },
+      onecli: { gateway: '1.42.0', sdk: '2.2.1' },
     });
     expect(commands).toHaveLength(2);
     expect(commands[0]).toMatchObject({ command: 'pnpm', args: ['install', '--frozen-lockfile'], cwd: root });
@@ -292,15 +141,10 @@ describe('release preflight', () => {
     vi.stubEnv('ANTHROPIC_API_KEY', 'must-not-propagate');
     vi.stubEnv('GOOGLE_APPLICATION_CREDENTIALS', '/tmp/hostile-google-key');
     const gitEnvironments: Array<Readonly<Record<string, string>> | undefined> = [];
-    let onecliEnvironment: Readonly<Record<string, string>> | undefined;
     const setupCommands: SetupCommand[] = [];
 
-    await runReleasePreflight(await preflightInput(root), {
+    await runReleasePreflight(preflightInput(root), {
       runCommand: async (spec) => {
-        if (spec.command === '/fixture/bin/onecli') {
-          onecliEnvironment = spec.env;
-          return { stdout: JSON.stringify({ version: '2.2.5', server_version: 'unknown' }), stderr: '' };
-        }
         gitEnvironments.push(spec.env);
         return runSanitizedCommand(spec);
       },
@@ -316,98 +160,7 @@ describe('release preflight', () => {
         expect([...TOOL_ENVIRONMENT_KEYS, 'HOME', 'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT']).toContain(key);
       }
     }
-    expectCommonEnvironment(onecliEnvironment!, root);
     for (const command of setupCommands) expectCommonEnvironment(command.env, root);
-  });
-
-  it.each([
-    ['template', 'templates/gws-ea/main/plugin.json', 'incomplete_release'],
-    ['external-email template', 'templates/gws-ea/external-email/plugin.json', 'incomplete_release'],
-    ['external-email guidance', 'src/modules/gws-ea-external-email/guidance.md', 'incomplete_release'],
-    ['GWS-EA inbox', 'src/modules/gws-ea-inbox/index.ts', 'incomplete_release'],
-    ['GWS-EA inbox migration', 'src/modules/gws-ea-inbox/migration.ts', 'incomplete_release'],
-    ['GWS-EA thread map', 'src/modules/gws-ea-inbox/thread-map.ts', 'incomplete_release'],
-    ['GWS-EA bridge', 'src/modules/gws-ea-external-email/bridge.ts', 'incomplete_release'],
-    ['GWS-EA scheduling', 'src/modules/gws-ea-meetings/index.ts', 'incomplete_release'],
-    ['GWS-EA scheduling tools', 'src/modules/gws-ea-meetings/tools.ts', 'incomplete_release'],
-    ['GWS-EA reminders', 'src/modules/gws-ea-reminders/index.ts', 'incomplete_release'],
-    ['GWS-EA email tools', 'container/agent-runner/src/mcp-tools/gws-ea-email.ts', 'incomplete_release'],
-    [
-      'external-email tool instructions',
-      'container/agent-runner/src/mcp-tools/gws-ea-email-external.instructions.md',
-      'incomplete_release',
-    ],
-    ['GWS-EA reminder tools', 'container/agent-runner/src/mcp-tools/reminders.ts', 'incomplete_release'],
-    [
-      'account-connection instructions',
-      'container/agent-runner/src/mcp-tools/connect.instructions.md',
-      'incomplete_release',
-    ],
-    ['memory instructions', 'container/agent-runner/src/mcp-tools/memory.instructions.md', 'incomplete_release'],
-    ['sealed-session runner rule', 'container/agent-runner/src/memory/sealed.ts', 'incomplete_release'],
-    ['GWS-EA welcome', 'templates/gws-ea/main/skills/welcome/SKILL.md', 'incomplete_release'],
-    ['GWS-EA guidance', 'src/modules/gws-ea-main/guidance.md', 'incomplete_release'],
-    ['GWS-EA Google access', 'src/modules/gws-ea-google/index.ts', 'incomplete_release'],
-    ['Google Calendar rules', 'container/skills/gcalendar/instructions.md', 'incomplete_release'],
-    ['Gmail skill', 'container/skills/gmail/SKILL.md', 'incomplete_release'],
-    ['Workspace directory skill', 'container/skills/gpeople/SKILL.md', 'incomplete_release'],
-    ['module container env seam', 'src/container-env.ts', 'incomplete_release'],
-    ['Google Chat adapter', 'src/channels/gchat.ts', 'incomplete_release'],
-    ['GWS-EA interactive launcher', 'setup/gws-ea-input.ts', 'incomplete_release'],
-    ['GWS-EA service launcher', 'src/gws-ea/process.ts', 'incomplete_release'],
-    ['GWS-EA profile migration', 'src/modules/gws-ea-profile/migration.ts', 'incomplete_release'],
-    ['GWS-EA preferences migration', 'src/modules/gws-ea-preferences/migration.ts', 'incomplete_release'],
-    ['GWS-EA people migration', 'src/modules/gws-ea-people/migration.ts', 'incomplete_release'],
-    ['GWS-EA failure notices', 'src/modules/gws-ea-notices/index.ts', 'incomplete_release'],
-    ['GWS-EA private values', 'src/modules/gws-ea-privacy/index.ts', 'incomplete_release'],
-    ['GWS-EA private values migration', 'src/modules/gws-ea-privacy/migration.ts', 'incomplete_release'],
-    ['per-group capabilities migration', 'src/modules/capabilities/migration.ts', 'incomplete_release'],
-    ['OneCLI gateway adapter', 'src/gateway-providers/onecli.ts', 'gateway_not_composed'],
-    ['OneCLI credential connection', 'src/gateway-providers/onecli-credentials.ts', 'gateway_not_composed'],
-    ['OneCLI agent instructions', 'container/skills/onecli-gateway/SKILL.md', 'gateway_not_composed'],
-    ['provider host contract', 'src/provider-contracts/claude.ts', 'provider_not_composed'],
-    ['provider runtime', 'container/agent-runner/src/providers/claude.ts', 'provider_not_composed'],
-  ])('rejects a release missing its committed %s before setup commands', async (_label, missingPath, code) => {
-    const root = await releaseFixture();
-    await rm(path.join(root, missingPath));
-    commit(root, `remove ${missingPath}`);
-    const commands: SetupCommand[] = [];
-
-    await expect(
-      runReleasePreflight(await preflightInput(root), {
-        runCommand: fixtureCommandRunner,
-        runSetupCommand: recorder(commands),
-      }),
-    ).rejects.toMatchObject({ code });
-    expect(commands).toEqual([]);
-  });
-
-  it('rejects an immutable cloudflared pin outside the launcher cohort, naming the pin', async () => {
-    const root = await releaseFixture();
-    const image = `cloudflare/cloudflared:2026.9.2@sha256:${'a'.repeat(64)}`;
-    await writePins(root, { cloudflared: image });
-    commit(root, 'different cloudflared cohort');
-
-    await expect(runReleasePreflight(await preflightInput(root))).rejects.toMatchObject({
-      code: 'cloudflared_release_mismatch',
-      message: expect.stringContaining(`cloudflared image ${image}`),
-      details: { pin: 'cloudflared image', release: image, launcher: CLOUDFLARED_IMAGE },
-    });
-  });
-
-  it('rejects a committed release without OneCLI gateway registration', async () => {
-    const root = await releaseFixture();
-    await write(root, 'src/gateway-providers/installed.ts', 'export {};\n');
-    commit(root, 'remove OneCLI gateway registration');
-    const commands: SetupCommand[] = [];
-
-    await expect(
-      runReleasePreflight(await preflightInput(root), {
-        runCommand: fixtureCommandRunner,
-        runSetupCommand: recorder(commands),
-      }),
-    ).rejects.toMatchObject({ code: 'gateway_not_composed' });
-    expect(commands).toEqual([]);
   });
 
   it('rejects a build that does not emit the service runtime artifacts', async () => {
@@ -415,8 +168,7 @@ describe('release preflight', () => {
     const commands: SetupCommand[] = [];
 
     await expect(
-      runReleasePreflight(await preflightInput(root), {
-        runCommand: fixtureCommandRunner,
+      runReleasePreflight(preflightInput(root), {
         runSetupCommand: async (command) => {
           commands.push(command);
         },
@@ -424,54 +176,6 @@ describe('release preflight', () => {
     ).rejects.toThrow(/dist\/gws-ea\/process\.js/u);
     expect(commands).toHaveLength(2);
   });
-
-  it('rejects a selected provider that is not composed into the release', async () => {
-    const root = await releaseFixture();
-    const commands: SetupCommand[] = [];
-
-    await expect(
-      runReleasePreflight(
-        { ...(await preflightInput(root)), provider: 'opencode' },
-        { runSetupCommand: recorder(commands) },
-      ),
-    ).rejects.toMatchObject({ code: 'provider_not_composed' });
-    expect(commands).toEqual([]);
-  });
-
-  it('rejects a launcher/target provider setup mismatch before setup commands', async () => {
-    const root = await releaseFixture();
-    const commands: SetupCommand[] = [];
-
-    await expect(
-      runReleasePreflight(
-        { ...(await preflightInput(root)), providerCapabilityDigest: 'f'.repeat(64) },
-        { runSetupCommand: recorder(commands) },
-      ),
-    ).rejects.toMatchObject({ code: 'provider_capability_mismatch' });
-    expect(commands).toEqual([]);
-  });
-
-  it.each([
-    ['onecli-gateway', 'OneCLI gateway', ONECLI_GATEWAY_VERSION],
-    ['onecli-cli', 'OneCLI CLI', ONECLI_CLI_VERSION],
-  ])(
-    'rejects a target %s pin the launcher cannot execute, naming it, before setup commands',
-    async (key, name, launcher) => {
-      const root = await releaseFixture();
-      await writePins(root, { [key]: '9.9.9' });
-      commit(root, 'new OneCLI cohort');
-      const commands: SetupCommand[] = [];
-
-      await expect(
-        runReleasePreflight(await preflightInput(root), { runSetupCommand: recorder(commands) }),
-      ).rejects.toMatchObject({
-        code: 'onecli_release_mismatch',
-        message: expect.stringContaining(`pins ${name} 9.9.9, but this launcher pins ${launcher}`),
-        details: { pin: name, release: '9.9.9', launcher },
-      });
-      expect(commands).toEqual([]);
-    },
-  );
 
   it.each([
     ['cloudflare/cloudflared:latest'],
@@ -482,54 +186,9 @@ describe('release preflight', () => {
     await writePins(root, { cloudflared: image });
     commit(root, 'invalid cloudflared pin');
 
-    await expect(runReleasePreflight(await preflightInput(root))).rejects.toMatchObject({
+    await expect(runReleasePreflight(preflightInput(root))).rejects.toMatchObject({
       code: 'invalid_release_pin',
     });
-  });
-
-  it('rejects an installed OneCLI CLI outside the selected cohort before setup commands', async () => {
-    const root = await releaseFixture();
-    const commands: SetupCommand[] = [];
-
-    await expect(
-      runReleasePreflight(await preflightInput(root), {
-        runCommand: async (spec) =>
-          spec.command === '/fixture/bin/onecli'
-            ? { stdout: JSON.stringify({ version: '2.2.4', server_version: 'unknown' }), stderr: '' }
-            : runSanitizedCommand(spec),
-        runSetupCommand: recorder(commands),
-      }),
-    ).rejects.toMatchObject({ code: 'incompatible_onecli' });
-    expect(commands).toEqual([]);
-  });
-
-  it('rejects an inconsistent pnpm lockfile before setup commands', async () => {
-    const root = await releaseFixture();
-    await write(
-      root,
-      'pnpm-lock.yaml',
-      [
-        "lockfileVersion: '9.0'",
-        'importers:',
-        '  .:',
-        '    dependencies:',
-        "      '@onecli-sh/sdk':",
-        '        specifier: 2.2.0',
-        '        version: 2.2.0',
-        '    devDependencies:',
-        '      typescript:',
-        '        specifier: ^5.7.0',
-        '        version: 5.9.3',
-        '',
-      ].join('\n'),
-    );
-    commit(root, 'inconsistent lockfile');
-    const commands: SetupCommand[] = [];
-
-    await expect(
-      runReleasePreflight(await preflightInput(root), { runSetupCommand: recorder(commands) }),
-    ).rejects.toMatchObject({ code: 'inconsistent_lockfile' });
-    expect(commands).toEqual([]);
   });
 
   it.each([
@@ -551,7 +210,7 @@ describe('release preflight', () => {
     const commands: SetupCommand[] = [];
 
     await expect(
-      runReleasePreflight(await preflightInput(root), { runSetupCommand: recorder(commands) }),
+      runReleasePreflight(preflightInput(root), { runSetupCommand: recorder(commands) }),
     ).rejects.toMatchObject({ code: 'invalid_release_pin' });
     expect(commands).toEqual([]);
   });
@@ -561,8 +220,7 @@ describe('release preflight', () => {
     const commands: SetupCommand[] = [];
 
     await expect(
-      runReleasePreflight(await preflightInput(root), {
-        runCommand: fixtureCommandRunner,
+      runReleasePreflight(preflightInput(root), {
         runSetupCommand: async (command) => {
           commands.push(command);
           if (command.args[0] === 'install') await write(root, 'package.json', '{"drift":true}\n');
@@ -573,21 +231,22 @@ describe('release preflight', () => {
     expect(commands[0]).toMatchObject({ command: 'pnpm', args: ['install', '--frozen-lockfile'], cwd: root });
   });
 
-  it('fails with the tracked diff when the build changes source', async () => {
+  it.each([
+    ['changes a tracked file', 'src/channels/gchat.ts'],
+    ['leaves an untracked file', 'src/channels/generated.ts'],
+  ])('refuses a dirty tree after the build when it %s, naming the file', async (_change, file) => {
     const root = await releaseFixture();
     const commands: SetupCommand[] = [];
+    const build = recorder(commands);
 
     await expect(
-      runReleasePreflight(await preflightInput(root), {
-        runCommand: fixtureCommandRunner,
+      runReleasePreflight(preflightInput(root), {
         runSetupCommand: async (command) => {
-          commands.push(command);
-          if (command.args[0] === 'run') {
-            await write(root, 'src/channels/gchat.ts', "export const gchat = 'drifted';\n");
-          }
+          await build(command);
+          if (command.args[0] === 'run') await write(root, file, "export const gchat = 'drifted';\n");
         },
       }),
-    ).rejects.toThrow(/src\/channels\/gchat\.ts/);
+    ).rejects.toMatchObject({ code: 'checkout_drift', message: expect.stringContaining(file) });
     expect(commands).toHaveLength(2);
   });
 });
@@ -595,7 +254,7 @@ describe('release preflight', () => {
 describe('update compatibility', () => {
   const credential = { name: 'Anthropic', type: 'anthropic', hostPattern: 'api.anthropic.com' } as const;
   const deployed: DeployedSetup = {
-    onecli: { gateway: '1.42.0', cli: '2.2.5', sdk: '2.2.1' },
+    onecli: { gateway: '1.42.0', sdk: '2.2.1' },
     postgresImage: 'postgres:18-alpine',
     provider: 'claude',
     providerCredential: credential,
@@ -612,7 +271,6 @@ describe('update compatibility', () => {
 
   it.each([
     ['OneCLI gateway', { onecli: { ...deployed.onecli, gateway: '1.43.0' } }, 'onecli_version_changed', '1.43.0'],
-    ['OneCLI CLI', { onecli: { ...deployed.onecli, cli: '2.3.0' } }, 'onecli_version_changed', '2.3.0'],
     ['OneCLI SDK', { onecli: { ...deployed.onecli, sdk: '2.3.1' } }, 'onecli_version_changed', '2.3.1'],
     ['Postgres image', { postgresImage: 'postgres:19-alpine' }, 'postgres_version_changed', 'postgres:19-alpine'],
     [

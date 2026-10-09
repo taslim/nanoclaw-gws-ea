@@ -1,3 +1,5 @@
+import path from 'node:path';
+
 import type { ModuleMigration } from '../../db/migrations/index.js';
 
 /*
@@ -85,7 +87,8 @@ export const gwsEaInboxMigration: ModuleMigration = {
  *   each one an outside sender wrote in their own words, and each one `main`
  *   named, recorded once for each way it came.
  * - `gws_ea_thread_files`: each file `main` handed over for the thread, by
- *   its SHA-256, with its name and the host's staged copy.
+ *   its SHA-256, with its name and the host's staged copy, by its place in
+ *   the data directory.
  * - `gws_ea_thread_sends`: a send between allocating its Message-ID and
  *   delivery recording it, per thread and side, so a retry finds what Gmail
  *   may already hold.
@@ -168,5 +171,36 @@ export const gwsEaInboxDropThreadHoldsMigration: ModuleMigration = {
   name: 'module:gws-ea-inbox:drop-thread-holds',
   async up(db) {
     await db.exec('DROP TABLE IF EXISTS gws_ea_thread_holds');
+  },
+};
+
+/** Where an earlier release's absolute path to a handed file entered its data directory. */
+const EARLIER_DATA_DIR = '/data/';
+const EARLIER_SESSIONS = `${EARLIER_DATA_DIR}v2-sessions/`;
+
+/**
+ * A handed file's copy is recorded by its place in the data directory
+ * (thread-map.ts). Earlier releases recorded its absolute path, through the
+ * checkout they ran from, which the move to release folders leaves behind:
+ * each such path keeps its part from its last `v2-sessions/` on. Any other
+ * path stays as it was.
+ */
+export const gwsEaInboxRelativeFilePathsMigration: ModuleMigration = {
+  version: 4,
+  name: 'module:gws-ea-inbox:relative-file-paths',
+  async up(db) {
+    const files = await db.all<{ thread_key: string; sha256: string; host_path: string }>(
+      'SELECT thread_key, sha256, host_path FROM gws_ea_thread_files',
+    );
+    for (const file of files) {
+      const at = file.host_path.lastIndexOf(EARLIER_SESSIONS);
+      if (!path.isAbsolute(file.host_path) || at === -1) continue;
+      await db.run(
+        'UPDATE gws_ea_thread_files SET host_path = ? WHERE thread_key = ? AND sha256 = ?',
+        file.host_path.slice(at + EARLIER_DATA_DIR.length),
+        file.thread_key,
+        file.sha256,
+      );
+    }
   },
 };

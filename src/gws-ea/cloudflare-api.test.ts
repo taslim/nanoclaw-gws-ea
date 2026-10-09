@@ -244,17 +244,21 @@ describe('Cloudflare REST readers', () => {
     });
   });
 
-  it('reads connector clients without config_version, and with one', async () => {
-    const withVersion = { ...connectorClient, config_version: 5 };
+  it('reads and addresses a tunnel whose ID is a version 7 UUID', async () => {
+    const v7 = '01922b7e-8c3a-7d4e-9f12-3456789abcde';
+    const routes: string[] = [];
     const client = api(
-      vi.fn<typeof globalThis.fetch>(async () => envelope([connectorClient, withVersion, { conns: [] }])),
+      vi.fn<typeof globalThis.fetch>(async (input) => {
+        const route = new URL(String(input)).pathname.replace('/client/v4', '');
+        routes.push(route);
+        if (route.endsWith('/configurations')) return envelope({ tunnel_id: v7, version: 0, config: {} });
+        return envelope([{ ...tunnel, id: v7 }], { page: 1, per_page: 50, count: 1, total_count: 1, total_pages: 1 });
+      }),
     );
 
-    await expect(client.listTunnelConnections(ACCOUNT_ID, TUNNEL_ID)).resolves.toEqual([
-      { id: CLIENT_ID },
-      { id: CLIENT_ID, configVersion: 5 },
-      {},
-    ]);
+    await expect(client.listTunnels(ACCOUNT_ID, 'gws-ea-owned')).resolves.toEqual([{ id: v7, name: 'gws-ea-owned' }]);
+    await expect(client.getTunnelConfiguration(ACCOUNT_ID, v7)).resolves.toEqual({ config: {}, version: 0 });
+    expect(routes.at(-1)).toBe(`/accounts/${ACCOUNT_ID}/cfd_tunnel/${v7}/configurations`);
   });
 
   it('ends pagination on total_pages 0, on the reported last page, and on a short page without totals', async () => {
@@ -536,14 +540,13 @@ describe('Cloudflare retries and failures', () => {
 });
 
 describe('Cloudflare request logging', () => {
-  it('logs request status only, captures non-token reads, and keeps the tunnel-token response out of both', async () => {
+  it('logs request status only, and keeps the tunnel-token response out of the log', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-cloudflare-log-'));
     roots.push(root);
     const paths = resolveControlPlanePaths({
       configRoot: path.join(root, 'config'),
       stateRoot: path.join(root, 'state'),
     });
-    const staging = path.join(root, 'fixture-staging');
     // Real tunnel tokens are base64 JSON; this canary matches no redaction pattern, so only
     // not writing the body at all keeps it out of the logs.
     const connectorToken = 'tunnel-token-canary-5f0c1b7e9d';
@@ -555,7 +558,7 @@ describe('Cloudflare request logging', () => {
       }),
     );
 
-    const run = await startRunLog({ paths, command: 'create', captureFixturesTo: staging });
+    const run = await startRunLog({ paths, command: 'create' });
     await run.step('establish_transport', async () => {
       await client.listTunnels(ACCOUNT_ID, 'gws-ea-owned');
       await expect(client.getTunnelToken(ACCOUNT_ID, TUNNEL_ID)).resolves.toBe(connectorToken);
@@ -568,16 +571,10 @@ describe('Cloudflare request logging', () => {
         ...(await readdir(path.join(run.directory, 'steps'))).map((name) => path.join(run.directory, 'steps', name)),
       ].map((file) => readFile(file, 'utf8')),
     );
-    const staged = await Promise.all(
-      (await readdir(staging)).map((name) => readFile(path.join(staging, name), 'utf8')),
-    );
     const raw = logs.join('\n');
     expect(raw).toMatch(/GET \/client\/v4\/accounts\/[0-9a-f]+\/cfd_tunnel\/[0-9a-f-]+\/token: HTTP 200/u);
     expect(raw).not.toContain(connectorToken);
     expect(raw).not.toContain(REDACTED);
-    expect(staged).toHaveLength(1);
-    expect(staged[0]).toContain('gws-ea-owned');
-    expect(staged.join('\n')).not.toContain(connectorToken);
     expect(redact(`token ${connectorToken}`)).toBe(`token ${REDACTED}`);
   });
 });

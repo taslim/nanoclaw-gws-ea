@@ -10,13 +10,12 @@ export const ONECLI_INSTANCE_LABEL = 'dev.gws-ea.instance-id' as const;
 export const ONECLI_RESOURCE_ROLE_LABEL = 'dev.gws-ea.onecli-role' as const;
 
 /**
- * The OneCLI versions an instance's release pinned, as its release-preflight
- * receipt records them. An instance runs these, never the launcher's own, so
- * a launcher upgrade never upgrades a running assistant.
+ * The OneCLI version an instance's release pinned, as its release-preflight
+ * receipt records it. An instance runs it, never the launcher's own, so a
+ * launcher upgrade never upgrades a running assistant.
  */
 export interface OnecliPins {
   readonly gateway: string;
-  readonly cli: string;
 }
 
 export function onecliGatewayImage(pins: Pick<OnecliPins, 'gateway'>): string {
@@ -58,12 +57,10 @@ export interface OnecliRuntimeLayout {
   readonly rootDirectory: string;
   readonly composeFile: string;
   readonly envFile: string;
-  readonly cliHome: string;
   readonly secretsDirectory: string;
   readonly postgresPasswordFile: string;
   readonly encryptionKeyFile: string;
   readonly gatewayInternalSecretFile: string;
-  readonly providerStagingFile: string;
   readonly backendNetwork: string;
   readonly agentEgressNetwork: string;
   readonly postgresVolume: string;
@@ -72,7 +69,6 @@ export interface OnecliRuntimeLayout {
   readonly gatewayPort: number;
   readonly appUrl: string;
   readonly gatewayUrl: string;
-  readonly cliExecutable: string;
   /** The local Docker endpoint recorded for this instance, given to every Docker command. */
   readonly dockerEndpoint: string;
 }
@@ -83,7 +79,6 @@ export interface OnecliRuntimeLayoutInput {
   readonly project: string;
   readonly appPort: number;
   readonly gatewayPort: number;
-  readonly cliExecutable: string;
   readonly dockerEndpoint: string;
 }
 
@@ -98,9 +93,6 @@ export function createOnecliRuntimeLayout(input: OnecliRuntimeLayoutInput): Onec
   if (!/^[a-z0-9][a-z0-9_-]{0,62}$/.test(input.project)) {
     throw new Error('OneCLI Compose project is invalid');
   }
-  if (!path.isAbsolute(input.cliExecutable) || path.resolve(input.cliExecutable) !== input.cliExecutable) {
-    throw new Error('OneCLI CLI path must be absolute and normalized');
-  }
   const rootDirectory = path.resolve(input.instanceRoot, 'onecli');
   const project = input.project;
   const secretsDirectory = path.join(rootDirectory, 'secrets');
@@ -110,12 +102,10 @@ export function createOnecliRuntimeLayout(input: OnecliRuntimeLayoutInput): Onec
     rootDirectory,
     composeFile: path.join(rootDirectory, 'compose.yaml'),
     envFile: path.join(rootDirectory, 'compose.env'),
-    cliHome: path.join(rootDirectory, 'cli-home'),
     secretsDirectory,
     postgresPasswordFile: path.join(secretsDirectory, 'postgres-password'),
     encryptionKeyFile: path.join(secretsDirectory, 'encryption-key'),
     gatewayInternalSecretFile: path.join(secretsDirectory, 'gateway-internal-secret'),
-    providerStagingFile: path.join(secretsDirectory, 'provider-credential.staging'),
     backendNetwork: `${project}-backend`,
     agentEgressNetwork: `${project}-agent-egress`,
     postgresVolume: `${project}-postgres`,
@@ -124,7 +114,6 @@ export function createOnecliRuntimeLayout(input: OnecliRuntimeLayoutInput): Onec
     gatewayPort: input.gatewayPort,
     appUrl: `http://127.0.0.1:${input.appPort}`,
     gatewayUrl: `http://127.0.0.1:${input.gatewayPort}`,
-    cliExecutable: input.cliExecutable,
     dockerEndpoint: requireDockerEndpoint(input.dockerEndpoint, 'Docker endpoint', 'invalid_runtime_config'),
   };
 }

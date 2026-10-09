@@ -21,7 +21,6 @@ export interface InstanceServiceCoordinates {
   readonly manager: InstanceServiceManager;
   readonly serviceIdentity: string;
   readonly serviceDefinitionPath: string;
-  readonly imageTag: string;
   readonly installLabel: string;
 }
 
@@ -40,7 +39,6 @@ export function createInstanceServiceCoordinates(input: InstanceServiceCoordinat
     manager,
     serviceIdentity,
     serviceDefinitionPath,
-    imageTag: names.defaultContainerImage,
     installLabel: names.containerInstallLabel,
   };
 }

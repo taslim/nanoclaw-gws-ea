@@ -157,7 +157,7 @@ function candidate(): PrincipalCandidate {
 
 function input(overrides: Partial<ConversationVerificationInput> = {}): ConversationVerificationInput {
   return {
-    checkoutRoot: checkout,
+    stateRoot: checkout,
     mainAgentGroupId: MAIN,
     messagingGroupId: dmId,
     principalUserId: USER,
@@ -264,7 +264,7 @@ describe('principal binding verification', () => {
   it('matches the binding and queued welcome in the session the router created for the DM', async () => {
     const welcomeEventId = principalWelcomeEventId(RUNTIME, MAIN, candidate());
     await inbound(`${welcomeEventId}:${MAIN}`, BOUND_AT, 'chat', { text: 'welcome', senderId: USER });
-    const runtime = { ...RUNTIME, checkout_realpath: checkout };
+    const runtime = { ...RUNTIME, state_root: checkout };
 
     expect(
       verifyPrincipalBinding({
@@ -291,7 +291,7 @@ describe('principal binding verification', () => {
 
     expect(
       verifyPrincipalBinding({
-        runtime: { ...RUNTIME, checkout_realpath: checkout },
+        runtime: { ...RUNTIME, state_root: checkout },
         adapterInstance: INSTANCE,
         provisioningStartedAt: BOUND_AT,
         selectedCandidate: candidate(),
@@ -302,7 +302,7 @@ describe('principal binding verification', () => {
   it('is absent until the welcome is queued', () => {
     expect(
       verifyPrincipalBinding({
-        runtime: { ...RUNTIME, checkout_realpath: checkout },
+        runtime: { ...RUNTIME, state_root: checkout },
         adapterInstance: INSTANCE,
         provisioningStartedAt: BOUND_AT,
         selectedCandidate: candidate(),
@@ -551,7 +551,7 @@ describe('read-only observation', () => {
     expect(readLatestDelivery(checkout)).toMatchObject({ last: { messageOutId: 'out-welcome' } });
     expect(
       verifyPrincipalBinding({
-        runtime: { ...RUNTIME, checkout_realpath: checkout },
+        runtime: { ...RUNTIME, state_root: checkout },
         adapterInstance: INSTANCE,
         provisioningStartedAt: BOUND_AT,
         selectedCandidate: candidate(),

@@ -1,7 +1,6 @@
 import Database from 'better-sqlite3';
 import { existsSync } from 'node:fs';
 import { mkdir, rmdir } from 'node:fs/promises';
-import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import {
@@ -21,13 +20,10 @@ import {
   type ProvisionSteps,
   type StepResource,
 } from './phases.js';
-import { assertReleaseCheckoutAgreement, materializeReleaseCheckout, type ResolvedRelease } from './checkout.js';
-import {
-  runReleasePreflight,
-  type DeployedSetup,
-  type ReleasePreflightInput,
-  type ReleasePreflightResult,
-} from './release-preflight.js';
+import { assertReleaseCheckoutAgreement, type ResolvedRelease } from './checkout.js';
+import { loadReleasePreflightReceipt, type ReleasePreflightReceipt } from './kept-release.js';
+import type { DeployedSetup, ReleasePreflightInput } from './release-preflight.js';
+import { applyReleaseEnvironment, stageRelease } from './release-stage.js';
 import {
   findCredentialSecret,
   importProviderCredential,
@@ -47,9 +43,10 @@ import {
 } from './onecli-compose.js';
 import {
   reconcileInstanceRuntime,
-  runInstanceOnecliAdminCommand,
+  instanceOnecliAdmin,
   createInstanceRuntimeConfig,
   googleChatProjectNumberFile,
+  hostLogFiles,
   instanceServicePid,
   loadInstanceRuntimeConfig,
   type HostStatusHelpers,
@@ -61,15 +58,18 @@ import { createServiceControl, runtimeServiceTarget, type NanoclawServiceHelpers
 import { instanceServicePlatform } from './service-coordinates.js';
 import { runInstanceNclJson } from './ncl.js';
 import { reconcileMainIdentity, type MainIdentityDependencies, type MainIdentityInput } from './identity.js';
+import type { OnecliAgent } from './onecli-admin.js';
 import {
   listPrincipalCandidates,
   reconcilePrincipalDm,
   type PrincipalCandidate,
   type PrincipalDiscoveryDependencies,
 } from './principal.js';
-import { verifyExistingGchatEndpoint, verifyExistingGchatRoute, validateExistingGchatEndpoint } from './endpoint.js';
+import { verifyExistingGchatRoute, validateExistingGchatEndpoint } from './endpoint.js';
 import {
+  centralDatabaseFile,
   instanceErrorsSince,
+  openWithoutSideFiles,
   verifyPrincipalBinding,
   verifyTalkableConversation,
   type ConversationVerificationInput,
@@ -79,9 +79,10 @@ import {
   type PrincipalBindingVerificationResult,
 } from './verify.js';
 import { readOwnerOnlyFile, readOwnerOnlyJson, removePrivateFile, writePrivateTextFile } from './secrets.js';
-import { assertInstanceId, getInstanceReservation } from './registry.js';
+import { assertInstanceId, getInstanceReservation, writeInstanceMarker } from './registry.js';
 import { isErrno } from '../community-portal/errors.js';
-import { instanceRuntimeFile, isRegularFile, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
+import { isRegularFile, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
+import { createState, pointCurrent, readCurrent, releaseName } from './release-layout.js';
 import { pollUntil } from './poll.js';
 import { findPortHolder, portInUseError } from './ports.js';
 import {
@@ -95,7 +96,6 @@ import {
   isRecord,
   normalizePrincipalEmail,
   optionalString,
-  parseJson,
   requireDockerEndpoint,
   requirePath,
   requireRecord,
@@ -105,11 +105,9 @@ import {
 import { parseGcpProjectNumber } from './gcp-identity.js';
 import {
   credentialMatchesMetadata,
-  sameCredentialMetadata,
   type ProviderCredential,
   type ProviderCredentialMetadata,
 } from '../provider-credential.js';
-import { assertProviderProvisioningCapabilityDigest } from '../provider-provisioning-capability.js';
 import { googleChatConfigurationUrl } from './chat-configuration.js';
 import { googleSignInPause, type Interaction } from './events.js';
 import { googleConnectionResources, type GoogleConnectionInput } from './google-connection.js';
@@ -145,7 +143,8 @@ export interface ProductionProvisionOptions {
 
 export interface ProductionProvisionInput {
   readonly release: ResolvedRelease;
-  readonly releasePreflight: ReleasePreflightInput;
+  /** The provider setup the release's receipt records. */
+  readonly releasePreflight: Pick<ReleasePreflightInput, 'provider' | 'providerCredential'>;
   readonly onecli: OnecliRuntimeLayout;
   readonly runtime: InstanceRuntimeConfig;
   readonly gcp: GcpProjectInput;
@@ -190,8 +189,7 @@ type Observe = (context: ProductionProvisionContext) => Promise<Observation>;
 
 export interface ProductionProvisionDependencies {
   readonly observeCheckout: Observe;
-  readonly materializeReleaseCheckout: typeof materializeReleaseCheckout;
-  readonly runReleasePreflight: typeof runReleasePreflight;
+  readonly stageRelease: typeof stageRelease;
   /** `provision_gcp`'s resources. */
   readonly googleCloudResources: typeof googleCloudResources;
   readonly getOwnedGcpProjectNumber: typeof getOwnedGcpProjectNumber;
@@ -210,7 +208,6 @@ export interface ProductionProvisionDependencies {
   readonly findPortHolder: typeof findPortHolder;
   readonly reconcileMainIdentity: typeof reconcileMainIdentity;
   readonly verifyRoute: typeof verifyExistingGchatRoute;
-  readonly verifyEndpoint: typeof verifyExistingGchatEndpoint;
   readonly verifyPrincipalBinding: (input: PrincipalBindingVerificationInput) => PrincipalBindingVerificationResult;
   readonly reconcilePrincipal: typeof reconcilePrincipalDm;
   readonly verifyConversation: (input: ConversationVerificationInput) => ConversationVerificationResult;
@@ -221,168 +218,76 @@ export interface ProductionProvisionDependencies {
   readonly sleep: (milliseconds: number) => Promise<void>;
 }
 
+/**
+ * The release step's postcondition: the assistant's `state/` carries its
+ * marker, and the live link names the reservation's release, complete, at its
+ * commit with a clean tree, whose receipt is this instance's.
+ */
 async function defaultObserveCheckout(context: ProductionProvisionContext): Promise<Observation> {
+  const { paths, instanceId } = context.operation;
   try {
-    await assertReleaseCheckoutAgreement(context.operation.paths, context.operation.instanceId);
+    if ((await readCurrent(paths.instanceLayout(instanceId))) !== releaseName(context.input.release.commit)) {
+      return ABSENT;
+    }
+    await assertReleaseCheckoutAgreement(paths, instanceId);
     await instanceReleaseReceipt(context);
     return PRESENT;
   } catch (error) {
-    if (error instanceof GwsEaError && ['marker_missing', 'checkout_exists', 'unsafe_checkout'].includes(error.code)) {
-      return ABSENT;
-    }
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT') return ABSENT;
+    if (error instanceof GwsEaError && ['marker_missing', 'unsafe_checkout'].includes(error.code)) return ABSENT;
+    if (isErrno(error, 'ENOENT')) return ABSENT;
     throw error;
   }
 }
 
-interface ReleasePreflightReceipt extends ReleasePreflightResult {
-  readonly schema_version: 1;
-  readonly instance_id: string;
-  readonly deployed_commit: string;
-}
-
-interface ReleasePreflightExpectation {
-  readonly instanceId: string;
-  /** The commits the receipt may name: the reservation's, and mid-update the one an operation placed live. */
-  readonly deployedCommits: readonly string[];
-  readonly provider: string;
-  readonly providerCapabilityDigest?: string;
-  readonly providerCredential?: ProviderCredentialMetadata;
-}
-
-const INVALID_RECEIPT = 'invalid_release_preflight';
-
-const OPTIONAL_CREDENTIAL_FIELDS = ['pathPattern', 'headerName', 'valueFormat', 'paramName', 'paramFormat'] as const;
-
-function credentialMetadataRecord(value: unknown): ProviderCredentialMetadata {
-  const metadata = requireRecord(value, 'Release provider credential metadata', INVALID_RECEIPT);
-  const field = (key: string): string =>
-    requireString(metadata[key], `Release provider credential ${key}`, INVALID_RECEIPT);
-  const optional: { [Key in (typeof OPTIONAL_CREDENTIAL_FIELDS)[number]]?: string } = {};
-  for (const key of OPTIONAL_CREDENTIAL_FIELDS) if (metadata[key] !== undefined) optional[key] = field(key);
-  return { name: field('name'), type: field('type'), hostPattern: field('hostPattern'), ...optional };
-}
-
-/**
- * The receipt records what create's release preflight established, including
- * the OneCLI cohort the release pinned. The instance's OneCLI runtime runs
- * that cohort; resume never compares it with this launcher's pins, so a
- * launcher upgrade neither blocks nor upgrades an instance it did not create.
- */
-function validateReleasePreflightReceipt(
-  value: unknown,
-  expectation: ReleasePreflightExpectation,
-): ReleasePreflightReceipt {
-  const receipt = requireRecord(value, 'Release preflight receipt', INVALID_RECEIPT);
-  const onecli = requireRecord(receipt.onecli, 'Release preflight OneCLI cohort', INVALID_RECEIPT);
-  let providerCapabilityDigest: string;
-  try {
-    providerCapabilityDigest = assertProviderProvisioningCapabilityDigest(receipt.providerCapabilityDigest);
-  } catch {
-    throw new GwsEaError(INVALID_RECEIPT, 'Release provider capability digest is invalid');
-  }
-  const validated: ReleasePreflightReceipt = {
-    schema_version: 1,
-    instance_id: requireString(receipt.instance_id, 'Release preflight instance_id', INVALID_RECEIPT),
-    deployed_commit: requireString(receipt.deployed_commit, 'Release preflight deployed_commit', INVALID_RECEIPT),
-    provider: requireString(receipt.provider, 'Release preflight provider', INVALID_RECEIPT),
-    providerCapabilityDigest,
-    providerCredential: credentialMetadataRecord(receipt.providerCredential),
-    packageManager: requireString(receipt.packageManager, 'Release preflight packageManager', INVALID_RECEIPT),
-    onecli: {
-      gateway: requireString(onecli.gateway, 'Release preflight OneCLI gateway', INVALID_RECEIPT),
-      cli: requireString(onecli.cli, 'Release preflight OneCLI CLI', INVALID_RECEIPT),
-      sdk: requireString(onecli.sdk, 'Release preflight OneCLI SDK', INVALID_RECEIPT),
-    },
-  };
-  if (
-    receipt.schema_version !== 1 ||
-    validated.instance_id !== expectation.instanceId ||
-    !expectation.deployedCommits.includes(validated.deployed_commit) ||
-    validated.provider !== expectation.provider ||
-    (expectation.providerCapabilityDigest !== undefined &&
-      providerCapabilityDigest !== expectation.providerCapabilityDigest) ||
-    (expectation.providerCredential !== undefined &&
-      !sameCredentialMetadata(validated.providerCredential, expectation.providerCredential))
-  ) {
-    throw new GwsEaError('release_preflight_mismatch', 'Release preflight receipt does not match this instance');
-  }
-  return validated;
-}
-
-async function loadReleasePreflightReceipt(
-  file: string,
-  expectation: ReleasePreflightExpectation,
-): Promise<ReleasePreflightReceipt> {
-  return validateReleasePreflightReceipt(
-    await readOwnerOnlyJson(file, 'Release preflight receipt', INVALID_RECEIPT),
-    expectation,
-  );
-}
-
-/** The receipt create's release preflight wrote for this instance, checked against it. */
+/** The receipt create's staging kept with this instance's release, checked against it. */
 function instanceReleaseReceipt(context: ProductionProvisionContext): Promise<ReleasePreflightReceipt> {
-  return loadReleasePreflightReceipt(context.operation.paths.releasePreflightFile(context.operation.instanceId), {
+  const { paths, instanceId } = context.operation;
+  return loadReleasePreflightReceipt(paths.releasePreflightFile(instanceId, context.input.release.commit), {
     instanceId: context.operation.instanceId,
     deployedCommits: [context.input.release.commit],
     provider: context.input.releasePreflight.provider,
-    providerCapabilityDigest: context.input.releasePreflight.providerCapabilityDigest,
     providerCredential: context.input.releasePreflight.providerCredential,
   });
 }
 
-/** The OneCLI versions this instance's release pinned: its runtime runs these, not the launcher's. */
+/** The OneCLI version this instance's release pinned: its runtime runs it, not the launcher's. */
 async function instanceOnecliPins(context: ProductionProvisionContext): Promise<OnecliPins> {
   const { onecli } = await instanceReleaseReceipt(context);
-  return { gateway: onecli.gateway, cli: onecli.cli };
+  return { gateway: onecli.gateway };
 }
 
-/** Record what a release preflight established for `instanceId` at `deployedCommit`, owner-only, at `file`. */
-export async function writeReleasePreflightReceipt(
-  file: string,
-  instanceId: string,
-  deployedCommit: string,
-  result: ReleasePreflightResult,
-): Promise<void> {
-  const receipt: ReleasePreflightReceipt = {
-    schema_version: 1,
-    instance_id: instanceId,
-    deployed_commit: deployedCommit,
-    ...result,
-  };
-  await writePrivateTextFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
-}
-
-async function persistReleasePreflightReceipt(
-  context: ProductionProvisionContext,
-  result: ReleasePreflightResult,
-): Promise<void> {
-  const { paths, instanceId } = context.operation;
-  await writeReleasePreflightReceipt(
-    paths.releasePreflightFile(instanceId),
-    instanceId,
-    context.input.release.commit,
-    result,
-  );
-}
-
-async function ensureReleaseCheckout(
+/**
+ * Create's first release (KTD1): the assistant's `state/`, its marker first so
+ * a `state/` there always names its assistant, then the reservation's release
+ * staged as every release is (`stageRelease`), and the live link pointed at
+ * it. Of the files kept with the release, create applies only gws-ea's `.env`
+ * keys here: its OneCLI step renders and starts the Compose file and its
+ * service step installs the service definition, each as the release kept it,
+ * and installing the definition before the host can start would have launchd
+ * start it at the next login. Run again, it finishes what a run cut short
+ * began, restaging a release left incomplete.
+ */
+async function ensureRelease(
   context: ProductionProvisionContext,
   dependencies: ProductionProvisionDependencies,
 ): Promise<void> {
-  try {
-    await assertReleaseCheckoutAgreement(context.operation.paths, context.operation.instanceId);
-  } catch (error) {
-    const code = error instanceof GwsEaError ? error.code : (error as NodeJS.ErrnoException).code;
-    if (!['ENOENT', 'marker_missing', 'checkout_exists', 'unsafe_checkout'].includes(code ?? '')) throw error;
-    await dependencies.materializeReleaseCheckout(
-      context.operation.paths,
-      await getInstanceReservation(context.operation.paths, context.operation.instanceId),
-    );
-  }
-  const result = await dependencies.runReleasePreflight(context.input.releasePreflight);
-  await persistReleasePreflightReceipt(context, result);
+  const { paths, instanceId } = context.operation;
+  const { runtime, onecli, release, releasePreflight, serviceDependencies } = context.input;
+  const layout = paths.instanceLayout(instanceId);
+  const name = releaseName(release.commit);
+  await writeInstanceMarker(paths, instanceId);
+  await createState(layout);
+  await dependencies.stageRelease({
+    paths,
+    view: await getInstanceReservation(paths, instanceId),
+    runtime,
+    state: layout.state,
+    onecli,
+    service: serviceDependencies,
+    provider: releasePreflight,
+  });
+  await applyReleaseEnvironment(runtime, name, serviceDependencies.upsertEnvVars);
+  await pointCurrent(layout, name);
 }
 
 /** The OneCLI runtime at the instance's pins, and the API key files the host and admin commands read. */
@@ -411,13 +316,9 @@ async function defaultObserveOnecli(context: ProductionProvisionContext): Promis
 async function defaultObserveProvider(context: ProductionProvisionContext): Promise<Observation> {
   const credential = context.input.providerCredentialMetadata;
   try {
-    const result = await runInstanceOnecliAdminCommand(context.input.runtime, ['secrets', 'list', '--max', '0']);
-    const value = unwrapData(parseJson(result.stdout, 'OneCLI output', 'invalid_child_output'));
-    if (!Array.isArray(value) || !value.every(isRecord)) {
-      throw new GwsEaError('invalid_child_output', 'OneCLI returned an invalid secret list');
-    }
+    const secrets = await (await instanceOnecliAdmin(context.input.runtime)).listSecrets();
     if (context.state.providerSecretId) {
-      const match = value.find((candidate) => candidate.id === context.state.providerSecretId);
+      const match = secrets.find((candidate) => candidate.id === context.state.providerSecretId);
       if (!match) return ABSENT;
       if (!credential || !onecliSecretMatchesCredentialMetadata(match, credential)) {
         throw new GwsEaError('onecli_secret_conflict', 'Provider credential metadata does not match');
@@ -425,7 +326,7 @@ async function defaultObserveProvider(context: ProductionProvisionContext): Prom
       return PRESENT;
     }
     if (!credential) return ABSENT;
-    const match = findCredentialSecret(value, credential, {
+    const match = findCredentialSecret(secrets, credential, {
       ambiguous: 'Provider credential is ambiguous',
       conflict: 'Provider credential metadata does not match',
     });
@@ -435,9 +336,7 @@ async function defaultObserveProvider(context: ProductionProvisionContext): Prom
     context.state.providerSecretId = id;
     return PRESENT;
   } catch (error) {
-    if (error instanceof GwsEaError && ['command_failed', 'command_timeout'].includes(error.code)) {
-      return ABSENT;
-    }
+    if (error instanceof GwsEaError && error.code === 'onecli_request_failed') return ABSENT;
     throw error;
   }
 }
@@ -450,13 +349,10 @@ async function runNanoclawProbeNcl(context: ProductionProvisionContext, args: re
 /** How long a (re)started host may take to answer and connect Google Chat. */
 const HOST_READY_TIMEOUT_MS = 60_000;
 
-/** Upstream's messages name the checkout-relative error log; point at this instance's. */
+/** Upstream's messages name the checkout-relative error log; point at this instance's physical one. */
 function hostReason(error: unknown, runtime: InstanceRuntimeConfig): string {
   const message = error instanceof Error ? error.message : String(error);
-  return message.replaceAll(
-    'logs/nanoclaw.error.log',
-    path.join(runtime.checkout_realpath, 'logs', 'nanoclaw.error.log'),
-  );
+  return message.replaceAll('logs/nanoclaw.error.log', hostLogFiles(runtime.instance_root).errors);
 }
 
 /**
@@ -471,10 +367,10 @@ async function observeInstanceHost(
   dependencies: ProductionProvisionDependencies,
 ): Promise<Observation> {
   const { runtime, hostStatus, serviceDependencies } = context.input;
-  const errorLog = path.join(runtime.checkout_realpath, 'logs', 'nanoclaw.error.log');
+  const errorLog = hostLogFiles(runtime.instance_root).errors;
   let status: unknown;
   try {
-    status = await hostStatus.queryHost(runtime.checkout_realpath);
+    status = await hostStatus.queryHost(runtime.checkout_root);
     // eslint-disable-next-line no-catch-all/no-catch-all -- Upstream queryHost reports every failure as a plain Error meaning the host is not answering; its service manager then tells starting from stopped.
   } catch (error) {
     const pid = await dependencies.instanceServicePid(runtime, serviceDependencies);
@@ -517,11 +413,11 @@ async function startInstanceHost(
   dependencies: ProductionProvisionDependencies,
   emit: ProvisionRuntime['emit'],
 ): Promise<void> {
-  const { runtime, hostStatus, serviceDependencies } = context.input;
-  const { pid } = await dependencies.reconcileInstanceRuntime(runtime, serviceDependencies);
+  const { runtime, hostStatus, serviceDependencies, release } = context.input;
+  const { pid } = await dependencies.reconcileInstanceRuntime(runtime, release.commit, serviceDependencies);
   emit?.({ type: 'step-waiting', step: 'start_nanoclaw', reason: 'Waiting for the assistant to connect Google Chat…' });
   try {
-    await hostStatus.waitForHost(runtime.checkout_realpath, {
+    await hostStatus.waitForHost(runtime.checkout_root, {
       channel: 'gchat',
       ...(pid === undefined ? {} : { pid, alive: () => processAlive(pid) }),
       timeoutMs: HOST_READY_TIMEOUT_MS,
@@ -545,11 +441,9 @@ function processAlive(pid: number): boolean {
   }
 }
 
-async function runNanoclawProbeOnecli(context: ProductionProvisionContext, args: readonly string[]): Promise<unknown> {
-  const run = context.input.identityDependencies?.runOnecliAdmin;
-  if (run) return run(context.input.runtime, args);
-  const result = await runInstanceOnecliAdminCommand(context.input.runtime, args);
-  return parseJson(result.stdout, 'OneCLI output', 'invalid_child_output');
+async function listOnecliAgents(context: ProductionProvisionContext): Promise<readonly OnecliAgent[]> {
+  const admin = context.input.identityDependencies?.onecliAdmin ?? instanceOnecliAdmin;
+  return (await admin(context.input.runtime)).listAgents();
 }
 
 /** Main exists as published, and its OneCLI agent injects every matching secret (all mode). */
@@ -579,18 +473,16 @@ async function defaultObserveMainIdentity(context: ProductionProvisionContext): 
     ) {
       return ABSENT;
     }
-    const agents = unwrapData(await runNanoclawProbeOnecli(context, ['agents', 'list', '--max', '0']));
-    if (!Array.isArray(agents) || !agents.every(isRecord)) return ABSENT;
-    const matching = agents.filter((agent) => agent.identifier === mainAgentGroupId);
+    const matching = (await listOnecliAgents(context)).filter((agent) => agent.identifier === mainAgentGroupId);
     const agent = matching[0];
-    const agentId = optionalString(agent?.id);
-    if (matching.length !== 1 || !agentId || agent!.name !== 'main' || agent!.secretMode !== 'all') {
-      return ABSENT;
-    }
+    if (matching.length !== 1 || agent?.name !== 'main' || agent.secretMode !== 'all') return ABSENT;
     context.state.mainAgentGroupId = mainAgentGroupId;
     return PRESENT;
   } catch (error) {
-    if (error instanceof GwsEaError && ['command_failed', 'command_timeout', 'ncl_failed'].includes(error.code)) {
+    if (
+      error instanceof GwsEaError &&
+      ['command_failed', 'command_timeout', 'ncl_failed', 'onecli_request_failed'].includes(error.code)
+    ) {
       return ABSENT;
     }
     throw error;
@@ -641,8 +533,7 @@ async function ensureGchatProjectNumber(
 
 const defaultProductionDependencies: ProductionProvisionDependencies = {
   observeCheckout: defaultObserveCheckout,
-  materializeReleaseCheckout,
-  runReleasePreflight,
+  stageRelease,
   googleCloudResources,
   getOwnedGcpProjectNumber,
   observeOnecli: defaultObserveOnecli,
@@ -657,7 +548,6 @@ const defaultProductionDependencies: ProductionProvisionDependencies = {
   findPortHolder,
   reconcileMainIdentity,
   verifyRoute: verifyExistingGchatRoute,
-  verifyEndpoint: verifyExistingGchatEndpoint,
   verifyPrincipalBinding,
   reconcilePrincipal: reconcilePrincipalDm,
   verifyConversation: verifyTalkableConversation,
@@ -790,7 +680,7 @@ async function principalPause(
 ): Promise<ProvisionHumanPause> {
   const journal = await readProvisionJournal(context.operation.paths, context.operation.instanceId);
   const since = journal.steps[phase]?.started_at ?? new Date().toISOString();
-  const errors = await instanceErrorsSince(context.input.runtime.checkout_realpath, since);
+  const errors = await instanceErrorsSince(context.input.runtime.instance_root, since);
   return {
     ...humanPause(phase, code, message),
     details: [
@@ -884,7 +774,7 @@ function conversationInput(context: ProductionProvisionContext): ConversationVer
   const welcomeEventId = context.state.welcomeEventId;
   if (!mainAgentGroupId || !principal || !welcomeEventId) return undefined;
   return {
-    checkoutRoot: context.input.runtime.checkout_realpath,
+    stateRoot: context.input.runtime.state_root,
     mainAgentGroupId,
     messagingGroupId: principal.messagingGroupId,
     principalUserId: principal.userId,
@@ -910,12 +800,6 @@ export function createProductionProvisionSteps(
   const { ingress } = input;
   if (input.runtime.instance_id !== context.operation.instanceId) {
     throw new GwsEaError('runtime_mismatch', 'Provision runtime targets a different instance');
-  }
-  if (input.release.commit !== input.runtime.deployed_commit) {
-    throw new GwsEaError('release_mismatch', 'Provision release and runtime commits disagree');
-  }
-  if (input.releasePreflight.checkoutRoot !== input.runtime.checkout_realpath) {
-    throw new GwsEaError('runtime_mismatch', 'Release preflight targets a different checkout');
   }
   if (input.runtime.endpoint_url !== validateExistingGchatEndpoint(input.runtime.endpoint_url)) {
     throw new GwsEaError('endpoint_mismatch', 'Runtime endpoint is not canonical');
@@ -977,7 +861,7 @@ export function createProductionProvisionSteps(
           name: 'the release checkout',
           observe: dependencies.observeCheckout,
           apply: async (value) => {
-            await ensureReleaseCheckout(value, dependencies);
+            await ensureRelease(value, dependencies);
             return undefined;
           },
         },
@@ -1138,10 +1022,7 @@ export function createProductionProvisionSteps(
           observe: async (value) => {
             if (!value.input.chatConfigured) return { status: 'pause', pause: chatConfigurationPause(value.input) };
             try {
-              await dependencies.verifyEndpoint({
-                endpointUrl: input.runtime.endpoint_url,
-                audienceUrl: input.runtime.endpoint_url,
-              });
+              await dependencies.verifyRoute({ endpointUrl: input.runtime.endpoint_url });
               return PRESENT;
               /* eslint-disable-next-line no-catch-all/no-catch-all -- Any auth-probe failure means the external postcondition is absent. */
             } catch {
@@ -1150,10 +1031,7 @@ export function createProductionProvisionSteps(
           },
           apply: async (value) => {
             if (!value.input.chatConfigured) return chatConfigurationPause(value.input);
-            await dependencies.verifyEndpoint({
-              endpointUrl: input.runtime.endpoint_url,
-              audienceUrl: input.runtime.endpoint_url,
-            });
+            await dependencies.verifyRoute({ endpointUrl: input.runtime.endpoint_url });
             return undefined;
           },
         },
@@ -1227,14 +1105,12 @@ const BOOTSTRAP_SCHEMA_VERSION = 1 as const;
 
 export interface ProductionBootstrapManifest {
   readonly schema_version: typeof BOOTSTRAP_SCHEMA_VERSION;
-  readonly onecli_cli_path: string;
   readonly node_path: string;
   readonly home_directory: string;
   readonly platform: 'macos' | 'linux';
   readonly running_as_root: boolean;
   /** The local Docker endpoint prerequisites resolved at create. */
   readonly docker_endpoint: string;
-  readonly provider_capability_digest: string;
   readonly provider: {
     readonly id: string;
     readonly name: string;
@@ -1292,21 +1168,13 @@ export function validateProductionBootstrapManifest(value: unknown): ProductionB
     return candidate === null || candidate === undefined ? null : bootstrapString(candidate, `provider ${key}`, 512);
   };
   const selected = manifest.selected_messaging_group_id;
-  let providerCapabilityDigest: string;
-  try {
-    providerCapabilityDigest = assertProviderProvisioningCapabilityDigest(manifest.provider_capability_digest);
-  } catch {
-    throw new GwsEaError(INVALID_BOOTSTRAP, 'provider_capability_digest is invalid');
-  }
   return {
     schema_version: BOOTSTRAP_SCHEMA_VERSION,
-    onecli_cli_path: requirePath(manifest.onecli_cli_path, 'onecli_cli_path', INVALID_BOOTSTRAP),
     node_path: requirePath(manifest.node_path, 'node_path', INVALID_BOOTSTRAP),
     home_directory: requirePath(manifest.home_directory, 'home_directory', INVALID_BOOTSTRAP),
     platform: manifest.platform,
     running_as_root: manifest.running_as_root,
     docker_endpoint: requireDockerEndpoint(manifest.docker_endpoint, 'docker_endpoint', INVALID_BOOTSTRAP),
-    provider_capability_digest: providerCapabilityDigest,
     provider: {
       id: bootstrapString(provider.id, 'provider id', 64),
       name: bootstrapString(provider.name, 'provider name', 256),
@@ -1356,7 +1224,7 @@ export async function installProductionBootstrapManifest(
 ): Promise<void> {
   assertInstanceId(instanceId);
   const manifest = validateProductionBootstrapManifest(input);
-  await preparePrivateDirectory(paths.instancesRoot);
+  await preparePrivateDirectory(paths.stateRoot);
   try {
     await mkdir(paths.instanceRoot(instanceId), { mode: 0o700 });
   } catch (error) {
@@ -1395,10 +1263,10 @@ interface PersistedProfileIdentity {
 }
 
 function readPersistedProfile(runtime: InstanceRuntimeConfig): PersistedProfileIdentity | undefined {
-  const file = path.join(runtime.checkout_realpath, 'data', 'v2.db');
+  const file = centralDatabaseFile(runtime.state_root);
   let database: Database.Database;
   try {
-    database = new Database(file, { readonly: true, fileMustExist: true });
+    database = openWithoutSideFiles(file);
   } catch (error) {
     if (!existsSync(file)) return undefined;
     throw error;
@@ -1432,7 +1300,6 @@ function hydrateMainState(profile: PersistedProfileIdentity | undefined): Produc
  */
 interface ProvisionSource {
   readonly providerCredentialMetadata: ProviderCredentialMetadata;
-  readonly providerCapabilityDigest: string;
   readonly identity: MainIdentityInput;
   /** The messaging group create's bootstrap input selected, if any. */
   readonly bootstrapMessagingGroupId: string | null;
@@ -1450,7 +1317,6 @@ async function resolveProvisionSource(
     const profile = readPersistedProfile(runtime);
     return {
       providerCredentialMetadata: bootstrapProviderCredential(manifest),
-      providerCapabilityDigest: manifest.provider_capability_digest,
       profile,
       identity: {
         assistantDisplayName: manifest.identity.assistant_display_name,
@@ -1465,7 +1331,8 @@ async function resolveProvisionSource(
       bootstrapMessagingGroupId: manifest.selected_messaging_group_id,
     };
   }
-  const preflight = await loadReleasePreflightReceipt(operation.paths.releasePreflightFile(operation.instanceId), {
+  const receipt = operation.paths.releasePreflightFile(operation.instanceId, reservation.deployed_commit);
+  const preflight = await loadReleasePreflightReceipt(receipt, {
     instanceId: operation.instanceId,
     deployedCommits: [reservation.deployed_commit],
     provider: runtime.selected_provider,
@@ -1476,7 +1343,6 @@ async function resolveProvisionSource(
   }
   return {
     providerCredentialMetadata: preflight.providerCredential,
-    providerCapabilityDigest: preflight.providerCapabilityDigest,
     profile,
     // No principal addresses: once main is published, the profile holds them and the principal and operator change them.
     identity: {
@@ -1503,16 +1369,15 @@ async function readInstanceState(paths: ControlPlanePaths, reservation: Instance
   };
   const [manifest, runtime] = await Promise.all([
     loadProductionBootstrapManifest(paths.bootstrapFile(reservation.instance_id)).catch(absent),
-    loadInstanceRuntimeConfig(instanceRuntimeFile(reservation.checkout_realpath)).catch(absent),
+    loadInstanceRuntimeConfig(paths.runtimeFile(reservation.instance_id)).catch(absent),
   ]);
   return { ...(manifest ? { manifest } : {}), ...(runtime ? { runtime } : {}) };
 }
 
-/** The instance's OneCLI layout, run through the CLI and Docker endpoint it records. */
+/** The instance's OneCLI layout, run through the Docker endpoint it records. */
 export function instanceOnecliLayout(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
-  cliExecutable: string,
   dockerEndpoint: string,
 ): OnecliRuntimeLayout {
   return createOnecliRuntimeLayout({
@@ -1521,43 +1386,36 @@ export function instanceOnecliLayout(
     project: reservation.exclusive_resource_claims.onecli_project,
     appPort: reservation.allocated_ports.onecli_app,
     gatewayPort: reservation.allocated_ports.onecli_gateway,
-    cliExecutable,
     dockerEndpoint,
   });
 }
 
-export interface DeployedAssistantSetup extends DeployedSetup {
-  /** The OneCLI CLI the assistant's runtime runs. */
-  readonly onecliCliPath: string;
-}
-
 /**
  * What a created assistant's own record says it runs (KTD6): the provider,
- * credential metadata, and OneCLI cohort its release receipt records, the
- * OneCLI CLI its runtime uses, and the Postgres image its Compose file names.
- * An update holds the tool's release to these, never to the tool's own tree.
- * The receipt must be for one of `commits`: the reservation's by default, or
- * mid-update also the release an operation placed live (KTD17).
+ * credential metadata, and OneCLI cohort the receipt kept with the
+ * reservation's release records, and the Postgres image its Compose file
+ * names. An update holds the tool's release to these, never to the tool's
+ * own tree. Everything is read physically, so it is there while no release
+ * is live.
  */
 export async function readDeployedSetup(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
-  commits: readonly string[] = [reservation.deployed_commit],
-): Promise<DeployedAssistantSetup> {
-  const runtime = await loadInstanceRuntimeConfig(instanceRuntimeFile(reservation.checkout_realpath));
-  const receipt = await loadReleasePreflightReceipt(paths.releasePreflightFile(reservation.instance_id), {
+): Promise<DeployedSetup> {
+  const commit = reservation.deployed_commit;
+  const runtime = await loadInstanceRuntimeConfig(paths.runtimeFile(reservation.instance_id));
+  const receipt = await loadReleasePreflightReceipt(paths.releasePreflightFile(reservation.instance_id, commit), {
     instanceId: reservation.instance_id,
-    deployedCommits: commits,
+    deployedCommits: [commit],
     provider: runtime.selected_provider,
   });
-  const onecli = instanceOnecliLayout(paths, reservation, runtime.onecli_cli_path, runtime.docker_endpoint);
+  const onecli = instanceOnecliLayout(paths, reservation, runtime.docker_endpoint);
   const images = parseOnecliComposeImages(await readOwnerOnlyFile(onecli.composeFile));
   return {
     onecli: receipt.onecli,
     postgresImage: images.postgres,
     provider: receipt.provider,
     providerCredential: receipt.providerCredential,
-    onecliCliPath: runtime.onecli_cli_path,
   };
 }
 
@@ -1565,16 +1423,15 @@ export async function readDeployedSetup(
  * The host coordinates create recorded for this instance: the runtime's once
  * the host has started, the bootstrap manifest's before. Once recorded,
  * resume probes the Docker endpoint rather than re-resolving the active
- * context, and runs the OneCLI CLI this instance was created with.
+ * context.
  */
 export async function recordedHost(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
-): Promise<{ readonly dockerEndpoint?: string; readonly onecliCliPath?: string }> {
+): Promise<{ readonly dockerEndpoint?: string }> {
   const { manifest, runtime } = await readInstanceState(paths, reservation);
   const dockerEndpoint = runtime?.docker_endpoint ?? manifest?.docker_endpoint;
-  const onecliCliPath = runtime?.onecli_cli_path ?? manifest?.onecli_cli_path;
-  return { ...(dockerEndpoint ? { dockerEndpoint } : {}), ...(onecliCliPath ? { onecliCliPath } : {}) };
+  return dockerEndpoint ? { dockerEndpoint } : {};
 }
 
 /** Build the production context from temporary bootstrap input or authoritative instance state. */
@@ -1603,12 +1460,12 @@ export async function runProductionProvision(
   let onecli: OnecliRuntimeLayout;
   if (persistedRuntime) {
     runtime = persistedRuntime;
-    onecli = instanceOnecliLayout(operation.paths, reservation, runtime.onecli_cli_path, runtime.docker_endpoint);
+    onecli = instanceOnecliLayout(operation.paths, reservation, runtime.docker_endpoint);
   } else {
     if (!manifest) throw new GwsEaError('bootstrap_required', 'The temporary bootstrap manifest is missing');
-    // The runtime records this layout's CLI path and Docker endpoint verbatim, so the layout matches it too.
-    onecli = instanceOnecliLayout(operation.paths, reservation, manifest.onecli_cli_path, manifest.docker_endpoint);
-    runtime = createInstanceRuntimeConfig(reservation, onecli, {
+    // The runtime records this layout's Docker endpoint verbatim, so the layout matches it too.
+    onecli = instanceOnecliLayout(operation.paths, reservation, manifest.docker_endpoint);
+    runtime = createInstanceRuntimeConfig(operation.paths, reservation, onecli, {
       nodePath: manifest.node_path,
       homeDirectory: manifest.home_directory,
       selectedProvider: manifest.provider.id,
@@ -1630,11 +1487,8 @@ export async function runProductionProvision(
         commit: reservation.deployed_commit,
       },
       releasePreflight: {
-        checkoutRoot: reservation.checkout_realpath,
         provider: runtime.selected_provider,
-        providerCapabilityDigest: source.providerCapabilityDigest,
         providerCredential: source.providerCredentialMetadata,
-        onecliCliPath: runtime.onecli_cli_path,
       },
       onecli,
       runtime,
@@ -1644,7 +1498,7 @@ export async function runProductionProvision(
         account: reservation.exclusive_resource_claims.gcp_account,
         serviceAccountEmail: reservation.exclusive_resource_claims.gchat_service_account,
         credentialFile: runtime.secret_files.gchat_credentials,
-        cwd: reservation.checkout_realpath,
+        cwd: runtime.instance_root,
       },
       providerCredentialMetadata: source.providerCredentialMetadata,
       ...(manifest && interaction

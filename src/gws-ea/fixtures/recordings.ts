@@ -11,7 +11,7 @@ function recorded(file: string): string {
   return readFileSync(new URL(file, import.meta.url), 'utf8');
 }
 
-/** `docker context inspect` on Docker Desktop for macOS, from the capture sink. */
+/** `docker context inspect` on Docker Desktop for macOS, from the live gate's capture. */
 export const RECORDED_DOCKER_CONTEXT_INSPECT: SanitizedCommandOutcome = {
   stdout: dockerContextInspect.stdout,
   stderr: dockerContextInspect.stderr,
@@ -23,11 +23,4 @@ export const RECORDED_GCLOUD_REAUTHENTICATION_FAILED: SanitizedCommandOutcome = 
   stdout: '',
   stderr: recorded('./gcloud-auth-print-access-token.reauth-failed.stderr.txt'),
   exitCode: 1,
-};
-
-/** `onecli version` from OneCLI CLI 2.2.5 with no server version to report. */
-export const RECORDED_ONECLI_VERSION: SanitizedCommandOutcome = {
-  stdout: recorded('./onecli-version.stdout.json'),
-  stderr: '',
-  exitCode: 0,
 };

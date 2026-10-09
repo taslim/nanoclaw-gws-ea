@@ -4,6 +4,7 @@ import { getDb } from '../../db/connection.js';
 import { hasControlCharacters, identityMatchKey, normalizePrincipalEmail, parseLine } from '../../gws-ea/validation.js';
 import { getGwsEaProfile, listVerifiedPrincipalUsers } from '../gws-ea-profile/db.js';
 import { createFingerprintKey, fingerprintKeyFile, identityFingerprint, readFingerprintKey } from './fingerprint.js';
+import type { ForgottenFingerprint } from './forget-handoff.js';
 
 /** The fixed set of levels, closest first (R13). Anyone without a record is `unknown`, which is never stored. */
 export const PERSON_LEVELS = ['inner-circle', 'close', 'active', 'known'] as const;
@@ -696,4 +697,54 @@ export async function forgetPerson(
     }
     return { forgotten: id, name: record.name, identities: forgotten };
   });
+}
+
+// ---------------------------------------------------------------------------
+// After a snapshot restore: the forgets the restored state predates (KTD8)
+// ---------------------------------------------------------------------------
+
+/**
+ * Record fingerprints that state a snapshot restore replaced held and the
+ * restored state lacks, in one transaction. One already recorded keeps its
+ * own time.
+ */
+export async function recordForgottenFingerprints(rows: readonly ForgottenFingerprint[]): Promise<void> {
+  const db = getDb();
+  await db.transaction(async () => {
+    for (const { fingerprint, forgotten_at } of rows) {
+      await db.run(
+        `INSERT INTO gws_ea_people_fingerprints (fingerprint, forgotten_at) VALUES (?, ?)
+         ON CONFLICT (fingerprint) DO NOTHING`,
+        fingerprint,
+        forgotten_at,
+      );
+    }
+  });
+}
+
+/**
+ * Everyone holding an identity whose fingerprint is recorded, by name. A
+ * principal adding an identity back clears its fingerprint, so only a
+ * snapshot restore leaves anyone here.
+ */
+export async function listForgottenPeople(): Promise<Array<{ readonly id: string; readonly name: string }>> {
+  const key = await loadFingerprintKey();
+  if (key === undefined) return [];
+  const db = getDb();
+  const recorded = new Set(
+    (await db.all<{ readonly fingerprint: string }>('SELECT fingerprint FROM gws_ea_people_fingerprints')).map(
+      (row) => row.fingerprint,
+    ),
+  );
+  const identities = await db.all<{ readonly id: string; readonly name: string; readonly handle: string }>(
+    `SELECT p.id, p.name, i.handle
+       FROM gws_ea_people_identities i
+       JOIN gws_ea_people p ON p.id = i.person_id
+      ORDER BY p.name_key, p.id`,
+  );
+  const people = new Map<string, string>();
+  for (const { id, name, handle } of identities) {
+    if (recorded.has(identityFingerprint(key, handle))) people.set(id, name);
+  }
+  return [...people].map(([id, name]) => ({ id, name }));
 }

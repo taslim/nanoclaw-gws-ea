@@ -4,14 +4,14 @@ import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parse } from 'yaml';
 
-const TEST_ROOT = '/tmp/nanoclaw-gws-ea-main-template-test';
+const TEST_ROOT = '/tmp/nanoclaw-gws-ea-templates-test';
 const GROUPS_DIR = `${TEST_ROOT}/groups`;
 const DATA_DIR = `${TEST_ROOT}/data`;
 
 vi.mock('../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../config.js')>()),
-  GROUPS_DIR: '/tmp/nanoclaw-gws-ea-main-template-test/groups',
-  DATA_DIR: '/tmp/nanoclaw-gws-ea-main-template-test/data',
+  GROUPS_DIR: '/tmp/nanoclaw-gws-ea-templates-test/groups',
+  DATA_DIR: '/tmp/nanoclaw-gws-ea-templates-test/data',
   TEMPLATES_DIR: `${process.cwd()}/templates`,
 }));
 
@@ -28,7 +28,28 @@ import { parseTemplate } from './parse.js';
 
 const TEMPLATE_ROOT = path.resolve('templates', 'gws-ea', 'main');
 const WELCOME_FILE = path.join(TEMPLATE_ROOT, 'skills', 'welcome', 'SKILL.md');
-const EXPECTED_FILES = ['README.md', 'plugin.json', 'skills/welcome/SKILL.md'];
+
+/**
+ * GWS-EA's templates, each stamped once at create and never again: anything
+ * that must change with a release ships in the release's guidance, skills, or
+ * modules, so a template holds only its plugin and these files.
+ */
+const TEMPLATES = [
+  {
+    ref: 'gws-ea/main',
+    name: 'gws-ea-main',
+    agentName: 'main',
+    skills: ['welcome'],
+    files: ['README.md', 'plugin.json', 'skills/welcome/SKILL.md'],
+  },
+  {
+    ref: 'gws-ea/external-email',
+    name: 'gws-ea-external-email',
+    agentName: 'external-email',
+    skills: [],
+    files: ['README.md', 'plugin.json'],
+  },
+] as const;
 
 function listFiles(dir: string, relative = ''): string[] {
   return fs
@@ -51,20 +72,28 @@ afterEach(async () => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
-describe('gws-ea/main template', () => {
-  it('parses the real Agent Plugins template without notices: main, its welcome, and nothing else', () => {
-    const template = parseTemplate(TEMPLATE_ROOT);
+describe.each(TEMPLATES)('$ref template', ({ ref, name, agentName, skills, files }) => {
+  const root = path.resolve('templates', ref);
 
-    expect(template.name).toBe('gws-ea-main');
-    expect(template.agentName).toBe('main');
+  it('parses without notices and stamps no persona, context, MCP server, or task', () => {
+    const template = parseTemplate(root);
+
+    expect(template.name).toBe(name);
+    expect(template.agentName).toBe(agentName);
     expect(template.instructions).toBeUndefined();
     expect(template.contextExtras).toEqual([]);
     expect(template.mcpServers).toEqual({});
-    expect(template.skills.map(({ name }) => name)).toEqual(['welcome']);
+    expect(template.skills.map((skill) => skill.name)).toEqual(skills);
     expect(template.tasks).toEqual([]);
     expect(template.report).toEqual([]);
   });
 
+  it('holds exactly its plugin, README, and listed skills', () => {
+    expect(listFiles(root)).toEqual(files);
+  });
+});
+
+describe('gws-ea/main template', () => {
   it('stamps main with its welcome and leaves the persona file to the principal', async () => {
     const { group, report } = await createAgentFromTemplate('gws-ea/main');
     const groupDir = path.join(GROUPS_DIR, group.folder);
@@ -102,8 +131,6 @@ describe('gws-ea/main template', () => {
   });
 
   it('contains no deployment configuration, secrets, endpoints, personal identity, or emoji', () => {
-    expect(listFiles(TEMPLATE_ROOT)).toEqual(EXPECTED_FILES);
-
     const manifest = JSON.parse(fs.readFileSync(path.join(TEMPLATE_ROOT, 'plugin.json'), 'utf-8')) as Record<
       string,
       unknown

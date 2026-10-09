@@ -1,7 +1,9 @@
+import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -18,6 +20,8 @@ import { REDACTED } from './redact.js';
 import { startRunLog, type RunLog } from './run-log.js';
 import { GwsEaError } from './types.js';
 
+const execFileAsync = promisify(execFile);
+
 const NODE = process.execPath;
 const roots: string[] = [];
 
@@ -31,9 +35,7 @@ async function temporaryRoot(label: string, parent = os.tmpdir()): Promise<strin
   return root;
 }
 
-async function runLog(
-  options: { secretDirectories?: readonly string[]; captureFixturesTo?: string } = {},
-): Promise<RunLog> {
+async function runLog(options: { secretDirectories?: readonly string[] } = {}): Promise<RunLog> {
   const root = await temporaryRoot('process-run');
   return startRunLog({
     paths: resolveControlPlanePaths({ configRoot: path.join(root, 'config'), stateRoot: path.join(root, 'state') }),
@@ -528,35 +530,6 @@ describe('GWS-EA command runner', () => {
     expect((await failure(runSanitizedCommand(command))).code).toBe('command_output_limit');
     await expect(runSanitizedCommand({ ...command, stream: true })).resolves.toMatchObject({ stdout: '' });
   });
-
-  it('captures an allowlisted read with the stdout the runner parsed when the run enables capture', async () => {
-    const root = await temporaryRoot('capture');
-    const bin = path.join(root, 'bin');
-    const staging = path.join(root, 'staging');
-    await mkdir(bin);
-    await writeFile(path.join(bin, 'gcloud'), '#!/bin/sh\nprintf \'[{"projectId":"gws-ea-fixture"}]\'\n', {
-      mode: 0o755,
-    });
-    const run = await runLog({ captureFixturesTo: staging });
-
-    await run.step('provision_gcp', () =>
-      runSanitizedCommand({
-        command: 'gcloud',
-        args: ['projects', 'list', '--format=json'],
-        cwd: root,
-        env: { PATH: bin },
-      }),
-    );
-
-    const staged = await Promise.all(
-      (await readdir(staging)).map(
-        async (file) => JSON.parse(await readFile(path.join(staging, file), 'utf8')) as unknown,
-      ),
-    );
-    expect(staged).toEqual([
-      expect.objectContaining({ kind: 'command', program: 'gcloud', stdout: '[{"projectId":"gws-ea-fixture"}]' }),
-    ]);
-  });
 });
 
 describe('GWS-EA process replacement', () => {
@@ -677,4 +650,41 @@ describe('GWS-EA persisted executables', () => {
       message: expect.stringContaining('temporary'),
     });
   });
+});
+
+describe('the instance host launcher', () => {
+  it('loads as a module of a process whose first argument names no file', async () => {
+    const release = path.resolve(import.meta.dirname, '..', '..');
+    // `node -e <code> <arg>` puts `<arg>` in argv[1]: nothing the launcher's entry check may resolve.
+    const loaded = await execFileAsync(
+      process.execPath,
+      ['--import', 'tsx', '-e', "import('./src/gws-ea/process.ts').then(() => console.log('loaded'))", 'no-such-file'],
+      { cwd: release, timeout: 60_000 },
+    );
+
+    expect(loaded.stdout.trim()).toBe('loaded');
+  }, 60_000);
+
+  it('runs when the service manager starts it through the live link, as it starts every release', async () => {
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'gws-ea-launcher-link-')));
+    // `<instance>/nanoclaw -> <release>`: the service definition names the launcher through the link.
+    const release = path.resolve(import.meta.dirname, '..', '..');
+    const live = path.join(root, 'nanoclaw');
+    await symlink(release, live);
+    try {
+      const run = execFileAsync(
+        process.execPath,
+        ['--import', 'tsx', path.join(live, 'src', 'gws-ea', 'process.ts'), 'launch-host'],
+        // Run from the release, as the service definition does, so `tsx` resolves.
+        { cwd: release, timeout: 60_000 },
+      );
+      // It ran: its argument check answered, rather than the module exiting without a word.
+      await expect(run).rejects.toMatchObject({
+        code: 1,
+        stderr: expect.stringContaining('Usage: process.js launch-host <runtime-config>'),
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

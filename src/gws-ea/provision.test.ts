@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,14 +8,13 @@ import type { NanoclawServiceHelpers } from './service-control.js';
 
 import { PauseRequired, pendingActionOf, SignInRequired, type RunEvent } from './events.js';
 import {
-  contractSteps,
   readProvisionJournal,
   recordPrincipalSelection,
   reserveInstance,
   withInstanceOperation,
   type InstanceOperation,
 } from './journal.js';
-import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+import { CONTROL_PLANE_ROOT, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import {
   ABSENT,
   OBSERVATION_WAITS_SECONDS,
@@ -38,22 +37,31 @@ import {
   type ProductionProvisionDependencies,
 } from './provision.js';
 import type { MainIdentityDependencies } from './identity.js';
+import { keepRelease, keptReleaseFiles } from './kept-release.js';
+import { createOnecliAdmin } from './onecli-admin.js';
 import { createOnecliRuntimeLayout, renderOnecliCompose } from './onecli-compose.js';
 import { wrapperImageTag } from './onecli-gateway-image.js';
-import { ONECLI_CLI_VERSION, ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './pins.js';
+import { ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './pins.js';
 import type { OnecliRuntimeReceipt } from './onecli.js';
 import { findPortHolder } from './ports.js';
+import type { SanitizedCommand } from './process.js';
+import { linkReleaseState } from './release-layout.js';
+import { stageRelease, type ReleaseStageRequest } from './release-stage.js';
 import { startRunLog, type RunLog } from './run-log.js';
 import { writeOwnerOnlyFileExclusive } from './secrets.js';
 import {
   createInstanceRuntimeConfig,
   googleChatProjectNumberFile,
+  instanceHostConfiguration,
+  instanceServiceDefinitionFile,
   persistInstanceRuntime,
+  readInstanceHostEnvironment,
   type HostStatusHelpers,
   type UpsertEnvVars,
   type WaitForHostOptions,
 } from './service.js';
 import type { ManagedTransport } from './cloudflare-ingress.js';
+import { KILLED_INSTALL_LEFTOVER, releaseRepository, stagingWorld } from './testing/release-fixture.js';
 import {
   GwsEaError,
   PROVISION_STEPS,
@@ -66,7 +74,11 @@ import type { CloudflareZoneChoice } from './create-input.js';
 import type { ConversationNotReadyReason } from './verify.js';
 
 const roots: string[] = [];
-const providerCapabilityDigest = 'c'.repeat(64);
+
+/** Upstream's `.env` writer, which the driver injects; loaded by path because `src/` cannot import `setup/`. */
+const { upsertEnvVars } = (await import(path.join(CONTROL_PLANE_ROOT, 'setup', 'set-env.ts'))) as {
+  readonly upsertEnvVars: UpsertEnvVars;
+};
 
 async function testPaths(): Promise<ControlPlanePaths> {
   const root = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-provision-'));
@@ -75,13 +87,11 @@ async function testPaths(): Promise<ControlPlanePaths> {
 }
 
 function reservation(
-  paths: ControlPlanePaths,
   allocatedPorts: AllocatedPorts = { nanoclaw_webhook: 3101, onecli_app: 3201, onecli_gateway: 3301 },
 ): InstanceReservationInput {
   const instanceId = '11111111-1111-4111-8111-111111111111';
   return {
     instance_id: instanceId,
-    checkout_realpath: paths.checkoutRoot(instanceId),
     release_track: 'dogfood',
     source_remote: 'https://example.com/nanoclaw.git',
     deployed_commit: 'a'.repeat(40),
@@ -98,10 +108,9 @@ function reservation(
 }
 
 function managedReservation(
-  paths: ControlPlanePaths,
   allocatedPorts: AllocatedPorts = { nanoclaw_webhook: 3101, onecli_app: 3201, onecli_gateway: 3301 },
 ): InstanceReservationInput {
-  const input = reservation(paths, allocatedPorts);
+  const input = reservation(allocatedPorts);
   return {
     ...input,
     exclusive_resource_claims: {
@@ -152,13 +161,11 @@ function serviceAccount(overrides: Readonly<Record<string, string>> = {}): strin
 function bootstrapManifest(paths: ControlPlanePaths): ProductionBootstrapManifest {
   return {
     schema_version: 1,
-    onecli_cli_path: '/usr/local/bin/onecli',
     node_path: process.execPath,
     home_directory: path.dirname(paths.stateRoot),
     platform: process.platform === 'darwin' ? 'macos' : 'linux',
     running_as_root: false,
     docker_endpoint: 'unix:///var/run/docker.sock',
-    provider_capability_digest: providerCapabilityDigest,
     provider: {
       id: 'claude',
       name: 'Claude provider',
@@ -272,7 +279,7 @@ function worldSteps(world: World, ingress: 'existing' | 'managed' = 'existing'):
 
 async function engineFixture(ingress: 'existing' | 'managed' = 'existing') {
   const paths = await testPaths();
-  const reserved = await reserveInstance(paths, reservation(paths));
+  const reserved = await reserveInstance(paths, reservation());
   const world: World = {
     present: new Set(),
     observed: [],
@@ -327,22 +334,6 @@ function startedSteps(events: readonly RunEvent[]): string[] {
 
 const FULL_WAIT = OBSERVATION_WAITS_SECONDS.map((seconds) => seconds * 1_000);
 
-/** Rewrite the instance's journal as an earlier launcher left it: contract 1, with `steps` complete. */
-async function contractOneJournal(engine: Awaited<ReturnType<typeof engineFixture>>, steps: readonly string[]) {
-  const file = engine.paths.journalFile(engine.instanceId);
-  const raw = JSON.parse(await readFile(file, 'utf8')) as Record<string, unknown>;
-  const at = new Date().toISOString();
-  await writeFile(
-    file,
-    JSON.stringify({
-      ...raw,
-      launcher_contract_version: 1,
-      steps: Object.fromEntries(steps.map((step) => [step, { started_at: at, completed_at: at }])),
-    }),
-    { mode: 0o600 },
-  );
-}
-
 /** These provisions stop before the host starts, so NanoClaw's service helpers are never reached. */
 const UNUSED_SERVICE_HELPERS: NanoclawServiceHelpers = new Proxy({} as NanoclawServiceHelpers, {
   get: () => {
@@ -351,29 +342,6 @@ const UNUSED_SERVICE_HELPERS: NanoclawServiceHelpers = new Proxy({} as NanoclawS
 });
 
 describe('step engine', () => {
-  it('runs only its own steps for an assistant created under contract 1, never the Google sign-in', async () => {
-    const engine = await engineFixture();
-    await contractOneJournal(engine, contractSteps(1));
-    for (const id of contractSteps(1)) engine.world.present.add(id);
-
-    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
-
-    expect(startedSteps(engine.events)).not.toContain('connect_google');
-    expect(engine.world.applied).toEqual([]);
-    expect((await engine.journal()).steps.connect_google).toBeUndefined();
-  });
-
-  it('refuses to finish a contract 1 setup, naming remove and recreate', async () => {
-    const engine = await engineFixture();
-    await contractOneJournal(engine, ['materialize_checkout', 'provision_gcp']);
-
-    const refusal = await engine.run().catch((error: unknown) => error);
-
-    expect(refusal).toMatchObject({ code: 'incompatible_launcher' });
-    expect(String((refusal as Error).message)).toContain(`gws-ea remove --id ${engine.instanceId}`);
-    expect(engine.world.applied).toEqual([]);
-  });
-
   it('runs a fresh instance in order, recording when each step started and completed', async () => {
     const engine = await engineFixture();
 
@@ -712,7 +680,12 @@ describe('production bootstrap trust boundary', () => {
     const file = path.join(path.dirname(paths.configRoot), 'setup.json');
     await writeFile(
       file,
-      JSON.stringify({ ...bootstrapManifest(paths), provisioning_started_at: '1970-01-01T00:00:00.000Z' }),
+      JSON.stringify({
+        ...bootstrapManifest(paths),
+        provisioning_started_at: '1970-01-01T00:00:00.000Z',
+        // A manifest written by a create from before the provider capability digest was retired.
+        provider_capability_digest: 'c'.repeat(64),
+      }),
       { mode: 0o600 },
     );
 
@@ -758,7 +731,7 @@ describe('production bootstrap trust boundary', () => {
 
   it('stages and removes only the validated bootstrap file before reservation publication', async () => {
     const paths = await testPaths();
-    const input = reservation(paths);
+    const input = reservation();
     const manifest = bootstrapManifest(paths);
 
     await installProductionBootstrapManifest(paths, input.instance_id, manifest);
@@ -769,33 +742,36 @@ describe('production bootstrap trust boundary', () => {
   });
 
   /** A reserved instance whose host started once: runtime and receipt persisted, bootstrap manifest gone. */
-  async function startedInstance(receiptCohort: { gateway: string; cli: string; sdk: string }) {
+  async function startedInstance(
+    receiptCohort: Readonly<Record<string, string>>,
+    olderReceiptFields: Record<string, unknown> = {},
+  ) {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
     const onecli = createOnecliRuntimeLayout({
       instanceId: reserved.instance_id,
       instanceRoot: paths.instanceRoot(reserved.instance_id),
       project: reserved.exclusive_resource_claims.onecli_project,
       appPort: reserved.allocated_ports.onecli_app,
       gatewayPort: reserved.allocated_ports.onecli_gateway,
-      cliExecutable: '/usr/local/bin/onecli',
       dockerEndpoint: 'unix:///var/run/docker.sock',
     });
-    const runtime = createInstanceRuntimeConfig(reserved, onecli, {
+    const runtime = createInstanceRuntimeConfig(paths, reserved, onecli, {
       nodePath: process.execPath,
       homeDirectory: path.dirname(paths.stateRoot),
       selectedProvider: 'claude',
       dockerEndpoint: 'unix:///var/run/docker.sock',
     });
     await persistInstanceRuntime(runtime, recordEnv);
+    const receipt = paths.releasePreflightFile(reserved.instance_id, reserved.deployed_commit);
+    await mkdir(path.dirname(receipt), { recursive: true, mode: 0o700 });
     await writeFile(
-      paths.releasePreflightFile(reserved.instance_id),
+      receipt,
       `${JSON.stringify({
         schema_version: 1,
         instance_id: reserved.instance_id,
         deployed_commit: reserved.deployed_commit,
         provider: 'claude',
-        providerCapabilityDigest,
         providerCredential: {
           name: 'Claude provider',
           type: 'api_key',
@@ -805,20 +781,16 @@ describe('production bootstrap trust boundary', () => {
         packageManager: 'pnpm@10.0.0',
         onecli: receiptCohort,
         recorded_by: 'a launcher with other fields',
+        ...olderReceiptFields,
       })}\n`,
       { mode: 0o600 },
     );
-    await mkdir(path.join(reserved.checkout_realpath, 'data'), { recursive: true });
-    new Database(path.join(reserved.checkout_realpath, 'data', 'v2.db')).close();
+    new Database(path.join(runtime.state_root, 'data', 'v2.db')).close();
     return { paths, reserved };
   }
 
   it('treats a database created before the profile migration as unpublished', async () => {
-    const { paths, reserved } = await startedInstance({
-      gateway: ONECLI_GATEWAY_VERSION,
-      cli: ONECLI_CLI_VERSION,
-      sdk: ONECLI_SDK_VERSION,
-    });
+    const { paths, reserved } = await startedInstance({ gateway: ONECLI_GATEWAY_VERSION, sdk: ONECLI_SDK_VERSION });
 
     await expect(
       withInstanceOperation(paths, reserved.instance_id, (operation) =>
@@ -831,7 +803,26 @@ describe('production bootstrap trust boundary', () => {
     ).rejects.toMatchObject({ code: 'bootstrap_required' });
   });
 
+  it('still parses an old receipt carrying the provider capability digest', async () => {
+    const { paths, reserved } = await startedInstance(
+      { gateway: ONECLI_GATEWAY_VERSION, sdk: ONECLI_SDK_VERSION },
+      { providerCapabilityDigest: 'c'.repeat(64) },
+    );
+
+    // bootstrap_required is raised only after the receipt was accepted.
+    await expect(
+      withInstanceOperation(paths, reserved.instance_id, (operation) =>
+        runProductionProvision(operation, {
+          upsertEnvVars: recordEnv,
+          hostStatus: servingHost(reserved),
+          serviceHelpers: UNUSED_SERVICE_HELPERS,
+        }),
+      ),
+    ).rejects.toMatchObject({ code: 'bootstrap_required' });
+  });
+
   it('resumes past a release receipt whose OneCLI cohort differs from this launcher’s pins', async () => {
+    // An earlier release's receipt also records the OneCLI CLI it pinned, which nothing reads any more.
     const { paths, reserved } = await startedInstance({ gateway: '1.41.0', cli: '2.2.4', sdk: '2.2.0' });
 
     // bootstrap_required is raised only after the receipt was accepted.
@@ -854,10 +845,9 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
     project: reserved.exclusive_resource_claims.onecli_project,
     appPort: reserved.allocated_ports.onecli_app,
     gatewayPort: reserved.allocated_ports.onecli_gateway,
-    cliExecutable: '/usr/local/bin/onecli',
     dockerEndpoint: 'unix:///var/run/docker.sock',
   });
-  const runtime = createInstanceRuntimeConfig(reserved, onecli, {
+  const runtime = createInstanceRuntimeConfig(operation.paths, reserved, onecli, {
     nodePath: '/usr/local/bin/node',
     homeDirectory: path.dirname(operation.paths.stateRoot),
     selectedProvider: 'claude',
@@ -873,16 +863,13 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
         commit: reserved.deployed_commit,
       },
       releasePreflight: {
-        checkoutRoot: reserved.checkout_realpath,
         provider: 'claude',
-        providerCapabilityDigest,
         providerCredential: {
           name: 'Claude provider',
           type: 'api_key',
           hostPattern: 'api.anthropic.com',
           headerName: 'x-api-key',
         },
-        onecliCliPath: '/usr/local/bin/onecli',
       },
       onecli,
       runtime,
@@ -892,7 +879,7 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
         account: reserved.exclusive_resource_claims.gcp_account,
         serviceAccountEmail: reserved.exclusive_resource_claims.gchat_service_account,
         credentialFile: runtime.secret_files.gchat_credentials,
-        cwd: reserved.checkout_realpath,
+        cwd: runtime.instance_root,
       },
       providerCredentialMetadata: {
         name: 'Claude provider',
@@ -942,7 +929,6 @@ function hostStatusOf(reserved: InstanceReservation, overrides: Readonly<Record<
     pid: 4242,
     started_at: '2026-09-25T12:00:00.000Z',
     instance_id: 'host-instance-1',
-    project_root: reserved.checkout_realpath,
     webhook: { id: 'listener-1', port: reserved.allocated_ports.nanoclaw_webhook, paths: ['/webhook/gchat'] },
     channels: [{ instance: 'gchat', type: 'gchat', connected: true }],
     ...overrides,
@@ -958,16 +944,17 @@ function servingHost(reserved: InstanceReservation): HostStatusHelpers {
 async function writeReleaseReceipt(
   paths: ControlPlanePaths,
   reserved: InstanceReservation,
-  onecli: { gateway: string; cli: string; sdk: string },
+  onecli: { gateway: string; sdk: string },
 ): Promise<void> {
+  const receipt = paths.releasePreflightFile(reserved.instance_id, reserved.deployed_commit);
+  await mkdir(path.dirname(receipt), { recursive: true, mode: 0o700 });
   await writeFile(
-    paths.releasePreflightFile(reserved.instance_id),
+    receipt,
     `${JSON.stringify({
       schema_version: 1,
       instance_id: reserved.instance_id,
       deployed_commit: reserved.deployed_commit,
       provider: 'claude',
-      providerCapabilityDigest,
       providerCredential: {
         name: 'Claude provider',
         type: 'api_key',
@@ -982,9 +969,10 @@ async function writeReleaseReceipt(
 }
 
 interface ProbeIdentityState {
-  agents: Array<{ id: string; identifier: string; name: string; secretMode: 'all' | 'selective' }>;
-  readonly onecliCalls: string[][];
-  readonly providerSecretIds: string[];
+  /** The agents OneCLI lists; one without a secret mode is as a OneCLI from 1.43 on lists it. */
+  agents: Array<{ id: string; identifier: string; name: string; secretMode?: 'all' | 'selective' }>;
+  /** Every OneCLI request, as `<method> <path>`. */
+  readonly onecliCalls: string[];
 }
 
 function probeIdentityDependencies(
@@ -1008,12 +996,16 @@ function probeIdentityDependencies(
       }
       throw new Error(`Unexpected ncl probe call: ${args.join(' ')}`);
     },
-    runOnecliAdmin: async (_runtime, args) => {
-      state.onecliCalls.push([...args]);
-      if (args[0] === 'agents' && args[1] === 'list') return state.agents;
-      if (args[0] === 'agents' && args[1] === 'secrets') return state.providerSecretIds;
-      throw new Error(`Unexpected OneCLI probe call: ${args.join(' ')}`);
-    },
+    onecliAdmin: async (runtime) =>
+      createOnecliAdmin(runtime.onecli_app_url, `oc_${'a'.repeat(64)}`, {
+        fetch: async (input, init) => {
+          const url = new URL(String(input));
+          const call = `${init?.method ?? 'GET'} ${url.pathname}`;
+          state.onecliCalls.push(call);
+          if (call === 'GET /v1/agents') return new Response(JSON.stringify(state.agents));
+          throw new Error(`Unexpected OneCLI probe call: ${call}`);
+        },
+      }),
   };
 }
 
@@ -1070,6 +1062,7 @@ function healthyOnecliDocker(context: ProductionProvisionContext) {
             Labels: {
               'com.docker.compose.project': layout.project,
               'com.docker.compose.service': service,
+              'com.docker.compose.config-hash': `hash-${service}`,
               'dev.gws-ea.instance-id': layout.instanceId,
             },
           },
@@ -1115,6 +1108,9 @@ function healthyOnecliDocker(context: ProductionProvisionContext) {
     }
     // The provenance label the release's gateway build stamped.
     if (kind === 'image' && verb === 'inspect') return { stdout: `${RELEASE_WRAPPER_HASH}\n`, stderr: '' };
+    // `config --hash`: each service's configuration is the one its container was created from.
+    if (kind === 'compose')
+      return { stdout: 'app hash-app\ngateway hash-gateway\npostgres hash-postgres\n', stderr: '' };
     throw new Error(`unexpected docker command: ${command.args.join(' ')}`);
   };
 }
@@ -1125,7 +1121,7 @@ describe('production provision step composition', () => {
     ['managed', ['start_onecli', 'start_nanoclaw', 'establish_transport']],
   ] as const)('re-checks only runtime steps once complete (%s ingress)', async (mode, runtime) => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, mode === 'managed' ? managedReservation(paths) : reservation(paths));
+    const reserved = await reserveInstance(paths, mode === 'managed' ? managedReservation() : reservation());
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const steps = createProductionProvisionSteps(productionContext(operation, reserved));
@@ -1138,7 +1134,7 @@ describe('production provision step composition', () => {
 
   it('forwards Google Cloud waits through the provision runtime', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
     const progress: RunEvent[] = [];
     const reason = 'Waiting for Google Cloud to allow Google Chat key creation…';
 
@@ -1168,7 +1164,7 @@ describe('production provision step composition', () => {
 
   it('observes Google Cloud as its own resources, restoring a lifted key policy only after the key', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const resources = createProductionProvisionSteps(productionContext(operation, reserved)).provision_gcp.resources;
@@ -1185,14 +1181,13 @@ describe('production provision step composition', () => {
 
   it('accepts only an all-mode canonical main without enumerating its grants', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
       const state: ProbeIdentityState = {
         agents: [{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'all' }],
         onecliCalls: [],
-        providerSecretIds: ['secret-provider'],
       };
       const context: ProductionProvisionContext = {
         ...base,
@@ -1201,23 +1196,23 @@ describe('production provision step composition', () => {
       const phase = createProductionProvisionSteps(context).start_nanoclaw.resources[1]!;
 
       await expect(phase.observe(context)).resolves.toEqual(PRESENT);
-      expect(state.onecliCalls).toEqual([['agents', 'list', '--max', '0']]);
+      expect(state.onecliCalls).toEqual(['GET /v1/agents']);
+
+      // A OneCLI that no longer lists secret modes leaves main on its default, all.
+      state.agents = [{ id: 'oc-main', identifier: 'ag-main', name: 'main' }];
+      await expect(phase.observe(context)).resolves.toEqual(PRESENT);
 
       state.agents = [{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'selective' }];
       state.onecliCalls.length = 0;
       await expect(phase.observe(context)).resolves.toEqual(ABSENT);
-      expect(state.onecliCalls).toEqual([['agents', 'list', '--max', '0']]);
+      expect(state.onecliCalls).toEqual(['GET /v1/agents']);
     });
   });
 
   it('repairs a completed OneCLI runtime whose container stopped at once, and refuses unsafe drift', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
-    await writeReleaseReceipt(paths, reserved, {
-      gateway: ONECLI_GATEWAY_VERSION,
-      cli: ONECLI_CLI_VERSION,
-      sdk: '2.2.1',
-    });
+    const reserved = await reserveInstance(paths, reservation());
+    await writeReleaseReceipt(paths, reserved, { gateway: ONECLI_GATEWAY_VERSION, sdk: '2.2.1' });
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
@@ -1264,8 +1259,8 @@ describe('production provision step composition', () => {
 
   it('runs and checks OneCLI at the pins its release recorded, not this launcher’s', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
-    const recorded = { gateway: '1.41.3', cli: '2.2.4', sdk: '2.2.0' };
+    const reserved = await reserveInstance(paths, reservation());
+    const recorded = { gateway: '1.41.3', sdk: '2.2.0' };
     await writeReleaseReceipt(paths, reserved, recorded);
     const receipt = Object.freeze({}) as OnecliRuntimeReceipt;
 
@@ -1284,7 +1279,7 @@ describe('production provision step composition', () => {
       context.state.onecliReceipt = undefined;
       await registry.configure_provider.resources[0]!.apply(context);
 
-      const pins = { gateway: recorded.gateway, cli: recorded.cli };
+      const pins = { gateway: recorded.gateway };
       expect(recorded.gateway).not.toBe(ONECLI_GATEWAY_VERSION);
       expect(reconcileOnecliRuntime).toHaveBeenCalledWith(context.input.onecli, pins, undefined);
       // A resumed provider step checks the running vault instead of starting it again.
@@ -1295,12 +1290,8 @@ describe('production provision step composition', () => {
 
   it('adopts a healthy OneCLI runtime its release created, interrupted before its API keys were persisted', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
-    await writeReleaseReceipt(paths, reserved, {
-      gateway: ONECLI_GATEWAY_VERSION,
-      cli: ONECLI_CLI_VERSION,
-      sdk: '2.2.1',
-    });
+    const reserved = await reserveInstance(paths, reservation());
+    await writeReleaseReceipt(paths, reserved, { gateway: ONECLI_GATEWAY_VERSION, sdk: '2.2.1' });
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
@@ -1332,12 +1323,8 @@ describe('production provision step composition', () => {
 
   it('asks for the provider credential and imports it with the OneCLI receipt the run already holds', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
-    await writeReleaseReceipt(paths, reserved, {
-      gateway: ONECLI_GATEWAY_VERSION,
-      cli: ONECLI_CLI_VERSION,
-      sdk: '2.2.1',
-    });
+    const reserved = await reserveInstance(paths, reservation());
+    await writeReleaseReceipt(paths, reserved, { gateway: ONECLI_GATEWAY_VERSION, sdk: '2.2.1' });
     const collected = {
       name: 'Claude provider',
       type: 'api_key',
@@ -1372,7 +1359,7 @@ describe('production provision step composition', () => {
 
   it('rejects a credential that does not match the selected provider definition', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
     const importProviderCredential = vi.fn();
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
@@ -1404,7 +1391,7 @@ describe('production provision step composition', () => {
 
   it('hands the managed transport its instance, claim, and platform, and asks for the account token only through it', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, managedReservation(paths));
+    const reserved = await reserveInstance(paths, managedReservation());
     const claim = reserved.exclusive_resource_claims.ingress;
     if (claim.mode !== 'managed-cloudflare') throw new Error('managed fixture');
     const resources = [{ name: 'the managed transport', observe: async () => PRESENT, apply: async () => undefined }];
@@ -1468,7 +1455,7 @@ describe('production provision step composition', () => {
 
   it('keeps the account token only until the route is set up, and asks again only when Cloudflare refuses it', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, managedReservation(paths));
+    const reserved = await reserveInstance(paths, managedReservation());
     const claim = reserved.exclusive_resource_claims.ingress;
     if (claim.mode !== 'managed-cloudflare') throw new Error('managed fixture');
     const kept = paths.keptCloudflareTokenFile(reserved.instance_id);
@@ -1597,7 +1584,7 @@ describe('production provision step composition', () => {
 
   it('keeps existing transport behavior and invokes no Cloudflare dependency', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
     const managedTransportResources = vi.fn();
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
@@ -1617,12 +1604,12 @@ describe('production provision step composition', () => {
 
   it('pauses with the exact project-scoped Chat configuration handoff', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
-    const verifyEndpoint = vi.fn();
+    const reserved = await reserveInstance(paths, reservation());
+    const verifyRoute = vi.fn();
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
-      const phase = createProductionProvisionSteps(context, { verifyEndpoint }).configure_channel.resources[0]!;
+      const phase = createProductionProvisionSteps(context, { verifyRoute }).configure_channel.resources[0]!;
 
       await expect(phase.observe(context)).resolves.toMatchObject({
         status: 'pause',
@@ -1641,12 +1628,12 @@ describe('production provision step composition', () => {
       });
     });
 
-    expect(verifyEndpoint).not.toHaveBeenCalled();
+    expect(verifyRoute).not.toHaveBeenCalled();
   });
 
   it('uses the reserved managed callback byte-for-byte in runtime and Chat configuration', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, managedReservation(paths));
+    const reserved = await reserveInstance(paths, managedReservation());
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const context = productionContext(operation, reserved);
@@ -1667,7 +1654,7 @@ describe('production provision step composition', () => {
     ['identity', { client_email: 'other@gws-ea-dogfood.iam.gserviceaccount.com' }],
   ] as const)('rejects a service-account %s swap before starting NanoClaw', async (_label, credentialOverride) => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
     const startRuntime = vi.fn(async (): Promise<never> => {
       throw new Error('NanoClaw must not start');
     });
@@ -1695,7 +1682,7 @@ describe('production provision step composition', () => {
 
   it('continues main identity setup when this checkout’s host already serves, without restarting it', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
@@ -1720,7 +1707,7 @@ describe('production provision step composition', () => {
       }).start_nanoclaw;
 
       await expect(runAlone(operation, context, 'start_nanoclaw', step)).resolves.toEqual({ status: 'ready' });
-      expect(queryHost).toHaveBeenCalledWith(reserved.checkout_realpath);
+      expect(queryHost).toHaveBeenCalledWith(paths.checkoutRoot(reserved.instance_id));
       expect(waitForHost).not.toHaveBeenCalled();
       expect(reconcileInstanceRuntime).not.toHaveBeenCalled();
       expect(reconcileMainIdentity).toHaveBeenCalledOnce();
@@ -1736,7 +1723,7 @@ describe('production provision step composition', () => {
     const port = (webhook.address() as { port: number }).port;
     const bound = await reserveInstance(
       paths,
-      reservation(paths, { nanoclaw_webhook: port, onecli_app: 3201, onecli_gateway: 3301 }),
+      reservation({ nanoclaw_webhook: port, onecli_app: 3201, onecli_gateway: 3301 }),
     );
     const events: RunEvent[] = [];
     let socketOpen = false;
@@ -1744,7 +1731,8 @@ describe('production provision step composition', () => {
     try {
       await withInstanceOperation(paths, bound.instance_id, async (operation) => {
         const base = productionContext(operation, bound);
-        const socketClosed = () => new Error(`connect ENOENT ${path.join(bound.checkout_realpath, 'data/ncl.sock')}`);
+        const socketClosed = () =>
+          new Error(`connect ENOENT ${path.join(base.input.runtime.state_root, 'data/ncl.sock')}`);
         const waitForHost = vi.fn(async (_root: string, _options?: WaitForHostOptions) => {
           socketOpen = true;
           return hostStatusOf(bound);
@@ -1786,7 +1774,7 @@ describe('production provision step composition', () => {
           runAlone(operation, context, 'start_nanoclaw', step, { emit: (event) => void events.push(event) }),
         ).resolves.toEqual({ status: 'ready' });
         expect(reconcileInstanceRuntime).toHaveBeenCalledOnce();
-        expect(waitForHost).toHaveBeenCalledWith(bound.checkout_realpath, {
+        expect(waitForHost).toHaveBeenCalledWith(paths.checkoutRoot(bound.instance_id), {
           channel: 'gchat',
           pid: 4242,
           alive: expect.any(Function),
@@ -1806,7 +1794,7 @@ describe('production provision step composition', () => {
 
   it('names a foreign process on the webhook port when the host does not become ready', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
@@ -1849,7 +1837,7 @@ describe('production provision step composition', () => {
 
   it('stops with the host’s reason and its error log at the instance path when it does not become ready', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
@@ -1876,14 +1864,14 @@ describe('production provision step composition', () => {
 
       await expect(host.apply(context)).rejects.toMatchObject({
         code: 'nanoclaw_not_ready',
-        message: `Channel gchat is not connected in the running host. Check ${path.join(reserved.checkout_realpath, 'logs', 'nanoclaw.error.log')}.`,
+        message: `Channel gchat is not connected in the running host. Check ${path.join(paths.instanceRoot(reserved.instance_id), 'logs', 'nanoclaw.error.log')}.`,
       });
     });
   });
 
   it('waits on a starting host, and restarts a stopped one at once without restamping its matching main identity', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
     let host: 'serving' | 'stopped' | number = 'serving';
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
@@ -1891,7 +1879,6 @@ describe('production provision step composition', () => {
       const identityState: ProbeIdentityState = {
         agents: [{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'all' }],
         onecliCalls: [],
-        providerSecretIds: [],
       };
       const context: ProductionProvisionContext = {
         ...base,
@@ -1957,7 +1944,7 @@ describe('production provision step composition', () => {
 
   it('waits on a host whose Google Chat channel has not connected yet', async () => {
     const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation(paths));
+    const reserved = await reserveInstance(paths, reservation());
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
@@ -1977,9 +1964,192 @@ describe('production provision step composition', () => {
       await expect(host.observe(context)).resolves.toMatchObject({
         status: 'unknown',
         reason: 'Channel gchat is not connected in the running host',
-        evidence: expect.stringContaining(path.join(reserved.checkout_realpath, 'logs', 'nanoclaw.error.log')),
+        evidence: expect.stringContaining(
+          path.join(paths.instanceRoot(reserved.instance_id), 'logs', 'nanoclaw.error.log'),
+        ),
       });
     });
+  });
+});
+
+describe('create on the release layout', () => {
+  /** A reserved assistant whose release is a real repository; staging's install, build, and Docker are faked. */
+  async function releaseCreate() {
+    const paths = await testPaths();
+    const repository = await releaseRepository(path.dirname(paths.stateRoot));
+    const reserved = await reserveInstance(paths, {
+      ...reservation(),
+      source_remote: repository.remote,
+      deployed_commit: repository.commit,
+    });
+    const staging = stagingWorld();
+    const serviceCommands: SanitizedCommand[] = [];
+    const contextOf = (operation: InstanceOperation): ProductionProvisionContext => {
+      const base = productionContext(operation, reserved);
+      return {
+        ...base,
+        input: {
+          ...base.input,
+          serviceDependencies: {
+            ...base.input.serviceDependencies,
+            upsertEnvVars,
+            restartService: async () => undefined,
+            runCommand: async (command) => {
+              serviceCommands.push(command);
+              return { stdout: '', stderr: '' };
+            },
+            uid: 501,
+          },
+          // Create's OneCLI step renders its Compose file first; the Docker it then reaches is not needed here.
+          onecliDependencies: {
+            dockerCommandRunner: async () => {
+              throw new Error('Docker is not reached');
+            },
+          },
+        },
+      };
+    };
+    /** Run `use` with create's production steps, staging through the fixture. */
+    const withSteps = async <T>(
+      use: (
+        steps: ProvisionSteps<ProductionProvisionContext>,
+        context: ProductionProvisionContext,
+        operation: InstanceOperation,
+      ) => Promise<T>,
+    ): Promise<T> => {
+      const result = await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
+        const context = contextOf(operation);
+        const steps = createProductionProvisionSteps(context, {
+          stageRelease: (request) => stageRelease(request, staging.seams),
+          getOwnedGcpProjectNumber: async () => '441811502258',
+        });
+        return { value: await use(steps, context, operation) };
+      });
+      if (!result) throw new Error('The instance operation was busy');
+      return result.value;
+    };
+    return {
+      paths,
+      reserved,
+      layout: paths.instanceLayout(reserved.instance_id),
+      release: repository.commit.slice(0, 8),
+      staging: staging.world,
+      serviceCommands,
+      withSteps,
+      runReleaseStep: () =>
+        withSteps((steps, context, operation) =>
+          runAlone(operation, context, 'materialize_checkout', steps.materialize_checkout),
+        ),
+    };
+  }
+
+  /** The release layout create leaves (KTD1), as its directories hold it. */
+  async function expectReleaseLayout(create: Awaited<ReturnType<typeof releaseCreate>>): Promise<void> {
+    const { layout, release, reserved } = create;
+    expect(await readlink(layout.current)).toBe(release);
+    expect((await readdir(layout.root)).sort()).toEqual(
+      ['.release-home', 'kept', 'logs', 'nanoclaw', 'provision.json', release, 'state'].sort(),
+    );
+    // The release holds no state: each of NanoClaw's state roots, and its logs, is a link to the assistant's own.
+    for (const [link, target] of [
+      ['.env', '../state/.env'],
+      ['data', '../state/data'],
+      ['groups', '../state/groups'],
+      ['store', '../state/store'],
+      ['logs', '../logs'],
+    ] as const) {
+      expect((await lstat(path.join(layout.release(release), link))).isSymbolicLink()).toBe(true);
+      expect(await readlink(path.join(layout.release(release), link))).toBe(target);
+    }
+    expect((await readdir(layout.state)).sort()).toEqual(['.env', 'data', 'groups', 'store']);
+    expect((await readdir(path.join(layout.state, 'data'), { recursive: true })).sort()).toEqual([
+      'gws-ea',
+      path.join('gws-ea', 'instance.json'),
+    ]);
+    expect(await readdir(layout.logs)).toEqual([]);
+    expect(await readdir(path.join(layout.root, 'kept'))).toEqual([release]);
+    expect((await readdir(layout.kept(release))).sort()).toEqual([
+      'host-environment.json',
+      'onecli-compose.yaml',
+      'release-preflight.json',
+      'service-definition',
+    ]);
+    expect(JSON.parse(await readFile(layout.receipt(release), 'utf8'))).toMatchObject({
+      instance_id: reserved.instance_id,
+      deployed_commit: reserved.deployed_commit,
+      onecli: { gateway: ONECLI_GATEWAY_VERSION, sdk: ONECLI_SDK_VERSION },
+    });
+    // gws-ea's `.env` keys in the assistant's state are the ones kept with its release.
+    expect(readInstanceHostEnvironment(layout.state)).toEqual(
+      JSON.parse(await readFile(keptReleaseFiles(layout.kept(release)).hostEnvironment, 'utf8')),
+    );
+  }
+
+  it('leaves exactly the release layout: the live link, the release and its links, state, logs, and what is kept', async () => {
+    const create = await releaseCreate();
+
+    await expect(create.runReleaseStep()).resolves.toEqual({ status: 'ready' });
+
+    await expectReleaseLayout(create);
+    // The release runs its own agent image, built for it while staging.
+    const install = create.reserved.instance_id.replaceAll('-', '');
+    expect(create.staging.faked.map((command) => command.args.join(' '))).toContainEqual(
+      expect.stringMatching(new RegExp(`--tag nanoclaw-agent-v2-${install}:r-${create.release} -$`, 'u')),
+    );
+  });
+
+  it('resumes a create killed during the release install by staging the release again, leaving nothing stray', async () => {
+    const create = await releaseCreate();
+    const { layout, release } = create;
+    create.staging.killInstall = true;
+
+    await expect(create.runReleaseStep()).rejects.toThrow('The install was killed');
+    // Staging wrote nothing into the assistant's state, linked nothing, kept nothing, and nothing is live.
+    expect((await readdir(layout.state)).sort()).toEqual(['.env', 'data', 'groups', 'store']);
+    expect(await readFile(path.join(layout.state, '.env'), 'utf8')).toBe('');
+    await expect(lstat(path.join(layout.release(release), 'data'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(lstat(layout.kept(release))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(lstat(layout.current)).rejects.toMatchObject({ code: 'ENOENT' });
+
+    await expect(create.runReleaseStep()).resolves.toEqual({ status: 'ready' });
+
+    // A fresh checkout, installed again: the killed install's work is gone with the release it began.
+    expect(create.staging.git.filter((subcommand) => subcommand === 'init')).toHaveLength(2);
+    expect(create.staging.setup.filter((command) => command.args[0] === 'install')).toHaveLength(2);
+    await expect(lstat(path.join(layout.release(release), KILLED_INSTALL_LEFTOVER))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    await expectReleaseLayout(create);
+  });
+
+  it("keeps with the release exactly what create's own steps then run, so the first update has a rollback target", async () => {
+    const create = await releaseCreate();
+    await create.runReleaseStep();
+
+    await create.withSteps(async (steps, context) => {
+      // Create's OneCLI step renders the Compose file itself before it reaches Docker.
+      await expect(steps.start_onecli.resources[0]!.apply(context)).rejects.toThrow('Docker is not reached');
+      // Create's service step installs the service definition when it starts the host.
+      await mkdir(path.dirname(context.input.runtime.secret_files.gchat_credentials), { recursive: true, mode: 0o700 });
+      await writeFile(context.input.runtime.secret_files.gchat_credentials, serviceAccount(), { mode: 0o600 });
+      await expect(steps.start_nanoclaw.resources[0]!.apply(context)).resolves.toBeUndefined();
+
+      const kept = keptReleaseFiles(create.layout.kept(create.release));
+      expect(await readFile(context.input.onecli.composeFile, 'utf8')).toBe(await readFile(kept.compose, 'utf8'));
+      expect(
+        await readFile(instanceServiceDefinitionFile(context.input.runtime, context.input.serviceDependencies), 'utf8'),
+      ).toBe(await readFile(kept.serviceDefinition, 'utf8'));
+      expect(readInstanceHostEnvironment(context.input.runtime.state_root)).toEqual(
+        JSON.parse(await readFile(kept.hostEnvironment, 'utf8')),
+      );
+    });
+    // The host starts on its release, stamped by the release's own script, without building any image.
+    expect(create.serviceCommands.map((command) => [command.command, command.cwd])).toContainEqual([
+      'pnpm',
+      create.layout.release(create.release),
+    ]);
+    expect(create.serviceCommands.some((command) => command.command === 'docker')).toBe(false);
+    expect(create.serviceCommands.some((command) => command.args.includes('container'))).toBe(false);
   });
 });
 
@@ -2040,9 +2210,38 @@ const PRINCIPAL = {
   authenticatedMessageAt: '2026-09-18T18:00:01.000Z',
 } as const;
 
+/**
+ * A release staged as `stageRelease` leaves it, without a checkout to build:
+ * its folder linked to the assistant's state, and what is kept with it, its
+ * receipt last.
+ */
+async function stageWithoutCheckout(request: ReleaseStageRequest): Promise<void> {
+  const layout = request.paths.instanceLayout(request.view.instance_id);
+  const release = request.view.deployed_commit.slice(0, 8);
+  await mkdir(layout.release(release), { recursive: true, mode: 0o700 });
+  await linkReleaseState(layout, release);
+  await keepRelease(
+    layout.kept(release),
+    {
+      compose: 'services: {}\n',
+      serviceDefinition: 'the service definition\n',
+      hostEnvironment: instanceHostConfiguration(request.runtime),
+    },
+    {
+      instanceId: request.view.instance_id,
+      commit: request.view.deployed_commit,
+      preflight: {
+        ...request.provider,
+        packageManager: 'pnpm@10.0.0',
+        onecli: { gateway: ONECLI_GATEWAY_VERSION, sdk: ONECLI_SDK_VERSION },
+      },
+    },
+  );
+}
+
 async function productionHarness(): Promise<ProductionHarness> {
   const paths = await testPaths();
-  const reserved = await reserveInstance(paths, reservation(paths));
+  const reserved = await reserveInstance(paths, reservation());
   await mkdir(paths.instanceRoot(reserved.instance_id), { recursive: true, mode: 0o700 });
   await writeFile(paths.bootstrapFile(reserved.instance_id), '{}', { mode: 0o600 });
   const resources = new Set<string>();
@@ -2091,7 +2290,7 @@ async function productionHarness(): Promise<ProductionHarness> {
             hostStatus: {
               queryHost: async () => {
                 if (resources.has('host')) return hostStatusOf(reserved);
-                throw new Error(`connect ENOENT ${path.join(reserved.checkout_realpath, 'data/ncl.sock')}`);
+                throw new Error(`connect ENOENT ${path.join(base.input.runtime.state_root, 'data/ncl.sock')}`);
               },
               waitForHost: async () => hostStatusOf(reserved),
             },
@@ -2109,22 +2308,10 @@ async function productionHarness(): Promise<ProductionHarness> {
         };
         const overrides: Partial<ProductionProvisionDependencies> = {
           observeCheckout: async () => (resources.has('checkout') ? PRESENT : ABSENT),
-          materializeReleaseCheckout: async () => {
-            effect('materializeReleaseCheckout', 'checkout');
-            return reserved;
+          stageRelease: async (request) => {
+            effect('stageRelease', 'checkout');
+            await stageWithoutCheckout(request);
           },
-          runReleasePreflight: async () => ({
-            provider: 'claude',
-            providerCapabilityDigest,
-            providerCredential: {
-              name: 'Claude provider',
-              type: 'api_key',
-              hostPattern: 'api.anthropic.com',
-              headerName: 'x-api-key',
-            },
-            packageManager: 'pnpm@10.0.0',
-            onecli: { gateway: ONECLI_GATEWAY_VERSION, cli: ONECLI_CLI_VERSION, sdk: ONECLI_SDK_VERSION },
-          }),
           googleCloudResources: () => [
             {
               name: 'the Google Cloud project',
@@ -2180,10 +2367,6 @@ async function productionHarness(): Promise<ProductionHarness> {
             if (!harness.routePublished) throw new GwsEaError('endpoint_unreachable', 'Route is not published');
             return endpointUrl;
           },
-          verifyEndpoint: async (endpoint) => ({
-            endpointUrl: endpoint.endpointUrl,
-            audienceUrl: endpoint.audienceUrl,
-          }),
           // Like `verifyPrincipalBinding`, the binding is found only for the candidate it is asked about.
           verifyPrincipalBinding: ({ selectedCandidate }) =>
             principalBound && selectedCandidate?.messagingGroupId === PRINCIPAL.messagingGroupId
@@ -2265,7 +2448,7 @@ describe('production step order and pause outcomes', () => {
     });
     expect(harness.started.slice(0, ORDER.length)).toEqual(ORDER);
     expect(harness.effects).toEqual([
-      'materializeReleaseCheckout',
+      'stageRelease',
       'provisionGoogleCloud',
       'reconcileOnecliRuntime',
       'importProviderCredential',
@@ -2291,16 +2474,16 @@ describe('production step order and pause outcomes', () => {
     await expect(readFile(harness.paths.bootstrapFile(harness.instanceId), 'utf8')).rejects.toMatchObject({
       code: 'ENOENT',
     });
-    await expect(readFile(harness.paths.releasePreflightFile(harness.instanceId), 'utf8')).resolves.toContain(
-      '"providerCredential"',
-    );
+    await expect(
+      readFile(harness.paths.releasePreflightFile(harness.instanceId, 'a'.repeat(40)), 'utf8'),
+    ).resolves.toContain('"providerCredential"');
 
     harness.principal = 'bound';
     harness.selectedMessagingGroupId = 'mg-principal';
     await expect(harness.run()).resolves.toEqual({ status: 'ready' });
     expect(harness.sleeps).toEqual([]);
     expect(harness.effects.filter((effect) => !effect.startsWith('reconcilePrincipalDm'))).toEqual([
-      'materializeReleaseCheckout',
+      'stageRelease',
       'provisionGoogleCloud',
       'reconcileOnecliRuntime',
       'importProviderCredential',
@@ -2350,7 +2533,7 @@ describe('production step order and pause outcomes', () => {
   }
 
   async function writeErrorLog(harness: ProductionHarness, lines: readonly string[], writtenAt: Date): Promise<string> {
-    const errorLog = path.join(harness.lastContext!.input.runtime.checkout_realpath, 'logs', 'nanoclaw.error.log');
+    const errorLog = path.join(harness.lastContext!.input.runtime.instance_root, 'logs', 'nanoclaw.error.log');
     await mkdir(path.dirname(errorLog), { recursive: true });
     await writeFile(errorLog, `${lines.join('\n')}\n`);
     await utimes(errorLog, writtenAt, writtenAt);
@@ -2361,7 +2544,7 @@ describe('production step order and pause outcomes', () => {
     const harness = await productionHarness();
     const first = await harness.run();
     const began = (await readProvisionJournal(harness.paths, harness.instanceId)).steps.bind_principal!.started_at;
-    const errorLog = path.join(harness.lastContext!.input.runtime.checkout_realpath, 'logs', 'nanoclaw.error.log');
+    const errorLog = path.join(harness.lastContext!.input.runtime.instance_root, 'logs', 'nanoclaw.error.log');
     expect(first).toMatchObject({
       status: 'paused',
       pause: {
