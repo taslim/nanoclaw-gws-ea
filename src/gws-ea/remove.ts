@@ -9,10 +9,11 @@
  * Cloudflare token — is checked before the first change, and removal locks
  * only its own instance, so one stuck removal never blocks another assistant.
  * NanoClaw's helpers stop the host; removal then cleans up what they leave.
- * An unfinished update or rollback never stops it: its staged, kept, and
- * outgoing releases all sit under the instance root, and go with it. So does
- * every image the assistant's updates and rollbacks built or displaced, while
- * the images assistants share stay (KTD19).
+ * An unfinished update or rollback never stops it: its releases, what is
+ * kept with them, its snapshots, and its quarantined state all sit under the
+ * instance root, and go with it. So does every image the assistant's
+ * releases tagged or its rebuilds displaced, while the images assistants
+ * share stay (KTD6).
  */
 import { access, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -45,7 +46,7 @@ import {
   renderManagedCloudflareConfiguration,
   replaceManagedCloudflareConfiguration,
 } from './cloudflare-ingress.js';
-import { releaseImage } from './agent-image.js';
+import { reclaimImage } from './agent-image-release.js';
 import {
   PauseRequired,
   runStep,
@@ -66,13 +67,7 @@ import { readProvisionJournal } from './journal.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { removeOnecliRuntime } from './onecli.js';
 import { readOperationRecord, type OperationRecord } from './operation.js';
-import {
-  CONTROL_PLANE_ROOT,
-  instanceRuntimeFile,
-  preparePrivateDirectory,
-  type ControlPlanePaths,
-  type ReleaseSlot,
-} from './paths.js';
+import { CONTROL_PLANE_ROOT, preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import { pollUntil } from './poll.js';
 import { probeRecordedDockerEndpoint, resolveDockerEndpoint } from './prerequisites.js';
 import {
@@ -87,7 +82,6 @@ import {
   activeRemovalInstanceIds,
   assertInstanceId,
   assertStateConsistent,
-  assertStateMarker,
   getInstanceReservation,
   readRegistry,
   releaseInstanceReservation,
@@ -341,13 +335,6 @@ async function readRecord(file: string): Promise<Record<string, unknown> | undef
 }
 
 /**
- * Where updates and rollbacks keep releases beside the live checkout, newest
- * first: the one an update stages, the one a rollback left, the rollback
- * point, and the rollback point an update set aside at its swap.
- */
-const KEPT_RELEASES = ['next', 'outgoing', 'previous', 'superseded'] as const satisfies readonly ReleaseSlot[];
-
-/**
  * The record of an unfinished update or rollback: undefined when there is
  * none, null when it cannot be read. Removal goes on without what an
  * unreadable one would say.
@@ -368,47 +355,20 @@ async function readUnfinishedOperation(
 }
 
 /**
- * The agent images an unfinished update or rollback retagged or displaced, by
- * ID. The repository's tags name those its retag moved, the ones it holds
- * included (see `moveRecordedImages`), but an agent group's image a rebuild
- * displaced keeps no tag to be found by, and the record is the only place
- * that names it until its follow-up releases it.
+ * The agent images an update's or rollback's rebuilds displaced, by ID: an
+ * agent group's image a rebuild displaced keeps no tag to be found by, and the
+ * record is the only place that names it until its follow-up reclaims it.
  */
 function recordedAgentImages(record: OperationRecord | undefined | null): readonly string[] {
   if (!record) return [];
-  const moved = record.images.flatMap((image) =>
-    image.displaced_image_id === null ? [image.image_id] : [image.image_id, image.displaced_image_id],
-  );
-  const displaced = record.follow_ups.flatMap((followUp) =>
-    followUp.kind === 'delete_image' ? [followUp.image_id] : [],
-  );
-  return [...new Set([...moved, ...displaced])];
-}
-
-/**
- * The assistant's `state/` must carry its marker. Every kept release,
- * wherever an update or rollback left it, is checked by its marker's
- * instance identity alone, and staging may have stopped before writing one.
- */
-async function assertOwnCheckouts(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<void> {
-  await assertStateConsistent(paths, reservation);
-  for (const slot of KEPT_RELEASES) {
-    const checkout = paths.releaseCheckoutRoot(reservation.instance_id, slot);
-    try {
-      await assertStateMarker(checkout, reservation.instance_id);
-    } catch (error) {
-      if (isErrno(error, 'ENOENT') || (error instanceof GwsEaError && error.code === 'marker_missing')) continue;
-      throw error;
-    }
-  }
+  return record.follow_ups.flatMap((followUp) => (followUp.kind === 'reclaim_image' ? [followUp.image_id] : []));
 }
 
 /**
  * The home directory and Docker endpoint the instance recorded:
- * `runtime.json` once the host started (in the live checkout, or, with an
- * update or rollback cut short, the newest kept release holding one), else
- * the bootstrap manifest create wrote. Only these fields are read, so files
- * an earlier launcher wrote still remove cleanly.
+ * `runtime.json` in its `state/` once create wrote it, else the bootstrap
+ * manifest create wrote first. Only these fields are read, so files an
+ * earlier launcher wrote still remove cleanly.
  */
 async function readRecordedRuntime(
   paths: ControlPlanePaths,
@@ -416,9 +376,6 @@ async function readRecordedRuntime(
 ): Promise<{ readonly homeDirectory?: string; readonly dockerEndpoint?: string }> {
   const records = await Promise.all([
     readRecord(paths.runtimeFile(reservation.instance_id)),
-    ...KEPT_RELEASES.map((slot) =>
-      readRecord(instanceRuntimeFile(paths.releaseCheckoutRoot(reservation.instance_id, slot))),
-    ),
     readRecord(paths.bootstrapFile(reservation.instance_id)),
   ]);
   const field = (key: string, parse: (value: unknown, label: string, code: string) => string): string | undefined => {
@@ -810,11 +767,11 @@ export async function uninstallNanoclaw(install: NanoclawInstall, teardown: Nano
     if ((await containers()).length > 0) throw incomplete('NanoClaw containers remain after removal');
   }
 
-  // Every tag in the assistant's own image repository goes: `:latest`, the `:next` an update staged (and the
-  // `:building` tag of an image its build had not yet labeled), the `:previous` it kept, each agent group's own
-  // image, and each image it held. Removing a tag deletes its image only with the last tag naming it, so an agent
-  // image another assistant shares by content stays with that assistant's tags. Nothing outside the repository is
-  // named, so the OneCLI, gateway, and connector images assistants share stay too (KTD19).
+  // Every tag in the assistant's own image repository goes: each kept release's `:r-<release>`, the `:building` tag
+  // of an image a build had not yet labeled, and each agent group's own image. Removing a tag deletes its image only
+  // with the last tag naming it, so an agent image another assistant shares by content stays with that assistant's
+  // tags. Nothing outside the repository is named, so the OneCLI, gateway, and connector images assistants share
+  // stay too (KTD6).
   const repository = getInstallScopedNames(installId).containerImageBase;
   const tagged = async (): Promise<string[]> =>
     repositoryTags(
@@ -827,10 +784,10 @@ export async function uninstallNanoclaw(install: NanoclawInstall, teardown: Nano
     const remaining = await tagged();
     if (remaining.length > 0) throw incomplete(`NanoClaw images remain after removal: ${remaining.join(', ')}`);
   }
-  // An image a rebuild displaced has no tag left to find it by, so it is released by the ID its record holds, and
+  // An image a rebuild displaced has no tag left to find it by, so it is removed by the ID its record holds, and
   // stays while another repository still tags it: assistants share agent images by content.
   const images = { run: runChecked, cwd: CONTROL_PLANE_ROOT, env: tools };
-  for (const imageId of teardown.recordedImages) await releaseImage(images, repository, imageId);
+  for (const imageId of teardown.recordedImages) await reclaimImage(images, imageId);
 }
 
 /** OneCLI's Compose project, through the recorded Docker endpoint. */
@@ -926,7 +883,7 @@ async function removeLocked(
 
   // Everything below reads; nothing changes until the receipt is written.
   const operation = await readUnfinishedOperation(paths, instanceId);
-  await assertOwnCheckouts(paths, reservation);
+  await assertStateConsistent(paths, reservation);
   const provisioning = await readProvisioningRecord(paths, instanceId);
   const recorded = await readRecordedRuntime(paths, reservation);
   // Released last, so a released reservation left only local files and the receipt behind.

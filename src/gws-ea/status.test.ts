@@ -44,6 +44,7 @@ import { PRESENT } from './phases.js';
 import type { PrincipalCandidate } from './principal.js';
 import { runSanitizedCommand, type SanitizedCommand } from './process.js';
 import { redact } from './redact.js';
+import { operationName } from './release-layout.js';
 import { writeInstanceMarker } from './registry.js';
 import { createInstanceRuntimeConfig, persistInstanceRuntime, type HostStatusHelpers } from './service.js';
 import type { NanoclawServiceHelpers } from './service-control.js';
@@ -263,23 +264,21 @@ async function bound(paths: ControlPlanePaths, instanceId: string): Promise<void
   }
 }
 
-/** A previous release an update kept: its checkout's marker, its manifest naming this assistant, and its receipt. */
-async function keepPrevious(paths: ControlPlanePaths, reservation: InstanceReservation, commit: string): Promise<void> {
-  const id = reservation.instance_id;
-  const previous = paths.releaseCheckoutRoot(id, 'previous');
-  await writePrivate(path.join(previous, 'data', 'gws-ea', 'instance.json'), {
+/** The rollback point an update left: the release it left, and the snapshot it took, whose schema is `manifest`. */
+async function keepRollbackPoint(
+  paths: ControlPlanePaths,
+  reservation: InstanceReservation,
+  commit: string,
+  manifest: SnapshotManifest = MANIFEST,
+): Promise<void> {
+  await writePrivate(paths.rollbackPointFile(reservation.instance_id), {
     schema_version: 1,
-    instance_id: id,
-    deployed_commit: commit,
-  });
-  const root = paths.releaseRoot(id, 'previous');
-  await writePrivate(path.join(root, 'release-manifest.json'), {
-    schema_version: 1,
-    instance_id: id,
+    instance_id: reservation.instance_id,
     release: { ...releaseOf(reservation), deployed_commit: commit },
-    snapshot_at: NOW.toISOString(),
+    snapshot: operationName(NOW.toISOString()),
+    manifest,
+    taken_at: NOW.toISOString(),
   });
-  await writePrivate(path.join(root, 'release-preflight.json'), { instance_id: id, deployed_commit: commit });
 }
 
 /** The release an update to `to` is moving this assistant towards, unfinished at `phase`. */
@@ -287,7 +286,7 @@ async function updateUnfinishedAt(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
   to: ReleaseCoordinates,
-  phase: OperationPhase = 'stopped',
+  phase: Exclude<OperationPhase, 'committed'> = 'fenced',
 ) {
   const operation = await acquireInstanceOperation(paths, reservation.instance_id, { command: 'update', target: to });
   if (!operation) throw new Error('The test instance operation was busy');
@@ -309,8 +308,13 @@ async function recordedWith(
   const operation = await acquireInstanceOperation(paths, reservation.instance_id, intent);
   if (!operation) throw new Error('The test instance operation was busy');
   try {
-    await beginOperation(operation, { kind, from: releaseOf(reservation), to, follow_ups: [followUp] });
-    await advanceOperation(operation, 'verified', { stop: { at: NOW.toISOString(), graceful: true } });
+    await beginOperation(operation, { kind, from: releaseOf(reservation), to });
+    await advanceOperation(operation, 'verified', {
+      stop: { at: NOW.toISOString(), graceful: true },
+      manifest: MANIFEST,
+      ...(kind === 'rollback' ? { mode: 'code_only' as const } : {}),
+      follow_ups: [followUp],
+    });
     await commitOperationRelease(operation);
   } finally {
     operation.release();
@@ -324,11 +328,6 @@ async function removalStarted(paths: ControlPlanePaths, reservation: InstanceRes
     reservation,
     started_at: NOW.toISOString(),
   });
-}
-
-/** The staging an interrupted update left behind: `next/`, with no operation record. */
-async function stagingLeft(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<void> {
-  await mkdir(paths.releaseCheckoutRoot(reservation.instance_id, 'next'), { recursive: true, mode: 0o700 });
 }
 
 /** NanoClaw's install slug for an assistant: its instance ID without dashes. */
@@ -552,9 +551,8 @@ describe('status', () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
     await bound(host.paths, reservation.instance_id);
-    // Beside the healthy host: a removal cut short, staging an interrupted update left, and a drifted shared connector.
+    // Beside the healthy host: a removal cut short, and a drifted shared connector.
     await removalStarted(host.paths, reservation);
-    await stagingLeft(host.paths, reservation);
     const state = world(reservation);
 
     const { exitCode, status } = await statusJson(host, state, reservation.instance_id, {
@@ -593,14 +591,14 @@ describe('status', () => {
         source_remote: host.tool,
         deployed_commit: host.release,
       },
-      operation: { state: 'none', abandoned_staging: true },
+      operation: { state: 'none' },
       removal_in_progress: true,
       release: { deployed_commit: host.release, tool_commit: host.release, behind_tool_release: false, reason: null },
       rollback: {
         available: false,
         previous_commit: null,
         schema_moved: null,
-        reason: `Assistant ${reservation.instance_id} keeps no previous release, so there is nothing to roll back to.`,
+        reason: `Assistant ${reservation.instance_id} keeps no rollback point, so there is nothing to roll back to.`,
       },
       schema: {
         central_fingerprint: expect.stringMatching(FINGERPRINT),
@@ -830,13 +828,13 @@ describe('status', () => {
     expect(text).toContain(`gws-ea update --id ${reservation.instance_id}`);
   });
 
-  it('reports the kept previous release, whether either schema moved since it, and a fingerprint of each', async () => {
+  it('reports the rollback point, whether either schema moved since its snapshot, and a fingerprint of each', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
     const previousCommit = 'e'.repeat(40);
-    await keepPrevious(host.paths, reservation, previousCommit);
+    await keepRollbackPoint(host.paths, reservation, previousCommit);
     const state = world(reservation);
-    // The kept release's databases record MANIFEST; each case sets what the live checkout's record.
+    // The rollback point's snapshot records MANIFEST; each case sets what the live state's databases record.
     let live = MANIFEST;
     const observers: Partial<StatusObservers> = {
       ...healthyObservers(state),
@@ -874,36 +872,28 @@ describe('status', () => {
   });
 
   it.each([
-    ['without its manifest', 'manifest', /keeps a previous release without its manifest/u],
-    ['whose manifest names another assistant', 'other', /belongs to another assistant/u],
-    ['without its receipt', 'receipt', /keeps a previous release without its receipt/u],
-  ] as const)(
-    'offers no rollback for a previous release %s, as rollback would refuse it',
-    async (_label, flaw, why) => {
-      const host = await machine();
-      const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
-      const root = host.paths.releaseRoot(reservation.instance_id, 'previous');
-      await keepPrevious(host.paths, reservation, 'e'.repeat(40));
-      if (flaw === 'manifest') await rm(path.join(root, 'release-manifest.json'));
-      if (flaw === 'receipt') await rm(path.join(root, 'release-preflight.json'));
-      if (flaw === 'other') {
-        const manifest = JSON.parse(await readFile(path.join(root, 'release-manifest.json'), 'utf8')) as object;
-        await writePrivate(path.join(root, 'release-manifest.json'), {
-          ...manifest,
-          instance_id: randomUUID(),
-        });
-      }
+    ['that names another assistant', 'other', /is not its own/u],
+    ['that cannot be read', 'torn', /Rollback point/u],
+  ] as const)('offers no rollback for a rollback point %s', async (_label, flaw, why) => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
+    const file = host.paths.rollbackPointFile(reservation.instance_id);
+    await keepRollbackPoint(host.paths, reservation, 'e'.repeat(40));
+    if (flaw === 'torn') await writeFile(file, '{torn', { mode: 0o600 });
+    else {
+      const point = JSON.parse(await readFile(file, 'utf8')) as object;
+      await writePrivate(file, { ...point, instance_id: randomUUID() });
+    }
 
-      const { status } = await statusJson(host, world(reservation), reservation.instance_id);
+    const { status } = await statusJson(host, world(reservation), reservation.instance_id);
 
-      expect(status.rollback).toEqual({
-        available: false,
-        previous_commit: null,
-        schema_moved: null,
-        reason: expect.stringMatching(why),
-      });
-    },
-  );
+    expect(status.rollback).toEqual({
+      available: false,
+      previous_commit: null,
+      schema_moved: null,
+      reason: expect.stringMatching(why),
+    });
+  });
 
   it('renders its observations as text, with times in the install timezone', async () => {
     const host = await machine();
@@ -930,8 +920,8 @@ describe('status', () => {
 
   it.each([
     ['update', { kind: 'rebuild_group_image', agent_group_id: 'ag-research' }],
-    ['rollback', { kind: 'delete_release', release: 'outgoing' }],
-  ] as const)("names a recorded %s's own command as the one that retries its follow-ups", async (kind, followUp) => {
+    ['rollback', { kind: 'prune' }],
+  ] as const)("names a committed %s's own command as the one that retries its follow-ups", async (kind, followUp) => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'existing' });
     const to: ReleaseCoordinates = { ...releaseOf(reservation), deployed_commit: 'c'.repeat(40) };
@@ -942,7 +932,7 @@ describe('status', () => {
 
     // After a rollback, update --id would go on to stage a new update rather than only retry its follow-ups.
     expect(output.stdout).toContain(
-      `  Operation: Its ${kind} to ${'c'.repeat(12)} is recorded, with follow-ups still to run: ${followUp.kind}; ` +
+      `  Operation: Its ${kind} to ${'c'.repeat(12)} is committed, with follow-ups still to run: ${followUp.kind}; ` +
         `the next gws-ea ${kind} --id ${reservation.instance_id} retries them.`,
     );
   });
@@ -990,14 +980,13 @@ describe('status', () => {
 });
 
 describe('list', () => {
-  it('shows every assistant, the phase of one mid-update, and the removal and staging another left', async () => {
+  it('shows every assistant, the phase of one mid-update, and the removal another left', async () => {
     const host = await machine();
     const alpha = await assistant(host, { label: 'alpha', port: 36_001, ingress: 'managed-cloudflare' });
     const beta = await assistant(host, { label: 'beta', port: 36_011, ingress: 'existing' });
     const target: ReleaseCoordinates = { ...releaseOf(beta), deployed_commit: 'c'.repeat(40) };
     await updateUnfinishedAt(host.paths, beta, target);
     await removalStarted(host.paths, alpha);
-    await stagingLeft(host.paths, alpha);
     const state = world(alpha, beta);
     state.active.delete(installOf(beta));
 
@@ -1022,7 +1011,7 @@ describe('list', () => {
           deployed_commit: host.release,
           release: current,
           service: { state: 'running', reason: null },
-          operation: { state: 'none', abandoned_staging: true },
+          operation: { state: 'none' },
           removal_in_progress: true,
         },
         {
@@ -1035,7 +1024,7 @@ describe('list', () => {
           operation: {
             state: 'open',
             kind: 'update',
-            phase: 'stopped',
+            phase: 'fenced',
             from: releaseOf(beta),
             to: target,
             started_at: expect.any(String),
@@ -1059,19 +1048,16 @@ describe('list', () => {
     );
     expect(lines).toMatch(
       new RegExp(
-        `${beta.instance_id} +beta\\.example\\.test +dogfood +${host.release.slice(0, 12)} +no +stopped +update stopped`,
+        `${beta.instance_id} +beta\\.example\\.test +dogfood +${host.release.slice(0, 12)} +no +stopped +update fenced`,
         'u',
       ),
     );
     // Each thing left under way is named beside the table, with the command that settles it.
     expect(text.output.stdout).toContain(
-      `${beta.instance_id}: Its update to dogfood ${'c'.repeat(12)} is unfinished (stopped); ` +
+      `${beta.instance_id}: Its update to dogfood ${'c'.repeat(12)} is unfinished (fenced); ` +
         `continue it with gws-ea update --id ${beta.instance_id}, or revert it with gws-ea rollback --id ${beta.instance_id}.`,
     );
     expect(lines).toMatch(new RegExp(`^${alpha.instance_id}: Removal .*gws-ea remove --id ${alpha.instance_id}`, 'mu'));
-    expect(lines).toMatch(
-      new RegExp(`^${alpha.instance_id}: .*staging .*gws-ea update --id ${alpha.instance_id}`, 'mu'),
-    );
   });
 
   it("says whether each assistant is behind the tool's release, from the tool's own history", async () => {
@@ -1234,9 +1220,10 @@ describe('read-only commands', () => {
     await bound(host.paths, alpha.instance_id);
     hostDatabases(stateOf(alpha), ['initial-v2-schema', 'host-coordination']);
     await sessionMailbox(stateOf(alpha));
-    const previous = host.paths.releaseCheckoutRoot(alpha.instance_id, 'previous');
-    await keepPrevious(host.paths, alpha, 'e'.repeat(40));
-    hostDatabases(previous, ['initial-v2-schema']);
+    await keepRollbackPoint(host.paths, alpha, 'e'.repeat(40), {
+      central_migrations: ['initial-v2-schema'],
+      session_tables: {},
+    });
     const secretsFile = path.join(host.paths.configRoot, 'secrets.env');
     await writeFile(secretsFile, `GWS_EA_PROVIDER_CREDENTIAL=${SENTINEL}\n`, { mode: 0o600 });
     vi.stubEnv('GWS_EA_PROVIDER_CREDENTIAL', SENTINEL);

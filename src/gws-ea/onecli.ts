@@ -288,7 +288,7 @@ export interface GatewayImageChange {
  * when its tag differs from the one the instance's Compose file names is
  * Docker asked for it, and built when absent; content-addressed tags never
  * collide, so a build never replaces what another assistant runs. The
- * Compose file and the running runtime are left for the cutover.
+ * Compose file and the running runtime are left for the switch.
  */
 export async function prepareReleaseGatewayImage(
   layout: OnecliRuntimeLayout,
@@ -302,32 +302,10 @@ export async function prepareReleaseGatewayImage(
 }
 
 /**
- * Move an instance to the gateway the release an update deploys builds, at
- * its cutover (KTD8): that image, which staging built, is made present
- * first, so a failed build leaves the Compose file naming the gateway still
- * running; only then is the file rendered for it and only the gateway
- * recreated, and probed when it was (KTD15). `compose up` keeps every volume,
- * and Postgres and the app run on as they are, since an update never changes
- * their versions (R9). Rendered from this tool's tree, which is the release
- * (R6). Run again after an interruption, it converges.
- */
-export async function applyReleaseGateway(
-  layout: OnecliRuntimeLayout,
-  pins: OnecliPins,
-  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv'> = {},
-): Promise<void> {
-  const docker = dockerContext(layout, dependencies);
-  const { image } = await resolveWrapperGatewayImage(pins);
-  const { gateway } = await instanceOnecliImages(layout, pins);
-  await ensureWrapperGatewayImage(docker, pins, image);
-  if (gateway !== image) await writePrivateTextFile(layout.composeFile, renderOnecliCompose(layout, pins, image));
-  await upGateway(docker, pins);
-}
-
-/**
- * Put back the Compose file a kept release ran with and recreate the gateway
- * it names, at a rollback (KTD8): the gateway image that release built is
- * still present, since assistant commands never delete one; only when it is
+ * Put back the Compose file a kept release runs with and recreate the gateway
+ * it names, at a switch to that release (KTD8): the gateway image the release
+ * names was built when it was staged, or by an earlier release, and is still
+ * present, since assistant commands never delete one; only when it is
  * missing and this tool's tree builds the same content is it built again,
  * and otherwise it is refused before the Compose file changes. Only the
  * gateway is recreated, and probed when it was (KTD15), and every volume is

@@ -1039,12 +1039,13 @@ class Cli {
   /**
    * One assistant's update, which `update --id` and each turn of `update
    * --all` run: stage this tool's release beside the running assistant, show
-   * what the update changes, and once confirmed carry it through its cutover
-   * to the recorded release (R7, R8, R10, R12). An update already under way
-   * to this release is continued, not staged again, and a recorded one's
+   * what the update changes, and once confirmed carry it through its switch
+   * to the committed release (R1, R2). An update already under way to this
+   * release is continued, not staged again; one with no release to return to
+   * is superseded by an update to another (KTD9); and a committed one's
    * follow-ups are finished before anything else (KTD2), even when this
-   * release is the one already recorded. Undefined when its preview was
-   * declined, which removed the staging.
+   * release is the one already committed. Undefined when its preview was
+   * declined, which left the staging for the next update.
    */
   async #updateAssistant(
     reporter: Session['reporter'],
@@ -1071,14 +1072,21 @@ class Cli {
         reporter,
       };
       const unfinished = await readOperationRecord(this.#paths, request.instanceId);
-      if (unfinished?.phase === 'recorded') {
+      if (unfinished?.phase === 'committed') {
         await finishFollowUps(operation, dependencies);
         if (sameRelease(unfinished.to, intent.target)) return { kind: 'completed', release: unfinished.to };
       }
-      if (!unfinished || unfinished.phase === 'recorded') {
+      // The gate admitted this update: it continues an open update to this release, or supersedes one with no release
+      // to return to (KTD9), which is staged anew.
+      const continuing =
+        unfinished?.phase !== 'committed' &&
+        unfinished?.kind === 'update' &&
+        unfinished.closed === undefined &&
+        sameRelease(unfinished.to, intent.target);
+      if (!continuing) {
         const staged = await prepareUpdate(operation, intent, dependencies);
         for (const line of updatePreviewLines(staged.preview)) this.#presenter.line(line);
-        if (!(await confirmStagedUpdate(operation, staged, dependencies, confirm))) return undefined;
+        if (!(await confirmStagedUpdate(operation, staged, confirm))) return undefined;
       }
       return { kind: 'updated', updated: await continueUpdate(operation, dependencies) };
     } finally {
@@ -1159,11 +1167,11 @@ class Cli {
   }
 
   /**
-   * `rollback`: return the assistant to the release kept in `previous/`, or
-   * settle what its record says is unfinished (R13-R16). A restore of the
-   * pre-update snapshot is shown first and needs confirmation: `--yes`, or a
-   * terminal to be asked on; a code-only rollback loses nothing and is not
-   * asked about. A recorded rollback's follow-ups run last.
+   * `rollback`: return the assistant to its rollback point, or settle what
+   * its record says is unfinished (R3). A restore of the pre-update snapshot
+   * is shown first and needs confirmation: `--yes`, or a terminal to be asked
+   * on; a code-only rollback loses nothing and is not asked about. A
+   * committed rollback's follow-ups run last.
    */
   async #rollbackWork({ reporter }: Session, instanceId: string, options: CommandOptions): Promise<Outcome> {
     const { serviceHelpers, upsertEnvVars, hostStatus, confirmRollback } = this.#runtime;
@@ -1388,12 +1396,14 @@ function releaseName(release: ReleaseCoordinates): string {
   return `${release.release_track} ${shortCommit(release.deployed_commit)}`;
 }
 
-/** Where an update leaves the assistant: on its release, the one it ran kept to roll back to. */
+/** Where an update leaves the assistant: on its release, the one it ran kept to roll back to when it has one. */
 function updatedOutcome(instanceId: string, updated: UpdatedAssistant): Outcome {
   return {
     status: 'ready',
     message: `Assistant ${instanceId} was updated to ${releaseName(updated.to)}.`,
-    details: [`Its previous release, ${releaseName(updated.from)}, is kept to roll back to.`],
+    details: updated.rollbackTarget
+      ? [`Its previous release, ${releaseName(updated.from)}, is kept to roll back to.`]
+      : ['It has no previous release to roll back to.'],
   };
 }
 
@@ -1406,13 +1416,10 @@ function rollbackOutcome(instanceId: string, outcome: RollbackOutcome, timezone:
         message: `Assistant ${instanceId} was rolled back to ${releaseName(outcome.to)}.`,
         details:
           outcome.mode === 'code_only'
-            ? [
-                'Only its code went back: every conversation, memory, and setting since the update was kept.',
-                `The release it left, ${releaseName(outcome.from)}, is kept in ${outcome.keptAt} until the next update or removal.`,
-              ]
+            ? ['Only its code went back: every conversation, memory, and setting since the update was kept.']
             : [
                 `Its snapshot from ${formatLocalTime(outcome.snapshotAt, timezone)} was restored.`,
-                `What it recorded since, with the release it left, ${releaseName(outcome.from)}, is kept in ${outcome.keptAt} until the next update or removal.`,
+                `What it recorded since on ${releaseName(outcome.from)} is kept in ${outcome.keptAt ?? 'its quarantine'} until another snapshot restore replaces it, or the assistant is removed.`,
               ],
       };
     case 'update_discarded':

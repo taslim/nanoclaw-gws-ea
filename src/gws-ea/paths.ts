@@ -15,13 +15,6 @@ import { GwsEaError } from './types.js';
  */
 export const CONTROL_PLANE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-/**
- * Releases the update swap keeps beside its live checkout, each under
- * `<instance>/<slot>/nanoclaw`. Deleted with the swap (U11).
- */
-export const RELEASE_SLOTS = ['next', 'previous', 'outgoing', 'superseded'] as const;
-export type ReleaseSlot = (typeof RELEASE_SLOTS)[number];
-
 /** The name of an instance's root under the state root: the first eight hex digits of its ID (KTD10). */
 export function instanceRootName(instanceId: string): string {
   return instanceId.slice(0, 8);
@@ -62,10 +55,8 @@ export interface ControlPlanePaths {
   journalFile(instanceId: string): string;
   /** The record of an update or rollback under way, beside the provision journal. */
   operationFile(instanceId: string): string;
-  /** Deleted with the swap (U11). */
-  releaseRoot(instanceId: string, slot: ReleaseSlot): string;
-  /** Deleted with the swap (U11). */
-  releaseCheckoutRoot(instanceId: string, slot: ReleaseSlot): string;
+  /** The release a rollback returns to, and the snapshot of the state it left (KTD4). */
+  rollbackPointFile(instanceId: string): string;
   instanceLock(instanceId: string): string;
   /** The instance marker in the physical `state/`, which names the assistant the state belongs to. */
   markerFile(instanceId: string): string;
@@ -119,7 +110,6 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
   const logsRoot = path.join(stateRoot, 'logs');
   const instanceRoot = (instanceId: string): string => path.join(stateRoot, instanceRootName(instanceId));
   const layout = (instanceId: string): InstanceLayout => instanceLayout(instanceRoot(instanceId));
-  const releaseRoot = (instanceId: string, slot: ReleaseSlot): string => path.join(instanceRoot(instanceId), slot);
 
   return {
     configRoot,
@@ -137,8 +127,7 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
     checkoutRoot: (instanceId) => layout(instanceId).current,
     journalFile: (instanceId) => path.join(instanceRoot(instanceId), 'provision.json'),
     operationFile: (instanceId) => path.join(instanceRoot(instanceId), 'operation.json'),
-    releaseRoot,
-    releaseCheckoutRoot: (instanceId, slot) => path.join(releaseRoot(instanceId, slot), 'nanoclaw'),
+    rollbackPointFile: (instanceId) => path.join(instanceRoot(instanceId), 'rollback-point.json'),
     instanceLock: (instanceId) => path.join(configRoot, 'locks', `${instanceId}.lock`),
     markerFile: (instanceId) => instanceMarkerFile(layout(instanceId).state),
     runtimeFile: (instanceId) => instanceRuntimeFile(layout(instanceId).state),

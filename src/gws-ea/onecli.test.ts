@@ -7,7 +7,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { parse as parseYaml } from 'yaml';
 
 import {
-  applyReleaseGateway,
   restoreReleaseGateway,
   importProviderCredential,
   observeOnecliRuntime,
@@ -1012,52 +1011,6 @@ describe("an update's gateway image", () => {
     expect(world.calls.some((call) => call.args[0] === 'build')).toBe(false);
   });
 
-  it('moves the assistant to the release gateway at the cutover: Compose file re-rendered, only the gateway recreated', async () => {
-    const layout = await layoutFixture();
-    await writeInstanceCompose(layout, RELEASE_GATEWAY_IMAGE);
-    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
-
-    await applyReleaseGateway(layout, PINS, { dockerCommandRunner: runner, ambientEnv: HOSTILE_AMBIENT });
-
-    const compose = await readFile(layout.composeFile, 'utf8');
-    expect(compose).toBe(renderOnecliCompose(layout, PINS, GATEWAY_IMAGE));
-    expect((await stat(layout.composeFile)).mode & 0o777).toBe(0o600);
-    // Only the gateway: no pull, no Postgres or app recreate, and nothing that removes a volume.
-    expect(composeCalls(world)).toEqual([
-      [
-        'up',
-        '--detach',
-        '--wait',
-        '--wait-timeout',
-        String(ONECLI_WAIT_TIMEOUT_SECONDS),
-        '--pull',
-        'never',
-        '--no-deps',
-        'gateway',
-      ],
-    ]);
-    expect(world.calls.flatMap((call) => call.args)).not.toContain('down');
-    expect(world.calls.every((call) => call.env?.DOCKER_HOST === DOCKER_ENDPOINT)).toBe(true);
-
-    // Run again after an interruption, it converges without rendering anything new.
-    await applyReleaseGateway(layout, PINS, { dockerCommandRunner: runner });
-    expect(await readFile(layout.composeFile, 'utf8')).toBe(compose);
-  });
-
-  it('leaves the Compose file naming the running gateway and recreates nothing when the release gateway build fails', async () => {
-    const layout = await layoutFixture();
-    const written = await writeInstanceCompose(layout, RELEASE_GATEWAY_IMAGE);
-    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
-    world.wrapperImageMissing = true;
-    world.failBuild = new GwsEaError('command_failed', 'docker build failed');
-
-    await expect(applyReleaseGateway(layout, PINS, { dockerCommandRunner: runner })).rejects.toBe(world.failBuild);
-
-    // The file still names the image the gateway runs, so observation sees no drift.
-    expect(await readFile(layout.composeFile, 'utf8')).toBe(written);
-    expect(composeCalls(world)).toEqual([]);
-  });
-
   it("puts a rollback's kept Compose file back and recreates only the gateway from the image it kept, converging when rerun", async () => {
     const layout = await layoutFixture();
     await writeInstanceCompose(layout, GATEWAY_IMAGE);
@@ -1089,13 +1042,14 @@ describe("an update's gateway image", () => {
     expect(await readFile(layout.composeFile, 'utf8')).toBe(kept);
   });
 
-  it("probes the gateway an update's switch recreated before returning, and only when it was recreated", async () => {
+  it('probes the gateway a switch recreated before returning, and only when it was recreated', async () => {
     const layout = await layoutFixture();
-    const kept = await writeInstanceCompose(layout, RELEASE_GATEWAY_IMAGE);
-    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' }, kept);
+    const running = await writeInstanceCompose(layout, RELEASE_GATEWAY_IMAGE);
+    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' }, running);
     const { gateway, ...unchanged } = containerIds(world);
+    const kept = renderOnecliCompose(layout, PINS, GATEWAY_IMAGE);
 
-    await applyReleaseGateway(layout, PINS, { dockerCommandRunner: runner });
+    await restoreReleaseGateway(layout, PINS, kept, { dockerCommandRunner: runner });
 
     const { gateway: recreated, ...after } = containerIds(world);
     expect(recreated).not.toBe(gateway);
@@ -1107,7 +1061,7 @@ describe("an update's gateway image", () => {
     expect(world.calls.at(-1)).toBe(probe);
 
     // Run again, Compose recreates nothing, so there is nothing new to prove.
-    await applyReleaseGateway(layout, PINS, { dockerCommandRunner: runner });
+    await restoreReleaseGateway(layout, PINS, kept, { dockerCommandRunner: runner });
     expect(containerIds(world).gateway).toBe(recreated);
     expect(probes(world)).toHaveLength(1);
   });

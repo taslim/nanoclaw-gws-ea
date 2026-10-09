@@ -4,19 +4,22 @@
  * long as the instance does, is written atomically and owner-only under the
  * instance lock, and readers ignore unknown fields.
  *
- * Its phases run `staged → stopped → swapping → swapped → started → verified →
- * recorded` and only move forward, except that recovery at `swapping` may
- * reverse the renames back to `stopped`. From `staged` through `verified` the
- * record is open, and `acquireInstanceOperation` admits only the command that
- * continues or reverts it. `recorded` releases that gate: the record then only
- * lists the follow-ups still to run, and is deleted once none remain.
+ * Its phases run `staged → fenced → snapshotted → switched → started →
+ * verified → committed` and only move forward. From `staged` through
+ * `verified` the record is open, and `acquireInstanceOperation` admits only
+ * the command that continues or reverts it. `committed` releases that gate:
+ * the record then only lists the follow-ups still to run, and is deleted once
+ * none remain. A record closed `failed` (an update with no release to return
+ * to, or a rollback whose return failed too) admits only an update to another
+ * release, which supersedes it (fix-forward, KTD9).
  *
- * An update's commit point is the registry compare-and-swap, so recovery reads
- * the registry first: an open record whose target the registry already names
- * was committed, and counts as recorded whatever phase it last reached.
+ * The commit point is the registry compare-and-swap, so recovery reads the
+ * registry first: an open record whose target the registry already names was
+ * committed, and counts as committed whatever phase it last reached. Settling
+ * a committed release also settles the rollback point (`rollback-point.json`):
+ * an update names the release it left and the snapshot it took as it left it,
+ * and a rollback leaves nothing to roll back to (KTD4).
  */
-import { lstat } from 'node:fs/promises';
-
 import { writePrivate } from '../community-portal/private-file.js';
 import { isErrno } from '../community-portal/errors.js';
 import type { InstanceOperation } from './journal.js';
@@ -28,6 +31,7 @@ import {
   swapInstanceRelease,
   validateReleaseCoordinates,
 } from './registry.js';
+import { operationName } from './release-layout.js';
 import { readOwnerOnlyJson, removePrivateFile } from './secrets.js';
 import {
   GwsEaError,
@@ -39,16 +43,16 @@ import {
 } from './types.js';
 import { isRecord, requireCanonicalTimestamp, requireString } from './validation.js';
 
-export const OPERATION_RECORD_SCHEMA_VERSION = 1 as const;
+const OPERATION_RECORD_SCHEMA_VERSION = 2 as const;
 
 export const OPERATION_PHASES = [
   'staged',
-  'stopped',
-  'swapping',
-  'swapped',
+  'fenced',
+  'snapshotted',
+  'switched',
   'started',
   'verified',
-  'recorded',
+  'committed',
 ] as const;
 export type OperationPhase = (typeof OPERATION_PHASES)[number];
 
@@ -58,19 +62,18 @@ export type OperationKind = (typeof OPERATION_KINDS)[number];
 /**
  * Where an operation's release is committed. `registry`: the registry
  * compare-and-swap from `from` to `to`. `record`: the registry already names
- * `to` (a rollback reverting an update that was never recorded), so writing
- * `recorded` is the commit.
+ * `to` (a rollback reverting an update that was never committed), so writing
+ * `committed` is the commit.
  */
 const COMMIT_POINTS = ['registry', 'record'] as const;
 export type OperationCommitPoint = (typeof COMMIT_POINTS)[number];
 
 /**
- * How a rollback treats what the assistant recorded since the update it
- * undoes (R13): `code_only` carries it to the restored release; `snapshot`
- * restores the state the update stopped from, keeping the discarded state in
- * `outgoing/`.
+ * How a rollback treats what the assistant recorded since the snapshot it
+ * returns to (R3): `code_only` keeps it; `snapshot` restores the snapshot,
+ * keeping the state it replaces in `quarantine/<op>/`.
  */
-export const ROLLBACK_MODES = ['code_only', 'snapshot'] as const;
+const ROLLBACK_MODES = ['code_only', 'snapshot'] as const;
 export type RollbackMode = (typeof ROLLBACK_MODES)[number];
 
 export interface OperationStop {
@@ -87,25 +90,14 @@ export interface SnapshotManifest {
   readonly session_tables: Readonly<Record<string, readonly string[]>>;
 }
 
-/**
- * An agent image tag the operation moved: the image it names after the move,
- * and the one it named before (null when it named none). Both by ID, so a
- * move cut short replays exactly, and a reversal can move it back; the
- * assistant holds both while its moves may still need them (KTD19).
- */
-export interface MovedImage {
-  readonly tag: string;
-  readonly image_id: string;
-  readonly displaced_image_id: string | null;
-}
-
-const DELETABLE_RELEASES = ['superseded_previous', 'outgoing'] as const;
-
-/** Work that runs once the release is recorded; its failure never rolls back. */
+/** Work that runs once the release is committed; its failure never rolls back. */
 export type OperationFollowUp =
+  /** Rebuild an agent group's own image on the live release's image. */
   | { readonly kind: 'rebuild_group_image'; readonly agent_group_id: string }
-  | { readonly kind: 'delete_release'; readonly release: (typeof DELETABLE_RELEASES)[number] }
-  | { readonly kind: 'delete_image'; readonly image_id: string };
+  /** Remove an image a rebuild displaced, by ID, once no tag names it. */
+  | { readonly kind: 'reclaim_image'; readonly image_id: string }
+  /** Delete the releases, snapshots, and quarantines nothing keeps any more (KTD4). */
+  | { readonly kind: 'prune' };
 
 export interface OperationRecord {
   readonly schema_version: typeof OPERATION_RECORD_SCHEMA_VERSION;
@@ -115,36 +107,30 @@ export interface OperationRecord {
   readonly from: ReleaseCoordinates;
   readonly to: ReleaseCoordinates;
   readonly phase: OperationPhase;
+  /** When it began, which names its snapshot and quarantine (`operationName`). */
   readonly started_at: string;
   readonly updated_at: string;
-  /** The cutover's stop; required from `stopped` on. */
+  /** The fence's stop; required from `fenced` until committed. */
   readonly stop?: OperationStop;
-  /** The live schema: as staging read it, until the stop records it again. */
+  /** The live schema: as staging read it, until the fence records it again. */
   readonly manifest?: SnapshotManifest;
-  readonly images: readonly MovedImage[];
-  /** Planned before `recorded`; what is left of it after. */
-  readonly follow_ups: readonly OperationFollowUp[];
-  /** A rollback's mode, fixed once its restored release is prepared, as it enters `swapping`. */
+  /** A rollback's mode, decided while fenced; required from `snapshotted` on. */
   readonly mode?: RollbackMode;
-  /**
-   * A rollback that failed once its swap began, going back to the release it
-   * left: continuing it finishes that return rather than the rollback.
-   */
+  /** Planned by `verified`; what is left of it once committed. */
+  readonly follow_ups: readonly OperationFollowUp[];
+  /** An update with no release to return to: once its target started, a failure closes it (KTD9). */
+  readonly no_rollback_target?: true;
+  /** A rollback that failed, going back to the release it left (KTD5): continuing it finishes that return. */
   readonly returning?: true;
-  /**
-   * The update a rollback replaced: one recorded with follow-ups pending, or
-   * one never recorded whose renames ran. It comes back if the rollback is
-   * withdrawn before its swap, so nothing it planned (no image ID it names)
-   * is ever dropped.
-   */
-  readonly superseded?: OperationRecord;
+  /** Closed for fix-forward: only an update to another release goes on from here (KTD9). */
+  readonly closed?: 'failed';
 }
 
 /** Facts an operation adds as it runs; each one given replaces what the record held. */
-export type OperationFacts = Partial<Pick<OperationRecord, 'stop' | 'manifest' | 'images' | 'follow_ups' | 'mode'>>;
+export type OperationFacts = Partial<Pick<OperationRecord, 'stop' | 'manifest' | 'mode' | 'follow_ups'>>;
 
 export type OperationStart = Pick<OperationRecord, 'kind' | 'from' | 'to'> &
-  Partial<Pick<OperationRecord, 'manifest' | 'follow_ups' | 'images'>>;
+  Partial<Pick<OperationRecord, 'manifest' | 'no_rollback_target'>>;
 
 /**
  * A command that takes the instance lock, and for `update` the release it
@@ -165,14 +151,23 @@ export interface OperationNextSteps {
 
 /** What `list` and `status` report, read without the instance lock. */
 export type OperationInspection =
-  | { readonly state: 'none'; readonly abandonedStaging: boolean }
-  | { readonly state: 'open'; readonly record: OperationRecord; readonly next: OperationNextSteps }
-  | { readonly state: 'recorded'; readonly record: OperationRecord; readonly abandonedStaging: boolean }
+  | { readonly state: 'none' }
+  | { readonly state: 'open' | 'failed'; readonly record: OperationRecord; readonly next: OperationNextSteps }
+  | { readonly state: 'committed'; readonly record: OperationRecord }
   | { readonly state: 'unreadable'; readonly code: string; readonly message: string };
+
+/** The release a rollback returns to, and the snapshot of the state it left (KTD4). */
+export interface RollbackPoint {
+  readonly release: ReleaseCoordinates;
+  /** The name of the snapshot in `snapshots/`. */
+  readonly snapshot: string;
+  /** The schema the snapshot holds. */
+  readonly manifest: SnapshotManifest;
+  readonly taken_at: string;
+}
 
 const INVALID = 'invalid_operation';
 const IMAGE_ID_PATTERN = /^sha256:[0-9a-f]{64}$/u;
-const IMAGE_TAG_PATTERN = /^[a-z0-9][a-z0-9._/-]*(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$/u;
 /** Docker's tag grammar: a per-group image is tagged with its agent group's ID. */
 const AGENT_GROUP_ID_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/u;
 
@@ -183,9 +178,6 @@ function invalid(message: string): GwsEaError {
 function rank(phase: OperationPhase): number {
   return OPERATION_PHASES.indexOf(phase);
 }
-
-/** Where a rollback can fail and go back: once its swap began, until it is recorded. */
-const RETURNABLE_PHASES: ReadonlySet<OperationPhase> = new Set(['swapping', 'swapped', 'started', 'verified']);
 
 function oneOf<T extends string>(values: readonly T[], value: unknown, label: string): T {
   const found = values.find((candidate) => candidate === value);
@@ -210,6 +202,11 @@ function matching(value: unknown, pattern: RegExp, label: string): string {
 function list<T>(value: unknown, label: string, parse: (entry: unknown) => T): readonly T[] {
   if (!Array.isArray(value)) throw invalid(`Operation record ${label} is invalid`);
   return value.map((entry: unknown) => parse(entry));
+}
+
+function flag(value: unknown, label: string): boolean {
+  if (value !== undefined && value !== true) throw invalid(`Operation record ${label} is invalid`);
+  return value === true;
 }
 
 function parseRelease(value: unknown, label: string): ReleaseCoordinates {
@@ -240,16 +237,6 @@ function parseManifest(value: unknown): SnapshotManifest {
   };
 }
 
-function parseImage(value: unknown): MovedImage {
-  if (!isRecord(value)) throw invalid('Operation record image is invalid');
-  return {
-    tag: matching(value.tag, IMAGE_TAG_PATTERN, 'image tag'),
-    image_id: matching(value.image_id, IMAGE_ID_PATTERN, 'image ID'),
-    displaced_image_id:
-      value.displaced_image_id === null ? null : matching(value.displaced_image_id, IMAGE_ID_PATTERN, 'image ID'),
-  };
-}
-
 function parseFollowUp(value: unknown): OperationFollowUp {
   if (!isRecord(value)) throw invalid('Operation record follow-up is invalid');
   switch (value.kind) {
@@ -258,36 +245,42 @@ function parseFollowUp(value: unknown): OperationFollowUp {
         kind: 'rebuild_group_image',
         agent_group_id: matching(value.agent_group_id, AGENT_GROUP_ID_PATTERN, 'agent group ID'),
       };
-    case 'delete_release':
-      return { kind: 'delete_release', release: oneOf(DELETABLE_RELEASES, value.release, 'release to delete') };
-    case 'delete_image':
-      return { kind: 'delete_image', image_id: matching(value.image_id, IMAGE_ID_PATTERN, 'image ID') };
+    case 'reclaim_image':
+      return { kind: 'reclaim_image', image_id: matching(value.image_id, IMAGE_ID_PATTERN, 'image ID') };
+    case 'prune':
+      return { kind: 'prune' };
     default:
       throw invalid('Operation record follow-up is invalid');
   }
 }
 
 /** What makes two follow-ups the same work, so planning one twice records it once. */
-export function followUpKey(followUp: OperationFollowUp): string {
+function followUpKey(followUp: OperationFollowUp): string {
   switch (followUp.kind) {
     case 'rebuild_group_image':
       return `${followUp.kind}:${followUp.agent_group_id}`;
-    case 'delete_release':
-      return `${followUp.kind}:${followUp.release}`;
-    case 'delete_image':
+    case 'reclaim_image':
       return `${followUp.kind}:${followUp.image_id}`;
+    case 'prune':
+      return followUp.kind;
   }
+}
+
+/** Add follow-ups to those planned, each at most once. */
+export function planFollowUps(
+  planned: readonly OperationFollowUp[],
+  added: readonly OperationFollowUp[],
+): OperationFollowUp[] {
+  const known = new Set(planned.map(followUpKey));
+  return [...planned, ...added.filter((followUp) => !known.has(followUpKey(followUp)))];
 }
 
 function recreate(instanceId: string): string {
   return `remove it with gws-ea remove --id ${instanceId}, then create it again`;
 }
 
-/**
- * Validate a record read from disk or about to be written; unknown fields are
- * dropped. A superseded update is itself a record, one level deep.
- */
-function parseOperationRecord(value: unknown, instanceId: string, nested = true): OperationRecord {
+/** Validate a record read from disk or about to be written; unknown fields are dropped. */
+function parseOperationRecord(value: unknown, instanceId: string): OperationRecord {
   if (!isRecord(value)) throw invalid('Operation record is invalid');
   if (value.schema_version !== OPERATION_RECORD_SCHEMA_VERSION) {
     const version = typeof value.schema_version === 'number' ? value.schema_version : 'unknown';
@@ -306,23 +299,28 @@ function parseOperationRecord(value: unknown, instanceId: string, nested = true)
   }
   const phase = oneOf(OPERATION_PHASES, value.phase, 'phase');
   const kind = oneOf(OPERATION_KINDS, value.kind, 'kind');
+  const commitPoint = oneOf(COMMIT_POINTS, value.commit_point, 'commit point');
   const stop = value.stop === undefined ? undefined : parseStop(value.stop);
-  if (!stop && rank(phase) >= rank('stopped')) throw invalid(`Operation record at ${phase} must record its stop`);
-  const mode = value.mode === undefined ? undefined : oneOf(ROLLBACK_MODES, value.mode, 'rollback mode');
-  if (value.returning !== undefined && value.returning !== true) throw invalid('Operation record return is invalid');
-  const returning = value.returning === true;
-  if (kind === 'update' && (mode || returning)) throw invalid('An update records no rollback mode or return');
-  if (returning && !RETURNABLE_PHASES.has(phase)) throw invalid(`A rollback at ${phase} cannot be returning`);
-  const superseded =
-    value.superseded === undefined || !nested ? undefined : parseOperationRecord(value.superseded, instanceId, false);
-  if (value.superseded !== undefined && (!superseded || kind !== 'rollback' || !isReplaceableUpdate(superseded))) {
-    throw invalid('Operation record names an invalid superseded update');
+  if (!stop && rank(phase) >= rank('fenced') && phase !== 'committed') {
+    throw invalid(`Operation record at ${phase} must record its stop`);
   }
+  const mode = value.mode === undefined ? undefined : oneOf(ROLLBACK_MODES, value.mode, 'rollback mode');
+  const noRollbackTarget = flag(value.no_rollback_target, 'rollback target');
+  const returning = flag(value.returning, 'return');
+  if (value.closed !== undefined && value.closed !== 'failed') throw invalid('Operation record closing is invalid');
+  if (kind === 'update' && (mode || returning || commitPoint === 'record')) {
+    throw invalid('An update records no rollback mode, return, or commit by record');
+  }
+  if (kind === 'rollback' && noRollbackTarget) throw invalid('A rollback always has a release to return to');
+  if (kind === 'rollback' && !mode && rank(phase) >= rank('snapshotted')) {
+    throw invalid(`A rollback at ${phase} must record its mode`);
+  }
+  if (returning && commitPoint === 'record') throw invalid('A rollback reverting an update never goes back to it');
   return {
     schema_version: OPERATION_RECORD_SCHEMA_VERSION,
     instance_id: instanceId,
     kind,
-    commit_point: oneOf(COMMIT_POINTS, value.commit_point, 'commit point'),
+    commit_point: commitPoint,
     from,
     to,
     phase,
@@ -330,17 +328,12 @@ function parseOperationRecord(value: unknown, instanceId: string, nested = true)
     updated_at: timestamp(value.updated_at, 'update time'),
     ...(stop ? { stop } : {}),
     ...(value.manifest === undefined ? {} : { manifest: parseManifest(value.manifest) }),
-    images: list(value.images, 'images', parseImage),
-    follow_ups: list(value.follow_ups, 'follow-ups', parseFollowUp),
     ...(mode ? { mode } : {}),
+    follow_ups: list(value.follow_ups, 'follow-ups', parseFollowUp),
+    ...(noRollbackTarget ? { no_rollback_target: true as const } : {}),
     ...(returning ? { returning: true as const } : {}),
-    ...(superseded ? { superseded } : {}),
+    ...(value.closed === 'failed' ? { closed: 'failed' as const } : {}),
   };
-}
-
-/** An update a rollback may replace: recorded, or unrecorded with its renames run. */
-function isReplaceableUpdate(record: OperationRecord): boolean {
-  return record.kind === 'update' && rank(record.phase) >= rank('swapped');
 }
 
 /** The record of this instance's update or rollback, or undefined when none is under way. */
@@ -366,37 +359,112 @@ async function writeRecord(paths: ControlPlanePaths, record: OperationRecord): P
   return validated;
 }
 
+function parseRollbackPoint(value: unknown, instanceId: string): RollbackPoint {
+  if (!isRecord(value) || value.schema_version !== 1 || value.instance_id !== instanceId) {
+    throw new GwsEaError('invalid_rollback_point', `Assistant ${instanceId}'s rollback point is not its own.`);
+  }
+  return {
+    release: parseRelease(value.release, 'rollback point'),
+    snapshot: name(value.snapshot, 'rollback point snapshot'),
+    manifest: parseManifest(value.manifest),
+    taken_at: timestamp(value.taken_at, 'snapshot time'),
+  };
+}
+
+/** The release this assistant would roll back to, or undefined when it has none (KTD4). */
+export async function readRollbackPoint(
+  paths: ControlPlanePaths,
+  instanceId: string,
+): Promise<RollbackPoint | undefined> {
+  assertInstanceId(instanceId);
+  let raw: unknown;
+  try {
+    raw = await readOwnerOnlyJson(paths.rollbackPointFile(instanceId), 'Rollback point', 'invalid_rollback_point');
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) return undefined;
+    throw error;
+  }
+  return parseRollbackPoint(raw, instanceId);
+}
+
 /**
- * Mark a committed operation recorded, deleting the record when no follow-up
- * is left. A superseded update's follow-ups were carried in when it was
- * replaced, so it is no longer kept.
+ * What a committed release leaves to roll back to: an update, the release it
+ * left and the snapshot it took as it left it (none for one with no rollback
+ * target); a rollback, nothing. A rollback reverting an update that was never
+ * committed leaves the rollback point as it was. Rewritten whole each time,
+ * so a settle cut short is settled again.
  */
-async function settleRecorded(paths: ControlPlanePaths, record: OperationRecord): Promise<OperationRecord | undefined> {
+async function settleRollbackPoint(paths: ControlPlanePaths, record: OperationRecord): Promise<void> {
+  const file = paths.rollbackPointFile(record.instance_id);
+  if (record.kind === 'rollback' && record.commit_point === 'record') return;
+  if (record.kind === 'rollback' || record.no_rollback_target) {
+    await removePrivateFile(file);
+    return;
+  }
+  if (!record.manifest || !record.stop) throw invalid('A committed update must record its fence');
+  await writePrivate(file, {
+    schema_version: 1,
+    instance_id: record.instance_id,
+    release: record.from,
+    snapshot: operationName(record.started_at),
+    manifest: record.manifest,
+    taken_at: record.stop.at,
+  });
+}
+
+/**
+ * Mark a committed operation committed and settle its rollback point,
+ * deleting the record when no follow-up is left.
+ */
+async function settleCommitted(
+  paths: ControlPlanePaths,
+  record: OperationRecord,
+): Promise<OperationRecord | undefined> {
+  await settleRollbackPoint(paths, record);
+  return settleFollowUps(paths, record);
+}
+
+/** A committed record with what is left to follow up, or no record once nothing is. */
+async function settleFollowUps(
+  paths: ControlPlanePaths,
+  record: OperationRecord,
+): Promise<OperationRecord | undefined> {
   if (record.follow_ups.length === 0) {
     await removePrivateFile(paths.operationFile(record.instance_id));
     return undefined;
   }
-  const { superseded: _superseded, returning: _returning, ...rest } = record;
-  return writeRecord(paths, { ...rest, phase: 'recorded', updated_at: new Date().toISOString() });
+  const { returning: _returning, closed: _closed, ...rest } = record;
+  return writeRecord(paths, { ...rest, phase: 'committed', updated_at: new Date().toISOString() });
 }
 
 /** An open record whose target the registry already names passed its commit point. */
 function committedByRegistry(record: OperationRecord, reservation: InstanceReservation): boolean {
   return (
-    record.phase !== 'recorded' && record.commit_point === 'registry' && sameRelease(releaseOf(reservation), record.to)
+    record.phase !== 'committed' &&
+    record.closed === undefined &&
+    !record.returning &&
+    record.commit_point === 'registry' &&
+    sameRelease(releaseOf(reservation), record.to)
   );
 }
 
 export function operationNextSteps(record: OperationRecord): OperationNextSteps {
   const id = record.instance_id;
-  return record.kind === 'update'
+  if (record.closed === 'failed') return { continueWith: `gws-ea update --id ${id}` };
+  return record.kind === 'update' && !record.no_rollback_target
     ? { continueWith: `gws-ea update --id ${id}`, revertWith: `gws-ea rollback --id ${id}` }
-    : { continueWith: `gws-ea rollback --id ${id}` };
+    : { continueWith: `gws-ea ${record.kind} --id ${id}` };
 }
 
 /** The clause naming what reverts an unfinished operation, or nothing when only continuing it can. */
 export function revertClause(next: OperationNextSteps): string {
   return next.revertWith ? `, or revert it with ${next.revertWith}` : '';
+}
+
+/** How an unfinished record reads to an operator: its kind, target, and phase. */
+function describeRecord(record: OperationRecord): string {
+  const subject = `${record.kind === 'update' ? 'An update' : 'A rollback'} of this assistant`;
+  return `${subject} to ${record.to.release_track} ${shortCommit(record.to.deployed_commit)}`;
 }
 
 /**
@@ -408,18 +476,38 @@ export function revertClause(next: OperationNextSteps): string {
 function inProgress(record: OperationRecord, deploying?: ReleaseCoordinates): GwsEaError {
   const next = operationNextSteps(record);
   const staged = shortCommit(record.to.deployed_commit);
-  const subject = `${record.kind === 'update' ? 'An update' : 'A rollback'} of this assistant`;
   const moved = deploying ? `, and this gws-ea deploys ${shortCommit(deploying.deployed_commit)}` : '';
   const continued = deploying ? `${next.continueWith} from the gws-ea at ${staged}` : next.continueWith;
   return new GwsEaError(
     'operation_in_progress',
-    `${subject} to ${record.to.release_track} ${staged} is unfinished (${record.phase})${moved}. ` +
+    `${describeRecord(record)} is unfinished (${record.phase})${moved}. ` +
       `Continue it with ${continued}${revertClause(next)}.`,
     { details: { phase: record.phase, continueWith: next.continueWith, revertWith: next.revertWith ?? null } },
   );
 }
 
+/** The refusal a record closed for fix-forward gives: only an update to another release goes on. */
+function closedFailed(record: OperationRecord): GwsEaError {
+  const id = record.instance_id;
+  return new GwsEaError(
+    'operation_failed',
+    `${describeRecord(record)} failed, and so did returning to the release it left (${record.phase}). ` +
+      `Fix it forward: update it to a newer release with gws-ea update --id ${id}, or remove it with gws-ea remove --id ${id}.`,
+    { details: { phase: record.phase, continueWith: `gws-ea update --id ${id}` } },
+  );
+}
+
+/** Whether an update to `target` may replace `record` (KTD9): it has no release to return to. */
+function supersedable(record: OperationRecord, target: ReleaseCoordinates): boolean {
+  return (
+    (record.closed === 'failed' || (record.kind === 'update' && record.no_rollback_target === true)) &&
+    !sameRelease(record.to, target)
+  );
+}
+
 function refusal(record: OperationRecord, intent: OperationIntent): GwsEaError | undefined {
+  if (intent.command === 'update' && supersedable(record, intent.target)) return undefined;
+  if (record.closed === 'failed') return closedFailed(record);
   switch (intent.command) {
     case 'rollback':
       return undefined;
@@ -440,9 +528,9 @@ function refusal(record: OperationRecord, intent: OperationIntent): GwsEaError |
 /**
  * The gate `acquireInstanceOperation` applies under the instance lock. An
  * open record is resolved against the registry first, and one it shows
- * committed is recorded here; only then may it refuse `intent`. A record
- * that cannot be read refuses every command, since nothing can tell what it
- * left half-moved.
+ * committed is settled here; only then may it refuse `intent`. A record that
+ * cannot be read refuses every command, since nothing can tell what it left
+ * half-done.
  */
 export async function admitInstanceCommand(
   paths: ControlPlanePaths,
@@ -451,28 +539,28 @@ export async function admitInstanceCommand(
 ): Promise<void> {
   const record = await readOperationRecord(paths, reservation.instance_id);
   if (!record) return;
-  const resolved = committedByRegistry(record, reservation) ? await settleRecorded(paths, record) : record;
-  if (!resolved || resolved.phase === 'recorded') return;
+  const resolved = committedByRegistry(record, reservation) ? await settleCommitted(paths, record) : record;
+  if (!resolved || resolved.phase === 'committed') return;
   const refused = refusal(resolved, intent);
   if (refused) throw refused;
 }
 
 /**
  * Recovery's first read, the resolution the gate makes (KTD2): an operation
- * that failed before it was recorded may have passed its commit point anyway.
+ * that failed before it was committed may have passed its commit point anyway.
  * When the registry already names its target, the compare-and-swap ran and
- * only the record write after it failed, so the release stands and nothing
- * may revert it: this throws `cause` reported that way, naming the command
- * whose gate settles the record and runs its follow-ups. Nothing is written,
- * since the write that failed may fail again. Otherwise it returns, and
- * recovery goes on.
+ * only the writes after it failed, so the release stands and nothing may
+ * revert it: this throws `cause` reported that way, naming the command whose
+ * gate settles the record and runs its follow-ups. Nothing is written, since
+ * the write that failed may fail again. Otherwise it returns, and recovery
+ * goes on.
  */
 export async function assertNotCommitted(operation: InstanceOperation, cause: unknown): Promise<void> {
   operation.assertActive();
   const { paths, instanceId } = operation;
   const record = await readOperationRecord(paths, instanceId);
   if (!record || !committedByRegistry(record, await getInstanceReservation(paths, instanceId))) return;
-  const { continueWith } = operationNextSteps(record);
+  const continueWith = `gws-ea ${record.kind} --id ${instanceId}`;
   throw new GwsEaError(
     'operation_unsettled',
     `${safeErrorMessage(cause)} Assistant ${instanceId} runs ${record.to.release_track} ${shortCommit(record.to.deployed_commit)}: ` +
@@ -481,20 +569,9 @@ export async function assertNotCommitted(operation: InstanceOperation, cause: un
   );
 }
 
-async function exists(target: string): Promise<boolean> {
-  try {
-    await lstat(target);
-    return true;
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) return false;
-    throw error;
-  }
-}
-
 /**
  * The operation as `list` and `status` show it: read-only, lock-free, and
- * resolved against the registry the same way the gate resolves it. A `next/`
- * with no open record is staging an interrupted update left behind.
+ * resolved against the registry the same way the gate resolves it.
  */
 export async function inspectOperation(
   paths: ControlPlanePaths,
@@ -507,12 +584,10 @@ export async function inspectOperation(
     if (!(error instanceof GwsEaError)) throw error;
     return { state: 'unreadable', code: error.code, message: error.message };
   }
-  if (record && committedByRegistry(record, reservation)) record = { ...record, phase: 'recorded' };
-  if (record && record.phase !== 'recorded') return { state: 'open', record, next: operationNextSteps(record) };
-  const abandonedStaging = await exists(paths.releaseRoot(reservation.instance_id, 'next'));
-  return record && record.follow_ups.length > 0
-    ? { state: 'recorded', record, abandonedStaging }
-    : { state: 'none', abandonedStaging };
+  if (!record) return { state: 'none' };
+  if (committedByRegistry(record, reservation)) record = { ...record, phase: 'committed' };
+  if (record.phase === 'committed') return { state: 'committed', record };
+  return { state: record.closed === 'failed' ? 'failed' : 'open', record, next: operationNextSteps(record) };
 }
 
 async function currentRecord(operation: InstanceOperation): Promise<OperationRecord> {
@@ -522,41 +597,34 @@ async function currentRecord(operation: InstanceOperation): Promise<OperationRec
   return record;
 }
 
-/** Whether `start` is a rollback reverting `record`, an update whose renames already ran. */
+/** Whether `start` is a rollback reverting `record`, an update whose release started and was never committed. */
 function reverts(record: OperationRecord, start: OperationStart): boolean {
   return (
     record.kind === 'update' &&
+    record.closed === undefined &&
+    record.no_rollback_target === undefined &&
+    rank(record.phase) >= rank('started') &&
+    record.phase !== 'committed' &&
     start.kind === 'rollback' &&
-    rank(record.phase) >= rank('swapped') &&
-    record.phase !== 'recorded' &&
     sameRelease(start.from, record.to) &&
     sameRelease(start.to, record.from)
   );
 }
 
 /**
- * Whether `start` is a rollback of the release a recorded update left with
- * follow-ups pending: the rollback takes the update's place, planning what of
- * them still applies, so a failed rebuild on the release never blocks going
- * back from it.
- */
-function supersedes(record: OperationRecord, start: OperationStart): boolean {
-  return (
-    record.phase === 'recorded' &&
-    record.kind === 'update' &&
-    start.kind === 'rollback' &&
-    sameRelease(start.from, record.to)
-  );
-}
-
-/**
  * Record an update or rollback at `staged`, once it is decided and before
  * anything changes: staging and the preview write no record. It starts from
- * the release the registry names, unless it is a rollback reverting an update
- * that already swapped but was never recorded; that one replaces the update's
- * record in one write, so the gate never lifts, and commits by its own record.
- * A rollback of a recorded update whose follow-ups are pending replaces that
- * record too, and commits through the registry.
+ * the release the registry names, and replaces in one write, so the gate
+ * never lifts:
+ *
+ * - a committed update's record with follow-ups left, when it is a rollback,
+ *   carrying those follow-ups, so a failed rebuild never blocks going back
+ *   and nothing it planned is dropped;
+ * - an update whose release started and was never committed, when it is the
+ *   rollback reverting it, which commits by its own record and keeps the
+ *   update's start time, so it finds the snapshot the update took;
+ * - a record with no release to return to, when it is an update to another
+ *   release, which supersedes it with no release to return to either (KTD9).
  */
 export async function beginOperation(operation: InstanceOperation, start: OperationStart): Promise<OperationRecord> {
   operation.assertActive();
@@ -567,14 +635,27 @@ export async function beginOperation(operation: InstanceOperation, start: Operat
     throw invalid('An update or rollback must change the deployed commit');
   }
   const existing = await readOperationRecord(paths, instanceId);
-  if (existing?.phase === 'recorded' && !supersedes(existing, start)) {
-    throw new GwsEaError(
-      'operation_follow_ups_pending',
-      "This assistant's last update or rollback still has follow-ups to finish before another can start",
-    );
+  const now = new Date().toISOString();
+  let commitPoint: OperationCommitPoint = 'registry';
+  let startedAt = now;
+  let followUps: readonly OperationFollowUp[] = [];
+  let noRollbackTarget = start.no_rollback_target === true;
+  if (existing?.phase === 'committed') {
+    if (start.kind !== 'rollback') {
+      throw new GwsEaError(
+        'operation_follow_ups_pending',
+        "This assistant's last update or rollback still has follow-ups to finish before another can start",
+      );
+    }
+    followUps = existing.follow_ups;
+  } else if (existing && reverts(existing, start)) {
+    commitPoint = 'record';
+    startedAt = existing.started_at;
+  } else if (existing && start.kind === 'update' && supersedable(existing, to)) {
+    noRollbackTarget = true;
+  } else if (existing) {
+    throw existing.closed === 'failed' ? closedFailed(existing) : inProgress(existing);
   }
-  if (existing && existing.phase !== 'recorded' && !reverts(existing, start)) throw inProgress(existing);
-  const commitPoint: OperationCommitPoint = existing && existing.phase !== 'recorded' ? 'record' : 'registry';
   const registered = releaseOf(await getInstanceReservation(paths, instanceId));
   if (!sameRelease(registered, commitPoint === 'record' ? to : from)) {
     throw new GwsEaError(
@@ -582,13 +663,6 @@ export async function beginOperation(operation: InstanceOperation, start: Operat
       "The assistant's recorded release is not the one this operation moves",
     );
   }
-  const now = new Date().toISOString();
-  const planned = start.follow_ups ?? [];
-  const planning = new Set(planned.map(followUpKey));
-  // Every image the replaced record would have deleted stays named, so none is left untagged and forgotten.
-  const deletions = (existing?.follow_ups ?? []).filter(
-    (followUp) => followUp.kind === 'delete_image' && !planning.has(followUpKey(followUp)),
-  );
   return writeRecord(paths, {
     schema_version: OPERATION_RECORD_SCHEMA_VERSION,
     instance_id: instanceId,
@@ -597,106 +671,44 @@ export async function beginOperation(operation: InstanceOperation, start: Operat
     from,
     to,
     phase: 'staged',
-    started_at: now,
+    started_at: startedAt,
     updated_at: now,
     ...(start.manifest ? { manifest: start.manifest } : {}),
-    images: start.images ?? [],
-    follow_ups: [...planned, ...deletions],
-    ...(existing ? { superseded: existing } : {}),
+    follow_ups: followUps,
+    ...(noRollbackTarget ? { no_rollback_target: true as const } : {}),
   });
+}
+
+/** An open record that may still move: not committed, closed, or going back. */
+function assertMoving(record: OperationRecord): void {
+  if (record.phase === 'committed' || record.closed || record.returning) {
+    throw new GwsEaError(
+      'operation_phase',
+      `This ${record.kind} is ${record.closed ? 'closed' : record.returning ? 'going back' : 'committed'}; it does not move on`,
+    );
+  }
 }
 
 /**
  * Move an open operation to `phase`, adding `facts`. Re-entering the current
- * phase records fresh facts (a cutover restarted from `stopped` stops again);
- * the one move back is `swapping → stopped`, once recovery reversed the
- * renames, and it drops a rollback's mode, which is fixed only as it enters
- * `swapping` and so is decided again (KTD5). `recorded` is reached only
+ * phase records fresh facts (a fence re-established on resume records its
+ * stop again); a phase is never left backward. `committed` is reached only
  * through `commitOperationRelease`.
  */
 export async function advanceOperation(
   operation: InstanceOperation,
-  phase: OperationPhase,
+  phase: Exclude<OperationPhase, 'committed'>,
   facts: OperationFacts = {},
 ): Promise<OperationRecord> {
   const record = await currentRecord(operation);
-  if (phase === 'recorded' || record.phase === 'recorded') {
-    throw new GwsEaError('operation_phase', 'An update or rollback is recorded only by committing its release');
-  }
-  if (record.returning) {
-    throw new GwsEaError('operation_phase', 'A rollback going back to the release it left only completes its return');
-  }
-  if (rank(phase) < rank(record.phase) && !(record.phase === 'swapping' && phase === 'stopped')) {
+  assertMoving(record);
+  if (rank(phase) < rank(record.phase)) {
     throw new GwsEaError(
       'operation_phase_regression',
       `An update or rollback cannot move back from ${record.phase} to ${phase}`,
     );
   }
-  const { mode: _mode, ...undecided } = record;
-  const kept = rank(phase) < rank('swapping') ? undecided : record;
-  return writeRecord(operation.paths, { ...kept, ...facts, phase, updated_at: new Date().toISOString() });
-}
-
-/**
- * Mark a rollback that failed once its swap began as returning to the release
- * it left (KTD19). From then on, continuing it finishes the return.
- */
-export async function beginOperationReturn(operation: InstanceOperation): Promise<OperationRecord> {
-  const record = await currentRecord(operation);
-  if (record.returning) return record;
-  if (record.kind !== 'rollback' || !RETURNABLE_PHASES.has(record.phase)) {
-    throw new GwsEaError(
-      'operation_phase',
-      `Only a rollback whose swap began and that is not yet recorded can go back; this ${record.kind} is at ${record.phase}`,
-    );
-  }
-  return writeRecord(operation.paths, { ...record, returning: true, updated_at: new Date().toISOString() });
-}
-
-/**
- * A returning rollback is back where its cutover started: the release it left
- * live again, the one it restored kept as it was, every image tag back. It is
- * `stopped` again with no mode, so continuing it starts its cutover over; its
- * image moves and follow-ups stay, since they still hold and name every image
- * it would delete.
- */
-export async function completeOperationReturn(operation: InstanceOperation): Promise<OperationRecord> {
-  const record = await currentRecord(operation);
-  if (!record.returning) {
-    throw new GwsEaError('operation_phase', 'This rollback is not going back to the release it left');
-  }
-  const { returning: _returning, mode: _mode, superseded, ...rest } = record;
-  // A rollback of the recorded release gives back the update it replaced once withdrawn. One reverting an
-  // unrecorded update may have dropped that update's `:next` tag, so the update can no longer continue: the
-  // rollback stays, with everything it carried from the update.
-  return writeRecord(operation.paths, {
-    ...rest,
-    ...(superseded && record.commit_point === 'registry' ? { superseded } : {}),
-    phase: 'stopped',
-    updated_at: new Date().toISOString(),
-  });
-}
-
-/**
- * Withdraw a rollback that has swapped nothing, at `staged` or `stopped`: the
- * update it replaced comes back as it was, with everything it planned, or the
- * record is deleted when it replaced none. A rollback reverting an unrecorded
- * update always replaced that update, so the update is never lost; one that
- * no longer holds it (it went back once already) stays for `rollback --id`.
- * Returns whether the rollback was withdrawn.
- */
-export async function withdrawRollback(operation: InstanceOperation): Promise<boolean> {
-  const record = await currentRecord(operation);
-  if (record.kind !== 'rollback' || record.returning || rank(record.phase) > rank('stopped')) {
-    throw inProgress(record);
-  }
-  if (record.superseded) {
-    await writeRecord(operation.paths, { ...record.superseded, updated_at: new Date().toISOString() });
-    return true;
-  }
-  if (record.commit_point === 'record') return false;
-  await removePrivateFile(operation.paths.operationFile(operation.instanceId));
-  return true;
+  return writeRecord(operation.paths, { ...record, ...facts, phase, updated_at: new Date().toISOString() });
 }
 
 /** Add facts to an open operation without moving its phase. */
@@ -705,26 +717,70 @@ export async function recordOperationFacts(
   facts: OperationFacts,
 ): Promise<OperationRecord> {
   const record = await currentRecord(operation);
-  if (record.phase === 'recorded') {
-    throw new GwsEaError('operation_phase', 'A recorded update or rollback only completes its follow-ups');
-  }
+  assertMoving(record);
   return writeRecord(operation.paths, { ...record, ...facts, updated_at: new Date().toISOString() });
+}
+
+/** Mark a rollback that failed as going back to the release it left (KTD5); continuing it finishes the return. */
+export async function beginOperationReturn(operation: InstanceOperation): Promise<OperationRecord> {
+  const record = await currentRecord(operation);
+  if (record.returning) return record;
+  if (record.kind !== 'rollback' || record.commit_point !== 'registry' || record.phase === 'committed') {
+    throw new GwsEaError('operation_phase', `Only a rollback of a committed release goes back to it`);
+  }
+  return writeRecord(operation.paths, { ...record, returning: true, updated_at: new Date().toISOString() });
+}
+
+/** Close an operation that cannot go back for fix-forward (KTD9): only an update to another release replaces it. */
+export async function closeOperationFailed(operation: InstanceOperation): Promise<OperationRecord> {
+  const record = await currentRecord(operation);
+  if (record.phase === 'committed') throw new GwsEaError('operation_phase', 'A committed operation is not closed');
+  const { returning: _returning, ...rest } = record;
+  return writeRecord(operation.paths, { ...rest, closed: 'failed', updated_at: new Date().toISOString() });
+}
+
+/**
+ * End an operation that will not commit: an update refused before its
+ * release started, or a rollback declined or gone back. Its record is
+ * deleted, unless it is a rollback that replaced a committed update with
+ * follow-ups left: that update is committed again, with them, so nothing it
+ * planned is dropped.
+ */
+export async function discardOperation(operation: InstanceOperation): Promise<void> {
+  const record = await currentRecord(operation);
+  if (record.phase === 'committed') throw new GwsEaError('operation_phase', 'A committed operation is not discarded');
+  if (record.kind === 'rollback' && record.commit_point === 'registry' && record.follow_ups.length > 0) {
+    await settleFollowUps(operation.paths, {
+      schema_version: OPERATION_RECORD_SCHEMA_VERSION,
+      instance_id: record.instance_id,
+      kind: 'update',
+      commit_point: 'registry',
+      from: record.to,
+      to: record.from,
+      phase: 'committed',
+      started_at: record.started_at,
+      updated_at: record.updated_at,
+      follow_ups: record.follow_ups,
+    });
+    return;
+  }
+  await removePrivateFile(operation.paths.operationFile(operation.instanceId));
 }
 
 /**
  * The commit point: once verified, the registry compare-and-swap moves the
  * reservation to the target (unless the registry already names it, after a
- * crash right after the swap), then the record becomes `recorded`, releasing
- * the gate. Returns what is left to follow up, or undefined once the record is
- * deleted because nothing is.
+ * crash right after the swap), then the rollback point is settled and the
+ * record becomes `committed`, releasing the gate. Returns what is left to
+ * follow up, or undefined once the record is deleted because nothing is.
  */
 export async function commitOperationRelease(operation: InstanceOperation): Promise<OperationRecord | undefined> {
   const record = await currentRecord(operation);
-  if (record.phase === 'recorded') return record;
-  if (record.phase !== 'verified' || record.returning) {
+  if (record.phase === 'committed') return record;
+  if (record.phase !== 'verified' || record.returning || record.closed) {
     throw new GwsEaError(
       'operation_phase',
-      `An update or rollback is recorded only once verified; this one is at ${record.phase}`,
+      `An update or rollback is committed only once verified; this one is at ${record.phase}`,
     );
   }
   const { paths, instanceId } = operation;
@@ -738,7 +794,21 @@ export async function commitOperationRelease(operation: InstanceOperation): Prom
     }
     await swapInstanceRelease(paths, instanceId, record.from, record.to);
   }
-  return settleRecorded(paths, record);
+  return settleCommitted(paths, record);
+}
+
+/** Add follow-ups to a committed operation's, each at most once: a rebuild records the image it displaces first. */
+export async function addFollowUps(
+  operation: InstanceOperation,
+  followUps: readonly OperationFollowUp[],
+): Promise<OperationRecord> {
+  const record = await currentRecord(operation);
+  if (record.phase !== 'committed') throw new GwsEaError('operation_phase', 'Follow-ups run once committed');
+  return writeRecord(operation.paths, {
+    ...record,
+    follow_ups: planFollowUps(record.follow_ups, followUps),
+    updated_at: new Date().toISOString(),
+  });
 }
 
 /** Mark one follow-up done; the record is deleted with the last. Returns what is left. */
@@ -747,60 +817,28 @@ export async function completeFollowUp(
   followUp: OperationFollowUp,
 ): Promise<OperationRecord | undefined> {
   const record = await currentRecord(operation);
-  if (record.phase !== 'recorded') {
-    throw new GwsEaError('operation_phase', 'Follow-ups run only once the release is recorded');
-  }
+  if (record.phase !== 'committed') throw new GwsEaError('operation_phase', 'Follow-ups run once committed');
   const done = followUpKey(followUp);
-  return settleRecorded(operation.paths, {
+  return settleFollowUps(operation.paths, {
     ...record,
     follow_ups: record.follow_ups.filter((pending) => followUpKey(pending) !== done),
   });
 }
 
 /**
- * Delete the record. Before the renames an operation is discarded rather than
- * reverted (its staging is dropped and the old host restarted); a recorded
- * one's follow-ups are given up. From `swapping` until recorded the releases
- * may be half-moved, so the operation can only be continued or reverted.
- */
-export async function discardOperation(operation: InstanceOperation): Promise<void> {
-  operation.assertActive();
-  const record = await readOperationRecord(operation.paths, operation.instanceId);
-  if (!record) return;
-  if (record.phase !== 'recorded' && rank(record.phase) >= rank('swapping')) throw inProgress(record);
-  await removePrivateFile(operation.paths.operationFile(operation.instanceId));
-}
-
-/**
- * The commits the live checkout's marker may name: the registry's, and the
- * one an unfinished operation placed there, its origin before the renames
- * and its target from `swapping` on (either may be live mid-rename), and
- * both while a rollback goes back to the release it left.
+ * The commits the live link may name: the registry's, and while an update or
+ * rollback is open or closed failed, either release it moves between.
  */
 export function liveCheckoutCommits(
   reservation: InstanceReservation,
   record: OperationRecord | undefined,
 ): readonly string[] {
   const commits = new Set([reservation.deployed_commit]);
-  if (record && record.phase !== 'recorded') {
-    // A returning rollback may have put back the release it left at any phase.
-    if (rank(record.phase) <= rank('swapping') || record.returning) commits.add(record.from.deployed_commit);
-    if (rank(record.phase) >= rank('swapping')) commits.add(record.to.deployed_commit);
+  if (record && record.phase !== 'committed') {
+    commits.add(record.from.deployed_commit);
+    commits.add(record.to.deployed_commit);
   }
   return [...commits];
-}
-
-/**
- * The target reservation view: the registry entry with the operation's target
- * release overlaid. An update hands it to what checks a reservation's release
- * (the materializer, runtime-config creation, receipt checks) while the
- * registry itself still names the release it moves from.
- */
-export function targetReservationView(reservation: InstanceReservation, record: OperationRecord): InstanceReservation {
-  if (record.instance_id !== reservation.instance_id) {
-    throw new GwsEaError('operation_mismatch', 'The operation record belongs to another instance');
-  }
-  return reservationAt(reservation, record.to);
 }
 
 /** The registry entry with `release` overlaid: the view an update stages before it writes its record. */

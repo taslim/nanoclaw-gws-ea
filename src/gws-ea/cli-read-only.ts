@@ -157,12 +157,17 @@ export const READ_ONLY_COMMANDS: ReadonlyMap<string, ReadOnlyCommand> = new Map(
 function operationNote(inspection: OperationInspection): string | undefined {
   switch (inspection.state) {
     case 'none':
-    case 'recorded':
+    case 'committed':
       return undefined;
     case 'open': {
       const { record, next } = inspection;
       const subject = record.kind === 'update' ? 'An update' : 'A rollback';
       return `${subject} of this assistant is unfinished (${record.phase}); continue it with ${next.continueWith}${revertClause(next)}.`;
+    }
+    case 'failed': {
+      const { record, next } = inspection;
+      const subject = record.kind === 'update' ? 'An update' : 'A rollback';
+      return `${subject} of this assistant failed and could not go back (${record.phase}); fix it forward with ${next.continueWith} to a newer release.`;
     }
     case 'unreadable':
       return `This assistant's update or rollback record cannot be read: ${inspection.message}`;

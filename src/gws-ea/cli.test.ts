@@ -743,7 +743,7 @@ describe('gws-ea without a TTY', () => {
     expect(advanceProvision).not.toHaveBeenCalled();
   });
 
-  it('refuses to resume mid-update instead of re-cloning the swapped-away checkout, naming what continues or reverts', async () => {
+  it('refuses to resume mid-update instead of staging the release the fence took live away, naming what continues or reverts', async () => {
     const paths = await testPaths();
     const input = await reserveInstance(paths, reservation());
     const target = { ...releaseOf(input), deployed_commit: 'b'.repeat(40) };
@@ -751,9 +751,9 @@ describe('gws-ea without a TTY', () => {
     if (!operation) throw new Error('The test instance operation was busy');
     try {
       await beginOperation(operation, { kind: 'update', from: releaseOf(input), to: target });
-      await advanceOperation(operation, 'stopped', { stop: { at: '2026-09-28T10:00:00.000Z', graceful: true } });
-      await advanceOperation(operation, 'swapping');
-      await advanceOperation(operation, 'swapped');
+      await advanceOperation(operation, 'fenced', { stop: { at: '2026-09-28T10:00:00.000Z', graceful: true } });
+      await advanceOperation(operation, 'snapshotted');
+      await advanceOperation(operation, 'switched');
     } finally {
       operation.release();
     }
@@ -770,7 +770,7 @@ describe('gws-ea without a TTY', () => {
       }),
     ).toBe(1);
     const summary = io.err.join('\n');
-    expect(summary).toContain('is unfinished (swapped)');
+    expect(summary).toContain('is unfinished (switched)');
     expect(summary).toContain(`gws-ea update --id ${input.instance_id}`);
     expect(summary).toContain(`gws-ea rollback --id ${input.instance_id}`);
     expect(summary).not.toContain('Resume with');
@@ -1683,7 +1683,7 @@ async function runCliInChild(
   return { exitCode, stdout, stderr };
 }
 
-/** Leave an update of the assistant open at `stopped`, as a cutover interrupted after its stop would. */
+/** Leave an update of the assistant open at `fenced`, as an update interrupted after its fence would. */
 async function interruptUpdate(paths: ControlPlanePaths, instanceId: string): Promise<void> {
   const registered = releaseOf((await readRegistry(paths)).instances[instanceId]!);
   const target = { ...registered, deployed_commit: 'b'.repeat(40) };
@@ -1691,7 +1691,7 @@ async function interruptUpdate(paths: ControlPlanePaths, instanceId: string): Pr
   if (!operation) throw new Error('The test instance operation was busy');
   try {
     await beginOperation(operation, { kind: 'update', from: registered, to: target });
-    await advanceOperation(operation, 'stopped', { stop: { at: '2026-09-28T10:00:00.000Z', graceful: true } });
+    await advanceOperation(operation, 'fenced', { stop: { at: '2026-09-28T10:00:00.000Z', graceful: true } });
   } finally {
     operation.release();
   }
@@ -2174,7 +2174,7 @@ describe('gws-ea on an assistant that is not ready to operate', () => {
       expect(exitCode).toBe(1);
       expect(replacement).toBeUndefined();
       const summary = io.err.join('\n');
-      expect(summary).toContain('is unfinished (stopped)');
+      expect(summary).toContain('is unfinished (fenced)');
       expect(summary).toContain(`gws-ea update --id ${a.instance_id}`);
       expect(summary).toContain(`gws-ea rollback --id ${a.instance_id}`);
       expect(summary).not.toContain('Retry with');
@@ -2184,7 +2184,7 @@ describe('gws-ea on an assistant that is not ready to operate', () => {
     const io = lines();
     const { replacement } = await runReplacing(['logs', '--id', a.instance_id], { paths, ...io.runtime });
     expect(replacement?.args).toEqual(['cat', logs.output]);
-    expect(io.err.join('\n')).toContain('is unfinished (stopped)');
+    expect(io.err.join('\n')).toContain('is unfinished (fenced)');
     expect(io.err.join('\n')).toContain(`gws-ea update --id ${a.instance_id}`);
     expect(io.out).toEqual([]);
   });

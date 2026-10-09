@@ -230,7 +230,7 @@ describe('exact release checkout', () => {
     await expect(lstat(paths.checkoutRoot(instanceId))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it("stages an update's target reservation view in its release slot from the target's source, leaving the live release in place", async () => {
+  it("stages an update's target reservation view in its own folder from the target's source, leaving the live release in place", async () => {
     const dogfood = await sourceFixture();
     const paths = await controlPlanePaths();
     const deployed = await reserved(paths, dogfood.remote, dogfood.firstCommit);
@@ -248,9 +248,9 @@ describe('exact release checkout', () => {
     git(prodRoot, 'clone', '--quiet', '--bare', prodWork, prodRemote);
     const view = { ...deployed, source_remote: prodRemote, release_track: 'prod', deployed_commit: prodCommit };
 
-    await expect(materializeReleaseCheckout(paths, view, {}, 'next')).resolves.toEqual(view);
+    await expect(materializeReleaseCheckout(paths, view)).resolves.toEqual(view);
 
-    const staged = paths.releaseCheckoutRoot(instanceId, 'next');
+    const staged = releaseFolder(paths, view);
     expect(git(staged, 'rev-parse', 'HEAD')).toBe(prodCommit);
     expect(git(staged, 'branch', '--show-current')).toBe('');
     expect(git(staged, 'status', '--porcelain')).toBe('');

@@ -23,14 +23,7 @@ import path from 'node:path';
 
 import { readEnvFile } from '../env.js';
 import { getInstallScopedNames } from '../install-slug.js';
-import {
-  agentImageKey,
-  inspectImage,
-  provideSharedAgentImage,
-  removeImage,
-  taggedImageId,
-  type ImageDocker,
-} from './agent-image.js';
+import { agentImageKey, inspectImage, provideSharedAgentImage, removeImage, type ImageDocker } from './agent-image.js';
 import { prepareReleaseCommandEnvironments } from './checkout.js';
 import type { InstanceLayout } from './release-layout.js';
 import { GwsEaError } from './types.js';
@@ -168,20 +161,15 @@ export async function removeReleaseImage(docker: ImageDocker, base: string, rele
 }
 
 /**
- * Rebuild an agent group's own image, `tag` (`<base>:<agentGroupId>`, which
- * NanoClaw builds `FROM` the release's image), with `rebuild`, and reclaim
- * the image it displaced. The rebuild moves the tag and leaves that image
- * with no tag to remove, so it is deleted by the ID recorded before the
- * rebuild: only when the rebuild produced another image and Docker reports no
- * tag on it. An ID that carries any tag is never deleted, since Docker deletes
- * an image of one repository by ID together with its tags, another
- * assistant's included.
+ * Delete the image a rebuild of an agent group's own image displaced, by the
+ * ID recorded before the rebuild (KTD6): the rebuild moved the group's tag
+ * off it and left it no tag to remove. It is deleted only when it is still
+ * there and Docker reports no tag on it: the rebuild produced the same image,
+ * or another assistant or tag still names it, and Docker deletes an image of
+ * one repository by ID together with its tags, another assistant's included.
  */
-export async function replaceGroupImage(docker: ImageDocker, tag: string, rebuild: () => Promise<void>): Promise<void> {
-  const displaced = await taggedImageId(docker, tag);
-  await rebuild();
-  if (displaced === undefined || displaced === (await taggedImageId(docker, tag))) return;
-  const image = await inspectImage(docker, displaced);
+export async function reclaimImage(docker: ImageDocker, imageId: string): Promise<void> {
+  const image = await inspectImage(docker, imageId);
   if (image === undefined || image.tags.length > 0) return;
-  await removeImage(docker, displaced);
+  await removeImage(docker, imageId);
 }

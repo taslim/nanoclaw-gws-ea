@@ -395,28 +395,6 @@ export function readInstanceHostEnvironment(root: string): Record<string, string
   return readEnvFile([...INSTANCE_HOST_ENV_KEYS], root);
 }
 
-/**
- * Write gws-ea's `.env` keys of the release an update deploys into the `.env`
- * in `root` (KTD6, KTD9). Only create and update render them; here they are
- * the release's own, so every gws-ea key is written, replacing the outgoing
- * release's, while every other writer's key the `.env` holds is kept.
- */
-export function writeReleaseEnvironment(
-  configInput: InstanceRuntimeConfig,
-  root: string,
-  upsertEnvVars: UpsertEnvVars,
-): void {
-  const config = validateRuntimeConfig(configInput);
-  const owned = instanceHostConfiguration(config);
-  upsertEnvVars({ ...owned }, root);
-  activeStep()?.envFile(
-    path.join(root, '.env'),
-    Object.entries(owned)
-      .map(([key, value]) => `${key}=${value}\n`)
-      .join(''),
-  );
-}
-
 /** Load the runtime record at `file`, which must be where the record itself says it lives: its own `state/`. */
 export async function loadInstanceRuntimeConfig(file: string): Promise<InstanceRuntimeConfig> {
   const config = validateRuntimeConfig(await readOwnerOnlyJson(file, 'Runtime config', INVALID_RUNTIME));
@@ -522,30 +500,10 @@ export function renderInstanceServiceDefinition(
 }
 
 /**
- * Write the service definition the release an update deploys renders, while
- * its service is stopped (KTD6): only when it differs from the one installed,
- * and systemd is then told to reload it. launchd reads a definition when the
- * job is bootstrapped, which the next start does. Returns whether it changed.
- */
-export async function writeInstanceServiceDefinition(
-  configInput: InstanceRuntimeConfig,
-  dependencies: InstanceServiceDependencies,
-): Promise<boolean> {
-  const config = validateRuntimeConfig(configInput);
-  const layout = createInstanceServiceLayout(config, dependencies);
-  const rendered = renderInstanceService(config, layout);
-  const installed = await readFile(layout.serviceDefinitionPath, 'utf8').catch((error: unknown) => {
-    if (isErrno(error, 'ENOENT')) return undefined;
-    throw error;
-  });
-  return installServiceDefinition(config, layout, rendered, installed, dependencies);
-}
-
-/**
  * Put back the service definition a kept release ran with, while its service
- * is stopped (KTD6): a rollback restores it rather than rendering one. Only
- * when it differs from the one installed, and systemd is then told to reload
- * it. Returns whether it changed.
+ * is stopped (KTD6): a switch installs the one the release kept rather than
+ * rendering one. Only when it differs from the one installed, and systemd is
+ * then told to reload it. Returns whether it changed.
  */
 export async function restoreInstanceServiceDefinition(
   configInput: InstanceRuntimeConfig,
@@ -571,16 +529,39 @@ async function installServiceDefinition(
   if (installed === definition) return false;
   await mkdir(path.dirname(layout.serviceDefinitionPath), { recursive: true, mode: 0o700 });
   await writePrivateTextFile(layout.serviceDefinitionPath, definition);
-  if (layout.manager !== 'launchd') {
-    await (dependencies.runCommand ?? runSanitizedCommand)({
-      command: 'systemctl',
-      args: [...(layout.manager === 'systemd-user' ? ['--user'] : []), 'daemon-reload'],
-      cwd: config.home_directory,
-      env: serviceManagerEnvironment(config, layout.manager, dependencies),
-      timeoutMs: 30_000,
-    });
-  }
+  await reloadServiceManager(config, layout, dependencies);
   return true;
+}
+
+/** Tell systemd to read the service definitions again; launchd reads one when its job is bootstrapped. */
+async function reloadServiceManager(
+  config: InstanceRuntimeConfig,
+  layout: InstanceServiceLayout,
+  dependencies: InstanceServiceDependencies,
+): Promise<void> {
+  if (layout.manager === 'launchd') return;
+  await (dependencies.runCommand ?? runSanitizedCommand)({
+    command: 'systemctl',
+    args: [...(layout.manager === 'systemd-user' ? ['--user'] : []), 'daemon-reload'],
+    cwd: config.home_directory,
+    env: serviceManagerEnvironment(config, layout.manager, dependencies),
+    timeoutMs: 30_000,
+  });
+}
+
+/**
+ * Have the service manager read the assistant's service definition as it is
+ * now, before a start: systemd is told to reload, so a switch resumed after
+ * the definition was written, which then finds it unchanged, never starts a
+ * unit systemd read before. launchd reads the definition when its job is
+ * bootstrapped, which a start after a stop does.
+ */
+export async function reloadInstanceService(
+  configInput: InstanceRuntimeConfig,
+  dependencies: InstanceServiceDependencies,
+): Promise<void> {
+  const config = validateRuntimeConfig(configInput);
+  await reloadServiceManager(config, createInstanceServiceLayout(config, dependencies), dependencies);
 }
 
 async function assertRegularFile(file: string): Promise<void> {

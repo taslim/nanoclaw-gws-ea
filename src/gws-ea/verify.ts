@@ -5,6 +5,7 @@ import path from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
 
 import { isErrno } from '../community-portal/errors.js';
+import type { ForgottenFingerprint } from '../modules/gws-ea-people/forget-handoff.js';
 import type { SnapshotManifest } from './operation.js';
 import { principalWelcomeEventId, type PrincipalCandidate } from './principal.js';
 import { redact } from './redact.js';
@@ -513,6 +514,43 @@ export function readCentralMigrations(stateRoot: string): string[] {
     return (central.prepare('SELECT name FROM schema_version ORDER BY version').all() as Array<{ name: string }>).map(
       (row) => row.name,
     );
+  } finally {
+    central.close();
+  }
+}
+
+/**
+ * Whether a host left the central database under `stateRoot`'s `data` with
+ * its claim lease still live at `now`: a host stopped gracefully marks its row
+ * stopped, and one that was killed leaves it to expire, which delays the next
+ * host's claims. A release without leases has none. Only read.
+ */
+export function hostLeaseLive(stateRoot: string, now: string): boolean {
+  const central = openReadonly(centralDatabaseFile(stateRoot));
+  try {
+    if (!hasTable(central, 'host_instances')) return false;
+    return (
+      central
+        .prepare('SELECT 1 FROM host_instances WHERE stopped_at IS NULL AND lease_expires_at > ? LIMIT 1')
+        .get(now) !== undefined
+    );
+  } finally {
+    central.close();
+  }
+}
+
+/**
+ * The identities forgotten in the central database under `stateRoot`'s
+ * `data`, as `gws_ea_people_fingerprints` keeps them (KTD8); none when it has
+ * no such table. Only read.
+ */
+export function readForgottenFingerprints(stateRoot: string): ForgottenFingerprint[] {
+  const central = openReadonly(centralDatabaseFile(stateRoot));
+  try {
+    if (!hasTable(central, 'gws_ea_people_fingerprints')) return [];
+    return central
+      .prepare('SELECT fingerprint, forgotten_at FROM gws_ea_people_fingerprints ORDER BY fingerprint')
+      .all() as ForgottenFingerprint[];
   } finally {
     central.close();
   }

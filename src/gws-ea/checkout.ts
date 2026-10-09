@@ -8,7 +8,6 @@ import {
   assertPrivateDirectory,
   preparePrivateDirectory,
   type ControlPlanePaths,
-  type ReleaseSlot,
 } from './paths.js';
 import { assertRegistryMarkerAgreement, assertStateMarker, getInstanceReservation } from './registry.js';
 import { buildToolEnvironment, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
@@ -235,21 +234,6 @@ export async function committedTree(
   });
 }
 
-/**
- * The paths under `directory` where a checkout's working tree differs from
- * its HEAD: tracked changes, and untracked files Git does not ignore.
- */
-export async function workingTreeChanges(
-  root: string,
-  directory: string,
-  runtime: CheckoutRuntime = {},
-): Promise<string[]> {
-  const run = runtime.runCommand ?? runSanitizedCommand;
-  return withScratchEnvironments('gws-ea-tree-', ({ git: environment }) =>
-    statusPaths(root, run, environment, ['--untracked-files=all', '--', directory]),
-  );
-}
-
 /** Where an assistant's deployed commit stands against the tool's own release. */
 export interface ToolReleasePosition {
   /** The tool's own commit: the release an update would deploy. */
@@ -432,27 +416,22 @@ function releaseFolder(paths: ControlPlanePaths, instanceId: string, commit: str
  * folder, `<instance root>/<hex8>`, which is where it runs: its installed
  * tools record their absolute paths, so it is never built elsewhere and
  * moved. Nothing outside the folder is written, the assistant's `state/`
- * included, and publishing a release does not make it live. The swap's
- * update stages in a release `slot` instead, deleted with the swap (U11). A
- * checkout is published only at the view's commit with a clean tree: its
- * folder and its Git HEAD are what identify it.
+ * included, and publishing a release does not make it live. A checkout is
+ * published only at the view's commit with a clean tree: its folder and its
+ * Git HEAD are what identify it.
  */
 export async function materializeReleaseCheckout(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
   runtime: CheckoutRuntime = {},
-  slot?: ReleaseSlot,
 ): Promise<InstanceReservation> {
   const instanceId = reservation.instance_id;
   await getInstanceReservation(paths, instanceId);
-  const destination = slot
-    ? paths.releaseCheckoutRoot(instanceId, slot)
-    : releaseFolder(paths, instanceId, reservation.deployed_commit);
+  const destination = releaseFolder(paths, instanceId, reservation.deployed_commit);
   await assertCheckoutTargetAbsent(destination);
   await assertOwnedDestination(destination);
   await mkdir(paths.instanceRoot(instanceId), { recursive: true, mode: 0o700 });
   await assertPrivateDirectory(paths.instanceRoot(instanceId));
-  if (slot) await preparePrivateDirectory(paths.releaseRoot(instanceId, slot));
   const environments = await prepareReleaseCommandEnvironments(paths.instanceRoot(instanceId));
   const stagingRoot = stagingCheckoutRoot(destination);
   const run = runtime.runCommand ?? runSanitizedCommand;

@@ -9,7 +9,7 @@
  * and provider setup), and a running service. One that cannot move is
  * skipped and reported, with the command that moves it; each other one then
  * takes its turn through `update --id`'s own path, which checks everything
- * again under its lock. A recorded update's follow-ups are finished before
+ * again under its lock. A committed update's follow-ups are finished before
  * anything else, as `update --id` finishes them, even at the tool's release;
  * they run through the assistant's host, so a stopped one is skipped first.
  * The tool's commit is read once, as the run begins, and every check and
@@ -59,7 +59,7 @@ export type PlannedTurn =
       readonly to: ReleaseCoordinates;
       readonly migrations: readonly string[] | undefined;
     }
-  /** It already runs `release`, recorded by an update whose follow-ups are left. */
+  /** It already runs `release`, committed by an update whose follow-ups are left. */
   | { readonly kind: 'follow_ups'; readonly release: ReleaseCoordinates };
 
 /** One registered assistant: it takes `turn`, or it is skipped for `reason`. */
@@ -98,9 +98,10 @@ function releaseName(release: ReleaseCoordinates): string {
 function operationRefusal({ operation }: ListedAssistant): string | undefined {
   switch (operation.state) {
     case 'none':
-    case 'recorded':
+    case 'committed':
       return undefined;
     case 'open':
+    case 'failed':
     case 'unreadable':
       return unfinishedOperation(operation);
   }
@@ -112,8 +113,8 @@ type IntendedTurn =
       readonly kind: 'update';
       readonly from: ReleaseCoordinates;
       readonly to: ReleaseCoordinates;
-      /** Its live checkout, whose central database names the migrations it has applied. */
-      readonly checkout: string;
+      /** Its `state/`, whose central database names the migrations it has applied. */
+      readonly state: string;
     }
   | { readonly kind: 'follow_ups'; readonly release: ReleaseCoordinates }
   | { readonly kind: 'refused'; readonly reason: string };
@@ -134,8 +135,8 @@ async function intendedTurn(
   try {
     await assertInstanceCreated(paths, instanceId);
     const intent = await resolveUpdateIntent(paths, { instanceId, expectedToolCommit: toolCommit }, seams);
-    // `update --id` finishes a recorded operation's follow-ups first, and is done when it recorded this release.
-    if (operation.state === 'recorded' && sameRelease(operation.to, intent.target)) {
+    // `update --id` finishes a committed operation's follow-ups first, and is done when it committed this release.
+    if (operation.state === 'committed' && sameRelease(operation.to, intent.target)) {
       return { kind: 'follow_ups', release: intent.target };
     }
     const reservation = await getInstanceReservation(paths, instanceId);
@@ -157,7 +158,7 @@ async function intendedTurn(
       kind: 'update',
       from: releaseOf(reservation),
       to: intent.target,
-      checkout: paths.checkoutRoot(reservation.instance_id),
+      state: paths.instanceLayout(reservation.instance_id).state,
     };
   } catch (error) {
     if (error instanceof GwsEaError) return { kind: 'refused', reason: safeErrorMessage(error) };
@@ -171,16 +172,16 @@ async function intendedTurn(
 }
 
 /**
- * The release's migrations the central database under `checkout` has not
+ * The release's migrations the central database under `state` has not
  * applied, in the order the release applies them; undefined when that
  * database cannot be read. Only read, never changed: the plan names them,
  * and each turn's dry run on a copy of the database is what its update is
  * held to.
  */
-function unappliedMigrations(checkout: string, release: readonly string[]): readonly string[] | undefined {
+function unappliedMigrations(state: string, release: readonly string[]): readonly string[] | undefined {
   let applied: readonly string[];
   try {
-    applied = readCentralMigrations(checkout);
+    applied = readCentralMigrations(state);
   } catch (error) {
     if (error instanceof GwsEaError || error instanceof Database.SqliteError) return undefined;
     throw error;
@@ -208,8 +209,8 @@ async function classify(
   const { state, reason } = listed.service;
   if (state !== 'running') return skip(serviceRefusal(instanceId, state, reason));
   if (intended.kind === 'follow_ups') return { instanceId, eligible: true, turn: intended };
-  const { from, to, checkout } = intended;
-  const migrations = unappliedMigrations(checkout, await releaseMigrations());
+  const { from, to, state: stateRoot } = intended;
+  const migrations = unappliedMigrations(stateRoot, await releaseMigrations());
   return { instanceId, eligible: true, turn: { kind: 'update', from, to, migrations } };
 }
 

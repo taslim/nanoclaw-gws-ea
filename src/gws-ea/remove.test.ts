@@ -26,13 +26,13 @@ import {
   beginOperation,
   commitOperationRelease,
   OPERATION_PHASES,
-  type MovedImage,
   type OperationFollowUp,
   type OperationPhase,
 } from './operation.js';
-import { RELEASE_SLOTS, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { SanitizedCommand, SanitizedCommandOutcome, SanitizedCommandOutcomeRunner } from './process.js';
 import { readRegistry, swapInstanceRelease, withLockedCloudflareRegistry, writeInstanceMarker } from './registry.js';
+import { linkReleaseState, pointCurrent, releaseName, type InstanceLayout } from './release-layout.js';
 import {
   describeRemoval,
   RemovalPause,
@@ -41,7 +41,7 @@ import {
   type RemovalInteraction,
 } from './remove.js';
 import type { NanoclawServiceHandle, NanoclawServiceHelpers } from './service-control.js';
-import { GwsEaError, type InstanceReservationInput, type ProvisionStepId, type ReleaseCoordinates } from './types.js';
+import { GwsEaError, type InstanceReservationInput, type ProvisionStepId } from './types.js';
 import { keepAccountToken } from './cloudflare-token.js';
 
 // Removal must never reach a real gcloud, Docker, service manager, or Cloudflare from these tests.
@@ -370,22 +370,26 @@ class FakeDocker {
       .sort();
   }
 
-  /** An assistant as create and one update left it: its agent images and containers, and its OneCLI stack. */
+  /**
+   * An assistant as create and one update left it: the agent images of the
+   * release it runs and the one it keeps to roll back to, an agent group's own
+   * image, its containers, and its OneCLI stack.
+   */
   assistant(
     input: InstanceReservationInput,
-    images: { readonly latest: string; readonly previous: string; readonly group: string },
+    images: { readonly live: string; readonly kept: string; readonly group: string },
     onecli: { readonly gateway: string; readonly postgres: string; readonly app: string },
   ): this {
     const install = installOf(input);
     const repository = repositoryOf(input);
     const project = input.exclusive_resource_claims.onecli_project;
-    this.image(images.latest, `${repository}:latest`)
-      .image(images.previous, `${repository}:previous`)
+    this.image(images.live, `${repository}:r-bbbbbbbb`)
+      .image(images.kept, `${repository}:r-aaaaaaaa`)
       .image(images.group, `${repository}:${AGENT_GROUP}`);
     const agent = { 'nanoclaw-install': install };
     this.containers.push(
       { id: `${install}-agent`, image: images.group, labels: agent },
-      { id: `${install}-exited`, image: images.latest, labels: agent },
+      { id: `${install}-exited`, image: images.live, labels: agent },
       ...(['postgres', 'app', 'gateway'] as const).map((service) => ({
         id: `${install}-${service}`,
         image: onecli[service],
@@ -496,11 +500,13 @@ class FakeDocker {
     if (group === 'image' && verb === 'ls' && flagValues(args, '--format')[0] === '{{.Repository}}:{{.Tag}}') {
       return listed(this.tags(args.at(-1) ?? ''));
     }
-    if (group === 'image' && verb === 'inspect' && flagValues(args, '--format')[0] === '{{json .RepoTags}}') {
+    if (group === 'image' && verb === 'inspect') {
       const id = args.at(-1) ?? '';
       const references = this.images.get(id);
       if (!references) return { stdout: '', stderr: `Error response from daemon: No such image: ${id}`, exitCode: 1 };
-      return ok(`${JSON.stringify([...references])}\n`);
+      return ok(
+        `${JSON.stringify([{ Id: id, RepoTags: [...references], Created: '2026-09-01T00:00:00Z', Config: { Labels: null } }])}\n`,
+      );
     }
     if (group === 'tag') {
       const source = verb ?? '';
@@ -1237,23 +1243,13 @@ describe('removal from any partial state', () => {
 describe('removal after an update or rollback', () => {
   const TARGET = 'b'.repeat(40);
   const RECORDED_DOCKER = 'unix:///var/run/recorded-docker.sock';
+  const STOP = { at: '2026-09-28T10:00:00.000Z', graceful: true } as const;
 
   function release(input: InstanceReservationInput, commit: string) {
     return { source_remote: input.source_remote, release_track: input.release_track, deployed_commit: commit };
   }
 
-  async function checkoutAt(root: string, instanceId: string, commit: string, docker?: string): Promise<void> {
-    const state = path.join(root, 'data', 'gws-ea');
-    await mkdir(state, { recursive: true, mode: 0o700 });
-    await writePrivate(path.join(state, 'instance.json'), {
-      schema_version: 1,
-      instance_id: instanceId,
-      deployed_commit: commit,
-    });
-    if (docker) await writePrivate(path.join(state, 'runtime.json'), { docker_endpoint: docker });
-  }
-
-  /** The runtime record of the release in `checkout`: a home of the test's own, and the recorded endpoint. */
+  /** The runtime record in the assistant's state: a home of the test's own, and the recorded endpoint. */
   async function recordRuntime(paths: ControlPlanePaths, input: InstanceReservationInput): Promise<void> {
     await writePrivate(paths.runtimeFile(input.instance_id), {
       home_directory: path.join(paths.stateRoot, 'home'),
@@ -1261,121 +1257,74 @@ describe('removal after an update or rollback', () => {
     });
   }
 
-  /** What an operation records as it runs: the follow-ups it planned, and the images it moved before `started`. */
-  interface Recorded {
-    readonly followUps?: readonly OperationFollowUp[];
-    readonly images?: readonly MovedImage[];
+  /**
+   * Both releases staged beside the assistant's state as an update stages
+   * them, each linked to the state with its receipt kept, and the rollback
+   * material an update and a rollback leave: a snapshot and a quarantine.
+   */
+  async function releasesBeside(paths: ControlPlanePaths, input: InstanceReservationInput): Promise<InstanceLayout> {
+    const layout = paths.instanceLayout(input.instance_id);
+    await recordRuntime(paths, input);
+    for (const commit of [input.deployed_commit, TARGET]) {
+      const name = releaseName(commit);
+      await mkdir(layout.release(name), { recursive: true, mode: 0o700 });
+      await writeFile(path.join(layout.release(name), 'release.txt'), `${name}\n`);
+      await linkReleaseState(layout, name);
+      await writePrivate(layout.receipt(name), { instance_id: input.instance_id, deployed_commit: commit });
+    }
+    for (const kept of [layout.snapshot('20260928T100000000Z'), layout.quarantine('20260929T100000000Z')]) {
+      await mkdir(path.join(kept, 'data'), { recursive: true, mode: 0o700 });
+    }
+    return layout;
   }
 
-  /** Run an update or rollback through its record until `phase`. */
-  async function operateUntil(
+  /**
+   * An update from the reserved commit to `TARGET`, or a rollback back from
+   * it, run through its record until `phase`, with the live link where that
+   * phase leaves it: the release it moves from until the fence, none while
+   * fenced, the one it moves to once switched.
+   */
+  async function operatedUntil(
     paths: ControlPlanePaths,
     input: InstanceReservationInput,
+    kind: 'update' | 'rollback',
     phase: OperationPhase,
-    moving: {
-      readonly kind: 'update' | 'rollback';
-      readonly from: ReleaseCoordinates;
-      readonly to: ReleaseCoordinates;
-    },
-    recorded: Recorded,
+    followUps: readonly OperationFollowUp[] = [],
   ): Promise<void> {
+    const layout = await releasesBeside(paths, input);
+    const original = release(input, input.deployed_commit);
+    const updated = release(input, TARGET);
+    if (kind === 'rollback') await swapInstanceRelease(paths, input.instance_id, original, updated);
+    const [from, to] = kind === 'update' ? [original, updated] : [updated, original];
+    const reached = OPERATION_PHASES.indexOf(phase);
+    const fenced = reached >= OPERATION_PHASES.indexOf('fenced') && reached < OPERATION_PHASES.indexOf('switched');
+    if (!fenced) {
+      const live = reached < OPERATION_PHASES.indexOf('fenced') ? from : to;
+      await pointCurrent(layout, releaseName(live.deployed_commit));
+    }
     const operation = await acquireInstanceOperation(
       paths,
       input.instance_id,
-      moving.kind === 'update' ? { command: 'update', target: moving.to } : { command: 'rollback' },
+      kind === 'update' ? { command: 'update', target: to } : { command: 'rollback' },
     );
     if (!operation) throw new Error('The test instance operation was busy');
     try {
-      await beginOperation(operation, {
-        ...moving,
-        follow_ups: recorded.followUps ?? [{ kind: 'rebuild_group_image', agent_group_id: 'ag-research' }],
-      });
-      for (const step of OPERATION_PHASES.slice(1, OPERATION_PHASES.indexOf(phase) + 1)) {
-        if (step === 'recorded') await commitOperationRelease(operation);
-        else if (step === 'stopped') {
-          await advanceOperation(operation, step, { stop: { at: '2026-09-28T10:00:00.000Z', graceful: true } });
-        } else await advanceOperation(operation, step, step === 'started' ? { images: recorded.images ?? [] } : {});
+      await beginOperation(operation, { kind, from, to });
+      for (const step of OPERATION_PHASES.slice(1, reached + 1)) {
+        if (step === 'committed') await commitOperationRelease(operation);
+        else if (step === 'fenced') {
+          await advanceOperation(operation, step, {
+            stop: STOP,
+            manifest: { central_migrations: [], session_tables: {} },
+          });
+        } else if (step === 'snapshotted' && kind === 'rollback')
+          await advanceOperation(operation, step, { mode: 'snapshot' });
+        else if (step === 'verified') await advanceOperation(operation, step, { follow_ups: followUps });
+        else await advanceOperation(operation, step);
       }
     } finally {
       operation.release();
     }
-  }
-
-  /**
-   * An update from the reserved commit to `TARGET`, interrupted at `phase`,
-   * with the directories each phase leaves: the staged release beside the live
-   * one until the renames, then the live one at the target and the old one kept;
-   * the files kept with the outgoing release, the carry's build area, and the
-   * previous release an earlier update kept, set aside at the swap.
-   */
-  async function interruptedAt(
-    paths: ControlPlanePaths,
-    input: InstanceReservationInput,
-    phase: OperationPhase,
-    recorded: Recorded = {},
-  ): Promise<void> {
-    const id = input.instance_id;
-    // The runtime record is the assistant's, in its own state, whatever the operation moved.
-    await recordRuntime(paths, input);
-    const renamed = OPERATION_PHASES.indexOf(phase) >= OPERATION_PHASES.indexOf('swapped');
-    const live = paths.checkoutRoot(id);
-    const previous = paths.releaseCheckoutRoot(id, 'previous');
-    const next = paths.releaseCheckoutRoot(id, 'next');
-    await rm(live, { recursive: true, force: true });
-    const kept = async (root: string): Promise<void> => {
-      await writePrivate(path.join(root, 'release-preflight.json'), { instance_id: id });
-      await writePrivate(path.join(root, 'host-environment.json'), { WEBHOOK_PORT: '1' });
-    };
-    const older = paths.releaseCheckoutRoot(id, 'superseded');
-    if (phase === 'swapping') {
-      // Killed between the two renames: the old release is kept, the staged one not yet in place.
-      await checkoutAt(previous, id, input.deployed_commit, RECORDED_DOCKER);
-      await kept(paths.releaseRoot(id, 'previous'));
-      await checkoutAt(older, id, 'c'.repeat(40));
-      await checkoutAt(next, id, TARGET);
-    } else if (renamed) {
-      await checkoutAt(live, id, TARGET, RECORDED_DOCKER);
-      await checkoutAt(previous, id, input.deployed_commit, RECORDED_DOCKER);
-      await kept(paths.releaseRoot(id, 'previous'));
-      await checkoutAt(older, id, 'c'.repeat(40));
-    } else {
-      await checkoutAt(live, id, input.deployed_commit, RECORDED_DOCKER);
-      await checkoutAt(next, id, TARGET);
-      await kept(path.join(paths.releaseRoot(id, 'next'), 'previous'));
-      await mkdir(path.join(paths.releaseRoot(id, 'next'), 'carrying', 'data'), { recursive: true, mode: 0o700 });
-    }
-    const moving = { kind: 'update', from: release(input, input.deployed_commit), to: release(input, TARGET) } as const;
-    await operateUntil(paths, input, phase, moving, recorded);
-    await mkdir(paths.releaseCheckoutRoot(id, 'outgoing'), { recursive: true, mode: 0o700 });
-  }
-
-  /**
-   * A rollback of an update to `TARGET`, back to the reserved commit,
-   * interrupted at `phase`. Before the renames the updated release is live and
-   * the one it replaced is kept in `previous/`; between them the updated
-   * release has moved to `outgoing/` and nothing is live; after them the
-   * restored release is live and the updated one kept in `outgoing/`. Only the
-   * updated release, the one that was running, holds a runtime record.
-   */
-  async function rolledBackAt(
-    paths: ControlPlanePaths,
-    input: InstanceReservationInput,
-    phase: OperationPhase,
-    recorded: Recorded,
-  ): Promise<void> {
-    const id = input.instance_id;
-    const original = release(input, input.deployed_commit);
-    const updated = release(input, TARGET);
-    await swapInstanceRelease(paths, id, original, updated);
-    const live = paths.checkoutRoot(id);
-    await rm(live, { recursive: true, force: true });
-    const reached = OPERATION_PHASES.indexOf(phase);
-    const running = reached < OPERATION_PHASES.indexOf('swapping') ? live : paths.releaseCheckoutRoot(id, 'outgoing');
-    await checkoutAt(running, id, TARGET);
-    await recordRuntime(paths, input);
-    const restored = reached > OPERATION_PHASES.indexOf('swapping') ? live : paths.releaseCheckoutRoot(id, 'previous');
-    await checkoutAt(restored, id, input.deployed_commit);
-    await operateUntil(paths, input, phase, { kind: 'rollback', from: updated, to: original }, recorded);
   }
 
   it.each(OPERATION_PHASES)('completes with an update interrupted at %s', async (phase) => {
@@ -1383,85 +1332,29 @@ describe('removal after an update or rollback', () => {
     const input = await reserve(paths, reservationInput(), {
       started: ['materialize_checkout', 'start_onecli', 'start_nanoclaw'],
     });
-    await interruptedAt(paths, input, phase);
+    await operatedUntil(paths, input, 'update', phase, [{ kind: 'prune' }]);
     const reservation = (await readRegistry(paths)).instances[input.instance_id]!;
     const { dependencies } = world(reservation);
-    // What the update left: its record and its releases, all under the instance root.
-    const lifecycle = [
-      paths.operationFile(input.instance_id),
-      ...RELEASE_SLOTS.map((slot) => paths.releaseRoot(input.instance_id, slot)),
-    ];
-    const left: string[] = [];
-    for (const artifact of lifecycle) if (await exists(artifact)) left.push(artifact);
-    expect(left).toEqual(
-      expect.arrayContaining([
-        paths.operationFile(input.instance_id),
-        paths.releaseRoot(input.instance_id, 'outgoing'),
-      ]),
-    );
 
     const outcome = await removeAssistant(paths, input.instance_id, dependencies);
 
     expect(outcome.removed).toEqual(['nanoclaw', 'onecli', 'instance-files']);
-    // The recorded Docker endpoint is found in the assistant's state, even with no live checkout.
+    // The recorded Docker endpoint is found in the assistant's state, live link or none.
     expect(dependencies.resolveDocker).toHaveBeenCalledWith(RECORDED_DOCKER);
     expect(dependencies.uninstallNanoclaw).toHaveBeenCalledWith(reservation, expect.anything());
-    for (const artifact of left) expect(await exists(artifact), artifact).toBe(false);
     await expectGone(paths, reservation);
   });
 
-  it.each(OPERATION_PHASES)(
-    'completes with a rollback interrupted at %s, deleting the images its record names',
-    async (phase) => {
-      const paths = await testPaths();
-      const input = await reserve(paths, reservationInput(), {
-        started: ['materialize_checkout', 'start_nanoclaw'],
-      });
-      const repository = repositoryOf(input);
-      const updatedImage = imageId('1');
-      const originalImage = imageId('2');
-      const displacedGroupImage = imageId('9');
-      await rolledBackAt(paths, input, phase, {
-        followUps: [{ kind: 'delete_image', image_id: displacedGroupImage }],
-        images: [{ tag: `${repository}:latest`, image_id: originalImage, displaced_image_id: updatedImage }],
-      });
-      // Until the retag, `:latest` is the updated release's image and `:previous` the one it replaced; after it,
-      // the restored image is `:latest` and the updated one keeps no tag. Nor does a group image a rebuild displaced.
-      const docker = new FakeDocker().image(imageId('3'), `${repository}:${AGENT_GROUP}`).image(displacedGroupImage);
-      if (OPERATION_PHASES.indexOf(phase) >= OPERATION_PHASES.indexOf('started')) {
-        docker.image(originalImage, `${repository}:latest`).image(updatedImage);
-      } else {
-        docker.image(updatedImage, `${repository}:latest`).image(originalImage, `${repository}:previous`);
-      }
-      const reservation = (await readRegistry(paths)).instances[input.instance_id]!;
-      const { uninstallNanoclaw: _fake, ...dependencies } = world(reservation).dependencies;
-
-      const outcome = await removeAssistant(paths, input.instance_id, {
-        ...dependencies,
-        runCommand: teardownCommands(docker),
-        serviceHelpers: nanoclawService([], { mode: 'none', active: false }),
-      });
-
-      expect(outcome.removed).toEqual(['nanoclaw', 'instance-files']);
-      // The recorded endpoint is found in the release that was running, wherever the rollback left it.
-      expect(dependencies.resolveDocker).toHaveBeenCalledWith(RECORDED_DOCKER);
-      expect([...docker.images.keys()]).toEqual([]);
-      await expectGone(paths, reservation);
-    },
-  );
-
-  it('removes what a finished rollback leaves: the release it left, and a repository with no :previous tag', async () => {
+  it.each(OPERATION_PHASES)('completes with a rollback interrupted at %s', async (phase) => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput(), {
       started: ['materialize_checkout', 'start_nanoclaw'],
     });
+    await operatedUntil(paths, input, 'rollback', phase, [{ kind: 'prune' }]);
     const repository = repositoryOf(input);
-    // Recorded with nothing left to follow up, and its cleanup dropped `:previous`: only `:latest` names the image.
-    await rolledBackAt(paths, input, 'recorded', { followUps: [] });
-    expect(await exists(paths.operationFile(input.instance_id))).toBe(false);
-    expect(await exists(paths.releaseRoot(input.instance_id, 'previous'))).toBe(false);
     const docker = new FakeDocker()
-      .image(imageId('2'), `${repository}:latest`)
+      .image(imageId('1'), `${repository}:r-bbbbbbbb`)
+      .image(imageId('2'), `${repository}:r-aaaaaaaa`)
       .image(imageId('3'), `${repository}:${AGENT_GROUP}`);
     const reservation = (await readRegistry(paths)).instances[input.instance_id]!;
     const { uninstallNanoclaw: _fake, ...dependencies } = world(reservation).dependencies;
@@ -1473,31 +1366,15 @@ describe('removal after an update or rollback', () => {
     });
 
     expect(outcome.removed).toEqual(['nanoclaw', 'instance-files']);
+    expect(dependencies.resolveDocker).toHaveBeenCalledWith(RECORDED_DOCKER);
     expect([...docker.images.keys()]).toEqual([]);
     await expectGone(paths, reservation);
-  });
-
-  it.each(RELEASE_SLOTS)('refuses before any effect when its %s release carries another assistant', async (slot) => {
-    const paths = await testPaths();
-    const input = await reserve(paths, reservationInput(), {
-      started: ['materialize_checkout', 'start_nanoclaw'],
-    });
-    await interruptedAt(paths, input, 'swapped');
-    await checkoutAt(paths.releaseCheckoutRoot(input.instance_id, slot), randomUUID(), 'c'.repeat(40));
-    const { dependencies } = world(input);
-
-    await expect(removeAssistant(paths, input.instance_id, dependencies)).rejects.toMatchObject({
-      code: 'marker_mismatch',
-    });
-    expect(dependencies.uninstallNanoclaw).not.toHaveBeenCalled();
-    expect(await exists(paths.removalFile(input.instance_id))).toBe(false);
-    expect(await exists(paths.instanceRoot(input.instance_id))).toBe(true);
   });
 
   it('removes by instance identity alone when the operation record cannot be read', async () => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput(), { started: ['materialize_checkout'] });
-    await interruptedAt(paths, input, 'started');
+    await operatedUntil(paths, input, 'update', 'started');
     await writeFile(paths.operationFile(input.instance_id), '{torn', { mode: 0o600 });
 
     await removeAssistant(paths, input.instance_id, world(input).dependencies);
@@ -1523,23 +1400,19 @@ describe('removal after an update or rollback', () => {
     const started = ['materialize_checkout', 'start_onecli', 'start_nanoclaw'] as const;
     const a = await reserve(paths, reservationInput(), { started });
     const b = await reserve(paths, reservationInput({ label: 'peer', port: 34_001 }), { started });
-    await interruptedAt(paths, a, 'recorded', { followUps: [] });
-    // Its finished follow-ups deleted what the swap set aside.
-    await rm(paths.releaseRoot(a.instance_id, 'superseded'), { recursive: true, force: true });
-    await rm(paths.releaseRoot(a.instance_id, 'outgoing'), { recursive: true, force: true });
-    await recordRuntime(paths, a);
+    await operatedUntil(paths, a, 'update', 'committed');
     const docker = new FakeDocker();
     for (const [reference, id] of Object.entries(SHARED_IMAGES)) docker.image(id, reference);
     const onecli = { postgres: imageId('c'), app: imageId('d') };
     docker
       .assistant(
         a,
-        { latest: imageId('1'), previous: imageId('2'), group: imageId('3') },
+        { live: imageId('1'), kept: imageId('2'), group: imageId('3') },
         { ...onecli, gateway: imageId('a') },
       )
       .assistant(
         b,
-        { latest: imageId('5'), previous: imageId('6'), group: imageId('7') },
+        { live: imageId('5'), kept: imageId('6'), group: imageId('7') },
         { ...onecli, gateway: imageId('b') },
       );
     docker.containers.push({ id: 'cloudflared', image: imageId('e'), labels: {} });
@@ -1558,15 +1431,15 @@ describe('removal after an update or rollback', () => {
     };
   }
 
-  it("deletes previous/, :previous, and every group's image after an update, and nothing of another assistant's", async () => {
+  it("deletes every release, its image tags, and every group's image after an update, and nothing of another assistant's", async () => {
     const paths = await testPaths();
     const { a, b, docker, calls, dependencies } = await besidePeer(paths);
     const repository = repositoryOf(a);
-    expect(await exists(paths.releaseCheckoutRoot(a.instance_id, 'previous'))).toBe(true);
+    expect(await exists(paths.instanceLayout(a.instance_id).release(releaseName(a.deployed_commit)))).toBe(true);
     expect(docker.of(a).tags).toEqual([
       `${repository}:${AGENT_GROUP}`,
-      `${repository}:latest`,
-      `${repository}:previous`,
+      `${repository}:r-aaaaaaaa`,
+      `${repository}:r-bbbbbbbb`,
     ]);
     const peer = docker.of(b);
 
@@ -1607,7 +1480,7 @@ describe('removal after an update or rollback', () => {
     // Both updated to one release, so both run the one image A's update built and labeled, each under its own tag.
     const shared = imageId('4');
     for (const ran of [imageId('1'), imageId('5')]) docker.images.delete(ran);
-    docker.image(shared, `${repositoryOf(a)}:latest`, `${repositoryOf(b)}:latest`);
+    docker.image(shared, `${repositoryOf(a)}:r-bbbbbbbb`, `${repositoryOf(b)}:r-bbbbbbbb`);
     docker.containers = docker.containers.map((container) =>
       [imageId('1'), imageId('5')].includes(container.image) ? { ...container, image: shared } : container,
     );
@@ -1615,8 +1488,8 @@ describe('removal after an update or rollback', () => {
     await removeAssistant(paths, a.instance_id, dependencies);
 
     expect(docker.of(a).tags).toEqual([]);
-    expect([...(docker.images.get(shared) ?? [])]).toEqual([`${repositoryOf(b)}:latest`]);
-    expect(docker.of(b).tags).toContain(`${repositoryOf(b)}:latest`);
+    expect([...(docker.images.get(shared) ?? [])]).toEqual([`${repositoryOf(b)}:r-bbbbbbbb`]);
+    expect(docker.of(b).tags).toContain(`${repositoryOf(b)}:r-bbbbbbbb`);
 
     await recordRuntime(paths, b);
     const { uninstallNanoclaw: _uninstall, removeOnecli: _removeOnecli, ...peer } = world(b).dependencies;
@@ -1640,32 +1513,20 @@ describe('removal after an update or rollback', () => {
     });
     const repository = repositoryOf(input);
     const peerRepository = getInstallScopedNames(randomUUID().replaceAll('-', '')).containerImageBase;
-    const built = imageId('1');
-    const ran = imageId('2');
-    const olderPrevious = imageId('8');
     const olderGroup = imageId('9');
     const identical = imageId('f');
-    // Recorded, with its cleanup still to run: the retag displaced the previous `:previous`, the group rebuild
-    // displaced the group's old image, and an earlier displaced image is an identical build another assistant tags.
-    await interruptedAt(paths, input, 'recorded', {
-      followUps: [
-        { kind: 'delete_image', image_id: olderPrevious },
-        { kind: 'delete_image', image_id: olderGroup },
-        { kind: 'delete_image', image_id: identical },
-      ],
-      images: [
-        { tag: `${repository}:latest`, image_id: built, displaced_image_id: ran },
-        { tag: `${repository}:previous`, image_id: ran, displaced_image_id: olderPrevious },
-      ],
-    });
-    await recordRuntime(paths, input);
+    // Committed, its cleanup still to run: the group's rebuild displaced the group's old image, and an earlier
+    // rebuild displaced an identical build another assistant tags.
+    await operatedUntil(paths, input, 'update', 'committed', [
+      { kind: 'reclaim_image', image_id: olderGroup },
+      { kind: 'reclaim_image', image_id: identical },
+    ]);
     const docker = new FakeDocker()
-      .image(built, `${repository}:latest`)
-      .image(ran, `${repository}:previous`)
+      .image(imageId('1'), `${repository}:r-bbbbbbbb`)
+      .image(imageId('2'), `${repository}:r-aaaaaaaa`)
       .image(imageId('3'), `${repository}:${AGENT_GROUP}`)
-      .image(olderPrevious)
       .image(olderGroup)
-      .image(identical, `${peerRepository}:latest`);
+      .image(identical, `${peerRepository}:r-bbbbbbbb`);
     const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
 
     await removeAssistant(paths, input.instance_id, {
@@ -1674,7 +1535,7 @@ describe('removal after an update or rollback', () => {
       serviceHelpers: nanoclawService([], { mode: 'none', active: false }),
     });
 
-    expect([...docker.images]).toEqual([[identical, new Set([`${peerRepository}:latest`])]]);
+    expect([...docker.images]).toEqual([[identical, new Set([`${peerRepository}:r-bbbbbbbb`])]]);
     await expectGone(paths, input);
   });
 });

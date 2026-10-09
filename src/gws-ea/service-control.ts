@@ -10,7 +10,7 @@
  *
  * Stop follows NanoClaw: agent containers are left for the next start to
  * adopt, and the stop lasts until the next start, login, or reboot. Only
- * cutover and removal drain containers.
+ * an update's or rollback's fence and removal drain containers.
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -138,7 +138,7 @@ export interface InstanceServiceControl {
    */
   stopByLabel(label: string, definition: string): Promise<void>;
   restart(): Promise<RestartOutcome>;
-  /** Stops this assistant's agent containers and waits until none runs; for cutover and removal only. */
+  /** Stops this assistant's agent containers and waits until none runs; for a fence and removal only. */
   drain(timeoutMs?: number): Promise<void>;
   /** Whether the host serves: its service active, its CLI socket up, and `ncl` answering. */
   verifyHealth(timeoutMs?: number): Promise<boolean>;

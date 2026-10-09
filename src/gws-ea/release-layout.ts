@@ -391,6 +391,21 @@ export async function takeSnapshot(layout: InstanceLayout, op: string, release: 
   return snapshot;
 }
 
+/** When snapshot `op` was taken, as the record kept with it says. */
+export async function snapshotTakenAt(layout: InstanceLayout, op: string): Promise<string> {
+  const file = path.join(layout.snapshot(op), SNAPSHOT_RECORD);
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(file, 'utf8'));
+  } catch (error) {
+    if (isErrno(error, 'ENOENT') || error instanceof SyntaxError) throw unsafe(`Snapshot ${op} is not kept whole.`);
+    throw error;
+  }
+  const takenAt = isRecord(value) ? canonicalTimestamp(value.taken_at) : undefined;
+  if (takenAt === undefined) throw unsafe(`Snapshot ${op} records no time it was taken.`);
+  return takenAt;
+}
+
 /**
  * While fenced, put snapshot `snapshot` back as the assistant's state for
  * operation `op`: rename the state aside whole into `quarantine/<op>/`, then
@@ -418,12 +433,14 @@ export async function restoreSnapshot(layout: InstanceLayout, snapshot: string, 
  * failed (KTD5): rename the state the rollback's target produced aside into
  * `quarantine/<op>-returned/`, then rename `quarantine/<op>/` back to
  * `state/`, so the assistant has exactly the state it had before. A return
- * cut short at either step is finished by running it again.
+ * cut short at either step is finished by running it again. A rollback whose
+ * restore never began quarantined nothing, and its state stays as it is.
  */
 export async function returnQuarantinedState(layout: InstanceLayout, op: string): Promise<void> {
   await assertFenced(layout, 'its state is not returned');
   const quarantined = layout.quarantine(op);
   const returned = `${quarantined}${RETURNED}`;
+  if (!(await lstatIfPresent(quarantined)) && !(await lstatIfPresent(returned))) return;
   if (!(await lstatIfPresent(returned)) && (await lstatIfPresent(layout.state))) {
     await rename(layout.state, returned);
     await syncDirectory(quarantineRoot(layout.root));

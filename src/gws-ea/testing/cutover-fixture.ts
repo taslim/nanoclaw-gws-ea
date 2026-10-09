@@ -1,40 +1,47 @@
 /**
  * The world update and rollback tests share: a machine with a release
- * repository, assistants built as create leaves them (a registry reservation
- * and completed journal, a Git checkout detached at its release with its
- * marker, runtime, and `.env`, the release receipt, the OneCLI Compose file,
- * main stamped from the release's template, and a central database the host
- * left closed), and every boundary a cutover crosses faked: the service
- * manager, Docker, `ps`, `lsof`, the release's install, build, migration, and
- * tripwire scripts, the host's status and listener, OneCLI, and `ncl`. Git,
- * SQLite, and the files are real. Each test file removes the machines it made
- * with `removeTemporaryRoots`.
+ * repository, and assistants built as create leaves them on the release
+ * layout (a registry reservation and completed journal; `state/` with its
+ * marker, runtime record, `.env`, and a central database the host left
+ * closed; the release staged as every release is, its OneCLI Compose file and
+ * service definition installed from what was kept with it, and the live link
+ * pointed at it). Every boundary a switch crosses is faked: the service
+ * manager (launchd: a job loaded or not, its host running only while the
+ * program its definition names exists), Docker and the OneCLI project, `ps`,
+ * `lsof`, the release's install, build, migration, and tripwire scripts, the
+ * host's status and listener, and `ncl`. Git, tar, SQLite, and the files are
+ * real. Each test file removes the machines it made with
+ * `removeTemporaryRoots`.
  */
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
 import { cp, lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, writeFile } from 'node:fs/promises';
-import { writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 import Database from 'better-sqlite3';
 import { expect } from 'vitest';
 
-import { AGENT_IMAGE_KEY_LABEL, agentImageKey } from '../agent-image.js';
-import { materializeReleaseCheckout } from '../checkout.js';
+import { AGENT_IMAGE_KEY_LABEL } from '../agent-image.js';
+import { releaseImageKey, releaseImageTag } from '../agent-image-release.js';
 import { runCli, type CliRuntime } from '../cli.js';
 import { acquireInstanceOperation, recordStepCompleted, reserveInstance } from '../journal.js';
-import { createOnecliRuntimeLayout, renderOnecliCompose } from '../onecli-compose.js';
+import { readKeptRelease } from '../kept-release.js';
+import { createOnecliRuntimeLayout, renderOnecliCompose, type OnecliRuntimeLayout } from '../onecli-compose.js';
 import { resolveWrapperGatewayImage, wrapperImageTag } from '../onecli-gateway-image.js';
-import { CONTROL_PLANE_ROOT, instanceRuntimeFile, resolveControlPlanePaths, type ControlPlanePaths } from '../paths.js';
+import { CONTROL_PLANE_ROOT, resolveControlPlanePaths, type ControlPlanePaths } from '../paths.js';
 import type { Observation } from '../phases.js';
 import { LAUNCHER_PINS, ONECLI_SDK_VERSION } from '../pins.js';
 import { runSanitizedCommand, type SanitizedCommand, type SanitizedCommandRunner } from '../process.js';
-import { getInstanceReservation } from '../registry.js';
-import type { ReleasePreflightInput } from '../release-preflight.js';
+import { getInstanceReservation, writeInstanceMarker } from '../registry.js';
+import { createState, pointCurrent, releaseName } from '../release-layout.js';
+import type { SetupCommand } from '../release-preflight.js';
+import { applyReleaseEnvironment, stageRelease } from '../release-stage.js';
 import type { ToolProviderSetup } from '../release-target.js';
 import {
   createInstanceRuntimeConfig,
+  instanceServiceDefinitionFile,
   persistInstanceRuntime,
   type HostStatusHelpers,
   type InstanceRuntimeConfig,
@@ -80,10 +87,13 @@ export const CREDENTIAL = {
   hostPattern: 'api.anthropic.com',
   headerName: 'x-api-key',
 };
-export const COHORT = { gateway: LAUNCHER_PINS.onecliGateway, sdk: ONECLI_SDK_VERSION };
-/** The gateway the assistant's Compose file names: one an earlier release built. */
+const PINS = { gateway: LAUNCHER_PINS.onecliGateway };
+/** A release whose agent image differs from the first one's: its build context changed. */
+export const NEW_IMAGE = { 'container/Dockerfile': 'FROM scratch\nRUN true\n' } as const;
+/** A gateway an earlier release built, which an assistant may still run. */
 export const DEPLOYED_GATEWAY = wrapperImageTag('0'.repeat(16));
-export const RELEASE_GATEWAY = (await resolveWrapperGatewayImage(COHORT)).image;
+/** The gateway every release this machine stages names. */
+export const RELEASE_GATEWAY = (await resolveWrapperGatewayImage(PINS)).image;
 export const LIVE_MIGRATIONS = ['initial-v2-schema', 'host-coordination'] as const;
 export const ADDED_MIGRATION = 'module:gws-ea-profile:add-notes';
 export const FAILING_MIGRATION = 'module:gws-ea-profile:add-reminders';
@@ -94,30 +104,51 @@ export const SESSION_SCHEMA_SOURCES = [
   'src/mailbox/sqlite/session-db.ts',
   'container/agent-runner/src/mailbox/sqlite/connection.ts',
 ] as const;
+/** The file a release ships main's shared skill list in, as the fake `ncl` reads it from the live release. */
+export const MAIN_SKILLS = 'main-skills.json';
 export const PROVIDER_SETUP: ToolProviderSetup = {
   credentialMetadata: (provider) => (provider === 'claude' ? CREDENTIAL : undefined),
 };
 export const SESSION = path.join('data', 'v2-sessions', 'ag-main', 'session-1');
-/** The 16 bytes every SQLite database begins with, which a file an agent writes can begin with too. */
-export const SQLITE_HEADER = 'SQLite format 3\0';
 export const MEMORY = path.join('groups', 'main', 'CLAUDE.local.md');
-/** Main's template in a release, main's folder, and the plugin stamped into it. */
+/** Main's template in a release, and main's folder. */
 const MAIN_TEMPLATE_DIR = path.join('templates', 'gws-ea', 'main');
 export const MAIN_FOLDER = path.join('groups', 'main');
-const MAIN_BASELINE = path.join(MAIN_FOLDER, 'plugins', 'gws-ea-main');
-const MAIN_CONTEXT = path.join(MAIN_TEMPLATE_DIR, 'ai.nanoco.nanoclaw', 'context');
 
-/** Main's template as a release ships it at `version`: its manifest, persona, and operating procedure. */
+/** Main's template as a release ships it at `version`. */
 export function mainTemplate(version: string): Record<string, string> {
   return {
-    [path.join(MAIN_TEMPLATE_DIR, 'plugin.json')]: `${JSON.stringify({
-      $schema: 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json',
-      name: 'gws-ea-main',
-      version: '1.0.0',
+    [path.join(MAIN_TEMPLATE_DIR, 'plugin.json')]: `${JSON.stringify({ name: 'gws-ea-main', version: '1.0.0' })}\n`,
+    [path.join(MAIN_TEMPLATE_DIR, 'instructions.md')]: `# Main executive assistant\n\nInstructions ${version}.\n`,
+  };
+}
+
+/**
+ * What a release needs for staging to find it whole: its package manifest
+ * and gws-ea's pins (the receipt's cohort), the `ncl` launcher, the agent
+ * image's build context and the script it sources, the session-schema
+ * sources and agent-runner lockfile an update compares, main's template and
+ * shared skill list, and an ignore file that leaves its build output and its
+ * links to the assistant's state untracked, as NanoClaw's own does.
+ */
+function releaseFiles(): Readonly<Record<string, string>> {
+  return {
+    '.gitignore': 'node_modules\ndist\n.env\ndata\ngroups\nstore\nlogs\n',
+    'package.json': `${JSON.stringify({
+      name: 'nanoclaw',
+      version: '2.3.0',
+      packageManager: 'pnpm@10.0.0',
+      dependencies: { '@onecli-sh/sdk': ONECLI_SDK_VERSION },
     })}\n`,
-    // Trailing blank lines: NanoClaw stamps the persona trimmed.
-    [path.join(MAIN_CONTEXT, 'instructions.md')]: `# Main executive assistant\n\nInstructions ${version}.\n\n`,
-    [path.join(MAIN_CONTEXT, 'additional_context', 'operating-procedure.md')]: `Operating procedure ${version}.\n`,
+    'src/gws-ea/versions.json': readFileSync(path.join(CONTROL_PLANE_ROOT, 'src', 'gws-ea', 'versions.json'), 'utf8'),
+    'container/Dockerfile': 'FROM scratch\n',
+    // Never run: the tests' runner stands in for NanoClaw's image build.
+    'container/build.sh': '#!/bin/bash\nexit 99\n',
+    [LOCKFILE]: 'lock 1\n',
+    'setup/lib/install-slug.sh': '# names the image repository\n',
+    [MAIN_SKILLS]: `${JSON.stringify(['agent-browser'])}\n`,
+    ...Object.fromEntries(SESSION_SCHEMA_SOURCES.map((source) => [source, `// ${source} 1\n`])),
+    ...mainTemplate('1'),
   };
 }
 
@@ -167,19 +198,17 @@ export async function machine(): Promise<Machine> {
   const work = path.join(root, 'work');
   await mkdir(work);
   git(work, 'init', '--quiet', '-b', TRACK_BRANCH);
-  await write(work, '.gitignore', 'data/\nlogs/\ngroups/\nstore/\n.env\n');
-  await write(work, 'package.json', '{"version":"2.0.0"}\n');
+  for (const [file, contents] of Object.entries(releaseFiles())) await write(work, file, contents);
   await write(work, 'release.txt', 'first\n');
-  await write(work, LOCKFILE, 'lock 1\n');
-  for (const source of SESSION_SCHEMA_SOURCES) await write(work, source, `// ${source} 1\n`);
-  for (const [file, contents] of Object.entries(mainTemplate('1'))) await write(work, file, contents);
-  // Never run: the tests' runner stands in for the release's own image build.
-  await write(work, 'container/build.sh', '#!/bin/bash\nexit 99\n');
+  execFileSync('chmod', ['0755', path.join(work, 'container', 'build.sh')]);
+  await write(work, 'bin/ncl', '#!/bin/sh\n');
+  execFileSync('chmod', ['0755', path.join(work, 'bin', 'ncl')]);
   const first = commitAll(work, 'first release');
   const remote = path.join(root, 'remote.git');
   git(root, 'clone', '--quiet', '--bare', work, remote);
   git(remote, 'config', 'uploadpack.allowFilter', 'true');
   git(work, 'remote', 'add', 'origin', remote);
+  git(work, 'push', '--quiet', 'origin', `HEAD:refs/heads/${TRACK_BRANCH}`);
   return { root, paths, remote, work, first };
 }
 
@@ -191,25 +220,15 @@ export interface Release {
 
 let releases = 0;
 
-/** Where a release is pushed: a repository, and the branch there that carries it. */
-export interface ReleaseDestination {
-  readonly remote: string;
-  readonly branch: string;
-}
-
-/** Push the next release, changing `files`, to the track's branch of the release repository or to `to`. */
-export async function nextRelease(
-  host: Machine,
-  files: Readonly<Record<string, string>> = {},
-  to: ReleaseDestination = { remote: host.remote, branch: TRACK_BRANCH },
-): Promise<Release> {
+/** Push the next release, changing `files`, to the track's branch of the release repository. */
+export async function nextRelease(host: Machine, files: Readonly<Record<string, string>> = {}): Promise<Release> {
   releases += 1;
   await write(host.work, 'release.txt', `release ${releases}\n`);
   for (const [file, contents] of Object.entries(files)) await write(host.work, file, contents);
   const commit = commitAll(host.work, `release ${releases}`);
-  git(host.work, 'push', '--quiet', to.remote, `HEAD:refs/heads/${to.branch}`);
+  git(host.work, 'push', '--quiet', host.remote, `HEAD:refs/heads/${TRACK_BRANCH}`);
   const tool = path.join(host.root, `tool-${commit.slice(0, 8)}`);
-  git(host.root, 'clone', '--quiet', to.remote, tool);
+  git(host.root, 'clone', '--quiet', host.remote, tool);
   git(tool, 'checkout', '--quiet', '--detach', commit);
   return { commit, tool };
 }
@@ -218,23 +237,32 @@ export function imageBase(runtime: Pick<InstanceRuntimeConfig, 'install_id'>): s
   return getInstallScopedNames(runtime.install_id).containerImageBase;
 }
 
-/** The content key of `release`'s agent image, built with the fixture's `.env` flags unless told otherwise. */
+/** The tag of `commit`'s release in the assistant's repository. */
+export function releaseTag(runtime: Pick<InstanceRuntimeConfig, 'install_id'>, commit: string): string {
+  return releaseImageTag(imageBase(runtime), releaseName(commit));
+}
+
+/** The content key of `release`'s agent image, built with the fixture's `INSTALL_CJK_FONTS=true`. */
 export function releaseAgentImageKey(release: Release, flags: { readonly installCjkFonts?: boolean } = {}): string {
-  return agentImageKey({
+  return releaseImageKey({
     contextTree: git(release.tool, 'rev-parse', `${release.commit}:container`),
     installCjkFonts: flags.installCjkFonts ?? true,
-    hardenedImage: false,
   });
+}
+
+/** The physical layout of the assistant's instance. */
+export function layoutOf(host: Machine, runtime: InstanceRuntimeConfig) {
+  return host.paths.instanceLayout(runtime.instance_id);
 }
 
 /**
  * The central database a host left closed (WAL, no side files): the live
- * migrations, the profile naming main, no sessions yet, and three agent
- * groups, one of them running a per-group image NanoClaw built on the base,
- * and one an image of its own.
+ * migrations, the profile naming main, main's shared skills, no sessions yet,
+ * and three agent groups, one of them running a per-group image NanoClaw
+ * built on the base, and one an image of its own.
  */
 export function centralDatabase(runtime: InstanceRuntimeConfig): void {
-  const database = new Database(path.join(runtime.checkout_root, 'data', 'v2.db'));
+  const database = new Database(path.join(runtime.state_root, 'data', 'v2.db'));
   try {
     database.pragma('journal_mode = WAL');
     database.exec(`
@@ -243,7 +271,7 @@ export function centralDatabase(runtime: InstanceRuntimeConfig): void {
         id TEXT PRIMARY KEY, name TEXT NOT NULL, folder TEXT NOT NULL UNIQUE, agent_provider TEXT, created_at TEXT NOT NULL
       );
       CREATE TABLE container_configs (
-        agent_group_id TEXT PRIMARY KEY, image_tag TEXT, mcp_servers TEXT NOT NULL DEFAULT '{}'
+        agent_group_id TEXT PRIMARY KEY, image_tag TEXT, mcp_servers TEXT NOT NULL DEFAULT '{}', skills TEXT
       );
       CREATE TABLE gws_ea_profile (singleton INTEGER PRIMARY KEY, main_agent_group_id TEXT);
       INSERT INTO gws_ea_profile VALUES (1, 'ag-main');
@@ -269,13 +297,54 @@ export function centralDatabase(runtime: InstanceRuntimeConfig): void {
   }
 }
 
-/** An assistant create finished at the machine's first release, its Compose file naming `gateway`. */
-export async function assistant(
-  host: Machine,
-  port = 37_001,
-  gateway: string = DEPLOYED_GATEWAY,
-): Promise<InstanceRuntimeConfig> {
+/** Fake staging boundaries: Git and tar for real, the release's install and build written as they would leave it. */
+const stagingSeams = {
+  runCommand: async (command: SanitizedCommand) => {
+    if (command.command === 'git' || command.command === 'tar') return runSanitizedCommand(command);
+    return { stdout: '', stderr: '' };
+  },
+  runSetupCommand: setupCommand,
+};
+
+/** The release's frozen install and build, as they leave the release: its dependencies and its build output. */
+async function setupCommand(command: SetupCommand): Promise<void> {
+  if (command.args[0] === 'install') {
+    await write(command.cwd, 'node_modules/.modules.yaml', 'installed\n');
+    return;
+  }
+  await write(command.cwd, 'dist/index.js', 'host\n');
+  await write(command.cwd, 'dist/gws-ea/process.js', 'launcher\n');
+}
+
+/** How a test wants an assistant made: what an older release than this tool kept with its own. */
+export interface AssistantOptions {
+  readonly port?: number;
+  /** The gateway its release's Compose file names, as an older tool rendered it. */
+  readonly gateway?: string;
+  /** Its release's service definition, as an older tool rendered it. */
+  readonly serviceDefinition?: string;
+}
+
+/** Each assistant's first release and its image's content key, which `world` tags its image for. */
+const createdAt = new Map<string, { readonly commit: string; readonly key: string }>();
+
+/** The service manager options the fixture's assistants run under: launchd, as this user. */
+export const SERVICE = { platform: 'darwin' as const, uid: 501, ambientEnv: {}, sleep: async () => undefined };
+
+/** The assistant's service definition, in the fixture machine's home. */
+export function serviceDefinitionFile(runtime: InstanceRuntimeConfig): string {
+  return instanceServiceDefinitionFile(runtime, { platform: 'macos', homeDirectory: runtime.home_directory });
+}
+
+/**
+ * An assistant create finished at the machine's first release: its state, its
+ * release staged and kept, gws-ea's `.env` keys applied, its OneCLI Compose
+ * file and service definition installed from what was kept, and the live link
+ * pointing at the release; its central database as the host left it.
+ */
+export async function assistant(host: Machine, options: AssistantOptions = {}): Promise<InstanceRuntimeConfig> {
   const { paths } = host;
+  const port = options.port ?? 37_001;
   const instanceId = randomUUID();
   const reserved = await reserveInstance(paths, {
     instance_id: instanceId,
@@ -299,7 +368,9 @@ export async function assistant(
   } finally {
     operation.release();
   }
-  await materializeReleaseCheckout(paths, reserved);
+  const layout = paths.instanceLayout(instanceId);
+  await writeInstanceMarker(paths, instanceId);
+  await createState(layout);
   const onecli = createOnecliRuntimeLayout({
     instanceId,
     instanceRoot: paths.instanceRoot(instanceId),
@@ -314,79 +385,57 @@ export async function assistant(
     selectedProvider: 'claude',
     dockerEndpoint: DOCKER,
   });
-  await persistInstanceRuntime(runtime, (values, root) =>
-    writeFileSync(
-      path.join(root, '.env'),
-      `INSTALL_CJK_FONTS=true\n${Object.entries(values)
-        .map(([key, value]) => `${key}=${value}\n`)
-        .join('')}`,
-      { mode: 0o600 },
-    ),
+  await writeFile(path.join(layout.state, '.env'), 'INSTALL_CJK_FONTS=true\n', { mode: 0o600 });
+  await persistInstanceRuntime(runtime, upsertEnvVars);
+  const service = { platform: 'macos' as const, homeDirectory: host.root, runningAsRoot: false };
+  await stageRelease(
+    {
+      paths,
+      view: reserved,
+      runtime,
+      onecli,
+      service,
+      provider: { provider: 'claude', providerCredential: CREDENTIAL },
+    },
+    stagingSeams,
   );
-  await mkdir(path.dirname(paths.releasePreflightFile(instanceId, host.first)), { recursive: true, mode: 0o700 });
-  await writeFile(
-    paths.releasePreflightFile(instanceId, host.first),
-    `${JSON.stringify({
-      schema_version: 1,
-      instance_id: instanceId,
-      deployed_commit: host.first,
-      provider: 'claude',
-      providerCredential: CREDENTIAL,
-      packageManager: 'pnpm@10.34.5',
-      onecli: COHORT,
-    })}\n`,
-    { mode: 0o600 },
-  );
+  const name = releaseName(host.first);
+  const keptFiles = path.join(layout.kept(name));
+  if (options.gateway) {
+    await writeFile(path.join(keptFiles, 'onecli-compose.yaml'), renderOnecliCompose(onecli, PINS, options.gateway), {
+      mode: 0o600,
+    });
+  }
+  if (options.serviceDefinition) {
+    await writeFile(path.join(keptFiles, 'service-definition'), options.serviceDefinition, { mode: 0o600 });
+  }
+  const kept = await readKeptRelease(keptFiles);
+  await applyReleaseEnvironment(runtime, name, upsertEnvVars);
   await mkdir(onecli.rootDirectory, { recursive: true, mode: 0o700 });
-  await writeFile(onecli.composeFile, renderOnecliCompose(onecli, COHORT, gateway), { mode: 0o600 });
+  await writeFile(onecli.composeFile, kept.compose, { mode: 0o600 });
+  await mkdir(path.dirname(serviceDefinitionFile(runtime)), { recursive: true });
+  await writeFile(serviceDefinitionFile(runtime), kept.serviceDefinition, { mode: 0o600 });
   centralDatabase(runtime);
-  await stampMain(runtime.checkout_root);
+  await stampMain(layout.release(name), runtime.state_root);
+  await pointCurrent(layout, name);
+  createdAt.set(instanceId, {
+    commit: host.first,
+    key: releaseImageKey({
+      contextTree: git(host.work, 'rev-parse', `${host.first}:container`),
+      installCjkFonts: true,
+    }),
+  });
   return runtime;
 }
 
-/** Every file under `root`, by path relative to it; none when it is absent. */
-async function filesUnder(root: string, prefix = ''): Promise<string[]> {
-  let entries;
-  try {
-    entries = await readdir(path.join(root, prefix), { withFileTypes: true });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
-    throw error;
-  }
-  const found: string[] = [];
-  for (const entry of entries) {
-    const relative = prefix ? path.join(prefix, entry.name) : entry.name;
-    if (entry.isDirectory()) found.push(...(await filesUnder(root, relative)));
-    else found.push(relative);
-  }
-  return found;
-}
-
-/** What a plugin stamps into main's folder beside itself, as NanoClaw writes it: its persona, trimmed, and each context file. */
-async function stampedContext(plugin: string): Promise<Map<string, string>> {
-  const context = path.join(plugin, 'ai.nanoco.nanoclaw', 'context');
-  const stamped = new Map<string, string>();
-  for (const file of await filesUnder(context)) {
-    if (!file.endsWith('.md')) continue;
-    const text = await readFile(path.join(context, file), 'utf8');
-    if (file === 'instructions.md') stamped.set('instructions.prepend.md', `${text.trimEnd()}\n`);
-    else stamped.set(file, text);
-  }
-  return stamped;
-}
-
-/** Stamp main from the checkout's own template, as create's `ncl groups create --template` does. */
-export async function stampMain(checkout: string): Promise<void> {
-  const template = path.join(checkout, MAIN_TEMPLATE_DIR);
-  await cp(template, path.join(checkout, MAIN_BASELINE), { recursive: true });
-  for (const [file, contents] of await stampedContext(template)) {
-    await write(path.join(checkout, MAIN_FOLDER), file, contents);
-  }
+/** Stamp main from a release's own template into the state, as create's `ncl groups create --template` does. */
+export async function stampMain(release: string, state: string): Promise<void> {
+  await cp(path.join(release, MAIN_TEMPLATE_DIR), path.join(state, MAIN_FOLDER), { recursive: true });
 }
 
 /** What the assistant's conversations and memory hold: a session message row and a memory file. */
 export async function converse(runtime: InstanceRuntimeConfig, ...messages: readonly string[]): Promise<void> {
-  const session = path.join(runtime.checkout_root, SESSION);
+  const session = path.join(runtime.state_root, SESSION);
   await mkdir(session, { recursive: true, mode: 0o700 });
   const database = new Database(path.join(session, 'inbound.db'));
   try {
@@ -396,11 +445,12 @@ export async function converse(runtime: InstanceRuntimeConfig, ...messages: read
   } finally {
     database.close();
   }
-  await write(runtime.checkout_root, MEMORY, 'The principal prefers mornings.\n');
+  await write(runtime.state_root, MEMORY, 'The principal prefers mornings.\n');
 }
 
-export function messages(checkout: string): string[] {
-  const database = new Database(path.join(checkout, SESSION, 'inbound.db'), { readonly: true });
+/** The messages the session under `stateRoot` received. */
+export function messages(stateRoot: string): string[] {
+  const database = new Database(path.join(stateRoot, SESSION, 'inbound.db'), { readonly: true });
   try {
     return (database.prepare('SELECT id FROM messages_in ORDER BY id').all() as Array<{ id: string }>).map(
       (row) => row.id,
@@ -429,31 +479,20 @@ export function applying(...names: readonly string[]): Migrate {
 }
 
 /**
- * Where an update is killed: the boundary call it never returns from. At
- * `untag` a rollback's cleanup is removing the `:previous` tag it leaves. At
- * `label` an update's agent image is built and not yet labeled; at
- * `untag-build` it is labeled, and the unlabeled one still carries its
- * `:building` tag. At `hold` an image is being held under a tag of the
- * assistant's own, and at `release` that hold is being removed.
+ * Where a run is killed: the boundary call it never returns from. `stamp` is
+ * the release's tripwire script, the first step of a switch, `verify` the
+ * wait for the started host, and `rebuild` an agent group's image rebuild.
  */
-export type HangPoint =
-  | 'build'
-  | 'label'
-  | 'untag-build'
-  | 'migrate'
-  | 'stop'
-  | 'stamp'
-  | 'retag'
-  | 'second-tag'
-  | 'verify'
-  | 'rebuild'
-  | 'untag'
-  | 'hold'
-  | 'release';
+export type HangPoint = 'build' | 'migrate' | 'stop' | 'stamp' | 'verify' | 'rebuild';
 
 /** What every faked boundary holds, and what reached it. */
 export interface World {
+  /** The launchd job is loaded. */
+  loaded: boolean;
+  /** Its host runs: only while the job is loaded and the program its definition names exists. */
   running: boolean;
+  /** The service definition the loaded job read when it was bootstrapped. */
+  loadedDefinition?: string;
   freeBytes: number;
   /** Docker's images: each tag and the image ID it names; `ids` holds every image, tagged or not. */
   readonly tags: Map<string, string>;
@@ -461,51 +500,51 @@ export interface World {
   /** The agent image key each image's label carries, by image ID. */
   readonly labels: Map<string, string>;
   readonly commands: SanitizedCommand[];
-  readonly serviceCalls: string[];
-  readonly preflights: ReleasePreflightInput[];
-  readonly onecli: string[];
-  readonly rebuilds: Array<{ readonly args: readonly string[]; readonly timeoutMs: number | undefined }>;
-  readonly fetched: string[];
-  /** The service's stops and starts, and Docker's tag moves, in order. */
+  /** Every install and build of a release staging ran. */
+  readonly setups: SetupCommand[];
+  /** The service's stops and starts, and staging's installs, builds, and image builds, in order. */
   readonly events: string[];
+  /** Every call the service helpers took, with the install it named. */
+  readonly serviceCalls: string[];
+  /** The OneCLI Compose file each project last came up from. */
+  readonly gateways: Map<string, string>;
+  /** Isolation probes run, by the gateway image each probed. */
+  readonly probes: string[];
+  /** The isolation probe fails while the gateway runs this image. */
+  failingGateway?: string;
+  /** The serving runtime's re-verification before the fence fails. */
+  reverifyFails?: boolean;
+  readonly reverified: string[];
+  readonly rebuilds: Array<{ readonly args: readonly string[]; readonly timeoutMs: number | undefined }>;
+  /** Main's shared skills reconciled, each time: the list the live release ships. */
+  readonly skills: string[][];
+  readonly fetched: string[];
   /** How long each health check was allowed. */
   readonly healthWaits: Array<number | undefined>;
   migrate: Migrate;
   buildFails?: boolean;
-  /** Every layer of the agent image is cached, so NanoClaw's build gives back the image `:latest` names. */
-  cachedBuild?: boolean;
   /** Every layer of a per-group image is cached, so its rebuild gives the image its tag already names. */
   cachedRebuild?: boolean;
-  /** What `ps` lists, and what `lsof` finds open under a checkout's data/. */
+  /** What `ps` lists, and what `lsof` finds open under the instance's state. */
   processes: string;
   openFiles: string;
   /** The containers `docker ps --all` lists, by the install label it filters on. */
   readonly containers: Map<string, readonly string[]>;
   /** The listener ID the running host answers with. */
   listener: string;
-  /** The listener ID the local listener answers with instead, as another host's would. */
-  listenerAnswer?: string;
-  /** The webhook port the host reports instead of its own. */
-  webhookPort?: number;
   /** The callback route answers 502, as a tunnel with nothing behind it does. */
   routeDown?: boolean;
-  /** What observing OneCLI finds instead of it present, when its gateway did not change. */
+  /** What observing OneCLI finds instead of it present. */
   onecliObservation?: Observation;
-  /** OneCLI's health or isolation check fails, when its gateway changed. */
-  onecliVerifyFails?: boolean;
-  /** Runs when the host starts, from the live checkout, as the host would. */
+  /** Runs when the host starts, from the live release, as the host would. */
   onStart?: (checkout: string) => void;
   /** The service manager refuses to start the host. */
   startFails?: boolean;
-  /** Runs once the release's tripwire is stamped: the last of the carry. */
+  /** Runs as the release's tripwire is stamped, the first step of a switch. */
   onStamp?: () => void;
   rebuildFails?: boolean;
-  /** The step an update never returns from, as if killed there; `reached` resolves once it is under way. */
+  /** The step a run never returns from, as if killed there; `reached` resolves once it is under way. */
   hangAt?: HangPoint;
-  /** Kill the swap at its rename number `renameKill`. */
-  renameKill?: number;
-  /** Every rename of a swap fails, as a filesystem gone read-only fails it. */
-  renameFails?: boolean;
   reached?: () => void;
 }
 
@@ -520,25 +559,33 @@ export function imageId(): string {
   return id;
 }
 
-export function world(runtime: Pick<InstanceRuntimeConfig, 'install_id'>, migrate: Migrate = applying()): World {
+/** The fixture's Docker and services for `runtime`'s assistant: its release image, a per-group image, and the gateways. */
+export function world(runtime: Pick<InstanceRuntimeConfig, 'install_id' | 'instance_id'>, migrate = applying()): World {
+  const created = createdAt.get(runtime.instance_id);
+  const own = imageId();
   const tags = new Map([
-    [`${imageBase(runtime)}:latest`, imageId()],
+    ...(created ? [[releaseTag(runtime, created.commit), own] as const] : []),
     [`${imageBase(runtime)}:ag-research`, imageId()],
     [DEPLOYED_GATEWAY, imageId()],
+    [RELEASE_GATEWAY, imageId()],
   ]);
   return {
+    loaded: true,
     running: true,
     freeBytes: 1e15,
     tags,
     ids: new Set(tags.values()),
-    labels: new Map(),
+    labels: new Map(created ? [[own, created.key]] : []),
     commands: [],
-    serviceCalls: [],
-    preflights: [],
-    onecli: [],
-    rebuilds: [],
-    fetched: [],
+    setups: [],
     events: [],
+    serviceCalls: [],
+    gateways: new Map(),
+    probes: [],
+    reverified: [],
+    rebuilds: [],
+    skills: [],
+    fetched: [],
     healthWaits: [],
     migrate,
     processes: '',
@@ -561,9 +608,8 @@ export async function hang(state: World, point: HangPoint): Promise<void> {
   await never();
 }
 
-/** Whether a tag is one an assistant holds an image under (`heldImageTag`), which a switch never moves. */
-export function isHold(reference: string): boolean {
-  return /:held-[0-9a-f]{12}$/u.test(reference);
+function dockerFailure(stderrTail: string): GwsEaError {
+  return new GwsEaError('command_failed', 'docker exited with code 1', { details: { exitCode: 1, stderrTail } });
 }
 
 /** Tag an image as Docker does: the tag's former image stays, untagged unless another tag names it. */
@@ -571,10 +617,6 @@ export function tag(state: World, reference: string, name: string): void {
   const id = state.tags.get(reference) ?? (state.ids.has(reference) ? reference : undefined);
   if (!id) throw dockerFailure(`Error response from daemon: No such image: ${reference}`);
   state.tags.set(name, id);
-}
-
-function dockerFailure(stderrTail: string): GwsEaError {
-  return new GwsEaError('command_failed', 'docker exited with code 1', { details: { exitCode: 1, stderrTail } });
 }
 
 /**
@@ -605,7 +647,7 @@ function removeImage(state: World, reference: string): void {
   state.labels.delete(reference);
 }
 
-/** Tagged and untagged image IDs of one repository. */
+/** Tagged and untagged image IDs: what a repository's tags name, and what no tag names at all. */
 export function repositoryImages(state: World, repository: string): { tagged: Set<string>; untagged: string[] } {
   const tagged = new Set([...state.tags].filter(([name]) => name.startsWith(`${repository}:`)).map(([, id]) => id));
   const named = new Set(state.tags.values());
@@ -617,10 +659,7 @@ function flagValues(args: readonly string[], flag: string): string[] {
   return args.flatMap((arg, index) => (args[index - 1] === flag ? [arg] : []));
 }
 
-/**
- * `docker image ls --filter`, as Docker answers it for the filters an agent
- * image lookup uses: `label=<key>=<value>` and `dangling=false`.
- */
+/** `docker image ls --filter`, as Docker answers it for `label=<key>=<value>` and `dangling=false`. */
 function listFiltered(state: World, args: readonly string[]): string {
   const tagged = new Set(state.tags.values());
   const matches = (id: string): boolean =>
@@ -649,13 +688,102 @@ function inspected(state: World, id: string): string {
   ])}\n`;
 }
 
-/** Git for real; Docker, `ps`, `lsof`, and the release's own scripts as `state` says. */
+/** A OneCLI project's containers: the gateway's ID changes whenever Compose recreated it from another file. */
+function projectContainers(state: World, project: string): string {
+  const running = state.gateways.get(project) ?? 'created';
+  const gateway = createHash('sha256').update(running).digest('hex').slice(0, 12);
+  return `postgres-${project}\napp-${project}\n${gateway}\n`;
+}
+
+/** Docker as the instance and its OneCLI project use it. */
+async function docker(state: World, spec: SanitizedCommand): Promise<{ stdout: string; stderr: string }> {
+  const [first, second] = spec.args;
+  const joined = spec.args.join(' ');
+  const last = spec.args.at(-1)!;
+  if (first === 'compose') {
+    const project = flagValues(spec.args, '--project-name')[0]!;
+    if (spec.args.includes('up')) {
+      state.gateways.set(project, await readFile(flagValues(spec.args, '--file')[0]!, 'utf8'));
+      return { stdout: '', stderr: '' };
+    }
+    throw new Error(`unexpected compose command: ${joined}`);
+  }
+  if (first === 'container' && second === 'ls') {
+    const project = flagValues(spec.args, '--filter')[0]!.replace('label=com.docker.compose.project=', '');
+    return { stdout: projectContainers(state, project), stderr: '' };
+  }
+  if (first === 'run') {
+    const project = [...state.gateways].find(([name]) =>
+      (flagValues(spec.args, '--network')[0] ?? '').startsWith(name),
+    );
+    const running = project?.[1] ?? '';
+    state.probes.push(
+      running.includes(RELEASE_GATEWAY)
+        ? RELEASE_GATEWAY
+        : running.includes(DEPLOYED_GATEWAY)
+          ? DEPLOYED_GATEWAY
+          : 'unknown',
+    );
+    if (state.failingGateway && running.includes(state.failingGateway)) {
+      throw new GwsEaError('command_failed', 'docker exited with code 1', {
+        details: { exitCode: 1, stderrTail: 'link-local/metadata reachable through gateway' },
+      });
+    }
+    return { stdout: '', stderr: '' };
+  }
+  if (first === 'ps') {
+    const label = spec.args[spec.args.indexOf('--filter') + 1]?.replace(/^label=/u, '') ?? '';
+    return { stdout: (state.containers.get(label) ?? []).map((id) => `${id}\n`).join(''), stderr: '' };
+  }
+  if (first === 'image' && second === 'inspect' && joined.includes('{{.Size}}')) {
+    if (!state.tags.has(last)) throw dockerFailure(`Error: No such image: ${last}`);
+    return { stdout: `${IMAGE_BYTES}\n`, stderr: '' };
+  }
+  if (first === 'image' && second === 'inspect') return { stdout: inspected(state, last), stderr: '' };
+  if (first === 'image' && second === 'ls' && spec.args.includes('--filter')) {
+    return { stdout: listFiltered(state, spec.args), stderr: '' };
+  }
+  if (first === 'image' && second === 'ls') {
+    const id = state.tags.get(last);
+    return { stdout: id ? `${joined.includes('--no-trunc') ? id : id.slice(7, 19)}\n` : '', stderr: '' };
+  }
+  if (first === 'tag') {
+    tag(state, spec.args[1]!, spec.args[2]!);
+    return { stdout: '', stderr: '' };
+  }
+  if (first === 'image' && second === 'rm') {
+    removeImage(state, last);
+    return { stdout: '', stderr: '' };
+  }
+  if (first === 'build' && last === '-') {
+    // A metadata-only build from stdin: the image it names `FROM`, with one label more.
+    const from = /^FROM (\S+)\n$/u.exec(spec.input ?? '')?.[1];
+    const base = from ? (state.tags.get(from) ?? (state.ids.has(from) ? from : undefined)) : undefined;
+    if (!base) throw dockerFailure(`ERROR: failed to solve: ${from ?? 'no FROM'}: not found`);
+    const [label, value] = (flagValues(spec.args, '--label')[0] ?? '').split(/=(.*)/su);
+    if (label !== AGENT_IMAGE_KEY_LABEL || !value) throw new Error(`unexpected label build: ${joined}`);
+    const id = imageId();
+    state.ids.add(id);
+    state.labels.set(id, value);
+    state.tags.set(flagValues(spec.args, '--tag')[0]!, id);
+    return { stdout: '', stderr: '' };
+  }
+  if (first === 'build') {
+    const id = imageId();
+    state.ids.add(id);
+    state.tags.set(flagValues(spec.args, '--tag')[0]!, id);
+    return { stdout: '', stderr: '' };
+  }
+  throw new Error(`unexpected docker command: ${joined}`);
+}
+
+/** Git and tar for real; Docker, `ps`, `lsof`, and the release's own scripts as `state` says. */
 export function runner(state: World): SanitizedCommandRunner {
   return async (spec) => {
     state.commands.push(spec);
     const [first, second] = spec.args;
     const joined = spec.args.join(' ');
-    if (spec.command === 'git') return runSanitizedCommand(spec);
+    if (spec.command === 'git' || spec.command === 'tar') return runSanitizedCommand(spec);
     if (spec.command === 'pnpm' && joined === 'run migrate') {
       state.migrate(path.join(spec.cwd, 'data', 'v2.db'));
       await hang(state, 'migrate');
@@ -663,149 +791,104 @@ export function runner(state: World): SanitizedCommandRunner {
     }
     if (spec.command === 'pnpm' && joined.startsWith('exec tsx scripts/upgrade-state.ts set ')) {
       await hang(state, 'stamp');
-      const commit = git(spec.cwd, 'rev-parse', 'HEAD');
-      await mkdir(path.join(spec.cwd, 'data'), { recursive: true });
-      await writeFile(path.join(spec.cwd, 'data', 'upgrade-state.json'), JSON.stringify({ commit, via: spec.args[5] }));
       state.onStamp?.();
+      // The release's own script, run from its folder, writes through the release's `data` link.
+      const commit = git(spec.cwd, 'rev-parse', 'HEAD');
+      await writeFile(path.join(spec.cwd, 'data', 'upgrade-state.json'), JSON.stringify({ commit, via: spec.args[5] }));
       return { stdout: '', stderr: '' };
     }
     if (spec.command === 'bash' && first?.endsWith(path.join('container', 'build.sh')) && second) {
+      await hang(state, 'build');
       if (state.buildFails) {
         throw new GwsEaError('command_failed', 'bash exited with code 1', {
           details: { exitCode: 1, stderrTail: 'ERROR: failed to solve: process did not complete successfully' },
         });
       }
       const base = getInstallScopedNames(spec.env?.NANOCLAW_INSTALL_ID ?? '').containerImageBase;
-      const cached = state.cachedBuild ? state.tags.get(`${base}:latest`) : undefined;
-      const id = cached ?? imageId();
+      const id = imageId();
       state.ids.add(id);
       state.tags.set(`${base}:${second}`, id);
-      await hang(state, 'build');
+      state.events.push('build');
       return { stdout: '', stderr: '' };
     }
     if (spec.command === 'ps') return { stdout: state.processes, stderr: '' };
-    if (spec.command === 'lsof') {
-      if (state.openFiles) return { stdout: state.openFiles, stderr: '' };
-      throw new GwsEaError('command_failed', 'lsof exited with code 1', { details: { exitCode: 1, stderrTail: '' } });
-    }
-    if (spec.command === 'docker') {
-      const last = spec.args.at(-1)!;
-      if (first === 'ps') {
-        const label = spec.args[spec.args.indexOf('--filter') + 1]?.replace(/^label=/u, '') ?? '';
-        return { stdout: (state.containers.get(label) ?? []).map((id) => `${id}\n`).join(''), stderr: '' };
-      }
-      if (first === 'image' && second === 'inspect' && joined.includes('{{.Size}}')) {
-        return { stdout: `${IMAGE_BYTES}\n`, stderr: '' };
-      }
-      if (first === 'image' && second === 'inspect' && !spec.args.includes('--format')) {
-        return { stdout: inspected(state, last), stderr: '' };
-      }
-      if (first === 'image' && second === 'inspect') {
-        if (!state.ids.has(last)) throw dockerFailure(`Error: No such image: ${last}`);
-        const names = [...state.tags].filter(([, id]) => id === last).map(([name]) => name);
-        return { stdout: `${JSON.stringify(names)}\n`, stderr: '' };
-      }
-      if (first === 'image' && second === 'ls' && spec.args.includes('--filter')) {
-        return { stdout: listFiltered(state, spec.args), stderr: '' };
-      }
-      if (first === 'image' && second === 'ls' && flagValues(spec.args, '--format')[0] === '{{.Repository}}:{{.Tag}}') {
-        const tags = [...state.tags.keys()].filter((name) => name.startsWith(`${last}:`));
-        return { stdout: tags.map((name) => `${name}\n`).join(''), stderr: '' };
-      }
-      if (first === 'image' && second === 'ls') {
-        const id = state.tags.get(last);
-        return { stdout: id ? `${joined.includes('--no-trunc') ? id : id.slice(7, 19)}\n` : '', stderr: '' };
-      }
-      if (first === 'tag' && isHold(spec.args[2]!)) {
-        await hang(state, 'hold');
-        tag(state, spec.args[1]!, spec.args[2]!);
-        return { stdout: '', stderr: '' };
-      }
-      if (first === 'tag') {
-        await hang(state, 'retag');
-        if (state.events.at(-1) === 'tag') await hang(state, 'second-tag');
-        state.events.push('tag');
-        tag(state, spec.args[1]!, spec.args[2]!);
-        return { stdout: '', stderr: '' };
-      }
-      if (first === 'image' && second === 'rm') {
-        if (last.endsWith(':previous')) await hang(state, 'untag');
-        if (last.endsWith(':building')) await hang(state, 'untag-build');
-        if (isHold(last)) await hang(state, 'release');
-        removeImage(state, last);
-        return { stdout: '', stderr: '' };
-      }
-      if (first === 'build' && last === '-') {
-        // A metadata-only build from stdin: the image it names `FROM`, with one label more.
-        await hang(state, 'label');
-        const from = /^FROM (\S+)\n$/u.exec(spec.input ?? '')?.[1];
-        const base = from ? (state.tags.get(from) ?? (state.ids.has(from) ? from : undefined)) : undefined;
-        if (!base) throw dockerFailure(`ERROR: failed to solve: ${from ?? 'no FROM'}: not found`);
-        const [label, value] = (flagValues(spec.args, '--label')[0] ?? '').split(/=(.*)/su);
-        if (label !== AGENT_IMAGE_KEY_LABEL || !value) throw new Error(`unexpected label build: ${joined}`);
-        const id = imageId();
-        state.ids.add(id);
-        state.labels.set(id, value);
-        state.tags.set(flagValues(spec.args, '--tag')[0]!, id);
-        return { stdout: '', stderr: '' };
-      }
-      if (first === 'build') {
-        const id = imageId();
-        state.ids.add(id);
-        state.tags.set(spec.args[spec.args.indexOf('--tag') + 1]!, id);
-        return { stdout: '', stderr: '' };
-      }
-    }
+    if (spec.command === 'sh' && spec.args[2] === 'lsof') return { stdout: state.openFiles, stderr: '' };
+    if (spec.command === 'systemctl') return { stdout: '', stderr: '' };
+    if (spec.command === 'docker') return docker(state, spec);
     throw new Error(`unexpected command: ${spec.command} ${joined}`);
   };
 }
 
-/** NanoClaw's service helpers: the assistant's service runs while `state.running` says so. */
+/**
+ * NanoClaw's service helpers, as launchd runs an assistant: a job is loaded
+ * (bootstrapped) or not, a stop boots it out, and a loaded job runs the host
+ * only while the program its definition names, through the live link,
+ * exists; launchd retries it, so a host comes up once the link is there.
+ */
 export function services(state: World): NanoclawServiceHelpers {
   const unused = (): never => {
     throw new Error('the helpers run their commands through the fakes below');
   };
+  const program = (root: string): boolean => existsSync(path.join(root, 'dist', 'gws-ea', 'process.js'));
   return {
     createCommandRunner: () => ({ run: unused, tryRun: unused }),
     detectService: (_root, env) => {
       state.serviceCalls.push(`detect ${env.installSlug}`);
-      return { mode: 'launchd', active: state.running, name: `com.nanoclaw-v2-${env.installSlug}` };
+      return {
+        mode: 'launchd',
+        active: state.loaded,
+        name: `com.nanoclaw-v2-${env.installSlug}`,
+        definition: path.join(env.home, 'Library', 'LaunchAgents', `com.nanoclaw-v2-${env.installSlug}.plist`),
+      };
     },
-    stopService: async (_handle, env) => {
+    stopService: async (handle, env) => {
+      if (!handle.active) return;
       state.serviceCalls.push(`stop ${env.installSlug}`);
       state.events.push(state.running ? 'stop running' : 'stop');
       await hang(state, 'stop');
+      state.loaded = false;
       state.running = false;
     },
-    startService: (_handle, root, env) => {
+    startService: (handle, root, env) => {
+      if (!handle.active) return;
       state.serviceCalls.push(`start ${env.installSlug}`);
       if (state.startFails) throw new Error('Bootstrap failed: 5: Input/output error');
       state.events.push('start');
-      state.running = true;
-      state.onStart?.(root);
+      state.loaded = true;
+      state.loadedDefinition = readFileSync(handle.definition!, 'utf8');
+      state.running = program(root);
+      if (state.running) state.onStart?.(root);
     },
     drainContainers: async (_root, env) => {
       state.serviceCalls.push(`drain ${env.installSlug}`);
     },
-    verifyServiceHealth: async (_handle, _root, env, timeoutMs) => {
+    verifyServiceHealth: async (_handle, root, env, timeoutMs) => {
       state.serviceCalls.push(`health ${env.installSlug}`);
       state.healthWaits.push(timeoutMs);
+      // launchd retries a loaded job whose program was missing, and starts it once the live link is back.
+      if (state.loaded && !state.running && program(root)) state.running = true;
       return state.running;
     },
   };
 }
 
-/** The host's status over its socket, and its listener: the running host answers for its own checkout. */
+/**
+ * A reboot or login: launchd loads the job from its definition (`RunAtLoad`)
+ * and runs the host only if the program the definition names exists.
+ */
+export function reboot(state: World, runtime: InstanceRuntimeConfig): void {
+  state.loaded = true;
+  state.loadedDefinition = readFileSync(serviceDefinitionFile(runtime), 'utf8');
+  state.running = existsSync(path.join(runtime.checkout_root, 'dist', 'gws-ea', 'process.js'));
+}
+
+/** The host's status over its socket, and its listener: the running host answers for its own release. */
 export function hostStatus(state: World, runtime: InstanceRuntimeConfig): HostStatusHelpers {
   const status = (root: string) => ({
     pid: 4242,
-    instance_id: `host-${state.serviceCalls.length}`,
+    instance_id: `host-${state.events.length}`,
     project_root: root,
-    webhook: {
-      id: state.listener,
-      port: state.webhookPort ?? runtime.allocated_ports.nanoclaw_webhook,
-      paths: ['/webhook/gchat'],
-    },
+    webhook: { id: state.listener, port: runtime.allocated_ports.nanoclaw_webhook, paths: ['/webhook/gchat'] },
     channels: [{ instance: 'gchat', type: 'gchat', connected: true }],
   });
   return {
@@ -821,6 +904,43 @@ export function hostStatus(state: World, runtime: InstanceRuntimeConfig): HostSt
   };
 }
 
+/**
+ * The assistant's own `ncl`, through its running host: an agent group's image
+ * rebuilt on the live release's image, the profile, and main's shared skills
+ * set to the list the live release ships.
+ */
+function ncl(state: World): NonNullable<UpdateDependencies['ncl']> {
+  return async (config, args, options) => {
+    if (!state.running) throw new GwsEaError('ncl_failed', 'ncl could not reach the host: connect ENOENT');
+    if (args[0] === 'gws-ea-profile' && args[1] === 'get') return { main_agent_group_id: 'ag-main' };
+    if (args[0] === 'gws-ea-main' && args[1] === 'reconcile') {
+      const id = args[args.indexOf('--agent-group-id') + 1]!;
+      const skills = JSON.parse(await readFile(path.join(config.checkout_root, MAIN_SKILLS), 'utf8')) as string[];
+      const database = new Database(path.join(config.state_root, 'data', 'v2.db'));
+      try {
+        database
+          .prepare('UPDATE container_configs SET skills = ? WHERE agent_group_id = ?')
+          .run(JSON.stringify(skills), id);
+      } finally {
+        database.close();
+      }
+      state.skills.push(skills);
+      return { agent_group_id: id, skills };
+    }
+    state.rebuilds.push({ args, timeoutMs: options?.timeoutMs });
+    await hang(state, 'rebuild');
+    if (state.rebuildFails) {
+      throw new GwsEaError('ncl_failed', `ncl ${args.join(' ')} failed: apt-get could not find package made-up`);
+    }
+    // NanoClaw's buildAgentGroupImage moves the group's tag to an image built on the live release's image.
+    const group = `${imageBase(config)}:${args[args.indexOf('--id') + 1]}`;
+    const id = (state.cachedRebuild ? state.tags.get(group) : undefined) ?? imageId();
+    state.ids.add(id);
+    state.tags.set(group, id);
+    return { restarted: 0, rebuilt: true };
+  };
+}
+
 export function dependencies(state: World, release: Release, runtime: InstanceRuntimeConfig): UpdateDependencies {
   return {
     serviceHelpers: services(state),
@@ -829,90 +949,39 @@ export function dependencies(state: World, release: Release, runtime: InstanceRu
     hostStatus: hostStatus(state, runtime),
     toolRoot: release.tool,
     runCommand: runner(state),
-    runReleasePreflight: async (input) => {
-      state.preflights.push(input);
-      return {
-        provider: input.provider,
-        providerCredential: input.providerCredential,
-        packageManager: 'pnpm@10.34.5',
-        onecli: COHORT,
-      };
+    runSetupCommand: async (command) => {
+      state.setups.push(command);
+      state.events.push(`setup ${command.args[0] === 'install' ? 'install' : 'build'}`);
+      await setupCommand(command);
     },
     freeBytes: async () => state.freeBytes,
-    service: { platform: 'darwin', uid: 501, ambientEnv: {}, sleep: async () => undefined },
+    service: SERVICE,
+    ambientEnv: {},
     fetch: async (input, init) => {
       const url = String(input);
       state.fetched.push(`${init?.method ?? 'GET'} ${url}`);
       if (!state.running) throw new TypeError('fetch failed');
       const local = new URL(url).hostname === '127.0.0.1';
       if (!local && state.routeDown) return new Response(null, { status: 502 });
-      const listener = local ? (state.listenerAnswer ?? state.listener) : state.listener;
-      return new Response(null, { status: 401, headers: { 'x-nanoclaw-webhook-id': listener } });
+      return new Response(null, { status: 401, headers: { 'x-nanoclaw-webhook-id': state.listener } });
     },
     onecli: {
-      // As the real ones do, each writes the Compose file of the gateway it recreates.
-      apply: async (layout, pins) => {
-        state.onecli.push(`apply ${layout.project}`);
-        const { image } = await resolveWrapperGatewayImage(pins);
-        await writeFile(layout.composeFile, renderOnecliCompose(layout, pins, image), { mode: 0o600 });
+      reverify: async (layout: OnecliRuntimeLayout) => {
+        state.reverified.push(layout.project);
+        if (state.reverifyFails) throw new GwsEaError('unhealthy_onecli', 'The OneCLI runtime is not serving.');
       },
-      restore: async (layout, _pins, compose) => {
-        state.onecli.push(`restore ${layout.project}`);
-        await writeFile(layout.composeFile, compose, { mode: 0o600 });
-      },
-      verify: async (layout) => {
-        state.onecli.push(`verify ${layout.project}`);
-        if (state.onecliVerifyFails) {
-          throw new GwsEaError('onecli_isolation_failed', 'An agent reached the network around the gateway.');
-        }
-      },
-      observe: async (layout) => {
-        state.onecli.push(`observe ${layout.project}`);
-        return state.onecliObservation ?? { status: 'present' };
-      },
+      observe: async () => state.onecliObservation ?? { status: 'present' },
     },
-    ncl: async (config, args, options) => {
-      state.rebuilds.push({ args, timeoutMs: options?.timeoutMs });
-      await hang(state, 'rebuild');
-      if (state.rebuildFails) {
-        throw new GwsEaError('ncl_failed', `ncl ${args.join(' ')} failed: apt-get could not find package made-up`);
-      }
-      // NanoClaw's buildAgentGroupImage moves the group's tag to an image built on the new base, which inherits
-      // the base's labels, its agent image key included.
-      const group = `${imageBase(config)}:${args[args.indexOf('--id') + 1]}`;
-      const id = (state.cachedRebuild ? state.tags.get(group) : undefined) ?? imageId();
-      const inherited = state.labels.get(state.tags.get(`${imageBase(config)}:latest`) ?? '');
-      state.ids.add(id);
-      state.tags.set(group, id);
-      if (inherited !== undefined) state.labels.set(id, inherited);
-      return { restarted: 0, rebuilt: true };
-    },
-    rename: (() => {
-      let calls = 0;
-      return async (from: string, to: string) => {
-        calls += 1;
-        if (state.renameKill !== undefined && calls >= state.renameKill) {
-          state.reached?.();
-          await never();
-        }
-        if (state.renameFails) {
-          throw Object.assign(new Error(`EROFS: read-only file system, rename '${from}' -> '${to}'`), {
-            code: 'EROFS',
-          });
-        }
-        const { rename } = await import('node:fs/promises');
-        await rename(from, to);
-      };
-    })(),
+    ncl: ncl(state),
   };
 }
 
 /**
- * Confirm an update and run its cutover until `state.hangAt` (or the swap's
- * rename `state.renameKill`), then abandon it there, as if the process were
- * killed: nothing after that point runs, and the instance lock goes with it.
+ * Confirm an update and run it until `state.hangAt`, or until `kill` stops it,
+ * then abandon it there, as if the process were killed: nothing after that
+ * point runs, and the instance lock goes with it.
  */
-export async function killDuringCutover(host: Machine, runtime: InstanceRuntimeConfig, state: World, release: Release) {
+export async function killDuringUpdate(host: Machine, runtime: InstanceRuntimeConfig, state: World, release: Release) {
   const deps = dependencies(state, release, runtime);
   const intent = await resolveUpdateIntent(host.paths, { instanceId: runtime.instance_id }, deps);
   const operation = await acquireInstanceOperation(host.paths, runtime.instance_id, {
@@ -923,7 +992,7 @@ export async function killDuringCutover(host: Machine, runtime: InstanceRuntimeC
   const reached = new Promise<'killed'>((resolve) => (state.reached = () => resolve('killed')));
   const run = async (): Promise<'finished'> => {
     const staged = await prepareUpdate(operation, intent, deps);
-    await confirmStagedUpdate(operation, staged, deps, async () => true);
+    await confirmStagedUpdate(operation, staged, async () => true);
     await continueUpdate(operation, deps);
     return 'finished';
   };
@@ -957,20 +1026,14 @@ export function release(host: Machine, commit: string): ReleaseCoordinates {
   return { source_remote: host.remote, release_track: 'dogfood', deployed_commit: commit };
 }
 
-/** What the assistant's live release is: its registry entry, checkout, receipt, and service. */
+/** What the assistant's live release is: its registry entry, live link, and the live release's HEAD and tree. */
 export async function liveState(host: Machine, runtime: InstanceRuntimeConfig) {
   return {
     registered: releaseOf(await getInstanceReservation(host.paths, runtime.instance_id)),
+    live: await readlink(runtime.checkout_root),
     head: git(runtime.checkout_root, 'rev-parse', 'HEAD'),
     status: git(runtime.checkout_root, 'status', '--porcelain'),
-    receipt: await readFile(
-      host.paths.releasePreflightFile(
-        runtime.instance_id,
-        (await getInstanceReservation(host.paths, runtime.instance_id)).deployed_commit,
-      ),
-      'utf8',
-    ),
-    migrations: readCentralMigrations(runtime.checkout_root),
+    migrations: readCentralMigrations(runtime.state_root),
   };
 }
 
@@ -1030,12 +1093,4 @@ export function status(host: Machine, state: World, next: Release, runtime: Inst
     },
     runtime.instance_id,
   );
-}
-
-export function receiptCommit(file: string): Promise<string> {
-  return readFile(file, 'utf8').then((text) => (JSON.parse(text) as { deployed_commit: string }).deployed_commit);
-}
-
-export function runtimeCommit(checkout: string): Promise<string> {
-  return receiptCommit(instanceRuntimeFile(checkout));
 }

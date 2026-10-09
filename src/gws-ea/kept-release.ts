@@ -5,23 +5,17 @@
  * so a release is complete only once everything kept with it is there
  * (`release-layout.ts`). A switch to a release applies these files
  * (`release-stage.ts`); nothing here changes once the receipt is written.
- *
- * The kept manifest, `stagedKeptFilesRoot`, and `keepReleaseFiles` serve the
- * update swap's release slots. Deleted with the swap (U11).
  */
-import { mkdir, readFile, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 
-import { writePrivate } from '../community-portal/private-file.js';
 import type { ProviderCredentialMetadata } from '../provider-credential.js';
 import { sameCredentialMetadata } from '../provider-credential.js';
-import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
-import { validateReleaseCoordinates } from './registry.js';
+import { preparePrivateDirectory } from './paths.js';
 import type { ReleasePreflightResult } from './release-preflight.js';
 import { readOwnerOnlyFile, readOwnerOnlyJson, writePrivateTextFile } from './secrets.js';
 import { INSTANCE_HOST_ENV_KEYS } from './service.js';
-import { GwsEaError, type ReleaseCoordinates } from './types.js';
-import { isRecord, requireCanonicalTimestamp, requireRecord, requireString } from './validation.js';
+import { GwsEaError } from './types.js';
+import { isRecord, requireRecord, requireString } from './validation.js';
 
 /** Where `kept/<release>/` keeps each file; the receipt's name is the one `release-layout.ts` checks for. */
 export interface KeptReleaseFiles {
@@ -178,7 +172,7 @@ export async function loadReleasePreflightReceipt(
 }
 
 /** Record what a release preflight established for `instanceId` at `deployedCommit`, owner-only, at `file`. */
-export async function writeReleasePreflightReceipt(
+async function writeReleasePreflightReceipt(
   file: string,
   instanceId: string,
   deployedCommit: string,
@@ -192,85 +186,4 @@ export async function writeReleasePreflightReceipt(
   };
   await preparePrivateDirectory(path.dirname(file));
   await writePrivateTextFile(file, `${JSON.stringify(receipt, null, 2)}\n`);
-}
-
-/** Where a swap slot keeps its manifest. Deleted with the swap (U11). */
-function keptReleaseManifestFile(root: string): string {
-  return path.join(root, 'release-manifest.json');
-}
-
-export const KEPT_RELEASE_MANIFEST_SCHEMA_VERSION = 1 as const;
-
-/**
- * What a release a swap kept is: the assistant it belongs to, the release it
- * ran, and when its host stopped for the cutover that kept it. Deleted with
- * the swap (U11).
- */
-export interface KeptReleaseManifest {
-  readonly schema_version: typeof KEPT_RELEASE_MANIFEST_SCHEMA_VERSION;
-  readonly instance_id: string;
-  readonly release: ReleaseCoordinates;
-  readonly snapshot_at: string;
-}
-
-/** A swap slot's manifest, refused when it belongs to another assistant. Deleted with the swap (U11). */
-export async function readKeptReleaseManifest(releaseRoot: string, instanceId: string): Promise<KeptReleaseManifest> {
-  const file = keptReleaseManifestFile(releaseRoot);
-  const value = await readOwnerOnlyJson(file, 'Kept release manifest', 'invalid_kept_release');
-  const invalid = (detail: string): GwsEaError =>
-    new GwsEaError('invalid_kept_release', `The kept release manifest ${file} ${detail}.`);
-  if (!isRecord(value) || value.schema_version !== KEPT_RELEASE_MANIFEST_SCHEMA_VERSION) {
-    throw invalid('was written by a different gws-ea');
-  }
-  if (value.instance_id !== instanceId) {
-    throw new GwsEaError(
-      'kept_release_mismatch',
-      `The release kept in ${releaseRoot} belongs to another assistant, so it cannot be restored into ${instanceId}.`,
-    );
-  }
-  let release: ReleaseCoordinates;
-  try {
-    release = validateReleaseCoordinates(value.release);
-  } catch (error) {
-    if (!(error instanceof GwsEaError)) throw error;
-    throw invalid('names no valid release');
-  }
-  return {
-    schema_version: KEPT_RELEASE_MANIFEST_SCHEMA_VERSION,
-    instance_id: instanceId,
-    release,
-    snapshot_at: requireCanonicalTimestamp(value.snapshot_at, 'invalid_kept_release', `${file} names no snapshot time`),
-  };
-}
-
-/** The live release's files a swap keeps. Deleted with the swap (U11). */
-export interface KeptReleaseSources {
-  readonly manifest: KeptReleaseManifest;
-  readonly receipt: string;
-  readonly compose: string;
-  /** Undefined when the release has no service definition installed. */
-  readonly serviceDefinition: string | undefined;
-  readonly hostEnvironment: Readonly<Record<string, string>>;
-}
-
-/** Where a swap gathers the live release's files before it moves them to `previous/`. Deleted with the swap (U11). */
-export function stagedKeptFilesRoot(paths: ControlPlanePaths, instanceId: string): string {
-  return path.join(paths.releaseRoot(instanceId, 'next'), 'previous');
-}
-
-/** Copy the live release's files into a swap slot's `root`. Deleted with the swap (U11). */
-export async function keepReleaseFiles(root: string, sources: KeptReleaseSources): Promise<void> {
-  const building = `${root}.building`;
-  await rm(building, { recursive: true, force: true });
-  await mkdir(building, { mode: 0o700 });
-  const kept = keptReleaseFiles(building);
-  await writePrivate(keptReleaseManifestFile(building), sources.manifest);
-  await writePrivateTextFile(kept.receipt, await readOwnerOnlyFile(sources.receipt));
-  await writePrivateTextFile(kept.compose, await readOwnerOnlyFile(sources.compose));
-  if (sources.serviceDefinition !== undefined) {
-    await writePrivateTextFile(kept.serviceDefinition, await readFile(sources.serviceDefinition, 'utf8'));
-  }
-  await writePrivate(kept.hostEnvironment, sources.hostEnvironment);
-  await rm(root, { recursive: true, force: true });
-  await rename(building, root);
 }

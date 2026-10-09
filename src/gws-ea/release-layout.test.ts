@@ -478,6 +478,17 @@ describe('snapshots', STAGING, () => {
     );
   });
 
+  it('leaves the state as it is when the rollback going back never began its restore', async () => {
+    const { layout, a } = await fencedForUpdate();
+    await takeSnapshot(layout, UPDATE, a);
+    const before = inode(path.join(layout.state, 'data', 'v2.db'));
+
+    await returnQuarantinedState(layout, ROLLBACK);
+
+    expect(inode(path.join(layout.state, 'data', 'v2.db'))).toBe(before);
+    expect(await readdir(layout.root)).not.toContain('quarantine');
+  });
+
   it.each(['after setting the target state aside', 'after returning the state'])(
     'finishes a return cut short %s',
     async (when) => {

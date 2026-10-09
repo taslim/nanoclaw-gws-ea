@@ -24,8 +24,8 @@ import {
   readInstallCjkFonts,
   releaseImageKey,
   releaseImageTag,
+  reclaimImage,
   removeReleaseImage,
-  replaceGroupImage,
   type ReleaseImageInputs,
 } from './agent-image-release.js';
 import { CONTROL_PLANE_ROOT } from './paths.js';
@@ -589,27 +589,29 @@ describe("a release's image build", () => {
   });
 });
 
-describe("an agent group's image rebuilt on the release's image", () => {
+describe("the image an agent group's rebuild displaced", () => {
   const group = `${X}:ag-research`;
 
-  it('deletes the image the rebuild displaced once no tag names it', async () => {
+  it('is deleted once the rebuild moved its tag off it and no tag names it', async () => {
     const store = new ImageStore();
     store.addTagged(releaseImageTag(X, '8774b4dc'), releaseImageKey(INPUTS));
     const displaced = store.addTagged(group);
+    store.addTagged(group);
 
-    await replaceGroupImage(store.docker(), group, async () => void store.addTagged(group));
+    await reclaimImage(store.docker(), displaced);
 
     expect(store.images.has(displaced)).toBe(false);
     expect(store.images.has(store.tags.get(group)!)).toBe(true);
     expect(store.tags.has(releaseImageTag(X, '8774b4dc'))).toBe(true);
+    // Reclaimed again, as a retried follow-up does, it is gone already.
+    await reclaimImage(store.docker(), displaced);
   });
 
-  it('deletes nothing when the rebuild produced the same image, or there was none before', async () => {
+  it('is kept when the rebuild produced the same image, which the group still names', async () => {
     const store = new ImageStore();
     const same = store.addTagged(group);
 
-    await replaceGroupImage(store.docker(), group, async () => void store.tags.set(group, same));
-    await replaceGroupImage(store.docker(), `${X}:ag-new`, async () => void store.addTagged(`${X}:ag-new`));
+    await reclaimImage(store.docker(), same);
 
     expect(store.tags.get(group)).toBe(same);
     expect(store.commands.filter((command) => command.startsWith('image rm'))).toEqual([]);
@@ -618,12 +620,13 @@ describe("an agent group's image rebuilt on the release's image", () => {
   it.each([
     ['another assistant', `${Y}:ag-research`],
     ['another tag of its own', `${X}:ag-research-copy`],
-  ])('keeps a displaced image %s still tags', async (_label, elsewhere) => {
+  ])('is kept while %s still tags it', async (_label, elsewhere) => {
     const store = new ImageStore();
     const displaced = store.addTagged(group);
     store.tags.set(elsewhere, displaced);
+    store.addTagged(group);
 
-    await replaceGroupImage(store.docker(), group, async () => void store.addTagged(group));
+    await reclaimImage(store.docker(), displaced);
 
     expect(store.tags.get(elsewhere)).toBe(displaced);
     expect(store.images.has(displaced)).toBe(true);

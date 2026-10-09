@@ -37,6 +37,7 @@ import { createOnecliRuntimeLayout, type OnecliPins, type OnecliRuntimeLayout } 
 import {
   inspectOperation,
   liveCheckoutCommits,
+  readRollbackPoint,
   type OperationFollowUp,
   type OperationInspection,
   type OperationKind,
@@ -50,7 +51,7 @@ import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { readDeployedSetup } from './provision.js';
 import { redact, safeErrorMessage } from './redact.js';
 import { assertInstanceId, readRegistry } from './registry.js';
-import { readKeptPreviousRelease, sameSchema } from './rollback.js';
+import { sameSchema } from './rollback.js';
 import {
   hostLogFiles,
   instanceOnecliAdmin,
@@ -212,14 +213,13 @@ interface OperationRecordFacts {
 
 /** An assistant's update or rollback, as the operation record and the registry show it. */
 export type OperationView =
-  | { readonly state: 'none'; readonly abandoned_staging: boolean }
-  | ({ readonly state: 'open' } & OperationRecordFacts & {
+  | { readonly state: 'none' }
+  | ({ readonly state: 'open' | 'failed' } & OperationRecordFacts & {
         readonly continue_with: string;
         readonly revert_with: string | null;
       })
-  | ({ readonly state: 'recorded' } & OperationRecordFacts & {
+  | ({ readonly state: 'committed' } & OperationRecordFacts & {
         readonly follow_ups: readonly OperationFollowUp[];
-        readonly abandoned_staging: boolean;
       })
   | { readonly state: 'unreadable'; readonly code: string; readonly message: string };
 
@@ -395,34 +395,16 @@ type RuntimeRecord =
   | { readonly state: 'missing'; readonly why: string }
   | { readonly state: 'unreadable'; readonly error: unknown };
 
-/** Where an unfinished update or rollback may have the live checkout moved aside, or not yet in place. */
-const SWITCHING: ReadonlySet<OperationPhase> = new Set(['swapping', 'swapped']);
+/** Why the assistant's `state/` holds no runtime record: its create never got as far as its host. */
+const MISSING_RUNTIME = 'The assistant has no runtime record: its host has never been started.';
 
-/**
- * Why the live checkout holds no runtime record: an update or rollback is
- * switching releases (or a rollback going back is), or the host has never
- * been started.
- */
-function missingRuntime(inspection: OperationInspection): string {
-  if (inspection.state === 'open' && (SWITCHING.has(inspection.record.phase) || inspection.record.returning)) {
-    return `The assistant is mid-switch; ${inspection.next.continueWith} finishes it.`;
-  }
-  return 'The assistant has no runtime record: its host has never been started.';
-}
-
-async function readRuntimeRecord(
-  paths: ControlPlanePaths,
-  reservation: InstanceReservation,
-  inspection: OperationInspection,
-): Promise<RuntimeRecord> {
+async function readRuntimeRecord(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<RuntimeRecord> {
   try {
     const file = paths.runtimeFile(reservation.instance_id);
     return { state: 'recorded', config: await loadInstanceRuntimeConfig(file) };
     // eslint-disable-next-line no-catch-all/no-catch-all -- An unreadable runtime is reported by each probe that needs it.
   } catch (error) {
-    return isErrno(error, 'ENOENT')
-      ? { state: 'missing', why: missingRuntime(inspection) }
-      : { state: 'unreadable', error };
+    return isErrno(error, 'ENOENT') ? { state: 'missing', why: MISSING_RUNTIME } : { state: 'unreadable', error };
   }
 }
 
@@ -461,20 +443,20 @@ function operationFacts(record: OperationRecord): OperationRecordFacts {
 function operationView(inspection: OperationInspection): OperationView {
   switch (inspection.state) {
     case 'none':
-      return { state: 'none', abandoned_staging: inspection.abandonedStaging };
+      return { state: 'none' };
     case 'open':
+    case 'failed':
       return {
-        state: 'open',
+        state: inspection.state,
         ...operationFacts(inspection.record),
         continue_with: inspection.next.continueWith,
         revert_with: inspection.next.revertWith ?? null,
       };
-    case 'recorded':
+    case 'committed':
       return {
-        state: 'recorded',
+        state: 'committed',
         ...operationFacts(inspection.record),
         follow_ups: inspection.record.follow_ups,
-        abandoned_staging: inspection.abandonedStaging,
       };
     case 'unreadable':
       return { state: 'unreadable', code: inspection.code, message: redact(inspection.message) };
@@ -566,7 +548,7 @@ async function checkoutProbe({
   inspection,
   observers,
 }: Subject): Promise<ProbeResult & CheckoutFacts> {
-  const record = inspection.state === 'open' ? inspection.record : undefined;
+  const record = inspection.state === 'open' || inspection.state === 'failed' ? inspection.record : undefined;
   try {
     const commit = await observeLiveCheckout(context.paths, reservation, liveCheckoutCommits(reservation, record), {
       runCommand: observers.runCommand,
@@ -957,33 +939,34 @@ function schemaView(read: SchemaRead): SchemaView {
 }
 
 /**
- * The kept previous release, and whether either schema moved since it (R13,
- * R15), decided as `rollback` decides it. It is available exactly when
- * `rollback` would take it: kept whole, with its manifest naming this
- * assistant and its marker's release.
+ * The rollback point, and whether either schema moved since its snapshot
+ * (R3), decided as `rollback` decides it, from the schema the rollback point
+ * records. It is available exactly when the assistant has one.
  */
-async function observeRollback({ context, reservation, observers }: Subject, live: SchemaRead): Promise<RollbackView> {
-  const previous = context.paths.releaseCheckoutRoot(reservation.instance_id, 'previous');
-  let commit: string;
+async function observeRollback({ context, reservation }: Subject, live: SchemaRead): Promise<RollbackView> {
+  let point;
   try {
-    commit = (await readKeptPreviousRelease(context.paths, reservation.instance_id)).release.deployed_commit;
-    // eslint-disable-next-line no-catch-all/no-catch-all -- A previous release that cannot be read is reported, never thrown.
+    point = await readRollbackPoint(context.paths, reservation.instance_id);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- A rollback point that cannot be read is reported, never thrown.
   } catch (error) {
     return { available: false, previous_commit: null, schema_moved: null, reason: failure(error).reason };
   }
-  const unknownMove = (error: unknown): RollbackView => ({
-    available: true,
-    previous_commit: commit,
-    schema_moved: null,
-    reason: failure(error).reason,
-  });
-  if ('error' in live) return unknownMove(live.error);
-  const kept = readSchema(observers, previous);
-  if ('error' in kept) return unknownMove(kept.error);
+  if (!point) {
+    return {
+      available: false,
+      previous_commit: null,
+      schema_moved: null,
+      reason: `Assistant ${reservation.instance_id} keeps no rollback point, so there is nothing to roll back to.`,
+    };
+  }
+  const commit = point.release.deployed_commit;
+  if ('error' in live) {
+    return { available: true, previous_commit: commit, schema_moved: null, reason: failure(live.error).reason };
+  }
   return {
     available: true,
     previous_commit: commit,
-    schema_moved: sameSchema(live.manifest, kept.manifest) !== 'same',
+    schema_moved: sameSchema(live.manifest, point.manifest) !== 'same',
     reason: null,
   };
 }
@@ -1011,7 +994,7 @@ export async function observeAssistantStatus(
   const observers = resolveObservers(context.observers);
   const inspection = await inspect(context.paths, reservation);
   const [runtime, removal] = await Promise.all([
-    readRuntimeRecord(context.paths, reservation, inspection),
+    readRuntimeRecord(context.paths, reservation),
     removalInProgress(context.paths, instanceId),
   ]);
   const subject: Subject = { context, observers, reservation, inspection, runtime };
@@ -1106,7 +1089,7 @@ export async function listAssistants(context: ObservationContext): Promise<Assis
     reservations.map(async (reservation): Promise<ListedAssistant> => {
       const inspection = await inspect(context.paths, reservation);
       const [runtime, removal, release] = await Promise.all([
-        readRuntimeRecord(context.paths, reservation, inspection),
+        readRuntimeRecord(context.paths, reservation),
         removalInProgress(context.paths, reservation.instance_id),
         observeRelease({ context, reservation, observers }),
       ]);
@@ -1129,10 +1112,12 @@ export async function listAssistants(context: ObservationContext): Promise<Assis
 function operationSummary(operation: OperationView): string {
   switch (operation.state) {
     case 'none':
-      return operation.abandoned_staging ? 'staging left' : '-';
+      return '-';
     case 'open':
       return `${operation.kind} ${operation.phase}`;
-    case 'recorded':
+    case 'failed':
+      return `${operation.kind} failed`;
+    case 'committed':
       return 'follow-ups';
     case 'unreadable':
       return 'unreadable';
@@ -1141,11 +1126,11 @@ function operationSummary(operation: OperationView): string {
 
 /**
  * What an operator is told of an update or rollback left unfinished, naming
- * what continues or reverts it, or of a record that cannot be read: `status`,
- * `list`, and `update --all` word it alike.
+ * what continues or reverts it, of one closed for fix-forward, or of a record
+ * that cannot be read: `status`, `list`, and `update --all` word it alike.
  */
 export function unfinishedOperation(
-  operation: Extract<OperationView, { readonly state: 'open' | 'unreadable' }>,
+  operation: Extract<OperationView, { readonly state: 'open' | 'failed' | 'unreadable' }>,
 ): string {
   switch (operation.state) {
     case 'open': {
@@ -1155,6 +1140,11 @@ export function unfinishedOperation(
         `(${operation.phase}); continue it with ${operation.continue_with}${revert}.`
       );
     }
+    case 'failed':
+      return (
+        `Its ${operation.kind} to ${operation.to.release_track} ${shortCommit(operation.to.deployed_commit)} failed, and so did going back ` +
+        `(${operation.phase}); fix it forward to a newer release with ${operation.continue_with}.`
+      );
     case 'unreadable':
       return `Its update or rollback record cannot be read: ${operation.message}`;
   }
@@ -1166,22 +1156,17 @@ function operationDetail(instanceId: string, operation: OperationView, removal: 
   if (removal) lines.push(`Removal is in progress; finish it with gws-ea remove --id ${instanceId}.`);
   switch (operation.state) {
     case 'none':
-      if (operation.abandoned_staging) {
-        lines.push(`An interrupted update left staging behind; the next gws-ea update --id ${instanceId} removes it.`);
-      }
       break;
     case 'open':
+    case 'failed':
     case 'unreadable':
       lines.push(unfinishedOperation(operation));
       break;
-    case 'recorded':
+    case 'committed':
       lines.push(
-        `Its ${operation.kind} to ${shortCommit(operation.to.deployed_commit)} is recorded, with follow-ups still to run: ` +
+        `Its ${operation.kind} to ${shortCommit(operation.to.deployed_commit)} is committed, with follow-ups still to run: ` +
           `${operation.follow_ups.map((followUp) => followUp.kind).join(', ')}; the next gws-ea ${operation.kind} --id ${instanceId} retries them.`,
       );
-      if (operation.abandoned_staging) {
-        lines.push(`An interrupted update left staging behind; the next gws-ea update --id ${instanceId} removes it.`);
-      }
       break;
   }
   return lines;

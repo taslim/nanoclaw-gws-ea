@@ -1,69 +1,58 @@
 /**
- * The cutover's mechanics, shared by update and rollback. Once an assistant's
- * host is stopped, its checkout is proven quiet (KTD18): nothing runs from it,
- * no container carries its install's label in any state, and no process holds
- * anything under its `data/` open. Its databases are then settled — the
- * central WAL folded into `v2.db`, every hot journal rolled back, without
- * running anything of the release's own — and its state carried, root by
- * root and whole, into the checkout that replaces it (KTD9). The two are
- * swapped by renames that recovery can place from wherever they were cut
- * short, then finish or reverse (KTD1, KTD2): an update's swap, and a
- * rollback's, which also sets the kept release's own state aside rather than
- * overwrite it (KTD19).
+ * What update and rollback share on the release layout (KTD1): the fence, the
+ * one switch, and the host around them.
  *
- * The host side both share lives here too: the service stopped and started
- * through NanoClaw's helpers, agent images looked up by ID, the checks that a
- * started release serves, and the follow-ups a recorded release runs.
+ * The fence stops the assistant's service job and drains its agents, proves
+ * the instance quiet (no process runs from its instance root, no container
+ * carries its install's label, nothing holds anything under its `state/`
+ * open), and removes the live link, so nothing can start a host until a
+ * switch points the link again, not even the service manager after a reboot.
+ * The switch, run only fenced, stamps the target release's upgrade tripwire
+ * with its own script, resets the circuit breaker, applies the files kept
+ * with the release (`applyReleaseFiles`), has the service manager read its
+ * definition, and points the live link at it. Neither moves or copies state.
+ *
+ * The host side lives here too: the service started and checked through
+ * NanoClaw's helpers, the checks that a started release serves, main's
+ * shared skills reconciled (KTD16), and the follow-ups a committed release
+ * runs.
  */
-import { closeSync, constants as fsConstants, lstatSync, openSync, readdirSync, readSync, type Stats } from 'node:fs';
-import {
-  chmod,
-  copyFile,
-  lchown,
-  lstat,
-  lutimes,
-  mkdir,
-  readdir,
-  readFile,
-  readlink,
-  rename,
-  rm,
-  symlink,
-  utimes,
-} from 'node:fs/promises';
+import { lstat, readdir, readFile, readlink, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import Database from 'better-sqlite3';
-
 import { isErrno } from '../community-portal/errors.js';
 import { getInstallScopedNames } from '../install-slug.js';
-import { moveHoldingImages, releaseImage, taggedImageId, type ImageDocker } from './agent-image.js';
+import { removeReleaseImage, reclaimImage } from './agent-image-release.js';
+import { taggedImageId, type ImageDocker } from './agent-image.js';
 import { observeLiveCheckout } from './checkout.js';
 import { observeManagedGchatRoute, verifyExistingGchatRoute } from './endpoint.js';
 import { runStep, type StepReporter } from './events.js';
 import { loadCreatedRuntime, type InstanceOperation } from './journal.js';
-import { keptReleaseFiles, stagedKeptFilesRoot } from './kept-release.js';
 import { runInstanceNclJson, type InstanceNclOptions } from './ncl.js';
-import { applyReleaseGateway, observeOnecliRuntime, restoreReleaseGateway, verifyOnecliRuntime } from './onecli.js';
+import { observeOnecliRuntime, reconcileOnecliRuntime } from './onecli.js';
 import type { OnecliPins, OnecliRuntimeLayout } from './onecli-compose.js';
 import {
+  addFollowUps,
   completeFollowUp,
-  followUpKey,
   readOperationRecord,
-  type MovedImage,
+  readRollbackPoint,
   type OperationFollowUp,
+  type OperationStop,
 } from './operation.js';
-import { instanceMarkerFile, isWithinDirectory, type ControlPlanePaths, type ReleaseSlot } from './paths.js';
+import { isWithinDirectory, type ControlPlanePaths } from './paths.js';
 import type { Observation } from './phases.js';
 import { pollUntil } from './poll.js';
 import { buildToolEnvironment, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { instanceOnecliLayout } from './provision.js';
 import { redact, safeErrorMessage } from './redact.js';
-import { getInstanceReservation, readInstanceMarkerFile } from './registry.js';
-import { readOwnerOnlyFile, readOwnerOnlyJson, writePrivateTextFile } from './secrets.js';
+import { getInstanceReservation } from './registry.js';
+import { fence, pointCurrent, pruneInstance, readCurrent, releaseName, type InstanceLayout } from './release-layout.js';
+import { applyReleaseFiles } from './release-stage.js';
 import {
   loadInstanceRuntimeConfig,
+  reloadInstanceService,
+  stampUpgradeState,
   type HostStatusHelpers,
   type InstanceRuntimeConfig,
   type InstanceServiceDependencies,
@@ -77,47 +66,21 @@ import {
   type ServiceControlOptions,
 } from './service-control.js';
 import { instanceServicePlatform } from './service-coordinates.js';
-import { GwsEaError, releaseOf, shortCommit, type InstanceReservation, type ReleaseCoordinates } from './types.js';
-import { isRecord } from './validation.js';
-import { readDerivedImageGroups } from './verify.js';
-
-/**
- * What a cutover carries from the outgoing checkout into the incoming one:
- * the roots NanoClaw's own update treats as install state (`MUTABLE_PATHS` in
- * scripts/update/transaction.ts, which src/ cannot import) and the host's
- * logs. cutover.test.ts fails if NanoClaw's list gains a root this one lacks.
- */
-export const CARRIED_ROOTS = ['.env', 'data', 'groups', 'store', 'start-nanoclaw.sh', 'nanoclaw.pid', 'logs'] as const;
-
-/**
- * State under a carried root that stays with its release: its marker and
- * runtime record, which the incoming release gets fresh, and the circuit
- * breaker, which counts only the outgoing release's crashes and could keep
- * the incoming host asleep past its verification. Sockets are never copied.
- */
-const RELEASE_BOUND_STATE: ReadonlySet<string> = new Set([
-  path.join('data', 'gws-ea', 'instance.json'),
-  path.join('data', 'gws-ea', 'runtime.json'),
-  path.join('data', 'circuit-breaker.json'),
-]);
+import { GwsEaError, shortCommit, type InstanceReservation, type ReleaseCoordinates } from './types.js';
+import { isRecord, unwrapData } from './validation.js';
+import { hostLeaseLive, readDerivedImageGroups } from './verify.js';
 
 /** How long containers the drain stopped may take to be removed (`--rm` removes them after they exit). */
 const CONTAINER_POLL_MS = 1_000;
 const CONTAINER_LIMIT_MS = 30_000;
 const PROBE_TIMEOUT_MS = 60_000;
 
-async function lstatIfPresent(target: string): Promise<Stats | undefined> {
-  try {
-    return await lstat(target);
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) return undefined;
-    throw error;
-  }
-}
-
-/** The checkout a cutover proves quiet, with what Docker needs to look for its containers. */
-export interface QuietCheckout {
-  readonly checkoutRoot: string;
+/** The instance a fence proves quiet, with what Docker needs to look for its containers. */
+export interface QuietInstance {
+  /** `<state root>/<hex8>`: every release, its state, and its records. */
+  readonly instanceRoot: string;
+  /** The physical `state/`, which no process may hold open. */
+  readonly state: string;
   readonly installId: string;
   readonly homeDirectory: string;
   readonly dockerEndpoint: string;
@@ -151,23 +114,23 @@ function isInside(file: string, directory: string): boolean {
 }
 
 /**
- * Processes whose arguments name a path inside the checkout: its host, its
- * `ncl`, a script run from it. One only reading its logs (`gws-ea logs
- * --follow`) touches no state. A tool started with relative paths names none,
- * which is what the open-file check is for.
+ * Processes whose arguments name a path inside the instance root: its host,
+ * its `ncl`, a script run from a release. One only reading the host's logs
+ * (`gws-ea logs --follow`) touches no state. A tool started with relative
+ * paths names none, which is what the open-file check is for.
  */
 async function processesRunningFrom(
-  checkoutRoot: string,
+  instanceRoot: string,
   seams: QuiescenceSeams,
 ): Promise<Array<{ readonly pid: number; readonly args: string }>> {
   const { stdout } = await (seams.runCommand ?? runSanitizedCommand)({
     command: 'ps',
     args: ['-A', '-ww', '-o', 'pid=', '-o', 'args='],
-    cwd: path.dirname(checkoutRoot),
+    cwd: path.dirname(instanceRoot),
     env: toolEnvironment(seams),
     timeoutMs: PROBE_TIMEOUT_MS,
   });
-  const inside = `${checkoutRoot}${path.sep}`;
+  const inside = `${instanceRoot}${path.sep}`;
   const logs = `${inside}logs${path.sep}`;
   const found: Array<{ pid: number; args: string }> = [];
   for (const line of stdout.split('\n')) {
@@ -182,13 +145,13 @@ async function processesRunningFrom(
 }
 
 /** Every container carrying the install's label, in any state. */
-async function labeledContainers(checkout: QuietCheckout, seams: QuiescenceSeams): Promise<string[]> {
-  const label = getInstallScopedNames(checkout.installId).containerInstallLabel;
+async function labeledContainers(instance: QuietInstance, seams: QuiescenceSeams): Promise<string[]> {
+  const label = getInstallScopedNames(instance.installId).containerInstallLabel;
   const { stdout } = await (seams.runCommand ?? runSanitizedCommand)({
     command: 'docker',
     args: ['ps', '--all', '--quiet', '--filter', `label=${label}`],
-    cwd: checkout.homeDirectory,
-    env: toolEnvironment(seams, { HOME: checkout.homeDirectory, DOCKER_HOST: checkout.dockerEndpoint }),
+    cwd: instance.homeDirectory,
+    env: toolEnvironment(seams, { HOME: instance.homeDirectory, DOCKER_HOST: instance.dockerEndpoint }),
     timeoutMs: PROBE_TIMEOUT_MS,
   });
   return stdout
@@ -198,28 +161,30 @@ async function labeledContainers(checkout: QuietCheckout, seams: QuiescenceSeams
 }
 
 /**
- * `lsof` on everything under `directory`, in its field output. It exits 1,
- * printing nothing, when nothing there is open; an error it meets instead is
- * reported on stderr, and fails the check.
+ * Run `lsof` with the arguments after it, keeping any status but 1: lsof exits
+ * 1 both when nothing it was asked about is open and, on macOS, once it found
+ * what is open but skipped a process it may not inspect, so that status says
+ * nothing about what it printed.
+ */
+const LSOF = 'lsof "$@"; status=$?; [ "$status" -le 1 ] || exit "$status"';
+
+/**
+ * `lsof` on everything under `directory`, in its field output, read whatever
+ * its status; an error it meets is reported on stderr, and fails the check.
  */
 async function lsofHolders(directory: string, seams: QuiescenceSeams): Promise<OpenFileHolder[]> {
-  let stdout: string;
-  try {
-    ({ stdout } = await (seams.runCommand ?? runSanitizedCommand)({
-      command: 'lsof',
-      args: ['-n', '-P', '-w', '-F', 'pcn', '+D', directory],
-      cwd: directory,
-      env: toolEnvironment(seams),
-      timeoutMs: PROBE_TIMEOUT_MS,
-    }));
-  } catch (error) {
-    const quiet =
-      error instanceof GwsEaError &&
-      error.code === 'command_failed' &&
-      error.details?.exitCode === 1 &&
-      !error.details.stderrTail;
-    if (quiet) return [];
-    throw error;
+  const { stdout, stderr } = await (seams.runCommand ?? runSanitizedCommand)({
+    command: 'sh',
+    args: ['-c', LSOF, 'lsof', '-n', '-P', '-w', '-F', 'pcn', '+D', directory],
+    cwd: directory,
+    env: toolEnvironment(seams),
+    timeoutMs: PROBE_TIMEOUT_MS,
+  });
+  if (stderr.trim()) {
+    throw new GwsEaError(
+      'command_failed',
+      `lsof could not tell what holds ${directory} open: ${redact(stderr.trim())}`,
+    );
   }
   const holders: OpenFileHolder[] = [];
   let pid = 0;
@@ -280,9 +245,9 @@ async function procHolders(directory: string, procRoot: string): Promise<OpenFil
 
 /**
  * Every process holding anything under `directory` open, its working
- * directory included: `lsof` on macOS, the process table on Linux. A WAL
- * checkpoint cannot see an idle connection, and a process matched by its
- * arguments misses one started with relative paths; this sees both.
+ * directory included: `lsof` on macOS, the process table on Linux. A process
+ * matched by its arguments misses one started with relative paths, or an
+ * idle database connection; this sees both.
  */
 export async function openFileHolders(
   directory: string,
@@ -291,14 +256,24 @@ export async function openFileHolders(
   const platform = seams.platform ?? process.platform;
   if (platform === 'darwin') return lsofHolders(directory, seams);
   if (platform === 'linux') return procHolders(directory, seams.procRoot ?? '/proc');
-  throw new GwsEaError('unsupported_platform', `Proving a checkout quiet needs macOS or Linux, not ${platform}`);
+  throw new GwsEaError('unsupported_platform', `Proving an assistant quiet needs macOS or Linux, not ${platform}`);
 }
 
-function notQuiet(checkoutRoot: string, detail: string): GwsEaError {
+function notQuiet(instanceRoot: string, detail: string): GwsEaError {
   return new GwsEaError(
-    'checkout_not_quiet',
-    `The assistant's checkout ${checkoutRoot} is not quiet, so the cutover went no further: ${detail}.`,
+    'instance_not_quiet',
+    `The assistant at ${instanceRoot} is not quiet, so the switch went no further: ${detail}.`,
   );
+}
+
+async function exists(target: string): Promise<boolean> {
+  try {
+    await lstat(target);
+    return true;
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) return false;
+    throw error;
+  }
 }
 
 function abbreviated(args: string): string {
@@ -306,14 +281,15 @@ function abbreviated(args: string): string {
 }
 
 /**
- * Prove a stopped assistant's checkout quiet (KTD18): no process runs from
- * it, no container carries its install's label in any state (those the drain
- * stopped get a moment to be removed), and no process holds anything under
- * its `data/` open, `-wal`, `-shm`, and `-journal` side files included.
- * Refuses, naming what it found, before anything is copied or moved.
+ * Prove a stopped assistant quiet (KTD1): no process runs from its instance
+ * root, no container carries its install's label in any state (those the
+ * drain stopped get a moment to be removed), and no process holds anything
+ * under its `state/` open, a database's `-wal`, `-shm`, and `-journal` side
+ * files included. Refuses, naming what it found, before anything is copied
+ * or moved.
  */
-export async function assertCheckoutQuiet(checkout: QuietCheckout, seams: QuiescenceSeams = {}): Promise<void> {
-  const root = checkout.checkoutRoot;
+export async function assertInstanceQuiet(instance: QuietInstance, seams: QuiescenceSeams = {}): Promise<void> {
+  const root = instance.instanceRoot;
   const running = await processesRunningFrom(root, seams);
   if (running.length > 0) {
     throw notQuiet(
@@ -322,7 +298,7 @@ export async function assertCheckoutQuiet(checkout: QuietCheckout, seams: Quiesc
     );
   }
   const containers = await pollUntil(
-    () => labeledContainers(checkout, seams),
+    () => labeledContainers(instance, seams),
     (ids) => ids.length === 0,
     {
       intervalMs: CONTAINER_POLL_MS,
@@ -333,842 +309,22 @@ export async function assertCheckoutQuiet(checkout: QuietCheckout, seams: Quiesc
   if (containers.length > 0) {
     throw notQuiet(root, `containers ${containers.join(', ')} still carry its install's label`);
   }
-  const data = path.join(root, 'data');
-  if (!(await lstatIfPresent(data))?.isDirectory()) return;
-  const holders = await openFileHolders(data, seams);
+  // A snapshot restore cut short holds `state/` aside whole, until it is finished or gone back from.
+  const holders = (await exists(instance.state)) ? await openFileHolders(instance.state, seams) : [];
   if (holders.length > 0) {
     throw notQuiet(root, holders.map(({ pid, command, file }) => `${command} (PID ${pid}) holds ${file}`).join('; '));
   }
 }
 
-/** How the stopped host left its checkout. */
-export interface SettledCheckout {
-  /** False when the host was killed: its lease is still live, and delays the next host's claims until it expires. */
-  readonly graceful: boolean;
-}
-
-/** SQLite's `wal_checkpoint` answer. */
-interface CheckpointResult {
-  readonly busy: number;
-  readonly log: number;
-  readonly checkpointed: number;
-}
-
-/**
- * Open `file` read-write as SQLite itself, running nothing of the release's:
- * the first read rolls back a hot journal, and a WAL database has its log
- * folded into the main file and truncated. A reader holding the log back
- * leaves busy frames, and is refused rather than waited on; a file SQLite
- * cannot open or settle is refused, naming it.
- */
-function settleDatabase<T>(file: string, read: (database: Database.Database) => T): T {
-  let database: Database.Database | undefined;
-  try {
-    database = new Database(file, { fileMustExist: true, timeout: 0 });
-    database.prepare('SELECT count(*) FROM sqlite_master').get();
-    if (String(database.pragma('journal_mode', { simple: true })) === 'wal') {
-      const [result] = database.pragma('wal_checkpoint(TRUNCATE)') as CheckpointResult[];
-      if (!result || result.busy !== 0) {
-        throw new GwsEaError(
-          'database_busy',
-          `${file} still has a reader holding its log back (${result?.busy ?? 'unknown'} busy), so it cannot be copied whole.`,
-        );
-      }
-    }
-    return read(database);
-  } catch (error) {
-    if (!(error instanceof Database.SqliteError)) throw error;
-    throw new GwsEaError(
-      'database_unreadable',
-      `${file} is not a database SQLite can open (${error.code}: ${error.message}), so it cannot be copied whole.`,
-      { cause: error },
-    );
-  } finally {
-    database?.close();
-  }
-}
-
-/** Whether no host left a live lease: a graceful stop marks its row stopped; a release without leases has none. */
-function hostStoppedGracefully(database: Database.Database, now: string): boolean {
-  const leases = database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'host_instances'").get();
-  if (!leases) return true;
-  return (
-    database
-      .prepare('SELECT 1 FROM host_instances WHERE stopped_at IS NULL AND lease_expires_at > ? LIMIT 1')
-      .get(now) === undefined
-  );
-}
-
-/** The 16 bytes every SQLite database file begins with. */
-const SQLITE_HEADER = Buffer.from('SQLite format 3\0', 'latin1');
-
-/**
- * Whether `file` is a SQLite database: a regular file, never reached through
- * a link, that begins with SQLite's header. Agents write under `data/`, so a
- * name with a side file beside it proves nothing.
- */
-function isSqliteDatabase(file: string): boolean {
-  let descriptor: number;
-  try {
-    if (!lstatSync(file).isFile()) return false;
-    descriptor = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-  } catch (error) {
-    // Gone, or swapped for a link since it was looked at: either way no database is there.
-    if (isErrno(error, 'ENOENT') || isErrno(error, 'ELOOP')) return false;
-    throw error;
-  }
-  try {
-    const header = Buffer.alloc(SQLITE_HEADER.length);
-    return readSync(descriptor, header, 0, header.length, 0) === header.length && header.equals(SQLITE_HEADER);
-  } finally {
-    closeSync(descriptor);
-  }
-}
-
-/** The directories in `directory`, none reached through a link; none when it is gone. */
-function subdirectories(directory: string): string[] {
-  try {
-    return readdirSync(directory, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => path.join(directory, entry.name))
-      .sort();
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) return [];
-    throw error;
-  }
-}
-
-/** Whether a regular `-journal` or `-wal` file lies beside `database`. */
-function hasSideFile(database: string): boolean {
-  return ['-journal', '-wal'].some(
-    (suffix) => lstatSync(`${database}${suffix}`, { throwIfNoEntry: false })?.isFile() === true,
-  );
-}
-
-/**
- * The session mailboxes under the checkout's `data/`,
- * `v2-sessions/<agent group>/<session>/inbound.db` and `outbound.db`, that
- * are SQLite databases with a side file beside them: besides `v2.db`, the
- * only databases there the host owns. Nothing else is looked at.
- */
-function mailboxesWithSideFiles(data: string): string[] {
-  const found: string[] = [];
-  for (const group of subdirectories(path.join(data, 'v2-sessions'))) {
-    for (const session of subdirectories(group)) {
-      for (const name of ['inbound.db', 'outbound.db']) {
-        const mailbox = path.join(session, name);
-        if (hasSideFile(mailbox) && isSqliteDatabase(mailbox)) found.push(mailbox);
-      }
-    }
-  }
-  return found;
-}
-
-/**
- * Settle a quiet checkout's own databases before they are copied (KTD18).
- * It must already be proven quiet (`assertCheckoutQuiet`): nothing holds any
- * of them open. Only SQLite opens them, so no lazy migration runs:
- *
- * - the central `v2.db` always: a TRUNCATE checkpoint folds its WAL in and
- *   must find no busy frames;
- * - each session mailbox with a `-journal` or `-wal` beside it, when it is a
- *   regular file, reached through no link, that begins with SQLite's header:
- *   opened read-write and read once, which rolls back a hot journal and folds
- *   a log in.
- *
- * Either one SQLite cannot open or settle fails the settle, naming it.
- * Nothing else under `data/` is ever opened, whatever its name, contents, or
- * side files: an agent's own database, or a file planted beside a side file,
- * is copied whole by the carry with the side files beside it, and SQLite
- * rolls back its hot journal or replays its log the next time something
- * opens it read-write. Reports whether the host that stopped left its lease
- * stopped.
- */
-export function settleCheckoutDatabases(checkoutRoot: string, now: Date = new Date()): SettledCheckout {
-  const data = path.join(checkoutRoot, 'data');
-  const graceful = settleDatabase(path.join(data, 'v2.db'), (database) =>
-    hostStoppedGracefully(database, now.toISOString()),
-  );
-  for (const mailbox of mailboxesWithSideFiles(data)) settleDatabase(mailbox, () => undefined);
-  return { graceful };
-}
-
-/**
- * A carried root that is a link would be copied as the link, so the kept
- * previous release and the new one would share one state; anything but a
- * file or directory is no state of the install's at all.
- */
-export async function assertCarriable(checkoutRoot: string): Promise<void> {
-  for (const root of CARRIED_ROOTS) {
-    const target = path.join(checkoutRoot, root);
-    const info = await lstatIfPresent(target);
-    if (!info || info.isFile() || info.isDirectory()) continue;
-    throw new GwsEaError(
-      'uncarriable_state',
-      info.isSymbolicLink()
-        ? `${target} is a link, so its copy would share its state with the release kept for rollback; replace it with what it points to, then update.`
-        : `${target} is neither a file nor a directory, so it cannot be carried to the new release.`,
-    );
-  }
-}
-
-/** Keep `source`'s owner, mode, and times on `target`: ownership first, since changing it can clear mode bits. */
-async function preserve(target: string, source: Stats, link: boolean): Promise<void> {
-  const current = await lstat(target);
-  if (current.uid !== source.uid || current.gid !== source.gid) {
-    try {
-      await lchown(target, source.uid, source.gid);
-    } catch (error) {
-      if (!isErrno(error, 'EPERM')) throw error;
-      throw new GwsEaError(
-        'uncarriable_state',
-        `${target} could not be given the owner of the state it copies (${source.uid}:${source.gid}), so the new release would not read it as the previous one did.`,
-        { cause: error },
-      );
-    }
-  }
-  if (link) {
-    await lutimes(target, source.atime, source.mtime);
-    return;
-  }
-  await chmod(target, source.mode & 0o7777);
-  await utimes(target, source.atime, source.mtime);
-}
-
-/**
- * Copy one entry of a carried root. Files are cloned where the filesystem
- * can (APFS, Btrfs, XFS), which keeps the offline window short; a directory
- * is made owner-writable while it fills, then given its own mode.
- */
-async function copyEntry(source: string, destination: string, relative: string): Promise<void> {
-  if (RELEASE_BOUND_STATE.has(relative)) return;
-  const info = await lstat(source);
-  if (info.isDirectory()) {
-    await mkdir(destination, { mode: 0o700 });
-    for (const name of await readdir(source)) {
-      await copyEntry(path.join(source, name), path.join(destination, name), path.join(relative, name));
-    }
-    await preserve(destination, info, false);
-  } else if (info.isSymbolicLink()) {
-    await symlink(await readlink(source), destination);
-    await preserve(destination, info, true);
-  } else if (info.isFile()) {
-    await copyFile(source, destination, fsConstants.COPYFILE_FICLONE | fsConstants.COPYFILE_EXCL);
-    await preserve(destination, info, false);
-  }
-  // A socket, pipe, or device belongs to a process that ran, not to the install's state.
-}
-
-/**
- * Carry the outgoing checkout's state into the incoming one (KTD9): each
- * carried root is copied whole into a build area beside the incoming
- * checkout, then replaces its counterpart there whole. Nothing is merged, so
- * a stale `-wal` or `-journal` the incoming checkout held can never be
- * replayed onto a copied database; the outgoing checkout is only read, so it
- * stays the snapshot the previous release is kept as. A carry cut short is
- * started again from scratch.
- */
-export async function carryState(fromCheckout: string, toCheckout: string): Promise<void> {
-  await assertCarriable(fromCheckout);
-  const building = path.join(path.dirname(toCheckout), 'carrying');
-  await rm(building, { recursive: true, force: true });
-  await mkdir(building, { mode: 0o700 });
-  for (const root of CARRIED_ROOTS) {
-    const source = path.join(fromCheckout, root);
-    const built = path.join(building, root);
-    const destination = path.join(toCheckout, root);
-    const present = (await lstatIfPresent(source)) !== undefined;
-    if (present) await copyEntry(source, built, root);
-    await rm(destination, { recursive: true, force: true });
-    if (present) await rename(built, destination);
-  }
-  await rm(building, { recursive: true, force: true });
-}
-
-/** The two commits a swap exchanges. */
-export interface SwapReleases {
-  readonly from: string;
-  readonly to: string;
-}
-
-/** Boundary seams; each defaults to the real one. */
-export interface SwapSeams {
-  readonly rename?: (from: string, to: string) => Promise<void>;
-}
-
-/**
- * How far a swap got, each stage one rename further (the last removes the
- * emptied `next/`): `ready` → the kept previous release set aside → the live
- * release's files kept in `previous/` → the live checkout moved into it → the
- * staged checkout moved live → its receipt promoted → `next/` removed.
- */
-const SWAP_STAGES = [
-  'ready',
-  'set_aside',
-  'kept',
-  'live_moved',
-  'staged_moved',
-  'receipt_promoted',
-  'swapped',
-] as const;
-type SwapStage = (typeof SWAP_STAGES)[number];
-
-interface SwapPlaces {
-  readonly live: string;
-  readonly liveReceipt: string;
-  readonly next: string;
-  readonly staged: string;
-  readonly stagedReceipt: string;
-  readonly kept: string;
-  readonly previous: string;
-  readonly previousCheckout: string;
-  readonly superseded: string;
-}
-
-/** What is where: each checkout's marker commit, which directories exist, and which receipt the live one is. */
-interface SwapLayout {
-  readonly live: string | undefined;
-  readonly liveReceipt: string | undefined;
-  readonly next: boolean;
-  readonly staged: string | undefined;
-  readonly stagedReceipt: boolean;
-  readonly kept: boolean;
-  readonly previous: boolean;
-  readonly previousCheckout: string | undefined;
-  readonly superseded: boolean;
-}
-
-/** The receipt the swap keeps for its live checkout. Deleted with the swap (U11). */
-export function swapLiveReceipt(paths: ControlPlanePaths, instanceId: string): string {
-  return path.join(paths.instanceRoot(instanceId), 'release-preflight.json');
-}
-
-/** The receipt the swap keeps beside a release slot. Deleted with the swap (U11). */
-export function swapSlotReceipt(paths: ControlPlanePaths, instanceId: string, slot: ReleaseSlot): string {
-  return path.join(paths.releaseRoot(instanceId, slot), 'release-preflight.json');
-}
-
-/** The commit the swap's marker in `checkout` names, which only the swap still writes. Deleted with the swap (U11). */
-export async function swapMarkerCommit(checkout: string): Promise<string> {
-  const file = instanceMarkerFile(checkout);
-  await readInstanceMarkerFile(file);
-  const marker = await readOwnerOnlyJson(file, 'Instance marker', 'invalid_marker');
-  if (!isRecord(marker) || typeof marker.deployed_commit !== 'string') {
-    throw new GwsEaError('invalid_marker', `${file} names no release.`);
-  }
-  return marker.deployed_commit;
-}
-
-function swapPlaces(paths: ControlPlanePaths, instanceId: string): SwapPlaces {
-  return {
-    live: paths.checkoutRoot(instanceId),
-    liveReceipt: swapLiveReceipt(paths, instanceId),
-    next: paths.releaseRoot(instanceId, 'next'),
-    staged: paths.releaseCheckoutRoot(instanceId, 'next'),
-    stagedReceipt: swapSlotReceipt(paths, instanceId, 'next'),
-    kept: stagedKeptFilesRoot(paths, instanceId),
-    previous: paths.releaseRoot(instanceId, 'previous'),
-    previousCheckout: paths.releaseCheckoutRoot(instanceId, 'previous'),
-    superseded: paths.releaseRoot(instanceId, 'superseded'),
-  };
-}
-
-function layoutFault(message: string): GwsEaError {
-  return new GwsEaError('swap_layout_unknown', message);
-}
-
-/** The commit a checkout's marker names, or undefined when there is no checkout there. */
-async function markerCommit(checkout: string, instanceId: string): Promise<string | undefined> {
-  if (!(await lstatIfPresent(checkout))) return undefined;
-  let marker;
-  try {
-    marker = await readInstanceMarkerFile(instanceMarkerFile(checkout));
-  } catch (error) {
-    if (error instanceof GwsEaError && error.code === 'marker_missing') {
-      throw layoutFault(`${checkout} holds no instance marker, so it is no release of this assistant.`);
-    }
-    throw error;
-  }
-  if (marker.instance_id !== instanceId) throw layoutFault(`${checkout} belongs to another assistant.`);
-  return swapMarkerCommit(checkout);
-}
-
-/** The commit a release receipt names, or undefined when there is none. */
-async function receiptCommit(file: string, instanceId: string): Promise<string | undefined> {
-  if (!(await lstatIfPresent(file))) return undefined;
-  const receipt = await readOwnerOnlyJson(file, 'Release preflight receipt', 'invalid_release_preflight');
-  if (!isRecord(receipt) || receipt.instance_id !== instanceId || typeof receipt.deployed_commit !== 'string') {
-    throw layoutFault(`${file} is not a release receipt of this assistant.`);
-  }
-  return receipt.deployed_commit;
-}
-
-async function observeSwap(places: SwapPlaces, instanceId: string): Promise<SwapLayout> {
-  const present = async (target: string): Promise<boolean> => (await lstatIfPresent(target)) !== undefined;
-  const [live, liveReceipt, next, staged, stagedReceipt, kept, previous, previousCheckout, superseded] =
-    await Promise.all([
-      markerCommit(places.live, instanceId),
-      receiptCommit(places.liveReceipt, instanceId),
-      present(places.next),
-      markerCommit(places.staged, instanceId),
-      present(places.stagedReceipt),
-      present(places.kept),
-      present(places.previous),
-      markerCommit(places.previousCheckout, instanceId),
-      present(places.superseded),
-    ]);
-  return { live, liveReceipt, next, staged, stagedReceipt, kept, previous, previousCheckout, superseded };
-}
-
-/**
- * The stage a layout is at, or undefined for one no swap leaves. Up to the
- * staged checkout's move, the live checkout and receipt are the outgoing
- * release's and the staged ones are waiting in `next/`; from then on, the
- * outgoing checkout is `previous/nanoclaw`. A live receipt missing beside a
- * staged one is where a reversal had moved it back and not yet restored its
- * own.
- */
-function swapStage(layout: SwapLayout, { from, to }: SwapReleases): SwapStage | undefined {
-  const receiptsWaiting = layout.stagedReceipt && layout.liveReceipt === from;
-  if (layout.live === from) {
-    if (layout.staged !== to || !receiptsWaiting) return undefined;
-    if (!layout.kept) return layout.previous && layout.previousCheckout === undefined ? 'kept' : undefined;
-    if (layout.superseded) return layout.previous ? undefined : 'set_aside';
-    return layout.previousCheckout === from || layout.previousCheckout === to ? undefined : 'ready';
-  }
-  if (layout.kept || layout.previousCheckout !== from) return undefined;
-  if (layout.live === undefined) return layout.staged === to && receiptsWaiting ? 'live_moved' : undefined;
-  if (layout.live !== to || layout.staged !== undefined) return undefined;
-  if (layout.stagedReceipt) {
-    return layout.liveReceipt === from || layout.liveReceipt === undefined ? 'staged_moved' : undefined;
-  }
-  if (layout.liveReceipt !== to) return undefined;
-  return layout.next ? 'receipt_promoted' : 'swapped';
-}
-
-function describeLayout(layout: SwapLayout): string {
-  const commit = (value: string | undefined): string => (value === undefined ? 'none' : shortCommit(value));
-  return [
-    `live ${commit(layout.live)}`,
-    `live receipt ${commit(layout.liveReceipt)}`,
-    `staged ${commit(layout.staged)}`,
-    `staged receipt ${layout.stagedReceipt ? 'present' : 'none'}`,
-    `kept files ${layout.kept ? 'staged' : 'not staged'}`,
-    `previous ${layout.previous ? commit(layout.previousCheckout) : 'none'}`,
-    `set-aside previous ${layout.superseded ? 'present' : 'none'}`,
-  ].join(', ');
-}
-
-/** A swap's releases as observed, and the stage (an index of `SWAP_STAGES`) they are at. */
-interface PlacedSwap {
-  readonly places: SwapPlaces;
-  readonly layout: SwapLayout;
-  readonly stage: number;
-}
-
-/** Observe the releases and place them, refusing, before anything moves, a layout no swap step leaves. */
-async function placeSwap(paths: ControlPlanePaths, instanceId: string, releases: SwapReleases): Promise<PlacedSwap> {
-  const places = swapPlaces(paths, instanceId);
-  const layout = await observeSwap(places, instanceId);
-  const stage = swapStage(layout, releases);
-  if (stage === undefined) {
-    throw layoutFault(
-      `Assistant ${instanceId}'s releases are in a layout no swap from ${shortCommit(releases.from)} to ${shortCommit(releases.to)} leaves (${describeLayout(layout)}); nothing was moved.`,
-    );
-  }
-  return { places, layout, stage: SWAP_STAGES.indexOf(stage) };
-}
-
-/**
- * Swap the live release for the staged one (KTD1), from whatever stage an
- * interrupted swap reached: a kept previous release is set aside as
- * `superseded/` (deleted only once the update is recorded, KTD19), the live
- * release's kept files become `previous/`, the live checkout moves into it,
- * the staged checkout moves live, its receipt is promoted, and the emptied
- * `next/` is removed. The checkout path never changes.
- */
-export async function finishSwap(
-  paths: ControlPlanePaths,
-  instanceId: string,
-  releases: SwapReleases,
-  seams: SwapSeams = {},
-): Promise<void> {
-  const move = seams.rename ?? rename;
-  const { places, layout, stage } = await placeSwap(paths, instanceId, releases);
-  const before = (step: SwapStage): boolean => stage < SWAP_STAGES.indexOf(step);
-  if (before('set_aside') && layout.previous) await move(places.previous, places.superseded);
-  if (before('kept')) await move(places.kept, places.previous);
-  if (before('live_moved')) await move(places.live, places.previousCheckout);
-  if (before('staged_moved')) await move(places.staged, places.live);
-  if (before('receipt_promoted')) await move(places.stagedReceipt, places.liveReceipt);
-  if (before('swapped')) await rm(places.next, { recursive: true, force: true });
-}
-
-/**
- * Undo a swap from whatever stage it, or an interrupted reversal, reached,
- * back to where it started: the outgoing release live with its own receipt,
- * the staged release and its receipt in `next/` beside the outgoing release's
- * kept files, and any set-aside previous release back in `previous/`.
- */
-export async function reverseSwap(
-  paths: ControlPlanePaths,
-  instanceId: string,
-  releases: SwapReleases,
-  seams: SwapSeams = {},
-): Promise<void> {
-  await reversePlacedSwap(await placeSwap(paths, instanceId, releases), seams);
-}
-
-/**
- * Take back a swap cut short before it moved the live checkout, and say
- * whether it was. Until then the live path still holds the outgoing release,
- * which the OS may have started again since, recording what the carry never
- * took; so the swap is undone, and the stop and carry run again (KTD2). Once
- * the live checkout moved, whatever ran from the live path ran on the carried
- * state, and the swap is left to be finished.
- */
-export async function reverseSwapBeforeLiveMoved(
-  paths: ControlPlanePaths,
-  instanceId: string,
-  releases: SwapReleases,
-  seams: SwapSeams = {},
-): Promise<boolean> {
-  const placed = await placeSwap(paths, instanceId, releases);
-  if (placed.stage >= SWAP_STAGES.indexOf('live_moved')) return false;
-  await reversePlacedSwap(placed, seams);
-  return true;
-}
-
-async function reversePlacedSwap({ places, layout, stage }: PlacedSwap, seams: SwapSeams): Promise<void> {
-  const move = seams.rename ?? rename;
-  const reached = (step: SwapStage): boolean => stage >= SWAP_STAGES.indexOf(step);
-  if (reached('swapped')) await mkdir(places.next, { mode: 0o700 });
-  if (reached('receipt_promoted')) await move(places.liveReceipt, places.stagedReceipt);
-  if (reached('receipt_promoted') || (reached('staged_moved') && layout.liveReceipt === undefined)) {
-    await writePrivateTextFile(places.liveReceipt, await readOwnerOnlyFile(keptReleaseFiles(places.previous).receipt));
-  }
-  if (reached('staged_moved')) await move(places.live, places.staged);
-  if (reached('live_moved')) await move(places.previousCheckout, places.live);
-  if (reached('kept')) await move(places.previous, places.kept);
-  if (reached('set_aside') && layout.superseded) await move(places.superseded, places.previous);
-}
-
-/** Where a rollback's outgoing release keeps what the release it restores left behind (`outgoing/restored/`). */
-export function restoredReleaseRoot(paths: ControlPlanePaths, instanceId: string): string {
-  return path.join(paths.releaseRoot(instanceId, 'outgoing'), 'restored');
-}
-
-/** Where a kept release's own state is set aside while another is carried into its checkout. */
-export function setAsideStateRoot(releaseRoot: string): string {
-  return path.join(releaseRoot, 'state');
-}
-
-/**
- * Set a kept release's own state aside, root by root, so another can be
- * carried into its checkout without overwriting it (KTD19). The roots gather
- * in a building area that is renamed into place once all of them are there;
- * nothing is carried in before, so every carried root still in the checkout
- * is its own, and an interrupted set-aside simply goes on.
- */
-export async function setAsideState(checkoutRoot: string, stateRoot: string): Promise<void> {
-  if (await lstatIfPresent(stateRoot)) return;
-  const building = `${stateRoot}.building`;
-  await mkdir(building, { recursive: true, mode: 0o700 });
-  for (const root of CARRIED_ROOTS) {
-    const source = path.join(checkoutRoot, root);
-    if (await lstatIfPresent(source)) await rename(source, path.join(building, root));
-  }
-  await rename(building, stateRoot);
-}
-
-/** The records that name a checkout's release, which a carry leaves out: its marker and runtime record. */
-const RELEASE_RECORDS = [path.join('data', 'gws-ea', 'instance.json'), path.join('data', 'gws-ea', 'runtime.json')];
-
-/** Copy a release's own marker and runtime record from its set-aside state into its checkout. */
-export async function copyReleaseRecords(stateRoot: string, checkoutRoot: string): Promise<void> {
-  for (const record of RELEASE_RECORDS) {
-    const source = path.join(stateRoot, record);
-    if (!(await lstatIfPresent(source))) continue;
-    const destination = path.join(checkoutRoot, record);
-    await mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
-    await writePrivateTextFile(destination, await readOwnerOnlyFile(source));
-  }
-}
-
-/**
- * Put a kept release's own state back in its checkout, replacing whatever was
- * carried in, from wherever the set-aside or an earlier restore stopped. A
- * set-aside that never finished had nothing carried in, so its roots move
- * back; a finished one is copied back whole, like any carry, with the
- * release's own marker and runtime record, and only then discarded, so an
- * interrupted restore starts over from state that is still whole.
- */
-export async function restoreSetAsideState(checkoutRoot: string, stateRoot: string): Promise<void> {
-  const building = `${stateRoot}.building`;
-  if (await lstatIfPresent(building)) {
-    for (const root of CARRIED_ROOTS) {
-      const moved = path.join(building, root);
-      if (await lstatIfPresent(moved)) await rename(moved, path.join(checkoutRoot, root));
-    }
-    await rm(building, { recursive: true, force: true });
-  }
-  const discarded = `${stateRoot}.discarded`;
-  if (await lstatIfPresent(stateRoot)) {
-    await carryState(stateRoot, checkoutRoot);
-    await copyReleaseRecords(stateRoot, checkoutRoot);
-    await rename(stateRoot, discarded);
-  }
-  await rm(discarded, { recursive: true, force: true });
-}
-
-/** The two commits a rollback exchanges, and whether it puts back a previous release its update set aside. */
-export interface RollbackReleases extends SwapReleases {
-  /**
-   * The rollback reverts an update that was never recorded: the previous
-   * release that update set aside at its swap is the rollback point again.
-   */
-  readonly restoreSetAside: boolean;
-}
-
-/**
- * How far a rollback's swap got, each stage one rename further, starting once
- * the outgoing release's files are kept in `outgoing/`: the outgoing checkout
- * moved there → the restored one moved live → its receipt made the live one →
- * the rest of `previous/` moved to `outgoing/restored/` → a set-aside previous
- * release put back.
- */
-const ROLLBACK_STAGES = [
-  'prepared',
-  'outgoing_moved',
-  'previous_moved',
-  'receipt_restored',
-  'kept_moved',
-  'swapped',
-] as const;
-type RollbackStage = (typeof ROLLBACK_STAGES)[number];
-
-interface RollbackPlaces {
-  readonly live: string;
-  readonly liveReceipt: string;
-  readonly previous: string;
-  readonly previousCheckout: string;
-  readonly previousReceipt: string;
-  readonly outgoing: string;
-  readonly outgoingCheckout: string;
-  readonly restored: string;
-  readonly superseded: string;
-}
-
-interface RollbackLayout {
-  readonly live: string | undefined;
-  readonly liveReceipt: string | undefined;
-  readonly previous: boolean;
-  readonly previousCheckout: string | undefined;
-  readonly previousReceipt: boolean;
-  readonly outgoing: boolean;
-  readonly outgoingCheckout: string | undefined;
-  readonly restored: boolean;
-  readonly superseded: boolean;
-}
-
-function rollbackPlaces(paths: ControlPlanePaths, instanceId: string): RollbackPlaces {
-  const previous = paths.releaseRoot(instanceId, 'previous');
-  return {
-    live: paths.checkoutRoot(instanceId),
-    liveReceipt: swapLiveReceipt(paths, instanceId),
-    previous,
-    previousCheckout: paths.releaseCheckoutRoot(instanceId, 'previous'),
-    previousReceipt: keptReleaseFiles(previous).receipt,
-    outgoing: paths.releaseRoot(instanceId, 'outgoing'),
-    outgoingCheckout: paths.releaseCheckoutRoot(instanceId, 'outgoing'),
-    restored: restoredReleaseRoot(paths, instanceId),
-    superseded: paths.releaseRoot(instanceId, 'superseded'),
-  };
-}
-
-async function observeRollback(places: RollbackPlaces, instanceId: string): Promise<RollbackLayout> {
-  const present = async (target: string): Promise<boolean> => (await lstatIfPresent(target)) !== undefined;
-  const [live, liveReceipt, previous, previousCheckout, previousReceipt, outgoing, outgoingCheckout, restored] =
-    await Promise.all([
-      markerCommit(places.live, instanceId),
-      receiptCommit(places.liveReceipt, instanceId),
-      present(places.previous),
-      markerCommit(places.previousCheckout, instanceId),
-      present(places.previousReceipt),
-      present(places.outgoing),
-      markerCommit(places.outgoingCheckout, instanceId),
-      present(places.restored),
-    ]);
-  const superseded = await present(places.superseded);
-  return {
-    live,
-    liveReceipt,
-    previous,
-    previousCheckout,
-    previousReceipt,
-    outgoing,
-    outgoingCheckout,
-    restored,
-    superseded,
-  };
-}
-
-/**
- * The stage a layout is at, or undefined for one no rollback leaves. Until
- * the restored checkout moves live, the outgoing release's receipt is the
- * live one; a live receipt missing then is where a return moved the restored
- * release's back and had not yet put the outgoing one's in its place.
- */
-function rollbackStage(
-  layout: RollbackLayout,
-  { from, to, restoreSetAside }: RollbackReleases,
-): RollbackStage | undefined {
-  if (!layout.outgoing) return undefined;
-  const untouched = layout.previousCheckout === to && layout.previousReceipt && !layout.restored;
-  if (layout.live === from) {
-    return layout.outgoingCheckout === undefined && untouched && layout.liveReceipt === from ? 'prepared' : undefined;
-  }
-  if (layout.outgoingCheckout !== from) return undefined;
-  if (layout.live === undefined) return untouched && layout.liveReceipt === from ? 'outgoing_moved' : undefined;
-  if (layout.live !== to) return undefined;
-  const emptied = layout.previous && layout.previousCheckout === undefined;
-  if (layout.previousReceipt) {
-    const receipt = layout.liveReceipt === from || layout.liveReceipt === undefined;
-    return emptied && !layout.restored && receipt ? 'previous_moved' : undefined;
-  }
-  if (layout.liveReceipt !== to) return undefined;
-  if (!layout.restored) return emptied ? 'receipt_restored' : undefined;
-  if (!restoreSetAside) return layout.previous ? undefined : 'swapped';
-  if (layout.superseded) return layout.previous ? undefined : 'kept_moved';
-  return layout.previousCheckout !== from && layout.previousCheckout !== to ? 'swapped' : undefined;
-}
-
-function describeRollbackLayout(layout: RollbackLayout): string {
-  const commit = (value: string | undefined): string => (value === undefined ? 'none' : shortCommit(value));
-  return [
-    `live ${commit(layout.live)}`,
-    `live receipt ${commit(layout.liveReceipt)}`,
-    `previous ${layout.previous ? commit(layout.previousCheckout) : 'none'}`,
-    `previous receipt ${layout.previousReceipt ? 'present' : 'none'}`,
-    `outgoing ${layout.outgoing ? commit(layout.outgoingCheckout) : 'none'}`,
-    `restored files ${layout.restored ? 'present' : 'none'}`,
-    `set-aside previous ${layout.superseded ? 'present' : 'none'}`,
-  ].join(', ');
-}
-
-/** A rollback's releases as observed, and the stage (an index of `ROLLBACK_STAGES`) they are at. */
-interface PlacedRollback {
-  readonly places: RollbackPlaces;
-  readonly layout: RollbackLayout;
-  readonly stage: number;
-}
-
-async function placeRollback(
-  paths: ControlPlanePaths,
-  instanceId: string,
-  releases: RollbackReleases,
-): Promise<PlacedRollback> {
-  const places = rollbackPlaces(paths, instanceId);
-  const layout = await observeRollback(places, instanceId);
-  const stage = rollbackStage(layout, releases);
-  if (stage === undefined) {
-    throw layoutFault(
-      `Assistant ${instanceId}'s releases are in a layout no rollback from ${shortCommit(releases.from)} to ${shortCommit(releases.to)} leaves (${describeRollbackLayout(layout)}); nothing was moved.`,
-    );
-  }
-  return { places, layout, stage: ROLLBACK_STAGES.indexOf(stage) };
-}
-
-/**
- * Swap the live release for the kept previous one (KTD19), from whatever
- * stage an interrupted swap reached, once the outgoing release's files are
- * kept in `outgoing/`: the live checkout moves to `outgoing/nanoclaw` whole,
- * the previous checkout moves live and its receipt becomes the live one, what
- * else `previous/` held moves to `outgoing/restored/`, and a previous release
- * the reverted update had set aside is put back. The checkout path never
- * changes.
- */
-export async function finishRollbackSwap(
-  paths: ControlPlanePaths,
-  instanceId: string,
-  releases: RollbackReleases,
-  seams: SwapSeams = {},
-): Promise<void> {
-  const move = seams.rename ?? rename;
-  const { places, layout, stage } = await placeRollback(paths, instanceId, releases);
-  const before = (step: RollbackStage): boolean => stage < ROLLBACK_STAGES.indexOf(step);
-  if (before('outgoing_moved')) await move(places.live, places.outgoingCheckout);
-  if (before('previous_moved')) await move(places.previousCheckout, places.live);
-  if (before('receipt_restored')) await move(places.previousReceipt, places.liveReceipt);
-  if (before('kept_moved')) await move(places.previous, places.restored);
-  if (before('swapped') && releases.restoreSetAside && layout.superseded)
-    await move(places.superseded, places.previous);
-}
-
-/**
- * Undo a rollback's swap from whatever stage it, or an interrupted return,
- * reached: the outgoing release live again with its own receipt, the restored
- * one back in `previous/` with its receipt and files, and a set-aside previous
- * release put back aside.
- */
-export async function reverseRollbackSwap(
-  paths: ControlPlanePaths,
-  instanceId: string,
-  releases: RollbackReleases,
-  seams: SwapSeams = {},
-): Promise<void> {
-  await reversePlacedRollbackSwap(await placeRollback(paths, instanceId, releases), releases, seams);
-}
-
-/**
- * Take back a rollback's swap cut short before it moved the live checkout,
- * and say whether it was. Until then the release the rollback leaves is still
- * at the live path, where the OS may have started it again since, so the
- * rollback is decided and prepared again (KTD2, KTD5). Once the live checkout
- * moved, the swap is left to be finished or gone back from.
- */
-export async function reverseRollbackSwapBeforeLiveMoved(
-  paths: ControlPlanePaths,
-  instanceId: string,
-  releases: RollbackReleases,
-  seams: SwapSeams = {},
-): Promise<boolean> {
-  const placed = await placeRollback(paths, instanceId, releases);
-  if (placed.stage >= ROLLBACK_STAGES.indexOf('outgoing_moved')) return false;
-  await reversePlacedRollbackSwap(placed, releases, seams);
-  return true;
-}
-
-async function reversePlacedRollbackSwap(
-  { places, layout, stage }: PlacedRollback,
-  releases: RollbackReleases,
-  seams: SwapSeams,
-): Promise<void> {
-  const move = seams.rename ?? rename;
-  const reached = (step: RollbackStage): boolean => stage >= ROLLBACK_STAGES.indexOf(step);
-  if (reached('swapped') && releases.restoreSetAside && layout.previous) await move(places.previous, places.superseded);
-  if (reached('kept_moved')) await move(places.restored, places.previous);
-  if (reached('receipt_restored')) await move(places.liveReceipt, places.previousReceipt);
-  if (reached('receipt_restored') || (reached('previous_moved') && layout.liveReceipt === undefined)) {
-    await writePrivateTextFile(places.liveReceipt, await readOwnerOnlyFile(keptReleaseFiles(places.outgoing).receipt));
-  }
-  if (reached('previous_moved')) await move(places.live, places.previousCheckout);
-  if (reached('outgoing_moved')) await move(places.outgoingCheckout, places.live);
-}
-
-// The host side of a cutover, shared by update and rollback: the assistant's service stopped and started through
-// NanoClaw's helpers, its agent images, its credential gateway, the checks that a release serves, and the
-// follow-ups that run once a release is recorded.
-
-/** OneCLI as a cutover moves and checks it; each step defaults to the real one. */
+/** OneCLI as a switch's host checks it; each step defaults to the real one. */
 export interface CutoverOnecli {
-  /** Recreate the gateway at the image the release an update deploys builds (KTD8). */
-  apply(layout: OnecliRuntimeLayout, pins: OnecliPins): Promise<void>;
-  /** Put a kept release's Compose file back and recreate the gateway it names (KTD8). */
-  restore(layout: OnecliRuntimeLayout, pins: OnecliPins, compose: string): Promise<void>;
-  /** Its health and versions, and the isolation probe through the gateway: after the gateway changed. */
-  verify(layout: OnecliRuntimeLayout, pins: OnecliPins): Promise<void>;
-  /** Its health alone: when the gateway did not change. */
+  /**
+   * Re-verify the serving runtime before the fence (KTD15): observed by
+   * Compose's config hash, provenance, and ownership; anything but present is
+   * repaired by Compose, and probed for isolation, as create's repair is.
+   */
+  reverify(layout: OnecliRuntimeLayout, pins: OnecliPins): Promise<void>;
+  /** Its health alone, once a release serves. */
   observe(layout: OnecliRuntimeLayout, pins: OnecliPins): Promise<Observation>;
 }
 
@@ -1189,8 +345,6 @@ export interface CutoverSeams {
     args: readonly string[],
     options?: InstanceNclOptions,
   ) => Promise<unknown>;
-  /** Renames the swap makes. */
-  readonly rename?: (from: string, to: string) => Promise<void>;
 }
 
 /** What a cutover needs from the driver, and its seams. */
@@ -1212,8 +366,9 @@ export interface CutoverHost {
   readonly run: SanitizedCommandRunner;
   /** The registry's reservation, which names the release the cutover moves from until its commit point. */
   readonly reservation: InstanceReservation;
-  /** The assistant's runtime: its checkout path, install, home, and Docker endpoint are the same on every release. */
+  /** The assistant's runtime, the same on every release. */
   readonly runtime: InstanceRuntimeConfig;
+  readonly layout: InstanceLayout;
   readonly onecli: OnecliRuntimeLayout;
   readonly service: InstanceServiceControl;
   readonly uid: number | undefined;
@@ -1231,7 +386,7 @@ async function readCutoverRuntime(
   return runtime;
 }
 
-/** Read what one cutover works from: the reservation, the runtime some release holds, and its service. */
+/** Read what one cutover works from: the reservation, the runtime, the layout, and the service. */
 export async function openCutoverHost(
   operation: InstanceOperation,
   dependencies: CutoverDependencies,
@@ -1245,6 +400,7 @@ export async function openCutoverHost(
     run: dependencies.runCommand ?? runSanitizedCommand,
     reservation,
     runtime,
+    layout: operation.paths.instanceLayout(operation.instanceId),
     onecli: instanceOnecliLayout(operation.paths, reservation, runtime.docker_endpoint),
     service: createServiceControl(dependencies.serviceHelpers, runtimeServiceTarget(runtime), dependencies.service),
     uid: dependencies.service?.uid ?? process.getuid?.(),
@@ -1252,21 +408,22 @@ export async function openCutoverHost(
 }
 
 /** How every cutover wait sleeps. */
-export function cutoverSleep({ dependencies }: CutoverHost): (milliseconds: number) => Promise<void> {
+function cutoverSleep({ dependencies }: CutoverHost): (milliseconds: number) => Promise<void> {
   return dependencies.service?.sleep ?? ((milliseconds) => delay(milliseconds));
 }
 
-/** The checkout at `checkoutRoot` as the quiescence proof looks for it. */
-export function quietCheckoutOf(host: CutoverHost, checkoutRoot: string): QuietCheckout {
+/** The instance as the quiescence proof looks for it. */
+function quietInstanceOf(host: CutoverHost): QuietInstance {
   return {
-    checkoutRoot,
+    instanceRoot: host.layout.root,
+    state: host.layout.state,
     installId: host.runtime.install_id,
     homeDirectory: host.runtime.home_directory,
     dockerEndpoint: host.runtime.docker_endpoint,
   };
 }
 
-export function cutoverQuiescence({ run, dependencies }: CutoverHost): QuiescenceSeams {
+function cutoverQuiescence({ run, dependencies }: CutoverHost): QuiescenceSeams {
   return {
     runCommand: run,
     ...(dependencies.service?.platform ? { platform: dependencies.service.platform } : {}),
@@ -1275,8 +432,8 @@ export function cutoverQuiescence({ run, dependencies }: CutoverHost): Quiescenc
   };
 }
 
-/** What writing the assistant's service definition needs. */
-export function cutoverServiceDependencies(host: CutoverHost): InstanceServiceDependencies {
+/** What installing the assistant's service definition needs. */
+function cutoverServiceDependencies(host: CutoverHost): InstanceServiceDependencies {
   const { dependencies, runtime, uid } = host;
   return {
     platform: instanceServicePlatform(dependencies.service?.platform),
@@ -1288,21 +445,25 @@ export function cutoverServiceDependencies(host: CutoverHost): InstanceServiceDe
   };
 }
 
-export function cutoverOnecli({ run, dependencies }: CutoverHost): CutoverOnecli {
-  const boundaries = {
+function onecliBoundaries({ run, dependencies }: CutoverHost) {
+  return {
     dockerCommandRunner: run,
     ...(dependencies.ambientEnv ? { ambientEnv: dependencies.ambientEnv } : {}),
+  };
+}
+
+export function cutoverOnecli(host: CutoverHost): CutoverOnecli {
+  const { dependencies } = host;
+  const boundaries = {
+    ...onecliBoundaries(host),
     ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
   };
   return {
-    apply: dependencies.onecli?.apply ?? ((layout, pins) => applyReleaseGateway(layout, pins, boundaries)),
-    restore:
-      dependencies.onecli?.restore ??
-      ((layout, pins, compose) => restoreReleaseGateway(layout, pins, compose, boundaries)),
-    verify:
-      dependencies.onecli?.verify ??
+    reverify:
+      dependencies.onecli?.reverify ??
       (async (layout, pins) => {
-        await verifyOnecliRuntime(layout, pins, boundaries);
+        if ((await observeOnecliRuntime(layout, pins, boundaries)).status === 'present') return;
+        await reconcileOnecliRuntime(layout, pins, boundaries);
       }),
     observe: dependencies.onecli?.observe ?? ((layout, pins) => observeOnecliRuntime(layout, pins, boundaries)),
   };
@@ -1319,133 +480,109 @@ export function dockerEnvironment(
   });
 }
 
-/** What running Docker for one assistant takes: the assistant, its runtime, and the runner and seams to use. */
-export type AssistantDocker = Pick<CutoverHost, 'operation' | 'runtime' | 'run' | 'dependencies'>;
-
-export function cutoverDocker(host: AssistantDocker, args: readonly string[]) {
-  return host.run({
-    command: 'docker',
-    args,
-    cwd: host.operation.paths.instanceRoot(host.operation.instanceId),
-    env: dockerEnvironment(host.runtime, host.dependencies),
-    timeoutMs: DOCKER_TIMEOUT_MS,
-  });
-}
-
-const DOCKER_TIMEOUT_MS = 60_000;
-
 /** One assistant's images as `agent-image.ts` reaches them: from its instance directory, through its Docker. */
 export function assistantImageDocker(
   runtime: InstanceRuntimeConfig,
   seams: Pick<CutoverSeams, 'runCommand' | 'ambientEnv'>,
-  cwd: string,
 ): ImageDocker {
-  return { run: seams.runCommand ?? runSanitizedCommand, cwd, env: dockerEnvironment(runtime, seams) };
-}
-
-/** One assistant's images as `agent-image.ts` reaches them, through the Docker its cutover runs. */
-function hostImageDocker(host: AssistantDocker): ImageDocker {
   return {
-    run: host.run,
-    cwd: host.operation.paths.instanceRoot(host.operation.instanceId),
-    env: dockerEnvironment(host.runtime, host.dependencies),
+    run: seams.runCommand ?? runSanitizedCommand,
+    cwd: runtime.instance_root,
+    env: dockerEnvironment(runtime, seams),
   };
 }
 
-/** The ID of the image `reference` names, or undefined when it names none. */
-export function imageIdOf(host: AssistantDocker, reference: string): Promise<string | undefined> {
-  return taggedImageId(hostImageDocker(host), reference);
-}
-
 /**
- * Move an assistant's agent image tags (`move`) with every image its
- * record's moves name held (KTD19): each image a tag moves to, and each it
- * moves off. Until the record's follow-ups release them, no other
- * assistant's release deletes an image this switch, or its reversal, may
- * still point a tag at (see `moveHoldingImages`).
+ * Fence the assistant (KTD1): stop its service's job and drain its agents,
+ * prove the instance quiet, then remove the live link, so nothing can start a
+ * host until a switch points it again. `inspect` runs once nothing uses the
+ * state and while the link is still there: an operation reads the schema the
+ * host left, and an update checks its dry run still speaks for it. Fencing
+ * an assistant already fenced stops whatever started since (a launchd job
+ * loaded at login is booted out) and proves it quiet again; the link stays
+ * absent. Reports the stop, ungraceful when the host left its claim lease
+ * live.
  */
-export function moveRecordedImages(
-  host: AssistantDocker,
-  images: readonly MovedImage[],
-  move: () => Promise<void>,
-): Promise<void> {
-  return moveHoldingImages(
-    hostImageDocker(host),
-    getInstallScopedNames(host.runtime.install_id).containerImageBase,
-    images.flatMap((image) =>
-      image.displaced_image_id === null ? [image.image_id] : [image.image_id, image.displaced_image_id],
-    ),
-    move,
-  );
-}
-
-/** The tag an update gives its agent image, beside the `:latest` the assistant runs. */
-export function nextAgentImage(runtime: Pick<InstanceRuntimeConfig, 'install_id'>): string {
-  return `${getInstallScopedNames(runtime.install_id).containerImageBase}:next`;
-}
-
-/** The tag NanoClaw's build gives an update's agent image before it is labeled with its key and tagged `:next`. */
-export const BUILDING_AGENT_IMAGE_TAG = 'building';
-
-/** The image an update's build tags `BUILDING_AGENT_IMAGE_TAG`, in the assistant's own repository. */
-export function buildingAgentImage(runtime: Pick<InstanceRuntimeConfig, 'install_id'>): string {
-  return `${getInstallScopedNames(runtime.install_id).containerImageBase}:${BUILDING_AGENT_IMAGE_TAG}`;
-}
-
-/** Add follow-ups to those planned, each at most once. */
-export function planFollowUps(
-  planned: readonly OperationFollowUp[],
-  added: readonly OperationFollowUp[],
-): OperationFollowUp[] {
-  const known = new Set(planned.map(followUpKey));
-  return [...planned, ...added.filter((followUp) => !known.has(followUpKey(followUp)))];
-}
-
-/**
- * Stop the host and its agents. Service control waits until the job is gone;
- * the drain stops the containers the host leaves for the next start to adopt.
- */
-export async function stopCutoverHost(host: CutoverHost, label: string): Promise<void> {
+export async function fenceInstance(host: CutoverHost, label: string, inspect?: () => void): Promise<OperationStop> {
   await runStep(host.reporter, { id: 'stop_host', label }, async () => {
     await host.service.stop();
     await host.service.drain();
   });
+  const at = new Date().toISOString();
+  return runStep(host.reporter, { id: 'fence', label: 'Checking nothing still uses its state…' }, async () => {
+    await assertInstanceQuiet(quietInstanceOf(host), cutoverQuiescence(host));
+    inspect?.();
+    const graceful = !(await exists(host.layout.state)) || !hostLeaseLive(host.layout.state, at);
+    await fence(host.layout);
+    return { at, graceful };
+  });
 }
 
 /**
- * Stop again, before a rename or a start, any host the OS started since the
- * cutover stopped it (`RunAtLoad`, `KeepAlive`). The same step as the stop,
- * told apart by its label: the host is normally still stopped.
+ * The one switch (KTD1), run only while the assistant is fenced and proven
+ * quiet: stamp the target release's upgrade tripwire with its own script, so
+ * the host it starts accepts exactly that release; reset the circuit
+ * breaker, which counts only the crashes of the release it left; apply the
+ * files kept with the release, its OneCLI gateway recreated and probed only
+ * when its Compose file differs, a failed probe refusing the release before
+ * its host starts (KTD15); have the service manager read its definition; and
+ * point the live link at it. Each step converges, so a switch cut short is
+ * finished by running it again. Returns whether the service definition
+ * changed, which the start needs.
  */
-export function keepCutoverHostStopped(host: CutoverHost): Promise<void> {
-  return stopCutoverHost(host, 'Making sure the assistant is still stopped…');
-}
-
-/**
- * Remove an update's staging: its image tags, `:next` and the `:building` one
- * its build had not yet labeled, then `next/`. Each tag is removed as a tag,
- * so an image another assistant shares stays; the tags go first, so a staging
- * whose image could not be removed is still found as abandoned.
- */
-export async function removeUpdateStaging(
-  paths: ControlPlanePaths,
-  instanceId: string,
-  runtime: InstanceRuntimeConfig,
-  seams: Pick<CutoverSeams, 'runCommand' | 'ambientEnv'>,
-): Promise<void> {
-  const run = seams.runCommand ?? runSanitizedCommand;
-  const docker = (args: readonly string[]) =>
-    run({
-      command: 'docker',
-      args,
-      cwd: paths.instanceRoot(instanceId),
-      env: dockerEnvironment(runtime, seams),
-      timeoutMs: DOCKER_TIMEOUT_MS,
+export async function switchTo(host: CutoverHost, release: ReleaseCoordinates, label: string): Promise<boolean> {
+  const name = releaseName(release.deployed_commit);
+  return runStep(host.reporter, { id: 'switch_release', label }, async () => {
+    const { runtime, layout, dependencies } = host;
+    await stampUpgradeState(layout.release(name), host.run, {
+      ...dockerEnvironment(runtime, dependencies),
+      NANOCLAW_INSTALL_ID: runtime.install_id,
     });
-  for (const image of [nextAgentImage(runtime), buildingAgentImage(runtime)]) {
-    if ((await docker(['image', 'ls', '--quiet', image])).stdout.trim()) await docker(['image', 'rm', image]);
+    await rm(path.join(layout.state, 'data', 'circuit-breaker.json'), { force: true });
+    const service = cutoverServiceDependencies(host);
+    const { definitionChanged } = await applyReleaseFiles(
+      { runtime, onecli: host.onecli, commit: release.deployed_commit },
+      { ...service, upsertEnvVars: dependencies.upsertEnvVars },
+      onecliBoundaries(host),
+    );
+    await reloadInstanceService(runtime, service);
+    await pointCurrent(layout, name);
+    return definitionChanged;
+  });
+}
+
+/** Start the release the live link names; a job still loaded is started afresh when its definition changed. */
+export async function startRelease(host: CutoverHost, definitionChanged: boolean, label: string): Promise<void> {
+  await runStep(host.reporter, { id: 'start_release', label }, async () => {
+    await host.service.start({ definitionChanged });
+  });
+}
+
+/**
+ * Serve `release` again, the one an operation left, after the operation
+ * stopped short of its target serving. While the live link still names it,
+ * nothing of its own was touched: the fence never removed the link, or an
+ * earlier return already switched back; only its host is started. Otherwise
+ * the assistant is fenced again, which stops whatever started since and
+ * proves it quiet, `beforeSwitch` runs (a rollback's state goes back), and
+ * the release is switched to, its kept files put back over whatever the
+ * operation's switch applied, and started.
+ */
+export async function serveLeftRelease(
+  host: CutoverHost,
+  release: ReleaseCoordinates,
+  beforeSwitch?: () => Promise<void>,
+): Promise<void> {
+  if ((await readCurrent(host.layout)) === releaseName(release.deployed_commit)) {
+    await runStep(host.reporter, { id: 'start_release', label: 'Starting the assistant again…' }, async () => {
+      await host.service.start();
+    });
+    return;
   }
-  await rm(paths.releaseRoot(instanceId, 'next'), { recursive: true, force: true });
+  await fenceInstance(host, 'Stopping the assistant to go back…');
+  await beforeSwitch?.();
+  const changed = await switchTo(host, release, 'Switching back to the release it ran…');
+  await startRelease(host, changed, 'Starting the assistant again…');
 }
 
 /** How long a started host may take to serve, and what a killed host's claim lease adds (`src/host-instance.ts`). */
@@ -1453,13 +590,15 @@ const HOST_READY_MS = 60_000;
 const HOST_LEASE_MS = 90_000;
 const PROBE_INTERVAL_MS = 1_000;
 const LISTENER_TIMEOUT_MS = 10_000;
+/** As long as the host's own `ncl` may take to answer while it starts. */
+const SKILLS_TIMEOUT_MS = 60_000;
 
-function hostFailure(error: unknown, checkoutRoot: string): string {
+function hostFailure(error: unknown, logs: string): string {
   const message = error instanceof Error ? error.message : String(error);
-  return redact(message.replaceAll('logs/nanoclaw.error.log', path.join(checkoutRoot, 'logs', 'nanoclaw.error.log')));
+  return redact(message.replaceAll('logs/nanoclaw.error.log', path.join(logs, 'nanoclaw.error.log')));
 }
 
-/** The listener ID of the host serving the live checkout, once it answers with Google Chat connected. */
+/** The listener ID of the host serving the live release, once it answers with Google Chat connected. */
 async function servingListener(host: CutoverHost, budgetMs: number, subject: string): Promise<string> {
   const root = host.runtime.checkout_root;
   const port = host.reservation.allocated_ports.nanoclaw_webhook;
@@ -1468,9 +607,11 @@ async function servingListener(host: CutoverHost, budgetMs: number, subject: str
     status = await host.dependencies.hostStatus.waitForHost(root, { channel: 'gchat', timeoutMs: budgetMs });
   } catch (error) {
     // Upstream waitForHost reports every failure as a plain Error naming why the host is not ready.
-    throw new GwsEaError('host_not_serving', `${subject}'s host is not serving: ${hostFailure(error, root)}`, {
-      cause: error,
-    });
+    throw new GwsEaError(
+      'host_not_serving',
+      `${subject}'s host is not serving: ${hostFailure(error, host.layout.logs)}`,
+      { cause: error },
+    );
   }
   const webhook = isRecord(status) ? status.webhook : undefined;
   if (!isRecord(webhook) || webhook.port !== port || typeof webhook.id !== 'string' || !webhook.id) {
@@ -1556,51 +697,102 @@ async function assertRouteServes(host: CutoverHost, listener: string, budgetMs: 
   }
 }
 
+/**
+ * Wait for the started host's service to be healthy, its `ncl` answering; a
+ * killed host's claim lease lengthens the wait. Returns the budget every
+ * later wait is allowed.
+ */
+async function awaitHealthyHost(host: CutoverHost, leaseHeld: boolean, subject: string): Promise<number> {
+  const budget = leaseHeld ? HOST_READY_MS + HOST_LEASE_MS : HOST_READY_MS;
+  if (!(await host.service.verifyHealth(budget))) {
+    throw new GwsEaError('host_not_serving', `${subject}'s host service never became healthy.`);
+  }
+  return budget;
+}
+
 /** What a release must show to count as serving. */
 export interface ServingRelease {
-  /** The reservation with that release overlaid (KTD17): its commit must be the live checkout's. */
+  /** The reservation with that release overlaid: its commit must be the live link's. */
   readonly view: InstanceReservation;
   /** The OneCLI versions its receipt records. */
   readonly pins: OnecliPins;
-  /** The stop killed the host, so its claim lease delays the next one's (KTD18). */
+  /** The stop killed the host, so its claim lease delays the next one's. */
   readonly leaseHeld: boolean;
-  /** It runs another gateway than the release it replaced, so the isolation probe runs again (KTD8). */
-  readonly gatewayChanged: boolean;
   /** How failures name it, such as "The new release". */
   readonly subject: string;
 }
 
 /**
- * Check a started release serves. Its service is healthy; the live checkout
- * is the release, marker and commit with no tracked changes, and the host answers for
- * it, which NanoClaw's upgrade tripwire allows only at the commit its
- * checkout was stamped for; its listener answers 401 with the host's own
- * listener ID; OneCLI is healthy, and still isolates agents when the gateway
- * changed; and the callback route reaches it. A killed host's claim lease can
+ * Check a started release serves. Its service is healthy; the live link names
+ * the release, at its commit with no tracked changes, and the host answers
+ * for it, which NanoClaw's upgrade tripwire allows only at the commit it was
+ * stamped for; its listener answers 401 with the host's own listener ID;
+ * OneCLI is healthy (a gateway the switch recreated was probed before the
+ * start); and the callback route reaches it. A killed host's claim lease can
  * delay the new one, so it lengthens every wait. A host that went down since
  * it was started is started again; a running one is left as it is.
  */
 export async function verifyServingRelease(host: CutoverHost, release: ServingRelease): Promise<void> {
   const { subject } = release;
   await host.service.start();
-  const budget = release.leaseHeld ? HOST_READY_MS + HOST_LEASE_MS : HOST_READY_MS;
-  if (!(await host.service.verifyHealth(budget))) {
-    throw new GwsEaError('host_not_serving', `${subject}'s host service never became healthy.`);
-  }
+  const budget = await awaitHealthyHost(host, release.leaseHeld, subject);
   await observeLiveCheckout(host.operation.paths, release.view, [release.view.deployed_commit], {
     runCommand: host.run,
   });
   const listener = await servingListener(host, budget, subject);
   await assertListenerServes(host, listener, budget, subject);
-  const onecli = cutoverOnecli(host);
-  if (release.gatewayChanged) await onecli.verify(host.onecli, release.pins);
-  else {
-    const seen = await onecli.observe(host.onecli, release.pins);
-    if (seen.status !== 'present') {
-      throw new GwsEaError('onecli_not_serving', `The credential vault is not healthy on ${subject.toLowerCase()}.`);
-    }
+  const seen = await cutoverOnecli(host).observe(host.onecli, release.pins);
+  if (seen.status !== 'present') {
+    throw new GwsEaError('onecli_not_serving', `The credential vault is not healthy on ${subject.toLowerCase()}.`);
   }
   await assertRouteServes(host, listener, budget);
+}
+
+/**
+ * Reconcile main's shared skills to the started release's own list (KTD16),
+ * through the assistant's own `ncl` once its host answers, before the release
+ * is verified: a release that changes the list reaches main this way, on
+ * every update and rollback, never by restamping main's template.
+ */
+export async function reconcileMainSkills(host: CutoverHost, leaseHeld: boolean): Promise<void> {
+  await runStep(host.reporter, { id: 'reconcile_main_skills', label: "Updating main's shared skills…" }, async () => {
+    await awaitHealthyHost(host, leaseHeld, 'The started release');
+    const ncl = host.dependencies.ncl ?? runInstanceNclJson;
+    const options = { timeoutMs: SKILLS_TIMEOUT_MS };
+    const profile = unwrapData(await ncl(host.runtime, ['gws-ea-profile', 'get'], options));
+    const main = isRecord(profile) ? profile.main_agent_group_id : undefined;
+    if (typeof main !== 'string' || !main) {
+      throw new GwsEaError(
+        'main_unpublished',
+        "The assistant's profile names no main group, so its skills were not reconciled.",
+      );
+    }
+    const skills = unwrapData(await ncl(host.runtime, ['gws-ea-main', 'reconcile', '--agent-group-id', main], options));
+    if (
+      !isRecord(skills) ||
+      skills.agent_group_id !== main ||
+      !Array.isArray(skills.skills) ||
+      !skills.skills.every((skill) => typeof skill === 'string')
+    ) {
+      throw new GwsEaError('main_group_mismatch', "Main's skills did not reconcile to the release's list.");
+    }
+  });
+}
+
+/**
+ * The follow-ups a committed release runs (KTD4, KTD6): each agent group
+ * running its own image has it rebuilt on the release's image, then whatever
+ * nothing keeps any more is pruned.
+ */
+export function releaseFollowUps(runtime: InstanceRuntimeConfig): OperationFollowUp[] {
+  const base = getInstallScopedNames(runtime.install_id).containerImageBase;
+  return [
+    ...readDerivedImageGroups(runtime.state_root, base).map((group) => ({
+      kind: 'rebuild_group_image' as const,
+      agent_group_id: group.id,
+    })),
+    { kind: 'prune' },
+  ];
 }
 
 /** At least the host's own bound on building an agent group's image (`src/container-runner.ts`), plus its restart. */
@@ -1614,33 +806,35 @@ function describeFollowUp(followUp: OperationFollowUp): string {
   switch (followUp.kind) {
     case 'rebuild_group_image':
       return `rebuilding agent group ${followUp.agent_group_id}'s image`;
-    case 'delete_release':
-      return followUp.release === 'outgoing'
-        ? 'deleting the outgoing release'
-        : 'deleting the superseded previous release';
-    case 'delete_image':
-      return `deleting image ${followUp.image_id.slice(0, 19)}`;
+    case 'reclaim_image':
+      return `removing the image ${followUp.image_id.slice(0, 19)} a rebuild replaced`;
+    case 'prune':
+      return 'removing the releases and snapshots nothing keeps';
   }
 }
 
 /** Work that brings the release up to date, before any cleanup. */
 function isCleanup(followUp: OperationFollowUp): boolean {
-  return followUp.kind === 'delete_release' || followUp.kind === 'delete_image';
+  return followUp.kind !== 'rebuild_group_image';
 }
 
 /**
  * Rebuild an agent group's own image on the base the release runs with the
- * assistant's own `ncl` (KTD7): NanoClaw's `buildAgentGroupImage`, then a
- * restart of that group's containers. A group that no longer runs its own
- * image is done.
+ * assistant's own `ncl` (KTD6): NanoClaw's `buildAgentGroupImage`, then a
+ * restart of that group's containers. The image the group's tag named is
+ * recorded first, to be reclaimed once nothing names it (KTD6). A group that
+ * no longer runs its own image is done.
  */
 async function rebuildGroupImage(
+  operation: InstanceOperation,
   runtime: InstanceRuntimeConfig,
   agentGroupId: string,
   dependencies: CutoverSeams,
 ): Promise<void> {
   const base = getInstallScopedNames(runtime.install_id).containerImageBase;
   if (!readDerivedImageGroups(runtime.state_root, base).some((group) => group.id === agentGroupId)) return;
+  const displaced = await taggedImageId(assistantImageDocker(runtime, dependencies), `${base}:${agentGroupId}`);
+  if (displaced) await addFollowUps(operation, [{ kind: 'reclaim_image', image_id: displaced }]);
   const result = await (dependencies.ncl ?? runInstanceNclJson)(
     runtime,
     ['groups', 'restart', '--id', agentGroupId, '--rebuild'],
@@ -1654,6 +848,23 @@ async function rebuildGroupImage(
   );
 }
 
+/** Delete the releases, snapshots, and quarantines nothing keeps: the live release and the rollback point stay (KTD4). */
+async function pruneReleases(
+  operation: InstanceOperation,
+  runtime: InstanceRuntimeConfig,
+  dependencies: CutoverSeams,
+): Promise<void> {
+  const { paths, instanceId } = operation;
+  const point = await readRollbackPoint(paths, instanceId);
+  const base = getInstallScopedNames(runtime.install_id).containerImageBase;
+  const docker = assistantImageDocker(runtime, dependencies);
+  await pruneInstance(
+    paths.instanceLayout(instanceId),
+    point ? { rollbackPoint: { release: releaseName(point.release.deployed_commit), snapshot: point.snapshot } } : {},
+    (release) => removeReleaseImage(docker, base, release),
+  );
+}
+
 /** Run one follow-up. */
 async function runFollowUp(
   operation: InstanceOperation,
@@ -1661,24 +872,15 @@ async function runFollowUp(
   followUp: OperationFollowUp,
   dependencies: CutoverSeams,
 ): Promise<void> {
-  const { paths, instanceId } = operation;
   switch (followUp.kind) {
     case 'rebuild_group_image':
-      await rebuildGroupImage(runtime, followUp.agent_group_id, dependencies);
+      await rebuildGroupImage(operation, runtime, followUp.agent_group_id, dependencies);
       return;
-    case 'delete_release':
-      await rm(paths.releaseRoot(instanceId, followUp.release === 'outgoing' ? 'outgoing' : 'superseded'), {
-        recursive: true,
-        force: true,
-      });
+    case 'reclaim_image':
+      await reclaimImage(assistantImageDocker(runtime, dependencies), followUp.image_id);
       return;
-    case 'delete_image':
-      // Displaced by a retag or a rebuild; another assistant sharing it by content keeps it by its own tag (KTD19).
-      await releaseImage(
-        assistantImageDocker(runtime, dependencies, paths.instanceRoot(instanceId)),
-        getInstallScopedNames(runtime.install_id).containerImageBase,
-        followUp.image_id,
-      );
+    case 'prune':
+      await pruneReleases(operation, runtime, dependencies);
       return;
   }
 }
@@ -1688,63 +890,20 @@ function sentenceCase(text: string): string {
 }
 
 /**
- * Whether, with no update or rollback open, the release last recorded is a
- * rollback's that keeps nothing to roll back to: the release it left is kept
- * in `outgoing/` (until the next update is recorded), and `previous/` is gone.
- * A rollback that put back the previous release its unrecorded update had
- * set aside keeps one, and so does one that went back.
- */
-async function rolledBackKeepingNone(paths: ControlPlanePaths, instanceId: string): Promise<boolean> {
-  const [previous, outgoing] = await Promise.all([
-    lstatIfPresent(paths.releaseRoot(instanceId, 'previous')),
-    lstatIfPresent(paths.releaseRoot(instanceId, 'outgoing')),
-  ]);
-  return previous === undefined && outgoing !== undefined;
-}
-
-/**
- * The `:previous` tag a recorded rollback leaves (KTD7, KTD19): the rollback
- * points `:latest` back at the image `:previous` names and keeps no release
- * to roll back to, so `:previous` would read as the image the assistant runs.
- * Derived from the state each time it is asked, never recorded. Returns the
- * tag only while it names the image `:latest` names, so removing it untags
- * and never deletes an image.
- */
-export async function leftoverPreviousTag(host: AssistantDocker): Promise<string | undefined> {
-  const { paths, instanceId } = host.operation;
-  if (!(await rolledBackKeepingNone(paths, instanceId))) return undefined;
-  const base = getInstallScopedNames(host.runtime.install_id).containerImageBase;
-  const previous = await imageIdOf(host, `${base}:previous`);
-  if (previous === undefined || previous !== (await imageIdOf(host, `${base}:latest`))) return undefined;
-  return `${base}:previous`;
-}
-
-/**
- * Run a recorded update's or rollback's follow-ups (KTD2): the per-group image
- * rebuilds first, then, once they all succeeded, the cleanup of the superseded
- * releases and displaced images.
- * Each is struck from the record as it finishes, and the record is deleted
- * with the last. A failure never rolls back: it stays in the record, `status`
- * reports it, and the next run of the same command retries it.
- *
- * A rollback's cleanup also drops the `:previous` tag it leaves (see
- * `leftoverPreviousTag`), derived from the state rather than recorded, and
- * before any recorded cleanup is struck, so a run cut short keeps the record
- * that has `rollback --id` finish it. One recorded with nothing else to
- * follow up has no record left: `rollback --id` finds its leftover tag
- * instead.
+ * Run a committed update's or rollback's follow-ups (KTD2): the per-group
+ * image rebuilds first, then, once they all succeeded, the cleanup: the
+ * images they displaced, and the prune. Each is struck from the record as it
+ * finishes, and the record is deleted with the last. A failure never rolls
+ * back: it stays in the record, `status` reports it, and the next run of the
+ * same command retries it.
  */
 export async function finishFollowUps(operation: InstanceOperation, dependencies: CutoverDependencies): Promise<void> {
   operation.assertActive();
   const { paths, instanceId } = operation;
   const record = await readOperationRecord(paths, instanceId);
-  if (record && record.phase !== 'recorded') return;
-  const rolledBack = await rolledBackKeepingNone(paths, instanceId);
-  if (!record && !rolledBack) return;
+  if (record?.phase !== 'committed') return;
   const runtime = await loadCreatedRuntime(paths, instanceId);
   const reporter = dependencies.reporter ?? {};
-  const kind = record?.kind ?? 'rollback';
-  const pending = record?.follow_ups ?? [];
   const failures: string[] = [];
   const attempt = async (followUp: OperationFollowUp, label: string): Promise<void> => {
     try {
@@ -1757,36 +916,18 @@ export async function finishFollowUps(operation: InstanceOperation, dependencies
       failures.push(`${describeFollowUp(followUp)}: ${safeErrorMessage(error)}`);
     }
   };
-  for (const followUp of pending.filter((planned) => !isCleanup(planned))) {
+  for (const followUp of record.follow_ups.filter((planned) => !isCleanup(planned))) {
     await attempt(followUp, `${sentenceCase(describeFollowUp(followUp))}…`);
   }
-  if (failures.length === 0 && rolledBack) {
-    const docker: AssistantDocker = {
-      operation,
-      runtime,
-      run: dependencies.runCommand ?? runSanitizedCommand,
-      dependencies,
-    };
-    try {
-      await runStep(reporter, { id: 'untag_previous_image', label: `Cleaning up after the ${kind}…` }, async () => {
-        const tag = await leftoverPreviousTag(docker);
-        if (tag) await cutoverDocker(docker, ['image', 'rm', tag]);
-      });
-    } catch (error) {
-      if (!(error instanceof GwsEaError)) throw error;
-      failures.push(`removing its leftover :previous image tag: ${safeErrorMessage(error)}`);
-    }
-  }
   if (failures.length === 0) {
-    for (const followUp of pending.filter(isCleanup)) {
-      await attempt(followUp, `Cleaning up after the ${kind}…`);
-    }
+    // The rebuilds recorded the images they displaced, so the cleanup is read again.
+    const cleanup = (await readOperationRecord(paths, instanceId))?.follow_ups.filter(isCleanup) ?? [];
+    for (const followUp of cleanup) await attempt(followUp, `Cleaning up after the ${record.kind}…`);
   }
   if (failures.length === 0) return;
-  const release = record?.to ?? releaseOf(await getInstanceReservation(paths, instanceId));
   throw new GwsEaError(
     'follow_ups_failed',
-    `Assistant ${instanceId} runs ${releaseLine(release)}, but ${failures.length === 1 ? 'a follow-up' : `${failures.length} follow-ups`} of its ${kind} failed: ${failures.join('; ')}. ` +
-      `${record ? `gws-ea status --id ${instanceId} lists what is left, and ` : ''}gws-ea ${kind} --id ${instanceId} retries it.`,
+    `Assistant ${instanceId} runs ${releaseLine(record.to)}, but ${failures.length === 1 ? 'a follow-up' : `${failures.length} follow-ups`} of its ${record.kind} failed: ${failures.join('; ')}. ` +
+      `gws-ea status --id ${instanceId} lists what is left, and gws-ea ${record.kind} --id ${instanceId} retries it.`,
   );
 }

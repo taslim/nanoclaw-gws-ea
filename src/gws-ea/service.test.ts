@@ -18,12 +18,12 @@ import {
   loadInstanceRuntimeConfig,
   instanceServiceDefinitionFile,
   persistInstanceRuntime,
-  readInstanceHostEnvironment,
   reconcileInstanceRuntime,
   reconcileInstanceService,
   instanceOnecliAdmin,
-  writeInstanceServiceDefinition,
-  writeReleaseEnvironment,
+  reloadInstanceService,
+  renderInstanceServiceDefinition,
+  restoreInstanceServiceDefinition,
   type InstanceRuntimeConfig,
   type InstanceServiceLayout,
   type UpsertEnvVars,
@@ -658,28 +658,8 @@ describe('GWS-EA instance runtime', () => {
   });
 });
 
-describe('rendering the release an update deploys', () => {
-  it("writes every gws-ea .env key of the release into the .env it is given, keeping other writers' keys", async () => {
-    const { config } = await fixture();
-    await persistInstanceRuntime(config, upsertEnvVars);
-    const root = path.join(config.instance_root, 'next');
-    await mkdir(root, { recursive: true, mode: 0o700 });
-    await writeFile(path.join(root, '.env'), 'INSTALL_CJK_FONTS=true\nWEBHOOK_PORT=1\nONECLI_URL=http://stale\n', {
-      mode: 0o600,
-    });
-
-    writeReleaseEnvironment(config, root, upsertEnvVars);
-
-    const environment = await readFile(path.join(root, '.env'), 'utf8');
-    expect(environment).toContain('INSTALL_CJK_FONTS=true');
-    expect(environment).toContain(`WEBHOOK_PORT=${config.allocated_ports.nanoclaw_webhook}`);
-    expect(environment).toContain(`ONECLI_URL=${config.onecli_app_url}`);
-    expect(environment).not.toContain('stale');
-    expect(readInstanceHostEnvironment(root)).toEqual(readInstanceHostEnvironment(config.state_root));
-    expect(Object.keys(readInstanceHostEnvironment(root))).not.toContain('INSTALL_CJK_FONTS');
-  });
-
-  it('writes the service definition an update renders only when it differs, and reloads systemd for it', async () => {
+describe('the service definition a switch installs', () => {
+  it('installs a kept definition only when it differs, and has systemd read it before every start', async () => {
     const { config, home } = await fixture();
     const calls: SanitizedCommand[] = [];
     const runCommand = vi.fn(async (command: SanitizedCommand) => {
@@ -691,15 +671,19 @@ describe('rendering the release an update deploys', () => {
       const file = instanceServiceDefinitionFile(config, options);
       await mkdir(path.dirname(file), { recursive: true });
       await writeFile(file, 'the definition an earlier release rendered\n', { mode: 0o600 });
+      const kept = renderInstanceServiceDefinition(config, options);
 
-      expect(await writeInstanceServiceDefinition(config, options)).toBe(true);
-      const rendered = await readFile(file, 'utf8');
-      expect(rendered).toContain(path.join(config.checkout_root, 'dist', 'gws-ea', 'process.js'));
+      expect(await restoreInstanceServiceDefinition(config, kept, options)).toBe(true);
+      expect(await readFile(file, 'utf8')).toBe(kept);
+      expect(kept).toContain(path.join(config.checkout_root, 'dist', 'gws-ea', 'process.js'));
       expect((await stat(file)).mode & 0o777).toBe(0o600);
-      expect(await writeInstanceServiceDefinition(config, options)).toBe(false);
-      expect(await readFile(file, 'utf8')).toBe(rendered);
+      expect(await restoreInstanceServiceDefinition(config, kept, options)).toBe(false);
+      await reloadInstanceService(config, options);
     }
-    // launchd reads its definition when the job is bootstrapped; systemd must be told once it changed.
-    expect(calls.map((call) => [call.command, ...call.args])).toEqual([['systemctl', '--user', 'daemon-reload']]);
+    // launchd reads its definition when the job is bootstrapped; systemd is told when it changed and before a start.
+    expect(calls.map((call) => [call.command, ...call.args])).toEqual([
+      ['systemctl', '--user', 'daemon-reload'],
+      ['systemctl', '--user', 'daemon-reload'],
+    ]);
   });
 });
